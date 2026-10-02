@@ -3,6 +3,7 @@ mod agents;
 mod attach;
 mod client;
 mod daemon;
+mod drive;
 mod env;
 mod git;
 mod hook;
@@ -12,6 +13,7 @@ mod shell;
 mod socket;
 mod state;
 mod tui;
+mod typing;
 mod viewer;
 
 use anyhow::{Result, bail};
@@ -20,6 +22,7 @@ use protocol::{Request, Response, SessionInfo, State};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::Duration;
 
 /// One terminal for all your coding agents. With no command, opens the
 /// TUI: every session in a sidebar, the selected one live beside it.
@@ -75,6 +78,44 @@ enum Command {
     Attach {
         /// The session [default: the newest one]
         name: Option<String>,
+    },
+    /// Type text into a session and press Enter, the way a person would.
+    Send {
+        name: String,
+
+        /// The text to type. Several words are joined with spaces; put
+        /// `--` before text that starts with a `-`.
+        #[arg(required = true)]
+        text: Vec<String>,
+
+        /// Type the text without pressing Enter.
+        #[arg(long)]
+        no_enter: bool,
+
+        /// Then wait for the turn it starts to end, and print how it ended.
+        #[arg(long)]
+        wait: bool,
+
+        /// With --wait, give up after this many seconds.
+        #[arg(long, value_name = "SECONDS", requires = "wait")]
+        timeout: Option<f64>,
+    },
+    /// Wait until a session's agent isn't working, or its program has
+    /// ended, and print which: done, waiting, idle, exited 0…
+    Wait {
+        name: String,
+
+        /// Give up after this many seconds, and fail.
+        #[arg(long, value_name = "SECONDS")]
+        timeout: Option<f64>,
+    },
+    /// Print what's on a session's screen.
+    Read {
+        name: String,
+
+        /// Only the last this many rows that aren't blank.
+        #[arg(short = 'n', long)]
+        lines: Option<usize>,
     },
     /// Stop a session and remove it from the list.
     Kill { name: String },
@@ -133,6 +174,20 @@ fn run(cli: Cli) -> Result<()> {
                 print_sessions(&sessions);
             }
         }
+        Command::Send {
+            name,
+            text,
+            no_enter,
+            wait,
+            timeout,
+        } => {
+            drive::send(&socket, &name, &text.join(" "), !no_enter)?;
+            if wait {
+                drive::wait_for_turn(&socket, &name, seconds(timeout))?;
+            }
+        }
+        Command::Wait { name, timeout } => drive::wait(&socket, &name, seconds(timeout))?,
+        Command::Read { name, lines } => drive::read(&socket, &name, lines)?,
         Command::Kill { name } => {
             if client::ask(&socket, &Request::Kill { name }, false)?.is_none() {
                 no_daemon(&socket)?;
@@ -201,6 +256,11 @@ fn runs_in(session: &SessionInfo, path: &Path) -> bool {
         .worktree
         .as_ref()
         .is_some_and(|worktree| worktree.path == path)
+}
+
+/// A number of seconds from the command line, as a `Duration`.
+fn seconds(seconds: Option<f64>) -> Option<Duration> {
+    seconds.map(Duration::from_secs_f64)
 }
 
 fn no_daemon(socket: &Path) -> Result<()> {

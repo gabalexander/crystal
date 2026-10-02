@@ -8,6 +8,7 @@ use crate::protocol::{self, Conversation, Frame, NewSession, Request, Response};
 use crate::session::{STOP_GRACE, Session, Term};
 use crate::socket;
 use crate::state::{self, SavedSession};
+use crate::typing;
 use anyhow::{Context, Result, bail, ensure};
 use std::io::{BufReader, ErrorKind, Write};
 use std::net::Shutdown;
@@ -152,6 +153,16 @@ impl Daemon {
         Ok((session.name.clone(), session.term()))
     }
 
+    /// The terminal of the session called `name`, to type into, which
+    /// only makes sense while its program runs. The sessions are let go
+    /// before any typing, which takes a moment.
+    fn running_term(&self, name: &str) -> Result<Arc<Term>> {
+        let mut sessions = self.sessions.lock().unwrap();
+        let session = named(&mut sessions, name)?;
+        ensure!(session.is_running(), "{name} has ended");
+        Ok(session.term())
+    }
+
     fn handle(&self, request: Request) -> Result<Response> {
         match request {
             Request::Attach { .. } => bail!("attach takes over the connection"),
@@ -183,6 +194,20 @@ impl Daemon {
                     .with_context(|| format!("no session named {name}"))?;
                 sessions.remove(index).stop();
                 Ok(Response::Done)
+            }
+            Request::Send { name, text, enter } => {
+                let term = self.running_term(&name)?;
+                term.write(&typing::keystrokes(&text, term.wants_bracketed_paste()))?;
+                if enter {
+                    thread::sleep(typing::ENTER_PAUSE);
+                    term.write(typing::ENTER)?;
+                }
+                Ok(Response::Done)
+            }
+            Request::Read { name } => {
+                let mut sessions = self.sessions.lock().unwrap();
+                let rows = named(&mut sessions, &name)?.term().rows();
+                Ok(Response::Screen { rows })
             }
             Request::Shutdown => {
                 let sessions = std::mem::take(&mut *self.sessions.lock().unwrap());

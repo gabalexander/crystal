@@ -26,6 +26,16 @@ pub enum Request {
         #[serde(default)]
         conversation: Option<Conversation>,
     },
+    /// Type `text` into a session, then press Enter if `enter` is set.
+    Send {
+        name: String,
+        text: String,
+        enter: bool,
+    },
+    /// What's on a session's screen, as text.
+    Read {
+        name: String,
+    },
     /// With no name, the newest session.
     Attach {
         name: Option<String>,
@@ -59,6 +69,10 @@ pub enum Response {
     Attached {
         name: String,
         running: bool,
+    },
+    /// A session's screen, one string per row.
+    Screen {
+        rows: Vec<String>,
     },
     Done,
     Error {

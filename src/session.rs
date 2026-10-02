@@ -238,6 +238,23 @@ impl Term {
         agent_screen::read(screen.parser.screen(), &screen.parser.callbacks().title)
     }
 
+    /// Whether the program has asked for pastes to be marked as pastes.
+    pub fn wants_bracketed_paste(&self) -> bool {
+        self.screen
+            .lock()
+            .unwrap()
+            .parser
+            .screen()
+            .bracketed_paste()
+    }
+
+    /// What's on the screen, one string per row.
+    pub fn rows(&self) -> Vec<String> {
+        let screen = self.screen.lock().unwrap();
+        let (_, cols) = screen.parser.screen().size();
+        screen.parser.screen().rows(0, cols).collect()
+    }
+
     pub fn is_watched(&self) -> bool {
         !self.screen.lock().unwrap().viewers.is_empty()
     }

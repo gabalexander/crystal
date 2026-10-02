@@ -1126,3 +1126,183 @@ fn claude_picks_its_conversation_up_again_after_a_restart() {
     let args: Vec<&str> = args.lines().collect();
     assert_eq!(args[2..], ["--resume", "abc-123"]);
 }
+
+/// Waits until the session's screen shows `text`, as `crystal read` sees it.
+fn shows_on_screen(crystal: &Crystal, name: &str, text: &str) {
+    eventually(&format!("{name} shows {text:?}"), || {
+        crystal.ok(&["read", name]).contains(text)
+    });
+}
+
+#[test]
+fn send_types_into_a_program_and_presses_enter() {
+    let crystal = Crystal::new();
+    let script = r#"read line; echo "got $line" > got; sleep 30"#;
+    crystal.ok(&["new", "-n", "reader", "sh", "-c", script]);
+
+    crystal.ok(&["send", "reader", "hello", "there"]);
+    assert_eq!(
+        written(&crystal.dir.path().join("got")),
+        "got hello there\n"
+    );
+}
+
+#[test]
+fn send_marks_the_text_as_a_paste_for_a_program_that_asks() {
+    let crystal = Crystal::new();
+    // A program that asks for bracketed paste, says it's ready, and keeps
+    // the first 21 bytes it gets: the marked text, then the Enter.
+    let script = r"stty raw -echo; printf '\033[?2004hready'; head -c 21 > received; echo >> received; sleep 30";
+    crystal.ok(&["new", "-n", "pasty", "sh", "-c", script]);
+    shows_on_screen(&crystal, "pasty", "ready");
+
+    crystal.ok(&["send", "pasty", "hi there"]);
+    assert_eq!(
+        written(&crystal.dir.path().join("received")),
+        "\x1b[200~hi there\x1b[201~\r\n"
+    );
+}
+
+#[test]
+fn send_no_enter_types_and_leaves_it_there() {
+    let crystal = Crystal::new();
+    let script = r"stty raw -echo; printf ready; head -c 6 > received; echo >> received; sleep 30";
+    crystal.ok(&["new", "-n", "typist", "sh", "-c", script]);
+    shows_on_screen(&crystal, "typist", "ready");
+
+    // With an Enter after the first, the program would get `hello\r`.
+    crystal.ok(&["send", "--no-enter", "typist", "hello"]);
+    crystal.ok(&["send", "--no-enter", "typist", "!"]);
+    assert_eq!(written(&crystal.dir.path().join("received")), "hello!\n");
+}
+
+#[test]
+fn read_prints_the_screen_and_lines_keeps_the_last_rows() {
+    let crystal = Crystal::new();
+    let script = r"printf 'one\ntwo\n\nthree\n'; sleep 30";
+    crystal.ok(&["new", "-n", "printer", "sh", "-c", script]);
+    shows_on_screen(&crystal, "printer", "three");
+
+    assert_eq!(crystal.ok(&["read", "printer"]), "one\ntwo\n\nthree\n");
+    assert_eq!(
+        crystal.ok(&["read", "printer", "--lines", "2"]),
+        "two\nthree\n"
+    );
+}
+
+#[test]
+fn wait_returns_how_a_program_ended() {
+    let crystal = Crystal::new();
+    crystal.ok(&["new", "-n", "brief", "sh", "-c", "read go; exit 4"]);
+
+    // The program can't end before it's sent a line, so the wait must
+    // still be waiting when the line goes.
+    let waiting = crystal
+        .command(&["wait", "brief"])
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    crystal.ok(&["send", "brief", "go"]);
+    let out = waiting.wait_with_output().unwrap();
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8(out.stdout).unwrap(), "exited 4\n");
+}
+
+#[test]
+fn wait_returns_what_an_agent_settles_on() {
+    let crystal = Crystal::new();
+    crystal.ok(&["new", "-n", "agent", "sleep", "30"]);
+    let hook = format!("'{CRYSTAL}' hook claude");
+    run_hook(
+        &crystal,
+        "agent",
+        &hook,
+        r#"{"hook_event_name":"UserPromptSubmit"}"#,
+    );
+
+    let waiting = crystal
+        .command(&["wait", "agent"])
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    run_hook(
+        &crystal,
+        "agent",
+        &hook,
+        r#"{"hook_event_name":"PermissionRequest"}"#,
+    );
+    let out = waiting.wait_with_output().unwrap();
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8(out.stdout).unwrap(), "waiting\n");
+
+    run_hook(&crystal, "agent", &hook, r#"{"hook_event_name":"Stop"}"#);
+    assert_eq!(crystal.ok(&["wait", "agent"]), "done\n");
+}
+
+#[test]
+fn wait_gives_up_after_its_timeout() {
+    let crystal = Crystal::new();
+    crystal.ok(&["new", "-n", "forever", "sleep", "30"]);
+
+    let err = crystal.fails(&["wait", "forever", "--timeout", "0.3"]);
+    assert!(err.contains("forever was still busy after 0.3s"), "{err}");
+}
+
+#[test]
+fn send_wait_waits_for_the_turn_it_started() {
+    let crystal = Crystal::new();
+    // A pretend agent without hooks: for each line it's sent, it shows a
+    // spinner in its title while it works for a second, then answers.
+    let script = r#"
+        while read line; do
+            printf '\033]0;⠋ working\007'
+            sleep 1
+            printf '\033]0;\007'
+            echo "answer to $line"
+        done
+    "#;
+    crystal.ok(&["new", "-n", "agent", "sh", "-c", script]);
+
+    assert_eq!(crystal.ok(&["send", "agent", "first", "--wait"]), "done\n");
+    assert!(crystal.ok(&["read", "agent"]).contains("answer to first"));
+
+    // The agent is done with the first turn, which must not end the wait
+    // for the second.
+    assert_eq!(crystal.ok(&["send", "agent", "second", "--wait"]), "done\n");
+    assert!(crystal.ok(&["read", "agent"]).contains("answer to second"));
+}
+
+#[test]
+fn an_agent_can_read_another_from_inside_its_session() {
+    let crystal = Crystal::new();
+    let other = "echo hello from other; sleep 30";
+    crystal.ok(&["new", "-n", "other", "sh", "-c", other]);
+    shows_on_screen(&crystal, "other", "hello from other");
+
+    // Inside a session, crystal finds its daemon through CRYSTAL_SOCKET.
+    let driver = format!("'{CRYSTAL}' read other > seen; sleep 30");
+    crystal.ok(&["new", "-n", "driver", "sh", "-c", &driver]);
+    assert!(written(&crystal.dir.path().join("seen")).contains("hello from other"));
+}
+
+#[test]
+fn send_wait_and_read_say_when_a_session_is_missing_or_ended() {
+    let crystal = Crystal::new();
+    crystal.ok(&["new", "-n", "gone", "true"]);
+    eventually("gone has ended", || {
+        crystal.row("gone").unwrap()[1] == "exited 0"
+    });
+
+    for args in [
+        &["send", "nope", "hi"][..],
+        &["wait", "nope"],
+        &["read", "nope"],
+    ] {
+        assert!(crystal.fails(args).contains("no session named nope"));
+    }
+    assert!(
+        crystal
+            .fails(&["send", "gone", "hi"])
+            .contains("gone has ended")
+    );
+}
