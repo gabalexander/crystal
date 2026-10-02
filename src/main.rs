@@ -1,16 +1,19 @@
+mod agents;
 mod attach;
 mod client;
 mod daemon;
 mod env;
+mod hook;
 mod protocol;
 mod session;
+mod shell;
 mod socket;
 mod tui;
 mod viewer;
 
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
-use protocol::{Request, Response, SessionInfo};
+use protocol::{Request, Response, SessionInfo, State};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -66,6 +69,9 @@ enum Command {
     /// Run the daemon in the foreground.
     #[command(hide = true)]
     Daemon,
+    /// Tell the daemon about an agent's event; what the agent's hooks run.
+    #[command(hide = true)]
+    Hook { agent: String },
 }
 
 fn main() -> ExitCode {
@@ -109,6 +115,7 @@ fn run(cli: Cli) -> Result<()> {
             }
         }
         Command::Daemon => daemon::run(&socket)?,
+        Command::Hook { agent } => hook::run(&socket, &agent),
     }
     Ok(())
 }
@@ -154,13 +161,13 @@ fn print_sessions(sessions: &[SessionInfo]) {
             };
             [
                 session.name.clone(),
-                session.state.to_string(),
+                status(session),
                 session.pid.map_or("-".into(), |pid| pid.to_string()),
                 cwd,
                 session
                     .command
                     .iter()
-                    .map(|arg| quote(arg))
+                    .map(|arg| shell::quote(arg))
                     .collect::<Vec<_>>()
                     .join(" "),
             ]
@@ -183,28 +190,11 @@ fn print_sessions(sessions: &[SessionInfo]) {
     }
 }
 
-/// `arg` as you'd type it into a shell.
-fn quote(arg: &str) -> String {
-    let plain = |c: char| c.is_ascii_alphanumeric() || "-_./=:@%+,".contains(c);
-    if !arg.is_empty() && arg.chars().all(plain) {
-        return arg.to_string();
-    }
-    format!("'{}'", arg.replace('\'', r"'\''"))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::quote;
-
-    #[test]
-    fn quote_leaves_plain_words_alone() {
-        assert_eq!(quote("--model=opus"), "--model=opus");
-    }
-
-    #[test]
-    fn quote_wraps_what_a_shell_would_split() {
-        assert_eq!(quote("exit 3"), "'exit 3'");
-        assert_eq!(quote("it's"), r"'it'\''s'");
-        assert_eq!(quote(""), "''");
+/// What `ls` says about a session: what its agent is doing, when it runs
+/// one that says, or else whether it's running or how it ended.
+fn status(session: &SessionInfo) -> String {
+    match (&session.state, session.activity) {
+        (State::Running, Some(activity)) => activity.to_string(),
+        (state, _) => state.to_string(),
     }
 }

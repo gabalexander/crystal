@@ -5,7 +5,7 @@
 use super::app::{App, Focus};
 use super::pane::Pane;
 use super::screen_widget::ScreenWidget;
-use crate::protocol::{SessionInfo, State};
+use crate::protocol::{Activity, SessionInfo, State};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
@@ -64,17 +64,21 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_stateful_widget(list, area, &mut state);
 }
 
-/// A session's row: a mark that says whether it's running, its name, and
-/// how it ended if it has.
+/// A session's row: a mark for what it's doing, its name, and a word on
+/// it, unless it's simply running.
 fn session_row(session: &SessionInfo) -> Line<'_> {
-    let mark = match session.state {
-        State::Running => "▶ ".green(),
-        State::Exited { code: 0 } => "■ ".dark_gray(),
-        _ => "■ ".red(),
+    let (mark, word) = match (&session.state, session.activity) {
+        (State::Running, Some(Activity::Waiting)) => ("▲ ".yellow(), "waiting".yellow()),
+        (State::Running, Some(Activity::Working)) => ("◐ ".cyan(), "working".dark_gray()),
+        (State::Running, Some(Activity::Done)) => ("✓ ".green(), "done".dark_gray()),
+        (State::Running, _) => ("▶ ".green(), "".into()),
+        (State::Exited { code: 0 }, _) => ("■ ".dark_gray(), session.state.to_string().dark_gray()),
+        (_, _) => ("■ ".red(), session.state.to_string().dark_gray()),
     };
     let mut row = Line::from(vec![mark, session.name.as_str().into()]);
-    if session.state != State::Running {
-        row.push_span(format!(" {}", session.state).dark_gray());
+    if !word.content.is_empty() {
+        row.push_span(" ");
+        row.push_span(word);
     }
     row
 }
@@ -178,6 +182,7 @@ mod tests {
             cwd: PathBuf::from("/"),
             pid: Some(1),
             state,
+            activity: None,
         }
     }
 
@@ -200,6 +205,28 @@ mod tests {
         assert!(text[1].contains("▶ claude"));
         assert!(text[2].contains("■ codex exited 1"));
         assert!(text[0].contains(" claude "), "the pane is titled after it");
+    }
+
+    #[test]
+    fn the_sidebar_says_what_each_agent_is_doing() {
+        let mut app = App::new(None);
+        let mut sessions = Vec::new();
+        for (name, activity) in [
+            ("asks", Activity::Waiting),
+            ("busy", Activity::Working),
+            ("finished", Activity::Done),
+            ("resting", Activity::Idle),
+        ] {
+            let mut session = session(name, State::Running);
+            session.activity = Some(activity);
+            sessions.push(session);
+        }
+        app.set_sessions(sessions);
+        let text = screen_text(&app);
+        assert!(text[1].contains("▲ asks waiting"));
+        assert!(text[2].contains("◐ busy working"));
+        assert!(text[3].contains("✓ finished done"));
+        assert!(text[4].contains("▶ resting "));
     }
 
     #[test]

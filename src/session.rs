@@ -1,6 +1,6 @@
 //! A program running in a PTY of its own.
 
-use crate::protocol::{SessionInfo, State};
+use crate::protocol::{Activity, AgentEvent, SessionInfo, State};
 use anyhow::Result;
 use portable_pty::{CommandBuilder, ExitStatus, MasterPty, PtySize, native_pty_system};
 use std::collections::BTreeMap;
@@ -21,23 +21,31 @@ const VIEWER_BACKLOG: usize = 256;
 
 pub struct Session {
     pub name: String,
+    /// As it was asked for, which is how `ls` shows it.
     command: Vec<String>,
     cwd: PathBuf,
     pid: Option<u32>,
     state: Arc<Mutex<State>>,
+    /// `None` until an agent reports what it's doing; most programs never
+    /// do.
+    activity: Option<Activity>,
     term: Arc<Term>,
 }
 
 impl Session {
+    /// Starts `argv` in a PTY of its own. `command` is what was asked for;
+    /// `argv` may add to it, like the flags that make an agent report what
+    /// it's doing.
     pub fn spawn(
         name: String,
         command: Vec<String>,
+        argv: &[String],
         cwd: PathBuf,
         env: &BTreeMap<String, String>,
     ) -> Result<Session> {
         let pty = native_pty_system().openpty(size(24, 80))?;
-        let mut builder = CommandBuilder::new(&command[0]);
-        builder.args(&command[1..]);
+        let mut builder = CommandBuilder::new(&argv[0]);
+        builder.args(&argv[1..]);
         builder.cwd(&cwd);
         builder.env_clear();
         for (key, value) in env {
@@ -80,6 +88,7 @@ impl Session {
             cwd,
             pid,
             state,
+            activity: None,
             term,
         })
     }
@@ -95,6 +104,19 @@ impl Session {
             cwd: self.cwd.clone(),
             pid: self.pid,
             state: self.state.lock().unwrap().clone(),
+            activity: self.activity,
+        }
+    }
+
+    /// Works out what the agent is doing from what it just reported.
+    pub fn on_agent_event(&mut self, event: AgentEvent) {
+        self.activity = next_activity(self.activity, event, self.term.is_watched());
+    }
+
+    /// Someone has just looked at the session.
+    pub fn seen(&mut self) {
+        if self.activity == Some(Activity::Done) {
+            self.activity = Some(Activity::Idle);
         }
     }
 
@@ -165,6 +187,10 @@ impl Term {
             screen: snapshot,
             feed,
         }
+    }
+
+    pub fn is_watched(&self) -> bool {
+        !self.screen.lock().unwrap().viewers.is_empty()
     }
 
     pub fn unwatch(&self, id: u64) {
@@ -248,6 +274,27 @@ impl vt100::Callbacks for Replies {
     }
 }
 
+/// What a session's agent is doing after `event`, given what it was doing
+/// before and whether anyone is watching the session.
+fn next_activity(before: Option<Activity>, event: AgentEvent, watched: bool) -> Option<Activity> {
+    let after = match event {
+        AgentEvent::Started => Activity::Idle,
+        AgentEvent::TurnStarted | AgentEvent::ToolFinished => Activity::Working,
+        AgentEvent::Asking => Activity::Waiting,
+        AgentEvent::TurnEnded => Activity::Done,
+        // Only news if we thought it was still working: a turn the user
+        // cut short reports no end.
+        AgentEvent::StillIdle if before == Some(Activity::Working) => Activity::Done,
+        AgentEvent::StillIdle => return before,
+    };
+    // A turn that ends while someone's watching has been seen.
+    if after == Activity::Done && watched {
+        Some(Activity::Idle)
+    } else {
+        Some(after)
+    }
+}
+
 fn size(rows: u16, cols: u16) -> PtySize {
     PtySize {
         rows,
@@ -276,5 +323,44 @@ fn signal_group(pid: u32, signal: libc::c_int) {
     // hasn't been reaped yet, so the group id still belongs to it.
     unsafe {
         libc::kill(-(pid as libc::pid_t), signal);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use Activity::*;
+
+    fn after(before: Option<Activity>, event: AgentEvent) -> Option<Activity> {
+        next_activity(before, event, false)
+    }
+
+    #[test]
+    fn a_turn_goes_from_working_to_done() {
+        assert_eq!(after(None, AgentEvent::Started), Some(Idle));
+        assert_eq!(after(Some(Idle), AgentEvent::TurnStarted), Some(Working));
+        assert_eq!(after(Some(Working), AgentEvent::TurnEnded), Some(Done));
+    }
+
+    #[test]
+    fn a_question_waits_until_the_agent_goes_on() {
+        assert_eq!(after(Some(Working), AgentEvent::Asking), Some(Waiting));
+        assert_eq!(
+            after(Some(Waiting), AgentEvent::ToolFinished),
+            Some(Working)
+        );
+    }
+
+    #[test]
+    fn a_turn_that_ends_while_watched_is_already_seen() {
+        let activity = next_activity(Some(Working), AgentEvent::TurnEnded, true);
+        assert_eq!(activity, Some(Idle));
+    }
+
+    #[test]
+    fn sitting_idle_ends_a_turn_that_never_reported_its_end() {
+        assert_eq!(after(Some(Working), AgentEvent::StillIdle), Some(Done));
+        assert_eq!(after(Some(Idle), AgentEvent::StillIdle), Some(Idle));
+        assert_eq!(after(Some(Waiting), AgentEvent::StillIdle), Some(Waiting));
     }
 }

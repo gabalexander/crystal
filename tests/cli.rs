@@ -3,7 +3,7 @@
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -656,4 +656,113 @@ fn the_tui_needs_a_terminal() {
     let crystal = Crystal::new();
     assert!(crystal.fails(&[]).contains("crystal needs a terminal"));
     assert!(!crystal.socket.exists());
+}
+
+/// A stand-in for Claude Code: a `claude` that writes down the arguments
+/// it was started with, one per line, and waits. Returns the directory to
+/// put on the PATH.
+fn fake_claude(dir: &Path) -> PathBuf {
+    let bin = dir.join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let claude = bin.join("claude");
+    std::fs::write(
+        &claude,
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > args\nsleep 30\n",
+    )
+    .unwrap();
+    let mut permissions = std::fs::metadata(&claude).unwrap().permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+    std::fs::set_permissions(&claude, permissions).unwrap();
+    bin
+}
+
+/// Runs a hook command the way Claude Code does: through a shell, in the
+/// session's environment, with the event on stdin. A hook must succeed and
+/// print nothing.
+fn run_hook(crystal: &Crystal, session: &str, hook: &str, event: &str) {
+    let mut child = Command::new("sh")
+        .arg("-c")
+        .arg(hook)
+        .env("CRYSTAL_SESSION", session)
+        .env("CRYSTAL_SOCKET", &crystal.socket)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(event.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success(), "the hook failed for {event}");
+    assert!(out.stdout.is_empty(), "the hook printed for {event}");
+}
+
+#[test]
+fn claude_reports_what_it_is_doing_through_its_hooks() {
+    let crystal = Crystal::new();
+    let bin = fake_claude(crystal.dir.path());
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let out = crystal
+        .command(&["new", "-n", "agent", "claude", "--resume"])
+        .env("PATH", path)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(crystal.row("agent").unwrap()[4], "claude --resume");
+
+    // crystal added its hooks ahead of the arguments it was given.
+    let args = written(&crystal.dir.path().join("args"));
+    let args: Vec<&str> = args.lines().collect();
+    assert_eq!(args[0], "--settings");
+    assert_eq!(args[2], "--resume");
+    let settings: serde_json::Value = serde_json::from_str(args[1]).unwrap();
+    let hook = settings["hooks"]["Stop"][0]["hooks"][0]["command"]
+        .as_str()
+        .unwrap();
+
+    let steps = [
+        (
+            r#"{"hook_event_name":"SessionStart","source":"startup"}"#,
+            "idle",
+        ),
+        (r#"{"hook_event_name":"UserPromptSubmit"}"#, "working"),
+        (r#"{"hook_event_name":"PermissionRequest"}"#, "waiting"),
+        (r#"{"hook_event_name":"PostToolUse"}"#, "working"),
+        (r#"{"hook_event_name":"Stop"}"#, "done"),
+    ];
+    for (event, status) in steps {
+        run_hook(&crystal, "agent", hook, event);
+        assert_eq!(crystal.row("agent").unwrap()[1], status, "after {event}");
+    }
+
+    // Looking at a finished turn marks it seen.
+    let mut terminal = crystal.attach(&["attach", "agent"]);
+    terminal.type_keys("\x1c");
+    assert!(terminal.exit());
+    assert_eq!(crystal.row("agent").unwrap()[1], "idle");
+}
+
+#[test]
+fn a_hook_outside_a_session_does_nothing_quietly() {
+    let crystal = Crystal::new();
+    let mut child = crystal
+        .command(&["hook", "claude"])
+        .env_remove("CRYSTAL_SESSION")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(br#"{"hook_event_name":"Stop"}"#)
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success());
+    assert!(out.stdout.is_empty());
+    assert!(!crystal.socket.exists(), "a hook never starts the daemon");
 }

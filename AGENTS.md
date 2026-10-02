@@ -27,7 +27,11 @@ Run lint, format and tests before every commit.
   - `screen_widget.rs`: draws a vt100 screen into ratatui
   - `keys.rs`: turns crossterm keys back into the bytes a terminal sends
 - `src/daemon.rs`: the daemon: listens on the socket and owns the sessions
+- `src/agents.rs`: what crystal knows about particular agents: the hooks it adds to Claude Code, and what they mean
+- `src/hook.rs`: `crystal hook <agent>`: what those hooks run, to tell the daemon
 - `src/session.rs`: one program in a PTY: spawn, exit status, stop, and its screen (vt100) and viewers
 - `src/protocol.rs`: requests and responses, one JSON line each, and the frames an attached client sends
 - `src/socket.rs`: where the socket lives
+- `src/env.rs`: the environment a session's program starts with
+- `src/shell.rs`: quoting arguments the way a shell reads them
 - `tests/cli.rs`: end-to-end tests that drive the real binary against a private daemon

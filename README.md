@@ -63,6 +63,20 @@ a pane beside it.
 While you're typing into a session, every key goes to it except `Ctrl+\`, which takes you back to the
 sidebar.
 
+Each row says what its session is doing. Sessions waiting on you move to the top.
+
+| Mark | Meaning |
+|---|---|
+| `▲` waiting | the agent is asking you something, like a permission |
+| `◐` working | the agent is working on a turn |
+| `✓` done | the agent finished its turn, and you haven't looked yet |
+| `▶` | running: an agent at its prompt, or any other program |
+| `■` | ended, with how it exited |
+
+crystal knows what Claude Code is doing from its hooks. It adds them with `--settings` when it starts
+`claude`, so your settings files are left alone and your own hooks still run. Other agents show as running
+for now.
+
 Everything is also a command, for scripts and for agents:
 
 ```sh
@@ -77,7 +91,8 @@ crystal kill-server                         # stop every session, and the daemon
 ```
 $ crystal ls
 NAME    STATE     PID    DIRECTORY   COMMAND
-claude  running   41210  ~/code/app  claude
+claude  waiting   41210  ~/code/app  claude
+docs    done      41377  ~/code/app  claude
 review  exited 0  41388  ~/code/app  codex
 ```
 
@@ -104,7 +119,8 @@ commands talk to it over a unix socket, so closing the TUI never stops an agent.
 - [x] Daemon that runs an agent in a PTY and keeps it alive
 - [x] Attach and detach
 - [x] Session list in a sidebar
-- [ ] Session status, from agent hooks first, then from the screen
+- [x] Session status from Claude Code's hooks
+- [ ] Session status from the screen, for agents without hooks
 - [ ] Projects and worktrees
 - [ ] Resume after a restart
 - [ ] Split panes

@@ -4,7 +4,7 @@
 //! every state change testable on its own.
 
 use super::keys;
-use crate::protocol::{SessionInfo, State};
+use crate::protocol::{Activity, SessionInfo, State};
 use crossterm::event::{KeyCode, KeyEvent};
 
 /// Where the keyboard goes.
@@ -88,10 +88,14 @@ impl App {
         }
     }
 
-    /// Takes a fresh list from the daemon. The selected session stays
-    /// selected wherever it moved to; if it's gone, the selection stays at
-    /// the same place in the list, or the end of it.
-    pub fn set_sessions(&mut self, sessions: Vec<SessionInfo>) {
+    /// Takes a fresh list from the daemon, with the sessions waiting on the
+    /// user moved to the top. The selected session stays selected wherever
+    /// it moved to; if it's gone, the selection stays at the same place in
+    /// the list, or the end of it.
+    pub fn set_sessions(&mut self, mut sessions: Vec<SessionInfo>) {
+        // A stable sort: false comes before true, and otherwise the order
+        // the sessions were made in is kept.
+        sessions.sort_by_key(|session| session.activity != Some(Activity::Waiting));
         let selected_name = self.selected().map(|session| session.name.clone());
         self.sessions = sessions;
         let still_there = selected_name.and_then(|name| self.position(&name));
@@ -184,6 +188,7 @@ mod tests {
             cwd: PathBuf::from("/"),
             pid: Some(1),
             state: State::Running,
+            activity: None,
         }
     }
 
@@ -288,6 +293,16 @@ mod tests {
         assert_eq!(app.notice(), Some("no session named b"));
         press(&mut app, KeyCode::Char('j'));
         assert_eq!(app.notice(), None);
+    }
+
+    #[test]
+    fn sessions_waiting_on_the_user_come_first() {
+        let mut waiting = session("asks");
+        waiting.activity = Some(Activity::Waiting);
+        let mut app = App::new(None);
+        app.set_sessions(vec![session("a"), session("b"), waiting]);
+        let names: Vec<&str> = app.sessions().iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["asks", "a", "b"]);
     }
 
     #[test]

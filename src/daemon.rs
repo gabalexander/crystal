@@ -2,6 +2,7 @@
 //! terminal it was started from, so sessions keep running when the
 //! client goes away.
 
+use crate::agents;
 use crate::env;
 use crate::protocol::{self, Frame, NewSession, Request, Response};
 use crate::session::{STOP_GRACE, Session, Term};
@@ -84,15 +85,15 @@ impl Daemon {
     }
 
     /// The session called `name`, or the newest one.
+    /// The session called `name`, or the newest one, for a client about to
+    /// show it. That counts as having seen it.
     fn find(&self, name: Option<&str>) -> Result<(String, Arc<Term>)> {
-        let sessions = self.sessions.lock().unwrap();
+        let mut sessions = self.sessions.lock().unwrap();
         let session = match name {
-            Some(name) => sessions
-                .iter()
-                .find(|session| session.name == name)
-                .with_context(|| format!("no session named {name}"))?,
-            None => sessions.last().context("there are no sessions")?,
+            Some(name) => named(&mut sessions, name)?,
+            None => sessions.last_mut().context("there are no sessions")?,
         };
+        session.seen();
         Ok((session.name.clone(), session.term()))
     }
 
@@ -105,6 +106,11 @@ impl Daemon {
                 Ok(Response::Sessions {
                     sessions: sessions.iter().map(Session::info).collect(),
                 })
+            }
+            Request::Report { name, event } => {
+                let mut sessions = self.sessions.lock().unwrap();
+                named(&mut sessions, &name)?.on_agent_event(event);
+                Ok(Response::Done)
             }
             Request::Kill { name } => {
                 let mut sessions = self.sessions.lock().unwrap();
@@ -157,10 +163,19 @@ impl Daemon {
             None => unique_name(program, taken),
         };
         let env = env::for_session(&env, &name, &self.socket);
-        let session = Session::spawn(name.clone(), command, cwd, &env)?;
+        let crystal = std::env::current_exe()?;
+        let argv = agents::argv(&command, &crystal);
+        let session = Session::spawn(name.clone(), command, &argv, cwd, &env)?;
         sessions.push(session);
         Ok(Response::Created { name })
     }
+}
+
+fn named<'a>(sessions: &'a mut [Session], name: &str) -> Result<&'a mut Session> {
+    sessions
+        .iter_mut()
+        .find(|session| session.name == name)
+        .with_context(|| format!("no session named {name}"))
 }
 
 /// Shows a session to a client until either of them goes: first the screen

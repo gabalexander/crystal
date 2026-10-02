@@ -18,6 +18,11 @@ pub enum Request {
     Kill {
         name: String,
     },
+    /// Something the agent in a session did, sent by its hooks.
+    Report {
+        name: String,
+        event: AgentEvent,
+    },
     /// With no name, the newest session.
     Attach {
         name: Option<String>,
@@ -65,6 +70,8 @@ pub struct SessionInfo {
     pub cwd: PathBuf,
     pub pid: Option<u32>,
     pub state: State,
+    /// `None` for a program that doesn't report what it's doing.
+    pub activity: Option<Activity>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -73,6 +80,50 @@ pub enum State {
     Running,
     Exited { code: u32 },
     Signaled { signal: String },
+}
+
+/// What an agent's hooks report, in terms that fit any agent. The daemon
+/// works out the session's [`Activity`] from these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentEvent {
+    /// The agent is up and waiting for its first prompt.
+    Started,
+    TurnStarted,
+    /// A tool call finished, so the agent is back to work, say after the
+    /// user allowed it.
+    ToolFinished,
+    /// The agent is asking the user something: a permission, a question.
+    Asking,
+    TurnEnded,
+    /// The agent has sat at its prompt for a while.
+    StillIdle,
+}
+
+/// What the agent in a session is doing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Activity {
+    /// Working on a turn.
+    Working,
+    /// Stopped until the user answers it, say a permission prompt.
+    Waiting,
+    /// Finished its turn, and nobody has looked at it since.
+    Done,
+    /// Finished its turn, and it has been seen.
+    Idle,
+}
+
+impl fmt::Display for Activity {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let name = match self {
+            Activity::Working => "working",
+            Activity::Waiting => "waiting",
+            Activity::Done => "done",
+            Activity::Idle => "idle",
+        };
+        f.write_str(name)
+    }
 }
 
 impl fmt::Display for State {
