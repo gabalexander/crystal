@@ -15,6 +15,22 @@ roadmap.
 
 Run lint, format and tests before every commit.
 
+## Releasing
+
+Releases are built by `.github/workflows/release.yml`, for macOS (Apple silicon and Intel) and Linux (x86_64
+and ARM, static with musl), and installed by `install.sh`.
+
+1. Set the new version in `Cargo.toml`, run `cargo build` so `Cargo.lock` follows, and commit both:
+   `chore: release 0.2.0`.
+2. Optionally try the build first: `gh workflow run release.yml`, then check the run builds every target.
+3. Tag the commit with the same version and push the tag: `git tag v0.2.0 && git push origin v0.2.0`. The
+   workflow checks the tag against `Cargo.toml`, builds each target, and publishes the GitHub release with
+   the archives and their checksums.
+
+The daemon refuses requests from a crystal of another version (except a shutdown), so a user who upgrades is
+told to run `crystal restart-server` rather than getting odd errors. Keep `Request::Shutdown` exactly as it
+is: it's the one request every version must understand.
+
 ## Layout
 
 - `src/main.rs`: the CLI (clap) and how it prints

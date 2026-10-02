@@ -42,7 +42,17 @@ worktrees. The agents keep working after you close it, and you can always see wh
 
 ## Install
 
-There are no releases yet. Build from source with Rust 1.88 or newer:
+On macOS or Linux, on Apple silicon, Intel or ARM:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/gabalexander/crystal/master/install.sh | sh
+```
+
+It downloads the latest release, checks it against its checksum, and puts `crystal` in `~/.local/bin`.
+`CRYSTAL_VERSION=0.1.0` picks a release, and `CRYSTAL_INSTALL_DIR` another directory. The Linux builds are
+static, so they run on any distribution.
+
+Or build it from source, with Rust 1.88 or newer:
 
 ```sh
 git clone https://github.com/gabalexander/crystal
@@ -54,8 +64,9 @@ or `cargo install --git https://github.com/gabalexander/crystal`.
 
 There's one binary: crystal starts its daemon in the background, from the same binary, the first time it's
 needed. A daemon that's already running goes on running the old crystal until it's restarted, so after
-upgrading, run `crystal restart-server` (`make install` does it for you). Running sessions come back: Claude
-Code in its conversation, other programs from the start.
+upgrading, run `crystal restart-server` (the install script and `make install` do it for you). Running
+sessions come back: Claude Code in its conversation, other programs from the start. A crystal that finds a
+daemon of another version says so, rather than misunderstanding it.
 
 ## Usage
 
