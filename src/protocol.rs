@@ -42,7 +42,12 @@ pub enum Request {
         rows: u16,
         cols: u16,
     },
-    Shutdown,
+    /// Stop the daemon. With `keep_sessions`, the running sessions stay
+    /// written down, so that the next daemon starts them again.
+    Shutdown {
+        #[serde(default)]
+        keep_sessions: bool,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]

@@ -6,10 +6,12 @@ roadmap.
 
 ## Commands
 
-- Build: `cargo build`
-- Test: `cargo test`
-- Lint: `cargo clippy --all-targets -- -D warnings`
+- Build: `make build` (`cargo build`)
+- Test: `make test` (`cargo test`)
+- Lint: `make lint` (`cargo fmt --check` and `cargo clippy --all-targets -- -D warnings`)
 - Format: `cargo fmt`
+- Install: `make install`: a release build into `~/.local/bin`, then `crystal restart-server` so a running
+  daemon picks it up
 
 Run lint, format and tests before every commit.
 

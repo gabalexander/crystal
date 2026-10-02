@@ -89,7 +89,7 @@ impl Daemon {
                 Err(err) => Ok(protocol::send(&conn, &Response::from(err))?),
             };
         }
-        let shutdown = matches!(request, Request::Shutdown);
+        let shutdown = matches!(request, Request::Shutdown { .. });
         let response = self.handle(request).unwrap_or_else(Response::from);
         protocol::send(&conn, &response)?;
         if shutdown {
@@ -209,7 +209,14 @@ impl Daemon {
                 let rows = named(&mut sessions, &name)?.term().rows();
                 Ok(Response::Screen { rows })
             }
-            Request::Shutdown => {
+            // Leaving is enough: the sessions' terminals close with the
+            // daemon, and the list of them stays as it was last written.
+            Request::Shutdown {
+                keep_sessions: true,
+            } => Ok(Response::Done),
+            Request::Shutdown {
+                keep_sessions: false,
+            } => {
                 let sessions = std::mem::take(&mut *self.sessions.lock().unwrap());
                 for session in &sessions {
                     session.stop();

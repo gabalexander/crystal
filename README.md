@@ -45,8 +45,17 @@ worktrees. The agents keep working after you close it, and you can always see wh
 There are no releases yet. Build from source with Rust 1.88 or newer:
 
 ```sh
-cargo install --git https://github.com/gabalexander/crystal
+git clone https://github.com/gabalexander/crystal
+cd crystal
+make install    # into ~/.local/bin; make install PREFIX=/usr/local for /usr/local/bin
 ```
+
+or `cargo install --git https://github.com/gabalexander/crystal`.
+
+There's one binary: crystal starts its daemon in the background, from the same binary, the first time it's
+needed. A daemon that's already running goes on running the old crystal until it's restarted, so after
+upgrading, run `crystal restart-server` (`make install` does it for you). Running sessions come back: Claude
+Code in its conversation, other programs from the start.
 
 ## Usage
 
@@ -107,6 +116,7 @@ crystal wait review                         # block until its agent stops workin
 crystal read review --lines 20              # print the last 20 rows of its screen
 crystal kill review                         # stop one session
 crystal kill-server                         # stop every session, and the daemon
+crystal restart-server                      # restart the daemon, say after an upgrade; sessions come back
 ```
 
 ```
@@ -179,11 +189,10 @@ commands talk to it over a unix socket, so closing the TUI never stops an agent.
 ## Development
 
 ```sh
-git clone https://github.com/gabalexander/crystal
-cd crystal
-cargo build
-cargo test
-cargo clippy --all-targets -- -D warnings
+make build      # cargo build
+make test       # cargo test
+make lint       # cargo fmt --check, and clippy with warnings as errors
+make install    # a release build into ~/.local/bin, and the daemon restarted on it
 ```
 
 If you're an AI agent working on this repository, read [`AGENTS.md`](AGENTS.md) before making changes.

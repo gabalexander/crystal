@@ -121,6 +121,10 @@ enum Command {
     Kill { name: String },
     /// Stop every session and the daemon.
     KillServer,
+    /// Restart the daemon on this crystal, say after installing a new one.
+    /// Running sessions come back: Claude Code in its conversation, other
+    /// programs from the start.
+    RestartServer,
     /// Run the daemon in the foreground.
     #[command(hide = true)]
     Daemon,
@@ -194,8 +198,18 @@ fn run(cli: Cli) -> Result<()> {
             }
         }
         Command::KillServer => {
-            if client::ask(&socket, &Request::Shutdown, false)?.is_none() {
+            let shutdown = Request::Shutdown {
+                keep_sessions: false,
+            };
+            if client::ask(&socket, &shutdown, false)?.is_none() {
                 no_daemon(&socket)?;
+            }
+        }
+        Command::RestartServer => {
+            if client::restart_daemon(&socket)? {
+                println!("restarted the daemon");
+            } else {
+                println!("no daemon was running");
             }
         }
         Command::Daemon => daemon::run(&socket)?,

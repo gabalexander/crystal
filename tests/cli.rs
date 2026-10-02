@@ -1415,3 +1415,27 @@ fn each_pane_sizes_its_own_session() {
         size_of("left") == (27, 84) && size_of("right") == (27, 84)
     });
 }
+
+#[test]
+fn restart_server_brings_the_running_sessions_back() {
+    let crystal = Crystal::new();
+    crystal.ok(&["new", "-n", "keeper", "sleep", "300"]);
+    eventually("the session is saved", || {
+        crystal.saved().contains("keeper")
+    });
+    let old_pid = crystal.pid("keeper");
+
+    assert_eq!(crystal.ok(&["restart-server"]), "restarted the daemon\n");
+    assert_eq!(crystal.row("keeper").unwrap()[1], "running");
+    assert_ne!(crystal.pid("keeper"), old_pid);
+    eventually("the old program has gone with its daemon", || {
+        !alive(old_pid)
+    });
+}
+
+#[test]
+fn restart_server_without_a_daemon_starts_nothing() {
+    let crystal = Crystal::new();
+    assert_eq!(crystal.ok(&["restart-server"]), "no daemon was running\n");
+    assert!(!crystal.socket.exists());
+}

@@ -58,6 +58,30 @@ pub fn new_session(
     }
 }
 
+/// Stops the daemon, keeping its list of running sessions, and starts a
+/// new one from this program, which starts those sessions again. That's
+/// how a newly installed crystal takes over: until then, the daemon goes on
+/// running the program it was started from. Returns `false` when there was
+/// no daemon to restart.
+pub fn restart_daemon(socket: &Path) -> Result<bool> {
+    let shutdown = Request::Shutdown {
+        keep_sessions: true,
+    };
+    if ask(socket, &shutdown, false)?.is_none() {
+        return Ok(false);
+    }
+    // The old daemon takes its socket away as it goes.
+    let deadline = Instant::now() + START_TIMEOUT;
+    while socket.exists() {
+        if Instant::now() > deadline {
+            bail!("the old daemon didn't stop");
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    start_daemon(socket)?;
+    Ok(true)
+}
+
 fn start_daemon(socket: &Path) -> Result<UnixStream> {
     socket::prepare_dir(socket)?;
     let log_path = socket::log_path(socket);
