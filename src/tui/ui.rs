@@ -3,9 +3,12 @@
 //! changes it.
 
 use super::app::{App, Focus};
+use super::groups::Row;
 use super::pane::Pane;
 use super::screen_widget::ScreenWidget;
+use super::text_input::TextInput;
 use crate::protocol::{Activity, SessionInfo, State};
+use crate::shell;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
@@ -52,16 +55,41 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect) {
     let block = Block::bordered()
         .title(" sessions ")
         .border_style(border_style(app.focus() == Focus::Sidebar));
-    let rows: Vec<ListItem> = app
-        .sessions()
+    let rows = app.rows();
+    let items: Vec<ListItem> = rows
         .iter()
-        .map(|session| ListItem::new(session_row(session)))
+        .map(|row| ListItem::new(sidebar_row(app, row)))
         .collect();
-    let list = List::new(rows)
+    // The selection is a session; find the row it's drawn on.
+    let selected = app
+        .selected_index()
+        .and_then(|index| rows.iter().position(|row| *row == Row::Session(index)));
+    let list = List::new(items)
         .block(block)
         .highlight_style(Style::new().add_modifier(Modifier::REVERSED));
-    let mut state = ListState::default().with_selected(app.selected_index());
+    let mut state = ListState::default().with_selected(selected);
     frame.render_stateful_widget(list, area, &mut state);
+}
+
+/// One row of the sidebar. Headings name a project, then a worktree's
+/// branch (`⌂` for the main worktree, `⎇` for a linked one); the sessions
+/// sit indented under them.
+fn sidebar_row<'a>(app: &'a App, row: &Row) -> Line<'a> {
+    match row {
+        Row::Project(name) => Line::from(name.clone()).bold(),
+        Row::OutsideGit => Line::from("outside git").bold().dark_gray(),
+        Row::Worktree { branch, main } => {
+            let mark = if *main { "⌂ " } else { "⎇ " };
+            let branch = branch.as_deref().unwrap_or("(detached)").to_string();
+            Line::from(vec!["  ".into(), mark.dark_gray(), branch.into()])
+        }
+        Row::Directory(dir) => Line::from(format!("  {}", shell::home_relative(dir))).dark_gray(),
+        Row::Session(index) => {
+            let mut line = session_row(&app.sessions()[*index]);
+            line.spans.insert(0, "    ".into());
+            line
+        }
+    }
 }
 
 /// A session's row: a mark for what it's doing, its name, and a word on
@@ -135,14 +163,31 @@ fn draw_message(frame: &mut Frame, message: &str, area: Rect) {
 }
 
 fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
+    if let Some(input) = app.branch_prompt() {
+        draw_branch_prompt(frame, input, area);
+        return;
+    }
     let footer = if let Some(notice) = app.notice() {
         Line::from(notice.to_string()).red()
     } else if app.focus() == Focus::Pane {
         Line::from("typing into the session · ctrl+\\ back to the list").dark_gray()
     } else {
-        Line::from("j/k select · enter type into it · n new shell · x kill · q quit").dark_gray()
+        Line::from(
+            "j/k select · enter type into it · n new shell · w new worktree · x kill · q quit",
+        )
+        .dark_gray()
     };
     frame.render_widget(footer, area);
+}
+
+/// Asks for the new worktree's branch, with the cursor in the answer.
+fn draw_branch_prompt(frame: &mut Frame, input: &TextInput, area: Rect) {
+    const QUESTION: &str = "branch for the new worktree: ";
+    let line = Line::from(vec![QUESTION.cyan(), input.text().into()]);
+    frame.render_widget(line, area);
+    // The question is plain ASCII, so its length in bytes is its width.
+    let column = area.x + (QUESTION.len() + input.cursor()) as u16;
+    frame.set_cursor_position((column.min(area.right().saturating_sub(1)), area.y));
 }
 
 /// The focused part stands out; the other fades.
@@ -157,6 +202,8 @@ fn border_style(focused: bool) -> Style {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::Worktree;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use std::path::PathBuf;
@@ -183,7 +230,14 @@ mod tests {
             pid: Some(1),
             state,
             activity: None,
+            worktree: None,
         }
+    }
+
+    /// The number of the first line that holds `text`.
+    fn line_with(lines: &[String], text: &str) -> usize {
+        let found = lines.iter().position(|line| line.contains(text));
+        found.unwrap_or_else(|| panic!("{text:?} isn't on screen:\n{}", lines.join("\n")))
     }
 
     #[test]
@@ -202,8 +256,7 @@ mod tests {
             session("codex", State::Exited { code: 1 }),
         ]);
         let text = screen_text(&app);
-        assert!(text[1].contains("▶ claude"));
-        assert!(text[2].contains("■ codex exited 1"));
+        assert!(line_with(&text, "▶ claude") < line_with(&text, "■ codex exited 1"));
         assert!(text[0].contains(" claude "), "the pane is titled after it");
     }
 
@@ -223,10 +276,54 @@ mod tests {
         }
         app.set_sessions(sessions);
         let text = screen_text(&app);
-        assert!(text[1].contains("▲ asks waiting"));
-        assert!(text[2].contains("◐ busy working"));
-        assert!(text[3].contains("✓ finished done"));
-        assert!(text[4].contains("▶ resting "));
+        line_with(&text, "▲ asks waiting");
+        line_with(&text, "◐ busy working");
+        line_with(&text, "✓ finished done");
+        line_with(&text, "▶ resting ");
+    }
+
+    #[test]
+    fn sessions_sit_under_their_project_and_worktree() {
+        let in_worktree = |name: &str, branch: &str, main: bool| SessionInfo {
+            worktree: Some(Worktree {
+                project: "app".into(),
+                project_path: PathBuf::from("/code/app"),
+                path: PathBuf::from(format!("/code/app/{branch}")),
+                main,
+                branch: Some(branch.into()),
+            }),
+            ..session(name, State::Running)
+        };
+        let mut app = App::new(None);
+        app.set_sessions(vec![
+            in_worktree("fixer", "fix", false),
+            in_worktree("planner", "main", true),
+            session("shell", State::Running),
+        ]);
+        let text = screen_text(&app);
+        let order = [
+            line_with(&text, "│app"),
+            line_with(&text, "⌂ main"),
+            line_with(&text, "▶ planner"),
+            line_with(&text, "⎇ fix"),
+            line_with(&text, "▶ fixer"),
+            line_with(&text, "outside git"),
+            line_with(&text, "▶ shell"),
+        ];
+        assert!(
+            order.is_sorted(),
+            "out of order: {order:?}\n{}",
+            text.join("\n")
+        );
+    }
+
+    #[test]
+    fn the_branch_prompt_takes_the_footer() {
+        let mut app = App::new(None);
+        app.on_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        let text = screen_text(&app);
+        assert!(text[11].contains("branch for the new worktree: x"));
     }
 
     #[test]

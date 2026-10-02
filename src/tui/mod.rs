@@ -6,13 +6,15 @@
 //! The loop takes each event, updates the state, and draws.
 
 mod app;
+mod groups;
 mod keys;
 mod pane;
 mod screen_widget;
+mod text_input;
 mod ui;
 
 use crate::protocol::{Request, Response, SessionInfo};
-use crate::{client, env};
+use crate::{client, env, git};
 use anyhow::{Result, bail};
 use app::{Action, App};
 use crossterm::event::{Event as TerminalEvent, KeyEvent, KeyEventKind};
@@ -135,12 +137,14 @@ impl Tui {
     fn perform(&mut self, action: Action) -> Result<()> {
         match action {
             Action::Quit => self.quitting = true,
-            Action::NewSession => {
-                let cwd = std::env::current_dir()?;
-                let name = client::new_session(&self.socket, None, cwd, Vec::new())?;
-                self.refresh_sessions()?;
-                self.app.select(&name);
-                self.app.type_into_selected();
+            Action::NewSession => self.start_shell(std::env::current_dir()?)?,
+            Action::NewWorktree { branch, base } => {
+                let base = match base {
+                    Some(base) => base,
+                    None => std::env::current_dir()?,
+                };
+                let worktree = git::add_worktree(&base, &branch)?;
+                self.start_shell(worktree)?;
             }
             Action::Kill(name) => {
                 client::ask(&self.socket, &Request::Kill { name }, false)?;
@@ -155,6 +159,16 @@ impl Tui {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Starts the user's shell in a new session in `cwd`, selects it, and
+    /// hands it the keyboard.
+    fn start_shell(&mut self, cwd: PathBuf) -> Result<()> {
+        let name = client::new_session(&self.socket, None, cwd, Vec::new())?;
+        self.refresh_sessions()?;
+        self.app.select(&name);
+        self.app.type_into_selected();
         Ok(())
     }
 

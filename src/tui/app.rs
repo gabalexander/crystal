@@ -3,9 +3,12 @@
 //! comes back as an [`Action`] for the event loop to carry out. That keeps
 //! every state change testable on its own.
 
+use super::groups::{self, Row};
 use super::keys;
-use crate::protocol::{Activity, SessionInfo, State};
+use super::text_input::TextInput;
+use crate::protocol::{SessionInfo, State};
 use crossterm::event::{KeyCode, KeyEvent};
+use std::path::PathBuf;
 
 /// Where the keyboard goes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,15 +25,24 @@ pub enum Action {
     Quit,
     /// Start a shell in a new session.
     NewSession,
+    /// Start a shell in a new worktree on `branch`, made in the repository
+    /// at `base`, or the TUI's own directory when that's `None`.
+    NewWorktree {
+        branch: String,
+        base: Option<PathBuf>,
+    },
     Kill(String),
     /// Send the key to the selected session.
     Type(KeyEvent),
 }
 
 pub struct App {
+    /// In the sidebar's order: see [`groups`].
     sessions: Vec<SessionInfo>,
     /// An index into `sessions`, kept in range while there are any.
     selected: usize,
+    /// The branch name being typed for a new worktree, while it's asked for.
+    branch_prompt: Option<TextInput>,
     focus: Focus,
     /// The session this TUI runs in, if it runs in one. The pane never
     /// shows it: it would be showing itself.
@@ -45,6 +57,7 @@ impl App {
         App {
             sessions: Vec::new(),
             selected: 0,
+            branch_prompt: None,
             focus: Focus::Sidebar,
             own_session,
             notice: None,
@@ -61,6 +74,16 @@ impl App {
 
     pub fn sessions(&self) -> &[SessionInfo] {
         &self.sessions
+    }
+
+    /// The sidebar's rows: the sessions under their projects and worktrees.
+    pub fn rows(&self) -> Vec<Row> {
+        groups::rows(&self.sessions)
+    }
+
+    /// The branch name typed so far, while a new worktree's is asked for.
+    pub fn branch_prompt(&self) -> Option<&TextInput> {
+        self.branch_prompt.as_ref()
     }
 
     pub fn focus(&self) -> Focus {
@@ -88,16 +111,13 @@ impl App {
         }
     }
 
-    /// Takes a fresh list from the daemon, with the sessions waiting on the
-    /// user moved to the top. The selected session stays selected wherever
-    /// it moved to; if it's gone, the selection stays at the same place in
-    /// the list, or the end of it.
-    pub fn set_sessions(&mut self, mut sessions: Vec<SessionInfo>) {
-        // A stable sort: false comes before true, and otherwise the order
-        // the sessions were made in is kept.
-        sessions.sort_by_key(|session| session.activity != Some(Activity::Waiting));
+    /// Takes a fresh list from the daemon and puts it in the sidebar's
+    /// order. The selected session stays selected wherever it moved to; if
+    /// it's gone, the selection stays at the same place in the list, or the
+    /// end of it.
+    pub fn set_sessions(&mut self, sessions: Vec<SessionInfo>) {
         let selected_name = self.selected().map(|session| session.name.clone());
-        self.sessions = sessions;
+        self.sessions = groups::order(sessions);
         let still_there = selected_name.and_then(|name| self.position(&name));
         if let Some(index) = still_there {
             self.selected = index;
@@ -124,6 +144,9 @@ impl App {
 
     pub fn on_key(&mut self, key: KeyEvent) -> Option<Action> {
         self.notice = None;
+        if self.branch_prompt.is_some() {
+            return self.on_prompt_key(key);
+        }
         match self.focus {
             Focus::Sidebar => self.on_sidebar_key(key),
             Focus::Pane => self.on_pane_key(key),
@@ -136,6 +159,7 @@ impl App {
             KeyCode::Char('k') | KeyCode::Up => self.move_selection(-1),
             KeyCode::Enter => self.type_into_selected(),
             KeyCode::Char('n') => return Some(Action::NewSession),
+            KeyCode::Char('w') => self.branch_prompt = Some(TextInput::default()),
             KeyCode::Char('x') => {
                 let name = self.selected()?.name.clone();
                 return Some(Action::Kill(name));
@@ -144,6 +168,42 @@ impl App {
             _ => {}
         }
         None
+    }
+
+    /// Keys while a branch name is asked for: Enter makes the worktree, Esc
+    /// gives up, and every other key edits the name.
+    fn on_prompt_key(&mut self, key: KeyEvent) -> Option<Action> {
+        match key.code {
+            KeyCode::Esc => {
+                self.branch_prompt = None;
+                None
+            }
+            KeyCode::Enter => {
+                let input = self.branch_prompt.take()?;
+                let branch = input.text().trim();
+                if branch.is_empty() {
+                    return None;
+                }
+                Some(Action::NewWorktree {
+                    branch: branch.to_string(),
+                    base: self.worktree_base(),
+                })
+            }
+            _ => {
+                if let Some(input) = &mut self.branch_prompt {
+                    input.on_key(&key);
+                }
+                None
+            }
+        }
+    }
+
+    /// Where a new worktree is made from: the selected session's project,
+    /// or `None` for the TUI's own directory when nothing in a repository
+    /// is selected.
+    fn worktree_base(&self) -> Option<PathBuf> {
+        let worktree = self.selected()?.worktree.as_ref()?;
+        Some(worktree.project_path.clone())
     }
 
     fn on_pane_key(&mut self, key: KeyEvent) -> Option<Action> {
@@ -178,8 +238,8 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::{Activity, Worktree};
     use crossterm::event::KeyModifiers;
-    use std::path::PathBuf;
 
     fn session(name: &str) -> SessionInfo {
         SessionInfo {
@@ -189,6 +249,7 @@ mod tests {
             pid: Some(1),
             state: State::Running,
             activity: None,
+            worktree: None,
         }
     }
 
@@ -318,5 +379,81 @@ mod tests {
             Some(Action::Kill("b".into()))
         );
         assert_eq!(press(&mut app, KeyCode::Char('q')), Some(Action::Quit));
+    }
+
+    fn in_project(name: &str, project: &str) -> SessionInfo {
+        SessionInfo {
+            worktree: Some(Worktree {
+                project: project.into(),
+                project_path: PathBuf::from(format!("/code/{project}")),
+                path: PathBuf::from(format!("/code/{project}")),
+                main: true,
+                branch: Some("main".into()),
+            }),
+            ..session(name)
+        }
+    }
+
+    fn type_text(app: &mut App, text: &str) {
+        for c in text.chars() {
+            press(app, KeyCode::Char(c));
+        }
+    }
+
+    #[test]
+    fn w_asks_for_a_branch_and_enter_makes_the_worktree_in_the_selected_project() {
+        let mut app = App::new(None);
+        app.set_sessions(vec![in_project("agent", "app")]);
+        press(&mut app, KeyCode::Char('w'));
+        type_text(&mut app, "fix/typo");
+        assert_eq!(app.branch_prompt().unwrap().text(), "fix/typo");
+
+        let action = press(&mut app, KeyCode::Enter);
+        assert_eq!(
+            action,
+            Some(Action::NewWorktree {
+                branch: "fix/typo".into(),
+                base: Some(PathBuf::from("/code/app")),
+            })
+        );
+        assert!(app.branch_prompt().is_none());
+    }
+
+    #[test]
+    fn keys_go_to_the_branch_prompt_while_it_is_open() {
+        let mut app = app_with(&["a", "b"]);
+        press(&mut app, KeyCode::Char('w'));
+        // q and x would quit and kill on the list; here they're letters.
+        type_text(&mut app, "qx");
+        assert_eq!(app.branch_prompt().unwrap().text(), "qx");
+        assert_eq!(selected_name(&app), Some("a"));
+    }
+
+    #[test]
+    fn esc_or_an_empty_name_gives_up_on_the_new_worktree() {
+        let mut app = app_with(&["a"]);
+        press(&mut app, KeyCode::Char('w'));
+        type_text(&mut app, "feat");
+        assert_eq!(press(&mut app, KeyCode::Esc), None);
+        assert!(app.branch_prompt().is_none());
+
+        press(&mut app, KeyCode::Char('w'));
+        type_text(&mut app, "  ");
+        assert_eq!(press(&mut app, KeyCode::Enter), None);
+        assert!(app.branch_prompt().is_none());
+    }
+
+    #[test]
+    fn outside_a_repository_the_worktree_is_made_from_the_tuis_directory() {
+        let mut app = app_with(&["shell"]);
+        press(&mut app, KeyCode::Char('w'));
+        type_text(&mut app, "feat");
+        assert_eq!(
+            press(&mut app, KeyCode::Enter),
+            Some(Action::NewWorktree {
+                branch: "feat".into(),
+                base: None,
+            })
+        );
     }
 }

@@ -4,6 +4,7 @@ mod attach;
 mod client;
 mod daemon;
 mod env;
+mod git;
 mod hook;
 mod protocol;
 mod session;
@@ -50,9 +51,20 @@ enum Command {
         #[arg(short, long)]
         detached: bool,
 
+        /// Start in a new git worktree on this branch, beside the
+        /// repository in <repo>.worktrees/. The branch is made if it
+        /// doesn't exist.
+        #[arg(short, long, value_name = "BRANCH")]
+        worktree: Option<String>,
+
         /// The command and its arguments.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
+    },
+    /// Work with git worktrees.
+    Worktree {
+        #[command(subcommand)]
+        command: WorktreeCommand,
     },
     /// List the sessions.
     #[command(visible_alias = "list")]
@@ -75,6 +87,17 @@ enum Command {
     Hook { agent: String },
 }
 
+#[derive(Subcommand)]
+enum WorktreeCommand {
+    /// Remove a worktree, given its directory or its branch. Refuses while
+    /// a session runs in it.
+    #[command(visible_alias = "remove")]
+    Rm {
+        /// The worktree's directory, or the branch it has checked out.
+        worktree: String,
+    },
+}
+
 fn main() -> ExitCode {
     match run(Cli::parse()) {
         Ok(()) => ExitCode::SUCCESS,
@@ -95,8 +118,12 @@ fn run(cli: Cli) -> Result<()> {
             name,
             cwd,
             detached,
+            worktree,
             command,
-        } => new_session(&socket, name, cwd, detached, command)?,
+        } => new_session(&socket, name, cwd, worktree, detached, command)?,
+        Command::Worktree {
+            command: WorktreeCommand::Rm { worktree },
+        } => remove_worktree(&socket, &worktree)?,
         Command::Attach { name } => attach::run(&socket, name.as_deref())?,
         Command::Ls => {
             if let Some(Response::Sessions { sessions }) =
@@ -125,13 +152,17 @@ fn new_session(
     socket: &Path,
     name: Option<String>,
     cwd: Option<PathBuf>,
+    worktree: Option<String>,
     detached: bool,
     command: Vec<String>,
 ) -> Result<()> {
-    let cwd = match cwd {
+    let mut cwd = match cwd {
         Some(cwd) => std::path::absolute(cwd)?,
         None => std::env::current_dir()?,
     };
+    if let Some(branch) = worktree {
+        cwd = git::add_worktree(&cwd, &branch)?;
+    }
     let name = client::new_session(socket, name, cwd, command)?;
 
     let in_a_terminal = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
@@ -143,6 +174,34 @@ fn new_session(
     }
 }
 
+/// Removes the worktree `target` names, unless sessions are still running
+/// in it: removing a directory out from under a program would leave it
+/// working on files that are gone.
+fn remove_worktree(socket: &Path, target: &str) -> Result<()> {
+    let path = git::find_worktree(&std::env::current_dir()?, target)?;
+    let sessions = match client::ask(socket, &Request::List, false)? {
+        Some(Response::Sessions { sessions }) => sessions,
+        _ => Vec::new(),
+    };
+    let running: Vec<&str> = sessions
+        .iter()
+        .filter(|session| session.state == State::Running && runs_in(session, &path))
+        .map(|session| session.name.as_str())
+        .collect();
+    if !running.is_empty() {
+        bail!("{} still running in {}", running.join(", "), path.display());
+    }
+    git::remove_worktree(&path)
+}
+
+/// Whether `session` runs in the worktree at `path`.
+fn runs_in(session: &SessionInfo, path: &Path) -> bool {
+    session
+        .worktree
+        .as_ref()
+        .is_some_and(|worktree| worktree.path == path)
+}
+
 fn no_daemon(socket: &Path) -> Result<()> {
     bail!("no daemon is running on {}", socket.display())
 }
@@ -151,20 +210,17 @@ fn print_sessions(sessions: &[SessionInfo]) {
     if sessions.is_empty() {
         return;
     }
-    let home = std::env::var("HOME").unwrap_or_default();
-    let rows: Vec<[String; 5]> = sessions
+    let rows: Vec<[String; 7]> = sessions
         .iter()
         .map(|session| {
-            let cwd = session.cwd.to_string_lossy();
-            let cwd = match cwd.strip_prefix(&home) {
-                Some(rest) if !home.is_empty() => format!("~{rest}"),
-                _ => cwd.into_owned(),
-            };
+            let (project, branch) = project_and_branch(session);
             [
                 session.name.clone(),
                 status(session),
                 session.pid.map_or("-".into(), |pid| pid.to_string()),
-                cwd,
+                project,
+                branch,
+                shell::home_relative(&session.cwd),
                 session
                     .command
                     .iter()
@@ -174,8 +230,17 @@ fn print_sessions(sessions: &[SessionInfo]) {
             ]
         })
         .collect();
-    let header = ["NAME", "STATE", "PID", "DIRECTORY", "COMMAND"].map(String::from);
-    let mut widths = [0; 5];
+    let header = [
+        "NAME",
+        "STATE",
+        "PID",
+        "PROJECT",
+        "BRANCH",
+        "DIRECTORY",
+        "COMMAND",
+    ]
+    .map(String::from);
+    let mut widths = [0; 7];
     for row in std::iter::once(&header).chain(&rows) {
         for (width, cell) in widths.iter_mut().zip(row) {
             *width = (*width).max(cell.chars().count());
@@ -188,6 +253,19 @@ fn print_sessions(sessions: &[SessionInfo]) {
             .map(|(cell, width)| format!("{cell:width$}"))
             .collect();
         println!("{}", line.join("  ").trim_end());
+    }
+}
+
+/// The project and branch a session runs in, for `ls`. Every cell holds a
+/// word, so a script can split the table on spaces: `-` outside a
+/// repository, and `(detached)` for a worktree on no branch.
+fn project_and_branch(session: &SessionInfo) -> (String, String) {
+    match &session.worktree {
+        Some(worktree) => {
+            let branch = worktree.branch.as_deref().unwrap_or("(detached)");
+            (worktree.project.clone(), branch.to_string())
+        }
+        None => ("-".into(), "-".into()),
     }
 }
 

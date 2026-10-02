@@ -29,7 +29,8 @@ impl Crystal {
             .arg("--socket")
             .arg(&self.socket)
             .args(args)
-            .current_dir(self.dir.path());
+            .current_dir(self.dir.path())
+            .envs(PLAIN_GIT);
         command
     }
 
@@ -100,6 +101,9 @@ impl Crystal {
         command.env_remove("CRYSTAL_SESSION");
         // So that a shell crystal starts is the same everywhere.
         command.env("SHELL", "/bin/sh");
+        for (key, value) in PLAIN_GIT {
+            command.env(key, value);
+        }
         let child = pty.slave.spawn_command(command).unwrap();
         drop(pty.slave);
 
@@ -189,6 +193,47 @@ fn size(rows: u16, cols: u16) -> PtySize {
     }
 }
 
+/// Keeps the machine's own git config, like signed commits or hooks, out of
+/// the git that tests and crystal run.
+const PLAIN_GIT: [(&str, &str); 2] = [
+    ("GIT_CONFIG_GLOBAL", "/dev/null"),
+    ("GIT_CONFIG_NOSYSTEM", "1"),
+];
+
+/// Runs git in `dir` the way the tests need it, failing the test if git
+/// fails, and returns what it printed.
+fn git(dir: &Path, args: &[&str]) -> String {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args([
+            "-c",
+            "user.name=crystal",
+            "-c",
+            "user.email=crystal@example.com",
+        ])
+        .args(args)
+        .envs(PLAIN_GIT)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout).unwrap()
+}
+
+/// Makes a git repository called `name` in `dir`, with one commit on
+/// `main`.
+fn git_repo(dir: &Path, name: &str) -> PathBuf {
+    let repo = dir.join(name);
+    std::fs::create_dir(&repo).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    git(&repo, &["commit", "-q", "--allow-empty", "-m", "first"]);
+    repo
+}
+
 /// Waits for a file a session writes, ended by a newline.
 fn written(file: &Path) -> String {
     eventually(&format!("{} is written", file.display()), || {
@@ -226,7 +271,7 @@ fn new_starts_the_daemon_and_the_session_shows_in_ls() {
 
     let row = crystal.row("agent").unwrap();
     assert_eq!(row[1], "running");
-    assert_eq!(row[4], "sleep 30");
+    assert_eq!(row[6], "sleep 30");
     assert!(alive(crystal.pid("agent")));
 }
 
@@ -252,7 +297,7 @@ fn ls_shows_how_a_session_ended() {
         crystal.row("fails").unwrap()[1] == "exited 3"
             && crystal.row("killed").unwrap()[1] == "killed (Terminated)"
     });
-    assert_eq!(crystal.row("fails").unwrap()[4], "sh -c 'exit 3'");
+    assert_eq!(crystal.row("fails").unwrap()[6], "sh -c 'exit 3'");
 }
 
 #[test]
@@ -711,7 +756,7 @@ fn claude_reports_what_it_is_doing_through_its_hooks() {
         .output()
         .unwrap();
     assert!(out.status.success());
-    assert_eq!(crystal.row("agent").unwrap()[4], "claude --resume");
+    assert_eq!(crystal.row("agent").unwrap()[6], "claude --resume");
 
     // crystal added its hooks ahead of the arguments it was given.
     let args = written(&crystal.dir.path().join("args"));
@@ -789,4 +834,178 @@ fn the_screen_says_what_an_agent_without_hooks_is_doing() {
         std::fs::write(crystal.dir.path().join(stage), "").unwrap();
         eventually(&format!("the agent is {expected}"), || status() == expected);
     }
+}
+
+/// The line number of the first line of `text` that holds `needle`.
+fn line_with(text: &str, needle: &str) -> usize {
+    let found = text.lines().position(|line| line.contains(needle));
+    found.unwrap_or_else(|| panic!("{needle:?} isn't on screen:\n{text}"))
+}
+
+#[test]
+fn ls_shows_the_project_and_branch_of_each_session() {
+    let crystal = Crystal::new();
+    let repo = git_repo(crystal.dir.path(), "app");
+    let repo_arg = repo.to_str().unwrap();
+    crystal.ok(&["new", "-n", "inside", "-c", repo_arg, "sleep", "30"]);
+    crystal.ok(&["new", "-n", "outside", "sleep", "30"]);
+
+    let inside = crystal.row("inside").unwrap();
+    assert_eq!((inside[3].as_str(), inside[4].as_str()), ("app", "main"));
+    let outside = crystal.row("outside").unwrap();
+    assert_eq!((outside[3].as_str(), outside[4].as_str()), ("-", "-"));
+
+    // A switch of branch shows straight away.
+    git(&repo, &["switch", "-q", "-c", "other"]);
+    assert_eq!(crystal.row("inside").unwrap()[4], "other");
+}
+
+#[test]
+fn new_with_a_worktree_starts_the_session_on_a_new_branch_beside_the_repo() {
+    let crystal = Crystal::new();
+    let repo = git_repo(crystal.dir.path(), "app");
+    crystal.ok(&[
+        "new",
+        "-n",
+        "fixer",
+        "-c",
+        repo.to_str().unwrap(),
+        "-w",
+        "fix/typo",
+        "sh",
+        "-c",
+        "pwd > where; sleep 30",
+    ]);
+
+    let worktree = crystal.dir.path().join("app.worktrees/fix-typo");
+    let started_in = written(&worktree.join("where"));
+    assert_eq!(
+        Path::new(started_in.trim()).canonicalize().unwrap(),
+        worktree.canonicalize().unwrap()
+    );
+    let row = crystal.row("fixer").unwrap();
+    assert_eq!((row[3].as_str(), row[4].as_str()), ("app", "fix/typo"));
+    assert!(git(&repo, &["branch", "--list", "fix/typo"]).contains("fix/typo"));
+}
+
+#[test]
+fn new_with_a_branch_that_exists_checks_it_out() {
+    let crystal = Crystal::new();
+    let repo = git_repo(crystal.dir.path(), "app");
+    git(&repo, &["branch", "older"]);
+    let repo_arg = repo.to_str().unwrap();
+    crystal.ok(&[
+        "new", "-n", "x", "-c", repo_arg, "-w", "older", "sleep", "30",
+    ]);
+
+    assert!(crystal.dir.path().join("app.worktrees/older").is_dir());
+    assert_eq!(crystal.row("x").unwrap()[4], "older");
+}
+
+#[test]
+fn new_with_a_worktree_needs_a_repository() {
+    let crystal = Crystal::new();
+    let err = crystal.fails(&["new", "-w", "feat", "sleep", "30"]);
+    assert!(err.contains("isn't in a git repository"), "{err}");
+    assert!(!crystal.socket.exists(), "nothing was started");
+}
+
+#[test]
+fn what_git_refuses_is_said_in_gits_words() {
+    let crystal = Crystal::new();
+    let repo = git_repo(crystal.dir.path(), "app");
+    let repo_arg = repo.to_str().unwrap();
+    let err = crystal.fails(&["new", "-c", repo_arg, "-w", "bad..name", "sleep", "30"]);
+    assert!(err.contains("not a valid branch name"), "{err}");
+}
+
+#[test]
+fn worktree_rm_waits_until_no_session_runs_in_it() {
+    let crystal = Crystal::new();
+    let repo = git_repo(crystal.dir.path(), "app");
+    let repo_arg = repo.to_str().unwrap();
+    crystal.ok(&[
+        "new", "-n", "fixer", "-c", repo_arg, "-w", "fix", "sleep", "30",
+    ]);
+    let worktree = crystal.dir.path().join("app.worktrees/fix");
+
+    // Named by its branch, from inside the repository.
+    let out = crystal
+        .command(&["worktree", "rm", "fix"])
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let err = String::from_utf8(out.stderr).unwrap();
+    assert!(err.contains("fixer still running in"), "{err}");
+    assert!(worktree.is_dir());
+
+    // Named by its directory, once its session is gone.
+    crystal.ok(&["kill", "fixer"]);
+    crystal.ok(&["worktree", "rm", "app.worktrees/fix"]);
+    assert!(!worktree.exists());
+}
+
+#[test]
+fn worktree_rm_keeps_work_that_isnt_committed() {
+    let crystal = Crystal::new();
+    let repo = git_repo(crystal.dir.path(), "app");
+    let repo_arg = repo.to_str().unwrap();
+    crystal.ok(&["new", "-n", "x", "-c", repo_arg, "-w", "fix", "true"]);
+    let worktree = crystal.dir.path().join("app.worktrees/fix");
+    std::fs::write(worktree.join("notes.txt"), "half done\n").unwrap();
+
+    let err = crystal.fails(&["worktree", "rm", "app.worktrees/fix"]);
+    assert!(err.contains("untracked"), "{err}");
+    assert!(worktree.join("notes.txt").exists());
+}
+
+#[test]
+fn the_tui_groups_sessions_by_project_then_worktree() {
+    let crystal = Crystal::new();
+    let repo = git_repo(crystal.dir.path(), "app");
+    let repo_arg = repo.to_str().unwrap();
+    crystal.ok(&[
+        "new", "-n", "fixer", "-c", repo_arg, "-w", "fix", "sleep", "30",
+    ]);
+    crystal.ok(&["new", "-n", "planner", "-c", repo_arg, "sleep", "30"]);
+    crystal.ok(&["new", "-n", "shell", "sleep", "30"]);
+
+    let tui = crystal.tui();
+    tui.shows("▶ shell");
+    let text = tui.text();
+    let order = [
+        line_with(&text, "│app"),
+        line_with(&text, "⌂ main"),
+        line_with(&text, "▶ planner"),
+        line_with(&text, "⎇ fix"),
+        line_with(&text, "▶ fixer"),
+        line_with(&text, "outside git"),
+        line_with(&text, "▶ shell"),
+    ];
+    assert!(order.is_sorted(), "out of order: {order:?}\n{text}");
+}
+
+#[test]
+fn w_in_the_tui_starts_a_shell_in_a_new_worktree() {
+    let crystal = Crystal::new();
+    let repo = git_repo(crystal.dir.path(), "app");
+    crystal.ok(&[
+        "new",
+        "-n",
+        "planner",
+        "-c",
+        repo.to_str().unwrap(),
+        "sleep",
+        "30",
+    ]);
+
+    let mut tui = crystal.tui();
+    tui.shows("▶ planner");
+    tui.type_keys("w");
+    tui.shows("branch for the new worktree:");
+    tui.type_keys("spike\r");
+    tui.shows("⎇ spike");
+    tui.shows("typing into the session");
+    assert!(crystal.dir.path().join("app.worktrees/spike").is_dir());
 }

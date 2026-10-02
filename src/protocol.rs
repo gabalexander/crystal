@@ -72,6 +72,24 @@ pub struct SessionInfo {
     pub state: State,
     /// `None` for a program that doesn't report what it's doing.
     pub activity: Option<Activity>,
+    /// `None` when the session's directory isn't in a git repository.
+    pub worktree: Option<Worktree>,
+}
+
+/// The git worktree a session runs in, and the project it belongs to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Worktree {
+    /// The project's name: the name of its main worktree's directory.
+    pub project: String,
+    /// The main worktree's directory, which tells projects apart.
+    pub project_path: PathBuf,
+    /// This worktree's top directory.
+    pub path: PathBuf,
+    /// Whether this is the repository's main worktree, rather than one
+    /// linked to it with `git worktree add`.
+    pub main: bool,
+    /// The branch checked out, or `None` when HEAD is detached.
+    pub branch: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

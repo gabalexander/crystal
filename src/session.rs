@@ -1,6 +1,7 @@
 //! A program running in a PTY of its own.
 
 use crate::agent_screen::{self, Looks, ScreenWatch};
+use crate::git::Checkout;
 use crate::protocol::{Activity, AgentEvent, SessionInfo, State};
 use anyhow::Result;
 use portable_pty::{CommandBuilder, ExitStatus, MasterPty, PtySize, native_pty_system};
@@ -32,6 +33,8 @@ pub struct Session {
     activity: Option<Activity>,
     /// What the screen has been saying the agent is doing.
     screen_watch: ScreenWatch,
+    /// The git worktree `cwd` is in, if it's in one.
+    checkout: Option<Checkout>,
     term: Arc<Term>,
 }
 
@@ -88,6 +91,7 @@ impl Session {
         Ok(Session {
             name,
             command,
+            checkout: Checkout::find(&cwd),
             cwd,
             pid,
             state,
@@ -109,6 +113,7 @@ impl Session {
             pid: self.pid,
             state: self.state.lock().unwrap().clone(),
             activity: self.activity,
+            worktree: self.checkout.as_ref().map(Checkout::worktree),
         }
     }
 
