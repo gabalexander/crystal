@@ -5,17 +5,20 @@ mod env;
 mod protocol;
 mod session;
 mod socket;
+mod tui;
+mod viewer;
 
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
-use protocol::{NewSession, Request, Response, SessionInfo};
+use protocol::{Request, Response, SessionInfo};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-/// One terminal for all your coding agents.
+/// One terminal for all your coding agents. With no command, opens the
+/// TUI: every session in a sidebar, the selected one live beside it.
 #[derive(Parser)]
-#[command(version, arg_required_else_help = true)]
+#[command(version)]
 struct Cli {
     /// The daemon's socket [default: $XDG_RUNTIME_DIR/crystal/default.sock,
     /// or /tmp/crystal-<uid>/default.sock]
@@ -23,7 +26,7 @@ struct Cli {
     socket: Option<PathBuf>,
 
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
@@ -77,7 +80,10 @@ fn main() -> ExitCode {
 
 fn run(cli: Cli) -> Result<()> {
     let socket = cli.socket.unwrap_or_else(socket::default_path);
-    match cli.command {
+    let Some(command) = cli.command else {
+        return tui::run(&socket);
+    };
+    match command {
         Command::New {
             name,
             cwd,
@@ -112,25 +118,13 @@ fn new_session(
     name: Option<String>,
     cwd: Option<PathBuf>,
     detached: bool,
-    mut command: Vec<String>,
+    command: Vec<String>,
 ) -> Result<()> {
     let cwd = match cwd {
         Some(cwd) => std::path::absolute(cwd)?,
         None => std::env::current_dir()?,
     };
-    if command.is_empty() {
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
-        command.push(shell);
-    }
-    let request = Request::New(NewSession {
-        name,
-        cwd,
-        command,
-        env: env::current(),
-    });
-    let Some(Response::Created { name }) = client::ask(socket, &request, true)? else {
-        bail!("the daemon didn't create the session");
-    };
+    let name = client::new_session(socket, name, cwd, command)?;
 
     let in_a_terminal = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     if in_a_terminal && !detached {

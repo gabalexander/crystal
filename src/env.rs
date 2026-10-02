@@ -68,6 +68,19 @@ pub fn for_session(
     env
 }
 
+/// The session this process runs in, when it runs in one of the daemon at
+/// `socket`'s sessions. Showing that session here would show it showing
+/// itself, endlessly.
+pub fn own_session(socket: &Path) -> Option<String> {
+    let session = std::env::var("CRYSTAL_SESSION").ok()?;
+    let daemon = std::env::var_os("CRYSTAL_SOCKET")?;
+    if Path::new(&daemon) == socket {
+        Some(session)
+    } else {
+        None
+    }
+}
+
 fn is_dropped(key: &str) -> bool {
     DROPPED.contains(&key)
         || DROPPED_PREFIXES

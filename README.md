@@ -41,7 +41,7 @@ worktrees. The agents keep working after you close it, and you can always see wh
 
 ## Install
 
-There are no releases yet. Build from source with Rust 1.85 or newer:
+There are no releases yet. Build from source with Rust 1.88 or newer:
 
 ```sh
 cargo install --git https://github.com/gabalexander/crystal
@@ -49,7 +49,21 @@ cargo install --git https://github.com/gabalexander/crystal
 
 ## Usage
 
-There's no TUI yet. For now crystal is a CLI for the daemon:
+Run `crystal` on its own to open the TUI: every session in a sidebar on the left, and the selected one live in
+a pane beside it.
+
+| Key | In the sidebar |
+|---|---|
+| `j` / `k`, `↓` / `↑` | select a session |
+| `Enter` | type into the selected session |
+| `n` | start a shell in a new session, and type into it |
+| `x` | kill the selected session |
+| `q` | quit; the sessions keep running |
+
+While you're typing into a session, every key goes to it except `Ctrl+\`, which takes you back to the
+sidebar.
+
+Everything is also a command, for scripts and for agents:
 
 ```sh
 crystal new claude                          # start Claude Code here and attach to it
@@ -89,7 +103,7 @@ commands talk to it over a unix socket, so closing the TUI never stops an agent.
 - [x] Project skeleton
 - [x] Daemon that runs an agent in a PTY and keeps it alive
 - [x] Attach and detach
-- [ ] Session list in a sidebar
+- [x] Session list in a sidebar
 - [ ] Session status, from agent hooks first, then from the screen
 - [ ] Projects and worktrees
 - [ ] Resume after a restart

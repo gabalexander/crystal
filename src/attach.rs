@@ -6,14 +6,14 @@
 //! like switching screens, stays inside the attach.
 
 use crate::client;
-use crate::protocol::{self, Frame, Request, Response, State};
-use anyhow::{Context, Result, bail};
+use crate::env;
+use crate::protocol::{Request, Response, State};
+use crate::viewer::{Output, Viewer};
+use anyhow::{Result, bail};
 use crossterm::terminal;
 use std::fs::File;
-use std::io::{self, BufReader, ErrorKind, IsTerminal, Read, Write};
-use std::net::Shutdown;
+use std::io::{self, ErrorKind, IsTerminal, Read, Write};
 use std::os::fd::{AsFd, AsRawFd};
-use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -37,33 +37,19 @@ pub fn run(socket: &Path, name: Option<&str>) -> Result<()> {
         bail!("attach needs a terminal");
     }
     let (cols, rows) = terminal::size()?;
-    let conn = UnixStream::connect(socket)
-        .with_context(|| format!("no daemon is running on {}", socket.display()))?;
-    let request = Request::Attach {
-        name: name.map(String::from),
-        rows,
-        cols,
-    };
-    protocol::send(&conn, &request)?;
-    let mut output = BufReader::new(conn.try_clone()?);
-    let (name, running) = match protocol::recv(&mut output)? {
-        Some(Response::Attached { name, running }) => (name, running),
-        Some(Response::Error { message }) => bail!(message),
-        _ => bail!("the daemon hung up without answering"),
-    };
-    let inside = std::env::var_os("CRYSTAL_SESSION").is_some_and(|session| session == *name)
-        && std::env::var_os("CRYSTAL_SOCKET").is_some_and(|ours| Path::new(&ours) == socket);
-    if inside {
+    let (viewer, output) = Viewer::connect(socket, name, rows, cols)?;
+    let name = viewer.name.clone();
+    if env::own_session(socket).as_deref() == Some(name.as_str()) {
         bail!("can't attach {name} to itself");
     }
 
-    if !running {
+    if !viewer.running {
         // Nothing more is coming: show how it ended, without taking over
         // the terminal.
         let mut screen = vt100::Parser::new(rows, cols, 0);
-        let mut rest = Vec::new();
-        output.read_to_end(&mut rest)?;
-        screen.process(&rest);
+        for chunk in output {
+            screen.process(&chunk);
+        }
         print_screen(screen.screen())?;
         println!("{}", ending(socket, &name));
         return Ok(());
@@ -71,7 +57,7 @@ pub fn run(socket: &Path, name: Option<&str>) -> Result<()> {
 
     let detached = {
         let _raw = RawTerminal::enter()?;
-        relay(&conn, output, rows, cols)?
+        relay(viewer, output, rows, cols)?
     };
     if detached {
         println!("[detached from {name}]");
@@ -83,23 +69,17 @@ pub fn run(socket: &Path, name: Option<&str>) -> Result<()> {
 
 /// Draws the session and sends it the keyboard until the user detaches
 /// (`true`) or the session goes (`false`).
-fn relay(
-    conn: &UnixStream,
-    mut output: BufReader<UnixStream>,
-    rows: u16,
-    cols: u16,
-) -> Result<bool> {
+fn relay(viewer: Viewer, output: Output, rows: u16, cols: u16) -> Result<bool> {
     let screen = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 0)));
     let gone = Arc::new(AtomicBool::new(false));
     let drawer = thread::spawn({
         let screen = screen.clone();
         let gone = gone.clone();
         move || {
-            let mut buf = [0; 16 * 1024];
-            while let Ok(n @ 1..) = output.read(&mut buf) {
+            for chunk in output {
                 let mut screen = screen.lock().unwrap();
                 let before = screen.screen().clone();
-                screen.process(&buf[..n]);
+                screen.process(&chunk);
                 if draw(&screen.screen().state_diff(&before)).is_err() {
                     break;
                 }
@@ -122,7 +102,7 @@ fn relay(
             let detach = buf[..n].iter().position(|&byte| byte == DETACH_KEY);
             let keys = &buf[..detach.unwrap_or(n)];
             if !keys.is_empty() {
-                let _ = protocol::send_frame(conn, &Frame::Input(keys.to_vec()));
+                let _ = viewer.send_keys(keys);
             }
             if detach.is_some() || n == 0 {
                 break true;
@@ -131,15 +111,15 @@ fn relay(
         let (cols, rows) = terminal::size()?;
         if (rows, cols) != size {
             size = (rows, cols);
-            let _ = protocol::send_frame(conn, &Frame::Resize { rows, cols });
+            let _ = viewer.resize(rows, cols);
             let mut screen = screen.lock().unwrap();
             screen.screen_mut().set_size(rows, cols);
             draw(&screen.screen().state_formatted())?;
         }
     };
-    // Unblocks the drawer, which must be done before the terminal is put
-    // back.
-    let _ = conn.shutdown(Shutdown::Both);
+    // Hanging up ends the drawer's output, and the drawer must be done
+    // before the terminal is put back.
+    drop(viewer);
     let _ = drawer.join();
     Ok(detached)
 }

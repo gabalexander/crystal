@@ -84,6 +84,11 @@ impl Crystal {
         terminal
     }
 
+    /// Opens the TUI and waits until it has taken over its terminal.
+    fn tui(&self) -> Terminal {
+        self.attach(&[])
+    }
+
     /// Runs crystal in a terminal of its own, the way a person would.
     fn terminal(&self, args: &[&str]) -> Terminal {
         let pty = native_pty_system().openpty(size(24, 80)).unwrap();
@@ -93,6 +98,8 @@ impl Crystal {
         command.args(args);
         command.cwd(self.dir.path());
         command.env_remove("CRYSTAL_SESSION");
+        // So that a shell crystal starts is the same everywhere.
+        command.env("SHELL", "/bin/sh");
         let child = pty.slave.spawn_command(command).unwrap();
         drop(pty.slave);
 
@@ -529,4 +536,124 @@ fn a_session_starts_from_the_environment_of_the_new_that_asked_for_it() {
     assert!(out.status.success());
 
     assert_eq!(written(&crystal.dir.path().join("env")), "hello unmarked\n");
+}
+
+#[test]
+fn the_tui_lists_the_sessions_and_shows_the_selected_one() {
+    let crystal = Crystal::new();
+    for name in ["alpha", "beta"] {
+        let script = format!("echo {name} is here; echo > {name}-ready; sleep 30");
+        crystal.ok(&["new", "-n", name, "sh", "-c", &script]);
+        written(&crystal.dir.path().join(format!("{name}-ready")));
+    }
+
+    let mut tui = crystal.tui();
+    tui.shows("▶ alpha");
+    tui.shows("▶ beta");
+    tui.shows("alpha is here");
+
+    tui.type_keys("j");
+    tui.shows("beta is here");
+}
+
+#[test]
+fn keys_go_to_the_pane_after_enter_and_back_to_the_list_after_ctrl_backslash() {
+    let crystal = Crystal::new();
+    crystal.ok(&["new", "-n", "cat", "cat"]);
+
+    let mut tui = crystal.tui();
+    tui.shows("▶ cat");
+    tui.type_keys("\r");
+    tui.shows("typing into the session");
+    tui.type_keys("hello pane\r");
+    tui.shows("hello pane");
+
+    tui.type_keys("\x1c");
+    tui.shows("q quit");
+    // Back on the list, q quits rather than going to cat.
+    tui.type_keys("q");
+    assert!(tui.exit());
+}
+
+#[test]
+fn n_starts_a_shell_and_hands_it_the_keyboard() {
+    let crystal = Crystal::new();
+    let mut tui = crystal.tui();
+    assert!(crystal.socket.exists(), "the TUI starts the daemon");
+    tui.shows("No sessions yet");
+
+    tui.type_keys("n");
+    tui.shows("▶ sh");
+    tui.shows("typing into the session");
+    tui.type_keys("echo I am $CRYSTAL_SESSION\r");
+    tui.shows("I am sh");
+}
+
+#[test]
+fn x_kills_the_selected_session() {
+    let crystal = Crystal::new();
+    crystal.ok(&["new", "-n", "doomed", "sleep", "30"]);
+    let pid = crystal.pid("doomed");
+
+    let mut tui = crystal.tui();
+    tui.shows("▶ doomed");
+    tui.type_keys("x");
+    tui.shows("No sessions yet");
+    eventually("the program has exited", || !alive(pid));
+}
+
+#[test]
+fn q_quits_the_tui_and_the_sessions_keep_running() {
+    let crystal = Crystal::new();
+    crystal.ok(&["new", "-n", "stays", "sleep", "30"]);
+
+    let mut tui = crystal.tui();
+    tui.shows("▶ stays");
+    tui.type_keys("q");
+    assert!(tui.exit());
+    assert_eq!(crystal.row("stays").unwrap()[1], "running");
+}
+
+#[test]
+fn an_ended_session_shows_how_it_ended() {
+    let crystal = Crystal::new();
+    crystal.ok(&["new", "-n", "done", "sh", "-c", "echo last words; exit 3"]);
+    eventually("the session has ended", || {
+        crystal.row("done").unwrap()[1] == "exited 3"
+    });
+
+    let tui = crystal.tui();
+    tui.shows("■ done exited 3");
+    tui.shows("last words");
+}
+
+#[test]
+fn the_session_in_the_pane_is_sized_to_the_pane() {
+    let crystal = Crystal::new();
+    crystal.ok(&[
+        "new",
+        "-n",
+        "sizer",
+        "sh",
+        "-c",
+        "trap 'stty size > size' WINCH; echo watching; while :; do sleep 0.05; done",
+    ]);
+    let size = crystal.dir.path().join("size");
+    let size_is = |expected: &str| std::fs::read_to_string(&size).is_ok_and(|s| s == expected);
+
+    // The terminal is 24 by 80; inside the pane's border, beside the
+    // sidebar and above the footer, that leaves 21 by 50.
+    let tui = crystal.tui();
+    tui.shows("watching");
+    eventually("the session is the pane's size", || size_is("21 50\n"));
+
+    tui.resize(30, 100);
+    eventually("the session follows the pane", || size_is("27 70\n"));
+}
+
+#[test]
+fn the_tui_needs_a_terminal() {
+    let crystal = Crystal::new();
+    assert!(crystal.fails(&[]).contains("crystal needs a terminal"));
+    assert!(!crystal.socket.exists());
 }

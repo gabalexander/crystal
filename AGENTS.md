@@ -18,6 +18,14 @@ Run lint, format and tests before every commit.
 - `src/main.rs`: the CLI (clap) and how it prints
 - `src/client.rs`: connects to the daemon, starting it when needed
 - `src/attach.rs`: `crystal attach`: draws a session in your terminal and sends it your keys
+- `src/viewer.rs`: the client's side of an attach, shared by `crystal attach` and the TUI's pane
+- `src/tui/`: the TUI (`crystal` with no command)
+  - `mod.rs`: the event loop: one channel of events, then update and draw
+  - `app.rs`: the state and how keys change it; no I/O, so it's unit-tested
+  - `ui.rs`: the layout and drawing
+  - `pane.rs`: the viewer of the selected session and its screen
+  - `screen_widget.rs`: draws a vt100 screen into ratatui
+  - `keys.rs`: turns crossterm keys back into the bytes a terminal sends
 - `src/daemon.rs`: the daemon: listens on the socket and owns the sessions
 - `src/session.rs`: one program in a PTY: spawn, exit status, stop, and its screen (vt100) and viewers
 - `src/protocol.rs`: requests and responses, one JSON line each, and the frames an attached client sends

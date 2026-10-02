@@ -1,12 +1,13 @@
 //! The CLI's side of the socket.
 
-use crate::protocol::{self, Request, Response};
+use crate::env;
+use crate::protocol::{self, NewSession, Request, Response};
 use crate::socket;
 use anyhow::{Context, Result, bail};
 use std::fs::OpenOptions;
 use std::io::BufReader;
 use std::os::unix::net::UnixStream;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -29,6 +30,31 @@ pub fn ask(socket: &Path, request: &Request, start: bool) -> Result<Option<Respo
     match response {
         Response::Error { message } => bail!(message),
         response => Ok(Some(response)),
+    }
+}
+
+/// Asks the daemon to start `command` in `cwd`, or the user's shell when
+/// `command` is empty, with this process's environment. Starts the daemon
+/// if it isn't running. Returns the new session's name.
+pub fn new_session(
+    socket: &Path,
+    name: Option<String>,
+    cwd: PathBuf,
+    mut command: Vec<String>,
+) -> Result<String> {
+    if command.is_empty() {
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+        command.push(shell);
+    }
+    let request = Request::New(NewSession {
+        name,
+        cwd,
+        command,
+        env: env::current(),
+    });
+    match ask(socket, &request, true)? {
+        Some(Response::Created { name }) => Ok(name),
+        _ => bail!("the daemon didn't create the session"),
     }
 }
 
