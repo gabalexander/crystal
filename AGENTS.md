@@ -54,6 +54,8 @@ is: it's the one request every version must understand.
 - `src/agent_screen.rs`: reading what an agent is doing off its screen and title
 - `src/typing.rs`: typing into a session the way a person would: pastes marked, Enter on its own
 - `src/session.rs`: one program in a PTY: spawn, exit status, stop, and its screen (vt100) and viewers
+- `src/history.rs`: the rows that scroll off a session's screen: keeping them (inline agents' too), reading
+  them, and replaying them to a new viewer
 - `src/protocol.rs`: requests and responses, one JSON line each, and the frames an attached client sends
 - `src/socket.rs`: where the socket lives
 - `src/state.rs`: the running sessions, written down to start them again after a restart

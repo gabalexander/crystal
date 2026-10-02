@@ -79,13 +79,20 @@ a pane beside it.
 | `Enter` | type into the selected session |
 | `s` | split the selected session off into a pane of its own, or close its split |
 | `Tab` / `Shift+Tab` | type into the next pane, or the one before |
+| `PageUp` / `PageDown` | page the selected session's pane back through its history, or forward to live |
 | `n` | ask what to run, then start it in a new session beside the selected one, and type into it |
 | `w` | ask for a branch, then what to run in a new worktree on it, and type into it |
 | `x` | kill the selected session, once you've said `y` |
 | `q` | quit; the sessions keep running |
 
 While you're typing into a session, every key goes to it, `Tab` included, except `Ctrl+\`, which takes you
-back to the sidebar.
+back to the sidebar, and `Shift+PageUp` / `Shift+PageDown`, which page through the pane's history. Some
+terminals keep `Shift+PageUp` for their own scrolling; `Ctrl+\` and then `PageUp` does the same.
+
+Each session keeps the last 2,000 rows that scrolled off its screen, so a pane can page back through what an
+agent wrote before you opened it. The title says how far back you are (`↑ 120 lines`), new output doesn't pull
+you away while you read, and typing into the session brings you back to live. That includes agents that print
+inline through a scroll region, like Codex, whose rows a plain terminal emulator would lose.
 
 `n` asks on the bottom line, `new session:`, starting out with the command you used last, at first `claude`.
 For an agent, the rest of the line is its first prompt: `claude fix the login bug` starts Claude on that.
@@ -130,6 +137,7 @@ crystal attach review                       # show a session; Ctrl+\ hands your 
 crystal send review "check the diff"        # type into a session and press Enter
 crystal wait review                         # block until its agent stops working; print how it ended
 crystal read review --lines 20              # print the last 20 rows of its screen
+crystal read review --history               # and what scrolled off it before
 crystal kill review                         # stop one session
 crystal kill-server                         # stop every session, and the daemon
 crystal restart-server                      # restart the daemon, say after an upgrade; sessions come back
