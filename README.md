@@ -68,13 +68,18 @@ a pane beside it.
 | `Enter` | type into the selected session |
 | `s` | split the selected session off into a pane of its own, or close its split |
 | `Tab` / `Shift+Tab` | type into the next pane, or the one before |
-| `n` | start a shell in a new session, and type into it |
-| `w` | ask for a branch, then start a shell in a new worktree on it, and type into it |
-| `x` | kill the selected session |
+| `n` | ask what to run, then start it in a new session beside the selected one, and type into it |
+| `w` | ask for a branch, then what to run in a new worktree on it, and type into it |
+| `x` | kill the selected session, once you've said `y` |
 | `q` | quit; the sessions keep running |
 
 While you're typing into a session, every key goes to it, `Tab` included, except `Ctrl+\`, which takes you
 back to the sidebar.
+
+`n` asks on the bottom line, `new session:`, starting out with the command you used last, at first `claude`.
+For an agent, the rest of the line is its first prompt: `claude fix the login bug` starts Claude on that.
+Anything else runs as a shell would run it, so `npm run dev` or `sh -c 'make && make test'` work too, and an
+empty line (`Ctrl+U` clears it) starts your shell.
 
 A split keeps a session on screen while the selection moves on: up to two of them, beside the selected
 session's pane when each pane can be at least 80 columns wide, and stacked below it when not. Each pane's
