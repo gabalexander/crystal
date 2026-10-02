@@ -73,9 +73,10 @@ pub fn run(socket: &Path, name: Option<&str>) -> Result<()> {
         let _raw = RawTerminal::enter()?;
         relay(&conn, output, rows, cols)?
     };
-    match detached {
-        true => println!("[detached from {name}]"),
-        false => println!("{}", ending(socket, &name)),
+    if detached {
+        println!("[detached from {name}]");
+    } else {
+        println!("{}", ending(socket, &name));
     }
     Ok(())
 }

@@ -5,6 +5,7 @@
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::io::{self, BufRead, ErrorKind, Read, Write};
 use std::path::PathBuf;
@@ -12,11 +13,7 @@ use std::path::PathBuf;
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Request {
-    New {
-        name: Option<String>,
-        cwd: PathBuf,
-        command: Vec<String>,
-    },
+    New(NewSession),
     List,
     Kill {
         name: String,
@@ -28,6 +25,16 @@ pub enum Request {
         cols: u16,
     },
     Shutdown,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct NewSession {
+    /// `None` names the session after its program.
+    pub name: Option<String>,
+    pub cwd: PathBuf,
+    pub command: Vec<String>,
+    /// The client's environment, which the program starts from.
+    pub env: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

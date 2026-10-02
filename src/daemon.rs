@@ -2,7 +2,8 @@
 //! terminal it was started from, so sessions keep running when the
 //! client goes away.
 
-use crate::protocol::{self, Frame, Request, Response};
+use crate::env;
+use crate::protocol::{self, Frame, NewSession, Request, Response};
 use crate::session::{STOP_GRACE, Session, Term};
 use crate::socket;
 use anyhow::{Context, Result, bail, ensure};
@@ -98,7 +99,7 @@ impl Daemon {
     fn handle(&self, request: Request) -> Result<Response> {
         match request {
             Request::Attach { .. } => bail!("attach takes over the connection"),
-            Request::New { name, cwd, command } => self.new_session(name, cwd, command),
+            Request::New(new) => self.new_session(new),
             Request::List => {
                 let sessions = self.sessions.lock().unwrap();
                 Ok(Response::Sessions {
@@ -128,17 +129,19 @@ impl Daemon {
         }
     }
 
-    fn new_session(
-        &self,
-        name: Option<String>,
-        cwd: PathBuf,
-        command: Vec<String>,
-    ) -> Result<Response> {
-        ensure!(!command.is_empty(), "no command to run");
+    fn new_session(&self, new: NewSession) -> Result<Response> {
+        let NewSession {
+            name,
+            cwd,
+            command,
+            env,
+        } = new;
+        let Some(program) = command.first() else {
+            bail!("no command to run");
+        };
         ensure!(
-            exists(&command[0], &cwd),
-            "command not found: {}",
-            command[0]
+            exists(program, &cwd, env.get("PATH")),
+            "command not found: {program}"
         );
         let mut sessions = self.sessions.lock().unwrap();
         let taken = |name: &str| sessions.iter().any(|session| session.name == name);
@@ -151,15 +154,9 @@ impl Daemon {
                 ensure!(!taken(&name), "a session named {name} already exists");
                 name
             }
-            None => unique_name(&command[0], taken),
+            None => unique_name(program, taken),
         };
-        let socket = self.socket.to_string_lossy();
-        let env = [
-            ("CRYSTAL_SOCKET", &*socket),
-            ("CRYSTAL_SESSION", &*name),
-            ("TERM", "xterm-256color"),
-            ("COLORTERM", "truecolor"),
-        ];
+        let env = env::for_session(&env, &name, &self.socket);
         let session = Session::spawn(name.clone(), command, cwd, &env)?;
         sessions.push(session);
         Ok(Response::Created { name })
@@ -220,13 +217,15 @@ impl From<anyhow::Error> for Response {
 }
 
 /// Whether `program` names a file to run: a path, taken from `cwd`, or a
-/// name found on `PATH`.
-fn exists(program: &str, cwd: &Path) -> bool {
+/// name found on the client's `PATH`.
+fn exists(program: &str, cwd: &Path, path: Option<&String>) -> bool {
     if program.contains('/') {
         return cwd.join(program).is_file();
     }
-    std::env::var_os("PATH")
-        .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join(program).is_file()))
+    let Some(path) = path else {
+        return false;
+    };
+    std::env::split_paths(path).any(|dir| dir.join(program).is_file())
 }
 
 /// The program's name, with `-2`, `-3`… added until it's free.

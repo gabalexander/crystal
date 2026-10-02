@@ -23,14 +23,18 @@ impl Crystal {
         Crystal { dir, socket }
     }
 
-    fn run(&self, args: &[&str]) -> Output {
-        Command::new(CRYSTAL)
+    fn command(&self, args: &[&str]) -> Command {
+        let mut command = Command::new(CRYSTAL);
+        command
             .arg("--socket")
             .arg(&self.socket)
             .args(args)
-            .current_dir(self.dir.path())
-            .output()
-            .unwrap()
+            .current_dir(self.dir.path());
+        command
+    }
+
+    fn run(&self, args: &[&str]) -> Output {
+        self.command(args).output().unwrap()
     }
 
     /// Runs a command that must succeed, and returns what it printed.
@@ -500,4 +504,29 @@ fn a_session_cannot_attach_to_itself() {
     let mut terminal = crystal.attach(&["attach", "loop"]);
     terminal.type_keys(&format!("{CRYSTAL} attach loop\r"));
     terminal.shows("can't attach loop to itself");
+}
+
+#[test]
+fn a_session_starts_from_the_environment_of_the_new_that_asked_for_it() {
+    let crystal = Crystal::new();
+    // The first `new` starts the daemon with its environment…
+    crystal.ok(&["new", "-n", "first", "sleep", "30"]);
+    // …but the second session gets the second `new`'s, minus the marks
+    // of the agent it ran in.
+    let out = crystal
+        .command(&[
+            "new",
+            "-n",
+            "second",
+            "sh",
+            "-c",
+            "echo $GREETING ${CLAUDECODE:-unmarked} > env",
+        ])
+        .env("GREETING", "hello")
+        .env("CLAUDECODE", "1")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+
+    assert_eq!(written(&crystal.dir.path().join("env")), "hello unmarked\n");
 }

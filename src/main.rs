@@ -1,13 +1,14 @@
 mod attach;
 mod client;
 mod daemon;
+mod env;
 mod protocol;
 mod session;
 mod socket;
 
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
-use protocol::{Request, Response, SessionInfo};
+use protocol::{NewSession, Request, Response, SessionInfo};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -82,21 +83,7 @@ fn run(cli: Cli) -> Result<()> {
             cwd,
             detached,
             command,
-        } => {
-            let cwd = std::path::absolute(cwd.unwrap_or(std::env::current_dir()?))?;
-            let command = match command.is_empty() {
-                true => vec![std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into())],
-                false => command,
-            };
-            let request = Request::New { name, cwd, command };
-            if let Some(Response::Created { name }) = client::ask(&socket, &request, true)? {
-                match !detached && std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
-                {
-                    true => attach::run(&socket, Some(&name))?,
-                    false => println!("{name}"),
-                }
-            }
-        }
+        } => new_session(&socket, name, cwd, detached, command)?,
         Command::Attach { name } => attach::run(&socket, name.as_deref())?,
         Command::Ls => {
             if let Some(Response::Sessions { sessions }) =
@@ -118,6 +105,40 @@ fn run(cli: Cli) -> Result<()> {
         Command::Daemon => daemon::run(&socket)?,
     }
     Ok(())
+}
+
+fn new_session(
+    socket: &Path,
+    name: Option<String>,
+    cwd: Option<PathBuf>,
+    detached: bool,
+    mut command: Vec<String>,
+) -> Result<()> {
+    let cwd = match cwd {
+        Some(cwd) => std::path::absolute(cwd)?,
+        None => std::env::current_dir()?,
+    };
+    if command.is_empty() {
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+        command.push(shell);
+    }
+    let request = Request::New(NewSession {
+        name,
+        cwd,
+        command,
+        env: env::current(),
+    });
+    let Some(Response::Created { name }) = client::ask(socket, &request, true)? else {
+        bail!("the daemon didn't create the session");
+    };
+
+    let in_a_terminal = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    if in_a_terminal && !detached {
+        attach::run(socket, Some(&name))
+    } else {
+        println!("{name}");
+        Ok(())
+    }
 }
 
 fn no_daemon(socket: &Path) -> Result<()> {

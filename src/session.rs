@@ -3,6 +3,7 @@
 use crate::protocol::{SessionInfo, State};
 use anyhow::Result;
 use portable_pty::{CommandBuilder, ExitStatus, MasterPty, PtySize, native_pty_system};
+use std::collections::BTreeMap;
 use std::io::{self, ErrorKind, Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -32,12 +33,13 @@ impl Session {
         name: String,
         command: Vec<String>,
         cwd: PathBuf,
-        env: &[(&str, &str)],
+        env: &BTreeMap<String, String>,
     ) -> Result<Session> {
         let pty = native_pty_system().openpty(size(24, 80))?;
         let mut builder = CommandBuilder::new(&command[0]);
         builder.args(&command[1..]);
         builder.cwd(&cwd);
+        builder.env_clear();
         for (key, value) in env {
             builder.env(key, value);
         }
