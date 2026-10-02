@@ -1,0 +1,13 @@
+[package]
+name = "crystal"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "One terminal for all your coding agents"
+license = "MIT"
+repository = "https://github.com/gabalexander/crystal"
+readme = "README.md"
+keywords = ["agents", "terminal", "tui", "multiplexer", "claude"]
+categories = ["command-line-utilities", "development-tools"]
+
+[dependencies]
