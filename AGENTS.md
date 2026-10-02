@@ -23,6 +23,8 @@ Run lint, format and tests before every commit.
   - `mod.rs`: the event loop: one channel of events, then update and draw
   - `app.rs`: the state and how keys change it; no I/O, so it's unit-tested
   - `ui.rs`: the layout and drawing
+  - `groups.rs`: the sidebar's order and headings: sessions by project, then worktree
+  - `text_input.rs`: a one-line text box, for the new worktree's branch
   - `pane.rs`: the viewer of the selected session and its screen
   - `screen_widget.rs`: draws a vt100 screen into ratatui
   - `keys.rs`: turns crossterm keys back into the bytes a terminal sends
@@ -34,5 +36,6 @@ Run lint, format and tests before every commit.
 - `src/protocol.rs`: requests and responses, one JSON line each, and the frames an attached client sends
 - `src/socket.rs`: where the socket lives
 - `src/env.rs`: the environment a session's program starts with
-- `src/shell.rs`: quoting arguments the way a shell reads them
+- `src/git.rs`: a directory's project, worktree and branch, and making and removing worktrees (runs `git`)
+- `src/shell.rs`: quoting arguments and writing paths with `~`, the way a shell reads them
 - `tests/cli.rs`: end-to-end tests that drive the real binary against a private daemon

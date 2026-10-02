@@ -57,13 +57,19 @@ a pane beside it.
 | `j` / `k`, `↓` / `↑` | select a session |
 | `Enter` | type into the selected session |
 | `n` | start a shell in a new session, and type into it |
+| `w` | ask for a branch, then start a shell in a new worktree on it, and type into it |
 | `x` | kill the selected session |
 | `q` | quit; the sessions keep running |
 
 While you're typing into a session, every key goes to it except `Ctrl+\`, which takes you back to the
 sidebar.
 
-Each row says what its session is doing. Sessions waiting on you move to the top.
+The sidebar groups sessions by project, then by worktree: `⌂` marks a repository's main worktree and `⎇` a
+linked one, each named by its branch. Sessions outside any repository come last, under their directory.
+`w` makes its worktree in the selected session's project, or in the repository you started `crystal` in.
+
+Each row says what its session is doing. A project with a session waiting on you moves to the top, and that
+session leads its worktree.
 
 | Mark | Meaning |
 |---|---|
@@ -84,6 +90,8 @@ Everything is also a command, for scripts and for agents:
 ```sh
 crystal new claude                          # start Claude Code here and attach to it
 crystal new -d -n review -c ~/code/app codex   # start one in the background, named, somewhere else
+crystal new -w fix/login claude             # start one in a new worktree, on a new branch
+crystal worktree rm fix/login               # remove that worktree, once nothing runs in it
 crystal ls                                  # list sessions and how they're doing
 crystal attach review                       # show a session; Ctrl+\ hands your terminal back
 crystal kill review                         # stop one session
@@ -92,11 +100,17 @@ crystal kill-server                         # stop every session, and the daemon
 
 ```
 $ crystal ls
-NAME    STATE     PID    DIRECTORY   COMMAND
-claude  waiting   41210  ~/code/app  claude
-docs    done      41377  ~/code/app  claude
-review  exited 0  41388  ~/code/app  codex
+NAME    STATE     PID    PROJECT  BRANCH     DIRECTORY                       COMMAND
+claude  waiting   41210  app      main       ~/code/app                      claude
+fixer   working   41377  app      fix/login  ~/code/app.worktrees/fix-login  claude
+review  exited 0  41388  app      main       ~/code/app                      codex
 ```
+
+`crystal new -w <branch>` makes the worktree beside the repository, in `<repo>.worktrees/<branch>`, with any
+`/` in the branch made a `-`. A branch that doesn't exist yet starts from the commit you're on; one that does
+is checked out as it is. `crystal worktree rm` takes the worktree's directory or its branch, refuses while a
+session is still running in it, and leaves the rest to `git worktree remove`, which keeps a worktree with
+changes you haven't committed.
 
 The first `crystal new` starts the daemon. Sessions keep running after you detach or close the terminal, and
 `crystal attach` picks up exactly where the screen was. With no name it attaches to the newest session; on a
@@ -123,7 +137,7 @@ commands talk to it over a unix socket, so closing the TUI never stops an agent.
 - [x] Session list in a sidebar
 - [x] Session status from Claude Code's hooks
 - [x] Session status from the screen, for agents without hooks
-- [ ] Projects and worktrees
+- [x] Projects and worktrees
 - [ ] Resume after a restart
 - [ ] Split panes
 - [ ] Agents that start, message, wait on and read other agents
