@@ -69,6 +69,17 @@ impl Crystal {
         self.row(name).unwrap()[2].parse().unwrap()
     }
 
+    /// Runs a crystal command that attaches, and waits until it has taken
+    /// over its terminal: keys typed before that would go to the terminal,
+    /// not the session.
+    fn attach(&self, args: &[&str]) -> Terminal {
+        let terminal = self.terminal(args);
+        eventually("crystal has attached", || {
+            terminal.screen.lock().unwrap().screen().alternate_screen()
+        });
+        terminal
+    }
+
     /// Runs crystal in a terminal of its own, the way a person would.
     fn terminal(&self, args: &[&str]) -> Terminal {
         let pty = native_pty_system().openpty(size(24, 80)).unwrap();
@@ -352,7 +363,7 @@ fn attach_shows_the_session_until_ctrl_backslash() {
     let crystal = Crystal::new();
     crystal.ok(&["new", "-n", "cat", "cat"]);
 
-    let mut terminal = crystal.terminal(&["attach", "cat"]);
+    let mut terminal = crystal.attach(&["attach", "cat"]);
     terminal.type_keys("hello from the keyboard\r");
     terminal.shows("hello from the keyboard");
 
@@ -382,7 +393,7 @@ fn attach_starts_from_what_is_already_on_screen() {
 #[test]
 fn new_attaches_when_run_in_a_terminal() {
     let crystal = Crystal::new();
-    let mut terminal = crystal.terminal(&["new", "-n", "shell", "sh"]);
+    let mut terminal = crystal.attach(&["new", "-n", "shell", "sh"]);
     terminal.type_keys("echo I am $CRYSTAL_SESSION\r");
     terminal.shows("I am shell");
 
@@ -397,7 +408,7 @@ fn attach_without_a_name_picks_the_newest_session() {
     crystal.ok(&["new", "-n", "older", "sleep", "30"]);
     crystal.ok(&["new", "-n", "newest", "sh"]);
 
-    let mut terminal = crystal.terminal(&["attach"]);
+    let mut terminal = crystal.attach(&["attach"]);
     terminal.type_keys("echo I am $CRYSTAL_SESSION\r");
     terminal.shows("I am newest");
 }
@@ -407,7 +418,7 @@ fn attach_ends_when_the_program_does() {
     let crystal = Crystal::new();
     crystal.ok(&["new", "-n", "brief", "sh", "-c", "read line; exit 7"]);
 
-    let mut terminal = crystal.terminal(&["attach", "brief"]);
+    let mut terminal = crystal.attach(&["attach", "brief"]);
     terminal.type_keys("bye\r");
     terminal.shows("[brief exited 7]");
     assert!(terminal.exit());
@@ -439,7 +450,7 @@ fn a_resize_reaches_the_program() {
         "trap 'stty size > size' WINCH; echo watching; while :; do sleep 0.05; done",
     ]);
 
-    let terminal = crystal.terminal(&["attach", "sizer"]);
+    let terminal = crystal.attach(&["attach", "sizer"]);
     terminal.shows("watching");
     terminal.resize(30, 100);
     assert_eq!(written(&crystal.dir.path().join("size")), "30 100\n");
@@ -486,7 +497,7 @@ fn a_session_cannot_attach_to_itself() {
     let crystal = Crystal::new();
     crystal.ok(&["new", "-n", "loop", "sh"]);
 
-    let mut terminal = crystal.terminal(&["attach", "loop"]);
+    let mut terminal = crystal.attach(&["attach", "loop"]);
     terminal.type_keys(&format!("{CRYSTAL} attach loop\r"));
     terminal.shows("can't attach loop to itself");
 }
