@@ -12,3 +12,13 @@ roadmap.
 - Format: `cargo fmt`
 
 Run lint, format and tests before every commit.
+
+## Layout
+
+- `src/main.rs`: the CLI (clap) and how it prints
+- `src/client.rs`: connects to the daemon, starting it when needed
+- `src/daemon.rs`: the daemon: listens on the socket and owns the sessions
+- `src/session.rs`: one program in a PTY: spawn, exit status, stop
+- `src/protocol.rs`: requests and responses, one JSON line each
+- `src/socket.rs`: where the socket lives
+- `tests/cli.rs`: end-to-end tests that drive the real binary against a private daemon
