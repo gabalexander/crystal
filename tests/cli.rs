@@ -78,7 +78,11 @@ impl Crystal {
     /// over its terminal: keys typed before that would go to the terminal,
     /// not the session.
     fn attach(&self, args: &[&str]) -> Terminal {
-        let terminal = self.terminal(args);
+        self.attach_with_env(args, &[])
+    }
+
+    fn attach_with_env(&self, args: &[&str], env: &[(&str, &str)]) -> Terminal {
+        let terminal = self.terminal_with_env(args, env);
         eventually("crystal has attached", || {
             terminal.screen.lock().unwrap().screen().alternate_screen()
         });
@@ -92,6 +96,11 @@ impl Crystal {
 
     /// Runs crystal in a terminal of its own, the way a person would.
     fn terminal(&self, args: &[&str]) -> Terminal {
+        self.terminal_with_env(args, &[])
+    }
+
+    /// Like [`Crystal::terminal`], with `env` added to its environment.
+    fn terminal_with_env(&self, args: &[&str], env: &[(&str, &str)]) -> Terminal {
         let pty = native_pty_system().openpty(size(24, 80)).unwrap();
         let mut command = CommandBuilder::new(CRYSTAL);
         command.arg("--socket");
@@ -101,7 +110,7 @@ impl Crystal {
         command.env_remove("CRYSTAL_SESSION");
         // So that a shell crystal starts is the same everywhere.
         command.env("SHELL", "/bin/sh");
-        for (key, value) in PLAIN_GIT {
+        for (key, value) in PLAIN_GIT.iter().chain(env) {
             command.env(key, value);
         }
         let child = pty.slave.spawn_command(command).unwrap();
@@ -643,13 +652,16 @@ fn keys_go_to_the_pane_after_enter_and_back_to_the_list_after_ctrl_backslash() {
 }
 
 #[test]
-fn n_starts_a_shell_and_hands_it_the_keyboard() {
+fn n_with_an_empty_line_starts_a_shell_and_hands_it_the_keyboard() {
     let crystal = Crystal::new();
     let mut tui = crystal.tui();
     assert!(crystal.socket.exists(), "the TUI starts the daemon");
     tui.shows("No sessions yet");
 
     tui.type_keys("n");
+    tui.shows("new session: claude");
+    // Ctrl+U clears the line, and an empty line is the shell.
+    tui.type_keys("\x15\r");
     tui.shows("▶ sh");
     tui.shows("typing into the session");
     tui.type_keys("echo I am $CRYSTAL_SESSION\r");
@@ -657,7 +669,26 @@ fn n_starts_a_shell_and_hands_it_the_keyboard() {
 }
 
 #[test]
-fn x_kills_the_selected_session() {
+fn n_starts_claude_with_its_hooks_and_the_rest_of_the_line_as_its_prompt() {
+    let crystal = Crystal::new();
+    let bin = fake_claude(crystal.dir.path());
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let mut tui = crystal.attach_with_env(&[], &[("PATH", &path)]);
+
+    tui.type_keys("n");
+    tui.shows("new session: claude");
+    tui.type_keys(" fix the login bug\r");
+    tui.shows("▶ claude");
+
+    let args = written(&crystal.dir.path().join("args"));
+    let args: Vec<&str> = args.lines().collect();
+    assert_eq!(args.len(), 3, "{args:?}");
+    assert_eq!(args[0], "--settings");
+    assert_eq!(args[2], "fix the login bug");
+}
+
+#[test]
+fn x_asks_first_and_only_y_kills_the_selected_session() {
     let crystal = Crystal::new();
     crystal.ok(&["new", "-n", "doomed", "sleep", "30"]);
     let pid = crystal.pid("doomed");
@@ -665,6 +696,14 @@ fn x_kills_the_selected_session() {
     let mut tui = crystal.tui();
     tui.shows("▶ doomed");
     tui.type_keys("x");
+    tui.shows("kill doomed? y/n");
+    tui.type_keys("n");
+    tui.shows("x kill");
+    assert!(alive(pid));
+
+    tui.type_keys("x");
+    tui.shows("kill doomed? y/n");
+    tui.type_keys("y");
     tui.shows("No sessions yet");
     eventually("the program has exited", || !alive(pid));
 }
@@ -1009,7 +1048,7 @@ fn the_tui_groups_sessions_by_project_then_worktree() {
 }
 
 #[test]
-fn w_in_the_tui_starts_a_shell_in_a_new_worktree() {
+fn w_in_the_tui_starts_a_command_in_a_new_worktree() {
     let crystal = Crystal::new();
     let repo = git_repo(crystal.dir.path(), "app");
     crystal.ok(&[
@@ -1027,9 +1066,17 @@ fn w_in_the_tui_starts_a_shell_in_a_new_worktree() {
     tui.type_keys("w");
     tui.shows("branch for the new worktree:");
     tui.type_keys("spike\r");
+    tui.shows("new session: claude");
+    tui.type_keys("\x15sh -c 'pwd > where; sleep 30'\r");
     tui.shows("⎇ spike");
     tui.shows("typing into the session");
-    assert!(crystal.dir.path().join("app.worktrees/spike").is_dir());
+
+    let worktree = crystal.dir.path().join("app.worktrees/spike");
+    let written = written(&worktree.join("where"));
+    assert_eq!(
+        Path::new(written.trim()).canonicalize().unwrap(),
+        worktree.canonicalize().unwrap()
+    );
 }
 
 impl Crystal {

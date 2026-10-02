@@ -2,11 +2,10 @@
 //! and the panes of the sessions split off, and a footer with the keys.
 //! Drawing only reads the state; it never changes it.
 
-use super::app::{App, Focus, Slot};
+use super::app::{App, Focus, Prompt, Question, Slot};
 use super::groups::Row;
 use super::pane::Pane;
 use super::screen_widget::ScreenWidget;
-use super::text_input::TextInput;
 use crate::protocol::{Activity, SessionInfo, State};
 use crate::shell;
 use ratatui::Frame;
@@ -207,14 +206,16 @@ fn draw_message(frame: &mut Frame, message: &str, area: Rect) {
 }
 
 fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
-    if let Some(input) = app.branch_prompt() {
-        draw_branch_prompt(frame, input, area);
+    if let Some(prompt) = app.prompt() {
+        draw_prompt(frame, prompt, area);
         return;
     }
-    let footer = if let Some(notice) = app.notice() {
+    let footer = if let Some(name) = app.kill_asked() {
+        Line::from(format!("kill {name}? y/n")).yellow()
+    } else if let Some(notice) = app.notice() {
         Line::from(notice.to_string()).red()
     } else if app.focus() == Focus::Sidebar {
-        Line::from("j/k · enter type · tab pane · s split · n shell · w worktree · x kill · q quit")
+        Line::from("j/k · enter type · tab pane · s split · n new · w worktree · x kill · q quit")
             .dark_gray()
     } else {
         Line::from("typing into the session · ctrl+\\ back to the list").dark_gray()
@@ -222,13 +223,16 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(footer, area);
 }
 
-/// Asks for the new worktree's branch, with the cursor in the answer.
-fn draw_branch_prompt(frame: &mut Frame, input: &TextInput, area: Rect) {
-    const QUESTION: &str = "branch for the new worktree: ";
-    let line = Line::from(vec![QUESTION.cyan(), input.text().into()]);
+/// Asks the prompt's question, with the cursor in the answer.
+fn draw_prompt(frame: &mut Frame, prompt: &Prompt, area: Rect) {
+    let question = match prompt.question {
+        Question::Branch => "branch for the new worktree: ",
+        Question::Command(_) => "new session: ",
+    };
+    let line = Line::from(vec![question.cyan(), prompt.input.text().into()]);
     frame.render_widget(line, area);
     // The question is plain ASCII, so its length in bytes is its width.
-    let column = area.x + (QUESTION.len() + input.cursor()) as u16;
+    let column = area.x + (question.len() + prompt.input.cursor()) as u16;
     frame.set_cursor_position((column.min(area.right().saturating_sub(1)), area.y));
 }
 
@@ -366,6 +370,23 @@ mod tests {
         app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
         let text = screen_text(&app);
         assert!(text[11].contains("branch for the new worktree: x"));
+    }
+
+    #[test]
+    fn the_new_session_line_takes_the_footer() {
+        let mut app = App::new(None);
+        app.on_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        let text = screen_text(&app);
+        assert!(text[11].contains("new session: claude"));
+    }
+
+    #[test]
+    fn killing_asks_on_the_footer() {
+        let mut app = App::new(None);
+        app.set_sessions(vec![session("doomed", State::Running)]);
+        app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        let text = screen_text(&app);
+        assert!(text[11].contains("kill doomed? y/n"));
     }
 
     #[test]

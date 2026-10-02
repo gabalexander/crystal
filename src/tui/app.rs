@@ -3,6 +3,7 @@
 //! comes back as an [`Action`] for the event loop to carry out. That keeps
 //! every state change testable on its own.
 
+use super::command_line;
 use super::groups::{self, Row};
 use super::keys;
 use super::text_input::TextInput;
@@ -37,17 +38,48 @@ enum Direction {
     Back,
 }
 
+/// What the TUI starts a new session with before anything else has been
+/// typed at the "new session:" prompt.
+const FIRST_COMMAND: &str = "claude";
+
+/// Where a new session starts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Place {
+    /// In this directory, or the TUI's own when it's `None`.
+    Directory(Option<PathBuf>),
+    /// In a new worktree on `branch`, made in the repository at `base`, or
+    /// the TUI's own directory's when that's `None`.
+    NewWorktree {
+        branch: String,
+        base: Option<PathBuf>,
+    },
+}
+
+/// A question asked on the footer line, and the answer typed so far.
+#[derive(Debug)]
+pub struct Prompt {
+    pub question: Question,
+    pub input: TextInput,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Question {
+    /// The branch for a new worktree. The command to run there is asked
+    /// for next.
+    Branch,
+    /// The command line for a new session, which starts at the place.
+    Command(Place),
+}
+
 /// What a key asks the event loop to do.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Action {
     Quit,
-    /// Start a shell in a new session.
-    NewSession,
-    /// Start a shell in a new worktree on `branch`, made in the repository
-    /// at `base`, or the TUI's own directory when that's `None`.
-    NewWorktree {
-        branch: String,
-        base: Option<PathBuf>,
+    /// Start `command` in a new session at `place`. An empty command starts
+    /// the user's shell.
+    Start {
+        place: Place,
+        command: Vec<String>,
     },
     Kill(String),
     /// Send the key to the session in the pane at `to`.
@@ -62,8 +94,13 @@ pub struct App {
     sessions: Vec<SessionInfo>,
     /// An index into `sessions`, kept in range while there are any.
     selected: usize,
-    /// The branch name being typed for a new worktree, while it's asked for.
-    branch_prompt: Option<TextInput>,
+    /// The question on the footer line, while one is being answered.
+    prompt: Option<Prompt>,
+    /// The command line the last new session was started with, which the
+    /// next one starts out with.
+    last_command: String,
+    /// The session the user has asked to kill, until they say yes or no.
+    kill_asked: Option<String>,
     /// Sessions split off into panes of their own, by name, in the order
     /// they were split off. A split stays on its session while the
     /// selection moves.
@@ -85,7 +122,9 @@ impl App {
         App {
             sessions: Vec::new(),
             selected: 0,
-            branch_prompt: None,
+            prompt: None,
+            last_command: FIRST_COMMAND.to_string(),
+            kill_asked: None,
             splits: Vec::new(),
             focus: Focus::Sidebar,
             last_pane: None,
@@ -111,9 +150,15 @@ impl App {
         groups::rows(&self.sessions)
     }
 
-    /// The branch name typed so far, while a new worktree's is asked for.
-    pub fn branch_prompt(&self) -> Option<&TextInput> {
-        self.branch_prompt.as_ref()
+    /// The question on the footer line and its answer so far, while one
+    /// is being answered.
+    pub fn prompt(&self) -> Option<&Prompt> {
+        self.prompt.as_ref()
+    }
+
+    /// The session waiting on a yes or no before it's killed.
+    pub fn kill_asked(&self) -> Option<&str> {
+        self.kill_asked.as_deref()
     }
 
     pub fn focus(&self) -> Focus {
@@ -234,7 +279,14 @@ impl App {
 
     pub fn on_key(&mut self, key: KeyEvent) -> Option<Action> {
         self.notice = None;
-        if self.branch_prompt.is_some() {
+        // Only `y` kills; any other key keeps the session.
+        if let Some(name) = self.kill_asked.take() {
+            if key.code == KeyCode::Char('y') {
+                return Some(Action::Kill(name));
+            }
+            return None;
+        }
+        if self.prompt.is_some() {
             return self.on_prompt_key(key);
         }
         match self.focus {
@@ -251,44 +303,85 @@ impl App {
             KeyCode::Tab => self.move_to_pane(Direction::Forward),
             KeyCode::BackTab => self.move_to_pane(Direction::Back),
             KeyCode::Char('s') => self.toggle_split(),
-            KeyCode::Char('n') => return Some(Action::NewSession),
-            KeyCode::Char('w') => self.branch_prompt = Some(TextInput::default()),
-            KeyCode::Char('x') => {
-                let name = self.selected()?.name.clone();
-                return Some(Action::Kill(name));
-            }
+            KeyCode::Char('n') => self.ask_for_command(self.selected_place()),
+            KeyCode::Char('w') => self.ask(Question::Branch, ""),
+            KeyCode::Char('x') => self.kill_asked = Some(self.selected()?.name.clone()),
             KeyCode::Char('q') => return Some(Action::Quit),
             _ => {}
         }
         None
     }
 
-    /// Keys while a branch name is asked for: Enter makes the worktree, Esc
-    /// gives up, and every other key edits the name.
+    fn ask(&mut self, question: Question, answer: &str) {
+        self.prompt = Some(Prompt {
+            question,
+            input: TextInput::with_text(answer),
+        });
+    }
+
+    /// Asks what to run in a new session at `place`, starting out with the
+    /// command line used last.
+    fn ask_for_command(&mut self, place: Place) {
+        let last = self.last_command.clone();
+        self.ask(Question::Command(place), &last);
+    }
+
+    /// Keys while a question is asked: Enter answers it, Esc gives up, and
+    /// every other key edits the answer.
     fn on_prompt_key(&mut self, key: KeyEvent) -> Option<Action> {
         match key.code {
             KeyCode::Esc => {
-                self.branch_prompt = None;
+                self.prompt = None;
                 None
             }
             KeyCode::Enter => {
-                let input = self.branch_prompt.take()?;
-                let branch = input.text().trim();
-                if branch.is_empty() {
-                    return None;
-                }
-                Some(Action::NewWorktree {
-                    branch: branch.to_string(),
-                    base: self.worktree_base(),
-                })
+                let prompt = self.prompt.take()?;
+                self.answer(prompt)
             }
             _ => {
-                if let Some(input) = &mut self.branch_prompt {
-                    input.on_key(&key);
+                if let Some(prompt) = &mut self.prompt {
+                    prompt.input.on_key(&key);
                 }
                 None
             }
         }
+    }
+
+    /// What an answered question leads to: a branch, to asking what to run
+    /// there; a command line, to a new session.
+    fn answer(&mut self, prompt: Prompt) -> Option<Action> {
+        let answer = prompt.input.text().trim().to_string();
+        match prompt.question {
+            Question::Branch => {
+                if !answer.is_empty() {
+                    let base = self.worktree_base();
+                    self.ask_for_command(Place::NewWorktree {
+                        branch: answer,
+                        base,
+                    });
+                }
+                None
+            }
+            Question::Command(place) => {
+                // Kept even when it doesn't read, so that the next `n`
+                // brings it back to put right.
+                self.last_command = answer.clone();
+                match command_line::parse(&answer) {
+                    Ok(command) => Some(Action::Start { place, command }),
+                    Err(err) => {
+                        self.notify(err);
+                        None
+                    }
+                }
+            }
+        }
+    }
+
+    /// Where `n` starts a session: where the selected session runs, or the
+    /// TUI's own directory when nothing is selected.
+    fn selected_place(&self) -> Place {
+        let dir = self.selected().map(|session| session.cwd.clone());
+        Place::Directory(dir)
     }
 
     /// Where a new worktree is made from: the selected session's project,
@@ -531,17 +624,8 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_keys_ask_for_their_actions() {
-        let mut app = app_with(&["a", "b"]);
-        press(&mut app, KeyCode::Char('j'));
-        assert_eq!(
-            press(&mut app, KeyCode::Char('n')),
-            Some(Action::NewSession)
-        );
-        assert_eq!(
-            press(&mut app, KeyCode::Char('x')),
-            Some(Action::Kill("b".into()))
-        );
+    fn q_asks_to_quit() {
+        let mut app = app_with(&["a"]);
         assert_eq!(press(&mut app, KeyCode::Char('q')), Some(Action::Quit));
     }
 
@@ -564,47 +648,120 @@ mod tests {
         }
     }
 
-    #[test]
-    fn w_asks_for_a_branch_and_enter_makes_the_worktree_in_the_selected_project() {
-        let mut app = App::new(None);
-        app.set_sessions(vec![in_project("agent", "app")]);
-        press(&mut app, KeyCode::Char('w'));
-        type_text(&mut app, "fix/typo");
-        assert_eq!(app.branch_prompt().unwrap().text(), "fix/typo");
+    /// Clears the answer the prompt started out with, and types `text`.
+    fn answer(app: &mut App, text: &str) {
+        app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        type_text(app, text);
+    }
 
-        let action = press(&mut app, KeyCode::Enter);
-        assert_eq!(
-            action,
-            Some(Action::NewWorktree {
-                branch: "fix/typo".into(),
-                base: Some(PathBuf::from("/code/app")),
-            })
-        );
-        assert!(app.branch_prompt().is_none());
+    fn prompt_text(app: &App) -> Option<&str> {
+        app.prompt().map(|prompt| prompt.input.text())
+    }
+
+    fn start(place: Place, command: &[&str]) -> Option<Action> {
+        let command = command.iter().map(|word| word.to_string()).collect();
+        Some(Action::Start { place, command })
     }
 
     #[test]
-    fn keys_go_to_the_branch_prompt_while_it_is_open() {
+    fn n_starts_out_with_claude_and_enter_starts_it_where_the_selection_runs() {
+        let mut app = app_with(&["a"]);
+        press(&mut app, KeyCode::Char('n'));
+        assert_eq!(prompt_text(&app), Some("claude"));
+
+        let place = Place::Directory(Some(PathBuf::from("/")));
+        assert_eq!(press(&mut app, KeyCode::Enter), start(place, &["claude"]));
+        assert!(app.prompt().is_none());
+    }
+
+    #[test]
+    fn an_agents_first_prompt_goes_as_one_argument() {
+        let mut app = App::new(None);
+        press(&mut app, KeyCode::Char('n'));
+        type_text(&mut app, " fix the login bug");
+        assert_eq!(
+            press(&mut app, KeyCode::Enter),
+            start(Place::Directory(None), &["claude", "fix the login bug"])
+        );
+    }
+
+    #[test]
+    fn the_next_n_starts_out_with_the_command_used_last() {
+        let mut app = App::new(None);
+        press(&mut app, KeyCode::Char('n'));
+        answer(&mut app, "codex --model o3");
+        press(&mut app, KeyCode::Enter);
+
+        press(&mut app, KeyCode::Char('n'));
+        assert_eq!(prompt_text(&app), Some("codex --model o3"));
+    }
+
+    #[test]
+    fn an_empty_line_starts_the_shell() {
+        let mut app = App::new(None);
+        press(&mut app, KeyCode::Char('n'));
+        answer(&mut app, "");
+        assert_eq!(
+            press(&mut app, KeyCode::Enter),
+            start(Place::Directory(None), &[])
+        );
+    }
+
+    #[test]
+    fn a_line_that_does_not_read_says_why_and_comes_back_to_put_right() {
+        let mut app = App::new(None);
+        press(&mut app, KeyCode::Char('n'));
+        answer(&mut app, "echo 'oops");
+        assert_eq!(press(&mut app, KeyCode::Enter), None);
+        assert_eq!(app.notice(), Some("a quote isn't closed"));
+
+        press(&mut app, KeyCode::Char('n'));
+        assert_eq!(prompt_text(&app), Some("echo 'oops"));
+    }
+
+    #[test]
+    fn keys_go_to_the_prompt_while_it_is_open() {
         let mut app = app_with(&["a", "b"]);
         press(&mut app, KeyCode::Char('w'));
         // q and x would quit and kill on the list; here they're letters.
         type_text(&mut app, "qx");
-        assert_eq!(app.branch_prompt().unwrap().text(), "qx");
+        assert_eq!(prompt_text(&app), Some("qx"));
         assert_eq!(selected_name(&app), Some("a"));
     }
 
     #[test]
-    fn esc_or_an_empty_name_gives_up_on_the_new_worktree() {
+    fn w_asks_for_a_branch_then_what_to_run_in_the_new_worktree() {
+        let mut app = App::new(None);
+        app.set_sessions(vec![in_project("agent", "app")]);
+        press(&mut app, KeyCode::Char('w'));
+        type_text(&mut app, "fix/typo");
+        assert_eq!(press(&mut app, KeyCode::Enter), None);
+        assert_eq!(prompt_text(&app), Some("claude"));
+
+        let place = Place::NewWorktree {
+            branch: "fix/typo".into(),
+            base: Some(PathBuf::from("/code/app")),
+        };
+        answer(&mut app, "npm test");
+        assert_eq!(
+            press(&mut app, KeyCode::Enter),
+            start(place, &["npm", "test"])
+        );
+        assert!(app.prompt().is_none());
+    }
+
+    #[test]
+    fn esc_or_an_empty_branch_gives_up_on_the_new_worktree() {
         let mut app = app_with(&["a"]);
         press(&mut app, KeyCode::Char('w'));
         type_text(&mut app, "feat");
         assert_eq!(press(&mut app, KeyCode::Esc), None);
-        assert!(app.branch_prompt().is_none());
+        assert!(app.prompt().is_none());
 
         press(&mut app, KeyCode::Char('w'));
         type_text(&mut app, "  ");
         assert_eq!(press(&mut app, KeyCode::Enter), None);
-        assert!(app.branch_prompt().is_none());
+        assert!(app.prompt().is_none());
     }
 
     #[test]
@@ -612,13 +769,36 @@ mod tests {
         let mut app = app_with(&["shell"]);
         press(&mut app, KeyCode::Char('w'));
         type_text(&mut app, "feat");
+        press(&mut app, KeyCode::Enter);
+        let place = Place::NewWorktree {
+            branch: "feat".into(),
+            base: None,
+        };
+        assert_eq!(press(&mut app, KeyCode::Enter), start(place, &["claude"]));
+    }
+
+    #[test]
+    fn x_asks_first_and_only_y_kills() {
+        let mut app = app_with(&["a", "b"]);
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(press(&mut app, KeyCode::Char('x')), None);
+        assert_eq!(app.kill_asked(), Some("b"));
+        assert_eq!(press(&mut app, KeyCode::Char('n')), None);
+        assert_eq!(app.kill_asked(), None);
+        assert!(app.prompt().is_none(), "the n answered the question");
+
+        press(&mut app, KeyCode::Char('x'));
         assert_eq!(
-            press(&mut app, KeyCode::Enter),
-            Some(Action::NewWorktree {
-                branch: "feat".into(),
-                base: None,
-            })
+            press(&mut app, KeyCode::Char('y')),
+            Some(Action::Kill("b".into()))
         );
+    }
+
+    #[test]
+    fn x_with_nothing_selected_asks_nothing() {
+        let mut app = App::new(None);
+        assert_eq!(press(&mut app, KeyCode::Char('x')), None);
+        assert_eq!(app.kill_asked(), None);
     }
 
     fn hand_back(app: &mut App) {

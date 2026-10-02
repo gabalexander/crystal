@@ -27,7 +27,8 @@ Run lint, format and tests before every commit.
   - `app.rs`: the state and how keys change it; no I/O, so it's unit-tested
   - `ui.rs`: the layout and drawing
   - `groups.rs`: the sidebar's order and headings: sessions by project, then worktree
-  - `text_input.rs`: a one-line text box, for the new worktree's branch
+  - `text_input.rs`: a one-line text box, for the questions asked on the bottom line
+  - `command_line.rs`: reads the line typed at `new session:` into the command to run
   - `pane.rs`: a viewer of a session on screen, the selected one or a split, and its screen
   - `screen_widget.rs`: draws a vt100 screen into ratatui
   - `keys.rs`: turns crossterm keys back into the bytes a terminal sends

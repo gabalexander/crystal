@@ -7,6 +7,7 @@
 //! The loop takes each event, updates the state, and draws.
 
 mod app;
+mod command_line;
 mod groups;
 mod keys;
 mod pane;
@@ -17,7 +18,7 @@ mod ui;
 use crate::protocol::{Request, Response, SessionInfo};
 use crate::{client, env, git};
 use anyhow::{Result, bail};
-use app::{Action, App, Slot};
+use app::{Action, App, Place, Slot};
 use crossterm::event::{Event as TerminalEvent, KeyEvent, KeyEventKind};
 use pane::Pane;
 use ratatui::DefaultTerminal;
@@ -140,14 +141,9 @@ impl Tui {
     fn perform(&mut self, action: Action) -> Result<()> {
         match action {
             Action::Quit => self.quitting = true,
-            Action::NewSession => self.start_shell(std::env::current_dir()?)?,
-            Action::NewWorktree { branch, base } => {
-                let base = match base {
-                    Some(base) => base,
-                    None => std::env::current_dir()?,
-                };
-                let worktree = git::add_worktree(&base, &branch)?;
-                self.start_shell(worktree)?;
+            Action::Start { place, command } => {
+                let cwd = directory_for(place)?;
+                self.start_session(cwd, command)?;
             }
             Action::Kill(name) => {
                 client::ask(&self.socket, &Request::Kill { name }, false)?;
@@ -165,10 +161,10 @@ impl Tui {
         Ok(())
     }
 
-    /// Starts the user's shell in a new session in `cwd`, selects it, and
-    /// hands it the keyboard.
-    fn start_shell(&mut self, cwd: PathBuf) -> Result<()> {
-        let name = client::new_session(&self.socket, None, cwd, Vec::new())?;
+    /// Starts `command` in a new session in `cwd`, or the user's shell when
+    /// it's empty, then selects the session and hands it the keyboard.
+    fn start_session(&mut self, cwd: PathBuf, command: Vec<String>) -> Result<()> {
+        let name = client::new_session(&self.socket, None, cwd, command)?;
         self.refresh_sessions()?;
         self.app.select(&name);
         self.app.type_into_selected();
@@ -235,6 +231,23 @@ impl Tui {
 
     fn pane_with_id(&mut self, id: u64) -> Option<&mut Pane> {
         self.panes.iter_mut().find(|pane| pane.id == id)
+    }
+}
+
+/// The directory a new session at `place` starts in, making the worktree
+/// first when it's a new one. Where a place says nothing, it's the TUI's
+/// own directory.
+fn directory_for(place: Place) -> Result<PathBuf> {
+    match place {
+        Place::Directory(Some(dir)) => Ok(dir),
+        Place::Directory(None) => Ok(std::env::current_dir()?),
+        Place::NewWorktree { branch, base } => {
+            let base = match base {
+                Some(base) => base,
+                None => std::env::current_dir()?,
+            };
+            git::add_worktree(&base, &branch)
+        }
     }
 }
 

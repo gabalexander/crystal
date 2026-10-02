@@ -11,6 +11,14 @@ pub struct TextInput {
 }
 
 impl TextInput {
+    /// A box that starts out holding `text`, with the cursor at its end.
+    pub fn with_text(text: &str) -> TextInput {
+        TextInput {
+            text: text.to_string(),
+            cursor: text.chars().count(),
+        }
+    }
+
     pub fn text(&self) -> &str {
         &self.text
     }
@@ -20,11 +28,13 @@ impl TextInput {
     }
 
     /// Edits the text for `key`: a character goes in at the cursor,
-    /// Backspace and Delete take out the character before or after it, and
-    /// the arrows, Home and End move it. Other keys do nothing.
+    /// Backspace and Delete take out the character before or after it,
+    /// Ctrl+U everything before it, as in a shell, and the arrows, Home and
+    /// End move it. Other keys do nothing.
     pub fn on_key(&mut self, key: &KeyEvent) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
+            KeyCode::Char('u') if ctrl => self.clear_before_cursor(),
             KeyCode::Char(c) if !ctrl => self.insert(c),
             KeyCode::Backspace => self.backspace(),
             KeyCode::Delete => self.delete(),
@@ -49,6 +59,12 @@ impl TextInput {
         self.cursor -= 1;
         let at = self.byte_index(self.cursor);
         self.text.remove(at);
+    }
+
+    fn clear_before_cursor(&mut self) {
+        let at = self.byte_index(self.cursor);
+        self.text.replace_range(..at, "");
+        self.cursor = 0;
     }
 
     fn delete(&mut self) {
@@ -130,6 +146,24 @@ mod tests {
         press(&mut input, KeyCode::Backspace);
         press(&mut input, KeyCode::Char('e'));
         assert_eq!(input.text(), "cafe");
+    }
+
+    #[test]
+    fn a_box_can_start_out_holding_text() {
+        let mut input = TextInput::with_text("claude");
+        assert_eq!((input.text(), input.cursor()), ("claude", 6));
+        press(&mut input, KeyCode::Char('!'));
+        assert_eq!(input.text(), "claude!");
+    }
+
+    #[test]
+    fn ctrl_u_clears_everything_before_the_cursor() {
+        let mut input = typed("claude fix");
+        press(&mut input, KeyCode::Left);
+        press(&mut input, KeyCode::Left);
+        press(&mut input, KeyCode::Left);
+        input.on_key(&KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert_eq!((input.text(), input.cursor()), ("fix", 0));
     }
 
     #[test]
