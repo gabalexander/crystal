@@ -94,6 +94,9 @@ crystal new -w fix/login claude             # start one in a new worktree, on a 
 crystal worktree rm fix/login               # remove that worktree, once nothing runs in it
 crystal ls                                  # list sessions and how they're doing
 crystal attach review                       # show a session; Ctrl+\ hands your terminal back
+crystal send review "check the diff"        # type into a session and press Enter
+crystal wait review                         # block until its agent stops working; print how it ended
+crystal read review --lines 20              # print the last 20 rows of its screen
 crystal kill review                         # stop one session
 crystal kill-server                         # stop every session, and the daemon
 ```
@@ -122,6 +125,23 @@ was in. `crystal kill-server` is asked to stop everything, so after it nothing c
 `~/.local/state/crystal/sessions.json`, without the sessions' environment variables, since those can hold
 secrets; a session started again gets the environment of whoever started the daemon again.
 
+### Agents driving agents
+
+Every session knows how to reach its daemon, so an agent can run crystal commands too: start a second agent,
+hand it work, wait for it, and read what it said. Here a Claude Code session gets a review of its change:
+
+```sh
+crystal new -d -n reviewer claude                         # a second Claude, in the background
+crystal send reviewer "Review the diff on this branch" --wait   # prints done, or waiting if it asks something
+crystal read reviewer --lines 40                          # the end of its answer
+```
+
+`send` types the way a person does: the text first, marked as a paste when the program asks for that, then
+Enter on its own, so an agent takes it as a prompt and not as pasted text. `--wait` waits for the turn the
+text starts, not one that ended before it. `wait` returns once the agent isn't working: `done`, `waiting` when
+it asks something, `idle`, or how its program exited. It takes a `--timeout` in seconds, and fails when that
+runs out. A program that doesn't say what it's doing counts as busy until it ends.
+
 ## How it works
 
 ```
@@ -146,7 +166,7 @@ commands talk to it over a unix socket, so closing the TUI never stops an agent.
 - [x] Projects and worktrees
 - [x] Resume after a restart
 - [ ] Split panes
-- [ ] Agents that start, message, wait on and read other agents
+- [x] Agents that start, message, wait on and read other agents
 
 ## Development
 

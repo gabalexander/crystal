@@ -19,6 +19,7 @@ Run lint, format and tests before every commit.
 - `src/client.rs`: connects to the daemon, starting it when needed
 - `src/attach.rs`: `crystal attach`: draws a session in your terminal and sends it your keys
 - `src/viewer.rs`: the client's side of an attach, shared by `crystal attach` and the TUI's pane
+- `src/drive.rs`: `crystal send`, `wait` and `read`, for driving one session from another or a script
 - `src/tui/`: the TUI (`crystal` with no command)
   - `mod.rs`: the event loop: one channel of events, then update and draw
   - `app.rs`: the state and how keys change it; no I/O, so it's unit-tested
@@ -32,6 +33,7 @@ Run lint, format and tests before every commit.
 - `src/agents.rs`: what crystal knows about particular agents: the hooks it adds to Claude Code, and what they mean
 - `src/hook.rs`: `crystal hook <agent>`: what those hooks run, to tell the daemon
 - `src/agent_screen.rs`: reading what an agent is doing off its screen and title
+- `src/typing.rs`: typing into a session the way a person would: pastes marked, Enter on its own
 - `src/session.rs`: one program in a PTY: spawn, exit status, stop, and its screen (vt100) and viewers
 - `src/protocol.rs`: requests and responses, one JSON line each, and the frames an attached client sends
 - `src/socket.rs`: where the socket lives
