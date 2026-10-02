@@ -404,8 +404,17 @@ fn new_refuses_a_program_that_does_not_exist() {
 #[test]
 fn a_stale_socket_does_not_stop_the_daemon_from_starting() {
     let crystal = Crystal::new();
-    let listener = std::os::unix::net::UnixListener::bind(&crystal.socket).unwrap();
-    drop(listener);
+    // A daemon killed outright leaves its socket behind. The socket is made
+    // in a process of its own: one made in this test process could leak into
+    // a program another test starts at that moment, and go on listening.
+    let mut daemon = crystal
+        .command(&["daemon"])
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    eventually("the daemon is listening", || crystal.socket.exists());
+    daemon.kill().unwrap();
+    daemon.wait().unwrap();
     assert!(crystal.socket.exists());
 
     assert_eq!(
