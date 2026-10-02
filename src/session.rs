@@ -2,7 +2,8 @@
 
 use crate::agent_screen::{self, Looks, ScreenWatch};
 use crate::git::Checkout;
-use crate::protocol::{Activity, AgentEvent, SessionInfo, State};
+use crate::protocol::{Activity, AgentEvent, Conversation, SessionInfo, State};
+use crate::state::SavedSession;
 use anyhow::Result;
 use portable_pty::{CommandBuilder, ExitStatus, MasterPty, PtySize, native_pty_system};
 use std::collections::BTreeMap;
@@ -35,6 +36,8 @@ pub struct Session {
     screen_watch: ScreenWatch,
     /// The git worktree `cwd` is in, if it's in one.
     checkout: Option<Checkout>,
+    /// The agent's conversation, once its hooks have named it.
+    conversation: Option<Conversation>,
     term: Arc<Term>,
 }
 
@@ -96,6 +99,7 @@ impl Session {
             pid,
             state,
             activity: None,
+            conversation: None,
             screen_watch: ScreenWatch::default(),
             term,
         })
@@ -132,6 +136,24 @@ impl Session {
         if let Some(event) = self.screen_watch.update(looks) {
             self.on_agent_event(event);
         }
+    }
+
+    pub fn set_conversation(&mut self, conversation: Conversation) {
+        self.conversation = Some(conversation);
+    }
+
+    /// What it takes to start the session again after a restart, while it
+    /// runs. A program that has ended stays ended.
+    pub fn saved(&self) -> Option<SavedSession> {
+        if !self.is_running() {
+            return None;
+        }
+        Some(SavedSession {
+            name: self.name.clone(),
+            command: self.command.clone(),
+            cwd: self.cwd.clone(),
+            conversation: self.conversation.clone(),
+        })
     }
 
     /// Someone has just looked at the session.

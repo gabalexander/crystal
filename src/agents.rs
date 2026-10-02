@@ -7,10 +7,10 @@
 //! `--settings`, so the user's settings files are never touched, and its
 //! hooks run alongside any the user has.
 
-use crate::protocol::AgentEvent;
+use crate::protocol::{AgentEvent, Conversation};
 use crate::shell;
 use serde_json::{Value, json};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// The Claude Code hook events crystal listens to; [`claude_event`] says
 /// what each one means.
@@ -25,8 +25,9 @@ const CLAUDE_HOOK_EVENTS: &[&str] = &[
 
 /// The command line to run for `command`. For an agent crystal knows, it
 /// carries the flags that make the agent report to `crystal hook`, run
-/// from `crystal`, the path of this program.
-pub fn argv(command: &[String], crystal: &Path) -> Vec<String> {
+/// from `crystal`, the path of this program, and with `resume`, the id of
+/// a conversation to pick up again.
+pub fn argv(command: &[String], crystal: &Path, resume: Option<&str>) -> Vec<String> {
     if program_name(command) != Some("claude") {
         return command.to_vec();
     }
@@ -35,8 +36,47 @@ pub fn argv(command: &[String], crystal: &Path) -> Vec<String> {
         "--settings".to_string(),
         claude_settings(crystal),
     ];
-    argv.extend_from_slice(&command[1..]);
+    match resume {
+        Some(id) => {
+            argv.push("--resume".to_string());
+            argv.push(id.to_string());
+            argv.extend(without_resume_flags(&command[1..]));
+        }
+        None => argv.extend_from_slice(&command[1..]),
+    }
     argv
+}
+
+/// The conversation a Claude Code hook's input names, if it does.
+pub fn claude_conversation(input: &Value) -> Option<Conversation> {
+    let id = input["session_id"].as_str()?;
+    let transcript = input["transcript_path"].as_str().map(PathBuf::from);
+    Some(Conversation {
+        id: id.to_string(),
+        transcript,
+    })
+}
+
+/// Claude's arguments without the ones that choose a conversation to pick
+/// up, since crystal is choosing it: `--resume` and `-r`, with the id
+/// after them if there is one, and `--continue` and `-c`.
+fn without_resume_flags(args: &[String]) -> Vec<String> {
+    let mut kept = Vec::new();
+    let mut args = args.iter().peekable();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--continue" | "-c" => {}
+            "--resume" | "-r" => {
+                // The id is optional: without one, Claude offers a list.
+                if args.peek().is_some_and(|next| !next.starts_with('-')) {
+                    args.next();
+                }
+            }
+            _ if arg.starts_with("--resume=") => {}
+            _ => kept.push(arg.clone()),
+        }
+    }
+    kept
 }
 
 /// What a Claude Code hook's input means, or `None` if it's nothing that
@@ -94,13 +134,35 @@ mod tests {
     #[test]
     fn other_programs_run_as_asked() {
         let asked = command(&["codex", "--model", "o3"]);
-        assert_eq!(argv(&asked, Path::new("/bin/crystal")), asked);
+        assert_eq!(argv(&asked, Path::new("/bin/crystal"), Some("abc")), asked);
+    }
+
+    #[test]
+    fn claude_resumes_the_conversation_it_was_in() {
+        let asked = command(&["claude", "--continue", "--model", "opus"]);
+        let argv = argv(&asked, Path::new("/bin/crystal"), Some("abc"));
+        assert_eq!(argv[3..], ["--resume", "abc", "--model", "opus"]);
+    }
+
+    #[test]
+    fn resume_flags_make_way_for_crystals_own() {
+        let args = command(&["-r", "old", "--resume=older", "--resume", "-c", "--verbose"]);
+        assert_eq!(without_resume_flags(&args), ["--verbose"]);
+    }
+
+    #[test]
+    fn a_hook_names_its_conversation() {
+        let input = json!({"session_id": "abc", "transcript_path": "/t/abc.jsonl"});
+        let conversation = claude_conversation(&input).unwrap();
+        assert_eq!(conversation.id, "abc");
+        assert_eq!(conversation.transcript, Some(PathBuf::from("/t/abc.jsonl")));
+        assert_eq!(claude_conversation(&json!({})), None);
     }
 
     #[test]
     fn claude_gets_hooks_ahead_of_its_own_arguments() {
         let asked = command(&["/usr/local/bin/claude", "--resume"]);
-        let argv = argv(&asked, Path::new("/opt/my tools/crystal"));
+        let argv = argv(&asked, Path::new("/opt/my tools/crystal"), None);
         assert_eq!(argv[0], "/usr/local/bin/claude");
         assert_eq!(argv[1], "--settings");
         assert_eq!(argv[3], "--resume");

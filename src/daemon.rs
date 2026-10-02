@@ -4,9 +4,10 @@
 
 use crate::agents;
 use crate::env;
-use crate::protocol::{self, Frame, NewSession, Request, Response};
+use crate::protocol::{self, Conversation, Frame, NewSession, Request, Response};
 use crate::session::{STOP_GRACE, Session, Term};
 use crate::socket;
+use crate::state::{self, SavedSession};
 use anyhow::{Context, Result, bail, ensure};
 use std::io::{BufReader, ErrorKind, Write};
 use std::net::Shutdown;
@@ -16,8 +17,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use std::{fs, process, thread};
 
-/// How often every session's screen is read for what its agent is doing.
-const SCREEN_CHECK_EVERY: Duration = Duration::from_millis(250);
+/// How often the daemon reads every session's screen for what its agent is
+/// doing, and writes down the sessions that are running.
+const KEEP_UP_EVERY: Duration = Duration::from_millis(250);
 
 pub fn run(socket: &Path) -> Result<()> {
     // Leave the client's terminal, so closing it doesn't hang up the
@@ -29,11 +31,13 @@ pub fn run(socket: &Path) -> Result<()> {
     let listener = listen(socket)?;
     let daemon = Arc::new(Daemon {
         socket: socket.to_path_buf(),
+        state: state::path(socket),
         sessions: Mutex::default(),
     });
+    daemon.start_saved_sessions();
     thread::spawn({
         let daemon = daemon.clone();
-        move || daemon.check_screens()
+        move || daemon.keep_up()
     });
     for conn in listener.incoming() {
         let Ok(conn) = conn else { continue };
@@ -65,6 +69,9 @@ fn listen(socket: &Path) -> Result<UnixListener> {
 
 struct Daemon {
     socket: PathBuf,
+    /// Where the running sessions are written down, to start them again
+    /// after a restart.
+    state: PathBuf,
     /// In the order they were created, which is the order `ls` shows.
     sessions: Mutex<Vec<Session>>,
 }
@@ -91,14 +98,44 @@ impl Daemon {
         Ok(())
     }
 
-    /// The session called `name`, or the newest one.
-    /// Reads every session's screen, again and again, for what its agent
-    /// is doing.
-    fn check_screens(&self) {
+    /// Starts again the sessions that were running when the last daemon
+    /// stopped without being asked to: it crashed, or the machine rebooted.
+    fn start_saved_sessions(&self) {
+        let mut sessions = self.sessions.lock().unwrap();
+        for saved in state::load(&self.state) {
+            let new = NewSession {
+                name: Some(saved.name.clone()),
+                cwd: saved.cwd,
+                command: saved.command,
+                env: env::current(),
+            };
+            if let Err(err) = start(&mut sessions, &self.socket, new, saved.conversation) {
+                eprintln!(
+                    "crystal daemon: couldn't start {} again: {err:#}",
+                    saved.name
+                );
+            }
+        }
+    }
+
+    /// Again and again: reads every session's screen for what its agent is
+    /// doing, and writes down the running sessions when they've changed.
+    fn keep_up(&self) {
+        let mut last_saved: Vec<SavedSession> = Vec::new();
         loop {
-            thread::sleep(SCREEN_CHECK_EVERY);
-            for session in self.sessions.lock().unwrap().iter_mut() {
+            thread::sleep(KEEP_UP_EVERY);
+            let mut sessions = self.sessions.lock().unwrap();
+            for session in sessions.iter_mut() {
                 session.check_screen();
+            }
+            // Written while the list is still locked, so that an older list
+            // can never be written after a shutdown has emptied it.
+            let saved: Vec<SavedSession> = sessions.iter().filter_map(Session::saved).collect();
+            if saved != last_saved {
+                match state::save(&self.state, &saved) {
+                    Ok(()) => last_saved = saved,
+                    Err(err) => eprintln!("crystal daemon: couldn't save the sessions: {err:#}"),
+                }
             }
         }
     }
@@ -125,9 +162,17 @@ impl Daemon {
                     sessions: sessions.iter().map(Session::info).collect(),
                 })
             }
-            Request::Report { name, event } => {
+            Request::Report {
+                name,
+                event,
+                conversation,
+            } => {
                 let mut sessions = self.sessions.lock().unwrap();
-                named(&mut sessions, &name)?.on_agent_event(event);
+                let session = named(&mut sessions, &name)?;
+                session.on_agent_event(event);
+                if let Some(conversation) = conversation {
+                    session.set_conversation(conversation);
+                }
                 Ok(Response::Done)
             }
             Request::Kill { name } => {
@@ -148,45 +193,67 @@ impl Daemon {
                 while sessions.iter().any(Session::is_running) && Instant::now() < deadline {
                     thread::sleep(Duration::from_millis(20));
                 }
+                // Asked to stop, the sessions stay stopped.
+                state::forget(&self.state);
                 Ok(Response::Done)
             }
         }
     }
 
     fn new_session(&self, new: NewSession) -> Result<Response> {
-        let NewSession {
-            name,
-            cwd,
-            command,
-            env,
-        } = new;
-        let Some(program) = command.first() else {
-            bail!("no command to run");
-        };
-        ensure!(
-            exists(program, &cwd, env.get("PATH")),
-            "command not found: {program}"
-        );
         let mut sessions = self.sessions.lock().unwrap();
-        let taken = |name: &str| sessions.iter().any(|session| session.name == name);
-        let name = match name {
-            Some(name) => {
-                ensure!(
-                    !name.is_empty() && !name.contains(char::is_whitespace),
-                    "a session name can't be empty or contain spaces"
-                );
-                ensure!(!taken(&name), "a session named {name} already exists");
-                name
-            }
-            None => unique_name(program, taken),
-        };
-        let env = env::for_session(&env, &name, &self.socket);
-        let crystal = std::env::current_exe()?;
-        let argv = agents::argv(&command, &crystal);
-        let session = Session::spawn(name.clone(), command, &argv, cwd, &env)?;
-        sessions.push(session);
+        let name = start(&mut sessions, &self.socket, new, None)?;
         Ok(Response::Created { name })
     }
+}
+
+/// Starts a session and adds it to `sessions`. Given a `conversation`, an
+/// agent that can pick one up starts back in it.
+fn start(
+    sessions: &mut Vec<Session>,
+    socket: &Path,
+    new: NewSession,
+    conversation: Option<Conversation>,
+) -> Result<String> {
+    let NewSession {
+        name,
+        cwd,
+        command,
+        env,
+    } = new;
+    let Some(program) = command.first() else {
+        bail!("no command to run");
+    };
+    ensure!(
+        exists(program, &cwd, env.get("PATH")),
+        "command not found: {program}"
+    );
+    let taken = |name: &str| sessions.iter().any(|session| session.name == name);
+    let name = match name {
+        Some(name) => {
+            ensure!(
+                !name.is_empty() && !name.contains(char::is_whitespace),
+                "a session name can't be empty or contain spaces"
+            );
+            ensure!(!taken(&name), "a session named {name} already exists");
+            name
+        }
+        None => unique_name(program, taken),
+    };
+
+    let env = env::for_session(&env, &name, socket);
+    let crystal = std::env::current_exe()?;
+    let resume = conversation
+        .as_ref()
+        .filter(|conversation| conversation.can_resume())
+        .map(|conversation| conversation.id.as_str());
+    let argv = agents::argv(&command, &crystal, resume);
+    let mut session = Session::spawn(name.clone(), command, &argv, cwd, &env)?;
+    if let Some(conversation) = conversation {
+        session.set_conversation(conversation);
+    }
+    sessions.push(session);
+    Ok(name)
 }
 
 fn named<'a>(sessions: &'a mut [Session], name: &str) -> Result<&'a mut Session> {

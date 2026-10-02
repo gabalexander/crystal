@@ -28,12 +28,20 @@ fn report(socket: &Path, agent: &str) -> Result<()> {
     std::io::stdin().read_to_string(&mut input)?;
     let input = serde_json::from_str(&input)?;
 
-    let event = match agent {
-        "claude" => agents::claude_event(&input),
-        _ => None,
+    let (event, conversation) = match agent {
+        "claude" => (
+            agents::claude_event(&input),
+            agents::claude_conversation(&input),
+        ),
+        _ => (None, None),
     };
     if let Some(event) = event {
-        client::ask(socket, &Request::Report { name, event }, false)?;
+        let report = Request::Report {
+            name,
+            event,
+            conversation,
+        };
+        client::ask(socket, &report, false)?;
     }
     Ok(())
 }

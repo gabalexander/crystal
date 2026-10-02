@@ -1018,3 +1018,111 @@ fn w_in_the_tui_starts_a_shell_in_a_new_worktree() {
     tui.shows("typing into the session");
     assert!(crystal.dir.path().join("app.worktrees/spike").is_dir());
 }
+
+impl Crystal {
+    /// Starts the daemon in a process of this test's own, so the test can
+    /// kill it the way a crash would.
+    fn start_daemon(&self) -> std::process::Child {
+        let daemon = self
+            .command(&["daemon"])
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        eventually("the daemon is listening", || self.socket.exists());
+        daemon
+    }
+
+    /// The sessions the daemon has written down, as JSON.
+    fn saved(&self) -> String {
+        std::fs::read_to_string(self.socket.with_extension("sessions.json")).unwrap_or_default()
+    }
+}
+
+fn crash(mut daemon: std::process::Child) {
+    daemon.kill().unwrap();
+    daemon.wait().unwrap();
+}
+
+#[test]
+fn running_sessions_come_back_after_the_daemon_dies() {
+    let crystal = Crystal::new();
+    let daemon = crystal.start_daemon();
+    crystal.ok(&["new", "-n", "keeper", "sleep", "300"]);
+    crystal.ok(&["new", "-n", "finished", "sh", "-c", "exit 0"]);
+    eventually("only the running session is saved", || {
+        let saved = crystal.saved();
+        saved.contains("keeper") && !saved.contains("finished")
+    });
+    let old_pid = crystal.pid("keeper");
+
+    crash(daemon);
+    eventually("the old program has gone with its terminal", || {
+        !alive(old_pid)
+    });
+
+    // The next command starts a new daemon, which starts keeper again.
+    crystal.ok(&["new", "-n", "fresh", "sleep", "300"]);
+    let row = crystal.row("keeper").unwrap();
+    assert_eq!(row[1], "running");
+    assert_ne!(crystal.pid("keeper"), old_pid);
+    assert!(crystal.row("finished").is_none());
+}
+
+#[test]
+fn kill_server_means_the_sessions_stay_stopped() {
+    let crystal = Crystal::new();
+    crystal.ok(&["new", "-n", "gone", "sleep", "300"]);
+    eventually("the session is saved", || crystal.saved().contains("gone"));
+
+    crystal.ok(&["kill-server"]);
+    assert_eq!(crystal.saved(), "");
+    crystal.ok(&["new", "-n", "next", "sleep", "300"]);
+    assert!(crystal.row("gone").is_none());
+}
+
+#[test]
+fn claude_picks_its_conversation_up_again_after_a_restart() {
+    let crystal = Crystal::new();
+    let bin = fake_claude(crystal.dir.path());
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let daemon = crystal.start_daemon();
+    let out = crystal
+        .command(&["new", "-n", "agent", "claude", "--continue"])
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+
+    // Claude's hooks name its conversation, whose transcript exists once a
+    // prompt has been sent.
+    let args = written(&crystal.dir.path().join("args"));
+    let settings: serde_json::Value = serde_json::from_str(args.lines().nth(1).unwrap()).unwrap();
+    let hook = settings["hooks"]["Stop"][0]["hooks"][0]["command"]
+        .as_str()
+        .unwrap();
+    let transcript = crystal.dir.path().join("abc-123.jsonl");
+    std::fs::write(&transcript, "{}\n").unwrap();
+    let event = serde_json::json!({
+        "hook_event_name": "UserPromptSubmit",
+        "session_id": "abc-123",
+        "transcript_path": transcript,
+    });
+    run_hook(&crystal, "agent", hook, &event.to_string());
+    eventually("the conversation is saved", || {
+        crystal.saved().contains("abc-123")
+    });
+
+    crash(daemon);
+    std::fs::remove_file(crystal.dir.path().join("args")).unwrap();
+    let out = crystal
+        .command(&["new", "-n", "other", "sleep", "300"])
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+
+    // Started again with crystal's resume in place of its own --continue.
+    let args = written(&crystal.dir.path().join("args"));
+    let args: Vec<&str> = args.lines().collect();
+    assert_eq!(args[2..], ["--resume", "abc-123"]);
+}

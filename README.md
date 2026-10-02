@@ -116,6 +116,12 @@ The first `crystal new` starts the daemon. Sessions keep running after you detac
 `crystal attach` picks up exactly where the screen was. With no name it attaches to the newest session; on a
 session that has ended, it prints the last screen and how the program exited.
 
+If the daemon dies without being asked to, because it crashed or the machine rebooted, the next `crystal` starts
+the sessions that were running again, in the same directories. Claude Code comes back in the conversation it
+was in. `crystal kill-server` is asked to stop everything, so after it nothing comes back. The list is kept in
+`~/.local/state/crystal/sessions.json`, without the sessions' environment variables, since those can hold
+secrets; a session started again gets the environment of whoever started the daemon again.
+
 ## How it works
 
 ```
@@ -138,7 +144,7 @@ commands talk to it over a unix socket, so closing the TUI never stops an agent.
 - [x] Session status from Claude Code's hooks
 - [x] Session status from the screen, for agents without hooks
 - [x] Projects and worktrees
-- [ ] Resume after a restart
+- [x] Resume after a restart
 - [ ] Split panes
 - [ ] Agents that start, message, wait on and read other agents
 

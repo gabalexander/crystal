@@ -35,6 +35,7 @@ Run lint, format and tests before every commit.
 - `src/session.rs`: one program in a PTY: spawn, exit status, stop, and its screen (vt100) and viewers
 - `src/protocol.rs`: requests and responses, one JSON line each, and the frames an attached client sends
 - `src/socket.rs`: where the socket lives
+- `src/state.rs`: the running sessions, written down to start them again after a restart
 - `src/env.rs`: the environment a session's program starts with
 - `src/git.rs`: a directory's project, worktree and branch, and making and removing worktrees (runs `git`)
 - `src/shell.rs`: quoting arguments and writing paths with `~`, the way a shell reads them

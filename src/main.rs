@@ -10,6 +10,7 @@ mod protocol;
 mod session;
 mod shell;
 mod socket;
+mod state;
 mod tui;
 mod viewer;
 

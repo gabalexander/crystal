@@ -22,6 +22,9 @@ pub enum Request {
     Report {
         name: String,
         event: AgentEvent,
+        /// The conversation the agent is in, when its hooks say.
+        #[serde(default)]
+        conversation: Option<Conversation>,
     },
     /// With no name, the newest session.
     Attach {
@@ -98,6 +101,23 @@ pub enum State {
     Running,
     Exited { code: u32 },
     Signaled { signal: String },
+}
+
+/// An agent's conversation, as its hooks name it: what it takes to pick
+/// the conversation up again after a restart.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Conversation {
+    pub id: String,
+    /// The file the agent keeps the conversation in.
+    pub transcript: Option<PathBuf>,
+}
+
+impl Conversation {
+    /// Whether there's anything to pick up: an agent that was never sent a
+    /// prompt hasn't written its transcript, and can't resume it.
+    pub fn can_resume(&self) -> bool {
+        self.transcript.as_ref().is_some_and(|path| path.is_file())
+    }
 }
 
 /// What an agent's hooks report, in terms that fit any agent. The daemon
@@ -229,6 +249,19 @@ pub fn recv_frame(mut input: impl Read) -> io::Result<Option<Frame>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_conversation_resumes_only_once_its_transcript_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join("abc.jsonl");
+        let conversation = Conversation {
+            id: "abc".into(),
+            transcript: Some(transcript.clone()),
+        };
+        assert!(!conversation.can_resume());
+        std::fs::write(&transcript, "{}\n").unwrap();
+        assert!(conversation.can_resume());
+    }
 
     #[test]
     fn frames_survive_the_round_trip() {
