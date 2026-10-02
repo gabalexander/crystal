@@ -151,6 +151,19 @@ impl Terminal {
         }
     }
 
+    /// Waits until `text` is no longer on screen.
+    fn hides(&self, text: &str) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while self.text().contains(text) {
+            assert!(
+                Instant::now() < deadline,
+                "{text:?} never went away; the screen was:\n{}",
+                self.text()
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     fn type_keys(&mut self, keys: &str) {
         self.keys.write_all(keys.as_bytes()).unwrap();
         self.keys.flush().unwrap();
@@ -1305,4 +1318,100 @@ fn send_wait_and_read_say_when_a_session_is_missing_or_ended() {
             .fails(&["send", "gone", "hi"])
             .contains("gone has ended")
     );
+}
+
+#[test]
+fn s_splits_a_session_off_and_it_stays_while_the_selection_moves() {
+    let crystal = Crystal::new();
+    for name in ["alpha", "beta"] {
+        let script = format!("echo {name} is here; echo > {name}-ready; sleep 30");
+        crystal.ok(&["new", "-n", name, "sh", "-c", &script]);
+        written(&crystal.dir.path().join(format!("{name}-ready")));
+    }
+
+    let mut tui = crystal.tui();
+    tui.shows("alpha is here");
+    tui.type_keys("s");
+    tui.shows("alpha has a pane of its own");
+
+    tui.type_keys("j");
+    tui.shows("beta is here");
+    tui.shows("alpha is here");
+
+    // Back on alpha, s closes its split, and beta leaves the screen.
+    tui.type_keys("k");
+    tui.shows("alpha has a pane of its own");
+    tui.type_keys("s");
+    tui.hides("alpha has a pane of its own");
+    tui.hides("beta is here");
+    tui.shows("alpha is here");
+}
+
+#[test]
+fn tab_takes_the_keyboard_on_to_a_split_and_its_session_gets_the_keys() {
+    let crystal = Crystal::new();
+    crystal.ok(&[
+        "new",
+        "-n",
+        "reader",
+        "sh",
+        "-c",
+        "read line; echo \"$line\" > got; sleep 30",
+    ]);
+    crystal.ok(&["new", "-n", "other", "sleep", "30"]);
+
+    let mut tui = crystal.tui();
+    tui.shows("▶ reader");
+    tui.type_keys("s");
+    tui.type_keys("j");
+
+    // The first Tab goes to the selection's pane, the next to the split.
+    tui.type_keys("\t");
+    tui.shows("typing into the session");
+    tui.type_keys("\x1c");
+    tui.shows("q quit");
+    tui.type_keys("\t");
+    tui.shows("typing into the session");
+    tui.type_keys("hello split\r");
+
+    assert_eq!(written(&crystal.dir.path().join("got")), "hello split\n");
+}
+
+#[test]
+fn each_pane_sizes_its_own_session() {
+    let crystal = Crystal::new();
+    for name in ["left", "right"] {
+        let script = format!(
+            "trap 'stty size > {name}-size' WINCH; echo {name} watching; \
+             while :; do sleep 0.05; done"
+        );
+        crystal.ok(&["new", "-n", name, "sh", "-c", &script]);
+    }
+    let size_of = |name: &str| -> (u16, u16) {
+        let file = crystal.dir.path().join(format!("{name}-size"));
+        let size = std::fs::read_to_string(file).unwrap_or_default();
+        let mut numbers = size.split_whitespace().map(|n| n.parse().unwrap());
+        (numbers.next().unwrap_or(0), numbers.next().unwrap_or(0))
+    };
+
+    let mut tui = crystal.tui();
+    tui.shows("left watching");
+    tui.type_keys("s");
+    tui.type_keys("j");
+    tui.shows("right watching");
+    tui.shows("left watching");
+
+    // At 24 by 80 there are 52 columns beside the sidebar, too few to share
+    // side by side, so the panes are stacked: each 50 columns inside its
+    // border, with the 23 rows above the footer shared between them.
+    eventually("the panes are stacked", || {
+        let (left, right) = (size_of("left"), size_of("right"));
+        left.1 == 50 && right.1 == 50 && left.0 + right.0 + 4 == 23
+    });
+
+    // At 200 columns each pane is 86 wide, so they go side by side.
+    tui.resize(30, 200);
+    eventually("the panes are side by side", || {
+        size_of("left") == (27, 84) && size_of("right") == (27, 84)
+    });
 }

@@ -1,8 +1,8 @@
-//! Drawing the TUI: the sidebar of sessions, the pane with the selected one,
-//! and a footer with the keys. Drawing only reads the state; it never
-//! changes it.
+//! Drawing the TUI: the sidebar of sessions, the pane with the selected one
+//! and the panes of the sessions split off, and a footer with the keys.
+//! Drawing only reads the state; it never changes it.
 
-use super::app::{App, Focus};
+use super::app::{App, Focus, Slot};
 use super::groups::Row;
 use super::pane::Pane;
 use super::screen_widget::ScreenWidget;
@@ -17,37 +17,62 @@ use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph};
 
 const SIDEBAR_WIDTH: u16 = 28;
 
+/// Panes go side by side only while each is at least this wide, which fits
+/// most agents' screens; narrower than that, they're stacked.
+const MIN_PANE_WIDTH: u16 = 80;
+
 /// Where each part of the TUI goes on a screen of a given size.
 pub struct Areas {
     pub sidebar: Rect,
-    pub pane: Rect,
+    /// One per pane, in the app's [`App::slots`] order: the selection's
+    /// pane, then each split.
+    pub panes: Vec<Rect>,
     pub footer: Rect,
 }
 
 impl Areas {
-    pub fn new(screen: Rect) -> Areas {
+    /// Lays out a screen with `splits` sessions split off beside the
+    /// selection's pane.
+    pub fn new(screen: Rect, splits: usize) -> Areas {
         let [main, footer] =
             Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(screen);
-        let [sidebar, pane] =
+        let [sidebar, panes] =
             Layout::horizontal([Constraint::Length(SIDEBAR_WIDTH), Constraint::Min(0)]).areas(main);
         Areas {
             sidebar,
-            pane,
+            panes: pane_areas(panes, 1 + splits),
             footer,
         }
     }
-
-    /// The inside of the pane's border, where the session's screen goes.
-    /// The session is sized to fit it exactly.
-    pub fn session_screen(&self) -> Rect {
-        Block::bordered().inner(self.pane)
-    }
 }
 
-pub fn draw(frame: &mut Frame, app: &App, pane: Option<&Pane>) {
-    let areas = Areas::new(frame.area());
+/// Shares `area` out evenly between `count` panes: side by side when each
+/// is still at least [`MIN_PANE_WIDTH`] wide, stacked otherwise.
+pub fn pane_areas(area: Rect, count: usize) -> Vec<Rect> {
+    let count = count.max(1);
+    let constraints = vec![Constraint::Ratio(1, count as u32); count];
+    let side_by_side = area.width / count as u16 >= MIN_PANE_WIDTH;
+    let layout = if side_by_side {
+        Layout::horizontal(constraints)
+    } else {
+        Layout::vertical(constraints)
+    };
+    layout.split(area).to_vec()
+}
+
+/// The inside of a pane's border, where its session's screen goes. The
+/// session is sized to fit it exactly.
+pub fn screen_area(pane: Rect) -> Rect {
+    Block::bordered().inner(pane)
+}
+
+/// Draws the whole TUI. `panes` are the viewers of the sessions on screen.
+pub fn draw(frame: &mut Frame, app: &App, panes: &[Pane]) {
+    let areas = Areas::new(frame.area(), app.splits().len());
     draw_sidebar(frame, app, areas.sidebar);
-    draw_pane(frame, app, pane, &areas);
+    for (slot, area) in app.slots().into_iter().zip(&areas.panes) {
+        draw_pane(frame, app, slot, *area, panes);
+    }
     draw_footer(frame, app, areas.footer);
 }
 
@@ -111,26 +136,38 @@ fn session_row(session: &SessionInfo) -> Line<'_> {
     row
 }
 
-fn draw_pane(frame: &mut Frame, app: &App, pane: Option<&Pane>, areas: &Areas) {
-    let focused = app.focus() == Focus::Pane;
+/// Draws the pane at `slot` in `area`: its session's screen, or a word on
+/// why there's none to show. Only the focused pane shows the cursor.
+fn draw_pane(frame: &mut Frame, app: &App, slot: Slot, area: Rect, panes: &[Pane]) {
+    let focused = app.focus() == Focus::Pane(slot);
+    let session = app.pane_session(slot);
     let mut block = Block::bordered().border_style(border_style(focused));
-    if let Some(session) = app.selected() {
-        block = block.title(pane_title(session));
+    if let Some(session) = session {
+        block = block.title(pane_title(app, slot, session));
     }
-    frame.render_widget(block, areas.pane);
+    frame.render_widget(block, area);
 
-    let screen = areas.session_screen();
-    let Some(session) = app.selected() else {
-        draw_message(frame, "No sessions yet. Press n to start a shell.", screen);
+    let screen = screen_area(area);
+    let Some(session) = session else {
+        if slot == Slot::Selected {
+            draw_message(frame, "No sessions yet. Press n to start a shell.", screen);
+        }
         return;
     };
-    if app.selected_is_own() {
+    if slot == Slot::Selected && app.selected_is_own() {
         draw_message(frame, "This is the session crystal is running in.", screen);
         return;
     }
-    // Until the pane has attached to the selected session, there's
-    // nothing to show yet.
-    let Some(pane) = pane.filter(|pane| pane.session == session.name) else {
+    if !app.shows_screen(slot) {
+        // The selected session is split off: point at its pane rather than
+        // draw it twice at two sizes.
+        let message = format!("{} has a pane of its own", session.name);
+        draw_message(frame, &message, screen);
+        return;
+    }
+    // Until a viewer has attached to the session, there's nothing to show
+    // yet.
+    let Some(pane) = panes.iter().find(|pane| pane.session == session.name) else {
         return;
     };
     let session_screen = pane.screen.screen();
@@ -143,12 +180,19 @@ fn draw_pane(frame: &mut Frame, app: &App, pane: Option<&Pane>, areas: &Areas) {
     }
 }
 
-fn pane_title(session: &SessionInfo) -> String {
-    if session.state == State::Running {
-        format!(" {} ", session.name)
-    } else {
-        format!(" {} · {} ", session.name, session.state)
+/// A pane's title: its session's name and, once it has ended, how. A split
+/// showing the selected session says so, since the selection's own pane
+/// points to it.
+fn pane_title(app: &App, slot: Slot, session: &SessionInfo) -> String {
+    let mut words = vec![session.name.clone()];
+    if session.state != State::Running {
+        words.push(session.state.to_string());
     }
+    let selected = app.selected().is_some_and(|s| s.name == session.name);
+    if slot != Slot::Selected && selected {
+        words.push("selected".to_string());
+    }
+    format!(" {} ", words.join(" · "))
 }
 
 /// One line of text across the middle of `area`.
@@ -169,13 +213,11 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     }
     let footer = if let Some(notice) = app.notice() {
         Line::from(notice.to_string()).red()
-    } else if app.focus() == Focus::Pane {
-        Line::from("typing into the session · ctrl+\\ back to the list").dark_gray()
+    } else if app.focus() == Focus::Sidebar {
+        Line::from("j/k · enter type · tab pane · s split · n shell · w worktree · x kill · q quit")
+            .dark_gray()
     } else {
-        Line::from(
-            "j/k select · enter type into it · n new shell · w new worktree · x kill · q quit",
-        )
-        .dark_gray()
+        Line::from("typing into the session · ctrl+\\ back to the list").dark_gray()
     };
     frame.render_widget(footer, area);
 }
@@ -211,7 +253,7 @@ mod tests {
     /// Draws `app` on an 80 by 12 screen and returns it as lines of text.
     fn screen_text(app: &App) -> Vec<String> {
         let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
-        terminal.draw(|frame| draw(frame, app, None)).unwrap();
+        terminal.draw(|frame| draw(frame, app, &[])).unwrap();
         let buffer = terminal.backend().buffer();
         (0..buffer.area.height)
             .map(|y| {
@@ -328,7 +370,45 @@ mod tests {
 
     #[test]
     fn the_session_screen_sits_inside_the_panes_border() {
-        let areas = Areas::new(Rect::new(0, 0, 80, 24));
-        assert_eq!(areas.session_screen(), Rect::new(29, 1, 50, 21));
+        let areas = Areas::new(Rect::new(0, 0, 80, 24), 0);
+        assert_eq!(screen_area(areas.panes[0]), Rect::new(29, 1, 50, 21));
+    }
+
+    #[test]
+    fn one_pane_takes_the_whole_area() {
+        let area = Rect::new(28, 0, 52, 23);
+        assert_eq!(pane_areas(area, 1), [area]);
+    }
+
+    #[test]
+    fn panes_go_side_by_side_when_each_is_wide_enough() {
+        let panes = pane_areas(Rect::new(0, 0, 240, 40), 3);
+        assert_eq!(
+            panes,
+            [
+                Rect::new(0, 0, 80, 40),
+                Rect::new(80, 0, 80, 40),
+                Rect::new(160, 0, 80, 40),
+            ]
+        );
+    }
+
+    #[test]
+    fn panes_are_stacked_when_side_by_side_would_be_too_narrow() {
+        let panes = pane_areas(Rect::new(0, 0, 159, 40), 2);
+        assert_eq!(panes, [Rect::new(0, 0, 159, 20), Rect::new(0, 20, 159, 20)]);
+    }
+
+    #[test]
+    fn a_selected_session_with_a_split_is_pointed_to_not_drawn_twice() {
+        let mut app = App::new(None);
+        app.set_sessions(vec![
+            session("left", State::Running),
+            session("right", State::Running),
+        ]);
+        app.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        let text = screen_text(&app).join("\n");
+        assert!(text.contains("left has a pane of its own"));
+        assert!(text.contains(" left · selected "));
     }
 }

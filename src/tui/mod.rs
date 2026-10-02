@@ -1,5 +1,6 @@
 //! The TUI, run as `crystal` with no command: a sidebar with every session,
-//! and the selected one live in a pane beside it.
+//! the selected one live in a pane beside it, and up to two more split off
+//! into panes of their own.
 //!
 //! Everything that happens arrives as an [`Event`] on one channel: a key,
 //! a resize, output from the session in the pane, a fresh session list.
@@ -16,7 +17,7 @@ mod ui;
 use crate::protocol::{Request, Response, SessionInfo};
 use crate::{client, env, git};
 use anyhow::{Result, bail};
-use app::{Action, App};
+use app::{Action, App, Slot};
 use crossterm::event::{Event as TerminalEvent, KeyEvent, KeyEventKind};
 use pane::Pane;
 use ratatui::DefaultTerminal;
@@ -62,7 +63,7 @@ pub fn run(socket: &Path) -> Result<()> {
     let mut tui = Tui {
         socket: socket.to_path_buf(),
         app: App::new(env::own_session(socket)),
-        pane: None,
+        panes: Vec::new(),
         last_pane_id: 0,
         events: sender,
         quitting: false,
@@ -78,8 +79,9 @@ pub fn run(socket: &Path) -> Result<()> {
 struct Tui {
     socket: PathBuf,
     app: App,
-    /// A viewer of the selected session, once there is one to show.
-    pane: Option<Pane>,
+    /// A viewer of each session a pane shows: the selected one and the
+    /// split ones. No session is shown twice, so its name finds its pane.
+    panes: Vec<Pane>,
     last_pane_id: u64,
     /// Handed to each pane, for its output.
     events: Sender<Event>,
@@ -90,9 +92,10 @@ impl Tui {
     fn run(&mut self, terminal: &mut DefaultTerminal, events: Receiver<Event>) -> Result<()> {
         while !self.quitting {
             let size = terminal.size()?;
-            let areas = ui::Areas::new(Rect::new(0, 0, size.width, size.height));
-            self.sync_pane(areas.session_screen());
-            terminal.draw(|frame| ui::draw(frame, &self.app, self.pane.as_ref()))?;
+            let screen = Rect::new(0, 0, size.width, size.height);
+            let areas = ui::Areas::new(screen, self.app.splits().len());
+            self.sync_panes(&areas);
+            terminal.draw(|frame| ui::draw(frame, &self.app, &self.panes))?;
 
             // Wait for something to happen, then take whatever else has
             // happened meanwhile, so a burst of output is drawn once.
@@ -150,8 +153,8 @@ impl Tui {
                 client::ask(&self.socket, &Request::Kill { name }, false)?;
                 self.refresh_sessions()?;
             }
-            Action::Type(key) => {
-                if let Some(pane) = &self.pane {
+            Action::Type { to, key } => {
+                if let Some(pane) = self.pane_in(to) {
                     let application_cursor = pane.screen.screen().application_cursor();
                     if let Some(bytes) = keys::encode(&key, application_cursor) {
                         pane.send_keys(&bytes);
@@ -180,41 +183,58 @@ impl Tui {
         Ok(())
     }
 
-    /// Keeps the pane on the selected session at the size it's drawn at:
-    /// attaches to another session when the selection moves, and resizes
-    /// when the layout changes.
-    fn sync_pane(&mut self, area: Rect) {
-        let rows = area.height.max(1);
-        let cols = area.width.max(1);
-        let wanted = match self.app.selected() {
-            Some(session) if !self.app.selected_is_own() => session.name.clone(),
-            _ => {
-                self.pane = None;
-                return;
+    /// Keeps a viewer on each session a pane shows, at the size it's drawn
+    /// at: attaches to a session as it comes on screen, resizes when the
+    /// layout changes, and lets go of sessions no pane shows any more.
+    fn sync_panes(&mut self, areas: &ui::Areas) {
+        let mut before = std::mem::take(&mut self.panes);
+        for (slot, area) in self.app.slots().into_iter().zip(&areas.panes) {
+            if !self.app.shows_screen(slot) {
+                continue;
             }
-        };
+            let Some(session) = self.app.pane_session(slot) else {
+                continue;
+            };
+            let name = session.name.clone();
+            let screen = ui::screen_area(*area);
+            let (rows, cols) = (screen.height.max(1), screen.width.max(1));
 
-        let showing_wanted = self
-            .pane
-            .as_ref()
-            .is_some_and(|pane| pane.session == wanted);
-        if !showing_wanted {
-            self.last_pane_id += 1;
-            let id = self.last_pane_id;
-            let events = self.events.clone();
-            // If it fails, the session has likely just gone; the next list
-            // will catch up.
-            self.pane = Pane::open(&self.socket, &wanted, rows, cols, id, events).ok();
+            let kept = before.iter().position(|pane| pane.session == name);
+            let pane = match kept {
+                Some(index) => Some(before.swap_remove(index)),
+                None => self.open_pane(&name, rows, cols),
+            };
+            if let Some(mut pane) = pane {
+                if pane.size() != (rows, cols) {
+                    pane.resize(rows, cols);
+                }
+                self.panes.push(pane);
+            }
         }
-        if let Some(pane) = &mut self.pane
-            && pane.size() != (rows, cols)
-        {
-            pane.resize(rows, cols);
+        // What's left in `before` is on no pane now. Dropping a viewer
+        // hangs up.
+    }
+
+    /// Attaches a new pane to `session`. If that fails, the session has
+    /// likely just gone, and the next list will catch up.
+    fn open_pane(&mut self, session: &str, rows: u16, cols: u16) -> Option<Pane> {
+        self.last_pane_id += 1;
+        let id = self.last_pane_id;
+        let events = self.events.clone();
+        Pane::open(&self.socket, session, rows, cols, id, events).ok()
+    }
+
+    /// The viewer of the session the pane at `slot` shows.
+    fn pane_in(&self, slot: Slot) -> Option<&Pane> {
+        if !self.app.shows_screen(slot) {
+            return None;
         }
+        let session = self.app.pane_session(slot)?;
+        self.panes.iter().find(|pane| pane.session == session.name)
     }
 
     fn pane_with_id(&mut self, id: u64) -> Option<&mut Pane> {
-        self.pane.as_mut().filter(|pane| pane.id == id)
+        self.panes.iter_mut().find(|pane| pane.id == id)
     }
 }
 

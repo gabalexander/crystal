@@ -56,13 +56,20 @@ a pane beside it.
 |---|---|
 | `j` / `k`, `↓` / `↑` | select a session |
 | `Enter` | type into the selected session |
+| `s` | split the selected session off into a pane of its own, or close its split |
+| `Tab` / `Shift+Tab` | type into the next pane, or the one before |
 | `n` | start a shell in a new session, and type into it |
 | `w` | ask for a branch, then start a shell in a new worktree on it, and type into it |
 | `x` | kill the selected session |
 | `q` | quit; the sessions keep running |
 
-While you're typing into a session, every key goes to it except `Ctrl+\`, which takes you back to the
-sidebar.
+While you're typing into a session, every key goes to it, `Tab` included, except `Ctrl+\`, which takes you
+back to the sidebar.
+
+A split keeps a session on screen while the selection moves on: up to two of them, beside the selected
+session's pane when each pane can be at least 80 columns wide, and stacked below it when not. Each pane's
+session is sized to its pane. `Tab` from the sidebar goes on to the pane after the one you typed into last, so
+`Tab`, then `Ctrl+\`, then `Tab` again walks through them all.
 
 The sidebar groups sessions by project, then by worktree: `⌂` marks a repository's main worktree and `⎇` a
 linked one, each named by its branch. Sessions outside any repository come last, under their directory.
@@ -165,7 +172,7 @@ commands talk to it over a unix socket, so closing the TUI never stops an agent.
 - [x] Session status from the screen, for agents without hooks
 - [x] Projects and worktrees
 - [x] Resume after a restart
-- [ ] Split panes
+- [x] Split panes
 - [x] Agents that start, message, wait on and read other agents
 
 ## Development
