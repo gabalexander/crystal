@@ -2,9 +2,11 @@
 
 use crate::protocol::{SessionInfo, State};
 use anyhow::Result;
-use portable_pty::{CommandBuilder, ExitStatus, PtySize, native_pty_system};
-use std::io;
+use portable_pty::{CommandBuilder, ExitStatus, MasterPty, PtySize, native_pty_system};
+use std::io::{self, ErrorKind, Read, Write};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -13,12 +15,16 @@ use std::time::Duration;
 /// killed outright.
 pub const STOP_GRACE: Duration = Duration::from_secs(2);
 
+/// Chunks of output a viewer may fall behind by before it's dropped.
+const VIEWER_BACKLOG: usize = 256;
+
 pub struct Session {
     pub name: String,
     command: Vec<String>,
     cwd: PathBuf,
     pid: Option<u32>,
     state: Arc<Mutex<State>>,
+    term: Arc<Term>,
 }
 
 impl Session {
@@ -28,12 +34,7 @@ impl Session {
         cwd: PathBuf,
         env: &[(&str, &str)],
     ) -> Result<Session> {
-        let pty = native_pty_system().openpty(PtySize {
-            rows: 24,
-            cols: 80,
-            pixel_width: 0,
-            pixel_height: 0,
-        })?;
+        let pty = native_pty_system().openpty(size(24, 80))?;
         let mut builder = CommandBuilder::new(&command[0]);
         builder.args(&command[1..]);
         builder.cwd(&cwd);
@@ -45,10 +46,20 @@ impl Session {
         // ends the output.
         drop(pty.slave);
 
-        // Nothing shows the output yet, but someone has to read it: a full
-        // PTY buffer blocks the program on its next write.
-        let mut output = pty.master.try_clone_reader()?;
-        thread::spawn(move || io::copy(&mut output, &mut io::sink()));
+        let output = pty.master.try_clone_reader()?;
+        let term = Arc::new(Term {
+            input: Mutex::new(pty.master.take_writer()?),
+            pty: Mutex::new(pty.master),
+            screen: Mutex::new(Screen {
+                parser: vt100::Parser::new_with_callbacks(24, 80, 0, Replies::default()),
+                viewers: Vec::new(),
+                ended: false,
+            }),
+        });
+        thread::spawn({
+            let term = term.clone();
+            move || term.pump(output)
+        });
 
         let pid = child.process_id();
         let state = Arc::new(Mutex::new(State::Running));
@@ -67,6 +78,7 @@ impl Session {
             cwd,
             pid,
             state,
+            term,
         })
     }
 
@@ -84,6 +96,10 @@ impl Session {
         }
     }
 
+    pub fn term(&self) -> Arc<Term> {
+        self.term.clone()
+    }
+
     /// Hangs up on everything the session started, the way closing a
     /// terminal window does, and kills whatever is still there after
     /// [`STOP_GRACE`].
@@ -99,6 +115,143 @@ impl Session {
                 signal_group(pid, libc::SIGKILL);
             }
         });
+    }
+}
+
+/// The daemon's end of a session's PTY: the screen the program has drawn,
+/// the clients watching it, and the way in.
+pub struct Term {
+    pty: Mutex<Box<dyn MasterPty + Send>>,
+    input: Mutex<Box<dyn Write + Send>>,
+    screen: Mutex<Screen>,
+}
+
+struct Screen {
+    parser: vt100::Parser<Replies>,
+    viewers: Vec<Viewer>,
+    /// The program has closed its end: there will be no more output.
+    ended: bool,
+}
+
+struct Viewer {
+    id: u64,
+    feed: SyncSender<Arc<[u8]>>,
+}
+
+/// A new viewer's start: the screen as it is now, then everything the
+/// program writes after it.
+pub struct Watch {
+    pub id: u64,
+    pub screen: Vec<u8>,
+    /// `None` once the program has ended.
+    pub feed: Option<Receiver<Arc<[u8]>>>,
+}
+
+impl Term {
+    pub fn watch(&self) -> Watch {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let mut screen = self.screen.lock().unwrap();
+        let snapshot = screen.parser.screen().state_formatted();
+        let feed = (!screen.ended).then(|| {
+            let (feed, rx) = mpsc::sync_channel(VIEWER_BACKLOG);
+            screen.viewers.push(Viewer { id, feed });
+            rx
+        });
+        Watch {
+            id,
+            screen: snapshot,
+            feed,
+        }
+    }
+
+    pub fn unwatch(&self, id: u64) {
+        let mut screen = self.screen.lock().unwrap();
+        screen.viewers.retain(|viewer| viewer.id != id);
+    }
+
+    pub fn write(&self, bytes: &[u8]) -> io::Result<()> {
+        self.input.lock().unwrap().write_all(bytes)
+    }
+
+    pub fn resize(&self, rows: u16, cols: u16) -> Result<()> {
+        let mut screen = self.screen.lock().unwrap();
+        screen.parser.screen_mut().set_size(rows, cols);
+        self.pty.lock().unwrap().resize(size(rows, cols))
+    }
+
+    /// Reads the program's output until it closes the terminal: keeps the
+    /// screen up to date, passes the output on to every viewer, and answers
+    /// the program's questions to its terminal.
+    fn pump(&self, mut output: Box<dyn Read + Send>) {
+        let mut buf = [0; 16 * 1024];
+        loop {
+            let n = match output.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(err) if err.kind() == ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            };
+            let chunk: Arc<[u8]> = buf[..n].into();
+            let replies = {
+                let mut screen = self.screen.lock().unwrap();
+                screen.parser.process(&chunk);
+                // A viewer that's gone, or too far behind to catch up, is
+                // dropped rather than holding up the program.
+                screen
+                    .viewers
+                    .retain(|viewer| viewer.feed.try_send(chunk.clone()).is_ok());
+                std::mem::take(&mut screen.parser.callbacks_mut().0)
+            };
+            if !replies.is_empty() {
+                let _ = self.write(&replies);
+            }
+        }
+        let mut screen = self.screen.lock().unwrap();
+        screen.ended = true;
+        screen.viewers.clear();
+    }
+}
+
+/// Answers what programs ask their terminal: where the cursor is, and what
+/// kind of terminal it is. Viewers only draw, so the answers come from here,
+/// whether anyone's watching or not.
+#[derive(Default)]
+struct Replies(Vec<u8>);
+
+impl vt100::Callbacks for Replies {
+    fn unhandled_csi(
+        &mut self,
+        screen: &mut vt100::Screen,
+        i1: Option<u8>,
+        _i2: Option<u8>,
+        params: &[&[u16]],
+        c: char,
+    ) {
+        let param = params.first().and_then(|param| param.first()).copied();
+        match (i1, c, param.unwrap_or(0)) {
+            // Device status.
+            (None, 'n', 5) => self.0.extend_from_slice(b"\x1b[0n"),
+            // Cursor position, 1-based.
+            (None, 'n', 6) => {
+                let (row, col) = screen.cursor_position();
+                let _ = write!(self.0, "\x1b[{};{}R", row + 1, col + 1);
+            }
+            // Primary device attributes: a VT100 with advanced video.
+            (None, 'c', 0) => self.0.extend_from_slice(b"\x1b[?1;2c"),
+            // Secondary device attributes.
+            (Some(b'>'), 'c', 0) => self.0.extend_from_slice(b"\x1b[>0;0;0c"),
+            _ => {}
+        }
+    }
+}
+
+fn size(rows: u16, cols: u16) -> PtySize {
+    PtySize {
+        rows,
+        cols,
+        pixel_width: 0,
+        pixel_height: 0,
     }
 }
 

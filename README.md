@@ -52,11 +52,12 @@ cargo install --git https://github.com/gabalexander/crystal
 There's no TUI yet. For now crystal is a CLI for the daemon:
 
 ```sh
-crystal new claude                       # start Claude Code in the current directory
-crystal new -n review -c ~/code/app codex   # pick the name and the directory
-crystal ls                               # list sessions and how they're doing
-crystal kill review                      # stop one session
-crystal kill-server                      # stop every session, and the daemon
+crystal new claude                          # start Claude Code here and attach to it
+crystal new -d -n review -c ~/code/app codex   # start one in the background, named, somewhere else
+crystal ls                                  # list sessions and how they're doing
+crystal attach review                       # show a session; Ctrl+\ hands your terminal back
+crystal kill review                         # stop one session
+crystal kill-server                         # stop every session, and the daemon
 ```
 
 ```
@@ -66,8 +67,9 @@ claude  running   41210  ~/code/app  claude
 review  exited 0  41388  ~/code/app  codex
 ```
 
-The first `crystal new` starts the daemon. Sessions keep running after you close the terminal you started them
-from. You can't attach to a session yet; that's next on the roadmap.
+The first `crystal new` starts the daemon. Sessions keep running after you detach or close the terminal, and
+`crystal attach` picks up exactly where the screen was. With no name it attaches to the newest session; on a
+session that has ended, it prints the last screen and how the program exited.
 
 ## How it works
 
@@ -86,7 +88,7 @@ commands talk to it over a unix socket, so closing the TUI never stops an agent.
 
 - [x] Project skeleton
 - [x] Daemon that runs an agent in a PTY and keeps it alive
-- [ ] Attach and detach
+- [x] Attach and detach
 - [ ] Session list in a sidebar
 - [ ] Session status, from agent hooks first, then from the screen
 - [ ] Projects and worktrees

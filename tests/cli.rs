@@ -1,10 +1,15 @@
 //! Drives the real binary against a daemon of its own per test.
 
+use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
+
+const CRYSTAL: &str = env!("CARGO_BIN_EXE_crystal");
 
 struct Crystal {
     dir: TempDir,
@@ -19,7 +24,7 @@ impl Crystal {
     }
 
     fn run(&self, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_crystal"))
+        Command::new(CRYSTAL)
             .arg("--socket")
             .arg(&self.socket)
             .args(args)
@@ -63,6 +68,111 @@ impl Crystal {
     fn pid(&self, name: &str) -> i32 {
         self.row(name).unwrap()[2].parse().unwrap()
     }
+
+    /// Runs crystal in a terminal of its own, the way a person would.
+    fn terminal(&self, args: &[&str]) -> Terminal {
+        let pty = native_pty_system().openpty(size(24, 80)).unwrap();
+        let mut command = CommandBuilder::new(CRYSTAL);
+        command.arg("--socket");
+        command.arg(&self.socket);
+        command.args(args);
+        command.cwd(self.dir.path());
+        command.env_remove("CRYSTAL_SESSION");
+        let child = pty.slave.spawn_command(command).unwrap();
+        drop(pty.slave);
+
+        let screen = Arc::new(Mutex::new(vt100::Parser::new(24, 80, 0)));
+        let mut output = pty.master.try_clone_reader().unwrap();
+        thread::spawn({
+            let screen = screen.clone();
+            move || {
+                let mut buf = [0; 4096];
+                while let Ok(n @ 1..) = output.read(&mut buf) {
+                    screen.lock().unwrap().process(&buf[..n]);
+                }
+            }
+        });
+        Terminal {
+            screen,
+            keys: pty.master.take_writer().unwrap(),
+            pty: pty.master,
+            child,
+        }
+    }
+}
+
+struct Terminal {
+    screen: Arc<Mutex<vt100::Parser>>,
+    keys: Box<dyn Write + Send>,
+    pty: Box<dyn MasterPty + Send>,
+    child: Box<dyn Child + Send + Sync>,
+}
+
+impl Terminal {
+    fn text(&self) -> String {
+        self.screen.lock().unwrap().screen().contents()
+    }
+
+    fn shows(&self, text: &str) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !self.text().contains(text) {
+            assert!(
+                Instant::now() < deadline,
+                "{text:?} never showed up; the screen was:\n{}",
+                self.text()
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn type_keys(&mut self, keys: &str) {
+        self.keys.write_all(keys.as_bytes()).unwrap();
+        self.keys.flush().unwrap();
+    }
+
+    fn resize(&self, rows: u16, cols: u16) {
+        self.pty.resize(size(rows, cols)).unwrap();
+        self.screen
+            .lock()
+            .unwrap()
+            .screen_mut()
+            .set_size(rows, cols);
+    }
+
+    /// Waits for crystal to exit, and says whether it succeeded.
+    fn exit(&mut self) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                return status.success();
+            }
+            assert!(Instant::now() < deadline, "crystal never exited");
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+impl Drop for Terminal {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+    }
+}
+
+fn size(rows: u16, cols: u16) -> PtySize {
+    PtySize {
+        rows,
+        cols,
+        pixel_width: 0,
+        pixel_height: 0,
+    }
+}
+
+/// Waits for a file a session writes, ended by a newline.
+fn written(file: &Path) -> String {
+    eventually(&format!("{} is written", file.display()), || {
+        std::fs::read_to_string(file).is_ok_and(|text| text.ends_with('\n'))
+    });
+    std::fs::read_to_string(file).unwrap()
 }
 
 impl Drop for Crystal {
@@ -235,4 +345,148 @@ fn a_stale_socket_does_not_stop_the_daemon_from_starting() {
         crystal.ok(&["new", "-n", "fresh", "sleep", "30"]),
         "fresh\n"
     );
+}
+
+#[test]
+fn attach_shows_the_session_until_ctrl_backslash() {
+    let crystal = Crystal::new();
+    crystal.ok(&["new", "-n", "cat", "cat"]);
+
+    let mut terminal = crystal.terminal(&["attach", "cat"]);
+    terminal.type_keys("hello from the keyboard\r");
+    terminal.shows("hello from the keyboard");
+
+    terminal.type_keys("\x1c");
+    terminal.shows("[detached from cat]");
+    assert!(terminal.exit());
+    assert_eq!(crystal.row("cat").unwrap()[1], "running");
+}
+
+#[test]
+fn attach_starts_from_what_is_already_on_screen() {
+    let crystal = Crystal::new();
+    crystal.ok(&[
+        "new",
+        "-n",
+        "greeter",
+        "sh",
+        "-c",
+        "echo ready when you are; echo > printed; sleep 30",
+    ]);
+    written(&crystal.dir.path().join("printed"));
+
+    let terminal = crystal.terminal(&["attach", "greeter"]);
+    terminal.shows("ready when you are");
+}
+
+#[test]
+fn new_attaches_when_run_in_a_terminal() {
+    let crystal = Crystal::new();
+    let mut terminal = crystal.terminal(&["new", "-n", "shell", "sh"]);
+    terminal.type_keys("echo I am $CRYSTAL_SESSION\r");
+    terminal.shows("I am shell");
+
+    terminal.type_keys("\x1c");
+    terminal.shows("[detached from shell]");
+    assert!(terminal.exit());
+}
+
+#[test]
+fn attach_without_a_name_picks_the_newest_session() {
+    let crystal = Crystal::new();
+    crystal.ok(&["new", "-n", "older", "sleep", "30"]);
+    crystal.ok(&["new", "-n", "newest", "sh"]);
+
+    let mut terminal = crystal.terminal(&["attach"]);
+    terminal.type_keys("echo I am $CRYSTAL_SESSION\r");
+    terminal.shows("I am newest");
+}
+
+#[test]
+fn attach_ends_when_the_program_does() {
+    let crystal = Crystal::new();
+    crystal.ok(&["new", "-n", "brief", "sh", "-c", "read line; exit 7"]);
+
+    let mut terminal = crystal.terminal(&["attach", "brief"]);
+    terminal.type_keys("bye\r");
+    terminal.shows("[brief exited 7]");
+    assert!(terminal.exit());
+}
+
+#[test]
+fn attaching_to_an_ended_session_prints_its_last_screen() {
+    let crystal = Crystal::new();
+    crystal.ok(&["new", "-n", "done", "sh", "-c", "echo last words"]);
+    eventually("the session has ended", || {
+        crystal.row("done").unwrap()[1] == "exited 0"
+    });
+
+    let mut terminal = crystal.terminal(&["attach", "done"]);
+    terminal.shows("last words");
+    terminal.shows("[done exited 0]");
+    assert!(terminal.exit());
+}
+
+#[test]
+fn a_resize_reaches_the_program() {
+    let crystal = Crystal::new();
+    crystal.ok(&[
+        "new",
+        "-n",
+        "sizer",
+        "sh",
+        "-c",
+        "trap 'stty size > size' WINCH; echo watching; while :; do sleep 0.05; done",
+    ]);
+
+    let terminal = crystal.terminal(&["attach", "sizer"]);
+    terminal.shows("watching");
+    terminal.resize(30, 100);
+    assert_eq!(written(&crystal.dir.path().join("size")), "30 100\n");
+}
+
+#[test]
+fn the_daemon_tells_a_program_where_its_cursor_is() {
+    let crystal = Crystal::new();
+    crystal.ok(&[
+        "new",
+        "-n",
+        "asker",
+        "sh",
+        "-c",
+        r"stty raw -echo; printf 'hi\033[6n'; dd bs=1 count=6 2>/dev/null > reply; echo >> reply",
+    ]);
+
+    assert_eq!(written(&crystal.dir.path().join("reply")), "\x1b[1;3R\n");
+}
+
+#[test]
+fn attach_needs_a_terminal() {
+    let crystal = Crystal::new();
+    crystal.ok(&["new", "-n", "x", "sleep", "30"]);
+    assert!(
+        crystal
+            .fails(&["attach", "x"])
+            .contains("attach needs a terminal")
+    );
+}
+
+#[test]
+fn attach_to_a_missing_session_fails() {
+    let crystal = Crystal::new();
+    crystal.ok(&["new", "-n", "x", "sleep", "30"]);
+
+    let mut terminal = crystal.terminal(&["attach", "nope"]);
+    terminal.shows("no session named nope");
+    assert!(!terminal.exit());
+}
+
+#[test]
+fn a_session_cannot_attach_to_itself() {
+    let crystal = Crystal::new();
+    crystal.ok(&["new", "-n", "loop", "sh"]);
+
+    let mut terminal = crystal.terminal(&["attach", "loop"]);
+    terminal.type_keys(&format!("{CRYSTAL} attach loop\r"));
+    terminal.shows("can't attach loop to itself");
 }

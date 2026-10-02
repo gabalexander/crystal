@@ -1,3 +1,4 @@
+mod attach;
 mod client;
 mod daemon;
 mod protocol;
@@ -7,6 +8,7 @@ mod socket;
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
 use protocol::{Request, Response, SessionInfo};
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -25,7 +27,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Start a session running a command, or your shell if there's none.
+    /// Start a session running a command, or your shell if there's none,
+    /// and attach to it when run in a terminal.
     New {
         /// The session's name [default: the program's name]
         #[arg(short, long)]
@@ -35,6 +38,10 @@ enum Command {
         #[arg(short = 'c', long)]
         cwd: Option<PathBuf>,
 
+        /// Don't attach; print the session's name instead.
+        #[arg(short, long)]
+        detached: bool,
+
         /// The command and its arguments.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
@@ -42,6 +49,12 @@ enum Command {
     /// List the sessions.
     #[command(visible_alias = "list")]
     Ls,
+    /// Show a session in this terminal; Ctrl+\ detaches.
+    #[command(visible_alias = "a")]
+    Attach {
+        /// The session [default: the newest one]
+        name: Option<String>,
+    },
     /// Stop a session and remove it from the list.
     Kill { name: String },
     /// Stop every session and the daemon.
@@ -64,7 +77,12 @@ fn main() -> ExitCode {
 fn run(cli: Cli) -> Result<()> {
     let socket = cli.socket.unwrap_or_else(socket::default_path);
     match cli.command {
-        Command::New { name, cwd, command } => {
+        Command::New {
+            name,
+            cwd,
+            detached,
+            command,
+        } => {
             let cwd = std::path::absolute(cwd.unwrap_or(std::env::current_dir()?))?;
             let command = match command.is_empty() {
                 true => vec![std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into())],
@@ -72,9 +90,14 @@ fn run(cli: Cli) -> Result<()> {
             };
             let request = Request::New { name, cwd, command };
             if let Some(Response::Created { name }) = client::ask(&socket, &request, true)? {
-                println!("{name}");
+                match !detached && std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
+                {
+                    true => attach::run(&socket, Some(&name))?,
+                    false => println!("{name}"),
+                }
             }
         }
+        Command::Attach { name } => attach::run(&socket, name.as_deref())?,
         Command::Ls => {
             if let Some(Response::Sessions { sessions }) =
                 client::ask(&socket, &Request::List, false)?

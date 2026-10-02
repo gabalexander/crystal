@@ -2,11 +2,12 @@
 //! terminal it was started from, so sessions keep running when the
 //! client goes away.
 
-use crate::protocol::{self, Request, Response};
-use crate::session::{STOP_GRACE, Session};
+use crate::protocol::{self, Frame, Request, Response};
+use crate::session::{STOP_GRACE, Session, Term};
 use crate::socket;
 use anyhow::{Context, Result, bail, ensure};
-use std::io::{BufReader, ErrorKind};
+use std::io::{BufReader, ErrorKind, Write};
+use std::net::Shutdown;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -61,13 +62,18 @@ struct Daemon {
 
 impl Daemon {
     fn serve(&self, conn: UnixStream) -> Result<()> {
-        let Some(request) = protocol::recv(BufReader::new(&conn))? else {
+        let mut input = BufReader::new(&conn);
+        let Some(request) = protocol::recv(&mut input)? else {
             return Ok(());
         };
+        if let Request::Attach { name, rows, cols } = request {
+            return match self.find(name.as_deref()) {
+                Ok((name, term)) => attach(&conn, input, name, &term, rows, cols),
+                Err(err) => Ok(protocol::send(&conn, &Response::from(err))?),
+            };
+        }
         let shutdown = matches!(request, Request::Shutdown);
-        let response = self.handle(request).unwrap_or_else(|err| Response::Error {
-            message: format!("{err:#}"),
-        });
+        let response = self.handle(request).unwrap_or_else(Response::from);
         protocol::send(&conn, &response)?;
         if shutdown {
             let _ = fs::remove_file(&self.socket);
@@ -76,8 +82,22 @@ impl Daemon {
         Ok(())
     }
 
+    /// The session called `name`, or the newest one.
+    fn find(&self, name: Option<&str>) -> Result<(String, Arc<Term>)> {
+        let sessions = self.sessions.lock().unwrap();
+        let session = match name {
+            Some(name) => sessions
+                .iter()
+                .find(|session| session.name == name)
+                .with_context(|| format!("no session named {name}"))?,
+            None => sessions.last().context("there are no sessions")?,
+        };
+        Ok((session.name.clone(), session.term()))
+    }
+
     fn handle(&self, request: Request) -> Result<Response> {
         match request {
+            Request::Attach { .. } => bail!("attach takes over the connection"),
             Request::New { name, cwd, command } => self.new_session(name, cwd, command),
             Request::List => {
                 let sessions = self.sessions.lock().unwrap();
@@ -143,6 +163,59 @@ impl Daemon {
         let session = Session::spawn(name.clone(), command, cwd, &env)?;
         sessions.push(session);
         Ok(Response::Created { name })
+    }
+}
+
+/// Shows a session to a client until either of them goes: first the screen
+/// as it is, then the output as it comes, while the client's keys and size
+/// go to the session.
+fn attach(
+    conn: &UnixStream,
+    mut input: BufReader<&UnixStream>,
+    name: String,
+    term: &Term,
+    rows: u16,
+    cols: u16,
+) -> Result<()> {
+    term.resize(rows, cols)?;
+    let watch = term.watch();
+    let running = watch.feed.is_some();
+    protocol::send(conn, &Response::Attached { name, running })?;
+    let mut output = conn.try_clone()?;
+    output.write_all(&watch.screen)?;
+    match watch.feed {
+        Some(feed) => {
+            thread::spawn(move || {
+                for chunk in feed {
+                    if output.write_all(&chunk).is_err() {
+                        break;
+                    }
+                }
+                // The session has ended: the client sees the end of the
+                // output and goes.
+                let _ = output.shutdown(Shutdown::Write);
+            });
+        }
+        None => conn.shutdown(Shutdown::Write)?,
+    }
+
+    while let Ok(Some(frame)) = protocol::recv_frame(&mut input) {
+        match frame {
+            Frame::Input(keys) => {
+                let _ = term.write(&keys);
+            }
+            Frame::Resize { rows, cols } => term.resize(rows, cols)?,
+        }
+    }
+    term.unwatch(watch.id);
+    Ok(())
+}
+
+impl From<anyhow::Error> for Response {
+    fn from(err: anyhow::Error) -> Response {
+        Response::Error {
+            message: format!("{err:#}"),
+        }
     }
 }
 
