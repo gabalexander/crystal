@@ -80,9 +80,17 @@ struct Daemon {
 impl Daemon {
     fn serve(&self, conn: UnixStream) -> Result<()> {
         let mut input = BufReader::new(&conn);
-        let Some(request) = protocol::recv(&mut input)? else {
+        let Some(incoming) = protocol::recv_request(&mut input)? else {
             return Ok(());
         };
+        // A shutdown goes through whatever the versions: it's how a crystal
+        // of another version gets this daemon out of its way.
+        let ours = protocol::version();
+        if incoming.version.as_deref() != Some(ours.as_str()) && !incoming.is_shutdown() {
+            let message = version_mismatch(&ours, incoming.version.as_deref());
+            return Ok(protocol::send(&conn, &Response::Error { message })?);
+        }
+        let request = incoming.request()?;
         if let Request::Attach { name, rows, cols } = request {
             return match self.find(name.as_deref()) {
                 Ok((name, term)) => attach(&conn, input, name, &term, rows, cols),
@@ -340,6 +348,19 @@ fn attach(
     Ok(())
 }
 
+/// What to tell a crystal of another version than this daemon's. Starting
+/// the daemon again from that crystal makes the two match.
+fn version_mismatch(daemon: &str, client: Option<&str>) -> String {
+    let client = match client {
+        Some(version) => format!("crystal {version}"),
+        None => "an older crystal".to_string(),
+    };
+    format!(
+        "this is {client}, but the daemon is crystal {daemon}: \
+         run `crystal restart-server` to restart the daemon on this crystal"
+    )
+}
+
 impl From<anyhow::Error> for Response {
     fn from(err: anyhow::Error) -> Response {
         Response::Error {
@@ -379,6 +400,16 @@ fn unique_name(program: &str, taken: impl Fn(&str) -> bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_mismatch_says_both_versions_and_the_way_out() {
+        assert_eq!(
+            version_mismatch("0.1.0", Some("0.2.0")),
+            "this is crystal 0.2.0, but the daemon is crystal 0.1.0: \
+             run `crystal restart-server` to restart the daemon on this crystal"
+        );
+        assert!(version_mismatch("0.1.0", None).starts_with("this is an older crystal,"));
+    }
 
     #[test]
     fn a_name_comes_from_the_program() {

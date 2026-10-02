@@ -24,9 +24,13 @@ pub fn ask(socket: &Path, request: &Request, start: bool) -> Result<Option<Respo
         Err(_) if !start => return Ok(None),
         Err(_) => start_daemon(socket)?,
     };
-    protocol::send(&conn, request)?;
-    let response =
-        protocol::recv(BufReader::new(&conn))?.context("the daemon hung up without answering")?;
+    protocol::send_request(&conn, request)?;
+    // A daemon from before requests carried their version can't say that
+    // it's another version: it hangs up on what it doesn't understand.
+    let response = protocol::recv(BufReader::new(&conn))?.context(
+        "the daemon hung up without answering; if crystal was just upgraded, \
+         run `crystal restart-server`",
+    )?;
     match response {
         Response::Error { message } => bail!(message),
         response => Ok(Some(response)),

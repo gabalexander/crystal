@@ -1486,3 +1486,75 @@ fn restart_server_without_a_daemon_starts_nothing() {
     assert_eq!(crystal.ok(&["restart-server"]), "no daemon was running\n");
     assert!(!crystal.socket.exists());
 }
+
+impl Crystal {
+    /// Starts a daemon that takes itself for crystal 0.0.1, the way one left
+    /// running from an older install would be.
+    fn start_older_daemon(&self) -> std::process::Child {
+        let daemon = self
+            .command(&["daemon"])
+            .env("CRYSTAL_PRETEND_VERSION", "0.0.1")
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        eventually("the daemon is listening", || self.socket.exists());
+        daemon
+    }
+}
+
+#[test]
+fn a_daemon_of_another_version_says_how_to_restart_it() {
+    let crystal = Crystal::new();
+    let mut older = crystal.start_older_daemon();
+
+    let err = crystal.fails(&["ls"]);
+    let ours = env!("CARGO_PKG_VERSION");
+    assert_eq!(
+        err,
+        format!(
+            "crystal: this is crystal {ours}, but the daemon is crystal 0.0.1: \
+             run `crystal restart-server` to restart the daemon on this crystal\n"
+        )
+    );
+
+    // Restarting goes through whatever the version, and ends the mismatch.
+    assert_eq!(crystal.ok(&["restart-server"]), "restarted the daemon\n");
+    older.wait().unwrap();
+    assert_eq!(crystal.ok(&["ls"]), "");
+}
+
+#[test]
+fn kill_server_stops_a_daemon_of_another_version() {
+    let crystal = Crystal::new();
+    let mut older = crystal.start_older_daemon();
+    crystal.ok(&["kill-server"]);
+    older.wait().unwrap();
+    assert!(!crystal.socket.exists());
+}
+
+#[test]
+fn a_hook_stays_quiet_with_a_daemon_of_another_version() {
+    let crystal = Crystal::new();
+    let mut older = crystal.start_older_daemon();
+    let mut child = crystal
+        .command(&["hook", "claude"])
+        .env("CRYSTAL_SESSION", "agent")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(br#"{"hook_event_name":"Stop"}"#)
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success());
+    assert!(out.stdout.is_empty());
+    assert!(out.stderr.is_empty());
+
+    crystal.ok(&["kill-server"]);
+    older.wait().unwrap();
+}

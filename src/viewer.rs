@@ -42,7 +42,7 @@ impl Viewer {
             rows,
             cols,
         };
-        protocol::send(&conn, &request)?;
+        protocol::send_request(&conn, &request)?;
 
         // The same reader goes on to read the output: it may already hold
         // the first of it.
