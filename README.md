@@ -73,9 +73,11 @@ Each row says what its session is doing. Sessions waiting on you move to the top
 | `▶` | running: an agent at its prompt, or any other program |
 | `■` | ended, with how it exited |
 
-crystal knows what Claude Code is doing from its hooks. It adds them with `--settings` when it starts
-`claude`, so your settings files are left alone and your own hooks still run. Other agents show as running
-for now.
+crystal knows what an agent is doing in two ways. When it starts Claude Code itself, it adds hooks with
+`--settings`, so your settings files are left alone and your own hooks still run. And for every session it
+reads the screen: the spinner an agent puts in its title, "esc to interrupt" while it works, the question
+it asks before a command. The screen covers agents without hooks, like Codex or a Claude you started from a
+shell, and what hooks never say: a turn you cut short with Esc, or work carrying on once you've said yes.
 
 Everything is also a command, for scripts and for agents:
 
@@ -120,7 +122,7 @@ commands talk to it over a unix socket, so closing the TUI never stops an agent.
 - [x] Attach and detach
 - [x] Session list in a sidebar
 - [x] Session status from Claude Code's hooks
-- [ ] Session status from the screen, for agents without hooks
+- [x] Session status from the screen, for agents without hooks
 - [ ] Projects and worktrees
 - [ ] Resume after a restart
 - [ ] Split panes

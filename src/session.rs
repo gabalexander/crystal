@@ -1,5 +1,6 @@
 //! A program running in a PTY of its own.
 
+use crate::agent_screen::{self, Looks, ScreenWatch};
 use crate::protocol::{Activity, AgentEvent, SessionInfo, State};
 use anyhow::Result;
 use portable_pty::{CommandBuilder, ExitStatus, MasterPty, PtySize, native_pty_system};
@@ -29,6 +30,8 @@ pub struct Session {
     /// `None` until an agent reports what it's doing; most programs never
     /// do.
     activity: Option<Activity>,
+    /// What the screen has been saying the agent is doing.
+    screen_watch: ScreenWatch,
     term: Arc<Term>,
 }
 
@@ -61,7 +64,7 @@ impl Session {
             input: Mutex::new(pty.master.take_writer()?),
             pty: Mutex::new(pty.master),
             screen: Mutex::new(Screen {
-                parser: vt100::Parser::new_with_callbacks(24, 80, 0, Replies::default()),
+                parser: vt100::Parser::new_with_callbacks(24, 80, 0, Callbacks::default()),
                 viewers: Vec::new(),
                 ended: false,
             }),
@@ -89,6 +92,7 @@ impl Session {
             pid,
             state,
             activity: None,
+            screen_watch: ScreenWatch::default(),
             term,
         })
     }
@@ -111,6 +115,18 @@ impl Session {
     /// Works out what the agent is doing from what it just reported.
     pub fn on_agent_event(&mut self, event: AgentEvent) {
         self.activity = next_activity(self.activity, event, self.term.is_watched());
+    }
+
+    /// Reads what the agent is doing off the screen, and takes it as an
+    /// event when that has changed.
+    pub fn check_screen(&mut self) {
+        if !self.is_running() {
+            return;
+        }
+        let looks = self.term.looks();
+        if let Some(event) = self.screen_watch.update(looks) {
+            self.on_agent_event(event);
+        }
     }
 
     /// Someone has just looked at the session.
@@ -151,7 +167,7 @@ pub struct Term {
 }
 
 struct Screen {
-    parser: vt100::Parser<Replies>,
+    parser: vt100::Parser<Callbacks>,
     viewers: Vec<Viewer>,
     /// The program has closed its end: there will be no more output.
     ended: bool,
@@ -187,6 +203,12 @@ impl Term {
             screen: snapshot,
             feed,
         }
+    }
+
+    /// What the screen says the agent is doing.
+    pub fn looks(&self) -> Looks {
+        let screen = self.screen.lock().unwrap();
+        agent_screen::read(screen.parser.screen(), &screen.parser.callbacks().title)
     }
 
     pub fn is_watched(&self) -> bool {
@@ -229,7 +251,7 @@ impl Term {
                 screen
                     .viewers
                     .retain(|viewer| viewer.feed.try_send(chunk.clone()).is_ok());
-                std::mem::take(&mut screen.parser.callbacks_mut().0)
+                std::mem::take(&mut screen.parser.callbacks_mut().replies)
             };
             if !replies.is_empty() {
                 let _ = self.write(&replies);
@@ -241,13 +263,23 @@ impl Term {
     }
 }
 
-/// Answers what programs ask their terminal: where the cursor is, and what
-/// kind of terminal it is. Viewers only draw, so the answers come from here,
-/// whether anyone's watching or not.
+/// What vt100 hands back to us as it reads a program's output: questions
+/// the program asks its terminal, and the title it gives it.
 #[derive(Default)]
-struct Replies(Vec<u8>);
+struct Callbacks {
+    /// Answers to send back: where the cursor is, and what kind of terminal
+    /// this is. Viewers only draw, so the answers come from here, whether
+    /// anyone's watching or not.
+    replies: Vec<u8>,
+    /// Agents put a spinner here while they work.
+    title: String,
+}
 
-impl vt100::Callbacks for Replies {
+impl vt100::Callbacks for Callbacks {
+    fn set_window_title(&mut self, _: &mut vt100::Screen, title: &[u8]) {
+        self.title = String::from_utf8_lossy(title).into_owned();
+    }
+
     fn unhandled_csi(
         &mut self,
         screen: &mut vt100::Screen,
@@ -259,16 +291,16 @@ impl vt100::Callbacks for Replies {
         let param = params.first().and_then(|param| param.first()).copied();
         match (i1, c, param.unwrap_or(0)) {
             // Device status.
-            (None, 'n', 5) => self.0.extend_from_slice(b"\x1b[0n"),
+            (None, 'n', 5) => self.replies.extend_from_slice(b"\x1b[0n"),
             // Cursor position, 1-based.
             (None, 'n', 6) => {
                 let (row, col) = screen.cursor_position();
-                let _ = write!(self.0, "\x1b[{};{}R", row + 1, col + 1);
+                let _ = write!(self.replies, "\x1b[{};{}R", row + 1, col + 1);
             }
             // Primary device attributes: a VT100 with advanced video.
-            (None, 'c', 0) => self.0.extend_from_slice(b"\x1b[?1;2c"),
+            (None, 'c', 0) => self.replies.extend_from_slice(b"\x1b[?1;2c"),
             // Secondary device attributes.
-            (Some(b'>'), 'c', 0) => self.0.extend_from_slice(b"\x1b[>0;0;0c"),
+            (Some(b'>'), 'c', 0) => self.replies.extend_from_slice(b"\x1b[>0;0;0c"),
             _ => {}
         }
     }

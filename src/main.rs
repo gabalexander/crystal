@@ -1,3 +1,4 @@
+mod agent_screen;
 mod agents;
 mod attach;
 mod client;

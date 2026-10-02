@@ -29,6 +29,7 @@ Run lint, format and tests before every commit.
 - `src/daemon.rs`: the daemon: listens on the socket and owns the sessions
 - `src/agents.rs`: what crystal knows about particular agents: the hooks it adds to Claude Code, and what they mean
 - `src/hook.rs`: `crystal hook <agent>`: what those hooks run, to tell the daemon
+- `src/agent_screen.rs`: reading what an agent is doing off its screen and title
 - `src/session.rs`: one program in a PTY: spawn, exit status, stop, and its screen (vt100) and viewers
 - `src/protocol.rs`: requests and responses, one JSON line each, and the frames an attached client sends
 - `src/socket.rs`: where the socket lives

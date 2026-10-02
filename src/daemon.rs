@@ -16,6 +16,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use std::{fs, process, thread};
 
+/// How often every session's screen is read for what its agent is doing.
+const SCREEN_CHECK_EVERY: Duration = Duration::from_millis(250);
+
 pub fn run(socket: &Path) -> Result<()> {
     // Leave the client's terminal, so closing it doesn't hang up the
     // daemon. Fails harmlessly when run in the foreground from a shell.
@@ -27,6 +30,10 @@ pub fn run(socket: &Path) -> Result<()> {
     let daemon = Arc::new(Daemon {
         socket: socket.to_path_buf(),
         sessions: Mutex::default(),
+    });
+    thread::spawn({
+        let daemon = daemon.clone();
+        move || daemon.check_screens()
     });
     for conn in listener.incoming() {
         let Ok(conn) = conn else { continue };
@@ -85,6 +92,17 @@ impl Daemon {
     }
 
     /// The session called `name`, or the newest one.
+    /// Reads every session's screen, again and again, for what its agent
+    /// is doing.
+    fn check_screens(&self) {
+        loop {
+            thread::sleep(SCREEN_CHECK_EVERY);
+            for session in self.sessions.lock().unwrap().iter_mut() {
+                session.check_screen();
+            }
+        }
+    }
+
     /// The session called `name`, or the newest one, for a client about to
     /// show it. That counts as having seen it.
     fn find(&self, name: Option<&str>) -> Result<(String, Arc<Term>)> {

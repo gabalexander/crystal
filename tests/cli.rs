@@ -766,3 +766,27 @@ fn a_hook_outside_a_session_does_nothing_quietly() {
     assert!(out.stdout.is_empty());
     assert!(!crystal.socket.exists(), "a hook never starts the daemon");
 }
+
+#[test]
+fn the_screen_says_what_an_agent_without_hooks_is_doing() {
+    let crystal = Crystal::new();
+    // A pretend agent that draws what agents draw, a stage at a time,
+    // moving on when the test creates the stage's file: a spinner in the
+    // title while it works, then a question, then its prompt again.
+    let script = r#"
+        wait_for() { while [ ! -e "$1" ]; do sleep 0.05; done; }
+        printf '> '
+        wait_for work; printf '\033]0;⠋ Thinking\007'
+        wait_for ask; printf '\033]0;\007\r\033[2KDo you want to proceed?'
+        wait_for rest; printf '\r\033[2K> '
+        sleep 30
+    "#;
+    crystal.ok(&["new", "-n", "agent", "sh", "-c", script]);
+    let status = || crystal.row("agent").unwrap()[1].clone();
+    assert_eq!(status(), "running");
+
+    for (stage, expected) in [("work", "working"), ("ask", "waiting"), ("rest", "done")] {
+        std::fs::write(crystal.dir.path().join(stage), "").unwrap();
+        eventually(&format!("the agent is {expected}"), || status() == expected);
+    }
+}
