@@ -37,7 +37,9 @@ pub fn run(socket: &Path, name: Option<&str>) -> Result<()> {
         bail!("attach needs a terminal");
     }
     let (cols, rows) = terminal::size()?;
-    let (viewer, output) = Viewer::connect(socket, name, rows, cols)?;
+    // Your own terminal keeps what scrolls by while you're attached; the
+    // history from before is for the TUI's panes and `crystal read`.
+    let (viewer, output) = Viewer::connect(socket, name, (rows, cols), false)?;
     let name = viewer.name.clone();
     if env::own_session(socket).as_deref() == Some(name.as_str()) {
         bail!("can't attach {name} to itself");

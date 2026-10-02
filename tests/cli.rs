@@ -1558,3 +1558,102 @@ fn a_hook_stays_quiet_with_a_daemon_of_another_version() {
     crystal.ok(&["kill-server"]);
     older.wait().unwrap();
 }
+
+/// A program that prints a marked first line and then enough lines to
+/// scroll it well off the screen, then says it's done and waits.
+const LONG_OUTPUT: &str =
+    "echo first-line; for i in $(seq 1 60); do echo line $i; done; echo > printed; sleep 30";
+
+#[test]
+fn read_with_history_shows_what_scrolled_off_the_screen() {
+    let crystal = Crystal::new();
+    crystal.ok(&["new", "-n", "printer", "sh", "-c", LONG_OUTPUT]);
+    written(&crystal.dir.path().join("printed"));
+
+    let screen = crystal.ok(&["read", "printer"]);
+    assert!(!screen.lines().any(|line| line == "first-line"));
+    assert!(screen.lines().any(|line| line == "line 60"));
+
+    let all = crystal.ok(&["read", "printer", "--history"]);
+    let lines: Vec<&str> = all.lines().collect();
+    assert_eq!(lines[0], "first-line");
+    assert_eq!(lines[60], "line 60");
+
+    let last = crystal.ok(&["read", "printer", "--history", "--lines", "2"]);
+    assert_eq!(last, "line 59\nline 60\n");
+}
+
+#[test]
+fn rows_an_inline_agent_scrolls_up_through_a_region_reach_the_history() {
+    let crystal = Crystal::new();
+    // How an agent like Codex prints above its prompt: a scroll region from
+    // the top of the screen down to just above the prompt, and each line
+    // scrolled up through it.
+    let script = r#"
+        printf '\033[12;1H> the prompt\033[1;10r\033[10;1H'
+        for i in $(seq 1 30); do printf '\r\nout %s' "$i"; done
+        printf '\033[r'
+        echo > printed
+        sleep 30
+    "#;
+    crystal.ok(&["new", "-n", "inline", "sh", "-c", script]);
+    written(&crystal.dir.path().join("printed"));
+
+    let all = crystal.ok(&["read", "inline", "--history"]);
+    let lines: Vec<&str> = all.lines().map(str::trim_end).collect();
+    let first = lines.iter().position(|line| *line == "out 1");
+    let last = lines.iter().position(|line| *line == "out 30");
+    assert!(
+        first.is_some() && first < last,
+        "every line, in order:\n{all}"
+    );
+    assert!(
+        lines.contains(&"> the prompt"),
+        "the prompt stayed put:\n{all}"
+    );
+}
+
+#[test]
+fn the_tui_pages_back_through_output_from_before_it_opened_and_returns_to_live() {
+    let crystal = Crystal::new();
+    crystal.ok(&["new", "-n", "printer", "sh", "-c", LONG_OUTPUT]);
+    written(&crystal.dir.path().join("printed"));
+
+    let mut tui = crystal.tui();
+    tui.shows("line 40");
+    assert!(!tui.text().contains("first-line"));
+
+    // Page Up in the sidebar pages the selected session's pane, as far
+    // back as the history goes.
+    for _ in 0..5 {
+        tui.type_keys("\x1b[5~");
+    }
+    tui.shows("first-line");
+    tui.shows("↑");
+
+    for _ in 0..5 {
+        tui.type_keys("\x1b[6~");
+    }
+    eventually("the pane is live again", || {
+        let text = tui.text();
+        !text.contains("first-line") && !text.contains("↑")
+    });
+}
+
+#[test]
+fn typing_into_a_pane_brings_it_back_from_its_history() {
+    let crystal = Crystal::new();
+    crystal.ok(&["new", "-n", "printer", "sh", "-c", LONG_OUTPUT]);
+    written(&crystal.dir.path().join("printed"));
+
+    let mut tui = crystal.tui();
+    tui.shows("line 40");
+    tui.type_keys("\r");
+    tui.shows("typing into the session");
+
+    // Shift+Page Up, as a terminal sends it.
+    tui.type_keys("\x1b[5;2~");
+    tui.shows("↑");
+    tui.type_keys("x");
+    eventually("the pane is live again", || !tui.text().contains("↑"));
+}

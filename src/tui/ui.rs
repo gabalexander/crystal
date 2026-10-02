@@ -140,9 +140,15 @@ fn session_row(session: &SessionInfo) -> Line<'_> {
 fn draw_pane(frame: &mut Frame, app: &App, slot: Slot, area: Rect, panes: &[Pane]) {
     let focused = app.focus() == Focus::Pane(slot);
     let session = app.pane_session(slot);
+    // Until a viewer has attached to the session, there's nothing to show
+    // yet.
+    let pane = session
+        .filter(|_| app.shows_screen(slot))
+        .and_then(|session| panes.iter().find(|pane| pane.session == session.name));
+    let back = pane.map_or(0, Pane::scrolled_back);
     let mut block = Block::bordered().border_style(border_style(focused));
     if let Some(session) = session {
-        block = block.title(pane_title(app, slot, session));
+        block = block.title(pane_title(app, slot, session, back));
     }
     frame.render_widget(block, area);
 
@@ -164,14 +170,14 @@ fn draw_pane(frame: &mut Frame, app: &App, slot: Slot, area: Rect, panes: &[Pane
         draw_message(frame, &message, screen);
         return;
     }
-    // Until a viewer has attached to the session, there's nothing to show
-    // yet.
-    let Some(pane) = panes.iter().find(|pane| pane.session == session.name) else {
+    let Some(pane) = pane else {
         return;
     };
     let session_screen = pane.screen.screen();
     frame.render_widget(ScreenWidget::new(session_screen), screen);
-    if focused && !session_screen.hide_cursor() {
+    // Back in the history, the cursor's place on the live screen means
+    // nothing.
+    if focused && back == 0 && !session_screen.hide_cursor() {
         let (row, col) = session_screen.cursor_position();
         if row < screen.height && col < screen.width {
             frame.set_cursor_position((screen.x + col, screen.y + row));
@@ -181,8 +187,8 @@ fn draw_pane(frame: &mut Frame, app: &App, slot: Slot, area: Rect, panes: &[Pane
 
 /// A pane's title: its session's name and, once it has ended, how. A split
 /// showing the selected session says so, since the selection's own pane
-/// points to it.
-fn pane_title(app: &App, slot: Slot, session: &SessionInfo) -> String {
+/// points to it. A pane looking `back` rows into its history says how far.
+fn pane_title(app: &App, slot: Slot, session: &SessionInfo, back: usize) -> String {
     let mut words = vec![session.name.clone()];
     if session.state != State::Running {
         words.push(session.state.to_string());
@@ -190,6 +196,9 @@ fn pane_title(app: &App, slot: Slot, session: &SessionInfo) -> String {
     let selected = app.selected().is_some_and(|s| s.name == session.name);
     if slot != Slot::Selected && selected {
         words.push("selected".to_string());
+    }
+    if back > 0 {
+        words.push(format!("↑ {back} lines"));
     }
     format!(" {} ", words.join(" · "))
 }
@@ -218,7 +227,8 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         Line::from("j/k · enter type · tab pane · s split · n new · w worktree · x kill · q quit")
             .dark_gray()
     } else {
-        Line::from("typing into the session · ctrl+\\ back to the list").dark_gray()
+        Line::from("typing into the session · ctrl+\\ back to the list · shift+pgup history")
+            .dark_gray()
     };
     frame.render_widget(footer, area);
 }

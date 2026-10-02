@@ -62,11 +62,13 @@ pub fn wait_for_turn(socket: &Path, name: &str, timeout: Option<Duration>) -> Re
     wait(socket, name, remaining)
 }
 
-/// Prints what's on the session's screen. With `lines`, only that many of
-/// the last rows that aren't blank.
-pub fn read(socket: &Path, name: &str, lines: Option<usize>) -> Result<()> {
+/// Prints what's on the session's screen, after its history with
+/// `history`. With `lines`, only that many of the last rows that aren't
+/// blank.
+pub fn read(socket: &Path, name: &str, lines: Option<usize>, history: bool) -> Result<()> {
     let request = Request::Read {
         name: name.to_string(),
+        history,
     };
     let Response::Screen { rows } = ask(socket, &request)? else {
         bail!("the daemon didn't send the screen");

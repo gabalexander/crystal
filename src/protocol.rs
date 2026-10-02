@@ -41,12 +41,19 @@ pub enum Request {
     /// What's on a session's screen, as text.
     Read {
         name: String,
+        /// The rows that have scrolled up off the screen too, ahead of it.
+        #[serde(default)]
+        history: bool,
     },
     /// With no name, the newest session.
     Attach {
         name: Option<String>,
         rows: u16,
         cols: u16,
+        /// Send the session's history ahead of its screen, so the viewer
+        /// can scroll back through it.
+        #[serde(default)]
+        history: bool,
     },
     /// Stop the daemon. With `keep_sessions`, the running sessions stay
     /// written down, so that the next daemon starts them again.

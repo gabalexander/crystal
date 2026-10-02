@@ -8,7 +8,7 @@ use super::groups::{self, Row};
 use super::keys;
 use super::text_input::TextInput;
 use crate::protocol::{SessionInfo, State};
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::path::PathBuf;
 
 /// How many sessions can be split off into panes of their own at once.
@@ -87,6 +87,10 @@ pub enum Action {
         to: Slot,
         key: KeyEvent,
     },
+    /// Show a page further back into the history of the pane at this slot.
+    PageBack(Slot),
+    /// Show a page further toward live in the pane at this slot.
+    PageForward(Slot),
 }
 
 pub struct App {
@@ -265,16 +269,23 @@ impl App {
     /// Hands the keyboard to the selected session, in whichever pane shows
     /// it, if it can take keys.
     pub fn type_into_selected(&mut self) {
-        let Some(selected) = self.selected() else {
+        let Some(slot) = self.selected_slot() else {
             return;
-        };
-        let slot = match self.splits.iter().position(|split| *split == selected.name) {
-            Some(index) => Slot::Split(index),
-            None => Slot::Selected,
         };
         if self.can_type_into(slot) {
             self.focus_pane(slot);
         }
+    }
+
+    /// The pane that shows the selected session: its split, if it has one,
+    /// or else the pane that follows the selection.
+    fn selected_slot(&self) -> Option<Slot> {
+        let selected = self.selected()?;
+        let slot = match self.splits.iter().position(|split| *split == selected.name) {
+            Some(index) => Slot::Split(index),
+            None => Slot::Selected,
+        };
+        Some(slot)
     }
 
     pub fn on_key(&mut self, key: KeyEvent) -> Option<Action> {
@@ -303,6 +314,8 @@ impl App {
             KeyCode::Tab => self.move_to_pane(Direction::Forward),
             KeyCode::BackTab => self.move_to_pane(Direction::Back),
             KeyCode::Char('s') => self.toggle_split(),
+            KeyCode::PageUp => return Some(Action::PageBack(self.selected_slot()?)),
+            KeyCode::PageDown => return Some(Action::PageForward(self.selected_slot()?)),
             KeyCode::Char('n') => self.ask_for_command(self.selected_place()),
             KeyCode::Char('w') => self.ask(Question::Branch, ""),
             KeyCode::Char('x') => self.kill_asked = Some(self.selected()?.name.clone()),
@@ -393,13 +406,20 @@ impl App {
     }
 
     /// Every key goes to the pane's session, Tab too, since shells and
-    /// agents need it. Only Ctrl+\ is kept back: it returns to the sidebar.
+    /// agents need it. Kept back are Ctrl+\, which returns to the sidebar,
+    /// and Shift+PageUp and Shift+PageDown, how terminals have always
+    /// scrolled back: they page through the pane's history. Unshifted, the
+    /// page keys go to the session like any other.
     fn on_pane_key(&mut self, slot: Slot, key: KeyEvent) -> Option<Action> {
-        if keys::is_hand_back(&key) {
-            self.focus = Focus::Sidebar;
-            None
-        } else {
-            Some(Action::Type { to: slot, key })
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        match key.code {
+            _ if keys::is_hand_back(&key) => {
+                self.focus = Focus::Sidebar;
+                None
+            }
+            KeyCode::PageUp if shift => Some(Action::PageBack(slot)),
+            KeyCode::PageDown if shift => Some(Action::PageForward(slot)),
+            _ => Some(Action::Type { to: slot, key }),
         }
     }
 
@@ -941,6 +961,44 @@ mod tests {
         app.set_sessions(vec![session("b"), session("c")]);
         assert_eq!(app.splits(), ["b"]);
         assert_eq!(app.focus(), Focus::Pane(Slot::Split(0)));
+    }
+
+    #[test]
+    fn page_keys_in_the_sidebar_page_the_selected_sessions_pane() {
+        let mut app = app_with_splits(&["a", "b"], 1);
+        app.select("b");
+        assert_eq!(
+            press(&mut app, KeyCode::PageUp),
+            Some(Action::PageBack(Slot::Selected))
+        );
+        // A session split off is paged in its split.
+        app.select("a");
+        assert_eq!(
+            press(&mut app, KeyCode::PageDown),
+            Some(Action::PageForward(Slot::Split(0)))
+        );
+        assert_eq!(press(&mut App::new(None), KeyCode::PageUp), None);
+    }
+
+    #[test]
+    fn in_a_pane_only_shifted_page_keys_page_its_history() {
+        let mut app = app_with(&["a"]);
+        press(&mut app, KeyCode::Enter);
+        let shifted = |code| KeyEvent::new(code, KeyModifiers::SHIFT);
+        assert_eq!(
+            app.on_key(shifted(KeyCode::PageUp)),
+            Some(Action::PageBack(Slot::Selected))
+        );
+        assert_eq!(
+            app.on_key(shifted(KeyCode::PageDown)),
+            Some(Action::PageForward(Slot::Selected))
+        );
+        let page_up = KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE);
+        let typed = Action::Type {
+            to: Slot::Selected,
+            key: page_up,
+        };
+        assert_eq!(app.on_key(page_up), Some(typed));
     }
 
     #[test]

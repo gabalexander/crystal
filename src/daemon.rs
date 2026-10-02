@@ -91,9 +91,15 @@ impl Daemon {
             return Ok(protocol::send(&conn, &Response::Error { message })?);
         }
         let request = incoming.request()?;
-        if let Request::Attach { name, rows, cols } = request {
+        if let Request::Attach {
+            name,
+            rows,
+            cols,
+            history,
+        } = request
+        {
             return match self.find(name.as_deref()) {
-                Ok((name, term)) => attach(&conn, input, name, &term, rows, cols),
+                Ok((name, term)) => attach(&conn, input, name, &term, (rows, cols), history),
                 Err(err) => Ok(protocol::send(&conn, &Response::from(err))?),
             };
         }
@@ -212,9 +218,9 @@ impl Daemon {
                 }
                 Ok(Response::Done)
             }
-            Request::Read { name } => {
+            Request::Read { name, history } => {
                 let mut sessions = self.sessions.lock().unwrap();
-                let rows = named(&mut sessions, &name)?.term().rows();
+                let rows = named(&mut sessions, &name)?.term().rows(history);
                 Ok(Response::Screen { rows })
             }
             // Leaving is enough: the sessions' terminals close with the
@@ -304,18 +310,18 @@ fn named<'a>(sessions: &'a mut [Session], name: &str) -> Result<&'a mut Session>
 }
 
 /// Shows a session to a client until either of them goes: first the screen
-/// as it is, then the output as it comes, while the client's keys and size
-/// go to the session.
+/// as it is (after its history, with `with_history`), then the output as
+/// it comes, while the client's keys and size go to the session.
 fn attach(
     conn: &UnixStream,
     mut input: BufReader<&UnixStream>,
     name: String,
     term: &Term,
-    rows: u16,
-    cols: u16,
+    (rows, cols): (u16, u16),
+    with_history: bool,
 ) -> Result<()> {
     term.resize(rows, cols)?;
-    let watch = term.watch();
+    let watch = term.watch(with_history);
     let running = watch.feed.is_some();
     protocol::send(conn, &Response::Attached { name, running })?;
     let mut output = conn.try_clone()?;

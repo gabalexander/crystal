@@ -2,6 +2,7 @@
 
 use crate::agent_screen::{self, Looks, ScreenWatch};
 use crate::git::Checkout;
+use crate::history::{self, HISTORY_LINES, HistoryKeeper};
 use crate::protocol::{Activity, AgentEvent, Conversation, SessionInfo, State};
 use crate::state::SavedSession;
 use anyhow::Result;
@@ -70,7 +71,13 @@ impl Session {
             input: Mutex::new(pty.master.take_writer()?),
             pty: Mutex::new(pty.master),
             screen: Mutex::new(Screen {
-                parser: vt100::Parser::new_with_callbacks(24, 80, 0, Callbacks::default()),
+                parser: vt100::Parser::new_with_callbacks(
+                    24,
+                    80,
+                    HISTORY_LINES,
+                    Callbacks::default(),
+                ),
+                history: HistoryKeeper::default(),
                 viewers: Vec::new(),
                 ended: false,
             }),
@@ -195,6 +202,9 @@ pub struct Term {
 
 struct Screen {
     parser: vt100::Parser<Callbacks>,
+    /// Sees that rows scrolling up off the screen reach the parser's
+    /// history.
+    history: HistoryKeeper,
     viewers: Vec<Viewer>,
     /// The program has closed its end: there will be no more output.
     ended: bool,
@@ -205,8 +215,8 @@ struct Viewer {
     feed: SyncSender<Arc<[u8]>>,
 }
 
-/// A new viewer's start: the screen as it is now, then everything the
-/// program writes after it.
+/// A new viewer's start: the screen as it is now, with the history ahead
+/// of it if asked for, then everything the program writes after it.
 pub struct Watch {
     pub id: u64,
     pub screen: Vec<u8>,
@@ -215,11 +225,18 @@ pub struct Watch {
 }
 
 impl Term {
-    pub fn watch(&self) -> Watch {
+    /// Starts showing the session to a new viewer. With `with_history`, the
+    /// viewer's screen gets the history too, so that it can scroll back
+    /// through output from before it came.
+    pub fn watch(&self, with_history: bool) -> Watch {
         static NEXT_ID: AtomicU64 = AtomicU64::new(0);
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         let mut screen = self.screen.lock().unwrap();
-        let snapshot = screen.parser.screen().state_formatted();
+        let mut snapshot = Vec::new();
+        if with_history {
+            snapshot = history::replay(screen.parser.screen_mut());
+        }
+        snapshot.extend(screen.parser.screen().state_formatted());
         let feed = (!screen.ended).then(|| {
             let (feed, rx) = mpsc::sync_channel(VIEWER_BACKLOG);
             screen.viewers.push(Viewer { id, feed });
@@ -248,11 +265,17 @@ impl Term {
             .bracketed_paste()
     }
 
-    /// What's on the screen, one string per row.
-    pub fn rows(&self) -> Vec<String> {
-        let screen = self.screen.lock().unwrap();
+    /// What's on the screen, one string per row, after the rows of the
+    /// history with `with_history`.
+    pub fn rows(&self, with_history: bool) -> Vec<String> {
+        let mut screen = self.screen.lock().unwrap();
+        let mut rows = Vec::new();
+        if with_history {
+            rows = history::text(screen.parser.screen_mut());
+        }
         let (_, cols) = screen.parser.screen().size();
-        screen.parser.screen().rows(0, cols).collect()
+        rows.extend(screen.parser.screen().rows(0, cols));
+        rows
     }
 
     pub fn is_watched(&self) -> bool {
@@ -270,6 +293,8 @@ impl Term {
 
     pub fn resize(&self, rows: u16, cols: u16) -> Result<()> {
         let mut screen = self.screen.lock().unwrap();
+        let (old_rows, _) = screen.parser.screen().size();
+        screen.history.resize(old_rows, rows);
         screen.parser.screen_mut().set_size(rows, cols);
         self.pty.lock().unwrap().resize(size(rows, cols))
     }
@@ -286,10 +311,12 @@ impl Term {
                 Err(err) if err.kind() == ErrorKind::Interrupted => continue,
                 Err(_) => break,
             };
-            let chunk: Arc<[u8]> = buf[..n].into();
             let replies = {
-                let mut screen = self.screen.lock().unwrap();
-                screen.parser.process(&chunk);
+                let mut guard = self.screen.lock().unwrap();
+                let screen = &mut *guard;
+                // Viewers get what the screen was fed, so that their own
+                // screens keep the same history.
+                let chunk: Arc<[u8]> = screen.history.feed(&mut screen.parser, &buf[..n]).into();
                 // A viewer that's gone, or too far behind to catch up, is
                 // dropped rather than holding up the program.
                 screen

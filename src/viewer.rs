@@ -28,12 +28,13 @@ pub struct Output {
 
 impl Viewer {
     /// Attaches to the session called `name`, or the newest one, at a size
-    /// of `rows` by `cols`.
+    /// of `rows` by `cols`. With `with_history`, the output starts with the
+    /// session's history, for a viewer that scrolls back through it.
     pub fn connect(
         socket: &Path,
         name: Option<&str>,
-        rows: u16,
-        cols: u16,
+        (rows, cols): (u16, u16),
+        with_history: bool,
     ) -> Result<(Viewer, Output)> {
         let conn = UnixStream::connect(socket)
             .with_context(|| format!("no daemon is running on {}", socket.display()))?;
@@ -41,6 +42,7 @@ impl Viewer {
             name: name.map(String::from),
             rows,
             cols,
+            history: with_history,
         };
         protocol::send_request(&conn, &request)?;
 

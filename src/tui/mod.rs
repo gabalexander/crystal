@@ -157,6 +157,16 @@ impl Tui {
                     }
                 }
             }
+            Action::PageBack(slot) => {
+                if let Some(pane) = self.pane_in(slot) {
+                    pane.page_back();
+                }
+            }
+            Action::PageForward(slot) => {
+                if let Some(pane) = self.pane_in(slot) {
+                    pane.page_forward();
+                }
+            }
         }
         Ok(())
     }
@@ -221,12 +231,14 @@ impl Tui {
     }
 
     /// The viewer of the session the pane at `slot` shows.
-    fn pane_in(&self, slot: Slot) -> Option<&Pane> {
+    fn pane_in(&mut self, slot: Slot) -> Option<&mut Pane> {
         if !self.app.shows_screen(slot) {
             return None;
         }
         let session = self.app.pane_session(slot)?;
-        self.panes.iter().find(|pane| pane.session == session.name)
+        self.panes
+            .iter_mut()
+            .find(|pane| pane.session == session.name)
     }
 
     fn pane_with_id(&mut self, id: u64) -> Option<&mut Pane> {

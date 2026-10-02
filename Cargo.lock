@@ -240,6 +240,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "vt100",
+ "vte",
 ]
 
 [[package]]

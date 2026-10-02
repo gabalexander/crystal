@@ -6,6 +6,7 @@ mod daemon;
 mod drive;
 mod env;
 mod git;
+mod history;
 mod hook;
 mod protocol;
 mod session;
@@ -116,6 +117,10 @@ enum Command {
         /// Only the last this many rows that aren't blank.
         #[arg(short = 'n', long)]
         lines: Option<usize>,
+
+        /// The rows that have scrolled up off the screen too, ahead of it.
+        #[arg(long)]
+        history: bool,
     },
     /// Stop a session and remove it from the list.
     Kill { name: String },
@@ -191,7 +196,11 @@ fn run(cli: Cli) -> Result<()> {
             }
         }
         Command::Wait { name, timeout } => drive::wait(&socket, &name, seconds(timeout))?,
-        Command::Read { name, lines } => drive::read(&socket, &name, lines)?,
+        Command::Read {
+            name,
+            lines,
+            history,
+        } => drive::read(&socket, &name, lines, history)?,
         Command::Kill { name } => {
             if client::ask(&socket, &Request::Kill { name }, false)?.is_none() {
                 no_daemon(&socket)?;
