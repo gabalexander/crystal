@@ -17,9 +17,9 @@
 crystal runs Claude Code, Codex, Cursor and any other agent CLI side by side, across all your projects and git
 worktrees. The agents keep working after you close it, and you can always see which one is waiting on you.
 
-> [!WARNING]
-> crystal is pre-alpha and not usable yet. This README describes what it's being built to do. The
-> [roadmap](#roadmap) shows what works today.
+> [!NOTE]
+> crystal is young. Everything below works, but expect rough edges and changes between versions. The screen
+> reading in particular follows what today's agents draw, and will need keeping up with them.
 
 - **Agents outlive the window** — a background daemon owns every terminal, the way tmux does. Close crystal or
   drop your SSH connection and the agents carry on; reattach later and the scrollback is all there.
