@@ -142,7 +142,10 @@ impl Finder {
             KeyCode::Esc => return Outcome::Close,
             KeyCode::Enter => {
                 return match self.selected_path() {
-                    Some(path) => Outcome::Edit(path.to_string()),
+                    Some(path) => Outcome::Edit {
+                        path: path.to_string(),
+                        line: None,
+                    },
                     None => Outcome::Stay,
                 };
             }
@@ -479,7 +482,10 @@ mod tests {
         type_text(&mut finder, "main");
         assert_eq!(
             finder.on_key(key(KeyCode::Enter)),
-            Outcome::Edit("src/main.rs".into())
+            Outcome::Edit {
+                path: "src/main.rs".into(),
+                line: None,
+            }
         );
         assert_eq!(finder.on_key(key(KeyCode::Esc)), Outcome::Close);
     }

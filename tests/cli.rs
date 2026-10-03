@@ -5203,6 +5203,13 @@ fn capital_o_reads_a_pull_request_shows_its_diff_and_comments_on_it() {
     tui.type_keys("\x04");
     tui.shows("pull request #57");
     tui.shows("redirect(\"/home\");");
+    // A file marked reviewed stays marked the next time it's read.
+    tui.type_keys("r");
+    tui.shows("1 reviewed");
+    tui.type_keys("\x1b");
+    tui.shows("pull requests · app");
+    tui.type_keys("\x04");
+    tui.shows("1 reviewed");
     tui.type_keys("\x1b");
     tui.shows("pull requests · app");
 
@@ -5575,6 +5582,150 @@ fn p_finds_a_file_and_opens_it_in_the_editor() {
     tui.type_keys("\r");
     assert_eq!(written(&edited), "refund.rs\n");
     tui.shows("typing into refund.rs");
+}
+
+#[test]
+fn r_marks_a_file_reviewed_until_it_changes_and_t_lists_files_as_a_tree() {
+    let crystal = Crystal::new();
+    let repo = repo_with_work(crystal.dir.path());
+    std::fs::create_dir_all(repo.join("src/tui")).unwrap();
+    std::fs::write(repo.join("src/tui/app.rs"), "fn app() {}\n").unwrap();
+    crystal.ok(&[
+        "new",
+        "-n",
+        "agent",
+        "-c",
+        repo.to_str().unwrap(),
+        "sleep",
+        "30",
+    ]);
+
+    let mut tui = crystal.tui();
+    tui.shows("agent");
+    tui.type_keys("d");
+    tui.shows("uncommitted changes · 3 files +3 −0");
+    // Reading starts at the first file, and goes on to the next.
+    tui.shows("+ - ask about fees");
+    tui.type_keys("r");
+    tui.shows("1 reviewed");
+    tui.shows("+ fn app() {}");
+
+    // The mark is there the next time the diff is read…
+    tui.type_keys("q");
+    tui.hides("1 reviewed");
+    tui.type_keys("d");
+    tui.shows("1 reviewed");
+    // …until the file changes again.
+    tui.type_keys("q");
+    std::fs::write(repo.join("notes.md"), "# Notes\n- ask about refunds\n").unwrap();
+    tui.type_keys("d");
+    tui.shows("ask about refunds");
+    tui.hides("1 reviewed");
+
+    // As a tree, and still a tree the next time.
+    tui.type_keys("t");
+    tui.shows("▾ src/tui");
+    tui.type_keys("q");
+    tui.hides("▾ src/tui");
+    tui.type_keys("d");
+    tui.shows("▾ src/tui");
+}
+
+#[test]
+fn capital_g_finds_text_in_the_files_and_edits_one_at_its_line() {
+    let crystal = Crystal::new();
+    let repo = repo_with_work(crystal.dir.path());
+    crystal.ok(&[
+        "new",
+        "-n",
+        "agent",
+        "-c",
+        repo.to_str().unwrap(),
+        "sleep",
+        "30",
+    ]);
+    // An editor that notes what it was asked to open.
+    let editor = crystal.dir.path().join("editor");
+    let edited = crystal.dir.path().join("edited");
+    script(&editor, "printf '%s\\n' \"$@\" > \"$EDITED\"\nsleep 30\n");
+
+    let mut tui = crystal.attach_with_env(
+        &[],
+        &[
+            ("EDITOR", editor.to_str().unwrap()),
+            ("EDITED", edited.to_str().unwrap()),
+        ],
+    );
+    tui.shows("agent");
+    tui.type_keys("G");
+    tui.shows("find in files");
+    tui.shows("type 2 letters or more");
+    // A new file git doesn't know about yet is searched too.
+    tui.type_keys("TESTS");
+    tui.shows("nothing found");
+    tui.type_keys("\x7f\x7f\x7f\x7f\x7fledger");
+    tui.shows("1 line in 1 file");
+    tui.shows("refund.rs");
+    tui.shows("3  ledger.write(total);");
+
+    tui.type_keys("\r");
+    assert_eq!(written(&edited), "+3\nrefund.rs\n");
+    tui.shows("typing into refund.rs");
+}
+
+#[test]
+fn capital_b_makes_a_branch_and_switches_back_stashing_the_changes() {
+    let crystal = Crystal::new();
+    let repo = repo_with_work(crystal.dir.path());
+    crystal.ok(&[
+        "new",
+        "-n",
+        "agent",
+        "-c",
+        repo.to_str().unwrap(),
+        "sleep",
+        "30",
+    ]);
+    // A stash is a commit, and git wants to know whose.
+    let mut tui = crystal.attach_with_env(
+        &[],
+        &[
+            ("GIT_AUTHOR_NAME", "crystal"),
+            ("GIT_AUTHOR_EMAIL", "crystal@example.com"),
+            ("GIT_COMMITTER_NAME", "crystal"),
+            ("GIT_COMMITTER_EMAIL", "crystal@example.com"),
+        ],
+    );
+    tui.shows("agent");
+    tui.type_keys("B");
+    tui.shows("switch branch · 2 uncommitted changes");
+    tui.shows("● fee");
+    // The branch it can switch to is selected, with its last commit.
+    tui.shows("just now · refunds");
+
+    // A name no branch has makes one, and the changes come along.
+    tui.type_keys("spike");
+    tui.shows("no such branch");
+    tui.shows("Enter makes this branch from fee");
+    tui.type_keys("\r");
+    tui.shows("the worktree is on spike");
+    assert_eq!(git(&repo, &["branch", "--show-current"]), "spike\n");
+    assert!(repo.join("todo.txt").exists());
+
+    // Going back to main asks what's to become of them.
+    tui.type_keys("B");
+    tui.shows("● spike");
+    tui.type_keys("main\r");
+    tui.shows("spike has 2 uncommitted changes");
+    tui.type_keys("s");
+    tui.shows("the worktree is on main · changes stashed as");
+    assert_eq!(git(&repo, &["branch", "--show-current"]), "main\n");
+    assert!(!repo.join("todo.txt").exists());
+    let stashed = git(&repo, &["stash", "list"]);
+    assert!(
+        stashed.contains("crystal: spike before switching to main"),
+        "{stashed}"
+    );
 }
 
 #[test]

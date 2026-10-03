@@ -38,6 +38,9 @@ pub const TABS: &str = "tabs";
 pub const LAUNCHER: &str = "launcher";
 /// The layouts saved with `S`.
 pub const LAYOUTS: &str = "layouts";
+/// What the diff view keeps: the files marked reviewed, and whether it
+/// lists them as a tree.
+pub const DIFF: &str = "diff";
 
 /// How long a write waits for another to finish: the daemon and every TUI
 /// share the one database.

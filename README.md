@@ -118,6 +118,8 @@ and the footer says where you are and offers the keys that matter there.
 | `f` | on a step of a flow waiting at its gate: send it back, with notes on what to do differently |
 | `d` | show what changed in the selected session's worktree: [the diff](#the-diff) |
 | `p` | find a file in the selected session's worktree and edit it: [the file finder](#the-file-finder) |
+| `G` | search the files of the selected session's worktree as you type, and edit one where it's found: [find in files](#find-in-files) |
+| `B` | move the selected session's worktree onto another branch, or a new one: [the branch switcher](#the-branch-switcher) |
 | `m` | what the selected session's project has remembered: [memory](#memory) |
 | `P` | list your [profiles](#profiles), and add, change, copy or remove one |
 | `X` | list the [plugins](#plugins): switch them on and off, run their actions and open their panes |
@@ -304,7 +306,8 @@ variables, since those can hold secrets; a session started again gets the enviro
 daemon again.
 
 The database is SQLite, and holds everything crystal keeps but its settings and memory: the sessions to start
-again, flow runs, each project's backlog and closed tasks, and the TUI's tabs, layouts and earlier tasks. Each
+again, flow runs, each project's backlog and closed tasks, and the TUI's tabs, layouts, earlier tasks and the
+files you've marked reviewed in the diff. Each
 change is written whole or not at all, so a crash or a power cut never leaves half of one, and a database that
 can't be read stops the daemon rather than being started over. What an older crystal kept in JSON files there is
 brought in the first time, and each file is kept beside it, renamed `.imported` (or `.broken`, when it couldn't
@@ -439,6 +442,16 @@ since it left its base (where it meets `origin`'s default branch, or `main` or `
 committed, as its pull request would read. From [the pull requests](#pull-requests), `Ctrl+D` shows one's own
 diff here, as GitHub or GitLab has it, with no worktree needed.
 
+Once you've read a file, `r` marks it reviewed: it sinks to the bottom of the list with a `✓`, and the next file
+is selected, so `r` after `r` reads through a change. A mark is crystal's own bookkeeping, nothing staged or
+committed, and it keeps until the file changes again, or HEAD moves, a commit say, when the next diff is new work
+to read. They're kept with your tabs, in crystal's database, apart for each worktree's uncommitted changes and
+its branch, and for each pull request's diff, where only a file changing takes a mark off.
+
+`t` folds the list into a tree of directories, and back, and crystal remembers which you like. Every directory
+starts open, a directory that holds only another reads as one row with it, like `src/tui`, and a directory's
+row shows how many lines change under it, and a `✓` once every file under it is reviewed; selected, it lists them.
+
 | Key | In the diff |
 |---|---|
 | `j` / `k`, `↓` / `↑` | the next or previous file |
@@ -446,9 +459,13 @@ diff here, as GitHub or GitLab has it, with no worktree needed.
 | `]` / `[` | the next or previous hunk |
 | `v` | side by side, the old file beside the new one, or unified again; side by side needs 120 columns |
 | `b` | the branch since its base, or the uncommitted changes again |
+| `r` | mark the file reviewed, or take its mark off |
+| `t` | the files as a tree of directories, or a list again |
+| `←` / `→`, `h` / `l` | in the tree: fold a directory or go up to the one it's in; open one or go into it |
+| `Enter` | in the tree: fold or open the directory |
 | `Esc` / `q` | back to the sidebar |
 
-The wheel scrolls the diff, and moves through the files over the list.
+The wheel scrolls the diff, and moves through the files over the list; a click on a directory folds or opens it.
 
 ### Pull requests and issues
 
@@ -529,6 +546,43 @@ in order (`rfnd` finds `src/billing/refund.rs`), and the best matches come first
 selected one beside the list. Letters in a file's name, at the start of a word, or next to each other count for
 more. `↑` / `↓` pick another, `Enter` opens it in your `$EDITOR` (or `vi`) as a session of its own in that
 worktree, named after the file, and `Esc` closes the finder. Files git ignores aren't listed.
+
+### Find in files
+
+`G` searches the files of the selected session's worktree for what you type, with `git grep`: the files git
+tracks and the new ones it would, but not those it ignores, or binary files. It searches once you've typed two
+letters and stopped for a moment, the case of letters counting only when what you type has a capital in it. The
+lines it finds are listed under their files, the first 500 of them, and the lines around the selected one are
+beside the list. `↑` / `↓` pick another, `Enter` opens the file in your `$EDITOR` at that line, as a session of
+its own like the file finder's, and `Esc` closes it. The line goes to your editor the way it takes one: `+12` for
+most, `file:12` for Helix, Zed and Sublime Text, and `--goto file:12` for VS Code, Cursor and their kind.
+
+### The branch switcher
+
+`B` moves the selected session's worktree onto another branch, without leaving crystal. It lists the project's
+branches, the one the worktree is on first, marked `●`, then the others, the latest commit first, each with how
+long ago that was, then the branches on its remotes that have no branch of yours by their name. Type to filter
+them, the way the file finder does; beside the list is the selected branch's last commit and what `Enter` would
+do with it. `Enter` switches to it; a remote's branch, like `origin/fix-login`, becomes a branch of your own,
+`fix-login`, that follows it. When nothing matches what you typed, `Enter` makes a branch by that name, from the
+commit the worktree is on, and switches to it, your changes coming along. The remotes' branches are as your last
+`git fetch` left them: the switcher doesn't go over the network.
+
+When the worktree has changes not committed, the switcher stops and asks what's to become of them:
+
+| Key | The changes are |
+|---|---|
+| `s` | stashed, new files too, as `crystal: main before switching to fix-login`, where `git stash list` shows them; if git won't switch, they come straight back out |
+| `b` | brought along, which git does unless they're in files the other branch changes |
+| `c` | committed on the branch you're leaving, new files too, with the message you type; not on a detached HEAD, where the commit would be on no branch |
+| `d` | thrown away, once you've pressed `d` a second time: the changes to files git knows, unstaged first, so new files stay; if they've changed since you were shown them, it asks again |
+
+`Enter` takes the one the bar is on, stashing at first, and `Esc` goes back to the branches. Nothing switches in
+the middle of a merge or a rebase, or with conflicts, and a branch another worktree has checked out is listed but
+can't be switched to, since git keeps a branch in one worktree. `Esc` while git is at it, running a commit's
+hooks say, closes the switcher, and the footer says how it went. Sessions in the worktree keep running, and see
+its files change. Only a project's main worktree switches: a linked one is named after the branch it was made
+for, and stays on it.
 
 ### Codex
 

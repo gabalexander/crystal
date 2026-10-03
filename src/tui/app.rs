@@ -7,6 +7,7 @@ use super::backlog_view::{BacklogChange, BacklogView, Step};
 use super::command_line;
 use super::diff_view::{self, Against, DiffView};
 use super::finder::Finder;
+use super::grep::Grep;
 use super::groups::{self, Row};
 use super::issues::{self, IssuesView};
 use super::launcher::{self, Launcher, Memory, Run, Setup, Target};
@@ -15,10 +16,12 @@ use super::memory_view::MemoryView;
 use super::plugins_view::{self, PluginsView};
 use super::profiles::{self, ProfilesView};
 use super::pull_requests::{self, PullRequestsView};
+use super::review;
 use super::search;
 use super::settings_view::{self, SettingsView};
 use super::split_tree::{Direction, Pane, SplitTree, Way};
 use super::status::Status;
+use super::switcher::{self, Switcher};
 use super::tabs::{self, Tabs};
 use super::text_input::TextInput;
 use crate::catalog::{self, Agent};
@@ -101,10 +104,13 @@ pub struct Grab {
 }
 
 /// Something that takes the place of the sidebar and the panes until it's
-/// closed: the diff of a worktree, the file finder, or a project's memory.
+/// closed: the diff of a worktree, the file finder, find in files, the
+/// branch switcher, or a project's memory.
 pub enum View {
     Diff(DiffView),
     Files(Finder),
+    Grep(Grep),
+    Branches(Switcher),
     Memory(MemoryView),
 }
 
@@ -117,8 +123,11 @@ pub enum Outcome {
     /// Something for the event loop to do, like reading a diff.
     Do(Action),
     /// Close the view, and open this file, by its path from the top of the
-    /// view's worktree, in the user's editor.
-    Edit(String),
+    /// view's worktree, in the user's editor: at `line`, when there's one.
+    Edit {
+        path: String,
+        line: Option<usize>,
+    },
 }
 
 /// Something read off the event loop: still being read, read, or what went
@@ -404,6 +413,13 @@ pub enum Action {
         dir: PathBuf,
         against: Against,
     },
+    /// Keep `marks` as the files reviewed in the diff `scope` names.
+    KeepReviewed {
+        scope: review::Scope,
+        marks: review::Marks,
+    },
+    /// Keep whether the diff view lists its files as a tree.
+    KeepTree(bool),
     /// List the files of the worktree at this directory, off the event
     /// loop.
     ReadFiles(PathBuf),
@@ -413,11 +429,35 @@ pub enum Action {
         dir: PathBuf,
         path: String,
     },
+    /// List the branches of the worktree at this directory, and its
+    /// changes, off the event loop.
+    ListBranches(PathBuf),
+    /// Move the worktree at `dir` onto `target`, its changes going as
+    /// `carry` says, off the event loop.
+    SwitchBranch {
+        dir: PathBuf,
+        target: crate::git::branches::Branch,
+        carry: crate::git::branches::Carry,
+    },
+    /// Search the worktree at `dir` for `query`, off the event loop, once
+    /// the typing stops.
+    Grep {
+        dir: PathBuf,
+        query: String,
+    },
+    /// Read the file at `path`, from the top of the worktree at `dir`, off
+    /// the event loop, for find in files' preview.
+    ReadMatchedFile {
+        dir: PathBuf,
+        path: String,
+    },
     /// Open the file at `path`, from the top of the worktree at `dir`, in
-    /// the user's editor, as a new session called `name`.
+    /// the user's editor, at `line` if there's one, as a new session called
+    /// `name`.
     Edit {
         dir: PathBuf,
         path: String,
+        line: Option<usize>,
         name: String,
     },
     /// Open the history and screen of the pane at `slot` in the user's
@@ -618,8 +658,14 @@ pub struct App {
     issues: Option<IssuesView>,
     /// The pull requests view, while it's open.
     pull_requests_view: Option<PullRequestsView>,
-    /// The diff, the file finder or a project's memory, while one is open.
+    /// The view that takes the place of the sidebar and the panes, while
+    /// one is open.
     view: Option<View>,
+    /// Whether the diff view lists its files as a tree, as it last did.
+    diff_tree: bool,
+    /// The worktrees git is switching to another branch, off the loop: one
+    /// switch at a time in each.
+    switching: HashSet<PathBuf>,
     /// Whether memory is on, which is whether `m` opens it: see
     /// [`crate::memory::enabled`].
     memory_on: bool,
@@ -697,6 +743,8 @@ impl App {
             issues: None,
             pull_requests_view: None,
             view: None,
+            diff_tree: false,
+            switching: HashSet::new(),
             memory_on: true,
             tasks_on: true,
             backlog_on: true,
@@ -924,6 +972,12 @@ impl App {
         self.view.as_ref()
     }
 
+    /// Takes whether the diff view lists its files as a tree, as it last
+    /// did.
+    pub fn set_diff_tree(&mut self, on: bool) {
+        self.diff_tree = on;
+    }
+
     /// Takes a diff read for the diff view, if it's still the one it wants.
     pub fn diff_read(
         &mut self,
@@ -952,6 +1006,81 @@ impl App {
         }
     }
 
+    /// Takes the branches listed for the branch switcher, if it's still
+    /// open on their worktree.
+    pub fn branches_listed(&mut self, dir: &Path, listed: Result<switcher::Listed, String>) {
+        if let Some(View::Branches(switcher)) = &mut self.view {
+            switcher.listed_done(dir, listed);
+        }
+    }
+
+    /// git is done switching the worktree at `dir`. The switcher that
+    /// started it takes what it came to, if it's still open on it; or else
+    /// the footer says.
+    pub fn branch_switched(
+        &mut self,
+        dir: &Path,
+        outcome: crate::git::branches::Outcome,
+    ) -> Option<Action> {
+        use crate::git::branches::Outcome as Switch;
+        self.switching.remove(dir);
+        if let Switch::Switched { branch, note } = &outcome {
+            let notice = match note {
+                Some(note) => format!("the worktree is on {branch} · {note}"),
+                None => format!("the worktree is on {branch}"),
+            };
+            self.notify(notice);
+        }
+        if let Some(View::Branches(switcher)) = &mut self.view
+            && switcher.dir == dir
+            && switcher.working()
+        {
+            let next = switcher.switched(outcome);
+            return self.follow(next);
+        }
+        match outcome {
+            Switch::Switched { .. } => {}
+            Switch::Dirty { changes, .. } => {
+                let count = changes.len();
+                let noun = if count == 1 { "change" } else { "changes" };
+                self.notify(format!(
+                    "not switched: {count} uncommitted {noun}; B to choose what becomes of them"
+                ));
+            }
+            Switch::Failed(why) | Switch::Stopped(why) => {
+                self.notify(format!("couldn't switch: {why}"));
+            }
+        }
+        None
+    }
+
+    /// Takes what a search found, if find in files is still open on its
+    /// worktree and query. The first hit's file is to be read next.
+    pub fn searched(
+        &mut self,
+        dir: &Path,
+        query: &str,
+        found: Result<crate::git::Found, String>,
+    ) -> Option<Action> {
+        let Some(View::Grep(grep)) = &mut self.view else {
+            return None;
+        };
+        grep.searched(dir, query, found)
+    }
+
+    /// Takes a file's lines, if find in files still has a hit in it
+    /// selected.
+    pub fn matched_file_read(
+        &mut self,
+        dir: &Path,
+        path: &str,
+        lines: Result<Vec<String>, String>,
+    ) {
+        if let Some(View::Grep(grep)) = &mut self.view {
+            grep.file_read(dir, path, lines);
+        }
+    }
+
     /// Takes a project's memory, read for the memory view, if it's still
     /// open on that project.
     pub fn memory_read(&mut self, dir: &Path, read: Result<Vec<crate::memory::Listed>, String>) {
@@ -966,6 +1095,8 @@ impl App {
         match &mut self.view {
             Some(View::Diff(diff)) => diff.set_size(content),
             Some(View::Files(finder)) => finder.set_size(list),
+            Some(View::Grep(grep)) => grep.set_size(list),
+            Some(View::Branches(switcher)) => switcher.set_size(list),
             Some(View::Memory(memory)) => memory.set_size(list),
             None => {}
         }
@@ -1929,6 +2060,8 @@ impl App {
             let outcome = match view {
                 View::Diff(diff) => diff.on_mouse(kind, hit),
                 View::Files(finder) => finder.on_mouse(kind, hit),
+                View::Grep(grep) => grep.on_mouse(kind, hit),
+                View::Branches(switcher) => switcher.on_mouse(kind, hit),
                 View::Memory(memory) => memory.on_mouse(kind, hit),
             };
             return self.follow(outcome);
@@ -2154,6 +2287,8 @@ impl App {
             KeyCode::Char('u') => self.select_next_needing_user(),
             KeyCode::Char('d') => return self.open_diff(),
             KeyCode::Char('p') => return self.open_finder(),
+            KeyCode::Char('G') => self.open_grep(),
+            KeyCode::Char('B') => return self.open_switcher(),
             KeyCode::Char('m') => return self.open_memory(),
             KeyCode::Char('P') => return self.open_profiles(),
             KeyCode::Char('?') => self.showing_keys = true,
@@ -2239,7 +2374,7 @@ impl App {
     /// to be read.
     fn open_diff(&mut self) -> Option<Action> {
         let (dir, place) = self.selected_worktree()?;
-        let diff = DiffView::new(dir, place);
+        let diff = DiffView::new(dir, place, self.diff_tree);
         let read = diff.read();
         self.view = Some(View::Diff(diff));
         Some(read)
@@ -2253,6 +2388,46 @@ impl App {
         let read = finder.read();
         self.view = Some(View::Files(finder));
         Some(read)
+    }
+
+    /// `B`: opens the branch switcher on the selected session's worktree,
+    /// and asks for its branches to be listed. Only a project's main
+    /// worktree switches: a linked one is named after its branch.
+    fn open_switcher(&mut self) -> Option<Action> {
+        let worktree = match self.selected_empty_worktree() {
+            Some(worktree) => worktree.clone(),
+            None => {
+                let selected = self.selected()?;
+                let Some(worktree) = selected.worktree.clone() else {
+                    let notice = format!("{} isn't in a git repository", selected.name);
+                    self.notify(notice);
+                    return None;
+                };
+                worktree
+            }
+        };
+        if !worktree.main {
+            self.notify(
+                "B switches a project's main worktree: a linked one stays on the branch it was made for"
+                    .to_string(),
+            );
+            return None;
+        }
+        if self.switching.contains(&worktree.path) {
+            self.notify("git is still switching it: the footer will say how it went".to_string());
+            return None;
+        }
+        let switcher = Switcher::new(worktree.path.clone(), worktree_label(&worktree));
+        let read = switcher.read();
+        self.view = Some(View::Branches(switcher));
+        Some(read)
+    }
+
+    /// `G`: opens find in files on the selected session's worktree.
+    fn open_grep(&mut self) {
+        if let Some((dir, place)) = self.selected_worktree() {
+            self.view = Some(View::Grep(Grep::new(dir, place)));
+        }
     }
 
     /// `m`: opens the memory of the selected session's project, and asks for
@@ -2299,6 +2474,8 @@ impl App {
         let outcome = match self.view.as_mut()? {
             View::Diff(diff) => diff.on_key(key),
             View::Files(finder) => finder.on_key(key),
+            View::Grep(grep) => grep.on_key(key),
+            View::Branches(switcher) => switcher.on_key(key),
             View::Memory(memory) => memory.on_key(key),
         };
         self.follow(outcome)
@@ -2312,15 +2489,27 @@ impl App {
                 self.view = None;
                 None
             }
-            Outcome::Do(action) => Some(action),
-            Outcome::Edit(path) => {
-                let Some(View::Files(finder)) = self.view.take() else {
-                    return None;
+            Outcome::Do(action) => {
+                match &action {
+                    Action::KeepTree(on) => self.diff_tree = *on,
+                    Action::SwitchBranch { dir, .. } => {
+                        self.switching.insert(dir.clone());
+                    }
+                    _ => {}
+                }
+                Some(action)
+            }
+            Outcome::Edit { path, line } => {
+                let dir = match self.view.take()? {
+                    View::Files(finder) => finder.dir,
+                    View::Grep(grep) => grep.dir,
+                    _ => return None,
                 };
                 let name = self.free_name(&edit_name(&path));
                 Some(Action::Edit {
-                    dir: finder.dir,
+                    dir,
                     path,
+                    line,
                     name,
                 })
             }
@@ -2754,7 +2943,8 @@ impl App {
             pull_requests::Step::Start(pull_request) => self.start_on_pull_request(&pull_request),
             pull_requests::Step::Diff(number) => {
                 let place = view.project_name.clone();
-                let diff = DiffView::of_pull_request(project, place, view.forge, number);
+                let diff =
+                    DiffView::of_pull_request(project, place, self.diff_tree, view.forge, number);
                 let read = diff.read();
                 // Over the view, which is there again when the diff closes.
                 self.view = Some(View::Diff(diff));
@@ -3016,6 +3206,14 @@ impl App {
         if let Some(View::Files(finder)) = &mut self.view {
             let outcome = finder.on_paste(&text);
             return self.follow(outcome);
+        }
+        if let Some(View::Grep(grep)) = &mut self.view {
+            let outcome = grep.on_paste(&text);
+            return self.follow(outcome);
+        }
+        if let Some(View::Branches(switcher)) = &mut self.view {
+            switcher.on_paste(&text);
+            return None;
         }
         if let Some(View::Memory(memory)) = &mut self.view {
             let outcome = memory.on_paste(&text);
@@ -4529,6 +4727,101 @@ mod tests {
             }),
             ..session(name)
         }
+    }
+
+    #[test]
+    fn capital_b_switches_a_projects_main_worktree_only() {
+        let mut app = App::new(None);
+        app.set_sessions(vec![
+            in_worktree("fixer", "fix", State::Running),
+            in_worktree("other", "main", State::Running),
+        ]);
+        app.select("fixer");
+        assert_eq!(press(&mut app, KeyCode::Char('B')), None);
+        assert!(app.notice().unwrap().contains("a linked one stays"));
+        app.select("other");
+        let main = PathBuf::from("/code/app.worktrees/main");
+        assert_eq!(
+            press(&mut app, KeyCode::Char('B')),
+            Some(Action::ListBranches(main))
+        );
+        assert!(matches!(app.view(), Some(View::Branches(_))));
+    }
+
+    #[test]
+    fn a_switch_whose_switcher_has_closed_is_said_at_the_bottom() {
+        use crate::git::branches::{Branch, Carry, Outcome as Switch};
+        let mut app = App::new(None);
+        app.set_sessions(vec![in_worktree("other", "main", State::Running)]);
+        let main = PathBuf::from("/code/app.worktrees/main");
+        press(&mut app, KeyCode::Char('B'));
+        let current = Branch {
+            current: true,
+            ..Branch::new("main")
+        };
+        let listed = switcher::Listed {
+            branches: vec![current, Branch::new("feature")],
+            changes: Vec::new(),
+        };
+        app.branches_listed(&main, Ok(listed));
+        assert_eq!(
+            press(&mut app, KeyCode::Enter),
+            Some(Action::SwitchBranch {
+                dir: main.clone(),
+                target: Branch::new("feature"),
+                carry: Carry::Ask,
+            })
+        );
+        // Esc while git works closes it, and it won't open again until
+        // git is done.
+        press(&mut app, KeyCode::Esc);
+        assert!(app.view().is_none());
+        assert_eq!(press(&mut app, KeyCode::Char('B')), None);
+        assert!(app.notice().unwrap().contains("still switching"));
+
+        let done = Switch::Switched {
+            branch: "feature".into(),
+            note: None,
+        };
+        assert_eq!(app.branch_switched(&main, done), None);
+        assert_eq!(app.notice(), Some("the worktree is on feature"));
+        assert!(press(&mut app, KeyCode::Char('B')).is_some());
+    }
+
+    #[test]
+    fn enter_in_find_in_files_edits_the_file_at_the_line_found() {
+        let mut app = App::new(None);
+        app.set_sessions(vec![in_worktree("fixer", "fix", State::Running)]);
+        let dir = PathBuf::from("/code/app.worktrees/fix");
+        assert_eq!(press(&mut app, KeyCode::Char('G')), None);
+        press(&mut app, KeyCode::Char('n'));
+        assert_eq!(
+            press(&mut app, KeyCode::Char('e')),
+            Some(Action::Grep {
+                dir: dir.clone(),
+                query: "ne".into(),
+            })
+        );
+        let hit = crate::git::Hit {
+            path: "src/a.rs".into(),
+            line: 4,
+            text: "needle".into(),
+        };
+        let found = crate::git::Found {
+            hits: vec![hit],
+            more: false,
+        };
+        assert!(app.searched(&dir, "ne", Ok(found)).is_some());
+        assert_eq!(
+            press(&mut app, KeyCode::Enter),
+            Some(Action::Edit {
+                dir,
+                path: "src/a.rs".into(),
+                line: Some(4),
+                name: "a.rs".into(),
+            })
+        );
+        assert!(app.view().is_none());
     }
 
     #[test]

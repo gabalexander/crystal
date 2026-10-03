@@ -13,9 +13,11 @@ mod command_line;
 mod compose;
 mod copy_mode;
 mod diff;
+mod diff_tree;
 mod diff_view;
 mod finder;
 mod fuzzy;
+mod grep;
 mod groups;
 mod help;
 mod issues;
@@ -28,12 +30,14 @@ mod pane;
 mod plugins_view;
 mod profiles;
 mod pull_requests;
+mod review;
 pub(crate) mod screen_widget;
 mod search;
 mod settings_view;
 pub(crate) mod sidebar;
 mod split_tree;
 mod status;
+mod switcher;
 mod tabs;
 mod text_area;
 mod text_input;
@@ -65,7 +69,7 @@ use std::collections::HashMap;
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -83,6 +87,10 @@ const SPIN_EVERY: Duration = Duration::from_millis(150);
 /// How often its forge is asked again about a project's pull requests. A
 /// project seen for the first time is asked about straight away.
 const PULL_REQUESTS_EVERY: Duration = Duration::from_secs(60);
+
+/// How long find in files waits after a key before it searches: the time
+/// between keys of someone typing a word, so a search runs once it's typed.
+const GREP_PAUSE: Duration = Duration::from_millis(150);
 
 /// How often git is asked again about a project's worktrees, for those
 /// made or removed outside crystal. A project seen for the first time is
@@ -185,6 +193,28 @@ pub enum Event {
         path: String,
         lines: Result<Vec<String>, String>,
     },
+    /// A worktree's branches and changes, listed for the branch switcher.
+    BranchesListed {
+        dir: PathBuf,
+        listed: Result<switcher::Listed, String>,
+    },
+    /// What switching the worktree at `dir` to another branch came to.
+    BranchSwitched {
+        dir: PathBuf,
+        outcome: git::branches::Outcome,
+    },
+    /// What find in files' search for `query` found.
+    Searched {
+        dir: PathBuf,
+        query: String,
+        found: Result<git::Found, String>,
+    },
+    /// A file's lines, for find in files' preview.
+    MatchedFileRead {
+        dir: PathBuf,
+        path: String,
+        lines: Result<Vec<String>, String>,
+    },
     /// A project's memory, read for the memory view.
     MemoryRead {
         dir: PathBuf,
@@ -251,6 +281,7 @@ pub fn run(socket: &Path) -> Result<()> {
         list_worktrees_now,
         theme: Theme::from_env(config.theme),
         started: Instant::now(),
+        searches: Arc::new(AtomicU64::new(0)),
         kept_tabs: tabs::Tabs::default(),
         quitting: false,
         overlay: None,
@@ -265,6 +296,7 @@ pub fn run(socket: &Path) -> Result<()> {
     tui.app.set_plugin_keys(plugin_keys(&config));
     tui.app
         .set_memory(launcher::read_memory(tui.ui(db::LAUNCHER).as_deref()));
+    tui.app.set_diff_tree(tui.review().tree);
     if tui.app.shows_flows() {
         tui.app.set_flows(list_flows(socket));
     }
@@ -362,6 +394,9 @@ struct Tui {
     started: Instant,
     /// The tabs as they were last kept.
     kept_tabs: tabs::Tabs,
+    /// How many searches find in files has asked for: a search that isn't
+    /// the last one asked for stops.
+    searches: Arc<AtomicU64>,
     quitting: bool,
 }
 
@@ -441,6 +476,17 @@ impl Tui {
         if let Ok(db) = &self.db {
             let _ = db.keep_ui(db::LAUNCHER, self.app.memory());
         }
+    }
+
+    /// What the diff view keeps: the files marked reviewed, and whether it
+    /// lists them as a tree.
+    fn review(&self) -> review::Kept {
+        review::read(self.ui(db::DIFF).as_deref())
+    }
+
+    fn keep_review(&self, kept: &review::Kept) -> Result<()> {
+        let db = self.db.as_ref().map_err(|why| anyhow::anyhow!("{why}"))?;
+        db.keep_ui(db::DIFF, kept)
     }
 
     /// The layouts saved with `S`, or why they can't be read.
@@ -589,13 +635,34 @@ impl Tui {
                     pane.ended = true;
                 }
             }
-            Event::DiffRead { dir, against, read } => self.app.diff_read(&dir, against, read),
+            Event::DiffRead { dir, against, read } => {
+                let kept = self.review();
+                let read = read.map(|mut read| {
+                    read.reviewed = kept.marks(&diff_view::scope(&dir, against, &read.head));
+                    read
+                });
+                self.app.diff_read(&dir, against, read);
+            }
             Event::FilesRead { dir, files } => {
                 if let Some(action) = self.app.files_read(&dir, files) {
                     self.carry_out(action);
                 }
             }
             Event::PreviewRead { dir, path, lines } => self.app.preview_read(&dir, &path, lines),
+            Event::BranchesListed { dir, listed } => self.app.branches_listed(&dir, listed),
+            Event::BranchSwitched { dir, outcome } => {
+                if let Some(action) = self.app.branch_switched(&dir, outcome) {
+                    self.carry_out(action);
+                }
+            }
+            Event::Searched { dir, query, found } => {
+                if let Some(action) = self.app.searched(&dir, &query, found) {
+                    self.carry_out(action);
+                }
+            }
+            Event::MatchedFileRead { dir, path, lines } => {
+                self.app.matched_file_read(&dir, &path, lines);
+            }
             Event::MemoryRead { dir, read } => self.app.memory_read(&dir, read),
             Event::Backlog { dir, found } => self.app.set_backlog(&dir, found),
             Event::BacklogCounts(counts) => self.app.set_backlog_counts(counts),
@@ -803,6 +870,16 @@ impl Tui {
                     Event::DiffRead { dir, against, read }
                 });
             }
+            Action::KeepReviewed { scope, marks } => {
+                let mut kept = self.review();
+                kept.set_marks(scope, marks);
+                self.keep_review(&kept)?;
+            }
+            Action::KeepTree(on) => {
+                let mut kept = self.review();
+                kept.tree = on;
+                self.keep_review(&kept)?;
+            }
             Action::ReadFiles(dir) => {
                 self.read_in_background(move || {
                     let files = finder::read_files(&dir);
@@ -854,9 +931,33 @@ impl Tui {
                     Err(err) => Event::Notice(format!("{err:#}")),
                 });
             }
-            Action::Edit { dir, path, name } => {
-                let mut command = editor()?;
-                command.push(path);
+            Action::ListBranches(dir) => {
+                self.read_in_background(move || {
+                    let listed = switcher::read(&dir);
+                    Event::BranchesListed { dir, listed }
+                });
+            }
+            Action::SwitchBranch { dir, target, carry } => {
+                // git can take a while, over a commit's hooks say.
+                self.read_in_background(move || {
+                    let outcome = git::branches::switch(&dir, &target, &carry);
+                    Event::BranchSwitched { dir, outcome }
+                });
+            }
+            Action::Grep { dir, query } => self.search(dir, query),
+            Action::ReadMatchedFile { dir, path } => {
+                self.read_in_background(move || {
+                    let lines = grep::read_file(&dir, &path);
+                    Event::MatchedFileRead { dir, path, lines }
+                });
+            }
+            Action::Edit {
+                dir,
+                path,
+                line,
+                name,
+            } => {
+                let command = editor_at(editor()?, path, line);
                 self.start_session(Some(name), dir, command)?;
             }
             Action::EditHistory { slot, dir, name } => {
@@ -1340,6 +1441,25 @@ impl Tui {
         });
     }
 
+    /// Searches the worktree at `dir` for `query` on a thread of its own, a
+    /// moment after it's asked for, unless another search has been asked for
+    /// by then: that one is what's wanted, and this one stops.
+    fn search(&self, dir: PathBuf, query: String) {
+        let this = self.searches.fetch_add(1, Ordering::Relaxed) + 1;
+        let latest = self.searches.clone();
+        let events = self.events.clone();
+        thread::spawn(move || {
+            thread::sleep(GREP_PAUSE);
+            let stale = || latest.load(Ordering::Relaxed) != this;
+            if stale() {
+                return;
+            }
+            if let Some(found) = grep::search(&dir, &query, &stale) {
+                let _ = events.send(Event::Searched { dir, query, found });
+            }
+        });
+    }
+
     /// Runs `read` on a thread of its own, since git and the disk can keep
     /// it a while, and hands what it read back to the loop as an event.
     fn read_in_background(&self, read: impl FnOnce() -> Event + Send + 'static) {
@@ -1664,6 +1784,29 @@ fn editor() -> Result<Vec<String>> {
     Ok(command)
 }
 
+/// The command that opens `path` in `editor` at `line`: `+12 path`, the way
+/// vi, Emacs, nano and most others take it, but for the editors that take
+/// `path:12`, and VS Code and those made from it, which want `--goto` too.
+fn editor_at(mut editor: Vec<String>, path: String, line: Option<usize>) -> Vec<String> {
+    let Some(line) = line else {
+        editor.push(path);
+        return editor;
+    };
+    let program = editor
+        .first()
+        .and_then(|program| Path::new(program).file_name())
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    match program.as_str() {
+        "code" | "code-insiders" | "codium" | "cursor" | "windsurf" => {
+            editor.extend(["--goto".to_string(), format!("{path}:{line}")]);
+        }
+        "hx" | "helix" | "zed" | "subl" => editor.push(format!("{path}:{line}")),
+        _ => editor.extend([format!("+{line}"), path]),
+    }
+    editor
+}
+
 fn seconds_since_epoch() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1865,5 +2008,26 @@ fn backlog_counts(socket: &Path, projects: Vec<PathBuf>) -> Option<HashMap<PathB
     match client::ask(socket, &Request::BacklogCounts { projects }, false) {
         Ok(Some(Response::BacklogCounts { open })) => Some(open.into_iter().collect()),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn words(words: &[&str]) -> Vec<String> {
+        words.iter().map(|word| word.to_string()).collect()
+    }
+
+    #[test]
+    fn an_editor_is_told_the_line_the_way_it_takes_it() {
+        let at = |editor: &[&str], line| editor_at(words(editor), "src/a.rs".into(), line);
+        assert_eq!(at(&["nvim"], Some(12)), ["nvim", "+12", "src/a.rs"]);
+        assert_eq!(at(&["/usr/bin/vi"], None), ["/usr/bin/vi", "src/a.rs"]);
+        assert_eq!(at(&["hx"], Some(12)), ["hx", "src/a.rs:12"]);
+        assert_eq!(
+            at(&["code", "--wait"], Some(12)),
+            ["code", "--wait", "--goto", "src/a.rs:12"]
+        );
     }
 }

@@ -98,11 +98,20 @@ is: it's the one request every version must understand.
   - `screen_widget.rs`: draws a session's screen into ratatui, for the panes and `crystal attach`
   - `diff.rs`: reads `git diff`'s patch into files, hunks and lines, marks the words that changed,
     and lays a file out in rows, unified or side by side; pure, so it's unit-tested
-  - `diff_view.rs`: the diff view (`d`): its state, keys and drawing, and reading the diff off the
-    event loop
+  - `diff_view.rs`: the diff view (`d`): its state, keys and drawing, files marked reviewed sinking to the
+    bottom, and reading the diff off the event loop
+  - `diff_tree.rs`: the diff view's files folded into a tree of directories (`t`), a chain of directories
+    that hold only one another as one row; pure
+  - `review.rs`: what the diff view keeps between runs, a document the event loop keeps in the database: the
+    files marked reviewed, for each worktree's diff at its commit or each pull request's, with their hashes,
+    and whether it lists files as a tree
   - `fuzzy.rs`: how a path matches a few typed letters, and how well
   - `finder.rs`: the file finder (`p`): its state, keys and drawing, listing files and reading the
     preview off the event loop
+  - `grep.rs`: find in files (`G`): `git grep` as you type, run off the event loop once the typing stops,
+    the lines found under their files, the preview around one, and its drawing
+  - `switcher.rs`: the branch switcher (`B`): the branches filtered as you type, the question about the
+    worktree's uncommitted changes and the commit message, kept apart from I/O, and its drawing
   - `memory_view.rs`: the memory view (`m`): a project's entries, the filter, forgetting and
     promoting after a `y`, and its drawing
   - `plugins_view.rs`: the plugins view (`X`): every plugin, on or off, with installed ones' actions and panes,
@@ -156,7 +165,8 @@ is: it's the one request every version must understand.
 - `src/db.rs`: the SQLite database the daemon and the TUI keep their state in (WAL, `synchronous=NORMAL`,
   migrations by `user_version`, as docket does): the sessions to start again, flow runs, each project's backlog
   and closed tasks, the tasks waiting to start and the last task number, what background tasks spent each day,
-  the event log, and the TUI's tabs, layouts and the new-session panel's memory, each a JSON document; and
+  the event log, and the TUI's tabs, layouts, the new-session panel's memory and the diff view's reviewed
+  marks, each a JSON document; and
   bringing in the JSON files from before, a project's the first time it's asked for. Settings stay in the
   config file and memory in `memory.db`
 - `src/project.rs`: the project a directory is in: its git main worktree, or the directory itself outside git
@@ -206,7 +216,11 @@ is: it's the one request every version must understand.
   installing, making and removing
 - `src/env.rs`: the environment a session's program starts with
 - `src/git.rs`: a directory's project, worktree and branch, a project's linked worktrees, and making and
-  removing worktrees, a pull request's with its commits fetched from `origin` (runs `git`)
+  removing worktrees, a pull request's with its commits fetched from `origin`, the patches the diff reads,
+  and `git grep` stopped once it's no longer wanted (runs `git`)
+  - `git/branches.rs`: a worktree's branches, local and remote, its uncommitted changes, and switching it to
+    another branch or a new one, the changes stashed, brought along, committed or thrown away, and put back
+    when git won't switch
 - `src/names.rs`: made-up names for new worktrees' branches, like `brave-otter`
 - `src/forge.rs`: pull requests and issues from the forge a project's remote is on, GitHub or GitLab, told
   apart by its host and the hosts `gh` and `glab` know: the types both read into, `Repo`'s calls, and running
