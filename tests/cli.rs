@@ -2139,6 +2139,56 @@ fn restart_server_brings_the_running_sessions_back() {
 }
 
 #[test]
+fn a_claude_session_picked_up_again_isn_t_asked_its_task_again() {
+    let crystal = Crystal::new();
+    let bin = fake_claude(crystal.dir.path());
+    let path = path_of(&[&bin]);
+    let out = crystal
+        .command(&["new", "-n", "agent", "-t", "fix the login bug", "claude"])
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let args = written(&crystal.dir.path().join("args"));
+    assert!(args.ends_with("--\nfix the login bug\n"), "{args}");
+
+    // Claude's hooks name its conversation, whose transcript exists once
+    // the task has been sent.
+    let settings: serde_json::Value = serde_json::from_str(args.lines().nth(1).unwrap()).unwrap();
+    let hook = settings["hooks"]["Stop"][0]["hooks"][0]["command"]
+        .as_str()
+        .unwrap();
+    let transcript = crystal.dir.path().join("abc-123.jsonl");
+    std::fs::write(&transcript, "{}\n").unwrap();
+    let event = serde_json::json!({
+        "hook_event_name": "UserPromptSubmit",
+        "session_id": "abc-123",
+        "transcript_path": transcript,
+    });
+    run_hook(&crystal, "agent", hook, &event.to_string());
+    eventually("the conversation is saved", || {
+        crystal.saved().contains("abc-123")
+    });
+
+    std::fs::remove_file(crystal.dir.path().join("args")).unwrap();
+    let out = crystal
+        .command(&["restart-server"])
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+
+    // Back in its conversation, which has had the task already.
+    let args = written(&crystal.dir.path().join("args"));
+    let args: Vec<&str> = args.lines().collect();
+    assert_eq!(args[2..4], ["--resume", "abc-123"]);
+    assert!(!args.contains(&"fix the login bug"), "{args:?}");
+    assert!(!args.contains(&"--"), "{args:?}");
+    // Still a task, open as it was.
+    assert_eq!(crystal.row("agent").unwrap()[8], "fix the login bug");
+}
+
+#[test]
 fn restart_server_without_a_daemon_starts_nothing() {
     let crystal = Crystal::new();
     assert_eq!(crystal.ok(&["restart-server"]), "no daemon was running\n");

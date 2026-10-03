@@ -979,6 +979,9 @@ fn start(
     let mut instructions: Vec<String> = Vec::new();
     instructions.extend(remembered(socket, &cwd, &command));
     let mut asked = command.clone();
+    // What it was started to do: a conversation picked up again has been
+    // asked that already, whether tasks are on or off.
+    let given_task = task.clone();
     // With tasks off, a session started with something to do is just a
     // session.
     let config = settings();
@@ -996,7 +999,13 @@ fn start(
             last.push_str(&about_tasks);
         }
     }
-    let argv = agents::argv(&asked, &crystal, resume, &instructions);
+    let argv = agents::argv(
+        &asked,
+        &crystal,
+        resume,
+        given_task.as_deref(),
+        &instructions,
+    );
     let mut session = Session::spawn(id, name.clone(), command, &argv, cwd, &env)?;
     if let Some(goal) = task {
         session.give_task(TaskInfo {
