@@ -4,6 +4,7 @@ mod attach;
 mod backlog;
 mod catalog;
 mod client;
+mod clipboard;
 mod codex;
 mod config;
 mod daemon;
@@ -22,6 +23,7 @@ mod keys;
 mod mcp;
 mod memory;
 mod memory_cli;
+mod names;
 mod notify;
 mod plugin_cli;
 mod plugin_hooks;
@@ -472,11 +474,15 @@ enum FlowCommand {
 #[derive(Subcommand)]
 enum WorktreeCommand {
     /// Remove a worktree, given its directory or its branch. Refuses while
-    /// a session runs in it.
+    /// a session runs in it, and when it has changes not committed.
     #[command(visible_alias = "remove")]
     Rm {
         /// The worktree's directory, or the branch it has checked out.
         worktree: String,
+
+        /// Remove it even with changes not committed, which go with it.
+        #[arg(long, short)]
+        force: bool,
     },
 }
 
@@ -627,8 +633,8 @@ fn run(cli: Cli) -> Result<()> {
         Command::Flow { json, command } => flow(&socket, json, command)?,
         Command::Result { name, json } => drive::result(&socket, &name, json)?,
         Command::Worktree {
-            command: WorktreeCommand::Rm { worktree },
-        } => remove_worktree(&socket, &worktree)?,
+            command: WorktreeCommand::Rm { worktree, force },
+        } => remove_worktree(&socket, &worktree, force)?,
         Command::Attach { name } => attach::run(&socket, name.as_deref())?,
         Command::Ls { json } => {
             // Without a daemon, there are no sessions.
@@ -952,10 +958,10 @@ fn start_dir(socket: &Path, cwd: Option<PathBuf>, worktree: Option<String>) -> R
 }
 
 /// Removes the worktree `target` names: a directory, or the branch it has
-/// checked out.
-fn remove_worktree(socket: &Path, target: &str) -> Result<()> {
+/// checked out. With `force`, though it has changes not committed.
+fn remove_worktree(socket: &Path, target: &str, force: bool) -> Result<()> {
     let path = git::find_worktree(&std::env::current_dir()?, target)?;
-    client::remove_worktree(socket, &path)
+    client::remove_worktree(socket, &path, force)
 }
 
 /// A number of seconds from the command line, as a `Duration`.

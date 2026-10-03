@@ -84,15 +84,21 @@ and the footer says where you are and offers the keys that matter there.
 | `j` / `k`, `↓` / `↑` | select a session, or a worktree with no sessions |
 | `Enter` | type into the selected session, or start an ended one again, once you've said `y`; on a worktree with no sessions, start one there |
 | `s` | split the selected session off into a pane of its own, or close its split |
+| `F` | float the selected session over the panes, and type into it; again, put it back |
+| `H` / `L` | move the selected session's pane a place left or right among the panes (up or down, stacked), swapping it with the pane there |
+| `z` | [zoom](#zoom-copy-mode-and-search) the selected session's pane to take the whole screen, or put it back |
 | `Tab` / `Shift+Tab` | type into the next pane, or the one before |
-| `PageUp` / `PageDown` | page the selected session's pane back through its history, or forward to live |
+| `PgUp` / `PgDn` | page the selected session's pane back through its history, or forward to live |
+| `e` | open the selected session's [history](#zoom-copy-mode-and-search), and what's on its screen, in your `$EDITOR` |
+| `v` | [copy mode](#zoom-copy-mode-and-search) in the selected session's pane: select, search its history, copy |
 | `t` | make a new [tab](#tabs) with a shell in it, and go to it |
 | `T` | name the tab you're in |
 | `&` | close the tab you're in, and kill its sessions once you've said `y` |
 | `[` / `]`, `1-9` | go to the tab before or after this one, or to the tab with that number |
 | `>` | move the selected session to another tab: then a tab's number, or `t` for a new one |
+| `S` | your saved [layouts](#layouts): save your tabs as one, or put them back the way one has them |
 | `n` | start a new session from [the new-session panel](#starting-a-session), and type into it |
-| `w` | the same, in a new worktree on a branch named after the task |
+| `w` | the same, in a new worktree on a branch with a made-up name, like `brave-otter` |
 | `W` | remove the selected worktree, once nothing runs in it and you've said `y` |
 | `r` | rename the selected session |
 | `x` | kill the selected session, once you've said `y` |
@@ -125,18 +131,32 @@ other, keys arrive the old way.
 Each session keeps the last 2,000 rows that scrolled off its screen, so a pane can page back through what an
 agent wrote before you opened it. The title says how far back you are (`↑ 120 lines`), new output doesn't pull
 you away while you read, and typing into the session brings you back to live. That includes agents that print
-inline through a scroll region, like Codex.
+inline through a scroll region, like Codex. To search that history, or copy from it, there's
+[copy mode](#zoom-copy-mode-and-search), and `e` opens it in your editor.
 
 The mouse works too. Click a session in the sidebar to select it, or click a pane to type into it. The wheel
-moves the selection over the sidebar, and scrolls a pane through its history. A program that asks for the
-mouse itself, like `vim` with `set mouse=a` or `htop`, gets the clicks, drags and the wheel in its pane while
-that pane has the keyboard. Since crystal takes the mouse, your terminal's own text selection needs a key held:
-`Shift` in most terminals, `Option` in iTerm2 and Terminal on macOS.
+moves the selection over the sidebar, and scrolls a pane through its history. Drag across a pane to select
+text: it goes to your clipboard as you let go, and stays marked until you click or type. A program that asks
+for the mouse itself, like `vim` with `set mouse=a` or `htop`, gets the clicks, drags and the wheel in its pane
+while that pane has the keyboard; there, your terminal's own selection still works with a key held: `Shift` in
+most terminals, `Option` in iTerm2 and Terminal on macOS.
 
 A split keeps a session on screen while the selection moves on: up to two of them, beside the selected
 session's pane when each pane can be at least 80 columns wide, and stacked below it when not. Each pane's
 session is sized to its pane. `Tab` from the sidebar goes on to the pane after the one you typed into last, so
 `Tab`, then `Ctrl+\`, then `Tab` again walks through them all.
+
+A new split goes after the other panes. To put them in another order, `H` moves the selected session's pane a
+place to the left and `L` a place to the right (up and down when they're stacked), swapping it with the pane
+that was there; or take a pane by its header line with the mouse and let go over another, and the two swap
+places. Each tab keeps its panes in their order, the next time you open the TUI too.
+
+`F` floats the selected session over the panes, in a frame of its own in the middle of them, and hands it the
+keyboard: a shell to run something in, or an agent to answer, without changing the panes under it. The session
+is sized to the frame. `Ctrl+\` takes you back to the sidebar and leaves it floating, over whatever the
+selection shows; `Tab` or a click gets back into it, as with any pane. `F` again puts it back among the others,
+whichever session is selected. A tab has one float at most, kept with the tab like its splits. A session split
+off floats up out of its split, and `s` on the one floating puts it down into a split.
 
 The sidebar groups sessions by project, then by worktree: `⌂` marks a repository's main worktree and `⎇` a
 linked one, each named by its branch. Sessions outside any repository come last, under their directory.
@@ -250,8 +270,9 @@ review  exited 0  41388  app      main       ~/code/app                      cod
 `/` in the branch made a `-`. A branch that doesn't exist yet starts from the commit you're on; one that does
 is checked out as it is. `crystal worktree rm` (or `W` in the TUI) takes the worktree's directory or its
 branch, refuses while a session is still running in it, and leaves the rest to `git worktree remove`, which
-keeps a worktree with changes you haven't committed. Sessions that had ended in it leave the list with it:
-their directory is gone, so they could never start again.
+keeps a worktree with changes you haven't committed. `crystal worktree rm --force` removes it anyway, and
+those changes with it; `W` asks a second time, naming them, and a second `y` does the same. Sessions that had
+ended in it leave the list with it: their directory is gone, so they could never start again.
 
 `crystal rename` changes what a session is called; its program and its saved place after a restart follow the
 new name. `crystal respawn`, or `Enter` on an ended session in the TUI, runs its command again in the same
@@ -292,6 +313,67 @@ number next, or `t` to make a new tab for it. `&` closes the tab you're in and k
 you've said `y`; an empty tab closes at once. There's always one tab, and nine at most. They're kept beside the
 daemon's state, in `~/.local/state/crystal/`, so they're there when you open the TUI again.
 
+### Layouts
+
+A layout is your tabs saved under a name, to put back later: each tab's name and sessions, its splits and the
+order of its panes, its float, whether it's zoomed, and which tab was in front. `S` lists them, the one saved
+last first, each with how many tabs and sessions it has and how many of those have gone since. `s` saves your
+tabs as they are now under a name you type, in place of the layout of that name if there's one already;
+`Enter` puts your tabs back the way the layout has them; `x` removes it, once you've said `y`; `Esc` closes the
+list.
+
+A layout names sessions; it doesn't start them. Restoring one arranges the sessions running now: those it
+names that have gone since are left out, and those it doesn't name join the tab in front. The tabs a restore
+replaces are kept, at the top of the list as `↶ before` the layout's name, so `Enter` on that takes you back,
+once. Layouts are kept beside your tabs, in `~/.local/state/crystal/layouts.json`.
+
+### Zoom, copy mode and search
+
+`z` zooms the selected session's pane: it takes the whole screen between the top bar and the footer, and the
+sidebar and the other panes step aside until `z` puts them back. The session is sized to the zoomed pane, as
+any pane's is. The keyboard stays where it was, so `j` and `k` go on choosing the session the pane shows, and
+`Enter` types into it. `/` brings the sidebar out over the pane while you look through it. Each tab is zoomed
+or not on its own, and stays that way when you open the TUI again.
+
+`v` puts the selected session's pane in copy mode: a cursor of its own that moves over the screen and back
+through the history with vi's keys, while the program goes on running and its output goes on showing. It
+works on a session that has ended too, on the last it showed. `Ctrl+\` leaves copy mode for the sidebar.
+
+| Key | In copy mode |
+|---|---|
+| `h` `j` `k` `l`, the arrows | move a character or a row; up past the top goes back through the history |
+| `w` / `b` / `e` | to the next word, back a word, to the end of the word; `W` `B` `E` take only blanks to end one |
+| `0` / `^` / `$` | to the start of the line, its first character, its end |
+| `H` / `M` / `L` | to the top, middle or bottom row showing |
+| `{` / `}`, `%` | to the blank line before or after the paragraph; to the bracket that pairs with this one |
+| `gg` / `G` | to the top of the history, or the bottom of the screen |
+| `Ctrl+U` / `Ctrl+D` | half a screen back, or forward |
+| `Ctrl+B` / `Ctrl+F`, `PageUp` / `PageDown` | a screen back, or forward |
+| `v` or `Space` / `V` / `Ctrl+V` | select from here as the cursor moves: characters, whole lines, or a block |
+| `y` or `Enter` | copy the selection, and leave copy mode |
+| `Y` | copy the line the cursor is on, and leave copy mode |
+| `/` / `?` | search down, or up, for what you type next; `Enter` searches |
+| `n` / `N` | the next match the same way, or the other way |
+| `Esc` | drop the selection, then the search, then leave copy mode |
+| `q`, `Ctrl+C` | leave copy mode |
+
+A search finds what you type as it's written, letter for letter, across lines that wrapped, and ignores case
+unless you type a capital. Every match on screen is marked, the one the cursor is on most of all, and the
+footer says which it is: `of: 3 of 12`, counted from the top of the history. A search goes round: down past the
+last match, it starts again at the top.
+
+What you copy goes to your clipboard. On your own machine crystal hands it to `pbcopy` on macOS, or to
+`wl-copy`, `xclip` or `xsel` on Linux. Over ssh, or with none of those, it asks the terminal you're in to take
+it, with OSC 52, which puts it on the clipboard of the machine your terminal runs on: Ghostty, kitty, WezTerm,
+Alacritty, foot and Windows Terminal do; iTerm2 once you allow it in its settings; macOS's Terminal doesn't.
+
+`e` opens the selected session's history in your `$EDITOR` (or `vi`): everything its pane can page back through,
+then what's on its screen, as plain text, with a line that wrapped onto several rows made whole again. It opens
+as a session of its own, in the session's directory, called after it (`claude-history`), and takes the keyboard,
+so you can search, copy or save from it with the editor you know. It works on a session that has ended too. The
+text is a copy, written beside the daemon's state in `~/.local/state/crystal/history/`: the session goes on as
+before, and editing the file changes nothing in it.
+
 ### Starting a session
 
 `n` opens the new-session panel over the panes, titled with where the session will start: `New session ·
@@ -308,15 +390,17 @@ Under the task, `Tab` and `Shift+Tab` go from row to row and `←` / `→` chang
 - **how**, for Claude Code: **in a terminal**, or **in the background**, as a [background
   task](#background-tasks) that needs no terminal. Only Claude Code offers it: crystal reads `claude -p`'s
   events for a task's transcript, and Codex's `codex exec` writes another kind it doesn't read yet.
-- Claude Code's **model** and **permissions** (`--model`, `--permission-mode`), or Codex's **model** and
-  **approvals** (`-m`, `-a`), its models the ones `codex debug models` lists. Left at `default`, no option is
-  added.
+- Claude Code's **model** (fable, opus, sonnet, haiku), **effort** (low to max) and **permissions** (`--model`,
+  `--effort`, `--permission-mode`), or Codex's **model** and **approvals** (`-m`, `-a`), its models the ones
+  `codex debug models` lists. Left at `default`, no option is added.
 - **start in**: here (the selected session's worktree, or where you started `crystal`), a new worktree, or
   another project's main worktree.
 
-A new worktree's **branch** is named after the task, its words in lowercase joined by `-`; type in that row to
-change it. With no task, `Enter` asks you to name it. `w` opens the panel with a new worktree chosen, and
-`Enter` on an issue opens it ready to fix that issue, on a branch named after it.
+A new worktree's **branch** gets a made-up name, an adjective and an animal like `brave-otter`, whatever the
+task says; type in that row to change it. A made-up name is always a new branch: if it's taken, the worktree
+goes on `brave-otter-2`. One you type that's a branch already is checked out as it is. `w` opens the panel
+with a new worktree chosen, and `Enter` on an issue opens it ready to fix that issue, on a branch named after
+it.
 
 The panel ends with the command it runs and, for a new worktree, where. `Ctrl+E` hands that command to the
 bottom line, `new session:`, to change it or run anything else: `npm run dev` or `sh -c 'make && make test'`
@@ -896,6 +980,7 @@ name = "review"                            # how the panel shows it
 description = "Reads the branch's diff"    # optional: shown under it in the panel
 agent = "claude"                           # claude, codex, gemini, opencode, cursor-agent or aider
 model = "opus"                             # optional: Claude Code's or Codex's model
+effort = "high"                            # optional: Claude Code's effort: low, medium, high, xhigh or max
 mode = "plan"                              # optional: Claude Code's permission mode, or Codex's approvals
 args = ["--verbose"]                       # optional: more options, after those
 prompt = "Review the diff on this branch." # optional: put before the task, a blank line between

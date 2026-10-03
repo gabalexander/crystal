@@ -37,9 +37,20 @@ pub struct Tab {
     /// sidebar's selection is what counts, and this waits to be written as
     /// the tab is left.
     pub selected: Option<String>,
-    /// The sessions split off into panes of their own, in the order they
-    /// were split off. Only the tab's own sessions.
+    /// The sessions split off into panes of their own, in the order their
+    /// panes are drawn. Only the tab's own sessions.
     pub splits: Vec<String>,
+    /// Where the pane that follows the selection is among the tab's panes:
+    /// before every split at 0, after the first at 1, and so on. A file
+    /// from before panes could move has none, and reads as 0, where that
+    /// pane always was.
+    pub selection_at: usize,
+    /// Whether the selected session's pane takes all the room between the
+    /// top bar and the footer, the sidebar and the other panes put away.
+    pub zoomed: bool,
+    /// The session floating over the panes, in a pane of its own, if one
+    /// is. One of the tab's own sessions, and never one split off too.
+    pub floating: Option<String>,
 }
 
 impl Tab {
@@ -48,13 +59,43 @@ impl Tab {
         self.sessions.iter().any(|held| held == name)
     }
 
+    /// Where the pane that follows the selection is among the panes: see
+    /// [`Tab::selection_at`], kept to the panes there are.
+    pub fn selection_pane_at(&self) -> usize {
+        self.selection_at.min(self.splits.len())
+    }
+
+    /// Closes the split at `index`. The panes after it move up a place,
+    /// the one that follows the selection among them.
+    pub fn close_split(&mut self, index: usize) {
+        self.splits.remove(index);
+        if index < self.selection_at {
+            self.selection_at -= 1;
+        }
+    }
+
+    /// Closes the splits of the sessions `keep` doesn't keep.
+    fn keep_splits(&mut self, keep: impl Fn(&str) -> bool) {
+        let mut index = 0;
+        while index < self.splits.len() {
+            if keep(&self.splits[index]) {
+                index += 1;
+            } else {
+                self.close_split(index);
+            }
+        }
+    }
+
     /// Takes the session called `name` out of the tab, and out of its
     /// splits and its selection with it.
     fn let_go(&mut self, name: &str) {
         self.sessions.retain(|held| held != name);
-        self.splits.retain(|split| split != name);
+        self.keep_splits(|split| split != name);
         if self.selected.as_deref() == Some(name) {
             self.selected = None;
+        }
+        if self.floating.as_deref() == Some(name) {
+            self.floating = None;
         }
     }
 }
@@ -175,7 +216,8 @@ impl Tabs {
                 .sessions
                 .iter_mut()
                 .chain(tab.splits.iter_mut())
-                .chain(tab.selected.as_mut());
+                .chain(tab.selected.as_mut())
+                .chain(tab.floating.as_mut());
             for name in names.filter(|name| name.as_str() == from) {
                 *name = to.to_string();
             }
@@ -188,7 +230,14 @@ impl Tabs {
     pub fn take_in(&mut self, names: &[&str], home: impl Fn(&str) -> Option<usize>) {
         for tab in &mut self.tabs {
             tab.sessions.retain(|held| names.contains(&held.as_str()));
-            tab.splits.retain(|split| names.contains(&split.as_str()));
+            tab.keep_splits(|split| names.contains(&split));
+            if tab
+                .floating
+                .as_deref()
+                .is_some_and(|name| !names.contains(&name))
+            {
+                tab.floating = None;
+            }
         }
         for name in names {
             if self.tab_of(name).is_none() {
@@ -200,10 +249,23 @@ impl Tabs {
         }
     }
 
+    /// Tabs as read from a file, if they were written in the shape this
+    /// crystal writes them, and put right: see [`Tabs::checked`].
+    pub fn kept(self) -> Option<Tabs> {
+        (self.version == VERSION).then(|| self.checked())
+    }
+
+    /// Every session the tabs hold, by name.
+    pub fn sessions(&self) -> impl Iterator<Item = &str> {
+        let tabs = self.tabs.iter();
+        tabs.flat_map(|tab| tab.sessions.iter().map(String::as_str))
+    }
+
     /// Tabs as read from a file, put right where they couldn't have been
     /// written that way: one tab at least and [`MAX_TABS`] at most, each
-    /// with [`MAX_SPLITS`] splits at most of its own sessions, no session
-    /// in two tabs, and the one in front among them.
+    /// with [`MAX_SPLITS`] splits at most of its own sessions and a float
+    /// of its own that isn't split off too, no session in two tabs, and
+    /// the one in front among them.
     fn checked(mut self) -> Tabs {
         self.tabs.truncate(MAX_TABS);
         if self.tabs.is_empty() {
@@ -213,9 +275,14 @@ impl Tabs {
         for tab in &mut self.tabs {
             tab.sessions.retain(|name| !seen.contains(name));
             seen.extend(tab.sessions.iter().cloned());
-            let sessions = &tab.sessions;
-            tab.splits.retain(|split| sessions.contains(split));
+            let sessions = tab.sessions.clone();
+            let floating = tab.floating.take().filter(|name| sessions.contains(name));
+            tab.keep_splits(|split| {
+                sessions.iter().any(|held| held == split) && floating.as_deref() != Some(split)
+            });
             tab.splits.truncate(MAX_SPLITS);
+            tab.selection_at = tab.selection_pane_at();
+            tab.floating = floating;
         }
         self.current = self.current.min(self.tabs.len() - 1);
         self
@@ -235,8 +302,7 @@ pub fn load(path: &Path) -> Tabs {
     std::fs::read_to_string(path)
         .ok()
         .and_then(|text| serde_json::from_str::<Tabs>(&text).ok())
-        .filter(|tabs| tabs.version == VERSION)
-        .map(Tabs::checked)
+        .and_then(Tabs::kept)
         .unwrap_or_default()
 }
 
@@ -442,9 +508,80 @@ mod tests {
         tabs.put("server", 2);
         tabs.current_mut().splits = vec!["server".into()];
         tabs.current_mut().selected = Some("agent".into());
+        tabs.current_mut().zoomed = true;
+        tabs.current_mut().selection_at = 1;
+        tabs.current_mut().floating = Some("agent".into());
         tabs.go_to(1);
         save(&path, &tabs);
         assert_eq!(load(&path), tabs);
+    }
+
+    #[test]
+    fn tabs_kept_before_they_could_zoom_come_back_unzoomed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tabs.json");
+        let kept = r#"{"version": 2, "tabs": [{"name": "a", "sessions": ["x"], "splits": []}]}"#;
+        std::fs::write(&path, kept).unwrap();
+        let tabs = load(&path);
+        assert_eq!(tabs.current().sessions, ["x"]);
+        assert!(!tabs.current().zoomed);
+    }
+
+    #[test]
+    fn tabs_kept_before_panes_could_move_have_the_selections_pane_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tabs.json");
+        let kept = r#"{"version": 2, "tabs": [{"sessions": ["x", "y"], "splits": ["y"]}]}"#;
+        std::fs::write(&path, kept).unwrap();
+        assert_eq!(load(&path).current().selection_pane_at(), 0);
+
+        // One past the panes there are is put back after the last.
+        let kept = r#"{"version": 2, "tabs": [{"sessions": ["x", "y"], "splits": ["y"],
+            "selection_at": 7}]}"#;
+        std::fs::write(&path, kept).unwrap();
+        assert_eq!(load(&path).current().selection_at, 1);
+    }
+
+    #[test]
+    fn a_split_that_closes_before_the_selections_pane_takes_it_back_a_place() {
+        let mut tabs = Tabs::default();
+        for name in ["a", "b", "c"] {
+            tabs.put(name, 0);
+        }
+        let tab = tabs.current_mut();
+        tab.splits = vec!["a".into(), "b".into()];
+        tab.selection_at = 1;
+        // a, the selection's pane, b: b closing leaves the first two.
+        tab.close_split(1);
+        assert_eq!(tab.selection_at, 1);
+        // a closing leaves the selection's pane on its own, first.
+        tabs.take_in(&["b", "c"], |_| None);
+        assert!(tabs.current().splits.is_empty());
+        assert_eq!(tabs.current().selection_at, 0);
+    }
+
+    #[test]
+    fn a_float_follows_its_session_through_a_rename_and_goes_with_it() {
+        let mut tabs = Tabs::default();
+        tabs.put("old", 0);
+        tabs.current_mut().floating = Some("old".into());
+        tabs.renamed("old", "new");
+        assert_eq!(tabs.current().floating.as_deref(), Some("new"));
+        tabs.take_in(&[], |_| None);
+        assert_eq!(tabs.current().floating, None);
+    }
+
+    #[test]
+    fn a_float_read_from_a_file_is_one_of_its_tabs_sessions_and_not_split_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tabs.json");
+        let kept = r#"{"version": 2, "tabs": [{"sessions": ["x", "y"], "splits": ["x", "y"],
+            "floating": "x"}, {"sessions": ["z"], "floating": "y"}]}"#;
+        std::fs::write(&path, kept).unwrap();
+        let tabs = load(&path);
+        assert_eq!(tabs.all()[0].floating.as_deref(), Some("x"));
+        assert_eq!(tabs.all()[0].splits, ["y"]);
+        assert_eq!(tabs.all()[1].floating, None);
     }
 
     #[test]

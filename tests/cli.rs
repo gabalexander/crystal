@@ -141,18 +141,22 @@ impl Crystal {
         drop(pty.slave);
 
         let screen = Arc::new(Mutex::new(vt100::Parser::new(24, 80, 0)));
+        let written = Arc::new(Mutex::new(Vec::new()));
         let mut output = pty.master.try_clone_reader().unwrap();
         thread::spawn({
             let screen = screen.clone();
+            let written = written.clone();
             move || {
                 let mut buf = [0; 4096];
                 while let Ok(n @ 1..) = output.read(&mut buf) {
                     screen.lock().unwrap().process(&buf[..n]);
+                    written.lock().unwrap().extend_from_slice(&buf[..n]);
                 }
             }
         });
         Terminal {
             screen,
+            written,
             keys: pty.master.take_writer().unwrap(),
             pty: pty.master,
             child,
@@ -162,6 +166,9 @@ impl Crystal {
 
 struct Terminal {
     screen: Arc<Mutex<vt100::Parser>>,
+    /// Everything crystal wrote to the terminal, for what vt100 doesn't
+    /// keep, like a request to put text on the clipboard.
+    written: Arc<Mutex<Vec<u8>>>,
     keys: Box<dyn Write + Send>,
     pty: Box<dyn MasterPty + Send>,
     child: Box<dyn Child + Send + Sync>,
@@ -208,6 +215,32 @@ impl Terminal {
         }
     }
 
+    /// Waits until crystal has asked the terminal, with OSC 52, to put
+    /// `text` on the clipboard.
+    fn copies(&self, text: &str) {
+        let request = format!("\x1b]52;c;{}\x07", base64(text.as_bytes()));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let written = self.written.lock().unwrap().clone();
+            if written
+                .windows(request.len())
+                .any(|window| window == request.as_bytes())
+            {
+                return;
+            }
+            let asked: Vec<String> = String::from_utf8_lossy(&written)
+                .split("\x1b]52;c;")
+                .skip(1)
+                .map(|rest| rest.split('\x07').next().unwrap_or("").to_string())
+                .collect();
+            assert!(
+                Instant::now() < deadline,
+                "{text:?} was never copied; crystal asked for {asked:?}"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     fn type_keys(&mut self, keys: &str) {
         self.keys.write_all(keys.as_bytes()).unwrap();
         self.keys.flush().unwrap();
@@ -239,6 +272,28 @@ impl Drop for Terminal {
     fn drop(&mut self) {
         let _ = self.child.kill();
     }
+}
+
+/// `bytes` in base64, as OSC 52 carries them.
+fn base64(bytes: &[u8]) -> String {
+    const LETTERS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = u32::from(b[0]) << 16 | u32::from(b[1]) << 8 | u32::from(b[2]);
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(LETTERS[(n >> (18 - 6 * i) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
 }
 
 fn size(rows: u16, cols: u16) -> PtySize {
@@ -1205,6 +1260,181 @@ fn the_session_in_the_pane_is_sized_to_the_pane() {
 }
 
 #[test]
+fn z_zooms_the_pane_over_the_whole_screen_and_back() {
+    let crystal = Crystal::new();
+    crystal.ok(&[
+        "new",
+        "-n",
+        "sizer",
+        "sh",
+        "-c",
+        "trap 'stty size > size' WINCH; echo watching; while :; do sleep 0.05; done",
+    ]);
+    let size = crystal.dir.path().join("size");
+    let size_is = |expected: &str| std::fs::read_to_string(&size).is_ok_and(|s| s == expected);
+
+    let mut tui = crystal.tui();
+    tui.shows("watching");
+    eventually("the session is the pane's size", || size_is("21 51\n"));
+
+    // Zoomed, the pane has all 80 columns: the sidebar has stepped aside.
+    tui.type_keys("z");
+    tui.shows("sizer · zoomed");
+    eventually("the session is the zoomed pane's size", || {
+        size_is("21 80\n")
+    });
+    tui.type_keys("z");
+    tui.hides("zoomed");
+    eventually("the session is the pane's size again", || {
+        size_is("21 51\n")
+    });
+}
+
+#[test]
+fn f_floats_a_session_over_the_panes_and_puts_it_back() {
+    let crystal = Crystal::new();
+    crystal.ok(&[
+        "new",
+        "-n",
+        "sizer",
+        "sh",
+        "-c",
+        "trap 'stty size > size' WINCH; echo watching; while :; do sleep 0.05; done",
+    ]);
+    let size = crystal.dir.path().join("size");
+    let size_is = |expected: &str| std::fs::read_to_string(&size).is_ok_and(|s| s == expected);
+
+    let mut tui = crystal.tui();
+    tui.shows("watching");
+    eventually("the session is the pane's size", || size_is("21 51\n"));
+
+    // Beside the sidebar there are 51 columns and 22 rows. The float's
+    // frame takes all 51 and 17 of the rows; inside the frame, below its
+    // header line, the session has 49 by 14.
+    tui.type_keys("F");
+    tui.shows("sizer · floating");
+    tui.shows("typing into sizer");
+    eventually("the session is the float's size", || size_is("14 49\n"));
+
+    // Back in the sidebar, it goes on floating, until F puts it back.
+    tui.type_keys("\x1c");
+    tui.shows("F puts it back");
+    tui.type_keys("F");
+    tui.hides("floating");
+    eventually("the session is the pane's size again", || {
+        size_is("21 51\n")
+    });
+}
+
+#[test]
+fn keys_go_to_the_session_that_floats() {
+    let crystal = Crystal::new();
+    crystal.ok(&[
+        "new",
+        "-n",
+        "reader",
+        "sh",
+        "-c",
+        "read line; echo \"$line\" > got; sleep 30",
+    ]);
+
+    let mut tui = crystal.tui();
+    tui.shows("❯ reader");
+    tui.type_keys("F");
+    tui.shows("typing into reader");
+    tui.type_keys("hello float\r");
+    assert_eq!(written(&crystal.dir.path().join("got")), "hello float\n");
+}
+
+/// Opens the TUI the way it runs over ssh, so that what it copies goes to
+/// the terminal, with OSC 52, rather than to this machine's clipboard.
+fn tui_over_ssh(crystal: &Crystal) -> Terminal {
+    crystal.attach_with_env(&[], &[("SSH_TTY", "/dev/ttys999")])
+}
+
+#[test]
+fn copy_mode_finds_text_in_the_history_and_copies_it() {
+    let crystal = Crystal::new();
+    let script = "for i in $(seq 1 60); do echo row $i; done; echo the needle is here; \
+                  for i in $(seq 61 120); do echo row $i; done; sleep 30";
+    crystal.ok(&["new", "-n", "printer", "sh", "-c", script]);
+
+    let mut tui = tui_over_ssh(&crystal);
+    tui.shows("row 120");
+    tui.type_keys("v");
+    tui.shows("copying from printer");
+    tui.type_keys("?needle");
+    tui.shows("search up: needle");
+    tui.type_keys("\r");
+    tui.shows("the needle is here");
+    tui.shows("needle: 1 of 1");
+
+    // The search left the cursor on "needle": select to the end of the
+    // line, and copy it.
+    tui.type_keys("v$y");
+    tui.copies("needle is here");
+    tui.shows("copied 1 line");
+    // Copy mode is over, and the keyboard is back in the sidebar.
+    tui.type_keys("j");
+    tui.shows("q quit");
+}
+
+#[test]
+fn e_opens_a_sessions_history_in_the_editor() {
+    let crystal = Crystal::new();
+    // 120 rows, most of them in the history by the end, and a line longer
+    // than the pane is wide, which wraps onto two rows.
+    let long = "word ".repeat(16);
+    let printing = format!(
+        "for i in $(seq 1 120); do echo row $i; done; echo '{long}'; echo the end; sleep 30"
+    );
+    crystal.ok(&["new", "-n", "printer", "sh", "-c", &printing]);
+    // An editor that keeps a copy of the file it was asked to open.
+    let editor = crystal.dir.path().join("editor");
+    let edited = crystal.dir.path().join("edited");
+    script(
+        &editor,
+        "cp \"$1\" \"$EDITED.new\" && mv \"$EDITED.new\" \"$EDITED\"\nsleep 30\n",
+    );
+
+    let mut tui = crystal.attach_with_env(
+        &[],
+        &[
+            ("EDITOR", editor.to_str().unwrap()),
+            ("EDITED", edited.to_str().unwrap()),
+        ],
+    );
+    tui.shows("the end");
+    tui.type_keys("e");
+    tui.shows("typing into printer-history");
+    let rows: Vec<String> = (1..=120).map(|i| format!("row {i}")).collect();
+    let expected = format!("{}\n{}\nthe end\n", rows.join("\n"), long.trim_end());
+    assert_eq!(written(&edited), expected);
+}
+
+#[test]
+fn a_drag_across_a_pane_copies_what_it_covers() {
+    let crystal = Crystal::new();
+    crystal.ok(&[
+        "new",
+        "-n",
+        "words",
+        "sh",
+        "-c",
+        "echo alpha beta gamma; sleep 30",
+    ]);
+
+    let mut tui = tui_over_ssh(&crystal);
+    tui.shows("alpha beta gamma");
+    // The pane's screen starts at column 30, row 3, counting from 1 as the
+    // mouse does: "beta" is at columns 36 to 39 of the first row. Down on
+    // its first letter, drag to its last, and let go.
+    tui.type_keys("\x1b[<0;36;3M\x1b[<32;39;3M\x1b[<0;39;3m");
+    tui.copies("beta");
+    tui.shows("copied 1 line");
+}
+
+#[test]
 fn the_tui_needs_a_terminal() {
     let crystal = Crystal::new();
     assert!(crystal.fails(&[]).contains("crystal needs a terminal"));
@@ -1509,7 +1739,7 @@ fn worktree_rm_waits_until_no_session_runs_in_it() {
 }
 
 #[test]
-fn worktree_rm_keeps_work_that_isnt_committed() {
+fn worktree_rm_keeps_work_that_isnt_committed_unless_forced() {
     let crystal = Crystal::new();
     let repo = git_repo(crystal.dir.path(), "app");
     let repo_arg = repo.to_str().unwrap();
@@ -1520,6 +1750,10 @@ fn worktree_rm_keeps_work_that_isnt_committed() {
     let err = crystal.fails(&["worktree", "rm", "app.worktrees/fix"]);
     assert!(err.contains("untracked"), "{err}");
     assert!(worktree.join("notes.txt").exists());
+
+    // Unless it's forced, and the work goes with it.
+    crystal.ok(&["worktree", "rm", "--force", "app.worktrees/fix"]);
+    assert!(!worktree.exists());
 }
 
 #[test]
@@ -1549,7 +1783,7 @@ fn the_tui_groups_sessions_by_project_then_worktree() {
 }
 
 #[test]
-fn w_names_the_new_worktrees_branch_after_the_task() {
+fn w_makes_the_new_worktree_on_a_branch_with_a_made_up_name() {
     let crystal = Crystal::new();
     let repo = git_repo(crystal.dir.path(), "app");
     crystal.ok(&[
@@ -1567,23 +1801,26 @@ fn w_names_the_new_worktrees_branch_after_the_task() {
     let mut tui = crystal.attach_with_env(&[], &[("PATH", &path)]);
     tui.shows("▸ planner");
     tui.type_keys("w");
-    tui.shows("New session · app ⎇ a new branch");
+    let branch = panel_branch(&tui);
+    assert!(branch.split_once('-').is_some(), "{branch}");
+    tui.shows(&format!("New session · app ⎇ {branch}"));
+    // The task doesn't rename it.
     tui.type_keys("Fix the flaky test!");
-    tui.shows("New session · app ⎇ fix-the-flaky-test");
-    tui.shows("branch       fix-the-flaky-test");
+    tui.shows("Fix the flaky test!");
+    assert_eq!(panel_branch(&tui), branch);
     tui.type_keys("\r");
-    tui.shows("⎇ fix-the-flaky-test");
     tui.shows("typing into");
+    tui.shows(&format!("⎇ {branch}"));
 
     // Claude Code started in the new worktree, which writes down its
     // arguments where it runs.
-    let worktree = crystal.dir.path().join("app.worktrees/fix-the-flaky-test");
+    let worktree = crystal.dir.path().join("app.worktrees").join(&branch);
     let args = written(&worktree.join("args"));
     assert_eq!(args.lines().last(), Some("Fix the flaky test!"));
 }
 
 #[test]
-fn a_new_worktree_with_no_task_asks_what_to_call_its_branch() {
+fn a_new_worktrees_made_up_name_can_be_typed_over() {
     let crystal = Crystal::new();
     let repo = git_repo(crystal.dir.path(), "app");
     let repo_arg = repo.to_str().unwrap();
@@ -1592,12 +1829,34 @@ fn a_new_worktree_with_no_task_asks_what_to_call_its_branch() {
     let path = path_of(&[]);
     let mut tui = crystal.attach_with_env(&[], &[("PATH", &path)]);
     tui.shows("▸ planner");
-    tui.type_keys("w\r");
+    tui.type_keys("w");
+    panel_branch(&tui);
+    // Shift+Tab goes round from the first row to the branch's, and Ctrl+U
+    // rubs the name out, so Enter asks for one.
+    tui.type_keys("\x1b[Z\x15\r");
     tui.shows("name the new worktree's branch");
     tui.type_keys("spike\r");
-    // The panel's title shows the branch as it's typed, before Enter.
     let worktree = crystal.dir.path().join("app.worktrees/spike");
     eventually("the worktree is made", || worktree.is_dir());
+}
+
+/// The branch the new-session panel shows for a new worktree, once it has
+/// drawn its title and the rows below it, down to the command it runs.
+fn panel_branch(tui: &Terminal) -> String {
+    let mut branch = String::new();
+    eventually("the panel shows the new worktree's branch", || {
+        let text = tui.text();
+        let row = text
+            .lines()
+            .find_map(|line| line.split_once("branch       "))
+            .map_or("", |(_, after)| after);
+        branch = row
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
+            .collect();
+        !branch.is_empty() && text.contains(&format!("⎇ {branch}")) && text.contains("runs  ")
+    });
+    branch
 }
 
 impl Crystal {
@@ -1977,6 +2236,99 @@ fn tab_takes_the_keyboard_on_to_a_split_and_its_session_gets_the_keys() {
     tui.type_keys("hello split\r");
 
     assert_eq!(written(&crystal.dir.path().join("got")), "hello split\n");
+}
+
+/// The row of the screen `text` first shows on, counted from 0.
+fn row_of(tui: &Terminal, text: &str) -> Option<usize> {
+    tui.text().lines().position(|row| row.contains(text))
+}
+
+#[test]
+fn l_moves_a_pane_past_the_next_and_the_tab_keeps_the_order() {
+    let crystal = Crystal::new();
+    for name in ["alpha", "beta"] {
+        let script = format!("echo {name} is here; echo > {name}-ready; sleep 30");
+        crystal.ok(&["new", "-n", name, "sh", "-c", &script]);
+        written(&crystal.dir.path().join(format!("{name}-ready")));
+    }
+
+    // At 80 columns the panes are stacked: beta's, which follows the
+    // selection, on top, then alpha's split.
+    let mut tui = crystal.tui();
+    tui.shows("alpha is here");
+    tui.type_keys("sj");
+    tui.shows("beta is here");
+    let above = |tui: &Terminal, first: &str, second: &str| matches!((row_of(tui, first), row_of(tui, second)), (Some(a), Some(b)) if a < b);
+    assert!(
+        above(&tui, "beta is here", "alpha is here"),
+        "{}",
+        tui.text()
+    );
+
+    tui.type_keys("L");
+    eventually("beta's pane goes below alpha's", || {
+        above(&tui, "alpha is here", "beta is here")
+    });
+
+    // The order is the tab's: it's there again when the TUI opens.
+    tui.type_keys("q");
+    assert!(tui.exit());
+    let tui = crystal.tui();
+    tui.shows("beta is here");
+    tui.shows("alpha is here");
+    assert!(
+        above(&tui, "alpha is here", "beta is here"),
+        "{}",
+        tui.text()
+    );
+}
+
+#[test]
+fn a_layout_saved_puts_the_tabs_back_the_way_they_were() {
+    let crystal = Crystal::new();
+    for name in ["alpha", "beta"] {
+        let script = format!("echo {name} is here; echo > {name}-ready; sleep 30");
+        crystal.ok(&["new", "-n", name, "sh", "-c", &script]);
+        written(&crystal.dir.path().join(format!("{name}-ready")));
+    }
+
+    // alpha split off beside beta, in a tab called review.
+    let mut tui = crystal.tui();
+    tui.shows("alpha is here");
+    tui.type_keys("sj");
+    tui.shows("beta is here");
+    tui.type_keys("Treview\r");
+    tui.shows("1 review");
+
+    tui.type_keys("S");
+    tui.shows("no layouts yet");
+    tui.type_keys("s");
+    tui.shows("save the tabs as:");
+    tui.type_keys("side by side\r");
+    tui.shows("saved your tabs as side by side");
+    tui.shows("1 tab · 2 sessions");
+    tui.type_keys("\x1b");
+    tui.hides("layouts ·");
+
+    // The split closes, and the tab loses its name.
+    tui.type_keys("k");
+    tui.type_keys("s");
+    tui.hides("beta is here");
+    tui.type_keys("T\x15\r");
+    tui.hides("review");
+
+    tui.type_keys("S");
+    tui.shows("side by side");
+    tui.type_keys("\r");
+    tui.shows("restored side by side");
+    tui.shows("1 review");
+    tui.shows("alpha is here");
+    tui.shows("beta is here");
+
+    // The tabs it replaced are kept, to go back to.
+    tui.type_keys("S");
+    tui.shows("↶ before side by side");
+    assert!(crystal.dir.path().join("layouts.json").exists());
 }
 
 #[test]
@@ -2936,7 +3288,7 @@ fn a_worktree_whose_last_session_is_killed_stays_until_shift_w_removes_it() {
 }
 
 #[test]
-fn shift_w_on_a_worktree_with_work_in_it_says_why_git_keeps_it() {
+fn shift_w_on_a_worktree_with_work_in_it_asks_again_before_losing_it() {
     let crystal = Crystal::new();
     let repo = git_repo(crystal.dir.path(), "app");
     let repo_arg = repo.to_str().unwrap();
@@ -2953,9 +3305,20 @@ fn shift_w_on_a_worktree_with_work_in_it_says_why_git_keeps_it() {
     tui.type_keys("W");
     tui.shows("remove worktree fix? y/n");
     tui.type_keys("y");
-    tui.shows("'fix' contains modified or untracked files");
+    tui.shows("fix has uncommitted changes: remove it and lose them? y/n");
+    // A no keeps it, and the work in it.
+    tui.type_keys("n");
+    tui.hides("uncommitted changes");
     assert!(worktree.join("notes.txt").exists());
     tui.shows("· no sessions");
+
+    tui.type_keys("W");
+    tui.shows("remove worktree fix? y/n");
+    tui.type_keys("y");
+    tui.shows("fix has uncommitted changes: remove it and lose them? y/n");
+    tui.type_keys("y");
+    eventually("the worktree is gone", || !worktree.exists());
+    tui.hides("⎇ fix");
 }
 
 #[test]

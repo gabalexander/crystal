@@ -2,14 +2,20 @@
 //! drawn, the rows that scrolled up off it, and what the program asked of
 //! its terminal. The daemon keeps one for each session, and answers the
 //! program's questions from it; each viewer keeps one of its own, fed the
-//! same output, to draw.
+//! same output, to draw, and to copy from: copy mode's cursor, the
+//! selection and searches are Alacritty's own vi mode, kept in step with
+//! the output as it scrolls.
 
 use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::{Dimensions, Grid, Scroll};
-use alacritty_terminal::index::{Column, Line};
+use alacritty_terminal::index::{Boundary, Column, Direction, Line, Point, Side};
+use alacritty_terminal::selection::{Selection, SelectionRange, SelectionType};
 use alacritty_terminal::term::cell::{Cell as GridCell, Flags};
+use alacritty_terminal::term::search::{Match, RegexIter, RegexSearch};
 use alacritty_terminal::term::{Config, Term, TermMode};
+use alacritty_terminal::vi_mode::ViMotion;
 use alacritty_terminal::vte::ansi::{Color, NamedColor, Processor, Timeout};
+use std::cell::RefCell;
 use std::fmt::Write as _;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -71,6 +77,96 @@ pub struct Screen {
     parser: Processor<Unsynced>,
     /// What the terminal has heard from the program besides what it drew.
     heard: Arc<Mutex<Heard>>,
+    /// The last search, while copy mode keeps it.
+    search: Option<Search>,
+}
+
+/// A search through the screen and its history.
+struct Search {
+    /// Alacritty's search, which keeps a cache as it goes, and so is
+    /// borrowed mutably even to draw the matches.
+    regex: RefCell<RegexSearch>,
+}
+
+/// A move of copy mode's cursor, as vi has it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Motion {
+    Left,
+    Down,
+    Up,
+    Right,
+    /// To the start of the line: `0`.
+    LineStart,
+    /// To its first character that isn't a blank: `^`.
+    LineText,
+    /// To its end: `$`.
+    LineEnd,
+    /// To the top, middle or bottom row showing: `H`, `M`, `L`.
+    ViewTop,
+    ViewMiddle,
+    ViewBottom,
+    /// To the start of the next word, the start of this one or the one
+    /// before, or its end: `w`, `b`, `e`. A word ends at punctuation.
+    WordNext,
+    WordBack,
+    WordEnd,
+    /// The same, with words that only blanks end: `W`, `B`, `E`.
+    BigWordNext,
+    BigWordBack,
+    BigWordEnd,
+    /// To the blank line before or after this paragraph: `{`, `}`.
+    ParagraphBack,
+    ParagraphNext,
+    /// To the bracket that pairs with the one under the cursor: `%`.
+    Bracket,
+    /// To the first row of the history: `gg`.
+    HistoryTop,
+    /// To the last row of the screen: `G`.
+    HistoryBottom,
+}
+
+/// What a selection takes in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectionKind {
+    /// Characters, from one to another, wrapping onto the rows between.
+    Chars,
+    /// Whole lines.
+    Lines,
+    /// A rectangle.
+    Block,
+}
+
+impl SelectionKind {
+    fn alacritty(self) -> SelectionType {
+        match self {
+            SelectionKind::Chars => SelectionType::Simple,
+            SelectionKind::Lines => SelectionType::Lines,
+            SelectionKind::Block => SelectionType::Block,
+        }
+    }
+}
+
+/// Where a search landed: the match the cursor is on now, counted from
+/// the top of the history, out of how many there are.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Found {
+    pub number: usize,
+    pub of: usize,
+}
+
+/// What copy mode marks on a cell, beyond what the program drew there.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum Mark {
+    #[default]
+    None,
+    /// Something the search found.
+    Found,
+    /// The match copy mode's cursor is on.
+    Current,
+    /// Inside the selection.
+    Selected,
+    /// Under copy mode's cursor.
+    Cursor,
 }
 
 /// What alacritty_terminal hands back as it reads a program's output: the
@@ -151,6 +247,7 @@ pub struct Cell<'a> {
     pub style: CellStyle,
     /// The left half of a wide character, whose right half is left out.
     pub wide: bool,
+    pub mark: Mark,
 }
 
 /// How a cell looks, beyond its text.
@@ -196,6 +293,7 @@ impl Screen {
             term,
             parser: Processor::new(),
             heard,
+            search: None,
         }
     }
 
@@ -336,6 +434,28 @@ impl Screen {
             .collect()
     }
 
+    /// The history and the screen as text to read in an editor: a line
+    /// that wrapped onto several rows is one line again, the blanks at the
+    /// end of each are left off, and so are the empty rows after the last
+    /// with something on it. Ends in a line break, as a text file does,
+    /// unless there's nothing at all.
+    pub fn text(&self) -> String {
+        let grid = self.term.grid();
+        let start = Point::new(Line(-(grid.history_size() as i32)), Column(0));
+        let end = Point::new(Line(grid.screen_lines() as i32 - 1), grid.last_column());
+        let text = self.term.bounds_to_string(start, end);
+        let lines: Vec<&str> = text.lines().map(str::trim_end).collect();
+        let used = lines
+            .iter()
+            .rposition(|line| !line.is_empty())
+            .map_or(0, |last| last + 1);
+        let mut text = lines[..used].join("\n");
+        if used > 0 {
+            text.push('\n');
+        }
+        text
+    }
+
     /// The screen's rows down to its last one with something on it, as
     /// text with the escapes that color it, to print.
     pub fn styled(&self) -> String {
@@ -380,15 +500,17 @@ impl Screen {
     pub fn each_cell(&self, mut visit: impl FnMut(u16, u16, &Cell)) {
         let grid = self.term.grid();
         let offset = grid.display_offset() as i32;
+        let mut marks = self.marks();
         let mut text = String::new();
         for row in 0..grid.screen_lines() {
-            let line = &grid[Line(row as i32 - offset)];
+            let line = Line(row as i32 - offset);
             for col in 0..grid.columns() {
-                let cell = &line[Column(col)];
+                let cell = &grid[line][Column(col)];
                 // A wide character's right half is drawn by its left half.
                 if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
                     continue;
                 }
+                let wide = cell.flags.contains(Flags::WIDE_CHAR);
                 text.clear();
                 cell_text(cell, &mut text);
                 visit(
@@ -397,11 +519,252 @@ impl Screen {
                     &Cell {
                         text: &text,
                         style: Style::of(cell).cell_style(),
-                        wide: cell.flags.contains(Flags::WIDE_CHAR),
+                        wide,
+                        mark: marks.at(Point::new(line, Column(col)), wide),
                     },
                 );
             }
         }
+    }
+
+    /// What copy mode marks on the rows showing.
+    fn marks(&self) -> Marks {
+        let cursor = self.copying().then_some(self.term.vi_mode_cursor.point);
+        let selection = self.term.selection.as_ref();
+        Marks {
+            cursor,
+            selection: selection.and_then(|selection| selection.to_range(&self.term)),
+            found: self.matches_showing(),
+            next_found: 0,
+        }
+    }
+
+    /// The matches of the search on the rows showing, in order. A match
+    /// that starts on a row above, and wraps onto them, counts.
+    fn matches_showing(&self) -> Vec<Match> {
+        let Some(search) = &self.search else {
+            return Vec::new();
+        };
+        let grid = self.term.grid();
+        let top = Line(-(grid.display_offset() as i32));
+        let bottom = top + (grid.screen_lines() as i32 - 1);
+        let start = self.term.line_search_left(Point::new(top, Column(0)));
+        let end = self
+            .term
+            .line_search_right(Point::new(bottom, grid.last_column()));
+        let mut regex = search.regex.borrow_mut();
+        RegexIter::new(start, end, Direction::Right, &self.term, &mut regex).collect()
+    }
+
+    /// Whether copy mode is on: a cursor of its own over the screen and
+    /// the history, which the program's output doesn't move.
+    pub fn copying(&self) -> bool {
+        self.term.mode().contains(TermMode::VI)
+    }
+
+    /// Turns copy mode on, its cursor where the program's is, or at the
+    /// top of what's showing when the program's isn't in sight.
+    pub fn start_copying(&mut self) {
+        self.term.selection = None;
+        if !self.copying() {
+            self.term.toggle_vi_mode();
+        }
+    }
+
+    /// Turns copy mode off, forgetting its selection and its search. What's
+    /// showing stays where it is.
+    pub fn stop_copying(&mut self) {
+        self.term.selection = None;
+        self.search = None;
+        if self.copying() {
+            self.term.toggle_vi_mode();
+        }
+    }
+
+    /// Where copy mode's cursor is on what's showing, as `(row, col)`,
+    /// while copy mode is on.
+    pub fn copy_cursor(&self) -> Option<(u16, u16)> {
+        if !self.copying() {
+            return None;
+        }
+        let point = self.term.vi_mode_cursor.point;
+        let row = point.line.0 + self.term.grid().display_offset() as i32;
+        let row = u16::try_from(row).ok()?;
+        Some((row, point.column.0 as u16))
+    }
+
+    /// Moves copy mode's cursor, taking the view with it to keep it in
+    /// sight, and the end of the selection with it.
+    pub fn move_copy_cursor(&mut self, motion: Motion) {
+        let vi = match motion {
+            Motion::Left => ViMotion::Left,
+            Motion::Down => ViMotion::Down,
+            Motion::Up => ViMotion::Up,
+            Motion::Right => ViMotion::Right,
+            Motion::LineStart => ViMotion::First,
+            Motion::LineText => ViMotion::FirstOccupied,
+            Motion::LineEnd => ViMotion::Last,
+            Motion::ViewTop => ViMotion::High,
+            Motion::ViewMiddle => ViMotion::Middle,
+            Motion::ViewBottom => ViMotion::Low,
+            Motion::WordNext => ViMotion::SemanticRight,
+            Motion::WordBack => ViMotion::SemanticLeft,
+            Motion::WordEnd => ViMotion::SemanticRightEnd,
+            Motion::BigWordNext => ViMotion::WordRight,
+            Motion::BigWordBack => ViMotion::WordLeft,
+            Motion::BigWordEnd => ViMotion::WordRightEnd,
+            Motion::ParagraphBack => ViMotion::ParagraphUp,
+            Motion::ParagraphNext => ViMotion::ParagraphDown,
+            Motion::Bracket => ViMotion::Bracket,
+            Motion::HistoryTop => {
+                let top = Point::new(self.term.topmost_line(), Column(0));
+                return self.term.vi_goto_point(top);
+            }
+            Motion::HistoryBottom => {
+                let bottom = Point::new(self.term.bottommost_line(), Column(0));
+                self.term.vi_goto_point(bottom);
+                ViMotion::FirstOccupied
+            }
+        };
+        self.term.vi_motion(vi);
+    }
+
+    /// Moves the view `rows` further back into the history, or toward live
+    /// when it's negative, and copy mode's cursor as far: `Ctrl+U` and
+    /// `Ctrl+D`, `PageUp` and `PageDown`.
+    pub fn page_copy_cursor(&mut self, rows: i32) {
+        self.term.vi_mode_cursor = self.term.vi_mode_cursor.scroll(&self.term, rows);
+        // Scrolling the view keeps the cursor in it, and the selection's end
+        // on the cursor.
+        self.term.scroll_display(Scroll::Delta(rows));
+    }
+
+    /// Puts copy mode's cursor on the cell at `(row, col)` of what's
+    /// showing, as a click does.
+    pub fn put_copy_cursor(&mut self, cell: (u16, u16)) {
+        let point = self.point_showing(cell);
+        self.term.vi_goto_point(point);
+    }
+
+    /// Starts a selection of `kind` at copy mode's cursor, which then
+    /// takes its end along as it moves. Asked again for the same kind, it
+    /// takes the selection away; for another kind, it changes it to that.
+    pub fn toggle_selection(&mut self, kind: SelectionKind) {
+        let ty = kind.alacritty();
+        // A click that never dragged leaves a selection of nothing.
+        if !self.selecting() {
+            self.term.selection = None;
+        }
+        match &mut self.term.selection {
+            Some(selection) if selection.ty == ty => self.term.selection = None,
+            Some(selection) => selection.ty = ty,
+            None => {
+                let point = self.term.vi_mode_cursor.point;
+                let mut selection = Selection::new(ty, point, Side::Left);
+                // Both ends take in the cells they're on.
+                selection.include_all();
+                self.term.selection = Some(selection);
+            }
+        }
+    }
+
+    /// Starts a selection with the mouse, at the cell at `(row, col)` of
+    /// what's showing. It holds nothing until [`Screen::select_to`] takes
+    /// its end somewhere.
+    pub fn select_from(&mut self, cell: (u16, u16)) {
+        let point = self.point_showing(cell);
+        self.term.selection = Some(Selection::new(SelectionType::Simple, point, Side::Left));
+    }
+
+    /// Takes the end of the selection the mouse started to the cell at
+    /// `(row, col)` of what's showing: both cells, and every one between
+    /// them, are in it.
+    pub fn select_to(&mut self, cell: (u16, u16)) {
+        let point = self.point_showing(cell);
+        if let Some(selection) = &mut self.term.selection {
+            selection.update(point, Side::Left);
+            selection.include_all();
+        }
+    }
+
+    /// Whether anything is selected.
+    pub fn selecting(&self) -> bool {
+        self.term
+            .selection
+            .as_ref()
+            .is_some_and(|selection| selection.to_range(&self.term).is_some())
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.term.selection = None;
+    }
+
+    /// The text selected, with a line break where a line ended rather
+    /// than wrapped, and none after the last; `None` when nothing is.
+    pub fn selected_text(&self) -> Option<String> {
+        let text = self.term.selection_to_string()?;
+        let text = text.strip_suffix('\n').unwrap_or(&text).to_string();
+        (!text.is_empty()).then_some(text)
+    }
+
+    /// The line copy mode's cursor is on, whole, however many rows it
+    /// wrapped onto.
+    pub fn copy_cursor_line(&self) -> String {
+        let point = self.term.vi_mode_cursor.point;
+        let start = self.term.line_search_left(point);
+        let end = self.term.line_search_right(point);
+        let text = self.term.bounds_to_string(start, end);
+        text.trim_end_matches('\n').to_string()
+    }
+
+    /// Searches for `text`, a word or a phrase as it's written, from copy
+    /// mode's cursor down to the end and on round from the top, or up when
+    /// not `forward`, and puts the cursor on what it finds. Upper and
+    /// lower case are the same unless `text` has a capital letter.
+    pub fn search(&mut self, text: &str, forward: bool) -> Option<Found> {
+        self.search = RegexSearch::new(&literal(text)).ok().map(|regex| Search {
+            regex: RefCell::new(regex),
+        });
+        self.search_again(forward)
+    }
+
+    /// Finds the next match of the last search past copy mode's cursor,
+    /// that way, and puts the cursor on it.
+    pub fn search_again(&mut self, forward: bool) -> Option<Found> {
+        let search = self.search.as_ref()?;
+        let cursor = self.term.vi_mode_cursor.point;
+        // From the cell beside the cursor, so the match it's on is passed.
+        let (origin, direction) = if forward {
+            let origin = cursor.add(&self.term, Boundary::None, 1);
+            (origin, Direction::Right)
+        } else {
+            let origin = cursor.sub(&self.term, Boundary::None, 1);
+            (origin, Direction::Left)
+        };
+        let mut regex = search.regex.borrow_mut();
+        let found = self
+            .term
+            .search_next(&mut regex, origin, direction, Side::Left, None)?;
+        let place = found_at(&self.term, &mut regex, &found);
+        drop(regex);
+        self.term.vi_goto_point(*found.start());
+        Some(place)
+    }
+
+    /// Whether there's a search whose matches are marked.
+    pub fn searched(&self) -> bool {
+        self.search.is_some()
+    }
+
+    pub fn clear_search(&mut self) {
+        self.search = None;
+    }
+
+    /// The point in the grid of the cell at `(row, col)` of what's showing.
+    fn point_showing(&self, (row, col): (u16, u16)) -> Point {
+        let grid = self.term.grid();
+        let line = Line(i32::from(row) - grid.display_offset() as i32);
+        Point::new(line, Column(usize::from(col))).grid_clamp(&self.term, Boundary::Grid)
     }
 
     /// Where the cursor is on what's showing, as `(row, col)`, when it's
@@ -420,6 +783,83 @@ impl Screen {
         let row = u16::try_from(row).ok()?;
         (usize::from(row) < grid.screen_lines()).then_some((row, point.column.0 as u16))
     }
+}
+
+/// What copy mode marks on the rows showing, asked about each cell in turn
+/// from the top left.
+struct Marks {
+    cursor: Option<Point>,
+    selection: Option<SelectionRange>,
+    /// The search's matches, in order.
+    found: Vec<Match>,
+    /// The first match that doesn't end before the cell last asked about:
+    /// the cells come in order, and so do the matches.
+    next_found: usize,
+}
+
+impl Marks {
+    /// The mark on the cell at `point`; a `wide` one takes in the cell
+    /// after it too.
+    fn at(&mut self, point: Point, wide: bool) -> Mark {
+        let right = Point::new(point.line, point.column + usize::from(wide));
+        if self
+            .cursor
+            .is_some_and(|cursor| cursor == point || cursor == right)
+        {
+            return Mark::Cursor;
+        }
+        let selection = self.selection.as_ref();
+        if selection.is_some_and(|range| range.contains(point) || range.contains(right)) {
+            return Mark::Selected;
+        }
+        while self
+            .found
+            .get(self.next_found)
+            .is_some_and(|found| *found.end() < point)
+        {
+            self.next_found += 1;
+        }
+        match self.found.get(self.next_found) {
+            Some(found) if *found.start() <= right => {
+                // The cursor sits at the start of the match a search put it
+                // on.
+                if self.cursor == Some(*found.start()) {
+                    Mark::Current
+                } else {
+                    Mark::Found
+                }
+            }
+            _ => Mark::None,
+        }
+    }
+}
+
+/// Where `found` is among every match of `regex` in the history and on the
+/// screen.
+fn found_at(term: &Term<Listener>, regex: &mut RegexSearch, found: &Match) -> Found {
+    let start = Point::new(term.topmost_line(), Column(0));
+    let end = Point::new(term.bottommost_line(), term.last_column());
+    let mut place = Found { number: 0, of: 0 };
+    for each in RegexIter::new(start, end, Direction::Right, term, regex) {
+        place.of += 1;
+        if each.start() == found.start() {
+            place.number = place.of;
+        }
+    }
+    place
+}
+
+/// A pattern that matches `text` as it's written: every character regular
+/// expressions give a meaning to is escaped.
+fn literal(text: &str) -> String {
+    let mut pattern = String::new();
+    for c in text.chars() {
+        if "\\.+*?()|[]{}^$#&-~".contains(c) {
+            pattern.push('\\');
+        }
+        pattern.push(c);
+    }
+    pattern
 }
 
 /// What a cell has in it: its character and any that combine with it, or a
@@ -750,6 +1190,24 @@ mod tests {
     }
 
     #[test]
+    fn the_text_is_the_history_then_the_screen_with_wrapped_lines_whole() {
+        let screen = screen(3, 8, b"one\r\nabcdefghij\r\nthree  \r\nfour\r\n");
+        // "abcdefghij" took two rows; the last row is empty.
+        assert_eq!(
+            screen.rows(true),
+            ["one", "abcdefgh", "ij", "three", "four", ""]
+        );
+        assert_eq!(screen.text(), "one\nabcdefghij\nthree\nfour\n");
+    }
+
+    #[test]
+    fn the_text_keeps_blank_lines_between_but_not_after() {
+        let screen = screen(5, 10, b"one\r\n\r\ntwo");
+        assert_eq!(screen.text(), "one\n\ntwo\n");
+        assert_eq!(Screen::new(3, 10).text(), "");
+    }
+
+    #[test]
     fn the_alternate_screen_keeps_no_history() {
         let screen = screen(2, 20, b"\x1b[?1049hone\r\ntwo\r\nthree");
         assert_eq!(screen.rows(true), ["two", "three"]);
@@ -938,5 +1396,228 @@ mod tests {
         assert_eq!(screen.cursor(), Some((0, 2)));
         screen.process(b"\x1b[?25l");
         assert_eq!(screen.cursor(), None);
+    }
+
+    /// A 4-row screen, 30 wide, with numbered lines behind it, the last of
+    /// them `line 9`, and the cursor on the empty row below.
+    fn copying() -> Screen {
+        let mut output = Vec::new();
+        for line in 0..10 {
+            output.extend(format!("line {line} of ten\r\n").as_bytes());
+        }
+        let mut screen = screen(4, 30, &output);
+        screen.start_copying();
+        screen
+    }
+
+    /// The mark on each cell of row `row` showing, as a letter: `.` for
+    /// none, `f` found, `F` the current match, `s` selected, `c` the cursor.
+    fn marks_on(screen: &Screen, row: u16) -> String {
+        let mut marks = String::new();
+        screen.each_cell(|at, _, cell| {
+            if at == row {
+                marks.push(match cell.mark {
+                    Mark::None => '.',
+                    Mark::Found => 'f',
+                    Mark::Current => 'F',
+                    Mark::Selected => 's',
+                    Mark::Cursor => 'c',
+                });
+            }
+        });
+        marks.trim_end_matches('.').to_string()
+    }
+
+    #[test]
+    fn copy_mode_starts_at_the_programs_cursor_and_stops_where_it_was() {
+        let mut screen = copying();
+        assert!(screen.copying());
+        assert_eq!(screen.copy_cursor(), Some((3, 0)));
+        screen.move_copy_cursor(Motion::Up);
+        screen.move_copy_cursor(Motion::Right);
+        assert_eq!(screen.copy_cursor(), Some((2, 1)));
+
+        screen.stop_copying();
+        assert!(!screen.copying());
+        assert_eq!(screen.copy_cursor(), None);
+    }
+
+    #[test]
+    fn copy_modes_cursor_takes_the_view_back_into_the_history() {
+        let mut screen = copying();
+        for _ in 0..5 {
+            screen.move_copy_cursor(Motion::Up);
+        }
+        assert_eq!(screen.scrolled_back(), 2);
+        assert_eq!(screen.copy_cursor(), Some((0, 0)));
+        assert_eq!(screen.copy_cursor_line(), "line 5 of ten");
+
+        screen.move_copy_cursor(Motion::HistoryTop);
+        assert_eq!(screen.copy_cursor_line(), "line 0 of ten");
+        assert_eq!(screen.scrolled_back(), 7);
+        screen.move_copy_cursor(Motion::HistoryBottom);
+        assert_eq!(screen.scrolled_back(), 0);
+    }
+
+    #[test]
+    fn a_page_moves_the_view_and_the_cursor_together() {
+        let mut screen = copying();
+        screen.page_copy_cursor(2);
+        assert_eq!(screen.scrolled_back(), 2);
+        assert_eq!(screen.copy_cursor(), Some((3, 0)));
+        screen.page_copy_cursor(-2);
+        assert_eq!(screen.scrolled_back(), 0);
+    }
+
+    #[test]
+    fn words_end_at_punctuation_and_big_words_only_at_blanks() {
+        let mut screen = screen(2, 30, b"git log --oneline\r\n");
+        screen.start_copying();
+        screen.move_copy_cursor(Motion::Up);
+        screen.move_copy_cursor(Motion::LineStart);
+        screen.move_copy_cursor(Motion::WordNext);
+        screen.move_copy_cursor(Motion::WordNext);
+        assert_eq!(screen.copy_cursor(), Some((0, 8)));
+        screen.move_copy_cursor(Motion::LineStart);
+        screen.move_copy_cursor(Motion::BigWordNext);
+        screen.move_copy_cursor(Motion::BigWordNext);
+        assert_eq!(screen.copy_cursor(), Some((0, 8)));
+        screen.move_copy_cursor(Motion::BigWordEnd);
+        assert_eq!(screen.copy_cursor(), Some((0, 16)));
+        screen.move_copy_cursor(Motion::LineStart);
+        screen.move_copy_cursor(Motion::LineEnd);
+        assert_eq!(screen.copy_cursor(), Some((0, 16)));
+    }
+
+    #[test]
+    fn a_selection_follows_the_cursor_and_copies_what_it_covers() {
+        let mut screen = copying();
+        screen.move_copy_cursor(Motion::Up);
+        screen.move_copy_cursor(Motion::Up);
+        screen.move_copy_cursor(Motion::WordNext);
+        screen.toggle_selection(SelectionKind::Chars);
+        screen.move_copy_cursor(Motion::Down);
+        assert_eq!(screen.selected_text().unwrap(), "8 of ten\nline 9");
+        // The first row is selected to its end, as the line goes on.
+        assert_eq!(marks_on(&screen, 1), format!(".....{}", "s".repeat(25)));
+        assert_eq!(marks_on(&screen, 2), "sssssc");
+
+        // Asked again, it goes.
+        screen.toggle_selection(SelectionKind::Chars);
+        assert!(!screen.selecting());
+        assert_eq!(screen.selected_text(), None);
+    }
+
+    #[test]
+    fn a_selection_of_lines_takes_them_whole() {
+        let mut screen = copying();
+        screen.move_copy_cursor(Motion::Up);
+        screen.move_copy_cursor(Motion::WordEnd);
+        screen.toggle_selection(SelectionKind::Lines);
+        screen.move_copy_cursor(Motion::Up);
+        assert_eq!(
+            screen.selected_text().unwrap(),
+            "line 8 of ten\nline 9 of ten"
+        );
+    }
+
+    #[test]
+    fn a_block_selection_takes_the_same_columns_of_each_row() {
+        let mut screen = copying();
+        screen.move_copy_cursor(Motion::Up);
+        screen.move_copy_cursor(Motion::Up);
+        screen.toggle_selection(SelectionKind::Block);
+        screen.move_copy_cursor(Motion::Down);
+        screen.move_copy_cursor(Motion::WordEnd);
+        screen.move_copy_cursor(Motion::Right);
+        screen.move_copy_cursor(Motion::Right);
+        assert_eq!(screen.selected_text().unwrap(), "line 8\nline 9");
+    }
+
+    #[test]
+    fn a_selection_stays_on_its_text_as_output_scrolls_it_up() {
+        let mut screen = copying();
+        screen.move_copy_cursor(Motion::Up);
+        screen.toggle_selection(SelectionKind::Lines);
+        screen.process(b"more\r\nand more\r\n");
+        assert_eq!(screen.selected_text().unwrap(), "line 9 of ten");
+    }
+
+    #[test]
+    fn the_mouse_selects_from_where_it_went_down_to_where_it_is() {
+        let mut screen = screen(3, 20, b"one two\r\nthree four");
+        screen.select_from((0, 4));
+        assert!(!screen.selecting(), "a click alone selects nothing");
+        screen.select_to((1, 4));
+        assert_eq!(screen.selected_text().unwrap(), "two\nthree");
+        // Back past where it started, it selects the other way.
+        screen.select_to((0, 0));
+        assert_eq!(screen.selected_text().unwrap(), "one t");
+        screen.clear_selection();
+        assert_eq!(screen.selected_text(), None);
+    }
+
+    #[test]
+    fn in_copy_mode_a_drag_takes_the_cursor_and_the_keys_go_on_from_there() {
+        let mut screen = screen(3, 20, b"one two\r\nthree four");
+        screen.start_copying();
+        // As the pane does it: the selection, then the cursor, each time.
+        screen.select_from((0, 4));
+        screen.put_copy_cursor((0, 4));
+        screen.select_to((1, 4));
+        screen.put_copy_cursor((1, 4));
+        assert_eq!(screen.selected_text().unwrap(), "two\nthree");
+        assert_eq!(screen.copy_cursor(), Some((1, 4)));
+        screen.move_copy_cursor(Motion::LineEnd);
+        assert_eq!(screen.selected_text().unwrap(), "two\nthree four");
+    }
+
+    #[test]
+    fn the_line_under_the_cursor_is_copied_whole_across_its_wraps() {
+        let mut screen = screen(4, 5, b"abcdefgh\r\n");
+        screen.start_copying();
+        screen.move_copy_cursor(Motion::Up);
+        assert_eq!(screen.copy_cursor_line(), "abcdefgh");
+    }
+
+    #[test]
+    fn a_search_finds_text_up_or_down_and_goes_round() {
+        let mut screen = copying();
+        let found = screen.search("line 4", false).unwrap();
+        assert_eq!(found, Found { number: 1, of: 1 });
+        assert_eq!(screen.copy_cursor_line(), "line 4 of ten");
+
+        // Every line has "of": 1 of 10 at the top, down to 10 of 10.
+        let found = screen.search("of", false).unwrap();
+        assert_eq!(found, Found { number: 4, of: 10 });
+        assert_eq!(screen.copy_cursor_line(), "line 3 of ten");
+        let found = screen.search_again(true).unwrap();
+        assert_eq!(found.number, 5);
+        screen.move_copy_cursor(Motion::HistoryTop);
+        let found = screen.search_again(false).unwrap();
+        assert_eq!(found.number, 10, "up from the top goes round to the end");
+    }
+
+    #[test]
+    fn a_search_is_literal_and_any_case_unless_it_has_a_capital() {
+        let mut screen = screen(4, 30, b"cost: $5 (more)\r\nCost\r\n");
+        screen.start_copying();
+        assert_eq!(screen.search("$5 (m", false).map(|f| f.of), Some(1));
+        assert_eq!(screen.search("cost", false).map(|f| f.of), Some(2));
+        assert_eq!(screen.search("Cost", false).map(|f| f.of), Some(1));
+        assert_eq!(screen.search("nowhere", false), None);
+        assert_eq!(screen.search_again(true), None);
+    }
+
+    #[test]
+    fn the_matches_showing_are_marked_and_the_one_the_cursor_is_on_most() {
+        let mut screen = copying();
+        screen.search("ten", false).unwrap();
+        // The cursor is on line 9's "ten", so its first cell is the cursor.
+        assert_eq!(marks_on(&screen, 2), "..........cFF");
+        assert_eq!(marks_on(&screen, 1), "..........fff");
+        screen.clear_search();
+        assert!(!screen.searched());
+        assert_eq!(marks_on(&screen, 1), "");
     }
 }

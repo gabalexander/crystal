@@ -9,6 +9,7 @@
 mod app;
 mod backlog_view;
 mod command_line;
+mod copy_mode;
 mod diff;
 mod diff_view;
 mod finder;
@@ -17,6 +18,7 @@ mod groups;
 mod help;
 mod issues;
 pub(crate) mod launcher;
+mod layouts;
 mod memory_view;
 mod mouse;
 mod pane;
@@ -40,12 +42,13 @@ use crate::plugins::{self, Context};
 use crate::profile;
 use crate::protocol::{Backlog, NewSession, Request, Response, SessionInfo, Worktree};
 use crate::{catalog, keys, typing};
-use crate::{client, env, git};
+use crate::{client, clipboard, env, git};
 use anyhow::{Context as _, Result, bail};
 use app::{Action, App, Focus, Hit, Place, PluginKey, PluginPane, Slot};
 use backlog_view::BacklogChange;
 use crossterm::event::{Event as TerminalEvent, KeyEvent, KeyEventKind, MouseEvent};
 use diff_view::Against;
+use layouts::Which;
 use pane::Pane;
 use ratatui::DefaultTerminal;
 use ratatui::layout::Rect;
@@ -109,6 +112,17 @@ pub enum Event {
     Worktrees {
         project: PathBuf,
         worktrees: Vec<Worktree>,
+    },
+    /// git is done removing the worktree at `path`: it's gone, or why not.
+    WorktreeRemoved {
+        path: PathBuf,
+        removed: Result<(), String>,
+    },
+    /// The worktree at `path`, on `branch`, has changes not committed, so
+    /// git didn't remove it: only a forced removal would.
+    WorktreeHasChanges {
+        path: PathBuf,
+        branch: String,
     },
     /// What GitHub said about the open issues of a project.
     Issues {
@@ -196,6 +210,7 @@ pub fn run(socket: &Path) -> Result<()> {
         started: Instant::now(),
         memory_path: launcher::memory_path(socket),
         tabs_path: tabs::path(socket),
+        layouts_path: layouts::path(socket),
         kept_tabs: tabs::Tabs::default(),
         quitting: false,
         overlay: None,
@@ -299,6 +314,8 @@ struct Tui {
     /// Where the tabs are kept, and the tabs as they were last kept there.
     tabs_path: PathBuf,
     kept_tabs: tabs::Tabs,
+    /// Where the layouts are kept.
+    layouts_path: PathBuf,
     quitting: bool,
 }
 
@@ -318,7 +335,7 @@ impl Tui {
         while !self.quitting {
             let size = terminal.size()?;
             self.screen = Rect::new(0, 0, size.width, size.height);
-            let areas = ui::Areas::new(self.screen, self.app.splits().len());
+            let areas = ui::Areas::of(&self.app, self.screen);
             self.sync_panes(&areas);
             if let Some(overlay) = &mut self.overlay {
                 let screen = ui::plugin_pane_screen(&areas);
@@ -443,6 +460,10 @@ impl Tui {
             Event::Flows(runs) => self.app.set_flows(runs),
             Event::PullRequests { project, found } => self.app.set_pull_requests(project, found),
             Event::Worktrees { project, worktrees } => self.app.set_worktrees(project, worktrees),
+            Event::WorktreeRemoved { path, removed } => self.worktree_removed(&path, removed),
+            Event::WorktreeHasChanges { path, branch } => {
+                self.app.ask_to_force_removal(path, branch);
+            }
             Event::Issues { project, found } => self.app.set_issues(&project, found),
             Event::IssueBody {
                 project,
@@ -499,9 +520,14 @@ impl Tui {
         if self.overlay.is_some() {
             return;
         }
-        let areas = ui::Areas::new(self.screen, self.app.splits().len());
-        let hit = ui::hit(&areas, &self.app, mouse.column, mouse.row);
-        if self.pass_to_program(&mouse, hit) {
+        let areas = ui::Areas::of(&self.app, self.screen);
+        let mut hit = ui::hit(&areas, &self.app, mouse.column, mouse.row);
+        if let Some(slot) = self.app.dragging() {
+            // A selection being dragged is crystal's to the end, and keeps
+            // to the edge of its pane when the mouse leaves it.
+            let cell = ui::nearest_cell(&areas, &self.app, slot, mouse.column, mouse.row);
+            hit = Hit::Pane { slot, cell };
+        } else if self.app.grabbed().is_none() && self.pass_to_program(&mouse, hit) {
             return;
         }
         if let Some(action) = self.app.on_mouse(mouse.kind, hit) {
@@ -680,6 +706,17 @@ impl Tui {
                 command.push(path);
                 self.start_session(Some(name), dir, command)?;
             }
+            Action::EditHistory { slot, dir, name } => {
+                let Some(pane) = self.pane_in(slot) else {
+                    bail!("there's nothing on the pane yet");
+                };
+                let text = pane.screen.text();
+                let path = history_path(&self.socket, &name);
+                write_history(&path, &text)?;
+                let mut command = editor()?;
+                command.push(path.display().to_string());
+                self.start_session(Some(name), dir, command)?;
+            }
             Action::SaveProfile { replacing, profile } => {
                 let saved = profile::save(&config::path(), replacing.as_deref(), &profile);
                 self.profiles_changed(saved, Some(&profile.name));
@@ -724,6 +761,42 @@ impl Tui {
                 }
             }
             Action::ClosePluginPane => self.close_plugin_pane(),
+            Action::ListLayouts => {
+                let found = layouts::load(&self.layouts_path);
+                self.app.show_layouts(found, None);
+            }
+            Action::SaveLayout(name) => {
+                let mut kept = layouts::load(&self.layouts_path).map_err(anyhow::Error::msg)?;
+                let tabs = self.app.tabs_to_keep();
+                let replaced = kept.save(&name, tabs, seconds_since_epoch());
+                layouts::save(&self.layouts_path, &kept)?;
+                self.app
+                    .show_layouts(Ok(kept), Some(&Which::Saved(name.clone())));
+                let how = if replaced { "over" } else { "as" };
+                self.app.notify(format!("saved your tabs {how} {name}"));
+            }
+            Action::RestoreLayout(which) => {
+                let mut kept = layouts::load(&self.layouts_path).map_err(anyhow::Error::msg)?;
+                let current = self.app.tabs_to_keep();
+                let name = match &which {
+                    Which::Saved(name) => name.clone(),
+                    Which::Before => "the tabs from before".to_string(),
+                };
+                let Some(tabs) = kept.restore(&which, current, seconds_since_epoch()) else {
+                    bail!("{name} can't be restored: it's from another crystal");
+                };
+                layouts::save(&self.layouts_path, &kept)?;
+                self.app.restore_layout(tabs, &name);
+            }
+            Action::RemoveLayout(which) => {
+                let mut kept = layouts::load(&self.layouts_path).map_err(anyhow::Error::msg)?;
+                kept.remove(&which);
+                layouts::save(&self.layouts_path, &kept)?;
+                self.app.show_layouts(Ok(kept), None);
+                if let Which::Saved(name) = which {
+                    self.app.notify(format!("removed {name}"));
+                }
+            }
             Action::Kill(name) => {
                 client::ask(&self.socket, &Request::Kill { name }, false)?;
                 self.refresh_sessions()?;
@@ -753,13 +826,25 @@ impl Tui {
                 self.app.select(&name);
                 self.app.type_into_selected();
             }
-            Action::RemoveWorktree(path) => {
-                if let Err(err) = client::remove_worktree(&self.socket, &path) {
-                    bail!("{}", removal_refused(&path, &err));
-                }
-                self.app.worktree_removed(&path);
-                self.list_worktrees_again();
-                self.refresh_sessions()?;
+            Action::RemoveWorktree {
+                path,
+                branch,
+                force,
+            } => {
+                // git looks for changes and deletes every file in it, which
+                // can take a while: off the loop.
+                let socket = self.socket.clone();
+                self.read_in_background(move || {
+                    // git won't remove a worktree with changes not
+                    // committed unless it's forced, so the user is asked
+                    // again, this time about losing them.
+                    if !force && git::has_changes(&path).unwrap_or(false) {
+                        return Event::WorktreeHasChanges { path, branch };
+                    }
+                    let removed = client::remove_worktree(&socket, &path, force)
+                        .map_err(|err| removal_refused(&path, &err));
+                    Event::WorktreeRemoved { path, removed }
+                });
             }
             Action::Type { to, key } => {
                 if let Some(pane) = self.pane_in(to)
@@ -788,6 +873,44 @@ impl Tui {
                     pane.scroll_forward();
                 }
             }
+            Action::CopyKey { slot, key } => {
+                let Some(pane) = self.pane_in(slot) else {
+                    self.app.stop_copying();
+                    return Ok(());
+                };
+                match pane.copy_key(key) {
+                    copy_mode::Outcome::Stay => {}
+                    copy_mode::Outcome::Say(said) => self.app.notify(said),
+                    copy_mode::Outcome::Leave => self.app.stop_copying(),
+                    copy_mode::Outcome::Copy(text) => {
+                        self.app.stop_copying();
+                        self.copy_to_clipboard(&text)?;
+                    }
+                }
+            }
+            Action::CopyPaste { slot, text } => {
+                if let Some(copy) = self.pane_in(slot).and_then(|pane| pane.copy.as_mut()) {
+                    copy.on_paste(&text);
+                }
+            }
+            Action::SelectFrom { slot, cell } => {
+                if let Some(pane) = self.pane_in(slot) {
+                    pane.select_from(cell);
+                }
+            }
+            Action::SelectTo { slot, cell } => {
+                if let Some(pane) = self.pane_in(slot) {
+                    pane.select_to(cell);
+                }
+            }
+            Action::CopySelection(slot) => {
+                let text = self
+                    .pane_in(slot)
+                    .and_then(|pane| pane.screen.selected_text());
+                if let Some(text) = text {
+                    self.copy_to_clipboard(&text)?;
+                }
+            }
             Action::OpenPullRequest { project, number } => {
                 // gh goes over the network: off the loop, saying only what
                 // went wrong.
@@ -806,6 +929,15 @@ impl Tui {
                 });
             }
         }
+        Ok(())
+    }
+
+    /// Puts `text` on the user's clipboard, and says how much went.
+    fn copy_to_clipboard(&mut self, text: &str) -> Result<()> {
+        clipboard::copy(text).context("couldn't copy")?;
+        let lines = text.lines().count().max(1);
+        let noun = if lines == 1 { "line" } else { "lines" };
+        self.app.notify(format!("copied {lines} {noun}"));
         Ok(())
     }
 
@@ -922,7 +1054,7 @@ impl Tui {
         let Some(Response::Created { name }) = client::ask(&self.socket, &request, true)? else {
             bail!("the daemon didn't start {plugin}'s pane");
         };
-        let areas = ui::Areas::new(self.screen, self.app.splits().len());
+        let areas = ui::Areas::of(&self.app, self.screen);
         let screen = ui::plugin_pane_screen(&areas);
         self.last_pane_id += 1;
         let (id, events) = (self.last_pane_id, self.events.clone());
@@ -972,6 +1104,20 @@ impl Tui {
         });
     }
 
+    /// git is done removing the worktree at `path`. Once it's gone, it and
+    /// the sessions that had ended in it leave the sidebar straight away.
+    fn worktree_removed(&mut self, path: &Path, removed: Result<(), String>) {
+        if let Err(reason) = removed {
+            self.app.worktree_not_removed(path, reason);
+            return;
+        }
+        self.app.worktree_removed(path);
+        self.list_worktrees_again();
+        if let Err(err) = self.refresh_sessions() {
+            self.app.notify(format!("{err:#}"));
+        }
+    }
+
     /// Asks for the list now, rather than waiting for the next poll, so a
     /// key's effect shows straight away.
     fn refresh_sessions(&mut self) -> Result<()> {
@@ -1008,6 +1154,8 @@ impl Tui {
                 if pane.size() != (rows, cols) {
                     pane.resize(rows, cols);
                 }
+                // Copy mode is on in a pane while the keyboard is in it.
+                pane.set_copying(self.app.focus() == Focus::Copy(slot));
                 self.panes.push(pane);
             }
         }
@@ -1159,12 +1307,20 @@ fn directory_for(socket: &Path, place: Place) -> Result<PathBuf> {
     match place {
         Place::Directory(Some(dir)) => Ok(dir),
         Place::Directory(None) => Ok(std::env::current_dir()?),
-        Place::NewWorktree { branch, base } => {
+        Place::NewWorktree {
+            branch,
+            base,
+            made_up,
+        } => {
             let base = match base {
                 Some(base) => base,
                 None => std::env::current_dir()?,
             };
-            client::add_worktree(socket, &base, &branch)
+            if made_up {
+                client::add_new_worktree(socket, &base, &branch)
+            } else {
+                client::add_worktree(socket, &base, &branch)
+            }
         }
     }
 }
@@ -1224,6 +1380,25 @@ fn read_codex_models() -> Vec<String> {
         }
         _ => Vec::new(),
     }
+}
+
+/// Where the history a session called `name` opens in the editor is
+/// written: beside the daemon's state, by the name of that session, which
+/// no other running session has, so it never writes over a file an editor
+/// still has open.
+fn history_path(socket: &Path, name: &str) -> PathBuf {
+    let file = format!("{}.txt", name.replace('/', "-"));
+    crate::state::path(socket)
+        .with_file_name("history")
+        .join(file)
+}
+
+/// Writes `text` to `path`, making its directory first.
+fn write_history(path: &Path, text: &str) -> Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).with_context(|| format!("couldn't make {}", dir.display()))?;
+    }
+    std::fs::write(path, text).with_context(|| format!("couldn't write {}", path.display()))
 }
 
 /// The user's editor, as a command line to put a file's path after:

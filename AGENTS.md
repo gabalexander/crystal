@@ -47,16 +47,20 @@ is: it's the one request every version must understand.
   - `mod.rs`: the event loop: one channel of events, then update and draw
   - `app.rs`: the state and how keys and the mouse change it; no I/O, so it's unit-tested
   - `ui.rs`: the layout and drawing (top bar and its tabs, pane headers, footer), and what's under the mouse
-  - `tabs.rs`: tabs, each holding its own sessions (each session in exactly one) with its own selection and
-    splits, and which is in front; the sidebar shows only that tab's sessions. Kept apart from I/O but for
-    keeping them in a file beside the daemon's state
+  - `tabs.rs`: tabs, each holding its own sessions (each session in exactly one) with its own selection,
+    splits, the order of its panes and the session floating over them, and which is in front; the sidebar
+    shows only that tab's sessions. Kept apart from I/O but for keeping them in a file beside the daemon's
+    state
+  - `layouts.rs`: the layouts view (`S`): the tabs saved under a name and put back, and the tabs a restore
+    replaced; its state and keys, kept apart from I/O but for keeping them in a file beside the tabs, and its
+    drawing
   - `sidebar.rs`: the sidebar's rows: headings, worktree lines, sessions with their mark and how long ago,
     terminals drawn apart from agents
   - `status.rs`: a session's status as the TUI shows it, and its mark
   - `theme.rs`: every color, named for what it's for: `dark`, `light`, `terminal`, and none for `NO_COLOR`
   - `mouse.rs`: writes mouse events the way a program in a pane asked for them
-  - `help.rs`: the overlay `?` opens, drawn from one table of every key; a test keeps the README's
-    table of sidebar keys in step with it
+  - `help.rs`: the overlay `?` opens, drawn from one table of every key, its sections put in two columns to
+    fit the terminal; a test keeps the README's table of sidebar keys in step with it
   - `groups.rs`: the sidebar's order and headings: sessions by project, then worktree, agents before
     terminals, each flow run's steps under it, and linked worktrees with no sessions left at the end of
     their project
@@ -71,7 +75,10 @@ is: it's the one request every version must understand.
   - `issues.rs`: the issues view `i` opens: its state, kept apart from I/O, and its drawing
   - `backlog_view.rs`: the backlog view `b` opens: its state and keys, kept apart from I/O, and its
     drawing
-  - `pane.rs`: a viewer of a session on screen, the selected one or a split, and its screen
+  - `pane.rs`: a viewer of a session on screen, the selected one or a split, and its screen, with copy mode
+    over it while that's on
+  - `copy_mode.rs`: copy mode (`v`): vi's keys over a pane's screen and history, selecting, searching, and
+    the text to copy; works on the screen, kept apart from I/O
   - `screen_widget.rs`: draws a session's screen into ratatui, for the panes and `crystal attach`
   - `diff.rs`: reads `git diff`'s patch into files, hunks and lines, marks the words that changed,
     and lays a file out in rows, unified or side by side; pure, so it's unit-tested
@@ -99,8 +106,10 @@ is: it's the one request every version must understand.
 - `src/session.rs`: one program in a PTY, or a task: spawn, exit status, stop, and its screen and viewers
 - `src/vt.rs`: a terminal's screen, through `alacritty_terminal`: what a program drew and its history, the modes
   it set, its answers to the program's questions (the daemon's screen only), the output that catches a new viewer
-  up, the cells to draw, and the input modes `crystal attach` asks your terminal for. The only module that uses
-  `alacritty_terminal`
+  up, the cells to draw, the input modes `crystal attach` asks your terminal for, and, for a viewer, copy mode's
+  cursor, selection and search, which are Alacritty's vi mode. The only module that uses `alacritty_terminal`
+- `src/clipboard.rs`: putting text on the user's clipboard: `pbcopy`, `wl-copy`, `xclip` or `xsel` on their own
+  machine, or OSC 52 to their terminal over ssh or when none of those works
 - `src/task.rs`: tasks: Claude Code run without a terminal (`claude -p`), one run per prompt or follow-up
 - `src/transcript.rs`: reading `claude -p`'s stream-json events, and drawing them as a task's transcript
 - `src/protocol.rs`: requests and responses, one JSON line each, and the frames an attached client sends
@@ -152,6 +161,7 @@ is: it's the one request every version must understand.
 - `src/env.rs`: the environment a session's program starts with
 - `src/git.rs`: a directory's project, worktree and branch, a project's linked worktrees, and making and
   removing worktrees (runs `git`)
+- `src/names.rs`: made-up names for new worktrees' branches, like `brave-otter`
 - `src/github.rs`: pull requests and issues from GitHub, through `gh` with a timeout; tests use a fake `gh`,
   never the real one
 - `src/shell.rs`: quoting arguments and writing paths with `~`, the way a shell reads them
@@ -159,4 +169,5 @@ is: it's the one request every version must understand.
   their own that turns notifications and the memory plugin off (a memory test turns it back on), and plugins
   of their own in its plugins directory; a test that opens the new-session panel pins `PATH` to its fake
   agents, so no real agent is found or run. vt100 stands in for the user's own terminal: a second emulator,
-  apart from crystal's
+  apart from crystal's. A test that copies runs the TUI as over ssh (`SSH_TTY` set), so it asks the terminal
+  with OSC 52 and never touches the machine's clipboard

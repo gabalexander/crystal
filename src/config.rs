@@ -424,6 +424,7 @@ back_to = "build"
                 description: Some("A second pair of eyes".into()),
                 agent: "claude".into(),
                 model: Some("opus".into()),
+                effort: Some("high".into()),
                 mode: Some("plan".into()),
                 args: vec!["--verbose".into()],
                 prompt: Some("Review it.".into()),

@@ -10,6 +10,7 @@ use super::finder::Finder;
 use super::groups::{self, Row};
 use super::issues::IssuesView;
 use super::launcher::{self, Launcher, Memory, Run, Setup, Target};
+use super::layouts::{self, Layouts, LayoutsView, Which};
 use super::memory_view::MemoryView;
 use super::plugins_view::{self, PluginsView};
 use super::profiles::{self, ProfilesView};
@@ -27,17 +28,19 @@ use crate::keys;
 use crate::profile::{self, Profile};
 use crate::protocol::{Activity, Backlog, SessionInfo, State, TaskSpec, Worktree};
 use crate::shell;
-use crate::{backlog, plugins, tasks};
+use crate::{backlog, names, plugins, tasks};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// Where a pane sits beside the sidebar: the one that follows the
-/// selection, or one of the splits, counted in the order they were made.
+/// selection, or one of the splits, counted in the order they're drawn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Slot {
     Selected,
     Split(usize),
+    /// The pane floating over the others: see [`App::floating`].
+    Float,
 }
 
 /// Where the keyboard goes.
@@ -47,6 +50,9 @@ pub enum Focus {
     Sidebar,
     /// Keys go to the session in this pane.
     Pane(Slot),
+    /// Keys move copy mode's cursor over this pane's screen and history,
+    /// select from it and search it.
+    Copy(Slot),
 }
 
 /// What the mouse is over, worked out from the layout by `ui::hit`.
@@ -70,6 +76,15 @@ pub enum Hit {
     ViewContent,
     /// The footer, or anywhere else.
     Elsewhere,
+}
+
+/// A pane being moved with the mouse, by its header line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Grab {
+    /// The pane taken.
+    pub from: Slot,
+    /// The pane the mouse is over now, if it's over one.
+    pub over: Option<Slot>,
 }
 
 /// Something that takes the place of the sidebar and the panes until it's
@@ -115,10 +130,14 @@ pub enum Place {
     /// In this directory, or the TUI's own when it's `None`.
     Directory(Option<PathBuf>),
     /// In a new worktree on `branch`, made in the repository at `base`, or
-    /// the TUI's own directory's when that's `None`.
+    /// the TUI's own directory's when that's `None`. A branch that exists
+    /// already is checked out there, unless crystal `made_up` its name:
+    /// then it's always a new branch, `branch-2` or the next number that's
+    /// free when `branch` is taken.
     NewWorktree {
         branch: String,
         base: Option<PathBuf>,
+        made_up: bool,
     },
 }
 
@@ -154,10 +173,12 @@ pub enum Confirm {
     Kill(String),
     /// Start this ended session's command again.
     Respawn(String),
-    /// Remove the linked worktree at `path`, which is on `branch`.
+    /// Remove the linked worktree at `path`, which is on `branch`: with
+    /// `force`, though it has changes not committed, which go with it.
     RemoveWorktree {
         path: PathBuf,
         branch: String,
+        force: bool,
     },
     /// Close the tab in front, tab `number`, and kill the sessions in it.
     CloseTab {
@@ -172,7 +193,16 @@ impl Confirm {
         match self {
             Confirm::Kill(name) => format!("kill {name}? y/n"),
             Confirm::Respawn(name) => format!("start {name} again? y/n"),
-            Confirm::RemoveWorktree { branch, .. } => format!("remove worktree {branch}? y/n"),
+            Confirm::RemoveWorktree {
+                branch,
+                force: false,
+                ..
+            } => format!("remove worktree {branch}? y/n"),
+            Confirm::RemoveWorktree {
+                branch,
+                force: true,
+                ..
+            } => format!("{branch} has uncommitted changes: remove it and lose them? y/n"),
             Confirm::CloseTab { number, sessions } => {
                 let count = sessions.len();
                 let noun = if count == 1 { "session" } else { "sessions" };
@@ -186,7 +216,15 @@ impl Confirm {
         match self {
             Confirm::Kill(name) => Action::Kill(name),
             Confirm::Respawn(name) => Action::Respawn(name),
-            Confirm::RemoveWorktree { path, .. } => Action::RemoveWorktree(path),
+            Confirm::RemoveWorktree {
+                path,
+                branch,
+                force,
+            } => Action::RemoveWorktree {
+                path,
+                branch,
+                force,
+            },
             Confirm::CloseTab { sessions, .. } => Action::KillAll(sessions),
         }
     }
@@ -249,8 +287,13 @@ pub enum Action {
     },
     /// Start this ended session's command again.
     Respawn(String),
-    /// Remove the linked worktree at this path.
-    RemoveWorktree(PathBuf),
+    /// Remove the linked worktree at `path`, which is on `branch`: with
+    /// `force`, though it has changes not committed.
+    RemoveWorktree {
+        path: PathBuf,
+        branch: String,
+        force: bool,
+    },
     /// Send the key to the session in the pane at `to`.
     Type {
         to: Slot,
@@ -272,6 +315,30 @@ pub enum Action {
     ScrollBack(Slot),
     /// Show a few lines further toward live in the pane at this slot.
     ScrollForward(Slot),
+    /// A key for copy mode in the pane at `slot`.
+    CopyKey {
+        slot: Slot,
+        key: KeyEvent,
+    },
+    /// Text pasted while copy mode in the pane at this slot has the keyboard.
+    CopyPaste {
+        slot: Slot,
+        text: String,
+    },
+    /// The mouse went down on `cell` of the screen of the pane at `slot`,
+    /// where a selection starts if it drags.
+    SelectFrom {
+        slot: Slot,
+        cell: (u16, u16),
+    },
+    /// The mouse dragged to `cell` of the screen of the pane at `slot`.
+    SelectTo {
+        slot: Slot,
+        cell: (u16, u16),
+    },
+    /// The mouse let go: put what it selected in the pane at this slot on
+    /// the clipboard.
+    CopySelection(Slot),
     /// Open pull request `number` of the project at `project` in the
     /// browser.
     OpenPullRequest {
@@ -302,6 +369,13 @@ pub enum Action {
         path: String,
         name: String,
     },
+    /// Open the history and screen of the pane at `slot` in the user's
+    /// editor, as a new session called `name` in `dir`.
+    EditHistory {
+        slot: Slot,
+        dir: PathBuf,
+        name: String,
+    },
     /// Read the memory of the project at `dir`, off the event loop.
     ReadMemory(PathBuf),
     /// Forget entry `id` of the memory of the project at `dir`.
@@ -319,7 +393,7 @@ pub enum Action {
     /// `replacing`, or as a new one.
     SaveProfile {
         replacing: Option<String>,
-        profile: Profile,
+        profile: Box<Profile>,
     },
     /// Take the profile with this name out of the config file.
     DeleteProfile(String),
@@ -348,6 +422,13 @@ pub enum Action {
     PasteInPluginPane(String),
     /// Close the plugin's pane that's open, and end its session.
     ClosePluginPane,
+    /// Read the saved layouts, and open the layouts view on them.
+    ListLayouts,
+    /// Save the tabs as they are as the layout with this name.
+    SaveLayout(String),
+    /// Put the tabs back the way this layout has them.
+    RestoreLayout(Which),
+    RemoveLayout(Which),
 }
 
 /// A sidebar key one of the installed plugins' actions took.
@@ -391,6 +472,9 @@ pub struct App {
     /// Each project's linked worktrees, by its main worktree, as git last
     /// listed them. Those with no sessions stay in the sidebar.
     worktrees: HashMap<PathBuf, Vec<Worktree>>,
+    /// The worktrees git is removing, off the loop, by their directories:
+    /// their lines say so, and `W` leaves them be until git is done.
+    removing: HashSet<PathBuf>,
     /// The question on the footer line, while one is being answered.
     prompt: Option<Prompt>,
     /// The new-session panel, while it's open.
@@ -429,6 +513,12 @@ pub struct App {
     /// The pane the keyboard was in last, so that Tab in the sidebar goes
     /// on to the next one.
     last_pane: Option<Slot>,
+    /// The pane a drag of the mouse started in, while the button is down:
+    /// the drag is a selection in that pane to the end, wherever it goes.
+    dragging: Option<Slot>,
+    /// The pane taken by its header line, while the button is down, and
+    /// the pane the mouse is over now: letting go there swaps the two.
+    grabbed: Option<Grab>,
     /// The id of the session this TUI runs in, if it runs in one. The pane
     /// never shows it: it would be showing itself.
     own_id: Option<String>,
@@ -468,6 +558,8 @@ pub struct App {
     closing: Option<String>,
     /// The backlog view, while it's open.
     backlog: Option<BacklogView>,
+    /// The layouts view, while it's open.
+    layouts: Option<LayoutsView>,
     /// How many backlog items each project has to do, by its main
     /// worktree.
     backlog_counts: HashMap<PathBuf, usize>,
@@ -489,6 +581,7 @@ impl App {
             selected: 0,
             on_worktree: None,
             worktrees: HashMap::new(),
+            removing: HashSet::new(),
             prompt: None,
             launcher: None,
             agents: Vec::new(),
@@ -504,6 +597,8 @@ impl App {
             moving: None,
             focus: Focus::Sidebar,
             last_pane: None,
+            dragging: None,
+            grabbed: None,
             own_id,
             notice: None,
             showing_keys: false,
@@ -520,6 +615,7 @@ impl App {
             plugin_pane: None,
             closing: None,
             backlog: None,
+            layouts: None,
             backlog_counts: HashMap::new(),
             flows: Vec::new(),
             flow_defs: Vec::new(),
@@ -849,13 +945,38 @@ impl App {
         self.keep_selection_on_a_row();
     }
 
+    /// Asks again before removing the worktree at `path`, on `branch`,
+    /// which git found changes not committed in: a yes forces it, and they
+    /// go with it. Until then, git isn't removing it.
+    pub fn ask_to_force_removal(&mut self, path: PathBuf, branch: String) {
+        self.removing.remove(&path);
+        self.confirm = Some(Confirm::RemoveWorktree {
+            path,
+            branch,
+            force: true,
+        });
+    }
+
     /// The worktree at `path` has been removed: it leaves the sidebar now,
     /// rather than when git is next asked.
     pub fn worktree_removed(&mut self, path: &Path) {
+        self.removing.remove(path);
         for linked in self.worktrees.values_mut() {
             linked.retain(|worktree| worktree.path != path);
         }
         self.keep_selection_on_a_row();
+    }
+
+    /// git didn't remove the worktree at `path`, for `reason`: it stays,
+    /// and can be asked about again.
+    pub fn worktree_not_removed(&mut self, path: &Path, reason: String) {
+        self.removing.remove(path);
+        self.notify(reason);
+    }
+
+    /// Whether git is removing the worktree at `path`.
+    pub fn removing(&self, path: &Path) -> bool {
+        self.removing.contains(path)
     }
 
     /// The linked worktree with no sessions the selection is on, if it's
@@ -997,6 +1118,42 @@ impl App {
         self.issues.as_ref()
     }
 
+    /// The layouts view, while it's open.
+    pub fn layouts_view(&self) -> Option<&LayoutsView> {
+        self.layouts.as_ref()
+    }
+
+    /// Takes the layouts as they were read, or why they couldn't be: opens
+    /// the layouts view on them, or shows them in it if it's open, with the
+    /// bar on `on`, if that's given.
+    pub fn show_layouts(&mut self, found: Result<Layouts, String>, on: Option<&Which>) {
+        match &mut self.layouts {
+            Some(view) => view.set_layouts(found, on),
+            None => {
+                let running = self.sessions.iter().map(|s| s.name.clone()).collect();
+                self.layouts = Some(LayoutsView::new(found, running));
+            }
+        }
+    }
+
+    /// Puts the tabs back the way the layout called `name` had them, and
+    /// closes the layouts view: see [`Self::set_tabs`]. Says how many of
+    /// the layout's sessions have gone since, which it leaves out.
+    pub fn restore_layout(&mut self, tabs: Tabs, name: &str) {
+        let gone = tabs
+            .sessions()
+            .filter(|name| self.position(name).is_none())
+            .count();
+        self.layouts = None;
+        self.set_tabs(tabs);
+        let notice = match gone {
+            0 => format!("restored {name}"),
+            1 => format!("restored {name}: one of its sessions has gone"),
+            gone => format!("restored {name}: {gone} of its sessions have gone"),
+        };
+        self.notify(notice);
+    }
+
     /// The backlog view, while it's open.
     pub fn backlog_view(&self) -> Option<&BacklogView> {
         self.backlog.as_ref()
@@ -1092,15 +1249,61 @@ impl App {
         &self.tabs.current().splits
     }
 
-    /// The panes beside the sidebar, in the order they're drawn: the one
-    /// that follows the selection, then each split.
+    /// The panes on screen, in the order they're drawn: the splits, with
+    /// the one that follows the selection where it's been moved to, first
+    /// until it's moved. Zoomed, only the pane that shows the selected
+    /// session. Then, last, over the others, the float, if there is one.
     pub fn slots(&self) -> Vec<Slot> {
-        let splits = (0..self.splits().len()).map(Slot::Split);
-        std::iter::once(Slot::Selected).chain(splits).collect()
+        let mut slots = if self.zoomed() {
+            let zoomed = self.selected_slot().filter(|slot| *slot != Slot::Float);
+            vec![zoomed.unwrap_or(Slot::Selected)]
+        } else {
+            self.tiled()
+        };
+        if self.floating().is_some() {
+            slots.push(Slot::Float);
+        }
+        slots
     }
 
-    /// The session the pane at `slot` is about: the selected one, or the
-    /// one split off there.
+    /// The session floating over the panes of the tab in front, if one is.
+    pub fn floating(&self) -> Option<&SessionInfo> {
+        let name = self.tabs.current().floating.as_deref()?;
+        self.sessions.iter().find(|session| session.name == name)
+    }
+
+    /// Whether the session called `name` floats over the panes.
+    fn is_floating(&self, name: &str) -> bool {
+        self.tabs.current().floating.as_deref() == Some(name)
+    }
+
+    /// Every pane of the tab in front, in the order they're drawn when it
+    /// isn't zoomed.
+    fn tiled(&self) -> Vec<Slot> {
+        let tab = self.tabs.current();
+        let mut slots: Vec<Slot> = (0..tab.splits.len()).map(Slot::Split).collect();
+        slots.insert(tab.selection_pane_at(), Slot::Selected);
+        slots
+    }
+
+    /// Whether the tab in front is zoomed: the selected session's pane
+    /// takes the room of the sidebar and the other panes.
+    pub fn zoomed(&self) -> bool {
+        self.tabs.current().zoomed
+    }
+
+    /// The pane a drag of the mouse is selecting in, while it lasts.
+    pub fn dragging(&self) -> Option<Slot> {
+        self.dragging
+    }
+
+    /// The pane being moved by its header line, while the button is down.
+    pub fn grabbed(&self) -> Option<Grab> {
+        self.grabbed
+    }
+
+    /// The session the pane at `slot` is about: the selected one, the one
+    /// split off there, or the one floating.
     pub fn pane_session(&self, slot: Slot) -> Option<&SessionInfo> {
         match slot {
             Slot::Selected => self.selected(),
@@ -1108,20 +1311,29 @@ impl App {
                 let name = self.splits().get(index)?;
                 self.sessions.iter().find(|session| session.name == *name)
             }
+            Slot::Float => self.floating(),
         }
     }
 
     /// Whether the pane at `slot` shows its session's screen. The pane that
     /// follows the selection doesn't when the selected session is split
-    /// off, so that no session is drawn twice at two sizes, nor when it's
-    /// the session this TUI runs in.
+    /// off or floats, so that no session is drawn twice at two sizes, nor
+    /// when it's the session this TUI runs in. Zoomed, no other pane is on
+    /// screen but the float.
     pub fn shows_screen(&self, slot: Slot) -> bool {
         let Some(session) = self.pane_session(slot) else {
             return false;
         };
+        if self.zoomed() && slot != Slot::Float && Some(slot) != self.selected_slot() {
+            return false;
+        }
         match slot {
-            Slot::Selected => !self.selected_is_own() && !self.is_split(&session.name),
-            Slot::Split(_) => true,
+            Slot::Selected => {
+                !self.selected_is_own()
+                    && !self.is_split(&session.name)
+                    && !self.is_floating(&session.name)
+            }
+            Slot::Split(_) | Slot::Float => true,
         }
     }
 
@@ -1185,9 +1397,13 @@ impl App {
             self.on_worktree = Some(worktree.path);
         }
         self.keep_selection_on_a_row();
-        if let Focus::Pane(slot) = self.focus
-            && !self.can_type_into(slot)
-        {
+        let keeps_keyboard = match self.focus {
+            Focus::Sidebar => true,
+            Focus::Pane(slot) => self.can_type_into(slot),
+            // An ended session's last screen can still be copied from.
+            Focus::Copy(slot) => self.shows_screen(slot),
+        };
+        if !keeps_keyboard {
             self.focus = Focus::Sidebar;
         }
     }
@@ -1275,10 +1491,14 @@ impl App {
         }
     }
 
-    /// The pane that shows the selected session: its split, if it has one,
-    /// or else the pane that follows the selection.
+    /// The pane that shows the selected session: the float, if it floats,
+    /// its split, if it has one, or else the pane that follows the
+    /// selection.
     fn selected_slot(&self) -> Option<Slot> {
         let selected = self.selected()?;
+        if self.is_floating(&selected.name) {
+            return Some(Slot::Float);
+        }
         let split = self
             .splits()
             .iter()
@@ -1316,6 +1536,11 @@ impl App {
             if matches!(confirm, Confirm::CloseTab { .. }) {
                 self.close_tab_in_front();
             }
+            // git removes a worktree off the loop; its line says so until
+            // it's done.
+            if let Confirm::RemoveWorktree { path, .. } = &confirm {
+                self.removing.insert(path.clone());
+            }
             return Some(confirm.action());
         }
         // A digit or `t` says which tab the session goes to; any other key
@@ -1337,6 +1562,9 @@ impl App {
         }
         if self.backlog.is_some() {
             return self.on_backlog_key(key);
+        }
+        if self.layouts.is_some() {
+            return self.on_layouts_key(key);
         }
         if self.launcher.is_some() {
             return self.on_launcher_key(key);
@@ -1360,6 +1588,7 @@ impl App {
         match self.focus {
             Focus::Sidebar => self.on_sidebar_key(key),
             Focus::Pane(slot) => self.on_pane_key(slot, key),
+            Focus::Copy(slot) => self.on_copy_key(slot, key),
         }
     }
 
@@ -1388,6 +1617,7 @@ impl App {
         let typing = self.filter.is_some()
             || self.issues.is_some()
             || self.backlog.is_some()
+            || self.layouts.is_some()
             || self.launcher.is_some()
             || self.profiles_view.is_some()
             || self.plugins_view.is_some()
@@ -1403,12 +1633,74 @@ impl App {
         if click {
             self.notice = None;
         }
+        // A drag selects in the pane it started in until the button comes
+        // up, wherever it goes meanwhile.
+        if let Some(slot) = self.dragging {
+            match (kind, hit) {
+                (MouseEventKind::Drag(MouseButton::Left), Hit::Pane { slot: at, cell })
+                    if at == slot =>
+                {
+                    return cell.map(|cell| Action::SelectTo { slot, cell });
+                }
+                (MouseEventKind::Up(_), _) => {
+                    self.dragging = None;
+                    return Some(Action::CopySelection(slot));
+                }
+                // The button came up somewhere nothing heard it: this is a
+                // new click.
+                (MouseEventKind::Down(_), _) => self.dragging = None,
+                _ => return None,
+            }
+        }
+        // A pane taken by its header goes where the button comes up, over
+        // another pane, and swaps places with it.
+        if let Some(grab) = self.grabbed {
+            match (kind, hit) {
+                (MouseEventKind::Drag(_), Hit::Pane { slot, .. }) if slot != Slot::Float => {
+                    self.grabbed = Some(Grab {
+                        over: Some(slot),
+                        ..grab
+                    });
+                    return None;
+                }
+                (MouseEventKind::Drag(_), _) => {
+                    self.grabbed = Some(Grab { over: None, ..grab });
+                    return None;
+                }
+                (MouseEventKind::Up(_), hit) => {
+                    self.grabbed = None;
+                    if let Hit::Pane { slot, .. } = hit
+                        && slot != grab.from
+                    {
+                        self.swap_panes(grab.from, slot);
+                    }
+                    return None;
+                }
+                (MouseEventKind::Down(_), _) => self.grabbed = None,
+                _ => return None,
+            }
+        }
         match (kind, hit) {
             (_, Hit::Tab(index)) if click => self.go_to_tab(index),
             (_, Hit::SidebarRow(row)) if click => self.click_row(row),
-            (_, Hit::Pane { slot, .. }) if click => {
-                if self.can_type_into(slot) {
+            (_, Hit::Pane { slot, cell }) if click => {
+                // A click hands a pane the keyboard, but copy mode keeps it.
+                if self.focus != Focus::Copy(slot) && self.can_type_into(slot) {
                     self.focus_pane(slot);
+                }
+                // On its header line, it takes the pane, to move it.
+                let tiled = slot != Slot::Float;
+                if tiled && cell.is_none() && !self.zoomed() && self.tiled().len() > 1 {
+                    self.grabbed = Some(Grab {
+                        from: slot,
+                        over: Some(slot),
+                    });
+                }
+                if let Some(cell) = cell
+                    && self.shows_screen(slot)
+                {
+                    self.dragging = Some(slot);
+                    return Some(Action::SelectFrom { slot, cell });
                 }
             }
             (MouseEventKind::ScrollUp, Hit::SidebarRow(_) | Hit::Sidebar) => {
@@ -1462,6 +1754,13 @@ impl App {
             KeyCode::Tab => self.move_to_pane(Direction::Forward),
             KeyCode::BackTab => self.move_to_pane(Direction::Back),
             KeyCode::Char('s') => self.toggle_split(),
+            KeyCode::Char('z') => self.toggle_zoom(),
+            KeyCode::Char('v') => self.start_copying(),
+            KeyCode::Char('e') => return self.edit_history(),
+            KeyCode::Char('F') => self.toggle_float(),
+            KeyCode::Char('S') => return Some(Action::ListLayouts),
+            KeyCode::Char('H') => self.move_pane(-1),
+            KeyCode::Char('L') => self.move_pane(1),
             KeyCode::Char('t') => return self.new_tab(),
             KeyCode::Char('T') => self.ask_for_tab_name(),
             KeyCode::Char('&') => self.close_tab(),
@@ -1695,10 +1994,8 @@ impl App {
     fn ask_to_remove_worktree(&mut self) {
         if let Some(worktree) = self.selected_empty_worktree() {
             let branch = worktree.branch.as_deref().unwrap_or("(detached)");
-            self.confirm = Some(Confirm::RemoveWorktree {
-                path: worktree.path.clone(),
-                branch: branch.to_string(),
-            });
+            let (path, branch) = (worktree.path.clone(), branch.to_string());
+            self.confirm_removal(path, branch);
             return;
         }
         let Some(selected) = self.selected() else {
@@ -1725,13 +2022,24 @@ impl App {
             .map(|session| session.name.as_str())
             .collect();
         if running.is_empty() {
-            self.confirm = Some(Confirm::RemoveWorktree {
-                path: worktree.path,
-                branch,
-            });
+            self.confirm_removal(worktree.path, branch);
         } else {
             let notice = format!("{} still running in {branch}", running.join(", "));
             self.notify(notice);
+        }
+    }
+
+    /// Asks before removing the worktree at `path`, on `branch`, unless git
+    /// is removing it already.
+    fn confirm_removal(&mut self, path: PathBuf, branch: String) {
+        if self.removing(&path) {
+            self.notify(format!("already removing {branch}"));
+        } else {
+            self.confirm = Some(Confirm::RemoveWorktree {
+                path,
+                branch,
+                force: false,
+            });
         }
     }
 
@@ -1947,6 +2255,21 @@ impl App {
         Some(Action::ListBacklog(dir))
     }
 
+    /// Keys while the layouts view is open: all of them are its.
+    fn on_layouts_key(&mut self, key: KeyEvent) -> Option<Action> {
+        let view = self.layouts.as_mut()?;
+        match view.on_key(&key) {
+            layouts::Step::Stay => None,
+            layouts::Step::Close => {
+                self.layouts = None;
+                None
+            }
+            layouts::Step::Save(name) => Some(Action::SaveLayout(name)),
+            layouts::Step::Restore(which) => Some(Action::RestoreLayout(which)),
+            layouts::Step::Remove(which) => Some(Action::RemoveLayout(which)),
+        }
+    }
+
     /// Keys while the backlog view is open: all of them are its.
     fn on_backlog_key(&mut self, key: KeyEvent) -> Option<Action> {
         let view = self.backlog.as_mut()?;
@@ -2061,6 +2384,7 @@ impl App {
             history: self.memory.tasks.clone(),
             codex_models: self.codex_models.clone().unwrap_or_default(),
             background: self.tasks_on,
+            branch: names::random(),
         }
     }
 
@@ -2229,11 +2553,15 @@ impl App {
             issues.on_paste(&text);
         } else if let Some(backlog) = &mut self.backlog {
             backlog.on_paste(&text);
+        } else if let Some(view) = &mut self.layouts {
+            view.on_paste(&text);
         } else if let Some(filter) = &mut self.filter {
             filter.input.insert_str(&text);
             self.keep_filter_bar_on_a_match();
         } else if let Focus::Pane(slot) = self.focus {
             return Some(Action::Paste { to: slot, text });
+        } else if let Focus::Copy(slot) = self.focus {
+            return Some(Action::CopyPaste { slot, text });
         }
         None
     }
@@ -2349,6 +2677,63 @@ impl App {
         }
     }
 
+    /// Every key goes to copy mode, but Ctrl+\, which leaves it for the
+    /// sidebar.
+    fn on_copy_key(&mut self, slot: Slot, key: KeyEvent) -> Option<Action> {
+        if keys::is_hand_back(&key) {
+            self.focus = Focus::Sidebar;
+            return None;
+        }
+        Some(Action::CopyKey { slot, key })
+    }
+
+    /// `v`: turns copy mode on in the pane that shows the selected session,
+    /// and hands it the keyboard. A session that's ended can still be
+    /// copied from.
+    fn start_copying(&mut self) {
+        let Some(slot) = self.selected_slot() else {
+            return;
+        };
+        if self.shows_screen(slot) {
+            self.focus = Focus::Copy(slot);
+        } else if self.selected_is_own() {
+            self.notify("crystal can't show the session it runs in".into());
+        }
+    }
+
+    /// `e`: opens what the selected session's pane shows, its history and
+    /// all, in the user's editor, as a session of its own beside it. One
+    /// that's ended can still be read.
+    fn edit_history(&mut self) -> Option<Action> {
+        let slot = self.selected_slot()?;
+        if !self.shows_screen(slot) {
+            if self.selected_is_own() {
+                self.notify("crystal can't show the session it runs in".into());
+            }
+            return None;
+        }
+        let session = self.pane_session(slot)?;
+        let dir = session.cwd.clone();
+        let name = self.free_name(&format!("{}-history", session.name));
+        Some(Action::EditHistory { slot, dir, name })
+    }
+
+    /// Copy mode is over: the keyboard goes back to the sidebar it came
+    /// from.
+    pub fn stop_copying(&mut self) {
+        if let Focus::Copy(_) = self.focus {
+            self.focus = Focus::Sidebar;
+        }
+    }
+
+    /// `z`: zooms the selected session's pane, so it takes the room of the
+    /// sidebar and the other panes, or puts them back. The keyboard stays in
+    /// the sidebar, so `j` and `k` go on choosing the session it shows.
+    fn toggle_zoom(&mut self) {
+        let tab = self.tabs.current_mut();
+        tab.zoomed = !tab.zoomed;
+    }
+
     /// Splits the selected session off into a pane of its own, or closes
     /// its split if it has one.
     fn toggle_split(&mut self) {
@@ -2364,7 +2749,49 @@ impl App {
             let most = tabs::MAX_SPLITS;
             self.notify(format!("{most} splits at most: press s on one to close it"));
         } else {
+            // A session that floats comes down into its split.
+            if self.is_floating(&name) {
+                self.put_float_back();
+            }
             self.tabs.current_mut().splits.push(name);
+        }
+    }
+
+    /// `F`: floats the selected session over the panes, in a pane of its
+    /// own that takes the keyboard, or puts back the one that floats. A
+    /// session split off comes up out of its split.
+    fn toggle_float(&mut self) {
+        if self.tabs.current().floating.is_some() {
+            return self.put_float_back();
+        }
+        let Some(selected) = self.selected() else {
+            return;
+        };
+        if self.selected_is_own() {
+            return self.notify("crystal can't show the session it runs in".into());
+        }
+        let name = selected.name.clone();
+        if let Some(split) = self.splits().iter().position(|split| *split == name) {
+            self.close_split(split);
+        }
+        self.tabs.current_mut().floating = Some(name);
+        if self.can_type_into(Slot::Float) {
+            self.focus_pane(Slot::Float);
+        }
+    }
+
+    /// Puts the session that floats back among the others. The keyboard
+    /// goes back to the sidebar if it was in the float.
+    fn put_float_back(&mut self) {
+        self.tabs.current_mut().floating = None;
+        if matches!(
+            self.focus,
+            Focus::Pane(Slot::Float) | Focus::Copy(Slot::Float)
+        ) {
+            self.focus = Focus::Sidebar;
+        }
+        if self.last_pane == Some(Slot::Float) {
+            self.last_pane = None;
         }
     }
 
@@ -2372,12 +2799,81 @@ impl App {
     /// and the keyboard moves with its pane, or goes back to the sidebar
     /// if its pane is the one that closed.
     fn close_split(&mut self, index: usize) {
-        self.tabs.current_mut().splits.remove(index);
+        self.tabs.current_mut().close_split(index);
         self.focus = match self.focus {
             Focus::Pane(Slot::Split(at)) if at == index => Focus::Sidebar,
             Focus::Pane(Slot::Split(at)) if at > index => Focus::Pane(Slot::Split(at - 1)),
             focus => focus,
         };
+    }
+
+    /// `H` and `L`: moves the selected session's pane `by` places among the
+    /// panes, back toward the left (or the top, stacked) or on, swapping it
+    /// with the pane that was there. It stops at the ends.
+    fn move_pane(&mut self, by: isize) {
+        let Some(slot) = self.selected_slot() else {
+            return;
+        };
+        if self.zoomed() {
+            return self.notify("zoomed: z puts the panes back first".into());
+        }
+        if slot == Slot::Float {
+            return self.notify("it floats: F puts it back among the panes".into());
+        }
+        let mut order = self.tiled();
+        if order.len() == 1 {
+            return self.notify("one pane: s splits a session off into another".into());
+        }
+        let Some(at) = order.iter().position(|placed| *placed == slot) else {
+            return;
+        };
+        let Some(to) = at.checked_add_signed(by).filter(|to| *to < order.len()) else {
+            return;
+        };
+        order.swap(at, to);
+        self.arrange(&order);
+    }
+
+    /// Swaps the panes at `a` and `b`, wherever they are.
+    fn swap_panes(&mut self, a: Slot, b: Slot) {
+        let mut order = self.tiled();
+        let at = |slot: Slot| order.iter().position(|placed| *placed == slot);
+        if let (Some(a), Some(b)) = (at(a), at(b)) {
+            order.swap(a, b);
+            self.arrange(&order);
+        }
+    }
+
+    /// Draws the panes in `order`, which has every pane there is. A split
+    /// is counted by where it's drawn, so the keyboard, Tab and a drag
+    /// follow each split to its new place.
+    fn arrange(&mut self, order: &[Slot]) {
+        let before = self.splits().to_vec();
+        let splits: Vec<String> = order
+            .iter()
+            .filter_map(|slot| match slot {
+                Slot::Split(index) => before.get(*index).cloned(),
+                Slot::Selected | Slot::Float => None,
+            })
+            .collect();
+        let moved = |slot: Slot| match slot {
+            Slot::Split(index) => before
+                .get(index)
+                .and_then(|name| splits.iter().position(|split| split == name))
+                .map_or(slot, Slot::Split),
+            Slot::Selected | Slot::Float => slot,
+        };
+        self.focus = match self.focus {
+            Focus::Pane(slot) => Focus::Pane(moved(slot)),
+            Focus::Copy(slot) => Focus::Copy(moved(slot)),
+            Focus::Sidebar => Focus::Sidebar,
+        };
+        self.last_pane = self.last_pane.map(moved);
+        self.dragging = self.dragging.map(moved);
+        let selection_at = order.iter().position(|slot| *slot == Slot::Selected);
+        let tab = self.tabs.current_mut();
+        tab.splits = splits;
+        tab.selection_at = selection_at.unwrap_or(0);
     }
 
     /// `t`: makes a new tab, brings it to the front, and starts a shell in
@@ -3096,7 +3592,7 @@ mod tests {
             press(&mut app, KeyCode::Enter),
             Some(Action::SaveProfile {
                 replacing: Some("review".into()),
-                profile: reviewer.clone()
+                profile: Box::new(reviewer.clone())
             })
         );
         // The event loop wrote it, and read the file again.
@@ -3158,13 +3654,19 @@ mod tests {
     }
 
     #[test]
-    fn w_opens_the_panel_on_a_new_worktree_named_after_the_task() {
+    fn w_opens_the_panel_on_a_new_worktree_with_a_made_up_name() {
         let mut app = with_agents(&["claude"], vec![in_project("agent", "app")]);
         press(&mut app, KeyCode::Char('w'));
         type_text(&mut app, "fix typo");
+        let branch = app.launcher().unwrap().branch_name();
+        assert!(
+            matches!(branch.split_once('-'), Some((a, b)) if !a.is_empty() && !b.is_empty()),
+            "{branch}"
+        );
         let place = Place::NewWorktree {
-            branch: "fix-typo".into(),
+            branch,
             base: Some(PathBuf::from("/code/app")),
+            made_up: true,
         };
         assert_eq!(
             press(&mut app, KeyCode::Enter),
@@ -3178,8 +3680,9 @@ mod tests {
         press(&mut app, KeyCode::Char('w'));
         type_text(&mut app, "feat");
         let place = Place::NewWorktree {
-            branch: "feat".into(),
+            branch: app.launcher().unwrap().branch_name(),
             base: None,
+            made_up: true,
         };
         assert_eq!(
             press(&mut app, KeyCode::Enter),
@@ -3360,6 +3863,7 @@ mod tests {
         let removal = Confirm::RemoveWorktree {
             path: PathBuf::from("/code/app.worktrees/fix"),
             branch: "fix".into(),
+            force: false,
         };
         assert_eq!(app.confirm(), Some(&removal));
         assert_eq!(
@@ -3368,8 +3872,38 @@ mod tests {
         );
         assert_eq!(
             press(&mut app, KeyCode::Char('y')),
-            Some(Action::RemoveWorktree("/code/app.worktrees/fix".into()))
+            Some(removal_of("fix", false))
         );
+    }
+
+    /// Removing the worktree of app on `branch`, forced or not.
+    fn removal_of(branch: &str, force: bool) -> Action {
+        Action::RemoveWorktree {
+            path: PathBuf::from(format!("/code/app.worktrees/{branch}")),
+            branch: branch.into(),
+            force,
+        }
+    }
+
+    #[test]
+    fn a_worktree_with_changes_is_asked_about_again_before_it_is_forced() {
+        let mut app = App::new(None);
+        app.set_sessions(vec![in_worktree("fixer", "fix", State::Exited { code: 0 })]);
+        app.select("fixer");
+        // The event loop found changes not committed after the first yes.
+        app.ask_to_force_removal("/code/app.worktrees/fix".into(), "fix".into());
+        assert_eq!(
+            app.confirm().map(Confirm::question).as_deref(),
+            Some("fix has uncommitted changes: remove it and lose them? y/n")
+        );
+        assert_eq!(
+            press(&mut app, KeyCode::Char('y')),
+            Some(removal_of("fix", true))
+        );
+
+        app.ask_to_force_removal("/code/app.worktrees/fix".into(), "fix".into());
+        assert_eq!(press(&mut app, KeyCode::Char('n')), None);
+        assert_eq!(app.confirm(), None);
     }
 
     #[test]
@@ -3462,11 +3996,85 @@ mod tests {
         );
         assert_eq!(
             press(&mut app, KeyCode::Char('y')),
-            Some(Action::RemoveWorktree("/code/app.worktrees/old".into()))
+            Some(removal_of("old", false))
         );
         app.worktree_removed(Path::new("/code/app.worktrees/old"));
         assert!(!shows_empty_worktree(&app));
         assert_eq!(selected_name(&app), Some("planner"));
+    }
+
+    #[test]
+    fn a_worktree_stays_while_git_removes_it_and_isn_t_asked_about_twice() {
+        let mut app = app_with_an_empty_worktree();
+        let old = Path::new("/code/app.worktrees/old");
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('W'));
+        assert!(!app.removing(old), "not until it's a yes");
+        press(&mut app, KeyCode::Char('y'));
+        assert!(app.removing(old));
+        assert!(shows_empty_worktree(&app), "it's there until git is done");
+        assert_eq!(empty_branch(&app), Some("old"));
+
+        press(&mut app, KeyCode::Char('W'));
+        assert_eq!(app.confirm(), None);
+        assert_eq!(app.notice(), Some("already removing old"));
+
+        app.worktree_removed(old);
+        assert!(!app.removing(old));
+        assert!(!shows_empty_worktree(&app));
+    }
+
+    #[test]
+    fn a_worktree_git_wouldn_t_remove_can_be_asked_about_again() {
+        let mut app = app_with_an_empty_worktree();
+        let old = Path::new("/code/app.worktrees/old");
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('W'));
+        press(&mut app, KeyCode::Char('y'));
+        app.worktree_not_removed(old, "'old' contains modified or untracked files".into());
+        assert!(!app.removing(old));
+        assert!(shows_empty_worktree(&app));
+        assert_eq!(
+            app.notice(),
+            Some("'old' contains modified or untracked files")
+        );
+
+        press(&mut app, KeyCode::Char('W'));
+        assert_eq!(
+            app.confirm().map(Confirm::question).as_deref(),
+            Some("remove worktree old? y/n")
+        );
+    }
+
+    #[test]
+    fn a_worktree_found_with_changes_isn_t_being_removed_until_it_s_forced() {
+        let mut app = app_with_an_empty_worktree();
+        let old = Path::new("/code/app.worktrees/old");
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('W'));
+        press(&mut app, KeyCode::Char('y'));
+        assert!(app.removing(old));
+        // git found changes not committed, off the loop.
+        app.ask_to_force_removal(old.into(), "old".into());
+        assert!(!app.removing(old));
+        assert_eq!(
+            press(&mut app, KeyCode::Char('y')),
+            Some(Action::RemoveWorktree {
+                path: old.into(),
+                branch: "old".into(),
+                force: true,
+            })
+        );
+        assert!(app.removing(old));
+    }
+
+    #[test]
+    fn no_to_removing_a_worktree_leaves_it_be() {
+        let mut app = app_with_an_empty_worktree();
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('W'));
+        assert_eq!(press(&mut app, KeyCode::Char('n')), None);
+        assert!(!app.removing(Path::new("/code/app.worktrees/old")));
     }
 
     #[test]
@@ -3610,6 +4218,340 @@ mod tests {
         assert!(app.notice().unwrap().contains("2 splits at most"));
     }
 
+    /// The sessions the panes show, in the order they're drawn: `-` for
+    /// the selection's pane while its session has a split of its own.
+    fn drawn(app: &App) -> Vec<String> {
+        app.slots()
+            .into_iter()
+            .map(|slot| match app.pane_session(slot) {
+                Some(_) if !app.shows_screen(slot) => "-".to_string(),
+                Some(session) => session.name.clone(),
+                None => "?".to_string(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn h_and_l_move_the_selected_sessions_pane_and_stop_at_the_ends() {
+        let mut app = app_with_splits(&["a", "b", "c"], 2);
+        assert_eq!(drawn(&app), ["c", "a", "b"]);
+        press(&mut app, KeyCode::Char('L'));
+        assert_eq!(drawn(&app), ["a", "c", "b"]);
+        press(&mut app, KeyCode::Char('L'));
+        assert_eq!(drawn(&app), ["a", "b", "c"]);
+        press(&mut app, KeyCode::Char('L'));
+        assert_eq!(drawn(&app), ["a", "b", "c"]);
+        assert_eq!(app.notice(), None);
+
+        // A split moves the same way, past the others.
+        app.select("a");
+        press(&mut app, KeyCode::Char('L'));
+        assert_eq!(drawn(&app), ["b", "a", "-"]);
+        assert_eq!(app.splits(), ["b", "a"]);
+        press(&mut app, KeyCode::Char('L'));
+        assert_eq!(drawn(&app), ["b", "-", "a"]);
+        press(&mut app, KeyCode::Char('H'));
+        press(&mut app, KeyCode::Char('H'));
+        assert_eq!(drawn(&app), ["a", "b", "-"]);
+    }
+
+    #[test]
+    fn the_keyboard_and_tab_follow_a_pane_that_moved() {
+        let mut app = app_with_splits(&["a", "b", "c"], 2);
+        // Type into each pane in turn, b's last, then come back to the
+        // sidebar.
+        for _ in 0..2 {
+            press(&mut app, KeyCode::Tab);
+            hand_back(&mut app);
+        }
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.focus(), Focus::Pane(Slot::Split(1)));
+        hand_back(&mut app);
+        app.select("b");
+        press(&mut app, KeyCode::Char('H'));
+        assert_eq!(app.splits(), ["b", "a"]);
+        // Tab goes on from b's pane, wherever it is: to a's, after it.
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.focus(), Focus::Pane(Slot::Split(1)));
+        let typing_into = app.pane_session(Slot::Split(1)).unwrap();
+        assert_eq!(typing_into.name, "a");
+    }
+
+    #[test]
+    fn a_pane_doesnt_move_zoomed_or_alone() {
+        let mut app = app_with(&["a"]);
+        press(&mut app, KeyCode::Char('L'));
+        assert!(app.notice().unwrap().contains("one pane"));
+
+        let mut app = app_with_splits(&["a", "b"], 1);
+        press(&mut app, KeyCode::Char('z'));
+        press(&mut app, KeyCode::Char('L'));
+        assert!(app.notice().unwrap().contains("zoomed"));
+        press(&mut app, KeyCode::Char('z'));
+        assert_eq!(drawn(&app), ["b", "a"]);
+    }
+
+    #[test]
+    fn panes_keep_their_order_as_splits_close_and_come() {
+        let mut app = app_with_splits(&["a", "b", "c"], 2);
+        press(&mut app, KeyCode::Char('L'));
+        press(&mut app, KeyCode::Char('L'));
+        assert_eq!(drawn(&app), ["a", "b", "c"]);
+        // a's split closes: b stays before the selection's pane.
+        app.select("a");
+        press(&mut app, KeyCode::Char('s'));
+        app.select("c");
+        assert_eq!(drawn(&app), ["b", "c"]);
+        // A new split goes at the end.
+        app.select("a");
+        press(&mut app, KeyCode::Char('s'));
+        app.select("c");
+        assert_eq!(drawn(&app), ["b", "c", "a"]);
+        // So does a session that goes, from before the selection's pane.
+        app.set_sessions(vec![session("a"), session("c")]);
+        assert_eq!(drawn(&app), ["c", "a"]);
+        assert_eq!(app.tabs_to_keep().current().selection_at, 0);
+    }
+
+    #[test]
+    fn a_pane_taken_by_its_header_swaps_with_the_one_it_is_let_go_over() {
+        let mut app = app_with_splits(&["a", "b", "c"], 2);
+        let down = MouseEventKind::Down(MouseButton::Left);
+        let drag = MouseEventKind::Drag(MouseButton::Left);
+        let up = MouseEventKind::Up(MouseButton::Left);
+        let header = |slot| Hit::Pane { slot, cell: None };
+        assert_eq!(app.on_mouse(down, header(Slot::Selected)), None);
+        assert_eq!(
+            app.grabbed(),
+            Some(Grab {
+                from: Slot::Selected,
+                over: Some(Slot::Selected)
+            })
+        );
+        app.on_mouse(drag, Hit::Sidebar);
+        assert_eq!(app.grabbed().unwrap().over, None);
+        let over_b = Hit::Pane {
+            slot: Slot::Split(1),
+            cell: Some((3, 4)),
+        };
+        assert_eq!(app.on_mouse(drag, over_b), None);
+        assert_eq!(app.grabbed().unwrap().over, Some(Slot::Split(1)));
+        assert_eq!(app.on_mouse(up, over_b), None);
+        assert_eq!(app.grabbed(), None);
+        assert_eq!(drawn(&app), ["b", "a", "c"]);
+
+        // Let go anywhere but over another pane, and nothing moves.
+        app.on_mouse(down, header(Slot::Split(0)));
+        app.on_mouse(up, Hit::Sidebar);
+        app.on_mouse(down, header(Slot::Split(0)));
+        app.on_mouse(up, header(Slot::Split(0)));
+        assert_eq!(drawn(&app), ["b", "a", "c"]);
+    }
+
+    #[test]
+    fn a_header_alone_or_zoomed_takes_nothing() {
+        let down = MouseEventKind::Down(MouseButton::Left);
+        let header = Hit::Pane {
+            slot: Slot::Selected,
+            cell: None,
+        };
+        let mut app = app_with(&["a"]);
+        app.on_mouse(down, header);
+        assert_eq!(app.grabbed(), None);
+        // The click still hands the pane the keyboard.
+        assert_eq!(app.focus(), Focus::Pane(Slot::Selected));
+
+        let mut app = app_with_splits(&["a", "b"], 1);
+        press(&mut app, KeyCode::Char('z'));
+        app.on_mouse(down, header);
+        assert_eq!(app.grabbed(), None);
+    }
+
+    #[test]
+    fn f_floats_the_selected_session_with_the_keyboard_and_again_puts_it_back() {
+        let mut app = app_with(&["a", "b"]);
+        press(&mut app, KeyCode::Char('F'));
+        assert_eq!(app.slots(), [Slot::Selected, Slot::Float]);
+        assert_eq!(app.floating().unwrap().name, "a");
+        assert_eq!(app.focus(), Focus::Pane(Slot::Float));
+        // The selection's pane doesn't draw it a second time.
+        assert!(app.shows_screen(Slot::Float));
+        assert!(!app.shows_screen(Slot::Selected));
+
+        // The float stays over the panes while the selection moves on.
+        hand_back(&mut app);
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(drawn(&app), ["b", "a"]);
+        assert_eq!(app.tabs_to_keep().current().floating.as_deref(), Some("a"));
+
+        // F puts it back, whatever is selected.
+        press(&mut app, KeyCode::Char('F'));
+        assert_eq!(app.slots(), [Slot::Selected]);
+        assert!(app.floating().is_none());
+        assert_eq!(app.focus(), Focus::Sidebar);
+    }
+
+    #[test]
+    fn tab_goes_round_to_the_float_last_and_keys_go_to_it() {
+        let mut app = app_with_splits(&["a", "b", "c"], 1);
+        press(&mut app, KeyCode::Char('F'));
+        hand_back(&mut app);
+        press(&mut app, KeyCode::Char('k'));
+        assert_eq!(app.slots(), [Slot::Selected, Slot::Split(0), Slot::Float]);
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.focus(), Focus::Pane(Slot::Selected));
+        hand_back(&mut app);
+        press(&mut app, KeyCode::Tab);
+        hand_back(&mut app);
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.focus(), Focus::Pane(Slot::Float));
+        let key = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE);
+        assert_eq!(
+            app.on_key(key),
+            Some(Action::Type {
+                to: Slot::Float,
+                key
+            })
+        );
+    }
+
+    #[test]
+    fn a_split_comes_up_into_the_float_and_s_puts_the_float_in_a_split() {
+        let mut app = app_with_splits(&["a", "b"], 1);
+        app.select("a");
+        press(&mut app, KeyCode::Char('F'));
+        assert!(app.splits().is_empty());
+        assert_eq!(app.floating().unwrap().name, "a");
+        hand_back(&mut app);
+        press(&mut app, KeyCode::Char('s'));
+        assert_eq!(app.splits(), ["a"]);
+        assert!(app.floating().is_none());
+        assert_eq!(app.focus(), Focus::Sidebar);
+    }
+
+    #[test]
+    fn the_float_floats_over_a_zoomed_tab_too() {
+        let mut app = app_with(&["a", "b"]);
+        press(&mut app, KeyCode::Char('F'));
+        hand_back(&mut app);
+        press(&mut app, KeyCode::Char('z'));
+        // a floats: the zoomed pane follows the selection, under it.
+        assert_eq!(app.slots(), [Slot::Selected, Slot::Float]);
+        assert!(app.shows_screen(Slot::Float));
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(drawn(&app), ["b", "a"]);
+    }
+
+    #[test]
+    fn the_float_goes_with_its_session() {
+        let mut app = app_with(&["a", "b"]);
+        press(&mut app, KeyCode::Char('F'));
+        app.set_sessions(vec![session("b")]);
+        assert!(app.floating().is_none());
+        assert_eq!(app.slots(), [Slot::Selected]);
+        assert_eq!(app.focus(), Focus::Sidebar);
+        assert_eq!(app.tabs_to_keep().current().floating, None);
+    }
+
+    #[test]
+    fn the_float_is_the_tabs_and_leaves_it_with_its_session() {
+        let mut app = app_with_a_second_tab(&["a"]);
+        press(&mut app, KeyCode::Char('F'));
+        hand_back(&mut app);
+        press(&mut app, KeyCode::Char('['));
+        assert!(app.floating().is_none());
+        press(&mut app, KeyCode::Char(']'));
+        assert_eq!(app.floating().unwrap().name, "shell");
+        press(&mut app, KeyCode::Char('>'));
+        press(&mut app, KeyCode::Char('1'));
+        assert!(app.floating().is_none());
+    }
+
+    #[test]
+    fn the_tuis_own_session_doesnt_float_and_a_float_doesnt_move() {
+        let mut app = App::new(Some("me".into()));
+        app.set_sessions(vec![session("me")]);
+        press(&mut app, KeyCode::Char('F'));
+        assert!(app.floating().is_none());
+        assert!(app.notice().unwrap().contains("runs in"));
+
+        let mut app = app_with_splits(&["a", "b"], 1);
+        press(&mut app, KeyCode::Char('F'));
+        hand_back(&mut app);
+        press(&mut app, KeyCode::Char('L'));
+        assert!(app.notice().unwrap().contains("F puts it back"));
+    }
+
+    #[test]
+    fn s_capital_opens_the_layouts_and_keys_go_to_them_until_esc() {
+        let mut app = app_with(&["a"]);
+        assert_eq!(
+            press(&mut app, KeyCode::Char('S')),
+            Some(Action::ListLayouts)
+        );
+        app.show_layouts(Ok(Layouts::default()), None);
+        assert!(app.layouts_view().is_some());
+        // `s` saves rather than splits while the view is open.
+        press(&mut app, KeyCode::Char('s'));
+        assert!(app.splits().is_empty());
+        type_text(&mut app, "work");
+        assert_eq!(
+            press(&mut app, KeyCode::Enter),
+            Some(Action::SaveLayout("work".into()))
+        );
+        press(&mut app, KeyCode::Esc);
+        assert!(app.layouts_view().is_none());
+    }
+
+    #[test]
+    fn enter_in_the_layouts_asks_for_the_one_the_bar_is_on() {
+        let mut app = app_with(&["a"]);
+        let mut layouts = Layouts::default();
+        layouts.save("work", app.tabs_to_keep(), 10);
+        app.show_layouts(Ok(layouts), None);
+        assert_eq!(
+            press(&mut app, KeyCode::Enter),
+            Some(Action::RestoreLayout(Which::Saved("work".into())))
+        );
+    }
+
+    #[test]
+    fn a_layout_restored_puts_the_tabs_back_with_the_sessions_still_there() {
+        let mut app = app_with(&["a", "b", "c"]);
+        press(&mut app, KeyCode::Char('s'));
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('L'));
+        press(&mut app, KeyCode::Char('T'));
+        type_text(&mut app, "work");
+        press(&mut app, KeyCode::Enter);
+        let saved = app.tabs_to_keep();
+
+        // Then the tabs change: a tab of its own for c, the split closed.
+        app.select("c");
+        press(&mut app, KeyCode::Char('>'));
+        press(&mut app, KeyCode::Char('t'));
+        app.select("a");
+        press(&mut app, KeyCode::Char('s'));
+        assert_eq!(app.tabs().all().len(), 2);
+
+        // a has gone since the layout was saved; d is new.
+        app.set_sessions(vec![session("b"), session("c"), session("d")]);
+        app.show_layouts(Ok(Layouts::default()), None);
+        app.restore_layout(saved, "work");
+        assert!(app.layouts_view().is_none());
+        assert_eq!(app.tabs().all().len(), 1);
+        assert_eq!(app.tabs().current().name, "work");
+        assert_eq!(drawn(&app), ["b"]);
+        assert_eq!(selected_name(&app), Some("b"));
+        let mut held = app.tabs().current().sessions.clone();
+        held.sort();
+        assert_eq!(held, ["b", "c", "d"]);
+        assert_eq!(
+            app.notice(),
+            Some("restored work: one of its sessions has gone")
+        );
+    }
+
     #[test]
     fn a_session_with_a_split_is_not_shown_again_in_the_selections_pane() {
         let mut app = app_with(&["a"]);
@@ -3743,6 +4685,213 @@ mod tests {
             key: page_up,
         };
         assert_eq!(app.on_key(page_up), Some(typed));
+    }
+
+    #[test]
+    fn z_zooms_the_selected_sessions_pane_alone_and_again_puts_the_others_back() {
+        let mut app = app_with_splits(&["a", "b", "c"], 1);
+        app.select("b");
+        assert_eq!(on_screen(&app), ["b", "a"]);
+        press(&mut app, KeyCode::Char('z'));
+        assert!(app.zoomed());
+        assert_eq!(on_screen(&app), ["b"]);
+        assert!(!app.shows_screen(Slot::Split(0)));
+        assert_eq!(app.focus(), Focus::Sidebar);
+
+        // Zoomed, j and k choose what the one pane shows: a split session
+        // is shown in its own split's place.
+        press(&mut app, KeyCode::Char('k'));
+        assert_eq!(selected_name(&app), Some("a"));
+        assert_eq!(app.slots(), [Slot::Split(0)]);
+        assert!(app.shows_screen(Slot::Split(0)));
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(on_screen(&app), ["c"]);
+
+        press(&mut app, KeyCode::Char('z'));
+        assert!(!app.zoomed());
+        assert_eq!(on_screen(&app), ["c", "a"]);
+    }
+
+    #[test]
+    fn zoomed_tab_goes_to_the_one_pane_and_enter_types_into_it() {
+        let mut app = app_with_splits(&["a", "b"], 1);
+        press(&mut app, KeyCode::Char('z'));
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.focus(), Focus::Pane(Slot::Selected));
+        hand_back(&mut app);
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(
+            app.focus(),
+            Focus::Pane(Slot::Selected),
+            "the split is put away"
+        );
+        hand_back(&mut app);
+        app.select("a");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.focus(), Focus::Pane(Slot::Split(0)));
+    }
+
+    #[test]
+    fn each_tab_is_zoomed_on_its_own() {
+        let mut app = app_with_a_second_tab(&["a"]);
+        press(&mut app, KeyCode::Char('z'));
+        assert!(app.zoomed());
+        press(&mut app, KeyCode::Char('['));
+        assert!(!app.zoomed());
+        press(&mut app, KeyCode::Char(']'));
+        assert!(app.zoomed());
+        assert!(app.tabs_to_keep().current().zoomed);
+    }
+
+    #[test]
+    fn v_takes_the_keyboard_into_copy_mode_and_every_key_goes_there() {
+        let mut app = app_with_splits(&["a", "b"], 1);
+        app.select("a");
+        press(&mut app, KeyCode::Char('v'));
+        assert_eq!(app.focus(), Focus::Copy(Slot::Split(0)));
+        let q = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE);
+        assert_eq!(
+            app.on_key(q),
+            Some(Action::CopyKey {
+                slot: Slot::Split(0),
+                key: q
+            })
+        );
+        let paste = app.on_paste("text".into());
+        let expected = Action::CopyPaste {
+            slot: Slot::Split(0),
+            text: "text".into(),
+        };
+        assert_eq!(paste, Some(expected));
+
+        // The event loop says when copy mode is over.
+        app.stop_copying();
+        assert_eq!(app.focus(), Focus::Sidebar);
+        press(&mut app, KeyCode::Char('v'));
+        hand_back(&mut app);
+        assert_eq!(app.focus(), Focus::Sidebar);
+    }
+
+    #[test]
+    fn an_ended_session_can_be_copied_from_but_not_the_tuis_own() {
+        let mut app = App::new(None);
+        app.set_sessions(vec![ended("done")]);
+        press(&mut app, KeyCode::Char('v'));
+        assert_eq!(app.focus(), Focus::Copy(Slot::Selected));
+        // Copy mode stays while the ended session is still there to show.
+        app.set_sessions(vec![ended("done")]);
+        assert_eq!(app.focus(), Focus::Copy(Slot::Selected));
+        app.set_sessions(Vec::new());
+        assert_eq!(app.focus(), Focus::Sidebar);
+
+        let mut app = App::new(Some("me".into()));
+        app.set_sessions(vec![session("me")]);
+        press(&mut app, KeyCode::Char('v'));
+        assert_eq!(app.focus(), Focus::Sidebar);
+        assert!(app.notice().unwrap().contains("runs in"));
+    }
+
+    #[test]
+    fn e_opens_the_history_of_the_selected_sessions_pane_in_the_editor() {
+        let mut app = app_with_splits(&["a", "b", "a-history"], 1);
+        app.select("a");
+        // "a-history" is taken: the editor's session is called after it.
+        assert_eq!(
+            press(&mut app, KeyCode::Char('e')),
+            Some(Action::EditHistory {
+                slot: Slot::Split(0),
+                dir: PathBuf::from("/"),
+                name: "a-history-2".into(),
+            })
+        );
+
+        // An ended session's last screen can be read too.
+        let mut app = App::new(None);
+        app.set_sessions(vec![ended("done")]);
+        let edit = press(&mut app, KeyCode::Char('e'));
+        assert!(matches!(
+            edit,
+            Some(Action::EditHistory {
+                slot: Slot::Selected,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn e_has_nothing_to_open_for_the_tuis_own_session_or_none() {
+        let mut app = App::new(Some("me".into()));
+        assert_eq!(press(&mut app, KeyCode::Char('e')), None);
+        app.set_sessions(vec![session("me")]);
+        assert_eq!(press(&mut app, KeyCode::Char('e')), None);
+        assert!(app.notice().unwrap().contains("runs in"));
+    }
+
+    #[test]
+    fn a_drag_selects_in_the_pane_it_started_in_and_letting_go_copies() {
+        let mut app = app_with_splits(&["a", "b"], 1);
+        let down = MouseEventKind::Down(MouseButton::Left);
+        let drag = MouseEventKind::Drag(MouseButton::Left);
+        let up = MouseEventKind::Up(MouseButton::Left);
+        let in_split = |cell| Hit::Pane {
+            slot: Slot::Split(0),
+            cell,
+        };
+        assert_eq!(
+            app.on_mouse(down, in_split(Some((2, 3)))),
+            Some(Action::SelectFrom {
+                slot: Slot::Split(0),
+                cell: (2, 3)
+            })
+        );
+        assert_eq!(app.focus(), Focus::Pane(Slot::Split(0)));
+        assert_eq!(app.dragging(), Some(Slot::Split(0)));
+        assert_eq!(
+            app.on_mouse(drag, in_split(Some((4, 0)))),
+            Some(Action::SelectTo {
+                slot: Slot::Split(0),
+                cell: (4, 0)
+            })
+        );
+        // Over anything else, the drag goes on but selects nothing new.
+        assert_eq!(app.on_mouse(drag, Hit::Sidebar), None);
+        assert_eq!(
+            app.on_mouse(up, Hit::Elsewhere),
+            Some(Action::CopySelection(Slot::Split(0)))
+        );
+        assert_eq!(app.dragging(), None);
+    }
+
+    #[test]
+    fn a_click_in_the_pane_in_copy_mode_leaves_the_keyboard_there() {
+        let mut app = app_with(&["a"]);
+        press(&mut app, KeyCode::Char('v'));
+        let down = MouseEventKind::Down(MouseButton::Left);
+        let hit = Hit::Pane {
+            slot: Slot::Selected,
+            cell: Some((0, 0)),
+        };
+        app.on_mouse(down, hit);
+        assert_eq!(app.focus(), Focus::Copy(Slot::Selected));
+    }
+
+    #[test]
+    fn a_click_after_a_lost_release_starts_afresh() {
+        let mut app = app_with_splits(&["a", "b"], 1);
+        let down = MouseEventKind::Down(MouseButton::Left);
+        let in_pane = |slot| Hit::Pane {
+            slot,
+            cell: Some((0, 0)),
+        };
+        app.on_mouse(down, in_pane(Slot::Split(0)));
+        let again = app.on_mouse(down, in_pane(Slot::Selected));
+        let expected = Action::SelectFrom {
+            slot: Slot::Selected,
+            cell: (0, 0),
+        };
+        assert_eq!(again, Some(expected));
+        assert_eq!(app.dragging(), Some(Slot::Selected));
     }
 
     #[test]
@@ -4360,6 +5509,7 @@ mod tests {
             Place::NewWorktree {
                 branch: "42-fix-login-redirect".into(),
                 base: Some(PathBuf::from("/code/app")),
+                made_up: false,
             }
         );
         assert_eq!(command[0], "claude");
