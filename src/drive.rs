@@ -1,6 +1,6 @@
-//! `crystal send`, `wait` and `read`: how one agent drives another, or a
-//! script drives an agent. They work from inside a session as well, since
-//! every session knows its daemon's socket.
+//! `crystal send`, `wait`, `read` and `result`: how one agent drives
+//! another, or a script drives an agent. They work from inside a session as
+//! well, since every session knows its daemon's socket.
 
 use crate::client;
 use crate::protocol::{Activity, Request, Response, SessionInfo, State};
@@ -77,6 +77,25 @@ pub fn wait_for_turn(socket: &Path, name: &str, timeout: Option<Duration>) -> Re
 /// Prints what's on the session's screen, after its history with
 /// `history`. With `lines`, only that many of the last rows that aren't
 /// blank.
+/// Prints a task's answer: what Claude said at the end of its last run. With
+/// `json`, everything the task has come to, for scripts: whether the run
+/// failed, the conversation's id, the cost so far and how many runs it's
+/// had.
+pub fn result(socket: &Path, name: &str, json: bool) -> Result<()> {
+    let request = Request::Result {
+        name: name.to_string(),
+    };
+    let Response::Result(result) = ask(socket, &request)? else {
+        bail!("the daemon didn't send the result");
+    };
+    if json {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+    } else {
+        println!("{}", result.text.trim_end());
+    }
+    Ok(())
+}
+
 pub fn read(socket: &Path, name: &str, lines: Option<usize>, history: bool) -> Result<()> {
     let request = Request::Read {
         name: name.to_string(),

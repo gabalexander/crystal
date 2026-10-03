@@ -2,7 +2,7 @@
 
 use crate::env;
 use crate::git;
-use crate::protocol::{self, NewSession, Request, Response, SessionInfo, State};
+use crate::protocol::{self, NewSession, NewTask, Request, Response, SessionInfo, State, TaskSpec};
 use crate::socket;
 use anyhow::{Context, Result, bail};
 use std::fs::OpenOptions;
@@ -60,6 +60,27 @@ pub fn new_session(
     match ask(socket, &request, true)? {
         Some(Response::Created { name }) => Ok(name),
         _ => bail!("the daemon didn't create the session"),
+    }
+}
+
+/// Asks the daemon to start a task in `cwd`, with this process's
+/// environment. Starts the daemon if it isn't running. Returns the task's
+/// name.
+pub fn new_task(
+    socket: &Path,
+    name: Option<String>,
+    cwd: PathBuf,
+    spec: TaskSpec,
+) -> Result<String> {
+    let request = Request::NewTask(NewTask {
+        name,
+        cwd,
+        spec,
+        env: env::current(),
+    });
+    match ask(socket, &request, true)? {
+        Some(Response::Created { name }) => Ok(name),
+        _ => bail!("the daemon didn't start the task"),
     }
 }
 

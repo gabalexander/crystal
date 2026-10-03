@@ -5,7 +5,7 @@
 //! session started again gets the environment of whoever started the
 //! daemon again.
 
-use crate::protocol::Conversation;
+use crate::protocol::{Conversation, TaskSpec};
 use crate::socket;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -20,6 +20,11 @@ pub struct SavedSession {
     pub cwd: PathBuf,
     /// The agent's conversation, to pick up where it left off.
     pub conversation: Option<Conversation>,
+    /// For a task, what it was asked to do. A task comes back at rest,
+    /// ready to carry its conversation on, rather than running its prompt
+    /// again.
+    #[serde(default)]
+    pub task: Option<TaskSpec>,
 }
 
 /// Where the sessions of the daemon at `socket` are written down. The
@@ -84,6 +89,7 @@ mod tests {
                 id: "abc".into(),
                 transcript: None,
             }),
+            task: None,
         }
     }
 
@@ -91,7 +97,12 @@ mod tests {
     fn what_is_saved_loads_back_the_same() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("sessions.json");
-        let sessions = vec![saved("a"), saved("b")];
+        let mut task = saved("b");
+        task.task = Some(TaskSpec {
+            prompt: "fix the tests".into(),
+            args: vec!["--permission-mode".into(), "acceptEdits".into()],
+        });
+        let sessions = vec![saved("a"), task];
         save(&path, &sessions).unwrap();
         assert_eq!(load(&path), sessions);
     }

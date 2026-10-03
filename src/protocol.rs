@@ -20,6 +20,8 @@ use std::path::PathBuf;
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Request {
     New(NewSession),
+    /// Start a task: Claude Code run without a terminal.
+    NewTask(NewTask),
     List,
     Kill {
         name: String,
@@ -59,6 +61,10 @@ pub enum Request {
     SendKeys {
         name: String,
         keys: Vec<String>,
+    },
+    /// A task's answer: what Claude said at the end of its last run.
+    Result {
+        name: String,
     },
     /// What's on a session's screen, as text.
     Read {
@@ -100,6 +106,42 @@ pub struct NewSession {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct NewTask {
+    /// `None` names the task "task", with a number added if that's taken.
+    pub name: Option<String>,
+    pub cwd: PathBuf,
+    pub spec: TaskSpec,
+    /// The client's environment, which Claude starts from.
+    pub env: BTreeMap<String, String>,
+}
+
+/// What a task is asked to do: the prompt it starts with, and arguments
+/// for each `claude -p` it runs, like `--permission-mode acceptEdits`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskSpec {
+    pub prompt: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
+/// What `crystal result` answers with: a task's last answer, and what the
+/// task has come to so far.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaskResult {
+    /// What Claude said at the end of its last run, or what went wrong.
+    pub text: String,
+    /// Whether the last run failed.
+    pub failed: bool,
+    /// The conversation's id, which `claude --resume` takes.
+    pub conversation: Option<String>,
+    /// What the task has cost so far, in US dollars, as Claude counts it.
+    pub cost_usd: f64,
+    /// How many times Claude has run for it: its prompt, then each
+    /// follow-up.
+    pub runs: u32,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Response {
     Created {
@@ -120,6 +162,8 @@ pub enum Response {
     Screen {
         rows: Vec<String>,
     },
+    /// A task's answer, and what it has come to.
+    Result(TaskResult),
     Done,
     Error {
         message: String,

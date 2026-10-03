@@ -7,7 +7,7 @@ use crate::codex;
 use crate::env;
 use crate::keys;
 use crate::notify;
-use crate::protocol::{self, Conversation, Frame, NewSession, Request, Response};
+use crate::protocol::{self, Conversation, Frame, NewSession, NewTask, Request, Response};
 use crate::session::{STOP_GRACE, Session, Term};
 use crate::socket;
 use crate::state::{self, SavedSession};
@@ -124,13 +124,30 @@ impl Daemon {
     fn start_saved_sessions(&self) {
         let mut sessions = self.sessions.lock().unwrap();
         for saved in state::load(&self.state) {
-            let new = NewSession {
-                name: Some(saved.name.clone()),
-                cwd: saved.cwd,
-                command: saved.command,
-                env: env::current(),
+            let started = match saved.task {
+                // A task comes back at rest: a run it was in the middle of
+                // can't be picked up halfway, so it isn't run again either.
+                Some(spec) => {
+                    let task = NewTask {
+                        name: Some(saved.name.clone()),
+                        cwd: saved.cwd,
+                        spec,
+                        env: env::current(),
+                    };
+                    let conversation = saved.conversation.map(|conversation| conversation.id);
+                    start_task(&mut sessions, &self.socket, task, conversation, false)
+                }
+                None => {
+                    let new = NewSession {
+                        name: Some(saved.name.clone()),
+                        cwd: saved.cwd,
+                        command: saved.command,
+                        env: env::current(),
+                    };
+                    start(&mut sessions, &self.socket, new, saved.conversation)
+                }
             };
-            if let Err(err) = start(&mut sessions, &self.socket, new, saved.conversation) {
+            if let Err(err) = started {
                 eprintln!(
                     "crystal daemon: couldn't start {} again: {err:#}",
                     saved.name
@@ -158,7 +175,7 @@ impl Daemon {
                 .collect();
             for session in sessions.iter_mut() {
                 session.find_conversation(&claimed, &looking);
-                session.check_screen();
+                session.check();
                 if let Some(notice) = session.notice() {
                     notify::tell(notice);
                 }
@@ -191,6 +208,11 @@ impl Daemon {
         })
     }
 
+    fn is_task(&self, name: &str) -> Result<bool> {
+        let mut sessions = self.sessions.lock().unwrap();
+        Ok(named(&mut sessions, name)?.is_task())
+    }
+
     /// The terminal of the session called `name`, to type into, which
     /// only makes sense while its program runs. The sessions are let go
     /// before any typing, which takes a moment.
@@ -205,6 +227,11 @@ impl Daemon {
         match request {
             Request::Attach { .. } => bail!("attach takes over the connection"),
             Request::New(new) => self.new_session(new),
+            Request::NewTask(task) => {
+                let mut sessions = self.sessions.lock().unwrap();
+                let name = start_task(&mut sessions, &self.socket, task, None, true)?;
+                Ok(Response::Created { name })
+            }
             Request::List => {
                 let sessions = self.sessions.lock().unwrap();
                 Ok(Response::Sessions {
@@ -249,6 +276,18 @@ impl Daemon {
             }
             Request::Respawn { name, env } => self.respawn(&name, env),
             Request::Send { name, text, enter } => {
+                // In a block of its own, so the sessions are let go before
+                // the typing below, which takes a moment.
+                {
+                    let mut sessions = self.sessions.lock().unwrap();
+                    let session = named(&mut sessions, &name)?;
+                    // A task takes text as a follow-up: another run that
+                    // carries its conversation on.
+                    if session.is_task() {
+                        session.prompt(&text)?;
+                        return Ok(Response::Done);
+                    }
+                }
                 let term = self.running_term(&name)?;
                 term.write(&typing::keystrokes(&text, term.wants_bracketed_paste()))?;
                 if enter {
@@ -258,12 +297,22 @@ impl Daemon {
                 Ok(Response::Done)
             }
             Request::SendKeys { name, keys } => {
+                ensure!(
+                    !self.is_task(&name)?,
+                    "{name} is a task, which takes no keys: \
+                     `crystal send {name} \"…\"` gives it a follow-up"
+                );
                 let term = self.running_term(&name)?;
                 let application_cursor = term.wants_application_cursor();
                 for key in &keys {
                     term.write(&keys::keystrokes(key, application_cursor))?;
                 }
                 Ok(Response::Done)
+            }
+            Request::Result { name } => {
+                let mut sessions = self.sessions.lock().unwrap();
+                let result = named(&mut sessions, &name)?.result()?;
+                Ok(Response::Result(result))
             }
             Request::Read { name, history } => {
                 let mut sessions = self.sessions.lock().unwrap();
@@ -314,13 +363,30 @@ impl Daemon {
         // that doesn't start.
         let ended = sessions.remove(index);
         let launch = ended.launch();
-        let new = NewSession {
-            name: Some(launch.name),
-            cwd: launch.cwd,
-            command: launch.command,
-            env,
+        let started = match launch.task {
+            // A task runs its prompt again, in its conversation if it had
+            // got as far as one.
+            Some(spec) => {
+                let task = NewTask {
+                    name: Some(launch.name),
+                    cwd: launch.cwd,
+                    spec,
+                    env,
+                };
+                let conversation = launch.conversation.map(|conversation| conversation.id);
+                start_task(&mut sessions, &self.socket, task, conversation, true)
+            }
+            None => {
+                let new = NewSession {
+                    name: Some(launch.name),
+                    cwd: launch.cwd,
+                    command: launch.command,
+                    env,
+                };
+                start(&mut sessions, &self.socket, new, launch.conversation)
+            }
         };
-        if let Err(err) = start(&mut sessions, &self.socket, new, launch.conversation) {
+        if let Err(err) = started {
             sessions.insert(index, ended);
             return Err(err);
         }
@@ -388,6 +454,48 @@ fn start(
                 session.look_for_conversation_in(rollouts);
             }
         }
+    }
+    sessions.push(session);
+    Ok(name)
+}
+
+/// Starts a task and adds it to `sessions`. With `run_prompt`, Claude runs
+/// its prompt now; without, the task waits at rest for a follow-up. Given a
+/// `conversation`, its runs carry that on.
+fn start_task(
+    sessions: &mut Vec<Session>,
+    socket: &Path,
+    task: NewTask,
+    conversation: Option<String>,
+    run_prompt: bool,
+) -> Result<String> {
+    let NewTask {
+        name,
+        cwd,
+        spec,
+        env,
+    } = task;
+    ensure!(
+        exists("claude", &cwd, env.get("PATH")),
+        "command not found: claude"
+    );
+    let taken = |name: &str| sessions.iter().any(|session| session.name == name);
+    let name = match name {
+        Some(name) => {
+            check_name(&name, taken)?;
+            name
+        }
+        None => unique_name("task", taken),
+    };
+
+    let id = new_id();
+    let env = env::for_session(&env, &name, &id, socket);
+    let prompt = spec.prompt.clone();
+    let mut session = Session::task(id, name.clone(), spec, cwd, env, conversation);
+    if run_prompt {
+        session.prompt(&prompt)?;
+    } else {
+        session.came_back();
     }
     sessions.push(session);
     Ok(name)

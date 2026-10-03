@@ -1,13 +1,17 @@
-//! A program running in a PTY of its own.
+//! A program running in a PTY of its own, or a task: Claude Code run
+//! without a terminal.
 
 use crate::agent_screen::{self, Looks, ScreenWatch};
 use crate::codex::Rollouts;
 use crate::git::Checkout;
 use crate::history::{self, HISTORY_LINES, HistoryKeeper};
 use crate::notify::{self, Notice};
-use crate::protocol::{Activity, AgentEvent, Conversation, SessionInfo, State};
+use crate::protocol::{
+    Activity, AgentEvent, Conversation, SessionInfo, State, TaskResult, TaskSpec,
+};
 use crate::state::SavedSession;
-use anyhow::Result;
+use crate::task::Task;
+use anyhow::{Context, Result, ensure};
 use portable_pty::{CommandBuilder, ExitStatus, MasterPty, PtySize, native_pty_system};
 use std::collections::BTreeMap;
 use std::io::{self, ErrorKind, Read, Write};
@@ -54,6 +58,9 @@ pub struct Session {
     /// What the user was last told about the session, while it still
     /// holds: it waits on them, or it's done.
     told: Option<Activity>,
+    /// `Some` for a task, whose screen shows what Claude does in its runs
+    /// rather than a program in a PTY.
+    task: Option<Task>,
     term: Arc<Term>,
 }
 
@@ -83,21 +90,10 @@ impl Session {
         drop(pty.slave);
 
         let output = pty.master.try_clone_reader()?;
-        let term = Arc::new(Term {
+        let term = Arc::new(Term::new(Some(Pty {
             input: Mutex::new(pty.master.take_writer()?),
-            pty: Mutex::new(pty.master),
-            screen: Mutex::new(Screen {
-                parser: vt100::Parser::new_with_callbacks(
-                    24,
-                    80,
-                    HISTORY_LINES,
-                    Callbacks::default(),
-                ),
-                history: HistoryKeeper::default(),
-                viewers: Vec::new(),
-                ended: false,
-            }),
-        });
+            master: Mutex::new(pty.master),
+        })));
         thread::spawn({
             let term = term.clone();
             move || term.pump(output)
@@ -133,8 +129,92 @@ impl Session {
             rollouts: None,
             told: None,
             screen_watch: ScreenWatch::default(),
+            task: None,
             term,
         })
+    }
+
+    /// Makes a task: a session for `claude -p` runs of `spec`, whose screen
+    /// shows what Claude does. It starts at rest; [`Session::prompt`] gives
+    /// it its prompt. Given a `conversation`, its runs carry it on.
+    pub fn task(
+        id: String,
+        name: String,
+        spec: TaskSpec,
+        cwd: PathBuf,
+        env: BTreeMap<String, String>,
+        conversation: Option<String>,
+    ) -> Session {
+        let term = Arc::new(Term::without_terminal());
+        let state = Arc::new(Mutex::new(State::Running));
+        let command = task_command(&spec);
+        let task = Task::new(
+            spec,
+            cwd.clone(),
+            env,
+            term.clone(),
+            state.clone(),
+            conversation,
+        );
+        Session {
+            name,
+            id,
+            command,
+            checkout: Checkout::find(&cwd),
+            cwd,
+            pid: None,
+            state,
+            activity: None,
+            changed: Arc::new(Mutex::new(SystemTime::now())),
+            conversation: None,
+            rollouts: None,
+            told: None,
+            screen_watch: ScreenWatch::default(),
+            task: Some(task),
+            term,
+        }
+    }
+
+    pub fn is_task(&self) -> bool {
+        self.task.is_some()
+    }
+
+    /// Gives a task a prompt to run: its own to start with, then
+    /// follow-ups, which carry its conversation on.
+    pub fn prompt(&self, text: &str) -> Result<()> {
+        let task = self
+            .task
+            .as_ref()
+            .with_context(|| format!("{} isn't a task", self.name))?;
+        ensure!(self.is_running(), "{} has ended", self.name);
+        task.run(text)
+    }
+
+    /// A task's last answer, and what it has come to.
+    pub fn result(&self) -> Result<TaskResult> {
+        let name = &self.name;
+        let task = self
+            .task
+            .as_ref()
+            .with_context(|| format!("{name} isn't a task"))?;
+        ensure!(
+            task.pid().is_none(),
+            "{name} is still working: `crystal wait {name}` for it first"
+        );
+        task.result()
+            .with_context(|| format!("{name} has no answer yet"))
+    }
+
+    /// A task started again after a restart: it says so, and waits at rest
+    /// for a follow-up, which carries its conversation on.
+    pub fn came_back(&mut self) {
+        if let Some(task) = &self.task {
+            task.note(
+                "crystal restarted, and what this task showed before is gone. \
+                 `crystal send` carries its conversation on.",
+            );
+            self.on_agent_event(AgentEvent::Started);
+        }
     }
 
     pub fn is_running(&self) -> bool {
@@ -147,7 +227,7 @@ impl Session {
             id: self.id.clone(),
             command: self.command.clone(),
             cwd: self.cwd.clone(),
-            pid: self.pid,
+            pid: self.task.as_ref().map_or(self.pid, Task::pid),
             state: self.state.lock().unwrap().clone(),
             activity: self.activity,
             worktree: self.checkout.as_ref().map(Checkout::worktree),
@@ -164,9 +244,21 @@ impl Session {
         }
     }
 
+    /// Keeps up with what the session's agent is doing: a task's from its
+    /// runs, any other program's from its screen.
+    pub fn check(&mut self) {
+        let Some(task) = &mut self.task else {
+            return self.check_screen();
+        };
+        let events = task.events();
+        for event in events {
+            self.on_agent_event(event);
+        }
+    }
+
     /// Reads what the agent is doing off the screen, and takes it as an
     /// event when that has changed.
-    pub fn check_screen(&mut self) {
+    fn check_screen(&mut self) {
         if !self.is_running() {
             return;
         }
@@ -251,11 +343,21 @@ impl Session {
     /// What it takes to start the session's program again: its name,
     /// command and directory, and the agent's conversation to pick up.
     pub fn launch(&self) -> SavedSession {
+        // A task's conversation comes from Claude's own events, which need
+        // no transcript file to resume it.
+        let conversation = match &self.task {
+            Some(task) => task.conversation().map(|id| Conversation {
+                id,
+                transcript: None,
+            }),
+            None => self.conversation.clone(),
+        };
         SavedSession {
             name: self.name.clone(),
             command: self.command.clone(),
             cwd: self.cwd.clone(),
-            conversation: self.conversation.clone(),
+            conversation,
+            task: self.task.as_ref().map(|task| task.spec().clone()),
         }
     }
 
@@ -274,6 +376,9 @@ impl Session {
     /// terminal window does, and kills whatever is still there after
     /// [`STOP_GRACE`].
     pub fn stop(&self) {
+        if let Some(task) = &self.task {
+            return task.stop();
+        }
         let Some(pid) = self.pid.filter(|_| self.is_running()) else {
             return;
         };
@@ -291,9 +396,17 @@ impl Session {
 /// The daemon's end of a session's PTY: the screen the program has drawn,
 /// the clients watching it, and the way in.
 pub struct Term {
-    pty: Mutex<Box<dyn MasterPty + Send>>,
-    input: Mutex<Box<dyn Write + Send>>,
+    /// `None` for a task, which has no terminal: crystal draws what Claude
+    /// does on the screen itself.
+    pty: Option<Pty>,
     screen: Mutex<Screen>,
+}
+
+/// The daemon's side of a PTY: how the program's terminal is sized, and
+/// the way in.
+struct Pty {
+    master: Mutex<Box<dyn MasterPty + Send>>,
+    input: Mutex<Box<dyn Write + Send>>,
 }
 
 struct Screen {
@@ -321,6 +434,26 @@ pub struct Watch {
 }
 
 impl Term {
+    /// A screen of 24 rows by 80 columns, until a viewer gives it another
+    /// size.
+    fn new(pty: Option<Pty>) -> Term {
+        let parser = vt100::Parser::new_with_callbacks(24, 80, HISTORY_LINES, Callbacks::default());
+        Term {
+            pty,
+            screen: Mutex::new(Screen {
+                parser,
+                history: HistoryKeeper::default(),
+                viewers: Vec::new(),
+                ended: false,
+            }),
+        }
+    }
+
+    /// A screen with no program behind it, for a task to draw on.
+    pub fn without_terminal() -> Term {
+        Term::new(None)
+    }
+
     /// Starts showing the session to a new viewer. With `with_history`, the
     /// viewer's screen gets the history too, so that it can scroll back
     /// through output from before it came.
@@ -395,7 +528,10 @@ impl Term {
     }
 
     pub fn write(&self, bytes: &[u8]) -> io::Result<()> {
-        self.input.lock().unwrap().write_all(bytes)
+        match &self.pty {
+            Some(pty) => pty.input.lock().unwrap().write_all(bytes),
+            None => Err(io::Error::other("a task takes no keys")),
+        }
     }
 
     pub fn resize(&self, rows: u16, cols: u16) -> Result<()> {
@@ -403,11 +539,27 @@ impl Term {
         let (old_rows, _) = screen.parser.screen().size();
         screen.history.resize(old_rows, rows);
         screen.parser.screen_mut().set_size(rows, cols);
-        self.pty.lock().unwrap().resize(size(rows, cols))
+        if let Some(pty) = &self.pty {
+            pty.master.lock().unwrap().resize(size(rows, cols))?;
+        }
+        Ok(())
     }
 
-    /// Reads the program's output until it closes the terminal: keeps the
-    /// screen up to date, passes the output on to every viewer, and answers
+    /// Draws `output` on the screen as if a program had written it: how a
+    /// task shows what Claude does.
+    pub fn show(&self, output: &[u8]) {
+        self.take_output(output);
+    }
+
+    /// Says there will be no more output: viewers see the end, and new ones
+    /// get the last screen and nothing after it.
+    pub fn close(&self) {
+        let mut screen = self.screen.lock().unwrap();
+        screen.ended = true;
+        screen.viewers.clear();
+    }
+
+    /// Reads the program's output until it closes the terminal, and answers
     /// the program's questions to its terminal.
     fn pump(&self, mut output: Box<dyn Read + Send>) {
         let mut buf = [0; 16 * 1024];
@@ -418,26 +570,28 @@ impl Term {
                 Err(err) if err.kind() == ErrorKind::Interrupted => continue,
                 Err(_) => break,
             };
-            let replies = {
-                let mut guard = self.screen.lock().unwrap();
-                let screen = &mut *guard;
-                // Viewers get what the screen was fed, so that their own
-                // screens keep the same history.
-                let chunk: Arc<[u8]> = screen.history.feed(&mut screen.parser, &buf[..n]).into();
-                // A viewer that's gone, or too far behind to catch up, is
-                // dropped rather than holding up the program.
-                screen
-                    .viewers
-                    .retain(|viewer| viewer.feed.try_send(chunk.clone()).is_ok());
-                std::mem::take(&mut screen.parser.callbacks_mut().replies)
-            };
+            let replies = self.take_output(&buf[..n]);
             if !replies.is_empty() {
                 let _ = self.write(&replies);
             }
         }
-        let mut screen = self.screen.lock().unwrap();
-        screen.ended = true;
-        screen.viewers.clear();
+        self.close();
+    }
+
+    /// Keeps the screen up to date with `output` and passes it on to every
+    /// viewer. Returns what the program asked its terminal, to answer.
+    fn take_output(&self, output: &[u8]) -> Vec<u8> {
+        let mut guard = self.screen.lock().unwrap();
+        let screen = &mut *guard;
+        // Viewers get what the screen was fed, so that their own screens
+        // keep the same history.
+        let chunk: Arc<[u8]> = screen.history.feed(&mut screen.parser, output).into();
+        // A viewer that's gone, or too far behind to catch up, is dropped
+        // rather than holding up the program.
+        screen
+            .viewers
+            .retain(|viewer| viewer.feed.try_send(chunk.clone()).is_ok());
+        std::mem::take(&mut screen.parser.callbacks_mut().replies)
     }
 }
 
@@ -512,6 +666,14 @@ fn next_activity(before: Option<Activity>, event: AgentEvent, watched: bool) -> 
     }
 }
 
+/// How `ls` shows a task's command: the `claude -p` it runs, with its own
+/// arguments after the prompt.
+fn task_command(spec: &TaskSpec) -> Vec<String> {
+    let mut command = vec!["claude".to_string(), "-p".to_string(), spec.prompt.clone()];
+    command.extend(spec.args.iter().cloned());
+    command
+}
+
 fn size(rows: u16, cols: u16) -> PtySize {
     PtySize {
         rows,
@@ -535,7 +697,7 @@ fn ended(status: &ExitStatus) -> State {
 
 /// The child leads its own session and process group, so signalling the
 /// group reaches whatever it started too.
-fn signal_group(pid: u32, signal: libc::c_int) {
+pub fn signal_group(pid: u32, signal: libc::c_int) {
     // SAFETY: kill only sends a signal. The caller has checked the child
     // hasn't been reaped yet, so the group id still belongs to it.
     unsafe {

@@ -2744,3 +2744,275 @@ fn two_codex_sessions_in_one_directory_each_find_their_own_conversation() {
     assert_eq!(conversation_of("first"), "first-thread");
     assert_eq!(conversation_of("second"), "second-thread");
 }
+
+/// A stand-in for `claude -p`. Each run notes its arguments in `runs`, one
+/// line each, then writes what a short run of Claude writes as stream-json:
+/// the conversation, some text, a tool and its answer. It waits for the
+/// test to make `finish-<run>` before its answer and result. With
+/// `FAKE_FAIL` set its result says it failed; with `FAKE_CRASH` it writes an
+/// error and exits before saying anything. Returns the directory to put on
+/// the PATH.
+fn print_claude(dir: &Path) -> PathBuf {
+    let bin = dir.join("print-bin");
+    std::fs::create_dir(&bin).unwrap();
+    let claude = bin.join("claude");
+    let script = r#"#!/bin/sh
+echo "$*" >> runs
+run=$(wc -l < runs | tr -d ' ')
+if [ -n "$FAKE_CRASH" ]; then
+    echo 'Error: Invalid API key' >&2
+    exit 1
+fi
+echo '{"type":"system","subtype":"init","session_id":"conv-1","cwd":"/x","model":"m"}'
+echo '{"type":"assistant","parent_tool_use_id":null,"message":{"content":[{"type":"text","text":"Looking at the tests."},{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"cargo test"}}]}}'
+echo '{"type":"user","parent_tool_use_id":null,"message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"test result: ok. 3 passed","is_error":false}]}}'
+while [ ! -e "finish-$run" ]; do sleep 0.05; done
+echo '{"type":"assistant","parent_tool_use_id":null,"message":{"content":[{"type":"text","text":"All green on run '"$run"'."}]}}'
+if [ -n "$FAKE_FAIL" ]; then
+    echo '{"type":"result","subtype":"error_max_turns","is_error":true,"session_id":"conv-1","total_cost_usd":0.01,"duration_ms":900}'
+    exit 1
+fi
+echo '{"type":"result","subtype":"success","is_error":false,"result":"All green on run '"$run"'.","session_id":"conv-1","total_cost_usd":0.0421,"duration_ms":3200,"permission_denials":[{"tool_name":"Bash","tool_use_id":"t9","tool_input":{"command":"rm -rf build"}}]}'
+"#;
+    std::fs::write(&claude, script).unwrap();
+    let mut permissions = std::fs::metadata(&claude).unwrap().permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+    std::fs::set_permissions(&claude, permissions).unwrap();
+    bin
+}
+
+/// The PATH, with `bin` ahead of the rest.
+fn path_with(bin: &Path) -> String {
+    format!("{}:{}", bin.display(), std::env::var("PATH").unwrap())
+}
+
+/// The arguments of each `claude -p` run so far, once there are `count`.
+fn runs(dir: &Path, count: usize) -> Vec<String> {
+    let file = dir.join("runs");
+    eventually(&format!("claude has run {count} times"), || {
+        std::fs::read_to_string(&file).is_ok_and(|runs| runs.lines().count() == count)
+    });
+    let runs = std::fs::read_to_string(&file).unwrap();
+    runs.lines().map(String::from).collect()
+}
+
+fn finish_run(dir: &Path, run: usize) {
+    std::fs::write(dir.join(format!("finish-{run}")), "").unwrap();
+}
+
+fn status(crystal: &Crystal, name: &str) -> String {
+    crystal.row(name).unwrap()[1].clone()
+}
+
+#[test]
+fn a_task_runs_claude_without_a_terminal_and_shows_what_it_did() {
+    let crystal = Crystal::new();
+    let dir = crystal.dir.path();
+    let path = path_with(&print_claude(dir));
+    let out = crystal
+        .command(&["task", "-n", "fixer", "fix", "the", "tests"])
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "fixer\n");
+
+    // Claude was asked for its events, with the prompt behind `--`.
+    assert_eq!(
+        runs(dir, 1),
+        ["-p --output-format stream-json --verbose -- fix the tests"]
+    );
+    eventually("the task is working", || {
+        status(&crystal, "fixer") == "working"
+    });
+    shows_on_screen(&crystal, "fixer", "> fix the tests");
+    shows_on_screen(&crystal, "fixer", "▸ Bash cargo test");
+    shows_on_screen(&crystal, "fixer", "└ test result: ok. 3 passed");
+
+    finish_run(dir, 1);
+    eventually("the task is done", || status(&crystal, "fixer") == "done");
+    shows_on_screen(&crystal, "fixer", "All green on run 1.");
+    shows_on_screen(&crystal, "fixer", "✓ done");
+    shows_on_screen(&crystal, "fixer", "$0.04");
+    shows_on_screen(&crystal, "fixer", "refused: Bash rm -rf build");
+    assert_eq!(
+        crystal.row("fixer").unwrap()[6],
+        "claude -p 'fix the tests'"
+    );
+
+    assert_eq!(crystal.ok(&["result", "fixer"]), "All green on run 1.\n");
+    let result: serde_json::Value =
+        serde_json::from_str(&crystal.ok(&["result", "fixer", "--json"])).unwrap();
+    assert_eq!(result["failed"], false);
+    assert_eq!(result["conversation"], "conv-1");
+    assert_eq!(result["cost_usd"], 0.0421);
+    assert_eq!(result["runs"], 1);
+}
+
+#[test]
+fn a_follow_up_carries_the_conversation_on_one_run_at_a_time() {
+    let crystal = Crystal::new();
+    let dir = crystal.dir.path();
+    let path = path_with(&print_claude(dir));
+    let start = crystal
+        .command(&[
+            "task",
+            "-n",
+            "fixer",
+            "fix the tests",
+            "--",
+            "--model",
+            "opus",
+        ])
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert!(start.status.success());
+    finish_run(dir, 1);
+    eventually("the task is done", || status(&crystal, "fixer") == "done");
+
+    crystal.ok(&["send", "fixer", "now", "the", "docs"]);
+    let runs = runs(dir, 2);
+    assert_eq!(
+        runs[1],
+        "-p --output-format stream-json --verbose --resume conv-1 --model opus -- now the docs"
+    );
+    eventually("the follow-up is working", || {
+        status(&crystal, "fixer") == "working"
+    });
+    let busy = crystal.fails(&["send", "fixer", "and the changelog"]);
+    assert!(busy.contains("still working"), "{busy}");
+    assert!(
+        crystal
+            .fails(&["result", "fixer"])
+            .contains("still working")
+    );
+    let keys = crystal.fails(&["send-keys", "fixer", "Enter"]);
+    assert!(keys.contains("takes no keys"), "{keys}");
+
+    finish_run(dir, 2);
+    eventually("the follow-up is done", || {
+        status(&crystal, "fixer") == "done"
+    });
+    shows_on_screen(&crystal, "fixer", "> now the docs");
+    assert_eq!(crystal.ok(&["result", "fixer"]), "All green on run 2.\n");
+}
+
+#[test]
+fn task_wait_waits_for_the_run_and_says_how_it_ended() {
+    let crystal = Crystal::new();
+    let dir = crystal.dir.path();
+    let path = path_with(&print_claude(dir));
+    finish_run(dir, 1);
+    let out = crystal
+        .command(&["task", "--wait", "-n", "quick", "fix the tests"])
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "quick\ndone\n");
+}
+
+#[test]
+fn a_task_whose_run_fails_ends_and_says_why() {
+    let crystal = Crystal::new();
+    let path = path_with(&print_claude(crystal.dir.path()));
+    let start = |name: &str, fault: &str| {
+        let dir = crystal.dir.path().join(name);
+        std::fs::create_dir(&dir).unwrap();
+        let out = crystal
+            .command(&[
+                "task",
+                "-n",
+                name,
+                "-c",
+                dir.to_str().unwrap(),
+                "fix the tests",
+            ])
+            .env("PATH", &path)
+            .env(fault, "1")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        dir
+    };
+
+    // Claude says the run failed.
+    let failing = start("failing", "FAKE_FAIL");
+    finish_run(&failing, 1);
+    eventually("the task has ended", || {
+        status(&crystal, "failing") == "exited 1"
+    });
+    shows_on_screen(&crystal, "failing", "✗ failed · error max turns");
+    let result: serde_json::Value =
+        serde_json::from_str(&crystal.ok(&["result", "failing", "--json"])).unwrap();
+    assert_eq!(result["failed"], true);
+
+    // Claude crashes before it says anything.
+    start("crashing", "FAKE_CRASH");
+    eventually("the task has ended", || {
+        status(&crystal, "crashing") == "exited 1"
+    });
+    shows_on_screen(&crystal, "crashing", "Error: Invalid API key");
+    assert_eq!(
+        crystal.ok(&["result", "crashing"]),
+        "Error: Invalid API key\n"
+    );
+    assert!(
+        crystal
+            .fails(&["send", "crashing", "again"])
+            .contains("has ended")
+    );
+}
+
+#[test]
+fn a_task_comes_back_at_rest_after_a_restart_and_carries_its_conversation_on() {
+    let crystal = Crystal::new();
+    let dir = crystal.dir.path();
+    let path = path_with(&print_claude(dir));
+    let daemon = crystal.start_daemon();
+    let out = crystal
+        .command(&["task", "-n", "fixer", "fix the tests"])
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    finish_run(dir, 1);
+    eventually("the task is done", || status(&crystal, "fixer") == "done");
+    eventually("its conversation is saved", || {
+        crystal.saved().contains("conv-1")
+    });
+
+    crash(daemon);
+    // The next command starts a daemon, which brings the task back at rest
+    // rather than running its prompt again.
+    let out = crystal
+        .command(&["new", "-n", "other", "sleep", "30"])
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    eventually("the task is back", || {
+        crystal.row("fixer").is_some_and(|row| row[1] == "idle")
+    });
+    shows_on_screen(&crystal, "fixer", "crystal restarted");
+    assert_eq!(runs(dir, 1).len(), 1);
+
+    crystal.ok(&["send", "fixer", "carry on"]);
+    assert_eq!(
+        runs(dir, 2)[1],
+        "-p --output-format stream-json --verbose --resume conv-1 -- carry on"
+    );
+}

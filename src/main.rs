@@ -19,13 +19,15 @@ mod shell;
 mod skill;
 mod socket;
 mod state;
+mod task;
+mod transcript;
 mod tui;
 mod typing;
 mod viewer;
 
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
-use protocol::{Request, Response, SessionInfo, State};
+use protocol::{Request, Response, SessionInfo, State, TaskSpec};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -71,6 +73,49 @@ enum Command {
         /// The command and its arguments.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
+    },
+    /// Start a task: Claude Code runs a prompt without a terminal (`claude
+    /// -p`), in the background. Its transcript shows like any session's, and
+    /// `crystal send` gives it follow-ups. Prints the task's name.
+    Task {
+        /// The task's name [default: task, task-2…]
+        #[arg(short, long)]
+        name: Option<String>,
+
+        /// The directory to start in [default: the current one]
+        #[arg(short = 'c', long)]
+        cwd: Option<PathBuf>,
+
+        /// Start in a new git worktree on this branch, as `new -w` does.
+        #[arg(short, long, value_name = "BRANCH")]
+        worktree: Option<String>,
+
+        /// Then wait for the run to end, and print how it ended.
+        #[arg(long)]
+        wait: bool,
+
+        /// With --wait, give up after this many seconds.
+        #[arg(long, value_name = "SECONDS", requires = "wait")]
+        timeout: Option<f64>,
+
+        /// The prompt. Several words are joined with spaces.
+        #[arg(required = true)]
+        prompt: Vec<String>,
+
+        /// Arguments for each `claude -p` the task runs, after `--`: for
+        /// example `-- --permission-mode acceptEdits`.
+        #[arg(last = true, value_name = "CLAUDE ARGS")]
+        claude_args: Vec<String>,
+    },
+    /// Print a task's answer: what Claude said at the end of its last run.
+    Result {
+        name: String,
+
+        /// Everything the task has come to, as JSON: the answer, whether the
+        /// run failed, the conversation's id, the cost so far and how many
+        /// runs it has had.
+        #[arg(long)]
+        json: bool,
     },
     /// Work with git worktrees.
     Worktree {
@@ -234,6 +279,27 @@ fn run(cli: Cli) -> Result<()> {
             worktree,
             command,
         } => new_session(&socket, name, cwd, worktree, detached, command)?,
+        Command::Task {
+            name,
+            cwd,
+            worktree,
+            wait,
+            timeout,
+            prompt,
+            claude_args,
+        } => {
+            let spec = TaskSpec {
+                prompt: prompt.join(" "),
+                args: claude_args,
+            };
+            let cwd = start_dir(cwd, worktree)?;
+            let name = client::new_task(&socket, name, cwd, spec)?;
+            println!("{name}");
+            if wait {
+                drive::wait_for_turn(&socket, &name, seconds(timeout))?;
+            }
+        }
+        Command::Result { name, json } => drive::result(&socket, &name, json)?,
         Command::Worktree {
             command: WorktreeCommand::Rm { worktree },
         } => remove_worktree(&socket, &worktree)?,
@@ -346,13 +412,7 @@ fn new_session(
     detached: bool,
     command: Vec<String>,
 ) -> Result<()> {
-    let mut cwd = match cwd {
-        Some(cwd) => std::path::absolute(cwd)?,
-        None => std::env::current_dir()?,
-    };
-    if let Some(branch) = worktree {
-        cwd = git::add_worktree(&cwd, &branch)?;
-    }
+    let cwd = start_dir(cwd, worktree)?;
     let name = client::new_session(socket, name, cwd, command)?;
 
     let in_a_terminal = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
@@ -361,6 +421,19 @@ fn new_session(
     } else {
         println!("{name}");
         Ok(())
+    }
+}
+
+/// Where a new session or task starts: `cwd`, or the current directory,
+/// or else a new worktree on the branch `worktree` made from there.
+fn start_dir(cwd: Option<PathBuf>, worktree: Option<String>) -> Result<PathBuf> {
+    let cwd = match cwd {
+        Some(cwd) => std::path::absolute(cwd)?,
+        None => std::env::current_dir()?,
+    };
+    match worktree {
+        Some(branch) => git::add_worktree(&cwd, &branch),
+        None => Ok(cwd),
     }
 }
 
