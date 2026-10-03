@@ -165,6 +165,7 @@ mod tests {
             branch: Some(branch.into()),
         });
         SessionInfo {
+            front: None,
             name: name.into(),
             id: name.into(),
             command: vec!["sh".into()],

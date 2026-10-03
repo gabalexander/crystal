@@ -8,6 +8,7 @@ mod config;
 mod daemon;
 mod drive;
 mod env;
+mod front;
 mod git;
 mod github;
 mod history;
@@ -630,7 +631,7 @@ fn print_sessions(sessions: &[SessionInfo]) {
     if sessions.is_empty() {
         return;
     }
-    let rows: Vec<[String; 7]> = sessions
+    let rows: Vec<[String; 8]> = sessions
         .iter()
         .map(|session| {
             let (project, branch) = project_and_branch(session);
@@ -641,6 +642,10 @@ fn print_sessions(sessions: &[SessionInfo]) {
                 project,
                 branch,
                 shell::home_relative(&session.cwd),
+                session
+                    .front
+                    .as_ref()
+                    .map_or("-".into(), |front| front.word().to_string()),
                 session
                     .command
                     .iter()
@@ -657,6 +662,7 @@ fn print_sessions(sessions: &[SessionInfo]) {
         "PROJECT",
         "BRANCH",
         "DIRECTORY",
+        "PROGRAM",
         "COMMAND",
     ];
     print_table(header, &rows);

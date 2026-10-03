@@ -777,6 +777,7 @@ mod tests {
 
     fn session(name: &str, state: State) -> SessionInfo {
         SessionInfo {
+            front: None,
             name: name.into(),
             id: name.into(),
             command: vec!["sh".into()],
@@ -791,6 +792,7 @@ mod tests {
 
     fn in_worktree(name: &str, branch: &str, main: bool) -> SessionInfo {
         SessionInfo {
+            front: None,
             worktree: Some(Worktree {
                 project: "app".into(),
                 project_path: PathBuf::from("/code/app"),

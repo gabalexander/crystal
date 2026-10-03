@@ -328,7 +328,7 @@ fn new_starts_the_daemon_and_the_session_shows_in_ls() {
 
     let row = crystal.row("agent").unwrap();
     assert_eq!(row[1], "running");
-    assert_eq!(row[6], "sleep 30");
+    assert_eq!(row[7], "sleep 30");
     assert!(alive(crystal.pid("agent")));
 }
 
@@ -354,7 +354,7 @@ fn ls_shows_how_a_session_ended() {
         crystal.row("fails").unwrap()[1] == "exited 3"
             && crystal.row("killed").unwrap()[1] == "killed (Terminated)"
     });
-    assert_eq!(crystal.row("fails").unwrap()[6], "sh -c 'exit 3'");
+    assert_eq!(crystal.row("fails").unwrap()[7], "sh -c 'exit 3'");
 }
 
 #[test]
@@ -1223,7 +1223,7 @@ fn claude_reports_what_it_is_doing_through_its_hooks() {
         .output()
         .unwrap();
     assert!(out.status.success());
-    assert_eq!(crystal.row("agent").unwrap()[6], "claude --resume");
+    assert_eq!(crystal.row("agent").unwrap()[7], "claude --resume");
 
     // crystal added its hooks ahead of the arguments it was given.
     let args = written(&crystal.dir.path().join("args"));
@@ -1279,6 +1279,25 @@ fn a_hook_outside_a_session_does_nothing_quietly() {
     assert!(!crystal.socket.exists(), "a hook never starts the daemon");
 }
 
+impl Crystal {
+    /// Starts a pretend agent: `body` as a shell script on the PATH under
+    /// the name of an agent crystal knows, so that crystal takes it for an
+    /// agent and reads its screen. A plain `sh -c` would be a shell, whose
+    /// screen says nothing about what an agent is doing.
+    fn new_pretend_agent(&self, name: &str, body: &str) {
+        let bin = self.dir.path().join("pretend-bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        script(&bin.join("aider"), body);
+        let out = self
+            .command(&["new", "-n", name, "aider"])
+            .env("PATH", path_of(&[&bin]))
+            .output()
+            .unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{err}");
+    }
+}
+
 #[test]
 fn the_screen_says_what_an_agent_without_hooks_is_doing() {
     let crystal = Crystal::new();
@@ -1293,7 +1312,7 @@ fn the_screen_says_what_an_agent_without_hooks_is_doing() {
         wait_for rest; printf '\r\033[2K> '
         sleep 30
     "#;
-    crystal.ok(&["new", "-n", "agent", "sh", "-c", script]);
+    crystal.new_pretend_agent("agent", script);
     let status = || crystal.row("agent").unwrap()[1].clone();
     assert_eq!(status(), "running");
 
@@ -1774,7 +1793,7 @@ fn send_wait_waits_for_the_turn_it_started() {
             echo "answer to $line"
         done
     "#;
-    crystal.ok(&["new", "-n", "agent", "sh", "-c", script]);
+    crystal.new_pretend_agent("agent", script);
 
     assert_eq!(crystal.ok(&["send", "agent", "first", "--wait"]), "done\n");
     assert!(crystal.ok(&["read", "agent"]).contains("answer to first"));
@@ -2189,7 +2208,7 @@ fn lines_in(file: &Path) -> Vec<String> {
 fn the_user_is_told_once_each_time_a_session_comes_to_need_them() {
     let crystal = Crystal::new();
     let notices = crystal.notices_to_file();
-    crystal.ok(&["new", "-n", "agent", "sh", "-c", ASKING_AGENT]);
+    crystal.new_pretend_agent("agent", ASKING_AGENT);
 
     std::fs::write(crystal.dir.path().join("ask"), "").unwrap();
     eventually("the user is told it's waiting", || {
@@ -2210,7 +2229,7 @@ fn the_user_is_told_once_each_time_a_session_comes_to_need_them() {
 fn nobody_is_told_about_a_session_someone_is_watching() {
     let crystal = Crystal::new();
     let notices = crystal.notices_to_file();
-    crystal.ok(&["new", "-n", "agent", "sh", "-c", ASKING_AGENT]);
+    crystal.new_pretend_agent("agent", ASKING_AGENT);
 
     let mut terminal = crystal.attach(&["attach", "agent"]);
     std::fs::write(crystal.dir.path().join("ask"), "").unwrap();
@@ -3373,7 +3392,7 @@ fn a_task_runs_claude_without_a_terminal_and_shows_what_it_did() {
     shows_on_screen(&crystal, "fixer", "$0.04");
     shows_on_screen(&crystal, "fixer", "refused: Bash rm -rf build");
     assert_eq!(
-        crystal.row("fixer").unwrap()[6],
+        crystal.row("fixer").unwrap()[7],
         "claude -p 'fix the tests'"
     );
 
@@ -3888,4 +3907,65 @@ fn p_finds_a_file_and_opens_it_in_the_editor() {
     tui.type_keys("\r");
     assert_eq!(written(&edited), "refund.rs\n");
     tui.shows("typing into refund.rs");
+}
+
+#[test]
+fn what_is_in_front_follows_a_shell_and_the_agent_it_runs() {
+    let crystal = Crystal::new();
+    // A pretend Claude Code that stays in front until the test creates
+    // `quit`.
+    let bin = crystal.dir.path().join("agent-bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    script(
+        &bin.join("claude"),
+        "echo pretend claude; while [ ! -e quit ]; do sleep 0.05; done\n",
+    );
+    let out = crystal
+        .command(&["new", "-n", "box", "sh"])
+        .env("PATH", path_of(&[&bin]))
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let program = || crystal.row("box").map(|row| row[6].clone());
+    eventually("the shell is in front", || {
+        program().as_deref() == Some("sh")
+    });
+
+    crystal.ok(&["send", "box", "claude"]);
+    eventually("claude is in front", || {
+        program().as_deref() == Some("claude")
+    });
+    let json = crystal.ok(&["ls", "--json"]);
+    assert!(json.contains(r#""kind": "agent""#), "{json}");
+    assert!(json.contains(r#""name": "Claude Code""#), "{json}");
+
+    // What Claude says it's doing holds while it's in front…
+    let hook = format!("{CRYSTAL} hook claude");
+    run_hook(
+        &crystal,
+        "box",
+        &hook,
+        r#"{"hook_event_name":"UserPromptSubmit"}"#,
+    );
+    assert_eq!(crystal.row("box").unwrap()[1], "working");
+
+    // …and goes with it when the shell is back in front.
+    std::fs::write(crystal.dir.path().join("quit"), "").unwrap();
+    eventually("the shell is back in front", || {
+        program().as_deref() == Some("sh")
+    });
+    assert_eq!(crystal.row("box").unwrap()[1], "running");
+}
+
+#[test]
+fn a_shell_never_looks_like_an_agent_whatever_it_prints() {
+    let crystal = Crystal::new();
+    // What an agent draws while it waits on the user, printed by a shell.
+    let script = "printf 'Do you want to proceed?'; sleep 30";
+    crystal.ok(&["new", "-n", "plain", "sh", "-c", script]);
+    eventually("the shell is in front", || {
+        crystal.row("plain").map(|row| row[6].clone()).as_deref() == Some("sh")
+    });
+    thread::sleep(Duration::from_millis(800));
+    assert_eq!(crystal.row("plain").unwrap()[1], "running");
 }

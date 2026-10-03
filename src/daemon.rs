@@ -176,6 +176,7 @@ impl Daemon {
                 .collect();
             for session in sessions.iter_mut() {
                 session.find_conversation(&claimed, &looking);
+                session.check_front();
                 session.check();
                 if let Some(notice) = session.notice() {
                     notify::tell(notice);

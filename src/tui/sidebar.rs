@@ -7,7 +7,7 @@ use super::status::Status;
 use super::theme::Theme;
 use super::ui::Look;
 use crate::github::{PullRequest, PullRequestState};
-use crate::protocol::SessionInfo;
+use crate::protocol::{Front, SessionInfo};
 use crate::shell;
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -193,9 +193,10 @@ fn heading<'a>(name: &str, style: Style, look: &Look, width: u16) -> Line<'a> {
     ])
 }
 
-/// A session's row: its mark, its name, and on the right how long ago it
-/// changed. When the name and the time don't both fit, the time goes. The
-/// letters at `marked` in the name are those `/`'s filter matched.
+/// A session's row: its mark, its name, what's in front in it when the
+/// name doesn't say, and on the right how long ago it changed. Short of
+/// room, what's in front goes first, then the time, before the name is
+/// cut. The letters at `marked` in the name are those `/`'s filter matched.
 fn session_line<'a>(
     session: &SessionInfo,
     marked: &[usize],
@@ -209,38 +210,78 @@ fn session_line<'a>(
     if selected {
         name_style = name_style.add_modifier(Modifier::BOLD);
     }
+    // A shell at its prompt is the quiet kind of running: its mark fades,
+    // so the agents stand out.
+    let at_a_shell = matches!(session.front, Some(Front::Shell { .. }));
+    let mark_color = if at_a_shell && status == Status::Running {
+        theme.muted
+    } else {
+        theme.status(status)
+    };
     // The indent, the mark and a space before the name; a space at the end.
     let room = usize::from(width).saturating_sub(SESSION_INDENT.len() + 2 + 1);
     let when = changed_ago(session, look.now);
-    let name_width = session.name.chars().count();
-    let fits_both = name_width + 1 + when.chars().count() <= room;
+    let label = front_label(session).unwrap_or_default();
+    let (label, when) = fitting_extras(session.name.chars().count(), label, &when, room);
 
     let mut spans = vec![
         Span::raw(SESSION_INDENT),
-        Span::styled(
-            status.mark(look.spin),
-            Style::new().fg(theme.status(status)),
-        ),
+        Span::styled(status.mark(look.spin), Style::new().fg(mark_color)),
         Span::raw(" "),
     ];
     let marked_style = name_style
         .fg(theme.accent)
         .add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
-    if fits_both {
-        let gap = room - name_width - when.chars().count();
-        spans.extend(marked_spans(
-            &session.name,
-            marked,
-            name_style,
-            marked_style,
+    let name = fit(&session.name, room);
+    spans.extend(marked_spans(&name, marked, name_style, marked_style));
+    if !label.is_empty() {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            label.to_string(),
+            Style::new().fg(theme.muted),
         ));
+    }
+    if !when.is_empty() {
+        let used: usize = spans.iter().skip(3).map(Span::width).sum();
+        let gap = room.saturating_sub(used + when.chars().count());
         spans.push(Span::raw(" ".repeat(gap)));
-        spans.push(Span::styled(when, Style::new().fg(theme.muted)));
-    } else {
-        let name = fit(&session.name, room);
-        spans.extend(marked_spans(&name, marked, name_style, marked_style));
+        spans.push(Span::styled(when.to_string(), Style::new().fg(theme.muted)));
     }
     Line::from(spans)
+}
+
+/// What's in front in the session, in a word, when its name doesn't say
+/// already: a session called `refund-fix` with Claude Code in front shows
+/// `claude`, and one called `claude-2` shows nothing more.
+fn front_label(session: &SessionInfo) -> Option<&str> {
+    let word = session.front.as_ref()?.word();
+    let named = session.name.to_lowercase().contains(&word.to_lowercase());
+    if named { None } else { Some(word) }
+}
+
+/// Which of a row's extras fit beside a name `name_width` wide in `room`
+/// columns, a space before each: what's in front and the time, the time
+/// alone, or neither.
+fn fitting_extras<'b>(
+    name_width: usize,
+    label: &'b str,
+    when: &'b str,
+    room: usize,
+) -> (&'b str, &'b str) {
+    let width = |text: &str| {
+        if text.is_empty() {
+            0
+        } else {
+            1 + text.chars().count()
+        }
+    };
+    if name_width + width(label) + width(when) <= room {
+        (label, when)
+    } else if name_width + width(when) <= room {
+        ("", when)
+    } else {
+        ("", "")
+    }
 }
 
 /// `text` as spans: the characters at `marked` in `marked_style`, the rest
@@ -344,6 +385,38 @@ mod tests {
         assert_eq!(texts, ["r", "efund-", "fix"]);
         assert_eq!(spans[0].style, marked);
         assert_eq!(spans[1].style, plain);
+    }
+
+    #[test]
+    fn what_s_in_front_shows_when_the_name_doesn_t_say_it() {
+        let mut session = crate::protocol::SessionInfo {
+            front: Some(Front::Agent {
+                program: "claude".into(),
+                name: "Claude Code".into(),
+            }),
+            name: "refund-fix".into(),
+            id: "1".into(),
+            command: vec!["claude".into()],
+            cwd: "/".into(),
+            pid: None,
+            state: crate::protocol::State::Running,
+            activity: None,
+            worktree: None,
+            changed: 0,
+        };
+        assert_eq!(front_label(&session), Some("claude"));
+        session.name = "Claude-2".into();
+        assert_eq!(front_label(&session), None);
+        session.front = None;
+        assert_eq!(front_label(&session), None);
+    }
+
+    #[test]
+    fn short_of_room_what_s_in_front_goes_before_the_time() {
+        // "refund-fix" is 10 wide; " claude" 7 and " 12m" 4 more.
+        assert_eq!(fitting_extras(10, "claude", "12m", 21), ("claude", "12m"));
+        assert_eq!(fitting_extras(10, "claude", "12m", 20), ("", "12m"));
+        assert_eq!(fitting_extras(10, "claude", "12m", 13), ("", ""));
     }
 
     #[test]

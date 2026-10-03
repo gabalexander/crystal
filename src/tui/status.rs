@@ -55,6 +55,7 @@ mod tests {
 
     fn session(state: State, activity: Option<Activity>) -> SessionInfo {
         SessionInfo {
+            front: None,
             name: "s".into(),
             id: "s".into(),
             command: vec!["sh".into()],

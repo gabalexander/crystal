@@ -190,6 +190,48 @@ pub struct SessionInfo {
     /// program ended. 0 from a daemon that doesn't say.
     #[serde(default)]
     pub changed: u64,
+    /// What's in front in the session's terminal, which can change as it
+    /// runs: a shell can have an agent in front, and the shell back.
+    /// `None` until it's been looked at, and from a daemon that doesn't
+    /// say.
+    #[serde(default)]
+    pub front: Option<Front>,
+}
+
+/// What's in front in a session's terminal: the program its keys go to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Front {
+    /// A coding agent crystal knows: its program, like `claude`, and what
+    /// it's called, like `Claude Code`.
+    Agent {
+        program: String,
+        name: String,
+    },
+    Shell {
+        name: String,
+    },
+    /// Any other program, by its name.
+    Program {
+        name: String,
+    },
+    /// A task: Claude Code run without a terminal.
+    Task,
+}
+
+impl Front {
+    /// One word for it, the way `ls` shows it: `claude`, `zsh`, `vite`.
+    pub fn word(&self) -> &str {
+        match self {
+            Front::Agent { program, .. } => program,
+            Front::Shell { name } | Front::Program { name } => name,
+            Front::Task => "task",
+        }
+    }
+
+    pub fn is_agent(&self) -> bool {
+        matches!(self, Front::Agent { .. })
+    }
 }
 
 /// The git worktree a session runs in, and the project it belongs to.

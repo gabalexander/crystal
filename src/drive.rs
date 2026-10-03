@@ -199,6 +199,7 @@ mod tests {
 
     fn session(state: State, activity: Option<Activity>) -> SessionInfo {
         SessionInfo {
+            front: None,
             name: "agent".into(),
             id: "1".into(),
             command: vec!["claude".into()],

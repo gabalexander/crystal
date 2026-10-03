@@ -1647,6 +1647,7 @@ mod tests {
 
     fn session(name: &str) -> SessionInfo {
         SessionInfo {
+            front: None,
             name: name.into(),
             id: name.into(),
             command: vec!["sh".into()],
@@ -1661,6 +1662,7 @@ mod tests {
 
     fn ended(name: &str) -> SessionInfo {
         SessionInfo {
+            front: None,
             state: State::Exited { code: 0 },
             ..session(name)
         }
@@ -1682,6 +1684,7 @@ mod tests {
 
     fn doing(name: &str, activity: Activity) -> SessionInfo {
         SessionInfo {
+            front: None,
             activity: Some(activity),
             ..session(name)
         }
@@ -1744,6 +1747,7 @@ mod tests {
     fn with_nothing_needing_the_user_u_says_so() {
         let mut app = App::new(None);
         let gone = SessionInfo {
+            front: None,
             activity: Some(Activity::Done),
             ..ended("gone")
         };
@@ -1893,6 +1897,7 @@ mod tests {
 
     fn in_project(name: &str, project: &str) -> SessionInfo {
         SessionInfo {
+            front: None,
             worktree: Some(Worktree {
                 project: project.into(),
                 project_path: PathBuf::from(format!("/code/{project}")),
@@ -2278,6 +2283,7 @@ mod tests {
     /// one when `branch` is "main".
     fn in_worktree(name: &str, branch: &str, state: State) -> SessionInfo {
         SessionInfo {
+            front: None,
             state,
             worktree: Some(Worktree {
                 project: "app".into(),
@@ -2684,6 +2690,7 @@ mod tests {
     /// A session in the `app` project, on `branch`.
     fn in_repo(name: &str, branch: &str) -> SessionInfo {
         SessionInfo {
+            front: None,
             worktree: Some(Worktree {
                 project: "app".into(),
                 project_path: PathBuf::from("/code/app"),

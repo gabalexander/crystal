@@ -3,11 +3,12 @@
 
 use crate::agent_screen::{self, Looks, ScreenWatch};
 use crate::codex::Rollouts;
+use crate::front;
 use crate::git::Checkout;
 use crate::history::{self, HISTORY_LINES, HistoryKeeper};
 use crate::notify::{self, Notice};
 use crate::protocol::{
-    Activity, AgentEvent, Conversation, SessionInfo, State, TaskResult, TaskSpec,
+    Activity, AgentEvent, Conversation, Front, SessionInfo, State, TaskResult, TaskSpec,
 };
 use crate::state::SavedSession;
 use crate::task::Task;
@@ -20,7 +21,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// How long a stopped session gets to exit after its hang-up before it's
 /// killed outright.
@@ -28,6 +29,11 @@ pub const STOP_GRACE: Duration = Duration::from_secs(2);
 
 /// Chunks of output a viewer may fall behind by before it's dropped.
 const VIEWER_BACKLOG: usize = 256;
+
+/// How often what's in front in a terminal is looked at again even when
+/// its job hasn't changed: a program can replace itself with another, the
+/// way `exec` does, and keep its place in front.
+const FRONT_RECHECK: Duration = Duration::from_secs(2);
 
 pub struct Session {
     pub name: String,
@@ -48,6 +54,12 @@ pub struct Session {
     changed: Arc<Mutex<SystemTime>>,
     /// What the screen has been saying the agent is doing.
     screen_watch: ScreenWatch,
+    /// What's in front in the terminal, once it's been looked at.
+    front: Option<Front>,
+    /// The job that was in front when it was last looked at, by its process
+    /// group, and when: a new job in front is looked at straight away.
+    front_group: Option<i32>,
+    front_checked: Instant,
     /// The git worktree `cwd` is in, if it's in one.
     checkout: Option<Checkout>,
     /// The agent's conversation, once its hooks have named it, or it has
@@ -129,6 +141,9 @@ impl Session {
             rollouts: None,
             told: None,
             screen_watch: ScreenWatch::default(),
+            front: None,
+            front_group: None,
+            front_checked: Instant::now(),
             task: None,
             term,
         })
@@ -170,6 +185,9 @@ impl Session {
             rollouts: None,
             told: None,
             screen_watch: ScreenWatch::default(),
+            front: Some(Front::Task),
+            front_group: None,
+            front_checked: Instant::now(),
             task: Some(task),
             term,
         }
@@ -223,6 +241,7 @@ impl Session {
 
     pub fn info(&self) -> SessionInfo {
         SessionInfo {
+            front: self.front.clone(),
             name: self.name.clone(),
             id: self.id.clone(),
             command: self.command.clone(),
@@ -256,10 +275,53 @@ impl Session {
         }
     }
 
+    /// Looks at what's in front in the terminal, when its job has changed
+    /// or it's been a while. Cheap otherwise: one question to the terminal.
+    pub fn check_front(&mut self) {
+        if self.task.is_some() || !self.is_running() {
+            return;
+        }
+        let Some(group) = self.term.foreground_group() else {
+            return;
+        };
+        let same_job = self.front_group == Some(group);
+        if same_job && self.front_checked.elapsed() < FRONT_RECHECK {
+            return;
+        }
+        self.front_group = Some(group);
+        self.front_checked = Instant::now();
+        if let Some(front) = front::of_process(group) {
+            self.set_front(front);
+        }
+    }
+
+    /// Takes what's in front now. An agent that leaves the front takes what
+    /// it was doing with it: the shell it gives the terminal back to isn't
+    /// working or waiting on anyone.
+    fn set_front(&mut self, front: Front) {
+        if self.front.as_ref() == Some(&front) {
+            return;
+        }
+        let agent_left = self.front.as_ref().is_some_and(Front::is_agent);
+        if agent_left && self.activity.is_some() {
+            self.activity = None;
+            *self.changed.lock().unwrap() = SystemTime::now();
+        }
+        self.screen_watch = ScreenWatch::default();
+        self.front = Some(front);
+    }
+
+    /// Whether an agent is in front in the terminal, the only time its
+    /// screen says anything about what an agent is doing.
+    fn agent_in_front(&self) -> bool {
+        self.front.as_ref().is_some_and(Front::is_agent)
+    }
+
     /// Reads what the agent is doing off the screen, and takes it as an
-    /// event when that has changed.
+    /// event when that has changed. Only while an agent is in front: a
+    /// shell or any other program can print an agent's words.
     fn check_screen(&mut self) {
-        if !self.is_running() {
+        if !self.is_running() || !self.agent_in_front() {
             return;
         }
         let looks = self.term.looks();
@@ -516,6 +578,14 @@ impl Term {
         let (_, cols) = screen.parser.screen().size();
         rows.extend(screen.parser.screen().rows(0, cols));
         rows
+    }
+
+    /// The process group in front in the terminal: the job its keys go to.
+    /// `None` without a terminal, or when the terminal won't say.
+    pub fn foreground_group(&self) -> Option<i32> {
+        let pty = self.pty.as_ref()?;
+        let master = pty.master.lock().unwrap();
+        master.process_group_leader()
     }
 
     pub fn is_watched(&self) -> bool {
