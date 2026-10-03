@@ -111,11 +111,39 @@ pub fn find_worktree(dir: &Path, target: &str) -> Result<PathBuf> {
     let list = git(dir, &["worktree", "list", "--porcelain"])?;
     let found = parse_worktree_list(&list)
         .into_iter()
-        .find(|(_, branch)| branch.as_deref() == Some(target));
+        .find(|listed| listed.branch.as_deref() == Some(target));
     match found {
-        Some((path, _)) => Ok(std::fs::canonicalize(&path).unwrap_or(path)),
+        Some(Listed { path, .. }) => Ok(std::fs::canonicalize(&path).unwrap_or(path)),
         None => bail!("no worktree at {target} or on a branch called {target}"),
     }
+}
+
+/// The worktrees linked to the repository whose main worktree is
+/// `project_path`: every one git lists but the main worktree, which it
+/// lists first. One whose directory has gone is left out: git only keeps
+/// it until it's pruned.
+pub fn linked_worktrees(project_path: &Path) -> Result<Vec<Worktree>> {
+    let checkout = Checkout::find(project_path)
+        .with_context(|| format!("{} isn't in a git repository", project_path.display()))?;
+    let list = git(project_path, &["worktree", "list", "--porcelain"])?;
+    let linked = parse_worktree_list(&list)
+        .into_iter()
+        .skip(1)
+        .filter(|listed| !listed.prunable)
+        .filter_map(|listed| {
+            // Resolved the way a session's worktree is, so that the two
+            // can be compared; a directory that has gone can't be.
+            let path = std::fs::canonicalize(&listed.path).ok()?;
+            Some(Worktree {
+                project: checkout.project.clone(),
+                project_path: checkout.project_path.clone(),
+                path,
+                main: false,
+                branch: listed.branch,
+            })
+        })
+        .collect();
+    Ok(linked)
 }
 
 /// Removes the worktree at `path` the way `git worktree remove` does, which
@@ -257,19 +285,37 @@ fn branch_from_head(head: &str) -> Option<String> {
     Some(branch.to_string())
 }
 
-/// The worktrees in `git worktree list --porcelain`, each with the branch
-/// it has checked out. Each worktree is a block of lines like
-/// `worktree /path` and `branch refs/heads/main`.
-fn parse_worktree_list(list: &str) -> Vec<(PathBuf, Option<String>)> {
-    let mut worktrees: Vec<(PathBuf, Option<String>)> = Vec::new();
+/// One worktree as `git worktree list --porcelain` lists it.
+#[derive(Debug, PartialEq, Eq)]
+struct Listed {
+    path: PathBuf,
+    /// The branch it has checked out, or `None` when HEAD is detached.
+    branch: Option<String>,
+    /// Whether git would prune it: its directory has gone.
+    prunable: bool,
+}
+
+/// The worktrees in `git worktree list --porcelain`, in its order. Each
+/// worktree is a block of lines like `worktree /path`, `branch
+/// refs/heads/main`, and `prunable …` once its directory has gone.
+fn parse_worktree_list(list: &str) -> Vec<Listed> {
+    let mut worktrees: Vec<Listed> = Vec::new();
     for line in list.lines() {
         if let Some(path) = line.strip_prefix("worktree ") {
-            worktrees.push((PathBuf::from(path), None));
-        } else if let (Some(branch), Some(last)) = (
-            line.strip_prefix("branch refs/heads/"),
-            worktrees.last_mut(),
-        ) {
-            last.1 = Some(branch.to_string());
+            worktrees.push(Listed {
+                path: PathBuf::from(path),
+                branch: None,
+                prunable: false,
+            });
+            continue;
+        }
+        let Some(last) = worktrees.last_mut() else {
+            continue;
+        };
+        if let Some(branch) = line.strip_prefix("branch refs/heads/") {
+            last.branch = Some(branch.to_string());
+        } else if line == "prunable" || line.starts_with("prunable ") {
+            last.prunable = true;
         }
     }
     worktrees
@@ -346,7 +392,7 @@ mod tests {
     }
 
     #[test]
-    fn the_worktree_list_gives_each_worktree_its_branch() {
+    fn the_worktree_list_gives_each_worktree_its_branch_and_says_which_have_gone() {
         let list = "worktree /code/app\n\
                     HEAD 9fceb02d0ae598e95dc970b74767f19372d61af8\n\
                     branch refs/heads/main\n\
@@ -357,16 +403,24 @@ mod tests {
                     \n\
                     worktree /code/app.worktrees/spike\n\
                     HEAD 0e7b51f1e2a4cdb0b27c2ac83c20f0c6ce3a1c51\n\
-                    detached\n";
+                    detached\n\
+                    \n\
+                    worktree /code/app.worktrees/gone\n\
+                    HEAD 0e7b51f1e2a4cdb0b27c2ac83c20f0c6ce3a1c51\n\
+                    branch refs/heads/gone\n\
+                    prunable gitdir file points to non-existent location\n";
+        let listed = |path: &str, branch: Option<&str>, prunable| Listed {
+            path: PathBuf::from(path),
+            branch: branch.map(String::from),
+            prunable,
+        };
         assert_eq!(
             parse_worktree_list(list),
             [
-                (PathBuf::from("/code/app"), Some("main".into())),
-                (
-                    PathBuf::from("/code/app.worktrees/feat-login"),
-                    Some("feat/login".into())
-                ),
-                (PathBuf::from("/code/app.worktrees/spike"), None),
+                listed("/code/app", Some("main"), false),
+                listed("/code/app.worktrees/feat-login", Some("feat/login"), false),
+                listed("/code/app.worktrees/spike", None, false),
+                listed("/code/app.worktrees/gone", Some("gone"), true),
             ]
         );
     }

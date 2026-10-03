@@ -2905,6 +2905,60 @@ fn shift_w_removes_a_worktree_once_nothing_runs_in_it() {
 }
 
 #[test]
+fn a_worktree_whose_last_session_is_killed_stays_until_shift_w_removes_it() {
+    let crystal = Crystal::new();
+    let repo = git_repo(crystal.dir.path(), "app");
+    let repo_arg = repo.to_str().unwrap();
+    crystal.ok(&["new", "-n", "planner", "-c", repo_arg, "sleep", "30"]);
+    crystal.ok(&[
+        "new", "-n", "fixer", "-c", repo_arg, "-w", "fix", "sleep", "30",
+    ]);
+    let worktree = crystal.dir.path().join("app.worktrees/fix");
+
+    let mut tui = crystal.tui();
+    tui.shows("❯ fixer");
+    // planner, in the main worktree, comes first.
+    tui.type_keys("jx");
+    tui.shows("kill fixer? y/n");
+    tui.type_keys("y");
+    tui.hides("❯ fixer");
+    // The worktree stays, and the selection is on it.
+    tui.shows("· no sessions");
+    tui.shows("No sessions in ⎇ fix");
+    assert!(worktree.is_dir());
+
+    tui.type_keys("W");
+    tui.shows("remove worktree fix? y/n");
+    tui.type_keys("y");
+    eventually("the worktree is gone", || !worktree.exists());
+    tui.hides("no sessions");
+    tui.hides("⎇ fix");
+}
+
+#[test]
+fn shift_w_on_a_worktree_with_work_in_it_says_why_git_keeps_it() {
+    let crystal = Crystal::new();
+    let repo = git_repo(crystal.dir.path(), "app");
+    let repo_arg = repo.to_str().unwrap();
+    crystal.ok(&["new", "-n", "planner", "-c", repo_arg, "sleep", "30"]);
+    crystal.ok(&["new", "-n", "fixer", "-c", repo_arg, "-w", "fix", "true"]);
+    let worktree = crystal.dir.path().join("app.worktrees/fix");
+    std::fs::write(worktree.join("notes.txt"), "half done\n").unwrap();
+    crystal.ok(&["kill", "fixer"]);
+
+    let mut tui = crystal.tui();
+    tui.shows("· no sessions");
+    tui.type_keys("j");
+    tui.shows("No sessions in ⎇ fix");
+    tui.type_keys("W");
+    tui.shows("remove worktree fix? y/n");
+    tui.type_keys("y");
+    tui.shows("'fix' contains modified or untracked files");
+    assert!(worktree.join("notes.txt").exists());
+    tui.shows("· no sessions");
+}
+
+#[test]
 fn ls_json_lists_every_session_with_its_status() {
     let crystal = Crystal::new();
     assert_eq!(crystal.ok(&["ls", "--json"]).trim(), "[]");

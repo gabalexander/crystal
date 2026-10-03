@@ -38,9 +38,9 @@ use crate::github::{self, Issue, PullRequest};
 use crate::memory::{self, Listed, Memory};
 use crate::plugins::{self, Context};
 use crate::profile;
-use crate::protocol::{Backlog, NewSession, Request, Response, SessionInfo};
+use crate::protocol::{Backlog, NewSession, Request, Response, SessionInfo, Worktree};
 use crate::{catalog, keys, typing};
-use crate::{client, env};
+use crate::{client, env, git};
 use anyhow::{Context as _, Result, bail};
 use app::{Action, App, Focus, Hit, Place, PluginKey, PluginPane, Slot};
 use backlog_view::BacklogChange;
@@ -72,6 +72,12 @@ const SPIN_EVERY: Duration = Duration::from_millis(150);
 /// project seen for the first time is asked about straight away.
 const PULL_REQUESTS_EVERY: Duration = Duration::from_secs(60);
 
+/// How often git is asked again about a project's worktrees, for those
+/// made or removed outside crystal. A project seen for the first time is
+/// asked about straight away, and so is every one when crystal has just
+/// made or removed a worktree.
+const WORKTREES_EVERY: Duration = Duration::from_secs(5);
+
 pub enum Event {
     Key(KeyEvent),
     Mouse(MouseEvent),
@@ -98,6 +104,11 @@ pub enum Event {
     PullRequests {
         project: PathBuf,
         found: Result<Vec<PullRequest>, String>,
+    },
+    /// The linked worktrees of a project, as git listed them.
+    Worktrees {
+        project: PathBuf,
+        worktrees: Vec<Worktree>,
     },
     /// What GitHub said about the open issues of a project.
     Issues {
@@ -163,6 +174,13 @@ pub fn run(socket: &Path) -> Result<()> {
     );
     let projects = Arc::new(Mutex::new(Vec::new()));
     spawn_pull_request_poller(projects.clone(), sender.clone());
+    let worktree_projects = Arc::new(Mutex::new(Vec::new()));
+    let list_worktrees_now = Arc::new(AtomicBool::new(false));
+    spawn_worktree_lister(
+        worktree_projects.clone(),
+        list_worktrees_now.clone(),
+        sender.clone(),
+    );
 
     let mut tui = Tui {
         socket: socket.to_path_buf(),
@@ -172,6 +190,8 @@ pub fn run(socket: &Path) -> Result<()> {
         events: sender,
         screen: Rect::default(),
         projects,
+        worktree_projects,
+        list_worktrees_now,
         theme: Theme::from_env(config.theme),
         started: Instant::now(),
         memory_path: launcher::memory_path(socket),
@@ -265,6 +285,12 @@ struct Tui {
     /// The projects the sessions are in, for the thread that asks GitHub
     /// about their pull requests.
     projects: Arc<Mutex<Vec<PathBuf>>>,
+    /// The projects the sessions are in, for the thread that asks git
+    /// about their worktrees: all of them, whatever the plugins.
+    worktree_projects: Arc<Mutex<Vec<PathBuf>>>,
+    /// Set when crystal has just made or removed a worktree, for that
+    /// thread to ask git again straight away.
+    list_worktrees_now: Arc<AtomicBool>,
     theme: Theme,
     /// When the TUI started: the working mark turns with the time since.
     started: Instant,
@@ -339,13 +365,33 @@ impl Tui {
         }
     }
 
+    /// The directory a new session at `place` starts in, as
+    /// [`directory_for`] finds or makes it. A worktree made for it is
+    /// listed straight away, so that it stays in the sidebar even if its
+    /// session ends at once.
+    fn start_dir(&self, place: Place) -> Result<PathBuf> {
+        let makes_a_worktree = matches!(place, Place::NewWorktree { .. });
+        let dir = directory_for(&self.socket, place)?;
+        if makes_a_worktree {
+            self.list_worktrees_again();
+        }
+        Ok(dir)
+    }
+
+    /// Has git asked about every project's worktrees again, straight away.
+    fn list_worktrees_again(&self) {
+        self.list_worktrees_now.store(true, Ordering::Relaxed);
+    }
+
     /// Takes a fresh list of sessions, and tells the pull request poller
-    /// which projects they're in.
+    /// and the worktree lister which projects they're in.
     fn set_sessions(&mut self, sessions: Vec<SessionInfo>) {
         self.app.set_sessions(sessions);
+        let projects = self.app.projects();
+        *self.worktree_projects.lock().unwrap() = projects.clone();
         // With the github plugin off, the poller has nothing to ask about.
         let asked = if self.app.github_on() {
-            self.app.projects()
+            projects
         } else {
             Vec::new()
         };
@@ -396,6 +442,7 @@ impl Tui {
             Event::Sessions(sessions) => self.set_sessions(sessions),
             Event::Flows(runs) => self.app.set_flows(runs),
             Event::PullRequests { project, found } => self.app.set_pull_requests(project, found),
+            Event::Worktrees { project, worktrees } => self.app.set_worktrees(project, worktrees),
             Event::Issues { project, found } => self.app.set_issues(&project, found),
             Event::IssueBody {
                 project,
@@ -502,7 +549,7 @@ impl Tui {
                 command,
                 purpose,
             } => {
-                let cwd = directory_for(&self.socket, place)?;
+                let cwd = self.start_dir(place)?;
                 let name = client::new_session_for(&self.socket, None, cwd, command, purpose)?;
                 self.show_new_session(&name)?;
                 launcher::save_memory(&self.memory_path, self.app.memory());
@@ -512,7 +559,7 @@ impl Tui {
                 spec,
                 backlog,
             } => {
-                let cwd = directory_for(&self.socket, place)?;
+                let cwd = self.start_dir(place)?;
                 let name = client::new_task(&self.socket, None, cwd, spec, backlog)?;
                 // A background task takes no keys: the sidebar keeps them.
                 self.refresh_sessions()?;
@@ -520,7 +567,7 @@ impl Tui {
                 launcher::save_memory(&self.memory_path, self.app.memory());
             }
             Action::StartFlow { place, flow, goal } => {
-                let cwd = directory_for(&self.socket, place)?;
+                let cwd = self.start_dir(place)?;
                 let run = client::start_flow(&self.socket, &flow, &goal, cwd)?;
                 // Its first step takes no keys: the sidebar keeps them.
                 self.refresh_sessions()?;
@@ -707,7 +754,11 @@ impl Tui {
                 self.app.type_into_selected();
             }
             Action::RemoveWorktree(path) => {
-                client::remove_worktree(&self.socket, &path)?;
+                if let Err(err) = client::remove_worktree(&self.socket, &path) {
+                    bail!("{}", removal_refused(&path, &err));
+                }
+                self.app.worktree_removed(&path);
+                self.list_worktrees_again();
                 self.refresh_sessions()?;
             }
             Action::Type { to, key } => {
@@ -1118,6 +1169,16 @@ fn directory_for(socket: &Path, place: Place) -> Result<PathBuf> {
     }
 }
 
+/// Why the worktree at `path` wasn't removed, short enough for the footer:
+/// git names a worktree by its whole path, which would push the reason
+/// itself off the end, so it's named by its directory instead.
+fn removal_refused(path: &Path, err: &anyhow::Error) -> String {
+    let said = format!("{err:#}");
+    let said = said.strip_prefix("fatal: ").unwrap_or(&said);
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    said.replace(&path.display().to_string(), &name)
+}
+
 /// The bytes that hand `text`, pasted, to a program: marked as a paste
 /// when the program asked for that. A program that didn't gets a newline
 /// the way a terminal sends it for the Enter key.
@@ -1219,6 +1280,45 @@ fn spawn_input_reader(events: Sender<Event>) {
             if events.send(event).is_err() {
                 return;
             }
+        }
+    });
+}
+
+/// Asks git about the linked worktrees of each project the sessions are
+/// in, on a thread of its own: a project as soon as it's seen, every one
+/// again each [`WORKTREES_EVERY`], and every one straight away once `now`
+/// is set. When git can't say, what was known stays.
+fn spawn_worktree_lister(
+    projects: Arc<Mutex<Vec<PathBuf>>>,
+    now: Arc<AtomicBool>,
+    events: Sender<Event>,
+) {
+    thread::spawn(move || {
+        let mut listed: HashMap<PathBuf, Instant> = HashMap::new();
+        loop {
+            if now.swap(false, Ordering::Relaxed) {
+                listed.clear();
+            }
+            let wanted = projects.lock().unwrap().clone();
+            for project in wanted {
+                let due = listed
+                    .get(&project)
+                    .is_none_or(|at| at.elapsed() >= WORKTREES_EVERY);
+                if !due {
+                    continue;
+                }
+                listed.insert(project.clone(), Instant::now());
+                let Ok(worktrees) = git::linked_worktrees(&project) else {
+                    continue;
+                };
+                if events
+                    .send(Event::Worktrees { project, worktrees })
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            thread::sleep(Duration::from_millis(100));
         }
     });
 }
