@@ -353,9 +353,9 @@ Under the task, `Tab` and `Shift+Tab` go from row to row and `←` / `→` chang
 - **how**, for Claude Code: **in a terminal**, or **in the background**, as a [background
   task](#background-tasks) that needs no terminal. Only Claude Code offers it: crystal reads `claude -p`'s
   events for a task's transcript, and Codex's `codex exec` writes another kind it doesn't read yet.
-- Claude Code's **model** and **permissions** (`--model`, `--permission-mode`), or Codex's **model** and
-  **approvals** (`-m`, `-a`), its models the ones `codex debug models` lists. Left at `default`, no option is
-  added.
+- Claude Code's **model** (fable, opus, sonnet, haiku), **effort** (low to max) and **permissions** (`--model`,
+  `--effort`, `--permission-mode`), or Codex's **model** and **approvals** (`-m`, `-a`), its models the ones
+  `codex debug models` lists. Left at `default`, no option is added.
 - **start in**: here (the selected session's worktree, or where you started `crystal`), a new worktree, or
   another project's main worktree.
 
@@ -872,6 +872,7 @@ name = "review"                            # how the panel shows it
 description = "Reads the branch's diff"    # optional: shown under it in the panel
 agent = "claude"                           # claude, codex, gemini, opencode, cursor-agent or aider
 model = "opus"                             # optional: Claude Code's or Codex's model
+effort = "high"                            # optional: Claude Code's effort: low, medium, high, xhigh or max
 mode = "plan"                              # optional: Claude Code's permission mode, or Codex's approvals
 args = ["--verbose"]                       # optional: more options, after those
 prompt = "Review the diff on this branch." # optional: put before the task, a blank line between

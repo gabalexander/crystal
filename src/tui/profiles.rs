@@ -10,7 +10,7 @@ use super::launcher::{cut, shown_choices};
 use super::text_area::TextArea;
 use super::text_input::TextInput;
 use super::theme::Theme;
-use crate::catalog::{self, Agent, Choices, Instructions};
+use crate::catalog::{self, Agent, Choices, Instructions, Kind};
 use crate::profile::{Profile, StartIn};
 use crate::shell;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -43,7 +43,7 @@ pub enum Outcome {
     /// `replacing`, or as a new one.
     Save {
         replacing: Option<String>,
-        profile: Profile,
+        profile: Box<Profile>,
     },
     /// Take the profile with this name out of the config file.
     Delete(String),
@@ -197,7 +197,7 @@ impl ProfilesView {
             FormKey::Save => match form.profile() {
                 Ok(profile) => Outcome::Save {
                     replacing: form.replacing.clone(),
-                    profile,
+                    profile: Box::new(profile),
                 },
                 Err(problem) => {
                     self.problem = Some(problem);
@@ -215,6 +215,7 @@ pub enum Field {
     Description,
     Agent,
     Model,
+    Effort,
     Mode,
     Where,
     Args,
@@ -247,6 +248,7 @@ pub struct Form {
     /// Codex.
     codex_models: Vec<String>,
     model: usize,
+    effort: usize,
     mode: usize,
     /// Which of [`PLACES`].
     place: usize,
@@ -275,6 +277,7 @@ impl Form {
             models: Vec::new(),
             codex_models: codex_models.to_vec(),
             model: 0,
+            effort: 0,
             mode: 0,
             place: PLACES
                 .iter()
@@ -291,10 +294,8 @@ impl Form {
             .iter()
             .position(|(_, value)| Some(value.as_str()) == profile.model.as_deref())
             .unwrap_or(0);
-        form.mode = mode_row(form.agent())
-            .iter()
-            .position(|(_, value)| Some(*value) == profile.mode.as_deref())
-            .unwrap_or(0);
+        form.effort = fixed_index(form.agent(), Kind::Effort, &profile.effort);
+        form.mode = fixed_index(form.agent(), Kind::Mode, &profile.mode);
         form
     }
 
@@ -317,17 +318,21 @@ impl Form {
             .unwrap_or(0);
     }
 
-    /// The rows the form has for its agent, in order: the model and mode
-    /// only for an agent that takes them, instructions only for one that
-    /// can be given them.
+    /// The rows the form has for its agent, in order: the model, effort
+    /// and mode only for an agent that takes them, instructions only for
+    /// one that can be given them.
     pub fn fields(&self) -> Vec<Field> {
         let agent = self.agent();
         let mut fields = vec![Field::Name, Field::Description, Field::Agent];
-        if agent.model_setting().is_some() {
-            fields.push(Field::Model);
-        }
-        if agent.mode_setting().is_some() {
-            fields.push(Field::Mode);
+        let rows = [
+            (Kind::Model, Field::Model),
+            (Kind::Effort, Field::Effort),
+            (Kind::Mode, Field::Mode),
+        ];
+        for (kind, field) in rows {
+            if agent.setting(kind).is_some() {
+                fields.push(field);
+            }
         }
         fields.extend([Field::Where, Field::Args, Field::Prompt]);
         if agent.instructions != Instructions::None {
@@ -383,7 +388,7 @@ impl Form {
     fn is_choice(&self) -> bool {
         matches!(
             self.focus,
-            Field::Agent | Field::Model | Field::Mode | Field::Where
+            Field::Agent | Field::Model | Field::Effort | Field::Mode | Field::Where
         )
     }
 
@@ -391,13 +396,21 @@ impl Form {
         match self.focus {
             Field::Agent => {
                 self.agent = step(self.agent, by, catalog::AGENTS.len());
-                // Another agent takes other models and modes.
+                // Another agent takes other models, efforts and modes.
                 self.models = model_choices(self.agent(), &self.codex_models, None);
                 self.model = 0;
+                self.effort = 0;
                 self.mode = 0;
             }
             Field::Model => self.model = step(self.model, by, self.models.len()),
-            Field::Mode => self.mode = step(self.mode, by, mode_row(self.agent()).len()),
+            Field::Effort => {
+                let count = fixed_row(self.agent(), Kind::Effort).len();
+                self.effort = step(self.effort, by, count);
+            }
+            Field::Mode => {
+                let count = fixed_row(self.agent(), Kind::Mode).len();
+                self.mode = step(self.mode, by, count);
+            }
             Field::Where => self.place = step(self.place, by, PLACES.len()),
             _ => {}
         }
@@ -453,9 +466,12 @@ impl Form {
             .get(self.model)
             .map(|(_, value)| value.clone())
             .filter(|value| !value.is_empty());
-        let mode = mode_row(agent)
-            .get(self.mode)
-            .map(|(_, value)| value.to_string());
+        let fixed = |kind, chosen: usize| {
+            fixed_row(agent, kind)
+                .get(chosen)
+                .map(|(_, value)| value.to_string())
+                .filter(|value| !value.is_empty())
+        };
         let instructions = if agent.instructions == Instructions::None {
             None
         } else {
@@ -466,7 +482,8 @@ impl Form {
             description: filled(self.description.text()),
             agent: agent.program.to_string(),
             model,
-            mode: mode.filter(|mode| !mode.is_empty()),
+            effort: fixed(Kind::Effort, self.effort),
+            mode: fixed(Kind::Mode, self.mode),
             args,
             prompt: filled(self.prompt.text()),
             instructions,
@@ -489,8 +506,14 @@ impl Form {
                 let shown = self.models.iter().map(|(shown, _)| shown.clone()).collect();
                 Value::Choices(shown, self.model)
             }
+            Field::Effort => {
+                let row = fixed_row(agent, Kind::Effort);
+                let shown = row.iter().map(|(s, _)| s.to_string()).collect();
+                Value::Choices(shown, self.effort)
+            }
             Field::Mode => {
-                let shown = mode_row(agent).iter().map(|(s, _)| s.to_string()).collect();
+                let row = fixed_row(agent, Kind::Mode);
+                let shown = row.iter().map(|(s, _)| s.to_string()).collect();
                 Value::Choices(shown, self.mode)
             }
             Field::Where => {
@@ -511,7 +534,8 @@ impl Form {
             Field::Description => "description",
             Field::Agent => "agent",
             Field::Model => "model",
-            Field::Mode => self.agent().mode_setting().map_or("mode", |s| s.label),
+            Field::Effort => "effort",
+            Field::Mode => self.agent().setting(Kind::Mode).map_or("mode", |s| s.label),
             Field::Where => "where",
             Field::Args => "arguments",
             Field::Prompt => "prompt",
@@ -560,7 +584,7 @@ fn model_choices(
     keep: Option<&str>,
 ) -> Vec<(String, String)> {
     let mut choices = vec![("default".to_string(), String::new())];
-    match agent.model_setting().map(|setting| &setting.choices) {
+    match agent.setting(Kind::Model).map(|setting| &setting.choices) {
         Some(Choices::Fixed(fixed)) => {
             choices.extend(
                 fixed
@@ -582,13 +606,23 @@ fn model_choices(
     choices
 }
 
-/// The mode row's choices for `agent`, as `(shown, value)`, the first
-/// being the agent's own default, which sets nothing.
-fn mode_row(agent: &Agent) -> &'static [(&'static str, &'static str)] {
-    match agent.mode_setting().map(|setting| &setting.choices) {
+/// The choices of `agent`'s row of `kind`, when they're fixed, as
+/// `(shown, value)`, the first being the agent's own default, which sets
+/// nothing.
+fn fixed_row(agent: &Agent, kind: Kind) -> &'static [(&'static str, &'static str)] {
+    match agent.setting(kind).map(|setting| &setting.choices) {
         Some(Choices::Fixed(fixed)) => fixed,
         _ => &[],
     }
+}
+
+/// Where `chosen` is in `agent`'s row of `kind`: its default when it's
+/// `None`, or not a choice there.
+fn fixed_index(agent: &Agent, kind: Kind, chosen: &Option<String>) -> usize {
+    fixed_row(agent, kind)
+        .iter()
+        .position(|(_, value)| Some(*value) == chosen.as_deref())
+        .unwrap_or(0)
 }
 
 /// The text, unless it's only blanks.
@@ -766,6 +800,12 @@ fn summary(profile: &Profile) -> String {
     let agent = catalog::find(&profile.agent).map_or(profile.agent.as_str(), |a| a.name);
     let mut parts = vec![agent.to_string()];
     parts.extend(profile.model.clone());
+    parts.extend(
+        profile
+            .effort
+            .as_ref()
+            .map(|effort| format!("{effort} effort")),
+    );
     parts.extend(profile.mode.clone());
     match profile.start_in {
         Some(StartIn::Here) => parts.push("here".to_string()),
@@ -933,6 +973,7 @@ mod tests {
         Profile {
             name: "review".into(),
             description: Some("A second pair of eyes".into()),
+            effort: Some("high".into()),
             mode: Some("plan".into()),
             instructions: Some("Point out risks first.".into()),
             ..Profile::for_agent("claude")
@@ -954,6 +995,7 @@ mod tests {
         };
         assert_eq!(replacing.as_deref(), Some("review"));
         assert_eq!(profile.name, "reviewer");
+        assert_eq!(profile.effort.as_deref(), Some("high"));
         assert_eq!(profile.mode.as_deref(), Some("plan"));
         assert_eq!(
             profile.instructions.as_deref(),
@@ -974,7 +1016,7 @@ mod tests {
         };
         assert_eq!(replacing, None);
         assert_eq!(
-            profile,
+            *profile,
             Profile {
                 name: "quick".into(),
                 ..Profile::for_agent("claude")
@@ -1010,6 +1052,32 @@ mod tests {
     }
 
     #[test]
+    fn claude_s_rows_choose_its_model_and_effort() {
+        let mut view = view();
+        press(&mut view, KeyCode::Char('a'));
+        type_text(&mut view, "deep");
+        // Down past the description and the agent to the model: fable.
+        for _ in 0..3 {
+            press(&mut view, KeyCode::Down);
+        }
+        assert_eq!(view.form().unwrap().focus(), Field::Model);
+        press(&mut view, KeyCode::Right);
+        press(&mut view, KeyCode::Down);
+        assert_eq!(view.form().unwrap().focus(), Field::Effort);
+        press(&mut view, KeyCode::Left); // round to the last: max
+        let profile = view.form().unwrap().profile().unwrap();
+        assert_eq!(profile.model.as_deref(), Some("fable"));
+        assert_eq!(profile.effort.as_deref(), Some("max"));
+        // Codex has no effort row, so its profile sets none.
+        press(&mut view, KeyCode::Up);
+        press(&mut view, KeyCode::Up);
+        press(&mut view, KeyCode::Right);
+        let form = view.form().unwrap();
+        assert!(!form.fields().contains(&Field::Effort));
+        assert_eq!(form.profile().unwrap().effort, None);
+    }
+
+    #[test]
     fn an_agent_that_takes_no_instructions_has_no_row_for_them() {
         let mut view = view();
         press(&mut view, KeyCode::Char('a'));
@@ -1029,8 +1097,9 @@ mod tests {
         let mut view = view();
         press(&mut view, KeyCode::Char('a'));
         type_text(&mut view, "x");
-        // Name, description, agent, model, mode, where, then arguments.
-        for _ in 0..6 {
+        // Name, description, agent, model, effort, mode, where, then
+        // arguments.
+        for _ in 0..7 {
             press(&mut view, KeyCode::Tab);
         }
         assert_eq!(view.form().unwrap().focus(), Field::Args);
@@ -1097,7 +1166,7 @@ mod tests {
         let lines: Vec<String> = view_lines(&view, 96).iter().map(ViewLine::text).collect();
         let runs = lines.iter().find(|line| line.starts_with("runs")).unwrap();
         assert!(
-            runs.contains("claude --permission-mode plan --append-system-prompt"),
+            runs.contains("claude --effort high --permission-mode plan --append-system-prompt"),
             "{runs}"
         );
     }
@@ -1105,11 +1174,9 @@ mod tests {
     #[test]
     fn the_list_says_what_each_profile_runs() {
         let lines: Vec<String> = view_lines(&view(), 96).iter().map(ViewLine::text).collect();
-        assert!(
-            lines
-                .iter()
-                .any(|line| line.contains("review") && line.contains("Claude Code · plan"))
-        );
+        assert!(lines.iter().any(
+            |line| line.contains("review") && line.contains("Claude Code · high effort · plan")
+        ));
         assert!(
             lines
                 .iter()

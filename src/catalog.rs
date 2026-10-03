@@ -81,14 +81,37 @@ impl Instructions {
     }
 }
 
-/// A row of choices the panel offers for an agent: a label, the option
-/// it sets, and what it can be set to. The first choice, "default", leaves
-/// the option off, so the agent's own setting stands.
+/// A row of choices the panel offers for an agent: what it chooses, a
+/// label, the option it sets, and what it can be set to. The first choice,
+/// "default", leaves the option off, so the agent's own setting stands.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Setting {
+    pub kind: Kind,
     pub label: &'static str,
     pub option: &'static str,
     pub choices: Choices,
+}
+
+/// What a row of choices chooses, which is what a profile sets it with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    Model,
+    /// How hard it thinks: Claude Code's `--effort`.
+    Effort,
+    /// How it asks before acting: Claude Code's permissions, Codex's
+    /// approvals.
+    Mode,
+}
+
+impl Kind {
+    /// What it's called, after "a" or "an": what a profile's errors say.
+    pub fn noun(self) -> &'static str {
+        match self {
+            Kind::Model => "a model",
+            Kind::Effort => "an effort level",
+            Kind::Mode => "a mode",
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -108,16 +131,32 @@ pub const AGENTS: &[Agent] = &[
         instructions: Instructions::Option("--append-system-prompt"),
         settings: &[
             Setting {
+                kind: Kind::Model,
                 label: "model",
                 option: "--model",
                 choices: Choices::Fixed(&[
                     ("default", ""),
+                    ("fable", "fable"),
                     ("opus", "opus"),
                     ("sonnet", "sonnet"),
                     ("haiku", "haiku"),
                 ]),
             },
             Setting {
+                kind: Kind::Effort,
+                label: "effort",
+                option: "--effort",
+                choices: Choices::Fixed(&[
+                    ("default", ""),
+                    ("low", "low"),
+                    ("medium", "medium"),
+                    ("high", "high"),
+                    ("xhigh", "xhigh"),
+                    ("max", "max"),
+                ]),
+            },
+            Setting {
+                kind: Kind::Mode,
                 label: "permissions",
                 option: "--permission-mode",
                 choices: Choices::Fixed(&[
@@ -137,11 +176,13 @@ pub const AGENTS: &[Agent] = &[
         instructions: Instructions::Setting("developer_instructions"),
         settings: &[
             Setting {
+                kind: Kind::Model,
                 label: "model",
                 option: "-m",
                 choices: Choices::CodexModels,
             },
             Setting {
+                kind: Kind::Mode,
                 label: "approvals",
                 option: "-a",
                 choices: Choices::Fixed(&[
@@ -187,23 +228,15 @@ pub const AGENTS: &[Agent] = &[
 ];
 
 impl Agent {
-    /// The row that chooses its model, if it takes one.
-    pub fn model_setting(&self) -> Option<&Setting> {
-        self.settings
-            .iter()
-            .find(|setting| setting.label == "model")
+    /// The row that chooses `kind`, if it takes one.
+    pub fn setting(&self, kind: Kind) -> Option<&Setting> {
+        self.settings.iter().find(|setting| setting.kind == kind)
     }
 
-    /// The row that chooses how it asks before acting, if it has one.
-    pub fn mode_setting(&self) -> Option<&Setting> {
-        self.settings
-            .iter()
-            .find(|setting| setting.label != "model")
-    }
-
-    /// What its mode option can be given, past the default.
-    pub fn mode_values(&self) -> Vec<&'static str> {
-        match self.mode_setting().map(|setting| &setting.choices) {
+    /// What the option of the row that chooses `kind` can be given, past
+    /// the default; nothing when that row's choices aren't fixed.
+    pub fn values(&self, kind: Kind) -> Vec<&'static str> {
+        match self.setting(kind).map(|setting| &setting.choices) {
             Some(Choices::Fixed(choices)) => choices
                 .iter()
                 .map(|(_, value)| *value)

@@ -374,7 +374,7 @@ pub enum Action {
     /// `replacing`, or as a new one.
     SaveProfile {
         replacing: Option<String>,
-        profile: Profile,
+        profile: Box<Profile>,
     },
     /// Take the profile with this name out of the config file.
     DeleteProfile(String),
@@ -3262,7 +3262,7 @@ mod tests {
             press(&mut app, KeyCode::Enter),
             Some(Action::SaveProfile {
                 replacing: Some("review".into()),
-                profile: reviewer.clone()
+                profile: Box::new(reviewer.clone())
             })
         );
         // The event loop wrote it, and read the file again.
