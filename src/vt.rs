@@ -434,6 +434,15 @@ impl Screen {
             .collect()
     }
 
+    /// The screen's rows, after the last `history` rows of the history.
+    pub fn recent_rows(&self, history: usize) -> Vec<String> {
+        let grid = self.term.grid();
+        let first = -(grid.history_size().min(history) as i32);
+        (first..grid.screen_lines() as i32)
+            .map(|line| row_text(grid, Line(line)))
+            .collect()
+    }
+
     /// The history and the screen as text to read in an editor: a line
     /// that wrapped onto several rows is one line again, the blanks at the
     /// end of each are left off, and so are the empty rows after the last

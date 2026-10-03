@@ -126,6 +126,18 @@ Every command works on the current directory's project; `-C <dir>` names another
 | `waiting` | asking something: a permission, a choice, or a question it ended its turn on with its task open | `read` it, then answer: a permission or a choice with `send-keys` (a background task's permission with `crystal answer`), a question with `send` |
 | `exited N`, `killed (…)` | the program ended | `read` its last screen; `crystal respawn <name>` runs it again |
 
+To wait for one status in particular, or for a program to print something:
+
+```sh
+crystal wait reviewer --until waiting --timeout 600   # or working, done, idle, ended; several with commas
+crystal wait server --output 'listening on' --timeout 60   # a regular expression; prints the line
+```
+
+- `--until` fails when the program ends first, unless `ended` is one it waits for.
+- A turn that ends while the user watches it is `idle` at once, never `done`: wait for `done,idle`.
+- `--output` counts what's on the screen already, and the rows just above it.
+- `crystal events -n reviewer` prints what happened to a session, one line each; `--follow` keeps printing.
+
 ## Answer its questions
 
 When an agent asks for a permission or offers numbered choices, its status is `waiting`. Read the question,

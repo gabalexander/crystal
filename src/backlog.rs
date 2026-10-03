@@ -93,6 +93,10 @@ impl Store {
         open
     }
 
+    pub fn get(&self, number: u64) -> Option<&BacklogItem> {
+        self.items.iter().find(|item| item.number == number)
+    }
+
     pub fn open_count(&self) -> usize {
         self.items.iter().filter(|item| !item.done).count()
     }

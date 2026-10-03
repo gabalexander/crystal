@@ -8,6 +8,7 @@
 //! installed, and the two may not understand each other: the daemon checks
 //! the version before it reads the request, and says what to do.
 
+use crate::events::{Event, Filter, Since};
 use crate::flow_run::FlowRun;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -173,12 +174,30 @@ pub enum Request {
     BacklogCounts {
         projects: Vec<PathBuf>,
     },
-    /// A client made a worktree, or removed one, for the plugins that
-    /// listen for that.
-    Worktree {
-        path: PathBuf,
-        branch: Option<String>,
-        created: bool,
+    /// Something that happened outside the daemon, like a worktree a
+    /// client made or an entry it added to memory: the daemon numbers it,
+    /// writes it in the event log, and passes it on to whoever listens.
+    Emit {
+        event: Box<Event>,
+    },
+    /// Turn the connection into a stream of the events `filter` takes, one
+    /// JSON line each, after [`Response::Subscribed`]. With `since`, the
+    /// events the log has from then come first, so a client can catch up
+    /// without a gap.
+    Subscribe {
+        #[serde(default)]
+        filter: Filter,
+        #[serde(default)]
+        since: Option<Since>,
+    },
+    /// Wait until a line on a session's screen, or just scrolled off it,
+    /// matches the regular expression `pattern`, or `timeout_ms` has
+    /// passed.
+    WaitOutput {
+        name: String,
+        pattern: String,
+        #[serde(default)]
+        timeout_ms: Option<u64>,
     },
     /// Start a run of the flow called `flow` on `goal`, from `cwd`. Its
     /// steps' tasks start from the client's environment, `env`.
@@ -407,6 +426,15 @@ pub enum Response {
     Remind {
         text: String,
     },
+    /// The stream of events has started: the ones from the log come
+    /// first, those up to `seq`, then each new one as it happens.
+    Subscribed {
+        seq: u64,
+    },
+    /// The line on a session's screen that matched.
+    Matched {
+        line: String,
+    },
     Done,
     Error {
         message: String,
@@ -468,6 +496,17 @@ pub struct Spending {
 impl Spending {
     pub fn over_budget(&self) -> bool {
         self.daily_budget_usd > 0.0 && self.today_usd >= self.daily_budget_usd
+    }
+}
+
+impl SessionInfo {
+    /// The one word `ls` shows for it: what its agent is doing, when it
+    /// runs one that says, or else whether it's running or how it ended.
+    pub fn status(&self) -> String {
+        match (&self.state, self.activity) {
+            (State::Running, Some(activity)) => activity.to_string(),
+            (state, _) => state.to_string(),
+        }
     }
 }
 

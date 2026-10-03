@@ -542,6 +542,22 @@ text starts, not one that ended before it. `wait` returns once the agent isn't w
 it asks something, `idle`, or how its program exited. It takes a `--timeout` in seconds, and fails when that
 runs out. A program that doesn't say what it's doing counts as busy until it ends.
 
+`wait` can wait for something else instead:
+
+```sh
+crystal wait reviewer --until waiting         # until it asks something; prints waiting
+crystal wait reviewer --until done,idle       # any of them: working, waiting, done, idle, ended
+crystal wait server --output 'listening on'   # until a line on its screen matches; prints the line
+```
+
+`--until` returns at once if the session is there already, and catches a state it's in only a moment, like
+`working`. A turn that ends while someone watches it is `idle` at once, never `done`, so a script that doesn't
+mind waits for `done,idle`. `ended` (or `exited`) waits for its program to end; ending first, when that isn't
+what it waits for, is an error. `--output` takes a regular expression, matched a line at a time against the
+screen and the 200 rows above it, so output already there counts. Both take `--timeout`. Waits listen to the
+daemon's [events](#events) rather than asking it again and again, and `--output` looks each time the program
+writes.
+
 `send-keys` presses keys instead, the way tmux's does: key names like `Enter`, `Escape`, `Tab`, `Up`, `Down`,
 `BSpace`, `C-c` or `M-x`, and any other word typed as keys. That's what answers an agent's question, since
 agents don't act on a pasted answer. With `--wait`, it waits for the turn the answer lets carry on.
@@ -599,6 +615,61 @@ The install script installs it when it finds Claude Code (its `claude` command, 
 [`skill/SKILL.md`](skill/SKILL.md), and each crystal carries its own copy. After an upgrade, the daemon brings
 the skill up to date as it starts, when the copy installed is one an earlier crystal wrote and nobody has
 changed since; it never installs the skill where it isn't, or writes over one you've changed.
+
+### Events
+
+The daemon writes down everything that happens in an event log, kept in crystal's database
+(`~/.local/state/crystal/crystal.db`): sessions starting, working, waiting and ending, tasks opening and
+closing, background runs, what they asked and what they cost, flows, worktrees, memory and the backlog.
+`crystal events` prints it, one line each, the oldest first:
+
+```sh
+crystal events                        # all of it
+crystal events --since 2h             # or 30m, 3d, 14:00, 2026-10-01T09:30
+crystal events -n reviewer -k 'task.*'   # one session, through its renames; kinds or families, repeatable
+crystal events -C ~/code/app --json   # one project's, as JSON lines
+crystal events --follow               # new ones as they happen; with --since, catch up first
+```
+
+```
+14:03:07     session.started     reviewer  claude 'Review the diff on this branch'
+14:03:07     task.opened         reviewer  Review the diff on this branch
+14:03:09     session.working     reviewer  idle → working
+14:05:40     session.waiting     reviewer  working → waiting
+14:05:52     session.working     reviewer  waiting → working
+14:06:02     session.done        reviewer  working → done
+14:06:15     task.closed         reviewer  done: two risks in the retry loop
+```
+
+The time is `14:03:07` today, `09-24 14:03` earlier in the year, and the date before that.
+
+Each line of `--json` is one event, the same JSON the log keeps and plugins get: its `seq` (1, 2, 3…, never
+going back), `at` (milliseconds since the Unix epoch), its name as `event`, the `project` it's about, the
+`session` (its `name`, `id`, `command`, `cwd`, `project`, `worktree`, `branch`, `activity`, `task` and
+`status`, as `ls` words it), and what its kind carries: `from` (a renamed session's old name, or what its agent
+was doing before), `task` (with its `id`, `pending`, `waiting` and, once closed, its `outcome`), `run`
+(`prompt`; `asking`, with its `tool` and `gist`, and the `decision`; then `failed`, `answer` and `cost_usd`),
+`flow` (`run`, `flow`, `goal`, `step`, `state`, `said`, `cost_usd`), `worktree`, `memory` (the entry),
+`backlog` (the item) or `plugin` (`name` and `why`). New fields and events may appear; none goes away. The
+events are listed under [plugins](#events-1).
+
+A program can listen on the daemon's socket, as `--follow` does, with one line of JSON:
+
+```json
+{"type": "subscribe", "version": "0.3.0", "filter": {"kinds": ["session.waiting", "task.*"], "session": "reviewer"}, "since": {"seq": 41}}
+```
+
+`filter` takes `kinds` (names or patterns), a `session` by name or id and a `project` by the path of its main
+worktree, all optional. `since` is `{"seq": N}` for the events after that one, or `{"at": ms}` for those from
+that time; leave it out for new ones only. The daemon answers `{"type":"subscribed","seq":N}`, sends what the
+log has from `since` up to that `seq`, then each new event as it happens, one line each, so a client that
+reconnects with the last `seq` it saw misses nothing. One that falls more than 4096 events behind gets a last
+`{"type":"error",…}` line and is let go. `version` is crystal's own: the daemon refuses another's.
+
+The log keeps 30 days, or `keep_days` under `[events]` in the config (`0` keeps everything), and never more
+than 50,000 events; the daemon prunes it as it starts and every hour after, and the numbers never go back,
+however much is pruned. Events from outside the daemon, like `crystal remember`, reach the log through it,
+so one done with no daemon running isn't written down.
 
 ### Other machines
 
@@ -953,6 +1024,7 @@ crystal plugin disable github      # or enable; written under [plugins] in the c
 crystal plugin new notes           # a plugin to start from, in ~/.config/crystal/plugins/notes
 crystal plugin install <git-url>   # or a directory; shows what it runs and asks first
 crystal plugin run notes hello     # run one of its actions
+crystal plugin run notes --event session.waiting   # try its hooks on a made-up event
 crystal plugin log notes           # what its commands printed, and how they failed
 crystal plugin remove notes
 ```
@@ -1031,23 +1103,52 @@ It's in `crystal ls` while it's open, and ends when its program does or when you
 | Event | When |
 |---|---|
 | `session.started` | a session starts, or starts again |
+| `session.renamed` | a session gets another name |
+| `session.working` | a session's agent starts working on a turn |
 | `session.waiting` | a session's agent comes to wait on you |
-| `session.done` | a session's agent finishes a turn |
+| `session.done` | a session's agent finishes a turn nobody was watching |
+| `session.idle` | a session's agent is at its prompt, its turn seen |
 | `session.ended` | a session's program ends, or the session is killed |
-| `task.closed` | a task closes, done or failed |
+| `session.removed` | a session leaves the list: killed, or its worktree removed |
+| `task.opened` | a task is made: given to a session as it starts, made to start later, or opened again by a follow-up |
+| `task.started` | a task made to start later starts, in a session of its own |
+| `task.waiting` | a task's agent ends a turn with the task still open: it waits on you |
+| `task.closed` | a task closes, done, failed or cancelled |
+| `run.started` | a background task starts a run of Claude: its prompt, or a follow-up |
+| `run.asking` | a background task's Claude asks you for a permission |
+| `run.answered` | you answer it: allowed, allowed always, or denied |
+| `run.interrupted` | you stop a background task's run halfway |
+| `run.ended` | that run ends, with what the task has cost |
+| `flow.started` | a flow run starts |
+| `flow.step_started` | a flow run starts a step |
+| `flow.step_ended` | a step's run ends: done, at its gate, or failed |
+| `flow.gate` | a flow run waits at a gate for you |
+| `flow.gate_answered` | you approve a gate, or send the run back |
+| `flow.ended` | a flow run ends: every step done, or one failed |
 | `worktree.created` | crystal makes a worktree |
 | `worktree.removed` | crystal removes one |
+| `memory.added` | an entry is added to a project's memory: remembered, a task's outcome, or by the distiller |
+| `memory.forgotten` | an entry is forgotten |
+| `backlog.added` | an item goes on a project's backlog |
+| `backlog.closed` | an item is marked done |
+| `plugin.paused` | a plugin is paused for failing |
 
-A hook gets the event as a line of JSON on its standard input, and its name in `CRYSTAL_EVENT`:
+A hook gets the event as a line of JSON on its standard input, the same as the [event log](#events) keeps it,
+and its name in `CRYSTAL_EVENT`:
 
 ```json
-{"event":"session.waiting","session":{"name":"claude-2","id":"k3x9…","command":["claude"],"cwd":"/code/app",
- "project":"/code/app","worktree":"/code/app","branch":"main","activity":"waiting","task":"Fix the login redirect"}}
+{"seq":412,"at":1790949076244,"event":"session.waiting","project":"/code/app","session":{"name":"claude-2",
+ "id":"k3x9…","command":["claude"],"cwd":"/code/app","project":"/code/app","worktree":"/code/app",
+ "branch":"main","activity":"waiting","task":"Fix the login redirect","status":"waiting"},"from":"working"}
 ```
 
 `task.closed` has a `task`, with its `goal`, `session`, `project`, `branch` and `outcome` (whether it `failed`,
 its `summary`, and when it `closed`). The worktree events have a `worktree`, with its `path`, `branch` and,
-once it's made, `project`.
+once it's made, `project`. The rest are under [events](#events).
+
+`crystal plugin run <name> --event <event>` runs the plugin's hooks on that event, here and now, whether the
+plugin is on or not, on a made-up event with everything its kind carries, about the session `--session` names,
+or the one it's run in, or a made-up one. What they print is printed, and it exits as the first that failed.
 
 A plugin's hooks run one at a time, in the order things happened, and what they print goes to its log, kept in
 crystal's state directory. A hook still running after 30 seconds is stopped. After 5 failures in a row the
@@ -1076,6 +1177,7 @@ file and change. A setting crystal doesn't know is an error that names it, so a 
 | `[plugins]` | | which plugins are on and off: [plugins](#plugins) |
 | `[memory]` | | how memory's [distiller](#the-distiller) runs, and whether it [searches by meaning](#search-by-meaning) |
 | `[tasks]` | | what [background tasks](#background-tasks) may spend: `max_budget_usd` each (`5`), `daily_budget_usd` all together (none) |
+| `[events]` | | `keep_days`, how long the [event log](#events) keeps what happened: 30 days, or `0` for ever |
 
 `dark` and `light` paint their own background, so crystal looks the same in any terminal; `terminal` paints
 nothing and uses your terminal's own colors. With `NO_COLOR` set, crystal uses no color at all.
@@ -1188,6 +1290,7 @@ commands talk to it over a unix socket, so closing the TUI never stops an agent.
 - [x] Agents that start, message, wait on and read other agents
 - [x] Tasks that close done or failed, and a backlog per project
 - [x] Plugins: crystal's own switched on and off, and your own actions, panes and hooks
+- [x] An event log, a stream of events on the socket, and waits on it
 
 ## Development
 

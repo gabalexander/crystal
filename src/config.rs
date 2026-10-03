@@ -38,6 +38,8 @@ pub struct Config {
     pub memory: MemorySettings,
     /// What background tasks may spend: `[tasks]` in the file.
     pub tasks: TaskSettings,
+    /// How long the event log keeps what happened: `[events]` in the file.
+    pub events: EventSettings,
     /// Saved ways to start an agent, offered first in the new-session
     /// panel: `[[profile]]` tables in the file. See [`crate::profile`].
     #[serde(rename = "profile", skip_serializing_if = "Vec::is_empty")]
@@ -97,6 +99,20 @@ impl Default for TaskSettings {
     }
 }
 
+/// How long the event log keeps what happened: see [`crate::event_log`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct EventSettings {
+    /// How many days an event is kept; 0 keeps every one.
+    pub keep_days: u32,
+}
+
+impl Default for EventSettings {
+    fn default() -> EventSettings {
+        EventSettings { keep_days: 30 }
+    }
+}
+
 /// The TUI's colors to choose from. `dark` and `light` paint their own
 /// background, so they look the same in any terminal; `terminal` paints
 /// nothing and keeps to the terminal's own colors.
@@ -118,6 +134,7 @@ impl Default for Config {
             plugins: BTreeMap::new(),
             memory: MemorySettings::default(),
             tasks: TaskSettings::default(),
+            events: EventSettings::default(),
             profiles: Vec::new(),
             flows: Vec::new(),
         }
@@ -530,6 +547,14 @@ back_to = "build"
     }
 
     #[test]
+    fn the_event_log_keeps_a_month_unless_told() {
+        assert_eq!(Config::default().events.keep_days, 30);
+        let config = parse("[events]\nkeep_days = 0\n").unwrap();
+        assert_eq!(config.events.keep_days, 0);
+        assert!(parse("[events]\nkeep = 3\n").is_err());
+    }
+
+    #[test]
     fn a_leftover_preset_says_its_now_a_profile() {
         let err = parse("[[preset]]\nname = \"x\"\nagent = \"claude\"\n").unwrap_err();
         assert!(
@@ -556,6 +581,7 @@ back_to = "build"
                 max_budget_usd: 2.5,
                 daily_budget_usd: 20.0,
             },
+            events: EventSettings { keep_days: 7 },
             profiles: vec![Profile {
                 name: "review".into(),
                 description: Some("A second pair of eyes".into()),

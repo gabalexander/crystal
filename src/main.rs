@@ -14,6 +14,9 @@ mod distill;
 mod drive;
 mod embed;
 mod env;
+mod event_log;
+mod events;
+mod events_cli;
 mod flow_cli;
 mod flow_run;
 mod flows;
@@ -54,7 +57,7 @@ mod work;
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
 use profile::{Profile, StartIn};
-use protocol::{Request, Response, SessionInfo, State, TaskSpec, TaskState};
+use protocol::{Request, Response, SessionInfo, TaskSpec, TaskState};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -298,9 +301,57 @@ enum Command {
     Wait {
         name: String,
 
+        /// Wait for this instead, and print it once it's reached: working,
+        /// waiting, done, idle, or ended (exited). Several, with commas
+        /// between, wait for any of them.
+        #[arg(
+            long,
+            value_enum,
+            value_delimiter = ',',
+            value_name = "STATUS",
+            conflicts_with = "output"
+        )]
+        until: Vec<drive::Until>,
+
+        /// Wait until a line on its screen, or just scrolled off it,
+        /// matches this regular expression, and print the line.
+        #[arg(long, value_name = "REGEX")]
+        output: Option<String>,
+
         /// Give up after this many seconds, and fail.
         #[arg(long, value_name = "SECONDS")]
         timeout: Option<f64>,
+    },
+    /// Print what happened, from the event log, one line each, the oldest
+    /// first: sessions starting, working, waiting and ending, tasks, runs,
+    /// flows, worktrees, memory and the backlog.
+    Events {
+        /// Only those since then: a while back, like 30m, 2h or 3d, or a
+        /// time, like 14:00, 2026-10-01 or 2026-10-01T09:30.
+        #[arg(long, value_name = "WHEN")]
+        since: Option<String>,
+
+        /// Only events of this kind, or family, like session.waiting or
+        /// task.*; give it more than once for more.
+        #[arg(short, long = "kind", value_name = "KIND")]
+        kinds: Vec<String>,
+
+        /// Only those about this session, through its renames.
+        #[arg(short, long)]
+        name: Option<String>,
+
+        /// Only those about the project this directory is in.
+        #[arg(short = 'C', long = "dir", value_name = "DIR")]
+        dir: Option<PathBuf>,
+
+        /// Print them as JSON, one object a line, as the log keeps them.
+        #[arg(long)]
+        json: bool,
+
+        /// Then keep printing each new one as it happens; without --since,
+        /// only new ones.
+        #[arg(short, long)]
+        follow: bool,
     },
     /// Print what's on a session's screen.
     Read {
@@ -600,10 +651,19 @@ enum PluginCommand {
     Enable { name: String },
     /// Turn a plugin off.
     Disable { name: String },
-    /// Run one of a plugin's actions.
+    /// Run one of a plugin's actions, or try its hooks out on an event.
     Run {
         plugin: String,
-        action: String,
+
+        /// The action, by its id.
+        #[arg(required_unless_present = "event")]
+        action: Option<String>,
+
+        /// Run the plugin's hooks on a made-up event of this kind, like
+        /// session.waiting, here and now, on or off, and print what they
+        /// print.
+        #[arg(long, value_name = "KIND", conflicts_with = "action")]
+        event: Option<String>,
 
         /// The session to run it for [default: the one this runs in, if
         /// any]
@@ -790,7 +850,37 @@ fn run(cli: Cli) -> Result<()> {
                 drive::wait_for_turn(&socket, &name, seconds(timeout))?;
             }
         }
-        Command::Wait { name, timeout } => drive::wait(&socket, &name, seconds(timeout))?,
+        Command::Wait {
+            name,
+            until,
+            output,
+            timeout,
+        } => {
+            let timeout = seconds(timeout);
+            match output {
+                Some(pattern) => drive::wait_for_output(&socket, &name, &pattern, timeout)?,
+                None if until.is_empty() => drive::wait(&socket, &name, timeout)?,
+                None => drive::wait_until(&socket, &name, &until, timeout)?,
+            }
+        }
+        Command::Events {
+            since,
+            kinds,
+            name,
+            dir,
+            json,
+            follow,
+        } => {
+            let options = events_cli::Options {
+                since,
+                kinds,
+                session: name,
+                dir: dir.map(|dir| here(Some(dir))).transpose()?,
+                json,
+                follow,
+            };
+            events_cli::run(&socket, options)?;
+        }
         Command::Read {
             name,
             lines,
@@ -847,10 +937,17 @@ fn run(cli: Cli) -> Result<()> {
             Some(PluginCommand::Run {
                 plugin,
                 action,
+                event,
                 session,
             }) => {
-                let code = plugin_cli::run(&socket, &plugin, &action, session)?;
-                // The action's own exit code is crystal's.
+                let code = match (action, event) {
+                    (_, Some(event)) => plugin_cli::run_event(&socket, &plugin, &event, session)?,
+                    (action, None) => {
+                        let action = action.unwrap_or_default();
+                        plugin_cli::run(&socket, &plugin, &action, session)?
+                    }
+                };
+                // The action's or the hook's own exit code is crystal's.
                 std::process::exit(code);
             }
             Some(PluginCommand::Install {
@@ -1144,7 +1241,7 @@ fn print_sessions_json(sessions: &[SessionInfo]) -> Result<()> {
         .iter()
         .map(|session| ListedSession {
             session,
-            status: status(session),
+            status: session.status(),
         })
         .collect();
     println!("{}", serde_json::to_string_pretty(&listed)?);
@@ -1161,7 +1258,7 @@ fn print_sessions(sessions: &[SessionInfo]) {
             let (project, branch) = project_and_branch(session);
             [
                 session.name.clone(),
-                status(session),
+                session.status(),
                 session.pid.map_or("-".into(), |pid| pid.to_string()),
                 project,
                 branch,
@@ -1248,14 +1345,5 @@ fn project_and_branch(session: &SessionInfo) -> (String, String) {
             (worktree.project.clone(), branch.to_string())
         }
         None => ("-".into(), "-".into()),
-    }
-}
-
-/// What `ls` says about a session: what its agent is doing, when it runs
-/// one that says, or else whether it's running or how it ended.
-fn status(session: &SessionInfo) -> String {
-    match (&session.state, session.activity) {
-        (State::Running, Some(activity)) => activity.to_string(),
-        (state, _) => state.to_string(),
     }
 }

@@ -11,8 +11,8 @@ use crate::git::Checkout;
 use crate::keys;
 use crate::notify::{self, Notice};
 use crate::protocol::{
-    Activity, AgentEvent, Answer, Conversation, Front, SessionInfo, State, TaskInfo, TaskOutcome,
-    TaskRecord, TaskResult, TaskSpec, TaskState, TaskView,
+    Activity, AgentEvent, Answer, Asking, Conversation, Front, SessionInfo, State, TaskInfo,
+    TaskOutcome, TaskRecord, TaskResult, TaskSpec, TaskState, TaskView,
 };
 use crate::spending::Spending;
 use crate::state::SavedSession;
@@ -25,7 +25,7 @@ use std::collections::BTreeMap;
 use std::io::{self, ErrorKind, Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -92,7 +92,31 @@ pub struct Session {
     /// Tasks that closed of themselves, like a background task whose run
     /// ended, for the daemon to write down.
     closed: Vec<TaskRecord>,
+    /// What has happened to it since the daemon last asked, for it to tell.
+    changes: Vec<Change>,
     term: Arc<Term>,
+}
+
+/// Something that happened to a session, kept in order until the daemon
+/// takes it to tell.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Change {
+    /// Its agent went from doing one thing to another.
+    Activity {
+        from: Option<Activity>,
+        to: Option<Activity>,
+    },
+    /// A task's run started: its prompt, or a follow-up.
+    RunStarted { prompt: String },
+    /// That run ended, with what it came to.
+    RunEnded(TaskResult),
+    /// A background task's Claude asks the user for a permission.
+    Asking(Asking),
+    /// A task its run had closed opened again, with a follow-up.
+    Reopened,
+    /// Its agent's turn ended with its task still open: the task waits on
+    /// the user.
+    TaskWaiting,
 }
 
 impl Session {
@@ -168,6 +192,7 @@ impl Session {
             goal: None,
             reminded: false,
             closed: Vec::new(),
+            changes: Vec::new(),
             term,
         })
     }
@@ -222,6 +247,7 @@ impl Session {
             goal: None,
             reminded: false,
             closed: Vec::new(),
+            changes: Vec::new(),
             term,
         }
     }
@@ -323,7 +349,7 @@ impl Session {
         goal.outcome = Some(TaskOutcome::new(state, summary, closed));
         // A task that waited on the user asks nothing of them any more.
         if std::mem::take(&mut goal.waiting) && self.activity == Some(Activity::Waiting) {
-            self.activity = Some(Activity::Idle);
+            self.set_activity(Some(Activity::Idle));
         }
         *self.changed.lock().unwrap() = SystemTime::now();
         Ok(self.task_record().expect("the task was just closed"))
@@ -389,6 +415,12 @@ impl Session {
         std::mem::take(&mut self.closed)
     }
 
+    /// What has happened to it since this was last asked, in order, for
+    /// the daemon to tell.
+    pub fn take_changes(&mut self) -> Vec<Change> {
+        std::mem::take(&mut self.changes)
+    }
+
     /// The session's task as `crystal tasks` lists it, if it has one.
     pub fn task_record(&self) -> Option<TaskRecord> {
         let goal = self.goal.as_ref()?;
@@ -451,11 +483,6 @@ impl Session {
         *self.state.lock().unwrap() == State::Running
     }
 
-    /// What the session's agent is doing, when it reports that.
-    pub fn activity(&self) -> Option<Activity> {
-        self.activity
-    }
-
     pub fn info(&self) -> SessionInfo {
         SessionInfo {
             front: self.front.clone(),
@@ -482,15 +509,29 @@ impl Session {
         let mut activity = next_activity(self.activity, event, self.term.is_watched());
         if let Some(goal) = self.goal.as_mut().filter(|goal| goal.is_open()) {
             if turn_ended && tasks_on() {
-                goal.waiting = true;
+                if !std::mem::replace(&mut goal.waiting, true) {
+                    self.changes.push(Change::TaskWaiting);
+                }
                 activity = Some(Activity::Waiting);
             } else if matches!(event, AgentEvent::TurnStarted | AgentEvent::ToolFinished) {
                 goal.waiting = false;
             }
         }
         if activity != self.activity {
-            self.activity = activity;
+            self.set_activity(activity);
             *self.changed.lock().unwrap() = SystemTime::now();
+        }
+    }
+
+    /// Takes what the agent is doing now, noting the change for the daemon
+    /// to tell.
+    fn set_activity(&mut self, activity: Option<Activity>) {
+        if activity != self.activity {
+            self.changes.push(Change::Activity {
+                from: self.activity,
+                to: activity,
+            });
+            self.activity = activity;
         }
     }
 
@@ -512,29 +553,47 @@ impl Session {
         self.fail_task_if_ended();
     }
 
-    /// A background task closes itself when a run ends, from what Claude
-    /// said at the end, and opens again when a follow-up starts another. A
-    /// run the user stopped leaves it open.
+    /// Keeps up with a task's runs, noting each that starts and ends, and a
+    /// permission it comes to ask for. A background task closes itself when
+    /// a run ends, from what Claude said at the end, and opens again when a
+    /// follow-up starts another. A run the user stopped leaves it open.
     fn follow_runs(&mut self, event: AgentEvent) {
-        let Some(goal) = &mut self.goal else {
+        let Some(task) = &self.task else {
             return;
         };
         match event {
-            AgentEvent::TurnStarted if goal.outcome.is_some() => goal.outcome = None,
-            AgentEvent::TurnEnded if goal.outcome.is_none() => {
-                let Some(task) = &self.task else {
+            AgentEvent::TurnStarted => {
+                let prompt = task.last_prompt();
+                if let Some(goal) = &mut self.goal
+                    && goal.outcome.is_some()
+                {
+                    goal.outcome = None;
+                    self.changes.push(Change::Reopened);
+                }
+                self.changes.push(Change::RunStarted { prompt });
+            }
+            AgentEvent::Asking => {
+                if let Some(asking) = task.asking() {
+                    self.changes.push(Change::Asking(asking));
+                }
+            }
+            AgentEvent::TurnEnded => {
+                let Some(result) = task.result() else {
                     return;
                 };
-                let Some(result) = task.result().filter(|_| !task.was_interrupted()) else {
+                let interrupted = task.was_interrupted();
+                self.changes.push(Change::RunEnded(result.clone()));
+                let open = self.goal.as_ref().is_some_and(TaskInfo::is_open);
+                if !open || interrupted {
                     return;
-                };
-                let summary = result.text.lines().next().unwrap_or("").to_string();
+                }
+                let summary = result.text.lines().next().unwrap_or("");
                 let state = if result.failed {
                     TaskState::Failed
                 } else {
                     TaskState::Done
                 };
-                if let Ok(record) = self.close_task(state, &summary) {
+                if let Ok(record) = self.close_task(state, summary) {
                     self.closed.push(record);
                 }
             }
@@ -584,7 +643,7 @@ impl Session {
         }
         let agent_left = self.front.as_ref().is_some_and(Front::is_agent);
         if agent_left && self.activity.is_some() {
-            self.activity = None;
+            self.set_activity(None);
             *self.changed.lock().unwrap() = SystemTime::now();
         }
         self.screen_watch = ScreenWatch::default();
@@ -707,7 +766,7 @@ impl Session {
     /// Someone has just looked at the session.
     pub fn seen(&mut self) {
         if self.activity == Some(Activity::Done) {
-            self.activity = Some(Activity::Idle);
+            self.set_activity(Some(Activity::Idle));
         }
     }
 
@@ -758,6 +817,9 @@ struct Screen {
     /// answers come from here, whether anyone's watching or not.
     vt: vt::Screen,
     viewers: Vec<Viewer>,
+    /// Told each time there's output, but not watching: see
+    /// [`Term::listen`].
+    listeners: Vec<SyncSender<()>>,
     /// The program has closed its end: there will be no more output.
     ended: bool,
 }
@@ -785,6 +847,7 @@ impl Term {
             screen: Mutex::new(Screen {
                 vt: vt::Screen::answering(24, 80),
                 viewers: Vec::new(),
+                listeners: Vec::new(),
                 ended: false,
             }),
         }
@@ -813,6 +876,25 @@ impl Term {
             screen: snapshot,
             feed,
         }
+    }
+
+    /// A signal each time the program writes something, to look at the
+    /// screen again: never more than one waiting, however much it writes,
+    /// and none after it has ended. Unlike a viewer, a listener isn't
+    /// watching, so the session isn't seen for it.
+    pub fn listen(&self) -> Receiver<()> {
+        let mut screen = self.screen.lock().unwrap();
+        let (signal, listener) = mpsc::sync_channel(1);
+        if !screen.ended {
+            screen.listeners.push(signal);
+        }
+        listener
+    }
+
+    /// The screen, one string per row, after the last `history` rows of
+    /// the history.
+    pub fn recent_rows(&self, history: usize) -> Vec<String> {
+        self.screen.lock().unwrap().vt.recent_rows(history)
     }
 
     /// What the screen says the agent is doing.
@@ -884,6 +966,7 @@ impl Term {
         let mut screen = self.screen.lock().unwrap();
         screen.ended = true;
         screen.viewers.clear();
+        screen.listeners.clear();
     }
 
     /// Reads the program's output until it closes the terminal, and answers
@@ -918,6 +1001,11 @@ impl Term {
         screen
             .viewers
             .retain(|viewer| viewer.feed.try_send(chunk.clone()).is_ok());
+        // One signal waiting is enough: the listener looks at the screen as
+        // it is then.
+        screen.listeners.retain(|listener| {
+            !matches!(listener.try_send(()), Err(TrySendError::Disconnected(_)))
+        });
         screen.vt.take_replies()
     }
 }

@@ -4638,6 +4638,13 @@ fn a_permission_a_task_asks_for_waits_on_the_user_until_they_answer() {
         "localSettings"
     );
     shows_on_screen(&crystal, "fixer", "└ allowed always · Bash(cargo test:*)");
+    let logged = events(
+        &crystal,
+        &["-n", "fixer", "-k", "run.asking", "-k", "run.answered"],
+    );
+    assert_eq!(names(&logged), ["run.asking", "run.answered"]);
+    assert_eq!(logged[0]["run"]["asking"]["gist"], "cargo test");
+    assert_eq!(logged[1]["run"]["decision"], "always");
     eventually("the task is done", || status(&crystal, "fixer") == "done");
     assert!(listed(&crystal, "fixer")["asking"].is_null());
     let late = crystal.fails(&["answer", "fixer", "y"]);
@@ -4675,6 +4682,13 @@ fn an_interrupted_run_leaves_its_task_open_waiting_on_the_user() {
     crystal.ok(&["interrupt", "fixer"]);
     eventually("the task waits on the user", || {
         status(&crystal, "fixer") == "waiting"
+    });
+    eventually("the log says why", || {
+        let logged = events(
+            &crystal,
+            &["-n", "fixer", "-k", "run.interrupted", "-k", "task.*"],
+        );
+        names(&logged) == ["task.opened", "run.interrupted", "task.waiting"]
     });
     shows_on_screen(&crystal, "fixer", "interrupted");
     let tasks = crystal.ok(&["tasks"]);
@@ -5789,6 +5803,14 @@ fn a_task_made_to_wait_is_pending_until_it_starts() {
         again.contains("there's no task t1 waiting to start"),
         "{again}"
     );
+    let logged = events(&crystal, &["-k", "task.*"]);
+    assert_eq!(
+        names(&logged),
+        ["task.opened", "task.started", "task.closed"]
+    );
+    assert_eq!(logged[0]["task"]["pending"], true);
+    assert_eq!(logged[0]["task"]["id"], 1);
+    assert_eq!(logged[1]["session"]["name"], "later");
 }
 
 #[test]
@@ -5831,6 +5853,18 @@ fn cancelling_a_task_stops_its_session_and_killing_a_session_cancels_its_task() 
     assert!(
         tasks.contains("t3    cancelled  doomed") && tasks.contains("dig — its session was killed"),
         "{tasks}"
+    );
+    let closed = events(&crystal, &["-k", "task.closed"]);
+    let cancelled: Vec<&serde_json::Value> = closed
+        .iter()
+        .map(|event| &event["task"]["outcome"]["cancelled"])
+        .collect();
+    assert_eq!(cancelled, [true, true, true]);
+    assert!(closed[0].get("session").is_none(), "it never had one");
+    let printed = crystal.ok(&["events", "-k", "task.closed", "-n", "doomed"]);
+    assert!(
+        printed.contains("cancelled: its session was killed"),
+        "{printed}"
     );
 }
 
@@ -6462,10 +6496,15 @@ command = ["sh", "hook.sh"]
         .collect();
     assert_eq!(
         events,
-        ["session.started", "session.waiting", "session.done"],
+        [
+            "session.started",
+            "session.working",
+            "session.waiting",
+            "session.done"
+        ],
         "{heard}"
     );
-    let waiting = heard.lines().nth(1).unwrap();
+    let waiting = heard.lines().nth(2).unwrap();
     let json = waiting
         .strip_prefix("session.waiting agent ")
         .unwrap_or_else(|| panic!("{waiting}"));
@@ -6473,6 +6512,7 @@ command = ["sh", "hook.sh"]
     assert_eq!(json["event"], "session.waiting");
     assert_eq!(json["session"]["name"], "agent");
     assert_eq!(json["session"]["activity"], "waiting");
+    assert_eq!(json["from"], "working");
 }
 
 #[test]
@@ -7169,4 +7209,438 @@ fn with_the_flows_plugin_off_its_commands_say_so() {
     assert!(!out.status.success());
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("the flows plugin is off"), "{err}");
+}
+
+/// The events `crystal events --json` prints with `args`, each one parsed.
+fn events(crystal: &Crystal, args: &[&str]) -> Vec<serde_json::Value> {
+    let mut all = vec!["events", "--json"];
+    all.extend(args);
+    crystal
+        .ok(&all)
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+/// The names of `events`, in order.
+fn names(events: &[serde_json::Value]) -> Vec<String> {
+    events
+        .iter()
+        .map(|event| event["event"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// Reads what a command prints, a line at a time, on a thread of its own,
+/// so a test can wait for the next line without hanging on it forever.
+fn lines_of(child: &mut std::process::Child) -> std::sync::mpsc::Receiver<String> {
+    use std::io::BufRead;
+    let stdout = child.stdout.take().unwrap();
+    let (lines, receiver) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        for line in std::io::BufReader::new(stdout)
+            .lines()
+            .map_while(Result::ok)
+        {
+            if lines.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    receiver
+}
+
+fn next_line(lines: &std::sync::mpsc::Receiver<String>) -> String {
+    lines
+        .recv_timeout(Duration::from_secs(5))
+        .expect("a line within 5s")
+}
+
+#[test]
+fn the_event_log_keeps_what_happened_to_a_session_through_its_renames() {
+    let crystal = Crystal::new();
+    crystal.ok(&["new", "-d", "-n", "brief", "sh", "-c", "read go; exit 4"]);
+    crystal.ok(&["rename", "brief", "memo"]);
+    crystal.ok(&["send", "memo", "go"]);
+    assert_eq!(crystal.ok(&["wait", "memo"]), "exited 4\n");
+    // The daemon tells of an end as it next looks over its sessions.
+    eventually("its end is in the log", || {
+        crystal
+            .ok(&["events", "-n", "memo"])
+            .contains("session.ended")
+    });
+
+    let about_memo = events(&crystal, &["-n", "memo"]);
+    assert_eq!(
+        names(&about_memo),
+        ["session.started", "session.renamed", "session.ended"]
+    );
+    let seqs: Vec<u64> = about_memo
+        .iter()
+        .map(|e| e["seq"].as_u64().unwrap())
+        .collect();
+    assert!(seqs.windows(2).all(|pair| pair[0] < pair[1]), "{seqs:?}");
+    assert_eq!(about_memo[1]["from"], "brief");
+    assert_eq!(about_memo[2]["session"]["status"], "exited 4");
+
+    crystal.ok(&["kill", "memo"]);
+    // Gone, it's known by the names it had.
+    assert_eq!(
+        names(&events(&crystal, &["-n", "brief"])),
+        ["session.started"]
+    );
+    assert_eq!(
+        names(&events(&crystal, &["-n", "memo", "-k", "session.removed"])),
+        ["session.removed"]
+    );
+    assert!(events(&crystal, &["--since", "0s"]).is_empty());
+
+    let printed = crystal.ok(&["events", "-k", "session.renamed"]);
+    assert!(
+        printed.contains("session.renamed     memo  was brief"),
+        "{printed}"
+    );
+    let err = crystal.fails(&["events", "-k", "sesion.*"]);
+    assert!(err.contains("matches no event"), "{err}");
+    let err = crystal.fails(&["events", "--since", "yesterday"]);
+    assert!(err.contains("nor a time"), "{err}");
+}
+
+#[test]
+fn events_follow_catches_up_from_the_log_then_streams_what_happens() {
+    let crystal = Crystal::new();
+    crystal.ok(&["new", "-d", "-n", "first", "sleep", "30"]);
+    let follow = |args: &[&str]| {
+        let mut all = vec!["events", "--follow", "--json", "-k", "session.started"];
+        all.extend(args);
+        let mut child = crystal
+            .command(&all)
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let lines = lines_of(&mut child);
+        (child, lines)
+    };
+    let parse = |line: String| -> serde_json::Value { serde_json::from_str(&line).unwrap() };
+    let (mut caught_up, caught_up_lines) = follow(&["--since", "1h"]);
+    let first = parse(next_line(&caught_up_lines));
+    assert_eq!(first["session"]["name"], "first");
+
+    // Without --since, it hears only what happens once it's listening.
+    let (mut new_only, new_only_lines) = follow(&[]);
+    let heard = (0..25).find_map(|n| {
+        crystal.ok(&["new", "-d", "-n", &format!("probe-{n}"), "sleep", "30"]);
+        new_only_lines.recv_timeout(Duration::from_millis(200)).ok()
+    });
+    let heard = parse(heard.expect("the follower heard a session start"));
+    assert!(
+        heard["session"]["name"]
+            .as_str()
+            .unwrap()
+            .starts_with("probe-")
+    );
+
+    let next = parse(next_line(&caught_up_lines));
+    assert_eq!(next["session"]["name"], "probe-0");
+    assert!(next["seq"].as_u64() > first["seq"].as_u64());
+    caught_up.kill().unwrap();
+    new_only.kill().unwrap();
+}
+
+#[test]
+fn wait_until_catches_a_state_however_short_and_fails_when_the_program_ends_first() {
+    let crystal = Crystal::new();
+    crystal.ok(&["new", "-n", "agent", "sleep", "30"]);
+    let hook = format!("'{CRYSTAL}' hook claude");
+    let waiting_for = |until: &str| {
+        crystal
+            .command(&["wait", "agent", "--until", until])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap()
+    };
+    let printed = |child: std::process::Child| {
+        let out = child.wait_with_output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap()
+    };
+
+    // Working only a moment, between two reports, still counts. However
+    // long the wait takes to start listening, a turn after that is heard.
+    let mut working = waiting_for("working");
+    eventually("the wait has seen it working", || {
+        run_hook(
+            &crystal,
+            "agent",
+            &hook,
+            r#"{"hook_event_name":"UserPromptSubmit"}"#,
+        );
+        run_hook(&crystal, "agent", &hook, r#"{"hook_event_name":"Stop"}"#);
+        working.try_wait().unwrap().is_some()
+    });
+    assert_eq!(printed(working), "working\n");
+    assert_eq!(
+        crystal.ok(&["wait", "agent", "--until", "waiting,done"]),
+        "done\n"
+    );
+
+    let err = crystal.fails(&["wait", "agent", "--until", "waiting", "--timeout", "0.3"]);
+    assert!(err.contains("agent wasn't waiting after 0.3s"), "{err}");
+
+    crystal.ok(&["new", "-n", "brief", "sh", "-c", "read go; exit 4"]);
+    let waiting = crystal
+        .command(&["wait", "brief", "--until", "waiting"])
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // It ends only once it's sent a line, and fails the wait either way.
+    crystal.ok(&["send", "brief", "go"]);
+    let out = waiting.wait_with_output().unwrap();
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("brief ended (exited 4) without being waiting"),
+        "{err}"
+    );
+    assert_eq!(
+        crystal.ok(&["wait", "brief", "--until", "exited"]),
+        "exited 4\n"
+    );
+}
+
+#[test]
+fn wait_output_returns_the_line_that_matches_once_it_shows() {
+    let crystal = Crystal::new();
+    let script = "echo booting; read go; echo ready on port 4000; sleep 30";
+    crystal.ok(&["new", "-n", "server", "sh", "-c", script]);
+    shows_on_screen(&crystal, "server", "booting");
+
+    let waiting = crystal
+        .command(&["wait", "server", "--output", "port [0-9]+"])
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Before the line or after it, the wait ends on it.
+    crystal.ok(&["send", "server", "go"]);
+    let out = waiting.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(out.stdout).unwrap(),
+        "ready on port 4000\n"
+    );
+
+    // What's on screen already counts.
+    assert_eq!(
+        crystal.ok(&["wait", "server", "--output", "boot"]),
+        "booting\n"
+    );
+    let err = crystal.fails(&["wait", "server", "--output", "crashed", "--timeout", "0.3"]);
+    assert!(
+        err.contains("nothing on server's screen matched `crashed` after 0.3s"),
+        "{err}"
+    );
+    let err = crystal.fails(&["wait", "server", "--output", "("]);
+    assert!(err.contains("isn't a regular expression"), "{err}");
+
+    crystal.ok(&["new", "-n", "quiet", "sh", "-c", "read go"]);
+    let waiting = crystal
+        .command(&["wait", "quiet", "--output", "never"])
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    crystal.ok(&["send", "quiet", "go"]);
+    let out = waiting.wait_with_output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("quiet has ended, and nothing on its screen matches"),
+        "{err}"
+    );
+}
+
+#[test]
+fn a_background_task_s_runs_and_its_task_are_in_the_log() {
+    let crystal = Crystal::new();
+    let dir = crystal.dir.path();
+    let path = path_with(&print_claude(dir));
+    finish_run(dir, 1);
+    let out = crystal
+        .command(&["task", "--wait", "-n", "fixer", "fix the tests"])
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    eventually("the task has closed", || {
+        crystal
+            .ok(&["events", "-k", "task.closed"])
+            .contains("fixer")
+    });
+
+    let logged = events(&crystal, &["-n", "fixer"]);
+    assert_eq!(
+        names(&logged),
+        [
+            "session.started",
+            "task.opened",
+            "run.started",
+            "session.working",
+            "run.ended",
+            "session.done",
+            "task.closed"
+        ]
+    );
+    assert_eq!(logged[2]["run"]["prompt"], "fix the tests");
+    assert_eq!(logged[4]["run"]["cost_usd"], 0.0421);
+    assert_eq!(logged[4]["run"]["answer"], "All green on run 1.");
+    assert_eq!(logged[6]["task"]["outcome"]["failed"], false);
+}
+
+#[test]
+fn the_backlog_and_memory_tell_the_log_what_changed() {
+    let (crystal, repo) = crystal_remembering();
+    let repo_dir = repo.to_str().unwrap();
+    // Memory is kept by whoever's asked; the daemon has to be there to hear.
+    crystal.ok(&["new", "-d", "-n", "here", "sleep", "30"]);
+    crystal.ok(&["backlog", "-C", repo_dir, "add", "Retry", "the", "webhook"]);
+    crystal.ok(&["backlog", "-C", repo_dir, "done", "1"]);
+    crystal.ok(&[
+        "remember",
+        "-C",
+        repo_dir,
+        "The ledger tests need the database",
+    ]);
+    crystal.ok(&["memory", "-C", repo_dir, "rm", "1"]);
+
+    let logged = events(&crystal, &["-C", repo_dir]);
+    assert_eq!(
+        names(&logged),
+        [
+            "backlog.added",
+            "backlog.closed",
+            "memory.added",
+            "memory.forgotten"
+        ]
+    );
+    assert_eq!(logged[0]["backlog"]["text"], "Retry the webhook");
+    assert_eq!(logged[1]["backlog"]["done"], true);
+    assert_eq!(
+        logged[2]["memory"]["text"],
+        "The ledger tests need the database"
+    );
+    let printed = crystal.ok(&["events", "-k", "memory.*"]);
+    assert!(
+        printed.contains("1 (note) The ledger tests need the database"),
+        "{printed}"
+    );
+}
+
+#[test]
+fn a_flow_s_steps_and_gate_are_in_the_log() {
+    let crystal = Crystal::new();
+    crystal.configure(FLOWS);
+    let dir = crystal.dir.path();
+    let path = path_with(&flow_claude(dir));
+    let out = flow_ok(&crystal, &path, &["gated", "add retries", "--wait"]);
+    assert_eq!(out, "gated-1\nwaiting at plan\n");
+    crystal.ok(&["flow", "approve", "gated-1"]);
+    assert_eq!(flow_waits(&crystal, "gated-1"), "done\n");
+
+    let logged = events(&crystal, &["-k", "flow.*"]);
+    assert_eq!(
+        names(&logged),
+        [
+            "flow.started",
+            "flow.step_started",
+            "flow.step_ended",
+            "flow.gate",
+            "flow.gate_answered",
+            "flow.step_started",
+            "flow.step_ended",
+            "flow.ended"
+        ]
+    );
+    let flow = |n: usize| logged[n]["flow"].clone();
+    assert_eq!(flow(0)["run"], "gated-1");
+    assert_eq!(flow(1)["step"], "plan");
+    assert_eq!(logged[1]["session"]["name"], "gated-1-plan");
+    assert_eq!(flow(2)["state"], "waiting");
+    assert_eq!(flow(2)["said"], "answer 1");
+    assert_eq!(flow(4)["state"], "approved");
+    assert_eq!(flow(7)["state"], "done");
+    assert_eq!(flow(7)["cost_usd"], 1.0);
+}
+
+#[test]
+fn plugin_run_event_tries_a_plugin_s_hooks_on_a_made_up_event() {
+    let crystal = Crystal::new();
+    let manifest = r#"
+name = "listener"
+version = "1.0.0"
+
+[[events]]
+on = "task.*"
+command = ["sh", "hook.sh"]
+"#;
+    let hook = r#"printf '%s ' "$CRYSTAL_EVENT"; cat; [ -z "$FAIL" ]"#;
+    plugin(&crystal, "listener", manifest, &[("hook.sh", hook)]);
+
+    // Off, it's tried all the same.
+    let out = crystal.ok(&["plugin", "run", "listener", "--event", "task.closed"]);
+    let json = out
+        .strip_prefix("task.closed ")
+        .unwrap_or_else(|| panic!("{out}"));
+    let event: serde_json::Value = serde_json::from_str(json.trim()).unwrap();
+    assert_eq!(event["event"], "task.closed");
+    assert_eq!(event["task"]["outcome"]["failed"], false);
+    assert_eq!(event["session"]["name"], "example");
+
+    let out = crystal
+        .command(&["plugin", "run", "listener", "--event", "task.opened"])
+        .env("FAIL", "1")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let err = crystal.fails(&["plugin", "run", "listener", "--event", "session.done"]);
+    assert!(
+        err.contains("listener has no hook on session.done"),
+        "{err}"
+    );
+    let err = crystal.fails(&["plugin", "run", "listener", "--event", "task.*"]);
+    assert!(err.contains("say one event"), "{err}");
+}
+
+#[test]
+fn an_event_plugin_hears_what_happens_beyond_sessions() {
+    let crystal = Crystal::new();
+    let manifest = r#"
+name = "listener"
+version = "1.0.0"
+
+[[events]]
+on = "backlog.added"
+command = ["sh", "hook.sh"]
+"#;
+    let hook = r#"{ printf '%s ' "$CRYSTAL_EVENT"; cat; } >> heard"#;
+    let dir = plugin(&crystal, "listener", manifest, &[("hook.sh", hook)]);
+    crystal.ok(&["plugin", "enable", "listener"]);
+    crystal.ok(&["backlog", "add", "Retry", "the", "webhook"]);
+    let heard = dir.join("heard");
+    eventually("the plugin hears of it", || heard.exists());
+    let heard = std::fs::read_to_string(&heard).unwrap();
+    let json = heard
+        .strip_prefix("backlog.added ")
+        .unwrap_or_else(|| panic!("{heard}"));
+    let event: serde_json::Value = serde_json::from_str(json.trim()).unwrap();
+    assert_eq!(event["backlog"]["text"], "Retry the webhook");
+    assert!(event["seq"].as_u64().unwrap() > 0);
 }

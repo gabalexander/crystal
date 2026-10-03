@@ -1,0 +1,1105 @@
+//! What happens in crystal, as events: the one [`Event`] the daemon writes
+//! in its log, streams to the clients that subscribe and hands to plugins'
+//! `[[events]]` hooks, so that a script, an agent and a plugin all see the
+//! same thing. [`crate::event_log`] keeps the log and does the handing on.
+//!
+//! An event is one JSON object: its `seq` in the log, when it happened
+//! (`at`), what happened (`event`, one of [`Kind`]'s names), the `project`
+//! and `session` it's about, and whatever its kind carries besides, like the
+//! `task` that closed. Plugins listen for events by name, so a name, once
+//! given, stays.
+
+use crate::flow_run::{FlowRun, StepState};
+use crate::memory::{self, Entry};
+use crate::plugin_manifest;
+use crate::project;
+use crate::protocol::{
+    Activity, Answer, Asking, BacklogItem, SessionInfo, State, TaskOutcome, TaskRecord, TaskResult,
+    TaskState,
+};
+use crate::shell;
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// What happened. A kind can be added, but never renamed or taken away.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(into = "&'static str", try_from = "String")]
+pub enum Kind {
+    SessionStarted,
+    SessionRenamed,
+    SessionWorking,
+    SessionWaiting,
+    SessionDone,
+    SessionIdle,
+    SessionEnded,
+    SessionRemoved,
+    TaskOpened,
+    TaskStarted,
+    TaskWaiting,
+    TaskClosed,
+    RunStarted,
+    RunAsking,
+    RunAnswered,
+    RunInterrupted,
+    RunEnded,
+    FlowStarted,
+    FlowStepStarted,
+    FlowStepEnded,
+    FlowGate,
+    FlowGateAnswered,
+    FlowEnded,
+    WorktreeCreated,
+    WorktreeRemoved,
+    MemoryAdded,
+    MemoryForgotten,
+    BacklogAdded,
+    BacklogClosed,
+    PluginPaused,
+}
+
+impl Kind {
+    pub const ALL: [Kind; 30] = [
+        Kind::SessionStarted,
+        Kind::SessionRenamed,
+        Kind::SessionWorking,
+        Kind::SessionWaiting,
+        Kind::SessionDone,
+        Kind::SessionIdle,
+        Kind::SessionEnded,
+        Kind::SessionRemoved,
+        Kind::TaskOpened,
+        Kind::TaskStarted,
+        Kind::TaskWaiting,
+        Kind::TaskClosed,
+        Kind::RunStarted,
+        Kind::RunAsking,
+        Kind::RunAnswered,
+        Kind::RunInterrupted,
+        Kind::RunEnded,
+        Kind::FlowStarted,
+        Kind::FlowStepStarted,
+        Kind::FlowStepEnded,
+        Kind::FlowGate,
+        Kind::FlowGateAnswered,
+        Kind::FlowEnded,
+        Kind::WorktreeCreated,
+        Kind::WorktreeRemoved,
+        Kind::MemoryAdded,
+        Kind::MemoryForgotten,
+        Kind::BacklogAdded,
+        Kind::BacklogClosed,
+        Kind::PluginPaused,
+    ];
+
+    /// Its name, which is how plugins, filters and the log know it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Kind::SessionStarted => "session.started",
+            Kind::SessionRenamed => "session.renamed",
+            Kind::SessionWorking => "session.working",
+            Kind::SessionWaiting => "session.waiting",
+            Kind::SessionDone => "session.done",
+            Kind::SessionIdle => "session.idle",
+            Kind::SessionEnded => "session.ended",
+            Kind::SessionRemoved => "session.removed",
+            Kind::TaskOpened => "task.opened",
+            Kind::TaskStarted => "task.started",
+            Kind::TaskWaiting => "task.waiting",
+            Kind::TaskClosed => "task.closed",
+            Kind::RunStarted => "run.started",
+            Kind::RunAsking => "run.asking",
+            Kind::RunAnswered => "run.answered",
+            Kind::RunInterrupted => "run.interrupted",
+            Kind::RunEnded => "run.ended",
+            Kind::FlowStarted => "flow.started",
+            Kind::FlowStepStarted => "flow.step_started",
+            Kind::FlowStepEnded => "flow.step_ended",
+            Kind::FlowGate => "flow.gate",
+            Kind::FlowGateAnswered => "flow.gate_answered",
+            Kind::FlowEnded => "flow.ended",
+            Kind::WorktreeCreated => "worktree.created",
+            Kind::WorktreeRemoved => "worktree.removed",
+            Kind::MemoryAdded => "memory.added",
+            Kind::MemoryForgotten => "memory.forgotten",
+            Kind::BacklogAdded => "backlog.added",
+            Kind::BacklogClosed => "backlog.closed",
+            Kind::PluginPaused => "plugin.paused",
+        }
+    }
+
+    pub fn named(name: &str) -> Option<Kind> {
+        Kind::ALL.into_iter().find(|kind| kind.name() == name)
+    }
+
+    /// The event for a session's agent coming to do `activity`.
+    pub fn of_activity(activity: Activity) -> Kind {
+        match activity {
+            Activity::Working => Kind::SessionWorking,
+            Activity::Waiting => Kind::SessionWaiting,
+            Activity::Done => Kind::SessionDone,
+            Activity::Idle => Kind::SessionIdle,
+        }
+    }
+}
+
+impl From<Kind> for &'static str {
+    fn from(kind: Kind) -> &'static str {
+        kind.name()
+    }
+}
+
+impl TryFrom<String> for Kind {
+    type Error = String;
+
+    fn try_from(name: String) -> Result<Kind, String> {
+        Kind::named(&name).ok_or_else(|| format!("there's no event called {name}"))
+    }
+}
+
+/// Something that happened. Only the fields its kind carries are there.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Event {
+    /// Its place in the log: 1 for the first event, and one more for each
+    /// after it. The daemon gives it as it writes the event down.
+    #[serde(default)]
+    pub seq: u64,
+    /// When it happened, in milliseconds since the Unix epoch.
+    #[serde(default)]
+    pub at: u64,
+    #[serde(rename = "event")]
+    pub kind: Kind,
+    /// The project it's about: its main worktree, or the directory itself
+    /// outside git.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<SessionAbout>,
+    /// What it was before: a renamed session's old name, or what its agent
+    /// was doing before it changed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<TaskRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<RunAbout>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flow: Option<FlowAbout>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<WorktreeAbout>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<Entry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backlog: Option<BacklogItem>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin: Option<PluginAbout>,
+}
+
+/// The session an event is about, as it was then.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionAbout {
+    pub name: String,
+    pub id: String,
+    pub command: Vec<String>,
+    pub cwd: PathBuf,
+    /// Its project's main worktree, when it runs in git.
+    pub project: Option<PathBuf>,
+    /// The worktree it runs in, when it runs in git.
+    pub worktree: Option<PathBuf>,
+    pub branch: Option<String>,
+    pub activity: Option<Activity>,
+    /// What it was asked to do, when it has a task.
+    pub task: Option<String>,
+    /// The word `ls` shows for it: `waiting`, `running`, `exited 0`.
+    #[serde(default)]
+    pub status: String,
+}
+
+/// A background task's run of `claude -p`: what it was asked as it starts,
+/// the permissions it asks for and how they're answered, and how it went
+/// once it has ended.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RunAbout {
+    /// The first line of the task's prompt, or of a follow-up.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+    /// The permission Claude asks for, or that was answered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asking: Option<Asking>,
+    /// How the user answered it: `allow`, `deny` or `always`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision: Option<Answer>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed: Option<bool>,
+    /// The first line of Claude's answer, or of what went wrong.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer: Option<String>,
+    /// What the task has cost so far, in US dollars, as Claude counts it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
+}
+
+/// A flow run, and the step an event is about.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FlowAbout {
+    /// The run's name: `ship-1`.
+    pub run: String,
+    /// The flow it runs, by its name in the config file.
+    pub flow: String,
+    pub goal: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step: Option<String>,
+    /// How the step, or the whole run, stands: `running`, `waiting`, `done`
+    /// or `failed`; for a gate answered, `approved` or `sent back`.
+    pub state: String,
+    /// The first line of a step's answer or of why it failed, or the notes
+    /// a gate was sent back with.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub said: Option<String>,
+    /// What a step's run cost, or once the run ends, all of it, in US
+    /// dollars.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
+}
+
+/// A worktree crystal made or removed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorktreeAbout {
+    pub path: PathBuf,
+    pub branch: Option<String>,
+    /// Its project's main worktree. A removed worktree's directory is gone,
+    /// so git can't say which project it was in.
+    pub project: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginAbout {
+    pub name: String,
+    pub why: String,
+}
+
+impl Event {
+    /// An event of `kind` about nothing yet, for the constructors to fill
+    /// in. The daemon gives it its `seq` and `at`.
+    pub fn new(kind: Kind) -> Event {
+        Event {
+            seq: 0,
+            at: 0,
+            kind,
+            project: None,
+            session: None,
+            from: None,
+            task: None,
+            run: None,
+            flow: None,
+            worktree: None,
+            memory: None,
+            backlog: None,
+            plugin: None,
+        }
+    }
+
+    /// An event of `kind` about `session`, as it is now.
+    pub fn about_session(kind: Kind, session: &SessionInfo) -> Event {
+        let project = match &session.worktree {
+            Some(worktree) => worktree.project_path.clone(),
+            None => project::of(&session.cwd).path,
+        };
+        Event {
+            project: Some(project),
+            session: Some(SessionAbout::of(session)),
+            ..Event::new(kind)
+        }
+    }
+
+    /// An event of `kind` about the project whose main worktree is
+    /// `project`.
+    pub fn about_project(kind: Kind, project: PathBuf) -> Event {
+        Event {
+            project: Some(project),
+            ..Event::new(kind)
+        }
+    }
+
+    /// `session`'s agent went from doing `from` to doing `to`.
+    pub fn activity(session: &SessionInfo, from: Option<Activity>, to: Activity) -> Event {
+        let mut event = Event::about_session(Kind::of_activity(to), session);
+        if let Some(about) = &mut event.session {
+            about.activity = Some(to);
+            about.status = to.to_string();
+        }
+        Event {
+            from: from.map(|from| from.to_string()),
+            ..event
+        }
+    }
+
+    /// `session` was given another name; `from` is the one it had.
+    pub fn renamed(session: &SessionInfo, from: &str) -> Event {
+        Event {
+            from: Some(from.to_string()),
+            ..Event::about_session(Kind::SessionRenamed, session)
+        }
+    }
+
+    /// `session`'s program ended, as `status` says: `exited 0`, or
+    /// `killed` for one stopped as it left the list.
+    pub fn ended(session: &SessionInfo, status: String) -> Event {
+        let mut event = Event::about_session(Kind::SessionEnded, session);
+        if let Some(about) = &mut event.session {
+            about.status = status;
+        }
+        event
+    }
+
+    /// `session`'s task opened or closed, as `task` says.
+    pub fn task(kind: Kind, session: &SessionInfo, task: TaskRecord) -> Event {
+        Event {
+            task: Some(task),
+            ..Event::about_session(kind, session)
+        }
+    }
+
+    /// A task no session works on: one made to start later, in `project`,
+    /// or one cancelled before it started.
+    pub fn pending_task(kind: Kind, project: PathBuf, task: TaskRecord) -> Event {
+        Event {
+            task: Some(task),
+            ..Event::about_project(kind, project)
+        }
+    }
+
+    /// The background task `session` started a run of Claude on `prompt`.
+    pub fn run_started(session: &SessionInfo, prompt: &str) -> Event {
+        let run = RunAbout {
+            prompt: Some(first_line(prompt)),
+            ..RunAbout::default()
+        };
+        Event {
+            run: Some(run),
+            ..Event::about_session(Kind::RunStarted, session)
+        }
+    }
+
+    /// The run ended, with what it came to.
+    pub fn run_ended(session: &SessionInfo, result: &TaskResult) -> Event {
+        let run = RunAbout {
+            failed: Some(result.failed),
+            answer: Some(first_line(&result.text)),
+            cost_usd: Some(result.cost_usd),
+            ..RunAbout::default()
+        };
+        Event {
+            run: Some(run),
+            ..Event::about_session(Kind::RunEnded, session)
+        }
+    }
+
+    /// The background task `session` asks the user for a permission:
+    /// `asking`.
+    pub fn asking(session: &SessionInfo, asking: Asking) -> Event {
+        let run = RunAbout {
+            asking: Some(asking),
+            ..RunAbout::default()
+        };
+        Event {
+            run: Some(run),
+            ..Event::about_session(Kind::RunAsking, session)
+        }
+    }
+
+    /// The user answered the permission `session`'s background task asked
+    /// for, `asking`, with `decision`.
+    pub fn answered(session: &SessionInfo, asking: Option<Asking>, decision: Answer) -> Event {
+        let run = RunAbout {
+            asking,
+            decision: Some(decision),
+            ..RunAbout::default()
+        };
+        Event {
+            run: Some(run),
+            ..Event::about_session(Kind::RunAnswered, session)
+        }
+    }
+
+    pub fn flow_started(run: &FlowRun) -> Event {
+        Event::about_flow(Kind::FlowStarted, run, None, "running")
+    }
+
+    /// `run` started `step`, in `session`.
+    pub fn step_started(run: &FlowRun, step: usize, session: Option<&SessionInfo>) -> Event {
+        let event = Event::about_flow(Kind::FlowStepStarted, run, Some(step), "running");
+        Event {
+            session: session.map(SessionAbout::of),
+            ..event
+        }
+    }
+
+    /// The run of `step` ended: it's done, waits at its gate, or failed.
+    /// `cost_usd` is what that run cost.
+    pub fn step_ended(run: &FlowRun, step: usize, cost_usd: f64) -> Event {
+        let state = run.steps[step].state;
+        let mut event = Event::about_flow(Kind::FlowStepEnded, run, Some(step), state.word());
+        if let Some(flow) = &mut event.flow {
+            flow.said = run.steps[step].answer.as_deref().map(first_line);
+            flow.cost_usd = Some(cost_usd);
+        }
+        event
+    }
+
+    /// `run` stopped at the gate after `step`.
+    pub fn gate(run: &FlowRun, step: usize) -> Event {
+        Event::about_flow(Kind::FlowGate, run, Some(step), "waiting")
+    }
+
+    /// The user answered the gate after `step`: went on, or, with `notes`,
+    /// sent the run back.
+    pub fn gate_answered(run: &FlowRun, step: usize, notes: Option<&str>) -> Event {
+        let state = if notes.is_some() {
+            "sent back"
+        } else {
+            "approved"
+        };
+        let mut event = Event::about_flow(Kind::FlowGateAnswered, run, Some(step), state);
+        if let Some(flow) = &mut event.flow {
+            flow.said = notes.map(first_line);
+        }
+        event
+    }
+
+    /// `run` ended: every step done, or one failed, which it names.
+    pub fn flow_ended(run: &FlowRun) -> Event {
+        let failed = run
+            .steps
+            .iter()
+            .position(|step| step.state == StepState::Failed);
+        let mut event = Event::about_flow(Kind::FlowEnded, run, failed, run.state().word());
+        if let Some(flow) = &mut event.flow {
+            flow.said = failed.and_then(|step| run.steps[step].answer.as_deref().map(first_line));
+            flow.cost_usd = Some(run.cost_usd());
+        }
+        event
+    }
+
+    fn about_flow(kind: Kind, run: &FlowRun, step: Option<usize>, state: &str) -> Event {
+        let flow = FlowAbout {
+            run: run.name.clone(),
+            flow: run.flow.name.clone(),
+            goal: first_line(&run.goal),
+            step: step.map(|step| run.step_name(step).to_string()),
+            state: state.to_string(),
+            said: None,
+            cost_usd: None,
+        };
+        Event {
+            flow: Some(flow),
+            ..Event::about_project(kind, project::of(&run.cwd).path)
+        }
+    }
+
+    /// A worktree was made at `path`, or removed from there.
+    pub fn worktree(created: bool, path: &Path, branch: Option<&str>) -> Event {
+        let kind = if created {
+            Kind::WorktreeCreated
+        } else {
+            Kind::WorktreeRemoved
+        };
+        let project = created.then(|| project::of(path).path);
+        let worktree = WorktreeAbout {
+            path: path.to_path_buf(),
+            branch: branch.map(String::from),
+            project: project.clone(),
+        };
+        Event {
+            project,
+            worktree: Some(worktree),
+            ..Event::new(kind)
+        }
+    }
+
+    /// `entry` was added to `project`'s memory, or forgotten.
+    pub fn memory(kind: Kind, project: PathBuf, entry: Entry) -> Event {
+        Event {
+            memory: Some(entry),
+            ..Event::about_project(kind, project)
+        }
+    }
+
+    /// `item` went on `project`'s backlog, or was marked done.
+    pub fn backlog(kind: Kind, project: PathBuf, item: BacklogItem) -> Event {
+        Event {
+            backlog: Some(item),
+            ..Event::about_project(kind, project)
+        }
+    }
+
+    pub fn plugin_paused(name: &str, why: &str) -> Event {
+        let plugin = PluginAbout {
+            name: name.to_string(),
+            why: why.to_string(),
+        };
+        Event {
+            plugin: Some(plugin),
+            ..Event::new(Kind::PluginPaused)
+        }
+    }
+
+    /// What it's about, in a word: the session's name, the flow run's, the
+    /// plugin's, or else the project's.
+    pub fn subject(&self) -> String {
+        if let Some(session) = &self.session {
+            return session.name.clone();
+        }
+        if let Some(flow) = &self.flow {
+            return flow.run.clone();
+        }
+        if let Some(plugin) = &self.plugin {
+            return plugin.name.clone();
+        }
+        match &self.project {
+            Some(project) => project::name_of(project),
+            None => "-".to_string(),
+        }
+    }
+
+    /// What happened, in words, to follow its subject.
+    pub fn text(&self) -> String {
+        let said = |text: Option<&str>| text.map(|text| format!(": {text}")).unwrap_or_default();
+        match self.kind {
+            Kind::SessionStarted => self.session.as_ref().map_or(String::new(), |session| {
+                let command: Vec<String> =
+                    session.command.iter().map(|a| shell::quote(a)).collect();
+                command.join(" ")
+            }),
+            Kind::SessionRenamed => format!("was {}", self.from.as_deref().unwrap_or("?")),
+            Kind::SessionWorking | Kind::SessionWaiting | Kind::SessionDone | Kind::SessionIdle => {
+                let now = self.session.as_ref().map_or("", |session| &session.status);
+                match &self.from {
+                    Some(from) => format!("{from} → {now}"),
+                    None => now.to_string(),
+                }
+            }
+            Kind::SessionEnded => self
+                .session
+                .as_ref()
+                .map_or(String::new(), |session| session.status.clone()),
+            Kind::TaskOpened | Kind::TaskStarted | Kind::TaskWaiting | Kind::TaskClosed => {
+                self.task.as_ref().map_or(String::new(), |task| {
+                    let goal = first_line(&task.goal);
+                    match &task.outcome {
+                        None if task.pending => format!("{goal}, to start later"),
+                        None => goal,
+                        Some(outcome) => {
+                            let summary =
+                                (!outcome.summary.is_empty()).then_some(&*outcome.summary);
+                            format!("{}{}", outcome.state().word(), said(summary))
+                        }
+                    }
+                })
+            }
+            Kind::RunStarted
+            | Kind::RunAsking
+            | Kind::RunAnswered
+            | Kind::RunInterrupted
+            | Kind::RunEnded => self.run.as_ref().map_or(String::new(), |run| {
+                if let Some(prompt) = &run.prompt {
+                    return prompt.clone();
+                }
+                let asked = run
+                    .asking
+                    .as_ref()
+                    .map(|asking| format!("{} {}", asking.tool, asking.gist));
+                match (run.decision, asked) {
+                    (Some(decision), asked) => {
+                        format!("{}{}", decision_word(decision), said(asked.as_deref()))
+                    }
+                    (None, Some(asked)) => asked,
+                    (None, None) if self.kind == Kind::RunEnded => {
+                        let how = if run.failed == Some(true) {
+                            "failed"
+                        } else {
+                            "done"
+                        };
+                        format!("{how}{}{}", cost(run.cost_usd), said(run.answer.as_deref()))
+                    }
+                    (None, None) => String::new(),
+                }
+            }),
+            Kind::FlowStarted
+            | Kind::FlowStepStarted
+            | Kind::FlowStepEnded
+            | Kind::FlowGate
+            | Kind::FlowGateAnswered
+            | Kind::FlowEnded => self.flow.as_ref().map_or(String::new(), |flow| {
+                if self.kind == Kind::FlowStarted {
+                    return format!("{}: {}", flow.flow, flow.goal);
+                }
+                let step = flow
+                    .step
+                    .as_deref()
+                    .map(|step| format!("{step} "))
+                    .unwrap_or_default();
+                format!(
+                    "{step}{}{}{}",
+                    flow.state,
+                    cost(flow.cost_usd),
+                    said(flow.said.as_deref())
+                )
+            }),
+            Kind::WorktreeCreated | Kind::WorktreeRemoved => {
+                self.worktree.as_ref().map_or(String::new(), |worktree| {
+                    let path = shell::home_relative(&worktree.path);
+                    match &worktree.branch {
+                        Some(branch) => format!("{path} on {branch}"),
+                        None => path,
+                    }
+                })
+            }
+            Kind::MemoryAdded | Kind::MemoryForgotten => {
+                self.memory.as_ref().map_or(String::new(), |entry| {
+                    format!(
+                        "{} ({}) {}",
+                        entry.id,
+                        entry.kind,
+                        memory::one_line(&entry.text)
+                    )
+                })
+            }
+            Kind::BacklogAdded | Kind::BacklogClosed => {
+                self.backlog.as_ref().map_or(String::new(), |item| {
+                    format!("#{} {}", item.number, first_line(&item.text))
+                })
+            }
+            Kind::SessionRemoved => String::new(),
+            Kind::PluginPaused => self
+                .plugin
+                .as_ref()
+                .map_or(String::new(), |plugin| plugin.why.clone()),
+        }
+    }
+}
+
+impl SessionAbout {
+    pub fn of(session: &SessionInfo) -> SessionAbout {
+        let worktree = session.worktree.as_ref();
+        SessionAbout {
+            name: session.name.clone(),
+            id: session.id.clone(),
+            command: session.command.clone(),
+            cwd: session.cwd.clone(),
+            project: worktree.map(|worktree| worktree.project_path.clone()),
+            worktree: worktree.map(|worktree| worktree.path.clone()),
+            branch: worktree.and_then(|worktree| worktree.branch.clone()),
+            activity: session.activity,
+            task: session.task.as_ref().map(|task| task.goal.clone()),
+            status: session.status(),
+        }
+    }
+}
+
+/// A made-up event of `kind`, with all that kind carries filled in, about
+/// `session`, or without one, a made-up session in `dir`: what `crystal
+/// plugin run --event` tries a plugin's hooks on.
+pub fn example(kind: Kind, session: Option<&SessionInfo>, dir: &Path) -> Event {
+    let session = match session {
+        Some(session) => session.clone(),
+        None => SessionInfo {
+            name: "example".into(),
+            id: "example".into(),
+            command: vec!["claude".into()],
+            cwd: dir.to_path_buf(),
+            pid: None,
+            state: State::Running,
+            activity: Some(Activity::Idle),
+            worktree: None,
+            changed: 0,
+            front: None,
+            task: None,
+            asking: None,
+        },
+    };
+    let now = now_ms() / 1000;
+    let goal = "Fix the login redirect";
+    let task = TaskRecord {
+        goal: goal.into(),
+        session: session.name.clone(),
+        project: project::of(dir).name,
+        branch: session
+            .worktree
+            .as_ref()
+            .and_then(|worktree| worktree.branch.clone()),
+        background: false,
+        backlog: None,
+        pending: false,
+        waiting: kind == Kind::TaskWaiting,
+        created: now,
+        outcome: None,
+        id: Some(12),
+    };
+    let asking = Asking {
+        tool: "Bash".into(),
+        gist: "cargo test".into(),
+    };
+    let at_step = |step: Option<&str>, state: &str| FlowAbout {
+        run: "ship-1".into(),
+        flow: "ship".into(),
+        goal: goal.into(),
+        step: step.map(String::from),
+        state: state.into(),
+        said: None,
+        cost_usd: None,
+    };
+    let flow = |flow: FlowAbout| Event {
+        flow: Some(flow),
+        ..Event::about_project(kind, project::of(dir).path)
+    };
+    let entry = Entry {
+        id: 1,
+        kind: memory::Kind::Gotcha,
+        text: "The ledger tests need the database up: make db".into(),
+        files: Vec::new(),
+        source: memory::Source::User,
+        created: now,
+        seen: 1,
+        last_seen: now,
+    };
+    let item = BacklogItem {
+        number: 1,
+        text: "Retry the webhook on a timeout".into(),
+        tags: Vec::new(),
+        done: kind == Kind::BacklogClosed,
+        created: now,
+        closed: (kind == Kind::BacklogClosed).then_some(now),
+    };
+    let event = match kind {
+        Kind::SessionStarted | Kind::SessionRemoved => Event::about_session(kind, &session),
+        Kind::SessionRenamed => Event::renamed(&session, "old-name"),
+        Kind::SessionWorking => Event::activity(&session, Some(Activity::Idle), Activity::Working),
+        Kind::SessionWaiting => {
+            Event::activity(&session, Some(Activity::Working), Activity::Waiting)
+        }
+        Kind::SessionDone => Event::activity(&session, Some(Activity::Working), Activity::Done),
+        Kind::SessionIdle => Event::activity(&session, Some(Activity::Done), Activity::Idle),
+        Kind::SessionEnded => Event::ended(&session, "exited 0".into()),
+        Kind::TaskOpened | Kind::TaskStarted | Kind::TaskWaiting => {
+            Event::task(kind, &session, task)
+        }
+        Kind::TaskClosed => {
+            let outcome = TaskOutcome::new(TaskState::Done, "Fixed it, with a test", now);
+            let task = TaskRecord {
+                outcome: Some(outcome),
+                ..task
+            };
+            Event::task(kind, &session, task)
+        }
+        Kind::RunStarted => Event::run_started(&session, goal),
+        Kind::RunAsking => Event::asking(&session, asking),
+        Kind::RunAnswered => Event::answered(&session, Some(asking), Answer::Allow),
+        Kind::RunInterrupted => Event::about_session(kind, &session),
+        Kind::RunEnded => {
+            let result = TaskResult {
+                text: "Fixed it, with a test".into(),
+                failed: false,
+                conversation: None,
+                cost_usd: 0.0421,
+                runs: 1,
+            };
+            Event::run_ended(&session, &result)
+        }
+        Kind::FlowStarted => flow(at_step(None, "running")),
+        Kind::FlowStepStarted => flow(at_step(Some("build"), "running")),
+        Kind::FlowStepEnded => flow(FlowAbout {
+            said: Some("Built it".into()),
+            cost_usd: Some(0.0421),
+            ..at_step(Some("build"), "done")
+        }),
+        Kind::FlowGate => flow(at_step(Some("review"), "waiting")),
+        Kind::FlowGateAnswered => flow(at_step(Some("review"), "approved")),
+        Kind::FlowEnded => flow(at_step(None, "done")),
+        Kind::WorktreeCreated | Kind::WorktreeRemoved => {
+            let path = session
+                .worktree
+                .as_ref()
+                .map_or(dir, |worktree| &worktree.path);
+            Event::worktree(kind == Kind::WorktreeCreated, path, Some("fix-login"))
+        }
+        Kind::MemoryAdded | Kind::MemoryForgotten => {
+            Event::memory(kind, project::of(dir).path, entry)
+        }
+        Kind::BacklogAdded | Kind::BacklogClosed => {
+            Event::backlog(kind, project::of(dir).path, item)
+        }
+        Kind::PluginPaused => Event::plugin_paused("example", "it failed 5 times in a row"),
+    };
+    Event {
+        at: now_ms(),
+        ..event
+    }
+}
+
+/// Which events a reader wants: every one, but for what it says.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Filter {
+    /// Names or patterns, the way a plugin's `on` takes them:
+    /// `session.waiting`, `task.*`, `*`. None takes every kind.
+    #[serde(default)]
+    pub kinds: Vec<String>,
+    /// Only those about the session with this name or id.
+    #[serde(default)]
+    pub session: Option<String>,
+    /// Only those about the project whose main worktree this is.
+    #[serde(default)]
+    pub project: Option<PathBuf>,
+}
+
+impl Filter {
+    pub fn matches(&self, event: &Event) -> bool {
+        let kind = event.kind.name();
+        let kind_wanted = self.kinds.is_empty()
+            || self
+                .kinds
+                .iter()
+                .any(|pattern| plugin_manifest::matches(pattern, kind));
+        let session_wanted = self.session.as_ref().is_none_or(|wanted| {
+            event
+                .session
+                .as_ref()
+                .is_some_and(|session| session.name == *wanted || session.id == *wanted)
+        });
+        let project_wanted = self.project.is_none() || self.project == event.project;
+        kind_wanted && session_wanted && project_wanted
+    }
+}
+
+/// Where in the log a reader starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Since {
+    /// After the event with this `seq`: 0 for the whole log.
+    Seq(u64),
+    /// At this time or after, in milliseconds since the Unix epoch.
+    At(u64),
+}
+
+/// Refuses a pattern that matches none of the events, which would wait
+/// for nothing, without a word.
+pub fn check_pattern(pattern: &str) -> anyhow::Result<()> {
+    let known = Kind::ALL
+        .iter()
+        .any(|kind| plugin_manifest::matches(pattern, kind.name()));
+    if !known {
+        let names: Vec<&str> = Kind::ALL.iter().map(|kind| kind.name()).collect();
+        anyhow::bail!(
+            "`{pattern}` matches no event; they are {}",
+            names.join(", ")
+        );
+    }
+    Ok(())
+}
+
+/// Now, in milliseconds since the Unix epoch.
+pub fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis() as u64)
+}
+
+/// The first line of `text` with something on it, cut short past a few
+/// hundred characters: enough to say what it was, kept to one log line.
+fn first_line(text: &str) -> String {
+    const LONGEST: usize = 200;
+    let line = text.lines().map(str::trim).find(|line| !line.is_empty());
+    let line = line.unwrap_or("");
+    match line.char_indices().nth(LONGEST) {
+        Some((cut, _)) => format!("{}…", &line[..cut]),
+        None => line.to_string(),
+    }
+}
+
+/// How a permission was answered, in words.
+fn decision_word(decision: Answer) -> &'static str {
+    match decision {
+        Answer::Allow => "allowed",
+        Answer::Deny => "denied",
+        Answer::Always => "allowed always",
+    }
+}
+
+/// A cost, as ` ($0.0123)`, when there is one.
+fn cost(cost_usd: Option<f64>) -> String {
+    cost_usd.map_or(String::new(), |cost| format!(" (${cost:.4})"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::Worktree;
+
+    fn session() -> SessionInfo {
+        SessionInfo {
+            name: "claude".into(),
+            id: "s1".into(),
+            command: vec!["claude".into()],
+            cwd: "/code/app".into(),
+            pid: None,
+            state: State::Running,
+            activity: Some(Activity::Working),
+            worktree: Some(Worktree {
+                project: "app".into(),
+                project_path: "/code/app".into(),
+                path: "/code/app".into(),
+                main: true,
+                branch: Some("main".into()),
+            }),
+            changed: 0,
+            front: None,
+            task: None,
+            asking: None,
+        }
+    }
+
+    #[test]
+    fn every_kind_has_a_name_of_its_own_that_reads_back() {
+        let mut names: Vec<&str> = Kind::ALL.iter().map(|kind| kind.name()).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), Kind::ALL.len());
+        for kind in Kind::ALL {
+            let json = serde_json::to_string(&kind).unwrap();
+            assert_eq!(json, format!("\"{}\"", kind.name()));
+            assert_eq!(serde_json::from_str::<Kind>(&json).unwrap(), kind);
+        }
+        assert!(serde_json::from_str::<Kind>("\"session.teleported\"").is_err());
+    }
+
+    #[test]
+    fn a_session_event_keeps_the_fields_plugins_have_always_read() {
+        let event = Event::activity(&session(), Some(Activity::Working), Activity::Waiting);
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["event"], "session.waiting");
+        assert_eq!(json["project"], "/code/app");
+        assert_eq!(json["from"], "working");
+        let about = &json["session"];
+        assert_eq!(about["name"], "claude");
+        assert_eq!(about["id"], "s1");
+        assert_eq!(about["branch"], "main");
+        assert_eq!(about["worktree"], "/code/app");
+        assert_eq!(about["activity"], "waiting");
+        assert_eq!(about["status"], "waiting");
+        // What a kind doesn't carry isn't there at all.
+        assert!(json.get("task").is_none() && json.get("flow").is_none());
+    }
+
+    #[test]
+    fn a_worktree_event_keeps_its_worktree_as_plugins_have_read_it() {
+        let removed = Event::worktree(false, Path::new("/code/app.worktrees/x"), Some("x"));
+        let json = serde_json::to_value(&removed).unwrap();
+        assert_eq!(json["event"], "worktree.removed");
+        assert_eq!(json["worktree"]["path"], "/code/app.worktrees/x");
+        assert_eq!(json["worktree"]["branch"], "x");
+        assert!(json["worktree"]["project"].is_null());
+    }
+
+    #[test]
+    fn a_filter_takes_kinds_by_pattern_and_a_session_by_name_or_id() {
+        let event = Event::about_session(Kind::SessionStarted, &session());
+        let filter = |kinds: &[&str], session: Option<&str>, project: Option<&str>| Filter {
+            kinds: kinds.iter().map(|kind| kind.to_string()).collect(),
+            session: session.map(String::from),
+            project: project.map(PathBuf::from),
+        };
+        assert!(filter(&[], None, None).matches(&event));
+        assert!(filter(&["session.*"], None, None).matches(&event));
+        assert!(filter(&["task.*", "session.started"], None, None).matches(&event));
+        assert!(!filter(&["session.waiting"], None, None).matches(&event));
+        assert!(filter(&[], Some("claude"), None).matches(&event));
+        assert!(filter(&[], Some("s1"), None).matches(&event));
+        assert!(!filter(&[], Some("codex"), None).matches(&event));
+        assert!(filter(&[], None, Some("/code/app")).matches(&event));
+        assert!(!filter(&[], None, Some("/code/other")).matches(&event));
+        let memory = Event::new(Kind::MemoryAdded);
+        assert!(!filter(&[], Some("claude"), None).matches(&memory));
+    }
+
+    #[test]
+    fn a_pattern_that_matches_nothing_is_refused() {
+        assert!(check_pattern("flow.*").is_ok());
+        assert!(check_pattern("*").is_ok());
+        let err = check_pattern("sesion.*").unwrap_err();
+        assert!(err.to_string().contains("matches no event"), "{err}");
+    }
+
+    #[test]
+    fn an_event_says_what_happened_in_a_line() {
+        let info = session();
+        let waiting = Event::activity(&info, Some(Activity::Working), Activity::Waiting);
+        assert_eq!(
+            (waiting.subject(), waiting.text()),
+            ("claude".into(), "working → waiting".into())
+        );
+        let ended = Event::ended(
+            &SessionInfo {
+                state: State::Exited { code: 3 },
+                ..session()
+            },
+            "exited 3".into(),
+        );
+        assert_eq!(ended.text(), "exited 3");
+        let result = TaskResult {
+            text: "It's fixed\nand tested".into(),
+            failed: false,
+            conversation: None,
+            cost_usd: 0.25,
+            runs: 1,
+        };
+        assert_eq!(
+            Event::run_ended(&info, &result).text(),
+            "done ($0.2500): It's fixed"
+        );
+        assert_eq!(Event::renamed(&info, "old").text(), "was old");
+        let paused = Event::plugin_paused("notes", "it kept failing");
+        assert_eq!(
+            (paused.subject(), paused.text()),
+            ("notes".into(), "it kept failing".into())
+        );
+    }
+
+    #[test]
+    fn a_long_answer_is_kept_to_the_start_of_its_first_line() {
+        assert_eq!(first_line("\n  first  \nsecond"), "first");
+        let long = "x".repeat(300);
+        assert_eq!(first_line(&long).chars().count(), 201);
+    }
+
+    #[test]
+    fn every_kind_has_an_example_with_what_it_carries() {
+        let dir = Path::new("/code/app");
+        for kind in Kind::ALL {
+            let event = example(kind, Some(&session()), dir);
+            assert_eq!(event.kind, kind);
+            // The name says all there is to say of these.
+            let said_by_name = [Kind::SessionRemoved, Kind::RunInterrupted].contains(&kind);
+            assert!(!event.text().is_empty() || said_by_name, "{kind:?}");
+        }
+        let closed = example(Kind::TaskClosed, None, dir);
+        assert_eq!(closed.session.unwrap().name, "example");
+        assert!(closed.task.unwrap().outcome.is_some());
+    }
+
+    #[test]
+    fn the_readme_lists_every_event() {
+        let readme = include_str!("../README.md");
+        let table = readme
+            .split("| Event | When |")
+            .nth(1)
+            .expect("the README has a table of events");
+        let listed: Vec<&str> = table
+            .lines()
+            .skip(2)
+            .take_while(|line| line.starts_with('|'))
+            .filter_map(|line| line.split('`').nth(1))
+            .collect();
+        let names: Vec<&str> = Kind::ALL.iter().map(|kind| kind.name()).collect();
+        assert_eq!(listed, names);
+    }
+}

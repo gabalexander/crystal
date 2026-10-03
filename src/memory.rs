@@ -294,6 +294,7 @@ pub enum Added {
     Refused,
 }
 
+#[cfg(test)]
 impl Added {
     pub fn entry(&self) -> Option<&Entry> {
         match self {
@@ -894,15 +895,14 @@ pub fn add(socket: &Path, project: &Path, new: New) -> Result<Added> {
 
 /// Keeps how a task turned out, for the sessions after it: what the tasks
 /// part of crystal calls when a task ends with something to say. With
-/// memory off it keeps nothing, and says so with `None`; so it does when
-/// the user forgot the same before.
+/// memory off it keeps nothing, and says so with `None`.
 pub fn record_outcome(
     config: &Config,
     socket: &Path,
     project: &Path,
     task: &str,
     summary: &str,
-) -> Result<Option<Entry>> {
+) -> Result<Option<Added>> {
     if !enabled(config) {
         return Ok(None);
     }
@@ -912,7 +912,7 @@ pub fn record_outcome(
         files: Vec::new(),
         source: Source::Task(task.to_string()),
     };
-    Ok(add(socket, project, new)?.entry().cloned())
+    Ok(Some(add(socket, project, new)?))
 }
 
 /// Takes the entry `id` out of `project`'s memory, and returns it.
@@ -1276,9 +1276,12 @@ mod tests {
     fn a_task_s_outcome_is_kept_as_one() {
         let (_dir, socket) = socket();
         let config = Config::default();
-        let entry = record_outcome(&config, &socket, Path::new(APP), "fixer", "fixed the race")
+        let added = record_outcome(&config, &socket, Path::new(APP), "fixer", "fixed the race")
             .unwrap()
             .unwrap();
+        let Added::New(entry) = added else {
+            panic!("{added:?}");
+        };
         assert_eq!(entry.kind, Kind::Outcome);
         assert_eq!(entry.source, Source::Task("fixer".into()));
     }

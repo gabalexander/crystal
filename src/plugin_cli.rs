@@ -4,7 +4,9 @@
 use crate::client;
 use crate::config::{self, Config};
 use crate::env;
+use crate::events::{self, Kind};
 use crate::memory_cli::confirm;
+use crate::plugin_hooks;
 use crate::plugin_manifest::{self, Manifest};
 use crate::plugins::{self, Context, Installed};
 use crate::protocol::{Request, Response, SessionInfo};
@@ -101,9 +103,43 @@ pub fn run(socket: &Path, plugin: &str, action: &str, session: Option<String>) -
     Ok(status.code().unwrap_or(1))
 }
 
+/// `crystal plugin run --event`: runs the plugin's hooks on a made-up
+/// event of the kind called `kind`, here, in the foreground, whether the
+/// plugin is on or not, and returns the exit code of the first that fails,
+/// or 0. The event is about the session `session` names, or else the one
+/// it's run in, or else a made-up one in the current directory.
+pub fn run_event(socket: &Path, plugin: &str, kind: &str, session: Option<String>) -> Result<i32> {
+    let found = find(plugin)?;
+    let manifest = manifest_of(&found)?;
+    events::check_pattern(kind)?;
+    let kind =
+        Kind::named(kind).with_context(|| format!("say one event, not a pattern like `{kind}`"))?;
+    let session = session_for(socket, session)?;
+    let event = events::example(kind, session.as_ref(), &std::env::current_dir()?);
+    let hooks: Vec<_> = plugin_hooks::hooks_on(manifest, &event).collect();
+    if hooks.is_empty() {
+        bail!("{plugin} has no hook on {}", kind.name());
+    }
+    for hook in hooks {
+        let status = plugin_hooks::run_here(&found.dir, &hook.command, socket, &event)?;
+        if !status.success() {
+            return Ok(status.code().unwrap_or(1));
+        }
+    }
+    Ok(0)
+}
+
 /// What an action run from the command line is about: the session it
 /// names, or else the one it's run in, or else the current directory.
 fn context_for(socket: &Path, session: Option<String>) -> Result<Context> {
+    match session_for(socket, session)? {
+        Some(found) => Ok(Context::of_session(&found)),
+        None => Ok(Context::of_dir(&std::env::current_dir()?)),
+    }
+}
+
+/// The session `session` names, or else the one this runs in, if any.
+fn session_for(socket: &Path, session: Option<String>) -> Result<Option<SessionInfo>> {
     let sessions = || -> Result<Vec<SessionInfo>> {
         match client::ask(socket, &Request::List, false)? {
             Some(Response::Sessions { sessions }) => Ok(sessions),
@@ -112,15 +148,14 @@ fn context_for(socket: &Path, session: Option<String>) -> Result<Context> {
     };
     if let Some(name) = session {
         let found = sessions()?.into_iter().find(|info| info.name == name);
-        let found = found.with_context(|| format!("no session named {name}"))?;
-        return Ok(Context::of_session(&found));
+        return found
+            .map(Some)
+            .with_context(|| format!("no session named {name}"));
     }
-    if let Some(id) = env::own_session_id(socket)
-        && let Some(found) = sessions()?.into_iter().find(|info| info.id == id)
-    {
-        return Ok(Context::of_session(&found));
+    match env::own_session_id(socket) {
+        Some(id) => Ok(sessions()?.into_iter().find(|info| info.id == id)),
+        None => Ok(None),
     }
-    Ok(Context::of_dir(&std::env::current_dir()?))
 }
 
 /// `crystal plugin install`: fetches a plugin from a git repository, or

@@ -1,6 +1,7 @@
 //! The CLI's side of the socket.
 
 use crate::env;
+use crate::events::{Event, Filter, Since};
 use crate::forge::Checkout;
 use crate::git;
 use crate::protocol::{
@@ -9,8 +10,9 @@ use crate::protocol::{
 };
 use crate::socket;
 use anyhow::{Context, Result, bail};
+use serde_json::Value;
 use std::fs::OpenOptions;
-use std::io::BufReader;
+use std::io::{BufRead, BufReader, ErrorKind};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -273,16 +275,110 @@ pub fn pull_request_worktree(socket: &Path, checkout: &Checkout) -> Result<PathB
 /// Tells the daemon a worktree was made or removed. The worktree is made or
 /// gone either way, so a daemon that can't be told is no reason to fail.
 fn tell_worktree(socket: &Path, path: &Path, branch: Option<String>, created: bool) {
-    let request = Request::Worktree {
-        path: path.to_path_buf(),
-        branch,
-        created,
-    };
-    if let Err(err) = ask(socket, &request, false) {
+    let event = Event::worktree(created, path, branch.as_deref());
+    if let Err(err) = tell(socket, event) {
         eprintln!(
             "crystal: couldn't tell the daemon about {}: {err:#}",
             path.display()
         );
+    }
+}
+
+/// Tells the daemon about something done outside it, for its event log
+/// and whoever listens. With no daemon running, there's nobody to tell.
+pub fn tell(socket: &Path, event: Event) -> Result<()> {
+    let event = Box::new(event);
+    ask(socket, &Request::Emit { event }, false)?;
+    Ok(())
+}
+
+/// Subscribes to the events `filter` takes, those in the log from `since`
+/// first, then each new one as it happens. Starts the daemon if it isn't
+/// running.
+pub fn subscribe(socket: &Path, filter: Filter, since: Option<Since>) -> Result<Subscription> {
+    let conn = match UnixStream::connect(socket) {
+        Ok(conn) => conn,
+        Err(_) => start_daemon(socket)?,
+    };
+    protocol::send_request(&conn, &Request::Subscribe { filter, since })?;
+    let mut subscription = Subscription {
+        input: BufReader::new(conn),
+        line: Vec::new(),
+        seq: 0,
+    };
+    match subscription.next_line(None)? {
+        Some(Response::Subscribed { seq }) => subscription.seq = seq,
+        Some(Response::Error { message }) => bail!(message),
+        _ => bail!("the daemon didn't start sending events"),
+    }
+    Ok(subscription)
+}
+
+/// Events from the daemon, as they happen.
+pub struct Subscription {
+    input: BufReader<UnixStream>,
+    /// What has come of a line that isn't whole yet.
+    line: Vec<u8>,
+    /// The `seq` of the latest event before the subscription started.
+    pub seq: u64,
+}
+
+impl Subscription {
+    /// The next event, waiting until `deadline` if there is one; `None`
+    /// once it has passed. The daemon going away, or dropping a
+    /// subscriber that fell too far behind, is an error.
+    pub fn next_before(&mut self, deadline: Option<Instant>) -> Result<Option<Event>> {
+        let Some(line) = self.next_line::<Value>(deadline)? else {
+            return Ok(None);
+        };
+        // Events are all there is after the start, but for the error that
+        // ends a stream.
+        if line["type"] == "error" {
+            bail!(
+                "{}",
+                line["message"].as_str().unwrap_or("the daemon said no")
+            );
+        }
+        Ok(Some(serde_json::from_value(line)?))
+    }
+
+    /// The next line, read as a `T`; `None` once `deadline` has passed. A
+    /// line cut short by the deadline is kept for the next call.
+    fn next_line<T: serde::de::DeserializeOwned>(
+        &mut self,
+        deadline: Option<Instant>,
+    ) -> Result<Option<T>> {
+        let socket = self.input.get_ref();
+        match deadline {
+            Some(deadline) => {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return Ok(None);
+                }
+                socket.set_read_timeout(Some(left))?;
+            }
+            None => socket.set_read_timeout(None)?,
+        }
+        match self.input.read_until(b'\n', &mut self.line) {
+            Ok(0) => bail!("the daemon stopped sending events"),
+            Ok(_) if self.line.ends_with(b"\n") => {
+                let line = std::mem::take(&mut self.line);
+                Ok(Some(serde_json::from_slice(&line)?))
+            }
+            Ok(_) => bail!("the daemon stopped sending events"),
+            Err(err) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                Ok(None)
+            }
+            Err(err) => Err(err.into()),
+        }
+    }
+}
+
+impl Iterator for Subscription {
+    type Item = Result<Event>;
+
+    fn next(&mut self) -> Option<Result<Event>> {
+        self.next_before(None).transpose()
     }
 }
 

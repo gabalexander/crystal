@@ -80,6 +80,8 @@ struct Runs {
     /// The last turn to end had been stopped by the user.
     interrupted: bool,
     conversation: Option<String>,
+    /// What the last turn was asked.
+    prompt: String,
     /// What the last turn came to: Claude's answer, or what went wrong.
     result: Option<String>,
     failed: bool,
@@ -216,6 +218,7 @@ impl Task {
         }
         runs.started += 1;
         runs.idle_since = None;
+        runs.prompt = prompt.to_string();
         runs.record.push(format!("USER: {}", prompt.trim()));
         // Drawn while the runs are held, so that nothing Claude says in
         // answer can come before it.
@@ -263,6 +266,11 @@ impl Task {
         let events = turn_events(self.seen, now);
         self.seen = now;
         events
+    }
+
+    /// What the last run to start was asked.
+    pub fn last_prompt(&self) -> String {
+        self.runs.lock().unwrap().prompt.clone()
     }
 
     /// The last run's answer, and what the task has come to: `None` until a

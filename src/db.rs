@@ -2,8 +2,8 @@
 //! in the state directory holding the sessions to start again after a
 //! restart, the flow runs, each project's backlog and closed tasks, the
 //! tasks waiting to start and the number the next task gets, what
-//! background tasks have spent each day, and the TUI's tabs, layouts and
-//! what the new-session panel remembers. The
+//! background tasks have spent each day, the event log, and the TUI's tabs,
+//! layouts and what the new-session panel remembers. The
 //! settings stay in the config file, which people edit by hand, and memory
 //! in a database of its own.
 //!
@@ -18,6 +18,7 @@
 //! anyone want it; one that can't be read is renamed `.broken` instead.
 
 use crate::backlog;
+use crate::events::{Event, Since};
 use crate::flow_run::FlowRun;
 use crate::protocol::{BacklogItem, PendingTask, TaskOutcome, TaskRecord};
 use crate::state::{self, SavedSession};
@@ -134,10 +135,26 @@ CREATE TABLE spending (
 );
 ";
 
+/// The event log (see [`crate::event_log`]): each event under its `seq`,
+/// which AUTOINCREMENT never gives again, not even once the events before
+/// it are pruned; when it happened, what it was, the session (by id) and
+/// project it's about, and the whole of it as JSON.
+const EVENTS: &str = "
+CREATE TABLE events (
+  seq     INTEGER PRIMARY KEY AUTOINCREMENT,
+  at      INTEGER NOT NULL,
+  kind    TEXT NOT NULL,
+  session TEXT,
+  project TEXT,
+  json    TEXT NOT NULL
+);
+CREATE INDEX events_at ON events(at);
+";
+
 /// What makes the database as it is now, a step for each version: a
 /// database at version `v`, kept in its `user_version`, takes the steps
 /// after the first `v`.
-const MIGRATIONS: &[&str] = &[TABLES, TASK_STATES];
+const MIGRATIONS: &[&str] = &[TABLES, TASK_STATES, EVENTS];
 
 /// The file each project kept its backlog in before the database.
 const OLD_BACKLOG: &str = "backlog.json";
@@ -347,6 +364,80 @@ impl Db {
             "INSERT INTO spending (day, usd) VALUES (?1, ?2) \
              ON CONFLICT (day) DO UPDATE SET usd = usd + excluded.usd",
             params![day, usd],
+        )?;
+        Ok(())
+    }
+
+    /// Writes `event` down, under the `seq` it has been given.
+    pub fn add_event(&self, event: &Event) -> Result<()> {
+        let session = event.session.as_ref().map(|session| &session.id);
+        let project = event
+            .project
+            .as_ref()
+            .map(|project| project.to_string_lossy());
+        self.conn.execute(
+            "INSERT INTO events (seq, at, kind, session, project, json) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                event.seq,
+                event.at,
+                event.kind.name(),
+                session,
+                project,
+                json(event)?
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// The `seq` of the latest event ever written down, pruned since or
+    /// not: 0 before the first.
+    pub fn latest_event(&self) -> Result<u64> {
+        // AUTOINCREMENT keeps the highest it has seen in sqlite_sequence.
+        Ok(self.conn.query_row(
+            "SELECT COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'events'), 0)",
+            [],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// The events from `since` on, the oldest first. One that can't be
+    /// read, written by a newer crystal say, is left out.
+    pub fn events(&self, since: Since) -> Result<Vec<Event>> {
+        let (from, value) = match since {
+            Since::Seq(seq) => ("seq >", seq),
+            Since::At(at) => ("at >=", at),
+        };
+        let mut statement = self.conn.prepare(&format!(
+            "SELECT json FROM events WHERE {from} ?1 ORDER BY seq"
+        ))?;
+        let rows = statement.query_map(params![value], |row| {
+            Ok(from_json::<Event>(&row.get::<_, String>(0)?))
+        })?;
+        readable(rows, "an event")
+    }
+
+    /// Takes the events from before `at`, in milliseconds since the Unix
+    /// epoch, out of the log.
+    pub fn delete_events_before(&self, at: u64) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM events WHERE at < ?1", params![at])?;
+        Ok(())
+    }
+
+    /// How many events the log holds.
+    pub fn event_count(&self) -> Result<u64> {
+        Ok(self
+            .conn
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))?)
+    }
+
+    /// Takes every event out of the log but the newest `count`.
+    pub fn keep_newest_events(&self, count: u64) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM events WHERE seq <= \
+             (SELECT seq FROM events ORDER BY seq DESC LIMIT 1 OFFSET ?1)",
+            params![count],
         )?;
         Ok(())
     }

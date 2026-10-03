@@ -6,6 +6,7 @@ use crate::client;
 use crate::config::Config;
 use crate::embed::{self, Embedder};
 use crate::env;
+use crate::events::{self, Event};
 use crate::git::Checkout;
 use crate::memory::{self, Added, Kind, Listed, Memory, New, Source, Store};
 use crate::protocol::{Request, Response};
@@ -38,7 +39,13 @@ pub fn remember(
         source: source(socket),
     };
     match memory::add(socket, &project, new)? {
-        Added::New(entry) => println!("remembered {}", entry.id),
+        Added::New(entry) => {
+            println!("remembered {}", entry.id);
+            tell(
+                socket,
+                Event::memory(events::Kind::MemoryAdded, project, entry),
+            );
+        }
         Added::Again(entry) => println!("remembered {} already", entry.id),
         Added::Refused => unreachable!("only crystal is refused what was forgotten"),
     }
@@ -101,7 +108,20 @@ pub fn remove(socket: &Path, dir: Option<PathBuf>, id: u64) -> Result<()> {
     let project = memory::project_of(&dir_or_current(dir)?);
     let entry = memory::remove(socket, &project, id)?;
     println!("forgot {}: {}", entry.id, entry.text);
+    tell(
+        socket,
+        Event::memory(events::Kind::MemoryForgotten, project, entry),
+    );
     Ok(())
+}
+
+/// Tells the daemon what was done to the memory, for its event log. The
+/// memory has it either way, so a daemon that can't be told is no reason
+/// to fail.
+fn tell(socket: &Path, event: Event) {
+    if let Err(err) = client::tell(socket, event) {
+        eprintln!("crystal: couldn't tell the daemon: {err:#}");
+    }
 }
 
 /// Downloads the embedding model if it isn't here yet, then gives every

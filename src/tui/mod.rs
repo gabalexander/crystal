@@ -49,7 +49,7 @@ use crate::plugins::{self, Context};
 use crate::profile;
 use crate::protocol::{Backlog, NewSession, Request, Response, SessionInfo, Spending, Worktree};
 use crate::{catalog, keys, typing};
-use crate::{client, clipboard, drive, env, git};
+use crate::{client, clipboard, drive, env, events, git};
 use anyhow::{Context as _, Result, bail};
 use app::{Action, App, Focus, Hit, Place, PluginKey, PluginPane, Slot};
 use backlog_view::BacklogChange;
@@ -821,10 +821,19 @@ impl Tui {
                 self.read_in_background(move || {
                     let project = memory::project_of(&dir);
                     match memory::remove(&socket, &project, id) {
-                        Ok(_) => Event::MemoryRead {
-                            read: read_memory(&socket, &dir),
-                            dir,
-                        },
+                        Ok(entry) => {
+                            let forgotten = events::Event::memory(
+                                events::Kind::MemoryForgotten,
+                                project,
+                                entry,
+                            );
+                            // The entry is gone either way.
+                            let _ = client::tell(&socket, forgotten);
+                            Event::MemoryRead {
+                                read: read_memory(&socket, &dir),
+                                dir,
+                            }
+                        }
                         Err(err) => Event::Notice(format!("{err:#}")),
                     }
                 });

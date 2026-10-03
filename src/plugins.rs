@@ -13,6 +13,7 @@
 //! crystal through its own command line, like any script would.
 
 use crate::config::{self, Config};
+use crate::events::Event;
 use crate::git::Checkout;
 use crate::plugin_manifest::Manifest;
 use crate::protocol::SessionInfo;
@@ -206,6 +207,22 @@ impl Context {
             session_id: Some(session.id.clone()),
             project: Some(project),
             worktree: Some(worktree),
+        }
+    }
+
+    /// About what `event` is about.
+    pub fn of_event(event: &Event) -> Context {
+        let session = event.session.as_ref();
+        let worktree = match (session, &event.worktree) {
+            (Some(session), _) => Some(session.worktree.as_ref().unwrap_or(&session.cwd).clone()),
+            (None, Some(worktree)) => Some(worktree.path.clone()),
+            (None, None) => None,
+        };
+        Context {
+            session: session.map(|session| session.name.clone()),
+            session_id: session.map(|session| session.id.clone()),
+            project: event.project.clone(),
+            worktree,
         }
     }
 

@@ -10,19 +10,9 @@
 //! A command is a list of words, run without a shell, from the plugin's
 //! own directory: `["sh", "hook.sh"]`.
 
-use anyhow::{Result, bail};
+use crate::events;
+use anyhow::{Context, Result, bail};
 use serde::Deserialize;
-
-/// What happens in crystal that a plugin can hear about.
-pub const EVENTS: &[&str] = &[
-    "session.started",
-    "session.waiting",
-    "session.done",
-    "session.ended",
-    "task.closed",
-    "worktree.created",
-    "worktree.removed",
-];
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -58,7 +48,7 @@ pub struct Action {
 #[serde(deny_unknown_fields)]
 pub struct EventHook {
     /// The event, or a pattern of them: `session.waiting`, `session.*`,
-    /// or `*` for every one.
+    /// or `*` for every one. See [`events::Kind`].
     pub on: String,
     pub command: Vec<String>,
 }
@@ -105,13 +95,7 @@ impl Manifest {
             check_command(&pane.command, &format!("pane {}", pane.id))?;
         }
         for hook in &self.events {
-            if !EVENTS.iter().any(|event| matches(&hook.on, event)) {
-                bail!(
-                    "events: `{}` matches no event; they are {}",
-                    hook.on,
-                    EVENTS.join(", ")
-                );
-            }
+            events::check_pattern(&hook.on).context("events")?;
             check_command(&hook.command, &format!("the hook on {}", hook.on))?;
         }
         Ok(())

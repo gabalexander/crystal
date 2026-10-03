@@ -34,11 +34,13 @@ is: it's the one request every version must understand.
 ## Layout
 
 - `src/main.rs`: the CLI (clap) and how it prints
-- `src/client.rs`: connects to the daemon, starting it when needed
+- `src/client.rs`: connects to the daemon, starting it when needed; `tell` gives it an event from outside, and
+  `subscribe` a stream of its events, for the CLI and a TUI to read
 - `src/attach.rs`: `crystal attach`: draws a session in your terminal and sends it your keys
 - `src/viewer.rs`: the client's side of an attach, shared by `crystal attach` and the TUI's pane
 - `src/drive.rs`: `crystal send`, `wait`, `read`, `result`, `answer` and `interrupt`, for driving one session from
-  another or a script
+  another or a script; waits listen to the daemon's events about their session, and `wait --output` has the
+  daemon look at its screen
 - `src/keys.rs`: turning keys into the bytes a terminal sends: the TUI's keys, and the names `send-keys` takes;
   the old way, or in the Kitty keyboard protocol once a program has asked for it
 - `src/remote.rs`: `crystal ssh`: finds (or installs) crystal on another machine, then runs it there over ssh
@@ -104,7 +106,16 @@ is: it's the one request every version must understand.
   - `settings_view.rs`: the settings view (`,`): notifications, the theme, the distiller and search by meaning,
     each changed with a key, and how the model stands; the event loop writes the file (`config::set`) and,
     while it's open, reads the settings and the daemon's `EmbeddingStatus` again every half a second
-- `src/daemon.rs`: the daemon: listens on the socket and owns the sessions
+- `src/daemon.rs`: the daemon: listens on the socket and owns the sessions, and emits an event wherever something
+  happens to them, their tasks, flows, worktrees, memory or backlog
+- `src/events.rs`: what happens, as events: the one `Event` type, its kinds (a public contract plugins listen
+  for), what each carries, how one reads in a line, the filter a reader gives, and the made-up event `plugin run
+  --event` tries hooks on; pure, so it's unit-tested
+- `src/event_log.rs`: the event log, the `events` table in the database, read and pruned by age and count; and
+  the daemon's `Bus`, which numbers each event (a `seq` that never goes back), writes it down and sends it to
+  every subscriber: clients streaming over the socket, and the plugins' hooks
+- `src/events_cli.rs`: `crystal events`: the log in a shell, filtered, as lines or JSON, or followed, and `--since`
+  read as a while back or a time on this machine's clock
 - `src/agents.rs`: what crystal knows about particular agents: the hooks it adds to Claude Code, and what they mean
 - `src/catalog.rs`: the agents the new-session panel offers: their names, how each takes a first prompt, their
   options, and which are installed
@@ -115,7 +126,8 @@ is: it's the one request every version must understand.
 - `src/agent_screen.rs`: reading what an agent is doing off its screen and title
 - `src/front.rs`: what's in front in a session's terminal (agent, shell or program), from its foreground process
 - `src/typing.rs`: typing into a session the way a person would: pastes marked, Enter on its own
-- `src/session.rs`: one program in a PTY, or a task: spawn, exit status, stop, and its screen and viewers
+- `src/session.rs`: one program in a PTY, or a task: spawn, exit status, stop, its screen, viewers and listeners,
+  and what has changed in it (its agent's activity, a task's runs) for the daemon to tell
 - `src/vt.rs`: a terminal's screen, through `alacritty_terminal`: what a program drew and its history, the modes
   it set, its answers to the program's questions (the daemon's screen only), the output that catches a new viewer
   up, the cells to draw, the input modes `crystal attach` asks your terminal for, and, for a viewer, copy mode's
@@ -139,7 +151,7 @@ is: it's the one request every version must understand.
 - `src/db.rs`: the SQLite database the daemon and the TUI keep their state in (WAL, `synchronous=NORMAL`,
   migrations by `user_version`, as docket does): the sessions to start again, flow runs, each project's backlog
   and closed tasks, the tasks waiting to start and the last task number, what background tasks spent each day,
-  and the TUI's tabs, layouts and the new-session panel's memory, each a JSON document; and
+  the event log, and the TUI's tabs, layouts and the new-session panel's memory, each a JSON document; and
   bringing in the JSON files from before, a project's the first time it's asked for. Settings stay in the
   config file and memory in `memory.db`
 - `src/project.rs`: the project a directory is in: its git main worktree, or the directory itself outside git
@@ -182,10 +194,11 @@ is: it's the one request every version must understand.
   `toml_edit`, the context and environment their commands run with, their logs, and pausing one that fails
 - `src/plugin_manifest.rs`: an installed plugin's `plugin.toml` (actions, events, panes), read and checked, and
   how event patterns match
-- `src/plugin_hooks.rs`: the daemon's side of plugins' `[[events]]`: the events, and each plugin's hooks run one
-  at a time on a thread of its own, with a timeout, a log, and a pause after failures in a row
-- `src/plugin_cli.rs`: `crystal plugin`: listing, switching, running an action, installing, making and
-  removing
+- `src/plugin_hooks.rs`: the daemon's side of plugins' `[[events]]`: a subscriber of the bus, each plugin's hooks
+  run one at a time on a thread of its own, with a timeout, a log, and a pause (and a `plugin.paused` event)
+  after failures in a row; and running a hook here, for `plugin run --event`
+- `src/plugin_cli.rs`: `crystal plugin`: listing, switching, running an action or trying hooks on a made-up event,
+  installing, making and removing
 - `src/env.rs`: the environment a session's program starts with
 - `src/git.rs`: a directory's project, worktree and branch, a project's linked worktrees, and making and
   removing worktrees, a pull request's with its commits fetched from `origin` (runs `git`)
