@@ -757,10 +757,8 @@ fn bytes_of(vector: &[f32]) -> Vec<u8> {
 }
 
 fn vector_of(bytes: &[u8]) -> Vec<f32> {
-    bytes
-        .chunks_exact(4)
-        .map(|four| f32::from_le_bytes([four[0], four[1], four[2], four[3]]))
-        .collect()
+    let (fours, _) = bytes.as_chunks::<4>();
+    fours.iter().map(|four| f32::from_le_bytes(*four)).collect()
 }
 
 /// A text as an FTS5 query: its words (letters, digits and `_`), lower
