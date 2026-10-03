@@ -28,7 +28,16 @@ const CLAUDE_HOOK_EVENTS: &[&str] = &[
 /// carries the flags that make the agent report to `crystal hook`, run
 /// from `crystal`, the path of this program, and with `resume`, the id of
 /// a conversation to pick up again.
-pub fn argv(command: &[String], crystal: &Path, resume: Option<&str>) -> Vec<String> {
+///
+/// `instructions` are what crystal tells the agent on top of what it was
+/// asked, each a paragraph: Claude Code gets them added to its system
+/// prompt. Other agents have no such option, and go without.
+pub fn argv(
+    command: &[String],
+    crystal: &Path,
+    resume: Option<&str>,
+    instructions: &[String],
+) -> Vec<String> {
     if program_name(command) == Some("codex")
         && let Some(id) = resume
         && let Some(argv) = codex::resume_argv(command, id)
@@ -43,15 +52,45 @@ pub fn argv(command: &[String], crystal: &Path, resume: Option<&str>) -> Vec<Str
         "--settings".to_string(),
         claude_settings(crystal),
     ];
-    match resume {
+    let args = match resume {
         Some(id) => {
             argv.push("--resume".to_string());
             argv.push(id.to_string());
-            argv.extend(without_resume_flags(&command[1..]));
+            without_resume_flags(&command[1..])
         }
-        None => argv.extend_from_slice(&command[1..]),
-    }
+        None => command[1..].to_vec(),
+    };
+    argv.extend(with_instructions(&args, instructions));
     argv
+}
+
+/// Claude's arguments with crystal's `instructions` added to its system
+/// prompt. Claude takes `--append-system-prompt` once, so one the user gave
+/// is taken out and comes first in the one crystal passes.
+fn with_instructions(args: &[String], instructions: &[String]) -> Vec<String> {
+    if instructions.is_empty() {
+        return args.to_vec();
+    }
+    let mut kept = Vec::new();
+    let mut paragraphs = Vec::new();
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        if arg == "--append-system-prompt" {
+            paragraphs.extend(args.next().cloned());
+        } else if let Some(text) = arg.strip_prefix("--append-system-prompt=") {
+            paragraphs.push(text.to_string());
+        } else {
+            kept.push(arg.clone());
+        }
+    }
+    paragraphs.extend(instructions.iter().cloned());
+    // Ahead of the rest, so that it can't be taken for the first prompt.
+    let mut with = vec![
+        "--append-system-prompt".to_string(),
+        paragraphs.join("\n\n"),
+    ];
+    with.extend(kept);
+    with
 }
 
 /// The conversation a Claude Code hook's input names, if it does.
@@ -139,25 +178,50 @@ mod tests {
     }
 
     #[test]
+    fn crystal_s_instructions_join_the_users_own_system_prompt() {
+        let asked = command(&["claude", "--append-system-prompt", "Be brief.", "fix it"]);
+        let instructions = ["Run `crystal done` when finished.".to_string()];
+        let argv = argv(&asked, Path::new("/bin/crystal"), None, &instructions);
+        assert_eq!(
+            argv[3..],
+            [
+                "--append-system-prompt",
+                "Be brief.\n\nRun `crystal done` when finished.",
+                "fix it"
+            ]
+        );
+    }
+
+    #[test]
+    fn without_instructions_claude_s_arguments_stay_as_they_are() {
+        let asked = command(&["claude", "--append-system-prompt", "Be brief."]);
+        let argv = argv(&asked, Path::new("/bin/crystal"), None, &[]);
+        assert_eq!(argv[3..], ["--append-system-prompt", "Be brief."]);
+    }
+
+    #[test]
     fn other_programs_run_as_asked() {
         let asked = command(&["aider", "--model", "o3"]);
-        assert_eq!(argv(&asked, Path::new("/bin/crystal"), Some("abc")), asked);
+        assert_eq!(
+            argv(&asked, Path::new("/bin/crystal"), Some("abc"), &[]),
+            asked
+        );
     }
 
     #[test]
     fn codex_resumes_its_conversation_with_its_own_subcommand() {
         let asked = command(&["codex", "--model", "o4", "fix it"]);
         assert_eq!(
-            argv(&asked, Path::new("/bin/crystal"), Some("abc")),
+            argv(&asked, Path::new("/bin/crystal"), Some("abc"), &[]),
             ["codex", "resume", "abc", "--model", "o4"]
         );
-        assert_eq!(argv(&asked, Path::new("/bin/crystal"), None), asked);
+        assert_eq!(argv(&asked, Path::new("/bin/crystal"), None, &[]), asked);
     }
 
     #[test]
     fn claude_resumes_the_conversation_it_was_in() {
         let asked = command(&["claude", "--continue", "--model", "opus"]);
-        let argv = argv(&asked, Path::new("/bin/crystal"), Some("abc"));
+        let argv = argv(&asked, Path::new("/bin/crystal"), Some("abc"), &[]);
         assert_eq!(argv[3..], ["--resume", "abc", "--model", "opus"]);
     }
 
@@ -179,7 +243,7 @@ mod tests {
     #[test]
     fn claude_gets_hooks_ahead_of_its_own_arguments() {
         let asked = command(&["/usr/local/bin/claude", "--resume"]);
-        let argv = argv(&asked, Path::new("/opt/my tools/crystal"), None);
+        let argv = argv(&asked, Path::new("/opt/my tools/crystal"), None, &[]);
         assert_eq!(argv[0], "/usr/local/bin/claude");
         assert_eq!(argv[1], "--settings");
         assert_eq!(argv[3], "--resume");

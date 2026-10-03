@@ -445,7 +445,10 @@ fn start(
     let resume = conversation
         .as_ref()
         .map(|conversation| conversation.id.as_str());
-    let argv = agents::argv(&command, &crystal, resume);
+    // What crystal tells the agent on top of what it was asked. Each part of
+    // crystal that has something to say adds its paragraph here.
+    let instructions: Vec<String> = Vec::new();
+    let argv = agents::argv(&command, &crystal, resume, &instructions);
     let mut session = Session::spawn(id, name.clone(), command, &argv, cwd, &env)?;
     match conversation {
         Some(conversation) => session.set_conversation(conversation),
