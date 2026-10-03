@@ -507,7 +507,9 @@ impl Launcher {
         self.chosen = settings
             .iter()
             .map(|setting| {
-                let wanted = profile.as_ref().and_then(|p| profile_value(p, setting));
+                let wanted = profile
+                    .as_ref()
+                    .and_then(|p| p.choice(setting.kind).clone());
                 wanted
                     .and_then(|value| self.index_of(setting, &value))
                     .unwrap_or(0)
@@ -615,12 +617,7 @@ impl Launcher {
             return Vec::new();
         };
         for (setting, &choice) in self.run().settings().iter().zip(&self.chosen) {
-            let value = self.value(setting, choice);
-            if is_model(setting) {
-                profile.model = value;
-            } else {
-                profile.mode = value;
-            }
+            *profile.choice_mut(setting.kind) = self.value(setting, choice);
         }
         profile.command(&self.task_text())
     }
@@ -760,21 +757,6 @@ pub fn background_spec(command: &[String]) -> Option<TaskSpec> {
         prompt: prompt.clone(),
         args: args.to_vec(),
     })
-}
-
-/// Whether `setting` is the row that chooses the agent's model; the other
-/// row an agent may have is how it asks before acting, its mode.
-fn is_model(setting: &Setting) -> bool {
-    setting.label == "model"
-}
-
-/// What `profile` sets the row `setting` to, if it sets it.
-fn profile_value(profile: &Profile, setting: &Setting) -> Option<String> {
-    if is_model(setting) {
-        profile.model.clone()
-    } else {
-        profile.mode.clone()
-    }
 }
 
 /// `at` moved `by` within `0..count`, going round at the ends.
@@ -1187,7 +1169,7 @@ mod tests {
         press(&mut panel, KeyCode::Down); // model
         press(&mut panel, KeyCode::Right);
         assert!(panel.title().starts_with("New background task"));
-        assert_eq!(panel.runs_line(), "claude -p --model opus 'fix the tests'");
+        assert_eq!(panel.runs_line(), "claude -p --model fable 'fix the tests'");
 
         let Outcome::Start {
             command,
@@ -1200,7 +1182,7 @@ mod tests {
         assert!(background);
         let spec = background_spec(&command).unwrap();
         assert_eq!(spec.prompt, "fix the tests");
-        assert_eq!(spec.args, ["--model", "opus"]);
+        assert_eq!(spec.args, ["--model", "fable"]);
     }
 
     #[test]
@@ -1288,6 +1270,8 @@ mod tests {
         press(&mut panel, KeyCode::Tab); // model
         assert_eq!(panel.focus(), Field::Setting(0));
         press(&mut panel, KeyCode::Right);
+        press(&mut panel, KeyCode::Down); // effort
+        press(&mut panel, KeyCode::Left); // round to the last: max
         press(&mut panel, KeyCode::Down); // permissions
         press(&mut panel, KeyCode::Right);
         press(&mut panel, KeyCode::Right);
@@ -1296,7 +1280,9 @@ mod tests {
             [
                 "claude",
                 "--model",
-                "opus",
+                "fable",
+                "--effort",
+                "max",
                 "--permission-mode",
                 "plan",
                 "--",
@@ -1305,7 +1291,7 @@ mod tests {
         );
         assert_eq!(
             panel.command_line(),
-            "claude --model opus --permission-mode plan -- 'plan it'"
+            "claude --model fable --effort max --permission-mode plan -- 'plan it'"
         );
     }
 
@@ -1338,7 +1324,7 @@ mod tests {
     fn tab_goes_round_the_fields_and_back() {
         let mut panel = launcher(vec![agent("claude")]);
         let mut seen = vec![panel.focus()];
-        for _ in 0..4 {
+        for _ in 0..5 {
             press(&mut panel, KeyCode::Tab);
             seen.push(panel.focus());
         }
@@ -1349,6 +1335,7 @@ mod tests {
                 Field::Run,
                 Field::Setting(0),
                 Field::Setting(1),
+                Field::Setting(2),
                 Field::Where
             ]
         );
@@ -1460,6 +1447,7 @@ mod tests {
             name: "review".into(),
             description: Some("A second pair of eyes".into()),
             model: Some("opus".into()),
+            effort: Some("high".into()),
             mode: Some("plan".into()),
             prompt: Some("Review the diff.".into()),
             start_in: Some(StartIn::Worktree),
@@ -1476,6 +1464,7 @@ mod tests {
                 Field::Run,
                 Field::Setting(0),
                 Field::Setting(1),
+                Field::Setting(2),
                 Field::Where,
                 Field::Branch
             ]
@@ -1487,6 +1476,8 @@ mod tests {
                 "claude",
                 "--model",
                 "opus",
+                "--effort",
+                "high",
                 "--permission-mode",
                 "plan",
                 "--",
@@ -1494,12 +1485,16 @@ mod tests {
             ]
         );
 
+        // Down to the effort row, and one to the right: xhigh.
+        press(&mut panel, KeyCode::Tab);
+        press(&mut panel, KeyCode::Tab);
+        press(&mut panel, KeyCode::Tab);
+        press(&mut panel, KeyCode::Right);
+        assert_eq!(panel.command()[3..5], ["--effort", "xhigh"]);
         // Down to the permissions row, and one to the left: accept edits.
         press(&mut panel, KeyCode::Tab);
-        press(&mut panel, KeyCode::Tab);
-        press(&mut panel, KeyCode::Tab);
         press(&mut panel, KeyCode::Left);
-        assert_eq!(panel.command()[3..5], ["--permission-mode", "acceptEdits"]);
+        assert_eq!(panel.command()[5..7], ["--permission-mode", "acceptEdits"]);
     }
 
     #[test]
