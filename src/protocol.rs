@@ -183,9 +183,15 @@ pub struct Conversation {
 
 impl Conversation {
     /// Whether there's anything to pick up: an agent that was never sent a
-    /// prompt hasn't written its transcript, and can't resume it.
+    /// prompt hasn't written its transcript, and can't resume it. Codex
+    /// compresses the transcripts it hasn't touched in a while, adding
+    /// `.zst` to the name, and resumes those all the same.
     pub fn can_resume(&self) -> bool {
-        self.transcript.as_ref().is_some_and(|path| path.is_file())
+        let Some(path) = &self.transcript else {
+            return false;
+        };
+        let compressed = PathBuf::from(format!("{}.zst", path.display()));
+        path.is_file() || compressed.is_file()
     }
 }
 

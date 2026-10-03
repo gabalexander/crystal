@@ -3,6 +3,7 @@
 //! client goes away.
 
 use crate::agents;
+use crate::codex;
 use crate::env;
 use crate::keys;
 use crate::notify;
@@ -145,7 +146,18 @@ impl Daemon {
         loop {
             thread::sleep(KEEP_UP_EVERY);
             let mut sessions = self.sessions.lock().unwrap();
+            let claimed: Vec<String> = sessions
+                .iter()
+                .filter_map(|session| session.conversation_id().map(String::from))
+                .collect();
+            let claimed: Vec<&str> = claimed.iter().map(String::as_str).collect();
+            let looking: Vec<(PathBuf, SystemTime)> = sessions
+                .iter()
+                .filter_map(Session::looking_for_conversation)
+                .map(|rollouts| (rollouts.cwd().to_path_buf(), rollouts.started()))
+                .collect();
             for session in sessions.iter_mut() {
+                session.find_conversation(&claimed, &looking);
                 session.check_screen();
                 if let Some(notice) = session.notice() {
                     notify::tell(notice);
@@ -358,16 +370,24 @@ fn start(
     };
 
     let id = new_id();
+    let rollouts = codex::Rollouts::for_session(&command, &cwd, &env);
     let env = env::for_session(&env, &name, &id, socket);
     let crystal = std::env::current_exe()?;
+    // A conversation that can't be picked up any more is left behind: the
+    // agent starts a new one, which its hooks or its rollout will name.
+    let conversation = conversation.filter(Conversation::can_resume);
     let resume = conversation
         .as_ref()
-        .filter(|conversation| conversation.can_resume())
         .map(|conversation| conversation.id.as_str());
     let argv = agents::argv(&command, &crystal, resume);
     let mut session = Session::spawn(id, name.clone(), command, &argv, cwd, &env)?;
-    if let Some(conversation) = conversation {
-        session.set_conversation(conversation);
+    match conversation {
+        Some(conversation) => session.set_conversation(conversation),
+        None => {
+            if let Some(rollouts) = rollouts {
+                session.look_for_conversation_in(rollouts);
+            }
+        }
     }
     sessions.push(session);
     Ok(name)

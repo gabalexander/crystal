@@ -1,6 +1,7 @@
 //! A program running in a PTY of its own.
 
 use crate::agent_screen::{self, Looks, ScreenWatch};
+use crate::codex::Rollouts;
 use crate::git::Checkout;
 use crate::history::{self, HISTORY_LINES, HistoryKeeper};
 use crate::notify::{self, Notice};
@@ -45,8 +46,11 @@ pub struct Session {
     screen_watch: ScreenWatch,
     /// The git worktree `cwd` is in, if it's in one.
     checkout: Option<Checkout>,
-    /// The agent's conversation, once its hooks have named it.
+    /// The agent's conversation, once its hooks have named it, or it has
+    /// turned up in Codex's rollouts.
     conversation: Option<Conversation>,
+    /// Where to find a Codex session's conversation, until it's found.
+    rollouts: Option<Rollouts>,
     /// What the user was last told about the session, while it still
     /// holds: it waits on them, or it's done.
     told: Option<Activity>,
@@ -126,6 +130,7 @@ impl Session {
             activity: None,
             changed,
             conversation: None,
+            rollouts: None,
             told: None,
             screen_watch: ScreenWatch::default(),
             term,
@@ -189,6 +194,48 @@ impl Session {
 
     pub fn set_conversation(&mut self, conversation: Conversation) {
         self.conversation = Some(conversation);
+    }
+
+    /// The id of the agent's conversation, once it's known.
+    pub fn conversation_id(&self) -> Option<&str> {
+        let conversation = self.conversation.as_ref()?;
+        Some(conversation.id.as_str())
+    }
+
+    /// Has the session look for its Codex conversation in `rollouts`, for
+    /// as long as it doesn't know it.
+    pub fn look_for_conversation_in(&mut self, rollouts: Rollouts) {
+        self.rollouts = Some(rollouts);
+    }
+
+    /// Where a Codex session is looking for its conversation, while it runs
+    /// and doesn't know it yet.
+    pub fn looking_for_conversation(&self) -> Option<&Rollouts> {
+        if self.conversation.is_some() || !self.is_running() {
+            return None;
+        }
+        self.rollouts.as_ref()
+    }
+
+    /// Looks for a Codex session's conversation, while it runs and isn't
+    /// known yet. `claimed` are the conversations other sessions are in;
+    /// `looking` says where every Codex session still looking is, and when
+    /// it started, its own place among them.
+    pub fn find_conversation(&mut self, claimed: &[&str], looking: &[(PathBuf, SystemTime)]) {
+        let Some(ours) = self.looking_for_conversation() else {
+            return;
+        };
+        let rivals: Vec<SystemTime> = looking
+            .iter()
+            .filter(|(cwd, started)| cwd == ours.cwd() && *started != ours.started())
+            .map(|(_, started)| *started)
+            .collect();
+        let Some(rollouts) = &mut self.rollouts else {
+            return;
+        };
+        if let Some(conversation) = rollouts.look(claimed, &rivals) {
+            self.conversation = Some(conversation);
+        }
     }
 
     /// What it takes to start the session again after a restart, while it

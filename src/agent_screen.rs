@@ -21,9 +21,13 @@ const WAITING_TEXT: &[&str] = &[
     // Claude Code
     "do you want to proceed?",
     "waiting for permission",
-    // Codex
-    "allow command?",
+    // Codex: each of its approvals asks "would you like to …?", and ends
+    // with how to answer. "Allow command?" is from older versions.
+    "would you like to run the following command?",
+    "would you like to make the following edits?",
+    "would you like to grant these permissions?",
     "press enter to confirm or esc to cancel",
+    "allow command?",
 ];
 
 /// Text, in lower case, that agents show only while they work on a turn.
@@ -144,6 +148,24 @@ mod tests {
             "Bash command\r\n  echo hi\r\nDo you want to proceed?\r\n❯ 1. Yes\r\n  2. No";
         assert_eq!(looks(question, "⠋ Running"), Looks::Waiting);
         assert_eq!(looks("> ", "Action Required"), Looks::Waiting);
+    }
+
+    // The Codex screens below are from its own TUI snapshot tests.
+
+    #[test]
+    fn codex_at_work_says_so_in_its_status_line() {
+        let working = "• Working (0s • esc to interrupt)\r\n\r\n› Ask Codex to do anything\r\n\r\n  gpt-5 default · /tmp/project";
+        assert_eq!(looks(working, ""), Looks::Working);
+        let resting = "› Ask Codex to do anything\r\n\r\n  gpt-5 default · /tmp/project";
+        assert_eq!(looks(resting, ""), Looks::Settled);
+    }
+
+    #[test]
+    fn codex_asking_to_run_a_command_waits() {
+        let question = "  Would you like to run the following command?\r\n\r\n  $ echo hello world\r\n\r\n› 1. Yes, proceed (y)\r\n  2. Yes, and don't ask again (p)\r\n  3. No, and tell Codex what to do differently (esc)\r\n\r\n  Press enter to confirm or esc to cancel";
+        assert_eq!(looks(question, ""), Looks::Waiting);
+        let edits = "  Would you like to make the following edits?\r\n\r\n› 1. Yes, proceed (y)";
+        assert_eq!(looks(edits, ""), Looks::Waiting);
     }
 
     #[test]

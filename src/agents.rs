@@ -7,6 +7,7 @@
 //! `--settings`, so the user's settings files are never touched, and its
 //! hooks run alongside any the user has.
 
+use crate::codex;
 use crate::protocol::{AgentEvent, Conversation};
 use crate::shell;
 use serde_json::{Value, json};
@@ -28,6 +29,12 @@ const CLAUDE_HOOK_EVENTS: &[&str] = &[
 /// from `crystal`, the path of this program, and with `resume`, the id of
 /// a conversation to pick up again.
 pub fn argv(command: &[String], crystal: &Path, resume: Option<&str>) -> Vec<String> {
+    if program_name(command) == Some("codex")
+        && let Some(id) = resume
+        && let Some(argv) = codex::resume_argv(command, id)
+    {
+        return argv;
+    }
     if program_name(command) != Some("claude") {
         return command.to_vec();
     }
@@ -133,8 +140,18 @@ mod tests {
 
     #[test]
     fn other_programs_run_as_asked() {
-        let asked = command(&["codex", "--model", "o3"]);
+        let asked = command(&["aider", "--model", "o3"]);
         assert_eq!(argv(&asked, Path::new("/bin/crystal"), Some("abc")), asked);
+    }
+
+    #[test]
+    fn codex_resumes_its_conversation_with_its_own_subcommand() {
+        let asked = command(&["codex", "--model", "o4", "fix it"]);
+        assert_eq!(
+            argv(&asked, Path::new("/bin/crystal"), Some("abc")),
+            ["codex", "resume", "abc", "--model", "o4"]
+        );
+        assert_eq!(argv(&asked, Path::new("/bin/crystal"), None), asked);
     }
 
     #[test]

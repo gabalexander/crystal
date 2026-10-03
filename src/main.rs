@@ -2,6 +2,7 @@ mod agent_screen;
 mod agents;
 mod attach;
 mod client;
+mod codex;
 mod config;
 mod daemon;
 mod drive;

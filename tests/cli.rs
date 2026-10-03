@@ -2525,3 +2525,222 @@ fn ssh_uses_the_ssh_on_the_path() {
     );
     assert_eq!(remote.file("ran").unwrap(), "ls\n");
 }
+
+/// A stand-in for Codex: a `codex` that writes down the arguments it was
+/// started with, one per line, and for a new conversation writes its
+/// rollout the way Codex does, into `$CODEX_HOME/sessions/YYYY/MM/DD/`,
+/// named after when it started and `$FAKE_CODEX_ID`. Like Codex, it notes
+/// the time it starts but writes the file later: once `$FAKE_CODEX_WAIT_FOR`
+/// exists, if that's set, the way Codex waits for a first prompt. Then it
+/// waits. Returns the directory to put on the PATH.
+fn fake_codex(dir: &Path) -> PathBuf {
+    let bin = dir.join("codex-bin");
+    std::fs::create_dir(&bin).unwrap();
+    let codex = bin.join("codex");
+    let script = r#"#!/bin/sh
+printf '%s\n' "$@" > args
+if [ "$1" != resume ]; then
+    dir="$CODEX_HOME/sessions/$(date +%Y/%m/%d)"
+    stamp=$(date +%Y-%m-%dT%H-%M-%S)
+    started="$(date -u +%Y-%m-%dT%H:%M:%S).000Z"
+    if [ -n "$FAKE_CODEX_WAIT_FOR" ]; then
+        while [ ! -e "$FAKE_CODEX_WAIT_FOR" ]; do sleep 0.05; done
+    fi
+    mkdir -p "$dir"
+    printf '{"timestamp":"%s","type":"session_meta","payload":{"id":"%s","timestamp":"%s","cwd":"%s"}}\n' \
+        "$started" "$FAKE_CODEX_ID" "$started" "$(pwd -P)" \
+        > "$dir/rollout-$stamp-$FAKE_CODEX_ID.jsonl"
+fi
+sleep 30
+"#;
+    std::fs::write(&codex, script).unwrap();
+    let mut permissions = std::fs::metadata(&codex).unwrap().permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+    std::fs::set_permissions(&codex, permissions).unwrap();
+    bin
+}
+
+/// Runs crystal with the fake Codex in `bin` on the PATH, a Codex home in
+/// the test's directory, and `id` for the conversation it starts.
+fn with_codex(crystal: &Crystal, bin: &Path, id: &str, args: &[&str]) {
+    let out = codex_command(crystal, bin, id, args).output().unwrap();
+    assert!(
+        out.status.success(),
+        "crystal {args:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+fn codex_command(crystal: &Crystal, bin: &Path, id: &str, args: &[&str]) -> Command {
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let mut command = crystal.command(args);
+    command
+        .env("PATH", path)
+        .env("CODEX_HOME", crystal.dir.path().join("codex-home"))
+        .env("FAKE_CODEX_ID", id);
+    command
+}
+
+/// The arguments the fake Codex was last started with, once it has been.
+fn codex_args(crystal: &Crystal) -> Vec<String> {
+    let args = written(&crystal.dir.path().join("args"));
+    args.lines().map(String::from).collect()
+}
+
+fn forget_codex_args(crystal: &Crystal) {
+    std::fs::remove_file(crystal.dir.path().join("args")).unwrap();
+}
+
+/// Every file under `dir`, however deep.
+fn files_under(dir: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(dir).unwrap().flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            files.extend(files_under(&path));
+        } else {
+            files.push(path);
+        }
+    }
+    files
+}
+
+const CODEX_TASK: &[&str] = &[
+    "new",
+    "-n",
+    "coder",
+    "codex",
+    "--model",
+    "o4",
+    "fix the tests",
+];
+
+#[test]
+fn codex_picks_its_conversation_up_again_after_a_restart() {
+    let crystal = Crystal::new();
+    let bin = fake_codex(crystal.dir.path());
+    let daemon = crystal.start_daemon();
+    with_codex(&crystal, &bin, "thread-123", CODEX_TASK);
+    assert_eq!(codex_args(&crystal), ["--model", "o4", "fix the tests"]);
+    eventually("the conversation is found and saved", || {
+        crystal.saved().contains("thread-123")
+    });
+
+    crash(daemon);
+    forget_codex_args(&crystal);
+    // The next command starts a daemon, which starts coder again: in its
+    // conversation, with its options, and without its first prompt again.
+    with_codex(
+        &crystal,
+        &bin,
+        "thread-456",
+        &["new", "-n", "other", "sleep", "300"],
+    );
+    assert_eq!(
+        codex_args(&crystal),
+        ["resume", "thread-123", "--model", "o4"]
+    );
+}
+
+#[test]
+fn a_respawned_codex_picks_its_conversation_up_again() {
+    let crystal = Crystal::new();
+    let bin = fake_codex(crystal.dir.path());
+    with_codex(&crystal, &bin, "thread-123", CODEX_TASK);
+    eventually("the conversation is found and saved", || {
+        crystal.saved().contains("thread-123")
+    });
+
+    let pid = crystal.pid("coder");
+    // SAFETY: kill only sends a signal, to the group the program leads.
+    unsafe {
+        libc::kill(-pid, libc::SIGTERM);
+    }
+    eventually("coder has ended", || {
+        crystal.row("coder").unwrap()[1].starts_with("killed")
+    });
+
+    forget_codex_args(&crystal);
+    with_codex(&crystal, &bin, "thread-456", &["respawn", "coder"]);
+    assert_eq!(
+        codex_args(&crystal),
+        ["resume", "thread-123", "--model", "o4"]
+    );
+}
+
+#[test]
+fn codex_starts_afresh_when_its_rollout_is_gone() {
+    let crystal = Crystal::new();
+    let bin = fake_codex(crystal.dir.path());
+    let daemon = crystal.start_daemon();
+    with_codex(&crystal, &bin, "thread-123", CODEX_TASK);
+    eventually("the conversation is found and saved", || {
+        crystal.saved().contains("thread-123")
+    });
+
+    crash(daemon);
+    for rollout in files_under(&crystal.dir.path().join("codex-home")) {
+        std::fs::remove_file(rollout).unwrap();
+    }
+    forget_codex_args(&crystal);
+    with_codex(
+        &crystal,
+        &bin,
+        "thread-456",
+        &["new", "-n", "other", "sleep", "300"],
+    );
+
+    // Started as it was asked for, in a new conversation, which crystal
+    // finds in turn.
+    assert_eq!(codex_args(&crystal), ["--model", "o4", "fix the tests"]);
+    eventually("the new conversation is found and saved", || {
+        crystal.saved().contains("thread-456")
+    });
+}
+
+#[test]
+fn two_codex_sessions_in_one_directory_each_find_their_own_conversation() {
+    let crystal = Crystal::new();
+    let bin = fake_codex(crystal.dir.path());
+    // The first is started first but sent its first prompt last, so its
+    // rollout appears after the second's.
+    let go_first = crystal.dir.path().join("go-first");
+    let out = codex_command(
+        &crystal,
+        &bin,
+        "first-thread",
+        &["new", "-n", "first", "codex"],
+    )
+    .env("FAKE_CODEX_WAIT_FOR", &go_first)
+    .output()
+    .unwrap();
+    assert!(out.status.success());
+    // Seconds apart, as the rollouts' names count them.
+    thread::sleep(Duration::from_secs(3));
+    with_codex(
+        &crystal,
+        &bin,
+        "second-thread",
+        &["new", "-n", "second", "codex"],
+    );
+
+    eventually("the second's conversation is found", || {
+        crystal.saved().contains("second-thread")
+    });
+    // Time for the first to look too, while only the second's rollout is
+    // there to find.
+    thread::sleep(Duration::from_millis(1500));
+    std::fs::write(&go_first, "").unwrap();
+    eventually("both conversations are found", || {
+        let saved = crystal.saved();
+        saved.contains("first-thread") && saved.contains("second-thread")
+    });
+    let saved: serde_json::Value = serde_json::from_str(&crystal.saved()).unwrap();
+    let conversation_of = |name: &str| {
+        let sessions = saved.as_array().unwrap();
+        let session = sessions.iter().find(|s| s["name"] == name).unwrap();
+        session["conversation"]["id"].as_str().unwrap().to_string()
+    };
+    assert_eq!(conversation_of("first"), "first-thread");
+    assert_eq!(conversation_of("second"), "second-thread");
+}
