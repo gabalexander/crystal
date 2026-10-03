@@ -54,6 +54,12 @@ pub enum Request {
         text: String,
         enter: bool,
     },
+    /// Press keys in a session: each one a key name, like `Enter` or
+    /// `C-c`, or else text typed as it is, never as a paste.
+    SendKeys {
+        name: String,
+        keys: Vec<String>,
+    },
     /// What's on a session's screen, as text.
     Read {
         name: String,

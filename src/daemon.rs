@@ -4,6 +4,7 @@
 
 use crate::agents;
 use crate::env;
+use crate::keys;
 use crate::notify;
 use crate::protocol::{self, Conversation, Frame, NewSession, Request, Response};
 use crate::session::{STOP_GRACE, Session, Term};
@@ -241,6 +242,14 @@ impl Daemon {
                 if enter {
                     thread::sleep(typing::ENTER_PAUSE);
                     term.write(typing::ENTER)?;
+                }
+                Ok(Response::Done)
+            }
+            Request::SendKeys { name, keys } => {
+                let term = self.running_term(&name)?;
+                let application_cursor = term.wants_application_cursor();
+                for key in &keys {
+                    term.write(&keys::keystrokes(key, application_cursor))?;
                 }
                 Ok(Response::Done)
             }

@@ -9,6 +9,7 @@ mod env;
 mod git;
 mod history;
 mod hook;
+mod keys;
 mod notify;
 mod protocol;
 mod session;
@@ -81,6 +82,25 @@ enum Command {
     Attach {
         /// The session [default: the newest one]
         name: Option<String>,
+    },
+    /// Press keys in a session, the way tmux's send-keys does: key names
+    /// (Enter, Escape, Tab, BTab, BSpace, Space, Up, Down, Left, Right, Home,
+    /// End, PageUp, PageDown, Delete, F1-F12, C-x, M-x) or text, typed as
+    /// keys. What answers an agent's question: `send-keys reviewer 1`.
+    SendKeys {
+        name: String,
+
+        #[arg(required = true)]
+        keys: Vec<String>,
+
+        /// Then wait for the turn they start or carry on to end, and print
+        /// how it ended.
+        #[arg(long)]
+        wait: bool,
+
+        /// With --wait, give up after this many seconds.
+        #[arg(long, value_name = "SECONDS", requires = "wait")]
+        timeout: Option<f64>,
     },
     /// Type text into a session and press Enter, the way a person would.
     Send {
@@ -201,6 +221,17 @@ fn run(cli: Cli) -> Result<()> {
             timeout,
         } => {
             drive::send(&socket, &name, &text.join(" "), !no_enter)?;
+            if wait {
+                drive::wait_for_turn(&socket, &name, seconds(timeout))?;
+            }
+        }
+        Command::SendKeys {
+            name,
+            keys,
+            wait,
+            timeout,
+        } => {
+            drive::send_keys(&socket, &name, keys)?;
             if wait {
                 drive::wait_for_turn(&socket, &name, seconds(timeout))?;
             }

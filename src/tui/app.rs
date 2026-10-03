@@ -5,9 +5,9 @@
 
 use super::command_line;
 use super::groups::{self, Row};
-use super::keys;
 use super::text_input::TextInput;
 use crate::config::Config;
+use crate::keys;
 use crate::protocol::{Activity, SessionInfo, State};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
 use std::path::PathBuf;

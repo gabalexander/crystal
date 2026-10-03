@@ -1257,6 +1257,23 @@ fn send_marks_the_text_as_a_paste_for_a_program_that_asks() {
 }
 
 #[test]
+fn send_keys_presses_keys_never_pasting_them() {
+    let crystal = Crystal::new();
+    // The same program that asks for bracketed paste: answering an agent's
+    // question has to reach it as keys, which agents act on, not a paste.
+    // It keeps the first 8 bytes: `1`, Escape, Up, `yes`.
+    let script = r"stty raw -echo; printf '\033[?2004hready'; head -c 8 > received; echo >> received; sleep 30";
+    crystal.ok(&["new", "-n", "asker", "sh", "-c", script]);
+    shows_on_screen(&crystal, "asker", "ready");
+
+    crystal.ok(&["send-keys", "asker", "1", "Escape", "Up", "yes"]);
+    assert_eq!(
+        written(&crystal.dir.path().join("received")),
+        "1\x1b\x1b[Ayes\n"
+    );
+}
+
+#[test]
 fn send_no_enter_types_and_leaves_it_there() {
     let crystal = Crystal::new();
     let script = r"stty raw -echo; printf ready; head -c 6 > received; echo >> received; sleep 30";

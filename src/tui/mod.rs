@@ -9,7 +9,6 @@
 mod app;
 mod command_line;
 mod groups;
-mod keys;
 mod mouse;
 mod pane;
 mod screen_widget;
@@ -17,6 +16,7 @@ mod text_input;
 mod ui;
 
 use crate::config::Config;
+use crate::keys;
 use crate::protocol::{Request, Response, SessionInfo};
 use crate::{client, env, git};
 use anyhow::{Result, bail};

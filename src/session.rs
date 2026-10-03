@@ -290,6 +290,17 @@ impl Term {
         agent_screen::read(screen.parser.screen(), &screen.parser.callbacks().title)
     }
 
+    /// Whether the program has asked the arrow keys to send `ESC O` rather
+    /// than `ESC [`, which changes what a key named to `send-keys` sends.
+    pub fn wants_application_cursor(&self) -> bool {
+        self.screen
+            .lock()
+            .unwrap()
+            .parser
+            .screen()
+            .application_cursor()
+    }
+
     /// Whether the program has asked for pastes to be marked as pastes.
     pub fn wants_bracketed_paste(&self) -> bool {
         self.screen

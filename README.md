@@ -150,6 +150,7 @@ crystal worktree rm fix/login               # remove that worktree, once nothing
 crystal ls                                  # list sessions and how they're doing
 crystal attach review                       # show a session; Ctrl+\ hands your terminal back
 crystal send review "check the diff"        # type into a session and press Enter
+crystal send-keys review 1                  # press keys: an answer, Enter, Escape, C-c, Up…
 crystal wait review                         # block until its agent stops working; print how it ended
 crystal read review --lines 20              # print the last 20 rows of its screen
 crystal read review --history               # and what scrolled off it before
@@ -200,7 +201,8 @@ hand it work, wait for it, and read what it said. Here a Claude Code session get
 ```sh
 crystal new -d -n reviewer claude                         # a second Claude, in the background
 crystal send reviewer "Review the diff on this branch" --wait   # prints done, or waiting if it asks something
-crystal read reviewer --lines 40                          # the end of its answer
+crystal read reviewer --lines 40                          # the end of its answer, or its question
+crystal send-keys reviewer 1 --wait                       # answer a question: the first choice
 ```
 
 `send` types the way a person does: the text first, marked as a paste when the program asks for that, then
@@ -208,6 +210,10 @@ Enter on its own, so an agent takes it as a prompt and not as pasted text. `--wa
 text starts, not one that ended before it. `wait` returns once the agent isn't working: `done`, `waiting` when
 it asks something, `idle`, or how its program exited. It takes a `--timeout` in seconds, and fails when that
 runs out. A program that doesn't say what it's doing counts as busy until it ends.
+
+`send-keys` presses keys instead, the way tmux's does: key names like `Enter`, `Escape`, `Tab`, `Up`, `Down`,
+`BSpace`, `C-c` or `M-x`, and any other word typed as keys. That's what answers an agent's question, since
+agents don't act on a pasted answer. With `--wait`, it waits for the turn the answer lets carry on.
 
 ### Settings
 

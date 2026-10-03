@@ -29,6 +29,18 @@ pub fn send(socket: &Path, name: &str, text: &str, enter: bool) -> Result<()> {
     Ok(())
 }
 
+/// Presses `keys` in the session called `name`: key names like `Enter`,
+/// or text, typed as keys rather than pasted. That's what answering an
+/// agent's question takes, since agents ignore a pasted answer.
+pub fn send_keys(socket: &Path, name: &str, keys: Vec<String>) -> Result<()> {
+    let request = Request::SendKeys {
+        name: name.to_string(),
+        keys,
+    };
+    ask(socket, &request)?;
+    Ok(())
+}
+
 /// Waits until the session's agent isn't working, or its program has
 /// ended, and prints which. Gives up after `timeout`, if there is one.
 pub fn wait(socket: &Path, name: &str, timeout: Option<Duration>) -> Result<()> {

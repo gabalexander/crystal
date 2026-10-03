@@ -38,6 +38,7 @@ is: it's the one request every version must understand.
 - `src/attach.rs`: `crystal attach`: draws a session in your terminal and sends it your keys
 - `src/viewer.rs`: the client's side of an attach, shared by `crystal attach` and the TUI's pane
 - `src/drive.rs`: `crystal send`, `wait` and `read`, for driving one session from another or a script
+- `src/keys.rs`: turning keys into the bytes a terminal sends: the TUI's keys, and the names `send-keys` takes
 - `src/tui/`: the TUI (`crystal` with no command)
   - `mod.rs`: the event loop: one channel of events, then update and draw
   - `app.rs`: the state and how keys and the mouse change it; no I/O, so it's unit-tested
@@ -48,7 +49,6 @@ is: it's the one request every version must understand.
   - `command_line.rs`: reads the line typed at `new session:` into the command to run
   - `pane.rs`: a viewer of a session on screen, the selected one or a split, and its screen
   - `screen_widget.rs`: draws a vt100 screen into ratatui
-  - `keys.rs`: turns crossterm keys back into the bytes a terminal sends
 - `src/daemon.rs`: the daemon: listens on the socket and owns the sessions
 - `src/agents.rs`: what crystal knows about particular agents: the hooks it adds to Claude Code, and what they mean
 - `src/hook.rs`: `crystal hook <agent>`: what those hooks run, to tell the daemon

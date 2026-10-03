@@ -1,6 +1,7 @@
-//! Turning the keys crossterm reports back into the bytes a terminal would
-//! have sent for them, so a session in the pane gets what it would get if
-//! it ran in a terminal of its own.
+//! Turning keys into the bytes a terminal would send for them, so that a
+//! session gets what it would get if it ran in a terminal of its own: the
+//! keys crossterm reports to the TUI, and the keys named to
+//! `crystal send-keys`.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -47,6 +48,62 @@ pub fn encode(key: &KeyEvent, application_cursor: bool) -> Option<Vec<u8>> {
         return Some(with_escape);
     }
     Some(bytes)
+}
+
+/// The key a name stands for, in the names tmux's `send-keys` uses:
+/// `Enter`, `Escape`, `Tab`, `BTab` (Shift+Tab), `BSpace`, `Space`, the
+/// arrows `Up` `Down` `Left` `Right`, `Home`, `End`, `PageUp` (`PPage`),
+/// `PageDown` (`NPage`), `Delete`, `F1`…`F12`, and `C-x` or `M-x` for a key
+/// with Ctrl or Alt held. Names aren't case-sensitive. Anything else isn't
+/// a name, and `None` says so.
+pub fn named(name: &str) -> Option<KeyEvent> {
+    if let Some(key) = name.strip_prefix("C-").or_else(|| name.strip_prefix("c-")) {
+        return with_modifier(key, KeyModifiers::CONTROL);
+    }
+    if let Some(key) = name.strip_prefix("M-").or_else(|| name.strip_prefix("m-")) {
+        return with_modifier(key, KeyModifiers::ALT);
+    }
+    let code = match name.to_ascii_lowercase().as_str() {
+        "enter" => KeyCode::Enter,
+        "escape" | "esc" => KeyCode::Esc,
+        "tab" => KeyCode::Tab,
+        "btab" => KeyCode::BackTab,
+        "bspace" => KeyCode::Backspace,
+        "space" => KeyCode::Char(' '),
+        "up" => KeyCode::Up,
+        "down" => KeyCode::Down,
+        "left" => KeyCode::Left,
+        "right" => KeyCode::Right,
+        "home" => KeyCode::Home,
+        "end" => KeyCode::End,
+        "pageup" | "ppage" => KeyCode::PageUp,
+        "pagedown" | "npage" => KeyCode::PageDown,
+        "delete" | "dc" => KeyCode::Delete,
+        lower => match lower.strip_prefix('f').map(str::parse::<u8>) {
+            Some(Ok(n)) if (1..=12).contains(&n) => KeyCode::F(n),
+            _ => return None,
+        },
+    };
+    Some(KeyEvent::new(code, KeyModifiers::NONE))
+}
+
+/// What pressing `key` sends: the key it names, or else the text as it
+/// is, the way typing it would send it.
+pub fn keystrokes(key: &str, application_cursor: bool) -> Vec<u8> {
+    named(key)
+        .and_then(|named| encode(&named, application_cursor))
+        .unwrap_or_else(|| key.as_bytes().to_vec())
+}
+
+/// `key`, a single character or a name, with `modifier` held too.
+fn with_modifier(key: &str, modifier: KeyModifiers) -> Option<KeyEvent> {
+    let mut chars = key.chars();
+    let mut event = match (chars.next(), chars.next()) {
+        (Some(c), None) => KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE),
+        _ => named(key)?,
+    };
+    event.modifiers |= modifier;
+    Some(event)
 }
 
 /// Ctrl+letter is the letter's position in the alphabet: Ctrl+A is 1. A few
@@ -129,6 +186,32 @@ mod tests {
 
     fn encoded(key: KeyEvent) -> Vec<u8> {
         encode(&key, false).unwrap()
+    }
+
+    #[test]
+    fn names_stand_for_their_keys() {
+        let bytes = |name: &str| encode(&named(name).unwrap(), false).unwrap();
+        assert_eq!(bytes("Enter"), b"\r");
+        assert_eq!(bytes("escape"), b"\x1b");
+        assert_eq!(bytes("Up"), b"\x1b[A");
+        assert_eq!(bytes("BTab"), b"\x1b[Z");
+        assert_eq!(bytes("C-c"), [3]);
+        assert_eq!(bytes("M-b"), b"\x1bb");
+        assert_eq!(bytes("F5"), b"\x1b[15~");
+    }
+
+    #[test]
+    fn a_word_that_isnt_a_name_is_typed_as_it_is() {
+        assert_eq!(keystrokes("1", false), b"1");
+        assert_eq!(keystrokes("yes", false), b"yes");
+        assert_eq!(keystrokes("Up", true), b"\x1bOA");
+    }
+
+    #[test]
+    fn a_word_that_isnt_a_name_is_none() {
+        assert_eq!(named("hello"), None);
+        assert_eq!(named("1"), None);
+        assert_eq!(named("F13"), None);
     }
 
     #[test]
