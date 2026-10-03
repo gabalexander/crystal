@@ -1509,7 +1509,7 @@ fn worktree_rm_waits_until_no_session_runs_in_it() {
 }
 
 #[test]
-fn worktree_rm_keeps_work_that_isnt_committed() {
+fn worktree_rm_keeps_work_that_isnt_committed_unless_forced() {
     let crystal = Crystal::new();
     let repo = git_repo(crystal.dir.path(), "app");
     let repo_arg = repo.to_str().unwrap();
@@ -1520,6 +1520,10 @@ fn worktree_rm_keeps_work_that_isnt_committed() {
     let err = crystal.fails(&["worktree", "rm", "app.worktrees/fix"]);
     assert!(err.contains("untracked"), "{err}");
     assert!(worktree.join("notes.txt").exists());
+
+    // Unless it's forced, and the work goes with it.
+    crystal.ok(&["worktree", "rm", "--force", "app.worktrees/fix"]);
+    assert!(!worktree.exists());
 }
 
 #[test]
@@ -2936,7 +2940,7 @@ fn a_worktree_whose_last_session_is_killed_stays_until_shift_w_removes_it() {
 }
 
 #[test]
-fn shift_w_on_a_worktree_with_work_in_it_says_why_git_keeps_it() {
+fn shift_w_on_a_worktree_with_work_in_it_asks_again_before_losing_it() {
     let crystal = Crystal::new();
     let repo = git_repo(crystal.dir.path(), "app");
     let repo_arg = repo.to_str().unwrap();
@@ -2953,9 +2957,20 @@ fn shift_w_on_a_worktree_with_work_in_it_says_why_git_keeps_it() {
     tui.type_keys("W");
     tui.shows("remove worktree fix? y/n");
     tui.type_keys("y");
-    tui.shows("'fix' contains modified or untracked files");
+    tui.shows("fix has uncommitted changes: remove it and lose them? y/n");
+    // A no keeps it, and the work in it.
+    tui.type_keys("n");
+    tui.hides("uncommitted changes");
     assert!(worktree.join("notes.txt").exists());
     tui.shows("· no sessions");
+
+    tui.type_keys("W");
+    tui.shows("remove worktree fix? y/n");
+    tui.type_keys("y");
+    tui.shows("fix has uncommitted changes: remove it and lose them? y/n");
+    tui.type_keys("y");
+    eventually("the worktree is gone", || !worktree.exists());
+    tui.hides("⎇ fix");
 }
 
 #[test]

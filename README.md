@@ -250,8 +250,9 @@ review  exited 0  41388  app      main       ~/code/app                      cod
 `/` in the branch made a `-`. A branch that doesn't exist yet starts from the commit you're on; one that does
 is checked out as it is. `crystal worktree rm` (or `W` in the TUI) takes the worktree's directory or its
 branch, refuses while a session is still running in it, and leaves the rest to `git worktree remove`, which
-keeps a worktree with changes you haven't committed. Sessions that had ended in it leave the list with it:
-their directory is gone, so they could never start again.
+keeps a worktree with changes you haven't committed. `crystal worktree rm --force` removes it anyway, and
+those changes with it; `W` asks a second time, naming them, and a second `y` does the same. Sessions that had
+ended in it leave the list with it: their directory is gone, so they could never start again.
 
 `crystal rename` changes what a session is called; its program and its saved place after a restart follow the
 new name. `crystal respawn`, or `Enter` on an ended session in the TUI, runs its command again in the same

@@ -753,8 +753,19 @@ impl Tui {
                 self.app.select(&name);
                 self.app.type_into_selected();
             }
-            Action::RemoveWorktree(path) => {
-                if let Err(err) = client::remove_worktree(&self.socket, &path) {
+            Action::RemoveWorktree {
+                path,
+                branch,
+                force,
+            } => {
+                // git won't remove a worktree with changes not committed
+                // unless it's forced, so the user is asked again, this time
+                // about losing them.
+                if !force && git::has_changes(&path).unwrap_or(false) {
+                    self.app.ask_to_force_removal(path, branch);
+                    return Ok(());
+                }
+                if let Err(err) = client::remove_worktree(&self.socket, &path, force) {
                     bail!("{}", removal_refused(&path, &err));
                 }
                 self.app.worktree_removed(&path);
