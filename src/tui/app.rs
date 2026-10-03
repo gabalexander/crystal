@@ -10,12 +10,14 @@ use super::groups::{self, Row};
 use super::issues::IssuesView;
 use super::launcher::{self, Launcher, Memory, Run, Setup, Target};
 use super::memory_view::MemoryView;
+use super::profiles::{self, ProfilesView};
 use super::search;
 use super::text_input::TextInput;
 use crate::catalog::{self, Agent};
-use crate::config::{Config, Preset};
+use crate::config::Config;
 use crate::github::{self, PullRequest};
 use crate::keys;
+use crate::profile::{self, Profile};
 use crate::protocol::{Activity, SessionInfo, State};
 use crate::shell;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
@@ -247,6 +249,14 @@ pub enum Action {
         dir: PathBuf,
         id: u64,
     },
+    /// Write `profile` to the config file, in place of the profile called
+    /// `replacing`, or as a new one.
+    SaveProfile {
+        replacing: Option<String>,
+        profile: Profile,
+    },
+    /// Take the profile with this name out of the config file.
+    DeleteProfile(String),
 }
 
 /// The sidebar narrowed to the sessions that match what's typed, while `/`
@@ -271,8 +281,16 @@ pub struct App {
     launcher: Option<Launcher>,
     /// The agents installed on this machine, which the panel offers.
     agents: Vec<&'static Agent>,
-    /// The presets the panel offers first, from the config file.
-    presets: Vec<Preset>,
+    /// The profiles in the config file, which the panel offers first and
+    /// the profiles view changes.
+    profiles: Vec<Profile>,
+    /// Whether profiles are offered at all: see [`profile::enabled`].
+    profiles_on: bool,
+    /// The profiles view, while it's open.
+    profiles_view: Option<ProfilesView>,
+    /// The config's `new_session` when it has arguments, like `codex
+    /// --full-auto`: offered as a profile of its own, ahead of the others.
+    new_session_profile: Option<Profile>,
     /// What the panel picks at first, until something has been started
     /// from it: the config's `new_session`, by [`Run::key`].
     first_run: Option<String>,
@@ -324,7 +342,10 @@ impl App {
             prompt: None,
             launcher: None,
             agents: Vec::new(),
-            presets: Vec::new(),
+            profiles: Vec::new(),
+            profiles_on: profile::enabled(&Config::default()),
+            profiles_view: None,
+            new_session_profile: None,
             first_run: None,
             memory: Memory::default(),
             codex_models: None,
@@ -354,11 +375,14 @@ impl App {
     }
 
     /// Takes what the config file says about starting sessions: its
-    /// presets, and `new_session`, what the panel picks at first. A
+    /// profiles, and `new_session`, what the panel picks at first. A
     /// `new_session` with arguments, like `codex --full-auto`, is offered
-    /// as a preset of its own.
+    /// as a profile of its own.
     pub fn set_launch_settings(&mut self, config: &Config) {
-        self.presets = config.presets.clone();
+        self.profiles_on = profile::enabled(config);
+        self.profiles = config.profiles.clone();
+        self.new_session_profile = None;
+        self.first_run = None;
         let words = command_line::parse(&config.new_session).unwrap_or_default();
         let Some((program, args)) = words.split_first() else {
             return;
@@ -366,16 +390,36 @@ impl App {
         if args.is_empty() {
             self.first_run = Some(program.clone());
         } else if catalog::find(program).is_some() {
-            let preset = Preset {
+            let profile = Profile {
                 name: config.new_session.clone(),
-                agent: program.clone(),
-                model: None,
-                mode: None,
                 args: args.to_vec(),
-                prompt: None,
+                ..Profile::for_agent(program)
             };
-            self.first_run = Some(Run::Preset(preset.clone()).key());
-            self.presets.insert(0, preset);
+            self.first_run = Some(Run::Profile(profile.clone()).key());
+            self.new_session_profile = Some(profile);
+        }
+    }
+
+    /// The profiles view, while it's open.
+    pub fn profiles_view(&self) -> Option<&ProfilesView> {
+        self.profiles_view.as_ref()
+    }
+
+    /// The config file as it is after a profile was saved or taken out:
+    /// the panel offers what it now says, and the open view shows it, its
+    /// bar on the profile called `select`.
+    pub fn profiles_saved(&mut self, config: &Config, select: Option<&str>) {
+        self.set_launch_settings(config);
+        if let Some(view) = &mut self.profiles_view {
+            view.saved(self.profiles.clone(), select);
+        }
+    }
+
+    /// Why a profile couldn't be saved or taken out, for the open view to
+    /// say.
+    pub fn profile_failed(&mut self, problem: String) {
+        if let Some(view) = &mut self.profiles_view {
+            view.failed(problem);
         }
     }
 
@@ -397,6 +441,9 @@ impl App {
     pub fn set_codex_models(&mut self, models: Vec<String>) {
         if let Some(launcher) = &mut self.launcher {
             launcher.set_codex_models(models.clone());
+        }
+        if let Some(view) = &mut self.profiles_view {
+            view.set_codex_models(models.clone());
         }
         self.codex_models = Some(models);
     }
@@ -749,6 +796,9 @@ impl App {
         if self.launcher.is_some() {
             return self.on_launcher_key(key);
         }
+        if self.profiles_view.is_some() {
+            return self.on_profiles_key(key);
+        }
         if self.prompt.is_some() {
             return self.on_prompt_key(key);
         }
@@ -786,7 +836,10 @@ impl App {
         }
         // A question on the footer waits for its answer from the keyboard,
         // and so do the filter, the issues view and the new-session panel.
-        let typing = self.filter.is_some() || self.issues.is_some() || self.launcher.is_some();
+        let typing = self.filter.is_some()
+            || self.issues.is_some()
+            || self.launcher.is_some()
+            || self.profiles_view.is_some();
         if self.prompt.is_some() || self.confirm.is_some() || typing {
             return None;
         }
@@ -855,6 +908,7 @@ impl App {
             KeyCode::Char('d') => return self.open_diff(),
             KeyCode::Char('p') => return self.open_finder(),
             KeyCode::Char('m') => return self.open_memory(),
+            KeyCode::Char('P') => return self.open_profiles(),
             KeyCode::Char('?') => self.showing_keys = true,
             KeyCode::Char('/') => self.open_filter(),
             KeyCode::Char('o') => return self.open_pull_request(),
@@ -1198,16 +1252,22 @@ impl App {
     /// What the panel opens with: what can run, with what to pick first,
     /// where it can start, and the tasks given before.
     fn launch_setup(&self, worktree: bool) -> Setup {
+        let offered: &[Profile] = if self.profiles_on {
+            &self.profiles
+        } else {
+            &[]
+        };
         let mut runs: Vec<Run> = self
-            .presets
+            .new_session_profile
             .iter()
-            .filter(|preset| {
+            .chain(offered)
+            .filter(|profile| {
                 self.agents
                     .iter()
-                    .any(|agent| agent.program == preset.agent)
+                    .any(|agent| agent.program == profile.agent)
             })
             .cloned()
-            .map(Run::Preset)
+            .map(Run::Profile)
             .collect();
         runs.extend(self.agents.iter().map(|agent| Run::Agent(agent)));
         runs.push(Run::Shell);
@@ -1272,6 +1332,32 @@ impl App {
         targets
     }
 
+    /// Opens the profiles view, unless profiles are switched off.
+    fn open_profiles(&mut self) -> Option<Action> {
+        if !self.profiles_on {
+            self.notify(profile::DISABLED.to_string());
+            return None;
+        }
+        let models = self.codex_models.clone().unwrap_or_default();
+        self.profiles_view = Some(ProfilesView::new(self.profiles.clone(), models));
+        self.codex_models_wanted()
+    }
+
+    /// Keys while the profiles view is open: all of them are its.
+    fn on_profiles_key(&mut self, key: KeyEvent) -> Option<Action> {
+        match self.profiles_view.as_mut()?.on_key(key) {
+            profiles::Outcome::Stay => None,
+            profiles::Outcome::Close => {
+                self.profiles_view = None;
+                None
+            }
+            profiles::Outcome::Save { replacing, profile } => {
+                Some(Action::SaveProfile { replacing, profile })
+            }
+            profiles::Outcome::Delete(name) => Some(Action::DeleteProfile(name)),
+        }
+    }
+
     /// Asks Codex for its models the first time the panel could show them.
     fn codex_models_wanted(&mut self) -> Option<Action> {
         let has_codex = self.agents.iter().any(|agent| agent.program == "codex");
@@ -1326,6 +1412,8 @@ impl App {
         }
         if let Some(launcher) = &mut self.launcher {
             launcher.on_paste(&text);
+        } else if let Some(view) = &mut self.profiles_view {
+            view.on_paste(&text);
         } else if let Some(prompt) = &mut self.prompt {
             prompt.input.insert_str(&text);
         } else if let Some(issues) = &mut self.issues {
@@ -1902,14 +1990,14 @@ mod tests {
     }
 
     #[test]
-    fn a_new_session_setting_with_arguments_is_offered_as_a_preset() {
+    fn a_new_session_setting_with_arguments_is_offered_as_a_profile() {
         let mut app = with_agents(&["codex"], vec![]);
         app.set_launch_settings(&Config {
             new_session: "codex --full-auto".into(),
             ..Config::default()
         });
         press(&mut app, KeyCode::Char('n'));
-        assert_eq!(run_key(&app), "preset:codex --full-auto");
+        assert_eq!(run_key(&app), "profile:codex --full-auto");
         type_text(&mut app, "go");
         assert_eq!(
             press(&mut app, KeyCode::Enter),
@@ -1918,23 +2006,91 @@ mod tests {
     }
 
     #[test]
-    fn presets_for_agents_not_installed_are_left_out() {
+    fn profiles_for_agents_not_installed_are_left_out() {
         let mut app = with_agents(&["claude"], vec![]);
-        let preset = |name: &str, agent: &str| Preset {
+        let profile = |name: &str, agent: &str| Profile {
             name: name.into(),
-            agent: agent.into(),
-            model: None,
-            mode: None,
-            args: Vec::new(),
-            prompt: None,
+            ..Profile::for_agent(agent)
         };
         app.set_launch_settings(&Config {
-            presets: vec![preset("review", "claude"), preset("fast", "codex")],
+            profiles: vec![profile("review", "claude"), profile("fast", "codex")],
             ..Config::default()
         });
         press(&mut app, KeyCode::Char('n'));
         let rows = app.launcher().unwrap().choice_rows();
         assert_eq!(rows[0].2, ["review", "Claude Code", "shell"]);
+    }
+
+    #[test]
+    fn a_profile_changed_in_the_profiles_view_is_saved_then_offered() {
+        let mut app = with_agents(&["claude"], vec![]);
+        let review = Profile {
+            name: "review".into(),
+            ..Profile::for_agent("claude")
+        };
+        app.set_launch_settings(&Config {
+            profiles: vec![review.clone()],
+            ..Config::default()
+        });
+        press(&mut app, KeyCode::Char('P'));
+        press(&mut app, KeyCode::Enter);
+        type_text(&mut app, "er");
+        let reviewer = Profile {
+            name: "reviewer".into(),
+            ..review
+        };
+        assert_eq!(
+            press(&mut app, KeyCode::Enter),
+            Some(Action::SaveProfile {
+                replacing: Some("review".into()),
+                profile: reviewer.clone()
+            })
+        );
+        // The event loop wrote it, and read the file again.
+        app.profiles_saved(
+            &Config {
+                profiles: vec![reviewer],
+                ..Config::default()
+            },
+            Some("reviewer"),
+        );
+        let view = app.profiles_view().unwrap();
+        assert!(view.form().is_none());
+        assert_eq!(view.profiles()[0].name, "reviewer");
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('n'));
+        let rows = app.launcher().unwrap().choice_rows();
+        assert_eq!(rows[0].2, ["reviewer", "Claude Code", "shell"]);
+    }
+
+    #[test]
+    fn a_profile_that_couldnt_be_saved_says_why_in_the_view() {
+        let mut app = with_agents(&["claude"], vec![]);
+        press(&mut app, KeyCode::Char('P'));
+        app.profile_failed("two profiles are called review".into());
+        assert_eq!(
+            app.profiles_view().unwrap().problem(),
+            Some("two profiles are called review")
+        );
+    }
+
+    #[test]
+    fn with_profiles_switched_off_they_arent_offered() {
+        let mut app = with_agents(&["claude"], vec![]);
+        app.set_launch_settings(&Config {
+            profiles: vec![Profile {
+                name: "review".into(),
+                ..Profile::for_agent("claude")
+            }],
+            ..Config::default()
+        });
+        app.profiles_on = false;
+        press(&mut app, KeyCode::Char('P'));
+        assert!(app.profiles_view().is_none());
+        assert_eq!(app.notice(), Some(profile::DISABLED));
+        press(&mut app, KeyCode::Char('n'));
+        let rows = app.launcher().unwrap().choice_rows();
+        assert_eq!(rows[0].2, ["Claude Code", "shell"]);
     }
 
     #[test]

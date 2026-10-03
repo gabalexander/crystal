@@ -15,6 +15,7 @@ pub struct Agent {
     /// What people call it: `Claude Code`.
     pub name: &'static str,
     pub first_prompt: FirstPrompt,
+    pub instructions: Instructions,
     /// The choices the panel offers for it, each a row of its own.
     pub settings: &'static [Setting],
 }
@@ -28,6 +29,50 @@ pub enum FirstPrompt {
     Option(&'static str),
     /// It can't be: the task is typed once the agent is open.
     None,
+}
+
+impl FirstPrompt {
+    /// Puts `task` on `command`, the way the agent takes a first prompt.
+    pub fn add(self, command: &mut Vec<String>, task: &str) {
+        if task.is_empty() {
+            return;
+        }
+        match self {
+            FirstPrompt::Argument => command.push(task.to_string()),
+            FirstPrompt::Option(option) => {
+                command.push(option.to_string());
+                command.push(task.to_string());
+            }
+            FirstPrompt::None => {}
+        }
+    }
+}
+
+/// How an agent is given standing instructions for a whole session, on top
+/// of its own: what a profile's `instructions` become on its command line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Instructions {
+    /// After this option: `claude --append-system-prompt "…"`.
+    Option(&'static str),
+    /// As this setting, given for the one run with `-c`, its value written
+    /// as TOML: `codex -c developer_instructions="…"`.
+    Setting(&'static str),
+    /// It has no way to be given them.
+    None,
+}
+
+impl Instructions {
+    /// The arguments that give the agent `text` as its instructions.
+    pub fn args(self, text: &str) -> Vec<String> {
+        match self {
+            Instructions::Option(option) => vec![option.to_string(), text.to_string()],
+            Instructions::Setting(key) => {
+                let quoted = toml_edit::Value::from(text).to_string();
+                vec!["-c".to_string(), format!("{key}={quoted}")]
+            }
+            Instructions::None => Vec::new(),
+        }
+    }
 }
 
 /// A row of choices the panel offers for an agent: a label, the option
@@ -54,6 +99,7 @@ pub const AGENTS: &[Agent] = &[
         program: "claude",
         name: "Claude Code",
         first_prompt: FirstPrompt::Argument,
+        instructions: Instructions::Option("--append-system-prompt"),
         settings: &[
             Setting {
                 label: "model",
@@ -81,6 +127,8 @@ pub const AGENTS: &[Agent] = &[
         program: "codex",
         name: "Codex",
         first_prompt: FirstPrompt::Argument,
+        // Codex adds these to the session as a developer message.
+        instructions: Instructions::Setting("developer_instructions"),
         settings: &[
             Setting {
                 label: "model",
@@ -104,6 +152,7 @@ pub const AGENTS: &[Agent] = &[
         // Its bare argument has meant both interactive and one-shot over
         // its versions; `-i` has always meant "run this, then stay".
         first_prompt: FirstPrompt::Option("-i"),
+        instructions: Instructions::None,
         settings: &[],
     },
     Agent {
@@ -111,12 +160,14 @@ pub const AGENTS: &[Agent] = &[
         name: "OpenCode",
         // Its bare argument is the project's directory.
         first_prompt: FirstPrompt::Option("--prompt"),
+        instructions: Instructions::None,
         settings: &[],
     },
     Agent {
         program: "cursor-agent",
         name: "Cursor",
         first_prompt: FirstPrompt::Argument,
+        instructions: Instructions::None,
         settings: &[],
     },
     Agent {
@@ -124,6 +175,7 @@ pub const AGENTS: &[Agent] = &[
         name: "Aider",
         // `--message` runs one message and exits, which isn't a session.
         first_prompt: FirstPrompt::None,
+        instructions: Instructions::None,
         settings: &[],
     },
 ];
@@ -229,6 +281,23 @@ mod tests {
         let path = format!("/nowhere:{}", dir.path().display());
         let found: Vec<&str> = installed_in(&path).iter().map(|a| a.program).collect();
         assert_eq!(found, ["codex"]);
+    }
+
+    #[test]
+    fn each_agent_is_given_instructions_its_own_way() {
+        let claude = find("claude").unwrap().instructions;
+        assert_eq!(
+            claude.args("Be brief."),
+            ["--append-system-prompt", "Be brief."]
+        );
+        // Codex reads the value as TOML: it must come back as the text.
+        let codex = find("codex").unwrap().instructions;
+        let text = "Say \"done\" at the end,\nthen stop.";
+        let args = codex.args(text);
+        assert_eq!(args[0], "-c");
+        let setting: toml::Table = toml::from_str(&args[1]).unwrap();
+        assert_eq!(setting["developer_instructions"].as_str(), Some(text));
+        assert!(find("aider").unwrap().instructions.args("x").is_empty());
     }
 
     #[test]

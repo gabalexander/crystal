@@ -19,6 +19,7 @@ mod launcher;
 mod memory_view;
 mod mouse;
 mod pane;
+mod profiles;
 mod screen_widget;
 mod search;
 pub(crate) mod sidebar;
@@ -28,9 +29,10 @@ mod text_input;
 mod theme;
 mod ui;
 
-use crate::config::Config;
+use crate::config::{self, Config};
 use crate::github::{self, Issue, PullRequest};
 use crate::memory::{self, Listed, Memory};
+use crate::profile;
 use crate::protocol::{Request, Response, SessionInfo};
 use crate::{catalog, keys, typing};
 use crate::{client, env, git};
@@ -470,6 +472,14 @@ impl Tui {
                 command.push(path);
                 self.start_session(Some(name), dir, command)?;
             }
+            Action::SaveProfile { replacing, profile } => {
+                let saved = profile::save(&config::path(), replacing.as_deref(), &profile);
+                self.profiles_changed(saved, Some(&profile.name));
+            }
+            Action::DeleteProfile(name) => {
+                let deleted = profile::delete(&config::path(), &name);
+                self.profiles_changed(deleted, None);
+            }
             Action::Kill(name) => {
                 client::ask(&self.socket, &Request::Kill { name }, false)?;
                 self.refresh_sessions()?;
@@ -553,6 +563,16 @@ impl Tui {
         self.app.select(&name);
         self.app.type_into_selected();
         Ok(())
+    }
+
+    /// After a profile was written to the config file or taken out of it:
+    /// reads the file again, so the panel and the profiles view show what
+    /// it now says, or has the view say why the file wasn't changed.
+    fn profiles_changed(&mut self, changed: Result<()>, select: Option<&str>) {
+        match changed.and_then(|()| Config::load()) {
+            Ok(config) => self.app.profiles_saved(&config, select),
+            Err(error) => self.app.profile_failed(format!("{error:#}")),
+        }
     }
 
     /// Runs `read` on a thread of its own, since git and the disk can keep

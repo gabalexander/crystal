@@ -835,14 +835,15 @@ fn ctrl_e_turns_the_panel_into_the_command_line_it_would_run() {
 }
 
 #[test]
-fn a_preset_from_the_config_starts_with_its_options_and_prompt() {
+fn a_profile_from_the_config_starts_with_its_options_and_prompt() {
     let crystal = Crystal::new();
     crystal.configure(
         r#"notify = false
 memory = false
 
-[[preset]]
+[[profile]]
 name = "review"
+description = "A second pair of eyes"
 agent = "claude"
 model = "opus"
 mode = "plan"
@@ -856,8 +857,9 @@ prompt = "Review the change."
 
     tui.type_keys("n");
     tui.shows("review");
-    // Presets come first: Tab to what runs, then left from Claude Code.
+    // Profiles come first: Tab to what runs, then left from Claude Code.
     tui.type_keys("the refund fix\t\x1b[D");
+    tui.shows("A second pair of eyes");
     tui.shows("runs  claude --model opus");
     tui.type_keys("\r");
     tui.shows("▸ claude");
@@ -876,6 +878,157 @@ prompt = "Review the change."
             "",
             "the refund fix"
         ]
+    );
+}
+
+#[test]
+fn a_profile_s_instructions_are_added_to_claude_s_system_prompt() {
+    let crystal = Crystal::new();
+    crystal.configure(
+        r#"notify = false
+
+[[profile]]
+name = "careful"
+agent = "claude"
+instructions = "Point out risks before anything else."
+"#,
+    );
+    let bin = fake_claude(crystal.dir.path());
+    let path = path_of(&[&bin]);
+    let mut tui = crystal.attach_with_env(&[], &[("PATH", &path)]);
+
+    tui.type_keys("n");
+    tui.shows("careful");
+    tui.type_keys("tidy up\t\x1b[D");
+    tui.shows("runs  claude --append-system-prompt");
+    tui.type_keys("\r");
+    tui.shows("▸ claude");
+
+    // One argument a line: the instructions start the one after the option.
+    let args = written(&crystal.dir.path().join("args"));
+    let lines: Vec<&str> = args.lines().collect();
+    let option = lines
+        .iter()
+        .position(|line| *line == "--append-system-prompt")
+        .expect("claude was given a system prompt to add");
+    assert_eq!(lines[option + 1], "Point out risks before anything else.");
+    assert_eq!(lines.last(), Some(&"tidy up"));
+}
+
+#[test]
+fn profiles_made_and_changed_in_the_tui_keep_the_config_s_comments() {
+    let crystal = Crystal::new();
+    crystal.configure(
+        r#"# my own settings
+notify = false
+
+# the one for pull requests
+[[profile]]
+name = "review"
+agent = "claude"
+"#,
+    );
+    let bin = fake_claude(crystal.dir.path());
+    let path = path_of(&[&bin]);
+    let mut tui = crystal.attach_with_env(&[], &[("PATH", &path)]);
+    let file = crystal.config_file();
+    let saved = |text: &str| {
+        eventually(&format!("the config file has {text}"), || {
+            std::fs::read_to_string(&file).is_ok_and(|toml| toml.contains(text))
+        });
+    };
+
+    tui.type_keys("P");
+    tui.shows("Profiles");
+    tui.shows("review");
+    // A new one: a, its name, Enter.
+    tui.type_keys("a");
+    tui.shows("New profile");
+    tui.type_keys("quick\r");
+    saved("name = \"quick\"");
+    tui.shows("quick");
+    // Up to review, change it: Tab to the description, then Enter.
+    tui.type_keys("k\r");
+    tui.shows("Profile · review");
+    tui.type_keys("\tLooks it over\r");
+    saved("description = \"Looks it over\"");
+    tui.shows("Looks it over");
+
+    let toml = std::fs::read_to_string(&file).unwrap();
+    assert!(toml.starts_with("# my own settings\n"), "{toml}");
+    assert!(
+        toml.contains("# the one for pull requests\n[[profile]]\nname = \"review\""),
+        "{toml}"
+    );
+}
+
+#[test]
+fn profile_lists_the_profiles_and_shows_what_one_runs() {
+    let crystal = Crystal::new();
+    crystal.configure(
+        r#"notify = false
+
+[[profile]]
+name = "review"
+description = "A second pair of eyes"
+agent = "claude"
+model = "opus"
+instructions = "Be brief."
+where = "worktree"
+
+[[profile]]
+name = "quick"
+agent = "codex"
+mode = "never"
+instructions = "Keep changes small."
+"#,
+    );
+    let listed = crystal.ok(&["profile"]);
+    let rows: Vec<Vec<&str>> = listed
+        .lines()
+        .map(|line| {
+            line.split("  ")
+                .filter(|cell| !cell.is_empty())
+                .map(str::trim)
+                .collect()
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            vec!["NAME", "AGENT", "WHERE", "DESCRIPTION"],
+            vec!["review", "claude", "worktree", "A second pair of eyes"],
+            vec!["quick", "codex", "-"],
+        ]
+    );
+    // The README's example, word for word.
+    assert_eq!(
+        crystal.ok(&["profile", "show", "quick"]),
+        "quick\n\
+         agent   Codex\n\
+         starts  wherever the new-session panel is set\n\
+         runs    codex -a never -c 'developer_instructions=\"Keep changes small.\"' '<task>'\n"
+    );
+
+    let shown = crystal.ok(&["profile", "show", "review"]);
+    assert!(shown.contains("agent   Claude Code\n"), "{shown}");
+    assert!(shown.contains("starts  in a new worktree\n"), "{shown}");
+    assert!(
+        shown.contains("runs    claude --model opus --append-system-prompt 'Be brief.' '<task>'\n"),
+        "{shown}"
+    );
+    let error = crystal.fails(&["profile", "show", "nope"]);
+    assert!(error.contains("there's no profile called nope"), "{error}");
+}
+
+#[test]
+fn a_leftover_preset_table_says_it_s_now_a_profile() {
+    let crystal = Crystal::new();
+    crystal.configure("[[preset]]\nname = \"review\"\nagent = \"claude\"\n");
+    let error = crystal.fails(&["profile"]);
+    assert!(
+        error.contains("`[[preset]]` tables are now `[[profile]]`"),
+        "{error}"
     );
 }
 

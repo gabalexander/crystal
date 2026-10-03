@@ -58,6 +58,8 @@ is: it's the one request every version must understand.
   - `launcher.rs`: the new-session panel (`n`, `w`): its state and keys, kept apart from I/O, the command
     it builds, what it remembers between runs, and its drawing
   - `command_line.rs`: reads the line typed at `new session:` (the panel's `Ctrl+E`) into the command to run
+  - `profiles.rs`: the profiles view (`P`): the list, the form that edits one, its keys and drawing; the
+    event loop does the writing
   - `search.rs`: `/`'s matching: a session's name, project, branch or command, letters in order
   - `issues.rs`: the issues view `i` opens: its state, kept apart from I/O, and its drawing
   - `pane.rs`: a viewer of a session on screen, the selected one or a split, and its screen
@@ -88,11 +90,13 @@ is: it's the one request every version must understand.
 - `src/protocol.rs`: requests and responses, one JSON line each, and the frames an attached client sends
 - `src/socket.rs`: where the socket lives
 - `src/state.rs`: the running sessions, written down to start them again after a restart
-- `src/config.rs`: the settings in `~/.config/crystal/config.toml`, presets included
+- `src/config.rs`: the settings in `~/.config/crystal/config.toml`, read and checked
 - `src/memory.rs`: what a project's sessions learned: the store in the state directory, staleness, search,
   the paragraph Claude Code is shown at launch, promoting into CLAUDE.md, and `enabled`, the one gate
   everything memory adds goes through
 - `src/memory_cli.rs`: `crystal remember` and `crystal memory`
+- `src/profile.rs`: agent profiles: what one runs, checking it, and saving or removing one in the config file
+  with `toml_edit`, so the user's comments and layout stay; `enabled` is the one switch for the feature
 - `src/notify.rs`: telling the user when a session needs them: desktop notifications, or their own command
 - `src/env.rs`: the environment a session's program starts with
 - `src/git.rs`: a directory's project, worktree and branch, and making and removing worktrees (runs `git`)

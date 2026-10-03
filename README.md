@@ -98,6 +98,7 @@ you are and offers the keys that matter there.
 | `d` | show what changed in the selected session's worktree: [the diff](#the-diff) |
 | `p` | find a file in the selected session's worktree and edit it: [the file finder](#the-file-finder) |
 | `m` | what the selected session's project has remembered: [memory](#memory) |
+| `P` | list your [profiles](#profiles), and add, change, copy or remove one |
 | `?` | show every key, in the sidebar, in a pane, in a question and with the mouse |
 | `q` | quit; the sessions keep running |
 
@@ -200,6 +201,8 @@ crystal kill review                         # stop one session
 crystal kill-server                         # stop every session, and the daemon
 crystal restart-server                      # restart the daemon, say after an upgrade; sessions come back
 crystal config                              # where the config file is, and the settings in effect
+crystal profile                             # list your agent profiles
+crystal profile show review                 # what a profile runs, and where it starts
 crystal skill --install                     # teach Claude Code to drive crystal (see below)
 crystal ssh box                             # crystal's TUI on another machine (see below)
 ```
@@ -245,8 +248,9 @@ prompt. `↑` on the first line and `↓` on the last bring back earlier tasks: 
 
 Under the task, `Tab` and `Shift+Tab` go from row to row and `←` / `→` change a row's choice:
 
-- **run**: your [presets](#presets), then the agents installed on your `PATH` (Claude Code, Codex, Gemini CLI,
-  OpenCode, Cursor, Aider), then your shell. What you started last is chosen the next time.
+- **run**: your [profiles](#profiles), then the agents installed on your `PATH` (Claude Code, Codex, Gemini
+  CLI, OpenCode, Cursor, Aider), then your shell. What you started last is chosen the next time. A profile's
+  description shows under the row, and choosing it sets the rows below from it; you can still change them.
 - Claude Code's **model** and **permissions** (`--model`, `--permission-mode`), or Codex's **model** and
   **approvals** (`-m`, `-a`), its models the ones `codex debug models` lists. Left at `default`, no option is
   added.
@@ -480,29 +484,58 @@ notify_command = 'curl -s -d "$CRYSTAL_NOTICE" ntfy.sh/my-crystal'
 ```
 
 `new_session` names an agent (`claude`, `codex`, …) or `shell`. With options, like `codex --full-auto`, it's
-offered as a preset of its own.
+offered as a profile of its own.
 
 The daemon reads the notification settings each time it tells you something, and `memory` each time a session
-starts, so a change counts straight away; the TUI reads `new_session`, `theme`, `memory` and the presets when
-it starts.
+starts, so a change counts straight away; the TUI reads `new_session`, `theme`, `memory` and the profiles when
+it starts, and again when you save a profile.
 
-#### Presets
+#### Profiles
 
-A preset is a way of starting an agent you use often, offered first in the new-session panel:
+A profile is a way of starting an agent you use often: which agent, how, with what standing instructions, and
+where. The new-session panel offers your profiles first.
 
 ```toml
-[[preset]]
+[[profile]]
 name = "review"                            # how the panel shows it
+description = "Reads the branch's diff"    # optional: shown under it in the panel
 agent = "claude"                           # claude, codex, gemini, opencode, cursor-agent or aider
 model = "opus"                             # optional: Claude Code's or Codex's model
 mode = "plan"                              # optional: Claude Code's permission mode, or Codex's approvals
 args = ["--verbose"]                       # optional: more options, after those
 prompt = "Review the diff on this branch." # optional: put before the task, a blank line between
+instructions = """
+You are reviewing, not writing. Point out risks before style,
+and say which lines each comment is about.
+"""                                        # optional: kept for the whole session, see below
+where = "worktree"                         # optional: "here" or "worktree"; else as the panel is set
 ```
 
+`instructions` stay with the agent for the whole session, on top of its own: Claude Code gets them with
+`--append-system-prompt`, and Codex as its `developer_instructions` setting (`-c`). The other agents can't be
+given any, so a profile for them that has some is an error. `prompt`, unlike `instructions`, is only the start
+of the first message.
+
 `mode` is one of `acceptEdits`, `plan` or `bypassPermissions` for Claude Code, and `on-request` or `never` for
-Codex. A preset is shown only when its agent is installed. One that can't start, for an agent crystal doesn't
-know, with a mode that agent doesn't have, or with the name of another, is an error that says why.
+Codex. A profile is offered only when its agent is installed. One that can't start, for an agent crystal
+doesn't know, with a mode that agent doesn't have, or with the name of another, is an error that says why.
+
+`P` in the TUI lists your profiles: `Enter` changes the one the bar is on, `a` adds one, `c` copies one, and `x`
+removes one once you've said `y`. Each setting is a row of the form; `Tab` goes from row to row, `←` / `→`
+change a choice, and the form ends with the command the profile runs. `Enter` saves it to the config file,
+changing only that profile's lines, so your comments and layout stay as they were. A change that would make
+the file one crystal can't read isn't written, and the form says why.
+
+`crystal profile` lists them, and `crystal profile show <name>` prints the command one runs, quoted the way a
+shell reads it, with `<task>` where the task goes:
+
+```
+$ crystal profile show quick
+quick
+agent   Codex
+starts  wherever the new-session panel is set
+runs    codex -a never -c 'developer_instructions="Keep changes small."' '<task>'
+```
 
 ## How it works
 

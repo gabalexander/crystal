@@ -12,6 +12,7 @@ use super::issues;
 use super::launcher;
 use super::memory_view;
 use super::pane::Pane;
+use super::profiles;
 use super::screen_widget::ScreenWidget;
 use super::sidebar::{self, fit};
 use super::status::Status;
@@ -256,6 +257,11 @@ pub fn draw(frame: &mut Frame, app: &App, panes: &[Pane], look: &Look) {
         );
         launcher::draw(frame, panel, look.theme, over);
     }
+    if let Some(view) = app.profiles_view() {
+        let below_top = areas.top.bottom();
+        let middle = Rect::new(0, below_top, frame.area().width, areas.footer.y - below_top);
+        profiles::draw(frame, view, look.theme, middle);
+    }
     draw_footer(frame, app, look, areas.footer);
     if app.showing_keys() {
         help::draw(frame, look.theme, frame.area());
@@ -493,6 +499,8 @@ fn draw_footer(frame: &mut Frame, app: &App, look: &Look, area: Rect) {
     let theme = look.theme;
     if app.launcher().is_some() {
         frame.render_widget(hint_spans(LAUNCHER_HINTS, theme), area);
+    } else if let Some(view) = app.profiles_view() {
+        frame.render_widget(hint_spans(profiles::hints(view), theme), area);
     } else if let Some(prompt) = app.prompt() {
         draw_prompt(frame, theme, prompt, area);
     } else if app.issues_view().is_some() {

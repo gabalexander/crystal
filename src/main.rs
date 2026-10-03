@@ -16,6 +16,7 @@ mod keys;
 mod memory;
 mod memory_cli;
 mod notify;
+mod profile;
 mod protocol;
 mod remote;
 mod session;
@@ -31,6 +32,7 @@ mod viewer;
 
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
+use profile::{Profile, StartIn};
 use protocol::{Request, Response, SessionInfo, State, TaskSpec};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -245,6 +247,11 @@ enum Command {
         #[command(subcommand)]
         command: Option<MemoryCommand>,
     },
+    /// List the agent profiles in the config file.
+    Profile {
+        #[command(subcommand)]
+        command: Option<ProfileCommand>,
+    },
     /// Print the Claude Code skill that teaches an agent to drive crystal.
     Skill {
         /// Install it into Claude Code's skills, in $CLAUDE_CONFIG_DIR or
@@ -308,6 +315,13 @@ enum WorktreeCommand {
         /// The worktree's directory, or the branch it has checked out.
         worktree: String,
     },
+}
+
+#[derive(Subcommand)]
+enum ProfileCommand {
+    /// Show a profile: its agent, where it starts, and the command it runs
+    /// for a task.
+    Show { name: String },
 }
 
 fn main() -> ExitCode {
@@ -438,6 +452,16 @@ fn run(cli: Cli) -> Result<()> {
                 memory_cli::promote(&socket, dir, id, yes)?;
             }
         },
+        Command::Profile { command } => {
+            let settings = config::Config::load()?;
+            if !profile::enabled(&settings) {
+                bail!(profile::DISABLED);
+            }
+            match command {
+                None => print_profiles(&settings.profiles),
+                Some(ProfileCommand::Show { name }) => print_profile(&settings.profiles, &name)?,
+            }
+        }
         Command::Skill { install, force } => {
             if install {
                 skill::install(force)?;
@@ -471,6 +495,62 @@ fn print_config() -> Result<()> {
         println!("# {} (no file yet: these are the defaults)", path.display());
     }
     print!("{}", settings.to_toml());
+    Ok(())
+}
+
+/// A table of the profiles: one a row, its description last, since it's
+/// the one with spaces.
+fn print_profiles(profiles: &[Profile]) {
+    if profiles.is_empty() {
+        println!(
+            "no profiles yet: add one with P in the TUI, or in {}",
+            shell::home_relative(&config::path())
+        );
+        return;
+    }
+    let rows: Vec<[String; 4]> = profiles
+        .iter()
+        .map(|profile| {
+            let place = match profile.start_in {
+                Some(StartIn::Here) => "here",
+                Some(StartIn::Worktree) => "worktree",
+                None => "-",
+            };
+            [
+                profile.name.clone(),
+                profile.agent.clone(),
+                place.to_string(),
+                profile.description.clone().unwrap_or_default(),
+            ]
+        })
+        .collect();
+    print_table(["NAME", "AGENT", "WHERE", "DESCRIPTION"], &rows);
+}
+
+/// What the profile called `name` is: its agent, where it starts, and the
+/// command it runs for a task, which is written `<task>`.
+fn print_profile(profiles: &[Profile], name: &str) -> Result<()> {
+    let Some(profile) = profiles.iter().find(|profile| profile.name == name) else {
+        bail!("there's no profile called {name}; `crystal profile` lists them");
+    };
+    let agent = catalog::find(&profile.agent).map_or(profile.agent.as_str(), |agent| agent.name);
+    let place = match profile.start_in {
+        Some(StartIn::Here) => "where the selected session runs",
+        Some(StartIn::Worktree) => "in a new worktree",
+        None => "wherever the new-session panel is set",
+    };
+    let command: Vec<String> = profile
+        .command("<task>")
+        .iter()
+        .map(|arg| shell::quote(arg))
+        .collect();
+    println!("{}", profile.name);
+    if let Some(description) = &profile.description {
+        println!("  {description}");
+    }
+    println!("agent   {agent}");
+    println!("starts  {place}");
+    println!("runs    {}", command.join(" "));
     Ok(())
 }
 
@@ -578,15 +658,20 @@ fn print_sessions(sessions: &[SessionInfo]) {
         "BRANCH",
         "DIRECTORY",
         "COMMAND",
-    ]
-    .map(String::from);
-    let mut widths = [0; 7];
-    for row in std::iter::once(&header).chain(&rows) {
+    ];
+    print_table(header, &rows);
+}
+
+/// Prints `rows` under `header`, each column as wide as its widest cell.
+fn print_table<const N: usize>(header: [&str; N], rows: &[[String; N]]) {
+    let header = header.map(String::from);
+    let mut widths = [0; N];
+    for row in std::iter::once(&header).chain(rows) {
         for (width, cell) in widths.iter_mut().zip(row) {
             *width = (*width).max(cell.chars().count());
         }
     }
-    for row in std::iter::once(&header).chain(&rows) {
+    for row in std::iter::once(&header).chain(rows) {
         let line: Vec<String> = row
             .iter()
             .zip(widths)

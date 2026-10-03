@@ -34,7 +34,7 @@ fn is_agent(program: &str) -> bool {
 /// Splits `line` into words the way a shell does: at spaces, except inside
 /// single or double quotes. Outside single quotes, a backslash takes the
 /// character after it as it is.
-fn split_words(line: &str) -> Result<Vec<String>, String> {
+pub fn split_words(line: &str) -> Result<Vec<String>, String> {
     let mut words = Vec::new();
     let mut word = String::new();
     // Whether a word has begun, which `""` does even though it adds nothing.

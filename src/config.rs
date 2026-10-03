@@ -4,7 +4,7 @@
 //! A key crystal doesn't know is an error, not something to skip: a
 //! setting spelled wrong would otherwise do nothing, without a word.
 
-use crate::catalog;
+use crate::profile::Profile;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -29,33 +29,10 @@ pub struct Config {
     /// Show Claude Code what the project's earlier sessions learned when a
     /// session starts: see [`crate::memory`].
     pub memory: bool,
-    /// Saved ways to start a session, offered first in the new-session
-    /// panel: `[[preset]]` tables in the file.
-    #[serde(rename = "preset", skip_serializing_if = "Vec::is_empty")]
-    pub presets: Vec<Preset>,
-}
-
-/// A saved way to start a session: an agent, set up a certain way.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Preset {
-    /// What the panel calls it.
-    pub name: String,
-    /// The agent's program, one crystal knows: `claude`, `codex`, ….
-    pub agent: String,
-    /// The model, for an agent that takes one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
-    /// How it asks before acting: Claude Code's `--permission-mode`, or
-    /// Codex's `-a`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mode: Option<String>,
-    /// More arguments for the agent, as they'd be written after it.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub args: Vec<String>,
-    /// Text put in front of the task: what this preset always asks for.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub prompt: Option<String>,
+    /// Saved ways to start an agent, offered first in the new-session
+    /// panel: `[[profile]]` tables in the file. See [`crate::profile`].
+    #[serde(rename = "profile", skip_serializing_if = "Vec::is_empty")]
+    pub profiles: Vec<Profile>,
 }
 
 /// The TUI's colors to choose from. `dark` and `light` paint their own
@@ -77,7 +54,7 @@ impl Default for Config {
             new_session: "claude".to_string(),
             theme: ThemeName::Dark,
             memory: true,
-            presets: Vec::new(),
+            profiles: Vec::new(),
         }
     }
 }
@@ -97,7 +74,7 @@ impl Config {
                 return Err(err).with_context(|| format!("couldn't read {}", path.display()));
             }
         };
-        parse(&text).with_context(|| format!("in {}", path.display()))
+        from_text(&text).with_context(|| format!("in {}", path.display()))
     }
 
     /// The settings written as TOML, the way the file would hold them.
@@ -120,56 +97,35 @@ pub fn path() -> PathBuf {
     base.join("crystal").join("config.toml")
 }
 
-fn parse(text: &str) -> Result<Config> {
-    let config: Config = toml::from_str(text)?;
-    for preset in &config.presets {
-        check_preset(preset)?;
+/// The settings `text`, a config file's contents, holds; or an error that
+/// says what doesn't make sense in it.
+pub fn from_text(text: &str) -> Result<Config> {
+    let table: toml::Table = toml::from_str(text)?;
+    // Profiles were called presets for a while; say so rather than only
+    // that `preset` is a key crystal doesn't know.
+    if table.contains_key("preset") {
+        bail!("`[[preset]]` tables are now `[[profile]]`: rename them in the file");
     }
-    let mut names: Vec<&str> = config.presets.iter().map(|p| p.name.as_str()).collect();
+    let config: Config = table.try_into()?;
+    for profile in &config.profiles {
+        profile.check()?;
+    }
+    let mut names: Vec<&str> = config.profiles.iter().map(|p| p.name.as_str()).collect();
     names.sort_unstable();
     if let Some(pair) = names.windows(2).find(|pair| pair[0] == pair[1]) {
-        bail!("two presets are called {}", pair[0]);
+        bail!("two profiles are called {}", pair[0]);
     }
     Ok(config)
-}
-
-/// A preset that can't be started as written is an error that says why:
-/// an agent crystal doesn't know, or a model or mode its agent doesn't take.
-fn check_preset(preset: &Preset) -> Result<()> {
-    let name = &preset.name;
-    if name.trim().is_empty() {
-        bail!("a preset has no name");
-    }
-    let Some(agent) = catalog::find(&preset.agent) else {
-        let known: Vec<&str> = catalog::AGENTS.iter().map(|a| a.program).collect();
-        bail!(
-            "preset {name}: crystal doesn't know the agent {}; it knows {}",
-            preset.agent,
-            known.join(", ")
-        );
-    };
-    if preset.model.is_some() && agent.model_setting().is_none() {
-        bail!("preset {name}: {} doesn't take a model", agent.name);
-    }
-    if let Some(mode) = &preset.mode {
-        let modes = agent.mode_values();
-        if modes.is_empty() {
-            bail!("preset {name}: {} doesn't take a mode", agent.name);
-        }
-        if !modes.contains(&mode.as_str()) {
-            bail!(
-                "preset {name}: {mode} isn't a mode of {}; it takes {}",
-                agent.name,
-                modes.join(", ")
-            );
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::profile::StartIn;
+
+    fn parse(text: &str) -> Result<Config> {
+        from_text(text)
+    }
 
     #[test]
     fn an_empty_file_is_all_defaults() {
@@ -211,39 +167,41 @@ mod tests {
     }
 
     #[test]
-    fn presets_are_read_in_order() {
+    fn profiles_are_read_in_order() {
         let config = parse(
             r#"
-[[preset]]
+[[profile]]
 name = "review"
+description = "A second pair of eyes"
 agent = "claude"
 mode = "plan"
 prompt = "Review the diff on this branch."
+instructions = "Point out risks before style."
+where = "here"
 
-[[preset]]
+[[profile]]
 name = "fast"
 agent = "codex"
 model = "gpt-6-luna"
 args = ["--search"]
+where = "worktree"
 "#,
         )
         .unwrap();
-        let names: Vec<&str> = config.presets.iter().map(|p| p.name.as_str()).collect();
+        let names: Vec<&str> = config.profiles.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(names, ["review", "fast"]);
-        assert_eq!(config.presets[0].mode.as_deref(), Some("plan"));
-        assert_eq!(config.presets[1].args, ["--search"]);
+        assert_eq!(config.profiles[0].mode.as_deref(), Some("plan"));
+        assert_eq!(config.profiles[0].start_in, Some(StartIn::Here));
+        assert_eq!(config.profiles[1].args, ["--search"]);
+        assert_eq!(config.profiles[1].start_in, Some(StartIn::Worktree));
     }
 
     #[test]
-    fn a_preset_that_cant_start_is_an_error_that_says_why() {
+    fn a_profile_that_cant_start_is_an_error_that_says_why() {
         let cases = [
             (
                 "name = \"x\"\nagent = \"vim\"",
                 "doesn't know the agent vim",
-            ),
-            (
-                "name = \"x\"\nagent = \"aider\"\nmodel = \"o3\"",
-                "doesn't take a model",
             ),
             (
                 "name = \"x\"\nagent = \"claude\"\nmode = \"yolo\"",
@@ -253,15 +211,25 @@ args = ["--search"]
                 "name = \"x\"\nagent = \"claude\"\nflavor = \"mint\"",
                 "flavor",
             ),
+            ("name = \"x\"\nagent = \"claude\"\nwhere = \"moon\"", "moon"),
             (
-                "name = \"x\"\nagent = \"claude\"\n[[preset]]\nname = \"x\"\nagent = \"codex\"",
-                "two presets are called x",
+                "name = \"x\"\nagent = \"claude\"\n[[profile]]\nname = \"x\"\nagent = \"codex\"",
+                "two profiles are called x",
             ),
         ];
-        for (preset, expected) in cases {
-            let err = parse(&format!("[[preset]]\n{preset}\n")).unwrap_err();
+        for (profile, expected) in cases {
+            let err = parse(&format!("[[profile]]\n{profile}\n")).unwrap_err();
             assert!(format!("{err:#}").contains(expected), "{err:#}");
         }
+    }
+
+    #[test]
+    fn a_leftover_preset_says_its_now_a_profile() {
+        let err = parse("[[preset]]\nname = \"x\"\nagent = \"claude\"\n").unwrap_err();
+        assert!(
+            format!("{err:#}").contains("`[[preset]]` tables are now `[[profile]]`"),
+            "{err:#}"
+        );
     }
 
     #[test]
@@ -272,13 +240,16 @@ args = ["--search"]
             new_session: "codex --model o3".into(),
             theme: ThemeName::Terminal,
             memory: false,
-            presets: vec![Preset {
+            profiles: vec![Profile {
                 name: "review".into(),
+                description: Some("A second pair of eyes".into()),
                 agent: "claude".into(),
                 model: Some("opus".into()),
                 mode: Some("plan".into()),
                 args: vec!["--verbose".into()],
                 prompt: Some("Review it.".into()),
+                instructions: Some("Be brief.".into()),
+                start_in: Some(StartIn::Worktree),
             }],
         };
         assert_eq!(parse(&config.to_toml()).unwrap(), config);

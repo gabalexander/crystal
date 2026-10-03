@@ -1,0 +1,475 @@
+//! Profiles: named, saved ways of starting an agent. A profile says which
+//! agent, set up how (its model, how it asks before acting, more
+//! arguments), what it's asked on top of every task, the standing
+//! instructions it keeps all session, and where it starts. The new-session
+//! panel offers them first.
+//!
+//! They live in the config file as `[[profile]]` tables. The TUI changes
+//! them there through `toml_edit`, which keeps the rest of the file as the
+//! user wrote it, comments and all.
+
+use crate::catalog::{self, Agent, FirstPrompt, Instructions};
+use crate::config;
+use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
+use std::path::Path;
+use toml_edit::{Array, ArrayOfTables, DocumentMut, Item, Table, value};
+
+/// Whether profiles are offered: first in the new-session panel, in the
+/// view `P` opens, and by `crystal profile`. Every part of crystal that
+/// offers them asks here, so they can be switched off in one place. The
+/// profiles in the config file are read and checked either way; switched
+/// off, they're only not offered.
+pub fn enabled(_config: &config::Config) -> bool {
+    true
+}
+
+/// What `crystal profile` says when profiles are switched off.
+pub const DISABLED: &str = "the profiles plugin is off";
+
+/// A saved way to start an agent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Profile {
+    /// What the panel calls it.
+    pub name: String,
+    /// A line on what it's for, shown in the panel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// The agent's program, one crystal knows: `claude`, `codex`, ….
+    pub agent: String,
+    /// The model, for an agent that takes one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// How it asks before acting: Claude Code's `--permission-mode`, or
+    /// Codex's `-a`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    /// More arguments for the agent, as they'd be written after it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+    /// Text put in front of the task: what this profile always asks for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+    /// What the agent keeps in mind all session, on top of its own
+    /// instructions: added to Claude Code's system prompt, or given to
+    /// Codex as developer instructions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
+    /// Where it starts, unless the panel is told otherwise. Left out, it
+    /// starts wherever the panel is set to.
+    #[serde(rename = "where", default, skip_serializing_if = "Option::is_none")]
+    pub start_in: Option<StartIn>,
+}
+
+/// Where a profile starts its agent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StartIn {
+    /// Where the selected session runs.
+    Here,
+    /// In a new worktree, on a branch named after the task.
+    Worktree,
+}
+
+impl Profile {
+    /// A profile for `agent` with nothing else set: what an agent chosen on
+    /// its own in the panel amounts to.
+    pub fn for_agent(agent: &str) -> Profile {
+        Profile {
+            name: String::new(),
+            description: None,
+            agent: agent.to_string(),
+            model: None,
+            mode: None,
+            args: Vec::new(),
+            prompt: None,
+            instructions: None,
+            start_in: None,
+        }
+    }
+
+    /// The command line that starts it on `task`: the agent, its options,
+    /// its instructions and arguments, then its prompt and the task, the
+    /// way the agent takes a first prompt.
+    pub fn command(&self, task: &str) -> Vec<String> {
+        let agent = catalog::find(&self.agent);
+        let mut command = vec![self.agent.clone()];
+        let model_option = agent.and_then(Agent::model_setting).map(|s| s.option);
+        let mode_option = agent.and_then(Agent::mode_setting).map(|s| s.option);
+        push_option(&mut command, model_option, self.model.as_deref());
+        push_option(&mut command, mode_option, self.mode.as_deref());
+        if let Some(text) = filled(&self.instructions) {
+            let instructions = agent.map_or(Instructions::None, |agent| agent.instructions);
+            command.extend(instructions.args(text));
+        }
+        command.extend(self.args.iter().cloned());
+        let prompt = match (filled(&self.prompt), task) {
+            (Some(asks), "") => asks.to_string(),
+            (Some(asks), task) => format!("{asks}\n\n{task}"),
+            (None, task) => task.to_string(),
+        };
+        let first_prompt = agent.map_or(FirstPrompt::Argument, |agent| agent.first_prompt);
+        first_prompt.add(&mut command, &prompt);
+        command
+    }
+
+    /// A profile that can't be started as written is an error that says
+    /// why: no name, an agent crystal doesn't know, or something its agent
+    /// doesn't take.
+    pub fn check(&self) -> Result<()> {
+        let name = &self.name;
+        if name.trim().is_empty() {
+            bail!("a profile has no name");
+        }
+        let Some(agent) = catalog::find(&self.agent) else {
+            let known: Vec<&str> = catalog::AGENTS.iter().map(|a| a.program).collect();
+            bail!(
+                "profile {name}: crystal doesn't know the agent {}; it knows {}",
+                self.agent,
+                known.join(", ")
+            );
+        };
+        if self.model.is_some() && agent.model_setting().is_none() {
+            bail!("profile {name}: {} doesn't take a model", agent.name);
+        }
+        if let Some(mode) = &self.mode {
+            let modes = agent.mode_values();
+            if modes.is_empty() {
+                bail!("profile {name}: {} doesn't take a mode", agent.name);
+            }
+            if !modes.contains(&mode.as_str()) {
+                bail!(
+                    "profile {name}: {mode} isn't a mode of {}; it takes {}",
+                    agent.name,
+                    modes.join(", ")
+                );
+            }
+        }
+        if filled(&self.instructions).is_some() && agent.instructions == Instructions::None {
+            bail!("profile {name}: {} can't be given instructions", agent.name);
+        }
+        Ok(())
+    }
+}
+
+/// `option` and `value` on `command`, when the agent has the option and
+/// the profile gives it a value.
+fn push_option(command: &mut Vec<String>, option: Option<&str>, value: Option<&str>) {
+    if let (Some(option), Some(value)) = (option, value) {
+        command.push(option.to_string());
+        command.push(value.to_string());
+    }
+}
+
+/// The text, unless it's missing or only blanks.
+fn filled(text: &Option<String>) -> Option<&str> {
+    text.as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+}
+
+/// Writes `profile` into the config file at `path`: in place of the profile
+/// called `replacing`, keeping its place in the file, or after the others
+/// when that's `None`. Nothing is written unless the file, with the
+/// change, still makes sense.
+pub fn save(path: &Path, replacing: Option<&str>, profile: &Profile) -> Result<()> {
+    edit(path, |profiles| {
+        match replacing {
+            Some(old_name) => {
+                let table = find(profiles, old_name)
+                    .with_context(|| format!("there's no profile called {old_name}"))?;
+                fill(table, profile);
+            }
+            None => {
+                let mut table = Table::new();
+                fill(&mut table, profile);
+                profiles.push(table);
+            }
+        }
+        Ok(())
+    })
+}
+
+/// Takes the profile called `name` out of the config file at `path`.
+pub fn delete(path: &Path, name: &str) -> Result<()> {
+    edit(path, |profiles| {
+        let index = profiles
+            .iter()
+            .position(|table| table_name(table) == Some(name))
+            .with_context(|| format!("there's no profile called {name}"))?;
+        profiles.remove(index);
+        Ok(())
+    })
+}
+
+/// Reads the config file at `path`, lets `change` change its profiles, and
+/// writes it back, unless the result doesn't make sense as a config file.
+/// The new file is written beside the old one and then moved over it, so
+/// a crash halfway through can't leave half a file.
+fn edit(path: &Path, change: impl FnOnce(&mut ArrayOfTables) -> Result<()>) -> Result<()> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(err) => return Err(err).with_context(|| format!("couldn't read {}", path.display())),
+    };
+    let mut document: DocumentMut = text
+        .parse()
+        .with_context(|| format!("couldn't read {}", path.display()))?;
+    let profiles = document
+        .entry("profile")
+        .or_insert(Item::ArrayOfTables(ArrayOfTables::new()))
+        .as_array_of_tables_mut()
+        .context("`profile` in the config file isn't a list of [[profile]] tables")?;
+    change(profiles)?;
+    if profiles.is_empty() {
+        document.remove("profile");
+    }
+
+    let new_text = document.to_string();
+    config::from_text(&new_text)?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let unfinished = path.with_extension("toml.saving");
+    std::fs::write(&unfinished, &new_text)?;
+    std::fs::rename(&unfinished, path)?;
+    Ok(())
+}
+
+fn find<'a>(profiles: &'a mut ArrayOfTables, name: &str) -> Option<&'a mut Table> {
+    profiles
+        .iter_mut()
+        .find(|table| table_name(table) == Some(name))
+}
+
+fn table_name(table: &Table) -> Option<&str> {
+    table.get("name").and_then(Item::as_str)
+}
+
+/// Writes `profile` into `table`, one key at a time. A key whose value
+/// doesn't change is left alone, with any comment beside it; one the
+/// profile doesn't set is taken out.
+fn fill(table: &mut Table, profile: &Profile) {
+    set_text(table, "name", Some(&profile.name));
+    set_text(table, "description", filled(&profile.description));
+    set_text(table, "agent", Some(&profile.agent));
+    set_text(table, "model", profile.model.as_deref());
+    set_text(table, "mode", profile.mode.as_deref());
+    set_words(table, "args", &profile.args);
+    set_text(table, "prompt", filled(&profile.prompt));
+    set_text(table, "instructions", filled(&profile.instructions));
+    let start_in = profile.start_in.map(|start_in| match start_in {
+        StartIn::Here => "here",
+        StartIn::Worktree => "worktree",
+    });
+    set_text(table, "where", start_in);
+}
+
+fn set_text(table: &mut Table, key: &str, text: Option<&str>) {
+    let Some(text) = text else {
+        table.remove(key);
+        return;
+    };
+    if table.get(key).and_then(Item::as_str) != Some(text) {
+        table.insert(key, value(text));
+    }
+}
+
+fn set_words(table: &mut Table, key: &str, words: &[String]) {
+    if words.is_empty() {
+        table.remove(key);
+        return;
+    }
+    let current: Option<Vec<&str>> = table
+        .get(key)
+        .and_then(Item::as_array)
+        .map(|array| array.iter().filter_map(|word| word.as_str()).collect());
+    if current.as_deref() != Some(&words.iter().map(String::as_str).collect::<Vec<_>>()[..]) {
+        let array: Array = words.iter().map(String::as_str).collect();
+        table.insert(key, value(array));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn review() -> Profile {
+        Profile {
+            name: "review".into(),
+            description: Some("A second pair of eyes".into()),
+            agent: "claude".into(),
+            model: Some("opus".into()),
+            mode: Some("plan".into()),
+            args: vec!["--verbose".into()],
+            prompt: Some("Review the diff on this branch.".into()),
+            instructions: Some("Point out risks before style.".into()),
+            start_in: Some(StartIn::Here),
+        }
+    }
+
+    #[test]
+    fn a_claude_profile_runs_with_its_options_instructions_and_prompt() {
+        assert_eq!(
+            review().command("Mind the tests."),
+            [
+                "claude",
+                "--model",
+                "opus",
+                "--permission-mode",
+                "plan",
+                "--append-system-prompt",
+                "Point out risks before style.",
+                "--verbose",
+                "Review the diff on this branch.\n\nMind the tests.",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_codex_profile_gives_its_instructions_as_a_setting() {
+        let profile = Profile {
+            model: Some("gpt-6-luna".into()),
+            mode: Some("on-request".into()),
+            instructions: Some("Keep changes small.".into()),
+            prompt: None,
+            args: Vec::new(),
+            ..Profile::for_agent("codex")
+        };
+        assert_eq!(
+            profile.command("add a test"),
+            [
+                "codex",
+                "-m",
+                "gpt-6-luna",
+                "-a",
+                "on-request",
+                "-c",
+                "developer_instructions=\"Keep changes small.\"",
+                "add a test",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_prompt_alone_is_the_first_prompt_and_no_task_leaves_none() {
+        let mut profile = review();
+        assert_eq!(
+            profile.command("").last().unwrap(),
+            "Review the diff on this branch."
+        );
+        profile.prompt = None;
+        assert_eq!(profile.command("").last().unwrap(), "--verbose");
+    }
+
+    #[test]
+    fn a_profile_that_cant_start_says_why() {
+        let cases = [
+            (Profile::for_agent("vim"), "doesn't know the agent vim"),
+            (
+                Profile {
+                    model: Some("o3".into()),
+                    ..Profile::for_agent("aider")
+                },
+                "doesn't take a model",
+            ),
+            (
+                Profile {
+                    mode: Some("yolo".into()),
+                    ..Profile::for_agent("claude")
+                },
+                "isn't a mode of Claude Code",
+            ),
+            (
+                Profile {
+                    instructions: Some("Be brief.".into()),
+                    ..Profile::for_agent("gemini")
+                },
+                "can't be given instructions",
+            ),
+        ];
+        for (mut profile, expected) in cases {
+            profile.name = "x".into();
+            let err = profile.check().unwrap_err();
+            assert!(format!("{err:#}").contains(expected), "{err:#}");
+        }
+        assert!(Profile::for_agent("claude").check().is_err(), "no name");
+    }
+
+    fn file(text: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, text).unwrap();
+        (dir, path)
+    }
+
+    #[test]
+    fn saving_a_new_profile_keeps_the_rest_of_the_file_as_it_was() {
+        let (_dir, path) = file("# my settings\nnotify = false # quiet, please\n");
+        save(&path, None, &review()).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.starts_with("# my settings\nnotify = false # quiet, please\n"));
+        let config = config::from_text(&text).unwrap();
+        assert_eq!(config.profiles, [review()]);
+    }
+
+    #[test]
+    fn saving_over_a_profile_changes_only_what_changed() {
+        let (_dir, path) = file(
+            "[[profile]]\n# the reviewer\nname = \"review\"\nagent = \"claude\"\nmode = \"plan\" # careful\n",
+        );
+        let changed = Profile {
+            model: Some("opus".into()),
+            mode: Some("plan".into()),
+            ..review()
+        };
+        save(&path, Some("review"), &changed).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# the reviewer\nname = \"review\""), "{text}");
+        assert!(text.contains("mode = \"plan\" # careful"), "{text}");
+        assert_eq!(config::from_text(&text).unwrap().profiles, [changed]);
+    }
+
+    #[test]
+    fn a_change_that_doesnt_make_sense_is_never_written() {
+        let original = "[[profile]]\nname = \"review\"\nagent = \"claude\"\n";
+        let (_dir, path) = file(original);
+        let broken = Profile {
+            mode: Some("yolo".into()),
+            ..review()
+        };
+        assert!(save(&path, Some("review"), &broken).is_err());
+        let twin = Profile {
+            name: "review".into(),
+            ..Profile::for_agent("codex")
+        };
+        let err = save(&path, None, &twin).unwrap_err();
+        assert!(format!("{err:#}").contains("two profiles are called review"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn deleting_the_last_profile_leaves_no_empty_list() {
+        let (_dir, path) =
+            file("notify = false\n\n[[profile]]\nname = \"review\"\nagent = \"claude\"\n");
+        delete(&path, "review").unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("profile"), "{text}");
+        assert!(text.contains("notify = false"));
+        assert!(delete(&path, "review").is_err());
+    }
+
+    #[test]
+    fn a_config_file_not_there_yet_is_made() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("crystal").join("config.toml");
+        save(&path, None, &review()).unwrap();
+        assert_eq!(
+            config::from_text(&std::fs::read_to_string(&path).unwrap())
+                .unwrap()
+                .profiles,
+            [review()]
+        );
+    }
+}

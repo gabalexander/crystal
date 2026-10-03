@@ -12,7 +12,7 @@ use super::text_area::TextArea;
 use super::text_input::TextInput;
 use super::theme::Theme;
 use crate::catalog::{self, Agent, Choices, FirstPrompt, Setting};
-use crate::config::Preset;
+use crate::profile::{Profile, StartIn};
 use crate::{git, shell};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
@@ -35,11 +35,11 @@ const BRANCH_LENGTH: usize = 40;
 /// How wide the labels of the panel's rows are, so the choices line up.
 const LABEL_WIDTH: usize = 13;
 
-/// What can be started: a preset from the config file, an agent crystal
+/// What can be started: a profile from the config file, an agent crystal
 /// knows, or the user's shell.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Run {
-    Preset(Preset),
+    Profile(Profile),
     Agent(&'static Agent),
     Shell,
 }
@@ -48,7 +48,7 @@ impl Run {
     /// What the panel calls it.
     pub fn label(&self) -> String {
         match self {
-            Run::Preset(preset) => preset.name.clone(),
+            Run::Profile(profile) => profile.name.clone(),
             Run::Agent(agent) => agent.name.to_string(),
             Run::Shell => "shell".to_string(),
         }
@@ -57,7 +57,7 @@ impl Run {
     /// What it's remembered by, to pick it again next time.
     pub fn key(&self) -> String {
         match self {
-            Run::Preset(preset) => format!("preset:{}", preset.name),
+            Run::Profile(profile) => format!("profile:{}", profile.name),
             Run::Agent(agent) => agent.program.to_string(),
             Run::Shell => "shell".to_string(),
         }
@@ -65,7 +65,7 @@ impl Run {
 
     fn agent(&self) -> Option<&'static Agent> {
         match self {
-            Run::Preset(preset) => catalog::find(&preset.agent),
+            Run::Profile(profile) => catalog::find(&profile.agent),
             Run::Agent(agent) => Some(agent),
             Run::Shell => None,
         }
@@ -77,12 +77,19 @@ impl Run {
             .is_some_and(|agent| agent.first_prompt != FirstPrompt::None)
     }
 
-    /// The rows of choices the panel shows for it: a preset's are set in
-    /// the config file, so it has none.
+    /// The rows of choices the panel shows for it: its agent's. A profile
+    /// starts them at what it sets, and they can still be changed.
     fn settings(&self) -> &'static [Setting] {
+        self.agent().map_or(&[], |agent| agent.settings)
+    }
+
+    /// What it starts from: a profile as it's written, or an agent with
+    /// nothing set.
+    fn profile(&self) -> Option<Profile> {
         match self {
-            Run::Agent(agent) => agent.settings,
-            Run::Preset(_) | Run::Shell => &[],
+            Run::Profile(profile) => Some(profile.clone()),
+            Run::Agent(agent) => Some(Profile::for_agent(agent.program)),
+            Run::Shell => None,
         }
     }
 }
@@ -163,6 +170,9 @@ pub struct Launcher {
     run: usize,
     /// The choice made in each of the agent's rows, by row.
     chosen: Vec<usize>,
+    /// Whether a row has been changed by hand since what runs was chosen,
+    /// so the profile's own choices aren't put back over it.
+    touched: bool,
     targets: Vec<Target>,
     target: usize,
     branch: TextInput,
@@ -185,6 +195,7 @@ impl Launcher {
             runs: setup.runs,
             run: 0,
             chosen: Vec::new(),
+            touched: false,
             targets: setup.targets,
             target: setup.target,
             branch: TextInput::default(),
@@ -195,6 +206,11 @@ impl Launcher {
             problem: None,
         };
         launcher.choose_run(setup.run);
+        // Opened for a new worktree, as by `w`, it stays one whatever the
+        // profile picked first says.
+        if setup.target != 0 {
+            launcher.target = setup.target;
+        }
         launcher
     }
 
@@ -233,6 +249,11 @@ impl Launcher {
     /// Takes the models Codex lists, once they've been read.
     pub fn set_codex_models(&mut self, models: Vec<String>) {
         self.codex_models = models;
+        if !self.touched {
+            // The profile's model can be found among them now.
+            self.choose_rows();
+            return;
+        }
         let rows = self.run().settings();
         for (row, setting) in rows.iter().enumerate() {
             let count = self.choices(setting).len();
@@ -396,18 +417,75 @@ impl Launcher {
                 let setting = &self.run().settings()[row];
                 let count = self.choices(setting).len();
                 self.chosen[row] = step(self.chosen[row], by, count);
+                self.touched = true;
             }
             Field::Where => self.target = step(self.target, by, self.targets.len()),
             Field::Task | Field::Branch => {}
         }
     }
 
-    /// Picks what runs, with each of its rows at its default.
+    /// Picks what runs, with its rows, and for a profile where it starts,
+    /// set from it.
     fn choose_run(&mut self, run: usize) {
         self.run = run.min(self.runs.len().saturating_sub(1));
-        self.chosen = vec![0; self.run().settings().len()];
+        self.touched = false;
+        self.choose_rows();
+        if let Run::Profile(Profile {
+            start_in: Some(start_in),
+            ..
+        }) = self.run()
+        {
+            self.start_in(*start_in);
+        }
         if self.focus == Field::Task && !self.run().takes_task() {
             self.focus = Field::Run;
+        }
+    }
+
+    /// Puts each row at what the profile chosen sets, or else its default.
+    fn choose_rows(&mut self) {
+        let profile = self.run().profile();
+        let settings = self.run().settings();
+        // A model the profile names stays choosable even when Codex hasn't
+        // listed its models yet, or doesn't list that one.
+        if let Some(model) = profile.as_ref().and_then(|p| p.model.clone())
+            && settings.iter().any(|s| s.choices == Choices::CodexModels)
+            && !self.codex_models.contains(&model)
+        {
+            self.codex_models.push(model);
+        }
+        self.chosen = settings
+            .iter()
+            .map(|setting| {
+                let wanted = profile.as_ref().and_then(|p| profile_value(p, setting));
+                wanted
+                    .and_then(|value| self.index_of(setting, &value))
+                    .unwrap_or(0)
+            })
+            .collect();
+    }
+
+    /// Where a row's choice gives its option `value`, if one does.
+    fn index_of(&self, setting: &Setting, value: &str) -> Option<usize> {
+        match setting.choices {
+            Choices::Fixed(choices) => choices.iter().position(|(_, given)| *given == value),
+            Choices::CodexModels => self
+                .codex_models
+                .iter()
+                .position(|model| model == value)
+                .map(|at| at + 1),
+        }
+    }
+
+    /// Sets where the session starts to `start_in`, when the panel offers
+    /// it.
+    fn start_in(&mut self, start_in: StartIn) {
+        let wanted = |target: &Target| match start_in {
+            StartIn::Here => matches!(target, Target::Here { .. }),
+            StartIn::Worktree => matches!(target, Target::NewWorktree { .. }),
+        };
+        if let Some(index) = self.targets.iter().position(wanted) {
+            self.target = index;
         }
     }
 
@@ -479,24 +557,28 @@ impl Launcher {
         }
     }
 
-    /// The command line the session runs. An empty one is the user's
-    /// shell.
+    /// The command line the session runs: what's chosen, as a profile with
+    /// the rows' choices, on the task. An empty one is the user's shell.
     pub fn command(&self) -> Vec<String> {
-        let task = self.task_text();
-        match self.run() {
-            Run::Shell => Vec::new(),
-            Run::Preset(preset) => preset_command(preset, &task),
-            Run::Agent(agent) => {
-                let mut command = vec![agent.program.to_string()];
-                for (setting, &choice) in agent.settings.iter().zip(&self.chosen) {
-                    if let Some(value) = self.value(setting, choice) {
-                        command.push(setting.option.to_string());
-                        command.push(value);
-                    }
-                }
-                add_task(&mut command, agent.first_prompt, &task);
-                command
+        let Some(mut profile) = self.run().profile() else {
+            return Vec::new();
+        };
+        for (setting, &choice) in self.run().settings().iter().zip(&self.chosen) {
+            let value = self.value(setting, choice);
+            if is_model(setting) {
+                profile.model = value;
+            } else {
+                profile.mode = value;
             }
+        }
+        profile.command(&self.task_text())
+    }
+
+    /// The chosen profile's description, if it has one.
+    pub fn description(&self) -> Option<&str> {
+        match self.run() {
+            Run::Profile(profile) => profile.description.as_deref(),
+            _ => None,
         }
     }
 
@@ -565,43 +647,18 @@ impl Launcher {
     }
 }
 
-/// A preset's command line, with `task` after the text it always asks.
-pub fn preset_command(preset: &Preset, task: &str) -> Vec<String> {
-    let mut command = vec![preset.agent.clone()];
-    let agent = catalog::find(&preset.agent);
-    let model_option = agent.and_then(Agent::model_setting).map(|s| s.option);
-    let mode_option = agent.and_then(Agent::mode_setting).map(|s| s.option);
-    if let (Some(model), Some(option)) = (&preset.model, model_option) {
-        command.push(option.to_string());
-        command.push(model.clone());
-    }
-    if let (Some(mode), Some(option)) = (&preset.mode, mode_option) {
-        command.push(option.to_string());
-        command.push(mode.clone());
-    }
-    command.extend(preset.args.iter().cloned());
-    let prompt = match (preset.prompt.as_deref().map(str::trim), task) {
-        (Some(asks), "") => asks.to_string(),
-        (Some(asks), task) if !asks.is_empty() => format!("{asks}\n\n{task}"),
-        _ => task.to_string(),
-    };
-    let first_prompt = agent.map_or(FirstPrompt::Argument, |agent| agent.first_prompt);
-    add_task(&mut command, first_prompt, &prompt);
-    command
+/// Whether `setting` is the row that chooses the agent's model; the other
+/// row an agent may have is how it asks before acting, its mode.
+fn is_model(setting: &Setting) -> bool {
+    setting.label == "model"
 }
 
-/// Puts `task` on `command`, the way its agent takes a first prompt.
-fn add_task(command: &mut Vec<String>, first_prompt: FirstPrompt, task: &str) {
-    if task.is_empty() {
-        return;
-    }
-    match first_prompt {
-        FirstPrompt::Argument => command.push(task.to_string()),
-        FirstPrompt::Option(option) => {
-            command.push(option.to_string());
-            command.push(task.to_string());
-        }
-        FirstPrompt::None => {}
+/// What `profile` sets the row `setting` to, if it sets it.
+fn profile_value(profile: &Profile, setting: &Setting) -> Option<String> {
+    if is_model(setting) {
+        profile.model.clone()
+    } else {
+        profile.mode.clone()
     }
 }
 
@@ -797,6 +854,16 @@ pub fn panel_lines(launcher: &Launcher, width: u16) -> Vec<PanelLine> {
     lines.push(PanelLine::blank());
     for (field, label, choices, chosen) in launcher.choice_rows() {
         lines.push(choice_line(launcher, field, label, &choices, chosen, width));
+        // What a profile is for, under the row that chose it.
+        if field == Field::Run
+            && let Some(description) = launcher.description()
+        {
+            let room = width.saturating_sub(LABEL_WIDTH);
+            lines.push(PanelLine::new(vec![
+                (" ".repeat(LABEL_WIDTH), Ink::Muted),
+                (cut(description, room), Ink::Muted),
+            ]));
+        }
     }
     if launcher.is_new_worktree() {
         let focused = launcher.focus() == Field::Branch;
@@ -893,7 +960,7 @@ fn choice_line(
 
 /// Which choices fit in `room`, as a range that holds the chosen one:
 /// from the first while they all fit, or else starting further along.
-fn shown_choices(choices: &[String], chosen: usize, room: usize) -> (usize, usize) {
+pub(super) fn shown_choices(choices: &[String], chosen: usize, room: usize) -> (usize, usize) {
     let width = |range: std::ops::Range<usize>| -> usize {
         choices[range]
             .iter()
@@ -922,7 +989,7 @@ fn label(name: &str, focused: bool) -> (String, Ink) {
 }
 
 /// `text`, cut to `width` characters with `…` when it's longer.
-fn cut(text: &str, width: usize) -> String {
+pub(super) fn cut(text: &str, width: usize) -> String {
     let text = text.replace('\n', " ");
     if text.chars().count() <= width {
         return text;
@@ -1218,35 +1285,82 @@ mod tests {
     }
 
     #[test]
-    fn a_preset_brings_its_settings_and_puts_its_prompt_first() {
-        let preset = Preset {
+    fn a_profile_fills_the_panel_and_its_choices_can_still_change() {
+        let review = Profile {
             name: "review".into(),
-            agent: "claude".into(),
+            description: Some("A second pair of eyes".into()),
             model: Some("opus".into()),
             mode: Some("plan".into()),
-            args: vec!["--verbose".into()],
             prompt: Some("Review the diff.".into()),
+            start_in: Some(StartIn::Worktree),
+            ..Profile::for_agent("claude")
         };
+        let mut panel = launcher(vec![Run::Profile(review), agent("claude")]);
+        assert_eq!(panel.run().key(), "profile:review");
+        assert_eq!(panel.description(), Some("A second pair of eyes"));
+        assert!(panel.is_new_worktree());
         assert_eq!(
-            preset_command(&preset, "Mind the tests."),
+            panel.fields(),
+            [
+                Field::Task,
+                Field::Run,
+                Field::Setting(0),
+                Field::Setting(1),
+                Field::Where,
+                Field::Branch
+            ]
+        );
+        type_text(&mut panel, "Mind the tests.");
+        assert_eq!(
+            panel.command(),
             [
                 "claude",
                 "--model",
                 "opus",
                 "--permission-mode",
                 "plan",
-                "--verbose",
                 "Review the diff.\n\nMind the tests."
             ]
         );
-        assert_eq!(
-            preset_command(&preset, "").last().unwrap(),
-            "Review the diff."
-        );
-        let mut panel = launcher(vec![Run::Preset(preset), agent("claude")]);
-        assert_eq!(panel.fields(), [Field::Task, Field::Run, Field::Where]);
-        type_text(&mut panel, "x");
-        assert_eq!(panel.run().key(), "preset:review");
+
+        // Down to the permissions row, and one to the left: accept edits.
+        press(&mut panel, KeyCode::Tab);
+        press(&mut panel, KeyCode::Tab);
+        press(&mut panel, KeyCode::Tab);
+        press(&mut panel, KeyCode::Left);
+        assert_eq!(panel.command()[3..5], ["--permission-mode", "acceptEdits"]);
+    }
+
+    #[test]
+    fn a_codex_profile_s_model_is_there_before_codex_lists_its_models() {
+        let fast = Profile {
+            name: "fast".into(),
+            model: Some("gpt-7".into()),
+            ..Profile::for_agent("codex")
+        };
+        let mut panel = launcher(vec![Run::Profile(fast)]);
+        assert_eq!(panel.command(), ["codex", "-m", "gpt-7"]);
+        // The list arrives, without that model: it stays chosen.
+        panel.set_codex_models(vec!["gpt-6-luna".into()]);
+        assert_eq!(panel.command(), ["codex", "-m", "gpt-7"]);
+    }
+
+    #[test]
+    fn opened_for_a_new_worktree_a_profile_that_starts_here_doesnt_undo_it() {
+        let here = Profile {
+            name: "here".into(),
+            start_in: Some(StartIn::Here),
+            ..Profile::for_agent("claude")
+        };
+        let panel = Launcher::new(Setup {
+            runs: vec![Run::Profile(here)],
+            run: 0,
+            targets: vec![super::tests::here(), worktree()],
+            target: 1,
+            history: Vec::new(),
+            codex_models: Vec::new(),
+        });
+        assert!(panel.is_new_worktree());
     }
 
     #[test]
