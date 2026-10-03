@@ -73,6 +73,12 @@ daemon of another version says so, rather than misunderstanding it.
 Run `crystal` on its own to open the TUI: every session in a sidebar on the left, and the selected one live in
 a pane beside it.
 
+There are no boxes. The sidebar lists each project with a thin rule after its name, its worktrees under it,
+and their sessions under those, each with a mark for what it's doing and how long ago that changed. A thin
+rule separates the sidebar from the panes; each pane has a header line naming its session, with where it runs
+on the right. The bar along the top counts the sessions and how many wait on you, and the footer says where
+you are and offers the keys that matter there.
+
 | Key | In the sidebar |
 |---|---|
 | `j` / `k`, `↓` / `↑` | select a session |
@@ -124,10 +130,10 @@ session leads its worktree.
 | Mark | Meaning |
 |---|---|
 | `▲` waiting | the agent is asking you something, like a permission |
-| `◐` working | the agent is working on a turn |
+| `◐` working | the agent is working on a turn; the mark turns while it does |
 | `✓` done | the agent finished its turn, and you haven't looked yet |
-| `▶` | running: an agent at its prompt, or any other program |
-| `■` | ended, with how it exited |
+| `▸` | running: an agent at its prompt, or any other program |
+| `■` | ended: muted when it exited well, red when it failed; the pane's header says how |
 
 crystal knows what an agent is doing in two ways. When it starts Claude Code itself, it adds hooks with
 `--settings`, so your settings files are left alone and your own hooks still run. And for every session it
@@ -291,6 +297,10 @@ file and change. A setting crystal doesn't know is an error that names it, so a 
 | `notify` | `true` | tell you when a session needs you |
 | `notify_command` | none | a shell command to run instead of the desktop notification |
 | `new_session` | `"claude"` | what the TUI's new-session line starts out with |
+| `theme` | `"dark"` | the TUI's colors: `"dark"`, `"light"`, or `"terminal"` |
+
+`dark` and `light` paint their own background, so crystal looks the same in any terminal; `terminal` paints
+nothing and uses your terminal's own colors. With `NO_COLOR` set, crystal uses no color at all.
 
 `notify_command` is for telling you some other way, like a message to your phone. It runs with
 `CRYSTAL_NOTICE` (the line a notification would show), `CRYSTAL_NOTICE_SESSION` (the session's name) and
@@ -301,7 +311,7 @@ notify_command = 'curl -s -d "$CRYSTAL_NOTICE" ntfy.sh/my-crystal'
 ```
 
 The daemon reads the notification settings each time it tells you something, so a change counts straight
-away; the TUI reads `new_session` when it starts.
+away; the TUI reads `new_session` and `theme` when it starts.
 
 ## How it works
 

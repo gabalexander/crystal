@@ -45,7 +45,10 @@ is: it's the one request every version must understand.
 - `src/tui/`: the TUI (`crystal` with no command)
   - `mod.rs`: the event loop: one channel of events, then update and draw
   - `app.rs`: the state and how keys and the mouse change it; no I/O, so it's unit-tested
-  - `ui.rs`: the layout and drawing, and what's under the mouse
+  - `ui.rs`: the layout and drawing (top bar, pane headers, footer), and what's under the mouse
+  - `sidebar.rs`: the sidebar's rows: headings, worktree lines, sessions with their mark and how long ago
+  - `status.rs`: a session's status as the TUI shows it, and its mark
+  - `theme.rs`: every color, named for what it's for: `dark`, `light`, `terminal`, and none for `NO_COLOR`
   - `mouse.rs`: writes mouse events the way a program in a pane asked for them
   - `help.rs`: the overlay `?` opens, drawn from one table of every key; a test keeps the README's
     table of sidebar keys in step with it
