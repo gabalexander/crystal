@@ -188,12 +188,15 @@ impl<T: Item, D> Listing<T, D> {
 }
 
 /// Whether every word of `query` turns up in what's searched of `item`,
-/// its letters in order.
+/// its letters in order. With no words, everything matches, and nothing is
+/// searched.
 fn matches(query: &str, item: &impl Item) -> bool {
+    let mut words = query.split_whitespace().peekable();
+    if words.peek().is_none() {
+        return true;
+    }
     let text = item.searched();
-    query
-        .split_whitespace()
-        .all(|word| letters_in(word, &text).is_some())
+    words.all(|word| letters_in(word, &text).is_some())
 }
 
 /// The parts of a view, top to bottom: its heading, the filter, and the

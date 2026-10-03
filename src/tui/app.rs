@@ -3,6 +3,7 @@
 //! world, it comes back as an [`Action`] for the event loop to carry out.
 //! That keeps every state change testable on its own.
 
+use super::away::{Away, Tally};
 use super::backlog_view::{BacklogChange, BacklogView, Step};
 use super::command_line;
 use super::diff_view::{self, Against, DiffView};
@@ -13,6 +14,7 @@ use super::issues::{self, IssuesView};
 use super::launcher::{self, Launcher, Memory, Run, Setup, Target};
 use super::layouts::{self, Layouts, LayoutsView, Which};
 use super::memory_view::MemoryView;
+use super::needs_you::{self, NeedsYouView};
 use super::plugins_view::{self, PluginsView};
 use super::preview::Content;
 use super::profiles::{self, ProfilesView};
@@ -25,10 +27,12 @@ use super::status::Status;
 use super::switcher::{self, Switcher};
 use super::tabs::{self, Tabs};
 use super::text_input::TextInput;
+use super::timeline::{self, TimelineView};
 use super::tree_browser::TreeBrowser;
 use crate::catalog::{self, Agent};
 use crate::client::Purpose;
 use crate::config::Config;
+use crate::events::Event;
 use crate::flow_run::{FlowRun, RunState};
 use crate::flows::{self, Flow};
 use crate::forge::{self, Checkout, Forge, Issue, PullRequest, PullRequestDetail, Topic};
@@ -538,6 +542,14 @@ pub enum Action {
     /// Put the tabs back the way this layout has them.
     RestoreLayout(Which),
     RemoveLayout(Which),
+    /// The timeline has opened: read the newest page of the event log for
+    /// it, then follow the log as it grows.
+    FollowEvents,
+    /// The timeline has closed: stop following the log.
+    StopFollowing,
+    /// Read the page of the event log before the event with this `seq`,
+    /// for the timeline.
+    ReadOlderEvents(u64),
 }
 
 impl Action {
@@ -718,6 +730,16 @@ pub struct App {
     /// The server the TUI is on, when it isn't the default one: the top bar
     /// names it.
     server: Option<String>,
+    /// The timeline, while it's open.
+    timeline: Option<TimelineView>,
+    /// The list of everything waiting on the user, while it's open.
+    needs_you: Option<NeedsYouView>,
+    /// What happened while the user was away, and since when, until the
+    /// timeline is opened at that point.
+    away: Option<Away>,
+    /// Whether the footer says what happened while the user was away: until
+    /// the next key.
+    away_shown: bool,
 }
 
 impl App {
@@ -778,6 +800,10 @@ impl App {
             flows_on: true,
             spending: None,
             server: None,
+            timeline: None,
+            needs_you: None,
+            away: None,
+            away_shown: false,
         }
     }
 
@@ -1137,6 +1163,65 @@ impl App {
 
     pub fn notify(&mut self, notice: String) {
         self.notice = Some(notice);
+    }
+
+    pub fn timeline_view(&self) -> Option<&TimelineView> {
+        self.timeline.as_ref()
+    }
+
+    pub fn needs_you_view(&self) -> Option<&NeedsYouView> {
+        self.needs_you.as_ref()
+    }
+
+    /// Everything waiting on the user now, in every tab: see
+    /// [`needs_you::rows`].
+    pub fn needs_you_rows(&self) -> Vec<needs_you::Row> {
+        needs_you::rows(&self.sessions, self.shown_flows())
+    }
+
+    /// The footer's line on what happened while the user was away, until
+    /// the next key.
+    pub fn away_line(&self) -> Option<&str> {
+        let away = self.away.as_ref().filter(|_| self.away_shown)?;
+        Some(&away.line)
+    }
+
+    /// Takes what the event log gained while the user was away. When
+    /// something worth saying happened, the footer says it, and the
+    /// timeline opened next marks what's new since.
+    pub fn set_away(&mut self, tally: &Tally) {
+        if let Some(line) = tally.line(&self.needs_you_rows()) {
+            self.away = Some(Away {
+                line,
+                after: tally.after,
+            });
+            self.away_shown = true;
+        }
+    }
+
+    /// Takes a page of the event log, for the timeline, and asks for the
+    /// one before it when the timeline wants more to fill itself.
+    pub fn events_read(&mut self, page: Result<Vec<Event>, String>) -> Option<Action> {
+        let view = self.timeline.as_mut()?;
+        // The timeline says why its first page couldn't be read; the footer
+        // says why one further back couldn't.
+        let failed = match (&page, view.list.items()) {
+            (Err(reason), Some(Ok(_))) => Some(format!("couldn't read further back: {reason}")),
+            _ => None,
+        };
+        view.read(page);
+        let older = view.wants_older(false);
+        if let Some(failed) = failed {
+            self.notify(failed);
+        }
+        older.map(Action::ReadOlderEvents)
+    }
+
+    /// Takes an event that has just happened, for the timeline.
+    pub fn logged(&mut self, event: Event) {
+        if let Some(view) = &mut self.timeline {
+            view.logged(event);
+        }
     }
 
     pub fn sessions(&self) -> &[SessionInfo] {
@@ -1925,6 +2010,12 @@ impl App {
         if !keeps_keyboard {
             self.focus = Focus::Sidebar;
         }
+        if self.needs_you.is_some() {
+            let rows = self.needs_you_rows();
+            if let Some(view) = &mut self.needs_you {
+                view.refresh(rows);
+            }
+        }
         self.remember_shown();
     }
 
@@ -2030,6 +2121,7 @@ impl App {
 
     fn take_key(&mut self, key: KeyEvent) -> Option<Action> {
         self.notice = None;
+        self.away_shown = false;
         // A plugin's pane is over everything, and has every key but the one
         // that closes it.
         if self.plugin_pane.is_some() {
@@ -2102,6 +2194,12 @@ impl App {
         }
         if self.prompt.is_some() {
             return self.on_prompt_key(key);
+        }
+        if self.needs_you.is_some() {
+            return self.on_needs_you_key(key);
+        }
+        if self.timeline.is_some() {
+            return self.on_timeline_key(key);
         }
         if self.issues.is_some() {
             return self.on_issues_key(key);
@@ -2271,6 +2369,8 @@ impl App {
     /// panel, the profiles view and the others over the panes.
     fn waiting_on_keyboard(&self) -> bool {
         let typing = self.filter.is_some()
+            || self.timeline.is_some()
+            || self.needs_you.is_some()
             || self.issues.is_some()
             || self.pull_requests_view.is_some()
             || self.backlog.is_some()
@@ -2376,6 +2476,8 @@ impl App {
             KeyCode::Char('r') => self.ask_for_name(),
             KeyCode::Char('x') => self.confirm = Some(Confirm::Kill(self.selected()?.name.clone())),
             KeyCode::Char('u') => self.select_next_needing_user(),
+            KeyCode::Char('U') => self.open_needs_you(),
+            KeyCode::Char('a') => return Some(self.open_timeline()),
             KeyCode::Char('d') => return self.open_diff(),
             KeyCode::Char('p') => return self.open_finder(),
             KeyCode::Char('E') => return self.open_tree_browser(),
@@ -3336,6 +3438,10 @@ impl App {
             view.on_paste(&text);
         } else if let Some(prompt) = &mut self.prompt {
             prompt.input.insert_str(&text);
+        } else if self.needs_you.is_some() {
+            return None;
+        } else if let Some(view) = &mut self.timeline {
+            view.on_paste(&text);
         } else if let Some(issues) = &mut self.issues {
             issues.on_paste(&text);
         } else if let Some(view) = &mut self.pull_requests_view {
@@ -4058,6 +4164,95 @@ impl App {
             }
             None => self.notify("nothing needs you".to_string()),
         }
+    }
+
+    /// `U`: opens the list of everything waiting on the user.
+    fn open_needs_you(&mut self) {
+        self.needs_you = Some(NeedsYouView::new(self.needs_you_rows()));
+    }
+
+    /// Keys while the needs-you view is open: all of them are its, but
+    /// those of the question `f` asks.
+    fn on_needs_you_key(&mut self, key: KeyEvent) -> Option<Action> {
+        match self.needs_you.as_mut()?.on_key(&key) {
+            needs_you::Step::Stay => None,
+            needs_you::Step::Close => {
+                self.needs_you = None;
+                None
+            }
+            needs_you::Step::Go(name) => {
+                self.needs_you = None;
+                self.select(&name);
+                None
+            }
+            needs_you::Step::Answer { name, answer } => Some(Action::Answer { name, answer }),
+            needs_you::Step::GoOn(run) => Some(Action::ApproveFlow(run)),
+            needs_you::Step::SendBack(run) => {
+                self.ask(Question::SendFlowBack(run), "");
+                None
+            }
+            needs_you::Step::Say(said) => {
+                self.notify(said);
+                None
+            }
+        }
+    }
+
+    /// `a`: opens the timeline, which marks what's new since the user was
+    /// away when the footer has just said what that was, and has the log
+    /// read for it.
+    fn open_timeline(&mut self) -> Action {
+        let after = self.away.take().map(|away| away.after);
+        self.timeline = Some(TimelineView::new(after));
+        Action::FollowEvents
+    }
+
+    /// Keys while the timeline is open: all of them are its.
+    fn on_timeline_key(&mut self, key: KeyEvent) -> Option<Action> {
+        let view = self.timeline.as_mut()?;
+        match view.on_key(&key) {
+            timeline::Step::Stay => view.wants_older(true).map(Action::ReadOlderEvents),
+            timeline::Step::Close => self.close_timeline(),
+            timeline::Step::Go(event) => self.go_to_event(&event),
+        }
+    }
+
+    fn close_timeline(&mut self) -> Option<Action> {
+        self.timeline = None;
+        Some(Action::StopFollowing)
+    }
+
+    /// Enter on a line of the timeline: goes to the session it's about,
+    /// closing the timeline, or says why there's none to go to.
+    fn go_to_event(&mut self, event: &Event) -> Option<Action> {
+        match self.session_of(event) {
+            Some(name) => {
+                self.select(&name);
+                self.close_timeline()
+            }
+            None => {
+                let notice = match &event.session {
+                    Some(about) => format!("{} has gone", about.name),
+                    None => format!("{} isn't about a session", event.kind.name()),
+                };
+                self.notify(notice);
+                None
+            }
+        }
+    }
+
+    /// What the session `event` is about is called now: the session with
+    /// its id, whatever it has been renamed since; or for a flow run's
+    /// event, the session of its latest step that has one.
+    fn session_of(&self, event: &Event) -> Option<String> {
+        if let Some(about) = &event.session {
+            let session = self.sessions.iter().find(|s| s.id == about.id)?;
+            return Some(session.name.clone());
+        }
+        let run = event.flow.as_ref()?;
+        let run = self.flows.iter().find(|found| found.name == run.run)?;
+        let step = run.steps.iter().rev().find_map(|s| s.session.as_deref())?;
+        self.position(step).map(|_| step.to_string())
     }
 
     /// The next session that needs the user, in any tab: one waiting on
@@ -7435,5 +7630,110 @@ gate = true
         assert_eq!(press(&mut app, KeyCode::Esc), Some(Action::CloseSettings));
         assert!(app.settings_view().is_none());
         assert_eq!(selected_name(&app), Some("agent"));
+    }
+
+    #[test]
+    fn capital_u_lists_what_needs_you_in_every_tab_and_enter_goes_there() {
+        let mut app = app_with_a_second_tab(&["a"]);
+        app.set_sessions(vec![doing("a", Activity::Waiting), session("shell")]);
+        press(&mut app, KeyCode::Char('U'));
+        let row = app.needs_you_view().unwrap().highlighted().unwrap();
+        assert_eq!(row.name, "a");
+        // Its keys are the list's: in the sidebar, `x` would ask to kill.
+        assert_eq!(press(&mut app, KeyCode::Char('x')), None);
+        assert!(app.confirm().is_none());
+        press(&mut app, KeyCode::Enter);
+        assert!(app.needs_you_view().is_none());
+        assert_eq!(selected_name(&app), Some("a"));
+        assert_eq!(app.tabs().current_index(), 0);
+    }
+
+    #[test]
+    fn a_permission_is_answered_from_the_list_which_stays_open() {
+        let mut app = App::new(None);
+        let asking = SessionInfo {
+            asking: Some(crate::protocol::Asking {
+                tool: "Bash".into(),
+                gist: "cargo test".into(),
+            }),
+            ..doing("fixer", Activity::Waiting)
+        };
+        app.set_sessions(vec![session("other"), asking]);
+        press(&mut app, KeyCode::Char('U'));
+        let answered = Action::Answer {
+            name: "fixer".into(),
+            answer: Answer::Always,
+        };
+        assert_eq!(press(&mut app, KeyCode::Char('Y')), Some(answered));
+        // Answered, it leaves the list as the next list of sessions comes.
+        app.set_sessions(vec![session("other"), doing("fixer", Activity::Working)]);
+        assert!(app.needs_you_view().unwrap().highlighted().is_none());
+        press(&mut app, KeyCode::Esc);
+        assert!(app.needs_you_view().is_none());
+    }
+
+    /// An event about `session`, numbered `seq`.
+    fn about(seq: u64, kind: crate::events::Kind, session: &SessionInfo) -> Event {
+        Event {
+            seq,
+            session: Some(crate::events::SessionAbout::of(session)),
+            ..Event::new(kind)
+        }
+    }
+
+    #[test]
+    fn the_timeline_follows_the_log_while_open_and_enter_goes_to_a_line_s_session() {
+        let mut app = app_with(&["a"]);
+        assert_eq!(
+            press(&mut app, KeyCode::Char('a')),
+            Some(Action::FollowEvents)
+        );
+        let worker = SessionInfo {
+            id: "s1".into(),
+            ..session("worker")
+        };
+        let gone = session("gone");
+        let page = vec![
+            about(2, crate::events::Kind::SessionEnded, &gone),
+            about(1, crate::events::Kind::SessionStarted, &worker),
+        ];
+        assert_eq!(app.events_read(Ok(page)), None, "the log has no more");
+        // Renamed since, it's still the session the line is about.
+        let builder = SessionInfo {
+            id: "s1".into(),
+            ..session("builder")
+        };
+        app.set_sessions(vec![session("a"), builder]);
+        assert_eq!(press(&mut app, KeyCode::Enter), None);
+        assert_eq!(app.notice(), Some("gone has gone"));
+        press(&mut app, KeyCode::Down);
+        assert_eq!(press(&mut app, KeyCode::Enter), Some(Action::StopFollowing));
+        assert!(app.timeline_view().is_none());
+        assert_eq!(selected_name(&app), Some("builder"));
+
+        press(&mut app, KeyCode::Char('a'));
+        assert_eq!(press(&mut app, KeyCode::Esc), Some(Action::StopFollowing));
+    }
+
+    #[test]
+    fn what_happened_while_you_were_away_shows_until_a_key_and_marks_the_timeline() {
+        let mut app = app_with(&["a"]);
+        let finished = about(8, crate::events::Kind::SessionDone, &session("a"));
+        app.set_away(&Tally::of(&[finished]));
+        assert_eq!(
+            app.away_line(),
+            Some("while you were away: 1 session finished")
+        );
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.away_line(), None);
+        press(&mut app, KeyCode::Char('a'));
+        assert_eq!(app.timeline_view().unwrap().away_after, Some(7));
+        press(&mut app, KeyCode::Esc);
+        // Once it has been seen there, it's not new any more.
+        press(&mut app, KeyCode::Char('a'));
+        assert_eq!(app.timeline_view().unwrap().away_after, None);
+        // Nothing worth saying says nothing.
+        app.set_away(&Tally::of(&[]));
+        assert_eq!(app.away_line(), None);
     }
 }

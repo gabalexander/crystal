@@ -79,7 +79,8 @@ There are no boxes. The sidebar lists each project with a thin rule after its na
 and their sessions under those, each with a mark for what it's doing and how long ago that changed. A thin
 rule separates the sidebar from the panes; each pane has a header line naming its session, with where it runs
 on the right. The bar along the top shows your [tabs](#tabs) and counts the sessions and how many wait on you,
-and the footer says where you are and offers the keys that matter there.
+and the footer says where you are and offers the keys that matter there, or, when you come back, what happened
+[while you were away](#timeline).
 
 | Key | In the sidebar |
 |---|---|
@@ -108,6 +109,8 @@ and the footer says where you are and offers the keys that matter there.
 | `r` | rename the selected session |
 | `x` | kill the selected session, once you've said `y` |
 | `u` | select the next session that needs you: waiting on you first, then done |
+| `U` | list everything that [needs you](#timeline), in every tab, and answer a permission or a gate where it stands |
+| `a` | the [timeline](#timeline): what happened, the newest first, as it happens |
 | `/` | find a session by typing a little of its name, project, branch or command |
 | `o` | open the pull request of the selected session's branch in your browser |
 | `O` | list the open [pull requests](#pull-requests-and-issues) of the selected session's project: read one, see its diff, comment, or start an agent in its worktree |
@@ -241,7 +244,7 @@ When a session comes to need you while you're looking elsewhere (its agent asks 
 turn nobody was watching), crystal shows a desktop notification, like "claude-2 is waiting on you · app
 fix/login". It uses macOS's own notifications, or `notify-send` on Linux when it's installed. You're told once
 each time a session comes to need you, and never about a session you're watching. `u` in the TUI takes you to
-it.
+it, and `U` [lists everything](#timeline) that needs you.
 
 `/` finds a session by typing a little of it. The sidebar shows only the sessions that match, under their
 project and worktree, with the letters that matched marked in each name. The letters only have to turn up in
@@ -878,7 +881,8 @@ crystal events --follow               # new ones as they happen; with --since, c
 14:06:15     task.closed         reviewer  done: two risks in the retry loop
 ```
 
-The time is `14:03:07` today, `09-24 14:03` earlier in the year, and the date before that.
+The time is `14:03:07` today, `09-24 14:03` earlier in the year, and the date before that. In the TUI, `a`
+shows the same lines as the [timeline](#timeline).
 
 Each line of `--json` is one event, the same JSON the log keeps and plugins get: its `seq` (1, 2, 3…, never
 going back), `at` (milliseconds since the Unix epoch), its name as `event`, the `project` it's about, the
@@ -909,6 +913,37 @@ The log keeps 30 days, or `keep_days` under `[events]` in the config (`0` keeps 
 than 50,000 events; the daemon prunes it as it starts and every hour after, and the numbers never go back,
 however much is pruned. Events from outside the daemon, like `crystal remember`, reach the log through it,
 so one done with no daemon running isn't written down.
+
+### Timeline
+
+`a` in the TUI opens the timeline: the event log read back, the newest first, a line an event, the way
+`crystal events` prints it: when, what happened, in the color of how it went, the session or flow run it's
+about, and what it says. It's live: while it's open, new events come in on top, and the bar stays on the line
+it was on. Type to filter the lines by anything in them (`fixer`, `task.closed`, `failed`, a branch), and
+`Tab` and `Shift+Tab` narrow them to one kind: sessions and worktrees, tasks with their runs, handoff notes
+and the backlog, flows, memory, or the others. `↑` and `↓` move; the line the bar is on is read whole under
+the list, with everything its event carries, and `PgUp` and `PgDn` scroll it. `Enter` goes to the session the
+line is about, whatever it's called now (for a flow run, its latest step's); `Esc` clears the filter, then
+closes. The timeline reads the log a page at a time, and further back as the bar reaches the end.
+
+`U` lists everything that needs you now, in every tab, the most urgent first: background tasks asking for a
+permission, flow runs at a gate, tasks whose agent ended its turn with the task still open, agents asking you
+something, then agents that finished a turn you haven't seen. Within each, whatever has waited longest comes
+first, and each thing has one row. `y`, `n` and `Y` answer a permission where it stands, and `g` and `f` a
+gate (go on, or send it back with your notes), as on the session's own row; the list stays open, and an
+answered row leaves it. `Enter` goes to the session, and `Esc` closes the list.
+
+When you come back to crystal, the footer says what happened while you were away, in one line:
+
+```
+while you were away: 2 tasks done · 1 failed · 3 sessions finished · 1 needs you
+```
+
+Only what isn't nothing is said, a task or a session once however often, and of what came to need you only
+what still does. You were away since you last quit the TUI (crystal keeps the latest event you had seen in its
+database), while your terminal didn't have focus for five minutes or more, or, in a terminal that doesn't say
+when it has focus, while you didn't type or click for that long. The line stays until your next key: `a` opens
+the timeline with what's new since marked `•`, and `U` lists what needs you.
 
 ### Other machines
 
@@ -986,8 +1021,8 @@ crystal interrupt docs                                               # stop the 
   (`--input-format stream-json`). Arguments after `--` go to every `claude -p` the task starts.
 - When Claude asks for a tool its permission mode and rules don't allow, the run waits on you: the session
   shows as `waiting`, its transcript and its pane's header say what it asks (`⚠ Bash cargo test`), and `ls
-  --json` has it as `asking`. `y` in the TUI, on the task in the sidebar or in its pane, or `crystal answer
-  <task> y`, lets it run once. `n` says no: Claude is told so, or what `-m` says, and carries on. `Y`, or
+  --json` has it as `asking`. `y` in the TUI, on the task in the sidebar, in its pane or in the list `U` opens, or
+  `crystal answer <task> y`, lets it run once. `n` says no: Claude is told so, or what `-m` says, and carries on. `Y`, or
   `always`, lets it run and keeps a rule for calls like it, so they aren't asked about again: for a shell
   command its first word, or its first two for `git`, `cargo`, `npm`, `go` and the like (`Bash(cargo
   test:*)`), and for any other tool the tool. Claude adds the rule to the checkout's
@@ -1397,8 +1432,8 @@ crystal flow defs                    # the flows a run started here finds, and w
   runs, `▲` at its gate, `✓` done, `✗` failed, `■` cut short and `–` cancelled. A step's row is its task's
   session, so selecting it shows the step's transcript.
 - At a gate, the step's session waits on you the way an agent asking something does: you're told, `u` goes to
-  it, and `ls` says `waiting`. `g` goes on, and `f` asks for your notes on the footer and sends the flow back.
-  On a step that failed or was cut short, `g` runs it again.
+  it, and `ls` says `waiting`. `g` goes on, and `f` asks for your notes on the footer and sends the flow back,
+  on the step's row or in the list `U` opens. On a step that failed or was cut short, `g` runs it again.
 - The new-session panel offers the flows in your config file after your profiles, `flow: ship`; what you type
   as the task is the goal.
 - Runs are kept with the sessions, in crystal's database. After a restart, a run waiting at a gate waits

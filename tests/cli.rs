@@ -1239,7 +1239,7 @@ fn a_question_mark_shows_every_key_and_the_next_key_only_closes_it() {
     tui.shows("? keys");
     tui.type_keys("?");
     tui.shows("In the sidebar");
-    tui.shows("next needing you");
+    tui.shows("next/all needing you");
     tui.shows("With the mouse");
 
     // q puts the keys away; it doesn't quit.
@@ -9380,4 +9380,79 @@ fn a_session_crystal_named_takes_its_name_from_its_first_prompt() {
     crystal.ok(&["send", "claude", "hello"]);
     prompt("claude", "Write the docs");
     assert!(crystal.row("claude").is_some());
+}
+
+#[test]
+fn the_timeline_shows_what_happens_as_it_happens_and_enter_goes_to_the_session() {
+    let crystal = Crystal::new();
+    crystal.ok(&["new", "-d", "-n", "worker", "sleep", "30"]);
+    crystal.ok(&["new", "-d", "-n", "other", "sleep", "30"]);
+    let mut tui = crystal.tui();
+    tui.shows("❯ other");
+    tui.type_keys("a");
+    tui.shows("session.started");
+    tui.shows("worker");
+
+    // While it's open, what happens comes in on top.
+    crystal.ok(&["rename", "worker", "builder"]);
+    tui.shows("was worker");
+    tui.type_keys("renamed");
+    tui.hides("session.started");
+
+    // Enter goes to the session the line is about, by the name it has now.
+    tui.type_keys("\r");
+    tui.hides("session.renamed");
+    eventually("builder is selected", || {
+        let text = tui.text();
+        text.lines()
+            .last()
+            .is_some_and(|footer| footer.contains("builder"))
+    });
+}
+
+#[test]
+fn a_permission_is_answered_from_the_list_of_what_needs_you() {
+    let crystal = Crystal::new();
+    let dir = crystal.dir.path();
+    let path = path_with(&print_claude(dir));
+    crystal.ok(&["new", "-d", "-n", "quiet", "sleep", "30"]);
+    start_task(&crystal, &path, "fixer", "ASK first");
+    eventually("the task waits on the user", || {
+        status(&crystal, "fixer") == "waiting"
+    });
+
+    let mut tui = crystal.tui();
+    tui.type_keys("U");
+    tui.shows("needs you · 1 waiting on you");
+    tui.shows("Bash cargo test");
+    tui.type_keys("y");
+    let answer: serde_json::Value = serde_json::from_str(&answers(dir, 1)[0]).unwrap();
+    assert_eq!(answer["response"]["response"]["behavior"], "allow");
+
+    // The list stays open, and follows: answered, the task carries on, and
+    // finishes its turn in the pane behind the list, seen.
+    tui.shows("nothing needs you");
+    eventually("the task is done", || status(&crystal, "fixer") == "idle");
+}
+
+#[test]
+fn coming_back_the_footer_says_what_happened_while_you_were_away() {
+    let crystal = Crystal::new();
+    let mut tui = crystal.tui();
+    tui.type_keys("q");
+    assert!(tui.exit());
+
+    crystal.ok(&["new", "-d", "-n", "fixer", "-t", "tidy up", "sleep", "30"]);
+    crystal.ok(&["done", "-n", "fixer", "tidied"]);
+    crystal.ok(&[
+        "new", "-d", "-n", "breaker", "-t", "break it", "sleep", "30",
+    ]);
+    crystal.ok(&["done", "-n", "breaker", "--failed", "it", "held"]);
+
+    let mut tui = crystal.tui();
+    tui.shows("while you were away: 1 task done · 1 failed");
+    // `a` opens the timeline with what came since marked.
+    tui.type_keys("a");
+    tui.shows("task.closed");
+    tui.shows(" • ");
 }

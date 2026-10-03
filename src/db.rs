@@ -41,6 +41,9 @@ pub const LAYOUTS: &str = "layouts";
 /// What the diff view keeps: the files marked reviewed, and whether it
 /// lists them as a tree.
 pub const DIFF: &str = "diff";
+/// The latest event the user had seen when the TUI last knew they were
+/// looking: where "while you were away" counts from.
+pub const SEEN: &str = "seen";
 
 /// How long a write waits for another to finish: the daemon and every TUI
 /// share the one database.
@@ -469,6 +472,19 @@ impl Db {
             "SELECT json FROM events WHERE {from} ?1 ORDER BY seq"
         ))?;
         let rows = statement.query_map(params![value], |row| {
+            Ok(from_json::<Event>(&row.get::<_, String>(0)?))
+        })?;
+        readable(rows, "an event")
+    }
+
+    /// The newest `count` events from before the one numbered `before`, or
+    /// from the end of the log without it, the newest first: a page of the
+    /// TUI's timeline.
+    pub fn events_before(&self, before: Option<u64>, count: usize) -> Result<Vec<Event>> {
+        let mut statement = self.conn.prepare(
+            "SELECT json FROM events WHERE ?1 IS NULL OR seq < ?1 ORDER BY seq DESC LIMIT ?2",
+        )?;
+        let rows = statement.query_map(params![before, count], |row| {
             Ok(from_json::<Event>(&row.get::<_, String>(0)?))
         })?;
         readable(rows, "an event")
@@ -1383,6 +1399,24 @@ mod tests {
         let mut db = Db::open(&socket).unwrap();
         assert!(db.backlog(app).unwrap().items.is_empty());
         assert!(old.join("backlog.json.broken").exists());
+    }
+
+    #[test]
+    fn the_timeline_reads_the_log_back_a_page_at_a_time_the_newest_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&socket_in(&dir)).unwrap();
+        for seq in 1..=5 {
+            let event = Event {
+                seq,
+                at: seq * 1000,
+                ..Event::about_project(crate::events::Kind::BacklogAdded, "/code/app".into())
+            };
+            db.add_event(&event).unwrap();
+        }
+        let seqs = |events: Vec<Event>| -> Vec<u64> { events.iter().map(|e| e.seq).collect() };
+        assert_eq!(seqs(db.events_before(None, 2).unwrap()), [5, 4]);
+        assert_eq!(seqs(db.events_before(Some(4), 2).unwrap()), [3, 2]);
+        assert_eq!(seqs(db.events_before(Some(2), 2).unwrap()), [1]);
     }
 
     #[test]

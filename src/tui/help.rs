@@ -50,7 +50,7 @@ pub struct Key {
 
 /// Every key the TUI takes, in the order the overlay lists them.
 pub const KEYS: &[Key] = &[
-    sidebar("j/k ↓/↑", "select a session"),
+    sidebar("j/k ↓/↑ /", "select a session / find"),
     sidebar("Enter", "type into it, or rerun"),
     sidebar("Tab/Shift+Tab", "next / previous pane"),
     sidebar("Shift+arrows", "the pane that way"),
@@ -63,7 +63,7 @@ pub const KEYS: &[Key] = &[
     sidebar("r/x W", "rename, kill, rm worktree"),
     of_plugin("tasks", "c y/n/Y", "close it / answer it"),
     of_plugin("flows", "g/f", "flow: go on / send back"),
-    sidebar("u /", "next needing you / find"),
+    sidebar("u/U a", "next/all needing you, log"),
     of_plugin("github", "o/O/i", "its PR / all PRs / issues"),
     sidebar("d/p/E/G B", "diff/file/tree/grep/br"),
     of_plugin("backlog", "b", "the project's backlog"),
@@ -507,13 +507,13 @@ mod tests {
     #[test]
     fn a_key_label_lines_up_with_the_others() {
         let lines = column(LEFT, &all_rows(), &theme());
-        // Heading first, then `j/k ↓/↑`, padded out to `Tab/Shift+Tab`.
+        // Heading first, then `j/k ↓/↑ /`, padded out to `Tab/Shift+Tab`.
         let first: String = lines[1]
             .spans
             .iter()
             .map(|span| span.content.as_ref())
             .collect();
-        let padded = format!("{:<15}select a session", "j/k ↓/↑");
+        let padded = format!("{:<15}select a session / find", "j/k ↓/↑ /");
         assert_eq!(first, padded);
     }
 }

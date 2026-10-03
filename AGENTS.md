@@ -86,8 +86,8 @@ is: it's the one request every version must understand.
     changing its title and text, and its drawing
   - `pull_requests.rs`: the pull requests view (`O`): its state and keys, kept apart from I/O, reading one with
     its checks and conversation, its diff, commenting, starting a session in its worktree, and its drawing
-  - `listing.rs`: what the issues and pull requests views share: the forge's list filtered as you type, the
-    bar kept on its item, each item read whole once, the reading pane, and drawing them
+  - `listing.rs`: what the issues and pull requests views and the timeline share: a list filtered as you
+    type, the bar kept on its item, each item read whole once, the reading pane, and drawing them
   - `compose.rs`: writing back to the forge from those views: the comment box and the form that edits an
     issue, which keep what's typed until the forge takes it
   - `backlog_view.rs`: the backlog view `b` opens: its state and keys, kept apart from I/O, and its
@@ -123,6 +123,16 @@ is: it's the one request every version must understand.
   - `plugins_view.rs`: the plugins view (`X`): every plugin, on or off, with installed ones' actions, panes and
     link handlers, its keys and drawing; the event loop does the switching, runs actions and opens plugins'
     panes over the others
+  - `timeline.rs`: the timeline (`a`): the event log read back a page at a time, the newest first, and
+    followed while it's open, filtered as you type and by kind, what's new since the user was away marked,
+    the line the bar is on read whole, and its drawing; kept apart from I/O, and events of kinds it doesn't
+    know are listed by their name and what they say
+  - `needs_you.rs`: the needs-you view (`U`): everything waiting on the user, in every tab, the most urgent
+    first, from the sessions and flow runs the TUI has; answering a permission or a gate in place, the bar
+    kept on its row as rows come and go, and its drawing
+  - `away.rs`: "while you were away": when the user is gone (a quit, the terminal's focus lost for a while, or
+    no key for a while where focus isn't told), what the event log gained meanwhile counted into the
+    footer's line, and the latest event seen, which the event loop keeps in the database
   - `settings_view.rs`: the settings view (`,`): notifications, the theme, the distiller and search by meaning,
     each changed with a key, and how the model stands; the event loop writes the file (`config::set`) and,
     while it's open, reads the settings and the daemon's `EmbeddingStatus` again every half a second
@@ -201,9 +211,10 @@ is: it's the one request every version must understand.
 - `src/db.rs`: the SQLite database the daemon and the TUI keep their state in (WAL, `synchronous=NORMAL`,
   migrations by `user_version`, as docket does): the sessions to start again, flow runs, each project's backlog
   and closed tasks, the files tasks kept, the tasks waiting to start and the last task number, what background
-  tasks spent each day, the event log, and the TUI's tabs, layouts, the new-session panel's memory and the diff
-  view's reviewed marks, each a JSON document; and bringing in the JSON files from before, a project's the first
-  time it's asked for. Settings stay in the config file and memory in `memory.db`
+  tasks spent each day, the event log, read from a point on or a page at a time back from its end, and the TUI's
+  tabs, layouts, the new-session panel's memory, the diff view's reviewed marks and the latest event the user
+  had seen, each a JSON document; and bringing in the JSON files from before, a project's the first time it's
+  asked for. Settings stay in the config file and memory in `memory.db`
 - `src/project.rs`: the project a directory is in: its git main worktree, or the directory itself outside git
 - `src/tasks.rs`: tasks, sessions started with something to do: the paragraph an agent is told about
   `crystal done`, the reminder for one that ends a turn with its task open, reading a project's closed tasks

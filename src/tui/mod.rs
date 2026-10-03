@@ -8,6 +8,7 @@
 //! session list. The loop takes each event, updates the state, and draws.
 
 mod app;
+mod away;
 mod backlog_view;
 mod command_line;
 mod compose;
@@ -26,6 +27,7 @@ mod layouts;
 mod listing;
 mod memory_view;
 mod mouse;
+mod needs_you;
 mod pane;
 mod plugins_view;
 mod preview;
@@ -43,11 +45,13 @@ mod tabs;
 mod text_area;
 mod text_input;
 mod theme;
+mod timeline;
 mod tree_browser;
 mod ui;
 
 use crate::config::{self, Config};
 use crate::db::{self, Db};
+use crate::events::{Filter, Since};
 use crate::flow_run::FlowRun;
 use crate::forge::{
     Checkout, Forge, Issue, IssueDetail, PullRequest, PullRequestDetail, Repo, Topic,
@@ -57,7 +61,7 @@ use crate::plugins::{self, Context};
 use crate::profile;
 use crate::protocol::{Backlog, NewSession, Request, Response, SessionInfo, Spending, Worktree};
 use crate::{catalog, keys, links, socket, typing};
-use crate::{client, clipboard, drive, env, events, git};
+use crate::{client, clipboard, drive, env, event_log, events, git};
 use anyhow::{Context as _, Result, bail};
 use app::{Action, App, Focus, Hit, Place, PluginKey, PluginPane, Slot};
 use backlog_view::BacklogChange;
@@ -102,6 +106,10 @@ const GREP_PAUSE: Duration = Duration::from_millis(150);
 /// asked about straight away, and so is every one when crystal has just
 /// made or removed a worktree.
 const WORKTREES_EVERY: Duration = Duration::from_secs(5);
+
+/// How often the thread following the event log for the timeline looks up
+/// from waiting, to see whether the timeline is still open.
+const FOLLOW_CHECK: Duration = Duration::from_millis(250);
 
 pub enum Event {
     Key(KeyEvent),
@@ -236,6 +244,22 @@ pub enum Event {
     Spending(Spending),
     /// The settings as they are now, for the settings view.
     Settings(settings_view::Current),
+    /// The terminal has focus again, or has lost it.
+    Focus(bool),
+    /// A page of the event log, the newest first, read for the timeline
+    /// following the log under the number `feed`.
+    EventsRead {
+        feed: u64,
+        read: Result<Vec<events::Event>, String>,
+    },
+    /// An event that has just happened, for the timeline following the log
+    /// under the number `feed`.
+    Logged {
+        feed: u64,
+        event: Box<events::Event>,
+    },
+    /// What the event log gained while the user was away.
+    Away(Result<away::Tally, String>),
 }
 
 pub fn run(socket: &Path) -> Result<()> {
@@ -295,6 +319,8 @@ pub fn run(socket: &Path) -> Result<()> {
         poll_flows,
         poll_settings,
         config: config.clone(),
+        feed: Arc::new(AtomicU64::new(0)),
+        presence: away::Presence::new(events::now_ms()),
     };
     tui.app.set_agents(catalog::installed());
     let server = socket::server_of(socket).filter(|server| server != socket::DEFAULT);
@@ -311,6 +337,7 @@ pub fn run(socket: &Path) -> Result<()> {
     tui.set_sessions(sessions);
     tui.app.set_tabs(tabs::read(tui.ui(db::TABS).as_deref()));
     tui.kept_tabs = tui.app.tabs_to_keep();
+    tui.look_back_from_last_seen();
 
     let mut terminal = ratatui::try_init()?;
     let result = tui.run_with_modes(&mut terminal, events);
@@ -337,13 +364,17 @@ impl TerminalModes {
         // (1003), to underline the link under it while Ctrl is held, all
         // written the SGR way (1006). A move that changes nothing isn't
         // drawn. Then bracketed paste (2004): a paste comes whole, its
-        // lines kept, not as typed keys. Last, pushed on the terminal's
+        // lines kept, not as typed keys. Then, pushed on the terminal's
         // stack, the Kitty keyboard protocol's flags to tell apart keys the
         // old way can't, like Esc or Shift+Enter, and to say which key a
         // shifted one is (1 and 4): a program in a pane that asked for the
         // protocol gets them. A terminal without it ignores the request.
+        // Last, focus (1004): the terminal says when it gains and loses it,
+        // for "while you were away".
         let mut out = std::io::stdout();
-        out.write_all(b"\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h\x1b[?2004h\x1b[>5u")?;
+        out.write_all(
+            b"\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h\x1b[?2004h\x1b[>5u\x1b[?1004h",
+        )?;
         out.flush()?;
         Ok(TerminalModes)
     }
@@ -357,7 +388,8 @@ impl Drop for TerminalModes {
 
 fn modes_off() {
     let mut out = std::io::stdout();
-    let _ = out.write_all(b"\x1b[<u\x1b[?2004l\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l");
+    let _ =
+        out.write_all(b"\x1b[?1004l\x1b[<u\x1b[?2004l\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l");
     let _ = out.flush();
 }
 
@@ -409,6 +441,12 @@ struct Tui {
     /// not the program's under it.
     link_clicked: bool,
     quitting: bool,
+    /// The number the timeline follows the event log under, which goes up
+    /// each time it starts or stops following: a thread following under an
+    /// older number stops, and what was read under one is dropped.
+    feed: Arc<AtomicU64>,
+    /// Whether the user is there, for "while you were away".
+    presence: away::Presence,
 }
 
 impl Tui {
@@ -442,6 +480,7 @@ impl Tui {
             self.read_topic();
             self.keep_tabs();
         }
+        self.keep_seen();
         Ok(())
     }
 
@@ -485,6 +524,95 @@ impl Tui {
         }
         self.handle(event);
         true
+    }
+
+    /// As the TUI starts, has it say what happened since it was last open,
+    /// if it has been before.
+    fn look_back_from_last_seen(&mut self) {
+        match away::read_seen(self.ui(db::SEEN).as_deref()) {
+            Some(seq) => self.look_back(Since::Seq(seq)),
+            None => self.keep_seen(),
+        }
+    }
+
+    /// Has what the event log gained since `since`, when the user went
+    /// away, counted off the loop, for the footer to say. From now, they've
+    /// seen it all.
+    fn look_back(&self, since: Since) {
+        self.keep_seen();
+        let socket = self.socket.clone();
+        self.read_in_background(move || {
+            let read = event_log::read(&socket, &Filter::default(), since);
+            let tally = read.map(|events| away::Tally::of(&events));
+            Event::Away(tally.map_err(|err| format!("{err:#}")))
+        });
+    }
+
+    /// Keeps the latest event in the log as the last the user has seen,
+    /// where "while you were away" counts from the next time the TUI opens.
+    fn keep_seen(&self) {
+        let Ok(db) = &self.db else {
+            return;
+        };
+        if let Ok(seq) = db.latest_event() {
+            let _ = db.keep_ui(db::SEEN, &away::Seen { seq });
+        }
+    }
+
+    /// A key, a click or a paste: when it ends a long while without one,
+    /// the footer says what happened meanwhile.
+    fn user_is_here(&mut self) {
+        if let Some(went) = self.presence.input(events::now_ms()) {
+            self.look_back(Since::At(went));
+        }
+    }
+
+    /// Reads the newest page of the event log for the timeline, then
+    /// follows the log from there, on a thread of its own, until the
+    /// timeline closes. Subscribing from the page's newest event leaves no
+    /// gap between the two.
+    fn follow_events(&self) {
+        let feed = self.feed.fetch_add(1, Ordering::Relaxed) + 1;
+        let current = self.feed.clone();
+        let socket = self.socket.clone();
+        let events = self.events.clone();
+        thread::spawn(move || {
+            let read = read_events(&socket, None);
+            let since = match &read {
+                Ok(page) => Some(Since::Seq(page.first().map_or(0, |event| event.seq))),
+                Err(_) => None,
+            };
+            if events.send(Event::EventsRead { feed, read }).is_err() {
+                return;
+            }
+            let mut subscription = match client::subscribe(&socket, Filter::default(), since) {
+                Ok(subscription) => subscription,
+                Err(err) => {
+                    let notice = format!("couldn't follow the event log: {err:#}");
+                    let _ = events.send(Event::Notice(notice));
+                    return;
+                }
+            };
+            while current.load(Ordering::Relaxed) == feed {
+                let event = match subscription.next_before(Some(Instant::now() + FOLLOW_CHECK)) {
+                    Ok(Some(event)) => Box::new(event),
+                    Ok(None) => continue,
+                    Err(err) => {
+                        let notice = format!("stopped following the event log: {err:#}");
+                        let _ = events.send(Event::Notice(notice));
+                        return;
+                    }
+                };
+                if events.send(Event::Logged { feed, event }).is_err() {
+                    return;
+                }
+            }
+        });
+    }
+
+    /// Whether the timeline still follows the log under the number `feed`.
+    fn following(&self, feed: u64) -> bool {
+        self.feed.load(Ordering::Relaxed) == feed
     }
 
     /// Writes the tabs down when they've changed, so that they're there the
@@ -606,6 +734,9 @@ impl Tui {
     }
 
     fn handle(&mut self, event: Event) {
+        if matches!(event, Event::Key(_) | Event::Mouse(_) | Event::Paste(_)) {
+            self.user_is_here();
+        }
         match event {
             Event::Key(key) => self.on_key(key),
             Event::Mouse(mouse) => self.on_mouse(mouse),
@@ -707,6 +838,28 @@ impl Tui {
                     self.config_changed(config);
                 }
                 self.app.show_settings(current);
+            }
+            Event::Focus(true) => {
+                if let Some(went) = self.presence.focus_gained(events::now_ms()) {
+                    self.look_back(Since::At(went));
+                }
+            }
+            Event::Focus(false) => {
+                self.presence.focus_lost(events::now_ms());
+                self.keep_seen();
+            }
+            Event::EventsRead { feed, read } if self.following(feed) => {
+                if let Some(action) = self.app.events_read(read) {
+                    self.carry_out(action);
+                }
+            }
+            Event::Logged { feed, event } if self.following(feed) => self.app.logged(*event),
+            // Read for a timeline that has closed since.
+            Event::EventsRead { .. } | Event::Logged { .. } => {}
+            Event::Away(Ok(tally)) => self.app.set_away(&tally),
+            Event::Away(Err(reason)) => {
+                self.app
+                    .notify(format!("couldn't read the event log: {reason}"));
             }
         }
     }
@@ -1162,6 +1315,18 @@ impl Tui {
                 };
                 self.keep_layouts(&kept)?;
                 self.app.restore_layout(tabs, &name);
+            }
+            Action::FollowEvents => self.follow_events(),
+            Action::StopFollowing => {
+                self.feed.fetch_add(1, Ordering::Relaxed);
+            }
+            Action::ReadOlderEvents(before) => {
+                let feed = self.feed.load(Ordering::Relaxed);
+                let socket = self.socket.clone();
+                self.read_in_background(move || Event::EventsRead {
+                    feed,
+                    read: read_events(&socket, Some(before)),
+                });
             }
             Action::RemoveLayout(which) => {
                 let mut kept = self.layouts().map_err(anyhow::Error::msg)?;
@@ -1953,6 +2118,13 @@ fn list_sessions(socket: &Path, start: bool) -> Result<Vec<SessionInfo>> {
     }
 }
 
+/// A page of the event log of the daemon at `socket`, the newest first:
+/// its end, or from before the event numbered `before`.
+fn read_events(socket: &Path, before: Option<u64>) -> Result<Vec<events::Event>, String> {
+    let page = Db::open(socket).and_then(|db| db.events_before(before, timeline::PAGE));
+    page.map_err(|err| format!("{err:#}"))
+}
+
 /// Every flow run, or none when the daemon can't say.
 fn list_flows(socket: &Path) -> Vec<FlowRun> {
     match client::ask(socket, &Request::ListFlows, false) {
@@ -1971,6 +2143,8 @@ fn spawn_input_reader(events: Sender<Event>) {
                 TerminalEvent::Mouse(mouse) => Event::Mouse(mouse),
                 TerminalEvent::Paste(text) => Event::Paste(text),
                 TerminalEvent::Resize(..) => Event::Resize,
+                TerminalEvent::FocusGained => Event::Focus(true),
+                TerminalEvent::FocusLost => Event::Focus(false),
                 _ => continue,
             };
             if events.send(event).is_err() {

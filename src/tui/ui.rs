@@ -15,6 +15,7 @@ use super::issues;
 use super::launcher;
 use super::layouts::{self, LayoutsView};
 use super::memory_view;
+use super::needs_you;
 use super::pane::Pane;
 use super::plugins_view;
 use super::profiles;
@@ -27,6 +28,7 @@ use super::status::Status;
 use super::switcher;
 use super::tabs::Tab;
 use super::theme::Theme;
+use super::timeline;
 use super::tree_browser;
 use crate::flow_run::RunState;
 use crate::protocol::{SessionInfo, State, TaskState};
@@ -426,6 +428,12 @@ pub fn draw(frame: &mut Frame, app: &App, panes: &[Pane], overlay: Option<&Pane>
     }
     if let Some(view) = app.layouts_view() {
         layouts::draw(frame, view, look.theme, look.now, middle);
+    }
+    if let Some(view) = app.timeline_view() {
+        timeline::draw(frame, view, look.theme, look.now * 1000, middle);
+    }
+    if let Some(view) = app.needs_you_view() {
+        needs_you::draw(frame, view, look.theme, look.now, middle);
     }
     if let Some(panel) = app.launcher() {
         // Over the panes, beside the sidebar.
@@ -998,6 +1006,10 @@ fn draw_footer(frame: &mut Frame, app: &App, panes: &[Pane], look: &Look, area: 
         frame.render_widget(hint_spans(settings_view::HINTS, theme), area);
     } else if let Some(prompt) = app.prompt() {
         draw_prompt(frame, theme, prompt, area);
+    } else if let Some(view) = app.needs_you_view() {
+        draw_notice_or(frame, app.notice(), needs_you::hints(view), theme, area);
+    } else if app.timeline_view().is_some() {
+        draw_notice_or(frame, app.notice(), timeline::HINTS, theme, area);
     } else if let Some(view) = app.issues_view() {
         draw_notice_or(frame, app.notice(), issues::hints(view), theme, area);
     } else if let Some(view) = app.pull_requests_view() {
@@ -1021,12 +1033,30 @@ fn draw_footer(frame: &mut Frame, app: &App, panes: &[Pane], look: &Look, area: 
     } else if let Some(notice) = app.notice() {
         let notice = Line::styled(format!(" {notice}"), Style::new().fg(theme.failed));
         frame.render_widget(notice, area);
+    } else if let Some(away) = app.away_line() {
+        frame.render_widget(away_line(away, theme), area);
     } else {
         let right = footer_right(app, theme);
         let room = usize::from(area.width).saturating_sub(right.width() + 1);
         frame.render_widget(hints_line(app, copying, theme, area.width, room), area);
         frame.render_widget(right.right_aligned(), area);
     }
+}
+
+/// What happened while the user was away, `while you were away:` standing
+/// out, and the keys that show more.
+fn away_line<'a>(away: &str, theme: &Theme) -> Line<'a> {
+    let (lead, counts) = away.split_once(": ").unwrap_or((away, ""));
+    let mut spans = vec![
+        Span::styled(
+            format!(" {lead}: "),
+            Style::new().fg(theme.accent).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(counts.to_string(), Style::new().fg(theme.text)),
+        Span::raw("  "),
+    ];
+    spans.extend(hint_spans(&[("a", "timeline"), ("U", "needs you")], theme).spans);
+    Line::from(spans)
 }
 
 /// The viewer of the session the pane at `slot` shows, once it has one.

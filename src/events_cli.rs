@@ -99,8 +99,9 @@ fn line(event: &Event, now: u64) -> String {
 
 /// When something happened, in milliseconds since the Unix epoch, as
 /// short as it can be said from `now`: `14:03:07` today, `09-24 14:03`
-/// earlier this year, and the date before that.
-fn when(at: u64, now: u64) -> String {
+/// earlier this year, and the date before that. The TUI's timeline says it
+/// the same way.
+pub fn when(at: u64, now: u64) -> String {
     let at = local(at);
     let now = local(now);
     let (year, month, day) = (at.tm_year + 1900, at.tm_mon + 1, at.tm_mday);
