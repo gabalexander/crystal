@@ -177,10 +177,15 @@ is: it's the one request every version must understand.
 - `src/spending.rs`: what background tasks have spent today, kept in the database by the day: the TUI footer's
   `$X today`, and what `daily_budget_usd` is held against
 - `src/protocol.rs`: requests and responses, one JSON line each, and the frames an attached client sends
-- `src/socket.rs`: where the socket lives, and whether a socket is the default one, however it's spelled and
-  whoever starts its daemon, so the same socket always gets the same state
-- `src/state.rs`: where the daemon's state is: the database, and the files kept before it (the sessions, the
-  flow runs, each project's directory); a running session as it's written down to start it again
+- `src/socket.rs`: where the socket lives: a server's, named after it in crystal's socket directory, or one
+  given by its path; which a command is for (`-S`, `--server`, `CRYSTAL_SOCKET`, then `CRYSTAL_SERVER`); and
+  which server a socket is, however it's spelled and whoever starts its daemon, so the same socket always gets
+  the same state
+- `src/state.rs`: where the daemon's state is: a server's directory in the state dir (the default server's is
+  the state dir itself), or beside a socket given by its path; the database, and the files kept before it (the
+  sessions, the flow runs, each project's directory); a running session as it's written down to start it again
+- `src/server_cli.rs`: `crystal server`: every server with whether it's running and how many sessions it has,
+  stopping one, and deleting a stopped one's state
 - `src/db.rs`: the SQLite database the daemon and the TUI keep their state in (WAL, `synchronous=NORMAL`,
   migrations by `user_version`, as docket does): the sessions to start again, flow runs, each project's backlog
   and closed tasks, the tasks waiting to start and the last task number, what background tasks spent each day,
@@ -255,4 +260,6 @@ is: it's the one request every version must understand.
   agents, so no real agent is found or run, and a background task's `claude` is a fake that speaks stream-json,
   asks for permissions and takes interrupts. vt100 stands in for the user's own terminal: a second emulator,
   apart from crystal's. A test that copies runs the TUI as over ssh (`SSH_TTY` set), so it asks the terminal
-  with OSC 52 and never touches the machine's clipboard
+  with OSC 52 and never touches the machine's clipboard. A test of servers by name runs crystal without
+  `--socket`, in a runtime dir and a state dir of its own, with `CRYSTAL_SOCKET` and `CRYSTAL_SERVER` taken
+  out of its environment, so it never reaches the user's own daemon

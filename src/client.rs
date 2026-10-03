@@ -34,10 +34,13 @@ pub fn ask(socket: &Path, request: &Request, start: bool) -> Result<Option<Respo
     protocol::send_request(&conn, request)?;
     // A daemon from before requests carried their version can't say that
     // it's another version: it hangs up on what it doesn't understand.
-    let response = protocol::recv(BufReader::new(&conn))?.context(
-        "the daemon hung up without answering; if crystal was just upgraded, \
-         run `crystal restart-server`",
-    )?;
+    let response = protocol::recv(BufReader::new(&conn))?.with_context(|| {
+        format!(
+            "the daemon hung up without answering; if crystal was just upgraded, \
+             run `{} restart-server`",
+            socket::crystal_for(socket)
+        )
+    })?;
     match response {
         Response::Error { message } => bail!(message),
         response => Ok(Some(response)),

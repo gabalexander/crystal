@@ -508,8 +508,9 @@ fn draw_plugin_pane(frame: &mut Frame, open: &PluginPane, pane: &Pane, look: &Lo
     }
 }
 
-/// crystal's name and the tabs on the left, and on the right how many
-/// sessions there are and how many wait on the user.
+/// crystal's name and the tabs on the left, and on the right the server,
+/// when it isn't the default, then how many sessions there are and how
+/// many wait on the user.
 fn draw_top_bar(frame: &mut Frame, app: &App, look: &Look, area: Rect) {
     let theme = look.theme;
     let name = Line::from(vec![
@@ -521,7 +522,8 @@ fn draw_top_bar(frame: &mut Frame, app: &App, look: &Look, area: Rect) {
     ]);
     frame.render_widget(name, area);
     draw_tabs(frame, app, look, area);
-    frame.render_widget(summary(app.sessions(), theme).right_aligned(), area);
+    let summary = summary(app.sessions(), app.server(), theme);
+    frame.render_widget(summary.right_aligned(), area);
 }
 
 /// The tabs, after crystal's name in the top bar in `area`: the one in
@@ -532,7 +534,7 @@ fn draw_tabs(frame: &mut Frame, app: &App, look: &Look, area: Rect) {
     let theme = look.theme;
     let in_front = app.tabs().current_index();
     let statuses = tab_statuses(app);
-    let labels = tab_labels(app.tabs().all(), &statuses, area.width);
+    let labels = tab_labels(app.tabs().all(), &statuses, tabs_width(app, area));
     for (index, (column, label)) in labels.into_iter().enumerate() {
         let style = if index == in_front {
             theme
@@ -604,11 +606,25 @@ fn tab_label(number: usize, tab: &Tab, status: Option<Status>, named: bool) -> S
     }
 }
 
+/// How much of the top bar in `area` the tabs share with the summary: all
+/// of it, but for the server's name the summary starts with, if it does.
+fn tabs_width(app: &App, area: Rect) -> u16 {
+    let server = app
+        .server()
+        .map_or(0, |server| width_of(&server_label(server)));
+    area.width.saturating_sub(server)
+}
+
+/// What the summary says of the server, before the sessions.
+fn server_label(server: &str) -> String {
+    format!("{server} · ")
+}
+
 /// The tab drawn at `column` of the top bar in `area`, if there's one
 /// there.
 fn tab_hit(app: &App, area: Rect, column: u16) -> Hit {
     let column = column - area.x;
-    let labels = tab_labels(app.tabs().all(), &tab_statuses(app), area.width);
+    let labels = tab_labels(app.tabs().all(), &tab_statuses(app), tabs_width(app, area));
     let under = labels.iter().position(|(start, label)| {
         let end = start + width_of(label);
         (*start..end).contains(&column)
@@ -622,14 +638,19 @@ fn width_of(text: &str) -> u16 {
 }
 
 /// "6 sessions · 2 waiting": the waiting count only when some are, in the
-/// color that says so.
-pub fn summary<'a>(sessions: &[SessionInfo], theme: &Theme) -> Line<'a> {
+/// color that says so; "work · 6 sessions" on a server that isn't the
+/// default.
+pub fn summary<'a>(sessions: &[SessionInfo], server: Option<&str>, theme: &Theme) -> Line<'a> {
     let count = sessions.len();
     let noun = if count == 1 { "session" } else { "sessions" };
-    let mut spans = vec![Span::styled(
+    let mut spans: Vec<Span> = server
+        .map(|server| Span::styled(server_label(server), Style::new().fg(theme.muted)))
+        .into_iter()
+        .collect();
+    spans.push(Span::styled(
         format!("{count} {noun}"),
         Style::new().fg(theme.muted),
-    )];
+    ));
     let waiting = sessions
         .iter()
         .filter(|session| Status::of(session) == Status::Waiting)
@@ -1626,6 +1647,19 @@ mod tests {
         assert!(text[0].trim_end().ends_with("1 session"), "{}", text[0]);
     }
 
+    #[test]
+    fn the_top_bar_names_a_server_that_isn_t_the_default_before_the_count() {
+        let mut app = app_with_three_tabs();
+        app.set_server(Some("work".into()));
+        let text = screen_text(&app);
+        assert!(
+            text[0].trim_end().ends_with("work · 1 session"),
+            "{}",
+            text[0]
+        );
+        assert!(text[0].contains(" 2 review "), "{}", text[0]);
+    }
+
     /// An app with one session and three tabs, the second named `review`
     /// and in front.
     fn app_with_three_tabs() -> App {
@@ -1731,11 +1765,11 @@ mod tests {
     fn the_summary_counts_the_waiting_only_when_some_wait() {
         let theme = theme();
         let quiet = vec![session("a", State::Running), session("b", State::Running)];
-        assert_eq!(text_of(&summary(&quiet, &theme)), "2 sessions ");
+        assert_eq!(text_of(&summary(&quiet, None, &theme)), "2 sessions ");
 
         let mut waiting = quiet.clone();
         waiting[1].activity = Some(Activity::Waiting);
-        let line = summary(&waiting, &theme);
+        let line = summary(&waiting, None, &theme);
         assert_eq!(text_of(&line), "2 sessions · 1 waiting ");
         let count = line.spans.iter().find(|span| span.content == "1 waiting");
         assert_eq!(count.unwrap().style.fg, Some(theme.waiting));

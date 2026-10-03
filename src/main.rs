@@ -42,6 +42,7 @@ mod project;
 mod protocol;
 mod remote;
 mod secrets;
+mod server_cli;
 mod session;
 mod shell;
 mod skill;
@@ -72,9 +73,16 @@ use std::time::Duration;
 #[derive(Parser)]
 #[command(version)]
 struct Cli {
-    /// The daemon's socket [default: $XDG_RUNTIME_DIR/crystal/default.sock,
-    /// or /tmp/crystal-<uid>/default.sock]
-    #[arg(short = 'S', long, global = true, env = "CRYSTAL_SOCKET")]
+    /// The server to use: a daemon of its own, with its own sessions and
+    /// state, made the first time it's named [env: CRYSTAL_SERVER]
+    /// [default: default]
+    #[arg(short = 'L', long, global = true, value_name = "NAME")]
+    server: Option<String>,
+
+    /// The daemon's socket, in place of a server's [env: CRYSTAL_SOCKET]
+    /// [default: $XDG_RUNTIME_DIR/crystal/default.sock, or
+    /// /tmp/crystal-<uid>/default.sock]
+    #[arg(short = 'S', long, global = true, conflicts_with = "server")]
     socket: Option<PathBuf>,
 
     #[command(subcommand)]
@@ -382,6 +390,18 @@ enum Command {
     /// Running sessions come back: Claude Code in its conversation, other
     /// programs from the start.
     RestartServer,
+    /// List the servers, each a daemon with its own sessions and state: the
+    /// default one and those named with --server, with whether each is
+    /// running and how many sessions it has. Or stop one, or delete one.
+    #[command(visible_alias = "servers")]
+    Server {
+        /// With no command: print them as JSON.
+        #[arg(long)]
+        json: bool,
+
+        #[command(subcommand)]
+        command: Option<ServerCommand>,
+    },
     /// Show where the config file is, and the settings in effect, as the
     /// file would hold them.
     Config,
@@ -644,6 +664,17 @@ enum FlowCommand {
 }
 
 #[derive(Subcommand)]
+enum ServerCommand {
+    /// Stop a server and every session in it, as kill-server does.
+    Stop { name: String },
+    /// Delete a stopped server: its saved sessions, tabs, layouts, backlog,
+    /// tasks and memory. Refuses while it's running, and for the default
+    /// server.
+    #[command(visible_alias = "rm")]
+    Delete { name: String },
+}
+
+#[derive(Subcommand)]
 enum WorktreeCommand {
     /// Remove a worktree, given its directory or its branch. Refuses while
     /// a session runs in it, and when it has changes not committed.
@@ -766,7 +797,7 @@ fn main() -> ExitCode {
 fn run(cli: Cli) -> Result<()> {
     // Made absolute here: the daemon runs from `/`, where a relative path
     // would name another socket.
-    let socket = std::path::absolute(cli.socket.unwrap_or_else(socket::default_path))?;
+    let socket = std::path::absolute(socket::chosen(cli.socket, cli.server.clone())?)?;
     let Some(command) = cli.command else {
         return tui::run(&socket);
     };
@@ -925,6 +956,11 @@ fn run(cli: Cli) -> Result<()> {
                 println!("no daemon was running");
             }
         }
+        Command::Server { json, command } => match command {
+            None => server_cli::list(json)?,
+            Some(ServerCommand::Stop { name }) => server_cli::stop(&name)?,
+            Some(ServerCommand::Delete { name }) => server_cli::delete(&name)?,
+        },
         Command::Config => print_config()?,
         Command::Remember {
             kind,
@@ -990,8 +1026,12 @@ fn run(cli: Cli) -> Result<()> {
         Command::Ssh {
             install,
             destination,
-            args,
+            mut args,
         } => {
+            // A server named for `crystal ssh` is one over there.
+            if let Some(server) = cli.server {
+                args.splice(0..0, ["--server".to_string(), server]);
+            }
             let code = remote::run(&destination, &args, install)?;
             // The remote command's own exit code is crystal's.
             std::process::exit(code);

@@ -24,7 +24,7 @@ use crate::protocol::{BacklogItem, PendingTask, TaskOutcome, TaskRecord};
 use crate::state::{self, SavedSession};
 use crate::tasks;
 use anyhow::{Context, Result};
-use rusqlite::{Connection, Row, Transaction, TransactionBehavior, params};
+use rusqlite::{Connection, OpenFlags, Row, Transaction, TransactionBehavior, params};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::fs;
@@ -580,6 +580,21 @@ impl Db {
     }
 }
 
+/// How many sessions the daemon at `socket` has written down to start
+/// again, for a server that isn't running: read only, since it's only
+/// being looked at, so a database is neither made, brought up to date nor
+/// given what was kept before it. No database yet is none.
+pub fn saved_session_count(socket: &Path) -> Result<usize> {
+    let file = state::db_path(socket);
+    if !file.exists() {
+        return Ok(0);
+    }
+    let conn = Connection::open_with_flags(&file, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .with_context(|| format!("couldn't open {}", file.display()))?;
+    let count = conn.query_row("SELECT count(*) FROM sessions", [], |row| row.get(0))?;
+    Ok(count)
+}
+
 /// Brings the database up to date: makes its tables, or adds what a newer
 /// crystal keeps.
 fn migrate(conn: &mut Connection) -> Result<()> {
@@ -1051,6 +1066,19 @@ mod tests {
                 .items
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn the_sessions_a_stopped_server_will_start_again_are_counted_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = socket_in(&dir);
+        assert_eq!(saved_session_count(&socket).unwrap(), 0);
+        assert!(!state::db_path(&socket).exists());
+        Db::open(&socket)
+            .unwrap()
+            .save_sessions(&[saved("a"), saved("b")])
+            .unwrap();
+        assert_eq!(saved_session_count(&socket).unwrap(), 2);
     }
 
     #[test]

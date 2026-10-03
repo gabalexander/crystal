@@ -56,7 +56,7 @@ use crate::memory::{self, Listed, Memory};
 use crate::plugins::{self, Context};
 use crate::profile;
 use crate::protocol::{Backlog, NewSession, Request, Response, SessionInfo, Spending, Worktree};
-use crate::{catalog, keys, typing};
+use crate::{catalog, keys, socket, typing};
 use crate::{client, clipboard, drive, env, events, git};
 use anyhow::{Context as _, Result, bail};
 use app::{Action, App, Focus, Hit, Place, PluginKey, PluginPane, Slot};
@@ -293,6 +293,8 @@ pub fn run(socket: &Path) -> Result<()> {
         config: config.clone(),
     };
     tui.app.set_agents(catalog::installed());
+    let server = socket::server_of(socket).filter(|server| server != socket::DEFAULT);
+    tui.app.set_server(server);
     tui.app.set_launch_settings(&config);
     tui.app.set_features(&config);
     tui.app.set_plugin_keys(plugin_keys(&config));

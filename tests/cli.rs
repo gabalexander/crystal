@@ -2742,6 +2742,198 @@ fn the_default_socket_keeps_its_state_however_its_daemon_is_started() {
     assert!(!link.join("crystal/default.db").exists());
 }
 
+/// Servers named with `--server`, in a runtime dir and a state dir of the
+/// test's own. crystal runs without `--socket`, and without the
+/// `CRYSTAL_SOCKET` or `CRYSTAL_SERVER` of a session the tests may be run
+/// in, which would reach the user's own daemon.
+struct Servers {
+    crystal: Crystal,
+}
+
+impl Servers {
+    fn new() -> Servers {
+        Servers {
+            crystal: Crystal::new(),
+        }
+    }
+
+    fn dir(&self) -> &Path {
+        self.crystal.dir.path()
+    }
+
+    /// The test's `XDG_RUNTIME_DIR`: the sockets are in its `crystal`.
+    fn run_dir(&self) -> PathBuf {
+        self.dir().join("run")
+    }
+
+    /// Where each server but the default keeps its state.
+    fn kept(&self) -> PathBuf {
+        self.dir().join("state/crystal/servers")
+    }
+
+    fn command(&self, args: &[&str]) -> Command {
+        let mut command = Command::new(CRYSTAL);
+        command
+            .args(args)
+            .current_dir(self.dir())
+            .env_remove("CRYSTAL_SOCKET")
+            .env_remove("CRYSTAL_SERVER")
+            .env("XDG_RUNTIME_DIR", self.run_dir())
+            .env("XDG_STATE_HOME", self.dir().join("state"))
+            .env("XDG_CONFIG_HOME", self.crystal.config_home())
+            .env("CLAUDE_CONFIG_DIR", self.crystal.claude_config_dir())
+            .envs(PLAIN_GIT);
+        command
+    }
+
+    fn ok(&self, args: &[&str]) -> String {
+        let out = self.command(args).output().unwrap();
+        assert!(
+            out.status.success(),
+            "crystal {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap()
+    }
+
+    fn fails(&self, args: &[&str]) -> String {
+        let out = self.command(args).output().unwrap();
+        assert!(!out.status.success(), "crystal {args:?} succeeded");
+        String::from_utf8(out.stderr).unwrap()
+    }
+
+    /// The names of the sessions `ls` lists, run with `args` before it.
+    fn sessions(&self, args: &[&str]) -> Vec<String> {
+        let ls = [args, &["ls"]].concat();
+        let listed = self.ok(&ls);
+        let names = listed
+            .lines()
+            .skip(1)
+            .filter_map(|line| line.split(' ').next());
+        names.map(String::from).collect()
+    }
+}
+
+impl Drop for Servers {
+    /// Stops every server the test started.
+    fn drop(&mut self) {
+        let sockets = std::fs::read_dir(self.run_dir().join("crystal"));
+        for entry in sockets.into_iter().flatten().flatten() {
+            let socket = entry.path();
+            if socket
+                .extension()
+                .is_some_and(|extension| extension == "sock")
+            {
+                let _ = self
+                    .command(&["kill-server"])
+                    .arg("--socket")
+                    .arg(&socket)
+                    .output();
+            }
+        }
+    }
+}
+
+#[test]
+fn two_named_servers_run_side_by_side_each_with_its_own_sessions_and_state() {
+    let servers = Servers::new();
+    let new = |server: &str, name: &str| {
+        servers.ok(&["--server", server, "new", "-d", "-n", name, "sleep", "30"])
+    };
+    assert_eq!(new("work", "one"), "one\n");
+    assert_eq!(new("side", "two"), "two\n");
+
+    assert_eq!(servers.sessions(&["--server", "work"]), ["one"]);
+    assert_eq!(servers.sessions(&["-L", "side"]), ["two"]);
+    let ls = servers
+        .command(&["ls"])
+        .env("CRYSTAL_SERVER", "side")
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&ls.stdout).contains("two"));
+    // The default server is left alone, and isn't started.
+    assert!(servers.sessions(&[]).is_empty());
+    assert!(!servers.run_dir().join("crystal/default.sock").exists());
+
+    // Each keeps its state in a directory of its own in the state dir,
+    // which a reboot doesn't empty, rather than beside its socket.
+    assert!(servers.kept().join("work/crystal.db").exists());
+    assert!(servers.kept().join("side/crystal.db").exists());
+    assert!(!servers.run_dir().join("crystal/work.db").exists());
+
+    assert_eq!(
+        servers.ok(&["server"]),
+        "NAME     STATE    SESSIONS\n\
+         default  stopped  0\n\
+         side     running  1\n\
+         work     running  1\n"
+    );
+    let listed: serde_json::Value =
+        serde_json::from_str(&servers.ok(&["servers", "--json"])).unwrap();
+    let work = &listed[2];
+    assert_eq!(work["name"], "work");
+    assert_eq!(work["running"], true);
+    assert_eq!(work["sessions"], 1);
+    let state = servers.kept().join("work");
+    assert_eq!(work["state"], state.to_str().unwrap());
+}
+
+#[test]
+fn a_session_in_a_named_server_reaches_its_own_server() {
+    let servers = Servers::new();
+    servers.ok(&[
+        "--server", "work", "new", "-d", "-n", "other", "sleep", "30",
+    ]);
+    let script = format!("echo $CRYSTAL_SERVER > server; '{CRYSTAL}' ls > seen; sleep 30");
+    let new = [
+        "--server", "side", "new", "-d", "-n", "inner", "sh", "-c", &script,
+    ];
+    servers.ok(&new);
+    assert_eq!(written(&servers.dir().join("server")), "side\n");
+    let seen = written(&servers.dir().join("seen"));
+    assert!(seen.contains("inner"), "{seen}");
+    assert!(!seen.contains("other"), "{seen}");
+}
+
+#[test]
+fn a_server_stops_by_name_and_its_state_is_deleted_once_it_has() {
+    let servers = Servers::new();
+    for (server, name) in [("work", "one"), ("side", "two")] {
+        servers.ok(&["--server", server, "new", "-d", "-n", name, "sleep", "30"]);
+    }
+    let refused = servers.fails(&["server", "delete", "work"]);
+    assert!(refused.contains("the server work is running"), "{refused}");
+
+    servers.ok(&["server", "stop", "work"]);
+    assert!(!servers.run_dir().join("crystal/work.sock").exists());
+    assert_eq!(servers.sessions(&["--server", "side"]), ["two"]);
+    assert_eq!(
+        servers.ok(&["server"]),
+        "NAME     STATE    SESSIONS\n\
+         default  stopped  0\n\
+         side     running  1\n\
+         work     stopped  0\n"
+    );
+    let again = servers.fails(&["server", "stop", "work"]);
+    assert!(again.contains("the server work isn't running"), "{again}");
+
+    servers.ok(&["server", "delete", "work"]);
+    assert!(!servers.kept().join("work").exists());
+    assert!(!servers.run_dir().join("crystal/work.log").exists());
+    assert!(servers.kept().join("side").exists());
+    let listed = servers.ok(&["server"]);
+    assert!(!listed.contains("work"), "{listed}");
+    let gone = servers.fails(&["server", "rm", "work"]);
+    assert!(gone.contains("there's no server called work"), "{gone}");
+    let default = servers.fails(&["server", "delete", "default"]);
+    assert!(
+        default.contains("the default server can't be deleted"),
+        "{default}"
+    );
+    let bad = servers.fails(&["--server", "../work", "ls"]);
+    assert!(bad.contains("can't name a server"), "{bad}");
+}
+
 #[test]
 fn a_claude_session_picked_up_again_isn_t_asked_its_task_again() {
     let crystal = Crystal::new();

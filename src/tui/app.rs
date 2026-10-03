@@ -712,6 +712,9 @@ pub struct App {
     flows_on: bool,
     /// What background tasks have spent today, as the daemon last said.
     spending: Option<Spending>,
+    /// The server the TUI is on, when it isn't the default one: the top bar
+    /// names it.
+    server: Option<String>,
 }
 
 impl App {
@@ -770,6 +773,7 @@ impl App {
             flow_defs: Vec::new(),
             flows_on: true,
             spending: None,
+            server: None,
         }
     }
 
@@ -891,6 +895,16 @@ impl App {
     /// The agents installed on this machine, for the new-session panel.
     pub fn set_agents(&mut self, agents: Vec<&'static Agent>) {
         self.agents = agents;
+    }
+
+    /// Takes the server the TUI is on, when it isn't the default one.
+    pub fn set_server(&mut self, server: Option<String>) {
+        self.server = server;
+    }
+
+    /// The server the TUI is on, when it isn't the default one.
+    pub fn server(&self) -> Option<&str> {
+        self.server.as_deref()
     }
 
     /// Takes what the config file says about starting sessions: its
