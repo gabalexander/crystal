@@ -33,9 +33,10 @@ pub struct SavedSession {
 
 /// The database of the daemon at `socket`. The default socket lives in
 /// /tmp, which a reboot empties, so its database is in the user's state
-/// directory instead. Any other socket keeps its own beside it.
+/// directory instead, whoever starts the daemon ([`socket::is_default`]).
+/// Any other socket keeps its own beside it.
 pub fn db_path(socket: &Path) -> PathBuf {
-    if socket == socket::default_path() {
+    if socket::is_default(socket) {
         state_dir().join("crystal.db")
     } else {
         socket.with_extension("db")
@@ -45,7 +46,7 @@ pub fn db_path(socket: &Path) -> PathBuf {
 /// Where the sessions of the daemon at `socket` were written down before
 /// the database. The rest of its state, like memory, is kept beside it.
 pub fn path(socket: &Path) -> PathBuf {
-    if socket == socket::default_path() {
+    if socket::is_default(socket) {
         state_dir().join("sessions.json")
     } else {
         socket.with_extension("sessions.json")
@@ -55,7 +56,7 @@ pub fn path(socket: &Path) -> PathBuf {
 /// Where the flow runs of the daemon at `socket` were written down before
 /// the database: beside its sessions.
 pub fn flows_path(socket: &Path) -> PathBuf {
-    if socket == socket::default_path() {
+    if socket::is_default(socket) {
         state_dir().join("flows.json")
     } else {
         socket.with_extension("flows.json")
@@ -84,7 +85,7 @@ pub fn project_dirs(socket: &Path) -> Vec<PathBuf> {
 
 /// Where the daemon at `socket` keeps the logs of the plugins it runs.
 pub fn plugins_dir(socket: &Path) -> PathBuf {
-    if socket == socket::default_path() {
+    if socket::is_default(socket) {
         state_dir().join("plugins")
     } else {
         socket.with_extension("plugins")
@@ -92,7 +93,7 @@ pub fn plugins_dir(socket: &Path) -> PathBuf {
 }
 
 fn projects_dir(socket: &Path) -> PathBuf {
-    if socket == socket::default_path() {
+    if socket::is_default(socket) {
         state_dir().join("projects")
     } else {
         socket.with_extension("projects")
