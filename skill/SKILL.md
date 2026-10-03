@@ -53,6 +53,36 @@ crystal result tests
 - A task takes follow-ups with `send`, one at a time, never `send-keys`.
 - A task whose run fails ends: `wait` prints `exited N`, and `result` says why.
 
+## Close your task
+
+A session started with something to do is a task, and stays open until it's closed. If you were started
+with a task, close it when you're through, with one line on how it went:
+
+```sh
+crystal done "Fixed the redirect and added a test"
+crystal done --failed "The staging database is down"
+```
+
+- `crystal done` closes the task of the session it runs in. `-n <name>` closes another's.
+- An agent you start with a prompt (`crystal new -d claude "…"`, or `-t "…"` for any command) is given a task.
+  `crystal ls --json` shows it: `task.goal`, and once closed, `task.outcome` with `failed` and `summary`.
+- A background task (`crystal task`) closes itself when its run ends.
+- `crystal tasks` lists the project's tasks: open ones, then those closed, the latest first.
+
+## Keep a backlog
+
+Each project has a backlog of things to do later. When you notice something worth doing that isn't part of
+your task, put it there rather than into your change:
+
+```sh
+crystal backlog add "Retry the webhook on a timeout" -t payments   # prints its number, like #4
+crystal backlog                   # what's to do
+crystal backlog done 4            # tick it off; reopen 4 or rm 4 undo it
+crystal backlog start 4 -w -d     # an agent on #4 in a new worktree; closing its task done ticks #4
+```
+
+Every command works on the current directory's project; `-C <dir>` names another.
+
 ## Statuses
 
 `crystal wait <name>`, `send --wait` and `send-keys --wait` print one of these:
@@ -84,8 +114,9 @@ crystal ls --json
 ```
 
 One object per session: `name`, `status` (the word `crystal ls` shows), `state`, `activity`, `cwd`,
-`command`, `worktree` with `project`, `branch` and `path` when it's in a git repository, and `front`: what's
-in front in its terminal, `{"kind": "agent", "program": "claude", …}`, a `shell` or another `program`.
+`command`, `worktree` with `project`, `branch` and `path` when it's in a git repository, `front`: what's in
+front in its terminal, `{"kind": "agent", "program": "claude", …}`, a `shell` or another `program`, and `task`
+when it was started with something to do.
 
 ## Clean up
 

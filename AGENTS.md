@@ -62,6 +62,8 @@ is: it's the one request every version must understand.
     event loop does the writing
   - `search.rs`: `/`'s matching: a session's name, project, branch or command, letters in order
   - `issues.rs`: the issues view `i` opens: its state, kept apart from I/O, and its drawing
+  - `backlog_view.rs`: the backlog view `b` opens: its state and keys, kept apart from I/O, and its
+    drawing
   - `pane.rs`: a viewer of a session on screen, the selected one or a split, and its screen
   - `screen_widget.rs`: draws a vt100 screen into ratatui
   - `diff.rs`: reads `git diff`'s patch into files, hunks and lines, marks the words that changed,
@@ -90,7 +92,15 @@ is: it's the one request every version must understand.
   them, and replaying them to a new viewer
 - `src/protocol.rs`: requests and responses, one JSON line each, and the frames an attached client sends
 - `src/socket.rs`: where the socket lives
-- `src/state.rs`: the running sessions, written down to start them again after a restart
+- `src/state.rs`: the running sessions, written down to start them again after a restart, and each
+  project's directory in the state dir
+- `src/project.rs`: the project a directory is in: its git main worktree, or the directory itself outside git
+- `src/tasks.rs`: tasks, sessions started with something to do: the paragraph an agent is told about
+  `crystal done`, each project's history of closed tasks, and `enabled`, the one gate everything tasks add
+  goes through
+- `src/backlog.rs`: a project's backlog, numbered items kept in the state dir by the daemon alone, its
+  markdown export, and `enabled`, the one gate everything the backlog adds goes through
+- `src/work.rs`: `crystal done`, `tasks` and `backlog`
 - `src/config.rs`: the settings in `~/.config/crystal/config.toml`, read and checked
 - `src/memory.rs`: what a project's sessions learned: the store in the state directory, staleness, search,
   the paragraph Claude Code is shown at launch, promoting into CLAUDE.md, and `enabled`, the one gate
