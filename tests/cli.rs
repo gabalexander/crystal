@@ -1537,8 +1537,9 @@ fn a_new_worktree_with_no_task_asks_what_to_call_its_branch() {
     tui.type_keys("w\r");
     tui.shows("name the new worktree's branch");
     tui.type_keys("spike\r");
-    tui.shows("⎇ spike");
-    assert!(crystal.dir.path().join("app.worktrees/spike").is_dir());
+    // The panel's title shows the branch as it's typed, before Enter.
+    let worktree = crystal.dir.path().join("app.worktrees/spike");
+    eventually("the worktree is made", || worktree.is_dir());
 }
 
 impl Crystal {
