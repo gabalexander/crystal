@@ -506,14 +506,11 @@ pub fn pane_header<'a>(
     width: u16,
 ) -> Line<'a> {
     let theme = look.theme;
-    let status = Status::of(session);
+    let (mark, mark_color) = sidebar::session_mark(session, look);
     let name_color = if focused { theme.accent } else { theme.text };
     let mut spans = vec![
         Span::raw(" "),
-        Span::styled(
-            status.mark(look.spin),
-            Style::new().fg(theme.status(status)),
-        ),
+        Span::styled(mark, Style::new().fg(mark_color)),
         Span::raw(" "),
         Span::styled(
             session.name.clone(),
@@ -900,7 +897,7 @@ fn draw_prompt(frame: &mut Frame, theme: &Theme, prompt: &Prompt, area: Rect) {
 mod tests {
     use super::*;
     use crate::config::ThemeName;
-    use crate::protocol::{Activity, Worktree};
+    use crate::protocol::{Activity, Front, Worktree};
     use crate::tui::groups::Row;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::Terminal;
@@ -981,6 +978,21 @@ mod tests {
         }
     }
 
+    /// `session` with Claude Code in front.
+    fn agent(mut session: SessionInfo) -> SessionInfo {
+        session.front = Some(Front::Agent {
+            program: "claude".into(),
+            name: "Claude Code".into(),
+        });
+        session
+    }
+
+    /// `session` with zsh in front, at its prompt.
+    fn shell(mut session: SessionInfo) -> SessionInfo {
+        session.front = Some(Front::Shell { name: "zsh".into() });
+        session
+    }
+
     /// The number of the first line that holds `text`.
     fn line_with(lines: &[String], text: &str) -> usize {
         let found = lines.iter().position(|line| line.contains(text));
@@ -1047,8 +1059,8 @@ mod tests {
     fn the_sidebar_lists_sessions_under_a_heading_with_marks() {
         let mut app = App::new(None);
         app.set_sessions(vec![
-            session("claude", State::Running),
-            session("codex", State::Exited { code: 1 }),
+            agent(session("claude", State::Running)),
+            agent(session("codex", State::Exited { code: 1 })),
         ]);
         let sidebar = sidebar_text(&app);
         assert!(line_with(&sidebar, "outside git ─") < line_with(&sidebar, "▸ claude"));
@@ -1120,7 +1132,7 @@ mod tests {
             ("finished", Activity::Done),
             ("resting", Activity::Idle),
         ] {
-            let mut session = session(name, State::Running);
+            let mut session = agent(session(name, State::Running));
             session.activity = Some(activity);
             sessions.push(session);
         }
@@ -1133,13 +1145,36 @@ mod tests {
     }
 
     #[test]
+    fn agents_and_terminals_tell_apart_by_shape_alone() {
+        let mut app = App::new(None);
+        app.set_sessions(vec![
+            agent(in_worktree("claude", "main", true)),
+            shell(in_worktree("zsh-2", "main", true)),
+            agent(in_worktree("claude-2", "main", true)),
+            in_worktree("server", "main", true),
+        ]);
+        // The text has no color: the marks and the line between say it all.
+        let text = sidebar_text(&app);
+        let order = [
+            line_with(&text, "⌂ main"),
+            line_with(&text, "▸ claude "),
+            line_with(&text, "▸ claude-2"),
+            line_with(&text, "terminals ┄"),
+            line_with(&text, "❯ zsh-2"),
+            line_with(&text, "❯ server"),
+        ];
+        let one_after_another: Vec<usize> = (order[0]..order[0] + 6).collect();
+        assert_eq!(order.to_vec(), one_after_another, "\n{}", text.join("\n"));
+    }
+
+    #[test]
     fn a_session_row_says_how_long_ago_it_changed() {
         let mut app = App::new(None);
         let mut old = session("old", State::Running);
         old.changed = 1_000 - 12 * 60;
         app.set_sessions(vec![old]);
         let text = sidebar_text(&app);
-        let row = &text[line_with(&text, "▸ old")];
+        let row = &text[line_with(&text, "❯ old")];
         // Right-aligned against the rule.
         assert!(row.contains("12m │"), "{row}");
     }
@@ -1151,7 +1186,7 @@ mod tests {
         long.changed = 1_000 - 45;
         app.set_sessions(vec![long]);
         let text = sidebar_text(&app);
-        let row = &text[line_with(&text, "▸ a-very-long")];
+        let row = &text[line_with(&text, "❯ a-very-long")];
         assert!(!row.contains("45s"), "{row}");
     }
 
@@ -1159,9 +1194,9 @@ mod tests {
     fn sessions_sit_under_their_project_and_worktree() {
         let mut app = App::new(None);
         app.set_sessions(vec![
-            in_worktree("fixer", "fix", false),
-            in_worktree("planner", "main", true),
-            session("shell", State::Running),
+            agent(in_worktree("fixer", "fix", false)),
+            agent(in_worktree("planner", "main", true)),
+            shell(session("shell", State::Running)),
         ]);
         let text = sidebar_text(&app);
         let order = [
@@ -1171,7 +1206,7 @@ mod tests {
             line_with(&text, "⎇ fix"),
             line_with(&text, "▸ fixer"),
             line_with(&text, "outside git"),
-            line_with(&text, "▸ shell"),
+            line_with(&text, "❯ shell"),
         ];
         assert!(
             order.is_sorted(),
@@ -1184,7 +1219,7 @@ mod tests {
     fn a_pane_header_drops_the_command_then_the_place_as_it_narrows() {
         let theme = theme();
         let look = look(&theme);
-        let session = in_worktree("planner", "main", true);
+        let session = agent(in_worktree("planner", "main", true));
         let header = |width| text_of(&pane_header(&session, &[], false, &look, width));
 
         let wide = header(60);

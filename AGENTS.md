@@ -46,14 +46,15 @@ is: it's the one request every version must understand.
   - `mod.rs`: the event loop: one channel of events, then update and draw
   - `app.rs`: the state and how keys and the mouse change it; no I/O, so it's unit-tested
   - `ui.rs`: the layout and drawing (top bar, pane headers, footer), and what's under the mouse
-  - `sidebar.rs`: the sidebar's rows: headings, worktree lines, sessions with their mark and how long ago
+  - `sidebar.rs`: the sidebar's rows: headings, worktree lines, sessions with their mark and how long ago,
+    terminals drawn apart from agents
   - `status.rs`: a session's status as the TUI shows it, and its mark
   - `theme.rs`: every color, named for what it's for: `dark`, `light`, `terminal`, and none for `NO_COLOR`
   - `mouse.rs`: writes mouse events the way a program in a pane asked for them
   - `help.rs`: the overlay `?` opens, drawn from one table of every key; a test keeps the README's
     table of sidebar keys in step with it
-  - `groups.rs`: the sidebar's order and headings: sessions by project, then worktree, and each flow run's
-    steps under it
+  - `groups.rs`: the sidebar's order and headings: sessions by project, then worktree, agents before
+    terminals, and each flow run's steps under it
   - `text_input.rs`: a one-line text box, for the questions asked on the bottom line
   - `text_area.rs`: a text box of several lines that wrap: the new-session panel's task
   - `launcher.rs`: the new-session panel (`n`, `w`): its state and keys, kept apart from I/O, the command

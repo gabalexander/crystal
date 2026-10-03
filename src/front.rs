@@ -42,6 +42,13 @@ pub fn of_process(leader: i32) -> Option<Front> {
     Some(classify(&process.exe, &process.args))
 }
 
+/// What a session's own command is, as if it were in front: until the
+/// daemon has looked at what really is, this is the best guess there is.
+pub fn of_command(command: &[String]) -> Option<Front> {
+    let program = command.first()?;
+    Some(classify(Path::new(program), command))
+}
+
 /// What a program is, from its executable's path and its arguments, the
 /// first of them its name as it was run.
 pub fn classify(exe: &Path, args: &[String]) -> Front {

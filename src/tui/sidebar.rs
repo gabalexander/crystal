@@ -1,9 +1,12 @@
 //! The sidebar: every session under its project and its worktree, each
 //! with a mark for what it's doing and how long ago that last changed, and
-//! each flow run under its project, a row for each of its steps.
+//! each flow run under its project, a row for each of its steps. A
+//! worktree's agents come first; its terminals, the shells and other
+//! programs, come after a line of their own and are drawn quieter, with a
+//! prompt's chevron for a mark, so the two never look alike.
 
 use super::app::{App, Hit};
-use super::groups::Row;
+use super::groups::{self, Row};
 use super::status::Status;
 use super::theme::Theme;
 use super::ui::Look;
@@ -26,6 +29,11 @@ const WORKTREE_INDENT: &str = "   ";
 
 /// How far a session row is indented: under its worktree's line.
 const SESSION_INDENT: &str = "     ";
+
+/// A terminal's mark while it runs: a prompt's chevron. No agent's status
+/// uses it, so a terminal never passes for an agent at its prompt, even
+/// without color.
+const TERMINAL_MARK: &str = "❯";
 
 pub fn draw(frame: &mut Frame, app: &App, look: &Look, area: Rect) {
     let rows = app.rows();
@@ -118,6 +126,7 @@ fn row_line<'a>(app: &'a App, row: &Row, look: &Look, width: u16, selected: bool
             let marked = app.marked_letters(*index);
             session_line(session, &marked, look, width, selected)
         }
+        Row::Terminals => terminals_line(theme, width),
         Row::Task(index) => task_line(&app.sessions()[*index], theme, width),
         Row::Flow(run) => flow_heading(&app.flows()[*run], look, width),
         Row::Step { run, step } => step_line(&app.flows()[*run], *step, None, look, width, false),
@@ -229,6 +238,21 @@ fn to_do_on_heading(line: &mut Line, open: usize, theme: &Theme) {
     rule.content = "─".repeat(rule_width - to_do_width).into();
     line.spans
         .push(Span::styled(to_do, Style::new().fg(theme.muted)));
+}
+
+/// The line between a worktree's agents and its terminals: `terminals`,
+/// then a dotted rule to the edge, fainter than a heading's.
+fn terminals_line<'a>(theme: &Theme, width: u16) -> Line<'a> {
+    // A space kept clear at the end, as on a heading.
+    let room = usize::from(width).saturating_sub(SESSION_INDENT.len() + 1);
+    let label = fit("terminals", room);
+    let rule = room.saturating_sub(label.chars().count() + 1);
+    Line::from(vec![
+        Span::raw(SESSION_INDENT),
+        Span::styled(label, Style::new().fg(theme.muted)),
+        Span::raw(" "),
+        Span::styled("┄".repeat(rule), Style::new().fg(theme.rule)),
+    ])
 }
 
 /// The line under a session with a task: what it was asked to do, while
@@ -369,19 +393,17 @@ fn session_line<'a>(
     selected: bool,
 ) -> Line<'a> {
     let theme = look.theme;
-    let status = Status::of(session);
-    let mut name_style = Style::new().fg(theme.text);
+    let (mark, mark_color) = session_mark(session, look);
+    // A terminal's name is muted, so the agents stand out.
+    let name_color = if groups::is_terminal(session) {
+        theme.muted
+    } else {
+        theme.text
+    };
+    let mut name_style = Style::new().fg(name_color);
     if selected {
         name_style = name_style.add_modifier(Modifier::BOLD);
     }
-    // A shell at its prompt is the quiet kind of running: its mark fades,
-    // so the agents stand out.
-    let at_a_shell = matches!(session.front, Some(Front::Shell { .. }));
-    let mark_color = if at_a_shell && status == Status::Running {
-        theme.muted
-    } else {
-        theme.status(status)
-    };
     // The indent, the mark and a space before the name; a space at the end.
     let room = usize::from(width).saturating_sub(SESSION_INDENT.len() + 2 + 1);
     let when = changed_ago(session, look.now);
@@ -390,7 +412,7 @@ fn session_line<'a>(
 
     let mut spans = vec![
         Span::raw(SESSION_INDENT),
-        Span::styled(status.mark(look.spin), Style::new().fg(mark_color)),
+        Span::styled(mark, Style::new().fg(mark_color)),
         Span::raw(" "),
     ];
     let marked_style = name_style
@@ -412,6 +434,25 @@ fn session_line<'a>(
         spans.push(Span::styled(when.to_string(), Style::new().fg(theme.muted)));
     }
     Line::from(spans)
+}
+
+/// A session's mark, in its color, the same in its row and in its pane's
+/// header. A running terminal has the chevron: muted at a shell's prompt,
+/// in running's color with a program in front. An agent, or a terminal
+/// that has ended, has its status's mark.
+pub fn session_mark(session: &SessionInfo, look: &Look) -> (&'static str, Color) {
+    let theme = look.theme;
+    let status = Status::of(session);
+    if status == Status::Running && groups::is_terminal(session) {
+        let at_a_shell = matches!(session.front, Some(Front::Shell { .. }));
+        let color = if at_a_shell {
+            theme.muted
+        } else {
+            theme.running
+        };
+        return (TERMINAL_MARK, color);
+    }
+    (status.mark(look.spin), theme.status(status))
 }
 
 /// What's in front in the session, in a word, when its name doesn't say
@@ -551,16 +592,13 @@ mod tests {
         assert_eq!(spans[1].style, plain);
     }
 
-    #[test]
-    fn what_s_in_front_shows_when_the_name_doesn_t_say_it() {
-        let mut session = crate::protocol::SessionInfo {
-            front: Some(Front::Agent {
-                program: "claude".into(),
-                name: "Claude Code".into(),
-            }),
-            name: "refund-fix".into(),
+    /// A running session called `name`, with `front` in front.
+    fn session(name: &str, front: Front) -> SessionInfo {
+        SessionInfo {
+            front: Some(front),
+            name: name.into(),
             id: "1".into(),
-            command: vec!["claude".into()],
+            command: vec!["sh".into()],
             cwd: "/".into(),
             pid: None,
             state: crate::protocol::State::Running,
@@ -568,7 +606,72 @@ mod tests {
             worktree: None,
             changed: 0,
             task: None,
+        }
+    }
+
+    fn claude() -> Front {
+        Front::Agent {
+            program: "claude".into(),
+            name: "Claude Code".into(),
+        }
+    }
+
+    #[test]
+    fn a_running_terminal_has_the_chevron_and_an_agent_its_status() {
+        let theme = Theme::new(crate::config::ThemeName::Dark, false);
+        let look = Look {
+            theme: &theme,
+            now: 0,
+            spin: 0,
         };
+        let zsh = session("zsh-2", Front::Shell { name: "zsh".into() });
+        let vite = session(
+            "server",
+            Front::Program {
+                name: "vite".into(),
+            },
+        );
+        let agent = session("claude", claude());
+        assert_eq!(session_mark(&zsh, &look), ("❯", theme.muted));
+        assert_eq!(session_mark(&vite, &look), ("❯", theme.running));
+        assert_eq!(session_mark(&agent, &look), ("▸", theme.running));
+        // Once it has ended, a terminal says how, the way an agent does.
+        let ended = SessionInfo {
+            state: crate::protocol::State::Exited { code: 1 },
+            ..zsh
+        };
+        assert_eq!(session_mark(&ended, &look), ("■", theme.failed));
+    }
+
+    #[test]
+    fn a_terminal_s_name_is_muted_and_an_agent_s_is_not() {
+        let theme = Theme::new(crate::config::ThemeName::Dark, false);
+        let look = Look {
+            theme: &theme,
+            now: 0,
+            spin: 0,
+        };
+        let name_color = |session: &SessionInfo| {
+            let line = session_line(session, &[], &look, 28, false);
+            // The indent, the mark and a space, then the name.
+            line.spans[3].style.fg
+        };
+        let zsh = session("zsh-2", Front::Shell { name: "zsh".into() });
+        assert_eq!(name_color(&zsh), Some(theme.muted));
+        assert_eq!(name_color(&session("claude", claude())), Some(theme.text));
+    }
+
+    #[test]
+    fn the_line_before_the_terminals_fills_the_row() {
+        let theme = Theme::new(crate::config::ThemeName::Dark, false);
+        let line = terminals_line(&theme, 28);
+        assert_eq!(line.width(), 27);
+        assert!(line.to_string().starts_with("     terminals ┄┄"));
+    }
+
+    #[test]
+    fn what_s_in_front_shows_when_the_name_doesn_t_say_it() {
+        let mut session = session("refund-fix", claude());
         assert_eq!(front_label(&session), Some("claude"));
         session.name = "Claude-2".into();
         assert_eq!(front_label(&session), None);
