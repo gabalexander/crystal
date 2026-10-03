@@ -657,10 +657,7 @@ fn run(cli: Cli) -> Result<()> {
             }
         }
         Command::KillServer => {
-            let shutdown = Request::Shutdown {
-                keep_sessions: false,
-            };
-            if client::ask(&socket, &shutdown, false)?.is_none() {
+            if !client::stop_daemon(&socket, false)? {
                 no_daemon(&socket)?;
             }
         }
