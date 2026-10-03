@@ -245,7 +245,7 @@ their directory is gone, so they could never start again.
 `crystal rename` changes what a session is called; its program and its saved place after a restart follow the
 new name. `crystal respawn`, or `Enter` on an ended session in the TUI, runs its command again in the same
 directory, under the same name and in the same place in the list, with your environment. Claude Code and Codex
-come back in the conversation they were in. Every session's program also gets `CRYSTAL_SESSION_ID`, which stays the same
+come back in the conversation they were in, without being asked their task again. Every session's program also gets `CRYSTAL_SESSION_ID`, which stays the same
 when the session is renamed, while `CRYSTAL_SESSION` keeps the name the program started under.
 
 The first `crystal new` starts the daemon. Sessions keep running after you detach or close the terminal, and

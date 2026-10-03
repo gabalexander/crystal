@@ -29,6 +29,11 @@ const CLAUDE_HOOK_EVENTS: &[&str] = &[
 /// from `crystal`, the path of this program, and with `resume`, the id of
 /// a conversation to pick up again.
 ///
+/// A conversation picked up again has been asked its first prompt already,
+/// so it isn't asked again: `task`, what the session was started to do,
+/// helps find that prompt on a command line written before crystal put it
+/// after `--`.
+///
 /// `instructions` are what crystal tells the agent on top of what it was
 /// asked, each a paragraph: Claude Code gets them added to its system
 /// prompt. Other agents have no such option, and go without.
@@ -36,6 +41,7 @@ pub fn argv(
     command: &[String],
     crystal: &Path,
     resume: Option<&str>,
+    task: Option<&str>,
     instructions: &[String],
 ) -> Vec<String> {
     if program_name(command) == Some("codex")
@@ -56,7 +62,7 @@ pub fn argv(
         Some(id) => {
             argv.push("--resume".to_string());
             argv.push(id.to_string());
-            without_resume_flags(&command[1..])
+            without_resume_flags(without_first_prompt(&command[1..], task))
         }
         None => command[1..].to_vec(),
     };
@@ -105,6 +111,23 @@ pub fn claude_conversation(input: &Value) -> Option<Conversation> {
         id: id.to_string(),
         transcript,
     })
+}
+
+/// Claude's arguments without its first prompt, for a conversation that
+/// has had it already. After `--`, everything is the prompt. A command line
+/// written before crystal put it there ends in the prompt instead, but a
+/// last word can as well be an option's value, like `opus` in `--model
+/// opus`, so it's taken for the prompt only when it's the session's `task`,
+/// or when it's all there is.
+fn without_first_prompt<'a>(args: &'a [String], task: Option<&str>) -> &'a [String] {
+    if let Some(at) = args.iter().position(|arg| arg == "--") {
+        return &args[..at];
+    }
+    match args.split_last() {
+        Some((last, before)) if Some(last.as_str()) == task => before,
+        Some((last, [])) if !last.starts_with('-') => &[],
+        _ => args,
+    }
 }
 
 /// Claude's arguments without the ones that choose a conversation to pick
@@ -185,7 +208,7 @@ mod tests {
     fn crystal_s_instructions_join_the_users_own_system_prompt() {
         let asked = command(&["claude", "--append-system-prompt", "Be brief.", "fix it"]);
         let instructions = ["Run `crystal done` when finished.".to_string()];
-        let argv = argv(&asked, Path::new("/bin/crystal"), None, &instructions);
+        let argv = argv(&asked, Path::new("/bin/crystal"), None, None, &instructions);
         assert_eq!(
             argv[3..],
             [
@@ -204,7 +227,7 @@ mod tests {
             "--append-system-prompt=x, explain this flag",
         ]);
         let instructions = ["Run `crystal done` when finished.".to_string()];
-        let argv = argv(&asked, Path::new("/bin/crystal"), None, &instructions);
+        let argv = argv(&asked, Path::new("/bin/crystal"), None, None, &instructions);
         assert_eq!(
             argv[3..],
             [
@@ -219,7 +242,7 @@ mod tests {
     #[test]
     fn without_instructions_claude_s_arguments_stay_as_they_are() {
         let asked = command(&["claude", "--append-system-prompt", "Be brief."]);
-        let argv = argv(&asked, Path::new("/bin/crystal"), None, &[]);
+        let argv = argv(&asked, Path::new("/bin/crystal"), None, None, &[]);
         assert_eq!(argv[3..], ["--append-system-prompt", "Be brief."]);
     }
 
@@ -227,7 +250,7 @@ mod tests {
     fn other_programs_run_as_asked() {
         let asked = command(&["aider", "--model", "o3"]);
         assert_eq!(
-            argv(&asked, Path::new("/bin/crystal"), Some("abc"), &[]),
+            argv(&asked, Path::new("/bin/crystal"), Some("abc"), None, &[]),
             asked
         );
     }
@@ -236,17 +259,70 @@ mod tests {
     fn codex_resumes_its_conversation_with_its_own_subcommand() {
         let asked = command(&["codex", "--model", "o4", "fix it"]);
         assert_eq!(
-            argv(&asked, Path::new("/bin/crystal"), Some("abc"), &[]),
+            argv(&asked, Path::new("/bin/crystal"), Some("abc"), None, &[]),
             ["codex", "resume", "abc", "--model", "o4"]
         );
-        assert_eq!(argv(&asked, Path::new("/bin/crystal"), None, &[]), asked);
+        assert_eq!(
+            argv(&asked, Path::new("/bin/crystal"), None, None, &[]),
+            asked
+        );
     }
 
     #[test]
     fn claude_resumes_the_conversation_it_was_in() {
         let asked = command(&["claude", "--continue", "--model", "opus"]);
-        let argv = argv(&asked, Path::new("/bin/crystal"), Some("abc"), &[]);
+        let argv = argv(&asked, Path::new("/bin/crystal"), Some("abc"), None, &[]);
         assert_eq!(argv[3..], ["--resume", "abc", "--model", "opus"]);
+    }
+
+    #[test]
+    fn a_resumed_conversation_isn_t_asked_its_first_prompt_again() {
+        let asked = command(&["claude", "--model", "opus", "--", "fix it"]);
+        let crystal = Path::new("/bin/crystal");
+        let resumed = argv(&asked, crystal, Some("abc"), Some("fix it"), &[]);
+        assert_eq!(resumed[3..], ["--resume", "abc", "--model", "opus"]);
+        // After `--`, it's the prompt whether the task is known or not.
+        let resumed = argv(&asked, crystal, Some("abc"), None, &[]);
+        assert_eq!(resumed[3..], ["--resume", "abc", "--model", "opus"]);
+    }
+
+    #[test]
+    fn an_older_command_line_loses_the_task_it_ends_in() {
+        let asked = command(&["claude", "--model", "opus", "fix it"]);
+        let crystal = Path::new("/bin/crystal");
+        let resumed = argv(&asked, crystal, Some("abc"), Some("fix it"), &[]);
+        assert_eq!(resumed[3..], ["--resume", "abc", "--model", "opus"]);
+    }
+
+    #[test]
+    fn an_option_s_value_isn_t_taken_for_a_prompt() {
+        let asked = command(&["claude", "--model", "opus"]);
+        let crystal = Path::new("/bin/crystal");
+        let resumed = argv(&asked, crystal, Some("abc"), None, &[]);
+        assert_eq!(resumed[3..], ["--resume", "abc", "--model", "opus"]);
+        let resumed = argv(&asked, crystal, Some("abc"), Some("fix it"), &[]);
+        assert_eq!(resumed[3..], ["--resume", "abc", "--model", "opus"]);
+    }
+
+    #[test]
+    fn a_prompt_given_alone_is_left_out_even_without_its_task() {
+        let asked = command(&["claude", "fix it"]);
+        let resumed = argv(&asked, Path::new("/bin/crystal"), Some("abc"), None, &[]);
+        assert_eq!(resumed[3..], ["--resume", "abc"]);
+    }
+
+    #[test]
+    fn a_new_conversation_is_asked_its_first_prompt() {
+        let asked = command(&["claude", "--", "fix it"]);
+        let started = argv(&asked, Path::new("/bin/crystal"), None, Some("fix it"), &[]);
+        assert_eq!(started[3..], ["--", "fix it"]);
+    }
+
+    #[test]
+    fn a_prompt_that_looks_like_a_resume_flag_isn_t_one() {
+        let asked = command(&["claude", "--", "-c is short for --continue"]);
+        let resumed = argv(&asked, Path::new("/bin/crystal"), Some("abc"), None, &[]);
+        assert_eq!(resumed[3..], ["--resume", "abc"]);
     }
 
     #[test]
@@ -267,7 +343,7 @@ mod tests {
     #[test]
     fn claude_gets_hooks_ahead_of_its_own_arguments() {
         let asked = command(&["/usr/local/bin/claude", "--resume"]);
-        let argv = argv(&asked, Path::new("/opt/my tools/crystal"), None, &[]);
+        let argv = argv(&asked, Path::new("/opt/my tools/crystal"), None, None, &[]);
         assert_eq!(argv[0], "/usr/local/bin/claude");
         assert_eq!(argv[1], "--settings");
         assert_eq!(argv[3], "--resume");
