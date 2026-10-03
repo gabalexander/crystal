@@ -2596,6 +2596,12 @@ fn the_default_socket_keeps_its_state_however_its_daemon_is_started() {
             .env("XDG_RUNTIME_DIR", &run)
             .env("XDG_STATE_HOME", &state)
             .env("XDG_CONFIG_HOME", crystal.config_home())
+            // Nor the user's Claude Code config, where a daemon may update
+            // the skill as it starts.
+            .env(
+                "CLAUDE_CONFIG_DIR",
+                crystal.dir.path().join("claude-config"),
+            )
             .envs(PLAIN_GIT)
             .output()
             .unwrap();
