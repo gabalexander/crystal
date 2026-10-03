@@ -1657,6 +1657,7 @@ mod tests {
             activity: None,
             worktree: None,
             changed: 0,
+            task: None,
         }
     }
 

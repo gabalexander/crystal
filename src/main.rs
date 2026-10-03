@@ -1,6 +1,7 @@
 mod agent_screen;
 mod agents;
 mod attach;
+mod backlog;
 mod catalog;
 mod client;
 mod codex;
@@ -18,6 +19,7 @@ mod memory;
 mod memory_cli;
 mod notify;
 mod profile;
+mod project;
 mod protocol;
 mod remote;
 mod session;
@@ -26,10 +28,12 @@ mod skill;
 mod socket;
 mod state;
 mod task;
+mod tasks;
 mod transcript;
 mod tui;
 mod typing;
 mod viewer;
+mod work;
 
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
@@ -77,9 +81,65 @@ enum Command {
         #[arg(short, long, value_name = "BRANCH")]
         worktree: Option<String>,
 
+        /// Give the agent this to do, as its first prompt, which makes the
+        /// session a task: open until it's closed with `crystal done`. A
+        /// prompt given as the agent's only argument, like `claude "fix
+        /// it"`, does the same.
+        #[arg(short, long, value_name = "TEXT")]
+        task: Option<String>,
+
         /// The command and its arguments.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
+    },
+    /// Close a task, the one of the session this runs in unless `-n` says
+    /// another's: done, with a line on what was done, or `--failed`, with
+    /// why.
+    Done {
+        /// The session whose task to close [default: the one this runs in]
+        #[arg(short, long)]
+        name: Option<String>,
+
+        /// It couldn't be done.
+        #[arg(long)]
+        failed: bool,
+
+        /// What was done, or why it couldn't be. Several words are joined
+        /// with spaces.
+        summary: Vec<String>,
+    },
+    /// List the tasks of the project this directory is in: those still
+    /// open, then those closed, the latest first.
+    Tasks {
+        /// Every project's tasks.
+        #[arg(long)]
+        all: bool,
+
+        /// The project's directory [default: the current one]
+        #[arg(short = 'C', long = "dir", value_name = "DIR")]
+        dir: Option<PathBuf>,
+
+        /// Print them as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Keep the project's backlog: things worth doing later. With no
+    /// command, lists what's open.
+    Backlog {
+        /// The project's directory [default: the current one]
+        #[arg(short = 'C', long = "dir", value_name = "DIR", global = true)]
+        dir: Option<PathBuf>,
+
+        /// With no command: what's done too.
+        #[arg(long)]
+        all: bool,
+
+        /// With no command: print it as JSON.
+        #[arg(long)]
+        json: bool,
+
+        #[command(subcommand)]
+        command: Option<BacklogCommand>,
     },
     /// Start a task: Claude Code runs a prompt without a terminal (`claude
     /// -p`), in the background. Its transcript shows like any session's, and
@@ -325,6 +385,46 @@ enum ProfileCommand {
     Show { name: String },
 }
 
+#[derive(Subcommand)]
+enum BacklogCommand {
+    /// Put something on the backlog. Prints its number.
+    Add {
+        /// What to do later. Several words are joined with spaces.
+        #[arg(required = true)]
+        text: Vec<String>,
+
+        /// A tag for it, like `ui`; give it more than once for more.
+        #[arg(short, long = "tag", value_name = "TAG")]
+        tags: Vec<String>,
+    },
+    /// Mark an item done.
+    Done { number: u64 },
+    /// Mark a done item open again.
+    Reopen { number: u64 },
+    /// Take an item off the backlog.
+    #[command(visible_alias = "remove")]
+    Rm { number: u64 },
+    /// Start a task for an item, with the agent the new-session panel
+    /// starts first. Closing the task done ticks the item.
+    Start {
+        number: u64,
+
+        /// In a new worktree, on a branch named after the item.
+        #[arg(short, long)]
+        worktree: bool,
+
+        /// The session's name [default: the agent's name]
+        #[arg(short, long)]
+        name: Option<String>,
+
+        /// Don't attach; print the session's name instead.
+        #[arg(short, long)]
+        detached: bool,
+    },
+    /// Print the backlog as markdown checkboxes, done items too.
+    Export,
+}
+
 fn main() -> ExitCode {
     match run(Cli::parse()) {
         Ok(()) => ExitCode::SUCCESS,
@@ -348,8 +448,21 @@ fn run(cli: Cli) -> Result<()> {
             cwd,
             detached,
             worktree,
+            task,
             command,
-        } => new_session(&socket, name, cwd, worktree, detached, command)?,
+        } => new_session(&socket, name, cwd, worktree, detached, command, task)?,
+        Command::Done {
+            name,
+            failed,
+            summary,
+        } => work::done(&socket, name, failed, &summary.join(" "))?,
+        Command::Tasks { all, dir, json } => work::list_tasks(&socket, here(dir)?, all, json)?,
+        Command::Backlog {
+            dir,
+            all,
+            json,
+            command,
+        } => backlog(&socket, here(dir)?, all, json, command)?,
         Command::Task {
             name,
             cwd,
@@ -364,7 +477,7 @@ fn run(cli: Cli) -> Result<()> {
                 args: claude_args,
             };
             let cwd = start_dir(cwd, worktree)?;
-            let name = client::new_task(&socket, name, cwd, spec)?;
+            let name = client::new_task(&socket, name, cwd, spec, None)?;
             println!("{name}");
             if wait {
                 drive::wait_for_turn(&socket, &name, seconds(timeout))?;
@@ -561,17 +674,80 @@ fn new_session(
     cwd: Option<PathBuf>,
     worktree: Option<String>,
     detached: bool,
-    command: Vec<String>,
+    mut command: Vec<String>,
+    task: Option<String>,
 ) -> Result<()> {
     let cwd = start_dir(cwd, worktree)?;
-    let name = client::new_session(socket, name, cwd, command)?;
+    // A task given with `-t` goes to the agent as its first prompt; one
+    // given as the agent's only argument is a task all the same.
+    let task = match task {
+        Some(task) => {
+            catalog::add_first_prompt(&mut command, &task);
+            Some(task)
+        }
+        None => catalog::first_prompt_in(&command),
+    };
+    let purpose = client::Purpose {
+        task,
+        backlog: None,
+    };
+    let name = client::new_session_for(socket, name, cwd, command, purpose)?;
+    attach_or_print(socket, &name, detached)
+}
 
+/// Attaches to the new session `name` when run in a terminal, unless
+/// `detached`; prints its name otherwise.
+fn attach_or_print(socket: &Path, name: &str, detached: bool) -> Result<()> {
     let in_a_terminal = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     if in_a_terminal && !detached {
-        attach::run(socket, Some(&name))
+        attach::run(socket, Some(name))
     } else {
         println!("{name}");
         Ok(())
+    }
+}
+
+/// `crystal backlog` and its commands, for the project `dir` is in.
+fn backlog(
+    socket: &Path,
+    dir: PathBuf,
+    all: bool,
+    json: bool,
+    command: Option<BacklogCommand>,
+) -> Result<()> {
+    use work::BacklogAction;
+    let action = match command {
+        None => BacklogAction::List { all, json },
+        Some(BacklogCommand::Add { text, tags }) => BacklogAction::Add {
+            text: text.join(" "),
+            tags,
+        },
+        Some(BacklogCommand::Done { number }) => BacklogAction::Mark { number, done: true },
+        Some(BacklogCommand::Reopen { number }) => BacklogAction::Mark {
+            number,
+            done: false,
+        },
+        Some(BacklogCommand::Rm { number }) => BacklogAction::Remove { number },
+        Some(BacklogCommand::Export) => BacklogAction::Export,
+        Some(BacklogCommand::Start {
+            number,
+            worktree,
+            name,
+            detached,
+        }) => {
+            let name = work::start_from_backlog(socket, dir, number, worktree, name)?;
+            return attach_or_print(socket, &name, detached);
+        }
+    };
+    work::change_backlog(socket, dir, action)
+}
+
+/// The directory a command about a project is given with `-C`, or the
+/// current one.
+fn here(dir: Option<PathBuf>) -> Result<PathBuf> {
+    match dir {
+        Some(dir) => Ok(std::path::absolute(dir)?),
+        None => Ok(std::env::current_dir()?),
     }
 }
 
@@ -631,7 +807,7 @@ fn print_sessions(sessions: &[SessionInfo]) {
     if sessions.is_empty() {
         return;
     }
-    let rows: Vec<[String; 8]> = sessions
+    let rows: Vec<[String; 9]> = sessions
         .iter()
         .map(|session| {
             let (project, branch) = project_and_branch(session);
@@ -652,6 +828,7 @@ fn print_sessions(sessions: &[SessionInfo]) {
                     .map(|arg| shell::quote(arg))
                     .collect::<Vec<_>>()
                     .join(" "),
+                task_cell(session),
             ]
         })
         .collect();
@@ -664,6 +841,7 @@ fn print_sessions(sessions: &[SessionInfo]) {
         "DIRECTORY",
         "PROGRAM",
         "COMMAND",
+        "TASK",
     ];
     print_table(header, &rows);
 }
@@ -684,6 +862,27 @@ fn print_table<const N: usize>(header: [&str; N], rows: &[[String; N]]) {
             .map(|(cell, width)| format!("{cell:width$}"))
             .collect();
         println!("{}", line.join("  ").trim_end());
+    }
+}
+
+/// A session's task, for `ls`: what it was asked to do while it's open,
+/// and how it went once it's closed.
+fn task_cell(session: &SessionInfo) -> String {
+    let Some(task) = &session.task else {
+        return "-".into();
+    };
+    let goal = task.goal.lines().next().unwrap_or("");
+    match &task.outcome {
+        None => goal.to_string(),
+        Some(outcome) => {
+            let mark = if outcome.failed { "✗" } else { "✓" };
+            let said = if outcome.summary.is_empty() {
+                goal
+            } else {
+                &outcome.summary
+            };
+            format!("{mark} {said}")
+        }
     }
 }
 

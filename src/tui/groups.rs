@@ -175,6 +175,7 @@ mod tests {
             activity: None,
             worktree,
             changed: 0,
+            task: None,
         }
     }
 

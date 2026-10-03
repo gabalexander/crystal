@@ -8,7 +8,8 @@ use crate::git::Checkout;
 use crate::history::{self, HISTORY_LINES, HistoryKeeper};
 use crate::notify::{self, Notice};
 use crate::protocol::{
-    Activity, AgentEvent, Conversation, Front, SessionInfo, State, TaskResult, TaskSpec,
+    Activity, AgentEvent, Conversation, Front, SessionInfo, State, TaskInfo, TaskOutcome,
+    TaskRecord, TaskResult, TaskSpec,
 };
 use crate::state::SavedSession;
 use crate::task::Task;
@@ -73,6 +74,12 @@ pub struct Session {
     /// `Some` for a task, whose screen shows what Claude does in its runs
     /// rather than a program in a PTY.
     task: Option<Task>,
+    /// What the agent was asked to do, for a session started with
+    /// something to do: a task, in a terminal or in the background.
+    goal: Option<TaskInfo>,
+    /// Tasks that closed of themselves, like a background task whose run
+    /// ended, for the daemon to write down.
+    closed: Vec<TaskRecord>,
     term: Arc<Term>,
 }
 
@@ -145,6 +152,8 @@ impl Session {
             front_group: None,
             front_checked: Instant::now(),
             task: None,
+            goal: None,
+            closed: Vec::new(),
             term,
         })
     }
@@ -189,6 +198,8 @@ impl Session {
             front_group: None,
             front_checked: Instant::now(),
             task: Some(task),
+            goal: None,
+            closed: Vec::new(),
             term,
         }
     }
@@ -235,6 +246,58 @@ impl Session {
         }
     }
 
+    /// Makes the session a task: its agent was asked to do something, which
+    /// stays open until the task is closed done or failed.
+    pub fn give_task(&mut self, goal: TaskInfo) {
+        self.goal = Some(goal);
+    }
+
+    /// Closes the session's task, done or failed, saying how it went, and
+    /// gives back the task as the project's history keeps it.
+    pub fn close_task(&mut self, failed: bool, summary: &str) -> Result<TaskRecord> {
+        let name = &self.name;
+        let goal = self.goal.as_mut().with_context(|| {
+            format!("{name} has no task: it wasn't started with something to do")
+        })?;
+        goal.outcome = Some(TaskOutcome {
+            failed,
+            summary: summary.trim().to_string(),
+            closed: seconds_since_epoch(SystemTime::now()),
+        });
+        *self.changed.lock().unwrap() = SystemTime::now();
+        Ok(self.task_record().expect("the task was just closed"))
+    }
+
+    /// The tasks that have closed of themselves since this was last asked,
+    /// for the daemon to write down.
+    pub fn take_closed(&mut self) -> Vec<TaskRecord> {
+        std::mem::take(&mut self.closed)
+    }
+
+    /// The session's task as `crystal tasks` lists it, if it has one.
+    pub fn task_record(&self) -> Option<TaskRecord> {
+        let goal = self.goal.as_ref()?;
+        let worktree = self.checkout.as_ref().map(Checkout::worktree);
+        let project = match &worktree {
+            Some(worktree) => worktree.project.clone(),
+            None => crate::project::of(&self.cwd).name,
+        };
+        Some(TaskRecord {
+            goal: goal.goal.clone(),
+            session: self.name.clone(),
+            project,
+            branch: worktree.and_then(|worktree| worktree.branch),
+            background: goal.background,
+            backlog: goal.backlog,
+            outcome: goal.outcome.clone(),
+        })
+    }
+
+    /// Where the session runs: the directory its project is found from.
+    pub fn cwd(&self) -> &std::path::Path {
+        &self.cwd
+    }
+
     pub fn is_running(&self) -> bool {
         *self.state.lock().unwrap() == State::Running
     }
@@ -251,6 +314,7 @@ impl Session {
             activity: self.activity,
             worktree: self.checkout.as_ref().map(Checkout::worktree),
             changed: seconds_since_epoch(*self.changed.lock().unwrap()),
+            task: self.goal.clone(),
         }
     }
 
@@ -272,6 +336,28 @@ impl Session {
         let events = task.events();
         for event in events {
             self.on_agent_event(event);
+            self.follow_runs(event);
+        }
+    }
+
+    /// A background task closes itself when a run ends, from what Claude
+    /// said at the end, and opens again when a follow-up starts another.
+    fn follow_runs(&mut self, event: AgentEvent) {
+        let Some(goal) = &mut self.goal else {
+            return;
+        };
+        match event {
+            AgentEvent::TurnStarted if goal.outcome.is_some() => goal.outcome = None,
+            AgentEvent::TurnEnded if goal.outcome.is_none() => {
+                let Some(result) = self.task.as_ref().and_then(Task::result) else {
+                    return;
+                };
+                let summary = result.text.lines().next().unwrap_or("").to_string();
+                if let Ok(record) = self.close_task(result.failed, &summary) {
+                    self.closed.push(record);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -420,6 +506,7 @@ impl Session {
             cwd: self.cwd.clone(),
             conversation,
             task: self.task.as_ref().map(|task| task.spec().clone()),
+            goal: self.goal.clone(),
         }
     }
 

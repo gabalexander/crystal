@@ -209,6 +209,7 @@ mod tests {
             activity,
             worktree: None,
             changed: 0,
+            task: None,
         }
     }
 

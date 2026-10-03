@@ -103,6 +103,7 @@ mod tests {
                 branch: Some(branch.into()),
             }),
             changed: 0,
+            task: None,
         }
     }
 

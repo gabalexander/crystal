@@ -3,15 +3,22 @@
 //! client goes away.
 
 use crate::agents;
+use crate::backlog;
 use crate::codex;
+use crate::config::Config;
 use crate::env;
 use crate::keys;
 use crate::memory::{self, Memory};
 use crate::notify;
-use crate::protocol::{self, Conversation, Frame, NewSession, NewTask, Request, Response};
+use crate::project::{self, Project};
+use crate::protocol::{
+    self, Backlog, Conversation, Frame, NewSession, NewTask, Request, Response, TaskInfo,
+    TaskRecord,
+};
 use crate::session::{STOP_GRACE, Session, Term};
 use crate::socket;
 use crate::state::{self, SavedSession};
+use crate::tasks;
 use crate::typing;
 use anyhow::{Context, Result, bail, ensure};
 use std::collections::BTreeMap;
@@ -41,6 +48,7 @@ pub fn run(socket: &Path) -> Result<()> {
         socket: socket.to_path_buf(),
         state: state::path(socket),
         sessions: Mutex::default(),
+        stores: Mutex::default(),
     });
     daemon.start_saved_sessions();
     thread::spawn({
@@ -82,6 +90,9 @@ struct Daemon {
     state: PathBuf,
     /// In the order they were created, which is the order `ls` shows.
     sessions: Mutex<Vec<Session>>,
+    /// Held while a project's backlog or task history is read and written
+    /// back, so two requests at once can't each write over the other.
+    stores: Mutex<()>,
 }
 
 impl Daemon {
@@ -125,6 +136,8 @@ impl Daemon {
     fn start_saved_sessions(&self) {
         let mut sessions = self.sessions.lock().unwrap();
         for saved in state::load(&self.state) {
+            let goal = saved.goal.clone();
+            let backlog = goal.as_ref().and_then(|goal| goal.backlog);
             let started = match saved.task {
                 // A task comes back at rest: a run it was in the middle of
                 // can't be picked up halfway, so it isn't run again either.
@@ -134,6 +147,7 @@ impl Daemon {
                         cwd: saved.cwd,
                         spec,
                         env: env::current(),
+                        backlog,
                     };
                     let conversation = saved.conversation.map(|conversation| conversation.id);
                     start_task(&mut sessions, &self.socket, task, conversation, false)
@@ -144,15 +158,23 @@ impl Daemon {
                         cwd: saved.cwd,
                         command: saved.command,
                         env: env::current(),
+                        task: goal.as_ref().map(|goal| goal.goal.clone()),
+                        backlog,
                     };
                     start(&mut sessions, &self.socket, new, saved.conversation)
                 }
             };
-            if let Err(err) = started {
-                eprintln!(
+            match started {
+                // It comes back with its task as it was, closed or not.
+                Ok(_) => {
+                    if let (Some(goal), Some(session)) = (goal, sessions.last_mut()) {
+                        session.give_task(goal);
+                    }
+                }
+                Err(err) => eprintln!(
                     "crystal daemon: couldn't start {} again: {err:#}",
                     saved.name
-                );
+                ),
             }
         }
     }
@@ -178,6 +200,9 @@ impl Daemon {
                 session.find_conversation(&claimed, &looking);
                 session.check_front();
                 session.check();
+                for closed in session.take_closed() {
+                    self.write_down_closed(session.cwd(), &closed);
+                }
                 if let Some(notice) = session.notice() {
                     notify::tell(notice);
                 }
@@ -190,6 +215,27 @@ impl Daemon {
                     Ok(()) => last_saved = saved,
                     Err(err) => eprintln!("crystal daemon: couldn't save the sessions: {err:#}"),
                 }
+            }
+        }
+    }
+
+    /// Writes a task that has just closed into its project's history, and,
+    /// when it was done and was for a backlog item, ticks the item.
+    fn write_down_closed(&self, cwd: &Path, task: &TaskRecord) {
+        let _stores = self.stores.lock().unwrap();
+        let dir = state::project_dir(&self.socket, &project::of(cwd).path);
+        if let Err(err) = tasks::record(&dir, task) {
+            eprintln!("crystal daemon: couldn't write down a closed task: {err:#}");
+        }
+        let done = task.outcome.as_ref().is_some_and(|outcome| !outcome.failed);
+        let ticks = done && backlog::enabled(&settings());
+        if let (true, Some(number)) = (ticks, task.backlog) {
+            let mut backlog = backlog::Store::load(&dir);
+            let ticked = backlog
+                .mark(number, true, now_seconds())
+                .and_then(|()| backlog.save(&dir));
+            if let Err(err) = ticked {
+                eprintln!("crystal daemon: couldn't tick #{number} on the backlog: {err:#}");
             }
         }
     }
@@ -321,6 +367,62 @@ impl Daemon {
                 let rows = named(&mut sessions, &name)?.term().rows(history);
                 Ok(Response::Screen { rows })
             }
+            Request::Close {
+                id,
+                name,
+                failed,
+                summary,
+            } => {
+                let mut sessions = self.sessions.lock().unwrap();
+                let session = match (id, name) {
+                    (Some(id), _) => with_id(&mut sessions, &id)?,
+                    (None, Some(name)) => named(&mut sessions, &name)?,
+                    (None, None) => bail!("say which session's task to close"),
+                };
+                let closed = session.close_task(failed, &summary)?;
+                self.write_down_closed(session.cwd(), &closed);
+                Ok(Response::Done)
+            }
+            Request::Tasks { dir, all } => Ok(Response::Tasks {
+                tasks: self.tasks(&dir, all),
+            }),
+            Request::BacklogList { dir, all } => {
+                backlog::ensure_enabled(&settings())?;
+                let project = project::of(&dir);
+                let _stores = self.stores.lock().unwrap();
+                let store = backlog::Store::load(&self.project_dir(&project));
+                Ok(Response::Backlog(Backlog {
+                    project: project.name,
+                    path: project.path,
+                    items: store.items(all),
+                }))
+            }
+            Request::BacklogAdd { dir, text, tags } => {
+                let number =
+                    self.change_backlog(&dir, |store| store.add(&text, tags, now_seconds()))?;
+                Ok(Response::Added { number })
+            }
+            Request::BacklogMark { dir, number, done } => {
+                self.change_backlog(&dir, |store| store.mark(number, done, now_seconds()))?;
+                Ok(Response::Done)
+            }
+            Request::BacklogRemove { dir, number } => {
+                self.change_backlog(&dir, |store| store.remove(number))?;
+                Ok(Response::Done)
+            }
+            Request::BacklogCounts { projects } => {
+                backlog::ensure_enabled(&settings())?;
+                let _stores = self.stores.lock().unwrap();
+                let open = projects
+                    .into_iter()
+                    .map(|path| {
+                        let dir = state::project_dir(&self.socket, &path);
+                        let count = backlog::Store::load(&dir).open_count();
+                        (path, count)
+                    })
+                    .collect();
+                Ok(Response::BacklogCounts { open })
+            }
             // Leaving is enough: the sessions' terminals close with the
             // daemon, and the list of them stays as it was last written.
             Request::Shutdown {
@@ -344,6 +446,57 @@ impl Daemon {
         }
     }
 
+    /// Where the daemon keeps what it knows of `project`.
+    fn project_dir(&self, project: &Project) -> PathBuf {
+        state::project_dir(&self.socket, &project.path)
+    }
+
+    /// Changes the backlog of the project `dir` is in with `change`, and
+    /// writes it back when that worked.
+    fn change_backlog<T>(
+        &self,
+        dir: &Path,
+        change: impl FnOnce(&mut backlog::Store) -> Result<T>,
+    ) -> Result<T> {
+        backlog::ensure_enabled(&settings())?;
+        let project = project::of(dir);
+        let _stores = self.stores.lock().unwrap();
+        let dir = self.project_dir(&project);
+        let mut store = backlog::Store::load(&dir);
+        let changed = change(&mut store)?;
+        store.save(&dir)?;
+        Ok(changed)
+    }
+
+    /// The tasks of the project `dir` is in, or every project's with `all`:
+    /// those still open in sessions, then those closed, the latest first.
+    fn tasks(&self, dir: &Path, all: bool) -> Vec<TaskRecord> {
+        let project = project::of(dir);
+        let in_project =
+            |session: &&Session| all || project::of(session.cwd()).path == project.path;
+        let mut tasks: Vec<TaskRecord> = {
+            let sessions = self.sessions.lock().unwrap();
+            sessions
+                .iter()
+                .filter(in_project)
+                .filter_map(Session::task_record)
+                .filter(|task| task.outcome.is_none())
+                .collect()
+        };
+        let _stores = self.stores.lock().unwrap();
+        let dirs = if all {
+            state::project_dirs(&self.socket)
+        } else {
+            vec![self.project_dir(&project)]
+        };
+        let mut closed: Vec<TaskRecord> = dirs.iter().flat_map(|dir| tasks::load(dir)).collect();
+        closed.sort_by_key(|task| {
+            std::cmp::Reverse(task.outcome.as_ref().map_or(0, |outcome| outcome.closed))
+        });
+        tasks.extend(closed);
+        tasks
+    }
+
     fn new_session(&self, new: NewSession) -> Result<Response> {
         let mut sessions = self.sessions.lock().unwrap();
         let name = start(&mut sessions, &self.socket, new, None)?;
@@ -365,6 +518,8 @@ impl Daemon {
         // that doesn't start.
         let ended = sessions.remove(index);
         let launch = ended.launch();
+        // Run again, its task is open again: the work goes on.
+        let backlog = launch.goal.as_ref().and_then(|goal| goal.backlog);
         let started = match launch.task {
             // A task runs its prompt again, in its conversation if it had
             // got as far as one.
@@ -374,6 +529,7 @@ impl Daemon {
                     cwd: launch.cwd,
                     spec,
                     env,
+                    backlog,
                 };
                 let conversation = launch.conversation.map(|conversation| conversation.id);
                 start_task(&mut sessions, &self.socket, task, conversation, true)
@@ -384,6 +540,8 @@ impl Daemon {
                     cwd: launch.cwd,
                     command: launch.command,
                     env,
+                    task: launch.goal.map(|goal| goal.goal),
+                    backlog,
                 };
                 start(&mut sessions, &self.socket, new, launch.conversation)
             }
@@ -420,6 +578,8 @@ fn start(
         cwd,
         command,
         env,
+        task,
+        backlog,
     } = new;
     let Some(program) = command.first() else {
         bail!("no command to run");
@@ -451,8 +611,33 @@ fn start(
     // crystal that has something to say adds its paragraph here.
     let mut instructions: Vec<String> = Vec::new();
     instructions.extend(remembered(socket, &cwd, &command));
-    let argv = agents::argv(&command, &crystal, resume, &instructions);
+    let mut asked = command.clone();
+    // With tasks off, a session started with something to do is just a
+    // session.
+    let task = task.filter(|_| tasks::enabled(&settings()));
+    if let Some(goal) = &task {
+        let about_tasks = tasks::instructions();
+        instructions.push(about_tasks.clone());
+        // Codex has no system prompt to add to, so it hears it at the end
+        // of what it's asked to do.
+        if agents::program_name(&command) == Some("codex")
+            && let Some(last) = asked.last_mut()
+            && last == goal
+        {
+            last.push_str("\n\n");
+            last.push_str(&about_tasks);
+        }
+    }
+    let argv = agents::argv(&asked, &crystal, resume, &instructions);
     let mut session = Session::spawn(id, name.clone(), command, &argv, cwd, &env)?;
+    if let Some(goal) = task {
+        session.give_task(TaskInfo {
+            goal,
+            background: false,
+            backlog,
+            outcome: None,
+        });
+    }
     match conversation {
         Some(conversation) => session.set_conversation(conversation),
         None => {
@@ -496,6 +681,7 @@ fn start_task(
         cwd,
         spec,
         env,
+        backlog,
     } = task;
     ensure!(
         exists("claude", &cwd, env.get("PATH")),
@@ -514,6 +700,15 @@ fn start_task(
     let env = env::for_session(&env, &name, &id, socket);
     let prompt = spec.prompt.clone();
     let mut session = Session::task(id, name.clone(), spec, cwd, env, conversation);
+    // It closes itself when its run ends, from Claude's answer.
+    if tasks::enabled(&settings()) {
+        session.give_task(TaskInfo {
+            goal: prompt.clone(),
+            background: true,
+            backlog,
+            outcome: None,
+        });
+    }
     if run_prompt {
         session.prompt(&prompt)?;
     } else {
@@ -521,6 +716,19 @@ fn start_task(
     }
     sessions.push(session);
     Ok(name)
+}
+
+/// The user's settings, read again each time so that a change counts at
+/// once. A file that can't be read leaves the defaults.
+fn settings() -> Config {
+    Config::load().unwrap_or_default()
+}
+
+/// Now, in seconds since the Unix epoch.
+fn now_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs())
 }
 
 /// Refuses a name a session can't have: an empty one, one with spaces, or

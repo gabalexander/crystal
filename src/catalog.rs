@@ -213,6 +213,45 @@ pub fn find(program: &str) -> Option<&'static Agent> {
     AGENTS.iter().find(|agent| agent.program == program)
 }
 
+/// The agent `command` runs, if crystal knows it, by its program's name.
+fn agent_of(command: &[String]) -> Option<&'static Agent> {
+    let program = command.first()?;
+    find(Path::new(program).file_name()?.to_str()?)
+}
+
+/// Puts `task` on `command` as its agent's first prompt, the way that agent
+/// takes one. A program crystal doesn't know gets it as its last argument.
+pub fn add_first_prompt(command: &mut Vec<String>, task: &str) {
+    match agent_of(command).map_or(FirstPrompt::Argument, |agent| agent.first_prompt) {
+        FirstPrompt::Argument => command.push(task.to_string()),
+        FirstPrompt::Option(option) => {
+            command.push(option.to_string());
+            command.push(task.to_string());
+        }
+        FirstPrompt::None => {}
+    }
+}
+
+/// The first prompt `command` gives its agent, when that's plain to see:
+/// an agent that takes it as an argument, given only that, as in `claude
+/// "fix the tests"`, or given it after `--`. With options in between there's
+/// no telling an option's value from a prompt, so it's left to the caller
+/// to say.
+pub fn first_prompt_in(command: &[String]) -> Option<String> {
+    let agent = agent_of(command)?;
+    if agent.first_prompt != FirstPrompt::Argument {
+        return None;
+    }
+    let args = &command[1..];
+    match args {
+        [prompt] if !prompt.starts_with('-') => Some(prompt.clone()),
+        _ => match args.iter().position(|arg| arg == "--") {
+            Some(at) if at + 2 == args.len() => Some(args[at + 1].clone()),
+            _ => None,
+        },
+    }
+}
+
 /// The agents whose programs are in one of the directories of `path`, a
 /// PATH variable's value, in [`AGENTS`]' order.
 pub fn installed_in(path: &str) -> Vec<&'static Agent> {
@@ -266,6 +305,42 @@ pub fn codex_models(printed: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn words(args: &[&str]) -> Vec<String> {
+        args.iter().map(|arg| arg.to_string()).collect()
+    }
+
+    #[test]
+    fn a_task_goes_where_each_agent_takes_its_first_prompt() {
+        let mut claude = words(&["claude", "--model", "opus"]);
+        add_first_prompt(&mut claude, "fix it");
+        assert_eq!(claude, ["claude", "--model", "opus", "fix it"]);
+
+        let mut gemini = words(&["gemini"]);
+        add_first_prompt(&mut gemini, "fix it");
+        assert_eq!(gemini, ["gemini", "-i", "fix it"]);
+
+        let mut aider = words(&["aider"]);
+        add_first_prompt(&mut aider, "fix it");
+        assert_eq!(aider, ["aider"], "aider takes no first prompt");
+    }
+
+    #[test]
+    fn a_first_prompt_is_found_only_where_it_is_plain_to_see() {
+        let prompt = |args: &[&str]| first_prompt_in(&words(args));
+        assert_eq!(
+            prompt(&["claude", "fix the tests"]),
+            Some("fix the tests".into())
+        );
+        assert_eq!(
+            prompt(&["/usr/local/bin/codex", "--model", "o3", "--", "fix it"]),
+            Some("fix it".into())
+        );
+        assert_eq!(prompt(&["claude", "--model", "opus"]), None);
+        assert_eq!(prompt(&["claude", "--model", "opus", "fix it"]), None);
+        assert_eq!(prompt(&["vim", "notes.md"]), None);
+        assert_eq!(prompt(&["gemini", "-i", "fix it"]), None);
+    }
 
     #[test]
     fn an_agent_shows_when_its_program_is_on_the_path() {

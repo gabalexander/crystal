@@ -403,6 +403,7 @@ mod tests {
             activity: None,
             worktree: None,
             changed: 0,
+            task: None,
         };
         assert_eq!(front_label(&session), Some("claude"));
         session.name = "Claude-2".into();

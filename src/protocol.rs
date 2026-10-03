@@ -66,6 +66,53 @@ pub enum Request {
     Result {
         name: String,
     },
+    /// Close a session's task, done or failed. A program in a session says
+    /// which by its `id`; from outside, it's the session's `name`.
+    Close {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(default)]
+        name: Option<String>,
+        failed: bool,
+        summary: String,
+    },
+    /// The tasks of the project `dir` is in, or of every project with
+    /// `all`: those still open, then those closed, the latest first.
+    Tasks {
+        dir: PathBuf,
+        #[serde(default)]
+        all: bool,
+    },
+    /// The backlog of the project `dir` is in: what's open, or with `all`,
+    /// what's done too.
+    BacklogList {
+        dir: PathBuf,
+        #[serde(default)]
+        all: bool,
+    },
+    /// Put something on the backlog of the project `dir` is in.
+    BacklogAdd {
+        dir: PathBuf,
+        text: String,
+        #[serde(default)]
+        tags: Vec<String>,
+    },
+    /// Mark a backlog item done, or open again.
+    BacklogMark {
+        dir: PathBuf,
+        number: u64,
+        done: bool,
+    },
+    /// Take an item off the backlog.
+    BacklogRemove {
+        dir: PathBuf,
+        number: u64,
+    },
+    /// How many items are open on each of these projects' backlogs, by the
+    /// path of the project's main worktree.
+    BacklogCounts {
+        projects: Vec<PathBuf>,
+    },
     /// What's on a session's screen, as text.
     Read {
         name: String,
@@ -103,6 +150,14 @@ pub struct NewSession {
     pub command: Vec<String>,
     /// The client's environment, which the program starts from.
     pub env: BTreeMap<String, String>,
+    /// What the agent is asked to do, which makes the session a task. It's
+    /// in `command` already, as the agent's first prompt; this says which
+    /// part of the command it is.
+    #[serde(default)]
+    pub task: Option<String>,
+    /// The backlog item the task is for, which closing it done ticks.
+    #[serde(default)]
+    pub backlog: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -113,6 +168,9 @@ pub struct NewTask {
     pub spec: TaskSpec,
     /// The client's environment, which Claude starts from.
     pub env: BTreeMap<String, String>,
+    /// The backlog item the task is for, which closing it done ticks.
+    #[serde(default)]
+    pub backlog: Option<u64>,
 }
 
 /// What a task is asked to do: the prompt it starts with, and arguments
@@ -164,6 +222,20 @@ pub enum Response {
     },
     /// A task's answer, and what it has come to.
     Result(TaskResult),
+    /// Tasks, as `Request::Tasks` asks for them.
+    Tasks {
+        tasks: Vec<TaskRecord>,
+    },
+    /// A project's backlog.
+    Backlog(Backlog),
+    /// The number a new backlog item got.
+    Added {
+        number: u64,
+    },
+    /// How many items are open on each project's backlog.
+    BacklogCounts {
+        open: BTreeMap<PathBuf, usize>,
+    },
     Done,
     Error {
         message: String,
@@ -196,6 +268,10 @@ pub struct SessionInfo {
     /// say.
     #[serde(default)]
     pub front: Option<Front>,
+    /// What the session's agent was asked to do, when it was, and how that
+    /// went.
+    #[serde(default)]
+    pub task: Option<TaskInfo>,
 }
 
 /// What's in front in a session's terminal: the program its keys go to.
@@ -232,6 +308,78 @@ impl Front {
     pub fn is_agent(&self) -> bool {
         matches!(self, Front::Agent { .. })
     }
+}
+
+/// A session's task: what its agent was asked to do, and, once it's
+/// closed, how that went.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskInfo {
+    /// What the agent was asked to do.
+    pub goal: String,
+    /// Whether it runs in the background, without a terminal.
+    #[serde(default)]
+    pub background: bool,
+    /// The backlog item it's for, which closing it done ticks.
+    #[serde(default)]
+    pub backlog: Option<u64>,
+    /// `None` while the task is open.
+    #[serde(default)]
+    pub outcome: Option<TaskOutcome>,
+}
+
+/// How a task went, once it's closed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskOutcome {
+    pub failed: bool,
+    /// A line on what was done, or why it couldn't be.
+    pub summary: String,
+    /// When it was closed, in seconds since the Unix epoch.
+    pub closed: u64,
+}
+
+/// A task as `crystal tasks` lists it: one still open in a session, or one
+/// closed, from its project's history.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskRecord {
+    pub goal: String,
+    /// The session it ran in, under the name it had then.
+    pub session: String,
+    pub project: String,
+    #[serde(default)]
+    pub branch: Option<String>,
+    #[serde(default)]
+    pub background: bool,
+    #[serde(default)]
+    pub backlog: Option<u64>,
+    /// `None` while it's open.
+    #[serde(default)]
+    pub outcome: Option<TaskOutcome>,
+}
+
+/// One project's backlog: things to do later.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Backlog {
+    /// The project's name, as the sidebar shows it.
+    pub project: String,
+    /// The project's main worktree, or the directory itself outside git.
+    pub path: PathBuf,
+    pub items: Vec<BacklogItem>,
+}
+
+/// A thing to do later.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BacklogItem {
+    /// Its number in the project's backlog, which never changes: #1, #2…
+    pub number: u64,
+    pub text: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    pub done: bool,
+    /// When it was put on the backlog, in seconds since the Unix epoch.
+    pub created: u64,
+    /// When it was done, while it is.
+    #[serde(default)]
+    pub closed: Option<u64>,
 }
 
 /// The git worktree a session runs in, and the project it belongs to.

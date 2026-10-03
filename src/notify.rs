@@ -184,6 +184,7 @@ mod tests {
             activity: Some(Waiting),
             worktree,
             changed: 0,
+            task: None,
         }
     }
 

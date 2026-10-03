@@ -3969,3 +3969,236 @@ fn a_shell_never_looks_like_an_agent_whatever_it_prints() {
     thread::sleep(Duration::from_millis(800));
     assert_eq!(crystal.row("plain").unwrap()[1], "running");
 }
+
+/// A stand-in for Claude Code that does its task: it writes down its
+/// arguments, waits for the test to make the file `$FINISH`, then closes
+/// its task the way it's told to, with `crystal done`, and waits. Returns
+/// the directory to put on the PATH.
+fn finishing_claude(dir: &Path) -> PathBuf {
+    let bin = dir.join("finishing-bin");
+    std::fs::create_dir(&bin).unwrap();
+    script(
+        &bin.join("claude"),
+        &format!(
+            "printf '%s\\n' \"$@\" > args\n\
+             while [ ! -e \"$FINISH\" ]; do sleep 0.05; done\n\
+             {CRYSTAL} done \"did what was asked\"\n\
+             sleep 30\n"
+        ),
+    );
+    bin
+}
+
+/// The `ls --json` entry for `name`.
+fn listed(crystal: &Crystal, name: &str) -> serde_json::Value {
+    let sessions: serde_json::Value = serde_json::from_str(&crystal.ok(&["ls", "--json"])).unwrap();
+    let session = sessions
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["name"] == name);
+    session.unwrap().clone()
+}
+
+#[test]
+fn an_agent_closes_its_task_with_crystal_done_and_ls_shows_how_it_went() {
+    let crystal = Crystal::new();
+    let dir = crystal.dir.path();
+    let bin = finishing_claude(dir);
+    let finish = dir.join("finish");
+    let out = crystal
+        .command(&["new", "-d", "-n", "fixer", "claude", "fix the tests"])
+        .env("PATH", path_of(&[&bin]))
+        .env("FINISH", &finish)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Claude is told how to close its task, and the task is open.
+    let args = written(&dir.join("args"));
+    assert!(args.contains("crystal done"), "{args}");
+    assert!(args.ends_with("fix the tests\n"), "{args}");
+    assert_eq!(crystal.row("fixer").unwrap()[8], "fix the tests");
+    assert_eq!(listed(&crystal, "fixer")["task"]["goal"], "fix the tests");
+
+    std::fs::write(&finish, "").unwrap();
+    eventually("the task is closed", || {
+        crystal.row("fixer").unwrap()[8] == "✓ did what was asked"
+    });
+    let task = &listed(&crystal, "fixer")["task"];
+    assert_eq!(task["outcome"]["failed"], false);
+    assert_eq!(task["outcome"]["summary"], "did what was asked");
+
+    let tasks = crystal.ok(&["tasks"]);
+    assert!(
+        tasks.starts_with("done    fixer") && tasks.contains("fix the tests — did what was asked"),
+        "{tasks}"
+    );
+}
+
+#[test]
+fn done_needs_a_session_with_a_task() {
+    let crystal = Crystal::new();
+    let outside = crystal.fails(&["done", "all of it"]);
+    assert!(
+        outside.contains("isn't running in a crystal session"),
+        "{outside}"
+    );
+
+    crystal.ok(&["new", "-d", "-n", "plain", "sleep", "30"]);
+    let no_task = crystal.fails(&["done", "-n", "plain", "all of it"]);
+    assert!(no_task.contains("plain has no task"), "{no_task}");
+    assert_eq!(crystal.row("plain").unwrap()[8], "-");
+
+    // `-t` makes any session a task, and `-n` closes another's.
+    crystal.ok(&["new", "-d", "-n", "given", "-t", "tidy up", "sleep", "30"]);
+    crystal.ok(&["done", "-n", "given", "--failed", "no", "time"]);
+    assert_eq!(crystal.row("given").unwrap()[8], "✗ no time");
+    let tasks = crystal.ok(&["tasks"]);
+    assert!(
+        tasks.contains("failed  given") && tasks.contains("tidy up — no time"),
+        "{tasks}"
+    );
+}
+
+#[test]
+fn a_background_task_closes_itself_with_the_first_line_of_its_answer() {
+    let crystal = Crystal::new();
+    let dir = crystal.dir.path();
+    let path = path_with(&print_claude(dir));
+    let out = crystal
+        .command(&["task", "-n", "fixer", "fix the tests"])
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    eventually("the task is working", || {
+        status(&crystal, "fixer") == "working"
+    });
+    assert!(crystal.ok(&["tasks"]).starts_with("open    fixer"));
+
+    finish_run(dir, 1);
+    eventually("the task has closed", || {
+        crystal.row("fixer").unwrap()[8] == "✓ All green on run 1."
+    });
+    let tasks = crystal.ok(&["tasks"]);
+    assert!(
+        tasks.contains("fix the tests — All green on run 1."),
+        "{tasks}"
+    );
+}
+
+#[test]
+fn the_backlog_numbers_items_and_ticks_them_off() {
+    let crystal = Crystal::new();
+    let repo = git_repo(crystal.dir.path(), "shop");
+    let repo_dir = repo.to_str().unwrap();
+    let backlog = |args: &[&str]| {
+        let mut all = vec!["backlog", "-C", repo_dir];
+        all.extend(args);
+        crystal.ok(&all)
+    };
+    assert_eq!(
+        backlog(&["add", "write", "the", "docs", "-t", "docs"]),
+        "#1\n"
+    );
+    assert_eq!(backlog(&["add", "fix the cart"]), "#2\n");
+    assert_eq!(
+        backlog(&[]),
+        "#1    write the docs  #docs\n#2    fix the cart\n"
+    );
+
+    // Every worktree of the project shares its backlog.
+    let worktree = crystal.dir.path().join("shop-cart");
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "cart",
+            worktree.to_str().unwrap(),
+        ],
+    );
+    let from_worktree = crystal.ok(&["backlog", "-C", worktree.to_str().unwrap()]);
+    assert_eq!(from_worktree, backlog(&[]));
+
+    backlog(&["done", "1"]);
+    assert_eq!(backlog(&[]), "#2    fix the cart\n");
+    assert_eq!(
+        backlog(&["--all"]),
+        "#2    fix the cart\n#1    ✓ write the docs  #docs\n"
+    );
+    assert_eq!(
+        backlog(&["export"]),
+        "# shop backlog\n\n- [ ] fix the cart (#2)\n- [x] write the docs (#1) #docs\n"
+    );
+    backlog(&["reopen", "1"]);
+    backlog(&["rm", "2"]);
+    assert_eq!(backlog(&[]), "#1    write the docs  #docs\n");
+    let missing = crystal.fails(&["backlog", "-C", repo_dir, "done", "7"]);
+    assert!(
+        missing.contains("there's no #7 on the backlog"),
+        "{missing}"
+    );
+    assert_eq!(
+        backlog(&["add", "after"]),
+        "#3\n",
+        "numbers aren't used again"
+    );
+}
+
+#[test]
+fn a_task_started_from_the_backlog_ticks_its_item_when_it_closes_done() {
+    let crystal = Crystal::new();
+    let dir = crystal.dir.path();
+    let repo = git_repo(dir, "shop");
+    let repo_dir = repo.to_str().unwrap();
+    crystal.ok(&["backlog", "-C", repo_dir, "add", "write the docs"]);
+
+    let bin = finishing_claude(dir);
+    let finish = dir.join("finish");
+    let out = crystal
+        .command(&[
+            "backlog", "-C", repo_dir, "start", "1", "-w", "-d", "-n", "docs",
+        ])
+        .env("PATH", path_of(&[&bin]))
+        .env("FINISH", &finish)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "docs\n");
+
+    // It runs in a worktree named after the item, asked to do what it says.
+    let row = crystal.row("docs").unwrap();
+    assert_eq!(
+        (row[3].as_str(), row[8].as_str()),
+        ("shop", "write the docs")
+    );
+    assert!(row[4].contains("write-the-docs"), "{row:?}");
+    let worktree = PathBuf::from(listed(&crystal, "docs")["cwd"].as_str().unwrap());
+    let args = written(&worktree.join("args"));
+    assert!(args.ends_with("write the docs\n"), "{args}");
+
+    std::fs::write(&finish, "").unwrap();
+    eventually("the item is ticked", || {
+        crystal.ok(&["backlog", "-C", repo_dir]).is_empty()
+    });
+    assert_eq!(
+        crystal.ok(&["backlog", "-C", repo_dir, "--all"]),
+        "#1    ✓ write the docs\n"
+    );
+}

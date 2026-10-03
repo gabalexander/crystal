@@ -45,7 +45,29 @@ pub fn new_session(
     socket: &Path,
     name: Option<String>,
     cwd: PathBuf,
+    command: Vec<String>,
+) -> Result<String> {
+    new_session_for(socket, name, cwd, command, Purpose::default())
+}
+
+/// What a session is started to do, when it's started with something to
+/// do: that makes it a task.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Purpose {
+    /// The task, which is in the command already as the agent's first
+    /// prompt.
+    pub task: Option<String>,
+    /// The backlog item it's for.
+    pub backlog: Option<u64>,
+}
+
+/// [`new_session`], for a session started with `purpose`.
+pub fn new_session_for(
+    socket: &Path,
+    name: Option<String>,
+    cwd: PathBuf,
     mut command: Vec<String>,
+    purpose: Purpose,
 ) -> Result<String> {
     if command.is_empty() {
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
@@ -56,6 +78,8 @@ pub fn new_session(
         cwd,
         command,
         env: env::current(),
+        task: purpose.task,
+        backlog: purpose.backlog,
     });
     match ask(socket, &request, true)? {
         Some(Response::Created { name }) => Ok(name),
@@ -64,19 +88,21 @@ pub fn new_session(
 }
 
 /// Asks the daemon to start a task in `cwd`, with this process's
-/// environment. Starts the daemon if it isn't running. Returns the task's
-/// name.
+/// environment, for backlog item `backlog` if it's for one. Starts the
+/// daemon if it isn't running. Returns the task's name.
 pub fn new_task(
     socket: &Path,
     name: Option<String>,
     cwd: PathBuf,
     spec: TaskSpec,
+    backlog: Option<u64>,
 ) -> Result<String> {
     let request = Request::NewTask(NewTask {
         name,
         cwd,
         spec,
         env: env::current(),
+        backlog,
     });
     match ask(socket, &request, true)? {
         Some(Response::Created { name }) => Ok(name),
