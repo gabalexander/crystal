@@ -357,6 +357,13 @@ pub enum Action {
         path: String,
         name: String,
     },
+    /// Open the history and screen of the pane at `slot` in the user's
+    /// editor, as a new session called `name` in `dir`.
+    EditHistory {
+        slot: Slot,
+        dir: PathBuf,
+        name: String,
+    },
     /// Read the memory of the project at `dir`, off the event loop.
     ReadMemory(PathBuf),
     /// Forget entry `id` of the memory of the project at `dir`.
@@ -1606,6 +1613,7 @@ impl App {
             KeyCode::Char('s') => self.toggle_split(),
             KeyCode::Char('z') => self.toggle_zoom(),
             KeyCode::Char('v') => self.start_copying(),
+            KeyCode::Char('e') => return self.edit_history(),
             KeyCode::Char('t') => return self.new_tab(),
             KeyCode::Char('T') => self.ask_for_tab_name(),
             KeyCode::Char('&') => self.close_tab(),
@@ -2527,6 +2535,23 @@ impl App {
         } else if self.selected_is_own() {
             self.notify("crystal can't show the session it runs in".into());
         }
+    }
+
+    /// `e`: opens what the selected session's pane shows, its history and
+    /// all, in the user's editor, as a session of its own beside it. One
+    /// that's ended can still be read.
+    fn edit_history(&mut self) -> Option<Action> {
+        let slot = self.selected_slot()?;
+        if !self.shows_screen(slot) {
+            if self.selected_is_own() {
+                self.notify("crystal can't show the session it runs in".into());
+            }
+            return None;
+        }
+        let session = self.pane_session(slot)?;
+        let dir = session.cwd.clone();
+        let name = self.free_name(&format!("{}-history", session.name));
+        Some(Action::EditHistory { slot, dir, name })
     }
 
     /// Copy mode is over: the keyboard goes back to the sidebar it came
@@ -4155,6 +4180,42 @@ mod tests {
         app.set_sessions(vec![session("me")]);
         press(&mut app, KeyCode::Char('v'));
         assert_eq!(app.focus(), Focus::Sidebar);
+        assert!(app.notice().unwrap().contains("runs in"));
+    }
+
+    #[test]
+    fn e_opens_the_history_of_the_selected_sessions_pane_in_the_editor() {
+        let mut app = app_with_splits(&["a", "b", "a-history"], 1);
+        app.select("a");
+        // "a-history" is taken: the editor's session is called after it.
+        assert_eq!(
+            press(&mut app, KeyCode::Char('e')),
+            Some(Action::EditHistory {
+                slot: Slot::Split(0),
+                dir: PathBuf::from("/"),
+                name: "a-history-2".into(),
+            })
+        );
+
+        // An ended session's last screen can be read too.
+        let mut app = App::new(None);
+        app.set_sessions(vec![ended("done")]);
+        let edit = press(&mut app, KeyCode::Char('e'));
+        assert!(matches!(
+            edit,
+            Some(Action::EditHistory {
+                slot: Slot::Selected,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn e_has_nothing_to_open_for_the_tuis_own_session_or_none() {
+        let mut app = App::new(Some("me".into()));
+        assert_eq!(press(&mut app, KeyCode::Char('e')), None);
+        app.set_sessions(vec![session("me")]);
+        assert_eq!(press(&mut app, KeyCode::Char('e')), None);
         assert!(app.notice().unwrap().contains("runs in"));
     }
 

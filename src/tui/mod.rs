@@ -701,6 +701,17 @@ impl Tui {
                 command.push(path);
                 self.start_session(Some(name), dir, command)?;
             }
+            Action::EditHistory { slot, dir, name } => {
+                let Some(pane) = self.pane_in(slot) else {
+                    bail!("there's nothing on the pane yet");
+                };
+                let text = pane.screen.text();
+                let path = history_path(&self.socket, &name);
+                write_history(&path, &text)?;
+                let mut command = editor()?;
+                command.push(path.display().to_string());
+                self.start_session(Some(name), dir, command)?;
+            }
             Action::SaveProfile { replacing, profile } => {
                 let saved = profile::save(&config::path(), replacing.as_deref(), &profile);
                 self.profiles_changed(saved, Some(&profile.name));
@@ -1328,6 +1339,25 @@ fn read_codex_models() -> Vec<String> {
         }
         _ => Vec::new(),
     }
+}
+
+/// Where the history a session called `name` opens in the editor is
+/// written: beside the daemon's state, by the name of that session, which
+/// no other running session has, so it never writes over a file an editor
+/// still has open.
+fn history_path(socket: &Path, name: &str) -> PathBuf {
+    let file = format!("{}.txt", name.replace('/', "-"));
+    crate::state::path(socket)
+        .with_file_name("history")
+        .join(file)
+}
+
+/// Writes `text` to `path`, making its directory first.
+fn write_history(path: &Path, text: &str) -> Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).with_context(|| format!("couldn't make {}", dir.display()))?;
+    }
+    std::fs::write(path, text).with_context(|| format!("couldn't write {}", path.display()))
 }
 
 /// The user's editor, as a command line to put a file's path after:

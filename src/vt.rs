@@ -434,6 +434,28 @@ impl Screen {
             .collect()
     }
 
+    /// The history and the screen as text to read in an editor: a line
+    /// that wrapped onto several rows is one line again, the blanks at the
+    /// end of each are left off, and so are the empty rows after the last
+    /// with something on it. Ends in a line break, as a text file does,
+    /// unless there's nothing at all.
+    pub fn text(&self) -> String {
+        let grid = self.term.grid();
+        let start = Point::new(Line(-(grid.history_size() as i32)), Column(0));
+        let end = Point::new(Line(grid.screen_lines() as i32 - 1), grid.last_column());
+        let text = self.term.bounds_to_string(start, end);
+        let lines: Vec<&str> = text.lines().map(str::trim_end).collect();
+        let used = lines
+            .iter()
+            .rposition(|line| !line.is_empty())
+            .map_or(0, |last| last + 1);
+        let mut text = lines[..used].join("\n");
+        if used > 0 {
+            text.push('\n');
+        }
+        text
+    }
+
     /// The screen's rows down to its last one with something on it, as
     /// text with the escapes that color it, to print.
     pub fn styled(&self) -> String {
@@ -1165,6 +1187,24 @@ mod tests {
     fn a_region_that_does_not_start_at_the_top_keeps_no_history() {
         let screen = screen(4, 20, b"\x1b[2;3r\x1b[3;1Hone\n\rtwo\n\rthree");
         assert_eq!(screen.rows(true), screen.rows(false));
+    }
+
+    #[test]
+    fn the_text_is_the_history_then_the_screen_with_wrapped_lines_whole() {
+        let screen = screen(3, 8, b"one\r\nabcdefghij\r\nthree  \r\nfour\r\n");
+        // "abcdefghij" took two rows; the last row is empty.
+        assert_eq!(
+            screen.rows(true),
+            ["one", "abcdefgh", "ij", "three", "four", ""]
+        );
+        assert_eq!(screen.text(), "one\nabcdefghij\nthree\nfour\n");
+    }
+
+    #[test]
+    fn the_text_keeps_blank_lines_between_but_not_after() {
+        let screen = screen(5, 10, b"one\r\n\r\ntwo");
+        assert_eq!(screen.text(), "one\n\ntwo\n");
+        assert_eq!(Screen::new(3, 10).text(), "");
     }
 
     #[test]

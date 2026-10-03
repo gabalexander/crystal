@@ -1324,6 +1324,39 @@ fn copy_mode_finds_text_in_the_history_and_copies_it() {
 }
 
 #[test]
+fn e_opens_a_sessions_history_in_the_editor() {
+    let crystal = Crystal::new();
+    // 120 rows, most of them in the history by the end, and a line longer
+    // than the pane is wide, which wraps onto two rows.
+    let long = "word ".repeat(16);
+    let printing = format!(
+        "for i in $(seq 1 120); do echo row $i; done; echo '{long}'; echo the end; sleep 30"
+    );
+    crystal.ok(&["new", "-n", "printer", "sh", "-c", &printing]);
+    // An editor that keeps a copy of the file it was asked to open.
+    let editor = crystal.dir.path().join("editor");
+    let edited = crystal.dir.path().join("edited");
+    script(
+        &editor,
+        "cp \"$1\" \"$EDITED.new\" && mv \"$EDITED.new\" \"$EDITED\"\nsleep 30\n",
+    );
+
+    let mut tui = crystal.attach_with_env(
+        &[],
+        &[
+            ("EDITOR", editor.to_str().unwrap()),
+            ("EDITED", edited.to_str().unwrap()),
+        ],
+    );
+    tui.shows("the end");
+    tui.type_keys("e");
+    tui.shows("typing into printer-history");
+    let rows: Vec<String> = (1..=120).map(|i| format!("row {i}")).collect();
+    let expected = format!("{}\n{}\nthe end\n", rows.join("\n"), long.trim_end());
+    assert_eq!(written(&edited), expected);
+}
+
+#[test]
 fn a_drag_across_a_pane_copies_what_it_covers() {
     let crystal = Crystal::new();
     crystal.ok(&[

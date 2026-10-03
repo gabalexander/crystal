@@ -54,7 +54,7 @@ pub const KEYS: &[Key] = &[
     sidebar("Enter", "type into it, or rerun"),
     sidebar("Tab/Shift+Tab", "next / previous pane"),
     sidebar("s/z/v", "split / zoom / copy"),
-    sidebar("PageUp/PageDown", "page its history"),
+    sidebar("PgUp/PgDn e", "page / edit its history"),
     sidebar("t/T/&", "tab: new / name / close"),
     sidebar("[/] 1-9 >", "switch tabs / move it"),
     sidebar("n/w", "new, or in a worktree"),
@@ -412,13 +412,13 @@ mod tests {
     #[test]
     fn a_key_label_lines_up_with_the_others() {
         let lines = column(LEFT, &all_rows(), &theme());
-        // Heading first, then `j/k ↓/↑`, padded out to `PageUp/PageDown`.
+        // Heading first, then `j/k ↓/↑`, padded out to `Tab/Shift+Tab`.
         let first: String = lines[1]
             .spans
             .iter()
             .map(|span| span.content.as_ref())
             .collect();
-        let padded = format!("{:<17}select a session", "j/k ↓/↑");
+        let padded = format!("{:<15}select a session", "j/k ↓/↑");
         assert_eq!(first, padded);
     }
 }

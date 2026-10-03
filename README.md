@@ -86,7 +86,8 @@ and the footer says where you are and offers the keys that matter there.
 | `s` | split the selected session off into a pane of its own, or close its split |
 | `z` | [zoom](#zoom-copy-mode-and-search) the selected session's pane to take the whole screen, or put it back |
 | `Tab` / `Shift+Tab` | type into the next pane, or the one before |
-| `PageUp` / `PageDown` | page the selected session's pane back through its history, or forward to live |
+| `PgUp` / `PgDn` | page the selected session's pane back through its history, or forward to live |
+| `e` | open the selected session's [history](#zoom-copy-mode-and-search), and what's on its screen, in your `$EDITOR` |
 | `v` | [copy mode](#zoom-copy-mode-and-search) in the selected session's pane: select, search its history, copy |
 | `t` | make a new [tab](#tabs) with a shell in it, and go to it |
 | `T` | name the tab you're in |
@@ -128,7 +129,7 @@ Each session keeps the last 2,000 rows that scrolled off its screen, so a pane c
 agent wrote before you opened it. The title says how far back you are (`↑ 120 lines`), new output doesn't pull
 you away while you read, and typing into the session brings you back to live. That includes agents that print
 inline through a scroll region, like Codex. To search that history, or copy from it, there's
-[copy mode](#zoom-copy-mode-and-search).
+[copy mode](#zoom-copy-mode-and-search), and `e` opens it in your editor.
 
 The mouse works too. Click a session in the sidebar to select it, or click a pane to type into it. The wheel
 moves the selection over the sidebar, and scrolls a pane through its history. Drag across a pane to select
@@ -336,6 +337,13 @@ What you copy goes to your clipboard. On your own machine crystal hands it to `p
 `wl-copy`, `xclip` or `xsel` on Linux. Over ssh, or with none of those, it asks the terminal you're in to take
 it, with OSC 52, which puts it on the clipboard of the machine your terminal runs on: Ghostty, kitty, WezTerm,
 Alacritty, foot and Windows Terminal do; iTerm2 once you allow it in its settings; macOS's Terminal doesn't.
+
+`e` opens the selected session's history in your `$EDITOR` (or `vi`): everything its pane can page back through,
+then what's on its screen, as plain text, with a line that wrapped onto several rows made whole again. It opens
+as a session of its own, in the session's directory, called after it (`claude-history`), and takes the keyboard,
+so you can search, copy or save from it with the editor you know. It works on a session that has ended too. The
+text is a copy, written beside the daemon's state in `~/.local/state/crystal/history/`: the session goes on as
+before, and editing the file changes nothing in it.
 
 ### Starting a session
 
