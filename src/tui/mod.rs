@@ -507,7 +507,7 @@ impl Tui {
             // to the edge of its pane when the mouse leaves it.
             let cell = ui::nearest_cell(&areas, &self.app, slot, mouse.column, mouse.row);
             hit = Hit::Pane { slot, cell };
-        } else if self.pass_to_program(&mouse, hit) {
+        } else if self.app.grabbed().is_none() && self.pass_to_program(&mouse, hit) {
             return;
         }
         if let Some(action) = self.app.on_mouse(mouse.kind, hit) {

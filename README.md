@@ -84,6 +84,7 @@ and the footer says where you are and offers the keys that matter there.
 | `j` / `k`, `↓` / `↑` | select a session, or a worktree with no sessions |
 | `Enter` | type into the selected session, or start an ended one again, once you've said `y`; on a worktree with no sessions, start one there |
 | `s` | split the selected session off into a pane of its own, or close its split |
+| `H` / `L` | move the selected session's pane a place left or right among the panes (up or down, stacked), swapping it with the pane there |
 | `z` | [zoom](#zoom-copy-mode-and-search) the selected session's pane to take the whole screen, or put it back |
 | `Tab` / `Shift+Tab` | type into the next pane, or the one before |
 | `PgUp` / `PgDn` | page the selected session's pane back through its history, or forward to live |
@@ -142,6 +143,11 @@ A split keeps a session on screen while the selection moves on: up to two of the
 session's pane when each pane can be at least 80 columns wide, and stacked below it when not. Each pane's
 session is sized to its pane. `Tab` from the sidebar goes on to the pane after the one you typed into last, so
 `Tab`, then `Ctrl+\`, then `Tab` again walks through them all.
+
+A new split goes after the other panes. To put them in another order, `H` moves the selected session's pane a
+place to the left and `L` a place to the right (up and down when they're stacked), swapping it with the pane
+that was there; or take a pane by its header line with the mouse and let go over another, and the two swap
+places. Each tab keeps its panes in their order, the next time you open the TUI too.
 
 The sidebar groups sessions by project, then by worktree: `⌂` marks a repository's main worktree and `⎇` a
 linked one, each named by its branch. Sessions outside any repository come last, under their directory.

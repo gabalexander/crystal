@@ -54,6 +54,7 @@ pub const KEYS: &[Key] = &[
     sidebar("Enter", "type into it, or rerun"),
     sidebar("Tab/Shift+Tab", "next / previous pane"),
     sidebar("s/z/v", "split / zoom / copy"),
+    sidebar("H/L", "move its pane"),
     sidebar("PgUp/PgDn e", "page / edit its history"),
     sidebar("t/T/&", "tab: new / name / close"),
     sidebar("[/] 1-9 >", "switch tabs / move it"),
@@ -148,6 +149,11 @@ const RIGHT: &[Section] = &[
     Section::Mouse,
 ];
 
+/// The sections left out, in this order, when there isn't room for them
+/// all: what the new-session panel's own footer says, then how to answer
+/// a question, which the question says.
+const LEFT_OUT_FIRST: &[Section] = &[Section::NewSession, Section::Question];
+
 /// Space between the two columns.
 const GAP: u16 = 2;
 
@@ -158,8 +164,12 @@ const SIDE: u16 = 2;
 /// own, or, where the theme paints nothing, a thin frame.
 pub fn draw(frame: &mut Frame, theme: &Theme, area: Rect, shown: &Shown) {
     let rows = rows(shown);
-    let left = column(LEFT, &rows, theme);
-    let right = column(RIGHT, &rows, theme);
+    // The footer keeps the bottom row, and the overlay's title and how to
+    // close it take one each.
+    let room = usize::from(area.height.saturating_sub(3));
+    let (left, right) = columns(&rows, room);
+    let left = column(&left, &rows, theme);
+    let right = column(&right, &rows, theme);
     let (width, height) = size(&left, &right);
     let overlay = centered(area, width, height);
 
@@ -192,6 +202,43 @@ pub fn draw(frame: &mut Frame, theme: &Theme, area: Rect, shown: &Shown) {
     .areas(inside);
     frame.render_widget(Paragraph::new(left), left_area);
     frame.render_widget(Paragraph::new(right), right_area);
+}
+
+/// Which sections go in each column to fit `room` lines: the sidebar's
+/// keys on the left, with the plugins' under them while they fit, and
+/// everything else on the right. When the left is too long, the plugins'
+/// keys start the right column instead; when the right is too long then,
+/// the sections [`LEFT_OUT_FIRST`] names are left out until it fits.
+fn columns(rows: &[Row], room: usize) -> (Vec<Section>, Vec<Section>) {
+    let lines = |sections: &[Section]| column_lines(sections, rows);
+    let mut left = LEFT.to_vec();
+    let mut right = RIGHT.to_vec();
+    if lines(&left) > room {
+        left.retain(|section| *section != Section::Plugins);
+        right.insert(0, Section::Plugins);
+    }
+    for section in LEFT_OUT_FIRST {
+        if lines(&right) <= room {
+            break;
+        }
+        right.retain(|kept| kept != section);
+    }
+    (left, right)
+}
+
+/// How many lines a column of `sections` takes: see [`column`].
+fn column_lines(sections: &[Section], rows: &[Row]) -> usize {
+    let shown: Vec<Section> = sections
+        .iter()
+        .copied()
+        .filter(|section| rows.iter().any(|row| row.section == *section))
+        .collect();
+    let keys = rows
+        .iter()
+        .filter(|row| shown.contains(&row.section))
+        .count();
+    // Each section's heading, and a blank line between sections.
+    keys + shown.len() + shown.len().saturating_sub(1)
 }
 
 /// Every row the overlay shows: crystal's keys, but those of plugins that
@@ -396,6 +443,53 @@ mod tests {
         assert!(width <= 80, "the overlay is {width} columns wide");
         // The footer keeps the bottom row.
         assert!(height <= 23, "the overlay is {height} rows high");
+    }
+
+    #[test]
+    fn a_column_is_as_long_as_it_says() {
+        let rows = all_rows();
+        for sections in [LEFT, RIGHT] {
+            let lines = column(sections, &rows, &theme()).len();
+            assert_eq!(column_lines(sections, &rows), lines);
+        }
+    }
+
+    /// Every row, with every plugin on and `installed` keys taken by
+    /// installed plugins' actions.
+    fn rows_with_installed(installed: usize) -> Vec<Row> {
+        let keys: Vec<(String, String)> = (0..installed)
+            .map(|n| (format!("{n}"), format!("plugin action {n}")))
+            .collect();
+        rows(&Shown {
+            plugin_on: &|_| true,
+            plugin_keys: &keys,
+        })
+    }
+
+    #[test]
+    fn with_room_the_plugins_keys_go_under_the_sidebars_and_nothing_is_left_out() {
+        let rows = rows_with_installed(2);
+        let (left, right) = columns(&rows, 40);
+        assert_eq!(left, LEFT);
+        assert_eq!(right, RIGHT);
+    }
+
+    #[test]
+    fn at_80_by_24_installed_plugins_keys_are_still_shown() {
+        // 24 rows leave 21 for the columns.
+        for installed in 1..=4 {
+            let rows = rows_with_installed(installed);
+            let (left, right) = columns(&rows, 21);
+            assert!(right.contains(&Section::Plugins), "{installed}: {right:?}");
+            assert!(column_lines(&left, &rows) <= 21);
+            assert!(column_lines(&right, &rows) <= 21, "{installed}: {right:?}");
+            assert!(right.contains(&Section::Pane) && right.contains(&Section::Mouse));
+            assert!(!right.contains(&Section::NewSession));
+        }
+        // With more, how to answer a question goes too.
+        let rows = rows_with_installed(8);
+        let (_, right) = columns(&rows, 21);
+        assert_eq!(right, [Section::Plugins, Section::Pane, Section::Mouse]);
     }
 
     #[test]
