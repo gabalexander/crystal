@@ -12,6 +12,7 @@ mod hook;
 mod keys;
 mod notify;
 mod protocol;
+mod remote;
 mod session;
 mod shell;
 mod skill;
@@ -176,6 +177,20 @@ enum Command {
         #[arg(long, requires = "install")]
         force: bool,
     },
+    /// Run crystal on another machine, over your own ssh: its TUI, or a
+    /// crystal command there, like `crystal ssh box ls`.
+    Ssh {
+        /// Install crystal there, or upgrade it, without asking.
+        #[arg(long)]
+        install: bool,
+
+        /// Where to, the way ssh takes it: `box`, or `me@box.example.com`.
+        destination: String,
+
+        /// The crystal command to run there [default: the TUI]
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Run the daemon in the foreground.
     #[command(hide = true)]
     Daemon,
@@ -292,6 +307,15 @@ fn run(cli: Cli) -> Result<()> {
             } else {
                 skill::print();
             }
+        }
+        Command::Ssh {
+            install,
+            destination,
+            args,
+        } => {
+            let code = remote::run(&destination, &args, install)?;
+            // The remote command's own exit code is crystal's.
+            std::process::exit(code);
         }
         Command::Daemon => daemon::run(&socket)?,
         Command::Hook { agent } => hook::run(&socket, &agent),

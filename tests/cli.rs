@@ -2235,3 +2235,255 @@ fn skill_install_writes_the_skill_and_keeps_a_changed_one() {
     assert!(install(&["skill", "--install", "--force"]).status.success());
     assert_eq!(std::fs::read_to_string(&skill_file).unwrap(), printed);
 }
+
+/// Another machine for `crystal ssh` to reach: a fake ssh that runs the
+/// remote command right here, as if this machine were the other one, with a
+/// home and a PATH of its own.
+struct Remote {
+    _dir: TempDir,
+    home: PathBuf,
+    /// The other machine's PATH, ahead of the system's own directories.
+    bin: PathBuf,
+    ssh: PathBuf,
+}
+
+impl Remote {
+    fn new() -> Remote {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&bin).unwrap();
+        // ssh joins what follows the destination into one command line for
+        // the other machine's shell; this one notes its arguments and runs
+        // that line with `sh -c`.
+        let ssh = dir.path().join("ssh");
+        script(
+            &ssh,
+            r#"printf '%s\n' "$*" >> "$REMOTE_HOME/ssh-calls"
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --) shift; break ;;
+        -*) shift ;;
+        *) break ;;
+    esac
+done
+shift
+HOME="$REMOTE_HOME" PATH="$REMOTE_BIN:/usr/bin:/bin" exec sh -c "$*"
+"#,
+        );
+        Remote {
+            _dir: dir,
+            home,
+            bin,
+            ssh,
+        }
+    }
+
+    /// Puts a stand-in crystal at `path` that says it's `version`, writes
+    /// down the arguments it runs with in `~/ran`, and exits 7 when the
+    /// first is `fail`.
+    fn put_crystal(&self, path: &Path, version: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let body = format!(
+            r#"if [ "$1" = --version ]; then echo "crystal {version}"; exit 0; fi
+printf '%s\n' "$@" > "$HOME/ran"
+if [ "$1" = fail ]; then exit 7; fi
+"#
+        );
+        script(path, &body);
+    }
+
+    fn local_bin_crystal(&self) -> PathBuf {
+        self.home.join(".local/bin/crystal")
+    }
+
+    /// Runs `crystal ssh <args>` through the fake ssh.
+    fn ssh(&self, crystal: &Crystal, args: &[&str]) -> Output {
+        let mut all = vec!["ssh"];
+        all.extend_from_slice(args);
+        crystal
+            .command(&all)
+            .env("CRYSTAL_SSH", &self.ssh)
+            .env("REMOTE_HOME", &self.home)
+            .env("REMOTE_BIN", &self.bin)
+            .output()
+            .unwrap()
+    }
+
+    fn file(&self, name: &str) -> Option<String> {
+        std::fs::read_to_string(self.home.join(name)).ok()
+    }
+}
+
+/// Writes an executable shell script.
+fn script(path: &Path, body: &str) {
+    std::fs::write(path, format!("#!/bin/sh\n{body}")).unwrap();
+    let mut permissions = std::fs::metadata(path).unwrap().permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+    std::fs::set_permissions(path, permissions).unwrap();
+}
+
+const OUR_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+#[test]
+fn ssh_runs_a_crystal_command_on_the_other_machine() {
+    let crystal = Crystal::new();
+    let remote = Remote::new();
+    remote.put_crystal(&remote.bin.join("crystal"), OUR_VERSION);
+
+    let out = remote.ssh(&crystal, &["box", "ls", "--json"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(remote.file("ran").unwrap(), "ls\n--json\n");
+    // Not at a terminal, so no terminal is asked for over there.
+    // Two calls, one to find crystal and one to run it; the first carries a
+    // script of several lines.
+    let calls = remote.file("ssh-calls").unwrap();
+    let starts = calls.lines().filter(|line| line.starts_with("-- box "));
+    assert_eq!(starts.count(), 2, "{calls}");
+    assert!(
+        !calls.lines().any(|line| line.starts_with("-t ")),
+        "{calls}"
+    );
+}
+
+#[test]
+fn ssh_finds_crystal_where_the_install_script_puts_it() {
+    let crystal = Crystal::new();
+    let remote = Remote::new();
+    // The Crystal language's `crystal` on the PATH isn't ours.
+    script(
+        &remote.bin.join("crystal"),
+        "echo 'Crystal 1.11.2 [LLVM 15]'\n",
+    );
+    remote.put_crystal(&remote.local_bin_crystal(), OUR_VERSION);
+
+    let out = remote.ssh(&crystal, &["box", "ls"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(remote.file("ran").unwrap(), "ls\n");
+}
+
+#[test]
+fn ssh_hands_over_arguments_exactly_as_typed() {
+    let crystal = Crystal::new();
+    let remote = Remote::new();
+    remote.put_crystal(&remote.bin.join("crystal"), OUR_VERSION);
+
+    let prompt = r#"it's $HOME and "quoted"; rm -rf ~"#;
+    let out = remote.ssh(&crystal, &["box", "new", "-d", "claude", prompt]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        remote.file("ran").unwrap(),
+        format!("new\n-d\nclaude\n{prompt}\n")
+    );
+}
+
+#[test]
+fn ssh_exits_the_way_the_command_over_there_did() {
+    let crystal = Crystal::new();
+    let remote = Remote::new();
+    remote.put_crystal(&remote.bin.join("crystal"), OUR_VERSION);
+
+    let out = remote.ssh(&crystal, &["box", "fail"]);
+    assert_eq!(out.status.code(), Some(7));
+}
+
+#[test]
+fn ssh_wont_install_crystal_without_being_asked_to() {
+    let crystal = Crystal::new();
+    let remote = Remote::new();
+
+    let out = remote.ssh(&crystal, &["box", "ls"]);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("isn't installed on box"), "{err}");
+    assert!(err.contains("crystal ssh --install box"), "{err}");
+    assert_eq!(remote.file("curl-calls"), None);
+}
+
+#[test]
+fn ssh_install_runs_the_install_script_there_then_the_command() {
+    let crystal = Crystal::new();
+    let remote = Remote::new();
+    // A curl that hands out an "install script" putting a stand-in crystal
+    // where the real one goes; nothing is downloaded.
+    remote.put_crystal(&remote.bin.join("to-install"), OUR_VERSION);
+    script(
+        &remote.bin.join("curl"),
+        r#"echo "$*" >> "$HOME/curl-calls"
+echo 'mkdir -p "$HOME/.local/bin" && cp "$REMOTE_BIN/to-install" "$HOME/.local/bin/crystal"'
+"#,
+    );
+
+    let out = remote.ssh(&crystal, &["--install", "box", "ls"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(remote.file("curl-calls").unwrap().contains("install.sh"));
+    assert_eq!(remote.file("ran").unwrap(), "ls\n");
+}
+
+#[test]
+fn ssh_says_when_crystal_over_there_is_another_version() {
+    let crystal = Crystal::new();
+    let remote = Remote::new();
+    remote.put_crystal(&remote.bin.join("crystal"), "0.0.1");
+
+    let out = remote.ssh(&crystal, &["box", "ls"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("crystal on box is 0.0.1") && err.contains(OUR_VERSION),
+        "{err}"
+    );
+    // Not asked to upgrade, and no one at a terminal to ask: it runs as is.
+    assert_eq!(remote.file("curl-calls"), None);
+    assert_eq!(remote.file("ran").unwrap(), "ls\n");
+}
+
+#[test]
+fn ssh_uses_the_ssh_on_the_path() {
+    let crystal = Crystal::new();
+    let remote = Remote::new();
+    remote.put_crystal(&remote.bin.join("crystal"), OUR_VERSION);
+    let path_dir = tempfile::tempdir().unwrap();
+    std::fs::copy(&remote.ssh, path_dir.path().join("ssh")).unwrap();
+    let path = format!(
+        "{}:{}",
+        path_dir.path().display(),
+        std::env::var("PATH").unwrap()
+    );
+
+    let out = crystal
+        .command(&["ssh", "box", "ls"])
+        .env_remove("CRYSTAL_SSH")
+        .env("PATH", path)
+        .env("REMOTE_HOME", &remote.home)
+        .env("REMOTE_BIN", &remote.bin)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(remote.file("ran").unwrap(), "ls\n");
+}
