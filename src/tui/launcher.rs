@@ -23,7 +23,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph};
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// How many earlier tasks are remembered, for Up to bring back.
 const HISTORY_LENGTH: usize = 100;
@@ -792,29 +792,11 @@ impl Memory {
     }
 }
 
-/// Where the memory of the daemon at `socket`'s TUI is kept: beside the
-/// sessions the daemon writes down.
-pub fn memory_path(socket: &Path) -> PathBuf {
-    crate::state::path(socket).with_file_name("launcher.json")
-}
-
-/// The memory kept at `path`. One that's missing or can't be read is an
-/// empty one: forgetting earlier tasks is no reason to stop.
-pub fn load_memory(path: &Path) -> Memory {
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|text| serde_json::from_str(&text).ok())
+/// The memory kept as `json`. None, or one that can't be read, is an empty
+/// one: forgetting earlier tasks is no reason to stop.
+pub fn read_memory(json: Option<&str>) -> Memory {
+    json.and_then(|json| serde_json::from_str(json).ok())
         .unwrap_or_default()
-}
-
-/// Keeps `memory` at `path`, if it can.
-pub fn save_memory(path: &Path, memory: &Memory) {
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    if let Ok(text) = serde_json::to_string_pretty(memory) {
-        let _ = std::fs::write(path, text);
-    }
 }
 
 /// The panel's place over `area`, the panes: as wide as reads well, near

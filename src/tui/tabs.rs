@@ -10,7 +10,6 @@
 //! again the next time the TUI opens. Nothing else here does any I/O.
 
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
 
 /// How many tabs there can be: one for each of the keys 1 to 9.
 pub const MAX_TABS: usize = 9;
@@ -289,31 +288,13 @@ impl Tabs {
     }
 }
 
-/// Where the TUI of the daemon at `socket` keeps its tabs: beside what the
-/// new-session panel remembers.
-pub fn path(socket: &Path) -> PathBuf {
-    crate::state::path(socket).with_file_name("tabs.json")
-}
-
-/// The tabs kept at `path`. When there are none, or they can't be read, or
+/// The tabs kept as `json`. When there are none, or they can't be read, or
 /// they were written in another shape, it's one tab: losing a layout is no
 /// reason not to start, and every session joins that tab.
-pub fn load(path: &Path) -> Tabs {
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|text| serde_json::from_str::<Tabs>(&text).ok())
+pub fn read(json: Option<&str>) -> Tabs {
+    json.and_then(|json| serde_json::from_str::<Tabs>(json).ok())
         .and_then(Tabs::kept)
         .unwrap_or_default()
-}
-
-/// Keeps `tabs` at `path`, if it can.
-pub fn save(path: &Path, tabs: &Tabs) {
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    if let Ok(text) = serde_json::to_string_pretty(tabs) {
-        let _ = std::fs::write(path, text);
-    }
 }
 
 #[cfg(test)]
@@ -500,9 +481,7 @@ mod tests {
     }
 
     #[test]
-    fn tabs_kept_on_disk_come_back_as_they_were() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("state/tabs.json");
+    fn tabs_kept_come_back_as_they_were() {
         let mut tabs = three_tabs();
         tabs.put("agent", 2);
         tabs.put("server", 2);
@@ -512,34 +491,27 @@ mod tests {
         tabs.current_mut().selection_at = 1;
         tabs.current_mut().floating = Some("agent".into());
         tabs.go_to(1);
-        save(&path, &tabs);
-        assert_eq!(load(&path), tabs);
+        let json = serde_json::to_string(&tabs).unwrap();
+        assert_eq!(read(Some(&json)), tabs);
     }
 
     #[test]
     fn tabs_kept_before_they_could_zoom_come_back_unzoomed() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("tabs.json");
         let kept = r#"{"version": 2, "tabs": [{"name": "a", "sessions": ["x"], "splits": []}]}"#;
-        std::fs::write(&path, kept).unwrap();
-        let tabs = load(&path);
+        let tabs = read(Some(kept));
         assert_eq!(tabs.current().sessions, ["x"]);
         assert!(!tabs.current().zoomed);
     }
 
     #[test]
     fn tabs_kept_before_panes_could_move_have_the_selections_pane_first() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("tabs.json");
         let kept = r#"{"version": 2, "tabs": [{"sessions": ["x", "y"], "splits": ["y"]}]}"#;
-        std::fs::write(&path, kept).unwrap();
-        assert_eq!(load(&path).current().selection_pane_at(), 0);
+        assert_eq!(read(Some(kept)).current().selection_pane_at(), 0);
 
         // One past the panes there are is put back after the last.
         let kept = r#"{"version": 2, "tabs": [{"sessions": ["x", "y"], "splits": ["y"],
             "selection_at": 7}]}"#;
-        std::fs::write(&path, kept).unwrap();
-        assert_eq!(load(&path).current().selection_at, 1);
+        assert_eq!(read(Some(kept)).current().selection_at, 1);
     }
 
     #[test]
@@ -572,13 +544,10 @@ mod tests {
     }
 
     #[test]
-    fn a_float_read_from_a_file_is_one_of_its_tabs_sessions_and_not_split_too() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("tabs.json");
+    fn a_float_read_back_is_one_of_its_tabs_sessions_and_not_split_too() {
         let kept = r#"{"version": 2, "tabs": [{"sessions": ["x", "y"], "splits": ["x", "y"],
             "floating": "x"}, {"sessions": ["z"], "floating": "y"}]}"#;
-        std::fs::write(&path, kept).unwrap();
-        let tabs = load(&path);
+        let tabs = read(Some(kept));
         assert_eq!(tabs.all()[0].floating.as_deref(), Some("x"));
         assert_eq!(tabs.all()[0].splits, ["y"]);
         assert_eq!(tabs.all()[1].floating, None);
@@ -586,36 +555,24 @@ mod tests {
 
     #[test]
     fn with_nothing_to_read_there_is_one_tab() {
-        let dir = tempfile::tempdir().unwrap();
-        let missing = dir.path().join("tabs.json");
-        assert_eq!(load(&missing), Tabs::default());
-
-        std::fs::write(&missing, "not json").unwrap();
-        assert_eq!(load(&missing), Tabs::default());
-
-        std::fs::write(&missing, r#"{"version": 2, "tabs": []}"#).unwrap();
-        assert_eq!(load(&missing), Tabs::default());
+        assert_eq!(read(None), Tabs::default());
+        assert_eq!(read(Some("not json")), Tabs::default());
+        assert_eq!(read(Some(r#"{"version": 2, "tabs": []}"#)), Tabs::default());
     }
 
     #[test]
     fn tabs_kept_before_they_held_sessions_are_ignored() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("tabs.json");
         let old = r#"{"tabs": [{"name": "one", "selected": "claude-2", "splits": []},
             {"name": "", "selected": "claude-2", "splits": []}], "current": 1}"#;
-        std::fs::write(&path, old).unwrap();
-        assert_eq!(load(&path), Tabs::default());
+        assert_eq!(read(Some(old)), Tabs::default());
     }
 
     #[test]
-    fn tabs_read_from_a_file_are_put_right() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("tabs.json");
+    fn tabs_read_back_are_put_right() {
         let tab = r#"{"name": "x", "sessions": ["a", "b", "c"], "splits": ["a", "b", "c", "d"]}"#;
         let many = [tab; 12].join(",");
         let text = format!(r#"{{"version": 2, "tabs": [{many}], "current": 20}}"#);
-        std::fs::write(&path, text).unwrap();
-        let tabs = load(&path);
+        let tabs = read(Some(&text));
         assert_eq!(tabs.all().len(), MAX_TABS);
         assert_eq!(tabs.current_index(), MAX_TABS - 1);
         assert_eq!(tabs.all()[0].sessions, ["a", "b", "c"]);

@@ -6,6 +6,7 @@ use crate::agents;
 use crate::backlog;
 use crate::codex;
 use crate::config::{Config, MemorySettings};
+use crate::db::Db;
 use crate::distill::{self, Job};
 use crate::embed;
 use crate::env;
@@ -16,14 +17,14 @@ use crate::mcp;
 use crate::memory;
 use crate::notify::{self, Notice};
 use crate::plugin_hooks::{self, Event, Hooks};
-use crate::project::{self, Project};
+use crate::project;
 use crate::protocol::{
     self, Activity, AgentEvent, Backlog, Conversation, Frame, NewSession, NewTask, Request,
     Response, TaskInfo, TaskRecord,
 };
 use crate::session::{STOP_GRACE, Session, Term};
 use crate::socket;
-use crate::state::{self, SavedSession};
+use crate::state::SavedSession;
 use crate::tasks;
 use crate::typing;
 use anyhow::{Context, Result, bail, ensure};
@@ -49,14 +50,15 @@ pub fn run(socket: &Path) -> Result<()> {
     unsafe {
         libc::setsid();
     }
+    // Before listening: a daemon that can't keep its state doesn't start,
+    // rather than run with none and write over it.
+    let db = Db::open(socket)?;
     let listener = listen(socket)?;
     let daemon = Arc::new(Daemon {
         socket: socket.to_path_buf(),
-        state: state::path(socket),
-        flows_file: state::flows_path(socket),
+        db: Mutex::new(db),
         sessions: Mutex::default(),
         flows: Mutex::default(),
-        stores: Mutex::default(),
         hooks: Hooks::new(socket),
         distilling: Arc::default(),
         preparing: Arc::default(),
@@ -103,12 +105,11 @@ fn listen(socket: &Path) -> Result<UnixListener> {
 
 struct Daemon {
     socket: PathBuf,
-    /// Where the running sessions are written down, to start them again
-    /// after a restart.
-    state: PathBuf,
-    /// Where the flow runs are written down, to take them up again after a
-    /// restart.
-    flows_file: PathBuf,
+    /// Where the running sessions and the flow runs are written down, to
+    /// start them again after a restart, and each project's backlog and
+    /// task history. Whoever needs it and `sessions` or `flows` locks those
+    /// first, and this last.
+    db: Mutex<Db>,
     /// In the order they were created, which is the order `ls` shows.
     sessions: Mutex<Vec<Session>>,
     /// Every flow run, the oldest first. A run's steps are sessions, so
@@ -116,9 +117,6 @@ struct Daemon {
     /// other way round, which could leave two threads each waiting on the
     /// other.
     flows: Mutex<Vec<FlowRun>>,
-    /// Held while a project's backlog or task history is read and written
-    /// back, so two requests at once can't each write over the other.
-    stores: Mutex<()>,
     /// The plugins' hooks, told what happens.
     hooks: Hooks,
     /// The sessions the distiller is reading now, by id: one pass at a
@@ -176,7 +174,12 @@ impl Daemon {
     /// stopped without being asked to: it crashed, or the machine rebooted.
     fn start_saved_sessions(&self) {
         let mut sessions = self.sessions.lock().unwrap();
-        for saved in state::load(&self.state) {
+        let saved = self.db.lock().unwrap().sessions();
+        let saved = saved.unwrap_or_else(|err| {
+            eprintln!("crystal daemon: couldn't read the sessions to start again: {err:#}");
+            Vec::new()
+        });
+        for saved in saved {
             let goal = saved.goal.clone();
             let backlog = goal.as_ref().and_then(|goal| goal.backlog);
             let started = match saved.task {
@@ -271,14 +274,14 @@ impl Daemon {
             // can never be written after a shutdown has emptied it.
             let saved: Vec<SavedSession> = sessions.iter().filter_map(Session::saved).collect();
             if saved != last_saved {
-                match state::save(&self.state, &saved) {
+                match self.db.lock().unwrap().save_sessions(&saved) {
                     Ok(()) => last_saved = saved,
                     Err(err) => eprintln!("crystal daemon: couldn't save the sessions: {err:#}"),
                 }
             }
             let runs = self.flows.lock().unwrap().clone();
             if runs != last_runs {
-                match flow_run::save(&self.flows_file, &runs) {
+                match self.db.lock().unwrap().save_flow_runs(&runs) {
                     Ok(()) => last_runs = runs,
                     Err(err) => eprintln!("crystal daemon: couldn't save the flow runs: {err:#}"),
                 }
@@ -292,7 +295,11 @@ impl Daemon {
     /// daemon's environment, as the sessions it starts again do.
     fn take_up_flows(&self) {
         let mut sessions = self.sessions.lock().unwrap();
-        let mut runs = flow_run::load(&self.flows_file);
+        let runs = self.db.lock().unwrap().flow_runs();
+        let mut runs = runs.unwrap_or_else(|err| {
+            eprintln!("crystal daemon: couldn't read the flow runs: {err:#}");
+            Vec::new()
+        });
         for run in &mut runs {
             run.interrupt();
             run.env = env::current();
@@ -498,24 +505,24 @@ impl Daemon {
     /// item. Then the distiller reads what it did.
     fn write_down_closed(&self, session: &Session, task: &TaskRecord) {
         let cwd = session.cwd();
-        let _stores = self.stores.lock().unwrap();
-        let dir = state::project_dir(&self.socket, &project::of(cwd).path);
-        if let Err(err) = tasks::record(&dir, task) {
-            eprintln!("crystal daemon: couldn't write down a closed task: {err:#}");
+        let project = project::of(cwd).path;
+        {
+            let mut db = self.db.lock().unwrap();
+            if let Err(err) = db.record_task(&project, task) {
+                eprintln!("crystal daemon: couldn't write down a closed task: {err:#}");
+            }
+            let done = task.outcome.as_ref().is_some_and(|outcome| !outcome.failed);
+            let ticks = done && backlog::enabled(&settings());
+            if let (true, Some(number)) = (ticks, task.backlog) {
+                let ticked =
+                    db.change_backlog(&project, |store| store.mark(number, true, now_seconds()));
+                if let Err(err) = ticked {
+                    eprintln!("crystal daemon: couldn't tick #{number} on the backlog: {err:#}");
+                }
+            }
         }
         self.hooks.tell(Event::task_closed(cwd, task));
         self.remember_outcome(cwd, task);
-        let done = task.outcome.as_ref().is_some_and(|outcome| !outcome.failed);
-        let ticks = done && backlog::enabled(&settings());
-        if let (true, Some(number)) = (ticks, task.backlog) {
-            let mut backlog = backlog::Store::load(&dir);
-            let ticked = backlog
-                .mark(number, true, now_seconds())
-                .and_then(|()| backlog.save(&dir));
-            if let Err(err) = ticked {
-                eprintln!("crystal daemon: couldn't tick #{number} on the backlog: {err:#}");
-            }
-        }
         self.distill_later(session, task);
     }
 
@@ -897,8 +904,7 @@ impl Daemon {
             Request::BacklogList { dir, all } => {
                 backlog::ensure_enabled(&settings())?;
                 let project = project::of(&dir);
-                let _stores = self.stores.lock().unwrap();
-                let store = backlog::Store::load(&self.project_dir(&project));
+                let store = self.db.lock().unwrap().backlog(&project.path)?;
                 Ok(Response::Backlog(Backlog {
                     project: project.name,
                     path: project.path,
@@ -920,15 +926,14 @@ impl Daemon {
             }
             Request::BacklogCounts { projects } => {
                 backlog::ensure_enabled(&settings())?;
-                let _stores = self.stores.lock().unwrap();
+                let mut db = self.db.lock().unwrap();
                 let open = projects
                     .into_iter()
                     .map(|path| {
-                        let dir = state::project_dir(&self.socket, &path);
-                        let count = backlog::Store::load(&dir).open_count();
-                        (path, count)
+                        let count = db.backlog(&path)?.open_count();
+                        Ok((path, count))
                     })
-                    .collect();
+                    .collect::<Result<_>>()?;
                 Ok(Response::BacklogCounts { open })
             }
             Request::StartFlow {
@@ -974,15 +979,12 @@ impl Daemon {
                     thread::sleep(Duration::from_millis(20));
                 }
                 // Asked to stop, the sessions stay stopped.
-                state::forget(&self.state);
+                if let Err(err) = self.db.lock().unwrap().save_sessions(&[]) {
+                    eprintln!("crystal daemon: couldn't forget the sessions: {err:#}");
+                }
                 Ok(Response::Done)
             }
         }
-    }
-
-    /// Where the daemon keeps what it knows of `project`.
-    fn project_dir(&self, project: &Project) -> PathBuf {
-        state::project_dir(&self.socket, &project.path)
     }
 
     /// Changes the backlog of the project `dir` is in with `change`, and
@@ -994,12 +996,10 @@ impl Daemon {
     ) -> Result<T> {
         backlog::ensure_enabled(&settings())?;
         let project = project::of(dir);
-        let _stores = self.stores.lock().unwrap();
-        let dir = self.project_dir(&project);
-        let mut store = backlog::Store::load(&dir);
-        let changed = change(&mut store)?;
-        store.save(&dir)?;
-        Ok(changed)
+        self.db
+            .lock()
+            .unwrap()
+            .change_backlog(&project.path, change)
     }
 
     /// The tasks of the project `dir` is in, or every project's with `all`:
@@ -1017,13 +1017,12 @@ impl Daemon {
                 .filter(|task| task.outcome.is_none())
                 .collect()
         };
-        let _stores = self.stores.lock().unwrap();
-        let dirs = if all {
-            state::project_dirs(&self.socket)
-        } else {
-            vec![self.project_dir(&project)]
-        };
-        let mut closed: Vec<TaskRecord> = dirs.iter().flat_map(|dir| tasks::load(dir)).collect();
+        let mine = (!all).then_some(project.path.as_path());
+        let closed = self.db.lock().unwrap().closed_tasks(mine);
+        let mut closed = closed.unwrap_or_else(|err| {
+            eprintln!("crystal daemon: couldn't read the closed tasks: {err:#}");
+            Vec::new()
+        });
         closed.sort_by_key(|task| {
             std::cmp::Reverse(task.outcome.as_ref().map_or(0, |outcome| outcome.closed))
         });

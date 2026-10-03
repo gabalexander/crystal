@@ -1872,9 +1872,26 @@ impl Crystal {
         daemon
     }
 
-    /// The sessions the daemon has written down, as JSON.
+    /// The sessions the daemon has written down in its database, as a JSON
+    /// list, or nothing when there are none.
     fn saved(&self) -> String {
-        std::fs::read_to_string(self.socket.with_extension("sessions.json")).unwrap_or_default()
+        let list = "SELECT json_group_array(json_object('name', name, 'command', json(command), \
+                    'cwd', cwd, 'conversation', json(conversation), 'task', json(task), \
+                    'goal', json(goal))) FROM (SELECT * FROM sessions ORDER BY position)";
+        let json = self.query(list).unwrap_or_default();
+        if json == "[]" { String::new() } else { json }
+    }
+
+    /// The one value `sql` reads from the daemon's database, when there's
+    /// a database to read.
+    fn query(&self, sql: &str) -> Option<String> {
+        let file = self.socket.with_extension("db");
+        if !file.exists() {
+            return None;
+        }
+        let conn = rusqlite::Connection::open(file).ok()?;
+        conn.busy_timeout(Duration::from_secs(5)).ok()?;
+        conn.query_row(sql, [], |row| row.get(0)).ok()
     }
 }
 
@@ -2328,7 +2345,8 @@ fn a_layout_saved_puts_the_tabs_back_the_way_they_were() {
     // The tabs it replaced are kept, to go back to.
     tui.type_keys("S");
     tui.shows("↶ before side by side");
-    assert!(crystal.dir.path().join("layouts.json").exists());
+    let layouts = crystal.query("SELECT json FROM ui WHERE name = 'layouts'");
+    assert!(layouts.unwrap().contains("side by side"));
 }
 
 #[test]

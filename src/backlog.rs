@@ -1,6 +1,6 @@
 //! A project's backlog: things worth doing later that aren't anyone's task
-//! yet. The daemon keeps one per project, in the project's directory in the
-//! state dir, and it's the only one that writes it.
+//! yet. The daemon keeps one per project, in its database, and it's the only
+//! one that writes it.
 //!
 //! Items are numbered per project, #1 on, and keep their number: it's how
 //! a person or an agent names one, and how a task started for an item says
@@ -14,11 +14,6 @@ use crate::plugins;
 use crate::protocol::BacklogItem;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use std::fs;
-use std::path::Path;
-
-/// The file a project's backlog is kept in, in its directory.
-const FILE: &str = "backlog.json";
 
 /// Whether the backlog is on: the `backlog` plugin.
 pub fn enabled(config: &Config) -> bool {
@@ -30,33 +25,16 @@ pub fn ensure_enabled(config: &Config) -> Result<()> {
     plugins::ensure_enabled(config, "backlog")
 }
 
-/// A project's backlog as it's kept: its items, and the number the next one
-/// gets, which is never reused, not even after an item is removed.
+/// A project's backlog as it's kept: its items, and the number the last one
+/// got, which is never given again, not even after an item is removed. The
+/// same as JSON is how each project's backlog was kept before the database.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Store {
-    next: u64,
-    items: Vec<BacklogItem>,
+    pub next: u64,
+    pub items: Vec<BacklogItem>,
 }
 
 impl Store {
-    /// The backlog kept in `dir`, or an empty one when there's none yet.
-    pub fn load(dir: &Path) -> Store {
-        let Ok(text) = fs::read_to_string(dir.join(FILE)) else {
-            return Store::default();
-        };
-        serde_json::from_str(&text).unwrap_or_default()
-    }
-
-    pub fn save(&self, dir: &Path) -> Result<()> {
-        fs::create_dir_all(dir)?;
-        // Written beside it first, then moved into place in one step, so
-        // a reader never finds half a file.
-        let unfinished = dir.join(format!("{FILE}.unfinished"));
-        fs::write(&unfinished, serde_json::to_string_pretty(self)?)?;
-        fs::rename(&unfinished, dir.join(FILE))?;
-        Ok(())
-    }
-
     /// Puts `text` on the backlog, at `now`, and gives back its number.
     pub fn add(&mut self, text: &str, tags: Vec<String>, now: u64) -> Result<u64> {
         let text = text.trim();
@@ -194,16 +172,6 @@ mod tests {
         assert!(store.mark(7, true, 0).is_err());
         assert!(store.remove(7).is_err());
         assert!(store.add("   ", Vec::new(), 0).is_err());
-    }
-
-    #[test]
-    fn a_saved_backlog_loads_back_the_same() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut store = store_with(&["write the docs"]);
-        store.add("tag me", vec!["ui".into()], 5).unwrap();
-        store.save(dir.path()).unwrap();
-        assert_eq!(Store::load(dir.path()), store);
-        assert_eq!(Store::load(&dir.path().join("none")), Store::default());
     }
 
     #[test]

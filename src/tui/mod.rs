@@ -36,6 +36,7 @@ mod theme;
 mod ui;
 
 use crate::config::{self, Config};
+use crate::db::{self, Db};
 use crate::flow_run::FlowRun;
 use crate::github::{self, Issue, PullRequest};
 use crate::memory::{self, Listed, Memory};
@@ -49,7 +50,7 @@ use app::{Action, App, Focus, Hit, Place, PluginKey, PluginPane, Slot};
 use backlog_view::BacklogChange;
 use crossterm::event::{Event as TerminalEvent, KeyEvent, KeyEventKind, MouseEvent};
 use diff_view::Against;
-use layouts::Which;
+use layouts::{Layouts, Which};
 use pane::Pane;
 use ratatui::DefaultTerminal;
 use ratatui::layout::Rect;
@@ -203,8 +204,12 @@ pub fn run(socket: &Path) -> Result<()> {
         sender.clone(),
     );
 
+    // Losing the tabs is no reason not to start: without the database, the
+    // TUI starts with one tab, and says why when asked for a layout.
+    let db = Db::open(socket).map_err(|err| format!("{err:#}"));
     let mut tui = Tui {
         socket: socket.to_path_buf(),
+        db,
         app: App::new(env::own_session_id(socket)),
         panes: Vec::new(),
         last_pane_id: 0,
@@ -215,9 +220,6 @@ pub fn run(socket: &Path) -> Result<()> {
         list_worktrees_now,
         theme: Theme::from_env(config.theme),
         started: Instant::now(),
-        memory_path: launcher::memory_path(socket),
-        tabs_path: tabs::path(socket),
-        layouts_path: layouts::path(socket),
         kept_tabs: tabs::Tabs::default(),
         quitting: false,
         overlay: None,
@@ -230,12 +232,13 @@ pub fn run(socket: &Path) -> Result<()> {
     tui.app.set_launch_settings(&config);
     tui.app.set_features(&config);
     tui.app.set_plugin_keys(plugin_keys(&config));
-    tui.app.set_memory(launcher::load_memory(&tui.memory_path));
+    tui.app
+        .set_memory(launcher::read_memory(tui.ui(db::LAUNCHER).as_deref()));
     if tui.app.shows_flows() {
         tui.app.set_flows(list_flows(socket));
     }
     tui.set_sessions(sessions);
-    tui.app.set_tabs(tabs::load(&tui.tabs_path));
+    tui.app.set_tabs(tabs::read(tui.ui(db::TABS).as_deref()));
     tui.kept_tabs = tui.app.tabs_to_keep();
 
     let mut terminal = ratatui::try_init()?;
@@ -289,6 +292,9 @@ fn modes_off() {
 
 struct Tui {
     socket: PathBuf,
+    /// Where the tabs, the layouts and the new-session panel's memory are
+    /// kept, or why it couldn't be opened.
+    db: Result<Db, String>,
     app: App,
     /// A viewer of each session a pane shows: the selected one and the
     /// split ones. No session is shown twice, so its id finds its pane.
@@ -323,13 +329,8 @@ struct Tui {
     theme: Theme,
     /// When the TUI started: the working mark turns with the time since.
     started: Instant,
-    /// Where the new-session panel's memory is kept.
-    memory_path: PathBuf,
-    /// Where the tabs are kept, and the tabs as they were last kept there.
-    tabs_path: PathBuf,
+    /// The tabs as they were last kept.
     kept_tabs: tabs::Tabs,
-    /// Where the layouts are kept.
-    layouts_path: PathBuf,
     quitting: bool,
 }
 
@@ -391,9 +392,37 @@ impl Tui {
     fn keep_tabs(&mut self) {
         let tabs = self.app.tabs_to_keep();
         if tabs != self.kept_tabs {
-            tabs::save(&self.tabs_path, &tabs);
+            if let Ok(db) = &self.db {
+                let _ = db.keep_ui(db::TABS, &tabs);
+            }
             self.kept_tabs = tabs;
         }
+    }
+
+    /// The document called `name` the TUI keeps, when there's one to read.
+    fn ui(&self, name: &str) -> Option<String> {
+        self.db.as_ref().ok()?.ui(name).ok()?
+    }
+
+    /// Keeps what the new-session panel remembers, if it can.
+    fn keep_memory(&self) {
+        if let Ok(db) = &self.db {
+            let _ = db.keep_ui(db::LAUNCHER, self.app.memory());
+        }
+    }
+
+    /// The layouts saved with `S`, or why they can't be read.
+    fn layouts(&self) -> Result<Layouts, String> {
+        let db = self.db.as_ref().map_err(Clone::clone)?;
+        let json = db
+            .ui(db::LAYOUTS)
+            .map_err(|err| format!("couldn't read the saved layouts: {err:#}"))?;
+        layouts::read(json.as_deref())
+    }
+
+    fn keep_layouts(&self, layouts: &Layouts) -> Result<()> {
+        let db = self.db.as_ref().map_err(|why| anyhow::anyhow!("{why}"))?;
+        db.keep_ui(db::LAYOUTS, layouts)
     }
 
     /// The directory a new session at `place` starts in, as
@@ -600,7 +629,7 @@ impl Tui {
                 let cwd = self.start_dir(place)?;
                 let name = client::new_session_for(&self.socket, None, cwd, command, purpose)?;
                 self.show_new_session(&name)?;
-                launcher::save_memory(&self.memory_path, self.app.memory());
+                self.keep_memory();
             }
             Action::StartInBackground {
                 place,
@@ -612,7 +641,7 @@ impl Tui {
                 // A background task takes no keys: the sidebar keeps them.
                 self.refresh_sessions()?;
                 self.app.select(&name);
-                launcher::save_memory(&self.memory_path, self.app.memory());
+                self.keep_memory();
             }
             Action::StartFlow { place, flow, goal } => {
                 let cwd = self.start_dir(place)?;
@@ -624,7 +653,7 @@ impl Tui {
                 if let Some(session) = session {
                     self.app.select(&session);
                 }
-                launcher::save_memory(&self.memory_path, self.app.memory());
+                self.keep_memory();
             }
             Action::ApproveFlow(run) => {
                 client::ask(&self.socket, &Request::ApproveFlow { run }, false)?;
@@ -807,21 +836,21 @@ impl Tui {
             }
             Action::ClosePluginPane => self.close_plugin_pane(),
             Action::ListLayouts => {
-                let found = layouts::load(&self.layouts_path);
+                let found = self.layouts();
                 self.app.show_layouts(found, None);
             }
             Action::SaveLayout(name) => {
-                let mut kept = layouts::load(&self.layouts_path).map_err(anyhow::Error::msg)?;
+                let mut kept = self.layouts().map_err(anyhow::Error::msg)?;
                 let tabs = self.app.tabs_to_keep();
                 let replaced = kept.save(&name, tabs, seconds_since_epoch());
-                layouts::save(&self.layouts_path, &kept)?;
+                self.keep_layouts(&kept)?;
                 self.app
                     .show_layouts(Ok(kept), Some(&Which::Saved(name.clone())));
                 let how = if replaced { "over" } else { "as" };
                 self.app.notify(format!("saved your tabs {how} {name}"));
             }
             Action::RestoreLayout(which) => {
-                let mut kept = layouts::load(&self.layouts_path).map_err(anyhow::Error::msg)?;
+                let mut kept = self.layouts().map_err(anyhow::Error::msg)?;
                 let current = self.app.tabs_to_keep();
                 let name = match &which {
                     Which::Saved(name) => name.clone(),
@@ -830,13 +859,13 @@ impl Tui {
                 let Some(tabs) = kept.restore(&which, current, seconds_since_epoch()) else {
                     bail!("{name} can't be restored: it's from another crystal");
                 };
-                layouts::save(&self.layouts_path, &kept)?;
+                self.keep_layouts(&kept)?;
                 self.app.restore_layout(tabs, &name);
             }
             Action::RemoveLayout(which) => {
-                let mut kept = layouts::load(&self.layouts_path).map_err(anyhow::Error::msg)?;
+                let mut kept = self.layouts().map_err(anyhow::Error::msg)?;
                 kept.remove(&which);
-                layouts::save(&self.layouts_path, &kept)?;
+                self.keep_layouts(&kept)?;
                 self.app.show_layouts(Ok(kept), None);
                 if let Which::Saved(name) = which {
                     self.app.notify(format!("removed {name}"));

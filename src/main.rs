@@ -8,6 +8,7 @@ mod clipboard;
 mod codex;
 mod config;
 mod daemon;
+mod db;
 mod distill;
 mod drive;
 mod embed;
