@@ -13,6 +13,7 @@
 //! shuffle as agents work.
 
 use crate::flow_run::FlowRun;
+use crate::front;
 use crate::protocol::{Activity, Front, SessionInfo};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -253,10 +254,15 @@ fn worktree_heading(session: &SessionInfo) -> Row {
 }
 
 /// Whether a session is a terminal rather than an agent: what's in front
-/// in it is a shell or some other program. One not looked at yet counts as
-/// a terminal until it has been, a moment after it starts.
+/// in it is a shell or some other program. Until the daemon has looked,
+/// a moment after it starts, or once it has ended, its command says: a
+/// session started as `claude` is an agent from its first moment.
 pub fn is_terminal(session: &SessionInfo) -> bool {
-    !matches!(session.front, Some(Front::Agent { .. } | Front::Task))
+    let front = session
+        .front
+        .clone()
+        .or_else(|| front::of_command(&session.command));
+    !matches!(front, Some(Front::Agent { .. } | Front::Task))
 }
 
 fn is_waiting(session: &SessionInfo) -> bool {
@@ -446,13 +452,23 @@ mod tests {
     }
 
     #[test]
-    fn a_task_counts_as_an_agent_and_a_session_not_looked_at_as_a_terminal() {
+    fn a_task_counts_as_an_agent_and_a_shell_as_a_terminal() {
         let mut task = session("task", "app", "main");
         task.front = Some(Front::Task);
         assert!(!is_terminal(&task));
         assert!(!is_terminal(&agent(session("claude", "app", "main"))));
         assert!(is_terminal(&shell(session("zsh", "app", "main"))));
         assert!(is_terminal(&session("new", "app", "main")));
+    }
+
+    #[test]
+    fn a_session_not_looked_at_yet_goes_by_its_command() {
+        let mut claude = session("claude", "app", "main");
+        claude.command = vec!["claude".into(), "fix the login".into()];
+        assert!(!is_terminal(&claude));
+        let mut server = session("server", "app", "main");
+        server.command = vec!["npm".into(), "run".into(), "dev".into()];
+        assert!(is_terminal(&server));
     }
 
     #[test]
