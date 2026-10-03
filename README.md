@@ -239,6 +239,36 @@ conversation they were in. `crystal kill-server` is asked to stop everything, so
 The list is kept in `~/.local/state/crystal/sessions.json`, without the sessions' environment variables, since
 those can hold secrets; a session started again gets the environment of whoever started the daemon again.
 
+### The diff
+
+`d` shows what changed in the selected session's worktree, the way VS Code and GitHub show it: the changed
+files on the left, each with its status (`M`odified, `A`dded, `D`eleted, `R`enamed, `U`ntracked) and how many
+lines it adds and removes, and the selected file's diff on the right, with both files' line numbers, added lines
+on green, removed lines on red, and the words that changed inside a line marked stronger.
+
+It starts with what isn't committed yet, staged or not, new files included. `b` switches to the whole branch
+since it left its base (where it meets `origin`'s default branch, or `main` or `master`): everything an agent
+committed, as its pull request would read.
+
+| Key | In the diff |
+|---|---|
+| `j` / `k`, `↓` / `↑` | the next or previous file |
+| `Space` / `Shift+Space`, `PageDown` / `PageUp` | page through the file's diff |
+| `]` / `[` | the next or previous hunk |
+| `v` | side by side, the old file beside the new one, or unified again; side by side needs 120 columns |
+| `b` | the branch since its base, or the uncommitted changes again |
+| `Esc` / `q` | back to the sidebar |
+
+The wheel scrolls the diff, and moves through the files over the list.
+
+### The file finder
+
+`p` finds a file in the selected session's worktree, like an editor's quick open: type a few letters of its path,
+in order (`rfnd` finds `src/billing/refund.rs`), and the best matches come first, with the start of the
+selected one beside the list. Letters in a file's name, at the start of a word, or next to each other count for
+more. `↑` / `↓` pick another, `Enter` opens it in your `$EDITOR` (or `vi`) as a session of its own in that
+worktree, named after the file, and `Esc` closes the finder. Files git ignores aren't listed.
+
 ### Codex
 
 crystal reads what Codex is doing off its screen: `Working (… esc to interrupt)` while it works, and its

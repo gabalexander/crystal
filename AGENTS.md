@@ -59,6 +59,13 @@ is: it's the one request every version must understand.
   - `issues.rs`: the issues view `i` opens: its state, kept apart from I/O, and its drawing
   - `pane.rs`: a viewer of a session on screen, the selected one or a split, and its screen
   - `screen_widget.rs`: draws a vt100 screen into ratatui
+  - `diff.rs`: reads `git diff`'s patch into files, hunks and lines, marks the words that changed,
+    and lays a file out in rows, unified or side by side; pure, so it's unit-tested
+  - `diff_view.rs`: the diff view (`d`): its state, keys and drawing, and reading the diff off the
+    event loop
+  - `fuzzy.rs`: how a path matches a few typed letters, and how well
+  - `finder.rs`: the file finder (`p`): its state, keys and drawing, listing files and reading the
+    preview off the event loop
 - `src/daemon.rs`: the daemon: listens on the socket and owns the sessions
 - `src/agents.rs`: what crystal knows about particular agents: the hooks it adds to Claude Code, and what they mean
 - `src/codex.rs`: what crystal knows about Codex: finding a session's conversation in its rollouts, and
