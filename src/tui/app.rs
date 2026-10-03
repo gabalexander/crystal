@@ -464,6 +464,15 @@ impl App {
     }
 
     fn on_sidebar_key(&mut self, key: KeyEvent) -> Option<Action> {
+        // Ctrl or Alt with a letter isn't that letter. Ctrl+J is a line feed,
+        // which a terminal sends as it closes, and it mustn't move the
+        // selection: showing a session counts as having seen it.
+        if key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
+            return None;
+        }
         match key.code {
             KeyCode::Char('j') | KeyCode::Down => self.move_selection(1),
             KeyCode::Char('k') | KeyCode::Up => self.move_selection(-1),
@@ -889,6 +898,20 @@ mod tests {
         app.set_first_command("codex".to_string());
         press(&mut app, KeyCode::Char('n'));
         assert_eq!(app.prompt().unwrap().input.text(), "codex");
+    }
+
+    #[test]
+    fn ctrl_or_alt_with_a_letter_does_nothing_in_the_sidebar() {
+        let mut app = app_with(&["a", "b"]);
+        let ctrl_j = KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL);
+        let alt_x = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::ALT);
+        let ctrl_n = KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL);
+        for key in [ctrl_j, alt_x, ctrl_n] {
+            assert_eq!(app.on_key(key), None);
+        }
+        assert_eq!(selected_name(&app), Some("a"));
+        assert!(app.confirm().is_none());
+        assert!(app.prompt().is_none());
     }
 
     #[test]

@@ -737,6 +737,30 @@ fn x_asks_first_and_only_y_kills_the_selected_session() {
 }
 
 #[test]
+fn a_closing_terminal_never_marks_a_session_seen() {
+    let crystal = Crystal::new();
+    crystal.ok(&["new", "-n", "first", "sleep", "30"]);
+    crystal.ok(&["new", "-n", "second", "sleep", "30"]);
+    // A finished turn on the second session, waiting to be seen.
+    for event in ["UserPromptSubmit", "Stop"] {
+        let json = format!(r#"{{"hook_event_name":"{event}"}}"#);
+        run_hook(&crystal, "second", &format!("{CRYSTAL} hook claude"), &json);
+    }
+    assert_eq!(crystal.row("second").unwrap()[1], "done");
+
+    // A terminal that closes sends a line feed, Ctrl+J, on its way out. Had
+    // it moved the selection, the second session would be shown, and so
+    // seen, within moments; nothing to wait for, so give it half a second.
+    let mut tui = crystal.tui();
+    tui.shows("first");
+    tui.type_keys("\n");
+    thread::sleep(Duration::from_millis(500));
+    assert_eq!(crystal.row("second").unwrap()[1], "done");
+    tui.type_keys("q");
+    assert!(tui.exit());
+}
+
+#[test]
 fn q_quits_the_tui_and_the_sessions_keep_running() {
     let crystal = Crystal::new();
     crystal.ok(&["new", "-n", "stays", "sleep", "30"]);
