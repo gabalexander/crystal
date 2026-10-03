@@ -82,6 +82,12 @@ pub enum Request {
     Distill {
         name: String,
     },
+    /// How the model that searches memory by meaning stands.
+    EmbeddingStatus,
+    /// Get the model that searches memory by meaning ready, in the
+    /// background: download it if it isn't here, load it, and give every
+    /// entry its vector.
+    PrepareEmbeddings,
     /// Search the memory of the project `dir` is in, by words and, with the
     /// model on, by meaning: the daemon keeps the model loaded, once for
     /// every client.
@@ -293,6 +299,8 @@ pub enum Response {
     },
     /// What came of the distiller reading what a session did.
     Distilled(crate::distill::Report),
+    /// How the model that searches memory by meaning stands.
+    EmbeddingStatus(crate::embed::Status),
     /// The entries a memory search found, the best first.
     Memory {
         entries: Vec<crate::memory::Listed>,

@@ -16,6 +16,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use candle_core::{DType, Device, IndexOp, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::bert::{BertModel, Config as BertConfig};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File};
 use std::io::Read;
@@ -173,14 +174,18 @@ impl Embed for Embedder {
     }
 }
 
+/// The model, once a process has loaded it.
+static LOADED: Mutex<Option<Arc<Embedder>>> = Mutex::new(None);
+
 /// The model, loaded once in each process and kept, when the config says to
-/// search with it and it's been downloaded.
+/// search with it and it's been downloaded. With the config saying not to,
+/// a process that had it loaded lets it go.
 pub fn shared(settings: &MemorySettings) -> Option<Arc<Embedder>> {
-    static LOADED: Mutex<Option<Arc<Embedder>>> = Mutex::new(None);
+    let mut loaded = LOADED.lock().unwrap();
     if !settings.embeddings {
+        *loaded = None;
         return None;
     }
-    let mut loaded = LOADED.lock().unwrap();
     if let Some(embedder) = &*loaded {
         return Some(embedder.clone());
     }
@@ -199,6 +204,63 @@ pub fn shared(settings: &MemorySettings) -> Option<Arc<Embedder>> {
             None
         }
     }
+}
+
+/// Whether this process has the model loaded.
+pub fn is_loaded() -> bool {
+    LOADED.lock().unwrap().is_some()
+}
+
+/// Lets the model go, when this process has it and the config now says
+/// not to search with it.
+pub fn let_go_unless(settings: &MemorySettings) {
+    if !settings.embeddings {
+        LOADED.lock().unwrap().take();
+    }
+}
+
+/// How the model stands, as the settings view shows it.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Status {
+    /// How much of the model is on disk, in bytes, downloaded or on its
+    /// way, and how much it is in all.
+    pub on_disk: u64,
+    pub size: u64,
+    /// Whether the daemon has it loaded.
+    pub loaded: bool,
+    /// What the daemon is doing to get it ready, while it does.
+    pub preparing: Option<String>,
+    /// Why getting it ready last failed.
+    pub failed: Option<String>,
+    /// How many entries every project has, and how many of them have their
+    /// vector from the model.
+    pub entries: usize,
+    pub embedded: usize,
+}
+
+impl Status {
+    pub fn is_downloaded(&self) -> bool {
+        self.size > 0 && self.on_disk >= self.size
+    }
+}
+
+/// How much of the model is in `dir`, in bytes: the files there, and those
+/// on their way, each counted up to its size.
+pub fn on_disk(dir: &Path) -> u64 {
+    FILES
+        .iter()
+        .map(|file| {
+            let size = |name: &str| fs::metadata(dir.join(name)).map_or(0, |meta| meta.len());
+            let done = size(file.name);
+            let coming = size(&format!("{}.part", file.name));
+            done.max(coming).min(file.size)
+        })
+        .sum()
+}
+
+/// How big the model is, all its files together, in bytes.
+pub fn size() -> u64 {
+    FILES.iter().map(|file| file.size).sum()
 }
 
 /// [`shared`], by the config file as it is now.
@@ -247,7 +309,7 @@ pub fn is_downloaded(dir: &Path) -> bool {
 
 /// How big the model is, all its files together, in megabytes.
 pub fn size_mb() -> u64 {
-    FILES.iter().map(|file| file.size).sum::<u64>() / 1_000_000
+    size() / 1_000_000
 }
 
 /// Downloads the model into [`model_dir`], each file it doesn't have yet,
@@ -351,6 +413,22 @@ mod tests {
         fs::write(dir.path().join("model.safetensors"), "short").unwrap();
         assert!(!is_downloaded(dir.path()));
         assert_eq!(size_mb(), 134);
+    }
+
+    #[test]
+    fn what_s_on_disk_counts_the_files_on_their_way() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(on_disk(dir.path()), 0);
+        fs::write(dir.path().join("config.json"), vec![0; 743]).unwrap();
+        fs::write(dir.path().join("model.safetensors.part"), vec![0; 1000]).unwrap();
+        assert_eq!(on_disk(dir.path()), 1743);
+        let status = Status {
+            on_disk: size(),
+            size: size(),
+            ..Status::default()
+        };
+        assert!(status.is_downloaded());
+        assert!(!Status::default().is_downloaded());
     }
 
     /// Runs the real model, when `crystal memory embed` has downloaded it:

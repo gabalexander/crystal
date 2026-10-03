@@ -92,6 +92,9 @@ is: it's the one request every version must understand.
   - `plugins_view.rs`: the plugins view (`X`): every plugin, on or off, with installed ones' actions and panes,
     its keys and drawing; the event loop does the switching, runs actions and opens plugins' panes over the
     others
+  - `settings_view.rs`: the settings view (`,`): notifications, the theme, the distiller and search by meaning,
+    each changed with a key, and how the model stands; the event loop writes the file (`config::set`) and,
+    while it's open, reads the settings and the daemon's `EmbeddingStatus` again every half a second
 - `src/daemon.rs`: the daemon: listens on the socket and owns the sessions
 - `src/agents.rs`: what crystal knows about particular agents: the hooks it adds to Claude Code, and what they mean
 - `src/catalog.rs`: the agents the new-session panel offers: their names, how each takes a first prompt, their

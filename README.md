@@ -115,6 +115,7 @@ and the footer says where you are and offers the keys that matter there.
 | `m` | what the selected session's project has remembered: [memory](#memory) |
 | `P` | list your [profiles](#profiles), and add, change, copy or remove one |
 | `X` | list the [plugins](#plugins): switch them on and off, run their actions and open their panes |
+| `,` | open the [settings](#the-settings-view): notifications, the theme, and how memory learns and searches, each changed as you go |
 | `?` | show every key, in the sidebar, in a pane, in a question and with the mouse |
 | `q` | quit; the sessions keep running |
 
@@ -965,9 +966,25 @@ notify_command = 'curl -s -d "$CRYSTAL_NOTICE" ntfy.sh/my-crystal'
 offered as a profile of its own.
 
 The daemon reads the notification settings each time it tells you something, `[plugins]` each time it
-does something a plugin adds, and a flow each time one starts, so a change counts straight away; the TUI
-reads `new_session`, `theme`, `[plugins]`, the profiles and the flows when it starts, and again when you save
-a profile or switch a plugin.
+does something a plugin adds, `[memory]` each time a task closes or a search runs, and a flow each time one
+starts, so a change counts straight away; the TUI reads `new_session`, `theme`, `[plugins]`, the profiles and
+the flows when it starts, again when you save a profile or switch a plugin, and every half a second while the
+settings view is open.
+
+#### The settings view
+
+`,` in the sidebar opens the settings you'd otherwise change in the file: notifications, the theme, and how
+memory learns ([the distiller](#the-distiller)) and searches ([by meaning](#search-by-meaning)). `space`
+changes the one the bar is on, and `←/→` go through the themes. Each change is written to the file at once,
+keeping the rest of it as you wrote it, comments and all, and counts straight away: the TUI repaints in a new
+theme, and the daemon reads the rest as it goes.
+
+While it's open, the view reads the file and asks the daemon again every half a second, so it follows a
+change made by hand in the file too, and shows how the model that searches by meaning stands: downloading
+(`42 of 134 MB`), loaded in the daemon or not, and how many entries have their vector. Turning search by
+meaning on has the daemon get the model ready: it downloads it if it isn't here, loads it and gives every
+entry its vector, and `enter` on that row does it again. Turned off, the daemon lets the model go, and the
+memory it took with it.
 
 #### Profiles
 

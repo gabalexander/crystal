@@ -5466,6 +5466,59 @@ fn with_github_switched_off_gh_is_never_asked_until_it_s_on_again() {
 }
 
 #[test]
+fn the_settings_view_changes_the_config_and_follows_it_live() {
+    let crystal = Crystal::new();
+    crystal.configure("notify = false\n");
+    // The daemon the TUI starts gets a curl that can't download anything,
+    // and a cache of the test's own with no model in it.
+    let bin = crystal.dir.path().join("curl-bin");
+    std::fs::create_dir(&bin).unwrap();
+    script(
+        &bin.join("curl"),
+        "echo 'curl: (6) no network' >&2\nexit 6\n",
+    );
+    let cache = crystal.dir.path().join("cache");
+    let env = [
+        ("PATH", path_with(&bin)),
+        ("XDG_CACHE_HOME", cache.display().to_string()),
+    ];
+    let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let mut tui = crystal.attach_with_env(&[], &env);
+    crystal.ok(&["new", "-n", "agent", "sleep", "30"]);
+    tui.shows("agent");
+    let config = || std::fs::read_to_string(crystal.config_file()).unwrap();
+
+    tui.type_keys(",");
+    tui.shows("○ notifications");
+    tui.shows("not downloaded (134 MB)");
+    tui.type_keys(" ");
+    tui.shows("● notifications");
+    assert!(config().starts_with("notify = true\n"), "{}", config());
+    tui.type_keys("jl");
+    tui.shows("light");
+    assert!(config().contains("theme = \"light\""), "{}", config());
+
+    // Changed by hand, the file is shown as it is now.
+    crystal.configure("notify = true\ntheme = \"light\"\n\n[memory]\ndistill = false\n");
+    tui.shows("○ distill closed tasks");
+
+    // Turned on, search by meaning has the daemon get the model, and the
+    // view follows how that goes: here, a download that fails.
+    tui.type_keys("jj ");
+    tui.shows("● search by meaning");
+    assert!(
+        config().contains("[memory]\ndistill = false\nembeddings = true\n"),
+        "{}",
+        config()
+    );
+    tui.shows("couldn't get it ready");
+
+    tui.type_keys("\x1b");
+    tui.hides("search by meaning");
+    tui.shows("agent");
+}
+
+#[test]
 fn the_keys_of_a_plugin_that_s_off_aren_t_listed() {
     let crystal = Crystal::new();
     crystal.ok(&["new", "-n", "agent", "sleep", "30"]);

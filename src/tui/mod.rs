@@ -26,6 +26,7 @@ mod plugins_view;
 mod profiles;
 pub(crate) mod screen_widget;
 mod search;
+mod settings_view;
 pub(crate) mod sidebar;
 mod status;
 mod tabs;
@@ -166,6 +167,8 @@ pub enum Event {
     },
     /// How many backlog items each project has to do.
     BacklogCounts(HashMap<PathBuf, usize>),
+    /// The settings as they are now, for the settings view.
+    Settings(settings_view::Current),
 }
 
 pub fn run(socket: &Path) -> Result<()> {
@@ -180,11 +183,15 @@ pub fn run(socket: &Path) -> Result<()> {
     spawn_input_reader(sender.clone());
     let count_backlog = Arc::new(AtomicBool::new(crate::backlog::enabled(&config)));
     let poll_flows = Arc::new(AtomicBool::new(crate::flows::enabled(&config)));
+    let poll_settings = Arc::new(AtomicBool::new(false));
     spawn_session_poller(
         socket.to_path_buf(),
         sender.clone(),
-        count_backlog.clone(),
-        poll_flows.clone(),
+        Polled {
+            backlog_counts: count_backlog.clone(),
+            flows: poll_flows.clone(),
+            settings: poll_settings.clone(),
+        },
     );
     let projects = Arc::new(Mutex::new(Vec::new()));
     spawn_pull_request_poller(projects.clone(), sender.clone());
@@ -216,6 +223,8 @@ pub fn run(socket: &Path) -> Result<()> {
         overlay: None,
         count_backlog,
         poll_flows,
+        poll_settings,
+        config: config.clone(),
     };
     tui.app.set_agents(catalog::installed());
     tui.app.set_launch_settings(&config);
@@ -297,6 +306,11 @@ struct Tui {
     /// Whether the session poller asks for the flow runs too: the flows
     /// plugin is on.
     poll_flows: Arc<AtomicBool>,
+    /// Whether the session poller reads the settings too: the settings
+    /// view is open.
+    poll_settings: Arc<AtomicBool>,
+    /// The config as the TUI last took it in.
+    config: Config,
     /// The projects the sessions are in, for the thread that asks GitHub
     /// about their pull requests.
     projects: Arc<Mutex<Vec<PathBuf>>>,
@@ -498,6 +512,14 @@ impl Tui {
             Event::MemoryRead { dir, read } => self.app.memory_read(&dir, read),
             Event::Backlog { dir, found } => self.app.set_backlog(&dir, found),
             Event::BacklogCounts(counts) => self.app.set_backlog_counts(counts),
+            Event::Settings(current) => {
+                // The file changed by hand, or by another crystal, counts
+                // here too, straight away.
+                if let Ok(config) = &current.config {
+                    self.config_changed(config);
+                }
+                self.app.show_settings(current);
+            }
         }
     }
 
@@ -724,6 +746,29 @@ impl Tui {
             Action::DeleteProfile(name) => {
                 let deleted = profile::delete(&config::path(), &name);
                 self.profiles_changed(deleted, None);
+            }
+            Action::OpenSettings => {
+                self.poll_settings.store(true, Ordering::Relaxed);
+                self.read_settings_now();
+            }
+            Action::CloseSettings => self.poll_settings.store(false, Ordering::Relaxed),
+            Action::ChangeSetting(change) => {
+                let changed = config::set(&config::path(), change.keys(), change.value())
+                    .and_then(|()| Config::load());
+                match changed {
+                    Ok(config) => {
+                        self.config_changed(&config);
+                        if change == settings_view::Change::Embeddings(true) {
+                            self.prepare_embeddings();
+                        }
+                    }
+                    Err(err) => self.app.setting_failed(format!("{err:#}")),
+                }
+                self.read_settings_now();
+            }
+            Action::PrepareEmbeddings => {
+                self.prepare_embeddings();
+                self.read_settings_now();
             }
             Action::ListPlugins => {
                 let config = Config::load()?;
@@ -976,14 +1021,44 @@ impl Tui {
     /// After a plugin was switched on or off: everything that shows what
     /// the plugins add follows what the config file now says.
     fn plugins_changed(&mut self, config: &Config) {
+        self.config_changed(config);
+        self.app.show_plugins(listed_plugins(config, &self.socket));
+    }
+
+    /// Takes in `config`, when it's not the one the TUI has: the theme, the
+    /// new-session panel's settings and everything the plugins add follow
+    /// what it says, straight away.
+    fn config_changed(&mut self, config: &Config) {
+        if *config == self.config {
+            return;
+        }
+        if config.theme != self.config.theme {
+            self.theme = Theme::from_env(config.theme);
+        }
+        self.config = config.clone();
+        self.app.set_launch_settings(config);
         self.app.set_features(config);
         self.app.set_plugin_keys(plugin_keys(config));
-        self.app.show_plugins(listed_plugins(config, &self.socket));
         let backlog = crate::backlog::enabled(config);
         self.count_backlog.store(backlog, Ordering::Relaxed);
         let flows = crate::flows::enabled(config);
         self.poll_flows.store(flows, Ordering::Relaxed);
         self.set_sessions(self.app.sessions().to_vec());
+    }
+
+    /// Reads the settings as they are now, off the loop, for the settings
+    /// view.
+    fn read_settings_now(&self) {
+        let socket = self.socket.clone();
+        self.read_in_background(move || Event::Settings(read_settings(&socket)));
+    }
+
+    /// Asks the daemon to get the model that searches memory by meaning
+    /// ready; the settings view follows how that goes.
+    fn prepare_embeddings(&mut self) {
+        if let Err(err) = client::ask(&self.socket, &Request::PrepareEmbeddings, false) {
+            self.app.setting_failed(format!("{err:#}"));
+        }
     }
 
     /// Runs one of a plugin's actions, off the loop, with what it prints in
@@ -1529,17 +1604,32 @@ fn spawn_pull_request_poller(projects: Arc<Mutex<Vec<PathBuf>>>, events: Sender<
 /// flow runs first, which the sidebar groups the sessions under; and with
 /// `count_backlog`, how many backlog items each of their projects has to
 /// do.
-fn spawn_session_poller(
-    socket: PathBuf,
-    events: Sender<Event>,
-    count_backlog: Arc<AtomicBool>,
-    poll_flows: Arc<AtomicBool>,
-) {
+/// What the session poller asks for beyond the sessions, each while its
+/// flag is set.
+struct Polled {
+    backlog_counts: Arc<AtomicBool>,
+    flows: Arc<AtomicBool>,
+    settings: Arc<AtomicBool>,
+}
+
+fn spawn_session_poller(socket: PathBuf, events: Sender<Event>, polled: Polled) {
+    let Polled {
+        backlog_counts: count_backlog,
+        flows: poll_flows,
+        settings: poll_settings,
+    } = polled;
     thread::spawn(move || {
         loop {
             thread::sleep(POLL_EVERY);
             if poll_flows.load(Ordering::Relaxed)
                 && events.send(Event::Flows(list_flows(&socket))).is_err()
+            {
+                return;
+            }
+            if poll_settings.load(Ordering::Relaxed)
+                && events
+                    .send(Event::Settings(read_settings(&socket)))
+                    .is_err()
             {
                 return;
             }
@@ -1557,6 +1647,20 @@ fn spawn_session_poller(
             }
         }
     });
+}
+
+/// The settings as they are now: the config file, and how the model that
+/// searches memory by meaning stands, as the daemon says.
+fn read_settings(socket: &Path) -> settings_view::Current {
+    let model = match client::ask(socket, &Request::EmbeddingStatus, false) {
+        Ok(Some(Response::EmbeddingStatus(status))) => Some(status),
+        _ => None,
+    };
+    settings_view::Current {
+        path: config::path(),
+        config: Config::load().map_err(|err| format!("{err:#}")),
+        model,
+    }
 }
 
 /// The projects `sessions` are in, by their main worktrees.

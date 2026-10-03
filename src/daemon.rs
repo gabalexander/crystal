@@ -59,6 +59,7 @@ pub fn run(socket: &Path) -> Result<()> {
         stores: Mutex::default(),
         hooks: Hooks::new(socket),
         distilling: Arc::default(),
+        preparing: Arc::default(),
     });
     daemon.start_saved_sessions();
     daemon.take_up_flows();
@@ -123,6 +124,16 @@ struct Daemon {
     /// The sessions the distiller is reading now, by id: one pass at a
     /// time over each.
     distilling: Arc<Mutex<HashSet<String>>>,
+    /// Getting the model that searches memory by meaning ready: what's
+    /// being done, and why it last failed.
+    preparing: Arc<Mutex<Preparing>>,
+}
+
+/// What [`Daemon::prepare_embeddings`] is doing, or why it failed.
+#[derive(Debug, Default)]
+struct Preparing {
+    doing: Option<&'static str>,
+    failed: Option<String>,
 }
 
 impl Daemon {
@@ -566,6 +577,71 @@ impl Daemon {
         })
     }
 
+    /// How the model that searches memory by meaning stands. Asked while
+    /// the config says not to search with it, the daemon lets it go; while
+    /// it has it loaded and entries have no vector yet, it gives them one,
+    /// in the background, rather than at the next search.
+    fn embedding_status(&self) -> Result<embed::Status> {
+        let settings = settings().memory;
+        embed::let_go_unless(&settings);
+        let on_disk = embed::model_dir().map_or(0, |dir| embed::on_disk(&dir));
+        let (entries, embedded) = memory::Store::open(&self.socket)?.counts(embed::MODEL)?;
+        if embed::is_loaded() && embedded < entries {
+            self.prepare_embeddings();
+        }
+        let preparing = self.preparing.lock().unwrap();
+        Ok(embed::Status {
+            on_disk,
+            size: embed::size(),
+            loaded: embed::is_loaded(),
+            preparing: preparing.doing.map(String::from),
+            failed: preparing.failed.clone(),
+            entries,
+            embedded,
+        })
+    }
+
+    /// Gets the model that searches memory by meaning ready, on a thread of
+    /// its own, unless that's being done already: downloads it if it isn't
+    /// here, then, while the config still says to search with it, loads it
+    /// and gives every entry its vector.
+    fn prepare_embeddings(&self) {
+        {
+            let mut preparing = self.preparing.lock().unwrap();
+            if preparing.doing.is_some() {
+                return;
+            }
+            *preparing = Preparing {
+                doing: Some("downloading the model"),
+                failed: None,
+            };
+        }
+        let preparing = self.preparing.clone();
+        let socket = self.socket.clone();
+        thread::spawn(move || {
+            let doing = |what| preparing.lock().unwrap().doing = Some(what);
+            let prepared = (|| -> Result<()> {
+                let downloaded = embed::model_dir().is_some_and(|dir| embed::is_downloaded(&dir));
+                if !downloaded {
+                    embed::download(false)?;
+                }
+                doing("loading the model");
+                let Some(embedder) = embed::shared_now() else {
+                    return Ok(());
+                };
+                doing("embedding the entries");
+                memory::Store::open(&socket)?.embed_missing(&*embedder)?;
+                Ok(())
+            })();
+            let mut preparing = preparing.lock().unwrap();
+            preparing.doing = None;
+            if let Err(err) = prepared {
+                eprintln!("crystal daemon: couldn't get the model ready: {err:#}");
+                preparing.failed = Some(format!("{err:#}"));
+            }
+        });
+    }
+
     /// Runs the distiller over what the session called `name` did, now,
     /// and says what came of it.
     fn distill_now(&self, name: &str) -> Result<Response> {
@@ -791,6 +867,11 @@ impl Daemon {
                 Ok(Response::Done)
             }
             Request::Distill { name } => self.distill_now(&name),
+            Request::EmbeddingStatus => Ok(Response::EmbeddingStatus(self.embedding_status()?)),
+            Request::PrepareEmbeddings => {
+                self.prepare_embeddings();
+                Ok(Response::Done)
+            }
             Request::SearchMemory {
                 dir,
                 query,

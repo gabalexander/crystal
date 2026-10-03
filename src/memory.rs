@@ -550,6 +550,20 @@ impl Store {
         Ok(newest.collect::<rusqlite::Result<_>>()?)
     }
 
+    /// How many entries every project has, and how many of them have their
+    /// vector from the model called `model`.
+    pub fn counts(&self, model: &str) -> Result<(usize, usize)> {
+        let entries = self
+            .conn
+            .query_row("SELECT count(*) FROM entries", [], |row| row.get(0))?;
+        let embedded = self.conn.query_row(
+            "SELECT count(*) FROM vectors v JOIN entries e ON e.n = v.n WHERE v.model = ?1",
+            params![model],
+            |row| row.get(0),
+        )?;
+        Ok((entries, embedded))
+    }
+
     /// Gives every entry, in every project, that has no vector from
     /// `embedder` one, and says how many that was.
     pub fn embed_missing(&mut self, embedder: &dyn Embed) -> Result<usize> {
@@ -1619,7 +1633,9 @@ mod tests {
         store
             .add(project, note("the release is on tuesday"))
             .unwrap();
+        assert_eq!(store.counts("meanings").unwrap(), (3, 2));
         assert_eq!(store.embed_missing(&MEANINGS).unwrap(), 1);
+        assert_eq!(store.counts("meanings").unwrap(), (3, 3));
         store.remove(project, 1).unwrap();
         assert_eq!(vectors(&store), 2);
 
