@@ -28,6 +28,9 @@ const WAITING_TEXT: &[&str] = &[
     "would you like to grant these permissions?",
     "press enter to confirm or esc to cancel",
     "allow command?",
+    // Codex's other questions, like reviewing new hooks when it starts,
+    // end with their keys in this shorter form.
+    "enter confirm · esc",
 ];
 
 /// Text, in lower case, that agents show only while they work on a turn.
@@ -166,6 +169,14 @@ mod tests {
         assert_eq!(looks(question, ""), Looks::Waiting);
         let edits = "  Would you like to make the following edits?\r\n\r\n› 1. Yes, proceed (y)";
         assert_eq!(looks(edits, ""), Looks::Waiting);
+    }
+
+    #[test]
+    fn a_codex_question_at_startup_is_waiting() {
+        let hooks = "  Hooks need review\r\n  12 hooks are new or changed.\r\n\
+                     › 1. Review hooks\r\n  2. Trust all and continue\r\n\
+                     \r\n  enter confirm · esc skip";
+        assert_eq!(looks(hooks, ""), Looks::Waiting);
     }
 
     #[test]
