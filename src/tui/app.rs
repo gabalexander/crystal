@@ -25,7 +25,7 @@ use crate::flows::{self, Flow};
 use crate::github::{self, PullRequest};
 use crate::keys;
 use crate::profile::{self, Profile};
-use crate::protocol::{Activity, Backlog, SessionInfo, State, TaskSpec};
+use crate::protocol::{Activity, Backlog, SessionInfo, State, TaskSpec, Worktree};
 use crate::shell;
 use crate::{backlog, plugins, tasks};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
@@ -412,6 +412,12 @@ pub struct App {
     sessions: Vec<SessionInfo>,
     /// An index into `sessions`, kept in range while there are any.
     selected: usize,
+    /// The linked worktree with no sessions the selection is on instead,
+    /// by its directory, when it's on one: see [`Row::NoSessions`].
+    on_worktree: Option<PathBuf>,
+    /// Each project's linked worktrees, by its main worktree, as git last
+    /// listed them. Those with no sessions stay in the sidebar.
+    worktrees: HashMap<PathBuf, Vec<Worktree>>,
     /// The question on the footer line, while one is being answered.
     prompt: Option<Prompt>,
     /// The new-session panel, while it's open.
@@ -511,6 +517,8 @@ impl App {
         App {
             sessions: Vec::new(),
             selected: 0,
+            on_worktree: None,
+            worktrees: HashMap::new(),
             prompt: None,
             launcher: None,
             agents: Vec::new(),
@@ -819,16 +827,98 @@ impl App {
     }
 
     /// The sidebar's rows: the sessions under their projects and worktrees,
-    /// only those that match while `/`'s filter is open.
+    /// only those that match while `/`'s filter is open. The linked
+    /// worktrees with no sessions come under their projects too, except
+    /// while the filter is open: it finds sessions.
     pub fn rows(&self) -> Vec<Row> {
         let shown = self.matches();
-        let mut rows = groups::rows(&self.sessions, self.shown_flows(), |index| {
+        let empty = match self.filter {
+            Some(_) => Vec::new(),
+            None => self.empty_worktrees(),
+        };
+        let mut rows = groups::rows(&self.sessions, self.shown_flows(), &empty, |index| {
             shown.contains(&index)
         });
         if !self.tasks_on {
             rows.retain(|row| !matches!(row, Row::Task(_)));
         }
         rows
+    }
+
+    /// The linked worktrees git listed that no session is in, in any tab.
+    fn empty_worktrees(&self) -> Vec<Worktree> {
+        let linked: Vec<Worktree> = self.worktrees.values().flatten().cloned().collect();
+        groups::empty_worktrees(&linked, &self.sessions)
+    }
+
+    /// Adds the linked worktrees the sessions are in to those git listed.
+    /// A worktree a session is in is there, without asking git; and when
+    /// its last session goes, it stays known until git is next asked, so
+    /// it doesn't leave the sidebar in between.
+    fn know_sessions_worktrees(&mut self) {
+        let linked = self
+            .sessions
+            .iter()
+            .filter_map(|session| session.worktree.as_ref())
+            .filter(|worktree| !worktree.main);
+        for worktree in linked {
+            let known = self
+                .worktrees
+                .entry(worktree.project_path.clone())
+                .or_default();
+            if !known.iter().any(|w| w.path == worktree.path) {
+                known.push(worktree.clone());
+            }
+        }
+    }
+
+    /// Takes what git listed as the linked worktrees of `project`, by its
+    /// main worktree.
+    pub fn set_worktrees(&mut self, project: PathBuf, worktrees: Vec<Worktree>) {
+        self.worktrees.insert(project, worktrees);
+        self.know_sessions_worktrees();
+        self.keep_selection_on_a_row();
+    }
+
+    /// The worktree at `path` has been removed: it leaves the sidebar now,
+    /// rather than when git is next asked.
+    pub fn worktree_removed(&mut self, path: &Path) {
+        for linked in self.worktrees.values_mut() {
+            linked.retain(|worktree| worktree.path != path);
+        }
+        self.keep_selection_on_a_row();
+    }
+
+    /// The linked worktree with no sessions the selection is on, if it's
+    /// on one rather than on a session.
+    pub fn selected_empty_worktree(&self) -> Option<&Worktree> {
+        let path = self.on_worktree.as_ref()?;
+        self.worktrees
+            .values()
+            .flatten()
+            .find(|worktree| worktree.path == *path)
+    }
+
+    /// Moves the selection off an empty worktree's row once that row has
+    /// gone. When it went because a session is in the worktree now, the
+    /// selection goes to that session: it stays in the worktree. When the
+    /// worktree was removed, or isn't in the tab in front, it goes back to
+    /// the selected session.
+    fn keep_selection_on_a_row(&mut self) {
+        let Some(path) = self.on_worktree.clone() else {
+            return;
+        };
+        if self.rows().contains(&Row::NoSessions(path.clone())) {
+            return;
+        }
+        self.on_worktree = None;
+        let in_it = self.in_tab().into_iter().find(|&index| {
+            let worktree = self.sessions[index].worktree.as_ref();
+            worktree.is_some_and(|worktree| worktree.path == path)
+        });
+        if let Some(index) = in_it {
+            self.selected = index;
+        }
     }
 
     /// `/`'s filter, while it's open.
@@ -1090,8 +1180,11 @@ impl App {
     }
 
     /// The index of the selected session, or `None` when the tab in front
-    /// has none.
+    /// has none, or the selection is on a worktree with no sessions.
     pub fn selected_index(&self) -> Option<usize> {
+        if self.on_worktree.is_some() {
+            return None;
+        }
         let session = self.sessions.get(self.selected)?;
         let in_tab = self.tabs.current().holds(&session.name);
         in_tab.then_some(self.selected)
@@ -1116,18 +1209,31 @@ impl App {
 
     /// Takes a fresh list from the daemon and puts it in the sidebar's
     /// order, each session in its tab. The selected session stays selected
-    /// wherever it moved to; if it's gone, the selection goes to the next
-    /// session in the tab, or the last.
+    /// wherever it moved to. If it's gone, and it was the last in its
+    /// worktree, the selection goes to the row that worktree is left with;
+    /// otherwise to the next session in the tab, or the last.
     pub fn set_sessions(&mut self, sessions: Vec<SessionInfo>) {
-        let selected_name = self.sessions.get(self.selected).map(|s| s.name.clone());
+        let before = self.sessions.get(self.selected).cloned();
+        let on_a_session = self.on_worktree.is_none();
         self.sessions = groups::order(sessions, self.shown_flows());
-        let still_there = selected_name.and_then(|name| self.position(&name));
+        let still_there = before.as_ref().and_then(|s| self.position(&s.name));
         if let Some(index) = still_there {
             self.selected = index;
         }
         self.close_splits_of_gone_sessions();
         self.place_sessions();
         self.keep_selection_in_tab();
+        self.know_sessions_worktrees();
+        if on_a_session
+            && still_there.is_none()
+            && let Some(worktree) = before.and_then(|session| session.worktree)
+            && self
+                .rows()
+                .contains(&Row::NoSessions(worktree.path.clone()))
+        {
+            self.on_worktree = Some(worktree.path);
+        }
+        self.keep_selection_on_a_row();
         let keeps_keyboard = match self.focus {
             Focus::Sidebar => true,
             Focus::Pane(slot) => self.can_type_into(slot),
@@ -1202,6 +1308,7 @@ impl App {
             self.go_to_tab(tab);
         }
         self.selected = index;
+        self.on_worktree = None;
     }
 
     /// The session called `from` is called `to` now: a split of it stays
@@ -1401,11 +1508,16 @@ impl App {
         None
     }
 
-    /// A click on a sidebar row: on a session, selects it and gives the
-    /// sidebar the keyboard. Headings don't do anything.
+    /// A click on a sidebar row: on a session, or a worktree with none,
+    /// selects it and gives the sidebar the keyboard. Headings don't do
+    /// anything.
     fn click_row(&mut self, row: usize) {
-        if let Some(Row::Session(index) | Row::Task(index)) = self.rows().get(row) {
-            self.selected = *index;
+        let rows = self.rows();
+        let Some(row) = rows.get(row) else {
+            return;
+        };
+        if matches!(row, Row::Session(_) | Row::Task(_) | Row::NoSessions(_)) {
+            self.select_row(row);
             self.focus = Focus::Sidebar;
         }
     }
@@ -1423,6 +1535,9 @@ impl App {
         match key.code {
             KeyCode::Char('j') | KeyCode::Down => self.move_selection(1),
             KeyCode::Char('k') | KeyCode::Up => self.move_selection(-1),
+            // On a worktree with no sessions, there's nothing to type into:
+            // Enter starts something there, as `n` does.
+            KeyCode::Enter if self.on_worktree.is_some() => return self.open_launcher(false),
             KeyCode::Enter => self.enter(),
             KeyCode::Tab => self.move_to_pane(Direction::Forward),
             KeyCode::BackTab => self.move_to_pane(Direction::Back),
@@ -1548,10 +1663,14 @@ impl App {
         Some(read)
     }
 
-    /// The selected session's worktree, and its project and branch the way
-    /// a view's header names them: `payments ⎇ fix/login`. When it isn't in
+    /// The selected session's worktree, or the worktree with no sessions
+    /// the selection is on, and its project and branch the way a view's
+    /// header names them: `payments ⎇ fix/login`. When a session isn't in
     /// one, the footer says so.
     fn selected_worktree(&mut self) -> Option<(PathBuf, String)> {
+        if let Some(worktree) = self.selected_empty_worktree() {
+            return Some((worktree.path.clone(), worktree_label(worktree)));
+        }
         let selected = self.selected()?;
         let Some(worktree) = &selected.worktree else {
             let notice = format!("{} isn't in a git repository", selected.name);
@@ -1651,10 +1770,19 @@ impl App {
         self.ask(Question::TabName, &name);
     }
 
-    /// Asks before removing the selected session's worktree. Only a linked
+    /// Asks before removing the selected session's worktree, or the
+    /// worktree with no sessions the selection is on. Only a linked
     /// worktree goes, and only once nothing runs in it any more: removing
     /// it would pull the directory out from under them.
     fn ask_to_remove_worktree(&mut self) {
+        if let Some(worktree) = self.selected_empty_worktree() {
+            let branch = worktree.branch.as_deref().unwrap_or("(detached)");
+            self.confirm = Some(Confirm::RemoveWorktree {
+                path: worktree.path.clone(),
+                branch: branch.to_string(),
+            });
+            return;
+        }
         let Some(selected) = self.selected() else {
             return;
         };
@@ -1709,6 +1837,7 @@ impl App {
             KeyCode::Enter => {
                 if let Some(index) = self.sidebar_cursor() {
                     self.selected = index;
+                    self.on_worktree = None;
                 }
                 self.filter = None;
             }
@@ -2017,21 +2146,22 @@ impl App {
         }
     }
 
-    /// Where a new session can start: where the selected session is, a new
-    /// worktree of its project, or another project's main worktree.
+    /// Where a new session can start: where the selected session is, or
+    /// the worktree with no sessions the selection is on; a new worktree of
+    /// its project; or another project's main worktree.
     fn launch_targets(&self) -> Vec<Target> {
         let selected = self.selected();
-        let worktree = selected.and_then(|session| session.worktree.as_ref());
-        let here = match (selected, worktree) {
-            (Some(_), Some(worktree)) => Target::Here {
+        let worktree = self.selection_worktree();
+        let here = match (worktree, selected) {
+            (Some(worktree), _) => Target::Here {
                 dir: Some(worktree.path.clone()),
                 label: worktree_label(worktree),
             },
-            (Some(session), None) => Target::Here {
+            (None, Some(session)) => Target::Here {
                 dir: Some(session.cwd.clone()),
                 label: shell::home_relative(&session.cwd),
             },
-            (None, _) => Target::Here {
+            (None, None) => Target::Here {
                 dir: None,
                 label: "this directory".to_string(),
             },
@@ -2272,8 +2402,17 @@ impl App {
     /// or `None` for the TUI's own directory when nothing in a repository
     /// is selected.
     fn worktree_base(&self) -> Option<PathBuf> {
-        let worktree = self.selected()?.worktree.as_ref()?;
+        let worktree = self.selection_worktree()?;
         Some(worktree.project_path.clone())
+    }
+
+    /// The worktree the selection is in: the selected session's, or the
+    /// worktree with no sessions it's on.
+    fn selection_worktree(&self) -> Option<&Worktree> {
+        match self.selected_empty_worktree() {
+            Some(worktree) => Some(worktree),
+            None => self.selected()?.worktree.as_ref(),
+        }
     }
 
     /// Every key goes to the pane's session, Tab too, since shells and
@@ -2497,6 +2636,7 @@ impl App {
         if let Some(index) = was_on.or(in_tab.first().copied()) {
             self.selected = index;
         }
+        self.on_worktree = None;
         self.focus = Focus::Sidebar;
         self.last_pane = None;
     }
@@ -2535,15 +2675,42 @@ impl App {
         self.last_pane = Some(slot);
     }
 
-    /// Moves the selection `by` sessions up or down the tab in front,
-    /// stopping at the ends.
+    /// Moves the selection `by` rows up or down the sidebar, over the rows
+    /// it can be on: the sessions, and the worktrees with none. It stops
+    /// at the ends.
     fn move_selection(&mut self, by: isize) {
-        let in_tab = self.in_tab();
-        let Some(at) = in_tab.iter().position(|&index| index == self.selected) else {
+        let stops: Vec<Row> = self
+            .rows()
+            .into_iter()
+            .filter(|row| matches!(row, Row::Session(_) | Row::NoSessions(_)))
+            .collect();
+        let Some(at) = stops.iter().position(|row| self.is_selected(row)) else {
             return;
         };
-        let to = at.saturating_add_signed(by).min(in_tab.len() - 1);
-        self.selected = in_tab[to];
+        let to = at.saturating_add_signed(by).min(stops.len() - 1);
+        self.select_row(&stops[to]);
+    }
+
+    /// Whether the selection is on `row`: a session's, or a worktree's
+    /// with no sessions.
+    fn is_selected(&self, row: &Row) -> bool {
+        match row {
+            Row::Session(index) => self.selected_index() == Some(*index),
+            Row::NoSessions(path) => self.on_worktree.as_ref() == Some(path),
+            _ => false,
+        }
+    }
+
+    /// Puts the selection on `row`, if it's one it can be on.
+    fn select_row(&mut self, row: &Row) {
+        match row {
+            Row::Session(index) | Row::Task(index) => {
+                self.selected = *index;
+                self.on_worktree = None;
+            }
+            Row::NoSessions(path) => self.on_worktree = Some(path.clone()),
+            _ => {}
+        }
     }
 
     /// Selects the next session that needs the user, bringing its tab to
@@ -3353,6 +3520,173 @@ mod tests {
         press(&mut app, KeyCode::Char('W'));
         assert_eq!(app.notice(), Some("shell isn't in a git worktree"));
         assert_eq!(app.confirm(), None);
+    }
+
+    /// A linked worktree of app on `branch`, as git lists it.
+    fn linked(branch: &str) -> Worktree {
+        Worktree {
+            project: "app".into(),
+            project_path: PathBuf::from("/code/app"),
+            path: PathBuf::from(format!("/code/app.worktrees/{branch}")),
+            main: false,
+            branch: Some(branch.into()),
+        }
+    }
+
+    /// An app with a session in app's main worktree, and a worktree `old`
+    /// git lists with no sessions in it.
+    fn app_with_an_empty_worktree() -> App {
+        let planner = in_worktree("planner", "main", State::Running);
+        let mut app = with_agents(&["claude"], vec![planner]);
+        app.set_worktrees(PathBuf::from("/code/app"), vec![linked("old")]);
+        app
+    }
+
+    fn empty_branch(app: &App) -> Option<&str> {
+        app.selected_empty_worktree()?.branch.as_deref()
+    }
+
+    fn shows_empty_worktree(app: &App) -> bool {
+        app.rows()
+            .iter()
+            .any(|row| matches!(row, Row::NoSessions(_)))
+    }
+
+    #[test]
+    fn a_worktree_with_no_sessions_stays_in_the_sidebar_and_j_and_k_reach_it() {
+        let mut app = app_with_an_empty_worktree();
+        assert!(shows_empty_worktree(&app));
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(empty_branch(&app), Some("old"));
+        assert_eq!(selected_name(&app), None, "no session is selected");
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(empty_branch(&app), Some("old"), "it's the last row");
+        press(&mut app, KeyCode::Char('k'));
+        assert_eq!(selected_name(&app), Some("planner"));
+        assert_eq!(empty_branch(&app), None);
+    }
+
+    #[test]
+    fn a_click_on_a_worktree_with_no_sessions_selects_it() {
+        let mut app = app_with_an_empty_worktree();
+        let row = Row::NoSessions("/code/app.worktrees/old".into());
+        let at = app.rows().iter().position(|shown| *shown == row).unwrap();
+        app.on_mouse(CLICK, Hit::SidebarRow(at));
+        assert_eq!(empty_branch(&app), Some("old"));
+    }
+
+    #[test]
+    fn shift_w_on_a_worktree_with_no_sessions_asks_to_remove_it() {
+        let mut app = app_with_an_empty_worktree();
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('W'));
+        assert_eq!(
+            app.confirm().map(Confirm::question).as_deref(),
+            Some("remove worktree old? y/n")
+        );
+        assert_eq!(
+            press(&mut app, KeyCode::Char('y')),
+            Some(Action::RemoveWorktree("/code/app.worktrees/old".into()))
+        );
+        app.worktree_removed(Path::new("/code/app.worktrees/old"));
+        assert!(!shows_empty_worktree(&app));
+        assert_eq!(selected_name(&app), Some("planner"));
+    }
+
+    #[test]
+    fn n_on_a_worktree_with_no_sessions_starts_there() {
+        let mut app = app_with_an_empty_worktree();
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('n'));
+        type_text(&mut app, "pick it up");
+        let place = Place::Directory(Some(PathBuf::from("/code/app.worktrees/old")));
+        assert_eq!(
+            press(&mut app, KeyCode::Enter),
+            start(place, &["claude", "--", "pick it up"], "pick it up")
+        );
+    }
+
+    #[test]
+    fn a_session_started_in_a_worktree_with_none_takes_its_row_and_the_selection() {
+        let mut app = app_with_an_empty_worktree();
+        press(&mut app, KeyCode::Char('j'));
+        app.set_sessions(vec![
+            in_worktree("planner", "main", State::Running),
+            in_worktree("picker", "old", State::Running),
+        ]);
+        assert!(!shows_empty_worktree(&app));
+        assert_eq!(empty_branch(&app), None);
+        assert_eq!(selected_name(&app), Some("picker"));
+    }
+
+    #[test]
+    fn a_worktree_stays_when_its_last_session_goes_before_git_is_asked() {
+        let mut app = App::new(None);
+        app.set_sessions(vec![
+            in_worktree("planner", "main", State::Running),
+            in_worktree("fixer", "fix", State::Running),
+        ]);
+        app.select("fixer");
+        app.set_sessions(vec![in_worktree("planner", "main", State::Running)]);
+        assert_eq!(empty_branch(&app), Some("fix"));
+        // Git, asked at last, says it has gone.
+        app.set_worktrees(PathBuf::from("/code/app"), Vec::new());
+        assert!(!shows_empty_worktree(&app));
+        assert_eq!(selected_name(&app), Some("planner"));
+    }
+
+    #[test]
+    fn a_list_from_before_a_kill_doesn_t_lose_the_worktree_it_left() {
+        let mut app = App::new(None);
+        let before = vec![
+            in_worktree("planner", "main", State::Running),
+            in_worktree("fixer", "fix", State::Running),
+        ];
+        app.set_sessions(before.clone());
+        app.set_worktrees(PathBuf::from("/code/app"), vec![linked("fix")]);
+        app.select("fixer");
+        let after = vec![in_worktree("planner", "main", State::Running)];
+        app.set_sessions(after.clone());
+        // A list asked for just before the kill comes in late.
+        app.set_sessions(before);
+        app.set_sessions(after);
+        assert_eq!(empty_branch(&app), Some("fix"));
+    }
+
+    #[test]
+    fn killing_the_last_session_in_a_worktree_leaves_the_selection_on_its_row() {
+        let mut app = App::new(None);
+        app.set_sessions(vec![
+            in_worktree("planner", "main", State::Running),
+            in_worktree("fixer", "fix", State::Running),
+        ]);
+        app.set_worktrees(PathBuf::from("/code/app"), vec![linked("fix")]);
+        assert!(!shows_empty_worktree(&app), "fixer is in it");
+        app.select("fixer");
+        app.set_sessions(vec![in_worktree("planner", "main", State::Running)]);
+        assert_eq!(empty_branch(&app), Some("fix"));
+    }
+
+    #[test]
+    fn a_worktree_with_no_sessions_shows_only_in_tabs_its_project_is_in() {
+        let mut app = app_with_an_empty_worktree();
+        press(&mut app, KeyCode::Char('t'));
+        app.set_sessions(vec![
+            in_worktree("planner", "main", State::Running),
+            session("shell"),
+        ]);
+        assert!(!shows_empty_worktree(&app), "tab 2 has only a shell");
+        press(&mut app, KeyCode::Char('1'));
+        assert!(shows_empty_worktree(&app));
+    }
+
+    #[test]
+    fn the_filter_finds_sessions_and_leaves_worktrees_with_none_out() {
+        let mut app = app_with_an_empty_worktree();
+        press(&mut app, KeyCode::Char('/'));
+        assert!(!shows_empty_worktree(&app));
+        press(&mut app, KeyCode::Esc);
+        assert!(shows_empty_worktree(&app));
     }
 
     fn hand_back(app: &mut App) {

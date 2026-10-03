@@ -58,7 +58,8 @@ is: it's the one request every version must understand.
   - `help.rs`: the overlay `?` opens, drawn from one table of every key; a test keeps the README's
     table of sidebar keys in step with it
   - `groups.rs`: the sidebar's order and headings: sessions by project, then worktree, agents before
-    terminals, and each flow run's steps under it
+    terminals, each flow run's steps under it, and linked worktrees with no sessions left at the end of
+    their project
   - `text_input.rs`: a one-line text box, for the questions asked on the bottom line
   - `text_area.rs`: a text box of several lines that wrap: the new-session panel's task
   - `launcher.rs`: the new-session panel (`n`, `w`): its state and keys, kept apart from I/O, the command
@@ -142,7 +143,8 @@ is: it's the one request every version must understand.
 - `src/plugin_cli.rs`: `crystal plugin`: listing, switching, running an action, installing, making and
   removing
 - `src/env.rs`: the environment a session's program starts with
-- `src/git.rs`: a directory's project, worktree and branch, and making and removing worktrees (runs `git`)
+- `src/git.rs`: a directory's project, worktree and branch, a project's linked worktrees, and making and
+  removing worktrees (runs `git`)
 - `src/github.rs`: pull requests and issues from GitHub, through `gh` with a timeout; tests use a fake `gh`,
   never the real one
 - `src/shell.rs`: quoting arguments and writing paths with `~`, the way a shell reads them

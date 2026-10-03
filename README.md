@@ -81,8 +81,8 @@ and the footer says where you are and offers the keys that matter there.
 
 | Key | In the sidebar |
 |---|---|
-| `j` / `k`, `↓` / `↑` | select a session |
-| `Enter` | type into the selected session, or start an ended one again, once you've said `y` |
+| `j` / `k`, `↓` / `↑` | select a session, or a worktree with no sessions |
+| `Enter` | type into the selected session, or start an ended one again, once you've said `y`; on a worktree with no sessions, start one there |
 | `s` | split the selected session off into a pane of its own, or close its split |
 | `z` | [zoom](#zoom-copy-mode-and-search) the selected session's pane to take the whole screen, or put it back |
 | `Tab` / `Shift+Tab` | type into the next pane, or the one before |
@@ -95,7 +95,7 @@ and the footer says where you are and offers the keys that matter there.
 | `>` | move the selected session to another tab: then a tab's number, or `t` for a new one |
 | `n` | start a new session from [the new-session panel](#starting-a-session), and type into it |
 | `w` | the same, in a new worktree on a branch named after the task |
-| `W` | remove the selected session's worktree, once nothing runs in it and you've said `y` |
+| `W` | remove the selected worktree, once nothing runs in it and you've said `y` |
 | `r` | rename the selected session |
 | `x` | kill the selected session, once you've said `y` |
 | `u` | select the next session that needs you: waiting on you first, then done |
@@ -145,6 +145,11 @@ session is sized to its pane. `Tab` from the sidebar goes on to the pane after t
 The sidebar groups sessions by project, then by worktree: `⌂` marks a repository's main worktree and `⎇` a
 linked one, each named by its branch. Sessions outside any repository come last, under their directory.
 `w` makes its worktree in the selected session's project, or in the repository you started `crystal` in.
+
+A linked worktree with no sessions left stays at the end of its project, with a `· no sessions` row under it,
+until it's removed: it's still on disk, maybe with work in it. Select it, and `n` or `Enter` starts something
+there, `d` and `p` show its changes and files, and `W` removes it. It shows in every tab its project has
+sessions in. One made or removed outside crystal comes or goes within a few seconds.
 
 Each row says what its session is doing. Within a worktree the agents come first, then a `terminals` line and
 the terminals: shells, and any other program that isn't an agent, drawn quieter. A project with a session

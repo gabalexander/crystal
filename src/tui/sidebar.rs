@@ -111,13 +111,19 @@ fn offset(app: &App, height: u16) -> usize {
     }
 }
 
-/// The row the bar is on: the selected session's, or, while `/`'s filter
-/// is open, the one its bar is on.
+/// The row the bar is on: the selected session's, or the worktree's with
+/// no sessions the selection is on, or, while `/`'s filter is open, the
+/// one its bar is on.
 fn selected_row(app: &App) -> Option<usize> {
+    let rows = app.rows();
+    if app.filter().is_none()
+        && let Some(worktree) = app.selected_empty_worktree()
+    {
+        let row = Row::NoSessions(worktree.path.clone());
+        return rows.iter().position(|shown| *shown == row);
+    }
     let index = app.sidebar_cursor()?;
-    app.rows()
-        .iter()
-        .position(|row| *row == Row::Session(index))
+    rows.iter().position(|row| *row == Row::Session(index))
 }
 
 /// One row, fitted to `width` columns.
@@ -154,6 +160,7 @@ fn row_line<'a>(app: &'a App, row: &Row, look: &Look, width: u16, selected: bool
             session_line(session, &marked, look, width, selected)
         }
         Row::Terminals => terminals_line(theme, width),
+        Row::NoSessions(_) => no_sessions_line(theme, width, selected),
         Row::Task(index) => task_line(&app.sessions()[*index], theme, width),
         Row::Flow(run) => flow_heading(&app.flows()[*run], look, width),
         Row::Step { run, step } => step_line(&app.flows()[*run], *step, None, look, width, false),
@@ -279,6 +286,23 @@ fn terminals_line<'a>(theme: &Theme, width: u16) -> Line<'a> {
         Span::styled(label, Style::new().fg(theme.muted)),
         Span::raw(" "),
         Span::styled("┄".repeat(rule), Style::new().fg(theme.rule)),
+    ])
+}
+
+/// The row under a linked worktree with no sessions, where a session's
+/// would be: quiet, since nothing runs there, but the selection can be on
+/// it.
+fn no_sessions_line<'a>(theme: &Theme, width: u16, selected: bool) -> Line<'a> {
+    let mut style = Style::new().fg(theme.muted);
+    if selected {
+        style = style.add_modifier(Modifier::BOLD);
+    }
+    // The indent, the mark and a space before the words; a space at the end.
+    let room = usize::from(width).saturating_sub(SESSION_INDENT.len() + 2 + 1);
+    Line::from(vec![
+        Span::raw(SESSION_INDENT),
+        Span::styled("· ", Style::new().fg(theme.muted)),
+        Span::styled(fit("no sessions", room), style),
     ])
 }
 
