@@ -1,14 +1,14 @@
 //! Profiles: named, saved ways of starting an agent. A profile says which
-//! agent, set up how (its model, how it asks before acting, more
-//! arguments), what it's asked on top of every task, the standing
-//! instructions it keeps all session, and where it starts. The new-session
-//! panel offers them first.
+//! agent, set up how (its model, how hard it thinks, how it asks before
+//! acting, more arguments), what it's asked on top of every task, the
+//! standing instructions it keeps all session, and where it starts. The
+//! new-session panel offers them first.
 //!
 //! They live in the config file as `[[profile]]` tables. The TUI changes
 //! them there through `toml_edit`, which keeps the rest of the file as the
 //! user wrote it, comments and all.
 
-use crate::catalog::{self, Agent, FirstPrompt, Instructions};
+use crate::catalog::{self, FirstPrompt, Instructions, Kind};
 use crate::config;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -38,6 +38,9 @@ pub struct Profile {
     /// The model, for an agent that takes one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// How hard it thinks: Claude Code's `--effort`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
     /// How it asks before acting: Claude Code's `--permission-mode`, or
     /// Codex's `-a`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -65,7 +68,7 @@ pub struct Profile {
 pub enum StartIn {
     /// Where the selected session runs.
     Here,
-    /// In a new worktree, on a branch named after the task.
+    /// In a new worktree, on a branch with a made-up name.
     Worktree,
 }
 
@@ -78,6 +81,7 @@ impl Profile {
             description: None,
             agent: agent.to_string(),
             model: None,
+            effort: None,
             mode: None,
             args: Vec::new(),
             prompt: None,
@@ -86,16 +90,36 @@ impl Profile {
         }
     }
 
-    /// The command line that starts it on `task`: the agent, its options,
-    /// its instructions and arguments, then its prompt and the task, the
-    /// way the agent takes a first prompt.
+    /// What it sets the agent's row of `kind` to, if anything.
+    pub fn choice(&self, kind: Kind) -> &Option<String> {
+        match kind {
+            Kind::Model => &self.model,
+            Kind::Effort => &self.effort,
+            Kind::Mode => &self.mode,
+        }
+    }
+
+    /// The same, to change it.
+    pub fn choice_mut(&mut self, kind: Kind) -> &mut Option<String> {
+        match kind {
+            Kind::Model => &mut self.model,
+            Kind::Effort => &mut self.effort,
+            Kind::Mode => &mut self.mode,
+        }
+    }
+
+    /// The command line that starts it on `task`: the agent, its options in
+    /// the order of its rows, its instructions and arguments, then its
+    /// prompt and the task, the way the agent takes a first prompt.
     pub fn command(&self, task: &str) -> Vec<String> {
         let agent = catalog::find(&self.agent);
         let mut command = vec![self.agent.clone()];
-        let model_option = agent.and_then(Agent::model_setting).map(|s| s.option);
-        let mode_option = agent.and_then(Agent::mode_setting).map(|s| s.option);
-        push_option(&mut command, model_option, self.model.as_deref());
-        push_option(&mut command, mode_option, self.mode.as_deref());
+        for setting in agent.map_or(&[][..], |agent| agent.settings) {
+            if let Some(value) = self.choice(setting.kind) {
+                command.push(setting.option.to_string());
+                command.push(value.clone());
+            }
+        }
         if let Some(text) = filled(&self.instructions) {
             let instructions = agent.map_or(Instructions::None, |agent| agent.instructions);
             command.extend(instructions.args(text));
@@ -127,19 +151,26 @@ impl Profile {
                 known.join(", ")
             );
         };
-        if self.model.is_some() && agent.model_setting().is_none() {
-            bail!("profile {name}: {} doesn't take a model", agent.name);
-        }
-        if let Some(mode) = &self.mode {
-            let modes = agent.mode_values();
-            if modes.is_empty() {
-                bail!("profile {name}: {} doesn't take a mode", agent.name);
-            }
-            if !modes.contains(&mode.as_str()) {
+        for kind in [Kind::Model, Kind::Effort, Kind::Mode] {
+            let Some(chosen) = self.choice(kind) else {
+                continue;
+            };
+            if agent.setting(kind).is_none() {
                 bail!(
-                    "profile {name}: {mode} isn't a mode of {}; it takes {}",
+                    "profile {name}: {} doesn't take {}",
                     agent.name,
-                    modes.join(", ")
+                    kind.noun()
+                );
+            }
+            // Models are too many to know, and Codex's change as it ships
+            // them; the rest are fixed.
+            let values = agent.values(kind);
+            if kind != Kind::Model && !values.contains(&chosen.as_str()) {
+                bail!(
+                    "profile {name}: {chosen} isn't {} of {}; it takes {}",
+                    kind.noun(),
+                    agent.name,
+                    values.join(", ")
                 );
             }
         }
@@ -147,15 +178,6 @@ impl Profile {
             bail!("profile {name}: {} can't be given instructions", agent.name);
         }
         Ok(())
-    }
-}
-
-/// `option` and `value` on `command`, when the agent has the option and
-/// the profile gives it a value.
-fn push_option(command: &mut Vec<String>, option: Option<&str>, value: Option<&str>) {
-    if let (Some(option), Some(value)) = (option, value) {
-        command.push(option.to_string());
-        command.push(value.to_string());
     }
 }
 
@@ -252,6 +274,7 @@ fn fill(table: &mut Table, profile: &Profile) {
     set_text(table, "description", filled(&profile.description));
     set_text(table, "agent", Some(&profile.agent));
     set_text(table, "model", profile.model.as_deref());
+    set_text(table, "effort", profile.effort.as_deref());
     set_text(table, "mode", profile.mode.as_deref());
     set_words(table, "args", &profile.args);
     set_text(table, "prompt", filled(&profile.prompt));
@@ -298,6 +321,7 @@ mod tests {
             description: Some("A second pair of eyes".into()),
             agent: "claude".into(),
             model: Some("opus".into()),
+            effort: Some("high".into()),
             mode: Some("plan".into()),
             args: vec!["--verbose".into()],
             prompt: Some("Review the diff on this branch.".into()),
@@ -314,6 +338,8 @@ mod tests {
                 "claude",
                 "--model",
                 "opus",
+                "--effort",
+                "high",
                 "--permission-mode",
                 "plan",
                 "--append-system-prompt",
@@ -379,6 +405,20 @@ mod tests {
                     ..Profile::for_agent("claude")
                 },
                 "isn't a mode of Claude Code",
+            ),
+            (
+                Profile {
+                    effort: Some("turbo".into()),
+                    ..Profile::for_agent("claude")
+                },
+                "turbo isn't an effort level of Claude Code; it takes low, medium",
+            ),
+            (
+                Profile {
+                    effort: Some("high".into()),
+                    ..Profile::for_agent("codex")
+                },
+                "Codex doesn't take an effort level",
             ),
             (
                 Profile {

@@ -32,9 +32,11 @@ pub enum Row {
     OutsideGit,
     /// A worktree's branch, heading its sessions. `branch` is `None` when
     /// the worktree is on no branch. `project` is the project's main
-    /// worktree, where its pull requests are asked for.
+    /// worktree, where its pull requests are asked for; `path`, the
+    /// worktree's own directory.
     Worktree {
         project: PathBuf,
+        path: PathBuf,
         branch: Option<String>,
         main: bool,
     },
@@ -182,6 +184,7 @@ fn empty_rows(empty: &[Worktree], project: &Path) -> Vec<Row> {
     for worktree in empty.iter().filter(|w| w.project_path == project) {
         rows.push(Row::Worktree {
             project: worktree.project_path.clone(),
+            path: worktree.path.clone(),
             branch: worktree.branch.clone(),
             main: false,
         });
@@ -300,6 +303,7 @@ fn worktree_heading(session: &SessionInfo) -> Row {
     match &session.worktree {
         Some(worktree) => Row::Worktree {
             project: worktree.project_path.clone(),
+            path: worktree.path.clone(),
             branch: worktree.branch.clone(),
             main: worktree.main,
         },
@@ -584,6 +588,7 @@ mod tests {
                 },
                 Row::Worktree {
                     project: PathBuf::from("/code/app"),
+                    path: PathBuf::from("/code/app/main"),
                     branch: Some("main".into()),
                     main: true
                 },
@@ -591,6 +596,7 @@ mod tests {
                 Row::Session(1),
                 Row::Worktree {
                     project: PathBuf::from("/code/app"),
+                    path: PathBuf::from("/code/app/feat"),
                     branch: Some("feat".into()),
                     main: false
                 },
@@ -612,6 +618,7 @@ mod tests {
         let rows = super::rows(&sessions, &[], &empty, |_| true);
         let old = Row::Worktree {
             project: PathBuf::from("/code/app"),
+            path: PathBuf::from("/code/app/old"),
             branch: Some("old".into()),
             main: false,
         };

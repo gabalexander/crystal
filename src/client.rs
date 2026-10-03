@@ -173,10 +173,10 @@ pub fn respawn(socket: &Path, name: &str) -> Result<()> {
 
 /// Removes the worktree at `path`, unless sessions are still running in
 /// it: removing a directory out from under a program would leave it
-/// working on files that are gone. Sessions that had ended there leave the
-/// list with it, since their directory is gone and they could never start
-/// again.
-pub fn remove_worktree(socket: &Path, path: &Path) -> Result<()> {
+/// working on files that are gone. With `force`, changes not committed go
+/// with it. Sessions that had ended there leave the list with it, since
+/// their directory is gone and they could never start again.
+pub fn remove_worktree(socket: &Path, path: &Path, force: bool) -> Result<()> {
     let sessions = match ask(socket, &Request::List, false)? {
         Some(Response::Sessions { sessions }) => sessions,
         _ => Vec::new(),
@@ -193,7 +193,7 @@ pub fn remove_worktree(socket: &Path, path: &Path) -> Result<()> {
         bail!("{} still running in {}", names.join(", "), path.display());
     }
     let branch = git::Checkout::find(path).and_then(|checkout| checkout.worktree().branch);
-    git::remove_worktree(path)?;
+    git::remove_worktree(path, force)?;
     tell_worktree(socket, path, branch, false);
     for session in ended {
         let kill = Request::Kill {
@@ -210,6 +210,14 @@ pub fn remove_worktree(socket: &Path, path: &Path) -> Result<()> {
 pub fn add_worktree(socket: &Path, dir: &Path, branch: &str) -> Result<PathBuf> {
     let path = git::add_worktree(dir, branch)?;
     tell_worktree(socket, &path, Some(branch.to_string()), true);
+    Ok(path)
+}
+
+/// Makes a worktree on a new branch, `branch` or the first like it that's
+/// free, as [`git::add_new_worktree`] does, and tells the daemon.
+pub fn add_new_worktree(socket: &Path, dir: &Path, branch: &str) -> Result<PathBuf> {
+    let (path, branch) = git::add_new_worktree(dir, branch)?;
+    tell_worktree(socket, &path, Some(branch), true);
     Ok(path)
 }
 

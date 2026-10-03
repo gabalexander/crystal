@@ -111,6 +111,17 @@ pub enum Event {
         project: PathBuf,
         worktrees: Vec<Worktree>,
     },
+    /// git is done removing the worktree at `path`: it's gone, or why not.
+    WorktreeRemoved {
+        path: PathBuf,
+        removed: Result<(), String>,
+    },
+    /// The worktree at `path`, on `branch`, has changes not committed, so
+    /// git didn't remove it: only a forced removal would.
+    WorktreeHasChanges {
+        path: PathBuf,
+        branch: String,
+    },
     /// What GitHub said about the open issues of a project.
     Issues {
         project: PathBuf,
@@ -444,6 +455,10 @@ impl Tui {
             Event::Flows(runs) => self.app.set_flows(runs),
             Event::PullRequests { project, found } => self.app.set_pull_requests(project, found),
             Event::Worktrees { project, worktrees } => self.app.set_worktrees(project, worktrees),
+            Event::WorktreeRemoved { path, removed } => self.worktree_removed(&path, removed),
+            Event::WorktreeHasChanges { path, branch } => {
+                self.app.ask_to_force_removal(path, branch);
+            }
             Event::Issues { project, found } => self.app.set_issues(&project, found),
             Event::IssueBody {
                 project,
@@ -770,13 +785,25 @@ impl Tui {
                 self.app.select(&name);
                 self.app.type_into_selected();
             }
-            Action::RemoveWorktree(path) => {
-                if let Err(err) = client::remove_worktree(&self.socket, &path) {
-                    bail!("{}", removal_refused(&path, &err));
-                }
-                self.app.worktree_removed(&path);
-                self.list_worktrees_again();
-                self.refresh_sessions()?;
+            Action::RemoveWorktree {
+                path,
+                branch,
+                force,
+            } => {
+                // git looks for changes and deletes every file in it, which
+                // can take a while: off the loop.
+                let socket = self.socket.clone();
+                self.read_in_background(move || {
+                    // git won't remove a worktree with changes not
+                    // committed unless it's forced, so the user is asked
+                    // again, this time about losing them.
+                    if !force && git::has_changes(&path).unwrap_or(false) {
+                        return Event::WorktreeHasChanges { path, branch };
+                    }
+                    let removed = client::remove_worktree(&socket, &path, force)
+                        .map_err(|err| removal_refused(&path, &err));
+                    Event::WorktreeRemoved { path, removed }
+                });
             }
             Action::Type { to, key } => {
                 if let Some(pane) = self.pane_in(to)
@@ -1036,6 +1063,20 @@ impl Tui {
         });
     }
 
+    /// git is done removing the worktree at `path`. Once it's gone, it and
+    /// the sessions that had ended in it leave the sidebar straight away.
+    fn worktree_removed(&mut self, path: &Path, removed: Result<(), String>) {
+        if let Err(reason) = removed {
+            self.app.worktree_not_removed(path, reason);
+            return;
+        }
+        self.app.worktree_removed(path);
+        self.list_worktrees_again();
+        if let Err(err) = self.refresh_sessions() {
+            self.app.notify(format!("{err:#}"));
+        }
+    }
+
     /// Asks for the list now, rather than waiting for the next poll, so a
     /// key's effect shows straight away.
     fn refresh_sessions(&mut self) -> Result<()> {
@@ -1225,12 +1266,20 @@ fn directory_for(socket: &Path, place: Place) -> Result<PathBuf> {
     match place {
         Place::Directory(Some(dir)) => Ok(dir),
         Place::Directory(None) => Ok(std::env::current_dir()?),
-        Place::NewWorktree { branch, base } => {
+        Place::NewWorktree {
+            branch,
+            base,
+            made_up,
+        } => {
             let base = match base {
                 Some(base) => base,
                 None => std::env::current_dir()?,
             };
-            client::add_worktree(socket, &base, &branch)
+            if made_up {
+                client::add_new_worktree(socket, &base, &branch)
+            } else {
+                client::add_worktree(socket, &base, &branch)
+            }
         }
     }
 }
