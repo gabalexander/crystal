@@ -95,6 +95,12 @@ agent wrote before you opened it. The title says how far back you are (`↑ 120 
 you away while you read, and typing into the session brings you back to live. That includes agents that print
 inline through a scroll region, like Codex, whose rows a plain terminal emulator would lose.
 
+The mouse works too. Click a session in the sidebar to select it, or click a pane to type into it. The wheel
+moves the selection over the sidebar, and scrolls a pane through its history. A program that asks for the
+mouse itself, like `vim` with `set mouse=a` or `htop`, gets the clicks, drags and the wheel in its pane while
+that pane has the keyboard. Since crystal takes the mouse, your terminal's own text selection needs a key held:
+`Shift` in most terminals, `Option` in iTerm2 and Terminal on macOS.
+
 `n` asks on the bottom line, `new session:`, starting out with the command you used last, at first `claude`.
 For an agent, the rest of the line is its first prompt: `claude fix the login bug` starts Claude on that.
 Anything else runs as a shell would run it, so `npm run dev` or `sh -c 'make && make test'` work too, and an

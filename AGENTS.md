@@ -40,8 +40,9 @@ is: it's the one request every version must understand.
 - `src/drive.rs`: `crystal send`, `wait` and `read`, for driving one session from another or a script
 - `src/tui/`: the TUI (`crystal` with no command)
   - `mod.rs`: the event loop: one channel of events, then update and draw
-  - `app.rs`: the state and how keys change it; no I/O, so it's unit-tested
-  - `ui.rs`: the layout and drawing
+  - `app.rs`: the state and how keys and the mouse change it; no I/O, so it's unit-tested
+  - `ui.rs`: the layout and drawing, and what's under the mouse
+  - `mouse.rs`: writes mouse events the way a program in a pane asked for them
   - `groups.rs`: the sidebar's order and headings: sessions by project, then worktree
   - `text_input.rs`: a one-line text box, for the questions asked on the bottom line
   - `command_line.rs`: reads the line typed at `new session:` into the command to run
