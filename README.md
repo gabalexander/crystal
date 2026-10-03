@@ -163,7 +163,7 @@ crystal wait review                         # block until its agent stops workin
 crystal read review --lines 20              # print the last 20 rows of its screen
 crystal read review --history               # and what scrolled off it before
 crystal rename review reviewer              # give a session another name
-crystal respawn reviewer                    # run an ended session again; Claude Code in its conversation
+crystal respawn reviewer                    # run an ended session again; an agent in its conversation
 crystal kill review                         # stop one session
 crystal kill-server                         # stop every session, and the daemon
 crystal restart-server                      # restart the daemon, say after an upgrade; sessions come back
@@ -189,8 +189,8 @@ their directory is gone, so they could never start again.
 
 `crystal rename` changes what a session is called; its program and its saved place after a restart follow the
 new name. `crystal respawn`, or `Enter` on an ended session in the TUI, runs its command again in the same
-directory, under the same name and in the same place in the list, with your environment. Claude Code comes back
-in the conversation it was in. Every session's program also gets `CRYSTAL_SESSION_ID`, which stays the same
+directory, under the same name and in the same place in the list, with your environment. Claude Code and Codex
+come back in the conversation they were in. Every session's program also gets `CRYSTAL_SESSION_ID`, which stays the same
 when the session is renamed, while `CRYSTAL_SESSION` keeps the name the program started under.
 
 The first `crystal new` starts the daemon. Sessions keep running after you detach or close the terminal, and
@@ -198,10 +198,29 @@ The first `crystal new` starts the daemon. Sessions keep running after you detac
 session that has ended, it prints the last screen and how the program exited.
 
 If the daemon dies without being asked to, because it crashed or the machine rebooted, the next `crystal` starts
-the sessions that were running again, in the same directories. Claude Code comes back in the conversation it
-was in. `crystal kill-server` is asked to stop everything, so after it nothing comes back. The list is kept in
-`~/.local/state/crystal/sessions.json`, without the sessions' environment variables, since those can hold
-secrets; a session started again gets the environment of whoever started the daemon again.
+the sessions that were running again, in the same directories. Claude Code and Codex come back in the
+conversation they were in. `crystal kill-server` is asked to stop everything, so after it nothing comes back.
+The list is kept in `~/.local/state/crystal/sessions.json`, without the sessions' environment variables, since
+those can hold secrets; a session started again gets the environment of whoever started the daemon again.
+
+### Codex
+
+crystal reads what Codex is doing off its screen: `Working (… esc to interrupt)` while it works, and its
+approval questions ("Would you like to run the following command?") while it waits on you. Codex has hooks
+too, but crystal can't add its own the way it does for Claude Code: Codex only reads hooks from its config
+files, never from the command line, and skips any hook you haven't reviewed in `/hooks`. Its `notify` setting
+can be given on the command line, but that would replace yours, so crystal leaves it alone.
+
+To pick a conversation up again, crystal finds the file Codex records it in,
+`$CODEX_HOME/sessions/YYYY/MM/DD/rollout-…jsonl` (`~/.codex` without `CODEX_HOME`): the one for the session's
+directory that Codex started closest to when the session did, within a minute. After a restart, or with
+`crystal respawn`, the session runs `codex resume <id>` with the options it was started with, but not its first
+prompt again. The limits:
+
+- Codex writes that file once it has been sent a prompt, so a Codex that was never sent one starts afresh.
+- A conversation you begin from inside Codex with `/new` isn't followed: crystal picks the first one up again.
+- `codex exec` and Codex's other subcommands run as they were asked, without resuming.
+- A Codex you start yourself in a shell session gets its status from the screen, but isn't resumed.
 
 ### Agents driving agents
 

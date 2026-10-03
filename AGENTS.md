@@ -59,6 +59,8 @@ is: it's the one request every version must understand.
   - `screen_widget.rs`: draws a vt100 screen into ratatui
 - `src/daemon.rs`: the daemon: listens on the socket and owns the sessions
 - `src/agents.rs`: what crystal knows about particular agents: the hooks it adds to Claude Code, and what they mean
+- `src/codex.rs`: what crystal knows about Codex: finding a session's conversation in its rollouts, and
+  `codex resume`
 - `src/hook.rs`: `crystal hook <agent>`: what those hooks run, to tell the daemon
 - `src/agent_screen.rs`: reading what an agent is doing off its screen and title
 - `src/typing.rs`: typing into a session the way a person would: pastes marked, Enter on its own
