@@ -4328,3 +4328,432 @@ fn a_closed_task_is_remembered_in_its_project_s_memory() {
             .contains("fix the tests: did what was asked")
     });
 }
+
+/// Installs a plugin by hand, as `crystal plugin new` or `install` would:
+/// a directory called `name` in the test's plugins directory, with
+/// `manifest` for its plugin.toml and `files` beside it.
+fn plugin(crystal: &Crystal, name: &str, manifest: &str, files: &[(&str, &str)]) -> PathBuf {
+    let dir = crystal.config_home().join("crystal/plugins").join(name);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("plugin.toml"), manifest).unwrap();
+    for (file, text) in files {
+        std::fs::write(dir.join(file), text).unwrap();
+    }
+    dir
+}
+
+#[test]
+fn with_memory_switched_off_claude_isn_t_shown_what_was_remembered() {
+    let (crystal, repo) = crystal_remembering();
+    let repo_dir = repo.to_str().unwrap();
+    crystal.ok(&[
+        "remember",
+        "-C",
+        repo_dir,
+        "The ledger tests need the database up",
+    ]);
+    assert_eq!(
+        crystal.ok(&["plugin", "disable", "memory"]),
+        "the memory plugin is off\n"
+    );
+
+    let refused = crystal.fails(&["remember", "-C", repo_dir, "Fees are kept in cents"]);
+    assert!(
+        refused.contains("turn it on with `crystal plugin enable memory`"),
+        "{refused}"
+    );
+    let bin = fake_claude(crystal.dir.path());
+    let out = crystal
+        .command(&["new", "-n", "agent", "-c", repo_dir, "claude", "fix it"])
+        .env("PATH", path_of(&[&bin]))
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let args = written(&repo.join("args"));
+    assert!(!args.contains("earlier sessions learned"), "{args}");
+    assert!(!args.contains("crystal remember"), "{args}");
+    assert!(args.ends_with("fix it\n"), "{args}");
+}
+
+#[test]
+fn with_github_switched_off_gh_is_never_asked_until_it_s_on_again() {
+    let crystal = Crystal::new();
+    crystal.configure("notify = false\n\n[plugins]\nmemory = false\ngithub = false\n");
+    let repo = github_repo(crystal.dir.path());
+    let bin = fake_gh(crystal.dir.path(), "[]", NO_ISSUES);
+    let repo_arg = repo.to_str().unwrap();
+    crystal.ok(&["new", "-n", "planner", "-c", repo_arg, "sleep", "30"]);
+
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let mut tui = crystal.attach_with_env(&[], &[("PATH", &path)]);
+    tui.shows("▸ planner");
+    tui.type_keys("o");
+    tui.shows("the github plugin is off");
+    tui.type_keys("i");
+    tui.shows("the github plugin is off");
+    let calls = crystal.dir.path().join("gh-calls");
+    assert!(
+        !calls.exists(),
+        "gh was asked: {:?}",
+        std::fs::read_to_string(&calls)
+    );
+
+    // Switched on in the plugins view, it's asked straight away.
+    tui.type_keys("X");
+    tui.shows("crystal's own");
+    tui.type_keys("jjjj ");
+    tui.shows("● github");
+    eventually("gh is asked about pull requests", || {
+        std::fs::read_to_string(&calls).is_ok_and(|calls| calls.contains("pr list"))
+    });
+    let config = std::fs::read_to_string(crystal.config_file()).unwrap();
+    assert!(config.contains("github = true"), "{config}");
+}
+
+#[test]
+fn the_keys_of_a_plugin_that_s_off_aren_t_listed() {
+    let crystal = Crystal::new();
+    crystal.ok(&["new", "-n", "agent", "sleep", "30"]);
+    let mut tui = crystal.tui();
+    tui.shows("▸ agent");
+    tui.type_keys("?");
+    tui.shows("the project's backlog");
+    assert!(
+        !tui.text().contains("what it has remembered"),
+        "{}",
+        tui.text()
+    );
+    tui.type_keys("m");
+    tui.hides("the project's backlog");
+    tui.type_keys("m");
+    tui.shows("the memory plugin is off");
+}
+
+#[test]
+fn an_event_plugin_hears_a_session_come_to_wait_once() {
+    let crystal = Crystal::new();
+    let manifest = r#"
+name = "listener"
+version = "1.0.0"
+
+[[events]]
+on = "session.*"
+command = ["sh", "hook.sh"]
+"#;
+    let hook = r#"{ printf '%s %s ' "$CRYSTAL_EVENT" "$CRYSTAL_SESSION"; cat; } >> heard"#;
+    let dir = plugin(&crystal, "listener", manifest, &[("hook.sh", hook)]);
+    crystal.ok(&["plugin", "enable", "listener"]);
+
+    let bin = fake_claude(crystal.dir.path());
+    let out = crystal
+        .command(&["new", "-n", "agent", "claude"])
+        .env("PATH", path_of(&[&bin]))
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let args = written(&crystal.dir.path().join("args"));
+    let settings: serde_json::Value = serde_json::from_str(args.lines().nth(1).unwrap()).unwrap();
+    let hook = settings["hooks"]["Stop"][0]["hooks"][0]["command"]
+        .as_str()
+        .unwrap();
+
+    let heard = dir.join("heard");
+    let heard_of = |event: &str| {
+        let heard = std::fs::read_to_string(&heard).unwrap_or_default();
+        heard.lines().filter(|line| line.starts_with(event)).count()
+    };
+    run_hook(
+        &crystal,
+        "agent",
+        hook,
+        r#"{"hook_event_name":"UserPromptSubmit"}"#,
+    );
+    run_hook(
+        &crystal,
+        "agent",
+        hook,
+        r#"{"hook_event_name":"PermissionRequest"}"#,
+    );
+    eventually("the plugin hears it wait", || {
+        heard_of("session.waiting") == 1
+    });
+    run_hook(&crystal, "agent", hook, r#"{"hook_event_name":"Stop"}"#);
+    eventually("the plugin hears it finish", || {
+        heard_of("session.done") == 1
+    });
+
+    // In the order it happened, once each, with the event as JSON.
+    let heard = std::fs::read_to_string(&heard).unwrap();
+    let events: Vec<&str> = heard
+        .lines()
+        .map(|line| line.split(' ').next().unwrap())
+        .collect();
+    assert_eq!(
+        events,
+        ["session.started", "session.waiting", "session.done"],
+        "{heard}"
+    );
+    let waiting = heard.lines().nth(1).unwrap();
+    let json = waiting
+        .strip_prefix("session.waiting agent ")
+        .unwrap_or_else(|| panic!("{waiting}"));
+    let json: serde_json::Value = serde_json::from_str(json).unwrap();
+    assert_eq!(json["event"], "session.waiting");
+    assert_eq!(json["session"]["name"], "agent");
+    assert_eq!(json["session"]["activity"], "waiting");
+}
+
+#[test]
+fn a_plugin_whose_hooks_keep_failing_is_paused_until_it_s_turned_on_again() {
+    let crystal = Crystal::new();
+    let manifest = r#"
+name = "broken"
+version = "1"
+
+[[events]]
+on = "*"
+command = ["sh", "-c", "exit 1"]
+"#;
+    plugin(&crystal, "broken", manifest, &[]);
+    crystal.ok(&["plugin", "enable", "broken"]);
+    for n in 1..=5 {
+        crystal.ok(&["new", "-d", "-n", &format!("s{n}"), "sleep", "30"]);
+    }
+    eventually("the plugin is paused", || {
+        crystal.ok(&["plugin"]).contains("broken         paused")
+    });
+    let log = crystal.ok(&["plugin", "log", "broken"]);
+    assert!(log.contains("exit status: 1"), "{log}");
+    assert!(
+        log.contains("turn it back on with `crystal plugin enable broken`"),
+        "{log}"
+    );
+
+    crystal.ok(&["plugin", "enable", "broken"]);
+    assert!(crystal.ok(&["plugin"]).contains("broken         on"));
+}
+
+/// A plugin with an action that writes down what it was told about where
+/// it was run from.
+fn where_plugin(crystal: &Crystal) -> PathBuf {
+    let manifest = r#"
+name = "notes"
+version = "0.1.0"
+description = "Notes on sessions"
+
+[[actions]]
+id = "where"
+title = "Where am I"
+command = ["sh", "where.sh"]
+key = "N"
+"#;
+    let script = r#"test -x "$CRYSTAL_BIN" || exit 3
+echo "$CRYSTAL_SESSION|$CRYSTAL_SESSION_ID|$CRYSTAL_PROJECT|$CRYSTAL_WORKTREE|$CRYSTAL_SOCKET" > ran
+"#;
+    plugin(crystal, "notes", manifest, &[("where.sh", script)])
+}
+
+#[test]
+fn plugin_run_runs_an_action_with_where_it_was_run_from() {
+    let crystal = Crystal::new();
+    let dir = where_plugin(&crystal);
+    let repo = git_repo(crystal.dir.path(), "app");
+    let repo_arg = repo.to_str().unwrap();
+    crystal.ok(&["new", "-n", "agent", "-c", repo_arg, "sleep", "30"]);
+
+    let refused = crystal.fails(&["plugin", "run", "notes", "where"]);
+    assert!(
+        refused.contains("turn it on with `crystal plugin enable notes`"),
+        "{refused}"
+    );
+    crystal.ok(&["plugin", "enable", "notes"]);
+    crystal.ok(&["plugin", "run", "notes", "where", "--session", "agent"]);
+
+    let ran = written(&dir.join("ran"));
+    let told: Vec<&str> = ran.trim_end().split('|').collect();
+    let id = listed(&crystal, "agent")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(told[0], "agent");
+    assert_eq!(told[1], id);
+    assert!(told[2].ends_with("/app"), "{ran}");
+    assert!(told[3].ends_with("/app"), "{ran}");
+    assert_eq!(told[4], crystal.socket.to_str().unwrap());
+}
+
+#[test]
+fn a_plugin_action_s_key_runs_it_from_the_sidebar() {
+    let crystal = Crystal::new();
+    let dir = where_plugin(&crystal);
+    crystal.ok(&["plugin", "enable", "notes"]);
+    let repo = git_repo(crystal.dir.path(), "app");
+    let repo_arg = repo.to_str().unwrap();
+    crystal.ok(&["new", "-n", "agent", "-c", repo_arg, "sleep", "30"]);
+
+    let mut tui = crystal.tui();
+    tui.shows("▸ agent");
+    tui.type_keys("?");
+    tui.shows("notes: Where am I");
+    tui.type_keys("q");
+    tui.hides("notes: Where am I");
+    tui.type_keys("N");
+    let ran = written(&dir.join("ran"));
+    assert!(ran.starts_with("agent|"), "{ran}");
+    tui.shows("ran notes: Where am I");
+}
+
+#[test]
+fn a_plugin_pane_shows_its_program_over_the_panes_and_closes() {
+    let crystal = Crystal::new();
+    let manifest = r#"
+name = "board"
+version = "0.1.0"
+
+[[panes]]
+id = "show"
+title = "The board"
+command = ["sh", "show.sh"]
+"#;
+    let script = "echo 'the board says hi'\nread -r line\necho \"got $line\" > got\n";
+    let dir = plugin(&crystal, "board", manifest, &[("show.sh", script)]);
+    crystal.ok(&["plugin", "enable", "board"]);
+
+    let mut tui = crystal.tui();
+    // Down past crystal's own six, to the pane under board.
+    let open = |tui: &mut Terminal| {
+        tui.type_keys("X");
+        tui.shows("installed");
+        tui.type_keys("jjjjjjj\r");
+        tui.shows("the board says hi");
+        tui.shows("board · The board");
+    };
+    open(&mut tui);
+    assert!(crystal.row("board-show").is_some());
+    // It has the keyboard; its program ending closes it.
+    tui.type_keys("hello\r");
+    assert_eq!(written(&dir.join("got")), "got hello\n");
+    tui.hides("the board says hi");
+    eventually("its session ends with it", || {
+        crystal.row("board-show").is_none()
+    });
+
+    // Ctrl+\ closes it too, and ends its session.
+    open(&mut tui);
+    tui.type_keys("\x1c");
+    tui.hides("the board says hi");
+    eventually("its session ends with it", || {
+        crystal.row("board-show").is_none()
+    });
+}
+
+#[test]
+fn enabling_and_disabling_a_plugin_keeps_the_config_s_comments() {
+    let crystal = Crystal::new();
+    crystal.configure(
+        "# my settings\nnotify = false # quiet\n\n[plugins]\nmemory = false # not yet\n",
+    );
+    crystal.ok(&["plugin", "disable", "backlog"]);
+    crystal.ok(&["plugin", "enable", "memory"]);
+    let config = std::fs::read_to_string(crystal.config_file()).unwrap();
+    assert_eq!(
+        config,
+        "# my settings\nnotify = false # quiet\n\n[plugins]\nmemory = true # not yet\nbacklog = false\n"
+    );
+    let listed = crystal.ok(&["plugin"]);
+    assert!(
+        listed.contains("backlog        off    built-in"),
+        "{listed}"
+    );
+    let refused = crystal.fails(&["backlog"]);
+    assert!(
+        refused
+            .contains("the backlog plugin is off: turn it on with `crystal plugin enable backlog`"),
+        "{refused}"
+    );
+
+    let refused = crystal.fails(&["plugin", "enable", "nope"]);
+    assert!(
+        refused.contains("there's no plugin called nope"),
+        "{refused}"
+    );
+}
+
+#[test]
+fn a_leftover_top_level_memory_setting_says_where_it_went() {
+    let crystal = Crystal::new();
+    crystal.configure("memory = false\n");
+    let refused = crystal.fails(&["plugin"]);
+    assert!(refused.contains("`memory` is now a plugin"), "{refused}");
+}
+
+#[test]
+fn a_plugin_installs_from_a_git_repository_and_starts_off() {
+    let crystal = Crystal::new();
+    let source = git_repo(crystal.dir.path(), "notes-plugin");
+    let manifest = r#"name = "notes"
+version = "0.2.0"
+description = "Keeps notes"
+
+[[events]]
+on = "task.closed"
+command = ["sh", "closed.sh"]
+"#;
+    std::fs::write(source.join("plugin.toml"), manifest).unwrap();
+    std::fs::write(source.join("closed.sh"), "cat >> closed\n").unwrap();
+    git(&source, &["add", "."]);
+    git(&source, &["commit", "-q", "-m", "notes"]);
+    let url = format!("file://{}", source.display());
+
+    let refused = crystal.fails(&["plugin", "install", &url]);
+    assert!(refused.contains("add --yes"), "{refused}");
+    let said = crystal.ok(&["plugin", "install", &url, "--yes"]);
+    assert!(said.contains("notes 0.2.0"), "{said}");
+    assert!(said.contains("on task.closed  sh closed.sh"), "{said}");
+    assert!(
+        said.contains("it's off until you run `crystal plugin enable notes`"),
+        "{said}"
+    );
+    let installed = crystal.config_home().join("crystal/plugins/notes");
+    assert!(installed.join("closed.sh").exists());
+    let listed = crystal.ok(&["plugin"]);
+    assert!(
+        listed.contains("notes          off    0.2.0     Keeps notes"),
+        "{listed}"
+    );
+
+    let refused = crystal.fails(&["plugin", "install", &url, "--yes"]);
+    assert!(refused.contains("notes is installed already"), "{refused}");
+
+    crystal.ok(&["plugin", "enable", "notes"]);
+    crystal.ok(&["plugin", "remove", "notes"]);
+    assert!(!installed.exists());
+    let config = std::fs::read_to_string(crystal.config_file()).unwrap();
+    assert!(!config.contains("notes"), "{config}");
+
+    // A directory is copied, all but its git repository.
+    let source_arg = source.to_str().unwrap();
+    crystal.ok(&["plugin", "install", source_arg, "--yes", "--enable"]);
+    assert!(installed.join("plugin.toml").exists());
+    assert!(!installed.join(".git").exists());
+    assert!(crystal.ok(&["plugin"]).contains("notes          on"));
+}
+
+#[test]
+fn a_new_plugin_runs_its_action_and_hears_events() {
+    let crystal = Crystal::new();
+    let made = crystal.ok(&["plugin", "new", "hello"]);
+    assert!(made.contains("crystal plugin enable hello"), "{made}");
+    crystal.ok(&["plugin", "enable", "hello"]);
+    let said = crystal.ok(&["plugin", "run", "hello", "hello"]);
+    assert!(said.starts_with("hello from hello: session none"), "{said}");
+
+    crystal.ok(&["new", "-n", "agent", "sleep", "30"]);
+    let heard = crystal
+        .config_home()
+        .join("crystal/plugins/hello/events.jsonl");
+    let line = written(&heard);
+    let event: serde_json::Value = serde_json::from_str(line.lines().next().unwrap()).unwrap();
+    assert_eq!(event["event"], "session.started");
+    assert_eq!(event["session"]["name"], "agent");
+}
