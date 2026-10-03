@@ -249,6 +249,18 @@ impl Tabs {
         }
     }
 
+    /// Tabs as read from a file, if they were written in the shape this
+    /// crystal writes them, and put right: see [`Tabs::checked`].
+    pub fn kept(self) -> Option<Tabs> {
+        (self.version == VERSION).then(|| self.checked())
+    }
+
+    /// Every session the tabs hold, by name.
+    pub fn sessions(&self) -> impl Iterator<Item = &str> {
+        let tabs = self.tabs.iter();
+        tabs.flat_map(|tab| tab.sessions.iter().map(String::as_str))
+    }
+
     /// Tabs as read from a file, put right where they couldn't have been
     /// written that way: one tab at least and [`MAX_TABS`] at most, each
     /// with [`MAX_SPLITS`] splits at most of its own sessions and a float
@@ -290,8 +302,7 @@ pub fn load(path: &Path) -> Tabs {
     std::fs::read_to_string(path)
         .ok()
         .and_then(|text| serde_json::from_str::<Tabs>(&text).ok())
-        .filter(|tabs| tabs.version == VERSION)
-        .map(Tabs::checked)
+        .and_then(Tabs::kept)
         .unwrap_or_default()
 }
 

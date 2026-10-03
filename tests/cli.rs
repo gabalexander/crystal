@@ -2255,6 +2255,54 @@ fn l_moves_a_pane_past_the_next_and_the_tab_keeps_the_order() {
 }
 
 #[test]
+fn a_layout_saved_puts_the_tabs_back_the_way_they_were() {
+    let crystal = Crystal::new();
+    for name in ["alpha", "beta"] {
+        let script = format!("echo {name} is here; echo > {name}-ready; sleep 30");
+        crystal.ok(&["new", "-n", name, "sh", "-c", &script]);
+        written(&crystal.dir.path().join(format!("{name}-ready")));
+    }
+
+    // alpha split off beside beta, in a tab called review.
+    let mut tui = crystal.tui();
+    tui.shows("alpha is here");
+    tui.type_keys("sj");
+    tui.shows("beta is here");
+    tui.type_keys("Treview\r");
+    tui.shows("1 review");
+
+    tui.type_keys("S");
+    tui.shows("no layouts yet");
+    tui.type_keys("s");
+    tui.shows("save the tabs as:");
+    tui.type_keys("side by side\r");
+    tui.shows("saved your tabs as side by side");
+    tui.shows("1 tab · 2 sessions");
+    tui.type_keys("\x1b");
+    tui.hides("layouts ·");
+
+    // The split closes, and the tab loses its name.
+    tui.type_keys("k");
+    tui.type_keys("s");
+    tui.hides("beta is here");
+    tui.type_keys("T\x15\r");
+    tui.hides("review");
+
+    tui.type_keys("S");
+    tui.shows("side by side");
+    tui.type_keys("\r");
+    tui.shows("restored side by side");
+    tui.shows("1 review");
+    tui.shows("alpha is here");
+    tui.shows("beta is here");
+
+    // The tabs it replaced are kept, to go back to.
+    tui.type_keys("S");
+    tui.shows("↶ before side by side");
+    assert!(crystal.dir.path().join("layouts.json").exists());
+}
+
+#[test]
 fn each_pane_sizes_its_own_session() {
     let crystal = Crystal::new();
     for name in ["left", "right"] {

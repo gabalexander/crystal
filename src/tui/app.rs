@@ -10,6 +10,7 @@ use super::finder::Finder;
 use super::groups::{self, Row};
 use super::issues::IssuesView;
 use super::launcher::{self, Launcher, Memory, Run, Setup, Target};
+use super::layouts::{self, Layouts, LayoutsView, Which};
 use super::memory_view::MemoryView;
 use super::plugins_view::{self, PluginsView};
 use super::profiles::{self, ProfilesView};
@@ -393,6 +394,13 @@ pub enum Action {
     PasteInPluginPane(String),
     /// Close the plugin's pane that's open, and end its session.
     ClosePluginPane,
+    /// Read the saved layouts, and open the layouts view on them.
+    ListLayouts,
+    /// Save the tabs as they are as the layout with this name.
+    SaveLayout(String),
+    /// Put the tabs back the way this layout has them.
+    RestoreLayout(Which),
+    RemoveLayout(Which),
 }
 
 /// A sidebar key one of the installed plugins' actions took.
@@ -519,6 +527,8 @@ pub struct App {
     closing: Option<String>,
     /// The backlog view, while it's open.
     backlog: Option<BacklogView>,
+    /// The layouts view, while it's open.
+    layouts: Option<LayoutsView>,
     /// How many backlog items each project has to do, by its main
     /// worktree.
     backlog_counts: HashMap<PathBuf, usize>,
@@ -573,6 +583,7 @@ impl App {
             plugin_pane: None,
             closing: None,
             backlog: None,
+            layouts: None,
             backlog_counts: HashMap::new(),
             flows: Vec::new(),
             flow_defs: Vec::new(),
@@ -1050,6 +1061,42 @@ impl App {
         self.issues.as_ref()
     }
 
+    /// The layouts view, while it's open.
+    pub fn layouts_view(&self) -> Option<&LayoutsView> {
+        self.layouts.as_ref()
+    }
+
+    /// Takes the layouts as they were read, or why they couldn't be: opens
+    /// the layouts view on them, or shows them in it if it's open, with the
+    /// bar on `on`, if that's given.
+    pub fn show_layouts(&mut self, found: Result<Layouts, String>, on: Option<&Which>) {
+        match &mut self.layouts {
+            Some(view) => view.set_layouts(found, on),
+            None => {
+                let running = self.sessions.iter().map(|s| s.name.clone()).collect();
+                self.layouts = Some(LayoutsView::new(found, running));
+            }
+        }
+    }
+
+    /// Puts the tabs back the way the layout called `name` had them, and
+    /// closes the layouts view: see [`Self::set_tabs`]. Says how many of
+    /// the layout's sessions have gone since, which it leaves out.
+    pub fn restore_layout(&mut self, tabs: Tabs, name: &str) {
+        let gone = tabs
+            .sessions()
+            .filter(|name| self.position(name).is_none())
+            .count();
+        self.layouts = None;
+        self.set_tabs(tabs);
+        let notice = match gone {
+            0 => format!("restored {name}"),
+            1 => format!("restored {name}: one of its sessions has gone"),
+            gone => format!("restored {name}: {gone} of its sessions have gone"),
+        };
+        self.notify(notice);
+    }
+
     /// The backlog view, while it's open.
     pub fn backlog_view(&self) -> Option<&BacklogView> {
         self.backlog.as_ref()
@@ -1454,6 +1501,9 @@ impl App {
         if self.backlog.is_some() {
             return self.on_backlog_key(key);
         }
+        if self.layouts.is_some() {
+            return self.on_layouts_key(key);
+        }
         if self.launcher.is_some() {
             return self.on_launcher_key(key);
         }
@@ -1505,6 +1555,7 @@ impl App {
         let typing = self.filter.is_some()
             || self.issues.is_some()
             || self.backlog.is_some()
+            || self.layouts.is_some()
             || self.launcher.is_some()
             || self.profiles_view.is_some()
             || self.plugins_view.is_some()
@@ -1645,6 +1696,7 @@ impl App {
             KeyCode::Char('v') => self.start_copying(),
             KeyCode::Char('e') => return self.edit_history(),
             KeyCode::Char('F') => self.toggle_float(),
+            KeyCode::Char('S') => return Some(Action::ListLayouts),
             KeyCode::Char('H') => self.move_pane(-1),
             KeyCode::Char('L') => self.move_pane(1),
             KeyCode::Char('t') => return self.new_tab(),
@@ -2132,6 +2184,21 @@ impl App {
         Some(Action::ListBacklog(dir))
     }
 
+    /// Keys while the layouts view is open: all of them are its.
+    fn on_layouts_key(&mut self, key: KeyEvent) -> Option<Action> {
+        let view = self.layouts.as_mut()?;
+        match view.on_key(&key) {
+            layouts::Step::Stay => None,
+            layouts::Step::Close => {
+                self.layouts = None;
+                None
+            }
+            layouts::Step::Save(name) => Some(Action::SaveLayout(name)),
+            layouts::Step::Restore(which) => Some(Action::RestoreLayout(which)),
+            layouts::Step::Remove(which) => Some(Action::RemoveLayout(which)),
+        }
+    }
+
     /// Keys while the backlog view is open: all of them are its.
     fn on_backlog_key(&mut self, key: KeyEvent) -> Option<Action> {
         let view = self.backlog.as_mut()?;
@@ -2414,6 +2481,8 @@ impl App {
             issues.on_paste(&text);
         } else if let Some(backlog) = &mut self.backlog {
             backlog.on_paste(&text);
+        } else if let Some(view) = &mut self.layouts {
+            view.on_paste(&text);
         } else if let Some(filter) = &mut self.filter {
             filter.input.insert_str(&text);
             self.keep_filter_bar_on_a_match();
@@ -4227,6 +4296,76 @@ mod tests {
         hand_back(&mut app);
         press(&mut app, KeyCode::Char('L'));
         assert!(app.notice().unwrap().contains("F puts it back"));
+    }
+
+    #[test]
+    fn s_capital_opens_the_layouts_and_keys_go_to_them_until_esc() {
+        let mut app = app_with(&["a"]);
+        assert_eq!(
+            press(&mut app, KeyCode::Char('S')),
+            Some(Action::ListLayouts)
+        );
+        app.show_layouts(Ok(Layouts::default()), None);
+        assert!(app.layouts_view().is_some());
+        // `s` saves rather than splits while the view is open.
+        press(&mut app, KeyCode::Char('s'));
+        assert!(app.splits().is_empty());
+        type_text(&mut app, "work");
+        assert_eq!(
+            press(&mut app, KeyCode::Enter),
+            Some(Action::SaveLayout("work".into()))
+        );
+        press(&mut app, KeyCode::Esc);
+        assert!(app.layouts_view().is_none());
+    }
+
+    #[test]
+    fn enter_in_the_layouts_asks_for_the_one_the_bar_is_on() {
+        let mut app = app_with(&["a"]);
+        let mut layouts = Layouts::default();
+        layouts.save("work", app.tabs_to_keep(), 10);
+        app.show_layouts(Ok(layouts), None);
+        assert_eq!(
+            press(&mut app, KeyCode::Enter),
+            Some(Action::RestoreLayout(Which::Saved("work".into())))
+        );
+    }
+
+    #[test]
+    fn a_layout_restored_puts_the_tabs_back_with_the_sessions_still_there() {
+        let mut app = app_with(&["a", "b", "c"]);
+        press(&mut app, KeyCode::Char('s'));
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('L'));
+        press(&mut app, KeyCode::Char('T'));
+        type_text(&mut app, "work");
+        press(&mut app, KeyCode::Enter);
+        let saved = app.tabs_to_keep();
+
+        // Then the tabs change: a tab of its own for c, the split closed.
+        app.select("c");
+        press(&mut app, KeyCode::Char('>'));
+        press(&mut app, KeyCode::Char('t'));
+        app.select("a");
+        press(&mut app, KeyCode::Char('s'));
+        assert_eq!(app.tabs().all().len(), 2);
+
+        // a has gone since the layout was saved; d is new.
+        app.set_sessions(vec![session("b"), session("c"), session("d")]);
+        app.show_layouts(Ok(Layouts::default()), None);
+        app.restore_layout(saved, "work");
+        assert!(app.layouts_view().is_none());
+        assert_eq!(app.tabs().all().len(), 1);
+        assert_eq!(app.tabs().current().name, "work");
+        assert_eq!(drawn(&app), ["b"]);
+        assert_eq!(selected_name(&app), Some("b"));
+        let mut held = app.tabs().current().sessions.clone();
+        held.sort();
+        assert_eq!(held, ["b", "c", "d"]);
+        assert_eq!(
+            app.notice(),
+            Some("restored work: one of its sessions has gone")
+        );
     }
 
     #[test]

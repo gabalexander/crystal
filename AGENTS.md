@@ -51,6 +51,9 @@ is: it's the one request every version must understand.
     splits, the order of its panes and the session floating over them, and which is in front; the sidebar
     shows only that tab's sessions. Kept apart from I/O but for keeping them in a file beside the daemon's
     state
+  - `layouts.rs`: the layouts view (`S`): the tabs saved under a name and put back, and the tabs a restore
+    replaced; its state and keys, kept apart from I/O but for keeping them in a file beside the tabs, and its
+    drawing
   - `sidebar.rs`: the sidebar's rows: headings, worktree lines, sessions with their mark and how long ago,
     terminals drawn apart from agents
   - `status.rs`: a session's status as the TUI shows it, and its mark
