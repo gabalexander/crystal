@@ -215,10 +215,6 @@ pub fn add(
 /// Keeps how a task turned out, for the sessions after it: what the tasks
 /// part of crystal calls when a task ends with something to say. With
 /// memory off it keeps nothing, and says so with `None`.
-#[allow(
-    dead_code,
-    reason = "tasks record how they turned out through this once they close"
-)]
 pub fn record_outcome(
     config: &Config,
     socket: &Path,

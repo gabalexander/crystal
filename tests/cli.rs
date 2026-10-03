@@ -4295,3 +4295,33 @@ fn the_panel_starts_claude_in_the_background_as_a_task() {
         crystal.row("task").unwrap()[8] == "✓ All green on run 1."
     });
 }
+
+#[test]
+fn a_closed_task_is_remembered_in_its_project_s_memory() {
+    let crystal = Crystal::new();
+    crystal.configure("notify = false\nmemory = true\n");
+    let dir = crystal.dir.path();
+    let bin = finishing_claude(dir);
+    let finish = dir.join("finish");
+    let out = crystal
+        .command(&["new", "-d", "-n", "fixer", "claude", "fix the tests"])
+        .env("PATH", path_of(&[&bin]))
+        .env("FINISH", &finish)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    std::fs::write(&finish, "").unwrap();
+    eventually("the task is closed", || {
+        crystal.row("fixer").unwrap()[8] == "✓ did what was asked"
+    });
+    eventually("the outcome is remembered", || {
+        crystal
+            .ok(&["memory"])
+            .contains("fix the tests: did what was asked")
+    });
+}

@@ -227,6 +227,7 @@ impl Daemon {
         if let Err(err) = tasks::record(&dir, task) {
             eprintln!("crystal daemon: couldn't write down a closed task: {err:#}");
         }
+        self.remember_outcome(cwd, task);
         let done = task.outcome.as_ref().is_some_and(|outcome| !outcome.failed);
         let ticks = done && backlog::enabled(&settings());
         if let (true, Some(number)) = (ticks, task.backlog) {
@@ -237,6 +238,28 @@ impl Daemon {
             if let Err(err) = ticked {
                 eprintln!("crystal daemon: couldn't tick #{number} on the backlog: {err:#}");
             }
+        }
+    }
+
+    /// Keeps how a closed task turned out in its project's memory, for the
+    /// sessions after it, when it closed with something to say.
+    fn remember_outcome(&self, cwd: &Path, task: &TaskRecord) {
+        let Some(outcome) = &task.outcome else {
+            return;
+        };
+        if outcome.summary.trim().is_empty() {
+            return;
+        }
+        let line = if outcome.failed {
+            format!("{} (failed): {}", task.goal, outcome.summary)
+        } else {
+            format!("{}: {}", task.goal, outcome.summary)
+        };
+        let project = project::of(cwd).path;
+        let kept =
+            memory::record_outcome(&settings(), &self.socket, &project, &task.session, &line);
+        if let Err(err) = kept {
+            eprintln!("crystal daemon: couldn't remember how a task went: {err:#}");
         }
     }
 
