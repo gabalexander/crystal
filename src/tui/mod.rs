@@ -3,13 +3,14 @@
 //! into panes of their own.
 //!
 //! Everything that happens arrives as an [`Event`] on one channel: a key,
-//! a resize, output from the session in the pane, a fresh session list.
-//! The loop takes each event, updates the state, and draws.
+//! the mouse, a resize, output from the session in the pane, a fresh
+//! session list. The loop takes each event, updates the state, and draws.
 
 mod app;
 mod command_line;
 mod groups;
 mod keys;
+mod mouse;
 mod pane;
 mod screen_widget;
 mod text_input;
@@ -19,12 +20,12 @@ use crate::config::Config;
 use crate::protocol::{Request, Response, SessionInfo};
 use crate::{client, env, git};
 use anyhow::{Result, bail};
-use app::{Action, App, Place, Slot};
-use crossterm::event::{Event as TerminalEvent, KeyEvent, KeyEventKind};
+use app::{Action, App, Focus, Hit, Place, Slot};
+use crossterm::event::{Event as TerminalEvent, KeyEvent, KeyEventKind, MouseEvent};
 use pane::Pane;
 use ratatui::DefaultTerminal;
 use ratatui::layout::Rect;
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
@@ -36,6 +37,7 @@ const POLL_EVERY: Duration = Duration::from_millis(500);
 
 pub enum Event {
     Key(KeyEvent),
+    Mouse(MouseEvent),
     /// The terminal changed size. The next draw lays everything out again
     /// and resizes the pane's session to fit.
     Resize,
@@ -69,15 +71,52 @@ pub fn run(socket: &Path) -> Result<()> {
         panes: Vec::new(),
         last_pane_id: 0,
         events: sender,
+        screen: Rect::default(),
         quitting: false,
     };
     tui.app.set_first_command(config.new_session);
     tui.app.set_sessions(sessions);
 
     let mut terminal = ratatui::try_init()?;
-    let result = tui.run(&mut terminal, events);
+    let result = tui.run_with_mouse(&mut terminal, events);
     ratatui::restore();
     result
+}
+
+/// The terminal sending the TUI what the mouse does, for as long as this
+/// lives. However the TUI ends, by returning, failing or panicking, the
+/// mouse goes back to the terminal: left on, a shell would fill with the
+/// sequences the terminal sends for it.
+struct MouseCapture;
+
+impl MouseCapture {
+    fn on() -> Result<MouseCapture> {
+        // A panic on any thread turns it off before the panic is shown.
+        let shown_before = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            mouse_off();
+            shown_before(info);
+        }));
+        // Clicks and the wheel (1000), drags (1002), written the SGR way
+        // (1006). Not the mouse just moving (1003): nothing here needs it,
+        // and it would wake the TUI at every move.
+        let mut out = std::io::stdout();
+        out.write_all(b"\x1b[?1000h\x1b[?1002h\x1b[?1006h")?;
+        out.flush()?;
+        Ok(MouseCapture)
+    }
+}
+
+impl Drop for MouseCapture {
+    fn drop(&mut self) {
+        mouse_off();
+    }
+}
+
+fn mouse_off() {
+    let mut out = std::io::stdout();
+    let _ = out.write_all(b"\x1b[?1006l\x1b[?1002l\x1b[?1000l");
+    let _ = out.flush();
 }
 
 struct Tui {
@@ -89,15 +128,28 @@ struct Tui {
     last_pane_id: u64,
     /// Handed to each pane, for its output.
     events: Sender<Event>,
+    /// The whole screen as it was last drawn, to find what the mouse is on.
+    screen: Rect,
     quitting: bool,
 }
 
 impl Tui {
+    fn run_with_mouse(
+        &mut self,
+        terminal: &mut DefaultTerminal,
+        events: Receiver<Event>,
+    ) -> Result<()> {
+        // The mouse is the TUI's for as long as `_mouse` lives: to the end
+        // of this function, however it ends.
+        let _mouse = MouseCapture::on()?;
+        self.run(terminal, events)
+    }
+
     fn run(&mut self, terminal: &mut DefaultTerminal, events: Receiver<Event>) -> Result<()> {
         while !self.quitting {
             let size = terminal.size()?;
-            let screen = Rect::new(0, 0, size.width, size.height);
-            let areas = ui::Areas::new(screen, self.app.splits().len());
+            self.screen = Rect::new(0, 0, size.width, size.height);
+            let areas = ui::Areas::new(self.screen, self.app.splits().len());
             self.sync_panes(&areas);
             terminal.draw(|frame| ui::draw(frame, &self.app, &self.panes))?;
 
@@ -115,6 +167,7 @@ impl Tui {
     fn handle(&mut self, event: Event) {
         match event {
             Event::Key(key) => self.on_key(key),
+            Event::Mouse(mouse) => self.on_mouse(mouse),
             Event::Resize => {}
             Event::Sessions(sessions) => self.app.set_sessions(sessions),
             Event::Output { pane, bytes } => {
@@ -139,6 +192,52 @@ impl Tui {
         if let Err(err) = self.perform(action) {
             self.app.notify(format!("{err:#}"));
         }
+    }
+
+    fn on_mouse(&mut self, mouse: MouseEvent) {
+        let areas = ui::Areas::new(self.screen, self.app.splits().len());
+        let hit = ui::hit(&areas, &self.app, mouse.column, mouse.row);
+        if self.pass_to_program(&mouse, hit) {
+            return;
+        }
+        let Some(action) = self.app.on_mouse(mouse.kind, hit) else {
+            return;
+        };
+        if let Err(err) = self.perform(action) {
+            self.app.notify(format!("{err:#}"));
+        }
+    }
+
+    /// Hands the mouse to the program in the pane that has the keyboard,
+    /// if it asked for the mouse and the pane is showing it live (back in
+    /// the history, the program's screen isn't what's under the mouse).
+    /// Returns whether the program took it.
+    fn pass_to_program(&mut self, mouse: &MouseEvent, hit: Hit) -> bool {
+        let Hit::Pane {
+            slot,
+            cell: Some(cell),
+        } = hit
+        else {
+            return false;
+        };
+        if self.app.focus() != Focus::Pane(slot) {
+            return false;
+        }
+        let Some(pane) = self.pane_in(slot) else {
+            return false;
+        };
+        if !pane.wants_mouse() || pane.scrolled_back() > 0 {
+            return false;
+        }
+        let screen = pane.screen.screen();
+        let mode = screen.mouse_protocol_mode();
+        let encoding = screen.mouse_protocol_encoding();
+        // An event the program didn't ask for, like a drag when it asked
+        // only for clicks, is still the program's: it has the mouse here.
+        if let Some(bytes) = mouse::encode(mouse.kind, mouse.modifiers, cell, mode, encoding) {
+            pane.send_keys(&bytes);
+        }
+        true
     }
 
     fn perform(&mut self, action: Action) -> Result<()> {
@@ -168,6 +267,16 @@ impl Tui {
             Action::PageForward(slot) => {
                 if let Some(pane) = self.pane_in(slot) {
                     pane.page_forward();
+                }
+            }
+            Action::ScrollBack(slot) => {
+                if let Some(pane) = self.pane_in(slot) {
+                    pane.scroll_back();
+                }
+            }
+            Action::ScrollForward(slot) => {
+                if let Some(pane) = self.pane_in(slot) {
+                    pane.scroll_forward();
                 }
             }
         }
@@ -273,13 +382,14 @@ fn list_sessions(socket: &Path, start: bool) -> Result<Vec<SessionInfo>> {
     }
 }
 
-/// Reads keys and resizes off the terminal on a thread of its own, since
-/// reading blocks.
+/// Reads keys, the mouse and resizes off the terminal on a thread of its
+/// own, since reading blocks.
 fn spawn_input_reader(events: Sender<Event>) {
     thread::spawn(move || {
         while let Ok(event) = crossterm::event::read() {
             let event = match event {
                 TerminalEvent::Key(key) if key.kind != KeyEventKind::Release => Event::Key(key),
+                TerminalEvent::Mouse(mouse) => Event::Mouse(mouse),
                 TerminalEvent::Resize(..) => Event::Resize,
                 _ => continue,
             };

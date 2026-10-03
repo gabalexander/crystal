@@ -2,7 +2,7 @@
 //! and the panes of the sessions split off, and a footer with the keys.
 //! Drawing only reads the state; it never changes it.
 
-use super::app::{App, Focus, Prompt, Question, Slot};
+use super::app::{App, Focus, Hit, Prompt, Question, Slot};
 use super::groups::Row;
 use super::pane::Pane;
 use super::screen_widget::ScreenWidget;
@@ -65,6 +65,58 @@ pub fn screen_area(pane: Rect) -> Rect {
     Block::bordered().inner(pane)
 }
 
+/// What's at `(column, row)` on a screen laid out as `areas`, for `app`.
+pub fn hit(areas: &Areas, app: &App, column: u16, row: u16) -> Hit {
+    let at = |area: Rect| area.contains((column, row).into());
+    if at(areas.sidebar) {
+        return sidebar_hit(areas.sidebar, app, row);
+    }
+    let panes = app.slots().into_iter().zip(&areas.panes);
+    for (slot, area) in panes {
+        if at(*area) {
+            let screen = screen_area(*area);
+            let cell = at(screen).then(|| (row - screen.y, column - screen.x));
+            return Hit::Pane { slot, cell };
+        }
+    }
+    Hit::Elsewhere
+}
+
+/// Which sidebar row is on screen `row`, if any.
+fn sidebar_hit(sidebar: Rect, app: &App, row: u16) -> Hit {
+    let inside = Block::bordered().inner(sidebar);
+    if row < inside.y || row >= inside.bottom() {
+        return Hit::Sidebar;
+    }
+    let offset = sidebar_offset(app, inside.height);
+    let index = offset + usize::from(row - inside.y);
+    if index < app.rows().len() {
+        Hit::SidebarRow(index)
+    } else {
+        Hit::Sidebar
+    }
+}
+
+/// The first sidebar row on screen, when the rows don't all fit in
+/// `height`: the list scrolls just far enough to keep the selection in
+/// sight. Drawing and clicking both go by this, so a click lands on the
+/// row drawn there.
+fn sidebar_offset(app: &App, height: u16) -> usize {
+    let height = usize::from(height.max(1));
+    match selected_row(app) {
+        Some(selected) if selected >= height => selected + 1 - height,
+        _ => 0,
+    }
+}
+
+/// The sidebar row the selected session is drawn on.
+fn selected_row(app: &App) -> Option<usize> {
+    let index = app.selected_index()?;
+    app.rows()
+        .iter()
+        .position(|row| *row == Row::Session(index))
+}
+
 /// Draws the whole TUI. `panes` are the viewers of the sessions on screen.
 pub fn draw(frame: &mut Frame, app: &App, panes: &[Pane]) {
     let areas = Areas::new(frame.area(), app.splits().len());
@@ -84,14 +136,13 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect) {
         .iter()
         .map(|row| ListItem::new(sidebar_row(app, row)))
         .collect();
-    // The selection is a session; find the row it's drawn on.
-    let selected = app
-        .selected_index()
-        .and_then(|index| rows.iter().position(|row| *row == Row::Session(index)));
+    let height = block.inner(area).height;
     let list = List::new(items)
         .block(block)
         .highlight_style(Style::new().add_modifier(Modifier::REVERSED));
-    let mut state = ListState::default().with_selected(selected);
+    let mut state = ListState::default()
+        .with_offset(sidebar_offset(app, height))
+        .with_selected(selected_row(app));
     frame.render_stateful_widget(list, area, &mut state);
 }
 
@@ -441,5 +492,79 @@ mod tests {
         let text = screen_text(&app).join("\n");
         assert!(text.contains("left has a pane of its own"));
         assert!(text.contains(" left · selected "));
+    }
+
+    /// An app with `count` sessions, outside git, so under two headings.
+    fn app_with_sessions(count: usize) -> App {
+        let mut app = App::new(None);
+        let sessions = (0..count)
+            .map(|n| session(&format!("s{n}"), State::Running))
+            .collect();
+        app.set_sessions(sessions);
+        app
+    }
+
+    #[test]
+    fn a_click_finds_the_sidebar_row_under_it() {
+        let app = app_with_sessions(3);
+        let areas = Areas::new(Rect::new(0, 0, 80, 24), 0);
+        // Row 0 is the sidebar's border; the list starts below it.
+        assert_eq!(hit(&areas, &app, 5, 0), Hit::Sidebar);
+        assert_eq!(hit(&areas, &app, 5, 1), Hit::SidebarRow(0));
+        assert_eq!(hit(&areas, &app, 5, 3), Hit::SidebarRow(2));
+        // Below the last of the 5 rows: still the sidebar, but no row.
+        assert_eq!(hit(&areas, &app, 5, 10), Hit::Sidebar);
+    }
+
+    #[test]
+    fn a_click_finds_the_cell_on_the_panes_screen() {
+        let app = app_with_sessions(1);
+        let areas = Areas::new(Rect::new(0, 0, 80, 24), 0);
+        // The pane starts after the 28-column sidebar; its screen inside
+        // the border at column 29, row 1.
+        assert_eq!(
+            hit(&areas, &app, 31, 2),
+            Hit::Pane {
+                slot: Slot::Selected,
+                cell: Some((1, 2))
+            }
+        );
+        let on_the_border = hit(&areas, &app, 28, 2);
+        assert_eq!(
+            on_the_border,
+            Hit::Pane {
+                slot: Slot::Selected,
+                cell: None
+            }
+        );
+        assert_eq!(hit(&areas, &app, 40, 23), Hit::Elsewhere, "the footer");
+    }
+
+    #[test]
+    fn a_click_finds_which_pane_when_there_are_splits() {
+        let mut app = app_with_sessions(2);
+        app.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        // At 80 columns the two panes are stacked: the selection's on top.
+        let areas = Areas::new(Rect::new(0, 0, 80, 24), 1);
+        let below = areas.panes[1];
+        let Hit::Pane { slot, .. } = hit(&areas, &app, 40, below.y + 2) else {
+            panic!("not a pane");
+        };
+        assert_eq!(slot, Slot::Split(0));
+    }
+
+    #[test]
+    fn a_long_sidebar_scrolls_to_the_selection_and_clicks_follow_it() {
+        let mut app = app_with_sessions(30);
+        app.select("s29");
+        let areas = Areas::new(Rect::new(0, 0, 80, 12), 0);
+        // Above the footer and inside the border, 9 rows fit: the selection
+        // is drawn on the last of them, screen row 9.
+        let last_visible = hit(&areas, &app, 5, 9);
+        let Hit::SidebarRow(row) = last_visible else {
+            panic!("not a row");
+        };
+        assert_eq!(app.rows()[row], Row::Session(29));
+        assert!(screen_text(&app)[9].contains("s29"));
     }
 }

@@ -84,7 +84,26 @@ impl Pane {
     pub fn page_forward(&mut self) {
         page(self.screen.screen_mut(), Way::Forward);
     }
+
+    /// Shows a few lines further back into the history: a notch of the
+    /// mouse wheel.
+    pub fn scroll_back(&mut self) {
+        scroll(self.screen.screen_mut(), Way::Back, WHEEL_LINES);
+    }
+
+    /// Shows a few lines further toward live.
+    pub fn scroll_forward(&mut self) {
+        scroll(self.screen.screen_mut(), Way::Forward, WHEEL_LINES);
+    }
+
+    /// Whether the program has asked to hear about the mouse.
+    pub fn wants_mouse(&self) -> bool {
+        self.screen.screen().mouse_protocol_mode() != vt100::MouseProtocolMode::None
+    }
 }
+
+/// How far a notch of the mouse wheel scrolls: what most terminals do.
+const WHEEL_LINES: usize = 3;
 
 /// Which way through the history a page goes.
 #[derive(Debug, Clone, Copy)]
@@ -100,9 +119,14 @@ enum Way {
 fn page(screen: &mut vt100::Screen, way: Way) {
     let (rows, _) = screen.size();
     let page = usize::from(rows.saturating_sub(1).max(1));
+    scroll(screen, way, page);
+}
+
+/// Moves the screen's view `lines` through its history.
+fn scroll(screen: &mut vt100::Screen, way: Way, lines: usize) {
     let back = match way {
-        Way::Back => screen.scrollback().saturating_add(page),
-        Way::Forward => screen.scrollback().saturating_sub(page),
+        Way::Back => screen.scrollback().saturating_add(lines),
+        Way::Forward => screen.scrollback().saturating_sub(lines),
     };
     screen.set_scrollback(back);
 }
@@ -143,6 +167,15 @@ mod tests {
         for _ in 0..10 {
             page(parser.screen_mut(), Way::Forward);
         }
+        assert_eq!(parser.screen().scrollback(), 0);
+    }
+
+    #[test]
+    fn a_notch_of_the_wheel_scrolls_a_few_lines() {
+        let mut parser = screen_with_history();
+        scroll(parser.screen_mut(), Way::Back, WHEEL_LINES);
+        assert_eq!(parser.screen().scrollback(), 3);
+        scroll(parser.screen_mut(), Way::Forward, WHEEL_LINES);
         assert_eq!(parser.screen().scrollback(), 0);
     }
 

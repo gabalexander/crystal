@@ -1,7 +1,7 @@
-//! The TUI's state and how keys and session lists change it. Nothing here
-//! talks to the daemon or draws: when a key needs the outside world, it
-//! comes back as an [`Action`] for the event loop to carry out. That keeps
-//! every state change testable on its own.
+//! The TUI's state and how keys, the mouse and session lists change it.
+//! Nothing here talks to the daemon or draws: when a key needs the outside
+//! world, it comes back as an [`Action`] for the event loop to carry out.
+//! That keeps every state change testable on its own.
 
 use super::command_line;
 use super::groups::{self, Row};
@@ -9,7 +9,7 @@ use super::keys;
 use super::text_input::TextInput;
 use crate::config::Config;
 use crate::protocol::{Activity, SessionInfo, State};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
 use std::path::PathBuf;
 
 /// How many sessions can be split off into panes of their own at once.
@@ -30,6 +30,23 @@ pub enum Focus {
     Sidebar,
     /// Keys go to the session in this pane.
     Pane(Slot),
+}
+
+/// What the mouse is over, worked out from the layout by `ui::hit`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Hit {
+    /// A row of the sidebar, by its place in [`App::rows`].
+    SidebarRow(usize),
+    /// The sidebar, but none of its rows: its border, or below the last.
+    Sidebar,
+    /// The pane at `slot`. `cell` is the `(row, column)` on its session's
+    /// screen, counted from 0, when the mouse is inside the pane's border.
+    Pane {
+        slot: Slot,
+        cell: Option<(u16, u16)>,
+    },
+    /// The footer, or anywhere else.
+    Elsewhere,
 }
 
 /// Which way Tab goes round the panes: Tab forward, Shift+Tab back.
@@ -88,6 +105,11 @@ pub enum Action {
     PageBack(Slot),
     /// Show a page further toward live in the pane at this slot.
     PageForward(Slot),
+    /// Show a few lines further back into the history of the pane at this
+    /// slot: a notch of the mouse wheel.
+    ScrollBack(Slot),
+    /// Show a few lines further toward live in the pane at this slot.
+    ScrollForward(Slot),
 }
 
 pub struct App {
@@ -306,6 +328,51 @@ impl App {
         match self.focus {
             Focus::Sidebar => self.on_sidebar_key(key),
             Focus::Pane(slot) => self.on_pane_key(slot, key),
+        }
+    }
+
+    /// What the mouse does, when no program in a pane has taken it: a click
+    /// selects a session or hands a pane the keyboard, and the wheel moves
+    /// the selection, or scrolls a pane through its history.
+    pub fn on_mouse(&mut self, kind: MouseEventKind, hit: Hit) -> Option<Action> {
+        // A question on the footer waits for its answer from the keyboard.
+        if self.prompt.is_some() || self.kill_asked.is_some() {
+            return None;
+        }
+        let click = kind == MouseEventKind::Down(MouseButton::Left);
+        if click {
+            self.notice = None;
+        }
+        match (kind, hit) {
+            (_, Hit::SidebarRow(row)) if click => self.click_row(row),
+            (_, Hit::Pane { slot, .. }) if click => {
+                if self.can_type_into(slot) {
+                    self.focus_pane(slot);
+                }
+            }
+            (MouseEventKind::ScrollUp, Hit::SidebarRow(_) | Hit::Sidebar) => {
+                self.move_selection(-1);
+            }
+            (MouseEventKind::ScrollDown, Hit::SidebarRow(_) | Hit::Sidebar) => {
+                self.move_selection(1);
+            }
+            (MouseEventKind::ScrollUp, Hit::Pane { slot, .. }) => {
+                return Some(Action::ScrollBack(slot));
+            }
+            (MouseEventKind::ScrollDown, Hit::Pane { slot, .. }) => {
+                return Some(Action::ScrollForward(slot));
+            }
+            _ => {}
+        }
+        None
+    }
+
+    /// A click on a sidebar row: on a session, selects it and gives the
+    /// sidebar the keyboard. Headings don't do anything.
+    fn click_row(&mut self, row: usize) {
+        if let Some(Row::Session(index)) = self.rows().get(row) {
+            self.selected = *index;
+            self.focus = Focus::Sidebar;
         }
     }
 
@@ -1116,5 +1183,85 @@ mod tests {
         app.set_sessions(vec![ended("a"), session("b")]);
         assert_eq!(app.splits(), ["a"], "it stays, to show how it ended");
         assert_eq!(app.focus(), Focus::Sidebar);
+    }
+
+    const CLICK: MouseEventKind = MouseEventKind::Down(MouseButton::Left);
+
+    /// The sidebar row `name` is drawn on.
+    fn row_of(app: &App, name: &str) -> usize {
+        let index = app.sessions().iter().position(|s| s.name == name).unwrap();
+        app.rows()
+            .iter()
+            .position(|row| *row == Row::Session(index))
+            .unwrap()
+    }
+
+    #[test]
+    fn clicking_a_session_row_selects_it_and_a_heading_does_nothing() {
+        let mut app = app_with(&["a", "b", "c"]);
+        app.on_mouse(CLICK, Hit::SidebarRow(row_of(&app, "c")));
+        assert_eq!(selected_name(&app), Some("c"));
+
+        // Sessions outside git sit under two headings, on the first rows.
+        assert!(matches!(app.rows()[0], Row::OutsideGit));
+        app.on_mouse(CLICK, Hit::SidebarRow(0));
+        assert_eq!(selected_name(&app), Some("c"));
+    }
+
+    #[test]
+    fn clicking_a_row_gives_the_sidebar_the_keyboard() {
+        let mut app = app_with(&["a", "b"]);
+        press(&mut app, KeyCode::Enter);
+        app.on_mouse(CLICK, Hit::SidebarRow(row_of(&app, "b")));
+        assert_eq!(app.focus(), Focus::Sidebar);
+    }
+
+    #[test]
+    fn clicking_a_pane_hands_it_the_keyboard_if_it_takes_keys() {
+        let mut app = app_with(&["a"]);
+        let pane = Hit::Pane {
+            slot: Slot::Selected,
+            cell: Some((2, 3)),
+        };
+        app.on_mouse(CLICK, pane);
+        assert_eq!(app.focus(), Focus::Pane(Slot::Selected));
+
+        let mut app = App::new(None);
+        app.set_sessions(vec![ended("done")]);
+        app.on_mouse(CLICK, pane);
+        assert_eq!(app.focus(), Focus::Sidebar);
+    }
+
+    #[test]
+    fn the_wheel_over_the_sidebar_moves_the_selection() {
+        let mut app = app_with(&["a", "b", "c"]);
+        app.on_mouse(MouseEventKind::ScrollDown, Hit::Sidebar);
+        app.on_mouse(MouseEventKind::ScrollDown, Hit::SidebarRow(0));
+        assert_eq!(selected_name(&app), Some("c"));
+        app.on_mouse(MouseEventKind::ScrollUp, Hit::Sidebar);
+        assert_eq!(selected_name(&app), Some("b"));
+    }
+
+    #[test]
+    fn the_wheel_over_a_pane_scrolls_its_history() {
+        let mut app = app_with(&["a"]);
+        let over = |slot| Hit::Pane { slot, cell: None };
+        assert_eq!(
+            app.on_mouse(MouseEventKind::ScrollUp, over(Slot::Selected)),
+            Some(Action::ScrollBack(Slot::Selected))
+        );
+        assert_eq!(
+            app.on_mouse(MouseEventKind::ScrollDown, over(Slot::Selected)),
+            Some(Action::ScrollForward(Slot::Selected))
+        );
+    }
+
+    #[test]
+    fn the_mouse_waits_while_a_question_is_asked() {
+        let mut app = app_with(&["a", "b"]);
+        press(&mut app, KeyCode::Char('x'));
+        app.on_mouse(CLICK, Hit::SidebarRow(row_of(&app, "b")));
+        assert_eq!(selected_name(&app), Some("a"));
+        assert_eq!(app.kill_asked(), Some("a"), "the question is still asked");
     }
 }

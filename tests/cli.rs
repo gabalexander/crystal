@@ -169,6 +169,12 @@ impl Terminal {
         self.screen.lock().unwrap().screen().contents()
     }
 
+    /// Whether crystal has asked this terminal to send it the mouse.
+    fn sends_the_mouse(&self) -> bool {
+        let mode = self.screen.lock().unwrap().screen().mouse_protocol_mode();
+        mode != vt100::MouseProtocolMode::None
+    }
+
     fn shows(&self, text: &str) {
         let deadline = Instant::now() + Duration::from_secs(5);
         while !self.text().contains(text) {
@@ -1788,4 +1794,97 @@ fn nobody_is_told_about_a_session_someone_is_watching() {
     assert!(terminal.exit());
     thread::sleep(Duration::from_millis(800));
     assert!(lines_in(&notices).is_empty());
+}
+
+/// What a terminal sends for a click at `(column, row)` on its screen,
+/// counted from 0, the SGR way: a press, then a release.
+fn click(column: usize, row: usize) -> String {
+    let (x, y) = (column + 1, row + 1);
+    format!("\x1b[<0;{x};{y}M\x1b[<0;{x};{y}m")
+}
+
+/// What a terminal sends for a notch of the wheel, up, at `(column, row)`.
+fn wheel_up(column: usize, row: usize) -> String {
+    format!("\x1b[<64;{};{}M", column + 1, row + 1)
+}
+
+/// In the harness's 80-column terminal, the pane starts after the
+/// 28-column sidebar, and its session's screen inside the pane's border.
+const PANE_SCREEN_COLUMN: usize = 29;
+const PANE_SCREEN_ROW: usize = 1;
+
+#[test]
+fn the_tui_hands_the_mouse_back_to_the_terminal_when_it_quits() {
+    let crystal = Crystal::new();
+    crystal.ok(&["new", "-n", "stays", "sleep", "30"]);
+
+    let mut tui = crystal.tui();
+    tui.shows("▶ stays");
+    assert!(tui.sends_the_mouse());
+    tui.type_keys("q");
+    assert!(tui.exit());
+    assert!(!tui.sends_the_mouse());
+}
+
+#[test]
+fn clicking_a_session_row_selects_it() {
+    let crystal = Crystal::new();
+    for name in ["alpha", "beta"] {
+        let script = format!("echo {name} is here; echo > {name}-ready; sleep 30");
+        crystal.ok(&["new", "-n", name, "sh", "-c", &script]);
+        written(&crystal.dir.path().join(format!("{name}-ready")));
+    }
+
+    let mut tui = crystal.tui();
+    tui.shows("alpha is here");
+    let row = line_with(&tui.text(), "▶ beta");
+    tui.type_keys(&click(10, row));
+    tui.shows("beta is here");
+}
+
+#[test]
+fn clicking_a_pane_hands_it_the_keyboard() {
+    let crystal = Crystal::new();
+    crystal.ok(&["new", "-n", "cat", "cat"]);
+
+    let mut tui = crystal.tui();
+    tui.shows("▶ cat");
+    tui.type_keys(&click(50, 10));
+    tui.shows("typing into the session");
+    tui.type_keys("hello by mouse\r");
+    tui.shows("hello by mouse");
+}
+
+#[test]
+fn the_wheel_over_a_pane_scrolls_it_back_through_its_history() {
+    let crystal = Crystal::new();
+    crystal.ok(&["new", "-n", "printer", "sh", "-c", LONG_OUTPUT]);
+    written(&crystal.dir.path().join("printed"));
+
+    let mut tui = crystal.tui();
+    tui.shows("line 40");
+    tui.type_keys(&wheel_up(50, 10));
+    tui.shows("↑ 3 lines");
+}
+
+#[test]
+fn a_program_that_asks_for_the_mouse_gets_clicks_where_it_drew() {
+    let crystal = Crystal::new();
+    // Turns on mouse reporting the SGR way, then writes down the first
+    // click it hears: a press and a release, 9 bytes each.
+    let script = r"stty raw -echo; printf '\033[?1000h\033[?1006h'; echo > listening;
+        dd bs=1 count=18 2>/dev/null > clicks; echo >> clicks; sleep 30";
+    crystal.ok(&["new", "-n", "mousy", "sh", "-c", script]);
+    written(&crystal.dir.path().join("listening"));
+
+    let mut tui = crystal.tui();
+    tui.shows("▶ mousy");
+    // A program has the mouse in the pane that has the keyboard.
+    tui.type_keys("\r");
+    tui.shows("typing into the session");
+    // Row 1, column 2 of the program's own screen.
+    tui.type_keys(&click(PANE_SCREEN_COLUMN + 2, PANE_SCREEN_ROW + 1));
+
+    let clicks = written(&crystal.dir.path().join("clicks"));
+    assert_eq!(clicks, "\x1b[<0;3;2M\x1b[<0;3;2m\n");
 }
