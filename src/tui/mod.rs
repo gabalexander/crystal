@@ -16,11 +16,12 @@ mod groups;
 mod help;
 mod issues;
 mod launcher;
+mod memory_view;
 mod mouse;
 mod pane;
 mod screen_widget;
 mod search;
-mod sidebar;
+pub(crate) mod sidebar;
 mod status;
 mod text_area;
 mod text_input;
@@ -29,6 +30,7 @@ mod ui;
 
 use crate::config::Config;
 use crate::github::{self, Issue, PullRequest};
+use crate::memory::{self, Listed, Memory};
 use crate::protocol::{Request, Response, SessionInfo};
 use crate::{catalog, keys, typing};
 use crate::{client, env, git};
@@ -115,6 +117,11 @@ pub enum Event {
         path: String,
         lines: Result<Vec<String>, String>,
     },
+    /// A project's memory, read for the memory view.
+    MemoryRead {
+        dir: PathBuf,
+        read: Result<Vec<Listed>, String>,
+    },
 }
 
 pub fn run(socket: &Path) -> Result<()> {
@@ -146,6 +153,7 @@ pub fn run(socket: &Path) -> Result<()> {
     };
     tui.app.set_agents(catalog::installed());
     tui.app.set_launch_settings(&config);
+    tui.app.set_memory_on(memory::enabled(&config));
     tui.app.set_memory(launcher::load_memory(&tui.memory_path));
     tui.set_sessions(sessions);
 
@@ -332,6 +340,7 @@ impl Tui {
                 }
             }
             Event::PreviewRead { dir, path, lines } => self.app.preview_read(&dir, &path, lines),
+            Event::MemoryRead { dir, read } => self.app.memory_read(&dir, read),
         }
     }
 
@@ -424,6 +433,36 @@ impl Tui {
                 self.read_in_background(move || {
                     let lines = finder::read_preview(&dir, &path);
                     Event::PreviewRead { dir, path, lines }
+                });
+            }
+            Action::ReadMemory(dir) => {
+                let socket = self.socket.clone();
+                self.read_in_background(move || {
+                    let read = read_memory(&socket, &dir);
+                    Event::MemoryRead { dir, read }
+                });
+            }
+            Action::ForgetMemory { dir, id } => {
+                let socket = self.socket.clone();
+                self.read_in_background(move || {
+                    let project = memory::project_of(&dir);
+                    match memory::remove(&socket, &project, id) {
+                        Ok(_) => Event::MemoryRead {
+                            read: read_memory(&socket, &dir),
+                            dir,
+                        },
+                        Err(err) => Event::Notice(format!("{err:#}")),
+                    }
+                });
+            }
+            Action::PromoteMemory { dir, id } => {
+                let socket = self.socket.clone();
+                self.read_in_background(move || match promote_memory(&socket, &dir, id) {
+                    Ok(file) => {
+                        let file = crate::shell::home_relative(&file);
+                        Event::Notice(format!("added entry {id} to {file}"))
+                    }
+                    Err(err) => Event::Notice(format!("{err:#}")),
                 });
             }
             Action::Edit { dir, path, name } => {
@@ -616,6 +655,26 @@ fn pasted(text: &str, marked: bool) -> Vec<u8> {
     } else {
         text.replace("\r\n", "\r").replace('\n', "\r").into_bytes()
     }
+}
+
+/// The memory of the project `dir` is in, for the memory view.
+fn read_memory(socket: &Path, dir: &Path) -> Result<Vec<Listed>, String> {
+    let project = memory::project_of(dir);
+    match Memory::read(socket, &project) {
+        Ok(memory) => Ok(memory.listed()),
+        Err(err) => Err(format!("{err:#}")),
+    }
+}
+
+/// Writes entry `id` of the memory of the project `dir` is in into its
+/// CLAUDE.md or AGENTS.md, and returns which.
+fn promote_memory(socket: &Path, dir: &Path, id: u64) -> Result<PathBuf> {
+    let project = memory::project_of(dir);
+    let memory = Memory::read(socket, &project)?;
+    let Some(entry) = memory.get(id) else {
+        bail!("there's no entry {id}");
+    };
+    memory::promote(&project, entry)
 }
 
 /// The models Codex lets the user choose, as `codex debug models` lists

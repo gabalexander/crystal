@@ -97,6 +97,7 @@ you are and offers the keys that matter there.
 | `i` | list the open issues of the selected session's project, and start an agent on one |
 | `d` | show what changed in the selected session's worktree: [the diff](#the-diff) |
 | `p` | find a file in the selected session's worktree and edit it: [the file finder](#the-file-finder) |
+| `m` | what the selected session's project has remembered: [memory](#memory) |
 | `?` | show every key, in the sidebar, in a pane, in a question and with the mouse |
 | `q` | quit; the sessions keep running |
 
@@ -420,6 +421,39 @@ crystal send docs "Now the changelog too" --wait                     # a follow-
 - After a restart, a task comes back at rest rather than running its prompt again, and what it showed before
   is gone; `crystal send` carries its conversation on.
 
+### Memory
+
+A project keeps a short list of what its sessions have learned, so the next session doesn't learn it again: a
+decision and why it was made, a gotcha, a command that works, a note, or how a task turned out. You or an
+agent in a session add to it:
+
+```sh
+crystal remember "Fees are kept in cents; never store a float"
+crystal remember -k gotcha -f tests/ledger.rs "The ledger tests need the database up: make db"
+crystal remember -k command "make e2e runs the browser tests; they take about 4 minutes"
+crystal memory                       # the list, newest first
+crystal memory search ledger tests   # the entries that have most to do with those words
+crystal memory rm 3                  # forget one
+crystal memory promote 2             # copy one into the project's CLAUDE.md, under "Notes"
+```
+
+- `-k` is `decision`, `gotcha`, `command`, `note` (the default) or `outcome`. Inside a session, an entry goes
+  to the session's project and says which session added it; elsewhere it goes to the project of the current
+  directory, or of `-C <dir>`.
+- A project is its main worktree, so every worktree of it shares one list. The list is a JSON file in
+  crystal's state directory (`~/.local/state/crystal/memory/`), not in the repository.
+- `-f` names a file an entry is about, and can be given more than once. Once that file changes, the entry may
+  no longer hold: it's marked stale, and agents aren't shown it. `crystal memory rm` it, or remember it again.
+- `promote` asks first at a terminal; `--yes` doesn't. It writes to CLAUDE.md, or to AGENTS.md when that's the
+  only one the project has.
+- `m` in the sidebar opens the selected session's project's list: the entry the bar is on is shown in full
+  beside it, `/` filters, `x` forgets an entry and `p` promotes it, each after a `y`.
+
+When a Claude Code session starts, crystal adds the entries that have most to do with its first prompt (the
+newest, without one) to its system prompt, a few at most and none that's stale, with a line on how to add
+more. Codex is told nothing: it has no option for a system prompt, and anything crystal typed in would read as
+your first message. Turn it all off with `memory = false` in the settings.
+
 ### Settings
 
 Settings live in `~/.config/crystal/config.toml` (or `$XDG_CONFIG_HOME/crystal/config.toml`). The file is
@@ -432,6 +466,7 @@ file and change. A setting crystal doesn't know is an error that names it, so a 
 | `notify_command` | none | a shell command to run instead of the desktop notification |
 | `new_session` | `"claude"` | what the new-session panel runs at first, until you start something from it |
 | `theme` | `"dark"` | the TUI's colors: `"dark"`, `"light"`, or `"terminal"` |
+| `memory` | `true` | keep what sessions learn, and show it to Claude Code: [memory](#memory) |
 
 `dark` and `light` paint their own background, so crystal looks the same in any terminal; `terminal` paints
 nothing and uses your terminal's own colors. With `NO_COLOR` set, crystal uses no color at all.
@@ -447,8 +482,9 @@ notify_command = 'curl -s -d "$CRYSTAL_NOTICE" ntfy.sh/my-crystal'
 `new_session` names an agent (`claude`, `codex`, …) or `shell`. With options, like `codex --full-auto`, it's
 offered as a preset of its own.
 
-The daemon reads the notification settings each time it tells you something, so a change counts straight
-away; the TUI reads `new_session`, `theme` and the presets when it starts.
+The daemon reads the notification settings each time it tells you something, and `memory` each time a session
+starts, so a change counts straight away; the TUI reads `new_session`, `theme`, `memory` and the presets when
+it starts.
 
 #### Presets
 

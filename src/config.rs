@@ -26,6 +26,9 @@ pub struct Config {
     pub new_session: String,
     /// The TUI's colors.
     pub theme: ThemeName,
+    /// Show Claude Code what the project's earlier sessions learned when a
+    /// session starts: see [`crate::memory`].
+    pub memory: bool,
     /// Saved ways to start a session, offered first in the new-session
     /// panel: `[[preset]]` tables in the file.
     #[serde(rename = "preset", skip_serializing_if = "Vec::is_empty")]
@@ -73,6 +76,7 @@ impl Default for Config {
             notify_command: None,
             new_session: "claude".to_string(),
             theme: ThemeName::Dark,
+            memory: true,
             presets: Vec::new(),
         }
     }
@@ -267,6 +271,7 @@ args = ["--search"]
             notify_command: Some("say \"$CRYSTAL_NOTICE\"".into()),
             new_session: "codex --model o3".into(),
             theme: ThemeName::Terminal,
+            memory: false,
             presets: vec![Preset {
                 name: "review".into(),
                 agent: "claude".into(),

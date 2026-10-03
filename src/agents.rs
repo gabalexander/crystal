@@ -164,7 +164,7 @@ fn claude_settings(crystal: &Path) -> String {
 }
 
 /// The program's file name: `claude` for `/usr/local/bin/claude`.
-fn program_name(command: &[String]) -> Option<&str> {
+pub fn program_name(command: &[String]) -> Option<&str> {
     let program = command.first()?;
     Path::new(program).file_name()?.to_str()
 }

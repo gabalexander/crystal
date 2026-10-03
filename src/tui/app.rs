@@ -9,6 +9,7 @@ use super::finder::Finder;
 use super::groups::{self, Row};
 use super::issues::IssuesView;
 use super::launcher::{self, Launcher, Memory, Run, Setup, Target};
+use super::memory_view::MemoryView;
 use super::search;
 use super::text_input::TextInput;
 use crate::catalog::{self, Agent};
@@ -63,10 +64,11 @@ pub enum Hit {
 }
 
 /// Something that takes the place of the sidebar and the panes until it's
-/// closed: the diff of a worktree, or the file finder.
+/// closed: the diff of a worktree, the file finder, or a project's memory.
 pub enum View {
     Diff(DiffView),
     Files(Finder),
+    Memory(MemoryView),
 }
 
 /// What an open view's key asks for.
@@ -232,6 +234,19 @@ pub enum Action {
         path: String,
         name: String,
     },
+    /// Read the memory of the project at `dir`, off the event loop.
+    ReadMemory(PathBuf),
+    /// Forget entry `id` of the memory of the project at `dir`.
+    ForgetMemory {
+        dir: PathBuf,
+        id: u64,
+    },
+    /// Write entry `id` of the memory of the project at `dir` into its
+    /// CLAUDE.md or AGENTS.md.
+    PromoteMemory {
+        dir: PathBuf,
+        id: u64,
+    },
 }
 
 /// The sidebar narrowed to the sessions that match what's typed, while `/`
@@ -292,8 +307,11 @@ pub struct App {
     pull_requests: HashMap<PathBuf, Result<Vec<PullRequest>, String>>,
     /// The issues view, while it's open.
     issues: Option<IssuesView>,
-    /// The diff or the file finder, while one is open.
+    /// The diff, the file finder or a project's memory, while one is open.
     view: Option<View>,
+    /// Whether memory is on, which is whether `m` opens it: see
+    /// [`crate::memory::enabled`].
+    memory_on: bool,
 }
 
 impl App {
@@ -321,7 +339,13 @@ impl App {
             pull_requests: HashMap::new(),
             issues: None,
             view: None,
+            memory_on: true,
         }
+    }
+
+    /// Whether `m` opens a project's memory, by the config's say.
+    pub fn set_memory_on(&mut self, on: bool) {
+        self.memory_on = on;
     }
 
     /// The agents installed on this machine, for the new-session panel.
@@ -419,12 +443,21 @@ impl App {
         }
     }
 
+    /// Takes a project's memory, read for the memory view, if it's still
+    /// open on that project.
+    pub fn memory_read(&mut self, dir: &Path, read: Result<Vec<crate::memory::Listed>, String>) {
+        if let Some(View::Memory(memory)) = &mut self.view {
+            memory.read_done(dir, read);
+        }
+    }
+
     /// Tells an open view how big its list and the rest of it are drawn,
     /// as `(rows, columns)`: what a page is, and whether side by side fits.
     pub fn set_view_size(&mut self, list: (u16, u16), content: (u16, u16)) {
         match &mut self.view {
             Some(View::Diff(diff)) => diff.set_size(content),
             Some(View::Files(finder)) => finder.set_size(list),
+            Some(View::Memory(memory)) => memory.set_size(list),
             None => {}
         }
     }
@@ -740,6 +773,7 @@ impl App {
             let outcome = match view {
                 View::Diff(diff) => diff.on_mouse(kind, hit),
                 View::Files(finder) => finder.on_mouse(kind, hit),
+                View::Memory(memory) => memory.on_mouse(kind, hit),
             };
             return self.follow(outcome);
         }
@@ -820,6 +854,7 @@ impl App {
             KeyCode::Char('u') => self.select_next_needing_user(),
             KeyCode::Char('d') => return self.open_diff(),
             KeyCode::Char('p') => return self.open_finder(),
+            KeyCode::Char('m') => return self.open_memory(),
             KeyCode::Char('?') => self.showing_keys = true,
             KeyCode::Char('/') => self.open_filter(),
             KeyCode::Char('o') => return self.open_pull_request(),
@@ -850,6 +885,25 @@ impl App {
         Some(read)
     }
 
+    /// `m`: opens the memory of the selected session's project, and asks for
+    /// it to be read. A session outside git has its directory for a
+    /// project. With memory off, the footer says so instead.
+    fn open_memory(&mut self) -> Option<Action> {
+        if !self.memory_on {
+            self.notify(crate::memory::OFF.to_string());
+            return None;
+        }
+        let selected = self.selected()?;
+        let (dir, place) = match &selected.worktree {
+            Some(worktree) => (worktree.project_path.clone(), worktree.project.clone()),
+            None => (selected.cwd.clone(), shell::home_relative(&selected.cwd)),
+        };
+        let memory = MemoryView::new(dir, place);
+        let read = memory.read();
+        self.view = Some(View::Memory(memory));
+        Some(read)
+    }
+
     /// The selected session's worktree, and its project and branch the way
     /// a view's header names them: `payments ⎇ fix/login`. When it isn't in
     /// one, the footer says so.
@@ -871,6 +925,7 @@ impl App {
         let outcome = match self.view.as_mut()? {
             View::Diff(diff) => diff.on_key(key),
             View::Files(finder) => finder.on_key(key),
+            View::Memory(memory) => memory.on_key(key),
         };
         self.follow(outcome)
     }
@@ -1260,6 +1315,10 @@ impl App {
     pub fn on_paste(&mut self, text: String) -> Option<Action> {
         if let Some(View::Files(finder)) = &mut self.view {
             let outcome = finder.on_paste(&text);
+            return self.follow(outcome);
+        }
+        if let Some(View::Memory(memory)) = &mut self.view {
+            let outcome = memory.on_paste(&text);
             return self.follow(outcome);
         }
         if self.view.is_some() || self.showing_keys || self.confirm.is_some() {
@@ -2599,5 +2658,26 @@ mod tests {
         assert!(app.issues_view().is_some(), "q types into its filter");
         press(&mut app, KeyCode::Esc);
         assert!(app.issues_view().is_none());
+    }
+
+    #[test]
+    fn m_opens_the_memory_of_the_project_from_any_of_its_worktrees() {
+        let mut app = App::new(None);
+        app.set_sessions(vec![in_repo("fixer", "fix/ledger")]);
+        assert_eq!(
+            press(&mut app, KeyCode::Char('m')),
+            Some(Action::ReadMemory(PathBuf::from("/code/app")))
+        );
+        assert!(matches!(app.view(), Some(View::Memory(_))));
+    }
+
+    #[test]
+    fn m_with_memory_off_says_so_and_opens_nothing() {
+        let mut app = App::new(None);
+        app.set_sessions(vec![in_repo("fixer", "main")]);
+        app.set_memory_on(false);
+        assert_eq!(press(&mut app, KeyCode::Char('m')), None);
+        assert!(app.view().is_none());
+        assert_eq!(app.notice(), Some(crate::memory::OFF));
     }
 }

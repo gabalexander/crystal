@@ -22,8 +22,10 @@ impl Crystal {
         let socket = dir.path().join("crystal.sock");
         let crystal = Crystal { dir, socket };
         // A config of the test's own: the developer's can't change what
-        // the test sees, and no test pops up a real notification.
-        crystal.configure("notify = false\n");
+        // the test sees, and no test pops up a real notification. Memory is
+        // off unless a test turns it on, so Claude's arguments stay as each
+        // test expects them.
+        crystal.configure("notify = false\nmemory = false\n");
         crystal
     }
 
@@ -837,6 +839,7 @@ fn a_preset_from_the_config_starts_with_its_options_and_prompt() {
     let crystal = Crystal::new();
     crystal.configure(
         r#"notify = false
+memory = false
 
 [[preset]]
 name = "review"
@@ -2466,6 +2469,182 @@ fn skill_install_writes_the_skill_and_keeps_a_changed_one() {
 
     assert!(install(&["skill", "--install", "--force"]).status.success());
     assert_eq!(std::fs::read_to_string(&skill_file).unwrap(), printed);
+}
+
+/// A crystal with memory on, and a project for it to remember things about.
+fn crystal_remembering() -> (Crystal, PathBuf) {
+    let crystal = Crystal::new();
+    crystal.configure("notify = false\n");
+    let repo = git_repo(crystal.dir.path(), "app");
+    (crystal, repo)
+}
+
+#[test]
+fn remember_inside_a_session_keeps_the_entry_for_the_session_s_project() {
+    let (crystal, repo) = crystal_remembering();
+    // The session is in a worktree of its own; what it remembers is the
+    // whole project's.
+    let remember = format!(
+        "'{CRYSTAL}' remember -k gotcha 'The ledger tests need the database up' > said; sleep 30"
+    );
+    let repo_dir = repo.to_str().unwrap();
+    crystal.ok(&[
+        "new",
+        "-n",
+        "fixer",
+        "-c",
+        repo_dir,
+        "-w",
+        "fix/ledger",
+        "sh",
+        "-c",
+        &remember,
+    ]);
+    let worktree = crystal.dir.path().join("app.worktrees/fix-ledger");
+    assert_eq!(written(&worktree.join("said")), "remembered 1\n");
+
+    let listed = crystal.ok(&["memory", "-C", repo_dir]);
+    assert!(listed.contains("gotcha"), "{listed}");
+    assert!(
+        listed.contains("The ledger tests need the database up"),
+        "{listed}"
+    );
+    // It says which session it came from.
+    let store = files_under(&crystal.dir.path().join("memory"))
+        .into_iter()
+        .find(|file| {
+            file.extension()
+                .is_some_and(|extension| extension == "json")
+        })
+        .unwrap();
+    let store: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(store).unwrap()).unwrap();
+    assert_eq!(store["entries"][0]["source"]["session"], "fixer");
+}
+
+#[test]
+fn claude_starts_with_what_its_project_remembered_in_its_system_prompt() {
+    let (crystal, repo) = crystal_remembering();
+    let repo_dir = repo.to_str().unwrap();
+    crystal.ok(&[
+        "remember",
+        "-C",
+        repo_dir,
+        "-k",
+        "gotcha",
+        "The ledger tests need the database up",
+    ]);
+    // About a file that isn't there, so stale: Claude isn't shown it.
+    crystal.ok(&[
+        "remember",
+        "-C",
+        repo_dir,
+        "-f",
+        "ledger.rs",
+        "Ledger rounding lives in ledger.rs",
+    ]);
+    let bin = fake_claude(crystal.dir.path());
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let out = crystal
+        .command(&[
+            "new",
+            "-n",
+            "agent",
+            "-c",
+            repo_dir,
+            "claude",
+            "fix the ledger tests",
+        ])
+        .env("PATH", path)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+
+    let args = written(&repo.join("args"));
+    assert!(
+        args.contains(
+            "--append-system-prompt\nWhat this project's earlier sessions learned:\n\
+             - (gotcha) The ledger tests need the database up\n"
+        ),
+        "{args}"
+    );
+    assert!(args.contains("crystal remember"), "{args}");
+    assert!(!args.contains("rounding"), "{args}");
+    assert!(args.ends_with("fix the ledger tests\n"), "{args}");
+}
+
+#[test]
+fn memory_search_lists_the_entries_that_share_its_words() {
+    let (crystal, repo) = crystal_remembering();
+    let repo_dir = repo.to_str().unwrap();
+    for text in [
+        "Fees are kept in cents",
+        "The ledger tests need the database up",
+        "Deploys go out on Tuesdays",
+    ] {
+        crystal.ok(&["remember", "-C", repo_dir, text]);
+    }
+    let found = crystal.ok(&["memory", "-C", repo_dir, "search", "ledger", "database"]);
+    assert!(found.contains("The ledger tests"), "{found}");
+    assert!(!found.contains("Fees"), "{found}");
+    assert!(!found.contains("Deploys"), "{found}");
+}
+
+#[test]
+fn memory_promote_adds_the_entry_to_claude_md_under_notes() {
+    let (crystal, repo) = crystal_remembering();
+    let repo_dir = repo.to_str().unwrap();
+    std::fs::write(repo.join("CLAUDE.md"), "# app\n\nRun make test.\n").unwrap();
+    crystal.ok(&["remember", "-C", repo_dir, "Fees are kept in cents"]);
+
+    // Away from a terminal, it can't ask, so it needs to be told.
+    let refused = crystal.fails(&["memory", "-C", repo_dir, "promote", "1"]);
+    assert!(refused.contains("--yes"), "{refused}");
+    crystal.ok(&["memory", "-C", repo_dir, "promote", "1", "--yes"]);
+    assert_eq!(
+        std::fs::read_to_string(repo.join("CLAUDE.md")).unwrap(),
+        "# app\n\nRun make test.\n\n## Notes\n\n- Fees are kept in cents\n"
+    );
+}
+
+#[test]
+fn with_memory_off_its_commands_say_so() {
+    let crystal = Crystal::new();
+    let refused = crystal.fails(&["remember", "Fees are kept in cents"]);
+    assert!(refused.contains("the memory plugin is off"), "{refused}");
+    let refused = crystal.fails(&["memory"]);
+    assert!(refused.contains("the memory plugin is off"), "{refused}");
+}
+
+#[test]
+fn m_in_the_tui_shows_the_project_s_memory_and_x_forgets_an_entry() {
+    let (crystal, repo) = crystal_remembering();
+    let repo_dir = repo.to_str().unwrap();
+    crystal.ok(&[
+        "remember",
+        "-C",
+        repo_dir,
+        "-k",
+        "decision",
+        "Fees are kept in cents",
+    ]);
+    crystal.ok(&["new", "-n", "agent", "-c", repo_dir, "sleep", "30"]);
+
+    let mut tui = crystal.tui();
+    tui.shows("▸ agent");
+    tui.type_keys("m");
+    tui.shows("memory · 1 entry");
+    tui.shows("decision 1");
+    tui.shows("from you");
+
+    tui.type_keys("x");
+    tui.shows("forget entry 1?");
+    tui.type_keys("y");
+    tui.shows("nothing remembered yet");
+    assert_eq!(crystal.ok(&["memory", "-C", repo_dir]), "");
+
+    tui.type_keys("\x1b");
+    tui.shows("▸ agent");
 }
 
 /// Another machine for `crystal ssh` to reach: a fake ssh that runs the

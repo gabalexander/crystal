@@ -58,6 +58,7 @@ pub const KEYS: &[Key] = &[
     sidebar("i", "its project's issues"),
     sidebar("d", "diff of its worktree"),
     sidebar("p", "find a file to edit"),
+    sidebar("m", "its project's memory"),
     sidebar("?", "show these keys"),
     sidebar("q", "quit; sessions keep on"),
     in_pane("Ctrl+\\", "back to the sidebar"),

@@ -13,6 +13,8 @@ mod github;
 mod history;
 mod hook;
 mod keys;
+mod memory;
+mod memory_cli;
 mod notify;
 mod protocol;
 mod remote;
@@ -214,6 +216,35 @@ enum Command {
     /// Show where the config file is, and the settings in effect, as the
     /// file would hold them.
     Config,
+    /// Remember something about this project for its later sessions: a
+    /// decision, a gotcha, a command that works, a note.
+    Remember {
+        /// What sort of thing it is.
+        #[arg(short, long, value_enum, default_value_t = memory::Kind::Note)]
+        kind: memory::Kind,
+
+        /// A file it's about; once the file changes, the entry is marked
+        /// stale. Give it once a file.
+        #[arg(short = 'f', long = "file", value_name = "FILE")]
+        files: Vec<String>,
+
+        /// The project's directory [default: the current one]
+        #[arg(short = 'C', long = "dir", value_name = "DIR")]
+        dir: Option<PathBuf>,
+
+        /// What to remember. Several words are joined with spaces.
+        #[arg(required = true)]
+        text: Vec<String>,
+    },
+    /// What this project's sessions have remembered, newest first.
+    Memory {
+        /// The project's directory [default: the current one]
+        #[arg(short = 'C', long = "dir", value_name = "DIR", global = true)]
+        dir: Option<PathBuf>,
+
+        #[command(subcommand)]
+        command: Option<MemoryCommand>,
+    },
     /// Print the Claude Code skill that teaches an agent to drive crystal.
     Skill {
         /// Install it into Claude Code's skills, in $CLAUDE_CONFIG_DIR or
@@ -245,6 +276,27 @@ enum Command {
     /// Tell the daemon about an agent's event; what the agent's hooks run.
     #[command(hide = true)]
     Hook { agent: String },
+}
+
+#[derive(Subcommand)]
+enum MemoryCommand {
+    /// The entries that have to do with these words, the best first.
+    Search {
+        #[arg(required = true)]
+        words: Vec<String>,
+    },
+    /// Forget an entry, by its id.
+    #[command(visible_alias = "remove")]
+    Rm { id: u64 },
+    /// Write an entry into the project's CLAUDE.md, or its AGENTS.md, under
+    /// a "Notes" heading, for every session to read.
+    Promote {
+        id: u64,
+
+        /// Don't ask first.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -372,6 +424,20 @@ fn run(cli: Cli) -> Result<()> {
             }
         }
         Command::Config => print_config()?,
+        Command::Remember {
+            kind,
+            files,
+            dir,
+            text,
+        } => memory_cli::remember(&socket, dir, kind, files, &text.join(" "))?,
+        Command::Memory { dir, command } => match command {
+            None => memory_cli::list(&socket, dir)?,
+            Some(MemoryCommand::Search { words }) => memory_cli::search(&socket, dir, &words)?,
+            Some(MemoryCommand::Rm { id }) => memory_cli::remove(&socket, dir, id)?,
+            Some(MemoryCommand::Promote { id, yes }) => {
+                memory_cli::promote(&socket, dir, id, yes)?;
+            }
+        },
         Command::Skill { install, force } => {
             if install {
                 skill::install(force)?;

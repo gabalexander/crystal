@@ -10,6 +10,7 @@ use super::finder;
 use super::help;
 use super::issues;
 use super::launcher;
+use super::memory_view;
 use super::pane::Pane;
 use super::screen_widget::ScreenWidget;
 use super::sidebar::{self, fit};
@@ -95,6 +96,7 @@ pub fn view_areas(view: &View, area: Rect) -> ViewAreas {
     let list_width = match view {
         View::Diff(_) => diff_view::list_width(area.width),
         View::Files(_) => finder::list_width(area.width),
+        View::Memory(_) => memory_view::list_width(area.width),
     };
     let [header, body] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
     let [list, rule, content] = Layout::horizontal([
@@ -194,6 +196,7 @@ pub fn hit(areas: &Areas, app: &App, column: u16, row: u16) -> Hit {
             return match view {
                 View::Diff(diff) => diff_view::list_hit(diff, parts.list, row),
                 View::Files(finder) => finder::list_hit(finder, parts.list, row),
+                View::Memory(memory) => memory_view::list_hit(memory, parts.list, row),
             };
         }
         if at(parts.content) {
@@ -225,6 +228,7 @@ pub fn draw(frame: &mut Frame, app: &App, panes: &[Pane], look: &Look) {
         match view {
             View::Diff(diff) => diff_view::draw(frame, diff, look, &parts),
             View::Files(files) => finder::draw(frame, files, look, &parts),
+            View::Memory(memory) => memory_view::draw(frame, memory, look, &parts),
         }
         draw_view_footer(frame, app, view, look, areas.footer);
         return;
@@ -515,9 +519,16 @@ fn draw_view_footer(frame: &mut Frame, app: &App, view: &View, look: &Look, area
         frame.render_widget(notice, area);
         return;
     }
+    let owned = |hints: Vec<(&str, &str)>| -> Vec<(String, String)> {
+        hints
+            .into_iter()
+            .map(|(key, does)| (key.to_string(), does.to_string()))
+            .collect()
+    };
     let hints = match view {
-        View::Diff(diff) => diff_view::hints(diff),
-        View::Files(_) => finder::hints(),
+        View::Diff(diff) => owned(diff_view::hints(diff)),
+        View::Files(_) => owned(finder::hints()),
+        View::Memory(memory) => memory_view::hints(memory),
     };
     let mut spans = vec![Span::raw(" ")];
     for (key, does) in hints {

@@ -6,6 +6,7 @@ use crate::agents;
 use crate::codex;
 use crate::env;
 use crate::keys;
+use crate::memory::{self, Memory};
 use crate::notify;
 use crate::protocol::{self, Conversation, Frame, NewSession, NewTask, Request, Response};
 use crate::session::{STOP_GRACE, Session, Term};
@@ -447,7 +448,8 @@ fn start(
         .map(|conversation| conversation.id.as_str());
     // What crystal tells the agent on top of what it was asked. Each part of
     // crystal that has something to say adds its paragraph here.
-    let instructions: Vec<String> = Vec::new();
+    let mut instructions: Vec<String> = Vec::new();
+    instructions.extend(remembered(socket, &cwd, &command));
     let argv = agents::argv(&command, &crystal, resume, &instructions);
     let mut session = Session::spawn(id, name.clone(), command, &argv, cwd, &env)?;
     match conversation {
@@ -460,6 +462,22 @@ fn start(
     }
     sessions.push(session);
     Ok(name)
+}
+
+/// What the project's memory has to tell a Claude Code session as it
+/// starts, with the words of its command as what it was asked, unless the
+/// config turns memory off. Codex has no way to be told something at
+/// launch without it showing as the user's own first message, so it isn't.
+fn remembered(socket: &Path, cwd: &Path, command: &[String]) -> Option<String> {
+    if agents::program_name(command) != Some("claude") {
+        return None;
+    }
+    if !memory::enabled_now() {
+        return None;
+    }
+    let memory = Memory::read(socket, &memory::project_of(cwd)).ok()?;
+    let now = memory::seconds_since_epoch(SystemTime::now());
+    Some(memory::for_launch(&memory, &command[1..].join(" "), now))
 }
 
 /// Starts a task and adds it to `sessions`. With `run_prompt`, Claude runs
