@@ -149,6 +149,7 @@ is: it's the one request every version must understand.
 - `src/env.rs`: the environment a session's program starts with
 - `src/git.rs`: a directory's project, worktree and branch, a project's linked worktrees, and making and
   removing worktrees (runs `git`)
+- `src/names.rs`: made-up names for new worktrees' branches, like `brave-otter`
 - `src/github.rs`: pull requests and issues from GitHub, through `gh` with a timeout; tests use a fake `gh`,
   never the real one
 - `src/shell.rs`: quoting arguments and writing paths with `~`, the way a shell reads them

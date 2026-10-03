@@ -1739,7 +1739,7 @@ fn worktree_rm_waits_until_no_session_runs_in_it() {
 }
 
 #[test]
-fn worktree_rm_keeps_work_that_isnt_committed() {
+fn worktree_rm_keeps_work_that_isnt_committed_unless_forced() {
     let crystal = Crystal::new();
     let repo = git_repo(crystal.dir.path(), "app");
     let repo_arg = repo.to_str().unwrap();
@@ -1750,6 +1750,10 @@ fn worktree_rm_keeps_work_that_isnt_committed() {
     let err = crystal.fails(&["worktree", "rm", "app.worktrees/fix"]);
     assert!(err.contains("untracked"), "{err}");
     assert!(worktree.join("notes.txt").exists());
+
+    // Unless it's forced, and the work goes with it.
+    crystal.ok(&["worktree", "rm", "--force", "app.worktrees/fix"]);
+    assert!(!worktree.exists());
 }
 
 #[test]
@@ -1779,7 +1783,7 @@ fn the_tui_groups_sessions_by_project_then_worktree() {
 }
 
 #[test]
-fn w_names_the_new_worktrees_branch_after_the_task() {
+fn w_makes_the_new_worktree_on_a_branch_with_a_made_up_name() {
     let crystal = Crystal::new();
     let repo = git_repo(crystal.dir.path(), "app");
     crystal.ok(&[
@@ -1797,23 +1801,26 @@ fn w_names_the_new_worktrees_branch_after_the_task() {
     let mut tui = crystal.attach_with_env(&[], &[("PATH", &path)]);
     tui.shows("▸ planner");
     tui.type_keys("w");
-    tui.shows("New session · app ⎇ a new branch");
+    let branch = panel_branch(&tui);
+    assert!(branch.split_once('-').is_some(), "{branch}");
+    tui.shows(&format!("New session · app ⎇ {branch}"));
+    // The task doesn't rename it.
     tui.type_keys("Fix the flaky test!");
-    tui.shows("New session · app ⎇ fix-the-flaky-test");
-    tui.shows("branch       fix-the-flaky-test");
+    tui.shows("Fix the flaky test!");
+    assert_eq!(panel_branch(&tui), branch);
     tui.type_keys("\r");
-    tui.shows("⎇ fix-the-flaky-test");
     tui.shows("typing into");
+    tui.shows(&format!("⎇ {branch}"));
 
     // Claude Code started in the new worktree, which writes down its
     // arguments where it runs.
-    let worktree = crystal.dir.path().join("app.worktrees/fix-the-flaky-test");
+    let worktree = crystal.dir.path().join("app.worktrees").join(&branch);
     let args = written(&worktree.join("args"));
     assert_eq!(args.lines().last(), Some("Fix the flaky test!"));
 }
 
 #[test]
-fn a_new_worktree_with_no_task_asks_what_to_call_its_branch() {
+fn a_new_worktrees_made_up_name_can_be_typed_over() {
     let crystal = Crystal::new();
     let repo = git_repo(crystal.dir.path(), "app");
     let repo_arg = repo.to_str().unwrap();
@@ -1822,12 +1829,34 @@ fn a_new_worktree_with_no_task_asks_what_to_call_its_branch() {
     let path = path_of(&[]);
     let mut tui = crystal.attach_with_env(&[], &[("PATH", &path)]);
     tui.shows("▸ planner");
-    tui.type_keys("w\r");
+    tui.type_keys("w");
+    panel_branch(&tui);
+    // Shift+Tab goes round from the first row to the branch's, and Ctrl+U
+    // rubs the name out, so Enter asks for one.
+    tui.type_keys("\x1b[Z\x15\r");
     tui.shows("name the new worktree's branch");
     tui.type_keys("spike\r");
-    // The panel's title shows the branch as it's typed, before Enter.
     let worktree = crystal.dir.path().join("app.worktrees/spike");
     eventually("the worktree is made", || worktree.is_dir());
+}
+
+/// The branch the new-session panel shows for a new worktree, once it has
+/// drawn its title and the rows below it, down to the command it runs.
+fn panel_branch(tui: &Terminal) -> String {
+    let mut branch = String::new();
+    eventually("the panel shows the new worktree's branch", || {
+        let text = tui.text();
+        let row = text
+            .lines()
+            .find_map(|line| line.split_once("branch       "))
+            .map_or("", |(_, after)| after);
+        branch = row
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
+            .collect();
+        !branch.is_empty() && text.contains(&format!("⎇ {branch}")) && text.contains("runs  ")
+    });
+    branch
 }
 
 impl Crystal {
@@ -3259,7 +3288,7 @@ fn a_worktree_whose_last_session_is_killed_stays_until_shift_w_removes_it() {
 }
 
 #[test]
-fn shift_w_on_a_worktree_with_work_in_it_says_why_git_keeps_it() {
+fn shift_w_on_a_worktree_with_work_in_it_asks_again_before_losing_it() {
     let crystal = Crystal::new();
     let repo = git_repo(crystal.dir.path(), "app");
     let repo_arg = repo.to_str().unwrap();
@@ -3276,9 +3305,20 @@ fn shift_w_on_a_worktree_with_work_in_it_says_why_git_keeps_it() {
     tui.type_keys("W");
     tui.shows("remove worktree fix? y/n");
     tui.type_keys("y");
-    tui.shows("'fix' contains modified or untracked files");
+    tui.shows("fix has uncommitted changes: remove it and lose them? y/n");
+    // A no keeps it, and the work in it.
+    tui.type_keys("n");
+    tui.hides("uncommitted changes");
     assert!(worktree.join("notes.txt").exists());
     tui.shows("· no sessions");
+
+    tui.type_keys("W");
+    tui.shows("remove worktree fix? y/n");
+    tui.type_keys("y");
+    tui.shows("fix has uncommitted changes: remove it and lose them? y/n");
+    tui.type_keys("y");
+    eventually("the worktree is gone", || !worktree.exists());
+    tui.hides("⎇ fix");
 }
 
 #[test]

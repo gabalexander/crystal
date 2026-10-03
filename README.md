@@ -98,7 +98,7 @@ and the footer says where you are and offers the keys that matter there.
 | `>` | move the selected session to another tab: then a tab's number, or `t` for a new one |
 | `S` | your saved [layouts](#layouts): save your tabs as one, or put them back the way one has them |
 | `n` | start a new session from [the new-session panel](#starting-a-session), and type into it |
-| `w` | the same, in a new worktree on a branch named after the task |
+| `w` | the same, in a new worktree on a branch with a made-up name, like `brave-otter` |
 | `W` | remove the selected worktree, once nothing runs in it and you've said `y` |
 | `r` | rename the selected session |
 | `x` | kill the selected session, once you've said `y` |
@@ -270,8 +270,9 @@ review  exited 0  41388  app      main       ~/code/app                      cod
 `/` in the branch made a `-`. A branch that doesn't exist yet starts from the commit you're on; one that does
 is checked out as it is. `crystal worktree rm` (or `W` in the TUI) takes the worktree's directory or its
 branch, refuses while a session is still running in it, and leaves the rest to `git worktree remove`, which
-keeps a worktree with changes you haven't committed. Sessions that had ended in it leave the list with it:
-their directory is gone, so they could never start again.
+keeps a worktree with changes you haven't committed. `crystal worktree rm --force` removes it anyway, and
+those changes with it; `W` asks a second time, naming them, and a second `y` does the same. Sessions that had
+ended in it leave the list with it: their directory is gone, so they could never start again.
 
 `crystal rename` changes what a session is called; its program and its saved place after a restart follow the
 new name. `crystal respawn`, or `Enter` on an ended session in the TUI, runs its command again in the same
@@ -389,15 +390,17 @@ Under the task, `Tab` and `Shift+Tab` go from row to row and `←` / `→` chang
 - **how**, for Claude Code: **in a terminal**, or **in the background**, as a [background
   task](#background-tasks) that needs no terminal. Only Claude Code offers it: crystal reads `claude -p`'s
   events for a task's transcript, and Codex's `codex exec` writes another kind it doesn't read yet.
-- Claude Code's **model** and **permissions** (`--model`, `--permission-mode`), or Codex's **model** and
-  **approvals** (`-m`, `-a`), its models the ones `codex debug models` lists. Left at `default`, no option is
-  added.
+- Claude Code's **model** (fable, opus, sonnet, haiku), **effort** (low to max) and **permissions** (`--model`,
+  `--effort`, `--permission-mode`), or Codex's **model** and **approvals** (`-m`, `-a`), its models the ones
+  `codex debug models` lists. Left at `default`, no option is added.
 - **start in**: here (the selected session's worktree, or where you started `crystal`), a new worktree, or
   another project's main worktree.
 
-A new worktree's **branch** is named after the task, its words in lowercase joined by `-`; type in that row to
-change it. With no task, `Enter` asks you to name it. `w` opens the panel with a new worktree chosen, and
-`Enter` on an issue opens it ready to fix that issue, on a branch named after it.
+A new worktree's **branch** gets a made-up name, an adjective and an animal like `brave-otter`, whatever the
+task says; type in that row to change it. A made-up name is always a new branch: if it's taken, the worktree
+goes on `brave-otter-2`. One you type that's a branch already is checked out as it is. `w` opens the panel
+with a new worktree chosen, and `Enter` on an issue opens it ready to fix that issue, on a branch named after
+it.
 
 The panel ends with the command it runs and, for a new worktree, where. `Ctrl+E` hands that command to the
 bottom line, `new session:`, to change it or run anything else: `npm run dev` or `sh -c 'make && make test'`
@@ -906,6 +909,7 @@ name = "review"                            # how the panel shows it
 description = "Reads the branch's diff"    # optional: shown under it in the panel
 agent = "claude"                           # claude, codex, gemini, opencode, cursor-agent or aider
 model = "opus"                             # optional: Claude Code's or Codex's model
+effort = "high"                            # optional: Claude Code's effort: low, medium, high, xhigh or max
 mode = "plan"                              # optional: Claude Code's permission mode, or Codex's approvals
 args = ["--verbose"]                       # optional: more options, after those
 prompt = "Review the diff on this branch." # optional: put before the task, a blank line between
