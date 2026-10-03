@@ -69,6 +69,8 @@ is: it's the one request every version must understand.
   - `fuzzy.rs`: how a path matches a few typed letters, and how well
   - `finder.rs`: the file finder (`p`): its state, keys and drawing, listing files and reading the
     preview off the event loop
+  - `memory_view.rs`: the memory view (`m`): a project's entries, the filter, forgetting and
+    promoting after a `y`, and its drawing
 - `src/daemon.rs`: the daemon: listens on the socket and owns the sessions
 - `src/agents.rs`: what crystal knows about particular agents: the hooks it adds to Claude Code, and what they mean
 - `src/catalog.rs`: the agents the new-session panel offers: their names, how each takes a first prompt, their
@@ -87,6 +89,10 @@ is: it's the one request every version must understand.
 - `src/socket.rs`: where the socket lives
 - `src/state.rs`: the running sessions, written down to start them again after a restart
 - `src/config.rs`: the settings in `~/.config/crystal/config.toml`, presets included
+- `src/memory.rs`: what a project's sessions learned: the store in the state directory, staleness, search,
+  the paragraph Claude Code is shown at launch, promoting into CLAUDE.md, and `enabled`, the one gate
+  everything memory adds goes through
+- `src/memory_cli.rs`: `crystal remember` and `crystal memory`
 - `src/notify.rs`: telling the user when a session needs them: desktop notifications, or their own command
 - `src/env.rs`: the environment a session's program starts with
 - `src/git.rs`: a directory's project, worktree and branch, and making and removing worktrees (runs `git`)
@@ -94,5 +100,5 @@ is: it's the one request every version must understand.
   never the real one
 - `src/shell.rs`: quoting arguments and writing paths with `~`, the way a shell reads them
 - `tests/cli.rs`: end-to-end tests that drive the real binary against a private daemon, with a config of
-  their own that turns notifications off; a test that opens the new-session panel pins `PATH` to its fake
+  their own that turns notifications and memory off (a memory test turns it back on); a test that opens the new-session panel pins `PATH` to its fake
   agents, so no real agent is found or run

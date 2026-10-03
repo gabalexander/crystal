@@ -95,6 +95,22 @@ crystal worktree rm fix/login
 
 `worktree rm` refuses while a session still runs there, and leaves uncommitted changes to git's own refusal.
 
+## Remember what you learned
+
+A project keeps what its sessions learned, and later Claude Code sessions there are shown the parts that fit
+their prompt. Add to it when you find something the next session would otherwise have to find again:
+
+```sh
+crystal remember -k gotcha -f tests/ledger.rs "The ledger tests need the database up: make db"
+crystal memory search ledger
+```
+
+- `-k` is `decision`, `gotcha`, `command` or `note` (the default). Keep each entry to a sentence or two.
+- `-f <file>` names a file the entry is about. When that file changes, the entry is marked stale.
+- Don't remember what the code, the git log or CLAUDE.md already says, or anything that only matters now.
+- `crystal memory` lists every entry; `crystal memory rm <id>` forgets one that's wrong.
+- With memory turned off, these commands say "the memory plugin is off"; carry on without them.
+
 ## Pitfalls
 
 - `send` pastes its text. Agents ignore a pasted answer to a question: answer with `send-keys`.
