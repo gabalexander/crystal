@@ -40,6 +40,9 @@ pub struct Tab {
     /// The sessions split off into panes of their own, in the order they
     /// were split off. Only the tab's own sessions.
     pub splits: Vec<String>,
+    /// Whether the selected session's pane takes all the room between the
+    /// top bar and the footer, the sidebar and the other panes put away.
+    pub zoomed: bool,
 }
 
 impl Tab {
@@ -442,9 +445,21 @@ mod tests {
         tabs.put("server", 2);
         tabs.current_mut().splits = vec!["server".into()];
         tabs.current_mut().selected = Some("agent".into());
+        tabs.current_mut().zoomed = true;
         tabs.go_to(1);
         save(&path, &tabs);
         assert_eq!(load(&path), tabs);
+    }
+
+    #[test]
+    fn tabs_kept_before_they_could_zoom_come_back_unzoomed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tabs.json");
+        let kept = r#"{"version": 2, "tabs": [{"name": "a", "sessions": ["x"], "splits": []}]}"#;
+        std::fs::write(&path, kept).unwrap();
+        let tabs = load(&path);
+        assert_eq!(tabs.current().sessions, ["x"]);
+        assert!(!tabs.current().zoomed);
     }
 
     #[test]

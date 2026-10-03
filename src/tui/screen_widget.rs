@@ -1,7 +1,8 @@
 //! Draws a session's screen into a ratatui area: each cell of the screen
-//! becomes a ratatui cell with the same character, colors and attributes.
+//! becomes a ratatui cell with the same character, colors and attributes,
+//! with what copy mode marks on it laid over them.
 
-use crate::vt::{self, CellColor, CellStyle};
+use crate::vt::{self, CellColor, CellStyle, Mark};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -13,6 +14,28 @@ pub struct ScreenWidget<'a> {
     /// unless the theme paints its own.
     default_fg: Color,
     default_bg: Color,
+    marks: Marks,
+}
+
+/// How each of copy mode's marks looks, laid over the cell's own style.
+#[derive(Debug, Clone, Copy)]
+pub struct Marks {
+    pub selected: Style,
+    pub found: Style,
+    pub current: Style,
+    pub cursor: Style,
+}
+
+impl Default for Marks {
+    /// Marks any terminal can show, whatever its colors.
+    fn default() -> Marks {
+        Marks {
+            selected: Style::new().add_modifier(Modifier::REVERSED),
+            found: Style::new().add_modifier(Modifier::UNDERLINED),
+            current: Style::new().add_modifier(Modifier::UNDERLINED | Modifier::BOLD),
+            cursor: Style::new().add_modifier(Modifier::REVERSED),
+        }
+    }
 }
 
 impl<'a> ScreenWidget<'a> {
@@ -21,6 +44,7 @@ impl<'a> ScreenWidget<'a> {
             screen,
             default_fg: Color::Reset,
             default_bg: Color::Reset,
+            marks: Marks::default(),
         }
     }
 
@@ -31,6 +55,22 @@ impl<'a> ScreenWidget<'a> {
             default_fg: fg,
             default_bg: bg,
             ..self
+        }
+    }
+
+    /// Draws copy mode's marks as `marks` has them.
+    pub fn with_marks(self, marks: Marks) -> ScreenWidget<'a> {
+        ScreenWidget { marks, ..self }
+    }
+
+    /// What `mark` lays over a cell's style.
+    fn mark(&self, mark: Mark) -> Style {
+        match mark {
+            Mark::None => Style::new(),
+            Mark::Found => self.marks.found,
+            Mark::Current => self.marks.current,
+            Mark::Selected => self.marks.selected,
+            Mark::Cursor => self.marks.cursor,
         }
     }
 
@@ -72,7 +112,7 @@ impl Widget for ScreenWidget<'_> {
                 return;
             };
             target.set_symbol(cell.text);
-            target.set_style(self.style(&cell.style));
+            target.set_style(self.style(&cell.style).patch(self.mark(cell.mark)));
         });
     }
 }
@@ -158,6 +198,39 @@ mod tests {
         let buf = render(&parser, Rect::new(0, 0, 6, 1));
         assert_eq!(buf[(0, 0)].symbol(), "中");
         assert_eq!(buf[(2, 0)].symbol(), "x");
+    }
+
+    #[test]
+    fn copy_modes_marks_are_laid_over_the_cells() {
+        let mut parser = screen(2, 10, b"find me\r\n");
+        parser.start_copying();
+        parser.search("me", false);
+        let selected = Style::new().bg(Color::Rgb(1, 2, 3));
+        let marks = Marks {
+            selected,
+            ..Marks::default()
+        };
+        let area = Rect::new(0, 0, 10, 2);
+        let mut buf = Buffer::empty(area);
+        ScreenWidget::new(&parser)
+            .with_marks(marks)
+            .render(area, &mut buf);
+        // The search put the cursor on "me": its first cell is the cursor's,
+        // the next the match's.
+        assert!(buf[(5, 0)].modifier.contains(Modifier::REVERSED));
+        assert!(
+            buf[(6, 0)]
+                .modifier
+                .contains(Modifier::UNDERLINED | Modifier::BOLD)
+        );
+        assert!(buf[(0, 0)].modifier.is_empty());
+
+        parser.toggle_selection(vt::SelectionKind::Lines);
+        let mut buf = Buffer::empty(area);
+        ScreenWidget::new(&parser)
+            .with_marks(marks)
+            .render(area, &mut buf);
+        assert_eq!(buf[(0, 0)].bg, Color::Rgb(1, 2, 3));
     }
 
     #[test]

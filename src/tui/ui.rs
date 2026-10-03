@@ -6,6 +6,7 @@
 
 use super::app::{App, Filter, Focus, Hit, PluginPane, Prompt, Question, Slot, View};
 use super::backlog_view::{self, BacklogView};
+use super::copy_mode::{self, SearchPrompt};
 use super::diff_view;
 use super::finder;
 use super::help;
@@ -15,7 +16,7 @@ use super::memory_view;
 use super::pane::Pane;
 use super::plugins_view;
 use super::profiles;
-use super::screen_widget::ScreenWidget;
+use super::screen_widget::{Marks, ScreenWidget};
 use super::sidebar::{self, fit};
 use super::status::Status;
 use super::tabs::Tab;
@@ -71,15 +72,20 @@ pub struct Areas {
 }
 
 impl Areas {
+    /// Lays out a screen the way `app` has it: zoomed, or with its splits
+    /// beside the selection's pane.
+    pub fn of(app: &App, screen: Rect) -> Areas {
+        if app.zoomed() {
+            Areas::zoomed(screen)
+        } else {
+            Areas::new(screen, app.splits().len())
+        }
+    }
+
     /// Lays out a screen with `splits` sessions split off beside the
     /// selection's pane.
     pub fn new(screen: Rect, splits: usize) -> Areas {
-        let [top, main, footer] = Layout::vertical([
-            Constraint::Length(1),
-            Constraint::Min(0),
-            Constraint::Length(1),
-        ])
-        .areas(screen);
+        let [top, main, footer] = rows(screen);
         let [sidebar, rule, panes] = Layout::horizontal([
             Constraint::Length(SIDEBAR_WIDTH),
             Constraint::Length(1),
@@ -95,6 +101,31 @@ impl Areas {
             footer,
         }
     }
+
+    /// Lays out a screen zoomed: one pane takes everything between the top
+    /// bar and the footer, and the sidebar and its rule have no room.
+    pub fn zoomed(screen: Rect) -> Areas {
+        let [top, main, footer] = rows(screen);
+        let nowhere = Rect::new(main.x, main.y, 0, main.height);
+        Areas {
+            top,
+            main,
+            sidebar: nowhere,
+            rule: nowhere,
+            panes: vec![main],
+            footer,
+        }
+    }
+}
+
+/// The top bar, everything between, and the footer.
+fn rows(screen: Rect) -> [Rect; 3] {
+    Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(0),
+        Constraint::Length(1),
+    ])
+    .areas(screen)
 }
 
 /// Where an open view's parts go: a header line across the top, then its
@@ -202,6 +233,26 @@ pub fn screen_area(pane: Rect) -> Rect {
     screen
 }
 
+/// The cell of the screen of the pane at `slot` nearest `(column, row)`:
+/// where a drag that started in that pane has got to, once it's left it
+/// too.
+pub fn nearest_cell(
+    areas: &Areas,
+    app: &App,
+    slot: Slot,
+    column: u16,
+    row: u16,
+) -> Option<(u16, u16)> {
+    let index = app.slots().iter().position(|at| *at == slot)?;
+    let screen = screen_area(*areas.panes.get(index)?);
+    if screen.is_empty() {
+        return None;
+    }
+    let column = column.clamp(screen.x, screen.right() - 1);
+    let row = row.clamp(screen.y, screen.bottom() - 1);
+    Some((row - screen.y, column - screen.x))
+}
+
 /// What's at `(column, row)` on a screen laid out as `areas`, for `app`.
 pub fn hit(areas: &Areas, app: &App, column: u16, row: u16) -> Hit {
     let at = |area: Rect| area.contains((column, row).into());
@@ -239,7 +290,7 @@ pub fn hit(areas: &Areas, app: &App, column: u16, row: u16) -> Hit {
 /// Draws the whole TUI. `panes` are the viewers of the sessions on screen.
 pub fn draw(frame: &mut Frame, app: &App, panes: &[Pane], overlay: Option<&Pane>, look: &Look) {
     frame.render_widget(Block::new().style(look.theme.base()), frame.area());
-    let areas = Areas::new(frame.area(), app.splits().len());
+    let areas = Areas::of(app, frame.area());
     draw_top_bar(frame, app, look, areas.top);
     if let Some(view) = app.view() {
         let parts = view_areas(view, areas.main);
@@ -257,6 +308,19 @@ pub fn draw(frame: &mut Frame, app: &App, panes: &[Pane], overlay: Option<&Pane>
         draw_pane(frame, app, look, slot, *area, panes);
     }
     draw_rules_between(frame, look, &areas.panes);
+    // Zoomed, the sidebar comes out over the pane while `/` looks through
+    // it, rather than squeezing the pane, which its program would redraw
+    // for.
+    if app.zoomed() && app.filter().is_some() {
+        let main = areas.main;
+        let width = SIDEBAR_WIDTH.min(main.width.saturating_sub(1));
+        let drawer = Rect::new(main.x, main.y, width, main.height);
+        let rule = Rect::new(drawer.right(), main.y, 1, main.height);
+        frame.render_widget(Clear, drawer.union(rule));
+        frame.render_widget(Block::new().style(look.theme.base()), drawer.union(rule));
+        sidebar::draw(frame, app, look, drawer);
+        draw_rule(frame, look, rule);
+    }
     // Over everything between the top bar and the footer.
     let below_top = areas.top.bottom();
     let middle = Rect::new(0, below_top, frame.area().width, areas.footer.y - below_top);
@@ -288,7 +352,7 @@ pub fn draw(frame: &mut Frame, app: &App, panes: &[Pane], overlay: Option<&Pane>
     if let (Some(open), Some(pane)) = (app.plugin_pane(), overlay) {
         draw_plugin_pane(frame, open, pane, look, &areas);
     }
-    draw_footer(frame, app, look, areas.footer);
+    draw_footer(frame, app, panes, look, areas.footer);
     if app.showing_keys() {
         let plugin_on = |plugin: &str| app.plugin_on(plugin);
         let plugin_keys = app.plugin_key_rows();
@@ -504,13 +568,12 @@ fn draw_rules_between(frame: &mut Frame, look: &Look, panes: &[Rect]) {
 /// then the session's screen, or a word on why there's none to show. Only
 /// the pane with the keyboard shows the cursor.
 fn draw_pane(frame: &mut Frame, app: &App, look: &Look, slot: Slot, area: Rect, panes: &[Pane]) {
-    let focused = app.focus() == Focus::Pane(slot);
+    let copying = app.focus() == Focus::Copy(slot);
+    let focused = app.focus() == Focus::Pane(slot) || copying;
     let session = app.pane_session(slot);
     // Until a viewer has attached to the session, there's nothing to show
     // yet.
-    let pane = session
-        .filter(|_| app.shows_screen(slot))
-        .and_then(|session| panes.iter().find(|pane| pane.session_id == session.id));
+    let pane = pane_in(app, panes, slot);
     let back = pane.map_or(0, Pane::scrolled_back);
     let screen = screen_area(area);
     let header = Rect::new(area.x, area.y, area.width, 1);
@@ -549,14 +612,27 @@ fn draw_pane(frame: &mut Frame, app: &App, look: &Look, slot: Slot, area: Rect, 
     let Some(pane) = pane else {
         return;
     };
-    let widget =
-        ScreenWidget::new(&pane.screen).with_defaults(look.theme.text, look.theme.background);
+    let theme = look.theme;
+    let marks = Marks {
+        selected: theme.copy_selection,
+        found: theme.found,
+        current: theme.found_current,
+        ..Marks::default()
+    };
+    let widget = ScreenWidget::new(&pane.screen)
+        .with_defaults(theme.text, theme.background)
+        .with_marks(marks);
     frame.render_widget(widget, screen);
-    // Back in the history, the cursor's place on the live screen means
-    // nothing.
-    if focused
-        && back == 0
-        && let Some((row, col)) = pane.screen.cursor()
+    // In copy mode, the cursor is copy mode's. Back in the history, the
+    // program's cursor's place on the live screen means nothing.
+    let cursor = if copying {
+        pane.screen.copy_cursor()
+    } else if focused && back == 0 {
+        pane.screen.cursor()
+    } else {
+        None
+    };
+    if let Some((row, col)) = cursor
         && row < screen.height
         && col < screen.width
     {
@@ -572,9 +648,16 @@ fn header_notes(app: &App, slot: Slot, session: &SessionInfo, back: usize) -> Ve
     if session.state != State::Running {
         notes.push(session.state.to_string());
     }
+    // Zoomed, the one pane is the selected session's, and says why the
+    // sidebar has gone.
     let selected = app.selected().is_some_and(|s| s.name == session.name);
-    if slot != Slot::Selected && selected {
+    if app.zoomed() {
+        notes.push("zoomed".to_string());
+    } else if slot != Slot::Selected && selected {
         notes.push("selected".to_string());
+    }
+    if app.focus() == Focus::Copy(slot) {
+        notes.push("copy mode".to_string());
     }
     let index = app.sessions().iter().position(|s| s.name == session.name);
     let flow_step = index.and_then(|index| app.flow_step_of(index));
@@ -710,8 +793,13 @@ pub fn draw_message(frame: &mut Frame, look: &Look, message: &str, area: Rect) {
 
 /// The footer: a question being asked, a notice, or else where the keyboard
 /// is and the keys that matter there, with "? keys" on the right.
-fn draw_footer(frame: &mut Frame, app: &App, look: &Look, area: Rect) {
+fn draw_footer(frame: &mut Frame, app: &App, panes: &[Pane], look: &Look, area: Rect) {
     let theme = look.theme;
+    let copying = match app.focus() {
+        Focus::Copy(slot) => pane_in(app, panes, slot),
+        _ => None,
+    };
+    let searching = copying.and_then(|pane| pane.copy.as_ref()?.prompt.as_ref());
     if app.plugin_pane().is_some() {
         frame.render_widget(hint_spans(&[("ctrl+\\", "close")], theme), area);
     } else if app.launcher().is_some() {
@@ -736,13 +824,41 @@ fn draw_footer(frame: &mut Frame, app: &App, look: &Look, area: Rect) {
         draw_filter(frame, theme, filter, app.matches().len(), area);
     } else if let Some(confirm) = app.confirm() {
         frame.render_widget(question_line(&confirm.question(), theme), area);
+    } else if let Some(prompt) = searching {
+        draw_search_prompt(frame, theme, prompt, area);
     } else if let Some(notice) = app.notice() {
         let notice = Line::styled(format!(" {notice}"), Style::new().fg(theme.failed));
         frame.render_widget(notice, area);
     } else {
-        frame.render_widget(hints_line(app, theme, area.width), area);
+        frame.render_widget(hints_line(app, copying, theme, area.width), area);
         frame.render_widget(keys_hint(app, theme).right_aligned(), area);
     }
+}
+
+/// The viewer of the session the pane at `slot` shows, once it has one.
+fn pane_in<'a>(app: &App, panes: &'a [Pane], slot: Slot) -> Option<&'a Pane> {
+    let session = app.pane_session(slot).filter(|_| app.shows_screen(slot))?;
+    panes.iter().find(|pane| pane.session_id == session.id)
+}
+
+/// The search being typed in copy mode, with the cursor in it.
+fn draw_search_prompt(frame: &mut Frame, theme: &Theme, prompt: &SearchPrompt, area: Rect) {
+    let label = if prompt.forward {
+        " search down: "
+    } else {
+        " search up: "
+    };
+    let line = Line::from(vec![
+        Span::styled(
+            label,
+            Style::new().fg(theme.accent).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(prompt.input.text().to_string(), Style::new().fg(theme.text)),
+    ]);
+    frame.render_widget(line, area);
+    // The label is plain ASCII, so its length in bytes is its width.
+    let column = area.x + (label.len() + prompt.input.cursor()) as u16;
+    frame.set_cursor_position((column.min(area.right().saturating_sub(1)), area.y));
 }
 
 /// The footer while a view is open: a notice, if there is one, or else the
@@ -798,12 +914,25 @@ const SIDEBAR_HINTS: &[(&str, &str)] = &[
     ("s", "split"),
     ("x", "kill"),
     ("q", "quit"),
+    ("z", "zoom"),
+    ("v", "copy"),
     ("w", "worktree"),
     ("u", "next"),
     ("/", "find"),
     ("d", "diff"),
     ("p", "files"),
     ("t", "tab"),
+];
+
+/// The sidebar's keys while the tab is zoomed: `j` and `k` choose the
+/// session the one pane shows.
+const ZOOMED_HINTS: &[(&str, &str)] = &[
+    ("z", "unzoom"),
+    ("enter", "type"),
+    ("j/k", "switch"),
+    ("v", "copy"),
+    ("n", "new"),
+    ("q", "quit"),
 ];
 
 /// The sidebar's keys while the selected step's flow run waits at a gate.
@@ -929,16 +1058,20 @@ const PANE_HINTS: &[(&str, &str)] = &[("ctrl+\\", "sidebar"), ("shift+pgup", "hi
 
 /// Where the keyboard is, then the keys that matter most there, as many as
 /// fit beside "? keys".
-fn hints_line<'a>(app: &App, theme: &Theme, width: u16) -> Line<'a> {
+fn hints_line<'a>(app: &App, copying: Option<&Pane>, theme: &Theme, width: u16) -> Line<'a> {
+    let doing = |what: &str, slot: Slot| {
+        let name = app.pane_session(slot).map_or("", |s| s.name.as_str());
+        vec![
+            Span::styled(format!(" {what} "), Style::new().fg(theme.muted)),
+            Span::styled(name.to_string(), Style::new().fg(theme.accent)),
+        ]
+    };
     let (mut spans, hints) = match app.focus() {
         Focus::Sidebar => (whereabouts(app, theme, width), sidebar_hints(app)),
-        Focus::Pane(slot) => {
-            let name = app.pane_session(slot).map_or("", |s| s.name.as_str());
-            let spans = vec![
-                Span::styled(" typing into ", Style::new().fg(theme.muted)),
-                Span::styled(name.to_string(), Style::new().fg(theme.accent)),
-            ];
-            (spans, PANE_HINTS)
+        Focus::Pane(slot) => (doing("typing into", slot), PANE_HINTS),
+        Focus::Copy(slot) => {
+            let hints = copying.map_or(&[][..], |pane| copy_mode::hints(&pane.screen));
+            (doing("copying from", slot), hints)
         }
     };
     // Room left for "? keys" on the right.
@@ -971,6 +1104,7 @@ fn sidebar_hints(app: &App) -> &'static [(&'static str, &'static str)] {
     match run.map(|(run, _)| run.state()) {
         Some(RunState::AtGate) => GATE_HINTS,
         Some(RunState::Failed | RunState::Interrupted) => STOPPED_HINTS,
+        _ if app.zoomed() => ZOOMED_HINTS,
         _ => SIDEBAR_HINTS,
     }
 }
@@ -1571,6 +1705,62 @@ mod tests {
             "{}",
             text[11]
         );
+    }
+
+    #[test]
+    fn zoomed_the_pane_takes_the_sidebars_room_and_says_so() {
+        let mut app = App::new(None);
+        app.set_sessions(vec![
+            session("planner", State::Running),
+            session("other", State::Running),
+        ]);
+        app.on_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE));
+        let areas = Areas::of(&app, Rect::new(0, 0, 80, 24));
+        assert_eq!(areas.panes, [Rect::new(0, 1, 80, 22)]);
+        assert_eq!(screen_area(areas.panes[0]), Rect::new(0, 2, 80, 21));
+        assert_eq!(
+            hit(&areas, &app, 0, 5),
+            Hit::Pane {
+                slot: Slot::Selected,
+                cell: Some((3, 0)),
+            }
+        );
+
+        let text = screen_text(&app);
+        assert!(text[1].starts_with(" ❯ planner · zoomed "), "{}", text[1]);
+        assert!(!text.iter().any(|line| line.contains("other")));
+        assert!(text[11].contains("z unzoom"), "{}", text[11]);
+
+        // `/` brings the sidebar out over the pane.
+        app.on_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        let text = screen_text(&app);
+        assert!(text.iter().any(|line| line.contains("other")));
+    }
+
+    #[test]
+    fn in_copy_mode_the_footer_and_header_say_so() {
+        let mut app = App::new(None);
+        app.set_sessions(vec![session("planner", State::Running)]);
+        app.on_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
+        let text = screen_text(&app);
+        assert!(text[1].contains("planner · copy mode"), "{}", text[1]);
+        assert!(
+            text[11].starts_with(" copying from planner"),
+            "{}",
+            text[11]
+        );
+    }
+
+    #[test]
+    fn a_drag_keeps_to_the_edge_of_the_pane_it_started_in() {
+        let app = app_with_sessions(1);
+        let areas = Areas::new(Rect::new(0, 0, 80, 24), 0);
+        // The screen is at column 29, row 2, 51 by 21.
+        let nearest = |column, row| nearest_cell(&areas, &app, Slot::Selected, column, row);
+        assert_eq!(nearest(31, 3), Some((1, 2)));
+        assert_eq!(nearest(5, 0), Some((0, 0)));
+        assert_eq!(nearest(200, 200), Some((20, 50)));
+        assert_eq!(nearest_cell(&areas, &app, Slot::Split(0), 31, 3), None);
     }
 
     #[test]

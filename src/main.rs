@@ -4,6 +4,7 @@ mod attach;
 mod backlog;
 mod catalog;
 mod client;
+mod clipboard;
 mod codex;
 mod config;
 mod daemon;

@@ -1,10 +1,13 @@
 //! The pane's side of the selected session: a viewer of it, and the screen
-//! that viewer has drawn so far, history and all.
+//! that viewer has drawn so far, history and all, with copy mode over it
+//! while that's on.
 
 use super::Event;
+use super::copy_mode::{self, CopyMode};
 use crate::viewer::Viewer;
 use crate::vt;
 use anyhow::Result;
+use crossterm::event::KeyEvent;
 use std::path::Path;
 use std::sync::mpsc::Sender;
 use std::thread;
@@ -20,6 +23,8 @@ pub struct Pane {
     pub screen: vt::Screen,
     /// The session has ended: `screen` is the last it showed.
     pub ended: bool,
+    /// Copy mode, while it's on.
+    pub copy: Option<CopyMode>,
     viewer: Viewer,
 }
 
@@ -50,6 +55,7 @@ impl Pane {
             session_id: viewer.id.clone(),
             screen: vt::Screen::new(rows, cols),
             ended: false,
+            copy: None,
             viewer,
         })
     }
@@ -66,10 +72,51 @@ impl Pane {
     }
 
     /// Types into the session, which brings the pane back to live: what you
-    /// type shows there.
+    /// type shows there. What the mouse selected is let go.
     pub fn send_keys(&mut self, keys: &[u8]) {
         self.screen.scroll_to_live();
+        self.screen.clear_selection();
         let _ = self.viewer.send_keys(keys);
+    }
+
+    /// Turns copy mode on or off, to follow whether the keyboard is in it.
+    pub fn set_copying(&mut self, on: bool) {
+        match (on, self.copy.is_some()) {
+            (true, false) => {
+                self.screen.start_copying();
+                self.copy = Some(CopyMode::default());
+            }
+            (false, true) => {
+                self.screen.stop_copying();
+                self.copy = None;
+            }
+            _ => {}
+        }
+    }
+
+    /// A key in copy mode, which it turns on first if it isn't yet.
+    pub fn copy_key(&mut self, key: KeyEvent) -> copy_mode::Outcome {
+        self.set_copying(true);
+        let copy = self.copy.get_or_insert_default();
+        copy.on_key(&mut self.screen, key)
+    }
+
+    /// The mouse went down on the cell at `(row, col)`: where a selection
+    /// starts, if it drags, and where copy mode's cursor goes.
+    pub fn select_from(&mut self, cell: (u16, u16)) {
+        self.screen.select_from(cell);
+        if self.copy.is_some() {
+            self.screen.put_copy_cursor(cell);
+        }
+    }
+
+    /// The mouse dragged to the cell at `(row, col)`. In copy mode, its
+    /// cursor goes there too, and takes the selection's end on from there.
+    pub fn select_to(&mut self, cell: (u16, u16)) {
+        self.screen.select_to(cell);
+        if self.copy.is_some() {
+            self.screen.put_copy_cursor(cell);
+        }
     }
 
     /// How many rows back into the history the pane is showing, or 0 when
