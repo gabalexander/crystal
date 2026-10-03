@@ -95,6 +95,8 @@ you are and offers the keys that matter there.
 | `/` | find a session by typing a little of its name, project, branch or command |
 | `o` | open the pull request of the selected session's branch in your browser |
 | `i` | list the open issues of the selected session's project, and start an agent on one |
+| `d` | show what changed in the selected session's worktree: [the diff](#the-diff) |
+| `p` | find a file in the selected session's worktree and edit it: [the file finder](#the-file-finder) |
 | `?` | show every key, in the sidebar, in a pane, in a question and with the mouse |
 | `q` | quit; the sessions keep running |
 

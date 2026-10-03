@@ -4,7 +4,9 @@
 //! theme's colors tell the parts apart. Drawing only reads the state; it
 //! never changes it.
 
-use super::app::{App, Filter, Focus, Hit, Prompt, Question, Slot};
+use super::app::{App, Filter, Focus, Hit, Prompt, Question, Slot, View};
+use super::diff_view;
+use super::finder;
 use super::help;
 use super::issues;
 use super::pane::Pane;
@@ -39,6 +41,9 @@ pub struct Look<'a> {
 /// Where each part of the TUI goes on a screen of a given size.
 pub struct Areas {
     pub top: Rect,
+    /// Everything between the top bar and the footer: where an open view
+    /// goes, in place of the sidebar and the panes.
+    pub main: Rect,
     pub sidebar: Rect,
     /// The column with the rule between the sidebar and the panes.
     pub rule: Rect,
@@ -66,12 +71,92 @@ impl Areas {
         .areas(main);
         Areas {
             top,
+            main,
             sidebar,
             rule,
             panes: pane_areas(panes, 1 + splits),
             footer,
         }
     }
+}
+
+/// Where an open view's parts go: a header line across the top, then its
+/// list on the left, a rule, and the rest, its content, on the right.
+pub struct ViewAreas {
+    pub header: Rect,
+    pub list: Rect,
+    pub rule: Rect,
+    pub content: Rect,
+}
+
+/// Lays out `view` in `area`.
+pub fn view_areas(view: &View, area: Rect) -> ViewAreas {
+    let list_width = match view {
+        View::Diff(_) => diff_view::list_width(area.width),
+        View::Files(_) => finder::list_width(area.width),
+    };
+    let [header, body] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
+    let [list, rule, content] = Layout::horizontal([
+        Constraint::Length(list_width),
+        Constraint::Length(1),
+        Constraint::Min(0),
+    ])
+    .areas(body);
+    ViewAreas {
+        header,
+        list,
+        rule,
+        content,
+    }
+}
+
+/// A view's header line, `width` columns wide: its mark and `title` in the
+/// accent color, its `notes`, then a rule, and `right` muted on the right
+/// when it fits.
+pub fn view_header<'a>(
+    mark: &str,
+    title: &str,
+    notes: &[String],
+    right: &str,
+    look: &Look,
+    width: u16,
+) -> Line<'a> {
+    let theme = look.theme;
+    let mut spans = vec![
+        Span::raw(" "),
+        Span::styled(mark.to_string(), Style::new().fg(theme.accent)),
+        Span::raw(" "),
+        Span::styled(
+            title.to_string(),
+            Style::new().fg(theme.accent).add_modifier(Modifier::BOLD),
+        ),
+    ];
+    for note in notes {
+        spans.push(Span::styled(" · ", Style::new().fg(theme.muted)));
+        spans.push(Span::styled(note.clone(), Style::new().fg(theme.text)));
+    }
+    let left: usize = spans.iter().map(Span::width).sum();
+    let width = usize::from(width);
+    // A space, a few columns of rule, a space, the right side, a space.
+    let needed = left + 1 + 3 + 1 + right.chars().count() + 1;
+    let right_fits = needed <= width;
+    let right_width = if right_fits {
+        right.chars().count() + 2
+    } else {
+        0
+    };
+    let rule = width.saturating_sub(left + 1 + right_width);
+    spans.push(Span::raw(" "));
+    spans.push(Span::styled("─".repeat(rule), Style::new().fg(theme.rule)));
+    if right_fits {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            right.to_string(),
+            Style::new().fg(theme.muted),
+        ));
+        spans.push(Span::raw(" "));
+    }
+    Line::from(spans)
 }
 
 /// Shares `area` out evenly between `count` panes: side by side, a column
@@ -102,6 +187,19 @@ pub fn screen_area(pane: Rect) -> Rect {
 /// What's at `(column, row)` on a screen laid out as `areas`, for `app`.
 pub fn hit(areas: &Areas, app: &App, column: u16, row: u16) -> Hit {
     let at = |area: Rect| area.contains((column, row).into());
+    if let Some(view) = app.view() {
+        let parts = view_areas(view, areas.main);
+        if at(parts.list) {
+            return match view {
+                View::Diff(diff) => diff_view::list_hit(diff, parts.list, row),
+                View::Files(finder) => finder::list_hit(finder, parts.list, row),
+            };
+        }
+        if at(parts.content) {
+            return Hit::ViewContent;
+        }
+        return Hit::Elsewhere;
+    }
     if at(areas.sidebar) {
         return sidebar::hit(areas.sidebar, app, row);
     }
@@ -121,6 +219,15 @@ pub fn draw(frame: &mut Frame, app: &App, panes: &[Pane], look: &Look) {
     frame.render_widget(Block::new().style(look.theme.base()), frame.area());
     let areas = Areas::new(frame.area(), app.splits().len());
     draw_top_bar(frame, app, look, areas.top);
+    if let Some(view) = app.view() {
+        let parts = view_areas(view, areas.main);
+        match view {
+            View::Diff(diff) => diff_view::draw(frame, diff, look, &parts),
+            View::Files(files) => finder::draw(frame, files, look, &parts),
+        }
+        draw_view_footer(frame, app, view, look, areas.footer);
+        return;
+    }
     sidebar::draw(frame, app, look, areas.sidebar);
     draw_rule(frame, look, areas.rule);
     for (slot, area) in app.slots().into_iter().zip(&areas.panes) {
@@ -179,7 +286,7 @@ pub fn summary<'a>(sessions: &[SessionInfo], theme: &Theme) -> Line<'a> {
 }
 
 /// A thin vertical rule down `area`.
-fn draw_rule(frame: &mut Frame, look: &Look, area: Rect) {
+pub fn draw_rule(frame: &mut Frame, look: &Look, area: Rect) {
     let lines: Vec<Line> = (0..area.height).map(|_| Line::from("│")).collect();
     let rule = Paragraph::new(lines).style(Style::new().fg(look.theme.rule));
     frame.render_widget(rule, area);
@@ -351,7 +458,7 @@ fn right_sides(session: &SessionInfo) -> Vec<String> {
 }
 
 /// One line of text across the middle of `area`.
-fn draw_message(frame: &mut Frame, look: &Look, message: &str, area: Rect) {
+pub fn draw_message(frame: &mut Frame, look: &Look, message: &str, area: Rect) {
     let [_, middle, _] = Layout::vertical([
         Constraint::Fill(1),
         Constraint::Length(1),
@@ -385,6 +492,30 @@ fn draw_footer(frame: &mut Frame, app: &App, look: &Look, area: Rect) {
     }
 }
 
+/// The footer while a view is open: a notice, if there is one, or else the
+/// view's keys.
+fn draw_view_footer(frame: &mut Frame, app: &App, view: &View, look: &Look, area: Rect) {
+    let theme = look.theme;
+    if let Some(notice) = app.notice() {
+        let notice = Line::styled(format!(" {notice}"), Style::new().fg(theme.failed));
+        frame.render_widget(notice, area);
+        return;
+    }
+    let hints = match view {
+        View::Diff(diff) => diff_view::hints(diff),
+        View::Files(_) => finder::hints(),
+    };
+    let mut spans = vec![Span::raw(" ")];
+    for (key, does) in hints {
+        spans.push(Span::styled(key, Style::new().fg(theme.text)));
+        spans.push(Span::styled(
+            format!(" {does}  "),
+            Style::new().fg(theme.muted),
+        ));
+    }
+    frame.render_widget(Line::from(spans), area);
+}
+
 /// A yes-or-no question: the question in the accent color, the answers
 /// muted.
 fn question_line<'a>(question: &str, theme: &Theme) -> Line<'a> {
@@ -410,6 +541,8 @@ const SIDEBAR_HINTS: &[(&str, &str)] = &[
     ("w", "worktree"),
     ("u", "next"),
     ("/", "find"),
+    ("d", "diff"),
+    ("p", "files"),
 ];
 
 /// The keys while the issues view is open.

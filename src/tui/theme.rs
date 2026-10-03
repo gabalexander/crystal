@@ -35,6 +35,18 @@ pub struct Theme {
     pub ended: Color,
     /// A program that failed, and errors.
     pub failed: Color,
+    /// How many lines a diff adds, and the letter of a file it adds.
+    pub added: Color,
+    /// How many lines a diff removes, and the letter of a file it deletes.
+    pub removed: Color,
+    /// A line a diff adds: a green tint behind it, where a theme paints.
+    pub added_line: Style,
+    /// A line a diff removes: a red tint behind it.
+    pub removed_line: Style,
+    /// The words that changed inside an added line: the stronger green.
+    pub added_words: Style,
+    /// The words that changed inside a removed line: the stronger red.
+    pub removed_words: Style,
 }
 
 impl Theme {
@@ -74,6 +86,12 @@ impl Theme {
             running: Color::Rgb(124, 178, 142),
             ended: Color::Rgb(104, 112, 128),
             failed: Color::Rgb(240, 104, 112),
+            added: Color::Rgb(120, 220, 140),
+            removed: Color::Rgb(240, 104, 112),
+            added_line: Style::new().bg(Color::Rgb(22, 48, 36)),
+            removed_line: Style::new().bg(Color::Rgb(58, 26, 32)),
+            added_words: Style::new().bg(Color::Rgb(36, 92, 60)),
+            removed_words: Style::new().bg(Color::Rgb(112, 40, 52)),
         }
     }
 
@@ -94,6 +112,12 @@ impl Theme {
             running: Color::Rgb(70, 125, 92),
             ended: Color::Rgb(122, 126, 136),
             failed: Color::Rgb(196, 40, 52),
+            added: Color::Rgb(28, 135, 64),
+            removed: Color::Rgb(196, 40, 52),
+            added_line: Style::new().bg(Color::Rgb(226, 246, 232)),
+            removed_line: Style::new().bg(Color::Rgb(253, 232, 232)),
+            added_words: Style::new().bg(Color::Rgb(170, 230, 188)),
+            removed_words: Style::new().bg(Color::Rgb(248, 186, 186)),
         }
     }
 
@@ -116,6 +140,16 @@ impl Theme {
             running: Color::Gray,
             ended: Color::DarkGray,
             failed: Color::Red,
+            added: Color::Green,
+            removed: Color::Red,
+            // No tint can be picked without knowing the terminal's colors:
+            // the lines take the color, and changed words are reversed.
+            added_line: Style::new().fg(Color::Green),
+            removed_line: Style::new().fg(Color::Red),
+            added_words: Style::new()
+                .fg(Color::Green)
+                .add_modifier(Modifier::REVERSED),
+            removed_words: Style::new().fg(Color::Red).add_modifier(Modifier::REVERSED),
         }
     }
 
@@ -136,6 +170,14 @@ impl Theme {
             running: Color::Reset,
             ended: Color::Reset,
             failed: Color::Reset,
+            added: Color::Reset,
+            removed: Color::Reset,
+            // The `+` and `-` in front of a line say which it is; changed
+            // words are underlined.
+            added_line: Style::new(),
+            removed_line: Style::new(),
+            added_words: Style::new().add_modifier(Modifier::UNDERLINED),
+            removed_words: Style::new().add_modifier(Modifier::UNDERLINED),
         }
     }
 

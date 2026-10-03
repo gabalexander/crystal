@@ -4,6 +4,8 @@
 //! That keeps every state change testable on its own.
 
 use super::command_line;
+use super::diff_view::{self, Against, DiffView};
+use super::finder::Finder;
 use super::groups::{self, Row};
 use super::issues::IssuesView;
 use super::search;
@@ -49,8 +51,41 @@ pub enum Hit {
         slot: Slot,
         cell: Option<(u16, u16)>,
     },
+    /// A row of an open view's list, by its place in the whole list.
+    ViewList(usize),
+    /// The rest of an open view: the diff, or the file's preview.
+    ViewContent,
     /// The footer, or anywhere else.
     Elsewhere,
+}
+
+/// Something that takes the place of the sidebar and the panes until it's
+/// closed: the diff of a worktree, or the file finder.
+pub enum View {
+    Diff(DiffView),
+    Files(Finder),
+}
+
+/// What an open view's key asks for.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Outcome {
+    /// Nothing outside the view.
+    Stay,
+    Close,
+    /// Something for the event loop to do, like reading a diff.
+    Do(Action),
+    /// Close the view, and open this file, by its path from the top of the
+    /// view's worktree, in the user's editor.
+    Edit(String),
+}
+
+/// Something read off the event loop: still being read, read, or what went
+/// wrong.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Loading<T> {
+    Reading,
+    Read(T),
+    Failed(String),
 }
 
 /// Which way Tab goes round the panes: Tab forward, Shift+Tab back.
@@ -173,6 +208,27 @@ pub enum Action {
     /// Ask GitHub for the open issues of the project at this path, for the
     /// issues view that's now open.
     ListIssues(PathBuf),
+    /// Read the diff of the worktree at `dir`, off the event loop.
+    ReadDiff {
+        dir: PathBuf,
+        against: Against,
+    },
+    /// List the files of the worktree at this directory, off the event
+    /// loop.
+    ReadFiles(PathBuf),
+    /// Read the first lines of the file at `path`, from the top of the
+    /// worktree at `dir`, off the event loop.
+    ReadPreview {
+        dir: PathBuf,
+        path: String,
+    },
+    /// Open the file at `path`, from the top of the worktree at `dir`, in
+    /// the user's editor, as a new session called `name`.
+    Edit {
+        dir: PathBuf,
+        path: String,
+        name: String,
+    },
 }
 
 /// The sidebar narrowed to the sessions that match what's typed, while `/`
@@ -222,6 +278,8 @@ pub struct App {
     pull_requests: HashMap<PathBuf, Result<Vec<PullRequest>, String>>,
     /// The issues view, while it's open.
     issues: Option<IssuesView>,
+    /// The diff or the file finder, while one is open.
+    view: Option<View>,
 }
 
 impl App {
@@ -243,6 +301,7 @@ impl App {
             filter: None,
             pull_requests: HashMap::new(),
             issues: None,
+            view: None,
         }
     }
 
@@ -259,6 +318,49 @@ impl App {
     /// Whether the overlay listing every key is open.
     pub fn showing_keys(&self) -> bool {
         self.showing_keys
+    }
+
+    /// The diff or the file finder, while one is open.
+    pub fn view(&self) -> Option<&View> {
+        self.view.as_ref()
+    }
+
+    /// Takes a diff read for the diff view, if it's still the one it wants.
+    pub fn diff_read(
+        &mut self,
+        dir: &Path,
+        against: Against,
+        read: Result<diff_view::Read, String>,
+    ) {
+        if let Some(View::Diff(diff)) = &mut self.view {
+            diff.read_done(dir, against, read);
+        }
+    }
+
+    /// Takes the files listed for the file finder, if it's still open on
+    /// their worktree. Its first file's preview is to be read next.
+    pub fn files_read(&mut self, dir: &Path, files: Result<Vec<String>, String>) -> Option<Action> {
+        let Some(View::Files(finder)) = &mut self.view else {
+            return None;
+        };
+        finder.files_read(dir, files)
+    }
+
+    /// Takes a file's first lines, if the file finder still has it selected.
+    pub fn preview_read(&mut self, dir: &Path, path: &str, lines: Result<Vec<String>, String>) {
+        if let Some(View::Files(finder)) = &mut self.view {
+            finder.preview_read(dir, path, lines);
+        }
+    }
+
+    /// Tells an open view how big its list and the rest of it are drawn,
+    /// as `(rows, columns)`: what a page is, and whether side by side fits.
+    pub fn set_view_size(&mut self, list: (u16, u16), content: (u16, u16)) {
+        match &mut self.view {
+            Some(View::Diff(diff)) => diff.set_size(content),
+            Some(View::Files(finder)) => finder.set_size(list),
+            None => {}
+        }
     }
 
     pub fn notify(&mut self, notice: String) {
@@ -528,6 +630,10 @@ impl App {
 
     pub fn on_key(&mut self, key: KeyEvent) -> Option<Action> {
         self.notice = None;
+        // An open view has every key until it's closed.
+        if self.view.is_some() {
+            return self.on_view_key(key);
+        }
         // Any key closes the list of keys, and does nothing else: the key
         // that closes it may be one the user was only reading about.
         if self.showing_keys {
@@ -561,6 +667,13 @@ impl App {
     /// selects a session or hands a pane the keyboard, and the wheel moves
     /// the selection, or scrolls a pane through its history.
     pub fn on_mouse(&mut self, kind: MouseEventKind, hit: Hit) -> Option<Action> {
+        if let Some(view) = &mut self.view {
+            let outcome = match view {
+                View::Diff(diff) => diff.on_mouse(kind, hit),
+                View::Files(finder) => finder.on_mouse(kind, hit),
+            };
+            return self.follow(outcome);
+        }
         // A click closes the list of keys, like a key does.
         if self.showing_keys {
             if kind == MouseEventKind::Down(MouseButton::Left) {
@@ -636,6 +749,8 @@ impl App {
             KeyCode::Char('r') => self.ask_for_name(),
             KeyCode::Char('x') => self.confirm = Some(Confirm::Kill(self.selected()?.name.clone())),
             KeyCode::Char('u') => self.select_next_needing_user(),
+            KeyCode::Char('d') => return self.open_diff(),
+            KeyCode::Char('p') => return self.open_finder(),
             KeyCode::Char('?') => self.showing_keys = true,
             KeyCode::Char('/') => self.open_filter(),
             KeyCode::Char('o') => return self.open_pull_request(),
@@ -644,6 +759,85 @@ impl App {
             _ => {}
         }
         None
+    }
+
+    /// Opens the diff of the selected session's worktree, and asks for it
+    /// to be read.
+    fn open_diff(&mut self) -> Option<Action> {
+        let (dir, place) = self.selected_worktree()?;
+        let diff = DiffView::new(dir, place);
+        let read = diff.read();
+        self.view = Some(View::Diff(diff));
+        Some(read)
+    }
+
+    /// Opens the file finder on the selected session's worktree, and asks
+    /// for its files to be listed.
+    fn open_finder(&mut self) -> Option<Action> {
+        let (dir, place) = self.selected_worktree()?;
+        let finder = Finder::new(dir, place);
+        let read = finder.read();
+        self.view = Some(View::Files(finder));
+        Some(read)
+    }
+
+    /// The selected session's worktree, and its project and branch the way
+    /// a view's header names them: `payments ⎇ fix/login`. When it isn't in
+    /// one, the footer says so.
+    fn selected_worktree(&mut self) -> Option<(PathBuf, String)> {
+        let selected = self.selected()?;
+        let Some(worktree) = &selected.worktree else {
+            let notice = format!("{} isn't in a git repository", selected.name);
+            self.notify(notice);
+            return None;
+        };
+        let mark = if worktree.main { "⌂" } else { "⎇" };
+        let branch = worktree.branch.as_deref().unwrap_or("(detached)");
+        let place = format!("{} {mark} {branch}", worktree.project);
+        Some((worktree.path.clone(), place))
+    }
+
+    /// Keys while a view is open: they're all the view's.
+    fn on_view_key(&mut self, key: KeyEvent) -> Option<Action> {
+        let outcome = match self.view.as_mut()? {
+            View::Diff(diff) => diff.on_key(key),
+            View::Files(finder) => finder.on_key(key),
+        };
+        self.follow(outcome)
+    }
+
+    /// Does what an open view asked for.
+    fn follow(&mut self, outcome: Outcome) -> Option<Action> {
+        match outcome {
+            Outcome::Stay => None,
+            Outcome::Close => {
+                self.view = None;
+                None
+            }
+            Outcome::Do(action) => Some(action),
+            Outcome::Edit(path) => {
+                let Some(View::Files(finder)) = self.view.take() else {
+                    return None;
+                };
+                let name = self.free_name(&edit_name(&path));
+                Some(Action::Edit {
+                    dir: finder.dir,
+                    path,
+                    name,
+                })
+            }
+        }
+    }
+
+    /// `base`, or else `base-2`, `base-3`… whichever no session has yet.
+    fn free_name(&self, base: &str) -> String {
+        (1..)
+            .map(|n| match n {
+                1 => base.to_string(),
+                n => format!("{base}-{n}"),
+            })
+            .find(|name| self.position(name).is_none())
+            .unwrap()
     }
 
     /// Enter on a session: types into it while it runs, or, once it has
@@ -1096,6 +1290,16 @@ impl App {
             .iter()
             .position(|session| session.name == name)
     }
+}
+
+/// What a session editing the file at `path` is called: the file's name,
+/// with no spaces, which session names can't have.
+fn edit_name(path: &str) -> String {
+    let name = match Path::new(path).file_name() {
+        Some(name) => name.to_string_lossy().into_owned(),
+        None => path.to_string(),
+    };
+    name.replace(char::is_whitespace, "-")
 }
 
 #[cfg(test)]

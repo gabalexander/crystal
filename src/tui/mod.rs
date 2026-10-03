@@ -8,6 +8,10 @@
 
 mod app;
 mod command_line;
+mod diff;
+mod diff_view;
+mod finder;
+mod fuzzy;
 mod groups;
 mod help;
 mod issues;
@@ -29,6 +33,7 @@ use crate::{client, env, git};
 use anyhow::{Result, bail};
 use app::{Action, App, Focus, Hit, Place, Slot};
 use crossterm::event::{Event as TerminalEvent, KeyEvent, KeyEventKind, MouseEvent};
+use diff_view::Against;
 use pane::Pane;
 use ratatui::DefaultTerminal;
 use ratatui::layout::Rect;
@@ -87,6 +92,23 @@ pub enum Event {
     },
     /// Something to tell the user, from work done off the loop.
     Notice(String),
+    /// A worktree's diff, read for the diff view.
+    DiffRead {
+        dir: PathBuf,
+        against: Against,
+        read: Result<diff_view::Read, String>,
+    },
+    /// A worktree's files, listed for the file finder.
+    FilesRead {
+        dir: PathBuf,
+        files: Result<Vec<String>, String>,
+    },
+    /// The first lines of a file, for the file finder's preview.
+    PreviewRead {
+        dir: PathBuf,
+        path: String,
+        lines: Result<Vec<String>, String>,
+    },
 }
 
 pub fn run(socket: &Path) -> Result<()> {
@@ -198,6 +220,12 @@ impl Tui {
             self.screen = Rect::new(0, 0, size.width, size.height);
             let areas = ui::Areas::new(self.screen, self.app.splits().len());
             self.sync_panes(&areas);
+            if let Some(view) = self.app.view() {
+                let parts = ui::view_areas(view, areas.main);
+                let size = |area: Rect| (area.height, area.width);
+                self.app
+                    .set_view_size(size(parts.list), size(parts.content));
+            }
             let look = ui::Look {
                 theme: &self.theme,
                 now: seconds_since_epoch(),
@@ -279,15 +307,25 @@ impl Tui {
                     pane.ended = true;
                 }
             }
+            Event::DiffRead { dir, against, read } => self.app.diff_read(&dir, against, read),
+            Event::FilesRead { dir, files } => {
+                if let Some(action) = self.app.files_read(&dir, files) {
+                    self.carry_out(action);
+                }
+            }
+            Event::PreviewRead { dir, path, lines } => self.app.preview_read(&dir, &path, lines),
         }
     }
 
     fn on_key(&mut self, key: KeyEvent) {
-        let Some(action) = self.app.on_key(key) else {
-            return;
-        };
-        // A key that fails, say because its session has just gone, says
-        // why at the bottom rather than closing the TUI.
+        if let Some(action) = self.app.on_key(key) {
+            self.carry_out(action);
+        }
+    }
+
+    /// Performs `action`. One that fails, say because its session has just
+    /// gone, says why at the bottom rather than closing the TUI.
+    fn carry_out(&mut self, action: Action) {
         if let Err(err) = self.perform(action) {
             self.app.notify(format!("{err:#}"));
         }
@@ -299,11 +337,8 @@ impl Tui {
         if self.pass_to_program(&mouse, hit) {
             return;
         }
-        let Some(action) = self.app.on_mouse(mouse.kind, hit) else {
-            return;
-        };
-        if let Err(err) = self.perform(action) {
-            self.app.notify(format!("{err:#}"));
+        if let Some(action) = self.app.on_mouse(mouse.kind, hit) {
+            self.carry_out(action);
         }
     }
 
@@ -344,7 +379,30 @@ impl Tui {
             Action::Quit => self.quitting = true,
             Action::Start { place, command } => {
                 let cwd = directory_for(place)?;
-                self.start_session(cwd, command)?;
+                self.start_session(None, cwd, command)?;
+            }
+            Action::ReadDiff { dir, against } => {
+                self.read_in_background(move || {
+                    let read = diff_view::read(&dir, against);
+                    Event::DiffRead { dir, against, read }
+                });
+            }
+            Action::ReadFiles(dir) => {
+                self.read_in_background(move || {
+                    let files = finder::read_files(&dir);
+                    Event::FilesRead { dir, files }
+                });
+            }
+            Action::ReadPreview { dir, path } => {
+                self.read_in_background(move || {
+                    let lines = finder::read_preview(&dir, &path);
+                    Event::PreviewRead { dir, path, lines }
+                });
+            }
+            Action::Edit { dir, path, name } => {
+                let mut command = editor()?;
+                command.push(path);
+                self.start_session(Some(name), dir, command)?;
             }
             Action::Kill(name) => {
                 client::ask(&self.socket, &Request::Kill { name }, false)?;
@@ -416,13 +474,28 @@ impl Tui {
     }
 
     /// Starts `command` in a new session in `cwd`, or the user's shell when
-    /// it's empty, then selects the session and hands it the keyboard.
-    fn start_session(&mut self, cwd: PathBuf, command: Vec<String>) -> Result<()> {
-        let name = client::new_session(&self.socket, None, cwd, command)?;
+    /// it's empty, called `name` or after its program, then selects the
+    /// session and hands it the keyboard.
+    fn start_session(
+        &mut self,
+        name: Option<String>,
+        cwd: PathBuf,
+        command: Vec<String>,
+    ) -> Result<()> {
+        let name = client::new_session(&self.socket, name, cwd, command)?;
         self.refresh_sessions()?;
         self.app.select(&name);
         self.app.type_into_selected();
         Ok(())
+    }
+
+    /// Runs `read` on a thread of its own, since git and the disk can keep
+    /// it a while, and hands what it read back to the loop as an event.
+    fn read_in_background(&self, read: impl FnOnce() -> Event + Send + 'static) {
+        let events = self.events.clone();
+        thread::spawn(move || {
+            let _ = events.send(read());
+        });
     }
 
     /// Asks for the list now, rather than waiting for the next poll, so a
@@ -505,6 +578,23 @@ fn directory_for(place: Place) -> Result<PathBuf> {
             git::add_worktree(&base, &branch)
         }
     }
+}
+
+/// The user's editor, as a command line to put a file's path after:
+/// `$EDITOR`, which may carry its own arguments, like `code --wait`, or
+/// else `vi`.
+fn editor() -> Result<Vec<String>> {
+    let editor = std::env::var("EDITOR").unwrap_or_default();
+    let editor = if editor.trim().is_empty() {
+        "vi".to_string()
+    } else {
+        editor
+    };
+    let command = command_line::parse(&editor).map_err(|err| anyhow::anyhow!("$EDITOR: {err}"))?;
+    if command.is_empty() {
+        bail!("$EDITOR is empty");
+    }
+    Ok(command)
 }
 
 fn seconds_since_epoch() -> u64 {

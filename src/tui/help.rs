@@ -54,6 +54,8 @@ pub const KEYS: &[Key] = &[
     sidebar("/", "find a session"),
     sidebar("o", "open its pull request"),
     sidebar("i", "its project's issues"),
+    sidebar("d", "diff of its worktree"),
+    sidebar("p", "find a file to edit"),
     sidebar("?", "show these keys"),
     sidebar("q", "quit; sessions keep on"),
     in_pane("Ctrl+\\", "back to the sidebar"),

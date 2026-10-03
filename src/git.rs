@@ -1,7 +1,8 @@
 //! What crystal needs from git: which project and worktree a directory is
-//! in, which branch that worktree is on, and making and removing worktrees.
-//! It runs the `git` command rather than using a library, so it behaves
-//! exactly like the git the user runs.
+//! in, which branch that worktree is on, making and removing worktrees, and
+//! what changed in one, for the diff and the file finder. It runs the `git`
+//! command rather than using a library, so it behaves exactly like the git
+//! the user runs.
 
 use crate::protocol::Worktree;
 use anyhow::{Context, Result, bail};
@@ -107,6 +108,100 @@ pub fn remove_worktree(path: &Path) -> Result<()> {
         &["worktree", "remove", &path.to_string_lossy()],
     )?;
     Ok(())
+}
+
+/// What `git diff` is asked for every patch crystal reads: no colors, no
+/// diff program of the user's, renames found, and the usual `a/` and `b/`
+/// in front of paths whatever the user's config says, so that the patch
+/// always reads the same way. Paths come as they are, not quoted.
+const PATCH: &[&str] = &[
+    "-c",
+    "core.quotePath=false",
+    "diff",
+    "--no-color",
+    "--no-ext-diff",
+    "--find-renames",
+    "--src-prefix=a/",
+    "--dst-prefix=b/",
+];
+
+/// The changes in the worktree at `dir` that aren't committed yet, staged
+/// or not, as a patch against its last commit. Files git doesn't know about
+/// yet aren't in it: see [`untracked_files`].
+pub fn uncommitted_patch(dir: &Path) -> Result<String> {
+    git(dir, &[PATCH, &["HEAD"]].concat())
+}
+
+/// The changes committed on the branch at `dir` since `commit`, as a patch.
+pub fn patch_since(dir: &Path, commit: &str) -> Result<String> {
+    git(dir, &[PATCH, &[commit, "HEAD"]].concat())
+}
+
+/// The files in the worktree at `dir` that git doesn't track yet and that
+/// aren't ignored, by their paths from its top.
+pub fn untracked_files(dir: &Path) -> Result<Vec<String>> {
+    let args = [
+        "-c",
+        "core.quotePath=false",
+        "ls-files",
+        "--others",
+        "--exclude-standard",
+    ];
+    Ok(lines(&git(dir, &args)?))
+}
+
+/// Every file in the worktree at `dir` that git tracks, or would: the ones
+/// it knows and the new ones that aren't ignored.
+pub fn files(dir: &Path) -> Result<Vec<String>> {
+    let args = [
+        "-c",
+        "core.quotePath=false",
+        "ls-files",
+        "--cached",
+        "--others",
+        "--exclude-standard",
+    ];
+    let mut files = lines(&git(dir, &args)?);
+    // A file deleted but not committed yet is still known to git.
+    files.retain(|file| dir.join(file).exists());
+    Ok(files)
+}
+
+/// Where the branch at `dir` started: the name of the repository's default
+/// branch, and the commit the two have in common.
+pub fn branch_start(dir: &Path) -> Result<(String, String)> {
+    let default = default_branch(dir)?;
+    let commit = git(dir, &["merge-base", &default, "HEAD"])?;
+    Ok((default, commit.trim().to_string()))
+}
+
+/// The branch the repository's work goes back into: `origin`'s, when the
+/// clone knows which that is, or else `main` or `master`.
+fn default_branch(dir: &Path) -> Result<String> {
+    let origin_head = [
+        "symbolic-ref",
+        "--quiet",
+        "--short",
+        "refs/remotes/origin/HEAD",
+    ];
+    if let Ok(origin) = git(dir, &origin_head) {
+        return Ok(origin.trim().to_string());
+    }
+    for name in ["main", "master"] {
+        if branch_exists(dir, name) {
+            return Ok(name.to_string());
+        }
+    }
+    bail!("there's no branch to compare with: no origin/HEAD, main or master")
+}
+
+/// The lines git printed, without blank ones.
+fn lines(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(String::from)
+        .collect()
 }
 
 /// Where a new worktree for `branch` goes: beside the project, in a

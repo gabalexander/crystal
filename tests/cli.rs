@@ -3210,3 +3210,139 @@ fn i_lists_the_issues_and_enter_starts_a_session_for_one() {
     tui.type_keys("\x1b");
     tui.hides("new session:");
 }
+
+/// A repository with work in it, the way an agent leaves one: on `main`, a
+/// refund function and some notes; on the branch `fee`, one commit that
+/// changes the refund; and, not committed yet, a line added to the notes
+/// and a new file git doesn't know about.
+fn repo_with_work(dir: &Path) -> PathBuf {
+    let repo = git_repo(dir, "app");
+    std::fs::write(
+        repo.join("refund.rs"),
+        "fn refund(order: &Order) {\n    let total = order.total;\n    ledger.write(total);\n}\n",
+    )
+    .unwrap();
+    std::fs::write(repo.join("notes.md"), "# Notes\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "refunds"]);
+
+    git(&repo, &["checkout", "-q", "-b", "fee"]);
+    std::fs::write(
+        repo.join("refund.rs"),
+        "fn refund(order: &Order) {\n    let total = order.total - order.fee;\n    ledger.write(total);\n}\n",
+    )
+    .unwrap();
+    git(&repo, &["commit", "-q", "-am", "take the fee off"]);
+
+    std::fs::write(repo.join("notes.md"), "# Notes\n- ask about fees\n").unwrap();
+    std::fs::write(repo.join("todo.txt"), "write the tests\n").unwrap();
+    repo
+}
+
+#[test]
+fn d_shows_what_changed_in_the_selected_sessions_worktree() {
+    let crystal = Crystal::new();
+    let repo = repo_with_work(crystal.dir.path());
+    crystal.ok(&[
+        "new",
+        "-n",
+        "agent",
+        "-c",
+        repo.to_str().unwrap(),
+        "sleep",
+        "30",
+    ]);
+
+    let mut tui = crystal.tui();
+    tui.shows("agent");
+    tui.type_keys("d");
+    tui.shows("uncommitted changes · 2 files +2 −0");
+    // The notes' new line, and the file git doesn't know about yet.
+    tui.shows("notes.md");
+    tui.shows("todo.txt");
+    tui.shows("+ - ask about fees");
+
+    // The branch, the way its pull request would read.
+    tui.type_keys("b");
+    tui.shows("the branch since main · 1 file +1 −1");
+    tui.shows("refund.rs");
+    tui.shows("order.fee");
+    tui.hides("todo.txt");
+
+    tui.type_keys("\x1b");
+    tui.hides("the branch since main");
+    tui.shows("? keys");
+}
+
+#[test]
+fn v_puts_the_old_line_beside_its_new_version() {
+    let crystal = Crystal::new();
+    let repo = repo_with_work(crystal.dir.path());
+    crystal.ok(&[
+        "new",
+        "-n",
+        "agent",
+        "-c",
+        repo.to_str().unwrap(),
+        "sleep",
+        "30",
+    ]);
+
+    let mut tui = crystal.tui();
+    tui.shows("agent");
+    tui.type_keys("d");
+    tui.shows("uncommitted changes");
+    tui.type_keys("b");
+    tui.shows("refund.rs");
+    // 80 columns is too narrow for two files side by side.
+    tui.type_keys("v");
+    tui.shows("too narrow for side by side");
+
+    // Beside the list of files, 180 columns leave room.
+    tui.resize(30, 180);
+    tui.hides("too narrow for side by side");
+    eventually("the old and new lines share a row", || {
+        tui.text()
+            .lines()
+            .any(|row| row.contains("order.total;") && row.contains("order.fee;"))
+    });
+}
+
+#[test]
+fn p_finds_a_file_and_opens_it_in_the_editor() {
+    let crystal = Crystal::new();
+    let repo = repo_with_work(crystal.dir.path());
+    crystal.ok(&[
+        "new",
+        "-n",
+        "agent",
+        "-c",
+        repo.to_str().unwrap(),
+        "sleep",
+        "30",
+    ]);
+    // An editor that notes the file it was asked to open.
+    let editor = crystal.dir.path().join("editor");
+    let edited = crystal.dir.path().join("edited");
+    script(&editor, "printf '%s\\n' \"$1\" > \"$EDITED\"\nsleep 30\n");
+
+    let mut tui = crystal.attach_with_env(
+        &[],
+        &[
+            ("EDITOR", editor.to_str().unwrap()),
+            ("EDITED", edited.to_str().unwrap()),
+        ],
+    );
+    tui.shows("agent");
+    tui.type_keys("p");
+    tui.shows("find a file · 3 files");
+    tui.type_keys("rfnd");
+    // The match, and the start of the file beside it.
+    tui.shows("refund.rs");
+    tui.shows("fn refund(order: &Order) {");
+    tui.hides("notes.md");
+
+    tui.type_keys("\r");
+    assert_eq!(written(&edited), "refund.rs\n");
+    tui.shows("typing into refund.rs");
+}
