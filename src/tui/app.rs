@@ -27,9 +27,9 @@ use crate::keys;
 use crate::profile::{self, Profile};
 use crate::protocol::{Activity, Backlog, SessionInfo, State, TaskSpec, Worktree};
 use crate::shell;
-use crate::{backlog, plugins, tasks};
+use crate::{backlog, names, plugins, tasks};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// Where a pane sits beside the sidebar: the one that follows the
@@ -129,10 +129,14 @@ pub enum Place {
     /// In this directory, or the TUI's own when it's `None`.
     Directory(Option<PathBuf>),
     /// In a new worktree on `branch`, made in the repository at `base`, or
-    /// the TUI's own directory's when that's `None`.
+    /// the TUI's own directory's when that's `None`. A branch that exists
+    /// already is checked out there, unless crystal `made_up` its name:
+    /// then it's always a new branch, `branch-2` or the next number that's
+    /// free when `branch` is taken.
     NewWorktree {
         branch: String,
         base: Option<PathBuf>,
+        made_up: bool,
     },
 }
 
@@ -168,10 +172,12 @@ pub enum Confirm {
     Kill(String),
     /// Start this ended session's command again.
     Respawn(String),
-    /// Remove the linked worktree at `path`, which is on `branch`.
+    /// Remove the linked worktree at `path`, which is on `branch`: with
+    /// `force`, though it has changes not committed, which go with it.
     RemoveWorktree {
         path: PathBuf,
         branch: String,
+        force: bool,
     },
     /// Close the tab in front, tab `number`, and kill the sessions in it.
     CloseTab {
@@ -186,7 +192,16 @@ impl Confirm {
         match self {
             Confirm::Kill(name) => format!("kill {name}? y/n"),
             Confirm::Respawn(name) => format!("start {name} again? y/n"),
-            Confirm::RemoveWorktree { branch, .. } => format!("remove worktree {branch}? y/n"),
+            Confirm::RemoveWorktree {
+                branch,
+                force: false,
+                ..
+            } => format!("remove worktree {branch}? y/n"),
+            Confirm::RemoveWorktree {
+                branch,
+                force: true,
+                ..
+            } => format!("{branch} has uncommitted changes: remove it and lose them? y/n"),
             Confirm::CloseTab { number, sessions } => {
                 let count = sessions.len();
                 let noun = if count == 1 { "session" } else { "sessions" };
@@ -200,7 +215,15 @@ impl Confirm {
         match self {
             Confirm::Kill(name) => Action::Kill(name),
             Confirm::Respawn(name) => Action::Respawn(name),
-            Confirm::RemoveWorktree { path, .. } => Action::RemoveWorktree(path),
+            Confirm::RemoveWorktree {
+                path,
+                branch,
+                force,
+            } => Action::RemoveWorktree {
+                path,
+                branch,
+                force,
+            },
             Confirm::CloseTab { sessions, .. } => Action::KillAll(sessions),
         }
     }
@@ -263,8 +286,13 @@ pub enum Action {
     },
     /// Start this ended session's command again.
     Respawn(String),
-    /// Remove the linked worktree at this path.
-    RemoveWorktree(PathBuf),
+    /// Remove the linked worktree at `path`, which is on `branch`: with
+    /// `force`, though it has changes not committed.
+    RemoveWorktree {
+        path: PathBuf,
+        branch: String,
+        force: bool,
+    },
     /// Send the key to the session in the pane at `to`.
     Type {
         to: Slot,
@@ -364,7 +392,7 @@ pub enum Action {
     /// `replacing`, or as a new one.
     SaveProfile {
         replacing: Option<String>,
-        profile: Profile,
+        profile: Box<Profile>,
     },
     /// Take the profile with this name out of the config file.
     DeleteProfile(String),
@@ -436,6 +464,9 @@ pub struct App {
     /// Each project's linked worktrees, by its main worktree, as git last
     /// listed them. Those with no sessions stay in the sidebar.
     worktrees: HashMap<PathBuf, Vec<Worktree>>,
+    /// The worktrees git is removing, off the loop, by their directories:
+    /// their lines say so, and `W` leaves them be until git is done.
+    removing: HashSet<PathBuf>,
     /// The question on the footer line, while one is being answered.
     prompt: Option<Prompt>,
     /// The new-session panel, while it's open.
@@ -540,6 +571,7 @@ impl App {
             selected: 0,
             on_worktree: None,
             worktrees: HashMap::new(),
+            removing: HashSet::new(),
             prompt: None,
             launcher: None,
             agents: Vec::new(),
@@ -902,13 +934,38 @@ impl App {
         self.keep_selection_on_a_row();
     }
 
+    /// Asks again before removing the worktree at `path`, on `branch`,
+    /// which git found changes not committed in: a yes forces it, and they
+    /// go with it. Until then, git isn't removing it.
+    pub fn ask_to_force_removal(&mut self, path: PathBuf, branch: String) {
+        self.removing.remove(&path);
+        self.confirm = Some(Confirm::RemoveWorktree {
+            path,
+            branch,
+            force: true,
+        });
+    }
+
     /// The worktree at `path` has been removed: it leaves the sidebar now,
     /// rather than when git is next asked.
     pub fn worktree_removed(&mut self, path: &Path) {
+        self.removing.remove(path);
         for linked in self.worktrees.values_mut() {
             linked.retain(|worktree| worktree.path != path);
         }
         self.keep_selection_on_a_row();
+    }
+
+    /// git didn't remove the worktree at `path`, for `reason`: it stays,
+    /// and can be asked about again.
+    pub fn worktree_not_removed(&mut self, path: &Path, reason: String) {
+        self.removing.remove(path);
+        self.notify(reason);
+    }
+
+    /// Whether git is removing the worktree at `path`.
+    pub fn removing(&self, path: &Path) -> bool {
+        self.removing.contains(path)
     }
 
     /// The linked worktree with no sessions the selection is on, if it's
@@ -1432,6 +1489,11 @@ impl App {
             if matches!(confirm, Confirm::CloseTab { .. }) {
                 self.close_tab_in_front();
             }
+            // git removes a worktree off the loop; its line says so until
+            // it's done.
+            if let Confirm::RemoveWorktree { path, .. } = &confirm {
+                self.removing.insert(path.clone());
+            }
             return Some(confirm.action());
         }
         // A digit or `t` says which tab the session goes to; any other key
@@ -1880,10 +1942,8 @@ impl App {
     fn ask_to_remove_worktree(&mut self) {
         if let Some(worktree) = self.selected_empty_worktree() {
             let branch = worktree.branch.as_deref().unwrap_or("(detached)");
-            self.confirm = Some(Confirm::RemoveWorktree {
-                path: worktree.path.clone(),
-                branch: branch.to_string(),
-            });
+            let (path, branch) = (worktree.path.clone(), branch.to_string());
+            self.confirm_removal(path, branch);
             return;
         }
         let Some(selected) = self.selected() else {
@@ -1910,13 +1970,24 @@ impl App {
             .map(|session| session.name.as_str())
             .collect();
         if running.is_empty() {
-            self.confirm = Some(Confirm::RemoveWorktree {
-                path: worktree.path,
-                branch,
-            });
+            self.confirm_removal(worktree.path, branch);
         } else {
             let notice = format!("{} still running in {branch}", running.join(", "));
             self.notify(notice);
+        }
+    }
+
+    /// Asks before removing the worktree at `path`, on `branch`, unless git
+    /// is removing it already.
+    fn confirm_removal(&mut self, path: PathBuf, branch: String) {
+        if self.removing(&path) {
+            self.notify(format!("already removing {branch}"));
+        } else {
+            self.confirm = Some(Confirm::RemoveWorktree {
+                path,
+                branch,
+                force: false,
+            });
         }
     }
 
@@ -2246,6 +2317,7 @@ impl App {
             history: self.memory.tasks.clone(),
             codex_models: self.codex_models.clone().unwrap_or_default(),
             background: self.tasks_on,
+            branch: names::random(),
         }
     }
 
@@ -3451,7 +3523,7 @@ mod tests {
             press(&mut app, KeyCode::Enter),
             Some(Action::SaveProfile {
                 replacing: Some("review".into()),
-                profile: reviewer.clone()
+                profile: Box::new(reviewer.clone())
             })
         );
         // The event loop wrote it, and read the file again.
@@ -3513,13 +3585,19 @@ mod tests {
     }
 
     #[test]
-    fn w_opens_the_panel_on_a_new_worktree_named_after_the_task() {
+    fn w_opens_the_panel_on_a_new_worktree_with_a_made_up_name() {
         let mut app = with_agents(&["claude"], vec![in_project("agent", "app")]);
         press(&mut app, KeyCode::Char('w'));
         type_text(&mut app, "fix typo");
+        let branch = app.launcher().unwrap().branch_name();
+        assert!(
+            matches!(branch.split_once('-'), Some((a, b)) if !a.is_empty() && !b.is_empty()),
+            "{branch}"
+        );
         let place = Place::NewWorktree {
-            branch: "fix-typo".into(),
+            branch,
             base: Some(PathBuf::from("/code/app")),
+            made_up: true,
         };
         assert_eq!(
             press(&mut app, KeyCode::Enter),
@@ -3533,8 +3611,9 @@ mod tests {
         press(&mut app, KeyCode::Char('w'));
         type_text(&mut app, "feat");
         let place = Place::NewWorktree {
-            branch: "feat".into(),
+            branch: app.launcher().unwrap().branch_name(),
             base: None,
+            made_up: true,
         };
         assert_eq!(
             press(&mut app, KeyCode::Enter),
@@ -3715,6 +3794,7 @@ mod tests {
         let removal = Confirm::RemoveWorktree {
             path: PathBuf::from("/code/app.worktrees/fix"),
             branch: "fix".into(),
+            force: false,
         };
         assert_eq!(app.confirm(), Some(&removal));
         assert_eq!(
@@ -3723,8 +3803,38 @@ mod tests {
         );
         assert_eq!(
             press(&mut app, KeyCode::Char('y')),
-            Some(Action::RemoveWorktree("/code/app.worktrees/fix".into()))
+            Some(removal_of("fix", false))
         );
+    }
+
+    /// Removing the worktree of app on `branch`, forced or not.
+    fn removal_of(branch: &str, force: bool) -> Action {
+        Action::RemoveWorktree {
+            path: PathBuf::from(format!("/code/app.worktrees/{branch}")),
+            branch: branch.into(),
+            force,
+        }
+    }
+
+    #[test]
+    fn a_worktree_with_changes_is_asked_about_again_before_it_is_forced() {
+        let mut app = App::new(None);
+        app.set_sessions(vec![in_worktree("fixer", "fix", State::Exited { code: 0 })]);
+        app.select("fixer");
+        // The event loop found changes not committed after the first yes.
+        app.ask_to_force_removal("/code/app.worktrees/fix".into(), "fix".into());
+        assert_eq!(
+            app.confirm().map(Confirm::question).as_deref(),
+            Some("fix has uncommitted changes: remove it and lose them? y/n")
+        );
+        assert_eq!(
+            press(&mut app, KeyCode::Char('y')),
+            Some(removal_of("fix", true))
+        );
+
+        app.ask_to_force_removal("/code/app.worktrees/fix".into(), "fix".into());
+        assert_eq!(press(&mut app, KeyCode::Char('n')), None);
+        assert_eq!(app.confirm(), None);
     }
 
     #[test]
@@ -3817,11 +3927,85 @@ mod tests {
         );
         assert_eq!(
             press(&mut app, KeyCode::Char('y')),
-            Some(Action::RemoveWorktree("/code/app.worktrees/old".into()))
+            Some(removal_of("old", false))
         );
         app.worktree_removed(Path::new("/code/app.worktrees/old"));
         assert!(!shows_empty_worktree(&app));
         assert_eq!(selected_name(&app), Some("planner"));
+    }
+
+    #[test]
+    fn a_worktree_stays_while_git_removes_it_and_isn_t_asked_about_twice() {
+        let mut app = app_with_an_empty_worktree();
+        let old = Path::new("/code/app.worktrees/old");
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('W'));
+        assert!(!app.removing(old), "not until it's a yes");
+        press(&mut app, KeyCode::Char('y'));
+        assert!(app.removing(old));
+        assert!(shows_empty_worktree(&app), "it's there until git is done");
+        assert_eq!(empty_branch(&app), Some("old"));
+
+        press(&mut app, KeyCode::Char('W'));
+        assert_eq!(app.confirm(), None);
+        assert_eq!(app.notice(), Some("already removing old"));
+
+        app.worktree_removed(old);
+        assert!(!app.removing(old));
+        assert!(!shows_empty_worktree(&app));
+    }
+
+    #[test]
+    fn a_worktree_git_wouldn_t_remove_can_be_asked_about_again() {
+        let mut app = app_with_an_empty_worktree();
+        let old = Path::new("/code/app.worktrees/old");
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('W'));
+        press(&mut app, KeyCode::Char('y'));
+        app.worktree_not_removed(old, "'old' contains modified or untracked files".into());
+        assert!(!app.removing(old));
+        assert!(shows_empty_worktree(&app));
+        assert_eq!(
+            app.notice(),
+            Some("'old' contains modified or untracked files")
+        );
+
+        press(&mut app, KeyCode::Char('W'));
+        assert_eq!(
+            app.confirm().map(Confirm::question).as_deref(),
+            Some("remove worktree old? y/n")
+        );
+    }
+
+    #[test]
+    fn a_worktree_found_with_changes_isn_t_being_removed_until_it_s_forced() {
+        let mut app = app_with_an_empty_worktree();
+        let old = Path::new("/code/app.worktrees/old");
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('W'));
+        press(&mut app, KeyCode::Char('y'));
+        assert!(app.removing(old));
+        // git found changes not committed, off the loop.
+        app.ask_to_force_removal(old.into(), "old".into());
+        assert!(!app.removing(old));
+        assert_eq!(
+            press(&mut app, KeyCode::Char('y')),
+            Some(Action::RemoveWorktree {
+                path: old.into(),
+                branch: "old".into(),
+                force: true,
+            })
+        );
+        assert!(app.removing(old));
+    }
+
+    #[test]
+    fn no_to_removing_a_worktree_leaves_it_be() {
+        let mut app = app_with_an_empty_worktree();
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('W'));
+        assert_eq!(press(&mut app, KeyCode::Char('n')), None);
+        assert!(!app.removing(Path::new("/code/app.worktrees/old")));
     }
 
     #[test]
@@ -5186,6 +5370,7 @@ mod tests {
             Place::NewWorktree {
                 branch: "42-fix-login-redirect".into(),
                 base: Some(PathBuf::from("/code/app")),
+                made_up: false,
             }
         );
         assert_eq!(command[0], "claude");

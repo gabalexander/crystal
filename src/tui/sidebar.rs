@@ -140,9 +140,10 @@ fn row_line<'a>(app: &'a App, row: &Row, look: &Look, width: u16, selected: bool
         Row::OutsideGit => heading("outside git", Style::new().fg(theme.muted), look, width),
         Row::Worktree {
             project,
+            path,
             branch,
             main,
-        } => worktree_line(app, project, branch.as_deref(), *main, theme, width),
+        } => worktree_line(app, project, path, branch.as_deref(), *main, theme, width),
         Row::Directory(dir) => {
             let dir = shell::home_relative(dir);
             let room = usize::from(width).saturating_sub(WORKTREE_INDENT.len());
@@ -341,11 +342,12 @@ fn task_line<'a>(session: &SessionInfo, theme: &Theme, width: u16) -> Line<'a> {
 
 /// A worktree's line: its mark and branch, and on the right its pull
 /// request when GitHub knows of one, `#57` and a mark for what matters most
-/// about it. Short of room, the mark goes first, then the number, before
-/// the branch is cut.
+/// about it, or `removing…` while git removes it. Short of room, the mark
+/// goes first, then the number, before the branch is cut.
 fn worktree_line<'a>(
     app: &App,
     project: &Path,
+    path: &Path,
     branch: Option<&str>,
     main: bool,
     theme: &Theme,
@@ -355,10 +357,18 @@ fn worktree_line<'a>(
     let name = branch.unwrap_or("(detached)");
     // The indent and the mark before the branch; a space at the end.
     let room = usize::from(width).saturating_sub(WORKTREE_INDENT.len() + 2 + 1);
-    let pull_request = branch.and_then(|branch| app.pull_request(project, branch));
-    let right = pull_request
-        .map(|pull_request| pull_request_spans(pull_request, theme))
-        .unwrap_or_default()
+    let forms = if app.removing(path) {
+        vec![vec![Span::styled(
+            "removing…",
+            Style::new().fg(theme.muted),
+        )]]
+    } else {
+        let pull_request = branch.and_then(|branch| app.pull_request(project, branch));
+        pull_request
+            .map(|pull_request| pull_request_spans(pull_request, theme))
+            .unwrap_or_default()
+    };
+    let right = forms
         .into_iter()
         .find(|spans| name.chars().count() + 1 + width_of(spans) <= room)
         .unwrap_or_default();
@@ -710,6 +720,38 @@ mod tests {
         let zsh = session("zsh-2", Front::Shell { name: "zsh".into() });
         assert_eq!(name_color(&zsh), Some(theme.muted));
         assert_eq!(name_color(&session("claude", claude())), Some(theme.text));
+    }
+
+    #[test]
+    fn a_worktree_git_is_removing_says_so_on_its_line() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let theme = Theme::new(crate::config::ThemeName::Dark, false);
+        let project = Path::new("/code/app");
+        let path = Path::new("/code/app.worktrees/old");
+        // An agent that has ended in the worktree, which `W` removes.
+        let ended = SessionInfo {
+            state: crate::protocol::State::Exited { code: 0 },
+            worktree: Some(crate::protocol::Worktree {
+                project: "app".into(),
+                project_path: project.into(),
+                path: path.into(),
+                main: false,
+                branch: Some("old".into()),
+            }),
+            ..session("fixer", claude())
+        };
+        let mut app = App::new(None);
+        app.set_sessions(vec![ended]);
+        let line = |app: &App| worktree_line(app, project, path, Some("old"), false, &theme, 28);
+        assert_eq!(line(&app).to_string().trim_end(), "   ⎇ old");
+
+        for key in ['W', 'y'] {
+            app.on_key(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE));
+        }
+        assert!(app.removing(path));
+        let removing = line(&app);
+        assert_eq!(removing.width(), 27);
+        assert!(removing.to_string().ends_with("old          removing…"));
     }
 
     #[test]

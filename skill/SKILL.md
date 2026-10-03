@@ -147,7 +147,8 @@ crystal kill reviewer
 crystal worktree rm fix/login
 ```
 
-`worktree rm` refuses while a session still runs there, and leaves uncommitted changes to git's own refusal.
+`worktree rm` refuses while a session still runs there, and when the worktree has uncommitted changes.
+`--force` removes it with them, and they're lost: use it only when the user says so.
 
 ## Remember what you learned
 

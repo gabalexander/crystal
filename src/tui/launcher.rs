@@ -31,9 +31,6 @@ const HISTORY_LENGTH: usize = 100;
 /// The most rows the task box grows to before it scrolls.
 const TASK_ROWS: usize = 4;
 
-/// The longest a branch named after a task gets.
-const BRANCH_LENGTH: usize = 40;
-
 /// How wide the labels of the panel's rows are, so the choices line up.
 const LABEL_WIDTH: usize = 13;
 
@@ -159,6 +156,8 @@ pub struct Setup {
     /// Whether an agent that can work without a terminal may be started in
     /// the background: tasks are on.
     pub background: bool,
+    /// The made-up name a new worktree's branch starts with.
+    pub branch: String,
 }
 
 /// What a key in the panel leads to.
@@ -206,8 +205,9 @@ pub struct Launcher {
     targets: Vec<Target>,
     target: usize,
     branch: TextInput,
-    /// Whether the branch was typed in, rather than named after the task.
-    branch_typed: bool,
+    /// The name crystal made up for the branch, which it keeps unless
+    /// another is typed or given.
+    made_up: String,
     codex_models: Vec<String>,
     history: Vec<String>,
     /// While Up is bringing back earlier tasks: how many back, and the
@@ -234,8 +234,8 @@ impl Launcher {
             touched: false,
             targets: setup.targets,
             target: setup.target,
-            branch: TextInput::default(),
-            branch_typed: false,
+            branch: TextInput::with_text(&setup.branch),
+            made_up: setup.branch,
             codex_models: setup.codex_models,
             history: setup.history,
             recalling: None,
@@ -257,7 +257,6 @@ impl Launcher {
     pub fn with_task(mut self, task: &str, branch: &str) -> Launcher {
         self.task.set_text(task);
         self.branch = TextInput::with_text(branch);
-        self.branch_typed = true;
         self
     }
 
@@ -363,10 +362,7 @@ impl Launcher {
                 self.task.insert_str(text);
                 self.recalling = None;
             }
-            Field::Branch => {
-                self.start_typing_branch();
-                self.branch.insert_str(text);
-            }
+            Field::Branch => self.branch.insert_str(text),
             _ => {}
         }
     }
@@ -399,14 +395,7 @@ impl Launcher {
             .unwrap_or(0);
         let count = fields.len() as isize;
         let to = (at as isize + by).rem_euclid(count) as usize;
-        self.focus_on(fields[to]);
-    }
-
-    fn focus_on(&mut self, field: Field) {
-        if field == Field::Branch {
-            self.start_typing_branch();
-        }
-        self.focus = field;
+        self.focus = fields[to];
     }
 
     /// Up on the task's first line brings back the task before; Down on
@@ -453,17 +442,7 @@ impl Launcher {
     }
 
     fn on_branch_key(&mut self, key: &KeyEvent) {
-        self.start_typing_branch();
         self.branch.on_key(key);
-    }
-
-    /// From the first key in the branch field on, the branch is what's
-    /// typed there, starting from the name the task gave it.
-    fn start_typing_branch(&mut self) {
-        if !self.branch_typed {
-            self.branch = TextInput::with_text(&branch_from_task(self.task.text()));
-            self.branch_typed = true;
-        }
     }
 
     /// ←/→ change the choice in a row; ↑/↓ go to the row above or below.
@@ -528,7 +507,9 @@ impl Launcher {
         self.chosen = settings
             .iter()
             .map(|setting| {
-                let wanted = profile.as_ref().and_then(|p| profile_value(p, setting));
+                let wanted = profile
+                    .as_ref()
+                    .and_then(|p| p.choice(setting.kind).clone());
                 wanted
                     .and_then(|value| self.index_of(setting, &value))
                     .unwrap_or(0)
@@ -614,13 +595,10 @@ impl Launcher {
         matches!(self.target(), Target::NewWorktree { .. })
     }
 
-    /// The new worktree's branch: as typed, or else named after the task.
+    /// The new worktree's branch: the name crystal made up, or what was
+    /// typed or given instead.
     pub fn branch_name(&self) -> String {
-        if self.branch_typed {
-            self.branch.text().trim().to_string()
-        } else {
-            branch_from_task(self.task.text())
-        }
+        self.branch.text().trim().to_string()
     }
 
     /// The task, if what's chosen takes one.
@@ -639,12 +617,7 @@ impl Launcher {
             return Vec::new();
         };
         for (setting, &choice) in self.run().settings().iter().zip(&self.chosen) {
-            let value = self.value(setting, choice);
-            if is_model(setting) {
-                profile.model = value;
-            } else {
-                profile.mode = value;
-            }
+            *profile.choice_mut(setting.kind) = self.value(setting, choice);
         }
         profile.command(&self.task_text())
     }
@@ -672,6 +645,7 @@ impl Launcher {
             Target::NewWorktree { base, .. } => Place::NewWorktree {
                 branch: self.branch_name(),
                 base: base.clone(),
+                made_up: self.branch_name() == self.made_up,
             },
             Target::Project { path, .. } => Place::Directory(Some(path.clone())),
         }
@@ -717,19 +691,19 @@ impl Launcher {
     fn start(&mut self) -> Outcome {
         if self.is_new_worktree() && self.branch_name().is_empty() {
             self.problem = Some("name the new worktree's branch".to_string());
-            self.focus_on(Field::Branch);
+            self.focus = Field::Branch;
             return Outcome::Stay;
         }
         // In the background there's no terminal to type a task into later.
         if self.in_background() && self.task_text().is_empty() {
             self.problem = Some("say what the background task should do".to_string());
-            self.focus_on(Field::Task);
+            self.focus = Field::Task;
             return Outcome::Stay;
         }
         if let Run::Flow(flow) = self.run() {
             if self.task_text().is_empty() {
                 self.problem = Some("say what the flow should do".to_string());
-                self.focus_on(Field::Task);
+                self.focus = Field::Task;
                 return Outcome::Stay;
             }
             return Outcome::StartFlow {
@@ -783,43 +757,6 @@ pub fn background_spec(command: &[String]) -> Option<TaskSpec> {
         prompt: prompt.clone(),
         args: args.to_vec(),
     })
-}
-
-/// Whether `setting` is the row that chooses the agent's model; the other
-/// row an agent may have is how it asks before acting, its mode.
-fn is_model(setting: &Setting) -> bool {
-    setting.label == "model"
-}
-
-/// What `profile` sets the row `setting` to, if it sets it.
-fn profile_value(profile: &Profile, setting: &Setting) -> Option<String> {
-    if is_model(setting) {
-        profile.model.clone()
-    } else {
-        profile.mode.clone()
-    }
-}
-
-/// A branch named after a task: its words in lower case, joined by `-`,
-/// as many as fit in [`BRANCH_LENGTH`].
-pub fn branch_from_task(task: &str) -> String {
-    let mut branch = String::new();
-    let words = task
-        .split(|c: char| !c.is_ascii_alphanumeric())
-        .filter(|word| !word.is_empty())
-        .map(str::to_ascii_lowercase);
-    for word in words {
-        let joined = if branch.is_empty() {
-            word
-        } else {
-            format!("{branch}-{word}")
-        };
-        if joined.len() > BRANCH_LENGTH {
-            break;
-        }
-        branch = joined;
-    }
-    branch
 }
 
 /// `at` moved `by` within `0..count`, going round at the ends.
@@ -1210,6 +1147,7 @@ mod tests {
             history: vec!["first task".into(), "second task".into()],
             codex_models: vec!["gpt-6-luna".into(), "gpt-5.5".into()],
             background: false,
+            branch: "brave-otter".into(),
         })
     }
 
@@ -1231,7 +1169,7 @@ mod tests {
         press(&mut panel, KeyCode::Down); // model
         press(&mut panel, KeyCode::Right);
         assert!(panel.title().starts_with("New background task"));
-        assert_eq!(panel.runs_line(), "claude -p --model opus 'fix the tests'");
+        assert_eq!(panel.runs_line(), "claude -p --model fable 'fix the tests'");
 
         let Outcome::Start {
             command,
@@ -1244,7 +1182,7 @@ mod tests {
         assert!(background);
         let spec = background_spec(&command).unwrap();
         assert_eq!(spec.prompt, "fix the tests");
-        assert_eq!(spec.args, ["--model", "opus"]);
+        assert_eq!(spec.args, ["--model", "fable"]);
     }
 
     #[test]
@@ -1332,6 +1270,8 @@ mod tests {
         press(&mut panel, KeyCode::Tab); // model
         assert_eq!(panel.focus(), Field::Setting(0));
         press(&mut panel, KeyCode::Right);
+        press(&mut panel, KeyCode::Down); // effort
+        press(&mut panel, KeyCode::Left); // round to the last: max
         press(&mut panel, KeyCode::Down); // permissions
         press(&mut panel, KeyCode::Right);
         press(&mut panel, KeyCode::Right);
@@ -1340,7 +1280,9 @@ mod tests {
             [
                 "claude",
                 "--model",
-                "opus",
+                "fable",
+                "--effort",
+                "max",
                 "--permission-mode",
                 "plan",
                 "--",
@@ -1349,7 +1291,7 @@ mod tests {
         );
         assert_eq!(
             panel.command_line(),
-            "claude --model opus --permission-mode plan -- 'plan it'"
+            "claude --model fable --effort max --permission-mode plan -- 'plan it'"
         );
     }
 
@@ -1382,7 +1324,7 @@ mod tests {
     fn tab_goes_round_the_fields_and_back() {
         let mut panel = launcher(vec![agent("claude")]);
         let mut seen = vec![panel.focus()];
-        for _ in 0..4 {
+        for _ in 0..5 {
             press(&mut panel, KeyCode::Tab);
             seen.push(panel.focus());
         }
@@ -1393,6 +1335,7 @@ mod tests {
                 Field::Run,
                 Field::Setting(0),
                 Field::Setting(1),
+                Field::Setting(2),
                 Field::Where
             ]
         );
@@ -1403,57 +1346,61 @@ mod tests {
     }
 
     #[test]
-    fn a_new_worktree_is_named_after_the_task_until_its_branch_is_typed() {
+    fn a_new_worktree_has_a_made_up_name_whatever_the_task() {
         let mut panel = launcher(vec![agent("claude")]);
         type_text(&mut panel, "Fix the flaky refund test!");
         panel.target = 1;
-        assert_eq!(panel.branch_name(), "fix-the-flaky-refund-test");
-        assert_eq!(
-            panel.title(),
-            "New session · payments ⎇ fix-the-flaky-refund-test"
-        );
+        assert_eq!(panel.branch_name(), "brave-otter");
+        assert_eq!(panel.title(), "New session · payments ⎇ brave-otter");
         assert_eq!(
             panel.worktree_dir(),
-            Some(PathBuf::from(
-                "/code/payments.worktrees/fix-the-flaky-refund-test"
-            ))
+            Some(PathBuf::from("/code/payments.worktrees/brave-otter"))
         );
-        panel.focus_on(Field::Branch);
-        press(&mut panel, KeyCode::Backspace);
-        assert_eq!(panel.branch_name(), "fix-the-flaky-refund-tes");
         let (place, _) = started(press(&mut panel, KeyCode::Enter));
         assert_eq!(
             place,
             Place::NewWorktree {
-                branch: "fix-the-flaky-refund-tes".into(),
+                branch: "brave-otter".into(),
                 base: Some(PathBuf::from("/code/payments")),
+                made_up: true,
             }
         );
     }
 
     #[test]
-    fn a_new_worktree_with_no_task_asks_for_its_branch_first() {
+    fn a_new_worktrees_branch_can_be_typed_instead() {
         let mut panel = launcher(vec![agent("claude")]);
         panel.target = 1;
+        panel.focus = Field::Branch;
+        press(&mut panel, KeyCode::Backspace);
+        assert_eq!(panel.branch_name(), "brave-otte");
+        let (place, _) = started(press(&mut panel, KeyCode::Enter));
+        assert_eq!(
+            place,
+            Place::NewWorktree {
+                branch: "brave-otte".into(),
+                base: Some(PathBuf::from("/code/payments")),
+                made_up: false,
+            }
+        );
+    }
+
+    #[test]
+    fn a_new_worktree_whose_name_is_rubbed_out_asks_for_one() {
+        let mut panel = launcher(vec![agent("claude")]);
+        panel.target = 1;
+        panel.focus = Field::Branch;
+        panel.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        panel.focus = Field::Task;
         assert_eq!(press(&mut panel, KeyCode::Enter), Outcome::Stay);
         assert_eq!(panel.focus(), Field::Branch);
         assert_eq!(panel.problem(), Some("name the new worktree's branch"));
         type_text(&mut panel, "spike");
         let (place, _) = started(press(&mut panel, KeyCode::Enter));
-        assert!(matches!(place, Place::NewWorktree { branch, .. } if branch == "spike"));
-    }
-
-    #[test]
-    fn branches_from_tasks_are_short_and_plain() {
-        assert_eq!(
-            branch_from_task("Fix issue #42: login redirect"),
-            "fix-issue-42-login-redirect"
-        );
-        assert_eq!(
-            branch_from_task("make the export of the whole ledger stream instead of buffering"),
-            "make-the-export-of-the-whole-ledger"
-        );
-        assert_eq!(branch_from_task("  "), "");
+        assert!(matches!(
+            place,
+            Place::NewWorktree { branch, made_up: false, .. } if branch == "spike"
+        ));
     }
 
     #[test]
@@ -1500,6 +1447,7 @@ mod tests {
             name: "review".into(),
             description: Some("A second pair of eyes".into()),
             model: Some("opus".into()),
+            effort: Some("high".into()),
             mode: Some("plan".into()),
             prompt: Some("Review the diff.".into()),
             start_in: Some(StartIn::Worktree),
@@ -1516,6 +1464,7 @@ mod tests {
                 Field::Run,
                 Field::Setting(0),
                 Field::Setting(1),
+                Field::Setting(2),
                 Field::Where,
                 Field::Branch
             ]
@@ -1527,6 +1476,8 @@ mod tests {
                 "claude",
                 "--model",
                 "opus",
+                "--effort",
+                "high",
                 "--permission-mode",
                 "plan",
                 "--",
@@ -1534,12 +1485,16 @@ mod tests {
             ]
         );
 
+        // Down to the effort row, and one to the right: xhigh.
+        press(&mut panel, KeyCode::Tab);
+        press(&mut panel, KeyCode::Tab);
+        press(&mut panel, KeyCode::Tab);
+        press(&mut panel, KeyCode::Right);
+        assert_eq!(panel.command()[3..5], ["--effort", "xhigh"]);
         // Down to the permissions row, and one to the left: accept edits.
         press(&mut panel, KeyCode::Tab);
-        press(&mut panel, KeyCode::Tab);
-        press(&mut panel, KeyCode::Tab);
         press(&mut panel, KeyCode::Left);
-        assert_eq!(panel.command()[3..5], ["--permission-mode", "acceptEdits"]);
+        assert_eq!(panel.command()[5..7], ["--permission-mode", "acceptEdits"]);
     }
 
     #[test]
@@ -1571,6 +1526,7 @@ mod tests {
             history: Vec::new(),
             codex_models: Vec::new(),
             background: false,
+            branch: "brave-otter".into(),
         });
         assert!(panel.is_new_worktree());
     }
@@ -1601,7 +1557,7 @@ mod tests {
             .map(PanelLine::text)
             .collect();
         assert!(
-            lines[0].starts_with("New session · payments ⎇ fix-it"),
+            lines[0].starts_with("New session · payments ⎇ brave-otter"),
             "{lines:?}"
         );
         assert!(
@@ -1611,7 +1567,9 @@ mod tests {
             "{lines:?}"
         );
         assert!(
-            lines.iter().any(|l| l.starts_with("branch       fix-it")),
+            lines
+                .iter()
+                .any(|l| l.starts_with("branch       brave-otter")),
             "{lines:?}"
         );
         assert!(
@@ -1621,7 +1579,7 @@ mod tests {
         assert!(
             lines
                 .iter()
-                .any(|l| l == "in    /code/payments.worktrees/fix-it"),
+                .any(|l| l == "in    /code/payments.worktrees/brave-otter"),
             "{lines:?}"
         );
         // Too long for the panel, the path keeps its end.
@@ -1630,7 +1588,7 @@ mod tests {
             .map(PanelLine::text)
             .collect();
         assert!(
-            narrow.iter().any(|l| l == "in    …yments.worktrees/fix-it"),
+            narrow.iter().any(|l| l == "in    …s.worktrees/brave-otter"),
             "{narrow:?}"
         );
     }
