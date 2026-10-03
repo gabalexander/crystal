@@ -163,6 +163,7 @@ crystal kill-server                         # stop every session, and the daemon
 crystal restart-server                      # restart the daemon, say after an upgrade; sessions come back
 crystal config                              # where the config file is, and the settings in effect
 crystal skill --install                     # teach Claude Code to drive crystal (see below)
+crystal ssh box                             # crystal's TUI on another machine (see below)
 ```
 
 ```
@@ -260,6 +261,24 @@ crystal skill             # or just print it
 `--install` won't write over a skill file you've changed; `--force` does. The skill lives in
 [`skill/SKILL.md`](skill/SKILL.md), and each crystal carries its own copy, so installing again after an
 upgrade brings it up to date.
+
+### Other machines
+
+`crystal ssh` runs crystal on another machine through your own `ssh`, so your `~/.ssh/config`, keys and agent
+work as they always do, and crystal never sees a password or a key:
+
+```sh
+crystal ssh box                                  # the TUI over there
+crystal ssh me@box.example.com ls                # or any crystal command
+crystal ssh box new -d -n fixer claude "fix the flaky test"
+crystal ssh --install box                        # install or upgrade crystal there without asking
+```
+
+Everything after the machine goes to crystal over there as you typed it, quotes and all. That crystal has
+its own daemon and sessions, which keep running when you disconnect. crystal looks for itself there on the
+PATH, then in `~/.local/bin` and `~/.cargo/bin`. If it isn't there, crystal offers to install it with the
+install script; if it's another version, crystal says so and offers to upgrade it. Away from a terminal it
+never installs anything unless you pass `--install`. `CRYSTAL_SSH` names a command to use in place of `ssh`.
 
 ### Settings
 

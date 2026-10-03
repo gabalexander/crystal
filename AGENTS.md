@@ -39,6 +39,7 @@ is: it's the one request every version must understand.
 - `src/viewer.rs`: the client's side of an attach, shared by `crystal attach` and the TUI's pane
 - `src/drive.rs`: `crystal send`, `wait` and `read`, for driving one session from another or a script
 - `src/keys.rs`: turning keys into the bytes a terminal sends: the TUI's keys, and the names `send-keys` takes
+- `src/remote.rs`: `crystal ssh`: finds (or installs) crystal on another machine, then runs it there over ssh
 - `src/skill.rs`: `crystal skill`: prints or installs `skill/SKILL.md`, the Claude Code skill for driving
   crystal; keep it in step with the commands it teaches
 - `src/tui/`: the TUI (`crystal` with no command)
