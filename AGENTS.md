@@ -37,7 +37,7 @@ is: it's the one request every version must understand.
 - `src/client.rs`: connects to the daemon, starting it when needed
 - `src/attach.rs`: `crystal attach`: draws a session in your terminal and sends it your keys
 - `src/viewer.rs`: the client's side of an attach, shared by `crystal attach` and the TUI's pane
-- `src/drive.rs`: `crystal send`, `wait` and `read`, for driving one session from another or a script
+- `src/drive.rs`: `crystal send`, `wait`, `read` and `result`, for driving one session from another or a script
 - `src/keys.rs`: turning keys into the bytes a terminal sends: the TUI's keys, and the names `send-keys` takes
 - `src/remote.rs`: `crystal ssh`: finds (or installs) crystal on another machine, then runs it there over ssh
 - `src/skill.rs`: `crystal skill`: prints or installs `skill/SKILL.md`, the Claude Code skill for driving
@@ -64,7 +64,9 @@ is: it's the one request every version must understand.
 - `src/hook.rs`: `crystal hook <agent>`: what those hooks run, to tell the daemon
 - `src/agent_screen.rs`: reading what an agent is doing off its screen and title
 - `src/typing.rs`: typing into a session the way a person would: pastes marked, Enter on its own
-- `src/session.rs`: one program in a PTY: spawn, exit status, stop, and its screen (vt100) and viewers
+- `src/session.rs`: one program in a PTY, or a task: spawn, exit status, stop, and its screen (vt100) and viewers
+- `src/task.rs`: tasks: Claude Code run without a terminal (`claude -p`), one run per prompt or follow-up
+- `src/transcript.rs`: reading `claude -p`'s stream-json events, and drawing them as a task's transcript
 - `src/history.rs`: the rows that scroll off a session's screen: keeping them (inline agents' too), reading
   them, and replaying them to a new viewer
 - `src/protocol.rs`: requests and responses, one JSON line each, and the frames an attached client sends

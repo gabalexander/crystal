@@ -153,6 +153,8 @@ Everything is also a command, for scripts and for agents:
 crystal new claude                          # start Claude Code here and attach to it
 crystal new -d -n review -c ~/code/app codex   # start one in the background, named, somewhere else
 crystal new -w fix/login claude             # start one in a new worktree, on a new branch
+crystal task "update the docs"              # run Claude without a terminal, in the background (see below)
+crystal result task                         # a task's answer
 crystal worktree rm fix/login               # remove that worktree, once nothing runs in it
 crystal ls                                  # list sessions and how they're doing
 crystal ls --json                           # the same, as JSON, for scripts and agents
@@ -304,6 +306,33 @@ its own daemon and sessions, which keep running when you disconnect. crystal loo
 PATH, then in `~/.local/bin` and `~/.cargo/bin`. If it isn't there, crystal offers to install it with the
 install script; if it's another version, crystal says so and offers to upgrade it. Away from a terminal it
 never installs anything unless you pass `--install`. `CRYSTAL_SSH` names a command to use in place of `ssh`.
+
+### Background tasks
+
+A task is Claude Code without a terminal: `claude -p`, running a prompt in the background. It sits in the
+session list like any session, with a transcript you can watch in the TUI, attach to, or `read`: the prompt,
+what Claude says, each tool it uses with the first line of what came back, and how the run ended, with how
+long it took and what it cost.
+
+```sh
+crystal task -n docs "Update the README for the new flags"           # prints the task's name
+crystal task --wait -n tests "Run the tests and fix what fails" -- --permission-mode acceptEdits
+crystal result tests                                                 # Claude's answer at the end of the run
+crystal send docs "Now the changelog too" --wait                     # a follow-up, in the same conversation
+```
+
+- Arguments after `--` go to every `claude -p` the task runs. Nobody is there to say yes to a permission, so
+  Claude is refused what isn't allowed; say what is with `--allowedTools` or `--permission-mode`. The
+  transcript lists what was refused.
+- `crystal send` gives a finished task a follow-up: another run that carries the conversation on with
+  `--resume`. One run at a time: a follow-up sent while Claude is still working is refused. A task takes no
+  keys, so `send-keys` is refused too.
+- `crystal result <task>` prints the last answer; `--json` adds whether the run failed, the conversation's id,
+  the cost so far and how many runs the task has had.
+- A run that fails, or crashes before saying anything, ends the task, which shows how it exited and why.
+  `crystal respawn` runs its prompt again, in its conversation if it got that far.
+- After a restart, a task comes back at rest rather than running its prompt again, and what it showed before
+  is gone; `crystal send` carries its conversation on.
 
 ### Settings
 
