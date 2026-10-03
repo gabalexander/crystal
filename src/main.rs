@@ -18,6 +18,10 @@ mod keys;
 mod memory;
 mod memory_cli;
 mod notify;
+mod plugin_cli;
+mod plugin_hooks;
+mod plugin_manifest;
+mod plugins;
 mod profile;
 mod project;
 mod protocol;
@@ -313,6 +317,12 @@ enum Command {
         #[command(subcommand)]
         command: Option<ProfileCommand>,
     },
+    /// List plugins, crystal's own and yours, with whether they're on; or
+    /// switch, run, install, make or remove one.
+    Plugin {
+        #[command(subcommand)]
+        command: Option<PluginCommand>,
+    },
     /// Print the Claude Code skill that teaches an agent to drive crystal.
     Skill {
         /// Install it into Claude Code's skills, in $CLAUDE_CONFIG_DIR or
@@ -383,6 +393,45 @@ enum ProfileCommand {
     /// Show a profile: its agent, where it starts, and the command it runs
     /// for a task.
     Show { name: String },
+}
+
+#[derive(Subcommand)]
+enum PluginCommand {
+    /// Turn a plugin on.
+    Enable { name: String },
+    /// Turn a plugin off.
+    Disable { name: String },
+    /// Run one of a plugin's actions.
+    Run {
+        plugin: String,
+        action: String,
+
+        /// The session to run it for [default: the one this runs in, if
+        /// any]
+        #[arg(short, long)]
+        session: Option<String>,
+    },
+    /// Install a plugin from a git repository or a directory, once you've
+    /// seen what it runs and said yes. It starts off.
+    Install {
+        /// A git repository's URL, or a directory.
+        source: String,
+
+        /// Don't ask first.
+        #[arg(long)]
+        yes: bool,
+
+        /// Turn it on once it's installed.
+        #[arg(long)]
+        enable: bool,
+    },
+    /// Remove a plugin you installed.
+    #[command(visible_alias = "rm")]
+    Remove { name: String },
+    /// Make a plugin to start from, in your plugins directory.
+    New { name: String },
+    /// Print what a plugin's commands printed, and how they failed.
+    Log { name: String },
 }
 
 #[derive(Subcommand)]
@@ -476,7 +525,7 @@ fn run(cli: Cli) -> Result<()> {
                 prompt: prompt.join(" "),
                 args: claude_args,
             };
-            let cwd = start_dir(cwd, worktree)?;
+            let cwd = start_dir(&socket, cwd, worktree)?;
             let name = client::new_task(&socket, name, cwd, spec, None)?;
             println!("{name}");
             if wait {
@@ -568,14 +617,34 @@ fn run(cli: Cli) -> Result<()> {
         },
         Command::Profile { command } => {
             let settings = config::Config::load()?;
-            if !profile::enabled(&settings) {
-                bail!(profile::DISABLED);
-            }
+            plugins::ensure_enabled(&settings, "profiles")?;
             match command {
                 None => print_profiles(&settings.profiles),
                 Some(ProfileCommand::Show { name }) => print_profile(&settings.profiles, &name)?,
             }
         }
+        Command::Plugin { command } => match command {
+            None => plugin_cli::list(&socket)?,
+            Some(PluginCommand::Enable { name }) => plugin_cli::switch(&socket, &name, true)?,
+            Some(PluginCommand::Disable { name }) => plugin_cli::switch(&socket, &name, false)?,
+            Some(PluginCommand::Run {
+                plugin,
+                action,
+                session,
+            }) => {
+                let code = plugin_cli::run(&socket, &plugin, &action, session)?;
+                // The action's own exit code is crystal's.
+                std::process::exit(code);
+            }
+            Some(PluginCommand::Install {
+                source,
+                yes,
+                enable,
+            }) => plugin_cli::install(&socket, &source, yes, enable)?,
+            Some(PluginCommand::Remove { name }) => plugin_cli::remove(&name)?,
+            Some(PluginCommand::New { name }) => plugin_cli::new(&name)?,
+            Some(PluginCommand::Log { name }) => plugin_cli::log(&socket, &name)?,
+        },
         Command::Skill { install, force } => {
             if install {
                 skill::install(force)?;
@@ -677,7 +746,7 @@ fn new_session(
     mut command: Vec<String>,
     task: Option<String>,
 ) -> Result<()> {
-    let cwd = start_dir(cwd, worktree)?;
+    let cwd = start_dir(socket, cwd, worktree)?;
     // A task given with `-t` goes to the agent as its first prompt; one
     // given as the agent's only argument is a task all the same.
     let task = match task {
@@ -753,13 +822,13 @@ fn here(dir: Option<PathBuf>) -> Result<PathBuf> {
 
 /// Where a new session or task starts: `cwd`, or the current directory,
 /// or else a new worktree on the branch `worktree` made from there.
-fn start_dir(cwd: Option<PathBuf>, worktree: Option<String>) -> Result<PathBuf> {
+fn start_dir(socket: &Path, cwd: Option<PathBuf>, worktree: Option<String>) -> Result<PathBuf> {
     let cwd = match cwd {
         Some(cwd) => std::path::absolute(cwd)?,
         None => std::env::current_dir()?,
     };
     match worktree {
-        Some(branch) => git::add_worktree(&cwd, &branch),
+        Some(branch) => client::add_worktree(socket, &cwd, &branch),
         None => Ok(cwd),
     }
 }

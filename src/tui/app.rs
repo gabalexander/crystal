@@ -11,6 +11,7 @@ use super::groups::{self, Row};
 use super::issues::IssuesView;
 use super::launcher::{self, Launcher, Memory, Run, Setup, Target};
 use super::memory_view::MemoryView;
+use super::plugins_view::{self, PluginsView};
 use super::profiles::{self, ProfilesView};
 use super::search;
 use super::text_input::TextInput;
@@ -22,7 +23,7 @@ use crate::keys;
 use crate::profile::{self, Profile};
 use crate::protocol::{Activity, Backlog, SessionInfo, State, TaskSpec};
 use crate::shell;
-use crate::{backlog, tasks};
+use crate::{backlog, plugins, tasks};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -286,6 +287,50 @@ pub enum Action {
     },
     /// Take the profile with this name out of the config file.
     DeleteProfile(String),
+    /// Read which plugins there are, and open the plugins view on them.
+    ListPlugins,
+    /// Turn the plugin called `name` on, or off, in the config file.
+    SwitchPlugin {
+        name: String,
+        on: bool,
+    },
+    /// Run one of an installed plugin's actions, about `context`.
+    RunPlugin {
+        plugin: String,
+        action: String,
+        context: plugins::Context,
+    },
+    /// Start one of an installed plugin's panes, and show it over the
+    /// panes.
+    OpenPluginPane {
+        plugin: String,
+        pane: String,
+        context: plugins::Context,
+    },
+    /// Type into the plugin's pane that's open.
+    TypeInPluginPane(KeyEvent),
+    PasteInPluginPane(String),
+    /// Close the plugin's pane that's open, and end its session.
+    ClosePluginPane,
+}
+
+/// A sidebar key one of the installed plugins' actions took.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginKey {
+    pub key: char,
+    pub plugin: String,
+    pub action: String,
+    pub title: String,
+}
+
+/// A plugin's pane, open over the panes: a session of its own, which ends
+/// when the pane closes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginPane {
+    pub plugin: String,
+    pub title: String,
+    /// The session's name.
+    pub session: String,
 }
 
 /// The sidebar narrowed to the sessions that match what's typed, while `/`
@@ -363,6 +408,15 @@ pub struct App {
     tasks_on: bool,
     /// Whether the backlog is on: its view, and its counts in the sidebar.
     backlog_on: bool,
+    /// Whether the github plugin is on: pull requests on worktree lines,
+    /// `o` and `i`.
+    github_on: bool,
+    /// The plugins view, while it's open.
+    plugins_view: Option<PluginsView>,
+    /// The sidebar keys the installed plugins that are on took.
+    plugin_keys: Vec<PluginKey>,
+    /// A plugin's pane, while one is open.
+    plugin_pane: Option<PluginPane>,
     /// The session whose task `c` is closing, while the footer asks whether
     /// it was done or failed.
     closing: Option<String>,
@@ -404,21 +458,96 @@ impl App {
             memory_on: true,
             tasks_on: true,
             backlog_on: true,
+            github_on: true,
+            plugins_view: None,
+            plugin_keys: Vec::new(),
+            plugin_pane: None,
             closing: None,
             backlog: None,
             backlog_counts: HashMap::new(),
         }
     }
 
-    /// Whether `m` opens a project's memory, by the config's say.
-    pub fn set_memory_on(&mut self, on: bool) {
-        self.memory_on = on;
-    }
-
-    /// Takes which of crystal's features the config has on.
+    /// Takes which of crystal's plugins the config has on.
     pub fn set_features(&mut self, config: &Config) {
         self.tasks_on = tasks::enabled(config);
         self.backlog_on = backlog::enabled(config);
+        self.memory_on = crate::memory::enabled(config);
+        self.profiles_on = profile::enabled(config);
+        self.github_on = github::enabled(config);
+    }
+
+    /// Whether the TUI asks GitHub about the sessions' projects.
+    pub fn github_on(&self) -> bool {
+        self.github_on
+    }
+
+    /// Whether the one of crystal's plugins called `name` is on, as the
+    /// TUI last read the config.
+    pub fn plugin_on(&self, name: &str) -> bool {
+        match name {
+            "tasks" => self.tasks_on,
+            "backlog" => self.backlog_on,
+            "memory" => self.memory_on,
+            "profiles" => self.profiles_on,
+            "github" => self.github_on,
+            _ => true,
+        }
+    }
+
+    /// Takes the sidebar keys the installed plugins that are on took.
+    pub fn set_plugin_keys(&mut self, keys: Vec<PluginKey>) {
+        self.plugin_keys = keys;
+    }
+
+    /// The plugins' keys as the `?` overlay lists them: the key, and what
+    /// it does.
+    pub fn plugin_key_rows(&self) -> Vec<(String, String)> {
+        self.plugin_keys
+            .iter()
+            .map(|key| {
+                (
+                    key.key.to_string(),
+                    format!("{}: {}", key.plugin, key.title),
+                )
+            })
+            .collect()
+    }
+
+    /// Opens the plugins view on `plugins`, or, when it's open, shows them
+    /// as they are now.
+    pub fn show_plugins(&mut self, plugins: Vec<plugins_view::Listed>) {
+        match &mut self.plugins_view {
+            Some(view) => view.set_plugins(plugins),
+            None => self.plugins_view = Some(PluginsView::new(plugins)),
+        }
+    }
+
+    /// Says, in the plugins view if it's open, why something asked of a
+    /// plugin couldn't be done.
+    pub fn plugin_failed(&mut self, problem: String) {
+        match &mut self.plugins_view {
+            Some(view) => view.set_problem(problem),
+            None => self.notify(problem),
+        }
+    }
+
+    pub fn plugins_view(&self) -> Option<&PluginsView> {
+        self.plugins_view.as_ref()
+    }
+
+    /// A plugin's pane has opened, over the panes, with the keyboard.
+    pub fn plugin_pane_opened(&mut self, pane: PluginPane) {
+        self.plugins_view = None;
+        self.plugin_pane = Some(pane);
+    }
+
+    pub fn plugin_pane_closed(&mut self) {
+        self.plugin_pane = None;
+    }
+
+    pub fn plugin_pane(&self) -> Option<&PluginPane> {
+        self.plugin_pane.as_ref()
     }
 
     /// Whether the TUI shows tasks: under sessions, and in pane headers.
@@ -436,7 +565,6 @@ impl App {
     /// `new_session` with arguments, like `codex --full-auto`, is offered
     /// as a profile of its own.
     pub fn set_launch_settings(&mut self, config: &Config) {
-        self.profiles_on = profile::enabled(config);
         self.profiles = config.profiles.clone();
         self.new_session_profile = None;
         self.first_run = None;
@@ -655,6 +783,9 @@ impl App {
     /// The open pull request for `branch` in the project at `project`, if
     /// GitHub knows of one.
     pub fn pull_request(&self, project: &Path, branch: &str) -> Option<&PullRequest> {
+        if !self.github_on {
+            return None;
+        }
         let Some(Ok(pull_requests)) = self.pull_requests.get(project) else {
             return None;
         };
@@ -867,6 +998,14 @@ impl App {
 
     pub fn on_key(&mut self, key: KeyEvent) -> Option<Action> {
         self.notice = None;
+        // A plugin's pane is over everything, and has every key but the one
+        // that closes it.
+        if self.plugin_pane.is_some() {
+            if keys::is_hand_back(&key) {
+                return Some(Action::ClosePluginPane);
+            }
+            return Some(Action::TypeInPluginPane(key));
+        }
         // An open view has every key until it's closed.
         if self.view.is_some() {
             return self.on_view_key(key);
@@ -903,6 +1042,9 @@ impl App {
         }
         if self.profiles_view.is_some() {
             return self.on_profiles_key(key);
+        }
+        if self.plugins_view.is_some() {
+            return self.on_plugins_key(key);
         }
         if self.prompt.is_some() {
             return self.on_prompt_key(key);
@@ -946,7 +1088,9 @@ impl App {
             || self.issues.is_some()
             || self.backlog.is_some()
             || self.launcher.is_some()
-            || self.profiles_view.is_some();
+            || self.profiles_view.is_some()
+            || self.plugins_view.is_some()
+            || self.plugin_pane.is_some();
         let asking = self.prompt.is_some() || self.confirm.is_some() || self.closing.is_some();
         if asking || typing {
             return None;
@@ -1023,10 +1167,56 @@ impl App {
             KeyCode::Char('i') => return self.open_issues(),
             KeyCode::Char('c') if self.tasks_on => self.ask_how_the_task_went(),
             KeyCode::Char('b') if self.backlog_on => return self.open_backlog(),
+            KeyCode::Char('c') => self.notify(plugins::off("tasks")),
+            KeyCode::Char('b') => self.notify(plugins::off("backlog")),
+            KeyCode::Char('X') => return Some(Action::ListPlugins),
             KeyCode::Char('q') => return Some(Action::Quit),
+            KeyCode::Char(c) => return self.run_plugin_key(c),
             _ => {}
         }
         None
+    }
+
+    /// Runs the plugin action that took `key`, about the selected session,
+    /// if one did.
+    fn run_plugin_key(&mut self, key: char) -> Option<Action> {
+        let taken = self.plugin_keys.iter().find(|taken| taken.key == key)?;
+        let (plugin, action) = (taken.plugin.clone(), taken.action.clone());
+        Some(Action::RunPlugin {
+            plugin,
+            action,
+            context: self.selected_context(),
+        })
+    }
+
+    /// What a plugin's action or pane is told about where it was run from:
+    /// the selected session. With none, the event loop says where.
+    fn selected_context(&self) -> plugins::Context {
+        self.selected()
+            .map(plugins::Context::of_session)
+            .unwrap_or_default()
+    }
+
+    /// Keys while the plugins view is open: all of them are its.
+    fn on_plugins_key(&mut self, key: KeyEvent) -> Option<Action> {
+        match self.plugins_view.as_mut()?.on_key(key) {
+            plugins_view::Outcome::Stay => None,
+            plugins_view::Outcome::Close => {
+                self.plugins_view = None;
+                None
+            }
+            plugins_view::Outcome::Switch { name, on } => Some(Action::SwitchPlugin { name, on }),
+            plugins_view::Outcome::Run { plugin, action } => Some(Action::RunPlugin {
+                plugin,
+                action,
+                context: self.selected_context(),
+            }),
+            plugins_view::Outcome::Open { plugin, pane } => Some(Action::OpenPluginPane {
+                plugin,
+                pane,
+                context: self.selected_context(),
+            }),
+        }
     }
 
     /// Opens the diff of the selected session's worktree, and asks for it
@@ -1054,7 +1244,7 @@ impl App {
     /// project. With memory off, the footer says so instead.
     fn open_memory(&mut self) -> Option<Action> {
         if !self.memory_on {
-            self.notify(crate::memory::OFF.to_string());
+            self.notify(plugins::off("memory"));
             return None;
         }
         let selected = self.selected()?;
@@ -1260,6 +1450,10 @@ impl App {
     /// `o`: opens the pull request of the selected session's branch, or
     /// says why there's none to open.
     fn open_pull_request(&mut self) -> Option<Action> {
+        if !self.github_on {
+            self.notify(plugins::off("github"));
+            return None;
+        }
         let selected = self.selected()?;
         let name = selected.name.clone();
         let Some(worktree) = selected.worktree.clone() else {
@@ -1295,6 +1489,10 @@ impl App {
     /// `i`: opens the issues view for the selected session's project, or
     /// says why it can't.
     fn open_issues(&mut self) -> Option<Action> {
+        if !self.github_on {
+            self.notify(plugins::off("github"));
+            return None;
+        }
         let selected = self.selected()?;
         let name = selected.name.clone();
         let Some(worktree) = selected.worktree.clone() else {
@@ -1500,7 +1698,7 @@ impl App {
     /// Opens the profiles view, unless profiles are switched off.
     fn open_profiles(&mut self) -> Option<Action> {
         if !self.profiles_on {
-            self.notify(profile::DISABLED.to_string());
+            self.notify(plugins::off("profiles"));
             return None;
         }
         let models = self.codex_models.clone().unwrap_or_default();
@@ -1583,6 +1781,9 @@ impl App {
     /// the session in the pane that has it. Anywhere else, like the
     /// sidebar, where letters are commands, a paste does nothing.
     pub fn on_paste(&mut self, text: String) -> Option<Action> {
+        if self.plugin_pane.is_some() {
+            return Some(Action::PasteInPluginPane(text));
+        }
         if let Some(View::Files(finder)) = &mut self.view {
             let outcome = finder.on_paste(&text);
             return self.follow(outcome);
@@ -2309,7 +2510,7 @@ mod tests {
         app.profiles_on = false;
         press(&mut app, KeyCode::Char('P'));
         assert!(app.profiles_view().is_none());
-        assert_eq!(app.notice(), Some(profile::DISABLED));
+        assert_eq!(app.notice(), Some(plugins::off("profiles").as_str()));
         press(&mut app, KeyCode::Char('n'));
         let rows = app.launcher().unwrap().choice_rows();
         assert_eq!(rows[0].2, ["Claude Code", "shell"]);
@@ -3055,10 +3256,10 @@ mod tests {
     fn m_with_memory_off_says_so_and_opens_nothing() {
         let mut app = App::new(None);
         app.set_sessions(vec![in_repo("fixer", "main")]);
-        app.set_memory_on(false);
+        app.memory_on = false;
         assert_eq!(press(&mut app, KeyCode::Char('m')), None);
         assert!(app.view().is_none());
-        assert_eq!(app.notice(), Some(crate::memory::OFF));
+        assert_eq!(app.notice(), Some(plugins::off("memory").as_str()));
     }
 
     /// A session given `goal` to do, closed with `outcome` if it's given:

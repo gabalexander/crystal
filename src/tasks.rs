@@ -10,24 +10,21 @@
 //! switched off as one.
 
 use crate::config::Config;
+use crate::plugins;
 use crate::protocol::TaskRecord;
-use anyhow::{Result, bail};
+use anyhow::Result;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::Path;
 
-/// Whether tasks are on. They always are for now; this is the one place
-/// that will say otherwise once they can be switched off.
-pub fn enabled(_config: &Config) -> bool {
-    true
+/// Whether tasks are on: the `tasks` plugin.
+pub fn enabled(config: &Config) -> bool {
+    plugins::enabled(config, "tasks")
 }
 
 /// Refuses a command that's only about tasks while they're off.
 pub fn ensure_enabled(config: &Config) -> Result<()> {
-    if !enabled(config) {
-        bail!("the tasks plugin is off");
-    }
-    Ok(())
+    plugins::ensure_enabled(config, "tasks")
 }
 
 /// What an agent given a task is told about it: how to close it, and, with

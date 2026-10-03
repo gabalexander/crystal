@@ -8,7 +8,6 @@ use crate::catalog;
 use crate::client::{self, Purpose};
 use crate::config::Config;
 use crate::env;
-use crate::git;
 use crate::github;
 use crate::protocol::{BacklogItem, Request, Response, TaskRecord};
 use crate::tasks;
@@ -151,7 +150,7 @@ pub fn start_from_backlog(
         .collect();
     catalog::add_first_prompt(&mut command, &item.text);
     let cwd = if worktree {
-        git::add_worktree(&dir, &github::branch_for_issue(number, &item.text))?
+        client::add_worktree(socket, &dir, &github::branch_for_issue(number, &item.text))?
     } else {
         dir
     };

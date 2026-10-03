@@ -42,13 +42,10 @@ const COMMON_WORDS: &[&str] = &[
     "its", "has", "have", "when", "then", "than", "all", "any", "can", "use", "make",
 ];
 
-/// What's said when something asks for memory while it's turned off.
-pub const OFF: &str = "the memory plugin is off: set `memory = true` in the config to turn it on";
-
-/// Whether memory is on: the one gate for everything it adds, from the
-/// launch paragraph to the TUI's view and the commands.
+/// Whether memory is on, the `memory` plugin: the one gate for everything
+/// it adds, from the launch paragraph to the TUI's view and the commands.
 pub fn enabled(config: &Config) -> bool {
-    config.memory
+    crate::plugins::enabled(config, "memory")
 }
 
 /// Whether memory is on, by the config file as it is now. A file that
@@ -611,7 +608,7 @@ mod tests {
         let (_dir, socket) = socket();
         let project = Path::new("/code/app");
         let config = Config {
-            memory: false,
+            plugins: [("memory".to_string(), false)].into(),
             ..Config::default()
         };
         let kept = record_outcome(&config, &socket, project, "fixer", "done").unwrap();

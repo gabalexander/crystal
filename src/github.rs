@@ -8,6 +8,7 @@
 //! an error here that says so in a line, for the TUI to show only when the
 //! user asks for something from GitHub.
 
+use crate::config::Config;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use std::io::Read;
@@ -15,6 +16,12 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
+
+/// Whether crystal asks GitHub anything, the `github` plugin: off, no
+/// pull requests on worktree lines, no `o` or `i`, and gh is never run.
+pub fn enabled(config: &Config) -> bool {
+    crate::plugins::enabled(config, "github")
+}
 
 /// How long gh gets to answer before it's given up on: it goes over the
 /// network, and a TUI waiting on it would rather hear nothing than hang.

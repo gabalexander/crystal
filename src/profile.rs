@@ -20,12 +20,9 @@ use toml_edit::{Array, ArrayOfTables, DocumentMut, Item, Table, value};
 /// offers them asks here, so they can be switched off in one place. The
 /// profiles in the config file are read and checked either way; switched
 /// off, they're only not offered.
-pub fn enabled(_config: &config::Config) -> bool {
-    true
+pub fn enabled(config: &config::Config) -> bool {
+    crate::plugins::enabled(config, "profiles")
 }
-
-/// What `crystal profile` says when profiles are switched off.
-pub const DISABLED: &str = "the profiles plugin is off";
 
 /// A saved way to start an agent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

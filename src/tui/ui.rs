@@ -4,7 +4,7 @@
 //! theme's colors tell the parts apart. Drawing only reads the state; it
 //! never changes it.
 
-use super::app::{App, Filter, Focus, Hit, Prompt, Question, Slot, View};
+use super::app::{App, Filter, Focus, Hit, PluginPane, Prompt, Question, Slot, View};
 use super::backlog_view::{self, BacklogView};
 use super::diff_view;
 use super::finder;
@@ -13,6 +13,7 @@ use super::issues;
 use super::launcher;
 use super::memory_view;
 use super::pane::Pane;
+use super::plugins_view;
 use super::profiles;
 use super::screen_widget::ScreenWidget;
 use super::sidebar::{self, fit};
@@ -24,7 +25,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Paragraph};
+use ratatui::widgets::{Block, Clear, Paragraph};
 
 const SIDEBAR_WIDTH: u16 = 28;
 
@@ -221,7 +222,7 @@ pub fn hit(areas: &Areas, app: &App, column: u16, row: u16) -> Hit {
 }
 
 /// Draws the whole TUI. `panes` are the viewers of the sessions on screen.
-pub fn draw(frame: &mut Frame, app: &App, panes: &[Pane], look: &Look) {
+pub fn draw(frame: &mut Frame, app: &App, panes: &[Pane], overlay: Option<&Pane>, look: &Look) {
     frame.render_widget(Block::new().style(look.theme.base()), frame.area());
     let areas = Areas::new(frame.area(), app.splits().len());
     draw_top_bar(frame, app, look, areas.top);
@@ -266,9 +267,64 @@ pub fn draw(frame: &mut Frame, app: &App, panes: &[Pane], look: &Look) {
         let middle = Rect::new(0, below_top, frame.area().width, areas.footer.y - below_top);
         profiles::draw(frame, view, look.theme, middle);
     }
+    if let Some(view) = app.plugins_view() {
+        plugins_view::draw(frame, view, look.theme, middle);
+    }
+    if let (Some(open), Some(pane)) = (app.plugin_pane(), overlay) {
+        draw_plugin_pane(frame, open, pane, look, &areas);
+    }
     draw_footer(frame, app, look, areas.footer);
     if app.showing_keys() {
-        help::draw(frame, look.theme, frame.area());
+        let plugin_on = |plugin: &str| app.plugin_on(plugin);
+        let plugin_keys = app.plugin_key_rows();
+        let shown = help::Shown {
+            plugin_on: &plugin_on,
+            plugin_keys: &plugin_keys,
+        };
+        help::draw(frame, look.theme, frame.area(), &shown);
+    }
+}
+
+/// Where a plugin's pane goes: over every pane, beside the sidebar.
+fn plugin_pane_area(areas: &Areas) -> Rect {
+    let left = areas.rule.right();
+    let main = areas.main;
+    Rect::new(left, main.y, main.right().saturating_sub(left), main.height)
+}
+
+/// The part of a plugin's pane its program's screen takes: inside its
+/// frame.
+pub fn plugin_pane_screen(areas: &Areas) -> Rect {
+    Block::bordered().inner(plugin_pane_area(areas))
+}
+
+/// A plugin's pane: its program's screen in a frame, its title on top and
+/// the key that closes it below.
+fn draw_plugin_pane(frame: &mut Frame, open: &PluginPane, pane: &Pane, look: &Look, areas: &Areas) {
+    let theme = look.theme;
+    let area = plugin_pane_area(areas);
+    frame.render_widget(Clear, area);
+    let title = Style::new().fg(theme.accent).add_modifier(Modifier::BOLD);
+    let block = Block::bordered()
+        .border_style(Style::new().fg(theme.accent))
+        .style(theme.base())
+        .title(Line::styled(
+            format!(" {} · {} ", open.plugin, open.title),
+            title,
+        ))
+        .title_bottom(Line::styled(
+            " ctrl+\\ closes ",
+            Style::new().fg(theme.muted),
+        ));
+    let screen = block.inner(area);
+    frame.render_widget(block, area);
+    let session_screen = pane.screen.screen();
+    let widget =
+        ScreenWidget::new(session_screen).with_defaults(look.theme.text, look.theme.background);
+    frame.render_widget(widget, screen);
+    if !session_screen.hide_cursor() {
+        let (row, col) = session_screen.cursor_position();
+        frame.set_cursor_position((screen.x + col, screen.y + row));
     }
 }
 
@@ -529,10 +585,14 @@ pub fn draw_message(frame: &mut Frame, look: &Look, message: &str, area: Rect) {
 /// is and the keys that matter there, with "? keys" on the right.
 fn draw_footer(frame: &mut Frame, app: &App, look: &Look, area: Rect) {
     let theme = look.theme;
-    if app.launcher().is_some() {
+    if app.plugin_pane().is_some() {
+        frame.render_widget(hint_spans(&[("ctrl+\\", "close")], theme), area);
+    } else if app.launcher().is_some() {
         frame.render_widget(hint_spans(LAUNCHER_HINTS, theme), area);
     } else if let Some(view) = app.profiles_view() {
         frame.render_widget(hint_spans(profiles::hints(view), theme), area);
+    } else if app.plugins_view().is_some() {
+        frame.render_widget(hint_spans(plugins_view::HINTS, theme), area);
     } else if let Some(prompt) = app.prompt() {
         draw_prompt(frame, theme, prompt, area);
     } else if app.issues_view().is_some() {
@@ -821,7 +881,7 @@ mod tests {
         let theme = theme();
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal
-            .draw(|frame| draw(frame, app, &[], &look(&theme)))
+            .draw(|frame| draw(frame, app, &[], None, &look(&theme)))
             .unwrap();
         let buffer = terminal.backend().buffer();
         (0..buffer.area.height)

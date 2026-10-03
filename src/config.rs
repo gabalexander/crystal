@@ -4,9 +4,11 @@
 //! A key crystal doesn't know is an error, not something to skip: a
 //! setting spelled wrong would otherwise do nothing, without a word.
 
+use crate::plugins;
 use crate::profile::Profile;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -26,9 +28,11 @@ pub struct Config {
     pub new_session: String,
     /// The TUI's colors.
     pub theme: ThemeName,
-    /// Show Claude Code what the project's earlier sessions learned when a
-    /// session starts: see [`crate::memory`].
-    pub memory: bool,
+    /// Which plugins are on and off, by name: crystal's own, which are on
+    /// unless switched off here, and ones the user installed, which are off
+    /// until switched on. See [`crate::plugins`].
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub plugins: BTreeMap<String, bool>,
     /// Saved ways to start an agent, offered first in the new-session
     /// panel: `[[profile]]` tables in the file. See [`crate::profile`].
     #[serde(rename = "profile", skip_serializing_if = "Vec::is_empty")]
@@ -53,7 +57,7 @@ impl Default for Config {
             notify_command: None,
             new_session: "claude".to_string(),
             theme: ThemeName::Dark,
-            memory: true,
+            plugins: BTreeMap::new(),
             profiles: Vec::new(),
         }
     }
@@ -74,7 +78,10 @@ impl Config {
                 return Err(err).with_context(|| format!("couldn't read {}", path.display()));
             }
         };
-        from_text(&text).with_context(|| format!("in {}", path.display()))
+        let config = from_text(&text).with_context(|| format!("in {}", path.display()))?;
+        check_plugins(&config, &plugins::installed_names())
+            .with_context(|| format!("in {}", path.display()))?;
+        Ok(config)
     }
 
     /// The settings written as TOML, the way the file would hold them.
@@ -97,6 +104,25 @@ pub fn path() -> PathBuf {
     base.join("crystal").join("config.toml")
 }
 
+/// Checks that every name in `[plugins]` is a plugin: one of crystal's
+/// own, or one of those `installed`. A name spelled wrong would otherwise
+/// switch nothing, without a word.
+pub fn check_plugins(config: &Config, installed: &[String]) -> Result<()> {
+    for name in config.plugins.keys() {
+        let known = plugins::is_built_in(name) || installed.iter().any(|plugin| plugin == name);
+        if !known {
+            let built_in: Vec<&str> = plugins::BUILT_IN.iter().map(|plugin| plugin.name).collect();
+            bail!(
+                "`[plugins]` names `{name}`, which is neither one of crystal's plugins ({}) \
+                 nor one installed in {}",
+                built_in.join(", "),
+                plugins::plugins_dir().display()
+            );
+        }
+    }
+    Ok(())
+}
+
 /// The settings `text`, a config file's contents, holds; or an error that
 /// says what doesn't make sense in it.
 pub fn from_text(text: &str) -> Result<Config> {
@@ -105,6 +131,10 @@ pub fn from_text(text: &str) -> Result<Config> {
     // that `preset` is a key crystal doesn't know.
     if table.contains_key("preset") {
         bail!("`[[preset]]` tables are now `[[profile]]`: rename them in the file");
+    }
+    // Memory became a plugin; say where its setting went.
+    if table.contains_key("memory") {
+        bail!("`memory` is now a plugin: put `memory = …` under a `[plugins]` line instead");
     }
     let config: Config = table.try_into()?;
     for profile in &config.profiles {
@@ -224,6 +254,27 @@ where = "worktree"
     }
 
     #[test]
+    fn plugins_are_switched_by_name() {
+        let config = parse("[plugins]\nmemory = false\ngithub = true\n").unwrap();
+        assert_eq!(config.plugins.get("memory"), Some(&false));
+        assert_eq!(config.plugins.get("github"), Some(&true));
+    }
+
+    #[test]
+    fn a_plugin_that_doesnt_exist_is_an_error_that_names_it() {
+        let config = parse("[plugins]\nmemroy = false\n").unwrap();
+        let err = check_plugins(&config, &[]).unwrap_err();
+        assert!(format!("{err:#}").contains("memroy"), "{err:#}");
+        assert!(check_plugins(&config, &["memroy".to_string()]).is_ok());
+    }
+
+    #[test]
+    fn a_leftover_memory_setting_says_where_it_went() {
+        let err = parse("memory = false\n").unwrap_err();
+        assert!(format!("{err:#}").contains("`[plugins]`"), "{err:#}");
+    }
+
+    #[test]
     fn a_leftover_preset_says_its_now_a_profile() {
         let err = parse("[[preset]]\nname = \"x\"\nagent = \"claude\"\n").unwrap_err();
         assert!(
@@ -239,7 +290,7 @@ where = "worktree"
             notify_command: Some("say \"$CRYSTAL_NOTICE\"".into()),
             new_session: "codex --model o3".into(),
             theme: ThemeName::Terminal,
-            memory: false,
+            plugins: BTreeMap::from([("memory".to_string(), false)]),
             profiles: vec![Profile {
                 name: "review".into(),
                 description: Some("A second pair of eyes".into()),

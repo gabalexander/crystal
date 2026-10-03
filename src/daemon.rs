@@ -10,6 +10,7 @@ use crate::env;
 use crate::keys;
 use crate::memory::{self, Memory};
 use crate::notify;
+use crate::plugin_hooks::{self, Event, Hooks};
 use crate::project::{self, Project};
 use crate::protocol::{
     self, Backlog, Conversation, Frame, NewSession, NewTask, Request, Response, TaskInfo,
@@ -21,7 +22,7 @@ use crate::state::{self, SavedSession};
 use crate::tasks;
 use crate::typing;
 use anyhow::{Context, Result, bail, ensure};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{BufReader, ErrorKind, Write};
 use std::net::Shutdown;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -49,6 +50,7 @@ pub fn run(socket: &Path) -> Result<()> {
         state: state::path(socket),
         sessions: Mutex::default(),
         stores: Mutex::default(),
+        hooks: Hooks::new(socket),
     });
     daemon.start_saved_sessions();
     thread::spawn({
@@ -93,6 +95,8 @@ struct Daemon {
     /// Held while a project's backlog or task history is read and written
     /// back, so two requests at once can't each write over the other.
     stores: Mutex<()>,
+    /// The plugins' hooks, told what happens.
+    hooks: Hooks,
 }
 
 impl Daemon {
@@ -183,6 +187,9 @@ impl Daemon {
     /// doing, and writes down the running sessions when they've changed.
     fn keep_up(&self) {
         let mut last_saved: Vec<SavedSession> = Vec::new();
+        // Whether each session was running, and what its agent was doing,
+        // the last time round, by id, to tell plugins what changed.
+        let mut last_seen: HashMap<String, (bool, Option<protocol::Activity>)> = HashMap::new();
         loop {
             thread::sleep(KEEP_UP_EVERY);
             let mut sessions = self.sessions.lock().unwrap();
@@ -206,7 +213,17 @@ impl Daemon {
                 if let Some(notice) = session.notice() {
                     notify::tell(notice);
                 }
+                let now = (session.is_running(), session.activity());
+                // Every session starts running, its agent doing nothing it
+                // has said; that it started was told as it did.
+                let started = (true, None);
+                let before = last_seen.insert(session.id.clone(), now).unwrap_or(started);
+                for change in plugin_hooks::session_changes(before, now) {
+                    self.hooks
+                        .tell(Event::about_session(change, &session.info()));
+                }
             }
+            last_seen.retain(|id, _| sessions.iter().any(|session| &session.id == id));
             // Written while the list is still locked, so that an older list
             // can never be written after a shutdown has emptied it.
             let saved: Vec<SavedSession> = sessions.iter().filter_map(Session::saved).collect();
@@ -227,6 +244,7 @@ impl Daemon {
         if let Err(err) = tasks::record(&dir, task) {
             eprintln!("crystal daemon: couldn't write down a closed task: {err:#}");
         }
+        self.hooks.tell(Event::task_closed(cwd, task));
         self.remember_outcome(cwd, task);
         let done = task.outcome.as_ref().is_some_and(|outcome| !outcome.failed);
         let ticks = done && backlog::enabled(&settings());
@@ -301,6 +319,7 @@ impl Daemon {
             Request::NewTask(task) => {
                 let mut sessions = self.sessions.lock().unwrap();
                 let name = start_task(&mut sessions, &self.socket, task, None, true)?;
+                self.tell_started(&sessions, &name);
                 Ok(Response::Created { name })
             }
             Request::List => {
@@ -332,7 +351,21 @@ impl Daemon {
                     .iter()
                     .position(|session| session.name == name)
                     .with_context(|| format!("no session named {name}"))?;
-                sessions.remove(index).stop();
+                let session = sessions.remove(index);
+                if session.is_running() {
+                    self.hooks
+                        .tell(Event::about_session("session.ended", &session.info()));
+                }
+                session.stop();
+                Ok(Response::Done)
+            }
+            Request::Worktree {
+                path,
+                branch,
+                created,
+            } => {
+                let event = Event::about_worktree(created, &path, branch.as_deref());
+                self.hooks.tell(event);
                 Ok(Response::Done)
             }
             Request::Rename { name, new_name } => {
@@ -527,7 +560,16 @@ impl Daemon {
     fn new_session(&self, new: NewSession) -> Result<Response> {
         let mut sessions = self.sessions.lock().unwrap();
         let name = start(&mut sessions, &self.socket, new, None)?;
+        self.tell_started(&sessions, &name);
         Ok(Response::Created { name })
+    }
+
+    /// Tells the plugins that the session called `name` has started.
+    fn tell_started(&self, sessions: &[Session], name: &str) {
+        if let Some(session) = sessions.iter().find(|session| session.name == name) {
+            self.hooks
+                .tell(Event::about_session("session.started", &session.info()));
+        }
     }
 
     /// Runs an ended session's command again, in its directory and under
@@ -581,6 +623,7 @@ impl Daemon {
         // one was.
         let started = sessions.pop().expect("start added a session");
         sessions.insert(index, started);
+        self.tell_started(&sessions, name);
         Ok(Response::Done)
     }
 }

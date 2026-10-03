@@ -302,6 +302,11 @@ impl Session {
         *self.state.lock().unwrap() == State::Running
     }
 
+    /// What the session's agent is doing, when it reports that.
+    pub fn activity(&self) -> Option<Activity> {
+        self.activity
+    }
+
     pub fn info(&self) -> SessionInfo {
         SessionInfo {
             front: self.front.clone(),

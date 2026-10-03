@@ -10,6 +10,7 @@
 //! can be switched off as one.
 
 use crate::config::Config;
+use crate::plugins;
 use crate::protocol::BacklogItem;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -19,18 +20,14 @@ use std::path::Path;
 /// The file a project's backlog is kept in, in its directory.
 const FILE: &str = "backlog.json";
 
-/// Whether the backlog is on. It always is for now; this is the one place
-/// that will say otherwise once it can be switched off.
-pub fn enabled(_config: &Config) -> bool {
-    true
+/// Whether the backlog is on: the `backlog` plugin.
+pub fn enabled(config: &Config) -> bool {
+    plugins::enabled(config, "backlog")
 }
 
 /// Refuses a command that's only about the backlog while it's off.
 pub fn ensure_enabled(config: &Config) -> Result<()> {
-    if !enabled(config) {
-        bail!("the backlog plugin is off");
-    }
-    Ok(())
+    plugins::ensure_enabled(config, "backlog")
 }
 
 /// A project's backlog as it's kept: its items, and the number the next one

@@ -25,7 +25,7 @@ impl Crystal {
         // the test sees, and no test pops up a real notification. Memory is
         // off unless a test turns it on, so Claude's arguments stay as each
         // test expects them.
-        crystal.configure("notify = false\nmemory = false\n");
+        crystal.configure("notify = false\n\n[plugins]\nmemory = false\n");
         crystal
     }
 
@@ -845,6 +845,8 @@ fn a_profile_from_the_config_starts_with_its_options_and_prompt() {
     let crystal = Crystal::new();
     crystal.configure(
         r#"notify = false
+
+[plugins]
 memory = false
 
 [[profile]]
@@ -4300,7 +4302,7 @@ fn the_panel_starts_claude_in_the_background_as_a_task() {
 #[test]
 fn a_closed_task_is_remembered_in_its_project_s_memory() {
     let crystal = Crystal::new();
-    crystal.configure("notify = false\nmemory = true\n");
+    crystal.configure("notify = false\n");
     let dir = crystal.dir.path();
     let bin = finishing_claude(dir);
     let finish = dir.join("finish");

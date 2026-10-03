@@ -101,6 +101,7 @@ you are and offers the keys that matter there.
 | `p` | find a file in the selected session's worktree and edit it: [the file finder](#the-file-finder) |
 | `m` | what the selected session's project has remembered: [memory](#memory) |
 | `P` | list your [profiles](#profiles), and add, change, copy or remove one |
+| `X` | list the [plugins](#plugins): switch them on and off, run their actions and open their panes |
 | `?` | show every key, in the sidebar, in a pane, in a question and with the mouse |
 | `q` | quit; the sessions keep running |
 

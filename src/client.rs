@@ -176,7 +176,9 @@ pub fn remove_worktree(socket: &Path, path: &Path) -> Result<()> {
             .collect();
         bail!("{} still running in {}", names.join(", "), path.display());
     }
+    let branch = git::Checkout::find(path).and_then(|checkout| checkout.worktree().branch);
     git::remove_worktree(path)?;
+    tell_worktree(socket, path, branch, false);
     for session in ended {
         let kill = Request::Kill {
             name: session.name.clone(),
@@ -184,6 +186,31 @@ pub fn remove_worktree(socket: &Path, path: &Path) -> Result<()> {
         ask(socket, &kill, false)?;
     }
     Ok(())
+}
+
+/// Makes a worktree for `branch` in the repository `dir` is in, as
+/// [`git::add_worktree`] does, and tells the daemon, for the plugins that
+/// listen for new worktrees.
+pub fn add_worktree(socket: &Path, dir: &Path, branch: &str) -> Result<PathBuf> {
+    let path = git::add_worktree(dir, branch)?;
+    tell_worktree(socket, &path, Some(branch.to_string()), true);
+    Ok(path)
+}
+
+/// Tells the daemon a worktree was made or removed. The worktree is made or
+/// gone either way, so a daemon that can't be told is no reason to fail.
+fn tell_worktree(socket: &Path, path: &Path, branch: Option<String>, created: bool) {
+    let request = Request::Worktree {
+        path: path.to_path_buf(),
+        branch,
+        created,
+    };
+    if let Err(err) = ask(socket, &request, false) {
+        eprintln!(
+            "crystal: couldn't tell the daemon about {}: {err:#}",
+            path.display()
+        );
+    }
 }
 
 /// Whether `session` runs in the worktree at `path`.

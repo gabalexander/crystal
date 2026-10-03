@@ -113,6 +113,13 @@ pub enum Request {
     BacklogCounts {
         projects: Vec<PathBuf>,
     },
+    /// A client made a worktree, or removed one, for the plugins that
+    /// listen for that.
+    Worktree {
+        path: PathBuf,
+        branch: Option<String>,
+        created: bool,
+    },
     /// What's on a session's screen, as text.
     Read {
         name: String,

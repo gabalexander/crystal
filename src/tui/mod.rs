@@ -20,6 +20,7 @@ mod launcher;
 mod memory_view;
 mod mouse;
 mod pane;
+mod plugins_view;
 mod profiles;
 mod screen_widget;
 mod search;
@@ -33,12 +34,13 @@ mod ui;
 use crate::config::{self, Config};
 use crate::github::{self, Issue, PullRequest};
 use crate::memory::{self, Listed, Memory};
+use crate::plugins::{self, Context};
 use crate::profile;
-use crate::protocol::{Backlog, Request, Response, SessionInfo};
+use crate::protocol::{Backlog, NewSession, Request, Response, SessionInfo};
 use crate::{catalog, keys, typing};
-use crate::{client, env, git};
-use anyhow::{Result, bail};
-use app::{Action, App, Focus, Hit, Place, Slot};
+use crate::{client, env};
+use anyhow::{Context as _, Result, bail};
+use app::{Action, App, Focus, Hit, Place, PluginKey, PluginPane, Slot};
 use backlog_view::BacklogChange;
 use crossterm::event::{Event as TerminalEvent, KeyEvent, KeyEventKind, MouseEvent};
 use diff_view::Against;
@@ -48,6 +50,8 @@ use ratatui::layout::Rect;
 use std::collections::HashMap;
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -145,8 +149,8 @@ pub fn run(socket: &Path) -> Result<()> {
 
     let (sender, events) = mpsc::channel();
     spawn_input_reader(sender.clone());
-    let count_backlog = crate::backlog::enabled(&config);
-    spawn_session_poller(socket.to_path_buf(), sender.clone(), count_backlog);
+    let count_backlog = Arc::new(AtomicBool::new(crate::backlog::enabled(&config)));
+    spawn_session_poller(socket.to_path_buf(), sender.clone(), count_backlog.clone());
     let projects = Arc::new(Mutex::new(Vec::new()));
     spawn_pull_request_poller(projects.clone(), sender.clone());
 
@@ -162,11 +166,13 @@ pub fn run(socket: &Path) -> Result<()> {
         started: Instant::now(),
         memory_path: launcher::memory_path(socket),
         quitting: false,
+        overlay: None,
+        count_backlog,
     };
     tui.app.set_agents(catalog::installed());
     tui.app.set_launch_settings(&config);
-    tui.app.set_memory_on(memory::enabled(&config));
     tui.app.set_features(&config);
+    tui.app.set_plugin_keys(plugin_keys(&config));
     tui.app.set_memory(launcher::load_memory(&tui.memory_path));
     tui.set_sessions(sessions);
 
@@ -224,6 +230,11 @@ struct Tui {
     events: Sender<Event>,
     /// The whole screen as it was last drawn, to find what the mouse is on.
     screen: Rect,
+    /// The viewer of the session of a plugin's pane, while one is open.
+    overlay: Option<Pane>,
+    /// Whether the session poller asks how many backlog items each project
+    /// has, which follows the backlog plugin being switched.
+    count_backlog: Arc<AtomicBool>,
     /// The projects the sessions are in, for the thread that asks GitHub
     /// about their pull requests.
     projects: Arc<Mutex<Vec<PathBuf>>>,
@@ -253,6 +264,13 @@ impl Tui {
             self.screen = Rect::new(0, 0, size.width, size.height);
             let areas = ui::Areas::new(self.screen, self.app.splits().len());
             self.sync_panes(&areas);
+            if let Some(overlay) = &mut self.overlay {
+                let screen = ui::plugin_pane_screen(&areas);
+                let size = (screen.height.max(1), screen.width.max(1));
+                if overlay.size() != size {
+                    overlay.resize(size.0, size.1);
+                }
+            }
             if let Some(view) = self.app.view() {
                 let parts = ui::view_areas(view, areas.main);
                 let size = |area: Rect| (area.height, area.width);
@@ -264,7 +282,8 @@ impl Tui {
                 now: seconds_since_epoch(),
                 spin: (self.started.elapsed().as_millis() / SPIN_EVERY.as_millis()) as usize,
             };
-            terminal.draw(|frame| ui::draw(frame, &self.app, &self.panes, &look))?;
+            let overlay = self.overlay.as_ref();
+            terminal.draw(|frame| ui::draw(frame, &self.app, &self.panes, overlay, &look))?;
 
             // Wait for something to happen, then take whatever else has
             // happened meanwhile, so a burst of output is drawn once.
@@ -283,7 +302,13 @@ impl Tui {
     /// which projects they're in.
     fn set_sessions(&mut self, sessions: Vec<SessionInfo>) {
         self.app.set_sessions(sessions);
-        *self.projects.lock().unwrap() = self.app.projects();
+        // With the github plugin off, the poller has nothing to ask about.
+        let asked = if self.app.github_on() {
+            self.app.projects()
+        } else {
+            Vec::new()
+        };
+        *self.projects.lock().unwrap() = asked;
     }
 
     /// Asks GitHub, off the loop, for the text of the issue the issues
@@ -342,7 +367,14 @@ impl Tui {
                 }
             }
             Event::OutputEnded { pane } => {
-                if let Some(pane) = self.pane_with_id(pane) {
+                // A plugin's pane closes as its program ends.
+                if self
+                    .overlay
+                    .as_ref()
+                    .is_some_and(|overlay| overlay.id == pane)
+                {
+                    self.close_plugin_pane();
+                } else if let Some(pane) = self.pane_with_id(pane) {
                     pane.ended = true;
                 }
             }
@@ -374,6 +406,10 @@ impl Tui {
     }
 
     fn on_mouse(&mut self, mouse: MouseEvent) {
+        // A plugin's pane takes the keyboard, not the mouse.
+        if self.overlay.is_some() {
+            return;
+        }
         let areas = ui::Areas::new(self.screen, self.app.splits().len());
         let hit = ui::hit(&areas, &self.app, mouse.column, mouse.row);
         if self.pass_to_program(&mouse, hit) {
@@ -424,7 +460,7 @@ impl Tui {
                 command,
                 purpose,
             } => {
-                let cwd = directory_for(place)?;
+                let cwd = directory_for(&self.socket, place)?;
                 let name = client::new_session_for(&self.socket, None, cwd, command, purpose)?;
                 self.show_new_session(&name)?;
                 launcher::save_memory(&self.memory_path, self.app.memory());
@@ -434,7 +470,7 @@ impl Tui {
                 spec,
                 backlog,
             } => {
-                let cwd = directory_for(place)?;
+                let cwd = directory_for(&self.socket, place)?;
                 let name = client::new_task(&self.socket, None, cwd, spec, backlog)?;
                 // A background task takes no keys: the sidebar keeps them.
                 self.refresh_sessions()?;
@@ -539,6 +575,43 @@ impl Tui {
                 let deleted = profile::delete(&config::path(), &name);
                 self.profiles_changed(deleted, None);
             }
+            Action::ListPlugins => {
+                let config = Config::load()?;
+                self.app.show_plugins(listed_plugins(&config, &self.socket));
+            }
+            Action::SwitchPlugin { name, on } => {
+                let path = config::path();
+                let switched = plugins::set_enabled(&path, &self.socket, &name, on)
+                    .and_then(|()| Config::load());
+                match switched {
+                    Ok(config) => self.plugins_changed(&config),
+                    Err(err) => self.app.plugin_failed(format!("{err:#}")),
+                }
+            }
+            Action::RunPlugin {
+                plugin,
+                action,
+                context,
+            } => self.run_plugin(&plugin, &action, context)?,
+            Action::OpenPluginPane {
+                plugin,
+                pane,
+                context,
+            } => self.open_plugin_pane(&plugin, &pane, context)?,
+            Action::TypeInPluginPane(key) => {
+                if let Some(pane) = &mut self.overlay {
+                    let application_cursor = pane.screen.screen().application_cursor();
+                    if let Some(bytes) = keys::encode(&key, application_cursor) {
+                        pane.send_keys(&bytes);
+                    }
+                }
+            }
+            Action::PasteInPluginPane(text) => {
+                if let Some(pane) = &mut self.overlay {
+                    pane.send_keys(&pasted(&text, pane.wants_paste_marked()));
+                }
+            }
+            Action::ClosePluginPane => self.close_plugin_pane(),
             Action::Kill(name) => {
                 client::ask(&self.socket, &Request::Kill { name }, false)?;
                 self.refresh_sessions()?;
@@ -640,6 +713,115 @@ impl Tui {
         }
     }
 
+    /// After a plugin was switched on or off: everything that shows what
+    /// the plugins add follows what the config file now says.
+    fn plugins_changed(&mut self, config: &Config) {
+        self.app.set_features(config);
+        self.app.set_plugin_keys(plugin_keys(config));
+        self.app.show_plugins(listed_plugins(config, &self.socket));
+        let backlog = crate::backlog::enabled(config);
+        self.count_backlog.store(backlog, Ordering::Relaxed);
+        self.set_sessions(self.app.sessions().to_vec());
+    }
+
+    /// Runs one of a plugin's actions, off the loop, with what it prints in
+    /// the plugin's log, and says how it went at the bottom.
+    fn run_plugin(&mut self, plugin: &str, action: &str, context: Context) -> Result<()> {
+        plugins::ensure_enabled(&Config::load()?, plugin)?;
+        let (dir, manifest) = installed_plugin(plugin)?;
+        let action = manifest
+            .actions
+            .into_iter()
+            .find(|candidate| candidate.id == action)
+            .with_context(|| format!("{plugin} has no action {action}"))?;
+        let context = placed(context)?;
+        plugins::log(
+            &self.socket,
+            plugin,
+            &format!("{}: {}", action.id, action.command.join(" ")),
+        );
+        let log = plugins::open_log(&self.socket, plugin)?;
+        let mut child = plugins::command(&dir, &action.command, &self.socket, &context)
+            .stdin(Stdio::null())
+            .stdout(log.try_clone()?)
+            .stderr(log)
+            .spawn()
+            .with_context(|| format!("couldn't run {}", action.command.join(" ")))?;
+        let what = format!("{plugin}: {}", action.title);
+        let plugin = plugin.to_string();
+        let events = self.events.clone();
+        thread::spawn(move || {
+            let notice = match child.wait() {
+                Ok(status) if status.success() => format!("ran {what}"),
+                Ok(status) => format!("{what} failed ({status}): `crystal plugin log {plugin}`"),
+                Err(err) => format!("{what}: {err}"),
+            };
+            let _ = events.send(Event::Notice(notice));
+        });
+        Ok(())
+    }
+
+    /// Starts one of a plugin's panes in a session of its own, and shows it
+    /// over the panes, with the keyboard.
+    fn open_plugin_pane(&mut self, plugin: &str, pane: &str, context: Context) -> Result<()> {
+        plugins::ensure_enabled(&Config::load()?, plugin)?;
+        let (dir, manifest) = installed_plugin(plugin)?;
+        let spec = manifest
+            .panes
+            .into_iter()
+            .find(|candidate| candidate.id == pane)
+            .with_context(|| format!("{plugin} has no pane {pane}"))?;
+        let context = placed(context)?;
+        let mut env = env::current();
+        for (key, said) in plugins::env(&self.socket, &context) {
+            match said {
+                Some(value) => env.insert(key.to_string(), value),
+                None => env.remove(key),
+            };
+        }
+        let taken = list_sessions(&self.socket, false)?;
+        let name = free_name(&format!("{plugin}-{pane}"), &taken);
+        let request = Request::New(NewSession {
+            name: Some(name),
+            cwd: dir.clone(),
+            command: plugins::argv(&dir, &spec.command),
+            env,
+            task: None,
+            backlog: None,
+        });
+        let Some(Response::Created { name }) = client::ask(&self.socket, &request, true)? else {
+            bail!("the daemon didn't start {plugin}'s pane");
+        };
+        let areas = ui::Areas::new(self.screen, self.app.splits().len());
+        let screen = ui::plugin_pane_screen(&areas);
+        self.last_pane_id += 1;
+        let (id, events) = (self.last_pane_id, self.events.clone());
+        let rows = screen.height.max(1);
+        let cols = screen.width.max(1);
+        self.overlay = Some(Pane::open(&self.socket, &name, rows, cols, id, events)?);
+        self.app.plugin_pane_opened(PluginPane {
+            plugin: plugin.to_string(),
+            title: spec.title,
+            session: name,
+        });
+        self.refresh_sessions()
+    }
+
+    /// Closes the plugin's pane that's open, and ends its session, which
+    /// was only ever the pane's.
+    fn close_plugin_pane(&mut self) {
+        self.overlay = None;
+        let Some(pane) = self.app.plugin_pane().cloned() else {
+            return;
+        };
+        self.app.plugin_pane_closed();
+        let kill = Request::Kill { name: pane.session };
+        if let Err(err) = client::ask(&self.socket, &kill, false) {
+            self.app.notify(format!("{err:#}"));
+        }
+        let _ = self.refresh_sessions();
+    }
+
     /// Asks the daemon, off the loop, for the backlog of the project `dir`
     /// is in, done items too.
     fn list_backlog(&self, dir: PathBuf) {
@@ -721,14 +903,126 @@ impl Tui {
     }
 
     fn pane_with_id(&mut self, id: u64) -> Option<&mut Pane> {
-        self.panes.iter_mut().find(|pane| pane.id == id)
+        self.panes
+            .iter_mut()
+            .chain(self.overlay.as_mut())
+            .find(|pane| pane.id == id)
     }
+}
+
+/// The plugins as the plugins view lists them: crystal's own, then the
+/// installed ones, each with whether it's on and what keeps it from
+/// running.
+fn listed_plugins(config: &Config, socket: &Path) -> Vec<plugins_view::Listed> {
+    let own = plugins::BUILT_IN.iter().map(|plugin| plugins_view::Listed {
+        name: plugin.name.to_string(),
+        description: plugin.description.to_string(),
+        built_in: true,
+        on: plugins::enabled(config, plugin.name),
+        trouble: None,
+        actions: Vec::new(),
+        panes: Vec::new(),
+    });
+    let installed = plugins::installed().into_iter().map(|plugin| {
+        let on = plugins::enabled(config, &plugin.name);
+        let paused = plugins::paused(socket, &plugin.name).filter(|_| on);
+        let item = |id: &str, title: &str, key: Option<&String>| plugins_view::Item {
+            id: id.to_string(),
+            title: title.to_string(),
+            key: key.cloned(),
+        };
+        match plugin.manifest {
+            Ok(manifest) => plugins_view::Listed {
+                name: plugin.name,
+                description: manifest.description,
+                built_in: false,
+                on,
+                trouble: paused.map(|_| "paused after failing: space off and on again".to_string()),
+                actions: (manifest.actions.iter())
+                    .map(|action| item(&action.id, &action.title, action.key.as_ref()))
+                    .collect(),
+                panes: (manifest.panes.iter())
+                    .map(|pane| item(&pane.id, &pane.title, None))
+                    .collect(),
+            },
+            Err(why) => plugins_view::Listed {
+                name: plugin.name,
+                description: String::new(),
+                built_in: false,
+                on,
+                trouble: Some(why),
+                actions: Vec::new(),
+                panes: Vec::new(),
+            },
+        }
+    });
+    own.chain(installed).collect()
+}
+
+/// The sidebar keys taken by the actions of the installed plugins that are
+/// on. Installing or switching on a plugin refuses a key another has, so
+/// where two plugins' files were changed to share one, the first by name
+/// keeps it.
+fn plugin_keys(config: &Config) -> Vec<PluginKey> {
+    let mut keys: Vec<PluginKey> = Vec::new();
+    let on = plugins::installed()
+        .into_iter()
+        .filter(|plugin| plugins::enabled(config, &plugin.name));
+    for plugin in on {
+        let Ok(manifest) = plugin.manifest else {
+            continue;
+        };
+        for action in manifest.actions {
+            let Some(key) = action.key.as_ref().and_then(|key| key.chars().next()) else {
+                continue;
+            };
+            if keys.iter().all(|taken| taken.key != key) {
+                keys.push(PluginKey {
+                    key,
+                    plugin: plugin.name.clone(),
+                    action: action.id,
+                    title: action.title,
+                });
+            }
+        }
+    }
+    keys
+}
+
+/// The installed plugin called `name`: its directory and manifest.
+fn installed_plugin(name: &str) -> Result<(PathBuf, crate::plugin_manifest::Manifest)> {
+    let plugin = plugins::find(name).with_context(|| format!("there's no plugin called {name}"))?;
+    let manifest = plugin
+        .manifest
+        .map_err(|why| anyhow::anyhow!("{name}'s plugin.toml: {why}"))?;
+    Ok((plugin.dir, manifest))
+}
+
+/// `context`, or, with no session selected to say where, the TUI's own
+/// directory.
+fn placed(context: Context) -> Result<Context> {
+    if context.worktree.is_some() {
+        return Ok(context);
+    }
+    Ok(Context::of_dir(&std::env::current_dir()?))
+}
+
+/// `base`, or `base-2`, `base-3`, …, whichever no session has yet.
+fn free_name(base: &str, sessions: &[SessionInfo]) -> String {
+    let taken = |name: &str| sessions.iter().any(|session| session.name == name);
+    let mut name = base.to_string();
+    let mut number = 1;
+    while taken(&name) {
+        number += 1;
+        name = format!("{base}-{number}");
+    }
+    name
 }
 
 /// The directory a new session at `place` starts in, making the worktree
 /// first when it's a new one. Where a place says nothing, it's the TUI's
 /// own directory.
-fn directory_for(place: Place) -> Result<PathBuf> {
+fn directory_for(socket: &Path, place: Place) -> Result<PathBuf> {
     match place {
         Place::Directory(Some(dir)) => Ok(dir),
         Place::Directory(None) => Ok(std::env::current_dir()?),
@@ -737,7 +1031,7 @@ fn directory_for(place: Place) -> Result<PathBuf> {
                 Some(base) => base,
                 None => std::env::current_dir()?,
             };
-            git::add_worktree(&base, &branch)
+            client::add_worktree(socket, &base, &branch)
         }
     }
 }
@@ -869,7 +1163,7 @@ fn spawn_pull_request_poller(projects: Arc<Mutex<Vec<PathBuf>>>, events: Sender<
 /// Asks for the session list every [`POLL_EVERY`], and with
 /// `count_backlog`, how many backlog items each of their projects has to
 /// do.
-fn spawn_session_poller(socket: PathBuf, events: Sender<Event>, count_backlog: bool) {
+fn spawn_session_poller(socket: PathBuf, events: Sender<Event>, count_backlog: Arc<AtomicBool>) {
     thread::spawn(move || {
         loop {
             thread::sleep(POLL_EVERY);
@@ -879,7 +1173,7 @@ fn spawn_session_poller(socket: PathBuf, events: Sender<Event>, count_backlog: b
             if events.send(Event::Sessions(sessions)).is_err() {
                 return;
             }
-            if count_backlog
+            if count_backlog.load(Ordering::Relaxed)
                 && let Some(counts) = backlog_counts(&socket, projects)
                 && events.send(Event::BacklogCounts(counts)).is_err()
             {

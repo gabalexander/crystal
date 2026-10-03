@@ -86,6 +86,15 @@ pub fn project_dirs(socket: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
+/// Where the daemon at `socket` keeps the logs of the plugins it runs.
+pub fn plugins_dir(socket: &Path) -> PathBuf {
+    if socket == socket::default_path() {
+        state_dir().join("plugins")
+    } else {
+        socket.with_extension("plugins")
+    }
+}
+
 fn projects_dir(socket: &Path) -> PathBuf {
     if socket == socket::default_path() {
         state_dir().join("projects")

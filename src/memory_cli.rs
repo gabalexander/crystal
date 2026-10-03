@@ -85,10 +85,7 @@ fn read(socket: &Path, dir: Option<PathBuf>) -> Result<Memory> {
 /// Every memory command goes through here first: with memory off, they
 /// say so rather than doing anything.
 fn check_on() -> Result<()> {
-    if !memory::enabled(&Config::load()?) {
-        bail!(memory::OFF);
-    }
-    Ok(())
+    crate::plugins::ensure_enabled(&Config::load()?, "memory")
 }
 
 fn dir_or_current(dir: Option<PathBuf>) -> Result<PathBuf> {
@@ -145,7 +142,7 @@ fn print_entries(entries: &[&Listed]) {
 
 /// Asks `question` at the terminal, and says whether the answer was yes.
 /// Away from a terminal there's nobody to answer, so it's an error.
-fn confirm(question: &str) -> Result<bool> {
+pub fn confirm(question: &str) -> Result<bool> {
     if !std::io::stdin().is_terminal() {
         bail!("not at a terminal to ask: add --yes to go ahead");
     }

@@ -81,13 +81,20 @@ pub fn tell(notice: Notice) {
     });
 }
 
+/// Whether notifications are on: the `notifications` plugin, and the
+/// `notify` setting, which came first and still works. Either one off
+/// keeps crystal quiet.
+pub fn enabled(config: &Config) -> bool {
+    config.notify && crate::plugins::enabled(config, "notifications")
+}
+
 fn tell_now(notice: &Notice) -> Result<()> {
     // Read each time, so that a change to the file counts straight away.
     let config = Config::load().unwrap_or_else(|err| {
         eprintln!("crystal daemon: {err:#}; using the default settings");
         Config::default()
     });
-    if !config.notify {
+    if !enabled(&config) {
         return Ok(());
     }
     let command = match &config.notify_command {
