@@ -252,21 +252,30 @@ fn ask_running(socket: &Path, request: &Request) -> Result<Response> {
 /// running the program it was started from. Returns `false` when there was
 /// no daemon to restart.
 pub fn restart_daemon(socket: &Path) -> Result<bool> {
-    let shutdown = Request::Shutdown {
-        keep_sessions: true,
-    };
+    if !stop_daemon(socket, true)? {
+        return Ok(false);
+    }
+    start_daemon(socket)?;
+    Ok(true)
+}
+
+/// Asks the daemon to stop, keeping its list of running sessions or not,
+/// and waits until it has. It answers before it goes, and takes its socket
+/// away as it goes, so until the socket is gone a command run next could
+/// still reach it on its way out. Returns `false` when there was no daemon
+/// to stop.
+pub fn stop_daemon(socket: &Path, keep_sessions: bool) -> Result<bool> {
+    let shutdown = Request::Shutdown { keep_sessions };
     if ask(socket, &shutdown, false)?.is_none() {
         return Ok(false);
     }
-    // The old daemon takes its socket away as it goes.
     let deadline = Instant::now() + START_TIMEOUT;
     while socket.exists() {
         if Instant::now() > deadline {
-            bail!("the old daemon didn't stop");
+            bail!("the daemon didn't stop");
         }
         thread::sleep(Duration::from_millis(10));
     }
-    start_daemon(socket)?;
     Ok(true)
 }
 
@@ -300,5 +309,40 @@ fn start_daemon(socket: &Path) -> Result<UnixStream> {
                 });
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::BufRead;
+    use std::os::unix::net::UnixListener;
+
+    #[test]
+    fn stopping_the_daemon_waits_until_its_socket_is_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("test.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let path = socket.clone();
+        // A daemon that answers, then takes a moment to take its socket
+        // away, as a real one does on its way out.
+        let daemon = thread::spawn(move || {
+            let (conn, _) = listener.accept().unwrap();
+            let mut request = String::new();
+            BufReader::new(&conn).read_line(&mut request).unwrap();
+            protocol::send(&conn, &Response::Done).unwrap();
+            thread::sleep(Duration::from_millis(200));
+            std::fs::remove_file(&path).unwrap();
+        });
+        assert!(stop_daemon(&socket, false).unwrap());
+        assert!(!socket.exists());
+        daemon.join().unwrap();
+    }
+
+    #[test]
+    fn stopping_no_daemon_says_there_was_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("test.sock");
+        assert!(!stop_daemon(&socket, false).unwrap());
     }
 }
