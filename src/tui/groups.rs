@@ -11,10 +11,14 @@
 //! between the two, so an agent never passes for a shell at a glance.
 //! Everything else stays in the order it was made in, so the list doesn't
 //! shuffle as agents work.
+//!
+//! A linked worktree with no sessions left stays at the end of its
+//! project, with a row saying so, until it's removed: it's still on disk,
+//! maybe with work in it, and the sidebar is where it's removed from.
 
 use crate::flow_run::FlowRun;
 use crate::front;
-use crate::protocol::{Activity, Front, SessionInfo};
+use crate::protocol::{Activity, Front, SessionInfo, Worktree};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -41,6 +45,10 @@ pub enum Row {
     /// The line between a worktree's agents and its terminals, when it has
     /// both.
     Terminals,
+    /// The row under a linked worktree with no sessions, the one at this
+    /// directory: the selection can be on it, to start something there or
+    /// remove the worktree.
+    NoSessions(PathBuf),
     /// The task of the session at this index, under its row: what it was
     /// asked to do, or how that went.
     Task(usize),
@@ -102,7 +110,16 @@ pub fn order(sessions: Vec<SessionInfo>, runs: &[FlowRun]) -> Vec<SessionInfo> {
 /// between them. A flow run is a heading of its own, then a row for each
 /// step: its session's, or one for the step alone when it has none. Only a
 /// kept session brings its headings, and a run's.
-pub fn rows(sessions: &[SessionInfo], runs: &[FlowRun], keep: impl Fn(usize) -> bool) -> Vec<Row> {
+///
+/// `empty` are the linked worktrees with no sessions: each goes at the end
+/// of its project, a heading and a [`Row::NoSessions`], wherever the
+/// project has a kept session.
+pub fn rows(
+    sessions: &[SessionInfo],
+    runs: &[FlowRun],
+    empty: &[Worktree],
+    keep: impl Fn(usize) -> bool,
+) -> Vec<Row> {
     let mut rows = Vec::new();
     // Where the session given a row last went, and whether it's a terminal.
     let mut previous: Option<(Option<&Path>, Under, bool)> = None;
@@ -121,10 +138,14 @@ pub fn rows(sessions: &[SessionInfo], runs: &[FlowRun], keep: impl Fn(usize) -> 
         let same_group = same_project && previous.is_some_and(|(_, u, _)| u == under);
         let after_an_agent =
             same_group && previous.is_some_and(|(_, _, was_terminal)| !was_terminal);
-        previous = Some((project, under, terminal));
         if !same_project {
+            // The project before this one has ended.
+            if let Some((Some(ended), _, _)) = previous {
+                rows.extend(empty_rows(empty, ended));
+            }
             rows.push(project_heading(session));
         }
+        previous = Some((project, under, terminal));
         match under {
             // A run's rows all came with its first session.
             Under::Run(_) if same_group => {}
@@ -148,7 +169,40 @@ pub fn rows(sessions: &[SessionInfo], runs: &[FlowRun], keep: impl Fn(usize) -> 
             }
         }
     }
+    if let Some((Some(last), _, _)) = previous {
+        rows.extend(empty_rows(empty, last));
+    }
     rows
+}
+
+/// The rows of the worktrees in `empty` that are `project`'s, in the order
+/// they come: each one's heading, and the row saying it has no sessions.
+fn empty_rows(empty: &[Worktree], project: &Path) -> Vec<Row> {
+    let mut rows = Vec::new();
+    for worktree in empty.iter().filter(|w| w.project_path == project) {
+        rows.push(Row::Worktree {
+            project: worktree.project_path.clone(),
+            branch: worktree.branch.clone(),
+            main: false,
+        });
+        rows.push(Row::NoSessions(worktree.path.clone()));
+    }
+    rows
+}
+
+/// The worktrees in `linked` that no session in `sessions` is in, ended
+/// ones included: those the sidebar would otherwise lose.
+pub fn empty_worktrees(linked: &[Worktree], sessions: &[SessionInfo]) -> Vec<Worktree> {
+    linked
+        .iter()
+        .filter(|worktree| {
+            !sessions.iter().any(|session| {
+                let in_it = session.worktree.as_ref();
+                in_it.is_some_and(|w| w.path == worktree.path)
+            })
+        })
+        .cloned()
+        .collect()
 }
 
 /// What a session goes under in its project: its worktree, or the flow run
@@ -328,8 +382,20 @@ mod tests {
         super::order(sessions, &[])
     }
 
+    /// Most tests have no worktrees without sessions either.
     fn rows(sessions: &[SessionInfo], keep: impl Fn(usize) -> bool) -> Vec<Row> {
-        super::rows(sessions, &[], keep)
+        super::rows(sessions, &[], &[], keep)
+    }
+
+    /// The linked worktree of `project` on `branch`, as git lists it.
+    fn linked(project: &str, branch: &str) -> Worktree {
+        Worktree {
+            project: project.into(),
+            project_path: PathBuf::from(format!("/code/{project}")),
+            path: PathBuf::from(format!("/code/{project}/{branch}")),
+            main: false,
+            branch: Some(branch.into()),
+        }
     }
 
     /// A run of a flow of three steps, plan, build and review, whose first
@@ -376,7 +442,7 @@ mod tests {
             &runs,
         );
         assert_eq!(names(&sessions), ["a1", "a2", "plan", "build"]);
-        let rows = super::rows(&sessions, &runs, |_| true);
+        let rows = super::rows(&sessions, &runs, &[], |_| true);
         assert_eq!(
             rows[5..],
             [
@@ -398,7 +464,9 @@ mod tests {
             ],
             &runs,
         );
-        let rows = super::rows(&sessions, &runs, |index| sessions[index].name == "build");
+        let rows = super::rows(&sessions, &runs, &[], |index| {
+            sessions[index].name == "build"
+        });
         assert_eq!(
             rows[1..],
             [Row::Flow(0), Row::Session(1), Row::Step { run: 0, step: 2 }]
@@ -532,5 +600,53 @@ mod tests {
                 Row::Session(3),
             ]
         );
+    }
+
+    #[test]
+    fn a_worktree_with_no_sessions_stays_at_the_end_of_its_project() {
+        let sessions = order(vec![
+            session("a1", "app", "main"),
+            session("w1", "web", "main"),
+        ]);
+        let empty = [linked("app", "old"), linked("web", "spike")];
+        let rows = super::rows(&sessions, &[], &empty, |_| true);
+        let old = Row::Worktree {
+            project: PathBuf::from("/code/app"),
+            branch: Some("old".into()),
+            main: false,
+        };
+        assert_eq!(
+            rows[2..5],
+            [
+                Row::Session(0),
+                old,
+                Row::NoSessions(PathBuf::from("/code/app/old")),
+            ]
+        );
+        assert!(matches!(&rows[5], Row::Project { name, .. } if name == "web"));
+        assert_eq!(
+            rows.last(),
+            Some(&Row::NoSessions(PathBuf::from("/code/web/spike")))
+        );
+    }
+
+    #[test]
+    fn a_worktree_with_no_sessions_shows_only_where_its_project_does() {
+        let sessions = order(vec![
+            session("a1", "app", "main"),
+            session("w1", "web", "main"),
+        ]);
+        let empty = [linked("app", "old")];
+        let rows = super::rows(&sessions, &[], &empty, |index| index == 1);
+        assert!(!rows.iter().any(|row| matches!(row, Row::NoSessions(_))));
+    }
+
+    #[test]
+    fn a_worktree_with_a_session_in_it_ended_or_not_isn_t_empty() {
+        let mut ended = session("a", "app", "feat");
+        ended.state = State::Exited { code: 0 };
+        let worktrees = [linked("app", "feat"), linked("app", "old")];
+        let empty = empty_worktrees(&worktrees, &[ended]);
+        assert_eq!(empty, [linked("app", "old")]);
     }
 }

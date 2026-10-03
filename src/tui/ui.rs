@@ -516,9 +516,16 @@ fn draw_pane(frame: &mut Frame, app: &App, look: &Look, slot: Slot, area: Rect, 
     let header = Rect::new(area.x, area.y, area.width, 1);
 
     let Some(session) = session else {
-        if slot == Slot::Selected && app.sessions().is_empty() {
+        if slot != Slot::Selected {
+            return;
+        }
+        if let Some(worktree) = app.selected_empty_worktree() {
+            let branch = worktree.branch.as_deref().unwrap_or("(detached)");
+            let message = format!("No sessions in ⎇ {branch}");
+            draw_message(frame, look, &message, screen);
+        } else if app.sessions().is_empty() {
             draw_message(frame, look, "No sessions yet: n starts one", screen);
-        } else if slot == Slot::Selected {
+        } else {
             draw_message(frame, look, "Nothing in this tab yet", screen);
         }
         return;
@@ -811,6 +818,18 @@ const GATE_HINTS: &[(&str, &str)] = &[
     ("d", "diff"),
 ];
 
+/// The sidebar's keys while the selection is on a worktree with no
+/// sessions.
+const EMPTY_WORKTREE_HINTS: &[(&str, &str)] = &[
+    ("n", "start one here"),
+    ("W", "remove it"),
+    ("d", "diff"),
+    ("p", "files"),
+    ("q", "quit"),
+    ("u", "next"),
+    ("/", "find"),
+];
+
 /// The sidebar's keys while the selected step's flow run has stopped, at a
 /// step that failed or was cut short.
 const STOPPED_HINTS: &[(&str, &str)] = &[
@@ -941,8 +960,12 @@ fn hints_line<'a>(app: &App, theme: &Theme, width: u16) -> Line<'a> {
 }
 
 /// The sidebar's keys, led by what the selected step's flow run takes
-/// while it waits on the user.
+/// while it waits on the user, or by what can be done with a worktree
+/// with no sessions.
 fn sidebar_hints(app: &App) -> &'static [(&'static str, &'static str)] {
+    if app.selected_empty_worktree().is_some() {
+        return EMPTY_WORKTREE_HINTS;
+    }
     let index = app.selected_index();
     let run = index.and_then(|index| app.flow_step_of(index));
     match run.map(|(run, _)| run.state()) {
@@ -952,20 +975,14 @@ fn sidebar_hints(app: &App) -> &'static [(&'static str, &'static str)] {
     }
 }
 
-/// Where the selected session is: its project, branch and name. Cut from
-/// the left to a third of the footer, so the keys keep their room.
+/// Where the selection is: the selected session's project, branch and
+/// name, or the project and branch of the worktree with no sessions it's
+/// on. Cut from the left to a third of the footer, so the keys keep their
+/// room.
 fn whereabouts<'a>(app: &App, theme: &Theme, width: u16) -> Vec<Span<'a>> {
-    let Some(session) = app.selected() else {
+    let Some(full) = selection_place(app) else {
         return vec![Span::raw(" ")];
     };
-    let place = match &session.worktree {
-        Some(worktree) => {
-            let branch = worktree.branch.as_deref().unwrap_or("(detached)");
-            format!("{} ▸ {branch} ▸ ", worktree.project)
-        }
-        None => String::new(),
-    };
-    let full = format!("{place}{}", session.name);
     let room = usize::from(width / 3);
     let shown = if full.chars().count() <= room {
         full
@@ -977,6 +994,24 @@ fn whereabouts<'a>(app: &App, theme: &Theme, width: u16) -> Vec<Span<'a>> {
         Span::raw(" "),
         Span::styled(shown, Style::new().fg(theme.text)),
     ]
+}
+
+/// Where the selection is, written out whole: `payments ▸ fix/login ▸
+/// claude`, or `payments ▸ old-spike` on a worktree with no sessions.
+fn selection_place(app: &App) -> Option<String> {
+    if let Some(worktree) = app.selected_empty_worktree() {
+        let branch = worktree.branch.as_deref().unwrap_or("(detached)");
+        return Some(format!("{} ▸ {branch}", worktree.project));
+    }
+    let session = app.selected()?;
+    let place = match &session.worktree {
+        Some(worktree) => {
+            let branch = worktree.branch.as_deref().unwrap_or("(detached)");
+            format!("{} ▸ {branch} ▸ ", worktree.project)
+        }
+        None => String::new(),
+    };
+    Some(format!("{place}{}", session.name))
 }
 
 /// "? keys", where `?` opens the list of every key: from the sidebar only,
@@ -1125,6 +1160,31 @@ mod tests {
             .iter()
             .map(|span| span.content.as_ref())
             .collect()
+    }
+
+    #[test]
+    fn a_worktree_with_no_sessions_is_drawn_with_a_row_saying_so() {
+        let mut app = App::new(None);
+        app.set_sessions(vec![in_worktree("planner", "main", true)]);
+        let old = Worktree {
+            project: "app".into(),
+            project_path: PathBuf::from("/code/app"),
+            path: PathBuf::from("/code/app/old"),
+            main: false,
+            branch: Some("old".into()),
+        };
+        app.set_worktrees(PathBuf::from("/code/app"), vec![old]);
+        let lines = sidebar_text(&app);
+        let heading = line_with(&lines, "⎇ old");
+        assert!(lines[heading + 1].contains("· no sessions"), "{lines:?}");
+
+        // On it, the pane says there's nothing there, and the footer how to
+        // start something or remove it.
+        app.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        let screen = screen_text(&app).join("\n");
+        assert!(screen.contains("No sessions in ⎇ old"), "{screen}");
+        assert!(screen.contains("n start one here"), "{screen}");
+        assert!(screen.contains("W remove it"), "{screen}");
     }
 
     #[test]
