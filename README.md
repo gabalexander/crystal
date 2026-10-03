@@ -32,7 +32,8 @@ worktrees. The agents keep working after you close it, and you can always see wh
 - **One worktree per agent** — give an agent its own branch and `git worktree` in one key, so agents working in
   parallel never edit the same checkout.
 - **Conversations survive restarts** — when crystal comes back up, each agent reopens its previous
-  conversation.
+  conversation. An upgrade doesn't even stop them: the daemon hands every running program over to the new
+  crystal.
 - **Agents can run agents** — from the CLI or the socket, one agent can start another, send it a task, wait for
   it to finish and read what it said.
 - **Bring any agent** — Claude Code, Codex, Cursor, OpenCode, or any program that runs in a terminal, run
@@ -66,9 +67,13 @@ or `cargo install --git https://github.com/gabalexander/crystal`.
 
 There's one binary: crystal starts its daemon in the background, from the same binary, the first time it's
 needed. A daemon that's already running goes on running the old crystal until it's restarted, so after
-upgrading, run `crystal restart-server` (the install script and `make install` do it for you). Running
-sessions come back: Claude Code in its conversation, other programs from the start. A crystal that finds a
-daemon of another version says so, rather than misunderstanding it.
+upgrading, run `crystal restart-server` (the install script and `make install` do it for you). It hands the
+daemon over to the new crystal without stopping anything: programs go on running, background tasks go on
+working, and every screen keeps what it showed, history and all. A TUI or `crystal attach` left open picks its
+session up again by itself. `crystal restart-server --cold` stops the daemon and starts it again instead, as a
+daemon from before handovers is restarted: running sessions come back, Claude Code in its conversation, other
+programs from the start. A crystal that finds a daemon of another version says so, rather than misunderstanding
+it; a TUI left open on an older crystal asks you to start it again.
 
 ## Usage
 
@@ -279,7 +284,8 @@ crystal rename review reviewer              # give a session another name
 crystal respawn reviewer                    # run an ended session again; an agent in its conversation
 crystal kill review                         # stop one session
 crystal kill-server                         # stop every session, and the daemon
-crystal restart-server                      # restart the daemon, say after an upgrade; sessions come back
+crystal restart-server                      # restart the daemon on this crystal, say after an upgrade
+crystal restart-server --cold               # stop it and start it again: sessions start again too
 crystal server                              # list the servers, daemons of their own (see below)
 crystal config                              # where the config file is, and the settings in effect
 crystal profile                             # list your agent profiles
@@ -726,11 +732,12 @@ crystal report idle -- my-agent --resume "$SESSION_ID" --model my-model
 crystal report --session-only -- my-agent --resume "$NEW_ID"     # only the command, when the session changes
 ```
 
-After crystal restarts, from a crash, a reboot or `crystal restart-server`, the session starts again in its
-directory and runs that command: typed into the session's shell when the session runs one, the way you
+After crystal restarts, from a crash, a reboot or `crystal restart-server --cold`, the session starts again in
+its directory and runs that command: typed into the session's shell when the session runs one, the way you
 started your agent, or else in place of the session's own command, which `ls` still shows. Then your agent
 says what it's doing again, as it did the first time, command and all. `crystal respawn` does the same for a
-session that ended while your agent held it. A command that breaks these rules is refused, and the report
+session that ended while your agent held it. `crystal restart-server` hands the session over instead: your
+agent goes on running, and still holds it. A command that breaks these rules is refused, and the report
 with it:
 
 - Its first word is a plain command name found on the `PATH`, like `my-agent`, not a path.
@@ -1044,7 +1051,9 @@ crystal interrupt docs                                               # stop the 
 - A run that fails, or crashes before saying anything, ends the task, which shows how it exited and why.
   `crystal respawn` runs its prompt again, in its conversation if it got that far.
 - After a restart, a task comes back at rest rather than running its prompt again, and what it showed before
-  is gone; `crystal send` carries its conversation on.
+  is gone; `crystal send` carries its conversation on. `restart-server` hands it over as it is instead: its
+  `claude` goes on with the run it's in, a permission it's asking for is still there to answer, and its
+  screen keeps what it showed.
 
 `<task>` is the task's session, or its [task](#tasks) number, like `t12`.
 
@@ -1438,9 +1447,10 @@ crystal flow defs                    # the flows a run started here finds, and w
   as the task is the goal.
 - Runs are kept with the sessions, in crystal's database. After a restart, a run waiting at a gate waits
   again, a step in a terminal whose session comes back carries on there, and a background step that was
-  running is marked interrupted until you run it again, in its conversation. A run's steps start from the
-  environment of the `crystal flow run` that started it; after a restart, from the daemon's. The daemon reads
-  the flow and its profiles as the run starts, so changing them never changes a run halfway.
+  running is marked interrupted until you run it again, in its conversation; `restart-server` hands runs over
+  as they are, every step running carrying on. A run's steps start from the environment of the `crystal flow
+  run` that started it; after a restart, from the daemon's. The daemon reads the flow and its profiles as the
+  run starts, so changing them never changes a run halfway.
 
 ### Plugins
 
@@ -1622,6 +1632,7 @@ matched anywhere in the link unless `^` and `$` pin it. `X` lists each plugin's 
 | `backlog.added` | an item goes on a project's backlog |
 | `backlog.closed` | an item is marked done |
 | `plugin.paused` | a plugin is paused for failing |
+| `daemon.handed_over` | the daemon is handed over to another crystal, its sessions carrying on (see `restart-server`) |
 
 A hook gets the event as a line of JSON on its standard input, the same as the [event log](#events) keeps it,
 and its name in `CRYSTAL_EVENT`:
@@ -1772,6 +1783,15 @@ One binary is both the client and the daemon. The first `crystal` you run starts
 The daemon owns the PTYs, tracks each session's status and saves its state to disk. The TUI and the CLI
 commands talk to it over a unix socket, so closing the TUI never stops an agent.
 
+`crystal restart-server` hands the daemon over to the crystal it's run from. The daemon finishes the requests
+it's answering, gives plugins' hooks a few seconds to finish, then writes down what exec can't carry, each
+session's state and screen, and runs the new crystal in its own process with `exec`. The pid stays the same,
+so every program is still the daemon's child, and how it ends is still known; the PTYs, a background task's
+pipes to its `claude` and the listening socket stay open across the exec, so a client that connects meanwhile
+only waits. Attaches and event streams are cut, and come back by themselves: an event stream picks up after
+the last event it had, with none missed, and the log has a `daemon.handed_over`. If the new crystal can't take
+over, the daemon is restarted cold from the sessions it wrote down first.
+
 ## Roadmap
 
 - [x] Project skeleton
@@ -1790,6 +1810,7 @@ commands talk to it over a unix socket, so closing the TUI never stops an agent.
 - [x] Links in panes, opened with `Ctrl`+click or by a plugin; plugins' builds and startup commands
 - [x] An event log, a stream of events on the socket, and waits on it
 - [x] Any agent saying what it's doing and how to resume it, and sessions named from their first prompt
+- [x] Restart the daemon on a new crystal without stopping its sessions
 
 ## Development
 
@@ -1797,7 +1818,7 @@ commands talk to it over a unix socket, so closing the TUI never stops an agent.
 make build      # cargo build
 make test       # cargo test
 make lint       # cargo fmt --check, and clippy with warnings as errors
-make install    # a release build into ~/.local/bin, and the daemon restarted on it
+make install    # a release build into ~/.local/bin, and the daemon handed over to it
 ```
 
 If you're an AI agent working on this repository, read [`AGENTS.md`](AGENTS.md) before making changes.

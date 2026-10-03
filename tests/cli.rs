@@ -2686,8 +2686,347 @@ fn tabs_come_back_when_the_tui_opens_again() {
     sidebar_hides(&tui, "❯ sh");
 }
 
+/// A program that counts, a line every tenth of a second.
+const COUNTER: &str = "i=0; while true; do i=$((i+1)); echo count $i; sleep 0.1; done";
+
+/// The highest count `name` has on its screen.
+fn last_count(crystal: &Crystal, name: &str) -> u64 {
+    crystal
+        .ok(&["read", name])
+        .lines()
+        .filter_map(|line| line.strip_prefix("count ")?.parse().ok())
+        .max()
+        .unwrap_or(0)
+}
+
 #[test]
-fn restart_server_brings_the_running_sessions_back() {
+fn restart_server_hands_the_sessions_over_and_they_never_stop() {
+    let crystal = Crystal::new();
+    crystal.ok(&["new", "-n", "counter", "sh", "-c", COUNTER]);
+    crystal.ok(&["new", "-n", "echo", "cat"]);
+    crystal.ok(&["new", "-n", "ended", "sh", "-c", "echo bye; exit 3"]);
+    crystal.ok(&["send", "echo", "before"]);
+    shows_on_screen(&crystal, "echo", "before");
+    eventually("it has counted a while", || {
+        last_count(&crystal, "counter") >= 5
+    });
+    eventually("the last has ended", || {
+        crystal.row("ended").unwrap()[1] == "exited 3"
+    });
+    let (counter, echo) = (crystal.pid("counter"), crystal.pid("echo"));
+
+    assert_eq!(
+        crystal.ok(&["restart-server"]),
+        "restarted the daemon, and its sessions carried on\n"
+    );
+    // The same programs, never stopped, their screens as they were.
+    assert_eq!(crystal.pid("counter"), counter);
+    assert_eq!(crystal.pid("echo"), echo);
+    shows_on_screen(&crystal, "echo", "before");
+    let counted = last_count(&crystal, "counter");
+    eventually("it counts on", || last_count(&crystal, "counter") > counted);
+    let history = crystal.ok(&["read", "counter", "--history"]);
+    assert!(history.lines().any(|line| line == "count 1"), "{history}");
+    // Typing still reaches them.
+    crystal.ok(&["send", "echo", "after"]);
+    shows_on_screen(&crystal, "echo", "after");
+    // The one that had ended is there as it ended.
+    assert_eq!(crystal.row("ended").unwrap()[1], "exited 3");
+    shows_on_screen(&crystal, "ended", "bye");
+    let events = crystal.ok(&["events"]);
+    assert!(
+        events.contains("daemon.handed_over  daemon  from crystal"),
+        "{events}"
+    );
+    // A program that ends after the handover is seen to, the way it ended.
+    crystal.ok(&["kill", "counter"]);
+    crystal.ok(&["send-keys", "echo", "C-d"]);
+    eventually("cat has ended", || {
+        crystal.row("echo").unwrap()[1] == "exited 0"
+    });
+}
+
+#[test]
+fn two_handovers_asked_for_at_once_both_carry_the_sessions_on() {
+    let crystal = Crystal::new();
+    crystal.ok(&["new", "-n", "keeper", "sleep", "300"]);
+    let pid = crystal.pid("keeper");
+    let restarts: Vec<std::process::Child> = (0..2)
+        .map(|_| {
+            crystal
+                .command(&["restart-server"])
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap()
+        })
+        .collect();
+    for restart in restarts {
+        let out = restart.wait_with_output().unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "restarted the daemon, and its sessions carried on\n"
+        );
+    }
+    assert_eq!(crystal.pid("keeper"), pid);
+}
+
+#[test]
+fn a_task_halfway_through_a_run_carries_on_through_a_handover() {
+    let crystal = Crystal::new();
+    let dir = crystal.dir.path();
+    let path = path_with(&print_claude(dir));
+    let task = |name: &str, prompt: &str| {
+        let out = crystal
+            .command(&["task", "-n", name, prompt])
+            .env("PATH", &path)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+    };
+    task("fixer", "fix the tests");
+    // Its claude has it, as run 1.
+    runs(dir, 1);
+    eventually("it's working", || status(&crystal, "fixer") == "working");
+    task("asker", "ASK first");
+    eventually("it's asking", || status(&crystal, "asker") == "waiting");
+    let pids = (crystal.pid("fixer"), crystal.pid("asker"));
+
+    crystal.ok(&["restart-server"]);
+    assert_eq!((crystal.pid("fixer"), crystal.pid("asker")), pids);
+    shows_on_screen(&crystal, "fixer", "▸ Bash cargo test");
+    // The run goes on in the claude it had, which is answered there too.
+    finish_run(dir, 1);
+    eventually("it's done", || status(&crystal, "fixer") == "done");
+    assert_eq!(crystal.ok(&["result", "fixer"]), "All green on run 1.\n");
+    crystal.ok(&["answer", "asker", "y"]);
+    eventually("it's done", || status(&crystal, "asker") == "done");
+    assert_eq!(runs(dir, 2).len(), 2, "no claude started again");
+    assert!(
+        std::fs::read_to_string(dir.join("answers"))
+            .unwrap()
+            .contains(r#""behavior":"allow""#)
+    );
+}
+
+#[test]
+fn a_flow_s_step_carries_on_through_a_handover() {
+    let crystal = Crystal::new();
+    crystal.configure(FLOWS);
+    let dir = crystal.dir.path();
+    let path = path_with(&flow_claude(dir));
+    assert_eq!(
+        flow_ok(&crystal, &path, &["pair", "SLOW", "down"]),
+        "pair-1\n"
+    );
+    runs(dir, 1);
+
+    crystal.ok(&["restart-server"]);
+    let listed = crystal.ok(&["flow"]);
+    assert!(!listed.contains("interrupted"), "{listed}");
+    std::fs::write(dir.join("go"), "").unwrap();
+    // The next step starts from the run's environment, which finds the
+    // fake claude.
+    assert_eq!(flow_waits(&crystal, "pair-1"), "done\n");
+    assert_eq!(runs(dir, 2).len(), 2);
+}
+
+#[test]
+fn an_attach_carries_on_through_a_handover() {
+    let crystal = Crystal::new();
+    crystal.ok(&["new", "-n", "echo", "cat"]);
+    let mut attached = crystal.attach(&["attach", "echo"]);
+    attached.type_keys("before\r");
+    attached.shows("before");
+
+    crystal.ok(&["restart-server"]);
+    // Shown once the attach has come back, whether it comes as output or
+    // in the screen it's sent as it does.
+    crystal.ok(&["send", "echo", "from outside"]);
+    attached.shows("from outside");
+    attached.type_keys("after\r");
+    attached.shows("after");
+    attached.shows("before");
+    assert!(attached.child.try_wait().unwrap().is_none());
+}
+
+#[test]
+fn the_tui_carries_on_through_a_handover() {
+    let crystal = Crystal::new();
+    crystal.ok(&["new", "-n", "cat", "cat"]);
+    let mut tui = crystal.tui();
+    tui.shows("❯ cat");
+    tui.type_keys("\r");
+    tui.shows("typing into");
+    tui.type_keys("before\r");
+    tui.shows("before");
+
+    crystal.ok(&["restart-server"]);
+    crystal.ok(&["send", "cat", "from outside"]);
+    tui.shows("from outside");
+    tui.type_keys("after\r");
+    tui.shows("after");
+    tui.shows("before");
+    tui.shows("❯ cat");
+}
+
+#[test]
+fn following_events_carries_on_through_a_handover_with_none_missed() {
+    let crystal = Crystal::new();
+    let mut follower = crystal
+        .command(&["events", "--follow"])
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let lines = Arc::new(Mutex::new(Vec::new()));
+    thread::spawn({
+        let lines = lines.clone();
+        let output = follower.stdout.take().unwrap();
+        move || {
+            use std::io::BufRead;
+            for line in std::io::BufReader::new(output).lines() {
+                lines.lock().unwrap().push(line.unwrap());
+            }
+        }
+    });
+    let followed = |what: &str, name: &str| {
+        let lines = lines.clone();
+        let (what, name) = (what.to_string(), name.to_string());
+        move || {
+            let lines = lines.lock().unwrap();
+            lines
+                .iter()
+                .any(|line| line.contains(&what) && line.contains(&name))
+        }
+    };
+    // Followed from before the handover...
+    crystal.ok(&["new", "-n", "before", "sleep", "30"]);
+    eventually("it was followed", followed("session.started", "before"));
+
+    crystal.ok(&["restart-server"]);
+    crystal.ok(&["new", "-n", "after", "sleep", "30"]);
+    // ...to after, the handover itself too.
+    eventually(
+        "the handover was followed",
+        followed("daemon.handed_over", ""),
+    );
+    eventually("it was followed", followed("session.started", "after"));
+    follower.kill().unwrap();
+    follower.wait().unwrap();
+}
+
+#[test]
+fn wait_output_carries_on_through_a_handover() {
+    let crystal = Crystal::new();
+    crystal.ok(&["new", "-n", "echo", "cat"]);
+    let waiting = crystal
+        .command(&["wait", "echo", "--output", "^later$", "--timeout", "20"])
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // It's waiting once the daemon is looking at the screen for it.
+    thread::sleep(Duration::from_millis(200));
+    crystal.ok(&["restart-server"]);
+    crystal.ok(&["send", "echo", "later"]);
+    let out = waiting.wait_with_output().unwrap();
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "later\n");
+}
+
+/// Asks the daemon to hand over to the program at `exe`, the way
+/// `restart-server` asks it to hand over to itself, as a crystal that reads
+/// handovers of `format`; and gives back the answer, or nothing when the
+/// connection closes without one.
+fn ask_to_hand_over(crystal: &Crystal, exe: &Path, format: u32) -> String {
+    use std::io::BufRead;
+    let conn = std::os::unix::net::UnixStream::connect(&crystal.socket).unwrap();
+    let request = serde_json::json!({"type": "handover", "exe": exe, "format": format});
+    writeln!(&conn, "{request}").unwrap();
+    let mut answer = String::new();
+    let _ = std::io::BufReader::new(&conn).read_line(&mut answer);
+    answer
+}
+
+/// What this crystal's handovers are written as: `handover::FORMAT`.
+const HANDOVER_FORMAT: u32 = 1;
+
+#[test]
+fn a_handover_to_a_crystal_that_reads_another_kind_is_refused_and_nothing_changes() {
+    let crystal = Crystal::new();
+    crystal.ok(&["new", "-n", "keeper", "sleep", "300"]);
+    let pid = crystal.pid("keeper");
+
+    let answer = ask_to_hand_over(&crystal, Path::new(CRYSTAL), HANDOVER_FORMAT + 1);
+    assert!(
+        answer.contains("couldn't hand over: the new crystal reads handovers of another kind"),
+        "{answer}"
+    );
+    assert_eq!(crystal.pid("keeper"), pid);
+    crystal.ok(&["new", "-n", "fresh", "sleep", "300"]);
+}
+
+#[test]
+fn a_crystal_that_cant_read_its_handover_starts_the_sessions_again() {
+    let crystal = Crystal::new();
+    crystal.ok(&["new", "-n", "keeper", "sleep", "300"]);
+    eventually("the session is saved", || {
+        crystal.saved().contains("keeper")
+    });
+    let old_pid = crystal.pid("keeper");
+    // The new crystal is told to read the handover from a descriptor that
+    // isn't open.
+    let lost = crystal.dir.path().join("lost-crystal");
+    script(
+        &lost,
+        &format!("exec {CRYSTAL} \"$1\" \"$2\" \"$3\" --handover 999\n"),
+    );
+
+    // It stops, as a daemon that crashed does, and the program with it.
+    assert_eq!(ask_to_hand_over(&crystal, &lost, HANDOVER_FORMAT), "");
+    eventually("the old program was hung up on", || !alive(old_pid));
+    // The next daemon starts it again.
+    crystal.ok(&["new", "-n", "fresh", "sleep", "300"]);
+    assert_eq!(crystal.row("keeper").unwrap()[1], "running");
+    assert_ne!(crystal.pid("keeper"), old_pid);
+}
+
+#[test]
+fn a_daemon_from_before_handovers_is_restarted_cold() {
+    use std::io::BufRead;
+    let crystal = Crystal::new();
+    // One that says it's another version to all but a shutdown, which it
+    // answers by going, as an older crystal's does.
+    let listener = std::os::unix::net::UnixListener::bind(&crystal.socket).unwrap();
+    let socket = crystal.socket.clone();
+    let older = thread::spawn(move || {
+        for conn in listener.incoming() {
+            let conn = conn.unwrap();
+            let mut request = String::new();
+            std::io::BufReader::new(&conn)
+                .read_line(&mut request)
+                .unwrap();
+            if request.contains(r#""type":"shutdown""#) {
+                writeln!(&conn, r#"{{"type":"done"}}"#).unwrap();
+                std::fs::remove_file(&socket).unwrap();
+                return;
+            }
+            let refusal = "this is crystal 9.9.9, but the daemon is crystal 0.0.1: \
+                           run `crystal restart-server` to restart the daemon on this crystal";
+            let refusal = serde_json::json!({"type": "error", "message": refusal});
+            writeln!(&conn, "{refusal}").unwrap();
+        }
+    });
+
+    assert_eq!(
+        crystal.ok(&["restart-server"]),
+        "restarted the daemon; its sessions started again, \
+         since the daemon was a crystal from before handovers\n"
+    );
+    older.join().unwrap();
+    assert_eq!(crystal.ok(&["ls"]), "");
+}
+
+#[test]
+fn restart_server_cold_starts_the_running_sessions_again() {
     let crystal = Crystal::new();
     crystal.ok(&["new", "-n", "keeper", "sleep", "300"]);
     eventually("the session is saved", || {
@@ -2695,7 +3034,10 @@ fn restart_server_brings_the_running_sessions_back() {
     });
     let old_pid = crystal.pid("keeper");
 
-    assert_eq!(crystal.ok(&["restart-server"]), "restarted the daemon\n");
+    assert_eq!(
+        crystal.ok(&["restart-server", "--cold"]),
+        "restarted the daemon\n"
+    );
     assert_eq!(crystal.row("keeper").unwrap()[1], "running");
     assert_ne!(crystal.pid("keeper"), old_pid);
     eventually("the old program has gone with its daemon", || {
@@ -2755,7 +3097,7 @@ fn the_default_socket_keeps_its_state_however_its_daemon_is_started() {
     // and the session comes back.
     let through_link = link.join("crystal/default.sock");
     assert_eq!(
-        at(&through_link, &["restart-server"]),
+        at(&through_link, &["restart-server", "--cold"]),
         "restarted the daemon\n"
     );
     let listed = at(&socket, &["ls"]);
@@ -2902,6 +3244,40 @@ fn two_named_servers_run_side_by_side_each_with_its_own_sessions_and_state() {
 }
 
 #[test]
+fn restart_server_on_a_named_server_hands_over_that_server_alone() {
+    let servers = Servers::new();
+    for (server, name) in [("work", "one"), ("side", "two")] {
+        servers.ok(&["--server", server, "new", "-d", "-n", name, "sleep", "30"]);
+    }
+    let pid = |server: &str, name: &str| {
+        let listed = servers.ok(&["--server", server, "ls", "--json"]);
+        let listed: Vec<serde_json::Value> = serde_json::from_str(&listed).unwrap();
+        let found = listed.iter().find(|session| session["name"] == name);
+        found.unwrap()["pid"].as_u64().unwrap()
+    };
+    let (one, two) = (pid("work", "one"), pid("side", "two"));
+    let side_log = servers.run_dir().join("crystal/side.log");
+    let side_before = std::fs::read_to_string(&side_log).unwrap_or_default();
+
+    assert_eq!(
+        servers.ok(&["--server", "work", "restart-server"]),
+        "restarted the daemon, and its sessions carried on\n"
+    );
+    assert_eq!(pid("work", "one"), one);
+    assert_eq!(pid("side", "two"), two);
+    // Its state is where it was; the other server was never asked.
+    assert!(servers.kept().join("work/crystal.db").exists());
+    let handed = servers.ok(&["--server", "work", "events"]);
+    assert!(handed.contains("daemon.handed_over"), "{handed}");
+    let side = servers.ok(&["--server", "side", "events"]);
+    assert!(!side.contains("daemon.handed_over"), "{side}");
+    assert_eq!(
+        std::fs::read_to_string(&side_log).unwrap_or_default(),
+        side_before
+    );
+}
+
+#[test]
 fn a_session_in_a_named_server_reaches_its_own_server() {
     let servers = Servers::new();
     servers.ok(&[
@@ -2991,7 +3367,7 @@ fn a_claude_session_picked_up_again_isn_t_asked_its_task_again() {
 
     std::fs::remove_file(crystal.dir.path().join("args")).unwrap();
     let out = crystal
-        .command(&["restart-server"])
+        .command(&["restart-server", "--cold"])
         .env("PATH", &path)
         .output()
         .unwrap();
@@ -3044,10 +3420,32 @@ fn a_daemon_of_another_version_says_how_to_restart_it() {
         )
     );
 
-    // Restarting goes through whatever the version, and ends the mismatch.
+    // Restarting goes through whatever the version, and ends the mismatch:
+    // the daemon is handed over to this crystal, in the same process.
     assert_eq!(crystal.ok(&["restart-server"]), "restarted the daemon\n");
-    older.wait().unwrap();
     assert_eq!(crystal.ok(&["ls"]), "");
+    assert!(older.try_wait().unwrap().is_none());
+    crystal.ok(&["kill-server"]);
+    older.wait().unwrap();
+}
+
+#[test]
+fn a_crystal_older_than_the_daemon_is_told_to_start_again() {
+    let crystal = Crystal::new();
+    crystal.ok(&["new", "-n", "keeper", "sleep", "300"]);
+    let out = crystal
+        .command(&["ls"])
+        .env("CRYSTAL_PRETEND_VERSION", "0.0.1")
+        .output()
+        .unwrap();
+    let ours = env!("CARGO_PKG_VERSION");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        format!(
+            "crystal: this is crystal 0.0.1, but the daemon is crystal {ours}, which is newer: \
+             quit and run crystal again to use it\n"
+        )
+    );
 }
 
 #[test]
@@ -8015,12 +8413,15 @@ command = ["sh", "start.sh"]
         format!("startup {} \n", state.display())
     );
     assert!(state.is_dir());
-    // Once a start, not once a session.
+    // Once a start, not once a session; and again in a daemon handed over
+    // to, its sessions carrying on.
     crystal.ok(&["new", "-n", "second", "sleep", "30"]);
+    let pid = crystal.pid("first");
     crystal.ok(&["restart-server"]);
     eventually("it runs again", || {
         lines_in(&dir.join("started")).len() == 2
     });
+    assert_eq!(crystal.pid("first"), pid);
     crystal.ok(&["ls"]);
     assert_eq!(lines_in(&dir.join("started")).len(), 2);
 }
@@ -8665,6 +9066,66 @@ prompt = "Build {goal} following {plan.summary}"
     );
 }
 
+#[test]
+fn a_step_in_a_terminal_carries_on_through_a_handover() {
+    let crystal = Crystal::new();
+    crystal.configure(
+        r#"
+notify = false
+
+[plugins]
+memory = false
+
+[[profile]]
+name = "coder"
+agent = "codex"
+
+[[flow]]
+name = "mixed"
+
+[[flow.step]]
+name = "plan"
+prompt = "Plan {goal}"
+
+[[flow.step]]
+name = "build"
+profile = "coder"
+prompt = "Build {goal}"
+"#,
+    );
+    let dir = crystal.dir.path();
+    // A Codex that waits for the test before it closes its task.
+    let bin = dir.join("codex-bin");
+    std::fs::create_dir(&bin).unwrap();
+    script(
+        &bin.join("codex"),
+        &format!(
+            "echo > codex-started
+             while [ ! -e go ]; do sleep 0.05; done
+             {CRYSTAL} done \"built it after the handover\"
+             sleep 30
+"
+        ),
+    );
+    let path = format!("{}:{}", bin.display(), path_with(&flow_claude(dir)));
+    assert_eq!(
+        flow_ok(&crystal, &path, &["mixed", "add retries"]),
+        "mixed-1\n"
+    );
+    written(&dir.join("codex-started"));
+    let pid = crystal.pid("mixed-1-build");
+
+    crystal.ok(&["restart-server"]);
+    assert_eq!(crystal.pid("mixed-1-build"), pid);
+    std::fs::write(dir.join("go"), "").unwrap();
+    assert_eq!(flow_waits(&crystal, "mixed-1"), "done\n");
+    let listed: serde_json::Value = serde_json::from_str(&crystal.ok(&["flow", "--json"])).unwrap();
+    assert_eq!(
+        listed[0]["steps"][1]["answer"],
+        "built it after the handover"
+    );
+}
+
 /// The events `crystal events --json` prints with `args`, each one parsed.
 fn events(crystal: &Crystal, args: &[&str]) -> Vec<serde_json::Value> {
     let mut all = vec!["events", "--json"];
@@ -9226,6 +9687,41 @@ fn a_report_that_cant_be_taken_says_why() {
 }
 
 #[test]
+fn an_agent_that_reports_for_itself_holds_its_session_through_a_handover() {
+    let crystal = Crystal::new();
+    let bin = fake_reporting_agent(crystal.dir.path());
+    let out = crystal
+        .command(&["new", "-d", "-n", "agent", "pi"])
+        .env("PATH", path_of(&[&bin]))
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let status = || crystal.row("agent").unwrap()[1].clone();
+    crystal.stage("rest");
+    eventually("it's done with its turn", || status() == "done");
+    let pid = crystal.pid("agent");
+
+    crystal.ok(&["restart-server"]);
+    assert_eq!(crystal.pid("agent"), pid);
+    assert_eq!(status(), "done");
+    let reporter = crystal.listed("agent")["reporter"].clone();
+    assert_eq!(reporter["agent"], "pi");
+    assert_eq!(
+        reporter["resume"],
+        serde_json::json!(["pi", "--resume", "s 1"])
+    );
+    // It goes on saying what it's doing, to the daemon handed over to.
+    crystal.stage("ask");
+    eventually("it waits on the user", || status() == "waiting");
+    assert_eq!(
+        crystal.listed("agent")["reporter"]["message"],
+        "approve the deploy"
+    );
+    let told = events(&crystal, &["-n", "agent", "-k", "session.released"]);
+    assert!(told.is_empty(), "it never let go: {told:?}");
+}
+
+#[test]
 fn an_agent_comes_back_after_a_restart_with_the_command_it_said_resumes_it() {
     let crystal = Crystal::new();
     let bin = fake_reporting_agent(crystal.dir.path());
@@ -9269,7 +9765,7 @@ fn an_agent_comes_back_after_a_restart_with_the_command_it_said_resumes_it() {
     );
     std::fs::remove_file(&args).unwrap();
     let out = crystal
-        .command(&["restart-server"])
+        .command(&["restart-server", "--cold"])
         .env("PATH", &path)
         .output()
         .unwrap();
@@ -9408,6 +9904,24 @@ fn the_timeline_shows_what_happens_as_it_happens_and_enter_goes_to_the_session()
             .last()
             .is_some_and(|footer| footer.contains("builder"))
     });
+}
+
+#[test]
+fn the_timeline_stays_live_through_a_handover() {
+    let crystal = Crystal::new();
+    crystal.ok(&["new", "-d", "-n", "worker", "sleep", "30"]);
+    let mut tui = crystal.tui();
+    tui.shows("❯ worker");
+    tui.type_keys("a");
+    tui.shows("session.started");
+
+    crystal.ok(&["restart-server"]);
+    // It picks the log up again after the last event it showed: the
+    // handover itself, then what happens after.
+    tui.shows("daemon.handed_over");
+    crystal.ok(&["rename", "worker", "builder"]);
+    tui.shows("was worker");
+    assert!(!tui.text().contains("stopped following"), "{}", tui.text());
 }
 
 #[test]

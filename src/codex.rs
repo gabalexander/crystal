@@ -20,6 +20,7 @@
 
 use crate::catalog::Instructions;
 use crate::protocol::Conversation;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fs;
@@ -256,7 +257,7 @@ fn configured_instructions(home: &Path) -> Option<String> {
 /// sessions started a little apart can see each other's rollout first; the
 /// start time in its name, not the order the files appear in, says whose it
 /// is.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Rollouts {
     /// `$CODEX_HOME`: where Codex keeps its sessions.
     home: PathBuf,
@@ -264,6 +265,7 @@ pub struct Rollouts {
     cwd: PathBuf,
     /// When the session started.
     started: SystemTime,
+    #[serde(skip, default = "Instant::now")]
     next_look: Instant,
 }
 

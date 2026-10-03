@@ -168,6 +168,13 @@ impl Bus {
             .collect()
     }
 
+    /// Holds the bus, and its connection to the database, until what's
+    /// given back is dropped: for a handover, which closes it with the
+    /// exec, so that no event is halfway into the log then.
+    pub fn hold(&self) -> impl Sized + '_ {
+        self.state.lock().unwrap()
+    }
+
     /// Takes the events older than `keep_days` days out of the log, none
     /// with 0, and the oldest of the rest while it holds too many.
     pub fn prune(&self, keep_days: u32) {

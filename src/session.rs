@@ -8,6 +8,7 @@ use crate::config::Config;
 use crate::distill::Material;
 use crate::front;
 use crate::git::Checkout;
+use crate::handover::{self, Got};
 use crate::keys;
 use crate::notify::{self, Notice};
 use crate::protocol::{
@@ -17,18 +18,21 @@ use crate::protocol::{
 use crate::report;
 use crate::spending::Spending;
 use crate::state::SavedSession;
-use crate::task::Task;
+use crate::task::{self, Task};
 use crate::tasks;
 use crate::vt;
 use anyhow::{Context, Result, ensure};
-use portable_pty::{CommandBuilder, ExitStatus, MasterPty, PtySize, native_pty_system};
+use portable_pty::{CommandBuilder, ExitStatus, MasterPty, native_pty_system};
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::io::{self, ErrorKind, Read, Write};
+use std::fs::File;
+use std::io::{self, Write};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
-use std::sync::{Arc, Mutex};
-use std::thread;
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// How long a stopped session gets to exit after its hang-up before it's
@@ -135,6 +139,85 @@ pub enum Change {
     Released { agent: String },
 }
 
+/// A session as one daemon hands it to the next, in a handover: all it
+/// takes to carry it on, and its terminal by the number of the descriptor
+/// the next daemon inherits.
+#[derive(Serialize, Deserialize)]
+pub struct Handed {
+    name: String,
+    id: String,
+    command: Vec<String>,
+    cwd: PathBuf,
+    env: BTreeMap<String, String>,
+    pid: Option<u32>,
+    state: State,
+    activity: Option<Activity>,
+    changed: SystemTime,
+    looks: Looks,
+    front: Option<Front>,
+    conversation: Option<Conversation>,
+    rollouts: Option<Rollouts>,
+    told: Option<Activity>,
+    goal: Option<TaskInfo>,
+    reminded: bool,
+    reporter: Option<Reporter>,
+    reporter_job: Option<i32>,
+    named_after_program: bool,
+    screen: vt::Saved,
+    /// There will be no more output.
+    ended: bool,
+    /// The terminal's master side, while its program may still write to
+    /// it.
+    pty: Option<RawFd>,
+    task: Option<task::Handed>,
+}
+
+impl Handed {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The processes it has running, which the next daemon has to reap:
+    /// its program, or a task's `claude`s.
+    pub fn processes(&self) -> Vec<u32> {
+        match &self.task {
+            Some(task) => task.processes(),
+            None => self
+                .pid
+                .filter(|_| self.state == State::Running)
+                .into_iter()
+                .collect(),
+        }
+    }
+
+    /// What it takes to start the session again, as after any restart,
+    /// when it couldn't be carried on: `None` once its program had ended.
+    pub fn saved(&self) -> Option<SavedSession> {
+        if self.state != State::Running {
+            return None;
+        }
+        let conversation = match &self.task {
+            Some(task) => task.conversation().map(|id| Conversation {
+                id,
+                transcript: None,
+            }),
+            None => self.conversation.clone(),
+        };
+        Some(SavedSession {
+            name: self.name.clone(),
+            command: self.command.clone(),
+            cwd: self.cwd.clone(),
+            conversation,
+            task: self.task.as_ref().map(|task| task.spec().clone()),
+            goal: self.goal.clone(),
+            resume: self
+                .reporter
+                .as_ref()
+                .and_then(|reporter| reporter.resume.clone()),
+        })
+    }
+}
+
 impl Session {
     /// Starts `argv` in a PTY of its own. `command` is what was asked for;
     /// `argv` may add to it, like the flags that make an agent report what
@@ -147,7 +230,12 @@ impl Session {
         cwd: PathBuf,
         env: &BTreeMap<String, String>,
     ) -> Result<Session> {
-        let pty = native_pty_system().openpty(size(24, 80))?;
+        let pty = native_pty_system().openpty(portable_pty::PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })?;
         let mut builder = CommandBuilder::new(&argv[0]);
         builder.args(&argv[1..]);
         builder.cwd(&cwd);
@@ -155,36 +243,22 @@ impl Session {
         for (key, value) in env {
             builder.env(key, value);
         }
-        let mut child = pty.slave.spawn_command(builder)?;
+        let child = pty.slave.spawn_command(builder)?;
         // Only the child may hold the terminal's other end, so that its exit
         // ends the output.
         drop(pty.slave);
+        let pid = child
+            .process_id()
+            .context("the program started without a pid")?;
+        // Waited for by its pid, the same way a daemon it's handed over to
+        // waits for it.
+        drop(child);
 
-        let output = pty.master.try_clone_reader()?;
-        let term = Arc::new(Term::new(Some(Pty {
-            input: Mutex::new(pty.master.take_writer()?),
-            master: Mutex::new(pty.master),
-        })));
-        thread::spawn({
-            let term = term.clone();
-            move || term.pump(output)
-        });
-
-        let pid = child.process_id();
+        let term = Arc::new(Term::new(Some(Pty::of(pty.master)?)));
+        term.start_pumping();
         let state = Arc::new(Mutex::new(State::Running));
         let changed = Arc::new(Mutex::new(SystemTime::now()));
-        thread::spawn({
-            let state = state.clone();
-            let changed = changed.clone();
-            move || {
-                let ended = match child.wait() {
-                    Ok(status) => ended(&status),
-                    Err(_) => State::Exited { code: 1 },
-                };
-                *state.lock().unwrap() = ended;
-                *changed.lock().unwrap() = SystemTime::now();
-            }
-        });
+        watch_for_end(pid, state.clone(), changed.clone());
 
         Ok(Session {
             name,
@@ -193,7 +267,7 @@ impl Session {
             checkout: Checkout::find(&cwd),
             cwd,
             env: env.clone(),
-            pid,
+            pid: Some(pid),
             state,
             activity: None,
             changed,
@@ -916,6 +990,110 @@ impl Session {
         }
     }
 
+    /// Hands the session over to the next daemon: what it takes to carry it
+    /// on, its screen, and its terminal or a task's pipes, kept open across
+    /// the exec. Its readers must have been stopped
+    /// ([`handover::stop_reading`]). Its program's state comes back held,
+    /// to hold until the exec: a program that ends meanwhile is reaped only
+    /// with it held, so it's either handed over as having ended, or handed
+    /// over unreaped, for the next daemon to wait for.
+    pub fn hand_over(&self) -> io::Result<(Handed, MutexGuard<'_, State>)> {
+        let task = self.task.as_ref().map(Task::hand_over).transpose()?;
+        let (screen, ended, pty) = self.term.hand_over()?;
+        let state = self.state.lock().unwrap();
+        let handed = Handed {
+            name: self.name.clone(),
+            id: self.id.clone(),
+            command: self.command.clone(),
+            cwd: self.cwd.clone(),
+            env: self.env.clone(),
+            pid: self.pid,
+            state: state.clone(),
+            activity: self.activity,
+            changed: *self.changed.lock().unwrap(),
+            looks: self.screen_watch.looks(),
+            front: self.front.clone(),
+            conversation: self.conversation.clone(),
+            rollouts: self.rollouts.clone(),
+            told: self.told,
+            goal: self.goal.clone(),
+            reminded: self.reminded,
+            reporter: self.reporter.clone(),
+            reporter_job: self.reporter_job,
+            named_after_program: self.named_after_program,
+            screen,
+            ended,
+            pty,
+            task,
+        };
+        Ok((handed, state))
+    }
+
+    /// Carries on a session the last daemon handed over: its screen as it
+    /// was, its terminal read again, and its program waited for. A task's
+    /// runs add to `spending`. Fails when what it was handed isn't open.
+    pub fn adopt(handed: Handed, spending: &Arc<Spending>) -> Result<Session> {
+        let pty = handed
+            .pty
+            .map(|fd| handover::inherit(fd).map(|fd| Pty::new(File::from(fd))))
+            .transpose()
+            .with_context(|| format!("{}'s terminal wasn't handed over", handed.name))?;
+        let screen = vt::Screen::restored(&handed.screen);
+        let term = Arc::new(Term::with_screen(pty, screen));
+        let state = Arc::new(Mutex::new(handed.state.clone()));
+        let changed = Arc::new(Mutex::new(handed.changed));
+        let task = match handed.task {
+            Some(task) => Some(
+                Task::adopt(
+                    task,
+                    handed.cwd.clone(),
+                    handed.env.clone(),
+                    term.clone(),
+                    state.clone(),
+                    spending.clone(),
+                )
+                .with_context(|| format!("{}'s claude wasn't handed over", handed.name))?,
+            ),
+            None => None,
+        };
+        if handed.ended {
+            term.close();
+        } else {
+            term.start_pumping();
+        }
+        if let (Some(pid), State::Running, None) = (handed.pid, &handed.state, &task) {
+            watch_for_end(pid, state.clone(), changed.clone());
+        }
+        Ok(Session {
+            name: handed.name,
+            id: handed.id,
+            command: handed.command,
+            checkout: Checkout::find(&handed.cwd),
+            cwd: handed.cwd,
+            env: handed.env,
+            pid: handed.pid,
+            state,
+            activity: handed.activity,
+            changed,
+            screen_watch: ScreenWatch::seeing(handed.looks),
+            front: handed.front,
+            front_group: None,
+            front_checked: Instant::now(),
+            conversation: handed.conversation,
+            rollouts: handed.rollouts,
+            told: handed.told,
+            task,
+            goal: handed.goal,
+            reminded: handed.reminded,
+            reporter: handed.reporter,
+            reporter_job: handed.reporter_job,
+            named_after_program: handed.named_after_program,
+            closed: Vec::new(),
+            changes: Vec::new(),
+            term,
+        })
+    }
+
     /// Someone has just looked at the session.
     pub fn seen(&mut self) {
         if self.activity == Some(Activity::Done) {
@@ -955,13 +1133,70 @@ pub struct Term {
     /// does on the screen itself.
     pty: Option<Pty>,
     screen: Mutex<Screen>,
+    /// The thread reading the program's output, for a handover to wait for
+    /// once it has stopped it.
+    pump: Mutex<Option<JoinHandle<()>>>,
 }
 
-/// The daemon's side of a PTY: how the program's terminal is sized, and
-/// the way in.
+/// The daemon's side of a PTY, its master side: read for what the program
+/// writes, written with what it's sent, and where its size is set.
 struct Pty {
-    master: Mutex<Box<dyn MasterPty + Send>>,
-    input: Mutex<Box<dyn Write + Send>>,
+    master: File,
+    /// Held while writing, so that two writers' bytes never interleave.
+    writing: Mutex<()>,
+}
+
+impl Pty {
+    fn new(master: File) -> Pty {
+        Pty {
+            master,
+            writing: Mutex::new(()),
+        }
+    }
+
+    /// The master side portable_pty opened, on a descriptor of crystal's
+    /// own, which a handover can keep open: portable_pty's closes as it's
+    /// dropped. Its writer is never made, since dropping it would send the
+    /// program an end of file.
+    fn of(master: Box<dyn MasterPty + Send>) -> Result<Pty> {
+        let fd = master
+            .as_raw_fd()
+            .context("the terminal has no descriptor")?;
+        // SAFETY: `master` keeps the descriptor open until it's dropped,
+        // after this borrow.
+        let ours = unsafe { BorrowedFd::borrow_raw(fd) }.try_clone_to_owned()?;
+        Ok(Pty::new(File::from(ours)))
+    }
+
+    fn write(&self, bytes: &[u8]) -> io::Result<()> {
+        let _writing = self.writing.lock().unwrap();
+        (&self.master).write_all(bytes)
+    }
+
+    /// Tells the kernel, and so the program, the terminal's new size.
+    fn resize(&self, rows: u16, cols: u16) -> io::Result<()> {
+        let size = libc::winsize {
+            ws_row: rows,
+            ws_col: cols,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        // SAFETY: TIOCSWINSZ reads one winsize, which `size` is.
+        let set = unsafe { libc::ioctl(self.master.as_raw_fd(), libc::TIOCSWINSZ as _, &size) };
+        if set == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// The process group in front: the job its keys go to.
+    fn foreground_group(&self) -> Option<i32> {
+        // SAFETY: tcgetpgrp only asks.
+        match unsafe { libc::tcgetpgrp(self.master.as_raw_fd()) } {
+            group if group > 0 => Some(group),
+            _ => None,
+        }
+    }
 }
 
 struct Screen {
@@ -995,15 +1230,46 @@ impl Term {
     /// A screen of 24 rows by 80 columns, until a viewer gives it another
     /// size.
     fn new(pty: Option<Pty>) -> Term {
+        Term::with_screen(pty, vt::Screen::answering(24, 80))
+    }
+
+    fn with_screen(pty: Option<Pty>, vt: vt::Screen) -> Term {
         Term {
             pty,
             screen: Mutex::new(Screen {
-                vt: vt::Screen::answering(24, 80),
+                vt,
                 viewers: Vec::new(),
                 listeners: Vec::new(),
                 ended: false,
             }),
+            pump: Mutex::default(),
         }
+    }
+
+    /// Reads the program's output, on a thread of its own, until the
+    /// program closes the terminal or a handover stops it.
+    fn start_pumping(self: &Arc<Term>) {
+        if self.pty.is_none() {
+            return;
+        }
+        let term = self.clone();
+        *self.pump.lock().unwrap() = Some(thread::spawn(move || term.pump()));
+    }
+
+    /// The screen to hand over once a handover has stopped the reading of
+    /// the program's output, whether there will be more, and while there
+    /// may be, its terminal, kept open across the exec.
+    fn hand_over(&self) -> io::Result<(vt::Saved, bool, Option<RawFd>)> {
+        let pump = self.pump.lock().unwrap().take();
+        if let Some(pump) = pump {
+            let _ = pump.join();
+        }
+        let mut screen = self.screen.lock().unwrap();
+        let pty = match &self.pty {
+            Some(pty) if !screen.ended => Some(handover::keep_across_exec(pty.master.as_fd())?),
+            _ => None,
+        };
+        Ok((screen.vt.save(), screen.ended, pty))
     }
 
     /// A screen with no program behind it, for a task to draw on.
@@ -1082,9 +1348,7 @@ impl Term {
     /// The process group in front in the terminal: the job its keys go to.
     /// `None` without a terminal, or when the terminal won't say.
     pub fn foreground_group(&self) -> Option<i32> {
-        let pty = self.pty.as_ref()?;
-        let master = pty.master.lock().unwrap();
-        master.process_group_leader()
+        self.pty.as_ref()?.foreground_group()
     }
 
     pub fn is_watched(&self) -> bool {
@@ -1098,7 +1362,7 @@ impl Term {
 
     pub fn write(&self, bytes: &[u8]) -> io::Result<()> {
         match &self.pty {
-            Some(pty) => pty.input.lock().unwrap().write_all(bytes),
+            Some(pty) => pty.write(bytes),
             None => Err(io::Error::other("a task takes no keys")),
         }
     }
@@ -1107,7 +1371,7 @@ impl Term {
         let mut screen = self.screen.lock().unwrap();
         screen.vt.resize(rows, cols);
         if let Some(pty) = &self.pty {
-            pty.master.lock().unwrap().resize(size(rows, cols))?;
+            pty.resize(rows, cols)?;
         }
         Ok(())
     }
@@ -1128,19 +1392,23 @@ impl Term {
     }
 
     /// Reads the program's output until it closes the terminal, and answers
-    /// the program's questions to its terminal.
-    fn pump(&self, mut output: Box<dyn Read + Send>) {
+    /// the program's questions to its terminal. A handover stops it with
+    /// the rest unread, for the next daemon to read.
+    fn pump(&self) {
+        let Some(pty) = &self.pty else {
+            return;
+        };
         let mut buf = [0; 16 * 1024];
         loop {
-            let n = match output.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => n,
-                Err(err) if err.kind() == ErrorKind::Interrupted => continue,
-                Err(_) => break,
-            };
-            let replies = self.take_output(&buf[..n]);
-            if !replies.is_empty() {
-                let _ = self.write(&replies);
+            match handover::readers().read(&pty.master, &mut buf) {
+                Ok(Got::Bytes(n)) => {
+                    let replies = self.take_output(&buf[..n]);
+                    if !replies.is_empty() {
+                        let _ = self.write(&replies);
+                    }
+                }
+                Ok(Got::Stopped) => return,
+                Ok(Got::End) | Err(_) => break,
             }
         }
         self.close();
@@ -1210,13 +1478,21 @@ fn task_command(spec: &TaskSpec) -> Vec<String> {
     command
 }
 
-fn size(rows: u16, cols: u16) -> PtySize {
-    PtySize {
-        rows,
-        cols,
-        pixel_width: 0,
-        pixel_height: 0,
-    }
+/// Waits, on a thread of its own, for the program `pid` to end, then notes
+/// how it ended in `state`. It's reaped only with `state` held, which a
+/// handover holds from before it looks at the session until the exec: so
+/// the handover either sees that it ended, or hands it over unreaped, for
+/// the next daemon to wait for.
+fn watch_for_end(pid: u32, state: Arc<Mutex<State>>, changed: Arc<Mutex<SystemTime>>) {
+    thread::spawn(move || {
+        let _ = handover::wait_for_end(pid);
+        let mut state = state.lock().unwrap();
+        *state = match handover::reap(pid) {
+            Ok(status) => ended(&status.into()),
+            Err(_) => State::Exited { code: 1 },
+        };
+        *changed.lock().unwrap() = SystemTime::now();
+    });
 }
 
 fn ended(status: &ExitStatus) -> State {
@@ -1245,6 +1521,81 @@ pub fn signal_group(pid: u32, signal: libc::c_int) {
 mod tests {
     use super::*;
     use Activity::*;
+
+    #[test]
+    fn a_session_handed_over_comes_back_as_it_was() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::Db::open(&dir.path().join("crystal.sock")).unwrap();
+        let spending = Arc::new(Spending::new(db));
+        let mut screen = vt::Screen::answering(5, 20);
+        screen.process(b"\x1b]2;working\x07bye\r\n");
+        let goal = TaskInfo {
+            id: Some(12),
+            goal: "fix the login".into(),
+            background: false,
+            backlog: None,
+            waiting: true,
+            created: 1,
+            outcome: None,
+        };
+        let handed = Handed {
+            name: "agent".into(),
+            id: "id-1".into(),
+            command: vec!["claude".into()],
+            cwd: dir.path().to_path_buf(),
+            env: BTreeMap::new(),
+            pid: Some(4242),
+            state: State::Exited { code: 3 },
+            activity: Some(Waiting),
+            changed: UNIX_EPOCH + Duration::from_secs(100),
+            looks: Looks::Waiting,
+            front: Some(Front::Shell { name: "zsh".into() }),
+            conversation: Some(Conversation {
+                id: "conv-1".into(),
+                transcript: None,
+            }),
+            rollouts: None,
+            told: Some(Waiting),
+            goal: Some(goal.clone()),
+            reminded: true,
+            reporter: Some(Reporter {
+                agent: "pi".into(),
+                message: Some("approve the deploy".into()),
+                resume: Some(vec!["pi".into(), "--resume".into(), "s 1".into()]),
+            }),
+            reporter_job: Some(4242),
+            named_after_program: true,
+            screen: screen.save(),
+            ended: true,
+            pty: None,
+            task: None,
+        };
+        // Through the file it's handed over in.
+        let handed: Handed =
+            serde_json::from_str(&serde_json::to_string(&handed).unwrap()).unwrap();
+        assert!(handed.saved().is_none(), "it had ended");
+        assert!(handed.processes().is_empty());
+
+        let mut session = Session::adopt(handed, &spending).unwrap();
+        let info = session.info();
+        assert_eq!((info.name.as_str(), info.id.as_str()), ("agent", "id-1"));
+        assert_eq!(info.state, State::Exited { code: 3 });
+        assert_eq!(info.activity, Some(Waiting));
+        assert_eq!(info.changed, 100);
+        assert_eq!(info.task, Some(goal));
+        assert_eq!(session.conversation_id(), Some("conv-1"));
+        assert_eq!(session.term().rows(false)[0], "bye");
+        assert!(session.term().watch(false).feed.is_none(), "it had ended");
+        // Reminded of its task once already, it isn't again.
+        assert!(!session.remind_of_task());
+        // Still held by the agent that reports for itself, which resumes
+        // with its own command, and still named after its program.
+        assert!(session.is_claimed());
+        assert_eq!(info.reporter.unwrap().agent, "pi");
+        let resume = session.launch().resume.unwrap();
+        assert_eq!(resume, ["pi", "--resume", "s 1"]);
+        assert!(session.is_named_after_program());
+    }
 
     fn after(before: Option<Activity>, event: AgentEvent) -> Option<Activity> {
         next_activity(before, event, false)

@@ -24,6 +24,7 @@
 //! Adapted from docket's `docket-claude` crate (its control and permission
 //! modules), trimmed to what crystal does with it.
 
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::fmt;
 
@@ -122,7 +123,7 @@ pub enum Line {
 }
 
 /// A `can_use_tool` request: the tool Claude wants to use, and how.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PermissionRequest {
     pub request_id: String,
     pub tool_name: String,

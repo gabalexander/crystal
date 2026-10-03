@@ -16,6 +16,7 @@ use alacritty_terminal::term::search::{Match, RegexIter, RegexSearch};
 use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::vi_mode::ViMotion;
 use alacritty_terminal::vte::ansi::{Color, NamedColor, Processor, Timeout};
+use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::fmt::Write as _;
 use std::sync::{Arc, Mutex};
@@ -195,6 +196,17 @@ pub enum Mark {
     Selected,
     /// Under copy mode's cursor.
     Cursor,
+}
+
+/// A screen as one daemon hands it to the next (see [`crate::handover`]):
+/// its size, the title the program gave it, and output that draws it again
+/// on a fresh screen of that size, history and all, on both its screens.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Saved {
+    pub rows: u16,
+    pub cols: u16,
+    pub title: String,
+    pub output: String,
 }
 
 /// What alacritty_terminal hands back as it reads a program's output: the
@@ -409,6 +421,11 @@ impl Screen {
     /// alternate screen, that screen alone: the main one and its history
     /// aren't to be had.
     pub fn state_formatted(&self, with_history: bool) -> Vec<u8> {
+        self.formatted(with_history).into_bytes()
+    }
+
+    /// [`Screen::state_formatted`], as the text it is.
+    fn formatted(&self, with_history: bool) -> String {
         let grid = self.term.grid();
         let mode = *self.term.mode();
         let mut out = String::new();
@@ -451,7 +468,48 @@ impl Screen {
         if let Some(link) = cursor.template.hyperlink() {
             write_hyperlink(&mut out, Some(&link));
         }
-        out.into_bytes()
+        out
+    }
+
+    /// The screen as it's handed to the next daemon. On the alternate
+    /// screen, the main one and its history go first, then the alternate
+    /// one, which the program goes back from to find the main one as it
+    /// left it. Leaves the screen as it was.
+    pub fn save(&mut self) -> Saved {
+        let output = if self.alternate_screen() {
+            let alternate = self.formatted(false);
+            // The main screen, history and all, isn't to be had without
+            // going back to it.
+            self.term.swap_alt();
+            let main = self.formatted(true);
+            // Going to the alternate screen clears it: drawn again.
+            self.term.swap_alt();
+            self.process(alternate.as_bytes());
+            // A link left open on the main screen stays there.
+            let mut output = main;
+            write_hyperlink(&mut output, None);
+            output + &alternate
+        } else {
+            self.formatted(true)
+        };
+        let (rows, cols) = self.size();
+        Saved {
+            rows,
+            cols,
+            title: self.title(),
+            output,
+        }
+    }
+
+    /// The daemon's screen, answering, as the last daemon handed it over.
+    pub fn restored(saved: &Saved) -> Screen {
+        let mut screen = Screen::answering(saved.rows, saved.cols);
+        screen.process(saved.output.as_bytes());
+        // Drawing it asks the program nothing; anything it did ask was
+        // answered before.
+        screen.take_replies();
+        screen.heard.lock().unwrap().title = saved.title.clone();
+        screen
     }
 
     /// What's on the screen, one string per row without the blanks at its
@@ -1500,6 +1558,99 @@ mod tests {
         let copy = screen(3, 10, &original.state_formatted(true));
         assert!(copy.alternate_screen());
         assert_eq!(copy.rows(false)[0], "full");
+    }
+
+    /// History scrolled off a screen of 5 rows, colors, a wrapped line, a
+    /// title and modes: the main screen of the program a shell ran.
+    const SHELL: &str = "\x1b]2;my title\x07\x1b[?2004h\x1b[1;32mgreen\x1b[0m\r\n";
+
+    fn shell_output() -> Vec<u8> {
+        let mut output = SHELL.as_bytes().to_vec();
+        for line in 0..20 {
+            output.extend(format!("line {line}\r\n").as_bytes());
+        }
+        output.extend(b"a line long enough to wrap\r\n$ ");
+        output
+    }
+
+    #[test]
+    fn a_saved_screen_comes_back_with_its_history_title_and_modes() {
+        let mut original = screen(5, 20, &shell_output());
+        let saved = original.save();
+        let restored = Screen::restored(&saved);
+        assert_eq!(restored.size(), (5, 20));
+        assert_eq!(restored.rows(true), original.rows(true));
+        assert_eq!(cells(&restored), cells(&original));
+        assert_eq!(restored.cursor(), original.cursor());
+        assert_eq!(restored.title(), "my title");
+        assert!(restored.bracketed_paste());
+        assert_eq!(restored.text(), original.text());
+    }
+
+    #[test]
+    fn a_screen_saved_on_the_alternate_screen_keeps_the_main_one_under_it() {
+        let mut output = shell_output();
+        output.extend(b"\x1b[?1049h\x1b[H\x1b[2Jfull screen\x1b[3;5H");
+        let mut original = screen(5, 20, &output);
+        let before = (original.rows(true), cells(&original), original.cursor());
+
+        let saved = original.save();
+        // Saving left the screen as it was.
+        assert_eq!(
+            (original.rows(true), cells(&original), original.cursor()),
+            before
+        );
+        let mut restored = Screen::restored(&saved);
+        assert!(restored.alternate_screen());
+        assert_eq!(restored.rows(true), original.rows(true));
+        assert_eq!(restored.cursor(), Some((2, 4)));
+
+        // The program leaves the alternate screen: the shell is under it,
+        // with its history.
+        original.process(b"\x1b[?1049l");
+        restored.process(b"\x1b[?1049l");
+        assert!(!restored.alternate_screen());
+        assert_eq!(restored.rows(true), original.rows(true));
+        assert_eq!(restored.cursor(), original.cursor());
+        assert!(restored.rows(true).contains(&"line 0".to_string()));
+    }
+
+    #[test]
+    fn a_saved_screen_keeps_its_hyperlinks_on_both_screens() {
+        let mut output = b"\x1b]8;id=7;file:///tmp/main\x1b\\main link\x1b]8;;\x1b\\\r\n".to_vec();
+        // Left open as the program goes to the alternate screen.
+        output.extend(b"\x1b]8;id=8;https://example.com/open\x1b\\");
+        output
+            .extend(b"\x1b[?1049h\x1b]8;;\x1b\\plain \x1b]8;id=9;https://example.com/alt\x1b\\alt");
+        let mut original = screen(4, 30, &output);
+        let mut restored = Screen::restored(&original.save());
+        // The alternate screen starts where the cursor was: the second row.
+        let link = restored.link_at((1, 7)).unwrap();
+        assert_eq!(link.url, "https://example.com/alt");
+        assert_eq!(restored.link_at((1, 7)), original.link_at((1, 7)));
+        assert_eq!(restored.link_at((1, 2)), None);
+        assert_eq!(
+            restored.link_at((0, 2)),
+            None,
+            "the main screen's stays there"
+        );
+
+        original.process(b"\x1b[?1049l");
+        restored.process(b"\x1b[?1049l");
+        let link = restored.link_at((0, 2)).unwrap();
+        assert_eq!(link.url, "file:///tmp/main");
+        assert_eq!((link.start, link.end), ((0, 0), (0, 8)));
+        assert_eq!(restored.link_at((0, 2)), original.link_at((0, 2)));
+    }
+
+    #[test]
+    fn a_restored_screen_answers_the_program_and_asked_nothing_itself() {
+        let mut original = Screen::answering(3, 10);
+        original.process(b"hi\x1b[6n");
+        let mut restored = Screen::restored(&original.save());
+        assert!(restored.take_replies().is_empty());
+        restored.process(b"\x1b[6n");
+        assert_eq!(restored.take_replies(), b"\x1b[1;3R");
     }
 
     #[test]

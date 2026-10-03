@@ -11,7 +11,8 @@ roadmap.
 - Lint: `make lint` (`cargo fmt --check` and `cargo clippy --all-targets -- -D warnings`)
 - Format: `cargo fmt`
 - Install: `make install`: a release build into `~/.local/bin`, then `crystal restart-server` so a running
-  daemon picks it up, and `crystal skill --install` (not with `CRYSTAL_NO_SKILL=1`)
+  daemon is handed over to it, its sessions carrying on, and `crystal skill --install` (not with
+  `CRYSTAL_NO_SKILL=1`)
 
 Run lint, format and tests before every commit.
 
@@ -27,20 +28,25 @@ and ARM, static with musl), and installed by `install.sh`.
    workflow checks the tag against `Cargo.toml`, builds each target, and publishes the GitHub release with
    the archives and their checksums.
 
-The daemon refuses requests from a crystal of another version (except a shutdown), so a user who upgrades is
-told to run `crystal restart-server` rather than getting odd errors. Keep `Request::Shutdown` exactly as it
-is: it's the one request every version must understand.
+The daemon refuses requests from a crystal of another version (except a shutdown and a handover), so a user
+who upgrades is told to run `crystal restart-server` rather than getting odd errors, and one left on an older
+crystal to start it again. Keep `Request::Shutdown` and `Request::Handover` exactly as they are: they're the
+requests every version must understand. `restart-server` hands the daemon over to the new binary (see
+`src/handover.rs`), and a daemon only hands over to a crystal that reads its `handover::FORMAT`: bump it
+whenever what's handed over changes in a way the crystal before couldn't read.
 
 ## Layout
 
 - `src/main.rs`: the CLI (clap) and how it prints
 - `src/client.rs`: connects to the daemon, starting it when needed; `tell` gives it an event from outside, and
-  `subscribe` a stream of its events, for the CLI and a TUI to read
-- `src/attach.rs`: `crystal attach`: draws a session in your terminal and sends it your keys
+  `subscribe` a stream of its events, for the CLI and a TUI to read, which picks up again after a handover;
+  restarting the daemon, handed over or cold
+- `src/attach.rs`: `crystal attach`: draws a session in your terminal and sends it your keys, attaching again
+  after a handover
 - `src/viewer.rs`: the client's side of an attach, shared by `crystal attach` and the TUI's pane
 - `src/drive.rs`: `crystal send`, `wait`, `read`, `result`, `answer` and `interrupt`, for driving one session from
   another or a script; waits listen to the daemon's events about their session, and `wait --output` has the
-  daemon look at its screen
+  daemon look at its screen, asking again when a handover cuts it
 - `src/keys.rs`: turning keys into the bytes a terminal sends: the TUI's keys, and the names `send-keys` takes;
   the old way, or in the Kitty keyboard protocol once a program has asked for it
 - `src/remote.rs`: `crystal ssh`: finds (or installs) crystal on another machine, then runs it there over ssh
@@ -137,7 +143,12 @@ is: it's the one request every version must understand.
     each changed with a key, and how the model stands; the event loop writes the file (`config::set`) and,
     while it's open, reads the settings and the daemon's `EmbeddingStatus` again every half a second
 - `src/daemon.rs`: the daemon: listens on the socket and owns the sessions, and emits an event wherever something
-  happens to them, their tasks, flows, worktrees, memory or backlog
+  happens to them, their tasks, flows, worktrees, memory or backlog; hands itself over to a new crystal, and
+  takes over from the daemon that handed over
+- `src/handover.rs`: handing the daemon over to a newly installed crystal by exec in its own process, the
+  sessions carrying on: what's handed over and its `FORMAT`, the file it's written to and read from, keeping
+  descriptors open across the exec, the readers it stops, the gate connections come in through, the helpers
+  (hooks, the distiller) it waits for, and waiting for a child by its pid
 - `src/events.rs`: what happens, as events: the one `Event` type, its kinds (a public contract plugins listen
   for), what each carries, how one reads in a line, the filter a reader gives, and the made-up event `plugin run
   --event` tries hooks on; pure, so it's unit-tested
@@ -162,20 +173,22 @@ is: it's the one request every version must understand.
 - `src/typing.rs`: typing into a session the way a person would: pastes marked, Enter on its own
 - `src/session.rs`: one program in a PTY, or a task: spawn, exit status, stop, its screen, viewers and listeners,
   the agent that says what it's doing itself while it holds the session, whether its first prompt can name
-  it, and what has changed in it (its agent's activity, a task's runs) for the daemon to tell
+  it, and what has changed in it (its agent's activity, a task's runs) for the daemon to tell; handing it over
+  and adopting it, its PTY on a descriptor of crystal's own
 - `src/vt.rs`: a terminal's screen, through `alacritty_terminal`: what a program drew and its history, the modes
   it set, its answers to the program's questions (the daemon's screen only), the output that catches a new viewer
   up (its hyperlinks included), the cells to draw, the input modes `crystal attach` asks your terminal for, and,
   for a viewer, copy mode's cursor, selection and search, which are Alacritty's vi mode, and the link on a cell:
-  a hyperlink a program wrote (OSC 8), or a URL in the text across the rows it wrapped onto, as `vt::Link`. The
-  only module that uses `alacritty_terminal`
+  a hyperlink a program wrote (OSC 8), or a URL in the text across the rows it wrapped onto, as `vt::Link`; and a
+  screen saved for a handover, both its screens and the history, and restored. The only module that uses
+  `alacritty_terminal`
 - `src/links.rs`: opening a link a pane shows: `open` or `xdg-open`, or over ssh (or with neither) the link put
   on the user's clipboard instead
 - `src/clipboard.rs`: putting text on the user's clipboard: `pbcopy`, `wl-copy`, `xclip` or `xsel` on their own
   machine, or OSC 52 to their terminal over ssh or when none of those works
 - `src/task.rs`: tasks: Claude Code run without a terminal (`claude -p`): one process taking the prompt and each
   follow-up over its standard input, the permissions it asks for and their answers, interrupts, each run's cost
-  and budget, and letting an idle one go
+  and budget, letting an idle one go, and handing its `claude` over, pipes and all
 - `src/claude_stream.rs`: Claude Code's stream-json protocol, as crystal speaks it with a background task's
   `claude -p`: prompts in, the control messages that carry a permission prompt out and its answer back, an
   interrupt, and the rule "always" keeps; adapted from docket's `docket-claude`

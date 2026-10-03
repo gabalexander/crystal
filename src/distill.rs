@@ -22,6 +22,7 @@
 
 use crate::config::MemorySettings;
 use crate::embed;
+use crate::handover::HELPERS;
 use crate::memory::{self, Added, Kind, New, Source, Store};
 use crate::protocol::TaskRecord;
 use crate::secrets;
@@ -186,7 +187,7 @@ pub fn args(settings: &MemorySettings) -> Vec<String> {
 
 /// The end of what a session did, a line for each thing it said or did,
 /// kept to about [`MATERIAL_CAP`] bytes: the oldest lines go first.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct Record {
     lines: VecDeque<String>,
     bytes: usize,
@@ -514,6 +515,7 @@ fn ask_claude(job: &Job, message: &str) -> Result<(Value, f64)> {
         .spawn()
         .context("couldn't start claude")?;
     let pid = child.id();
+    let _helper = HELPERS.started(pid);
     let mut stdin = child.stdin.take().expect("its input is piped");
     let message = message.to_string();
     thread::spawn(move || {

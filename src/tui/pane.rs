@@ -21,7 +21,9 @@ pub struct Pane {
     /// has a new one, so its pane starts afresh.
     pub session_id: String,
     pub screen: vt::Screen,
-    /// The session has ended: `screen` is the last it showed.
+    /// Its output has ended: the session has, and `screen` is the last it
+    /// showed, or the daemon was handed over to a new crystal, and the pane
+    /// attaches again.
     pub ended: bool,
     /// Copy mode, while it's on.
     pub copy: Option<CopyMode>,

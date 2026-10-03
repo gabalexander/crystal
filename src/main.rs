@@ -25,6 +25,7 @@ mod forge;
 mod front;
 mod git;
 mod handoff;
+mod handover;
 mod hook;
 mod keys;
 mod links;
@@ -65,6 +66,7 @@ mod work;
 
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
+use client::Restart;
 use profile::{Profile, StartIn};
 use protocol::{Request, Response, SessionInfo, TaskSpec, TaskState};
 use std::io::IsTerminal;
@@ -453,9 +455,15 @@ enum Command {
     /// Stop every session and the daemon.
     KillServer,
     /// Restart the daemon on this crystal, say after installing a new one.
-    /// Running sessions come back: Claude Code in its conversation, other
-    /// programs from the start.
-    RestartServer,
+    /// The daemon hands its sessions over to it, and they carry on running,
+    /// their screens and all.
+    RestartServer {
+        /// Stop the daemon and start it again instead: running sessions
+        /// come back, Claude Code in its conversation, other programs from
+        /// the start.
+        #[arg(long)]
+        cold: bool,
+    },
     /// List the servers, each a daemon with its own sessions and state: the
     /// default one and those named with --server, with whether each is
     /// running and how many sessions it has. Or stop one, or delete one.
@@ -555,7 +563,12 @@ enum Command {
     },
     /// Run the daemon in the foreground.
     #[command(hide = true)]
-    Daemon,
+    Daemon {
+        /// Carry on from the daemon that ran this crystal in its place,
+        /// reading what it handed over from this descriptor.
+        #[arg(long, value_name = "FD")]
+        handover: Option<i32>,
+    },
     /// Tell the daemon about an agent's event; what the agent's hooks run.
     #[command(hide = true)]
     Hook { agent: String },
@@ -1087,13 +1100,18 @@ fn run(cli: Cli) -> Result<()> {
                 no_daemon(&socket)?;
             }
         }
-        Command::RestartServer => {
-            if client::restart_daemon(&socket)? {
+        Command::RestartServer { cold } => match client::restart_daemon(&socket, cold)? {
+            Restart::NoDaemon => println!("no daemon was running"),
+            Restart::HandedOver { sessions: 0 } | Restart::Cold { why: None } => {
                 println!("restarted the daemon");
-            } else {
-                println!("no daemon was running");
             }
-        }
+            Restart::HandedOver { .. } => {
+                println!("restarted the daemon, and its sessions carried on")
+            }
+            Restart::Cold { why: Some(why) } => {
+                println!("restarted the daemon; its sessions started again, since {why}");
+            }
+        },
         Command::Server { json, command } => match command {
             None => server_cli::list(json)?,
             Some(ServerCommand::Stop { name }) => server_cli::stop(&name)?,
@@ -1183,7 +1201,7 @@ fn run(cli: Cli) -> Result<()> {
             // The remote command's own exit code is crystal's.
             std::process::exit(code);
         }
-        Command::Daemon => daemon::run(&socket)?,
+        Command::Daemon { handover } => daemon::run(&socket, handover)?,
         Command::Hook { agent } => hook::run(&socket, &agent),
         Command::Mcp { dir } => mcp::run(&socket, &here(dir)?)?,
     }

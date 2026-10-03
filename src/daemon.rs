@@ -19,6 +19,7 @@ use crate::flows;
 use crate::front;
 use crate::git;
 use crate::handoff;
+use crate::handover::{self, Gate, Ticket};
 use crate::mcp;
 use crate::memory::{self, Added};
 use crate::names;
@@ -31,7 +32,7 @@ use crate::protocol::{
     TaskRecord, TaskSpec, TaskStart, TaskState, TaskView,
 };
 use crate::report;
-use crate::session::{Change, STOP_GRACE, Session, Term};
+use crate::session::{Change, STOP_GRACE, Session, Term, signal_group};
 use crate::skill;
 use crate::socket;
 use crate::spending::Spending;
@@ -41,8 +42,10 @@ use crate::typing;
 use anyhow::{Context, Result, bail, ensure};
 use regex::Regex;
 use std::collections::{BTreeMap, HashSet};
+use std::convert::Infallible;
 use std::io::{BufReader, ErrorKind, Read, Write};
 use std::net::Shutdown;
+use std::os::fd::{AsFd, AsRawFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -67,17 +70,36 @@ const HISTORY_MATCHED: usize = 200;
 /// program writing without a break doesn't keep the daemon looking.
 const LOOK_AT_MOST_EVERY: Duration = Duration::from_millis(50);
 
-pub fn run(socket: &Path) -> Result<()> {
+/// How long a handover waits for the requests the daemon is answering, and
+/// for plugins' hooks and the distiller, before it stops them.
+const HANDOVER_GRACE: Duration = Duration::from_secs(3);
+
+/// Runs the daemon on `socket`, or with `handover`, the descriptor of what
+/// the last daemon handed over as it ran this crystal in its place (see
+/// [`crate::handover`]), carries on from there.
+pub fn run(socket: &Path, handover: Option<RawFd>) -> Result<()> {
     // Leave the client's terminal, so closing it doesn't hang up the
-    // daemon. Fails harmlessly when run in the foreground from a shell.
+    // daemon. Fails harmlessly when run in the foreground from a shell, and
+    // in a daemon handed over, which left it already.
     // SAFETY: setsid has no preconditions.
     unsafe {
         libc::setsid();
     }
+    let handed = handover.map(|fd| handover::read(fd).unwrap_or_else(|err| give_up(socket, err)));
     // Before listening: a daemon that can't keep its state doesn't start,
     // rather than run with none and write over it.
-    let db = Db::open(socket)?;
-    let listener = listen(socket)?;
+    let db = match Db::open(socket) {
+        Ok(db) => db,
+        Err(err) if handed.is_some() => give_up(socket, err),
+        Err(err) => return Err(err),
+    };
+    let listener = match &handed {
+        Some(handed) => match handover::inherit(handed.listener) {
+            Ok(listener) => UnixListener::from(listener),
+            Err(err) => give_up(socket, err.into()),
+        },
+        None => listen(socket)?,
+    };
     let events = Arc::new(Bus::new(socket));
     let hooks = plugin_hooks::follow(&events, socket);
     thread::spawn({
@@ -91,6 +113,9 @@ pub fn run(socket: &Path) -> Result<()> {
     });
     let daemon = Arc::new(Daemon {
         socket: socket.to_path_buf(),
+        listener: listener.as_raw_fd(),
+        gate: Arc::default(),
+        asking_to_hand_over: Mutex::default(),
         db: Mutex::new(db),
         sessions: Mutex::default(),
         flows: Mutex::default(),
@@ -100,16 +125,24 @@ pub fn run(socket: &Path) -> Result<()> {
         preparing: Arc::default(),
         handoff: Mutex::default(),
     });
-    // A daemon starts again after every upgrade, so this is where the skill
-    // an earlier crystal installed learns this one's commands: before the
-    // saved sessions start, so that Claude Code in them reads the new one.
+    // A daemon starts again after every upgrade, or is handed over to the
+    // new crystal, so this is where the skill an earlier crystal installed
+    // learns this one's commands: before the saved sessions start, so that
+    // Claude Code in them reads the new one.
     match skill::refresh() {
         Ok(Some(path)) => eprintln!("crystal daemon: updated the skill in {}", path.display()),
         Ok(None) => {}
         Err(err) => eprintln!("crystal daemon: couldn't update the skill: {err:#}"),
     }
-    daemon.start_saved_sessions();
-    daemon.take_up_flows();
+    match handed {
+        Some(handed) => daemon.take_over(handed),
+        None => {
+            daemon.start_saved_sessions();
+            daemon.take_up_flows();
+        }
+    }
+    // Once the sessions are back, or carried on: a daemon handed over to
+    // starts up as any other does.
     hooks.start_up();
     // With search by meaning on, the model is loaded and every entry
     // without a vector given one now, rather than when a session starts.
@@ -123,14 +156,27 @@ pub fn run(socket: &Path) -> Result<()> {
     });
     for conn in listener.incoming() {
         let Ok(conn) = conn else { continue };
-        let daemon = daemon.clone();
-        thread::spawn(move || {
-            if let Err(err) = daemon.serve(conn) {
-                eprintln!("crystal daemon: {err:#}");
+        // Once a handover has begun, the daemon takes no more connections:
+        // they wait for the next crystal.
+        let Some((conn, ticket)) = daemon.gate.admit(conn) else {
+            loop {
+                thread::park();
             }
-        });
+        };
+        daemon.answer(conn, ticket);
     }
     Ok(())
+}
+
+/// Stops a crystal that can't take over from the daemon that handed over
+/// to it, the way a daemon that crashed does: what it inherited closes with
+/// it, which hangs up on those programs, and the client starts the next
+/// daemon, which starts them again from the database. The socket goes
+/// first, so the client finds it gone.
+fn give_up(socket: &Path, err: anyhow::Error) -> ! {
+    eprintln!("crystal daemon: couldn't take over: {err:#}");
+    let _ = fs::remove_file(socket);
+    process::exit(1);
 }
 
 fn listen(socket: &Path) -> Result<UnixListener> {
@@ -151,6 +197,14 @@ fn listen(socket: &Path) -> Result<UnixListener> {
 
 struct Daemon {
     socket: PathBuf,
+    /// The listening socket's descriptor, which a handover keeps open.
+    listener: RawFd,
+    /// Every connection comes in through here, so that a handover knows
+    /// which it has to answer first.
+    gate: Arc<Gate>,
+    /// The connections that asked for the handover underway, for the next
+    /// crystal to answer.
+    asking_to_hand_over: Mutex<Vec<UnixStream>>,
     /// Where the running sessions and the flow runs are written down, to
     /// start them again after a restart, and each project's backlog and
     /// task history. Whoever needs it and `sessions` or `flows` locks those
@@ -189,21 +243,36 @@ struct Preparing {
 }
 
 impl Daemon {
-    fn serve(&self, conn: UnixStream) -> Result<()> {
+    /// Answers a connection the gate let in, on a thread of its own.
+    fn answer(self: &Arc<Self>, conn: UnixStream, ticket: Ticket) {
+        let daemon = self.clone();
+        thread::spawn(move || {
+            if let Err(err) = daemon.serve(conn, ticket) {
+                eprintln!("crystal daemon: {err:#}");
+            }
+        });
+    }
+
+    /// Answers the request on `conn`, which `ticket` counts in at the gate
+    /// until it's answered: a handover waits for that.
+    fn serve(&self, conn: UnixStream, ticket: Ticket) -> Result<()> {
         let mut input = BufReader::new(&conn);
         let Some(incoming) = protocol::recv_request(&mut input)? else {
             return Ok(());
         };
-        // A shutdown goes through whatever the versions: it's how a crystal
-        // of another version gets this daemon out of its way.
+        // A shutdown and a handover go through whatever the versions: they
+        // are how a crystal of another version gets this daemon out of its
+        // way, or has it run that version.
         let ours = protocol::version();
-        if incoming.version.as_deref() != Some(ours.as_str()) && !incoming.is_shutdown() {
+        let any_version = incoming.is_shutdown() || incoming.is_handover();
+        if incoming.version.as_deref() != Some(ours.as_str()) && !any_version {
             let crystal = socket::crystal_for(&self.socket);
             let message = version_mismatch(&ours, incoming.version.as_deref(), &crystal);
             return Ok(protocol::send(&conn, &Response::Error { message })?);
         }
         let request = incoming.request()?;
-        // These take the connection over, and answer as they go.
+        // These take the connection over, and answer as they go. A handover
+        // cuts them, and their clients come back.
         match request {
             Request::Attach {
                 name,
@@ -211,12 +280,14 @@ impl Daemon {
                 cols,
                 history,
             } => {
+                drop(ticket);
                 return match self.find(name.as_deref()) {
                     Ok(found) => attach(&conn, input, found, (rows, cols), history),
                     Err(err) => Ok(protocol::send(&conn, &Response::from(err))?),
                 };
             }
             Request::Subscribe { filter, since } => {
+                drop(ticket);
                 return self.stream_events(&conn, filter, since);
             }
             Request::WaitOutput {
@@ -224,8 +295,12 @@ impl Daemon {
                 pattern,
                 timeout_ms,
             } => {
+                drop(ticket);
                 let timeout = timeout_ms.map(Duration::from_millis);
                 return self.wait_for_output(&conn, &name, &pattern, timeout);
+            }
+            Request::Handover { exe, format } => {
+                return self.hand_over(&conn, ticket, &exe, format);
             }
             _ => {}
         }
@@ -248,6 +323,13 @@ impl Daemon {
             eprintln!("crystal daemon: couldn't read the sessions to start again: {err:#}");
             Vec::new()
         });
+        self.start_again(&mut sessions, saved);
+    }
+
+    /// Starts sessions again from what was written down of them, adding
+    /// them to `sessions`: an agent in its conversation, a task at rest,
+    /// any other program from the start.
+    fn start_again(&self, sessions: &mut Vec<Session>, saved: Vec<SavedSession>) {
         for saved in saved {
             let goal = saved.goal.clone();
             let backlog = goal.as_ref().and_then(|goal| goal.backlog);
@@ -264,7 +346,7 @@ impl Daemon {
                     };
                     let conversation = saved.conversation.map(|conversation| conversation.id);
                     start_task(
-                        &mut sessions,
+                        sessions,
                         &self.socket,
                         &self.spending,
                         task,
@@ -282,7 +364,7 @@ impl Daemon {
                         backlog,
                     };
                     start(
-                        &mut sessions,
+                        sessions,
                         &self.socket,
                         new,
                         saved.conversation,
@@ -310,8 +392,16 @@ impl Daemon {
     /// when they've changed.
     fn keep_up(&self) {
         let mut last_saved: Vec<SavedSession> = Vec::new();
-        // The sessions whose program has ended and been told of, by id.
-        let mut told_ended: HashSet<String> = HashSet::new();
+        // The sessions whose program has ended and been told of, by id: a
+        // daemon handed ones that had ended was told of them already.
+        let mut told_ended: HashSet<String> = self
+            .sessions
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|session| !session.is_running())
+            .map(|session| session.id.clone())
+            .collect();
         let mut last_runs: Vec<FlowRun> = Vec::new();
         loop {
             thread::sleep(KEEP_UP_EVERY);
@@ -382,29 +472,189 @@ impl Daemon {
             Vec::new()
         });
         for run in &mut runs {
-            // A step in a terminal whose session came back with its task
-            // open carries on there; any other was cut short.
-            let carried_on = run.running().is_some_and(|step| {
-                run.in_terminal(step)
-                    && step_session(&mut sessions, run, step).is_some_and(|session| {
-                        let open = session
-                            .task_record()
-                            .is_some_and(|task| task.outcome.is_none());
-                        session.is_running() && open
-                    })
-            });
-            if !carried_on {
-                run.interrupt();
-            }
-            run.env = env::current();
-            let at_gate = run
-                .current()
-                .filter(|&step| run.steps[step].state == StepState::AtGate);
-            if let Some(session) = at_gate.and_then(|step| step_session(&mut sessions, run, step)) {
-                session.on_agent_event(AgentEvent::Asking);
-            }
+            take_up(&mut sessions, run);
         }
         *self.flows.lock().unwrap() = runs;
+    }
+
+    /// Hands the daemon over to the crystal at `exe` (see
+    /// [`crate::handover`]), which answers `conn`, the connection `ticket`
+    /// let in, once it has taken over. Refused, the daemon says why, and
+    /// carries on as it was: the client restarts it cold. Comes back with
+    /// nothing else: a handover that fails once it has begun stops the
+    /// daemon.
+    fn hand_over(&self, conn: &UnixStream, ticket: Ticket, exe: &Path, format: u32) -> Result<()> {
+        if let Err(err) = handover::check(exe, format) {
+            let message = format!("couldn't hand over: {err:#}");
+            return Ok(protocol::send(conn, &Response::Error { message })?);
+        }
+        let first = {
+            let mut asking = self.asking_to_hand_over.lock().unwrap();
+            asking.push(conn.try_clone()?);
+            asking.len() == 1
+        };
+        // Counted in until now, so that one asked for at the same time is
+        // in the list before the first goes on.
+        drop(ticket);
+        // One handover at a time: the next crystal answers this one too.
+        if !first {
+            return Ok(());
+        }
+        eprintln!("crystal daemon: handing over to {}", exe.display());
+        handover::begin();
+        let deadline = Instant::now() + HANDOVER_GRACE;
+        let waiting = self.gate.close(&self.socket, deadline);
+        let Err(err) = self.exec_handed_over(&waiting, exe, deadline);
+        // The sessions can't carry on: the daemon stops as a shutdown that
+        // keeps them does, and the client starts the next, which starts them
+        // again. Its socket goes first, so the client finds it gone.
+        eprintln!("crystal daemon: couldn't hand over, so it stops: {err:#}");
+        let _ = fs::remove_file(&self.socket);
+        let message = format!("couldn't hand over: {err:#}");
+        for conn in self.asking_to_hand_over.lock().unwrap().iter() {
+            let _ = protocol::send(
+                conn,
+                &Response::Error {
+                    message: message.clone(),
+                },
+            );
+        }
+        process::exit(1);
+    }
+
+    /// Gets every session ready to hand over, then runs the crystal at `exe`
+    /// in this process: comes back only with why it couldn't. `waiting` are
+    /// the connections the next crystal answers.
+    fn exec_handed_over(
+        &self,
+        waiting: &[UnixStream],
+        exe: &Path,
+        deadline: Instant,
+    ) -> Result<Infallible> {
+        let mut sessions = self.sessions.lock().unwrap();
+        let flows = self.flows.lock().unwrap();
+        // What has happened so far is told, and a task that closed written
+        // down, before the sessions go.
+        for session in sessions.iter_mut() {
+            for closed in session.take_closed() {
+                self.write_down(session.cwd(), Some(&session.info()), &closed);
+            }
+            self.tell_changes(session);
+        }
+        // Written down first: whatever goes wrong from here, the next
+        // daemon starts them again, as after any restart.
+        let saved: Vec<SavedSession> = sessions.iter().filter_map(Session::saved).collect();
+        {
+            let mut db = self.db.lock().unwrap();
+            db.save_sessions(&saved)?;
+            db.save_flow_runs(&flows)?;
+        }
+        handover::HELPERS.finish(deadline);
+        handover::stop_reading();
+        let mut handed = Vec::new();
+        // Held until the exec: see [`Session::hand_over`].
+        let mut held = Vec::new();
+        for session in sessions.iter() {
+            let (session, state) = session.hand_over()?;
+            handed.push(session);
+            held.push(state);
+        }
+        let keep = |conns: &[UnixStream]| {
+            conns
+                .iter()
+                .map(|conn| handover::keep_across_exec(conn.as_fd()))
+                .collect::<std::io::Result<Vec<RawFd>>>()
+        };
+        // SAFETY: the listener is open for as long as the daemon runs.
+        let listener = unsafe { std::os::fd::BorrowedFd::borrow_raw(self.listener) };
+        let asking = self.asking_to_hand_over.lock().unwrap();
+        let state = handover::State {
+            from: protocol::version(),
+            listener: handover::keep_across_exec(listener)?,
+            asking: keep(&asking)?,
+            waiting: keep(waiting)?,
+            sessions: handed,
+            flows: flows.iter().map(handover::HandedFlow::of).collect(),
+        };
+        let dir = self.socket.parent().unwrap_or(Path::new("/"));
+        let file = handover::write(dir, &state)?;
+        let state = handover::keep_across_exec(file.as_fd())?;
+        // No write to the database is halfway through as the exec closes
+        // it.
+        let _db = self.db.lock().unwrap();
+        let _spending = self.spending.hold();
+        let _events = self.events.hold();
+        let err = handover::exec(exe, &self.socket, state);
+        Err(err).with_context(|| format!("couldn't run {}", exe.display()))
+    }
+
+    /// Carries on from the daemon that handed over: its sessions and flow
+    /// runs as they were. A session that can't be carried on starts again,
+    /// as after any restart. Then the clients that asked for the handover
+    /// are told, and the connections that came in meanwhile are answered.
+    fn take_over(self: &Arc<Self>, handed: handover::State) {
+        let handover::State {
+            from,
+            asking,
+            waiting,
+            sessions: handed_sessions,
+            flows,
+            ..
+        } = handed;
+        let mut sessions = self.sessions.lock().unwrap();
+        let mut again = Vec::new();
+        for handed in handed_sessions {
+            let name = handed.name().to_string();
+            let saved = handed.saved();
+            let processes = handed.processes();
+            match Session::adopt(handed, &self.spending) {
+                Ok(session) => sessions.push(session),
+                Err(err) => {
+                    eprintln!("crystal daemon: couldn't carry {name} on: {err:#}");
+                    // Hung up on, then reaped, since they're this process's
+                    // children still.
+                    for pid in processes {
+                        signal_group(pid, libc::SIGHUP);
+                        thread::spawn(move || handover::reap(pid));
+                    }
+                    again.extend(saved);
+                }
+            }
+        }
+        let carried = sessions.len();
+        let restarted: Vec<String> = again.iter().map(|saved| saved.name.clone()).collect();
+        self.start_again(&mut sessions, again);
+        let mut flows: Vec<FlowRun> = flows
+            .into_iter()
+            .map(handover::HandedFlow::taken_over)
+            .collect();
+        // A run whose step's session started again goes on as after any
+        // restart.
+        for run in &mut flows {
+            let step = run
+                .current()
+                .and_then(|step| run.steps[step].session.as_ref());
+            if step.is_some_and(|name| restarted.contains(name)) {
+                take_up(&mut sessions, run);
+            }
+        }
+        *self.flows.lock().unwrap() = flows;
+        drop(sessions);
+        eprintln!("crystal daemon: took over from crystal {from}: {carried} sessions carried on");
+        self.events
+            .emit(Event::handed_over(&from, &protocol::version(), carried));
+        for conn in asking {
+            if let Ok(conn) = handover::inherit(conn) {
+                let answer = Response::HandedOver { sessions: carried };
+                let _ = protocol::send(UnixStream::from(conn), &answer);
+            }
+        }
+        for conn in waiting {
+            let conn = handover::inherit(conn).map(UnixStream::from);
+            if let Some((conn, ticket)) = conn.ok().and_then(|conn| self.gate.admit(conn)) {
+                self.answer(conn, ticket);
+            }
+        }
     }
 
     /// Keeps each flow run going: once the task of the step running has
@@ -841,6 +1091,10 @@ impl Daemon {
         if !memory::enabled(&config) || !config.memory.distill || !worth_reading {
             return;
         }
+        // A handover underway would only stop it halfway.
+        if handover::underway() {
+            return;
+        }
         let Some(job) = self.distill_job(session, Some(task), config.memory) else {
             return;
         };
@@ -1183,7 +1437,7 @@ impl Daemon {
                 self.events.emit(*event);
                 Ok(Response::Done)
             }
-            Request::Subscribe { .. } | Request::WaitOutput { .. } => {
+            Request::Subscribe { .. } | Request::WaitOutput { .. } | Request::Handover { .. } => {
                 bail!("this takes the connection over")
             }
             Request::Rename { name, new_name } => {
@@ -1862,6 +2116,33 @@ impl Daemon {
     }
 }
 
+/// Takes up `run` as the last daemon left it when it stopped: a step in a
+/// terminal whose session came back with its task open carries on there;
+/// any other that was running then was cut short, and waits to be run
+/// again; one waiting at its gate waits on the user again. Its steps start
+/// from this daemon's environment, as the sessions it starts again do.
+fn take_up(sessions: &mut [Session], run: &mut FlowRun) {
+    let carried_on = run.running().is_some_and(|step| {
+        run.in_terminal(step)
+            && step_session(sessions, run, step).is_some_and(|session| {
+                let open = session
+                    .task_record()
+                    .is_some_and(|task| task.outcome.is_none());
+                session.is_running() && open
+            })
+    });
+    if !carried_on {
+        run.interrupt();
+    }
+    run.env = env::current();
+    let at_gate = run
+        .current()
+        .filter(|&step| run.steps[step].state == StepState::AtGate);
+    if let Some(session) = at_gate.and_then(|step| step_session(sessions, run, step)) {
+        session.on_agent_event(AgentEvent::Asking);
+    }
+}
+
 /// The session `step` of `run` runs in, while it's there.
 fn step_session<'a>(
     sessions: &'a mut [Session],
@@ -2523,16 +2804,41 @@ fn attach(
 
 /// What to tell a crystal of another version than this daemon's. Starting
 /// the daemon again from that crystal, run as `crystal` runs on this daemon
-/// ([`socket::crystal_for`]), makes the two match.
+/// ([`socket::crystal_for`]), makes the two match; one older than the
+/// daemon, say a TUI left open as crystal was upgraded, is the one to start
+/// again.
 fn version_mismatch(daemon: &str, client: Option<&str>, crystal: &str) -> String {
-    let client = match client {
-        Some(version) => format!("crystal {version}"),
-        None => "an older crystal".to_string(),
+    match client {
+        Some(client) if older(client, daemon) => format!(
+            "this is crystal {client}, but the daemon is crystal {daemon}, which is newer: \
+             quit and run {crystal} again to use it"
+        ),
+        client => {
+            let client = match client {
+                Some(version) => format!("crystal {version}"),
+                None => "an older crystal".to_string(),
+            };
+            format!(
+                "this is {client}, but the daemon is crystal {daemon}: \
+                 run `{crystal} restart-server` to restart the daemon on this crystal"
+            )
+        }
+    }
+}
+
+/// Whether the version `a` comes before `b`, number by number. Neither,
+/// when either isn't numbers.
+fn older(a: &str, b: &str) -> bool {
+    let numbers = |version: &str| {
+        version
+            .split('.')
+            .map(|number| number.parse::<u64>().ok())
+            .collect::<Option<Vec<u64>>>()
     };
-    format!(
-        "this is {client}, but the daemon is crystal {daemon}: \
-         run `{crystal} restart-server` to restart the daemon on this crystal"
-    )
+    match (numbers(a), numbers(b)) {
+        (Some(a), Some(b)) => a < b,
+        _ => false,
+    }
 }
 
 impl From<anyhow::Error> for Response {
@@ -2589,6 +2895,18 @@ mod tests {
             version_mismatch("0.1.0", None, "crystal --server work")
                 .contains("run `crystal --server work restart-server`")
         );
+    }
+
+    #[test]
+    fn a_crystal_older_than_the_daemon_is_told_to_start_again() {
+        assert_eq!(
+            version_mismatch("0.4.0", Some("0.3.9"), "crystal --server work"),
+            "this is crystal 0.3.9, but the daemon is crystal 0.4.0, which is newer: \
+             quit and run crystal --server work again to use it"
+        );
+        assert!(older("0.9.0", "0.10.0"));
+        assert!(!older("0.10.0", "0.9.0"));
+        assert!(!older("dev", "0.1.0"));
     }
 
     #[test]

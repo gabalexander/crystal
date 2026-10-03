@@ -42,6 +42,13 @@ impl Spending {
         }
     }
 
+    /// Holds the spending's connection to the database, until what's given
+    /// back is dropped: for a handover, which closes it with the exec, so
+    /// that no write is halfway through then.
+    pub fn hold(&self) -> impl Sized + '_ {
+        self.db.lock().unwrap()
+    }
+
     /// Refuses a new run once today's spending has reached `budget`, saying
     /// why. A budget of 0 or less is none.
     pub fn check(&self, budget: f64) -> Result<()> {

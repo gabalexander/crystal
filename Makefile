@@ -20,10 +20,11 @@ lint:
 	cargo clippy --all-targets -- -D warnings
 
 # A running daemon goes on running the crystal it was started from, so after
-# copying the new one in, it's restarted on it: running sessions come back,
-# Claude Code in its conversation. The old file is removed first, not
-# written over, since macOS kills a program whose signed file changes under
-# it. Then the skill that teaches Claude Code to drive crystal is installed
+# copying the new one in, it's handed over to it: running sessions carry on,
+# never stopped (a daemon from before handovers is restarted instead, and
+# its sessions come back, Claude Code in its conversation). The old file is
+# removed first, not written over, since macOS kills a program whose signed
+# file changes under it. Then the skill that teaches Claude Code to drive crystal is installed
 # or brought up to date, unless CRYSTAL_NO_SKILL=1; one you've changed is
 # kept.
 install: release

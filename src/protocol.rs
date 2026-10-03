@@ -284,6 +284,18 @@ pub enum Request {
         #[serde(default)]
         keep_sessions: bool,
     },
+    /// Hand the daemon over to the crystal at `exe`, which carries on in its
+    /// place, its sessions running on (see [`crate::handover`]). `format`
+    /// is the kind of handover that crystal reads: a daemon that writes
+    /// another refuses, and is restarted cold.
+    ///
+    /// Like a shutdown, every version must keep this one as it is, and
+    /// every daemon takes it whatever the version of the crystal sending
+    /// it: handing over is how a daemon becomes another version.
+    Handover {
+        exe: PathBuf,
+        format: u32,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -469,6 +481,11 @@ pub enum Response {
     /// The line on a session's screen that matched.
     Matched {
         line: String,
+    },
+    /// The daemon a handover was asked of has been handed over: it runs the
+    /// new crystal now, which says so, with how many sessions carried on.
+    HandedOver {
+        sessions: usize,
     },
     Done,
     Error {
@@ -1017,6 +1034,10 @@ impl Incoming {
         self.message["type"] == "shutdown"
     }
 
+    pub fn is_handover(&self) -> bool {
+        self.message["type"] == "handover"
+    }
+
     /// Reads the request, once its version is known to match.
     pub fn request(self) -> serde_json::Result<Request> {
         serde_json::from_value(self.message)
@@ -1194,6 +1215,18 @@ mod tests {
         };
         send_request(&mut wire, &shutdown).unwrap();
         assert!(recv_request(&wire[..]).unwrap().unwrap().is_shutdown());
+    }
+
+    #[test]
+    fn a_handover_is_known_as_one_whatever_the_version() {
+        let line = br#"{"type":"handover","exe":"/bin/crystal","format":1,"version":"9.0.0"}"#;
+        let incoming = recv_request(&line[..]).unwrap().unwrap();
+        assert!(incoming.is_handover());
+        assert!(!incoming.is_shutdown());
+        let Request::Handover { exe, format } = incoming.request().unwrap() else {
+            panic!("not a handover");
+        };
+        assert_eq!((exe, format), (PathBuf::from("/bin/crystal"), 1));
     }
 
     #[test]

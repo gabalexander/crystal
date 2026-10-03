@@ -61,10 +61,11 @@ pub enum Kind {
     BacklogAdded,
     BacklogClosed,
     PluginPaused,
+    DaemonHandedOver,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 34] = [
+    pub const ALL: [Kind; 35] = [
         Kind::SessionStarted,
         Kind::SessionRenamed,
         Kind::SessionWorking,
@@ -99,6 +100,7 @@ impl Kind {
         Kind::BacklogAdded,
         Kind::BacklogClosed,
         Kind::PluginPaused,
+        Kind::DaemonHandedOver,
     ];
 
     /// Its name, which is how plugins, filters and the log know it.
@@ -138,6 +140,7 @@ impl Kind {
             Kind::BacklogAdded => "backlog.added",
             Kind::BacklogClosed => "backlog.closed",
             Kind::PluginPaused => "plugin.paused",
+            Kind::DaemonHandedOver => "daemon.handed_over",
         }
     }
 
@@ -211,6 +214,8 @@ pub struct Event {
     pub artifact: Option<Artifact>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub handoff: Option<HandoffAbout>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon: Option<DaemonAbout>,
 }
 
 /// The session an event is about, as it was then.
@@ -309,6 +314,15 @@ pub struct PluginAbout {
     pub why: String,
 }
 
+/// The daemon, handed over to another crystal: the version it runs now,
+/// and how many sessions carried on through it. The version it ran before
+/// is the event's `from`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonAbout {
+    pub version: String,
+    pub sessions: usize,
+}
+
 impl Event {
     /// An event of `kind` about nothing yet, for the constructors to fill
     /// in. The daemon gives it its `seq` and `at`.
@@ -329,6 +343,7 @@ impl Event {
             plugin: None,
             artifact: None,
             handoff: None,
+            daemon: None,
         }
     }
 
@@ -608,8 +623,21 @@ impl Event {
         }
     }
 
+    /// The daemon, which ran crystal `from`, was handed over to this one,
+    /// and `sessions` carried on through it.
+    pub fn handed_over(from: &str, version: &str, sessions: usize) -> Event {
+        Event {
+            from: Some(from.to_string()),
+            daemon: Some(DaemonAbout {
+                version: version.to_string(),
+                sessions,
+            }),
+            ..Event::new(Kind::DaemonHandedOver)
+        }
+    }
+
     /// What it's about, in a word: the session's name, the flow run's, the
-    /// plugin's, or else the project's.
+    /// plugin's, the daemon, or else the project's.
     pub fn subject(&self) -> String {
         if let Some(session) = &self.session {
             return session.name.clone();
@@ -619,6 +647,9 @@ impl Event {
         }
         if let Some(plugin) = &self.plugin {
             return plugin.name.clone();
+        }
+        if self.daemon.is_some() {
+            return "daemon".to_string();
         }
         match &self.project {
             Some(project) => project::name_of(project),
@@ -763,6 +794,17 @@ impl Event {
                 .plugin
                 .as_ref()
                 .map_or(String::new(), |plugin| plugin.why.clone()),
+            Kind::DaemonHandedOver => self.daemon.as_ref().map_or(String::new(), |daemon| {
+                let from = self.from.as_deref().unwrap_or("?");
+                let sessions = match daemon.sessions {
+                    1 => "1 session".to_string(),
+                    count => format!("{count} sessions"),
+                };
+                format!(
+                    "from crystal {from} to {}, {sessions} carried on",
+                    daemon.version
+                )
+            }),
         }
     }
 }
@@ -953,6 +995,7 @@ pub fn example(kind: Kind, session: Option<&SessionInfo>, dir: &Path) -> Event {
             Event::backlog(kind, project::of(dir).path, item)
         }
         Kind::PluginPaused => Event::plugin_paused("example", "it failed 5 times in a row"),
+        Kind::DaemonHandedOver => Event::handed_over("0.3.0", "0.4.0", 3),
     };
     Event {
         at: now_ms(),

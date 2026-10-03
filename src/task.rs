@@ -12,23 +12,32 @@
 //! A `claude` left idle for [`IDLE_KEEP`] is let go; the next follow-up
 //! starts another, which carries the conversation on with `--resume`, as
 //! one does after a restart. A turn that fails ends the task.
+//!
+//! A handover (see [`crate::handover`]) hands the `claude` over too, its
+//! pipes and all, so a turn halfway through carries on in the next daemon:
+//! a `claude` is a child like a terminal's program, and its pipes are
+//! descriptors like a terminal.
 
 use crate::claude_stream::{self, Decision, Line, PermissionRequest, Rule};
 use crate::config::Config;
 use crate::distill::Record;
+use crate::handover::{self, Got};
 use crate::protocol::{AgentEvent, Answer, Asking, State, TaskResult, TaskSpec};
 use crate::session::{STOP_GRACE, Term, signal_group};
 use crate::spending::Spending;
 use crate::transcript::{self, Event, Outcome};
 use anyhow::{Context, Result, ensure};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, VecDeque};
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::fs::File;
+use std::io::{self, Write};
+use std::os::fd::{AsFd, IntoRawFd, OwnedFd, RawFd};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::PathBuf;
-use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
-use std::thread;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 /// How many of the last lines Claude wrote to its standard error a run that
@@ -60,18 +69,24 @@ pub struct Task {
 
 /// What a task's runs have come to: written by the thread that reads its
 /// `claude`, and read as the daemon keeps up with its sessions.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 struct Runs {
     /// Turns are counted, not only marked as going on, so that a turn that
     /// starts and ends between two looks still counts.
     started: u32,
     ended: u32,
     /// The `claude` taking the task's turns, while there is one.
+    #[serde(skip)]
     claude: Option<Claude>,
+    /// The threads reading each `claude` that hasn't been read to its end,
+    /// for a handover to wait for once it has stopped them.
+    #[serde(skip)]
+    readers: Vec<JoinHandle<Option<Stopped>>>,
     /// How many `claude`s the task has started. Each one's number tells the
     /// thread reading it whether it's still the task's.
     spawned: u64,
     /// When the last turn ended, to let an idle `claude` go.
+    #[serde(skip)]
     idle_since: Option<Instant>,
     /// The permissions Claude waits on the user for, the oldest first.
     asking: VecDeque<PermissionRequest>,
@@ -118,7 +133,7 @@ struct Claude {
     pid: u32,
     /// Where its prompts and answers go. Dropping it closes it, which is
     /// how `claude` learns there's nothing more to do.
-    stdin: ChildStdin,
+    stdin: File,
     /// What it has cost so far, as it counts: from its start.
     cost: f64,
 }
@@ -133,7 +148,7 @@ impl Claude {
 }
 
 /// How a task's runs stood when the session last looked.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 struct Seen {
     started: u32,
     ended: u32,
@@ -233,23 +248,139 @@ impl Task {
             .command(runs.conversation.as_deref(), budget)
             .spawn()
             .context("couldn't start claude")?;
-        let stdin = child.stdin.take().context("claude has no input")?;
+        let pipe = |pipe: Option<OwnedFd>| pipe.map(File::from).context("claude has no pipes");
+        let stdin = pipe(child.stdin.take().map(OwnedFd::from))?;
+        let pipes = Pipes {
+            pid: child.id(),
+            stdout: pipe(child.stdout.take().map(OwnedFd::from))?,
+            stderr: pipe(child.stderr.take().map(OwnedFd::from))?,
+        };
+        // Waited for by its pid, the same way a daemon it's handed over to
+        // waits for it.
+        drop(child);
         runs.spawned += 1;
         runs.claude = Some(Claude {
             number: runs.spawned,
-            pid: child.id(),
+            pid: pipes.pid,
             stdin,
             cost: 0.0,
         });
+        self.follow(runs, runs.spawned, pipes, Vec::new(), Errors::default());
+        Ok(())
+    }
+
+    /// Reads `claude` number `number`, on a thread of its own, from where
+    /// the last reader left it: `unread`, what it wrote after its last
+    /// whole line, and `errors`.
+    fn follow(&self, runs: &mut Runs, number: u64, pipes: Pipes, unread: Vec<u8>, errors: Errors) {
         let reading = Reading {
-            number: runs.spawned,
+            number,
             term: self.term.clone(),
             runs: self.runs.clone(),
             state: self.state.clone(),
             spending: self.spending.clone(),
         };
-        thread::spawn(move || reading.follow(child));
-        Ok(())
+        runs.readers.retain(|reader| !reader.is_finished());
+        runs.readers
+            .push(thread::spawn(move || reading.follow(pipes, unread, errors)));
+    }
+
+    /// Hands the task over to the next daemon, once a handover has stopped
+    /// its readers: how its runs stand, and each `claude` not read to its
+    /// end, with its pipes kept open across the exec. Leaves the task
+    /// empty: only the exec comes after.
+    pub fn hand_over(&self) -> io::Result<Handed> {
+        let readers = std::mem::take(&mut self.runs.lock().unwrap().readers);
+        let stopped: Vec<Stopped> = readers
+            .into_iter()
+            .filter_map(|reader| reader.join().ok().flatten())
+            .collect();
+        let mut runs = std::mem::take(&mut *self.runs.lock().unwrap());
+        let mut current = runs.claude.take();
+        let mut claudes = Vec::new();
+        for stopped in stopped {
+            let claude = current.take_if(|claude| claude.number == stopped.number);
+            claudes.push(HandedClaude {
+                number: stopped.number,
+                pid: stopped.pid,
+                cost: claude.as_ref().map_or(0.0, |claude| claude.cost),
+                stdin: claude
+                    .map(|claude| keep_across_exec(claude.stdin))
+                    .transpose()?,
+                stdout: keep_across_exec(stopped.stdout)?,
+                stderr: keep_across_exec(stopped.stderr)?,
+                unread: stopped.unread,
+                errors: stopped.errors,
+            });
+        }
+        Ok(Handed {
+            spec: self.spec.clone(),
+            args: self.args.clone(),
+            runs,
+            seen: self.seen,
+            claudes,
+        })
+    }
+
+    /// Carries on a task the last daemon handed over, in `cwd` with `env`:
+    /// its runs as they stood, and each of its `claude`s read again from
+    /// where the last daemon left off. Fails when what it was handed isn't
+    /// open.
+    pub fn adopt(
+        handed: Handed,
+        cwd: PathBuf,
+        env: BTreeMap<String, String>,
+        term: Arc<Term>,
+        state: Arc<Mutex<State>>,
+        spending: Arc<Spending>,
+    ) -> Result<Task> {
+        let Handed {
+            spec,
+            args,
+            mut runs,
+            seen,
+            claudes,
+        } = handed;
+        let mut reading = Vec::new();
+        for claude in claudes {
+            let pipe = |fd| handover::inherit(fd).map(File::from);
+            let pipes = Pipes {
+                pid: claude.pid,
+                stdout: pipe(claude.stdout)?,
+                stderr: pipe(claude.stderr)?,
+            };
+            if let Some(stdin) = claude.stdin {
+                runs.claude = Some(Claude {
+                    number: claude.number,
+                    pid: claude.pid,
+                    stdin: pipe(stdin)?,
+                    cost: claude.cost,
+                });
+            }
+            reading.push((claude.number, pipes, claude.unread, claude.errors));
+        }
+        // An idle `claude` is let go a while from now.
+        if runs.claude.is_some() && !runs.working() {
+            runs.idle_since = Some(Instant::now());
+        }
+        let task = Task {
+            spec,
+            args,
+            cwd,
+            env,
+            term,
+            state,
+            spending,
+            runs: Arc::new(Mutex::new(runs)),
+            seen,
+        };
+        {
+            let mut runs = task.runs.lock().unwrap();
+            for (number, pipes, unread, errors) in reading {
+                task.follow(&mut runs, number, pipes, unread, errors);
+            }
+        }
+        Ok(task)
     }
 
     /// What its runs mean for the session since it last looked: a turn
@@ -469,24 +600,62 @@ struct Reading {
 }
 
 impl Reading {
-    /// Reads what `claude` says until it ends, then says how it ended.
-    fn follow(self, mut child: Child) {
+    /// Reads what `claude` says until it ends, then says how it ended; or,
+    /// stopped by a handover, gives back how far it got, for the next
+    /// daemon to carry on from.
+    fn follow(self, claude: Pipes, mut unread: Vec<u8>, errors: Errors) -> Option<Stopped> {
+        let Pipes {
+            pid,
+            stdout,
+            stderr,
+        } = claude;
         // What Claude writes to its standard error is read on a thread of
         // its own, so that neither pipe can fill up and stall it.
-        let errors = child
-            .stderr
-            .take()
-            .map(|stderr| thread::spawn(move || last_lines(stderr, ERROR_LINES)));
-        if let Some(stdout) = child.stdout.take() {
-            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                self.take(&line);
+        let reading_errors = thread::spawn(move || {
+            let mut errors = errors;
+            errors.read(&stderr);
+            (stderr, errors)
+        });
+        let stopped = self.read_lines(&stdout, &mut unread);
+        let (stderr, errors) = reading_errors.join().ok()?;
+        if stopped {
+            return Some(Stopped {
+                number: self.number,
+                pid,
+                stdout,
+                stderr,
+                unread,
+                errors,
+            });
+        }
+        let status = handover::reap(pid);
+        self.end(status, &errors.lines());
+        None
+    }
+
+    /// Takes what `claude` says a line at a time, until it ends (`false`),
+    /// or a handover stops the reading (`true`). What comes after the last
+    /// whole line waits in `unread`.
+    fn read_lines(&self, stdout: &File, unread: &mut Vec<u8>) -> bool {
+        let mut buf = [0; 16 * 1024];
+        loop {
+            match handover::readers().read(stdout, &mut buf) {
+                Ok(Got::Bytes(n)) => {
+                    unread.extend_from_slice(&buf[..n]);
+                    while let Some(end) = unread.iter().position(|&byte| byte == b'\n') {
+                        let line: Vec<u8> = unread.drain(..=end).collect();
+                        self.take(&text_of(&line));
+                    }
+                }
+                Ok(Got::Stopped) => return true,
+                Ok(Got::End) | Err(_) => {
+                    if !unread.is_empty() {
+                        self.take(&text_of(&std::mem::take(unread)));
+                    }
+                    return false;
+                }
             }
         }
-        let status = child.wait();
-        let errors = errors
-            .and_then(|reading| reading.join().ok())
-            .unwrap_or_default();
-        self.end(status, &errors);
     }
 
     /// Whether the `claude` read is still the task's: one it has let go of
@@ -641,15 +810,124 @@ fn signal_name(signal: i32) -> String {
     }
 }
 
-/// The last `count` lines of `input` that aren't blank.
-fn last_lines(input: impl Read, count: usize) -> Vec<String> {
-    let lines: Vec<String> = BufReader::new(input)
-        .lines()
-        .map_while(Result::ok)
-        .filter(|line| !line.trim().is_empty())
-        .collect();
-    let first = lines.len().saturating_sub(count);
-    lines[first..].to_vec()
+/// A line read off a pipe, as text, without its line ending.
+fn text_of(line: &[u8]) -> String {
+    let line = line.strip_suffix(b"\n").unwrap_or(line);
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
+    String::from_utf8_lossy(line).into_owned()
+}
+
+/// A `claude`'s pipes, as the thread reading it has them.
+struct Pipes {
+    pid: u32,
+    stdout: File,
+    stderr: File,
+}
+
+/// How far a thread reading a `claude` had got when a handover stopped
+/// it.
+#[derive(Debug)]
+struct Stopped {
+    number: u64,
+    pid: u32,
+    stdout: File,
+    stderr: File,
+    unread: Vec<u8>,
+    errors: Errors,
+}
+
+/// The last [`ERROR_LINES`] lines a `claude` wrote to its standard error
+/// that aren't blank, to say why a run that crashed did.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct Errors {
+    last: VecDeque<String>,
+    /// What came after the last whole line.
+    unread: Vec<u8>,
+}
+
+impl Errors {
+    /// Reads `stderr` to its end, or until a handover stops it.
+    fn read(&mut self, stderr: &File) {
+        let mut buf = [0; 4096];
+        while let Ok(Got::Bytes(n)) = handover::readers().read(stderr, &mut buf) {
+            self.take(&buf[..n]);
+        }
+    }
+
+    fn take(&mut self, bytes: &[u8]) {
+        self.unread.extend_from_slice(bytes);
+        while let Some(end) = self.unread.iter().position(|&byte| byte == b'\n') {
+            let line: Vec<u8> = self.unread.drain(..=end).collect();
+            self.keep(text_of(&line));
+        }
+    }
+
+    fn keep(&mut self, line: String) {
+        if line.trim().is_empty() {
+            return;
+        }
+        self.last.push_back(line);
+        if self.last.len() > ERROR_LINES {
+            self.last.pop_front();
+        }
+    }
+
+    /// The lines, the last one too if it had no line ending.
+    fn lines(mut self) -> Vec<String> {
+        let rest = std::mem::take(&mut self.unread);
+        self.keep(text_of(&rest));
+        self.last.into()
+    }
+}
+
+/// A task as one daemon hands it to the next: how its runs stand, and its
+/// `claude`s.
+#[derive(Serialize, Deserialize)]
+pub struct Handed {
+    spec: TaskSpec,
+    args: Vec<String>,
+    runs: Runs,
+    seen: Seen,
+    claudes: Vec<HandedClaude>,
+}
+
+impl Handed {
+    pub fn spec(&self) -> &TaskSpec {
+        &self.spec
+    }
+
+    pub fn conversation(&self) -> Option<String> {
+        self.runs.conversation.clone()
+    }
+
+    /// Its `claude`s, which the next daemon has to reap.
+    pub fn processes(&self) -> Vec<u32> {
+        self.claudes.iter().map(|claude| claude.pid).collect()
+    }
+}
+
+/// A `claude` a task hands over: which it is, and its pipes by the numbers
+/// of the descriptors the next daemon inherits, the way the last reader
+/// left them.
+#[derive(Serialize, Deserialize)]
+struct HandedClaude {
+    number: u64,
+    pid: u32,
+    /// What it has cost so far, as it counts.
+    cost: f64,
+    /// Its input, while it's the task's `claude`: one let go has none.
+    stdin: Option<RawFd>,
+    stdout: RawFd,
+    stderr: RawFd,
+    unread: Vec<u8>,
+    errors: Errors,
+}
+
+/// Keeps `pipe` open across the exec, for the next daemon, which owns it
+/// from then on: it's never closed here.
+fn keep_across_exec(pipe: File) -> io::Result<RawFd> {
+    handover::keep_across_exec(pipe.as_fd())?;
+    Ok(pipe.into_raw_fd())
 }
 
 #[cfg(test)]
@@ -742,9 +1020,69 @@ mod tests {
     }
 
     #[test]
-    fn the_last_lines_skip_the_blank_ones() {
-        let text = "one\n\ntwo\nthree\n\n";
-        assert_eq!(last_lines(text.as_bytes(), 2), ["two", "three"]);
-        assert_eq!(last_lines(text.as_bytes(), 9), ["one", "two", "three"]);
+    fn a_task_handed_over_comes_back_with_its_runs_as_they_stood() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::Db::open(&dir.path().join("crystal.sock")).unwrap();
+        let asking = PermissionRequest {
+            request_id: "perm-2".into(),
+            tool_name: "Bash".into(),
+            input: serde_json::json!({"command": "cargo test"}),
+        };
+        let runs = Runs {
+            started: 2,
+            ended: 1,
+            spawned: 2,
+            asking: [asking].into(),
+            conversation: Some("conv-1".into()),
+            prompt: "now the docs".into(),
+            result: Some("All green".into()),
+            cost_usd: 0.5,
+            ..Runs::default()
+        };
+        let handed = Handed {
+            spec: TaskSpec {
+                prompt: "fix the tests".into(),
+                args: Vec::new(),
+            },
+            args: Vec::new(),
+            runs,
+            seen: seen(2, 1, true),
+            claudes: Vec::new(),
+        };
+        // Through the file it's handed over in.
+        let handed: Handed =
+            serde_json::from_str(&serde_json::to_string(&handed).unwrap()).unwrap();
+        assert_eq!(handed.conversation().as_deref(), Some("conv-1"));
+
+        let mut task = Task::adopt(
+            handed,
+            dir.path().to_path_buf(),
+            BTreeMap::new(),
+            Arc::new(Term::without_terminal()),
+            Arc::new(Mutex::new(State::Running)),
+            Arc::new(Spending::new(db)),
+        )
+        .unwrap();
+        assert!(task.is_working());
+        assert_eq!(task.last_prompt(), "now the docs");
+        assert_eq!(task.asking().unwrap().gist, "cargo test");
+        assert_eq!(task.cost_usd(), 0.5);
+        assert_eq!(task.spec().prompt, "fix the tests");
+        // What the session had seen of its runs isn't news again.
+        assert!(task.events().is_empty());
+    }
+
+    #[test]
+    fn the_last_lines_of_errors_skip_the_blank_ones() {
+        let mut errors = Errors::default();
+        errors.take(b"one\n\ntwo\r\nthr");
+        errors.take(b"ee\n\nfour");
+        assert_eq!(errors.lines(), ["one", "two", "three", "four"]);
+
+        let mut errors = Errors::default();
+        for line in 0..9 {
+            errors.take(format!("line {line}\n").as_bytes());
+        }
+        assert_eq!(errors.lines().len(), ERROR_LINES);
     }
 }

@@ -59,7 +59,9 @@ use crate::forge::{
 use crate::memory::{self, Listed, Memory};
 use crate::plugins::{self, Context};
 use crate::profile;
-use crate::protocol::{Backlog, NewSession, Request, Response, SessionInfo, Spending, Worktree};
+use crate::protocol::{
+    Backlog, NewSession, Request, Response, SessionInfo, Spending, State, Worktree,
+};
 use crate::{catalog, keys, links, socket, typing};
 use crate::{client, clipboard, drive, env, event_log, events, git};
 use anyhow::{Context as _, Result, bail};
@@ -570,7 +572,8 @@ impl Tui {
     /// Reads the newest page of the event log for the timeline, then
     /// follows the log from there, on a thread of its own, until the
     /// timeline closes. Subscribing from the page's newest event leaves no
-    /// gap between the two.
+    /// gap between the two, and the subscription picks up again after the
+    /// last event it gave when a handover cuts it.
     fn follow_events(&self) {
         let feed = self.feed.fetch_add(1, Ordering::Relaxed) + 1;
         let current = self.feed.clone();
@@ -747,7 +750,10 @@ impl Tui {
             }
             Event::CodexModels(models) => self.app.set_codex_models(models),
             Event::Resize => {}
-            Event::Sessions(sessions) => self.set_sessions(sessions),
+            Event::Sessions(sessions) => {
+                self.attach_again(&sessions);
+                self.set_sessions(sessions);
+            }
             Event::Flows(runs) => self.app.set_flows(runs),
             Event::PullRequests { project, found } => self.app.set_pull_requests(project, found),
             Event::Worktrees { project, worktrees } => self.app.set_worktrees(project, worktrees),
@@ -787,15 +793,10 @@ impl Tui {
                     pane.screen.process(&bytes);
                 }
             }
+            // The next list says whether the session has ended, or runs on
+            // in a daemon handed over to a new crystal (`attach_again`).
             Event::OutputEnded { pane } => {
-                // A plugin's pane closes as its program ends.
-                if self
-                    .overlay
-                    .as_ref()
-                    .is_some_and(|overlay| overlay.id == pane)
-                {
-                    self.close_plugin_pane();
-                } else if let Some(pane) = self.pane_with_id(pane) {
+                if let Some(pane) = self.pane_with_id(pane) {
                     pane.ended = true;
                 }
             }
@@ -1683,6 +1684,36 @@ impl Tui {
         self.refresh_sessions()
     }
 
+    /// Attaches again to the sessions whose panes' output ended while they
+    /// run on, as `sessions` says: a daemon handed over to a new crystal
+    /// hangs up on every attach. A plugin's pane closes as its program
+    /// ends.
+    fn attach_again(&mut self, sessions: &[SessionInfo]) {
+        let running = |id: &str| {
+            sessions
+                .iter()
+                .any(|session| session.id == id && session.state == State::Running)
+        };
+        // Dropped, each attaches again as it's drawn.
+        self.panes
+            .retain(|pane| !pane.ended || !running(&pane.session_id));
+        let Some(overlay) = self.overlay.as_ref().filter(|overlay| overlay.ended) else {
+            return;
+        };
+        let (rows, cols) = overlay.size();
+        let name = self.app.plugin_pane().map(|pane| pane.session.clone());
+        let Some(name) = name.filter(|_| running(&overlay.session_id)) else {
+            self.close_plugin_pane();
+            return;
+        };
+        self.last_pane_id += 1;
+        let (id, events) = (self.last_pane_id, self.events.clone());
+        match Pane::open(&self.socket, &name, rows, cols, id, events) {
+            Ok(pane) => self.overlay = Some(pane),
+            Err(_) => self.close_plugin_pane(),
+        }
+    }
+
     /// Closes the plugin's pane that's open, and ends its session, which
     /// was only ever the pane's.
     fn close_plugin_pane(&mut self) {
@@ -2246,6 +2277,8 @@ fn spawn_session_poller(socket: PathBuf, events: Sender<Event>, polled: Polled) 
         settings: poll_settings,
     } = polled;
     thread::spawn(move || {
+        // Why the list couldn't be had, last time, once it has been said.
+        let mut said = None;
         loop {
             thread::sleep(POLL_EVERY);
             if poll_flows.load(Ordering::Relaxed)
@@ -2260,8 +2293,23 @@ fn spawn_session_poller(socket: PathBuf, events: Sender<Event>, polled: Polled) 
             {
                 return;
             }
-            // A daemon that has gone away has no sessions left.
-            let sessions = list_sessions(&socket, false).unwrap_or_default();
+            // A daemon that has gone away has no sessions left. One that
+            // can't say, say because it's a newer crystal than this TUI,
+            // leaves the list as it was, and says why, once.
+            let sessions = match list_sessions(&socket, false) {
+                Ok(sessions) => sessions,
+                Err(err) => {
+                    let why = format!("{err:#}");
+                    if said.as_ref() != Some(&why)
+                        && events.send(Event::Notice(why.clone())).is_err()
+                    {
+                        return;
+                    }
+                    said = Some(why);
+                    continue;
+                }
+            };
+            said = None;
             let projects = projects_of(&sessions);
             if events.send(Event::Sessions(sessions)).is_err() {
                 return;

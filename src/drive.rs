@@ -147,6 +147,11 @@ pub fn wait_until(
     }
 }
 
+/// How many times a wait for output asks again, for what's left of its
+/// time, when the daemon hangs up on it: a daemon handed over to a new
+/// crystal does, once.
+const ASK_AGAIN: usize = 3;
+
 /// Waits until a row on the session's screen, or just scrolled off it,
 /// matches the regular expression `pattern`, and prints the row. The
 /// daemon looks each time the program writes something.
@@ -156,12 +161,24 @@ pub fn wait_for_output(
     pattern: &str,
     timeout: Option<Duration>,
 ) -> Result<()> {
-    let request = Request::WaitOutput {
-        name: name.to_string(),
-        pattern: pattern.to_string(),
-        timeout_ms: timeout.map(|timeout| timeout.as_millis() as u64),
+    let deadline = deadline(timeout);
+    let mut left = timeout;
+    let mut asked = 0;
+    let response = loop {
+        let request = Request::WaitOutput {
+            name: name.to_string(),
+            pattern: pattern.to_string(),
+            timeout_ms: left.map(|left| left.as_millis() as u64),
+        };
+        asked += 1;
+        match ask(socket, &request) {
+            Err(err) if err.is::<client::HungUp>() && asked <= ASK_AGAIN => {
+                left = deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
+            }
+            response => break response?,
+        }
     };
-    let Response::Matched { line } = ask(socket, &request)? else {
+    let Response::Matched { line } = response else {
         bail!("the daemon didn't say what matched");
     };
     println!("{line}");

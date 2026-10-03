@@ -9,6 +9,7 @@
 //! lists need keeping up with the agents.
 
 use crate::protocol::AgentEvent;
+use serde::{Deserialize, Serialize};
 
 /// How many of the last rows with something on them to read: where agents
 /// draw their prompt, their status line and their questions. Agents draw
@@ -37,7 +38,7 @@ const WAITING_TEXT: &[&str] = &[
 const WORKING_TEXT: &[&str] = &["esc to interrupt"];
 
 /// What an agent's screen says it's doing.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Looks {
     Working,
     Waiting,
@@ -94,6 +95,20 @@ pub struct ScreenWatch {
 }
 
 impl ScreenWatch {
+    /// A watch that has seen the screen look `looks`: handed over, so that
+    /// how it looked already isn't news.
+    pub fn seeing(looks: Looks) -> ScreenWatch {
+        ScreenWatch {
+            current: looks,
+            candidate: None,
+        }
+    }
+
+    /// How the screen has been seen to look.
+    pub fn looks(&self) -> Looks {
+        self.current
+    }
+
     pub fn update(&mut self, looks: Looks) -> Option<AgentEvent> {
         if looks == self.current {
             self.candidate = None;

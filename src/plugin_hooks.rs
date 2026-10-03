@@ -11,11 +11,14 @@
 //! daemon nor the others. What a command prints goes to the plugin's log.
 //! One that runs past [`TIMEOUT`] is stopped, and a plugin whose commands
 //! fail [`FAILURES_TO_PAUSE`] times in a row is paused, with a notice and a
-//! `plugin.paused` event, until the user turns it on again.
+//! `plugin.paused` event, until the user turns it on again. A handover to a
+//! new crystal gives the commands running a few seconds to finish, and drops
+//! those still waiting to run.
 
 use crate::config::Config;
 use crate::event_log::Bus;
 use crate::events::{Event, Filter};
+use crate::handover::{self, HELPERS};
 use crate::notify::{self, Notice};
 use crate::plugin_manifest::{self, Manifest};
 use crate::plugins::{self, Context};
@@ -23,6 +26,7 @@ use crate::protocol::Activity;
 use anyhow::{Context as _, Result, bail};
 use std::collections::HashMap;
 use std::io::Write;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Sender};
@@ -143,6 +147,12 @@ impl Hooks {
                     if plugins::paused(&socket, &plugin).is_some() {
                         continue;
                     }
+                    // A handover waits only for the commands running.
+                    if handover::underway() {
+                        let name = job.on();
+                        plugins::log(&socket, &plugin, &format!("{name}: dropped in a handover"));
+                        continue;
+                    }
                     match run(&socket, &plugin, &job, TIMEOUT) {
                         Ok(()) => failures = 0,
                         Err(err) => {
@@ -237,7 +247,10 @@ fn run(socket: &Path, plugin: &str, job: &Job, timeout: Duration) -> Result<()> 
     let mut child = command(plugin, job, socket)
         .stdout(log.try_clone()?)
         .stderr(log)
+        // A process group of its own, which a handover can stop whole.
+        .process_group(0)
         .spawn()?;
+    let _helper = HELPERS.started(child.id());
     hand_over(&mut child, job);
     let started = Instant::now();
     loop {
