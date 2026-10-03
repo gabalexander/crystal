@@ -522,6 +522,7 @@ impl App {
             "memory" => self.memory_on,
             "profiles" => self.profiles_on,
             "github" => self.github_on,
+            "flows" => self.flows_on,
             _ => true,
         }
     }
@@ -1224,11 +1225,12 @@ impl App {
             KeyCode::Char('i') => return self.open_issues(),
             KeyCode::Char('c') if self.tasks_on => self.ask_how_the_task_went(),
             KeyCode::Char('b') if self.backlog_on => return self.open_backlog(),
-            KeyCode::Char('c') => self.notify(plugins::off("tasks")),
-            KeyCode::Char('b') => self.notify(plugins::off("backlog")),
-            KeyCode::Char('X') => return Some(Action::ListPlugins),
             KeyCode::Char('g') if self.flows_on => return self.go_on_with_flow(),
             KeyCode::Char('f') if self.flows_on => self.ask_to_send_flow_back(),
+            KeyCode::Char('c') => self.notify(plugins::off("tasks")),
+            KeyCode::Char('b') => self.notify(plugins::off("backlog")),
+            KeyCode::Char('g' | 'f') => self.notify(plugins::off("flows")),
+            KeyCode::Char('X') => return Some(Action::ListPlugins),
             KeyCode::Char('q') => return Some(Action::Quit),
             KeyCode::Char(c) => return self.run_plugin_key(c),
             _ => {}
@@ -3745,5 +3747,21 @@ gate = true
             app.notice(),
             Some("g runs review again, as a step of ship-1")
         );
+    }
+
+    #[test]
+    fn with_the_flows_plugin_off_g_says_so_and_runs_arent_grouped() {
+        let mut app = app_with_a_run(crate::flow_run::StepState::AtGate);
+        let config = crate::config::from_text("[plugins]\nflows = false\n").unwrap();
+        app.set_features(&config);
+        app.select("ship-1-review");
+        assert_eq!(press(&mut app, KeyCode::Char('g')), None);
+        assert!(
+            app.notice()
+                .is_some_and(|notice| notice.starts_with("the flows plugin is off")),
+            "{:?}",
+            app.notice()
+        );
+        assert!(!app.rows().contains(&Row::Flow(0)));
     }
 }

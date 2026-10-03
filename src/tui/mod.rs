@@ -153,12 +153,12 @@ pub fn run(socket: &Path) -> Result<()> {
     let (sender, events) = mpsc::channel();
     spawn_input_reader(sender.clone());
     let count_backlog = Arc::new(AtomicBool::new(crate::backlog::enabled(&config)));
-    let poll_flows = crate::flows::enabled(&config);
+    let poll_flows = Arc::new(AtomicBool::new(crate::flows::enabled(&config)));
     spawn_session_poller(
         socket.to_path_buf(),
         sender.clone(),
         count_backlog.clone(),
-        poll_flows,
+        poll_flows.clone(),
     );
     let projects = Arc::new(Mutex::new(Vec::new()));
     spawn_pull_request_poller(projects.clone(), sender.clone());
@@ -177,13 +177,14 @@ pub fn run(socket: &Path) -> Result<()> {
         quitting: false,
         overlay: None,
         count_backlog,
+        poll_flows,
     };
     tui.app.set_agents(catalog::installed());
     tui.app.set_launch_settings(&config);
     tui.app.set_features(&config);
     tui.app.set_plugin_keys(plugin_keys(&config));
     tui.app.set_memory(launcher::load_memory(&tui.memory_path));
-    if poll_flows {
+    if tui.app.shows_flows() {
         tui.app.set_flows(list_flows(socket));
     }
     tui.set_sessions(sessions);
@@ -247,6 +248,9 @@ struct Tui {
     /// Whether the session poller asks how many backlog items each project
     /// has, which follows the backlog plugin being switched.
     count_backlog: Arc<AtomicBool>,
+    /// Whether the session poller asks for the flow runs too: the flows
+    /// plugin is on.
+    poll_flows: Arc<AtomicBool>,
     /// The projects the sessions are in, for the thread that asks GitHub
     /// about their pull requests.
     projects: Arc<Mutex<Vec<PathBuf>>>,
@@ -758,6 +762,8 @@ impl Tui {
         self.app.show_plugins(listed_plugins(config, &self.socket));
         let backlog = crate::backlog::enabled(config);
         self.count_backlog.store(backlog, Ordering::Relaxed);
+        let flows = crate::flows::enabled(config);
+        self.poll_flows.store(flows, Ordering::Relaxed);
         self.set_sessions(self.app.sessions().to_vec());
     }
 
@@ -1216,12 +1222,14 @@ fn spawn_session_poller(
     socket: PathBuf,
     events: Sender<Event>,
     count_backlog: Arc<AtomicBool>,
-    poll_flows: bool,
+    poll_flows: Arc<AtomicBool>,
 ) {
     thread::spawn(move || {
         loop {
             thread::sleep(POLL_EVERY);
-            if poll_flows && events.send(Event::Flows(list_flows(&socket))).is_err() {
+            if poll_flows.load(Ordering::Relaxed)
+                && events.send(Event::Flows(list_flows(&socket))).is_err()
+            {
                 return;
             }
             // A daemon that has gone away has no sessions left.

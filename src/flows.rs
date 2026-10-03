@@ -13,25 +13,19 @@
 //! switched off as one.
 
 use crate::config::Config;
+use crate::plugins;
 use crate::profile::Profile;
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
-/// Whether flows are on. They always are for now; this is the one place
-/// that will say otherwise once they can be switched off.
-pub fn enabled(_config: &Config) -> bool {
-    true
+/// Whether flows are on: the `flows` plugin.
+pub fn enabled(config: &Config) -> bool {
+    plugins::enabled(config, "flows")
 }
-
-/// What a command about flows says while they're off.
-pub const DISABLED: &str = "the flows plugin is off";
 
 /// Refuses a command that's only about flows while they're off.
 pub fn ensure_enabled(config: &Config) -> Result<()> {
-    if !enabled(config) {
-        bail!(DISABLED);
-    }
-    Ok(())
+    plugins::ensure_enabled(config, "flows")
 }
 
 /// A named chain of steps.

@@ -620,7 +620,7 @@ crystal flow retry ship-1            # run a step that failed, or that a restart
 ### Plugins
 
 Most of what crystal does beyond running sessions is a plugin you can switch off: tasks, the backlog, memory,
-profiles, GitHub and notifications. Plugins of your own add actions, panes over the TUI and hooks on what
+profiles, GitHub, flows and notifications. Plugins of your own add actions, panes over the TUI and hooks on what
 happens, and use crystal through its own command line, like any script would.
 
 ```sh
@@ -640,6 +640,7 @@ crystal plugin remove notes
 | `memory` | [memory](#memory): `m`, `crystal remember` and `memory`, and what Claude Code is shown as it starts |
 | `profiles` | [profiles](#profiles): `P`, the profiles in the new-session panel, and `crystal profile` |
 | `github` | pull requests on worktree lines, `o` and `i`; switched off, crystal never runs `gh` |
+| `flows` | [flows](#flows): `g` and `f`, runs in the sidebar and the new-session panel, and `crystal flow` |
 | `notifications` | telling you when a session needs you |
 
 crystal's own plugins are on until you switch one off. Then everything it adds is gone: its keys (`?` stops

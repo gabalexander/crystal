@@ -4620,11 +4620,11 @@ command = ["sh", "show.sh"]
     crystal.ok(&["plugin", "enable", "board"]);
 
     let mut tui = crystal.tui();
-    // Down past crystal's own six, to the pane under board.
+    // Down past crystal's own seven, to the pane under board.
     let open = |tui: &mut Terminal| {
         tui.type_keys("X");
         tui.shows("installed");
-        tui.type_keys("jjjjjjj\r");
+        tui.type_keys("jjjjjjjj\r");
         tui.shows("the board says hi");
         tui.shows("board · The board");
     };
@@ -5181,4 +5181,17 @@ fn f_sends_a_flow_back_from_its_gate_with_the_notes_typed() {
     );
     assert!(runs[1].contains("with these notes: shorter"), "{}", runs[1]);
     tui.shows("round 2");
+}
+
+#[test]
+fn with_the_flows_plugin_off_its_commands_say_so() {
+    let crystal = Crystal::new();
+    crystal.configure(FLOWS);
+    crystal.ok(&["plugin", "disable", "flows"]);
+    let err = crystal.fails(&["flow"]);
+    assert!(err.contains("the flows plugin is off"), "{err}");
+    let out = run_flow(&crystal, "/nowhere", &["pair", "add retries"]);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("the flows plugin is off"), "{err}");
 }

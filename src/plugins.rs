@@ -51,6 +51,10 @@ pub const BUILT_IN: &[BuiltIn] = &[
         description: "pull requests on worktree lines, and a project's issues",
     },
     BuiltIn {
+        name: "flows",
+        description: "chains of background tasks on one goal, with gates",
+    },
+    BuiltIn {
         name: "notifications",
         description: "a notification when a session needs you",
     },

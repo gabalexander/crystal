@@ -71,6 +71,7 @@ crystal result ship-1-review                                   # a step's whole 
 - A gate is the user's to answer. Go on past it (`crystal flow approve <run>`) or send it back with notes
   (`crystal flow back <run> "<notes>"`) only when the user tells you to.
 - `crystal flow retry <run>` runs a failed or interrupted step again. `crystal flow --json` lists every run.
+- With flows turned off, these commands say "the flows plugin is off"; run the steps as tasks yourself.
 
 ## Close your task
 
