@@ -18,7 +18,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Block;
+use ratatui::widgets::{Block, Clear};
 use std::path::PathBuf;
 
 /// A change to the backlog, for the daemon to make.
@@ -231,6 +231,9 @@ fn matches(query: &str, item: &BacklogItem) -> bool {
 
 /// Draws the view in `area`: a heading, the filter, and the list.
 pub fn draw(frame: &mut Frame, view: &BacklogView, theme: &Theme, area: Rect) {
+    // A style alone would leave the characters drawn there before, the
+    // sidebar and the panes, showing through.
+    frame.render_widget(Clear, area);
     frame.render_widget(Block::new().style(theme.base()), area);
     let [heading, filter, list] = Layout::vertical([
         Constraint::Length(1),
@@ -354,6 +357,10 @@ fn draw_note(frame: &mut Frame, theme: &Theme, note: &str, area: Rect) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ThemeName;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::widgets::{Paragraph, Wrap};
 
     fn item(number: u64, text: &str, done: bool) -> BacklogItem {
         BacklogItem {
@@ -388,6 +395,32 @@ mod tests {
 
     fn numbers(view: &BacklogView) -> Vec<u64> {
         view.shown().iter().map(|item| item.number).collect()
+    }
+
+    /// Draws `view` over a screen full of `¤`, the way it opens over the
+    /// sidebar and the panes, and returns what's on the screen.
+    fn drawn_over_the_screen(view: &BacklogView) -> String {
+        let theme = Theme::new(ThemeName::Dark, false);
+        let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                let behind = "¤".repeat(usize::from(area.width * area.height));
+                frame.render_widget(Paragraph::new(behind).wrap(Wrap { trim: false }), area);
+                draw(frame, view, &theme, area);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        buffer.content().iter().map(|cell| cell.symbol()).collect()
+    }
+
+    #[test]
+    fn nothing_behind_the_backlog_shows_through_it() {
+        let mut view = view_of(vec![item(1, "Write the guide", false)]);
+        assert!(!drawn_over_the_screen(&view).contains('¤'));
+        press(&mut view, KeyCode::Char('/'));
+        type_text(&mut view, "nothing like it");
+        assert!(!drawn_over_the_screen(&view).contains('¤'));
     }
 
     #[test]
