@@ -173,10 +173,10 @@ pub fn respawn(socket: &Path, name: &str) -> Result<()> {
 
 /// Removes the worktree at `path`, unless sessions are still running in
 /// it: removing a directory out from under a program would leave it
-/// working on files that are gone. Sessions that had ended there leave the
-/// list with it, since their directory is gone and they could never start
-/// again.
-pub fn remove_worktree(socket: &Path, path: &Path) -> Result<()> {
+/// working on files that are gone. With `force`, changes not committed go
+/// with it. Sessions that had ended there leave the list with it, since
+/// their directory is gone and they could never start again.
+pub fn remove_worktree(socket: &Path, path: &Path, force: bool) -> Result<()> {
     let sessions = match ask(socket, &Request::List, false)? {
         Some(Response::Sessions { sessions }) => sessions,
         _ => Vec::new(),
@@ -193,7 +193,7 @@ pub fn remove_worktree(socket: &Path, path: &Path) -> Result<()> {
         bail!("{} still running in {}", names.join(", "), path.display());
     }
     let branch = git::Checkout::find(path).and_then(|checkout| checkout.worktree().branch);
-    git::remove_worktree(path)?;
+    git::remove_worktree(path, force)?;
     tell_worktree(socket, path, branch, false);
     for session in ended {
         let kill = Request::Kill {

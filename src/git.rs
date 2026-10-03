@@ -147,15 +147,26 @@ pub fn linked_worktrees(project_path: &Path) -> Result<Vec<Worktree>> {
 }
 
 /// Removes the worktree at `path` the way `git worktree remove` does, which
-/// refuses the main worktree, and one with changes not yet committed.
-pub fn remove_worktree(path: &Path) -> Result<()> {
+/// refuses the main worktree, and, unless `force`, one with changes not yet
+/// committed.
+pub fn remove_worktree(path: &Path, force: bool) -> Result<()> {
     let checkout = Checkout::find(path)
         .with_context(|| format!("{} isn't in a git repository", path.display()))?;
-    git(
-        &checkout.project_path,
-        &["worktree", "remove", &path.to_string_lossy()],
-    )?;
+    let path = path.to_string_lossy();
+    let mut args = vec!["worktree", "remove", &path];
+    if force {
+        args.push("--force");
+    }
+    git(&checkout.project_path, &args)?;
     Ok(())
+}
+
+/// Whether the worktree at `dir` has changes that `git worktree remove`
+/// would only remove when forced: files changed or new and not committed,
+/// found the way it finds them.
+pub fn has_changes(dir: &Path) -> Result<bool> {
+    let status = git(dir, &["status", "--porcelain", "--ignore-submodules=none"])?;
+    Ok(!status.trim().is_empty())
 }
 
 /// What `git diff` is asked for every patch crystal reads: no colors, no
