@@ -2825,7 +2825,11 @@ mod tests {
         let place = Place::Directory(Some(PathBuf::from("/code/app")));
         assert_eq!(
             press(&mut app, KeyCode::Enter),
-            start(place, &["claude", "fix the login bug"], "fix the login bug")
+            start(
+                place,
+                &["claude", "--", "fix the login bug"],
+                "fix the login bug"
+            )
         );
         assert!(app.launcher().is_none());
         assert_eq!(app.memory().tasks, ["fix the login bug"]);
@@ -2881,7 +2885,7 @@ mod tests {
             press(&mut app, KeyCode::Enter),
             start(
                 Place::Directory(None),
-                &["codex", "--full-auto", "go"],
+                &["codex", "--full-auto", "--", "go"],
                 "go"
             )
         );
@@ -2997,7 +3001,7 @@ mod tests {
         };
         assert_eq!(
             press(&mut app, KeyCode::Enter),
-            start(place, &["claude", "fix typo"], "fix typo")
+            start(place, &["claude", "--", "fix typo"], "fix typo")
         );
     }
 
@@ -3012,7 +3016,7 @@ mod tests {
         };
         assert_eq!(
             press(&mut app, KeyCode::Enter),
-            start(place, &["claude", "feat"], "feat")
+            start(place, &["claude", "--", "feat"], "feat")
         );
     }
 
@@ -3033,10 +3037,14 @@ mod tests {
         type_text(&mut app, "fix it");
         app.on_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
         assert!(app.launcher().is_none());
-        assert_eq!(prompt_text(&app), Some("claude 'fix it'"));
+        assert_eq!(prompt_text(&app), Some("claude -- 'fix it'"));
         assert_eq!(
             press(&mut app, KeyCode::Enter),
-            start(Place::Directory(None), &["claude", "fix it"], "fix it")
+            start(
+                Place::Directory(None),
+                &["claude", "--", "fix it"],
+                "fix it"
+            )
         );
     }
 
@@ -4021,7 +4029,7 @@ mod tests {
             }
         );
         assert_eq!(command[0], "claude");
-        assert!(command[1].starts_with("Fix issue #42"));
+        assert!(command[2].starts_with("Fix issue #42"));
     }
 
     #[test]

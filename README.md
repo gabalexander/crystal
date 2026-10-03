@@ -844,7 +844,7 @@ $ crystal profile show quick
 quick
 agent   Codex
 starts  wherever the new-session panel is set
-runs    codex -a never -c 'developer_instructions="Keep changes small."' '<task>'
+runs    codex -a never -c 'developer_instructions="Keep changes small."' -- '<task>'
 ```
 
 ## How it works

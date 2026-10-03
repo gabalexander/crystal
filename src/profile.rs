@@ -319,6 +319,7 @@ mod tests {
                 "--append-system-prompt",
                 "Point out risks before style.",
                 "--verbose",
+                "--",
                 "Review the diff on this branch.\n\nMind the tests.",
             ]
         );
@@ -344,6 +345,7 @@ mod tests {
                 "on-request",
                 "-c",
                 "developer_instructions=\"Keep changes small.\"",
+                "--",
                 "add a test",
             ]
         );

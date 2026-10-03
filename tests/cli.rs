@@ -735,18 +735,18 @@ fn n_starts_claude_with_its_hooks_and_the_task_as_its_prompt() {
     tui.shows("What should it do?");
     tui.shows("Claude Code");
     tui.type_keys("fix the login bug");
-    tui.shows("runs  claude 'fix the login bug'");
+    tui.shows("runs  claude -- 'fix the login bug'");
     tui.type_keys("\r");
     tui.shows("▸ claude");
 
     // Given a task, Claude is told how to close it, ahead of the prompt.
     let args = written(&crystal.dir.path().join("args"));
     let args: Vec<&str> = args.lines().collect();
-    assert_eq!(args.len(), 5, "{args:?}");
+    assert_eq!(args.len(), 6, "{args:?}");
     assert_eq!(args[0], "--settings");
     assert_eq!(args[2], "--append-system-prompt");
     assert!(args[3].contains("crystal done"), "{args:?}");
-    assert_eq!(args[4], "fix the login bug");
+    assert_eq!(args[4..], ["--", "fix the login bug"]);
 }
 
 #[test]
@@ -793,12 +793,12 @@ fn codex_starts_with_the_model_chosen_and_the_task() {
     tui.type_keys("add a test");
     // Tab to what runs, Tab to its model, and right to the first model.
     tui.type_keys("\t\t\x1b[C");
-    tui.shows("runs  codex -m gpt-test-mini 'add a test'");
+    tui.shows("runs  codex -m gpt-test-mini -- 'add a");
     tui.type_keys("\r");
     tui.shows("▸ codex");
     // Codex hears how to close its task at the end of its first prompt.
     let args = codex_args(&crystal);
-    assert_eq!(args[..3], ["-m", "gpt-test-mini", "add a test"]);
+    assert_eq!(args[..4], ["-m", "gpt-test-mini", "--", "add a test"]);
     assert!(args.last().unwrap().contains("crystal done"), "{args:?}");
 }
 
@@ -834,7 +834,7 @@ fn ctrl_e_turns_the_panel_into_the_command_line_it_would_run() {
     tui.shows("What should it do?");
     tui.type_keys("fix it\x05");
     tui.hides("New session");
-    tui.shows("new session: claude 'fix it'");
+    tui.shows("new session: claude -- 'fix it'");
     // Anything can be run from there.
     tui.type_keys("\x15sh -c 'echo ran > ran; sleep 30'\r");
     assert_eq!(written(&crystal.dir.path().join("ran")), "ran\n");
@@ -883,6 +883,7 @@ prompt = "Review the change."
             "--permission-mode",
             "plan",
             "--verbose",
+            "--",
             "Review the change.",
             "",
             "the refund fix"
@@ -1016,14 +1017,16 @@ instructions = "Keep changes small."
         "quick\n\
          agent   Codex\n\
          starts  wherever the new-session panel is set\n\
-         runs    codex -a never -c 'developer_instructions=\"Keep changes small.\"' '<task>'\n"
+         runs    codex -a never -c 'developer_instructions=\"Keep changes small.\"' -- '<task>'\n"
     );
 
     let shown = crystal.ok(&["profile", "show", "review"]);
     assert!(shown.contains("agent   Claude Code\n"), "{shown}");
     assert!(shown.contains("starts  in a new worktree\n"), "{shown}");
     assert!(
-        shown.contains("runs    claude --model opus --append-system-prompt 'Be brief.' '<task>'\n"),
+        shown.contains(
+            "runs    claude --model opus --append-system-prompt 'Be brief.' -- '<task>'\n"
+        ),
         "{shown}"
     );
     let error = crystal.fails(&["profile", "show", "nope"]);
@@ -1176,14 +1179,15 @@ fn path_of(bins: &[&Path]) -> String {
 
 /// A stand-in for Claude Code: a `claude` that writes down the arguments
 /// it was started with, one per line, and waits. Returns the directory to
-/// put on the PATH.
+/// put on the PATH. The arguments go to a file of their own first and are
+/// then moved into place, so a test never reads half of them.
 fn fake_claude(dir: &Path) -> PathBuf {
     let bin = dir.join("bin");
     std::fs::create_dir(&bin).unwrap();
     let claude = bin.join("claude");
     std::fs::write(
         &claude,
-        "#!/bin/sh\nprintf '%s\\n' \"$@\" > args\nsleep 30\n",
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > args.new && mv args.new args\nsleep 30\n",
     )
     .unwrap();
     let mut permissions = std::fs::metadata(&claude).unwrap().permissions();
@@ -3270,7 +3274,7 @@ if [ "$1" = debug ]; then
     echo '            {"slug": "gpt-internal", "visibility": "hide"}]}'
     exit 0
 fi
-printf '%s\n' "$@" > args
+printf '%s\n' "$@" > args.new && mv args.new args
 if [ "$1" != resume ]; then
     dir="$CODEX_HOME/sessions/$(date +%Y/%m/%d)"
     stamp=$(date +%Y-%m-%dT%H-%M-%S)
@@ -4160,7 +4164,7 @@ fn finishing_claude(dir: &Path) -> PathBuf {
     script(
         &bin.join("claude"),
         &format!(
-            "printf '%s\\n' \"$@\" > args\n\
+            "printf '%s\\n' \"$@\" > args.new && mv args.new args\n\
              while [ ! -e \"$FINISH\" ]; do sleep 0.05; done\n\
              {CRYSTAL} done \"did what was asked\"\n\
              sleep 30\n"
