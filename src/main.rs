@@ -267,7 +267,9 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: Cli) -> Result<()> {
-    let socket = cli.socket.unwrap_or_else(socket::default_path);
+    // Made absolute here: the daemon runs from `/`, where a relative path
+    // would name another socket.
+    let socket = std::path::absolute(cli.socket.unwrap_or_else(socket::default_path))?;
     let Some(command) = cli.command else {
         return tui::run(&socket);
     };

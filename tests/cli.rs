@@ -3016,3 +3016,32 @@ fn a_task_comes_back_at_rest_after_a_restart_and_carries_its_conversation_on() {
         "-p --output-format stream-json --verbose --resume conv-1 -- carry on"
     );
 }
+
+#[test]
+fn a_relative_socket_path_names_the_same_socket_for_the_daemon() {
+    let crystal = Crystal::new();
+    let mut new = Command::new(CRYSTAL);
+    new.args([
+        "--socket",
+        "relative.sock",
+        "new",
+        "-n",
+        "here",
+        "sleep",
+        "30",
+    ])
+    .current_dir(crystal.dir.path())
+    .env("XDG_CONFIG_HOME", crystal.dir.path());
+    let out = new.output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(crystal.dir.path().join("relative.sock").exists());
+
+    let mut stop = Command::new(CRYSTAL);
+    stop.args(["--socket", "relative.sock", "kill-server"])
+        .current_dir(crystal.dir.path());
+    assert!(stop.output().unwrap().status.success());
+}
