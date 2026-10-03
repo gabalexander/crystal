@@ -6,13 +6,15 @@
 //!
 //! It compares with the last commit, every change not committed yet, or,
 //! after `b`, with where the branch started, everything committed on it:
-//! how a branch an agent worked on reads as a pull request.
+//! how a branch an agent worked on reads as a pull request. Opened from the
+//! pull requests view, it's a pull request's own diff, as its forge has it.
 
 use super::app::{Action, Hit, Loading, Outcome};
 use super::diff::{self, Body, DiffLine, FileDiff, FileStatus, Layout, LineKind, Row};
 use super::sidebar::fit;
 use super::theme::Theme;
 use super::ui::{self, Look, ViewAreas};
+use crate::forge::{Forge, Repo};
 use crate::git;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
 use ratatui::Frame;
@@ -41,6 +43,9 @@ pub enum Against {
     Uncommitted,
     /// Where the branch started: everything committed on it since.
     Branch,
+    /// Nothing in the worktree: what pull request `number` changes, as its
+    /// forge has it.
+    PullRequest { forge: Forge, number: u64 },
 }
 
 /// A diff as it was read.
@@ -57,8 +62,19 @@ pub fn read(dir: &Path, against: Against) -> Result<Read, String> {
     let read = match against {
         Against::Uncommitted => read_uncommitted(dir),
         Against::Branch => read_branch(dir),
+        Against::PullRequest { number, .. } => return read_pull_request(dir, number),
     };
     read.map_err(|err| format!("{err:#}"))
+}
+
+/// What pull request `number` of the project at `dir` changes, from its
+/// forge, which goes over the network.
+fn read_pull_request(dir: &Path, number: u64) -> Result<Read, String> {
+    let patch = Repo::find(dir)?.diff(number)?;
+    Ok(Read {
+        files: diff::parse(&patch),
+        base: None,
+    })
 }
 
 fn read_uncommitted(dir: &Path) -> anyhow::Result<Read> {
@@ -121,6 +137,15 @@ impl DiffView {
             selected: 0,
             scroll: 0,
             size: (24, 80),
+        }
+    }
+
+    /// What pull request `number` changes, the project at `dir` being on
+    /// `forge`, until it's read.
+    pub fn of_pull_request(dir: PathBuf, place: String, forge: Forge, number: u64) -> DiffView {
+        DiffView {
+            against: Against::PullRequest { forge, number },
+            ..DiffView::new(dir, place)
         }
     }
 
@@ -295,10 +320,12 @@ impl DiffView {
     }
 
     /// Switches what the diff compares with, and asks for it to be read.
+    /// A pull request's diff is only ever that.
     fn toggle_against(&mut self) -> Outcome {
         self.against = match self.against {
             Against::Uncommitted => Against::Branch,
             Against::Branch => Against::Uncommitted,
+            Against::PullRequest { .. } => return Outcome::Stay,
         };
         self.diff = Loading::Reading;
         self.selected = 0;
@@ -318,18 +345,19 @@ pub fn hints(view: &DiffView) -> Vec<(&'static str, &'static str)> {
         Layout::Unified => "side by side",
         Layout::SideBySide => "unified",
     };
-    let against = match view.against {
-        Against::Uncommitted => "branch",
-        Against::Branch => "uncommitted",
-    };
-    vec![
+    let mut hints = vec![
         ("j/k", "file"),
         ("space", "page"),
         ("]/[", "hunk"),
         ("v", layout),
-        ("b", against),
-        ("esc", "close"),
-    ]
+    ];
+    match view.against {
+        Against::Uncommitted => hints.push(("b", "branch")),
+        Against::Branch => hints.push(("b", "uncommitted")),
+        Against::PullRequest { .. } => {}
+    }
+    hints.push(("esc", "close"));
+    hints
 }
 
 /// Which file's row is on screen `row`, in a list drawn in `area`.
@@ -369,6 +397,7 @@ pub fn draw(frame: &mut Frame, view: &DiffView, look: &Look, areas: &ViewAreas) 
         let message = match view.against {
             Against::Uncommitted => "no changes since the last commit",
             Against::Branch => "nothing committed on this branch yet",
+            Against::PullRequest { .. } => "it changes no files",
         };
         ui::draw_message(frame, look, message, areas.content);
         return;
@@ -392,6 +421,9 @@ fn header<'a>(view: &DiffView, look: &Look, width: u16) -> Line<'a> {
             format!("the branch since {base}")
         }
         (Against::Branch, _) => "the branch".to_string(),
+        (Against::PullRequest { forge, number }, _) => {
+            format!("{} {}", forge.pull_request(), forge.label(*number))
+        }
     };
     let mut notes = Vec::new();
     let files = view.files();

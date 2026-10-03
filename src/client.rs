@@ -1,6 +1,7 @@
 //! The CLI's side of the socket.
 
 use crate::env;
+use crate::forge::Checkout;
 use crate::git;
 use crate::protocol::{
     self, Backlog, NewSession, NewTask, Request, Response, SessionInfo, State, TaskSpec,
@@ -218,6 +219,23 @@ pub fn add_worktree(socket: &Path, dir: &Path, branch: &str) -> Result<PathBuf> 
 pub fn add_new_worktree(socket: &Path, dir: &Path, branch: &str) -> Result<PathBuf> {
     let (path, branch) = git::add_new_worktree(dir, branch)?;
     tell_worktree(socket, &path, Some(branch), true);
+    Ok(path)
+}
+
+/// The worktree for a pull request: the one its project has on its branch
+/// already, or else a new one, its commits fetched first, as
+/// [`git::add_fetched_worktree`] makes it, which the daemon is told of.
+pub fn pull_request_worktree(socket: &Path, checkout: &Checkout) -> Result<PathBuf> {
+    let Checkout {
+        project,
+        branch,
+        fetch,
+    } = checkout;
+    if let Some(path) = git::worktree_on(project, branch)? {
+        return Ok(path);
+    }
+    let path = git::add_fetched_worktree(project, branch, fetch)?;
+    tell_worktree(socket, &path, Some(branch.clone()), true);
     Ok(path)
 }
 

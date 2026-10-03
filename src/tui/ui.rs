@@ -17,6 +17,7 @@ use super::memory_view;
 use super::pane::Pane;
 use super::plugins_view;
 use super::profiles;
+use super::pull_requests;
 use super::screen_widget::{Marks, ScreenWidget};
 use super::settings_view;
 use super::sidebar::{self, fit};
@@ -381,6 +382,9 @@ pub fn draw(frame: &mut Frame, app: &App, panes: &[Pane], overlay: Option<&Pane>
     let middle = Rect::new(0, below_top, frame.area().width, areas.footer.y - below_top);
     if let Some(view) = app.issues_view() {
         issues::draw(frame, view, look.theme, look.now, middle);
+    }
+    if let Some(view) = app.pull_requests_view() {
+        pull_requests::draw(frame, view, look.theme, look.now, middle);
     }
     if let Some(view) = app.backlog_view() {
         backlog_view::draw(frame, view, look.theme, middle);
@@ -911,8 +915,10 @@ fn draw_footer(frame: &mut Frame, app: &App, panes: &[Pane], look: &Look, area: 
         frame.render_widget(hint_spans(settings_view::HINTS, theme), area);
     } else if let Some(prompt) = app.prompt() {
         draw_prompt(frame, theme, prompt, area);
-    } else if app.issues_view().is_some() {
-        frame.render_widget(hint_spans(ISSUES_HINTS, theme), area);
+    } else if let Some(view) = app.issues_view() {
+        draw_notice_or(frame, app.notice(), issues::hints(view), theme, area);
+    } else if let Some(view) = app.pull_requests_view() {
+        draw_notice_or(frame, app.notice(), pull_requests::hints(view), theme, area);
     } else if let Some(view) = app.backlog_view() {
         draw_backlog_footer(frame, view, theme, area);
     } else if let Some(view) = app.layouts_view() {
@@ -1084,12 +1090,23 @@ const LAUNCHER_HINTS: &[(&str, &str)] = &[
     ("esc", "cancel"),
 ];
 
-/// The keys while the issues view is open.
-const ISSUES_HINTS: &[(&str, &str)] = &[
-    ("↑/↓", "select"),
-    ("enter", "start a session on it"),
-    ("esc", "close"),
-];
+/// The footer of a view that leaves it to the app to say things: what's
+/// to be said, or else the view's keys.
+fn draw_notice_or(
+    frame: &mut Frame,
+    notice: Option<&str>,
+    hints: &[(&str, &str)],
+    theme: &Theme,
+    area: Rect,
+) {
+    match notice {
+        Some(notice) => {
+            let notice = Line::styled(format!(" {notice}"), Style::new().fg(theme.failed));
+            frame.render_widget(notice, area);
+        }
+        None => frame.render_widget(hint_spans(hints, theme), area),
+    }
+}
 
 /// The keys while the backlog view is open.
 const BACKLOG_HINTS: &[(&str, &str)] = &[

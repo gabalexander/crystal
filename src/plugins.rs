@@ -48,7 +48,7 @@ pub const BUILT_IN: &[BuiltIn] = &[
     },
     BuiltIn {
         name: "github",
-        description: "pull requests on worktree lines, and a project's issues",
+        description: "pull requests and issues, from GitHub or GitLab",
     },
     BuiltIn {
         name: "flows",
@@ -62,7 +62,7 @@ pub const BUILT_IN: &[BuiltIn] = &[
 
 /// The sidebar keys crystal uses itself, which a plugin's action can't
 /// take.
-pub const RESERVED_KEYS: &str = "jksnwWrxudpmPcbqoiXgf?/tT&[]123456789>zveHLFS,";
+pub const RESERVED_KEYS: &str = "jksnwWrxudpmPcbqoOiXgf?/tT&[]123456789>zveHLFS,";
 
 pub fn is_built_in(name: &str) -> bool {
     BUILT_IN.iter().any(|plugin| plugin.name == name)

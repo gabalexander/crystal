@@ -106,7 +106,8 @@ and the footer says where you are and offers the keys that matter there.
 | `u` | select the next session that needs you: waiting on you first, then done |
 | `/` | find a session by typing a little of its name, project, branch or command |
 | `o` | open the pull request of the selected session's branch in your browser |
-| `i` | list the open issues of the selected session's project, and start an agent on one |
+| `O` | list the open [pull requests](#pull-requests-and-issues) of the selected session's project: read one, see its diff, comment, or start an agent in its worktree |
+| `i` | list the open [issues](#pull-requests-and-issues) of the selected session's project: read one, comment, edit it, or start an agent on it |
 | `b` | open the selected session's project's [backlog](#the-backlog) |
 | `c` | close the selected session's [task](#tasks): done or failed, with a line on how it went |
 | `g` | on a step of a [flow](#flows): go on past its gate, or run a step that failed or was cut short again |
@@ -209,27 +210,9 @@ command, so `pay fix` finds the fixer in the payments project. Letters type into
 (or `Ctrl+P` and `Ctrl+N`) move among the matches; `Enter` selects one and `Esc` leaves the selection where it
 was.
 
-For a project whose `origin` is on GitHub, each worktree line shows its branch's open pull request when there
-is one: `#57`, and a mark for what matters most about it, in this order:
-
-| Mark | Meaning |
-|---|---|
-| `✗` | a check failed |
-| `±` | a reviewer asked for changes |
-| `draft` | it's still a draft |
-| `◌` | checks are still running |
-| `✓` | approved |
-
-A pull request that's simply ready shows its number alone. `o` opens the selected session's pull request in your
-browser. crystal asks [`gh`](https://cli.github.com), GitHub's own command line tool, as soon as it sees a
-project and then once a minute, so your login works as it always does and crystal never sees a token. Without
-`gh`, or logged out of it, or for a project that isn't on GitHub, nothing is shown; `o` and `i` say why.
-
-`i` lists the open issues of the selected session's project, the latest to change first, with the selected
-issue's text under the list. Typing filters them by number, title, label or author. `Enter` on one opens the
-[new-session panel](#starting-a-session) on a new worktree with a branch named after it, like
-`42-fix-login-redirect`, and the task `Fix issue #42: <its title> (<its address>)`, so the agent knows which
-issue and can read it with `gh issue view 42`. `Esc` closes the list.
+For a project on GitHub or GitLab, each worktree line shows its branch's open pull request, `#57` (a merge
+request, `!57`, on GitLab), with a mark for what matters most about it; `o` opens it in your browser, `O` lists
+the project's pull requests and `i` its issues: see [pull requests and issues](#pull-requests-and-issues).
 
 Everything is also a command, for scripts and for agents:
 
@@ -426,7 +409,8 @@ on green, removed lines on red, and the words that changed inside a line marked 
 
 It starts with what isn't committed yet, staged or not, new files included. `b` switches to the whole branch
 since it left its base (where it meets `origin`'s default branch, or `main` or `master`): everything an agent
-committed, as its pull request would read.
+committed, as its pull request would read. From [the pull requests](#pull-requests), `Ctrl+D` shows one's own
+diff here, as GitHub or GitLab has it, with no worktree needed.
 
 | Key | In the diff |
 |---|---|
@@ -438,6 +422,78 @@ committed, as its pull request would read.
 | `Esc` / `q` | back to the sidebar |
 
 The wheel scrolls the diff, and moves through the files over the list.
+
+### Pull requests and issues
+
+For a project whose remote is on GitHub or GitLab, each worktree line shows its branch's open pull request when
+there is one: `#57`, or on GitLab, where it's a merge request, `!57`, and a mark for what matters most about it,
+in this order:
+
+| Mark | Meaning |
+|---|---|
+| `✗` | a check failed |
+| `±` | a reviewer asked for changes |
+| `draft` | it's still a draft |
+| `◌` | checks are still running |
+| `✓` | approved |
+
+A pull request that's simply ready shows its number alone. `o` opens the selected session's pull request in your
+browser. crystal asks the forge's own command line tool, [`gh`](https://cli.github.com) for GitHub and
+[`glab`](https://gitlab.com/gitlab-org/cli) for GitLab, as soon as it sees a project and then once a minute,
+so your login works as it always does and crystal never sees a token. Which forge a project is on comes from
+its `origin` remote (or its first, without one): `github.com`, or a host `gh` is logged in to, like a GitHub
+Enterprise, is GitHub; `gitlab.com`, or a host in glab's config, like a GitLab of your own, is GitLab.
+Without the tool, or logged out of it, or for a project on neither, nothing is shown; `o`, `O` and `i` say why.
+
+#### Pull requests
+
+`O` lists the open pull requests of the selected session's project, with each one's author and branch, whether
+it's a draft, how its checks stand and what its reviewers decided. Under the list is the selected one, read
+whole: who wants to merge which branch into which, each of its checks, its description, and then its
+conversation, comments and reviews in the order they came. Typing filters the list by number, title, author or
+branch; `↑` / `↓` pick another, and `PageUp` / `PageDown` scroll what's under the list.
+
+| Key | In the pull requests |
+|---|---|
+| `Enter` | open the [new-session panel](#starting-a-session) in the pull request's worktree, with the task `Work on pull request #57: <its title> (<its address>)` |
+| `Ctrl+D` | its whole diff, in [the diff](#the-diff); `Esc` comes back to the list |
+| `Ctrl+C` | comment on it: `Enter` posts, `Alt+Enter` breaks a line, `Esc` puts the comment away |
+| `Ctrl+O` | open it in your browser |
+| `Esc` | close the list |
+
+A pull request's worktree is the project's worktree on its branch, when there's one already; otherwise crystal
+fetches the branch from `origin` and makes one beside the others, like `app.worktrees/fix-login`, its branch
+following `origin`'s so `git pull` brings what's pushed later. A pull request from a fork isn't on a branch of
+the project's, so it's fetched from where the forge keeps it (`refs/pull/57/head`, or
+`refs/merge-requests/57/head` on GitLab) onto a branch named for its owner, like `ana/main`, the way `gh pr
+checkout` names it, so that a fork's `main` is never taken for yours. GitLab doesn't name a fork's owner, so
+there it's `mr-57/main`.
+
+A comment is posted as you, the way `gh pr comment` or `glab mr note` would. While it's on its way the box
+waits; once posted, the pull request is read again with it, and if the forge refuses it, it's all still in the
+box, with why.
+
+#### Issues
+
+`i` lists the open issues of the selected session's project, the latest to change first, with the selected
+issue under the list: its text, then what's been said on it. Typing filters them by number, title, label or
+author.
+
+| Key | In the issues |
+|---|---|
+| `Enter` | open the [new-session panel](#starting-a-session) on a new worktree with a branch named after the issue, like `42-fix-login-redirect`, and the task `Fix issue #42: <its title> (<its address>)`, so the agent knows which issue and can read it with `gh issue view 42` or `glab issue view 42` |
+| `Ctrl+C` | comment on it: `Enter` posts, `Alt+Enter` breaks a line, `Esc` puts the comment away |
+| `Ctrl+E` | change its title and text: `Tab` goes between them, `Enter` saves both, `Esc` keeps them as they were |
+| `Ctrl+O` | open it in your browser |
+| `Esc` | close the list |
+
+#### On GitLab
+
+Everything above works on a GitLab project, through `glab`, with merge requests where GitHub has pull requests.
+GitLab's list of merge requests doesn't say how their checks or reviews stand, so their worktree lines and rows
+show only `draft`; reading one shows its pipeline as its check, and an approval in its conversation. GitLab wants
+a login to read comments, even on a project anyone can see: logged out, a merge request or an issue reads
+without them.
 
 ### The file finder
 
@@ -833,7 +889,7 @@ crystal flow retry ship-1            # run a step that failed, or that a restart
 ### Plugins
 
 Most of what crystal does beyond running sessions is a plugin you can switch off: tasks, the backlog, memory,
-profiles, GitHub, flows and notifications. Plugins of your own add actions, panes over the TUI and hooks on what
+profiles, GitHub and GitLab, flows and notifications. Plugins of your own add actions, panes over the TUI and hooks on what
 happens, and use crystal through its own command line, like any script would.
 
 ```sh
@@ -852,7 +908,7 @@ crystal plugin remove notes
 | `backlog` | [the backlog](#the-backlog): `b`, the counts beside projects, `crystal backlog`, and telling agents to use it |
 | `memory` | [memory](#memory): `m`, `crystal remember` and `memory`, and what Claude Code is shown as it starts |
 | `profiles` | [profiles](#profiles): `P`, the profiles in the new-session panel, and `crystal profile` |
-| `github` | pull requests on worktree lines, `o` and `i`; switched off, crystal never runs `gh` |
+| `github` | [pull requests and issues](#pull-requests-and-issues), on GitHub or GitLab: their marks on worktree lines, `o`, `O` and `i`; switched off, crystal never runs `gh` or `glab` |
 | `flows` | [flows](#flows): `g` and `f`, runs in the sidebar and the new-session panel, and `crystal flow` |
 | `notifications` | telling you when a session needs you |
 

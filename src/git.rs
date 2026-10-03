@@ -100,6 +100,64 @@ pub fn add_new_worktree(dir: &Path, branch: &str) -> Result<(PathBuf, String)> {
     Ok((path, free))
 }
 
+/// The worktree of the repository at `project` that has `branch` checked
+/// out, if one has: git checks a branch out in one worktree at a time.
+pub fn worktree_on(project: &Path, branch: &str) -> Result<Option<PathBuf>> {
+    let list = git(project, &["worktree", "list", "--porcelain"])?;
+    let found = parse_worktree_list(&list)
+        .into_iter()
+        .find(|listed| !listed.prunable && listed.branch.as_deref() == Some(branch));
+    Ok(found.map(|listed| std::fs::canonicalize(&listed.path).unwrap_or(listed.path)))
+}
+
+/// Makes a worktree in the repository at `project` on `branch`, with what
+/// `fetch` names on `origin`: a branch, or a ref like `refs/pull/57/head`.
+/// It's fetched first. A new branch starts there and follows `fetch` on
+/// `origin`, so that `git pull` brings what's pushed to it later; a branch
+/// that's there already is brought up to it, unless it has commits of its
+/// own. Returns the worktree's directory.
+pub fn add_fetched_worktree(project: &Path, branch: &str, fetch: &str) -> Result<PathBuf> {
+    // Both come from the forge, and go to git as arguments.
+    for name in [branch, fetch] {
+        if name.is_empty() || name.starts_with('-') || name.contains(char::is_whitespace) {
+            bail!("{name:?} isn't a branch git can check out");
+        }
+    }
+    let checkout = Checkout::find(project)
+        .with_context(|| format!("{} isn't in a git repository", project.display()))?;
+    git(project, &["fetch", "--quiet", "origin", fetch])
+        .with_context(|| format!("couldn't fetch {fetch} from origin"))?;
+    // By its commit: another fetch in the repository could move FETCH_HEAD.
+    let tip = git(project, &["rev-parse", "--verify", "FETCH_HEAD^{commit}"])?;
+    let tip = tip.trim();
+    let target = worktree_dir(&checkout.project_path, branch);
+    let target_arg = target.to_string_lossy();
+    if branch_exists(project, branch) {
+        git(project, &["worktree", "add", &target_arg, branch])?;
+        // Not fast-forward, it has work of its own, which is left as it is.
+        let _ = git(&target, &["merge", "--ff-only", "--quiet", tip]);
+    } else {
+        git(
+            project,
+            &["worktree", "add", "-b", branch, &target_arg, tip],
+        )?;
+        let merge = if fetch.starts_with("refs/") {
+            fetch.to_string()
+        } else {
+            format!("refs/heads/{fetch}")
+        };
+        git(
+            project,
+            &["config", &format!("branch.{branch}.remote"), "origin"],
+        )?;
+        git(
+            project,
+            &["config", &format!("branch.{branch}.merge"), &merge],
+        )?;
+    }
+    Ok(target)
+}
+
 /// The worktree `target` names: a directory, taken from `dir` when it's
 /// relative, or else a branch that a worktree of `dir`'s repository has
 /// checked out.
@@ -344,12 +402,14 @@ fn absolute(dir: &Path, path: &str) -> Option<PathBuf> {
 }
 
 /// Runs git in `dir` and gives back what it printed. When git fails, its
-/// own words are the error.
+/// own words are the error. It never asks for a password on the terminal,
+/// which may be the TUI's: a fetch that needs one fails instead.
 fn git(dir: &Path, args: &[&str]) -> Result<String> {
     let output = Command::new("git")
         .arg("-C")
         .arg(dir)
         .args(args)
+        .env("GIT_TERMINAL_PROMPT", "0")
         .output()
         .context("couldn't run git")?;
     if !output.status.success() {

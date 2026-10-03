@@ -11,7 +11,7 @@ use super::status::Status;
 use super::theme::Theme;
 use super::ui::Look;
 use crate::flow_run::{FlowRun, RunState, StepState};
-use crate::github::{PullRequest, PullRequestState};
+use crate::forge::{PullRequest, PullRequestState};
 use crate::protocol::{Front, SessionInfo};
 use crate::shell;
 use ratatui::Frame;
@@ -341,8 +341,8 @@ fn task_line<'a>(session: &SessionInfo, theme: &Theme, width: u16) -> Line<'a> {
 }
 
 /// A worktree's line: its mark and branch, and on the right its pull
-/// request when GitHub knows of one, `#57` and a mark for what matters most
-/// about it, or `removing…` while git removes it. Short of room, the mark
+/// request when its forge knows of one, `#57` (`!57` on GitLab) and a mark
+/// for what matters most about it, or `removing…` while git removes it. Short of room, the mark
 /// goes first, then the number, before the branch is cut.
 fn worktree_line<'a>(
     app: &App,
@@ -394,10 +394,7 @@ fn worktree_line<'a>(
 /// What a worktree line can say on the right about its pull request, the
 /// most first: its number and a mark, then its number alone.
 fn pull_request_spans<'a>(pull_request: &PullRequest, theme: &Theme) -> Vec<Vec<Span<'a>>> {
-    let number = Span::styled(
-        format!("#{}", pull_request.number),
-        Style::new().fg(theme.muted),
-    );
+    let number = Span::styled(pull_request.label(), Style::new().fg(theme.muted));
     let mut forms = Vec::new();
     if let Some((mark, color)) = pull_request_mark(pull_request.state(), theme) {
         forms.push(vec![

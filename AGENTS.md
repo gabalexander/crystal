@@ -73,7 +73,14 @@ is: it's the one request every version must understand.
   - `profiles.rs`: the profiles view (`P`): the list, the form that edits one, its keys and drawing; the
     event loop does the writing
   - `search.rs`: `/`'s matching: a session's name, project, branch or command, letters in order
-  - `issues.rs`: the issues view `i` opens: its state, kept apart from I/O, and its drawing
+  - `issues.rs`: the issues view (`i`): its state and keys, kept apart from I/O, commenting on an issue and
+    changing its title and text, and its drawing
+  - `pull_requests.rs`: the pull requests view (`O`): its state and keys, kept apart from I/O, reading one with
+    its checks and conversation, its diff, commenting, starting a session in its worktree, and its drawing
+  - `listing.rs`: what the issues and pull requests views share: the forge's list filtered as you type, the
+    bar kept on its item, each item read whole once, the reading pane, and drawing them
+  - `compose.rs`: writing back to the forge from those views: the comment box and the form that edits an
+    issue, which keep what's typed until the forge takes it
   - `backlog_view.rs`: the backlog view `b` opens: its state and keys, kept apart from I/O, and its
     drawing
   - `pane.rs`: a viewer of a session on screen, the selected one or a split, and its screen, with copy mode
@@ -172,10 +179,13 @@ is: it's the one request every version must understand.
   removing
 - `src/env.rs`: the environment a session's program starts with
 - `src/git.rs`: a directory's project, worktree and branch, a project's linked worktrees, and making and
-  removing worktrees (runs `git`)
+  removing worktrees, a pull request's with its commits fetched from `origin` (runs `git`)
 - `src/names.rs`: made-up names for new worktrees' branches, like `brave-otter`
-- `src/github.rs`: pull requests and issues from GitHub, through `gh` with a timeout; tests use a fake `gh`,
-  never the real one
+- `src/forge.rs`: pull requests and issues from the forge a project's remote is on, GitHub or GitLab, told
+  apart by its host and the hosts `gh` and `glab` know: the types both read into, `Repo`'s calls, and running
+  the CLI with a timeout; tests use a fake `gh` and `glab`, never the real ones. Was `github.rs`
+  - `forge/github.rs`: each call as a `gh` command, and reading its `--json`
+  - `forge/gitlab.rs`: each call as a `glab` command, and reading its JSON, a merge request as a pull request
 - `src/shell.rs`: quoting arguments and writing paths with `~`, the way a shell reads them
 - `tests/cli.rs`: end-to-end tests that drive the real binary against a private daemon (and read its database
   beside its socket to see what it wrote down), with a config of

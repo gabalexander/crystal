@@ -9,6 +9,7 @@
 mod app;
 mod backlog_view;
 mod command_line;
+mod compose;
 mod copy_mode;
 mod diff;
 mod diff_view;
@@ -19,11 +20,13 @@ mod help;
 mod issues;
 pub(crate) mod launcher;
 mod layouts;
+mod listing;
 mod memory_view;
 mod mouse;
 mod pane;
 mod plugins_view;
 mod profiles;
+mod pull_requests;
 pub(crate) mod screen_widget;
 mod search;
 mod settings_view;
@@ -38,7 +41,9 @@ mod ui;
 use crate::config::{self, Config};
 use crate::db::{self, Db};
 use crate::flow_run::FlowRun;
-use crate::github::{self, Issue, PullRequest};
+use crate::forge::{
+    Checkout, Forge, Issue, IssueDetail, PullRequest, PullRequestDetail, Repo, Topic,
+};
 use crate::memory::{self, Listed, Memory};
 use crate::plugins::{self, Context};
 use crate::profile;
@@ -73,7 +78,7 @@ const POLL_EVERY: Duration = Duration::from_millis(500);
 /// nothing working, the TUI waits for something to happen instead.
 const SPIN_EVERY: Duration = Duration::from_millis(150);
 
-/// How often GitHub is asked again about a project's pull requests. A
+/// How often its forge is asked again about a project's pull requests. A
 /// project seen for the first time is asked about straight away.
 const PULL_REQUESTS_EVERY: Duration = Duration::from_secs(60);
 
@@ -105,10 +110,10 @@ pub enum Event {
     OutputEnded {
         pane: u64,
     },
-    /// What GitHub said about the open pull requests of a project.
+    /// What its forge said about the open pull requests of a project.
     PullRequests {
         project: PathBuf,
-        found: Result<Vec<PullRequest>, String>,
+        found: Result<(Forge, Vec<PullRequest>), String>,
     },
     /// The linked worktrees of a project, as git listed them.
     Worktrees {
@@ -126,17 +131,39 @@ pub enum Event {
         path: PathBuf,
         branch: String,
     },
-    /// What GitHub said about the open issues of a project.
+    /// What its forge said about the open issues of a project.
     Issues {
         project: PathBuf,
-        found: Result<Vec<Issue>, String>,
+        found: Result<(Forge, Vec<Issue>), String>,
     },
-    /// The text of one of a project's issues.
-    IssueBody {
+    /// One of a project's issues, read whole.
+    IssueRead {
         project: PathBuf,
         number: u64,
-        body: Result<String, String>,
+        read: Result<IssueDetail, String>,
     },
+    /// One of a project's pull requests, read whole.
+    PullRequestRead {
+        project: PathBuf,
+        number: u64,
+        read: Result<PullRequestDetail, String>,
+    },
+    /// A comment was posted on `topic`, or why it wasn't.
+    Commented {
+        project: PathBuf,
+        topic: Topic,
+        posted: Result<(), String>,
+    },
+    /// An issue was given a new title and text, or why it wasn't.
+    IssueEdited {
+        project: PathBuf,
+        number: u64,
+        edit: (String, String),
+        saved: Result<(), String>,
+    },
+    /// A pull request's worktree is there now: the start that waited on it
+    /// can go on, in it.
+    Fetched(Box<Action>),
     /// Something to tell the user, from work done off the loop.
     Notice(String),
     /// A worktree's diff, read for the diff view.
@@ -381,7 +408,7 @@ impl Tui {
             while let Ok(event) = events.try_recv() {
                 self.handle(event);
             }
-            self.fetch_issue_body();
+            self.read_topic();
             self.keep_tabs();
         }
         Ok(())
@@ -458,20 +485,26 @@ impl Tui {
         *self.projects.lock().unwrap() = asked;
     }
 
-    /// Asks GitHub, off the loop, for the text of the issue the issues
-    /// view's bar is on, the first time the bar is on it.
-    fn fetch_issue_body(&mut self) {
-        let Some((project, number)) = self.app.issue_body_to_fetch() else {
+    /// Asks the forge, off the loop, for the issue or pull request the
+    /// open view's bar is on, read whole, the first time the bar is on it.
+    fn read_topic(&mut self) {
+        let Some((project, topic)) = self.app.topic_to_read() else {
             return;
         };
-        let events = self.events.clone();
-        thread::spawn(move || {
-            let body = github::issue_body(&project, number);
-            let _ = events.send(Event::IssueBody {
-                project,
-                number,
-                body,
-            });
+        self.read_in_background(move || {
+            let repo = Repo::find(&project);
+            match topic {
+                Topic::Issue(number) => Event::IssueRead {
+                    read: repo.and_then(|repo| repo.issue(number)),
+                    project,
+                    number,
+                },
+                Topic::PullRequest(number) => Event::PullRequestRead {
+                    read: repo.and_then(|repo| repo.pull_request(number)),
+                    project,
+                    number,
+                },
+            }
         });
     }
 
@@ -508,11 +541,31 @@ impl Tui {
                 self.app.ask_to_force_removal(path, branch);
             }
             Event::Issues { project, found } => self.app.set_issues(&project, found),
-            Event::IssueBody {
+            Event::IssueRead {
                 project,
                 number,
-                body,
-            } => self.app.set_issue_body(&project, number, body),
+                read,
+            } => self.app.set_issue(&project, number, read),
+            Event::PullRequestRead {
+                project,
+                number,
+                read,
+            } => self.app.set_pull_request(&project, number, read),
+            Event::Commented {
+                project,
+                topic,
+                posted,
+            } => self.app.commented(&project, topic, posted),
+            Event::IssueEdited {
+                project,
+                number,
+                edit,
+                saved,
+            } => self.app.issue_edited(&project, number, edit, saved),
+            Event::Fetched(start) => {
+                self.list_worktrees_again();
+                self.carry_out(*start);
+            }
             Event::Notice(notice) => self.app.notify(notice),
             Event::Output { pane, bytes } => {
                 if let Some(pane) = self.pane_with_id(pane) {
@@ -560,10 +613,33 @@ impl Tui {
 
     /// Performs `action`. One that fails, say because its session has just
     /// gone, says why at the bottom rather than closing the TUI.
-    fn carry_out(&mut self, action: Action) {
+    fn carry_out(&mut self, mut action: Action) {
+        if let Some(Place::PullRequest(checkout)) = action.place_mut() {
+            let checkout = checkout.clone();
+            self.fetch_then_start(checkout, action);
+            return;
+        }
         if let Err(err) = self.perform(action) {
             self.app.notify(format!("{err:#}"));
         }
+    }
+
+    /// Finds or makes the worktree `checkout` says, off the loop, since
+    /// making one fetches over the network; then `start` goes on in it.
+    fn fetch_then_start(&mut self, checkout: Checkout, mut start: Action) {
+        self.app.notify(format!("fetching {}…", checkout.branch));
+        let socket = self.socket.clone();
+        self.read_in_background(
+            move || match client::pull_request_worktree(&socket, &checkout) {
+                Ok(dir) => {
+                    if let Some(place) = start.place_mut() {
+                        *place = Place::Directory(Some(dir));
+                    }
+                    Event::Fetched(Box::new(start))
+                }
+                Err(err) => Event::Notice(format!("{err:#}")),
+            },
+        );
     }
 
     fn on_mouse(&mut self, mouse: MouseEvent) {
@@ -985,21 +1061,59 @@ impl Tui {
                     self.copy_to_clipboard(&text)?;
                 }
             }
-            Action::OpenPullRequest { project, number } => {
-                // gh goes over the network: off the loop, saying only what
-                // went wrong.
+            Action::OpenInBrowser { project, topic } => {
+                // The forge's CLI goes over the network: off the loop,
+                // saying only what went wrong.
                 let events = self.events.clone();
                 thread::spawn(move || {
-                    if let Err(reason) = github::open_pull_request(&project, number) {
+                    let opened = Repo::find(&project).and_then(|repo| repo.open(topic));
+                    if let Err(reason) = opened {
                         let _ = events.send(Event::Notice(reason));
                     }
                 });
             }
             Action::ListIssues(project) => {
-                let events = self.events.clone();
-                thread::spawn(move || {
-                    let found = github::issues(&project);
-                    let _ = events.send(Event::Issues { project, found });
+                self.read_in_background(move || {
+                    let found =
+                        Repo::find(&project).and_then(|repo| Ok((repo.forge, repo.issues()?)));
+                    Event::Issues { project, found }
+                });
+            }
+            Action::ListPullRequests(project) => {
+                self.read_in_background(move || {
+                    let found = list_pull_requests(&project);
+                    Event::PullRequests { project, found }
+                });
+            }
+            Action::Comment {
+                project,
+                topic,
+                text,
+            } => {
+                self.read_in_background(move || {
+                    let posted = Repo::find(&project).and_then(|repo| repo.comment(topic, &text));
+                    Event::Commented {
+                        project,
+                        topic,
+                        posted,
+                    }
+                });
+            }
+            Action::EditIssue {
+                project,
+                number,
+                title,
+                body,
+            } => {
+                self.read_in_background(move || {
+                    let saved = Repo::find(&project)
+                        .and_then(|repo| repo.edit_issue(number, &title, &body));
+                    Event::IssueEdited {
+                        project,
+                        number,
+                        edit: (title, body),
+                        saved,
+                    }
                 });
             }
         }
@@ -1426,6 +1540,7 @@ fn directory_for(socket: &Path, place: Place) -> Result<PathBuf> {
                 client::add_worktree(socket, &base, &branch)
             }
         }
+        Place::PullRequest(checkout) => client::pull_request_worktree(socket, &checkout),
     }
 }
 
@@ -1602,9 +1717,16 @@ fn spawn_worktree_lister(
     });
 }
 
-/// Asks GitHub about the open pull requests of each project the sessions
-/// are in, on a thread of its own, since gh can take seconds to answer: a
-/// project as soon as it's seen, and every one again each
+/// The pull requests open on the project at `project`, and the forge
+/// they're on.
+fn list_pull_requests(project: &Path) -> Result<(Forge, Vec<PullRequest>), String> {
+    let repo = Repo::find(project)?;
+    Ok((repo.forge, repo.pull_requests()?))
+}
+
+/// Asks their forge about the open pull requests of each project the
+/// sessions are in, on a thread of its own, since its CLI can take seconds
+/// to answer: a project as soon as it's seen, and every one again each
 /// [`PULL_REQUESTS_EVERY`].
 fn spawn_pull_request_poller(projects: Arc<Mutex<Vec<PathBuf>>>, events: Sender<Event>) {
     thread::spawn(move || {
@@ -1619,7 +1741,7 @@ fn spawn_pull_request_poller(projects: Arc<Mutex<Vec<PathBuf>>>, events: Sender<
                     continue;
                 }
                 asked.insert(project.clone(), Instant::now());
-                let found = github::pull_requests(&project);
+                let found = list_pull_requests(&project);
                 if events.send(Event::PullRequests { project, found }).is_err() {
                     return;
                 }

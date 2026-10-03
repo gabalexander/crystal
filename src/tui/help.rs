@@ -64,7 +64,7 @@ pub const KEYS: &[Key] = &[
     of_plugin("tasks", "c", "close its task"),
     of_plugin("flows", "g/f", "flow: go on / send back"),
     sidebar("u /", "next needing you / find"),
-    of_plugin("github", "o/i", "pull request / issues"),
+    of_plugin("github", "o/O/i", "its PR / all PRs / issues"),
     sidebar("d/p", "diff / find a file"),
     of_plugin("backlog", "b", "the project's backlog"),
     of_plugin("memory", "m", "what it has remembered"),

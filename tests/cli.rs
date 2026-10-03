@@ -4570,30 +4570,126 @@ fn slash_filters_the_sidebar_and_enter_selects_the_match() {
 }
 
 /// A stand-in for GitHub's `gh`: it answers `pr list` and `issue list` with
-/// the JSON given, `issue view` with an issue's text, and writes each call
-/// it gets into `gh-calls` beside it. Returns the directory to put first on
-/// the PATH.
+/// the JSON given, `pr view`, `pr diff` and `issue view` with a pull
+/// request and an issue of its own, and takes comments and edits. It
+/// writes each call it gets into `gh-calls` beside it, and what it's given
+/// on its standard input into `gh-input`. Returns the directory to put
+/// first on the PATH.
 fn fake_gh(dir: &Path, pull_requests: &str, issues: &str) -> PathBuf {
     let bin = dir.join("gh-bin");
     std::fs::create_dir(&bin).unwrap();
     std::fs::write(dir.join("gh-prs.json"), pull_requests).unwrap();
     std::fs::write(dir.join("gh-issues.json"), issues).unwrap();
+    std::fs::write(dir.join("gh-pr.json"), PULL_REQUEST_READ).unwrap();
+    std::fs::write(dir.join("gh-issue.json"), ISSUE_READ).unwrap();
+    std::fs::write(dir.join("forge.diff"), PULL_REQUEST_DIFF).unwrap();
     let dir = dir.display();
     script(
         &bin.join("gh"),
         &format!(
             r#"echo "$*" >> "{dir}/gh-calls"
-case "$1 $2" in
-    "pr list") cat "{dir}/gh-prs.json" ;;
-    "pr view") ;;
-    "issue list") cat "{dir}/gh-issues.json" ;;
-    "issue view") echo '{{"body": "The login page sends you back to itself."}}' ;;
+case "$1 $2 $3" in
+    "pr view --web") ;;
+    "pr list "*) cat "{dir}/gh-prs.json" ;;
+    "pr view "*) cat "{dir}/gh-pr.json" ;;
+    "pr diff "*) cat "{dir}/forge.diff" ;;
+    "issue list "*) cat "{dir}/gh-issues.json" ;;
+    "issue view "*) cat "{dir}/gh-issue.json" ;;
+    "pr comment "*|"issue comment "*|"issue edit "*) cat > "{dir}/gh-input" ;;
     *) echo "unexpected: $*" >&2; exit 1 ;;
 esac
 "#
         ),
     );
     bin
+}
+
+/// What the fake `gh` reads a pull request as.
+const PULL_REQUEST_READ: &str = r#"{
+    "baseRefName": "main",
+    "body": "Sends you home after login.",
+    "statusCheckRollup": [
+        {"__typename": "CheckRun", "name": "build", "status": "COMPLETED", "conclusion": "SUCCESS"}
+    ],
+    "comments": [
+        {"author": {"login": "bo"}, "body": "Does it keep the query string?", "createdAt": "2026-10-02T10:00:00Z"}
+    ],
+    "reviews": [
+        {"author": {"login": "cy"}, "body": "", "state": "APPROVED", "submittedAt": "2026-10-02T11:00:00Z"}
+    ]
+}"#;
+
+/// What the fake `gh` reads an issue as.
+const ISSUE_READ: &str = r#"{
+    "body": "The login page sends you back to itself.",
+    "comments": [
+        {"author": {"login": "bo"}, "body": "Me too, on Safari.", "createdAt": "2026-10-02T10:00:00Z"}
+    ]
+}"#;
+
+/// What the fake forges say a pull request changes.
+const PULL_REQUEST_DIFF: &str = "diff --git a/login.rs b/login.rs
+index 3b18e51..a1b2c3d 100644
+--- a/login.rs
++++ b/login.rs
+@@ -1,3 +1,3 @@
+ fn after_login() {
+-    redirect(\"/login\");
++    redirect(\"/home\");
+ }
+";
+
+/// A stand-in for GitLab's `glab`, like [`fake_gh`]: it answers `mr list`
+/// and `issue list` with the JSON given, `mr view`, `mr diff` and `issue
+/// view` with a merge request and an issue of its own, and takes notes. It
+/// writes each call it gets into `glab-calls` beside it, and what it's
+/// given on its standard input into `glab-input`.
+fn fake_glab(dir: &Path, merge_requests: &str, issues: &str) -> PathBuf {
+    let bin = dir.join("glab-bin");
+    std::fs::create_dir(&bin).unwrap();
+    std::fs::write(dir.join("glab-mrs.json"), merge_requests).unwrap();
+    std::fs::write(dir.join("glab-issues.json"), issues).unwrap();
+    std::fs::write(dir.join("glab-mr.json"), MERGE_REQUEST_READ).unwrap();
+    std::fs::write(dir.join("forge.diff"), PULL_REQUEST_DIFF).unwrap();
+    let issue = r#"{"description": "Keys never rotate.", "Notes": []}"#;
+    std::fs::write(dir.join("glab-issue.json"), issue).unwrap();
+    let dir = dir.display();
+    script(
+        &bin.join("glab"),
+        &format!(
+            r#"echo "$*" >> "{dir}/glab-calls"
+case "$1 $2" in
+    "mr list") cat "{dir}/glab-mrs.json" ;;
+    "mr view") cat "{dir}/glab-mr.json" ;;
+    "mr diff") cat "{dir}/forge.diff" ;;
+    "mr note"|"issue update") cat > "{dir}/glab-input" ;;
+    "issue list") cat "{dir}/glab-issues.json" ;;
+    "issue view") cat "{dir}/glab-issue.json" ;;
+    "issue note") ;;
+    *) echo "unexpected: $*" >&2; exit 1 ;;
+esac
+"#
+        ),
+    );
+    bin
+}
+
+/// What the fake `glab` reads a merge request as.
+const MERGE_REQUEST_READ: &str = r#"{
+    "iid": 57, "target_branch": "main", "description": "Sends you home after login.",
+    "head_pipeline": {"id": 3, "status": "failed"},
+    "Discussions": [
+        {"notes": [{"author": {"username": "bo"}, "body": "Why here?",
+                    "created_at": "2026-10-02T10:00:00Z", "system": false}]},
+        {"notes": [{"author": {"username": "cy"}, "body": "approved this merge request",
+                    "created_at": "2026-10-02T11:00:00Z", "system": true}]}
+    ]
+}"#;
+
+/// The calls the fake `gh` or `glab` has had, each a line, once one has
+/// come.
+fn calls(file: &Path) -> String {
+    std::fs::read_to_string(file).unwrap_or_default()
 }
 
 /// A repository called `app` whose origin is on github.com, as far as git
@@ -4716,6 +4812,275 @@ fn i_lists_the_issues_and_enter_starts_a_session_for_one() {
     assert_eq!(
         args.lines().last(),
         Some("Fix issue #42: Fix login redirect (https://github.com/acme/app/issues/42)")
+    );
+}
+
+const OPEN_PULL_REQUEST: &str = r#"[{"number": 57, "title": "Fix the login redirect",
+    "author": {"login": "ana"}, "headRefName": "fix-login", "isDraft": false,
+    "isCrossRepository": false, "headRepositoryOwner": {"login": "acme"},
+    "reviewDecision": "APPROVED", "statusCheckRollup": [], "updatedAt": "2026-10-02T09:30:00Z",
+    "url": "https://github.com/acme/app/pull/57"}]"#;
+
+#[test]
+fn capital_o_reads_a_pull_request_shows_its_diff_and_comments_on_it() {
+    let crystal = Crystal::new();
+    let repo = github_repo(crystal.dir.path());
+    let bin = fake_gh(crystal.dir.path(), OPEN_PULL_REQUEST, NO_ISSUES);
+    let repo_arg = repo.to_str().unwrap();
+    crystal.ok(&["new", "-n", "planner", "-c", repo_arg, "sleep", "30"]);
+
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let mut tui = crystal.attach_with_env(&[], &[("PATH", &path)]);
+    tui.shows("▸ planner");
+    tui.type_keys("O");
+    tui.shows("pull requests · app");
+    tui.shows("Fix the login redirect");
+    // The highlighted one, read whole: its checks, text and conversation.
+    tui.shows("ana wants to merge fix-login into main");
+    tui.shows("✓ build");
+    tui.shows("Sends you home after login.");
+    tui.shows("Does it keep the query string?");
+    tui.shows("cy approved");
+
+    // Its diff, then back to the list.
+    tui.type_keys("\x04");
+    tui.shows("pull request #57");
+    tui.shows("redirect(\"/home\");");
+    tui.type_keys("\x1b");
+    tui.shows("pull requests · app");
+
+    tui.type_keys("\x03");
+    tui.shows("comment on #57");
+    tui.type_keys("Looks right.\r");
+    tui.shows("commented on #57");
+    let gh_calls = crystal.dir.path().join("gh-calls");
+    assert!(
+        calls(&gh_calls)
+            .lines()
+            .any(|call| call == "pr comment 57 --body-file -"),
+        "{}",
+        calls(&gh_calls)
+    );
+    let input = std::fs::read_to_string(crystal.dir.path().join("gh-input")).unwrap();
+    assert_eq!(input, "Looks right.");
+    // It's read again, with the comment in it.
+    eventually("the pull request is read again", || {
+        let reads = calls(&gh_calls);
+        reads
+            .lines()
+            .filter(|call| call.starts_with("pr view 57 "))
+            .count()
+            == 2
+    });
+
+    tui.type_keys("\x0f");
+    eventually("gh is asked to open the pull request", || {
+        calls(&gh_calls)
+            .lines()
+            .any(|call| call == "pr view --web 57")
+    });
+}
+
+#[test]
+fn enter_on_a_pull_request_starts_a_session_in_its_worktree_forks_too() {
+    let crystal = Crystal::new();
+    let dir = crystal.dir.path();
+    // The project's origin, on this machine but named as GitHub: git goes
+    // to the one, and crystal's forge reads the other.
+    let origin = dir.join("origin.git");
+    git(
+        dir,
+        &[
+            "init",
+            "-q",
+            "--bare",
+            "-b",
+            "main",
+            origin.to_str().unwrap(),
+        ],
+    );
+    let repo = git_repo(dir, "app");
+    git(
+        &repo,
+        &["remote", "add", "origin", "https://github.com/acme/app.git"],
+    );
+    let instead = format!("url.{}.insteadOf", origin.display());
+    git(
+        &repo,
+        &["config", &instead, "https://github.com/acme/app.git"],
+    );
+    git(&repo, &["push", "-q", "origin", "main"]);
+    git(&repo, &["checkout", "-q", "-b", "fix-login"]);
+    git(
+        &repo,
+        &["commit", "-q", "--allow-empty", "-m", "send them home"],
+    );
+    git(&repo, &["push", "-q", "origin", "fix-login"]);
+    let fix = git(&repo, &["rev-parse", "HEAD"]);
+    // A fork's commit, which the project only has under refs/pull.
+    git(&repo, &["checkout", "-q", "main"]);
+    git(
+        &repo,
+        &["commit", "-q", "--allow-empty", "-m", "from a fork"],
+    );
+    let forked = git(&repo, &["rev-parse", "HEAD"]);
+    git(&repo, &["push", "-q", "origin", "HEAD:refs/pull/58/head"]);
+    git(&repo, &["reset", "-q", "--hard", "HEAD~1"]);
+    git(&repo, &["branch", "-q", "-D", "fix-login"]);
+
+    let pull_requests = r#"[
+        {"number": 57, "title": "Fix the login redirect", "author": {"login": "bo"},
+         "headRefName": "fix-login", "isCrossRepository": false,
+         "url": "https://github.com/acme/app/pull/57"},
+        {"number": 58, "title": "Dark mode", "author": {"login": "ana"},
+         "headRefName": "main", "isCrossRepository": true, "headRepositoryOwner": {"login": "ana"},
+         "url": "https://github.com/acme/app/pull/58"}
+    ]"#;
+    let gh = fake_gh(dir, pull_requests, NO_ISSUES);
+    let repo_arg = repo.to_str().unwrap();
+    crystal.ok(&["new", "-n", "planner", "-c", repo_arg, "sleep", "30"]);
+
+    let claude = fake_claude(dir);
+    let path = path_of(&[&gh, &claude]);
+    let mut tui = crystal.attach_with_env(&[], &[("PATH", &path)]);
+    tui.shows("▸ planner");
+    tui.type_keys("O");
+    tui.shows("Fix the login redirect");
+    tui.type_keys("\r");
+    tui.shows("New session · app ⎇ fix-login");
+    tui.shows("Work on pull request #57: Fix the login");
+    tui.type_keys("\r");
+    tui.shows("⎇ fix-login");
+    let worktree = dir.join("app.worktrees/fix-login");
+    let args = written(&worktree.join("args"));
+    assert!(args.contains("Work on pull request #57"), "{args}");
+    assert_eq!(git(&worktree, &["rev-parse", "HEAD"]), fix);
+    let upstream = git(&worktree, &["rev-parse", "--abbrev-ref", "@{upstream}"]);
+    assert_eq!(upstream.trim(), "origin/fix-login");
+
+    // The fork's `main` is never the project's: it goes under its owner.
+    tui.type_keys("\x1c");
+    tui.type_keys("O");
+    tui.shows("Dark mode");
+    tui.type_keys("\x1b[B\r");
+    tui.shows("New session · app ⎇ ana/main");
+    tui.type_keys("\r");
+    tui.shows("⎇ ana/main");
+    let fork = dir.join("app.worktrees/ana-main");
+    written(&fork.join("args"));
+    assert_eq!(git(&fork, &["rev-parse", "HEAD"]), forked);
+    let merge = git(&repo, &["config", "branch.ana/main.merge"]);
+    assert_eq!(merge.trim(), "refs/pull/58/head");
+}
+
+#[test]
+fn an_issue_takes_a_comment_and_a_new_title() {
+    let crystal = Crystal::new();
+    let repo = github_repo(crystal.dir.path());
+    let issues = r#"[{"number": 42, "title": "Fix login redirect", "labels": [],
+        "updatedAt": "2026-10-01T10:00:00Z", "author": {"login": "ana"},
+        "url": "https://github.com/acme/app/issues/42"}]"#;
+    let bin = fake_gh(crystal.dir.path(), "[]", issues);
+    let repo_arg = repo.to_str().unwrap();
+    crystal.ok(&["new", "-n", "planner", "-c", repo_arg, "sleep", "30"]);
+
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let mut tui = crystal.attach_with_env(&[], &[("PATH", &path)]);
+    tui.shows("▸ planner");
+    tui.type_keys("i");
+    tui.shows("The login page sends you back to itself.");
+    tui.shows("Me too, on Safari.");
+
+    tui.type_keys("\x03");
+    tui.shows("comment on #42");
+    tui.type_keys("Same here\r");
+    tui.shows("commented on #42");
+    let gh_calls = crystal.dir.path().join("gh-calls");
+    let input = crystal.dir.path().join("gh-input");
+    assert!(calls(&gh_calls).contains("issue comment 42 --body-file -"));
+    assert_eq!(std::fs::read_to_string(&input).unwrap(), "Same here");
+
+    tui.type_keys("\x05");
+    tui.shows("edit issue #42");
+    tui.type_keys(" on Safari\r");
+    tui.shows("updated issue #42");
+    tui.shows("Fix login redirect on Safari");
+    let edit = "issue edit 42 --title=Fix login redirect on Safari --body-file -";
+    assert!(calls(&gh_calls).contains(edit), "{}", calls(&gh_calls));
+    assert_eq!(
+        std::fs::read_to_string(&input).unwrap(),
+        "The login page sends you back to itself."
+    );
+}
+
+#[test]
+fn on_gitlab_merge_requests_and_issues_go_through_glab() {
+    let crystal = Crystal::new();
+    let repo = git_repo(crystal.dir.path(), "app");
+    git(
+        &repo,
+        &["remote", "add", "origin", "git@gitlab.com:acme/app.git"],
+    );
+    let merge_requests = r#"[{"iid": 57, "title": "Draft: Fix the login redirect", "draft": true,
+        "author": {"username": "ana"}, "source_branch": "fix-login",
+        "source_project_id": 7, "target_project_id": 7,
+        "updated_at": "2026-10-02T09:30:00.000Z",
+        "web_url": "https://gitlab.com/acme/app/-/merge_requests/57"}]"#;
+    let issues = r#"[{"iid": 8, "title": "Rotate keys", "labels": ["security"],
+        "updated_at": "2026-10-01T10:00:00Z", "author": {"username": "di"},
+        "web_url": "https://gitlab.com/acme/app/-/work_items/8"}]"#;
+    let glab = fake_glab(crystal.dir.path(), merge_requests, issues);
+    let repo_arg = repo.to_str().unwrap();
+    crystal.ok(&[
+        "new",
+        "-n",
+        "fixer",
+        "-c",
+        repo_arg,
+        "-w",
+        "fix-login",
+        "sleep",
+        "30",
+    ]);
+
+    let path = format!("{}:{}", glab.display(), std::env::var("PATH").unwrap());
+    let mut tui = crystal.attach_with_env(&[], &[("PATH", &path)]);
+    tui.shows("!57 draft");
+    tui.type_keys("O");
+    tui.shows("merge requests · app");
+    tui.shows("Fix the login redirect  draft");
+    tui.shows("✗ pipeline");
+    tui.shows("Why here?");
+    tui.shows("cy approved");
+
+    tui.type_keys("\x03");
+    tui.shows("comment on !57");
+    tui.type_keys("LGTM\r");
+    tui.shows("commented on !57");
+    let glab_calls = crystal.dir.path().join("glab-calls");
+    assert!(
+        calls(&glab_calls)
+            .lines()
+            .any(|call| call == "mr note create 57"),
+        "{}",
+        calls(&glab_calls)
+    );
+    let input = crystal.dir.path().join("glab-input");
+    assert_eq!(std::fs::read_to_string(&input).unwrap(), "LGTM");
+
+    // Esc on its own, not the start of an Alt+i.
+    tui.type_keys("\x1b");
+    tui.hides("merge requests · app");
+    tui.type_keys("i");
+    tui.shows("Rotate keys");
+    tui.shows("Keys never rotate.");
+    tui.type_keys("\x03");
+    tui.type_keys("On it\r");
+    tui.shows("commented on #8");
+    assert!(
+        calls(&glab_calls).contains("issue note 8 --message=On it"),
+        "{}",
+        calls(&glab_calls)
     );
 }
 

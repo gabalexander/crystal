@@ -8,12 +8,13 @@ use super::command_line;
 use super::diff_view::{self, Against, DiffView};
 use super::finder::Finder;
 use super::groups::{self, Row};
-use super::issues::IssuesView;
+use super::issues::{self, IssuesView};
 use super::launcher::{self, Launcher, Memory, Run, Setup, Target};
 use super::layouts::{self, Layouts, LayoutsView, Which};
 use super::memory_view::MemoryView;
 use super::plugins_view::{self, PluginsView};
 use super::profiles::{self, ProfilesView};
+use super::pull_requests::{self, PullRequestsView};
 use super::search;
 use super::settings_view::{self, SettingsView};
 use super::status::Status;
@@ -24,7 +25,7 @@ use crate::client::Purpose;
 use crate::config::Config;
 use crate::flow_run::{FlowRun, RunState};
 use crate::flows::{self, Flow};
-use crate::github::{self, PullRequest};
+use crate::forge::{self, Checkout, Forge, Issue, PullRequest, PullRequestDetail, Topic};
 use crate::keys;
 use crate::profile::{self, Profile};
 use crate::protocol::{Activity, Backlog, SessionInfo, State, TaskSpec, Worktree};
@@ -140,6 +141,9 @@ pub enum Place {
         base: Option<PathBuf>,
         made_up: bool,
     },
+    /// In a pull request's worktree: the one its project has on its branch
+    /// already, or a new one with its commits fetched.
+    PullRequest(Checkout),
 }
 
 /// A question asked on the footer line, and the answer typed so far.
@@ -340,15 +344,30 @@ pub enum Action {
     /// The mouse let go: put what it selected in the pane at this slot on
     /// the clipboard.
     CopySelection(Slot),
-    /// Open pull request `number` of the project at `project` in the
-    /// browser.
-    OpenPullRequest {
+    /// Open `topic`, of the project at `project`, in the browser.
+    OpenInBrowser {
+        project: PathBuf,
+        topic: Topic,
+    },
+    /// Ask the forge for the open issues of the project at this path, for
+    /// the issues view that's now open.
+    ListIssues(PathBuf),
+    /// Ask the forge for the open pull requests of the project at this
+    /// path, for the pull requests view that's now open.
+    ListPullRequests(PathBuf),
+    /// Post `text` on `topic`, of the project at `project`.
+    Comment {
+        project: PathBuf,
+        topic: Topic,
+        text: String,
+    },
+    /// Give issue `number` of the project at `project` this title and text.
+    EditIssue {
         project: PathBuf,
         number: u64,
+        title: String,
+        body: String,
     },
-    /// Ask GitHub for the open issues of the project at this path, for the
-    /// issues view that's now open.
-    ListIssues(PathBuf),
     /// Read the diff of the worktree at `dir`, off the event loop.
     ReadDiff {
         dir: PathBuf,
@@ -439,6 +458,18 @@ pub enum Action {
     /// Put the tabs back the way this layout has them.
     RestoreLayout(Which),
     RemoveLayout(Which),
+}
+
+impl Action {
+    /// Where the session it starts goes, for one that starts a session.
+    pub fn place_mut(&mut self) -> Option<&mut Place> {
+        match self {
+            Action::Start { place, .. }
+            | Action::StartInBackground { place, .. }
+            | Action::StartFlow { place, .. } => Some(place),
+            _ => None,
+        }
+    }
 }
 
 /// A sidebar key one of the installed plugins' actions took.
@@ -539,12 +570,14 @@ pub struct App {
     showing_keys: bool,
     /// `/`'s filter on the sidebar, while it's open.
     filter: Option<Filter>,
-    /// What GitHub said about each project's open pull requests, by the
-    /// project's main worktree: the pull requests, or why there are none to
-    /// show.
-    pull_requests: HashMap<PathBuf, Result<Vec<PullRequest>, String>>,
+    /// What its forge said about each project's open pull requests, by the
+    /// project's main worktree: the forge and the pull requests, or why
+    /// there are none to show.
+    pull_requests: HashMap<PathBuf, Result<(Forge, Vec<PullRequest>), String>>,
     /// The issues view, while it's open.
     issues: Option<IssuesView>,
+    /// The pull requests view, while it's open.
+    pull_requests_view: Option<PullRequestsView>,
     /// The diff, the file finder or a project's memory, while one is open.
     view: Option<View>,
     /// Whether memory is on, which is whether `m` opens it: see
@@ -555,7 +588,7 @@ pub struct App {
     /// Whether the backlog is on: its view, and its counts in the sidebar.
     backlog_on: bool,
     /// Whether the github plugin is on: pull requests on worktree lines,
-    /// `o` and `i`.
+    /// `o`, `O` and `i`, on GitHub or GitLab.
     github_on: bool,
     /// The plugins view, while it's open.
     plugins_view: Option<PluginsView>,
@@ -617,6 +650,7 @@ impl App {
             filter: None,
             pull_requests: HashMap::new(),
             issues: None,
+            pull_requests_view: None,
             view: None,
             memory_on: true,
             tasks_on: true,
@@ -642,11 +676,11 @@ impl App {
         self.backlog_on = backlog::enabled(config);
         self.memory_on = crate::memory::enabled(config);
         self.profiles_on = profile::enabled(config);
-        self.github_on = github::enabled(config);
+        self.github_on = forge::enabled(config);
         self.flows_on = flows::enabled(config);
     }
 
-    /// Whether the TUI asks GitHub about the sessions' projects.
+    /// Whether the TUI asks the forge about the sessions' projects.
     pub fn github_on(&self) -> bool {
         self.github_on
     }
@@ -1114,7 +1148,7 @@ impl App {
     }
 
     /// The projects the sessions are in, by their main worktrees: the ones
-    /// to ask GitHub about.
+    /// to ask their forge about.
     pub fn projects(&self) -> Vec<PathBuf> {
         let mut projects: Vec<PathBuf> = self
             .sessions
@@ -1127,29 +1161,53 @@ impl App {
         projects
     }
 
-    /// Takes what GitHub said about the open pull requests of the project
-    /// at `project`.
-    pub fn set_pull_requests(&mut self, project: PathBuf, found: Result<Vec<PullRequest>, String>) {
+    /// Takes what its forge said about the open pull requests of the
+    /// project at `project`, for the worktree lines and the pull requests
+    /// view, if it's open on that project.
+    pub fn set_pull_requests(
+        &mut self,
+        project: PathBuf,
+        found: Result<(Forge, Vec<PullRequest>), String>,
+    ) {
+        if let Some(view) = &mut self.pull_requests_view
+            && view.project == project
+        {
+            view.set_pull_requests(found.clone());
+        }
         self.pull_requests.insert(project, found);
     }
 
     /// The open pull request for `branch` in the project at `project`, if
-    /// GitHub knows of one.
+    /// its forge knows of one.
     pub fn pull_request(&self, project: &Path, branch: &str) -> Option<&PullRequest> {
         if !self.github_on {
             return None;
         }
-        let Some(Ok(pull_requests)) = self.pull_requests.get(project) else {
+        let Some(Ok((_, pull_requests))) = self.pull_requests.get(project) else {
             return None;
         };
         pull_requests
             .iter()
-            .find(|pull_request| pull_request.head_ref_name == branch)
+            .find(|pull_request| pull_request.local_branch == branch)
+    }
+
+    /// The forge the project at `project` is on, as far as the TUI knows:
+    /// GitHub until it's been asked.
+    fn forge_of(&self, project: &Path) -> Forge {
+        match self.pull_requests.get(project) {
+            Some(Ok((forge, _))) => *forge,
+            _ => Forge::GitHub,
+        }
     }
 
     /// The issues view, while it's open.
     pub fn issues_view(&self) -> Option<&IssuesView> {
         self.issues.as_ref()
+    }
+
+    /// The pull requests view, while it's open.
+    pub fn pull_requests_view(&self) -> Option<&PullRequestsView> {
+        self.pull_requests_view.as_ref()
     }
 
     /// The layouts view, while it's open.
@@ -1218,26 +1276,94 @@ impl App {
         self.closing.as_deref()
     }
 
-    /// Takes the open issues GitHub listed for the project at `project`.
-    pub fn set_issues(&mut self, project: &Path, found: Result<Vec<github::Issue>, String>) {
+    /// Takes the open issues its forge listed for the project at
+    /// `project`.
+    pub fn set_issues(&mut self, project: &Path, found: Result<(Forge, Vec<Issue>), String>) {
         if let Some(view) = self.issues.as_mut().filter(|view| view.project == project) {
             view.set_issues(found);
         }
     }
 
-    /// Takes the text of issue `number` of the project at `project`.
-    pub fn set_issue_body(&mut self, project: &Path, number: u64, body: Result<String, String>) {
+    /// Takes issue `number` of the project at `project`, read whole.
+    pub fn set_issue(
+        &mut self,
+        project: &Path,
+        number: u64,
+        read: Result<forge::IssueDetail, String>,
+    ) {
         if let Some(view) = self.issues.as_mut().filter(|view| view.project == project) {
-            view.set_body(number, body);
+            view.list.set_detail(number, read);
         }
     }
 
-    /// The issue whose text to fetch next, with its project: the one the
-    /// issues view's bar is on, once.
-    pub fn issue_body_to_fetch(&mut self) -> Option<(PathBuf, u64)> {
-        let view = self.issues.as_mut()?;
-        let number = view.body_to_fetch()?;
-        Some((view.project.clone(), number))
+    /// Takes pull request `number` of the project at `project`, read whole.
+    pub fn set_pull_request(
+        &mut self,
+        project: &Path,
+        number: u64,
+        read: Result<PullRequestDetail, String>,
+    ) {
+        let view = self.pull_requests_view.as_mut();
+        if let Some(view) = view.filter(|view| view.project == project) {
+            view.list.set_detail(number, read);
+        }
+    }
+
+    /// The issue or pull request to read whole next, with its project: the
+    /// one the open view's bar is on, once.
+    pub fn topic_to_read(&mut self) -> Option<(PathBuf, Topic)> {
+        if let Some(view) = &mut self.issues
+            && let Some(number) = view.list.detail_to_fetch()
+        {
+            return Some((view.project.clone(), Topic::Issue(number)));
+        }
+        let view = self.pull_requests_view.as_mut()?;
+        let number = view.list.detail_to_fetch()?;
+        Some((view.project.clone(), Topic::PullRequest(number)))
+    }
+
+    /// The comment on `topic`, of the project at `project`, was posted, or
+    /// why it wasn't.
+    pub fn commented(&mut self, project: &Path, topic: Topic, posted: Result<(), String>) {
+        let notice = posted.is_ok().then(|| match topic {
+            Topic::Issue(number) => format!("commented on #{number}"),
+            Topic::PullRequest(number) => {
+                format!("commented on {}", self.forge_of(project).label(number))
+            }
+        });
+        match topic {
+            Topic::Issue(number) => {
+                if let Some(view) = self.issues.as_mut().filter(|view| view.project == project) {
+                    view.commented(number, posted);
+                }
+            }
+            Topic::PullRequest(number) => {
+                let view = self.pull_requests_view.as_mut();
+                if let Some(view) = view.filter(|view| view.project == project) {
+                    view.commented(number, posted);
+                }
+            }
+        }
+        if let Some(notice) = notice {
+            self.notify(notice);
+        }
+    }
+
+    /// Issue `number` of the project at `project` was given this title and
+    /// text, or why it wasn't.
+    pub fn issue_edited(
+        &mut self,
+        project: &Path,
+        number: u64,
+        (title, body): (String, String),
+        saved: Result<(), String>,
+    ) {
+        if saved.is_ok() {
+            self.notify(format!("updated issue #{number}"));
+        }
+        if let Some(view) = self.issues.as_mut().filter(|view| view.project == project) {
+            view.edited(number, title, body, saved);
+        }
     }
 
     /// The question on the footer line and its answer so far, while one
@@ -1618,6 +1744,9 @@ impl App {
         if self.issues.is_some() {
             return self.on_issues_key(key);
         }
+        if self.pull_requests_view.is_some() {
+            return self.on_pull_requests_key(key);
+        }
         if self.filter.is_some() {
             self.on_filter_key(key);
             return None;
@@ -1653,6 +1782,7 @@ impl App {
         // panel and the profiles view.
         let typing = self.filter.is_some()
             || self.issues.is_some()
+            || self.pull_requests_view.is_some()
             || self.backlog.is_some()
             || self.layouts.is_some()
             || self.launcher.is_some()
@@ -1821,6 +1951,7 @@ impl App {
             KeyCode::Char('?') => self.showing_keys = true,
             KeyCode::Char('/') => self.open_filter(),
             KeyCode::Char('o') => return self.open_pull_request(),
+            KeyCode::Char('O') => return self.open_pull_requests(),
             KeyCode::Char('i') => return self.open_issues(),
             KeyCode::Char('c') if self.tasks_on => self.ask_how_the_task_went(),
             KeyCode::Char('b') if self.backlog_on => return self.open_backlog(),
@@ -2168,9 +2299,11 @@ impl App {
         }
     }
 
-    /// `o`: opens the pull request of the selected session's branch, or
-    /// says why there's none to open.
-    fn open_pull_request(&mut self) -> Option<Action> {
+    /// The worktree of the selected session, for a key that asks its
+    /// project's forge something: `None`, the footer saying why, when the
+    /// github plugin is off, when it isn't in a repository, or when what
+    /// stopped the forge listing its pull requests would stop this too.
+    fn forge_worktree(&mut self) -> Option<Worktree> {
         if !self.github_on {
             self.notify(plugins::off("github"));
             return None;
@@ -2181,54 +2314,65 @@ impl App {
             self.notify(format!("{name} isn't in a git repository"));
             return None;
         };
-        let Some(branch) = worktree.branch else {
-            self.notify(format!("{name} is on no branch"));
-            return None;
-        };
-        let project = worktree.project_path;
-        let number = match self.pull_requests.get(&project) {
-            None => {
-                self.notify(format!("still asking GitHub about {}", worktree.project));
-                return None;
-            }
-            Some(Err(reason)) => {
-                let reason = reason.clone();
-                self.notify(reason);
-                return None;
-            }
-            Some(Ok(_)) => self.pull_request(&project, &branch).map(|pr| pr.number),
-        };
-        match number {
-            Some(number) => Some(Action::OpenPullRequest { project, number }),
-            None => {
-                self.notify(format!("no open pull request for {branch}"));
-                None
-            }
-        }
-    }
-
-    /// `i`: opens the issues view for the selected session's project, or
-    /// says why it can't.
-    fn open_issues(&mut self) -> Option<Action> {
-        if !self.github_on {
-            self.notify(plugins::off("github"));
-            return None;
-        }
-        let selected = self.selected()?;
-        let name = selected.name.clone();
-        let Some(worktree) = selected.worktree.clone() else {
-            self.notify(format!("{name} isn't in a git repository"));
-            return None;
-        };
-        // What stopped GitHub listing pull requests would stop it listing
-        // issues too.
         if let Some(Err(reason)) = self.pull_requests.get(&worktree.project_path) {
             let reason = reason.clone();
             self.notify(reason);
             return None;
         }
+        Some(worktree)
+    }
+
+    /// `o`: opens the pull request of the selected session's branch, or
+    /// says why there's none to open.
+    fn open_pull_request(&mut self) -> Option<Action> {
+        let worktree = self.forge_worktree()?;
+        let Some(branch) = worktree.branch else {
+            let name = self.selected()?.name.clone();
+            self.notify(format!("{name} is on no branch"));
+            return None;
+        };
         let project = worktree.project_path;
-        self.issues = Some(IssuesView::new(project.clone(), worktree.project));
+        let Some(Ok((forge, _))) = self.pull_requests.get(&project) else {
+            let name = worktree.project;
+            self.notify(format!("still asking about {name}'s pull requests"));
+            return None;
+        };
+        let forge = *forge;
+        match self.pull_request(&project, &branch) {
+            Some(pull_request) => Some(Action::OpenInBrowser {
+                topic: Topic::PullRequest(pull_request.number),
+                project,
+            }),
+            None => {
+                self.notify(format!("no open {} for {branch}", forge.pull_request()));
+                None
+            }
+        }
+    }
+
+    /// `O`: opens the pull requests view for the selected session's
+    /// project, on the ones listed last until its forge lists them again,
+    /// or says why it can't.
+    fn open_pull_requests(&mut self) -> Option<Action> {
+        let worktree = self.forge_worktree()?;
+        let project = worktree.project_path;
+        let known = match self.pull_requests.get(&project) {
+            Some(Ok((_, pull_requests))) => Some(pull_requests.clone()),
+            _ => None,
+        };
+        let forge = self.forge_of(&project);
+        let view = PullRequestsView::new(project.clone(), worktree.project, forge, known);
+        self.pull_requests_view = Some(view);
+        Some(Action::ListPullRequests(project))
+    }
+
+    /// `i`: opens the issues view for the selected session's project, or
+    /// says why it can't.
+    fn open_issues(&mut self) -> Option<Action> {
+        let worktree = self.forge_worktree()?;
+        let project = worktree.project_path;
+        let forge = self.forge_of(&project);
+        self.issues = Some(IssuesView::new(project.clone(), worktree.project, forge));
         Some(Action::ListIssues(project))
     }
 
@@ -2340,10 +2484,11 @@ impl App {
             }),
             Step::Start(item) => {
                 self.backlog = None;
-                let branch = github::branch_for_issue(item.number, &item.text);
+                let branch = forge::branch_for_issue(item.number, &item.text);
                 let setup = self.launch_setup(false);
                 let launcher = Launcher::new(setup)
-                    .with_task(&item.text, &branch)
+                    .with_task(&item.text)
+                    .with_branch(&branch)
                     .for_backlog_item(item.number);
                 self.launcher = Some(launcher);
                 self.codex_models_wanted()
@@ -2351,32 +2496,104 @@ impl App {
         }
     }
 
-    /// Keys while the issues view is open: Esc closes it, Enter goes on to
-    /// start a session for the issue the bar is on, and the view takes the
-    /// rest.
+    /// Keys while the issues view is open: all of them are its.
     fn on_issues_key(&mut self, key: KeyEvent) -> Option<Action> {
-        match key.code {
-            KeyCode::Esc => self.issues = None,
-            KeyCode::Enter => return self.start_on_issue(),
-            _ => {
-                if let Some(view) = &mut self.issues {
-                    view.on_key(&key);
-                }
+        let view = self.issues.as_mut()?;
+        let project = view.project.clone();
+        match view.on_key(&key) {
+            issues::Step::Stay => None,
+            issues::Step::Close => {
+                self.issues = None;
+                None
+            }
+            issues::Step::Start(issue) => self.start_on_issue(&issue),
+            issues::Step::Open(number) => Some(Action::OpenInBrowser {
+                project,
+                topic: Topic::Issue(number),
+            }),
+            issues::Step::Comment { number, text } => Some(Action::Comment {
+                project,
+                topic: Topic::Issue(number),
+                text,
+            }),
+            issues::Step::Edit {
+                number,
+                title,
+                body,
+            } => Some(Action::EditIssue {
+                project,
+                number,
+                title,
+                body,
+            }),
+            issues::Step::Say(said) => {
+                self.notify(said);
+                None
             }
         }
-        None
     }
 
-    /// Closes the issues view and opens the new-session panel for the issue
-    /// the bar was on: a new worktree on a branch named after it, and the
-    /// task to fix it, with the issue's address so the agent can read it.
-    fn start_on_issue(&mut self) -> Option<Action> {
+    /// Keys while the pull requests view is open: all of them are its.
+    fn on_pull_requests_key(&mut self, key: KeyEvent) -> Option<Action> {
+        let view = self.pull_requests_view.as_mut()?;
+        let project = view.project.clone();
+        match view.on_key(&key) {
+            pull_requests::Step::Stay => None,
+            pull_requests::Step::Close => {
+                self.pull_requests_view = None;
+                None
+            }
+            pull_requests::Step::Start(pull_request) => self.start_on_pull_request(&pull_request),
+            pull_requests::Step::Diff(number) => {
+                let place = view.project_name.clone();
+                let diff = DiffView::of_pull_request(project, place, view.forge, number);
+                let read = diff.read();
+                // Over the view, which is there again when the diff closes.
+                self.view = Some(View::Diff(diff));
+                Some(read)
+            }
+            pull_requests::Step::Open(number) => Some(Action::OpenInBrowser {
+                project,
+                topic: Topic::PullRequest(number),
+            }),
+            pull_requests::Step::Comment { number, text } => Some(Action::Comment {
+                project,
+                topic: Topic::PullRequest(number),
+                text,
+            }),
+        }
+    }
+
+    /// Closes the pull requests view and opens the new-session panel in
+    /// `pull_request`'s worktree, with the task to work on it and its
+    /// address, so the agent can read it.
+    fn start_on_pull_request(&mut self, pull_request: &PullRequest) -> Option<Action> {
+        let view = self.pull_requests_view.take()?;
+        let forge = pull_request.forge;
+        let task = format!(
+            "Work on {} {}: {} ({})",
+            forge.pull_request(),
+            pull_request.label(),
+            pull_request.title,
+            pull_request.url
+        );
+        let mut setup = self.launch_setup(false);
+        setup.targets = vec![Target::PullRequest {
+            checkout: pull_request.checkout(&view.project),
+            label: format!("{} ⎇ {}", view.project_name, pull_request.local_branch),
+            choice: format!("{} {}", forge.pull_request(), pull_request.label()),
+        }];
+        setup.target = 0;
+        self.launcher = Some(Launcher::new(setup).with_task(&task));
+        self.codex_models_wanted()
+    }
+
+    /// Closes the issues view and opens the new-session panel for `issue`:
+    /// a new worktree on a branch named after it, and the task to fix it,
+    /// with the issue's address so the agent can read it.
+    fn start_on_issue(&mut self, issue: &Issue) -> Option<Action> {
         let view = self.issues.take()?;
-        let Some(issue) = view.highlighted() else {
-            self.issues = Some(view);
-            return None;
-        };
-        let branch = github::branch_for_issue(issue.number, &issue.title);
+        let branch = forge::branch_for_issue(issue.number, &issue.title);
         let task = format!(
             "Fix issue #{}: {} ({})",
             issue.number, issue.title, issue.url
@@ -2385,7 +2602,8 @@ impl App {
         if let Some(Target::NewWorktree { base, .. }) = setup.targets.get_mut(1) {
             *base = Some(view.project.clone());
         }
-        self.launcher = Some(Launcher::new(setup).with_task(&task, &branch));
+        let launcher = Launcher::new(setup).with_task(&task).with_branch(&branch);
+        self.launcher = Some(launcher);
         self.codex_models_wanted()
     }
 
@@ -2606,6 +2824,8 @@ impl App {
             prompt.input.insert_str(&text);
         } else if let Some(issues) = &mut self.issues {
             issues.on_paste(&text);
+        } else if let Some(view) = &mut self.pull_requests_view {
+            view.on_paste(&text);
         } else if let Some(backlog) = &mut self.backlog {
             backlog.on_paste(&text);
         } else if let Some(view) = &mut self.layouts {
@@ -5476,31 +5696,37 @@ mod tests {
     }
 
     fn pull_request(number: u64, branch: &str) -> PullRequest {
-        serde_json::from_value(serde_json::json!({
-            "number": number,
-            "title": "a change",
-            "headRefName": branch,
-            "isDraft": false,
-            "reviewDecision": "",
-            "statusCheckRollup": [],
-            "url": format!("https://github.com/acme/app/pull/{number}"),
-        }))
-        .unwrap()
+        PullRequest {
+            forge: Forge::GitHub,
+            number,
+            title: "a change".into(),
+            author: "ana".into(),
+            branch: branch.into(),
+            from_fork: false,
+            local_branch: branch.into(),
+            draft: false,
+            checks: forge::Checks::None,
+            review: forge::Review::None,
+            updated_at: "2026-10-02T09:30:00Z".into(),
+            url: format!("https://github.com/acme/app/pull/{number}"),
+        }
+    }
+
+    fn on_github(pull_requests: Vec<PullRequest>) -> Result<(Forge, Vec<PullRequest>), String> {
+        Ok((Forge::GitHub, pull_requests))
     }
 
     #[test]
     fn o_opens_the_pull_request_of_the_selected_sessions_branch() {
         let mut app = App::new(None);
         app.set_sessions(vec![in_repo("fixer", "fix-login")]);
-        app.set_pull_requests(
-            PathBuf::from("/code/app"),
-            Ok(vec![pull_request(57, "fix-login")]),
-        );
+        let found = on_github(vec![pull_request(57, "fix-login")]);
+        app.set_pull_requests(PathBuf::from("/code/app"), found);
         assert_eq!(
             press(&mut app, KeyCode::Char('o')),
-            Some(Action::OpenPullRequest {
+            Some(Action::OpenInBrowser {
                 project: PathBuf::from("/code/app"),
-                number: 57
+                topic: Topic::PullRequest(57),
             })
         );
     }
@@ -5510,31 +5736,135 @@ mod tests {
         let mut app = App::new(None);
         app.set_sessions(vec![in_repo("fixer", "fix-login")]);
         assert_eq!(press(&mut app, KeyCode::Char('o')), None);
-        assert_eq!(app.notice(), Some("still asking GitHub about app"));
+        assert_eq!(app.notice(), Some("still asking about app's pull requests"));
 
-        app.set_pull_requests(
-            PathBuf::from("/code/app"),
-            Ok(vec![pull_request(9, "other")]),
-        );
+        let found = on_github(vec![pull_request(9, "other")]);
+        app.set_pull_requests(PathBuf::from("/code/app"), found);
         press(&mut app, KeyCode::Char('o'));
         assert_eq!(app.notice(), Some("no open pull request for fix-login"));
 
-        let not_github = "app's origin isn't on GitHub".to_string();
-        app.set_pull_requests(PathBuf::from("/code/app"), Err(not_github.clone()));
+        let found = Ok((Forge::GitLab, Vec::new()));
+        app.set_pull_requests(PathBuf::from("/code/app"), found);
         press(&mut app, KeyCode::Char('o'));
-        assert_eq!(app.notice(), Some(not_github.as_str()));
+        assert_eq!(app.notice(), Some("no open merge request for fix-login"));
+
+        let not_on_one = "app's remote is on this machine, not GitHub or GitLab".to_string();
+        app.set_pull_requests(PathBuf::from("/code/app"), Err(not_on_one.clone()));
+        press(&mut app, KeyCode::Char('o'));
+        assert_eq!(app.notice(), Some(not_on_one.as_str()));
     }
 
-    fn issue(number: u64, title: &str) -> github::Issue {
-        serde_json::from_value(serde_json::json!({
-            "number": number,
-            "title": title,
-            "labels": [],
-            "updatedAt": "2026-10-02T09:30:00Z",
-            "author": {"login": "ana"},
-            "url": format!("https://github.com/acme/app/issues/{number}"),
-        }))
-        .unwrap()
+    #[test]
+    fn a_worktree_finds_a_forks_pull_request_by_its_own_branch() {
+        let mut app = App::new(None);
+        app.set_sessions(vec![in_repo("planner", "main")]);
+        let fork = PullRequest {
+            from_fork: true,
+            local_branch: "ana/main".into(),
+            ..pull_request(58, "main")
+        };
+        app.set_pull_requests(PathBuf::from("/code/app"), on_github(vec![fork]));
+        assert!(app.pull_request(Path::new("/code/app"), "main").is_none());
+        assert!(
+            app.pull_request(Path::new("/code/app"), "ana/main")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn capital_o_lists_the_pull_requests_and_enter_starts_in_one() {
+        let mut app = with_agents(&["claude"], vec![in_repo("planner", "main")]);
+        let found = on_github(vec![pull_request(57, "fix-login")]);
+        app.set_pull_requests(PathBuf::from("/code/app"), found);
+        assert_eq!(
+            press(&mut app, KeyCode::Char('O')),
+            Some(Action::ListPullRequests(PathBuf::from("/code/app")))
+        );
+        // What was listed last shows while the forge is asked again.
+        let view = app.pull_requests_view().unwrap();
+        assert_eq!(view.highlighted().map(|pr| pr.number), Some(57));
+
+        press(&mut app, KeyCode::Enter);
+        assert!(app.pull_requests_view().is_none());
+        let panel = app.launcher().unwrap();
+        assert_eq!(panel.title(), "New session · app ⎇ fix-login");
+        assert_eq!(
+            panel.task().text(),
+            "Work on pull request #57: a change (https://github.com/acme/app/pull/57)"
+        );
+        let Some(Action::Start { place, .. }) = press(&mut app, KeyCode::Enter) else {
+            panic!("Enter should start the session");
+        };
+        assert_eq!(
+            place,
+            Place::PullRequest(Checkout {
+                project: PathBuf::from("/code/app"),
+                branch: "fix-login".into(),
+                fetch: "fix-login".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn a_pull_requests_diff_opens_over_the_view_and_closes_back_to_it() {
+        let mut app = App::new(None);
+        app.set_sessions(vec![in_repo("planner", "main")]);
+        let found = on_github(vec![pull_request(57, "fix-login")]);
+        app.set_pull_requests(PathBuf::from("/code/app"), found);
+        press(&mut app, KeyCode::Char('O'));
+        let ctrl_d = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL);
+        assert_eq!(
+            app.on_key(ctrl_d),
+            Some(Action::ReadDiff {
+                dir: PathBuf::from("/code/app"),
+                against: Against::PullRequest {
+                    forge: Forge::GitHub,
+                    number: 57
+                },
+            })
+        );
+        assert!(matches!(app.view(), Some(View::Diff(_))));
+        press(&mut app, KeyCode::Esc);
+        assert!(app.view().is_none());
+        assert!(app.pull_requests_view().is_some());
+    }
+
+    #[test]
+    fn a_comment_goes_to_the_forge_and_its_answer_comes_back_to_the_view() {
+        let mut app = App::new(None);
+        app.set_sessions(vec![in_repo("planner", "main")]);
+        let found = on_github(vec![pull_request(57, "fix-login")]);
+        app.set_pull_requests(PathBuf::from("/code/app"), found);
+        press(&mut app, KeyCode::Char('O'));
+        app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        type_text(&mut app, "LGTM");
+        assert_eq!(
+            press(&mut app, KeyCode::Enter),
+            Some(Action::Comment {
+                project: PathBuf::from("/code/app"),
+                topic: Topic::PullRequest(57),
+                text: "LGTM".into(),
+            })
+        );
+        app.commented(Path::new("/code/app"), Topic::PullRequest(57), Ok(()));
+        assert_eq!(app.notice(), Some("commented on #57"));
+        assert!(app.pull_requests_view().unwrap().comment.is_none());
+        // It's read again, with the comment.
+        assert_eq!(
+            app.topic_to_read(),
+            Some((PathBuf::from("/code/app"), Topic::PullRequest(57)))
+        );
+    }
+
+    fn issue(number: u64, title: &str) -> Issue {
+        Issue {
+            number,
+            title: title.into(),
+            labels: Vec::new(),
+            updated_at: "2026-10-02T09:30:00Z".into(),
+            author: "ana".into(),
+            url: format!("https://github.com/acme/app/issues/{number}"),
+        }
     }
 
     #[test]
@@ -5546,7 +5876,7 @@ mod tests {
         );
         app.set_issues(
             Path::new("/code/app"),
-            Ok(vec![issue(42, "Fix login redirect")]),
+            Ok((Forge::GitHub, vec![issue(42, "Fix login redirect")])),
         );
         press(&mut app, KeyCode::Enter);
         assert!(app.issues_view().is_none());
