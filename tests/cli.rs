@@ -1854,6 +1854,47 @@ fn w_makes_the_new_worktree_on_a_branch_with_a_made_up_name() {
 }
 
 #[test]
+fn a_session_started_while_a_list_of_sessions_was_on_its_way_keeps_the_keyboard() {
+    let crystal = Crystal::new();
+    let repo = git_repo(crystal.dir.path(), "app");
+    let repo_arg = repo.to_str().unwrap();
+    crystal.ok(&["new", "-n", "planner", "-c", repo_arg, "sleep", "30"]);
+
+    // A slow `git worktree add` keeps the TUI busy long enough for a list
+    // of sessions asked for before the new one to arrive after it.
+    let bin = fake_claude(crystal.dir.path());
+    slow_worktree_add(&bin);
+    let path = path_of(&[&bin]);
+    let mut tui = crystal.attach_with_env(&[], &[("PATH", &path)]);
+    tui.shows("▸ planner");
+    tui.type_keys("w");
+    tui.shows("New session · app");
+    tui.type_keys("Plan it\r");
+    tui.shows("typing into");
+    thread::sleep(Duration::from_millis(500));
+    tui.shows("typing into");
+}
+
+/// Puts a `git` in `bin` that takes a second and a half over `worktree
+/// add`, then runs the real one.
+fn slow_worktree_add(bin: &Path) {
+    let found = std::process::Command::new("sh")
+        .args(["-c", "command -v git"])
+        .output()
+        .unwrap();
+    let git = String::from_utf8(found.stdout).unwrap();
+    let script = format!(
+        "#!/bin/sh\ncase \"$*\" in *\"worktree add\"*) sleep 1.5 ;; esac\nexec {} \"$@\"\n",
+        git.trim()
+    );
+    let slow = bin.join("git");
+    std::fs::write(&slow, script).unwrap();
+    let mut permissions = std::fs::metadata(&slow).unwrap().permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+    std::fs::set_permissions(&slow, permissions).unwrap();
+}
+
+#[test]
 fn a_new_worktrees_made_up_name_can_be_typed_over() {
     let crystal = Crystal::new();
     let repo = git_repo(crystal.dir.path(), "app");

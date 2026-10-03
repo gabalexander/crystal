@@ -127,7 +127,11 @@ pub enum Event {
     /// The terminal changed size. The next draw lays everything out again
     /// and resizes the pane's session to fit.
     Resize,
-    Sessions(Vec<SessionInfo>),
+    /// The sessions, as the daemon listed them when asked at `asked`.
+    Sessions {
+        sessions: Vec<SessionInfo>,
+        asked: Instant,
+    },
     /// Every flow run, as the daemon listed them.
     Flows(Vec<FlowRun>),
     /// Output from the session in the pane with this id.
@@ -317,6 +321,7 @@ pub fn run(socket: &Path) -> Result<()> {
         list_worktrees_now,
         theme: Theme::from_env(config.theme),
         started: Instant::now(),
+        sessions_asked: Instant::now(),
         searches: Arc::new(AtomicU64::new(0)),
         link_clicked: false,
         kept_tabs: tabs::Tabs::default(),
@@ -444,6 +449,9 @@ struct Tui {
     theme: Theme,
     /// When the TUI started: the working mark turns with the time since.
     started: Instant,
+    /// When the daemon was asked for the sessions the TUI shows: a list
+    /// asked for earlier, which a slow poll can bring in late, is dropped.
+    sessions_asked: Instant,
     /// The tabs as they were last kept.
     kept_tabs: tabs::Tabs,
     /// How many searches find in files has asked for: a search that isn't
@@ -771,7 +779,11 @@ impl Tui {
             }
             Event::CodexModels(models) => self.app.set_codex_models(models),
             Event::Resize => {}
-            Event::Sessions(sessions) => {
+            // A list asked for before the one the TUI has may lack a session
+            // started since, which would leave the sidebar as it came.
+            Event::Sessions { asked, .. } if asked < self.sessions_asked => {}
+            Event::Sessions { sessions, asked } => {
+                self.sessions_asked = asked;
                 self.attach_again(&sessions);
                 self.set_sessions(sessions);
             }
@@ -1823,7 +1835,9 @@ impl Tui {
         if self.app.shows_flows() {
             self.app.set_flows(list_flows(&self.socket));
         }
+        let asked = Instant::now();
         let sessions = list_sessions(&self.socket, false)?;
+        self.sessions_asked = asked;
         self.set_sessions(sessions);
         Ok(())
     }
@@ -2331,6 +2345,7 @@ fn spawn_session_poller(socket: PathBuf, events: Sender<Event>, polled: Polled) 
             // A daemon that has gone away has no sessions left. One that
             // can't say, say because it's a newer crystal than this TUI,
             // leaves the list as it was, and says why, once.
+            let asked = Instant::now();
             let sessions = match list_sessions(&socket, false) {
                 Ok(sessions) => sessions,
                 Err(err) => {
@@ -2346,7 +2361,7 @@ fn spawn_session_poller(socket: PathBuf, events: Sender<Event>, polled: Polled) 
             };
             said = None;
             let projects = projects_of(&sessions);
-            if events.send(Event::Sessions(sessions)).is_err() {
+            if events.send(Event::Sessions { sessions, asked }).is_err() {
                 return;
             }
             if let Ok(Some(Response::Spending(spending))) =
