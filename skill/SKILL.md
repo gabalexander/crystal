@@ -84,7 +84,8 @@ crystal ls --json
 ```
 
 One object per session: `name`, `status` (the word `crystal ls` shows), `state`, `activity`, `cwd`,
-`command`, and `worktree` with `project`, `branch` and `path` when it's in a git repository.
+`command`, `worktree` with `project`, `branch` and `path` when it's in a git repository, and `front`: what's
+in front in its terminal, `{"kind": "agent", "program": "claude", …}`, a `shell` or another `program`.
 
 ## Clean up
 

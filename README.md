@@ -137,11 +137,19 @@ session leads its worktree.
 | `▸` | running: an agent at its prompt, or any other program |
 | `■` | ended: muted when it exited well, red when it failed; the pane's header says how |
 
+Each row also says what's in front in the session's terminal when its name doesn't already say it: `claude`,
+`codex`, `vite`, `zsh`. crystal asks the terminal which program its keys go to, about once a second, so a
+shell you typed `claude` into shows Claude Code, and shows the shell again when Claude exits. A shell at its
+prompt has a muted `▸`, so the agents stand out. It recognises the agents crystal can start, however they're
+installed: Claude Code's own binary, named after its version, or an agent npm runs with `node`.
+
 crystal knows what an agent is doing in two ways. When it starts Claude Code itself, it adds hooks with
 `--settings`, so your settings files are left alone and your own hooks still run. And for every session it
 reads the screen: the spinner an agent puts in its title, "esc to interrupt" while it works, the question
 it asks before a command. The screen covers agents without hooks, like Codex or a Claude you started from a
 shell, and what hooks never say: a turn you cut short with Esc, or work carrying on once you've said yes.
+The screen only counts while an agent is in front: a shell or a build printing an agent's words never shows
+as waiting, and when an agent exits back to its shell, what it was doing goes with it.
 
 When a session comes to need you while you're looking elsewhere (its agent asks you something, or finishes a
 turn nobody was watching), crystal shows a desktop notification, like "claude-2 is waiting on you · app
@@ -209,10 +217,10 @@ crystal ssh box                             # crystal's TUI on another machine (
 
 ```
 $ crystal ls
-NAME    STATE     PID    PROJECT  BRANCH     DIRECTORY                       COMMAND
-claude  waiting   41210  app      main       ~/code/app                      claude
-fixer   working   41377  app      fix/login  ~/code/app.worktrees/fix-login  claude
-review  exited 0  41388  app      main       ~/code/app                      codex
+NAME    STATE     PID    PROJECT  BRANCH     DIRECTORY                       PROGRAM  COMMAND
+claude  waiting   41210  app      main       ~/code/app                      claude   claude
+fixer   working   41377  app      fix/login  ~/code/app.worktrees/fix-login  claude   zsh
+review  exited 0  41388  app      main       ~/code/app                      codex    codex
 ```
 
 `crystal new -w <branch>` makes the worktree beside the repository, in `<repo>.worktrees/<branch>`, with any
@@ -357,13 +365,16 @@ session, plus `status`, the word the STATE column shows:
       "main": true,
       "branch": "main"
     },
+    "front": { "kind": "agent", "program": "claude", "name": "Claude Code" },
     "status": "waiting"
   }
 ]
 ```
 
 `state` is `"running"`, `{"exited": {"code": 3}}` or `{"signaled": {"signal": "Terminated"}}`; `activity` is
-`null` for a program that doesn't report what it's doing; `worktree` is `null` outside a git repository. New
+`null` for a program that doesn't report what it's doing; `worktree` is `null` outside a git repository;
+`front` is what's in front in the terminal: `{"kind": "agent", …}`, `{"kind": "shell", "name": "zsh"}`,
+`{"kind": "program", "name": "vite"}` or `{"kind": "task"}`, and `null` until it's been looked at. New
 fields may appear; none goes away. With no daemon running, it prints `[]`.
 
 #### A skill for Claude Code

@@ -81,6 +81,7 @@ is: it's the one request every version must understand.
   `codex resume`
 - `src/hook.rs`: `crystal hook <agent>`: what those hooks run, to tell the daemon
 - `src/agent_screen.rs`: reading what an agent is doing off its screen and title
+- `src/front.rs`: what's in front in a session's terminal (agent, shell or program), from its foreground process
 - `src/typing.rs`: typing into a session the way a person would: pastes marked, Enter on its own
 - `src/session.rs`: one program in a PTY, or a task: spawn, exit status, stop, and its screen (vt100) and viewers
 - `src/task.rs`: tasks: Claude Code run without a terminal (`claude -p`), one run per prompt or follow-up
