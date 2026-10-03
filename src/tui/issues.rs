@@ -17,7 +17,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Paragraph, Wrap};
+use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
@@ -196,6 +196,9 @@ fn days_since_epoch(year: i64, month: i64, day: i64) -> i64 {
 /// Draws the view in `area`: a heading, the filter, the list, and the
 /// highlighted issue's text. `now` is seconds since the Unix epoch.
 pub fn draw(frame: &mut Frame, view: &IssuesView, theme: &Theme, now: u64, area: Rect) {
+    // A style alone would leave the characters drawn there before, the
+    // sidebar and the panes, showing through.
+    frame.render_widget(Clear, area);
     frame.render_widget(Block::new().style(theme.base()), area);
     let [heading, filter, rest] = Layout::vertical([
         Constraint::Length(1),
@@ -356,7 +359,10 @@ fn draw_note(frame: &mut Frame, theme: &Theme, note: &str, area: Rect) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ThemeName;
     use crate::github::{Author, Label};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
 
     fn issue(number: u64, title: &str, label: &str) -> Issue {
         Issue {
@@ -385,6 +391,31 @@ mod tests {
 
     fn numbers(view: &IssuesView) -> Vec<u64> {
         view.shown().iter().map(|issue| issue.number).collect()
+    }
+
+    /// Draws `view` over a screen full of `¤`, the way it opens over the
+    /// sidebar and the panes, and returns what's on the screen.
+    fn drawn_over_the_screen(view: &IssuesView) -> String {
+        let theme = Theme::new(ThemeName::Dark, false);
+        let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                let behind = "¤".repeat(usize::from(area.width * area.height));
+                frame.render_widget(Paragraph::new(behind).wrap(Wrap { trim: false }), area);
+                draw(frame, view, &theme, 1_000, area);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        buffer.content().iter().map(|cell| cell.symbol()).collect()
+    }
+
+    #[test]
+    fn nothing_behind_the_issues_shows_through_them() {
+        let mut view = view_of(vec![issue(42, "Login loops", "bug")]);
+        assert!(!drawn_over_the_screen(&view).contains('¤'));
+        type_text(&mut view, "nothing like it");
+        assert!(!drawn_over_the_screen(&view).contains('¤'));
     }
 
     #[test]
