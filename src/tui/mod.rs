@@ -18,6 +18,7 @@ mod groups;
 mod help;
 mod issues;
 pub(crate) mod launcher;
+mod layouts;
 mod memory_view;
 mod mouse;
 mod pane;
@@ -47,6 +48,7 @@ use app::{Action, App, Focus, Hit, Place, PluginKey, PluginPane, Slot};
 use backlog_view::BacklogChange;
 use crossterm::event::{Event as TerminalEvent, KeyEvent, KeyEventKind, MouseEvent};
 use diff_view::Against;
+use layouts::Which;
 use pane::Pane;
 use ratatui::DefaultTerminal;
 use ratatui::layout::Rect;
@@ -208,6 +210,7 @@ pub fn run(socket: &Path) -> Result<()> {
         started: Instant::now(),
         memory_path: launcher::memory_path(socket),
         tabs_path: tabs::path(socket),
+        layouts_path: layouts::path(socket),
         kept_tabs: tabs::Tabs::default(),
         quitting: false,
         overlay: None,
@@ -311,6 +314,8 @@ struct Tui {
     /// Where the tabs are kept, and the tabs as they were last kept there.
     tabs_path: PathBuf,
     kept_tabs: tabs::Tabs,
+    /// Where the layouts are kept.
+    layouts_path: PathBuf,
     quitting: bool,
 }
 
@@ -756,6 +761,42 @@ impl Tui {
                 }
             }
             Action::ClosePluginPane => self.close_plugin_pane(),
+            Action::ListLayouts => {
+                let found = layouts::load(&self.layouts_path);
+                self.app.show_layouts(found, None);
+            }
+            Action::SaveLayout(name) => {
+                let mut kept = layouts::load(&self.layouts_path).map_err(anyhow::Error::msg)?;
+                let tabs = self.app.tabs_to_keep();
+                let replaced = kept.save(&name, tabs, seconds_since_epoch());
+                layouts::save(&self.layouts_path, &kept)?;
+                self.app
+                    .show_layouts(Ok(kept), Some(&Which::Saved(name.clone())));
+                let how = if replaced { "over" } else { "as" };
+                self.app.notify(format!("saved your tabs {how} {name}"));
+            }
+            Action::RestoreLayout(which) => {
+                let mut kept = layouts::load(&self.layouts_path).map_err(anyhow::Error::msg)?;
+                let current = self.app.tabs_to_keep();
+                let name = match &which {
+                    Which::Saved(name) => name.clone(),
+                    Which::Before => "the tabs from before".to_string(),
+                };
+                let Some(tabs) = kept.restore(&which, current, seconds_since_epoch()) else {
+                    bail!("{name} can't be restored: it's from another crystal");
+                };
+                layouts::save(&self.layouts_path, &kept)?;
+                self.app.restore_layout(tabs, &name);
+            }
+            Action::RemoveLayout(which) => {
+                let mut kept = layouts::load(&self.layouts_path).map_err(anyhow::Error::msg)?;
+                kept.remove(&which);
+                layouts::save(&self.layouts_path, &kept)?;
+                self.app.show_layouts(Ok(kept), None);
+                if let Which::Saved(name) = which {
+                    self.app.notify(format!("removed {name}"));
+                }
+            }
             Action::Kill(name) => {
                 client::ask(&self.socket, &Request::Kill { name }, false)?;
                 self.refresh_sessions()?;

@@ -12,6 +12,7 @@ use super::finder;
 use super::help;
 use super::issues;
 use super::launcher;
+use super::layouts::{self, LayoutsView};
 use super::memory_view;
 use super::pane::Pane;
 use super::plugins_view;
@@ -382,6 +383,9 @@ pub fn draw(frame: &mut Frame, app: &App, panes: &[Pane], overlay: Option<&Pane>
     }
     if let Some(view) = app.backlog_view() {
         backlog_view::draw(frame, view, look.theme, middle);
+    }
+    if let Some(view) = app.layouts_view() {
+        layouts::draw(frame, view, look.theme, look.now, middle);
     }
     if let Some(panel) = app.launcher() {
         // Over the panes, beside the sidebar.
@@ -905,6 +909,8 @@ fn draw_footer(frame: &mut Frame, app: &App, panes: &[Pane], look: &Look, area: 
         frame.render_widget(hint_spans(ISSUES_HINTS, theme), area);
     } else if let Some(view) = app.backlog_view() {
         draw_backlog_footer(frame, view, theme, area);
+    } else if let Some(view) = app.layouts_view() {
+        draw_layouts_footer(frame, app.notice(), view, theme, area);
     } else if let Some(name) = app.closing() {
         let question = format!("close {name}'s task? d done · f failed · any other key, not yet");
         frame.render_widget(question_line(&question, theme), area);
@@ -1109,6 +1115,39 @@ fn draw_backlog_footer(frame: &mut Frame, view: &BacklogView, theme: &Theme, are
         frame.render_widget(question_line(&question, theme), area);
     } else {
         frame.render_widget(hint_spans(BACKLOG_HINTS, theme), area);
+    }
+}
+
+/// The footer while the layouts view is open: the name the tabs are being
+/// saved as, the question `x` asks, what the last key did, or the view's
+/// keys.
+fn draw_layouts_footer(
+    frame: &mut Frame,
+    notice: Option<&str>,
+    view: &LayoutsView,
+    theme: &Theme,
+    area: Rect,
+) {
+    if let Some(naming) = &view.naming {
+        let label = " save the tabs as: ";
+        let line = Line::from(vec![
+            Span::styled(
+                label,
+                Style::new().fg(theme.accent).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(naming.text().to_string(), Style::new().fg(theme.text)),
+        ]);
+        frame.render_widget(line, area);
+        // The label is plain ASCII, so its length in bytes is its width.
+        let column = area.x + (label.len() + naming.cursor()) as u16;
+        frame.set_cursor_position((column.min(area.right().saturating_sub(1)), area.y));
+    } else if let Some(question) = view.removing() {
+        frame.render_widget(question_line(&question, theme), area);
+    } else if let Some(notice) = notice {
+        let notice = Line::styled(format!(" {notice}"), Style::new().fg(theme.failed));
+        frame.render_widget(notice, area);
+    } else {
+        frame.render_widget(hint_spans(layouts::HINTS, theme), area);
     }
 }
 

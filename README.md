@@ -96,6 +96,7 @@ and the footer says where you are and offers the keys that matter there.
 | `&` | close the tab you're in, and kill its sessions once you've said `y` |
 | `[` / `]`, `1-9` | go to the tab before or after this one, or to the tab with that number |
 | `>` | move the selected session to another tab: then a tab's number, or `t` for a new one |
+| `S` | your saved [layouts](#layouts): save your tabs as one, or put them back the way one has them |
 | `n` | start a new session from [the new-session panel](#starting-a-session), and type into it |
 | `w` | the same, in a new worktree on a branch with a made-up name, like `brave-otter` |
 | `W` | remove the selected worktree, once nothing runs in it and you've said `y` |
@@ -311,6 +312,20 @@ goes in the tab with the rest of its run. `>` moves the selected session to anot
 number next, or `t` to make a new tab for it. `&` closes the tab you're in and kills the sessions in it, once
 you've said `y`; an empty tab closes at once. There's always one tab, and nine at most. They're kept beside the
 daemon's state, in `~/.local/state/crystal/`, so they're there when you open the TUI again.
+
+### Layouts
+
+A layout is your tabs saved under a name, to put back later: each tab's name and sessions, its splits and the
+order of its panes, its float, whether it's zoomed, and which tab was in front. `S` lists them, the one saved
+last first, each with how many tabs and sessions it has and how many of those have gone since. `s` saves your
+tabs as they are now under a name you type, in place of the layout of that name if there's one already;
+`Enter` puts your tabs back the way the layout has them; `x` removes it, once you've said `y`; `Esc` closes the
+list.
+
+A layout names sessions; it doesn't start them. Restoring one arranges the sessions running now: those it
+names that have gone since are left out, and those it doesn't name join the tab in front. The tabs a restore
+replaces are kept, at the top of the list as `↶ before` the layout's name, so `Enter` on that takes you back,
+once. Layouts are kept beside your tabs, in `~/.local/state/crystal/layouts.json`.
 
 ### Zoom, copy mode and search
 
