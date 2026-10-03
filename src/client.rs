@@ -2,7 +2,9 @@
 
 use crate::env;
 use crate::git;
-use crate::protocol::{self, NewSession, NewTask, Request, Response, SessionInfo, State, TaskSpec};
+use crate::protocol::{
+    self, Backlog, NewSession, NewTask, Request, Response, SessionInfo, State, TaskSpec,
+};
 use crate::socket;
 use anyhow::{Context, Result, bail};
 use std::fs::OpenOptions;
@@ -118,6 +120,28 @@ pub fn rename(socket: &Path, name: &str, new_name: &str) -> Result<()> {
     };
     ask_running(socket, &request)?;
     Ok(())
+}
+
+/// Closes the task of the session called `name`: done, or `failed`, with a
+/// line on how it went.
+pub fn close_task(socket: &Path, name: &str, failed: bool, summary: &str) -> Result<()> {
+    let request = Request::Close {
+        id: None,
+        name: Some(name.to_string()),
+        failed,
+        summary: summary.to_string(),
+    };
+    ask_running(socket, &request)?;
+    Ok(())
+}
+
+/// The backlog of the project `dir` is in: its open items, and with `all`
+/// those done too. Starts the daemon if it isn't running.
+pub fn backlog(socket: &Path, dir: PathBuf, all: bool) -> Result<Backlog> {
+    match ask(socket, &Request::BacklogList { dir, all }, true)? {
+        Some(Response::Backlog(backlog)) => Ok(backlog),
+        _ => bail!("the daemon didn't send the backlog"),
+    }
 }
 
 /// Runs the ended session called `name` again, with this process's

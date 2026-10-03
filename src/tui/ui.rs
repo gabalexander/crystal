@@ -5,6 +5,7 @@
 //! never changes it.
 
 use super::app::{App, Filter, Focus, Hit, Prompt, Question, Slot, View};
+use super::backlog_view::{self, BacklogView};
 use super::diff_view;
 use super::finder;
 use super::help;
@@ -240,11 +241,14 @@ pub fn draw(frame: &mut Frame, app: &App, panes: &[Pane], look: &Look) {
         draw_pane(frame, app, look, slot, *area, panes);
     }
     draw_rules_between(frame, look, &areas.panes);
+    // Over everything between the top bar and the footer.
+    let below_top = areas.top.bottom();
+    let middle = Rect::new(0, below_top, frame.area().width, areas.footer.y - below_top);
     if let Some(view) = app.issues_view() {
-        // Over everything between the top bar and the footer.
-        let below_top = areas.top.bottom();
-        let middle = Rect::new(0, below_top, frame.area().width, areas.footer.y - below_top);
         issues::draw(frame, view, look.theme, look.now, middle);
+    }
+    if let Some(view) = app.backlog_view() {
+        backlog_view::draw(frame, view, look.theme, middle);
     }
     if let Some(panel) = app.launcher() {
         // Over the panes, beside the sidebar.
@@ -392,10 +396,38 @@ fn header_notes(app: &App, slot: Slot, session: &SessionInfo, back: usize) -> Ve
     if slot != Slot::Selected && selected {
         notes.push("selected".to_string());
     }
+    if app.shows_tasks()
+        && let Some(note) = task_note(session)
+    {
+        notes.push(note);
+    }
     if back > 0 {
         notes.push(format!("↑ {back} lines"));
     }
     notes
+}
+
+/// The longest a task's goal or summary gets in a pane's header.
+const TASK_NOTE_LENGTH: usize = 40;
+
+/// A session's task, for its pane's header: what it was asked to do while
+/// it's open, and how it went, ✓ or ✗, once it's closed.
+fn task_note(session: &SessionInfo) -> Option<String> {
+    let task = session.task.as_ref()?;
+    let goal = task.goal.lines().next().unwrap_or("");
+    let note = match &task.outcome {
+        None => format!("task: {}", fit(goal, TASK_NOTE_LENGTH)),
+        Some(outcome) => {
+            let mark = if outcome.failed { "✗" } else { "✓" };
+            let said = if outcome.summary.is_empty() {
+                goal
+            } else {
+                &outcome.summary
+            };
+            format!("{mark} {}", fit(said, TASK_NOTE_LENGTH))
+        }
+    };
+    Some(note)
 }
 
 /// A pane's header line, `width` columns wide: the session's mark and name,
@@ -505,6 +537,11 @@ fn draw_footer(frame: &mut Frame, app: &App, look: &Look, area: Rect) {
         draw_prompt(frame, theme, prompt, area);
     } else if app.issues_view().is_some() {
         frame.render_widget(hint_spans(ISSUES_HINTS, theme), area);
+    } else if let Some(view) = app.backlog_view() {
+        draw_backlog_footer(frame, view, theme, area);
+    } else if let Some(name) = app.closing() {
+        let question = format!("close {name}'s task? d done · f failed · any other key, not yet");
+        frame.render_widget(question_line(&question, theme), area);
     } else if let Some(filter) = app.filter() {
         draw_filter(frame, theme, filter, app.matches().len(), area);
     } else if let Some(confirm) = app.confirm() {
@@ -594,6 +631,39 @@ const ISSUES_HINTS: &[(&str, &str)] = &[
     ("enter", "start a session on it"),
     ("esc", "close"),
 ];
+
+/// The keys while the backlog view is open.
+const BACKLOG_HINTS: &[(&str, &str)] = &[
+    ("enter", "start a task"),
+    ("a", "add"),
+    ("space", "done/undone"),
+    ("x", "remove"),
+    ("/", "filter"),
+    ("esc", "close"),
+];
+
+/// The footer while the backlog view is open: the item being added, the
+/// question `x` asks, or the view's keys.
+fn draw_backlog_footer(frame: &mut Frame, view: &BacklogView, theme: &Theme, area: Rect) {
+    if let Some(adding) = &view.adding {
+        let label = " add to the backlog: ";
+        let line = Line::from(vec![
+            Span::styled(
+                label,
+                Style::new().fg(theme.accent).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(adding.text().to_string(), Style::new().fg(theme.text)),
+        ]);
+        frame.render_widget(line, area);
+        // The label is plain ASCII, so its length in bytes is its width.
+        let column = area.x + (label.len() + adding.cursor()) as u16;
+        frame.set_cursor_position((column.min(area.right().saturating_sub(1)), area.y));
+    } else if let Some(question) = view.removing() {
+        frame.render_widget(question_line(&question, theme), area);
+    } else {
+        frame.render_widget(hint_spans(BACKLOG_HINTS, theme), area);
+    }
+}
 
 /// A line of key hints, keys a touch brighter than what they do.
 fn hint_spans<'a>(hints: &[(&str, &str)], theme: &Theme) -> Line<'a> {
@@ -706,6 +776,8 @@ fn draw_prompt(frame: &mut Frame, theme: &Theme, prompt: &Prompt, area: Rect) {
     let question = match prompt.question {
         Question::Command(_) => " new session: ",
         Question::Rename(_) => " new name: ",
+        Question::CloseTask { failed: false, .. } => " done; what was done: ",
+        Question::CloseTask { failed: true, .. } => " failed; why: ",
     };
     let line = Line::from(vec![
         Span::styled(

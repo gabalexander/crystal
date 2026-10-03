@@ -30,16 +30,21 @@ pub fn ensure_enabled(config: &Config) -> Result<()> {
     Ok(())
 }
 
-/// What an agent given a task is told about it: how to close it, and where
-/// to put what it notices for later.
-pub fn instructions() -> String {
-    "crystal is tracking what you were asked to do as a task. When it's \
-     finished, run `crystal done \"<one line on what you did>\"`; if you \
-     can't finish it, run `crystal done --failed \"<why>\"`. Anything you \
-     notice that's worth doing later but isn't part of this task, put on \
-     the project's backlog with `crystal backlog add \"<what>\"` rather \
-     than doing it now."
-        .to_string()
+/// What an agent given a task is told about it: how to close it, and, with
+/// `backlog` on, where to put what it notices for later.
+pub fn instructions(backlog: bool) -> String {
+    let mut text = "crystal is tracking what you were asked to do as a task. When it's \
+                    finished, run `crystal done \"<one line on what you did>\"`; if you \
+                    can't finish it, run `crystal done --failed \"<why>\"`."
+        .to_string();
+    if backlog {
+        text.push_str(
+            " Anything you notice that's worth doing later but isn't part of this \
+             task, put on the project's backlog with `crystal backlog add \"<what>\"` \
+             rather than doing it now.",
+        );
+    }
+    text
 }
 
 /// The file a project's closed tasks are kept in: one JSON line each, so a

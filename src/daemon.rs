@@ -373,6 +373,7 @@ impl Daemon {
                 failed,
                 summary,
             } => {
+                tasks::ensure_enabled(&settings())?;
                 let mut sessions = self.sessions.lock().unwrap();
                 let session = match (id, name) {
                     (Some(id), _) => with_id(&mut sessions, &id)?,
@@ -383,9 +384,12 @@ impl Daemon {
                 self.write_down_closed(session.cwd(), &closed);
                 Ok(Response::Done)
             }
-            Request::Tasks { dir, all } => Ok(Response::Tasks {
-                tasks: self.tasks(&dir, all),
-            }),
+            Request::Tasks { dir, all } => {
+                tasks::ensure_enabled(&settings())?;
+                Ok(Response::Tasks {
+                    tasks: self.tasks(&dir, all),
+                })
+            }
             Request::BacklogList { dir, all } => {
                 backlog::ensure_enabled(&settings())?;
                 let project = project::of(&dir);
@@ -614,9 +618,10 @@ fn start(
     let mut asked = command.clone();
     // With tasks off, a session started with something to do is just a
     // session.
-    let task = task.filter(|_| tasks::enabled(&settings()));
+    let config = settings();
+    let task = task.filter(|_| tasks::enabled(&config));
     if let Some(goal) = &task {
-        let about_tasks = tasks::instructions();
+        let about_tasks = tasks::instructions(backlog::enabled(&config));
         instructions.push(about_tasks.clone());
         // Codex has no system prompt to add to, so it hears it at the end
         // of what it's asked to do.

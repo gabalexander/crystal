@@ -7,6 +7,7 @@
 //! session list. The loop takes each event, updates the state, and draws.
 
 mod app;
+mod backlog_view;
 mod command_line;
 mod diff;
 mod diff_view;
@@ -33,11 +34,12 @@ use crate::config::{self, Config};
 use crate::github::{self, Issue, PullRequest};
 use crate::memory::{self, Listed, Memory};
 use crate::profile;
-use crate::protocol::{Request, Response, SessionInfo};
+use crate::protocol::{Backlog, Request, Response, SessionInfo};
 use crate::{catalog, keys, typing};
 use crate::{client, env, git};
 use anyhow::{Result, bail};
 use app::{Action, App, Focus, Hit, Place, Slot};
+use backlog_view::BacklogChange;
 use crossterm::event::{Event as TerminalEvent, KeyEvent, KeyEventKind, MouseEvent};
 use diff_view::Against;
 use pane::Pane;
@@ -124,6 +126,13 @@ pub enum Event {
         dir: PathBuf,
         read: Result<Vec<Listed>, String>,
     },
+    /// The backlog of the project `dir` is in, for the backlog view.
+    Backlog {
+        dir: PathBuf,
+        found: Result<Backlog, String>,
+    },
+    /// How many backlog items each project has to do.
+    BacklogCounts(HashMap<PathBuf, usize>),
 }
 
 pub fn run(socket: &Path) -> Result<()> {
@@ -136,7 +145,8 @@ pub fn run(socket: &Path) -> Result<()> {
 
     let (sender, events) = mpsc::channel();
     spawn_input_reader(sender.clone());
-    spawn_session_poller(socket.to_path_buf(), sender.clone());
+    let count_backlog = crate::backlog::enabled(&config);
+    spawn_session_poller(socket.to_path_buf(), sender.clone(), count_backlog);
     let projects = Arc::new(Mutex::new(Vec::new()));
     spawn_pull_request_poller(projects.clone(), sender.clone());
 
@@ -156,6 +166,7 @@ pub fn run(socket: &Path) -> Result<()> {
     tui.app.set_agents(catalog::installed());
     tui.app.set_launch_settings(&config);
     tui.app.set_memory_on(memory::enabled(&config));
+    tui.app.set_features(&config);
     tui.app.set_memory(launcher::load_memory(&tui.memory_path));
     tui.set_sessions(sessions);
 
@@ -343,6 +354,8 @@ impl Tui {
             }
             Event::PreviewRead { dir, path, lines } => self.app.preview_read(&dir, &path, lines),
             Event::MemoryRead { dir, read } => self.app.memory_read(&dir, read),
+            Event::Backlog { dir, found } => self.app.set_backlog(&dir, found),
+            Event::BacklogCounts(counts) => self.app.set_backlog_counts(counts),
         }
     }
 
@@ -406,10 +419,56 @@ impl Tui {
     fn perform(&mut self, action: Action) -> Result<()> {
         match action {
             Action::Quit => self.quitting = true,
-            Action::Start { place, command } => {
+            Action::Start {
+                place,
+                command,
+                purpose,
+            } => {
                 let cwd = directory_for(place)?;
-                self.start_session(None, cwd, command)?;
+                let name = client::new_session_for(&self.socket, None, cwd, command, purpose)?;
+                self.show_new_session(&name)?;
                 launcher::save_memory(&self.memory_path, self.app.memory());
+            }
+            Action::StartInBackground {
+                place,
+                spec,
+                backlog,
+            } => {
+                let cwd = directory_for(place)?;
+                let name = client::new_task(&self.socket, None, cwd, spec, backlog)?;
+                // A background task takes no keys: the sidebar keeps them.
+                self.refresh_sessions()?;
+                self.app.select(&name);
+                launcher::save_memory(&self.memory_path, self.app.memory());
+            }
+            Action::CloseTask {
+                name,
+                failed,
+                summary,
+            } => {
+                client::close_task(&self.socket, &name, failed, &summary)?;
+                self.refresh_sessions()?;
+            }
+            Action::ListBacklog(dir) => self.list_backlog(dir),
+            Action::ChangeBacklog { dir, change } => {
+                let request = match change {
+                    BacklogChange::Add(text) => Request::BacklogAdd {
+                        dir: dir.clone(),
+                        text,
+                        tags: Vec::new(),
+                    },
+                    BacklogChange::Mark { number, done } => Request::BacklogMark {
+                        dir: dir.clone(),
+                        number,
+                        done,
+                    },
+                    BacklogChange::Remove(number) => Request::BacklogRemove {
+                        dir: dir.clone(),
+                        number,
+                    },
+                };
+                client::ask(&self.socket, &request, false)?;
+                self.list_backlog(dir);
             }
             Action::Paste { to, text } => {
                 if let Some(pane) = self.pane_in(to) {
@@ -559,8 +618,14 @@ impl Tui {
         command: Vec<String>,
     ) -> Result<()> {
         let name = client::new_session(&self.socket, name, cwd, command)?;
+        self.show_new_session(&name)
+    }
+
+    /// Selects the session just started, called `name`, and hands it the
+    /// keyboard.
+    fn show_new_session(&mut self, name: &str) -> Result<()> {
         self.refresh_sessions()?;
-        self.app.select(&name);
+        self.app.select(name);
         self.app.type_into_selected();
         Ok(())
     }
@@ -573,6 +638,17 @@ impl Tui {
             Ok(config) => self.app.profiles_saved(&config, select),
             Err(error) => self.app.profile_failed(format!("{error:#}")),
         }
+    }
+
+    /// Asks the daemon, off the loop, for the backlog of the project `dir`
+    /// is in, done items too.
+    fn list_backlog(&self, dir: PathBuf) {
+        let socket = self.socket.clone();
+        self.read_in_background(move || {
+            let found =
+                client::backlog(&socket, dir.clone(), true).map_err(|err| format!("{err:#}"));
+            Event::Backlog { dir, found }
+        });
     }
 
     /// Runs `read` on a thread of its own, since git and the disk can keep
@@ -790,15 +866,46 @@ fn spawn_pull_request_poller(projects: Arc<Mutex<Vec<PathBuf>>>, events: Sender<
     });
 }
 
-fn spawn_session_poller(socket: PathBuf, events: Sender<Event>) {
+/// Asks for the session list every [`POLL_EVERY`], and with
+/// `count_backlog`, how many backlog items each of their projects has to
+/// do.
+fn spawn_session_poller(socket: PathBuf, events: Sender<Event>, count_backlog: bool) {
     thread::spawn(move || {
         loop {
             thread::sleep(POLL_EVERY);
             // A daemon that has gone away has no sessions left.
             let sessions = list_sessions(&socket, false).unwrap_or_default();
+            let projects = projects_of(&sessions);
             if events.send(Event::Sessions(sessions)).is_err() {
+                return;
+            }
+            if count_backlog
+                && let Some(counts) = backlog_counts(&socket, projects)
+                && events.send(Event::BacklogCounts(counts)).is_err()
+            {
                 return;
             }
         }
     });
+}
+
+/// The projects `sessions` are in, by their main worktrees.
+fn projects_of(sessions: &[SessionInfo]) -> Vec<PathBuf> {
+    let mut projects: Vec<PathBuf> = sessions
+        .iter()
+        .filter_map(|session| session.worktree.as_ref())
+        .map(|worktree| worktree.project_path.clone())
+        .collect();
+    projects.sort();
+    projects.dedup();
+    projects
+}
+
+/// How many backlog items each of `projects` has to do, or `None` when
+/// the daemon can't say.
+fn backlog_counts(socket: &Path, projects: Vec<PathBuf>) -> Option<HashMap<PathBuf, usize>> {
+    match client::ask(socket, &Request::BacklogCounts { projects }, false) {
+        Ok(Some(Response::BacklogCounts { open })) => Some(open.into_iter().collect()),
+        _ => None,
+    }
 }

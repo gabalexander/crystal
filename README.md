@@ -95,6 +95,8 @@ you are and offers the keys that matter there.
 | `/` | find a session by typing a little of its name, project, branch or command |
 | `o` | open the pull request of the selected session's branch in your browser |
 | `i` | list the open issues of the selected session's project, and start an agent on one |
+| `b` | open the selected session's project's [backlog](#the-backlog) |
+| `c` | close the selected session's [task](#tasks): done or failed, with a line on how it went |
 | `d` | show what changed in the selected session's worktree: [the diff](#the-diff) |
 | `p` | find a file in the selected session's worktree and edit it: [the file finder](#the-file-finder) |
 | `m` | what the selected session's project has remembered: [memory](#memory) |
@@ -259,6 +261,9 @@ Under the task, `Tab` and `Shift+Tab` go from row to row and `←` / `→` chang
 - **run**: your [profiles](#profiles), then the agents installed on your `PATH` (Claude Code, Codex, Gemini
   CLI, OpenCode, Cursor, Aider), then your shell. What you started last is chosen the next time. A profile's
   description shows under the row, and choosing it sets the rows below from it; you can still change them.
+- **how**, for Claude Code: **in a terminal**, or **in the background**, as a [background
+  task](#background-tasks) that needs no terminal. Only Claude Code offers it: crystal reads `claude -p`'s
+  events for a task's transcript, and Codex's `codex exec` writes another kind it doesn't read yet.
 - Claude Code's **model** and **permissions** (`--model`, `--permission-mode`), or Codex's **model** and
   **approvals** (`-m`, `-a`), its models the ones `codex debug models` lists. Left at `default`, no option is
   added.
@@ -374,8 +379,10 @@ session, plus `status`, the word the STATE column shows:
 `state` is `"running"`, `{"exited": {"code": 3}}` or `{"signaled": {"signal": "Terminated"}}`; `activity` is
 `null` for a program that doesn't report what it's doing; `worktree` is `null` outside a git repository;
 `front` is what's in front in the terminal: `{"kind": "agent", …}`, `{"kind": "shell", "name": "zsh"}`,
-`{"kind": "program", "name": "vite"}` or `{"kind": "task"}`, and `null` until it's been looked at. New
-fields may appear; none goes away. With no daemon running, it prints `[]`.
+`{"kind": "program", "name": "vite"}` or `{"kind": "task"}`, and `null` until it's been looked at.
+`task` is `null` for a session started with nothing to do, and otherwise holds its [task](#tasks): `goal`,
+and once it's closed, `outcome` with `failed` and `summary`. New fields may appear; none goes away. With no
+daemon running, it prints `[]`.
 
 #### A skill for Claude Code
 
@@ -468,6 +475,55 @@ When a Claude Code session starts, crystal adds the entries that have most to do
 newest, without one) to its system prompt, a few at most and none that's stale, with a line on how to add
 more. Codex is told nothing: it has no option for a system prompt, and anything crystal typed in would read as
 your first message. Turn it all off with `memory = false` in the settings.
+
+### Tasks
+
+A session started with something to do is a task: an agent given a task in the new-session panel, `crystal
+new -t "<task>" claude` (or simply `crystal new claude "<task>"`), a [background task](#background-tasks), or
+one started from the [backlog](#the-backlog). The task stays open until it's closed, done or failed, with a
+line on how it went:
+
+- The agent closes it from inside its session: `crystal done "<what was done>"`, or `crystal done --failed
+  "<why>"`. crystal tells Claude Code how, on top of its system prompt, and tells Codex at the end of its first
+  prompt. `-n <session>` closes another session's task.
+- You close it from the TUI: `c` on the session asks `d` done or `f` failed, then for a line on how it went,
+  which can stay empty.
+- A background task closes itself when its run ends: done with the first line of Claude's answer, or failed.
+  A follow-up opens it again.
+
+The sidebar shows a task under its session, what it was asked to do while it's open and `✓` or `✗` with how it
+went once it's closed, and so does the pane's header. `crystal ls` has a TASK column, and `ls --json` a `task`
+field.
+
+Closed tasks are kept in the project's history in the state directory: what each was asked, when and how it
+closed, and the session and branch it ran in. `crystal tasks` lists the project's tasks, open ones first, then
+those closed, the latest first; `--all` lists every project's, `-C <dir>` another project's, and `--json`
+prints them for scripts.
+
+### The backlog
+
+Each project keeps a backlog: things worth doing later that aren't anyone's task yet. It's the project's, not
+a worktree's, so every worktree of a repository shares it, and it's kept in the state directory, out of the
+repository. Items are numbered per project, `#1` on, and keep their number.
+
+```sh
+crystal backlog add "Retry the webhook on a timeout" -t payments   # prints #4
+crystal backlog                     # what's still to do; --all for what's done too, --json for scripts
+crystal backlog done 4              # or reopen 4, or rm 4
+crystal backlog start 4 -w          # an agent on #4, in a new worktree named after it
+crystal backlog export > TODO.md    # markdown checkboxes, done items ticked
+```
+
+`backlog start` starts the agent the new-session panel picks first (`new_session` in the
+[settings](#settings)) with the item as its task. When that task closes done, the item is ticked off. Agents
+are told to put what they notice along the way on the backlog with `crystal backlog add`, rather than into the
+change at hand. Every command works on the current directory's project; `-C <dir>` names another.
+
+In the TUI, `b` opens the selected session's project's backlog, and the sidebar counts what each project has
+to do beside its name: `payments ──── 3 to do`. In the view, what's to do comes first and what's done after.
+`a` adds an item, `Space` ticks one off or opens it again, `x` removes one once you've said `y`, and `/`
+filters the list as you type. `Enter` opens the new-session panel with the item as its task, on a branch named
+after it; that task ticks the item off when it closes done.
 
 ### Settings
 
@@ -573,6 +629,7 @@ commands talk to it over a unix socket, so closing the TUI never stops an agent.
 - [x] Resume after a restart
 - [x] Split panes
 - [x] Agents that start, message, wait on and read other agents
+- [x] Tasks that close done or failed, and a backlog per project
 
 ## Development
 

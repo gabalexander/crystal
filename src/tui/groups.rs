@@ -15,8 +15,9 @@ use std::path::{Path, PathBuf};
 /// One row of the sidebar.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Row {
-    /// A project's name, heading its worktrees.
-    Project(String),
+    /// A project's name, heading its worktrees, and its main worktree,
+    /// which tells projects apart.
+    Project { name: String, path: PathBuf },
     /// The heading for the sessions outside any repository.
     OutsideGit,
     /// A worktree's branch, heading its sessions. `branch` is `None` when
@@ -31,6 +32,9 @@ pub enum Row {
     Directory(PathBuf),
     /// The session at this index in the ordered list.
     Session(usize),
+    /// The task of the session at this index, under its row: what it was
+    /// asked to do, or how that went.
+    Task(usize),
 }
 
 /// Puts sessions in the sidebar's order. They come in the order they were
@@ -74,7 +78,8 @@ pub fn order(sessions: Vec<SessionInfo>) -> Vec<SessionInfo> {
 
 /// The sidebar's rows for sessions already in [`order`], those that `keep`
 /// keeps by their index: a heading wherever the project or the worktree
-/// changes, then each session. Only a kept session brings its headings.
+/// changes, then each session, and under one with a task, its task. Only a
+/// kept session brings its headings.
 pub fn rows(sessions: &[SessionInfo], keep: impl Fn(usize) -> bool) -> Vec<Row> {
     let mut rows = Vec::new();
     let mut previous: Option<(Option<&Path>, &Path)> = None;
@@ -93,6 +98,9 @@ pub fn rows(sessions: &[SessionInfo], keep: impl Fn(usize) -> bool) -> Vec<Row> 
             rows.push(worktree_heading(session));
         }
         rows.push(Row::Session(index));
+        if session.task.is_some() {
+            rows.push(Row::Task(index));
+        }
         previous = Some((project, worktree));
     }
     rows
@@ -129,7 +137,10 @@ fn group(session: &SessionInfo) -> (Option<&Path>, &Path) {
 
 fn project_heading(session: &SessionInfo) -> Row {
     match &session.worktree {
-        Some(worktree) => Row::Project(worktree.project.clone()),
+        Some(worktree) => Row::Project {
+            name: worktree.project.clone(),
+            path: worktree.project_path.clone(),
+        },
         None => Row::OutsideGit,
     }
 }
@@ -223,7 +234,7 @@ mod tests {
             session("w1", "web", "main"),
         ]);
         let rows = rows(&sessions, |index| sessions[index].name == "w1");
-        assert_eq!(rows[0], Row::Project("web".into()));
+        assert!(matches!(&rows[0], Row::Project { name, .. } if name == "web"));
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[2], Row::Session(1));
     }
@@ -239,7 +250,10 @@ mod tests {
         assert_eq!(
             rows(&sessions, |_| true),
             [
-                Row::Project("app".into()),
+                Row::Project {
+                    name: "app".into(),
+                    path: PathBuf::from("/code/app")
+                },
                 Row::Worktree {
                     project: PathBuf::from("/code/app"),
                     branch: Some("main".into()),

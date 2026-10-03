@@ -3,6 +3,7 @@
 //! world, it comes back as an [`Action`] for the event loop to carry out.
 //! That keeps every state change testable on its own.
 
+use super::backlog_view::{BacklogChange, BacklogView, Step};
 use super::command_line;
 use super::diff_view::{self, Against, DiffView};
 use super::finder::Finder;
@@ -14,12 +15,14 @@ use super::profiles::{self, ProfilesView};
 use super::search;
 use super::text_input::TextInput;
 use crate::catalog::{self, Agent};
+use crate::client::Purpose;
 use crate::config::Config;
 use crate::github::{self, PullRequest};
 use crate::keys;
 use crate::profile::{self, Profile};
-use crate::protocol::{Activity, SessionInfo, State};
+use crate::protocol::{Activity, Backlog, SessionInfo, State, TaskSpec};
 use crate::shell;
+use crate::{backlog, tasks};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -129,6 +132,9 @@ pub enum Question {
     Command(Place),
     /// A new name for the session now called this.
     Rename(String),
+    /// A line on how the task of the session called `name` went, closing
+    /// it done, or `failed`.
+    CloseTask { name: String, failed: bool },
 }
 
 /// A question on the footer line that `y` answers yes and any other key
@@ -171,10 +177,33 @@ impl Confirm {
 pub enum Action {
     Quit,
     /// Start `command` in a new session at `place`. An empty command starts
-    /// the user's shell.
+    /// the user's shell. A `purpose` with a task makes the session a task.
     Start {
         place: Place,
         command: Vec<String>,
+        purpose: Purpose,
+    },
+    /// Start a background task at `place`: Claude Code runs `spec` without
+    /// a terminal, for backlog item `backlog` if it's for one.
+    StartInBackground {
+        place: Place,
+        spec: TaskSpec,
+        backlog: Option<u64>,
+    },
+    /// Close the task of the session called `name`, done or `failed`.
+    CloseTask {
+        name: String,
+        failed: bool,
+        summary: String,
+    },
+    /// Ask the daemon for the backlog of the project `dir` is in, for the
+    /// backlog view that's open.
+    ListBacklog(PathBuf),
+    /// Make `change` to the backlog of the project `dir` is in, then list
+    /// it again.
+    ChangeBacklog {
+        dir: PathBuf,
+        change: BacklogChange,
     },
     Kill(String),
     Rename {
@@ -330,6 +359,18 @@ pub struct App {
     /// Whether memory is on, which is whether `m` opens it: see
     /// [`crate::memory::enabled`].
     memory_on: bool,
+    /// Whether tasks are on: closing them, and showing how they stand.
+    tasks_on: bool,
+    /// Whether the backlog is on: its view, and its counts in the sidebar.
+    backlog_on: bool,
+    /// The session whose task `c` is closing, while the footer asks whether
+    /// it was done or failed.
+    closing: Option<String>,
+    /// The backlog view, while it's open.
+    backlog: Option<BacklogView>,
+    /// How many backlog items each project has to do, by its main
+    /// worktree.
+    backlog_counts: HashMap<PathBuf, usize>,
 }
 
 impl App {
@@ -361,12 +402,28 @@ impl App {
             issues: None,
             view: None,
             memory_on: true,
+            tasks_on: true,
+            backlog_on: true,
+            closing: None,
+            backlog: None,
+            backlog_counts: HashMap::new(),
         }
     }
 
     /// Whether `m` opens a project's memory, by the config's say.
     pub fn set_memory_on(&mut self, on: bool) {
         self.memory_on = on;
+    }
+
+    /// Takes which of crystal's features the config has on.
+    pub fn set_features(&mut self, config: &Config) {
+        self.tasks_on = tasks::enabled(config);
+        self.backlog_on = backlog::enabled(config);
+    }
+
+    /// Whether the TUI shows tasks: under sessions, and in pane headers.
+    pub fn shows_tasks(&self) -> bool {
+        self.tasks_on
     }
 
     /// The agents installed on this machine, for the new-session panel.
@@ -529,7 +586,11 @@ impl App {
     /// only those that match while `/`'s filter is open.
     pub fn rows(&self) -> Vec<Row> {
         let shown = self.matches();
-        groups::rows(&self.sessions, |index| shown.contains(&index))
+        let mut rows = groups::rows(&self.sessions, |index| shown.contains(&index));
+        if !self.tasks_on {
+            rows.retain(|row| !matches!(row, Row::Task(_)));
+        }
+        rows
     }
 
     /// `/`'s filter, while it's open.
@@ -605,6 +666,36 @@ impl App {
     /// The issues view, while it's open.
     pub fn issues_view(&self) -> Option<&IssuesView> {
         self.issues.as_ref()
+    }
+
+    /// The backlog view, while it's open.
+    pub fn backlog_view(&self) -> Option<&BacklogView> {
+        self.backlog.as_ref()
+    }
+
+    /// Takes the backlog the daemon sent for the project `dir` is in.
+    pub fn set_backlog(&mut self, dir: &Path, found: Result<Backlog, String>) {
+        if let Some(view) = self.backlog.as_mut().filter(|view| view.dir == dir) {
+            view.set_backlog(found);
+        }
+    }
+
+    /// Takes how many backlog items each project has to do.
+    pub fn set_backlog_counts(&mut self, counts: HashMap<PathBuf, usize>) {
+        self.backlog_counts = counts;
+    }
+
+    /// How many backlog items the project at `project` has to do, when
+    /// there are some and the backlog is on.
+    pub fn backlog_open(&self, project: &Path) -> Option<usize> {
+        let open = *self.backlog_counts.get(project)?;
+        (self.backlog_on && open > 0).then_some(open)
+    }
+
+    /// The session whose task `c` is closing, while the footer asks how it
+    /// went.
+    pub fn closing(&self) -> Option<&str> {
+        self.closing.as_deref()
     }
 
     /// Takes the open issues GitHub listed for the project at `project`.
@@ -793,6 +884,20 @@ impl App {
             }
             return None;
         }
+        // `d` says the task was done, `f` that it failed; any other key
+        // leaves it open.
+        if let Some(name) = self.closing.take() {
+            let failed = match key.code {
+                KeyCode::Char('d') => false,
+                KeyCode::Char('f') => true,
+                _ => return None,
+            };
+            self.ask(Question::CloseTask { name, failed }, "");
+            return None;
+        }
+        if self.backlog.is_some() {
+            return self.on_backlog_key(key);
+        }
         if self.launcher.is_some() {
             return self.on_launcher_key(key);
         }
@@ -835,12 +940,15 @@ impl App {
             return None;
         }
         // A question on the footer waits for its answer from the keyboard,
-        // and so do the filter, the issues view and the new-session panel.
+        // and so do the filter, the issues and backlog views, the new-session
+        // panel and the profiles view.
         let typing = self.filter.is_some()
             || self.issues.is_some()
+            || self.backlog.is_some()
             || self.launcher.is_some()
             || self.profiles_view.is_some();
-        if self.prompt.is_some() || self.confirm.is_some() || typing {
+        let asking = self.prompt.is_some() || self.confirm.is_some() || self.closing.is_some();
+        if asking || typing {
             return None;
         }
         let click = kind == MouseEventKind::Down(MouseButton::Left);
@@ -874,7 +982,7 @@ impl App {
     /// A click on a sidebar row: on a session, selects it and gives the
     /// sidebar the keyboard. Headings don't do anything.
     fn click_row(&mut self, row: usize) {
-        if let Some(Row::Session(index)) = self.rows().get(row) {
+        if let Some(Row::Session(index) | Row::Task(index)) = self.rows().get(row) {
             self.selected = *index;
             self.focus = Focus::Sidebar;
         }
@@ -913,6 +1021,8 @@ impl App {
             KeyCode::Char('/') => self.open_filter(),
             KeyCode::Char('o') => return self.open_pull_request(),
             KeyCode::Char('i') => return self.open_issues(),
+            KeyCode::Char('c') if self.tasks_on => self.ask_how_the_task_went(),
+            KeyCode::Char('b') if self.backlog_on => return self.open_backlog(),
             KeyCode::Char('q') => return Some(Action::Quit),
             _ => {}
         }
@@ -1203,6 +1313,60 @@ impl App {
         Some(Action::ListIssues(project))
     }
 
+    /// `c`: asks, on the footer, whether the selected session's task was
+    /// done or failed, or says why there's no task to close.
+    fn ask_how_the_task_went(&mut self) {
+        let Some(selected) = self.selected() else {
+            return;
+        };
+        let name = selected.name.clone();
+        match &selected.task {
+            None => self.notify(format!("{name} has no task to close")),
+            Some(task) if task.outcome.is_some() => {
+                self.notify(format!("{name}'s task is closed already"));
+            }
+            Some(_) => self.closing = Some(name),
+        }
+    }
+
+    /// `b`: opens the backlog of the selected session's project: its main
+    /// worktree's, or, outside git, its directory's.
+    fn open_backlog(&mut self) -> Option<Action> {
+        let selected = self.selected()?;
+        let (dir, name) = match &selected.worktree {
+            Some(worktree) => (worktree.project_path.clone(), worktree.project.clone()),
+            None => (selected.cwd.clone(), shell::home_relative(&selected.cwd)),
+        };
+        self.backlog = Some(BacklogView::new(dir.clone(), name));
+        Some(Action::ListBacklog(dir))
+    }
+
+    /// Keys while the backlog view is open: all of them are its.
+    fn on_backlog_key(&mut self, key: KeyEvent) -> Option<Action> {
+        let view = self.backlog.as_mut()?;
+        match view.on_key(&key) {
+            Step::Stay => None,
+            Step::Close => {
+                self.backlog = None;
+                None
+            }
+            Step::Change(change) => Some(Action::ChangeBacklog {
+                dir: view.dir.clone(),
+                change,
+            }),
+            Step::Start(item) => {
+                self.backlog = None;
+                let branch = github::branch_for_issue(item.number, &item.text);
+                let setup = self.launch_setup(false);
+                let launcher = Launcher::new(setup)
+                    .with_task(&item.text, &branch)
+                    .for_backlog_item(item.number);
+                self.launcher = Some(launcher);
+                self.codex_models_wanted()
+            }
+        }
+    }
+
     /// Keys while the issues view is open: Esc closes it, Enter goes on to
     /// start a session for the issue the bar is on, and the view takes the
     /// rest.
@@ -1285,6 +1449,7 @@ impl App {
             target: usize::from(worktree),
             history: self.memory.tasks.clone(),
             codex_models: self.codex_models.clone().unwrap_or_default(),
+            background: self.tasks_on,
         }
     }
 
@@ -1382,10 +1547,29 @@ impl App {
                 command,
                 task,
                 run,
+                background,
+                backlog,
             } => {
                 self.launcher = None;
                 self.memory.remember(&task, &run);
-                Some(Action::Start { place, command })
+                if background {
+                    let spec = launcher::background_spec(&command)?;
+                    return Some(Action::StartInBackground {
+                        place,
+                        spec,
+                        backlog,
+                    });
+                }
+                // Given something to do, the session is a task.
+                let purpose = Purpose {
+                    task: (!task.is_empty()).then_some(task),
+                    backlog,
+                };
+                Some(Action::Start {
+                    place,
+                    command,
+                    purpose,
+                })
             }
             launcher::Outcome::CommandLine { place, line } => {
                 self.launcher = None;
@@ -1418,6 +1602,8 @@ impl App {
             prompt.input.insert_str(&text);
         } else if let Some(issues) = &mut self.issues {
             issues.on_paste(&text);
+        } else if let Some(backlog) = &mut self.backlog {
+            backlog.on_paste(&text);
         } else if let Some(filter) = &mut self.filter {
             filter.input.insert_str(&text);
             self.keep_filter_bar_on_a_match();
@@ -1461,12 +1647,29 @@ impl App {
         let answer = prompt.input.text().trim().to_string();
         match prompt.question {
             Question::Command(place) => match command_line::parse(&answer) {
-                Ok(command) => Some(Action::Start { place, command }),
+                Ok(command) => {
+                    // As with `crystal new`, an agent given only a prompt is
+                    // given a task.
+                    let purpose = Purpose {
+                        task: catalog::first_prompt_in(&command).filter(|_| self.tasks_on),
+                        backlog: None,
+                    };
+                    Some(Action::Start {
+                        place,
+                        command,
+                        purpose,
+                    })
+                }
                 Err(err) => {
                     self.notify(err);
                     None
                 }
             },
+            Question::CloseTask { name, failed } => Some(Action::CloseTask {
+                name,
+                failed,
+                summary: answer,
+            }),
             // An empty answer, or the name it already has, changes nothing.
             Question::Rename(name) => {
                 if answer.is_empty() || answer == name {
@@ -1642,7 +1845,7 @@ fn edit_name(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{Activity, Worktree};
+    use crate::protocol::{Activity, BacklogItem, TaskInfo, TaskOutcome, Worktree};
     use crossterm::event::KeyModifiers;
 
     fn session(name: &str) -> SessionInfo {
@@ -1926,9 +2129,18 @@ mod tests {
         app.prompt().map(|prompt| prompt.input.text())
     }
 
-    fn start(place: Place, command: &[&str]) -> Option<Action> {
+    /// Starting `command` at `place`, a task when `task` isn't empty.
+    fn start(place: Place, command: &[&str], task: &str) -> Option<Action> {
         let command = command.iter().map(|word| word.to_string()).collect();
-        Some(Action::Start { place, command })
+        let purpose = Purpose {
+            task: (!task.is_empty()).then(|| task.to_string()),
+            backlog: None,
+        };
+        Some(Action::Start {
+            place,
+            command,
+            purpose,
+        })
     }
 
     /// An app on a machine where these agents are installed.
@@ -1953,7 +2165,7 @@ mod tests {
         let place = Place::Directory(Some(PathBuf::from("/code/app")));
         assert_eq!(
             press(&mut app, KeyCode::Enter),
-            start(place, &["claude", "fix the login bug"])
+            start(place, &["claude", "fix the login bug"], "fix the login bug")
         );
         assert!(app.launcher().is_none());
         assert_eq!(app.memory().tasks, ["fix the login bug"]);
@@ -2007,7 +2219,11 @@ mod tests {
         type_text(&mut app, "go");
         assert_eq!(
             press(&mut app, KeyCode::Enter),
-            start(Place::Directory(None), &["codex", "--full-auto", "go"])
+            start(
+                Place::Directory(None),
+                &["codex", "--full-auto", "go"],
+                "go"
+            )
         );
     }
 
@@ -2106,7 +2322,7 @@ mod tests {
         assert_eq!(run_key(&app), "shell");
         assert_eq!(
             press(&mut app, KeyCode::Enter),
-            start(Place::Directory(None), &[])
+            start(Place::Directory(None), &[], "")
         );
     }
 
@@ -2121,7 +2337,7 @@ mod tests {
         };
         assert_eq!(
             press(&mut app, KeyCode::Enter),
-            start(place, &["claude", "fix typo"])
+            start(place, &["claude", "fix typo"], "fix typo")
         );
     }
 
@@ -2136,7 +2352,7 @@ mod tests {
         };
         assert_eq!(
             press(&mut app, KeyCode::Enter),
-            start(place, &["claude", "feat"])
+            start(place, &["claude", "feat"], "feat")
         );
     }
 
@@ -2160,7 +2376,7 @@ mod tests {
         assert_eq!(prompt_text(&app), Some("claude 'fix it'"));
         assert_eq!(
             press(&mut app, KeyCode::Enter),
-            start(Place::Directory(None), &["claude", "fix it"])
+            start(Place::Directory(None), &["claude", "fix it"], "fix it")
         );
     }
 
@@ -2784,7 +3000,7 @@ mod tests {
             panel.task().text(),
             "Fix issue #42: Fix login redirect (https://github.com/acme/app/issues/42)"
         );
-        let Some(Action::Start { place, command }) = press(&mut app, KeyCode::Enter) else {
+        let Some(Action::Start { place, command, .. }) = press(&mut app, KeyCode::Enter) else {
             panic!("Enter should start the session");
         };
         assert_eq!(
@@ -2843,5 +3059,167 @@ mod tests {
         assert_eq!(press(&mut app, KeyCode::Char('m')), None);
         assert!(app.view().is_none());
         assert_eq!(app.notice(), Some(crate::memory::OFF));
+    }
+
+    /// A session given `goal` to do, closed with `outcome` if it's given:
+    /// whether it failed, and how it went.
+    fn with_task(name: &str, goal: &str, outcome: Option<(bool, &str)>) -> SessionInfo {
+        SessionInfo {
+            task: Some(TaskInfo {
+                goal: goal.into(),
+                background: false,
+                backlog: None,
+                outcome: outcome.map(|(failed, summary)| TaskOutcome {
+                    failed,
+                    summary: summary.into(),
+                    closed: 1,
+                }),
+            }),
+            ..in_project(name, "shop")
+        }
+    }
+
+    fn backlog_of(items: &[(u64, &str)]) -> Backlog {
+        Backlog {
+            project: "shop".into(),
+            path: PathBuf::from("/code/shop"),
+            items: items
+                .iter()
+                .map(|(number, text)| BacklogItem {
+                    number: *number,
+                    text: text.to_string(),
+                    tags: Vec::new(),
+                    done: false,
+                    created: 0,
+                    closed: None,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn c_asks_how_the_task_went_then_for_a_line_on_it() {
+        let mut app = App::new(None);
+        app.set_sessions(vec![with_task("fixer", "fix the tests", None)]);
+        press(&mut app, KeyCode::Char('c'));
+        assert_eq!(app.closing(), Some("fixer"));
+        press(&mut app, KeyCode::Char('f'));
+        assert_eq!(app.closing(), None);
+        type_text(&mut app, "no network");
+        assert_eq!(
+            press(&mut app, KeyCode::Enter),
+            Some(Action::CloseTask {
+                name: "fixer".into(),
+                failed: true,
+                summary: "no network".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn c_leaves_the_task_open_on_any_other_key_and_says_when_there_is_none() {
+        let mut app = App::new(None);
+        app.set_sessions(vec![
+            with_task("fixer", "fix the tests", None),
+            session("plain"),
+            with_task("finished", "ship it", Some((false, "shipped"))),
+        ]);
+        press(&mut app, KeyCode::Char('c'));
+        assert_eq!(
+            press(&mut app, KeyCode::Char('q')),
+            None,
+            "q doesn't quit here"
+        );
+        assert_eq!(app.closing(), None);
+        assert!(app.prompt().is_none());
+
+        app.select("plain");
+        press(&mut app, KeyCode::Char('c'));
+        assert_eq!(app.notice(), Some("plain has no task to close"));
+        app.select("finished");
+        press(&mut app, KeyCode::Char('c'));
+        assert_eq!(app.notice(), Some("finished's task is closed already"));
+    }
+
+    #[test]
+    fn a_task_has_a_line_under_its_session_while_tasks_are_on() {
+        let mut app = App::new(None);
+        app.set_sessions(vec![with_task("fixer", "fix the tests", None)]);
+        app.set_features(&Config::default());
+        assert_eq!(app.rows().last(), Some(&Row::Task(0)));
+
+        // With tasks off, the line goes, and so does `c`.
+        app.tasks_on = false;
+        assert!(!app.rows().contains(&Row::Task(0)));
+        press(&mut app, KeyCode::Char('c'));
+        assert_eq!(app.closing(), None);
+    }
+
+    #[test]
+    fn b_opens_the_projects_backlog_and_enter_starts_a_task_for_an_item() {
+        let mut app = with_agents(&["claude"], vec![in_project("agent", "shop")]);
+        assert_eq!(
+            press(&mut app, KeyCode::Char('b')),
+            Some(Action::ListBacklog(PathBuf::from("/code/shop")))
+        );
+        app.set_backlog(
+            Path::new("/code/shop"),
+            Ok(backlog_of(&[(3, "write the docs")])),
+        );
+        assert_eq!(app.backlog_view().unwrap().shown().len(), 1);
+
+        // Letters are the view's: x asks, and only y removes.
+        press(&mut app, KeyCode::Char('x'));
+        assert_eq!(
+            press(&mut app, KeyCode::Char('y')),
+            Some(Action::ChangeBacklog {
+                dir: PathBuf::from("/code/shop"),
+                change: BacklogChange::Remove(3),
+            })
+        );
+
+        press(&mut app, KeyCode::Enter);
+        assert!(app.backlog_view().is_none());
+        let panel = app.launcher().unwrap();
+        assert_eq!(panel.task().text(), "write the docs");
+        let Some(Action::Start { purpose, .. }) = press(&mut app, KeyCode::Enter) else {
+            panic!("Enter should start the session");
+        };
+        assert_eq!(purpose.task.as_deref(), Some("write the docs"));
+        assert_eq!(purpose.backlog, Some(3));
+    }
+
+    #[test]
+    fn the_panel_starts_claude_in_the_background_as_a_background_task() {
+        let mut app = with_agents(&["claude"], vec![]);
+        press(&mut app, KeyCode::Char('n'));
+        type_text(&mut app, "fix the tests");
+        press(&mut app, KeyCode::Tab); // run
+        press(&mut app, KeyCode::Tab); // how
+        press(&mut app, KeyCode::Right);
+        assert_eq!(
+            press(&mut app, KeyCode::Enter),
+            Some(Action::StartInBackground {
+                place: Place::Directory(None),
+                spec: TaskSpec {
+                    prompt: "fix the tests".into(),
+                    args: Vec::new(),
+                },
+                backlog: None,
+            })
+        );
+    }
+
+    #[test]
+    fn a_projects_heading_counts_its_backlog_only_when_there_is_something_to_do() {
+        let mut app = App::new(None);
+        let counts = HashMap::from([
+            (PathBuf::from("/code/shop"), 3),
+            (PathBuf::from("/code/blog"), 0),
+        ]);
+        app.set_backlog_counts(counts);
+        assert_eq!(app.backlog_open(Path::new("/code/shop")), Some(3));
+        assert_eq!(app.backlog_open(Path::new("/code/blog")), None);
+        assert_eq!(app.backlog_open(Path::new("/code/else")), None);
     }
 }

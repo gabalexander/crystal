@@ -33,7 +33,11 @@ pub fn draw(frame: &mut Frame, app: &App, look: &Look, area: Rect) {
     for (index, row) in shown {
         let y = area.y + (index - first) as u16;
         let line_area = Rect::new(area.x, y, area.width, 1);
-        let is_selected = selected == Some(index);
+        // A session's task line goes with it, selected or not.
+        let is_selected = match row {
+            Row::Task(_) => index > 0 && selected == Some(index - 1),
+            _ => selected == Some(index),
+        };
         if is_selected {
             frame
                 .buffer_mut()
@@ -59,8 +63,13 @@ pub fn hit(area: Rect, app: &App, row: u16) -> Hit {
 /// clicking both go by this, so a click lands on the row drawn there.
 fn offset(app: &App, height: u16) -> usize {
     let height = usize::from(height.max(1));
-    match selected_row(app) {
-        Some(selected) if selected >= height => selected + 1 - height,
+    // The selected session's task line is kept in sight with it.
+    let last = selected_row(app).map(|row| match app.rows().get(row + 1) {
+        Some(Row::Task(_)) => row + 1,
+        _ => row,
+    });
+    match last {
+        Some(last) if last >= height => last + 1 - height,
         _ => 0,
     }
 }
@@ -78,7 +87,13 @@ fn selected_row(app: &App) -> Option<usize> {
 fn row_line<'a>(app: &'a App, row: &Row, look: &Look, width: u16, selected: bool) -> Line<'a> {
     let theme = look.theme;
     match row {
-        Row::Project(name) => heading(name, Style::new().fg(theme.text), look, width),
+        Row::Project { name, path } => {
+            let mut line = heading(name, Style::new().fg(theme.text), look, width);
+            if let Some(open) = app.backlog_open(path) {
+                to_do_on_heading(&mut line, open, theme);
+            }
+            line
+        }
         Row::OutsideGit => heading("outside git", Style::new().fg(theme.muted), look, width),
         Row::Worktree {
             project,
@@ -97,7 +112,60 @@ fn row_line<'a>(app: &'a App, row: &Row, look: &Look, width: u16, selected: bool
             let marked = app.marked_letters(*index);
             session_line(&app.sessions()[*index], &marked, look, width, selected)
         }
+        Row::Task(index) => task_line(&app.sessions()[*index], theme, width),
     }
+}
+
+/// How many backlog items are still to do, at the end of a project's
+/// heading, in place of the end of its rule: `payments ──── 3 to do`. When
+/// the rule is too short for it, it isn't shown.
+fn to_do_on_heading(line: &mut Line, open: usize, theme: &Theme) {
+    let to_do = format!(" {open} to do");
+    let Some(rule) = line.spans.last_mut() else {
+        return;
+    };
+    let rule_width = rule.content.chars().count();
+    let to_do_width = to_do.chars().count();
+    // Leave at least three columns of rule before it.
+    if rule_width < to_do_width + 3 {
+        return;
+    }
+    rule.content = "─".repeat(rule_width - to_do_width).into();
+    line.spans
+        .push(Span::styled(to_do, Style::new().fg(theme.muted)));
+}
+
+/// The line under a session with a task: what it was asked to do, while
+/// it's open, or how it went, marked done or failed, once it's closed.
+fn task_line<'a>(session: &SessionInfo, theme: &Theme, width: u16) -> Line<'a> {
+    let Some(task) = &session.task else {
+        return Line::default();
+    };
+    // Under the session's name: its indent and mark.
+    let indent = format!("{SESSION_INDENT}  ");
+    let room = usize::from(width).saturating_sub(indent.len() + 1);
+    let goal = task.goal.lines().next().unwrap_or("");
+    let (mark, color, said) = match &task.outcome {
+        None => ("", theme.muted, goal),
+        Some(outcome) => {
+            let said = if outcome.summary.is_empty() {
+                goal
+            } else {
+                outcome.summary.as_str()
+            };
+            if outcome.failed {
+                ("✗ ", theme.failed, said)
+            } else {
+                ("✓ ", theme.done, said)
+            }
+        }
+    };
+    let room = room.saturating_sub(mark.chars().count());
+    Line::from(vec![
+        Span::raw(indent),
+        Span::styled(mark, Style::new().fg(color)),
+        Span::styled(fit(said, room), Style::new().fg(theme.muted)),
+    ])
 }
 
 /// A worktree's line: its mark and branch, and on the right its pull

@@ -47,21 +47,17 @@ pub const KEYS: &[Key] = &[
     sidebar("Tab/Shift+Tab", "next / previous pane"),
     sidebar("s", "split off, or unsplit"),
     sidebar("PageUp/PageDown", "page its history"),
-    sidebar("n", "start a new session"),
-    sidebar("w", "start one in a worktree"),
+    sidebar("n/w", "new, or in a worktree"),
     sidebar("W", "remove its worktree"),
-    sidebar("r", "rename it"),
-    sidebar("x", "kill it"),
+    sidebar("r/x", "rename / kill it"),
+    sidebar("c", "close its task"),
     sidebar("u", "next one that needs you"),
     sidebar("/", "find a session"),
-    sidebar("o", "open its pull request"),
-    sidebar("i", "its project's issues"),
-    sidebar("d", "diff of its worktree"),
-    sidebar("p", "find a file to edit"),
-    sidebar("m", "its project's memory"),
+    sidebar("o/i", "pull request / issues"),
+    sidebar("d/p", "diff / find a file"),
+    sidebar("b/m", "backlog / memory"),
     sidebar("P", "your agent profiles"),
-    sidebar("?", "show these keys"),
-    sidebar("q", "quit; sessions keep on"),
+    sidebar("?/q", "keys / quit"),
     in_pane("Ctrl+\\", "back to the sidebar"),
     in_pane("Shift+PgUp", "page back"),
     in_pane("Shift+PgDn", "page forward"),
@@ -285,12 +281,15 @@ mod tests {
 
     #[test]
     fn the_overlay_and_the_readme_list_the_same_sidebar_keys() {
-        let mut overlay: Vec<Vec<String>> = KEYS
+        // The overlay puts keys that go together on one row to fit a small
+        // terminal, and the README gives most a row each, so the keys are
+        // compared, not the rows.
+        let mut overlay: Vec<String> = KEYS
             .iter()
             .filter(|key| key.section == Section::Sidebar)
-            .map(|key| keys_in(key.label))
+            .flat_map(|key| keys_in(key.label))
             .collect();
-        let mut readme = readme_sidebar_keys();
+        let mut readme: Vec<String> = readme_sidebar_keys().into_iter().flatten().collect();
         overlay.sort();
         readme.sort();
         assert_eq!(overlay, readme);

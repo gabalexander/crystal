@@ -220,9 +220,13 @@ fn agent_of(command: &[String]) -> Option<&'static Agent> {
 }
 
 /// Puts `task` on `command` as its agent's first prompt, the way that agent
-/// takes one. A program crystal doesn't know gets it as its last argument.
+/// takes one. A program crystal doesn't know is left as it is: there's no
+/// telling where it would want a prompt, if anywhere.
 pub fn add_first_prompt(command: &mut Vec<String>, task: &str) {
-    match agent_of(command).map_or(FirstPrompt::Argument, |agent| agent.first_prompt) {
+    let Some(agent) = agent_of(command) else {
+        return;
+    };
+    match agent.first_prompt {
         FirstPrompt::Argument => command.push(task.to_string()),
         FirstPrompt::Option(option) => {
             command.push(option.to_string());
@@ -323,6 +327,10 @@ mod tests {
         let mut aider = words(&["aider"]);
         add_first_prompt(&mut aider, "fix it");
         assert_eq!(aider, ["aider"], "aider takes no first prompt");
+
+        let mut unknown = words(&["sleep", "30"]);
+        add_first_prompt(&mut unknown, "fix it");
+        assert_eq!(unknown, ["sleep", "30"], "a program crystal doesn't know");
     }
 
     #[test]

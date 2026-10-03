@@ -10,7 +10,7 @@ use crate::config::Config;
 use crate::env;
 use crate::git;
 use crate::github;
-use crate::protocol::{Backlog, BacklogItem, Request, Response, TaskRecord};
+use crate::protocol::{BacklogItem, Request, Response, TaskRecord};
 use crate::tasks;
 use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
@@ -92,7 +92,7 @@ pub fn change_backlog(socket: &Path, dir: PathBuf, action: BacklogAction) -> Res
     backlog::ensure_enabled(&settings())?;
     match action {
         BacklogAction::List { all, json } => {
-            let backlog = list_backlog(socket, dir, all)?;
+            let backlog = client::backlog(socket, dir, all)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&backlog.items)?);
             } else {
@@ -115,7 +115,7 @@ pub fn change_backlog(socket: &Path, dir: PathBuf, action: BacklogAction) -> Res
             expect_done(client::ask(socket, &remove, true)?, socket)?;
         }
         BacklogAction::Export => {
-            let backlog = list_backlog(socket, dir, true)?;
+            let backlog = client::backlog(socket, dir, true)?;
             print!("{}", backlog::markdown(&backlog.project, &backlog.items));
         }
     }
@@ -135,7 +135,7 @@ pub fn start_from_backlog(
 ) -> Result<String> {
     let config = settings();
     backlog::ensure_enabled(&config)?;
-    let backlog = list_backlog(socket, dir.clone(), true)?;
+    let backlog = client::backlog(socket, dir.clone(), true)?;
     let item = backlog
         .items
         .iter()
@@ -160,14 +160,6 @@ pub fn start_from_backlog(
         backlog: Some(number),
     };
     client::new_session_for(socket, name, cwd, command, purpose)
-}
-
-/// The backlog of the project `dir` is in.
-pub fn list_backlog(socket: &Path, dir: PathBuf, all: bool) -> Result<Backlog> {
-    match client::ask(socket, &Request::BacklogList { dir, all }, true)? {
-        Some(Response::Backlog(backlog)) => Ok(backlog),
-        _ => bail!("the daemon didn't send the backlog"),
-    }
 }
 
 /// Backlog items as `crystal backlog` prints them: number, a tick for one

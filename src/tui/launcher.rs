@@ -13,6 +13,7 @@ use super::text_input::TextInput;
 use super::theme::Theme;
 use crate::catalog::{self, Agent, Choices, FirstPrompt, Setting};
 use crate::profile::{Profile, StartIn};
+use crate::protocol::TaskSpec;
 use crate::{git, shell};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
@@ -126,11 +127,17 @@ impl Target {
 pub enum Field {
     Task,
     Run,
+    /// How an agent that can work without a terminal runs: in one, or in
+    /// the background.
+    How,
     /// The agent's row of choices with this index in its settings.
     Setting(usize),
     Where,
     Branch,
 }
+
+/// The choices of the "how" row, in order: the first is the default.
+const HOW: [&str; 2] = ["in a terminal", "in the background"];
 
 /// What the panel opens with.
 pub struct Setup {
@@ -141,6 +148,9 @@ pub struct Setup {
     /// Earlier tasks, the most recent last.
     pub history: Vec<String>,
     pub codex_models: Vec<String>,
+    /// Whether an agent that can work without a terminal may be started in
+    /// the background: tasks are on.
+    pub background: bool,
 }
 
 /// What a key in the panel leads to.
@@ -148,13 +158,17 @@ pub struct Setup {
 pub enum Outcome {
     Stay,
     Cancel,
-    /// Start `command` at `place`. `task` and `run` are for the panel's
-    /// memory.
+    /// Start `command` at `place`: in a terminal, or with `background`,
+    /// without one, as a background task. `task` is what the agent was
+    /// asked, and with `run`, what the panel remembers. `backlog` is the
+    /// backlog item the session is for.
     Start {
         place: Place,
         command: Vec<String>,
         task: String,
         run: String,
+        background: bool,
+        backlog: Option<u64>,
     },
     /// Close the panel for the one-line command line, holding `line`.
     CommandLine {
@@ -185,6 +199,12 @@ pub struct Launcher {
     recalling: Option<(usize, String)>,
     /// Why Enter didn't start the session, for the panel to say.
     problem: Option<String>,
+    /// Whether the "how" row is offered at all.
+    offers_background: bool,
+    /// The choice in the "how" row: 0 in a terminal, 1 in the background.
+    how: usize,
+    /// The backlog item the session is for, when it was started from one.
+    backlog: Option<u64>,
 }
 
 impl Launcher {
@@ -204,6 +224,9 @@ impl Launcher {
             history: setup.history,
             recalling: None,
             problem: None,
+            offers_background: setup.background,
+            how: 0,
+            backlog: None,
         };
         launcher.choose_run(setup.run);
         // Opened for a new worktree, as by `w`, it stays one whatever the
@@ -220,6 +243,29 @@ impl Launcher {
         self.branch = TextInput::with_text(branch);
         self.branch_typed = true;
         self
+    }
+
+    /// Starts a task for backlog item `number`, which closing the task done
+    /// ticks.
+    pub fn for_backlog_item(mut self, number: u64) -> Launcher {
+        self.backlog = Some(number);
+        self
+    }
+
+    /// Whether the "how" row is shown: what's chosen can work without a
+    /// terminal. Only Claude Code can, through `claude -p`; Codex's `codex
+    /// exec` speaks another language crystal doesn't read yet.
+    fn can_run_in_background(&self) -> bool {
+        self.offers_background
+            && self
+                .run()
+                .agent()
+                .is_some_and(|agent| agent.program == "claude")
+    }
+
+    /// Whether the session will start in the background.
+    pub fn in_background(&self) -> bool {
+        self.can_run_in_background() && self.how == 1
     }
 
     pub fn focus(&self) -> Field {
@@ -282,7 +328,9 @@ impl Launcher {
             _ => match self.focus {
                 Field::Task => self.on_task_key(&key),
                 Field::Branch => self.on_branch_key(&key),
-                Field::Run | Field::Setting(_) | Field::Where => self.on_choice_key(&key),
+                Field::Run | Field::How | Field::Setting(_) | Field::Where => {
+                    self.on_choice_key(&key)
+                }
             },
         }
         Outcome::Stay
@@ -313,6 +361,9 @@ impl Launcher {
             fields.push(Field::Task);
         }
         fields.push(Field::Run);
+        if self.can_run_in_background() {
+            fields.push(Field::How);
+        }
         fields.extend((0..self.run().settings().len()).map(Field::Setting));
         fields.push(Field::Where);
         if self.is_new_worktree() {
@@ -419,6 +470,7 @@ impl Launcher {
                 self.chosen[row] = step(self.chosen[row], by, count);
                 self.touched = true;
             }
+            Field::How => self.how = step(self.how, by, HOW.len()),
             Field::Where => self.target = step(self.target, by, self.targets.len()),
             Field::Task | Field::Branch => {}
         }
@@ -521,6 +573,10 @@ impl Launcher {
             self.runs.iter().map(Run::label).collect(),
             self.run,
         )];
+        if self.can_run_in_background() {
+            let how = HOW.iter().map(|how| how.to_string()).collect();
+            rows.push((Field::How, "how", how, self.how));
+        }
         for (index, setting) in self.run().settings().iter().enumerate() {
             let choices = self.choices(setting);
             rows.push((
@@ -616,7 +672,11 @@ impl Launcher {
                 format!("{project} ⎇ {branch}")
             }
         };
-        format!("New session · {place}")
+        if self.in_background() {
+            format!("New background task · {place}")
+        } else {
+            format!("New session · {place}")
+        }
     }
 
     /// The directory a new worktree goes in, when it's known.
@@ -638,13 +698,47 @@ impl Launcher {
             self.focus_on(Field::Branch);
             return Outcome::Stay;
         }
+        // In the background there's no terminal to type a task into later.
+        if self.in_background() && self.task_text().is_empty() {
+            self.problem = Some("say what the background task should do".to_string());
+            self.focus_on(Field::Task);
+            return Outcome::Stay;
+        }
         Outcome::Start {
             place: self.place(),
             command: self.command(),
             task: self.task_text(),
             run: self.run().key(),
+            background: self.in_background(),
+            backlog: self.backlog,
         }
     }
+
+    /// What the panel says runs: the command line, or, in the background,
+    /// the `claude -p` run it turns into.
+    fn runs_line(&self) -> String {
+        let line = self.command_line();
+        match background_spec(&self.command()) {
+            Some(spec) if self.in_background() => {
+                let mut words = vec!["claude".to_string(), "-p".to_string()];
+                words.extend(spec.args.iter().map(|arg| shell::quote(arg)));
+                words.push(shell::quote(&spec.prompt));
+                words.join(" ")
+            }
+            _ => line,
+        }
+    }
+}
+
+/// A background task's run, from the command that would start the agent
+/// in a terminal: its options for each run, and its last argument, the
+/// task, as the prompt.
+pub fn background_spec(command: &[String]) -> Option<TaskSpec> {
+    let (prompt, args) = command.get(1..)?.split_last()?;
+    Some(TaskSpec {
+        prompt: prompt.clone(),
+        args: args.to_vec(),
+    })
 }
 
 /// Whether `setting` is the row that chooses the agent's model; the other
@@ -876,7 +970,7 @@ pub fn panel_lines(launcher: &Launcher, width: u16) -> Vec<PanelLine> {
         lines.push(PanelLine::new(vec![label("branch", focused), shown]));
     }
     lines.push(PanelLine::blank());
-    let runs = match launcher.command_line() {
+    let runs = match launcher.runs_line() {
         line if line.is_empty() => "your shell".to_string(),
         line => line,
     };
@@ -1068,7 +1162,75 @@ mod tests {
             target: 0,
             history: vec!["first task".into(), "second task".into()],
             codex_models: vec!["gpt-6-luna".into(), "gpt-5.5".into()],
+            background: false,
         })
+    }
+
+    /// A panel that offers to start Claude Code in the background.
+    fn launcher_with_background(runs: Vec<Run>) -> Launcher {
+        let mut panel = launcher(runs);
+        panel.offers_background = true;
+        panel
+    }
+
+    #[test]
+    fn claude_can_start_in_the_background_with_its_options_for_each_run() {
+        let mut panel = launcher_with_background(vec![agent("claude"), agent("codex")]);
+        type_text(&mut panel, "fix the tests");
+        press(&mut panel, KeyCode::Tab); // run
+        press(&mut panel, KeyCode::Tab); // how
+        assert_eq!(panel.focus(), Field::How);
+        press(&mut panel, KeyCode::Right);
+        press(&mut panel, KeyCode::Down); // model
+        press(&mut panel, KeyCode::Right);
+        assert!(panel.title().starts_with("New background task"));
+        assert_eq!(panel.runs_line(), "claude -p --model opus 'fix the tests'");
+
+        let Outcome::Start {
+            command,
+            background,
+            ..
+        } = press(&mut panel, KeyCode::Enter)
+        else {
+            panic!("didn't start");
+        };
+        assert!(background);
+        let spec = background_spec(&command).unwrap();
+        assert_eq!(spec.prompt, "fix the tests");
+        assert_eq!(spec.args, ["--model", "opus"]);
+    }
+
+    #[test]
+    fn only_claude_offers_the_background_and_only_with_something_to_do() {
+        let mut panel = launcher_with_background(vec![agent("claude"), agent("codex")]);
+        assert!(panel.fields().contains(&Field::How));
+        press(&mut panel, KeyCode::Tab);
+        press(&mut panel, KeyCode::Right); // codex
+        assert!(!panel.fields().contains(&Field::How));
+        assert!(
+            !launcher(vec![agent("claude")])
+                .fields()
+                .contains(&Field::How)
+        );
+
+        let mut panel = launcher_with_background(vec![agent("claude")]);
+        press(&mut panel, KeyCode::Tab);
+        press(&mut panel, KeyCode::Tab);
+        press(&mut panel, KeyCode::Right);
+        assert_eq!(press(&mut panel, KeyCode::Enter), Outcome::Stay);
+        assert_eq!(panel.focus(), Field::Task);
+        assert!(panel.problem().unwrap().contains("background task"));
+    }
+
+    #[test]
+    fn a_panel_for_a_backlog_item_says_which_item_it_is_for() {
+        let mut panel = launcher(vec![agent("claude")])
+            .with_task("write the docs", "3-write-the-docs")
+            .for_backlog_item(3);
+        let Outcome::Start { backlog, task, .. } = press(&mut panel, KeyCode::Enter) else {
+            panic!("didn't start");
+        };
+        assert_eq!((backlog, task.as_str()), (Some(3), "write the docs"));
     }
 
     fn press(launcher: &mut Launcher, code: KeyCode) -> Outcome {
@@ -1359,6 +1521,7 @@ mod tests {
             target: 1,
             history: Vec::new(),
             codex_models: Vec::new(),
+            background: false,
         });
         assert!(panel.is_new_worktree());
     }

@@ -81,10 +81,10 @@ enum Command {
         #[arg(short, long, value_name = "BRANCH")]
         worktree: Option<String>,
 
-        /// Give the agent this to do, as its first prompt, which makes the
-        /// session a task: open until it's closed with `crystal done`. A
-        /// prompt given as the agent's only argument, like `claude "fix
-        /// it"`, does the same.
+        /// Give the session this to do, which makes it a task: open until
+        /// it's closed with `crystal done`. An agent crystal knows gets it
+        /// as its first prompt. A prompt given as the agent's only
+        /// argument, like `claude "fix it"`, makes a task too.
         #[arg(short, long, value_name = "TEXT")]
         task: Option<String>,
 

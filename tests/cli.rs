@@ -739,11 +739,14 @@ fn n_starts_claude_with_its_hooks_and_the_task_as_its_prompt() {
     tui.type_keys("\r");
     tui.shows("▸ claude");
 
+    // Given a task, Claude is told how to close it, ahead of the prompt.
     let args = written(&crystal.dir.path().join("args"));
     let args: Vec<&str> = args.lines().collect();
-    assert_eq!(args.len(), 3, "{args:?}");
+    assert_eq!(args.len(), 5, "{args:?}");
     assert_eq!(args[0], "--settings");
-    assert_eq!(args[2], "fix the login bug");
+    assert_eq!(args[2], "--append-system-prompt");
+    assert!(args[3].contains("crystal done"), "{args:?}");
+    assert_eq!(args[4], "fix the login bug");
 }
 
 #[test]
@@ -793,7 +796,10 @@ fn codex_starts_with_the_model_chosen_and_the_task() {
     tui.shows("runs  codex -m gpt-test-mini 'add a test'");
     tui.type_keys("\r");
     tui.shows("▸ codex");
-    assert_eq!(codex_args(&crystal), ["-m", "gpt-test-mini", "add a test"]);
+    // Codex hears how to close its task at the end of its first prompt.
+    let args = codex_args(&crystal);
+    assert_eq!(args[..3], ["-m", "gpt-test-mini", "add a test"]);
+    assert!(args.last().unwrap().contains("crystal done"), "{args:?}");
 }
 
 #[test]
@@ -864,8 +870,9 @@ prompt = "Review the change."
     tui.type_keys("\r");
     tui.shows("▸ claude");
 
+    // After the hooks and what crystal tells Claude about its task.
     let args = written(&crystal.dir.path().join("args"));
-    let after_hooks: Vec<&str> = args.lines().skip(2).collect();
+    let after_hooks: Vec<&str> = args.lines().skip(4).collect();
     assert_eq!(
         after_hooks,
         [
@@ -4201,4 +4208,90 @@ fn a_task_started_from_the_backlog_ticks_its_item_when_it_closes_done() {
         crystal.ok(&["backlog", "-C", repo_dir, "--all"]),
         "#1    ✓ write the docs\n"
     );
+}
+
+#[test]
+fn c_in_the_tui_closes_the_selected_sessions_task_with_a_line_on_it() {
+    let crystal = Crystal::new();
+    crystal.ok(&[
+        "new",
+        "-d",
+        "-n",
+        "fixer",
+        "-t",
+        "fix the tests",
+        "sleep",
+        "30",
+    ]);
+    let mut tui = crystal.tui();
+    // The task shows under its session and in its pane's header.
+    tui.shows("task: fix the tests");
+
+    tui.type_keys("c");
+    tui.shows("close fixer's task?");
+    tui.type_keys("d");
+    tui.shows("done; what was done:");
+    tui.type_keys("all green\r");
+    tui.shows("✓ all green");
+    assert_eq!(crystal.row("fixer").unwrap()[8], "✓ all green");
+    let tasks = crystal.ok(&["tasks"]);
+    assert!(tasks.contains("fix the tests — all green"), "{tasks}");
+}
+
+#[test]
+fn b_opens_the_projects_backlog_to_add_to_and_tick_off() {
+    let crystal = Crystal::new();
+    let repo = git_repo(crystal.dir.path(), "shop");
+    let repo_dir = repo.to_str().unwrap();
+    crystal.ok(&["backlog", "-C", repo_dir, "add", "write the docs"]);
+    crystal.ok(&["new", "-d", "-n", "agent", "-c", repo_dir, "sleep", "30"]);
+    let mut tui = crystal.tui();
+    // The project's heading counts what's to do.
+    tui.shows("1 to do");
+
+    tui.type_keys("b");
+    tui.shows("backlog · shop");
+    tui.shows("write the docs");
+    tui.type_keys("a");
+    tui.shows("add to the backlog:");
+    tui.type_keys("fix the cart\r");
+    tui.shows("#2");
+    tui.shows("fix the cart");
+
+    // Space ticks off the item the bar is on, the first.
+    tui.type_keys(" ");
+    eventually("#1 is done", || {
+        crystal.ok(&["backlog", "-C", repo_dir]) == "#2    fix the cart\n"
+    });
+    tui.shows("✓ write the docs");
+    tui.type_keys("\x1b");
+    tui.hides("backlog · shop");
+}
+
+#[test]
+fn the_panel_starts_claude_in_the_background_as_a_task() {
+    let crystal = Crystal::new();
+    let dir = crystal.dir.path();
+    let bin = print_claude(dir);
+    let path = path_of(&[&bin]);
+    let mut tui = crystal.attach_with_env(&[], &[("PATH", &path)]);
+
+    tui.type_keys("n");
+    tui.shows("in a terminal");
+    // The task, then Tab to what runs, Tab to how, and right to the
+    // background.
+    tui.type_keys("fix the tests\t\t\x1b[C");
+    tui.shows("New background task");
+    tui.shows("runs  claude -p 'fix the tests'");
+    tui.type_keys("\r");
+
+    assert_eq!(
+        runs(dir, 1),
+        ["-p --output-format stream-json --verbose -- fix the tests"]
+    );
+    assert_eq!(crystal.row("task").unwrap()[8], "fix the tests");
+    finish_run(dir, 1);
+    eventually("the task has closed", || {
+        crystal.row("task").unwrap()[8] == "✓ All green on run 1."
+    });
 }
