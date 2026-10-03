@@ -15,6 +15,7 @@ pub enum Section {
     Sidebar,
     Pane,
     Question,
+    NewSession,
     Mouse,
 }
 
@@ -24,6 +25,7 @@ impl Section {
             Section::Sidebar => "In the sidebar",
             Section::Pane => "In a pane",
             Section::Question => "Answering a question",
+            Section::NewSession => "Starting a session",
             Section::Mouse => "With the mouse",
         }
     }
@@ -63,9 +65,12 @@ pub const KEYS: &[Key] = &[
     in_pane("Shift+PgDn", "page forward"),
     in_pane("other keys", "go to the program"),
     question("y", "yes; any other key, no"),
-    question("Enter", "answer"),
-    question("Esc", "cancel"),
+    question("Enter/Esc", "answer / cancel"),
     question("Ctrl+U", "clear the answer"),
+    new_session("Tab ←/→", "next row, choose"),
+    new_session("↑/↓", "earlier tasks"),
+    new_session("Alt+Enter", "new line in the task"),
+    new_session("Ctrl+E", "edit the command line"),
     mouse("click", "select; focus a pane"),
     mouse("wheel", "move, or scroll a pane"),
     mouse("Shift+drag", "select text"),
@@ -95,6 +100,14 @@ const fn question(label: &'static str, does: &'static str) -> Key {
     }
 }
 
+const fn new_session(label: &'static str, does: &'static str) -> Key {
+    Key {
+        label,
+        does,
+        section: Section::NewSession,
+    }
+}
+
 const fn mouse(label: &'static str, does: &'static str) -> Key {
     Key {
         label,
@@ -107,7 +120,12 @@ const fn mouse(label: &'static str, does: &'static str) -> Key {
 const LEFT: &[Section] = &[Section::Sidebar];
 
 /// The overlay's right column: everything else.
-const RIGHT: &[Section] = &[Section::Pane, Section::Question, Section::Mouse];
+const RIGHT: &[Section] = &[
+    Section::Pane,
+    Section::Question,
+    Section::NewSession,
+    Section::Mouse,
+];
 
 /// Space between the two columns.
 const GAP: u16 = 2;

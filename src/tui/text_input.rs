@@ -46,6 +46,15 @@ impl TextInput {
         }
     }
 
+    /// Puts `text` in at the cursor, the way a paste does. The box holds
+    /// one line, so the text's line breaks become spaces.
+    pub fn insert_str(&mut self, text: &str) {
+        for c in text.trim_end_matches(['\r', '\n']).chars() {
+            let c = if c == '\n' || c == '\r' { ' ' } else { c };
+            self.insert(c);
+        }
+    }
+
     fn insert(&mut self, c: char) {
         let at = self.byte_index(self.cursor);
         self.text.insert(at, c);

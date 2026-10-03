@@ -8,12 +8,15 @@ use super::diff_view::{self, Against, DiffView};
 use super::finder::Finder;
 use super::groups::{self, Row};
 use super::issues::IssuesView;
+use super::launcher::{self, Launcher, Memory, Run, Setup, Target};
 use super::search;
 use super::text_input::TextInput;
-use crate::config::Config;
+use crate::catalog::{self, Agent};
+use crate::config::{Config, Preset};
 use crate::github::{self, PullRequest};
 use crate::keys;
 use crate::protocol::{Activity, SessionInfo, State};
+use crate::shell;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -117,15 +120,8 @@ pub struct Prompt {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Question {
-    /// The branch for a new worktree. The command to run there is asked
-    /// for next, starting out with `command`, or else the one used last.
-    /// The worktree is made in the repository at `base`, or else the
-    /// selected session's.
-    Branch {
-        base: Option<PathBuf>,
-        command: Option<String>,
-    },
-    /// The command line for a new session, which starts at the place.
+    /// The command line for a new session, which starts at the place: what
+    /// the new-session panel hands over to with Ctrl+E.
     Command(Place),
     /// A new name for the session now called this.
     Rename(String),
@@ -190,6 +186,13 @@ pub enum Action {
         to: Slot,
         key: KeyEvent,
     },
+    /// Hand pasted text to the session in the pane at `to`.
+    Paste {
+        to: Slot,
+        text: String,
+    },
+    /// Ask Codex, off the event loop, which models it lets the user choose.
+    ReadCodexModels,
     /// Show a page further back into the history of the pane at this slot.
     PageBack(Slot),
     /// Show a page further toward live in the pane at this slot.
@@ -249,9 +252,20 @@ pub struct App {
     selected: usize,
     /// The question on the footer line, while one is being answered.
     prompt: Option<Prompt>,
-    /// The command line the last new session was started with, which the
-    /// next one starts out with.
-    last_command: String,
+    /// The new-session panel, while it's open.
+    launcher: Option<Launcher>,
+    /// The agents installed on this machine, which the panel offers.
+    agents: Vec<&'static Agent>,
+    /// The presets the panel offers first, from the config file.
+    presets: Vec<Preset>,
+    /// What the panel picks at first, until something has been started
+    /// from it: the config's `new_session`, by [`Run::key`].
+    first_run: Option<String>,
+    /// What the panel remembers: earlier tasks, and what ran last.
+    memory: Memory,
+    /// The models Codex lets the user choose, once asked for; empty while
+    /// the answer is on its way.
+    codex_models: Option<Vec<String>>,
     /// A yes-or-no question on the footer line, until it's answered.
     confirm: Option<Confirm>,
     /// Sessions split off into panes of their own, by name, in the order
@@ -290,7 +304,12 @@ impl App {
             sessions: Vec::new(),
             selected: 0,
             prompt: None,
-            last_command: Config::default().new_session,
+            launcher: None,
+            agents: Vec::new(),
+            presets: Vec::new(),
+            first_run: None,
+            memory: Memory::default(),
+            codex_models: None,
             confirm: None,
             splits: Vec::new(),
             focus: Focus::Sidebar,
@@ -305,10 +324,57 @@ impl App {
         }
     }
 
-    /// Sets what the new-session prompt starts out with, until a session
-    /// has been started from it: the config's `new_session`.
-    pub fn set_first_command(&mut self, command: String) {
-        self.last_command = command;
+    /// The agents installed on this machine, for the new-session panel.
+    pub fn set_agents(&mut self, agents: Vec<&'static Agent>) {
+        self.agents = agents;
+    }
+
+    /// Takes what the config file says about starting sessions: its
+    /// presets, and `new_session`, what the panel picks at first. A
+    /// `new_session` with arguments, like `codex --full-auto`, is offered
+    /// as a preset of its own.
+    pub fn set_launch_settings(&mut self, config: &Config) {
+        self.presets = config.presets.clone();
+        let words = command_line::parse(&config.new_session).unwrap_or_default();
+        let Some((program, args)) = words.split_first() else {
+            return;
+        };
+        if args.is_empty() {
+            self.first_run = Some(program.clone());
+        } else if catalog::find(program).is_some() {
+            let preset = Preset {
+                name: config.new_session.clone(),
+                agent: program.clone(),
+                model: None,
+                mode: None,
+                args: args.to_vec(),
+                prompt: None,
+            };
+            self.first_run = Some(Run::Preset(preset.clone()).key());
+            self.presets.insert(0, preset);
+        }
+    }
+
+    /// What the panel remembers, as kept on disk.
+    pub fn set_memory(&mut self, memory: Memory) {
+        self.memory = memory;
+    }
+
+    pub fn memory(&self) -> &Memory {
+        &self.memory
+    }
+
+    /// The new-session panel, while it's open.
+    pub fn launcher(&self) -> Option<&Launcher> {
+        self.launcher.as_ref()
+    }
+
+    /// Takes the models Codex lets the user choose.
+    pub fn set_codex_models(&mut self, models: Vec<String>) {
+        if let Some(launcher) = &mut self.launcher {
+            launcher.set_codex_models(models.clone());
+        }
+        self.codex_models = Some(models);
     }
 
     pub fn notice(&self) -> Option<&str> {
@@ -647,6 +713,9 @@ impl App {
             }
             return None;
         }
+        if self.launcher.is_some() {
+            return self.on_launcher_key(key);
+        }
         if self.prompt.is_some() {
             return self.on_prompt_key(key);
         }
@@ -682,8 +751,8 @@ impl App {
             return None;
         }
         // A question on the footer waits for its answer from the keyboard,
-        // and so do the filter and the issues view.
-        let typing = self.filter.is_some() || self.issues.is_some();
+        // and so do the filter, the issues view and the new-session panel.
+        let typing = self.filter.is_some() || self.issues.is_some() || self.launcher.is_some();
         if self.prompt.is_some() || self.confirm.is_some() || typing {
             return None;
         }
@@ -743,8 +812,8 @@ impl App {
             KeyCode::Char('s') => self.toggle_split(),
             KeyCode::PageUp => return Some(Action::PageBack(self.selected_slot()?)),
             KeyCode::PageDown => return Some(Action::PageForward(self.selected_slot()?)),
-            KeyCode::Char('n') => self.ask_for_command(self.selected_place()),
-            KeyCode::Char('w') => self.ask_for_branch(None, None, ""),
+            KeyCode::Char('n') => return self.open_launcher(false),
+            KeyCode::Char('w') => return self.open_launcher(true),
             KeyCode::Char('W') => self.ask_to_remove_worktree(),
             KeyCode::Char('r') => self.ask_for_name(),
             KeyCode::Char('x') => self.confirm = Some(Confirm::Kill(self.selected()?.name.clone())),
@@ -900,13 +969,6 @@ impl App {
         }
     }
 
-    /// Asks for the branch of a new worktree, starting out with `branch`.
-    /// `base` and `command` say where it's made and what runs in it, when
-    /// they're known already, as for an issue.
-    fn ask_for_branch(&mut self, base: Option<PathBuf>, command: Option<String>, branch: &str) {
-        self.ask(Question::Branch { base, command }, branch);
-    }
-
     /// Opens `/`'s filter, its bar on the selected session.
     fn open_filter(&mut self) {
         let highlighted = self.selected().map(|session| session.id.clone());
@@ -1038,7 +1100,7 @@ impl App {
     fn on_issues_key(&mut self, key: KeyEvent) -> Option<Action> {
         match key.code {
             KeyCode::Esc => self.issues = None,
-            KeyCode::Enter => self.start_on_issue(),
+            KeyCode::Enter => return self.start_on_issue(),
             _ => {
                 if let Some(view) = &mut self.issues {
                     view.on_key(&key);
@@ -1048,23 +1110,174 @@ impl App {
         None
     }
 
-    /// Closes the issues view and asks for a new worktree for the issue the
-    /// bar was on: a branch named after it, and then, to run there, an
-    /// agent asked to fix it, with the issue's address so it can read it.
-    fn start_on_issue(&mut self) {
-        let Some(view) = self.issues.take() else {
-            return;
-        };
+    /// Closes the issues view and opens the new-session panel for the issue
+    /// the bar was on: a new worktree on a branch named after it, and the
+    /// task to fix it, with the issue's address so the agent can read it.
+    fn start_on_issue(&mut self) -> Option<Action> {
+        let view = self.issues.take()?;
         let Some(issue) = view.highlighted() else {
             self.issues = Some(view);
-            return;
+            return None;
         };
         let branch = github::branch_for_issue(issue.number, &issue.title);
-        let command = format!(
-            "claude Fix issue #{}: {} ({})",
+        let task = format!(
+            "Fix issue #{}: {} ({})",
             issue.number, issue.title, issue.url
         );
-        self.ask_for_branch(Some(view.project.clone()), Some(command), &branch);
+        let mut setup = self.launch_setup(true);
+        if let Some(Target::NewWorktree { base, .. }) = setup.targets.get_mut(1) {
+            *base = Some(view.project.clone());
+        }
+        self.launcher = Some(Launcher::new(setup).with_task(&task, &branch));
+        self.codex_models_wanted()
+    }
+
+    /// Opens the new-session panel, set to start in a new worktree when
+    /// `worktree` is set, or else where the selected session runs.
+    fn open_launcher(&mut self, worktree: bool) -> Option<Action> {
+        let setup = self.launch_setup(worktree);
+        self.launcher = Some(Launcher::new(setup));
+        self.codex_models_wanted()
+    }
+
+    /// What the panel opens with: what can run, with what to pick first,
+    /// where it can start, and the tasks given before.
+    fn launch_setup(&self, worktree: bool) -> Setup {
+        let mut runs: Vec<Run> = self
+            .presets
+            .iter()
+            .filter(|preset| {
+                self.agents
+                    .iter()
+                    .any(|agent| agent.program == preset.agent)
+            })
+            .cloned()
+            .map(Run::Preset)
+            .collect();
+        runs.extend(self.agents.iter().map(|agent| Run::Agent(agent)));
+        runs.push(Run::Shell);
+        let wanted = [self.memory.last_run.as_ref(), self.first_run.as_ref()];
+        let picked = wanted
+            .into_iter()
+            .flatten()
+            .find_map(|key| runs.iter().position(|run| run.key() == *key));
+        let first_agent = runs.iter().position(|run| matches!(run, Run::Agent(_)));
+        let run = picked.or(first_agent).unwrap_or(runs.len() - 1);
+        Setup {
+            runs,
+            run,
+            targets: self.launch_targets(),
+            target: usize::from(worktree),
+            history: self.memory.tasks.clone(),
+            codex_models: self.codex_models.clone().unwrap_or_default(),
+        }
+    }
+
+    /// Where a new session can start: where the selected session is, a new
+    /// worktree of its project, or another project's main worktree.
+    fn launch_targets(&self) -> Vec<Target> {
+        let selected = self.selected();
+        let worktree = selected.and_then(|session| session.worktree.as_ref());
+        let here = match (selected, worktree) {
+            (Some(_), Some(worktree)) => Target::Here {
+                dir: Some(worktree.path.clone()),
+                label: worktree_label(worktree),
+            },
+            (Some(session), None) => Target::Here {
+                dir: Some(session.cwd.clone()),
+                label: shell::home_relative(&session.cwd),
+            },
+            (None, _) => Target::Here {
+                dir: None,
+                label: "this directory".to_string(),
+            },
+        };
+        let mut targets = vec![
+            here,
+            Target::NewWorktree {
+                base: self.worktree_base(),
+                project: worktree.map(|worktree| worktree.project.clone()),
+            },
+        ];
+        let current = worktree.map(|worktree| &worktree.project_path);
+        let mut others: Vec<Target> = Vec::new();
+        for worktree in self.sessions.iter().filter_map(|s| s.worktree.as_ref()) {
+            let path = &worktree.project_path;
+            let seen = others
+                .iter()
+                .any(|target| matches!(target, Target::Project { path: p, .. } if p == path));
+            if Some(path) != current && !seen {
+                others.push(Target::Project {
+                    path: path.clone(),
+                    label: worktree.project.clone(),
+                });
+            }
+        }
+        targets.extend(others);
+        targets
+    }
+
+    /// Asks Codex for its models the first time the panel could show them.
+    fn codex_models_wanted(&mut self) -> Option<Action> {
+        let has_codex = self.agents.iter().any(|agent| agent.program == "codex");
+        if !has_codex || self.codex_models.is_some() {
+            return None;
+        }
+        self.codex_models = Some(Vec::new());
+        Some(Action::ReadCodexModels)
+    }
+
+    /// Keys while the new-session panel is open: all of them are its.
+    fn on_launcher_key(&mut self, key: KeyEvent) -> Option<Action> {
+        let outcome = self.launcher.as_mut()?.on_key(key);
+        match outcome {
+            launcher::Outcome::Stay => None,
+            launcher::Outcome::Cancel => {
+                self.launcher = None;
+                None
+            }
+            launcher::Outcome::Start {
+                place,
+                command,
+                task,
+                run,
+            } => {
+                self.launcher = None;
+                self.memory.remember(&task, &run);
+                Some(Action::Start { place, command })
+            }
+            launcher::Outcome::CommandLine { place, line } => {
+                self.launcher = None;
+                self.ask(Question::Command(place), &line);
+                None
+            }
+        }
+    }
+
+    /// Pasted text: into whichever text box has the keyboard, or else to
+    /// the session in the pane that has it. Anywhere else, like the
+    /// sidebar, where letters are commands, a paste does nothing.
+    pub fn on_paste(&mut self, text: String) -> Option<Action> {
+        if let Some(View::Files(finder)) = &mut self.view {
+            let outcome = finder.on_paste(&text);
+            return self.follow(outcome);
+        }
+        if self.view.is_some() || self.showing_keys || self.confirm.is_some() {
+            return None;
+        }
+        if let Some(launcher) = &mut self.launcher {
+            launcher.on_paste(&text);
+        } else if let Some(prompt) = &mut self.prompt {
+            prompt.input.insert_str(&text);
+        } else if let Some(issues) = &mut self.issues {
+            issues.on_paste(&text);
+        } else if let Some(filter) = &mut self.filter {
+            filter.input.insert_str(&text);
+            self.keep_filter_bar_on_a_match();
+        } else if let Focus::Pane(slot) = self.focus {
+            return Some(Action::Paste { to: slot, text });
+        }
+        None
     }
 
     fn ask(&mut self, question: Question, answer: &str) {
@@ -1072,13 +1285,6 @@ impl App {
             question,
             input: TextInput::with_text(answer),
         });
-    }
-
-    /// Asks what to run in a new session at `place`, starting out with the
-    /// command line used last.
-    fn ask_for_command(&mut self, place: Place) {
-        let last = self.last_command.clone();
-        self.ask(Question::Command(place), &last);
     }
 
     /// Keys while a question is asked: Enter answers it, Esc gives up, and
@@ -1102,35 +1308,18 @@ impl App {
         }
     }
 
-    /// What an answered question leads to: a branch, to asking what to run
-    /// there; a command line, to a new session.
+    /// What an answered question leads to: a command line, to a new
+    /// session; a name, to a rename.
     fn answer(&mut self, prompt: Prompt) -> Option<Action> {
         let answer = prompt.input.text().trim().to_string();
         match prompt.question {
-            Question::Branch { base, command } => {
-                if !answer.is_empty() {
-                    let base = base.or_else(|| self.worktree_base());
-                    let command = command.unwrap_or_else(|| self.last_command.clone());
-                    let place = Place::NewWorktree {
-                        branch: answer,
-                        base,
-                    };
-                    self.ask(Question::Command(place), &command);
+            Question::Command(place) => match command_line::parse(&answer) {
+                Ok(command) => Some(Action::Start { place, command }),
+                Err(err) => {
+                    self.notify(err);
+                    None
                 }
-                None
-            }
-            Question::Command(place) => {
-                // Kept even when it doesn't read, so that the next `n`
-                // brings it back to put right.
-                self.last_command = answer.clone();
-                match command_line::parse(&answer) {
-                    Ok(command) => Some(Action::Start { place, command }),
-                    Err(err) => {
-                        self.notify(err);
-                        None
-                    }
-                }
-            }
+            },
             // An empty answer, or the name it already has, changes nothing.
             Question::Rename(name) => {
                 if answer.is_empty() || answer == name {
@@ -1143,13 +1332,6 @@ impl App {
                 }
             }
         }
-    }
-
-    /// Where `n` starts a session: where the selected session runs, or the
-    /// TUI's own directory when nothing is selected.
-    fn selected_place(&self) -> Place {
-        let dir = self.selected().map(|session| session.cwd.clone());
-        Place::Directory(dir)
     }
 
     /// Where a new worktree is made from: the selected session's project,
@@ -1292,6 +1474,14 @@ impl App {
     }
 }
 
+/// A worktree the way the panel names it: `payments ⌂ main` for a
+/// project's main worktree, `payments ⎇ fix/login` for a linked one.
+fn worktree_label(worktree: &crate::protocol::Worktree) -> String {
+    let mark = if worktree.main { "⌂" } else { "⎇" };
+    let branch = worktree.branch.as_deref().unwrap_or("(detached)");
+    format!("{} {mark} {branch}", worktree.project)
+}
+
 /// What a session editing the file at `path` is called: the file's name,
 /// with no spaces, which session names can't have.
 fn edit_name(path: &str) -> String {
@@ -1414,14 +1604,6 @@ mod tests {
         press(&mut app, KeyCode::Char('u'));
         assert_eq!(selected_name(&app), Some("a"));
         assert_eq!(app.notice(), Some("nothing needs you"));
-    }
-
-    #[test]
-    fn the_config_sets_what_a_new_session_starts_out_with() {
-        let mut app = app_with(&["a"]);
-        app.set_first_command("codex".to_string());
-        press(&mut app, KeyCode::Char('n'));
-        assert_eq!(app.prompt().unwrap().input.text(), "codex");
     }
 
     #[test]
@@ -1596,44 +1778,111 @@ mod tests {
         Some(Action::Start { place, command })
     }
 
-    #[test]
-    fn n_starts_out_with_claude_and_enter_starts_it_where_the_selection_runs() {
-        let mut app = app_with(&["a"]);
-        press(&mut app, KeyCode::Char('n'));
-        assert_eq!(prompt_text(&app), Some("claude"));
+    /// An app on a machine where these agents are installed.
+    fn with_agents(programs: &[&str], sessions: Vec<SessionInfo>) -> App {
+        let mut app = App::new(None);
+        let agents = programs.iter().map(|p| catalog::find(p).unwrap()).collect();
+        app.set_agents(agents);
+        app.set_sessions(sessions);
+        app
+    }
 
-        let place = Place::Directory(Some(PathBuf::from("/")));
-        assert_eq!(press(&mut app, KeyCode::Enter), start(place, &["claude"]));
-        assert!(app.prompt().is_none());
+    fn run_key(app: &App) -> String {
+        app.launcher().unwrap().run().key()
     }
 
     #[test]
-    fn an_agents_first_prompt_goes_as_one_argument() {
-        let mut app = App::new(None);
-        press(&mut app, KeyCode::Char('n'));
-        type_text(&mut app, " fix the login bug");
+    fn n_opens_the_panel_and_enter_starts_where_the_selection_runs() {
+        let mut app = with_agents(&["claude"], vec![in_project("agent", "app")]);
+        assert_eq!(press(&mut app, KeyCode::Char('n')), None);
+        assert!(app.launcher().is_some());
+        type_text(&mut app, "fix the login bug");
+        let place = Place::Directory(Some(PathBuf::from("/code/app")));
         assert_eq!(
             press(&mut app, KeyCode::Enter),
-            start(Place::Directory(None), &["claude", "fix the login bug"])
+            start(place, &["claude", "fix the login bug"])
+        );
+        assert!(app.launcher().is_none());
+        assert_eq!(app.memory().tasks, ["fix the login bug"]);
+        assert_eq!(app.memory().last_run.as_deref(), Some("claude"));
+    }
+
+    #[test]
+    fn keys_go_to_the_panel_while_it_is_open() {
+        let mut app = with_agents(&["claude"], vec![session("a"), session("b")]);
+        press(&mut app, KeyCode::Char('n'));
+        // q and x would quit and kill on the list; here they're the task.
+        type_text(&mut app, "qx");
+        assert_eq!(app.launcher().unwrap().task().text(), "qx");
+        assert_eq!(selected_name(&app), Some("a"));
+        assert_eq!(press(&mut app, KeyCode::Esc), None);
+        assert!(app.launcher().is_none());
+    }
+
+    #[test]
+    fn the_panel_picks_what_ran_last_then_the_configs_choice() {
+        let mut app = with_agents(&["claude", "codex"], vec![]);
+        press(&mut app, KeyCode::Char('n'));
+        assert_eq!(run_key(&app), "claude");
+        press(&mut app, KeyCode::Esc);
+
+        app.set_launch_settings(&Config {
+            new_session: "codex".into(),
+            ..Config::default()
+        });
+        press(&mut app, KeyCode::Char('n'));
+        assert_eq!(run_key(&app), "codex");
+        press(&mut app, KeyCode::Esc);
+
+        app.set_memory(Memory {
+            tasks: Vec::new(),
+            last_run: Some("shell".into()),
+        });
+        press(&mut app, KeyCode::Char('n'));
+        assert_eq!(run_key(&app), "shell");
+    }
+
+    #[test]
+    fn a_new_session_setting_with_arguments_is_offered_as_a_preset() {
+        let mut app = with_agents(&["codex"], vec![]);
+        app.set_launch_settings(&Config {
+            new_session: "codex --full-auto".into(),
+            ..Config::default()
+        });
+        press(&mut app, KeyCode::Char('n'));
+        assert_eq!(run_key(&app), "preset:codex --full-auto");
+        type_text(&mut app, "go");
+        assert_eq!(
+            press(&mut app, KeyCode::Enter),
+            start(Place::Directory(None), &["codex", "--full-auto", "go"])
         );
     }
 
     #[test]
-    fn the_next_n_starts_out_with_the_command_used_last() {
-        let mut app = App::new(None);
+    fn presets_for_agents_not_installed_are_left_out() {
+        let mut app = with_agents(&["claude"], vec![]);
+        let preset = |name: &str, agent: &str| Preset {
+            name: name.into(),
+            agent: agent.into(),
+            model: None,
+            mode: None,
+            args: Vec::new(),
+            prompt: None,
+        };
+        app.set_launch_settings(&Config {
+            presets: vec![preset("review", "claude"), preset("fast", "codex")],
+            ..Config::default()
+        });
         press(&mut app, KeyCode::Char('n'));
-        answer(&mut app, "codex --model o3");
-        press(&mut app, KeyCode::Enter);
-
-        press(&mut app, KeyCode::Char('n'));
-        assert_eq!(prompt_text(&app), Some("codex --model o3"));
+        let rows = app.launcher().unwrap().choice_rows();
+        assert_eq!(rows[0].2, ["review", "Claude Code", "shell"]);
     }
 
     #[test]
-    fn an_empty_line_starts_the_shell() {
+    fn with_no_agent_installed_the_panel_starts_a_shell() {
         let mut app = App::new(None);
         press(&mut app, KeyCode::Char('n'));
-        answer(&mut app, "");
+        assert_eq!(run_key(&app), "shell");
         assert_eq!(
             press(&mut app, KeyCode::Enter),
             start(Place::Directory(None), &[])
@@ -1641,73 +1890,93 @@ mod tests {
     }
 
     #[test]
-    fn a_line_that_does_not_read_says_why_and_comes_back_to_put_right() {
-        let mut app = App::new(None);
-        press(&mut app, KeyCode::Char('n'));
-        answer(&mut app, "echo 'oops");
-        assert_eq!(press(&mut app, KeyCode::Enter), None);
-        assert_eq!(app.notice(), Some("a quote isn't closed"));
-
-        press(&mut app, KeyCode::Char('n'));
-        assert_eq!(prompt_text(&app), Some("echo 'oops"));
-    }
-
-    #[test]
-    fn keys_go_to_the_prompt_while_it_is_open() {
-        let mut app = app_with(&["a", "b"]);
+    fn w_opens_the_panel_on_a_new_worktree_named_after_the_task() {
+        let mut app = with_agents(&["claude"], vec![in_project("agent", "app")]);
         press(&mut app, KeyCode::Char('w'));
-        // q and x would quit and kill on the list; here they're letters.
-        type_text(&mut app, "qx");
-        assert_eq!(prompt_text(&app), Some("qx"));
-        assert_eq!(selected_name(&app), Some("a"));
-    }
-
-    #[test]
-    fn w_asks_for_a_branch_then_what_to_run_in_the_new_worktree() {
-        let mut app = App::new(None);
-        app.set_sessions(vec![in_project("agent", "app")]);
-        press(&mut app, KeyCode::Char('w'));
-        type_text(&mut app, "fix/typo");
-        assert_eq!(press(&mut app, KeyCode::Enter), None);
-        assert_eq!(prompt_text(&app), Some("claude"));
-
+        type_text(&mut app, "fix typo");
         let place = Place::NewWorktree {
-            branch: "fix/typo".into(),
+            branch: "fix-typo".into(),
             base: Some(PathBuf::from("/code/app")),
         };
-        answer(&mut app, "npm test");
         assert_eq!(
             press(&mut app, KeyCode::Enter),
-            start(place, &["npm", "test"])
+            start(place, &["claude", "fix typo"])
         );
-        assert!(app.prompt().is_none());
-    }
-
-    #[test]
-    fn esc_or_an_empty_branch_gives_up_on_the_new_worktree() {
-        let mut app = app_with(&["a"]);
-        press(&mut app, KeyCode::Char('w'));
-        type_text(&mut app, "feat");
-        assert_eq!(press(&mut app, KeyCode::Esc), None);
-        assert!(app.prompt().is_none());
-
-        press(&mut app, KeyCode::Char('w'));
-        type_text(&mut app, "  ");
-        assert_eq!(press(&mut app, KeyCode::Enter), None);
-        assert!(app.prompt().is_none());
     }
 
     #[test]
     fn outside_a_repository_the_worktree_is_made_from_the_tuis_directory() {
-        let mut app = app_with(&["shell"]);
+        let mut app = with_agents(&["claude"], vec![session("shell")]);
         press(&mut app, KeyCode::Char('w'));
         type_text(&mut app, "feat");
-        press(&mut app, KeyCode::Enter);
         let place = Place::NewWorktree {
             branch: "feat".into(),
             base: None,
         };
-        assert_eq!(press(&mut app, KeyCode::Enter), start(place, &["claude"]));
+        assert_eq!(
+            press(&mut app, KeyCode::Enter),
+            start(place, &["claude", "feat"])
+        );
+    }
+
+    #[test]
+    fn other_projects_are_places_to_start_in() {
+        let sessions = vec![in_project("a", "app"), in_project("b", "billing")];
+        let mut app = with_agents(&["claude"], sessions);
+        press(&mut app, KeyCode::Char('n'));
+        let rows = app.launcher().unwrap().choice_rows();
+        let places = &rows.last().unwrap().2;
+        assert_eq!(places, &["here", "new worktree", "billing"]);
+    }
+
+    #[test]
+    fn ctrl_e_hands_the_command_to_the_command_line() {
+        let mut app = with_agents(&["claude"], vec![]);
+        press(&mut app, KeyCode::Char('n'));
+        type_text(&mut app, "fix it");
+        app.on_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
+        assert!(app.launcher().is_none());
+        assert_eq!(prompt_text(&app), Some("claude 'fix it'"));
+        assert_eq!(
+            press(&mut app, KeyCode::Enter),
+            start(Place::Directory(None), &["claude", "fix it"])
+        );
+    }
+
+    #[test]
+    fn a_paste_goes_to_the_panel_or_else_to_the_pane_typed_into() {
+        let mut app = with_agents(&["claude"], vec![session("a")]);
+        press(&mut app, KeyCode::Char('n'));
+        assert_eq!(app.on_paste("one\ntwo".into()), None);
+        assert_eq!(app.launcher().unwrap().task().text(), "one\ntwo");
+        press(&mut app, KeyCode::Esc);
+
+        // In the sidebar, where its letters would be commands, it's dropped.
+        assert_eq!(app.on_paste("xq".into()), None);
+        assert!(app.confirm().is_none());
+
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(
+            app.on_paste("ls\n".into()),
+            Some(Action::Paste {
+                to: Slot::Selected,
+                text: "ls\n".into()
+            })
+        );
+    }
+
+    #[test]
+    fn codex_is_asked_for_its_models_once() {
+        let mut app = with_agents(&["codex"], vec![]);
+        assert_eq!(
+            press(&mut app, KeyCode::Char('n')),
+            Some(Action::ReadCodexModels)
+        );
+        app.set_codex_models(vec!["gpt-6-luna".into()]);
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(press(&mut app, KeyCode::Char('n')), None);
+        let rows = app.launcher().unwrap().choice_rows();
+        assert_eq!(rows[1].2, ["default", "gpt-6-luna"]);
     }
 
     #[test]
@@ -2274,9 +2543,8 @@ mod tests {
     }
 
     #[test]
-    fn enter_on_an_issue_asks_for_its_branch_then_what_to_run() {
-        let mut app = App::new(None);
-        app.set_sessions(vec![in_repo("planner", "main")]);
+    fn enter_on_an_issue_opens_the_panel_ready_to_fix_it() {
+        let mut app = with_agents(&["claude"], vec![in_repo("planner", "main")]);
         assert_eq!(
             press(&mut app, KeyCode::Char('i')),
             Some(Action::ListIssues(PathBuf::from("/code/app")))
@@ -2287,12 +2555,12 @@ mod tests {
         );
         press(&mut app, KeyCode::Enter);
         assert!(app.issues_view().is_none());
-        assert_eq!(prompt_text(&app), Some("42-fix-login-redirect"));
-
-        press(&mut app, KeyCode::Enter);
-        let command = "claude Fix issue #42: Fix login redirect \
-                       (https://github.com/acme/app/issues/42)";
-        assert_eq!(prompt_text(&app), Some(command));
+        let panel = app.launcher().unwrap();
+        assert_eq!(panel.title(), "New session · app ⎇ 42-fix-login-redirect");
+        assert_eq!(
+            panel.task().text(),
+            "Fix issue #42: Fix login redirect (https://github.com/acme/app/issues/42)"
+        );
         let Some(Action::Start { place, command }) = press(&mut app, KeyCode::Enter) else {
             panic!("Enter should start the session");
         };

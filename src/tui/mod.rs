@@ -15,20 +15,22 @@ mod fuzzy;
 mod groups;
 mod help;
 mod issues;
+mod launcher;
 mod mouse;
 mod pane;
 mod screen_widget;
 mod search;
 mod sidebar;
 mod status;
+mod text_area;
 mod text_input;
 mod theme;
 mod ui;
 
 use crate::config::Config;
 use crate::github::{self, Issue, PullRequest};
-use crate::keys;
 use crate::protocol::{Request, Response, SessionInfo};
+use crate::{catalog, keys, typing};
 use crate::{client, env, git};
 use anyhow::{Result, bail};
 use app::{Action, App, Focus, Hit, Place, Slot};
@@ -61,6 +63,10 @@ const PULL_REQUESTS_EVERY: Duration = Duration::from_secs(60);
 pub enum Event {
     Key(KeyEvent),
     Mouse(MouseEvent),
+    /// Text pasted into the terminal, whole.
+    Paste(String),
+    /// The models Codex lets the user choose.
+    CodexModels(Vec<String>),
     /// The terminal changed size. The next draw lays everything out again
     /// and resizes the pane's session to fit.
     Resize,
@@ -135,50 +141,54 @@ pub fn run(socket: &Path) -> Result<()> {
         projects,
         theme: Theme::from_env(config.theme),
         started: Instant::now(),
+        memory_path: launcher::memory_path(socket),
         quitting: false,
     };
-    tui.app.set_first_command(config.new_session);
+    tui.app.set_agents(catalog::installed());
+    tui.app.set_launch_settings(&config);
+    tui.app.set_memory(launcher::load_memory(&tui.memory_path));
     tui.set_sessions(sessions);
 
     let mut terminal = ratatui::try_init()?;
-    let result = tui.run_with_mouse(&mut terminal, events);
+    let result = tui.run_with_modes(&mut terminal, events);
     ratatui::restore();
     result
 }
 
-/// The terminal sending the TUI what the mouse does, for as long as this
-/// lives. However the TUI ends, by returning, failing or panicking, the
-/// mouse goes back to the terminal: left on, a shell would fill with the
-/// sequences the terminal sends for it.
-struct MouseCapture;
+/// The terminal sending the TUI what the mouse does, and pastes marked as
+/// pastes, for as long as this lives. However the TUI ends, by returning,
+/// failing or panicking, both go back to how the terminal had them: left
+/// on, a shell would fill with the sequences the terminal sends for them.
+struct TerminalModes;
 
-impl MouseCapture {
-    fn on() -> Result<MouseCapture> {
-        // A panic on any thread turns it off before the panic is shown.
+impl TerminalModes {
+    fn on() -> Result<TerminalModes> {
+        // A panic on any thread turns them off before the panic is shown.
         let shown_before = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
-            mouse_off();
+            modes_off();
             shown_before(info);
         }));
         // Clicks and the wheel (1000), drags (1002), written the SGR way
         // (1006). Not the mouse just moving (1003): nothing here needs it,
-        // and it would wake the TUI at every move.
+        // and it would wake the TUI at every move. Then bracketed paste
+        // (2004): a paste comes whole, its lines kept, not as typed keys.
         let mut out = std::io::stdout();
-        out.write_all(b"\x1b[?1000h\x1b[?1002h\x1b[?1006h")?;
+        out.write_all(b"\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[?2004h")?;
         out.flush()?;
-        Ok(MouseCapture)
+        Ok(TerminalModes)
     }
 }
 
-impl Drop for MouseCapture {
+impl Drop for TerminalModes {
     fn drop(&mut self) {
-        mouse_off();
+        modes_off();
     }
 }
 
-fn mouse_off() {
+fn modes_off() {
     let mut out = std::io::stdout();
-    let _ = out.write_all(b"\x1b[?1006l\x1b[?1002l\x1b[?1000l");
+    let _ = out.write_all(b"\x1b[?2004l\x1b[?1006l\x1b[?1002l\x1b[?1000l");
     let _ = out.flush();
 }
 
@@ -199,18 +209,20 @@ struct Tui {
     theme: Theme,
     /// When the TUI started: the working mark turns with the time since.
     started: Instant,
+    /// Where the new-session panel's memory is kept.
+    memory_path: PathBuf,
     quitting: bool,
 }
 
 impl Tui {
-    fn run_with_mouse(
+    fn run_with_modes(
         &mut self,
         terminal: &mut DefaultTerminal,
         events: Receiver<Event>,
     ) -> Result<()> {
-        // The mouse is the TUI's for as long as `_mouse` lives: to the end
-        // of this function, however it ends.
-        let _mouse = MouseCapture::on()?;
+        // The mouse and pastes are the TUI's for as long as `_modes` lives:
+        // to the end of this function, however it ends.
+        let _modes = TerminalModes::on()?;
         self.run(terminal, events)
     }
 
@@ -287,6 +299,12 @@ impl Tui {
         match event {
             Event::Key(key) => self.on_key(key),
             Event::Mouse(mouse) => self.on_mouse(mouse),
+            Event::Paste(text) => {
+                if let Some(action) = self.app.on_paste(text) {
+                    self.carry_out(action);
+                }
+            }
+            Event::CodexModels(models) => self.app.set_codex_models(models),
             Event::Resize => {}
             Event::Sessions(sessions) => self.set_sessions(sessions),
             Event::PullRequests { project, found } => self.app.set_pull_requests(project, found),
@@ -380,6 +398,15 @@ impl Tui {
             Action::Start { place, command } => {
                 let cwd = directory_for(place)?;
                 self.start_session(None, cwd, command)?;
+                launcher::save_memory(&self.memory_path, self.app.memory());
+            }
+            Action::Paste { to, text } => {
+                if let Some(pane) = self.pane_in(to) {
+                    pane.send_keys(&pasted(&text, pane.wants_paste_marked()));
+                }
+            }
+            Action::ReadCodexModels => {
+                self.read_in_background(|| Event::CodexModels(read_codex_models()));
             }
             Action::ReadDiff { dir, against } => {
                 self.read_in_background(move || {
@@ -580,6 +607,33 @@ fn directory_for(place: Place) -> Result<PathBuf> {
     }
 }
 
+/// The bytes that hand `text`, pasted, to a program: marked as a paste
+/// when the program asked for that. A program that didn't gets a newline
+/// the way a terminal sends it for the Enter key.
+fn pasted(text: &str, marked: bool) -> Vec<u8> {
+    if marked {
+        typing::keystrokes(text, true)
+    } else {
+        text.replace("\r\n", "\r").replace('\n', "\r").into_bytes()
+    }
+}
+
+/// The models Codex lets the user choose, as `codex debug models` lists
+/// them, or none when it can't say.
+fn read_codex_models() -> Vec<String> {
+    let output = std::process::Command::new("codex")
+        .args(["debug", "models"])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output();
+    match output {
+        Ok(output) if output.status.success() => {
+            catalog::codex_models(&String::from_utf8_lossy(&output.stdout))
+        }
+        _ => Vec::new(),
+    }
+}
+
 /// The user's editor, as a command line to put a file's path after:
 /// `$EDITOR`, which may carry its own arguments, like `code --wait`, or
 /// else `vi`.
@@ -619,6 +673,7 @@ fn spawn_input_reader(events: Sender<Event>) {
             let event = match event {
                 TerminalEvent::Key(key) if key.kind != KeyEventKind::Release => Event::Key(key),
                 TerminalEvent::Mouse(mouse) => Event::Mouse(mouse),
+                TerminalEvent::Paste(text) => Event::Paste(text),
                 TerminalEvent::Resize(..) => Event::Resize,
                 _ => continue,
             };

@@ -1,6 +1,7 @@
 mod agent_screen;
 mod agents;
 mod attach;
+mod catalog;
 mod client;
 mod codex;
 mod config;

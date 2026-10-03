@@ -159,6 +159,17 @@ impl Finder {
         if self.query.text() == before {
             return Outcome::Stay;
         }
+        self.query_changed()
+    }
+
+    /// Pasted text goes into the query, as if typed.
+    pub fn on_paste(&mut self, text: &str) -> Outcome {
+        self.query.insert_str(text);
+        self.query_changed()
+    }
+
+    /// Matches the files again for a new query, from the best match.
+    fn query_changed(&mut self) -> Outcome {
         self.filter();
         self.selected = 0;
         self.outcome_for_selection()

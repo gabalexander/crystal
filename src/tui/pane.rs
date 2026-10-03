@@ -103,6 +103,11 @@ impl Pane {
     pub fn wants_mouse(&self) -> bool {
         self.screen.screen().mouse_protocol_mode() != vt100::MouseProtocolMode::None
     }
+
+    /// Whether the program has asked for pastes to be marked as pastes.
+    pub fn wants_paste_marked(&self) -> bool {
+        self.screen.screen().bracketed_paste()
+    }
 }
 
 /// How far a notch of the mouse wheel scrolls: what most terminals do.

@@ -111,6 +111,12 @@ impl IssuesView {
         }
     }
 
+    /// Pasted text goes into the filter, as if typed.
+    pub fn on_paste(&mut self, text: &str) {
+        self.filter.insert_str(text);
+        self.keep_highlight_shown();
+    }
+
     fn move_by(&mut self, by: isize) {
         let shown = self.shown();
         let Some(at) = shown

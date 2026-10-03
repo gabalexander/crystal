@@ -176,6 +176,11 @@ impl Terminal {
         mode != vt100::MouseProtocolMode::None
     }
 
+    /// Whether crystal has asked this terminal to mark pastes as pastes.
+    fn marks_pastes(&self) -> bool {
+        self.screen.lock().unwrap().screen().bracketed_paste()
+    }
+
     fn shows(&self, text: &str) {
         let deadline = Instant::now() + Duration::from_secs(5);
         while !self.text().contains(text) {
@@ -680,16 +685,37 @@ fn keys_go_to_the_pane_after_enter_and_back_to_the_list_after_ctrl_backslash() {
 }
 
 #[test]
-fn n_with_an_empty_line_starts_a_shell_and_hands_it_the_keyboard() {
+fn a_paste_goes_whole_to_the_pane_typed_into_and_never_to_the_list() {
     let crystal = Crystal::new();
+    crystal.ok(&["new", "-n", "cat", "sh", "-c", "cat > pasted"]);
+    let pasted = crystal.dir.path().join("pasted");
+
     let mut tui = crystal.tui();
+    tui.shows("▸ cat");
+    // On the list, its letters would be keys: x would ask to kill cat.
+    tui.type_keys("\x1b[200~x\x1b[201~");
+    tui.type_keys("\r");
+    tui.shows("typing into");
+    tui.type_keys("\x1b[200~first line\rsecond line\r\x1b[201~");
+    eventually("cat has both lines", || {
+        std::fs::read_to_string(&pasted).is_ok_and(|text| text == "first line\nsecond line\n")
+    });
+    assert!(!tui.text().contains("kill cat?"));
+}
+
+#[test]
+fn n_with_no_agent_installed_starts_a_shell_and_hands_it_the_keyboard() {
+    let crystal = Crystal::new();
+    let path = path_of(&[]);
+    let mut tui = crystal.attach_with_env(&[], &[("PATH", &path)]);
     assert!(crystal.socket.exists(), "the TUI starts the daemon");
     tui.shows("No sessions yet");
 
     tui.type_keys("n");
-    tui.shows("new session: claude");
-    // Ctrl+U clears the line, and an empty line is the shell.
-    tui.type_keys("\x15\r");
+    tui.shows("New session · this directory");
+    tui.shows("a shell takes no task");
+    tui.shows("runs  your shell");
+    tui.type_keys("\r");
     tui.shows("▸ sh");
     tui.shows("typing into");
     tui.type_keys("echo I am $CRYSTAL_SESSION\r");
@@ -697,15 +723,18 @@ fn n_with_an_empty_line_starts_a_shell_and_hands_it_the_keyboard() {
 }
 
 #[test]
-fn n_starts_claude_with_its_hooks_and_the_rest_of_the_line_as_its_prompt() {
+fn n_starts_claude_with_its_hooks_and_the_task_as_its_prompt() {
     let crystal = Crystal::new();
     let bin = fake_claude(crystal.dir.path());
-    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let path = path_of(&[&bin]);
     let mut tui = crystal.attach_with_env(&[], &[("PATH", &path)]);
 
     tui.type_keys("n");
-    tui.shows("new session: claude");
-    tui.type_keys(" fix the login bug\r");
+    tui.shows("What should it do?");
+    tui.shows("Claude Code");
+    tui.type_keys("fix the login bug");
+    tui.shows("runs  claude 'fix the login bug'");
+    tui.type_keys("\r");
     tui.shows("▸ claude");
 
     let args = written(&crystal.dir.path().join("args"));
@@ -713,6 +742,138 @@ fn n_starts_claude_with_its_hooks_and_the_rest_of_the_line_as_its_prompt() {
     assert_eq!(args.len(), 3, "{args:?}");
     assert_eq!(args[0], "--settings");
     assert_eq!(args[2], "fix the login bug");
+}
+
+#[test]
+fn a_task_pasted_whole_keeps_its_lines() {
+    let crystal = Crystal::new();
+    let bin = fake_claude(crystal.dir.path());
+    let path = path_of(&[&bin]);
+    let mut tui = crystal.attach_with_env(&[], &[("PATH", &path)]);
+    assert!(tui.marks_pastes());
+
+    tui.type_keys("n");
+    tui.shows("What should it do?");
+    // A paste, the way a terminal sends one: its Enter doesn't start it.
+    tui.type_keys("\x1b[200~fix the refund\rthen run the tests\x1b[201~");
+    tui.shows("then run the tests");
+    tui.type_keys("\r");
+    tui.shows("▸ claude");
+
+    let args = written(&crystal.dir.path().join("args"));
+    assert!(
+        args.ends_with("\nfix the refund\nthen run the tests\n"),
+        "{args:?}"
+    );
+}
+
+#[test]
+fn codex_starts_with_the_model_chosen_and_the_task() {
+    let crystal = Crystal::new();
+    let bin = fake_codex(crystal.dir.path());
+    let path = path_of(&[&bin]);
+    let codex_home = crystal.dir.path().join("codex-home");
+    let env = [
+        ("PATH", path.as_str()),
+        ("CODEX_HOME", codex_home.to_str().unwrap()),
+        ("FAKE_CODEX_ID", "thread-1"),
+    ];
+    let mut tui = crystal.attach_with_env(&[], &env);
+
+    tui.type_keys("n");
+    tui.shows("Codex");
+    // The models Codex lists, less the one it hides.
+    tui.shows("gpt-test-mini");
+    assert!(!tui.text().contains("gpt-internal"));
+    tui.type_keys("add a test");
+    // Tab to what runs, Tab to its model, and right to the first model.
+    tui.type_keys("\t\t\x1b[C");
+    tui.shows("runs  codex -m gpt-test-mini 'add a test'");
+    tui.type_keys("\r");
+    tui.shows("▸ codex");
+    assert_eq!(codex_args(&crystal), ["-m", "gpt-test-mini", "add a test"]);
+}
+
+#[test]
+fn esc_closes_the_new_session_panel_and_starts_nothing() {
+    let crystal = Crystal::new();
+    let bin = fake_claude(crystal.dir.path());
+    let path = path_of(&[&bin]);
+    let mut tui = crystal.attach_with_env(&[], &[("PATH", &path)]);
+
+    tui.type_keys("n");
+    tui.shows("New session");
+    tui.type_keys("never mind");
+    tui.shows("never mind");
+    tui.type_keys("\x1b");
+    tui.hides("New session");
+    tui.shows("No sessions yet");
+    // Back on the list: q quits, so nothing was left waiting on the panel.
+    tui.type_keys("q");
+    assert!(tui.exit());
+    assert!(!crystal.dir.path().join("args").exists());
+    assert!(crystal.row("claude").is_none());
+}
+
+#[test]
+fn ctrl_e_turns_the_panel_into_the_command_line_it_would_run() {
+    let crystal = Crystal::new();
+    let bin = fake_claude(crystal.dir.path());
+    let path = path_of(&[&bin]);
+    let mut tui = crystal.attach_with_env(&[], &[("PATH", &path)]);
+
+    tui.type_keys("n");
+    tui.shows("What should it do?");
+    tui.type_keys("fix it\x05");
+    tui.hides("New session");
+    tui.shows("new session: claude 'fix it'");
+    // Anything can be run from there.
+    tui.type_keys("\x15sh -c 'echo ran > ran; sleep 30'\r");
+    assert_eq!(written(&crystal.dir.path().join("ran")), "ran\n");
+}
+
+#[test]
+fn a_preset_from_the_config_starts_with_its_options_and_prompt() {
+    let crystal = Crystal::new();
+    crystal.configure(
+        r#"notify = false
+
+[[preset]]
+name = "review"
+agent = "claude"
+model = "opus"
+mode = "plan"
+args = ["--verbose"]
+prompt = "Review the change."
+"#,
+    );
+    let bin = fake_claude(crystal.dir.path());
+    let path = path_of(&[&bin]);
+    let mut tui = crystal.attach_with_env(&[], &[("PATH", &path)]);
+
+    tui.type_keys("n");
+    tui.shows("review");
+    // Presets come first: Tab to what runs, then left from Claude Code.
+    tui.type_keys("the refund fix\t\x1b[D");
+    tui.shows("runs  claude --model opus");
+    tui.type_keys("\r");
+    tui.shows("▸ claude");
+
+    let args = written(&crystal.dir.path().join("args"));
+    let after_hooks: Vec<&str> = args.lines().skip(2).collect();
+    assert_eq!(
+        after_hooks,
+        [
+            "--model",
+            "opus",
+            "--permission-mode",
+            "plan",
+            "--verbose",
+            "Review the change.",
+            "",
+            "the refund fix"
+        ]
+    );
 }
 
 #[test]
@@ -837,6 +998,15 @@ fn the_tui_needs_a_terminal() {
     let crystal = Crystal::new();
     assert!(crystal.fails(&[]).contains("crystal needs a terminal"));
     assert!(!crystal.socket.exists());
+}
+
+/// A PATH of `bins` and the system's own directories, and nothing else:
+/// the new-session panel offers the agents it finds on the PATH, and a
+/// test must find only its stand-ins, never a real agent.
+fn path_of(bins: &[&Path]) -> String {
+    let mut dirs: Vec<String> = bins.iter().map(|bin| bin.display().to_string()).collect();
+    dirs.extend(["/usr/bin", "/bin", "/usr/sbin", "/sbin"].map(String::from));
+    dirs.join(":")
 }
 
 /// A stand-in for Claude Code: a `claude` that writes down the arguments
@@ -1139,7 +1309,7 @@ fn the_tui_groups_sessions_by_project_then_worktree() {
 }
 
 #[test]
-fn w_in_the_tui_starts_a_command_in_a_new_worktree() {
+fn w_names_the_new_worktrees_branch_after_the_task() {
     let crystal = Crystal::new();
     let repo = git_repo(crystal.dir.path(), "app");
     crystal.ok(&[
@@ -1152,22 +1322,41 @@ fn w_in_the_tui_starts_a_command_in_a_new_worktree() {
         "30",
     ]);
 
-    let mut tui = crystal.tui();
+    let bin = fake_claude(crystal.dir.path());
+    let path = path_of(&[&bin]);
+    let mut tui = crystal.attach_with_env(&[], &[("PATH", &path)]);
     tui.shows("▸ planner");
     tui.type_keys("w");
-    tui.shows("branch for the new worktree:");
-    tui.type_keys("spike\r");
-    tui.shows("new session: claude");
-    tui.type_keys("\x15sh -c 'pwd > where; sleep 30'\r");
-    tui.shows("⎇ spike");
+    tui.shows("New session · app ⎇ a new branch");
+    tui.type_keys("Fix the flaky test!");
+    tui.shows("New session · app ⎇ fix-the-flaky-test");
+    tui.shows("branch       fix-the-flaky-test");
+    tui.type_keys("\r");
+    tui.shows("⎇ fix-the-flaky-test");
     tui.shows("typing into");
 
-    let worktree = crystal.dir.path().join("app.worktrees/spike");
-    let written = written(&worktree.join("where"));
-    assert_eq!(
-        Path::new(written.trim()).canonicalize().unwrap(),
-        worktree.canonicalize().unwrap()
-    );
+    // Claude Code started in the new worktree, which writes down its
+    // arguments where it runs.
+    let worktree = crystal.dir.path().join("app.worktrees/fix-the-flaky-test");
+    let args = written(&worktree.join("args"));
+    assert_eq!(args.lines().last(), Some("Fix the flaky test!"));
+}
+
+#[test]
+fn a_new_worktree_with_no_task_asks_what_to_call_its_branch() {
+    let crystal = Crystal::new();
+    let repo = git_repo(crystal.dir.path(), "app");
+    let repo_arg = repo.to_str().unwrap();
+    crystal.ok(&["new", "-n", "planner", "-c", repo_arg, "sleep", "30"]);
+
+    let path = path_of(&[]);
+    let mut tui = crystal.attach_with_env(&[], &[("PATH", &path)]);
+    tui.shows("▸ planner");
+    tui.type_keys("w\r");
+    tui.shows("name the new worktree's branch");
+    tui.type_keys("spike\r");
+    tui.shows("⎇ spike");
+    assert!(crystal.dir.path().join("app.worktrees/spike").is_dir());
 }
 
 impl Crystal {
@@ -1799,12 +1988,15 @@ fn a_setting_spelled_wrong_is_an_error_that_names_it_and_its_file() {
 }
 
 #[test]
-fn the_config_chooses_what_the_new_session_line_starts_with() {
+fn the_config_chooses_what_the_new_session_panel_starts_with() {
     let crystal = Crystal::new();
     crystal.configure("notify = false\nnew_session = \"codex --full-auto\"\n");
-    let mut tui = crystal.tui();
+    let claude = fake_claude(crystal.dir.path());
+    let codex = fake_codex(crystal.dir.path());
+    let path = path_of(&[&claude, &codex]);
+    let mut tui = crystal.attach_with_env(&[], &[("PATH", &path)]);
     tui.type_keys("n");
-    tui.shows("new session: codex --full-auto");
+    tui.shows("runs  codex --full-auto");
 }
 
 /// A pretend agent that asks the user something once the test creates
@@ -1904,9 +2096,11 @@ fn the_tui_hands_the_mouse_back_to_the_terminal_when_it_quits() {
     let mut tui = crystal.tui();
     tui.shows("▸ stays");
     assert!(tui.sends_the_mouse());
+    assert!(tui.marks_pastes());
     tui.type_keys("q");
     assert!(tui.exit());
     assert!(!tui.sends_the_mouse());
+    assert!(!tui.marks_pastes(), "pastes go back to plain typing too");
 }
 
 #[test]
@@ -2532,12 +2726,19 @@ fn ssh_uses_the_ssh_on_the_path() {
 /// named after when it started and `$FAKE_CODEX_ID`. Like Codex, it notes
 /// the time it starts but writes the file later: once `$FAKE_CODEX_WAIT_FOR`
 /// exists, if that's set, the way Codex waits for a first prompt. Then it
-/// waits. Returns the directory to put on the PATH.
+/// waits. `codex debug models` lists two models, one of them hidden, and
+/// is otherwise left out of all that. Returns the directory to put on the
+/// PATH.
 fn fake_codex(dir: &Path) -> PathBuf {
     let bin = dir.join("codex-bin");
     std::fs::create_dir(&bin).unwrap();
     let codex = bin.join("codex");
     let script = r#"#!/bin/sh
+if [ "$1" = debug ]; then
+    echo '{"models": [{"slug": "gpt-test-mini", "visibility": "list"},'
+    echo '            {"slug": "gpt-internal", "visibility": "hide"}]}'
+    exit 0
+fi
 printf '%s\n' "$@" > args
 if [ "$1" != resume ]; then
     dir="$CODEX_HOME/sessions/$(date +%Y/%m/%d)"
@@ -3184,7 +3385,8 @@ fn i_lists_the_issues_and_enter_starts_a_session_for_one() {
     let repo_arg = repo.to_str().unwrap();
     crystal.ok(&["new", "-n", "planner", "-c", repo_arg, "sleep", "30"]);
 
-    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let claude = fake_claude(crystal.dir.path());
+    let path = path_of(&[&bin, &claude]);
     let mut tui = crystal.attach_with_env(&[], &[("PATH", &path)]);
     tui.shows("▸ planner");
     tui.type_keys("i");
@@ -3204,11 +3406,20 @@ fn i_lists_the_issues_and_enter_starts_a_session_for_one() {
     tui.type_keys("\x1b[A");
 
     tui.type_keys("\r");
-    tui.shows("branch for the new worktree: 42-fix-login-redirect");
+    tui.shows("New session · app ⎇ 42-fix-login-redirect");
+    tui.shows("Fix issue #42: Fix login redirect");
     tui.type_keys("\r");
-    tui.shows("new session: claude Fix issue #42: Fix login redirect");
-    tui.type_keys("\x1b");
-    tui.hides("new session:");
+    tui.shows("⎇ 42-fix-login-redirect");
+
+    let worktree = crystal
+        .dir
+        .path()
+        .join("app.worktrees/42-fix-login-redirect");
+    let args = written(&worktree.join("args"));
+    assert_eq!(
+        args.lines().last(),
+        Some("Fix issue #42: Fix login redirect (https://github.com/acme/app/issues/42)")
+    );
 }
 
 /// A repository with work in it, the way an agent leaves one: on `main`, a

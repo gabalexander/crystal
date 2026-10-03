@@ -1,0 +1,1314 @@
+//! The panel `n` opens to start a session: what to ask for, what runs it,
+//! how that's set up, and where it starts. It builds the command line the
+//! session runs, and shows it, so nothing it does is hidden; Ctrl+E turns
+//! it into that command line, to change anything the panel can't.
+//!
+//! The panel is state and logic only, apart from [`draw`] at the end and
+//! the two functions that keep its memory on disk; the event loop does the
+//! rest.
+
+use super::app::Place;
+use super::text_area::TextArea;
+use super::text_input::TextInput;
+use super::theme::Theme;
+use crate::catalog::{self, Agent, Choices, FirstPrompt, Setting};
+use crate::config::Preset;
+use crate::{git, shell};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::Frame;
+use ratatui::layout::{Margin, Rect};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Clear, Paragraph};
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
+
+/// How many earlier tasks are remembered, for Up to bring back.
+const HISTORY_LENGTH: usize = 100;
+
+/// The most rows the task box grows to before it scrolls.
+const TASK_ROWS: usize = 4;
+
+/// The longest a branch named after a task gets.
+const BRANCH_LENGTH: usize = 40;
+
+/// How wide the labels of the panel's rows are, so the choices line up.
+const LABEL_WIDTH: usize = 13;
+
+/// What can be started: a preset from the config file, an agent crystal
+/// knows, or the user's shell.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Run {
+    Preset(Preset),
+    Agent(&'static Agent),
+    Shell,
+}
+
+impl Run {
+    /// What the panel calls it.
+    pub fn label(&self) -> String {
+        match self {
+            Run::Preset(preset) => preset.name.clone(),
+            Run::Agent(agent) => agent.name.to_string(),
+            Run::Shell => "shell".to_string(),
+        }
+    }
+
+    /// What it's remembered by, to pick it again next time.
+    pub fn key(&self) -> String {
+        match self {
+            Run::Preset(preset) => format!("preset:{}", preset.name),
+            Run::Agent(agent) => agent.program.to_string(),
+            Run::Shell => "shell".to_string(),
+        }
+    }
+
+    fn agent(&self) -> Option<&'static Agent> {
+        match self {
+            Run::Preset(preset) => catalog::find(&preset.agent),
+            Run::Agent(agent) => Some(agent),
+            Run::Shell => None,
+        }
+    }
+
+    /// Whether it can be given a task on its command line.
+    pub fn takes_task(&self) -> bool {
+        self.agent()
+            .is_some_and(|agent| agent.first_prompt != FirstPrompt::None)
+    }
+
+    /// The rows of choices the panel shows for it: a preset's are set in
+    /// the config file, so it has none.
+    fn settings(&self) -> &'static [Setting] {
+        match self {
+            Run::Agent(agent) => agent.settings,
+            Run::Preset(_) | Run::Shell => &[],
+        }
+    }
+}
+
+/// Where the session can start.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Target {
+    /// Where the selected session runs, or the TUI's own directory when
+    /// `dir` is `None`. `label` says which, like `payments ⌂ main`.
+    Here { dir: Option<PathBuf>, label: String },
+    /// A new worktree of the project at `base`, or of the TUI's own
+    /// directory's when that's `None`.
+    NewWorktree {
+        base: Option<PathBuf>,
+        project: Option<String>,
+    },
+    /// Another project's main worktree.
+    Project { path: PathBuf, label: String },
+}
+
+impl Target {
+    /// What the row of places calls it.
+    fn choice(&self) -> String {
+        match self {
+            Target::Here { .. } => "here".to_string(),
+            Target::NewWorktree { .. } => "new worktree".to_string(),
+            Target::Project { label, .. } => label.clone(),
+        }
+    }
+}
+
+/// A field of the panel, which Tab moves to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Field {
+    Task,
+    Run,
+    /// The agent's row of choices with this index in its settings.
+    Setting(usize),
+    Where,
+    Branch,
+}
+
+/// What the panel opens with.
+pub struct Setup {
+    pub runs: Vec<Run>,
+    pub run: usize,
+    pub targets: Vec<Target>,
+    pub target: usize,
+    /// Earlier tasks, the most recent last.
+    pub history: Vec<String>,
+    pub codex_models: Vec<String>,
+}
+
+/// What a key in the panel leads to.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Outcome {
+    Stay,
+    Cancel,
+    /// Start `command` at `place`. `task` and `run` are for the panel's
+    /// memory.
+    Start {
+        place: Place,
+        command: Vec<String>,
+        task: String,
+        run: String,
+    },
+    /// Close the panel for the one-line command line, holding `line`.
+    CommandLine {
+        place: Place,
+        line: String,
+    },
+}
+
+pub struct Launcher {
+    task: TextArea,
+    focus: Field,
+    runs: Vec<Run>,
+    run: usize,
+    /// The choice made in each of the agent's rows, by row.
+    chosen: Vec<usize>,
+    targets: Vec<Target>,
+    target: usize,
+    branch: TextInput,
+    /// Whether the branch was typed in, rather than named after the task.
+    branch_typed: bool,
+    codex_models: Vec<String>,
+    history: Vec<String>,
+    /// While Up is bringing back earlier tasks: how many back, and the
+    /// task as it was before, for Down to return to.
+    recalling: Option<(usize, String)>,
+    /// Why Enter didn't start the session, for the panel to say.
+    problem: Option<String>,
+}
+
+impl Launcher {
+    pub fn new(setup: Setup) -> Launcher {
+        let mut launcher = Launcher {
+            task: TextArea::default(),
+            focus: Field::Task,
+            runs: setup.runs,
+            run: 0,
+            chosen: Vec::new(),
+            targets: setup.targets,
+            target: setup.target,
+            branch: TextInput::default(),
+            branch_typed: false,
+            codex_models: setup.codex_models,
+            history: setup.history,
+            recalling: None,
+            problem: None,
+        };
+        launcher.choose_run(setup.run);
+        launcher
+    }
+
+    /// Starts out with `task` and a branch already named, as for an issue.
+    pub fn with_task(mut self, task: &str, branch: &str) -> Launcher {
+        self.task.set_text(task);
+        self.branch = TextInput::with_text(branch);
+        self.branch_typed = true;
+        self
+    }
+
+    pub fn focus(&self) -> Field {
+        self.focus
+    }
+
+    pub fn task(&self) -> &TextArea {
+        &self.task
+    }
+
+    pub fn branch_input(&self) -> &TextInput {
+        &self.branch
+    }
+
+    pub fn problem(&self) -> Option<&str> {
+        self.problem.as_deref()
+    }
+
+    pub fn run(&self) -> &Run {
+        &self.runs[self.run]
+    }
+
+    fn target(&self) -> &Target {
+        &self.targets[self.target]
+    }
+
+    /// Takes the models Codex lists, once they've been read.
+    pub fn set_codex_models(&mut self, models: Vec<String>) {
+        self.codex_models = models;
+        let rows = self.run().settings();
+        for (row, setting) in rows.iter().enumerate() {
+            let count = self.choices(setting).len();
+            if self.chosen[row] >= count {
+                self.chosen[row] = 0;
+            }
+        }
+    }
+
+    pub fn on_key(&mut self, key: KeyEvent) -> Outcome {
+        self.problem = None;
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        match key.code {
+            KeyCode::Esc => return Outcome::Cancel,
+            KeyCode::Char('e') if ctrl => {
+                return Outcome::CommandLine {
+                    place: self.place(),
+                    line: self.command_line(),
+                };
+            }
+            KeyCode::Enter if alt && self.focus == Field::Task => self.task.newline(),
+            KeyCode::Enter => return self.start(),
+            KeyCode::Tab => self.move_focus(1),
+            KeyCode::BackTab => self.move_focus(-1),
+            _ => match self.focus {
+                Field::Task => self.on_task_key(&key),
+                Field::Branch => self.on_branch_key(&key),
+                Field::Run | Field::Setting(_) | Field::Where => self.on_choice_key(&key),
+            },
+        }
+        Outcome::Stay
+    }
+
+    /// A paste goes into the text field that has the keyboard: the task
+    /// keeps its lines, a branch name can't have any.
+    pub fn on_paste(&mut self, text: &str) {
+        match self.focus {
+            Field::Task => {
+                self.task.insert_str(text);
+                self.recalling = None;
+            }
+            Field::Branch => {
+                self.start_typing_branch();
+                self.branch.insert_str(text);
+            }
+            _ => {}
+        }
+    }
+
+    /// The fields Tab goes through, in order: the task when what's chosen
+    /// takes one, what to run and its rows, where, and the branch when it's
+    /// a new worktree.
+    pub fn fields(&self) -> Vec<Field> {
+        let mut fields = Vec::new();
+        if self.run().takes_task() {
+            fields.push(Field::Task);
+        }
+        fields.push(Field::Run);
+        fields.extend((0..self.run().settings().len()).map(Field::Setting));
+        fields.push(Field::Where);
+        if self.is_new_worktree() {
+            fields.push(Field::Branch);
+        }
+        fields
+    }
+
+    fn move_focus(&mut self, by: isize) {
+        let fields = self.fields();
+        let at = fields
+            .iter()
+            .position(|&field| field == self.focus)
+            .unwrap_or(0);
+        let count = fields.len() as isize;
+        let to = (at as isize + by).rem_euclid(count) as usize;
+        self.focus_on(fields[to]);
+    }
+
+    fn focus_on(&mut self, field: Field) {
+        if field == Field::Branch {
+            self.start_typing_branch();
+        }
+        self.focus = field;
+    }
+
+    /// Up on the task's first line brings back the task before; Down on
+    /// its last line goes the other way, back to what was being typed.
+    fn on_task_key(&mut self, key: &KeyEvent) {
+        match key.code {
+            KeyCode::Up if self.task.on_first_line() => self.recall_older(),
+            KeyCode::Down if self.task.on_last_line() => self.recall_newer(),
+            KeyCode::Up => self.task.line_up(),
+            KeyCode::Down => self.task.line_down(),
+            _ => {
+                if self.task.on_key(key) {
+                    self.recalling = None;
+                }
+            }
+        }
+    }
+
+    fn recall_older(&mut self) {
+        let back = self.recalling.as_ref().map_or(0, |(back, _)| *back) + 1;
+        if back > self.history.len() {
+            return;
+        }
+        let draft = match self.recalling.take() {
+            Some((_, draft)) => draft,
+            None => self.task.text().to_string(),
+        };
+        let earlier = self.history[self.history.len() - back].clone();
+        self.task.set_text(&earlier);
+        self.recalling = Some((back, draft));
+    }
+
+    fn recall_newer(&mut self) {
+        let Some((back, draft)) = self.recalling.take() else {
+            return;
+        };
+        if back == 1 {
+            self.task.set_text(&draft);
+            return;
+        }
+        let later = self.history[self.history.len() - (back - 1)].clone();
+        self.task.set_text(&later);
+        self.recalling = Some((back - 1, draft));
+    }
+
+    fn on_branch_key(&mut self, key: &KeyEvent) {
+        self.start_typing_branch();
+        self.branch.on_key(key);
+    }
+
+    /// From the first key in the branch field on, the branch is what's
+    /// typed there, starting from the name the task gave it.
+    fn start_typing_branch(&mut self) {
+        if !self.branch_typed {
+            self.branch = TextInput::with_text(&branch_from_task(self.task.text()));
+            self.branch_typed = true;
+        }
+    }
+
+    /// ←/→ change the choice in a row; ↑/↓ go to the row above or below.
+    fn on_choice_key(&mut self, key: &KeyEvent) {
+        match key.code {
+            KeyCode::Left => self.change_choice(-1),
+            KeyCode::Right => self.change_choice(1),
+            KeyCode::Up => self.move_focus(-1),
+            KeyCode::Down => self.move_focus(1),
+            _ => {}
+        }
+    }
+
+    fn change_choice(&mut self, by: isize) {
+        match self.focus {
+            Field::Run => {
+                let to = step(self.run, by, self.runs.len());
+                self.choose_run(to);
+            }
+            Field::Setting(row) => {
+                let setting = &self.run().settings()[row];
+                let count = self.choices(setting).len();
+                self.chosen[row] = step(self.chosen[row], by, count);
+            }
+            Field::Where => self.target = step(self.target, by, self.targets.len()),
+            Field::Task | Field::Branch => {}
+        }
+    }
+
+    /// Picks what runs, with each of its rows at its default.
+    fn choose_run(&mut self, run: usize) {
+        self.run = run.min(self.runs.len().saturating_sub(1));
+        self.chosen = vec![0; self.run().settings().len()];
+        if self.focus == Field::Task && !self.run().takes_task() {
+            self.focus = Field::Run;
+        }
+    }
+
+    /// The choices a row offers, as the panel shows them.
+    fn choices(&self, setting: &Setting) -> Vec<String> {
+        match setting.choices {
+            Choices::Fixed(choices) => choices.iter().map(|(label, _)| label.to_string()).collect(),
+            Choices::CodexModels => {
+                let models = self.codex_models.iter().cloned();
+                std::iter::once("default".to_string())
+                    .chain(models)
+                    .collect()
+            }
+        }
+    }
+
+    /// What a row's choice gives its option, or `None` for the default,
+    /// which leaves the option off.
+    fn value(&self, setting: &Setting, choice: usize) -> Option<String> {
+        let value = match setting.choices {
+            Choices::Fixed(choices) => choices.get(choice)?.1.to_string(),
+            Choices::CodexModels => self.codex_models.get(choice.checked_sub(1)?)?.clone(),
+        };
+        (!value.is_empty()).then_some(value)
+    }
+
+    /// Every row of choices, for drawing: its field, label, choices, and
+    /// which one is chosen.
+    pub fn choice_rows(&self) -> Vec<(Field, &'static str, Vec<String>, usize)> {
+        let mut rows = vec![(
+            Field::Run,
+            "run",
+            self.runs.iter().map(Run::label).collect(),
+            self.run,
+        )];
+        for (index, setting) in self.run().settings().iter().enumerate() {
+            let choices = self.choices(setting);
+            rows.push((
+                Field::Setting(index),
+                setting.label,
+                choices,
+                self.chosen[index],
+            ));
+        }
+        let places = self.targets.iter().map(Target::choice).collect();
+        rows.push((Field::Where, "start in", places, self.target));
+        rows
+    }
+
+    pub fn is_new_worktree(&self) -> bool {
+        matches!(self.target(), Target::NewWorktree { .. })
+    }
+
+    /// The new worktree's branch: as typed, or else named after the task.
+    pub fn branch_name(&self) -> String {
+        if self.branch_typed {
+            self.branch.text().trim().to_string()
+        } else {
+            branch_from_task(self.task.text())
+        }
+    }
+
+    /// The task, if what's chosen takes one.
+    fn task_text(&self) -> String {
+        if self.run().takes_task() {
+            self.task.text().trim().to_string()
+        } else {
+            String::new()
+        }
+    }
+
+    /// The command line the session runs. An empty one is the user's
+    /// shell.
+    pub fn command(&self) -> Vec<String> {
+        let task = self.task_text();
+        match self.run() {
+            Run::Shell => Vec::new(),
+            Run::Preset(preset) => preset_command(preset, &task),
+            Run::Agent(agent) => {
+                let mut command = vec![agent.program.to_string()];
+                for (setting, &choice) in agent.settings.iter().zip(&self.chosen) {
+                    if let Some(value) = self.value(setting, choice) {
+                        command.push(setting.option.to_string());
+                        command.push(value);
+                    }
+                }
+                add_task(&mut command, agent.first_prompt, &task);
+                command
+            }
+        }
+    }
+
+    /// The command as the user would type it: what the panel shows, and
+    /// what Ctrl+E starts the command line with.
+    pub fn command_line(&self) -> String {
+        let command = self.command();
+        let quoted: Vec<String> = command.iter().map(|arg| shell::quote(arg)).collect();
+        quoted.join(" ")
+    }
+
+    pub fn place(&self) -> Place {
+        match self.target() {
+            Target::Here { dir, .. } => Place::Directory(dir.clone()),
+            Target::NewWorktree { base, .. } => Place::NewWorktree {
+                branch: self.branch_name(),
+                base: base.clone(),
+            },
+            Target::Project { path, .. } => Place::Directory(Some(path.clone())),
+        }
+    }
+
+    /// Where the session will start, the way the panel's title says it.
+    pub fn title(&self) -> String {
+        let place = match self.target() {
+            Target::Here { label, .. } | Target::Project { label, .. } => label.clone(),
+            Target::NewWorktree { project, .. } => {
+                let project = project.as_deref().unwrap_or("this repository");
+                let branch = self.branch_name();
+                let branch = if branch.is_empty() {
+                    "a new branch".to_string()
+                } else {
+                    branch
+                };
+                format!("{project} ⎇ {branch}")
+            }
+        };
+        format!("New session · {place}")
+    }
+
+    /// The directory a new worktree goes in, when it's known.
+    pub fn worktree_dir(&self) -> Option<PathBuf> {
+        let Target::NewWorktree {
+            base: Some(base), ..
+        } = self.target()
+        else {
+            return None;
+        };
+        let branch = self.branch_name();
+        (!branch.is_empty()).then(|| git::worktree_dir(base, &branch))
+    }
+
+    /// Enter: starts the session, unless a new worktree has no branch yet.
+    fn start(&mut self) -> Outcome {
+        if self.is_new_worktree() && self.branch_name().is_empty() {
+            self.problem = Some("name the new worktree's branch".to_string());
+            self.focus_on(Field::Branch);
+            return Outcome::Stay;
+        }
+        Outcome::Start {
+            place: self.place(),
+            command: self.command(),
+            task: self.task_text(),
+            run: self.run().key(),
+        }
+    }
+}
+
+/// A preset's command line, with `task` after the text it always asks.
+pub fn preset_command(preset: &Preset, task: &str) -> Vec<String> {
+    let mut command = vec![preset.agent.clone()];
+    let agent = catalog::find(&preset.agent);
+    let model_option = agent.and_then(Agent::model_setting).map(|s| s.option);
+    let mode_option = agent.and_then(Agent::mode_setting).map(|s| s.option);
+    if let (Some(model), Some(option)) = (&preset.model, model_option) {
+        command.push(option.to_string());
+        command.push(model.clone());
+    }
+    if let (Some(mode), Some(option)) = (&preset.mode, mode_option) {
+        command.push(option.to_string());
+        command.push(mode.clone());
+    }
+    command.extend(preset.args.iter().cloned());
+    let prompt = match (preset.prompt.as_deref().map(str::trim), task) {
+        (Some(asks), "") => asks.to_string(),
+        (Some(asks), task) if !asks.is_empty() => format!("{asks}\n\n{task}"),
+        _ => task.to_string(),
+    };
+    let first_prompt = agent.map_or(FirstPrompt::Argument, |agent| agent.first_prompt);
+    add_task(&mut command, first_prompt, &prompt);
+    command
+}
+
+/// Puts `task` on `command`, the way its agent takes a first prompt.
+fn add_task(command: &mut Vec<String>, first_prompt: FirstPrompt, task: &str) {
+    if task.is_empty() {
+        return;
+    }
+    match first_prompt {
+        FirstPrompt::Argument => command.push(task.to_string()),
+        FirstPrompt::Option(option) => {
+            command.push(option.to_string());
+            command.push(task.to_string());
+        }
+        FirstPrompt::None => {}
+    }
+}
+
+/// A branch named after a task: its words in lower case, joined by `-`,
+/// as many as fit in [`BRANCH_LENGTH`].
+pub fn branch_from_task(task: &str) -> String {
+    let mut branch = String::new();
+    let words = task
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .map(str::to_ascii_lowercase);
+    for word in words {
+        let joined = if branch.is_empty() {
+            word
+        } else {
+            format!("{branch}-{word}")
+        };
+        if joined.len() > BRANCH_LENGTH {
+            break;
+        }
+        branch = joined;
+    }
+    branch
+}
+
+/// `at` moved `by` within `0..count`, going round at the ends.
+fn step(at: usize, by: isize, count: usize) -> usize {
+    if count == 0 {
+        return 0;
+    }
+    (at as isize + by).rem_euclid(count as isize) as usize
+}
+
+/// What the panel remembers between sessions: earlier tasks, and what was
+/// run last, which it picks first next time.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Memory {
+    #[serde(default)]
+    pub tasks: Vec<String>,
+    #[serde(default)]
+    pub last_run: Option<String>,
+}
+
+impl Memory {
+    /// Remembers a session started with `task` by `run`. The same task
+    /// typed again moves to the end rather than being kept twice.
+    pub fn remember(&mut self, task: &str, run: &str) {
+        let task = task.trim();
+        if !task.is_empty() {
+            self.tasks.retain(|earlier| earlier != task);
+            self.tasks.push(task.to_string());
+            let extra = self.tasks.len().saturating_sub(HISTORY_LENGTH);
+            self.tasks.drain(..extra);
+        }
+        self.last_run = Some(run.to_string());
+    }
+}
+
+/// Where the memory of the daemon at `socket`'s TUI is kept: beside the
+/// sessions the daemon writes down.
+pub fn memory_path(socket: &Path) -> PathBuf {
+    crate::state::path(socket).with_file_name("launcher.json")
+}
+
+/// The memory kept at `path`. One that's missing or can't be read is an
+/// empty one: forgetting earlier tasks is no reason to stop.
+pub fn load_memory(path: &Path) -> Memory {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
+/// Keeps `memory` at `path`, if it can.
+pub fn save_memory(path: &Path, memory: &Memory) {
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(text) = serde_json::to_string_pretty(memory) {
+        let _ = std::fs::write(path, text);
+    }
+}
+
+/// The panel's place over `area`, the panes: as wide as reads well, near
+/// the top.
+pub fn panel_area(launcher: &Launcher, area: Rect) -> Rect {
+    let width = area.width.saturating_sub(4).clamp(40.min(area.width), 100);
+    // The panel's room inside: two columns a side, and a row above and
+    // below, plus a frame's rows where the theme can't paint a panel.
+    let lines = panel_lines(launcher, width.saturating_sub(4)).len() as u16;
+    let height = (lines + 4).min(area.height);
+    let top = if area.height > height { 1 } else { 0 };
+    Rect::new(
+        area.x + (area.width - width) / 2,
+        area.y + top,
+        width,
+        height,
+    )
+}
+
+/// Draws the panel over `area`, the panes.
+pub fn draw(frame: &mut Frame, launcher: &Launcher, theme: &Theme, area: Rect) {
+    let panel = panel_area(launcher, area);
+    frame.render_widget(Clear, panel);
+    let framed = theme.panel == Color::Reset;
+    let block = if framed {
+        Block::bordered().border_style(Style::new().fg(theme.rule))
+    } else {
+        Block::new()
+    };
+    let block = block.style(Style::new().bg(theme.panel).fg(theme.text));
+    // Two columns of room a side, and a row above and below, frame or not.
+    let inside = block
+        .inner(panel)
+        .inner(Margin::new(if framed { 1 } else { 2 }, 1));
+    frame.render_widget(block, panel);
+    let lines: Vec<Line> = panel_lines(launcher, inside.width)
+        .into_iter()
+        .map(|line| line.styled(theme))
+        .collect();
+    frame.render_widget(Paragraph::new(lines), inside);
+    if let Some(at) = cursor_position(launcher, inside) {
+        frame.set_cursor_position(at);
+    }
+}
+
+/// A line of the panel, before it's given the theme's colors.
+pub struct PanelLine {
+    spans: Vec<(String, Ink)>,
+}
+
+/// What a piece of text in the panel is, which says its color.
+#[derive(Clone, Copy)]
+enum Ink {
+    Title,
+    Text,
+    Muted,
+    Label,
+    FocusedLabel,
+    Choice,
+    Chosen,
+    ChosenHere,
+    Problem,
+}
+
+impl PanelLine {
+    fn new(spans: Vec<(String, Ink)>) -> PanelLine {
+        PanelLine { spans }
+    }
+
+    fn blank() -> PanelLine {
+        PanelLine { spans: Vec::new() }
+    }
+
+    /// The text of the line, without its colors: what tests read.
+    pub fn text(&self) -> String {
+        self.spans.iter().map(|(text, _)| text.as_str()).collect()
+    }
+
+    fn styled(self, theme: &Theme) -> Line<'static> {
+        let spans = self.spans.into_iter().map(|(text, ink)| {
+            let style = match ink {
+                Ink::Title => Style::new().fg(theme.accent).add_modifier(Modifier::BOLD),
+                Ink::Text => Style::new().fg(theme.text),
+                Ink::Muted | Ink::Label | Ink::Choice => Style::new().fg(theme.muted),
+                Ink::FocusedLabel => Style::new().fg(theme.accent),
+                Ink::Chosen => Style::new().fg(theme.text).add_modifier(Modifier::BOLD),
+                Ink::ChosenHere => Style::new()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+                Ink::Problem => Style::new().fg(theme.failed),
+            };
+            Span::styled(text, style)
+        });
+        Line::from(spans.collect::<Vec<_>>())
+    }
+}
+
+/// The panel's lines in a panel `width` wide, top to bottom: its title,
+/// the task, the rows of choices, the branch, then what will run.
+pub fn panel_lines(launcher: &Launcher, width: u16) -> Vec<PanelLine> {
+    let width = usize::from(width).max(10);
+    let mut lines = vec![
+        PanelLine::new(vec![(launcher.title(), Ink::Title)]),
+        PanelLine::blank(),
+    ];
+    lines.extend(task_lines(launcher, width));
+    lines.push(PanelLine::blank());
+    for (field, label, choices, chosen) in launcher.choice_rows() {
+        lines.push(choice_line(launcher, field, label, &choices, chosen, width));
+    }
+    if launcher.is_new_worktree() {
+        let focused = launcher.focus() == Field::Branch;
+        let branch = launcher.branch_name();
+        let shown = if branch.is_empty() && !focused {
+            ("what to call it".to_string(), Ink::Muted)
+        } else {
+            (branch, Ink::Text)
+        };
+        lines.push(PanelLine::new(vec![label("branch", focused), shown]));
+    }
+    lines.push(PanelLine::blank());
+    let runs = match launcher.command_line() {
+        line if line.is_empty() => "your shell".to_string(),
+        line => line,
+    };
+    lines.push(PanelLine::new(vec![
+        ("runs  ".to_string(), Ink::Muted),
+        (cut(&runs, width - 6), Ink::Muted),
+    ]));
+    if let Some(dir) = launcher.worktree_dir() {
+        let dir = shell::home_relative(&dir);
+        lines.push(PanelLine::new(vec![
+            ("in    ".to_string(), Ink::Muted),
+            (cut_front(&dir, width - 6), Ink::Muted),
+        ]));
+    }
+    if let Some(problem) = launcher.problem() {
+        lines.push(PanelLine::new(vec![(problem.to_string(), Ink::Problem)]));
+    }
+    lines
+}
+
+/// The task box: its rows, scrolled to keep the cursor in sight, or a
+/// note saying why there's no task to type.
+fn task_lines(launcher: &Launcher, width: usize) -> Vec<PanelLine> {
+    let run = launcher.run();
+    if !run.takes_task() {
+        let note = match run {
+            Run::Shell => "a shell takes no task; ctrl+e runs any command".to_string(),
+            other => format!(
+                "{} can't be given a task when it starts; type it once it's open",
+                other.label()
+            ),
+        };
+        return vec![PanelLine::new(vec![(cut(&note, width), Ink::Muted)])];
+    }
+    let task = launcher.task();
+    if task.is_empty() {
+        let placeholder = "What should it do?  (empty: just start it)";
+        return vec![PanelLine::new(vec![(cut(placeholder, width), Ink::Muted)])];
+    }
+    let rows = task.rows(width);
+    let (cursor_row, _) = task.cursor_at(width);
+    let first = cursor_row.saturating_sub(TASK_ROWS - 1);
+    rows.iter()
+        .skip(first)
+        .take(TASK_ROWS)
+        .map(|&row| PanelLine::new(vec![(task.row_text(row), Ink::Text)]))
+        .collect()
+}
+
+/// A row of choices: its label, then each choice, the chosen one standing
+/// out. When they don't all fit, those far from the chosen one go.
+fn choice_line(
+    launcher: &Launcher,
+    field: Field,
+    name: &str,
+    choices: &[String],
+    chosen: usize,
+    width: usize,
+) -> PanelLine {
+    let focused = launcher.focus() == field;
+    let mut spans = vec![label(name, focused)];
+    let room = width.saturating_sub(LABEL_WIDTH);
+    let (from, to) = shown_choices(choices, chosen, room);
+    if from > 0 {
+        spans.push(("… ".to_string(), Ink::Muted));
+    }
+    for (index, choice) in choices.iter().enumerate().take(to).skip(from) {
+        let ink = match (index == chosen, focused) {
+            (true, true) => Ink::ChosenHere,
+            (true, false) => Ink::Chosen,
+            (false, _) => Ink::Choice,
+        };
+        spans.push((choice.clone(), ink));
+        spans.push(("   ".to_string(), Ink::Muted));
+    }
+    if to < choices.len() {
+        spans.push(("…".to_string(), Ink::Muted));
+    }
+    PanelLine::new(spans)
+}
+
+/// Which choices fit in `room`, as a range that holds the chosen one:
+/// from the first while they all fit, or else starting further along.
+fn shown_choices(choices: &[String], chosen: usize, room: usize) -> (usize, usize) {
+    let width = |range: std::ops::Range<usize>| -> usize {
+        choices[range]
+            .iter()
+            .map(|choice| choice.chars().count() + 3)
+            .sum::<usize>()
+            + 4
+    };
+    let mut from = 0;
+    while from < chosen && width(from..chosen + 1) > room {
+        from += 1;
+    }
+    let mut to = chosen + 1;
+    while to < choices.len() && width(from..to + 1) <= room {
+        to += 1;
+    }
+    (from, to)
+}
+
+fn label(name: &str, focused: bool) -> (String, Ink) {
+    let ink = if focused {
+        Ink::FocusedLabel
+    } else {
+        Ink::Label
+    };
+    (format!("{name:<LABEL_WIDTH$}"), ink)
+}
+
+/// `text`, cut to `width` characters with `…` when it's longer.
+fn cut(text: &str, width: usize) -> String {
+    let text = text.replace('\n', " ");
+    if text.chars().count() <= width {
+        return text;
+    }
+    let kept: String = text.chars().take(width.saturating_sub(1)).collect();
+    format!("{kept}…")
+}
+
+/// `path`, cut to `width` from the front when it's longer: the end of a
+/// path is what tells it apart.
+fn cut_front(path: &str, width: usize) -> String {
+    let count = path.chars().count();
+    if count <= width {
+        return path.to_string();
+    }
+    let kept: String = path.chars().skip(count + 1 - width.max(1)).collect();
+    format!("…{kept}")
+}
+
+/// Where the cursor goes in `inside`, the panel's room: in the task box
+/// or the branch, when one has the keyboard.
+fn cursor_position(launcher: &Launcher, inside: Rect) -> Option<(u16, u16)> {
+    let width = usize::from(inside.width).max(10);
+    match launcher.focus() {
+        Field::Task => {
+            let task = launcher.task();
+            if !launcher.run().takes_task() {
+                return None;
+            }
+            let (row, column) = task.cursor_at(width);
+            let first = row.saturating_sub(TASK_ROWS - 1);
+            // Below the title and the blank line under it.
+            let y = inside.y + 2 + (row - first) as u16;
+            let x = inside.x + column.min(width - 1) as u16;
+            Some((x, y))
+        }
+        Field::Branch => {
+            let lines = panel_lines(launcher, inside.width);
+            let at = lines
+                .iter()
+                .position(|line| line.text().starts_with("branch "))?;
+            let column = LABEL_WIDTH + launcher.branch_input().cursor();
+            Some((inside.x + column as u16, inside.y + at as u16))
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn agent(program: &str) -> Run {
+        Run::Agent(catalog::find(program).unwrap())
+    }
+
+    fn here() -> Target {
+        Target::Here {
+            dir: Some(PathBuf::from("/code/payments")),
+            label: "payments ⌂ main".into(),
+        }
+    }
+
+    fn worktree() -> Target {
+        Target::NewWorktree {
+            base: Some(PathBuf::from("/code/payments")),
+            project: Some("payments".into()),
+        }
+    }
+
+    fn launcher(runs: Vec<Run>) -> Launcher {
+        Launcher::new(Setup {
+            runs,
+            run: 0,
+            targets: vec![here(), worktree()],
+            target: 0,
+            history: vec!["first task".into(), "second task".into()],
+            codex_models: vec!["gpt-6-luna".into(), "gpt-5.5".into()],
+        })
+    }
+
+    fn press(launcher: &mut Launcher, code: KeyCode) -> Outcome {
+        launcher.on_key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    fn type_text(launcher: &mut Launcher, text: &str) {
+        for c in text.chars() {
+            press(launcher, KeyCode::Char(c));
+        }
+    }
+
+    fn started(outcome: Outcome) -> (Place, Vec<String>) {
+        match outcome {
+            Outcome::Start { place, command, .. } => (place, command),
+            other => panic!("didn't start: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn claude_gets_the_task_as_one_argument() {
+        let mut panel = launcher(vec![agent("claude"), Run::Shell]);
+        type_text(&mut panel, "fix the flaky test");
+        let (place, command) = started(press(&mut panel, KeyCode::Enter));
+        assert_eq!(command, ["claude", "fix the flaky test"]);
+        assert_eq!(
+            place,
+            Place::Directory(Some(PathBuf::from("/code/payments")))
+        );
+    }
+
+    #[test]
+    fn each_agent_takes_its_first_prompt_its_own_way() {
+        let cases = [
+            ("gemini", vec!["gemini", "-i", "go"]),
+            ("opencode", vec!["opencode", "--prompt", "go"]),
+            ("cursor-agent", vec!["cursor-agent", "go"]),
+            ("aider", vec!["aider"]),
+        ];
+        for (program, expected) in cases {
+            let mut panel = launcher(vec![agent(program)]);
+            panel.task.set_text("go");
+            assert_eq!(panel.command(), expected, "{program}");
+        }
+    }
+
+    #[test]
+    fn a_choice_other_than_the_default_adds_its_option() {
+        let mut panel = launcher(vec![agent("claude")]);
+        type_text(&mut panel, "plan it");
+        press(&mut panel, KeyCode::Tab); // run
+        press(&mut panel, KeyCode::Tab); // model
+        assert_eq!(panel.focus(), Field::Setting(0));
+        press(&mut panel, KeyCode::Right);
+        press(&mut panel, KeyCode::Down); // permissions
+        press(&mut panel, KeyCode::Right);
+        press(&mut panel, KeyCode::Right);
+        assert_eq!(
+            panel.command(),
+            [
+                "claude",
+                "--model",
+                "opus",
+                "--permission-mode",
+                "plan",
+                "plan it"
+            ]
+        );
+        assert_eq!(
+            panel.command_line(),
+            "claude --model opus --permission-mode plan 'plan it'"
+        );
+    }
+
+    #[test]
+    fn codex_offers_the_models_it_lists() {
+        let mut panel = launcher(vec![agent("codex")]);
+        press(&mut panel, KeyCode::Tab);
+        press(&mut panel, KeyCode::Tab);
+        press(&mut panel, KeyCode::Right);
+        assert_eq!(panel.command(), ["codex", "-m", "gpt-6-luna"]);
+        // Going round from the first comes back to the default.
+        press(&mut panel, KeyCode::Left);
+        press(&mut panel, KeyCode::Left);
+        assert_eq!(panel.command(), ["codex", "-m", "gpt-5.5"]);
+    }
+
+    #[test]
+    fn changing_what_runs_resets_its_rows_and_the_shell_takes_no_task() {
+        let mut panel = launcher(vec![agent("claude"), Run::Shell]);
+        type_text(&mut panel, "x");
+        press(&mut panel, KeyCode::Tab);
+        press(&mut panel, KeyCode::Right);
+        assert_eq!(panel.run(), &Run::Shell);
+        assert_eq!(panel.command(), Vec::<String>::new());
+        assert_eq!(panel.fields(), [Field::Run, Field::Where]);
+        assert_eq!(panel.command_line(), "");
+    }
+
+    #[test]
+    fn tab_goes_round_the_fields_and_back() {
+        let mut panel = launcher(vec![agent("claude")]);
+        let mut seen = vec![panel.focus()];
+        for _ in 0..4 {
+            press(&mut panel, KeyCode::Tab);
+            seen.push(panel.focus());
+        }
+        assert_eq!(
+            seen,
+            [
+                Field::Task,
+                Field::Run,
+                Field::Setting(0),
+                Field::Setting(1),
+                Field::Where
+            ]
+        );
+        press(&mut panel, KeyCode::Tab);
+        assert_eq!(panel.focus(), Field::Task);
+        press(&mut panel, KeyCode::BackTab);
+        assert_eq!(panel.focus(), Field::Where);
+    }
+
+    #[test]
+    fn a_new_worktree_is_named_after_the_task_until_its_branch_is_typed() {
+        let mut panel = launcher(vec![agent("claude")]);
+        type_text(&mut panel, "Fix the flaky refund test!");
+        panel.target = 1;
+        assert_eq!(panel.branch_name(), "fix-the-flaky-refund-test");
+        assert_eq!(
+            panel.title(),
+            "New session · payments ⎇ fix-the-flaky-refund-test"
+        );
+        assert_eq!(
+            panel.worktree_dir(),
+            Some(PathBuf::from(
+                "/code/payments.worktrees/fix-the-flaky-refund-test"
+            ))
+        );
+        panel.focus_on(Field::Branch);
+        press(&mut panel, KeyCode::Backspace);
+        assert_eq!(panel.branch_name(), "fix-the-flaky-refund-tes");
+        let (place, _) = started(press(&mut panel, KeyCode::Enter));
+        assert_eq!(
+            place,
+            Place::NewWorktree {
+                branch: "fix-the-flaky-refund-tes".into(),
+                base: Some(PathBuf::from("/code/payments")),
+            }
+        );
+    }
+
+    #[test]
+    fn a_new_worktree_with_no_task_asks_for_its_branch_first() {
+        let mut panel = launcher(vec![agent("claude")]);
+        panel.target = 1;
+        assert_eq!(press(&mut panel, KeyCode::Enter), Outcome::Stay);
+        assert_eq!(panel.focus(), Field::Branch);
+        assert_eq!(panel.problem(), Some("name the new worktree's branch"));
+        type_text(&mut panel, "spike");
+        let (place, _) = started(press(&mut panel, KeyCode::Enter));
+        assert!(matches!(place, Place::NewWorktree { branch, .. } if branch == "spike"));
+    }
+
+    #[test]
+    fn branches_from_tasks_are_short_and_plain() {
+        assert_eq!(
+            branch_from_task("Fix issue #42: login redirect"),
+            "fix-issue-42-login-redirect"
+        );
+        assert_eq!(
+            branch_from_task("make the export of the whole ledger stream instead of buffering"),
+            "make-the-export-of-the-whole-ledger"
+        );
+        assert_eq!(branch_from_task("  "), "");
+    }
+
+    #[test]
+    fn up_brings_back_earlier_tasks_and_down_the_draft() {
+        let mut panel = launcher(vec![agent("claude")]);
+        type_text(&mut panel, "draft");
+        press(&mut panel, KeyCode::Up);
+        assert_eq!(panel.task().text(), "second task");
+        press(&mut panel, KeyCode::Up);
+        press(&mut panel, KeyCode::Up);
+        assert_eq!(panel.task().text(), "first task");
+        press(&mut panel, KeyCode::Down);
+        assert_eq!(panel.task().text(), "second task");
+        press(&mut panel, KeyCode::Down);
+        assert_eq!(panel.task().text(), "draft");
+    }
+
+    #[test]
+    fn alt_enter_breaks_the_line_and_a_paste_keeps_its_lines() {
+        let mut panel = launcher(vec![agent("claude")]);
+        type_text(&mut panel, "one");
+        panel.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT));
+        panel.on_paste("two\nthree");
+        assert_eq!(panel.task().text(), "one\ntwo\nthree");
+    }
+
+    #[test]
+    fn ctrl_e_hands_over_the_command_line() {
+        let mut panel = launcher(vec![agent("claude")]);
+        type_text(&mut panel, "fix it");
+        let outcome = panel.on_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
+        assert_eq!(
+            outcome,
+            Outcome::CommandLine {
+                place: Place::Directory(Some(PathBuf::from("/code/payments"))),
+                line: "claude 'fix it'".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_preset_brings_its_settings_and_puts_its_prompt_first() {
+        let preset = Preset {
+            name: "review".into(),
+            agent: "claude".into(),
+            model: Some("opus".into()),
+            mode: Some("plan".into()),
+            args: vec!["--verbose".into()],
+            prompt: Some("Review the diff.".into()),
+        };
+        assert_eq!(
+            preset_command(&preset, "Mind the tests."),
+            [
+                "claude",
+                "--model",
+                "opus",
+                "--permission-mode",
+                "plan",
+                "--verbose",
+                "Review the diff.\n\nMind the tests."
+            ]
+        );
+        assert_eq!(
+            preset_command(&preset, "").last().unwrap(),
+            "Review the diff."
+        );
+        let mut panel = launcher(vec![Run::Preset(preset), agent("claude")]);
+        assert_eq!(panel.fields(), [Field::Task, Field::Run, Field::Where]);
+        type_text(&mut panel, "x");
+        assert_eq!(panel.run().key(), "preset:review");
+    }
+
+    #[test]
+    fn the_memory_keeps_the_last_tasks_once_each() {
+        let mut memory = Memory::default();
+        memory.remember("a", "claude");
+        memory.remember("b", "codex");
+        memory.remember("a", "claude");
+        memory.remember("  ", "shell");
+        assert_eq!(memory.tasks, ["b", "a"]);
+        assert_eq!(memory.last_run.as_deref(), Some("shell"));
+        for n in 0..150 {
+            memory.remember(&n.to_string(), "claude");
+        }
+        assert_eq!(memory.tasks.len(), HISTORY_LENGTH);
+        assert_eq!(memory.tasks.last().unwrap(), "149");
+    }
+
+    #[test]
+    fn the_panel_shows_what_will_run_and_where() {
+        let mut panel = launcher(vec![agent("claude")]);
+        type_text(&mut panel, "fix it");
+        panel.target = 1;
+        let lines: Vec<String> = panel_lines(&panel, 70)
+            .iter()
+            .map(PanelLine::text)
+            .collect();
+        assert!(
+            lines[0].starts_with("New session · payments ⎇ fix-it"),
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("run          Claude Code")),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.starts_with("branch       fix-it")),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l == "runs  claude 'fix it'"),
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l == "in    /code/payments.worktrees/fix-it"),
+            "{lines:?}"
+        );
+        // Too long for the panel, the path keeps its end.
+        let narrow: Vec<String> = panel_lines(&panel, 30)
+            .iter()
+            .map(PanelLine::text)
+            .collect();
+        assert!(
+            narrow.iter().any(|l| l == "in    …yments.worktrees/fix-it"),
+            "{narrow:?}"
+        );
+    }
+
+    #[test]
+    fn a_long_row_keeps_the_chosen_choice_in_sight() {
+        let choices: Vec<String> = (0..10).map(|n| format!("choice-{n}")).collect();
+        let (from, to) = shown_choices(&choices, 8, 40);
+        assert!(from <= 8 && 8 < to, "{from}..{to}");
+        assert!(from > 0);
+    }
+}

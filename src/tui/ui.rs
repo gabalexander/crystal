@@ -9,6 +9,7 @@ use super::diff_view;
 use super::finder;
 use super::help;
 use super::issues;
+use super::launcher;
 use super::pane::Pane;
 use super::screen_widget::ScreenWidget;
 use super::sidebar::{self, fit};
@@ -239,6 +240,17 @@ pub fn draw(frame: &mut Frame, app: &App, panes: &[Pane], look: &Look) {
         let below_top = areas.top.bottom();
         let middle = Rect::new(0, below_top, frame.area().width, areas.footer.y - below_top);
         issues::draw(frame, view, look.theme, look.now, middle);
+    }
+    if let Some(panel) = app.launcher() {
+        // Over the panes, beside the sidebar.
+        let left = areas.rule.right();
+        let over = Rect::new(
+            left,
+            areas.main.y,
+            frame.area().width - left,
+            areas.main.height,
+        );
+        launcher::draw(frame, panel, look.theme, over);
     }
     draw_footer(frame, app, look, areas.footer);
     if app.showing_keys() {
@@ -475,7 +487,9 @@ pub fn draw_message(frame: &mut Frame, look: &Look, message: &str, area: Rect) {
 /// is and the keys that matter there, with "? keys" on the right.
 fn draw_footer(frame: &mut Frame, app: &App, look: &Look, area: Rect) {
     let theme = look.theme;
-    if let Some(prompt) = app.prompt() {
+    if app.launcher().is_some() {
+        frame.render_widget(hint_spans(LAUNCHER_HINTS, theme), area);
+    } else if let Some(prompt) = app.prompt() {
         draw_prompt(frame, theme, prompt, area);
     } else if app.issues_view().is_some() {
         frame.render_widget(hint_spans(ISSUES_HINTS, theme), area);
@@ -543,6 +557,16 @@ const SIDEBAR_HINTS: &[(&str, &str)] = &[
     ("/", "find"),
     ("d", "diff"),
     ("p", "files"),
+];
+
+/// The keys while the new-session panel is open.
+const LAUNCHER_HINTS: &[(&str, &str)] = &[
+    ("enter", "start"),
+    ("tab", "next"),
+    ("←/→", "choose"),
+    ("alt+enter", "new line"),
+    ("ctrl+e", "command line"),
+    ("esc", "cancel"),
 ];
 
 /// The keys while the issues view is open.
@@ -661,7 +685,6 @@ fn keys_hint<'a>(app: &App, theme: &Theme) -> Line<'a> {
 /// Asks the prompt's question, with the cursor in the answer.
 fn draw_prompt(frame: &mut Frame, theme: &Theme, prompt: &Prompt, area: Rect) {
     let question = match prompt.question {
-        Question::Branch { .. } => " branch for the new worktree: ",
         Question::Command(_) => " new session: ",
         Question::Rename(_) => " new name: ",
     };
@@ -939,20 +962,29 @@ mod tests {
     }
 
     #[test]
-    fn the_branch_prompt_takes_the_footer() {
+    fn the_new_session_panel_shows_over_the_panes_with_what_will_run() {
         let mut app = App::new(None);
-        app.on_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE));
-        app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
-        let text = screen_text(&app);
-        assert!(text[11].contains("branch for the new worktree: x"));
+        app.set_agents(vec![crate::catalog::find("claude").unwrap()]);
+        app.on_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        for c in "fix it".chars() {
+            app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        let text = screen_text_at(&app, 100, 24).join("\n");
+        assert!(text.contains("New session · this directory"), "{text}");
+        assert!(text.contains("fix it"), "{text}");
+        assert!(text.contains("run          Claude Code   shell"), "{text}");
+        assert!(text.contains("runs  claude 'fix it'"), "{text}");
+        assert!(text.contains("enter start"), "{text}");
     }
 
     #[test]
-    fn the_new_session_line_takes_the_footer() {
+    fn ctrl_e_puts_the_command_line_on_the_footer() {
         let mut app = App::new(None);
+        app.set_agents(vec![crate::catalog::find("claude").unwrap()]);
         app.on_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
         let text = screen_text(&app);
-        assert!(text[11].contains("new session: claude"));
+        assert!(text[11].contains("new session: claude"), "{text:?}");
     }
 
     #[test]
