@@ -1,6 +1,6 @@
-//! Drawing the TUI: a bar along the top, the sidebar of sessions, the pane
-//! with the selected session and the panes of those split off, each under a
-//! header line, and the footer. There are no boxes: thin rules and the
+//! Drawing the TUI: a bar along the top with the tabs, the sidebar of
+//! sessions, the pane with the selected session and the panes of those split
+//! off, each under a header line, and the footer. There are no boxes: thin rules and the
 //! theme's colors tell the parts apart. Drawing only reads the state; it
 //! never changes it.
 
@@ -18,6 +18,7 @@ use super::profiles;
 use super::screen_widget::ScreenWidget;
 use super::sidebar::{self, fit};
 use super::status::Status;
+use super::tabs::Tab;
 use super::theme::Theme;
 use crate::flow_run::RunState;
 use crate::protocol::{SessionInfo, State};
@@ -29,6 +30,16 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph};
 
 const SIDEBAR_WIDTH: u16 = 28;
+
+/// Where the tabs start in the top bar: after crystal's name and a gap.
+const TABS_START: u16 = 10;
+
+/// The columns the top bar keeps on its right for the summary, the most
+/// it's likely to need.
+const SUMMARY_ROOM: u16 = 26;
+
+/// The longest a tab's name gets in the top bar.
+const TAB_NAME_LENGTH: usize = 16;
 
 /// Panes go side by side only while each is at least this wide, which fits
 /// most agents' screens; narrower than that, they're stacked.
@@ -208,6 +219,9 @@ pub fn hit(areas: &Areas, app: &App, column: u16, row: u16) -> Hit {
         }
         return Hit::Elsewhere;
     }
+    if at(areas.top) {
+        return tab_hit(app, areas.top, column);
+    }
     if at(areas.sidebar) {
         return sidebar::hit(areas.sidebar, app, row);
     }
@@ -329,8 +343,8 @@ fn draw_plugin_pane(frame: &mut Frame, open: &PluginPane, pane: &Pane, look: &Lo
     }
 }
 
-/// crystal's name on the left, and on the right how many sessions there
-/// are and how many wait on the user.
+/// crystal's name and the tabs on the left, and on the right how many
+/// sessions there are and how many wait on the user.
 fn draw_top_bar(frame: &mut Frame, app: &App, look: &Look, area: Rect) {
     let theme = look.theme;
     let name = Line::from(vec![
@@ -341,7 +355,85 @@ fn draw_top_bar(frame: &mut Frame, app: &App, look: &Look, area: Rect) {
         ),
     ]);
     frame.render_widget(name, area);
+    draw_tabs(frame, app, theme, area);
     frame.render_widget(summary(app.sessions(), theme).right_aligned(), area);
+}
+
+/// The tabs, after crystal's name in the top bar in `area`: the one in
+/// front stands out the way the sidebar's selection does, the others are
+/// muted.
+fn draw_tabs(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
+    let in_front = app.tabs().current_index();
+    let labels = tab_labels(app.tabs().all(), area.width);
+    for (index, (column, label)) in labels.into_iter().enumerate() {
+        let style = if index == in_front {
+            theme
+                .selection
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::new().fg(theme.muted)
+        };
+        let place = Rect::new(area.x + column, area.y, width_of(&label), 1);
+        frame.render_widget(Span::styled(label, style), place);
+    }
+}
+
+/// The tabs' labels in a top bar `width` columns wide, each with the column
+/// it starts at: ` 1 `, or ` 2 review ` once the tab has a name. While they
+/// all fit they show their names; when they don't, only their numbers, and
+/// any that still don't fit are left off.
+pub fn tab_labels(tabs: &[Tab], width: u16) -> Vec<(u16, String)> {
+    let room = width.saturating_sub(TABS_START + SUMMARY_ROOM);
+    let labels = |named: bool| -> Vec<String> {
+        let numbered = tabs.iter().enumerate();
+        numbered
+            .map(|(index, tab)| tab_label(index + 1, tab, named))
+            .collect()
+    };
+    let mut shown = labels(true);
+    let all_named: u16 = shown.iter().map(|label| width_of(label)).sum();
+    if all_named > room {
+        shown = labels(false);
+    }
+    let mut placed = Vec::new();
+    let mut used = 0;
+    for label in shown {
+        let width = width_of(&label);
+        if used + width > room {
+            break;
+        }
+        placed.push((TABS_START + used, label));
+        used += width;
+    }
+    placed
+}
+
+/// Tab `number`'s label: its number, and its name if it has one and
+/// `named` says to show it.
+fn tab_label(number: usize, tab: &Tab, named: bool) -> String {
+    if named && !tab.name.is_empty() {
+        format!(" {number} {} ", fit(&tab.name, TAB_NAME_LENGTH))
+    } else {
+        format!(" {number} ")
+    }
+}
+
+/// The tab drawn at `column` of the top bar in `area`, if there's one
+/// there.
+fn tab_hit(app: &App, area: Rect, column: u16) -> Hit {
+    let column = column - area.x;
+    let labels = tab_labels(app.tabs().all(), area.width);
+    let under = labels.iter().position(|(start, label)| {
+        let end = start + width_of(label);
+        (*start..end).contains(&column)
+    });
+    under.map_or(Hit::Elsewhere, Hit::Tab)
+}
+
+/// How many columns `text` takes on screen.
+fn width_of(text: &str) -> u16 {
+    Span::raw(text).width() as u16
 }
 
 /// "6 sessions · 2 waiting": the waiting count only when some are, in the
@@ -677,6 +769,7 @@ const SIDEBAR_HINTS: &[(&str, &str)] = &[
     ("/", "find"),
     ("d", "diff"),
     ("p", "files"),
+    ("t", "tab"),
 ];
 
 /// The sidebar's keys while the selected step's flow run waits at a gate.
@@ -876,6 +969,7 @@ fn draw_prompt(frame: &mut Frame, theme: &Theme, prompt: &Prompt, area: Rect) {
     let question = match prompt.question {
         Question::Command(_) => " new session: ",
         Question::Rename(_) => " new name: ",
+        Question::TabName => " tab name: ",
         Question::CloseTask { failed: false, .. } => " done; what was done: ",
         Question::CloseTask { failed: true, .. } => " failed; why: ",
         Question::SendFlowBack(_) => " send back; what to do differently: ",
@@ -1039,6 +1133,77 @@ mod tests {
         let text = screen_text(&app);
         assert!(text[0].starts_with(" crystal"), "{}", text[0]);
         assert!(text[0].trim_end().ends_with("1 session"), "{}", text[0]);
+    }
+
+    /// An app with one session and three tabs, the second named `review`
+    /// and in front.
+    fn app_with_three_tabs() -> App {
+        let mut app = App::new(None);
+        app.set_sessions(vec![session("a", State::Running)]);
+        let mut press = |code| app.on_key(KeyEvent::new(code, KeyModifiers::NONE));
+        press(KeyCode::Char('t'));
+        press(KeyCode::Char('T'));
+        for c in "review".chars() {
+            press(KeyCode::Char(c));
+        }
+        press(KeyCode::Enter);
+        press(KeyCode::Char('t'));
+        press(KeyCode::Char('2'));
+        app
+    }
+
+    #[test]
+    fn the_top_bar_shows_the_tabs_by_number_and_name_after_crystal() {
+        let text = screen_text(&app_with_three_tabs());
+        assert!(
+            text[0].starts_with(" crystal   1  2 review  3 "),
+            "{}",
+            text[0]
+        );
+    }
+
+    #[test]
+    fn the_tab_in_front_stands_out_like_the_selection() {
+        let theme = theme();
+        let app = app_with_three_tabs();
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, &app, &[], None, &look(&theme)))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let (front, behind) = (&buffer[(16, 0)], &buffer[(11, 0)]);
+        assert_eq!(front.symbol(), "r");
+        assert_eq!(front.bg, theme.selection.bg.unwrap());
+        assert_eq!(front.fg, theme.accent);
+        assert_eq!(behind.symbol(), "1");
+        assert_eq!(behind.fg, theme.muted);
+    }
+
+    #[test]
+    fn tabs_go_by_their_numbers_alone_when_their_names_dont_fit() {
+        let named = |name: &str| Tab {
+            name: name.into(),
+            ..Tab::default()
+        };
+        let tabs = [named("agents"), named("a-long-name-for-a-tab"), named("")];
+        let labels = |width| -> Vec<String> {
+            let labels: Vec<(u16, String)> = tab_labels(&tabs, width);
+            labels.into_iter().map(|(_, label)| label).collect()
+        };
+        assert_eq!(labels(120), [" 1 agents ", " 2 a-long-name-for… ", " 3 "]);
+        assert_eq!(labels(60), [" 1 ", " 2 ", " 3 "]);
+        assert_eq!(labels(42), [" 1 ", " 2 "], "the last doesn't fit");
+    }
+
+    #[test]
+    fn a_click_finds_the_tab_under_it() {
+        let app = app_with_three_tabs();
+        let areas = Areas::new(Rect::new(0, 0, 80, 24), 0);
+        // " 1 " is drawn at columns 10 to 12, " 2 review " at 13 to 22.
+        assert_eq!(hit(&areas, &app, 10, 0), Hit::Tab(0));
+        assert_eq!(hit(&areas, &app, 18, 0), Hit::Tab(1));
+        assert_eq!(hit(&areas, &app, 24, 0), Hit::Tab(2));
+        assert_eq!(hit(&areas, &app, 40, 0), Hit::Elsewhere);
     }
 
     #[test]

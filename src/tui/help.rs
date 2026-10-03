@@ -55,20 +55,20 @@ pub const KEYS: &[Key] = &[
     sidebar("Tab/Shift+Tab", "next / previous pane"),
     sidebar("s", "split off, or unsplit"),
     sidebar("PageUp/PageDown", "page its history"),
+    sidebar("t/T/&", "tab: new / name / close"),
+    sidebar("[/] 1-9", "switch tabs"),
     sidebar("n/w", "new, or in a worktree"),
     sidebar("W", "remove its worktree"),
     sidebar("r/x", "rename / kill it"),
     of_plugin("tasks", "c", "close its task"),
     of_plugin("flows", "g/f", "flow: go on / send back"),
-    sidebar("u", "next one that needs you"),
-    sidebar("/", "find a session"),
+    sidebar("u /", "next needing you / find"),
     of_plugin("github", "o/i", "pull request / issues"),
     sidebar("d/p", "diff / find a file"),
     of_plugin("backlog", "b", "the project's backlog"),
     of_plugin("memory", "m", "what it has remembered"),
     of_plugin("profiles", "P", "your agent profiles"),
-    sidebar("X", "plugins"),
-    sidebar("?/q", "keys / quit"),
+    sidebar("?/X/q", "keys / plugins / quit"),
     in_pane("Ctrl+\\", "back to the sidebar"),
     in_pane("Shift+PgUp", "page back"),
     in_pane("Shift+PgDn", "page forward"),
@@ -80,7 +80,7 @@ pub const KEYS: &[Key] = &[
     new_session("↑/↓", "earlier tasks"),
     new_session("Alt+Enter", "new line in the task"),
     new_session("Ctrl+E", "edit the command line"),
-    mouse("click", "select; focus a pane"),
+    mouse("click", "a session, pane, tab"),
     mouse("wheel", "move, or scroll a pane"),
     mouse("Shift+drag", "select text"),
 ];
@@ -289,14 +289,15 @@ mod tests {
         Theme::new(ThemeName::Dark, false)
     }
 
-    /// The keys a label stands for: `j/k ↓/↑` is j, k, ↓ and ↑. A label
-    /// that's only `/` is that key.
+    /// The keys a label stands for: `j/k ↓/↑` is j, k, ↓ and ↑. A `/` on
+    /// its own between spaces is that key: `u /` is u and /.
     fn keys_in(label: &str) -> Vec<String> {
-        if label == "/" {
-            return vec![label.to_string()];
-        }
         label
-            .split(['/', ' '])
+            .split(' ')
+            .flat_map(|group| match group {
+                "/" => vec![group],
+                _ => group.split('/').collect(),
+            })
             .filter(|key| !key.is_empty())
             .map(String::from)
             .collect()
