@@ -53,6 +53,25 @@ crystal result tests
 - A task takes follow-ups with `send`, one at a time, never `send-keys`.
 - A task whose run fails ends: `wait` prints `exited N`, and `result` says why.
 
+## Or run a flow
+
+A flow is a chain of tasks on one goal, set up in the user's config file (`crystal config` shows it), like
+plan, then implement in a worktree, then a review the user approves. Run one when the user asks for it by
+name:
+
+```sh
+crystal flow run ship "Retry the webhook when it times out"   # prints the run's name, like ship-1
+crystal flow wait ship-1 --timeout 1800                        # until a gate, the end, or a failure
+crystal flow show ship-1                                       # each step and the first line of its answer
+crystal result ship-1-review                                   # a step's whole answer: its session is <run>-<step>
+```
+
+- `flow wait` prints `waiting at <step>` when the run stops at a gate for the user, or `done`. It fails, saying
+  `failed at <step>: <why>`, when a step fails.
+- A gate is the user's to answer. Go on past it (`crystal flow approve <run>`) or send it back with notes
+  (`crystal flow back <run> "<notes>"`) only when the user tells you to.
+- `crystal flow retry <run>` runs a failed or interrupted step again. `crystal flow --json` lists every run.
+
 ## Close your task
 
 A session started with something to do is a task, and stays open until it's closed. If you were started

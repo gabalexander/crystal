@@ -52,7 +52,8 @@ is: it's the one request every version must understand.
   - `mouse.rs`: writes mouse events the way a program in a pane asked for them
   - `help.rs`: the overlay `?` opens, drawn from one table of every key; a test keeps the README's
     table of sidebar keys in step with it
-  - `groups.rs`: the sidebar's order and headings: sessions by project, then worktree
+  - `groups.rs`: the sidebar's order and headings: sessions by project, then worktree, and each flow run's
+    steps under it
   - `text_input.rs`: a one-line text box, for the questions asked on the bottom line
   - `text_area.rs`: a text box of several lines that wrap: the new-session panel's task
   - `launcher.rs`: the new-session panel (`n`, `w`): its state and keys, kept apart from I/O, the command
@@ -111,6 +112,12 @@ is: it's the one request every version must understand.
 - `src/memory_cli.rs`: `crystal remember` and `crystal memory`
 - `src/profile.rs`: agent profiles: what one runs, checking it, and saving or removing one in the config file
   with `toml_edit`, so the user's comments and layout stay; `enabled` is the one switch for the feature
+- `src/flows.rs`: flows, chains of background tasks on one goal: the `[[flow]]` tables in the config file,
+  checking them, filling in a step's prompt, the example `crystal flow example` prints, and `enabled`, the one
+  gate everything flows add goes through
+- `src/flow_run.rs`: a flow run and how it changes as its steps end and the user answers its gates, kept apart
+  from I/O, so it's unit-tested; the daemon starts the steps and writes the runs down
+- `src/flow_cli.rs`: `crystal flow` and its commands
 - `src/notify.rs`: telling the user when a session needs them: desktop notifications, or their own command
 - `src/plugins.rs`: plugins: the registry of crystal's own, `enabled`, the gate every one of them goes through
   (each module's `enabled` asks it), finding installed plugins, switching one in the config's `[plugins]` with

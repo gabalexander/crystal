@@ -528,6 +528,95 @@ to do beside its name: `payments ──── 3 to do`. In the view, what's to d
 filters the list as you type. `Enter` opens the new-session panel with the item as its task, on a branch named
 after it; that task ticks the item off when it closes done.
 
+### Flows
+
+A flow is a chain of [background tasks](#background-tasks) on one goal: plan it, build it in a worktree,
+review it, open the pull request. Each step runs with a [profile](#profiles) of its own and starts once the
+step before it is done, given what that step answered. A step can stop the flow at a gate until you've looked
+at what it did, then you go on, or send it back with notes.
+
+Flows are written in the config file, a `[[flow]]` table each, with a `[[flow.step]]` table for each step.
+`crystal flow example` prints this one, with the profiles it runs with, ready to copy in:
+
+```toml
+[[flow]]
+name = "ship"
+description = "Plan, build in a worktree, review, open a pull request"
+
+[[flow.step]]
+name = "plan"
+profile = "planner"
+prompt = "Plan how to do this: {goal}. Answer with the files to change and how, in order."
+
+[[flow.step]]
+name = "implement"
+profile = "builder"
+worktree = true
+prompt = """
+Do this: {goal}
+
+Follow this plan:
+{previous}
+
+{feedback}"""
+
+[[flow.step]]
+name = "review"
+profile = "reviewer"
+gate = true
+back_to = "implement"
+prompt = "Review the changes on this branch against what was asked: {goal}"
+
+[[flow.step]]
+name = "pr"
+profile = "shipper"
+prompt = "Push this branch and open a pull request for it with `gh pr create --fill`."
+```
+
+| Step setting | What it does |
+|---|---|
+| `name` | what the step is called; its session is named after the run and it, like `ship-1-plan` |
+| `profile` | optional: the Claude Code [profile](#profiles) it runs with: model, mode, arguments, instructions, prompt |
+| `prompt` | what it's asked, with `{goal}`, `{previous}` and `{feedback}` filled in |
+| `worktree` | optional: `true` runs it in a worktree the flow makes, on a branch named after the goal; the steps after it run there too |
+| `gate` | optional: `true` stops the flow after it until you go on, or send the flow back |
+| `back_to` | optional, on a step with a gate: the step that sending the flow back runs again; left out, this one |
+
+`{goal}` is what you asked the flow to do, and `{previous}` what the step before answered. `{feedback}` is
+empty until you send the flow back; from then on it holds your notes and, when it went back to an earlier step,
+what the step at the gate said. The step it goes back to hears that even if its prompt doesn't ask for it.
+
+```sh
+crystal flow run ship "Retry the webhook when it times out"    # prints the run's name: ship-1
+crystal flow                         # every run: how it stands, its step, round and cost
+crystal flow show ship-1             # each step: how it stands, its session, runs, cost and answer
+crystal flow wait ship-1             # until it waits at a gate or is done; a failed step is an error
+crystal flow approve ship-1          # go on past the gate
+crystal flow back ship-1 "Keep the old timeout as the default"    # send it back, with notes
+crystal flow retry ship-1            # run a step that failed, or that a restart cut short, again
+```
+
+- Each step is a background task, so nobody is there to say yes to a permission: give each step a profile that
+  allows what it needs, with `mode` and `args`. Only Claude Code runs as a background task, so a step's profile
+  is a Claude Code one. Each step's task goes into the project's [history](#tasks) as `ship-1 plan: <goal>`.
+- Sending the flow back runs the step it goes back to again, as a follow-up in that step's own conversation,
+  then the steps after it again, in a new round. A step that fails stops the run until you run it again, and
+  you're told, as you are when a run stops at a gate.
+- In the sidebar, a run sits under its project after its worktrees: `◇`, the flow's name and the goal, and the
+  round once it's been sent back. Under it is a row for each step: `·` still to come, the working mark while it
+  runs, `▲` at its gate, `✓` done, `✗` failed and `■` cut short. A step's row is its task's session, so
+  selecting it shows the step's transcript.
+- At a gate, the step's session waits on you the way an agent asking something does: you're told, `u` goes to
+  it, and `ls` says `waiting`. `g` goes on, and `f` asks for your notes on the footer and sends the flow back.
+  On a step that failed or was cut short, `g` runs it again.
+- The new-session panel offers your flows after your profiles, `flow: ship`; what you type as the task is the
+  goal.
+- Runs are kept beside the sessions in the state directory. After a restart, a run waiting at a gate waits
+  again, and a step that was running is marked interrupted until you run it again, in its conversation. A
+  run's steps start from the environment of the `crystal flow run` that started it; after a restart, from the
+  daemon's. The daemon reads the flow and its profiles from the config file as the run starts, so changing
+  them never changes a run halfway.
+
 ### Plugins
 
 Most of what crystal does beyond running sessions is a plugin you can switch off: tasks, the backlog, memory,
@@ -675,9 +764,10 @@ notify_command = 'curl -s -d "$CRYSTAL_NOTICE" ntfy.sh/my-crystal'
 `new_session` names an agent (`claude`, `codex`, …) or `shell`. With options, like `codex --full-auto`, it's
 offered as a profile of its own.
 
-The daemon reads the notification settings each time it tells you something, and `[plugins]` each time it
-does something a plugin adds, so a change counts straight away; the TUI reads `new_session`, `theme`,
-`[plugins]` and the profiles when it starts, and again when you save a profile or switch a plugin.
+The daemon reads the notification settings each time it tells you something, `[plugins]` each time it
+does something a plugin adds, and a flow each time one starts, so a change counts straight away; the TUI
+reads `new_session`, `theme`, `[plugins]`, the profiles and the flows when it starts, and again when you save
+a profile or switch a plugin.
 
 #### Profiles
 
