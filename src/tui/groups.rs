@@ -155,6 +155,7 @@ mod tests {
         });
         SessionInfo {
             name: name.into(),
+            id: name.into(),
             command: vec!["sh".into()],
             cwd: PathBuf::from("/tmp"),
             pid: Some(1),

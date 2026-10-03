@@ -26,11 +26,27 @@ pub enum Request {
     },
     /// Something the agent in a session did, sent by its hooks.
     Report {
+        /// The name the session had when its program started, which may
+        /// have changed since. `id` finds the session whatever it's called.
         name: String,
+        /// The session's id, from programs started since sessions had one.
+        #[serde(default)]
+        id: Option<String>,
         event: AgentEvent,
         /// The conversation the agent is in, when its hooks say.
         #[serde(default)]
         conversation: Option<Conversation>,
+    },
+    /// Give a session another name.
+    Rename {
+        name: String,
+        new_name: String,
+    },
+    /// Run an ended session's command again, in the same directory and
+    /// under the same name, from the client's environment.
+    Respawn {
+        name: String,
+        env: BTreeMap<String, String>,
     },
     /// Type `text` into a session, then press Enter if `enter` is set.
     Send {
@@ -90,6 +106,8 @@ pub enum Response {
     /// sends its last screen and hangs up.
     Attached {
         name: String,
+        #[serde(default)]
+        id: String,
         running: bool,
     },
     /// A session's screen, one string per row.
@@ -105,6 +123,10 @@ pub enum Response {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionInfo {
     pub name: String,
+    /// Unlike its name, a session's id never changes: it's how a program
+    /// tells which session it runs in, whatever the session is called now.
+    #[serde(default)]
+    pub id: String,
     pub command: Vec<String>,
     pub cwd: PathBuf,
     pub pid: Option<u32>,

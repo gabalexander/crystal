@@ -124,6 +124,11 @@ enum Command {
         #[arg(long)]
         history: bool,
     },
+    /// Give a session another name.
+    Rename { name: String, new_name: String },
+    /// Run an ended session's command again, in the same directory and
+    /// under the same name. Claude Code comes back in its conversation.
+    Respawn { name: String },
     /// Stop a session and remove it from the list.
     Kill { name: String },
     /// Stop every session and the daemon.
@@ -206,6 +211,8 @@ fn run(cli: Cli) -> Result<()> {
             lines,
             history,
         } => drive::read(&socket, &name, lines, history)?,
+        Command::Rename { name, new_name } => client::rename(&socket, &name, &new_name)?,
+        Command::Respawn { name } => client::respawn(&socket, &name)?,
         Command::Kill { name } => {
             if client::ask(&socket, &Request::Kill { name }, false)?.is_none() {
                 no_daemon(&socket)?;
@@ -273,32 +280,11 @@ fn new_session(
     }
 }
 
-/// Removes the worktree `target` names, unless sessions are still running
-/// in it: removing a directory out from under a program would leave it
-/// working on files that are gone.
+/// Removes the worktree `target` names: a directory, or the branch it has
+/// checked out.
 fn remove_worktree(socket: &Path, target: &str) -> Result<()> {
     let path = git::find_worktree(&std::env::current_dir()?, target)?;
-    let sessions = match client::ask(socket, &Request::List, false)? {
-        Some(Response::Sessions { sessions }) => sessions,
-        _ => Vec::new(),
-    };
-    let running: Vec<&str> = sessions
-        .iter()
-        .filter(|session| session.state == State::Running && runs_in(session, &path))
-        .map(|session| session.name.as_str())
-        .collect();
-    if !running.is_empty() {
-        bail!("{} still running in {}", running.join(", "), path.display());
-    }
-    git::remove_worktree(&path)
-}
-
-/// Whether `session` runs in the worktree at `path`.
-fn runs_in(session: &SessionInfo, path: &Path) -> bool {
-    session
-        .worktree
-        .as_ref()
-        .is_some_and(|worktree| worktree.path == path)
+    client::remove_worktree(socket, &path)
 }
 
 /// A number of seconds from the command line, as a `Duration`.

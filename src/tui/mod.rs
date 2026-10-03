@@ -67,7 +67,7 @@ pub fn run(socket: &Path) -> Result<()> {
 
     let mut tui = Tui {
         socket: socket.to_path_buf(),
-        app: App::new(env::own_session(socket)),
+        app: App::new(env::own_session_id(socket)),
         panes: Vec::new(),
         last_pane_id: 0,
         events: sender,
@@ -123,7 +123,7 @@ struct Tui {
     socket: PathBuf,
     app: App,
     /// A viewer of each session a pane shows: the selected one and the
-    /// split ones. No session is shown twice, so its name finds its pane.
+    /// split ones. No session is shown twice, so its id finds its pane.
     panes: Vec<Pane>,
     last_pane_id: u64,
     /// Handed to each pane, for its output.
@@ -251,6 +251,22 @@ impl Tui {
                 client::ask(&self.socket, &Request::Kill { name }, false)?;
                 self.refresh_sessions()?;
             }
+            Action::Rename { name, new_name } => {
+                client::rename(&self.socket, &name, &new_name)?;
+                self.app.renamed(&name, &new_name);
+                self.refresh_sessions()?;
+                self.app.select(&new_name);
+            }
+            Action::Respawn(name) => {
+                client::respawn(&self.socket, &name)?;
+                self.refresh_sessions()?;
+                self.app.select(&name);
+                self.app.type_into_selected();
+            }
+            Action::RemoveWorktree(path) => {
+                client::remove_worktree(&self.socket, &path)?;
+                self.refresh_sessions()?;
+            }
             Action::Type { to, key } => {
                 if let Some(pane) = self.pane_in(to) {
                     let application_cursor = pane.screen.screen().application_cursor();
@@ -317,7 +333,7 @@ impl Tui {
             let screen = ui::screen_area(*area);
             let (rows, cols) = (screen.height.max(1), screen.width.max(1));
 
-            let kept = before.iter().position(|pane| pane.session == name);
+            let kept = before.iter().position(|pane| pane.session_id == session.id);
             let pane = match kept {
                 Some(index) => Some(before.swap_remove(index)),
                 None => self.open_pane(&name, rows, cols),
@@ -350,7 +366,7 @@ impl Tui {
         let session = self.app.pane_session(slot)?;
         self.panes
             .iter_mut()
-            .find(|pane| pane.session == session.name)
+            .find(|pane| pane.session_id == session.id)
     }
 
     fn pane_with_id(&mut self, id: u64) -> Option<&mut Pane> {

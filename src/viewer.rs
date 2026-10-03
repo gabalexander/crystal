@@ -13,6 +13,8 @@ use std::path::Path;
 pub struct Viewer {
     /// The session's name, as the daemon resolved it.
     pub name: String,
+    /// The session's id, which stays the same when it's renamed.
+    pub id: String,
     /// False when the session had already ended: the daemon sends its last
     /// screen and hangs up.
     pub running: bool,
@@ -49,13 +51,14 @@ impl Viewer {
         // The same reader goes on to read the output: it may already hold
         // the first of it.
         let mut reader = BufReader::new(conn.try_clone()?);
-        let (name, running) = match protocol::recv(&mut reader)? {
-            Some(Response::Attached { name, running }) => (name, running),
+        let (name, id, running) = match protocol::recv(&mut reader)? {
+            Some(Response::Attached { name, id, running }) => (name, id, running),
             Some(Response::Error { message }) => bail!(message),
             _ => bail!("the daemon hung up without answering"),
         };
         let viewer = Viewer {
             name,
+            id,
             running,
             conn,
         };

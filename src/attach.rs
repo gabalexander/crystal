@@ -41,7 +41,7 @@ pub fn run(socket: &Path, name: Option<&str>) -> Result<()> {
     // history from before is for the TUI's panes and `crystal read`.
     let (viewer, output) = Viewer::connect(socket, name, (rows, cols), false)?;
     let name = viewer.name.clone();
-    if env::own_session(socket).as_deref() == Some(name.as_str()) {
+    if env::own_session_id(socket).as_deref() == Some(viewer.id.as_str()) {
         bail!("can't attach {name} to itself");
     }
 

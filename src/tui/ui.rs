@@ -195,7 +195,7 @@ fn draw_pane(frame: &mut Frame, app: &App, slot: Slot, area: Rect, panes: &[Pane
     // yet.
     let pane = session
         .filter(|_| app.shows_screen(slot))
-        .and_then(|session| panes.iter().find(|pane| pane.session == session.name));
+        .and_then(|session| panes.iter().find(|pane| pane.session_id == session.id));
     let back = pane.map_or(0, Pane::scrolled_back);
     let mut block = Block::bordered().border_style(border_style(focused));
     if let Some(session) = session {
@@ -270,8 +270,8 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         draw_prompt(frame, prompt, area);
         return;
     }
-    let footer = if let Some(name) = app.kill_asked() {
-        Line::from(format!("kill {name}? y/n")).yellow()
+    let footer = if let Some(confirm) = app.confirm() {
+        Line::from(confirm.question()).yellow()
     } else if let Some(notice) = app.notice() {
         Line::from(notice.to_string()).red()
     } else if app.focus() == Focus::Sidebar {
@@ -289,6 +289,7 @@ fn draw_prompt(frame: &mut Frame, prompt: &Prompt, area: Rect) {
     let question = match prompt.question {
         Question::Branch => "branch for the new worktree: ",
         Question::Command(_) => "new session: ",
+        Question::Rename(_) => "new name: ",
     };
     let line = Line::from(vec![question.cyan(), prompt.input.text().into()]);
     frame.render_widget(line, area);
@@ -332,6 +333,7 @@ mod tests {
     fn session(name: &str, state: State) -> SessionInfo {
         SessionInfo {
             name: name.into(),
+            id: name.into(),
             command: vec!["sh".into()],
             cwd: PathBuf::from("/"),
             pid: Some(1),

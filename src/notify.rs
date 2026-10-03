@@ -174,6 +174,7 @@ mod tests {
 
     fn session(worktree: Option<Worktree>) -> SessionInfo {
         SessionInfo {
+            id: "1a2b".into(),
             name: "claude-2".into(),
             command: vec!["claude".into()],
             cwd: PathBuf::from("/code/app"),

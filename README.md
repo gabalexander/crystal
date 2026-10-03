@@ -76,12 +76,14 @@ a pane beside it.
 | Key | In the sidebar |
 |---|---|
 | `j` / `k`, `↓` / `↑` | select a session |
-| `Enter` | type into the selected session |
+| `Enter` | type into the selected session, or start an ended one again, once you've said `y` |
 | `s` | split the selected session off into a pane of its own, or close its split |
 | `Tab` / `Shift+Tab` | type into the next pane, or the one before |
 | `PageUp` / `PageDown` | page the selected session's pane back through its history, or forward to live |
 | `n` | ask what to run, then start it in a new session beside the selected one, and type into it |
 | `w` | ask for a branch, then what to run in a new worktree on it, and type into it |
+| `W` | remove the selected session's worktree, once nothing runs in it and you've said `y` |
+| `r` | rename the selected session |
 | `x` | kill the selected session, once you've said `y` |
 | `u` | select the next session that needs you: waiting on you first, then done |
 | `q` | quit; the sessions keep running |
@@ -151,6 +153,8 @@ crystal send review "check the diff"        # type into a session and press Ente
 crystal wait review                         # block until its agent stops working; print how it ended
 crystal read review --lines 20              # print the last 20 rows of its screen
 crystal read review --history               # and what scrolled off it before
+crystal rename review reviewer              # give a session another name
+crystal respawn reviewer                    # run an ended session again; Claude Code in its conversation
 crystal kill review                         # stop one session
 crystal kill-server                         # stop every session, and the daemon
 crystal restart-server                      # restart the daemon, say after an upgrade; sessions come back
@@ -167,9 +171,16 @@ review  exited 0  41388  app      main       ~/code/app                      cod
 
 `crystal new -w <branch>` makes the worktree beside the repository, in `<repo>.worktrees/<branch>`, with any
 `/` in the branch made a `-`. A branch that doesn't exist yet starts from the commit you're on; one that does
-is checked out as it is. `crystal worktree rm` takes the worktree's directory or its branch, refuses while a
-session is still running in it, and leaves the rest to `git worktree remove`, which keeps a worktree with
-changes you haven't committed.
+is checked out as it is. `crystal worktree rm` (or `W` in the TUI) takes the worktree's directory or its
+branch, refuses while a session is still running in it, and leaves the rest to `git worktree remove`, which
+keeps a worktree with changes you haven't committed. Sessions that had ended in it leave the list with it:
+their directory is gone, so they could never start again.
+
+`crystal rename` changes what a session is called; its program and its saved place after a restart follow the
+new name. `crystal respawn`, or `Enter` on an ended session in the TUI, runs its command again in the same
+directory, under the same name and in the same place in the list, with your environment. Claude Code comes back
+in the conversation it was in. Every session's program also gets `CRYSTAL_SESSION_ID`, which stays the same
+when the session is renamed, while `CRYSTAL_SESSION` keeps the name the program started under.
 
 The first `crystal new` starts the daemon. Sessions keep running after you detach or close the terminal, and
 `crystal attach` picks up exactly where the screen was. With no name it attaches to the newest session; on a

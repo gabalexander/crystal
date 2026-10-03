@@ -83,6 +83,43 @@ pub enum Question {
     Branch,
     /// The command line for a new session, which starts at the place.
     Command(Place),
+    /// A new name for the session now called this.
+    Rename(String),
+}
+
+/// A question on the footer line that `y` answers yes and any other key
+/// no, asked before something that can't be taken back, or that starts a
+/// program again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Confirm {
+    Kill(String),
+    /// Start this ended session's command again.
+    Respawn(String),
+    /// Remove the linked worktree at `path`, which is on `branch`.
+    RemoveWorktree {
+        path: PathBuf,
+        branch: String,
+    },
+}
+
+impl Confirm {
+    /// The question, the way the footer asks it.
+    pub fn question(&self) -> String {
+        match self {
+            Confirm::Kill(name) => format!("kill {name}? y/n"),
+            Confirm::Respawn(name) => format!("start {name} again? y/n"),
+            Confirm::RemoveWorktree { branch, .. } => format!("remove worktree {branch}? y/n"),
+        }
+    }
+
+    /// What a yes asks for.
+    fn action(self) -> Action {
+        match self {
+            Confirm::Kill(name) => Action::Kill(name),
+            Confirm::Respawn(name) => Action::Respawn(name),
+            Confirm::RemoveWorktree { path, .. } => Action::RemoveWorktree(path),
+        }
+    }
 }
 
 /// What a key asks the event loop to do.
@@ -96,6 +133,14 @@ pub enum Action {
         command: Vec<String>,
     },
     Kill(String),
+    Rename {
+        name: String,
+        new_name: String,
+    },
+    /// Start this ended session's command again.
+    Respawn(String),
+    /// Remove the linked worktree at this path.
+    RemoveWorktree(PathBuf),
     /// Send the key to the session in the pane at `to`.
     Type {
         to: Slot,
@@ -122,8 +167,8 @@ pub struct App {
     /// The command line the last new session was started with, which the
     /// next one starts out with.
     last_command: String,
-    /// The session the user has asked to kill, until they say yes or no.
-    kill_asked: Option<String>,
+    /// A yes-or-no question on the footer line, until it's answered.
+    confirm: Option<Confirm>,
     /// Sessions split off into panes of their own, by name, in the order
     /// they were split off. A split stays on its session while the
     /// selection moves.
@@ -132,26 +177,28 @@ pub struct App {
     /// The pane the keyboard was in last, so that Tab in the sidebar goes
     /// on to the next one.
     last_pane: Option<Slot>,
-    /// The session this TUI runs in, if it runs in one. The pane never
-    /// shows it: it would be showing itself.
-    own_session: Option<String>,
+    /// The id of the session this TUI runs in, if it runs in one. The pane
+    /// never shows it: it would be showing itself.
+    own_id: Option<String>,
     /// Something to tell the user, like why a key didn't work. It stays
     /// until the next key.
     notice: Option<String>,
 }
 
 impl App {
-    pub fn new(own_session: Option<String>) -> App {
+    /// A TUI with no sessions yet. `own_id` is the id of the session it
+    /// runs in, if it runs in one.
+    pub fn new(own_id: Option<String>) -> App {
         App {
             sessions: Vec::new(),
             selected: 0,
             prompt: None,
             last_command: Config::default().new_session,
-            kill_asked: None,
+            confirm: None,
             splits: Vec::new(),
             focus: Focus::Sidebar,
             last_pane: None,
-            own_session,
+            own_id,
             notice: None,
         }
     }
@@ -185,9 +232,9 @@ impl App {
         self.prompt.as_ref()
     }
 
-    /// The session waiting on a yes or no before it's killed.
-    pub fn kill_asked(&self) -> Option<&str> {
-        self.kill_asked.as_deref()
+    /// The yes-or-no question waiting on its answer, if there is one.
+    pub fn confirm(&self) -> Option<&Confirm> {
+        self.confirm.as_ref()
     }
 
     pub fn focus(&self) -> Focus {
@@ -250,10 +297,11 @@ impl App {
         self.sessions.get(self.selected)
     }
 
-    /// Whether the selected session is the one this TUI runs in.
+    /// Whether the selected session is the one this TUI runs in. Ids tell,
+    /// since the session may have been renamed since the TUI started.
     pub fn selected_is_own(&self) -> bool {
-        match (&self.own_session, self.selected()) {
-            (Some(own), Some(selected)) => selected.name == *own,
+        match (&self.own_id, self.selected()) {
+            (Some(own), Some(selected)) => selected.id == *own,
             _ => false,
         }
     }
@@ -291,6 +339,16 @@ impl App {
         }
     }
 
+    /// The session called `from` is called `to` now: a split of it stays
+    /// open under its new name.
+    pub fn renamed(&mut self, from: &str, to: &str) {
+        for split in &mut self.splits {
+            if split == from {
+                *split = to.to_string();
+            }
+        }
+    }
+
     /// Hands the keyboard to the selected session, in whichever pane shows
     /// it, if it can take keys.
     pub fn type_into_selected(&mut self) {
@@ -315,10 +373,10 @@ impl App {
 
     pub fn on_key(&mut self, key: KeyEvent) -> Option<Action> {
         self.notice = None;
-        // Only `y` kills; any other key keeps the session.
-        if let Some(name) = self.kill_asked.take() {
+        // Only `y` says yes; any other key says no.
+        if let Some(confirm) = self.confirm.take() {
             if key.code == KeyCode::Char('y') {
-                return Some(Action::Kill(name));
+                return Some(confirm.action());
             }
             return None;
         }
@@ -336,7 +394,7 @@ impl App {
     /// the selection, or scrolls a pane through its history.
     pub fn on_mouse(&mut self, kind: MouseEventKind, hit: Hit) -> Option<Action> {
         // A question on the footer waits for its answer from the keyboard.
-        if self.prompt.is_some() || self.kill_asked.is_some() {
+        if self.prompt.is_some() || self.confirm.is_some() {
             return None;
         }
         let click = kind == MouseEventKind::Down(MouseButton::Left);
@@ -380,7 +438,7 @@ impl App {
         match key.code {
             KeyCode::Char('j') | KeyCode::Down => self.move_selection(1),
             KeyCode::Char('k') | KeyCode::Up => self.move_selection(-1),
-            KeyCode::Enter => self.type_into_selected(),
+            KeyCode::Enter => self.enter(),
             KeyCode::Tab => self.move_to_pane(Direction::Forward),
             KeyCode::BackTab => self.move_to_pane(Direction::Back),
             KeyCode::Char('s') => self.toggle_split(),
@@ -388,12 +446,74 @@ impl App {
             KeyCode::PageDown => return Some(Action::PageForward(self.selected_slot()?)),
             KeyCode::Char('n') => self.ask_for_command(self.selected_place()),
             KeyCode::Char('w') => self.ask(Question::Branch, ""),
-            KeyCode::Char('x') => self.kill_asked = Some(self.selected()?.name.clone()),
+            KeyCode::Char('W') => self.ask_to_remove_worktree(),
+            KeyCode::Char('r') => self.ask_for_name(),
+            KeyCode::Char('x') => self.confirm = Some(Confirm::Kill(self.selected()?.name.clone())),
             KeyCode::Char('u') => self.select_next_needing_user(),
             KeyCode::Char('q') => return Some(Action::Quit),
             _ => {}
         }
         None
+    }
+
+    /// Enter on a session: types into it while it runs, or, once it has
+    /// ended, offers to start it again.
+    fn enter(&mut self) {
+        let Some(selected) = self.selected() else {
+            return;
+        };
+        if selected.state == State::Running {
+            self.type_into_selected();
+        } else {
+            self.confirm = Some(Confirm::Respawn(selected.name.clone()));
+        }
+    }
+
+    /// Asks for a new name for the selected session, starting from the
+    /// one it has.
+    fn ask_for_name(&mut self) {
+        if let Some(selected) = self.selected() {
+            let name = selected.name.clone();
+            self.ask(Question::Rename(name.clone()), &name);
+        }
+    }
+
+    /// Asks before removing the selected session's worktree. Only a linked
+    /// worktree goes, and only once nothing runs in it any more: removing
+    /// it would pull the directory out from under them.
+    fn ask_to_remove_worktree(&mut self) {
+        let Some(selected) = self.selected() else {
+            return;
+        };
+        let name = selected.name.clone();
+        let Some(worktree) = selected.worktree.clone() else {
+            self.notify(format!("{name} isn't in a git worktree"));
+            return;
+        };
+        if worktree.main {
+            self.notify("the main worktree can't be removed".into());
+            return;
+        }
+        let branch = worktree.branch.unwrap_or_else(|| "(detached)".into());
+        let running: Vec<&str> = self
+            .sessions
+            .iter()
+            .filter(|session| session.state == State::Running)
+            .filter(|session| {
+                let in_it = session.worktree.as_ref();
+                in_it.is_some_and(|w| w.path == worktree.path)
+            })
+            .map(|session| session.name.as_str())
+            .collect();
+        if running.is_empty() {
+            self.confirm = Some(Confirm::RemoveWorktree {
+                path: worktree.path,
+                branch,
+            });
+        } else {
+            let notice = format!("{} still running in {branch}", running.join(", "));
+            self.notify(notice);
+        }
     }
 
     fn ask(&mut self, question: Question, answer: &str) {
@@ -456,6 +576,17 @@ impl App {
                         self.notify(err);
                         None
                     }
+                }
+            }
+            // An empty answer, or the name it already has, changes nothing.
+            Question::Rename(name) => {
+                if answer.is_empty() || answer == name {
+                    None
+                } else {
+                    Some(Action::Rename {
+                        name,
+                        new_name: answer,
+                    })
                 }
             }
         }
@@ -617,6 +748,7 @@ mod tests {
     fn session(name: &str) -> SessionInfo {
         SessionInfo {
             name: name.into(),
+            id: name.into(),
             command: vec!["sh".into()],
             cwd: PathBuf::from("/"),
             pid: Some(1),
@@ -974,9 +1106,9 @@ mod tests {
         let mut app = app_with(&["a", "b"]);
         press(&mut app, KeyCode::Char('j'));
         assert_eq!(press(&mut app, KeyCode::Char('x')), None);
-        assert_eq!(app.kill_asked(), Some("b"));
+        assert_eq!(app.confirm(), Some(&Confirm::Kill("b".into())));
         assert_eq!(press(&mut app, KeyCode::Char('n')), None);
-        assert_eq!(app.kill_asked(), None);
+        assert_eq!(app.confirm(), None);
         assert!(app.prompt().is_none(), "the n answered the question");
 
         press(&mut app, KeyCode::Char('x'));
@@ -990,7 +1122,129 @@ mod tests {
     fn x_with_nothing_selected_asks_nothing() {
         let mut app = App::new(None);
         assert_eq!(press(&mut app, KeyCode::Char('x')), None);
-        assert_eq!(app.kill_asked(), None);
+        assert_eq!(app.confirm(), None);
+    }
+
+    #[test]
+    fn r_asks_for_a_new_name_starting_from_the_old_one() {
+        let mut app = app_with(&["a", "fixer"]);
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('r'));
+        assert_eq!(prompt_text(&app), Some("fixer"));
+
+        answer(&mut app, "login-fixer");
+        let renamed = Action::Rename {
+            name: "fixer".into(),
+            new_name: "login-fixer".into(),
+        };
+        assert_eq!(press(&mut app, KeyCode::Enter), Some(renamed));
+    }
+
+    #[test]
+    fn a_rename_to_nothing_or_the_same_name_changes_nothing() {
+        let mut app = app_with(&["fixer"]);
+        press(&mut app, KeyCode::Char('r'));
+        assert_eq!(press(&mut app, KeyCode::Enter), None);
+
+        press(&mut app, KeyCode::Char('r'));
+        answer(&mut app, "");
+        assert_eq!(press(&mut app, KeyCode::Enter), None);
+    }
+
+    #[test]
+    fn a_split_stays_open_when_its_session_is_renamed() {
+        let mut app = app_with(&["a", "b"]);
+        press(&mut app, KeyCode::Char('s'));
+        app.renamed("a", "c");
+        app.set_sessions(vec![session("c"), session("b")]);
+        assert_eq!(app.splits(), ["c"]);
+    }
+
+    #[test]
+    fn the_tuis_own_session_is_told_by_its_id_whatever_its_name() {
+        let mut renamed = session("renamed");
+        renamed.id = "me".into();
+        let mut app = App::new(Some("me".into()));
+        app.set_sessions(vec![renamed]);
+        assert!(app.selected_is_own());
+    }
+
+    #[test]
+    fn enter_on_an_ended_session_offers_to_start_it_again() {
+        let mut app = App::new(None);
+        app.set_sessions(vec![ended("done")]);
+        assert_eq!(press(&mut app, KeyCode::Enter), None);
+        assert_eq!(app.confirm(), Some(&Confirm::Respawn("done".into())));
+        assert_eq!(
+            press(&mut app, KeyCode::Char('y')),
+            Some(Action::Respawn("done".into()))
+        );
+    }
+
+    /// A session in the worktree of the `app` project on `branch`, the main
+    /// one when `branch` is "main".
+    fn in_worktree(name: &str, branch: &str, state: State) -> SessionInfo {
+        SessionInfo {
+            state,
+            worktree: Some(Worktree {
+                project: "app".into(),
+                project_path: PathBuf::from("/code/app"),
+                path: PathBuf::from(format!("/code/app.worktrees/{branch}")),
+                main: branch == "main",
+                branch: Some(branch.into()),
+            }),
+            ..session(name)
+        }
+    }
+
+    #[test]
+    fn shift_w_asks_before_removing_a_worktree_nothing_runs_in() {
+        let mut app = App::new(None);
+        app.set_sessions(vec![
+            in_worktree("fixer", "fix", State::Exited { code: 0 }),
+            in_worktree("other", "main", State::Running),
+        ]);
+        app.select("fixer");
+        press(&mut app, KeyCode::Char('W'));
+        let removal = Confirm::RemoveWorktree {
+            path: PathBuf::from("/code/app.worktrees/fix"),
+            branch: "fix".into(),
+        };
+        assert_eq!(app.confirm(), Some(&removal));
+        assert_eq!(
+            app.confirm().unwrap().question(),
+            "remove worktree fix? y/n"
+        );
+        assert_eq!(
+            press(&mut app, KeyCode::Char('y')),
+            Some(Action::RemoveWorktree("/code/app.worktrees/fix".into()))
+        );
+    }
+
+    #[test]
+    fn shift_w_refuses_while_a_session_runs_in_the_worktree() {
+        let mut app = App::new(None);
+        app.set_sessions(vec![
+            in_worktree("fixer", "fix", State::Exited { code: 0 }),
+            in_worktree("tests", "fix", State::Running),
+        ]);
+        app.select("fixer");
+        press(&mut app, KeyCode::Char('W'));
+        assert_eq!(app.confirm(), None);
+        assert_eq!(app.notice(), Some("tests still running in fix"));
+    }
+
+    #[test]
+    fn shift_w_leaves_the_main_worktree_and_sessions_outside_git_alone() {
+        let mut app = App::new(None);
+        app.set_sessions(vec![in_worktree("planner", "main", State::Running)]);
+        press(&mut app, KeyCode::Char('W'));
+        assert_eq!(app.notice(), Some("the main worktree can't be removed"));
+
+        app.set_sessions(vec![session("shell")]);
+        press(&mut app, KeyCode::Char('W'));
+        assert_eq!(app.notice(), Some("shell isn't in a git worktree"));
+        assert_eq!(app.confirm(), None);
     }
 
     fn hand_back(app: &mut App) {
@@ -1262,6 +1516,10 @@ mod tests {
         press(&mut app, KeyCode::Char('x'));
         app.on_mouse(CLICK, Hit::SidebarRow(row_of(&app, "b")));
         assert_eq!(selected_name(&app), Some("a"));
-        assert_eq!(app.kill_asked(), Some("a"), "the question is still asked");
+        assert_eq!(
+            app.confirm(),
+            Some(&Confirm::Kill("a".into())),
+            "the question is still asked"
+        );
     }
 }

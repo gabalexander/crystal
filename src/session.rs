@@ -26,6 +26,10 @@ const VIEWER_BACKLOG: usize = 256;
 
 pub struct Session {
     pub name: String,
+    /// Stays the same when the session is renamed. The program learns it
+    /// from its environment, which can't change once it runs, and its hooks
+    /// report with it.
+    pub id: String,
     /// As it was asked for, which is how `ls` shows it.
     command: Vec<String>,
     cwd: PathBuf,
@@ -51,6 +55,7 @@ impl Session {
     /// `argv` may add to it, like the flags that make an agent report what
     /// it's doing.
     pub fn spawn(
+        id: String,
         name: String,
         command: Vec<String>,
         argv: &[String],
@@ -104,6 +109,7 @@ impl Session {
 
         Ok(Session {
             name,
+            id,
             command,
             checkout: Checkout::find(&cwd),
             cwd,
@@ -124,6 +130,7 @@ impl Session {
     pub fn info(&self) -> SessionInfo {
         SessionInfo {
             name: self.name.clone(),
+            id: self.id.clone(),
             command: self.command.clone(),
             cwd: self.cwd.clone(),
             pid: self.pid,
@@ -173,15 +180,22 @@ impl Session {
     /// What it takes to start the session again after a restart, while it
     /// runs. A program that has ended stays ended.
     pub fn saved(&self) -> Option<SavedSession> {
-        if !self.is_running() {
-            return None;
+        if self.is_running() {
+            Some(self.launch())
+        } else {
+            None
         }
-        Some(SavedSession {
+    }
+
+    /// What it takes to start the session's program again: its name,
+    /// command and directory, and the agent's conversation to pick up.
+    pub fn launch(&self) -> SavedSession {
+        SavedSession {
             name: self.name.clone(),
             command: self.command.clone(),
             cwd: self.cwd.clone(),
             conversation: self.conversation.clone(),
-        })
+        }
     }
 
     /// Someone has just looked at the session.

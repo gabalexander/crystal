@@ -13,7 +13,10 @@ pub struct Pane {
     /// Tells this pane's output apart from that of panes already closed,
     /// whose last chunks may still be on their way.
     pub id: u64,
-    pub session: String,
+    /// The id of the session the pane shows, which finds the pane. It stays
+    /// the same when the session is renamed, and a session started again
+    /// has a new one, so its pane starts afresh.
+    pub session_id: String,
     pub screen: vt100::Parser,
     /// The session has ended: `screen` is the last it showed.
     pub ended: bool,
@@ -44,7 +47,7 @@ impl Pane {
         });
         Ok(Pane {
             id,
-            session: viewer.name.clone(),
+            session_id: viewer.id.clone(),
             screen: vt100::Parser::new(rows, cols, HISTORY_LINES),
             ended: false,
             viewer,

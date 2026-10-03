@@ -169,6 +169,7 @@ mod tests {
     fn session(state: State, activity: Option<Activity>) -> SessionInfo {
         SessionInfo {
             name: "agent".into(),
+            id: "1".into(),
             command: vec!["claude".into()],
             cwd: PathBuf::from("/"),
             pid: Some(1),

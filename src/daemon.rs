@@ -11,12 +11,14 @@ use crate::socket;
 use crate::state::{self, SavedSession};
 use crate::typing;
 use anyhow::{Context, Result, bail, ensure};
+use std::collections::BTreeMap;
 use std::io::{BufReader, ErrorKind, Write};
 use std::net::Shutdown;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{fs, process, thread};
 
 /// How often the daemon reads every session's screen for what its agent is
@@ -101,7 +103,7 @@ impl Daemon {
         } = request
         {
             return match self.find(name.as_deref()) {
-                Ok((name, term)) => attach(&conn, input, name, &term, (rows, cols), history),
+                Ok(found) => attach(&conn, input, found, (rows, cols), history),
                 Err(err) => Ok(protocol::send(&conn, &Response::from(err))?),
             };
         }
@@ -162,14 +164,18 @@ impl Daemon {
 
     /// The session called `name`, or the newest one, for a client about to
     /// show it. That counts as having seen it.
-    fn find(&self, name: Option<&str>) -> Result<(String, Arc<Term>)> {
+    fn find(&self, name: Option<&str>) -> Result<Found> {
         let mut sessions = self.sessions.lock().unwrap();
         let session = match name {
             Some(name) => named(&mut sessions, name)?,
             None => sessions.last_mut().context("there are no sessions")?,
         };
         session.seen();
-        Ok((session.name.clone(), session.term()))
+        Ok(Found {
+            name: session.name.clone(),
+            id: session.id.clone(),
+            term: session.term(),
+        })
     }
 
     /// The terminal of the session called `name`, to type into, which
@@ -194,11 +200,15 @@ impl Daemon {
             }
             Request::Report {
                 name,
+                id,
                 event,
                 conversation,
             } => {
                 let mut sessions = self.sessions.lock().unwrap();
-                let session = named(&mut sessions, &name)?;
+                let session = match id {
+                    Some(id) => with_id(&mut sessions, &id)?,
+                    None => named(&mut sessions, &name)?,
+                };
                 session.on_agent_event(event);
                 if let Some(conversation) = conversation {
                     session.set_conversation(conversation);
@@ -214,6 +224,17 @@ impl Daemon {
                 sessions.remove(index).stop();
                 Ok(Response::Done)
             }
+            Request::Rename { name, new_name } => {
+                let mut sessions = self.sessions.lock().unwrap();
+                if new_name != name {
+                    check_name(&new_name, |taken| {
+                        sessions.iter().any(|session| session.name == taken)
+                    })?;
+                }
+                named(&mut sessions, &name)?.name = new_name;
+                Ok(Response::Done)
+            }
+            Request::Respawn { name, env } => self.respawn(&name, env),
             Request::Send { name, text, enter } => {
                 let term = self.running_term(&name)?;
                 term.write(&typing::keystrokes(&text, term.wants_bracketed_paste()))?;
@@ -256,6 +277,45 @@ impl Daemon {
         let name = start(&mut sessions, &self.socket, new, None)?;
         Ok(Response::Created { name })
     }
+
+    /// Runs an ended session's command again, in its directory and under
+    /// its name, keeping its place in the list. An agent whose conversation
+    /// can be picked up starts back in it.
+    fn respawn(&self, name: &str, env: BTreeMap<String, String>) -> Result<Response> {
+        let mut sessions = self.sessions.lock().unwrap();
+        let index = sessions
+            .iter()
+            .position(|session| session.name == name)
+            .with_context(|| format!("no session named {name}"))?;
+        ensure!(!sessions[index].is_running(), "{name} is still running");
+
+        // The ended session makes way for the new one, and comes back if
+        // that doesn't start.
+        let ended = sessions.remove(index);
+        let launch = ended.launch();
+        let new = NewSession {
+            name: Some(launch.name),
+            cwd: launch.cwd,
+            command: launch.command,
+            env,
+        };
+        if let Err(err) = start(&mut sessions, &self.socket, new, launch.conversation) {
+            sessions.insert(index, ended);
+            return Err(err);
+        }
+        // `start` adds the new session at the end; it goes where the old
+        // one was.
+        let started = sessions.pop().expect("start added a session");
+        sessions.insert(index, started);
+        Ok(Response::Done)
+    }
+}
+
+/// A session found for a client about to show it.
+struct Found {
+    name: String,
+    id: String,
+    term: Arc<Term>,
 }
 
 /// Starts a session and adds it to `sessions`. Given a `conversation`, an
@@ -282,29 +342,50 @@ fn start(
     let taken = |name: &str| sessions.iter().any(|session| session.name == name);
     let name = match name {
         Some(name) => {
-            ensure!(
-                !name.is_empty() && !name.contains(char::is_whitespace),
-                "a session name can't be empty or contain spaces"
-            );
-            ensure!(!taken(&name), "a session named {name} already exists");
+            check_name(&name, taken)?;
             name
         }
         None => unique_name(program, taken),
     };
 
-    let env = env::for_session(&env, &name, socket);
+    let id = new_id();
+    let env = env::for_session(&env, &name, &id, socket);
     let crystal = std::env::current_exe()?;
     let resume = conversation
         .as_ref()
         .filter(|conversation| conversation.can_resume())
         .map(|conversation| conversation.id.as_str());
     let argv = agents::argv(&command, &crystal, resume);
-    let mut session = Session::spawn(name.clone(), command, &argv, cwd, &env)?;
+    let mut session = Session::spawn(id, name.clone(), command, &argv, cwd, &env)?;
     if let Some(conversation) = conversation {
         session.set_conversation(conversation);
     }
     sessions.push(session);
     Ok(name)
+}
+
+/// Refuses a name a session can't have: an empty one, one with spaces, or
+/// one another session has.
+fn check_name(name: &str, taken: impl Fn(&str) -> bool) -> Result<()> {
+    ensure!(
+        !name.is_empty() && !name.contains(char::is_whitespace),
+        "a session name can't be empty or contain spaces"
+    );
+    ensure!(!taken(name), "a session named {name} already exists");
+    Ok(())
+}
+
+/// A new session's id. The time it's made, to the nanosecond, sets it
+/// apart from the sessions of any daemon before this one; the count sets
+/// it apart from this daemon's own, however close together they start.
+fn new_id() -> String {
+    static MADE: AtomicU64 = AtomicU64::new(0);
+    let count = MADE.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("{nanos:x}-{count}")
 }
 
 fn named<'a>(sessions: &'a mut [Session], name: &str) -> Result<&'a mut Session> {
@@ -314,21 +395,28 @@ fn named<'a>(sessions: &'a mut [Session], name: &str) -> Result<&'a mut Session>
         .with_context(|| format!("no session named {name}"))
 }
 
+fn with_id<'a>(sessions: &'a mut [Session], id: &str) -> Result<&'a mut Session> {
+    sessions
+        .iter_mut()
+        .find(|session| session.id == id)
+        .with_context(|| format!("no session with id {id}"))
+}
+
 /// Shows a session to a client until either of them goes: first the screen
 /// as it is (after its history, with `with_history`), then the output as
 /// it comes, while the client's keys and size go to the session.
 fn attach(
     conn: &UnixStream,
     mut input: BufReader<&UnixStream>,
-    name: String,
-    term: &Term,
+    found: Found,
     (rows, cols): (u16, u16),
     with_history: bool,
 ) -> Result<()> {
+    let Found { name, id, term } = found;
     term.resize(rows, cols)?;
     let watch = term.watch(with_history);
     let running = watch.feed.is_some();
-    protocol::send(conn, &Response::Attached { name, running })?;
+    protocol::send(conn, &Response::Attached { name, id, running })?;
     let mut output = conn.try_clone()?;
     output.write_all(&watch.screen)?;
     match watch.feed {
@@ -439,5 +527,23 @@ mod tests {
     #[test]
     fn a_program_without_a_usable_name_falls_back() {
         assert_eq!(unique_name("/", |_| false), "session");
+    }
+
+    #[test]
+    fn a_name_has_to_be_free_and_one_word() {
+        let taken = |name: &str| name == "claude";
+        assert!(check_name("reviewer", taken).is_ok());
+        assert!(check_name("claude", taken).is_err());
+        assert!(check_name("", taken).is_err());
+        assert!(check_name("two words", taken).is_err());
+    }
+
+    #[test]
+    fn no_two_sessions_share_an_id() {
+        let ids: Vec<String> = (0..100).map(|_| new_id()).collect();
+        let mut unique = ids.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), ids.len());
     }
 }

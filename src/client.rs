@@ -1,7 +1,8 @@
 //! The CLI's side of the socket.
 
 use crate::env;
-use crate::protocol::{self, NewSession, Request, Response};
+use crate::git;
+use crate::protocol::{self, NewSession, Request, Response, SessionInfo, State};
 use crate::socket;
 use anyhow::{Context, Result, bail};
 use std::fs::OpenOptions;
@@ -59,6 +60,75 @@ pub fn new_session(
     match ask(socket, &request, true)? {
         Some(Response::Created { name }) => Ok(name),
         _ => bail!("the daemon didn't create the session"),
+    }
+}
+
+/// Gives the session called `name` another name.
+pub fn rename(socket: &Path, name: &str, new_name: &str) -> Result<()> {
+    let request = Request::Rename {
+        name: name.to_string(),
+        new_name: new_name.to_string(),
+    };
+    ask_running(socket, &request)?;
+    Ok(())
+}
+
+/// Runs the ended session called `name` again, with this process's
+/// environment, the way [`new_session`] starts one.
+pub fn respawn(socket: &Path, name: &str) -> Result<()> {
+    let request = Request::Respawn {
+        name: name.to_string(),
+        env: env::current(),
+    };
+    ask_running(socket, &request)?;
+    Ok(())
+}
+
+/// Removes the worktree at `path`, unless sessions are still running in
+/// it: removing a directory out from under a program would leave it
+/// working on files that are gone. Sessions that had ended there leave the
+/// list with it, since their directory is gone and they could never start
+/// again.
+pub fn remove_worktree(socket: &Path, path: &Path) -> Result<()> {
+    let sessions = match ask(socket, &Request::List, false)? {
+        Some(Response::Sessions { sessions }) => sessions,
+        _ => Vec::new(),
+    };
+    let (running, ended): (Vec<&SessionInfo>, Vec<&SessionInfo>) = sessions
+        .iter()
+        .filter(|session| runs_in(session, path))
+        .partition(|session| session.state == State::Running);
+    if !running.is_empty() {
+        let names: Vec<&str> = running
+            .iter()
+            .map(|session| session.name.as_str())
+            .collect();
+        bail!("{} still running in {}", names.join(", "), path.display());
+    }
+    git::remove_worktree(path)?;
+    for session in ended {
+        let kill = Request::Kill {
+            name: session.name.clone(),
+        };
+        ask(socket, &kill, false)?;
+    }
+    Ok(())
+}
+
+/// Whether `session` runs in the worktree at `path`.
+fn runs_in(session: &SessionInfo, path: &Path) -> bool {
+    session
+        .worktree
+        .as_ref()
+        .is_some_and(|worktree| worktree.path == path)
+}
+
+/// Asks a daemon that must be running already: the request is about a
+/// session that has to exist.
+fn ask_running(socket: &Path, request: &Request) -> Result<Response> {
+    match ask(socket, request, false)? {
+        Some(response) => Ok(response),
+        None => bail!("no daemon is running on {}", socket.display()),
     }
 }
 

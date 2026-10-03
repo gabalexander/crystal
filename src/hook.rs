@@ -28,6 +28,10 @@ fn report(socket: &Path, agent: &str) -> Result<()> {
     std::io::stdin().read_to_string(&mut input)?;
     let input = serde_json::from_str(&input)?;
 
+    // The name is the one the session had when this program started; the
+    // id finds the session even after a rename. Only programs started
+    // before sessions had ids go without one.
+    let id = std::env::var("CRYSTAL_SESSION_ID").ok();
     let (event, conversation) = match agent {
         "claude" => (
             agents::claude_event(&input),
@@ -38,6 +42,7 @@ fn report(socket: &Path, agent: &str) -> Result<()> {
     if let Some(event) = event {
         let report = Request::Report {
             name,
+            id,
             event,
             conversation,
         };

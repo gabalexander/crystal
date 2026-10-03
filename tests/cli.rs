@@ -128,6 +128,7 @@ impl Crystal {
         command.args(args);
         command.cwd(self.dir.path());
         command.env_remove("CRYSTAL_SESSION");
+        command.env_remove("CRYSTAL_SESSION_ID");
         // So that a shell crystal starts is the same everywhere.
         command.env("SHELL", "/bin/sh");
         command.env("XDG_CONFIG_HOME", self.config_home());
@@ -813,10 +814,15 @@ fn fake_claude(dir: &Path) -> PathBuf {
 /// session's environment, with the event on stdin. A hook must succeed and
 /// print nothing.
 fn run_hook(crystal: &Crystal, session: &str, hook: &str, event: &str) {
+    run_hook_with(crystal, &[("CRYSTAL_SESSION", session)], hook, event);
+}
+
+/// Like [`run_hook`], with the session's part of the environment as given.
+fn run_hook_with(crystal: &Crystal, session_env: &[(&str, &str)], hook: &str, event: &str) {
     let mut child = Command::new("sh")
         .arg("-c")
         .arg(hook)
-        .env("CRYSTAL_SESSION", session)
+        .envs(session_env.iter().copied())
         .env("CRYSTAL_SOCKET", &crystal.socket)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1887,4 +1893,246 @@ fn a_program_that_asks_for_the_mouse_gets_clicks_where_it_drew() {
 
     let clicks = written(&crystal.dir.path().join("clicks"));
     assert_eq!(clicks, "\x1b[<0;3;2M\x1b[<0;3;2m\n");
+}
+
+#[test]
+fn rename_gives_a_session_another_name() {
+    let crystal = Crystal::new();
+    crystal.ok(&["new", "-n", "agent", "sleep", "30"]);
+    crystal.ok(&["new", "-n", "other", "sleep", "30"]);
+
+    crystal.ok(&["rename", "agent", "reviewer"]);
+    assert!(crystal.row("agent").is_none());
+    assert_eq!(crystal.row("reviewer").unwrap()[1], "running");
+
+    let taken = crystal.fails(&["rename", "reviewer", "other"]);
+    assert!(taken.contains("already exists"), "{taken}");
+    let spaced = crystal.fails(&["rename", "reviewer", "two words"]);
+    assert!(spaced.contains("spaces"), "{spaced}");
+    let missing = crystal.fails(&["rename", "nobody", "x"]);
+    assert!(missing.contains("no session named nobody"), "{missing}");
+}
+
+#[test]
+fn a_renamed_session_still_hears_from_its_agent() {
+    let crystal = Crystal::new();
+    let script = "echo $CRYSTAL_SESSION_ID > id; sleep 30";
+    crystal.ok(&["new", "-n", "agent", "sh", "-c", script]);
+    let id = written(&crystal.dir.path().join("id"));
+    crystal.ok(&["rename", "agent", "reviewer"]);
+
+    // The program's environment can't change, so it still says "agent";
+    // its id finds the session whatever it's called now.
+    let hook = format!("'{CRYSTAL}' hook claude");
+    let session_env = [
+        ("CRYSTAL_SESSION", "agent"),
+        ("CRYSTAL_SESSION_ID", id.trim()),
+    ];
+    let event = r#"{"hook_event_name":"UserPromptSubmit"}"#;
+    run_hook_with(&crystal, &session_env, &hook, event);
+    assert_eq!(crystal.row("reviewer").unwrap()[1], "working");
+}
+
+#[test]
+fn a_renamed_session_comes_back_under_its_new_name_after_a_restart() {
+    let crystal = Crystal::new();
+    let daemon = crystal.start_daemon();
+    crystal.ok(&["new", "-n", "keeper", "sleep", "300"]);
+    crystal.ok(&["rename", "keeper", "kept"]);
+    eventually("the new name is saved", || {
+        let saved = crystal.saved();
+        saved.contains("\"kept\"") && !saved.contains("keeper")
+    });
+
+    crash(daemon);
+    crystal.ok(&["new", "-n", "fresh", "sleep", "300"]);
+    assert_eq!(crystal.row("kept").unwrap()[1], "running");
+}
+
+#[test]
+fn r_in_the_tui_renames_the_selected_session() {
+    let crystal = Crystal::new();
+    crystal.ok(&["new", "-n", "agent", "sleep", "30"]);
+
+    let mut tui = crystal.tui();
+    tui.shows("▶ agent");
+    tui.type_keys("r");
+    tui.shows("new name: agent");
+    // Ctrl+U clears the old name first.
+    tui.type_keys("\x15reviewer\r");
+    tui.shows("▶ reviewer");
+    assert!(crystal.row("reviewer").is_some());
+}
+
+#[test]
+fn a_session_still_cannot_attach_to_itself_once_renamed() {
+    let crystal = Crystal::new();
+    crystal.ok(&["new", "-n", "loop", "sh"]);
+
+    let mut terminal = crystal.attach(&["attach", "loop"]);
+    crystal.ok(&["rename", "loop", "looped"]);
+    terminal.type_keys(&format!("{CRYSTAL} attach looped\r"));
+    terminal.shows("can't attach looped to itself");
+}
+
+#[test]
+fn the_tui_still_knows_the_session_it_runs_in_once_renamed() {
+    let crystal = Crystal::new();
+    crystal.ok(&["new", "-n", "host", "sh"]);
+
+    // The TUI, run inside the session called host, which it never shows.
+    let mut terminal = crystal.attach(&["attach", "host"]);
+    terminal.type_keys(&format!("{CRYSTAL}\r"));
+    terminal.shows("This is the session crystal is running in.");
+
+    crystal.ok(&["rename", "host", "renamed"]);
+    terminal.shows("▶ renamed");
+    terminal.shows("This is the session crystal is running in.");
+}
+
+#[test]
+fn respawn_runs_an_ended_session_again_in_its_place() {
+    let crystal = Crystal::new();
+    crystal.ok(&["new", "-n", "first", "sleep", "30"]);
+    let script = "echo ran >> runs; exit 3";
+    crystal.ok(&["new", "-n", "once", "sh", "-c", script]);
+    crystal.ok(&["new", "-n", "last", "sleep", "30"]);
+    eventually("once has ended", || {
+        crystal.row("once").unwrap()[1] == "exited 3"
+    });
+    let running = crystal.fails(&["respawn", "first"]);
+    assert!(running.contains("first is still running"), "{running}");
+
+    crystal.ok(&["respawn", "once"]);
+    let runs = crystal.dir.path().join("runs");
+    eventually("once has run twice", || {
+        std::fs::read_to_string(&runs).is_ok_and(|runs| runs == "ran\nran\n")
+    });
+    let listed = crystal.ok(&["ls"]);
+    let names: Vec<&str> = listed
+        .lines()
+        .skip(1)
+        .filter_map(|line| line.split_whitespace().next())
+        .collect();
+    assert_eq!(names, ["first", "once", "last"]);
+}
+
+#[test]
+fn respawned_claude_picks_its_conversation_up_again() {
+    let crystal = Crystal::new();
+    let bin = fake_claude(crystal.dir.path());
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let out = crystal
+        .command(&["new", "-n", "agent", "claude"])
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+
+    // Claude's hooks name its conversation, whose transcript exists once a
+    // prompt has been sent.
+    let args = written(&crystal.dir.path().join("args"));
+    let settings: serde_json::Value = serde_json::from_str(args.lines().nth(1).unwrap()).unwrap();
+    let hook = settings["hooks"]["Stop"][0]["hooks"][0]["command"]
+        .as_str()
+        .unwrap();
+    let transcript = crystal.dir.path().join("abc-123.jsonl");
+    std::fs::write(&transcript, "{}\n").unwrap();
+    let event = serde_json::json!({
+        "hook_event_name": "UserPromptSubmit",
+        "session_id": "abc-123",
+        "transcript_path": transcript,
+    });
+    run_hook(&crystal, "agent", hook, &event.to_string());
+
+    // The agent's program ends on its own.
+    let pid = crystal.pid("agent");
+    // SAFETY: kill only sends a signal, to the group the agent leads.
+    unsafe {
+        libc::kill(-pid, libc::SIGTERM);
+    }
+    eventually("the agent has ended", || {
+        crystal.row("agent").unwrap()[1].starts_with("killed")
+    });
+
+    std::fs::remove_file(crystal.dir.path().join("args")).unwrap();
+    let out = crystal
+        .command(&["respawn", "agent"])
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let args = written(&crystal.dir.path().join("args"));
+    let args: Vec<&str> = args.lines().collect();
+    assert_eq!(args[2..], ["--resume", "abc-123"]);
+}
+
+#[test]
+fn enter_on_an_ended_session_starts_it_again_once_you_say_yes() {
+    let crystal = Crystal::new();
+    let script = "echo ran >> runs; exit 3";
+    crystal.ok(&["new", "-n", "once", "sh", "-c", script]);
+    eventually("once has ended", || {
+        crystal.row("once").unwrap()[1] == "exited 3"
+    });
+
+    let mut tui = crystal.tui();
+    tui.shows("■ once exited 3");
+    tui.type_keys("\r");
+    tui.shows("start once again? y/n");
+    tui.type_keys("y");
+    let runs = crystal.dir.path().join("runs");
+    eventually("once has run twice", || {
+        std::fs::read_to_string(&runs).is_ok_and(|runs| runs == "ran\nran\n")
+    });
+}
+
+#[test]
+fn worktree_rm_takes_the_sessions_that_ended_there_with_it() {
+    let crystal = Crystal::new();
+    let repo = git_repo(crystal.dir.path(), "app");
+    let repo_arg = repo.to_str().unwrap();
+    crystal.ok(&[
+        "new", "-n", "fixer", "-c", repo_arg, "-w", "fix", "sh", "-c", "exit 0",
+    ]);
+    eventually("fixer has ended", || {
+        crystal.row("fixer").unwrap()[1] == "exited 0"
+    });
+
+    crystal.ok(&["worktree", "rm", "app.worktrees/fix"]);
+    assert!(!crystal.dir.path().join("app.worktrees/fix").exists());
+    assert!(crystal.row("fixer").is_none());
+}
+
+#[test]
+fn shift_w_removes_a_worktree_once_nothing_runs_in_it() {
+    let crystal = Crystal::new();
+    let repo = git_repo(crystal.dir.path(), "app");
+    let repo_arg = repo.to_str().unwrap();
+    crystal.ok(&[
+        "new", "-n", "fixer", "-c", repo_arg, "-w", "fix", "sh", "-c", "exit 0",
+    ]);
+    let worktree = crystal.dir.path().join("app.worktrees/fix");
+    let worktree_arg = worktree.to_str().unwrap();
+    crystal.ok(&["new", "-n", "tests", "-c", worktree_arg, "sleep", "30"]);
+    eventually("fixer has ended", || {
+        crystal.row("fixer").unwrap()[1] == "exited 0"
+    });
+
+    // fixer, the first session in the worktree, is selected.
+    let mut tui = crystal.tui();
+    tui.shows("■ fixer");
+    tui.type_keys("W");
+    tui.shows("tests still running in fix");
+    assert!(worktree.is_dir());
+
+    crystal.ok(&["kill", "tests"]);
+    tui.hides("▶ tests");
+    tui.type_keys("W");
+    tui.shows("remove worktree fix? y/n");
+    tui.type_keys("y");
+    eventually("the worktree is gone", || !worktree.exists());
+    eventually("its ended session went with it", || {
+        crystal.row("fixer").is_none()
+    });
 }

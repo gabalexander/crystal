@@ -50,10 +50,13 @@ pub fn current() -> BTreeMap<String, String> {
 }
 
 /// The client's environment, minus what only made sense where the client
-/// runs, plus what tells the program which terminal and session it's in.
+/// runs, plus what tells the program which terminal and session it's in:
+/// the session's name as it is when the program starts, and its id, which
+/// stays the same when the session is renamed.
 pub fn for_session(
     client: &BTreeMap<String, String>,
     name: &str,
+    id: &str,
     socket: &Path,
 ) -> BTreeMap<String, String> {
     let mut env: BTreeMap<String, String> = client
@@ -64,15 +67,17 @@ pub fn for_session(
     env.insert("TERM".into(), "xterm-256color".into());
     env.insert("COLORTERM".into(), "truecolor".into());
     env.insert("CRYSTAL_SESSION".into(), name.into());
+    env.insert("CRYSTAL_SESSION_ID".into(), id.into());
     env.insert("CRYSTAL_SOCKET".into(), socket.display().to_string());
     env
 }
 
-/// The session this process runs in, when it runs in one of the daemon at
-/// `socket`'s sessions. Showing that session here would show it showing
-/// itself, endlessly.
-pub fn own_session(socket: &Path) -> Option<String> {
-    let session = std::env::var("CRYSTAL_SESSION").ok()?;
+/// The id of the session this process runs in, when it runs in one of the
+/// daemon at `socket`'s sessions. Showing that session here would show it
+/// showing itself, endlessly. It's the id rather than the name: the
+/// session may have been renamed since this process started.
+pub fn own_session_id(socket: &Path) -> Option<String> {
+    let session = std::env::var("CRYSTAL_SESSION_ID").ok()?;
     let daemon = std::env::var_os("CRYSTAL_SOCKET")?;
     if Path::new(&daemon) == socket {
         Some(session)
@@ -106,6 +111,7 @@ mod tests {
                 ("CLAUDE_CODE_USE_BEDROCK", "1"),
             ]),
             "agent",
+            "1a2b",
             Path::new("/tmp/s.sock"),
         );
         assert_eq!(env["PATH"], "/opt/bin:/usr/bin");
@@ -122,6 +128,7 @@ mod tests {
                 ("CLAUDE_CODE_SESSION_ID", "abc"),
             ]),
             "agent",
+            "1a2b",
             Path::new("/tmp/s.sock"),
         );
         for key in [
@@ -139,10 +146,12 @@ mod tests {
         let env = for_session(
             &client(&[("TERM", "xterm-ghostty")]),
             "agent",
+            "1a2b",
             Path::new("/tmp/s.sock"),
         );
         assert_eq!(env["TERM"], "xterm-256color");
         assert_eq!(env["CRYSTAL_SESSION"], "agent");
+        assert_eq!(env["CRYSTAL_SESSION_ID"], "1a2b");
         assert_eq!(env["CRYSTAL_SOCKET"], "/tmp/s.sock");
     }
 }
