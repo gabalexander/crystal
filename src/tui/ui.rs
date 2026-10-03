@@ -66,8 +66,11 @@ pub struct Areas {
     /// The column with the rule between the sidebar and the panes.
     pub rule: Rect,
     /// One per pane, in the app's [`App::slots`] order: the selection's
-    /// pane, then each split. Each is its header line, then its screen.
+    /// pane and the splits, then the float's. Each is its header line,
+    /// then its screen.
     pub panes: Vec<Rect>,
+    /// The frame around the float, over the other panes, while one floats.
+    pub float: Option<Rect>,
     pub footer: Rect,
 }
 
@@ -75,11 +78,29 @@ impl Areas {
     /// Lays out a screen the way `app` has it: zoomed, or with its splits
     /// beside the selection's pane.
     pub fn of(app: &App, screen: Rect) -> Areas {
-        if app.zoomed() {
+        let mut areas = if app.zoomed() {
             Areas::zoomed(screen)
         } else {
             Areas::new(screen, app.splits().len())
+        };
+        if app.floating().is_some() {
+            areas.add_float();
         }
+        areas
+    }
+
+    /// Puts a pane floating over the others, in a frame, in the middle of
+    /// the room they have.
+    pub fn add_float(&mut self) {
+        let frame = float_frame(self);
+        self.panes.push(Block::bordered().inner(frame));
+        self.float = Some(frame);
+    }
+
+    /// The panes laid side by side or stacked: all of them but the float.
+    pub fn tiled(&self) -> &[Rect] {
+        let floats = usize::from(self.float.is_some());
+        &self.panes[..self.panes.len() - floats]
     }
 
     /// Lays out a screen with `splits` sessions split off beside the
@@ -98,6 +119,7 @@ impl Areas {
             sidebar,
             rule,
             panes: pane_areas(panes, 1 + splits),
+            float: None,
             footer,
         }
     }
@@ -113,9 +135,31 @@ impl Areas {
             sidebar: nowhere,
             rule: nowhere,
             panes: vec![main],
+            float: None,
             footer,
         }
     }
+}
+
+/// How much of the room beside the sidebar a float takes, each way, in
+/// tenths.
+const FLOAT_TENTHS: u16 = 8;
+
+/// Where the frame of a float goes: over the panes, in the middle of the
+/// room they have, most of it each way, but no smaller than a small
+/// terminal while there's room for that.
+fn float_frame(areas: &Areas) -> Rect {
+    let left = areas.rule.right();
+    let main = areas.main;
+    let room = Rect::new(left, main.y, main.right().saturating_sub(left), main.height);
+    let width = (room.width * FLOAT_TENTHS / 10).max(room.width.min(60));
+    let height = (room.height * FLOAT_TENTHS / 10).max(room.height.min(12));
+    Rect::new(
+        room.x + (room.width - width) / 2,
+        room.y + (room.height - height) / 2,
+        width,
+        height,
+    )
 }
 
 /// The top bar, everything between, and the footer.
@@ -276,9 +320,15 @@ pub fn hit(areas: &Areas, app: &App, column: u16, row: u16) -> Hit {
     if at(areas.sidebar) {
         return sidebar::hit(areas.sidebar, app, row);
     }
-    let panes = app.slots().into_iter().zip(&areas.panes);
+    // The float is over the others, its frame and all: the last pane
+    // first.
+    let panes = app.slots().into_iter().zip(&areas.panes).rev();
     for (slot, area) in panes {
-        if at(*area) {
+        let frame = match (slot, areas.float) {
+            (Slot::Float, Some(frame)) => frame,
+            _ => *area,
+        };
+        if at(frame) {
             let screen = screen_area(*area);
             let cell = at(screen).then(|| (row - screen.y, column - screen.x));
             return Hit::Pane { slot, cell };
@@ -305,9 +355,12 @@ pub fn draw(frame: &mut Frame, app: &App, panes: &[Pane], overlay: Option<&Pane>
     sidebar::draw(frame, app, look, areas.sidebar);
     draw_rule(frame, look, areas.rule);
     for (slot, area) in app.slots().into_iter().zip(&areas.panes) {
+        if let (Slot::Float, Some(around)) = (slot, areas.float) {
+            draw_float_frame(frame, app, look, around);
+        }
         draw_pane(frame, app, look, slot, *area, panes);
     }
-    draw_rules_between(frame, look, &areas.panes);
+    draw_rules_between(frame, look, areas.tiled());
     // Zoomed, the sidebar comes out over the pane while `/` looks through
     // it, rather than squeezing the pane, which its program would redraw
     // for.
@@ -552,6 +605,28 @@ pub fn draw_rule(frame: &mut Frame, look: &Look, area: Rect) {
     frame.render_widget(rule, area);
 }
 
+/// The frame around the float, over the panes under it: in the accent
+/// color while it has the keyboard, with how to put it back below.
+fn draw_float_frame(frame: &mut Frame, app: &App, look: &Look, around: Rect) {
+    let theme = look.theme;
+    let focused = matches!(
+        app.focus(),
+        Focus::Pane(Slot::Float) | Focus::Copy(Slot::Float)
+    );
+    let color = if focused { theme.accent } else { theme.rule };
+    let hint = if app.focus() == Focus::Sidebar {
+        " F puts it back "
+    } else {
+        " ctrl+\\ sidebar · then F puts it back "
+    };
+    let block = Block::bordered()
+        .border_style(Style::new().fg(color))
+        .style(theme.base())
+        .title_bottom(Line::styled(hint, Style::new().fg(theme.muted)));
+    frame.render_widget(Clear, around);
+    frame.render_widget(block, around);
+}
+
 /// The rules between panes that sit side by side, in the column left
 /// between each pair.
 fn draw_rules_between(frame: &mut Frame, look: &Look, panes: &[Rect]) {
@@ -603,9 +678,16 @@ fn draw_pane(frame: &mut Frame, app: &App, look: &Look, slot: Slot, area: Rect, 
         return;
     }
     if !app.shows_screen(slot) {
-        // The selected session is split off: point at its pane rather than
-        // draw it twice at two sizes.
-        let message = format!("{} has a pane of its own", session.name);
+        // The selected session is split off, or floats: point at its pane
+        // rather than draw it twice at two sizes.
+        let floats = app
+            .floating()
+            .is_some_and(|float| float.name == session.name);
+        let message = if floats {
+            format!("{} floats over the panes", session.name)
+        } else {
+            format!("{} has a pane of its own", session.name)
+        };
         draw_message(frame, look, &message, screen);
         return;
     }
@@ -651,7 +733,9 @@ fn header_notes(app: &App, slot: Slot, session: &SessionInfo, back: usize) -> Ve
     // Zoomed, the one pane is the selected session's, and says why the
     // sidebar has gone.
     let selected = app.selected().is_some_and(|s| s.name == session.name);
-    if app.zoomed() {
+    if slot == Slot::Float {
+        notes.push("floating".to_string());
+    } else if app.zoomed() {
         notes.push("zoomed".to_string());
     } else if slot != Slot::Selected && selected {
         notes.push("selected".to_string());
@@ -1895,6 +1979,49 @@ mod tests {
             cell: None,
         };
         assert_eq!(header, selections);
+    }
+
+    #[test]
+    fn a_float_goes_over_the_middle_of_the_panes_and_takes_the_clicks_there() {
+        let mut app = app_with_sessions(2);
+        app.on_key(KeyEvent::new(KeyCode::Char('F'), KeyModifiers::NONE));
+        let areas = Areas::of(&app, Rect::new(0, 0, 120, 40));
+        // Beside the sidebar and its rule there are 91 columns, and 38 rows
+        // between the top bar and the footer: the frame takes eight tenths.
+        let frame = areas.float.unwrap();
+        assert_eq!(frame, Rect::new(38, 5, 72, 30));
+        assert_eq!(areas.tiled().len(), 1);
+        assert_eq!(*areas.panes.last().unwrap(), Rect::new(39, 6, 70, 28));
+
+        // Inside it is the float, even over the pane under it; its frame
+        // counts as its own; outside it, the pane under it.
+        let on = |column, row| hit(&areas, &app, column, row);
+        let inside = Hit::Pane {
+            slot: Slot::Float,
+            cell: Some((1, 1)),
+        };
+        assert_eq!(on(40, 8), inside);
+        let edge = Hit::Pane {
+            slot: Slot::Float,
+            cell: None,
+        };
+        assert_eq!(on(38, 10), edge);
+        assert!(matches!(
+            on(32, 10),
+            Hit::Pane {
+                slot: Slot::Selected,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_float_keeps_a_small_terminals_size_while_there_is_room() {
+        let mut app = app_with_sessions(1);
+        app.on_key(KeyEvent::new(KeyCode::Char('F'), KeyModifiers::NONE));
+        // 51 by 22 beside the sidebar: eight tenths would be 40 by 17.
+        let frame = Areas::of(&app, Rect::new(0, 0, 80, 24)).float.unwrap();
+        assert_eq!((frame.width, frame.height), (51, 17));
     }
 
     #[test]

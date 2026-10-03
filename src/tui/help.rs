@@ -54,7 +54,7 @@ pub const KEYS: &[Key] = &[
     sidebar("Enter", "type into it, or rerun"),
     sidebar("Tab/Shift+Tab", "next / previous pane"),
     sidebar("s/z/v", "split / zoom / copy"),
-    sidebar("H/L", "move its pane"),
+    sidebar("F H/L", "float / move its pane"),
     sidebar("PgUp/PgDn e", "page / edit its history"),
     sidebar("t/T/&", "tab: new / name / close"),
     sidebar("[/] 1-9 >", "switch tabs / move it"),

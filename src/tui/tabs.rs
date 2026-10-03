@@ -48,6 +48,9 @@ pub struct Tab {
     /// Whether the selected session's pane takes all the room between the
     /// top bar and the footer, the sidebar and the other panes put away.
     pub zoomed: bool,
+    /// The session floating over the panes, in a pane of its own, if one
+    /// is. One of the tab's own sessions, and never one split off too.
+    pub floating: Option<String>,
 }
 
 impl Tab {
@@ -90,6 +93,9 @@ impl Tab {
         self.keep_splits(|split| split != name);
         if self.selected.as_deref() == Some(name) {
             self.selected = None;
+        }
+        if self.floating.as_deref() == Some(name) {
+            self.floating = None;
         }
     }
 }
@@ -210,7 +216,8 @@ impl Tabs {
                 .sessions
                 .iter_mut()
                 .chain(tab.splits.iter_mut())
-                .chain(tab.selected.as_mut());
+                .chain(tab.selected.as_mut())
+                .chain(tab.floating.as_mut());
             for name in names.filter(|name| name.as_str() == from) {
                 *name = to.to_string();
             }
@@ -224,6 +231,13 @@ impl Tabs {
         for tab in &mut self.tabs {
             tab.sessions.retain(|held| names.contains(&held.as_str()));
             tab.keep_splits(|split| names.contains(&split));
+            if tab
+                .floating
+                .as_deref()
+                .is_some_and(|name| !names.contains(&name))
+            {
+                tab.floating = None;
+            }
         }
         for name in names {
             if self.tab_of(name).is_none() {
@@ -237,8 +251,9 @@ impl Tabs {
 
     /// Tabs as read from a file, put right where they couldn't have been
     /// written that way: one tab at least and [`MAX_TABS`] at most, each
-    /// with [`MAX_SPLITS`] splits at most of its own sessions, no session
-    /// in two tabs, and the one in front among them.
+    /// with [`MAX_SPLITS`] splits at most of its own sessions and a float
+    /// of its own that isn't split off too, no session in two tabs, and
+    /// the one in front among them.
     fn checked(mut self) -> Tabs {
         self.tabs.truncate(MAX_TABS);
         if self.tabs.is_empty() {
@@ -249,9 +264,13 @@ impl Tabs {
             tab.sessions.retain(|name| !seen.contains(name));
             seen.extend(tab.sessions.iter().cloned());
             let sessions = tab.sessions.clone();
-            tab.keep_splits(|split| sessions.iter().any(|held| held == split));
+            let floating = tab.floating.take().filter(|name| sessions.contains(name));
+            tab.keep_splits(|split| {
+                sessions.iter().any(|held| held == split) && floating.as_deref() != Some(split)
+            });
             tab.splits.truncate(MAX_SPLITS);
             tab.selection_at = tab.selection_pane_at();
+            tab.floating = floating;
         }
         self.current = self.current.min(self.tabs.len() - 1);
         self
@@ -480,6 +499,7 @@ mod tests {
         tabs.current_mut().selected = Some("agent".into());
         tabs.current_mut().zoomed = true;
         tabs.current_mut().selection_at = 1;
+        tabs.current_mut().floating = Some("agent".into());
         tabs.go_to(1);
         save(&path, &tabs);
         assert_eq!(load(&path), tabs);
@@ -527,6 +547,30 @@ mod tests {
         tabs.take_in(&["b", "c"], |_| None);
         assert!(tabs.current().splits.is_empty());
         assert_eq!(tabs.current().selection_at, 0);
+    }
+
+    #[test]
+    fn a_float_follows_its_session_through_a_rename_and_goes_with_it() {
+        let mut tabs = Tabs::default();
+        tabs.put("old", 0);
+        tabs.current_mut().floating = Some("old".into());
+        tabs.renamed("old", "new");
+        assert_eq!(tabs.current().floating.as_deref(), Some("new"));
+        tabs.take_in(&[], |_| None);
+        assert_eq!(tabs.current().floating, None);
+    }
+
+    #[test]
+    fn a_float_read_from_a_file_is_one_of_its_tabs_sessions_and_not_split_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tabs.json");
+        let kept = r#"{"version": 2, "tabs": [{"sessions": ["x", "y"], "splits": ["x", "y"],
+            "floating": "x"}, {"sessions": ["z"], "floating": "y"}]}"#;
+        std::fs::write(&path, kept).unwrap();
+        let tabs = load(&path);
+        assert_eq!(tabs.all()[0].floating.as_deref(), Some("x"));
+        assert_eq!(tabs.all()[0].splits, ["y"]);
+        assert_eq!(tabs.all()[1].floating, None);
     }
 
     #[test]

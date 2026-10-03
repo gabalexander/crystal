@@ -84,6 +84,7 @@ and the footer says where you are and offers the keys that matter there.
 | `j` / `k`, `↓` / `↑` | select a session, or a worktree with no sessions |
 | `Enter` | type into the selected session, or start an ended one again, once you've said `y`; on a worktree with no sessions, start one there |
 | `s` | split the selected session off into a pane of its own, or close its split |
+| `F` | float the selected session over the panes, and type into it; again, put it back |
 | `H` / `L` | move the selected session's pane a place left or right among the panes (up or down, stacked), swapping it with the pane there |
 | `z` | [zoom](#zoom-copy-mode-and-search) the selected session's pane to take the whole screen, or put it back |
 | `Tab` / `Shift+Tab` | type into the next pane, or the one before |
@@ -148,6 +149,13 @@ A new split goes after the other panes. To put them in another order, `H` moves 
 place to the left and `L` a place to the right (up and down when they're stacked), swapping it with the pane
 that was there; or take a pane by its header line with the mouse and let go over another, and the two swap
 places. Each tab keeps its panes in their order, the next time you open the TUI too.
+
+`F` floats the selected session over the panes, in a frame of its own in the middle of them, and hands it the
+keyboard: a shell to run something in, or an agent to answer, without changing the panes under it. The session
+is sized to the frame. `Ctrl+\` takes you back to the sidebar and leaves it floating, over whatever the
+selection shows; `Tab` or a click gets back into it, as with any pane. `F` again puts it back among the others,
+whichever session is selected. A tab has one float at most, kept with the tab like its splits. A session split
+off floats up out of its split, and `s` on the one floating puts it down into a split.
 
 The sidebar groups sessions by project, then by worktree: `⌂` marks a repository's main worktree and `⎇` a
 linked one, each named by its branch. Sessions outside any repository come last, under their directory.
