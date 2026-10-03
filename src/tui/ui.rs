@@ -333,12 +333,13 @@ fn draw_plugin_pane(frame: &mut Frame, open: &PluginPane, pane: &Pane, look: &Lo
         ));
     let screen = block.inner(area);
     frame.render_widget(block, area);
-    let session_screen = pane.screen.screen();
     let widget =
-        ScreenWidget::new(session_screen).with_defaults(look.theme.text, look.theme.background);
+        ScreenWidget::new(&pane.screen).with_defaults(look.theme.text, look.theme.background);
     frame.render_widget(widget, screen);
-    if !session_screen.hide_cursor() {
-        let (row, col) = session_screen.cursor_position();
+    if let Some((row, col)) = pane.screen.cursor()
+        && row < screen.height
+        && col < screen.width
+    {
         frame.set_cursor_position((screen.x + col, screen.y + row));
     }
 }
@@ -541,17 +542,18 @@ fn draw_pane(frame: &mut Frame, app: &App, look: &Look, slot: Slot, area: Rect, 
     let Some(pane) = pane else {
         return;
     };
-    let session_screen = pane.screen.screen();
     let widget =
-        ScreenWidget::new(session_screen).with_defaults(look.theme.text, look.theme.background);
+        ScreenWidget::new(&pane.screen).with_defaults(look.theme.text, look.theme.background);
     frame.render_widget(widget, screen);
     // Back in the history, the cursor's place on the live screen means
     // nothing.
-    if focused && back == 0 && !session_screen.hide_cursor() {
-        let (row, col) = session_screen.cursor_position();
-        if row < screen.height && col < screen.width {
-            frame.set_cursor_position((screen.x + col, screen.y + row));
-        }
+    if focused
+        && back == 0
+        && let Some((row, col)) = pane.screen.cursor()
+        && row < screen.height
+        && col < screen.width
+    {
+        frame.set_cursor_position((screen.x + col, screen.y + row));
     }
 }
 

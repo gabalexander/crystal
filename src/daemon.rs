@@ -10,7 +10,6 @@ use crate::env;
 use crate::flow_run::{self, Ended, FlowRun, Next, RunState, StepState};
 use crate::flows;
 use crate::git;
-use crate::keys;
 use crate::memory::{self, Memory};
 use crate::notify::{self, Notice};
 use crate::plugin_hooks::{self, Event, Hooks};
@@ -659,9 +658,8 @@ impl Daemon {
                      `crystal send {name} \"…\"` gives it a follow-up"
                 );
                 let term = self.running_term(&name)?;
-                let application_cursor = term.wants_application_cursor();
                 for key in &keys {
-                    term.write(&keys::keystrokes(key, application_cursor))?;
+                    term.write(&term.keystrokes(key))?;
                 }
                 Ok(Response::Done)
             }

@@ -2,13 +2,61 @@
 //! event into the bytes a terminal would send the program, in the way the
 //! program asked for them.
 //!
-//! A program asks with escape sequences that vt100 keeps track of: which
-//! events it wants (only presses, presses and releases, drags too) and how
-//! they're to be written (the old one-byte-per-number way, its UTF-8
-//! version, or the SGR way that most programs ask for today).
+//! A program asks by setting modes on its terminal: which events it wants
+//! (presses and releases, drags too, or every move) and how they're to be
+//! written (the old one-byte-per-number way, its UTF-8 version, or the SGR
+//! way that most programs ask for today).
 
+use crate::vt::{self, mode};
 use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
-use vt100::{MouseProtocolEncoding, MouseProtocolMode};
+
+/// Which mouse events a program asked to hear about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    PressRelease,
+    ButtonMotion,
+    AnyMotion,
+}
+
+/// How a program asked for mouse events to be written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Encoding {
+    Default,
+    Utf8,
+    Sgr,
+}
+
+/// What a program asked for the mouse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Protocol {
+    pub mode: Mode,
+    pub encoding: Encoding,
+}
+
+impl Protocol {
+    /// What the program on `screen` asked for, or `None` when it hasn't
+    /// asked for the mouse. Of the modes it set, the one that hears the
+    /// most counts.
+    pub fn of(screen: &vt::Screen) -> Option<Protocol> {
+        let mode = if screen.mode(mode::MOUSE_ANY) {
+            Mode::AnyMotion
+        } else if screen.mode(mode::MOUSE_BUTTON) {
+            Mode::ButtonMotion
+        } else if screen.mode(mode::MOUSE_NORMAL) {
+            Mode::PressRelease
+        } else {
+            return None;
+        };
+        let encoding = if screen.mode(mode::MOUSE_SGR) {
+            Encoding::Sgr
+        } else if screen.mode(mode::MOUSE_UTF8) {
+            Encoding::Utf8
+        } else {
+            Encoding::Default
+        };
+        Some(Protocol { mode, encoding })
+    }
+}
 
 /// The bytes for a mouse event at `cell`, a `(row, column)` on the
 /// program's screen counted from 0, or `None` when the program didn't ask
@@ -18,21 +66,20 @@ pub fn encode(
     kind: MouseEventKind,
     modifiers: KeyModifiers,
     cell: (u16, u16),
-    mode: MouseProtocolMode,
-    encoding: MouseProtocolEncoding,
+    protocol: Protocol,
 ) -> Option<Vec<u8>> {
-    let report = report(kind, mode)?;
+    let report = report(kind, protocol.mode)?;
     let button = report.button + modifier_bits(modifiers);
     // The protocols count rows and columns from 1.
     let (row, column) = cell;
     let x = u32::from(column) + 1;
     let y = u32::from(row) + 1;
-    match encoding {
-        MouseProtocolEncoding::Sgr => {
+    match protocol.encoding {
+        Encoding::Sgr => {
             let end = if report.release { 'm' } else { 'M' };
             Some(format!("\x1b[<{button};{x};{y}{end}").into_bytes())
         }
-        MouseProtocolEncoding::Default => {
+        Encoding::Default => {
             let button = if report.release {
                 RELEASE + modifier_bits(modifiers)
             } else {
@@ -46,7 +93,7 @@ pub fn encode(
             }
             Some(bytes)
         }
-        MouseProtocolEncoding::Utf8 => {
+        Encoding::Utf8 => {
             let button = if report.release {
                 RELEASE + modifier_bits(modifiers)
             } else {
@@ -77,25 +124,15 @@ struct Report {
 }
 
 /// How the protocols see `kind`, if the program asked to hear about it.
-fn report(kind: MouseEventKind, mode: MouseProtocolMode) -> Option<Report> {
-    let releases = matches!(
-        mode,
-        MouseProtocolMode::PressRelease
-            | MouseProtocolMode::ButtonMotion
-            | MouseProtocolMode::AnyMotion
-    );
-    let drags = matches!(
-        mode,
-        MouseProtocolMode::ButtonMotion | MouseProtocolMode::AnyMotion
-    );
+fn report(kind: MouseEventKind, mode: Mode) -> Option<Report> {
+    let drags = matches!(mode, Mode::ButtonMotion | Mode::AnyMotion);
     let press = |button| Report {
         button,
         release: false,
     };
     match kind {
-        _ if mode == MouseProtocolMode::None => None,
         MouseEventKind::Down(button) => Some(press(button_number(button))),
-        MouseEventKind::Up(button) if releases => Some(Report {
+        MouseEventKind::Up(button) => Some(Report {
             button: button_number(button),
             release: true,
         }),
@@ -145,8 +182,10 @@ mod tests {
             kind,
             modifiers,
             cell,
-            MouseProtocolMode::ButtonMotion,
-            MouseProtocolEncoding::Sgr,
+            Protocol {
+                mode: Mode::ButtonMotion,
+                encoding: Encoding::Sgr,
+            },
         )?;
         Some(String::from_utf8(bytes).unwrap())
     }
@@ -187,8 +226,10 @@ mod tests {
                 kind,
                 NONE,
                 (1, 2),
-                MouseProtocolMode::PressRelease,
-                MouseProtocolEncoding::Default,
+                Protocol {
+                    mode: Mode::PressRelease,
+                    encoding: Encoding::Default,
+                },
             )
         };
         assert_eq!(encode(LEFT_DOWN).unwrap(), b"\x1b[M\x20\x23\x22");
@@ -203,8 +244,10 @@ mod tests {
             LEFT_DOWN,
             NONE,
             far,
-            MouseProtocolMode::Press,
-            MouseProtocolEncoding::Default,
+            Protocol {
+                mode: Mode::PressRelease,
+                encoding: Encoding::Default,
+            },
         );
         assert_eq!(old, None);
 
@@ -212,8 +255,10 @@ mod tests {
             LEFT_DOWN,
             NONE,
             far,
-            MouseProtocolMode::Press,
-            MouseProtocolEncoding::Utf8,
+            Protocol {
+                mode: Mode::PressRelease,
+                encoding: Encoding::Utf8,
+            },
         )
         .unwrap();
         let expected: String = [
@@ -231,17 +276,42 @@ mod tests {
 
     #[test]
     fn a_program_hears_only_what_it_asked_for() {
-        let heard =
-            |kind, mode| encode(kind, NONE, (0, 0), mode, MouseProtocolEncoding::Sgr).is_some();
-        assert!(!heard(LEFT_DOWN, MouseProtocolMode::None));
-        assert!(heard(LEFT_DOWN, MouseProtocolMode::Press));
-        assert!(!heard(LEFT_UP, MouseProtocolMode::Press));
-        assert!(heard(LEFT_UP, MouseProtocolMode::PressRelease));
-        assert!(!heard(LEFT_DRAG, MouseProtocolMode::PressRelease));
-        assert!(heard(LEFT_DRAG, MouseProtocolMode::ButtonMotion));
-        assert!(!heard(
-            MouseEventKind::Moved,
-            MouseProtocolMode::ButtonMotion
-        ));
+        let heard = |kind, mode| {
+            let protocol = Protocol {
+                mode,
+                encoding: Encoding::Sgr,
+            };
+            encode(kind, NONE, (0, 0), protocol).is_some()
+        };
+        assert!(heard(LEFT_DOWN, Mode::PressRelease));
+        assert!(heard(LEFT_UP, Mode::PressRelease));
+        assert!(!heard(LEFT_DRAG, Mode::PressRelease));
+        assert!(heard(LEFT_DRAG, Mode::ButtonMotion));
+        assert!(!heard(MouseEventKind::Moved, Mode::ButtonMotion));
+    }
+
+    #[test]
+    fn the_protocol_is_read_off_the_programs_modes() {
+        let protocol = |output: &[u8]| {
+            let mut screen = vt::Screen::new(2, 10);
+            screen.process(output);
+            Protocol::of(&screen)
+        };
+        assert_eq!(protocol(b""), None);
+        assert_eq!(
+            protocol(b"\x1b[?1000h\x1b[?1006h"),
+            Some(Protocol {
+                mode: Mode::PressRelease,
+                encoding: Encoding::Sgr,
+            })
+        );
+        assert_eq!(
+            protocol(b"\x1b[?1002h\x1b[?1005h"),
+            Some(Protocol {
+                mode: Mode::ButtonMotion,
+                encoding: Encoding::Utf8,
+            })
+        );
+        assert_eq!(protocol(b"\x1b[?1003h\x1b[?1003l"), None);
     }
 }

@@ -1,14 +1,14 @@
-//! Draws a session's screen, as vt100 keeps it, into a ratatui area: each
-//! vt100 cell becomes a ratatui cell with the same character, colors and
-//! attributes.
+//! Draws a session's screen into a ratatui area: each cell of the screen
+//! becomes a ratatui cell with the same character, colors and attributes.
 
+use crate::vt::{self, CellColor, CellStyle};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::Widget;
 
 pub struct ScreenWidget<'a> {
-    screen: &'a vt100::Screen,
+    screen: &'a vt::Screen,
     /// What a program's "default" colors stand for: the terminal's own,
     /// unless the theme paints its own.
     default_fg: Color,
@@ -16,7 +16,7 @@ pub struct ScreenWidget<'a> {
 }
 
 impl<'a> ScreenWidget<'a> {
-    pub fn new(screen: &'a vt100::Screen) -> ScreenWidget<'a> {
+    pub fn new(screen: &'a vt::Screen) -> ScreenWidget<'a> {
         ScreenWidget {
             screen,
             default_fg: Color::Reset,
@@ -34,24 +34,25 @@ impl<'a> ScreenWidget<'a> {
         }
     }
 
-    fn style(&self, cell: &vt100::Cell) -> Style {
-        let fg = color(cell.fgcolor()).unwrap_or(self.default_fg);
-        let bg = color(cell.bgcolor()).unwrap_or(self.default_bg);
+    fn style(&self, cell: &CellStyle) -> Style {
+        let mut fg = cell.fg_color.map_or(self.default_fg, color);
+        let bg = cell.bg_color.map_or(self.default_bg, color);
+        if cell.invisible {
+            fg = bg;
+        }
         let mut style = Style::default().fg(fg).bg(bg);
-        if cell.bold() {
-            style = style.add_modifier(Modifier::BOLD);
-        }
-        if cell.dim() {
-            style = style.add_modifier(Modifier::DIM);
-        }
-        if cell.italic() {
-            style = style.add_modifier(Modifier::ITALIC);
-        }
-        if cell.underline() {
-            style = style.add_modifier(Modifier::UNDERLINED);
-        }
-        if cell.inverse() {
-            style = style.add_modifier(Modifier::REVERSED);
+        let attributes = [
+            (cell.bold, Modifier::BOLD),
+            (cell.faint, Modifier::DIM),
+            (cell.italic, Modifier::ITALIC),
+            (cell.underlined, Modifier::UNDERLINED),
+            (cell.inverse, Modifier::REVERSED),
+            (cell.strikethrough, Modifier::CROSSED_OUT),
+        ];
+        for (on, modifier) in attributes {
+            if on {
+                style = style.add_modifier(modifier);
+            }
         }
         style
     }
@@ -59,37 +60,28 @@ impl<'a> ScreenWidget<'a> {
 
 impl Widget for ScreenWidget<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        let (rows, cols) = self.screen.size();
-        for row in 0..rows.min(area.height) {
-            for col in 0..cols.min(area.width) {
-                let Some(cell) = self.screen.cell(row, col) else {
-                    continue;
-                };
-                // The right half of a wide character: ratatui leaves it
-                // alone once the left half holds the character.
-                if cell.is_wide_continuation() {
-                    continue;
-                }
-                let Some(target) = buf.cell_mut((area.x + col, area.y + row)) else {
-                    continue;
-                };
-                if cell.has_contents() {
-                    target.set_symbol(cell.contents());
-                } else {
-                    target.set_symbol(" ");
-                }
-                target.set_style(self.style(cell));
+        self.screen.each_cell(|row, col, cell| {
+            // A wide character in the last column would spill out.
+            let width = if cell.wide { 2 } else { 1 };
+            if row >= area.height || col + width > area.width {
+                return;
             }
-        }
+            // The right half of a wide character is left out: ratatui
+            // leaves it alone once the left half holds the character.
+            let Some(target) = buf.cell_mut((area.x + col, area.y + row)) else {
+                return;
+            };
+            target.set_symbol(cell.text);
+            target.set_style(self.style(&cell.style));
+        });
     }
 }
 
-/// The color a vt100 cell asks for, or `None` for the default one.
-fn color(color: vt100::Color) -> Option<Color> {
+/// The color a cell asks for.
+fn color(color: CellColor) -> Color {
     match color {
-        vt100::Color::Default => None,
-        vt100::Color::Idx(index) => Some(Color::Indexed(index)),
-        vt100::Color::Rgb(r, g, b) => Some(Color::Rgb(r, g, b)),
+        CellColor::Palette(index) => Color::Indexed(index),
+        CellColor::Rgb(rgb) => Color::Rgb(rgb.r, rgb.g, rgb.b),
     }
 }
 
@@ -97,15 +89,15 @@ fn color(color: vt100::Color) -> Option<Color> {
 mod tests {
     use super::*;
 
-    fn screen(rows: u16, cols: u16, output: &[u8]) -> vt100::Parser {
-        let mut parser = vt100::Parser::new(rows, cols, 0);
-        parser.process(output);
-        parser
+    fn screen(rows: u16, cols: u16, output: &[u8]) -> vt::Screen {
+        let mut screen = vt::Screen::new(rows, cols);
+        screen.process(output);
+        screen
     }
 
-    fn render(parser: &vt100::Parser, area: Rect) -> Buffer {
+    fn render(screen: &vt::Screen, area: Rect) -> Buffer {
         let mut buf = Buffer::empty(area);
-        ScreenWidget::new(parser.screen()).render(area, &mut buf);
+        ScreenWidget::new(screen).render(area, &mut buf);
         buf
     }
 
@@ -150,7 +142,7 @@ mod tests {
         let mut buf = Buffer::empty(area);
         let ink = Color::Rgb(1, 1, 1);
         let paper = Color::Rgb(9, 9, 9);
-        ScreenWidget::new(parser.screen())
+        ScreenWidget::new(&parser)
             .with_defaults(ink, paper)
             .render(area, &mut buf);
 
@@ -158,6 +150,14 @@ mod tests {
         assert_eq!(buf[(0, 0)].style().bg, Some(paper));
         assert_eq!(buf[(1, 0)].style().fg, Some(Color::Indexed(1)));
         assert_eq!(buf[(1, 0)].style().bg, Some(paper));
+    }
+
+    #[test]
+    fn a_wide_character_takes_two_cells() {
+        let parser = screen(1, 6, "中x".as_bytes());
+        let buf = render(&parser, Rect::new(0, 0, 6, 1));
+        assert_eq!(buf[(0, 0)].symbol(), "中");
+        assert_eq!(buf[(2, 0)].symbol(), "x");
     }
 
     #[test]

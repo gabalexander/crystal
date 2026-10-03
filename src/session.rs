@@ -5,7 +5,7 @@ use crate::agent_screen::{self, Looks, ScreenWatch};
 use crate::codex::Rollouts;
 use crate::front;
 use crate::git::Checkout;
-use crate::history::{self, HISTORY_LINES, HistoryKeeper};
+use crate::keys;
 use crate::notify::{self, Notice};
 use crate::protocol::{
     Activity, AgentEvent, Conversation, Front, SessionInfo, State, TaskInfo, TaskOutcome,
@@ -13,6 +13,7 @@ use crate::protocol::{
 };
 use crate::state::SavedSession;
 use crate::task::Task;
+use crate::vt;
 use anyhow::{Context, Result, ensure};
 use portable_pty::{CommandBuilder, ExitStatus, MasterPty, PtySize, native_pty_system};
 use std::collections::BTreeMap;
@@ -595,10 +596,10 @@ struct Pty {
 }
 
 struct Screen {
-    parser: vt100::Parser<Callbacks>,
-    /// Sees that rows scrolling up off the screen reach the parser's
-    /// history.
-    history: HistoryKeeper,
+    /// What the program has drawn, and the history. It answers the
+    /// program's questions to its terminal too: viewers only draw, so the
+    /// answers come from here, whether anyone's watching or not.
+    vt: vt::Screen,
     viewers: Vec<Viewer>,
     /// The program has closed its end: there will be no more output.
     ended: bool,
@@ -622,12 +623,10 @@ impl Term {
     /// A screen of 24 rows by 80 columns, until a viewer gives it another
     /// size.
     fn new(pty: Option<Pty>) -> Term {
-        let parser = vt100::Parser::new_with_callbacks(24, 80, HISTORY_LINES, Callbacks::default());
         Term {
             pty,
             screen: Mutex::new(Screen {
-                parser,
-                history: HistoryKeeper::default(),
+                vt: vt::Screen::answering(24, 80),
                 viewers: Vec::new(),
                 ended: false,
             }),
@@ -646,11 +645,7 @@ impl Term {
         static NEXT_ID: AtomicU64 = AtomicU64::new(0);
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         let mut screen = self.screen.lock().unwrap();
-        let mut snapshot = Vec::new();
-        if with_history {
-            snapshot = history::replay(screen.parser.screen_mut());
-        }
-        snapshot.extend(screen.parser.screen().state_formatted());
+        let snapshot = screen.vt.state_formatted(with_history);
         let feed = (!screen.ended).then(|| {
             let (feed, rx) = mpsc::sync_channel(VIEWER_BACKLOG);
             screen.viewers.push(Viewer { id, feed });
@@ -666,41 +661,25 @@ impl Term {
     /// What the screen says the agent is doing.
     pub fn looks(&self) -> Looks {
         let screen = self.screen.lock().unwrap();
-        agent_screen::read(screen.parser.screen(), &screen.parser.callbacks().title)
+        agent_screen::read(&screen.vt.rows(false), &screen.vt.title())
     }
 
-    /// Whether the program has asked the arrow keys to send `ESC O` rather
-    /// than `ESC [`, which changes what a key named to `send-keys` sends.
-    pub fn wants_application_cursor(&self) -> bool {
-        self.screen
-            .lock()
-            .unwrap()
-            .parser
-            .screen()
-            .application_cursor()
+    /// What pressing `key`, a key's name or some text, sends the program:
+    /// the way it asked for keys, which changes what a key named to
+    /// `send-keys` sends.
+    pub fn keystrokes(&self, key: &str) -> Vec<u8> {
+        keys::keystrokes(key, &self.screen.lock().unwrap().vt)
     }
 
     /// Whether the program has asked for pastes to be marked as pastes.
     pub fn wants_bracketed_paste(&self) -> bool {
-        self.screen
-            .lock()
-            .unwrap()
-            .parser
-            .screen()
-            .bracketed_paste()
+        self.screen.lock().unwrap().vt.bracketed_paste()
     }
 
     /// What's on the screen, one string per row, after the rows of the
     /// history with `with_history`.
     pub fn rows(&self, with_history: bool) -> Vec<String> {
-        let mut screen = self.screen.lock().unwrap();
-        let mut rows = Vec::new();
-        if with_history {
-            rows = history::text(screen.parser.screen_mut());
-        }
-        let (_, cols) = screen.parser.screen().size();
-        rows.extend(screen.parser.screen().rows(0, cols));
-        rows
+        self.screen.lock().unwrap().vt.rows(with_history)
     }
 
     /// The process group in front in the terminal: the job its keys go to.
@@ -729,9 +708,7 @@ impl Term {
 
     pub fn resize(&self, rows: u16, cols: u16) -> Result<()> {
         let mut screen = self.screen.lock().unwrap();
-        let (old_rows, _) = screen.parser.screen().size();
-        screen.history.resize(old_rows, rows);
-        screen.parser.screen_mut().set_size(rows, cols);
+        screen.vt.resize(rows, cols);
         if let Some(pty) = &self.pty {
             pty.master.lock().unwrap().resize(size(rows, cols))?;
         }
@@ -774,60 +751,17 @@ impl Term {
     /// Keeps the screen up to date with `output` and passes it on to every
     /// viewer. Returns what the program asked its terminal, to answer.
     fn take_output(&self, output: &[u8]) -> Vec<u8> {
-        let mut guard = self.screen.lock().unwrap();
-        let screen = &mut *guard;
-        // Viewers get what the screen was fed, so that their own screens
-        // keep the same history.
-        let chunk: Arc<[u8]> = screen.history.feed(&mut screen.parser, output).into();
+        let mut screen = self.screen.lock().unwrap();
+        screen.vt.process(output);
+        // Viewers get the same output, so that their own screens keep the
+        // same history.
+        let chunk: Arc<[u8]> = output.into();
         // A viewer that's gone, or too far behind to catch up, is dropped
         // rather than holding up the program.
         screen
             .viewers
             .retain(|viewer| viewer.feed.try_send(chunk.clone()).is_ok());
-        std::mem::take(&mut screen.parser.callbacks_mut().replies)
-    }
-}
-
-/// What vt100 hands back to us as it reads a program's output: questions
-/// the program asks its terminal, and the title it gives it.
-#[derive(Default)]
-struct Callbacks {
-    /// Answers to send back: where the cursor is, and what kind of terminal
-    /// this is. Viewers only draw, so the answers come from here, whether
-    /// anyone's watching or not.
-    replies: Vec<u8>,
-    /// Agents put a spinner here while they work.
-    title: String,
-}
-
-impl vt100::Callbacks for Callbacks {
-    fn set_window_title(&mut self, _: &mut vt100::Screen, title: &[u8]) {
-        self.title = String::from_utf8_lossy(title).into_owned();
-    }
-
-    fn unhandled_csi(
-        &mut self,
-        screen: &mut vt100::Screen,
-        i1: Option<u8>,
-        _i2: Option<u8>,
-        params: &[&[u16]],
-        c: char,
-    ) {
-        let param = params.first().and_then(|param| param.first()).copied();
-        match (i1, c, param.unwrap_or(0)) {
-            // Device status.
-            (None, 'n', 5) => self.replies.extend_from_slice(b"\x1b[0n"),
-            // Cursor position, 1-based.
-            (None, 'n', 6) => {
-                let (row, col) = screen.cursor_position();
-                let _ = write!(self.replies, "\x1b[{};{}R", row + 1, col + 1);
-            }
-            // Primary device attributes: a VT100 with advanced video.
-            (None, 'c', 0) => self.replies.extend_from_slice(b"\x1b[?1;2c"),
-            // Secondary device attributes.
-            (Some(b'>'), 'c', 0) => self.replies.extend_from_slice(b"\x1b[>0;0;0c"),
-            _ => {}
-        }
+        screen.vt.take_replies()
     }
 }
 

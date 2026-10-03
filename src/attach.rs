@@ -8,9 +8,13 @@
 use crate::client;
 use crate::env;
 use crate::protocol::{Request, Response, State};
+use crate::tui::screen_widget::ScreenWidget;
 use crate::viewer::{Output, Viewer};
+use crate::vt;
 use anyhow::{Result, bail};
 use crossterm::terminal;
+use ratatui::Terminal;
+use ratatui::backend::CrosstermBackend;
 use std::fs::File;
 use std::io::{self, ErrorKind, IsTerminal, Read, Write};
 use std::os::fd::{AsFd, AsRawFd};
@@ -20,17 +24,21 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-/// Ctrl+\, the key that hands your terminal back.
+/// Ctrl+\, the key that hands your terminal back, the old way. In the
+/// Kitty keyboard protocol it's an escape: see [`detach_key`].
 const DETACH_KEY: u8 = 0x1c;
+
+/// Ctrl+\'s key in the Kitty keyboard protocol: the backslash.
+const BACKSLASH: u32 = 92;
 
 /// How long the input loop waits on the keyboard before it checks the
 /// terminal's size and whether the session is still there.
 const TICK: Duration = Duration::from_millis(50);
 
-/// Puts back every mode a session may have turned on, then leaves the
-/// alternate screen.
-const RESET: &[u8] = b"\x1b[0m\x1b[?25h\x1b[?1l\x1b>\x1b[?2004l\
-\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1049l";
+/// Puts back every mode a session may have turned on, pops the Kitty
+/// keyboard flags the attach pushed, then leaves the alternate screen.
+const RESET: &[u8] = b"\x1b[<u\x1b[0m\x1b[?25h\x1b[?1l\x1b>\x1b[?2004l\x1b[?1004l\
+\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1016l\x1b[?1049l";
 
 pub fn run(socket: &Path, name: Option<&str>) -> Result<()> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
@@ -48,11 +56,11 @@ pub fn run(socket: &Path, name: Option<&str>) -> Result<()> {
     if !viewer.running {
         // Nothing more is coming: show how it ended, without taking over
         // the terminal.
-        let mut screen = vt100::Parser::new(rows, cols, 0);
+        let mut screen = vt::Screen::new(rows, cols);
         for chunk in output {
             screen.process(&chunk);
         }
-        print_screen(screen.screen())?;
+        print_screen(&screen)?;
         println!("{}", ending(socket, &name));
         return Ok(());
     }
@@ -72,17 +80,16 @@ pub fn run(socket: &Path, name: Option<&str>) -> Result<()> {
 /// Draws the session and sends it the keyboard until the user detaches
 /// (`true`) or the session goes (`false`).
 fn relay(viewer: Viewer, output: Output, rows: u16, cols: u16) -> Result<bool> {
-    let screen = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 0)));
+    let drawn = Arc::new(Mutex::new(Drawn::new(rows, cols)?));
     let gone = Arc::new(AtomicBool::new(false));
     let drawer = thread::spawn({
-        let screen = screen.clone();
+        let drawn = drawn.clone();
         let gone = gone.clone();
         move || {
             for chunk in output {
-                let mut screen = screen.lock().unwrap();
-                let before = screen.screen().clone();
-                screen.process(&chunk);
-                if draw(&screen.screen().state_diff(&before)).is_err() {
+                let mut drawn = drawn.lock().unwrap();
+                drawn.screen.process(&chunk);
+                if drawn.draw().is_err() {
                     break;
                 }
             }
@@ -101,7 +108,7 @@ fn relay(viewer: Viewer, output: Output, rows: u16, cols: u16) -> Result<bool> {
         }
         if readable(&keyboard, TICK)? {
             let n = (&keyboard).read(&mut buf)?;
-            let detach = buf[..n].iter().position(|&byte| byte == DETACH_KEY);
+            let detach = detach_key(&buf[..n]);
             let keys = &buf[..detach.unwrap_or(n)];
             if !keys.is_empty() {
                 let _ = viewer.send_keys(keys);
@@ -114,9 +121,9 @@ fn relay(viewer: Viewer, output: Output, rows: u16, cols: u16) -> Result<bool> {
         if (rows, cols) != size {
             size = (rows, cols);
             let _ = viewer.resize(rows, cols);
-            let mut screen = screen.lock().unwrap();
-            screen.screen_mut().set_size(rows, cols);
-            draw(&screen.screen().state_formatted())?;
+            let mut drawn = drawn.lock().unwrap();
+            drawn.screen.resize(rows, cols);
+            drawn.draw()?;
         }
     };
     // Hanging up ends the drawer's output, and the drawer must be done
@@ -147,20 +154,95 @@ fn ending(socket: &Path, name: &str) -> String {
 }
 
 /// The screen's rows down to its last non-blank one, in their colors.
-fn print_screen(screen: &vt100::Screen) -> io::Result<()> {
-    let (_, cols) = screen.size();
-    let used = screen
-        .rows(0, cols)
-        .enumerate()
-        .filter(|(_, row)| !row.trim().is_empty())
-        .last()
-        .map_or(0, |(last, _)| last + 1);
+fn print_screen(screen: &vt::Screen) -> io::Result<()> {
+    let printed = screen.styled();
     let mut out = io::stdout().lock();
-    for row in screen.rows_formatted(0, cols).take(used) {
-        out.write_all(&row)?;
+    if !printed.is_empty() {
+        out.write_all(printed.as_bytes())?;
         out.write_all(b"\x1b[0m\n")?;
     }
     out.flush()
+}
+
+/// Where the first Ctrl+\ in `keys` starts, the old way or as the Kitty
+/// keyboard protocol writes it: `CSI 92 ; 5 u`, with any alternate keys,
+/// Caps Lock or Num Lock, and maybe saying it's a press. The keys before
+/// it go to the session.
+fn detach_key(keys: &[u8]) -> Option<usize> {
+    (0..keys.len()).find(|&at| keys[at] == DETACH_KEY || kitty_detach_key(&keys[at..]))
+}
+
+/// Whether `keys` starts with Ctrl+\ pressed, in the Kitty protocol.
+fn kitty_detach_key(keys: &[u8]) -> bool {
+    let Some(rest) = keys.strip_prefix(b"\x1b[") else {
+        return false;
+    };
+    let Some(end) = rest
+        .iter()
+        .position(|byte| !matches!(byte, b'0'..=b'9' | b';' | b':'))
+    else {
+        return false;
+    };
+    if rest[end] != b'u' {
+        return false;
+    }
+    let params = String::from_utf8_lossy(&rest[..end]);
+    let mut params = params.split(';');
+    let number = |field: Option<&str>, at: usize, default: u32| {
+        field
+            .unwrap_or("")
+            .split(':')
+            .nth(at)
+            .filter(|number| !number.is_empty())
+            .map_or(Some(default), |number| number.parse().ok())
+    };
+    let key = params.next();
+    let modifiers = params.next();
+    // Modifiers are written one more than their bits: 4 is Ctrl, and Caps
+    // Lock (64) and Num Lock (128) don't count. A press is 1.
+    let ctrl = number(modifiers, 0, 1)
+        .and_then(|held| held.checked_sub(1))
+        .is_some_and(|bits| bits & !(64 | 128) == 4);
+    let press = number(modifiers, 1, 1) == Some(1);
+    number(key, 0, 0) == Some(BACKSLASH) && ctrl && press
+}
+
+/// The session's screen, and your terminal, which it's drawn on: ratatui
+/// keeps what it drew last, and writes only the cells that changed.
+struct Drawn {
+    screen: vt::Screen,
+    terminal: Terminal<CrosstermBackend<io::Stdout>>,
+    /// What your terminal has been asked to send: what the session's
+    /// program asked for, as of the last draw. Your keys go to it as they
+    /// come, so your terminal has to write them its way.
+    modes: vt::InputModes,
+}
+
+impl Drawn {
+    fn new(rows: u16, cols: u16) -> io::Result<Drawn> {
+        Ok(Drawn {
+            screen: vt::Screen::new(rows, cols),
+            terminal: Terminal::new(CrosstermBackend::new(io::stdout()))?,
+            modes: vt::InputModes::default(),
+        })
+    }
+
+    fn draw(&mut self) -> io::Result<()> {
+        let screen = &self.screen;
+        self.terminal.draw(|frame| {
+            frame.render_widget(ScreenWidget::new(screen), frame.area());
+            if let Some((row, col)) = screen.cursor() {
+                frame.set_cursor_position((col, row));
+            }
+        })?;
+        let modes = self.screen.input_modes();
+        let changes = modes.changes_from(&self.modes);
+        if !changes.is_empty() {
+            draw(&changes)?;
+            self.modes = modes;
+        }
+        Ok(())
+    }
 }
 
 fn draw(bytes: &[u8]) -> io::Result<()> {
@@ -195,7 +277,9 @@ impl RawTerminal {
     fn enter() -> Result<RawTerminal> {
         terminal::enable_raw_mode()?;
         let raw = RawTerminal;
-        draw(b"\x1b[?1049h\x1b[H\x1b[2J")?;
+        // An entry of the attach's own on the terminal's stack of Kitty
+        // keyboard flags, for the session's flags to go in.
+        draw(b"\x1b[?1049h\x1b[H\x1b[2J\x1b[>0u")?;
         Ok(raw)
     }
 }
@@ -204,5 +288,46 @@ impl Drop for RawTerminal {
     fn drop(&mut self) {
         let _ = draw(RESET);
         let _ = terminal::disable_raw_mode();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ctrl_backslash_detaches_the_old_way() {
+        assert_eq!(detach_key(b"ls\x1c"), Some(2));
+        assert_eq!(detach_key(b"ls\r"), None);
+    }
+
+    #[test]
+    fn ctrl_backslash_detaches_in_the_kitty_protocol() {
+        assert_eq!(detach_key(b"a\x1b[92;5u"), Some(1));
+        // A press said so, alternate keys, and Caps Lock on.
+        assert_eq!(detach_key(b"\x1b[92;5:1u"), Some(0));
+        assert_eq!(detach_key(b"\x1b[92:124;5u"), Some(0));
+        assert_eq!(detach_key(b"\x1b[92;69u"), Some(0));
+    }
+
+    #[test]
+    fn other_keys_in_the_kitty_protocol_dont_detach() {
+        // Its release, Ctrl+Shift+\, a plain backslash, Ctrl+], Shift+Enter.
+        for keys in [
+            &b"\x1b[92;5:3u"[..],
+            b"\x1b[92;6u",
+            b"\x1b[92u",
+            b"\x1b[93;5u",
+            b"\x1b[13;2u",
+            b"\x1b[92;5",
+            b"\x1b[92;0u",
+        ] {
+            assert_eq!(
+                detach_key(keys),
+                None,
+                "{:?}",
+                String::from_utf8_lossy(keys)
+            );
+        }
     }
 }
