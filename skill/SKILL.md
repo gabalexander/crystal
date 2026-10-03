@@ -16,7 +16,8 @@ crystal new -d -n fixer -w fix/login claude "Fix the login redirect bug"
 ```
 
 - `-d` starts it in the background and prints its name. Always pass it: without it, crystal attaches.
-- `-n` names it. Without it the name is the program's, with `-2`, `-3` added if taken.
+- `-n` names it. Without it the name comes from its prompt, like `review-diff-branch`, or else is the
+  program's, with `-2`, `-3` added if taken. Use the name `-d` prints.
 - `-w <branch>` starts it in a new git worktree, `<repo>.worktrees/<branch>`, making the branch if it
   doesn't exist. Use it when the agent will edit files, so it doesn't collide with you.
 - Words after `claude` are its first prompt. Quote them as one argument.

@@ -1845,10 +1845,20 @@ impl App {
     /// worktree, the selection goes to the row that worktree is left with;
     /// otherwise to the next session in the tab, or the last.
     pub fn set_sessions(&mut self, sessions: Vec<SessionInfo>) {
+        // A session renamed from elsewhere, by `crystal rename` or from its
+        // first prompt, keeps its tab, its pane and the selection.
+        for now in &sessions {
+            let was = self.sessions.iter().find(|was| was.id == now.id);
+            if let Some(was) = was.filter(|was| was.name != now.name) {
+                self.tabs.renamed(&was.name, &now.name);
+            }
+        }
         let before = self.sessions.get(self.selected).cloned();
         let on_a_session = self.on_worktree.is_none();
         self.sessions = groups::order(sessions, self.shown_flows());
-        let still_there = before.as_ref().and_then(|s| self.position(&s.name));
+        let still_there = before
+            .as_ref()
+            .and_then(|s| self.sessions.iter().position(|now| now.id == s.id));
         if let Some(index) = still_there {
             self.selected = index;
         }
@@ -4109,6 +4119,7 @@ mod tests {
             changed: 0,
             task: None,
             asking: None,
+            reporter: None,
         }
     }
 
@@ -4736,6 +4747,17 @@ mod tests {
         app.renamed("a", "c");
         app.set_sessions(vec![session("c"), session("b")]);
         assert_eq!(app.splits(), ["c"]);
+    }
+
+    #[test]
+    fn a_session_renamed_elsewhere_keeps_its_split_and_the_selection() {
+        let mut app = app_with(&["a", "b"]);
+        press(&mut app, KeyCode::Char('s'));
+        let mut renamed = session("fix-login");
+        renamed.id = "a".into();
+        app.set_sessions(vec![renamed, session("b")]);
+        assert_eq!(app.splits(), ["fix-login"]);
+        assert_eq!(selected_name(&app), Some("fix-login"));
     }
 
     #[test]
@@ -6223,6 +6245,17 @@ mod tests {
         let mut app = app_with_a_second_tab(&["a"]);
         app.renamed("a", "z");
         app.set_sessions(["z", "shell"].map(session).to_vec());
+        assert_eq!(in_sidebar(&app), ["shell"]);
+        press(&mut app, KeyCode::Char('1'));
+        assert_eq!(in_sidebar(&app), ["z"]);
+    }
+
+    #[test]
+    fn a_session_renamed_elsewhere_stays_in_its_tab() {
+        let mut app = app_with_a_second_tab(&["a"]);
+        let mut renamed = session("z");
+        renamed.id = "a".into();
+        app.set_sessions(vec![renamed, session("shell")]);
         assert_eq!(in_sidebar(&app), ["shell"]);
         press(&mut app, KeyCode::Char('1'));
         assert_eq!(in_sidebar(&app), ["z"]);

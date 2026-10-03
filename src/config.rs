@@ -27,6 +27,12 @@ pub struct Config {
     /// started from it: an agent's program, like `codex`, maybe with
     /// arguments for it, like `codex --full-auto`.
     pub new_session: String,
+    /// Name a session crystal would name after its program from the first
+    /// thing it's asked instead: see [`crate::names::from_prompt`].
+    pub name_from_prompt: bool,
+    /// After a restart, start an agent that said how to resume it, with
+    /// `crystal report`, with that command: see [`crate::report`].
+    pub resume_reported_agents: bool,
     /// The TUI's colors.
     pub theme: ThemeName,
     /// Which plugins are on and off, by name: crystal's own, which are on
@@ -142,6 +148,8 @@ impl Default for Config {
             notify: true,
             notify_command: None,
             new_session: "claude".to_string(),
+            name_from_prompt: true,
+            resume_reported_agents: true,
             theme: ThemeName::Dark,
             plugins: BTreeMap::new(),
             memory: MemorySettings::default(),
@@ -582,6 +590,8 @@ back_to = "build"
             notify: false,
             notify_command: Some("say \"$CRYSTAL_NOTICE\"".into()),
             new_session: "codex --model o3".into(),
+            name_from_prompt: false,
+            resume_reported_agents: false,
             theme: ThemeName::Terminal,
             plugins: BTreeMap::from([("memory".to_string(), false)]),
             memory: MemorySettings {

@@ -16,18 +16,21 @@ use crate::event_log::{self, Bus, Subscription};
 use crate::events::{Event, Filter, Kind, Since};
 use crate::flow_run::{self, Ended, FlowRun, Next, Place, RunState, StepState};
 use crate::flows;
+use crate::front;
 use crate::git;
 use crate::handoff;
 use crate::mcp;
 use crate::memory::{self, Added};
+use crate::names;
 use crate::notify::{self, Notice};
 use crate::plugin_hooks;
 use crate::project;
 use crate::protocol::{
-    self, Activity, AgentEvent, Artifact, ArtifactKind, Backlog, Conversation, Frame, NewSession,
-    NewTask, PendingTask, Request, Response, SessionInfo, State, TaskInfo, TaskOutcome, TaskRecord,
-    TaskSpec, TaskStart, TaskState, TaskView,
+    self, Activity, AgentEvent, Artifact, ArtifactKind, Backlog, Conversation, Frame, Front,
+    NewSession, NewTask, PendingTask, Request, Response, SessionInfo, State, TaskInfo, TaskOutcome,
+    TaskRecord, TaskSpec, TaskStart, TaskState, TaskView,
 };
+use crate::report;
 use crate::session::{Change, STOP_GRACE, Session, Term};
 use crate::skill;
 use crate::socket;
@@ -277,7 +280,13 @@ impl Daemon {
                         task: goal.as_ref().map(|goal| goal.goal.clone()),
                         backlog,
                     };
-                    start(&mut sessions, &self.socket, new, saved.conversation)
+                    start(
+                        &mut sessions,
+                        &self.socket,
+                        new,
+                        saved.conversation,
+                        saved.resume,
+                    )
                 }
             };
             match started {
@@ -511,7 +520,7 @@ impl Daemon {
                 task: Some(asked),
                 backlog: None,
             };
-            start(sessions, &self.socket, new, None)?
+            start(sessions, &self.socket, new, None, None)?
         } else {
             let task = NewTask {
                 name: Some(name),
@@ -1027,12 +1036,48 @@ impl Daemon {
 
     /// The terminal of the session called `name`, to type into, which
     /// only makes sense while its program runs. The sessions are let go
-    /// before any typing, which takes a moment.
+    /// before any typing, which takes a moment. A session typed into by
+    /// its name keeps that name: whoever types knows it by it.
     fn running_term(&self, name: &str) -> Result<Arc<Term>> {
         let mut sessions = self.sessions.lock().unwrap();
         let session = named(&mut sessions, name)?;
         ensure!(session.is_running(), "{name} has ended");
+        session.keep_name();
         Ok(session.term())
+    }
+
+    /// Names the session with id `id` from `prompt`, the first it was sent,
+    /// when crystal named it after its program and the config says to.
+    fn name_from_prompt(&self, sessions: &mut [Session], id: &str, prompt: &str) {
+        let Some(index) = sessions.iter().position(|session| session.id == id) else {
+            return;
+        };
+        if !sessions[index].is_named_after_program() || !settings().name_from_prompt {
+            return;
+        }
+        // A prompt with nothing to name it by leaves it for the next.
+        let Some(base) = names::from_prompt(prompt) else {
+            return;
+        };
+        let taken = |name: &str| sessions.iter().any(|session| session.name == name);
+        let new_name = unique_name(&base, taken);
+        let session = &mut sessions[index];
+        let old_name = std::mem::replace(&mut session.name, new_name);
+        session.keep_name();
+        self.tell_renamed(session, &old_name);
+    }
+
+    /// Tells that `session` was called `from` until now, and keeps a flow's
+    /// step to it under its new name.
+    fn tell_renamed(&self, session: &Session, from: &str) {
+        self.events.emit(Event::renamed(&session.info(), from));
+        for run in self.flows.lock().unwrap().iter_mut() {
+            for step in &mut run.steps {
+                if step.session.as_deref() == Some(from) {
+                    step.session = Some(session.name.clone());
+                }
+            }
+        }
     }
 
     fn handle(&self, request: Request) -> Result<Response> {
@@ -1062,12 +1107,17 @@ impl Daemon {
                 id,
                 event,
                 conversation,
+                prompt,
             } => {
                 let mut sessions = self.sessions.lock().unwrap();
-                let session = match id {
-                    Some(id) => with_id(&mut sessions, &id)?,
-                    None => named(&mut sessions, &name)?,
+                let id = match id {
+                    Some(id) => id,
+                    None => named(&mut sessions, &name)?.id.clone(),
                 };
+                if let Some(prompt) = prompt {
+                    self.name_from_prompt(&mut sessions, &id, &prompt);
+                }
+                let session = with_id(&mut sessions, &id)?;
                 if let Some(conversation) = conversation {
                     session.set_conversation(conversation);
                 }
@@ -1081,7 +1131,28 @@ impl Daemon {
                         text: tasks::REMINDER.to_string(),
                     });
                 }
-                session.on_agent_event(event);
+                // An agent that reports for itself holds the session's
+                // status: what hooks say counts again once it lets go.
+                if !session.is_claimed() {
+                    session.on_agent_event(event);
+                }
+                self.tell_changes(session);
+                Ok(Response::Done)
+            }
+            Request::ReportAgent { id, name, report } => {
+                let mut sessions = self.sessions.lock().unwrap();
+                let session = match (id, name) {
+                    (Some(id), _) => with_id(&mut sessions, &id)?,
+                    (None, Some(name)) => named(&mut sessions, &name)?,
+                    (None, None) => bail!("say which session the report is about"),
+                };
+                ensure!(
+                    !session.is_task(),
+                    "{} is a background task, which says what it's doing itself",
+                    session.name
+                );
+                ensure!(session.is_running(), "{} has ended", session.name);
+                session.take_report(report)?;
                 self.tell_changes(session);
                 Ok(Response::Done)
             }
@@ -1123,16 +1194,9 @@ impl Daemon {
                 }
                 let session = named(&mut sessions, &name)?;
                 session.name = new_name.clone();
+                session.keep_name();
                 if new_name != name {
-                    self.events.emit(Event::renamed(&session.info(), &name));
-                }
-                // A flow's step keeps to its session under the new name.
-                for run in self.flows.lock().unwrap().iter_mut() {
-                    for step in &mut run.steps {
-                        if step.session.as_ref() == Some(&name) {
-                            step.session = Some(new_name.clone());
-                        }
-                    }
+                    self.tell_renamed(session, &name);
                 }
                 Ok(Response::Done)
             }
@@ -1583,7 +1647,7 @@ impl Daemon {
                     task: Some(goal),
                     backlog,
                 };
-                start(&mut sessions, &self.socket, new, None)
+                start(&mut sessions, &self.socket, new, None, None)
             }
             TaskStart::Background { args } => {
                 let new = NewTask {
@@ -1609,7 +1673,7 @@ impl Daemon {
 
     fn new_session(&self, new: NewSession) -> Result<Response> {
         let mut sessions = self.sessions.lock().unwrap();
-        let name = start(&mut sessions, &self.socket, new, None)?;
+        let name = start(&mut sessions, &self.socket, new, None, None)?;
         Ok(self.started(&mut sessions, name, Kind::TaskOpened))
     }
 
@@ -1661,6 +1725,8 @@ impl Daemon {
                 Change::Asking(asking) => Some(Event::asking(&info, asking)),
                 Change::Reopened => task(Kind::TaskOpened),
                 Change::TaskWaiting => task(Kind::TaskWaiting),
+                Change::Claimed => Some(Event::about_session(Kind::SessionClaimed, &info)),
+                Change::Released { agent } => Some(Event::released(&info, &agent)),
             };
             if let Some(event) = event {
                 self.events.emit(event);
@@ -1765,7 +1831,13 @@ impl Daemon {
                     task: launch.goal.as_ref().map(|goal| goal.goal.clone()),
                     backlog,
                 };
-                start(&mut sessions, &self.socket, new, launch.conversation)
+                start(
+                    &mut sessions,
+                    &self.socket,
+                    new,
+                    launch.conversation,
+                    launch.resume,
+                )
             }
         };
         if let Err(err) = started {
@@ -1951,12 +2023,14 @@ struct Found {
 }
 
 /// Starts a session and adds it to `sessions`. Given a `conversation`, an
-/// agent that can pick one up starts back in it.
+/// agent that can pick one up starts back in it; given a `resume_command`,
+/// the command an agent said resumes it, it's resumed with that instead.
 fn start(
     sessions: &mut Vec<Session>,
     socket: &Path,
     new: NewSession,
     conversation: Option<Conversation>,
+    resume_command: Option<Vec<String>>,
 ) -> Result<String> {
     let NewSession {
         name,
@@ -1973,22 +2047,43 @@ fn start(
         exists(program, &cwd, env.get("PATH")),
         "command not found: {program}"
     );
+    let config = settings();
+    // Not given a name, a session is named for what it's asked to do, or
+    // else after its program, until its first prompt names it.
+    let from_prompt = task
+        .as_deref()
+        .filter(|_| config.name_from_prompt)
+        .and_then(names::from_prompt);
+    let named_after_program = name.is_none() && from_prompt.is_none();
     let taken = |name: &str| sessions.iter().any(|session| session.name == name);
     let name = match name {
         Some(name) => {
             check_name(&name, taken)?;
             name
         }
-        None => unique_name(program, taken),
+        None => unique_name(from_prompt.as_deref().unwrap_or(program), taken),
     };
 
     let id = new_id();
     let rollouts = codex::Rollouts::for_session(&command, &cwd, &env);
+    // An agent that said how to resume it comes back with that command:
+    // typed into the session's shell, or else run in place of its command.
+    // It says what it's doing again once it's up.
+    let resume_command = resume_command.filter(|argv| resumable(argv, &name, &config, &cwd, &env));
+    let at_a_shell = matches!(front::of_command(&command), Some(Front::Shell { .. }));
+    let resumed = resume_command.is_some();
+    let (asked, typed) = match resume_command {
+        Some(argv) if at_a_shell => (command.clone(), Some(report::typed(&argv))),
+        Some(argv) => (argv, None),
+        None => (command.clone(), None),
+    };
     let env = env::for_session(&env, &name, &id, socket);
     let crystal = std::env::current_exe()?;
     // A conversation that can't be picked up any more is left behind: the
     // agent starts a new one, which its hooks or its rollout will name.
-    let conversation = conversation.filter(Conversation::can_resume);
+    let conversation = conversation
+        .filter(|_| !resumed)
+        .filter(Conversation::can_resume);
     let resume = conversation
         .as_ref()
         .map(|conversation| conversation.id.as_str());
@@ -1997,7 +2092,6 @@ fn start(
     let given_task = task.clone();
     // With tasks off, a session started with something to do is just a
     // session.
-    let config = settings();
     let task = task.filter(|_| tasks::enabled(&config));
     let about_task = task
         .as_ref()
@@ -2009,17 +2103,31 @@ fn start(
         remembered.as_deref(),
     ];
     let handoff = handoff_note(&cwd, &said);
-    let instructions = notes(about_task, handoff, remembered);
+    // Picked up again with its own command, its conversation has heard
+    // crystal's notes already.
+    let instructions = if resumed {
+        Vec::new()
+    } else {
+        notes(about_task, handoff, remembered)
+    };
     let argv = agents::argv(
-        &command,
+        &asked,
         &crystal,
         resume,
         given_task.as_deref(),
         &instructions,
     );
-    let argv = agents::with_options(argv, &memory_tools(socket, &cwd, &command, &crystal));
+    let argv = agents::with_options(argv, &memory_tools(socket, &cwd, &asked, &crystal));
     let argv = codex::with_instructions(argv, &instructions, codex::home(&env).as_deref());
     let mut session = Session::spawn(id, name.clone(), command, &argv, cwd, &env)?;
+    if let Some(typed) = typed
+        && let Err(err) = session.term().write(&typed)
+    {
+        eprintln!("crystal daemon: couldn't resume {name}'s agent: {err:#}");
+    }
+    if named_after_program {
+        session.mark_named_after_program();
+    }
     if let Some(goal) = task {
         session.give_task(new_task_info(goal, false, backlog));
     }
@@ -2033,6 +2141,26 @@ fn start(
     }
     sessions.push(session);
     Ok(name)
+}
+
+/// Whether the session called `name` can be resumed with `argv`, the
+/// command its agent gave, run from `cwd` in the environment `env`: the
+/// config says to, and the command is there.
+fn resumable(
+    argv: &[String],
+    name: &str,
+    config: &Config,
+    cwd: &Path,
+    env: &BTreeMap<String, String>,
+) -> bool {
+    let Some(program) = argv.first().filter(|_| config.resume_reported_agents) else {
+        return false;
+    };
+    let found = exists(program, cwd, env.get("PATH"));
+    if !found {
+        eprintln!("crystal daemon: couldn't resume {name}'s agent: command not found: {program}");
+    }
+    found
 }
 
 /// What crystal tells an agent on top of what it was asked, a paragraph
@@ -2187,7 +2315,13 @@ fn start_task(
             check_name(&name, taken)?;
             name
         }
-        None => unique_name("task", taken),
+        None => {
+            let from_prompt = settings()
+                .name_from_prompt
+                .then_some(spec.prompt.as_str())
+                .and_then(names::from_prompt);
+            unique_name(from_prompt.as_deref().unwrap_or("task"), taken)
+        }
     };
 
     let id = new_id();

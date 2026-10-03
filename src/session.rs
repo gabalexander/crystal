@@ -11,9 +11,10 @@ use crate::git::Checkout;
 use crate::keys;
 use crate::notify::{self, Notice};
 use crate::protocol::{
-    Activity, AgentEvent, Answer, Asking, Conversation, Front, SessionInfo, State, TaskInfo,
-    TaskOutcome, TaskRecord, TaskResult, TaskSpec, TaskState, TaskView,
+    Activity, AgentEvent, AgentReport, Answer, Asking, Conversation, Front, Reporter, SessionInfo,
+    State, TaskInfo, TaskOutcome, TaskRecord, TaskResult, TaskSpec, TaskState, TaskView,
 };
+use crate::report;
 use crate::spending::Spending;
 use crate::state::SavedSession;
 use crate::task::Task;
@@ -89,6 +90,17 @@ pub struct Session {
     /// Whether its agent has been reminded that its task is still open,
     /// which it is once.
     reminded: bool,
+    /// The agent that says what it's doing itself, with `crystal report`,
+    /// while it holds the session: its reports are the session's status,
+    /// and crystal reads neither the screen nor hooks for it.
+    reporter: Option<Reporter>,
+    /// The job that was in front in the terminal as that agent took the
+    /// session over: the agent's own. A shell in front with another job is
+    /// the agent gone.
+    reporter_job: Option<i32>,
+    /// Whether crystal named the session after its program, and nothing
+    /// has named it since: its first prompt can, then.
+    named_after_program: bool,
     /// Tasks that closed of themselves, like a background task whose run
     /// ended, for the daemon to write down.
     closed: Vec<TaskRecord>,
@@ -117,6 +129,10 @@ pub enum Change {
     /// Its agent's turn ended with its task still open: the task waits on
     /// the user.
     TaskWaiting,
+    /// An agent took the session's status over with `crystal report`.
+    Claimed,
+    /// The agent called this let go of it.
+    Released { agent: String },
 }
 
 impl Session {
@@ -191,6 +207,9 @@ impl Session {
             task: None,
             goal: None,
             reminded: false,
+            reporter: None,
+            reporter_job: None,
+            named_after_program: false,
             closed: Vec::new(),
             changes: Vec::new(),
             term,
@@ -246,6 +265,9 @@ impl Session {
             task: Some(task),
             goal: None,
             reminded: false,
+            reporter: None,
+            reporter_job: None,
+            named_after_program: false,
             closed: Vec::new(),
             changes: Vec::new(),
             term,
@@ -485,8 +507,17 @@ impl Session {
     }
 
     pub fn info(&self) -> SessionInfo {
+        // An agent that reports for itself is in front by the name it gave,
+        // whatever its process is called.
+        let front = match &self.reporter {
+            Some(reporter) => Some(Front::Agent {
+                program: reporter.agent.clone(),
+                name: reporter.agent.clone(),
+            }),
+            None => self.front.clone(),
+        };
         SessionInfo {
-            front: self.front.clone(),
+            front,
             name: self.name.clone(),
             id: self.id.clone(),
             command: self.command.clone(),
@@ -498,7 +529,117 @@ impl Session {
             changed: seconds_since_epoch(*self.changed.lock().unwrap()),
             task: self.goal.clone(),
             asking: self.task.as_ref().and_then(Task::asking),
+            reporter: self.reporter.clone(),
         }
+    }
+
+    /// Takes what the session's agent says about itself with `crystal
+    /// report`. Its first report of what it's doing takes the session's
+    /// status over; a resume command alone needs it to hold the session
+    /// already, so that a command never outlives the agent it's for.
+    pub fn take_report(&mut self, report: AgentReport) -> Result<()> {
+        match report {
+            AgentReport::State {
+                agent,
+                state,
+                message,
+                resume,
+            } => {
+                if let Some(argv) = &resume {
+                    report::check_resume(argv)?;
+                }
+                let agent = match agent {
+                    Some(agent) => report::checked_agent(agent)?,
+                    None => self.agent_name(),
+                };
+                if self.reporter.is_none() {
+                    self.changes.push(Change::Claimed);
+                    self.reporter_job = self.term.foreground_group();
+                }
+                let reporter = self.reporter.get_or_insert(Reporter {
+                    agent: agent.clone(),
+                    message: None,
+                    resume: None,
+                });
+                reporter.agent = agent;
+                reporter.message = message.filter(|message| !message.trim().is_empty());
+                if resume.is_some() {
+                    reporter.resume = resume;
+                }
+                self.on_agent_event(report::event(state, self.activity));
+            }
+            AgentReport::Resume { agent, argv } => {
+                report::check_resume(&argv)?;
+                let agent = agent.map(report::checked_agent).transpose()?;
+                let reporter = self.reporter.as_mut().with_context(|| {
+                    format!(
+                        "no agent reports for {} yet: say what it's doing along with the \
+                         command, like `crystal report idle -- <command>`",
+                        self.name
+                    )
+                })?;
+                if let Some(agent) = agent {
+                    reporter.agent = agent;
+                }
+                reporter.resume = Some(argv);
+            }
+            AgentReport::Release => self.release(),
+        }
+        Ok(())
+    }
+
+    /// The name of an agent that reports without giving one: the one it
+    /// gave before, or else what's in front in the terminal.
+    fn agent_name(&self) -> String {
+        if let Some(reporter) = &self.reporter {
+            return reporter.agent.clone();
+        }
+        let front = self
+            .front
+            .clone()
+            .or_else(|| front::of_command(&self.command));
+        front.map_or_else(|| "agent".to_string(), |front| front.word().to_string())
+    }
+
+    /// The agent that reports for itself lets go of the session: crystal
+    /// reads what it's doing for itself again, from nothing, and the
+    /// agent's command won't resume it.
+    fn release(&mut self) {
+        let Some(reporter) = self.reporter.take() else {
+            return;
+        };
+        self.reporter_job = None;
+        self.changes.push(Change::Released {
+            agent: reporter.agent,
+        });
+        self.screen_watch = ScreenWatch::default();
+        if self.activity.is_some() {
+            self.set_activity(None);
+            *self.changed.lock().unwrap() = SystemTime::now();
+        }
+    }
+
+    /// Whether an agent that reports for itself holds the session.
+    pub fn is_claimed(&self) -> bool {
+        self.reporter.is_some()
+    }
+
+    /// crystal named the session after its program: its first prompt can
+    /// name it.
+    pub fn mark_named_after_program(&mut self) {
+        self.named_after_program = true;
+    }
+
+    /// Whether the session's first prompt can name it: crystal named it
+    /// after its program, and nothing has named it since.
+    pub fn is_named_after_program(&self) -> bool {
+        self.named_after_program
+    }
+
+    /// Its name was given now, by the user or a script, or comes from its
+    /// prompt: nothing names it after this but a rename.
+    pub fn keep_name(&mut self) {
+        self.named_after_program = false;
     }
 
     /// Works out what the agent is doing from what it just reported. A
@@ -617,6 +758,8 @@ impl Session {
 
     /// Looks at what's in front in the terminal, when its job has changed
     /// or it's been a while. Cheap otherwise: one question to the terminal.
+    /// An agent that reports for itself and left without letting go of the
+    /// session lets go of it once the shell is back in front.
     pub fn check_front(&mut self) {
         if self.task.is_some() || !self.is_running() {
             return;
@@ -625,13 +768,16 @@ impl Session {
             return;
         };
         let same_job = self.front_group == Some(group);
-        if same_job && self.front_checked.elapsed() < FRONT_RECHECK {
-            return;
+        if !same_job || self.front_checked.elapsed() >= FRONT_RECHECK {
+            self.front_group = Some(group);
+            self.front_checked = Instant::now();
+            if let Some(front) = front::of_process(group) {
+                self.set_front(front);
+            }
         }
-        self.front_group = Some(group);
-        self.front_checked = Instant::now();
-        if let Some(front) = front::of_process(group) {
-            self.set_front(front);
+        let at_a_shell = matches!(self.front, Some(Front::Shell { .. }));
+        if at_a_shell && self.reporter_job != Some(group) {
+            self.release();
         }
     }
 
@@ -659,9 +805,10 @@ impl Session {
 
     /// Reads what the agent is doing off the screen, and takes it as an
     /// event when that has changed. Only while an agent is in front: a
-    /// shell or any other program can print an agent's words.
+    /// shell or any other program can print an agent's words. An agent
+    /// that reports for itself knows better than its screen.
     fn check_screen(&mut self) {
-        if !self.is_running() || !self.agent_in_front() {
+        if !self.is_running() || !self.agent_in_front() || self.is_claimed() {
             return;
         }
         let looks = self.term.looks();
@@ -743,7 +890,8 @@ impl Session {
     }
 
     /// What it takes to start the session's program again: its name,
-    /// command and directory, and the agent's conversation to pick up.
+    /// command and directory, and the agent's conversation to pick up, or
+    /// the command an agent that reports for itself resumes with.
     pub fn launch(&self) -> SavedSession {
         // A task's conversation comes from Claude's own events, which need
         // no transcript file to resume it.
@@ -761,6 +909,10 @@ impl Session {
             conversation,
             task: self.task.as_ref().map(|task| task.spec().clone()),
             goal: self.goal.clone(),
+            resume: self
+                .reporter
+                .as_ref()
+                .and_then(|reporter| reporter.resume.clone()),
         }
     }
 

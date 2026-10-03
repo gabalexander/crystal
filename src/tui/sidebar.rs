@@ -672,6 +672,7 @@ mod tests {
             changed: 0,
             task: None,
             asking: None,
+            reporter: None,
         }
     }
 

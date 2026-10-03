@@ -36,7 +36,8 @@ worktrees. The agents keep working after you close it, and you can always see wh
 - **Agents can run agents** — from the CLI or the socket, one agent can start another, send it a task, wait for
   it to finish and read what it said.
 - **Bring any agent** — Claude Code, Codex, Cursor, OpenCode, or any program that runs in a terminal, run
-  exactly as you'd run it yourself.
+  exactly as you'd run it yourself. An agent crystal doesn't know can [tell it what it's
+  doing](#teaching-crystal-about-your-agent), and how to pick its session up again.
 - **A single Rust binary** — no Electron, no browser, nothing to host. It works in the terminal you already
   have.
 
@@ -408,6 +409,14 @@ argument. `Alt+Enter` starts a new line, and a paste keeps its lines. An empty t
 prompt. `↑` on the first line and `↓` on the last bring back earlier tasks: the panel keeps the last 100, in
 crystal's database.
 
+The session is named for its task: its first few words that say what it's about, like `fix-refund-rounding`
+for "Fix the refund rounding, please", with `-2`, `-3` added if that's taken. Started with no task, it's named
+after its program, `claude`, until its first prompt names it: Claude Code tells crystal each prompt it's sent,
+and the first that has words to go on names it, a slash command never. A name you give, or rename a session
+to, stays, and so does one a script has typed into the session by with `crystal send` or `send-keys`.
+`crystal new` and `crystal task` name a session the same way when you don't, and print the name.
+`name_from_prompt = false` in the [settings](#settings) names sessions after their programs.
+
 Under the task, `Tab` and `Shift+Tab` go from row to row and `←` / `→` change a row's choice:
 
 - **run**: your [profiles](#profiles), then the agents installed on your `PATH` (Claude Code, Codex, Gemini
@@ -654,6 +663,91 @@ prompt again. The limits:
 - `codex exec` and Codex's other subcommands run as they were asked, without resuming.
 - A Codex you start yourself in a shell session gets its status from the screen, but isn't resumed.
 
+### Teaching crystal about your agent
+
+crystal knows Claude Code by its hooks, and reads Codex and the other agents it knows off their screens. Any
+other agent, or a script wrapped around one, can tell crystal what it's doing itself, and how to pick its
+session up again, with `crystal report`: no change to crystal, and no waiting for a release of it. Once your
+agent reports, its status shows in the sidebar and in `crystal ls`, the user is told when it's done with a turn
+or waits on them, `crystal wait` and the [events](#events) follow it, and, once it says how, its session comes
+back in the same conversation after crystal restarts.
+
+Every program in a session has these in its environment:
+
+| Variable | What it is |
+|---|---|
+| `CRYSTAL_SESSION` | the session's name when the program started |
+| `CRYSTAL_SESSION_ID` | the session's id, which a rename never changes |
+| `CRYSTAL_SOCKET` | the daemon's socket, which `crystal` finds it by |
+| `CRYSTAL_SERVER` | the daemon's [server](#servers), when it isn't the default one |
+
+Report only when `CRYSTAL_SESSION_ID` is set. Outside crystal there's no one to tell, and `crystal report`
+fails, saying so.
+
+#### What it's doing
+
+```sh
+crystal report working --agent my-agent         # a turn has started
+crystal report waiting -m "approve the deploy"   # it needs the user to decide; blocked says the same
+crystal report idle                              # at its prompt, ready for the next
+crystal report done                              # it finished a turn
+```
+
+Report `working` as a turn starts, `idle` when your agent is ready for input, and `waiting` when it needs the
+user; `-m` says what for, in the notification and the event log. `idle` after `working` ends a turn, the same
+as `done`: the session shows `done` until someone looks at it, and the user is told. `--agent` is the name the
+sidebar and `ls` show for it, one word; without it, it's the name given before, or what's in front in the
+session. A report is about the session it's run in; `-n <session>` names another.
+
+The first report takes the session over: from then on, its reports are the session's status, and crystal
+reads neither its screen nor Claude Code's hooks for it, until your agent lets go.
+
+#### How to resume it
+
+Put the command that picks the current session up again after `--`, with the options that session needs, so
+it comes back the same:
+
+```sh
+crystal report idle -- my-agent --resume "$SESSION_ID" --model my-model
+crystal report --session-only -- my-agent --resume "$NEW_ID"     # only the command, when the session changes
+```
+
+After crystal restarts, from a crash, a reboot or `crystal restart-server`, the session starts again in its
+directory and runs that command: typed into the session's shell when the session runs one, the way you
+started your agent, or else in place of the session's own command, which `ls` still shows. Then your agent
+says what it's doing again, as it did the first time, command and all. `crystal respawn` does the same for a
+session that ended while your agent held it. A command that breaks these rules is refused, and the report
+with it:
+
+- Its first word is a plain command name found on the `PATH`, like `my-agent`, not a path.
+- No word holds a quote (`'`) or a control character, so every shell reads it the same.
+- At most 64 words, and 8 KiB in all.
+
+`--session-only` needs your agent to hold the session already: report what it's doing first, or along with
+the command. `resume_reported_agents = false` in the [settings](#settings) starts sessions again with their
+own commands instead.
+
+#### Letting go
+
+```sh
+crystal report --release
+```
+
+When your agent quits, it lets go: crystal reads the session for itself again, and forgets the agent's name
+and command. Let go only when the user quits; an agent that swaps one session for another reports the new
+one instead. An agent that leaves without letting go is let go of once the shell is back in front, a moment
+later: a safety net, not a way to leave. That's also why a report typed at the shell's own prompt doesn't
+hold: report from your agent's process.
+
+#### Keep it out of the way
+
+- Don't let crystal hold your agent up: report with a short timeout, one report at a time, and ignore
+  failures.
+- `crystal ls --json` shows what crystal has: `reporter`, with the agent's name, its last `message` and the
+  `resume` command, and `front`, the agent by its name.
+- `crystal events -n <session>` shows each report that changed something, and `session.claimed` and
+  `session.released` as your agent takes the session over and lets go.
+
 ### Agents driving agents
 
 Every session knows how to reach its daemon, so an agent can run crystal commands too: start a second agent,
@@ -725,8 +819,10 @@ session, plus `status`, the word the STATE column shows:
 `task` is `null` for a session started with nothing to do, and otherwise holds its [task](#tasks): `id`,
 `goal`, `waiting` while it waits on you, and once it's closed, `outcome` with `failed`, `cancelled` and
 `summary`. `asking` holds the permission a [background task](#background-tasks) waits on you for, `tool` and
-`gist`, and is `null` otherwise. New fields may appear; none goes away. With no daemon running, it prints
-`[]`.
+`gist`, and is `null` otherwise. `reporter` holds an agent that [says what it's doing
+itself](#teaching-crystal-about-your-agent): its `agent` name, its last `message` and its `resume` command;
+while it's there, `front` is that agent. New fields may appear; none goes away. With no daemon running, it
+prints `[]`.
 
 #### A skill for Claude Code
 
@@ -775,14 +871,15 @@ The time is `14:03:07` today, `09-24 14:03` earlier in the year, and the date be
 
 Each line of `--json` is one event, the same JSON the log keeps and plugins get: its `seq` (1, 2, 3…, never
 going back), `at` (milliseconds since the Unix epoch), its name as `event`, the `project` it's about, the
-`session` (its `name`, `id`, `command`, `cwd`, `project`, `worktree`, `branch`, `activity`, `task` and
-`status`, as `ls` words it), and what its kind carries: `from` (a renamed session's old name, or what its agent
-was doing before), `task` (with its `id`, `pending`, `waiting` and, once closed, its `outcome` and the
-`artifacts` kept with it), `run` (`prompt`; `asking`, with its `tool` and `gist`, and the `decision`; then
-`failed`, `answer` and `cost_usd`), `flow` (`run`, `flow`, `goal`, `step`, `state`, `said`, `cost_usd`),
-`worktree`, `handoff` (the file's `path` and the `note`'s first line), `artifact` (a kept file's `kind`,
-`name`, `path` and `bytes`), `memory` (the entry), `backlog` (the item) or `plugin` (`name` and `why`). New
-fields and events may appear; none goes away. The events are listed under [plugins](#events-1).
+`session` (its `name`, `id`, `command`, `cwd`, `project`, `worktree`, `branch`, `activity`, `task`, `status`,
+as `ls` words it, and `reporter` while an agent that reports for itself holds it), and what its kind carries:
+`from` (a renamed session's old name, what its agent was doing before, or the agent that let go), `task` (with
+its `id`, `pending`, `waiting` and, once closed, its `outcome` and the `artifacts` kept with it), `run`
+(`prompt`; `asking`, with its `tool` and `gist`, and the `decision`; then `failed`, `answer` and `cost_usd`),
+`flow` (`run`, `flow`, `goal`, `step`, `state`, `said`, `cost_usd`), `worktree`, `handoff` (the file's `path`
+and the `note`'s first line), `artifact` (a kept file's `kind`, `name`, `path` and `bytes`), `memory` (the
+entry), `backlog` (the item) or `plugin` (`name` and `why`). New fields and events may appear; none goes away.
+The events are listed under [plugins](#events-1).
 
 A program can listen on the daemon's socket, as `--follow` does, with one line of JSON:
 
@@ -1398,6 +1495,8 @@ It's in `crystal ls` while it's open, and ends when its program does or when you
 | `session.idle` | a session's agent is at its prompt, its turn seen |
 | `session.ended` | a session's program ends, or the session is killed |
 | `session.removed` | a session leaves the list: killed, or its worktree removed |
+| `session.claimed` | an agent takes over saying what a session is doing, with [`crystal report`](#teaching-crystal-about-your-agent) |
+| `session.released` | it lets go: `crystal report --release`, or it left and the shell is back in front |
 | `task.opened` | a task is made: given to a session as it starts, made to start later, or opened again by a follow-up |
 | `task.started` | a task made to start later starts, in a session of its own |
 | `task.waiting` | a task's agent ends a turn with the task still open: it waits on you |
@@ -1464,6 +1563,8 @@ file and change. A setting crystal doesn't know is an error that names it, so a 
 | `notify_command` | none | a shell command to run instead of the desktop notification |
 | `new_session` | `"claude"` | what the new-session panel runs at first, until you start something from it |
 | `theme` | `"dark"` | the TUI's colors: `"dark"`, `"light"`, or `"terminal"` |
+| `name_from_prompt` | `true` | name a session you don't name for the [first thing it's asked](#starting-a-session) |
+| `resume_reported_agents` | `true` | after a restart, run the command an agent [said resumes it](#teaching-crystal-about-your-agent) |
 | `[plugins]` | | which plugins are on and off: [plugins](#plugins) |
 | `[memory]` | | how memory's [distiller](#the-distiller) runs, and whether it [searches by meaning](#search-by-meaning) |
 | `[tasks]` | | what [background tasks](#background-tasks) may spend: `max_budget_usd` each (`5`), `daily_budget_usd` all together (none) |
@@ -1486,7 +1587,9 @@ offered as a profile of its own.
 
 The daemon reads the notification settings each time it tells you something, `[plugins]` each time it
 does something a plugin adds, `[memory]` each time a task closes or a search runs, `[tasks]` each time a
-background task's run starts, `[handoff]` each time a note is written, and a flow each time one starts, so a change counts straight away; the TUI reads `new_session`, `theme`, `[plugins]`, the profiles and
+background task's run starts, `[handoff]` each time a note is written, a flow each time one starts,
+`name_from_prompt` each time it names a session and `resume_reported_agents` as it starts sessions again, so a
+change counts straight away; the TUI reads `new_session`, `theme`, `[plugins]`, the profiles and
 the flows when it starts, again when you save a profile or switch a plugin, and every half a second while the
 settings view is open.
 
@@ -1583,6 +1686,7 @@ commands talk to it over a unix socket, so closing the TUI never stops an agent.
 - [x] Tasks that close done or failed, and a backlog per project
 - [x] Plugins: crystal's own switched on and off, and your own actions, panes and hooks
 - [x] An event log, a stream of events on the socket, and waits on it
+- [x] Any agent saying what it's doing and how to resume it, and sessions named from their first prompt
 
 ## Development
 

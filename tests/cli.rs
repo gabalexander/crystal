@@ -24,8 +24,10 @@ impl Crystal {
         // A config of the test's own: the developer's can't change what
         // the test sees, and no test pops up a real notification. Memory is
         // off unless a test turns it on, so Claude's arguments stay as each
-        // test expects them.
-        crystal.configure("notify = false\n\n[plugins]\nmemory = false\n");
+        // test expects them, and so is naming a session from its prompt, so
+        // its name does.
+        crystal
+            .configure("notify = false\nname_from_prompt = false\n\n[plugins]\nmemory = false\n");
         crystal
     }
 
@@ -986,7 +988,8 @@ prompt = "Review the change."
     tui.shows("A second pair of eyes");
     tui.shows("runs  claude --model opus");
     tui.type_keys("\r");
-    tui.shows("▸ claude");
+    // Named for what it was asked.
+    tui.shows("▸ refund-fix");
 
     // After the hooks and what crystal tells Claude about its task.
     let args = written(&crystal.dir.path().join("args"));
@@ -1029,7 +1032,7 @@ instructions = "Point out risks before anything else."
     tui.type_keys("tidy up\t\x1b[D");
     tui.shows("runs  claude --append-system-prompt");
     tui.type_keys("\r");
-    tui.shows("▸ claude");
+    tui.shows("▸ tidy");
 
     // One argument a line: the instructions start the one after the option.
     let args = written(&crystal.dir.path().join("args"));
@@ -1896,7 +1899,8 @@ impl Crystal {
     fn saved(&self) -> String {
         let list = "SELECT json_group_array(json_object('name', name, 'command', json(command), \
                     'cwd', cwd, 'conversation', json(conversation), 'task', json(task), \
-                    'goal', json(goal))) FROM (SELECT * FROM sessions ORDER BY position)";
+                    'goal', json(goal), 'resume', json(resume))) \
+                    FROM (SELECT * FROM sessions ORDER BY position)";
         let json = self.query(list).unwrap_or_default();
         if json == "[]" { String::new() } else { json }
     }
@@ -8800,4 +8804,287 @@ command = ["sh", "hook.sh"]
     let event: serde_json::Value = serde_json::from_str(json.trim()).unwrap();
     assert_eq!(event["backlog"]["text"], "Retry the webhook");
     assert!(event["seq"].as_u64().unwrap() > 0);
+}
+
+/// A stand-in for an agent crystal doesn't know, `pi`, that says what it's
+/// doing itself with `crystal report`: working as it starts, then a stage
+/// at a time, as the test makes each stage's file in its directory, idle
+/// with the command that resumes it, waiting on the user, and letting go of
+/// its session. A `quit` file has it quit at once, without letting go. It
+/// writes down the arguments it was started with. Returns the directory to
+/// put on the PATH.
+fn fake_reporting_agent(dir: &Path) -> PathBuf {
+    let bin = dir.join("pi-bin");
+    std::fs::create_dir(&bin).unwrap();
+    let body = format!(
+        r#"
+crystal='{CRYSTAL}'
+wait_for() {{
+    while [ ! -e "$1" ]; do [ -e quit ] && exit 0; sleep 0.05; done
+}}
+printf '%s\n' "$@" > pi-args.new && mv pi-args.new pi-args
+"$crystal" report working --agent pi
+wait_for rest; "$crystal" report idle -- pi --resume 's 1'
+wait_for ask; "$crystal" report waiting -m 'approve the deploy'
+wait_for leave; "$crystal" report --release
+wait_for quit
+"#
+    );
+    script(&bin.join("pi"), &body);
+    bin
+}
+
+impl Crystal {
+    /// Makes the file that moves [`fake_reporting_agent`] on to `stage`.
+    fn stage(&self, stage: &str) {
+        std::fs::write(self.dir.path().join(stage), "").unwrap();
+    }
+
+    /// The session called `name`, as `ls --json` lists it.
+    fn listed(&self, name: &str) -> serde_json::Value {
+        let listed: Vec<serde_json::Value> =
+            serde_json::from_str(&self.ok(&["ls", "--json"])).unwrap();
+        let found = listed.into_iter().find(|session| session["name"] == name);
+        found.unwrap_or_else(|| panic!("there's no session called {name}"))
+    }
+}
+
+#[test]
+fn an_agent_says_what_it_does_and_holds_its_session_until_it_lets_go() {
+    let crystal = Crystal::new();
+    let bin = fake_reporting_agent(crystal.dir.path());
+    let out = crystal
+        .command(&["new", "-d", "-n", "agent", "pi"])
+        .env("PATH", path_of(&[&bin]))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let status = || crystal.row("agent").unwrap()[1].clone();
+    eventually("it says it's working", || status() == "working");
+    let listed = crystal.listed("agent");
+    assert_eq!(listed["front"]["kind"], "agent");
+    assert_eq!(listed["front"]["program"], "pi");
+
+    crystal.stage("rest");
+    eventually("it's done with its turn", || status() == "done");
+    crystal.stage("ask");
+    eventually("it waits on the user", || status() == "waiting");
+    let reporter = crystal.listed("agent")["reporter"].clone();
+    assert_eq!(reporter["agent"], "pi");
+    assert_eq!(reporter["message"], "approve the deploy");
+    assert_eq!(
+        reporter["resume"],
+        serde_json::json!(["pi", "--resume", "s 1"])
+    );
+
+    crystal.stage("leave");
+    eventually("it has let go", || status() == "running");
+    assert!(crystal.listed("agent")["reporter"].is_null());
+    let told = events(&crystal, &["-n", "agent", "-k", "session.*"]);
+    assert_eq!(
+        names(&told),
+        [
+            "session.started",
+            "session.claimed",
+            "session.working",
+            "session.done",
+            "session.waiting",
+            "session.released"
+        ]
+    );
+    let printed = crystal.ok(&["events", "-n", "agent", "-k", "session.waiting"]);
+    assert!(
+        printed.contains("done → waiting: approve the deploy"),
+        "{printed}"
+    );
+}
+
+#[test]
+fn a_report_that_cant_be_taken_says_why() {
+    let crystal = Crystal::new();
+    crystal.ok(&["new", "-d", "-n", "agent", "sleep", "30"]);
+    let report = |args: &[&str]| {
+        let mut all = vec!["report", "-n", "agent"];
+        all.extend(args);
+        crystal.fails(&all)
+    };
+    let err = report(&["--session-only", "--", "pi", "--resume", "1"]);
+    assert!(err.contains("no agent reports for agent yet"), "{err}");
+    let err = report(&["idle", "--", "/usr/local/bin/pi"]);
+    assert!(err.contains("has to start with a command's name"), "{err}");
+    let err = report(&["idle", "--", "pi", "it's"]);
+    assert!(err.contains("has a quote in it"), "{err}");
+    let err = report(&["working", "--agent", "two words"]);
+    assert!(err.contains("one word"), "{err}");
+    assert_eq!(crystal.row("agent").unwrap()[1], "running");
+
+    let out = crystal
+        .command(&["report", "working"])
+        .env_remove("CRYSTAL_SESSION_ID")
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("isn't running in a crystal session"), "{err}");
+}
+
+#[test]
+fn an_agent_comes_back_after_a_restart_with_the_command_it_said_resumes_it() {
+    let crystal = Crystal::new();
+    let bin = fake_reporting_agent(crystal.dir.path());
+    let path = path_of(&[&bin]);
+    let args = crystal.dir.path().join("pi-args");
+    crystal.stage("rest");
+    let daemon = crystal.start_daemon();
+    let out = crystal
+        .command(&["new", "-d", "-n", "agent", "pi", "--fresh"])
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(written(&args), "--fresh\n");
+    eventually("its resume command is saved", || {
+        crystal
+            .saved()
+            .contains(r#""resume":["pi","--resume","s 1"]"#)
+    });
+
+    crash(daemon);
+    std::fs::remove_file(&args).unwrap();
+    let out = crystal
+        .command(&["new", "-d", "-n", "other", "sleep", "300"])
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    // Run in place of its command, which is still the one it was started
+    // with, it says what it's doing again.
+    assert_eq!(written(&args), "--resume\ns 1\n");
+    assert_eq!(crystal.row("agent").unwrap()[7], "pi --fresh");
+    eventually("it holds its session again", || {
+        crystal.listed("agent")["reporter"]["agent"] == "pi"
+    });
+
+    // With the config saying not to, it starts as it was asked to at first.
+    crystal.configure(
+        "notify = false\nname_from_prompt = false\nresume_reported_agents = false\n\n\
+         [plugins]\nmemory = false\n",
+    );
+    std::fs::remove_file(&args).unwrap();
+    let out = crystal
+        .command(&["restart-server"])
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(written(&args), "--fresh\n");
+}
+
+#[test]
+fn an_agent_in_a_shell_is_typed_back_in_after_a_restart_and_lets_go_as_it_leaves() {
+    let crystal = Crystal::new();
+    let bin = fake_reporting_agent(crystal.dir.path());
+    let path = path_of(&[&bin]);
+    let args = crystal.dir.path().join("pi-args");
+    crystal.stage("rest");
+    let daemon = crystal.start_daemon();
+    let out = crystal
+        .command(&["new", "-d", "-n", "box", "sh"])
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    crystal.ok(&["send", "box", "pi"]);
+    eventually("its resume command is saved", || {
+        crystal
+            .saved()
+            .contains(r#""resume":["pi","--resume","s 1"]"#)
+    });
+
+    crash(daemon);
+    std::fs::remove_file(&args).unwrap();
+    let out = crystal
+        .command(&["new", "-d", "-n", "other", "sleep", "300"])
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    // The shell comes back, and has the command typed into it.
+    assert_eq!(written(&args), "--resume\ns 1\n");
+    assert_eq!(crystal.row("box").unwrap()[7], "sh");
+
+    // Gone without letting go, it lets go as the shell is back in front.
+    crystal.stage("quit");
+    eventually("the shell is back, holding no agent", || {
+        let listed = crystal.listed("box");
+        listed["reporter"].is_null() && listed["front"]["kind"] == "shell"
+    });
+}
+
+#[test]
+fn a_session_crystal_named_takes_its_name_from_its_first_prompt() {
+    let crystal = Crystal::new();
+    crystal.configure("notify = false\nname_from_prompt = true\n\n[plugins]\nmemory = false\n");
+    let bin = fake_claude(crystal.dir.path());
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let new = |args: &[&str]| {
+        let out = crystal.command(args).env("PATH", &path).output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap()
+    };
+    // Asked something as it starts, it's named for that at once.
+    let fix = ["new", "-d", "claude", "Fix the login redirect"];
+    assert_eq!(new(&fix), "fix-login-redirect\n");
+    assert_eq!(new(&fix), "fix-login-redirect-2\n");
+
+    // Asked nothing, it's named after its program until its first prompt.
+    assert_eq!(new(&["new", "-d", "claude"]), "claude\n");
+    let args = written(&crystal.dir.path().join("args"));
+    let settings: serde_json::Value = serde_json::from_str(args.lines().nth(1).unwrap()).unwrap();
+    let hook = settings["hooks"]["Stop"][0]["hooks"][0]["command"]
+        .as_str()
+        .unwrap();
+    let prompt = |session: &str, text: &str| {
+        let event = serde_json::json!({"hook_event_name": "UserPromptSubmit", "prompt": text});
+        let id = crystal.listed(session)["id"].as_str().unwrap().to_string();
+        let env = [("CRYSTAL_SESSION", session), ("CRYSTAL_SESSION_ID", &id)];
+        run_hook_with(&crystal, &env, hook, &event.to_string());
+    };
+    prompt("claude", "/clear");
+    assert!(
+        crystal.row("claude").is_some(),
+        "a slash command names nothing"
+    );
+    prompt("claude", "Review the diff on this branch");
+    assert!(crystal.row("claude").is_none());
+    assert_eq!(
+        crystal.row("review-diff-branch").unwrap()[1],
+        "working",
+        "the prompt counts as ever"
+    );
+    // Only its first.
+    prompt("review-diff-branch", "Now the tests");
+    assert!(crystal.row("review-diff-branch").is_some());
+    let renamed = events(&crystal, &["-k", "session.renamed"]);
+    assert_eq!(renamed.len(), 1);
+    assert_eq!(renamed[0]["from"], "claude");
+    assert_eq!(renamed[0]["session"]["name"], "review-diff-branch");
+
+    // A name given stays, and so does one a script has typed into the
+    // session by.
+    new(&["new", "-d", "-n", "mine", "claude"]);
+    prompt("mine", "Write the docs");
+    assert!(crystal.row("mine").is_some());
+    assert_eq!(new(&["new", "-d", "claude"]), "claude\n");
+    crystal.ok(&["send", "claude", "hello"]);
+    prompt("claude", "Write the docs");
+    assert!(crystal.row("claude").is_some());
 }

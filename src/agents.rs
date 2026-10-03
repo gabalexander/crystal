@@ -188,6 +188,15 @@ pub fn claude_conversation(input: &Value) -> Option<Conversation> {
     })
 }
 
+/// What the user asked, when a Claude Code hook's input is for a prompt
+/// they sent.
+pub fn claude_prompt(input: &Value) -> Option<String> {
+    if input["hook_event_name"] != "UserPromptSubmit" {
+        return None;
+    }
+    input["prompt"].as_str().map(String::from)
+}
+
 /// Claude's arguments without its first prompt, for a conversation that
 /// has had it already. After `--`, everything is the prompt. A command line
 /// written before crystal put it there ends in the prompt instead, but a
@@ -614,5 +623,13 @@ mod tests {
         for (input, expected) in cases {
             assert_eq!(claude_event(&input), expected, "for {input}");
         }
+    }
+
+    #[test]
+    fn only_a_prompt_sent_says_what_the_user_asked() {
+        let sent = json!({"hook_event_name": "UserPromptSubmit", "prompt": "fix the tests"});
+        assert_eq!(claude_prompt(&sent).as_deref(), Some("fix the tests"));
+        let stop = json!({"hook_event_name": "Stop", "prompt": "not one"});
+        assert_eq!(claude_prompt(&stop), None);
     }
 }

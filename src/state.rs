@@ -29,6 +29,10 @@ pub struct SavedSession {
     /// What the session's agent was asked to do, and how that went so far.
     #[serde(default)]
     pub goal: Option<TaskInfo>,
+    /// The command an agent that says what it's doing itself said picks
+    /// its session up again: see [`crate::report`].
+    #[serde(default)]
+    pub resume: Option<Vec<String>>,
 }
 
 /// The database of the daemon at `socket`. A server's socket lives in

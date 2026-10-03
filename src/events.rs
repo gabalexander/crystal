@@ -15,8 +15,8 @@ use crate::memory::{self, Entry};
 use crate::plugin_manifest;
 use crate::project;
 use crate::protocol::{
-    Activity, Answer, Artifact, ArtifactKind, Asking, BacklogItem, SessionInfo, State, TaskOutcome,
-    TaskRecord, TaskResult, TaskState,
+    Activity, Answer, Artifact, ArtifactKind, Asking, BacklogItem, Reporter, SessionInfo, State,
+    TaskOutcome, TaskRecord, TaskResult, TaskState,
 };
 use crate::shell;
 use serde::{Deserialize, Serialize};
@@ -35,6 +35,8 @@ pub enum Kind {
     SessionIdle,
     SessionEnded,
     SessionRemoved,
+    SessionClaimed,
+    SessionReleased,
     TaskOpened,
     TaskStarted,
     TaskWaiting,
@@ -62,7 +64,7 @@ pub enum Kind {
 }
 
 impl Kind {
-    pub const ALL: [Kind; 32] = [
+    pub const ALL: [Kind; 34] = [
         Kind::SessionStarted,
         Kind::SessionRenamed,
         Kind::SessionWorking,
@@ -71,6 +73,8 @@ impl Kind {
         Kind::SessionIdle,
         Kind::SessionEnded,
         Kind::SessionRemoved,
+        Kind::SessionClaimed,
+        Kind::SessionReleased,
         Kind::TaskOpened,
         Kind::TaskStarted,
         Kind::TaskWaiting,
@@ -108,6 +112,8 @@ impl Kind {
             Kind::SessionIdle => "session.idle",
             Kind::SessionEnded => "session.ended",
             Kind::SessionRemoved => "session.removed",
+            Kind::SessionClaimed => "session.claimed",
+            Kind::SessionReleased => "session.released",
             Kind::TaskOpened => "task.opened",
             Kind::TaskStarted => "task.started",
             Kind::TaskWaiting => "task.waiting",
@@ -182,8 +188,8 @@ pub struct Event {
     pub project: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<SessionAbout>,
-    /// What it was before: a renamed session's old name, or what its agent
-    /// was doing before it changed.
+    /// What it was before: a renamed session's old name, what its agent
+    /// was doing before it changed, or the agent that let go of it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -225,6 +231,10 @@ pub struct SessionAbout {
     /// The word `ls` shows for it: `waiting`, `running`, `exited 0`.
     #[serde(default)]
     pub status: String,
+    /// The agent that says what it's doing itself, while it holds the
+    /// session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reporter: Option<Reporter>,
 }
 
 /// A background task's run of `claude -p`: what it was asked as it starts,
@@ -362,6 +372,15 @@ impl Event {
         Event {
             from: Some(from.to_string()),
             ..Event::about_session(Kind::SessionRenamed, session)
+        }
+    }
+
+    /// The agent called `agent`, which said what `session` was doing
+    /// itself, let go of it.
+    pub fn released(session: &SessionInfo, agent: &str) -> Event {
+        Event {
+            from: Some(agent.to_string()),
+            ..Event::about_session(Kind::SessionReleased, session)
         }
     }
 
@@ -619,11 +638,24 @@ impl Event {
             Kind::SessionRenamed => format!("was {}", self.from.as_deref().unwrap_or("?")),
             Kind::SessionWorking | Kind::SessionWaiting | Kind::SessionDone | Kind::SessionIdle => {
                 let now = self.session.as_ref().map_or("", |session| &session.status);
-                match &self.from {
+                let changed = match &self.from {
                     Some(from) => format!("{from} → {now}"),
                     None => now.to_string(),
-                }
+                };
+                // What an agent that reports for itself says it waits for.
+                let message = self
+                    .session
+                    .as_ref()
+                    .and_then(|session| session.reporter.as_ref()?.message.as_deref())
+                    .filter(|_| self.kind == Kind::SessionWaiting);
+                format!("{changed}{}", said(message))
             }
+            Kind::SessionClaimed => self
+                .session
+                .as_ref()
+                .and_then(|session| session.reporter.as_ref())
+                .map_or(String::new(), |reporter| format!("by {}", reporter.agent)),
+            Kind::SessionReleased => format!("by {}", self.from.as_deref().unwrap_or("?")),
             Kind::SessionEnded => self
                 .session
                 .as_ref()
@@ -749,6 +781,7 @@ impl SessionAbout {
             activity: session.activity,
             task: session.task.as_ref().map(|task| task.goal.clone()),
             status: session.status(),
+            reporter: session.reporter.clone(),
         }
     }
 }
@@ -772,6 +805,7 @@ pub fn example(kind: Kind, session: Option<&SessionInfo>, dir: &Path) -> Event {
             front: None,
             task: None,
             asking: None,
+            reporter: None,
         },
     };
     let now = now_ms() / 1000;
@@ -840,6 +874,19 @@ pub fn example(kind: Kind, session: Option<&SessionInfo>, dir: &Path) -> Event {
         Kind::SessionDone => Event::activity(&session, Some(Activity::Working), Activity::Done),
         Kind::SessionIdle => Event::activity(&session, Some(Activity::Done), Activity::Idle),
         Kind::SessionEnded => Event::ended(&session, "exited 0".into()),
+        Kind::SessionClaimed => {
+            let reporter = Reporter {
+                agent: "my-agent".into(),
+                message: None,
+                resume: Some(vec!["my-agent".into(), "--resume".into(), "s1".into()]),
+            };
+            let session = SessionInfo {
+                reporter: Some(reporter),
+                ..session
+            };
+            Event::about_session(kind, &session)
+        }
+        Kind::SessionReleased => Event::released(&session, "my-agent"),
         Kind::TaskOpened | Kind::TaskStarted | Kind::TaskWaiting => {
             Event::task(kind, &session, task)
         }
@@ -1031,6 +1078,7 @@ mod tests {
             front: None,
             task: None,
             asking: None,
+            reporter: None,
         }
     }
 
@@ -1138,6 +1186,29 @@ mod tests {
             (paused.subject(), paused.text()),
             ("notes".into(), "it kept failing".into())
         );
+    }
+
+    #[test]
+    fn an_agent_that_reports_for_itself_is_named_and_says_what_it_waits_for() {
+        let info = SessionInfo {
+            reporter: Some(Reporter {
+                agent: "pi".into(),
+                message: Some("approve the deploy".into()),
+                resume: None,
+            }),
+            activity: Some(Activity::Waiting),
+            ..session()
+        };
+        let claimed = Event::about_session(Kind::SessionClaimed, &info);
+        assert_eq!(claimed.text(), "by pi");
+        let json = serde_json::to_value(&claimed).unwrap();
+        assert_eq!(json["session"]["reporter"]["agent"], "pi");
+        let waiting = Event::activity(&info, Some(Activity::Working), Activity::Waiting);
+        assert_eq!(waiting.text(), "working → waiting: approve the deploy");
+        let released = Event::released(&session(), "pi");
+        assert_eq!(released.text(), "by pi");
+        let json = serde_json::to_value(&released).unwrap();
+        assert!(json["session"].get("reporter").is_none());
     }
 
     #[test]

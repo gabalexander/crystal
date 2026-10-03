@@ -43,6 +43,7 @@ mod profile;
 mod project;
 mod protocol;
 mod remote;
+mod report;
 mod secrets;
 mod server_cli;
 mod session;
@@ -96,7 +97,8 @@ enum Command {
     /// Start a session running a command, or your shell if there's none,
     /// and attach to it when run in a terminal.
     New {
-        /// The session's name [default: the program's name]
+        /// The session's name [default: from its first prompt, or else the
+        /// program's name]
         #[arg(short, long)]
         name: Option<String>,
 
@@ -160,6 +162,47 @@ enum Command {
         #[arg(required = true)]
         note: Vec<String>,
     },
+    /// Say what the agent in this session is doing, for an agent crystal
+    /// doesn't know or a script wrapped around one, and how to resume it
+    /// after a restart: the command after `--`. Its reports are the
+    /// session's status until `--release`.
+    Report {
+        /// What it's doing: working, waiting (on you, which `blocked` says
+        /// too), idle (at its prompt) or done (with a turn).
+        #[arg(
+            value_enum,
+            required_unless_present_any = ["session_only", "release"],
+            conflicts_with_all = ["session_only", "release"]
+        )]
+        state: Option<ReportedState>,
+
+        /// The agent's name, as the sidebar and `ls` show it [default: the
+        /// one it gave before, or what's in front in the session]
+        #[arg(long, conflicts_with = "release")]
+        agent: Option<String>,
+
+        /// A line on what it's doing, like what it's waiting on you for.
+        #[arg(short, long, conflicts_with_all = ["session_only", "release"])]
+        message: Option<String>,
+
+        /// The session [default: the one this runs in]
+        #[arg(short, long)]
+        name: Option<String>,
+
+        /// Only say how to resume it: the command after `--`.
+        #[arg(long, requires = "resume", conflicts_with = "release")]
+        session_only: bool,
+
+        /// Give the session's status back to crystal, and forget the resume
+        /// command: the agent is leaving.
+        #[arg(long)]
+        release: bool,
+
+        /// The command that resumes the agent's session after a restart,
+        /// its first word a command on the PATH: `-- my-agent --resume 42`.
+        #[arg(last = true, value_name = "COMMAND", conflicts_with = "release")]
+        resume: Vec<String>,
+    },
     /// List the tasks of the project this directory is in: those still
     /// open, then those waiting to start, then those closed, the latest
     /// first. Or make, start, show or cancel one.
@@ -222,7 +265,7 @@ enum Command {
     /// -p`), in the background. Its transcript shows like any session's, and
     /// `crystal send` gives it follow-ups. Prints the task's name.
     Task {
-        /// The task's name [default: task, task-2…]
+        /// The task's name [default: from its prompt, or task, task-2…]
         #[arg(short, long)]
         name: Option<String>,
 
@@ -531,7 +574,8 @@ enum TasksCommand {
     /// first, given the goal as its first prompt, or Claude in the
     /// background with --background. Prints the task's number.
     New {
-        /// The session's name [default: the program's]
+        /// The session's name [default: from its goal, or else the
+        /// program's]
         #[arg(short, long)]
         name: Option<String>,
 
@@ -586,6 +630,27 @@ enum TasksCommand {
         /// The task, by its number, like t12, or its session's name.
         task: String,
     },
+}
+
+/// What an agent says it's doing with `crystal report`.
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum ReportedState {
+    Working,
+    #[value(alias = "blocked")]
+    Waiting,
+    Idle,
+    Done,
+}
+
+impl ReportedState {
+    fn activity(self) -> protocol::Activity {
+        match self {
+            ReportedState::Working => protocol::Activity::Working,
+            ReportedState::Waiting => protocol::Activity::Waiting,
+            ReportedState::Idle => protocol::Activity::Idle,
+            ReportedState::Done => protocol::Activity::Done,
+        }
+    }
 }
 
 /// An answer to a permission a background task asks for.
@@ -810,7 +875,8 @@ enum BacklogCommand {
         #[arg(short, long)]
         worktree: bool,
 
-        /// The session's name [default: the agent's name]
+        /// The session's name [default: from the item, or else the agent's
+        /// name]
         #[arg(short, long)]
         name: Option<String>,
 
@@ -855,6 +921,29 @@ fn run(cli: Cli) -> Result<()> {
             summary,
         } => work::done(&socket, name, failed, &summary.join(" "), artifacts)?,
         Command::Handoff { name, note } => work::handoff(&socket, name, &note.join(" "))?,
+        Command::Report {
+            state,
+            agent,
+            message,
+            name,
+            session_only: _,
+            release,
+            resume,
+        } => {
+            let resume = (!resume.is_empty()).then_some(resume);
+            let report = match (state, resume) {
+                _ if release => protocol::AgentReport::Release,
+                (Some(state), resume) => protocol::AgentReport::State {
+                    agent,
+                    state: state.activity(),
+                    message,
+                    resume,
+                },
+                (None, Some(argv)) => protocol::AgentReport::Resume { agent, argv },
+                (None, None) => bail!("say what the agent is doing"),
+            };
+            report::run(&socket, name, report)?;
+        }
         Command::Tasks {
             all,
             dir,

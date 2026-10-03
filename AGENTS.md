@@ -141,13 +141,16 @@ is: it's the one request every version must understand.
   where it is on a command line, their options, and which are installed
 - `src/codex.rs`: what crystal knows about Codex: finding a session's conversation in its rollouts, `codex
   resume`, and crystal's notes given as its developer instructions, after the ones it has already
-- `src/hook.rs`: `crystal hook <agent>`: what those hooks run, to tell the daemon, and to pass on its reminder
-  to an agent ending a turn with its task open
+- `src/hook.rs`: `crystal hook <agent>`: what those hooks run, to tell the daemon, the prompt sent included, and
+  to pass on its reminder to an agent ending a turn with its task open
+- `src/report.rs`: `crystal report`: any agent, or a script wrapped around one, saying what it's doing and the
+  command that resumes it; checking that command, and what's typed into a shell to run it after a restart
 - `src/agent_screen.rs`: reading what an agent is doing off its screen and title
 - `src/front.rs`: what's in front in a session's terminal (agent, shell or program), from its foreground process
 - `src/typing.rs`: typing into a session the way a person would: pastes marked, Enter on its own
 - `src/session.rs`: one program in a PTY, or a task: spawn, exit status, stop, its screen, viewers and listeners,
-  and what has changed in it (its agent's activity, a task's runs) for the daemon to tell
+  the agent that says what it's doing itself while it holds the session, whether its first prompt can name
+  it, and what has changed in it (its agent's activity, a task's runs) for the daemon to tell
 - `src/vt.rs`: a terminal's screen, through `alacritty_terminal`: what a program drew and its history, the modes
   it set, its answers to the program's questions (the daemon's screen only), the output that catches a new viewer
   up, the cells to draw, the input modes `crystal attach` asks your terminal for, and, for a viewer, copy mode's
@@ -262,7 +265,8 @@ is: it's the one request every version must understand.
   - `git/branches.rs`: a worktree's branches, local and remote, its uncommitted changes, and switching it to
     another branch or a new one, the changes stashed, brought along, committed or thrown away, and put back
     when git won't switch
-- `src/names.rs`: made-up names for new worktrees' branches, like `brave-otter`
+- `src/names.rs`: made-up names for new worktrees' branches, like `brave-otter`, and a session's name from its
+  first prompt, like `fix-login-redirect`
 - `src/forge.rs`: pull requests and issues from the forge a project's remote is on, GitHub or GitLab, told
   apart by its host and the hosts `gh` and `glab` know: the types both read into, `Repo`'s calls, and running
   the CLI with a timeout; tests use a fake `gh` and `glab`, never the real ones. Was `github.rs`
@@ -271,7 +275,8 @@ is: it's the one request every version must understand.
 - `src/shell.rs`: quoting arguments and writing paths with `~`, the way a shell reads them
 - `tests/cli.rs`: end-to-end tests that drive the real binary against a private daemon (and read its database
   beside its socket to see what it wrote down), with a config of
-  their own that turns notifications and the memory plugin off (a memory test turns it back on), plugins
+  their own that turns notifications, the memory plugin and naming sessions from their prompts off (a test of
+  memory or naming turns it back on), plugins
   of their own in its plugins directory, and a Claude Code config directory of their own (`CLAUDE_CONFIG_DIR`),
   since a daemon brings the skill there up to date as it starts; a test that opens the new-session panel pins `PATH` to its fake
   agents, so no real agent is found or run, and a background task's `claude` is a fake that speaks stream-json,

@@ -171,15 +171,21 @@ CREATE TABLE task_artifacts (
 );
 ";
 
+/// The command an agent that says what it's doing itself said picks a
+/// session up again after a restart, as JSON.
+const RESUME: &str = "
+ALTER TABLE sessions ADD COLUMN resume TEXT;
+";
+
 /// What makes the database as it is now, a step for each version: a
 /// database at version `v`, kept in its `user_version`, takes the steps
 /// after the first `v`.
-const MIGRATIONS: &[&str] = &[TABLES, TASK_STATES, EVENTS, ARTIFACTS];
+const MIGRATIONS: &[&str] = &[TABLES, TASK_STATES, EVENTS, ARTIFACTS, RESUME];
 
 /// The file each project kept its backlog in before the database.
 const OLD_BACKLOG: &str = "backlog.json";
 
-const SESSION_COLUMNS: &str = "name, command, cwd, conversation, task, goal";
+const SESSION_COLUMNS: &str = "name, command, cwd, conversation, task, goal, resume";
 const RUN_COLUMNS: &str =
     "name, flow, profiles, goal, cwd, worktree, round, feedback, steps, started";
 const TASK_COLUMNS: &str = "project_name, goal, session, branch, background, backlog, failed, \
@@ -669,7 +675,7 @@ fn write_sessions(conn: &Connection, sessions: &[SavedSession]) -> Result<()> {
         conn.execute(
             &format!(
                 "INSERT INTO sessions (position, {SESSION_COLUMNS}) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
             ),
             params![
                 position as i64,
@@ -679,6 +685,7 @@ fn write_sessions(conn: &Connection, sessions: &[SavedSession]) -> Result<()> {
                 json_or_null(&session.conversation)?,
                 json_or_null(&session.task)?,
                 json_or_null(&session.goal)?,
+                json_or_null(&session.resume)?,
             ],
         )?;
     }
@@ -693,6 +700,7 @@ fn session_of(row: &Row) -> Result<SavedSession> {
         conversation: from_json_or_null(row.get(3)?)?,
         task: from_json_or_null(row.get(4)?)?,
         goal: from_json_or_null(row.get(5)?)?,
+        resume: from_json_or_null(row.get(6)?)?,
     })
 }
 
@@ -959,6 +967,7 @@ mod tests {
             }),
             task: None,
             goal: None,
+            resume: None,
         }
     }
 
@@ -1041,7 +1050,9 @@ mod tests {
             created: 3,
             outcome: None,
         });
-        let sessions = vec![saved("c"), task, saved("a")];
+        let mut reported = saved("c");
+        reported.resume = Some(vec!["pi".into(), "--session".into(), "s1".into()]);
+        let sessions = vec![reported, task, saved("a")];
         db.save_sessions(&sessions).unwrap();
         assert_eq!(db.sessions().unwrap(), sessions);
 

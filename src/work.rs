@@ -65,7 +65,7 @@ pub fn handoff(socket: &Path, name: Option<String>, note: &str) -> Result<()> {
 
 /// The id of the session this runs in, unless `name` names another: a
 /// command for a session that says `what` with `-n` from outside one.
-fn own_session(socket: &Path, name: &Option<String>, what: &str) -> Result<Option<String>> {
+pub fn own_session(socket: &Path, name: &Option<String>, what: &str) -> Result<Option<String>> {
     if name.is_some() {
         return Ok(None);
     }
@@ -96,7 +96,8 @@ pub fn list_tasks(socket: &Path, dir: PathBuf, all: bool, json: bool) -> Result<
 pub struct NewTask {
     pub goal: String,
     pub cwd: PathBuf,
-    /// Its session's name: `None` names it after its program.
+    /// Its session's name: `None` names it for its goal, or else after its
+    /// program.
     pub name: Option<String>,
     /// Run it in the background, `claude -p` with `claude_args`, rather
     /// than the agent the new-session panel starts first, in a terminal.

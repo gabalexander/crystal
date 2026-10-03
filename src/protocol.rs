@@ -40,6 +40,20 @@ pub enum Request {
         /// The conversation the agent is in, when its hooks say.
         #[serde(default)]
         conversation: Option<Conversation>,
+        /// What the user asked, when the event is a prompt sent: the first
+        /// names a session crystal named after its program.
+        #[serde(default)]
+        prompt: Option<String>,
+    },
+    /// What an agent says about itself with `crystal report`. A program in
+    /// a session says which by its `id`; from outside, it's the session's
+    /// `name`.
+    ReportAgent {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(default)]
+        name: Option<String>,
+        report: AgentReport,
     },
     /// Give a session another name.
     Rename {
@@ -274,7 +288,8 @@ pub enum Request {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct NewSession {
-    /// `None` names the session after its program.
+    /// `None` names the session for its task, or else after its program
+    /// until its first prompt names it.
     pub name: Option<String>,
     pub cwd: PathBuf,
     pub command: Vec<String>,
@@ -292,7 +307,8 @@ pub struct NewSession {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct NewTask {
-    /// `None` names the task "task", with a number added if that's taken.
+    /// `None` names the task for its prompt, or else "task", with a number
+    /// added if that's taken.
     pub name: Option<String>,
     pub cwd: PathBuf,
     pub spec: TaskSpec,
@@ -311,8 +327,8 @@ pub struct PendingTask {
     pub id: u64,
     pub goal: String,
     pub cwd: PathBuf,
-    /// The session's name, once it starts: `None` names it after its
-    /// program.
+    /// The session's name, once it starts: `None` names it for its goal,
+    /// or else after its program.
     #[serde(default)]
     pub name: Option<String>,
     pub start: TaskStart,
@@ -493,6 +509,53 @@ pub struct SessionInfo {
     /// The permission a background task is waiting on the user for.
     #[serde(default)]
     pub asking: Option<Asking>,
+    /// The agent that says what it's doing itself, with `crystal report`,
+    /// while it holds the session.
+    #[serde(default)]
+    pub reporter: Option<Reporter>,
+}
+
+/// An agent that says what it's doing itself, with `crystal report`, and
+/// how to pick its session up again after a restart.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Reporter {
+    /// The name it gave, which is what's in front in the session.
+    pub agent: String,
+    /// What it said with its last report, like what it waits on the user
+    /// for.
+    #[serde(default)]
+    pub message: Option<String>,
+    /// The command that picks its session up again after a restart.
+    #[serde(default)]
+    pub resume: Option<Vec<String>>,
+}
+
+/// What an agent says about itself with `crystal report`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AgentReport {
+    /// It's doing `state`, which takes the session's status over from
+    /// crystal's own reading of it. `None` for the agent keeps the name it
+    /// gave before; `resume`, the command that picks its session up again.
+    State {
+        #[serde(default)]
+        agent: Option<String>,
+        state: Activity,
+        #[serde(default)]
+        message: Option<String>,
+        #[serde(default)]
+        resume: Option<Vec<String>>,
+    },
+    /// Only the command that picks its session up again, from an agent
+    /// that holds the session.
+    Resume {
+        #[serde(default)]
+        agent: Option<String>,
+        argv: Vec<String>,
+    },
+    /// It lets go of the session: crystal reads what the session does for
+    /// itself again, and forgets the agent's name and command.
+    Release,
 }
 
 /// A permission a background task's Claude asks for: the tool, and what
