@@ -77,6 +77,26 @@ pub enum Request {
         failed: bool,
         summary: String,
     },
+    /// Have the distiller read what the session called `name` did, now,
+    /// and keep what a later session would need in its project's memory.
+    Distill {
+        name: String,
+    },
+    /// How the model that searches memory by meaning stands.
+    EmbeddingStatus,
+    /// Get the model that searches memory by meaning ready, in the
+    /// background: download it if it isn't here, load it, and give every
+    /// entry its vector.
+    PrepareEmbeddings,
+    /// Search the memory of the project `dir` is in, by words and, with the
+    /// model on, by meaning: the daemon keeps the model loaded, once for
+    /// every client.
+    SearchMemory {
+        dir: PathBuf,
+        query: String,
+        kind: Option<crate::memory::Kind>,
+        limit: usize,
+    },
     /// The tasks of the project `dir` is in, or of every project with
     /// `all`: those still open, then those closed, the latest first.
     Tasks {
@@ -276,6 +296,14 @@ pub enum Response {
     /// Flow runs, as `Request::ListFlows` asks for them.
     Flows {
         runs: Vec<FlowRun>,
+    },
+    /// What came of the distiller reading what a session did.
+    Distilled(crate::distill::Report),
+    /// How the model that searches memory by meaning stands.
+    EmbeddingStatus(crate::embed::Status),
+    /// The entries a memory search found, the best first.
+    Memory {
+        entries: Vec<crate::memory::Listed>,
     },
     /// What the hook that reported a turn ending tells its agent: its task
     /// is still open. The agent carries on, so the turn hasn't ended.

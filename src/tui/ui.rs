@@ -18,6 +18,7 @@ use super::pane::Pane;
 use super::plugins_view;
 use super::profiles;
 use super::screen_widget::{Marks, ScreenWidget};
+use super::settings_view;
 use super::sidebar::{self, fit};
 use super::status::Status;
 use super::tabs::Tab;
@@ -405,6 +406,9 @@ pub fn draw(frame: &mut Frame, app: &App, panes: &[Pane], overlay: Option<&Pane>
     }
     if let Some(view) = app.plugins_view() {
         plugins_view::draw(frame, view, look.theme, middle);
+    }
+    if let Some(view) = app.settings_view() {
+        settings_view::draw(frame, view, look.theme, middle);
     }
     if let (Some(open), Some(pane)) = (app.plugin_pane(), overlay) {
         draw_plugin_pane(frame, open, pane, look, &areas);
@@ -903,6 +907,8 @@ fn draw_footer(frame: &mut Frame, app: &App, panes: &[Pane], look: &Look, area: 
         frame.render_widget(hint_spans(profiles::hints(view), theme), area);
     } else if app.plugins_view().is_some() {
         frame.render_widget(hint_spans(plugins_view::HINTS, theme), area);
+    } else if app.settings_view().is_some() {
+        frame.render_widget(hint_spans(settings_view::HINTS, theme), area);
     } else if let Some(prompt) = app.prompt() {
         draw_prompt(frame, theme, prompt, area);
     } else if app.issues_view().is_some() {

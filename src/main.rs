@@ -8,7 +8,9 @@ mod clipboard;
 mod codex;
 mod config;
 mod daemon;
+mod distill;
 mod drive;
+mod embed;
 mod env;
 mod flow_cli;
 mod flow_run;
@@ -18,6 +20,7 @@ mod git;
 mod github;
 mod hook;
 mod keys;
+mod mcp;
 mod memory;
 mod memory_cli;
 mod names;
@@ -30,6 +33,7 @@ mod profile;
 mod project;
 mod protocol;
 mod remote;
+mod secrets;
 mod session;
 mod shell;
 mod skill;
@@ -369,6 +373,14 @@ enum Command {
     /// Tell the daemon about an agent's event; what the agent's hooks run.
     #[command(hide = true)]
     Hook { agent: String },
+    /// Serve a project's memory to Claude over MCP, on standard input and
+    /// output: what a task in the background searches it with.
+    #[command(hide = true)]
+    Mcp {
+        /// The project's directory [default: the current one]
+        #[arg(short = 'C', long = "dir", value_name = "DIR")]
+        dir: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -389,6 +401,16 @@ enum MemoryCommand {
         /// Don't ask first.
         #[arg(long)]
         yes: bool,
+    },
+    /// Download the model that searches by meaning, if it isn't here yet,
+    /// and give every entry its vector: see `embeddings` under `[memory]`
+    /// in the config.
+    Embed,
+    /// Have a model read what a session did and keep what a later session
+    /// would need, now: what happens by itself once a task closes.
+    Distill {
+        /// The session, by its name.
+        name: String,
     },
 }
 
@@ -685,6 +707,8 @@ fn run(cli: Cli) -> Result<()> {
             None => memory_cli::list(&socket, dir)?,
             Some(MemoryCommand::Search { words }) => memory_cli::search(&socket, dir, &words)?,
             Some(MemoryCommand::Rm { id }) => memory_cli::remove(&socket, dir, id)?,
+            Some(MemoryCommand::Distill { name }) => memory_cli::distill(&socket, &name)?,
+            Some(MemoryCommand::Embed) => memory_cli::embed(&socket)?,
             Some(MemoryCommand::Promote { id, yes }) => {
                 memory_cli::promote(&socket, dir, id, yes)?;
             }
@@ -737,6 +761,7 @@ fn run(cli: Cli) -> Result<()> {
         }
         Command::Daemon => daemon::run(&socket)?,
         Command::Hook { agent } => hook::run(&socket, &agent),
+        Command::Mcp { dir } => mcp::run(&socket, &here(dir)?)?,
     }
     Ok(())
 }

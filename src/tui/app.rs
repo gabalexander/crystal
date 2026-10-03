@@ -15,6 +15,7 @@ use super::memory_view::MemoryView;
 use super::plugins_view::{self, PluginsView};
 use super::profiles::{self, ProfilesView};
 use super::search;
+use super::settings_view::{self, SettingsView};
 use super::status::Status;
 use super::tabs::{self, Tabs};
 use super::text_input::TextInput;
@@ -399,6 +400,15 @@ pub enum Action {
     DeleteProfile(String),
     /// Read which plugins there are, and open the plugins view on them.
     ListPlugins,
+    /// The settings view has opened: read the settings, and again and
+    /// again while it's open.
+    OpenSettings,
+    /// The settings view has closed.
+    CloseSettings,
+    /// Write a change to a setting to the config file, and follow it.
+    ChangeSetting(settings_view::Change),
+    /// Have the daemon get the model that searches memory by meaning ready.
+    PrepareEmbeddings,
     /// Turn the plugin called `name` on, or off, in the config file.
     SwitchPlugin {
         name: String,
@@ -549,6 +559,8 @@ pub struct App {
     github_on: bool,
     /// The plugins view, while it's open.
     plugins_view: Option<PluginsView>,
+    /// The settings view, while it's open.
+    settings: Option<SettingsView>,
     /// The sidebar keys the installed plugins that are on took.
     plugin_keys: Vec<PluginKey>,
     /// A plugin's pane, while one is open.
@@ -611,6 +623,7 @@ impl App {
             backlog_on: true,
             github_on: true,
             plugins_view: None,
+            settings: None,
             plugin_keys: Vec::new(),
             plugin_pane: None,
             closing: None,
@@ -691,6 +704,27 @@ impl App {
 
     pub fn plugins_view(&self) -> Option<&PluginsView> {
         self.plugins_view.as_ref()
+    }
+
+    pub fn settings_view(&self) -> Option<&SettingsView> {
+        self.settings.as_ref()
+    }
+
+    /// Shows the settings as they are now, in the settings view, if it's
+    /// still open.
+    pub fn show_settings(&mut self, current: settings_view::Current) {
+        if let Some(view) = &mut self.settings {
+            view.set_current(current);
+        }
+    }
+
+    /// Says, in the settings view if it's open, why a setting wasn't
+    /// changed.
+    pub fn setting_failed(&mut self, problem: String) {
+        match &mut self.settings {
+            Some(view) => view.set_problem(problem),
+            None => self.notify(problem),
+        }
     }
 
     /// A plugin's pane has opened, over the panes, with the keyboard.
@@ -1575,6 +1609,9 @@ impl App {
         if self.plugins_view.is_some() {
             return self.on_plugins_key(key);
         }
+        if self.settings.is_some() {
+            return self.on_settings_key(key);
+        }
         if self.prompt.is_some() {
             return self.on_prompt_key(key);
         }
@@ -1621,6 +1658,7 @@ impl App {
             || self.launcher.is_some()
             || self.profiles_view.is_some()
             || self.plugins_view.is_some()
+            || self.settings.is_some()
             || self.plugin_pane.is_some();
         let asking = self.prompt.is_some()
             || self.confirm.is_some()
@@ -1792,6 +1830,10 @@ impl App {
             KeyCode::Char('b') => self.notify(plugins::off("backlog")),
             KeyCode::Char('g' | 'f') => self.notify(plugins::off("flows")),
             KeyCode::Char('X') => return Some(Action::ListPlugins),
+            KeyCode::Char(',') => {
+                self.settings = Some(SettingsView::new());
+                return Some(Action::OpenSettings);
+            }
             KeyCode::Char('q') => return Some(Action::Quit),
             KeyCode::Char(c) => return self.run_plugin_key(c),
             _ => {}
@@ -1817,6 +1859,19 @@ impl App {
         self.selected()
             .map(plugins::Context::of_session)
             .unwrap_or_default()
+    }
+
+    /// Keys while the settings view is open: all of them are its.
+    fn on_settings_key(&mut self, key: KeyEvent) -> Option<Action> {
+        match self.settings.as_mut()?.on_key(key) {
+            settings_view::Outcome::Stay => None,
+            settings_view::Outcome::Close => {
+                self.settings = None;
+                Some(Action::CloseSettings)
+            }
+            settings_view::Outcome::Change(change) => Some(Action::ChangeSetting(change)),
+            settings_view::Outcome::Prepare => Some(Action::PrepareEmbeddings),
+        }
     }
 
     /// Keys while the plugins view is open: all of them are its.
@@ -5922,5 +5977,37 @@ gate = true
             app.notice()
         );
         assert!(!app.rows().contains(&Row::Flow(0)));
+    }
+
+    #[test]
+    fn comma_opens_the_settings_which_take_every_key_until_closed() {
+        let mut app = app_with(&["agent"]);
+        assert_eq!(
+            press(&mut app, KeyCode::Char(',')),
+            Some(Action::OpenSettings)
+        );
+        assert!(app.settings_view().is_some());
+        // Nothing to change before the settings are read.
+        assert_eq!(press(&mut app, KeyCode::Char(' ')), None);
+        app.show_settings(settings_view::Current {
+            path: PathBuf::from("/c"),
+            config: Ok(Config::default()),
+            model: None,
+        });
+        // `x` would kill the session from the sidebar; here it's nothing.
+        assert_eq!(press(&mut app, KeyCode::Char('x')), None);
+        for _ in 0..3 {
+            press(&mut app, KeyCode::Char('j'));
+        }
+        assert_eq!(
+            press(&mut app, KeyCode::Char(' ')),
+            Some(Action::ChangeSetting(settings_view::Change::Embeddings(
+                true
+            )))
+        );
+        app.setting_failed("the file is read-only".into());
+        assert_eq!(press(&mut app, KeyCode::Esc), Some(Action::CloseSettings));
+        assert!(app.settings_view().is_none());
+        assert_eq!(selected_name(&app), Some("agent"));
     }
 }

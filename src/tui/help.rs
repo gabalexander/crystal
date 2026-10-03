@@ -69,7 +69,7 @@ pub const KEYS: &[Key] = &[
     of_plugin("backlog", "b", "the project's backlog"),
     of_plugin("memory", "m", "what it has remembered"),
     of_plugin("profiles", "P", "your agent profiles"),
-    sidebar("?/X/q", "keys / plugins / quit"),
+    sidebar("?/X/,/q", "keys/plugins/options/quit"),
     in_pane("Ctrl+\\", "back to the sidebar"),
     in_pane("Shift+PgUp", "page back"),
     in_pane("Shift+PgDn", "page forward"),

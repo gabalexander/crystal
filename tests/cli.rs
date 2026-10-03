@@ -3420,16 +3420,69 @@ fn remember_inside_a_session_keeps_the_entry_for_the_session_s_project() {
         "{listed}"
     );
     // It says which session it came from.
-    let store = files_under(&crystal.dir.path().join("memory"))
-        .into_iter()
-        .find(|file| {
-            file.extension()
-                .is_some_and(|extension| extension == "json")
-        })
+    let show = serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                                  "params": {"name": "memory_show", "arguments": {"id": 1}}});
+    let replies = mcp(&crystal, &repo, &[show]);
+    let shown = replies[0]["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(shown.contains("from: session fixer"), "{shown}");
+}
+
+/// Talks to `crystal mcp` serving the memory of the project `dir` is in:
+/// sends it `messages`, a line each, then ends its input, and gives back
+/// its replies.
+fn mcp(crystal: &Crystal, dir: &Path, messages: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    let mut child = crystal
+        .command(&["mcp", "-C", dir.to_str().unwrap()])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
         .unwrap();
-    let store: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(store).unwrap()).unwrap();
-    assert_eq!(store["entries"][0]["source"]["session"], "fixer");
+    let mut input = child.stdin.take().unwrap();
+    for message in messages {
+        writeln!(input, "{message}").unwrap();
+    }
+    drop(input);
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success());
+    let replies = String::from_utf8(out.stdout).unwrap();
+    replies
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+#[test]
+fn crystal_mcp_serves_the_project_s_memory_to_claude() {
+    let (crystal, repo) = crystal_remembering();
+    let repo_dir = repo.to_str().unwrap();
+    crystal.ok(&[
+        "remember",
+        "-C",
+        repo_dir,
+        "-k",
+        "gotcha",
+        "Migrations need the database up",
+    ]);
+    crystal.ok(&["remember", "-C", repo_dir, "Deploys go out on Tuesdays"]);
+    let messages = [
+        serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                           "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                                      "clientInfo": {"name": "claude-code", "version": "2"}}}),
+        serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+        serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
+        serde_json::json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                           "params": {"name": "memory_search",
+                                      "arguments": {"query": "migrating"}}}),
+    ];
+    let replies = mcp(&crystal, &repo, &messages);
+    // A notification has no reply.
+    assert_eq!(replies.len(), 3);
+    assert_eq!(replies[0]["result"]["serverInfo"]["name"], "crystal");
+    assert_eq!(replies[1]["result"]["tools"][0]["name"], "memory_search");
+    let found = replies[2]["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(found.starts_with("1 · gotcha · "), "{found}");
+    assert!(found.contains("Migrations need the database up"), "{found}");
+    assert!(!found.contains("Tuesdays"), "{found}");
 }
 
 #[test]
@@ -3498,6 +3551,45 @@ fn memory_search_lists_the_entries_that_share_its_words() {
     assert!(found.contains("The ledger tests"), "{found}");
     assert!(!found.contains("Fees"), "{found}");
     assert!(!found.contains("Deploys"), "{found}");
+    // A word's start finds it, and so does another form of it.
+    let found = crystal.ok(&["memory", "-C", repo_dir, "search", "deploying"]);
+    assert!(found.contains("Deploys go out"), "{found}");
+    let found = crystal.ok(&["memory", "-C", repo_dir, "search", "tue"]);
+    assert!(found.contains("Deploys go out"), "{found}");
+}
+
+#[test]
+fn search_by_meaning_without_its_model_goes_by_words_and_says_how_to_get_it() {
+    let (crystal, repo) = crystal_remembering();
+    crystal.configure("notify = false\n\n[memory]\nembeddings = true\ndistill = false\n");
+    let repo_dir = repo.to_str().unwrap();
+    crystal.ok(&["remember", "-C", repo_dir, "Deploys go out on Tuesdays"]);
+    let out = crystal
+        .command(&["memory", "-C", repo_dir, "search", "deploys"])
+        // A cache of the test's own, with no model in it.
+        .env("XDG_CACHE_HOME", crystal.dir.path().join("cache"))
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let found = String::from_utf8_lossy(&out.stdout);
+    assert!(found.contains("Deploys go out on Tuesdays"), "{found}");
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(said.contains("`crystal memory embed` gets it"), "{said}");
+}
+
+#[test]
+fn the_same_remembered_again_is_the_one_entry_seen_again() {
+    let (crystal, repo) = crystal_remembering();
+    let repo_dir = repo.to_str().unwrap();
+    assert_eq!(
+        crystal.ok(&["remember", "-C", repo_dir, "Fees are kept in cents"]),
+        "remembered 1\n"
+    );
+    assert_eq!(
+        crystal.ok(&["remember", "-C", repo_dir, "fees are kept in cents."]),
+        "remembered 1 already\n"
+    );
+    assert_eq!(crystal.ok(&["memory", "-C", repo_dir]).lines().count(), 1);
 }
 
 #[test]
@@ -5117,6 +5209,181 @@ fn a_closed_task_is_remembered_in_its_project_s_memory() {
     });
 }
 
+/// A stand-in for Claude that plays both its parts in a task: as the task,
+/// `claude -p --output-format stream-json`, it writes its arguments down
+/// one a line in `task-args`, then a short run: it found redis down, ran
+/// the tests and says so. As the distiller, run with `--json-schema`, it
+/// writes its arguments to `distill-args` and its message to
+/// `distill-message`, and answers with two entries, one of a kind it may
+/// not give. Returns the directory to put on the PATH.
+fn distilling_claude(dir: &Path) -> PathBuf {
+    let bin = dir.join("distilling-bin");
+    std::fs::create_dir(&bin).unwrap();
+    script(
+        &bin.join("claude"),
+        r#"case " $* " in
+*" --json-schema "*)
+    cat > distill-message
+    printf '%s\n' "$@" > distill-args.new && mv distill-args.new distill-args
+    echo '{"type":"result","subtype":"success","is_error":false,"result":"","structured_output":{"entries":[{"kind":"gotcha","text":"The ledger tests need redis up","files":["ledger.rs"]},{"kind":"outcome","text":"fixed it","files":[]}]},"total_cost_usd":0.01}'
+    ;;
+*)
+    printf '%s\n' "$@" > task-args.new && mv task-args.new task-args
+    echo '{"type":"system","subtype":"init","session_id":"conv-1"}'
+    echo '{"type":"assistant","parent_tool_use_id":null,"message":{"content":[{"type":"text","text":"Found it: redis was down."},{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"cargo test"}}]}}'
+    echo '{"type":"user","parent_tool_use_id":null,"message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"test result: ok","is_error":false}]}}'
+    echo '{"type":"result","subtype":"success","is_error":false,"result":"Fixed: start redis first.","session_id":"conv-1","total_cost_usd":0.04,"duration_ms":100}'
+    ;;
+esac
+"#,
+    );
+    bin
+}
+
+/// Starts a task called fixer in `repo`, on the ledger, with `bin` for its
+/// PATH.
+fn start_fixer(crystal: &Crystal, repo: &Path, bin: &Path) {
+    let out = crystal
+        .command(&[
+            "task",
+            "-n",
+            "fixer",
+            "-c",
+            repo.to_str().unwrap(),
+            "fix the ledger",
+        ])
+        .env("PATH", path_of(&[bin]))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn a_task_is_shown_what_was_learned_and_given_crystal_s_mcp_server() {
+    let (crystal, repo) = crystal_remembering();
+    crystal.configure("notify = false\n\n[memory]\ndistill = false\n");
+    let repo_dir = repo.to_str().unwrap();
+    crystal.ok(&[
+        "remember",
+        "-C",
+        repo_dir,
+        "-k",
+        "gotcha",
+        "The ledger needs redis",
+    ]);
+    let bin = distilling_claude(crystal.dir.path());
+    start_fixer(&crystal, &repo, &bin);
+
+    let args = written(&repo.join("task-args"));
+    let args: Vec<&str> = args.lines().collect();
+    let after = |flag: &str| {
+        let at = args.iter().position(|arg| *arg == flag).unwrap();
+        args[at + 1]
+    };
+    assert_eq!(
+        after("--allowedTools"),
+        "mcp__crystal__memory_search,mcp__crystal__memory_show"
+    );
+    let server: serde_json::Value = serde_json::from_str(after("--mcp-config")).unwrap();
+    let server = &server["mcpServers"]["crystal"];
+    assert_eq!(server["command"], CRYSTAL);
+    assert_eq!(server["args"][2], "mcp");
+    // What it was shown is in its system prompt, by id, for memory_show.
+    let prompt = args.join("\n");
+    assert!(
+        prompt.contains("- 1 (gotcha) The ledger needs redis"),
+        "{prompt}"
+    );
+    assert!(prompt.contains("memory_search tool"), "{prompt}");
+    assert!(prompt.ends_with("--\nfix the ledger"), "{prompt}");
+
+    eventually("the task is done and its outcome kept", || {
+        crystal
+            .ok(&["memory", "-C", repo_dir])
+            .contains("fix the ledger: Fixed: start redis first.")
+    });
+    // With the distiller off, nothing more is read.
+    thread::sleep(Duration::from_millis(300));
+    assert!(!repo.join("distill-args").exists());
+}
+
+#[test]
+fn the_distiller_keeps_what_a_closed_task_learned() {
+    let (crystal, repo) = crystal_remembering();
+    let repo_dir = repo.to_str().unwrap();
+    std::fs::write(repo.join("ledger.rs"), "fn ledger() {}").unwrap();
+    let bin = distilling_claude(crystal.dir.path());
+    start_fixer(&crystal, &repo, &bin);
+
+    eventually("the distiller's entry is kept", || {
+        crystal
+            .ok(&["memory", "-C", repo_dir])
+            .contains("The ledger tests need redis up  (ledger.rs)")
+    });
+    // It read what the task was and did, and kept to its own kinds.
+    let message = std::fs::read_to_string(repo.join("distill-message")).unwrap();
+    assert!(
+        message
+            .starts_with("The task: fix the ledger\nHow it ended: done: Fixed: start redis first."),
+        "{message}"
+    );
+    assert!(message.contains("USER: fix the ledger\n"), "{message}");
+    assert!(
+        message.contains("ASSISTANT: Found it: redis was down.\n"),
+        "{message}"
+    );
+    assert!(
+        message.contains("TOOL Bash: cargo test\nRESULT: test result: ok\n"),
+        "{message}"
+    );
+    let listed = crystal.ok(&["memory", "-C", repo_dir]);
+    assert!(!listed.contains("fixed it"), "{listed}");
+    let args = written(&repo.join("distill-args"));
+    assert!(args.contains("--model\nclaude-haiku-4-5\n"), "{args}");
+    assert!(args.contains("--tools\n\n"), "{args}");
+    assert!(args.contains("--no-session-persistence\n"), "{args}");
+
+    // Run again by hand, it finds the same, and says so.
+    let said = crystal.ok(&["memory", "distill", "fixer"]);
+    assert_eq!(
+        said,
+        "distilled fixer: 0 entries added, 1 seen again, 1 rejected ($0.0100)\n  \
+         rejected entry 2: \"outcome\" isn't a kind it may give\n"
+    );
+    let found = crystal.ok(&["memory", "-C", repo_dir, "search", "redis"]);
+    assert_eq!(found.lines().count(), 2, "{found}");
+
+    // Forgotten, it stays forgotten.
+    let id = found
+        .lines()
+        .find(|line| line.contains("ledger tests"))
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_string();
+    crystal.ok(&["memory", "-C", repo_dir, "rm", &id]);
+    let said = crystal.ok(&["memory", "distill", "fixer"]);
+    assert!(said.contains("1 forgotten before"), "{said}");
+    let listed = crystal.ok(&["memory", "-C", repo_dir]);
+    assert!(!listed.contains("ledger tests"), "{listed}");
+}
+
+#[test]
+fn a_session_with_nothing_to_read_can_t_be_distilled() {
+    let (crystal, _repo) = crystal_remembering();
+    crystal.ok(&["new", "-n", "plain", "sleep", "30"]);
+    let refused = crystal.fails(&["memory", "distill", "plain"]);
+    assert!(
+        refused.contains("left nothing the distiller can read"),
+        "{refused}"
+    );
+}
+
 /// Installs a plugin by hand, as `crystal plugin new` or `install` would:
 /// a directory called `name` in the test's plugins directory, with
 /// `manifest` for its plugin.toml and `files` beside it.
@@ -5196,6 +5463,59 @@ fn with_github_switched_off_gh_is_never_asked_until_it_s_on_again() {
     });
     let config = std::fs::read_to_string(crystal.config_file()).unwrap();
     assert!(config.contains("github = true"), "{config}");
+}
+
+#[test]
+fn the_settings_view_changes_the_config_and_follows_it_live() {
+    let crystal = Crystal::new();
+    crystal.configure("notify = false\n");
+    // The daemon the TUI starts gets a curl that can't download anything,
+    // and a cache of the test's own with no model in it.
+    let bin = crystal.dir.path().join("curl-bin");
+    std::fs::create_dir(&bin).unwrap();
+    script(
+        &bin.join("curl"),
+        "echo 'curl: (6) no network' >&2\nexit 6\n",
+    );
+    let cache = crystal.dir.path().join("cache");
+    let env = [
+        ("PATH", path_with(&bin)),
+        ("XDG_CACHE_HOME", cache.display().to_string()),
+    ];
+    let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let mut tui = crystal.attach_with_env(&[], &env);
+    crystal.ok(&["new", "-n", "agent", "sleep", "30"]);
+    tui.shows("agent");
+    let config = || std::fs::read_to_string(crystal.config_file()).unwrap();
+
+    tui.type_keys(",");
+    tui.shows("○ notifications");
+    tui.shows("not downloaded (134 MB)");
+    tui.type_keys(" ");
+    tui.shows("● notifications");
+    assert!(config().starts_with("notify = true\n"), "{}", config());
+    tui.type_keys("jl");
+    tui.shows("light");
+    assert!(config().contains("theme = \"light\""), "{}", config());
+
+    // Changed by hand, the file is shown as it is now.
+    crystal.configure("notify = true\ntheme = \"light\"\n\n[memory]\ndistill = false\n");
+    tui.shows("○ distill closed tasks");
+
+    // Turned on, search by meaning has the daemon get the model, and the
+    // view follows how that goes: here, a download that fails.
+    tui.type_keys("jj ");
+    tui.shows("● search by meaning");
+    assert!(
+        config().contains("[memory]\ndistill = false\nembeddings = true\n"),
+        "{}",
+        config()
+    );
+    tui.shows("couldn't get it ready");
+
+    tui.type_keys("\x1b");
+    tui.hides("search by meaning");
+    tui.shows("agent");
 }
 
 #[test]

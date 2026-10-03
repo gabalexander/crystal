@@ -163,7 +163,11 @@ crystal memory search ledger
 - `-k` is `decision`, `gotcha`, `command` or `note` (the default). Keep each entry to a sentence or two.
 - `-f <file>` names a file the entry is about. When that file changes, the entry is marked stale.
 - Don't remember what the code, the git log or CLAUDE.md already says, or anything that only matters now.
+- `crystal memory search` matches any of its words, or a word they start or stem from, best first; with
+  search by meaning on, entries that mean the same count too, so a few plain words do.
 - `crystal memory` lists every entry; `crystal memory rm <id>` forgets one that's wrong.
+- Once your task closes, a model reads what you did and keeps what it finds worth keeping, so remember what
+  only you know, like why you chose something; it never repeats what's there already.
 - With memory turned off, these commands say "the memory plugin is off"; carry on without them.
 
 ## Pitfalls

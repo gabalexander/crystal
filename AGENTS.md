@@ -92,6 +92,9 @@ is: it's the one request every version must understand.
   - `plugins_view.rs`: the plugins view (`X`): every plugin, on or off, with installed ones' actions and panes,
     its keys and drawing; the event loop does the switching, runs actions and opens plugins' panes over the
     others
+  - `settings_view.rs`: the settings view (`,`): notifications, the theme, the distiller and search by meaning,
+    each changed with a key, and how the model stands; the event loop writes the file (`config::set`) and,
+    while it's open, reads the settings and the daemon's `EmbeddingStatus` again every half a second
 - `src/daemon.rs`: the daemon: listens on the socket and owns the sessions
 - `src/agents.rs`: what crystal knows about particular agents: the hooks it adds to Claude Code, and what they mean
 - `src/catalog.rs`: the agents the new-session panel offers: their names, how each takes a first prompt, their
@@ -124,10 +127,22 @@ is: it's the one request every version must understand.
   markdown export, and `enabled`, the one gate everything the backlog adds goes through
 - `src/work.rs`: `crystal done`, `tasks` and `backlog`
 - `src/config.rs`: the settings in `~/.config/crystal/config.toml`, read and checked
-- `src/memory.rs`: what a project's sessions learned: the store in the state directory, staleness, search,
-  the paragraph Claude Code is shown at launch, promoting into CLAUDE.md, and `enabled`, the one gate
-  everything memory adds goes through
-- `src/memory_cli.rs`: `crystal remember` and `crystal memory`
+- `src/memory.rs`: what a project's sessions learned: the SQLite store in the state directory with its FTS5
+  index (bm25, prefix and porter-stemmed words), each entry's vector and search by meaning merged with it by
+  reciprocal rank fusion, its migrations, the same said again seen again, forgotten entries the
+  distiller can't add back, bringing in a project's JSON file from before, staleness, search, the paragraph
+  Claude Code is shown at launch (with ids for a task in the background), promoting into CLAUDE.md, and
+  `enabled`, the one gate everything memory adds goes through
+- `src/distill.rs`: the distiller: after a task closes, one tool-less `claude -p` (Haiku by default, `[memory]`
+  in the config) over the end of its transcript, told what the memory has already; its answer checked
+  against the checkout before it's kept
+- `src/mcp.rs`: `crystal mcp`: an MCP server over stdio with `memory_search` and `memory_show`, which a task in
+  the background is given with `--mcp-config` and its tools allowed
+- `src/embed.rs`: search by meaning: bge-small-en-v1.5 run through Candle, `Embed` (the model, or a stand-in in
+  tests), downloading it at a pinned revision with its SHA-256s checked, and the one copy each process loads
+  when `[memory] embeddings` is on; memory.rs keeps the vectors and merges the rankings
+- `src/secrets.rs`: taking credentials out of text before memory keeps it or the distiller reads it
+- `src/memory_cli.rs`: `crystal remember` and `crystal memory`, `distill` included
 - `src/profile.rs`: agent profiles: what one runs, checking it, and saving or removing one in the config file
   with `toml_edit`, so the user's comments and layout stay; `enabled` is the one switch for the feature
 - `src/flows.rs`: flows, chains of background tasks on one goal: the `[[flow]]` tables in the config file,

@@ -2,10 +2,13 @@
 //! and reading, searching and tidying it, from a shell or from an agent in
 //! a session.
 
+use crate::client;
 use crate::config::Config;
+use crate::embed::{self, Embedder};
 use crate::env;
 use crate::git::Checkout;
-use crate::memory::{self, Kind, Listed, Memory, Source};
+use crate::memory::{self, Added, Kind, Listed, Memory, New, Source, Store};
+use crate::protocol::{Request, Response};
 use crate::tui::sidebar::ago;
 use anyhow::{Result, bail};
 use std::io::{BufRead, IsTerminal, Write};
@@ -28,8 +31,17 @@ pub fn remember(
         .iter()
         .map(|file| from_worktree_top(file, &dir))
         .collect();
-    let entry = memory::add(socket, &project, kind, text, files, source(socket))?;
-    println!("remembered {}", entry.id);
+    let new = New {
+        kind,
+        text: text.to_string(),
+        files,
+        source: source(socket),
+    };
+    match memory::add(socket, &project, new)? {
+        Added::New(entry) => println!("remembered {}", entry.id),
+        Added::Again(entry) => println!("remembered {} already", entry.id),
+        Added::Refused => unreachable!("only crystal is refused what was forgotten"),
+    }
     Ok(())
 }
 
@@ -42,10 +54,46 @@ pub fn list(socket: &Path, dir: Option<PathBuf>) -> Result<()> {
 
 /// Prints the entries that have to do with `words`, the best first.
 pub fn search(socket: &Path, dir: Option<PathBuf>, words: &[String]) -> Result<()> {
-    let memory = read(socket, dir)?;
-    let listed = memory.listed();
-    print_entries(&memory::search(&listed, &words.join(" "), now()));
+    check_on()?;
+    let dir = dir_or_current(dir)?;
+    let settings = Config::load()?.memory;
+    let downloaded = embed::model_dir().is_some_and(|dir| embed::is_downloaded(&dir));
+    if settings.embeddings && !downloaded {
+        eprintln!(
+            "{} isn't downloaded, so this goes by words alone: `crystal memory embed` gets it",
+            embed::MODEL
+        );
+    }
+    let found = found(socket, &dir, &words.join(" "), None, memory::SEARCH_LIMIT)?;
+    print_entries(&found.iter().collect::<Vec<_>>());
     Ok(())
+}
+
+/// The entries of the memory of the project `dir` is in that have to do
+/// with `query`, of `kind` if it's given, the best first: searched by the
+/// daemon, which keeps the model that searches by meaning loaded, or here,
+/// when there's no daemon to ask.
+pub fn found(
+    socket: &Path,
+    dir: &Path,
+    query: &str,
+    kind: Option<Kind>,
+    limit: usize,
+) -> Result<Vec<Listed>> {
+    let request = Request::SearchMemory {
+        dir: dir.to_path_buf(),
+        query: query.to_string(),
+        kind,
+        limit,
+    };
+    if let Ok(Some(Response::Memory { entries })) = client::ask(socket, &request, false) {
+        return Ok(entries);
+    }
+    let project = memory::project_of(dir);
+    let embedder = embed::shared_now();
+    let mut store = Store::open(socket)?;
+    let found = store.search(&project, query, kind, limit, embed::as_embed(&embedder))?;
+    Ok(memory::stale_last(found, &project))
 }
 
 pub fn remove(socket: &Path, dir: Option<PathBuf>, id: u64) -> Result<()> {
@@ -53,6 +101,46 @@ pub fn remove(socket: &Path, dir: Option<PathBuf>, id: u64) -> Result<()> {
     let project = memory::project_of(&dir_or_current(dir)?);
     let entry = memory::remove(socket, &project, id)?;
     println!("forgot {}: {}", entry.id, entry.text);
+    Ok(())
+}
+
+/// Downloads the embedding model if it isn't here yet, then gives every
+/// entry of every project its vector, and says how many that was.
+pub fn embed(socket: &Path) -> Result<()> {
+    check_on()?;
+    let dir = match embed::model_dir().filter(|dir| embed::is_downloaded(dir)) {
+        Some(dir) => dir,
+        None => {
+            eprintln!("downloading {} ({} MB)", embed::MODEL, embed::size_mb());
+            embed::download(std::io::stderr().is_terminal())?
+        }
+    };
+    let embedder = Embedder::load(&dir)?;
+    let count = Store::open(socket)?.embed_missing(&embedder)?;
+    println!("embedded {count} entries with {}", embed::MODEL);
+    if !Config::load()?.memory.embeddings {
+        println!(
+            "searches use it once `embeddings = true` is under `[memory]` in {}",
+            crate::config::path().display()
+        );
+    }
+    Ok(())
+}
+
+/// Has the daemon run the distiller over what the session `name` did, and
+/// says what came of it.
+pub fn distill(socket: &Path, name: &str) -> Result<()> {
+    check_on()?;
+    let request = Request::Distill {
+        name: name.to_string(),
+    };
+    let Some(Response::Distilled(report)) = client::ask(socket, &request, false)? else {
+        bail!("there's no session called {name}: no daemon is running");
+    };
+    println!("distilled {name}: {}", report.line());
+    for why in &report.rejected {
+        println!("  rejected {why}");
+    }
     Ok(())
 }
 

@@ -10,9 +10,9 @@ use crate::profile::Profile;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     /// Tell the user when a session needs them: its agent is asking them
@@ -34,6 +34,8 @@ pub struct Config {
     /// until switched on. See [`crate::plugins`].
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub plugins: BTreeMap<String, bool>,
+    /// How the memory plugin learns: `[memory]` in the file.
+    pub memory: MemorySettings,
     /// Saved ways to start an agent, offered first in the new-session
     /// panel: `[[profile]]` tables in the file. See [`crate::profile`].
     #[serde(rename = "profile", skip_serializing_if = "Vec::is_empty")]
@@ -42,6 +44,33 @@ pub struct Config {
     /// tables in the file. See [`crate::flows`].
     #[serde(rename = "flow", skip_serializing_if = "Vec::is_empty")]
     pub flows: Vec<Flow>,
+}
+
+/// How the memory plugin learns, beyond what it's told.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MemorySettings {
+    /// Once a task has closed, have a model read what it did and keep what
+    /// a later session would need to know: see [`crate::distill`].
+    pub distill: bool,
+    /// The model that does it, as `claude --model` takes it.
+    pub distill_model: String,
+    /// The most it may spend on one task, in US dollars.
+    pub distill_budget_usd: f64,
+    /// Search by what entries mean as well as by their words, with a model
+    /// run on this machine: see [`crate::embed`].
+    pub embeddings: bool,
+}
+
+impl Default for MemorySettings {
+    fn default() -> MemorySettings {
+        MemorySettings {
+            distill: true,
+            distill_model: "claude-haiku-4-5".to_string(),
+            distill_budget_usd: 0.25,
+            embeddings: false,
+        }
+    }
 }
 
 /// The TUI's colors to choose from. `dark` and `light` paint their own
@@ -63,6 +92,7 @@ impl Default for Config {
             new_session: "claude".to_string(),
             theme: ThemeName::Dark,
             plugins: BTreeMap::new(),
+            memory: MemorySettings::default(),
             profiles: Vec::new(),
             flows: Vec::new(),
         }
@@ -94,6 +124,70 @@ impl Config {
     pub fn to_toml(&self) -> String {
         // Our own plain struct always makes valid TOML.
         toml::to_string(self).expect("settings make TOML")
+    }
+}
+
+/// Sets the setting at `keys`, like `["memory", "embeddings"]`, to `value`
+/// in the config file at `path`, making the table it's in if there isn't
+/// one, and keeping the rest of the file as the user wrote it, comments and
+/// all: what the settings view writes. A file the change would leave
+/// meaning nothing crystal knows is left as it was, with an error.
+pub fn set(path: &Path, keys: &[&str], value: toml_edit::Value) -> Result<()> {
+    let (last, tables) = keys.split_last().context("say which setting")?;
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(err) => return Err(err).with_context(|| format!("couldn't read {}", path.display())),
+    };
+    let mut document: toml_edit::DocumentMut = text
+        .parse()
+        .with_context(|| format!("couldn't read {}", path.display()))?;
+    let mut table = document.as_table_mut();
+    for key in tables {
+        table = table
+            .entry(key)
+            .or_insert(toml_edit::Item::Table(toml_edit::Table::new()))
+            .as_table_mut()
+            .with_context(|| format!("`{key}` in the config file isn't a [{key}] table"))?;
+    }
+    // A line that's there already keeps its comment.
+    match table.get_mut(last).and_then(toml_edit::Item::as_value_mut) {
+        Some(said) => {
+            let decor = said.decor().clone();
+            *said = value;
+            *said.decor_mut() = decor;
+        }
+        None => {
+            table.insert(last, toml_edit::Item::Value(value));
+        }
+    }
+    let new_text = document.to_string();
+    from_text(&new_text).with_context(|| format!("in {}", path.display()))?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let unfinished = path.with_extension("toml.saving");
+    std::fs::write(&unfinished, &new_text)?;
+    std::fs::rename(&unfinished, path)?;
+    Ok(())
+}
+
+impl ThemeName {
+    pub const ALL: [ThemeName; 3] = [ThemeName::Dark, ThemeName::Light, ThemeName::Terminal];
+
+    /// Its name, as the config file has it.
+    pub fn name(self) -> &'static str {
+        match self {
+            ThemeName::Dark => "dark",
+            ThemeName::Light => "light",
+            ThemeName::Terminal => "terminal",
+        }
+    }
+
+    /// The one after it, back to the first after the last.
+    pub fn next(self) -> ThemeName {
+        let at = ThemeName::ALL.iter().position(|theme| *theme == self);
+        ThemeName::ALL[(at.unwrap_or(0) + 1) % ThemeName::ALL.len()]
     }
 }
 
@@ -138,8 +232,9 @@ pub fn from_text(text: &str) -> Result<Config> {
     if table.contains_key("preset") {
         bail!("`[[preset]]` tables are now `[[profile]]`: rename them in the file");
     }
-    // Memory became a plugin; say where its setting went.
-    if table.contains_key("memory") {
+    // Memory became a plugin; say where its switch went. `[memory]` is
+    // how it learns.
+    if matches!(table.get("memory"), Some(toml::Value::Boolean(_))) {
         bail!("`memory` is now a plugin: put `memory = …` under a `[plugins]` line instead");
     }
     let config: Config = table.try_into()?;
@@ -352,6 +447,54 @@ back_to = "build"
     }
 
     #[test]
+    fn a_setting_set_keeps_the_rest_of_the_file_as_it_was() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "# mine\nnotify = true # loud\n\n[plugins]\nmemory = true\n",
+        )
+        .unwrap();
+        set(&path, &["notify"], false.into()).unwrap();
+        set(&path, &["memory", "embeddings"], true.into()).unwrap();
+        set(&path, &["theme"], "light".into()).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.starts_with("# mine\nnotify = false # loud\n"),
+            "{text}"
+        );
+        assert!(text.contains("[memory]\nembeddings = true\n"), "{text}");
+        let config = from_text(&text).unwrap();
+        assert!(!config.notify && config.memory.embeddings);
+        assert_eq!(config.theme, ThemeName::Light);
+
+        // What crystal wouldn't take is never written.
+        assert!(set(&path, &["theme"], "pink".into()).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+    }
+
+    #[test]
+    fn the_themes_go_round() {
+        assert_eq!(ThemeName::Dark.next(), ThemeName::Light);
+        assert_eq!(ThemeName::Terminal.next(), ThemeName::Dark);
+        assert_eq!(ThemeName::Light.name(), "light");
+    }
+
+    #[test]
+    fn memory_learns_by_its_own_table() {
+        let config = parse("[memory]\ndistill = false\n").unwrap();
+        assert!(!config.memory.distill);
+        assert_eq!(config.memory.distill_model, "claude-haiku-4-5");
+        assert_eq!(config.memory.distill_budget_usd, 0.25);
+        assert!(!config.memory.embeddings, "off until the model is wanted");
+        let config = parse("[memory]\ndistill_model = \"sonnet\"\ndistill_budget_usd = 1\n");
+        let config = config.unwrap();
+        assert_eq!(config.memory.distill_model, "sonnet");
+        assert_eq!(config.memory.distill_budget_usd, 1.0);
+        assert!(parse("[memory]\ndistil = false\n").is_err());
+    }
+
+    #[test]
     fn a_leftover_preset_says_its_now_a_profile() {
         let err = parse("[[preset]]\nname = \"x\"\nagent = \"claude\"\n").unwrap_err();
         assert!(
@@ -368,6 +511,12 @@ back_to = "build"
             new_session: "codex --model o3".into(),
             theme: ThemeName::Terminal,
             plugins: BTreeMap::from([("memory".to_string(), false)]),
+            memory: MemorySettings {
+                distill: false,
+                distill_model: "claude-sonnet-5-5".into(),
+                distill_budget_usd: 0.5,
+                embeddings: true,
+            },
             profiles: vec![Profile {
                 name: "review".into(),
                 description: Some("A second pair of eyes".into()),

@@ -54,7 +54,7 @@ pub fn install(force: bool) -> Result<()> {
 
 /// Claude Code's config directory: `$CLAUDE_CONFIG_DIR` when it's set,
 /// as Claude Code itself reads it, or else `~/.claude`.
-fn claude_config_dir(
+pub fn claude_config_dir(
     from_env: Option<std::ffi::OsString>,
     home: Option<std::ffi::OsString>,
 ) -> Option<PathBuf> {

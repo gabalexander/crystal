@@ -473,6 +473,8 @@ mod tests {
                 files: Vec::new(),
                 source: Source::User,
                 created: 1_000,
+                seen: 1,
+                last_seen: 1_000,
             },
             stale: false,
         }

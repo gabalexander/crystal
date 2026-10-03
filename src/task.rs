@@ -10,6 +10,7 @@
 //! follow-up, which carries the conversation on with `--resume`. A run that
 //! fails ends the task.
 
+use crate::distill::Record;
 use crate::protocol::{AgentEvent, State, TaskResult, TaskSpec};
 use crate::session::{STOP_GRACE, Term, signal_group};
 use crate::transcript::{self, Event};
@@ -28,6 +29,9 @@ const ERROR_LINES: usize = 5;
 
 pub struct Task {
     spec: TaskSpec,
+    /// What each run gives Claude: the spec's own arguments, with what
+    /// crystal adds to them.
+    args: Vec<String>,
     cwd: PathBuf,
     env: BTreeMap<String, String>,
     /// The session's screen, which each run is drawn on.
@@ -54,6 +58,9 @@ struct Runs {
     result: Option<String>,
     failed: bool,
     cost_usd: f64,
+    /// What its runs did, the end of it, for the distiller to read once
+    /// the task has closed.
+    record: Record,
 }
 
 impl Task {
@@ -61,6 +68,7 @@ impl Task {
     /// runs carry that conversation on.
     pub fn new(
         spec: TaskSpec,
+        args: Vec<String>,
         cwd: PathBuf,
         env: BTreeMap<String, String>,
         term: Arc<Term>,
@@ -73,6 +81,7 @@ impl Task {
         };
         Task {
             spec,
+            args,
             cwd,
             env,
             term,
@@ -109,6 +118,7 @@ impl Task {
             .context("couldn't start claude")?;
         runs.started += 1;
         runs.current = Some(child.id());
+        runs.record.push(format!("USER: {}", prompt.trim()));
         drop(runs);
 
         self.term.show(transcript::prompt_lines(prompt).as_bytes());
@@ -142,6 +152,11 @@ impl Task {
             cost_usd: runs.cost_usd,
             runs: runs.started,
         })
+    }
+
+    /// The end of what its runs have done.
+    pub fn record(&self) -> Record {
+        self.runs.lock().unwrap().record.clone()
     }
 
     /// Draws a note on the screen, between runs.
@@ -180,7 +195,7 @@ impl Task {
         // several values, like `--allowedTools Read Grep`, can't take it
         // too, and a prompt starting with `-` isn't taken for one.
         command
-            .args(&self.spec.args)
+            .args(&self.args)
             .arg("--")
             .arg(prompt)
             .current_dir(&self.cwd)
@@ -233,6 +248,7 @@ impl Reading {
         let mut answered = false;
         if let Some(stdout) = child.stdout.take() {
             for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                self.runs.lock().unwrap().record.push_claude(&line);
                 for event in transcript::events(&line) {
                     self.term.show(transcript::lines(&event).as_bytes());
                     answered |= matches!(event, Event::Finished(_));
