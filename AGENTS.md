@@ -115,7 +115,8 @@ is: it's the one request every version must understand.
 - `src/task.rs`: tasks: Claude Code run without a terminal (`claude -p`), one run per prompt or follow-up
 - `src/transcript.rs`: reading `claude -p`'s stream-json events, and drawing them as a task's transcript
 - `src/protocol.rs`: requests and responses, one JSON line each, and the frames an attached client sends
-- `src/socket.rs`: where the socket lives
+- `src/socket.rs`: where the socket lives, and whether a socket is the default one, however it's spelled and
+  whoever starts its daemon, so the same socket always gets the same state
 - `src/state.rs`: where the daemon's state is: the database, and the files kept before it (the sessions, the
   flow runs, each project's directory); a running session as it's written down to start it again
 - `src/db.rs`: the SQLite database the daemon and the TUI keep their state in (WAL, `synchronous=NORMAL`,

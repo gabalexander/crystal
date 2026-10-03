@@ -2578,6 +2578,62 @@ fn restart_server_brings_the_running_sessions_back() {
 }
 
 #[test]
+fn the_default_socket_keeps_its_state_however_its_daemon_is_started() {
+    // A runtime dir of the test's own, and a link to it: its default socket
+    // spelled two ways, whose state goes in a state dir of the test's own.
+    let crystal = Crystal::new();
+    let run = crystal.dir.path().join("run");
+    std::fs::create_dir(&run).unwrap();
+    let link = crystal.dir.path().join("link");
+    std::os::unix::fs::symlink(&run, &link).unwrap();
+    let state = crystal.dir.path().join("state");
+    let at = |socket: &Path, args: &[&str]| {
+        let out = Command::new(CRYSTAL)
+            .arg("--socket")
+            .arg(socket)
+            .args(args)
+            .current_dir(crystal.dir.path())
+            .env("XDG_RUNTIME_DIR", &run)
+            .env("XDG_STATE_HOME", &state)
+            .env("XDG_CONFIG_HOME", crystal.config_home())
+            .envs(PLAIN_GIT)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "crystal {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let socket = run.join("crystal/default.sock");
+    at(&socket, &["new", "-n", "keeper", "sleep", "300"]);
+    let db = state.join("crystal/crystal.db");
+    eventually("the session is saved in the state dir", || {
+        rusqlite::Connection::open(&db)
+            .and_then(|conn| {
+                conn.query_row("SELECT count(*) FROM sessions", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+            })
+            .is_ok_and(|count| count == 1)
+    });
+
+    // Started again through the link: the same socket, so the same state,
+    // and the session comes back.
+    let through_link = link.join("crystal/default.sock");
+    assert_eq!(
+        at(&through_link, &["restart-server"]),
+        "restarted the daemon\n"
+    );
+    let listed = at(&socket, &["ls"]);
+    at(&socket, &["kill-server"]);
+    assert!(listed.contains("keeper"), "{listed}");
+    assert!(!run.join("crystal/default.db").exists());
+    assert!(!link.join("crystal/default.db").exists());
+}
+
+#[test]
 fn a_claude_session_picked_up_again_isn_t_asked_its_task_again() {
     let crystal = Crystal::new();
     let bin = fake_claude(crystal.dir.path());
