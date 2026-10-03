@@ -163,7 +163,7 @@ impl Memory {
                 stale: is_stale(entry, &self.project),
             })
             .collect();
-        listed.sort_by(|a, b| b.entry.id.cmp(&a.entry.id));
+        listed.sort_by_key(|listed| std::cmp::Reverse(listed.entry.id));
         listed
     }
 
