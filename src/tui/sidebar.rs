@@ -1,11 +1,13 @@
 //! The sidebar: every session under its project and its worktree, each
-//! with a mark for what it's doing and how long ago that last changed.
+//! with a mark for what it's doing and how long ago that last changed, and
+//! each flow run under its project, a row for each of its steps.
 
 use super::app::{App, Hit};
 use super::groups::Row;
 use super::status::Status;
 use super::theme::Theme;
 use super::ui::Look;
+use crate::flow_run::{FlowRun, RunState, StepState};
 use crate::github::{PullRequest, PullRequestState};
 use crate::protocol::{Front, SessionInfo};
 use crate::shell;
@@ -109,11 +111,105 @@ fn row_line<'a>(app: &'a App, row: &Row, look: &Look, width: u16, selected: bool
             ])
         }
         Row::Session(index) => {
+            let session = &app.sessions()[*index];
+            if let Some((run, step)) = app.flow_step_of(*index) {
+                return step_line(run, step, Some(session), look, width, selected);
+            }
             let marked = app.marked_letters(*index);
-            session_line(&app.sessions()[*index], &marked, look, width, selected)
+            session_line(session, &marked, look, width, selected)
         }
         Row::Task(index) => task_line(&app.sessions()[*index], theme, width),
+        Row::Flow(run) => flow_heading(&app.flows()[*run], look, width),
+        Row::Step { run, step } => step_line(&app.flows()[*run], *step, None, look, width, false),
     }
+}
+
+/// A flow run's heading, in line with the worktrees: a mark in the color
+/// of how the run stands, the flow's name and the goal, and on the right
+/// the round once it has been sent back. Short of room, the round goes
+/// first, before the goal is cut.
+fn flow_heading<'a>(run: &FlowRun, look: &Look, width: u16) -> Line<'a> {
+    let theme = look.theme;
+    let color = match run.state() {
+        RunState::Running => theme.working,
+        RunState::AtGate => theme.waiting,
+        RunState::Done => theme.done,
+        RunState::Failed | RunState::Interrupted => theme.failed,
+    };
+    // The indent and the mark before the name; a space at the end.
+    let room = usize::from(width).saturating_sub(WORKTREE_INDENT.len() + 2 + 1);
+    let name = fit(&run.flow.name, room);
+    let goal_room = room.saturating_sub(name.chars().count() + 1);
+    let round = if run.round > 1 {
+        format!("round {}", run.round)
+    } else {
+        String::new()
+    };
+    let goal = run.goal.lines().next().unwrap_or("");
+    let round_fits = !round.is_empty() && goal_room >= round.chars().count() + 6;
+    let goal_room = if round_fits {
+        goal_room - round.chars().count() - 1
+    } else {
+        goal_room
+    };
+    let goal = fit(goal, goal_room);
+    let mut spans = vec![
+        Span::raw(WORKTREE_INDENT),
+        Span::styled("◇ ", Style::new().fg(color)),
+        Span::styled(name, Style::new().fg(theme.branch)),
+        Span::raw(" "),
+        Span::styled(goal.clone(), Style::new().fg(theme.muted)),
+    ];
+    if round_fits {
+        let gap = goal_room.saturating_sub(goal.chars().count()) + 1;
+        spans.push(Span::raw(" ".repeat(gap)));
+        spans.push(Span::styled(round, Style::new().fg(theme.muted)));
+    }
+    Line::from(spans)
+}
+
+/// A flow step's row: a mark for how it stands, its name, and, when it has
+/// a session, how long ago that changed. A step with no session is muted.
+fn step_line<'a>(
+    run: &FlowRun,
+    step: usize,
+    session: Option<&SessionInfo>,
+    look: &Look,
+    width: u16,
+    selected: bool,
+) -> Line<'a> {
+    let theme = look.theme;
+    let (mark, color) = match run.steps[step].state {
+        StepState::Pending => ("·", theme.muted),
+        StepState::Running => (Status::Working.mark(look.spin), theme.working),
+        StepState::AtGate => (Status::Waiting.mark(look.spin), theme.waiting),
+        StepState::Done => ("✓", theme.done),
+        StepState::Failed => ("✗", theme.failed),
+        StepState::Interrupted => ("■", theme.failed),
+    };
+    let mut name_style = Style::new().fg(if session.is_some() {
+        theme.text
+    } else {
+        theme.muted
+    });
+    if selected {
+        name_style = name_style.add_modifier(Modifier::BOLD);
+    }
+    // The indent, the mark and a space before the name; a space at the end.
+    let room = usize::from(width).saturating_sub(SESSION_INDENT.len() + 2 + 1);
+    let name = run.step_name(step);
+    let when = session.map_or(String::new(), |session| changed_ago(session, look.now));
+    let (_, when) = fitting_extras(name.chars().count(), "", &when, room);
+    let name = fit(name, room);
+    let gap = room.saturating_sub(name.chars().count() + when.chars().count());
+    Line::from(vec![
+        Span::raw(SESSION_INDENT),
+        Span::styled(mark, Style::new().fg(color)),
+        Span::raw(" "),
+        Span::styled(name, name_style),
+        Span::raw(" ".repeat(gap)),
+        Span::styled(when.to_string(), Style::new().fg(theme.muted)),
+    ])
 }
 
 /// How many backlog items are still to do, at the end of a project's

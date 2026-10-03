@@ -59,6 +59,7 @@ pub const KEYS: &[Key] = &[
     sidebar("W", "remove its worktree"),
     sidebar("r/x", "rename / kill it"),
     of_plugin("tasks", "c", "close its task"),
+    sidebar("g/f", "flow: go on / send back"),
     sidebar("u", "next one that needs you"),
     sidebar("/", "find a session"),
     of_plugin("github", "o/i", "pull request / issues"),

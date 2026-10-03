@@ -12,6 +12,7 @@ use super::text_area::TextArea;
 use super::text_input::TextInput;
 use super::theme::Theme;
 use crate::catalog::{self, Agent, Choices, FirstPrompt, Setting};
+use crate::flows::Flow;
 use crate::profile::{Profile, StartIn};
 use crate::protocol::TaskSpec;
 use crate::{git, shell};
@@ -37,12 +38,14 @@ const BRANCH_LENGTH: usize = 40;
 const LABEL_WIDTH: usize = 13;
 
 /// What can be started: a profile from the config file, an agent crystal
-/// knows, or the user's shell.
+/// knows, the user's shell, or a flow from the config file, whose goal is
+/// the task.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Run {
     Profile(Profile),
     Agent(&'static Agent),
     Shell,
+    Flow(Flow),
 }
 
 impl Run {
@@ -52,6 +55,7 @@ impl Run {
             Run::Profile(profile) => profile.name.clone(),
             Run::Agent(agent) => agent.name.to_string(),
             Run::Shell => "shell".to_string(),
+            Run::Flow(flow) => format!("flow: {}", flow.name),
         }
     }
 
@@ -61,6 +65,7 @@ impl Run {
             Run::Profile(profile) => format!("profile:{}", profile.name),
             Run::Agent(agent) => agent.program.to_string(),
             Run::Shell => "shell".to_string(),
+            Run::Flow(flow) => format!("flow:{}", flow.name),
         }
     }
 
@@ -68,14 +73,17 @@ impl Run {
         match self {
             Run::Profile(profile) => catalog::find(&profile.agent),
             Run::Agent(agent) => Some(agent),
-            Run::Shell => None,
+            Run::Shell | Run::Flow(_) => None,
         }
     }
 
-    /// Whether it can be given a task on its command line.
+    /// Whether it can be given a task on its command line, or for a flow,
+    /// a goal.
     pub fn takes_task(&self) -> bool {
-        self.agent()
-            .is_some_and(|agent| agent.first_prompt != FirstPrompt::None)
+        let agent_takes = self
+            .agent()
+            .is_some_and(|agent| agent.first_prompt != FirstPrompt::None);
+        agent_takes || matches!(self, Run::Flow(_))
     }
 
     /// The rows of choices the panel shows for it: its agent's. A profile
@@ -90,7 +98,7 @@ impl Run {
         match self {
             Run::Profile(profile) => Some(profile.clone()),
             Run::Agent(agent) => Some(Profile::for_agent(agent.program)),
-            Run::Shell => None,
+            Run::Shell | Run::Flow(_) => None,
         }
     }
 }
@@ -169,6 +177,14 @@ pub enum Outcome {
         run: String,
         background: bool,
         backlog: Option<u64>,
+    },
+    /// Start a run of the flow called `flow` at `place`, on `goal`. `run`
+    /// is what the panel remembers.
+    StartFlow {
+        place: Place,
+        flow: String,
+        goal: String,
+        run: String,
     },
     /// Close the panel for the one-line command line, holding `line`.
     CommandLine {
@@ -315,6 +331,9 @@ impl Launcher {
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         match key.code {
             KeyCode::Esc => return Outcome::Cancel,
+            KeyCode::Char('e') if ctrl && matches!(self.run(), Run::Flow(_)) => {
+                self.problem = Some("a flow has no command line to edit".to_string());
+            }
             KeyCode::Char('e') if ctrl => {
                 return Outcome::CommandLine {
                     place: self.place(),
@@ -634,6 +653,7 @@ impl Launcher {
     pub fn description(&self) -> Option<&str> {
         match self.run() {
             Run::Profile(profile) => profile.description.as_deref(),
+            Run::Flow(flow) => flow.description.as_deref(),
             _ => None,
         }
     }
@@ -672,7 +692,9 @@ impl Launcher {
                 format!("{project} ⎇ {branch}")
             }
         };
-        if self.in_background() {
+        if matches!(self.run(), Run::Flow(_)) {
+            format!("New flow run · {place}")
+        } else if self.in_background() {
             format!("New background task · {place}")
         } else {
             format!("New session · {place}")
@@ -704,6 +726,19 @@ impl Launcher {
             self.focus_on(Field::Task);
             return Outcome::Stay;
         }
+        if let Run::Flow(flow) = self.run() {
+            if self.task_text().is_empty() {
+                self.problem = Some("say what the flow should do".to_string());
+                self.focus_on(Field::Task);
+                return Outcome::Stay;
+            }
+            return Outcome::StartFlow {
+                place: self.place(),
+                flow: flow.name.clone(),
+                goal: self.task_text(),
+                run: self.run().key(),
+            };
+        }
         Outcome::Start {
             place: self.place(),
             command: self.command(),
@@ -717,6 +752,9 @@ impl Launcher {
     /// What the panel says runs: the command line, or, in the background,
     /// the `claude -p` run it turns into.
     fn runs_line(&self) -> String {
+        if let Run::Flow(flow) = self.run() {
+            return format!("flow {}: {}", flow.name, flow.chain());
+        }
         let line = self.command_line();
         match background_spec(&self.command()) {
             Some(spec) if self.in_background() => {
@@ -1007,7 +1045,10 @@ fn task_lines(launcher: &Launcher, width: usize) -> Vec<PanelLine> {
     }
     let task = launcher.task();
     if task.is_empty() {
-        let placeholder = "What should it do?  (empty: just start it)";
+        let placeholder = match run {
+            Run::Flow(_) => "What should the flow do?",
+            _ => "What should it do?  (empty: just start it)",
+        };
         return vec![PanelLine::new(vec![(cut(placeholder, width), Ink::Muted)])];
     }
     let rows = task.rows(width);
@@ -1592,5 +1633,31 @@ mod tests {
         let (from, to) = shown_choices(&choices, 8, 40);
         assert!(from <= 8 && 8 < to, "{from}..{to}");
         assert!(from > 0);
+    }
+
+    #[test]
+    fn a_flow_takes_a_goal_and_shows_its_steps_where_a_command_would_be() {
+        let config = crate::config::from_text(crate::flows::EXAMPLE).unwrap();
+        let mut panel = launcher(vec![Run::Flow(config.flows[0].clone()), agent("claude")]);
+        assert_eq!(panel.fields(), [Field::Task, Field::Run, Field::Where]);
+        assert_eq!(panel.run().label(), "flow: ship");
+        assert_eq!(
+            panel.runs_line(),
+            "flow ship: plan → implement → review → pr"
+        );
+        let ctrl_e = KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL);
+        assert_eq!(panel.on_key(ctrl_e), Outcome::Stay);
+        assert_eq!(panel.problem(), Some("a flow has no command line to edit"));
+
+        type_text(&mut panel, "add retries");
+        assert_eq!(
+            press(&mut panel, KeyCode::Enter),
+            Outcome::StartFlow {
+                place: Place::Directory(Some(PathBuf::from("/code/payments"))),
+                flow: "ship".into(),
+                goal: "add retries".into(),
+                run: "flow:ship".into(),
+            }
+        );
     }
 }

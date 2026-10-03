@@ -97,6 +97,8 @@ you are and offers the keys that matter there.
 | `i` | list the open issues of the selected session's project, and start an agent on one |
 | `b` | open the selected session's project's [backlog](#the-backlog) |
 | `c` | close the selected session's [task](#tasks): done or failed, with a line on how it went |
+| `g` | on a step of a [flow](#flows): go on past its gate, or run a step that failed or was cut short again |
+| `f` | on a step of a flow waiting at its gate: send it back, with notes on what to do differently |
 | `d` | show what changed in the selected session's worktree: [the diff](#the-diff) |
 | `p` | find a file in the selected session's worktree and edit it: [the file finder](#the-file-finder) |
 | `m` | what the selected session's project has remembered: [memory](#memory) |

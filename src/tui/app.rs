@@ -18,6 +18,8 @@ use super::text_input::TextInput;
 use crate::catalog::{self, Agent};
 use crate::client::Purpose;
 use crate::config::Config;
+use crate::flow_run::{FlowRun, RunState};
+use crate::flows::{self, Flow};
 use crate::github::{self, PullRequest};
 use crate::keys;
 use crate::profile::{self, Profile};
@@ -136,6 +138,9 @@ pub enum Question {
     /// A line on how the task of the session called `name` went, closing
     /// it done, or `failed`.
     CloseTask { name: String, failed: bool },
+    /// Notes on what the flow run called this is to do differently,
+    /// sending it back from its gate.
+    SendFlowBack(String),
 }
 
 /// A question on the footer line that `y` answers yes and any other key
@@ -191,6 +196,21 @@ pub enum Action {
         spec: TaskSpec,
         backlog: Option<u64>,
     },
+    /// Start a run of the flow called `flow` at `place`, on `goal`.
+    StartFlow {
+        place: Place,
+        flow: String,
+        goal: String,
+    },
+    /// Go on past the gate of the flow run called this.
+    ApproveFlow(String),
+    /// Send the flow run called `run` back from its gate, with `notes`.
+    SendFlowBack {
+        run: String,
+        notes: String,
+    },
+    /// Run the step that stopped the flow run called this again.
+    RetryFlow(String),
     /// Close the task of the session called `name`, done or `failed`.
     CloseTask {
         name: String,
@@ -425,6 +445,13 @@ pub struct App {
     /// How many backlog items each project has to do, by its main
     /// worktree.
     backlog_counts: HashMap<PathBuf, usize>,
+    /// Every flow run, as the daemon last listed them: the sidebar groups
+    /// their steps' sessions under them.
+    flows: Vec<FlowRun>,
+    /// The flows in the config file, which the panel offers.
+    flow_defs: Vec<Flow>,
+    /// Whether flows are on: offered, shown, and answered at their gates.
+    flows_on: bool,
 }
 
 impl App {
@@ -465,6 +492,9 @@ impl App {
             closing: None,
             backlog: None,
             backlog_counts: HashMap::new(),
+            flows: Vec::new(),
+            flow_defs: Vec::new(),
+            flows_on: true,
         }
     }
 
@@ -475,6 +505,7 @@ impl App {
         self.memory_on = crate::memory::enabled(config);
         self.profiles_on = profile::enabled(config);
         self.github_on = github::enabled(config);
+        self.flows_on = flows::enabled(config);
     }
 
     /// Whether the TUI asks GitHub about the sessions' projects.
@@ -550,6 +581,11 @@ impl App {
         self.plugin_pane.as_ref()
     }
 
+    /// Whether flows are on, which is whether the daemon is asked for them.
+    pub fn shows_flows(&self) -> bool {
+        self.flows_on
+    }
+
     /// Whether the TUI shows tasks: under sessions, and in pane headers.
     pub fn shows_tasks(&self) -> bool {
         self.tasks_on
@@ -566,6 +602,7 @@ impl App {
     /// as a profile of its own.
     pub fn set_launch_settings(&mut self, config: &Config) {
         self.profiles = config.profiles.clone();
+        self.flow_defs = config.flows.clone();
         self.new_session_profile = None;
         self.first_run = None;
         let words = command_line::parse(&config.new_session).unwrap_or_default();
@@ -702,6 +739,24 @@ impl App {
         &self.sessions
     }
 
+    /// Takes a fresh list of flow runs from the daemon, and puts the
+    /// sessions in order again around them.
+    pub fn set_flows(&mut self, runs: Vec<FlowRun>) {
+        self.flows = runs;
+        self.set_sessions(self.sessions.clone());
+    }
+
+    pub fn flows(&self) -> &[FlowRun] {
+        &self.flows
+    }
+
+    /// The flow run the session at `index` is a step of, and which step.
+    pub fn flow_step_of(&self, index: usize) -> Option<(&FlowRun, usize)> {
+        let session = self.sessions.get(index)?;
+        let (run, step) = groups::flow_step(session, self.shown_flows())?;
+        Some((&self.flows[run], step))
+    }
+
     /// Whether any session's agent is working, which is when the TUI keeps
     /// drawing to turn its mark.
     pub fn anything_working(&self) -> bool {
@@ -714,7 +769,9 @@ impl App {
     /// only those that match while `/`'s filter is open.
     pub fn rows(&self) -> Vec<Row> {
         let shown = self.matches();
-        let mut rows = groups::rows(&self.sessions, |index| shown.contains(&index));
+        let mut rows = groups::rows(&self.sessions, self.shown_flows(), |index| {
+            shown.contains(&index)
+        });
         if !self.tasks_on {
             rows.retain(|row| !matches!(row, Row::Task(_)));
         }
@@ -937,7 +994,7 @@ impl App {
     /// end of it.
     pub fn set_sessions(&mut self, sessions: Vec<SessionInfo>) {
         let selected_name = self.selected().map(|session| session.name.clone());
-        self.sessions = groups::order(sessions);
+        self.sessions = groups::order(sessions, self.shown_flows());
         let still_there = selected_name.and_then(|name| self.position(&name));
         if let Some(index) = still_there {
             self.selected = index;
@@ -1170,6 +1227,8 @@ impl App {
             KeyCode::Char('c') => self.notify(plugins::off("tasks")),
             KeyCode::Char('b') => self.notify(plugins::off("backlog")),
             KeyCode::Char('X') => return Some(Action::ListPlugins),
+            KeyCode::Char('g') if self.flows_on => return self.go_on_with_flow(),
+            KeyCode::Char('f') if self.flows_on => self.ask_to_send_flow_back(),
             KeyCode::Char('q') => return Some(Action::Quit),
             KeyCode::Char(c) => return self.run_plugin_key(c),
             _ => {}
@@ -1326,9 +1385,24 @@ impl App {
         };
         if selected.state == State::Running {
             self.type_into_selected();
-        } else {
-            self.confirm = Some(Confirm::Respawn(selected.name.clone()));
+            return;
         }
+        let name = selected.name.clone();
+        // A flow's step runs again as a step of its run, or the run
+        // wouldn't know.
+        let flow_step = self
+            .selected_index()
+            .and_then(|index| self.flow_step_of(index));
+        if let Some((run, step)) = flow_step {
+            let notice = format!(
+                "g runs {} again, as a step of {}",
+                run.step_name(step),
+                run.name
+            );
+            self.notify(notice);
+            return;
+        }
+        self.confirm = Some(Confirm::Respawn(name));
     }
 
     /// Asks for a new name for the selected session, starting from the
@@ -1527,6 +1601,56 @@ impl App {
         }
     }
 
+    /// The flow runs the sidebar groups sessions under: none while flows
+    /// are off.
+    fn shown_flows(&self) -> &[FlowRun] {
+        if self.flows_on { &self.flows } else { &[] }
+    }
+
+    /// The flow run the selected session is a step of, or `None`, the
+    /// footer saying it isn't one.
+    fn selected_flow(&mut self) -> Option<FlowRun> {
+        let index = self.selected_index()?;
+        let found = self.flow_step_of(index).map(|(run, _)| run.clone());
+        if found.is_none() {
+            let name = self.sessions[index].name.clone();
+            self.notify(format!("{name} isn't a step of a flow"));
+        }
+        found
+    }
+
+    /// `g`: the selected step's flow goes on: past the gate it waits at, or,
+    /// stopped at a step that failed or was cut short, with that step run
+    /// again. Running or done, the footer says so.
+    fn go_on_with_flow(&mut self) -> Option<Action> {
+        let run = self.selected_flow()?;
+        match run.state() {
+            RunState::AtGate => Some(Action::ApproveFlow(run.name)),
+            RunState::Failed | RunState::Interrupted => Some(Action::RetryFlow(run.name)),
+            RunState::Running => {
+                self.notify(format!("{} is still running", run.name));
+                None
+            }
+            RunState::Done => {
+                self.notify(format!("{} is done", run.name));
+                None
+            }
+        }
+    }
+
+    /// `f`: asks, on the footer, for notes to send the selected step's flow
+    /// back from its gate with.
+    fn ask_to_send_flow_back(&mut self) {
+        let Some(run) = self.selected_flow() else {
+            return;
+        };
+        if run.state() == RunState::AtGate {
+            self.ask(Question::SendFlowBack(run.name), "");
+        } else {
+            self.notify(format!("{} isn't waiting at a gate", run.name));
+        }
+    }
+
     /// `b`: opens the backlog of the selected session's project: its main
     /// worktree's, or, outside git, its directory's.
     fn open_backlog(&mut self) -> Option<Action> {
@@ -1631,6 +1755,11 @@ impl App {
             .cloned()
             .map(Run::Profile)
             .collect();
+        // A flow's steps are Claude Code's background tasks.
+        let has_claude = self.agents.iter().any(|agent| agent.program == "claude");
+        if self.flows_on && has_claude {
+            runs.extend(self.flow_defs.iter().cloned().map(Run::Flow));
+        }
         runs.extend(self.agents.iter().map(|agent| Run::Agent(agent)));
         runs.push(Run::Shell);
         let wanted = [self.memory.last_run.as_ref(), self.first_run.as_ref()];
@@ -1769,6 +1898,16 @@ impl App {
                     purpose,
                 })
             }
+            launcher::Outcome::StartFlow {
+                place,
+                flow,
+                goal,
+                run,
+            } => {
+                self.launcher = None;
+                self.memory.remember(&goal, &run);
+                Some(Action::StartFlow { place, flow, goal })
+            }
             launcher::Outcome::CommandLine { place, line } => {
                 self.launcher = None;
                 self.ask(Question::Command(place), &line);
@@ -1871,6 +2010,7 @@ impl App {
                 failed,
                 summary: answer,
             }),
+            Question::SendFlowBack(run) => Some(Action::SendFlowBack { run, notes: answer }),
             // An empty answer, or the name it already has, changes nothing.
             Question::Rename(name) => {
                 if answer.is_empty() || answer == name {
@@ -3422,5 +3562,188 @@ mod tests {
         assert_eq!(app.backlog_open(Path::new("/code/shop")), Some(3));
         assert_eq!(app.backlog_open(Path::new("/code/blog")), None);
         assert_eq!(app.backlog_open(Path::new("/code/else")), None);
+    }
+
+    /// The config file with a flow, `ship`: plan, then a review with a gate.
+    fn config_with_a_flow() -> Config {
+        crate::config::from_text(
+            r#"
+[[flow]]
+name = "ship"
+description = "Plan, then review"
+
+[[flow.step]]
+name = "plan"
+prompt = "Plan {goal}"
+
+[[flow.step]]
+name = "review"
+prompt = "Review it"
+gate = true
+"#,
+        )
+        .unwrap()
+    }
+
+    /// An app whose sessions `ship-1-plan` and `ship-1-review` are the steps
+    /// of the run `ship-1`, which stands as `review` says, beside a session
+    /// of its own.
+    fn app_with_a_run(review: crate::flow_run::StepState) -> App {
+        use crate::flow_run::{FlowRun, StepState};
+        let config = config_with_a_flow();
+        let mut run = FlowRun::new(
+            "ship-1".into(),
+            config.flows[0].clone(),
+            &[],
+            "add retries".into(),
+            PathBuf::from("/"),
+            Default::default(),
+            0,
+        );
+        run.steps[0].state = StepState::Done;
+        run.steps[0].session = Some("ship-1-plan".into());
+        run.steps[1].state = review;
+        run.steps[1].session = Some("ship-1-review".into());
+        let mut app = App::new(None);
+        app.set_flows(vec![run]);
+        app.set_sessions(vec![
+            session("ship-1-review"),
+            session("shell"),
+            session("ship-1-plan"),
+        ]);
+        app
+    }
+
+    #[test]
+    fn a_runs_steps_follow_the_other_sessions_in_step_order() {
+        let app = app_with_a_run(crate::flow_run::StepState::Running);
+        let names: Vec<&str> = app.sessions().iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["shell", "ship-1-plan", "ship-1-review"]);
+        assert_eq!(
+            app.flow_step_of(2)
+                .map(|(run, step)| (run.name.as_str(), step)),
+            Some(("ship-1", 1))
+        );
+        assert!(app.flow_step_of(0).is_none());
+        assert!(app.rows().contains(&Row::Flow(0)));
+    }
+
+    #[test]
+    fn g_goes_on_past_the_gate_of_the_selected_steps_run() {
+        let mut app = app_with_a_run(crate::flow_run::StepState::AtGate);
+        app.select("ship-1-plan");
+        assert_eq!(
+            press(&mut app, KeyCode::Char('g')),
+            Some(Action::ApproveFlow("ship-1".into()))
+        );
+    }
+
+    #[test]
+    fn g_runs_a_step_that_failed_again() {
+        let mut app = app_with_a_run(crate::flow_run::StepState::Failed);
+        app.select("ship-1-review");
+        assert_eq!(
+            press(&mut app, KeyCode::Char('g')),
+            Some(Action::RetryFlow("ship-1".into()))
+        );
+    }
+
+    #[test]
+    fn g_on_a_run_going_or_a_session_of_no_flow_says_why_not() {
+        let mut app = app_with_a_run(crate::flow_run::StepState::Running);
+        app.select("ship-1-review");
+        assert_eq!(press(&mut app, KeyCode::Char('g')), None);
+        assert_eq!(app.notice(), Some("ship-1 is still running"));
+        app.select("shell");
+        assert_eq!(press(&mut app, KeyCode::Char('g')), None);
+        assert_eq!(app.notice(), Some("shell isn't a step of a flow"));
+    }
+
+    #[test]
+    fn f_asks_for_notes_then_sends_the_run_back_with_them() {
+        let mut app = app_with_a_run(crate::flow_run::StepState::AtGate);
+        app.select("ship-1-review");
+        assert_eq!(press(&mut app, KeyCode::Char('f')), None);
+        assert_eq!(
+            app.prompt().map(|prompt| &prompt.question),
+            Some(&Question::SendFlowBack("ship-1".into()))
+        );
+        type_text(&mut app, "keep the old default");
+        assert_eq!(
+            press(&mut app, KeyCode::Enter),
+            Some(Action::SendFlowBack {
+                run: "ship-1".into(),
+                notes: "keep the old default".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn f_on_a_run_not_at_a_gate_says_so() {
+        let mut app = app_with_a_run(crate::flow_run::StepState::Running);
+        app.select("ship-1-review");
+        press(&mut app, KeyCode::Char('f'));
+        assert!(app.prompt().is_none());
+        assert_eq!(app.notice(), Some("ship-1 isn't waiting at a gate"));
+    }
+
+    #[test]
+    fn the_panel_offers_flows_and_starts_one_on_its_goal() {
+        let mut app = with_agents(&["claude"], vec![]);
+        app.set_launch_settings(&config_with_a_flow());
+        press(&mut app, KeyCode::Char('n'));
+        press(&mut app, KeyCode::Tab); // run
+        while run_key(&app) != "flow:ship" {
+            press(&mut app, KeyCode::Right);
+        }
+        let panel = app.launcher().unwrap();
+        assert!(
+            panel.title().starts_with("New flow run"),
+            "{}",
+            panel.title()
+        );
+        // A flow needs its goal.
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(
+            app.launcher().unwrap().problem(),
+            Some("say what the flow should do")
+        );
+        type_text(&mut app, "add retries");
+        assert_eq!(
+            press(&mut app, KeyCode::Enter),
+            Some(Action::StartFlow {
+                place: Place::Directory(None),
+                flow: "ship".into(),
+                goal: "add retries".into(),
+            })
+        );
+        assert_eq!(app.memory().last_run.as_deref(), Some("flow:ship"));
+    }
+
+    #[test]
+    fn without_claude_code_no_flow_is_offered() {
+        let mut app = with_agents(&["codex"], vec![]);
+        app.set_launch_settings(&config_with_a_flow());
+        let setup = app.launch_setup(false);
+        assert!(!setup.runs.iter().any(|run| matches!(run, Run::Flow(_))));
+    }
+
+    #[test]
+    fn enter_on_a_failed_step_points_to_g_rather_than_running_it_alone() {
+        let mut app = app_with_a_run(crate::flow_run::StepState::Failed);
+        let mut sessions = app.sessions().to_vec();
+        for session in &mut sessions {
+            if session.name == "ship-1-review" {
+                session.state = State::Exited { code: 1 };
+            }
+        }
+        app.set_sessions(sessions);
+        app.select("ship-1-review");
+        assert_eq!(press(&mut app, KeyCode::Enter), None);
+        assert!(app.confirm().is_none());
+        assert_eq!(
+            app.notice(),
+            Some("g runs review again, as a step of ship-1")
+        );
     }
 }

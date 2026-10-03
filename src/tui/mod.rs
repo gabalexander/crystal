@@ -32,6 +32,7 @@ mod theme;
 mod ui;
 
 use crate::config::{self, Config};
+use crate::flow_run::FlowRun;
 use crate::github::{self, Issue, PullRequest};
 use crate::memory::{self, Listed, Memory};
 use crate::plugins::{self, Context};
@@ -81,6 +82,8 @@ pub enum Event {
     /// and resizes the pane's session to fit.
     Resize,
     Sessions(Vec<SessionInfo>),
+    /// Every flow run, as the daemon listed them.
+    Flows(Vec<FlowRun>),
     /// Output from the session in the pane with this id.
     Output {
         pane: u64,
@@ -150,7 +153,13 @@ pub fn run(socket: &Path) -> Result<()> {
     let (sender, events) = mpsc::channel();
     spawn_input_reader(sender.clone());
     let count_backlog = Arc::new(AtomicBool::new(crate::backlog::enabled(&config)));
-    spawn_session_poller(socket.to_path_buf(), sender.clone(), count_backlog.clone());
+    let poll_flows = crate::flows::enabled(&config);
+    spawn_session_poller(
+        socket.to_path_buf(),
+        sender.clone(),
+        count_backlog.clone(),
+        poll_flows,
+    );
     let projects = Arc::new(Mutex::new(Vec::new()));
     spawn_pull_request_poller(projects.clone(), sender.clone());
 
@@ -174,6 +183,9 @@ pub fn run(socket: &Path) -> Result<()> {
     tui.app.set_features(&config);
     tui.app.set_plugin_keys(plugin_keys(&config));
     tui.app.set_memory(launcher::load_memory(&tui.memory_path));
+    if poll_flows {
+        tui.app.set_flows(list_flows(socket));
+    }
     tui.set_sessions(sessions);
 
     let mut terminal = ratatui::try_init()?;
@@ -353,6 +365,7 @@ impl Tui {
             Event::CodexModels(models) => self.app.set_codex_models(models),
             Event::Resize => {}
             Event::Sessions(sessions) => self.set_sessions(sessions),
+            Event::Flows(runs) => self.app.set_flows(runs),
             Event::PullRequests { project, found } => self.app.set_pull_requests(project, found),
             Event::Issues { project, found } => self.app.set_issues(&project, found),
             Event::IssueBody {
@@ -476,6 +489,30 @@ impl Tui {
                 self.refresh_sessions()?;
                 self.app.select(&name);
                 launcher::save_memory(&self.memory_path, self.app.memory());
+            }
+            Action::StartFlow { place, flow, goal } => {
+                let cwd = directory_for(&self.socket, place)?;
+                let run = client::start_flow(&self.socket, &flow, &goal, cwd)?;
+                // Its first step takes no keys: the sidebar keeps them.
+                self.refresh_sessions()?;
+                let first = self.app.flows().iter().find(|found| found.name == run);
+                let session = first.and_then(|run| run.steps.first()?.session.clone());
+                if let Some(session) = session {
+                    self.app.select(&session);
+                }
+                launcher::save_memory(&self.memory_path, self.app.memory());
+            }
+            Action::ApproveFlow(run) => {
+                client::ask(&self.socket, &Request::ApproveFlow { run }, false)?;
+                self.refresh_sessions()?;
+            }
+            Action::SendFlowBack { run, notes } => {
+                client::ask(&self.socket, &Request::SendFlowBack { run, notes }, false)?;
+                self.refresh_sessions()?;
+            }
+            Action::RetryFlow(run) => {
+                client::ask(&self.socket, &Request::RetryFlow { run }, false)?;
+                self.refresh_sessions()?;
             }
             Action::CloseTask {
                 name,
@@ -845,6 +882,9 @@ impl Tui {
     /// Asks for the list now, rather than waiting for the next poll, so a
     /// key's effect shows straight away.
     fn refresh_sessions(&mut self) -> Result<()> {
+        if self.app.shows_flows() {
+            self.app.set_flows(list_flows(&self.socket));
+        }
         let sessions = list_sessions(&self.socket, false)?;
         self.set_sessions(sessions);
         Ok(())
@@ -1114,6 +1154,14 @@ fn list_sessions(socket: &Path, start: bool) -> Result<Vec<SessionInfo>> {
     }
 }
 
+/// Every flow run, or none when the daemon can't say.
+fn list_flows(socket: &Path) -> Vec<FlowRun> {
+    match client::ask(socket, &Request::ListFlows, false) {
+        Ok(Some(Response::Flows { runs })) => runs,
+        _ => Vec::new(),
+    }
+}
+
 /// Reads keys, the mouse and resizes off the terminal on a thread of its
 /// own, since reading blocks.
 fn spawn_input_reader(events: Sender<Event>) {
@@ -1160,13 +1208,22 @@ fn spawn_pull_request_poller(projects: Arc<Mutex<Vec<PathBuf>>>, events: Sender<
     });
 }
 
-/// Asks for the session list every [`POLL_EVERY`], and with
+/// Asks for the session list every [`POLL_EVERY`]: with `poll_flows`, the
+/// flow runs first, which the sidebar groups the sessions under; and with
 /// `count_backlog`, how many backlog items each of their projects has to
 /// do.
-fn spawn_session_poller(socket: PathBuf, events: Sender<Event>, count_backlog: Arc<AtomicBool>) {
+fn spawn_session_poller(
+    socket: PathBuf,
+    events: Sender<Event>,
+    count_backlog: Arc<AtomicBool>,
+    poll_flows: bool,
+) {
     thread::spawn(move || {
         loop {
             thread::sleep(POLL_EVERY);
+            if poll_flows && events.send(Event::Flows(list_flows(&socket))).is_err() {
+                return;
+            }
             // A daemon that has gone away has no sessions left.
             let sessions = list_sessions(&socket, false).unwrap_or_default();
             let projects = projects_of(&sessions);

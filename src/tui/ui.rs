@@ -19,6 +19,7 @@ use super::screen_widget::ScreenWidget;
 use super::sidebar::{self, fit};
 use super::status::Status;
 use super::theme::Theme;
+use crate::flow_run::RunState;
 use crate::protocol::{SessionInfo, State};
 use crate::shell;
 use ratatui::Frame;
@@ -452,7 +453,13 @@ fn header_notes(app: &App, slot: Slot, session: &SessionInfo, back: usize) -> Ve
     if slot != Slot::Selected && selected {
         notes.push("selected".to_string());
     }
-    if app.shows_tasks()
+    let index = app.sessions().iter().position(|s| s.name == session.name);
+    let flow_step = index.and_then(|index| app.flow_step_of(index));
+    if let Some((run, step)) = flow_step {
+        // A step's task is the step: the run and how far it's got say more.
+        let state = run.steps[step].state.word();
+        notes.push(format!("{} {} · {state}", run.name, run.step_name(step)));
+    } else if app.shows_tasks()
         && let Some(note) = task_note(session)
     {
         notes.push(note);
@@ -675,6 +682,30 @@ const SIDEBAR_HINTS: &[(&str, &str)] = &[
     ("p", "files"),
 ];
 
+/// The sidebar's keys while the selected step's flow run waits at a gate.
+const GATE_HINTS: &[(&str, &str)] = &[
+    ("g", "go on"),
+    ("f", "send back"),
+    ("n", "new"),
+    ("x", "kill"),
+    ("q", "quit"),
+    ("u", "next"),
+    ("/", "find"),
+    ("d", "diff"),
+];
+
+/// The sidebar's keys while the selected step's flow run has stopped, at a
+/// step that failed or was cut short.
+const STOPPED_HINTS: &[(&str, &str)] = &[
+    ("g", "run again"),
+    ("n", "new"),
+    ("x", "kill"),
+    ("q", "quit"),
+    ("u", "next"),
+    ("/", "find"),
+    ("d", "diff"),
+];
+
 /// The keys while the new-session panel is open.
 const LAUNCHER_HINTS: &[(&str, &str)] = &[
     ("enter", "start"),
@@ -764,7 +795,7 @@ const PANE_HINTS: &[(&str, &str)] = &[("ctrl+\\", "sidebar"), ("shift+pgup", "hi
 /// fit beside "? keys".
 fn hints_line<'a>(app: &App, theme: &Theme, width: u16) -> Line<'a> {
     let (mut spans, hints) = match app.focus() {
-        Focus::Sidebar => (whereabouts(app, theme, width), SIDEBAR_HINTS),
+        Focus::Sidebar => (whereabouts(app, theme, width), sidebar_hints(app)),
         Focus::Pane(slot) => {
             let name = app.pane_session(slot).map_or("", |s| s.name.as_str());
             let spans = vec![
@@ -790,6 +821,18 @@ fn hints_line<'a>(app: &App, theme: &Theme, width: u16) -> Line<'a> {
         ));
     }
     Line::from(spans)
+}
+
+/// The sidebar's keys, led by what the selected step's flow run takes
+/// while it waits on the user.
+fn sidebar_hints(app: &App) -> &'static [(&'static str, &'static str)] {
+    let index = app.selected_index();
+    let run = index.and_then(|index| app.flow_step_of(index));
+    match run.map(|(run, _)| run.state()) {
+        Some(RunState::AtGate) => GATE_HINTS,
+        Some(RunState::Failed | RunState::Interrupted) => STOPPED_HINTS,
+        _ => SIDEBAR_HINTS,
+    }
 }
 
 /// Where the selected session is: its project, branch and name. Cut from
@@ -838,6 +881,7 @@ fn draw_prompt(frame: &mut Frame, theme: &Theme, prompt: &Prompt, area: Rect) {
         Question::Rename(_) => " new name: ",
         Question::CloseTask { failed: false, .. } => " done; what was done: ",
         Question::CloseTask { failed: true, .. } => " failed; why: ",
+        Question::SendFlowBack(_) => " send back; what to do differently: ",
     };
     let line = Line::from(vec![
         Span::styled(
@@ -1013,6 +1057,56 @@ mod tests {
         assert!(
             screen[1].contains("▸ claude ─"),
             "the pane's header names it"
+        );
+    }
+
+    #[test]
+    fn a_flow_run_heads_a_row_for_each_of_its_steps() {
+        use crate::flow_run::{FlowRun, StepState};
+        let config = crate::config::from_text(crate::flows::EXAMPLE).unwrap();
+        let mut run = FlowRun::new(
+            "ship-1".into(),
+            config.flows[0].clone(),
+            &config.profiles,
+            "add retries".into(),
+            PathBuf::from("/"),
+            Default::default(),
+            0,
+        );
+        run.round = 2;
+        run.steps[0].state = StepState::Done;
+        run.steps[0].session = Some("ship-1-plan".into());
+        run.steps[1].state = StepState::Done;
+        run.steps[1].session = Some("ship-1-implement".into());
+        run.steps[2].state = StepState::AtGate;
+        run.steps[2].session = Some("ship-1-review".into());
+        let mut app = App::new(None);
+        app.set_flows(vec![run]);
+        app.set_sessions(vec![
+            session("ship-1-plan", State::Running),
+            session("ship-1-implement", State::Running),
+            session("ship-1-review", State::Running),
+        ]);
+        app.select("ship-1-review");
+        let sidebar = sidebar_text(&app);
+        let heading = line_with(&sidebar, "◇ ship add retr");
+        assert!(sidebar[heading].contains("round 2"), "{}", sidebar[heading]);
+        assert_eq!(line_with(&sidebar, "✓ plan"), heading + 1);
+        assert_eq!(line_with(&sidebar, "✓ implement"), heading + 2);
+        assert_eq!(line_with(&sidebar, "▲ review"), heading + 3);
+        assert_eq!(line_with(&sidebar, "· pr"), heading + 4);
+        // The footer offers what the gate takes, and the pane's header says
+        // where the run is.
+        let screen = screen_text(&app);
+        let footer = screen.last().unwrap();
+        assert!(
+            footer.contains("g go on") && footer.contains("f send back"),
+            "{footer}"
+        );
+        assert!(
+            screen[1].contains("ship-1 review · waiting"),
+            "{}",
+            screen[1]
         );
     }
 
