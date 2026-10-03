@@ -573,10 +573,20 @@ impl Daemon {
                     Some(id) => with_id(&mut sessions, &id)?,
                     None => named(&mut sessions, &name)?,
                 };
-                session.on_agent_event(event);
                 if let Some(conversation) = conversation {
                     session.set_conversation(conversation);
                 }
+                // Reminded that its task is open, the agent carries on: its
+                // turn hasn't ended, and it isn't done.
+                if event == AgentEvent::TurnEnded
+                    && tasks::enabled(&settings())
+                    && session.remind_of_task()
+                {
+                    return Ok(Response::Remind {
+                        text: tasks::REMINDER.to_string(),
+                    });
+                }
+                session.on_agent_event(event);
                 Ok(Response::Done)
             }
             Request::Kill { name } => {

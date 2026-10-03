@@ -77,6 +77,9 @@ pub struct Session {
     /// What the agent was asked to do, for a session started with
     /// something to do: a task, in a terminal or in the background.
     goal: Option<TaskInfo>,
+    /// Whether its agent has been reminded that its task is still open,
+    /// which it is once.
+    reminded: bool,
     /// Tasks that closed of themselves, like a background task whose run
     /// ended, for the daemon to write down.
     closed: Vec<TaskRecord>,
@@ -153,6 +156,7 @@ impl Session {
             front_checked: Instant::now(),
             task: None,
             goal: None,
+            reminded: false,
             closed: Vec::new(),
             term,
         })
@@ -199,6 +203,7 @@ impl Session {
             front_checked: Instant::now(),
             task: Some(task),
             goal: None,
+            reminded: false,
             closed: Vec::new(),
             term,
         }
@@ -276,6 +281,22 @@ impl Session {
         });
         *self.changed.lock().unwrap() = SystemTime::now();
         Ok(self.task_record().expect("the task was just closed"))
+    }
+
+    /// Whether to remind the agent, as it ends a turn, that its task is
+    /// still open: once, so one that has its reasons, like waiting on the
+    /// user, isn't held up turn after turn. A background task has no turns
+    /// to end; its runs close it.
+    pub fn remind_of_task(&mut self) -> bool {
+        let open = self
+            .goal
+            .as_ref()
+            .is_some_and(|goal| goal.outcome.is_none() && !goal.background);
+        if !open || self.reminded {
+            return false;
+        }
+        self.reminded = true;
+        true
     }
 
     /// The tasks that have closed of themselves since this was last asked,
