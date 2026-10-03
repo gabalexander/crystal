@@ -749,6 +749,28 @@ fn q_quits_the_tui_and_the_sessions_keep_running() {
 }
 
 #[test]
+fn a_question_mark_shows_every_key_and_the_next_key_only_closes_it() {
+    let crystal = Crystal::new();
+    crystal.ok(&["new", "-n", "stays", "sleep", "30"]);
+
+    let mut tui = crystal.tui();
+    tui.shows("? keys");
+    tui.type_keys("?");
+    tui.shows("In the sidebar");
+    tui.shows("next one that needs you");
+    tui.shows("With the mouse");
+
+    // q puts the keys away; it doesn't quit.
+    tui.type_keys("q");
+    eventually("the keys are put away", || {
+        !tui.text().contains("In the sidebar")
+    });
+    tui.shows("▶ stays");
+    tui.type_keys("q");
+    assert!(tui.exit());
+}
+
+#[test]
 fn an_ended_session_shows_how_it_ended() {
     let crystal = Crystal::new();
     crystal.ok(&["new", "-n", "done", "sh", "-c", "echo last words; exit 3"]);

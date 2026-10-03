@@ -4,6 +4,7 @@
 
 use super::app::{App, Focus, Hit, Prompt, Question, Slot};
 use super::groups::Row;
+use super::help;
 use super::pane::Pane;
 use super::screen_widget::ScreenWidget;
 use crate::protocol::{Activity, SessionInfo, State};
@@ -125,6 +126,9 @@ pub fn draw(frame: &mut Frame, app: &App, panes: &[Pane]) {
         draw_pane(frame, app, slot, *area, panes);
     }
     draw_footer(frame, app, areas.footer);
+    if app.showing_keys() {
+        help::draw(frame, frame.area());
+    }
 }
 
 fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect) {
@@ -275,7 +279,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     } else if let Some(notice) = app.notice() {
         Line::from(notice.to_string()).red()
     } else if app.focus() == Focus::Sidebar {
-        Line::from("j/k · enter type · tab pane · s split · n new · w worktree · x kill · q quit")
+        Line::from("j/k · enter type · s split · n new · w worktree · x kill · ? keys · q quit")
             .dark_gray()
     } else {
         Line::from("typing into the session · ctrl+\\ back to the list · shift+pgup history")
@@ -347,6 +351,29 @@ mod tests {
     fn line_with(lines: &[String], text: &str) -> usize {
         let found = lines.iter().position(|line| line.contains(text));
         found.unwrap_or_else(|| panic!("{text:?} isn't on screen:\n{}", lines.join("\n")))
+    }
+
+    #[test]
+    fn the_keys_overlay_draws_over_an_80_by_24_screen() {
+        let mut app = App::new(None);
+        app.on_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &app, &[])).unwrap();
+        let buffer = terminal.backend().buffer();
+        let text: String = (0..buffer.area.height)
+            .flat_map(|y| (0..buffer.area.width).map(move |x| (x, y)))
+            .map(|cell| buffer[cell].symbol().to_string())
+            .collect();
+        let expected = [
+            "In the sidebar",
+            "In a pane",
+            "Ctrl+\\",
+            "With the mouse",
+            "any key closes this",
+        ];
+        for on_screen in expected {
+            assert!(text.contains(on_screen), "{on_screen} isn't on screen");
+        }
     }
 
     #[test]

@@ -9,6 +9,7 @@
 mod app;
 mod command_line;
 mod groups;
+mod help;
 mod mouse;
 mod pane;
 mod screen_widget;

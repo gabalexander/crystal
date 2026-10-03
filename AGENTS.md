@@ -44,6 +44,8 @@ is: it's the one request every version must understand.
   - `app.rs`: the state and how keys and the mouse change it; no I/O, so it's unit-tested
   - `ui.rs`: the layout and drawing, and what's under the mouse
   - `mouse.rs`: writes mouse events the way a program in a pane asked for them
+  - `help.rs`: the overlay `?` opens, drawn from one table of every key; a test keeps the README's
+    table of sidebar keys in step with it
   - `groups.rs`: the sidebar's order and headings: sessions by project, then worktree
   - `text_input.rs`: a one-line text box, for the questions asked on the bottom line
   - `command_line.rs`: reads the line typed at `new session:` into the command to run

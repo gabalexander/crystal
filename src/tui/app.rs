@@ -183,6 +183,8 @@ pub struct App {
     /// Something to tell the user, like why a key didn't work. It stays
     /// until the next key.
     notice: Option<String>,
+    /// Whether the overlay listing every key is open.
+    showing_keys: bool,
 }
 
 impl App {
@@ -200,6 +202,7 @@ impl App {
             last_pane: None,
             own_id,
             notice: None,
+            showing_keys: false,
         }
     }
 
@@ -211,6 +214,11 @@ impl App {
 
     pub fn notice(&self) -> Option<&str> {
         self.notice.as_deref()
+    }
+
+    /// Whether the overlay listing every key is open.
+    pub fn showing_keys(&self) -> bool {
+        self.showing_keys
     }
 
     pub fn notify(&mut self, notice: String) {
@@ -373,6 +381,12 @@ impl App {
 
     pub fn on_key(&mut self, key: KeyEvent) -> Option<Action> {
         self.notice = None;
+        // Any key closes the list of keys, and does nothing else: the key
+        // that closes it may be one the user was only reading about.
+        if self.showing_keys {
+            self.showing_keys = false;
+            return None;
+        }
         // Only `y` says yes; any other key says no.
         if let Some(confirm) = self.confirm.take() {
             if key.code == KeyCode::Char('y') {
@@ -393,6 +407,13 @@ impl App {
     /// selects a session or hands a pane the keyboard, and the wheel moves
     /// the selection, or scrolls a pane through its history.
     pub fn on_mouse(&mut self, kind: MouseEventKind, hit: Hit) -> Option<Action> {
+        // A click closes the list of keys, like a key does.
+        if self.showing_keys {
+            if kind == MouseEventKind::Down(MouseButton::Left) {
+                self.showing_keys = false;
+            }
+            return None;
+        }
         // A question on the footer waits for its answer from the keyboard.
         if self.prompt.is_some() || self.confirm.is_some() {
             return None;
@@ -450,6 +471,7 @@ impl App {
             KeyCode::Char('r') => self.ask_for_name(),
             KeyCode::Char('x') => self.confirm = Some(Confirm::Kill(self.selected()?.name.clone())),
             KeyCode::Char('u') => self.select_next_needing_user(),
+            KeyCode::Char('?') => self.showing_keys = true,
             KeyCode::Char('q') => return Some(Action::Quit),
             _ => {}
         }
@@ -951,6 +973,28 @@ mod tests {
     fn q_asks_to_quit() {
         let mut app = app_with(&["a"]);
         assert_eq!(press(&mut app, KeyCode::Char('q')), Some(Action::Quit));
+    }
+
+    #[test]
+    fn a_question_mark_shows_the_keys_and_any_key_puts_them_away() {
+        let mut app = app_with(&["a", "b"]);
+        press(&mut app, KeyCode::Char('?'));
+        assert!(app.showing_keys());
+
+        // q is read about, not obeyed: the TUI doesn't quit.
+        assert_eq!(press(&mut app, KeyCode::Char('q')), None);
+        assert!(!app.showing_keys());
+    }
+
+    #[test]
+    fn the_key_that_closes_the_keys_does_nothing_else() {
+        let mut app = app_with(&["a", "b"]);
+        for code in [KeyCode::Char('x'), KeyCode::Char('j'), KeyCode::Char('n')] {
+            press(&mut app, KeyCode::Char('?'));
+            assert_eq!(press(&mut app, code), None);
+            assert!(app.confirm().is_none() && app.prompt().is_none());
+            assert_eq!(selected_name(&app), Some("a"));
+        }
     }
 
     fn in_project(name: &str, project: &str) -> SessionInfo {
@@ -1521,5 +1565,16 @@ mod tests {
             Some(&Confirm::Kill("a".into())),
             "the question is still asked"
         );
+    }
+
+    #[test]
+    fn a_click_puts_the_keys_away_without_selecting() {
+        let mut app = app_with(&["a", "b"]);
+        press(&mut app, KeyCode::Char('?'));
+        app.on_mouse(MouseEventKind::ScrollDown, Hit::Sidebar);
+        assert!(app.showing_keys(), "the wheel leaves it open");
+        app.on_mouse(CLICK, Hit::SidebarRow(row_of(&app, "b")));
+        assert!(!app.showing_keys());
+        assert_eq!(selected_name(&app), Some("a"));
     }
 }

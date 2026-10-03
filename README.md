@@ -86,6 +86,7 @@ a pane beside it.
 | `r` | rename the selected session |
 | `x` | kill the selected session, once you've said `y` |
 | `u` | select the next session that needs you: waiting on you first, then done |
+| `?` | show every key, in the sidebar, in a pane, in a question and with the mouse |
 | `q` | quit; the sessions keep running |
 
 While you're typing into a session, every key goes to it, `Tab` included, except `Ctrl+\`, which takes you
