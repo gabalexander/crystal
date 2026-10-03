@@ -5,12 +5,15 @@
 use crate::agents;
 use crate::backlog;
 use crate::codex;
-use crate::config::Config;
+use crate::config::{Config, MemorySettings};
+use crate::distill::{self, Job};
+use crate::embed;
 use crate::env;
 use crate::flow_run::{self, Ended, FlowRun, Next, RunState, StepState};
 use crate::flows;
 use crate::git;
-use crate::memory::{self, Memory};
+use crate::mcp;
+use crate::memory;
 use crate::notify::{self, Notice};
 use crate::plugin_hooks::{self, Event, Hooks};
 use crate::project::{self, Project};
@@ -24,7 +27,7 @@ use crate::state::{self, SavedSession};
 use crate::tasks;
 use crate::typing;
 use anyhow::{Context, Result, bail, ensure};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{BufReader, ErrorKind, Write};
 use std::net::Shutdown;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -55,9 +58,16 @@ pub fn run(socket: &Path) -> Result<()> {
         flows: Mutex::default(),
         stores: Mutex::default(),
         hooks: Hooks::new(socket),
+        distilling: Arc::default(),
     });
     daemon.start_saved_sessions();
     daemon.take_up_flows();
+    // With search by meaning on, the model is loaded and every entry
+    // without a vector given one now, rather than when a session starts.
+    thread::spawn({
+        let socket = socket.to_path_buf();
+        move || embed_waiting(&socket)
+    });
     thread::spawn({
         let daemon = daemon.clone();
         move || daemon.keep_up()
@@ -110,6 +120,9 @@ struct Daemon {
     stores: Mutex<()>,
     /// The plugins' hooks, told what happens.
     hooks: Hooks,
+    /// The sessions the distiller is reading now, by id: one pass at a
+    /// time over each.
+    distilling: Arc<Mutex<HashSet<String>>>,
 }
 
 impl Daemon {
@@ -222,7 +235,7 @@ impl Daemon {
                 session.check_front();
                 session.check();
                 for closed in session.take_closed() {
-                    self.write_down_closed(session.cwd(), &closed);
+                    self.write_down_closed(session, &closed);
                 }
             }
             // Before telling the user anything: a step the flow goes on
@@ -469,9 +482,11 @@ impl Daemon {
         Ok(())
     }
 
-    /// Writes a task that has just closed into its project's history, and,
-    /// when it was done and was for a backlog item, ticks the item.
-    fn write_down_closed(&self, cwd: &Path, task: &TaskRecord) {
+    /// Writes a task that has just closed in `session` into its project's
+    /// history, and, when it was done and was for a backlog item, ticks the
+    /// item. Then the distiller reads what it did.
+    fn write_down_closed(&self, session: &Session, task: &TaskRecord) {
+        let cwd = session.cwd();
         let _stores = self.stores.lock().unwrap();
         let dir = state::project_dir(&self.socket, &project::of(cwd).path);
         if let Err(err) = tasks::record(&dir, task) {
@@ -490,6 +505,91 @@ impl Daemon {
                 eprintln!("crystal daemon: couldn't tick #{number} on the backlog: {err:#}");
             }
         }
+        self.distill_later(session, task);
+    }
+
+    /// Has the distiller read what the task that just closed in `session`
+    /// did, on a thread of its own, when memory is on and the config says
+    /// to.
+    fn distill_later(&self, session: &Session, task: &TaskRecord) {
+        let config = settings();
+        if !memory::enabled(&config) || !config.memory.distill || task.outcome.is_none() {
+            return;
+        }
+        let Some(job) = self.distill_job(session, Some(task), config.memory) else {
+            return;
+        };
+        let Some(reading) = Reading::start(&self.distilling, &session.id) else {
+            return;
+        };
+        thread::spawn(move || {
+            let name = &job.session;
+            match distill::run(&job) {
+                Ok(report) => {
+                    eprintln!("crystal daemon: distilled {name}: {}", report.line());
+                    for why in &report.rejected {
+                        eprintln!("crystal daemon:   rejected {why}");
+                    }
+                }
+                Err(err) => eprintln!("crystal daemon: couldn't distill {name}: {err:#}"),
+            }
+            drop(reading);
+        });
+    }
+
+    /// A pass of the distiller over what `session` did, on `task`: `None`
+    /// when it did nothing the distiller can read.
+    fn distill_job(
+        &self,
+        session: &Session,
+        task: Option<&TaskRecord>,
+        settings: MemorySettings,
+    ) -> Option<Job> {
+        let material = session.material()?;
+        let header = match task {
+            Some(task) => distill::header(task),
+            None => format!(
+                "The work of session {}, which wasn't started with a task.",
+                session.name
+            ),
+        };
+        Some(Job {
+            socket: self.socket.clone(),
+            project: memory::project_of(session.cwd()),
+            checkout: session.checkout_top(),
+            session: session.name.clone(),
+            header,
+            about: task.map(distill::about).unwrap_or_default(),
+            material,
+            env: session.env().clone(),
+            settings,
+        })
+    }
+
+    /// Runs the distiller over what the session called `name` did, now,
+    /// and says what came of it.
+    fn distill_now(&self, name: &str) -> Result<Response> {
+        let config = settings();
+        crate::plugins::ensure_enabled(&config, "memory")?;
+        let (job, reading) = {
+            let mut sessions = self.sessions.lock().unwrap();
+            let session = named(&mut sessions, name)?;
+            let task = session.task_record();
+            let job = self
+                .distill_job(session, task.as_ref(), config.memory)
+                .with_context(|| {
+                    format!(
+                        "{name} left nothing the distiller can read: \
+                         only Claude Code's sessions and tasks do"
+                    )
+                })?;
+            let reading = Reading::start(&self.distilling, &session.id)
+                .with_context(|| format!("the distiller is reading what {name} did already"))?;
+            (job, reading)
+        };
+        let report = distill::run(&job);
+        drop(reading);
+        Ok(Response::Distilled(report?))
     }
 
     /// Keeps how a closed task turned out in its project's memory, for the
@@ -687,8 +787,25 @@ impl Daemon {
                     (None, None) => bail!("say which session's task to close"),
                 };
                 let closed = session.close_task(failed, &summary)?;
-                self.write_down_closed(session.cwd(), &closed);
+                self.write_down_closed(session, &closed);
                 Ok(Response::Done)
+            }
+            Request::Distill { name } => self.distill_now(&name),
+            Request::SearchMemory {
+                dir,
+                query,
+                kind,
+                limit,
+            } => {
+                crate::plugins::ensure_enabled(&settings(), "memory")?;
+                let project = memory::project_of(&dir);
+                let embedder = embed::shared_now();
+                let mut store = memory::Store::open(&self.socket)?;
+                let found =
+                    store.search(&project, &query, kind, limit, embed::as_embed(&embedder))?;
+                Ok(Response::Memory {
+                    entries: memory::stale_last(found, &project),
+                })
             }
             Request::Tasks { dir, all } => {
                 tasks::ensure_enabled(&settings())?;
@@ -1058,9 +1175,52 @@ fn remembered(socket: &Path, cwd: &Path, command: &[String]) -> Option<String> {
     if !memory::enabled_now() {
         return None;
     }
-    let memory = Memory::read(socket, &memory::project_of(cwd)).ok()?;
-    let now = memory::seconds_since_epoch(SystemTime::now());
-    Some(memory::for_launch(&memory, &command[1..].join(" "), now))
+    let project = memory::project_of(cwd);
+    let embedder = embed::shared_now();
+    let asked = command[1..].join(" ");
+    memory::for_launch(socket, &project, &asked, false, embed::as_embed(&embedder))
+        .ok()
+        .flatten()
+}
+
+/// Loads the embedding model, when the config says to search with it, and
+/// gives every entry without a vector one.
+fn embed_waiting(socket: &Path) {
+    if !memory::enabled_now() {
+        return;
+    }
+    let Some(embedder) = embed::shared_now() else {
+        return;
+    };
+    match memory::Store::open(socket).and_then(|mut store| store.embed_missing(&*embedder)) {
+        Ok(0) => {}
+        Ok(count) => eprintln!("crystal daemon: embedded {count} entries of memory"),
+        Err(err) => eprintln!("crystal daemon: couldn't embed memory's entries: {err:#}"),
+    }
+}
+
+/// The arguments each of a task's runs gives Claude: the task's own, and,
+/// with memory on, what its project remembers that has to do with its
+/// prompt, in its system prompt, and crystal's MCP server, with its tools
+/// allowed, to search the rest.
+fn task_args(socket: &Path, cwd: &Path, spec: &protocol::TaskSpec) -> Vec<String> {
+    if !memory::enabled_now() {
+        return spec.args.clone();
+    }
+    let project = memory::project_of(cwd);
+    let embedder = embed::shared_now();
+    let embedder = embed::as_embed(&embedder);
+    let remembered = memory::for_launch(socket, &project, &spec.prompt, true, embedder)
+        .ok()
+        .flatten();
+    let args = agents::with_instructions(&spec.args, &notes(None, remembered));
+    let Ok(crystal) = std::env::current_exe() else {
+        return args;
+    };
+    let server = mcp::config(&crystal, socket, cwd);
+    let args = agents::with_value(&args, &["--mcp-config"], &server);
+    let tools = mcp::TOOLS.join(",");
+    agents::with_value(&args, &["--allowedTools", "--allowed-tools"], &tools)
 }
 
 /// Starts a task and adds it to `sessions`. With `run_prompt`, Claude runs
@@ -1096,7 +1256,8 @@ fn start_task(
     let id = new_id();
     let env = env::for_session(&env, &name, &id, socket);
     let prompt = spec.prompt.clone();
-    let mut session = Session::task(id, name.clone(), spec, cwd, env, conversation);
+    let args = task_args(socket, &cwd, &spec);
+    let mut session = Session::task(id, name.clone(), spec, args, cwd, env, conversation);
     // It closes itself when its run ends, from Claude's answer.
     if tasks::enabled(&settings()) {
         session.give_task(TaskInfo {
@@ -1150,6 +1311,32 @@ fn new_id() -> String {
         .unwrap_or_default()
         .as_nanos();
     format!("{nanos:x}-{count}")
+}
+
+/// The distiller reading what a session did, until it's dropped: while it
+/// is, another pass over the same session can't start.
+struct Reading {
+    reading: Arc<Mutex<HashSet<String>>>,
+    id: String,
+}
+
+impl Reading {
+    /// Marks the session `id` as being read, unless it is already.
+    fn start(reading: &Arc<Mutex<HashSet<String>>>, id: &str) -> Option<Reading> {
+        if !reading.lock().unwrap().insert(id.to_string()) {
+            return None;
+        }
+        Some(Reading {
+            reading: reading.clone(),
+            id: id.to_string(),
+        })
+    }
+}
+
+impl Drop for Reading {
+    fn drop(&mut self) {
+        self.reading.lock().unwrap().remove(&self.id);
+    }
 }
 
 fn named<'a>(sessions: &'a mut [Session], name: &str) -> Result<&'a mut Session> {

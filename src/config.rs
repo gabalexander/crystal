@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     /// Tell the user when a session needs them: its agent is asking them
@@ -34,6 +34,8 @@ pub struct Config {
     /// until switched on. See [`crate::plugins`].
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub plugins: BTreeMap<String, bool>,
+    /// How the memory plugin learns: `[memory]` in the file.
+    pub memory: MemorySettings,
     /// Saved ways to start an agent, offered first in the new-session
     /// panel: `[[profile]]` tables in the file. See [`crate::profile`].
     #[serde(rename = "profile", skip_serializing_if = "Vec::is_empty")]
@@ -42,6 +44,33 @@ pub struct Config {
     /// tables in the file. See [`crate::flows`].
     #[serde(rename = "flow", skip_serializing_if = "Vec::is_empty")]
     pub flows: Vec<Flow>,
+}
+
+/// How the memory plugin learns, beyond what it's told.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MemorySettings {
+    /// Once a task has closed, have a model read what it did and keep what
+    /// a later session would need to know: see [`crate::distill`].
+    pub distill: bool,
+    /// The model that does it, as `claude --model` takes it.
+    pub distill_model: String,
+    /// The most it may spend on one task, in US dollars.
+    pub distill_budget_usd: f64,
+    /// Search by what entries mean as well as by their words, with a model
+    /// run on this machine: see [`crate::embed`].
+    pub embeddings: bool,
+}
+
+impl Default for MemorySettings {
+    fn default() -> MemorySettings {
+        MemorySettings {
+            distill: true,
+            distill_model: "claude-haiku-4-5".to_string(),
+            distill_budget_usd: 0.25,
+            embeddings: false,
+        }
+    }
 }
 
 /// The TUI's colors to choose from. `dark` and `light` paint their own
@@ -63,6 +92,7 @@ impl Default for Config {
             new_session: "claude".to_string(),
             theme: ThemeName::Dark,
             plugins: BTreeMap::new(),
+            memory: MemorySettings::default(),
             profiles: Vec::new(),
             flows: Vec::new(),
         }
@@ -138,8 +168,9 @@ pub fn from_text(text: &str) -> Result<Config> {
     if table.contains_key("preset") {
         bail!("`[[preset]]` tables are now `[[profile]]`: rename them in the file");
     }
-    // Memory became a plugin; say where its setting went.
-    if table.contains_key("memory") {
+    // Memory became a plugin; say where its switch went. `[memory]` is
+    // how it learns.
+    if matches!(table.get("memory"), Some(toml::Value::Boolean(_))) {
         bail!("`memory` is now a plugin: put `memory = …` under a `[plugins]` line instead");
     }
     let config: Config = table.try_into()?;
@@ -352,6 +383,20 @@ back_to = "build"
     }
 
     #[test]
+    fn memory_learns_by_its_own_table() {
+        let config = parse("[memory]\ndistill = false\n").unwrap();
+        assert!(!config.memory.distill);
+        assert_eq!(config.memory.distill_model, "claude-haiku-4-5");
+        assert_eq!(config.memory.distill_budget_usd, 0.25);
+        assert!(!config.memory.embeddings, "off until the model is wanted");
+        let config = parse("[memory]\ndistill_model = \"sonnet\"\ndistill_budget_usd = 1\n");
+        let config = config.unwrap();
+        assert_eq!(config.memory.distill_model, "sonnet");
+        assert_eq!(config.memory.distill_budget_usd, 1.0);
+        assert!(parse("[memory]\ndistil = false\n").is_err());
+    }
+
+    #[test]
     fn a_leftover_preset_says_its_now_a_profile() {
         let err = parse("[[preset]]\nname = \"x\"\nagent = \"claude\"\n").unwrap_err();
         assert!(
@@ -368,6 +413,12 @@ back_to = "build"
             new_session: "codex --model o3".into(),
             theme: ThemeName::Terminal,
             plugins: BTreeMap::from([("memory".to_string(), false)]),
+            memory: MemorySettings {
+                distill: false,
+                distill_model: "claude-sonnet-5-5".into(),
+                distill_budget_usd: 0.5,
+                embeddings: true,
+            },
             profiles: vec![Profile {
                 name: "review".into(),
                 description: Some("A second pair of eyes".into()),

@@ -501,13 +501,23 @@ crystal memory                       # the list, newest first
 crystal memory search ledger tests   # the entries that have most to do with those words
 crystal memory rm 3                  # forget one
 crystal memory promote 2             # copy one into the project's CLAUDE.md, under "Notes"
+crystal memory distill fixer         # have a model read what a session did, now
+crystal memory embed                 # download the model that searches by meaning
 ```
 
 - `-k` is `decision`, `gotcha`, `command`, `note` (the default) or `outcome`. Inside a session, an entry goes
   to the session's project and says which session added it; elsewhere it goes to the project of the current
   directory, or of `-C <dir>`.
-- A project is its main worktree, so every worktree of it shares one list. The list is a JSON file in
-  crystal's state directory (`~/.local/state/crystal/memory/`), not in the repository.
+- A project is its main worktree, so every worktree of it shares one list. Every project's list is kept in one
+  SQLite database in crystal's state directory (`~/.local/state/crystal/memory/memory.db`), not in the
+  repository. A project's list from before, a JSON file there, is brought in the first time it's read.
+- `search` uses SQLite's full-text index (FTS5), ranked by bm25: any of the words matches, and so does a word
+  they start or stem from (`deploying` finds "Deploys go out on Tuesdays"); the entries with more of the words,
+  and rarer ones, come first, and stale ones last. With [search by meaning](#search-by-meaning) on, entries
+  that mean the same count too, whatever their words.
+- The same thing remembered again (the same words, whatever the case or punctuation) is the one entry, seen
+  again: `remembered 3 already`. Credentials in an entry, like `API_KEY=…` or a token, are taken out as it's
+  kept.
 - `-f` names a file an entry is about, and can be given more than once. Once that file changes, the entry may
   no longer hold: it's marked stale, and agents aren't shown it. `crystal memory rm` it, or remember it again.
 - `promote` asks first at a terminal; `--yes` doesn't. It writes to CLAUDE.md, or to AGENTS.md when that's the
@@ -516,9 +526,69 @@ crystal memory promote 2             # copy one into the project's CLAUDE.md, un
   beside it, `/` filters, `x` forgets an entry and `p` promotes it, each after a `y`.
 
 When a Claude Code session starts, crystal adds the entries that have most to do with its first prompt (the
-newest, without one) to its system prompt, a few at most and none that's stale, with a line on how to add
-more. Codex is told nothing: it has no option for a system prompt, and anything crystal typed in would read as
-your first message. `crystal plugin disable memory` turns it all off: see [plugins](#plugins).
+newest, without one) to its system prompt, a few at most and none that's stale, with a line on how to search
+and add more. Codex is told nothing: it has no option for a system prompt, and anything crystal typed in would
+read as your first message. `crystal plugin disable memory` turns it all off: see [plugins](#plugins).
+
+A task in the background (`claude -p`) is shown the same, with each entry's id, and gets crystal's own MCP
+server, `crystal mcp`, with its two tools allowed: `memory_search`, which searches the project's memory the way
+`crystal memory search` does, and `memory_show`, which reads one entry in full. A task has nobody to say yes to
+a shell command, so these are how it reads the rest of what was learned.
+
+#### Search by meaning
+
+Words only find words: "db" never finds "Postgres has to be running". With `embeddings = true` under
+`[memory]`, crystal also searches by what entries mean, with a small model run on your machine,
+[BAAI/bge-small-en-v1.5](https://huggingface.co/BAAI/bge-small-en-v1.5) through
+[Candle](https://github.com/huggingface/candle): no API, no key, and nothing leaves the machine.
+
+```sh
+crystal memory embed   # once: downloads the model (134 MB), then gives every entry its vector
+```
+
+- The model isn't part of crystal. `crystal memory embed` downloads it with `curl`, at a pinned revision,
+  checks each file against its SHA-256, and keeps it in `~/.cache/crystal/models/` (or `$XDG_CACHE_HOME`).
+  Until it's there, searches go by words alone, and `crystal memory search` says so.
+- Each entry's vector is kept beside it in `memory.db`. An entry without one, say one just remembered, gets it
+  the first time a search needs it.
+- A search ranks by words (bm25) and by meaning (the model), and merges the two by reciprocal rank fusion, so
+  an entry high in both comes first. By meaning, only the entries close to the best match count: the model's
+  scores sit close together, and one far behind the best is a match in name only.
+- The daemon keeps the model loaded (about 150 MB), once for every client: `crystal memory search` and every
+  task's `memory_search` ask it, and only search in their own process when no daemon is running. What a
+  session is shown as it starts, and what the distiller is shown the memory has already, go by meaning too.
+- It finds paraphrases and near-synonyms that words miss, but it's a small model: a one-word query can rank
+  oddly, and a query about something the memory doesn't hold still brings back what's nearest.
+
+#### The distiller
+
+Agents don't always remember what they learned. So once a task closes, done or failed, a model reads what it
+did and keeps what a later session would need to know and couldn't find in the code: decisions and why, dead
+ends, commands that work, traps. It's one `claude -p` run on Haiku, in the background:
+
+- It reads the end of what the task did: a task's transcript, as Claude Code keeps it (or, when it doesn't,
+  what crystal read of its runs), or for Claude Code in a terminal, the transcript its hooks named. Codex leaves
+  nothing it can read. Credentials are taken out before the model sees any of it.
+- It's shown what the project's memory has already on the same subject, and told never to give that again.
+- It has no tools, no MCP servers, none of the project's settings and none of your hooks, a budget (25 cents
+  by default) and two turns. Its answer is checked before anything is kept: at most 8 entries, of the kinds
+  `decision`, `gotcha`, `command` and `note`, each 400 characters at most, naming only files that are in the
+  checkout.
+- What passes is kept like anything else, `from the distiller, after task <name>`: what's there already is
+  seen again rather than added twice, and what you forgot with `rm` it never adds back (you can, by
+  remembering it yourself).
+- How it went is a line in the daemon's log, `default.log` beside the socket. `crystal memory distill <session>`
+  runs it now and says what came of it; it works on any Claude Code session or task, closed or not.
+
+`[memory]` in the [settings](#settings) changes how it runs:
+
+```toml
+[memory]
+distill = true                      # false to turn it off
+distill_model = "claude-haiku-4-5"  # the model, as `claude --model` takes it
+distill_budget_usd = 0.25           # the most one task's pass may spend
+embeddings = false                  # true to search by meaning too: see above
+```
 
 ### Tasks
 
@@ -794,6 +864,7 @@ file and change. A setting crystal doesn't know is an error that names it, so a 
 | `new_session` | `"claude"` | what the new-session panel runs at first, until you start something from it |
 | `theme` | `"dark"` | the TUI's colors: `"dark"`, `"light"`, or `"terminal"` |
 | `[plugins]` | | which plugins are on and off: [plugins](#plugins) |
+| `[memory]` | | how memory's [distiller](#the-distiller) runs, and whether it [searches by meaning](#search-by-meaning) |
 
 `dark` and `light` paint their own background, so crystal looks the same in any terminal; `terminal` paints
 nothing and uses your terminal's own colors. With `NO_COLOR` set, crystal uses no color at all.

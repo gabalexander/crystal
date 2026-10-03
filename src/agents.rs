@@ -78,10 +78,32 @@ pub fn argv(
     argv
 }
 
+/// Claude's arguments with `value` given to the option `names` names too:
+/// right after the option where the user gave it, which takes several
+/// values, or else ahead of the rest.
+pub fn with_value(args: &[String], names: &[&str], value: &str) -> Vec<String> {
+    let before_prompt = args
+        .iter()
+        .position(|arg| arg == "--")
+        .unwrap_or(args.len());
+    let mut with = args.to_vec();
+    match args[..before_prompt]
+        .iter()
+        .position(|arg| names.contains(&arg.as_str()))
+    {
+        Some(at) => with.insert(at + 1, value.to_string()),
+        None => {
+            with.insert(0, value.to_string());
+            with.insert(0, names[0].to_string());
+        }
+    }
+    with
+}
+
 /// Claude's arguments with crystal's `instructions` added to its system
 /// prompt. Claude takes `--append-system-prompt` once, so one the user gave
 /// is taken out and comes first in the one crystal passes.
-fn with_instructions(args: &[String], instructions: &[String]) -> Vec<String> {
+pub fn with_instructions(args: &[String], instructions: &[String]) -> Vec<String> {
     if instructions.is_empty() {
         return args.to_vec();
     }
@@ -230,6 +252,36 @@ mod tests {
                 "Be brief.\n\nRun `crystal done` when finished.",
                 "fix it"
             ]
+        );
+    }
+
+    #[test]
+    fn a_value_joins_the_option_where_the_user_gave_it_or_comes_first() {
+        let names = ["--allowedTools", "--allowed-tools"];
+        let own = command(&["--allowed-tools", "Bash", "Edit", "--model", "opus"]);
+        assert_eq!(
+            with_value(&own, &names, "mcp__crystal__memory_search"),
+            command(&[
+                "--allowed-tools",
+                "mcp__crystal__memory_search",
+                "Bash",
+                "Edit",
+                "--model",
+                "opus"
+            ])
+        );
+        // An option that's in the prompt isn't one.
+        let none = command(&["--model", "opus", "--", "--allowedTools"]);
+        assert_eq!(
+            with_value(&none, &names, "x"),
+            command(&[
+                "--allowedTools",
+                "x",
+                "--model",
+                "opus",
+                "--",
+                "--allowedTools"
+            ])
         );
     }
 

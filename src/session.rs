@@ -2,7 +2,9 @@
 //! without a terminal.
 
 use crate::agent_screen::{self, Looks, ScreenWatch};
+use crate::agents;
 use crate::codex::Rollouts;
+use crate::distill::Material;
 use crate::front;
 use crate::git::Checkout;
 use crate::keys;
@@ -46,6 +48,9 @@ pub struct Session {
     /// As it was asked for, which is how `ls` shows it.
     command: Vec<String>,
     cwd: PathBuf,
+    /// The environment its program started with, which the distiller runs
+    /// Claude with too. Never written down: it can hold secrets.
+    env: BTreeMap<String, String>,
     pid: Option<u32>,
     state: Arc<Mutex<State>>,
     /// `None` until an agent reports what it's doing; most programs never
@@ -144,6 +149,7 @@ impl Session {
             command,
             checkout: Checkout::find(&cwd),
             cwd,
+            env: env.clone(),
             pid,
             state,
             activity: None,
@@ -163,13 +169,15 @@ impl Session {
         })
     }
 
-    /// Makes a task: a session for `claude -p` runs of `spec`, whose screen
-    /// shows what Claude does. It starts at rest; [`Session::prompt`] gives
-    /// it its prompt. Given a `conversation`, its runs carry it on.
+    /// Makes a task: a session for `claude -p` runs of `spec`, with `args`,
+    /// whose screen shows what Claude does. It starts at rest;
+    /// [`Session::prompt`] gives it its prompt. Given a `conversation`, its
+    /// runs carry it on.
     pub fn task(
         id: String,
         name: String,
         spec: TaskSpec,
+        args: Vec<String>,
         cwd: PathBuf,
         env: BTreeMap<String, String>,
         conversation: Option<String>,
@@ -179,8 +187,9 @@ impl Session {
         let command = task_command(&spec);
         let task = Task::new(
             spec,
+            args,
             cwd.clone(),
-            env,
+            env.clone(),
             term.clone(),
             state.clone(),
             conversation,
@@ -191,6 +200,7 @@ impl Session {
             command,
             checkout: Checkout::find(&cwd),
             cwd,
+            env,
             pid: None,
             state,
             activity: None,
@@ -328,6 +338,36 @@ impl Session {
     /// Where the session runs: the directory its project is found from.
     pub fn cwd(&self) -> &std::path::Path {
         &self.cwd
+    }
+
+    /// The top of the worktree the session runs in, or outside git, where
+    /// it runs.
+    pub fn checkout_top(&self) -> PathBuf {
+        match &self.checkout {
+            Some(checkout) => checkout.worktree().path,
+            None => self.cwd.clone(),
+        }
+    }
+
+    pub fn env(&self) -> &BTreeMap<String, String> {
+        &self.env
+    }
+
+    /// What the distiller can read of what the session did: a task's runs,
+    /// or the transcript Claude Code keeps of its conversation. Nothing of
+    /// any other program.
+    pub fn material(&self) -> Option<Material> {
+        if let Some(task) = &self.task {
+            return Some(Material::Task {
+                record: task.record(),
+                conversation: task.conversation(),
+            });
+        }
+        if agents::program_name(&self.command) != Some("claude") {
+            return None;
+        }
+        let transcript = self.conversation.as_ref()?.transcript.clone()?;
+        Some(Material::Transcript(transcript))
     }
 
     pub fn is_running(&self) -> bool {
