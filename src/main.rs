@@ -1,8 +1,10 @@
 mod agent_screen;
 mod agents;
+mod artifacts;
 mod attach;
 mod backlog;
 mod catalog;
+mod claude_stream;
 mod client;
 mod clipboard;
 mod codex;
@@ -13,17 +15,28 @@ mod distill;
 mod drive;
 mod embed;
 mod env;
+mod event_log;
+mod events;
+mod events_cli;
 mod flow_cli;
 mod flow_run;
 mod flows;
+mod forge;
 mod front;
 mod git;
-mod github;
+mod handoff;
+mod handover;
 mod hook;
 mod keys;
+mod layout;
+mod layout_relay;
+mod links;
+mod markdown;
 mod mcp;
 mod memory;
 mod memory_cli;
+mod mermaid;
+mod mermaid_cli;
 mod names;
 mod notify;
 mod plugin_cli;
@@ -34,12 +47,16 @@ mod profile;
 mod project;
 mod protocol;
 mod remote;
+mod report;
 mod secrets;
+mod server_cli;
 mod session;
 mod shell;
 mod skill;
 mod socket;
+mod spending;
 mod state;
+mod syntax;
 mod task;
 mod tasks;
 mod transcript;
@@ -50,22 +67,31 @@ mod vt;
 mod work;
 
 use anyhow::{Result, bail};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
+use client::Restart;
 use profile::{Profile, StartIn};
-use protocol::{Request, Response, SessionInfo, State, TaskSpec};
+use protocol::{Request, Response, SessionInfo, TaskSpec, TaskState};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
+use tui::split_tree::{Direction, Way};
 
 /// One terminal for all your coding agents. With no command, opens the
 /// TUI: every session in a sidebar, the selected one live beside it.
 #[derive(Parser)]
 #[command(version)]
 struct Cli {
-    /// The daemon's socket [default: $XDG_RUNTIME_DIR/crystal/default.sock,
-    /// or /tmp/crystal-<uid>/default.sock]
-    #[arg(short = 'S', long, global = true, env = "CRYSTAL_SOCKET")]
+    /// The server to use: a daemon of its own, with its own sessions and
+    /// state, made the first time it's named [env: CRYSTAL_SERVER]
+    /// [default: default]
+    #[arg(short = 'L', long, global = true, value_name = "NAME")]
+    server: Option<String>,
+
+    /// The daemon's socket, in place of a server's [env: CRYSTAL_SOCKET]
+    /// [default: $XDG_RUNTIME_DIR/crystal/default.sock, or
+    /// /tmp/crystal-<uid>/default.sock]
+    #[arg(short = 'S', long, global = true, conflicts_with = "server")]
     socket: Option<PathBuf>,
 
     #[command(subcommand)]
@@ -77,7 +103,8 @@ enum Command {
     /// Start a session running a command, or your shell if there's none,
     /// and attach to it when run in a terminal.
     New {
-        /// The session's name [default: the program's name]
+        /// The session's name [default: from its first prompt, or else the
+        /// program's name]
         #[arg(short, long)]
         name: Option<String>,
 
@@ -118,24 +145,109 @@ enum Command {
         #[arg(long)]
         failed: bool,
 
+        /// A file in the session's worktree to keep with the task, copied
+        /// into crystal's state directory. Can be given more than once.
+        #[arg(long = "artifact", value_name = "PATH")]
+        artifacts: Vec<PathBuf>,
+
         /// What was done, or why it couldn't be. Several words are joined
         /// with spaces.
         summary: Vec<String>,
     },
+    /// Leave a note for the sessions that work in this worktree after
+    /// this one, in its `.crystal/handoff.md`: every agent started there is
+    /// told to read it.
+    Handoff {
+        /// The session whose worktree it's for [default: the one this runs
+        /// in]
+        #[arg(short, long)]
+        name: Option<String>,
+
+        /// What the next session should know. Several words are joined
+        /// with spaces.
+        #[arg(required = true)]
+        note: Vec<String>,
+    },
+    /// Say what the agent in this session is doing, for an agent crystal
+    /// doesn't know or a script wrapped around one, and how to resume it
+    /// after a restart: the command after `--`. Its reports are the
+    /// session's status until `--release`.
+    Report {
+        /// What it's doing: working, waiting (on you, which `blocked` says
+        /// too), idle (at its prompt) or done (with a turn).
+        #[arg(
+            value_enum,
+            required_unless_present_any = ["session_only", "release"],
+            conflicts_with_all = ["session_only", "release"]
+        )]
+        state: Option<ReportedState>,
+
+        /// The agent's name, as the sidebar and `ls` show it [default: the
+        /// one it gave before, or what's in front in the session]
+        #[arg(long, conflicts_with = "release")]
+        agent: Option<String>,
+
+        /// A line on what it's doing, like what it's waiting on you for.
+        #[arg(short, long, conflicts_with_all = ["session_only", "release"])]
+        message: Option<String>,
+
+        /// The session [default: the one this runs in]
+        #[arg(short, long)]
+        name: Option<String>,
+
+        /// Only say how to resume it: the command after `--`.
+        #[arg(long, requires = "resume", conflicts_with = "release")]
+        session_only: bool,
+
+        /// Give the session's status back to crystal, and forget the resume
+        /// command: the agent is leaving.
+        #[arg(long)]
+        release: bool,
+
+        /// The command that resumes the agent's session after a restart,
+        /// its first word a command on the PATH: `-- my-agent --resume 42`.
+        #[arg(last = true, value_name = "COMMAND", conflicts_with = "release")]
+        resume: Vec<String>,
+    },
     /// List the tasks of the project this directory is in: those still
-    /// open, then those closed, the latest first.
+    /// open, then those waiting to start, then those closed, the latest
+    /// first. Or make, start, show or cancel one.
     Tasks {
-        /// Every project's tasks.
+        /// With no command: every project's tasks.
         #[arg(long)]
         all: bool,
 
-        /// The project's directory [default: the current one]
+        /// With no command: the project's directory [default: the current
+        /// one]
         #[arg(short = 'C', long = "dir", value_name = "DIR")]
         dir: Option<PathBuf>,
 
-        /// Print them as JSON.
+        /// With no command: print them as JSON.
         #[arg(long)]
         json: bool,
+
+        #[command(subcommand)]
+        command: Option<TasksCommand>,
+    },
+    /// Answer the permission a background task is waiting on you for: `y`
+    /// lets the tool run, `always` lets it and keeps a rule for calls like
+    /// it, so they aren't asked about again, and `n` says no.
+    Answer {
+        /// The task, by its number, like t12, or its session's name.
+        task: String,
+
+        #[arg(value_enum)]
+        answer: Reply,
+
+        /// With `n`, what Claude is told.
+        #[arg(short, long)]
+        message: Option<String>,
+    },
+    /// Stop the run a background task is in the middle of. Its task stays
+    /// open, waiting on you.
+    Interrupt {
+        /// The task, by its number, like t12, or its session's name.
+        task: String,
     },
     /// Keep the project's backlog: things worth doing later. With no
     /// command, lists what's open.
@@ -159,7 +271,7 @@ enum Command {
     /// -p`), in the background. Its transcript shows like any session's, and
     /// `crystal send` gives it follow-ups. Prints the task's name.
     Task {
-        /// The task's name [default: task, task-2…]
+        /// The task's name [default: from its prompt, or task, task-2…]
         #[arg(short, long)]
         name: Option<String>,
 
@@ -188,8 +300,9 @@ enum Command {
         #[arg(last = true, value_name = "CLAUDE ARGS")]
         claude_args: Vec<String>,
     },
-    /// Run flows: chains of background tasks on one goal, from the config
-    /// file's `[[flow]]` tables. With no command, lists the runs.
+    /// Run flows: chains of tasks on one goal, from the config file's
+    /// `[[flow]]` tables and the project's `.crystal/flows.toml`. With no
+    /// command, lists the runs.
     Flow {
         /// With no command: print the runs as JSON.
         #[arg(long)]
@@ -217,6 +330,26 @@ enum Command {
     #[command(visible_alias = "list")]
     Ls {
         /// Print them as a JSON array, for scripts and agents.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Lay out the TUI's tabs: make one, go to one, name one, close one, or
+    /// move a session to one. The TUI used last does it.
+    Tab {
+        #[command(subcommand)]
+        command: TabCommand,
+    },
+    /// Lay out the panes of the TUI's tabs: split a session off beside
+    /// another, focus one, resize, close, zoom or float one, or even them
+    /// out. The TUI used last does it.
+    Pane {
+        #[command(subcommand)]
+        command: PaneCommand,
+    },
+    /// Print the TUI's tabs: each one's sessions, and how its panes split
+    /// the room.
+    Layout {
+        /// Print them as JSON.
         #[arg(long)]
         json: bool,
     },
@@ -271,9 +404,57 @@ enum Command {
     Wait {
         name: String,
 
+        /// Wait for this instead, and print it once it's reached: working,
+        /// waiting, done, idle, or ended (exited). Several, with commas
+        /// between, wait for any of them.
+        #[arg(
+            long,
+            value_enum,
+            value_delimiter = ',',
+            value_name = "STATUS",
+            conflicts_with = "output"
+        )]
+        until: Vec<drive::Until>,
+
+        /// Wait until a line on its screen, or just scrolled off it,
+        /// matches this regular expression, and print the line.
+        #[arg(long, value_name = "REGEX")]
+        output: Option<String>,
+
         /// Give up after this many seconds, and fail.
         #[arg(long, value_name = "SECONDS")]
         timeout: Option<f64>,
+    },
+    /// Print what happened, from the event log, one line each, the oldest
+    /// first: sessions starting, working, waiting and ending, tasks, runs,
+    /// flows, worktrees, memory and the backlog.
+    Events {
+        /// Only those since then: a while back, like 30m, 2h or 3d, or a
+        /// time, like 14:00, 2026-10-01 or 2026-10-01T09:30.
+        #[arg(long, value_name = "WHEN")]
+        since: Option<String>,
+
+        /// Only events of this kind, or family, like session.waiting or
+        /// task.*; give it more than once for more.
+        #[arg(short, long = "kind", value_name = "KIND")]
+        kinds: Vec<String>,
+
+        /// Only those about this session, through its renames.
+        #[arg(short, long)]
+        name: Option<String>,
+
+        /// Only those about the project this directory is in.
+        #[arg(short = 'C', long = "dir", value_name = "DIR")]
+        dir: Option<PathBuf>,
+
+        /// Print them as JSON, one object a line, as the log keeps them.
+        #[arg(long)]
+        json: bool,
+
+        /// Then keep printing each new one as it happens; without --since,
+        /// only new ones.
+        #[arg(short, long)]
+        follow: bool,
     },
     /// Print what's on a session's screen.
     Read {
@@ -297,9 +478,27 @@ enum Command {
     /// Stop every session and the daemon.
     KillServer,
     /// Restart the daemon on this crystal, say after installing a new one.
-    /// Running sessions come back: Claude Code in its conversation, other
-    /// programs from the start.
-    RestartServer,
+    /// The daemon hands its sessions over to it, and they carry on running,
+    /// their screens and all.
+    RestartServer {
+        /// Stop the daemon and start it again instead: running sessions
+        /// come back, Claude Code in its conversation, other programs from
+        /// the start.
+        #[arg(long)]
+        cold: bool,
+    },
+    /// List the servers, each a daemon with its own sessions and state: the
+    /// default one and those named with --server, with whether each is
+    /// running and how many sessions it has. Or stop one, or delete one.
+    #[command(visible_alias = "servers")]
+    Server {
+        /// With no command: print them as JSON.
+        #[arg(long)]
+        json: bool,
+
+        #[command(subcommand)]
+        command: Option<ServerCommand>,
+    },
     /// Show where the config file is, and the settings in effect, as the
     /// file would hold them.
     Config,
@@ -310,8 +509,9 @@ enum Command {
         #[arg(short, long, value_enum, default_value_t = memory::Kind::Note)]
         kind: memory::Kind,
 
-        /// A file it's about; once the file changes, the entry is marked
-        /// stale. Give it once a file.
+        /// A file it's about; once some of its files change, the entry is
+        /// marked drifting, and once all of them have, stale. Give it once
+        /// a file.
         #[arg(short = 'f', long = "file", value_name = "FILE")]
         files: Vec<String>,
 
@@ -338,10 +538,26 @@ enum Command {
         command: Option<ProfileCommand>,
     },
     /// List plugins, crystal's own and yours, with whether they're on; or
-    /// switch, run, install, make or remove one.
+    /// switch, run, install, build, make or remove one.
     Plugin {
         #[command(subcommand)]
         command: Option<PluginCommand>,
+    },
+    /// Draw a mermaid diagram as text, the way crystal's previews draw it:
+    /// a diagram, or each ```mermaid fence of a markdown file. One that
+    /// can't be drawn is printed as it is, and the command fails saying
+    /// why.
+    Mermaid {
+        /// The file [default: standard input]
+        file: Option<String>,
+
+        /// How many columns to draw in [default: the terminal's, or 80]
+        #[arg(short, long, value_name = "COLUMNS")]
+        width: Option<usize>,
+
+        /// Draw with ASCII rather than box drawing.
+        #[arg(long)]
+        ascii: bool,
     },
     /// Print the Claude Code skill that teaches an agent to drive crystal.
     Skill {
@@ -370,7 +586,12 @@ enum Command {
     },
     /// Run the daemon in the foreground.
     #[command(hide = true)]
-    Daemon,
+    Daemon {
+        /// Carry on from the daemon that ran this crystal in its place,
+        /// reading what it handed over from this descriptor.
+        #[arg(long, value_name = "FD")]
+        handover: Option<i32>,
+    },
     /// Tell the daemon about an agent's event; what the agent's hooks run.
     #[command(hide = true)]
     Hook { agent: String },
@@ -385,12 +606,112 @@ enum Command {
 }
 
 #[derive(Subcommand)]
+enum TasksCommand {
+    /// Make a task, and start it: the agent the new-session panel starts
+    /// first, given the goal as its first prompt, or Claude in the
+    /// background with --background. Prints the task's number.
+    New {
+        /// The session's name [default: from its goal, or else the
+        /// program's]
+        #[arg(short, long)]
+        name: Option<String>,
+
+        /// The directory to start in [default: the current one]
+        #[arg(short = 'c', long)]
+        cwd: Option<PathBuf>,
+
+        /// Start in a new git worktree on this branch, as `new -w` does,
+        /// made now.
+        #[arg(short, long, value_name = "BRANCH")]
+        worktree: Option<String>,
+
+        /// Run it in the background, as `crystal task` does.
+        #[arg(long)]
+        background: bool,
+
+        /// Don't start it: it waits, pending, until `crystal tasks start`.
+        #[arg(long)]
+        no_launch: bool,
+
+        /// What it's to do. Several words are joined with spaces.
+        #[arg(required = true)]
+        goal: Vec<String>,
+
+        /// With --background, arguments for its `claude -p`, after `--`.
+        #[arg(last = true, value_name = "CLAUDE ARGS", requires = "background")]
+        claude_args: Vec<String>,
+    },
+    /// Start a task made with --no-launch. Prints its session's name.
+    Start {
+        /// The task's number, like t12.
+        id: String,
+    },
+    /// Show a task: how it stands, its session, what it's asking for and
+    /// has cost, and how it went.
+    Show {
+        /// The task, by its number, like t12, or its session's name.
+        task: String,
+
+        /// Print it as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Cancel a task, and stop the session working on it.
+    Cancel {
+        /// The task, by its number, like t12, or its session's name.
+        task: String,
+    },
+    /// What happened to a task: how it stands, then its session's
+    /// transcript, while the session is still there.
+    Log {
+        /// The task, by its number, like t12, or its session's name.
+        task: String,
+    },
+}
+
+/// What an agent says it's doing with `crystal report`.
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum ReportedState {
+    Working,
+    #[value(alias = "blocked")]
+    Waiting,
+    Idle,
+    Done,
+}
+
+impl ReportedState {
+    fn activity(self) -> protocol::Activity {
+        match self {
+            ReportedState::Working => protocol::Activity::Working,
+            ReportedState::Waiting => protocol::Activity::Waiting,
+            ReportedState::Idle => protocol::Activity::Idle,
+            ReportedState::Done => protocol::Activity::Done,
+        }
+    }
+}
+
+/// An answer to a permission a background task asks for.
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum Reply {
+    #[value(name = "y", alias = "yes")]
+    Yes,
+    #[value(name = "n", alias = "no")]
+    No,
+    Always,
+}
+
+#[derive(Subcommand)]
 enum MemoryCommand {
     /// The entries that have to do with these words, the best first.
     Search {
         #[arg(required = true)]
         words: Vec<String>,
     },
+    /// An entry in full, by its id: its text, its files, where it came from
+    /// and how often it was said.
+    Show { id: u64 },
+    /// Print every entry as markdown, newest first.
+    Export,
     /// Forget an entry, by its id.
     #[command(visible_alias = "remove")]
     Rm { id: u64 },
@@ -419,7 +740,7 @@ enum MemoryCommand {
 enum FlowCommand {
     /// Start a run of a flow on a goal. Prints the run's name.
     Run {
-        /// The flow, by its name in the config file.
+        /// The flow, by its name: the project's own, or the config file's.
         flow: String,
 
         /// What the flow is to do: `{goal}` in its steps' prompts. Several
@@ -458,6 +779,16 @@ enum FlowCommand {
     /// Run the step that stopped a run again: it failed, or a restart cut it
     /// short.
     Retry { run: String },
+    /// Cancel a run: the task of the step it's at is cancelled and its
+    /// session stopped, and the run goes no further.
+    Cancel { run: String },
+    /// List the flows a run started here would find, and where each is
+    /// written: the config file, or the project's `.crystal/flows.toml`.
+    Defs {
+        /// The project's directory [default: the current one]
+        #[arg(short = 'C', long = "dir", value_name = "DIR")]
+        dir: Option<PathBuf>,
+    },
     /// Wait until a run stops running, at a gate or at its end, and print
     /// which. A step that failed or was cut short is an error.
     Wait {
@@ -470,6 +801,158 @@ enum FlowCommand {
     /// Print an example flow, with the profiles it runs with, to copy into
     /// the config file.
     Example,
+}
+
+#[derive(Subcommand)]
+enum TabCommand {
+    /// Make a tab after the others and go to it: sessions started from then
+    /// on go in it. Prints its number.
+    New {
+        /// What to call it [default: its number]
+        name: Option<String>,
+    },
+    /// Go to a tab.
+    Select {
+        /// The tab: its number, from 1, or its name.
+        tab: String,
+    },
+    /// Name a tab. An empty name takes it back to its number.
+    Rename { tab: String, name: String },
+    /// Close a tab.
+    Close {
+        /// The tab [default: the one in front]
+        tab: Option<String>,
+
+        /// Kill its sessions with it: a tab with sessions in it doesn't
+        /// close without.
+        #[arg(long)]
+        kill: bool,
+    },
+    /// Move a session to another tab.
+    Move { session: String, tab: String },
+}
+
+#[derive(Subcommand)]
+enum PaneCommand {
+    /// Show a session in a pane of its own, split off to the right of, or
+    /// below, the pane of the session this runs in, or else the selected
+    /// one's.
+    Split {
+        /// The session to show. One in another tab moves to this one.
+        session: String,
+
+        /// The session whose pane to split [default: the one this runs in,
+        /// or else the selected one]
+        #[arg(long, value_name = "SESSION")]
+        beside: Option<String>,
+
+        /// To the right of it: the default.
+        #[arg(long, conflicts_with = "down")]
+        right: bool,
+
+        /// Below it.
+        #[arg(long)]
+        down: bool,
+
+        /// The share of the room the pane split keeps, from 0.1 to 0.9.
+        #[arg(long, default_value_t = 0.5, value_parser = share)]
+        ratio: f32,
+    },
+    /// Select a session, bringing its tab to the front, and type into it;
+    /// or, given left, right, up or down, the session in the pane that way
+    /// from the pane of the session this runs in, or else the selected
+    /// one's.
+    Focus {
+        /// A session's name, or left, right, up or down.
+        target: String,
+    },
+    /// Move a border of a session's pane: the one on that side, which it
+    /// grows into, or else the one on its other side, which it shrinks
+    /// from.
+    Resize {
+        #[arg(value_enum)]
+        direction: Toward,
+
+        /// How many columns or rows [default: 4 columns or 2 rows, as resize
+        /// mode moves]
+        cells: Option<u16>,
+
+        /// The session [default: the one this runs in, or else the selected
+        /// one]
+        #[arg(short, long)]
+        name: Option<String>,
+    },
+    /// Close a session's pane of its own: its split, the pane beside it
+    /// taking the room, or its float.
+    Close {
+        /// The session [default: the one this runs in, or else the selected
+        /// one]
+        session: Option<String>,
+    },
+    /// Zoom a session's pane over the whole of its tab, selecting it there.
+    Zoom {
+        /// The session [default: the one this runs in, or else the selected
+        /// one]
+        session: Option<String>,
+
+        /// Put the tab's panes back instead.
+        #[arg(long)]
+        off: bool,
+    },
+    /// Even out the panes of the tab this runs in, or else the one in front.
+    Equalize,
+    /// Float a session over its tab's panes, in a pane of its own.
+    Float {
+        /// The session [default: the one this runs in, or else the selected
+        /// one]
+        session: Option<String>,
+
+        /// Put the session floating over the tab back among the panes
+        /// instead.
+        #[arg(long)]
+        off: bool,
+    },
+}
+
+/// A way to go from a pane, as the command line says it.
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum Toward {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+impl From<Toward> for Direction {
+    fn from(toward: Toward) -> Direction {
+        match toward {
+            Toward::Left => Direction::Left,
+            Toward::Right => Direction::Right,
+            Toward::Up => Direction::Up,
+            Toward::Down => Direction::Down,
+        }
+    }
+}
+
+/// A share of a pane's room, as `--ratio` takes it.
+fn share(text: &str) -> Result<f32, String> {
+    let share: f32 = text.parse().map_err(|_| format!("{text} isn't a number"))?;
+    if (0.1..=0.9).contains(&share) {
+        Ok(share)
+    } else {
+        Err("it's a share of the room, from 0.1 to 0.9".into())
+    }
+}
+
+#[derive(Subcommand)]
+enum ServerCommand {
+    /// Stop a server and every session in it, as kill-server does.
+    Stop { name: String },
+    /// Delete a stopped server: its saved sessions, tabs, layouts, backlog,
+    /// tasks and memory. Refuses while it's running, and for the default
+    /// server.
+    #[command(visible_alias = "rm")]
+    Delete { name: String },
 }
 
 #[derive(Subcommand)]
@@ -500,10 +983,24 @@ enum PluginCommand {
     Enable { name: String },
     /// Turn a plugin off.
     Disable { name: String },
-    /// Run one of a plugin's actions.
+    /// Run one of a plugin's actions, or try its hooks out on an event.
     Run {
         plugin: String,
-        action: String,
+
+        /// The action, by its id.
+        #[arg(required_unless_present_any = ["event", "link"])]
+        action: Option<String>,
+
+        /// Run the plugin's hooks on a made-up event of this kind, like
+        /// session.waiting, here and now, on or off, and print what they
+        /// print.
+        #[arg(long, value_name = "KIND", conflicts_with = "action")]
+        event: Option<String>,
+
+        /// Run the action the plugin's link handlers give this link, with
+        /// it in CRYSTAL_LINK, as a Ctrl+click on it in a pane would.
+        #[arg(long, value_name = "URL", conflicts_with_all = ["action", "event"])]
+        link: Option<String>,
 
         /// The session to run it for [default: the one this runs in, if
         /// any]
@@ -511,7 +1008,7 @@ enum PluginCommand {
         session: Option<String>,
     },
     /// Install a plugin from a git repository or a directory, once you've
-    /// seen what it runs and said yes. It starts off.
+    /// seen what it runs and said yes, and build it. It starts off.
     Install {
         /// A git repository's URL, or a directory.
         source: String,
@@ -524,6 +1021,9 @@ enum PluginCommand {
         #[arg(long)]
         enable: bool,
     },
+    /// Run a plugin's build commands again. One that fails turns it off
+    /// until a build works.
+    Build { name: String },
     /// Remove a plugin you installed.
     #[command(visible_alias = "rm")]
     Remove { name: String },
@@ -561,7 +1061,8 @@ enum BacklogCommand {
         #[arg(short, long)]
         worktree: bool,
 
-        /// The session's name [default: the agent's name]
+        /// The session's name [default: from the item, or else the agent's
+        /// name]
         #[arg(short, long)]
         name: Option<String>,
 
@@ -586,7 +1087,7 @@ fn main() -> ExitCode {
 fn run(cli: Cli) -> Result<()> {
     // Made absolute here: the daemon runs from `/`, where a relative path
     // would name another socket.
-    let socket = std::path::absolute(cli.socket.unwrap_or_else(socket::default_path))?;
+    let socket = std::path::absolute(socket::chosen(cli.socket, cli.server.clone())?)?;
     let Some(command) = cli.command else {
         return tui::run(&socket);
     };
@@ -602,9 +1103,52 @@ fn run(cli: Cli) -> Result<()> {
         Command::Done {
             name,
             failed,
+            artifacts,
             summary,
-        } => work::done(&socket, name, failed, &summary.join(" "))?,
-        Command::Tasks { all, dir, json } => work::list_tasks(&socket, here(dir)?, all, json)?,
+        } => work::done(&socket, name, failed, &summary.join(" "), artifacts)?,
+        Command::Handoff { name, note } => work::handoff(&socket, name, &note.join(" "))?,
+        Command::Report {
+            state,
+            agent,
+            message,
+            name,
+            session_only: _,
+            release,
+            resume,
+        } => {
+            let resume = (!resume.is_empty()).then_some(resume);
+            let report = match (state, resume) {
+                _ if release => protocol::AgentReport::Release,
+                (Some(state), resume) => protocol::AgentReport::State {
+                    agent,
+                    state: state.activity(),
+                    message,
+                    resume,
+                },
+                (None, Some(argv)) => protocol::AgentReport::Resume { agent, argv },
+                (None, None) => bail!("say what the agent is doing"),
+            };
+            report::run(&socket, name, report)?;
+        }
+        Command::Tasks {
+            all,
+            dir,
+            json,
+            command,
+        } => tasks(&socket, all, dir, json, command)?,
+        Command::Answer {
+            task,
+            answer,
+            message,
+        } => {
+            let answer = match answer {
+                Reply::Yes => protocol::Answer::Allow,
+                Reply::No => protocol::Answer::Deny,
+                Reply::Always => protocol::Answer::Always,
+            };
+            drive::answer(&socket, &task, answer, message)?;
+        }
+        Command::Interrupt { task } => drive::interrupt(&socket, &task)?,
         Command::Backlog {
             dir,
             all,
@@ -625,7 +1169,7 @@ fn run(cli: Cli) -> Result<()> {
                 args: claude_args,
             };
             let cwd = start_dir(&socket, cwd, worktree)?;
-            let name = client::new_task(&socket, name, cwd, spec, None)?;
+            let name = client::new_task(&socket, name, cwd, spec, None)?.name;
             println!("{name}");
             if wait {
                 drive::wait_for_turn(&socket, &name, seconds(timeout))?;
@@ -636,6 +1180,16 @@ fn run(cli: Cli) -> Result<()> {
         Command::Worktree {
             command: WorktreeCommand::Rm { worktree, force },
         } => remove_worktree(&socket, &worktree, force)?,
+        Command::Tab { command } => tab(&socket, command)?,
+        Command::Pane { command } => pane(&socket, command)?,
+        Command::Layout { json } => {
+            let layout = client::lay_out(&socket, layout::Command::Show)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&layout)?);
+            } else {
+                print!("{}", layout.text());
+            }
+        }
         Command::Attach { name } => attach::run(&socket, name.as_deref())?,
         Command::Ls { json } => {
             // Without a daemon, there are no sessions.
@@ -672,7 +1226,37 @@ fn run(cli: Cli) -> Result<()> {
                 drive::wait_for_turn(&socket, &name, seconds(timeout))?;
             }
         }
-        Command::Wait { name, timeout } => drive::wait(&socket, &name, seconds(timeout))?,
+        Command::Wait {
+            name,
+            until,
+            output,
+            timeout,
+        } => {
+            let timeout = seconds(timeout);
+            match output {
+                Some(pattern) => drive::wait_for_output(&socket, &name, &pattern, timeout)?,
+                None if until.is_empty() => drive::wait(&socket, &name, timeout)?,
+                None => drive::wait_until(&socket, &name, &until, timeout)?,
+            }
+        }
+        Command::Events {
+            since,
+            kinds,
+            name,
+            dir,
+            json,
+            follow,
+        } => {
+            let options = events_cli::Options {
+                since,
+                kinds,
+                session: name,
+                dir: dir.map(|dir| here(Some(dir))).transpose()?,
+                json,
+                follow,
+            };
+            events_cli::run(&socket, options)?;
+        }
         Command::Read {
             name,
             lines,
@@ -690,13 +1274,23 @@ fn run(cli: Cli) -> Result<()> {
                 no_daemon(&socket)?;
             }
         }
-        Command::RestartServer => {
-            if client::restart_daemon(&socket)? {
+        Command::RestartServer { cold } => match client::restart_daemon(&socket, cold)? {
+            Restart::NoDaemon => println!("no daemon was running"),
+            Restart::HandedOver { sessions: 0 } | Restart::Cold { why: None } => {
                 println!("restarted the daemon");
-            } else {
-                println!("no daemon was running");
             }
-        }
+            Restart::HandedOver { .. } => {
+                println!("restarted the daemon, and its sessions carried on")
+            }
+            Restart::Cold { why: Some(why) } => {
+                println!("restarted the daemon; its sessions started again, since {why}");
+            }
+        },
+        Command::Server { json, command } => match command {
+            None => server_cli::list(json)?,
+            Some(ServerCommand::Stop { name }) => server_cli::stop(&name)?,
+            Some(ServerCommand::Delete { name }) => server_cli::delete(&name)?,
+        },
         Command::Config => print_config()?,
         Command::Remember {
             kind,
@@ -707,6 +1301,8 @@ fn run(cli: Cli) -> Result<()> {
         Command::Memory { dir, command } => match command {
             None => memory_cli::list(&socket, dir)?,
             Some(MemoryCommand::Search { words }) => memory_cli::search(&socket, dir, &words)?,
+            Some(MemoryCommand::Show { id }) => memory_cli::show(&socket, dir, id)?,
+            Some(MemoryCommand::Export) => memory_cli::export(&socket, dir)?,
             Some(MemoryCommand::Rm { id }) => memory_cli::remove(&socket, dir, id)?,
             Some(MemoryCommand::Distill { name }) => memory_cli::distill(&socket, &name)?,
             Some(MemoryCommand::Embed) => memory_cli::embed(&socket)?,
@@ -729,10 +1325,23 @@ fn run(cli: Cli) -> Result<()> {
             Some(PluginCommand::Run {
                 plugin,
                 action,
+                event,
+                link,
                 session,
             }) => {
-                let code = plugin_cli::run(&socket, &plugin, &action, session)?;
-                // The action's own exit code is crystal's.
+                let code = match (action, event, link) {
+                    (_, Some(event), _) => {
+                        plugin_cli::run_event(&socket, &plugin, &event, session)?
+                    }
+                    (_, None, Some(link)) => {
+                        plugin_cli::run_link(&socket, &plugin, &link, session)?
+                    }
+                    (action, None, None) => {
+                        let action = action.unwrap_or_default();
+                        plugin_cli::run(&socket, &plugin, &action, session, None)?
+                    }
+                };
+                // The action's or the hook's own exit code is crystal's.
                 std::process::exit(code);
             }
             Some(PluginCommand::Install {
@@ -740,10 +1349,12 @@ fn run(cli: Cli) -> Result<()> {
                 yes,
                 enable,
             }) => plugin_cli::install(&socket, &source, yes, enable)?,
+            Some(PluginCommand::Build { name }) => plugin_cli::build(&socket, &name)?,
             Some(PluginCommand::Remove { name }) => plugin_cli::remove(&name)?,
             Some(PluginCommand::New { name }) => plugin_cli::new(&name)?,
             Some(PluginCommand::Log { name }) => plugin_cli::log(&socket, &name)?,
         },
+        Command::Mermaid { file, width, ascii } => mermaid_cli::run(file.as_deref(), width, ascii)?,
         Command::Skill { install, force } => {
             if install {
                 skill::install(force)?;
@@ -754,13 +1365,17 @@ fn run(cli: Cli) -> Result<()> {
         Command::Ssh {
             install,
             destination,
-            args,
+            mut args,
         } => {
+            // A server named for `crystal ssh` is one over there.
+            if let Some(server) = cli.server {
+                args.splice(0..0, ["--server".to_string(), server]);
+            }
             let code = remote::run(&destination, &args, install)?;
             // The remote command's own exit code is crystal's.
             std::process::exit(code);
         }
-        Command::Daemon => daemon::run(&socket)?,
+        Command::Daemon { handover } => daemon::run(&socket, handover)?,
         Command::Hook { agent } => hook::run(&socket, &agent),
         Command::Mcp { dir } => mcp::run(&socket, &here(dir)?)?,
     }
@@ -860,7 +1475,7 @@ fn new_session(
         task,
         backlog: None,
     };
-    let name = client::new_session_for(socket, name, cwd, command, purpose)?;
+    let name = client::new_session_for(socket, name, cwd, command, purpose)?.name;
     attach_or_print(socket, &name, detached)
 }
 
@@ -911,6 +1526,42 @@ fn backlog(
     work::change_backlog(socket, dir, action)
 }
 
+/// `crystal tasks` and its commands.
+fn tasks(
+    socket: &Path,
+    all: bool,
+    dir: Option<PathBuf>,
+    json: bool,
+    command: Option<TasksCommand>,
+) -> Result<()> {
+    match command {
+        None => work::list_tasks(socket, here(dir)?, all, json),
+        Some(TasksCommand::New {
+            name,
+            cwd,
+            worktree,
+            background,
+            no_launch,
+            goal,
+            claude_args,
+        }) => {
+            let task = work::NewTask {
+                goal: goal.join(" "),
+                cwd: start_dir(socket, cwd, worktree)?,
+                name,
+                background,
+                claude_args,
+                launch: !no_launch,
+            };
+            work::new_task(socket, task)
+        }
+        Some(TasksCommand::Start { id }) => work::start_task(socket, &id),
+        Some(TasksCommand::Show { task, json }) => work::show_task(socket, &task, json),
+        Some(TasksCommand::Cancel { task }) => work::cancel_task(socket, &task),
+        Some(TasksCommand::Log { task }) => work::task_log(socket, &task),
+    }
+}
+
 /// `crystal flow` and its commands.
 fn flow(socket: &Path, json: bool, command: Option<FlowCommand>) -> Result<()> {
     match command {
@@ -928,12 +1579,72 @@ fn flow(socket: &Path, json: bool, command: Option<FlowCommand>) -> Result<()> {
         Some(FlowCommand::Approve { run }) => flow_cli::approve(socket, &run),
         Some(FlowCommand::Back { run, notes }) => flow_cli::back(socket, &run, &notes.join(" ")),
         Some(FlowCommand::Retry { run }) => flow_cli::retry(socket, &run),
+        Some(FlowCommand::Cancel { run }) => flow_cli::cancel(socket, &run),
+        Some(FlowCommand::Defs { dir }) => flow_cli::defs(&here(dir)?),
         Some(FlowCommand::Wait { run, timeout }) => flow_cli::wait(socket, &run, seconds(timeout)),
         Some(FlowCommand::Example) => {
             flow_cli::example();
             Ok(())
         }
     }
+}
+
+/// `crystal tab` and its commands. A new tab's number is printed.
+fn tab(socket: &Path, command: TabCommand) -> Result<()> {
+    let new = matches!(command, TabCommand::New { .. });
+    let command = match command {
+        TabCommand::New { name } => layout::Command::NewTab { name },
+        TabCommand::Select { tab } => layout::Command::SelectTab { tab },
+        TabCommand::Rename { tab, name } => layout::Command::RenameTab { tab, name },
+        TabCommand::Close { tab, kill } => layout::Command::CloseTab { tab, kill },
+        TabCommand::Move { session, tab } => layout::Command::MoveToTab { session, tab },
+    };
+    let layout = client::lay_out(socket, command)?;
+    if new && let Some(tab) = layout.current() {
+        println!("{}", tab.number);
+    }
+    Ok(())
+}
+
+/// `crystal pane` and its commands.
+fn pane(socket: &Path, command: PaneCommand) -> Result<()> {
+    let command = match command {
+        PaneCommand::Split {
+            session,
+            beside,
+            right: _,
+            down,
+            ratio,
+        } => layout::Command::Split {
+            session,
+            beside,
+            way: if down { Way::Down } else { Way::Right },
+            ratio,
+        },
+        // A direction's word is a direction, even where a session has it
+        // for its name.
+        PaneCommand::Focus { target } => match Toward::from_str(&target, false) {
+            Ok(toward) => layout::Command::FocusToward {
+                toward: toward.into(),
+            },
+            Err(_) => layout::Command::Focus { session: target },
+        },
+        PaneCommand::Resize {
+            direction,
+            cells,
+            name,
+        } => layout::Command::Resize {
+            session: name,
+            toward: direction.into(),
+            cells,
+        },
+        PaneCommand::Close { session } => layout::Command::Close { session },
+        PaneCommand::Zoom { session, off } => layout::Command::Zoom { session, on: !off },
+        PaneCommand::Equalize => layout::Command::Equalize,
+        PaneCommand::Float { session, off } => layout::Command::Float { session, on: !off },
+    };
+    client::lay_out(socket, command)?;
+    Ok(())
 }
 
 /// The directory a command about a project is given with `-C`, or the
@@ -990,7 +1701,7 @@ fn print_sessions_json(sessions: &[SessionInfo]) -> Result<()> {
         .iter()
         .map(|session| ListedSession {
             session,
-            status: status(session),
+            status: session.status(),
         })
         .collect();
     println!("{}", serde_json::to_string_pretty(&listed)?);
@@ -1007,7 +1718,7 @@ fn print_sessions(sessions: &[SessionInfo]) {
             let (project, branch) = project_and_branch(session);
             [
                 session.name.clone(),
-                status(session),
+                session.status(),
                 session.pid.map_or("-".into(), |pid| pid.to_string()),
                 project,
                 branch,
@@ -1069,7 +1780,11 @@ fn task_cell(session: &SessionInfo) -> String {
     match &task.outcome {
         None => goal.to_string(),
         Some(outcome) => {
-            let mark = if outcome.failed { "✗" } else { "✓" };
+            let mark = match outcome.state() {
+                TaskState::Failed => "✗",
+                TaskState::Cancelled => "–",
+                _ => "✓",
+            };
             let said = if outcome.summary.is_empty() {
                 goal
             } else {
@@ -1090,14 +1805,5 @@ fn project_and_branch(session: &SessionInfo) -> (String, String) {
             (worktree.project.clone(), branch.to_string())
         }
         None => ("-".into(), "-".into()),
-    }
-}
-
-/// What `ls` says about a session: what its agent is doing, when it runs
-/// one that says, or else whether it's running or how it ended.
-fn status(session: &SessionInfo) -> String {
-    match (&session.state, session.activity) {
-        (State::Running, Some(activity)) => activity.to_string(),
-        (state, _) => state.to_string(),
     }
 }

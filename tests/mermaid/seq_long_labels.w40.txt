@@ -1,0 +1,2 @@
+unsupported · width 40
+5 participants need 45 columns even with the boxes shrunk and the labels cut short; 40 available

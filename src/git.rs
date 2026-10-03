@@ -1,14 +1,18 @@
 //! What crystal needs from git: which project and worktree a directory is
-//! in, which branch that worktree is on, making and removing worktrees, and
-//! what changed in one, for the diff and the file finder. It runs the `git`
-//! command rather than using a library, so it behaves exactly like the git
-//! the user runs.
+//! in, which branch that worktree is on, making and removing worktrees,
+//! what changed in one, for the diff and the file finder, and searching
+//! its files. [`branches`] lists a worktree's branches and moves it onto
+//! another. It runs the `git` command rather than using a library, so it
+//! behaves exactly like the git the user runs.
+
+pub mod branches;
 
 use crate::protocol::Worktree;
 use anyhow::{Context, Result, bail};
 use std::ffi::OsStr;
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
 
 /// Where a directory sits in git, found once. A session's directory never
 /// changes, so neither does this; the branch can, so it's read again each
@@ -98,6 +102,64 @@ pub fn add_new_worktree(dir: &Path, branch: &str) -> Result<(PathBuf, String)> {
         .expect("some number is free");
     let path = add_worktree(dir, &free)?;
     Ok((path, free))
+}
+
+/// The worktree of the repository at `project` that has `branch` checked
+/// out, if one has: git checks a branch out in one worktree at a time.
+pub fn worktree_on(project: &Path, branch: &str) -> Result<Option<PathBuf>> {
+    let list = git(project, &["worktree", "list", "--porcelain"])?;
+    let found = parse_worktree_list(&list)
+        .into_iter()
+        .find(|listed| !listed.prunable && listed.branch.as_deref() == Some(branch));
+    Ok(found.map(|listed| std::fs::canonicalize(&listed.path).unwrap_or(listed.path)))
+}
+
+/// Makes a worktree in the repository at `project` on `branch`, with what
+/// `fetch` names on `origin`: a branch, or a ref like `refs/pull/57/head`.
+/// It's fetched first. A new branch starts there and follows `fetch` on
+/// `origin`, so that `git pull` brings what's pushed to it later; a branch
+/// that's there already is brought up to it, unless it has commits of its
+/// own. Returns the worktree's directory.
+pub fn add_fetched_worktree(project: &Path, branch: &str, fetch: &str) -> Result<PathBuf> {
+    // Both come from the forge, and go to git as arguments.
+    for name in [branch, fetch] {
+        if name.is_empty() || name.starts_with('-') || name.contains(char::is_whitespace) {
+            bail!("{name:?} isn't a branch git can check out");
+        }
+    }
+    let checkout = Checkout::find(project)
+        .with_context(|| format!("{} isn't in a git repository", project.display()))?;
+    git(project, &["fetch", "--quiet", "origin", fetch])
+        .with_context(|| format!("couldn't fetch {fetch} from origin"))?;
+    // By its commit: another fetch in the repository could move FETCH_HEAD.
+    let tip = git(project, &["rev-parse", "--verify", "FETCH_HEAD^{commit}"])?;
+    let tip = tip.trim();
+    let target = worktree_dir(&checkout.project_path, branch);
+    let target_arg = target.to_string_lossy();
+    if branch_exists(project, branch) {
+        git(project, &["worktree", "add", &target_arg, branch])?;
+        // Not fast-forward, it has work of its own, which is left as it is.
+        let _ = git(&target, &["merge", "--ff-only", "--quiet", tip]);
+    } else {
+        git(
+            project,
+            &["worktree", "add", "-b", branch, &target_arg, tip],
+        )?;
+        let merge = if fetch.starts_with("refs/") {
+            fetch.to_string()
+        } else {
+            format!("refs/heads/{fetch}")
+        };
+        git(
+            project,
+            &["config", &format!("branch.{branch}.remote"), "origin"],
+        )?;
+        git(
+            project,
+            &["config", &format!("branch.{branch}.merge"), &merge],
+        )?;
+    }
+    Ok(target)
 }
 
 /// The worktree `target` names: a directory, taken from `dir` when it's
@@ -196,6 +258,14 @@ pub fn patch_since(dir: &Path, commit: &str) -> Result<String> {
     git(dir, &[PATCH, &[commit, "HEAD"]].concat())
 }
 
+/// The commit the worktree at `dir` is on, or an empty string before its
+/// first commit.
+pub fn head(dir: &Path) -> String {
+    git(dir, &["rev-parse", "--verify", "--quiet", "HEAD"])
+        .map(|head| head.trim().to_string())
+        .unwrap_or_default()
+}
+
 /// The files in the worktree at `dir` that git doesn't track yet and that
 /// aren't ignored, by their paths from its top.
 pub fn untracked_files(dir: &Path) -> Result<Vec<String>> {
@@ -226,12 +296,138 @@ pub fn files(dir: &Path) -> Result<Vec<String>> {
     Ok(files)
 }
 
+/// A line `git grep` found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Hit {
+    /// The file's path from the top of the worktree.
+    pub path: String,
+    /// The line's number, from 1.
+    pub line: usize,
+    /// The line, without the space it starts with, and cut short when it's
+    /// long.
+    pub text: String,
+}
+
+/// What a search found: its hits, in the order git found them, file by
+/// file, and whether it stopped short of finding them all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Found {
+    pub hits: Vec<Hit>,
+    pub more: bool,
+}
+
+/// How much of a line a hit keeps: enough to read it by.
+const HIT_CHARS: usize = 300;
+
+/// The lines with `text` in them, in the files of the worktree at `dir`
+/// that git tracks and the new ones it would, binary files left out: no
+/// more than `most`. The case of letters counts only when `text` has a
+/// capital in it. git is stopped as soon as `stale` says the search isn't
+/// wanted any more, and then there's nothing: `None`.
+pub fn grep(
+    dir: &Path,
+    text: &str,
+    most: usize,
+    stale: &dyn Fn() -> bool,
+) -> Result<Option<Found>> {
+    let mut args = vec![
+        "grep",
+        "-z",
+        "--line-number",
+        "-I",
+        "--untracked",
+        "--no-color",
+        "--fixed-strings",
+    ];
+    if !text.chars().any(char::is_uppercase) {
+        args.push("--ignore-case");
+    }
+    args.extend(["-e", text]);
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["-c", "core.quotePath=false"])
+        .args(&args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("couldn't run git")?;
+    let output = child.stdout.take().context("git grep has no output")?;
+    let mut hits = Vec::new();
+    // Each hit is `<path>\0<line>\0<text>\n`: a NUL can't be in a path.
+    for record in BufReader::new(output).split(b'\n') {
+        if stale() {
+            stop(&mut child);
+            return Ok(None);
+        }
+        if hits.len() == most {
+            stop(&mut child);
+            return Ok(Some(Found { hits, more: true }));
+        }
+        hits.extend(parse_hit(&record?));
+    }
+    let mut complaint = String::new();
+    if let Some(mut stderr) = child.stderr.take() {
+        let _ = stderr.read_to_string(&mut complaint);
+    }
+    // git grep says it found nothing by ending with 1.
+    match child.wait()?.code() {
+        Some(0 | 1) => Ok(Some(Found { hits, more: false })),
+        _ => bail!("{}", complaint.trim()),
+    }
+}
+
+/// One hit, from what `git grep -z --line-number` printed for it.
+fn parse_hit(record: &[u8]) -> Option<Hit> {
+    let mut fields = record.splitn(3, |byte| *byte == 0);
+    let path = String::from_utf8_lossy(fields.next()?).into_owned();
+    let line = String::from_utf8_lossy(fields.next()?).parse().ok()?;
+    let text = String::from_utf8_lossy(fields.next()?);
+    let text = text.trim();
+    Some(Hit {
+        path,
+        line,
+        text: text.chars().take(HIT_CHARS).collect(),
+    })
+}
+
+/// Stops a git that's no longer wanted.
+fn stop(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 /// Where the branch at `dir` started: the name of the repository's default
 /// branch, and the commit the two have in common.
 pub fn branch_start(dir: &Path) -> Result<(String, String)> {
     let default = default_branch(dir)?;
     let commit = git(dir, &["merge-base", &default, "HEAD"])?;
     Ok((default, commit.trim().to_string()))
+}
+
+/// The files the worktree at `dir` has changed since its branch left the
+/// repository's default branch, committed or not, by their paths from its
+/// top. One git call when the clone knows `origin`'s default branch: the
+/// working tree against where the two branches meet.
+pub fn branch_changes(dir: &Path) -> Result<Vec<String>> {
+    let since = |base: &str| {
+        let args = [
+            "-c",
+            "core.quotePath=false",
+            "diff",
+            "--name-only",
+            "--no-ext-diff",
+            "--merge-base",
+            base,
+            "--",
+        ];
+        git(dir, &args)
+    };
+    let names = since("origin/HEAD")
+        .or_else(|_| since("main"))
+        .or_else(|_| since("master"))?;
+    Ok(lines(&names))
 }
 
 /// The branch the repository's work goes back into: `origin`'s, when the
@@ -344,12 +540,14 @@ fn absolute(dir: &Path, path: &str) -> Option<PathBuf> {
 }
 
 /// Runs git in `dir` and gives back what it printed. When git fails, its
-/// own words are the error.
+/// own words are the error. It never asks for a password on the terminal,
+/// which may be the TUI's: a fetch that needs one fails instead.
 fn git(dir: &Path, args: &[&str]) -> Result<String> {
     let output = Command::new("git")
         .arg("-C")
         .arg(dir)
         .args(args)
+        .env("GIT_TERMINAL_PROMPT", "0")
         .output()
         .context("couldn't run git")?;
     if !output.status.success() {
@@ -361,6 +559,86 @@ fn git(dir: &Path, args: &[&str]) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_hit_is_a_path_a_line_number_and_the_line() {
+        assert_eq!(
+            parse_hit(b"src/a b.rs\x0012\x00    let x = grep_me();"),
+            Some(Hit {
+                path: "src/a b.rs".into(),
+                line: 12,
+                text: "let x = grep_me();".into(),
+            })
+        );
+        assert_eq!(parse_hit(b"Binary file matches"), None);
+    }
+
+    /// A repository with one commit in a new directory, made with git's
+    /// config left out.
+    pub(crate) fn repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(dir.path())
+                .args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        run(&["init", "-q", "-b", "main"]);
+        run(&["config", "user.name", "crystal"]);
+        run(&["config", "user.email", "crystal@example.com"]);
+        // crystal's own git reads the machine's config: none of its
+        // signing or hooks here.
+        run(&["config", "commit.gpgsign", "false"]);
+        run(&["config", "core.hooksPath", "/dev/null"]);
+        std::fs::write(dir.path().join("tracked.txt"), "a needle in a haystack\n").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-q", "-m", "first"]);
+        dir
+    }
+
+    #[test]
+    fn grep_finds_tracked_and_new_files_minding_case_only_for_capitals() {
+        let dir = repo();
+        std::fs::write(dir.path().join("new.txt"), "another Needle\n").unwrap();
+        std::fs::write(dir.path().join(".gitignore"), "ignored.txt\n").unwrap();
+        std::fs::write(dir.path().join("ignored.txt"), "needle\n").unwrap();
+        let found = |text| grep(dir.path(), text, 10, &|| false).unwrap().unwrap();
+
+        let mut paths: Vec<String> = found("needle")
+            .hits
+            .into_iter()
+            .map(|hit| hit.path)
+            .collect();
+        paths.sort();
+        assert_eq!(paths, ["new.txt", "tracked.txt"]);
+        assert_eq!(found("Needle").hits.len(), 1);
+        assert_eq!(
+            found("nothing like it"),
+            Found {
+                hits: vec![],
+                more: false
+            }
+        );
+    }
+
+    #[test]
+    fn grep_stops_at_its_most_and_when_its_stale() {
+        let dir = repo();
+        std::fs::write(dir.path().join("many.txt"), "needle\n".repeat(20)).unwrap();
+        let found = grep(dir.path(), "needle", 5, &|| false).unwrap().unwrap();
+        assert_eq!(found.hits.len(), 5);
+        assert!(found.more);
+        assert_eq!(grep(dir.path(), "needle", 5, &|| true).unwrap(), None);
+    }
 
     #[test]
     fn head_names_the_branch_or_is_detached() {

@@ -1,41 +1,60 @@
 //! The TUI's state and how keys, the mouse and session lists change it.
 //! Nothing here talks to the daemon or draws: when a key needs the outside
 //! world, it comes back as an [`Action`] for the event loop to carry out.
-//! That keeps every state change testable on its own.
+//! That keeps every state change testable on its own. [`commands`] carries
+//! out the layout commands `crystal tab` and `crystal pane` send.
 
+mod commands;
+
+use super::away::{Away, Tally};
 use super::backlog_view::{BacklogChange, BacklogView, Step};
 use super::command_line;
 use super::diff_view::{self, Against, DiffView};
 use super::finder::Finder;
+use super::grep::Grep;
 use super::groups::{self, Row};
-use super::issues::IssuesView;
+use super::help;
+use super::issues::{self, IssuesView};
 use super::launcher::{self, Launcher, Memory, Run, Setup, Target};
 use super::layouts::{self, Layouts, LayoutsView, Which};
 use super::memory_view::MemoryView;
+use super::needs_you::{self, NeedsYouView};
 use super::plugins_view::{self, PluginsView};
+use super::preview::Content;
 use super::profiles::{self, ProfilesView};
+use super::pull_requests::{self, PullRequestsView};
+use super::review;
 use super::search;
 use super::settings_view::{self, SettingsView};
+use super::split_tree::{Direction, Pane, SplitTree, Way};
 use super::status::Status;
+use super::switcher::{self, Switcher};
 use super::tabs::{self, Tabs};
 use super::text_input::TextInput;
+use super::timeline::{self, TimelineView};
+use super::tree_browser::TreeBrowser;
 use crate::catalog::{self, Agent};
 use crate::client::Purpose;
 use crate::config::Config;
+use crate::events::Event;
 use crate::flow_run::{FlowRun, RunState};
 use crate::flows::{self, Flow};
-use crate::github::{self, PullRequest};
+use crate::forge::{self, Checkout, Forge, Issue, PullRequest, PullRequestDetail, Topic};
 use crate::keys;
 use crate::profile::{self, Profile};
-use crate::protocol::{Activity, Backlog, SessionInfo, State, TaskSpec, Worktree};
+use crate::protocol::{
+    Activity, Answer, Backlog, Front, SessionInfo, Spending, State, TaskSpec, Worktree,
+};
 use crate::shell;
 use crate::{backlog, names, plugins, tasks};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
+use ratatui::layout::Rect;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// Where a pane sits beside the sidebar: the one that follows the
-/// selection, or one of the splits, counted in the order they're drawn.
+/// selection, or one of the splits, counted in the order they're drawn
+/// (down the tab's tree of panes, left to right and top to bottom).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Slot {
     Selected,
@@ -71,10 +90,20 @@ pub enum Hit {
         slot: Slot,
         cell: Option<(u16, u16)>,
     },
+    /// The border between the two sides of a split of the tab's panes: the
+    /// rule between panes side by side, or, beside the name on it, the
+    /// header line of a pane below another. `split` counts the splits in
+    /// the order [`SplitTree::borders`] lists them; `at` is the column of
+    /// the screen the mouse is at for a rule, or the row for a header line.
+    Border { split: usize, at: u16 },
     /// A row of an open view's list, by its place in the whole list.
     ViewList(usize),
     /// The rest of an open view: the diff, or the file's preview.
     ViewContent,
+    /// The rule between an open view's list and the rest, where the tree
+    /// browser's is dragged: the column the mouse is at, counted from the
+    /// view's left edge.
+    ViewBorder(u16),
     /// The footer, or anywhere else.
     Elsewhere,
 }
@@ -89,10 +118,14 @@ pub struct Grab {
 }
 
 /// Something that takes the place of the sidebar and the panes until it's
-/// closed: the diff of a worktree, the file finder, or a project's memory.
+/// closed: the diff of a worktree, the file finder, the tree browser, find
+/// in files, the branch switcher, or a project's memory.
 pub enum View {
     Diff(DiffView),
     Files(Finder),
+    Tree(TreeBrowser),
+    Grep(Grep),
+    Branches(Switcher),
     Memory(MemoryView),
 }
 
@@ -105,8 +138,11 @@ pub enum Outcome {
     /// Something for the event loop to do, like reading a diff.
     Do(Action),
     /// Close the view, and open this file, by its path from the top of the
-    /// view's worktree, in the user's editor.
-    Edit(String),
+    /// view's worktree, in the user's editor: at `line`, when there's one.
+    Edit {
+        path: String,
+        line: Option<usize>,
+    },
 }
 
 /// Something read off the event loop: still being read, read, or what went
@@ -118,9 +154,22 @@ pub enum Loading<T> {
     Failed(String),
 }
 
+/// Panes `s` puts side by side are each at least this wide, which fits most
+/// agents' screens; narrower than that, it puts them one above the other.
+const SIDE_BY_SIDE_WIDTH: u16 = 80;
+
+/// How much of a pane's room a split leaves it: half.
+const HALF: f32 = 0.5;
+
+/// How far a key in resize mode moves a border: a few columns, or a row
+/// for every two of those, rows being about twice as tall as columns are
+/// wide.
+const RESIZE_COLUMNS: u16 = 4;
+const RESIZE_ROWS: u16 = 2;
+
 /// Which way Tab goes round the panes: Tab forward, Shift+Tab back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Direction {
+enum Round {
     Forward,
     Back,
 }
@@ -140,6 +189,9 @@ pub enum Place {
         base: Option<PathBuf>,
         made_up: bool,
     },
+    /// In a pull request's worktree: the one its project has on its branch
+    /// already, or a new one with its commits fetched.
+    PullRequest(Checkout),
 }
 
 /// A question asked on the footer line, and the answer typed so far.
@@ -270,6 +322,13 @@ pub enum Action {
         failed: bool,
         summary: String,
     },
+    /// Answer the permission the background task called `name` asks for.
+    Answer {
+        name: String,
+        answer: Answer,
+    },
+    /// Stop the run the background task called this is in the middle of.
+    Interrupt(String),
     /// Ask the daemon for the backlog of the project `dir` is in, for the
     /// backlog view that's open.
     ListBacklog(PathBuf),
@@ -340,34 +399,82 @@ pub enum Action {
     /// The mouse let go: put what it selected in the pane at this slot on
     /// the clipboard.
     CopySelection(Slot),
-    /// Open pull request `number` of the project at `project` in the
-    /// browser.
-    OpenPullRequest {
+    /// Open `topic`, of the project at `project`, in the browser.
+    OpenInBrowser {
+        project: PathBuf,
+        topic: Topic,
+    },
+    /// Ask the forge for the open issues of the project at this path, for
+    /// the issues view that's now open.
+    ListIssues(PathBuf),
+    /// Ask the forge for the open pull requests of the project at this
+    /// path, for the pull requests view that's now open.
+    ListPullRequests(PathBuf),
+    /// Post `text` on `topic`, of the project at `project`.
+    Comment {
+        project: PathBuf,
+        topic: Topic,
+        text: String,
+    },
+    /// Give issue `number` of the project at `project` this title and text.
+    EditIssue {
         project: PathBuf,
         number: u64,
+        title: String,
+        body: String,
     },
-    /// Ask GitHub for the open issues of the project at this path, for the
-    /// issues view that's now open.
-    ListIssues(PathBuf),
     /// Read the diff of the worktree at `dir`, off the event loop.
     ReadDiff {
         dir: PathBuf,
         against: Against,
     },
+    /// Keep `marks` as the files reviewed in the diff `scope` names.
+    KeepReviewed {
+        scope: review::Scope,
+        marks: review::Marks,
+    },
+    /// Keep whether the diff view lists its files as a tree.
+    KeepTree(bool),
     /// List the files of the worktree at this directory, off the event
     /// loop.
     ReadFiles(PathBuf),
-    /// Read the first lines of the file at `path`, from the top of the
-    /// worktree at `dir`, off the event loop.
+    /// Read and highlight the file at `path`, from the top of the worktree
+    /// at `dir`, for a preview, off the event loop.
     ReadPreview {
         dir: PathBuf,
         path: String,
     },
+    /// List the branches of the worktree at this directory, and its
+    /// changes, off the event loop.
+    ListBranches(PathBuf),
+    /// Move the worktree at `dir` onto `target`, its changes going as
+    /// `carry` says, off the event loop.
+    SwitchBranch {
+        dir: PathBuf,
+        target: crate::git::branches::Branch,
+        carry: crate::git::branches::Carry,
+    },
+    /// Search the worktree at `dir` for `query`, off the event loop, once
+    /// the typing stops.
+    Grep {
+        dir: PathBuf,
+        query: String,
+    },
+    /// Read the file at `path`, from the top of the worktree at `dir`, off
+    /// the event loop, for find in files' preview.
+    ReadMatchedFile {
+        dir: PathBuf,
+        path: String,
+    },
+    /// Put this path, from the top of a worktree, on the clipboard.
+    CopyPath(String),
     /// Open the file at `path`, from the top of the worktree at `dir`, in
-    /// the user's editor, as a new session called `name`.
+    /// the user's editor, at `line` if there's one, as a new session called
+    /// `name`.
     Edit {
         dir: PathBuf,
         path: String,
+        line: Option<usize>,
         name: String,
     },
     /// Open the history and screen of the pane at `slot` in the user's
@@ -439,6 +546,26 @@ pub enum Action {
     /// Put the tabs back the way this layout has them.
     RestoreLayout(Which),
     RemoveLayout(Which),
+    /// The timeline has opened: read the newest page of the event log for
+    /// it, then follow the log as it grows.
+    FollowEvents,
+    /// The timeline has closed: stop following the log.
+    StopFollowing,
+    /// Read the page of the event log before the event with this `seq`,
+    /// for the timeline.
+    ReadOlderEvents(u64),
+}
+
+impl Action {
+    /// Where the session it starts goes, for one that starts a session.
+    pub fn place_mut(&mut self) -> Option<&mut Place> {
+        match self {
+            Action::Start { place, .. }
+            | Action::StartInBackground { place, .. }
+            | Action::StartFlow { place, .. } => Some(place),
+            _ => None,
+        }
+    }
 }
 
 /// A sidebar key one of the installed plugins' actions took.
@@ -511,11 +638,20 @@ pub struct App {
     codex_models: Option<Vec<String>>,
     /// A yes-or-no question on the footer line, until it's answered.
     confirm: Option<Confirm>,
-    /// The tabs, each with its own sessions and the ones it splits off
-    /// into panes of their own, and which one is in front. The sidebar
-    /// shows only the sessions of the tab in front. A split stays on its
-    /// session while the selection moves.
+    /// The tabs, each with its own sessions and its own panes, and which
+    /// one is in front. The sidebar shows only the sessions of the tab in
+    /// front. A split stays on its session while the selection moves.
     tabs: Tabs,
+    /// The room beside the sidebar the panes share, as the event loop last
+    /// laid them out: splits, resizes and going from pane to pane are
+    /// worked out in it. Until then, an 80 by 24 terminal's.
+    tiles: Rect,
+    /// Whether the sidebar's keys move the selected session's pane's
+    /// borders: resize mode, which `R` starts.
+    resizing: bool,
+    /// The border the mouse took, while its button is down: the border
+    /// follows it.
+    border: Option<usize>,
     /// The session `>` is moving to another tab, while the footer asks
     /// which.
     moving: Option<String>,
@@ -529,24 +665,39 @@ pub struct App {
     /// The pane taken by its header line, while the button is down, and
     /// the pane the mouse is over now: letting go there swaps the two.
     grabbed: Option<Grab>,
+    /// Where the mouse is on a pane's screen while Ctrl is held: the link
+    /// there, if there's one, is underlined, for a click to open.
+    link_hover: Option<(Slot, (u16, u16))>,
     /// The id of the session this TUI runs in, if it runs in one. The pane
     /// never shows it: it would be showing itself.
     own_id: Option<String>,
     /// Something to tell the user, like why a key didn't work. It stays
     /// until the next key.
     notice: Option<String>,
-    /// Whether the overlay listing every key is open.
-    showing_keys: bool,
+    /// The page the overlay listing every key is open at, while it's
+    /// open.
+    keys_page: Option<usize>,
+    /// The whole terminal, as the event loop last drew it: what the list of
+    /// keys has to fit.
+    screen: Rect,
     /// `/`'s filter on the sidebar, while it's open.
     filter: Option<Filter>,
-    /// What GitHub said about each project's open pull requests, by the
-    /// project's main worktree: the pull requests, or why there are none to
-    /// show.
-    pull_requests: HashMap<PathBuf, Result<Vec<PullRequest>, String>>,
+    /// What its forge said about each project's open pull requests, by the
+    /// project's main worktree: the forge and the pull requests, or why
+    /// there are none to show.
+    pull_requests: HashMap<PathBuf, Result<(Forge, Vec<PullRequest>), String>>,
     /// The issues view, while it's open.
     issues: Option<IssuesView>,
-    /// The diff, the file finder or a project's memory, while one is open.
+    /// The pull requests view, while it's open.
+    pull_requests_view: Option<PullRequestsView>,
+    /// The view that takes the place of the sidebar and the panes, while
+    /// one is open.
     view: Option<View>,
+    /// Whether the diff view lists its files as a tree, as it last did.
+    diff_tree: bool,
+    /// The worktrees git is switching to another branch, off the loop: one
+    /// switch at a time in each.
+    switching: HashSet<PathBuf>,
     /// Whether memory is on, which is whether `m` opens it: see
     /// [`crate::memory::enabled`].
     memory_on: bool,
@@ -555,7 +706,7 @@ pub struct App {
     /// Whether the backlog is on: its view, and its counts in the sidebar.
     backlog_on: bool,
     /// Whether the github plugin is on: pull requests on worktree lines,
-    /// `o` and `i`.
+    /// `o`, `O` and `i`, on GitHub or GitLab.
     github_on: bool,
     /// The plugins view, while it's open.
     plugins_view: Option<PluginsView>,
@@ -582,6 +733,21 @@ pub struct App {
     flow_defs: Vec<Flow>,
     /// Whether flows are on: offered, shown, and answered at their gates.
     flows_on: bool,
+    /// What background tasks have spent today, as the daemon last said.
+    spending: Option<Spending>,
+    /// The server the TUI is on, when it isn't the default one: the top bar
+    /// names it.
+    server: Option<String>,
+    /// The timeline, while it's open.
+    timeline: Option<TimelineView>,
+    /// The list of everything waiting on the user, while it's open.
+    needs_you: Option<NeedsYouView>,
+    /// What happened while the user was away, and since when, until the
+    /// timeline is opened at that point.
+    away: Option<Away>,
+    /// Whether the footer says what happened while the user was away: until
+    /// the next key.
+    away_shown: bool,
 }
 
 impl App {
@@ -606,18 +772,26 @@ impl App {
             codex_models: None,
             confirm: None,
             tabs: Tabs::default(),
+            tiles: Rect::new(29, 1, 51, 22),
+            resizing: false,
+            border: None,
             moving: None,
             focus: Focus::Sidebar,
             last_pane: None,
             dragging: None,
             grabbed: None,
+            link_hover: None,
             own_id,
             notice: None,
-            showing_keys: false,
+            keys_page: None,
+            screen: Rect::new(0, 0, 80, 24),
             filter: None,
             pull_requests: HashMap::new(),
             issues: None,
+            pull_requests_view: None,
             view: None,
+            diff_tree: false,
+            switching: HashSet::new(),
             memory_on: true,
             tasks_on: true,
             backlog_on: true,
@@ -633,6 +807,12 @@ impl App {
             flows: Vec::new(),
             flow_defs: Vec::new(),
             flows_on: true,
+            spending: None,
+            server: None,
+            timeline: None,
+            needs_you: None,
+            away: None,
+            away_shown: false,
         }
     }
 
@@ -642,11 +822,11 @@ impl App {
         self.backlog_on = backlog::enabled(config);
         self.memory_on = crate::memory::enabled(config);
         self.profiles_on = profile::enabled(config);
-        self.github_on = github::enabled(config);
+        self.github_on = forge::enabled(config);
         self.flows_on = flows::enabled(config);
     }
 
-    /// Whether the TUI asks GitHub about the sessions' projects.
+    /// Whether the TUI asks the forge about the sessions' projects.
     pub fn github_on(&self) -> bool {
         self.github_on
     }
@@ -756,6 +936,16 @@ impl App {
         self.agents = agents;
     }
 
+    /// Takes the server the TUI is on, when it isn't the default one.
+    pub fn set_server(&mut self, server: Option<String>) {
+        self.server = server;
+    }
+
+    /// The server the TUI is on, when it isn't the default one.
+    pub fn server(&self) -> Option<&str> {
+        self.server.as_deref()
+    }
+
     /// Takes what the config file says about starting sessions: its
     /// profiles, and `new_session`, what the panel picks at first. A
     /// `new_session` with arguments, like `codex --full-auto`, is offered
@@ -836,12 +1026,39 @@ impl App {
 
     /// Whether the overlay listing every key is open.
     pub fn showing_keys(&self) -> bool {
-        self.showing_keys
+        self.keys_page.is_some()
+    }
+
+    /// The page of the list of keys that's open.
+    pub fn keys_page(&self) -> usize {
+        self.keys_page.unwrap_or(0)
+    }
+
+    /// Takes the whole terminal's size, as the event loop lays it out.
+    pub fn set_screen(&mut self, screen: Rect) {
+        self.screen = screen;
+    }
+
+    /// How many pages the list of keys takes on the screen.
+    fn keys_pages(&self) -> usize {
+        let plugin_on = |plugin: &str| self.plugin_on(plugin);
+        let plugin_keys = self.plugin_key_rows();
+        let shown = help::Shown {
+            plugin_on: &plugin_on,
+            plugin_keys: &plugin_keys,
+        };
+        help::page_count(&shown, self.screen)
     }
 
     /// The diff or the file finder, while one is open.
     pub fn view(&self) -> Option<&View> {
         self.view.as_ref()
+    }
+
+    /// Takes whether the diff view lists its files as a tree, as it last
+    /// did.
+    pub fn set_diff_tree(&mut self, on: bool) {
+        self.diff_tree = on;
     }
 
     /// Takes a diff read for the diff view, if it's still the one it wants.
@@ -856,19 +1073,99 @@ impl App {
         }
     }
 
-    /// Takes the files listed for the file finder, if it's still open on
-    /// their worktree. Its first file's preview is to be read next.
+    /// Takes the files listed for the file finder or the tree browser, if
+    /// it's still open on their worktree. The selected file's preview is to
+    /// be read next.
     pub fn files_read(&mut self, dir: &Path, files: Result<Vec<String>, String>) -> Option<Action> {
-        let Some(View::Files(finder)) = &mut self.view else {
-            return None;
-        };
-        finder.files_read(dir, files)
+        match &mut self.view {
+            Some(View::Files(finder)) => finder.files_read(dir, files),
+            Some(View::Tree(tree)) => tree.files_read(dir, files),
+            _ => None,
+        }
     }
 
-    /// Takes a file's first lines, if the file finder still has it selected.
-    pub fn preview_read(&mut self, dir: &Path, path: &str, lines: Result<Vec<String>, String>) {
-        if let Some(View::Files(finder)) = &mut self.view {
-            finder.preview_read(dir, path, lines);
+    /// Takes a file read for the preview of the file finder or the tree
+    /// browser, if it still shows it.
+    pub fn preview_read(&mut self, dir: &Path, path: &str, read: Result<Content, String>) {
+        match &mut self.view {
+            Some(View::Files(finder)) => finder.preview_read(dir, path, read),
+            Some(View::Tree(tree)) => tree.preview_read(dir, path, read),
+            _ => {}
+        }
+    }
+
+    /// Takes the branches listed for the branch switcher, if it's still
+    /// open on their worktree.
+    pub fn branches_listed(&mut self, dir: &Path, listed: Result<switcher::Listed, String>) {
+        if let Some(View::Branches(switcher)) = &mut self.view {
+            switcher.listed_done(dir, listed);
+        }
+    }
+
+    /// git is done switching the worktree at `dir`. The switcher that
+    /// started it takes what it came to, if it's still open on it; or else
+    /// the footer says.
+    pub fn branch_switched(
+        &mut self,
+        dir: &Path,
+        outcome: crate::git::branches::Outcome,
+    ) -> Option<Action> {
+        use crate::git::branches::Outcome as Switch;
+        self.switching.remove(dir);
+        if let Switch::Switched { branch, note } = &outcome {
+            let notice = match note {
+                Some(note) => format!("the worktree is on {branch} · {note}"),
+                None => format!("the worktree is on {branch}"),
+            };
+            self.notify(notice);
+        }
+        if let Some(View::Branches(switcher)) = &mut self.view
+            && switcher.dir == dir
+            && switcher.working()
+        {
+            let next = switcher.switched(outcome);
+            return self.follow(next);
+        }
+        match outcome {
+            Switch::Switched { .. } => {}
+            Switch::Dirty { changes, .. } => {
+                let count = changes.len();
+                let noun = if count == 1 { "change" } else { "changes" };
+                self.notify(format!(
+                    "not switched: {count} uncommitted {noun}; B to choose what becomes of them"
+                ));
+            }
+            Switch::Failed(why) | Switch::Stopped(why) => {
+                self.notify(format!("couldn't switch: {why}"));
+            }
+        }
+        None
+    }
+
+    /// Takes what a search found, if find in files is still open on its
+    /// worktree and query. The first hit's file is to be read next.
+    pub fn searched(
+        &mut self,
+        dir: &Path,
+        query: &str,
+        found: Result<crate::git::Found, String>,
+    ) -> Option<Action> {
+        let Some(View::Grep(grep)) = &mut self.view else {
+            return None;
+        };
+        grep.searched(dir, query, found)
+    }
+
+    /// Takes a file's lines, if find in files still has a hit in it
+    /// selected.
+    pub fn matched_file_read(
+        &mut self,
+        dir: &Path,
+        path: &str,
+        lines: Result<Vec<crate::syntax::Runs>, String>,
+    ) {
+        if let Some(View::Grep(grep)) = &mut self.view {
+            grep.file_read(dir, path, lines);
         }
     }
 
@@ -885,7 +1182,10 @@ impl App {
     pub fn set_view_size(&mut self, list: (u16, u16), content: (u16, u16)) {
         match &mut self.view {
             Some(View::Diff(diff)) => diff.set_size(content),
-            Some(View::Files(finder)) => finder.set_size(list),
+            Some(View::Files(finder)) => finder.set_size(list, content),
+            Some(View::Tree(tree)) => tree.set_size(content),
+            Some(View::Grep(grep)) => grep.set_size(list),
+            Some(View::Branches(switcher)) => switcher.set_size(list),
             Some(View::Memory(memory)) => memory.set_size(list),
             None => {}
         }
@@ -893,6 +1193,65 @@ impl App {
 
     pub fn notify(&mut self, notice: String) {
         self.notice = Some(notice);
+    }
+
+    pub fn timeline_view(&self) -> Option<&TimelineView> {
+        self.timeline.as_ref()
+    }
+
+    pub fn needs_you_view(&self) -> Option<&NeedsYouView> {
+        self.needs_you.as_ref()
+    }
+
+    /// Everything waiting on the user now, in every tab: see
+    /// [`needs_you::rows`].
+    pub fn needs_you_rows(&self) -> Vec<needs_you::Row> {
+        needs_you::rows(&self.sessions, self.shown_flows())
+    }
+
+    /// The footer's line on what happened while the user was away, until
+    /// the next key.
+    pub fn away_line(&self) -> Option<&str> {
+        let away = self.away.as_ref().filter(|_| self.away_shown)?;
+        Some(&away.line)
+    }
+
+    /// Takes what the event log gained while the user was away. When
+    /// something worth saying happened, the footer says it, and the
+    /// timeline opened next marks what's new since.
+    pub fn set_away(&mut self, tally: &Tally) {
+        if let Some(line) = tally.line(&self.needs_you_rows()) {
+            self.away = Some(Away {
+                line,
+                after: tally.after,
+            });
+            self.away_shown = true;
+        }
+    }
+
+    /// Takes a page of the event log, for the timeline, and asks for the
+    /// one before it when the timeline wants more to fill itself.
+    pub fn events_read(&mut self, page: Result<Vec<Event>, String>) -> Option<Action> {
+        let view = self.timeline.as_mut()?;
+        // The timeline says why its first page couldn't be read; the footer
+        // says why one further back couldn't.
+        let failed = match (&page, view.list.items()) {
+            (Err(reason), Some(Ok(_))) => Some(format!("couldn't read further back: {reason}")),
+            _ => None,
+        };
+        view.read(page);
+        let older = view.wants_older(false);
+        if let Some(failed) = failed {
+            self.notify(failed);
+        }
+        older.map(Action::ReadOlderEvents)
+    }
+
+    /// Takes an event that has just happened, for the timeline.
+    pub fn logged(&mut self, event: Event) {
+        if let Some(view) = &mut self.timeline {
+            view.logged(event);
+        }
     }
 
     pub fn sessions(&self) -> &[SessionInfo] {
@@ -908,6 +1267,17 @@ impl App {
 
     pub fn flows(&self) -> &[FlowRun] {
         &self.flows
+    }
+
+    /// Takes what the daemon says background tasks have spent today.
+    pub fn set_spending(&mut self, spending: Spending) {
+        self.spending = Some(spending);
+    }
+
+    /// What background tasks have spent today, once there's something
+    /// spent to show.
+    pub fn spending(&self) -> Option<Spending> {
+        self.spending.filter(|spending| spending.today_usd > 0.0)
     }
 
     /// The flow run the session at `index` is a step of, and which step.
@@ -1114,7 +1484,7 @@ impl App {
     }
 
     /// The projects the sessions are in, by their main worktrees: the ones
-    /// to ask GitHub about.
+    /// to ask their forge about.
     pub fn projects(&self) -> Vec<PathBuf> {
         let mut projects: Vec<PathBuf> = self
             .sessions
@@ -1127,29 +1497,53 @@ impl App {
         projects
     }
 
-    /// Takes what GitHub said about the open pull requests of the project
-    /// at `project`.
-    pub fn set_pull_requests(&mut self, project: PathBuf, found: Result<Vec<PullRequest>, String>) {
+    /// Takes what its forge said about the open pull requests of the
+    /// project at `project`, for the worktree lines and the pull requests
+    /// view, if it's open on that project.
+    pub fn set_pull_requests(
+        &mut self,
+        project: PathBuf,
+        found: Result<(Forge, Vec<PullRequest>), String>,
+    ) {
+        if let Some(view) = &mut self.pull_requests_view
+            && view.project == project
+        {
+            view.set_pull_requests(found.clone());
+        }
         self.pull_requests.insert(project, found);
     }
 
     /// The open pull request for `branch` in the project at `project`, if
-    /// GitHub knows of one.
+    /// its forge knows of one.
     pub fn pull_request(&self, project: &Path, branch: &str) -> Option<&PullRequest> {
         if !self.github_on {
             return None;
         }
-        let Some(Ok(pull_requests)) = self.pull_requests.get(project) else {
+        let Some(Ok((_, pull_requests))) = self.pull_requests.get(project) else {
             return None;
         };
         pull_requests
             .iter()
-            .find(|pull_request| pull_request.head_ref_name == branch)
+            .find(|pull_request| pull_request.local_branch == branch)
+    }
+
+    /// The forge the project at `project` is on, as far as the TUI knows:
+    /// GitHub until it's been asked.
+    fn forge_of(&self, project: &Path) -> Forge {
+        match self.pull_requests.get(project) {
+            Some(Ok((forge, _))) => *forge,
+            _ => Forge::GitHub,
+        }
     }
 
     /// The issues view, while it's open.
     pub fn issues_view(&self) -> Option<&IssuesView> {
         self.issues.as_ref()
+    }
+
+    /// The pull requests view, while it's open.
+    pub fn pull_requests_view(&self) -> Option<&PullRequestsView> {
+        self.pull_requests_view.as_ref()
     }
 
     /// The layouts view, while it's open.
@@ -1218,26 +1612,94 @@ impl App {
         self.closing.as_deref()
     }
 
-    /// Takes the open issues GitHub listed for the project at `project`.
-    pub fn set_issues(&mut self, project: &Path, found: Result<Vec<github::Issue>, String>) {
+    /// Takes the open issues its forge listed for the project at
+    /// `project`.
+    pub fn set_issues(&mut self, project: &Path, found: Result<(Forge, Vec<Issue>), String>) {
         if let Some(view) = self.issues.as_mut().filter(|view| view.project == project) {
             view.set_issues(found);
         }
     }
 
-    /// Takes the text of issue `number` of the project at `project`.
-    pub fn set_issue_body(&mut self, project: &Path, number: u64, body: Result<String, String>) {
+    /// Takes issue `number` of the project at `project`, read whole.
+    pub fn set_issue(
+        &mut self,
+        project: &Path,
+        number: u64,
+        read: Result<forge::IssueDetail, String>,
+    ) {
         if let Some(view) = self.issues.as_mut().filter(|view| view.project == project) {
-            view.set_body(number, body);
+            view.list.set_detail(number, read);
         }
     }
 
-    /// The issue whose text to fetch next, with its project: the one the
-    /// issues view's bar is on, once.
-    pub fn issue_body_to_fetch(&mut self) -> Option<(PathBuf, u64)> {
-        let view = self.issues.as_mut()?;
-        let number = view.body_to_fetch()?;
-        Some((view.project.clone(), number))
+    /// Takes pull request `number` of the project at `project`, read whole.
+    pub fn set_pull_request(
+        &mut self,
+        project: &Path,
+        number: u64,
+        read: Result<PullRequestDetail, String>,
+    ) {
+        let view = self.pull_requests_view.as_mut();
+        if let Some(view) = view.filter(|view| view.project == project) {
+            view.list.set_detail(number, read);
+        }
+    }
+
+    /// The issue or pull request to read whole next, with its project: the
+    /// one the open view's bar is on, once.
+    pub fn topic_to_read(&mut self) -> Option<(PathBuf, Topic)> {
+        if let Some(view) = &mut self.issues
+            && let Some(number) = view.list.detail_to_fetch()
+        {
+            return Some((view.project.clone(), Topic::Issue(number)));
+        }
+        let view = self.pull_requests_view.as_mut()?;
+        let number = view.list.detail_to_fetch()?;
+        Some((view.project.clone(), Topic::PullRequest(number)))
+    }
+
+    /// The comment on `topic`, of the project at `project`, was posted, or
+    /// why it wasn't.
+    pub fn commented(&mut self, project: &Path, topic: Topic, posted: Result<(), String>) {
+        let notice = posted.is_ok().then(|| match topic {
+            Topic::Issue(number) => format!("commented on #{number}"),
+            Topic::PullRequest(number) => {
+                format!("commented on {}", self.forge_of(project).label(number))
+            }
+        });
+        match topic {
+            Topic::Issue(number) => {
+                if let Some(view) = self.issues.as_mut().filter(|view| view.project == project) {
+                    view.commented(number, posted);
+                }
+            }
+            Topic::PullRequest(number) => {
+                let view = self.pull_requests_view.as_mut();
+                if let Some(view) = view.filter(|view| view.project == project) {
+                    view.commented(number, posted);
+                }
+            }
+        }
+        if let Some(notice) = notice {
+            self.notify(notice);
+        }
+    }
+
+    /// Issue `number` of the project at `project` was given this title and
+    /// text, or why it wasn't.
+    pub fn issue_edited(
+        &mut self,
+        project: &Path,
+        number: u64,
+        (title, body): (String, String),
+        saved: Result<(), String>,
+    ) {
+        if saved.is_ok() {
+            self.notify(format!("updated issue #{number}"));
+        }
+        if let Some(view) = self.issues.as_mut().filter(|view| view.project == project) {
+            view.edited(number, title, body, saved);
+        }
     }
 
     /// The question on the footer line and its answer so far, while one
@@ -1275,18 +1737,30 @@ impl App {
         self.tabs = tabs;
         self.place_sessions();
         self.arrive_at_tab();
+        self.remember_shown();
+    }
+
+    /// The panes of the tab in front.
+    pub fn panes(&self) -> &SplitTree {
+        &self.tabs.current().panes
+    }
+
+    /// Takes the room beside the sidebar the panes share, as the event loop
+    /// lays them out.
+    pub fn set_tiles(&mut self, tiles: Rect) {
+        self.tiles = tiles;
     }
 
     /// The names of the sessions the tab in front splits off, in the order
-    /// they were.
-    pub fn splits(&self) -> &[String] {
-        &self.tabs.current().splits
+    /// their panes are drawn.
+    pub fn splits(&self) -> Vec<&str> {
+        self.tabs.current().splits()
     }
 
-    /// The panes on screen, in the order they're drawn: the splits, with
-    /// the one that follows the selection where it's been moved to, first
-    /// until it's moved. Zoomed, only the pane that shows the selected
-    /// session. Then, last, over the others, the float, if there is one.
+    /// The panes on screen, in the order they're drawn: the tab's panes,
+    /// left to right and top to bottom. Zoomed, only the pane that shows
+    /// the selected session. Then, last, over the others, the float, if
+    /// there is one.
     pub fn slots(&self) -> Vec<Slot> {
         let mut slots = if self.zoomed() {
             let zoomed = self.selected_slot().filter(|slot| *slot != Slot::Float);
@@ -1314,16 +1788,57 @@ impl App {
     /// Every pane of the tab in front, in the order they're drawn when it
     /// isn't zoomed.
     fn tiled(&self) -> Vec<Slot> {
-        let tab = self.tabs.current();
-        let mut slots: Vec<Slot> = (0..tab.splits.len()).map(Slot::Split).collect();
-        slots.insert(tab.selection_pane_at(), Slot::Selected);
-        slots
+        let mut splits = 0;
+        let panes = self.panes().panes().into_iter();
+        panes
+            .map(|pane| match pane {
+                Pane::Selection => Slot::Selected,
+                Pane::Session(_) => {
+                    splits += 1;
+                    Slot::Split(splits - 1)
+                }
+            })
+            .collect()
+    }
+
+    /// The pane at `slot` in the tab's tree: the float isn't in it.
+    fn pane_of(&self, slot: Slot) -> Option<Pane> {
+        match slot {
+            Slot::Selected => Some(Pane::Selection),
+            Slot::Split(index) => Some(Pane::Session(self.splits().get(index)?.to_string())),
+            Slot::Float => None,
+        }
+    }
+
+    /// Where `pane` of the tab's tree is drawn.
+    fn slot_of(&self, pane: &Pane) -> Option<Slot> {
+        match pane {
+            Pane::Selection => Some(Slot::Selected),
+            Pane::Session(name) => {
+                let splits = self.splits();
+                splits
+                    .iter()
+                    .position(|split| split == name)
+                    .map(Slot::Split)
+            }
+        }
     }
 
     /// Whether the tab in front is zoomed: the selected session's pane
     /// takes the room of the sidebar and the other panes.
     pub fn zoomed(&self) -> bool {
         self.tabs.current().zoomed
+    }
+
+    /// Whether the sidebar's keys are moving the selected session's pane's
+    /// borders, in resize mode.
+    pub fn resizing(&self) -> bool {
+        self.resizing
+    }
+
+    /// The border the mouse is moving, while it is: see [`Hit::Border`].
+    pub fn moving_border(&self) -> Option<usize> {
+        self.border
     }
 
     /// The pane a drag of the mouse is selecting in, while it lasts.
@@ -1336,24 +1851,93 @@ impl App {
         self.grabbed
     }
 
-    /// The session the pane at `slot` is about: the selected one, the one
-    /// split off there, or the one floating.
+    /// Where on a pane's screen the mouse is with Ctrl held, to underline
+    /// the link there.
+    pub fn link_hover(&self) -> Option<(Slot, (u16, u16))> {
+        self.link_hover
+    }
+
+    /// The mouse moved onto `hit`, with Ctrl held or not: on a pane's
+    /// screen with Ctrl, the link there is to be underlined, and otherwise
+    /// none is. Returns whether that changes what's drawn.
+    pub fn mouse_moved(&mut self, hit: Hit, ctrl: bool) -> bool {
+        let over = if ctrl { self.link_cell(hit) } else { None };
+        let changed = over != self.link_hover;
+        self.link_hover = over;
+        changed
+    }
+
+    /// Where a Ctrl+click on `hit` looks for a link to open: a cell of a
+    /// pane's screen, while nothing over the panes waits on the keyboard.
+    pub fn link_cell(&self, hit: Hit) -> Option<(Slot, (u16, u16))> {
+        match hit {
+            Hit::Pane {
+                slot,
+                cell: Some(cell),
+            } if self.mouse_on_panes() && self.shows_screen(slot) => Some((slot, cell)),
+            _ => None,
+        }
+    }
+
+    /// What a plugin opening a link in the pane at `slot` is told: the
+    /// session the pane shows.
+    pub fn link_context(&self, slot: Slot) -> plugins::Context {
+        self.pane_session(slot)
+            .map(plugins::Context::of_session)
+            .unwrap_or_default()
+    }
+
+    /// The session the pane at `slot` is about: the one split off there,
+    /// the one floating, or, in the pane that follows the selection, the
+    /// selected one. While the selected session has a pane of its own,
+    /// that pane goes on showing the session it showed before, if it can;
+    /// if not, it's still about the selected one, to say where that is.
     pub fn pane_session(&self, slot: Slot) -> Option<&SessionInfo> {
         match slot {
-            Slot::Selected => self.selected(),
+            Slot::Selected => {
+                let selected = self.selected()?;
+                if self.has_own_pane(&selected.name) {
+                    return self.shown().or(Some(selected));
+                }
+                Some(selected)
+            }
             Slot::Split(index) => {
-                let name = self.splits().get(index)?;
-                self.sessions.iter().find(|session| session.name == *name)
+                let name = *self.splits().get(index)?;
+                self.sessions.iter().find(|session| session.name == name)
             }
             Slot::Float => self.floating(),
         }
     }
 
+    /// The session the selection's pane went on showing when the selection
+    /// moved to one with a pane of its own, while it's still in the tab
+    /// and has none itself.
+    fn shown(&self) -> Option<&SessionInfo> {
+        let tab = self.tabs.current();
+        let name = tab.shown.as_deref()?;
+        if !tab.holds(name) || self.has_own_pane(name) {
+            return None;
+        }
+        self.sessions.iter().find(|session| session.name == name)
+    }
+
+    /// Notes the selected session as the one the selection's pane shows,
+    /// while it has no pane of its own, so that the pane goes on showing it
+    /// once the selection moves to one that does.
+    fn remember_shown(&mut self) {
+        let Some(name) = self.selected_name() else {
+            return;
+        };
+        if !self.has_own_pane(&name) {
+            self.tabs.current_mut().shown = Some(name);
+        }
+    }
+
     /// Whether the pane at `slot` shows its session's screen. The pane that
-    /// follows the selection doesn't when the selected session is split
-    /// off or floats, so that no session is drawn twice at two sizes, nor
-    /// when it's the session this TUI runs in. Zoomed, no other pane is on
-    /// screen but the float.
+    /// follows the selection doesn't when its session has a pane of its
+    /// own, split off or floating, so that no session is drawn twice at two
+    /// sizes, nor when it's the session this TUI runs in. Zoomed, no other
+    /// pane is on screen but the float.
     pub fn shows_screen(&self, slot: Slot) -> bool {
         let Some(session) = self.pane_session(slot) else {
             return false;
@@ -1362,18 +1946,21 @@ impl App {
             return false;
         }
         match slot {
-            Slot::Selected => {
-                !self.selected_is_own()
-                    && !self.is_split(&session.name)
-                    && !self.is_floating(&session.name)
-            }
+            Slot::Selected => !self.is_own(session) && !self.has_own_pane(&session.name),
             Slot::Split(_) | Slot::Float => true,
         }
     }
 
-    /// Whether the session called `name` has a pane of its own.
+    /// Whether the session called `name` is split off into a pane of its
+    /// own.
     pub fn is_split(&self, name: &str) -> bool {
-        self.splits().iter().any(|split| split == name)
+        self.tabs.current().is_split(name)
+    }
+
+    /// Whether the session called `name` has a pane of its own: split off,
+    /// or floating.
+    fn has_own_pane(&self, name: &str) -> bool {
+        self.is_split(name) || self.is_floating(name)
     }
 
     /// The index of the selected session, or `None` when the tab in front
@@ -1395,13 +1982,16 @@ impl App {
         self.selected().map(|session| session.name.clone())
     }
 
-    /// Whether the selected session is the one this TUI runs in. Ids tell,
-    /// since the session may have been renamed since the TUI started.
+    /// Whether the selected session is the one this TUI runs in.
     pub fn selected_is_own(&self) -> bool {
-        match (&self.own_id, self.selected()) {
-            (Some(own), Some(selected)) => selected.id == *own,
-            _ => false,
-        }
+        self.selected()
+            .is_some_and(|selected| self.is_own(selected))
+    }
+
+    /// Whether `session` is the one this TUI runs in. Ids tell, since the
+    /// session may have been renamed since the TUI started.
+    pub fn is_own(&self, session: &SessionInfo) -> bool {
+        self.own_id.as_ref() == Some(&session.id)
     }
 
     /// Takes a fresh list from the daemon and puts it in the sidebar's
@@ -1410,10 +2000,20 @@ impl App {
     /// worktree, the selection goes to the row that worktree is left with;
     /// otherwise to the next session in the tab, or the last.
     pub fn set_sessions(&mut self, sessions: Vec<SessionInfo>) {
+        // A session renamed from elsewhere, by `crystal rename` or from its
+        // first prompt, keeps its tab, its pane and the selection.
+        for now in &sessions {
+            let was = self.sessions.iter().find(|was| was.id == now.id);
+            if let Some(was) = was.filter(|was| was.name != now.name) {
+                self.tabs.renamed(&was.name, &now.name);
+            }
+        }
         let before = self.sessions.get(self.selected).cloned();
         let on_a_session = self.on_worktree.is_none();
         self.sessions = groups::order(sessions, self.shown_flows());
-        let still_there = before.as_ref().and_then(|s| self.position(&s.name));
+        let still_there = before
+            .as_ref()
+            .and_then(|s| self.sessions.iter().position(|now| now.id == s.id));
         if let Some(index) = still_there {
             self.selected = index;
         }
@@ -1440,19 +2040,21 @@ impl App {
         if !keeps_keyboard {
             self.focus = Focus::Sidebar;
         }
+        if self.needs_you.is_some() {
+            let rows = self.needs_you_rows();
+            if let Some(view) = &mut self.needs_you {
+                view.refresh(rows);
+            }
+        }
+        self.remember_shown();
     }
 
-    /// Closes the splits of the tab in front whose sessions have gone, the
+    /// Closes the panes of the tab in front whose sessions have gone, the
     /// keyboard moving with its pane. The other tabs' go as
     /// [`Self::place_sessions`] puts their sessions right.
     fn close_splits_of_gone_sessions(&mut self) {
-        // Going from the end keeps the splits still to check where they
-        // were.
-        for index in (0..self.splits().len()).rev() {
-            if self.position(&self.splits()[index]).is_none() {
-                self.close_split(index);
-            }
-        }
+        let there: Vec<String> = self.sessions.iter().map(|s| s.name.clone()).collect();
+        self.change_panes(|panes| panes.retain(|name| there.iter().any(|held| held == name)));
     }
 
     /// Puts every session in a tab: those that have gone leave theirs, and
@@ -1506,6 +2108,7 @@ impl App {
         }
         self.selected = index;
         self.on_worktree = None;
+        self.remember_shown();
     }
 
     /// The session called `from` is called `to` now: a split of it stays
@@ -1541,7 +2144,14 @@ impl App {
     }
 
     pub fn on_key(&mut self, key: KeyEvent) -> Option<Action> {
+        let action = self.take_key(key);
+        self.remember_shown();
+        action
+    }
+
+    fn take_key(&mut self, key: KeyEvent) -> Option<Action> {
         self.notice = None;
+        self.away_shown = false;
         // A plugin's pane is over everything, and has every key but the one
         // that closes it.
         if self.plugin_pane.is_some() {
@@ -1554,10 +2164,15 @@ impl App {
         if self.view.is_some() {
             return self.on_view_key(key);
         }
-        // Any key closes the list of keys, and does nothing else: the key
-        // that closes it may be one the user was only reading about.
-        if self.showing_keys {
-            self.showing_keys = false;
+        // The arrows turn the list of keys' pages. Any other key closes it,
+        // and does nothing else: the key that closes it may be one the user
+        // was only reading about.
+        if let Some(page) = self.keys_page {
+            let pages = self.keys_pages();
+            self.keys_page = match page_turn(key.code) {
+                Some(by) if pages > 1 => Some((page + pages).wrapping_add_signed(by) % pages),
+                _ => None,
+            };
             return None;
         }
         // Only `y` says yes; any other key says no.
@@ -1615,11 +2230,24 @@ impl App {
         if self.prompt.is_some() {
             return self.on_prompt_key(key);
         }
+        if self.needs_you.is_some() {
+            return self.on_needs_you_key(key);
+        }
+        if self.timeline.is_some() {
+            return self.on_timeline_key(key);
+        }
         if self.issues.is_some() {
             return self.on_issues_key(key);
         }
+        if self.pull_requests_view.is_some() {
+            return self.on_pull_requests_key(key);
+        }
         if self.filter.is_some() {
             self.on_filter_key(key);
+            return None;
+        }
+        if self.resizing {
+            self.on_resize_key(key);
             return None;
         }
         match self.focus {
@@ -1630,46 +2258,57 @@ impl App {
     }
 
     /// What the mouse does, when no program in a pane has taken it: a click
-    /// selects a session or hands a pane the keyboard, and the wheel moves
-    /// the selection, or scrolls a pane through its history.
+    /// selects a session or hands a pane the keyboard, a drag moves a
+    /// border between panes, and the wheel moves the selection, or scrolls
+    /// a pane through its history.
     pub fn on_mouse(&mut self, kind: MouseEventKind, hit: Hit) -> Option<Action> {
+        let action = self.take_mouse(kind, hit);
+        self.remember_shown();
+        action
+    }
+
+    fn take_mouse(&mut self, kind: MouseEventKind, hit: Hit) -> Option<Action> {
         if let Some(view) = &mut self.view {
             let outcome = match view {
                 View::Diff(diff) => diff.on_mouse(kind, hit),
                 View::Files(finder) => finder.on_mouse(kind, hit),
+                View::Tree(tree) => tree.on_mouse(kind, hit),
+                View::Grep(grep) => grep.on_mouse(kind, hit),
+                View::Branches(switcher) => switcher.on_mouse(kind, hit),
                 View::Memory(memory) => memory.on_mouse(kind, hit),
             };
             return self.follow(outcome);
         }
         // A click closes the list of keys, like a key does.
-        if self.showing_keys {
+        if self.showing_keys() {
             if kind == MouseEventKind::Down(MouseButton::Left) {
-                self.showing_keys = false;
+                self.keys_page = None;
             }
             return None;
         }
-        // A question on the footer waits for its answer from the keyboard,
-        // and so do the filter, the issues and backlog views, the new-session
-        // panel and the profiles view.
-        let typing = self.filter.is_some()
-            || self.issues.is_some()
-            || self.backlog.is_some()
-            || self.layouts.is_some()
-            || self.launcher.is_some()
-            || self.profiles_view.is_some()
-            || self.plugins_view.is_some()
-            || self.settings.is_some()
-            || self.plugin_pane.is_some();
-        let asking = self.prompt.is_some()
-            || self.confirm.is_some()
-            || self.closing.is_some()
-            || self.moving.is_some();
-        if asking || typing {
+        if self.waiting_on_keyboard() {
             return None;
         }
         let click = kind == MouseEventKind::Down(MouseButton::Left);
         if click {
             self.notice = None;
+            self.resizing = false;
+        }
+        // A border taken by the mouse follows it until the button comes up.
+        if let Some(split) = self.border {
+            match (kind, hit) {
+                (MouseEventKind::Drag(_), Hit::Border { split: moved, at }) if moved == split => {
+                    let tiles = self.tiles;
+                    self.tabs.current_mut().panes.drag(split, at, tiles);
+                    return None;
+                }
+                (MouseEventKind::Up(_), _) => {
+                    self.border = None;
+                    return None;
+                }
+                (MouseEventKind::Down(_), _) => self.border = None,
+                _ => return None,
+            }
         }
         // A drag selects in the pane it started in until the button comes
         // up, wherever it goes meanwhile.
@@ -1721,6 +2360,7 @@ impl App {
         match (kind, hit) {
             (_, Hit::Tab(index)) if click => self.go_to_tab(index),
             (_, Hit::SidebarRow(row)) if click => self.click_row(row),
+            (_, Hit::Border { split, .. }) if click && !self.zoomed() => self.border = Some(split),
             (_, Hit::Pane { slot, cell }) if click => {
                 // A click hands a pane the keyboard, but copy mode keeps it.
                 if self.focus != Focus::Copy(slot) && self.can_type_into(slot) {
@@ -1758,6 +2398,36 @@ impl App {
         None
     }
 
+    /// Whether something open waits for the keyboard, and the mouse does
+    /// nothing meanwhile: a question on the footer waits for its answer,
+    /// and so do the filter, the issues and backlog views, the new-session
+    /// panel, the profiles view and the others over the panes.
+    fn waiting_on_keyboard(&self) -> bool {
+        let typing = self.filter.is_some()
+            || self.timeline.is_some()
+            || self.needs_you.is_some()
+            || self.issues.is_some()
+            || self.pull_requests_view.is_some()
+            || self.backlog.is_some()
+            || self.layouts.is_some()
+            || self.launcher.is_some()
+            || self.profiles_view.is_some()
+            || self.plugins_view.is_some()
+            || self.settings.is_some()
+            || self.plugin_pane.is_some();
+        let asking = self.prompt.is_some()
+            || self.confirm.is_some()
+            || self.closing.is_some()
+            || self.moving.is_some();
+        typing || asking
+    }
+
+    /// Whether the mouse works on the panes: they're showing, and nothing
+    /// over them waits on the keyboard.
+    fn mouse_on_panes(&self) -> bool {
+        self.view.is_none() && !self.showing_keys() && !self.waiting_on_keyboard()
+    }
+
     /// A click on a sidebar row: on a session, or a worktree with none,
     /// selects it and gives the sidebar the keyboard. Headings don't do
     /// anything.
@@ -1782,23 +2452,50 @@ impl App {
         {
             return None;
         }
+        // On a background task asking for a permission, `y`, `n` and `Y`
+        // answer it; `n` is a new session again once it's answered.
+        if let Some(answer) = answer_key(key.code)
+            && let Some(name) = self.selected().filter(|s| s.asking.is_some())
+        {
+            let name = name.name.clone();
+            return Some(Action::Answer { name, answer });
+        }
+        // Shift and an arrow go from pane to pane, where the arrow points.
+        if key.modifiers.contains(KeyModifiers::SHIFT)
+            && let Some(toward) = arrow(key.code)
+        {
+            self.focus_toward(toward);
+            return None;
+        }
         match key.code {
             KeyCode::Char('j') | KeyCode::Down => self.move_selection(1),
             KeyCode::Char('k') | KeyCode::Up => self.move_selection(-1),
+            KeyCode::Char('y' | 'Y') => {
+                let not_asking = |s: &SessionInfo| format!("{} isn't asking for anything", s.name);
+                let notice = self
+                    .selected()
+                    .map_or_else(|| "there's no session selected".into(), not_asking);
+                self.notify(notice);
+            }
             // On a worktree with no sessions, there's nothing to type into:
             // Enter starts something there, as `n` does.
             KeyCode::Enter if self.on_worktree.is_some() => return self.open_launcher(false),
             KeyCode::Enter => self.enter(),
-            KeyCode::Tab => self.move_to_pane(Direction::Forward),
-            KeyCode::BackTab => self.move_to_pane(Direction::Back),
+            KeyCode::Tab => self.move_to_pane(Round::Forward),
+            KeyCode::BackTab => self.move_to_pane(Round::Back),
             KeyCode::Char('s') => self.toggle_split(),
+            KeyCode::Char('|') => self.split_pane(Way::Right, HALF),
+            KeyCode::Char('-') => self.split_pane(Way::Down, HALF),
             KeyCode::Char('z') => self.toggle_zoom(),
             KeyCode::Char('v') => self.start_copying(),
             KeyCode::Char('e') => return self.edit_history(),
             KeyCode::Char('F') => self.toggle_float(),
             KeyCode::Char('S') => return Some(Action::ListLayouts),
-            KeyCode::Char('H') => self.move_pane(-1),
-            KeyCode::Char('L') => self.move_pane(1),
+            KeyCode::Char('H') => self.move_pane(Direction::Left),
+            KeyCode::Char('J') => self.move_pane(Direction::Down),
+            KeyCode::Char('K') => self.move_pane(Direction::Up),
+            KeyCode::Char('L') => self.move_pane(Direction::Right),
+            KeyCode::Char('R') => self.start_resizing(),
             KeyCode::Char('t') => return self.new_tab(),
             KeyCode::Char('T') => self.ask_for_tab_name(),
             KeyCode::Char('&') => self.close_tab(),
@@ -1814,13 +2511,19 @@ impl App {
             KeyCode::Char('r') => self.ask_for_name(),
             KeyCode::Char('x') => self.confirm = Some(Confirm::Kill(self.selected()?.name.clone())),
             KeyCode::Char('u') => self.select_next_needing_user(),
+            KeyCode::Char('U') => self.open_needs_you(),
+            KeyCode::Char('a') => return Some(self.open_timeline()),
             KeyCode::Char('d') => return self.open_diff(),
             KeyCode::Char('p') => return self.open_finder(),
+            KeyCode::Char('E') => return self.open_tree_browser(),
+            KeyCode::Char('G') => self.open_grep(),
+            KeyCode::Char('B') => return self.open_switcher(),
             KeyCode::Char('m') => return self.open_memory(),
             KeyCode::Char('P') => return self.open_profiles(),
-            KeyCode::Char('?') => self.showing_keys = true,
+            KeyCode::Char('?') => self.keys_page = Some(0),
             KeyCode::Char('/') => self.open_filter(),
             KeyCode::Char('o') => return self.open_pull_request(),
+            KeyCode::Char('O') => return self.open_pull_requests(),
             KeyCode::Char('i') => return self.open_issues(),
             KeyCode::Char('c') if self.tasks_on => self.ask_how_the_task_went(),
             KeyCode::Char('b') if self.backlog_on => return self.open_backlog(),
@@ -1900,7 +2603,7 @@ impl App {
     /// to be read.
     fn open_diff(&mut self) -> Option<Action> {
         let (dir, place) = self.selected_worktree()?;
-        let diff = DiffView::new(dir, place);
+        let diff = DiffView::new(dir, place, self.diff_tree);
         let read = diff.read();
         self.view = Some(View::Diff(diff));
         Some(read)
@@ -1914,6 +2617,56 @@ impl App {
         let read = finder.read();
         self.view = Some(View::Files(finder));
         Some(read)
+    }
+
+    /// `E`: opens the tree browser on the selected session's worktree, and
+    /// asks for its files to be listed.
+    fn open_tree_browser(&mut self) -> Option<Action> {
+        let (dir, place) = self.selected_worktree()?;
+        let tree = TreeBrowser::new(dir, place);
+        let read = tree.read();
+        self.view = Some(View::Tree(tree));
+        Some(read)
+    }
+
+    /// `B`: opens the branch switcher on the selected session's worktree,
+    /// and asks for its branches to be listed. Only a project's main
+    /// worktree switches: a linked one is named after its branch.
+    fn open_switcher(&mut self) -> Option<Action> {
+        let worktree = match self.selected_empty_worktree() {
+            Some(worktree) => worktree.clone(),
+            None => {
+                let selected = self.selected()?;
+                let Some(worktree) = selected.worktree.clone() else {
+                    let notice = format!("{} isn't in a git repository", selected.name);
+                    self.notify(notice);
+                    return None;
+                };
+                worktree
+            }
+        };
+        if !worktree.main {
+            self.notify(
+                "B switches a project's main worktree: a linked one stays on the branch it was made for"
+                    .to_string(),
+            );
+            return None;
+        }
+        if self.switching.contains(&worktree.path) {
+            self.notify("git is still switching it: the footer will say how it went".to_string());
+            return None;
+        }
+        let switcher = Switcher::new(worktree.path.clone(), worktree_label(&worktree));
+        let read = switcher.read();
+        self.view = Some(View::Branches(switcher));
+        Some(read)
+    }
+
+    /// `G`: opens find in files on the selected session's worktree.
+    fn open_grep(&mut self) {
+        if let Some((dir, place)) = self.selected_worktree() {
+            self.view = Some(View::Grep(Grep::new(dir, place)));
+        }
     }
 
     /// `m`: opens the memory of the selected session's project, and asks for
@@ -1960,6 +2713,9 @@ impl App {
         let outcome = match self.view.as_mut()? {
             View::Diff(diff) => diff.on_key(key),
             View::Files(finder) => finder.on_key(key),
+            View::Tree(tree) => tree.on_key(key),
+            View::Grep(grep) => grep.on_key(key),
+            View::Branches(switcher) => switcher.on_key(key),
             View::Memory(memory) => memory.on_key(key),
         };
         self.follow(outcome)
@@ -1973,15 +2729,28 @@ impl App {
                 self.view = None;
                 None
             }
-            Outcome::Do(action) => Some(action),
-            Outcome::Edit(path) => {
-                let Some(View::Files(finder)) = self.view.take() else {
-                    return None;
+            Outcome::Do(action) => {
+                match &action {
+                    Action::KeepTree(on) => self.diff_tree = *on,
+                    Action::SwitchBranch { dir, .. } => {
+                        self.switching.insert(dir.clone());
+                    }
+                    _ => {}
+                }
+                Some(action)
+            }
+            Outcome::Edit { path, line } => {
+                let dir = match self.view.take()? {
+                    View::Files(finder) => finder.dir,
+                    View::Tree(tree) => tree.dir,
+                    View::Grep(grep) => grep.dir,
+                    _ => return None,
                 };
                 let name = self.free_name(&edit_name(&path));
                 Some(Action::Edit {
-                    dir: finder.dir,
+                    dir,
                     path,
+                    line,
                     name,
                 })
             }
@@ -2168,9 +2937,11 @@ impl App {
         }
     }
 
-    /// `o`: opens the pull request of the selected session's branch, or
-    /// says why there's none to open.
-    fn open_pull_request(&mut self) -> Option<Action> {
+    /// The worktree of the selected session, for a key that asks its
+    /// project's forge something: `None`, the footer saying why, when the
+    /// github plugin is off, when it isn't in a repository, or when what
+    /// stopped the forge listing its pull requests would stop this too.
+    fn forge_worktree(&mut self) -> Option<Worktree> {
         if !self.github_on {
             self.notify(plugins::off("github"));
             return None;
@@ -2181,54 +2952,65 @@ impl App {
             self.notify(format!("{name} isn't in a git repository"));
             return None;
         };
-        let Some(branch) = worktree.branch else {
-            self.notify(format!("{name} is on no branch"));
-            return None;
-        };
-        let project = worktree.project_path;
-        let number = match self.pull_requests.get(&project) {
-            None => {
-                self.notify(format!("still asking GitHub about {}", worktree.project));
-                return None;
-            }
-            Some(Err(reason)) => {
-                let reason = reason.clone();
-                self.notify(reason);
-                return None;
-            }
-            Some(Ok(_)) => self.pull_request(&project, &branch).map(|pr| pr.number),
-        };
-        match number {
-            Some(number) => Some(Action::OpenPullRequest { project, number }),
-            None => {
-                self.notify(format!("no open pull request for {branch}"));
-                None
-            }
-        }
-    }
-
-    /// `i`: opens the issues view for the selected session's project, or
-    /// says why it can't.
-    fn open_issues(&mut self) -> Option<Action> {
-        if !self.github_on {
-            self.notify(plugins::off("github"));
-            return None;
-        }
-        let selected = self.selected()?;
-        let name = selected.name.clone();
-        let Some(worktree) = selected.worktree.clone() else {
-            self.notify(format!("{name} isn't in a git repository"));
-            return None;
-        };
-        // What stopped GitHub listing pull requests would stop it listing
-        // issues too.
         if let Some(Err(reason)) = self.pull_requests.get(&worktree.project_path) {
             let reason = reason.clone();
             self.notify(reason);
             return None;
         }
+        Some(worktree)
+    }
+
+    /// `o`: opens the pull request of the selected session's branch, or
+    /// says why there's none to open.
+    fn open_pull_request(&mut self) -> Option<Action> {
+        let worktree = self.forge_worktree()?;
+        let Some(branch) = worktree.branch else {
+            let name = self.selected()?.name.clone();
+            self.notify(format!("{name} is on no branch"));
+            return None;
+        };
         let project = worktree.project_path;
-        self.issues = Some(IssuesView::new(project.clone(), worktree.project));
+        let Some(Ok((forge, _))) = self.pull_requests.get(&project) else {
+            let name = worktree.project;
+            self.notify(format!("still asking about {name}'s pull requests"));
+            return None;
+        };
+        let forge = *forge;
+        match self.pull_request(&project, &branch) {
+            Some(pull_request) => Some(Action::OpenInBrowser {
+                topic: Topic::PullRequest(pull_request.number),
+                project,
+            }),
+            None => {
+                self.notify(format!("no open {} for {branch}", forge.pull_request()));
+                None
+            }
+        }
+    }
+
+    /// `O`: opens the pull requests view for the selected session's
+    /// project, on the ones listed last until its forge lists them again,
+    /// or says why it can't.
+    fn open_pull_requests(&mut self) -> Option<Action> {
+        let worktree = self.forge_worktree()?;
+        let project = worktree.project_path;
+        let known = match self.pull_requests.get(&project) {
+            Some(Ok((_, pull_requests))) => Some(pull_requests.clone()),
+            _ => None,
+        };
+        let forge = self.forge_of(&project);
+        let view = PullRequestsView::new(project.clone(), worktree.project, forge, known);
+        self.pull_requests_view = Some(view);
+        Some(Action::ListPullRequests(project))
+    }
+
+    /// `i`: opens the issues view for the selected session's project, or
+    /// says why it can't.
+    fn open_issues(&mut self) -> Option<Action> {
+        let worktree = self.forge_worktree()?;
+        let project = worktree.project_path;
+        let forge = self.forge_of(&project);
+        self.issues = Some(IssuesView::new(project.clone(), worktree.project, forge));
         Some(Action::ListIssues(project))
     }
 
@@ -2278,8 +3060,8 @@ impl App {
                 self.notify(format!("{} is still running", run.name));
                 None
             }
-            RunState::Done => {
-                self.notify(format!("{} is done", run.name));
+            RunState::Done | RunState::Cancelled => {
+                self.notify(format!("{} is {}", run.name, run.state().word()));
                 None
             }
         }
@@ -2340,10 +3122,11 @@ impl App {
             }),
             Step::Start(item) => {
                 self.backlog = None;
-                let branch = github::branch_for_issue(item.number, &item.text);
+                let branch = forge::branch_for_issue(item.number, &item.text);
                 let setup = self.launch_setup(false);
                 let launcher = Launcher::new(setup)
-                    .with_task(&item.text, &branch)
+                    .with_task(&item.text)
+                    .with_branch(&branch)
                     .for_backlog_item(item.number);
                 self.launcher = Some(launcher);
                 self.codex_models_wanted()
@@ -2351,32 +3134,105 @@ impl App {
         }
     }
 
-    /// Keys while the issues view is open: Esc closes it, Enter goes on to
-    /// start a session for the issue the bar is on, and the view takes the
-    /// rest.
+    /// Keys while the issues view is open: all of them are its.
     fn on_issues_key(&mut self, key: KeyEvent) -> Option<Action> {
-        match key.code {
-            KeyCode::Esc => self.issues = None,
-            KeyCode::Enter => return self.start_on_issue(),
-            _ => {
-                if let Some(view) = &mut self.issues {
-                    view.on_key(&key);
-                }
+        let view = self.issues.as_mut()?;
+        let project = view.project.clone();
+        match view.on_key(&key) {
+            issues::Step::Stay => None,
+            issues::Step::Close => {
+                self.issues = None;
+                None
+            }
+            issues::Step::Start(issue) => self.start_on_issue(&issue),
+            issues::Step::Open(number) => Some(Action::OpenInBrowser {
+                project,
+                topic: Topic::Issue(number),
+            }),
+            issues::Step::Comment { number, text } => Some(Action::Comment {
+                project,
+                topic: Topic::Issue(number),
+                text,
+            }),
+            issues::Step::Edit {
+                number,
+                title,
+                body,
+            } => Some(Action::EditIssue {
+                project,
+                number,
+                title,
+                body,
+            }),
+            issues::Step::Say(said) => {
+                self.notify(said);
+                None
             }
         }
-        None
     }
 
-    /// Closes the issues view and opens the new-session panel for the issue
-    /// the bar was on: a new worktree on a branch named after it, and the
-    /// task to fix it, with the issue's address so the agent can read it.
-    fn start_on_issue(&mut self) -> Option<Action> {
+    /// Keys while the pull requests view is open: all of them are its.
+    fn on_pull_requests_key(&mut self, key: KeyEvent) -> Option<Action> {
+        let view = self.pull_requests_view.as_mut()?;
+        let project = view.project.clone();
+        match view.on_key(&key) {
+            pull_requests::Step::Stay => None,
+            pull_requests::Step::Close => {
+                self.pull_requests_view = None;
+                None
+            }
+            pull_requests::Step::Start(pull_request) => self.start_on_pull_request(&pull_request),
+            pull_requests::Step::Diff(number) => {
+                let place = view.project_name.clone();
+                let diff =
+                    DiffView::of_pull_request(project, place, self.diff_tree, view.forge, number);
+                let read = diff.read();
+                // Over the view, which is there again when the diff closes.
+                self.view = Some(View::Diff(diff));
+                Some(read)
+            }
+            pull_requests::Step::Open(number) => Some(Action::OpenInBrowser {
+                project,
+                topic: Topic::PullRequest(number),
+            }),
+            pull_requests::Step::Comment { number, text } => Some(Action::Comment {
+                project,
+                topic: Topic::PullRequest(number),
+                text,
+            }),
+        }
+    }
+
+    /// Closes the pull requests view and opens the new-session panel in
+    /// `pull_request`'s worktree, with the task to work on it and its
+    /// address, so the agent can read it.
+    fn start_on_pull_request(&mut self, pull_request: &PullRequest) -> Option<Action> {
+        let view = self.pull_requests_view.take()?;
+        let forge = pull_request.forge;
+        let task = format!(
+            "Work on {} {}: {} ({})",
+            forge.pull_request(),
+            pull_request.label(),
+            pull_request.title,
+            pull_request.url
+        );
+        let mut setup = self.launch_setup(false);
+        setup.targets = vec![Target::PullRequest {
+            checkout: pull_request.checkout(&view.project),
+            label: format!("{} ⎇ {}", view.project_name, pull_request.local_branch),
+            choice: format!("{} {}", forge.pull_request(), pull_request.label()),
+        }];
+        setup.target = 0;
+        self.launcher = Some(Launcher::new(setup).with_task(&task));
+        self.codex_models_wanted()
+    }
+
+    /// Closes the issues view and opens the new-session panel for `issue`:
+    /// a new worktree on a branch named after it, and the task to fix it,
+    /// with the issue's address so the agent can read it.
+    fn start_on_issue(&mut self, issue: &Issue) -> Option<Action> {
         let view = self.issues.take()?;
-        let Some(issue) = view.highlighted() else {
-            self.issues = Some(view);
-            return None;
-        };
-        let branch = github::branch_for_issue(issue.number, &issue.title);
+        let branch = forge::branch_for_issue(issue.number, &issue.title);
         let task = format!(
             "Fix issue #{}: {} ({})",
             issue.number, issue.title, issue.url
@@ -2385,7 +3241,8 @@ impl App {
         if let Some(Target::NewWorktree { base, .. }) = setup.targets.get_mut(1) {
             *base = Some(view.project.clone());
         }
-        self.launcher = Some(Launcher::new(setup).with_task(&task, &branch));
+        let launcher = Launcher::new(setup).with_task(&task).with_branch(&branch);
+        self.launcher = Some(launcher);
         self.codex_models_wanted()
     }
 
@@ -2417,7 +3274,7 @@ impl App {
             .cloned()
             .map(Run::Profile)
             .collect();
-        // A flow's steps are Claude Code's background tasks.
+        // A flow's steps run Claude Code unless their profiles say otherwise.
         let has_claude = self.agents.iter().any(|agent| agent.program == "claude");
         if self.flows_on && has_claude {
             runs.extend(self.flow_defs.iter().cloned().map(Run::Flow));
@@ -2591,11 +3448,23 @@ impl App {
             let outcome = finder.on_paste(&text);
             return self.follow(outcome);
         }
+        if let Some(View::Tree(tree)) = &mut self.view {
+            let outcome = tree.on_paste(&text);
+            return self.follow(outcome);
+        }
+        if let Some(View::Grep(grep)) = &mut self.view {
+            let outcome = grep.on_paste(&text);
+            return self.follow(outcome);
+        }
+        if let Some(View::Branches(switcher)) = &mut self.view {
+            switcher.on_paste(&text);
+            return None;
+        }
         if let Some(View::Memory(memory)) = &mut self.view {
             let outcome = memory.on_paste(&text);
             return self.follow(outcome);
         }
-        if self.view.is_some() || self.showing_keys || self.confirm.is_some() {
+        if self.view.is_some() || self.showing_keys() || self.confirm.is_some() {
             return None;
         }
         if let Some(launcher) = &mut self.launcher {
@@ -2604,8 +3473,14 @@ impl App {
             view.on_paste(&text);
         } else if let Some(prompt) = &mut self.prompt {
             prompt.input.insert_str(&text);
+        } else if self.needs_you.is_some() {
+            return None;
+        } else if let Some(view) = &mut self.timeline {
+            view.on_paste(&text);
         } else if let Some(issues) = &mut self.issues {
             issues.on_paste(&text);
+        } else if let Some(view) = &mut self.pull_requests_view {
+            view.on_paste(&text);
         } else if let Some(backlog) = &mut self.backlog {
             backlog.on_paste(&text);
         } else if let Some(view) = &mut self.layouts {
@@ -2728,7 +3603,40 @@ impl App {
             }
             KeyCode::PageUp if shift => Some(Action::PageBack(slot)),
             KeyCode::PageDown if shift => Some(Action::PageForward(slot)),
+            _ if self.pane_shows_task(slot) => self.on_task_pane_key(slot, key),
             _ => Some(Action::Type { to: slot, key }),
+        }
+    }
+
+    /// Whether the pane at `slot` shows a background task, which takes no
+    /// keys but its own.
+    pub fn pane_shows_task(&self, slot: Slot) -> bool {
+        self.pane_session(slot)
+            .is_some_and(|session| session.front == Some(Front::Task))
+    }
+
+    /// A key in a background task's pane: `y`, `n` or `Y` answer what it
+    /// asks for, and Ctrl+C stops its run. It takes no others.
+    fn on_task_pane_key(&mut self, slot: Slot, key: KeyEvent) -> Option<Action> {
+        let session = self.pane_session(slot)?;
+        let name = session.name.clone();
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        if ctrl && key.code == KeyCode::Char('c') {
+            return Some(Action::Interrupt(name));
+        }
+        let answer = answer_key(key.code).filter(|_| !ctrl);
+        match answer {
+            Some(answer) if session.asking.is_some() => Some(Action::Answer { name, answer }),
+            Some(_) => {
+                self.notify(format!("{name} isn't asking for anything"));
+                None
+            }
+            None => {
+                self.notify(format!(
+                    "{name} takes no keys: ctrl+c stops its run, `crystal send` gives it a follow-up"
+                ));
+                None
+            }
         }
     }
 
@@ -2789,27 +3697,87 @@ impl App {
         tab.zoomed = !tab.zoomed;
     }
 
-    /// Splits the selected session off into a pane of its own, or closes
-    /// its split if it has one.
+    /// `s`: splits the selected session off into a pane of its own, beside
+    /// its pane when there's room for both side by side or else below it,
+    /// or closes its split if it has one.
     fn toggle_split(&mut self) {
         let Some(selected) = self.selected() else {
             return;
         };
-        let name = selected.name.clone();
-        if let Some(index) = self.splits().iter().position(|split| *split == name) {
-            self.close_split(index);
-        } else if self.selected_is_own() {
-            self.notify("crystal can't show the session it runs in".into());
-        } else if self.splits().len() >= tabs::MAX_SPLITS {
-            let most = tabs::MAX_SPLITS;
-            self.notify(format!("{most} splits at most: press s on one to close it"));
+        if self.is_split(&selected.name) {
+            self.close_pane();
         } else {
-            // A session that floats comes down into its split.
-            if self.is_floating(&name) {
-                self.put_float_back();
-            }
-            self.tabs.current_mut().splits.push(name);
+            self.split_pane(self.way_to_split(), HALF);
         }
+    }
+
+    /// The way `s` splits the selection's pane: side by side while both
+    /// sides would be at least [`SIDE_BY_SIDE_WIDTH`] wide, or else one
+    /// above the other.
+    fn way_to_split(&self) -> Way {
+        let pane = self.panes().area_of(&Pane::Selection, self.tiles);
+        let wide = pane.is_some_and(|pane| pane.width > 2 * SIDE_BY_SIDE_WIDTH);
+        if wide { Way::Right } else { Way::Down }
+    }
+
+    /// `|` and `-`, and `s`: splits the selected session's pane in two,
+    /// `way`, the first side keeping `ratio` of its room. The session
+    /// stays where it is, in a pane of its own now, and the pane that
+    /// follows the selection takes the other side, to show the next
+    /// session selected; a session floating comes down where the
+    /// selection's pane was. One split off already keeps its pane, and the
+    /// selection's pane comes beside it, leaving what it showed where it
+    /// was, split off.
+    pub fn split_pane(&mut self, way: Way, ratio: f32) {
+        let Some(selected) = self.selected() else {
+            return;
+        };
+        if self.selected_is_own() {
+            return self.notify("crystal can't show the session it runs in".into());
+        }
+        let name = selected.name.clone();
+        let at = Pane::Session(name.clone());
+        let split_off = self.is_split(&name);
+        let splitting = if split_off { &at } else { &Pane::Selection };
+        if !self.panes().has_room(splitting, way, self.tiles) {
+            let place = match way {
+                Way::Right => "beside",
+                Way::Down => "below",
+            };
+            return self.notify(format!("no room for another pane {place} {name}"));
+        }
+        if self.is_floating(&name) {
+            self.put_float_back();
+        }
+        let stays = if split_off {
+            let shown = self.shown().filter(|shown| !self.is_own(shown));
+            shown.map(|shown| Pane::Session(shown.name.clone()))
+        } else {
+            Some(at.clone())
+        };
+        self.change_panes(|panes| {
+            match stays {
+                Some(stays) => panes.replace(&Pane::Selection, stays),
+                None => panes.close(&Pane::Selection),
+            };
+            panes.split(&at, way, ratio, Pane::Selection);
+        });
+    }
+
+    /// Closes the selected session's split, when it has one: the pane
+    /// beside it takes the room, and the selection's pane shows the
+    /// session again. The selection's own pane stays.
+    pub fn close_pane(&mut self) {
+        let Some(selected) = self.selected() else {
+            return;
+        };
+        let name = selected.name.clone();
+        if !self.is_split(&name) {
+            return self.notify("the selection's pane stays: it shows what you select".into());
+        }
+        self.change_panes(|panes| {
+            panes.close(&Pane::Session(name));
+        });
     }
 
     /// `F`: floats the selected session over the panes, in a pane of its
@@ -2826,9 +3794,10 @@ impl App {
             return self.notify("crystal can't show the session it runs in".into());
         }
         let name = selected.name.clone();
-        if let Some(split) = self.splits().iter().position(|split| *split == name) {
-            self.close_split(split);
-        }
+        let split = Pane::Session(name.clone());
+        self.change_panes(|panes| {
+            panes.close(&split);
+        });
         self.tabs.current_mut().floating = Some(name);
         if self.can_type_into(Slot::Float) {
             self.focus_pane(Slot::Float);
@@ -2850,85 +3819,158 @@ impl App {
         }
     }
 
-    /// Closes the split at `index`. The splits after it move up a place,
-    /// and the keyboard moves with its pane, or goes back to the sidebar
-    /// if its pane is the one that closed.
-    fn close_split(&mut self, index: usize) {
-        self.tabs.current_mut().close_split(index);
-        self.focus = match self.focus {
-            Focus::Pane(Slot::Split(at)) if at == index => Focus::Sidebar,
-            Focus::Pane(Slot::Split(at)) if at > index => Focus::Pane(Slot::Split(at - 1)),
-            focus => focus,
-        };
-    }
-
-    /// `H` and `L`: moves the selected session's pane `by` places among the
-    /// panes, back toward the left (or the top, stacked) or on, swapping it
-    /// with the pane that was there. It stops at the ends.
-    fn move_pane(&mut self, by: isize) {
-        let Some(slot) = self.selected_slot() else {
-            return;
-        };
+    /// The pane that shows the selected session, as `H`, `J`, `K`, `L`,
+    /// Shift and the arrows, and `R` find it: in the tab's tree, so not the
+    /// float, and not while zoomed, which hides the others. Without a
+    /// selected session, the selection's pane. The footer says why not.
+    fn selected_pane(&mut self) -> Option<Pane> {
+        let slot = self.selected_slot().unwrap_or(Slot::Selected);
         if self.zoomed() {
-            return self.notify("zoomed: z puts the panes back first".into());
+            self.notify("zoomed: z puts the panes back first".into());
+            return None;
         }
         if slot == Slot::Float {
-            return self.notify("it floats: F puts it back among the panes".into());
+            self.notify("it floats: F puts it back among the panes".into());
+            return None;
         }
-        let mut order = self.tiled();
-        if order.len() == 1 {
+        self.pane_of(slot)
+    }
+
+    /// `H`, `J`, `K` and `L`: swaps the selected session's pane with the
+    /// one beside it `toward`: left, down, up or right. At the edge it
+    /// stays.
+    fn move_pane(&mut self, toward: Direction) {
+        let Some(pane) = self.selected_pane() else {
+            return;
+        };
+        if self.tiled().len() == 1 {
             return self.notify("one pane: s splits a session off into another".into());
         }
-        let Some(at) = order.iter().position(|placed| *placed == slot) else {
+        let Some(other) = self.panes().neighbour(&pane, toward, self.tiles).cloned() else {
             return;
         };
-        let Some(to) = at.checked_add_signed(by).filter(|to| *to < order.len()) else {
-            return;
-        };
-        order.swap(at, to);
-        self.arrange(&order);
+        self.change_panes(|panes| {
+            panes.swap(&pane, &other);
+        });
     }
 
     /// Swaps the panes at `a` and `b`, wherever they are.
     fn swap_panes(&mut self, a: Slot, b: Slot) {
-        let mut order = self.tiled();
-        let at = |slot: Slot| order.iter().position(|placed| *placed == slot);
-        if let (Some(a), Some(b)) = (at(a), at(b)) {
-            order.swap(a, b);
-            self.arrange(&order);
+        if let (Some(a), Some(b)) = (self.pane_of(a), self.pane_of(b)) {
+            self.change_panes(|panes| {
+                panes.swap(&a, &b);
+            });
         }
     }
 
-    /// Draws the panes in `order`, which has every pane there is. A split
-    /// is counted by where it's drawn, so the keyboard, Tab and a drag
-    /// follow each split to its new place.
-    fn arrange(&mut self, order: &[Slot]) {
-        let before = self.splits().to_vec();
-        let splits: Vec<String> = order
-            .iter()
-            .filter_map(|slot| match slot {
-                Slot::Split(index) => before.get(*index).cloned(),
-                Slot::Selected | Slot::Float => None,
-            })
-            .collect();
-        let moved = |slot: Slot| match slot {
-            Slot::Split(index) => before
-                .get(index)
-                .and_then(|name| splits.iter().position(|split| split == name))
-                .map_or(slot, Slot::Split),
-            Slot::Selected | Slot::Float => slot,
+    /// Shift and an arrow: selects the session in the pane beside the
+    /// selected session's `toward`, the way `j` and `k` would, so the keys
+    /// and the panes that show the selection follow. The selection's pane
+    /// is the session it shows. At the edge it stays.
+    pub fn focus_toward(&mut self, toward: Direction) {
+        let Some(pane) = self.selected_pane() else {
+            return;
         };
-        self.focus = match self.focus {
-            Focus::Pane(slot) => Focus::Pane(moved(slot)),
-            Focus::Copy(slot) => Focus::Copy(moved(slot)),
+        let Some(next) = self.panes().neighbour(&pane, toward, self.tiles) else {
+            return;
+        };
+        let session = match next {
+            Pane::Session(name) => Some(name.clone()),
+            Pane::Selection => {
+                let shown = self.pane_session(Slot::Selected);
+                let shown = shown.filter(|shown| !self.has_own_pane(&shown.name));
+                shown.map(|shown| shown.name.clone())
+            }
+        };
+        match session {
+            Some(name) => self.select(&name),
+            None => {
+                self.notify("the selection's pane is empty: j and k choose what it shows".into())
+            }
+        }
+    }
+
+    /// `R`: resize mode, until `Esc`: the keys move the selected session's
+    /// pane's borders.
+    fn start_resizing(&mut self) {
+        if self.selected_pane().is_none() {
+            return;
+        }
+        if self.tiled().len() == 1 {
+            return self.notify("one pane: s splits a session off into another".into());
+        }
+        self.resizing = true;
+    }
+
+    /// Keys in resize mode: `h` `j` `k` `l` or the arrows move a border of
+    /// the selected session's pane that way, Shift and an arrow go on to
+    /// the pane that way, `=` evens the panes out, and `Esc`, `Enter`, `q`
+    /// or `R` again are done. Other keys do nothing.
+    fn on_resize_key(&mut self, key: KeyEvent) {
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        let toward = match key.code {
+            KeyCode::Char('h') => Some(Direction::Left),
+            KeyCode::Char('j') => Some(Direction::Down),
+            KeyCode::Char('k') => Some(Direction::Up),
+            KeyCode::Char('l') => Some(Direction::Right),
+            code => arrow(code),
+        };
+        match (key.code, toward) {
+            (KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q' | 'R'), _) => self.resizing = false,
+            (KeyCode::Char('='), _) => self.equalize_panes(),
+            (code, Some(toward)) if shift && arrow(code).is_some() => self.focus_toward(toward),
+            (_, Some(toward)) => self.resize_pane(toward, resize_step(toward)),
+            _ => {}
+        }
+    }
+
+    /// Moves a border of the selected session's pane `cells` columns or
+    /// rows `toward`: the one on that side of it, which it grows into, or
+    /// else the one on its other side, which it shrinks from. No pane gets
+    /// smaller than it can be drawn.
+    pub fn resize_pane(&mut self, toward: Direction, cells: u16) {
+        let Some(pane) = self.selected_pane() else {
+            return;
+        };
+        let tiles = self.tiles;
+        self.tabs
+            .current_mut()
+            .panes
+            .resize(&pane, toward, cells, tiles);
+    }
+
+    /// `=` in resize mode: gives the panes in a line the same room each.
+    pub fn equalize_panes(&mut self) {
+        self.tabs.current_mut().panes.equalize();
+    }
+
+    /// Changes the panes of the tab in front. A split is counted by where
+    /// it's drawn, so the keyboard, Tab, a drag and a pane taken by its
+    /// header follow each split to its new place, and let go of one that
+    /// closed.
+    fn change_panes(&mut self, change: impl FnOnce(&mut SplitTree)) {
+        let before: Vec<String> = self.splits().into_iter().map(String::from).collect();
+        change(&mut self.tabs.current_mut().panes);
+        let moved = |slot: Slot| match slot {
+            Slot::Split(index) => self.slot_of(&Pane::Session(before.get(index)?.clone())),
+            Slot::Selected | Slot::Float => Some(slot),
+        };
+        let focus = match self.focus {
+            Focus::Pane(slot) => moved(slot).map_or(Focus::Sidebar, Focus::Pane),
+            Focus::Copy(slot) => moved(slot).map_or(Focus::Sidebar, Focus::Copy),
             Focus::Sidebar => Focus::Sidebar,
         };
-        self.last_pane = self.last_pane.map(moved);
-        self.dragging = self.dragging.map(moved);
-        let selection_at = order.iter().position(|slot| *slot == Slot::Selected);
-        let tab = self.tabs.current_mut();
-        tab.splits = splits;
-        tab.selection_at = selection_at.unwrap_or(0);
+        let last_pane = self.last_pane.and_then(moved);
+        let dragging = self.dragging.and_then(moved);
+        let grabbed = self.grabbed.and_then(|grab| {
+            let from = moved(grab.from)?;
+            let over = grab.over.and_then(moved);
+            Some(Grab { from, over })
+        });
+        self.focus = focus;
+        self.last_pane = last_pane;
+        self.dragging = dragging;
+        self.grabbed = grabbed;
     }
 
     /// `t`: makes a new tab, brings it to the front, and starts a shell in
@@ -2979,13 +4021,30 @@ impl App {
         if to >= self.tabs.all().len() {
             return self.notify(format!("there's no tab {number}"));
         }
-        // Closing its split here first moves the keyboard with the panes.
-        if let Some(split) = self.splits().iter().position(|split| split == name) {
-            self.close_split(split);
+        self.move_session(name, to);
+        self.notify(format!("moved {name} to tab {number}"));
+    }
+
+    /// Moves the session called `name` to the tab at `to`, out of its pane
+    /// in the tab it was in. Leaving the tab in front, the keyboard and the
+    /// selection stay in that tab.
+    fn move_session(&mut self, name: &str, to: usize) {
+        if self.tabs.tab_of(name) == Some(to) {
+            return;
+        }
+        if self.tabs.current().holds(name) {
+            // Closing its split here first moves the keyboard with the
+            // panes.
+            let split = Pane::Session(name.to_string());
+            self.change_panes(|panes| {
+                panes.close(&split);
+            });
+            if self.is_floating(name) {
+                self.put_float_back();
+            }
         }
         self.tabs.put(name, to);
         self.keep_selection_in_tab();
-        self.notify(format!("moved {name} to tab {number}"));
     }
 
     /// The session `>` is moving to another tab, while the footer asks
@@ -3070,8 +4129,8 @@ impl App {
 
     /// Moves the keyboard from the sidebar to the next pane that takes
     /// keys, going on from the one it was in last.
-    fn move_to_pane(&mut self, direction: Direction) {
-        if let Some(slot) = self.next_pane(direction) {
+    fn move_to_pane(&mut self, round: Round) {
+        if let Some(slot) = self.next_pane(round) {
             self.focus_pane(slot);
         }
     }
@@ -3080,18 +4139,18 @@ impl App {
     /// they're drawn, from just past the one used last. With none used
     /// yet, going forward starts at the first pane, and going back at the
     /// last.
-    fn next_pane(&self, direction: Direction) -> Option<Slot> {
+    fn next_pane(&self, round: Round) -> Option<Slot> {
         let slots = self.slots();
         let count = slots.len();
         let last = self
             .last_pane
             .and_then(|last| slots.iter().position(|slot| *slot == last));
         (1..=count)
-            .map(|step| match (direction, last) {
-                (Direction::Forward, Some(last)) => (last + step) % count,
-                (Direction::Back, Some(last)) => (last + count - step) % count,
-                (Direction::Forward, None) => step - 1,
-                (Direction::Back, None) => count - step,
+            .map(|step| match (round, last) {
+                (Round::Forward, Some(last)) => (last + step) % count,
+                (Round::Back, Some(last)) => (last + count - step) % count,
+                (Round::Forward, None) => step - 1,
+                (Round::Back, None) => count - step,
             })
             .map(|index| slots[index])
             .find(|slot| self.can_type_into(*slot))
@@ -3152,6 +4211,95 @@ impl App {
         }
     }
 
+    /// `U`: opens the list of everything waiting on the user.
+    fn open_needs_you(&mut self) {
+        self.needs_you = Some(NeedsYouView::new(self.needs_you_rows()));
+    }
+
+    /// Keys while the needs-you view is open: all of them are its, but
+    /// those of the question `f` asks.
+    fn on_needs_you_key(&mut self, key: KeyEvent) -> Option<Action> {
+        match self.needs_you.as_mut()?.on_key(&key) {
+            needs_you::Step::Stay => None,
+            needs_you::Step::Close => {
+                self.needs_you = None;
+                None
+            }
+            needs_you::Step::Go(name) => {
+                self.needs_you = None;
+                self.select(&name);
+                None
+            }
+            needs_you::Step::Answer { name, answer } => Some(Action::Answer { name, answer }),
+            needs_you::Step::GoOn(run) => Some(Action::ApproveFlow(run)),
+            needs_you::Step::SendBack(run) => {
+                self.ask(Question::SendFlowBack(run), "");
+                None
+            }
+            needs_you::Step::Say(said) => {
+                self.notify(said);
+                None
+            }
+        }
+    }
+
+    /// `a`: opens the timeline, which marks what's new since the user was
+    /// away when the footer has just said what that was, and has the log
+    /// read for it.
+    fn open_timeline(&mut self) -> Action {
+        let after = self.away.take().map(|away| away.after);
+        self.timeline = Some(TimelineView::new(after));
+        Action::FollowEvents
+    }
+
+    /// Keys while the timeline is open: all of them are its.
+    fn on_timeline_key(&mut self, key: KeyEvent) -> Option<Action> {
+        let view = self.timeline.as_mut()?;
+        match view.on_key(&key) {
+            timeline::Step::Stay => view.wants_older(true).map(Action::ReadOlderEvents),
+            timeline::Step::Close => self.close_timeline(),
+            timeline::Step::Go(event) => self.go_to_event(&event),
+        }
+    }
+
+    fn close_timeline(&mut self) -> Option<Action> {
+        self.timeline = None;
+        Some(Action::StopFollowing)
+    }
+
+    /// Enter on a line of the timeline: goes to the session it's about,
+    /// closing the timeline, or says why there's none to go to.
+    fn go_to_event(&mut self, event: &Event) -> Option<Action> {
+        match self.session_of(event) {
+            Some(name) => {
+                self.select(&name);
+                self.close_timeline()
+            }
+            None => {
+                let notice = match &event.session {
+                    Some(about) => format!("{} has gone", about.name),
+                    None => format!("{} isn't about a session", event.kind.name()),
+                };
+                self.notify(notice);
+                None
+            }
+        }
+    }
+
+    /// What the session `event` is about is called now: the session with
+    /// its id, whatever it has been renamed since; or for a flow run's
+    /// event, the session of its latest step that has one.
+    fn session_of(&self, event: &Event) -> Option<String> {
+        if let Some(about) = &event.session {
+            let session = self.sessions.iter().find(|s| s.id == about.id)?;
+            return Some(session.name.clone());
+        }
+        let run = event.flow.as_ref()?;
+        let run = self.flows.iter().find(|found| found.name == run.run)?;
+        let step = run.steps.iter().rev().find_map(|s| s.session.as_deref())?;
+        self.position(step).map(|_| step.to_string())
+    }
+
     /// The next session that needs the user, in any tab: one waiting on
     /// them comes before one that's done. See [`Self::sessions_in_turn`].
     fn next_needing_user(&self) -> Option<usize> {
@@ -3202,6 +4350,45 @@ impl App {
     }
 }
 
+/// How far a key in resize mode moves a border `toward`.
+fn resize_step(toward: Direction) -> u16 {
+    match toward {
+        Direction::Left | Direction::Right => RESIZE_COLUMNS,
+        Direction::Up | Direction::Down => RESIZE_ROWS,
+    }
+}
+
+/// The answer a key gives a permission a background task asks for: `y`
+/// yes, `n` no, `Y` yes always.
+fn answer_key(code: KeyCode) -> Option<Answer> {
+    match code {
+        KeyCode::Char('y') => Some(Answer::Allow),
+        KeyCode::Char('n') => Some(Answer::Deny),
+        KeyCode::Char('Y') => Some(Answer::Always),
+        _ => None,
+    }
+}
+
+/// Which way a key turns the list of keys' pages: on, or back.
+fn page_turn(code: KeyCode) -> Option<isize> {
+    match code {
+        KeyCode::Right | KeyCode::PageDown | KeyCode::Char(' ' | 'l') => Some(1),
+        KeyCode::Left | KeyCode::PageUp | KeyCode::Char('h') => Some(-1),
+        _ => None,
+    }
+}
+
+/// The way an arrow key points.
+fn arrow(code: KeyCode) -> Option<Direction> {
+    match code {
+        KeyCode::Left => Some(Direction::Left),
+        KeyCode::Right => Some(Direction::Right),
+        KeyCode::Up => Some(Direction::Up),
+        KeyCode::Down => Some(Direction::Down),
+        _ => None,
+    }
+}
+
 /// A worktree the way the panel names it: `payments ⌂ main` for a
 /// project's main worktree, `payments ⎇ fix/login` for a linked one.
 fn worktree_label(worktree: &crate::protocol::Worktree) -> String {
@@ -3223,7 +4410,7 @@ fn edit_name(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{Activity, BacklogItem, TaskInfo, TaskOutcome, Worktree};
+    use crate::protocol::{Activity, BacklogItem, TaskInfo, TaskOutcome, TaskState, Worktree};
     use crossterm::event::KeyModifiers;
 
     fn session(name: &str) -> SessionInfo {
@@ -3239,6 +4426,8 @@ mod tests {
             worktree: None,
             changed: 0,
             task: None,
+            asking: None,
+            reporter: None,
         }
     }
 
@@ -3869,6 +5058,17 @@ mod tests {
     }
 
     #[test]
+    fn a_session_renamed_elsewhere_keeps_its_split_and_the_selection() {
+        let mut app = app_with(&["a", "b"]);
+        press(&mut app, KeyCode::Char('s'));
+        let mut renamed = session("fix-login");
+        renamed.id = "a".into();
+        app.set_sessions(vec![renamed, session("b")]);
+        assert_eq!(app.splits(), ["fix-login"]);
+        assert_eq!(selected_name(&app), Some("fix-login"));
+    }
+
+    #[test]
     fn the_tuis_own_session_is_told_by_its_id_whatever_its_name() {
         let mut renamed = session("renamed");
         renamed.id = "me".into();
@@ -3904,6 +5104,101 @@ mod tests {
             }),
             ..session(name)
         }
+    }
+
+    #[test]
+    fn capital_b_switches_a_projects_main_worktree_only() {
+        let mut app = App::new(None);
+        app.set_sessions(vec![
+            in_worktree("fixer", "fix", State::Running),
+            in_worktree("other", "main", State::Running),
+        ]);
+        app.select("fixer");
+        assert_eq!(press(&mut app, KeyCode::Char('B')), None);
+        assert!(app.notice().unwrap().contains("a linked one stays"));
+        app.select("other");
+        let main = PathBuf::from("/code/app.worktrees/main");
+        assert_eq!(
+            press(&mut app, KeyCode::Char('B')),
+            Some(Action::ListBranches(main))
+        );
+        assert!(matches!(app.view(), Some(View::Branches(_))));
+    }
+
+    #[test]
+    fn a_switch_whose_switcher_has_closed_is_said_at_the_bottom() {
+        use crate::git::branches::{Branch, Carry, Outcome as Switch};
+        let mut app = App::new(None);
+        app.set_sessions(vec![in_worktree("other", "main", State::Running)]);
+        let main = PathBuf::from("/code/app.worktrees/main");
+        press(&mut app, KeyCode::Char('B'));
+        let current = Branch {
+            current: true,
+            ..Branch::new("main")
+        };
+        let listed = switcher::Listed {
+            branches: vec![current, Branch::new("feature")],
+            changes: Vec::new(),
+        };
+        app.branches_listed(&main, Ok(listed));
+        assert_eq!(
+            press(&mut app, KeyCode::Enter),
+            Some(Action::SwitchBranch {
+                dir: main.clone(),
+                target: Branch::new("feature"),
+                carry: Carry::Ask,
+            })
+        );
+        // Esc while git works closes it, and it won't open again until
+        // git is done.
+        press(&mut app, KeyCode::Esc);
+        assert!(app.view().is_none());
+        assert_eq!(press(&mut app, KeyCode::Char('B')), None);
+        assert!(app.notice().unwrap().contains("still switching"));
+
+        let done = Switch::Switched {
+            branch: "feature".into(),
+            note: None,
+        };
+        assert_eq!(app.branch_switched(&main, done), None);
+        assert_eq!(app.notice(), Some("the worktree is on feature"));
+        assert!(press(&mut app, KeyCode::Char('B')).is_some());
+    }
+
+    #[test]
+    fn enter_in_find_in_files_edits_the_file_at_the_line_found() {
+        let mut app = App::new(None);
+        app.set_sessions(vec![in_worktree("fixer", "fix", State::Running)]);
+        let dir = PathBuf::from("/code/app.worktrees/fix");
+        assert_eq!(press(&mut app, KeyCode::Char('G')), None);
+        press(&mut app, KeyCode::Char('n'));
+        assert_eq!(
+            press(&mut app, KeyCode::Char('e')),
+            Some(Action::Grep {
+                dir: dir.clone(),
+                query: "ne".into(),
+            })
+        );
+        let hit = crate::git::Hit {
+            path: "src/a.rs".into(),
+            line: 4,
+            text: "needle".into(),
+        };
+        let found = crate::git::Found {
+            hits: vec![hit],
+            more: false,
+        };
+        assert!(app.searched(&dir, "ne", Ok(found)).is_some());
+        assert_eq!(
+            press(&mut app, KeyCode::Enter),
+            Some(Action::Edit {
+                dir,
+                path: "src/a.rs".into(),
+                line: Some(4),
+                name: "a.rs".into(),
+            })
+        );
+        assert!(app.view().is_none());
     }
 
     #[test]
@@ -4233,7 +5528,9 @@ mod tests {
     }
 
     /// An app with `names`, the first `split` of them split off, and the
-    /// selection on the last one.
+    /// selection on the last one. At the 80 by 24 terminal an app takes
+    /// itself to be on until it's drawn, each is split off below the last,
+    /// so they're stacked in order, the selection's pane at the bottom.
     fn app_with_splits(names: &[&str], split: usize) -> App {
         let mut app = app_with(names);
         for _ in 0..split {
@@ -4249,10 +5546,12 @@ mod tests {
         let mut app = app_with(&["a", "b"]);
         press(&mut app, KeyCode::Char('s'));
         assert_eq!(app.splits(), ["a"]);
-        assert_eq!(app.slots(), [Slot::Selected, Slot::Split(0)]);
+        // a stays where it was, and the selection's pane goes below it.
+        assert_eq!(app.slots(), [Slot::Split(0), Slot::Selected]);
 
         press(&mut app, KeyCode::Char('s'));
         assert!(app.splits().is_empty());
+        assert_eq!(app.panes(), &SplitTree::default());
     }
 
     #[test]
@@ -4266,11 +5565,192 @@ mod tests {
     }
 
     #[test]
-    fn two_splits_at_most_and_a_third_says_so() {
-        let mut app = app_with_splits(&["a", "b", "c"], 2);
+    fn a_pane_with_no_room_for_another_says_so() {
+        let mut app = app_with(&["a", "b"]);
+        app.set_tiles(Rect::new(29, 1, 20, 5));
         press(&mut app, KeyCode::Char('s'));
+        assert!(app.splits().is_empty());
+        assert_eq!(app.notice(), Some("no room for another pane below a"));
+        press(&mut app, KeyCode::Char('|'));
+        assert_eq!(app.notice(), Some("no room for another pane beside a"));
+    }
+
+    /// Where the panes of the tab in front are, laid out in `tiles`, by
+    /// the names of the sessions they show, `-` for the selection's pane
+    /// while it shows none.
+    fn placed(app: &App, tiles: Rect) -> Vec<(String, Rect)> {
+        let slots = app.slots().into_iter();
+        let names = slots.map(|slot| match app.pane_session(slot) {
+            Some(session) if app.shows_screen(slot) => session.name.clone(),
+            _ => "-".to_string(),
+        });
+        let areas = app.panes().layout(tiles).into_iter();
+        names.zip(areas.map(|(_, area)| area)).collect()
+    }
+
+    const WIDE: Rect = Rect::new(0, 0, 101, 40);
+
+    #[test]
+    fn bar_and_dash_split_the_selected_sessions_pane_beside_or_below() {
+        let mut app = app_with(&["a", "b", "c"]);
+        app.set_tiles(WIDE);
+        press(&mut app, KeyCode::Char('|'));
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(
+            placed(&app, WIDE),
+            [
+                ("a".to_string(), Rect::new(0, 0, 50, 40)),
+                ("b".to_string(), Rect::new(51, 0, 50, 40)),
+            ]
+        );
+        // b, in the selection's pane, stays where it is, and the
+        // selection's pane goes below it.
+        press(&mut app, KeyCode::Char('-'));
+        press(&mut app, KeyCode::Char('j'));
         assert_eq!(app.splits(), ["a", "b"]);
-        assert!(app.notice().unwrap().contains("2 splits at most"));
+        assert_eq!(
+            placed(&app, WIDE)[2],
+            ("c".to_string(), Rect::new(51, 20, 50, 20))
+        );
+        assert_eq!(app.notice(), None);
+    }
+
+    #[test]
+    fn splitting_a_pane_of_its_own_brings_the_selections_pane_beside_it() {
+        let mut app = app_with(&["a", "b", "c"]);
+        app.set_tiles(WIDE);
+        press(&mut app, KeyCode::Char('|'));
+        press(&mut app, KeyCode::Char('j'));
+        // On a again, the selection's pane goes on showing b. Splitting a's
+        // pane below it leaves b where it was, split off, and the
+        // selection's pane comes under a, to show the next one selected.
+        press(&mut app, KeyCode::Char('k'));
+        press(&mut app, KeyCode::Char('-'));
+        assert_eq!(app.splits(), ["a", "b"]);
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('j'));
+        let names: Vec<String> = (placed(&app, WIDE).into_iter())
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(names, ["a", "c", "b"]);
+        assert_eq!(
+            placed(&app, WIDE)[1].1,
+            Rect::new(0, 20, 50, 20),
+            "c is under a"
+        );
+    }
+
+    #[test]
+    fn the_selections_pane_goes_on_showing_what_it_showed_while_a_split_is_selected() {
+        let mut app = app_with_splits(&["a", "b", "c"], 1);
+        assert_eq!(drawn(&app), ["a", "c"]);
+        app.select("a");
+        assert_eq!(drawn(&app), ["a", "c"]);
+        // Nor while a session floats: a comes up out of its split into
+        // the float, over the selection's pane, which still shows b.
+        app.select("b");
+        app.select("a");
+        press(&mut app, KeyCode::Char('F'));
+        hand_back(&mut app);
+        assert_eq!(drawn(&app), ["b", "a"]);
+        // With nothing it showed left to show, it says where the selected
+        // session is.
+        app.set_sessions(vec![session("a"), session("c")]);
+        assert_eq!(drawn(&app), ["-", "a"]);
+    }
+
+    #[test]
+    fn shift_and_an_arrow_select_the_session_in_the_pane_that_way() {
+        let mut app = app_with(&["a", "b", "c"]);
+        app.set_tiles(WIDE);
+        // a | (b over the selection's pane, showing c).
+        press(&mut app, KeyCode::Char('|'));
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('-'));
+        press(&mut app, KeyCode::Char('j'));
+        let shift = |code| KeyEvent::new(code, KeyModifiers::SHIFT);
+        app.on_key(shift(KeyCode::Up));
+        assert_eq!(selected_name(&app), Some("b"));
+        app.on_key(shift(KeyCode::Left));
+        assert_eq!(selected_name(&app), Some("a"));
+        // Into the selection's pane is to the session it shows.
+        app.on_key(shift(KeyCode::Right));
+        assert_eq!(selected_name(&app), Some("b"));
+        app.on_key(shift(KeyCode::Down));
+        assert_eq!(selected_name(&app), Some("c"));
+        assert_eq!(drawn(&app), ["a", "b", "c"]);
+        // At the edge it stays.
+        app.on_key(shift(KeyCode::Down));
+        assert_eq!(selected_name(&app), Some("c"));
+        assert_eq!(app.notice(), None);
+    }
+
+    #[test]
+    fn going_into_the_selections_pane_with_nothing_in_it_says_so() {
+        let mut app = app_with(&["a", "b"]);
+        press(&mut app, KeyCode::Char('s'));
+        let shift = KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT);
+        app.on_key(shift);
+        assert_eq!(selected_name(&app), Some("a"));
+        assert!(app.notice().unwrap().contains("is empty"));
+    }
+
+    #[test]
+    fn capital_r_moves_the_borders_with_the_keys_until_esc() {
+        let mut app = app_with(&["a", "b"]);
+        app.set_tiles(WIDE);
+        press(&mut app, KeyCode::Char('|'));
+        press(&mut app, KeyCode::Char('R'));
+        assert!(app.resizing());
+        let width = |app: &App| placed(app, WIDE)[0].1.width;
+        press(&mut app, KeyCode::Char('l'));
+        assert_eq!(width(&app), 50 + RESIZE_COLUMNS);
+        press(&mut app, KeyCode::Left);
+        press(&mut app, KeyCode::Char('h'));
+        assert_eq!(width(&app), 50 - RESIZE_COLUMNS);
+        // Keys that mean something else in the sidebar do nothing here.
+        press(&mut app, KeyCode::Char('x'));
+        assert_eq!(app.confirm(), None);
+        press(&mut app, KeyCode::Char('='));
+        assert_eq!(width(&app), 50);
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.resizing());
+        press(&mut app, KeyCode::Char('l'));
+        assert_eq!(width(&app), 50, "l isn't a sidebar key");
+    }
+
+    #[test]
+    fn resize_mode_needs_panes_to_resize() {
+        let mut app = app_with(&["a"]);
+        press(&mut app, KeyCode::Char('R'));
+        assert!(!app.resizing());
+        assert!(app.notice().unwrap().contains("one pane"));
+        let mut app = app_with_splits(&["a", "b"], 1);
+        press(&mut app, KeyCode::Char('z'));
+        press(&mut app, KeyCode::Char('R'));
+        assert!(!app.resizing());
+        assert!(app.notice().unwrap().contains("zoomed"));
+    }
+
+    #[test]
+    fn a_border_taken_by_the_mouse_follows_it_until_let_go() {
+        let mut app = app_with(&["a", "b"]);
+        app.set_tiles(WIDE);
+        press(&mut app, KeyCode::Char('|'));
+        let down = MouseEventKind::Down(MouseButton::Left);
+        let drag = MouseEventKind::Drag(MouseButton::Left);
+        let up = MouseEventKind::Up(MouseButton::Left);
+        let border = |at| Hit::Border { split: 0, at };
+        assert_eq!(app.on_mouse(down, border(50)), None);
+        assert_eq!(app.moving_border(), Some(0));
+        app.on_mouse(drag, border(70));
+        assert_eq!(placed(&app, WIDE)[0].1.width, 70);
+        // Anything else meanwhile is the drag's: nothing selects or moves.
+        app.on_mouse(drag, Hit::Sidebar);
+        assert_eq!(app.on_mouse(up, Hit::Elsewhere), None);
+        assert_eq!(app.moving_border(), None);
+        app.on_mouse(drag, border(20));
+        assert_eq!(placed(&app, WIDE)[0].1.width, 70);
     }
 
     /// The sessions the panes show, in the order they're drawn: `-` for
@@ -4287,43 +5767,48 @@ mod tests {
     }
 
     #[test]
-    fn h_and_l_move_the_selected_sessions_pane_and_stop_at_the_ends() {
+    fn capital_hjkl_swap_the_selected_sessions_pane_with_the_one_that_way() {
         let mut app = app_with_splits(&["a", "b", "c"], 2);
-        assert_eq!(drawn(&app), ["c", "a", "b"]);
-        press(&mut app, KeyCode::Char('L'));
+        assert_eq!(drawn(&app), ["a", "b", "c"]);
+        press(&mut app, KeyCode::Char('K'));
         assert_eq!(drawn(&app), ["a", "c", "b"]);
+        press(&mut app, KeyCode::Char('K'));
+        assert_eq!(drawn(&app), ["c", "a", "b"]);
+        // At the edges it stays.
+        press(&mut app, KeyCode::Char('K'));
         press(&mut app, KeyCode::Char('L'));
-        assert_eq!(drawn(&app), ["a", "b", "c"]);
-        press(&mut app, KeyCode::Char('L'));
-        assert_eq!(drawn(&app), ["a", "b", "c"]);
+        assert_eq!(drawn(&app), ["c", "a", "b"]);
         assert_eq!(app.notice(), None);
 
-        // A split moves the same way, past the others.
+        // A split moves the same way.
         app.select("a");
-        press(&mut app, KeyCode::Char('L'));
-        assert_eq!(drawn(&app), ["b", "a", "-"]);
+        press(&mut app, KeyCode::Char('J'));
+        assert_eq!(drawn(&app), ["c", "b", "a"]);
         assert_eq!(app.splits(), ["b", "a"]);
+
+        // Side by side, H and L.
+        let mut app = app_with(&["a", "b"]);
+        press(&mut app, KeyCode::Char('|'));
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('H'));
+        assert_eq!(drawn(&app), ["b", "a"]);
+        press(&mut app, KeyCode::Char('H'));
+        assert_eq!(drawn(&app), ["b", "a"]);
         press(&mut app, KeyCode::Char('L'));
-        assert_eq!(drawn(&app), ["b", "-", "a"]);
-        press(&mut app, KeyCode::Char('H'));
-        press(&mut app, KeyCode::Char('H'));
-        assert_eq!(drawn(&app), ["a", "b", "-"]);
+        assert_eq!(drawn(&app), ["a", "b"]);
     }
 
     #[test]
     fn the_keyboard_and_tab_follow_a_pane_that_moved() {
         let mut app = app_with_splits(&["a", "b", "c"], 2);
-        // Type into each pane in turn, b's last, then come back to the
-        // sidebar.
-        for _ in 0..2 {
-            press(&mut app, KeyCode::Tab);
-            hand_back(&mut app);
-        }
+        // Type into a's pane, then b's, then come back to the sidebar.
+        press(&mut app, KeyCode::Tab);
+        hand_back(&mut app);
         press(&mut app, KeyCode::Tab);
         assert_eq!(app.focus(), Focus::Pane(Slot::Split(1)));
         hand_back(&mut app);
         app.select("b");
-        press(&mut app, KeyCode::Char('H'));
+        press(&mut app, KeyCode::Char('K'));
         assert_eq!(app.splits(), ["b", "a"]);
         // Tab goes on from b's pane, wherever it is: to a's, after it.
         press(&mut app, KeyCode::Tab);
@@ -4343,29 +5828,27 @@ mod tests {
         press(&mut app, KeyCode::Char('L'));
         assert!(app.notice().unwrap().contains("zoomed"));
         press(&mut app, KeyCode::Char('z'));
-        assert_eq!(drawn(&app), ["b", "a"]);
+        assert_eq!(drawn(&app), ["a", "b"]);
     }
 
     #[test]
-    fn panes_keep_their_order_as_splits_close_and_come() {
+    fn panes_keep_their_places_as_splits_close_and_come() {
         let mut app = app_with_splits(&["a", "b", "c"], 2);
-        press(&mut app, KeyCode::Char('L'));
-        press(&mut app, KeyCode::Char('L'));
         assert_eq!(drawn(&app), ["a", "b", "c"]);
-        // a's split closes: b stays before the selection's pane.
+        // a's split closes, and b's pane takes its room.
         app.select("a");
         press(&mut app, KeyCode::Char('s'));
         app.select("c");
         assert_eq!(drawn(&app), ["b", "c"]);
-        // A new split goes at the end.
+        // A new split stays where the selection's pane showed it.
         app.select("a");
         press(&mut app, KeyCode::Char('s'));
         app.select("c");
-        assert_eq!(drawn(&app), ["b", "c", "a"]);
-        // So does a session that goes, from before the selection's pane.
+        assert_eq!(drawn(&app), ["b", "a", "c"]);
+        // A session that goes leaves its room to the pane beside it.
         app.set_sessions(vec![session("a"), session("c")]);
-        assert_eq!(drawn(&app), ["c", "a"]);
-        assert_eq!(app.tabs_to_keep().current().selection_at, 0);
+        assert_eq!(drawn(&app), ["a", "c"]);
+        assert_eq!(app.tabs_to_keep().current().splits(), ["a"]);
     }
 
     #[test]
@@ -4393,14 +5876,14 @@ mod tests {
         assert_eq!(app.grabbed().unwrap().over, Some(Slot::Split(1)));
         assert_eq!(app.on_mouse(up, over_b), None);
         assert_eq!(app.grabbed(), None);
-        assert_eq!(drawn(&app), ["b", "a", "c"]);
+        assert_eq!(drawn(&app), ["a", "c", "b"]);
 
         // Let go anywhere but over another pane, and nothing moves.
         app.on_mouse(down, header(Slot::Split(0)));
         app.on_mouse(up, Hit::Sidebar);
         app.on_mouse(down, header(Slot::Split(0)));
         app.on_mouse(up, header(Slot::Split(0)));
-        assert_eq!(drawn(&app), ["b", "a", "c"]);
+        assert_eq!(drawn(&app), ["a", "c", "b"]);
     }
 
     #[test]
@@ -4452,9 +5935,9 @@ mod tests {
         press(&mut app, KeyCode::Char('F'));
         hand_back(&mut app);
         press(&mut app, KeyCode::Char('k'));
-        assert_eq!(app.slots(), [Slot::Selected, Slot::Split(0), Slot::Float]);
+        assert_eq!(app.slots(), [Slot::Split(0), Slot::Selected, Slot::Float]);
         press(&mut app, KeyCode::Tab);
-        assert_eq!(app.focus(), Focus::Pane(Slot::Selected));
+        assert_eq!(app.focus(), Focus::Pane(Slot::Split(0)));
         hand_back(&mut app);
         press(&mut app, KeyCode::Tab);
         hand_back(&mut app);
@@ -4575,7 +6058,7 @@ mod tests {
         let mut app = app_with(&["a", "b", "c"]);
         press(&mut app, KeyCode::Char('s'));
         press(&mut app, KeyCode::Char('j'));
-        press(&mut app, KeyCode::Char('L'));
+        press(&mut app, KeyCode::Char('K'));
         press(&mut app, KeyCode::Char('T'));
         type_text(&mut app, "work");
         press(&mut app, KeyCode::Enter);
@@ -4646,10 +6129,10 @@ mod tests {
         assert_eq!(
             visited,
             [
-                pane(Slot::Selected),
                 pane(Slot::Split(0)),
                 pane(Slot::Split(1)),
                 pane(Slot::Selected),
+                pane(Slot::Split(0)),
             ]
         );
     }
@@ -4658,10 +6141,10 @@ mod tests {
     fn shift_tab_goes_round_the_other_way_starting_at_the_last_pane() {
         let mut app = app_with_splits(&["a", "b", "c"], 2);
         press(&mut app, KeyCode::BackTab);
-        assert_eq!(app.focus(), Focus::Pane(Slot::Split(1)));
+        assert_eq!(app.focus(), Focus::Pane(Slot::Selected));
         hand_back(&mut app);
         press(&mut app, KeyCode::BackTab);
-        assert_eq!(app.focus(), Focus::Pane(Slot::Split(0)));
+        assert_eq!(app.focus(), Focus::Pane(Slot::Split(1)));
     }
 
     #[test]
@@ -4746,7 +6229,7 @@ mod tests {
     fn z_zooms_the_selected_sessions_pane_alone_and_again_puts_the_others_back() {
         let mut app = app_with_splits(&["a", "b", "c"], 1);
         app.select("b");
-        assert_eq!(on_screen(&app), ["b", "a"]);
+        assert_eq!(on_screen(&app), ["a", "b"]);
         press(&mut app, KeyCode::Char('z'));
         assert!(app.zoomed());
         assert_eq!(on_screen(&app), ["b"]);
@@ -4765,7 +6248,7 @@ mod tests {
 
         press(&mut app, KeyCode::Char('z'));
         assert!(!app.zoomed());
-        assert_eq!(on_screen(&app), ["c", "a"]);
+        assert_eq!(on_screen(&app), ["a", "c"]);
     }
 
     #[test]
@@ -4919,6 +6402,46 @@ mod tests {
     }
 
     #[test]
+    fn with_ctrl_held_the_mouse_over_a_pane_marks_where_to_look_for_a_link() {
+        let mut app = app_with_splits(&["a", "b"], 1);
+        let over = |cell| Hit::Pane {
+            slot: Slot::Split(0),
+            cell,
+        };
+        assert!(!app.mouse_moved(over(Some((2, 3))), false));
+        assert!(app.mouse_moved(over(Some((2, 3))), true));
+        assert_eq!(app.link_hover(), Some((Slot::Split(0), (2, 3))));
+        // Staying on the cell changes nothing to draw.
+        assert!(!app.mouse_moved(over(Some((2, 3))), true));
+        // Its header line has no link, and nor has the sidebar.
+        assert!(app.mouse_moved(over(None), true));
+        assert_eq!(app.link_hover(), None);
+        app.mouse_moved(over(Some((1, 1))), true);
+        assert!(app.mouse_moved(Hit::Sidebar, true));
+        // Letting go of Ctrl lets go of the link.
+        app.mouse_moved(over(Some((1, 1))), true);
+        assert!(app.mouse_moved(over(Some((1, 1))), false));
+        assert_eq!(app.link_hover(), None);
+        assert_eq!(
+            app.link_context(Slot::Split(0)).session.as_deref(),
+            Some("a")
+        );
+    }
+
+    #[test]
+    fn a_link_is_looked_for_only_while_nothing_waits_on_the_keyboard() {
+        let mut app = app_with(&["a"]);
+        let hit = Hit::Pane {
+            slot: Slot::Selected,
+            cell: Some((0, 0)),
+        };
+        assert_eq!(app.link_cell(hit), Some((Slot::Selected, (0, 0))));
+        press(&mut app, KeyCode::Char('/'));
+        assert_eq!(app.link_cell(hit), None);
+        assert!(!app.mouse_moved(hit, true));
+    }
+
+    #[test]
     fn a_click_in_the_pane_in_copy_mode_leaves_the_keyboard_there() {
         let mut app = app_with(&["a"]);
         press(&mut app, KeyCode::Char('v'));
@@ -5043,12 +6566,12 @@ mod tests {
     #[test]
     fn each_tab_keeps_its_own_splits() {
         let mut app = app_with_splits(&["a", "b", "c"], 1);
-        assert_eq!(on_screen(&app), ["c", "a"]);
+        assert_eq!(on_screen(&app), ["a", "c"]);
         press(&mut app, KeyCode::Char('t'));
         app.set_sessions(["a", "b", "c", "shell"].map(session).to_vec());
         assert!(app.splits().is_empty());
         press(&mut app, KeyCode::Char('1'));
-        assert_eq!(on_screen(&app), ["c", "a"]);
+        assert_eq!(on_screen(&app), ["a", "c"]);
     }
 
     #[test]
@@ -5070,6 +6593,17 @@ mod tests {
         let mut app = app_with_a_second_tab(&["a"]);
         app.renamed("a", "z");
         app.set_sessions(["z", "shell"].map(session).to_vec());
+        assert_eq!(in_sidebar(&app), ["shell"]);
+        press(&mut app, KeyCode::Char('1'));
+        assert_eq!(in_sidebar(&app), ["z"]);
+    }
+
+    #[test]
+    fn a_session_renamed_elsewhere_stays_in_its_tab() {
+        let mut app = app_with_a_second_tab(&["a"]);
+        let mut renamed = session("z");
+        renamed.id = "a".into();
+        app.set_sessions(vec![renamed, session("shell")]);
         assert_eq!(in_sidebar(&app), ["shell"]);
         press(&mut app, KeyCode::Char('1'));
         assert_eq!(in_sidebar(&app), ["z"]);
@@ -5220,7 +6754,7 @@ mod tests {
     fn a_split_of_a_session_that_goes_closes() {
         let mut app = app_with_splits(&["a", "b", "c"], 1);
         app.set_sessions(vec![session("b"), session("c")]);
-        assert!(app.tabs().all().iter().all(|tab| tab.splits.is_empty()));
+        assert!(app.tabs().all().iter().all(|tab| tab.splits().is_empty()));
     }
 
     #[test]
@@ -5396,6 +6930,26 @@ mod tests {
     }
 
     #[test]
+    fn the_arrows_turn_the_keys_pages_round_and_round() {
+        let mut app = app_with(&["a"]);
+        press(&mut app, KeyCode::Char('?'));
+        let pages = app.keys_pages();
+        assert!(pages > 1, "80 by 24 takes more than a page");
+        press(&mut app, KeyCode::Right);
+        assert_eq!(app.keys_page(), 1);
+        press(&mut app, KeyCode::Left);
+        press(&mut app, KeyCode::Left);
+        assert_eq!(
+            app.keys_page(),
+            pages - 1,
+            "back from the first is the last"
+        );
+        assert!(app.showing_keys());
+        assert_eq!(press(&mut app, KeyCode::Char('q')), None);
+        assert!(!app.showing_keys());
+    }
+
+    #[test]
     fn a_click_puts_the_keys_away_without_selecting() {
         let mut app = app_with(&["a", "b"]);
         press(&mut app, KeyCode::Char('?'));
@@ -5476,31 +7030,37 @@ mod tests {
     }
 
     fn pull_request(number: u64, branch: &str) -> PullRequest {
-        serde_json::from_value(serde_json::json!({
-            "number": number,
-            "title": "a change",
-            "headRefName": branch,
-            "isDraft": false,
-            "reviewDecision": "",
-            "statusCheckRollup": [],
-            "url": format!("https://github.com/acme/app/pull/{number}"),
-        }))
-        .unwrap()
+        PullRequest {
+            forge: Forge::GitHub,
+            number,
+            title: "a change".into(),
+            author: "ana".into(),
+            branch: branch.into(),
+            from_fork: false,
+            local_branch: branch.into(),
+            draft: false,
+            checks: forge::Checks::None,
+            review: forge::Review::None,
+            updated_at: "2026-10-02T09:30:00Z".into(),
+            url: format!("https://github.com/acme/app/pull/{number}"),
+        }
+    }
+
+    fn on_github(pull_requests: Vec<PullRequest>) -> Result<(Forge, Vec<PullRequest>), String> {
+        Ok((Forge::GitHub, pull_requests))
     }
 
     #[test]
     fn o_opens_the_pull_request_of_the_selected_sessions_branch() {
         let mut app = App::new(None);
         app.set_sessions(vec![in_repo("fixer", "fix-login")]);
-        app.set_pull_requests(
-            PathBuf::from("/code/app"),
-            Ok(vec![pull_request(57, "fix-login")]),
-        );
+        let found = on_github(vec![pull_request(57, "fix-login")]);
+        app.set_pull_requests(PathBuf::from("/code/app"), found);
         assert_eq!(
             press(&mut app, KeyCode::Char('o')),
-            Some(Action::OpenPullRequest {
+            Some(Action::OpenInBrowser {
                 project: PathBuf::from("/code/app"),
-                number: 57
+                topic: Topic::PullRequest(57),
             })
         );
     }
@@ -5510,31 +7070,167 @@ mod tests {
         let mut app = App::new(None);
         app.set_sessions(vec![in_repo("fixer", "fix-login")]);
         assert_eq!(press(&mut app, KeyCode::Char('o')), None);
-        assert_eq!(app.notice(), Some("still asking GitHub about app"));
+        assert_eq!(app.notice(), Some("still asking about app's pull requests"));
 
-        app.set_pull_requests(
-            PathBuf::from("/code/app"),
-            Ok(vec![pull_request(9, "other")]),
-        );
+        let found = on_github(vec![pull_request(9, "other")]);
+        app.set_pull_requests(PathBuf::from("/code/app"), found);
         press(&mut app, KeyCode::Char('o'));
         assert_eq!(app.notice(), Some("no open pull request for fix-login"));
 
-        let not_github = "app's origin isn't on GitHub".to_string();
-        app.set_pull_requests(PathBuf::from("/code/app"), Err(not_github.clone()));
+        let found = Ok((Forge::GitLab, Vec::new()));
+        app.set_pull_requests(PathBuf::from("/code/app"), found);
         press(&mut app, KeyCode::Char('o'));
-        assert_eq!(app.notice(), Some(not_github.as_str()));
+        assert_eq!(app.notice(), Some("no open merge request for fix-login"));
+
+        let not_on_one = "app's remote is on this machine, not GitHub or GitLab".to_string();
+        app.set_pull_requests(PathBuf::from("/code/app"), Err(not_on_one.clone()));
+        press(&mut app, KeyCode::Char('o'));
+        assert_eq!(app.notice(), Some(not_on_one.as_str()));
     }
 
-    fn issue(number: u64, title: &str) -> github::Issue {
-        serde_json::from_value(serde_json::json!({
-            "number": number,
-            "title": title,
-            "labels": [],
-            "updatedAt": "2026-10-02T09:30:00Z",
-            "author": {"login": "ana"},
-            "url": format!("https://github.com/acme/app/issues/{number}"),
-        }))
-        .unwrap()
+    #[test]
+    fn a_worktree_finds_a_forks_pull_request_by_its_own_branch() {
+        let mut app = App::new(None);
+        app.set_sessions(vec![in_repo("planner", "main")]);
+        let fork = PullRequest {
+            from_fork: true,
+            local_branch: "ana/main".into(),
+            ..pull_request(58, "main")
+        };
+        app.set_pull_requests(PathBuf::from("/code/app"), on_github(vec![fork]));
+        assert!(app.pull_request(Path::new("/code/app"), "main").is_none());
+        assert!(
+            app.pull_request(Path::new("/code/app"), "ana/main")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn capital_o_lists_the_pull_requests_and_enter_starts_in_one() {
+        let mut app = with_agents(&["claude"], vec![in_repo("planner", "main")]);
+        let found = on_github(vec![pull_request(57, "fix-login")]);
+        app.set_pull_requests(PathBuf::from("/code/app"), found);
+        assert_eq!(
+            press(&mut app, KeyCode::Char('O')),
+            Some(Action::ListPullRequests(PathBuf::from("/code/app")))
+        );
+        // What was listed last shows while the forge is asked again.
+        let view = app.pull_requests_view().unwrap();
+        assert_eq!(view.highlighted().map(|pr| pr.number), Some(57));
+
+        press(&mut app, KeyCode::Enter);
+        assert!(app.pull_requests_view().is_none());
+        let panel = app.launcher().unwrap();
+        assert_eq!(panel.title(), "New session · app ⎇ fix-login");
+        assert_eq!(
+            panel.task().text(),
+            "Work on pull request #57: a change (https://github.com/acme/app/pull/57)"
+        );
+        let Some(Action::Start { place, .. }) = press(&mut app, KeyCode::Enter) else {
+            panic!("Enter should start the session");
+        };
+        assert_eq!(
+            place,
+            Place::PullRequest(Checkout {
+                project: PathBuf::from("/code/app"),
+                branch: "fix-login".into(),
+                fetch: "fix-login".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn a_pull_requests_diff_opens_over_the_view_and_closes_back_to_it() {
+        let mut app = App::new(None);
+        app.set_sessions(vec![in_repo("planner", "main")]);
+        let found = on_github(vec![pull_request(57, "fix-login")]);
+        app.set_pull_requests(PathBuf::from("/code/app"), found);
+        press(&mut app, KeyCode::Char('O'));
+        let ctrl_d = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL);
+        assert_eq!(
+            app.on_key(ctrl_d),
+            Some(Action::ReadDiff {
+                dir: PathBuf::from("/code/app"),
+                against: Against::PullRequest {
+                    forge: Forge::GitHub,
+                    number: 57
+                },
+            })
+        );
+        assert!(matches!(app.view(), Some(View::Diff(_))));
+        press(&mut app, KeyCode::Esc);
+        assert!(app.view().is_none());
+        assert!(app.pull_requests_view().is_some());
+    }
+
+    #[test]
+    fn big_e_opens_the_tree_browser_and_ctrl_e_edits_a_file_in_a_session() {
+        let mut app = App::new(None);
+        app.set_sessions(vec![in_repo("planner", "main")]);
+        assert_eq!(
+            press(&mut app, KeyCode::Char('E')),
+            Some(Action::ReadFiles(PathBuf::from("/code/app/main")))
+        );
+        assert!(matches!(app.view(), Some(View::Tree(_))));
+        let files = vec!["src/main.rs".to_string(), "README.md".to_string()];
+        // The directory comes first, and shows its names: nothing to read.
+        assert_eq!(app.files_read(Path::new("/code/app/main"), Ok(files)), None);
+        assert_eq!(
+            press(&mut app, KeyCode::Down),
+            Some(Action::ReadPreview {
+                dir: PathBuf::from("/code/app/main"),
+                path: "README.md".into(),
+            })
+        );
+        let ctrl_e = KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL);
+        assert_eq!(
+            app.on_key(ctrl_e),
+            Some(Action::Edit {
+                dir: PathBuf::from("/code/app/main"),
+                path: "README.md".into(),
+                line: None,
+                name: "README.md".into(),
+            })
+        );
+        assert!(app.view().is_none());
+    }
+
+    #[test]
+    fn a_comment_goes_to_the_forge_and_its_answer_comes_back_to_the_view() {
+        let mut app = App::new(None);
+        app.set_sessions(vec![in_repo("planner", "main")]);
+        let found = on_github(vec![pull_request(57, "fix-login")]);
+        app.set_pull_requests(PathBuf::from("/code/app"), found);
+        press(&mut app, KeyCode::Char('O'));
+        app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        type_text(&mut app, "LGTM");
+        assert_eq!(
+            press(&mut app, KeyCode::Enter),
+            Some(Action::Comment {
+                project: PathBuf::from("/code/app"),
+                topic: Topic::PullRequest(57),
+                text: "LGTM".into(),
+            })
+        );
+        app.commented(Path::new("/code/app"), Topic::PullRequest(57), Ok(()));
+        assert_eq!(app.notice(), Some("commented on #57"));
+        assert!(app.pull_requests_view().unwrap().comment.is_none());
+        // It's read again, with the comment.
+        assert_eq!(
+            app.topic_to_read(),
+            Some((PathBuf::from("/code/app"), Topic::PullRequest(57)))
+        );
+    }
+
+    fn issue(number: u64, title: &str) -> Issue {
+        Issue {
+            number,
+            title: title.into(),
+            labels: Vec::new(),
+            updated_at: "2026-10-02T09:30:00Z".into(),
+            author: "ana".into(),
+            url: format!("https://github.com/acme/app/issues/{number}"),
+        }
     }
 
     #[test]
@@ -5546,7 +7242,7 @@ mod tests {
         );
         app.set_issues(
             Path::new("/code/app"),
-            Ok(vec![issue(42, "Fix login redirect")]),
+            Ok((Forge::GitHub, vec![issue(42, "Fix login redirect")])),
         );
         press(&mut app, KeyCode::Enter);
         assert!(app.issues_view().is_none());
@@ -5621,16 +7317,23 @@ mod tests {
     /// A session given `goal` to do, closed with `outcome` if it's given:
     /// whether it failed, and how it went.
     fn with_task(name: &str, goal: &str, outcome: Option<(bool, &str)>) -> SessionInfo {
+        let closed = |(failed, summary)| {
+            let state = if failed {
+                TaskState::Failed
+            } else {
+                TaskState::Done
+            };
+            TaskOutcome::new(state, summary, 1)
+        };
         SessionInfo {
             task: Some(TaskInfo {
+                id: Some(1),
                 goal: goal.into(),
                 background: false,
                 backlog: None,
-                outcome: outcome.map(|(failed, summary)| TaskOutcome {
-                    failed,
-                    summary: summary.into(),
-                    closed: 1,
-                }),
+                waiting: false,
+                created: 0,
+                outcome: outcome.map(closed),
             }),
             ..in_project(name, "shop")
         }
@@ -6009,5 +7712,110 @@ gate = true
         assert_eq!(press(&mut app, KeyCode::Esc), Some(Action::CloseSettings));
         assert!(app.settings_view().is_none());
         assert_eq!(selected_name(&app), Some("agent"));
+    }
+
+    #[test]
+    fn capital_u_lists_what_needs_you_in_every_tab_and_enter_goes_there() {
+        let mut app = app_with_a_second_tab(&["a"]);
+        app.set_sessions(vec![doing("a", Activity::Waiting), session("shell")]);
+        press(&mut app, KeyCode::Char('U'));
+        let row = app.needs_you_view().unwrap().highlighted().unwrap();
+        assert_eq!(row.name, "a");
+        // Its keys are the list's: in the sidebar, `x` would ask to kill.
+        assert_eq!(press(&mut app, KeyCode::Char('x')), None);
+        assert!(app.confirm().is_none());
+        press(&mut app, KeyCode::Enter);
+        assert!(app.needs_you_view().is_none());
+        assert_eq!(selected_name(&app), Some("a"));
+        assert_eq!(app.tabs().current_index(), 0);
+    }
+
+    #[test]
+    fn a_permission_is_answered_from_the_list_which_stays_open() {
+        let mut app = App::new(None);
+        let asking = SessionInfo {
+            asking: Some(crate::protocol::Asking {
+                tool: "Bash".into(),
+                gist: "cargo test".into(),
+            }),
+            ..doing("fixer", Activity::Waiting)
+        };
+        app.set_sessions(vec![session("other"), asking]);
+        press(&mut app, KeyCode::Char('U'));
+        let answered = Action::Answer {
+            name: "fixer".into(),
+            answer: Answer::Always,
+        };
+        assert_eq!(press(&mut app, KeyCode::Char('Y')), Some(answered));
+        // Answered, it leaves the list as the next list of sessions comes.
+        app.set_sessions(vec![session("other"), doing("fixer", Activity::Working)]);
+        assert!(app.needs_you_view().unwrap().highlighted().is_none());
+        press(&mut app, KeyCode::Esc);
+        assert!(app.needs_you_view().is_none());
+    }
+
+    /// An event about `session`, numbered `seq`.
+    fn about(seq: u64, kind: crate::events::Kind, session: &SessionInfo) -> Event {
+        Event {
+            seq,
+            session: Some(crate::events::SessionAbout::of(session)),
+            ..Event::new(kind)
+        }
+    }
+
+    #[test]
+    fn the_timeline_follows_the_log_while_open_and_enter_goes_to_a_line_s_session() {
+        let mut app = app_with(&["a"]);
+        assert_eq!(
+            press(&mut app, KeyCode::Char('a')),
+            Some(Action::FollowEvents)
+        );
+        let worker = SessionInfo {
+            id: "s1".into(),
+            ..session("worker")
+        };
+        let gone = session("gone");
+        let page = vec![
+            about(2, crate::events::Kind::SessionEnded, &gone),
+            about(1, crate::events::Kind::SessionStarted, &worker),
+        ];
+        assert_eq!(app.events_read(Ok(page)), None, "the log has no more");
+        // Renamed since, it's still the session the line is about.
+        let builder = SessionInfo {
+            id: "s1".into(),
+            ..session("builder")
+        };
+        app.set_sessions(vec![session("a"), builder]);
+        assert_eq!(press(&mut app, KeyCode::Enter), None);
+        assert_eq!(app.notice(), Some("gone has gone"));
+        press(&mut app, KeyCode::Down);
+        assert_eq!(press(&mut app, KeyCode::Enter), Some(Action::StopFollowing));
+        assert!(app.timeline_view().is_none());
+        assert_eq!(selected_name(&app), Some("builder"));
+
+        press(&mut app, KeyCode::Char('a'));
+        assert_eq!(press(&mut app, KeyCode::Esc), Some(Action::StopFollowing));
+    }
+
+    #[test]
+    fn what_happened_while_you_were_away_shows_until_a_key_and_marks_the_timeline() {
+        let mut app = app_with(&["a"]);
+        let finished = about(8, crate::events::Kind::SessionDone, &session("a"));
+        app.set_away(&Tally::of(&[finished]));
+        assert_eq!(
+            app.away_line(),
+            Some("while you were away: 1 session finished")
+        );
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.away_line(), None);
+        press(&mut app, KeyCode::Char('a'));
+        assert_eq!(app.timeline_view().unwrap().away_after, Some(7));
+        press(&mut app, KeyCode::Esc);
+        // Once it has been seen there, it's not new any more.
+        press(&mut app, KeyCode::Char('a'));
+        assert_eq!(app.timeline_view().unwrap().away_after, None);
+        // Nothing worth saying says nothing.
+        app.set_away(&Tally::of(&[]));
+        assert_eq!(app.away_line(), None);
     }
 }

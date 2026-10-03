@@ -1,34 +1,41 @@
 //! Drawing the TUI: a bar along the top with the tabs, the sidebar of
-//! sessions, the pane with the selected session and the panes of those split
-//! off, each under a header line, and the footer. There are no boxes: thin rules and the
-//! theme's colors tell the parts apart. Drawing only reads the state; it
-//! never changes it.
+//! sessions, the tab's panes beside it, split as its tree has them, each
+//! under a header line, and the footer. There are no boxes: thin rules and
+//! the theme's colors tell the parts apart. Drawing only reads the state;
+//! it never changes it.
 
 use super::app::{App, Filter, Focus, Hit, PluginPane, Prompt, Question, Slot, View};
 use super::backlog_view::{self, BacklogView};
 use super::copy_mode::{self, SearchPrompt};
 use super::diff_view;
 use super::finder;
+use super::grep;
 use super::help;
 use super::issues;
 use super::launcher;
 use super::layouts::{self, LayoutsView};
 use super::memory_view;
+use super::needs_you;
 use super::pane::Pane;
 use super::plugins_view;
 use super::profiles;
+use super::pull_requests;
 use super::screen_widget::{Marks, ScreenWidget};
 use super::settings_view;
 use super::sidebar::{self, fit};
+use super::split_tree::{Border, Way};
 use super::status::Status;
+use super::switcher;
 use super::tabs::Tab;
 use super::theme::Theme;
+use super::timeline;
+use super::tree_browser;
 use crate::flow_run::RunState;
-use crate::protocol::{SessionInfo, State};
+use crate::protocol::{SessionInfo, State, TaskState};
 use crate::shell;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph};
 
@@ -43,10 +50,6 @@ const SUMMARY_ROOM: u16 = 26;
 
 /// The longest a tab's name gets in the top bar.
 const TAB_NAME_LENGTH: usize = 16;
-
-/// Panes go side by side only while each is at least this wide, which fits
-/// most agents' screens; narrower than that, they're stacked.
-const MIN_PANE_WIDTH: u16 = 80;
 
 /// What drawing needs besides the state.
 pub struct Look<'a> {
@@ -67,9 +70,11 @@ pub struct Areas {
     pub sidebar: Rect,
     /// The column with the rule between the sidebar and the panes.
     pub rule: Rect,
-    /// One per pane, in the app's [`App::slots`] order: the selection's
-    /// pane and the splits, then the float's. Each is its header line,
-    /// then its screen.
+    /// The room beside the sidebar the tab's panes share when it isn't
+    /// zoomed.
+    pub tiles: Rect,
+    /// One per pane, in the app's [`App::slots`] order: the tab's panes,
+    /// then the float's. Each is its header line, then its screen.
     pub panes: Vec<Rect>,
     /// The frame around the float, over the other panes, while one floats.
     pub float: Option<Rect>,
@@ -77,14 +82,35 @@ pub struct Areas {
 }
 
 impl Areas {
-    /// Lays out a screen the way `app` has it: zoomed, or with its splits
-    /// beside the selection's pane.
+    /// Lays out a screen the way `app` has it: its panes split as the tab's
+    /// tree has them, or zoomed, one pane taking everything between the top
+    /// bar and the footer, the sidebar and its rule with no room.
     pub fn of(app: &App, screen: Rect) -> Areas {
-        let mut areas = if app.zoomed() {
-            Areas::zoomed(screen)
-        } else {
-            Areas::new(screen, app.splits().len())
+        let [top, main, footer] = rows(screen);
+        let [sidebar, rule, tiles] = Layout::horizontal([
+            Constraint::Length(SIDEBAR_WIDTH),
+            Constraint::Length(1),
+            Constraint::Min(0),
+        ])
+        .areas(main);
+        let mut areas = Areas {
+            top,
+            main,
+            sidebar,
+            rule,
+            tiles,
+            panes: (app.panes().layout(tiles).into_iter())
+                .map(|(_, area)| area)
+                .collect(),
+            float: None,
+            footer,
         };
+        if app.zoomed() {
+            let nowhere = Rect::new(main.x, main.y, 0, main.height);
+            areas.sidebar = nowhere;
+            areas.rule = nowhere;
+            areas.panes = vec![main];
+        }
         if app.floating().is_some() {
             areas.add_float();
         }
@@ -93,7 +119,7 @@ impl Areas {
 
     /// Puts a pane floating over the others, in a frame, in the middle of
     /// the room they have.
-    pub fn add_float(&mut self) {
+    fn add_float(&mut self) {
         let frame = float_frame(self);
         self.panes.push(Block::bordered().inner(frame));
         self.float = Some(frame);
@@ -103,43 +129,6 @@ impl Areas {
     pub fn tiled(&self) -> &[Rect] {
         let floats = usize::from(self.float.is_some());
         &self.panes[..self.panes.len() - floats]
-    }
-
-    /// Lays out a screen with `splits` sessions split off beside the
-    /// selection's pane.
-    pub fn new(screen: Rect, splits: usize) -> Areas {
-        let [top, main, footer] = rows(screen);
-        let [sidebar, rule, panes] = Layout::horizontal([
-            Constraint::Length(SIDEBAR_WIDTH),
-            Constraint::Length(1),
-            Constraint::Min(0),
-        ])
-        .areas(main);
-        Areas {
-            top,
-            main,
-            sidebar,
-            rule,
-            panes: pane_areas(panes, 1 + splits),
-            float: None,
-            footer,
-        }
-    }
-
-    /// Lays out a screen zoomed: one pane takes everything between the top
-    /// bar and the footer, and the sidebar and its rule have no room.
-    pub fn zoomed(screen: Rect) -> Areas {
-        let [top, main, footer] = rows(screen);
-        let nowhere = Rect::new(main.x, main.y, 0, main.height);
-        Areas {
-            top,
-            main,
-            sidebar: nowhere,
-            rule: nowhere,
-            panes: vec![main],
-            float: None,
-            footer,
-        }
     }
 }
 
@@ -188,6 +177,9 @@ pub fn view_areas(view: &View, area: Rect) -> ViewAreas {
     let list_width = match view {
         View::Diff(_) => diff_view::list_width(area.width),
         View::Files(_) => finder::list_width(area.width),
+        View::Tree(tree) => tree.list_width(area.width),
+        View::Grep(_) => grep::list_width(area.width),
+        View::Branches(_) => switcher::list_width(area.width),
         View::Memory(_) => memory_view::list_width(area.width),
     };
     let [header, body] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
@@ -254,23 +246,6 @@ pub fn view_header<'a>(
     Line::from(spans)
 }
 
-/// Shares `area` out evenly between `count` panes: side by side, a column
-/// apart for the rule between them, when each is still at least
-/// [`MIN_PANE_WIDTH`] wide; stacked otherwise, where each pane's header
-/// line is what sets it apart.
-pub fn pane_areas(area: Rect, count: usize) -> Vec<Rect> {
-    let count = count.max(1) as u16;
-    let constraints = vec![Constraint::Ratio(1, u32::from(count)); usize::from(count)];
-    let rules = count - 1;
-    let side_by_side = area.width.saturating_sub(rules) / count >= MIN_PANE_WIDTH;
-    let layout = if side_by_side {
-        Layout::horizontal(constraints).spacing(1)
-    } else {
-        Layout::vertical(constraints)
-    };
-    layout.split(area).to_vec()
-}
-
 /// Where a pane's session's screen goes: all of the pane below its header
 /// line. The session is sized to fit it exactly.
 pub fn screen_area(pane: Rect) -> Rect {
@@ -304,10 +279,19 @@ pub fn hit(areas: &Areas, app: &App, column: u16, row: u16) -> Hit {
     let at = |area: Rect| area.contains((column, row).into());
     if let Some(view) = app.view() {
         let parts = view_areas(view, areas.main);
+        // The tree browser's border is the mouse's while it's dragged.
+        if let View::Tree(tree) = view
+            && (tree.dragging || at(parts.rule))
+        {
+            return Hit::ViewBorder(column.saturating_sub(areas.main.x));
+        }
         if at(parts.list) {
             return match view {
                 View::Diff(diff) => diff_view::list_hit(diff, parts.list, row),
                 View::Files(finder) => finder::list_hit(finder, parts.list, row),
+                View::Tree(tree) => tree_browser::list_hit(tree, parts.list, row),
+                View::Grep(grep) => grep::list_hit(grep, parts.list, row),
+                View::Branches(switcher) => switcher::list_hit(switcher, parts.list, row),
                 View::Memory(memory) => memory_view::list_hit(memory, parts.list, row),
             };
         }
@@ -333,10 +317,59 @@ pub fn hit(areas: &Areas, app: &App, column: u16, row: u16) -> Hit {
         if at(frame) {
             let screen = screen_area(*area);
             let cell = at(screen).then(|| (row - screen.y, column - screen.x));
+            // A header line below another pane is the border between
+            // them, but for the name on it, which takes the pane to move.
+            let on_name = column < area.x + name_width(app, slot);
+            if cell.is_none() && slot != Slot::Float && !on_name {
+                let border = borders(areas, app)
+                    .into_iter()
+                    .find(|border| at(border.line));
+                if let Some(border) = border {
+                    return Hit::Border {
+                        split: border.split,
+                        at: row,
+                    };
+                }
+            }
             return Hit::Pane { slot, cell };
         }
     }
+    // Between panes side by side, the rule is their border.
+    let border = borders(areas, app)
+        .into_iter()
+        .find(|border| at(border.line));
+    if let Some(border) = border {
+        return border_hit(areas, app, border.split, column, row);
+    }
     Hit::Elsewhere
+}
+
+/// The borders between the tab's panes on screen: none while it's zoomed.
+fn borders(areas: &Areas, app: &App) -> Vec<Border> {
+    if app.zoomed() {
+        return Vec::new();
+    }
+    app.panes().borders(areas.tiles)
+}
+
+/// How much of the header line of the pane at `slot` its session's mark and
+/// name take, from its left edge.
+fn name_width(app: &App, slot: Slot) -> u16 {
+    let session = app.pane_session(slot);
+    session.map_or(0, |session| 3 + width_of(&session.name))
+}
+
+/// The border [`SplitTree::borders`] counts as `split` with the mouse at
+/// `(column, row)`: where along the screen a drag that took it has got to.
+///
+/// [`SplitTree::borders`]: super::split_tree::SplitTree::borders
+pub fn border_hit(areas: &Areas, app: &App, split: usize, column: u16, row: u16) -> Hit {
+    let border = borders(areas, app).into_iter().nth(split);
+    match border.map(|border| border.way) {
+        Some(Way::Right) => Hit::Border { split, at: column },
+        Some(Way::Down) => Hit::Border { split, at: row },
+        None => Hit::Elsewhere,
+    }
 }
 
 /// Draws the whole TUI. `panes` are the viewers of the sessions on screen.
@@ -349,6 +382,9 @@ pub fn draw(frame: &mut Frame, app: &App, panes: &[Pane], overlay: Option<&Pane>
         match view {
             View::Diff(diff) => diff_view::draw(frame, diff, look, &parts),
             View::Files(files) => finder::draw(frame, files, look, &parts),
+            View::Tree(tree) => tree_browser::draw(frame, tree, look, &parts),
+            View::Grep(grep) => grep::draw(frame, grep, look, &parts),
+            View::Branches(switcher) => switcher::draw(frame, switcher, look, &parts),
             View::Memory(memory) => memory_view::draw(frame, memory, look, &parts),
         }
         draw_view_footer(frame, app, view, look, areas.footer);
@@ -356,13 +392,15 @@ pub fn draw(frame: &mut Frame, app: &App, panes: &[Pane], overlay: Option<&Pane>
     }
     sidebar::draw(frame, app, look, areas.sidebar);
     draw_rule(frame, look, areas.rule);
-    for (slot, area) in app.slots().into_iter().zip(&areas.panes) {
-        if let (Slot::Float, Some(around)) = (slot, areas.float) {
-            draw_float_frame(frame, app, look, around);
-        }
-        draw_pane(frame, app, look, slot, *area, panes);
+    let slots = app.slots();
+    for (slot, area) in slots.iter().zip(areas.tiled()) {
+        draw_pane(frame, app, look, *slot, *area, panes);
     }
-    draw_rules_between(frame, look, areas.tiled());
+    draw_borders(frame, app, look, &areas);
+    if let (Some(around), Some(area)) = (areas.float, areas.panes.last()) {
+        draw_float_frame(frame, app, look, around);
+        draw_pane(frame, app, look, Slot::Float, *area, panes);
+    }
     // Zoomed, the sidebar comes out over the pane while `/` looks through
     // it, rather than squeezing the pane, which its program would redraw
     // for.
@@ -382,11 +420,20 @@ pub fn draw(frame: &mut Frame, app: &App, panes: &[Pane], overlay: Option<&Pane>
     if let Some(view) = app.issues_view() {
         issues::draw(frame, view, look.theme, look.now, middle);
     }
+    if let Some(view) = app.pull_requests_view() {
+        pull_requests::draw(frame, view, look.theme, look.now, middle);
+    }
     if let Some(view) = app.backlog_view() {
         backlog_view::draw(frame, view, look.theme, middle);
     }
     if let Some(view) = app.layouts_view() {
         layouts::draw(frame, view, look.theme, look.now, middle);
+    }
+    if let Some(view) = app.timeline_view() {
+        timeline::draw(frame, view, look.theme, look.now * 1000, middle);
+    }
+    if let Some(view) = app.needs_you_view() {
+        needs_you::draw(frame, view, look.theme, look.now, middle);
     }
     if let Some(panel) = app.launcher() {
         // Over the panes, beside the sidebar.
@@ -421,7 +468,7 @@ pub fn draw(frame: &mut Frame, app: &App, panes: &[Pane], overlay: Option<&Pane>
             plugin_on: &plugin_on,
             plugin_keys: &plugin_keys,
         };
-        help::draw(frame, look.theme, frame.area(), &shown);
+        help::draw(frame, look.theme, frame.area(), &shown, app.keys_page());
     }
 }
 
@@ -469,8 +516,9 @@ fn draw_plugin_pane(frame: &mut Frame, open: &PluginPane, pane: &Pane, look: &Lo
     }
 }
 
-/// crystal's name and the tabs on the left, and on the right how many
-/// sessions there are and how many wait on the user.
+/// crystal's name and the tabs on the left, and on the right the server,
+/// when it isn't the default, then how many sessions there are and how
+/// many wait on the user.
 fn draw_top_bar(frame: &mut Frame, app: &App, look: &Look, area: Rect) {
     let theme = look.theme;
     let name = Line::from(vec![
@@ -482,7 +530,8 @@ fn draw_top_bar(frame: &mut Frame, app: &App, look: &Look, area: Rect) {
     ]);
     frame.render_widget(name, area);
     draw_tabs(frame, app, look, area);
-    frame.render_widget(summary(app.sessions(), theme).right_aligned(), area);
+    let summary = summary(app.sessions(), app.server(), theme);
+    frame.render_widget(summary.right_aligned(), area);
 }
 
 /// The tabs, after crystal's name in the top bar in `area`: the one in
@@ -493,7 +542,7 @@ fn draw_tabs(frame: &mut Frame, app: &App, look: &Look, area: Rect) {
     let theme = look.theme;
     let in_front = app.tabs().current_index();
     let statuses = tab_statuses(app);
-    let labels = tab_labels(app.tabs().all(), &statuses, area.width);
+    let labels = tab_labels(app.tabs().all(), &statuses, tabs_width(app, area));
     for (index, (column, label)) in labels.into_iter().enumerate() {
         let style = if index == in_front {
             theme
@@ -565,11 +614,25 @@ fn tab_label(number: usize, tab: &Tab, status: Option<Status>, named: bool) -> S
     }
 }
 
+/// How much of the top bar in `area` the tabs share with the summary: all
+/// of it, but for the server's name the summary starts with, if it does.
+fn tabs_width(app: &App, area: Rect) -> u16 {
+    let server = app
+        .server()
+        .map_or(0, |server| width_of(&server_label(server)));
+    area.width.saturating_sub(server)
+}
+
+/// What the summary says of the server, before the sessions.
+fn server_label(server: &str) -> String {
+    format!("{server} · ")
+}
+
 /// The tab drawn at `column` of the top bar in `area`, if there's one
 /// there.
 fn tab_hit(app: &App, area: Rect, column: u16) -> Hit {
     let column = column - area.x;
-    let labels = tab_labels(app.tabs().all(), &tab_statuses(app), area.width);
+    let labels = tab_labels(app.tabs().all(), &tab_statuses(app), tabs_width(app, area));
     let under = labels.iter().position(|(start, label)| {
         let end = start + width_of(label);
         (*start..end).contains(&column)
@@ -583,14 +646,19 @@ fn width_of(text: &str) -> u16 {
 }
 
 /// "6 sessions · 2 waiting": the waiting count only when some are, in the
-/// color that says so.
-pub fn summary<'a>(sessions: &[SessionInfo], theme: &Theme) -> Line<'a> {
+/// color that says so; "work · 6 sessions" on a server that isn't the
+/// default.
+pub fn summary<'a>(sessions: &[SessionInfo], server: Option<&str>, theme: &Theme) -> Line<'a> {
     let count = sessions.len();
     let noun = if count == 1 { "session" } else { "sessions" };
-    let mut spans = vec![Span::styled(
+    let mut spans: Vec<Span> = server
+        .map(|server| Span::styled(server_label(server), Style::new().fg(theme.muted)))
+        .into_iter()
+        .collect();
+    spans.push(Span::styled(
         format!("{count} {noun}"),
         Style::new().fg(theme.muted),
-    )];
+    ));
     let waiting = sessions
         .iter()
         .filter(|session| Status::of(session) == Status::Waiting)
@@ -608,8 +676,13 @@ pub fn summary<'a>(sessions: &[SessionInfo], theme: &Theme) -> Line<'a> {
 
 /// A thin vertical rule down `area`.
 pub fn draw_rule(frame: &mut Frame, look: &Look, area: Rect) {
+    draw_rule_in(frame, look.theme.rule, area);
+}
+
+/// A thin vertical rule down `area`, in `color`.
+fn draw_rule_in(frame: &mut Frame, color: Color, area: Rect) {
     let lines: Vec<Line> = (0..area.height).map(|_| Line::from("│")).collect();
-    let rule = Paragraph::new(lines).style(Style::new().fg(look.theme.rule));
+    let rule = Paragraph::new(lines).style(Style::new().fg(color));
     frame.render_widget(rule, area);
 }
 
@@ -635,15 +708,17 @@ fn draw_float_frame(frame: &mut Frame, app: &App, look: &Look, around: Rect) {
     frame.render_widget(block, around);
 }
 
-/// The rules between panes that sit side by side, in the column left
-/// between each pair.
-fn draw_rules_between(frame: &mut Frame, look: &Look, panes: &[Rect]) {
-    for pair in panes.windows(2) {
-        let (left, right) = (pair[0], pair[1]);
-        if right.x > left.right() {
-            let column = Rect::new(left.right(), left.y, 1, left.height);
-            draw_rule(frame, look, column);
-        }
+/// The rules between panes side by side, in the column each split keeps
+/// between them: in the accent color while the mouse is moving one.
+fn draw_borders(frame: &mut Frame, app: &App, look: &Look, areas: &Areas) {
+    let rules = borders(areas, app).into_iter();
+    for border in rules.filter(|border| border.way == Way::Right) {
+        let color = if app.moving_border() == Some(border.split) {
+            look.theme.accent
+        } else {
+            look.theme.rule
+        };
+        draw_rule_in(frame, color, border.line);
     }
 }
 
@@ -680,7 +755,7 @@ fn draw_pane(frame: &mut Frame, app: &App, look: &Look, slot: Slot, area: Rect, 
     let line = pane_header(session, &notes, focused, look, header.width);
     frame.render_widget(line, header);
 
-    if slot == Slot::Selected && app.selected_is_own() {
+    if slot == Slot::Selected && app.is_own(session) {
         let message = "This is the session crystal is running in.";
         draw_message(frame, look, message, screen);
         return;
@@ -709,9 +784,15 @@ fn draw_pane(frame: &mut Frame, app: &App, look: &Look, slot: Slot, area: Rect, 
         current: theme.found_current,
         ..Marks::default()
     };
+    // The link under the mouse, with Ctrl held, is underlined.
+    let link = app
+        .link_hover()
+        .filter(|(over, _)| *over == slot)
+        .and_then(|(_, cell)| pane.screen.link_at(cell));
     let widget = ScreenWidget::new(&pane.screen)
         .with_defaults(theme.text, theme.background)
-        .with_marks(marks);
+        .with_marks(marks)
+        .with_link(link);
     frame.render_widget(widget, screen);
     // In copy mode, the cursor is copy mode's. Back in the history, the
     // program's cursor's place on the live screen means nothing.
@@ -751,12 +832,19 @@ fn header_notes(app: &App, slot: Slot, session: &SessionInfo, back: usize) -> Ve
     if app.focus() == Focus::Copy(slot) {
         notes.push("copy mode".to_string());
     }
+    if app.resizing() && selected && slot != Slot::Float {
+        notes.push("resizing".to_string());
+    }
     if let Some(grab) = app.grabbed() {
         if grab.from == slot {
             notes.push("moving".to_string());
         } else if grab.over == Some(slot) {
             notes.push("let go to swap".to_string());
         }
+    }
+    if let Some(asking) = &session.asking {
+        let gist = fit(&asking.gist, TASK_NOTE_LENGTH);
+        notes.push(format!("⚠ {} {gist} · y/n/Y", asking.tool));
     }
     let index = app.sessions().iter().position(|s| s.name == session.name);
     let flow_step = index.and_then(|index| app.flow_step_of(index));
@@ -779,23 +867,30 @@ fn header_notes(app: &App, slot: Slot, session: &SessionInfo, back: usize) -> Ve
 const TASK_NOTE_LENGTH: usize = 40;
 
 /// A session's task, for its pane's header: what it was asked to do while
-/// it's open, and how it went, ✓ or ✗, once it's closed.
+/// it's open, that it waits on the user, and how it went, ✓, ✗ or –, once
+/// it's closed.
 fn task_note(session: &SessionInfo) -> Option<String> {
     let task = session.task.as_ref()?;
     let goal = task.goal.lines().next().unwrap_or("");
-    let note = match &task.outcome {
-        None => format!("task: {}", fit(goal, TASK_NOTE_LENGTH)),
-        Some(outcome) => {
-            let mark = if outcome.failed { "✗" } else { "✓" };
-            let said = if outcome.summary.is_empty() {
-                goal
-            } else {
-                &outcome.summary
-            };
-            format!("{mark} {}", fit(said, TASK_NOTE_LENGTH))
+    let mark = match task.state() {
+        TaskState::Running | TaskState::Pending => {
+            return Some(format!("task: {}", fit(goal, TASK_NOTE_LENGTH)));
         }
+        TaskState::Waiting => {
+            return Some(format!(
+                "task waits on you: {}",
+                fit(goal, TASK_NOTE_LENGTH)
+            ));
+        }
+        TaskState::Done => "✓",
+        TaskState::Failed => "✗",
+        TaskState::Cancelled => "–",
     };
-    Some(note)
+    let said = match &task.outcome {
+        Some(outcome) if !outcome.summary.is_empty() => &outcome.summary,
+        _ => goal,
+    };
+    Some(format!("{mark} {}", fit(said, TASK_NOTE_LENGTH)))
 }
 
 /// A pane's header line, `width` columns wide: the session's mark and name,
@@ -911,8 +1006,14 @@ fn draw_footer(frame: &mut Frame, app: &App, panes: &[Pane], look: &Look, area: 
         frame.render_widget(hint_spans(settings_view::HINTS, theme), area);
     } else if let Some(prompt) = app.prompt() {
         draw_prompt(frame, theme, prompt, area);
-    } else if app.issues_view().is_some() {
-        frame.render_widget(hint_spans(ISSUES_HINTS, theme), area);
+    } else if let Some(view) = app.needs_you_view() {
+        draw_notice_or(frame, app.notice(), needs_you::hints(view), theme, area);
+    } else if app.timeline_view().is_some() {
+        draw_notice_or(frame, app.notice(), timeline::HINTS, theme, area);
+    } else if let Some(view) = app.issues_view() {
+        draw_notice_or(frame, app.notice(), issues::hints(view), theme, area);
+    } else if let Some(view) = app.pull_requests_view() {
+        draw_notice_or(frame, app.notice(), pull_requests::hints(view), theme, area);
     } else if let Some(view) = app.backlog_view() {
         draw_backlog_footer(frame, view, theme, area);
     } else if let Some(view) = app.layouts_view() {
@@ -932,10 +1033,30 @@ fn draw_footer(frame: &mut Frame, app: &App, panes: &[Pane], look: &Look, area: 
     } else if let Some(notice) = app.notice() {
         let notice = Line::styled(format!(" {notice}"), Style::new().fg(theme.failed));
         frame.render_widget(notice, area);
+    } else if let Some(away) = app.away_line() {
+        frame.render_widget(away_line(away, theme), area);
     } else {
-        frame.render_widget(hints_line(app, copying, theme, area.width), area);
-        frame.render_widget(keys_hint(app, theme).right_aligned(), area);
+        let right = footer_right(app, theme);
+        let room = usize::from(area.width).saturating_sub(right.width() + 1);
+        frame.render_widget(hints_line(app, copying, theme, area.width, room), area);
+        frame.render_widget(right.right_aligned(), area);
     }
+}
+
+/// What happened while the user was away, `while you were away:` standing
+/// out, and the keys that show more.
+fn away_line<'a>(away: &str, theme: &Theme) -> Line<'a> {
+    let (lead, counts) = away.split_once(": ").unwrap_or((away, ""));
+    let mut spans = vec![
+        Span::styled(
+            format!(" {lead}: "),
+            Style::new().fg(theme.accent).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(counts.to_string(), Style::new().fg(theme.text)),
+        Span::raw("  "),
+    ];
+    spans.extend(hint_spans(&[("a", "timeline"), ("U", "needs you")], theme).spans);
+    Line::from(spans)
 }
 
 /// The viewer of the session the pane at `slot` shows, once it has one.
@@ -981,7 +1102,10 @@ fn draw_view_footer(frame: &mut Frame, app: &App, view: &View, look: &Look, area
     };
     let hints = match view {
         View::Diff(diff) => owned(diff_view::hints(diff)),
-        View::Files(_) => owned(finder::hints()),
+        View::Files(finder) => owned(finder::hints(finder)),
+        View::Tree(tree) => owned(tree_browser::hints(tree)),
+        View::Grep(_) => owned(grep::hints()),
+        View::Branches(switcher) => owned(switcher::hints(switcher)),
         View::Memory(memory) => memory_view::hints(memory),
     };
     let mut spans = vec![Span::raw(" ")];
@@ -1025,6 +1149,7 @@ const SIDEBAR_HINTS: &[(&str, &str)] = &[
     ("d", "diff"),
     ("p", "files"),
     ("t", "tab"),
+    ("R", "resize"),
 ];
 
 /// The sidebar's keys while the tab is zoomed: `j` and `k` choose the
@@ -1048,6 +1173,18 @@ const GATE_HINTS: &[(&str, &str)] = &[
     ("u", "next"),
     ("/", "find"),
     ("d", "diff"),
+];
+
+/// The sidebar's keys while the selected background task asks for a
+/// permission.
+const ASKING_HINTS: &[(&str, &str)] = &[
+    ("y", "allow"),
+    ("n", "deny"),
+    ("Y", "always"),
+    ("enter", "watch"),
+    ("x", "kill"),
+    ("q", "quit"),
+    ("u", "next"),
 ];
 
 /// The sidebar's keys while the selection is on a worktree with no
@@ -1084,12 +1221,23 @@ const LAUNCHER_HINTS: &[(&str, &str)] = &[
     ("esc", "cancel"),
 ];
 
-/// The keys while the issues view is open.
-const ISSUES_HINTS: &[(&str, &str)] = &[
-    ("↑/↓", "select"),
-    ("enter", "start a session on it"),
-    ("esc", "close"),
-];
+/// The footer of a view that leaves it to the app to say things: what's
+/// to be said, or else the view's keys.
+fn draw_notice_or(
+    frame: &mut Frame,
+    notice: Option<&str>,
+    hints: &[(&str, &str)],
+    theme: &Theme,
+    area: Rect,
+) {
+    match notice {
+        Some(notice) => {
+            let notice = Line::styled(format!(" {notice}"), Style::new().fg(theme.failed));
+            frame.render_widget(notice, area);
+        }
+        None => frame.render_widget(hint_spans(hints, theme), area),
+    }
+}
 
 /// The keys while the backlog view is open.
 const BACKLOG_HINTS: &[(&str, &str)] = &[
@@ -1192,26 +1340,50 @@ fn draw_filter(frame: &mut Frame, theme: &Theme, filter: &Filter, matches: usize
 /// The keys that don't go to the program, while a pane has the keyboard.
 const PANE_HINTS: &[(&str, &str)] = &[("ctrl+\\", "sidebar"), ("shift+pgup", "history")];
 
+/// The keys a background task's pane takes, while it has the keyboard.
+const TASK_PANE_HINTS: &[(&str, &str)] = &[
+    ("ctrl+\\", "sidebar"),
+    ("y/n/Y", "answer"),
+    ("ctrl+c", "stop the run"),
+    ("shift+pgup", "history"),
+];
+
+/// The keys in resize mode.
+const RESIZE_HINTS: &[(&str, &str)] = &[
+    ("h/j/k/l", "move a border"),
+    ("=", "even out"),
+    ("esc", "done"),
+    ("shift+arrows", "another pane"),
+];
+
 /// Where the keyboard is, then the keys that matter most there, as many as
-/// fit beside "? keys".
-fn hints_line<'a>(app: &App, copying: Option<&Pane>, theme: &Theme, width: u16) -> Line<'a> {
-    let doing = |what: &str, slot: Slot| {
-        let name = app.pane_session(slot).map_or("", |s| s.name.as_str());
+/// fit in `room`, what the right of the footer leaves.
+fn hints_line<'a>(
+    app: &App,
+    copying: Option<&Pane>,
+    theme: &Theme,
+    width: u16,
+    room: usize,
+) -> Line<'a> {
+    let doing = |what: &str, session: Option<&SessionInfo>| {
+        let name = session.map_or("", |s| s.name.as_str());
         vec![
             Span::styled(format!(" {what} "), Style::new().fg(theme.muted)),
             Span::styled(name.to_string(), Style::new().fg(theme.accent)),
         ]
     };
     let (mut spans, hints) = match app.focus() {
+        Focus::Sidebar if app.resizing() => (doing("resizing", app.selected()), RESIZE_HINTS),
         Focus::Sidebar => (whereabouts(app, theme, width), sidebar_hints(app)),
-        Focus::Pane(slot) => (doing("typing into", slot), PANE_HINTS),
+        Focus::Pane(slot) if app.pane_shows_task(slot) => {
+            (doing("in", app.pane_session(slot)), TASK_PANE_HINTS)
+        }
+        Focus::Pane(slot) => (doing("typing into", app.pane_session(slot)), PANE_HINTS),
         Focus::Copy(slot) => {
             let hints = copying.map_or(&[][..], |pane| copy_mode::hints(&pane.screen));
-            (doing("copying from", slot), hints)
+            (doing("copying from", app.pane_session(slot)), hints)
         }
     };
-    // Room left for "? keys" on the right.
-    let room = usize::from(width).saturating_sub(8);
     for (key, does) in hints {
         let used: usize = spans.iter().map(Span::width).sum();
         let hint = 2 + key.chars().count() + 1 + does.chars().count();
@@ -1234,6 +1406,12 @@ fn hints_line<'a>(app: &App, copying: Option<&Pane>, theme: &Theme, width: u16) 
 fn sidebar_hints(app: &App) -> &'static [(&'static str, &'static str)] {
     if app.selected_empty_worktree().is_some() {
         return EMPTY_WORKTREE_HINTS;
+    }
+    if app
+        .selected()
+        .is_some_and(|session| session.asking.is_some())
+    {
+        return ASKING_HINTS;
     }
     let index = app.selected_index();
     let run = index.and_then(|index| app.flow_step_of(index));
@@ -1284,16 +1462,28 @@ fn selection_place(app: &App) -> Option<String> {
     Some(format!("{place}{}", session.name))
 }
 
-/// "? keys", where `?` opens the list of every key: from the sidebar only,
-/// since in a pane `?` goes to the program.
-fn keys_hint<'a>(app: &App, theme: &Theme) -> Line<'a> {
-    if app.focus() != Focus::Sidebar {
-        return Line::default();
+/// The right of the footer: what background tasks have spent today, in
+/// red past the daily budget, and "? keys", where `?` opens the list of
+/// every key: from the sidebar only, since in a pane `?` goes to the
+/// program.
+fn footer_right<'a>(app: &App, theme: &Theme) -> Line<'a> {
+    let mut spans = Vec::new();
+    if let Some(spending) = app.spending() {
+        let today = format!("${:.2} today", spending.today_usd);
+        let said = if spending.over_budget() {
+            let over = format!("{today} · over ${:.2}", spending.daily_budget_usd);
+            Span::styled(over, Style::new().fg(theme.failed))
+        } else {
+            Span::styled(today, Style::new().fg(theme.muted))
+        };
+        spans.push(said);
+        spans.push(Span::raw("  "));
     }
-    Line::from(vec![
-        Span::styled("?", Style::new().fg(theme.text)),
-        Span::styled(" keys ", Style::new().fg(theme.muted)),
-    ])
+    if app.focus() == Focus::Sidebar && !app.resizing() {
+        spans.push(Span::styled("?", Style::new().fg(theme.text)));
+        spans.push(Span::styled(" keys ", Style::new().fg(theme.muted)));
+    }
+    Line::from(spans)
 }
 
 /// Asks the prompt's question, with the cursor in the answer.
@@ -1387,6 +1577,8 @@ mod tests {
             worktree: None,
             changed: 0,
             task: None,
+            asking: None,
+            reporter: None,
         }
     }
 
@@ -1458,18 +1650,16 @@ mod tests {
     }
 
     #[test]
-    fn the_keys_overlay_draws_over_an_80_by_24_screen() {
+    fn the_keys_overlay_draws_over_an_80_by_24_screen_a_page_at_a_time() {
         let mut app = App::new(None);
         app.on_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
         let text = screen_text_at(&app, 80, 24).join("\n");
-        let expected = [
-            "In the sidebar",
-            "In a pane",
-            "Ctrl+\\",
-            "With the mouse",
-            "any key closes this",
-        ];
-        for on_screen in expected {
+        for on_screen in ["In the sidebar", "select a session", "1/2 · ← → turn"] {
+            assert!(text.contains(on_screen), "{on_screen} isn't on screen");
+        }
+        app.on_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        let text = screen_text_at(&app, 80, 24).join("\n");
+        for on_screen in ["In a pane", "Ctrl+\\", "With the mouse", "2/2"] {
             assert!(text.contains(on_screen), "{on_screen} isn't on screen");
         }
     }
@@ -1490,6 +1680,19 @@ mod tests {
         let text = screen_text(&app);
         assert!(text[0].starts_with(" crystal"), "{}", text[0]);
         assert!(text[0].trim_end().ends_with("1 session"), "{}", text[0]);
+    }
+
+    #[test]
+    fn the_top_bar_names_a_server_that_isn_t_the_default_before_the_count() {
+        let mut app = app_with_three_tabs();
+        app.set_server(Some("work".into()));
+        let text = screen_text(&app);
+        assert!(
+            text[0].trim_end().ends_with("work · 1 session"),
+            "{}",
+            text[0]
+        );
+        assert!(text[0].contains(" 2 review "), "{}", text[0]);
     }
 
     /// An app with one session and three tabs, the second named `review`
@@ -1585,7 +1788,7 @@ mod tests {
     #[test]
     fn a_click_finds_the_tab_under_it() {
         let app = app_with_three_tabs();
-        let areas = Areas::new(Rect::new(0, 0, 80, 24), 0);
+        let areas = Areas::of(&app, Rect::new(0, 0, 80, 24));
         // " 1 " is drawn at columns 10 to 12, " 2 review " at 13 to 22.
         assert_eq!(hit(&areas, &app, 10, 0), Hit::Tab(0));
         assert_eq!(hit(&areas, &app, 18, 0), Hit::Tab(1));
@@ -1597,11 +1800,11 @@ mod tests {
     fn the_summary_counts_the_waiting_only_when_some_wait() {
         let theme = theme();
         let quiet = vec![session("a", State::Running), session("b", State::Running)];
-        assert_eq!(text_of(&summary(&quiet, &theme)), "2 sessions ");
+        assert_eq!(text_of(&summary(&quiet, None, &theme)), "2 sessions ");
 
         let mut waiting = quiet.clone();
         waiting[1].activity = Some(Activity::Waiting);
-        let line = summary(&waiting, &theme);
+        let line = summary(&waiting, None, &theme);
         assert_eq!(text_of(&line), "2 sessions · 1 waiting ");
         let count = line.spans.iter().find(|span| span.content == "1 waiting");
         assert_eq!(count.unwrap().style.fg, Some(theme.waiting));
@@ -1890,7 +2093,7 @@ mod tests {
     #[test]
     fn a_drag_keeps_to_the_edge_of_the_pane_it_started_in() {
         let app = app_with_sessions(1);
-        let areas = Areas::new(Rect::new(0, 0, 80, 24), 0);
+        let areas = Areas::of(&app, Rect::new(0, 0, 80, 24));
         // The screen is at column 29, row 2, 51 by 21.
         let nearest = |column, row| nearest_cell(&areas, &app, Slot::Selected, column, row);
         assert_eq!(nearest(31, 3), Some((1, 2)));
@@ -1901,35 +2104,68 @@ mod tests {
 
     #[test]
     fn the_session_screen_sits_below_its_header() {
-        let areas = Areas::new(Rect::new(0, 0, 80, 24), 0);
+        let areas = Areas::of(&App::new(None), Rect::new(0, 0, 80, 24));
         assert_eq!(areas.top, Rect::new(0, 0, 80, 1));
         assert_eq!(areas.rule, Rect::new(28, 1, 1, 22));
+        assert_eq!(areas.tiles, Rect::new(29, 1, 51, 22));
+        assert_eq!(areas.panes, [areas.tiles], "one pane takes all the room");
         assert_eq!(screen_area(areas.panes[0]), Rect::new(29, 2, 51, 21));
     }
 
     #[test]
-    fn one_pane_takes_the_whole_area() {
-        let area = Rect::new(29, 1, 51, 22);
-        assert_eq!(pane_areas(area, 1), [area]);
-    }
-
-    #[test]
-    fn panes_go_side_by_side_a_rule_apart_when_each_is_wide_enough() {
-        let panes = pane_areas(Rect::new(0, 0, 242, 40), 3);
+    fn panes_go_where_the_tabs_tree_puts_them_a_rule_between_side_by_side() {
+        let mut app = app_with_sessions(3);
+        let screen = Rect::new(0, 0, 200, 24);
+        app.set_tiles(Areas::of(&app, screen).tiles);
+        // 171 columns beside the sidebar: s puts the two side by side, and
+        // `-` splits the selection's pane, on the right, in two.
+        app.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Char('-'), KeyModifiers::NONE));
+        let areas = Areas::of(&app, screen);
         assert_eq!(
-            panes,
+            areas.panes,
             [
-                Rect::new(0, 0, 80, 40),
-                Rect::new(81, 0, 80, 40),
-                Rect::new(162, 0, 80, 40),
+                Rect::new(29, 1, 85, 22),
+                Rect::new(115, 1, 85, 11),
+                Rect::new(115, 12, 85, 11),
             ]
+        );
+        let text = screen_text_at(&app, 200, 24);
+        assert_eq!(text[5].chars().nth(114), Some('│'), "{}", text[5]);
+        // A header line under another pane is the border between them,
+        // but for the name on it.
+        assert_eq!(hit(&areas, &app, 150, 12), Hit::Border { split: 1, at: 12 });
+        assert!(matches!(
+            hit(&areas, &app, 117, 12),
+            Hit::Pane { cell: None, .. }
+        ));
+        assert_eq!(hit(&areas, &app, 114, 5), Hit::Border { split: 0, at: 114 });
+        assert!(matches!(
+            hit(&areas, &app, 150, 1),
+            Hit::Pane { cell: None, .. }
+        ));
+        // A drag goes on following the border it took, wherever it goes.
+        assert_eq!(
+            border_hit(&areas, &app, 0, 60, 20),
+            Hit::Border { split: 0, at: 60 }
+        );
+        assert_eq!(
+            border_hit(&areas, &app, 1, 60, 20),
+            Hit::Border { split: 1, at: 20 }
         );
     }
 
     #[test]
-    fn panes_are_stacked_when_side_by_side_would_be_too_narrow() {
-        let panes = pane_areas(Rect::new(0, 0, 160, 40), 2);
-        assert_eq!(panes, [Rect::new(0, 0, 160, 20), Rect::new(0, 20, 160, 20)]);
+    fn in_resize_mode_the_footer_and_header_say_so() {
+        let mut app = app_with_sessions(2);
+        app.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Char('R'), KeyModifiers::NONE));
+        let text = screen_text_at(&app, 80, 24);
+        assert!(text[1].contains("s0 · selected · resizing"), "{}", text[1]);
+        assert!(text[23].starts_with(" resizing s0"), "{}", text[23]);
+        assert!(text[23].contains("= even out"), "{}", text[23]);
+        assert!(!text[23].contains("? keys"), "{}", text[23]);
     }
 
     #[test]
@@ -1958,7 +2194,7 @@ mod tests {
     #[test]
     fn a_click_finds_the_sidebar_row_under_it() {
         let app = app_with_sessions(3);
-        let areas = Areas::new(Rect::new(0, 0, 80, 24), 0);
+        let areas = Areas::of(&app, Rect::new(0, 0, 80, 24));
         // Row 0 is the top bar; the sidebar's rows start below it.
         assert_eq!(hit(&areas, &app, 5, 0), Hit::Elsewhere);
         assert_eq!(hit(&areas, &app, 5, 1), Hit::SidebarRow(0));
@@ -1970,7 +2206,7 @@ mod tests {
     #[test]
     fn a_click_finds_the_cell_on_the_panes_screen() {
         let app = app_with_sessions(1);
-        let areas = Areas::new(Rect::new(0, 0, 80, 24), 0);
+        let areas = Areas::of(&app, Rect::new(0, 0, 80, 24));
         // The pane starts after the 28-column sidebar and its rule; its
         // screen below the header line, at column 29, row 2.
         assert_eq!(
@@ -1996,13 +2232,14 @@ mod tests {
     fn a_click_finds_which_pane_when_there_are_splits() {
         let mut app = app_with_sessions(2);
         app.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
-        // At 80 columns the two panes are stacked: the selection's on top.
-        let areas = Areas::new(Rect::new(0, 0, 80, 24), 1);
+        // At 80 columns the two panes are stacked: the session split off
+        // stays on top, where it was, and the selection's pane goes below.
+        let areas = Areas::of(&app, Rect::new(0, 0, 80, 24));
         let below = areas.panes[1];
         let Hit::Pane { slot, .. } = hit(&areas, &app, 40, below.y + 2) else {
             panic!("not a pane");
         };
-        assert_eq!(slot, Slot::Split(0));
+        assert_eq!(slot, Slot::Selected);
     }
 
     #[test]
@@ -2010,20 +2247,21 @@ mod tests {
         let mut app = app_with_sessions(2);
         app.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
         app.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
-        app.on_key(KeyEvent::new(KeyCode::Char('L'), KeyModifiers::NONE));
-        // The split's on top now, the selection's pane below it.
-        let areas = Areas::new(Rect::new(0, 0, 80, 24), 1);
+        app.on_key(KeyEvent::new(KeyCode::Char('K'), KeyModifiers::NONE));
+        // The selection's pane is on top now, the split below it.
+        let areas = Areas::of(&app, Rect::new(0, 0, 80, 24));
         let on_top = areas.panes[0];
         let Hit::Pane { slot, .. } = hit(&areas, &app, 40, on_top.y + 2) else {
             panic!("not a pane");
         };
-        assert_eq!(slot, Slot::Split(0));
-        let header = hit(&areas, &app, 40, areas.panes[1].y);
-        let selections = Hit::Pane {
-            slot: Slot::Selected,
+        assert_eq!(slot, Slot::Selected);
+        // Its name on the header line below takes the split, to move it.
+        let header = hit(&areas, &app, 31, areas.panes[1].y);
+        let split = Hit::Pane {
+            slot: Slot::Split(0),
             cell: None,
         };
-        assert_eq!(header, selections);
+        assert_eq!(header, split);
     }
 
     #[test]
@@ -2073,7 +2311,7 @@ mod tests {
     fn a_long_sidebar_scrolls_to_the_selection_and_clicks_follow_it() {
         let mut app = app_with_sessions(30);
         app.select("s29");
-        let areas = Areas::new(Rect::new(0, 0, 80, 12), 0);
+        let areas = Areas::of(&app, Rect::new(0, 0, 80, 12));
         // Between the top bar and the footer, 10 rows fit: the selection is
         // drawn on the last of them, screen row 10.
         let last_visible = hit(&areas, &app, 5, 10);

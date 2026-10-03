@@ -52,6 +52,11 @@ pub struct FileDiff {
     pub added: usize,
     pub removed: usize,
     pub body: Body,
+    /// A hash of the file's part of the patch, or of a new file's content:
+    /// it changes whenever the file changes again, which is what takes a
+    /// reviewed mark off it. git's `index` line names the file's content,
+    /// so a binary file's changes count too.
+    pub hash: u64,
 }
 
 /// What there is to show of a file's changes.
@@ -125,6 +130,7 @@ pub fn new_file(path: &str, content: &[u8]) -> FileDiff {
         added: 0,
         removed: 0,
         body: Body::Binary,
+        hash: hash(FNV_OFFSET, content),
     };
     let start = &content[..content.len().min(BINARY_CHECK)];
     if start.contains(&0) {
@@ -155,6 +161,20 @@ pub fn new_file(path: &str, content: &[u8]) -> FileDiff {
     file
 }
 
+/// Where an FNV-1a hash starts.
+const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+
+/// `hash` taken on over `bytes`, and a line's end after them: FNV-1a,
+/// written out here because reviewed marks are kept from one run to the
+/// next, and std's hasher may change between Rust releases.
+fn hash(mut hash: u64, bytes: &[u8]) -> u64 {
+    for byte in bytes.iter().chain(b"\n") {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    hash
+}
+
 /// One file's part of the patch, while it's being read.
 struct Reading {
     file: FileDiff,
@@ -182,6 +202,7 @@ impl Reading {
                 added: 0,
                 removed: 0,
                 body: Body::Hunks(Vec::new()),
+                hash: hash(FNV_OFFSET, header.as_bytes()),
             },
             hunks: Vec::new(),
             next_old: 0,
@@ -190,6 +211,7 @@ impl Reading {
     }
 
     fn read(&mut self, line: &str) {
+        self.file.hash = hash(self.file.hash, line.as_bytes());
         if let Some(header) = line.strip_prefix("@@ ") {
             self.start_hunk(header);
         } else if let Some(hunk) = self.hunks.last_mut() {
@@ -691,6 +713,24 @@ Binary files a/logo.png and b/logo.png differ
     fn a_file_with_nothing_to_show_has_no_rows() {
         let files = files();
         assert!(rows(&files[4], Layout::Unified).is_empty());
+    }
+
+    #[test]
+    fn a_files_hash_changes_with_its_part_of_the_patch_alone() {
+        let before = files();
+        let binary_changed = PATCH.replace(
+            "index 1111111..2222222 100644\nBinary",
+            "index 1111111..3333333 100644\nBinary",
+        );
+        let after = parse(&binary_changed);
+        assert_eq!(before[0].hash, after[0].hash);
+        assert_ne!(before[4].hash, after[4].hash);
+        // Kept from one run to the next, so it mustn't drift.
+        assert_eq!(hash(FNV_OFFSET, b""), 0xaf63_c74c_8601_c8dd);
+        assert_ne!(
+            new_file("a.txt", b"one\n").hash,
+            new_file("a.txt", b"two\n").hash
+        );
     }
 
     #[test]

@@ -34,12 +34,13 @@ fn report(socket: &Path, agent: &str) -> Result<()> {
     // id finds the session even after a rename. Only programs started
     // before sessions had ids go without one.
     let id = std::env::var("CRYSTAL_SESSION_ID").ok();
-    let (event, conversation) = match agent {
+    let (event, conversation, prompt) = match agent {
         "claude" => (
             agents::claude_event(&input),
             agents::claude_conversation(&input),
+            agents::claude_prompt(&input),
         ),
-        _ => (None, None),
+        _ => (None, None, None),
     };
     let Some(event) = event else {
         return Ok(());
@@ -49,6 +50,7 @@ fn report(socket: &Path, agent: &str) -> Result<()> {
         id,
         event,
         conversation,
+        prompt,
     };
     if let Some(Response::Remind { text }) = client::ask(socket, &report, false)?
         && agent == "claude"

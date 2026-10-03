@@ -8,6 +8,7 @@
 //! installed, and the two may not understand each other: the daemon checks
 //! the version before it reads the request, and says what to do.
 
+use crate::events::{Event, Filter, Since};
 use crate::flow_run::FlowRun;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -39,6 +40,20 @@ pub enum Request {
         /// The conversation the agent is in, when its hooks say.
         #[serde(default)]
         conversation: Option<Conversation>,
+        /// What the user asked, when the event is a prompt sent: the first
+        /// names a session crystal named after its program.
+        #[serde(default)]
+        prompt: Option<String>,
+    },
+    /// What an agent says about itself with `crystal report`. A program in
+    /// a session says which by its `id`; from outside, it's the session's
+    /// `name`.
+    ReportAgent {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(default)]
+        name: Option<String>,
+        report: AgentReport,
     },
     /// Give a session another name.
     Rename {
@@ -67,6 +82,22 @@ pub enum Request {
     Result {
         name: String,
     },
+    /// Answer the permission a background task is asking for. `task` is
+    /// the task's id or its session's name; `message` is what Claude is
+    /// told when it's denied.
+    Answer {
+        task: String,
+        answer: Answer,
+        #[serde(default)]
+        message: Option<String>,
+    },
+    /// Stop the run a background task is in the middle of, leaving the
+    /// task open.
+    Interrupt {
+        task: String,
+    },
+    /// What background tasks have spent today, and the daily budget.
+    Spending,
     /// Close a session's task, done or failed. A program in a session says
     /// which by its `id`; from outside, it's the session's `name`.
     Close {
@@ -76,6 +107,20 @@ pub enum Request {
         name: Option<String>,
         failed: bool,
         summary: String,
+        /// Files in the session's worktree to keep with the task, by their
+        /// absolute paths: the daemon checks and copies them itself.
+        #[serde(default)]
+        artifacts: Vec<PathBuf>,
+    },
+    /// Add a note to the handoff file of a session's worktree, for the
+    /// sessions after it there. `id` and `name` say which session, as for
+    /// [`Request::Close`].
+    Handoff {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(default)]
+        name: Option<String>,
+        note: String,
     },
     /// Have the distiller read what the session called `name` did, now,
     /// and keep what a later session would need in its project's memory.
@@ -98,11 +143,34 @@ pub enum Request {
         limit: usize,
     },
     /// The tasks of the project `dir` is in, or of every project with
-    /// `all`: those still open, then those closed, the latest first.
+    /// `all`: those still open, then those waiting to start, then those
+    /// closed, the latest first.
     Tasks {
         dir: PathBuf,
         #[serde(default)]
         all: bool,
+    },
+    /// Make a task that waits to be started: `crystal tasks new
+    /// --no-launch`.
+    AddTask(PendingTask),
+    /// Start the task with this id, which is waiting to, from the client's
+    /// environment.
+    StartTask {
+        id: u64,
+        env: BTreeMap<String, String>,
+    },
+    /// One task, by its id or its session's name.
+    ShowTask {
+        task: String,
+    },
+    /// Close a task as cancelled, and stop the session working on it.
+    CancelTask {
+        task: String,
+    },
+    /// What happened to a task: how it stands, and its session's
+    /// transcript while the session is there.
+    TaskLog {
+        task: String,
     },
     /// The backlog of the project `dir` is in: what's open, or with `all`,
     /// what's done too.
@@ -134,12 +202,30 @@ pub enum Request {
     BacklogCounts {
         projects: Vec<PathBuf>,
     },
-    /// A client made a worktree, or removed one, for the plugins that
-    /// listen for that.
-    Worktree {
-        path: PathBuf,
-        branch: Option<String>,
-        created: bool,
+    /// Something that happened outside the daemon, like a worktree a
+    /// client made or an entry it added to memory: the daemon numbers it,
+    /// writes it in the event log, and passes it on to whoever listens.
+    Emit {
+        event: Box<Event>,
+    },
+    /// Turn the connection into a stream of the events `filter` takes, one
+    /// JSON line each, after [`Response::Subscribed`]. With `since`, the
+    /// events the log has from then come first, so a client can catch up
+    /// without a gap.
+    Subscribe {
+        #[serde(default)]
+        filter: Filter,
+        #[serde(default)]
+        since: Option<Since>,
+    },
+    /// Wait until a line on a session's screen, or just scrolled off it,
+    /// matches the regular expression `pattern`, or `timeout_ms` has
+    /// passed.
+    WaitOutput {
+        name: String,
+        pattern: String,
+        #[serde(default)]
+        timeout_ms: Option<u64>,
     },
     /// Start a run of the flow called `flow` on `goal`, from `cwd`. Its
     /// steps' tasks start from the client's environment, `env`.
@@ -165,6 +251,24 @@ pub enum Request {
     /// a restart cut it short.
     RetryFlow {
         run: String,
+    },
+    /// Cancel the run called `run`: its step's open task is cancelled and
+    /// its session stopped, and the run goes no further.
+    CancelFlow {
+        run: String,
+    },
+    /// Carry out a layout command in the TUI used last, and answer with the
+    /// layout it comes to: `crystal tab`, `crystal pane` and `crystal
+    /// layout`.
+    Layout(crate::layout::Order),
+    /// A TUI offers to carry out layout commands, saying when it was last
+    /// used, in milliseconds since the Unix epoch. After
+    /// [`Response::Done`], the daemon writes it each one as a
+    /// [`crate::layout::Relayed`] line, and it writes back
+    /// [`crate::layout::Report`] lines. A handover cuts it, and the TUI
+    /// offers again.
+    TakeLayoutOrders {
+        used: u64,
     },
     /// What's on a session's screen, as text.
     Read {
@@ -193,11 +297,24 @@ pub enum Request {
         #[serde(default)]
         keep_sessions: bool,
     },
+    /// Hand the daemon over to the crystal at `exe`, which carries on in its
+    /// place, its sessions running on (see [`crate::handover`]). `format`
+    /// is the kind of handover that crystal reads: a daemon that writes
+    /// another refuses, and is restarted cold.
+    ///
+    /// Like a shutdown, every version must keep this one as it is, and
+    /// every daemon takes it whatever the version of the crystal sending
+    /// it: handing over is how a daemon becomes another version.
+    Handover {
+        exe: PathBuf,
+        format: u32,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct NewSession {
-    /// `None` names the session after its program.
+    /// `None` names the session for its task, or else after its program
+    /// until its first prompt names it.
     pub name: Option<String>,
     pub cwd: PathBuf,
     pub command: Vec<String>,
@@ -215,7 +332,8 @@ pub struct NewSession {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct NewTask {
-    /// `None` names the task "task", with a number added if that's taken.
+    /// `None` names the task for its prompt, or else "task", with a number
+    /// added if that's taken.
     pub name: Option<String>,
     pub cwd: PathBuf,
     pub spec: TaskSpec,
@@ -224,6 +342,48 @@ pub struct NewTask {
     /// The backlog item the task is for, which closing it done ticks.
     #[serde(default)]
     pub backlog: Option<u64>,
+}
+
+/// A task made to start later: what it's to do, where, and how it starts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingTask {
+    /// Given by the daemon as it takes the task.
+    #[serde(default)]
+    pub id: u64,
+    pub goal: String,
+    pub cwd: PathBuf,
+    /// The session's name, once it starts: `None` names it for its goal,
+    /// or else after its program.
+    #[serde(default)]
+    pub name: Option<String>,
+    pub start: TaskStart,
+    #[serde(default)]
+    pub backlog: Option<u64>,
+    /// When it was made, in seconds since the Unix epoch.
+    #[serde(default)]
+    pub created: u64,
+}
+
+/// How a task starts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TaskStart {
+    /// An agent in a terminal: this command, with the goal in it as the
+    /// agent's first prompt.
+    Agent { command: Vec<String> },
+    /// In the background, `claude -p` with these arguments.
+    Background { args: Vec<String> },
+}
+
+/// An answer to the permission a background task asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Answer {
+    /// Yes, this once.
+    Allow,
+    Deny,
+    /// Yes, and a rule for calls like it, so they're not asked about again.
+    Always,
 }
 
 /// What a task is asked to do: the prompt it starts with, and arguments
@@ -257,6 +417,9 @@ pub struct TaskResult {
 pub enum Response {
     Created {
         name: String,
+        /// The id of the task the session was started with, if it was.
+        #[serde(default)]
+        task: Option<u64>,
     },
     Sessions {
         sessions: Vec<SessionInfo>,
@@ -277,8 +440,21 @@ pub enum Response {
     Result(TaskResult),
     /// Tasks, as `Request::Tasks` asks for them.
     Tasks {
-        tasks: Vec<TaskRecord>,
+        tasks: Vec<TaskView>,
     },
+    /// The id a new task got.
+    TaskAdded {
+        id: u64,
+    },
+    /// One task, as `Request::ShowTask` asks for it.
+    Task(TaskView),
+    /// What happened to a task: how it stands, and its session's
+    /// transcript, while the session is still there.
+    TaskLog {
+        task: TaskView,
+        transcript: Option<Vec<String>>,
+    },
+    Spending(Spending),
     /// A project's backlog.
     Backlog(Backlog),
     /// The number a new backlog item got.
@@ -310,6 +486,22 @@ pub enum Response {
     Remind {
         text: String,
     },
+    /// The stream of events has started: the ones from the log come
+    /// first, those up to `seq`, then each new one as it happens.
+    Subscribed {
+        seq: u64,
+    },
+    /// The line on a session's screen that matched.
+    Matched {
+        line: String,
+    },
+    /// The daemon a handover was asked of has been handed over: it runs the
+    /// new crystal now, which says so, with how many sessions carried on.
+    HandedOver {
+        sessions: usize,
+    },
+    /// A TUI's tabs and their panes.
+    Layout(crate::layout::Layout),
     Done,
     Error {
         message: String,
@@ -346,6 +538,90 @@ pub struct SessionInfo {
     /// went.
     #[serde(default)]
     pub task: Option<TaskInfo>,
+    /// The permission a background task is waiting on the user for.
+    #[serde(default)]
+    pub asking: Option<Asking>,
+    /// The agent that says what it's doing itself, with `crystal report`,
+    /// while it holds the session.
+    #[serde(default)]
+    pub reporter: Option<Reporter>,
+}
+
+/// An agent that says what it's doing itself, with `crystal report`, and
+/// how to pick its session up again after a restart.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Reporter {
+    /// The name it gave, which is what's in front in the session.
+    pub agent: String,
+    /// What it said with its last report, like what it waits on the user
+    /// for.
+    #[serde(default)]
+    pub message: Option<String>,
+    /// The command that picks its session up again after a restart.
+    #[serde(default)]
+    pub resume: Option<Vec<String>>,
+}
+
+/// What an agent says about itself with `crystal report`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AgentReport {
+    /// It's doing `state`, which takes the session's status over from
+    /// crystal's own reading of it. `None` for the agent keeps the name it
+    /// gave before; `resume`, the command that picks its session up again.
+    State {
+        #[serde(default)]
+        agent: Option<String>,
+        state: Activity,
+        #[serde(default)]
+        message: Option<String>,
+        #[serde(default)]
+        resume: Option<Vec<String>>,
+    },
+    /// Only the command that picks its session up again, from an agent
+    /// that holds the session.
+    Resume {
+        #[serde(default)]
+        agent: Option<String>,
+        argv: Vec<String>,
+    },
+    /// It lets go of the session: crystal reads what the session does for
+    /// itself again, and forgets the agent's name and command.
+    Release,
+}
+
+/// A permission a background task's Claude asks for: the tool, and what
+/// it's asked to do with it, like `Bash` and `cargo test`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Asking {
+    pub tool: String,
+    pub gist: String,
+}
+
+/// What background tasks have spent today, by Claude's own count, and the
+/// daily budget, if there is one.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Spending {
+    pub today_usd: f64,
+    /// 0 for none.
+    pub daily_budget_usd: f64,
+}
+
+impl Spending {
+    pub fn over_budget(&self) -> bool {
+        self.daily_budget_usd > 0.0 && self.today_usd >= self.daily_budget_usd
+    }
+}
+
+impl SessionInfo {
+    /// The one word `ls` shows for it: what its agent is doing, when it
+    /// runs one that says, or else whether it's running or how it ended.
+    pub fn status(&self) -> String {
+        match (&self.state, self.activity) {
+            (State::Running, Some(activity)) => activity.to_string(),
+            (state, _) => state.to_string(),
+        }
+    }
 }
 
 /// What's in front in a session's terminal: the program its keys go to.
@@ -388,6 +664,10 @@ impl Front {
 /// closed, how that went.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskInfo {
+    /// Its number, which `crystal tasks` shows as `t12`. `None` for a task
+    /// from before tasks had one.
+    #[serde(default)]
+    pub id: Option<u64>,
     /// What the agent was asked to do.
     pub goal: String,
     /// Whether it runs in the background, without a terminal.
@@ -396,27 +676,107 @@ pub struct TaskInfo {
     /// The backlog item it's for, which closing it done ticks.
     #[serde(default)]
     pub backlog: Option<u64>,
+    /// Its agent's turn ended with the task still open: it's asking the
+    /// user something.
+    #[serde(default)]
+    pub waiting: bool,
+    /// When it was made, in seconds since the Unix epoch.
+    #[serde(default)]
+    pub created: u64,
     /// `None` while the task is open.
     #[serde(default)]
     pub outcome: Option<TaskOutcome>,
+}
+
+impl TaskInfo {
+    pub fn state(&self) -> TaskState {
+        match &self.outcome {
+            Some(outcome) => outcome.state(),
+            None if self.waiting => TaskState::Waiting,
+            None => TaskState::Running,
+        }
+    }
+
+    pub fn is_open(&self) -> bool {
+        self.outcome.is_none()
+    }
 }
 
 /// How a task went, once it's closed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskOutcome {
     pub failed: bool,
+    /// The user cancelled it, or killed its session while it was open.
+    #[serde(default)]
+    pub cancelled: bool,
     /// A line on what was done, or why it couldn't be.
     pub summary: String,
     /// When it was closed, in seconds since the Unix epoch.
     pub closed: u64,
 }
 
-/// A task as `crystal tasks` lists it: one still open in a session, or one
-/// closed, from its project's history.
+impl TaskOutcome {
+    /// An outcome for a task that has just come to `state`: done, failed
+    /// or cancelled.
+    pub fn new(state: TaskState, summary: &str, closed: u64) -> TaskOutcome {
+        TaskOutcome {
+            failed: state == TaskState::Failed,
+            cancelled: state == TaskState::Cancelled,
+            summary: summary.trim().to_string(),
+            closed,
+        }
+    }
+
+    pub fn state(&self) -> TaskState {
+        if self.cancelled {
+            TaskState::Cancelled
+        } else if self.failed {
+            TaskState::Failed
+        } else {
+            TaskState::Done
+        }
+    }
+}
+
+/// How a task stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskState {
+    /// Made to start later, with `--no-launch`: nothing works on it yet.
+    Pending,
+    /// Its session is working on it.
+    Running,
+    /// Its agent's turn ended with it still open: it's asking the user
+    /// something.
+    Waiting,
+    Done,
+    Failed,
+    /// The user cancelled it, or killed its session while it was open.
+    Cancelled,
+}
+
+impl TaskState {
+    pub fn word(self) -> &'static str {
+        match self {
+            TaskState::Pending => "pending",
+            TaskState::Running => "running",
+            TaskState::Waiting => "waiting",
+            TaskState::Done => "done",
+            TaskState::Failed => "failed",
+            TaskState::Cancelled => "cancelled",
+        }
+    }
+}
+
+/// A task as `crystal tasks` lists it: one still open in a session, one
+/// waiting to start, or one closed, from its project's history.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskRecord {
+    #[serde(default)]
+    pub id: Option<u64>,
     pub goal: String,
-    /// The session it ran in, under the name it had then.
+    /// The session it ran in, under the name it had then. Empty for a task
+    /// that hasn't started.
     pub session: String,
     pub project: String,
     #[serde(default)]
@@ -425,9 +785,106 @@ pub struct TaskRecord {
     pub background: bool,
     #[serde(default)]
     pub backlog: Option<u64>,
+    /// Made with `--no-launch`, and not started yet.
+    #[serde(default)]
+    pub pending: bool,
+    #[serde(default)]
+    pub waiting: bool,
+    #[serde(default)]
+    pub created: u64,
     /// `None` while it's open.
     #[serde(default)]
     pub outcome: Option<TaskOutcome>,
+    /// The files kept with it as it closed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifacts: Vec<Artifact>,
+}
+
+impl TaskRecord {
+    pub fn state(&self) -> TaskState {
+        match &self.outcome {
+            Some(outcome) => outcome.state(),
+            None if self.pending => TaskState::Pending,
+            None if self.waiting => TaskState::Waiting,
+            None => TaskState::Running,
+        }
+    }
+}
+
+/// A task as the CLI shows it: what's kept of it, how it stands, and, while
+/// a session works on it, what that session is doing.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaskView {
+    #[serde(flatten)]
+    pub record: TaskRecord,
+    pub state: TaskState,
+    /// How its session stands, while the session is still there.
+    #[serde(default)]
+    pub session_state: Option<State>,
+    /// The permission a background task is waiting on the user for.
+    #[serde(default)]
+    pub asking: Option<Asking>,
+    /// What a background task has cost so far, in US dollars.
+    #[serde(default)]
+    pub cost_usd: Option<f64>,
+}
+
+impl TaskView {
+    /// A task that no session is working on now.
+    pub fn of_record(record: TaskRecord) -> TaskView {
+        TaskView {
+            state: record.state(),
+            record,
+            session_state: None,
+            asking: None,
+            cost_usd: None,
+        }
+    }
+}
+
+/// A file kept with a task as it closed: copied out of its worktree into
+/// crystal's state directory, so it outlives the worktree.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Artifact {
+    pub kind: ArtifactKind,
+    /// The copy's name, which is the file's own unless two had one name.
+    pub name: String,
+    /// Where the copy is.
+    pub path: PathBuf,
+    pub bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactKind {
+    /// A file `crystal done --artifact` named.
+    File,
+    /// The worktree's handoff file as it was when the task closed.
+    Handoff,
+}
+
+impl ArtifactKind {
+    pub fn word(self) -> &'static str {
+        match self {
+            ArtifactKind::File => "file",
+            ArtifactKind::Handoff => "handoff",
+        }
+    }
+
+    /// The kind called `word`, as [`ArtifactKind::word`] says it.
+    pub fn named(word: &str) -> Option<ArtifactKind> {
+        [ArtifactKind::File, ArtifactKind::Handoff]
+            .into_iter()
+            .find(|kind| kind.word() == word)
+    }
+}
+
+/// How a task is shown: `t12`.
+pub fn task_label(id: Option<u64>) -> String {
+    match id {
+        Some(id) => format!("t{id}"),
+        None => "-".to_string(),
+    }
 }
 
 /// One project's backlog: things to do later.
@@ -590,6 +1047,10 @@ pub struct Incoming {
 impl Incoming {
     pub fn is_shutdown(&self) -> bool {
         self.message["type"] == "shutdown"
+    }
+
+    pub fn is_handover(&self) -> bool {
+        self.message["type"] == "handover"
     }
 
     /// Reads the request, once its version is known to match.
@@ -769,6 +1230,18 @@ mod tests {
         };
         send_request(&mut wire, &shutdown).unwrap();
         assert!(recv_request(&wire[..]).unwrap().unwrap().is_shutdown());
+    }
+
+    #[test]
+    fn a_handover_is_known_as_one_whatever_the_version() {
+        let line = br#"{"type":"handover","exe":"/bin/crystal","format":1,"version":"9.0.0"}"#;
+        let incoming = recv_request(&line[..]).unwrap().unwrap();
+        assert!(incoming.is_handover());
+        assert!(!incoming.is_shutdown());
+        let Request::Handover { exe, format } = incoming.request().unwrap() else {
+            panic!("not a handover");
+        };
+        assert_eq!((exe, format), (PathBuf::from("/bin/crystal"), 1));
     }
 
     #[test]

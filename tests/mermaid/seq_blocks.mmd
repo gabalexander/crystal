@@ -1,0 +1,23 @@
+sequenceDiagram
+    participant C as client
+    participant S as server
+    loop every 5s
+        C->>S: poll
+        alt has work
+            S-->>C: job
+        else idle
+            S-->>C: nothing
+        end
+    end
+    opt shutting down
+        C->>S: bye
+    end
+    par fan out
+        S->>C: event A
+    and
+        S->>C: event B
+    end
+    activate S
+    Note right of S: busy
+    deactivate S
+    Note left of C: done

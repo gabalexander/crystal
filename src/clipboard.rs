@@ -17,10 +17,7 @@ const PROGRAM_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Puts `text` on the clipboard.
 pub fn copy(text: &str) -> Result<()> {
-    if !over_ssh(
-        std::env::var_os("SSH_CONNECTION").as_deref(),
-        std::env::var_os("SSH_TTY").as_deref(),
-    ) {
+    if !remote() {
         for program in programs(cfg!(target_os = "macos"), &has) {
             if run(program, text).is_ok() {
                 return Ok(());
@@ -34,7 +31,15 @@ pub fn copy(text: &str) -> Result<()> {
 }
 
 /// Whether crystal runs on another machine than the user's, over ssh: its
-/// clipboard programs would fill that machine's clipboard, not theirs.
+/// clipboard programs would fill that machine's clipboard, not theirs, and
+/// a browser it opened would open there.
+pub fn remote() -> bool {
+    over_ssh(
+        std::env::var_os("SSH_CONNECTION").as_deref(),
+        std::env::var_os("SSH_TTY").as_deref(),
+    )
+}
+
 fn over_ssh(connection: Option<&OsStr>, tty: Option<&OsStr>) -> bool {
     connection.is_some() || tty.is_some()
 }

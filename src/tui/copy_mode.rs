@@ -1,7 +1,7 @@
 //! Copy mode: vi's keys move a cursor over a pane's screen and back
 //! through its history, select from it, and search it, and what's selected
-//! goes to the clipboard. The program in the pane goes on running, and its
-//! output on showing. Kept apart from I/O: the keys work on the pane's
+//! goes to the clipboard; `o` opens the link under the cursor. The program
+//! in the pane goes on running, and its output on showing. Kept apart from I/O: the keys work on the pane's
 //! screen, and say what's to be copied.
 
 use super::text_input::TextInput;
@@ -33,6 +33,8 @@ pub enum Outcome {
     Leave,
     /// Put this on the clipboard; copy mode is over.
     Copy(String),
+    /// Open this link; copy mode is over.
+    Open(String),
     /// Tell the user this.
     Say(String),
 }
@@ -75,6 +77,13 @@ impl CopyMode {
                     return Outcome::Say("this line is empty".into());
                 }
                 return Outcome::Copy(line);
+            }
+            KeyCode::Char('o') => {
+                let link = screen.copy_cursor().and_then(|cell| screen.link_at(cell));
+                return match link {
+                    Some(link) => Outcome::Open(link.url),
+                    None => Outcome::Say("there's no link under the cursor".into()),
+                };
             }
             KeyCode::Char('/') => self.open_prompt(true),
             KeyCode::Char('?') => self.open_prompt(false),
@@ -199,6 +208,7 @@ pub fn hints(screen: &vt::Screen) -> &'static [(&'static str, &'static str)] {
             ("n/N", "next"),
             ("Y", "copy line"),
             ("q", "leave"),
+            ("o", "open link"),
         ]
     }
 }
@@ -344,6 +354,20 @@ mod tests {
         assert_eq!(press(&mut copy, &mut screen, "\x1b"), Outcome::Stay);
         assert!(!screen.searched());
         assert_eq!(press(&mut copy, &mut screen, "\x1b"), Outcome::Leave);
+    }
+
+    #[test]
+    fn o_opens_the_link_under_the_cursor() {
+        let mut screen = vt::Screen::new(3, 40);
+        screen.process(b"docs at https://example.com/docs\r\n");
+        screen.start_copying();
+        let mut copy = CopyMode::default();
+        assert_eq!(
+            press(&mut copy, &mut screen, "o"),
+            Outcome::Say("there's no link under the cursor".into())
+        );
+        let outcome = press(&mut copy, &mut screen, "kWWo");
+        assert_eq!(outcome, Outcome::Open("https://example.com/docs".into()));
     }
 
     #[test]

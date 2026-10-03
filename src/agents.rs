@@ -1,17 +1,22 @@
 //! What crystal knows about particular agents: how to launch one so that it
-//! reports what it's doing, and how to read what it reports. Any other
-//! program runs exactly as it was asked for.
+//! reports what it's doing and hears crystal's notes, and how to read what
+//! it reports. Any other program runs exactly as it was asked for.
 //!
 //! Claude Code reports through hooks: commands it runs on events like a
 //! prompt being sent or a turn ending. crystal adds its own with
 //! `--settings`, so the user's settings files are never touched, and its
 //! hooks run alongside any the user has.
 
+use crate::catalog;
 use crate::codex;
 use crate::protocol::{AgentEvent, Conversation};
 use crate::shell;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
+
+/// The most a first prompt may be with crystal's notes at its top:
+/// docket's limit for a starting prompt.
+const FIRST_PROMPT_BYTES: usize = 16 * 1024;
 
 /// The Claude Code hook events crystal listens to; [`claude_event`] says
 /// what each one means.
@@ -44,7 +49,9 @@ pub const ABOUT_CRYSTAL: &str = "You're running inside crystal, the terminal wor
 ///
 /// `instructions` are what crystal tells the agent on top of what it was
 /// asked, each a paragraph: Claude Code gets them added to its system
-/// prompt. Other agents have no such option, and go without.
+/// prompt, and an agent with no option for them at the top of its first
+/// prompt, when it's given one. Codex gets them as its developer
+/// instructions, from [`codex::with_instructions`].
 pub fn argv(
     command: &[String],
     crystal: &Path,
@@ -52,14 +59,14 @@ pub fn argv(
     task: Option<&str>,
     instructions: &[String],
 ) -> Vec<String> {
-    if program_name(command) == Some("codex")
-        && let Some(id) = resume
-        && let Some(argv) = codex::resume_argv(command, id)
-    {
-        return argv;
-    }
-    if program_name(command) != Some("claude") {
-        return command.to_vec();
+    match program_name(command) {
+        Some("claude") => {}
+        Some("codex") => {
+            return resume
+                .and_then(|id| codex::resume_argv(command, id))
+                .unwrap_or_else(|| command.to_vec());
+        }
+        _ => return in_first_prompt(command, instructions),
     }
     let mut argv = vec![
         command[0].clone(),
@@ -145,6 +152,32 @@ pub fn with_instructions(args: &[String], instructions: &[String]) -> Vec<String
     with
 }
 
+/// `command` with crystal's `instructions` at the top of its agent's first
+/// prompt, for an agent with no other way to be told them. Past
+/// [`FIRST_PROMPT_BYTES`] they're left out from the last, what the memory
+/// has first. A command with no first prompt to find, like any program
+/// crystal doesn't know, stays as it is.
+fn in_first_prompt(command: &[String], instructions: &[String]) -> Vec<String> {
+    let mut command = command.to_vec();
+    let Some(at) = catalog::first_prompt_at(&command) else {
+        return command;
+    };
+    let size = |notes: &[String]| -> usize {
+        let notes: usize = notes.iter().map(|note| note.len() + 2).sum();
+        notes + command[at].len()
+    };
+    let mut notes = instructions;
+    while !notes.is_empty() && size(notes) > FIRST_PROMPT_BYTES {
+        notes = &notes[..notes.len() - 1];
+    }
+    // Where the notes come from says nothing on its own.
+    if notes.is_empty() || notes == [ABOUT_CRYSTAL] {
+        return command;
+    }
+    command[at] = format!("{}\n\n{}", notes.join("\n\n"), command[at]);
+    command
+}
+
 /// The conversation a Claude Code hook's input names, if it does.
 pub fn claude_conversation(input: &Value) -> Option<Conversation> {
     let id = input["session_id"].as_str()?;
@@ -153,6 +186,15 @@ pub fn claude_conversation(input: &Value) -> Option<Conversation> {
         id: id.to_string(),
         transcript,
     })
+}
+
+/// What the user asked, when a Claude Code hook's input is for a prompt
+/// they sent.
+pub fn claude_prompt(input: &Value) -> Option<String> {
+    if input["hook_event_name"] != "UserPromptSubmit" {
+        return None;
+    }
+    input["prompt"].as_str().map(String::from)
 }
 
 /// Claude's arguments without its first prompt, for a conversation that
@@ -345,6 +387,79 @@ mod tests {
         assert_eq!(with_options(other.clone(), &options), other);
     }
 
+    fn notes(said: &[&str]) -> Vec<String> {
+        let mut notes = vec![ABOUT_CRYSTAL.to_string()];
+        notes.extend(said.iter().map(|note| note.to_string()));
+        notes
+    }
+
+    #[test]
+    fn an_agent_with_no_option_for_notes_hears_them_atop_its_first_prompt() {
+        let crystal = Path::new("/bin/crystal");
+        let notes = notes(&["About the task.", "What was learned."]);
+        let told = format!("{ABOUT_CRYSTAL}\n\nAbout the task.\n\nWhat was learned.\n\nfix it");
+        let gemini = argv(
+            &command(&["gemini", "-i", "fix it"]),
+            crystal,
+            None,
+            None,
+            &notes,
+        );
+        assert_eq!(gemini, ["gemini", "-i", told.as_str()]);
+        let cursor = argv(
+            &command(&["cursor-agent", "--", "fix it"]),
+            crystal,
+            None,
+            None,
+            &notes,
+        );
+        assert_eq!(cursor, ["cursor-agent", "--", told.as_str()]);
+
+        // With no first prompt, or a program crystal doesn't know, there's
+        // nowhere to say them.
+        for asked in [
+            command(&["gemini"]),
+            command(&["aider", "--model", "o3"]),
+            command(&["sh", "-c", "fix it"]),
+        ] {
+            assert_eq!(argv(&asked, crystal, None, None, &notes), asked);
+        }
+    }
+
+    #[test]
+    fn notes_too_long_for_a_first_prompt_are_left_out_from_the_last() {
+        let crystal = Path::new("/bin/crystal");
+        let asked = command(&["gemini", "-i", &"x".repeat(FIRST_PROMPT_BYTES - 400)]);
+        let long = "~".repeat(500);
+        let argv = argv(
+            &asked,
+            crystal,
+            None,
+            None,
+            &notes(&["About the task.", &long]),
+        );
+        let prompt = &argv[2];
+        assert!(prompt.starts_with(ABOUT_CRYSTAL), "{prompt}");
+        assert!(prompt.contains("About the task.") && !prompt.contains('~'));
+
+        // Where the notes come from, alone, isn't worth saying.
+        let asked = command(&["gemini", "-i", &"x".repeat(FIRST_PROMPT_BYTES)]);
+        assert_eq!(
+            super::argv(&asked, crystal, None, None, &notes(&["About the task."])),
+            asked
+        );
+    }
+
+    #[test]
+    fn codex_hears_its_notes_elsewhere_than_its_first_prompt() {
+        let asked = command(&["codex", "--", "fix it"]);
+        let notes = notes(&["About the task."]);
+        assert_eq!(
+            argv(&asked, Path::new("/bin/crystal"), None, None, &notes),
+            asked
+        );
+    }
+
     #[test]
     fn other_programs_run_as_asked() {
         let asked = command(&["aider", "--model", "o3"]);
@@ -508,5 +623,13 @@ mod tests {
         for (input, expected) in cases {
             assert_eq!(claude_event(&input), expected, "for {input}");
         }
+    }
+
+    #[test]
+    fn only_a_prompt_sent_says_what_the_user_asked() {
+        let sent = json!({"hook_event_name": "UserPromptSubmit", "prompt": "fix the tests"});
+        assert_eq!(claude_prompt(&sent).as_deref(), Some("fix the tests"));
+        let stop = json!({"hook_event_name": "Stop", "prompt": "not one"});
+        assert_eq!(claude_prompt(&stop), None);
     }
 }

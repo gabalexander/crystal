@@ -1,0 +1,8 @@
+stateDiagram-v2
+    [*] --> Idle
+    Idle --> Running : prompt sent
+    Running --> NeedsFeedback : permission asked
+    NeedsFeedback --> Running : answered
+    Running --> Finished : turn ends
+    Finished --> Running : next prompt
+    Finished --> [*]

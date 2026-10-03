@@ -1,16 +1,16 @@
-//! `crystal send`, `wait`, `read` and `result`: how one agent drives
-//! another, or a script drives an agent. They work from inside a session as
-//! well, since every session knows its daemon's socket.
+//! `crystal send`, `wait`, `read`, `result`, `answer` and `interrupt`: how
+//! one agent drives another, or a script drives an agent. They work from
+//! inside a session as well, since every session knows its daemon's socket.
+//!
+//! A wait listens to the daemon's events about its session rather than
+//! asking again and again: each one is a reason to look again.
 
-use crate::client;
-use crate::protocol::{Activity, Request, Response, SessionInfo, State};
+use crate::client::{self, Subscription};
+use crate::events::{Filter, Kind};
+use crate::protocol::{Activity, Answer, Request, Response, SessionInfo, State};
 use anyhow::{Context, Result, bail};
 use std::path::Path;
-use std::thread;
 use std::time::{Duration, Instant};
-
-/// How often `wait` asks for the session again.
-const POLL_EVERY: Duration = Duration::from_millis(100);
 
 /// How long `send --wait` gives an agent to start on what it was sent. A
 /// turn can also be over before it's seen starting, so after this the wait
@@ -41,11 +41,82 @@ pub fn send_keys(socket: &Path, name: &str, keys: Vec<String>) -> Result<()> {
     Ok(())
 }
 
+/// Answers the permission the background task `task` names, by its number
+/// or its session's name, is waiting on: with a denial, Claude is told
+/// `message`.
+pub fn answer(socket: &Path, task: &str, answer: Answer, message: Option<String>) -> Result<()> {
+    let request = Request::Answer {
+        task: task.to_string(),
+        answer,
+        message,
+    };
+    ask(socket, &request)?;
+    Ok(())
+}
+
+/// Stops the run the background task `task` names is in the middle of.
+pub fn interrupt(socket: &Path, task: &str) -> Result<()> {
+    let request = Request::Interrupt {
+        task: task.to_string(),
+    };
+    ask(socket, &request)?;
+    Ok(())
+}
+
+/// What `wait --until` waits for: what a session's agent comes to do, or
+/// its program's end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum Until {
+    Working,
+    Waiting,
+    Done,
+    Idle,
+    #[value(alias = "exited")]
+    Ended,
+}
+
+impl Until {
+    fn word(self) -> &'static str {
+        match self {
+            Until::Working => "working",
+            Until::Waiting => "waiting",
+            Until::Done => "done",
+            Until::Idle => "idle",
+            Until::Ended => "ended",
+        }
+    }
+
+    /// Where `session` has got to now, if it's anywhere a wait can be for.
+    fn of_session(session: &SessionInfo) -> Option<Until> {
+        if session.state != State::Running {
+            return Some(Until::Ended);
+        }
+        Some(match session.activity? {
+            Activity::Working => Until::Working,
+            Activity::Waiting => Until::Waiting,
+            Activity::Done => Until::Done,
+            Activity::Idle => Until::Idle,
+        })
+    }
+
+    /// Where an event of `kind` says its session has got to.
+    fn of_event(kind: Kind) -> Option<Until> {
+        match kind {
+            Kind::SessionWorking => Some(Until::Working),
+            Kind::SessionWaiting => Some(Until::Waiting),
+            Kind::SessionDone => Some(Until::Done),
+            Kind::SessionIdle => Some(Until::Idle),
+            Kind::SessionEnded => Some(Until::Ended),
+            _ => None,
+        }
+    }
+}
+
 /// Waits until the session's agent isn't working, or its program has
 /// ended, and prints which. Gives up after `timeout`, if there is one.
 pub fn wait(socket: &Path, name: &str, timeout: Option<Duration>) -> Result<()> {
-    let deadline = timeout.map(|timeout| Instant::now() + timeout);
-    match poll(socket, name, deadline, settled)? {
+    let mut watch = Watch::start(socket, name)?;
+    match watch.settle(deadline(timeout))? {
         Some(settled) => {
             println!("{settled}");
             Ok(())
@@ -54,24 +125,84 @@ pub fn wait(socket: &Path, name: &str, timeout: Option<Duration>) -> Result<()> 
     }
 }
 
+/// Waits until the session's agent comes to do one of `until`, or, with
+/// `Ended` among them, its program ends, and prints which. Its program
+/// ending first is an error. Gives up after `timeout`, if there is one.
+pub fn wait_until(
+    socket: &Path,
+    name: &str,
+    until: &[Until],
+    timeout: Option<Duration>,
+) -> Result<()> {
+    let mut watch = Watch::start(socket, name)?;
+    match watch.reach(until, deadline(timeout))? {
+        Some(status) => {
+            println!("{status}");
+            Ok(())
+        }
+        None => {
+            let seconds = timeout.unwrap_or_default().as_secs_f64();
+            bail!("{name} wasn't {} after {seconds}s", words(until))
+        }
+    }
+}
+
+/// How many times a wait for output asks again, for what's left of its
+/// time, when the daemon hangs up on it: a daemon handed over to a new
+/// crystal does, once.
+const ASK_AGAIN: usize = 3;
+
+/// Waits until a row on the session's screen, or just scrolled off it,
+/// matches the regular expression `pattern`, and prints the row. The
+/// daemon looks each time the program writes something.
+pub fn wait_for_output(
+    socket: &Path,
+    name: &str,
+    pattern: &str,
+    timeout: Option<Duration>,
+) -> Result<()> {
+    let deadline = deadline(timeout);
+    let mut left = timeout;
+    let mut asked = 0;
+    let response = loop {
+        let request = Request::WaitOutput {
+            name: name.to_string(),
+            pattern: pattern.to_string(),
+            timeout_ms: left.map(|left| left.as_millis() as u64),
+        };
+        asked += 1;
+        match ask(socket, &request) {
+            Err(err) if err.is::<client::HungUp>() && asked <= ASK_AGAIN => {
+                left = deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
+            }
+            response => break response?,
+        }
+    };
+    let Response::Matched { line } = response else {
+        bail!("the daemon didn't say what matched");
+    };
+    println!("{line}");
+    Ok(())
+}
+
 /// Waits for the turn that a `send` has just started: first for the agent
 /// to start working, then as [`wait`] does. Right after the send the agent
 /// may not have started yet, and whatever it said about the turn before
 /// would end the wait at once.
 pub fn wait_for_turn(socket: &Path, name: &str, timeout: Option<Duration>) -> Result<()> {
-    let start = Instant::now();
-    let grace_over = start + START_GRACE;
-    let start_deadline = match timeout {
-        Some(timeout) => grace_over.min(start + timeout),
-        None => grace_over,
-    };
+    let deadline = deadline(timeout);
+    let grace_over = Instant::now() + START_GRACE;
+    let start_deadline = deadline.map_or(grace_over, |deadline| deadline.min(grace_over));
+    let mut watch = Watch::start(socket, name)?;
     // Seen starting or not, what's left is to wait for the turn to end.
-    let _seen_starting = poll(socket, name, Some(start_deadline), |session| {
-        started(session).then_some(())
-    })?;
-
-    let remaining = timeout.map(|timeout| timeout.saturating_sub(start.elapsed()));
-    wait(socket, name, remaining)
+    let _seen_starting = watch.reach(&[Until::Working, Until::Ended], Some(start_deadline))?;
+    match watch.settle(deadline)? {
+        Some(settled) => {
+            println!("{settled}");
+            Ok(())
+        }
+        None => timed_out(name, timeout),
+    }
 }
 
 /// Prints what's on the session's screen, after its history with
@@ -121,12 +252,6 @@ fn settled(session: &SessionInfo) -> Option<String> {
     }
 }
 
-/// Whether a session's agent has started on a turn, or its program has
-/// ended, which is as good as an answer.
-fn started(session: &SessionInfo) -> bool {
-    session.state != State::Running || session.activity == Some(Activity::Working)
-}
-
 /// The screen as text: each row without its trailing spaces, and no blank
 /// rows after the last one with something on it. With `lines`, only that
 /// many of the last rows that aren't blank.
@@ -149,33 +274,106 @@ fn screen_text(rows: &[String], lines: Option<usize>) -> String {
     kept.iter().map(|row| format!("{row}\n")).collect()
 }
 
-/// Asks for the session called `name` again and again, until `check`
-/// gives an answer, and returns it; or `None` once `deadline` has passed.
-fn poll<T>(
-    socket: &Path,
-    name: &str,
-    deadline: Option<Instant>,
-    check: impl Fn(&SessionInfo) -> Option<T>,
-) -> Result<Option<T>> {
-    loop {
-        if let Some(answer) = check(&session(socket, name)?) {
-            return Ok(Some(answer));
+/// A session a wait keeps an eye on: the daemon's events about it, each
+/// a reason to look again.
+struct Watch<'a> {
+    socket: &'a Path,
+    name: &'a str,
+    /// It keeps its id when it's renamed.
+    id: String,
+    events: Subscription,
+}
+
+impl<'a> Watch<'a> {
+    fn start(socket: &'a Path, name: &'a str) -> Result<Watch<'a>> {
+        let id = session(socket, |session| session.name == name, name)?.id;
+        let filter = Filter {
+            kinds: vec!["session.*".to_string()],
+            session: Some(id.clone()),
+            project: None,
+        };
+        // Listening before looking: whatever happens after the look is
+        // heard.
+        let events = client::subscribe(socket, filter, None)?;
+        Ok(Watch {
+            socket,
+            name,
+            id,
+            events,
+        })
+    }
+
+    fn now(&self) -> Result<SessionInfo> {
+        session(self.socket, |session| session.id == self.id, self.name)
+    }
+
+    /// Waits until the session settles, as [`settled`] says, looking again
+    /// after each event about it; `None` once `deadline` has passed.
+    fn settle(&mut self, deadline: Option<Instant>) -> Result<Option<String>> {
+        loop {
+            if let Some(settled) = settled(&self.now()?) {
+                return Ok(Some(settled));
+            }
+            if self.events.next_before(deadline)?.is_none() {
+                return Ok(None);
+            }
         }
-        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-            return Ok(None);
+    }
+
+    /// Waits until the session gets to one of `wanted`, as it is now or as
+    /// an event says, and says how it stands then: the agent may only be
+    /// there a moment, which the event catches. `None` once `deadline` has
+    /// passed. Its program ending, when that isn't wanted, is an error.
+    fn reach(&mut self, wanted: &[Until], deadline: Option<Instant>) -> Result<Option<String>> {
+        let now = self.now()?;
+        let mut reached = Until::of_session(&now).map(|until| (until, now.status()));
+        loop {
+            if let Some((until, status)) = reached {
+                if wanted.contains(&until) {
+                    return Ok(Some(status));
+                }
+                if until == Until::Ended {
+                    bail!(
+                        "{} ended ({status}) without being {}",
+                        self.name,
+                        words(wanted)
+                    );
+                }
+            }
+            let Some(event) = self.events.next_before(deadline)? else {
+                return Ok(None);
+            };
+            if event.kind == Kind::SessionRemoved {
+                bail!("{} was killed", self.name);
+            }
+            let status = event
+                .session
+                .map(|session| session.status)
+                .unwrap_or_default();
+            reached = Until::of_event(event.kind).map(|until| (until, status));
         }
-        thread::sleep(POLL_EVERY);
     }
 }
 
-fn session(socket: &Path, name: &str) -> Result<SessionInfo> {
+/// The session `which` finds, called `name`.
+fn session(socket: &Path, which: impl Fn(&SessionInfo) -> bool, name: &str) -> Result<SessionInfo> {
     let Response::Sessions { sessions } = ask(socket, &Request::List)? else {
         bail!("the daemon didn't send the sessions");
     };
     sessions
         .into_iter()
-        .find(|session| session.name == name)
+        .find(which)
         .with_context(|| format!("no session named {name}"))
+}
+
+fn deadline(timeout: Option<Duration>) -> Option<Instant> {
+    timeout.map(|timeout| Instant::now() + timeout)
+}
+
+/// What a wait waits for, in words: `waiting or done`.
+fn words(until: &[Until]) -> String {
+    let words: Vec<&str> = until.iter().map(|until| until.word()).collect();
+    words.join(" or ")
 }
 
 /// Asks the daemon, which must be running already: these commands only
@@ -210,6 +408,8 @@ mod tests {
             worktree: None,
             changed: 0,
             task: None,
+            asking: None,
+            reporter: None,
         }
     }
 
@@ -234,10 +434,16 @@ mod tests {
     }
 
     #[test]
-    fn a_turn_has_started_once_the_agent_works_or_the_program_ends() {
-        assert!(!started(&session(State::Running, Some(Activity::Done))));
-        assert!(started(&session(State::Running, Some(Activity::Working))));
-        assert!(started(&session(State::Exited { code: 0 }, None)));
+    fn a_wait_until_knows_where_a_session_has_got_to() {
+        let running = |activity| Until::of_session(&session(State::Running, activity));
+        assert_eq!(running(Some(Activity::Working)), Some(Until::Working));
+        assert_eq!(running(Some(Activity::Idle)), Some(Until::Idle));
+        assert_eq!(running(None), None);
+        let ended = session(State::Exited { code: 0 }, Some(Activity::Done));
+        assert_eq!(Until::of_session(&ended), Some(Until::Ended));
+        assert_eq!(Until::of_event(Kind::SessionWaiting), Some(Until::Waiting));
+        assert_eq!(Until::of_event(Kind::SessionRenamed), None);
+        assert_eq!(words(&[Until::Waiting, Until::Done]), "waiting or done");
     }
 
     #[test]

@@ -40,6 +40,11 @@ impl Notice {
             _ => "is done",
         };
         let mut text = format!("{} {what}", session.name);
+        // What an agent that reports for itself says it waits on them for.
+        let message = session.reporter.as_ref().and_then(|r| r.message.as_ref());
+        if let Some(message) = message.filter(|_| activity == Activity::Waiting) {
+            text.push_str(&format!(": {message}"));
+        }
         if let Some(worktree) = &session.worktree {
             text.push_str(&format!(" · {}", worktree.project));
             if let Some(branch) = &worktree.branch {
@@ -192,6 +197,8 @@ mod tests {
             worktree,
             changed: 0,
             task: None,
+            asking: None,
+            reporter: None,
         }
     }
 
@@ -228,5 +235,21 @@ mod tests {
 
         let notice = Notice::about(&session(None), Done);
         assert_eq!(notice.text, "claude-2 is done");
+    }
+
+    #[test]
+    fn a_notice_says_what_an_agent_that_reports_waits_for() {
+        let mut waiting = session(None);
+        waiting.reporter = Some(crate::protocol::Reporter {
+            agent: "pi".into(),
+            message: Some("approve the deploy".into()),
+            resume: None,
+        });
+        let notice = Notice::about(&waiting, Waiting);
+        assert_eq!(
+            notice.text,
+            "claude-2 is waiting on you: approve the deploy"
+        );
+        assert_eq!(Notice::about(&waiting, Done).text, "claude-2 is done");
     }
 }

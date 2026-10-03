@@ -16,7 +16,8 @@ crystal new -d -n fixer -w fix/login claude "Fix the login redirect bug"
 ```
 
 - `-d` starts it in the background and prints its name. Always pass it: without it, crystal attaches.
-- `-n` names it. Without it the name is the program's, with `-2`, `-3` added if taken.
+- `-n` names it. Without it the name comes from its prompt, like `review-diff-branch`, or else is the
+  program's, with `-2`, `-3` added if taken. Use the name `-d` prints.
 - `-w <branch>` starts it in a new git worktree, `<repo>.worktrees/<branch>`, making the branch if it
   doesn't exist. Use it when the agent will edit files, so it doesn't collide with you.
 - Words after `claude` are its first prompt. Quote them as one argument.
@@ -48,16 +49,20 @@ crystal send tests "Now add a test for the bug" --wait
 crystal result tests
 ```
 
-- Nobody can approve a permission for a task: allow what it needs after `--`, with `--allowedTools` or
-  `--permission-mode`. What it was refused shows at the end of its transcript (`crystal read`).
+- A task that asks for a permission waits: `wait` prints `waiting`, and `crystal tasks show <name>` says what
+  it asks for. The user answers it; answer it yourself (`crystal answer <name> y`, `n -m "<why>"`, or
+  `always`) only when the user has said what to allow. Better, allow what it needs up front, after `--`,
+  with `--allowedTools` or `--permission-mode`.
+- `crystal interrupt <name>` stops its run; the task stays open, and a follow-up carries on.
 - A task takes follow-ups with `send`, one at a time, never `send-keys`.
-- A task whose run fails ends: `wait` prints `exited N`, and `result` says why.
+- A task whose run fails ends: `wait` prints `exited N`, and `result` says why. Past the user's daily
+  budget, a new task or follow-up is refused, saying so: tell the user rather than retrying.
 
 ## Or run a flow
 
-A flow is a chain of tasks on one goal, set up in the user's config file (`crystal config` shows it), like
-plan, then implement in a worktree, then a review the user approves. Run one when the user asks for it by
-name:
+A flow is a chain of tasks on one goal, set up in the user's config file (`crystal config` shows it) or the
+project's `.crystal/flows.toml`, like plan, then implement in a worktree, then a review the user approves. Run
+one when the user asks for it by name; `crystal flow defs` lists them:
 
 ```sh
 crystal flow run ship "Retry the webhook when it times out"   # prints the run's name, like ship-1
@@ -71,6 +76,9 @@ crystal result ship-1-review                                   # a step's whole 
 - A gate is the user's to answer. Go on past it (`crystal flow approve <run>`) or send it back with notes
   (`crystal flow back <run> "<notes>"`) only when the user tells you to.
 - `crystal flow retry <run>` runs a failed or interrupted step again. `crystal flow --json` lists every run.
+- `crystal flow cancel <run>` cancels a run and its step's open task: only when the user asks.
+- A step on an agent other than Claude runs in a terminal session, `<run>-<step>`, and the flow goes on once
+  its task closes: `crystal read` it rather than `result`.
 - With flows turned off, these commands say "the flows plugin is off"; run the steps as tasks yourself.
 
 ## Close your task
@@ -81,15 +89,40 @@ with a task, close it when you're through, with one line on how it went:
 ```sh
 crystal done "Fixed the redirect and added a test"
 crystal done --failed "The staging database is down"
+crystal done "Wrote the plan" --artifact docs/plan.md
 ```
 
 - `crystal done` closes the task of the session it runs in. `-n <name>` closes another's.
+- `--artifact <path>`, once for each file, keeps a copy of a file in your worktree with the task, for whoever
+  reads it once the worktree is gone: a plan, a report. A file can be 1 MiB at most. One that can't be kept
+  refuses the close and says why; the task stays open, so fix the call and run it again.
 - End a turn with your task still open and crystal reminds you, once. Close it then if you're through;
   if you're waiting on the user, leave it open and end your turn.
 - An agent you start with a prompt (`crystal new -d claude "…"`, or `-t "…"` for any command) is given a task.
-  `crystal ls --json` shows it: `task.goal`, and once closed, `task.outcome` with `failed` and `summary`.
+  `crystal ls --json` shows it: `task.id`, `task.goal`, and once closed, `task.outcome` with `failed`,
+  `cancelled` and `summary`.
 - A background task (`crystal task`) closes itself when its run ends.
-- `crystal tasks` lists the project's tasks: open ones, then those closed, the latest first.
+- Each task has a number, like `t12`. `crystal tasks` lists the project's tasks with theirs and how each
+  stands: `pending`, `running`, `waiting` (its turn ended with it open: it's asking the user), `done`,
+  `failed` or `cancelled`. `crystal tasks show <task>` shows one, `crystal tasks log <task>` adds its
+  transcript, and `crystal tasks cancel <task>` cancels it and stops its session: only when the user asks.
+- `crystal tasks new "<goal>"` makes a task and starts an agent on it, printing its number; `--background`
+  runs it as `crystal task` does, and `--no-launch` leaves it pending until `crystal tasks start <task>`.
+
+## Leave notes for the next session
+
+Each git worktree keeps notes for the sessions that work in it after you, in `.crystal/handoff.md`. When
+you're told it has some, read that file before you start. When you learn something the next session there
+should know, like a decision and why, a dead end, a command that works or what you left undone, add a note:
+
+```sh
+crystal handoff "The fixtures live in tests/fixtures; cargo test codec runs just them"
+```
+
+- Keep each note short and whole on its own; crystal adds the time and your session's name. Never edit the
+  file yourself.
+- Closing your task adds its summary there for you.
+- With the handoff plugin off, `crystal handoff` says so; carry on without it.
 
 ## Keep a backlog
 
@@ -113,8 +146,20 @@ Every command works on the current directory's project; `-C <dir>` names another
 |---|---|---|
 | `done` | finished its turn | `read` the answer |
 | `idle` | at its prompt, already seen | `read`, or `send` more work |
-| `waiting` | asking something: a permission, a choice | `read` the question, then answer with `send-keys` |
+| `waiting` | asking something: a permission, a choice, or a question it ended its turn on with its task open | `read` it, then answer: a permission or a choice with `send-keys` (a background task's permission with `crystal answer`), a question with `send` |
 | `exited N`, `killed (…)` | the program ended | `read` its last screen; `crystal respawn <name>` runs it again |
+
+To wait for one status in particular, or for a program to print something:
+
+```sh
+crystal wait reviewer --until waiting --timeout 600   # or working, done, idle, ended; several with commas
+crystal wait server --output 'listening on' --timeout 60   # a regular expression; prints the line
+```
+
+- `--until` fails when the program ends first, unless `ended` is one it waits for.
+- A turn that ends while the user watches it is `idle` at once, never `done`: wait for `done,idle`.
+- `--output` counts what's on the screen already, and the rows just above it.
+- `crystal events -n reviewer` prints what happened to a session, one line each; `--follow` keeps printing.
 
 ## Answer its questions
 
@@ -140,6 +185,21 @@ One object per session: `name`, `status` (the word `crystal ls` shows), `state`,
 front in its terminal, `{"kind": "agent", "program": "claude", …}`, a `shell` or another `program`, and `task`
 when it was started with something to do.
 
+## Show a session beside yours
+
+The user watches sessions in crystal's TUI. To put one you started on their screen, beside your own pane:
+
+```sh
+crystal pane split tests          # to the right of your pane; --down below it
+crystal pane close tests          # off the screen again
+crystal layout --json             # the TUI's tabs, the sessions in each, and how their panes split
+```
+
+- These need the TUI open; without one they fail, saying "no TUI is running": carry on without them.
+- They change what the user sees. Split off what helps them follow your work, close it when it's done, and
+  leave their tabs and focus alone unless they ask: `crystal pane focus <name>` hands a session their
+  keyboard, and `crystal tab new <name>` brings a new tab to the front, where sessions started after go.
+
 ## Clean up
 
 ```sh
@@ -161,13 +221,15 @@ crystal memory search ledger
 ```
 
 - `-k` is `decision`, `gotcha`, `command` or `note` (the default). Keep each entry to a sentence or two.
-- `-f <file>` names a file the entry is about. When that file changes, the entry is marked stale.
+- `-f <file>` names a file the entry is about. Once some of its files change, the entry is marked drifting, and
+  once all of them have, stale.
 - Don't remember what the code, the git log or CLAUDE.md already says, or anything that only matters now.
 - `crystal memory search` matches any of its words, or a word they start or stem from, best first; with
   search by meaning on, entries that mean the same count too, so a few plain words do.
 - In a Claude Code session crystal started, the `memory_search` and `memory_show` tools search the memory and
   read an entry by its id without a shell command; use them when you have them.
-- `crystal memory` lists every entry; `crystal memory rm <id>` forgets one that's wrong.
+- `crystal memory` lists every entry; `crystal memory show <id>` reads one in full; `crystal memory rm <id>`
+  forgets one that's wrong.
 - Once your task closes, a model reads what you did and keeps what it finds worth keeping, so remember what
   only you know, like why you chose something; it never repeats what's there already.
 - With memory turned off, these commands say "the memory plugin is off"; carry on without them.

@@ -22,6 +22,7 @@
 
 use crate::config::MemorySettings;
 use crate::embed;
+use crate::handover::HELPERS;
 use crate::memory::{self, Added, Kind, New, Source, Store};
 use crate::protocol::TaskRecord;
 use crate::secrets;
@@ -186,7 +187,7 @@ pub fn args(settings: &MemorySettings) -> Vec<String> {
 
 /// The end of what a session did, a line for each thing it said or did,
 /// kept to about [`MATERIAL_CAP`] bytes: the oldest lines go first.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct Record {
     lines: VecDeque<String>,
     bytes: usize,
@@ -378,7 +379,7 @@ pub struct Job {
 pub fn header(task: &TaskRecord) -> String {
     let mut header = format!("The task: {}", task.goal);
     if let Some(outcome) = &task.outcome {
-        let how = if outcome.failed { "failed" } else { "done" };
+        let how = outcome.state().word();
         header.push_str(&format!("\nHow it ended: {how}: {}", outcome.summary));
     }
     header.push_str(&format!("\nThe project: {}", task.project));
@@ -514,6 +515,7 @@ fn ask_claude(job: &Job, message: &str) -> Result<(Value, f64)> {
         .spawn()
         .context("couldn't start claude")?;
     let pid = child.id();
+    let _helper = HELPERS.started(pid);
     let mut stdin = child.stdin.take().expect("its input is piped");
     let message = message.to_string();
     thread::spawn(move || {
@@ -653,6 +655,7 @@ fn entry(item: &Value, checkout: &Path) -> Result<New, String> {
         files,
         // Who it's from is the pass's to say.
         source: Source::User,
+        checkout: Some(checkout.to_path_buf()),
     })
 }
 
@@ -682,7 +685,7 @@ fn file_in(checkout: &Path, file: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::TaskOutcome;
+    use crate::protocol::{TaskOutcome, TaskState};
 
     fn checkout() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
@@ -761,17 +764,18 @@ mod tests {
     #[test]
     fn the_message_says_what_the_task_was_and_takes_out_credentials() {
         let task = TaskRecord {
+            id: Some(1),
             goal: "fix the ledger".into(),
             session: "fixer".into(),
             project: "app".into(),
             branch: Some("fix/ledger".into()),
             background: true,
             backlog: None,
-            outcome: Some(TaskOutcome {
-                failed: false,
-                summary: "redis has to be up".into(),
-                closed: 0,
-            }),
+            pending: false,
+            waiting: false,
+            created: 0,
+            outcome: Some(TaskOutcome::new(TaskState::Done, "redis has to be up", 0)),
+            artifacts: Vec::new(),
         };
         let header = header(&task);
         assert_eq!(

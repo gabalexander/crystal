@@ -1,0 +1,17 @@
+classDiagram
+    class Tour {
+        +String id
+        +String title
+        +TourKind kind
+        +add(stop) Stop
+    }
+    class Stop {
+        +u32 start_line
+        +u32 end_line
+        +String note
+    }
+    class Review
+    <<interface>> Review
+    Tour "1" *-- "*" Stop : holds
+    Review <|-- Tour
+    Stop ..> File : reads

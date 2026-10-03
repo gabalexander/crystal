@@ -32,7 +32,7 @@ pub fn of(dir: &Path) -> Project {
 
 /// A directory's own name, or the whole path for one that has none, like
 /// `/`.
-fn name_of(path: &Path) -> String {
+pub fn name_of(path: &Path) -> String {
     match path.file_name() {
         Some(name) => name.to_string_lossy().into_owned(),
         None => path.display().to_string(),

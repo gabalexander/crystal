@@ -1,14 +1,20 @@
 //! The CLI's side of the socket.
 
 use crate::env;
+use crate::events::{Event, Filter, Since};
+use crate::forge::Checkout;
 use crate::git;
+use crate::handover;
+use crate::layout::{self, Layout, Order};
 use crate::protocol::{
-    self, Backlog, NewSession, NewTask, Request, Response, SessionInfo, State, TaskSpec,
+    self, Backlog, NewSession, NewTask, PendingTask, Request, Response, SessionInfo, State,
+    TaskSpec,
 };
 use crate::socket;
 use anyhow::{Context, Result, bail};
+use serde_json::Value;
 use std::fs::OpenOptions;
-use std::io::BufReader;
+use std::io::{BufRead, BufReader, ErrorKind};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -28,17 +34,37 @@ pub fn ask(socket: &Path, request: &Request, start: bool) -> Result<Option<Respo
         Err(_) => start_daemon(socket)?,
     };
     protocol::send_request(&conn, request)?;
-    // A daemon from before requests carried their version can't say that
-    // it's another version: it hangs up on what it doesn't understand.
-    let response = protocol::recv(BufReader::new(&conn))?.context(
-        "the daemon hung up without answering; if crystal was just upgraded, \
-         run `crystal restart-server`",
-    )?;
+    let response = protocol::recv(BufReader::new(&conn))?.ok_or_else(|| HungUp {
+        crystal: socket::crystal_for(socket),
+    })?;
     match response {
         Response::Error { message } => bail!(message),
         response => Ok(Some(response)),
     }
 }
+
+/// The daemon hung up without answering. A daemon from before requests
+/// carried their version can't say that it's another version: it hangs up
+/// on what it doesn't understand. A daemon handed over to a new crystal
+/// hangs up on a wait it was in the middle of.
+#[derive(Debug)]
+pub struct HungUp {
+    /// How `crystal` is run on this daemon ([`socket::crystal_for`]).
+    crystal: String,
+}
+
+impl std::fmt::Display for HungUp {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(
+            f,
+            "the daemon hung up without answering; if crystal was just upgraded, \
+             run `{} restart-server`",
+            self.crystal
+        )
+    }
+}
+
+impl std::error::Error for HungUp {}
 
 /// Asks the daemon to start `command` in `cwd`, or the user's shell when
 /// `command` is empty, with this process's environment. Starts the daemon
@@ -49,7 +75,24 @@ pub fn new_session(
     cwd: PathBuf,
     command: Vec<String>,
 ) -> Result<String> {
-    new_session_for(socket, name, cwd, command, Purpose::default())
+    let started = new_session_for(socket, name, cwd, command, Purpose::default())?;
+    Ok(started.name)
+}
+
+/// A session the daemon has just started.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Started {
+    pub name: String,
+    /// The number of the task it was started with, if it was.
+    pub task: Option<u64>,
+}
+
+/// The session a request to start one started.
+fn started(response: Option<Response>) -> Result<Started> {
+    match response {
+        Some(Response::Created { name, task }) => Ok(Started { name, task }),
+        _ => bail!("the daemon didn't start it"),
+    }
 }
 
 /// What a session is started to do, when it's started with something to
@@ -70,7 +113,7 @@ pub fn new_session_for(
     cwd: PathBuf,
     mut command: Vec<String>,
     purpose: Purpose,
-) -> Result<String> {
+) -> Result<Started> {
     if command.is_empty() {
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
         command.push(shell);
@@ -83,22 +126,19 @@ pub fn new_session_for(
         task: purpose.task,
         backlog: purpose.backlog,
     });
-    match ask(socket, &request, true)? {
-        Some(Response::Created { name }) => Ok(name),
-        _ => bail!("the daemon didn't create the session"),
-    }
+    started(ask(socket, &request, true)?)
 }
 
 /// Asks the daemon to start a task in `cwd`, with this process's
 /// environment, for backlog item `backlog` if it's for one. Starts the
-/// daemon if it isn't running. Returns the task's name.
+/// daemon if it isn't running.
 pub fn new_task(
     socket: &Path,
     name: Option<String>,
     cwd: PathBuf,
     spec: TaskSpec,
     backlog: Option<u64>,
-) -> Result<String> {
+) -> Result<Started> {
     let request = Request::NewTask(NewTask {
         name,
         cwd,
@@ -106,10 +146,26 @@ pub fn new_task(
         env: env::current(),
         backlog,
     });
-    match ask(socket, &request, true)? {
-        Some(Response::Created { name }) => Ok(name),
-        _ => bail!("the daemon didn't start the task"),
+    started(ask(socket, &request, true)?)
+}
+
+/// Asks the daemon to keep `task` until it's started, and gives back its
+/// number. Starts the daemon if it isn't running.
+pub fn add_task(socket: &Path, task: PendingTask) -> Result<u64> {
+    match ask(socket, &Request::AddTask(task), true)? {
+        Some(Response::TaskAdded { id }) => Ok(id),
+        _ => bail!("the daemon didn't take the task"),
     }
+}
+
+/// Asks the daemon to start task `id`, which waits to, with this process's
+/// environment.
+pub fn start_task(socket: &Path, id: u64) -> Result<Started> {
+    let request = Request::StartTask {
+        id,
+        env: env::current(),
+    };
+    started(Some(ask_running(socket, &request)?))
 }
 
 /// Asks the daemon to start a run of the flow called `flow` on `goal`, in
@@ -146,6 +202,7 @@ pub fn close_task(socket: &Path, name: &str, failed: bool, summary: &str) -> Res
         name: Some(name.to_string()),
         failed,
         summary: summary.to_string(),
+        artifacts: Vec::new(),
     };
     ask_running(socket, &request)?;
     Ok(())
@@ -221,19 +278,190 @@ pub fn add_new_worktree(socket: &Path, dir: &Path, branch: &str) -> Result<PathB
     Ok(path)
 }
 
+/// The worktree for a pull request: the one its project has on its branch
+/// already, or else a new one, its commits fetched first, as
+/// [`git::add_fetched_worktree`] makes it, which the daemon is told of.
+pub fn pull_request_worktree(socket: &Path, checkout: &Checkout) -> Result<PathBuf> {
+    let Checkout {
+        project,
+        branch,
+        fetch,
+    } = checkout;
+    if let Some(path) = git::worktree_on(project, branch)? {
+        return Ok(path);
+    }
+    let path = git::add_fetched_worktree(project, branch, fetch)?;
+    tell_worktree(socket, &path, Some(branch.clone()), true);
+    Ok(path)
+}
+
 /// Tells the daemon a worktree was made or removed. The worktree is made or
 /// gone either way, so a daemon that can't be told is no reason to fail.
 fn tell_worktree(socket: &Path, path: &Path, branch: Option<String>, created: bool) {
-    let request = Request::Worktree {
-        path: path.to_path_buf(),
-        branch,
-        created,
-    };
-    if let Err(err) = ask(socket, &request, false) {
+    let event = Event::worktree(created, path, branch.as_deref());
+    if let Err(err) = tell(socket, event) {
         eprintln!(
             "crystal: couldn't tell the daemon about {}: {err:#}",
             path.display()
         );
+    }
+}
+
+/// Tells the daemon about something done outside it, for its event log
+/// and whoever listens. With no daemon running, there's nobody to tell.
+pub fn tell(socket: &Path, event: Event) -> Result<()> {
+    let event = Box::new(event);
+    ask(socket, &Request::Emit { event }, false)?;
+    Ok(())
+}
+
+/// Subscribes to the events `filter` takes, those in the log from `since`
+/// first, then each new one as it happens. Starts the daemon if it isn't
+/// running.
+pub fn subscribe(socket: &Path, filter: Filter, since: Option<Since>) -> Result<Subscription> {
+    let conn = match UnixStream::connect(socket) {
+        Ok(conn) => conn,
+        Err(_) => start_daemon(socket)?,
+    };
+    let mut subscription = Subscription {
+        socket: socket.to_path_buf(),
+        filter,
+        since,
+        input: BufReader::new(conn),
+        line: Vec::new(),
+        seq: 0,
+        last: None,
+    };
+    subscription.seq = subscription.start(since)?;
+    Ok(subscription)
+}
+
+/// Events from the daemon, as they happen.
+pub struct Subscription {
+    socket: PathBuf,
+    filter: Filter,
+    /// Where it asked to start in the log.
+    since: Option<Since>,
+    input: BufReader<UnixStream>,
+    /// What has come of a line that isn't whole yet.
+    line: Vec<u8>,
+    /// The `seq` of the latest event before the subscription started.
+    pub seq: u64,
+    /// The `seq` of the latest event it has given: it picks up again after
+    /// it on a new connection.
+    last: Option<u64>,
+}
+
+impl Subscription {
+    /// Asks for the events on the connection it has, from `since`, and
+    /// gives the `seq` of the latest event before them.
+    fn start(&mut self, since: Option<Since>) -> Result<u64> {
+        let request = Request::Subscribe {
+            filter: self.filter.clone(),
+            since,
+        };
+        protocol::send_request(self.input.get_ref(), &request)?;
+        match self.next_line(None)? {
+            Some(Response::Subscribed { seq }) => Ok(seq),
+            Some(Response::Error { message }) => bail!(message),
+            _ => bail!("the daemon didn't start sending events"),
+        }
+    }
+
+    /// The next event, waiting until `deadline` if there is one; `None`
+    /// once it has passed. The daemon handing over to a new crystal cuts
+    /// the stream, which carries on from the next one with nothing missed.
+    /// The daemon going away, or dropping a subscriber that fell too far
+    /// behind, is an error.
+    pub fn next_before(&mut self, deadline: Option<Instant>) -> Result<Option<Event>> {
+        let line = match self.next_line::<Value>(deadline) {
+            Ok(Some(line)) => line,
+            Ok(None) => return Ok(None),
+            Err(err) if err.is::<StreamEnded>() && self.pick_up_again()? => {
+                return self.next_before(deadline);
+            }
+            Err(err) => return Err(err),
+        };
+        // Events are all there is after the start, but for the error that
+        // ends a stream.
+        if line["type"] == "error" {
+            bail!(
+                "{}",
+                line["message"].as_str().unwrap_or("the daemon said no")
+            );
+        }
+        let event: Event = serde_json::from_value(line)?;
+        self.last = Some(event.seq);
+        Ok(Some(event))
+    }
+
+    /// Subscribes again, on a new connection, after the last event given,
+    /// or from where it started when it has given none, when a daemon is
+    /// there to ask: one handed over to a new crystal cuts its streams.
+    /// `false` when there's none; an error when it won't, say because it's
+    /// a newer crystal now.
+    fn pick_up_again(&mut self) -> Result<bool> {
+        let Ok(conn) = UnixStream::connect(&self.socket) else {
+            return Ok(false);
+        };
+        self.input = BufReader::new(conn);
+        self.line.clear();
+        let since = match self.last {
+            Some(last) => Since::Seq(last),
+            None => self.since.unwrap_or(Since::Seq(self.seq)),
+        };
+        self.start(Some(since))?;
+        Ok(true)
+    }
+
+    /// The next line, read as a `T`; `None` once `deadline` has passed. A
+    /// line cut short by the deadline is kept for the next call.
+    fn next_line<T: serde::de::DeserializeOwned>(
+        &mut self,
+        deadline: Option<Instant>,
+    ) -> Result<Option<T>> {
+        let socket = self.input.get_ref();
+        match deadline {
+            Some(deadline) => {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return Ok(None);
+                }
+                socket.set_read_timeout(Some(left))?;
+            }
+            None => socket.set_read_timeout(None)?,
+        }
+        match self.input.read_until(b'\n', &mut self.line) {
+            Ok(_) if self.line.ends_with(b"\n") => {
+                let line = std::mem::take(&mut self.line);
+                Ok(Some(serde_json::from_slice(&line)?))
+            }
+            Ok(_) => Err(StreamEnded.into()),
+            Err(err) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                Ok(None)
+            }
+            Err(err) => Err(err.into()),
+        }
+    }
+}
+
+/// The daemon stopped sending events, its connection closed.
+#[derive(Debug)]
+struct StreamEnded;
+
+impl std::fmt::Display for StreamEnded {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("the daemon stopped sending events")
+    }
+}
+
+impl std::error::Error for StreamEnded {}
+
+impl Iterator for Subscription {
+    type Item = Result<Event>;
+
+    fn next(&mut self) -> Option<Result<Event>> {
+        self.next_before(None).transpose()
     }
 }
 
@@ -245,6 +473,21 @@ fn runs_in(session: &SessionInfo, path: &Path) -> bool {
         .is_some_and(|worktree| worktree.path == path)
 }
 
+/// Has the TUI used last carry out a layout command, and gives the layout
+/// it came to. A command run in a session says so, for one about "this
+/// session".
+pub fn lay_out(socket: &Path, command: layout::Command) -> Result<Layout> {
+    let order = Order {
+        command,
+        caller: env::own_session_id(socket),
+    };
+    match ask(socket, &Request::Layout(order), false)? {
+        Some(Response::Layout(layout)) => Ok(layout),
+        Some(_) => bail!("the daemon didn't answer with the layout"),
+        None => bail!(layout::NO_TUI),
+    }
+}
+
 /// Asks a daemon that must be running already: the request is about a
 /// session that has to exist.
 fn ask_running(socket: &Path, request: &Request) -> Result<Response> {
@@ -254,17 +497,84 @@ fn ask_running(socket: &Path, request: &Request) -> Result<Response> {
     }
 }
 
-/// Stops the daemon, keeping its list of running sessions, and starts a
-/// new one from this program, which starts those sessions again. That's
-/// how a newly installed crystal takes over: until then, the daemon goes on
-/// running the program it was started from. Returns `false` when there was
-/// no daemon to restart.
-pub fn restart_daemon(socket: &Path) -> Result<bool> {
-    if !stop_daemon(socket, true)? {
-        return Ok(false);
+/// How long a client waits for the daemon it asked to hand over to say it
+/// has: the old one waits a few seconds for what it's doing, then the new
+/// one reads what it was handed.
+const HANDOVER_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// What restarting the daemon came to.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Restart {
+    /// There was no daemon to restart.
+    NoDaemon,
+    /// It was handed over to this crystal, and `sessions` carried on.
+    HandedOver { sessions: usize },
+    /// It was stopped, and started again from this crystal, which started
+    /// its running sessions again; `why`, when it was meant to be handed
+    /// over.
+    Cold { why: Option<String> },
+}
+
+/// Restarts the daemon on this program. That's how a newly installed
+/// crystal takes over: until then, the daemon goes on running the program
+/// it was started from. It's handed over to this one (see
+/// [`crate::handover`]), its sessions carrying on, unless `cold`, or unless
+/// it can't be: then it's stopped, keeping its list of running sessions,
+/// and a new one started, which starts them again.
+pub fn restart_daemon(socket: &Path, cold: bool) -> Result<Restart> {
+    let why = if cold {
+        None
+    } else {
+        match hand_over(socket)? {
+            HandOver::NoDaemon => return Ok(Restart::NoDaemon),
+            HandOver::Done { sessions } => return Ok(Restart::HandedOver { sessions }),
+            HandOver::Refused(why) => Some(why),
+        }
+    };
+    // A daemon that couldn't hand over may have gone already.
+    if !stop_daemon(socket, true)? && why.is_none() {
+        return Ok(Restart::NoDaemon);
     }
     start_daemon(socket)?;
-    Ok(true)
+    Ok(Restart::Cold { why })
+}
+
+/// What asking the daemon to hand over came to.
+enum HandOver {
+    NoDaemon,
+    Done {
+        sessions: usize,
+    },
+    /// It didn't hand over, for this reason.
+    Refused(String),
+}
+
+/// Asks the daemon to hand over to this program.
+fn hand_over(socket: &Path) -> Result<HandOver> {
+    let Ok(conn) = UnixStream::connect(socket) else {
+        return Ok(HandOver::NoDaemon);
+    };
+    let request = Request::Handover {
+        exe: std::env::current_exe()?,
+        format: handover::FORMAT,
+    };
+    protocol::send_request(&conn, &request)?;
+    conn.set_read_timeout(Some(HANDOVER_TIMEOUT))?;
+    let answer = match protocol::recv(BufReader::new(&conn)) {
+        Ok(Some(Response::HandedOver { sessions })) => return Ok(HandOver::Done { sessions }),
+        Ok(Some(Response::Error { message })) => match message.strip_prefix("couldn't hand over: ")
+        {
+            Some(why) => why.to_string(),
+            // What a daemon from before handovers says to a crystal of
+            // another version.
+            None => "the daemon was a crystal from before handovers".to_string(),
+        },
+        Ok(Some(_)) => "the daemon answered something else".to_string(),
+        // The new crystal couldn't take over, or a daemon of this version
+        // from before handovers didn't understand.
+        Ok(None) | Err(_) => "the new daemon couldn't take them over".to_string(),
+    };
+    Ok(HandOver::Refused(answer))
 }
 
 /// Asks the daemon to stop, keeping its list of running sessions or not,

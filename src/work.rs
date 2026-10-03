@@ -1,40 +1,83 @@
-//! The commands about work: closing a task with `crystal done`, listing
-//! tasks with `crystal tasks`, and keeping a project's backlog with
-//! `crystal backlog`. The daemon keeps the history and the backlogs; these
-//! ask it, and print what it says.
+//! The commands about work: closing a task with `crystal done`, leaving a
+//! note for the sessions after with `crystal handoff`, making, listing,
+//! showing and cancelling tasks with `crystal tasks`, and keeping a
+//! project's backlog with `crystal backlog`. The daemon keeps the tasks,
+//! the history, the handoff files and the backlogs; these ask it, and print
+//! what it says.
 
+use crate::artifacts;
 use crate::backlog;
 use crate::catalog;
 use crate::client::{self, Purpose};
 use crate::config::Config;
 use crate::env;
-use crate::github;
-use crate::protocol::{BacklogItem, Request, Response, TaskRecord};
+use crate::forge;
+use crate::handoff;
+use crate::protocol::{
+    BacklogItem, PendingTask, Request, Response, State, TaskSpec, TaskStart, TaskState, TaskView,
+    task_label,
+};
+use crate::shell;
 use crate::tasks;
+use crate::tui::sidebar::ago;
 use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 /// Closes a task: the one of the session this runs in, or the session
-/// called `name`.
-pub fn done(socket: &Path, name: Option<String>, failed: bool, summary: &str) -> Result<()> {
+/// called `name`, keeping the files at `artifacts` with it.
+pub fn done(
+    socket: &Path,
+    name: Option<String>,
+    failed: bool,
+    summary: &str,
+    artifacts: Vec<PathBuf>,
+) -> Result<()> {
     tasks::ensure_enabled(&settings())?;
-    let id = match &name {
-        Some(_) => None,
-        None => Some(env::own_session_id(socket).context(
-            "this isn't running in a crystal session: say whose task it is with `-n <session>`",
-        )?),
-    };
+    let id = own_session(socket, &name, "whose task it is")?;
+    // The daemon reads them, wherever it runs.
+    let artifacts = artifacts
+        .into_iter()
+        .map(std::path::absolute)
+        .collect::<std::io::Result<Vec<_>>>()?;
     let close = Request::Close {
         id,
         name,
         failed,
         summary: summary.to_string(),
+        artifacts,
     };
     expect_done(client::ask(socket, &close, false)?, socket)
 }
 
+/// Adds `note` to the handoff file of the worktree the session this runs
+/// in works in, or the session called `name`.
+pub fn handoff(socket: &Path, name: Option<String>, note: &str) -> Result<()> {
+    handoff::ensure_enabled(&settings())?;
+    let id = own_session(socket, &name, "whose worktree it's for")?;
+    let request = Request::Handoff {
+        id,
+        name,
+        note: note.to_string(),
+    };
+    expect_done(client::ask(socket, &request, false)?, socket)
+}
+
+/// The id of the session this runs in, unless `name` names another: a
+/// command for a session that says `what` with `-n` from outside one.
+pub fn own_session(socket: &Path, name: &Option<String>, what: &str) -> Result<Option<String>> {
+    if name.is_some() {
+        return Ok(None);
+    }
+    let id = env::own_session_id(socket).with_context(|| {
+        format!("this isn't running in a crystal session: say {what} with `-n <session>`")
+    })?;
+    Ok(Some(id))
+}
+
 /// Prints the tasks of the project `dir` is in, or every project's with
-/// `all`: those still open, then those closed, the latest first.
+/// `all`: those still open, then those waiting to start, then those
+/// closed, the latest first.
 pub fn list_tasks(socket: &Path, dir: PathBuf, all: bool, json: bool) -> Result<()> {
     tasks::ensure_enabled(&settings())?;
     let tasks = match client::ask(socket, &Request::Tasks { dir, all }, true)? {
@@ -49,32 +92,270 @@ pub fn list_tasks(socket: &Path, dir: PathBuf, all: bool, json: bool) -> Result<
     Ok(())
 }
 
-/// Tasks as `crystal tasks` prints them: how each stands, where it ran, what
-/// it was asked to do, and how it went. With `all`, the project too.
-fn task_lines(tasks: &[TaskRecord], all: bool) -> String {
+/// A task to make with `crystal tasks new`.
+pub struct NewTask {
+    pub goal: String,
+    pub cwd: PathBuf,
+    /// Its session's name: `None` names it for its goal, or else after its
+    /// program.
+    pub name: Option<String>,
+    /// Run it in the background, `claude -p` with `claude_args`, rather
+    /// than the agent the new-session panel starts first, in a terminal.
+    pub background: bool,
+    pub claude_args: Vec<String>,
+    /// Start it now, rather than leave it waiting to start.
+    pub launch: bool,
+}
+
+/// Makes a task, and starts it, unless it's to wait. Prints its number.
+pub fn new_task(socket: &Path, task: NewTask) -> Result<()> {
+    let config = settings();
+    tasks::ensure_enabled(&config)?;
+    let NewTask {
+        goal,
+        cwd,
+        name,
+        background,
+        claude_args,
+        launch,
+    } = task;
+    let start = if background {
+        TaskStart::Background { args: claude_args }
+    } else {
+        TaskStart::Agent {
+            command: agent_command(&config, &goal),
+        }
+    };
+    if !launch {
+        let pending = PendingTask {
+            id: 0,
+            goal,
+            cwd,
+            name,
+            start,
+            backlog: None,
+            created: 0,
+        };
+        let id = client::add_task(socket, pending)?;
+        println!("{}", task_label(Some(id)));
+        return Ok(());
+    }
+    let started = match start {
+        TaskStart::Agent { command } => {
+            let purpose = Purpose {
+                task: Some(goal),
+                backlog: None,
+            };
+            client::new_session_for(socket, name, cwd, command, purpose)?
+        }
+        TaskStart::Background { args } => {
+            let spec = TaskSpec { prompt: goal, args };
+            client::new_task(socket, name, cwd, spec, None)?
+        }
+    };
+    println!("{}", task_label(started.task));
+    Ok(())
+}
+
+/// Starts task `id`, which was made to wait. Prints its session's name.
+pub fn start_task(socket: &Path, id: &str) -> Result<()> {
+    tasks::ensure_enabled(&settings())?;
+    let id =
+        tasks::parse_id(id).with_context(|| format!("{id} isn't a task's number, like t12"))?;
+    let started = client::start_task(socket, id)?;
+    println!("{}", started.name);
+    Ok(())
+}
+
+/// Prints one task, by its number or its session's name: how it stands,
+/// where, what it was asked to do, and how it went.
+pub fn show_task(socket: &Path, task: &str, json: bool) -> Result<()> {
+    tasks::ensure_enabled(&settings())?;
+    let request = Request::ShowTask {
+        task: task.to_string(),
+    };
+    let Response::Task(task) = ask_running(socket, &request)? else {
+        bail!("the daemon didn't send the task");
+    };
+    if json {
+        println!("{}", serde_json::to_string_pretty(&task)?);
+    } else {
+        print!("{}", task_card(&task, now()));
+    }
+    Ok(())
+}
+
+/// Cancels a task, by its number or its session's name, and stops the
+/// session working on it.
+pub fn cancel_task(socket: &Path, task: &str) -> Result<()> {
+    tasks::ensure_enabled(&settings())?;
+    let request = Request::CancelTask {
+        task: task.to_string(),
+    };
+    expect_done(client::ask(socket, &request, false)?, socket)
+}
+
+/// Prints what happened to a task: how it stands, then its session's
+/// transcript, while the session is still there.
+pub fn task_log(socket: &Path, task: &str) -> Result<()> {
+    tasks::ensure_enabled(&settings())?;
+    let request = Request::TaskLog {
+        task: task.to_string(),
+    };
+    let Response::TaskLog { task, transcript } = ask_running(socket, &request)? else {
+        bail!("the daemon didn't send the task's log");
+    };
+    print!("{}", task_card(&task, now()));
+    println!();
+    match transcript {
+        Some(rows) => print!("{}", transcript_text(&rows)),
+        None if task.state == TaskState::Pending => println!("Nothing has worked on it yet."),
+        None => println!(
+            "Its session, {}, has gone, and its transcript with it.",
+            task.record.session
+        ),
+    }
+    Ok(())
+}
+
+/// Tasks as `crystal tasks` prints them: each one's number, how it stands,
+/// its session, where it ran, what it was asked to do, and how it went.
+/// With `all`, the project too.
+fn task_lines(tasks: &[TaskView], all: bool) -> String {
     let mut text = String::new();
     for task in tasks {
-        let stands = match &task.outcome {
-            None => "open",
-            Some(outcome) if outcome.failed => "failed",
-            Some(_) => "done",
-        };
-        let place = match (&task.branch, all) {
-            (Some(branch), true) => format!("{} {branch}", task.project),
+        let record = &task.record;
+        let place = match (&record.branch, all) {
+            (Some(branch), true) => format!("{} {branch}", record.project),
             (Some(branch), false) => branch.clone(),
-            (None, _) => task.project.clone(),
+            (None, _) => record.project.clone(),
         };
-        let goal = first_line(&task.goal);
-        let summary = match &task.outcome {
+        let session = if record.session.is_empty() {
+            "-"
+        } else {
+            &record.session
+        };
+        let goal = first_line(&record.goal);
+        let summary = match &record.outcome {
             Some(outcome) if !outcome.summary.is_empty() => format!(" — {}", outcome.summary),
             _ => String::new(),
         };
         text.push_str(&format!(
-            "{stands:<6}  {:<12}  {place}  {goal}{summary}\n",
-            task.session
+            "{:<4}  {:<9}  {session:<12}  {place}  {goal}{summary}\n",
+            task_label(record.id),
+            task.state.word(),
         ));
     }
     text
+}
+
+/// One task, as `crystal tasks show` prints it.
+fn task_card(task: &TaskView, now: u64) -> String {
+    let record = &task.record;
+    let label = task_label(record.id);
+    let mut card = format!(
+        "{label}  {}  {}\n",
+        task.state.word(),
+        first_line(&record.goal)
+    );
+    let mut line = |name: &str, said: String| card.push_str(&format!("  {name:<8}  {said}\n"));
+    match (&record.session[..], &task.session_state) {
+        ("", _) => {}
+        (session, Some(State::Running)) => line("session", session.to_string()),
+        (session, Some(state)) => line("session", format!("{session}, {state}")),
+        (session, None) => line("session", format!("{session}, gone")),
+    }
+    let place = match &record.branch {
+        Some(branch) => format!("{} {branch}", record.project),
+        None => record.project.clone(),
+    };
+    line("where", place);
+    let how = match (record.background, task.cost_usd) {
+        (true, Some(cost)) => format!("in the background, ${cost:.2} so far"),
+        (true, None) => "in the background".to_string(),
+        (false, _) => "in a terminal".to_string(),
+    };
+    line("runs", how);
+    if let Some(asking) = &task.asking {
+        let handle = if record.id.is_some() {
+            &label
+        } else {
+            &record.session
+        };
+        line(
+            "asking",
+            format!(
+                "{} {}: crystal answer {handle} y|n|always",
+                asking.tool, asking.gist
+            ),
+        );
+    }
+    if let Some(number) = record.backlog {
+        line("backlog", format!("#{number}"));
+    }
+    if record.created > 0 {
+        line("made", when(record.created, now));
+    }
+    if let Some(outcome) = &record.outcome {
+        let summary = if outcome.summary.is_empty() {
+            String::new()
+        } else {
+            format!(": {}", outcome.summary)
+        };
+        line(
+            "closed",
+            format!(
+                "{}, {}{summary}",
+                when(outcome.closed, now),
+                task.state.word()
+            ),
+        );
+    }
+    for (index, artifact) in record.artifacts.iter().enumerate() {
+        let label = if index == 0 { "kept" } else { "" };
+        let path = shell::home_relative(&artifact.path);
+        line(
+            label,
+            format!("{path} ({})", artifacts::size(artifact.bytes)),
+        );
+    }
+    if record.goal.lines().count() > 1 {
+        card.push('\n');
+        for goal_line in record.goal.lines() {
+            card.push_str(&format!("  {goal_line}\n"));
+        }
+    }
+    card
+}
+
+/// How long ago `then` was, at `now`: `just now`, `5m ago`.
+fn when(then: u64, now: u64) -> String {
+    match ago(then, now).as_str() {
+        "now" => "just now".to_string(),
+        ago => format!("{ago} ago"),
+    }
+}
+
+/// A session's rows as text: each without its trailing spaces, and no
+/// blank rows at the end.
+fn transcript_text(rows: &[String]) -> String {
+    let rows: Vec<&str> = rows.iter().map(|row| row.trim_end()).collect();
+    let end = rows
+        .iter()
+        .rposition(|row| !row.is_empty())
+        .map_or(0, |last| last + 1);
+    rows[..end].iter().map(|row| format!("{row}\n")).collect()
+}
+
+/// The agent the new-session panel starts first, asked to do `goal`.
+fn agent_command(config: &Config, goal: &str) -> Vec<String> {
+    let mut command: Vec<String> = config
+        .new_session
+        .split_whitespace()
+        .map(String::from)
+        .collect();
+    catalog::add_first_prompt(&mut command, goal);
+    command
 }
 
 /// What `crystal backlog` can do.
@@ -143,14 +424,9 @@ pub fn start_from_backlog(
     if item.done {
         bail!("#{number} is done already: `crystal backlog reopen {number}` first");
     }
-    let mut command: Vec<String> = config
-        .new_session
-        .split_whitespace()
-        .map(String::from)
-        .collect();
-    catalog::add_first_prompt(&mut command, &item.text);
+    let command = agent_command(&config, &item.text);
     let cwd = if worktree {
-        client::add_worktree(socket, &dir, &github::branch_for_issue(number, &item.text))?
+        client::add_worktree(socket, &dir, &forge::branch_for_issue(number, &item.text))?
     } else {
         dir
     };
@@ -158,7 +434,7 @@ pub fn start_from_backlog(
         task: Some(item.text.clone()),
         backlog: Some(number),
     };
-    client::new_session_for(socket, name, cwd, command, purpose)
+    Ok(client::new_session_for(socket, name, cwd, command, purpose)?.name)
 }
 
 /// Backlog items as `crystal backlog` prints them: number, a tick for one
@@ -181,6 +457,22 @@ fn first_line(text: &str) -> &str {
     text.lines().next().unwrap_or("")
 }
 
+/// Asks the daemon, which must be running already: these commands are
+/// about tasks it has.
+fn ask_running(socket: &Path, request: &Request) -> Result<Response> {
+    match client::ask(socket, request, false)? {
+        Some(response) => Ok(response),
+        None => bail!("no daemon is running on {}", socket.display()),
+    }
+}
+
+/// Now, in seconds since the Unix epoch.
+fn now() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs())
+}
+
 fn expect_done(response: Option<Response>, socket: &Path) -> Result<()> {
     match response {
         Some(Response::Done) => Ok(()),
@@ -198,41 +490,108 @@ fn settings() -> Config {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::TaskOutcome;
+    use crate::protocol::{Artifact, ArtifactKind, Asking, TaskOutcome, TaskRecord};
 
-    fn task(goal: &str, outcome: Option<(bool, &str)>) -> TaskRecord {
-        TaskRecord {
+    fn task(id: u64, goal: &str, outcome: Option<(TaskState, &str)>) -> TaskView {
+        TaskView::of_record(TaskRecord {
+            id: Some(id),
             goal: goal.into(),
             session: "claude".into(),
             project: "payments".into(),
             branch: Some("main".into()),
             background: false,
             backlog: None,
-            outcome: outcome.map(|(failed, summary)| TaskOutcome {
-                failed,
-                summary: summary.into(),
-                closed: 1,
-            }),
-        }
+            pending: false,
+            waiting: false,
+            created: 100,
+            outcome: outcome.map(|(state, summary)| TaskOutcome::new(state, summary, 1000)),
+            artifacts: Vec::new(),
+        })
     }
 
     #[test]
     fn a_task_line_says_how_it_stands_where_and_how_it_went() {
         let lines = task_lines(
             &[
-                task("fix the tests", None),
-                task("write the docs\nall of them", Some((false, "wrote them"))),
-                task("ship it", Some((true, "no network"))),
+                task(3, "fix the tests", None),
+                task(
+                    2,
+                    "write the docs\nall of them",
+                    Some((TaskState::Done, "wrote them")),
+                ),
+                task(1, "ship it", Some((TaskState::Failed, "no network"))),
             ],
             false,
         );
         assert_eq!(
             lines,
-            "open    claude        main  fix the tests\n\
-             done    claude        main  write the docs — wrote them\n\
-             failed  claude        main  ship it — no network\n"
+            "t3    running    claude        main  fix the tests\n\
+             t2    done       claude        main  write the docs — wrote them\n\
+             t1    failed     claude        main  ship it — no network\n"
         );
-        assert!(task_lines(&[task("x", None)], true).contains("payments main"));
+        assert!(task_lines(&[task(1, "x", None)], true).contains("payments main"));
+    }
+
+    #[test]
+    fn a_task_waiting_to_start_has_no_session_yet() {
+        let mut pending = task(4, "later", None);
+        pending.record.session = String::new();
+        pending.record.pending = true;
+        pending.state = pending.record.state();
+        assert!(task_lines(&[pending], false).starts_with("t4    pending    -     "));
+    }
+
+    #[test]
+    fn a_card_says_what_a_background_task_asks_for_and_what_it_cost() {
+        let mut asking = task(7, "fix the tests", None);
+        asking.record.background = true;
+        asking.session_state = Some(State::Running);
+        asking.cost_usd = Some(0.4213);
+        asking.asking = Some(Asking {
+            tool: "Bash".into(),
+            gist: "cargo test".into(),
+        });
+        let card = task_card(&asking, 160);
+        assert!(card.starts_with("t7  running  fix the tests\n"), "{card}");
+        assert!(card.contains("  session   claude\n"), "{card}");
+        assert!(card.contains("in the background, $0.42 so far"), "{card}");
+        assert!(
+            card.contains("asking    Bash cargo test: crystal answer t7 y|n|always"),
+            "{card}"
+        );
+        assert!(card.contains("made      1m ago"), "{card}");
+
+        let cancelled = task(
+            8,
+            "x",
+            Some((TaskState::Cancelled, "cancelled by the user")),
+        );
+        let card = task_card(&cancelled, 1000);
+        assert!(card.contains("  session   claude, gone\n"), "{card}");
+        assert!(card.contains("closed    just now, cancelled: cancelled by the user"));
+    }
+
+    #[test]
+    fn a_card_lists_the_files_kept_with_the_task() {
+        let mut kept = task(9, "write the plan", Some((TaskState::Done, "wrote it")));
+        let artifact = |kind, name: &str, bytes| Artifact {
+            kind,
+            name: name.into(),
+            path: Path::new("/state/tasks/t9").join(name),
+            bytes,
+        };
+        kept.record.artifacts = vec![
+            artifact(ArtifactKind::File, "plan.md", 9),
+            artifact(ArtifactKind::Handoff, "handoff.md", 3000),
+        ];
+        let card = task_card(&kept, 1000);
+        assert!(
+            card.contains(
+                "  kept      /state/tasks/t9/plan.md (9 bytes)\n\
+                 \x20           /state/tasks/t9/handoff.md (3 KiB)\n"
+            ),
+            "{card}"
+        );
     }
 
     #[test]

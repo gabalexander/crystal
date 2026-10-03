@@ -4,27 +4,35 @@
 use crate::agent_screen::{self, Looks, ScreenWatch};
 use crate::agents;
 use crate::codex::Rollouts;
+use crate::config::Config;
 use crate::distill::Material;
 use crate::front;
 use crate::git::Checkout;
+use crate::handover::{self, Got};
 use crate::keys;
 use crate::notify::{self, Notice};
 use crate::protocol::{
-    Activity, AgentEvent, Conversation, Front, SessionInfo, State, TaskInfo, TaskOutcome,
-    TaskRecord, TaskResult, TaskSpec,
+    Activity, AgentEvent, AgentReport, Answer, Asking, Conversation, Front, Reporter, SessionInfo,
+    State, TaskInfo, TaskOutcome, TaskRecord, TaskResult, TaskSpec, TaskState, TaskView,
 };
+use crate::report;
+use crate::spending::Spending;
 use crate::state::SavedSession;
-use crate::task::Task;
+use crate::task::{self, Task};
+use crate::tasks;
 use crate::vt;
 use anyhow::{Context, Result, ensure};
-use portable_pty::{CommandBuilder, ExitStatus, MasterPty, PtySize, native_pty_system};
+use portable_pty::{CommandBuilder, ExitStatus, MasterPty, native_pty_system};
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::io::{self, ErrorKind, Read, Write};
+use std::fs::File;
+use std::io::{self, Write};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, SyncSender};
-use std::sync::{Arc, Mutex};
-use std::thread;
+use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// How long a stopped session gets to exit after its hang-up before it's
@@ -86,10 +94,128 @@ pub struct Session {
     /// Whether its agent has been reminded that its task is still open,
     /// which it is once.
     reminded: bool,
+    /// The agent that says what it's doing itself, with `crystal report`,
+    /// while it holds the session: its reports are the session's status,
+    /// and crystal reads neither the screen nor hooks for it.
+    reporter: Option<Reporter>,
+    /// The job that was in front in the terminal as that agent took the
+    /// session over: the agent's own. A shell in front with another job is
+    /// the agent gone.
+    reporter_job: Option<i32>,
+    /// Whether crystal named the session after its program, and nothing
+    /// has named it since: its first prompt can, then.
+    named_after_program: bool,
     /// Tasks that closed of themselves, like a background task whose run
     /// ended, for the daemon to write down.
     closed: Vec<TaskRecord>,
+    /// What has happened to it since the daemon last asked, for it to tell.
+    changes: Vec<Change>,
     term: Arc<Term>,
+}
+
+/// Something that happened to a session, kept in order until the daemon
+/// takes it to tell.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Change {
+    /// Its agent went from doing one thing to another.
+    Activity {
+        from: Option<Activity>,
+        to: Option<Activity>,
+    },
+    /// A task's run started: its prompt, or a follow-up.
+    RunStarted { prompt: String },
+    /// That run ended, with what it came to.
+    RunEnded(TaskResult),
+    /// A background task's Claude asks the user for a permission.
+    Asking(Asking),
+    /// A task its run had closed opened again, with a follow-up.
+    Reopened,
+    /// Its agent's turn ended with its task still open: the task waits on
+    /// the user.
+    TaskWaiting,
+    /// An agent took the session's status over with `crystal report`.
+    Claimed,
+    /// The agent called this let go of it.
+    Released { agent: String },
+}
+
+/// A session as one daemon hands it to the next, in a handover: all it
+/// takes to carry it on, and its terminal by the number of the descriptor
+/// the next daemon inherits.
+#[derive(Serialize, Deserialize)]
+pub struct Handed {
+    name: String,
+    id: String,
+    command: Vec<String>,
+    cwd: PathBuf,
+    env: BTreeMap<String, String>,
+    pid: Option<u32>,
+    state: State,
+    activity: Option<Activity>,
+    changed: SystemTime,
+    looks: Looks,
+    front: Option<Front>,
+    conversation: Option<Conversation>,
+    rollouts: Option<Rollouts>,
+    told: Option<Activity>,
+    goal: Option<TaskInfo>,
+    reminded: bool,
+    reporter: Option<Reporter>,
+    reporter_job: Option<i32>,
+    named_after_program: bool,
+    screen: vt::Saved,
+    /// There will be no more output.
+    ended: bool,
+    /// The terminal's master side, while its program may still write to
+    /// it.
+    pty: Option<RawFd>,
+    task: Option<task::Handed>,
+}
+
+impl Handed {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The processes it has running, which the next daemon has to reap:
+    /// its program, or a task's `claude`s.
+    pub fn processes(&self) -> Vec<u32> {
+        match &self.task {
+            Some(task) => task.processes(),
+            None => self
+                .pid
+                .filter(|_| self.state == State::Running)
+                .into_iter()
+                .collect(),
+        }
+    }
+
+    /// What it takes to start the session again, as after any restart,
+    /// when it couldn't be carried on: `None` once its program had ended.
+    pub fn saved(&self) -> Option<SavedSession> {
+        if self.state != State::Running {
+            return None;
+        }
+        let conversation = match &self.task {
+            Some(task) => task.conversation().map(|id| Conversation {
+                id,
+                transcript: None,
+            }),
+            None => self.conversation.clone(),
+        };
+        Some(SavedSession {
+            name: self.name.clone(),
+            command: self.command.clone(),
+            cwd: self.cwd.clone(),
+            conversation,
+            task: self.task.as_ref().map(|task| task.spec().clone()),
+            goal: self.goal.clone(),
+            resume: self
+                .reporter
+                .as_ref()
+                .and_then(|reporter| reporter.resume.clone()),
+        })
+    }
 }
 
 impl Session {
@@ -104,7 +230,12 @@ impl Session {
         cwd: PathBuf,
         env: &BTreeMap<String, String>,
     ) -> Result<Session> {
-        let pty = native_pty_system().openpty(size(24, 80))?;
+        let pty = native_pty_system().openpty(portable_pty::PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })?;
         let mut builder = CommandBuilder::new(&argv[0]);
         builder.args(&argv[1..]);
         builder.cwd(&cwd);
@@ -112,36 +243,22 @@ impl Session {
         for (key, value) in env {
             builder.env(key, value);
         }
-        let mut child = pty.slave.spawn_command(builder)?;
+        let child = pty.slave.spawn_command(builder)?;
         // Only the child may hold the terminal's other end, so that its exit
         // ends the output.
         drop(pty.slave);
+        let pid = child
+            .process_id()
+            .context("the program started without a pid")?;
+        // Waited for by its pid, the same way a daemon it's handed over to
+        // waits for it.
+        drop(child);
 
-        let output = pty.master.try_clone_reader()?;
-        let term = Arc::new(Term::new(Some(Pty {
-            input: Mutex::new(pty.master.take_writer()?),
-            master: Mutex::new(pty.master),
-        })));
-        thread::spawn({
-            let term = term.clone();
-            move || term.pump(output)
-        });
-
-        let pid = child.process_id();
+        let term = Arc::new(Term::new(Some(Pty::of(pty.master)?)));
+        term.start_pumping();
         let state = Arc::new(Mutex::new(State::Running));
         let changed = Arc::new(Mutex::new(SystemTime::now()));
-        thread::spawn({
-            let state = state.clone();
-            let changed = changed.clone();
-            move || {
-                let ended = match child.wait() {
-                    Ok(status) => ended(&status),
-                    Err(_) => State::Exited { code: 1 },
-                };
-                *state.lock().unwrap() = ended;
-                *changed.lock().unwrap() = SystemTime::now();
-            }
-        });
+        watch_for_end(pid, state.clone(), changed.clone());
 
         Ok(Session {
             name,
@@ -150,7 +267,7 @@ impl Session {
             checkout: Checkout::find(&cwd),
             cwd,
             env: env.clone(),
-            pid,
+            pid: Some(pid),
             state,
             activity: None,
             changed,
@@ -164,15 +281,20 @@ impl Session {
             task: None,
             goal: None,
             reminded: false,
+            reporter: None,
+            reporter_job: None,
+            named_after_program: false,
             closed: Vec::new(),
+            changes: Vec::new(),
             term,
         })
     }
 
     /// Makes a task: a session for `claude -p` runs of `spec`, with `args`,
-    /// whose screen shows what Claude does. It starts at rest;
-    /// [`Session::prompt`] gives it its prompt. Given a `conversation`, its
-    /// runs carry it on.
+    /// whose screen shows what Claude does, and whose runs add to
+    /// `spending`. It starts at rest; [`Session::prompt`] gives it its
+    /// prompt. Given a `conversation`, its runs carry it on.
+    #[allow(clippy::too_many_arguments)]
     pub fn task(
         id: String,
         name: String,
@@ -180,6 +302,7 @@ impl Session {
         args: Vec<String>,
         cwd: PathBuf,
         env: BTreeMap<String, String>,
+        spending: Arc<Spending>,
         conversation: Option<String>,
     ) -> Session {
         let term = Arc::new(Term::without_terminal());
@@ -192,6 +315,7 @@ impl Session {
             env.clone(),
             term.clone(),
             state.clone(),
+            spending,
             conversation,
         );
         Session {
@@ -215,7 +339,11 @@ impl Session {
             task: Some(task),
             goal: None,
             reminded: false,
+            reporter: None,
+            reporter_job: None,
+            named_after_program: false,
             closed: Vec::new(),
+            changes: Vec::new(),
             term,
         }
     }
@@ -243,7 +371,7 @@ impl Session {
             .as_ref()
             .with_context(|| format!("{name} isn't a task"))?;
         ensure!(
-            task.pid().is_none(),
+            !task.is_working(),
             "{name} is still working: `crystal wait {name}` for it first"
         );
         task.result()
@@ -254,10 +382,37 @@ impl Session {
     /// going on, before any has ended, and for a session that isn't a task.
     pub fn finished_run(&self) -> Option<TaskResult> {
         let task = self.task.as_ref()?;
-        if task.pid().is_some() {
+        if task.is_working() {
             return None;
         }
         task.result()
+    }
+
+    /// The background task this session runs, or why there's none.
+    fn background(&self) -> Result<&Task> {
+        let name = &self.name;
+        self.task.as_ref().with_context(|| {
+            format!(
+                "{name} isn't a background task: answer it in its pane, or with `crystal send-keys {name}`"
+            )
+        })
+    }
+
+    /// Answers the permission a background task is waiting on the user
+    /// for.
+    pub fn answer(&self, answer: Answer, message: Option<&str>) -> Result<()> {
+        let task = self.background()?;
+        ensure!(self.is_running(), "{} has ended", self.name);
+        task.answer(answer, message)
+            .with_context(|| format!("{} can't take an answer", self.name))
+    }
+
+    /// Stops the run a background task is in the middle of.
+    pub fn interrupt(&self) -> Result<()> {
+        let task = self.background()?;
+        ensure!(self.is_running(), "{} has ended", self.name);
+        task.interrupt()
+            .with_context(|| format!("{} can't be interrupted", self.name))
     }
 
     /// A task started again after a restart: it says so, and waits at rest
@@ -278,20 +433,60 @@ impl Session {
         self.goal = Some(goal);
     }
 
-    /// Closes the session's task, done or failed, saying how it went, and
-    /// gives back the task as the project's history keeps it.
-    pub fn close_task(&mut self, failed: bool, summary: &str) -> Result<TaskRecord> {
+    /// Closes the session's task, saying how it went: `state` is done,
+    /// failed or cancelled. Gives back the task as the project's history
+    /// keeps it.
+    pub fn close_task(&mut self, state: TaskState, summary: &str) -> Result<TaskRecord> {
         let name = &self.name;
         let goal = self.goal.as_mut().with_context(|| {
             format!("{name} has no task: it wasn't started with something to do")
         })?;
-        goal.outcome = Some(TaskOutcome {
-            failed,
-            summary: summary.trim().to_string(),
-            closed: seconds_since_epoch(SystemTime::now()),
-        });
+        let closed = seconds_since_epoch(SystemTime::now());
+        goal.outcome = Some(TaskOutcome::new(state, summary, closed));
+        // A task that waited on the user asks nothing of them any more.
+        if std::mem::take(&mut goal.waiting) && self.activity == Some(Activity::Waiting) {
+            self.set_activity(Some(Activity::Idle));
+        }
         *self.changed.lock().unwrap() = SystemTime::now();
         Ok(self.task_record().expect("the task was just closed"))
+    }
+
+    /// Cancels the session's task, if it's open, saying `why`, and gives it
+    /// back as the project's history keeps it.
+    pub fn cancel_task(&mut self, why: &str) -> Option<TaskRecord> {
+        if !self.goal.as_ref().is_some_and(TaskInfo::is_open) {
+            return None;
+        }
+        self.close_task(TaskState::Cancelled, why).ok()
+    }
+
+    /// The session's task, as `crystal tasks show` shows it.
+    pub fn task_view(&self) -> Option<TaskView> {
+        let record = self.task_record()?;
+        Some(TaskView {
+            state: record.state(),
+            record,
+            session_state: Some(self.state.lock().unwrap().clone()),
+            asking: self.task.as_ref().and_then(Task::asking),
+            cost_usd: self.task.as_ref().map(Task::cost_usd),
+        })
+    }
+
+    /// The id of the session's task, if it has one.
+    pub fn task_id(&self) -> Option<u64> {
+        self.goal.as_ref()?.id
+    }
+
+    /// Whether the session has a task with no number yet.
+    pub fn task_unnumbered(&self) -> bool {
+        self.goal.as_ref().is_some_and(|goal| goal.id.is_none())
+    }
+
+    /// Gives the session's task the number `number`, unless it has one.
+    pub fn number_task(&mut self, number: u64) {
+        if let Some(goal) = &mut self.goal {
+            goal.id.get_or_insert(number);
+        }
     }
 
     /// Whether to remind the agent, as it ends a turn, that its task is
@@ -316,6 +511,12 @@ impl Session {
         std::mem::take(&mut self.closed)
     }
 
+    /// What has happened to it since this was last asked, in order, for
+    /// the daemon to tell.
+    pub fn take_changes(&mut self) -> Vec<Change> {
+        std::mem::take(&mut self.changes)
+    }
+
     /// The session's task as `crystal tasks` lists it, if it has one.
     pub fn task_record(&self) -> Option<TaskRecord> {
         let goal = self.goal.as_ref()?;
@@ -325,13 +526,18 @@ impl Session {
             None => crate::project::of(&self.cwd).name,
         };
         Some(TaskRecord {
+            id: goal.id,
             goal: goal.goal.clone(),
             session: self.name.clone(),
             project,
             branch: worktree.and_then(|worktree| worktree.branch),
             background: goal.background,
             backlog: goal.backlog,
+            pending: false,
+            waiting: goal.waiting,
+            created: goal.created,
             outcome: goal.outcome.clone(),
+            artifacts: Vec::new(),
         })
     }
 
@@ -374,14 +580,18 @@ impl Session {
         *self.state.lock().unwrap() == State::Running
     }
 
-    /// What the session's agent is doing, when it reports that.
-    pub fn activity(&self) -> Option<Activity> {
-        self.activity
-    }
-
     pub fn info(&self) -> SessionInfo {
+        // An agent that reports for itself is in front by the name it gave,
+        // whatever its process is called.
+        let front = match &self.reporter {
+            Some(reporter) => Some(Front::Agent {
+                program: reporter.agent.clone(),
+                name: reporter.agent.clone(),
+            }),
+            None => self.front.clone(),
+        };
         SessionInfo {
-            front: self.front.clone(),
+            front,
             name: self.name.clone(),
             id: self.id.clone(),
             command: self.command.clone(),
@@ -392,45 +602,214 @@ impl Session {
             worktree: self.checkout.as_ref().map(Checkout::worktree),
             changed: seconds_since_epoch(*self.changed.lock().unwrap()),
             task: self.goal.clone(),
+            asking: self.task.as_ref().and_then(Task::asking),
+            reporter: self.reporter.clone(),
         }
     }
 
-    /// Works out what the agent is doing from what it just reported.
-    pub fn on_agent_event(&mut self, event: AgentEvent) {
-        let activity = next_activity(self.activity, event, self.term.is_watched());
-        if activity != self.activity {
-            self.activity = activity;
+    /// Takes what the session's agent says about itself with `crystal
+    /// report`. Its first report of what it's doing takes the session's
+    /// status over; a resume command alone needs it to hold the session
+    /// already, so that a command never outlives the agent it's for.
+    pub fn take_report(&mut self, report: AgentReport) -> Result<()> {
+        match report {
+            AgentReport::State {
+                agent,
+                state,
+                message,
+                resume,
+            } => {
+                if let Some(argv) = &resume {
+                    report::check_resume(argv)?;
+                }
+                let agent = match agent {
+                    Some(agent) => report::checked_agent(agent)?,
+                    None => self.agent_name(),
+                };
+                if self.reporter.is_none() {
+                    self.changes.push(Change::Claimed);
+                    self.reporter_job = self.term.foreground_group();
+                }
+                let reporter = self.reporter.get_or_insert(Reporter {
+                    agent: agent.clone(),
+                    message: None,
+                    resume: None,
+                });
+                reporter.agent = agent;
+                reporter.message = message.filter(|message| !message.trim().is_empty());
+                if resume.is_some() {
+                    reporter.resume = resume;
+                }
+                self.on_agent_event(report::event(state, self.activity));
+            }
+            AgentReport::Resume { agent, argv } => {
+                report::check_resume(&argv)?;
+                let agent = agent.map(report::checked_agent).transpose()?;
+                let reporter = self.reporter.as_mut().with_context(|| {
+                    format!(
+                        "no agent reports for {} yet: say what it's doing along with the \
+                         command, like `crystal report idle -- <command>`",
+                        self.name
+                    )
+                })?;
+                if let Some(agent) = agent {
+                    reporter.agent = agent;
+                }
+                reporter.resume = Some(argv);
+            }
+            AgentReport::Release => self.release(),
+        }
+        Ok(())
+    }
+
+    /// The name of an agent that reports without giving one: the one it
+    /// gave before, or else what's in front in the terminal.
+    fn agent_name(&self) -> String {
+        if let Some(reporter) = &self.reporter {
+            return reporter.agent.clone();
+        }
+        let front = self
+            .front
+            .clone()
+            .or_else(|| front::of_command(&self.command));
+        front.map_or_else(|| "agent".to_string(), |front| front.word().to_string())
+    }
+
+    /// The agent that reports for itself lets go of the session: crystal
+    /// reads what it's doing for itself again, from nothing, and the
+    /// agent's command won't resume it.
+    fn release(&mut self) {
+        let Some(reporter) = self.reporter.take() else {
+            return;
+        };
+        self.reporter_job = None;
+        self.changes.push(Change::Released {
+            agent: reporter.agent,
+        });
+        self.screen_watch = ScreenWatch::default();
+        if self.activity.is_some() {
+            self.set_activity(None);
             *self.changed.lock().unwrap() = SystemTime::now();
         }
     }
 
-    /// Keeps up with what the session's agent is doing: a task's from its
-    /// runs, any other program's from its screen.
-    pub fn check(&mut self) {
-        let Some(task) = &mut self.task else {
-            return self.check_screen();
-        };
-        let events = task.events();
-        for event in events {
-            self.on_agent_event(event);
-            self.follow_runs(event);
+    /// Whether an agent that reports for itself holds the session.
+    pub fn is_claimed(&self) -> bool {
+        self.reporter.is_some()
+    }
+
+    /// crystal named the session after its program: its first prompt can
+    /// name it.
+    pub fn mark_named_after_program(&mut self) {
+        self.named_after_program = true;
+    }
+
+    /// Whether the session's first prompt can name it: crystal named it
+    /// after its program, and nothing has named it since.
+    pub fn is_named_after_program(&self) -> bool {
+        self.named_after_program
+    }
+
+    /// Its name was given now, by the user or a script, or comes from its
+    /// prompt: nothing names it after this but a rename.
+    pub fn keep_name(&mut self) {
+        self.named_after_program = false;
+    }
+
+    /// Works out what the agent is doing from what it just reported. A
+    /// turn that ends with the session's task still open is a question for
+    /// the user, and the task waits on them until the agent works again.
+    pub fn on_agent_event(&mut self, event: AgentEvent) {
+        let turn_ended = event == AgentEvent::TurnEnded
+            || (event == AgentEvent::StillIdle && self.activity == Some(Activity::Working));
+        let mut activity = next_activity(self.activity, event, self.term.is_watched());
+        if let Some(goal) = self.goal.as_mut().filter(|goal| goal.is_open()) {
+            if turn_ended && tasks_on() {
+                if !std::mem::replace(&mut goal.waiting, true) {
+                    self.changes.push(Change::TaskWaiting);
+                }
+                activity = Some(Activity::Waiting);
+            } else if matches!(event, AgentEvent::TurnStarted | AgentEvent::ToolFinished) {
+                goal.waiting = false;
+            }
+        }
+        if activity != self.activity {
+            self.set_activity(activity);
+            *self.changed.lock().unwrap() = SystemTime::now();
         }
     }
 
-    /// A background task closes itself when a run ends, from what Claude
-    /// said at the end, and opens again when a follow-up starts another.
+    /// Takes what the agent is doing now, noting the change for the daemon
+    /// to tell.
+    fn set_activity(&mut self, activity: Option<Activity>) {
+        if activity != self.activity {
+            self.changes.push(Change::Activity {
+                from: self.activity,
+                to: activity,
+            });
+            self.activity = activity;
+        }
+    }
+
+    /// Keeps up with what the session's agent is doing, a task's from its
+    /// runs, any other program's from its screen, and fails a task whose
+    /// session has ended under it.
+    pub fn check(&mut self) {
+        match self.task.as_mut().map(Task::events) {
+            Some(events) => {
+                for event in events {
+                    // How a run ended closes its task first: a task that
+                    // stays open waits on the user.
+                    self.follow_runs(event);
+                    self.on_agent_event(event);
+                }
+            }
+            None => self.check_screen(),
+        }
+        self.fail_task_if_ended();
+    }
+
+    /// Keeps up with a task's runs, noting each that starts and ends, and a
+    /// permission it comes to ask for. A background task closes itself when
+    /// a run ends, from what Claude said at the end, and opens again when a
+    /// follow-up starts another. A run the user stopped leaves it open.
     fn follow_runs(&mut self, event: AgentEvent) {
-        let Some(goal) = &mut self.goal else {
+        let Some(task) = &self.task else {
             return;
         };
         match event {
-            AgentEvent::TurnStarted if goal.outcome.is_some() => goal.outcome = None,
-            AgentEvent::TurnEnded if goal.outcome.is_none() => {
-                let Some(result) = self.task.as_ref().and_then(Task::result) else {
+            AgentEvent::TurnStarted => {
+                let prompt = task.last_prompt();
+                if let Some(goal) = &mut self.goal
+                    && goal.outcome.is_some()
+                {
+                    goal.outcome = None;
+                    self.changes.push(Change::Reopened);
+                }
+                self.changes.push(Change::RunStarted { prompt });
+            }
+            AgentEvent::Asking => {
+                if let Some(asking) = task.asking() {
+                    self.changes.push(Change::Asking(asking));
+                }
+            }
+            AgentEvent::TurnEnded => {
+                let Some(result) = task.result() else {
                     return;
                 };
-                let summary = result.text.lines().next().unwrap_or("").to_string();
-                if let Ok(record) = self.close_task(result.failed, &summary) {
+                let interrupted = task.was_interrupted();
+                self.changes.push(Change::RunEnded(result.clone()));
+                let open = self.goal.as_ref().is_some_and(TaskInfo::is_open);
+                if !open || interrupted {
+                    return;
+                }
+                let summary = result.text.lines().next().unwrap_or("");
+                let state = if result.failed {
+                    TaskState::Failed
+                } else {
+                    TaskState::Done
+                };
+                if let Ok(record) = self.close_task(state, summary) {
                     self.closed.push(record);
                 }
             }
@@ -438,8 +817,23 @@ impl Session {
         }
     }
 
+    /// Fails the session's task when the session has ended with it still
+    /// open: nobody is left who could close it.
+    fn fail_task_if_ended(&mut self) {
+        let open = self.goal.as_ref().is_some_and(TaskInfo::is_open);
+        if !open || self.is_running() || !tasks_on() {
+            return;
+        }
+        let why = format!("its session ended: {}", self.state.lock().unwrap());
+        if let Ok(record) = self.close_task(TaskState::Failed, &why) {
+            self.closed.push(record);
+        }
+    }
+
     /// Looks at what's in front in the terminal, when its job has changed
     /// or it's been a while. Cheap otherwise: one question to the terminal.
+    /// An agent that reports for itself and left without letting go of the
+    /// session lets go of it once the shell is back in front.
     pub fn check_front(&mut self) {
         if self.task.is_some() || !self.is_running() {
             return;
@@ -448,13 +842,16 @@ impl Session {
             return;
         };
         let same_job = self.front_group == Some(group);
-        if same_job && self.front_checked.elapsed() < FRONT_RECHECK {
-            return;
+        if !same_job || self.front_checked.elapsed() >= FRONT_RECHECK {
+            self.front_group = Some(group);
+            self.front_checked = Instant::now();
+            if let Some(front) = front::of_process(group) {
+                self.set_front(front);
+            }
         }
-        self.front_group = Some(group);
-        self.front_checked = Instant::now();
-        if let Some(front) = front::of_process(group) {
-            self.set_front(front);
+        let at_a_shell = matches!(self.front, Some(Front::Shell { .. }));
+        if at_a_shell && self.reporter_job != Some(group) {
+            self.release();
         }
     }
 
@@ -467,7 +864,7 @@ impl Session {
         }
         let agent_left = self.front.as_ref().is_some_and(Front::is_agent);
         if agent_left && self.activity.is_some() {
-            self.activity = None;
+            self.set_activity(None);
             *self.changed.lock().unwrap() = SystemTime::now();
         }
         self.screen_watch = ScreenWatch::default();
@@ -482,9 +879,10 @@ impl Session {
 
     /// Reads what the agent is doing off the screen, and takes it as an
     /// event when that has changed. Only while an agent is in front: a
-    /// shell or any other program can print an agent's words.
+    /// shell or any other program can print an agent's words. An agent
+    /// that reports for itself knows better than its screen.
     fn check_screen(&mut self) {
-        if !self.is_running() || !self.agent_in_front() {
+        if !self.is_running() || !self.agent_in_front() || self.is_claimed() {
             return;
         }
         let looks = self.term.looks();
@@ -566,7 +964,8 @@ impl Session {
     }
 
     /// What it takes to start the session's program again: its name,
-    /// command and directory, and the agent's conversation to pick up.
+    /// command and directory, and the agent's conversation to pick up, or
+    /// the command an agent that reports for itself resumes with.
     pub fn launch(&self) -> SavedSession {
         // A task's conversation comes from Claude's own events, which need
         // no transcript file to resume it.
@@ -584,13 +983,121 @@ impl Session {
             conversation,
             task: self.task.as_ref().map(|task| task.spec().clone()),
             goal: self.goal.clone(),
+            resume: self
+                .reporter
+                .as_ref()
+                .and_then(|reporter| reporter.resume.clone()),
         }
+    }
+
+    /// Hands the session over to the next daemon: what it takes to carry it
+    /// on, its screen, and its terminal or a task's pipes, kept open across
+    /// the exec. Its readers must have been stopped
+    /// ([`handover::stop_reading`]). Its program's state comes back held,
+    /// to hold until the exec: a program that ends meanwhile is reaped only
+    /// with it held, so it's either handed over as having ended, or handed
+    /// over unreaped, for the next daemon to wait for.
+    pub fn hand_over(&self) -> io::Result<(Handed, MutexGuard<'_, State>)> {
+        let task = self.task.as_ref().map(Task::hand_over).transpose()?;
+        let (screen, ended, pty) = self.term.hand_over()?;
+        let state = self.state.lock().unwrap();
+        let handed = Handed {
+            name: self.name.clone(),
+            id: self.id.clone(),
+            command: self.command.clone(),
+            cwd: self.cwd.clone(),
+            env: self.env.clone(),
+            pid: self.pid,
+            state: state.clone(),
+            activity: self.activity,
+            changed: *self.changed.lock().unwrap(),
+            looks: self.screen_watch.looks(),
+            front: self.front.clone(),
+            conversation: self.conversation.clone(),
+            rollouts: self.rollouts.clone(),
+            told: self.told,
+            goal: self.goal.clone(),
+            reminded: self.reminded,
+            reporter: self.reporter.clone(),
+            reporter_job: self.reporter_job,
+            named_after_program: self.named_after_program,
+            screen,
+            ended,
+            pty,
+            task,
+        };
+        Ok((handed, state))
+    }
+
+    /// Carries on a session the last daemon handed over: its screen as it
+    /// was, its terminal read again, and its program waited for. A task's
+    /// runs add to `spending`. Fails when what it was handed isn't open.
+    pub fn adopt(handed: Handed, spending: &Arc<Spending>) -> Result<Session> {
+        let pty = handed
+            .pty
+            .map(|fd| handover::inherit(fd).map(|fd| Pty::new(File::from(fd))))
+            .transpose()
+            .with_context(|| format!("{}'s terminal wasn't handed over", handed.name))?;
+        let screen = vt::Screen::restored(&handed.screen);
+        let term = Arc::new(Term::with_screen(pty, screen));
+        let state = Arc::new(Mutex::new(handed.state.clone()));
+        let changed = Arc::new(Mutex::new(handed.changed));
+        let task = match handed.task {
+            Some(task) => Some(
+                Task::adopt(
+                    task,
+                    handed.cwd.clone(),
+                    handed.env.clone(),
+                    term.clone(),
+                    state.clone(),
+                    spending.clone(),
+                )
+                .with_context(|| format!("{}'s claude wasn't handed over", handed.name))?,
+            ),
+            None => None,
+        };
+        if handed.ended {
+            term.close();
+        } else {
+            term.start_pumping();
+        }
+        if let (Some(pid), State::Running, None) = (handed.pid, &handed.state, &task) {
+            watch_for_end(pid, state.clone(), changed.clone());
+        }
+        Ok(Session {
+            name: handed.name,
+            id: handed.id,
+            command: handed.command,
+            checkout: Checkout::find(&handed.cwd),
+            cwd: handed.cwd,
+            env: handed.env,
+            pid: handed.pid,
+            state,
+            activity: handed.activity,
+            changed,
+            screen_watch: ScreenWatch::seeing(handed.looks),
+            front: handed.front,
+            front_group: None,
+            front_checked: Instant::now(),
+            conversation: handed.conversation,
+            rollouts: handed.rollouts,
+            told: handed.told,
+            task,
+            goal: handed.goal,
+            reminded: handed.reminded,
+            reporter: handed.reporter,
+            reporter_job: handed.reporter_job,
+            named_after_program: handed.named_after_program,
+            closed: Vec::new(),
+            changes: Vec::new(),
+            term,
+        })
     }
 
     /// Someone has just looked at the session.
     pub fn seen(&mut self) {
         if self.activity == Some(Activity::Done) {
-            self.activity = Some(Activity::Idle);
+            self.set_activity(Some(Activity::Idle));
         }
     }
 
@@ -626,13 +1133,70 @@ pub struct Term {
     /// does on the screen itself.
     pty: Option<Pty>,
     screen: Mutex<Screen>,
+    /// The thread reading the program's output, for a handover to wait for
+    /// once it has stopped it.
+    pump: Mutex<Option<JoinHandle<()>>>,
 }
 
-/// The daemon's side of a PTY: how the program's terminal is sized, and
-/// the way in.
+/// The daemon's side of a PTY, its master side: read for what the program
+/// writes, written with what it's sent, and where its size is set.
 struct Pty {
-    master: Mutex<Box<dyn MasterPty + Send>>,
-    input: Mutex<Box<dyn Write + Send>>,
+    master: File,
+    /// Held while writing, so that two writers' bytes never interleave.
+    writing: Mutex<()>,
+}
+
+impl Pty {
+    fn new(master: File) -> Pty {
+        Pty {
+            master,
+            writing: Mutex::new(()),
+        }
+    }
+
+    /// The master side portable_pty opened, on a descriptor of crystal's
+    /// own, which a handover can keep open: portable_pty's closes as it's
+    /// dropped. Its writer is never made, since dropping it would send the
+    /// program an end of file.
+    fn of(master: Box<dyn MasterPty + Send>) -> Result<Pty> {
+        let fd = master
+            .as_raw_fd()
+            .context("the terminal has no descriptor")?;
+        // SAFETY: `master` keeps the descriptor open until it's dropped,
+        // after this borrow.
+        let ours = unsafe { BorrowedFd::borrow_raw(fd) }.try_clone_to_owned()?;
+        Ok(Pty::new(File::from(ours)))
+    }
+
+    fn write(&self, bytes: &[u8]) -> io::Result<()> {
+        let _writing = self.writing.lock().unwrap();
+        (&self.master).write_all(bytes)
+    }
+
+    /// Tells the kernel, and so the program, the terminal's new size.
+    fn resize(&self, rows: u16, cols: u16) -> io::Result<()> {
+        let size = libc::winsize {
+            ws_row: rows,
+            ws_col: cols,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        // SAFETY: TIOCSWINSZ reads one winsize, which `size` is.
+        let set = unsafe { libc::ioctl(self.master.as_raw_fd(), libc::TIOCSWINSZ as _, &size) };
+        if set == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// The process group in front: the job its keys go to.
+    fn foreground_group(&self) -> Option<i32> {
+        // SAFETY: tcgetpgrp only asks.
+        match unsafe { libc::tcgetpgrp(self.master.as_raw_fd()) } {
+            group if group > 0 => Some(group),
+            _ => None,
+        }
+    }
 }
 
 struct Screen {
@@ -641,6 +1205,9 @@ struct Screen {
     /// answers come from here, whether anyone's watching or not.
     vt: vt::Screen,
     viewers: Vec<Viewer>,
+    /// Told each time there's output, but not watching: see
+    /// [`Term::listen`].
+    listeners: Vec<SyncSender<()>>,
     /// The program has closed its end: there will be no more output.
     ended: bool,
 }
@@ -663,14 +1230,46 @@ impl Term {
     /// A screen of 24 rows by 80 columns, until a viewer gives it another
     /// size.
     fn new(pty: Option<Pty>) -> Term {
+        Term::with_screen(pty, vt::Screen::answering(24, 80))
+    }
+
+    fn with_screen(pty: Option<Pty>, vt: vt::Screen) -> Term {
         Term {
             pty,
             screen: Mutex::new(Screen {
-                vt: vt::Screen::answering(24, 80),
+                vt,
                 viewers: Vec::new(),
+                listeners: Vec::new(),
                 ended: false,
             }),
+            pump: Mutex::default(),
         }
+    }
+
+    /// Reads the program's output, on a thread of its own, until the
+    /// program closes the terminal or a handover stops it.
+    fn start_pumping(self: &Arc<Term>) {
+        if self.pty.is_none() {
+            return;
+        }
+        let term = self.clone();
+        *self.pump.lock().unwrap() = Some(thread::spawn(move || term.pump()));
+    }
+
+    /// The screen to hand over once a handover has stopped the reading of
+    /// the program's output, whether there will be more, and while there
+    /// may be, its terminal, kept open across the exec.
+    fn hand_over(&self) -> io::Result<(vt::Saved, bool, Option<RawFd>)> {
+        let pump = self.pump.lock().unwrap().take();
+        if let Some(pump) = pump {
+            let _ = pump.join();
+        }
+        let mut screen = self.screen.lock().unwrap();
+        let pty = match &self.pty {
+            Some(pty) if !screen.ended => Some(handover::keep_across_exec(pty.master.as_fd())?),
+            _ => None,
+        };
+        Ok((screen.vt.save(), screen.ended, pty))
     }
 
     /// A screen with no program behind it, for a task to draw on.
@@ -698,6 +1297,25 @@ impl Term {
         }
     }
 
+    /// A signal each time the program writes something, to look at the
+    /// screen again: never more than one waiting, however much it writes,
+    /// and none after it has ended. Unlike a viewer, a listener isn't
+    /// watching, so the session isn't seen for it.
+    pub fn listen(&self) -> Receiver<()> {
+        let mut screen = self.screen.lock().unwrap();
+        let (signal, listener) = mpsc::sync_channel(1);
+        if !screen.ended {
+            screen.listeners.push(signal);
+        }
+        listener
+    }
+
+    /// The screen, one string per row, after the last `history` rows of
+    /// the history.
+    pub fn recent_rows(&self, history: usize) -> Vec<String> {
+        self.screen.lock().unwrap().vt.recent_rows(history)
+    }
+
     /// What the screen says the agent is doing.
     pub fn looks(&self) -> Looks {
         let screen = self.screen.lock().unwrap();
@@ -716,6 +1334,11 @@ impl Term {
         self.screen.lock().unwrap().vt.bracketed_paste()
     }
 
+    /// How many columns wide the screen is.
+    pub fn columns(&self) -> u16 {
+        self.screen.lock().unwrap().vt.size().1
+    }
+
     /// What's on the screen, one string per row, after the rows of the
     /// history with `with_history`.
     pub fn rows(&self, with_history: bool) -> Vec<String> {
@@ -725,9 +1348,7 @@ impl Term {
     /// The process group in front in the terminal: the job its keys go to.
     /// `None` without a terminal, or when the terminal won't say.
     pub fn foreground_group(&self) -> Option<i32> {
-        let pty = self.pty.as_ref()?;
-        let master = pty.master.lock().unwrap();
-        master.process_group_leader()
+        self.pty.as_ref()?.foreground_group()
     }
 
     pub fn is_watched(&self) -> bool {
@@ -741,7 +1362,7 @@ impl Term {
 
     pub fn write(&self, bytes: &[u8]) -> io::Result<()> {
         match &self.pty {
-            Some(pty) => pty.input.lock().unwrap().write_all(bytes),
+            Some(pty) => pty.write(bytes),
             None => Err(io::Error::other("a task takes no keys")),
         }
     }
@@ -750,7 +1371,7 @@ impl Term {
         let mut screen = self.screen.lock().unwrap();
         screen.vt.resize(rows, cols);
         if let Some(pty) = &self.pty {
-            pty.master.lock().unwrap().resize(size(rows, cols))?;
+            pty.resize(rows, cols)?;
         }
         Ok(())
     }
@@ -767,22 +1388,27 @@ impl Term {
         let mut screen = self.screen.lock().unwrap();
         screen.ended = true;
         screen.viewers.clear();
+        screen.listeners.clear();
     }
 
     /// Reads the program's output until it closes the terminal, and answers
-    /// the program's questions to its terminal.
-    fn pump(&self, mut output: Box<dyn Read + Send>) {
+    /// the program's questions to its terminal. A handover stops it with
+    /// the rest unread, for the next daemon to read.
+    fn pump(&self) {
+        let Some(pty) = &self.pty else {
+            return;
+        };
         let mut buf = [0; 16 * 1024];
         loop {
-            let n = match output.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => n,
-                Err(err) if err.kind() == ErrorKind::Interrupted => continue,
-                Err(_) => break,
-            };
-            let replies = self.take_output(&buf[..n]);
-            if !replies.is_empty() {
-                let _ = self.write(&replies);
+            match handover::readers().read(&pty.master, &mut buf) {
+                Ok(Got::Bytes(n)) => {
+                    let replies = self.take_output(&buf[..n]);
+                    if !replies.is_empty() {
+                        let _ = self.write(&replies);
+                    }
+                }
+                Ok(Got::Stopped) => return,
+                Ok(Got::End) | Err(_) => break,
             }
         }
         self.close();
@@ -801,8 +1427,19 @@ impl Term {
         screen
             .viewers
             .retain(|viewer| viewer.feed.try_send(chunk.clone()).is_ok());
+        // One signal waiting is enough: the listener looks at the screen as
+        // it is then.
+        screen.listeners.retain(|listener| {
+            !matches!(listener.try_send(()), Err(TrySendError::Disconnected(_)))
+        });
         screen.vt.take_replies()
     }
+}
+
+/// Whether tasks are on, by the config as it is now: with them off, an
+/// open task is left as it is.
+fn tasks_on() -> bool {
+    tasks::enabled(&Config::load().unwrap_or_default())
 }
 
 /// `time` as seconds since the Unix epoch, which is how it travels.
@@ -841,13 +1478,21 @@ fn task_command(spec: &TaskSpec) -> Vec<String> {
     command
 }
 
-fn size(rows: u16, cols: u16) -> PtySize {
-    PtySize {
-        rows,
-        cols,
-        pixel_width: 0,
-        pixel_height: 0,
-    }
+/// Waits, on a thread of its own, for the program `pid` to end, then notes
+/// how it ended in `state`. It's reaped only with `state` held, which a
+/// handover holds from before it looks at the session until the exec: so
+/// the handover either sees that it ended, or hands it over unreaped, for
+/// the next daemon to wait for.
+fn watch_for_end(pid: u32, state: Arc<Mutex<State>>, changed: Arc<Mutex<SystemTime>>) {
+    thread::spawn(move || {
+        let _ = handover::wait_for_end(pid);
+        let mut state = state.lock().unwrap();
+        *state = match handover::reap(pid) {
+            Ok(status) => ended(&status.into()),
+            Err(_) => State::Exited { code: 1 },
+        };
+        *changed.lock().unwrap() = SystemTime::now();
+    });
 }
 
 fn ended(status: &ExitStatus) -> State {
@@ -876,6 +1521,81 @@ pub fn signal_group(pid: u32, signal: libc::c_int) {
 mod tests {
     use super::*;
     use Activity::*;
+
+    #[test]
+    fn a_session_handed_over_comes_back_as_it_was() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::Db::open(&dir.path().join("crystal.sock")).unwrap();
+        let spending = Arc::new(Spending::new(db));
+        let mut screen = vt::Screen::answering(5, 20);
+        screen.process(b"\x1b]2;working\x07bye\r\n");
+        let goal = TaskInfo {
+            id: Some(12),
+            goal: "fix the login".into(),
+            background: false,
+            backlog: None,
+            waiting: true,
+            created: 1,
+            outcome: None,
+        };
+        let handed = Handed {
+            name: "agent".into(),
+            id: "id-1".into(),
+            command: vec!["claude".into()],
+            cwd: dir.path().to_path_buf(),
+            env: BTreeMap::new(),
+            pid: Some(4242),
+            state: State::Exited { code: 3 },
+            activity: Some(Waiting),
+            changed: UNIX_EPOCH + Duration::from_secs(100),
+            looks: Looks::Waiting,
+            front: Some(Front::Shell { name: "zsh".into() }),
+            conversation: Some(Conversation {
+                id: "conv-1".into(),
+                transcript: None,
+            }),
+            rollouts: None,
+            told: Some(Waiting),
+            goal: Some(goal.clone()),
+            reminded: true,
+            reporter: Some(Reporter {
+                agent: "pi".into(),
+                message: Some("approve the deploy".into()),
+                resume: Some(vec!["pi".into(), "--resume".into(), "s 1".into()]),
+            }),
+            reporter_job: Some(4242),
+            named_after_program: true,
+            screen: screen.save(),
+            ended: true,
+            pty: None,
+            task: None,
+        };
+        // Through the file it's handed over in.
+        let handed: Handed =
+            serde_json::from_str(&serde_json::to_string(&handed).unwrap()).unwrap();
+        assert!(handed.saved().is_none(), "it had ended");
+        assert!(handed.processes().is_empty());
+
+        let mut session = Session::adopt(handed, &spending).unwrap();
+        let info = session.info();
+        assert_eq!((info.name.as_str(), info.id.as_str()), ("agent", "id-1"));
+        assert_eq!(info.state, State::Exited { code: 3 });
+        assert_eq!(info.activity, Some(Waiting));
+        assert_eq!(info.changed, 100);
+        assert_eq!(info.task, Some(goal));
+        assert_eq!(session.conversation_id(), Some("conv-1"));
+        assert_eq!(session.term().rows(false)[0], "bye");
+        assert!(session.term().watch(false).feed.is_none(), "it had ended");
+        // Reminded of its task once already, it isn't again.
+        assert!(!session.remind_of_task());
+        // Still held by the agent that reports for itself, which resumes
+        // with its own command, and still named after its program.
+        assert!(session.is_claimed());
+        assert_eq!(info.reporter.unwrap().agent, "pi");
+        let resume = session.launch().resume.unwrap();
+        assert_eq!(resume, ["pi", "--resume", "s 1"]);
+        assert!(session.is_named_after_program());
+    }
 
     fn after(before: Option<Activity>, event: AgentEvent) -> Option<Activity> {
         next_activity(before, event, false)

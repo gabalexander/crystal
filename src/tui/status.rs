@@ -66,6 +66,8 @@ mod tests {
             worktree: None,
             changed: 0,
             task: None,
+            asking: None,
+            reporter: None,
         }
     }
 

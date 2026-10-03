@@ -1,0 +1,24 @@
+state · width 80
+                 ●
+                 │
+                 ▼
+             ┌──────┐
+             │ Idle │
+             └───┬──┘
+                 │ prompt sent
+                 ▼
+            ┌─────────┐
+            │ Running │
+            └─┬───┬───┘
+              │ ▲ │ ▲
+    ┌─────────┘ │ └─┼─┐
+    │       ┌───┘   └─┼────┐
+    │ permission asked│ turn ends
+    │       │ answered│    │ next prompt
+    ▼       │         ▼    │
+┌───────────┴───┐  ┌───────┴──┐
+│ NeedsFeedback │  │ Finished │
+└───────────────┘  └─────┬────┘
+                         │
+                         ▼
+                         ◉

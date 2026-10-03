@@ -1,10 +1,10 @@
 //! Layouts, `S` in the sidebar: the tabs saved under a name, to put back
 //! later. A layout is the tabs as they were: their names, which sessions
-//! each holds, its splits and the order of its panes, its float, whether
-//! it's zoomed, and which tab was in front. Restoring one arranges the
-//! sessions running now that way; those it names that have gone since are
-//! left out, and those it doesn't name join the tab in front. The tabs a
-//! restore replaces are kept, to go back to.
+//! each holds, its panes with how they're split and how big each is, its
+//! float, whether it's zoomed, and which tab was in front. Restoring one
+//! arranges the sessions running now that way; those it names that have
+//! gone since are left out, and those it doesn't name join the tab in
+//! front. The tabs a restore replaces are kept, to go back to.
 //!
 //! The view's keys: Enter restores the layout the bar is on, `s` saves the
 //! tabs as one under a name typed on the footer, and `x` removes one once
@@ -28,8 +28,9 @@ use serde::{Deserialize, Serialize};
 /// as one that can't be read, and isn't written over.
 const VERSION: u32 = 1;
 
-/// The tabs as they were when they were saved.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// The tabs as they were when they were saved. Saved by the crystal before
+/// this one, a tab's panes were a list: they're read as a tree.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Layout {
     pub name: String,
     /// When it was saved, in seconds since the Unix epoch.
@@ -45,7 +46,7 @@ impl Layout {
 }
 
 /// Every layout saved, and the tabs a restore last replaced.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Layouts {
     /// [`VERSION`] when written by [`save`]; 0 for a file without one.
@@ -406,6 +407,7 @@ pub const HINTS: &[(&str, &str)] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::split_tree::Pane;
 
     fn press(view: &mut LayoutsView, code: KeyCode) -> Step {
         view.on_key(&KeyEvent::new(code, KeyModifiers::NONE))
@@ -465,6 +467,19 @@ mod tests {
         layouts.save("work", tabs_of("one", &["a", "b"]), 10);
         let json = serde_json::to_string(&layouts).unwrap();
         assert_eq!(read(Some(&json)), Ok(layouts));
+    }
+
+    #[test]
+    fn a_layout_saved_when_panes_were_a_list_restores_them_as_a_tree() {
+        let old = r#"{"version": 1, "saved": [{"name": "work", "saved": 10, "tabs": {
+            "version": 2, "tabs": [{"sessions": ["a", "b"], "splits": ["a"],
+            "selection_at": 1}], "current": 0}}]}"#;
+        let mut layouts = read(Some(old)).unwrap();
+        let work = Which::Saved("work".into());
+        let tabs = layouts.restore(&work, Tabs::default(), 20).unwrap();
+        assert_eq!(tabs.current().splits(), ["a"]);
+        let panes = tabs.current().panes.panes();
+        assert_eq!(panes.last(), Some(&&Pane::Selection));
     }
 
     #[test]

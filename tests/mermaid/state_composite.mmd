@@ -1,0 +1,15 @@
+stateDiagram-v2
+    state "Waiting for review" as Waiting
+    [*] --> Draft
+    Draft --> Waiting : open PR
+    state Review {
+        [*] --> Reading
+        Reading --> Commenting
+        Commenting --> [*]
+    }
+    Waiting --> Review
+    Review --> Merged
+    state check <<choice>>
+    Merged --> check
+    check --> [*] : released
+    check --> Draft : reverted

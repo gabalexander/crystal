@@ -3,38 +3,54 @@
 //! client goes away.
 
 use crate::agents;
+use crate::artifacts;
 use crate::backlog;
+use crate::catalog;
 use crate::codex;
 use crate::config::{Config, MemorySettings};
 use crate::db::Db;
 use crate::distill::{self, Job};
 use crate::embed;
 use crate::env;
-use crate::flow_run::{self, Ended, FlowRun, Next, RunState, StepState};
+use crate::event_log::{self, Bus, Subscription};
+use crate::events::{Event, Filter, Kind, Since};
+use crate::flow_run::{self, Ended, FlowRun, Next, Place, RunState, StepState};
 use crate::flows;
+use crate::front;
 use crate::git;
+use crate::handoff;
+use crate::handover::{self, Gate, Ticket};
+use crate::layout_relay::Relay;
 use crate::mcp;
-use crate::memory;
+use crate::memory::{self, Added};
+use crate::names;
 use crate::notify::{self, Notice};
-use crate::plugin_hooks::{self, Event, Hooks};
+use crate::plugin_hooks;
 use crate::project;
 use crate::protocol::{
-    self, Activity, AgentEvent, Backlog, Conversation, Frame, NewSession, NewTask, Request,
-    Response, TaskInfo, TaskRecord,
+    self, Activity, AgentEvent, Artifact, ArtifactKind, Backlog, Conversation, Frame, Front,
+    NewSession, NewTask, PendingTask, Request, Response, SessionInfo, State, TaskInfo, TaskOutcome,
+    TaskRecord, TaskSpec, TaskStart, TaskState, TaskView,
 };
-use crate::session::{STOP_GRACE, Session, Term};
+use crate::report;
+use crate::session::{Change, STOP_GRACE, Session, Term, signal_group};
 use crate::skill;
 use crate::socket;
-use crate::state::SavedSession;
+use crate::spending::Spending;
+use crate::state::{self, SavedSession};
 use crate::tasks;
 use crate::typing;
 use anyhow::{Context, Result, bail, ensure};
-use std::collections::{BTreeMap, HashMap, HashSet};
-use std::io::{BufReader, ErrorKind, Write};
+use regex::Regex;
+use std::collections::{BTreeMap, HashSet};
+use std::convert::Infallible;
+use std::io::{BufReader, ErrorKind, Read, Write};
 use std::net::Shutdown;
+use std::os::fd::{AsFd, AsRawFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{fs, process, thread};
@@ -44,36 +60,92 @@ use std::{fs, process, thread};
 /// down the sessions that are running.
 const KEEP_UP_EVERY: Duration = Duration::from_millis(250);
 
-pub fn run(socket: &Path) -> Result<()> {
+/// How often a client that only listens is checked for having hung up.
+const LOOK_FOR_HANG_UP: Duration = Duration::from_secs(1);
+
+/// How many rows of a session's history, above its screen, `wait --output`
+/// looks through: enough for what scrolled off between two looks.
+const HISTORY_MATCHED: usize = 200;
+
+/// The least time between two looks at a screen for `wait --output`, so a
+/// program writing without a break doesn't keep the daemon looking.
+const LOOK_AT_MOST_EVERY: Duration = Duration::from_millis(50);
+
+/// How long a handover waits for the requests the daemon is answering, and
+/// for plugins' hooks and the distiller, before it stops them.
+const HANDOVER_GRACE: Duration = Duration::from_secs(3);
+
+/// Runs the daemon on `socket`, or with `handover`, the descriptor of what
+/// the last daemon handed over as it ran this crystal in its place (see
+/// [`crate::handover`]), carries on from there.
+pub fn run(socket: &Path, handover: Option<RawFd>) -> Result<()> {
     // Leave the client's terminal, so closing it doesn't hang up the
-    // daemon. Fails harmlessly when run in the foreground from a shell.
+    // daemon. Fails harmlessly when run in the foreground from a shell, and
+    // in a daemon handed over, which left it already.
     // SAFETY: setsid has no preconditions.
     unsafe {
         libc::setsid();
     }
+    let handed = handover.map(|fd| handover::read(fd).unwrap_or_else(|err| give_up(socket, err)));
     // Before listening: a daemon that can't keep its state doesn't start,
     // rather than run with none and write over it.
-    let db = Db::open(socket)?;
-    let listener = listen(socket)?;
+    let db = match Db::open(socket) {
+        Ok(db) => db,
+        Err(err) if handed.is_some() => give_up(socket, err),
+        Err(err) => return Err(err),
+    };
+    let listener = match &handed {
+        Some(handed) => match handover::inherit(handed.listener) {
+            Ok(listener) => UnixListener::from(listener),
+            Err(err) => give_up(socket, err.into()),
+        },
+        None => listen(socket)?,
+    };
+    let events = Arc::new(Bus::new(socket));
+    let hooks = plugin_hooks::follow(&events, socket);
+    thread::spawn({
+        let events = events.clone();
+        move || {
+            loop {
+                events.prune(settings().events.keep_days);
+                thread::sleep(event_log::PRUNE_EVERY);
+            }
+        }
+    });
     let daemon = Arc::new(Daemon {
         socket: socket.to_path_buf(),
+        listener: listener.as_raw_fd(),
+        gate: Arc::default(),
+        asking_to_hand_over: Mutex::default(),
         db: Mutex::new(db),
         sessions: Mutex::default(),
         flows: Mutex::default(),
-        hooks: Hooks::new(socket),
+        spending: Arc::new(Spending::new(Db::open(socket)?)),
+        events,
         distilling: Arc::default(),
         preparing: Arc::default(),
+        handoff: Mutex::default(),
+        layout: Relay::new(),
     });
-    // A daemon starts again after every upgrade, so this is where the skill
-    // an earlier crystal installed learns this one's commands: before the
-    // saved sessions start, so that Claude Code in them reads the new one.
+    // A daemon starts again after every upgrade, or is handed over to the
+    // new crystal, so this is where the skill an earlier crystal installed
+    // learns this one's commands: before the saved sessions start, so that
+    // Claude Code in them reads the new one.
     match skill::refresh() {
         Ok(Some(path)) => eprintln!("crystal daemon: updated the skill in {}", path.display()),
         Ok(None) => {}
         Err(err) => eprintln!("crystal daemon: couldn't update the skill: {err:#}"),
     }
-    daemon.start_saved_sessions();
-    daemon.take_up_flows();
+    match handed {
+        Some(handed) => daemon.take_over(handed),
+        None => {
+            daemon.start_saved_sessions();
+            daemon.take_up_flows();
+        }
+    }
+    // Once the sessions are back, or carried on: a daemon handed over to
+    // starts up as any other does.
+    hooks.start_up();
     // With search by meaning on, the model is loaded and every entry
     // without a vector given one now, rather than when a session starts.
     thread::spawn({
@@ -86,14 +158,27 @@ pub fn run(socket: &Path) -> Result<()> {
     });
     for conn in listener.incoming() {
         let Ok(conn) = conn else { continue };
-        let daemon = daemon.clone();
-        thread::spawn(move || {
-            if let Err(err) = daemon.serve(conn) {
-                eprintln!("crystal daemon: {err:#}");
+        // Once a handover has begun, the daemon takes no more connections:
+        // they wait for the next crystal.
+        let Some((conn, ticket)) = daemon.gate.admit(conn) else {
+            loop {
+                thread::park();
             }
-        });
+        };
+        daemon.answer(conn, ticket);
     }
     Ok(())
+}
+
+/// Stops a crystal that can't take over from the daemon that handed over
+/// to it, the way a daemon that crashed does: what it inherited closes with
+/// it, which hangs up on those programs, and the client starts the next
+/// daemon, which starts them again from the database. The socket goes
+/// first, so the client finds it gone.
+fn give_up(socket: &Path, err: anyhow::Error) -> ! {
+    eprintln!("crystal daemon: couldn't take over: {err:#}");
+    let _ = fs::remove_file(socket);
+    process::exit(1);
 }
 
 fn listen(socket: &Path) -> Result<UnixListener> {
@@ -114,6 +199,14 @@ fn listen(socket: &Path) -> Result<UnixListener> {
 
 struct Daemon {
     socket: PathBuf,
+    /// The listening socket's descriptor, which a handover keeps open.
+    listener: RawFd,
+    /// Every connection comes in through here, so that a handover knows
+    /// which it has to answer first.
+    gate: Arc<Gate>,
+    /// The connections that asked for the handover underway, for the next
+    /// crystal to answer.
+    asking_to_hand_over: Mutex<Vec<UnixStream>>,
     /// Where the running sessions and the flow runs are written down, to
     /// start them again after a restart, and each project's backlog and
     /// task history. Whoever needs it and `sessions` or `flows` locks those
@@ -126,14 +219,24 @@ struct Daemon {
     /// other way round, which could leave two threads each waiting on the
     /// other.
     flows: Mutex<Vec<FlowRun>>,
-    /// The plugins' hooks, told what happens.
-    hooks: Hooks,
+    /// What background tasks have spent today, on a connection to the
+    /// database of its own: each task's runs add to it as they end.
+    spending: Arc<Spending>,
+    /// What happens goes through here: into the event log, and on to the
+    /// clients and plugins that listen.
+    events: Arc<Bus>,
     /// The sessions the distiller is reading now, by id: one pass at a
     /// time over each.
     distilling: Arc<Mutex<HashSet<String>>>,
     /// Getting the model that searches memory by meaning ready: what's
     /// being done, and why it last failed.
     preparing: Arc<Mutex<Preparing>>,
+    /// Held while a worktree's handoff file is written: each write reads
+    /// the file, adds to it and writes it back. Never held while taking
+    /// another lock.
+    handoff: Mutex<()>,
+    /// The TUIs that take layout commands, which go to the one used last.
+    layout: Relay,
 }
 
 /// What [`Daemon::prepare_embeddings`] is doing, or why it failed.
@@ -144,30 +247,70 @@ struct Preparing {
 }
 
 impl Daemon {
-    fn serve(&self, conn: UnixStream) -> Result<()> {
+    /// Answers a connection the gate let in, on a thread of its own.
+    fn answer(self: &Arc<Self>, conn: UnixStream, ticket: Ticket) {
+        let daemon = self.clone();
+        thread::spawn(move || {
+            if let Err(err) = daemon.serve(conn, ticket) {
+                eprintln!("crystal daemon: {err:#}");
+            }
+        });
+    }
+
+    /// Answers the request on `conn`, which `ticket` counts in at the gate
+    /// until it's answered: a handover waits for that.
+    fn serve(&self, conn: UnixStream, ticket: Ticket) -> Result<()> {
         let mut input = BufReader::new(&conn);
         let Some(incoming) = protocol::recv_request(&mut input)? else {
             return Ok(());
         };
-        // A shutdown goes through whatever the versions: it's how a crystal
-        // of another version gets this daemon out of its way.
+        // A shutdown and a handover go through whatever the versions: they
+        // are how a crystal of another version gets this daemon out of its
+        // way, or has it run that version.
         let ours = protocol::version();
-        if incoming.version.as_deref() != Some(ours.as_str()) && !incoming.is_shutdown() {
-            let message = version_mismatch(&ours, incoming.version.as_deref());
+        let any_version = incoming.is_shutdown() || incoming.is_handover();
+        if incoming.version.as_deref() != Some(ours.as_str()) && !any_version {
+            let crystal = socket::crystal_for(&self.socket);
+            let message = version_mismatch(&ours, incoming.version.as_deref(), &crystal);
             return Ok(protocol::send(&conn, &Response::Error { message })?);
         }
         let request = incoming.request()?;
-        if let Request::Attach {
-            name,
-            rows,
-            cols,
-            history,
-        } = request
-        {
-            return match self.find(name.as_deref()) {
-                Ok(found) => attach(&conn, input, found, (rows, cols), history),
-                Err(err) => Ok(protocol::send(&conn, &Response::from(err))?),
-            };
+        // These take the connection over, and answer as they go. A handover
+        // cuts them, and their clients come back.
+        match request {
+            Request::Attach {
+                name,
+                rows,
+                cols,
+                history,
+            } => {
+                drop(ticket);
+                return match self.find(name.as_deref()) {
+                    Ok(found) => attach(&conn, input, found, (rows, cols), history),
+                    Err(err) => Ok(protocol::send(&conn, &Response::from(err))?),
+                };
+            }
+            Request::Subscribe { filter, since } => {
+                drop(ticket);
+                return self.stream_events(&conn, filter, since);
+            }
+            Request::TakeLayoutOrders { used } => {
+                drop(ticket);
+                return self.layout.serve(&conn, input, used);
+            }
+            Request::WaitOutput {
+                name,
+                pattern,
+                timeout_ms,
+            } => {
+                drop(ticket);
+                let timeout = timeout_ms.map(Duration::from_millis);
+                return self.wait_for_output(&conn, &name, &pattern, timeout);
+            }
+            Request::Handover { exe, format } => {
+                return self.hand_over(&conn, ticket, &exe, format);
+            }
+            _ => {}
         }
         let shutdown = matches!(request, Request::Shutdown { .. });
         let response = self.handle(request).unwrap_or_else(Response::from);
@@ -188,6 +331,13 @@ impl Daemon {
             eprintln!("crystal daemon: couldn't read the sessions to start again: {err:#}");
             Vec::new()
         });
+        self.start_again(&mut sessions, saved);
+    }
+
+    /// Starts sessions again from what was written down of them, adding
+    /// them to `sessions`: an agent in its conversation, a task at rest,
+    /// any other program from the start.
+    fn start_again(&self, sessions: &mut Vec<Session>, saved: Vec<SavedSession>) {
         for saved in saved {
             let goal = saved.goal.clone();
             let backlog = goal.as_ref().and_then(|goal| goal.backlog);
@@ -203,7 +353,14 @@ impl Daemon {
                         backlog,
                     };
                     let conversation = saved.conversation.map(|conversation| conversation.id);
-                    start_task(&mut sessions, &self.socket, task, conversation, false)
+                    start_task(
+                        sessions,
+                        &self.socket,
+                        &self.spending,
+                        task,
+                        conversation,
+                        false,
+                    )
                 }
                 None => {
                     let new = NewSession {
@@ -214,7 +371,13 @@ impl Daemon {
                         task: goal.as_ref().map(|goal| goal.goal.clone()),
                         backlog,
                     };
-                    start(&mut sessions, &self.socket, new, saved.conversation)
+                    start(
+                        sessions,
+                        &self.socket,
+                        new,
+                        saved.conversation,
+                        saved.resume,
+                    )
                 }
             };
             match started {
@@ -233,16 +396,25 @@ impl Daemon {
     }
 
     /// Again and again: reads every session's screen for what its agent is
-    /// doing, and writes down the running sessions when they've changed.
+    /// doing, tells what has changed, and writes down the running sessions
+    /// when they've changed.
     fn keep_up(&self) {
         let mut last_saved: Vec<SavedSession> = Vec::new();
-        // Whether each session was running, and what its agent was doing,
-        // the last time round, by id, to tell plugins what changed.
-        let mut last_seen: HashMap<String, (bool, Option<protocol::Activity>)> = HashMap::new();
+        // The sessions whose program has ended and been told of, by id: a
+        // daemon handed ones that had ended was told of them already.
+        let mut told_ended: HashSet<String> = self
+            .sessions
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|session| !session.is_running())
+            .map(|session| session.id.clone())
+            .collect();
         let mut last_runs: Vec<FlowRun> = Vec::new();
         loop {
             thread::sleep(KEEP_UP_EVERY);
             let mut sessions = self.sessions.lock().unwrap();
+            self.number_tasks(&mut sessions);
             let claimed: Vec<String> = sessions
                 .iter()
                 .filter_map(|session| session.conversation_id().map(String::from))
@@ -257,6 +429,7 @@ impl Daemon {
                 session.find_conversation(&claimed, &looking);
                 session.check_front();
                 session.check();
+                self.tell_changes(session);
                 for closed in session.take_closed() {
                     self.write_down_closed(session, &closed);
                 }
@@ -268,17 +441,14 @@ impl Daemon {
                 if let Some(notice) = session.notice() {
                     notify::tell(notice);
                 }
-                let now = (session.is_running(), session.activity());
-                // Every session starts running, its agent doing nothing it
-                // has said; that it started was told as it did.
-                let started = (true, None);
-                let before = last_seen.insert(session.id.clone(), now).unwrap_or(started);
-                for change in plugin_hooks::session_changes(before, now) {
-                    self.hooks
-                        .tell(Event::about_session(change, &session.info()));
+                self.tell_changes(session);
+                if !session.is_running() && told_ended.insert(session.id.clone()) {
+                    let info = session.info();
+                    let status = info.state.to_string();
+                    self.events.emit(Event::ended(&info, status));
                 }
             }
-            last_seen.retain(|id, _| sessions.iter().any(|session| &session.id == id));
+            told_ended.retain(|id| sessions.iter().any(|session| &session.id == id));
             // Written while the list is still locked, so that an older list
             // can never be written after a shutdown has emptied it.
             let saved: Vec<SavedSession> = sessions.iter().filter_map(Session::saved).collect();
@@ -310,16 +480,189 @@ impl Daemon {
             Vec::new()
         });
         for run in &mut runs {
-            run.interrupt();
-            run.env = env::current();
-            let at_gate = run
-                .current()
-                .filter(|&step| run.steps[step].state == StepState::AtGate);
-            if let Some(session) = at_gate.and_then(|step| step_session(&mut sessions, run, step)) {
-                session.on_agent_event(AgentEvent::Asking);
-            }
+            take_up(&mut sessions, run);
         }
         *self.flows.lock().unwrap() = runs;
+    }
+
+    /// Hands the daemon over to the crystal at `exe` (see
+    /// [`crate::handover`]), which answers `conn`, the connection `ticket`
+    /// let in, once it has taken over. Refused, the daemon says why, and
+    /// carries on as it was: the client restarts it cold. Comes back with
+    /// nothing else: a handover that fails once it has begun stops the
+    /// daemon.
+    fn hand_over(&self, conn: &UnixStream, ticket: Ticket, exe: &Path, format: u32) -> Result<()> {
+        if let Err(err) = handover::check(exe, format) {
+            let message = format!("couldn't hand over: {err:#}");
+            return Ok(protocol::send(conn, &Response::Error { message })?);
+        }
+        let first = {
+            let mut asking = self.asking_to_hand_over.lock().unwrap();
+            asking.push(conn.try_clone()?);
+            asking.len() == 1
+        };
+        // Counted in until now, so that one asked for at the same time is
+        // in the list before the first goes on.
+        drop(ticket);
+        // One handover at a time: the next crystal answers this one too.
+        if !first {
+            return Ok(());
+        }
+        eprintln!("crystal daemon: handing over to {}", exe.display());
+        handover::begin();
+        let deadline = Instant::now() + HANDOVER_GRACE;
+        let waiting = self.gate.close(&self.socket, deadline);
+        let Err(err) = self.exec_handed_over(&waiting, exe, deadline);
+        // The sessions can't carry on: the daemon stops as a shutdown that
+        // keeps them does, and the client starts the next, which starts them
+        // again. Its socket goes first, so the client finds it gone.
+        eprintln!("crystal daemon: couldn't hand over, so it stops: {err:#}");
+        let _ = fs::remove_file(&self.socket);
+        let message = format!("couldn't hand over: {err:#}");
+        for conn in self.asking_to_hand_over.lock().unwrap().iter() {
+            let _ = protocol::send(
+                conn,
+                &Response::Error {
+                    message: message.clone(),
+                },
+            );
+        }
+        process::exit(1);
+    }
+
+    /// Gets every session ready to hand over, then runs the crystal at `exe`
+    /// in this process: comes back only with why it couldn't. `waiting` are
+    /// the connections the next crystal answers.
+    fn exec_handed_over(
+        &self,
+        waiting: &[UnixStream],
+        exe: &Path,
+        deadline: Instant,
+    ) -> Result<Infallible> {
+        let mut sessions = self.sessions.lock().unwrap();
+        let flows = self.flows.lock().unwrap();
+        // What has happened so far is told, and a task that closed written
+        // down, before the sessions go.
+        for session in sessions.iter_mut() {
+            for closed in session.take_closed() {
+                self.write_down(session.cwd(), Some(&session.info()), &closed);
+            }
+            self.tell_changes(session);
+        }
+        // Written down first: whatever goes wrong from here, the next
+        // daemon starts them again, as after any restart.
+        let saved: Vec<SavedSession> = sessions.iter().filter_map(Session::saved).collect();
+        {
+            let mut db = self.db.lock().unwrap();
+            db.save_sessions(&saved)?;
+            db.save_flow_runs(&flows)?;
+        }
+        handover::HELPERS.finish(deadline);
+        handover::stop_reading();
+        let mut handed = Vec::new();
+        // Held until the exec: see [`Session::hand_over`].
+        let mut held = Vec::new();
+        for session in sessions.iter() {
+            let (session, state) = session.hand_over()?;
+            handed.push(session);
+            held.push(state);
+        }
+        let keep = |conns: &[UnixStream]| {
+            conns
+                .iter()
+                .map(|conn| handover::keep_across_exec(conn.as_fd()))
+                .collect::<std::io::Result<Vec<RawFd>>>()
+        };
+        // SAFETY: the listener is open for as long as the daemon runs.
+        let listener = unsafe { std::os::fd::BorrowedFd::borrow_raw(self.listener) };
+        let asking = self.asking_to_hand_over.lock().unwrap();
+        let state = handover::State {
+            from: protocol::version(),
+            listener: handover::keep_across_exec(listener)?,
+            asking: keep(&asking)?,
+            waiting: keep(waiting)?,
+            sessions: handed,
+            flows: flows.iter().map(handover::HandedFlow::of).collect(),
+        };
+        let dir = self.socket.parent().unwrap_or(Path::new("/"));
+        let file = handover::write(dir, &state)?;
+        let state = handover::keep_across_exec(file.as_fd())?;
+        // No write to the database is halfway through as the exec closes
+        // it.
+        let _db = self.db.lock().unwrap();
+        let _spending = self.spending.hold();
+        let _events = self.events.hold();
+        let err = handover::exec(exe, &self.socket, state);
+        Err(err).with_context(|| format!("couldn't run {}", exe.display()))
+    }
+
+    /// Carries on from the daemon that handed over: its sessions and flow
+    /// runs as they were. A session that can't be carried on starts again,
+    /// as after any restart. Then the clients that asked for the handover
+    /// are told, and the connections that came in meanwhile are answered.
+    fn take_over(self: &Arc<Self>, handed: handover::State) {
+        let handover::State {
+            from,
+            asking,
+            waiting,
+            sessions: handed_sessions,
+            flows,
+            ..
+        } = handed;
+        let mut sessions = self.sessions.lock().unwrap();
+        let mut again = Vec::new();
+        for handed in handed_sessions {
+            let name = handed.name().to_string();
+            let saved = handed.saved();
+            let processes = handed.processes();
+            match Session::adopt(handed, &self.spending) {
+                Ok(session) => sessions.push(session),
+                Err(err) => {
+                    eprintln!("crystal daemon: couldn't carry {name} on: {err:#}");
+                    // Hung up on, then reaped, since they're this process's
+                    // children still.
+                    for pid in processes {
+                        signal_group(pid, libc::SIGHUP);
+                        thread::spawn(move || handover::reap(pid));
+                    }
+                    again.extend(saved);
+                }
+            }
+        }
+        let carried = sessions.len();
+        let restarted: Vec<String> = again.iter().map(|saved| saved.name.clone()).collect();
+        self.start_again(&mut sessions, again);
+        let mut flows: Vec<FlowRun> = flows
+            .into_iter()
+            .map(handover::HandedFlow::taken_over)
+            .collect();
+        // A run whose step's session started again goes on as after any
+        // restart.
+        for run in &mut flows {
+            let step = run
+                .current()
+                .and_then(|step| run.steps[step].session.as_ref());
+            if step.is_some_and(|name| restarted.contains(name)) {
+                take_up(&mut sessions, run);
+            }
+        }
+        *self.flows.lock().unwrap() = flows;
+        drop(sessions);
+        eprintln!("crystal daemon: took over from crystal {from}: {carried} sessions carried on");
+        self.events
+            .emit(Event::handed_over(&from, &protocol::version(), carried));
+        for conn in asking {
+            if let Ok(conn) = handover::inherit(conn) {
+                let answer = Response::HandedOver { sessions: carried };
+                let _ = protocol::send(UnixStream::from(conn), &answer);
+            }
+        }
+        for conn in waiting {
+            let conn = handover::inherit(conn).map(UnixStream::from);
+            if let Some((conn, ticket)) = conn.ok().and_then(|conn| self.gate.admit(conn)) {
+                self.answer(conn, ticket);
+            }
+        }
     }
 
     /// Keeps each flow run going: once the task of the step running has
@@ -331,10 +674,13 @@ impl Daemon {
             let Some(step) = run.running() else {
                 continue;
             };
-            let Some(ended) = how_step_ended(sessions, run, step) else {
+            let Some(mut ended) = how_step_ended(sessions, run, step) else {
                 continue;
             };
+            ended.artifacts = self.kept_files(run.steps[step].task);
+            let cost_usd = ended.cost_usd;
             let next = run.step_ended(step, ended);
+            self.events.emit(Event::step_ended(run, step, cost_usd));
             // The flow has taken the step's answer on to the next step:
             // nobody needs to look at it to know it's done.
             if matches!(next, Next::Run { .. })
@@ -356,27 +702,37 @@ impl Daemon {
     }
 
     /// Does what a flow run needs once it has changed: runs its next step,
-    /// or has the session of the step at its gate wait on the user.
+    /// or has the session of the step at its gate wait on the user; and
+    /// tells of it.
     fn carry_out(&self, sessions: &mut Vec<Session>, run: &mut FlowRun, next: Next) {
         match next {
-            Next::Run { step, prompt } => {
-                if let Err(err) = self.start_step(sessions, run, step, &prompt) {
-                    run.could_not_start(step, format!("{err:#}"));
+            Next::Run { step, prompt } => match self.start_step(sessions, run, step, &prompt) {
+                Ok(()) => {
+                    let info = step_session(sessions, run, step).map(|session| session.info());
+                    self.events
+                        .emit(Event::step_started(run, step, info.as_ref()));
                 }
-            }
+                Err(err) => {
+                    run.could_not_start(step, format!("{err:#}"));
+                    self.events.emit(Event::flow_ended(run));
+                }
+            },
             Next::Gate(step) => {
                 if let Some(session) = step_session(sessions, run, step) {
                     session.on_agent_event(AgentEvent::Asking);
                 }
+                self.events.emit(Event::gate(run, step));
             }
-            Next::Finished | Next::Stopped => {}
+            Next::Finished | Next::Stopped => self.events.emit(Event::flow_ended(run)),
         }
     }
 
-    /// Runs `step` of `run`, asking it `prompt`. While the step's session is
-    /// there at rest, it's a follow-up there, in the same conversation. An
-    /// ended one makes way for a new task, which carries its conversation
-    /// on; with none, the step starts in a new task of its own.
+    /// Runs `step` of `run`, asking it `prompt`, where the flow places it.
+    /// A step in the background whose session is there at rest takes it as
+    /// a follow-up, in the same conversation; an ended one makes way for a
+    /// new task, which carries its conversation on. A step in a terminal
+    /// starts afresh in a session of its own, its ended one making way.
+    /// With neither, the step starts in a new task of its own.
     fn start_step(
         &self,
         sessions: &mut Vec<Session>,
@@ -384,6 +740,14 @@ impl Daemon {
         step: usize,
         prompt: &str,
     ) -> Result<()> {
+        let terminal = run.in_terminal(step);
+        // A step in a terminal goes on once its task closes.
+        ensure!(
+            !terminal || tasks::enabled(&settings()),
+            "step {} runs in a terminal, which takes tasks: {}",
+            run.step_name(step),
+            crate::plugins::off("tasks")
+        );
         let mut conversation = None;
         let had = run.steps[step].session.as_ref();
         if let Some(index) = had.and_then(|name| sessions.iter().position(|s| s.name == *name)) {
@@ -394,56 +758,80 @@ impl Daemon {
                     conversation = session.launch().conversation.map(|found| found.id);
                     sessions.remove(index);
                 }
-                // Not a task: a session that has taken the name since.
+                (false, false) if terminal => {
+                    sessions.remove(index);
+                }
+                // The step's agent still there to read, or a session that
+                // has taken the name since.
                 (false, _) => {}
             }
         }
         let cwd = self.step_dir(run, step)?;
         let taken = |name: &str| sessions.iter().any(|session| session.name == name);
         let name = unique_name(&run.session_name(step), taken);
-        let task = NewTask {
-            name: Some(name),
-            cwd,
-            spec: run.task_spec(step, prompt),
-            env: run.env.clone(),
-            backlog: None,
+        let name = if terminal {
+            let (command, asked) = run.command(step, prompt);
+            let new = NewSession {
+                name: Some(name),
+                cwd: cwd.clone(),
+                command,
+                env: run.env.clone(),
+                task: Some(asked),
+                backlog: None,
+            };
+            start(sessions, &self.socket, new, None, None)?
+        } else {
+            let task = NewTask {
+                name: Some(name),
+                cwd: cwd.clone(),
+                spec: run.task_spec(step, prompt),
+                env: run.env.clone(),
+                backlog: None,
+            };
+            start_task(
+                sessions,
+                &self.socket,
+                &self.spending,
+                task,
+                conversation,
+                true,
+            )?
         };
-        let name = start_task(sessions, &self.socket, task, conversation, true)?;
         // As a task, it's the step, in the project's history and memory,
         // rather than the whole of its prompt.
-        let session = sessions.last_mut().expect("start_task added it");
+        let session = sessions.last_mut().expect("it was just started");
         if session.task_record().is_some() {
-            session.give_task(TaskInfo {
-                goal: format!("{} {}: {}", run.name, run.step_name(step), run.goal),
-                background: true,
-                backlog: None,
-                outcome: None,
-            });
+            let goal = format!("{} {}: {}", run.name, run.step_name(step), run.goal);
+            session.give_task(new_task_info(goal, !terminal, None));
+            self.number_tasks(std::slice::from_mut(session));
         }
-        run.steps[step].session = Some(name);
+        let task = session.task_id();
+        self.tell_started(sessions, &name, Kind::TaskOpened);
+        let ran = &mut run.steps[step];
+        ran.session = Some(name);
+        ran.cwd = Some(cwd);
+        ran.task = task;
         Ok(())
     }
 
-    /// Where `step` of `run` runs: where the run started, or, from the
-    /// first step that wants one, the worktree the run makes for itself
-    /// then.
+    /// Where `step` of `run` runs, as [`FlowRun::place`] says: the
+    /// worktree the run makes for itself is made the first time a step
+    /// asks for it.
     fn step_dir(&self, run: &mut FlowRun, step: usize) -> Result<PathBuf> {
-        if !run.wants_worktree(step) {
-            return Ok(run.cwd.clone());
+        match run.place(step) {
+            Place::In(dir) => Ok(dir),
+            Place::NewWorktree => {
+                let (worktree, branch) = git::add_new_worktree(&run.cwd, &run.slug())?;
+                self.events
+                    .emit(Event::worktree(true, &worktree, Some(&branch)));
+                run.worktree = Some(worktree.clone());
+                Ok(worktree)
+            }
         }
-        if let Some(worktree) = &run.worktree {
-            return Ok(worktree.clone());
-        }
-        let (worktree, branch) = git::add_new_worktree(&run.cwd, &run.branch())?;
-        // The plugins that listen for new worktrees hear of it, as they do
-        // of one a client makes.
-        let made = Event::about_worktree(true, &worktree, Some(&branch));
-        self.hooks.tell(made);
-        run.worktree = Some(worktree.clone());
-        Ok(worktree)
     }
 
-    /// Starts a run of the flow called `flow` in the config file, on `goal`.
+    /// Starts a run of the flow called `flow` on `goal`: the project's own
+    /// flow of that name, or the config file's.
     fn start_flow(
         &self,
         flow: &str,
@@ -453,30 +841,20 @@ impl Daemon {
     ) -> Result<String> {
         let config = settings();
         flows::ensure_enabled(&config)?;
-        let Some(found) = config.flows.iter().find(|found| found.name == flow) else {
-            let known: Vec<&str> = config.flows.iter().map(|f| f.name.as_str()).collect();
-            if known.is_empty() {
-                bail!(
-                    "there's no flow called {flow}, nor any other: `crystal flow example` shows one"
-                );
-            }
-            bail!(
-                "there's no flow called {flow}; there's {}",
-                known.join(", ")
-            );
-        };
+        let found = flows::find(&config, &cwd, flow)?;
         let mut sessions = self.sessions.lock().unwrap();
         let mut runs = self.flows.lock().unwrap();
         let name = flow_run::new_name(flow, &runs);
         let mut run = FlowRun::new(
             name.clone(),
-            found.clone(),
+            found,
             &config.profiles,
             goal,
             cwd,
             env,
             now_seconds(),
         );
+        self.events.emit(Event::flow_started(&run));
         let next = run.start();
         self.carry_out(&mut sessions, &mut run, next);
         runs.push(run);
@@ -485,10 +863,12 @@ impl Daemon {
     }
 
     /// Changes the run called `name` with `change`, then does what that
-    /// leads to.
+    /// leads to. A change that answers the gate the run waits at goes on,
+    /// or with `sent_back`, the notes it's sent back with, goes back.
     fn change_flow(
         &self,
         name: &str,
+        sent_back: Option<&str>,
         change: impl FnOnce(&mut FlowRun) -> Result<Next>,
     ) -> Result<()> {
         flows::ensure_enabled(&settings())?;
@@ -502,6 +882,9 @@ impl Daemon {
             .current()
             .filter(|&step| run.steps[step].state == StepState::AtGate);
         let next = change(run)?;
+        if let Some(step) = gate {
+            self.events.emit(Event::gate_answered(run, step, sent_back));
+        }
         if let Some(session) = gate.and_then(|step| step_session(&mut sessions, run, step)) {
             session.on_agent_event(AgentEvent::Started);
         }
@@ -509,38 +892,215 @@ impl Daemon {
         Ok(())
     }
 
+    /// Cancels the run called `name`: the task of the step it's at, while
+    /// it's open, is cancelled and its session stopped, and the run goes no
+    /// further.
+    fn cancel_flow(&self, name: &str) -> Result<()> {
+        flows::ensure_enabled(&settings())?;
+        let mut sessions = self.sessions.lock().unwrap();
+        let mut runs = self.flows.lock().unwrap();
+        let run = runs.iter_mut().find(|run| run.name == name);
+        let run = run.with_context(|| format!("there's no flow run called {name}"))?;
+        let at_gate = run.state() == RunState::AtGate;
+        let step = run.cancel()?;
+        if let Some(session) = step_session(&mut sessions, run, step) {
+            if at_gate {
+                session.on_agent_event(AgentEvent::Started);
+            }
+            let cancelled = tasks::enabled(&settings())
+                .then(|| session.cancel_task("its flow was cancelled"))
+                .flatten();
+            if let Some(cancelled) = cancelled {
+                self.write_down_closed(session, &cancelled);
+                session.stop();
+            }
+        }
+        self.events.emit(Event::flow_ended(run));
+        Ok(())
+    }
+
+    /// Gives every task that has no number yet one: a task just made, or
+    /// one from before tasks were numbered. One the database can't number
+    /// now is numbered the next time round.
+    fn number_tasks(&self, sessions: &mut [Session]) {
+        for session in sessions.iter_mut().filter(|s| s.task_unnumbered()) {
+            match self.db.lock().unwrap().new_task_number() {
+                Ok(number) => session.number_task(number),
+                Err(err) => eprintln!("crystal daemon: couldn't number a task: {err:#}"),
+            }
+        }
+    }
+
     /// Writes a task that has just closed in `session` into its project's
-    /// history, and, when it was done and was for a backlog item, ticks the
-    /// item. Then the distiller reads what it did.
+    /// history, as [`Daemon::write_down`] does. Then the distiller reads
+    /// what it did.
     fn write_down_closed(&self, session: &Session, task: &TaskRecord) {
-        let cwd = session.cwd();
+        self.write_down(session.cwd(), Some(&session.info()), task);
+        self.distill_later(session, task);
+    }
+
+    /// Writes a task that has just closed, which ran in `cwd`, in `session`
+    /// if it had started, into its project's history, tells of it, and
+    /// keeps how it went in the project's memory. When it was done and was
+    /// for a backlog item, ticks the item.
+    fn write_down(&self, cwd: &Path, session: Option<&protocol::SessionInfo>, task: &TaskRecord) {
         let project = project::of(cwd).path;
-        {
+        let ticked = {
             let mut db = self.db.lock().unwrap();
             if let Err(err) = db.record_task(&project, task) {
                 eprintln!("crystal daemon: couldn't write down a closed task: {err:#}");
             }
-            let done = task.outcome.as_ref().is_some_and(|outcome| !outcome.failed);
+            let done = task.state() == TaskState::Done;
             let ticks = done && backlog::enabled(&settings());
-            if let (true, Some(number)) = (ticks, task.backlog) {
-                let ticked =
-                    db.change_backlog(&project, |store| store.mark(number, true, now_seconds()));
-                if let Err(err) = ticked {
-                    eprintln!("crystal daemon: couldn't tick #{number} on the backlog: {err:#}");
+            match (ticks, task.backlog) {
+                (true, Some(number)) => {
+                    let ticked = db.change_backlog(&project, |store| {
+                        store.mark(number, true, now_seconds())?;
+                        Ok(store.get(number).cloned())
+                    });
+                    ticked.unwrap_or_else(|err| {
+                        eprintln!(
+                            "crystal daemon: couldn't tick #{number} on the backlog: {err:#}"
+                        );
+                        None
+                    })
+                }
+                _ => None,
+            }
+        };
+        let mut task = task.clone();
+        if let Some(info) = session {
+            self.hand_off(info, &task);
+            task.artifacts = self.kept_with(task.id);
+        }
+        let closed = match session {
+            Some(info) => Event::task(Kind::TaskClosed, info, task.clone()),
+            None => Event::pending_task(Kind::TaskClosed, project, task.clone()),
+        };
+        self.events.emit(closed);
+        self.tell_backlog(Kind::BacklogClosed, cwd, ticked);
+        self.remember_outcome(cwd, &task);
+    }
+
+    /// Adds how `task` went, closed in the session `info` is about, to its
+    /// worktree's handoff file, then keeps the file with the task: what the
+    /// sessions after it there should know, and whoever reads the task
+    /// later. A cancelled task leaves nothing to say.
+    fn hand_off(&self, info: &SessionInfo, task: &TaskRecord) {
+        let Some(outcome) = &task.outcome else {
+            return;
+        };
+        let Some(worktree) = info.worktree.as_ref().map(|worktree| &worktree.path) else {
+            return;
+        };
+        if outcome.cancelled || !handoff::enabled(&settings()) {
+            return;
+        }
+        if let Some(note) = handoff::tidy(&outcome.summary) {
+            let how = outcome.state().word();
+            let heading =
+                handoff::heading(&handoff::now(), &info.name, Some(&task.goal), Some(how));
+            match self.add_to_handoff(worktree, &handoff::section(&heading, &note)) {
+                Ok(path) => self.events.emit(Event::handoff(info, path, &note)),
+                Err(err) => eprintln!("crystal daemon: couldn't add to a handoff file: {err:#}"),
+            }
+        }
+        let Some(id) = task.id else {
+            return;
+        };
+        let dir = state::task_dir(&self.socket, id);
+        match artifacts::keep_handoff(&dir, &handoff::path(worktree)) {
+            Ok(Some(kept)) => self.record_kept(info, task, &[kept]),
+            Ok(None) => {}
+            Err(err) => eprintln!("crystal daemon: couldn't keep t{id}'s handoff file: {err:#}"),
+        }
+    }
+
+    /// Adds `section` to the handoff file of the worktree at `worktree`,
+    /// one write at a time, kept out of git unless the config says its
+    /// project keeps its notes there.
+    fn add_to_handoff(&self, worktree: &Path, section: &str) -> Result<PathBuf> {
+        let in_git = handoff::in_git(&settings(), &project::of(worktree).path);
+        let _one_at_a_time = self.handoff.lock().unwrap();
+        handoff::append(worktree, section, in_git)
+    }
+
+    /// Checks the files at `paths` and copies them into the directory of
+    /// `session`'s task, before it closes: a file that can't be kept
+    /// refuses the close, and keeps none of them.
+    fn keep_files(&self, session: &mut Session, paths: &[PathBuf]) -> Result<Vec<Artifact>> {
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.number_tasks(std::slice::from_mut(session));
+        let id = session
+            .task_id()
+            .with_context(|| format!("{} has no task to keep files with", session.name))?;
+        let checked = artifacts::check(paths, &session.checkout_top())?;
+        let mut taken: Vec<String> = self
+            .kept_with(Some(id))
+            .into_iter()
+            .map(|a| a.name)
+            .collect();
+        // The handoff file is kept under its own name as the task closes.
+        taken.push(artifacts::HANDOFF_NAME.to_string());
+        artifacts::keep(&state::task_dir(&self.socket, id), &checked, &taken)
+    }
+
+    /// Writes down the files `kept` with `task`, closed in the session
+    /// `info` is about, and tells of each.
+    fn record_kept(&self, info: &SessionInfo, task: &TaskRecord, kept: &[Artifact]) {
+        let Some(id) = task.id else {
+            return;
+        };
+        for artifact in kept {
+            let added = self
+                .db
+                .lock()
+                .unwrap()
+                .add_artifact(id, artifact, now_seconds());
+            match added {
+                Ok(()) => self
+                    .events
+                    .emit(Event::artifact(info, task.clone(), artifact.clone())),
+                Err(err) => {
+                    eprintln!("crystal daemon: couldn't write down a file t{id} kept: {err:#}")
                 }
             }
         }
-        self.hooks.tell(Event::task_closed(cwd, task));
-        self.remember_outcome(cwd, task);
-        self.distill_later(session, task);
+    }
+
+    /// The files kept with the task numbered `task`.
+    fn kept_with(&self, task: Option<u64>) -> Vec<Artifact> {
+        let Some(id) = task else {
+            return Vec::new();
+        };
+        let kept = self.db.lock().unwrap().artifacts(id);
+        kept.unwrap_or_else(|err| {
+            eprintln!("crystal daemon: couldn't read the files t{id} kept: {err:#}");
+            Vec::new()
+        })
+    }
+
+    /// The paths of the files `crystal done --artifact` kept with the task
+    /// numbered `task`: what a flow step's `{<step>.artifacts}` says.
+    fn kept_files(&self, task: Option<u64>) -> Vec<PathBuf> {
+        let kept = self.kept_with(task).into_iter();
+        let files = kept.filter(|artifact| artifact.kind == ArtifactKind::File);
+        files.map(|artifact| artifact.path).collect()
     }
 
     /// Has the distiller read what the task that just closed in `session`
     /// did, on a thread of its own, when memory is on and the config says
-    /// to.
+    /// to. A cancelled task did nothing anyone wanted kept.
     fn distill_later(&self, session: &Session, task: &TaskRecord) {
         let config = settings();
-        if !memory::enabled(&config) || !config.memory.distill || task.outcome.is_none() {
+        let worth_reading = matches!(task.state(), TaskState::Done | TaskState::Failed);
+        if !memory::enabled(&config) || !config.memory.distill || !worth_reading {
+            return;
+        }
+        // A handover underway would only stop it halfway.
+        if handover::underway() {
             return;
         }
         let Some(job) = self.distill_job(session, Some(task), config.memory) else {
@@ -549,6 +1109,7 @@ impl Daemon {
         let Some(reading) = Reading::start(&self.distilling, &session.id) else {
             return;
         };
+        let events = self.events.clone();
         thread::spawn(move || {
             let name = &job.session;
             match distill::run(&job) {
@@ -557,6 +1118,7 @@ impl Daemon {
                     for why in &report.rejected {
                         eprintln!("crystal daemon:   rejected {why}");
                     }
+                    tell_distilled(&events, &job, &report.added);
                 }
                 Err(err) => eprintln!("crystal daemon: couldn't distill {name}: {err:#}"),
             }
@@ -681,16 +1243,18 @@ impl Daemon {
         };
         let report = distill::run(&job);
         drop(reading);
-        Ok(Response::Distilled(report?))
+        let report = report?;
+        tell_distilled(&self.events, &job, &report.added);
+        Ok(Response::Distilled(report))
     }
 
     /// Keeps how a closed task turned out in its project's memory, for the
-    /// sessions after it, when it closed with something to say.
+    /// sessions after it, when it was done or failed with something to say.
     fn remember_outcome(&self, cwd: &Path, task: &TaskRecord) {
         let Some(outcome) = &task.outcome else {
             return;
         };
-        if outcome.summary.trim().is_empty() {
+        if outcome.summary.trim().is_empty() || outcome.cancelled {
             return;
         }
         let line = if outcome.failed {
@@ -701,8 +1265,13 @@ impl Daemon {
         let project = project::of(cwd).path;
         let kept =
             memory::record_outcome(&settings(), &self.socket, &project, &task.session, &line);
-        if let Err(err) = kept {
-            eprintln!("crystal daemon: couldn't remember how a task went: {err:#}");
+        match kept {
+            Ok(Some(Added::New(entry))) => {
+                self.events
+                    .emit(Event::memory(Kind::MemoryAdded, project, entry));
+            }
+            Ok(_) => {}
+            Err(err) => eprintln!("crystal daemon: couldn't remember how a task went: {err:#}"),
         }
     }
 
@@ -715,6 +1284,7 @@ impl Daemon {
             None => sessions.last_mut().context("there are no sessions")?,
         };
         session.seen();
+        self.tell_changes(session);
         Ok(Found {
             name: session.name.clone(),
             id: session.id.clone(),
@@ -729,12 +1299,48 @@ impl Daemon {
 
     /// The terminal of the session called `name`, to type into, which
     /// only makes sense while its program runs. The sessions are let go
-    /// before any typing, which takes a moment.
+    /// before any typing, which takes a moment. A session typed into by
+    /// its name keeps that name: whoever types knows it by it.
     fn running_term(&self, name: &str) -> Result<Arc<Term>> {
         let mut sessions = self.sessions.lock().unwrap();
         let session = named(&mut sessions, name)?;
         ensure!(session.is_running(), "{name} has ended");
+        session.keep_name();
         Ok(session.term())
+    }
+
+    /// Names the session with id `id` from `prompt`, the first it was sent,
+    /// when crystal named it after its program and the config says to.
+    fn name_from_prompt(&self, sessions: &mut [Session], id: &str, prompt: &str) {
+        let Some(index) = sessions.iter().position(|session| session.id == id) else {
+            return;
+        };
+        if !sessions[index].is_named_after_program() || !settings().name_from_prompt {
+            return;
+        }
+        // A prompt with nothing to name it by leaves it for the next.
+        let Some(base) = names::from_prompt(prompt) else {
+            return;
+        };
+        let taken = |name: &str| sessions.iter().any(|session| session.name == name);
+        let new_name = unique_name(&base, taken);
+        let session = &mut sessions[index];
+        let old_name = std::mem::replace(&mut session.name, new_name);
+        session.keep_name();
+        self.tell_renamed(session, &old_name);
+    }
+
+    /// Tells that `session` was called `from` until now, and keeps a flow's
+    /// step to it under its new name.
+    fn tell_renamed(&self, session: &Session, from: &str) {
+        self.events.emit(Event::renamed(&session.info(), from));
+        for run in self.flows.lock().unwrap().iter_mut() {
+            for step in &mut run.steps {
+                if step.session.as_deref() == Some(from) {
+                    step.session = Some(session.name.clone());
+                }
+            }
+        }
     }
 
     fn handle(&self, request: Request) -> Result<Response> {
@@ -743,9 +1349,15 @@ impl Daemon {
             Request::New(new) => self.new_session(new),
             Request::NewTask(task) => {
                 let mut sessions = self.sessions.lock().unwrap();
-                let name = start_task(&mut sessions, &self.socket, task, None, true)?;
-                self.tell_started(&sessions, &name);
-                Ok(Response::Created { name })
+                let name = start_task(
+                    &mut sessions,
+                    &self.socket,
+                    &self.spending,
+                    task,
+                    None,
+                    true,
+                )?;
+                Ok(self.started(&mut sessions, name, Kind::TaskOpened))
             }
             Request::List => {
                 let sessions = self.sessions.lock().unwrap();
@@ -758,12 +1370,17 @@ impl Daemon {
                 id,
                 event,
                 conversation,
+                prompt,
             } => {
                 let mut sessions = self.sessions.lock().unwrap();
-                let session = match id {
-                    Some(id) => with_id(&mut sessions, &id)?,
-                    None => named(&mut sessions, &name)?,
+                let id = match id {
+                    Some(id) => id,
+                    None => named(&mut sessions, &name)?.id.clone(),
                 };
+                if let Some(prompt) = prompt {
+                    self.name_from_prompt(&mut sessions, &id, &prompt);
+                }
+                let session = with_id(&mut sessions, &id)?;
                 if let Some(conversation) = conversation {
                     session.set_conversation(conversation);
                 }
@@ -777,7 +1394,29 @@ impl Daemon {
                         text: tasks::REMINDER.to_string(),
                     });
                 }
-                session.on_agent_event(event);
+                // An agent that reports for itself holds the session's
+                // status: what hooks say counts again once it lets go.
+                if !session.is_claimed() {
+                    session.on_agent_event(event);
+                }
+                self.tell_changes(session);
+                Ok(Response::Done)
+            }
+            Request::ReportAgent { id, name, report } => {
+                let mut sessions = self.sessions.lock().unwrap();
+                let session = match (id, name) {
+                    (Some(id), _) => with_id(&mut sessions, &id)?,
+                    (None, Some(name)) => named(&mut sessions, &name)?,
+                    (None, None) => bail!("say which session the report is about"),
+                };
+                ensure!(
+                    !session.is_task(),
+                    "{} is a background task, which says what it's doing itself",
+                    session.name
+                );
+                ensure!(session.is_running(), "{} has ended", session.name);
+                session.take_report(report)?;
+                self.tell_changes(session);
                 Ok(Response::Done)
             }
             Request::Kill { name } => {
@@ -786,23 +1425,33 @@ impl Daemon {
                     .iter()
                     .position(|session| session.name == name)
                     .with_context(|| format!("no session named {name}"))?;
-                let session = sessions.remove(index);
-                if session.is_running() {
-                    self.hooks
-                        .tell(Event::about_session("session.ended", &session.info()));
+                let mut session = sessions.remove(index);
+                let cancelled = tasks::enabled(&settings())
+                    .then(|| session.cancel_task("its session was killed"))
+                    .flatten();
+                if let Some(cancelled) = cancelled {
+                    self.write_down_closed(&session, &cancelled);
                 }
+                let info = session.info();
                 session.stop();
+                if info.state == State::Running {
+                    self.events.emit(Event::ended(&info, "killed".into()));
+                }
+                self.events
+                    .emit(Event::about_session(Kind::SessionRemoved, &info));
                 Ok(Response::Done)
             }
-            Request::Worktree {
-                path,
-                branch,
-                created,
-            } => {
-                let event = Event::about_worktree(created, &path, branch.as_deref());
-                self.hooks.tell(event);
+            Request::Emit { event } => {
+                self.events.emit(*event);
                 Ok(Response::Done)
             }
+            Request::Subscribe { .. }
+            | Request::WaitOutput { .. }
+            | Request::Handover { .. }
+            | Request::TakeLayoutOrders { .. } => {
+                bail!("this takes the connection over")
+            }
+            Request::Layout(order) => Ok(Response::Layout(self.layout.pass(order)?)),
             Request::Rename { name, new_name } => {
                 let mut sessions = self.sessions.lock().unwrap();
                 if new_name != name {
@@ -810,14 +1459,11 @@ impl Daemon {
                         sessions.iter().any(|session| session.name == taken)
                     })?;
                 }
-                named(&mut sessions, &name)?.name = new_name.clone();
-                // A flow's step keeps to its session under the new name.
-                for run in self.flows.lock().unwrap().iter_mut() {
-                    for step in &mut run.steps {
-                        if step.session.as_ref() == Some(&name) {
-                            step.session = Some(new_name.clone());
-                        }
-                    }
+                let session = named(&mut sessions, &name)?;
+                session.name = new_name.clone();
+                session.keep_name();
+                if new_name != name {
+                    self.tell_renamed(session, &name);
                 }
                 Ok(Response::Done)
             }
@@ -870,16 +1516,43 @@ impl Daemon {
                 name,
                 failed,
                 summary,
+                artifacts,
             } => {
                 tasks::ensure_enabled(&settings())?;
                 let mut sessions = self.sessions.lock().unwrap();
-                let session = match (id, name) {
-                    (Some(id), _) => with_id(&mut sessions, &id)?,
-                    (None, Some(name)) => named(&mut sessions, &name)?,
-                    (None, None) => bail!("say which session's task to close"),
+                let session = id_or_name(&mut sessions, id, name)?;
+                let state = if failed {
+                    TaskState::Failed
+                } else {
+                    TaskState::Done
                 };
-                let closed = session.close_task(failed, &summary)?;
+                let kept = self.keep_files(session, &artifacts)?;
+                let closed = session.close_task(state, &summary)?;
+                self.record_kept(&session.info(), &closed, &kept);
                 self.write_down_closed(session, &closed);
+                Ok(Response::Done)
+            }
+            Request::Handoff { id, name, note } => {
+                handoff::ensure_enabled(&settings())?;
+                let note = handoff::tidy(&note).context(
+                    "the note is empty: `crystal handoff \"<what the next session here should know>\"`",
+                )?;
+                let (info, task) = {
+                    let mut sessions = self.sessions.lock().unwrap();
+                    let session = id_or_name(&mut sessions, id, name)?;
+                    let open = session.task_record().filter(|task| task.outcome.is_none());
+                    (session.info(), open.map(|task| task.goal))
+                };
+                let worktree = info.worktree.as_ref().map(|worktree| &worktree.path);
+                let worktree = worktree.with_context(|| {
+                    format!(
+                        "{} isn't in a git worktree, where notes are kept",
+                        info.name
+                    )
+                })?;
+                let heading = handoff::heading(&handoff::now(), &info.name, task.as_deref(), None);
+                let path = self.add_to_handoff(worktree, &handoff::section(&heading, &note))?;
+                self.events.emit(Event::handoff(&info, path, &note));
                 Ok(Response::Done)
             }
             Request::Distill { name } => self.distill_now(&name),
@@ -901,7 +1574,7 @@ impl Daemon {
                 let found =
                     store.search(&project, &query, kind, limit, embed::as_embed(&embedder))?;
                 Ok(Response::Memory {
-                    entries: memory::stale_last(found, &project),
+                    entries: memory::freshest_first(found, &project),
                 })
             }
             Request::Tasks { dir, all } => {
@@ -910,6 +1583,60 @@ impl Daemon {
                     tasks: self.tasks(&dir, all),
                 })
             }
+            Request::AddTask(mut task) => {
+                tasks::ensure_enabled(&settings())?;
+                task.created = now_seconds();
+                let id = self.db.lock().unwrap().add_pending_task(&task)?;
+                let project = project::of(&task.cwd).path;
+                let record = tasks::pending_record(&PendingTask { id, ..task });
+                self.events
+                    .emit(Event::pending_task(Kind::TaskOpened, project, record));
+                Ok(Response::TaskAdded { id })
+            }
+            Request::StartTask { id, env } => self.start_pending(id, env),
+            Request::ShowTask { task } => {
+                tasks::ensure_enabled(&settings())?;
+                Ok(Response::Task(self.with_kept(self.find_task(&task)?)))
+            }
+            Request::CancelTask { task } => {
+                self.cancel_task(&task)?;
+                Ok(Response::Done)
+            }
+            Request::TaskLog { task } => {
+                tasks::ensure_enabled(&settings())?;
+                let task = self.with_kept(self.find_task(&task)?);
+                let transcript = self.transcript_of(&task);
+                Ok(Response::TaskLog { task, transcript })
+            }
+            Request::Answer {
+                task,
+                answer,
+                message,
+            } => {
+                let mut sessions = self.sessions.lock().unwrap();
+                let session = task_session(&mut sessions, &task)?;
+                let asked = session.info().asking;
+                session.answer(answer, message.as_deref())?;
+                let info = session.info();
+                self.events.emit(Event::answered(&info, asked, answer));
+                // The next it asks for, if it asked for several at once.
+                if let Some(next) = info.asking.clone() {
+                    self.events.emit(Event::asking(&info, next));
+                }
+                Ok(Response::Done)
+            }
+            Request::Interrupt { task } => {
+                let mut sessions = self.sessions.lock().unwrap();
+                let session = task_session(&mut sessions, &task)?;
+                session.interrupt()?;
+                self.events
+                    .emit(Event::about_session(Kind::RunInterrupted, &session.info()));
+                Ok(Response::Done)
+            }
+            Request::Spending => Ok(Response::Spending(protocol::Spending {
+                today_usd: self.spending.today(),
+                daily_budget_usd: settings().tasks.daily_budget_usd,
+            })),
             Request::BacklogList { dir, all } => {
                 backlog::ensure_enabled(&settings())?;
                 let project = project::of(&dir);
@@ -921,12 +1648,21 @@ impl Daemon {
                 }))
             }
             Request::BacklogAdd { dir, text, tags } => {
-                let number =
-                    self.change_backlog(&dir, |store| store.add(&text, tags, now_seconds()))?;
+                let (number, item) = self.change_backlog(&dir, |store| {
+                    let number = store.add(&text, tags, now_seconds())?;
+                    Ok((number, store.get(number).cloned()))
+                })?;
+                self.tell_backlog(Kind::BacklogAdded, &dir, item);
                 Ok(Response::Added { number })
             }
             Request::BacklogMark { dir, number, done } => {
-                self.change_backlog(&dir, |store| store.mark(number, done, now_seconds()))?;
+                let item = self.change_backlog(&dir, |store| {
+                    store.mark(number, done, now_seconds())?;
+                    Ok(store.get(number).cloned())
+                })?;
+                if done {
+                    self.tell_backlog(Kind::BacklogClosed, &dir, item);
+                }
                 Ok(Response::Done)
             }
             Request::BacklogRemove { dir, number } => {
@@ -960,15 +1696,19 @@ impl Daemon {
                 Ok(Response::Flows { runs })
             }
             Request::ApproveFlow { run } => {
-                self.change_flow(&run, FlowRun::approve)?;
+                self.change_flow(&run, None, FlowRun::approve)?;
                 Ok(Response::Done)
             }
             Request::SendFlowBack { run, notes } => {
-                self.change_flow(&run, |run| run.send_back(&notes))?;
+                self.change_flow(&run, Some(&notes), |run| run.send_back(&notes))?;
                 Ok(Response::Done)
             }
             Request::RetryFlow { run } => {
-                self.change_flow(&run, FlowRun::retry)?;
+                self.change_flow(&run, None, FlowRun::retry)?;
+                Ok(Response::Done)
+            }
+            Request::CancelFlow { run } => {
+                self.cancel_flow(&run)?;
                 Ok(Response::Done)
             }
             // Leaving is enough: the sessions' terminals close with the
@@ -979,8 +1719,15 @@ impl Daemon {
             Request::Shutdown {
                 keep_sessions: false,
             } => {
-                let sessions = std::mem::take(&mut *self.sessions.lock().unwrap());
-                for session in &sessions {
+                let mut sessions = std::mem::take(&mut *self.sessions.lock().unwrap());
+                let tasks_on = tasks::enabled(&settings());
+                for session in &mut sessions {
+                    let cancelled = tasks_on
+                        .then(|| session.cancel_task("crystal was stopped"))
+                        .flatten();
+                    if let Some(cancelled) = cancelled {
+                        self.write_down(session.cwd(), Some(&session.info()), &cancelled);
+                    }
                     session.stop();
                 }
                 let deadline = Instant::now() + STOP_GRACE + Duration::from_millis(500);
@@ -1012,22 +1759,46 @@ impl Daemon {
     }
 
     /// The tasks of the project `dir` is in, or every project's with `all`:
-    /// those still open in sessions, then those closed, the latest first.
-    fn tasks(&self, dir: &Path, all: bool) -> Vec<TaskRecord> {
+    /// those still open in sessions, then those waiting to start, then
+    /// those closed, the latest first. A task closed more than once, say a
+    /// background task given a follow-up, is listed as it last closed.
+    fn tasks(&self, dir: &Path, all: bool) -> Vec<TaskView> {
         let project = project::of(dir);
-        let in_project =
-            |session: &&Session| all || project::of(session.cwd()).path == project.path;
-        let mut tasks: Vec<TaskRecord> = {
+        let in_project = |cwd: &Path| all || project::of(cwd).path == project.path;
+        let mut tasks: Vec<TaskView> = {
             let sessions = self.sessions.lock().unwrap();
             sessions
                 .iter()
-                .filter(in_project)
-                .filter_map(Session::task_record)
-                .filter(|task| task.outcome.is_none())
+                .filter(|session| in_project(session.cwd()))
+                .filter_map(Session::task_view)
+                .filter(|task| task.record.outcome.is_none())
                 .collect()
         };
+        let pending = self.db.lock().unwrap().pending_tasks();
+        let pending = pending.unwrap_or_else(|err| {
+            eprintln!("crystal daemon: couldn't read the tasks waiting to start: {err:#}");
+            Vec::new()
+        });
+        let pending = pending.iter().filter(|task| in_project(&task.cwd));
+        tasks.extend(pending.map(|task| TaskView::of_record(tasks::pending_record(task))));
         let mine = (!all).then_some(project.path.as_path());
-        let closed = self.db.lock().unwrap().closed_tasks(mine);
+        let mut closed = self.closed_tasks(mine);
+        let mut listed: HashSet<u64> = tasks.iter().filter_map(|task| task.record.id).collect();
+        closed.retain(|task| task.id.is_none_or(|id| listed.insert(id)));
+        tasks.extend(closed.into_iter().map(TaskView::of_record));
+        tasks.into_iter().map(|task| self.with_kept(task)).collect()
+    }
+
+    /// `task` with the files kept with it.
+    fn with_kept(&self, mut task: TaskView) -> TaskView {
+        task.record.artifacts = self.kept_with(task.record.id);
+        task
+    }
+
+    /// The closed tasks of the project whose main worktree is `project`, or
+    /// of every project, the latest to close first.
+    fn closed_tasks(&self, project: Option<&Path>) -> Vec<TaskRecord> {
+        let closed = self.db.lock().unwrap().closed_tasks(project);
         let mut closed = closed.unwrap_or_else(|err| {
             eprintln!("crystal daemon: couldn't read the closed tasks: {err:#}");
             Vec::new()
@@ -1035,23 +1806,249 @@ impl Daemon {
         closed.sort_by_key(|task| {
             std::cmp::Reverse(task.outcome.as_ref().map_or(0, |outcome| outcome.closed))
         });
-        tasks.extend(closed);
-        tasks
+        closed
+    }
+
+    /// The task `handle` names, by its number or its session's name: open
+    /// in a session, waiting to start, or closed.
+    fn find_task(&self, handle: &str) -> Result<TaskView> {
+        {
+            let mut sessions = self.sessions.lock().unwrap();
+            if let Some(session) = handled_session(&mut sessions, handle) {
+                return session
+                    .task_view()
+                    .with_context(|| format!("{} has no task", session.name));
+            }
+        }
+        let id = tasks::parse_id(handle).with_context(|| {
+            format!("there's no task or session called {handle}: give a task's number, like t12")
+        })?;
+        if let Some(task) = self.db.lock().unwrap().pending_task(id)? {
+            return Ok(TaskView::of_record(tasks::pending_record(&task)));
+        }
+        let closed = self.closed_tasks(None);
+        let found = closed.into_iter().find(|task| task.id == Some(id));
+        let found = found.with_context(|| format!("there's no task t{id}"))?;
+        Ok(TaskView::of_record(found))
+    }
+
+    /// The transcript of the session working on `task`, or that worked on
+    /// it, while that session is still there: its history, then its screen.
+    fn transcript_of(&self, task: &TaskView) -> Option<Vec<String>> {
+        let sessions = self.sessions.lock().unwrap();
+        let session = match task.record.id {
+            Some(id) => sessions
+                .iter()
+                .find(|session| session.task_id() == Some(id)),
+            None => sessions
+                .iter()
+                .find(|session| session.name == task.record.session),
+        }?;
+        Some(session.term().rows(true))
+    }
+
+    /// Cancels the task `handle` names, by its number or its session's
+    /// name, and stops its session; or, waiting to start, takes it out of
+    /// the store.
+    fn cancel_task(&self, handle: &str) -> Result<()> {
+        tasks::ensure_enabled(&settings())?;
+        {
+            let mut sessions = self.sessions.lock().unwrap();
+            if let Some(session) = handled_session(&mut sessions, handle) {
+                let name = session.name.clone();
+                let cancelled = session
+                    .cancel_task("cancelled by the user")
+                    .with_context(|| format!("{name} has no task that's open"))?;
+                self.write_down_closed(session, &cancelled);
+                session.stop();
+                return Ok(());
+            }
+        }
+        let id = tasks::parse_id(handle).with_context(|| {
+            format!("there's no task or session called {handle}: give a task's number, like t12")
+        })?;
+        let pending = {
+            let db = self.db.lock().unwrap();
+            let pending = db.pending_task(id)?;
+            let pending = pending.with_context(|| format!("there's no open task t{id}"))?;
+            db.remove_pending_task(id)?;
+            pending
+        };
+        let closed = now_seconds();
+        let cancelled = TaskRecord {
+            outcome: Some(TaskOutcome::new(
+                TaskState::Cancelled,
+                "cancelled before it started",
+                closed,
+            )),
+            pending: false,
+            ..tasks::pending_record(&pending)
+        };
+        self.write_down(&pending.cwd, None, &cancelled);
+        Ok(())
+    }
+
+    /// Starts the task numbered `id`, which was waiting to, from the
+    /// client's environment `env`. One that won't start waits on.
+    fn start_pending(&self, id: u64, env: BTreeMap<String, String>) -> Result<Response> {
+        tasks::ensure_enabled(&settings())?;
+        // Held to the end, so that the task can't be started twice at once.
+        let mut sessions = self.sessions.lock().unwrap();
+        let task = self.db.lock().unwrap().pending_task(id)?;
+        let task = task.with_context(|| format!("there's no task t{id} waiting to start"))?;
+        let PendingTask {
+            goal,
+            cwd,
+            name,
+            start: how,
+            backlog,
+            ..
+        } = task;
+        let started = match how {
+            TaskStart::Agent { command } => {
+                let new = NewSession {
+                    name,
+                    cwd,
+                    command,
+                    env,
+                    task: Some(goal),
+                    backlog,
+                };
+                start(&mut sessions, &self.socket, new, None, None)
+            }
+            TaskStart::Background { args } => {
+                let new = NewTask {
+                    name,
+                    cwd,
+                    spec: TaskSpec { prompt: goal, args },
+                    env,
+                    backlog,
+                };
+                start_task(&mut sessions, &self.socket, &self.spending, new, None, true)
+            }
+        };
+        let name = started?;
+        // It keeps the number it was given as it was made.
+        if let Some(session) = sessions.last_mut() {
+            session.number_task(id);
+        }
+        if let Err(err) = self.db.lock().unwrap().remove_pending_task(id) {
+            eprintln!("crystal daemon: couldn't forget that t{id} waits to start: {err:#}");
+        }
+        Ok(self.started(&mut sessions, name, Kind::TaskStarted))
     }
 
     fn new_session(&self, new: NewSession) -> Result<Response> {
         let mut sessions = self.sessions.lock().unwrap();
-        let name = start(&mut sessions, &self.socket, new, None)?;
-        self.tell_started(&sessions, &name);
-        Ok(Response::Created { name })
+        let name = start(&mut sessions, &self.socket, new, None, None)?;
+        Ok(self.started(&mut sessions, name, Kind::TaskOpened))
     }
 
-    /// Tells the plugins that the session called `name` has started.
-    fn tell_started(&self, sessions: &[Session], name: &str) {
-        if let Some(session) = sessions.iter().find(|session| session.name == name) {
-            self.hooks
-                .tell(Event::about_session("session.started", &session.info()));
+    /// What's said once the session called `name` has started: its task is
+    /// numbered, it's told of, its task as `task_kind`, and the client is
+    /// told both.
+    fn started(&self, sessions: &mut [Session], name: String, task_kind: Kind) -> Response {
+        self.number_tasks(sessions);
+        self.tell_started(sessions, &name, task_kind);
+        let session = sessions.iter().find(|session| session.name == name);
+        let task = session.and_then(Session::task_id);
+        Response::Created { name, task }
+    }
+
+    /// Tells that the session called `name` has started, and of its task,
+    /// when it has one open: opened with it, or `task_kind`, started after
+    /// it waited to.
+    fn tell_started(&self, sessions: &[Session], name: &str, task_kind: Kind) {
+        let Some(session) = sessions.iter().find(|session| session.name == name) else {
+            return;
+        };
+        let info = session.info();
+        self.events
+            .emit(Event::about_session(Kind::SessionStarted, &info));
+        if let Some(task) = session.task_record().filter(|task| task.outcome.is_none()) {
+            self.events.emit(Event::task(task_kind, &info, task));
         }
+    }
+
+    /// Tells what has happened to `session` since this was last asked.
+    fn tell_changes(&self, session: &mut Session) {
+        let changes = session.take_changes();
+        if changes.is_empty() {
+            return;
+        }
+        let info = session.info();
+        let task = |kind| {
+            let task = session.task_record()?;
+            Some(Event::task(kind, &info, task))
+        };
+        for change in changes {
+            let event = match change {
+                Change::Activity { from, to: Some(to) } => Some(Event::activity(&info, from, to)),
+                // The agent has left the front, and there's nothing to
+                // say it's doing.
+                Change::Activity { to: None, .. } => None,
+                Change::RunStarted { prompt } => Some(Event::run_started(&info, &prompt)),
+                Change::RunEnded(result) => Some(Event::run_ended(&info, &result)),
+                Change::Asking(asking) => Some(Event::asking(&info, asking)),
+                Change::Reopened => task(Kind::TaskOpened),
+                Change::TaskWaiting => task(Kind::TaskWaiting),
+                Change::Claimed => Some(Event::about_session(Kind::SessionClaimed, &info)),
+                Change::Released { agent } => Some(Event::released(&info, &agent)),
+            };
+            if let Some(event) = event {
+                self.events.emit(event);
+            }
+        }
+    }
+
+    /// Tells of `item`, on the backlog of the project `dir` is in.
+    fn tell_backlog(&self, kind: Kind, dir: &Path, item: Option<protocol::BacklogItem>) {
+        if let Some(item) = item {
+            let project = project::of(dir).path;
+            self.events.emit(Event::backlog(kind, project, item));
+        }
+    }
+
+    /// Streams the events `filter` takes to a client, after those the log
+    /// has from `since`, until it hangs up or falls too far behind.
+    fn stream_events(&self, conn: &UnixStream, filter: Filter, since: Option<Since>) -> Result<()> {
+        let subscription = self.events.subscribe(filter.clone());
+        let streamed = stream(conn, &self.events, &filter, since, &subscription);
+        self.events.unsubscribe(subscription.id);
+        let _ = conn.shutdown(Shutdown::Both);
+        streamed
+    }
+
+    /// Answers a client waiting for a row on the screen of the session
+    /// called `name` to match `pattern`, once one does, the program ends,
+    /// or `timeout` passes; or lets it go when it hangs up.
+    fn wait_for_output(
+        &self,
+        conn: &UnixStream,
+        name: &str,
+        pattern: &str,
+        timeout: Option<Duration>,
+    ) -> Result<()> {
+        let watched = (|| {
+            let pattern = Regex::new(pattern)
+                .with_context(|| format!("`{pattern}` isn't a regular expression"))?;
+            let term = {
+                let mut sessions = self.sessions.lock().unwrap();
+                named(&mut sessions, name)?.term()
+            };
+            let hung_up = watch_for_hang_up(conn)?;
+            matching_row(&term, name, &pattern, timeout, &hung_up)
+        })();
+        let response = match watched {
+            Ok(None) => None,
+            Ok(Some(line)) => Some(Response::Matched { line }),
+            Err(err) => Some(Response::from(err)),
+        };
+        if let Some(response) = response {
+            protocol::send(conn, &response)?;
+        }
+        let _ = conn.shutdown(Shutdown::Both);
+        Ok(())
     }
 
     /// Runs an ended session's command again, in its directory and under
@@ -1083,7 +2080,14 @@ impl Daemon {
                     backlog,
                 };
                 let conversation = launch.conversation.map(|conversation| conversation.id);
-                start_task(&mut sessions, &self.socket, task, conversation, true)
+                start_task(
+                    &mut sessions,
+                    &self.socket,
+                    &self.spending,
+                    task,
+                    conversation,
+                    true,
+                )
             }
             None => {
                 let new = NewSession {
@@ -1091,10 +2095,16 @@ impl Daemon {
                     cwd: launch.cwd,
                     command: launch.command,
                     env,
-                    task: launch.goal.map(|goal| goal.goal),
+                    task: launch.goal.as_ref().map(|goal| goal.goal.clone()),
                     backlog,
                 };
-                start(&mut sessions, &self.socket, new, launch.conversation)
+                start(
+                    &mut sessions,
+                    &self.socket,
+                    new,
+                    launch.conversation,
+                    launch.resume,
+                )
             }
         };
         if let Err(err) = started {
@@ -1103,10 +2113,45 @@ impl Daemon {
         }
         // `start` adds the new session at the end; it goes where the old
         // one was.
-        let started = sessions.pop().expect("start added a session");
+        let mut started = sessions.pop().expect("start added a session");
+        // It's the same task, open again, under the same number.
+        if let (Some(goal), true) = (launch.goal, started.task_record().is_some()) {
+            started.give_task(TaskInfo {
+                waiting: false,
+                outcome: None,
+                ..goal
+            });
+        }
         sessions.insert(index, started);
-        self.tell_started(&sessions, name);
+        self.tell_started(&sessions, name, Kind::TaskOpened);
         Ok(Response::Done)
+    }
+}
+
+/// Takes up `run` as the last daemon left it when it stopped: a step in a
+/// terminal whose session came back with its task open carries on there;
+/// any other that was running then was cut short, and waits to be run
+/// again; one waiting at its gate waits on the user again. Its steps start
+/// from this daemon's environment, as the sessions it starts again do.
+fn take_up(sessions: &mut [Session], run: &mut FlowRun) {
+    let carried_on = run.running().is_some_and(|step| {
+        run.in_terminal(step)
+            && step_session(sessions, run, step).is_some_and(|session| {
+                let open = session
+                    .task_record()
+                    .is_some_and(|task| task.outcome.is_none());
+                session.is_running() && open
+            })
+    });
+    if !carried_on {
+        run.interrupt();
+    }
+    run.env = env::current();
+    let at_gate = run
+        .current()
+        .filter(|&step| run.steps[step].state == StepState::AtGate);
+    if let Some(session) = at_gate.and_then(|step| step_session(sessions, run, step)) {
+        session.on_agent_event(AgentEvent::Asking);
     }
 }
 
@@ -1120,6 +2165,119 @@ fn step_session<'a>(
     sessions.iter_mut().find(|session| session.name == *name)
 }
 
+/// Sends a subscriber what it asked for: that it has started, the events
+/// from the log it wants to catch up on, then each new one as it comes.
+/// A client that has gone ends it, and so does falling too far behind,
+/// which it's told.
+fn stream(
+    conn: &UnixStream,
+    events: &Bus,
+    filter: &Filter,
+    since: Option<Since>,
+    subscription: &Subscription,
+) -> Result<()> {
+    protocol::send(
+        conn,
+        &Response::Subscribed {
+            seq: subscription.seq,
+        },
+    )?;
+    if let Some(since) = since {
+        for event in events.replay(filter, since, subscription.seq) {
+            if protocol::send(conn, &event).is_err() {
+                return Ok(());
+            }
+        }
+    }
+    let hung_up = watch_for_hang_up(conn)?;
+    loop {
+        match subscription.feed.recv_timeout(LOOK_FOR_HANG_UP) {
+            Ok(event) => {
+                if protocol::send(conn, &*event).is_err() {
+                    return Ok(());
+                }
+            }
+            Err(RecvTimeoutError::Timeout) if hung_up.load(Ordering::Relaxed) => return Ok(()),
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => {
+                let message = "the stream fell too far behind and lost events: \
+                               subscribe again, from the last one you got"
+                    .to_string();
+                return Ok(protocol::send(conn, &Response::Error { message })?);
+            }
+        }
+    }
+}
+
+/// Waits, looking again each time the program writes, until a row of
+/// `term`'s screen, or of the end of its history, matches `pattern`, and
+/// gives that row; or says why none did: the program ended, or `timeout`
+/// passed. `None` once the client has hung up.
+fn matching_row(
+    term: &Term,
+    name: &str,
+    pattern: &Regex,
+    timeout: Option<Duration>,
+    hung_up: &AtomicBool,
+) -> Result<Option<String>> {
+    let deadline = timeout.map(|timeout| Instant::now() + timeout);
+    let output = term.listen();
+    let mut ended = false;
+    loop {
+        let looked = Instant::now();
+        let rows = term.recent_rows(HISTORY_MATCHED);
+        if let Some(row) = rows.iter().find(|row| pattern.is_match(row)) {
+            return Ok(Some(row.trim_end().to_string()));
+        }
+        if ended {
+            bail!("{name} has ended, and nothing on its screen matches `{pattern}`");
+        }
+        let left = deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
+        if left == Some(Duration::ZERO) {
+            let seconds = timeout.unwrap_or_default().as_secs_f64();
+            bail!("nothing on {name}'s screen matched `{pattern}` after {seconds}s");
+        }
+        let wait = left.map_or(LOOK_FOR_HANG_UP, |left| left.min(LOOK_FOR_HANG_UP));
+        match output.recv_timeout(wait) {
+            Ok(()) => thread::sleep(LOOK_AT_MOST_EVERY.saturating_sub(looked.elapsed())),
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => ended = true,
+        }
+        if hung_up.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
+    }
+}
+
+/// Watches, on a thread of its own, for a client that only listens to hang
+/// up: it sends nothing after its request, so a read that returns at all
+/// means it has gone. Shutting the connection down ends the watch too.
+fn watch_for_hang_up(conn: &UnixStream) -> Result<Arc<AtomicBool>> {
+    let hung_up = Arc::new(AtomicBool::new(false));
+    let mut watched = conn.try_clone()?;
+    thread::spawn({
+        let hung_up = hung_up.clone();
+        move || {
+            let _ = watched.read(&mut [0]);
+            hung_up.store(true, Ordering::Relaxed);
+        }
+    });
+    Ok(hung_up)
+}
+
+/// Tells of the entries the distiller added to the memory of `job`'s
+/// project, by their ids.
+fn tell_distilled(events: &Bus, job: &Job, added: &[u64]) {
+    let Ok(mut store) = memory::Store::open(&job.socket) else {
+        return;
+    };
+    for &id in added {
+        if let Ok(Some(entry)) = store.get(&job.project, id) {
+            events.emit(Event::memory(Kind::MemoryAdded, job.project.clone(), entry));
+        }
+    }
+}
+
 /// How the run of `step` ended, once it has: from what its task's run came
 /// to, or a failure when its session has gone.
 fn how_step_ended(sessions: &[Session], run: &FlowRun, step: usize) -> Option<Ended> {
@@ -1129,13 +2287,25 @@ fn how_step_ended(sessions: &[Session], run: &FlowRun, step: usize) -> Option<En
             failed: true,
             answer: format!("its session, {name}, has gone"),
             cost_usd: 0.0,
+            artifacts: Vec::new(),
         });
     };
+    if !session.is_task() {
+        // A step in a terminal ends as its task closes.
+        let outcome = session.task_record()?.outcome?;
+        return Some(Ended {
+            failed: outcome.state() != TaskState::Done,
+            answer: outcome.summary,
+            cost_usd: 0.0,
+            artifacts: Vec::new(),
+        });
+    }
     let result = session.finished_run()?;
     Some(Ended {
         failed: result.failed || !session.is_running(),
         answer: result.text,
         cost_usd: result.cost_usd,
+        artifacts: Vec::new(),
     })
 }
 
@@ -1147,12 +2317,14 @@ struct Found {
 }
 
 /// Starts a session and adds it to `sessions`. Given a `conversation`, an
-/// agent that can pick one up starts back in it.
+/// agent that can pick one up starts back in it; given a `resume_command`,
+/// the command an agent said resumes it, it's resumed with that instead.
 fn start(
     sessions: &mut Vec<Session>,
     socket: &Path,
     new: NewSession,
     conversation: Option<Conversation>,
+    resume_command: Option<Vec<String>>,
 ) -> Result<String> {
     let NewSession {
         name,
@@ -1169,48 +2341,69 @@ fn start(
         exists(program, &cwd, env.get("PATH")),
         "command not found: {program}"
     );
+    let config = settings();
+    // Not given a name, a session is named for what it's asked to do, or
+    // else after its program, until its first prompt names it.
+    let from_prompt = task
+        .as_deref()
+        .filter(|_| config.name_from_prompt)
+        .and_then(names::from_prompt);
+    let named_after_program = name.is_none() && from_prompt.is_none();
     let taken = |name: &str| sessions.iter().any(|session| session.name == name);
     let name = match name {
         Some(name) => {
             check_name(&name, taken)?;
             name
         }
-        None => unique_name(program, taken),
+        None => unique_name(from_prompt.as_deref().unwrap_or(program), taken),
     };
 
     let id = new_id();
     let rollouts = codex::Rollouts::for_session(&command, &cwd, &env);
+    // An agent that said how to resume it comes back with that command:
+    // typed into the session's shell, or else run in place of its command.
+    // It says what it's doing again once it's up.
+    let resume_command = resume_command.filter(|argv| resumable(argv, &name, &config, &cwd, &env));
+    let at_a_shell = matches!(front::of_command(&command), Some(Front::Shell { .. }));
+    let resumed = resume_command.is_some();
+    let (asked, typed) = match resume_command {
+        Some(argv) if at_a_shell => (command.clone(), Some(report::typed(&argv))),
+        Some(argv) => (argv, None),
+        None => (command.clone(), None),
+    };
     let env = env::for_session(&env, &name, &id, socket);
     let crystal = std::env::current_exe()?;
     // A conversation that can't be picked up any more is left behind: the
     // agent starts a new one, which its hooks or its rollout will name.
-    let conversation = conversation.filter(Conversation::can_resume);
+    let conversation = conversation
+        .filter(|_| !resumed)
+        .filter(Conversation::can_resume);
     let resume = conversation
         .as_ref()
         .map(|conversation| conversation.id.as_str());
-    let mut asked = command.clone();
     // What it was started to do: a conversation picked up again has been
     // asked that already, whether tasks are on or off.
     let given_task = task.clone();
     // With tasks off, a session started with something to do is just a
     // session.
-    let config = settings();
     let task = task.filter(|_| tasks::enabled(&config));
-    let mut about_task = None;
-    if let Some(goal) = &task {
-        let paragraph = tasks::instructions(backlog::enabled(&config));
-        // Codex has no system prompt to add to, so it hears it at the end
-        // of what it's asked to do.
-        if agents::program_name(&command) == Some("codex")
-            && let Some(last) = asked.last_mut()
-            && last == goal
-        {
-            last.push_str("\n\n");
-            last.push_str(&notes(Some(paragraph.clone()), None).join("\n\n"));
-        }
-        about_task = Some(paragraph);
-    }
-    let instructions = notes(about_task, remembered(socket, &cwd, &command));
+    let about_task = task
+        .as_ref()
+        .map(|_| tasks::instructions(backlog::enabled(&config)));
+    let remembered = remembered(socket, &cwd, &command);
+    let said = [
+        task.as_deref(),
+        about_task.as_deref(),
+        remembered.as_deref(),
+    ];
+    let handoff = handoff_note(&cwd, &said);
+    // Picked up again with its own command, its conversation has heard
+    // crystal's notes already.
+    let instructions = if resumed {
+        Vec::new()
+    } else {
+        notes(about_task, handoff, remembered)
+    };
     let argv = agents::argv(
         &asked,
         &crystal,
@@ -1218,15 +2411,19 @@ fn start(
         given_task.as_deref(),
         &instructions,
     );
-    let argv = agents::with_options(argv, &memory_tools(socket, &cwd, &command, &crystal));
+    let argv = agents::with_options(argv, &memory_tools(socket, &cwd, &asked, &crystal));
+    let argv = codex::with_instructions(argv, &instructions, codex::home(&env).as_deref());
     let mut session = Session::spawn(id, name.clone(), command, &argv, cwd, &env)?;
+    if let Some(typed) = typed
+        && let Err(err) = session.term().write(&typed)
+    {
+        eprintln!("crystal daemon: couldn't resume {name}'s agent: {err:#}");
+    }
+    if named_after_program {
+        session.mark_named_after_program();
+    }
     if let Some(goal) = task {
-        session.give_task(TaskInfo {
-            goal,
-            background: false,
-            backlog,
-            outcome: None,
-        });
+        session.give_task(new_task_info(goal, false, backlog));
     }
     match conversation {
         Some(conversation) => session.set_conversation(conversation),
@@ -1240,12 +2437,41 @@ fn start(
     Ok(name)
 }
 
+/// Whether the session called `name` can be resumed with `argv`, the
+/// command its agent gave, run from `cwd` in the environment `env`: the
+/// config says to, and the command is there.
+fn resumable(
+    argv: &[String],
+    name: &str,
+    config: &Config,
+    cwd: &Path,
+    env: &BTreeMap<String, String>,
+) -> bool {
+    let Some(program) = argv.first().filter(|_| config.resume_reported_agents) else {
+        return false;
+    };
+    let found = exists(program, cwd, env.get("PATH"));
+    if !found {
+        eprintln!("crystal daemon: couldn't resume {name}'s agent: command not found: {program}");
+    }
+    found
+}
+
 /// What crystal tells an agent on top of what it was asked, a paragraph
-/// each: about its task first, the one thing it mustn't forget, then what
-/// the project's memory has, all opened by where they come from. Nothing at
+/// each: about its task first, the one thing it mustn't forget, then the
+/// notes the sessions before it in its worktree left, then what the
+/// project's memory has, all opened by where they come from. Nothing at
 /// all when there's nothing to say.
-fn notes(about_task: Option<String>, remembered: Option<String>) -> Vec<String> {
-    let said: Vec<String> = about_task.into_iter().chain(remembered).collect();
+fn notes(
+    about_task: Option<String>,
+    handoff: Option<String>,
+    remembered: Option<String>,
+) -> Vec<String> {
+    let said: Vec<String> = about_task
+        .into_iter()
+        .chain(handoff)
+        .chain(remembered)
+        .collect();
     if said.is_empty() {
         return said;
     }
@@ -1254,21 +2480,46 @@ fn notes(about_task: Option<String>, remembered: Option<String>) -> Vec<String> 
     notes
 }
 
-/// What the project's memory has to tell a Claude Code session as it
-/// starts, with the words of its command as what it was asked, unless the
-/// config turns memory off. Codex has no way to be told something at
-/// launch without it showing as the user's own first message, so it isn't.
-fn remembered(socket: &Path, cwd: &Path, command: &[String]) -> Option<String> {
-    if agents::program_name(command) != Some("claude") {
+/// What an agent starting in `cwd` is told of its worktree's handoff file,
+/// when the plugin is on and the file has notes. `said` is what else it's
+/// asked and told as it starts, which the file's end mustn't push past what
+/// a prompt may be.
+fn handoff_note(cwd: &Path, said: &[Option<&str>]) -> Option<String> {
+    if !handoff::enabled(&settings()) {
         return None;
     }
+    let worktree = handoff::worktree_of(cwd)?;
+    let said = said.iter().flatten().map(|text| text.len()).sum();
+    handoff::launch_note(&worktree, said)
+}
+
+/// What the project's memory has to tell an agent as it starts in `cwd`,
+/// with the words of its command as what it was asked, unless the config
+/// turns memory off: Claude Code, Codex, or another agent crystal knows
+/// that's given a first prompt to say it in.
+fn remembered(socket: &Path, cwd: &Path, command: &[String]) -> Option<String> {
+    let reader = match agents::program_name(command)? {
+        "claude" => memory::Reader::Claude,
+        "codex" => memory::Reader::Agent,
+        _ if catalog::first_prompt_at(command).is_some() => memory::Reader::Agent,
+        _ => return None,
+    };
     if !memory::enabled_now() {
         return None;
     }
-    let project = memory::project_of(cwd);
-    let embedder = embed::shared_now();
     let asked = command[1..].join(" ");
-    memory::for_launch(socket, &project, &asked, false, embed::as_embed(&embedder))
+    launch_memory(socket, cwd, &asked, reader)
+}
+
+/// What the memory of the project `cwd` is in tells `reader` as it starts
+/// there, asked `asked`: what has to do with the files its worktree has
+/// changed comes first.
+fn launch_memory(socket: &Path, cwd: &Path, asked: &str, reader: memory::Reader) -> Option<String> {
+    let project = memory::project_of(cwd);
+    let changed = git::branch_changes(cwd).unwrap_or_default();
+    let embedder = embed::shared_now();
+    let embedder = embed::as_embed(&embedder);
+    memory::for_launch(socket, &project, asked, &changed, reader, embedder)
         .ok()
         .flatten()
 }
@@ -1305,21 +2556,21 @@ fn embed_waiting(socket: &Path) {
     }
 }
 
-/// The arguments each of a task's runs gives Claude: the task's own, and,
-/// with memory on, what its project remembers that has to do with its
-/// prompt, in its system prompt, and crystal's MCP server, with its tools
-/// allowed, to search the rest.
+/// The arguments each of a task's runs gives Claude: the task's own; in its
+/// system prompt, the notes its worktree's sessions left and, with memory
+/// on, what its project remembers that has to do with its prompt; and with
+/// memory on, crystal's MCP server, with its tools allowed, to search the
+/// rest.
 fn task_args(socket: &Path, cwd: &Path, spec: &protocol::TaskSpec) -> Vec<String> {
-    if !memory::enabled_now() {
-        return spec.args.clone();
-    }
-    let project = memory::project_of(cwd);
-    let embedder = embed::shared_now();
-    let embedder = embed::as_embed(&embedder);
-    let remembered = memory::for_launch(socket, &project, &spec.prompt, true, embedder)
-        .ok()
+    let memory_on = memory::enabled_now();
+    let remembered = memory_on
+        .then(|| launch_memory(socket, cwd, &spec.prompt, memory::Reader::Task))
         .flatten();
-    let args = agents::with_instructions(&spec.args, &notes(None, remembered));
+    let handoff = handoff_note(cwd, &[remembered.as_deref()]);
+    let args = agents::with_instructions(&spec.args, &notes(None, handoff, remembered));
+    if !memory_on {
+        return args;
+    }
     let Ok(crystal) = std::env::current_exe() else {
         return args;
     };
@@ -1329,12 +2580,14 @@ fn task_args(socket: &Path, cwd: &Path, spec: &protocol::TaskSpec) -> Vec<String
     agents::with_value(&args, &["--allowedTools", "--allowed-tools"], &tools)
 }
 
-/// Starts a task and adds it to `sessions`. With `run_prompt`, Claude runs
-/// its prompt now; without, the task waits at rest for a follow-up. Given a
-/// `conversation`, its runs carry that on.
+/// Starts a task and adds it to `sessions`, its runs adding to
+/// `spending`. With `run_prompt`, Claude runs its prompt now; without, the
+/// task waits at rest for a follow-up. Given a `conversation`, its runs
+/// carry that on.
 fn start_task(
     sessions: &mut Vec<Session>,
     socket: &Path,
+    spending: &Arc<Spending>,
     task: NewTask,
     conversation: Option<String>,
     run_prompt: bool,
@@ -1356,22 +2609,33 @@ fn start_task(
             check_name(&name, taken)?;
             name
         }
-        None => unique_name("task", taken),
+        None => {
+            let from_prompt = settings()
+                .name_from_prompt
+                .then_some(spec.prompt.as_str())
+                .and_then(names::from_prompt);
+            unique_name(from_prompt.as_deref().unwrap_or("task"), taken)
+        }
     };
 
     let id = new_id();
     let env = env::for_session(&env, &name, &id, socket);
     let prompt = spec.prompt.clone();
     let args = task_args(socket, &cwd, &spec);
-    let mut session = Session::task(id, name.clone(), spec, args, cwd, env, conversation);
+    let spending = spending.clone();
+    let mut session = Session::task(
+        id,
+        name.clone(),
+        spec,
+        args,
+        cwd,
+        env,
+        spending,
+        conversation,
+    );
     // It closes itself when its run ends, from Claude's answer.
     if tasks::enabled(&settings()) {
-        session.give_task(TaskInfo {
-            goal: prompt.clone(),
-            background: true,
-            backlog,
-            outcome: None,
-        });
+        session.give_task(new_task_info(prompt.clone(), true, backlog));
     }
     if run_prompt {
         session.prompt(&prompt)?;
@@ -1380,6 +2644,19 @@ fn start_task(
     }
     sessions.push(session);
     Ok(name)
+}
+
+/// A task just made, open, and numbered by [`Daemon::number_tasks`].
+fn new_task_info(goal: String, background: bool, backlog: Option<u64>) -> TaskInfo {
+    TaskInfo {
+        id: None,
+        goal,
+        background,
+        backlog,
+        waiting: false,
+        created: now_seconds(),
+        outcome: None,
+    }
 }
 
 /// The user's settings, read again each time so that a change counts at
@@ -1445,6 +2722,39 @@ impl Drop for Reading {
     }
 }
 
+/// The session a request names by its `id`, from a program in it, or else
+/// by its `name`.
+fn id_or_name(
+    sessions: &mut [Session],
+    id: Option<String>,
+    name: Option<String>,
+) -> Result<&mut Session> {
+    match (id, name) {
+        (Some(id), _) => with_id(sessions, &id),
+        (None, Some(name)) => named(sessions, &name),
+        (None, None) => bail!("say which session"),
+    }
+}
+
+/// The session `handle` names: the one working on task `t12`, or else the
+/// one called that.
+fn handled_session<'a>(sessions: &'a mut [Session], handle: &str) -> Option<&'a mut Session> {
+    let by_task = tasks::parse_id(handle).and_then(|id| {
+        sessions
+            .iter()
+            .position(|session| session.task_id() == Some(id))
+    });
+    let index = by_task.or_else(|| sessions.iter().position(|session| session.name == handle))?;
+    Some(&mut sessions[index])
+}
+
+/// The session working on the task `handle` names, by the task's number or
+/// the session's name.
+fn task_session<'a>(sessions: &'a mut [Session], handle: &str) -> Result<&'a mut Session> {
+    handled_session(sessions, handle)
+        .with_context(|| format!("there's no task or session called {handle}"))
+}
+
 fn named<'a>(sessions: &'a mut [Session], name: &str) -> Result<&'a mut Session> {
     sessions
         .iter_mut()
@@ -1505,16 +2815,42 @@ fn attach(
 }
 
 /// What to tell a crystal of another version than this daemon's. Starting
-/// the daemon again from that crystal makes the two match.
-fn version_mismatch(daemon: &str, client: Option<&str>) -> String {
-    let client = match client {
-        Some(version) => format!("crystal {version}"),
-        None => "an older crystal".to_string(),
+/// the daemon again from that crystal, run as `crystal` runs on this daemon
+/// ([`socket::crystal_for`]), makes the two match; one older than the
+/// daemon, say a TUI left open as crystal was upgraded, is the one to start
+/// again.
+fn version_mismatch(daemon: &str, client: Option<&str>, crystal: &str) -> String {
+    match client {
+        Some(client) if older(client, daemon) => format!(
+            "this is crystal {client}, but the daemon is crystal {daemon}, which is newer: \
+             quit and run {crystal} again to use it"
+        ),
+        client => {
+            let client = match client {
+                Some(version) => format!("crystal {version}"),
+                None => "an older crystal".to_string(),
+            };
+            format!(
+                "this is {client}, but the daemon is crystal {daemon}: \
+                 run `{crystal} restart-server` to restart the daemon on this crystal"
+            )
+        }
+    }
+}
+
+/// Whether the version `a` comes before `b`, number by number. Neither,
+/// when either isn't numbers.
+fn older(a: &str, b: &str) -> bool {
+    let numbers = |version: &str| {
+        version
+            .split('.')
+            .map(|number| number.parse::<u64>().ok())
+            .collect::<Option<Vec<u64>>>()
     };
-    format!(
-        "this is {client}, but the daemon is crystal {daemon}: \
-         run `crystal restart-server` to restart the daemon on this crystal"
-    )
+    match (numbers(a), numbers(b)) {
+        (Some(a), Some(b)) => a < b,
+        _ => false,
+    }
 }
 
 impl From<anyhow::Error> for Response {
@@ -1560,26 +2896,54 @@ mod tests {
     #[test]
     fn a_mismatch_says_both_versions_and_the_way_out() {
         assert_eq!(
-            version_mismatch("0.1.0", Some("0.2.0")),
+            version_mismatch("0.1.0", Some("0.2.0"), "crystal"),
             "this is crystal 0.2.0, but the daemon is crystal 0.1.0: \
              run `crystal restart-server` to restart the daemon on this crystal"
         );
-        assert!(version_mismatch("0.1.0", None).starts_with("this is an older crystal,"));
+        assert!(
+            version_mismatch("0.1.0", None, "crystal").starts_with("this is an older crystal,")
+        );
+        assert!(
+            version_mismatch("0.1.0", None, "crystal --server work")
+                .contains("run `crystal --server work restart-server`")
+        );
+    }
+
+    #[test]
+    fn a_crystal_older_than_the_daemon_is_told_to_start_again() {
+        assert_eq!(
+            version_mismatch("0.4.0", Some("0.3.9"), "crystal --server work"),
+            "this is crystal 0.3.9, but the daemon is crystal 0.4.0, which is newer: \
+             quit and run crystal --server work again to use it"
+        );
+        assert!(older("0.9.0", "0.10.0"));
+        assert!(!older("0.10.0", "0.9.0"));
+        assert!(!older("dev", "0.1.0"));
     }
 
     #[test]
     fn crystal_s_notes_say_where_they_come_from_then_the_task_then_the_memory() {
-        let notes = notes(Some("about the task".into()), Some("remembered".into()));
+        let notes = notes(
+            Some("about the task".into()),
+            Some("handed off".into()),
+            Some("remembered".into()),
+        );
         assert_eq!(
             notes,
-            [agents::ABOUT_CRYSTAL, "about the task", "remembered"]
+            [
+                agents::ABOUT_CRYSTAL,
+                "about the task",
+                "handed off",
+                "remembered"
+            ]
         );
     }
 
     #[test]
     fn with_nothing_to_say_there_are_no_notes_at_all() {
-        assert!(notes(None, None).is_empty());
-        assert_eq!(notes(None, Some("remembered".into())).len(), 2);
+        assert!(notes(None, None, None).is_empty());
+        assert_eq!(notes(None, None, Some("remembered".into())).len(), 2);
+        assert_eq!(notes(None, Some("handed off".into()), None).len(), 2);
     }
 
     #[test]

@@ -1,31 +1,30 @@
 //! A flow run: one goal going through a flow's steps, and how far it's got.
 //!
 //! This is the state alone, and how it changes: a step ends, the user goes
-//! on past a gate, sends the flow back, or runs a stopped step again. Each
-//! change says what to do [`Next`], and the daemon does it: it starts the
-//! step's task, or tells the user the flow waits on them. Nothing here
-//! starts a process or reads a file, so every change is unit-tested; the
-//! daemon writes the runs down in its database.
+//! on past a gate, sends the flow back, runs a stopped step again, or
+//! cancels the run. Each change says what to do [`Next`], and the daemon
+//! does it: it starts the step's task where [`FlowRun::place`] says, or
+//! tells the user the flow waits on them. Nothing here starts a process or
+//! reads a file, so every change is unit-tested; the daemon writes the runs
+//! down in its database.
 //!
 //! The steps go in order. Those before the current step are done; the
 //! current one is running, waiting at its gate, or stopped; those after it
 //! are still to come. Sending the flow back makes the step it goes back to
 //! the current one again, and the steps from there on still to come.
 
-use crate::flows::{self, Flow};
+use crate::flows::{self, Flow, Placement, Value};
 use crate::profile::Profile;
 use crate::protocol::TaskSpec;
-use anyhow::{Result, bail};
+use crate::tasks::MAX_PROMPT_BYTES;
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-/// How many runs that have finished, done or failed, are kept for `crystal
-/// flow` to list. Older ones are let go as new ones start.
+/// How many runs that have finished, done, failed or cancelled, are kept
+/// for `crystal flow` to list. Older ones are let go as new ones start.
 const FINISHED_KEPT: usize = 50;
-
-/// The longest a branch named after a goal gets.
-const BRANCH_LENGTH: usize = 40;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FlowRun {
@@ -80,6 +79,16 @@ pub struct StepRun {
     /// What its runs cost, in US dollars, as Claude counts it.
     #[serde(default)]
     pub cost_usd: f64,
+    /// Where its latest run ran: a step placed `same` after it runs there
+    /// too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<PathBuf>,
+    /// The number of its latest task, 12 for `t12`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<u64>,
+    /// The files its task kept as it closed: `{<step>.artifacts}`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifacts: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -96,6 +105,8 @@ pub enum StepState {
     Failed,
     /// It was running when the daemon stopped, so its run was cut short.
     Interrupted,
+    /// The user cancelled the run while it was at this step.
+    Cancelled,
 }
 
 impl StepState {
@@ -108,6 +119,7 @@ impl StepState {
             StepState::Done => "done",
             StepState::Failed => "failed",
             StepState::Interrupted => "interrupted",
+            StepState::Cancelled => "cancelled",
         }
     }
 }
@@ -120,6 +132,7 @@ pub enum RunState {
     Done,
     Failed,
     Interrupted,
+    Cancelled,
 }
 
 impl RunState {
@@ -131,6 +144,7 @@ impl RunState {
             RunState::Done => "done",
             RunState::Failed => "failed",
             RunState::Interrupted => "interrupted",
+            RunState::Cancelled => "cancelled",
         }
     }
 }
@@ -148,13 +162,24 @@ pub enum Next {
     Stopped,
 }
 
+/// Where a step runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Place {
+    /// In this directory.
+    In(PathBuf),
+    /// In the run's worktree, which is still to be made.
+    NewWorktree,
+}
+
 /// How a step's run ended.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Ended {
     pub failed: bool,
-    /// Claude's answer, or what went wrong.
+    /// Its agent's answer, or what went wrong.
     pub answer: String,
     pub cost_usd: f64,
+    /// The files its task kept as it closed.
+    pub artifacts: Vec<PathBuf>,
 }
 
 impl FlowRun {
@@ -195,7 +220,9 @@ impl FlowRun {
 
     pub fn state(&self) -> RunState {
         let any = |state: StepState| self.steps.iter().any(|step| step.state == state);
-        if any(StepState::Failed) {
+        if any(StepState::Cancelled) {
+            RunState::Cancelled
+        } else if any(StepState::Failed) {
             RunState::Failed
         } else if any(StepState::Interrupted) {
             RunState::Interrupted
@@ -255,6 +282,7 @@ impl FlowRun {
         run.runs += 1;
         run.cost_usd += ended.cost_usd;
         run.answer = Some(ended.answer.trim().to_string());
+        run.artifacts = ended.artifacts;
         if ended.failed {
             run.state = StepState::Failed;
             return Next::Stopped;
@@ -285,9 +313,21 @@ impl FlowRun {
     /// The user sends the flow back from the gate it waits at, with
     /// `notes`: the step its `back_to` names runs again, or this one when
     /// it names none, with `{feedback}` saying so. The steps from there on
-    /// are to come again, in a new round.
+    /// are to come again, in a new round, unless the gate has no rounds
+    /// left to send it back for.
     pub fn send_back(&mut self, notes: &str) -> Result<Next> {
         let from = self.at_gate()?;
+        let rounds = self.flow.steps[from].rounds();
+        if self.round >= rounds {
+            bail!(
+                "{} is in round {}, the last its {} gate sends it back for: approve it, or \
+                 `crystal flow cancel {}`",
+                self.name,
+                self.round,
+                self.step_name(from),
+                self.name
+            );
+        }
         let back_to = match &self.flow.steps[from].back_to {
             Some(name) => self.step_called(name).unwrap_or(from),
             None => from,
@@ -320,7 +360,7 @@ impl FlowRun {
         }
         let prompt = match self.steps[step].prompt.clone() {
             Some(prompt) => prompt,
-            None => self.prompt_for(step, false),
+            None => self.prompt_for(step, false)?,
         };
         self.steps[step].state = StepState::Running;
         Ok(Next::Run { step, prompt })
@@ -336,38 +376,59 @@ impl FlowRun {
         }
     }
 
-    /// Whether `step` runs in the run's worktree: it, or a step before it,
-    /// asks for one.
-    pub fn wants_worktree(&self, step: usize) -> bool {
-        self.flow.steps[..=step].iter().any(|step| step.worktree)
+    /// The user cancels the run: the step it's at is cancelled, and it
+    /// goes no further. Gives back that step, whose task the daemon
+    /// cancels.
+    pub fn cancel(&mut self) -> Result<usize> {
+        let state = self.state();
+        let step = match self.current() {
+            Some(step) if state != RunState::Cancelled => step,
+            _ => bail!("{} is {} already", self.name, state.word()),
+        };
+        self.steps[step].state = StepState::Cancelled;
+        Ok(step)
     }
 
-    /// The branch the run's worktree is on: the goal's words, or the run's
-    /// name when the goal has none that fit a branch.
-    pub fn branch(&self) -> String {
-        let branch = branch_from_goal(&self.goal);
-        if branch.is_empty() {
-            self.name.clone()
-        } else {
-            branch
+    /// Where `step` runs, as its flow places it: where the run started, in
+    /// the run's worktree, or where the step before it ran.
+    pub fn place(&self, step: usize) -> Place {
+        match (self.flow.placement(step), step.checked_sub(1)) {
+            (Placement::Fresh, _) => match &self.worktree {
+                Some(worktree) => Place::In(worktree.clone()),
+                None => Place::NewWorktree,
+            },
+            (Placement::Same, Some(before)) => match &self.steps[before].cwd {
+                Some(cwd) => Place::In(cwd.clone()),
+                // A run written down before steps said where they ran.
+                None => self.place(before),
+            },
+            (Placement::Root | Placement::Same, _) => Place::In(self.cwd.clone()),
         }
     }
 
-    /// The `claude -p` arguments and first prompt of the task for `step`,
-    /// which is asked `prompt`: its profile's options, and the profile's
-    /// own prompt ahead of the step's.
+    /// The goal as `{slug}` and the branch of the run's worktree: its
+    /// words, or the run's name when it has none that fit a branch.
+    pub fn slug(&self) -> String {
+        let slug = flows::slug(&self.goal);
+        if slug.is_empty() {
+            self.name.clone()
+        } else {
+            slug
+        }
+    }
+
+    /// Whether `step` runs in a terminal: its agent isn't Claude Code, the
+    /// one agent that runs in the background.
+    pub fn in_terminal(&self, step: usize) -> bool {
+        self.profile_of(step).agent != "claude"
+    }
+
+    /// The `claude -p` arguments and first prompt of the background task
+    /// for `step`, which is asked `prompt`: its profile's options, and the
+    /// profile's own prompt ahead of the step's.
     pub fn task_spec(&self, step: usize, prompt: &str) -> TaskSpec {
-        let wanted = self.flow.steps[step].profile.as_ref();
-        let profile = self
-            .profiles
-            .iter()
-            .find(|profile| Some(&profile.name) == wanted)
-            .cloned()
-            .unwrap_or_else(|| Profile::for_agent("claude"));
-        let prompt = match profile.prompt.as_deref().map(str::trim) {
-            Some(asks) if !asks.is_empty() => format!("{asks}\n\n{prompt}"),
-            _ => prompt.to_string(),
-        };
+        let profile = self.profile_of(step);
+        let prompt = asked(&profile, prompt);
         // The profile's command with no prompt is the agent and its options.
         let options = Profile {
             prompt: None,
@@ -380,28 +441,100 @@ impl FlowRun {
         }
     }
 
-    /// What `step` is asked: its prompt, with the goal, what the step
-    /// before it answered, and the feedback from the last send back filled
-    /// in. A step the flow was just sent back to hears the feedback even
-    /// when its prompt doesn't ask for it.
-    pub fn prompt_for(&self, step: usize, sent_back: bool) -> String {
-        let template = &self.flow.steps[step].prompt;
-        let previous = match step.checked_sub(1) {
-            Some(before) => self.steps[before].answer.as_deref().unwrap_or(""),
-            None => "",
-        };
-        let feedback = self.feedback.as_deref().unwrap_or("");
-        let values = [
-            ("goal", self.goal.as_str()),
-            ("previous", previous),
-            ("feedback", feedback),
-        ];
-        let mut prompt = flows::fill(template, &values);
-        if sent_back && !template.contains("{feedback}") {
-            prompt.push_str("\n\n");
-            prompt.push_str(feedback);
+    /// The command that starts `step`'s agent in a terminal, asked
+    /// `prompt`, with its profile's own prompt ahead of it; and the whole
+    /// of what it's asked.
+    pub fn command(&self, step: usize, prompt: &str) -> (Vec<String>, String) {
+        let profile = self.profile_of(step);
+        let asked = asked(&profile, prompt);
+        let command = Profile {
+            prompt: None,
+            ..profile
         }
-        prompt.trim().to_string()
+        .command(&asked);
+        (command, asked)
+    }
+
+    /// What `step` is asked: its prompt with these filled in:
+    ///
+    /// - `{goal}`, `{slug}` and `{round}`;
+    /// - `{previous}`, what the step before it answered, and
+    ///   `{<step>.summary}`, what any step before it answered;
+    /// - `{<step>.artifacts}`, the paths of the files a step before it
+    ///   kept, one after another;
+    /// - `{feedback}`, what the last send back said.
+    ///
+    /// A step the flow was just sent back to hears the feedback even when
+    /// its prompt doesn't ask for it. A prompt past [`MAX_PROMPT_BYTES`]
+    /// has what steps answered cut, the oldest first; one too long even so
+    /// is an error.
+    pub fn prompt_for(&self, step: usize, sent_back: bool) -> Result<String> {
+        let template = &self.flow.steps[step].prompt;
+        let answer = |index: usize| self.steps[index].answer.as_deref().unwrap_or("");
+        let slug = self.slug();
+        let round = self.round.to_string();
+        let feedback = self.feedback.as_deref().unwrap_or("");
+        let earlier = &self.flow.steps[..step];
+        let summaries: Vec<String> = earlier
+            .iter()
+            .map(|step| format!("{}.summary", step.name))
+            .collect();
+        let artifacts: Vec<String> = earlier
+            .iter()
+            .map(|step| format!("{}.artifacts", step.name))
+            .collect();
+        let paths: Vec<String> = self.steps[..step]
+            .iter()
+            .map(|run| {
+                let paths: Vec<String> = run
+                    .artifacts
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect();
+                paths.join(" ")
+            })
+            .collect();
+        let previous = match step.checked_sub(1) {
+            Some(before) => Value::answer(answer(before), before),
+            None => Value::kept(""),
+        };
+        let mut values = vec![
+            ("goal", Value::kept(&self.goal)),
+            ("slug", Value::kept(&slug)),
+            ("round", Value::kept(&round)),
+            ("previous", previous),
+            ("feedback", Value::answer(feedback, usize::MAX)),
+        ];
+        for index in 0..step {
+            values.push((&summaries[index], Value::answer(answer(index), index)));
+            values.push((&artifacts[index], Value::kept(&paths[index])));
+        }
+        let mut filled = flows::fill(template, &values);
+        if sent_back && !template.contains("{feedback}") {
+            filled.push("\n\n", None);
+            filled.push(feedback, Some(usize::MAX));
+        }
+        filled.within(MAX_PROMPT_BYTES).with_context(|| {
+            format!(
+                "the prompt of step {} is over {} KiB even with what the steps before it \
+                 answered cut short",
+                self.step_name(step),
+                MAX_PROMPT_BYTES / 1024
+            )
+        })
+    }
+
+    /// The profile `step` runs with: the one it names, or Claude Code as
+    /// it's set up.
+    fn profile_of(&self, step: usize) -> Profile {
+        let wanted = self.flow.steps[step].profile.as_ref();
+        let named = self
+            .profiles
+            .iter()
+            .find(|profile| Some(&profile.name) == wanted);
+        named
+            .cloned()
+            .unwrap_or_else(|| Profile::for_agent("claude"))
     }
 
     /// Goes on to the step after the current one, or finishes.
@@ -412,8 +545,15 @@ impl FlowRun {
         }
     }
 
+    /// Runs `step`, or, when its prompt can't be put together, fails it.
     fn run_step(&mut self, step: usize, sent_back: bool) -> Next {
-        let prompt = self.prompt_for(step, sent_back);
+        let prompt = match self.prompt_for(step, sent_back) {
+            Ok(prompt) => prompt,
+            Err(err) => {
+                self.could_not_start(step, format!("{err:#}"));
+                return Next::Stopped;
+            }
+        };
         let run = &mut self.steps[step];
         run.state = StepState::Running;
         run.prompt = Some(prompt.clone());
@@ -430,6 +570,15 @@ impl FlowRun {
                 self.state().word()
             ),
         }
+    }
+}
+
+/// What an agent started with `profile` is asked to do `prompt`: the
+/// profile's own prompt ahead of it.
+fn asked(profile: &Profile, prompt: &str) -> String {
+    match profile.prompt.as_deref().map(str::trim) {
+        Some(asks) if !asks.is_empty() => format!("{asks}\n\n{prompt}"),
+        _ => prompt.to_string(),
     }
 }
 
@@ -464,7 +613,12 @@ pub fn new_name(flow: &str, runs: &[FlowRun]) -> String {
 /// Lets go of the oldest finished runs, past the last [`FINISHED_KEPT`].
 /// Runs still going, waiting or stopped part way stay, whatever their age.
 pub fn forget_old(runs: &mut Vec<FlowRun>) {
-    let finished = |run: &FlowRun| matches!(run.state(), RunState::Done | RunState::Failed);
+    let finished = |run: &FlowRun| {
+        matches!(
+            run.state(),
+            RunState::Done | RunState::Failed | RunState::Cancelled
+        )
+    };
     let mut extra = runs
         .iter()
         .filter(|run| finished(run))
@@ -480,28 +634,6 @@ pub fn forget_old(runs: &mut Vec<FlowRun>) {
     });
 }
 
-/// A branch named after a goal: its words in lower case, joined by `-`,
-/// as many as fit in [`BRANCH_LENGTH`].
-fn branch_from_goal(goal: &str) -> String {
-    let mut branch = String::new();
-    let words = goal
-        .split(|c: char| !c.is_ascii_alphanumeric())
-        .filter(|word| !word.is_empty())
-        .map(str::to_ascii_lowercase);
-    for word in words {
-        let joined = if branch.is_empty() {
-            word
-        } else {
-            format!("{branch}-{word}")
-        };
-        if joined.len() > BRANCH_LENGTH {
-            break;
-        }
-        branch = joined;
-    }
-    branch
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -512,9 +644,11 @@ mod tests {
             name: name.into(),
             profile: None,
             prompt: prompt.into(),
+            placement: None,
             worktree: false,
             gate: false,
             back_to: None,
+            max_rounds: None,
         }
     }
 
@@ -552,6 +686,7 @@ mod tests {
             failed: false,
             answer: answer.into(),
             cost_usd: 0.25,
+            artifacts: Vec::new(),
         }
     }
 
@@ -695,6 +830,7 @@ mod tests {
             failed: true,
             answer: "Invalid API key".into(),
             cost_usd: 0.0,
+            artifacts: Vec::new(),
         };
         assert_eq!(run.step_ended(0, failed), Next::Stopped);
         assert_eq!(run.state(), RunState::Failed);
@@ -742,23 +878,142 @@ mod tests {
 
     #[test]
     fn the_worktree_is_for_the_step_that_wants_it_and_every_one_after() {
-        let run = ship();
-        let wants: Vec<bool> = (0..4).map(|step| run.wants_worktree(step)).collect();
-        assert_eq!(wants, [false, true, true, true]);
-        assert_eq!(run.branch(), "add-retries");
+        let mut run = ship();
+        assert_eq!(run.place(0), Place::In("/code/app".into()));
+        assert_eq!(run.place(1), Place::NewWorktree);
+        assert_eq!(run.slug(), "add-retries");
+        run.start();
+        run.steps[0].cwd = Some("/code/app".into());
+        run.step_ended(0, done("the plan"));
+        run.worktree = Some("/code/app.worktrees/add-retries".into());
+        run.steps[1].cwd = run.worktree.clone();
+        let tree = Place::In("/code/app.worktrees/add-retries".into());
+        assert_eq!(run.place(1), tree);
+        assert_eq!(run.place(2), tree);
+        assert_eq!(run.place(3), tree);
+        // A step placed at the root goes back there.
+        run.flow.steps[3].placement = Some(Placement::Root);
+        assert_eq!(run.place(3), Place::In("/code/app".into()));
     }
 
     #[test]
-    fn branches_from_goals_are_short_and_plain() {
+    fn a_step_placed_same_runs_where_the_one_before_it_ran() {
+        let mut run = ship();
+        run.flow.steps[1].worktree = false;
+        run.flow.steps[1].placement = Some(Placement::Same);
+        run.steps[0].cwd = Some("/code/app/sub".into());
+        assert_eq!(run.place(1), Place::In("/code/app/sub".into()));
+        // A run from before steps said where they ran goes by the flow.
+        run.steps[0].cwd = None;
+        assert_eq!(run.place(1), Place::In("/code/app".into()));
+    }
+
+    #[test]
+    fn a_prompt_has_any_earlier_steps_answer_and_files_the_slug_and_the_round() {
+        let mut run = ship();
+        run.flow.steps[2].prompt =
+            "Review {slug} in round {round}: {plan.summary}, kept {plan.artifacts}".into();
+        run.start();
+        let mut planned = done("the plan");
+        planned.artifacts = vec!["/state/t1/plan.md".into(), "/state/t1/notes.md".into()];
+        run.step_ended(0, planned);
+        let next = run.step_ended(1, done("built it"));
         assert_eq!(
-            branch_from_goal("Fix issue #42: login redirect"),
-            "fix-issue-42-login-redirect"
+            next,
+            Next::Run {
+                step: 2,
+                prompt: "Review add-retries in round 1: the plan, kept /state/t1/plan.md \
+                         /state/t1/notes.md"
+                    .into()
+            }
         );
+    }
+
+    #[test]
+    fn a_prompt_too_long_cuts_the_oldest_answer_and_one_too_long_anyway_fails() {
+        let mut run = ship();
+        run.start();
+        let long = "p".repeat(MAX_PROMPT_BYTES);
+        let Next::Run { prompt, .. } = run.step_ended(0, done(&long)) else {
+            panic!("the build didn't run");
+        };
+        assert!(prompt.len() <= MAX_PROMPT_BYTES, "{}", prompt.len());
+        assert!(prompt.starts_with("Do add retries like so:\npppp"));
+        assert!(
+            prompt.ends_with(flows::CUT),
+            "{}",
+            &prompt[prompt.len() - 20..]
+        );
+
+        let mut run = ship();
+        run.flow.steps[0].prompt = format!("Plan {}", "x".repeat(MAX_PROMPT_BYTES));
+        assert_eq!(run.start(), Next::Stopped);
+        assert_eq!(run.state(), RunState::Failed);
+        let why = run.steps[0].answer.as_deref().unwrap();
+        assert!(why.contains("prompt of step plan is over 16 KiB"), "{why}");
+    }
+
+    #[test]
+    fn a_gate_sends_the_flow_back_only_for_the_rounds_it_allows() {
+        let mut run = ship();
+        run.flow.steps[2].max_rounds = Some(2);
+        run.start();
+        run.step_ended(0, done("the plan"));
+        run.step_ended(1, done("built it"));
+        run.step_ended(2, done("the timeout is wrong"));
+        run.send_back("fix it").unwrap();
+        run.step_ended(1, done("fixed it"));
+        run.step_ended(2, done("still wrong"));
+        let err = run.send_back("again").unwrap_err().to_string();
+        assert!(
+            err.contains("ship-1 is in round 2, the last its review gate sends it back for"),
+            "{err}"
+        );
+        assert_eq!(run.state(), RunState::AtGate);
+        run.approve().unwrap();
+    }
+
+    #[test]
+    fn a_cancelled_run_stops_at_its_step_and_goes_no_further() {
+        let mut run = ship();
+        run.start();
+        run.step_ended(0, done("the plan"));
+        assert_eq!(run.cancel().unwrap(), 1);
+        assert_eq!(states(&run), [Done, Cancelled, Pending, Pending]);
+        assert_eq!(run.state(), RunState::Cancelled);
+        assert_eq!(run.running(), None);
+        assert!(run.retry().is_err());
+        assert!(run.approve().is_err());
+        let again = run.cancel().unwrap_err().to_string();
+        assert_eq!(again, "ship-1 is cancelled already");
+
+        let mut finished = ship();
+        for step in &mut finished.steps {
+            step.state = Done;
+        }
         assert_eq!(
-            branch_from_goal("make the export of the whole ledger stream instead of buffering"),
-            "make-the-export-of-the-whole-ledger"
+            finished.cancel().unwrap_err().to_string(),
+            "ship-1 is done already"
         );
-        assert_eq!(branch_from_goal("  "), "");
+    }
+
+    #[test]
+    fn a_step_on_another_agent_runs_in_a_terminal_asked_its_prompt() {
+        let mut run = ship();
+        run.flow.steps[1].profile = Some("coder".into());
+        run.profiles = vec![Profile {
+            name: "coder".into(),
+            model: Some("gpt-5".into()),
+            prompt: Some("Be careful.".into()),
+            ..Profile::for_agent("codex")
+        }];
+        assert!(!run.in_terminal(0));
+        assert!(run.in_terminal(1));
+        let (command, asked) = run.command(1, "Do add retries");
+        assert_eq!(asked, "Be careful.\n\nDo add retries");
+        assert_eq!(command.first().map(String::as_str), Some("codex"));
+        assert_eq!(command.last(), Some(&asked));
+        assert!(command.contains(&"gpt-5".to_string()), "{command:?}");
     }
 
     #[test]
@@ -816,7 +1071,7 @@ mod tests {
         let kept: Vec<&str> = run.profiles.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(kept, ["planner"]);
         // A goal with no words for a branch has the run's name for one.
-        assert_eq!(run.branch(), "ship-1");
+        assert_eq!(run.slug(), "ship-1");
     }
 
     #[test]

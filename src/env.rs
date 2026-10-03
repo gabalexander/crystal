@@ -2,6 +2,7 @@
 //! `crystal new` that asked for it, not the daemon's, which is only a copy of
 //! whatever shell happened to start the daemon.
 
+use crate::socket;
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -51,8 +52,10 @@ pub fn current() -> BTreeMap<String, String> {
 
 /// The client's environment, minus what only made sense where the client
 /// runs, plus what tells the program which terminal and session it's in:
-/// the session's name as it is when the program starts, and its id, which
-/// stays the same when the session is renamed.
+/// the session's name as it is when the program starts, its id, which
+/// stays the same when the session is renamed, and its daemon's socket,
+/// with its server's name when it's a server's: crystal run in the session
+/// reaches its own daemon, whichever the client named.
 pub fn for_session(
     client: &BTreeMap<String, String>,
     name: &str,
@@ -69,6 +72,10 @@ pub fn for_session(
     env.insert("CRYSTAL_SESSION".into(), name.into());
     env.insert("CRYSTAL_SESSION_ID".into(), id.into());
     env.insert("CRYSTAL_SOCKET".into(), socket.display().to_string());
+    match socket::server_of(socket) {
+        Some(server) => env.insert("CRYSTAL_SERVER".into(), server),
+        None => env.remove("CRYSTAL_SERVER"),
+    };
     env
 }
 
@@ -153,5 +160,15 @@ mod tests {
         assert_eq!(env["CRYSTAL_SESSION"], "agent");
         assert_eq!(env["CRYSTAL_SESSION_ID"], "1a2b");
         assert_eq!(env["CRYSTAL_SOCKET"], "/tmp/s.sock");
+    }
+
+    #[test]
+    fn the_program_learns_its_server_and_not_the_clients() {
+        let work = socket::of_server("work").unwrap();
+        let clients = client(&[("CRYSTAL_SERVER", "other")]);
+        let env = for_session(&clients, "agent", "1a2b", &work);
+        assert_eq!(env["CRYSTAL_SERVER"], "work");
+        let env = for_session(&clients, "agent", "1a2b", Path::new("/tmp/s.sock"));
+        assert!(!env.contains_key("CRYSTAL_SERVER"));
     }
 }

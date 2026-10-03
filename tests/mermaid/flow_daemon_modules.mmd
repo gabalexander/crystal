@@ -1,0 +1,10 @@
+flowchart TD
+    tui[TUI] -->|ClientRequest| ipc
+    subgraph daemon [docket daemon]
+        ipc[IPC server] --> state[State]
+        state --> pty[PTY manager]
+        state --> db[(SQLite)]
+        hooks[Hook receiver] --> state
+    end
+    cli[claude CLI] -->|POST /hook| hooks
+    pty --> cli

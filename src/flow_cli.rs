@@ -1,5 +1,6 @@
 //! `crystal flow` and its commands: start a flow run, see how runs stand,
-//! and answer one waiting at a gate.
+//! answer one waiting at a gate or cancel one, and list the flows there are
+//! to run.
 
 use crate::client;
 use crate::config::Config;
@@ -123,9 +124,44 @@ pub fn retry(socket: &Path, name: &str) -> Result<()> {
     change(socket, Request::RetryFlow { run: name.into() })
 }
 
+/// Cancels the run called `name`.
+pub fn cancel(socket: &Path, name: &str) -> Result<()> {
+    change(socket, Request::CancelFlow { run: name.into() })
+}
+
+/// Lists the flows a run started in `dir` would find: each one's name, its
+/// steps or why it can't run, and the file it's written in.
+pub fn defs(dir: &Path) -> Result<()> {
+    ensure_on()?;
+    let (found, problem) = flows::definitions(&Config::load()?, dir);
+    if let Some(problem) = problem {
+        eprintln!("crystal: couldn't read the project's flows: {problem}");
+    }
+    if found.is_empty() {
+        println!("no flows yet: `crystal flow example` prints one to copy into your config file");
+        return Ok(());
+    }
+    let rows: Vec<[String; 3]> = found
+        .iter()
+        .map(|found| {
+            let steps = match &found.problem {
+                Some(why) => format!("can't run: {why}"),
+                None => found.flow.chain(),
+            };
+            [
+                found.flow.name.clone(),
+                steps,
+                shell::home_relative(&found.file),
+            ]
+        })
+        .collect();
+    crate::print_table(["FLOW", "STEPS", "FROM"], &rows);
+    Ok(())
+}
+
 /// Waits until the run called `name` stops running: it waits at a gate, is
-/// done, or stopped at a step that failed or was cut short. Prints which;
-/// a step that failed or was cut short is an error, for scripts to see.
+/// done, or stopped at a step that failed, was cut short or was cancelled.
+/// Prints which; any but the first two is an error, for scripts to see.
 /// Gives up after `timeout`, if there is one.
 pub fn wait(socket: &Path, name: &str, timeout: Option<Duration>) -> Result<()> {
     let deadline = timeout.map(|timeout| Instant::now() + timeout);
@@ -137,7 +173,9 @@ pub fn wait(socket: &Path, name: &str, timeout: Option<Duration>) -> Result<()> 
                 println!("{}", describe(&run));
                 return Ok(());
             }
-            RunState::Failed | RunState::Interrupted => bail!("{}", describe(&run)),
+            RunState::Failed | RunState::Interrupted | RunState::Cancelled => {
+                bail!("{}", describe(&run))
+            }
         }
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             let seconds = timeout.unwrap_or_default().as_secs_f64();
@@ -147,17 +185,19 @@ pub fn wait(socket: &Path, name: &str, timeout: Option<Duration>) -> Result<()> 
     }
 }
 
-/// Says there are no runs yet, and which flows there are to run: their
-/// names and steps, or how to write one.
+/// Says there are no runs yet, and which flows a run started in the
+/// current directory would find: their names and steps, or how to write one.
 fn print_flows() {
     let config = Config::load().unwrap_or_default();
-    if config.flows.is_empty() {
+    let here = std::env::current_dir().unwrap_or_default();
+    let (found, _) = flows::definitions(&config, &here);
+    if found.is_empty() {
         println!("no flows yet: `crystal flow example` prints one to copy into your config file");
         return;
     }
     println!("no flow runs yet; `crystal flow run <flow> \"<goal>\"` starts one of these:");
-    for flow in &config.flows {
-        println!("  {}  {}", flow.name, flow.chain());
+    for found in &found {
+        println!("  {}  {}", found.flow.name, found.flow.chain());
     }
 }
 
@@ -174,6 +214,7 @@ fn describe(run: &FlowRun) -> String {
         RunState::AtGate => format!("waiting at {step}"),
         RunState::Done => "done".to_string(),
         RunState::Interrupted => format!("interrupted at {step}"),
+        RunState::Cancelled => format!("cancelled at {step}"),
         RunState::Failed => {
             let why = run
                 .current()

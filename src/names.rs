@@ -1,6 +1,8 @@
-//! Made-up names for new worktrees' branches, like `brave-otter`: short,
-//! easy to say and to tell apart, and nothing to do with the task, which
-//! can change while the branch can't.
+//! Names: made-up ones for new worktrees' branches, like `brave-otter`:
+//! short, easy to say and to tell apart, and nothing to do with the task,
+//! which can change while the branch can't; and a session's, from the
+//! first thing it's asked, like `fix-login-redirect`, which a session can
+//! change.
 
 use std::hash::{BuildHasher, RandomState};
 use std::time::SystemTime;
@@ -24,6 +26,53 @@ const ANIMALS: [&str; 64] = [
     "stork", "swan", "tapir", "tiger", "toucan", "turtle", "walrus", "weasel", "whale", "wombat",
     "wren", "yak", "zebra", "alpaca", "bobcat", "osprey",
 ];
+
+/// The most words a name from a prompt takes.
+const PROMPT_WORDS: usize = 3;
+
+/// The longest a name from a prompt gets, in characters.
+const PROMPT_LONGEST: usize = 30;
+
+/// Words that say little of what a prompt asks: asking nicely, who's to do
+/// it, and the small words between the ones that matter.
+const FILLER: &[&str] = &[
+    "a", "about", "after", "all", "also", "am", "an", "and", "any", "are", "as", "at", "be",
+    "before", "but", "by", "can", "could", "do", "does", "for", "from", "go", "have", "hello",
+    "help", "hey", "hi", "how", "i", "if", "in", "into", "is", "it", "its", "just", "let", "lets",
+    "look", "me", "my", "need", "now", "of", "ok", "okay", "on", "or", "our", "please", "should",
+    "so", "some", "that", "the", "their", "them", "then", "there", "these", "this", "those", "to",
+    "up", "us", "want", "was", "we", "what", "when", "where", "which", "why", "will", "with",
+    "would", "you", "your",
+];
+
+/// A session's name from `prompt`, the first thing it was asked: its first
+/// few words that say what it's about, in lower case, joined by dashes.
+/// `None` for a prompt with no such words, or a slash command, which asks
+/// the agent itself for something.
+pub fn from_prompt(prompt: &str) -> Option<String> {
+    let prompt = prompt.trim_start();
+    if prompt.starts_with('/') {
+        return None;
+    }
+    let mut name = String::new();
+    // An apostrophe joins a word rather than ending it: `don't`, `user's`.
+    let words = prompt
+        .split(|c: char| !c.is_alphanumeric() && c != '\'' && c != '’')
+        .map(|word| word.replace(['\'', '’'], "").to_lowercase())
+        .filter(|word| !word.is_empty() && !FILLER.contains(&word.as_str()));
+    for word in words.take(PROMPT_WORDS) {
+        let longer = name.chars().count() + word.chars().count() + 1;
+        if !name.is_empty() && longer > PROMPT_LONGEST {
+            break;
+        }
+        if !name.is_empty() {
+            name.push('-');
+        }
+        name.push_str(&word);
+    }
+    let name: String = name.chars().take(PROMPT_LONGEST).collect();
+    (!name.is_empty()).then_some(name)
+}
 
 /// A new made-up name, picked at random.
 pub fn random() -> String {
@@ -64,6 +113,38 @@ mod tests {
         assert_eq!(name(0), "amber-badger");
         assert_eq!(name(1), "bold-badger");
         assert_eq!(name(64), "amber-beaver");
+    }
+
+    #[test]
+    fn a_prompt_names_a_session_by_its_first_words_that_matter() {
+        assert_eq!(
+            from_prompt("Fix the login redirect after OAuth").as_deref(),
+            Some("fix-login-redirect")
+        );
+        assert_eq!(
+            from_prompt("Can you please review the diff on this branch for bugs?").as_deref(),
+            Some("review-diff-branch")
+        );
+        assert_eq!(
+            from_prompt("  don't retry #412\nmore").as_deref(),
+            Some("dont-retry-412")
+        );
+        assert_eq!(from_prompt("Résumé café").as_deref(), Some("résumé-café"));
+    }
+
+    #[test]
+    fn a_name_from_a_prompt_is_kept_short() {
+        let name = from_prompt("internationalization localization accessibility").unwrap();
+        assert_eq!(name, "internationalization");
+        let one_long_word = "x".repeat(50);
+        assert_eq!(from_prompt(&one_long_word).unwrap().len(), PROMPT_LONGEST);
+    }
+
+    #[test]
+    fn a_prompt_with_nothing_to_go_on_names_nothing() {
+        assert_eq!(from_prompt(""), None);
+        assert_eq!(from_prompt("can you?"), None);
+        assert_eq!(from_prompt("/compact keep the tests"), None);
     }
 
     #[test]

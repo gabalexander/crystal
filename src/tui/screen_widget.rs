@@ -1,8 +1,9 @@
 //! Draws a session's screen into a ratatui area: each cell of the screen
 //! becomes a ratatui cell with the same character, colors and attributes,
-//! with what copy mode marks on it laid over them.
+//! with what copy mode marks on it laid over them, and the link under the
+//! mouse underlined.
 
-use crate::vt::{self, CellColor, CellStyle, Mark};
+use crate::vt::{self, CellColor, CellStyle, Link, Mark};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -15,6 +16,8 @@ pub struct ScreenWidget<'a> {
     default_fg: Color,
     default_bg: Color,
     marks: Marks,
+    /// The link the mouse is over, with Ctrl held.
+    link: Option<Link>,
 }
 
 /// How each of copy mode's marks looks, laid over the cell's own style.
@@ -45,6 +48,7 @@ impl<'a> ScreenWidget<'a> {
             default_fg: Color::Reset,
             default_bg: Color::Reset,
             marks: Marks::default(),
+            link: None,
         }
     }
 
@@ -61,6 +65,11 @@ impl<'a> ScreenWidget<'a> {
     /// Draws copy mode's marks as `marks` has them.
     pub fn with_marks(self, marks: Marks) -> ScreenWidget<'a> {
         ScreenWidget { marks, ..self }
+    }
+
+    /// Underlines `link`, to say a Ctrl+click opens it.
+    pub fn with_link(self, link: Option<Link>) -> ScreenWidget<'a> {
+        ScreenWidget { link, ..self }
     }
 
     /// What `mark` lays over a cell's style.
@@ -112,7 +121,15 @@ impl Widget for ScreenWidget<'_> {
                 return;
             };
             target.set_symbol(cell.text);
-            target.set_style(self.style(&cell.style).patch(self.mark(cell.mark)));
+            let mut style = self.style(&cell.style).patch(self.mark(cell.mark));
+            if self
+                .link
+                .as_ref()
+                .is_some_and(|link| link.covers((row, col)))
+            {
+                style = style.add_modifier(Modifier::UNDERLINED);
+            }
+            target.set_style(style);
         });
     }
 }
@@ -231,6 +248,20 @@ mod tests {
             .with_marks(marks)
             .render(area, &mut buf);
         assert_eq!(buf[(0, 0)].bg, Color::Rgb(1, 2, 3));
+    }
+
+    #[test]
+    fn the_link_under_the_mouse_is_underlined() {
+        let parser = screen(1, 30, b"at https://example.com now");
+        let area = Rect::new(0, 0, 30, 1);
+        let mut buf = Buffer::empty(area);
+        ScreenWidget::new(&parser)
+            .with_link(parser.link_at((0, 8)))
+            .render(area, &mut buf);
+        let underlined = |col: u16| buf[(col, 0)].modifier.contains(Modifier::UNDERLINED);
+        assert!(!underlined(2));
+        assert!(underlined(3) && underlined(21));
+        assert!(!underlined(22));
     }
 
     #[test]

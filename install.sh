@@ -120,7 +120,7 @@ main() {
     esac
 
     # A daemon left running goes on running the crystal it was started from
-    # until it's restarted on this one. Its running sessions come back.
+    # until it's handed over to this one. Its running sessions carry on.
     "$install_dir/crystal" restart-server ||
         say "couldn't restart the daemon: run crystal kill-server, then crystal"
 

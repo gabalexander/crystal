@@ -1,7 +1,9 @@
 //! The database the daemon and the TUI keep their state in: one SQLite file
 //! in the state directory holding the sessions to start again after a
-//! restart, the flow runs, each project's backlog and closed tasks, and the
-//! TUI's tabs, layouts and what the new-session panel remembers. The
+//! restart, the flow runs, each project's backlog and closed tasks, the
+//! tasks waiting to start and the number the next task gets, what
+//! background tasks have spent each day, the event log, and the TUI's tabs,
+//! layouts and what the new-session panel remembers. The
 //! settings stay in the config file, which people edit by hand, and memory
 //! in a database of its own.
 //!
@@ -16,12 +18,13 @@
 //! anyone want it; one that can't be read is renamed `.broken` instead.
 
 use crate::backlog;
+use crate::events::{Event, Since};
 use crate::flow_run::FlowRun;
-use crate::protocol::{BacklogItem, TaskOutcome, TaskRecord};
+use crate::protocol::{Artifact, ArtifactKind, BacklogItem, PendingTask, TaskOutcome, TaskRecord};
 use crate::state::{self, SavedSession};
 use crate::tasks;
 use anyhow::{Context, Result};
-use rusqlite::{Connection, Row, Transaction, TransactionBehavior, params};
+use rusqlite::{Connection, OpenFlags, Row, Transaction, TransactionBehavior, params};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::fs;
@@ -35,6 +38,12 @@ pub const TABS: &str = "tabs";
 pub const LAUNCHER: &str = "launcher";
 /// The layouts saved with `S`.
 pub const LAYOUTS: &str = "layouts";
+/// What the diff view keeps: the files marked reviewed, and whether it
+/// lists them as a tree.
+pub const DIFF: &str = "diff";
+/// The latest event the user had seen when the TUI last knew they were
+/// looking: where "while you were away" counts from.
+pub const SEEN: &str = "seen";
 
 /// How long a write waits for another to finish: the daemon and every TUI
 /// share the one database.
@@ -104,20 +113,89 @@ CREATE TABLE ui (
 );
 ";
 
+/// What tasks added: a closed task's number (`t12`), when it was made and
+/// whether it was cancelled; the number the last task got, which is never
+/// given again; the tasks waiting to start, each under its number, with how
+/// it starts as JSON; and what background tasks spent, by the day on this
+/// machine's clock.
+const TASK_STATES: &str = "
+ALTER TABLE tasks ADD COLUMN number INTEGER;
+ALTER TABLE tasks ADD COLUMN created INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE tasks ADD COLUMN cancelled INTEGER NOT NULL DEFAULT 0;
+CREATE TABLE task_numbers (
+  last INTEGER NOT NULL
+);
+INSERT INTO task_numbers (last) VALUES (0);
+CREATE TABLE pending_tasks (
+  number  INTEGER PRIMARY KEY,
+  goal    TEXT NOT NULL,
+  cwd     TEXT NOT NULL,
+  name    TEXT,
+  start   TEXT NOT NULL,
+  backlog INTEGER,
+  created INTEGER NOT NULL
+);
+CREATE TABLE spending (
+  day TEXT PRIMARY KEY,
+  usd REAL NOT NULL
+);
+";
+
+/// The event log (see [`crate::event_log`]): each event under its `seq`,
+/// which AUTOINCREMENT never gives again, not even once the events before
+/// it are pruned; when it happened, what it was, the session (by id) and
+/// project it's about, and the whole of it as JSON.
+const EVENTS: &str = "
+CREATE TABLE events (
+  seq     INTEGER PRIMARY KEY AUTOINCREMENT,
+  at      INTEGER NOT NULL,
+  kind    TEXT NOT NULL,
+  session TEXT,
+  project TEXT,
+  json    TEXT NOT NULL
+);
+CREATE INDEX events_at ON events(at);
+";
+
+/// The files kept with tasks as they closed: each under its task's number
+/// and the name of its copy, which is unique in the task's directory; what
+/// it is (`file` or `handoff`), where the copy is, how big, and when it was
+/// kept. A task that closes again, a background task given a follow-up,
+/// keeps its handoff file again in the same row.
+const ARTIFACTS: &str = "
+CREATE TABLE task_artifacts (
+  task  INTEGER NOT NULL,
+  name  TEXT NOT NULL,
+  kind  TEXT NOT NULL,
+  path  TEXT NOT NULL,
+  bytes INTEGER NOT NULL,
+  kept  INTEGER NOT NULL,
+  PRIMARY KEY (task, name)
+);
+";
+
+/// The command an agent that says what it's doing itself said picks a
+/// session up again after a restart, as JSON.
+const RESUME: &str = "
+ALTER TABLE sessions ADD COLUMN resume TEXT;
+";
+
 /// What makes the database as it is now, a step for each version: a
 /// database at version `v`, kept in its `user_version`, takes the steps
 /// after the first `v`.
-const MIGRATIONS: &[&str] = &[TABLES];
+const MIGRATIONS: &[&str] = &[TABLES, TASK_STATES, EVENTS, ARTIFACTS, RESUME];
 
 /// The file each project kept its backlog in before the database.
 const OLD_BACKLOG: &str = "backlog.json";
 
-const SESSION_COLUMNS: &str = "name, command, cwd, conversation, task, goal";
+const SESSION_COLUMNS: &str = "name, command, cwd, conversation, task, goal, resume";
 const RUN_COLUMNS: &str =
     "name, flow, profiles, goal, cwd, worktree, round, feedback, steps, started";
-const TASK_COLUMNS: &str =
-    "project_name, goal, session, branch, background, backlog, failed, summary, closed";
+const TASK_COLUMNS: &str = "project_name, goal, session, branch, background, backlog, failed, \
+                            summary, closed, number, created, cancelled";
+const PENDING_COLUMNS: &str = "number, goal, cwd, name, start, backlog, created";
 const ITEM_COLUMNS: &str = "number, text, tags, done, created, closed";
+const ARTIFACT_COLUMNS: &str = "kind, name, path, bytes";
 
 /// The database of the daemon at `socket`, open.
 pub struct Db {
@@ -240,6 +318,201 @@ impl Db {
             }
         }
         Ok(found)
+    }
+
+    /// The number for a new task, which is never given again.
+    pub fn new_task_number(&mut self) -> Result<u64> {
+        let tx = self.write()?;
+        let number = next_task_number(&tx)?;
+        tx.commit()?;
+        Ok(number)
+    }
+
+    /// Keeps `task` until it's started, under a new number, which it gives
+    /// back.
+    pub fn add_pending_task(&mut self, task: &PendingTask) -> Result<u64> {
+        let tx = self.write()?;
+        let number = next_task_number(&tx)?;
+        tx.execute(
+            &format!(
+                "INSERT INTO pending_tasks ({PENDING_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
+            ),
+            params![
+                number,
+                task.goal,
+                task.cwd.to_string_lossy(),
+                task.name,
+                json(&task.start)?,
+                task.backlog,
+                task.created,
+            ],
+        )?;
+        tx.commit()?;
+        Ok(number)
+    }
+
+    /// The tasks waiting to start, the oldest first.
+    pub fn pending_tasks(&self) -> Result<Vec<PendingTask>> {
+        let mut statement = self.conn.prepare(&format!(
+            "SELECT {PENDING_COLUMNS} FROM pending_tasks ORDER BY number"
+        ))?;
+        let rows = statement.query_map([], |row| Ok(pending_of(row)))?;
+        readable(rows, "a task waiting to start")
+    }
+
+    /// The task numbered `number`, if it's waiting to start.
+    pub fn pending_task(&self, number: u64) -> Result<Option<PendingTask>> {
+        let tasks = self.pending_tasks()?;
+        Ok(tasks.into_iter().find(|task| task.id == number))
+    }
+
+    /// Forgets the task numbered `number`, which was waiting to start: it
+    /// has, or it was cancelled. Says whether it was there.
+    pub fn remove_pending_task(&self, number: u64) -> Result<bool> {
+        let removed = self.conn.execute(
+            "DELETE FROM pending_tasks WHERE number = ?1",
+            params![number],
+        )?;
+        Ok(removed > 0)
+    }
+
+    /// Keeps `artifact` with the task numbered `task`, at `kept`, in place
+    /// of one of the same name.
+    pub fn add_artifact(&self, task: u64, artifact: &Artifact, kept: u64) -> Result<()> {
+        self.conn.execute(
+            &format!(
+                "INSERT OR REPLACE INTO task_artifacts (task, {ARTIFACT_COLUMNS}, kept) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
+            ),
+            params![
+                task,
+                artifact.kind.word(),
+                artifact.name,
+                artifact.path.to_string_lossy(),
+                artifact.bytes,
+                kept,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// The files kept with the task numbered `task`, in the order they
+    /// were kept.
+    pub fn artifacts(&self, task: u64) -> Result<Vec<Artifact>> {
+        let mut statement = self.conn.prepare(&format!(
+            "SELECT {ARTIFACT_COLUMNS} FROM task_artifacts WHERE task = ?1 ORDER BY kept, rowid"
+        ))?;
+        let rows = statement.query_map(params![task], |row| Ok(artifact_of(row)))?;
+        readable(rows, "a kept file")
+    }
+
+    /// What background tasks spent on `day`, like `2026-10-03`.
+    pub fn spent_on(&self, day: &str) -> Result<f64> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT usd FROM spending WHERE day = ?1")?;
+        let mut rows = statement.query(params![day])?;
+        Ok(match rows.next()? {
+            Some(row) => row.get(0)?,
+            None => 0.0,
+        })
+    }
+
+    /// Adds `usd` to what background tasks spent on `day`.
+    pub fn add_spending(&self, day: &str, usd: f64) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO spending (day, usd) VALUES (?1, ?2) \
+             ON CONFLICT (day) DO UPDATE SET usd = usd + excluded.usd",
+            params![day, usd],
+        )?;
+        Ok(())
+    }
+
+    /// Writes `event` down, under the `seq` it has been given.
+    pub fn add_event(&self, event: &Event) -> Result<()> {
+        let session = event.session.as_ref().map(|session| &session.id);
+        let project = event
+            .project
+            .as_ref()
+            .map(|project| project.to_string_lossy());
+        self.conn.execute(
+            "INSERT INTO events (seq, at, kind, session, project, json) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                event.seq,
+                event.at,
+                event.kind.name(),
+                session,
+                project,
+                json(event)?
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// The `seq` of the latest event ever written down, pruned since or
+    /// not: 0 before the first.
+    pub fn latest_event(&self) -> Result<u64> {
+        // AUTOINCREMENT keeps the highest it has seen in sqlite_sequence.
+        Ok(self.conn.query_row(
+            "SELECT COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'events'), 0)",
+            [],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// The events from `since` on, the oldest first. One that can't be
+    /// read, written by a newer crystal say, is left out.
+    pub fn events(&self, since: Since) -> Result<Vec<Event>> {
+        let (from, value) = match since {
+            Since::Seq(seq) => ("seq >", seq),
+            Since::At(at) => ("at >=", at),
+        };
+        let mut statement = self.conn.prepare(&format!(
+            "SELECT json FROM events WHERE {from} ?1 ORDER BY seq"
+        ))?;
+        let rows = statement.query_map(params![value], |row| {
+            Ok(from_json::<Event>(&row.get::<_, String>(0)?))
+        })?;
+        readable(rows, "an event")
+    }
+
+    /// The newest `count` events from before the one numbered `before`, or
+    /// from the end of the log without it, the newest first: a page of the
+    /// TUI's timeline.
+    pub fn events_before(&self, before: Option<u64>, count: usize) -> Result<Vec<Event>> {
+        let mut statement = self.conn.prepare(
+            "SELECT json FROM events WHERE ?1 IS NULL OR seq < ?1 ORDER BY seq DESC LIMIT ?2",
+        )?;
+        let rows = statement.query_map(params![before, count], |row| {
+            Ok(from_json::<Event>(&row.get::<_, String>(0)?))
+        })?;
+        readable(rows, "an event")
+    }
+
+    /// Takes the events from before `at`, in milliseconds since the Unix
+    /// epoch, out of the log.
+    pub fn delete_events_before(&self, at: u64) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM events WHERE at < ?1", params![at])?;
+        Ok(())
+    }
+
+    /// How many events the log holds.
+    pub fn event_count(&self) -> Result<u64> {
+        Ok(self
+            .conn
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))?)
+    }
+
+    /// Takes every event out of the log but the newest `count`.
+    pub fn keep_newest_events(&self, count: u64) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM events WHERE seq <= \
+             (SELECT seq FROM events ORDER BY seq DESC LIMIT 1 OFFSET ?1)",
+            params![count],
+        )?;
+        Ok(())
     }
 
     /// The TUI's document called `name`, when it has kept one.
@@ -377,6 +650,21 @@ impl Db {
     }
 }
 
+/// How many sessions the daemon at `socket` has written down to start
+/// again, for a server that isn't running: read only, since it's only
+/// being looked at, so a database is neither made, brought up to date nor
+/// given what was kept before it. No database yet is none.
+pub fn saved_session_count(socket: &Path) -> Result<usize> {
+    let file = state::db_path(socket);
+    if !file.exists() {
+        return Ok(0);
+    }
+    let conn = Connection::open_with_flags(&file, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .with_context(|| format!("couldn't open {}", file.display()))?;
+    let count = conn.query_row("SELECT count(*) FROM sessions", [], |row| row.get(0))?;
+    Ok(count)
+}
+
 /// Brings the database up to date: makes its tables, or adds what a newer
 /// crystal keeps.
 fn migrate(conn: &mut Connection) -> Result<()> {
@@ -403,7 +691,7 @@ fn write_sessions(conn: &Connection, sessions: &[SavedSession]) -> Result<()> {
         conn.execute(
             &format!(
                 "INSERT INTO sessions (position, {SESSION_COLUMNS}) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
             ),
             params![
                 position as i64,
@@ -413,6 +701,7 @@ fn write_sessions(conn: &Connection, sessions: &[SavedSession]) -> Result<()> {
                 json_or_null(&session.conversation)?,
                 json_or_null(&session.task)?,
                 json_or_null(&session.goal)?,
+                json_or_null(&session.resume)?,
             ],
         )?;
     }
@@ -427,6 +716,7 @@ fn session_of(row: &Row) -> Result<SavedSession> {
         conversation: from_json_or_null(row.get(3)?)?,
         task: from_json_or_null(row.get(4)?)?,
         goal: from_json_or_null(row.get(5)?)?,
+        resume: from_json_or_null(row.get(6)?)?,
     })
 }
 
@@ -531,7 +821,7 @@ fn insert_task(conn: &Connection, project: &str, task: &TaskRecord) -> Result<()
     conn.execute(
         &format!(
             "INSERT INTO tasks (project, {TASK_COLUMNS}) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"
         ),
         params![
             project,
@@ -544,29 +834,68 @@ fn insert_task(conn: &Connection, project: &str, task: &TaskRecord) -> Result<()
             outcome.map(|outcome| outcome.failed),
             outcome.map(|outcome| &outcome.summary),
             outcome.map(|outcome| outcome.closed),
+            task.id,
+            task.created,
+            outcome.is_some_and(|outcome| outcome.cancelled),
         ],
     )?;
     Ok(())
 }
 
+/// A task from a project's history. It closed, or it's from a file before
+/// the database that kept it open, so it was never pending or waiting.
 fn task_of(row: &Row) -> Result<TaskRecord> {
     let closed: Option<u64> = row.get(8)?;
     let outcome = match closed {
         Some(closed) => Some(TaskOutcome {
             failed: row.get::<_, Option<bool>>(6)?.unwrap_or(false),
+            cancelled: row.get(11)?,
             summary: row.get::<_, Option<String>>(7)?.unwrap_or_default(),
             closed,
         }),
         None => None,
     };
     Ok(TaskRecord {
+        id: row.get(9)?,
         project: row.get(0)?,
         goal: row.get(1)?,
         session: row.get(2)?,
         branch: row.get(3)?,
         background: row.get(4)?,
         backlog: row.get(5)?,
+        pending: false,
+        waiting: false,
+        created: row.get(10)?,
         outcome,
+        artifacts: Vec::new(),
+    })
+}
+
+fn artifact_of(row: &Row) -> Result<Artifact> {
+    let kind: String = row.get(0)?;
+    Ok(Artifact {
+        kind: ArtifactKind::named(&kind).with_context(|| format!("no kind of file is {kind}"))?,
+        name: row.get(1)?,
+        path: PathBuf::from(row.get::<_, String>(2)?),
+        bytes: row.get(3)?,
+    })
+}
+
+/// Takes the next task number, inside the transaction `tx` writes in.
+fn next_task_number(tx: &Transaction) -> Result<u64> {
+    tx.execute("UPDATE task_numbers SET last = last + 1", [])?;
+    Ok(tx.query_row("SELECT last FROM task_numbers", [], |row| row.get(0))?)
+}
+
+fn pending_of(row: &Row) -> Result<PendingTask> {
+    Ok(PendingTask {
+        id: row.get(0)?,
+        goal: row.get(1)?,
+        cwd: PathBuf::from(row.get::<_, String>(2)?),
+        name: row.get(3)?,
+        start: from_json(&row.get::<_, String>(4)?)?,
+        backlog: row.get(5)?,
+        created: row.get(6)?,
     })
 }
 
@@ -635,7 +964,7 @@ fn from_json_or_null<T: DeserializeOwned>(text: Option<String>) -> Result<Option
 mod tests {
     use super::*;
     use crate::flows::{Flow, Step};
-    use crate::protocol::{Conversation, TaskInfo, TaskSpec};
+    use crate::protocol::{Conversation, TaskInfo, TaskSpec, TaskStart, TaskState};
     use std::collections::BTreeMap;
 
     /// A socket of a test's own, in `dir`, so its database is too.
@@ -654,6 +983,7 @@ mod tests {
             }),
             task: None,
             goal: None,
+            resume: None,
         }
     }
 
@@ -665,9 +995,11 @@ mod tests {
                 name: "plan".into(),
                 profile: None,
                 prompt: "Plan {goal}".into(),
+                placement: None,
                 worktree: false,
                 gate: true,
                 back_to: None,
+                max_rounds: None,
             }],
         };
         let env = BTreeMap::from([("TOKEN".to_string(), "secret".to_string())]);
@@ -686,17 +1018,32 @@ mod tests {
 
     fn closed(goal: &str, at: u64) -> TaskRecord {
         TaskRecord {
+            id: Some(at),
             goal: goal.into(),
             session: "claude".into(),
             project: "app".into(),
             branch: Some("main".into()),
             background: false,
             backlog: Some(3),
-            outcome: Some(TaskOutcome {
-                failed: false,
-                summary: "did it".into(),
-                closed: at,
-            }),
+            pending: false,
+            waiting: false,
+            created: 1,
+            outcome: Some(TaskOutcome::new(TaskState::Done, "did it", at)),
+            artifacts: Vec::new(),
+        }
+    }
+
+    fn pending(goal: &str) -> PendingTask {
+        PendingTask {
+            id: 0,
+            goal: goal.into(),
+            cwd: PathBuf::from("/code/app"),
+            name: Some("later".into()),
+            start: TaskStart::Background {
+                args: vec!["--model".into(), "opus".into()],
+            },
+            backlog: Some(4),
+            created: 9,
         }
     }
 
@@ -711,12 +1058,17 @@ mod tests {
             args: vec!["--permission-mode".into(), "acceptEdits".into()],
         });
         task.goal = Some(TaskInfo {
+            id: Some(5),
             goal: "fix the tests".into(),
             background: true,
             backlog: Some(2),
+            waiting: true,
+            created: 3,
             outcome: None,
         });
-        let sessions = vec![saved("c"), task, saved("a")];
+        let mut reported = saved("c");
+        reported.resume = Some(vec!["pi".into(), "--session".into(), "s1".into()]);
+        let sessions = vec![reported, task, saved("a")];
         db.save_sessions(&sessions).unwrap();
         assert_eq!(db.sessions().unwrap(), sessions);
 
@@ -806,6 +1158,19 @@ mod tests {
     }
 
     #[test]
+    fn the_sessions_a_stopped_server_will_start_again_are_counted_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = socket_in(&dir);
+        assert_eq!(saved_session_count(&socket).unwrap(), 0);
+        assert!(!state::db_path(&socket).exists());
+        Db::open(&socket)
+            .unwrap()
+            .save_sessions(&[saved("a"), saved("b")])
+            .unwrap();
+        assert_eq!(saved_session_count(&socket).unwrap(), 2);
+    }
+
+    #[test]
     fn closed_tasks_come_back_by_project_in_the_order_they_closed() {
         let dir = tempfile::tempdir().unwrap();
         let mut db = Db::open(&socket_in(&dir)).unwrap();
@@ -826,6 +1191,108 @@ mod tests {
             .map(|task| task.goal)
             .collect();
         assert_eq!(goals, ["first", "elsewhere", "open"]);
+    }
+
+    #[test]
+    fn a_closed_task_keeps_its_number_and_whether_it_was_cancelled() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Db::open(&socket_in(&dir)).unwrap();
+        let app = Path::new("/code/app");
+        let mut cancelled = closed("dropped", 7);
+        cancelled.outcome = Some(TaskOutcome::new(TaskState::Cancelled, "no", 7));
+        db.record_task(app, &cancelled).unwrap();
+        let back = db.closed_tasks(Some(app)).unwrap();
+        assert_eq!(back, [cancelled]);
+        assert_eq!(back[0].state(), TaskState::Cancelled);
+    }
+
+    #[test]
+    fn tasks_waiting_to_start_share_the_numbers_no_task_gets_twice() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Db::open(&socket_in(&dir)).unwrap();
+        assert_eq!(db.new_task_number().unwrap(), 1);
+        assert_eq!(db.add_pending_task(&pending("later")).unwrap(), 2);
+        assert_eq!(db.add_pending_task(&pending("after")).unwrap(), 3);
+
+        let other = Db::open(&socket_in(&dir)).unwrap();
+        let waiting = other.pending_tasks().unwrap();
+        let wanted = PendingTask {
+            id: 2,
+            ..pending("later")
+        };
+        assert_eq!(waiting[0], wanted);
+        assert_eq!(waiting.len(), 2);
+        assert_eq!(other.pending_task(3).unwrap().unwrap().goal, "after");
+        assert!(other.remove_pending_task(2).unwrap());
+        assert!(!other.remove_pending_task(2).unwrap());
+        assert_eq!(db.pending_task(2).unwrap(), None);
+        assert_eq!(db.new_task_number().unwrap(), 4);
+    }
+
+    #[test]
+    fn a_tasks_kept_files_come_back_in_the_order_they_were_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&socket_in(&dir)).unwrap();
+        assert!(db.artifacts(12).unwrap().is_empty());
+        let artifact = |kind, name: &str, bytes| Artifact {
+            kind,
+            name: name.into(),
+            path: PathBuf::from("/state/tasks/t12").join(name),
+            bytes,
+        };
+        db.add_artifact(12, &artifact(ArtifactKind::File, "plan.md", 10), 1)
+            .unwrap();
+        db.add_artifact(12, &artifact(ArtifactKind::Handoff, "handoff.md", 20), 2)
+            .unwrap();
+        db.add_artifact(13, &artifact(ArtifactKind::File, "other.md", 30), 2)
+            .unwrap();
+        // Closing again keeps the handoff file again, in its place.
+        db.add_artifact(12, &artifact(ArtifactKind::Handoff, "handoff.md", 25), 3)
+            .unwrap();
+        let kept = db.artifacts(12).unwrap();
+        assert_eq!(
+            kept,
+            [
+                artifact(ArtifactKind::File, "plan.md", 10),
+                artifact(ArtifactKind::Handoff, "handoff.md", 25)
+            ]
+        );
+    }
+
+    #[test]
+    fn spending_adds_up_by_the_day() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&socket_in(&dir)).unwrap();
+        assert_eq!(db.spent_on("2026-10-03").unwrap(), 0.0);
+        db.add_spending("2026-10-03", 1.25).unwrap();
+        db.add_spending("2026-10-03", 0.5).unwrap();
+        db.add_spending("2026-10-04", 2.0).unwrap();
+        assert_eq!(db.spent_on("2026-10-03").unwrap(), 1.75);
+        assert_eq!(db.spent_on("2026-10-04").unwrap(), 2.0);
+    }
+
+    #[test]
+    fn a_database_from_before_tasks_had_numbers_takes_the_next_step() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = socket_in(&dir);
+        {
+            let conn = Connection::open(state::db_path(&socket)).unwrap();
+            conn.execute_batch(TABLES).unwrap();
+            conn.execute_batch("PRAGMA user_version = 1").unwrap();
+            conn.execute("INSERT INTO projects (path) VALUES ('/code/app')", [])
+                .unwrap();
+            conn.execute(
+                "INSERT INTO tasks (project, project_name, goal, session, failed, summary, closed) \
+                 VALUES ('/code/app', 'app', 'old', 'claude', 1, 'no', 5)",
+                [],
+            )
+            .unwrap();
+        }
+        let mut db = Db::open(&socket).unwrap();
+        let old = db.closed_tasks(Some(Path::new("/code/app"))).unwrap();
+        assert_eq!(old[0].id, None);
+        assert_eq!(old[0].state(), TaskState::Failed);
+        assert_eq!(db.new_task_number().unwrap(), 1);
     }
 
     #[test]
@@ -932,6 +1399,24 @@ mod tests {
         let mut db = Db::open(&socket).unwrap();
         assert!(db.backlog(app).unwrap().items.is_empty());
         assert!(old.join("backlog.json.broken").exists());
+    }
+
+    #[test]
+    fn the_timeline_reads_the_log_back_a_page_at_a_time_the_newest_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&socket_in(&dir)).unwrap();
+        for seq in 1..=5 {
+            let event = Event {
+                seq,
+                at: seq * 1000,
+                ..Event::about_project(crate::events::Kind::BacklogAdded, "/code/app".into())
+            };
+            db.add_event(&event).unwrap();
+        }
+        let seqs = |events: Vec<Event>| -> Vec<u64> { events.iter().map(|e| e.seq).collect() };
+        assert_eq!(seqs(db.events_before(None, 2).unwrap()), [5, 4]);
+        assert_eq!(seqs(db.events_before(Some(4), 2).unwrap()), [3, 2]);
+        assert_eq!(seqs(db.events_before(Some(2), 2).unwrap()), [1]);
     }
 
     #[test]

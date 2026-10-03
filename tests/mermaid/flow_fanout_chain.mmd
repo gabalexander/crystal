@@ -1,0 +1,7 @@
+flowchart LR
+    %% a chain and a fan-out
+    in1 & in2 --> merge --> split
+    split --> out1 & out2 & out3
+    classDef hot fill:#f96
+    class merge hot
+    style split fill:#bbf

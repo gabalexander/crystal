@@ -29,38 +29,30 @@ pub struct SavedSession {
     /// What the session's agent was asked to do, and how that went so far.
     #[serde(default)]
     pub goal: Option<TaskInfo>,
+    /// The command an agent that says what it's doing itself said picks
+    /// its session up again: see [`crate::report`].
+    #[serde(default)]
+    pub resume: Option<Vec<String>>,
 }
 
-/// The database of the daemon at `socket`. The default socket lives in
-/// /tmp, which a reboot empties, so its database is in the user's state
-/// directory instead, whoever starts the daemon ([`socket::is_default`]).
-/// Any other socket keeps its own beside it.
+/// The database of the daemon at `socket`. A server's socket lives in
+/// /tmp, which a reboot empties, so its database is in its directory in the
+/// user's state directory instead ([`server_dir`]), whoever starts the
+/// daemon. A socket given by its path keeps its own beside it.
 pub fn db_path(socket: &Path) -> PathBuf {
-    if socket::is_default(socket) {
-        state_dir().join("crystal.db")
-    } else {
-        socket.with_extension("db")
-    }
+    kept(socket, "crystal.db", "db")
 }
 
 /// Where the sessions of the daemon at `socket` were written down before
 /// the database. The rest of its state, like memory, is kept beside it.
 pub fn path(socket: &Path) -> PathBuf {
-    if socket::is_default(socket) {
-        state_dir().join("sessions.json")
-    } else {
-        socket.with_extension("sessions.json")
-    }
+    kept(socket, "sessions.json", "sessions.json")
 }
 
 /// Where the flow runs of the daemon at `socket` were written down before
 /// the database: beside its sessions.
 pub fn flows_path(socket: &Path) -> PathBuf {
-    if socket::is_default(socket) {
-        state_dir().join("flows.json")
-    } else {
-        socket.with_extension("flows.json")
-    }
+    kept(socket, "flows.json", "flows.json")
 }
 
 /// Where the daemon at `socket` kept what it knew of the project whose main
@@ -83,21 +75,45 @@ pub fn project_dirs(socket: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
+/// Where the daemon at `socket` keeps the files kept with the task numbered
+/// `task`: a directory of its own, beside the database.
+pub fn task_dir(socket: &Path, task: u64) -> PathBuf {
+    kept(socket, "tasks", "tasks").join(format!("t{task}"))
+}
+
 /// Where the daemon at `socket` keeps the logs of the plugins it runs.
 pub fn plugins_dir(socket: &Path) -> PathBuf {
-    if socket::is_default(socket) {
-        state_dir().join("plugins")
-    } else {
-        socket.with_extension("plugins")
-    }
+    kept(socket, "plugins", "plugins")
 }
 
 fn projects_dir(socket: &Path) -> PathBuf {
-    if socket::is_default(socket) {
-        state_dir().join("projects")
-    } else {
-        socket.with_extension("projects")
+    kept(socket, "projects", "projects")
+}
+
+/// Where the daemon at `socket` keeps `file`: in its server's directory
+/// ([`socket::server_of`]), or for a socket given by its path, beside it,
+/// named after it with `extension`.
+fn kept(socket: &Path, file: &str, extension: &str) -> PathBuf {
+    match socket::server_of(socket) {
+        Some(server) => server_dir(&server).join(file),
+        None => socket.with_extension(extension),
     }
+}
+
+/// Where the server called `name` keeps its state: the user's state
+/// directory for the default server, where it always has, and a directory
+/// of its own under [`servers_dir`] for any other.
+pub fn server_dir(name: &str) -> PathBuf {
+    if name == socket::DEFAULT {
+        state_dir()
+    } else {
+        servers_dir().join(name)
+    }
+}
+
+/// Where every server but the default keeps its state, a directory each.
+pub fn servers_dir() -> PathBuf {
+    state_dir().join("servers")
 }
 
 /// A directory name for a project: its own name, so a person can find it,
@@ -159,6 +175,19 @@ mod tests {
         assert_eq!(
             flows_path(Path::new("/tmp/test/crystal.sock")),
             Path::new("/tmp/test/crystal.flows.json")
+        );
+    }
+
+    #[test]
+    fn a_server_keeps_its_state_in_a_directory_of_its_own() {
+        let work = socket::of_server("work").unwrap();
+        assert_eq!(db_path(&work), servers_dir().join("work/crystal.db"));
+        assert_eq!(plugins_dir(&work), servers_dir().join("work/plugins"));
+        assert_eq!(server_dir("work"), servers_dir().join("work"));
+        assert_eq!(server_dir(socket::DEFAULT), state_dir());
+        assert_eq!(
+            db_path(&socket::default_path()),
+            state_dir().join("crystal.db")
         );
     }
 

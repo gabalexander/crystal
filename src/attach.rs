@@ -67,7 +67,7 @@ pub fn run(socket: &Path, name: Option<&str>) -> Result<()> {
 
     let detached = {
         let _raw = RawTerminal::enter()?;
-        relay(viewer, output, rows, cols)?
+        relay(socket, viewer, output, rows, cols)?
     };
     if detached {
         println!("[detached from {name}]");
@@ -79,23 +79,10 @@ pub fn run(socket: &Path, name: Option<&str>) -> Result<()> {
 
 /// Draws the session and sends it the keyboard until the user detaches
 /// (`true`) or the session goes (`false`).
-fn relay(viewer: Viewer, output: Output, rows: u16, cols: u16) -> Result<bool> {
+fn relay(socket: &Path, viewer: Viewer, output: Output, rows: u16, cols: u16) -> Result<bool> {
     let drawn = Arc::new(Mutex::new(Drawn::new(rows, cols)?));
-    let gone = Arc::new(AtomicBool::new(false));
-    let drawer = thread::spawn({
-        let drawn = drawn.clone();
-        let gone = gone.clone();
-        move || {
-            for chunk in output {
-                let mut drawn = drawn.lock().unwrap();
-                drawn.screen.process(&chunk);
-                if drawn.draw().is_err() {
-                    break;
-                }
-            }
-            gone.store(true, Ordering::SeqCst);
-        }
-    });
+    let mut viewer = viewer;
+    let mut drawing = Drawing::start(&drawn, output);
 
     // Our own handle on the keyboard, unbuffered, so that waiting on it
     // and reading from it agree.
@@ -103,8 +90,17 @@ fn relay(viewer: Viewer, output: Output, rows: u16, cols: u16) -> Result<bool> {
     let mut size = (rows, cols);
     let mut buf = [0; 4096];
     let detached = loop {
-        if gone.load(Ordering::SeqCst) {
-            break false;
+        if drawing.is_done() {
+            drawing.finish();
+            // The output ended: the session's program has, or the daemon
+            // was handed over to a new crystal, which hangs up on every
+            // attach. Attaching again says which.
+            let Some((again, output)) = attach_again(socket, &viewer, size) else {
+                break false;
+            };
+            viewer = again;
+            drawn.lock().unwrap().screen = vt::Screen::new(size.0, size.1);
+            drawing = Drawing::start(&drawn, output);
         }
         if readable(&keyboard, TICK)? {
             let n = (&keyboard).read(&mut buf)?;
@@ -129,8 +125,60 @@ fn relay(viewer: Viewer, output: Output, rows: u16, cols: u16) -> Result<bool> {
     // Hanging up ends the drawer's output, and the drawer must be done
     // before the terminal is put back.
     drop(viewer);
-    let _ = drawer.join();
+    drawing.finish();
     Ok(detached)
+}
+
+/// The session `viewer` showed, attached again at `(rows, cols)`, while its
+/// program still runs.
+fn attach_again(
+    socket: &Path,
+    viewer: &Viewer,
+    (rows, cols): (u16, u16),
+) -> Option<(Viewer, Output)> {
+    let (again, output) = Viewer::connect(socket, Some(&viewer.name), (rows, cols), false).ok()?;
+    (again.running && again.id == viewer.id).then_some((again, output))
+}
+
+/// The thread that draws a session's output as it comes, until it ends.
+struct Drawing {
+    drawer: Option<thread::JoinHandle<()>>,
+    done: Arc<AtomicBool>,
+}
+
+impl Drawing {
+    fn start(drawn: &Arc<Mutex<Drawn>>, output: Output) -> Drawing {
+        let done = Arc::new(AtomicBool::new(false));
+        let drawer = thread::spawn({
+            let drawn = drawn.clone();
+            let done = done.clone();
+            move || {
+                for chunk in output {
+                    let mut drawn = drawn.lock().unwrap();
+                    drawn.screen.process(&chunk);
+                    if drawn.draw().is_err() {
+                        break;
+                    }
+                }
+                done.store(true, Ordering::SeqCst);
+            }
+        });
+        Drawing {
+            drawer: Some(drawer),
+            done,
+        }
+    }
+
+    fn is_done(&self) -> bool {
+        self.done.load(Ordering::SeqCst)
+    }
+
+    /// Waits until the drawer is done, which it is once the output ends.
+    fn finish(&mut self) {
+        if let Some(drawer) = self.drawer.take() {
+            let _ = drawer.join();
+        }
+    }
 }
 
 /// How the session ended, as the daemon tells it.
@@ -140,7 +188,9 @@ fn ending(socket: &Path, name: &str) -> String {
     loop {
         let sessions = match client::ask(socket, &Request::List, false) {
             Ok(Some(Response::Sessions { sessions })) => sessions,
-            _ => return "[the daemon stopped]".into(),
+            // Say a newer crystal took the daemon over.
+            Err(err) => return format!("[{err:#}]"),
+            Ok(_) => return "[the daemon stopped]".into(),
         };
         match sessions.iter().find(|session| session.name == name) {
             None => return format!("[{name} was killed]"),

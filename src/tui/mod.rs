@@ -1,54 +1,78 @@
 //! The TUI, run as `crystal` with no command: a sidebar with every session,
-//! the selected one live in a pane beside it, and up to two more split off
-//! into panes of their own, in tabs that each keep their own.
+//! the selected one live in a pane beside it, and any others split off into
+//! panes of their own, split and sized as the user likes, in tabs that each
+//! keep their own.
 //!
 //! Everything that happens arrives as an [`Event`] on one channel: a key,
 //! the mouse, a resize, output from the session in the pane, a fresh
 //! session list. The loop takes each event, updates the state, and draws.
 
 mod app;
+mod away;
 mod backlog_view;
 mod command_line;
+mod compose;
 mod copy_mode;
 mod diff;
+mod diff_tree;
 mod diff_view;
 mod finder;
 mod fuzzy;
+mod grep;
 mod groups;
 mod help;
 mod issues;
 pub(crate) mod launcher;
+mod layout_link;
 mod layouts;
+mod listing;
 mod memory_view;
 mod mouse;
+mod needs_you;
 mod pane;
 mod plugins_view;
+mod preview;
 mod profiles;
+mod pull_requests;
+mod review;
 pub(crate) mod screen_widget;
 mod search;
 mod settings_view;
 pub(crate) mod sidebar;
+pub(crate) mod split_tree;
 mod status;
+mod switcher;
 mod tabs;
 mod text_area;
 mod text_input;
 mod theme;
+mod timeline;
+mod tree_browser;
 mod ui;
 
 use crate::config::{self, Config};
 use crate::db::{self, Db};
+use crate::events::{Filter, Since};
 use crate::flow_run::FlowRun;
-use crate::github::{self, Issue, PullRequest};
+use crate::forge::{
+    Checkout, Forge, Issue, IssueDetail, PullRequest, PullRequestDetail, Repo, Topic,
+};
+use crate::layout::{Layout, Order, Relayed};
 use crate::memory::{self, Listed, Memory};
 use crate::plugins::{self, Context};
 use crate::profile;
-use crate::protocol::{Backlog, NewSession, Request, Response, SessionInfo, Worktree};
-use crate::{catalog, keys, typing};
-use crate::{client, clipboard, env, git};
+use crate::protocol::{
+    Backlog, NewSession, Request, Response, SessionInfo, Spending, State, Worktree,
+};
+use crate::{catalog, keys, links, socket, typing};
+use crate::{client, clipboard, drive, env, event_log, events, git};
 use anyhow::{Context as _, Result, bail};
 use app::{Action, App, Focus, Hit, Place, PluginKey, PluginPane, Slot};
 use backlog_view::BacklogChange;
-use crossterm::event::{Event as TerminalEvent, KeyEvent, KeyEventKind, MouseEvent};
+use crossterm::event::{
+    Event as TerminalEvent, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
+};
 use diff_view::Against;
 use layouts::{Layouts, Which};
 use pane::Pane;
@@ -58,7 +82,7 @@ use std::collections::HashMap;
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -73,9 +97,13 @@ const POLL_EVERY: Duration = Duration::from_millis(500);
 /// nothing working, the TUI waits for something to happen instead.
 const SPIN_EVERY: Duration = Duration::from_millis(150);
 
-/// How often GitHub is asked again about a project's pull requests. A
+/// How often its forge is asked again about a project's pull requests. A
 /// project seen for the first time is asked about straight away.
 const PULL_REQUESTS_EVERY: Duration = Duration::from_secs(60);
+
+/// How long find in files waits after a key before it searches: the time
+/// between keys of someone typing a word, so a search runs once it's typed.
+const GREP_PAUSE: Duration = Duration::from_millis(150);
 
 /// How often git is asked again about a project's worktrees, for those
 /// made or removed outside crystal. A project seen for the first time is
@@ -83,11 +111,17 @@ const PULL_REQUESTS_EVERY: Duration = Duration::from_secs(60);
 /// made or removed a worktree.
 const WORKTREES_EVERY: Duration = Duration::from_secs(5);
 
+/// How often the thread following the event log for the timeline looks up
+/// from waiting, to see whether the timeline is still open.
+const FOLLOW_CHECK: Duration = Duration::from_millis(250);
+
 pub enum Event {
     Key(KeyEvent),
     Mouse(MouseEvent),
     /// Text pasted into the terminal, whole.
     Paste(String),
+    /// A layout command from the command line, passed on by the daemon.
+    Layout(Relayed),
     /// The models Codex lets the user choose.
     CodexModels(Vec<String>),
     /// The terminal changed size. The next draw lays everything out again
@@ -105,10 +139,10 @@ pub enum Event {
     OutputEnded {
         pane: u64,
     },
-    /// What GitHub said about the open pull requests of a project.
+    /// What its forge said about the open pull requests of a project.
     PullRequests {
         project: PathBuf,
-        found: Result<Vec<PullRequest>, String>,
+        found: Result<(Forge, Vec<PullRequest>), String>,
     },
     /// The linked worktrees of a project, as git listed them.
     Worktrees {
@@ -126,17 +160,39 @@ pub enum Event {
         path: PathBuf,
         branch: String,
     },
-    /// What GitHub said about the open issues of a project.
+    /// What its forge said about the open issues of a project.
     Issues {
         project: PathBuf,
-        found: Result<Vec<Issue>, String>,
+        found: Result<(Forge, Vec<Issue>), String>,
     },
-    /// The text of one of a project's issues.
-    IssueBody {
+    /// One of a project's issues, read whole.
+    IssueRead {
         project: PathBuf,
         number: u64,
-        body: Result<String, String>,
+        read: Result<IssueDetail, String>,
     },
+    /// One of a project's pull requests, read whole.
+    PullRequestRead {
+        project: PathBuf,
+        number: u64,
+        read: Result<PullRequestDetail, String>,
+    },
+    /// A comment was posted on `topic`, or why it wasn't.
+    Commented {
+        project: PathBuf,
+        topic: Topic,
+        posted: Result<(), String>,
+    },
+    /// An issue was given a new title and text, or why it wasn't.
+    IssueEdited {
+        project: PathBuf,
+        number: u64,
+        edit: (String, String),
+        saved: Result<(), String>,
+    },
+    /// A pull request's worktree is there now: the start that waited on it
+    /// can go on, in it.
+    Fetched(Box<Action>),
     /// Something to tell the user, from work done off the loop.
     Notice(String),
     /// A worktree's diff, read for the diff view.
@@ -145,16 +201,38 @@ pub enum Event {
         against: Against,
         read: Result<diff_view::Read, String>,
     },
-    /// A worktree's files, listed for the file finder.
+    /// A worktree's files, listed for the file finder or the tree browser.
     FilesRead {
         dir: PathBuf,
         files: Result<Vec<String>, String>,
     },
-    /// The first lines of a file, for the file finder's preview.
+    /// A file read and highlighted for a preview.
     PreviewRead {
         dir: PathBuf,
         path: String,
-        lines: Result<Vec<String>, String>,
+        read: Result<preview::Content, String>,
+    },
+    /// A worktree's branches and changes, listed for the branch switcher.
+    BranchesListed {
+        dir: PathBuf,
+        listed: Result<switcher::Listed, String>,
+    },
+    /// What switching the worktree at `dir` to another branch came to.
+    BranchSwitched {
+        dir: PathBuf,
+        outcome: git::branches::Outcome,
+    },
+    /// What find in files' search for `query` found.
+    Searched {
+        dir: PathBuf,
+        query: String,
+        found: Result<git::Found, String>,
+    },
+    /// A file's lines, highlighted, for find in files' preview.
+    MatchedFileRead {
+        dir: PathBuf,
+        path: String,
+        lines: Result<Vec<crate::syntax::Runs>, String>,
     },
     /// A project's memory, read for the memory view.
     MemoryRead {
@@ -168,8 +246,26 @@ pub enum Event {
     },
     /// How many backlog items each project has to do.
     BacklogCounts(HashMap<PathBuf, usize>),
+    /// What background tasks have spent today.
+    Spending(Spending),
     /// The settings as they are now, for the settings view.
     Settings(settings_view::Current),
+    /// The terminal has focus again, or has lost it.
+    Focus(bool),
+    /// A page of the event log, the newest first, read for the timeline
+    /// following the log under the number `feed`.
+    EventsRead {
+        feed: u64,
+        read: Result<Vec<events::Event>, String>,
+    },
+    /// An event that has just happened, for the timeline following the log
+    /// under the number `feed`.
+    Logged {
+        feed: u64,
+        event: Box<events::Event>,
+    },
+    /// What the event log gained while the user was away.
+    Away(Result<away::Tally, String>),
 }
 
 pub fn run(socket: &Path) -> Result<()> {
@@ -182,6 +278,7 @@ pub fn run(socket: &Path) -> Result<()> {
 
     let (sender, events) = mpsc::channel();
     spawn_input_reader(sender.clone());
+    let layout = layout_link::Link::open(socket, sender.clone());
     let count_backlog = Arc::new(AtomicBool::new(crate::backlog::enabled(&config)));
     let poll_flows = Arc::new(AtomicBool::new(crate::flows::enabled(&config)));
     let poll_settings = Arc::new(AtomicBool::new(false));
@@ -220,6 +317,8 @@ pub fn run(socket: &Path) -> Result<()> {
         list_worktrees_now,
         theme: Theme::from_env(config.theme),
         started: Instant::now(),
+        searches: Arc::new(AtomicU64::new(0)),
+        link_clicked: false,
         kept_tabs: tabs::Tabs::default(),
         quitting: false,
         overlay: None,
@@ -227,19 +326,26 @@ pub fn run(socket: &Path) -> Result<()> {
         poll_flows,
         poll_settings,
         config: config.clone(),
+        feed: Arc::new(AtomicU64::new(0)),
+        presence: away::Presence::new(events::now_ms()),
+        layout,
     };
     tui.app.set_agents(catalog::installed());
+    let server = socket::server_of(socket).filter(|server| server != socket::DEFAULT);
+    tui.app.set_server(server);
     tui.app.set_launch_settings(&config);
     tui.app.set_features(&config);
     tui.app.set_plugin_keys(plugin_keys(&config));
     tui.app
         .set_memory(launcher::read_memory(tui.ui(db::LAUNCHER).as_deref()));
+    tui.app.set_diff_tree(tui.review().tree);
     if tui.app.shows_flows() {
         tui.app.set_flows(list_flows(socket));
     }
     tui.set_sessions(sessions);
     tui.app.set_tabs(tabs::read(tui.ui(db::TABS).as_deref()));
     tui.kept_tabs = tui.app.tabs_to_keep();
+    tui.look_back_from_last_seen();
 
     let mut terminal = ratatui::try_init()?;
     let result = tui.run_with_modes(&mut terminal, events);
@@ -262,17 +368,22 @@ impl TerminalModes {
             modes_off();
             shown_before(info);
         }));
-        // Clicks and the wheel (1000), drags (1002), written the SGR way
-        // (1006). Not the mouse just moving (1003): nothing here needs it,
-        // and it would wake the TUI at every move. Then bracketed paste
-        // (2004): a paste comes whole, its lines kept, not as typed keys.
-        // Last, pushed on the terminal's stack, the Kitty keyboard
-        // protocol's flags to tell apart keys the old way can't, like Esc
-        // or Shift+Enter, and to say which key a shifted one is (1 and 4):
-        // a program in a pane that asked for the protocol gets them. A
-        // terminal without it ignores the request.
+        // Clicks and the wheel (1000), drags (1002), the mouse just moving
+        // (1003), to underline the link under it while Ctrl is held, all
+        // written the SGR way (1006). A move that changes nothing isn't
+        // drawn. Then bracketed paste (2004): a paste comes whole, its
+        // lines kept, not as typed keys. Then, pushed on the terminal's
+        // stack, the Kitty keyboard protocol's flags to tell apart keys the
+        // old way can't, like Esc or Shift+Enter, and to say which key a
+        // shifted one is (1 and 4): a program in a pane that asked for the
+        // protocol gets them. A terminal without it ignores the request.
+        // Last, focus (1004): the terminal says when it gains and loses it,
+        // for "while you were away", and so that layout commands from the
+        // command line go to the TUI the user is at.
         let mut out = std::io::stdout();
-        out.write_all(b"\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[?2004h\x1b[>5u")?;
+        out.write_all(
+            b"\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h\x1b[?2004h\x1b[>5u\x1b[?1004h",
+        )?;
         out.flush()?;
         Ok(TerminalModes)
     }
@@ -286,7 +397,8 @@ impl Drop for TerminalModes {
 
 fn modes_off() {
     let mut out = std::io::stdout();
-    let _ = out.write_all(b"\x1b[<u\x1b[?2004l\x1b[?1006l\x1b[?1002l\x1b[?1000l");
+    let _ =
+        out.write_all(b"\x1b[?1004l\x1b[<u\x1b[?2004l\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l");
     let _ = out.flush();
 }
 
@@ -317,6 +429,9 @@ struct Tui {
     poll_settings: Arc<AtomicBool>,
     /// The config as the TUI last took it in.
     config: Config,
+    /// Where layout commands from the command line come from, and their
+    /// answers go.
+    layout: layout_link::Link,
     /// The projects the sessions are in, for the thread that asks GitHub
     /// about their pull requests.
     projects: Arc<Mutex<Vec<PathBuf>>>,
@@ -331,7 +446,19 @@ struct Tui {
     started: Instant,
     /// The tabs as they were last kept.
     kept_tabs: tabs::Tabs,
+    /// How many searches find in files has asked for: a search that isn't
+    /// the last one asked for stops.
+    searches: Arc<AtomicU64>,
+    /// A Ctrl+click opened a link: the button coming up is that click's,
+    /// not the program's under it.
+    link_clicked: bool,
     quitting: bool,
+    /// The number the timeline follows the event log under, which goes up
+    /// each time it starts or stops following: a thread following under an
+    /// older number stops, and what was read under one is dropped.
+    feed: Arc<AtomicU64>,
+    /// Whether the user is there, for "while you were away".
+    presence: away::Presence,
 }
 
 impl Tui {
@@ -347,44 +474,159 @@ impl Tui {
     }
 
     fn run(&mut self, terminal: &mut DefaultTerminal, events: Receiver<Event>) -> Result<()> {
+        let mut changed = true;
         while !self.quitting {
-            let size = terminal.size()?;
-            self.screen = Rect::new(0, 0, size.width, size.height);
-            let areas = ui::Areas::of(&self.app, self.screen);
-            self.sync_panes(&areas);
-            if let Some(overlay) = &mut self.overlay {
-                let screen = ui::plugin_pane_screen(&areas);
-                let size = (screen.height.max(1), screen.width.max(1));
-                if overlay.size() != size {
-                    overlay.resize(size.0, size.1);
-                }
+            if changed {
+                self.draw(terminal)?;
             }
-            if let Some(view) = self.app.view() {
-                let parts = ui::view_areas(view, areas.main);
-                let size = |area: Rect| (area.height, area.width);
-                self.app
-                    .set_view_size(size(parts.list), size(parts.content));
-            }
-            let look = ui::Look {
-                theme: &self.theme,
-                now: seconds_since_epoch(),
-                spin: (self.started.elapsed().as_millis() / SPIN_EVERY.as_millis()) as usize,
-            };
-            let overlay = self.overlay.as_ref();
-            terminal.draw(|frame| ui::draw(frame, &self.app, &self.panes, overlay, &look))?;
 
             // Wait for something to happen, then take whatever else has
             // happened meanwhile, so a burst of output is drawn once.
-            if let Some(event) = self.next_event(&events)? {
-                self.handle(event);
-            }
+            changed = match self.next_event(&events)? {
+                Some(event) => self.take(event),
+                None => true,
+            };
             while let Ok(event) = events.try_recv() {
-                self.handle(event);
+                changed |= self.take(event);
             }
-            self.fetch_issue_body();
+            self.read_topic();
             self.keep_tabs();
         }
+        self.keep_seen();
         Ok(())
+    }
+
+    /// Lays everything out for the terminal's size, and draws it.
+    fn draw(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
+        let size = terminal.size()?;
+        self.screen = Rect::new(0, 0, size.width, size.height);
+        let areas = ui::Areas::of(&self.app, self.screen);
+        self.app.set_tiles(areas.tiles);
+        self.app.set_screen(self.screen);
+        self.sync_panes(&areas);
+        if let Some(overlay) = &mut self.overlay {
+            let screen = ui::plugin_pane_screen(&areas);
+            let size = (screen.height.max(1), screen.width.max(1));
+            if overlay.size() != size {
+                overlay.resize(size.0, size.1);
+            }
+        }
+        if let Some(view) = self.app.view() {
+            let parts = ui::view_areas(view, areas.main);
+            let size = |area: Rect| (area.height, area.width);
+            self.app
+                .set_view_size(size(parts.list), size(parts.content));
+        }
+        let look = ui::Look {
+            theme: &self.theme,
+            now: seconds_since_epoch(),
+            spin: (self.started.elapsed().as_millis() / SPIN_EVERY.as_millis()) as usize,
+        };
+        let overlay = self.overlay.as_ref();
+        terminal.draw(|frame| ui::draw(frame, &self.app, &self.panes, overlay, &look))?;
+        Ok(())
+    }
+
+    /// Takes in `event`, and says whether that may have changed what's
+    /// drawn: the mouse just moving mostly doesn't.
+    fn take(&mut self, event: Event) -> bool {
+        if let Event::Mouse(mouse) = &event
+            && mouse.kind == MouseEventKind::Moved
+        {
+            return self.mouse_moved(mouse);
+        }
+        self.handle(event);
+        true
+    }
+
+    /// As the TUI starts, has it say what happened since it was last open,
+    /// if it has been before.
+    fn look_back_from_last_seen(&mut self) {
+        match away::read_seen(self.ui(db::SEEN).as_deref()) {
+            Some(seq) => self.look_back(Since::Seq(seq)),
+            None => self.keep_seen(),
+        }
+    }
+
+    /// Has what the event log gained since `since`, when the user went
+    /// away, counted off the loop, for the footer to say. From now, they've
+    /// seen it all.
+    fn look_back(&self, since: Since) {
+        self.keep_seen();
+        let socket = self.socket.clone();
+        self.read_in_background(move || {
+            let read = event_log::read(&socket, &Filter::default(), since);
+            let tally = read.map(|events| away::Tally::of(&events));
+            Event::Away(tally.map_err(|err| format!("{err:#}")))
+        });
+    }
+
+    /// Keeps the latest event in the log as the last the user has seen,
+    /// where "while you were away" counts from the next time the TUI opens.
+    fn keep_seen(&self) {
+        let Ok(db) = &self.db else {
+            return;
+        };
+        if let Ok(seq) = db.latest_event() {
+            let _ = db.keep_ui(db::SEEN, &away::Seen { seq });
+        }
+    }
+
+    /// A key, a click or a paste: when it ends a long while without one,
+    /// the footer says what happened meanwhile.
+    fn user_is_here(&mut self) {
+        if let Some(went) = self.presence.input(events::now_ms()) {
+            self.look_back(Since::At(went));
+        }
+    }
+
+    /// Reads the newest page of the event log for the timeline, then
+    /// follows the log from there, on a thread of its own, until the
+    /// timeline closes. Subscribing from the page's newest event leaves no
+    /// gap between the two, and the subscription picks up again after the
+    /// last event it gave when a handover cuts it.
+    fn follow_events(&self) {
+        let feed = self.feed.fetch_add(1, Ordering::Relaxed) + 1;
+        let current = self.feed.clone();
+        let socket = self.socket.clone();
+        let events = self.events.clone();
+        thread::spawn(move || {
+            let read = read_events(&socket, None);
+            let since = match &read {
+                Ok(page) => Some(Since::Seq(page.first().map_or(0, |event| event.seq))),
+                Err(_) => None,
+            };
+            if events.send(Event::EventsRead { feed, read }).is_err() {
+                return;
+            }
+            let mut subscription = match client::subscribe(&socket, Filter::default(), since) {
+                Ok(subscription) => subscription,
+                Err(err) => {
+                    let notice = format!("couldn't follow the event log: {err:#}");
+                    let _ = events.send(Event::Notice(notice));
+                    return;
+                }
+            };
+            while current.load(Ordering::Relaxed) == feed {
+                let event = match subscription.next_before(Some(Instant::now() + FOLLOW_CHECK)) {
+                    Ok(Some(event)) => Box::new(event),
+                    Ok(None) => continue,
+                    Err(err) => {
+                        let notice = format!("stopped following the event log: {err:#}");
+                        let _ = events.send(Event::Notice(notice));
+                        return;
+                    }
+                };
+                if events.send(Event::Logged { feed, event }).is_err() {
+                    return;
+                }
+            }
+        });
+    }
+
+    /// Whether the timeline still follows the log under the number `feed`.
+    fn following(&self, feed: u64) -> bool {
+        self.feed.load(Ordering::Relaxed) == feed
     }
 
     /// Writes the tabs down when they've changed, so that they're there the
@@ -409,6 +651,17 @@ impl Tui {
         if let Ok(db) = &self.db {
             let _ = db.keep_ui(db::LAUNCHER, self.app.memory());
         }
+    }
+
+    /// What the diff view keeps: the files marked reviewed, and whether it
+    /// lists them as a tree.
+    fn review(&self) -> review::Kept {
+        review::read(self.ui(db::DIFF).as_deref())
+    }
+
+    fn keep_review(&self, kept: &review::Kept) -> Result<()> {
+        let db = self.db.as_ref().map_err(|why| anyhow::anyhow!("{why}"))?;
+        db.keep_ui(db::DIFF, kept)
     }
 
     /// The layouts saved with `S`, or why they can't be read.
@@ -458,20 +711,26 @@ impl Tui {
         *self.projects.lock().unwrap() = asked;
     }
 
-    /// Asks GitHub, off the loop, for the text of the issue the issues
-    /// view's bar is on, the first time the bar is on it.
-    fn fetch_issue_body(&mut self) {
-        let Some((project, number)) = self.app.issue_body_to_fetch() else {
+    /// Asks the forge, off the loop, for the issue or pull request the
+    /// open view's bar is on, read whole, the first time the bar is on it.
+    fn read_topic(&mut self) {
+        let Some((project, topic)) = self.app.topic_to_read() else {
             return;
         };
-        let events = self.events.clone();
-        thread::spawn(move || {
-            let body = github::issue_body(&project, number);
-            let _ = events.send(Event::IssueBody {
-                project,
-                number,
-                body,
-            });
+        self.read_in_background(move || {
+            let repo = Repo::find(&project);
+            match topic {
+                Topic::Issue(number) => Event::IssueRead {
+                    read: repo.and_then(|repo| repo.issue(number)),
+                    project,
+                    number,
+                },
+                Topic::PullRequest(number) => Event::PullRequestRead {
+                    read: repo.and_then(|repo| repo.pull_request(number)),
+                    project,
+                    number,
+                },
+            }
         });
     }
 
@@ -489,6 +748,15 @@ impl Tui {
     }
 
     fn handle(&mut self, event: Event) {
+        if matches!(
+            event,
+            Event::Key(_) | Event::Mouse(_) | Event::Paste(_) | Event::Focus(true)
+        ) {
+            self.layout.used();
+        }
+        if matches!(event, Event::Key(_) | Event::Mouse(_) | Event::Paste(_)) {
+            self.user_is_here();
+        }
         match event {
             Event::Key(key) => self.on_key(key),
             Event::Mouse(mouse) => self.on_mouse(mouse),
@@ -497,9 +765,16 @@ impl Tui {
                     self.carry_out(action);
                 }
             }
+            Event::Layout(relayed) => {
+                let answer = self.obey(relayed.order);
+                self.layout.answer(relayed.id, answer);
+            }
             Event::CodexModels(models) => self.app.set_codex_models(models),
             Event::Resize => {}
-            Event::Sessions(sessions) => self.set_sessions(sessions),
+            Event::Sessions(sessions) => {
+                self.attach_again(&sessions);
+                self.set_sessions(sessions);
+            }
             Event::Flows(runs) => self.app.set_flows(runs),
             Event::PullRequests { project, found } => self.app.set_pull_requests(project, found),
             Event::Worktrees { project, worktrees } => self.app.set_worktrees(project, worktrees),
@@ -508,39 +783,76 @@ impl Tui {
                 self.app.ask_to_force_removal(path, branch);
             }
             Event::Issues { project, found } => self.app.set_issues(&project, found),
-            Event::IssueBody {
+            Event::IssueRead {
                 project,
                 number,
-                body,
-            } => self.app.set_issue_body(&project, number, body),
+                read,
+            } => self.app.set_issue(&project, number, read),
+            Event::PullRequestRead {
+                project,
+                number,
+                read,
+            } => self.app.set_pull_request(&project, number, read),
+            Event::Commented {
+                project,
+                topic,
+                posted,
+            } => self.app.commented(&project, topic, posted),
+            Event::IssueEdited {
+                project,
+                number,
+                edit,
+                saved,
+            } => self.app.issue_edited(&project, number, edit, saved),
+            Event::Fetched(start) => {
+                self.list_worktrees_again();
+                self.carry_out(*start);
+            }
             Event::Notice(notice) => self.app.notify(notice),
             Event::Output { pane, bytes } => {
                 if let Some(pane) = self.pane_with_id(pane) {
                     pane.screen.process(&bytes);
                 }
             }
+            // The next list says whether the session has ended, or runs on
+            // in a daemon handed over to a new crystal (`attach_again`).
             Event::OutputEnded { pane } => {
-                // A plugin's pane closes as its program ends.
-                if self
-                    .overlay
-                    .as_ref()
-                    .is_some_and(|overlay| overlay.id == pane)
-                {
-                    self.close_plugin_pane();
-                } else if let Some(pane) = self.pane_with_id(pane) {
+                if let Some(pane) = self.pane_with_id(pane) {
                     pane.ended = true;
                 }
             }
-            Event::DiffRead { dir, against, read } => self.app.diff_read(&dir, against, read),
+            Event::DiffRead { dir, against, read } => {
+                let kept = self.review();
+                let read = read.map(|mut read| {
+                    read.reviewed = kept.marks(&diff_view::scope(&dir, against, &read.head));
+                    read
+                });
+                self.app.diff_read(&dir, against, read);
+            }
             Event::FilesRead { dir, files } => {
                 if let Some(action) = self.app.files_read(&dir, files) {
                     self.carry_out(action);
                 }
             }
-            Event::PreviewRead { dir, path, lines } => self.app.preview_read(&dir, &path, lines),
+            Event::PreviewRead { dir, path, read } => self.app.preview_read(&dir, &path, read),
+            Event::BranchesListed { dir, listed } => self.app.branches_listed(&dir, listed),
+            Event::BranchSwitched { dir, outcome } => {
+                if let Some(action) = self.app.branch_switched(&dir, outcome) {
+                    self.carry_out(action);
+                }
+            }
+            Event::Searched { dir, query, found } => {
+                if let Some(action) = self.app.searched(&dir, &query, found) {
+                    self.carry_out(action);
+                }
+            }
+            Event::MatchedFileRead { dir, path, lines } => {
+                self.app.matched_file_read(&dir, &path, lines);
+            }
             Event::MemoryRead { dir, read } => self.app.memory_read(&dir, read),
             Event::Backlog { dir, found } => self.app.set_backlog(&dir, found),
             Event::BacklogCounts(counts) => self.app.set_backlog_counts(counts),
+            Event::Spending(spending) => self.app.set_spending(spending),
             Event::Settings(current) => {
                 // The file changed by hand, or by another crystal, counts
                 // here too, straight away.
@@ -548,6 +860,28 @@ impl Tui {
                     self.config_changed(config);
                 }
                 self.app.show_settings(current);
+            }
+            Event::Focus(true) => {
+                if let Some(went) = self.presence.focus_gained(events::now_ms()) {
+                    self.look_back(Since::At(went));
+                }
+            }
+            Event::Focus(false) => {
+                self.presence.focus_lost(events::now_ms());
+                self.keep_seen();
+            }
+            Event::EventsRead { feed, read } if self.following(feed) => {
+                if let Some(action) = self.app.events_read(read) {
+                    self.carry_out(action);
+                }
+            }
+            Event::Logged { feed, event } if self.following(feed) => self.app.logged(*event),
+            // Read for a timeline that has closed since.
+            Event::EventsRead { .. } | Event::Logged { .. } => {}
+            Event::Away(Ok(tally)) => self.app.set_away(&tally),
+            Event::Away(Err(reason)) => {
+                self.app
+                    .notify(format!("couldn't read the event log: {reason}"));
             }
         }
     }
@@ -558,12 +892,49 @@ impl Tui {
         }
     }
 
+    /// Carries out a layout command from the command line, and what it
+    /// needs done outside the state, and says what the tabs came to, or
+    /// why it couldn't.
+    fn obey(&mut self, order: Order) -> Result<Layout, String> {
+        let failed = |err: anyhow::Error| format!("{err:#}");
+        // A session it names may have started a moment ago, too lately for
+        // the last list.
+        self.refresh_sessions().map_err(failed)?;
+        if let Some(action) = self.app.obey(order)? {
+            self.perform(action).map_err(failed)?;
+        }
+        Ok(self.app.layout())
+    }
+
     /// Performs `action`. One that fails, say because its session has just
     /// gone, says why at the bottom rather than closing the TUI.
-    fn carry_out(&mut self, action: Action) {
+    fn carry_out(&mut self, mut action: Action) {
+        if let Some(Place::PullRequest(checkout)) = action.place_mut() {
+            let checkout = checkout.clone();
+            self.fetch_then_start(checkout, action);
+            return;
+        }
         if let Err(err) = self.perform(action) {
             self.app.notify(format!("{err:#}"));
         }
+    }
+
+    /// Finds or makes the worktree `checkout` says, off the loop, since
+    /// making one fetches over the network; then `start` goes on in it.
+    fn fetch_then_start(&mut self, checkout: Checkout, mut start: Action) {
+        self.app.notify(format!("fetching {}…", checkout.branch));
+        let socket = self.socket.clone();
+        self.read_in_background(
+            move || match client::pull_request_worktree(&socket, &checkout) {
+                Ok(dir) => {
+                    if let Some(place) = start.place_mut() {
+                        *place = Place::Directory(Some(dir));
+                    }
+                    Event::Fetched(Box::new(start))
+                }
+                Err(err) => Event::Notice(format!("{err:#}")),
+            },
+        );
     }
 
     fn on_mouse(&mut self, mouse: MouseEvent) {
@@ -573,7 +944,13 @@ impl Tui {
         }
         let areas = ui::Areas::of(&self.app, self.screen);
         let mut hit = ui::hit(&areas, &self.app, mouse.column, mouse.row);
-        if let Some(slot) = self.app.dragging() {
+        if self.click_on_link(&mouse, hit) {
+            return;
+        }
+        if let Some(split) = self.app.moving_border() {
+            // A border taken by the mouse is crystal's until it's let go.
+            hit = ui::border_hit(&areas, &self.app, split, mouse.column, mouse.row);
+        } else if let Some(slot) = self.app.dragging() {
             // A selection being dragged is crystal's to the end, and keeps
             // to the edge of its pane when the mouse leaves it.
             let cell = ui::nearest_cell(&areas, &self.app, slot, mouse.column, mouse.row);
@@ -584,6 +961,63 @@ impl Tui {
         if let Some(action) = self.app.on_mouse(mouse.kind, hit) {
             self.carry_out(action);
         }
+    }
+
+    /// The mouse moved: with Ctrl held, onto the link to underline.
+    /// Returns whether that changes what's drawn.
+    fn mouse_moved(&mut self, mouse: &MouseEvent) -> bool {
+        if self.overlay.is_some() {
+            return false;
+        }
+        let areas = ui::Areas::of(&self.app, self.screen);
+        let hit = ui::hit(&areas, &self.app, mouse.column, mouse.row);
+        let ctrl = mouse.modifiers.contains(KeyModifiers::CONTROL);
+        self.app.mouse_moved(hit, ctrl)
+    }
+
+    /// Ctrl and a click on a link in a pane opens it, whoever has the
+    /// mouse there, and the button coming up after is the click's too.
+    /// Returns whether the mouse did that.
+    fn click_on_link(&mut self, mouse: &MouseEvent, hit: Hit) -> bool {
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left)
+                if mouse.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                let Some((slot, cell)) = self.app.link_cell(hit) else {
+                    return false;
+                };
+                let link = self
+                    .pane_in(slot)
+                    .and_then(|pane| pane.screen.link_at(cell));
+                let Some(link) = link else {
+                    return false;
+                };
+                self.link_clicked = true;
+                let context = self.app.link_context(slot);
+                if let Err(err) = self.open_link(link.url, context) {
+                    self.app.notify(format!("{err:#}"));
+                }
+                true
+            }
+            MouseEventKind::Up(MouseButton::Left) => std::mem::take(&mut self.link_clicked),
+            _ => false,
+        }
+    }
+
+    /// Opens `url`, a link a pane shows, about `context`: with the action
+    /// of the first plugin that handles links like it, or in the browser.
+    fn open_link(&mut self, url: String, context: Context) -> Result<()> {
+        let config = Config::load()?;
+        if let Some((plugin, action)) = plugins::link_handler(&config, &self.socket, &url) {
+            let context = Context {
+                link: Some(url),
+                ..context
+            };
+            return self.run_plugin(&plugin, &action, context);
+        }
+        let said = links::open(&url)?;
+        self.app.notify(said);
+        Ok(())
     }
 
     /// Hands the mouse to the program in the pane that has the keyboard,
@@ -627,7 +1061,7 @@ impl Tui {
                 purpose,
             } => {
                 let cwd = self.start_dir(place)?;
-                let name = client::new_session_for(&self.socket, None, cwd, command, purpose)?;
+                let name = client::new_session_for(&self.socket, None, cwd, command, purpose)?.name;
                 self.show_new_session(&name)?;
                 self.keep_memory();
             }
@@ -637,7 +1071,7 @@ impl Tui {
                 backlog,
             } => {
                 let cwd = self.start_dir(place)?;
-                let name = client::new_task(&self.socket, None, cwd, spec, backlog)?;
+                let name = client::new_task(&self.socket, None, cwd, spec, backlog)?.name;
                 // A background task takes no keys: the sidebar keeps them.
                 self.refresh_sessions()?;
                 self.app.select(&name);
@@ -675,6 +1109,14 @@ impl Tui {
                 client::close_task(&self.socket, &name, failed, &summary)?;
                 self.refresh_sessions()?;
             }
+            Action::Answer { name, answer } => {
+                drive::answer(&self.socket, &name, answer, None)?;
+                self.refresh_sessions()?;
+            }
+            Action::Interrupt(name) => {
+                drive::interrupt(&self.socket, &name)?;
+                self.refresh_sessions()?;
+            }
             Action::ListBacklog(dir) => self.list_backlog(dir),
             Action::ChangeBacklog { dir, change } => {
                 let request = match change {
@@ -710,6 +1152,16 @@ impl Tui {
                     Event::DiffRead { dir, against, read }
                 });
             }
+            Action::KeepReviewed { scope, marks } => {
+                let mut kept = self.review();
+                kept.set_marks(scope, marks);
+                self.keep_review(&kept)?;
+            }
+            Action::KeepTree(on) => {
+                let mut kept = self.review();
+                kept.tree = on;
+                self.keep_review(&kept)?;
+            }
             Action::ReadFiles(dir) => {
                 self.read_in_background(move || {
                     let files = finder::read_files(&dir);
@@ -718,9 +1170,13 @@ impl Tui {
             }
             Action::ReadPreview { dir, path } => {
                 self.read_in_background(move || {
-                    let lines = finder::read_preview(&dir, &path);
-                    Event::PreviewRead { dir, path, lines }
+                    let read = preview::read(&dir, &path);
+                    Event::PreviewRead { dir, path, read }
                 });
+            }
+            Action::CopyPath(path) => {
+                clipboard::copy(&path).context("couldn't copy")?;
+                self.app.notify(format!("copied {path}"));
             }
             Action::ReadMemory(dir) => {
                 let socket = self.socket.clone();
@@ -734,10 +1190,19 @@ impl Tui {
                 self.read_in_background(move || {
                     let project = memory::project_of(&dir);
                     match memory::remove(&socket, &project, id) {
-                        Ok(_) => Event::MemoryRead {
-                            read: read_memory(&socket, &dir),
-                            dir,
-                        },
+                        Ok(entry) => {
+                            let forgotten = events::Event::memory(
+                                events::Kind::MemoryForgotten,
+                                project,
+                                entry,
+                            );
+                            // The entry is gone either way.
+                            let _ = client::tell(&socket, forgotten);
+                            Event::MemoryRead {
+                                read: read_memory(&socket, &dir),
+                                dir,
+                            }
+                        }
                         Err(err) => Event::Notice(format!("{err:#}")),
                     }
                 });
@@ -752,9 +1217,33 @@ impl Tui {
                     Err(err) => Event::Notice(format!("{err:#}")),
                 });
             }
-            Action::Edit { dir, path, name } => {
-                let mut command = editor()?;
-                command.push(path);
+            Action::ListBranches(dir) => {
+                self.read_in_background(move || {
+                    let listed = switcher::read(&dir);
+                    Event::BranchesListed { dir, listed }
+                });
+            }
+            Action::SwitchBranch { dir, target, carry } => {
+                // git can take a while, over a commit's hooks say.
+                self.read_in_background(move || {
+                    let outcome = git::branches::switch(&dir, &target, &carry);
+                    Event::BranchSwitched { dir, outcome }
+                });
+            }
+            Action::Grep { dir, query } => self.search(dir, query),
+            Action::ReadMatchedFile { dir, path } => {
+                self.read_in_background(move || {
+                    let lines = grep::read_file(&dir, &path);
+                    Event::MatchedFileRead { dir, path, lines }
+                });
+            }
+            Action::Edit {
+                dir,
+                path,
+                line,
+                name,
+            } => {
+                let command = editor_at(editor()?, path, line);
                 self.start_session(Some(name), dir, command)?;
             }
             Action::EditHistory { slot, dir, name } => {
@@ -805,7 +1294,8 @@ impl Tui {
             }
             Action::SwitchPlugin { name, on } => {
                 let path = config::path();
-                let switched = plugins::set_enabled(&path, &self.socket, &name, on)
+                let switched = can_switch(&name, on)
+                    .and_then(|()| plugins::set_enabled(&path, &self.socket, &name, on))
                     .and_then(|()| Config::load());
                 match switched {
                     Ok(config) => self.plugins_changed(&config),
@@ -861,6 +1351,18 @@ impl Tui {
                 };
                 self.keep_layouts(&kept)?;
                 self.app.restore_layout(tabs, &name);
+            }
+            Action::FollowEvents => self.follow_events(),
+            Action::StopFollowing => {
+                self.feed.fetch_add(1, Ordering::Relaxed);
+            }
+            Action::ReadOlderEvents(before) => {
+                let feed = self.feed.load(Ordering::Relaxed);
+                let socket = self.socket.clone();
+                self.read_in_background(move || Event::EventsRead {
+                    feed,
+                    read: read_events(&socket, Some(before)),
+                });
             }
             Action::RemoveLayout(which) => {
                 let mut kept = self.layouts().map_err(anyhow::Error::msg)?;
@@ -960,6 +1462,11 @@ impl Tui {
                         self.app.stop_copying();
                         self.copy_to_clipboard(&text)?;
                     }
+                    copy_mode::Outcome::Open(url) => {
+                        self.app.stop_copying();
+                        let context = self.app.link_context(slot);
+                        self.open_link(url, context)?;
+                    }
                 }
             }
             Action::CopyPaste { slot, text } => {
@@ -985,21 +1492,59 @@ impl Tui {
                     self.copy_to_clipboard(&text)?;
                 }
             }
-            Action::OpenPullRequest { project, number } => {
-                // gh goes over the network: off the loop, saying only what
-                // went wrong.
+            Action::OpenInBrowser { project, topic } => {
+                // The forge's CLI goes over the network: off the loop,
+                // saying only what went wrong.
                 let events = self.events.clone();
                 thread::spawn(move || {
-                    if let Err(reason) = github::open_pull_request(&project, number) {
+                    let opened = Repo::find(&project).and_then(|repo| repo.open(topic));
+                    if let Err(reason) = opened {
                         let _ = events.send(Event::Notice(reason));
                     }
                 });
             }
             Action::ListIssues(project) => {
-                let events = self.events.clone();
-                thread::spawn(move || {
-                    let found = github::issues(&project);
-                    let _ = events.send(Event::Issues { project, found });
+                self.read_in_background(move || {
+                    let found =
+                        Repo::find(&project).and_then(|repo| Ok((repo.forge, repo.issues()?)));
+                    Event::Issues { project, found }
+                });
+            }
+            Action::ListPullRequests(project) => {
+                self.read_in_background(move || {
+                    let found = list_pull_requests(&project);
+                    Event::PullRequests { project, found }
+                });
+            }
+            Action::Comment {
+                project,
+                topic,
+                text,
+            } => {
+                self.read_in_background(move || {
+                    let posted = Repo::find(&project).and_then(|repo| repo.comment(topic, &text));
+                    Event::Commented {
+                        project,
+                        topic,
+                        posted,
+                    }
+                });
+            }
+            Action::EditIssue {
+                project,
+                number,
+                title,
+                body,
+            } => {
+                self.read_in_background(move || {
+                    let saved = Repo::find(&project)
+                        .and_then(|repo| repo.edit_issue(number, &title, &body));
+                    Event::IssueEdited {
+                        project,
+                        number,
+                        edit: (title, body),
+                        saved,
+                    }
                 });
             }
         }
@@ -1096,9 +1641,8 @@ impl Tui {
         plugins::ensure_enabled(&Config::load()?, plugin)?;
         let (dir, manifest) = installed_plugin(plugin)?;
         let action = manifest
-            .actions
-            .into_iter()
-            .find(|candidate| candidate.id == action)
+            .action(action)
+            .cloned()
             .with_context(|| format!("{plugin} has no action {action}"))?;
         let context = placed(context)?;
         plugins::log(
@@ -1107,7 +1651,7 @@ impl Tui {
             &format!("{}: {}", action.id, action.command.join(" ")),
         );
         let log = plugins::open_log(&self.socket, plugin)?;
-        let mut child = plugins::command(&dir, &action.command, &self.socket, &context)
+        let mut child = plugins::command(plugin, &dir, &action.command, &self.socket, &context)
             .stdin(Stdio::null())
             .stdout(log.try_clone()?)
             .stderr(log)
@@ -1138,8 +1682,9 @@ impl Tui {
             .find(|candidate| candidate.id == pane)
             .with_context(|| format!("{plugin} has no pane {pane}"))?;
         let context = placed(context)?;
+        plugins::make_state_dir(&self.socket, plugin);
         let mut env = env::current();
-        for (key, said) in plugins::env(&self.socket, &context) {
+        for (key, said) in plugins::env(&self.socket, plugin, &context) {
             match said {
                 Some(value) => env.insert(key.to_string(), value),
                 None => env.remove(key),
@@ -1155,7 +1700,8 @@ impl Tui {
             task: None,
             backlog: None,
         });
-        let Some(Response::Created { name }) = client::ask(&self.socket, &request, true)? else {
+        let Some(Response::Created { name, .. }) = client::ask(&self.socket, &request, true)?
+        else {
             bail!("the daemon didn't start {plugin}'s pane");
         };
         let areas = ui::Areas::of(&self.app, self.screen);
@@ -1171,6 +1717,36 @@ impl Tui {
             session: name,
         });
         self.refresh_sessions()
+    }
+
+    /// Attaches again to the sessions whose panes' output ended while they
+    /// run on, as `sessions` says: a daemon handed over to a new crystal
+    /// hangs up on every attach. A plugin's pane closes as its program
+    /// ends.
+    fn attach_again(&mut self, sessions: &[SessionInfo]) {
+        let running = |id: &str| {
+            sessions
+                .iter()
+                .any(|session| session.id == id && session.state == State::Running)
+        };
+        // Dropped, each attaches again as it's drawn.
+        self.panes
+            .retain(|pane| !pane.ended || !running(&pane.session_id));
+        let Some(overlay) = self.overlay.as_ref().filter(|overlay| overlay.ended) else {
+            return;
+        };
+        let (rows, cols) = overlay.size();
+        let name = self.app.plugin_pane().map(|pane| pane.session.clone());
+        let Some(name) = name.filter(|_| running(&overlay.session_id)) else {
+            self.close_plugin_pane();
+            return;
+        };
+        self.last_pane_id += 1;
+        let (id, events) = (self.last_pane_id, self.events.clone());
+        match Pane::open(&self.socket, &name, rows, cols, id, events) {
+            Ok(pane) => self.overlay = Some(pane),
+            Err(_) => self.close_plugin_pane(),
+        }
     }
 
     /// Closes the plugin's pane that's open, and ends its session, which
@@ -1196,6 +1772,25 @@ impl Tui {
             let found =
                 client::backlog(&socket, dir.clone(), true).map_err(|err| format!("{err:#}"));
             Event::Backlog { dir, found }
+        });
+    }
+
+    /// Searches the worktree at `dir` for `query` on a thread of its own, a
+    /// moment after it's asked for, unless another search has been asked for
+    /// by then: that one is what's wanted, and this one stops.
+    fn search(&self, dir: PathBuf, query: String) {
+        let this = self.searches.fetch_add(1, Ordering::Relaxed) + 1;
+        let latest = self.searches.clone();
+        let events = self.events.clone();
+        thread::spawn(move || {
+            thread::sleep(GREP_PAUSE);
+            let stale = || latest.load(Ordering::Relaxed) != this;
+            if stale() {
+                return;
+            }
+            if let Some(found) = grep::search(&dir, &query, &stale) {
+                let _ = events.send(Event::Searched { dir, query, found });
+            }
         });
     }
 
@@ -1307,10 +1902,13 @@ fn listed_plugins(config: &Config, socket: &Path) -> Vec<plugins_view::Listed> {
         trouble: None,
         actions: Vec::new(),
         panes: Vec::new(),
+        links: Vec::new(),
     });
     let installed = plugins::installed().into_iter().map(|plugin| {
         let on = plugins::enabled(config, &plugin.name);
         let paused = plugins::paused(socket, &plugin.name).filter(|_| on);
+        let paused = paused.map(|_| "paused after failing: space off and on again".to_string());
+        let trouble = plugin.blocked().or(paused);
         let item = |id: &str, title: &str, key: Option<&String>| plugins_view::Item {
             id: id.to_string(),
             title: title.to_string(),
@@ -1319,16 +1917,24 @@ fn listed_plugins(config: &Config, socket: &Path) -> Vec<plugins_view::Listed> {
         match plugin.manifest {
             Ok(manifest) => plugins_view::Listed {
                 name: plugin.name,
-                description: manifest.description,
                 built_in: false,
                 on,
-                trouble: paused.map(|_| "paused after failing: space off and on again".to_string()),
+                trouble,
                 actions: (manifest.actions.iter())
                     .map(|action| item(&action.id, &action.title, action.key.as_ref()))
                     .collect(),
                 panes: (manifest.panes.iter())
                     .map(|pane| item(&pane.id, &pane.title, None))
                     .collect(),
+                links: (manifest.link_handlers.iter())
+                    .map(|handler| plugins_view::LinkItem {
+                        pattern: handler.pattern.clone(),
+                        action: manifest
+                            .action(&handler.action)
+                            .map_or(handler.action.clone(), |action| action.title.clone()),
+                    })
+                    .collect(),
+                description: manifest.description,
             },
             Err(why) => plugins_view::Listed {
                 name: plugin.name,
@@ -1338,6 +1944,7 @@ fn listed_plugins(config: &Config, socket: &Path) -> Vec<plugins_view::Listed> {
                 trouble: Some(why),
                 actions: Vec::new(),
                 panes: Vec::new(),
+                links: Vec::new(),
             },
         }
     });
@@ -1345,14 +1952,14 @@ fn listed_plugins(config: &Config, socket: &Path) -> Vec<plugins_view::Listed> {
 }
 
 /// The sidebar keys taken by the actions of the installed plugins that are
-/// on. Installing or switching on a plugin refuses a key another has, so
-/// where two plugins' files were changed to share one, the first by name
-/// keeps it.
+/// on and can run here. Installing or switching on a plugin refuses a key
+/// another has, so where two plugins' files were changed to share one, the
+/// first by name keeps it.
 fn plugin_keys(config: &Config) -> Vec<PluginKey> {
     let mut keys: Vec<PluginKey> = Vec::new();
     let on = plugins::installed()
         .into_iter()
-        .filter(|plugin| plugins::enabled(config, &plugin.name));
+        .filter(|plugin| plugins::enabled(config, &plugin.name) && plugin.blocked().is_none());
     for plugin in on {
         let Ok(manifest) = plugin.manifest else {
             continue;
@@ -1374,13 +1981,30 @@ fn plugin_keys(config: &Config) -> Vec<PluginKey> {
     keys
 }
 
-/// The installed plugin called `name`: its directory and manifest.
+/// The installed plugin called `name`, when it can run here: its
+/// directory and manifest.
 fn installed_plugin(name: &str) -> Result<(PathBuf, crate::plugin_manifest::Manifest)> {
     let plugin = plugins::find(name).with_context(|| format!("there's no plugin called {name}"))?;
+    if let Some(why) = plugin.blocked() {
+        bail!("{name} can't run: {why}");
+    }
     let manifest = plugin
         .manifest
         .map_err(|why| anyhow::anyhow!("{name}'s plugin.toml: {why}"))?;
     Ok((plugin.dir, manifest))
+}
+
+/// Refuses to switch on the plugin called `name`, saying why, when it
+/// can't run here or wants another's key. Any can be switched off.
+fn can_switch(name: &str, on: bool) -> Result<()> {
+    if !on || plugins::is_built_in(name) {
+        return Ok(());
+    }
+    let installed = plugins::installed();
+    match installed.iter().find(|plugin| plugin.name == name) {
+        Some(plugin) => plugins::check_can_enable(plugin, &installed),
+        None => bail!("there's no plugin called {name}"),
+    }
 }
 
 /// `context`, or, with no session selected to say where, the TUI's own
@@ -1426,6 +2050,7 @@ fn directory_for(socket: &Path, place: Place) -> Result<PathBuf> {
                 client::add_worktree(socket, &base, &branch)
             }
         }
+        Place::PullRequest(checkout) => client::pull_request_worktree(socket, &checkout),
     }
 }
 
@@ -1522,6 +2147,29 @@ fn editor() -> Result<Vec<String>> {
     Ok(command)
 }
 
+/// The command that opens `path` in `editor` at `line`: `+12 path`, the way
+/// vi, Emacs, nano and most others take it, but for the editors that take
+/// `path:12`, and VS Code and those made from it, which want `--goto` too.
+fn editor_at(mut editor: Vec<String>, path: String, line: Option<usize>) -> Vec<String> {
+    let Some(line) = line else {
+        editor.push(path);
+        return editor;
+    };
+    let program = editor
+        .first()
+        .and_then(|program| Path::new(program).file_name())
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    match program.as_str() {
+        "code" | "code-insiders" | "codium" | "cursor" | "windsurf" => {
+            editor.extend(["--goto".to_string(), format!("{path}:{line}")]);
+        }
+        "hx" | "helix" | "zed" | "subl" => editor.push(format!("{path}:{line}")),
+        _ => editor.extend([format!("+{line}"), path]),
+    }
+    editor
+}
+
 fn seconds_since_epoch() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1534,6 +2182,13 @@ fn list_sessions(socket: &Path, start: bool) -> Result<Vec<SessionInfo>> {
         Some(Response::Sessions { sessions }) => Ok(sessions),
         _ => Ok(Vec::new()),
     }
+}
+
+/// A page of the event log of the daemon at `socket`, the newest first:
+/// its end, or from before the event numbered `before`.
+fn read_events(socket: &Path, before: Option<u64>) -> Result<Vec<events::Event>, String> {
+    let page = Db::open(socket).and_then(|db| db.events_before(before, timeline::PAGE));
+    page.map_err(|err| format!("{err:#}"))
 }
 
 /// Every flow run, or none when the daemon can't say.
@@ -1554,6 +2209,8 @@ fn spawn_input_reader(events: Sender<Event>) {
                 TerminalEvent::Mouse(mouse) => Event::Mouse(mouse),
                 TerminalEvent::Paste(text) => Event::Paste(text),
                 TerminalEvent::Resize(..) => Event::Resize,
+                TerminalEvent::FocusGained => Event::Focus(true),
+                TerminalEvent::FocusLost => Event::Focus(false),
                 _ => continue,
             };
             if events.send(event).is_err() {
@@ -1602,9 +2259,16 @@ fn spawn_worktree_lister(
     });
 }
 
-/// Asks GitHub about the open pull requests of each project the sessions
-/// are in, on a thread of its own, since gh can take seconds to answer: a
-/// project as soon as it's seen, and every one again each
+/// The pull requests open on the project at `project`, and the forge
+/// they're on.
+fn list_pull_requests(project: &Path) -> Result<(Forge, Vec<PullRequest>), String> {
+    let repo = Repo::find(project)?;
+    Ok((repo.forge, repo.pull_requests()?))
+}
+
+/// Asks their forge about the open pull requests of each project the
+/// sessions are in, on a thread of its own, since its CLI can take seconds
+/// to answer: a project as soon as it's seen, and every one again each
 /// [`PULL_REQUESTS_EVERY`].
 fn spawn_pull_request_poller(projects: Arc<Mutex<Vec<PathBuf>>>, events: Sender<Event>) {
     thread::spawn(move || {
@@ -1619,7 +2283,7 @@ fn spawn_pull_request_poller(projects: Arc<Mutex<Vec<PathBuf>>>, events: Sender<
                     continue;
                 }
                 asked.insert(project.clone(), Instant::now());
-                let found = github::pull_requests(&project);
+                let found = list_pull_requests(&project);
                 if events.send(Event::PullRequests { project, found }).is_err() {
                     return;
                 }
@@ -1648,6 +2312,8 @@ fn spawn_session_poller(socket: PathBuf, events: Sender<Event>, polled: Polled) 
         settings: poll_settings,
     } = polled;
     thread::spawn(move || {
+        // Why the list couldn't be had, last time, once it has been said.
+        let mut said = None;
         loop {
             thread::sleep(POLL_EVERY);
             if poll_flows.load(Ordering::Relaxed)
@@ -1662,10 +2328,31 @@ fn spawn_session_poller(socket: PathBuf, events: Sender<Event>, polled: Polled) 
             {
                 return;
             }
-            // A daemon that has gone away has no sessions left.
-            let sessions = list_sessions(&socket, false).unwrap_or_default();
+            // A daemon that has gone away has no sessions left. One that
+            // can't say, say because it's a newer crystal than this TUI,
+            // leaves the list as it was, and says why, once.
+            let sessions = match list_sessions(&socket, false) {
+                Ok(sessions) => sessions,
+                Err(err) => {
+                    let why = format!("{err:#}");
+                    if said.as_ref() != Some(&why)
+                        && events.send(Event::Notice(why.clone())).is_err()
+                    {
+                        return;
+                    }
+                    said = Some(why);
+                    continue;
+                }
+            };
+            said = None;
             let projects = projects_of(&sessions);
             if events.send(Event::Sessions(sessions)).is_err() {
+                return;
+            }
+            if let Ok(Some(Response::Spending(spending))) =
+                client::ask(&socket, &Request::Spending, false)
+                && events.send(Event::Spending(spending)).is_err()
+            {
                 return;
             }
             if count_backlog.load(Ordering::Relaxed)
@@ -1710,5 +2397,26 @@ fn backlog_counts(socket: &Path, projects: Vec<PathBuf>) -> Option<HashMap<PathB
     match client::ask(socket, &Request::BacklogCounts { projects }, false) {
         Ok(Some(Response::BacklogCounts { open })) => Some(open.into_iter().collect()),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn words(words: &[&str]) -> Vec<String> {
+        words.iter().map(|word| word.to_string()).collect()
+    }
+
+    #[test]
+    fn an_editor_is_told_the_line_the_way_it_takes_it() {
+        let at = |editor: &[&str], line| editor_at(words(editor), "src/a.rs".into(), line);
+        assert_eq!(at(&["nvim"], Some(12)), ["nvim", "+12", "src/a.rs"]);
+        assert_eq!(at(&["/usr/bin/vi"], None), ["/usr/bin/vi", "src/a.rs"]);
+        assert_eq!(at(&["hx"], Some(12)), ["hx", "src/a.rs:12"]);
+        assert_eq!(
+            at(&["code", "--wait"], Some(12)),
+            ["code", "--wait", "--goto", "src/a.rs:12"]
+        );
     }
 }

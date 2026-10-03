@@ -27,6 +27,12 @@ pub struct Config {
     /// started from it: an agent's program, like `codex`, maybe with
     /// arguments for it, like `codex --full-auto`.
     pub new_session: String,
+    /// Name a session crystal would name after its program from the first
+    /// thing it's asked instead: see [`crate::names::from_prompt`].
+    pub name_from_prompt: bool,
+    /// After a restart, start an agent that said how to resume it, with
+    /// `crystal report`, with that command: see [`crate::report`].
+    pub resume_reported_agents: bool,
     /// The TUI's colors.
     pub theme: ThemeName,
     /// Which plugins are on and off, by name: crystal's own, which are on
@@ -36,6 +42,12 @@ pub struct Config {
     pub plugins: BTreeMap<String, bool>,
     /// How the memory plugin learns: `[memory]` in the file.
     pub memory: MemorySettings,
+    /// What background tasks may spend: `[tasks]` in the file.
+    pub tasks: TaskSettings,
+    /// How long the event log keeps what happened: `[events]` in the file.
+    pub events: EventSettings,
+    /// Where worktrees' handoff notes go: `[handoff]` in the file.
+    pub handoff: HandoffSettings,
     /// Saved ways to start an agent, offered first in the new-session
     /// panel: `[[profile]]` tables in the file. See [`crate::profile`].
     #[serde(rename = "profile", skip_serializing_if = "Vec::is_empty")]
@@ -73,6 +85,52 @@ impl Default for MemorySettings {
     }
 }
 
+/// What background tasks may spend, in US dollars, by Claude's own count.
+/// 0 is no limit.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TaskSettings {
+    /// The most one task's `claude -p` may spend, as `--max-budget-usd`: a
+    /// run that reaches it fails.
+    pub max_budget_usd: f64,
+    /// The most every background task together may spend in a day: past
+    /// it, no new run starts until tomorrow.
+    pub daily_budget_usd: f64,
+}
+
+impl Default for TaskSettings {
+    fn default() -> TaskSettings {
+        TaskSettings {
+            max_budget_usd: 5.0,
+            daily_budget_usd: 0.0,
+        }
+    }
+}
+
+/// How long the event log keeps what happened: see [`crate::event_log`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct EventSettings {
+    /// How many days an event is kept; 0 keeps every one.
+    pub keep_days: u32,
+}
+
+impl Default for EventSettings {
+    fn default() -> EventSettings {
+        EventSettings { keep_days: 30 }
+    }
+}
+
+/// Where the handoff notes go: see [`crate::handoff`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct HandoffSettings {
+    /// The projects, by their main worktree's directory, whose notes are
+    /// kept in git with their branches, rather than kept out of it.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub in_git: Vec<PathBuf>,
+}
+
 /// The TUI's colors to choose from. `dark` and `light` paint their own
 /// background, so they look the same in any terminal; `terminal` paints
 /// nothing and keeps to the terminal's own colors.
@@ -90,9 +148,14 @@ impl Default for Config {
             notify: true,
             notify_command: None,
             new_session: "claude".to_string(),
+            name_from_prompt: true,
+            resume_reported_agents: true,
             theme: ThemeName::Dark,
             plugins: BTreeMap::new(),
             memory: MemorySettings::default(),
+            tasks: TaskSettings::default(),
+            events: EventSettings::default(),
+            handoff: HandoffSettings::default(),
             profiles: Vec::new(),
             flows: Vec::new(),
         }
@@ -261,7 +324,7 @@ pub fn from_text(text: &str) -> Result<Config> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::flows::Step;
+    use crate::flows::{Placement, Step};
     use crate::profile::StartIn;
 
     fn parse(text: &str) -> Result<Config> {
@@ -495,6 +558,24 @@ back_to = "build"
     }
 
     #[test]
+    fn background_tasks_have_a_budget_each_and_none_a_day_unless_given() {
+        let config = parse("").unwrap();
+        assert_eq!(config.tasks.max_budget_usd, 5.0);
+        assert_eq!(config.tasks.daily_budget_usd, 0.0);
+        let config = parse("[tasks]\ndaily_budget_usd = 10\n").unwrap();
+        assert_eq!(config.tasks.daily_budget_usd, 10.0);
+        assert!(parse("[tasks]\nbudget = 1\n").is_err());
+    }
+
+    #[test]
+    fn the_event_log_keeps_a_month_unless_told() {
+        assert_eq!(Config::default().events.keep_days, 30);
+        let config = parse("[events]\nkeep_days = 0\n").unwrap();
+        assert_eq!(config.events.keep_days, 0);
+        assert!(parse("[events]\nkeep = 3\n").is_err());
+    }
+
+    #[test]
     fn a_leftover_preset_says_its_now_a_profile() {
         let err = parse("[[preset]]\nname = \"x\"\nagent = \"claude\"\n").unwrap_err();
         assert!(
@@ -509,6 +590,8 @@ back_to = "build"
             notify: false,
             notify_command: Some("say \"$CRYSTAL_NOTICE\"".into()),
             new_session: "codex --model o3".into(),
+            name_from_prompt: false,
+            resume_reported_agents: false,
             theme: ThemeName::Terminal,
             plugins: BTreeMap::from([("memory".to_string(), false)]),
             memory: MemorySettings {
@@ -516,6 +599,14 @@ back_to = "build"
                 distill_model: "claude-sonnet-5-5".into(),
                 distill_budget_usd: 0.5,
                 embeddings: true,
+            },
+            tasks: TaskSettings {
+                max_budget_usd: 2.5,
+                daily_budget_usd: 20.0,
+            },
+            events: EventSettings { keep_days: 7 },
+            handoff: HandoffSettings {
+                in_git: vec![PathBuf::from("~/code/app")],
             },
             profiles: vec![Profile {
                 name: "review".into(),
@@ -537,17 +628,21 @@ back_to = "build"
                         name: "plan".into(),
                         profile: Some("review".into()),
                         prompt: "Plan {goal}".into(),
+                        placement: None,
                         worktree: false,
                         gate: true,
                         back_to: None,
+                        max_rounds: Some(2),
                     },
                     Step {
                         name: "build".into(),
                         profile: None,
                         prompt: "Build it:\n{previous}".into(),
-                        worktree: true,
+                        placement: Some(Placement::Fresh),
+                        worktree: false,
                         gate: false,
                         back_to: None,
+                        max_rounds: None,
                     },
                 ],
             }],

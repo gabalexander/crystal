@@ -13,6 +13,7 @@ use super::text_input::TextInput;
 use super::theme::Theme;
 use crate::catalog::{self, Agent, Choices, FirstPrompt, Setting};
 use crate::flows::Flow;
+use crate::forge::Checkout;
 use crate::profile::{Profile, StartIn};
 use crate::protocol::TaskSpec;
 use crate::{git, shell};
@@ -114,6 +115,14 @@ pub enum Target {
     },
     /// Another project's main worktree.
     Project { path: PathBuf, label: String },
+    /// A pull request's worktree, which `checkout` finds or makes. `label`
+    /// says where that is, like `app ⎇ fix-login`, and `choice` what it's
+    /// for, like `pull request #57`.
+    PullRequest {
+        checkout: Checkout,
+        label: String,
+        choice: String,
+    },
 }
 
 impl Target {
@@ -123,6 +132,7 @@ impl Target {
             Target::Here { .. } => "here".to_string(),
             Target::NewWorktree { .. } => "new worktree".to_string(),
             Target::Project { label, .. } => label.clone(),
+            Target::PullRequest { choice, .. } => choice.clone(),
         }
     }
 }
@@ -253,9 +263,15 @@ impl Launcher {
         launcher
     }
 
-    /// Starts out with `task` and a branch already named, as for an issue.
-    pub fn with_task(mut self, task: &str, branch: &str) -> Launcher {
+    /// Starts out with `task` already written, as for an issue.
+    pub fn with_task(mut self, task: &str) -> Launcher {
         self.task.set_text(task);
+        self
+    }
+
+    /// Starts out with a new worktree's branch named `branch`, rather than
+    /// a made-up name.
+    pub fn with_branch(mut self, branch: &str) -> Launcher {
         self.branch = TextInput::with_text(branch);
         self
     }
@@ -648,13 +664,16 @@ impl Launcher {
                 made_up: self.branch_name() == self.made_up,
             },
             Target::Project { path, .. } => Place::Directory(Some(path.clone())),
+            Target::PullRequest { checkout, .. } => Place::PullRequest(checkout.clone()),
         }
     }
 
     /// Where the session will start, the way the panel's title says it.
     pub fn title(&self) -> String {
         let place = match self.target() {
-            Target::Here { label, .. } | Target::Project { label, .. } => label.clone(),
+            Target::Here { label, .. }
+            | Target::Project { label, .. }
+            | Target::PullRequest { label, .. } => label.clone(),
             Target::NewWorktree { project, .. } => {
                 let project = project.as_deref().unwrap_or("this repository");
                 let branch = self.branch_name();
@@ -1192,7 +1211,8 @@ mod tests {
     #[test]
     fn a_panel_for_a_backlog_item_says_which_item_it_is_for() {
         let mut panel = launcher(vec![agent("claude")])
-            .with_task("write the docs", "3-write-the-docs")
+            .with_task("write the docs")
+            .with_branch("3-write-the-docs")
             .for_backlog_item(3);
         let Outcome::Start { backlog, task, .. } = press(&mut panel, KeyCode::Enter) else {
             panic!("didn't start");
