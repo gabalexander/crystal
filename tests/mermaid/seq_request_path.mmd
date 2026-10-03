@@ -1,0 +1,13 @@
+sequenceDiagram
+    autonumber
+    actor User
+    participant TUI as docket TUI
+    participant D as daemon
+    participant DB as SQLite
+    User->>TUI: presses n
+    TUI->>+D: ClientRequest::CreateAgent
+    D->>DB: INSERT agents
+    DB-->>D: row id
+    D-)TUI: AgentCreated
+    D-->>-TUI: Ack
+    Note over TUI,D: the ack carries the req_id

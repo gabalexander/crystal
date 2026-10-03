@@ -10,10 +10,12 @@
 
 use super::app::{Action, Hit, Outcome};
 use super::diff_view::pieces;
+use super::preview;
 use super::sidebar::fit;
 use super::text_input::TextInput;
 use super::ui::{self, Look, ViewAreas};
 use crate::git::{self, Found};
+use crate::syntax::Runs;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -46,18 +48,15 @@ pub fn search(dir: &Path, query: &str, stale: &dyn Fn() -> bool) -> Option<Resul
     }
 }
 
-/// The lines of the file at `path` in the worktree at `dir`, for the
-/// preview: run off the event loop.
-pub fn read_file(dir: &Path, path: &str) -> Result<Vec<String>, String> {
+/// The lines of the file at `path` in the worktree at `dir`, highlighted,
+/// for the preview: run off the event loop.
+pub fn read_file(dir: &Path, path: &str) -> Result<Vec<Runs>, String> {
     let file = std::fs::File::open(dir.join(path)).map_err(|err| err.to_string())?;
     let mut text = Vec::new();
     file.take(FILE_BYTES)
         .read_to_end(&mut text)
         .map_err(|err| err.to_string())?;
-    Ok(String::from_utf8_lossy(&text)
-        .lines()
-        .map(|line| line.replace('\t', "    "))
-        .collect())
+    Ok(preview::highlight(path, &String::from_utf8_lossy(&text)).collect())
 }
 
 pub struct Grep {
@@ -79,10 +78,10 @@ pub struct Grep {
     rows: u16,
 }
 
-/// A file's lines, or why there are none.
+/// A file's lines, highlighted, or why there are none.
 pub struct FileText {
     pub path: String,
-    pub lines: Result<Vec<String>, String>,
+    pub lines: Result<Vec<Runs>, String>,
 }
 
 /// A row of the list: a file, with how many lines were found in it, or one
@@ -141,7 +140,7 @@ impl Grep {
     }
 
     /// Takes a file's lines, if it's still the selected hit's.
-    pub fn file_read(&mut self, dir: &Path, path: &str, lines: Result<Vec<String>, String>) {
+    pub fn file_read(&mut self, dir: &Path, path: &str, lines: Result<Vec<Runs>, String>) {
         let wanted = self.selected_hit().map(|hit| hit.path.as_str());
         if dir == self.dir && wanted == Some(path) {
             self.file = Some(FileText {
@@ -476,7 +475,8 @@ fn found_spans<'a>(text: &str, query: &str, look: &Look) -> Vec<Span<'a>> {
 }
 
 /// The selected hit's file around its line: the path and line number,
-/// then the lines, numbered, the hit's a third of the way down.
+/// then the lines, numbered and highlighted, the hit's a third of the way
+/// down, with what was found in it marked.
 fn draw_preview(frame: &mut Frame, grep: &Grep, look: &Look, area: Rect) {
     let theme = look.theme;
     let Some(hit) = grep.selected_hit() else {
@@ -514,7 +514,7 @@ fn draw_preview(frame: &mut Frame, grep: &Grep, look: &Look, area: Rect) {
         .enumerate()
         .skip(first)
         .take(body.height.into());
-    for (row, (index, text)) in shown.enumerate() {
+    for (row, (index, runs)) in shown.enumerate() {
         let line_area = Rect::new(body.x, body.y + row as u16, body.width, 1);
         let number = Span::styled(
             format!(" {:>numbers$}  ", index + 1),
@@ -523,9 +523,10 @@ fn draw_preview(frame: &mut Frame, grep: &Grep, look: &Look, area: Rect) {
         let mut spans = vec![number];
         if index + 1 == hit.line {
             frame.buffer_mut().set_style(line_area, theme.selection);
-            spans.extend(found_spans(text, grep.query.text(), look));
+            let text: String = runs.iter().map(|(_, text)| text.as_str()).collect();
+            spans.extend(found_spans(&text, grep.query.text(), look));
         } else {
-            spans.push(Span::styled(text.clone(), Style::new().fg(theme.text)));
+            spans.extend(preview::runs_spans(runs, look));
         }
         frame.render_widget(Line::from(spans), line_area);
     }
@@ -534,6 +535,7 @@ fn draw_preview(frame: &mut Frame, grep: &Grep, look: &Look, area: Rect) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::syntax::TokenKind;
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -628,7 +630,8 @@ mod tests {
     #[test]
     fn a_hit_in_the_file_already_read_needs_no_reading() {
         let mut grep = grep_with(vec![hit("a.rs", 1), hit("a.rs", 9)]);
-        grep.file_read(Path::new("/code/app"), "a.rs", Ok(vec!["needle".into()]));
+        let line = vec![(TokenKind::Text, "needle".to_string())];
+        grep.file_read(Path::new("/code/app"), "a.rs", Ok(vec![line]));
         assert_eq!(grep.on_key(key(KeyCode::Down)), Outcome::Stay);
         assert!(grep.file.is_some());
     }
@@ -643,10 +646,18 @@ mod tests {
     }
 
     #[test]
-    fn a_files_lines_are_read_with_tabs_as_spaces() {
+    fn a_files_lines_are_read_highlighted_with_tabs_as_spaces() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("a.rs"), "one\n\ttwo\n").unwrap();
-        assert_eq!(read_file(dir.path(), "a.rs").unwrap(), ["one", "    two"]);
+        std::fs::write(dir.path().join("a.rs"), "one\n\tfn\n").unwrap();
+        let read = read_file(dir.path(), "a.rs").unwrap();
+        assert_eq!(read[0], [(TokenKind::Text, "one".to_string())]);
+        assert_eq!(
+            read[1],
+            [
+                (TokenKind::Text, "    ".to_string()),
+                (TokenKind::Keyword, "fn".to_string())
+            ]
+        );
         assert!(read_file(dir.path(), "gone.rs").is_err());
     }
 }

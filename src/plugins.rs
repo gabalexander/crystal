@@ -63,7 +63,7 @@ pub const BUILT_IN: &[BuiltIn] = &[
 
 /// The sidebar keys crystal uses itself, which a plugin's action can't
 /// take.
-pub const RESERVED_KEYS: &str = "jksnwWrxudpGBmPcbqoOiXgf?/tT&[]123456789>zveHJKLRFS,yY|-";
+pub const RESERVED_KEYS: &str = "jksnwWrxudpGBEmPcbqoOiXgf?/tT&[]123456789>zveHJKLRFS,yY|-";
 
 pub fn is_built_in(name: &str) -> bool {
     BUILT_IN.iter().any(|plugin| plugin.name == name)

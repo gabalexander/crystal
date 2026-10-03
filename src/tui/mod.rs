@@ -28,6 +28,7 @@ mod memory_view;
 mod mouse;
 mod pane;
 mod plugins_view;
+mod preview;
 mod profiles;
 mod pull_requests;
 mod review;
@@ -42,6 +43,7 @@ mod tabs;
 mod text_area;
 mod text_input;
 mod theme;
+mod tree_browser;
 mod ui;
 
 use crate::config::{self, Config};
@@ -182,16 +184,16 @@ pub enum Event {
         against: Against,
         read: Result<diff_view::Read, String>,
     },
-    /// A worktree's files, listed for the file finder.
+    /// A worktree's files, listed for the file finder or the tree browser.
     FilesRead {
         dir: PathBuf,
         files: Result<Vec<String>, String>,
     },
-    /// The first lines of a file, for the file finder's preview.
+    /// A file read and highlighted for a preview.
     PreviewRead {
         dir: PathBuf,
         path: String,
-        lines: Result<Vec<String>, String>,
+        read: Result<preview::Content, String>,
     },
     /// A worktree's branches and changes, listed for the branch switcher.
     BranchesListed {
@@ -209,11 +211,11 @@ pub enum Event {
         query: String,
         found: Result<git::Found, String>,
     },
-    /// A file's lines, for find in files' preview.
+    /// A file's lines, highlighted, for find in files' preview.
     MatchedFileRead {
         dir: PathBuf,
         path: String,
-        lines: Result<Vec<String>, String>,
+        lines: Result<Vec<crate::syntax::Runs>, String>,
     },
     /// A project's memory, read for the memory view.
     MemoryRead {
@@ -648,7 +650,7 @@ impl Tui {
                     self.carry_out(action);
                 }
             }
-            Event::PreviewRead { dir, path, lines } => self.app.preview_read(&dir, &path, lines),
+            Event::PreviewRead { dir, path, read } => self.app.preview_read(&dir, &path, read),
             Event::BranchesListed { dir, listed } => self.app.branches_listed(&dir, listed),
             Event::BranchSwitched { dir, outcome } => {
                 if let Some(action) = self.app.branch_switched(&dir, outcome) {
@@ -888,9 +890,13 @@ impl Tui {
             }
             Action::ReadPreview { dir, path } => {
                 self.read_in_background(move || {
-                    let lines = finder::read_preview(&dir, &path);
-                    Event::PreviewRead { dir, path, lines }
+                    let read = preview::read(&dir, &path);
+                    Event::PreviewRead { dir, path, read }
                 });
+            }
+            Action::CopyPath(path) => {
+                clipboard::copy(&path).context("couldn't copy")?;
+                self.app.notify(format!("copied {path}"));
             }
             Action::ReadMemory(dir) => {
                 let socket = self.socket.clone();

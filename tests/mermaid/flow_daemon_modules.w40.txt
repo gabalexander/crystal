@@ -1,0 +1,2 @@
+unsupported · width 40
+needs 41 columns even with its labels cut short; 40 available

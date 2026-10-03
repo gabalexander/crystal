@@ -117,7 +117,8 @@ and the footer says where you are and offers the keys that matter there.
 | `g` | on a step of a [flow](#flows): go on past its gate, or run a step that failed or was cut short again |
 | `f` | on a step of a flow waiting at its gate: send it back, with notes on what to do differently |
 | `d` | show what changed in the selected session's worktree: [the diff](#the-diff) |
-| `p` | find a file in the selected session's worktree and edit it: [the file finder](#the-file-finder) |
+| `p` | find a file in the selected session's worktree and edit it: [the file finder](#the-file-finder-and-the-tree-browser) |
+| `E` | browse the selected session's worktree as a tree of its files, each previewed beside it: [the tree browser](#the-file-finder-and-the-tree-browser) |
 | `G` | search the files of the selected session's worktree as you type, and edit one where it's found: [find in files](#find-in-files) |
 | `B` | move the selected session's worktree onto another branch, or a new one: [the branch switcher](#the-branch-switcher) |
 | `m` | what the selected session's project has remembered: [memory](#memory) |
@@ -269,6 +270,7 @@ crystal config                              # where the config file is, and the 
 crystal profile                             # list your agent profiles
 crystal profile show review                 # what a profile runs, and where it starts
 crystal skill --install                     # teach Claude Code to drive crystal (see below)
+crystal mermaid docs/flow.md                # draw a page's mermaid diagrams as text (see below)
 crystal ssh box                             # crystal's TUI on another machine (see below)
 ```
 
@@ -539,13 +541,61 @@ show only `draft`; reading one shows its pipeline as its check, and an approval 
 a login to read comments, even on a project anyone can see: logged out, a merge request or an issue reads
 without them.
 
-### The file finder
+### The file finder and the tree browser
 
 `p` finds a file in the selected session's worktree, like an editor's quick open: type a few letters of its path,
-in order (`rfnd` finds `src/billing/refund.rs`), and the best matches come first, with the start of the
-selected one beside the list. Letters in a file's name, at the start of a word, or next to each other count for
+in order (`rfnd` finds `src/billing/refund.rs`), and the best matches come first, with the selected one
+previewed beside the list. Letters in a file's name, at the start of a word, or next to each other count for
 more. `↑` / `↓` pick another, `Enter` opens it in your `$EDITOR` (or `vi`) as a session of its own in that
 worktree, named after the file, and `Esc` closes the finder. Files git ignores aren't listed.
+
+`E` shows the same files as a tree: directories first, each folded until `→` opens it, and the selected file
+previewed on the right. Whatever you type filters the tree, as the finder matches, down to the files whose
+paths match and the directories they're in, all open, with the best match selected. Drag the line between the
+tree and the preview to make the tree wider or narrower.
+
+| Key | In the tree browser |
+|---|---|
+| `↑` / `↓` | the file or directory above or below |
+| `→` / `←` | open a directory, or go into one that's open; fold it, or go up to the directory a file is in |
+| `Enter` | open or fold a directory; read a file into the preview again, with whatever an agent changed since |
+| `Space` / `Shift+Space`, `PageDown` / `PageUp` | page through the preview |
+| `Home` / `End`, `Shift+↑` / `Shift+↓` | the top or end of the preview; a line up or down |
+| `Ctrl+E` | open the file in your `$EDITOR`, the way the finder's `Enter` does |
+| `Ctrl+Y` | copy the path, from the top of the worktree |
+| `Ctrl+R` | a markdown file's source, or its page again |
+| `Esc` | clear what's typed; then close |
+
+The wheel scrolls the preview, and moves through the tree over it.
+
+Both preview a file highlighted, with its lines numbered: comments, strings, numbers and keywords, in Rust,
+JavaScript and TypeScript, Python, Go, C and C++, Java, Kotlin and Swift, Ruby, shell, SQL, TOML, YAML, JSON,
+CSS and Dockerfiles. A binary file says so; of a long one, the first megabyte or 10,000 lines are shown.
+
+A markdown file shows as the page it makes: headings, lists, emphasis, quotes and GitHub's alerts, tables in
+aligned columns, links with their address beside them, and fenced code highlighted. `Ctrl+R`, in the finder
+too, flips it to its source and back, and that holds from one file to the next. A ```` ```mermaid ```` fence is
+drawn as the diagram, in boxes and arrows, with a caption under it saying what kind: sequence diagrams,
+flowcharts, and state, class and ER diagrams. Any other kind, or one too wide for the preview, stays its source,
+and the caption says why. What Claude says in a [background task](#background-tasks)'s transcript is a page in
+the same way.
+
+`crystal mermaid` draws a diagram on the command line the same way, from a file or standard input: a diagram, or
+each mermaid fence of a markdown file, as wide as the terminal (`--width` gives another width) and in box drawing
+(`--ascii` in ASCII). One that can't be drawn is printed as it is, and the command fails saying why, so an agent
+can check a diagram before it writes it into a page.
+
+```
+$ printf 'sequenceDiagram\n  Alice->>Bob: hello\n  Bob-->>Alice: hi\n' | crystal mermaid
+┌───────┐  ┌─────┐
+│ Alice │  │ Bob │
+└───┬───┘  └──┬──┘
+    │  hello  │
+    ├────────▶│
+    │   hi    │
+    │◀┄┄┄┄┄┄┄┄┤
+    │         │
+```
 
 ### Find in files
 
@@ -772,8 +822,9 @@ never installs anything unless you pass `--install`. `CRYSTAL_SSH` names a comma
 
 A task is Claude Code without a terminal: `claude -p`, running a prompt in the background. It sits in the
 session list like any session, with a transcript you can watch in the TUI, attach to, or `read`: the prompt,
-what Claude says, each tool it uses with the first line of what came back, the permissions it asks for and
-how you answered, and how each run ended, with how long it took and what it cost.
+what Claude says, laid out as [markdown](#the-file-finder-and-the-tree-browser), each tool it uses with the first
+line of what came back, the permissions it asks for and how you answered, and how each run ended, with how long
+it took and what it cost.
 
 ```sh
 crystal task -n docs "Update the README for the new flags"           # prints the task's name

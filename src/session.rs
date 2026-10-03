@@ -915,6 +915,11 @@ impl Term {
         self.screen.lock().unwrap().vt.bracketed_paste()
     }
 
+    /// How many columns wide the screen is.
+    pub fn columns(&self) -> u16 {
+        self.screen.lock().unwrap().vt.size().1
+    }
+
     /// What's on the screen, one string per row, after the rows of the
     /// history with `with_history`.
     pub fn rows(&self, with_history: bool) -> Vec<String> {

@@ -27,6 +27,7 @@ use super::status::Status;
 use super::switcher;
 use super::tabs::Tab;
 use super::theme::Theme;
+use super::tree_browser;
 use crate::flow_run::RunState;
 use crate::protocol::{SessionInfo, State, TaskState};
 use crate::shell;
@@ -174,6 +175,7 @@ pub fn view_areas(view: &View, area: Rect) -> ViewAreas {
     let list_width = match view {
         View::Diff(_) => diff_view::list_width(area.width),
         View::Files(_) => finder::list_width(area.width),
+        View::Tree(tree) => tree.list_width(area.width),
         View::Grep(_) => grep::list_width(area.width),
         View::Branches(_) => switcher::list_width(area.width),
         View::Memory(_) => memory_view::list_width(area.width),
@@ -275,10 +277,17 @@ pub fn hit(areas: &Areas, app: &App, column: u16, row: u16) -> Hit {
     let at = |area: Rect| area.contains((column, row).into());
     if let Some(view) = app.view() {
         let parts = view_areas(view, areas.main);
+        // The tree browser's border is the mouse's while it's dragged.
+        if let View::Tree(tree) = view
+            && (tree.dragging || at(parts.rule))
+        {
+            return Hit::ViewBorder(column.saturating_sub(areas.main.x));
+        }
         if at(parts.list) {
             return match view {
                 View::Diff(diff) => diff_view::list_hit(diff, parts.list, row),
                 View::Files(finder) => finder::list_hit(finder, parts.list, row),
+                View::Tree(tree) => tree_browser::list_hit(tree, parts.list, row),
                 View::Grep(grep) => grep::list_hit(grep, parts.list, row),
                 View::Branches(switcher) => switcher::list_hit(switcher, parts.list, row),
                 View::Memory(memory) => memory_view::list_hit(memory, parts.list, row),
@@ -371,6 +380,7 @@ pub fn draw(frame: &mut Frame, app: &App, panes: &[Pane], overlay: Option<&Pane>
         match view {
             View::Diff(diff) => diff_view::draw(frame, diff, look, &parts),
             View::Files(files) => finder::draw(frame, files, look, &parts),
+            View::Tree(tree) => tree_browser::draw(frame, tree, look, &parts),
             View::Grep(grep) => grep::draw(frame, grep, look, &parts),
             View::Branches(switcher) => switcher::draw(frame, switcher, look, &parts),
             View::Memory(memory) => memory_view::draw(frame, memory, look, &parts),
@@ -1035,7 +1045,8 @@ fn draw_view_footer(frame: &mut Frame, app: &App, view: &View, look: &Look, area
     };
     let hints = match view {
         View::Diff(diff) => owned(diff_view::hints(diff)),
-        View::Files(_) => owned(finder::hints()),
+        View::Files(finder) => owned(finder::hints(finder)),
+        View::Tree(tree) => owned(tree_browser::hints(tree)),
         View::Grep(_) => owned(grep::hints()),
         View::Branches(switcher) => owned(switcher::hints(switcher)),
         View::Memory(memory) => memory_view::hints(memory),

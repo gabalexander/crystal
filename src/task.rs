@@ -545,7 +545,10 @@ impl Reading {
             match event {
                 Event::Started { conversation } => runs.conversation = Some(conversation),
                 Event::Finished(outcome) => self.finish(runs, outcome),
-                event => self.term.show(transcript::lines(&event).as_bytes()),
+                event => {
+                    let lines = transcript::lines(&event, self.term.columns());
+                    self.term.show(lines.as_bytes());
+                }
             }
         }
     }
@@ -573,8 +576,8 @@ impl Reading {
             cost_usd: cost,
             ..outcome
         };
-        self.term
-            .show(transcript::lines(&Event::Finished(shown)).as_bytes());
+        let lines = transcript::lines(&Event::Finished(shown), self.term.columns());
+        self.term.show(lines.as_bytes());
         if runs.failed && !runs.interrupted {
             // Let go: its input closes, and it ends.
             runs.claude = None;

@@ -1,0 +1,13 @@
+sequenceDiagram
+    participant Client
+    participant Gateway
+    participant Auth
+    participant Orders
+    participant Billing
+    Client->>Gateway: POST /orders with a very long description of the payload
+    Gateway->>Auth: verify the bearer token and the scopes it carries
+    Auth-->>Gateway: token is valid for orders:write
+    Gateway->>Orders: create the order in the pending state
+    Orders->>Billing: reserve the amount on the customer's card
+    Billing-->>Orders: reservation id
+    Orders-->>Client: 201 Created

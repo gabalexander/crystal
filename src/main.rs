@@ -25,9 +25,12 @@ mod front;
 mod git;
 mod hook;
 mod keys;
+mod markdown;
 mod mcp;
 mod memory;
 mod memory_cli;
+mod mermaid;
+mod mermaid_cli;
 mod names;
 mod notify;
 mod plugin_cli;
@@ -45,6 +48,7 @@ mod skill;
 mod socket;
 mod spending;
 mod state;
+mod syntax;
 mod task;
 mod tasks;
 mod transcript;
@@ -420,6 +424,22 @@ enum Command {
     Plugin {
         #[command(subcommand)]
         command: Option<PluginCommand>,
+    },
+    /// Draw a mermaid diagram as text, the way crystal's previews draw it:
+    /// a diagram, or each ```mermaid fence of a markdown file. One that
+    /// can't be drawn is printed as it is, and the command fails saying
+    /// why.
+    Mermaid {
+        /// The file [default: standard input]
+        file: Option<String>,
+
+        /// How many columns to draw in [default: the terminal's, or 80]
+        #[arg(short, long, value_name = "COLUMNS")]
+        width: Option<usize>,
+
+        /// Draw with ASCII rather than box drawing.
+        #[arg(long)]
+        ascii: bool,
     },
     /// Print the Claude Code skill that teaches an agent to drive crystal.
     Skill {
@@ -959,6 +979,7 @@ fn run(cli: Cli) -> Result<()> {
             Some(PluginCommand::New { name }) => plugin_cli::new(&name)?,
             Some(PluginCommand::Log { name }) => plugin_cli::log(&socket, &name)?,
         },
+        Command::Mermaid { file, width, ascii } => mermaid_cli::run(file.as_deref(), width, ascii)?,
         Command::Skill { install, force } => {
             if install {
                 skill::install(force)?;

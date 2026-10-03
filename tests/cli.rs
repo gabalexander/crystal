@@ -5584,6 +5584,153 @@ fn p_finds_a_file_and_opens_it_in_the_editor() {
     tui.shows("typing into refund.rs");
 }
 
+/// A worktree with a markdown guide holding a diagram, some code, and a
+/// file git ignores.
+fn repo_with_docs(dir: &Path) -> PathBuf {
+    let repo = git_repo(dir, "app");
+    std::fs::create_dir_all(repo.join("docs")).unwrap();
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    std::fs::create_dir_all(repo.join("target")).unwrap();
+    std::fs::write(
+        repo.join("docs/guide.md"),
+        "# The guide\n\nHow a frame is **drawn**:\n\n```mermaid\nflowchart LR\n  read --> draw\n```\n",
+    )
+    .unwrap();
+    std::fs::write(repo.join("src/lib.rs"), "pub fn draw() {}\n").unwrap();
+    std::fs::write(repo.join(".gitignore"), "target/\n").unwrap();
+    std::fs::write(repo.join("target/junk.txt"), "build output\n").unwrap();
+    repo
+}
+
+#[test]
+fn big_e_browses_the_worktree_as_a_tree_with_each_file_previewed() {
+    let crystal = Crystal::new();
+    let repo = repo_with_docs(crystal.dir.path());
+    crystal.ok(&[
+        "new",
+        "-n",
+        "agent",
+        "-c",
+        repo.to_str().unwrap(),
+        "sleep",
+        "30",
+    ]);
+    // An editor that notes the file it was asked to open.
+    let editor = crystal.dir.path().join("editor");
+    let edited = crystal.dir.path().join("edited");
+    script(&editor, "printf '%s\\n' \"$1\" > \"$EDITED\"\nsleep 30\n");
+
+    let mut tui = crystal.attach_with_env(
+        &[],
+        &[
+            ("SSH_TTY", "/dev/ttys999"),
+            ("EDITOR", editor.to_str().unwrap()),
+            ("EDITED", edited.to_str().unwrap()),
+        ],
+    );
+    tui.shows("agent");
+    tui.type_keys("E");
+    tui.shows("tree · 3 files");
+    // Folded, directories first; what git ignores isn't there.
+    tui.shows("▸ docs");
+    tui.shows("▸ src");
+    tui.shows(".gitignore");
+    assert!(!tui.text().contains("target"), "{}", tui.text());
+
+    // Typing filters the tree down to the guide, which shows as a page
+    // with its diagram drawn.
+    tui.type_keys("guide");
+    tui.shows("tree · 1 of 3 files");
+    tui.shows("▾ docs");
+    tui.hides("▸ src");
+    tui.shows("The guide");
+    tui.shows("How a frame is drawn:");
+    tui.shows("│ read ├──▶│ draw │");
+    tui.shows("mermaid · flowchart");
+
+    // Its source, then its path copied.
+    tui.type_keys("\x12");
+    tui.shows("```mermaid");
+    tui.type_keys("\x19");
+    tui.copies("docs/guide.md");
+    tui.shows("copied docs/guide.md");
+
+    // Esc clears the filter, and the tree is folded as it was.
+    tui.type_keys("\x1b");
+    tui.shows("▸ src");
+    tui.shows("tree · 3 files");
+
+    // Into src, and its file opens in the editor.
+    tui.type_keys("\x1b[B\x1b[C\x1b[B");
+    tui.shows("pub fn draw() {}");
+    tui.type_keys("\x05");
+    assert_eq!(written(&edited), "src/lib.rs\n");
+    tui.shows("typing into lib.rs");
+}
+
+#[test]
+fn dragging_the_tree_browsers_border_makes_the_tree_wider() {
+    let crystal = Crystal::new();
+    let repo = git_repo(crystal.dir.path(), "app");
+    std::fs::write(repo.join("a-file-with-a-long-name-indeed.txt"), "hi\n").unwrap();
+    crystal.ok(&[
+        "new",
+        "-n",
+        "agent",
+        "-c",
+        repo.to_str().unwrap(),
+        "sleep",
+        "30",
+    ]);
+
+    let mut tui = crystal.tui();
+    tui.shows("agent");
+    tui.type_keys("E");
+    tui.shows("a-file-with-a-long-…");
+    // The border is the 25th column, from the third row down, counting
+    // from 1 as the mouse does: take it, drag it to the 50th, and let go.
+    tui.type_keys("\x1b[<0;25;3M\x1b[<32;50;3M\x1b[<0;50;3m");
+    tui.shows("a-file-with-a-long-name-indeed.txt");
+}
+
+#[test]
+fn mermaid_draws_a_diagram_and_fails_on_one_it_cant() {
+    let crystal = Crystal::new();
+    let draw = |args: &[&str], diagram: &str| {
+        let mut child = crystal
+            .command(&["mermaid"])
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        stdin.write_all(diagram.as_bytes()).unwrap();
+        drop(stdin);
+        child.wait_with_output().unwrap()
+    };
+
+    let out = draw(&[], "sequenceDiagram\n  Alice->>Bob: hello\n");
+    assert!(out.status.success());
+    let drawn = String::from_utf8(out.stdout).unwrap();
+    assert!(drawn.contains("│ Alice │  │ Bob │"), "{drawn}");
+    assert!(drawn.contains("├────────▶│"), "{drawn}");
+
+    let out = draw(&["--ascii", "--width", "40"], "flowchart LR\n  a --> b\n");
+    let drawn = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(drawn, "+---+   +---+\n| a +-->| b |\n+---+   +---+\n");
+
+    let out = draw(&[], "pie\n  \"a\": 1\n");
+    assert!(!out.status.success());
+    assert_eq!(String::from_utf8(out.stdout).unwrap(), "pie\n  \"a\": 1\n");
+    let why = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        why.contains("not drawn: pie diagrams are not drawn in a terminal"),
+        "{why}"
+    );
+}
+
 #[test]
 fn r_marks_a_file_reviewed_until_it_changes_and_t_lists_files_as_a_tree() {
     let crystal = Crystal::new();

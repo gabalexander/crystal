@@ -14,6 +14,7 @@ use super::launcher::{self, Launcher, Memory, Run, Setup, Target};
 use super::layouts::{self, Layouts, LayoutsView, Which};
 use super::memory_view::MemoryView;
 use super::plugins_view::{self, PluginsView};
+use super::preview::Content;
 use super::profiles::{self, ProfilesView};
 use super::pull_requests::{self, PullRequestsView};
 use super::review;
@@ -24,6 +25,7 @@ use super::status::Status;
 use super::switcher::{self, Switcher};
 use super::tabs::{self, Tabs};
 use super::text_input::TextInput;
+use super::tree_browser::TreeBrowser;
 use crate::catalog::{self, Agent};
 use crate::client::Purpose;
 use crate::config::Config;
@@ -90,6 +92,10 @@ pub enum Hit {
     ViewList(usize),
     /// The rest of an open view: the diff, or the file's preview.
     ViewContent,
+    /// The rule between an open view's list and the rest, where the tree
+    /// browser's is dragged: the column the mouse is at, counted from the
+    /// view's left edge.
+    ViewBorder(u16),
     /// The footer, or anywhere else.
     Elsewhere,
 }
@@ -104,11 +110,12 @@ pub struct Grab {
 }
 
 /// Something that takes the place of the sidebar and the panes until it's
-/// closed: the diff of a worktree, the file finder, find in files, the
-/// branch switcher, or a project's memory.
+/// closed: the diff of a worktree, the file finder, the tree browser, find
+/// in files, the branch switcher, or a project's memory.
 pub enum View {
     Diff(DiffView),
     Files(Finder),
+    Tree(TreeBrowser),
     Grep(Grep),
     Branches(Switcher),
     Memory(MemoryView),
@@ -423,8 +430,8 @@ pub enum Action {
     /// List the files of the worktree at this directory, off the event
     /// loop.
     ReadFiles(PathBuf),
-    /// Read the first lines of the file at `path`, from the top of the
-    /// worktree at `dir`, off the event loop.
+    /// Read and highlight the file at `path`, from the top of the worktree
+    /// at `dir`, for a preview, off the event loop.
     ReadPreview {
         dir: PathBuf,
         path: String,
@@ -451,6 +458,8 @@ pub enum Action {
         dir: PathBuf,
         path: String,
     },
+    /// Put this path, from the top of a worktree, on the clipboard.
+    CopyPath(String),
     /// Open the file at `path`, from the top of the worktree at `dir`, in
     /// the user's editor, at `line` if there's one, as a new session called
     /// `name`.
@@ -990,19 +999,24 @@ impl App {
         }
     }
 
-    /// Takes the files listed for the file finder, if it's still open on
-    /// their worktree. Its first file's preview is to be read next.
+    /// Takes the files listed for the file finder or the tree browser, if
+    /// it's still open on their worktree. The selected file's preview is to
+    /// be read next.
     pub fn files_read(&mut self, dir: &Path, files: Result<Vec<String>, String>) -> Option<Action> {
-        let Some(View::Files(finder)) = &mut self.view else {
-            return None;
-        };
-        finder.files_read(dir, files)
+        match &mut self.view {
+            Some(View::Files(finder)) => finder.files_read(dir, files),
+            Some(View::Tree(tree)) => tree.files_read(dir, files),
+            _ => None,
+        }
     }
 
-    /// Takes a file's first lines, if the file finder still has it selected.
-    pub fn preview_read(&mut self, dir: &Path, path: &str, lines: Result<Vec<String>, String>) {
-        if let Some(View::Files(finder)) = &mut self.view {
-            finder.preview_read(dir, path, lines);
+    /// Takes a file read for the preview of the file finder or the tree
+    /// browser, if it still shows it.
+    pub fn preview_read(&mut self, dir: &Path, path: &str, read: Result<Content, String>) {
+        match &mut self.view {
+            Some(View::Files(finder)) => finder.preview_read(dir, path, read),
+            Some(View::Tree(tree)) => tree.preview_read(dir, path, read),
+            _ => {}
         }
     }
 
@@ -1074,7 +1088,7 @@ impl App {
         &mut self,
         dir: &Path,
         path: &str,
-        lines: Result<Vec<String>, String>,
+        lines: Result<Vec<crate::syntax::Runs>, String>,
     ) {
         if let Some(View::Grep(grep)) = &mut self.view {
             grep.file_read(dir, path, lines);
@@ -1094,7 +1108,8 @@ impl App {
     pub fn set_view_size(&mut self, list: (u16, u16), content: (u16, u16)) {
         match &mut self.view {
             Some(View::Diff(diff)) => diff.set_size(content),
-            Some(View::Files(finder)) => finder.set_size(list),
+            Some(View::Files(finder)) => finder.set_size(list, content),
+            Some(View::Tree(tree)) => tree.set_size(content),
             Some(View::Grep(grep)) => grep.set_size(list),
             Some(View::Branches(switcher)) => switcher.set_size(list),
             Some(View::Memory(memory)) => memory.set_size(list),
@@ -2060,6 +2075,7 @@ impl App {
             let outcome = match view {
                 View::Diff(diff) => diff.on_mouse(kind, hit),
                 View::Files(finder) => finder.on_mouse(kind, hit),
+                View::Tree(tree) => tree.on_mouse(kind, hit),
                 View::Grep(grep) => grep.on_mouse(kind, hit),
                 View::Branches(switcher) => switcher.on_mouse(kind, hit),
                 View::Memory(memory) => memory.on_mouse(kind, hit),
@@ -2287,6 +2303,7 @@ impl App {
             KeyCode::Char('u') => self.select_next_needing_user(),
             KeyCode::Char('d') => return self.open_diff(),
             KeyCode::Char('p') => return self.open_finder(),
+            KeyCode::Char('E') => return self.open_tree_browser(),
             KeyCode::Char('G') => self.open_grep(),
             KeyCode::Char('B') => return self.open_switcher(),
             KeyCode::Char('m') => return self.open_memory(),
@@ -2390,6 +2407,16 @@ impl App {
         Some(read)
     }
 
+    /// `E`: opens the tree browser on the selected session's worktree, and
+    /// asks for its files to be listed.
+    fn open_tree_browser(&mut self) -> Option<Action> {
+        let (dir, place) = self.selected_worktree()?;
+        let tree = TreeBrowser::new(dir, place);
+        let read = tree.read();
+        self.view = Some(View::Tree(tree));
+        Some(read)
+    }
+
     /// `B`: opens the branch switcher on the selected session's worktree,
     /// and asks for its branches to be listed. Only a project's main
     /// worktree switches: a linked one is named after its branch.
@@ -2474,6 +2501,7 @@ impl App {
         let outcome = match self.view.as_mut()? {
             View::Diff(diff) => diff.on_key(key),
             View::Files(finder) => finder.on_key(key),
+            View::Tree(tree) => tree.on_key(key),
             View::Grep(grep) => grep.on_key(key),
             View::Branches(switcher) => switcher.on_key(key),
             View::Memory(memory) => memory.on_key(key),
@@ -2502,6 +2530,7 @@ impl App {
             Outcome::Edit { path, line } => {
                 let dir = match self.view.take()? {
                     View::Files(finder) => finder.dir,
+                    View::Tree(tree) => tree.dir,
                     View::Grep(grep) => grep.dir,
                     _ => return None,
                 };
@@ -3205,6 +3234,10 @@ impl App {
         }
         if let Some(View::Files(finder)) = &mut self.view {
             let outcome = finder.on_paste(&text);
+            return self.follow(outcome);
+        }
+        if let Some(View::Tree(tree)) = &mut self.view {
+            let outcome = tree.on_paste(&text);
             return self.follow(outcome);
         }
         if let Some(View::Grep(grep)) = &mut self.view {
@@ -6713,6 +6746,38 @@ mod tests {
         press(&mut app, KeyCode::Esc);
         assert!(app.view().is_none());
         assert!(app.pull_requests_view().is_some());
+    }
+
+    #[test]
+    fn big_e_opens_the_tree_browser_and_ctrl_e_edits_a_file_in_a_session() {
+        let mut app = App::new(None);
+        app.set_sessions(vec![in_repo("planner", "main")]);
+        assert_eq!(
+            press(&mut app, KeyCode::Char('E')),
+            Some(Action::ReadFiles(PathBuf::from("/code/app/main")))
+        );
+        assert!(matches!(app.view(), Some(View::Tree(_))));
+        let files = vec!["src/main.rs".to_string(), "README.md".to_string()];
+        // The directory comes first, and shows its names: nothing to read.
+        assert_eq!(app.files_read(Path::new("/code/app/main"), Ok(files)), None);
+        assert_eq!(
+            press(&mut app, KeyCode::Down),
+            Some(Action::ReadPreview {
+                dir: PathBuf::from("/code/app/main"),
+                path: "README.md".into(),
+            })
+        );
+        let ctrl_e = KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL);
+        assert_eq!(
+            app.on_key(ctrl_e),
+            Some(Action::Edit {
+                dir: PathBuf::from("/code/app/main"),
+                path: "README.md".into(),
+                line: None,
+                name: "README.md".into(),
+            })
+        );
+        assert!(app.view().is_none());
     }
 
     #[test]

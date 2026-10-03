@@ -1,11 +1,13 @@
 //! The file finder, `p` in the sidebar, like an editor's quick open: type a
-//! few letters of a file's path and pick it from the list, with the start
-//! of the selected file shown beside it. Enter opens the file in the user's
-//! `$EDITOR`, as a session of its own in the worktree, so the editor sits
-//! in the sidebar like any agent.
+//! few letters of a file's path and pick it from the list, with the
+//! selected file previewed beside it, highlighted, or a markdown file as
+//! its page. Enter opens the file in the user's `$EDITOR`, as a session of
+//! its own in the worktree, so the editor sits in the sidebar like any
+//! agent.
 
 use super::app::{Action, Hit, Loading, Outcome};
 use super::fuzzy::{self, Match};
+use super::preview::{self, Content, Preview};
 use super::sidebar::fit;
 use super::text_input::TextInput;
 use super::ui::{self, Look, ViewAreas};
@@ -16,41 +18,17 @@ use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 
 /// How many matches are listed, at most: more is past what anyone scrolls.
 const MOST_MATCHES: usize = 500;
 
-/// How much of a file the preview reads, and how many of its lines it keeps.
-const PREVIEW_BYTES: u64 = 64 * 1024;
-const PREVIEW_LINES: usize = 500;
-
 /// The rows above the list of matches: the query, and a rule under it.
-const QUERY_ROWS: u16 = 2;
+pub const QUERY_ROWS: u16 = 2;
 
 /// Lists the files of the worktree at `dir`: run off the event loop.
 pub fn read_files(dir: &Path) -> Result<Vec<String>, String> {
     git::files(dir).map_err(|err| format!("{err:#}"))
-}
-
-/// The first lines of the file at `path` in the worktree at `dir`: run off
-/// the event loop. A binary file has none to show.
-pub fn read_preview(dir: &Path, path: &str) -> Result<Vec<String>, String> {
-    let file = std::fs::File::open(dir.join(path)).map_err(|err| err.to_string())?;
-    let mut start = Vec::new();
-    file.take(PREVIEW_BYTES)
-        .read_to_end(&mut start)
-        .map_err(|err| err.to_string())?;
-    if start.contains(&0) {
-        return Err("a binary file".to_string());
-    }
-    let text = String::from_utf8_lossy(&start);
-    Ok(text
-        .lines()
-        .take(PREVIEW_LINES)
-        .map(|line| line.replace('\t', "    "))
-        .collect())
 }
 
 pub struct Finder {
@@ -65,29 +43,23 @@ pub struct Finder {
     pub matches: Vec<(usize, Match)>,
     /// The selected match, by its place in `matches`.
     pub selected: usize,
-    /// The selected file's first lines, once they're read.
-    pub preview: Option<Preview>,
+    /// The selected file.
+    pub preview: Preview,
     /// How many rows the list is drawn in, for paging.
     rows: u16,
-}
-
-/// A file's first lines, or why there are none.
-pub struct Preview {
-    pub path: String,
-    pub lines: Result<Vec<String>, String>,
 }
 
 impl Finder {
     /// A finder on the worktree at `dir`, until its files are listed.
     pub fn new(dir: PathBuf, place: String) -> Finder {
         Finder {
+            preview: Preview::new(dir.clone()),
             dir,
             place,
             query: TextInput::default(),
             files: Loading::Reading,
             matches: Vec::new(),
             selected: 0,
-            preview: None,
             rows: 20,
         }
     }
@@ -111,19 +83,17 @@ impl Finder {
         self.read_selected()
     }
 
-    /// Takes a file's first lines, if it's still the selected one.
-    pub fn preview_read(&mut self, dir: &Path, path: &str, lines: Result<Vec<String>, String>) {
-        if dir == self.dir && self.selected_path() == Some(path) {
-            self.preview = Some(Preview {
-                path: path.to_string(),
-                lines,
-            });
-        }
+    /// Takes a file that's been read for the preview, if it's still the
+    /// selected one.
+    pub fn preview_read(&mut self, dir: &Path, path: &str, read: Result<Content, String>) {
+        self.preview.read_done(dir, path, read);
     }
 
-    /// The size of the list's area, as `(rows, columns)`.
-    pub fn set_size(&mut self, list: (u16, u16)) {
+    /// The sizes of the list's area and the preview's, as `(rows,
+    /// columns)`.
+    pub fn set_size(&mut self, list: (u16, u16), preview: (u16, u16)) {
         self.rows = list.0;
+        self.preview.set_size(preview);
     }
 
     /// The path of the selected match.
@@ -143,8 +113,8 @@ impl Finder {
             KeyCode::Enter => {
                 return match self.selected_path() {
                     Some(path) => Outcome::Edit {
+                        line: self.preview.top_line(path),
                         path: path.to_string(),
-                        line: None,
                     },
                     None => Outcome::Stay,
                 };
@@ -153,6 +123,10 @@ impl Finder {
             KeyCode::Down => return self.select_by(1),
             KeyCode::Char('p') if ctrl => return self.select_by(-1),
             KeyCode::Char('n') if ctrl => return self.select_by(1),
+            KeyCode::Char('r') if ctrl => {
+                self.preview.flip();
+                return Outcome::Stay;
+            }
             KeyCode::PageUp => return self.select_by(-(page as isize)),
             KeyCode::PageDown => return self.select_by(page as isize),
             _ => {}
@@ -178,7 +152,8 @@ impl Finder {
         self.outcome_for_selection()
     }
 
-    /// A click on a match selects it, and the wheel moves the selection.
+    /// A click on a match selects it, and the wheel moves the selection,
+    /// or scrolls the preview.
     pub fn on_mouse(&mut self, kind: MouseEventKind, hit: Hit) -> Outcome {
         match (kind, hit) {
             (MouseEventKind::Down(MouseButton::Left), Hit::ViewList(index)) => {
@@ -187,6 +162,14 @@ impl Finder {
             }
             (MouseEventKind::ScrollUp, Hit::ViewList(_)) => self.select_by(-1),
             (MouseEventKind::ScrollDown, Hit::ViewList(_)) => self.select_by(1),
+            (MouseEventKind::ScrollUp, Hit::ViewContent) => {
+                self.preview.wheel(true);
+                Outcome::Stay
+            }
+            (MouseEventKind::ScrollDown, Hit::ViewContent) => {
+                self.preview.wheel(false);
+                Outcome::Stay
+            }
             _ => Outcome::Stay,
         }
     }
@@ -209,16 +192,13 @@ impl Finder {
     /// What reading the selected file's preview takes, if it isn't the one
     /// shown already.
     fn read_selected(&mut self) -> Option<Action> {
-        let path = self.selected_path()?.to_string();
-        let shown = self.preview.as_ref().map(|preview| preview.path.as_str());
-        if shown == Some(path.as_str()) {
-            return None;
+        match self.selected_path().map(str::to_string) {
+            Some(path) => self.preview.show(&path),
+            None => {
+                self.preview.clear();
+                None
+            }
         }
-        self.preview = None;
-        Some(Action::ReadPreview {
-            dir: self.dir.clone(),
-            path,
-        })
     }
 
     /// Finds the matches for the query, best first.
@@ -237,8 +217,11 @@ pub fn list_width(width: u16) -> u16 {
 }
 
 /// The keys the footer shows while the finder is open.
-pub fn hints() -> Vec<(&'static str, &'static str)> {
-    vec![("↑/↓", "select"), ("enter", "edit"), ("esc", "close")]
+pub fn hints(finder: &Finder) -> Vec<(&'static str, &'static str)> {
+    let mut hints = vec![("↑/↓", "select"), ("enter", "edit")];
+    hints.extend(preview::flip_hint(&finder.preview));
+    hints.push(("esc", "close"));
+    hints
 }
 
 /// Which match's row is on screen `row`, in a list drawn in `area`.
@@ -269,7 +252,7 @@ pub fn draw(frame: &mut Frame, finder: &Finder, look: &Look, areas: &ViewAreas) 
     let theme = look.theme;
     frame.render_widget(header(finder, look, areas.header.width), areas.header);
     ui::draw_rule(frame, look, areas.rule);
-    draw_query(frame, finder, look, areas.list);
+    draw_query(frame, &finder.query, look, areas.list);
 
     let list = Rect::new(
         areas.list.x,
@@ -293,7 +276,7 @@ pub fn draw(frame: &mut Frame, finder: &Finder, look: &Look, areas: &ViewAreas) 
         }
         Loading::Read(files) => draw_matches(frame, finder, files, look, list),
     }
-    draw_preview(frame, finder, look, areas.content);
+    preview::draw(frame, &finder.preview, look, areas.content);
 }
 
 /// "⌕ find a file · 1204 files", and where on the right.
@@ -310,8 +293,9 @@ fn header<'a>(finder: &Finder, look: &Look, width: u16) -> Line<'a> {
     ui::view_header("⌕", "find a file", &notes, &finder.place, look, width)
 }
 
-/// The query, with the cursor in it, and a rule under it.
-fn draw_query(frame: &mut Frame, finder: &Finder, look: &Look, list: Rect) {
+/// The query, with the cursor in it, and a rule under it, at the top of
+/// `list`.
+pub fn draw_query(frame: &mut Frame, query: &TextInput, look: &Look, list: Rect) {
     let theme = look.theme;
     let prompt = " › ";
     let line = Line::from(vec![
@@ -319,7 +303,7 @@ fn draw_query(frame: &mut Frame, finder: &Finder, look: &Look, list: Rect) {
             prompt,
             Style::new().fg(theme.accent).add_modifier(Modifier::BOLD),
         ),
-        Span::styled(finder.query.text().to_string(), Style::new().fg(theme.text)),
+        Span::styled(query.text().to_string(), Style::new().fg(theme.text)),
     ]);
     frame.render_widget(line, Rect::new(list.x, list.y, list.width, 1));
     let rule = "─".repeat(usize::from(list.width));
@@ -328,7 +312,7 @@ fn draw_query(frame: &mut Frame, finder: &Finder, look: &Look, list: Rect) {
         Rect::new(list.x, list.y + 1, list.width, 1),
     );
     // The prompt is three columns wide.
-    let column = list.x + 3 + finder.query.cursor() as u16;
+    let column = list.x + 3 + query.cursor() as u16;
     frame.set_cursor_position((column.min(list.right().saturating_sub(1)), list.y));
 }
 
@@ -371,54 +355,6 @@ fn path_line<'a>(path: &str, matched: &[usize], look: &Look) -> Line<'a> {
     Line::from(spans)
 }
 
-/// The selected file's path, then its first lines, numbered.
-fn draw_preview(frame: &mut Frame, finder: &Finder, look: &Look, area: Rect) {
-    let theme = look.theme;
-    let Some(path) = finder.selected_path() else {
-        return;
-    };
-    let title = Line::from(vec![
-        Span::raw(" "),
-        Span::styled(
-            path.to_string(),
-            Style::new().fg(theme.text).add_modifier(Modifier::BOLD),
-        ),
-    ]);
-    frame.render_widget(title, Rect::new(area.x, area.y, area.width, 1));
-    let body = Rect::new(
-        area.x,
-        area.y + 1,
-        area.width,
-        area.height.saturating_sub(1),
-    );
-    let Some(preview) = &finder.preview else {
-        return;
-    };
-    let lines = match &preview.lines {
-        Ok(lines) => lines,
-        Err(why) => {
-            ui::draw_message(frame, look, why, body);
-            return;
-        }
-    };
-    let numbers = lines.len().to_string().len();
-    let shown: Vec<Line> = lines
-        .iter()
-        .take(body.height.into())
-        .enumerate()
-        .map(|(index, line)| {
-            Line::from(vec![
-                Span::styled(
-                    format!(" {:>numbers$}  ", index + 1),
-                    Style::new().fg(theme.muted),
-                ),
-                Span::styled(line.clone(), Style::new().fg(theme.text)),
-            ])
-        })
-        .collect();
-    frame.render_widget(Paragraph::new(shown), body);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -459,10 +395,12 @@ mod tests {
     #[test]
     fn typing_narrows_the_list_and_asks_for_the_new_best() {
         let mut finder = finder_with(&["README.md", "src/billing/refund.rs", "src/main.rs"]);
-        let outcome = type_text(&mut finder, "rfnd");
-        assert_eq!(finder.matches.len(), 1);
+        let outcome = type_text(&mut finder, "rf");
         assert_eq!(finder.selected_path(), Some("src/billing/refund.rs"));
         assert!(matches!(outcome, Outcome::Do(Action::ReadPreview { .. })));
+        // The same best again: it's read already.
+        assert_eq!(type_text(&mut finder, "nd"), Outcome::Stay);
+        assert_eq!(finder.matches.len(), 1);
     }
 
     #[test]
@@ -491,24 +429,26 @@ mod tests {
     }
 
     #[test]
-    fn a_preview_for_a_file_no_longer_selected_is_dropped() {
+    fn the_preview_follows_the_selection() {
         let mut finder = finder_with(&["a.rs", "b.rs"]);
+        assert_eq!(finder.preview.path(), Some("a.rs"));
         finder.on_key(key(KeyCode::Down));
-        finder.preview_read(Path::new("/code/app"), "a.rs", Ok(vec!["old".into()]));
-        assert!(finder.preview.is_none());
-        finder.preview_read(Path::new("/code/app"), "b.rs", Ok(vec!["fn b() {}".into()]));
-        assert_eq!(finder.preview.as_ref().unwrap().path, "b.rs");
+        assert_eq!(finder.preview.path(), Some("b.rs"));
+        type_text(&mut finder, "zzz");
+        assert_eq!(finder.preview.path(), None, "nothing matches");
     }
 
     #[test]
-    fn a_preview_reads_the_start_of_a_text_file_only() {
+    fn ctrl_r_flips_a_markdown_file_to_its_source() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("notes.txt"), "one\n\ttwo\n").unwrap();
-        std::fs::write(dir.path().join("logo.png"), b"\x89PNG\0\0").unwrap();
-        assert_eq!(
-            read_preview(dir.path(), "notes.txt").unwrap(),
-            ["one", "    two"]
-        );
-        assert!(read_preview(dir.path(), "logo.png").is_err());
+        std::fs::write(dir.path().join("README.md"), "# Title\n").unwrap();
+        let mut finder = Finder::new(dir.path().to_path_buf(), "app".into());
+        finder.files_read(dir.path(), Ok(vec!["README.md".into()]));
+        let read = preview::read(dir.path(), "README.md");
+        finder.preview_read(dir.path(), "README.md", read);
+        assert_eq!(hints(&finder)[2], ("ctrl+r", "source"));
+        finder.on_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        assert!(finder.preview.shows_source());
+        assert_eq!(finder.query.text(), "", "not typed into the query");
     }
 }

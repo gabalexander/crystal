@@ -9,6 +9,8 @@
 
 use super::status::Status;
 use crate::config::ThemeName;
+use crate::markdown::{Ink, Mark};
+use crate::syntax::TokenKind;
 use ratatui::style::{Color, Modifier, Style};
 
 pub struct Theme {
@@ -53,6 +55,15 @@ pub struct Theme {
     pub found: Style,
     /// The match copy mode's cursor is on.
     pub found_current: Style,
+    /// A keyword in highlighted code, and code in a line of prose.
+    pub keyword: Style,
+    /// A string in highlighted code.
+    pub string: Style,
+    /// A number in highlighted code.
+    pub number: Style,
+    /// Behind a block of code on a markdown page: a surface of its own,
+    /// where a theme paints.
+    pub code_block: Style,
 }
 
 impl Theme {
@@ -103,6 +114,10 @@ impl Theme {
             found_current: Style::new()
                 .fg(Color::Rgb(16, 18, 24))
                 .bg(Color::Rgb(255, 164, 84)),
+            keyword: Style::new().fg(Color::Rgb(122, 162, 247)),
+            string: Style::new().fg(Color::Rgb(158, 206, 106)),
+            number: Style::new().fg(Color::Rgb(255, 158, 100)),
+            code_block: Style::new().bg(Color::Rgb(23, 26, 35)),
         }
     }
 
@@ -134,6 +149,10 @@ impl Theme {
             found_current: Style::new()
                 .fg(Color::Rgb(250, 249, 246))
                 .bg(Color::Rgb(196, 98, 16)),
+            keyword: Style::new().fg(Color::Rgb(46, 92, 196)),
+            string: Style::new().fg(Color::Rgb(40, 120, 52)),
+            number: Style::new().fg(Color::Rgb(176, 90, 20)),
+            code_block: Style::new().bg(Color::Rgb(241, 239, 234)),
         }
     }
 
@@ -169,6 +188,10 @@ impl Theme {
             copy_selection: Style::new().add_modifier(Modifier::REVERSED),
             found: Style::new().fg(Color::Black).bg(Color::Yellow),
             found_current: Style::new().fg(Color::Black).bg(Color::LightRed),
+            keyword: Style::new().fg(Color::Blue),
+            string: Style::new().fg(Color::Green),
+            number: Style::new().fg(Color::Yellow),
+            code_block: Style::new(),
         }
     }
 
@@ -202,12 +225,49 @@ impl Theme {
             copy_selection: Style::new().add_modifier(Modifier::REVERSED),
             found: Style::new().add_modifier(Modifier::UNDERLINED),
             found_current: Style::new().add_modifier(Modifier::UNDERLINED.union(Modifier::BOLD)),
+            // Keywords are bold; the rest of code is as it's written.
+            keyword: Style::new().add_modifier(Modifier::BOLD),
+            string: Style::new(),
+            number: Style::new(),
+            code_block: Style::new(),
         }
     }
 
     /// Text on the theme's background: where everything starts.
     pub fn base(&self) -> Style {
         Style::new().fg(self.text).bg(self.background)
+    }
+
+    /// How a run of highlighted code that's `kind` is drawn.
+    pub fn token(&self, kind: TokenKind) -> Style {
+        match kind {
+            TokenKind::Keyword => self.keyword,
+            TokenKind::String => self.string,
+            TokenKind::Number => self.number,
+            TokenKind::Comment => Style::new().fg(self.muted),
+            TokenKind::Text => Style::new().fg(self.text),
+        }
+    }
+
+    /// How a piece of a markdown page marked `mark` is drawn.
+    pub fn mark(&self, mark: Mark) -> Style {
+        let style = match mark.ink {
+            Ink::Text => Style::new().fg(self.text),
+            Ink::Muted => Style::new().fg(self.muted),
+            Ink::Accent => Style::new().fg(self.accent),
+            Ink::Rule => Style::new().fg(self.rule),
+            Ink::Code => self.keyword,
+            Ink::Done => Style::new().fg(self.done),
+            Ink::Warning => Style::new().fg(self.waiting),
+            Ink::Failed => Style::new().fg(self.failed),
+            Ink::Token(kind) => self.token(kind),
+        };
+        let style = style.add_modifier(mark.modifier);
+        if mark.on_code {
+            style.patch(self.code_block)
+        } else {
+            style
+        }
     }
 
     /// The color that says `status`.
@@ -239,6 +299,12 @@ mod tests {
         ];
         assert!(colors.iter().all(|color| *color == Color::Reset));
         assert!(theme.selection.add_modifier.contains(Modifier::REVERSED));
+        let code = [theme.keyword, theme.string, theme.number, theme.code_block];
+        assert!(
+            code.iter()
+                .all(|style| style.fg.is_none() && style.bg.is_none())
+        );
+        assert!(theme.keyword.add_modifier.contains(Modifier::BOLD));
     }
 
     #[test]

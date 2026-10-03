@@ -1,0 +1,4 @@
+graph BT
+    build --> test
+    test --> deploy
+    test -->|fails| build

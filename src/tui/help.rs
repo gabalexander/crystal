@@ -65,7 +65,7 @@ pub const KEYS: &[Key] = &[
     of_plugin("flows", "g/f", "flow: go on / send back"),
     sidebar("u /", "next needing you / find"),
     of_plugin("github", "o/O/i", "its PR / all PRs / issues"),
-    sidebar("d/p/G B", "diff/file/in files/branch"),
+    sidebar("d/p/E/G B", "diff/file/tree/grep/br"),
     of_plugin("backlog", "b", "the project's backlog"),
     of_plugin("memory", "m", "what it has remembered"),
     of_plugin("profiles", "P", "your agent profiles"),

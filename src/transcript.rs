@@ -7,8 +7,12 @@
 //! line: `system` (`init` names the conversation), `assistant` (text and
 //! tool uses), `user` (tool results) and, last, `result`. A task draws these
 //! on its session's screen, so the lines here carry ANSI colors and end in
-//! `\r\n`, the way any program's output does on a terminal.
+//! `\r\n`, the way any program's output does on a terminal. What Claude
+//! says is markdown, laid out as a page for the screen's width.
 
+use crate::markdown::{self, Ink, Mark};
+use crate::syntax::TokenKind;
+use ratatui::style::Modifier;
 use serde_json::Value;
 
 /// How much of a tool's input or answer a line shows.
@@ -85,18 +89,11 @@ pub fn prompt_lines(prompt: &str) -> String {
     lines
 }
 
-/// The lines that show `event`.
-pub fn lines(event: &Event) -> String {
+/// The lines that show `event`, on a screen `width` columns wide.
+pub fn lines(event: &Event, width: u16) -> String {
     match event {
         Event::Started { .. } => String::new(),
-        Event::Said(text) => {
-            let mut lines = String::new();
-            for line in text.trim_end().lines() {
-                lines.push_str(line);
-                lines.push_str("\r\n");
-            }
-            lines
-        }
+        Event::Said(text) => said_lines(text, width),
         Event::UsedTool { name, gist } => format!("{CYAN}▸ {name}{RESET} {gist}\r\n"),
         Event::ToolAnswered { first_line, failed } => {
             let color = if *failed { RED } else { DIM };
@@ -104,6 +101,53 @@ pub fn lines(event: &Event) -> String {
         }
         Event::Finished(outcome) => finished_lines(outcome),
     }
+}
+
+/// What Claude said, laid out as a markdown page `width` columns wide, in
+/// the terminal's own colors.
+fn said_lines(text: &str, width: u16) -> String {
+    let mut lines = String::new();
+    for line in markdown::render(text, usize::from(width).max(1)) {
+        for piece in line {
+            let codes = sgr(piece.mark);
+            if codes.is_empty() {
+                lines.push_str(&piece.text);
+            } else {
+                lines.push_str(&format!("\x1b[{codes}m{}{RESET}", piece.text));
+            }
+        }
+        lines.push_str("\r\n");
+    }
+    lines
+}
+
+/// The SGR parameters a piece of a page marked `mark` is drawn with: the
+/// terminal's sixteen colors, and no surface behind code, since none could
+/// be picked without knowing them.
+fn sgr(mark: Mark) -> String {
+    let color = match mark.ink {
+        Ink::Text | Ink::Token(TokenKind::Text) => None,
+        Ink::Muted | Ink::Rule | Ink::Token(TokenKind::Comment) => Some("2"),
+        Ink::Accent => Some("35"),
+        Ink::Code => Some("36"),
+        Ink::Token(TokenKind::Keyword) => Some("34"),
+        Ink::Done | Ink::Token(TokenKind::String) => Some("32"),
+        Ink::Warning | Ink::Token(TokenKind::Number) => Some("33"),
+        Ink::Failed => Some("31"),
+    };
+    let modifiers = [
+        (Modifier::BOLD, "1"),
+        (Modifier::ITALIC, "3"),
+        (Modifier::UNDERLINED, "4"),
+        (Modifier::CROSSED_OUT, "9"),
+    ];
+    let mut codes: Vec<&str> = modifiers
+        .into_iter()
+        .filter(|(modifier, _)| mark.modifier.contains(*modifier))
+        .map(|(_, code)| code)
+        .collect();
+    codes.extend(color);
+    codes.join(";")
 }
 
 /// The lines for a note between runs, dimmed so it isn't taken for
@@ -399,10 +443,13 @@ mod tests {
 
     #[test]
     fn lines_are_terminal_lines() {
-        let used = lines(&Event::UsedTool {
-            name: "Bash".into(),
-            gist: "cargo test".into(),
-        });
+        let used = lines(
+            &Event::UsedTool {
+                name: "Bash".into(),
+                gist: "cargo test".into(),
+            },
+            80,
+        );
         assert!(used.contains("▸ Bash") && used.contains("cargo test"));
         assert!(used.ends_with("\r\n"));
         assert_eq!(
@@ -421,7 +468,7 @@ mod tests {
             duration_ms: 72_000,
             refused: vec!["Bash rm -rf build".into()],
         };
-        let shown = lines(&Event::Finished(outcome));
+        let shown = lines(&Event::Finished(outcome), 80);
         assert!(shown.contains("✓ done"));
         assert!(shown.contains("1m 12s"));
         assert!(shown.contains("$0.04"));
@@ -435,6 +482,20 @@ mod tests {
         assert!(asked.contains("waiting on you"));
         assert!(answered_lines("allowed always · Bash(cargo test:*)").starts_with(GREEN));
         assert!(answered_lines("denied").starts_with(DIM));
+    }
+
+    #[test]
+    fn what_claude_says_is_a_markdown_page_as_wide_as_the_screen() {
+        let said = Event::Said("# Done\n\nThe **tests** pass: `cargo test`.\n".into());
+        assert_eq!(
+            lines(&said, 80),
+            format!(
+                "\x1b[1;35mDone{RESET}\r\n\x1b[2m━━━━{RESET}\r\n\r\n\
+                 The \x1b[1mtests{RESET} pass: \x1b[36mcargo test{RESET}.\r\n"
+            )
+        );
+        let long = Event::Said("one two three four five".into());
+        assert_eq!(lines(&long, 10), "one two\r\nthree four\r\nfive\r\n");
     }
 
     #[test]

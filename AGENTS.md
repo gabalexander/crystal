@@ -106,12 +106,16 @@ is: it's the one request every version must understand.
     files marked reviewed, for each worktree's diff at its commit or each pull request's, with their hashes,
     and whether it lists files as a tree
   - `fuzzy.rs`: how a path matches a few typed letters, and how well
-  - `finder.rs`: the file finder (`p`): its state, keys and drawing, listing files and reading the
-    preview off the event loop
+  - `finder.rs`: the file finder (`p`): its state, keys and drawing, and listing files off the event loop
   - `grep.rs`: find in files (`G`): `git grep` as you type, run off the event loop once the typing stops,
     the lines found under their files, the preview around one, and its drawing
   - `switcher.rs`: the branch switcher (`B`): the branches filtered as you type, the question about the
     worktree's uncommitted changes and the commit message, kept apart from I/O, and its drawing
+  - `tree_browser.rs`: the tree browser (`E`): a worktree's files as a tree, folded and opened, the filter
+    that narrows it to the files that match and their directories, the border dragged, its keys and drawing;
+    kept apart from I/O, so it's unit-tested
+  - `preview.rs`: the file finder's and the tree browser's preview: a file read and highlighted off the
+    event loop, a markdown file's page laid out for its width or its source, scrolling, and drawing them
   - `memory_view.rs`: the memory view (`m`): a project's entries, the filter, forgetting and
     promoting after a `y`, and its drawing
   - `plugins_view.rs`: the plugins view (`X`): every plugin, on or off, with installed ones' actions and panes,
@@ -154,7 +158,22 @@ is: it's the one request every version must understand.
 - `src/claude_stream.rs`: Claude Code's stream-json protocol, as crystal speaks it with a background task's
   `claude -p`: prompts in, the control messages that carry a permission prompt out and its answer back, an
   interrupt, and the rule "always" keeps; adapted from docket's `docket-claude`
-- `src/transcript.rs`: reading `claude -p`'s stream-json events, and drawing them as a task's transcript
+- `src/transcript.rs`: reading `claude -p`'s stream-json events, and drawing them as a task's transcript,
+  Claude's answers as markdown pages
+- `src/markdown.rs`: markdown laid out as a page for one width (pulldown-cmark), each piece marked with what
+  it is for the TUI's theme or a transcript's colors to draw, mermaid fences drawn as diagrams; adapted from
+  docket's
+- `src/syntax.rs`: highlighting code a line at a time, by a file's name or a fence's language: comments,
+  strings, numbers and keywords, without a highlighter crate
+- `src/mermaid/`: mermaid diagrams drawn as box-drawing text, pure and never panicking; adapted from docket's
+  `docket-mermaid`, its drawings checked against `tests/mermaid/`
+  - `mod.rs`: `render`, the kinds drawn, and telling which kind a diagram is
+  - `canvas.rs`: the grid of cells a diagram is drawn into, and the glyphs, box drawing or ASCII
+  - `graph.rs`: the layered layout every kind but the sequence goes through
+  - `sequence.rs`: sequence diagrams, read and laid out on their own
+  - `flowchart.rs`, `state.rs`, `class.rs`, `er.rs`: each kind read into a graph
+  - `width.rs`: how many columns text takes, and cutting it to fit
+- `src/mermaid_cli.rs`: `crystal mermaid`: a diagram, or a markdown file's, drawn on standard output
 - `src/spending.rs`: what background tasks have spent today, kept in the database by the day: the TUI footer's
   `$X today`, and what `daily_budget_usd` is held against
 - `src/protocol.rs`: requests and responses, one JSON line each, and the frames an attached client sends
