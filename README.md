@@ -84,8 +84,10 @@ and the footer says where you are and offers the keys that matter there.
 | `j` / `k`, `↓` / `↑` | select a session |
 | `Enter` | type into the selected session, or start an ended one again, once you've said `y` |
 | `s` | split the selected session off into a pane of its own, or close its split |
+| `z` | [zoom](#zoom-copy-mode-and-search) the selected session's pane to take the whole screen, or put it back |
 | `Tab` / `Shift+Tab` | type into the next pane, or the one before |
 | `PageUp` / `PageDown` | page the selected session's pane back through its history, or forward to live |
+| `v` | [copy mode](#zoom-copy-mode-and-search) in the selected session's pane: select, search its history, copy |
 | `t` | make a new [tab](#tabs) with a shell in it, and go to it |
 | `T` | name the tab you're in |
 | `&` | close the tab you're in, and kill its sessions once you've said `y` |
@@ -125,13 +127,15 @@ other, keys arrive the old way.
 Each session keeps the last 2,000 rows that scrolled off its screen, so a pane can page back through what an
 agent wrote before you opened it. The title says how far back you are (`↑ 120 lines`), new output doesn't pull
 you away while you read, and typing into the session brings you back to live. That includes agents that print
-inline through a scroll region, like Codex.
+inline through a scroll region, like Codex. To search that history, or copy from it, there's
+[copy mode](#zoom-copy-mode-and-search).
 
 The mouse works too. Click a session in the sidebar to select it, or click a pane to type into it. The wheel
-moves the selection over the sidebar, and scrolls a pane through its history. A program that asks for the
-mouse itself, like `vim` with `set mouse=a` or `htop`, gets the clicks, drags and the wheel in its pane while
-that pane has the keyboard. Since crystal takes the mouse, your terminal's own text selection needs a key held:
-`Shift` in most terminals, `Option` in iTerm2 and Terminal on macOS.
+moves the selection over the sidebar, and scrolls a pane through its history. Drag across a pane to select
+text: it goes to your clipboard as you let go, and stays marked until you click or type. A program that asks
+for the mouse itself, like `vim` with `set mouse=a` or `htop`, gets the clicks, drags and the wheel in its pane
+while that pane has the keyboard; there, your terminal's own selection still works with a key held: `Shift` in
+most terminals, `Option` in iTerm2 and Terminal on macOS.
 
 A split keeps a session on screen while the selection moves on: up to two of them, beside the selected
 session's pane when each pane can be at least 80 columns wide, and stacked below it when not. Each pane's
@@ -286,6 +290,46 @@ goes in the tab with the rest of its run. `>` moves the selected session to anot
 number next, or `t` to make a new tab for it. `&` closes the tab you're in and kills the sessions in it, once
 you've said `y`; an empty tab closes at once. There's always one tab, and nine at most. They're kept beside the
 daemon's state, in `~/.local/state/crystal/`, so they're there when you open the TUI again.
+
+### Zoom, copy mode and search
+
+`z` zooms the selected session's pane: it takes the whole screen between the top bar and the footer, and the
+sidebar and the other panes step aside until `z` puts them back. The session is sized to the zoomed pane, as
+any pane's is. The keyboard stays where it was, so `j` and `k` go on choosing the session the pane shows, and
+`Enter` types into it. `/` brings the sidebar out over the pane while you look through it. Each tab is zoomed
+or not on its own, and stays that way when you open the TUI again.
+
+`v` puts the selected session's pane in copy mode: a cursor of its own that moves over the screen and back
+through the history with vi's keys, while the program goes on running and its output goes on showing. It
+works on a session that has ended too, on the last it showed. `Ctrl+\` leaves copy mode for the sidebar.
+
+| Key | In copy mode |
+|---|---|
+| `h` `j` `k` `l`, the arrows | move a character or a row; up past the top goes back through the history |
+| `w` / `b` / `e` | to the next word, back a word, to the end of the word; `W` `B` `E` take only blanks to end one |
+| `0` / `^` / `$` | to the start of the line, its first character, its end |
+| `H` / `M` / `L` | to the top, middle or bottom row showing |
+| `{` / `}`, `%` | to the blank line before or after the paragraph; to the bracket that pairs with this one |
+| `gg` / `G` | to the top of the history, or the bottom of the screen |
+| `Ctrl+U` / `Ctrl+D` | half a screen back, or forward |
+| `Ctrl+B` / `Ctrl+F`, `PageUp` / `PageDown` | a screen back, or forward |
+| `v` or `Space` / `V` / `Ctrl+V` | select from here as the cursor moves: characters, whole lines, or a block |
+| `y` or `Enter` | copy the selection, and leave copy mode |
+| `Y` | copy the line the cursor is on, and leave copy mode |
+| `/` / `?` | search down, or up, for what you type next; `Enter` searches |
+| `n` / `N` | the next match the same way, or the other way |
+| `Esc` | drop the selection, then the search, then leave copy mode |
+| `q`, `Ctrl+C` | leave copy mode |
+
+A search finds what you type as it's written, letter for letter, across lines that wrapped, and ignores case
+unless you type a capital. Every match on screen is marked, the one the cursor is on most of all, and the
+footer says which it is: `of: 3 of 12`, counted from the top of the history. A search goes round: down past the
+last match, it starts again at the top.
+
+What you copy goes to your clipboard. On your own machine crystal hands it to `pbcopy` on macOS, or to
+`wl-copy`, `xclip` or `xsel` on Linux. Over ssh, or with none of those, it asks the terminal you're in to take
+it, with OSC 52, which puts it on the clipboard of the machine your terminal runs on: Ghostty, kitty, WezTerm,
+Alacritty, foot and Windows Terminal do; iTerm2 once you allow it in its settings; macOS's Terminal doesn't.
 
 ### Starting a session
 

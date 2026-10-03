@@ -70,7 +70,10 @@ is: it's the one request every version must understand.
   - `issues.rs`: the issues view `i` opens: its state, kept apart from I/O, and its drawing
   - `backlog_view.rs`: the backlog view `b` opens: its state and keys, kept apart from I/O, and its
     drawing
-  - `pane.rs`: a viewer of a session on screen, the selected one or a split, and its screen
+  - `pane.rs`: a viewer of a session on screen, the selected one or a split, and its screen, with copy mode
+    over it while that's on
+  - `copy_mode.rs`: copy mode (`v`): vi's keys over a pane's screen and history, selecting, searching, and
+    the text to copy; works on the screen, kept apart from I/O
   - `screen_widget.rs`: draws a session's screen into ratatui, for the panes and `crystal attach`
   - `diff.rs`: reads `git diff`'s patch into files, hunks and lines, marks the words that changed,
     and lays a file out in rows, unified or side by side; pure, so it's unit-tested
@@ -98,8 +101,10 @@ is: it's the one request every version must understand.
 - `src/session.rs`: one program in a PTY, or a task: spawn, exit status, stop, and its screen and viewers
 - `src/vt.rs`: a terminal's screen, through `alacritty_terminal`: what a program drew and its history, the modes
   it set, its answers to the program's questions (the daemon's screen only), the output that catches a new viewer
-  up, the cells to draw, and the input modes `crystal attach` asks your terminal for. The only module that uses
-  `alacritty_terminal`
+  up, the cells to draw, the input modes `crystal attach` asks your terminal for, and, for a viewer, copy mode's
+  cursor, selection and search, which are Alacritty's vi mode. The only module that uses `alacritty_terminal`
+- `src/clipboard.rs`: putting text on the user's clipboard: `pbcopy`, `wl-copy`, `xclip` or `xsel` on their own
+  machine, or OSC 52 to their terminal over ssh or when none of those works
 - `src/task.rs`: tasks: Claude Code run without a terminal (`claude -p`), one run per prompt or follow-up
 - `src/transcript.rs`: reading `claude -p`'s stream-json events, and drawing them as a task's transcript
 - `src/protocol.rs`: requests and responses, one JSON line each, and the frames an attached client sends
@@ -145,4 +150,5 @@ is: it's the one request every version must understand.
   their own that turns notifications and the memory plugin off (a memory test turns it back on), and plugins
   of their own in its plugins directory; a test that opens the new-session panel pins `PATH` to its fake
   agents, so no real agent is found or run. vt100 stands in for the user's own terminal: a second emulator,
-  apart from crystal's
+  apart from crystal's. A test that copies runs the TUI as over ssh (`SSH_TTY` set), so it asks the terminal
+  with OSC 52 and never touches the machine's clipboard

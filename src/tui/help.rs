@@ -53,7 +53,7 @@ pub const KEYS: &[Key] = &[
     sidebar("j/k ↓/↑", "select a session"),
     sidebar("Enter", "type into it, or rerun"),
     sidebar("Tab/Shift+Tab", "next / previous pane"),
-    sidebar("s", "split off, or unsplit"),
+    sidebar("s/z/v", "split / zoom / copy"),
     sidebar("PageUp/PageDown", "page its history"),
     sidebar("t/T/&", "tab: new / name / close"),
     sidebar("[/] 1-9 >", "switch tabs / move it"),
@@ -82,7 +82,7 @@ pub const KEYS: &[Key] = &[
     new_session("Ctrl+E", "edit the command line"),
     mouse("click", "a session, pane, tab"),
     mouse("wheel", "move, or scroll a pane"),
-    mouse("Shift+drag", "select text"),
+    mouse("drag", "select and copy"),
 ];
 
 const fn key(section: Section, label: &'static str, does: &'static str) -> Key {

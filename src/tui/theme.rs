@@ -47,6 +47,12 @@ pub struct Theme {
     pub added_words: Style,
     /// The words that changed inside a removed line: the stronger red.
     pub removed_words: Style,
+    /// Text selected in a pane, to copy.
+    pub copy_selection: Style,
+    /// What a search through a pane's history found.
+    pub found: Style,
+    /// The match copy mode's cursor is on.
+    pub found_current: Style,
 }
 
 impl Theme {
@@ -92,6 +98,11 @@ impl Theme {
             removed_line: Style::new().bg(Color::Rgb(58, 26, 32)),
             added_words: Style::new().bg(Color::Rgb(36, 92, 60)),
             removed_words: Style::new().bg(Color::Rgb(112, 40, 52)),
+            copy_selection: Style::new().bg(Color::Rgb(70, 62, 130)),
+            found: Style::new().bg(Color::Rgb(92, 72, 30)),
+            found_current: Style::new()
+                .fg(Color::Rgb(16, 18, 24))
+                .bg(Color::Rgb(255, 164, 84)),
         }
     }
 
@@ -118,6 +129,11 @@ impl Theme {
             removed_line: Style::new().bg(Color::Rgb(253, 232, 232)),
             added_words: Style::new().bg(Color::Rgb(170, 230, 188)),
             removed_words: Style::new().bg(Color::Rgb(248, 186, 186)),
+            copy_selection: Style::new().bg(Color::Rgb(206, 198, 248)),
+            found: Style::new().bg(Color::Rgb(250, 226, 160)),
+            found_current: Style::new()
+                .fg(Color::Rgb(250, 249, 246))
+                .bg(Color::Rgb(196, 98, 16)),
         }
     }
 
@@ -150,6 +166,9 @@ impl Theme {
                 .fg(Color::Green)
                 .add_modifier(Modifier::REVERSED),
             removed_words: Style::new().fg(Color::Red).add_modifier(Modifier::REVERSED),
+            copy_selection: Style::new().add_modifier(Modifier::REVERSED),
+            found: Style::new().fg(Color::Black).bg(Color::Yellow),
+            found_current: Style::new().fg(Color::Black).bg(Color::LightRed),
         }
     }
 
@@ -178,6 +197,11 @@ impl Theme {
             removed_line: Style::new(),
             added_words: Style::new().add_modifier(Modifier::UNDERLINED),
             removed_words: Style::new().add_modifier(Modifier::UNDERLINED),
+            // Reversed is the selection; what a search found is underlined,
+            // and the match the cursor is on bold as well.
+            copy_selection: Style::new().add_modifier(Modifier::REVERSED),
+            found: Style::new().add_modifier(Modifier::UNDERLINED),
+            found_current: Style::new().add_modifier(Modifier::UNDERLINED.union(Modifier::BOLD)),
         }
     }
 

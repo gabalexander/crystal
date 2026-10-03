@@ -141,18 +141,22 @@ impl Crystal {
         drop(pty.slave);
 
         let screen = Arc::new(Mutex::new(vt100::Parser::new(24, 80, 0)));
+        let written = Arc::new(Mutex::new(Vec::new()));
         let mut output = pty.master.try_clone_reader().unwrap();
         thread::spawn({
             let screen = screen.clone();
+            let written = written.clone();
             move || {
                 let mut buf = [0; 4096];
                 while let Ok(n @ 1..) = output.read(&mut buf) {
                     screen.lock().unwrap().process(&buf[..n]);
+                    written.lock().unwrap().extend_from_slice(&buf[..n]);
                 }
             }
         });
         Terminal {
             screen,
+            written,
             keys: pty.master.take_writer().unwrap(),
             pty: pty.master,
             child,
@@ -162,6 +166,9 @@ impl Crystal {
 
 struct Terminal {
     screen: Arc<Mutex<vt100::Parser>>,
+    /// Everything crystal wrote to the terminal, for what vt100 doesn't
+    /// keep, like a request to put text on the clipboard.
+    written: Arc<Mutex<Vec<u8>>>,
     keys: Box<dyn Write + Send>,
     pty: Box<dyn MasterPty + Send>,
     child: Box<dyn Child + Send + Sync>,
@@ -208,6 +215,32 @@ impl Terminal {
         }
     }
 
+    /// Waits until crystal has asked the terminal, with OSC 52, to put
+    /// `text` on the clipboard.
+    fn copies(&self, text: &str) {
+        let request = format!("\x1b]52;c;{}\x07", base64(text.as_bytes()));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let written = self.written.lock().unwrap().clone();
+            if written
+                .windows(request.len())
+                .any(|window| window == request.as_bytes())
+            {
+                return;
+            }
+            let asked: Vec<String> = String::from_utf8_lossy(&written)
+                .split("\x1b]52;c;")
+                .skip(1)
+                .map(|rest| rest.split('\x07').next().unwrap_or("").to_string())
+                .collect();
+            assert!(
+                Instant::now() < deadline,
+                "{text:?} was never copied; crystal asked for {asked:?}"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     fn type_keys(&mut self, keys: &str) {
         self.keys.write_all(keys.as_bytes()).unwrap();
         self.keys.flush().unwrap();
@@ -239,6 +272,28 @@ impl Drop for Terminal {
     fn drop(&mut self) {
         let _ = self.child.kill();
     }
+}
+
+/// `bytes` in base64, as OSC 52 carries them.
+fn base64(bytes: &[u8]) -> String {
+    const LETTERS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = u32::from(b[0]) << 16 | u32::from(b[1]) << 8 | u32::from(b[2]);
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(LETTERS[(n >> (18 - 6 * i) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
 }
 
 fn size(rows: u16, cols: u16) -> PtySize {
@@ -1202,6 +1257,92 @@ fn the_session_in_the_pane_is_sized_to_the_pane() {
 
     tui.resize(30, 100);
     eventually("the session follows the pane", || size_is("27 71\n"));
+}
+
+#[test]
+fn z_zooms_the_pane_over_the_whole_screen_and_back() {
+    let crystal = Crystal::new();
+    crystal.ok(&[
+        "new",
+        "-n",
+        "sizer",
+        "sh",
+        "-c",
+        "trap 'stty size > size' WINCH; echo watching; while :; do sleep 0.05; done",
+    ]);
+    let size = crystal.dir.path().join("size");
+    let size_is = |expected: &str| std::fs::read_to_string(&size).is_ok_and(|s| s == expected);
+
+    let mut tui = crystal.tui();
+    tui.shows("watching");
+    eventually("the session is the pane's size", || size_is("21 51\n"));
+
+    // Zoomed, the pane has all 80 columns: the sidebar has stepped aside.
+    tui.type_keys("z");
+    tui.shows("sizer · zoomed");
+    eventually("the session is the zoomed pane's size", || {
+        size_is("21 80\n")
+    });
+    tui.type_keys("z");
+    tui.hides("zoomed");
+    eventually("the session is the pane's size again", || {
+        size_is("21 51\n")
+    });
+}
+
+/// Opens the TUI the way it runs over ssh, so that what it copies goes to
+/// the terminal, with OSC 52, rather than to this machine's clipboard.
+fn tui_over_ssh(crystal: &Crystal) -> Terminal {
+    crystal.attach_with_env(&[], &[("SSH_TTY", "/dev/ttys999")])
+}
+
+#[test]
+fn copy_mode_finds_text_in_the_history_and_copies_it() {
+    let crystal = Crystal::new();
+    let script = "for i in $(seq 1 60); do echo row $i; done; echo the needle is here; \
+                  for i in $(seq 61 120); do echo row $i; done; sleep 30";
+    crystal.ok(&["new", "-n", "printer", "sh", "-c", script]);
+
+    let mut tui = tui_over_ssh(&crystal);
+    tui.shows("row 120");
+    tui.type_keys("v");
+    tui.shows("copying from printer");
+    tui.type_keys("?needle");
+    tui.shows("search up: needle");
+    tui.type_keys("\r");
+    tui.shows("the needle is here");
+    tui.shows("needle: 1 of 1");
+
+    // The search left the cursor on "needle": select to the end of the
+    // line, and copy it.
+    tui.type_keys("v$y");
+    tui.copies("needle is here");
+    tui.shows("copied 1 line");
+    // Copy mode is over, and the keyboard is back in the sidebar.
+    tui.type_keys("j");
+    tui.shows("q quit");
+}
+
+#[test]
+fn a_drag_across_a_pane_copies_what_it_covers() {
+    let crystal = Crystal::new();
+    crystal.ok(&[
+        "new",
+        "-n",
+        "words",
+        "sh",
+        "-c",
+        "echo alpha beta gamma; sleep 30",
+    ]);
+
+    let mut tui = tui_over_ssh(&crystal);
+    tui.shows("alpha beta gamma");
+    // The pane's screen starts at column 30, row 3, counting from 1 as the
+    // mouse does: "beta" is at columns 36 to 39 of the first row. Down on
+    // its first letter, drag to its last, and let go.
+    tui.type_keys("\x1b[<0;36;3M\x1b[<32;39;3M\x1b[<0;39;3m");
+    tui.copies("beta");
+    tui.shows("copied 1 line");
 }
 
 #[test]

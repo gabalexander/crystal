@@ -9,6 +9,7 @@
 mod app;
 mod backlog_view;
 mod command_line;
+mod copy_mode;
 mod diff;
 mod diff_view;
 mod finder;
@@ -40,7 +41,7 @@ use crate::plugins::{self, Context};
 use crate::profile;
 use crate::protocol::{Backlog, NewSession, Request, Response, SessionInfo};
 use crate::{catalog, keys, typing};
-use crate::{client, env};
+use crate::{client, clipboard, env};
 use anyhow::{Context as _, Result, bail};
 use app::{Action, App, Focus, Hit, Place, PluginKey, PluginPane, Slot};
 use backlog_view::BacklogChange;
@@ -292,7 +293,7 @@ impl Tui {
         while !self.quitting {
             let size = terminal.size()?;
             self.screen = Rect::new(0, 0, size.width, size.height);
-            let areas = ui::Areas::new(self.screen, self.app.splits().len());
+            let areas = ui::Areas::of(&self.app, self.screen);
             self.sync_panes(&areas);
             if let Some(overlay) = &mut self.overlay {
                 let screen = ui::plugin_pane_screen(&areas);
@@ -452,9 +453,14 @@ impl Tui {
         if self.overlay.is_some() {
             return;
         }
-        let areas = ui::Areas::new(self.screen, self.app.splits().len());
-        let hit = ui::hit(&areas, &self.app, mouse.column, mouse.row);
-        if self.pass_to_program(&mouse, hit) {
+        let areas = ui::Areas::of(&self.app, self.screen);
+        let mut hit = ui::hit(&areas, &self.app, mouse.column, mouse.row);
+        if let Some(slot) = self.app.dragging() {
+            // A selection being dragged is crystal's to the end, and keeps
+            // to the edge of its pane when the mouse leaves it.
+            let cell = ui::nearest_cell(&areas, &self.app, slot, mouse.column, mouse.row);
+            hit = Hit::Pane { slot, cell };
+        } else if self.pass_to_program(&mouse, hit) {
             return;
         }
         if let Some(action) = self.app.on_mouse(mouse.kind, hit) {
@@ -737,6 +743,44 @@ impl Tui {
                     pane.scroll_forward();
                 }
             }
+            Action::CopyKey { slot, key } => {
+                let Some(pane) = self.pane_in(slot) else {
+                    self.app.stop_copying();
+                    return Ok(());
+                };
+                match pane.copy_key(key) {
+                    copy_mode::Outcome::Stay => {}
+                    copy_mode::Outcome::Say(said) => self.app.notify(said),
+                    copy_mode::Outcome::Leave => self.app.stop_copying(),
+                    copy_mode::Outcome::Copy(text) => {
+                        self.app.stop_copying();
+                        self.copy_to_clipboard(&text)?;
+                    }
+                }
+            }
+            Action::CopyPaste { slot, text } => {
+                if let Some(copy) = self.pane_in(slot).and_then(|pane| pane.copy.as_mut()) {
+                    copy.on_paste(&text);
+                }
+            }
+            Action::SelectFrom { slot, cell } => {
+                if let Some(pane) = self.pane_in(slot) {
+                    pane.select_from(cell);
+                }
+            }
+            Action::SelectTo { slot, cell } => {
+                if let Some(pane) = self.pane_in(slot) {
+                    pane.select_to(cell);
+                }
+            }
+            Action::CopySelection(slot) => {
+                let text = self
+                    .pane_in(slot)
+                    .and_then(|pane| pane.screen.selected_text());
+                if let Some(text) = text {
+                    self.copy_to_clipboard(&text)?;
+                }
+            }
             Action::OpenPullRequest { project, number } => {
                 // gh goes over the network: off the loop, saying only what
                 // went wrong.
@@ -755,6 +799,15 @@ impl Tui {
                 });
             }
         }
+        Ok(())
+    }
+
+    /// Puts `text` on the user's clipboard, and says how much went.
+    fn copy_to_clipboard(&mut self, text: &str) -> Result<()> {
+        clipboard::copy(text).context("couldn't copy")?;
+        let lines = text.lines().count().max(1);
+        let noun = if lines == 1 { "line" } else { "lines" };
+        self.app.notify(format!("copied {lines} {noun}"));
         Ok(())
     }
 
@@ -871,7 +924,7 @@ impl Tui {
         let Some(Response::Created { name }) = client::ask(&self.socket, &request, true)? else {
             bail!("the daemon didn't start {plugin}'s pane");
         };
-        let areas = ui::Areas::new(self.screen, self.app.splits().len());
+        let areas = ui::Areas::of(&self.app, self.screen);
         let screen = ui::plugin_pane_screen(&areas);
         self.last_pane_id += 1;
         let (id, events) = (self.last_pane_id, self.events.clone());
@@ -957,6 +1010,8 @@ impl Tui {
                 if pane.size() != (rows, cols) {
                     pane.resize(rows, cols);
                 }
+                // Copy mode is on in a pane while the keyboard is in it.
+                pane.set_copying(self.app.focus() == Focus::Copy(slot));
                 self.panes.push(pane);
             }
         }

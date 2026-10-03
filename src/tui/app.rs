@@ -47,6 +47,9 @@ pub enum Focus {
     Sidebar,
     /// Keys go to the session in this pane.
     Pane(Slot),
+    /// Keys move copy mode's cursor over this pane's screen and history,
+    /// select from it and search it.
+    Copy(Slot),
 }
 
 /// What the mouse is over, worked out from the layout by `ui::hit`.
@@ -272,6 +275,30 @@ pub enum Action {
     ScrollBack(Slot),
     /// Show a few lines further toward live in the pane at this slot.
     ScrollForward(Slot),
+    /// A key for copy mode in the pane at `slot`.
+    CopyKey {
+        slot: Slot,
+        key: KeyEvent,
+    },
+    /// Text pasted while copy mode in the pane at this slot has the keyboard.
+    CopyPaste {
+        slot: Slot,
+        text: String,
+    },
+    /// The mouse went down on `cell` of the screen of the pane at `slot`,
+    /// where a selection starts if it drags.
+    SelectFrom {
+        slot: Slot,
+        cell: (u16, u16),
+    },
+    /// The mouse dragged to `cell` of the screen of the pane at `slot`.
+    SelectTo {
+        slot: Slot,
+        cell: (u16, u16),
+    },
+    /// The mouse let go: put what it selected in the pane at this slot on
+    /// the clipboard.
+    CopySelection(Slot),
     /// Open pull request `number` of the project at `project` in the
     /// browser.
     OpenPullRequest {
@@ -423,6 +450,9 @@ pub struct App {
     /// The pane the keyboard was in last, so that Tab in the sidebar goes
     /// on to the next one.
     last_pane: Option<Slot>,
+    /// The pane a drag of the mouse started in, while the button is down:
+    /// the drag is a selection in that pane to the end, wherever it goes.
+    dragging: Option<Slot>,
     /// The id of the session this TUI runs in, if it runs in one. The pane
     /// never shows it: it would be showing itself.
     own_id: Option<String>,
@@ -496,6 +526,7 @@ impl App {
             moving: None,
             focus: Focus::Sidebar,
             last_pane: None,
+            dragging: None,
             own_id,
             notice: None,
             showing_keys: false,
@@ -1002,11 +1033,26 @@ impl App {
         &self.tabs.current().splits
     }
 
-    /// The panes beside the sidebar, in the order they're drawn: the one
-    /// that follows the selection, then each split.
+    /// The panes on screen, in the order they're drawn: the one that
+    /// follows the selection, then each split. Zoomed, only the pane that
+    /// shows the selected session.
     pub fn slots(&self) -> Vec<Slot> {
+        if self.zoomed() {
+            return vec![self.selected_slot().unwrap_or(Slot::Selected)];
+        }
         let splits = (0..self.splits().len()).map(Slot::Split);
         std::iter::once(Slot::Selected).chain(splits).collect()
+    }
+
+    /// Whether the tab in front is zoomed: the selected session's pane
+    /// takes the room of the sidebar and the other panes.
+    pub fn zoomed(&self) -> bool {
+        self.tabs.current().zoomed
+    }
+
+    /// The pane a drag of the mouse is selecting in, while it lasts.
+    pub fn dragging(&self) -> Option<Slot> {
+        self.dragging
     }
 
     /// The session the pane at `slot` is about: the selected one, or the
@@ -1024,11 +1070,14 @@ impl App {
     /// Whether the pane at `slot` shows its session's screen. The pane that
     /// follows the selection doesn't when the selected session is split
     /// off, so that no session is drawn twice at two sizes, nor when it's
-    /// the session this TUI runs in.
+    /// the session this TUI runs in. Zoomed, no other pane is on screen.
     pub fn shows_screen(&self, slot: Slot) -> bool {
         let Some(session) = self.pane_session(slot) else {
             return false;
         };
+        if self.zoomed() && Some(slot) != self.selected_slot() {
+            return false;
+        }
         match slot {
             Slot::Selected => !self.selected_is_own() && !self.is_split(&session.name),
             Slot::Split(_) => true,
@@ -1079,9 +1128,13 @@ impl App {
         self.close_splits_of_gone_sessions();
         self.place_sessions();
         self.keep_selection_in_tab();
-        if let Focus::Pane(slot) = self.focus
-            && !self.can_type_into(slot)
-        {
+        let keeps_keyboard = match self.focus {
+            Focus::Sidebar => true,
+            Focus::Pane(slot) => self.can_type_into(slot),
+            // An ended session's last screen can still be copied from.
+            Focus::Copy(slot) => self.shows_screen(slot),
+        };
+        if !keeps_keyboard {
             self.focus = Focus::Sidebar;
         }
     }
@@ -1253,6 +1306,7 @@ impl App {
         match self.focus {
             Focus::Sidebar => self.on_sidebar_key(key),
             Focus::Pane(slot) => self.on_pane_key(slot, key),
+            Focus::Copy(slot) => self.on_copy_key(slot, key),
         }
     }
 
@@ -1296,12 +1350,38 @@ impl App {
         if click {
             self.notice = None;
         }
+        // A drag selects in the pane it started in until the button comes
+        // up, wherever it goes meanwhile.
+        if let Some(slot) = self.dragging {
+            match (kind, hit) {
+                (MouseEventKind::Drag(MouseButton::Left), Hit::Pane { slot: at, cell })
+                    if at == slot =>
+                {
+                    return cell.map(|cell| Action::SelectTo { slot, cell });
+                }
+                (MouseEventKind::Up(_), _) => {
+                    self.dragging = None;
+                    return Some(Action::CopySelection(slot));
+                }
+                // The button came up somewhere nothing heard it: this is a
+                // new click.
+                (MouseEventKind::Down(_), _) => self.dragging = None,
+                _ => return None,
+            }
+        }
         match (kind, hit) {
             (_, Hit::Tab(index)) if click => self.go_to_tab(index),
             (_, Hit::SidebarRow(row)) if click => self.click_row(row),
-            (_, Hit::Pane { slot, .. }) if click => {
-                if self.can_type_into(slot) {
+            (_, Hit::Pane { slot, cell }) if click => {
+                // A click hands a pane the keyboard, but copy mode keeps it.
+                if self.focus != Focus::Copy(slot) && self.can_type_into(slot) {
                     self.focus_pane(slot);
+                }
+                if let Some(cell) = cell
+                    && self.shows_screen(slot)
+                {
+                    self.dragging = Some(slot);
+                    return Some(Action::SelectFrom { slot, cell });
                 }
             }
             (MouseEventKind::ScrollUp, Hit::SidebarRow(_) | Hit::Sidebar) => {
@@ -1347,6 +1427,8 @@ impl App {
             KeyCode::Tab => self.move_to_pane(Direction::Forward),
             KeyCode::BackTab => self.move_to_pane(Direction::Back),
             KeyCode::Char('s') => self.toggle_split(),
+            KeyCode::Char('z') => self.toggle_zoom(),
+            KeyCode::Char('v') => self.start_copying(),
             KeyCode::Char('t') => return self.new_tab(),
             KeyCode::Char('T') => self.ask_for_tab_name(),
             KeyCode::Char('&') => self.close_tab(),
@@ -2104,6 +2186,8 @@ impl App {
             self.keep_filter_bar_on_a_match();
         } else if let Focus::Pane(slot) = self.focus {
             return Some(Action::Paste { to: slot, text });
+        } else if let Focus::Copy(slot) = self.focus {
+            return Some(Action::CopyPaste { slot, text });
         }
         None
     }
@@ -2208,6 +2292,46 @@ impl App {
             KeyCode::PageDown if shift => Some(Action::PageForward(slot)),
             _ => Some(Action::Type { to: slot, key }),
         }
+    }
+
+    /// Every key goes to copy mode, but Ctrl+\, which leaves it for the
+    /// sidebar.
+    fn on_copy_key(&mut self, slot: Slot, key: KeyEvent) -> Option<Action> {
+        if keys::is_hand_back(&key) {
+            self.focus = Focus::Sidebar;
+            return None;
+        }
+        Some(Action::CopyKey { slot, key })
+    }
+
+    /// `v`: turns copy mode on in the pane that shows the selected session,
+    /// and hands it the keyboard. A session that's ended can still be
+    /// copied from.
+    fn start_copying(&mut self) {
+        let Some(slot) = self.selected_slot() else {
+            return;
+        };
+        if self.shows_screen(slot) {
+            self.focus = Focus::Copy(slot);
+        } else if self.selected_is_own() {
+            self.notify("crystal can't show the session it runs in".into());
+        }
+    }
+
+    /// Copy mode is over: the keyboard goes back to the sidebar it came
+    /// from.
+    pub fn stop_copying(&mut self) {
+        if let Focus::Copy(_) = self.focus {
+            self.focus = Focus::Sidebar;
+        }
+    }
+
+    /// `z`: zooms the selected session's pane, so it takes the room of the
+    /// sidebar and the other panes, or puts them back. The keyboard stays in
+    /// the sidebar, so `j` and `k` go on choosing the session it shows.
+    fn toggle_zoom(&mut self) {
+        let tab = self.tabs.current_mut();
+        tab.zoomed = !tab.zoomed;
     }
 
     /// Splits the selected session off into a pane of its own, or closes
@@ -3409,6 +3533,177 @@ mod tests {
             key: page_up,
         };
         assert_eq!(app.on_key(page_up), Some(typed));
+    }
+
+    #[test]
+    fn z_zooms_the_selected_sessions_pane_alone_and_again_puts_the_others_back() {
+        let mut app = app_with_splits(&["a", "b", "c"], 1);
+        app.select("b");
+        assert_eq!(on_screen(&app), ["b", "a"]);
+        press(&mut app, KeyCode::Char('z'));
+        assert!(app.zoomed());
+        assert_eq!(on_screen(&app), ["b"]);
+        assert!(!app.shows_screen(Slot::Split(0)));
+        assert_eq!(app.focus(), Focus::Sidebar);
+
+        // Zoomed, j and k choose what the one pane shows: a split session
+        // is shown in its own split's place.
+        press(&mut app, KeyCode::Char('k'));
+        assert_eq!(selected_name(&app), Some("a"));
+        assert_eq!(app.slots(), [Slot::Split(0)]);
+        assert!(app.shows_screen(Slot::Split(0)));
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(on_screen(&app), ["c"]);
+
+        press(&mut app, KeyCode::Char('z'));
+        assert!(!app.zoomed());
+        assert_eq!(on_screen(&app), ["c", "a"]);
+    }
+
+    #[test]
+    fn zoomed_tab_goes_to_the_one_pane_and_enter_types_into_it() {
+        let mut app = app_with_splits(&["a", "b"], 1);
+        press(&mut app, KeyCode::Char('z'));
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.focus(), Focus::Pane(Slot::Selected));
+        hand_back(&mut app);
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(
+            app.focus(),
+            Focus::Pane(Slot::Selected),
+            "the split is put away"
+        );
+        hand_back(&mut app);
+        app.select("a");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.focus(), Focus::Pane(Slot::Split(0)));
+    }
+
+    #[test]
+    fn each_tab_is_zoomed_on_its_own() {
+        let mut app = app_with_a_second_tab(&["a"]);
+        press(&mut app, KeyCode::Char('z'));
+        assert!(app.zoomed());
+        press(&mut app, KeyCode::Char('['));
+        assert!(!app.zoomed());
+        press(&mut app, KeyCode::Char(']'));
+        assert!(app.zoomed());
+        assert!(app.tabs_to_keep().current().zoomed);
+    }
+
+    #[test]
+    fn v_takes_the_keyboard_into_copy_mode_and_every_key_goes_there() {
+        let mut app = app_with_splits(&["a", "b"], 1);
+        app.select("a");
+        press(&mut app, KeyCode::Char('v'));
+        assert_eq!(app.focus(), Focus::Copy(Slot::Split(0)));
+        let q = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE);
+        assert_eq!(
+            app.on_key(q),
+            Some(Action::CopyKey {
+                slot: Slot::Split(0),
+                key: q
+            })
+        );
+        let paste = app.on_paste("text".into());
+        let expected = Action::CopyPaste {
+            slot: Slot::Split(0),
+            text: "text".into(),
+        };
+        assert_eq!(paste, Some(expected));
+
+        // The event loop says when copy mode is over.
+        app.stop_copying();
+        assert_eq!(app.focus(), Focus::Sidebar);
+        press(&mut app, KeyCode::Char('v'));
+        hand_back(&mut app);
+        assert_eq!(app.focus(), Focus::Sidebar);
+    }
+
+    #[test]
+    fn an_ended_session_can_be_copied_from_but_not_the_tuis_own() {
+        let mut app = App::new(None);
+        app.set_sessions(vec![ended("done")]);
+        press(&mut app, KeyCode::Char('v'));
+        assert_eq!(app.focus(), Focus::Copy(Slot::Selected));
+        // Copy mode stays while the ended session is still there to show.
+        app.set_sessions(vec![ended("done")]);
+        assert_eq!(app.focus(), Focus::Copy(Slot::Selected));
+        app.set_sessions(Vec::new());
+        assert_eq!(app.focus(), Focus::Sidebar);
+
+        let mut app = App::new(Some("me".into()));
+        app.set_sessions(vec![session("me")]);
+        press(&mut app, KeyCode::Char('v'));
+        assert_eq!(app.focus(), Focus::Sidebar);
+        assert!(app.notice().unwrap().contains("runs in"));
+    }
+
+    #[test]
+    fn a_drag_selects_in_the_pane_it_started_in_and_letting_go_copies() {
+        let mut app = app_with_splits(&["a", "b"], 1);
+        let down = MouseEventKind::Down(MouseButton::Left);
+        let drag = MouseEventKind::Drag(MouseButton::Left);
+        let up = MouseEventKind::Up(MouseButton::Left);
+        let in_split = |cell| Hit::Pane {
+            slot: Slot::Split(0),
+            cell,
+        };
+        assert_eq!(
+            app.on_mouse(down, in_split(Some((2, 3)))),
+            Some(Action::SelectFrom {
+                slot: Slot::Split(0),
+                cell: (2, 3)
+            })
+        );
+        assert_eq!(app.focus(), Focus::Pane(Slot::Split(0)));
+        assert_eq!(app.dragging(), Some(Slot::Split(0)));
+        assert_eq!(
+            app.on_mouse(drag, in_split(Some((4, 0)))),
+            Some(Action::SelectTo {
+                slot: Slot::Split(0),
+                cell: (4, 0)
+            })
+        );
+        // Over anything else, the drag goes on but selects nothing new.
+        assert_eq!(app.on_mouse(drag, Hit::Sidebar), None);
+        assert_eq!(
+            app.on_mouse(up, Hit::Elsewhere),
+            Some(Action::CopySelection(Slot::Split(0)))
+        );
+        assert_eq!(app.dragging(), None);
+    }
+
+    #[test]
+    fn a_click_in_the_pane_in_copy_mode_leaves_the_keyboard_there() {
+        let mut app = app_with(&["a"]);
+        press(&mut app, KeyCode::Char('v'));
+        let down = MouseEventKind::Down(MouseButton::Left);
+        let hit = Hit::Pane {
+            slot: Slot::Selected,
+            cell: Some((0, 0)),
+        };
+        app.on_mouse(down, hit);
+        assert_eq!(app.focus(), Focus::Copy(Slot::Selected));
+    }
+
+    #[test]
+    fn a_click_after_a_lost_release_starts_afresh() {
+        let mut app = app_with_splits(&["a", "b"], 1);
+        let down = MouseEventKind::Down(MouseButton::Left);
+        let in_pane = |slot| Hit::Pane {
+            slot,
+            cell: Some((0, 0)),
+        };
+        app.on_mouse(down, in_pane(Slot::Split(0)));
+        let again = app.on_mouse(down, in_pane(Slot::Selected));
+        let expected = Action::SelectFrom {
+            slot: Slot::Selected,
+            cell: (0, 0),
+        };
+        assert_eq!(again, Some(expected));
+        assert_eq!(app.dragging(), Some(Slot::Selected));
     }
 
     #[test]
