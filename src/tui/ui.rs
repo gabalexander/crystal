@@ -659,6 +659,13 @@ fn header_notes(app: &App, slot: Slot, session: &SessionInfo, back: usize) -> Ve
     if app.focus() == Focus::Copy(slot) {
         notes.push("copy mode".to_string());
     }
+    if let Some(grab) = app.grabbed() {
+        if grab.from == slot {
+            notes.push("moving".to_string());
+        } else if grab.over == Some(slot) {
+            notes.push("let go to swap".to_string());
+        }
+    }
     let index = app.sessions().iter().position(|s| s.name == session.name);
     let flow_step = index.and_then(|index| app.flow_step_of(index));
     if let Some((run, step)) = flow_step {
@@ -1867,6 +1874,27 @@ mod tests {
             panic!("not a pane");
         };
         assert_eq!(slot, Slot::Split(0));
+    }
+
+    #[test]
+    fn a_click_finds_a_pane_where_it_was_moved_to() {
+        let mut app = app_with_sessions(2);
+        app.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Char('L'), KeyModifiers::NONE));
+        // The split's on top now, the selection's pane below it.
+        let areas = Areas::new(Rect::new(0, 0, 80, 24), 1);
+        let on_top = areas.panes[0];
+        let Hit::Pane { slot, .. } = hit(&areas, &app, 40, on_top.y + 2) else {
+            panic!("not a pane");
+        };
+        assert_eq!(slot, Slot::Split(0));
+        let header = hit(&areas, &app, 40, areas.panes[1].y);
+        let selections = Hit::Pane {
+            slot: Slot::Selected,
+            cell: None,
+        };
+        assert_eq!(header, selections);
     }
 
     #[test]

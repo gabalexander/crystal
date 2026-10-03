@@ -2182,6 +2182,51 @@ fn tab_takes_the_keyboard_on_to_a_split_and_its_session_gets_the_keys() {
     assert_eq!(written(&crystal.dir.path().join("got")), "hello split\n");
 }
 
+/// The row of the screen `text` first shows on, counted from 0.
+fn row_of(tui: &Terminal, text: &str) -> Option<usize> {
+    tui.text().lines().position(|row| row.contains(text))
+}
+
+#[test]
+fn l_moves_a_pane_past_the_next_and_the_tab_keeps_the_order() {
+    let crystal = Crystal::new();
+    for name in ["alpha", "beta"] {
+        let script = format!("echo {name} is here; echo > {name}-ready; sleep 30");
+        crystal.ok(&["new", "-n", name, "sh", "-c", &script]);
+        written(&crystal.dir.path().join(format!("{name}-ready")));
+    }
+
+    // At 80 columns the panes are stacked: beta's, which follows the
+    // selection, on top, then alpha's split.
+    let mut tui = crystal.tui();
+    tui.shows("alpha is here");
+    tui.type_keys("sj");
+    tui.shows("beta is here");
+    let above = |tui: &Terminal, first: &str, second: &str| matches!((row_of(tui, first), row_of(tui, second)), (Some(a), Some(b)) if a < b);
+    assert!(
+        above(&tui, "beta is here", "alpha is here"),
+        "{}",
+        tui.text()
+    );
+
+    tui.type_keys("L");
+    eventually("beta's pane goes below alpha's", || {
+        above(&tui, "alpha is here", "beta is here")
+    });
+
+    // The order is the tab's: it's there again when the TUI opens.
+    tui.type_keys("q");
+    assert!(tui.exit());
+    let tui = crystal.tui();
+    tui.shows("beta is here");
+    tui.shows("alpha is here");
+    assert!(
+        above(&tui, "alpha is here", "beta is here"),
+        "{}",
+        tui.text()
+    );
+}
+
 #[test]
 fn each_pane_sizes_its_own_session() {
     let crystal = Crystal::new();
