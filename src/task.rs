@@ -566,19 +566,28 @@ impl Task {
     }
 }
 
-/// The events for what changed between two looks at a task's runs.
+/// The events for what changed between two looks at a task's runs. A run
+/// at a time: a turn ends before the next starts.
 fn turn_events(seen: Seen, now: Seen) -> Vec<AgentEvent> {
     let mut events = Vec::new();
-    if now.ended > seen.ended {
+    let was_working = seen.started > seen.ended;
+    let new_turn = now.started > seen.started;
+    let working = now.started > now.ended;
+    if new_turn {
+        if was_working && now.ended > seen.ended {
+            events.push(AgentEvent::TurnEnded);
+        }
+        events.push(AgentEvent::TurnStarted);
+        // One that started and ended between two looks still started, so
+        // the session is seen working before it's done.
+        if !working {
+            events.push(AgentEvent::TurnEnded);
+        }
+    } else if now.ended > seen.ended {
         events.push(AgentEvent::TurnEnded);
     }
-    if now.started <= now.ended {
+    if !working {
         return events;
-    }
-    // A turn is going on now; it may be one the session hasn't seen yet.
-    let new_turn = now.started > seen.started;
-    if new_turn {
-        events.push(AgentEvent::TurnStarted);
     }
     if now.asking && (new_turn || !seen.asking) {
         events.push(AgentEvent::Asking);
@@ -953,14 +962,23 @@ mod tests {
     }
 
     #[test]
-    fn a_turn_that_ended_is_a_turn_ended_even_if_it_was_never_seen_going() {
+    fn a_turn_that_ended_is_a_turn_ended() {
         assert_eq!(
             turn_events(seen(1, 0, false), seen(1, 1, false)),
             [TurnEnded]
         );
+    }
+
+    #[test]
+    fn a_turn_that_started_and_ended_between_two_looks_is_both() {
         assert_eq!(
             turn_events(seen(0, 0, false), seen(1, 1, false)),
-            [TurnEnded]
+            [TurnStarted, TurnEnded]
+        );
+        // And after one that was going on, that one's end first.
+        assert_eq!(
+            turn_events(seen(1, 0, false), seen(2, 2, false)),
+            [TurnEnded, TurnStarted, TurnEnded]
         );
     }
 
