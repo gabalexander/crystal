@@ -53,8 +53,13 @@ is: it's the one request every version must understand.
   - `app.rs`: the state and how keys and the mouse change it; no I/O, so it's unit-tested
   - `ui.rs`: the layout and drawing (top bar and its tabs, pane headers, footer), and what's under the mouse
   - `tabs.rs`: tabs, each holding its own sessions (each session in exactly one) with its own selection,
-    splits, the order of its panes and the session floating over them, and which is in front; the sidebar
-    shows only that tab's sessions. Kept apart from I/O; the event loop keeps them in the database
+    its tree of panes, the session the selection's pane last showed and the session floating over them, and
+    which is in front; the sidebar shows only that tab's sessions. Kept apart from I/O; the event loop keeps
+    them in the database, and tabs kept from when a tab's panes were a list are read as a tree
+  - `split_tree.rs`: a tab's panes as a tree of splits, right or down at a ratio, at any depth, one pane
+    following the selection: laying them out, borders, the pane beside another on screen, splitting, closing,
+    swapping, resizing within each pane's least size, dragging a border and evening them out; pure, so it's
+    unit-tested, and the API a command driving the layout would call
   - `layouts.rs`: the layouts view (`S`): the tabs saved under a name and put back, and the tabs a restore
     replaced; its state and keys, kept apart from I/O (the event loop keeps them in the database), and its
     drawing

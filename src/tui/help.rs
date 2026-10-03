@@ -53,15 +53,15 @@ pub const KEYS: &[Key] = &[
     sidebar("j/k ↓/↑", "select a session"),
     sidebar("Enter", "type into it, or rerun"),
     sidebar("Tab/Shift+Tab", "next / previous pane"),
-    sidebar("s/z/v", "split / zoom / copy"),
-    sidebar("F H/L S", "float / move / layouts"),
+    sidebar("Shift+arrows", "the pane that way"),
+    sidebar("s |/- z/v", "split / zoom / copy"),
+    sidebar("F H/J/K/L R", "float / move / resize"),
     sidebar("PgUp/PgDn e", "page / edit its history"),
     sidebar("t/T/&", "tab: new / name / close"),
-    sidebar("[/] 1-9 >", "switch tabs / move it"),
-    sidebar("n/w W", "new, in a worktree / rm"),
-    sidebar("y/n/Y", "answer what a task asks"),
-    sidebar("r/x", "rename / kill it"),
-    of_plugin("tasks", "c", "close its task"),
+    sidebar("[/] 1-9 > S", "tabs / move it / layouts"),
+    sidebar("n/w", "new, or in a worktree"),
+    sidebar("r/x W", "rename, kill, rm worktree"),
+    of_plugin("tasks", "c y/n/Y", "close it / answer it"),
     of_plugin("flows", "g/f", "flow: go on / send back"),
     sidebar("u /", "next needing you / find"),
     of_plugin("github", "o/O/i", "its PR / all PRs / issues"),
@@ -351,7 +351,8 @@ mod tests {
     }
 
     /// The keys in each row of the README's table of sidebar keys: what's
-    /// between backticks in its first column.
+    /// between backticks in its first column, with a `|` written `\|` so
+    /// it doesn't end the cell.
     fn readme_sidebar_keys() -> Vec<Vec<String>> {
         let readme = include_str!("../../README.md");
         let table = readme
@@ -368,7 +369,7 @@ mod tests {
                     .split('`')
                     .skip(1)
                     .step_by(2)
-                    .map(String::from)
+                    .map(|key| key.replace("\\|", "|"))
                     .collect()
             })
             .collect()

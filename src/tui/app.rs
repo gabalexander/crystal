@@ -17,6 +17,7 @@ use super::profiles::{self, ProfilesView};
 use super::pull_requests::{self, PullRequestsView};
 use super::search;
 use super::settings_view::{self, SettingsView};
+use super::split_tree::{Direction, Pane, SplitTree, Way};
 use super::status::Status;
 use super::tabs::{self, Tabs};
 use super::text_input::TextInput;
@@ -34,11 +35,13 @@ use crate::protocol::{
 use crate::shell;
 use crate::{backlog, names, plugins, tasks};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
+use ratatui::layout::Rect;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// Where a pane sits beside the sidebar: the one that follows the
-/// selection, or one of the splits, counted in the order they're drawn.
+/// selection, or one of the splits, counted in the order they're drawn
+/// (down the tab's tree of panes, left to right and top to bottom).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Slot {
     Selected,
@@ -74,6 +77,12 @@ pub enum Hit {
         slot: Slot,
         cell: Option<(u16, u16)>,
     },
+    /// The border between the two sides of a split of the tab's panes: the
+    /// rule between panes side by side, or, beside the name on it, the
+    /// header line of a pane below another. `split` counts the splits in
+    /// the order [`SplitTree::borders`] lists them; `at` is the column of
+    /// the screen the mouse is at for a rule, or the row for a header line.
+    Border { split: usize, at: u16 },
     /// A row of an open view's list, by its place in the whole list.
     ViewList(usize),
     /// The rest of an open view: the diff, or the file's preview.
@@ -121,9 +130,22 @@ pub enum Loading<T> {
     Failed(String),
 }
 
+/// Panes `s` puts side by side are each at least this wide, which fits most
+/// agents' screens; narrower than that, it puts them one above the other.
+const SIDE_BY_SIDE_WIDTH: u16 = 80;
+
+/// How much of a pane's room a split leaves it: half.
+const HALF: f32 = 0.5;
+
+/// How far a key in resize mode moves a border: a few columns, or a row
+/// for every two of those, rows being about twice as tall as columns are
+/// wide.
+const RESIZE_COLUMNS: u16 = 4;
+const RESIZE_ROWS: u16 = 2;
+
 /// Which way Tab goes round the panes: Tab forward, Shift+Tab back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Direction {
+enum Round {
     Forward,
     Back,
 }
@@ -551,11 +573,20 @@ pub struct App {
     codex_models: Option<Vec<String>>,
     /// A yes-or-no question on the footer line, until it's answered.
     confirm: Option<Confirm>,
-    /// The tabs, each with its own sessions and the ones it splits off
-    /// into panes of their own, and which one is in front. The sidebar
-    /// shows only the sessions of the tab in front. A split stays on its
-    /// session while the selection moves.
+    /// The tabs, each with its own sessions and its own panes, and which
+    /// one is in front. The sidebar shows only the sessions of the tab in
+    /// front. A split stays on its session while the selection moves.
     tabs: Tabs,
+    /// The room beside the sidebar the panes share, as the event loop last
+    /// laid them out: splits, resizes and going from pane to pane are
+    /// worked out in it. Until then, an 80 by 24 terminal's.
+    tiles: Rect,
+    /// Whether the sidebar's keys move the selected session's pane's
+    /// borders: resize mode, which `R` starts.
+    resizing: bool,
+    /// The border the mouse took, while its button is down: the border
+    /// follows it.
+    border: Option<usize>,
     /// The session `>` is moving to another tab, while the footer asks
     /// which.
     moving: Option<String>,
@@ -650,6 +681,9 @@ impl App {
             codex_models: None,
             confirm: None,
             tabs: Tabs::default(),
+            tiles: Rect::new(29, 1, 51, 22),
+            resizing: false,
+            border: None,
             moving: None,
             focus: Focus::Sidebar,
             last_pane: None,
@@ -1424,18 +1458,30 @@ impl App {
         self.tabs = tabs;
         self.place_sessions();
         self.arrive_at_tab();
+        self.remember_shown();
+    }
+
+    /// The panes of the tab in front.
+    pub fn panes(&self) -> &SplitTree {
+        &self.tabs.current().panes
+    }
+
+    /// Takes the room beside the sidebar the panes share, as the event loop
+    /// lays them out.
+    pub fn set_tiles(&mut self, tiles: Rect) {
+        self.tiles = tiles;
     }
 
     /// The names of the sessions the tab in front splits off, in the order
-    /// they were.
-    pub fn splits(&self) -> &[String] {
-        &self.tabs.current().splits
+    /// their panes are drawn.
+    pub fn splits(&self) -> Vec<&str> {
+        self.tabs.current().splits()
     }
 
-    /// The panes on screen, in the order they're drawn: the splits, with
-    /// the one that follows the selection where it's been moved to, first
-    /// until it's moved. Zoomed, only the pane that shows the selected
-    /// session. Then, last, over the others, the float, if there is one.
+    /// The panes on screen, in the order they're drawn: the tab's panes,
+    /// left to right and top to bottom. Zoomed, only the pane that shows
+    /// the selected session. Then, last, over the others, the float, if
+    /// there is one.
     pub fn slots(&self) -> Vec<Slot> {
         let mut slots = if self.zoomed() {
             let zoomed = self.selected_slot().filter(|slot| *slot != Slot::Float);
@@ -1463,16 +1509,57 @@ impl App {
     /// Every pane of the tab in front, in the order they're drawn when it
     /// isn't zoomed.
     fn tiled(&self) -> Vec<Slot> {
-        let tab = self.tabs.current();
-        let mut slots: Vec<Slot> = (0..tab.splits.len()).map(Slot::Split).collect();
-        slots.insert(tab.selection_pane_at(), Slot::Selected);
-        slots
+        let mut splits = 0;
+        let panes = self.panes().panes().into_iter();
+        panes
+            .map(|pane| match pane {
+                Pane::Selection => Slot::Selected,
+                Pane::Session(_) => {
+                    splits += 1;
+                    Slot::Split(splits - 1)
+                }
+            })
+            .collect()
+    }
+
+    /// The pane at `slot` in the tab's tree: the float isn't in it.
+    fn pane_of(&self, slot: Slot) -> Option<Pane> {
+        match slot {
+            Slot::Selected => Some(Pane::Selection),
+            Slot::Split(index) => Some(Pane::Session(self.splits().get(index)?.to_string())),
+            Slot::Float => None,
+        }
+    }
+
+    /// Where `pane` of the tab's tree is drawn.
+    fn slot_of(&self, pane: &Pane) -> Option<Slot> {
+        match pane {
+            Pane::Selection => Some(Slot::Selected),
+            Pane::Session(name) => {
+                let splits = self.splits();
+                splits
+                    .iter()
+                    .position(|split| split == name)
+                    .map(Slot::Split)
+            }
+        }
     }
 
     /// Whether the tab in front is zoomed: the selected session's pane
     /// takes the room of the sidebar and the other panes.
     pub fn zoomed(&self) -> bool {
         self.tabs.current().zoomed
+    }
+
+    /// Whether the sidebar's keys are moving the selected session's pane's
+    /// borders, in resize mode.
+    pub fn resizing(&self) -> bool {
+        self.resizing
+    }
+
+    /// The border the mouse is moving, while it is: see [`Hit::Border`].
+    pub fn moving_border(&self) -> Option<usize> {
+        self.border
     }
 
     /// The pane a drag of the mouse is selecting in, while it lasts.
@@ -1485,24 +1572,57 @@ impl App {
         self.grabbed
     }
 
-    /// The session the pane at `slot` is about: the selected one, the one
-    /// split off there, or the one floating.
+    /// The session the pane at `slot` is about: the one split off there,
+    /// the one floating, or, in the pane that follows the selection, the
+    /// selected one. While the selected session has a pane of its own,
+    /// that pane goes on showing the session it showed before, if it can;
+    /// if not, it's still about the selected one, to say where that is.
     pub fn pane_session(&self, slot: Slot) -> Option<&SessionInfo> {
         match slot {
-            Slot::Selected => self.selected(),
+            Slot::Selected => {
+                let selected = self.selected()?;
+                if self.has_own_pane(&selected.name) {
+                    return self.shown().or(Some(selected));
+                }
+                Some(selected)
+            }
             Slot::Split(index) => {
-                let name = self.splits().get(index)?;
-                self.sessions.iter().find(|session| session.name == *name)
+                let name = *self.splits().get(index)?;
+                self.sessions.iter().find(|session| session.name == name)
             }
             Slot::Float => self.floating(),
         }
     }
 
+    /// The session the selection's pane went on showing when the selection
+    /// moved to one with a pane of its own, while it's still in the tab
+    /// and has none itself.
+    fn shown(&self) -> Option<&SessionInfo> {
+        let tab = self.tabs.current();
+        let name = tab.shown.as_deref()?;
+        if !tab.holds(name) || self.has_own_pane(name) {
+            return None;
+        }
+        self.sessions.iter().find(|session| session.name == name)
+    }
+
+    /// Notes the selected session as the one the selection's pane shows,
+    /// while it has no pane of its own, so that the pane goes on showing it
+    /// once the selection moves to one that does.
+    fn remember_shown(&mut self) {
+        let Some(name) = self.selected_name() else {
+            return;
+        };
+        if !self.has_own_pane(&name) {
+            self.tabs.current_mut().shown = Some(name);
+        }
+    }
+
     /// Whether the pane at `slot` shows its session's screen. The pane that
-    /// follows the selection doesn't when the selected session is split
-    /// off or floats, so that no session is drawn twice at two sizes, nor
-    /// when it's the session this TUI runs in. Zoomed, no other pane is on
-    /// screen but the float.
+    /// follows the selection doesn't when its session has a pane of its
+    /// own, split off or floating, so that no session is drawn twice at two
+    /// sizes, nor when it's the session this TUI runs in. Zoomed, no other
+    /// pane is on screen but the float.
     pub fn shows_screen(&self, slot: Slot) -> bool {
         let Some(session) = self.pane_session(slot) else {
             return false;
@@ -1511,18 +1631,21 @@ impl App {
             return false;
         }
         match slot {
-            Slot::Selected => {
-                !self.selected_is_own()
-                    && !self.is_split(&session.name)
-                    && !self.is_floating(&session.name)
-            }
+            Slot::Selected => !self.is_own(session) && !self.has_own_pane(&session.name),
             Slot::Split(_) | Slot::Float => true,
         }
     }
 
-    /// Whether the session called `name` has a pane of its own.
+    /// Whether the session called `name` is split off into a pane of its
+    /// own.
     pub fn is_split(&self, name: &str) -> bool {
-        self.splits().iter().any(|split| split == name)
+        self.tabs.current().is_split(name)
+    }
+
+    /// Whether the session called `name` has a pane of its own: split off,
+    /// or floating.
+    fn has_own_pane(&self, name: &str) -> bool {
+        self.is_split(name) || self.is_floating(name)
     }
 
     /// The index of the selected session, or `None` when the tab in front
@@ -1544,13 +1667,16 @@ impl App {
         self.selected().map(|session| session.name.clone())
     }
 
-    /// Whether the selected session is the one this TUI runs in. Ids tell,
-    /// since the session may have been renamed since the TUI started.
+    /// Whether the selected session is the one this TUI runs in.
     pub fn selected_is_own(&self) -> bool {
-        match (&self.own_id, self.selected()) {
-            (Some(own), Some(selected)) => selected.id == *own,
-            _ => false,
-        }
+        self.selected()
+            .is_some_and(|selected| self.is_own(selected))
+    }
+
+    /// Whether `session` is the one this TUI runs in. Ids tell, since the
+    /// session may have been renamed since the TUI started.
+    pub fn is_own(&self, session: &SessionInfo) -> bool {
+        self.own_id.as_ref() == Some(&session.id)
     }
 
     /// Takes a fresh list from the daemon and puts it in the sidebar's
@@ -1589,19 +1715,15 @@ impl App {
         if !keeps_keyboard {
             self.focus = Focus::Sidebar;
         }
+        self.remember_shown();
     }
 
-    /// Closes the splits of the tab in front whose sessions have gone, the
+    /// Closes the panes of the tab in front whose sessions have gone, the
     /// keyboard moving with its pane. The other tabs' go as
     /// [`Self::place_sessions`] puts their sessions right.
     fn close_splits_of_gone_sessions(&mut self) {
-        // Going from the end keeps the splits still to check where they
-        // were.
-        for index in (0..self.splits().len()).rev() {
-            if self.position(&self.splits()[index]).is_none() {
-                self.close_split(index);
-            }
-        }
+        let there: Vec<String> = self.sessions.iter().map(|s| s.name.clone()).collect();
+        self.change_panes(|panes| panes.retain(|name| there.iter().any(|held| held == name)));
     }
 
     /// Puts every session in a tab: those that have gone leave theirs, and
@@ -1655,6 +1777,7 @@ impl App {
         }
         self.selected = index;
         self.on_worktree = None;
+        self.remember_shown();
     }
 
     /// The session called `from` is called `to` now: a split of it stays
@@ -1690,6 +1813,12 @@ impl App {
     }
 
     pub fn on_key(&mut self, key: KeyEvent) -> Option<Action> {
+        let action = self.take_key(key);
+        self.remember_shown();
+        action
+    }
+
+    fn take_key(&mut self, key: KeyEvent) -> Option<Action> {
         self.notice = None;
         // A plugin's pane is over everything, and has every key but the one
         // that closes it.
@@ -1774,6 +1903,10 @@ impl App {
             self.on_filter_key(key);
             return None;
         }
+        if self.resizing {
+            self.on_resize_key(key);
+            return None;
+        }
         match self.focus {
             Focus::Sidebar => self.on_sidebar_key(key),
             Focus::Pane(slot) => self.on_pane_key(slot, key),
@@ -1782,9 +1915,16 @@ impl App {
     }
 
     /// What the mouse does, when no program in a pane has taken it: a click
-    /// selects a session or hands a pane the keyboard, and the wheel moves
-    /// the selection, or scrolls a pane through its history.
+    /// selects a session or hands a pane the keyboard, a drag moves a
+    /// border between panes, and the wheel moves the selection, or scrolls
+    /// a pane through its history.
     pub fn on_mouse(&mut self, kind: MouseEventKind, hit: Hit) -> Option<Action> {
+        let action = self.take_mouse(kind, hit);
+        self.remember_shown();
+        action
+    }
+
+    fn take_mouse(&mut self, kind: MouseEventKind, hit: Hit) -> Option<Action> {
         if let Some(view) = &mut self.view {
             let outcome = match view {
                 View::Diff(diff) => diff.on_mouse(kind, hit),
@@ -1823,6 +1963,23 @@ impl App {
         let click = kind == MouseEventKind::Down(MouseButton::Left);
         if click {
             self.notice = None;
+            self.resizing = false;
+        }
+        // A border taken by the mouse follows it until the button comes up.
+        if let Some(split) = self.border {
+            match (kind, hit) {
+                (MouseEventKind::Drag(_), Hit::Border { split: moved, at }) if moved == split => {
+                    let tiles = self.tiles;
+                    self.tabs.current_mut().panes.drag(split, at, tiles);
+                    return None;
+                }
+                (MouseEventKind::Up(_), _) => {
+                    self.border = None;
+                    return None;
+                }
+                (MouseEventKind::Down(_), _) => self.border = None,
+                _ => return None,
+            }
         }
         // A drag selects in the pane it started in until the button comes
         // up, wherever it goes meanwhile.
@@ -1874,6 +2031,7 @@ impl App {
         match (kind, hit) {
             (_, Hit::Tab(index)) if click => self.go_to_tab(index),
             (_, Hit::SidebarRow(row)) if click => self.click_row(row),
+            (_, Hit::Border { split, .. }) if click && !self.zoomed() => self.border = Some(split),
             (_, Hit::Pane { slot, cell }) if click => {
                 // A click hands a pane the keyboard, but copy mode keeps it.
                 if self.focus != Focus::Copy(slot) && self.can_type_into(slot) {
@@ -1943,6 +2101,13 @@ impl App {
             let name = name.name.clone();
             return Some(Action::Answer { name, answer });
         }
+        // Shift and an arrow go from pane to pane, where the arrow points.
+        if key.modifiers.contains(KeyModifiers::SHIFT)
+            && let Some(toward) = arrow(key.code)
+        {
+            self.focus_toward(toward);
+            return None;
+        }
         match key.code {
             KeyCode::Char('j') | KeyCode::Down => self.move_selection(1),
             KeyCode::Char('k') | KeyCode::Up => self.move_selection(-1),
@@ -1957,16 +2122,21 @@ impl App {
             // Enter starts something there, as `n` does.
             KeyCode::Enter if self.on_worktree.is_some() => return self.open_launcher(false),
             KeyCode::Enter => self.enter(),
-            KeyCode::Tab => self.move_to_pane(Direction::Forward),
-            KeyCode::BackTab => self.move_to_pane(Direction::Back),
+            KeyCode::Tab => self.move_to_pane(Round::Forward),
+            KeyCode::BackTab => self.move_to_pane(Round::Back),
             KeyCode::Char('s') => self.toggle_split(),
+            KeyCode::Char('|') => self.split_pane(Way::Right, HALF),
+            KeyCode::Char('-') => self.split_pane(Way::Down, HALF),
             KeyCode::Char('z') => self.toggle_zoom(),
             KeyCode::Char('v') => self.start_copying(),
             KeyCode::Char('e') => return self.edit_history(),
             KeyCode::Char('F') => self.toggle_float(),
             KeyCode::Char('S') => return Some(Action::ListLayouts),
-            KeyCode::Char('H') => self.move_pane(-1),
-            KeyCode::Char('L') => self.move_pane(1),
+            KeyCode::Char('H') => self.move_pane(Direction::Left),
+            KeyCode::Char('J') => self.move_pane(Direction::Down),
+            KeyCode::Char('K') => self.move_pane(Direction::Up),
+            KeyCode::Char('L') => self.move_pane(Direction::Right),
+            KeyCode::Char('R') => self.start_resizing(),
             KeyCode::Char('t') => return self.new_tab(),
             KeyCode::Char('T') => self.ask_for_tab_name(),
             KeyCode::Char('&') => self.close_tab(),
@@ -3080,27 +3250,87 @@ impl App {
         tab.zoomed = !tab.zoomed;
     }
 
-    /// Splits the selected session off into a pane of its own, or closes
-    /// its split if it has one.
+    /// `s`: splits the selected session off into a pane of its own, beside
+    /// its pane when there's room for both side by side or else below it,
+    /// or closes its split if it has one.
     fn toggle_split(&mut self) {
         let Some(selected) = self.selected() else {
             return;
         };
-        let name = selected.name.clone();
-        if let Some(index) = self.splits().iter().position(|split| *split == name) {
-            self.close_split(index);
-        } else if self.selected_is_own() {
-            self.notify("crystal can't show the session it runs in".into());
-        } else if self.splits().len() >= tabs::MAX_SPLITS {
-            let most = tabs::MAX_SPLITS;
-            self.notify(format!("{most} splits at most: press s on one to close it"));
+        if self.is_split(&selected.name) {
+            self.close_pane();
         } else {
-            // A session that floats comes down into its split.
-            if self.is_floating(&name) {
-                self.put_float_back();
-            }
-            self.tabs.current_mut().splits.push(name);
+            self.split_pane(self.way_to_split(), HALF);
         }
+    }
+
+    /// The way `s` splits the selection's pane: side by side while both
+    /// sides would be at least [`SIDE_BY_SIDE_WIDTH`] wide, or else one
+    /// above the other.
+    fn way_to_split(&self) -> Way {
+        let pane = self.panes().area_of(&Pane::Selection, self.tiles);
+        let wide = pane.is_some_and(|pane| pane.width > 2 * SIDE_BY_SIDE_WIDTH);
+        if wide { Way::Right } else { Way::Down }
+    }
+
+    /// `|` and `-`, and `s`: splits the selected session's pane in two,
+    /// `way`, the first side keeping `ratio` of its room. The session
+    /// stays where it is, in a pane of its own now, and the pane that
+    /// follows the selection takes the other side, to show the next
+    /// session selected; a session floating comes down where the
+    /// selection's pane was. One split off already keeps its pane, and the
+    /// selection's pane comes beside it, leaving what it showed where it
+    /// was, split off.
+    pub fn split_pane(&mut self, way: Way, ratio: f32) {
+        let Some(selected) = self.selected() else {
+            return;
+        };
+        if self.selected_is_own() {
+            return self.notify("crystal can't show the session it runs in".into());
+        }
+        let name = selected.name.clone();
+        let at = Pane::Session(name.clone());
+        let split_off = self.is_split(&name);
+        let splitting = if split_off { &at } else { &Pane::Selection };
+        if !self.panes().has_room(splitting, way, self.tiles) {
+            let place = match way {
+                Way::Right => "beside",
+                Way::Down => "below",
+            };
+            return self.notify(format!("no room for another pane {place} {name}"));
+        }
+        if self.is_floating(&name) {
+            self.put_float_back();
+        }
+        let stays = if split_off {
+            let shown = self.shown().filter(|shown| !self.is_own(shown));
+            shown.map(|shown| Pane::Session(shown.name.clone()))
+        } else {
+            Some(at.clone())
+        };
+        self.change_panes(|panes| {
+            match stays {
+                Some(stays) => panes.replace(&Pane::Selection, stays),
+                None => panes.close(&Pane::Selection),
+            };
+            panes.split(&at, way, ratio, Pane::Selection);
+        });
+    }
+
+    /// Closes the selected session's split, when it has one: the pane
+    /// beside it takes the room, and the selection's pane shows the
+    /// session again. The selection's own pane stays.
+    pub fn close_pane(&mut self) {
+        let Some(selected) = self.selected() else {
+            return;
+        };
+        let name = selected.name.clone();
+        if !self.is_split(&name) {
+            return self.notify("the selection's pane stays: it shows what you select".into());
+        }
+        self.change_panes(|panes| {
+            panes.close(&Pane::Session(name));
+        });
     }
 
     /// `F`: floats the selected session over the panes, in a pane of its
@@ -3117,9 +3347,10 @@ impl App {
             return self.notify("crystal can't show the session it runs in".into());
         }
         let name = selected.name.clone();
-        if let Some(split) = self.splits().iter().position(|split| *split == name) {
-            self.close_split(split);
-        }
+        let split = Pane::Session(name.clone());
+        self.change_panes(|panes| {
+            panes.close(&split);
+        });
         self.tabs.current_mut().floating = Some(name);
         if self.can_type_into(Slot::Float) {
             self.focus_pane(Slot::Float);
@@ -3141,85 +3372,164 @@ impl App {
         }
     }
 
-    /// Closes the split at `index`. The splits after it move up a place,
-    /// and the keyboard moves with its pane, or goes back to the sidebar
-    /// if its pane is the one that closed.
-    fn close_split(&mut self, index: usize) {
-        self.tabs.current_mut().close_split(index);
-        self.focus = match self.focus {
-            Focus::Pane(Slot::Split(at)) if at == index => Focus::Sidebar,
-            Focus::Pane(Slot::Split(at)) if at > index => Focus::Pane(Slot::Split(at - 1)),
-            focus => focus,
-        };
-    }
-
-    /// `H` and `L`: moves the selected session's pane `by` places among the
-    /// panes, back toward the left (or the top, stacked) or on, swapping it
-    /// with the pane that was there. It stops at the ends.
-    fn move_pane(&mut self, by: isize) {
-        let Some(slot) = self.selected_slot() else {
-            return;
-        };
+    /// The pane that shows the selected session, as `H`, `J`, `K`, `L`,
+    /// Shift and the arrows, and `R` find it: in the tab's tree, so not the
+    /// float, and not while zoomed, which hides the others. Without a
+    /// selected session, the selection's pane. The footer says why not.
+    fn selected_pane(&mut self) -> Option<Pane> {
+        let slot = self.selected_slot().unwrap_or(Slot::Selected);
         if self.zoomed() {
-            return self.notify("zoomed: z puts the panes back first".into());
+            self.notify("zoomed: z puts the panes back first".into());
+            return None;
         }
         if slot == Slot::Float {
-            return self.notify("it floats: F puts it back among the panes".into());
+            self.notify("it floats: F puts it back among the panes".into());
+            return None;
         }
-        let mut order = self.tiled();
-        if order.len() == 1 {
+        self.pane_of(slot)
+    }
+
+    /// `H`, `J`, `K` and `L`: swaps the selected session's pane with the
+    /// one beside it `toward`: left, down, up or right. At the edge it
+    /// stays.
+    fn move_pane(&mut self, toward: Direction) {
+        let Some(pane) = self.selected_pane() else {
+            return;
+        };
+        if self.tiled().len() == 1 {
             return self.notify("one pane: s splits a session off into another".into());
         }
-        let Some(at) = order.iter().position(|placed| *placed == slot) else {
+        let Some(other) = self.panes().neighbour(&pane, toward, self.tiles).cloned() else {
             return;
         };
-        let Some(to) = at.checked_add_signed(by).filter(|to| *to < order.len()) else {
-            return;
-        };
-        order.swap(at, to);
-        self.arrange(&order);
+        self.change_panes(|panes| {
+            panes.swap(&pane, &other);
+        });
     }
 
     /// Swaps the panes at `a` and `b`, wherever they are.
     fn swap_panes(&mut self, a: Slot, b: Slot) {
-        let mut order = self.tiled();
-        let at = |slot: Slot| order.iter().position(|placed| *placed == slot);
-        if let (Some(a), Some(b)) = (at(a), at(b)) {
-            order.swap(a, b);
-            self.arrange(&order);
+        if let (Some(a), Some(b)) = (self.pane_of(a), self.pane_of(b)) {
+            self.change_panes(|panes| {
+                panes.swap(&a, &b);
+            });
         }
     }
 
-    /// Draws the panes in `order`, which has every pane there is. A split
-    /// is counted by where it's drawn, so the keyboard, Tab and a drag
-    /// follow each split to its new place.
-    fn arrange(&mut self, order: &[Slot]) {
-        let before = self.splits().to_vec();
-        let splits: Vec<String> = order
-            .iter()
-            .filter_map(|slot| match slot {
-                Slot::Split(index) => before.get(*index).cloned(),
-                Slot::Selected | Slot::Float => None,
-            })
-            .collect();
-        let moved = |slot: Slot| match slot {
-            Slot::Split(index) => before
-                .get(index)
-                .and_then(|name| splits.iter().position(|split| split == name))
-                .map_or(slot, Slot::Split),
-            Slot::Selected | Slot::Float => slot,
+    /// Shift and an arrow: selects the session in the pane beside the
+    /// selected session's `toward`, the way `j` and `k` would, so the keys
+    /// and the panes that show the selection follow. The selection's pane
+    /// is the session it shows. At the edge it stays.
+    pub fn focus_toward(&mut self, toward: Direction) {
+        let Some(pane) = self.selected_pane() else {
+            return;
         };
-        self.focus = match self.focus {
-            Focus::Pane(slot) => Focus::Pane(moved(slot)),
-            Focus::Copy(slot) => Focus::Copy(moved(slot)),
+        let Some(next) = self.panes().neighbour(&pane, toward, self.tiles) else {
+            return;
+        };
+        let session = match next {
+            Pane::Session(name) => Some(name.clone()),
+            Pane::Selection => {
+                let shown = self.pane_session(Slot::Selected);
+                let shown = shown.filter(|shown| !self.has_own_pane(&shown.name));
+                shown.map(|shown| shown.name.clone())
+            }
+        };
+        match session {
+            Some(name) => self.select(&name),
+            None => {
+                self.notify("the selection's pane is empty: j and k choose what it shows".into())
+            }
+        }
+    }
+
+    /// `R`: resize mode, until `Esc`: the keys move the selected session's
+    /// pane's borders.
+    fn start_resizing(&mut self) {
+        if self.selected_pane().is_none() {
+            return;
+        }
+        if self.tiled().len() == 1 {
+            return self.notify("one pane: s splits a session off into another".into());
+        }
+        self.resizing = true;
+    }
+
+    /// Keys in resize mode: `h` `j` `k` `l` or the arrows move a border of
+    /// the selected session's pane that way, Shift and an arrow go on to
+    /// the pane that way, `=` evens the panes out, and `Esc`, `Enter`, `q`
+    /// or `R` again are done. Other keys do nothing.
+    fn on_resize_key(&mut self, key: KeyEvent) {
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        let toward = match key.code {
+            KeyCode::Char('h') => Some(Direction::Left),
+            KeyCode::Char('j') => Some(Direction::Down),
+            KeyCode::Char('k') => Some(Direction::Up),
+            KeyCode::Char('l') => Some(Direction::Right),
+            code => arrow(code),
+        };
+        match (key.code, toward) {
+            (KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q' | 'R'), _) => self.resizing = false,
+            (KeyCode::Char('='), _) => self.equalize_panes(),
+            (code, Some(toward)) if shift && arrow(code).is_some() => self.focus_toward(toward),
+            (_, Some(toward)) => {
+                let cells = match toward {
+                    Direction::Left | Direction::Right => RESIZE_COLUMNS,
+                    Direction::Up | Direction::Down => RESIZE_ROWS,
+                };
+                self.resize_pane(toward, cells);
+            }
+            _ => {}
+        }
+    }
+
+    /// Moves a border of the selected session's pane `cells` columns or
+    /// rows `toward`: the one on that side of it, which it grows into, or
+    /// else the one on its other side, which it shrinks from. No pane gets
+    /// smaller than it can be drawn.
+    pub fn resize_pane(&mut self, toward: Direction, cells: u16) {
+        let Some(pane) = self.selected_pane() else {
+            return;
+        };
+        let tiles = self.tiles;
+        self.tabs
+            .current_mut()
+            .panes
+            .resize(&pane, toward, cells, tiles);
+    }
+
+    /// `=` in resize mode: gives the panes in a line the same room each.
+    pub fn equalize_panes(&mut self) {
+        self.tabs.current_mut().panes.equalize();
+    }
+
+    /// Changes the panes of the tab in front. A split is counted by where
+    /// it's drawn, so the keyboard, Tab, a drag and a pane taken by its
+    /// header follow each split to its new place, and let go of one that
+    /// closed.
+    fn change_panes(&mut self, change: impl FnOnce(&mut SplitTree)) {
+        let before: Vec<String> = self.splits().into_iter().map(String::from).collect();
+        change(&mut self.tabs.current_mut().panes);
+        let moved = |slot: Slot| match slot {
+            Slot::Split(index) => self.slot_of(&Pane::Session(before.get(index)?.clone())),
+            Slot::Selected | Slot::Float => Some(slot),
+        };
+        let focus = match self.focus {
+            Focus::Pane(slot) => moved(slot).map_or(Focus::Sidebar, Focus::Pane),
+            Focus::Copy(slot) => moved(slot).map_or(Focus::Sidebar, Focus::Copy),
             Focus::Sidebar => Focus::Sidebar,
         };
-        self.last_pane = self.last_pane.map(moved);
-        self.dragging = self.dragging.map(moved);
-        let selection_at = order.iter().position(|slot| *slot == Slot::Selected);
-        let tab = self.tabs.current_mut();
-        tab.splits = splits;
-        tab.selection_at = selection_at.unwrap_or(0);
+        let last_pane = self.last_pane.and_then(moved);
+        let dragging = self.dragging.and_then(moved);
+        let grabbed = self.grabbed.and_then(|grab| {
+            let from = moved(grab.from)?;
+            let over = grab.over.and_then(moved);
+            Some(Grab { from, over })
+        });
+        self.focus = focus;
+        self.last_pane = last_pane;
+        self.dragging = dragging;
+        self.grabbed = grabbed;
     }
 
     /// `t`: makes a new tab, brings it to the front, and starts a shell in
@@ -3271,9 +3581,10 @@ impl App {
             return self.notify(format!("there's no tab {number}"));
         }
         // Closing its split here first moves the keyboard with the panes.
-        if let Some(split) = self.splits().iter().position(|split| split == name) {
-            self.close_split(split);
-        }
+        let split = Pane::Session(name.to_string());
+        self.change_panes(|panes| {
+            panes.close(&split);
+        });
         self.tabs.put(name, to);
         self.keep_selection_in_tab();
         self.notify(format!("moved {name} to tab {number}"));
@@ -3361,8 +3672,8 @@ impl App {
 
     /// Moves the keyboard from the sidebar to the next pane that takes
     /// keys, going on from the one it was in last.
-    fn move_to_pane(&mut self, direction: Direction) {
-        if let Some(slot) = self.next_pane(direction) {
+    fn move_to_pane(&mut self, round: Round) {
+        if let Some(slot) = self.next_pane(round) {
             self.focus_pane(slot);
         }
     }
@@ -3371,18 +3682,18 @@ impl App {
     /// they're drawn, from just past the one used last. With none used
     /// yet, going forward starts at the first pane, and going back at the
     /// last.
-    fn next_pane(&self, direction: Direction) -> Option<Slot> {
+    fn next_pane(&self, round: Round) -> Option<Slot> {
         let slots = self.slots();
         let count = slots.len();
         let last = self
             .last_pane
             .and_then(|last| slots.iter().position(|slot| *slot == last));
         (1..=count)
-            .map(|step| match (direction, last) {
-                (Direction::Forward, Some(last)) => (last + step) % count,
-                (Direction::Back, Some(last)) => (last + count - step) % count,
-                (Direction::Forward, None) => step - 1,
-                (Direction::Back, None) => count - step,
+            .map(|step| match (round, last) {
+                (Round::Forward, Some(last)) => (last + step) % count,
+                (Round::Back, Some(last)) => (last + count - step) % count,
+                (Round::Forward, None) => step - 1,
+                (Round::Back, None) => count - step,
             })
             .map(|index| slots[index])
             .find(|slot| self.can_type_into(*slot))
@@ -3500,6 +3811,17 @@ fn answer_key(code: KeyCode) -> Option<Answer> {
         KeyCode::Char('y') => Some(Answer::Allow),
         KeyCode::Char('n') => Some(Answer::Deny),
         KeyCode::Char('Y') => Some(Answer::Always),
+        _ => None,
+    }
+}
+
+/// The way an arrow key points.
+fn arrow(code: KeyCode) -> Option<Direction> {
+    match code {
+        KeyCode::Left => Some(Direction::Left),
+        KeyCode::Right => Some(Direction::Right),
+        KeyCode::Up => Some(Direction::Up),
+        KeyCode::Down => Some(Direction::Down),
         _ => None,
     }
 }
@@ -4536,7 +4858,9 @@ mod tests {
     }
 
     /// An app with `names`, the first `split` of them split off, and the
-    /// selection on the last one.
+    /// selection on the last one. At the 80 by 24 terminal an app takes
+    /// itself to be on until it's drawn, each is split off below the last,
+    /// so they're stacked in order, the selection's pane at the bottom.
     fn app_with_splits(names: &[&str], split: usize) -> App {
         let mut app = app_with(names);
         for _ in 0..split {
@@ -4552,10 +4876,12 @@ mod tests {
         let mut app = app_with(&["a", "b"]);
         press(&mut app, KeyCode::Char('s'));
         assert_eq!(app.splits(), ["a"]);
-        assert_eq!(app.slots(), [Slot::Selected, Slot::Split(0)]);
+        // a stays where it was, and the selection's pane goes below it.
+        assert_eq!(app.slots(), [Slot::Split(0), Slot::Selected]);
 
         press(&mut app, KeyCode::Char('s'));
         assert!(app.splits().is_empty());
+        assert_eq!(app.panes(), &SplitTree::default());
     }
 
     #[test]
@@ -4569,11 +4895,192 @@ mod tests {
     }
 
     #[test]
-    fn two_splits_at_most_and_a_third_says_so() {
-        let mut app = app_with_splits(&["a", "b", "c"], 2);
+    fn a_pane_with_no_room_for_another_says_so() {
+        let mut app = app_with(&["a", "b"]);
+        app.set_tiles(Rect::new(29, 1, 20, 5));
         press(&mut app, KeyCode::Char('s'));
+        assert!(app.splits().is_empty());
+        assert_eq!(app.notice(), Some("no room for another pane below a"));
+        press(&mut app, KeyCode::Char('|'));
+        assert_eq!(app.notice(), Some("no room for another pane beside a"));
+    }
+
+    /// Where the panes of the tab in front are, laid out in `tiles`, by
+    /// the names of the sessions they show, `-` for the selection's pane
+    /// while it shows none.
+    fn placed(app: &App, tiles: Rect) -> Vec<(String, Rect)> {
+        let slots = app.slots().into_iter();
+        let names = slots.map(|slot| match app.pane_session(slot) {
+            Some(session) if app.shows_screen(slot) => session.name.clone(),
+            _ => "-".to_string(),
+        });
+        let areas = app.panes().layout(tiles).into_iter();
+        names.zip(areas.map(|(_, area)| area)).collect()
+    }
+
+    const WIDE: Rect = Rect::new(0, 0, 101, 40);
+
+    #[test]
+    fn bar_and_dash_split_the_selected_sessions_pane_beside_or_below() {
+        let mut app = app_with(&["a", "b", "c"]);
+        app.set_tiles(WIDE);
+        press(&mut app, KeyCode::Char('|'));
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(
+            placed(&app, WIDE),
+            [
+                ("a".to_string(), Rect::new(0, 0, 50, 40)),
+                ("b".to_string(), Rect::new(51, 0, 50, 40)),
+            ]
+        );
+        // b, in the selection's pane, stays where it is, and the
+        // selection's pane goes below it.
+        press(&mut app, KeyCode::Char('-'));
+        press(&mut app, KeyCode::Char('j'));
         assert_eq!(app.splits(), ["a", "b"]);
-        assert!(app.notice().unwrap().contains("2 splits at most"));
+        assert_eq!(
+            placed(&app, WIDE)[2],
+            ("c".to_string(), Rect::new(51, 20, 50, 20))
+        );
+        assert_eq!(app.notice(), None);
+    }
+
+    #[test]
+    fn splitting_a_pane_of_its_own_brings_the_selections_pane_beside_it() {
+        let mut app = app_with(&["a", "b", "c"]);
+        app.set_tiles(WIDE);
+        press(&mut app, KeyCode::Char('|'));
+        press(&mut app, KeyCode::Char('j'));
+        // On a again, the selection's pane goes on showing b. Splitting a's
+        // pane below it leaves b where it was, split off, and the
+        // selection's pane comes under a, to show the next one selected.
+        press(&mut app, KeyCode::Char('k'));
+        press(&mut app, KeyCode::Char('-'));
+        assert_eq!(app.splits(), ["a", "b"]);
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('j'));
+        let names: Vec<String> = (placed(&app, WIDE).into_iter())
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(names, ["a", "c", "b"]);
+        assert_eq!(
+            placed(&app, WIDE)[1].1,
+            Rect::new(0, 20, 50, 20),
+            "c is under a"
+        );
+    }
+
+    #[test]
+    fn the_selections_pane_goes_on_showing_what_it_showed_while_a_split_is_selected() {
+        let mut app = app_with_splits(&["a", "b", "c"], 1);
+        assert_eq!(drawn(&app), ["a", "c"]);
+        app.select("a");
+        assert_eq!(drawn(&app), ["a", "c"]);
+        // Nor while a session floats: a comes up out of its split into
+        // the float, over the selection's pane, which still shows b.
+        app.select("b");
+        app.select("a");
+        press(&mut app, KeyCode::Char('F'));
+        hand_back(&mut app);
+        assert_eq!(drawn(&app), ["b", "a"]);
+        // With nothing it showed left to show, it says where the selected
+        // session is.
+        app.set_sessions(vec![session("a"), session("c")]);
+        assert_eq!(drawn(&app), ["-", "a"]);
+    }
+
+    #[test]
+    fn shift_and_an_arrow_select_the_session_in_the_pane_that_way() {
+        let mut app = app_with(&["a", "b", "c"]);
+        app.set_tiles(WIDE);
+        // a | (b over the selection's pane, showing c).
+        press(&mut app, KeyCode::Char('|'));
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('-'));
+        press(&mut app, KeyCode::Char('j'));
+        let shift = |code| KeyEvent::new(code, KeyModifiers::SHIFT);
+        app.on_key(shift(KeyCode::Up));
+        assert_eq!(selected_name(&app), Some("b"));
+        app.on_key(shift(KeyCode::Left));
+        assert_eq!(selected_name(&app), Some("a"));
+        // Into the selection's pane is to the session it shows.
+        app.on_key(shift(KeyCode::Right));
+        assert_eq!(selected_name(&app), Some("b"));
+        app.on_key(shift(KeyCode::Down));
+        assert_eq!(selected_name(&app), Some("c"));
+        assert_eq!(drawn(&app), ["a", "b", "c"]);
+        // At the edge it stays.
+        app.on_key(shift(KeyCode::Down));
+        assert_eq!(selected_name(&app), Some("c"));
+        assert_eq!(app.notice(), None);
+    }
+
+    #[test]
+    fn going_into_the_selections_pane_with_nothing_in_it_says_so() {
+        let mut app = app_with(&["a", "b"]);
+        press(&mut app, KeyCode::Char('s'));
+        let shift = KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT);
+        app.on_key(shift);
+        assert_eq!(selected_name(&app), Some("a"));
+        assert!(app.notice().unwrap().contains("is empty"));
+    }
+
+    #[test]
+    fn capital_r_moves_the_borders_with_the_keys_until_esc() {
+        let mut app = app_with(&["a", "b"]);
+        app.set_tiles(WIDE);
+        press(&mut app, KeyCode::Char('|'));
+        press(&mut app, KeyCode::Char('R'));
+        assert!(app.resizing());
+        let width = |app: &App| placed(app, WIDE)[0].1.width;
+        press(&mut app, KeyCode::Char('l'));
+        assert_eq!(width(&app), 50 + RESIZE_COLUMNS);
+        press(&mut app, KeyCode::Left);
+        press(&mut app, KeyCode::Char('h'));
+        assert_eq!(width(&app), 50 - RESIZE_COLUMNS);
+        // Keys that mean something else in the sidebar do nothing here.
+        press(&mut app, KeyCode::Char('x'));
+        assert_eq!(app.confirm(), None);
+        press(&mut app, KeyCode::Char('='));
+        assert_eq!(width(&app), 50);
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.resizing());
+        press(&mut app, KeyCode::Char('l'));
+        assert_eq!(width(&app), 50, "l isn't a sidebar key");
+    }
+
+    #[test]
+    fn resize_mode_needs_panes_to_resize() {
+        let mut app = app_with(&["a"]);
+        press(&mut app, KeyCode::Char('R'));
+        assert!(!app.resizing());
+        assert!(app.notice().unwrap().contains("one pane"));
+        let mut app = app_with_splits(&["a", "b"], 1);
+        press(&mut app, KeyCode::Char('z'));
+        press(&mut app, KeyCode::Char('R'));
+        assert!(!app.resizing());
+        assert!(app.notice().unwrap().contains("zoomed"));
+    }
+
+    #[test]
+    fn a_border_taken_by_the_mouse_follows_it_until_let_go() {
+        let mut app = app_with(&["a", "b"]);
+        app.set_tiles(WIDE);
+        press(&mut app, KeyCode::Char('|'));
+        let down = MouseEventKind::Down(MouseButton::Left);
+        let drag = MouseEventKind::Drag(MouseButton::Left);
+        let up = MouseEventKind::Up(MouseButton::Left);
+        let border = |at| Hit::Border { split: 0, at };
+        assert_eq!(app.on_mouse(down, border(50)), None);
+        assert_eq!(app.moving_border(), Some(0));
+        app.on_mouse(drag, border(70));
+        assert_eq!(placed(&app, WIDE)[0].1.width, 70);
+        // Anything else meanwhile is the drag's: nothing selects or moves.
+        app.on_mouse(drag, Hit::Sidebar);
+        assert_eq!(app.on_mouse(up, Hit::Elsewhere), None);
+        assert_eq!(app.moving_border(), None);
+        app.on_mouse(drag, border(20));
+        assert_eq!(placed(&app, WIDE)[0].1.width, 70);
     }
 
     /// The sessions the panes show, in the order they're drawn: `-` for
@@ -4590,43 +5097,48 @@ mod tests {
     }
 
     #[test]
-    fn h_and_l_move_the_selected_sessions_pane_and_stop_at_the_ends() {
+    fn capital_hjkl_swap_the_selected_sessions_pane_with_the_one_that_way() {
         let mut app = app_with_splits(&["a", "b", "c"], 2);
-        assert_eq!(drawn(&app), ["c", "a", "b"]);
-        press(&mut app, KeyCode::Char('L'));
+        assert_eq!(drawn(&app), ["a", "b", "c"]);
+        press(&mut app, KeyCode::Char('K'));
         assert_eq!(drawn(&app), ["a", "c", "b"]);
+        press(&mut app, KeyCode::Char('K'));
+        assert_eq!(drawn(&app), ["c", "a", "b"]);
+        // At the edges it stays.
+        press(&mut app, KeyCode::Char('K'));
         press(&mut app, KeyCode::Char('L'));
-        assert_eq!(drawn(&app), ["a", "b", "c"]);
-        press(&mut app, KeyCode::Char('L'));
-        assert_eq!(drawn(&app), ["a", "b", "c"]);
+        assert_eq!(drawn(&app), ["c", "a", "b"]);
         assert_eq!(app.notice(), None);
 
-        // A split moves the same way, past the others.
+        // A split moves the same way.
         app.select("a");
-        press(&mut app, KeyCode::Char('L'));
-        assert_eq!(drawn(&app), ["b", "a", "-"]);
+        press(&mut app, KeyCode::Char('J'));
+        assert_eq!(drawn(&app), ["c", "b", "a"]);
         assert_eq!(app.splits(), ["b", "a"]);
+
+        // Side by side, H and L.
+        let mut app = app_with(&["a", "b"]);
+        press(&mut app, KeyCode::Char('|'));
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('H'));
+        assert_eq!(drawn(&app), ["b", "a"]);
+        press(&mut app, KeyCode::Char('H'));
+        assert_eq!(drawn(&app), ["b", "a"]);
         press(&mut app, KeyCode::Char('L'));
-        assert_eq!(drawn(&app), ["b", "-", "a"]);
-        press(&mut app, KeyCode::Char('H'));
-        press(&mut app, KeyCode::Char('H'));
-        assert_eq!(drawn(&app), ["a", "b", "-"]);
+        assert_eq!(drawn(&app), ["a", "b"]);
     }
 
     #[test]
     fn the_keyboard_and_tab_follow_a_pane_that_moved() {
         let mut app = app_with_splits(&["a", "b", "c"], 2);
-        // Type into each pane in turn, b's last, then come back to the
-        // sidebar.
-        for _ in 0..2 {
-            press(&mut app, KeyCode::Tab);
-            hand_back(&mut app);
-        }
+        // Type into a's pane, then b's, then come back to the sidebar.
+        press(&mut app, KeyCode::Tab);
+        hand_back(&mut app);
         press(&mut app, KeyCode::Tab);
         assert_eq!(app.focus(), Focus::Pane(Slot::Split(1)));
         hand_back(&mut app);
         app.select("b");
-        press(&mut app, KeyCode::Char('H'));
+        press(&mut app, KeyCode::Char('K'));
         assert_eq!(app.splits(), ["b", "a"]);
         // Tab goes on from b's pane, wherever it is: to a's, after it.
         press(&mut app, KeyCode::Tab);
@@ -4646,29 +5158,27 @@ mod tests {
         press(&mut app, KeyCode::Char('L'));
         assert!(app.notice().unwrap().contains("zoomed"));
         press(&mut app, KeyCode::Char('z'));
-        assert_eq!(drawn(&app), ["b", "a"]);
+        assert_eq!(drawn(&app), ["a", "b"]);
     }
 
     #[test]
-    fn panes_keep_their_order_as_splits_close_and_come() {
+    fn panes_keep_their_places_as_splits_close_and_come() {
         let mut app = app_with_splits(&["a", "b", "c"], 2);
-        press(&mut app, KeyCode::Char('L'));
-        press(&mut app, KeyCode::Char('L'));
         assert_eq!(drawn(&app), ["a", "b", "c"]);
-        // a's split closes: b stays before the selection's pane.
+        // a's split closes, and b's pane takes its room.
         app.select("a");
         press(&mut app, KeyCode::Char('s'));
         app.select("c");
         assert_eq!(drawn(&app), ["b", "c"]);
-        // A new split goes at the end.
+        // A new split stays where the selection's pane showed it.
         app.select("a");
         press(&mut app, KeyCode::Char('s'));
         app.select("c");
-        assert_eq!(drawn(&app), ["b", "c", "a"]);
-        // So does a session that goes, from before the selection's pane.
+        assert_eq!(drawn(&app), ["b", "a", "c"]);
+        // A session that goes leaves its room to the pane beside it.
         app.set_sessions(vec![session("a"), session("c")]);
-        assert_eq!(drawn(&app), ["c", "a"]);
-        assert_eq!(app.tabs_to_keep().current().selection_at, 0);
+        assert_eq!(drawn(&app), ["a", "c"]);
+        assert_eq!(app.tabs_to_keep().current().splits(), ["a"]);
     }
 
     #[test]
@@ -4696,14 +5206,14 @@ mod tests {
         assert_eq!(app.grabbed().unwrap().over, Some(Slot::Split(1)));
         assert_eq!(app.on_mouse(up, over_b), None);
         assert_eq!(app.grabbed(), None);
-        assert_eq!(drawn(&app), ["b", "a", "c"]);
+        assert_eq!(drawn(&app), ["a", "c", "b"]);
 
         // Let go anywhere but over another pane, and nothing moves.
         app.on_mouse(down, header(Slot::Split(0)));
         app.on_mouse(up, Hit::Sidebar);
         app.on_mouse(down, header(Slot::Split(0)));
         app.on_mouse(up, header(Slot::Split(0)));
-        assert_eq!(drawn(&app), ["b", "a", "c"]);
+        assert_eq!(drawn(&app), ["a", "c", "b"]);
     }
 
     #[test]
@@ -4755,9 +5265,9 @@ mod tests {
         press(&mut app, KeyCode::Char('F'));
         hand_back(&mut app);
         press(&mut app, KeyCode::Char('k'));
-        assert_eq!(app.slots(), [Slot::Selected, Slot::Split(0), Slot::Float]);
+        assert_eq!(app.slots(), [Slot::Split(0), Slot::Selected, Slot::Float]);
         press(&mut app, KeyCode::Tab);
-        assert_eq!(app.focus(), Focus::Pane(Slot::Selected));
+        assert_eq!(app.focus(), Focus::Pane(Slot::Split(0)));
         hand_back(&mut app);
         press(&mut app, KeyCode::Tab);
         hand_back(&mut app);
@@ -4878,7 +5388,7 @@ mod tests {
         let mut app = app_with(&["a", "b", "c"]);
         press(&mut app, KeyCode::Char('s'));
         press(&mut app, KeyCode::Char('j'));
-        press(&mut app, KeyCode::Char('L'));
+        press(&mut app, KeyCode::Char('K'));
         press(&mut app, KeyCode::Char('T'));
         type_text(&mut app, "work");
         press(&mut app, KeyCode::Enter);
@@ -4949,10 +5459,10 @@ mod tests {
         assert_eq!(
             visited,
             [
-                pane(Slot::Selected),
                 pane(Slot::Split(0)),
                 pane(Slot::Split(1)),
                 pane(Slot::Selected),
+                pane(Slot::Split(0)),
             ]
         );
     }
@@ -4961,10 +5471,10 @@ mod tests {
     fn shift_tab_goes_round_the_other_way_starting_at_the_last_pane() {
         let mut app = app_with_splits(&["a", "b", "c"], 2);
         press(&mut app, KeyCode::BackTab);
-        assert_eq!(app.focus(), Focus::Pane(Slot::Split(1)));
+        assert_eq!(app.focus(), Focus::Pane(Slot::Selected));
         hand_back(&mut app);
         press(&mut app, KeyCode::BackTab);
-        assert_eq!(app.focus(), Focus::Pane(Slot::Split(0)));
+        assert_eq!(app.focus(), Focus::Pane(Slot::Split(1)));
     }
 
     #[test]
@@ -5049,7 +5559,7 @@ mod tests {
     fn z_zooms_the_selected_sessions_pane_alone_and_again_puts_the_others_back() {
         let mut app = app_with_splits(&["a", "b", "c"], 1);
         app.select("b");
-        assert_eq!(on_screen(&app), ["b", "a"]);
+        assert_eq!(on_screen(&app), ["a", "b"]);
         press(&mut app, KeyCode::Char('z'));
         assert!(app.zoomed());
         assert_eq!(on_screen(&app), ["b"]);
@@ -5068,7 +5578,7 @@ mod tests {
 
         press(&mut app, KeyCode::Char('z'));
         assert!(!app.zoomed());
-        assert_eq!(on_screen(&app), ["c", "a"]);
+        assert_eq!(on_screen(&app), ["a", "c"]);
     }
 
     #[test]
@@ -5346,12 +5856,12 @@ mod tests {
     #[test]
     fn each_tab_keeps_its_own_splits() {
         let mut app = app_with_splits(&["a", "b", "c"], 1);
-        assert_eq!(on_screen(&app), ["c", "a"]);
+        assert_eq!(on_screen(&app), ["a", "c"]);
         press(&mut app, KeyCode::Char('t'));
         app.set_sessions(["a", "b", "c", "shell"].map(session).to_vec());
         assert!(app.splits().is_empty());
         press(&mut app, KeyCode::Char('1'));
-        assert_eq!(on_screen(&app), ["c", "a"]);
+        assert_eq!(on_screen(&app), ["a", "c"]);
     }
 
     #[test]
@@ -5523,7 +6033,7 @@ mod tests {
     fn a_split_of_a_session_that_goes_closes() {
         let mut app = app_with_splits(&["a", "b", "c"], 1);
         app.set_sessions(vec![session("b"), session("c")]);
-        assert!(app.tabs().all().iter().all(|tab| tab.splits.is_empty()));
+        assert!(app.tabs().all().iter().all(|tab| tab.splits().is_empty()));
     }
 
     #[test]

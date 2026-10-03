@@ -84,9 +84,12 @@ and the footer says where you are and offers the keys that matter there.
 |---|---|
 | `j` / `k`, `↓` / `↑` | select a session, or a worktree with no sessions |
 | `Enter` | type into the selected session, or start an ended one again, once you've said `y`; on a worktree with no sessions, start one there |
-| `s` | split the selected session off into a pane of its own, or close its split |
+| `s` | split the selected session off into a pane of its own, beside its pane or below it, or close its split |
+| `\|` / `-` | split the selected session's pane in two, side by side or one above the other |
+| `Shift+arrows` | select the session in the pane to the left, right, above or below |
 | `F` | float the selected session over the panes, and type into it; again, put it back |
-| `H` / `L` | move the selected session's pane a place left or right among the panes (up or down, stacked), swapping it with the pane there |
+| `H` / `J` / `K` / `L` | swap the selected session's pane with the one to its left, below, above or right |
+| `R` | resize mode: move the borders of the selected session's pane with the keys |
 | `z` | [zoom](#zoom-copy-mode-and-search) the selected session's pane to take the whole screen, or put it back |
 | `Tab` / `Shift+Tab` | type into the next pane, or the one before |
 | `PgUp` / `PgDn` | page the selected session's pane back through its history, or forward to live |
@@ -145,22 +148,44 @@ for the mouse itself, like `vim` with `set mouse=a` or `htop`, gets the clicks, 
 while that pane has the keyboard; there, your terminal's own selection still works with a key held: `Shift` in
 most terminals, `Option` in iTerm2 and Terminal on macOS.
 
-A split keeps a session on screen while the selection moves on: up to two of them, beside the selected
-session's pane when each pane can be at least 80 columns wide, and stacked below it when not. Each pane's
-session is sized to its pane. `Tab` from the sidebar goes on to the pane after the one you typed into last, so
-`Tab`, then `Ctrl+\`, then `Tab` again walks through them all.
+A split keeps a session on screen while the selection moves on. `s` splits the selected session off into a
+pane of its own: it stays where it is, and the pane that follows the selection takes the other half, to show
+the next session you select, beside it when both halves can be at least 80 columns wide and below it when not.
+`|` splits side by side and `-` one above the other, whatever the width. On a session that has a pane of its
+own already, they split that pane: the selection's pane comes beside it, and what it showed stays where it was,
+split off. Split any pane again, as often as there's room, to lay the panes out any way you like. `s` on a
+session split off closes its split, and the pane beside it takes the room. Each pane's session is sized to its
+pane.
 
-A new split goes after the other panes. To put them in another order, `H` moves the selected session's pane a
-place to the left and `L` a place to the right (up and down when they're stacked), swapping it with the pane
-that was there; or take a pane by its header line with the mouse and let go over another, and the two swap
-places. Each tab keeps its panes in their order, the next time you open the TUI too.
+While the selection is on a session with a pane of its own, the selection's pane goes on showing the last
+session it showed, so no session is drawn twice and going from pane to pane changes none of them. Shift and an
+arrow select the session in the pane that way, as `j` and `k` would, and `Enter` types into it. `Tab` from the
+sidebar goes on to the pane after the one you typed into last, so `Tab`, then `Ctrl+\`, then `Tab` again walks
+through them all.
+
+`H`, `J`, `K` and `L` swap the selected session's pane with the one to its left, below, above or right; or take
+a pane by its name, in its header line, with the mouse and let go over another, and the two swap places. To
+change how big they are, drag the rule between two panes side by side, or the header line of a pane below
+another, beside its name; or press `R` for resize mode, where the footer shows its keys until you're done:
+
+| Key | In resize mode |
+|---|---|
+| `h` `j` `k` `l`, the arrows | move a border of the selected session's pane that way: the one on that side, which it grows into, or else the one on its other side, which it shrinks from |
+| `Shift` and an arrow | go on to the pane that way |
+| `=` | even the panes out: those in a line the same way get the same room each |
+| `Esc`, `Enter`, `q`, `R` | done |
+
+No pane gets smaller than 12 columns or 3 rows. Each tab keeps its panes, how they're split and how big each
+is, the next time you open the TUI too; panes kept by an older crystal, as a list, come back two side by side,
+or more stacked.
 
 `F` floats the selected session over the panes, in a frame of its own in the middle of them, and hands it the
 keyboard: a shell to run something in, or an agent to answer, without changing the panes under it. The session
 is sized to the frame. `Ctrl+\` takes you back to the sidebar and leaves it floating, over whatever the
 selection shows; `Tab` or a click gets back into it, as with any pane. `F` again puts it back among the others,
-whichever session is selected. A tab has one float at most, kept with the tab like its splits. A session split
-off floats up out of its split, and `s` on the one floating puts it down into a split.
+whichever session is selected. A tab has one float at most, kept with the tab like its panes. A session split
+off floats up out of its split, and `s` on the one floating puts it down into a split, where the selection's
+pane was.
 
 The sidebar groups sessions by project, then by worktree: `⌂` marks a repository's main worktree and `⎇` a
 linked one, each named by its branch. Sessions outside any repository come last, under their directory.
@@ -294,7 +319,7 @@ logs in another, a review in a third, and switch between them.
 The tabs sit in the bar along the top, numbered, the one you're in standing out. `t` makes a new one, starts
 your shell in it, in the selected session's directory, and takes you there. `[` and `]` go to the tab before
 and after, `1` to `9` straight to that one, and a click on a tab goes there too. Each tab keeps its own
-selection and splits. `T` names the tab you're in, and the bar shows the name after its number; with too many
+selection and panes, split and sized its own way. `T` names the tab you're in, and the bar shows the name after its number; with too many
 to fit, the bar shows only the numbers.
 
 A tab with something going on in it shows that on its label, the way the sidebar marks a session: `▲` when an
@@ -310,8 +335,8 @@ database, so they're there when you open the TUI again.
 
 ### Layouts
 
-A layout is your tabs saved under a name, to put back later: each tab's name and sessions, its splits and the
-order of its panes, its float, whether it's zoomed, and which tab was in front. `S` lists them, the one saved
+A layout is your tabs saved under a name, to put back later: each tab's name and sessions, its panes with how
+they're split and how big each is, its float, whether it's zoomed, and which tab was in front. `S` lists them, the one saved
 last first, each with how many tabs and sessions it has and how many of those have gone since. `s` saves your
 tabs as they are now under a name you type, in place of the layout of that name if there's one already;
 `Enter` puts your tabs back the way the layout has them; `x` removes it, once you've said `y`; `Esc` closes the

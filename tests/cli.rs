@@ -2225,11 +2225,12 @@ fn s_splits_a_session_off_and_it_stays_while_the_selection_moves() {
     tui.shows("beta is here");
     tui.shows("alpha is here");
 
-    // Back on alpha, s closes its split, and beta leaves the screen.
+    // Back on alpha, the selection's pane goes on showing beta, and s
+    // closes alpha's split: beta leaves the screen.
     tui.type_keys("k");
-    tui.shows("alpha has a pane of its own");
+    tui.shows("alpha · selected");
+    tui.shows("beta is here");
     tui.type_keys("s");
-    tui.hides("alpha has a pane of its own");
     tui.hides("beta is here");
     tui.shows("alpha is here");
 }
@@ -2252,13 +2253,19 @@ fn tab_takes_the_keyboard_on_to_a_split_and_its_session_gets_the_keys() {
     tui.type_keys("s");
     tui.type_keys("j");
 
-    // The first Tab goes to the selection's pane, the next to the split.
+    // reader's split stays on top, where it was: the first Tab goes to it,
+    // the next to the selection's pane below, and the next round to it
+    // again.
     tui.type_keys("\t");
-    tui.shows("typing into");
+    tui.shows("typing into reader");
     tui.type_keys("\x1c");
     tui.shows("q quit");
     tui.type_keys("\t");
-    tui.shows("typing into");
+    tui.shows("typing into other");
+    tui.type_keys("\x1c");
+    tui.shows("q quit");
+    tui.type_keys("\t");
+    tui.shows("typing into reader");
     tui.type_keys("hello split\r");
 
     assert_eq!(written(&crystal.dir.path().join("got")), "hello split\n");
@@ -2270,7 +2277,7 @@ fn row_of(tui: &Terminal, text: &str) -> Option<usize> {
 }
 
 #[test]
-fn l_moves_a_pane_past_the_next_and_the_tab_keeps_the_order() {
+fn capital_k_moves_a_pane_up_past_the_one_above_and_the_tab_keeps_it_there() {
     let crystal = Crystal::new();
     for name in ["alpha", "beta"] {
         let script = format!("echo {name} is here; echo > {name}-ready; sleep 30");
@@ -2278,32 +2285,32 @@ fn l_moves_a_pane_past_the_next_and_the_tab_keeps_the_order() {
         written(&crystal.dir.path().join(format!("{name}-ready")));
     }
 
-    // At 80 columns the panes are stacked: beta's, which follows the
-    // selection, on top, then alpha's split.
+    // At 80 columns s splits alpha off above the selection's pane, where
+    // beta shows.
     let mut tui = crystal.tui();
     tui.shows("alpha is here");
     tui.type_keys("sj");
     tui.shows("beta is here");
     let above = |tui: &Terminal, first: &str, second: &str| matches!((row_of(tui, first), row_of(tui, second)), (Some(a), Some(b)) if a < b);
     assert!(
-        above(&tui, "beta is here", "alpha is here"),
+        above(&tui, "alpha is here", "beta is here"),
         "{}",
         tui.text()
     );
 
-    tui.type_keys("L");
-    eventually("beta's pane goes below alpha's", || {
-        above(&tui, "alpha is here", "beta is here")
+    tui.type_keys("K");
+    eventually("beta's pane goes above alpha's", || {
+        above(&tui, "beta is here", "alpha is here")
     });
 
-    // The order is the tab's: it's there again when the TUI opens.
+    // The panes are the tab's: they're there again when the TUI opens.
     tui.type_keys("q");
     assert!(tui.exit());
     let tui = crystal.tui();
     tui.shows("beta is here");
     tui.shows("alpha is here");
     assert!(
-        above(&tui, "alpha is here", "beta is here"),
+        above(&tui, "beta is here", "alpha is here"),
         "{}",
         tui.text()
     );
@@ -2383,19 +2390,106 @@ fn each_pane_sizes_its_own_session() {
     tui.shows("left watching");
 
     // At 24 by 80 there are 51 columns beside the sidebar, too few to share
-    // side by side, so the panes are stacked: each 51 columns wide, with
-    // the 22 rows between the top bar and the footer shared between them,
-    // less a header line each.
+    // side by side, so s stacks the panes: each 51 columns wide, with the
+    // 22 rows between the top bar and the footer shared between them, less
+    // a header line each.
     eventually("the panes are stacked", || {
         let (left, right) = (size_of("left"), size_of("right"));
         left.1 == 51 && right.1 == 51 && left.0 + right.0 + 2 == 22
     });
 
-    // At 200 columns there are 171 beside the sidebar: two panes of 85,
-    // with a rule between them, so they go side by side.
+    // Wider, they stay stacked, each as wide as the room beside the
+    // sidebar, 171 columns, and the 28 rows shared between them.
     tui.resize(30, 200);
+    eventually("the panes widen", || {
+        size_of("left") == (13, 171) && size_of("right") == (13, 171)
+    });
+
+    // Split off again at that width, left goes beside the selection's
+    // pane: two panes of 85, with a rule between them.
+    tui.type_keys("kssj");
     eventually("the panes are side by side", || {
         size_of("left") == (27, 85) && size_of("right") == (27, 85)
+    });
+}
+
+/// Starts a session for each of `names` that writes its size to a file
+/// called after it whenever it changes.
+fn sessions_telling_their_size(crystal: &Crystal, names: &[&str]) {
+    for name in names {
+        let script = format!(
+            "trap 'stty size > {name}-size' WINCH; echo {name} watching; \
+             while :; do sleep 0.05; done"
+        );
+        crystal.ok(&["new", "-n", name, "sh", "-c", &script]);
+    }
+}
+
+/// The `(rows, columns)` the session called `name` last said it has.
+fn told_size(crystal: &Crystal, name: &str) -> (u16, u16) {
+    let file = crystal.dir.path().join(format!("{name}-size"));
+    let size = std::fs::read_to_string(file).unwrap_or_default();
+    let mut numbers = size.split_whitespace().map(|n| n.parse().unwrap_or(0));
+    (numbers.next().unwrap_or(0), numbers.next().unwrap_or(0))
+}
+
+#[test]
+fn bar_and_dash_split_any_pane_and_each_session_is_sized_to_its_own() {
+    let crystal = Crystal::new();
+    sessions_telling_their_size(&crystal, &["one", "two", "three"]);
+    let mut tui = crystal.tui();
+    tui.shows("one watching");
+
+    // one | (two over three): 51 columns beside the sidebar make two of 25
+    // and a rule; two and three share 22 rows, less their header lines.
+    tui.type_keys("|j");
+    tui.shows("two watching");
+    tui.type_keys("-j");
+    tui.shows("three watching");
+    eventually("each session is its pane's size", || {
+        told_size(&crystal, "one") == (21, 25)
+            && told_size(&crystal, "two") == (10, 25)
+            && told_size(&crystal, "three") == (10, 25)
+    });
+    tui.shows("one watching");
+    tui.shows("two watching");
+
+    // Shift and an arrow go from pane to pane.
+    tui.type_keys("\x1b[1;2D");
+    tui.shows("one · selected");
+}
+
+#[test]
+fn r_resizes_the_selected_pane_with_the_keys_and_a_rule_drags_with_the_mouse() {
+    let crystal = Crystal::new();
+    sessions_telling_their_size(&crystal, &["left", "right"]);
+    let mut tui = crystal.tui();
+    tui.shows("left watching");
+    tui.type_keys("|j");
+    eventually("the panes share the room", || {
+        told_size(&crystal, "left") == (21, 25) && told_size(&crystal, "right") == (21, 25)
+    });
+
+    // right, in the selection's pane, has no border on its right: l moves
+    // the one on its left, four columns at a time.
+    tui.type_keys("R");
+    tui.shows("resizing right");
+    tui.type_keys("ll");
+    eventually("the border moved right", || {
+        told_size(&crystal, "left") == (21, 33) && told_size(&crystal, "right") == (21, 17)
+    });
+    tui.type_keys("=");
+    eventually("the panes are even again", || {
+        told_size(&crystal, "left") == (21, 25) && told_size(&crystal, "right") == (21, 25)
+    });
+    tui.type_keys("\x1b");
+    tui.hides("resizing right");
+
+    // The rule between them is at column 54. Dragged to column 40, it
+    // would leave left 11 columns: it stops at 12, the fewest a pane has.
+    tui.type_keys("\x1b[<0;55;10M\x1b[<32;45;10M\x1b[<32;41;10M\x1b[<0;41;10m");
+    eventually("the rule went where it was dragged", || {
+        told_size(&crystal, "left") == (21, 12) && told_size(&crystal, "right") == (21, 38)
     });
 }
 

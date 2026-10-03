@@ -1,6 +1,7 @@
 //! The TUI, run as `crystal` with no command: a sidebar with every session,
-//! the selected one live in a pane beside it, and up to two more split off
-//! into panes of their own, in tabs that each keep their own.
+//! the selected one live in a pane beside it, and any others split off into
+//! panes of their own, split and sized as the user likes, in tabs that each
+//! keep their own.
 //!
 //! Everything that happens arrives as an [`Event`] on one channel: a key,
 //! the mouse, a resize, output from the session in the pane, a fresh
@@ -31,6 +32,7 @@ pub(crate) mod screen_widget;
 mod search;
 mod settings_view;
 pub(crate) mod sidebar;
+mod split_tree;
 mod status;
 mod tabs;
 mod text_area;
@@ -380,6 +382,7 @@ impl Tui {
             let size = terminal.size()?;
             self.screen = Rect::new(0, 0, size.width, size.height);
             let areas = ui::Areas::of(&self.app, self.screen);
+            self.app.set_tiles(areas.tiles);
             self.sync_panes(&areas);
             if let Some(overlay) = &mut self.overlay {
                 let screen = ui::plugin_pane_screen(&areas);
@@ -652,7 +655,10 @@ impl Tui {
         }
         let areas = ui::Areas::of(&self.app, self.screen);
         let mut hit = ui::hit(&areas, &self.app, mouse.column, mouse.row);
-        if let Some(slot) = self.app.dragging() {
+        if let Some(split) = self.app.moving_border() {
+            // A border taken by the mouse is crystal's until it's let go.
+            hit = ui::border_hit(&areas, &self.app, split, mouse.column, mouse.row);
+        } else if let Some(slot) = self.app.dragging() {
             // A selection being dragged is crystal's to the end, and keeps
             // to the edge of its pane when the mouse leaves it.
             let cell = ui::nearest_cell(&areas, &self.app, slot, mouse.column, mouse.row);
