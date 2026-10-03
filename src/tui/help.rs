@@ -77,13 +77,13 @@ pub const KEYS: &[Key] = &[
     in_pane("Ctrl+C", "stop a task's run"),
     question("y", "yes; any other key, no"),
     question("Enter/Esc", "answer / cancel"),
-    question("Ctrl+U", "clear the answer"),
     new_session("Tab ←/→", "next row, choose"),
     new_session("↑/↓", "earlier tasks"),
     new_session("Alt+Enter", "new line in the task"),
     new_session("Ctrl+E", "edit the command line"),
     mouse("click", "a session, pane, tab"),
     mouse("wheel/drag", "scroll / select, copy"),
+    mouse("Ctrl+click", "open a link"),
 ];
 
 const fn key(section: Section, label: &'static str, does: &'static str) -> Key {

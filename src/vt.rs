@@ -4,13 +4,14 @@
 //! program's questions from it; each viewer keeps one of its own, fed the
 //! same output, to draw, and to copy from: copy mode's cursor, the
 //! selection and searches are Alacritty's own vi mode, kept in step with
-//! the output as it scrolls.
+//! the output as it scrolls. A viewer's screen also finds the links on it,
+//! the hyperlinks a program wrote (OSC 8) and the URLs in its text.
 
 use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::{Dimensions, Grid, Scroll};
 use alacritty_terminal::index::{Boundary, Column, Direction, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionRange, SelectionType};
-use alacritty_terminal::term::cell::{Cell as GridCell, Flags};
+use alacritty_terminal::term::cell::{Cell as GridCell, Flags, Hyperlink};
 use alacritty_terminal::term::search::{Match, RegexIter, RegexSearch};
 use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::vi_mode::ViMotion;
@@ -79,6 +80,33 @@ pub struct Screen {
     heard: Arc<Mutex<Heard>>,
     /// The last search, while copy mode keeps it.
     search: Option<Search>,
+    /// What finds URLs in the text, made the first time a link is looked
+    /// for, and borrowed mutably for the cache it keeps as it goes.
+    urls: RefCell<Option<RegexSearch>>,
+}
+
+/// What a URL written out in a screen's text looks like: a scheme a
+/// browser opens, then everything up to a blank, a quote or a bracket that
+/// can't be in one. Punctuation that ends a sentence is taken off after.
+const URL: &str = r#"(https?|file)://[^\x00-\x1f\x7f-\x9f\s<>"{}|\\^`⟨⟩]+"#;
+
+/// A link on a screen: a hyperlink the program wrote (OSC 8), or a URL in
+/// its text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Link {
+    pub url: String,
+    /// Its first and last cells on what's showing, as `(row, col)`; every
+    /// cell between them, in reading order, is the link's. One that goes
+    /// on out of sight is cut at the edge.
+    pub start: (u16, u16),
+    pub end: (u16, u16),
+}
+
+impl Link {
+    /// Whether the cell at `(row, col)` of what's showing is the link's.
+    pub fn covers(&self, cell: (u16, u16)) -> bool {
+        self.start <= cell && cell <= self.end
+    }
 }
 
 /// A search through the screen and its history.
@@ -294,6 +322,7 @@ impl Screen {
             parser: Processor::new(),
             heard,
             search: None,
+            urls: RefCell::default(),
         }
     }
 
@@ -416,6 +445,11 @@ impl Screen {
         let pen = Style::of(&cursor.template);
         if pen != Style::default() {
             out.push_str(&pen.sequence());
+        }
+        // A hyperlink the program has opened and not yet closed takes in
+        // what it writes next.
+        if let Some(link) = cursor.template.hyperlink() {
+            write_hyperlink(&mut out, Some(&link));
         }
         out.into_bytes()
     }
@@ -792,6 +826,126 @@ impl Screen {
         let row = u16::try_from(row).ok()?;
         (usize::from(row) < grid.screen_lines()).then_some((row, point.column.0 as u16))
     }
+
+    /// The link on the cell at `(row, col)` of what's showing, if there's
+    /// one: a hyperlink the program wrote, or else a URL in the text, whole
+    /// across the rows it wrapped onto.
+    pub fn link_at(&self, cell: (u16, u16)) -> Option<Link> {
+        let point = self.point_showing(cell);
+        self.hyperlink_at(point).or_else(|| self.url_at(point))
+    }
+
+    /// The hyperlink on the cell at `point`: the cells around it with the
+    /// same one, as far as what's showing goes.
+    fn hyperlink_at(&self, point: Point) -> Option<Link> {
+        let grid = self.term.grid();
+        let link = grid[point].hyperlink()?;
+        let same = |at: &Point| grid[*at].hyperlink().as_ref() == Some(&link);
+        let (top, bottom) = self.lines_showing();
+        let before = |at: &Point| self.cell_before(*at).filter(|at| at.line >= top);
+        let after = |at: &Point| self.cell_after(*at).filter(|at| at.line <= bottom);
+        let start = std::iter::successors(Some(point), before)
+            .take_while(same)
+            .last()?;
+        let end = std::iter::successors(Some(point), after)
+            .take_while(same)
+            .last()?;
+        Some(self.link_showing(link.uri().to_string(), start, end))
+    }
+
+    /// The URL in the text on the cell at `point`, if it's in one.
+    fn url_at(&self, point: Point) -> Option<Link> {
+        let mut urls = self.urls.borrow_mut();
+        let regex = match &mut *urls {
+            Some(regex) => regex,
+            empty => empty.insert(RegexSearch::new(URL).ok()?),
+        };
+        let start = self.term.line_search_left(point);
+        let end = self.term.line_search_right(point);
+        let found = RegexIter::new(start, end, Direction::Right, &self.term, regex)
+            .find(|found| found.contains(&point))?;
+        let text = self.term.bounds_to_string(*found.start(), *found.end());
+        let url = trim_url(&text);
+        // What's taken off the end is punctuation, a cell a character.
+        let mut last = *found.end();
+        for _ in url.chars().count()..text.chars().count() {
+            last = self.cell_before(last)?;
+        }
+        (point <= last).then(|| self.link_showing(url.to_string(), *found.start(), last))
+    }
+
+    /// The first and last lines showing.
+    fn lines_showing(&self) -> (Line, Line) {
+        let grid = self.term.grid();
+        let top = Line(-(grid.display_offset() as i32));
+        (top, top + (grid.screen_lines() as i32 - 1))
+    }
+
+    /// The cell before `point` in reading order, back up the rows to the
+    /// top of the history.
+    fn cell_before(&self, point: Point) -> Option<Point> {
+        if point.column.0 > 0 {
+            Some(Point::new(point.line, point.column - 1))
+        } else if point.line > self.term.topmost_line() {
+            Some(Point::new(point.line - 1, self.term.last_column()))
+        } else {
+            None
+        }
+    }
+
+    /// The cell after `point` in reading order, down the rows to the
+    /// bottom of the screen.
+    fn cell_after(&self, point: Point) -> Option<Point> {
+        if point.column < self.term.last_column() {
+            Some(Point::new(point.line, point.column + 1))
+        } else if point.line < self.term.bottommost_line() {
+            Some(Point::new(point.line + 1, Column(0)))
+        } else {
+            None
+        }
+    }
+
+    /// A link to `url` from `start` to `end` in the grid, placed on what's
+    /// showing, and cut at its edges.
+    fn link_showing(&self, url: String, start: Point, end: Point) -> Link {
+        let (top, bottom) = self.lines_showing();
+        let last_column = self.term.last_column();
+        let place = |point: Point| {
+            let point = if point.line < top {
+                Point::new(top, Column(0))
+            } else if point.line > bottom {
+                Point::new(bottom, last_column)
+            } else {
+                point
+            };
+            ((point.line - top).0 as u16, point.column.0 as u16)
+        };
+        Link {
+            url,
+            start: place(start),
+            end: place(end),
+        }
+    }
+}
+
+/// A URL found in the text, without what ends the sentence around it: a
+/// full stop, a comma, a quote, or a closing bracket that opens nowhere in
+/// it, the way `(see https://example.com/a)` reads.
+fn trim_url(found: &str) -> &str {
+    let mut url = found;
+    loop {
+        let unpaired = |open: char, close: char| {
+            url.ends_with(close) && url.matches(close).count() > url.matches(open).count()
+        };
+        if url.ends_with(['.', ',', ':', ';', '!', '?', '\''])
+            || unpaired('(', ')')
+            || unpaired('[', ']')
+        {
+            url = &url[..url.len() - 1];
+        } else {
+            return url;
+        }
+    }
 }
 
 /// What copy mode marks on the rows showing, asked about each cell in turn
@@ -899,8 +1053,9 @@ fn row_text(grid: &Grid<GridCell>, line: Line) -> String {
 }
 
 /// Writes `row` as output that draws it again: its text, with a style
-/// sequence wherever the style changes. With `trim`, the blank cells at
-/// its end with no style of their own are left out.
+/// sequence wherever the style changes, and its hyperlinks. With `trim`,
+/// the blank cells at its end with no style or link of their own are left
+/// out.
 fn write_row(
     out: &mut String,
     row: &alacritty_terminal::grid::Row<GridCell>,
@@ -913,13 +1068,14 @@ fn write_row(
             .iter()
             .rposition(|cell| {
                 let blank = cell.c == ' ' || cell.c == '\0';
-                !blank || Style::of(cell) != Style::default()
+                !blank || Style::of(cell) != Style::default() || cell.hyperlink().is_some()
             })
             .map_or(0, |last| last + 1)
     } else {
         cols
     };
     let mut style = Style::default();
+    let mut link = None;
     out.push_str("\x1b[m");
     for cell in &cells[..used] {
         // A wide character's right half is drawn by its left half, and the
@@ -936,7 +1092,28 @@ fn write_row(
             out.push_str(&cell_style.sequence());
             style = cell_style;
         }
+        let cell_link = cell.hyperlink();
+        if cell_link != link {
+            write_hyperlink(out, cell_link.as_ref());
+            link = cell_link;
+        }
         cell_text(cell, out);
+    }
+    // A link that wraps onto the next row opens again there, with the same
+    // id, which makes it the same link.
+    if link.is_some() {
+        write_hyperlink(out, None);
+    }
+}
+
+/// Writes the OSC 8 sequence that starts `link`, with its id, or with
+/// `None` the one that ends the link before.
+fn write_hyperlink(out: &mut String, link: Option<&Hyperlink>) {
+    match link {
+        Some(link) => {
+            let _ = write!(out, "\x1b]8;id={};{}\x1b\\", link.id(), link.uri());
+        }
+        None => out.push_str("\x1b]8;;\x1b\\"),
     }
 }
 
@@ -1616,6 +1793,62 @@ mod tests {
         assert_eq!(screen.search("Cost", false).map(|f| f.of), Some(1));
         assert_eq!(screen.search("nowhere", false), None);
         assert_eq!(screen.search_again(true), None);
+    }
+
+    #[test]
+    fn a_hyperlink_is_found_on_any_of_its_cells() {
+        let screen = screen(
+            2,
+            30,
+            b"see \x1b]8;;https://example.com/a\x1b\\the docs\x1b]8;;\x1b\\ now",
+        );
+        let link = screen.link_at((0, 6)).unwrap();
+        assert_eq!(link.url, "https://example.com/a");
+        assert_eq!((link.start, link.end), ((0, 4), (0, 11)));
+        assert!(link.covers((0, 11)) && !link.covers((0, 12)));
+        assert_eq!(screen.link_at((0, 1)), None);
+        assert_eq!(screen.link_at((0, 13)), None);
+    }
+
+    #[test]
+    fn a_url_in_the_text_is_a_link_without_the_punctuation_after_it() {
+        let screen = screen(
+            3,
+            40,
+            b"read https://example.com/x?q=1. then\r\n(at http://h/a_(b)) ok",
+        );
+        let link = screen.link_at((0, 10)).unwrap();
+        assert_eq!(link.url, "https://example.com/x?q=1");
+        assert_eq!((link.start, link.end), ((0, 5), (0, 29)));
+        // The full stop after it isn't the link.
+        assert_eq!(screen.link_at((0, 30)), None);
+        let link = screen.link_at((1, 5)).unwrap();
+        assert_eq!(link.url, "http://h/a_(b)");
+        assert_eq!(screen.link_at((0, 2)), None);
+    }
+
+    #[test]
+    fn a_url_that_wraps_is_one_link_from_either_row() {
+        let screen = screen(3, 12, b"go https://example.com/abc end");
+        let from_top = screen.link_at((0, 5)).unwrap();
+        let from_below = screen.link_at((1, 3)).unwrap();
+        assert_eq!(from_top, from_below);
+        assert_eq!(from_top.url, "https://example.com/abc");
+        assert_eq!((from_top.start, from_top.end), ((0, 3), (2, 1)));
+    }
+
+    #[test]
+    fn a_hyperlink_reaches_a_new_viewer() {
+        let original = screen(
+            3,
+            20,
+            b"\x1b]8;id=7;file:///tmp/x\x1b\\linked\x1b]8;;\x1b\\ plain",
+        );
+        let copy = screen(3, 20, &original.state_formatted(true));
+        let link = copy.link_at((0, 2)).unwrap();
+        assert_eq!(link.url, "file:///tmp/x");
+        assert_eq!((link.start, link.end), ((0, 0), (0, 5)));
+        assert_eq!(copy.link_at((0, 8)), None);
     }
 
     #[test]

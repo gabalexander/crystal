@@ -79,7 +79,7 @@ pub fn run(socket: &Path) -> Result<()> {
     let db = Db::open(socket)?;
     let listener = listen(socket)?;
     let events = Arc::new(Bus::new(socket));
-    plugin_hooks::follow(&events, socket);
+    let hooks = plugin_hooks::follow(&events, socket);
     thread::spawn({
         let events = events.clone();
         move || {
@@ -110,6 +110,7 @@ pub fn run(socket: &Path) -> Result<()> {
     }
     daemon.start_saved_sessions();
     daemon.take_up_flows();
+    hooks.start_up();
     // With search by meaning on, the model is loaded and every entry
     // without a vector given one now, rather than when a session starts.
     thread::spawn({

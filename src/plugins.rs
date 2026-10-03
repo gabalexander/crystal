@@ -10,7 +10,14 @@
 //! Plugins the user installs live in a directory each, under
 //! [`plugins_dir`], with a `plugin.toml` saying what they add: see
 //! [`crate::plugin_manifest`]. They are off until switched on, and they use
-//! crystal through its own command line, like any script would.
+//! crystal through its own command line, like any script would. One that
+//! doesn't fit this crystal or this system, or whose build failed, can't be
+//! switched on, and doesn't run if it was.
+//!
+//! Each has a directory for its user's settings, shared by every server
+//! like the config file, and one for what it keeps as it runs, a server's
+//! own like the server's sessions: what a plugin keeps is about what it
+//! saw happen, which is a server's.
 
 use crate::config::{self, Config};
 use crate::events::Event;
@@ -165,6 +172,23 @@ fn edit_plugins(path: &Path, change: impl FnOnce(&mut Table)) -> Result<()> {
     Ok(())
 }
 
+/// Refuses, saying why, to switch on the plugin `plugin` of those
+/// `installed`: it can't run here, or it wants a key another has.
+pub fn check_can_enable(plugin: &Installed, installed: &[Installed]) -> Result<()> {
+    if let Some(why) = plugin.blocked() {
+        bail!("{} can't be turned on: {why}", plugin.name);
+    }
+    if let Ok(manifest) = &plugin.manifest
+        && let Some((key, other)) = key_taken(manifest, installed)
+    {
+        bail!(
+            "{} wants the key {key}, which the {other} plugin has",
+            plugin.name
+        );
+    }
+    Ok(())
+}
+
 /// The first of `manifest`'s keys another installed plugin's action has
 /// already taken, with that plugin's name. Two plugins can't share a key.
 pub fn key_taken(manifest: &Manifest, others: &[Installed]) -> Option<(String, String)> {
@@ -190,13 +214,15 @@ pub fn key_taken(manifest: &Manifest, others: &[Installed]) -> Option<(String, S
 }
 
 /// What a plugin's command is told about where it was run from: the
-/// session, and the project and worktree it's in.
+/// session, and the project and worktree it's in; and for an action run on
+/// a link, the link.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Context {
     pub session: Option<String>,
     pub session_id: Option<String>,
     pub project: Option<PathBuf>,
     pub worktree: Option<PathBuf>,
+    pub link: Option<String>,
 }
 
 impl Context {
@@ -211,6 +237,7 @@ impl Context {
             session_id: Some(session.id.clone()),
             project: Some(project),
             worktree: Some(worktree),
+            link: None,
         }
     }
 
@@ -227,6 +254,7 @@ impl Context {
             session_id: session.map(|session| session.id.clone()),
             project: event.project.clone(),
             worktree,
+            link: None,
         }
     }
 
@@ -247,28 +275,37 @@ impl Context {
     }
 
     /// The variables a command finds this in: `CRYSTAL_SESSION`,
-    /// `CRYSTAL_SESSION_ID`, `CRYSTAL_PROJECT` and `CRYSTAL_WORKTREE`, each
-    /// `None` when there's nothing to say, to take away one the command
-    /// would otherwise get from whoever ran it.
-    pub fn vars(&self) -> [(&'static str, Option<String>); 4] {
+    /// `CRYSTAL_SESSION_ID`, `CRYSTAL_PROJECT`, `CRYSTAL_WORKTREE` and
+    /// `CRYSTAL_LINK`, each `None` when there's nothing to say, to take away
+    /// one the command would otherwise get from whoever ran it.
+    pub fn vars(&self) -> [(&'static str, Option<String>); 5] {
         let path = |path: &Option<PathBuf>| path.as_ref().map(|path| path.display().to_string());
         [
             ("CRYSTAL_SESSION", self.session.clone()),
             ("CRYSTAL_SESSION_ID", self.session_id.clone()),
             ("CRYSTAL_PROJECT", path(&self.project)),
             ("CRYSTAL_WORKTREE", path(&self.worktree)),
+            ("CRYSTAL_LINK", self.link.clone()),
         ]
     }
 }
 
-/// `words`, a plugin's command, ready to run from the plugin's directory
-/// `dir`, with [`env`] in its environment.
-pub fn command(dir: &Path, words: &[String], socket: &Path, context: &Context) -> Command {
+/// `words`, a command of the plugin called `plugin`, ready to run from the
+/// plugin's directory `dir`, with [`env`] in its environment and the
+/// plugin's state directory made.
+pub fn command(
+    plugin: &str,
+    dir: &Path,
+    words: &[String],
+    socket: &Path,
+    context: &Context,
+) -> Command {
+    make_state_dir(socket, plugin);
     let argv = argv(dir, words);
     let (program, args) = argv.split_first().expect("a checked command has a program");
     let mut command = Command::new(program);
     command.args(args).current_dir(dir);
-    for (key, said) in env(socket, context) {
+    for (key, said) in env(socket, plugin, context) {
         match said {
             Some(value) => command.env(key, value),
             None => command.env_remove(key),
@@ -289,28 +326,54 @@ pub fn argv(dir: &Path, words: &[String]) -> Vec<String> {
     argv
 }
 
-/// What a plugin's command finds in its environment: `CRYSTAL_BIN`, the
-/// crystal that runs it, and `CRYSTAL_SOCKET`, its daemon, so the plugin
-/// can use crystal's own commands, and then `context`.
-pub fn env(socket: &Path, context: &Context) -> Vec<(&'static str, Option<String>)> {
+/// What a command of the plugin called `plugin` finds in its environment:
+/// `CRYSTAL_BIN`, the crystal that runs it, and `CRYSTAL_SOCKET`, its
+/// daemon, so the plugin can use crystal's own commands; `CRYSTAL_PLUGIN`,
+/// its name, and its directories, `CRYSTAL_PLUGIN_DIR`, the plugin's own,
+/// `CRYSTAL_PLUGIN_CONFIG_DIR` and `CRYSTAL_PLUGIN_STATE_DIR`; and then
+/// `context`.
+pub fn env(socket: &Path, plugin: &str, context: &Context) -> Vec<(&'static str, Option<String>)> {
     let crystal = std::env::current_exe().ok();
+    let path = |path: PathBuf| Some(path.display().to_string());
     let mut env = vec![
+        ("CRYSTAL_BIN", crystal.and_then(path)),
+        ("CRYSTAL_SOCKET", path(socket.to_path_buf())),
+        ("CRYSTAL_PLUGIN", Some(plugin.to_string())),
+        ("CRYSTAL_PLUGIN_DIR", path(plugins_dir().join(plugin))),
+        ("CRYSTAL_PLUGIN_CONFIG_DIR", path(config_dir(plugin))),
         (
-            "CRYSTAL_BIN",
-            crystal.map(|path| path.display().to_string()),
+            "CRYSTAL_PLUGIN_STATE_DIR",
+            path(own_state_dir(socket, plugin)),
         ),
-        ("CRYSTAL_SOCKET", Some(socket.display().to_string())),
     ];
     env.extend(context.vars());
     env
 }
 
+/// Makes the plugin's state directory on the daemon at `socket`, before
+/// something of the plugin's runs there. One that can't be made is the
+/// plugin's to find missing.
+pub fn make_state_dir(socket: &Path, plugin: &str) {
+    let _ = fs::create_dir_all(own_state_dir(socket, plugin));
+}
+
 /// Where installed plugins live: `$XDG_CONFIG_HOME/crystal/plugins`, or
 /// `~/.config/crystal/plugins`, beside the config file.
 pub fn plugins_dir() -> PathBuf {
+    config_root().join("plugins")
+}
+
+/// Where the plugin called `plugin` keeps its user's settings, like a
+/// token: beside the config file, apart from the plugin's own files, so
+/// installing it again keeps them. It's made as the plugin is installed.
+pub fn config_dir(plugin: &str) -> PathBuf {
+    config_root().join("plugin-config").join(plugin)
+}
+
+/// The directory of crystal's config file.
+fn config_root() -> PathBuf {
     let config = crate::config::path();
-    let dir = config.parent().unwrap_or(Path::new("."));
-    dir.join("plugins")
+    config.parent().unwrap_or(Path::new(".")).to_path_buf()
 }
 
 /// An installed plugin: its directory, and its manifest, or why the
@@ -319,6 +382,26 @@ pub struct Installed {
     pub name: String,
     pub dir: PathBuf,
     pub manifest: Result<Manifest, String>,
+}
+
+impl Installed {
+    /// Why the plugin can't run here, whatever the config says: a manifest
+    /// that doesn't make sense, or doesn't fit this crystal or this system,
+    /// or a build that failed.
+    pub fn blocked(&self) -> Option<String> {
+        let manifest = match &self.manifest {
+            Ok(manifest) => manifest,
+            Err(why) => return Some(why.clone()),
+        };
+        manifest.unfit().or_else(|| {
+            let failed = build_failed(&self.name)?;
+            let why = failed.lines().next().unwrap_or_default();
+            Some(format!(
+                "{why}; `crystal plugin build {}` tries again",
+                self.name
+            ))
+        })
+    }
 }
 
 /// The plugins installed in [`plugins_dir`], by name.
@@ -358,14 +441,30 @@ pub fn find(name: &str) -> Option<Installed> {
     installed().into_iter().find(|plugin| plugin.name == name)
 }
 
-/// The installed plugins that are on, with manifests that make sense, and
-/// not paused for failing.
+/// The installed plugins that are on, can run here, and aren't paused for
+/// failing, in order by name.
 pub fn running(config: &Config, socket: &Path) -> Vec<(PathBuf, Manifest)> {
     installed()
         .into_iter()
         .filter(|plugin| enabled(config, &plugin.name) && paused(socket, &plugin.name).is_none())
+        .filter(|plugin| plugin.blocked().is_none())
         .filter_map(|plugin| Some((plugin.dir, plugin.manifest.ok()?)))
         .collect()
+}
+
+/// The plugin, and its action, that opens `url` in place of the browser:
+/// the first running plugin by name with a link handler that takes it,
+/// its handlers tried in their order.
+pub fn link_handler(config: &Config, socket: &Path, url: &str) -> Option<(String, String)> {
+    running(config, socket)
+        .into_iter()
+        .find_map(|(_, manifest)| {
+            let handler = manifest
+                .link_handlers
+                .iter()
+                .find(|handler| handler.takes(url))?;
+            Some((manifest.name.clone(), handler.action.clone()))
+        })
 }
 
 fn read_manifest(dir: &Path, name: &str) -> Result<Manifest, String> {
@@ -374,9 +473,42 @@ fn read_manifest(dir: &Path, name: &str) -> Result<Manifest, String> {
 }
 
 /// Where the daemon at `socket` keeps what it knows about plugins: their
-/// logs, and which it paused for failing.
+/// logs, which it paused for failing, and a directory each for what they
+/// keep.
 pub fn state_dir(socket: &Path) -> PathBuf {
     state::plugins_dir(socket)
+}
+
+/// Where the plugin called `plugin` keeps what it needs as it runs on the
+/// daemon at `socket`.
+pub fn own_state_dir(socket: &Path, plugin: &str) -> PathBuf {
+    state_dir(socket).join(plugin)
+}
+
+/// Why the plugin called `name` failed to build, if its last build did.
+fn build_failed(name: &str) -> Option<String> {
+    fs::read_to_string(unbuilt_path(name)).ok()
+}
+
+/// Notes why the plugin called `name` failed to build, or with `None` that
+/// it built.
+pub fn set_build_failed(name: &str, why: Option<&str>) -> Result<()> {
+    let path = unbuilt_path(name);
+    match why {
+        Some(why) => {
+            fs::write(&path, why).with_context(|| format!("couldn't write {}", path.display()))?
+        }
+        None => {
+            let _ = fs::remove_file(&path);
+        }
+    }
+    Ok(())
+}
+
+/// Where a plugin's failed build is noted: beside the plugin, since its
+/// files are every server's, out of the way of its own.
+fn unbuilt_path(name: &str) -> PathBuf {
+    plugins_dir().join(format!(".{name}.unbuilt"))
 }
 
 /// The log of the plugin called `name`: what its commands printed.
@@ -547,6 +679,30 @@ mod tests {
     }
 
     #[test]
+    fn a_plugin_that_cant_run_here_or_wants_a_taken_key_cant_be_turned_on() {
+        // A name no plugin of the machine's has, since a failed build is
+        // noted beside the installed plugins.
+        let name = "crystal-test-only";
+        let mut future = installed(name, "Q");
+        if let Ok(manifest) = &mut future.manifest {
+            manifest.min_crystal_version = Some("99.0".into());
+        }
+        let err = check_can_enable(&future, &[]).unwrap_err();
+        assert!(
+            err.to_string()
+                .starts_with("crystal-test-only can't be turned on: needs crystal 99.0"),
+            "{err}"
+        );
+        let wanting = installed(name, "Q");
+        assert!(check_can_enable(&wanting, &[installed("other", "R")]).is_ok());
+        let err = check_can_enable(&wanting, &[installed("other", "Q")]).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "crystal-test-only wants the key Q, which the other plugin has"
+        );
+    }
+
+    #[test]
     fn switching_a_plugin_on_lets_a_paused_one_run_again() {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("crystal.sock");
@@ -564,10 +720,13 @@ mod tests {
             ..Context::default()
         };
         let words = ["./run.sh".to_string(), "now".to_string()];
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("s.sock");
         let command = command(
+            "notes",
             Path::new("/plugins/notes"),
             &words,
-            Path::new("/s.sock"),
+            &socket,
             &context,
         );
         assert_eq!(command.get_program(), "/plugins/notes/./run.sh");
@@ -582,6 +741,14 @@ mod tests {
         assert!(env.contains(&("CRYSTAL_SESSION".into(), Some("claude".into()))));
         assert!(env.contains(&("CRYSTAL_SESSION_ID".into(), None)));
         assert!(env.contains(&("CRYSTAL_PROJECT".into(), Some("/code/app".into()))));
-        assert!(env.contains(&("CRYSTAL_SOCKET".into(), Some("/s.sock".into()))));
+        assert!(env.contains(&("CRYSTAL_LINK".into(), None)));
+        let socket_var = Some(socket.display().to_string());
+        assert!(env.contains(&("CRYSTAL_SOCKET".into(), socket_var)));
+        assert!(env.contains(&("CRYSTAL_PLUGIN".into(), Some("notes".into()))));
+        // Its state is the server's, and made before it runs.
+        let state = dir.path().join("s.plugins/notes");
+        let state_var = Some(state.display().to_string());
+        assert!(env.contains(&("CRYSTAL_PLUGIN_STATE_DIR".into(), state_var)));
+        assert!(state.is_dir());
     }
 }

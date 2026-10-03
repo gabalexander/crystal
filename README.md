@@ -152,6 +152,16 @@ for the mouse itself, like `vim` with `set mouse=a` or `htop`, gets the clicks, 
 while that pane has the keyboard; there, your terminal's own selection still works with a key held: `Shift` in
 most terminals, `Option` in iTerm2 and Terminal on macOS.
 
+`Ctrl`+click opens a link in a pane, whoever has the mouse there: a URL written out in the text (`http://`,
+`https://` or `file://`), whole across the rows it wrapped onto, or a hyperlink a program wrote (OSC 8), which
+goes where it points rather than to the text it shows. Hold `Ctrl` and move the mouse over one to see it
+underlined. It opens in your browser, with `open` on macOS or `xdg-open` on Linux, unless a
+[plugin takes links like it](#link-handlers). Over ssh a browser opened on the other machine would be no use to
+you, so the link goes on your clipboard instead, as copying does. Your terminal has to hand the click to
+crystal: macOS's Terminal keeps `Ctrl`+click for its own menu, and iTerm2 does unless you turn that off in its
+settings. Copy mode's `o` opens the link under its cursor, from the keyboard. In `crystal attach`, links are
+your terminal's to open, as it finds them in the text.
+
 A split keeps a session on screen while the selection moves on. `s` splits the selected session off into a
 pane of its own: it stays where it is, and the pane that follows the selection takes the other half, to show
 the next session you select, beside it when both halves can be at least 80 columns wide and below it when not.
@@ -381,6 +391,7 @@ works on a session that has ended too, on the last it showed. `Ctrl+\` leaves co
 | `Y` | copy the line the cursor is on, and leave copy mode |
 | `/` / `?` | search down, or up, for what you type next; `Enter` searches |
 | `n` / `N` | the next match the same way, or the other way |
+| `o` | open the link under the cursor, as `Ctrl`+click does, and leave copy mode |
 | `Esc` | drop the selection, then the search, then leave copy mode |
 | `q`, `Ctrl+C` | leave copy mode |
 
@@ -1399,16 +1410,19 @@ crystal flow defs                    # the flows a run started here finds, and w
 ### Plugins
 
 Most of what crystal does beyond running sessions is a plugin you can switch off: tasks, handoff notes, the
-backlog, memory, profiles, GitHub and GitLab, flows and notifications. Plugins of your own add actions, panes over the TUI and hooks on what
-happens, and use crystal through its own command line, like any script would.
+backlog, memory, profiles, GitHub and GitLab, flows and notifications. Plugins of your own add actions, panes
+over the TUI, hooks on what happens, commands to run as the daemon starts and links to open their own way, and
+use crystal through its own command line, like any script would.
 
 ```sh
 crystal plugin                     # every plugin, and whether it's on
 crystal plugin disable github      # or enable; written under [plugins] in the config file
 crystal plugin new notes           # a plugin to start from, in ~/.config/crystal/plugins/notes
-crystal plugin install <git-url>   # or a directory; shows what it runs and asks first
+crystal plugin install <git-url>   # or a directory; shows what it runs and asks first, then builds it
+crystal plugin build notes         # run its build commands again
 crystal plugin run notes hello     # run one of its actions
 crystal plugin run notes --event session.waiting   # try its hooks on a made-up event
+crystal plugin run notes --link https://…          # run what its link handlers do with a link
 crystal plugin log notes           # what its commands printed, and how they failed
 crystal plugin remove notes
 ```
@@ -1449,6 +1463,15 @@ you add is off until you turn it on.
 name = "notes"                # its directory's name: lowercase letters, digits and dashes
 version = "0.1.0"
 description = "Notes on sessions"
+min_crystal_version = "0.3.0" # optional: the oldest crystal it works with
+platforms = ["macos", "linux"] # optional: where it runs; anywhere, left out
+
+[[build]]                     # run as it's installed, and by `crystal plugin build notes`
+command = ["npm", "ci"]
+platforms = ["linux"]         # optional, here and on a startup command: only there
+
+[[startup]]                   # run by the daemon as it starts
+command = ["sh", "restore.sh"]
 
 [[actions]]                   # run from X, its key, or `crystal plugin run notes add`
 id = "add"
@@ -1464,16 +1487,30 @@ command = ["./on-wait.sh"]
 id = "board"
 title = "The notes board"
 command = ["sh", "board.sh"]
+
+[[link_handlers]]             # links a Ctrl+click opens with one of its actions
+pattern = "^https://github\\.com/[^/]+/[^/]+/issues/[0-9]+$"
+action = "add"
 ```
 
 A command is a list of words, run without a shell from the plugin's directory; a program given as a path is
-found from there too. Every command finds crystal in its environment:
+found from there too. Every command but a build command finds crystal in its environment:
 
 - `CRYSTAL_BIN`: the crystal running it, for crystal's own commands, like `"$CRYSTAL_BIN" send
   "$CRYSTAL_SESSION" "…"`
 - `CRYSTAL_SOCKET`: that crystal's daemon
+- `CRYSTAL_PLUGIN`, `CRYSTAL_PLUGIN_DIR`: the plugin's name and its directory
+- `CRYSTAL_PLUGIN_CONFIG_DIR`: a directory for its settings, like a token, which you fill in:
+  `~/.config/crystal/plugin-config/notes/`, made as the plugin is installed
+- `CRYSTAL_PLUGIN_STATE_DIR`: a directory for what it keeps as it runs, made before each command:
+  `~/.local/state/crystal/plugins/notes/`, the server's own (see [servers](#servers))
 - `CRYSTAL_SESSION`, `CRYSTAL_SESSION_ID`: the session it's about, when there is one
 - `CRYSTAL_PROJECT`, `CRYSTAL_WORKTREE`: the project's main worktree, and the worktree, it's about
+- `CRYSTAL_LINK`: for an action a [link](#link-handlers) runs, the link
+
+Its settings are every server's, like the config file, and stay when the plugin is removed, for when it's
+installed again. What it keeps is each server's, like the sessions it's about, and goes with the server when
+`crystal server delete` deletes it.
 
 An action is about the session selected in the TUI; for `crystal plugin run`, the session `--session` names,
 or else the one it's run in, or else the current directory. Run from the TUI, what it prints goes to the
@@ -1482,6 +1519,35 @@ plugin's log; `plugin run` prints it, and exits as the action did.
 A pane is a session of its own, started in the plugin's directory and shown over the panes with the keyboard.
 It's in `crystal ls` while it's open, and ends when its program does or when you press `Ctrl+\`. Its
 `CRYSTAL_SESSION` is its own; `CRYSTAL_PROJECT` and `CRYSTAL_WORKTREE` are the selected session's.
+
+A plugin that names a `min_crystal_version` newer than yours, or `platforms` without yours, won't install;
+one already there is listed `unsupported`, saying why, and can't be turned on.
+
+#### Building
+
+`crystal plugin install` runs the plugin's build commands once you've said yes, in turn, from its directory,
+as you'd run them, those with `platforms` only on the systems they name. What they print goes to the plugin's
+log. A build that fails leaves the plugin installed but off, with the last of what the command printed, and
+`crystal plugin` lists it `unbuilt` until `crystal plugin build <name>` works; that turns a plugin that's on off
+too, when it fails. crystal runs the commands, not the tools they need: say in your plugin's README which it
+needs, like `npm` or `cargo`.
+
+#### Startup
+
+Each startup command of each plugin that's on runs once as the daemon starts, after it has brought back the
+sessions that were running, and again whenever a daemon starts in place of another, as `crystal
+restart-server` does; not when the TUI opens, or a plugin is turned on. It's for restoring what the plugin
+keeps and handing it to crystal, then ending: `CRYSTAL_EVENT` is `startup`, and it runs as a hook does, one at
+a time with the plugin's hooks, logged, stopped after 30 seconds. One that fails doesn't stop the daemon.
+
+#### Link handlers
+
+A `Ctrl`+click on a link in a pane, or copy mode's `o`, goes to the first plugin that's on, by name, with a
+link handler whose `pattern` matches the link, the plugin's handlers tried in their order. The handler's
+`action` runs in place of your browser, about the session in that pane, with the link in `CRYSTAL_LINK`: open
+an issue in a pane of the plugin's own, say, or have an agent look at it. The pattern is a regular expression,
+matched anywhere in the link unless `^` and `$` pin it. `X` lists each plugin's handlers under it, and
+`crystal plugin run <name> --link <url>` runs the action its handlers give a link, to try them.
 
 #### Events
 
@@ -1540,16 +1606,17 @@ plugin is on or not, on a made-up event with everything its kind carries, about 
 or the one it's run in, or a made-up one. What they print is printed, and it exits as the first that failed.
 
 A plugin's hooks run one at a time, in the order things happened, and what they print goes to its log, kept in
-crystal's state directory. A hook still running after 30 seconds is stopped. After 5 failures in a row the
-plugin is paused, with a notification, and `crystal plugin` shows it `paused` until `crystal plugin enable
-<name>` turns it back on.
+crystal's state directory. A hook still running after 30 seconds is stopped. After 5 failures in a row, startup
+commands included, the plugin is paused, with a notification, and `crystal plugin` shows it `paused` until
+`crystal plugin enable <name>` turns it back on.
 
 #### Security
 
 A plugin is code that runs as you, with everything you can reach: your files, your keys, your logins. Its
-hooks run in the background, whenever something happens. Add only plugins you'd run as a script of your own.
-`crystal plugin install` shows every command a plugin would run and asks before it installs it, and installs
-it switched off.
+build runs as it's installed, and its hooks and startup commands in the background, whenever something happens
+or the daemon starts. Add only plugins you'd run as a script of your own. `crystal plugin install` shows every
+command a plugin would run, its build and startup commands and the actions its link handlers run included, and
+asks before it installs it, and installs it switched off.
 
 ### Settings
 
@@ -1685,6 +1752,7 @@ commands talk to it over a unix socket, so closing the TUI never stops an agent.
 - [x] Agents that start, message, wait on and read other agents
 - [x] Tasks that close done or failed, and a backlog per project
 - [x] Plugins: crystal's own switched on and off, and your own actions, panes and hooks
+- [x] Links in panes, opened with `Ctrl`+click or by a plugin; plugins' builds and startup commands
 - [x] An event log, a stream of events on the socket, and waits on it
 - [x] Any agent saying what it's doing and how to resume it, and sessions named from their first prompt
 

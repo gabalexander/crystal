@@ -56,12 +56,15 @@ use crate::memory::{self, Listed, Memory};
 use crate::plugins::{self, Context};
 use crate::profile;
 use crate::protocol::{Backlog, NewSession, Request, Response, SessionInfo, Spending, Worktree};
-use crate::{catalog, keys, socket, typing};
+use crate::{catalog, keys, links, socket, typing};
 use crate::{client, clipboard, drive, env, events, git};
 use anyhow::{Context as _, Result, bail};
 use app::{Action, App, Focus, Hit, Place, PluginKey, PluginPane, Slot};
 use backlog_view::BacklogChange;
-use crossterm::event::{Event as TerminalEvent, KeyEvent, KeyEventKind, MouseEvent};
+use crossterm::event::{
+    Event as TerminalEvent, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
+};
 use diff_view::Against;
 use layouts::{Layouts, Which};
 use pane::Pane;
@@ -284,6 +287,7 @@ pub fn run(socket: &Path) -> Result<()> {
         theme: Theme::from_env(config.theme),
         started: Instant::now(),
         searches: Arc::new(AtomicU64::new(0)),
+        link_clicked: false,
         kept_tabs: tabs::Tabs::default(),
         quitting: false,
         overlay: None,
@@ -329,17 +333,17 @@ impl TerminalModes {
             modes_off();
             shown_before(info);
         }));
-        // Clicks and the wheel (1000), drags (1002), written the SGR way
-        // (1006). Not the mouse just moving (1003): nothing here needs it,
-        // and it would wake the TUI at every move. Then bracketed paste
-        // (2004): a paste comes whole, its lines kept, not as typed keys.
-        // Last, pushed on the terminal's stack, the Kitty keyboard
-        // protocol's flags to tell apart keys the old way can't, like Esc
-        // or Shift+Enter, and to say which key a shifted one is (1 and 4):
-        // a program in a pane that asked for the protocol gets them. A
-        // terminal without it ignores the request.
+        // Clicks and the wheel (1000), drags (1002), the mouse just moving
+        // (1003), to underline the link under it while Ctrl is held, all
+        // written the SGR way (1006). A move that changes nothing isn't
+        // drawn. Then bracketed paste (2004): a paste comes whole, its
+        // lines kept, not as typed keys. Last, pushed on the terminal's
+        // stack, the Kitty keyboard protocol's flags to tell apart keys the
+        // old way can't, like Esc or Shift+Enter, and to say which key a
+        // shifted one is (1 and 4): a program in a pane that asked for the
+        // protocol gets them. A terminal without it ignores the request.
         let mut out = std::io::stdout();
-        out.write_all(b"\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[?2004h\x1b[>5u")?;
+        out.write_all(b"\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h\x1b[?2004h\x1b[>5u")?;
         out.flush()?;
         Ok(TerminalModes)
     }
@@ -353,7 +357,7 @@ impl Drop for TerminalModes {
 
 fn modes_off() {
     let mut out = std::io::stdout();
-    let _ = out.write_all(b"\x1b[<u\x1b[?2004l\x1b[?1006l\x1b[?1002l\x1b[?1000l");
+    let _ = out.write_all(b"\x1b[<u\x1b[?2004l\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l");
     let _ = out.flush();
 }
 
@@ -401,6 +405,9 @@ struct Tui {
     /// How many searches find in files has asked for: a search that isn't
     /// the last one asked for stops.
     searches: Arc<AtomicU64>,
+    /// A Ctrl+click opened a link: the button coming up is that click's,
+    /// not the program's under it.
+    link_clicked: bool,
     quitting: bool,
 }
 
@@ -417,45 +424,67 @@ impl Tui {
     }
 
     fn run(&mut self, terminal: &mut DefaultTerminal, events: Receiver<Event>) -> Result<()> {
+        let mut changed = true;
         while !self.quitting {
-            let size = terminal.size()?;
-            self.screen = Rect::new(0, 0, size.width, size.height);
-            let areas = ui::Areas::of(&self.app, self.screen);
-            self.app.set_tiles(areas.tiles);
-            self.sync_panes(&areas);
-            if let Some(overlay) = &mut self.overlay {
-                let screen = ui::plugin_pane_screen(&areas);
-                let size = (screen.height.max(1), screen.width.max(1));
-                if overlay.size() != size {
-                    overlay.resize(size.0, size.1);
-                }
+            if changed {
+                self.draw(terminal)?;
             }
-            if let Some(view) = self.app.view() {
-                let parts = ui::view_areas(view, areas.main);
-                let size = |area: Rect| (area.height, area.width);
-                self.app
-                    .set_view_size(size(parts.list), size(parts.content));
-            }
-            let look = ui::Look {
-                theme: &self.theme,
-                now: seconds_since_epoch(),
-                spin: (self.started.elapsed().as_millis() / SPIN_EVERY.as_millis()) as usize,
-            };
-            let overlay = self.overlay.as_ref();
-            terminal.draw(|frame| ui::draw(frame, &self.app, &self.panes, overlay, &look))?;
 
             // Wait for something to happen, then take whatever else has
             // happened meanwhile, so a burst of output is drawn once.
-            if let Some(event) = self.next_event(&events)? {
-                self.handle(event);
-            }
+            changed = match self.next_event(&events)? {
+                Some(event) => self.take(event),
+                None => true,
+            };
             while let Ok(event) = events.try_recv() {
-                self.handle(event);
+                changed |= self.take(event);
             }
             self.read_topic();
             self.keep_tabs();
         }
         Ok(())
+    }
+
+    /// Lays everything out for the terminal's size, and draws it.
+    fn draw(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
+        let size = terminal.size()?;
+        self.screen = Rect::new(0, 0, size.width, size.height);
+        let areas = ui::Areas::of(&self.app, self.screen);
+        self.app.set_tiles(areas.tiles);
+        self.sync_panes(&areas);
+        if let Some(overlay) = &mut self.overlay {
+            let screen = ui::plugin_pane_screen(&areas);
+            let size = (screen.height.max(1), screen.width.max(1));
+            if overlay.size() != size {
+                overlay.resize(size.0, size.1);
+            }
+        }
+        if let Some(view) = self.app.view() {
+            let parts = ui::view_areas(view, areas.main);
+            let size = |area: Rect| (area.height, area.width);
+            self.app
+                .set_view_size(size(parts.list), size(parts.content));
+        }
+        let look = ui::Look {
+            theme: &self.theme,
+            now: seconds_since_epoch(),
+            spin: (self.started.elapsed().as_millis() / SPIN_EVERY.as_millis()) as usize,
+        };
+        let overlay = self.overlay.as_ref();
+        terminal.draw(|frame| ui::draw(frame, &self.app, &self.panes, overlay, &look))?;
+        Ok(())
+    }
+
+    /// Takes in `event`, and says whether that may have changed what's
+    /// drawn: the mouse just moving mostly doesn't.
+    fn take(&mut self, event: Event) -> bool {
+        if let Event::Mouse(mouse) = &event
+            && mouse.kind == MouseEventKind::Moved
+        {
+            return self.mouse_moved(mouse);
+        }
+        self.handle(event);
+        true
     }
 
     /// Writes the tabs down when they've changed, so that they're there the
@@ -726,6 +755,9 @@ impl Tui {
         }
         let areas = ui::Areas::of(&self.app, self.screen);
         let mut hit = ui::hit(&areas, &self.app, mouse.column, mouse.row);
+        if self.click_on_link(&mouse, hit) {
+            return;
+        }
         if let Some(split) = self.app.moving_border() {
             // A border taken by the mouse is crystal's until it's let go.
             hit = ui::border_hit(&areas, &self.app, split, mouse.column, mouse.row);
@@ -740,6 +772,63 @@ impl Tui {
         if let Some(action) = self.app.on_mouse(mouse.kind, hit) {
             self.carry_out(action);
         }
+    }
+
+    /// The mouse moved: with Ctrl held, onto the link to underline.
+    /// Returns whether that changes what's drawn.
+    fn mouse_moved(&mut self, mouse: &MouseEvent) -> bool {
+        if self.overlay.is_some() {
+            return false;
+        }
+        let areas = ui::Areas::of(&self.app, self.screen);
+        let hit = ui::hit(&areas, &self.app, mouse.column, mouse.row);
+        let ctrl = mouse.modifiers.contains(KeyModifiers::CONTROL);
+        self.app.mouse_moved(hit, ctrl)
+    }
+
+    /// Ctrl and a click on a link in a pane opens it, whoever has the
+    /// mouse there, and the button coming up after is the click's too.
+    /// Returns whether the mouse did that.
+    fn click_on_link(&mut self, mouse: &MouseEvent, hit: Hit) -> bool {
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left)
+                if mouse.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                let Some((slot, cell)) = self.app.link_cell(hit) else {
+                    return false;
+                };
+                let link = self
+                    .pane_in(slot)
+                    .and_then(|pane| pane.screen.link_at(cell));
+                let Some(link) = link else {
+                    return false;
+                };
+                self.link_clicked = true;
+                let context = self.app.link_context(slot);
+                if let Err(err) = self.open_link(link.url, context) {
+                    self.app.notify(format!("{err:#}"));
+                }
+                true
+            }
+            MouseEventKind::Up(MouseButton::Left) => std::mem::take(&mut self.link_clicked),
+            _ => false,
+        }
+    }
+
+    /// Opens `url`, a link a pane shows, about `context`: with the action
+    /// of the first plugin that handles links like it, or in the browser.
+    fn open_link(&mut self, url: String, context: Context) -> Result<()> {
+        let config = Config::load()?;
+        if let Some((plugin, action)) = plugins::link_handler(&config, &self.socket, &url) {
+            let context = Context {
+                link: Some(url),
+                ..context
+            };
+            return self.run_plugin(&plugin, &action, context);
+        }
+        let said = links::open(&url)?;
+        self.app.notify(said);
+        Ok(())
     }
 
     /// Hands the mouse to the program in the pane that has the keyboard,
@@ -1016,7 +1105,8 @@ impl Tui {
             }
             Action::SwitchPlugin { name, on } => {
                 let path = config::path();
-                let switched = plugins::set_enabled(&path, &self.socket, &name, on)
+                let switched = can_switch(&name, on)
+                    .and_then(|()| plugins::set_enabled(&path, &self.socket, &name, on))
                     .and_then(|()| Config::load());
                 match switched {
                     Ok(config) => self.plugins_changed(&config),
@@ -1170,6 +1260,11 @@ impl Tui {
                     copy_mode::Outcome::Copy(text) => {
                         self.app.stop_copying();
                         self.copy_to_clipboard(&text)?;
+                    }
+                    copy_mode::Outcome::Open(url) => {
+                        self.app.stop_copying();
+                        let context = self.app.link_context(slot);
+                        self.open_link(url, context)?;
                     }
                 }
             }
@@ -1345,9 +1440,8 @@ impl Tui {
         plugins::ensure_enabled(&Config::load()?, plugin)?;
         let (dir, manifest) = installed_plugin(plugin)?;
         let action = manifest
-            .actions
-            .into_iter()
-            .find(|candidate| candidate.id == action)
+            .action(action)
+            .cloned()
             .with_context(|| format!("{plugin} has no action {action}"))?;
         let context = placed(context)?;
         plugins::log(
@@ -1356,7 +1450,7 @@ impl Tui {
             &format!("{}: {}", action.id, action.command.join(" ")),
         );
         let log = plugins::open_log(&self.socket, plugin)?;
-        let mut child = plugins::command(&dir, &action.command, &self.socket, &context)
+        let mut child = plugins::command(plugin, &dir, &action.command, &self.socket, &context)
             .stdin(Stdio::null())
             .stdout(log.try_clone()?)
             .stderr(log)
@@ -1387,8 +1481,9 @@ impl Tui {
             .find(|candidate| candidate.id == pane)
             .with_context(|| format!("{plugin} has no pane {pane}"))?;
         let context = placed(context)?;
+        plugins::make_state_dir(&self.socket, plugin);
         let mut env = env::current();
-        for (key, said) in plugins::env(&self.socket, &context) {
+        for (key, said) in plugins::env(&self.socket, plugin, &context) {
             match said {
                 Some(value) => env.insert(key.to_string(), value),
                 None => env.remove(key),
@@ -1576,10 +1671,13 @@ fn listed_plugins(config: &Config, socket: &Path) -> Vec<plugins_view::Listed> {
         trouble: None,
         actions: Vec::new(),
         panes: Vec::new(),
+        links: Vec::new(),
     });
     let installed = plugins::installed().into_iter().map(|plugin| {
         let on = plugins::enabled(config, &plugin.name);
         let paused = plugins::paused(socket, &plugin.name).filter(|_| on);
+        let paused = paused.map(|_| "paused after failing: space off and on again".to_string());
+        let trouble = plugin.blocked().or(paused);
         let item = |id: &str, title: &str, key: Option<&String>| plugins_view::Item {
             id: id.to_string(),
             title: title.to_string(),
@@ -1588,16 +1686,24 @@ fn listed_plugins(config: &Config, socket: &Path) -> Vec<plugins_view::Listed> {
         match plugin.manifest {
             Ok(manifest) => plugins_view::Listed {
                 name: plugin.name,
-                description: manifest.description,
                 built_in: false,
                 on,
-                trouble: paused.map(|_| "paused after failing: space off and on again".to_string()),
+                trouble,
                 actions: (manifest.actions.iter())
                     .map(|action| item(&action.id, &action.title, action.key.as_ref()))
                     .collect(),
                 panes: (manifest.panes.iter())
                     .map(|pane| item(&pane.id, &pane.title, None))
                     .collect(),
+                links: (manifest.link_handlers.iter())
+                    .map(|handler| plugins_view::LinkItem {
+                        pattern: handler.pattern.clone(),
+                        action: manifest
+                            .action(&handler.action)
+                            .map_or(handler.action.clone(), |action| action.title.clone()),
+                    })
+                    .collect(),
+                description: manifest.description,
             },
             Err(why) => plugins_view::Listed {
                 name: plugin.name,
@@ -1607,6 +1713,7 @@ fn listed_plugins(config: &Config, socket: &Path) -> Vec<plugins_view::Listed> {
                 trouble: Some(why),
                 actions: Vec::new(),
                 panes: Vec::new(),
+                links: Vec::new(),
             },
         }
     });
@@ -1614,14 +1721,14 @@ fn listed_plugins(config: &Config, socket: &Path) -> Vec<plugins_view::Listed> {
 }
 
 /// The sidebar keys taken by the actions of the installed plugins that are
-/// on. Installing or switching on a plugin refuses a key another has, so
-/// where two plugins' files were changed to share one, the first by name
-/// keeps it.
+/// on and can run here. Installing or switching on a plugin refuses a key
+/// another has, so where two plugins' files were changed to share one, the
+/// first by name keeps it.
 fn plugin_keys(config: &Config) -> Vec<PluginKey> {
     let mut keys: Vec<PluginKey> = Vec::new();
     let on = plugins::installed()
         .into_iter()
-        .filter(|plugin| plugins::enabled(config, &plugin.name));
+        .filter(|plugin| plugins::enabled(config, &plugin.name) && plugin.blocked().is_none());
     for plugin in on {
         let Ok(manifest) = plugin.manifest else {
             continue;
@@ -1643,13 +1750,30 @@ fn plugin_keys(config: &Config) -> Vec<PluginKey> {
     keys
 }
 
-/// The installed plugin called `name`: its directory and manifest.
+/// The installed plugin called `name`, when it can run here: its
+/// directory and manifest.
 fn installed_plugin(name: &str) -> Result<(PathBuf, crate::plugin_manifest::Manifest)> {
     let plugin = plugins::find(name).with_context(|| format!("there's no plugin called {name}"))?;
+    if let Some(why) = plugin.blocked() {
+        bail!("{name} can't run: {why}");
+    }
     let manifest = plugin
         .manifest
         .map_err(|why| anyhow::anyhow!("{name}'s plugin.toml: {why}"))?;
     Ok((plugin.dir, manifest))
+}
+
+/// Refuses to switch on the plugin called `name`, saying why, when it
+/// can't run here or wants another's key. Any can be switched off.
+fn can_switch(name: &str, on: bool) -> Result<()> {
+    if !on || plugins::is_built_in(name) {
+        return Ok(());
+    }
+    let installed = plugins::installed();
+    match installed.iter().find(|plugin| plugin.name == name) {
+        Some(plugin) => plugins::check_can_enable(plugin, &installed),
+        None => bail!("there's no plugin called {name}"),
+    }
 }
 
 /// `context`, or, with no session selected to say where, the TUI's own

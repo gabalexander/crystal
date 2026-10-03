@@ -1,7 +1,7 @@
 //! The plugins view, `X`: crystal's own plugins and the ones installed,
-//! each on or off, with the actions and panes of the installed ones under
-//! them. Space switches the plugin the bar is on, and Enter runs the action,
-//! or opens the pane, the bar is on. The event loop does the writing and
+//! each on or off, with the actions, panes and link handlers of the
+//! installed ones under them. Space switches the plugin the bar is on, and
+//! Enter runs the action, or opens the pane, the bar is on. The event loop does the writing and
 //! the running (see [`crate::plugins`]).
 //!
 //! The view is state and logic only, apart from [`draw`] at the end.
@@ -26,6 +26,15 @@ pub struct Listed {
     pub trouble: Option<String>,
     pub actions: Vec<Item>,
     pub panes: Vec<Item>,
+    pub links: Vec<LinkItem>,
+}
+
+/// One of a plugin's link handlers: the links it takes, and the title of
+/// the action it runs on them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkItem {
+    pub pattern: String,
+    pub action: String,
 }
 
 /// One of a plugin's actions or panes.
@@ -66,6 +75,7 @@ enum Row {
     Plugin(usize),
     Action(usize, usize),
     Pane(usize, usize),
+    Link(usize, usize),
 }
 
 pub struct PluginsView {
@@ -153,7 +163,10 @@ impl PluginsView {
     fn plugin(&self) -> Option<&Listed> {
         let index = match self.rows.get(self.selected)? {
             Row::Heading(_) => return None,
-            Row::Plugin(index) | Row::Action(index, _) | Row::Pane(index, _) => *index,
+            Row::Plugin(index)
+            | Row::Action(index, _)
+            | Row::Pane(index, _)
+            | Row::Link(index, _) => *index,
         };
         self.plugins.get(index)
     }
@@ -210,6 +223,7 @@ fn rows(plugins: &[Listed]) -> Vec<Row> {
         rows.push(Row::Plugin(index));
         rows.extend((0..plugin.actions.len()).map(|action| Row::Action(index, action)));
         rows.extend((0..plugin.panes.len()).map(|pane| Row::Pane(index, pane)));
+        rows.extend((0..plugin.links.len()).map(|link| Row::Link(index, link)));
     }
     rows
 }
@@ -307,6 +321,11 @@ fn row_line(view: &PluginsView, row: Row, selected: bool, theme: &Theme) -> Line
             let pane = &view.plugins[index].panes[pane];
             item_line("open", &pane.title, "", view.plugins[index].on, theme)
         }
+        Row::Link(index, link) => {
+            let link = &view.plugins[index].links[link];
+            let runs = format!("  → {}", link.action);
+            item_line("link", &link.pattern, &runs, view.plugins[index].on, theme)
+        }
     };
     if selected {
         line.style(theme.selection)
@@ -353,6 +372,7 @@ mod tests {
             } else {
                 vec![item("board")]
             },
+            links: Vec::new(),
         }
     }
 
@@ -417,6 +437,28 @@ mod tests {
         }
         assert_eq!(press(&mut view, KeyCode::Enter), Outcome::Stay);
         assert_eq!(view.problem(), Some("todo is off: space turns it on"));
+    }
+
+    #[test]
+    fn a_link_handler_is_listed_under_its_plugin_and_enter_on_it_does_nothing() {
+        let mut notes = plugin("notes", false, true);
+        notes.links.push(LinkItem {
+            pattern: "^https://".into(),
+            action: "NOTE".into(),
+        });
+        let mut view = PluginsView::new(vec![plugin("memory", true, true), notes]);
+        for _ in 0..4 {
+            press(&mut view, KeyCode::Down);
+        }
+        assert_eq!(view.rows[view.selected], Row::Link(1, 0));
+        assert_eq!(press(&mut view, KeyCode::Enter), Outcome::Stay);
+        assert_eq!(
+            press(&mut view, KeyCode::Char(' ')),
+            Outcome::Switch {
+                name: "notes".into(),
+                on: false
+            }
+        );
     }
 
     #[test]

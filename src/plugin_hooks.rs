@@ -1,13 +1,16 @@
-//! The daemon's side of plugins' `[[events]]`: when something happens in
-//! crystal, the hooks of the plugins that asked for it run, each with the
-//! event as JSON on its standard input and its name in `CRYSTAL_EVENT`.
-//! They hear it from the daemon's [`Bus`], like any other subscriber.
+//! The daemon's side of plugins' `[[events]]` and `[[startup]]`: when
+//! something happens in crystal, the hooks of the plugins that asked for it
+//! run, each with the event as JSON on its standard input and its name in
+//! `CRYSTAL_EVENT`. They hear it from the daemon's [`Bus`], like any other
+//! subscriber. As the daemon starts, once it has brought back its sessions,
+//! each plugin's startup commands run, with `CRYSTAL_EVENT` set to
+//! `startup`.
 //!
-//! A plugin's hooks run one at a time, in the order things happened, on a
-//! thread of the plugin's own, so a slow plugin holds up neither the daemon
-//! nor the others. What a hook prints goes to the plugin's log. A hook that
-//! runs past [`TIMEOUT`] is stopped, and a plugin whose hooks fail
-//! [`FAILURES_TO_PAUSE`] times in a row is paused, with a notice and a
+//! A plugin's commands run one at a time, in the order things happened, on
+//! a thread of the plugin's own, so a slow plugin holds up neither the
+//! daemon nor the others. What a command prints goes to the plugin's log.
+//! One that runs past [`TIMEOUT`] is stopped, and a plugin whose commands
+//! fail [`FAILURES_TO_PAUSE`] times in a row is paused, with a notice and a
 //! `plugin.paused` event, until the user turns it on again.
 
 use crate::config::Config;
@@ -34,24 +37,28 @@ const TIMEOUT: Duration = Duration::from_secs(30);
 const FAILURES_TO_PAUSE: u32 = 5;
 
 /// Hands every event on `bus` to the hooks of the plugins that listen for
-/// it, from a thread of its own, for as long as the daemon runs.
-pub fn follow(bus: &Arc<Bus>, socket: &Path) {
-    let hooks = Hooks::new(socket, Arc::downgrade(bus));
+/// it, from a thread of its own, for as long as the daemon runs. The hooks
+/// it returns run the plugins' startup commands too: see
+/// [`Hooks::start_up`].
+pub fn follow(bus: &Arc<Bus>, socket: &Path) -> Arc<Hooks> {
+    let hooks = Arc::new(Hooks::new(socket, Arc::downgrade(bus)));
+    let following = hooks.clone();
     let bus = Arc::downgrade(bus);
     thread::spawn(move || {
         while let Some(subscription) = bus.upgrade().map(|bus| bus.subscribe(Filter::default())) {
             for event in subscription.feed {
-                hooks.tell(&event);
+                following.tell(&event);
             }
             // Dropped for falling behind: what was missed is lost, and the
             // hooks hear what happens from now on.
             eprintln!("crystal daemon: the plugins fell behind, and missed events");
         }
     });
+    hooks
 }
 
-/// The hooks of every plugin, run off the daemon's own threads.
-struct Hooks {
+/// The commands of every plugin, run off the daemon's own threads.
+pub struct Hooks {
     socket: PathBuf,
     /// Where a plugin paused for failing says so.
     bus: Weak<Bus>,
@@ -60,11 +67,23 @@ struct Hooks {
     queues: Mutex<HashMap<String, Sender<Job>>>,
 }
 
-/// One hook to run for one event.
+/// One of a plugin's commands to run: a hook for one event, or a startup
+/// command.
 struct Job {
     dir: PathBuf,
     command: Vec<String>,
-    event: Arc<Event>,
+    /// The event it's run on, or `None` as the daemon starts.
+    event: Option<Arc<Event>>,
+}
+
+impl Job {
+    /// What it's run on, for `CRYSTAL_EVENT` and the log: the event's name,
+    /// or `startup`.
+    fn on(&self) -> &'static str {
+        self.event
+            .as_ref()
+            .map_or("startup", |event| event.kind.name())
+    }
 }
 
 impl Hooks {
@@ -85,7 +104,25 @@ impl Hooks {
                 let job = Job {
                     dir: dir.clone(),
                     command: hook.command.clone(),
-                    event: event.clone(),
+                    event: Some(event.clone()),
+                };
+                self.queue(&manifest.name).send(job).ok();
+            }
+        }
+    }
+
+    /// Runs the startup commands of every plugin that's on and can run
+    /// here, in turn with its plugin's hooks: once as the daemon starts,
+    /// after it has brought back its sessions, and again whenever a daemon
+    /// takes over from another.
+    pub fn start_up(&self) {
+        let config = Config::load().unwrap_or_default();
+        for (dir, manifest) in plugins::running(&config, &self.socket) {
+            for once in manifest.startup.iter().filter(|once| once.runs_here()) {
+                let job = Job {
+                    dir: dir.clone(),
+                    command: once.command.clone(),
+                    event: None,
                 };
                 self.queue(&manifest.name).send(job).ok();
             }
@@ -137,54 +174,71 @@ pub fn hooks_on<'a>(
         .filter(move |hook| plugin_manifest::matches(&hook.on, name))
 }
 
-/// A hook's `command`, from the plugin's directory `dir`, with `event`'s
-/// name in `CRYSTAL_EVENT` and what it's about in the variables every
-/// plugin command finds. The event goes on its standard input.
-fn command(dir: &Path, words: &[String], socket: &Path, event: &Event) -> Command {
-    let mut command = plugins::command(dir, words, socket, &Context::of_event(event));
-    command
-        .env("CRYSTAL_EVENT", event.kind.name())
-        .stdin(Stdio::piped());
+/// The plugin called `plugin`'s `job`, from its directory, with what it's
+/// run on in `CRYSTAL_EVENT` and what the event is about in the variables
+/// every plugin command finds. An event goes on its standard input.
+fn command(plugin: &str, job: &Job, socket: &Path) -> Command {
+    let context = job.event.as_deref().map(Context::of_event);
+    let context = context.unwrap_or_default();
+    let mut command = plugins::command(plugin, &job.dir, &job.command, socket, &context);
+    let stdin = if job.event.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    };
+    command.env("CRYSTAL_EVENT", job.on()).stdin(stdin);
     command
 }
 
-/// Gives a hook just started the event, on a line of its own. A hook that
+/// Gives a hook just started its event, on a line of its own. A hook that
 /// doesn't read it is fine.
-fn hand_over(child: &mut std::process::Child, event: &Event) {
-    if let Some(mut stdin) = child.stdin.take()
+fn hand_over(child: &mut std::process::Child, job: &Job) {
+    if let (Some(mut stdin), Some(event)) = (child.stdin.take(), &job.event)
         && let Ok(line) = serde_json::to_string(event)
     {
         let _ = writeln!(stdin, "{line}");
     }
 }
 
-/// Runs a hook here, in the foreground, its output going where this
-/// process's does: how `crystal plugin run --event` tries a plugin's hooks
-/// out. It's neither logged nor counted towards a pause.
-pub fn run_here(dir: &Path, words: &[String], socket: &Path, event: &Event) -> Result<ExitStatus> {
-    let mut child = command(dir, words, socket, event)
+/// Runs a hook of the plugin called `plugin` here, in the foreground, its
+/// output going where this process's does: how `crystal plugin run
+/// --event` tries a plugin's hooks out. It's neither logged nor counted
+/// towards a pause.
+pub fn run_here(
+    plugin: &str,
+    dir: &Path,
+    words: &[String],
+    socket: &Path,
+    event: &Event,
+) -> Result<ExitStatus> {
+    let job = Job {
+        dir: dir.to_path_buf(),
+        command: words.to_vec(),
+        event: Some(Arc::new(event.clone())),
+    };
+    let mut child = command(plugin, &job, socket)
         .spawn()
         .with_context(|| format!("couldn't run {}", words.join(" ")))?;
-    hand_over(&mut child, event);
+    hand_over(&mut child, &job);
     Ok(child.wait()?)
 }
 
-/// Runs one hook, with the event on its standard input and what it prints
-/// in the plugin's log, and stops it if it runs past `timeout`.
+/// Runs one of the plugin's commands, with its event on its standard input
+/// and what it prints in the plugin's log, and stops it if it runs past
+/// `timeout`.
 fn run(socket: &Path, plugin: &str, job: &Job, timeout: Duration) -> Result<()> {
-    let event = &job.event;
-    let name = event.kind.name();
+    let name = job.on();
     plugins::log(
         socket,
         plugin,
         &format!("{name}: {}", job.command.join(" ")),
     );
     let log = plugins::open_log(socket, plugin)?;
-    let mut child = command(&job.dir, &job.command, socket, event)
+    let mut child = command(plugin, job, socket)
         .stdout(log.try_clone()?)
         .stderr(log)
         .spawn()?;
-    hand_over(&mut child, event);
+    hand_over(&mut child, job);
     let started = Instant::now();
     loop {
         if let Some(status) = child.try_wait()? {
@@ -241,7 +295,7 @@ mod tests {
         Job {
             dir: dir.to_path_buf(),
             command: vec!["sh".into(), "hook.sh".into()],
-            event: Arc::new(Event::new(Kind::SessionDone)),
+            event: Some(Arc::new(Event::new(Kind::SessionDone))),
         }
     }
 
@@ -254,6 +308,26 @@ mod tests {
         let log = fs::read_to_string(plugins::log_path(&socket, "notes")).unwrap();
         assert!(log.contains("got session.done"), "{log}");
         assert!(log.contains(r#""event":"session.done""#), "{log}");
+    }
+
+    #[test]
+    fn a_startup_command_is_told_so_and_reads_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("crystal.sock");
+        let mut job = job(
+            dir.path(),
+            "echo \"started: $CRYSTAL_EVENT in $CRYSTAL_PLUGIN_STATE_DIR\"; cat\n",
+        );
+        job.event = None;
+        run(&socket, "notes", &job, TIMEOUT).unwrap();
+        let log = fs::read_to_string(plugins::log_path(&socket, "notes")).unwrap();
+        assert!(log.contains("startup: sh hook.sh"), "{log}");
+        let state = plugins::own_state_dir(&socket, "notes");
+        assert!(
+            log.contains(&format!("started: startup in {}", state.display())),
+            "{log}"
+        );
+        assert!(state.is_dir());
     }
 
     #[test]

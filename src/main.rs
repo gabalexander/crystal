@@ -27,6 +27,7 @@ mod git;
 mod handoff;
 mod hook;
 mod keys;
+mod links;
 mod markdown;
 mod mcp;
 mod memory;
@@ -506,7 +507,7 @@ enum Command {
         command: Option<ProfileCommand>,
     },
     /// List plugins, crystal's own and yours, with whether they're on; or
-    /// switch, run, install, make or remove one.
+    /// switch, run, install, build, make or remove one.
     Plugin {
         #[command(subcommand)]
         command: Option<PluginCommand>,
@@ -810,7 +811,7 @@ enum PluginCommand {
         plugin: String,
 
         /// The action, by its id.
-        #[arg(required_unless_present = "event")]
+        #[arg(required_unless_present_any = ["event", "link"])]
         action: Option<String>,
 
         /// Run the plugin's hooks on a made-up event of this kind, like
@@ -819,13 +820,18 @@ enum PluginCommand {
         #[arg(long, value_name = "KIND", conflicts_with = "action")]
         event: Option<String>,
 
+        /// Run the action the plugin's link handlers give this link, with
+        /// it in CRYSTAL_LINK, as a Ctrl+click on it in a pane would.
+        #[arg(long, value_name = "URL", conflicts_with_all = ["action", "event"])]
+        link: Option<String>,
+
         /// The session to run it for [default: the one this runs in, if
         /// any]
         #[arg(short, long)]
         session: Option<String>,
     },
     /// Install a plugin from a git repository or a directory, once you've
-    /// seen what it runs and said yes. It starts off.
+    /// seen what it runs and said yes, and build it. It starts off.
     Install {
         /// A git repository's URL, or a directory.
         source: String,
@@ -838,6 +844,9 @@ enum PluginCommand {
         #[arg(long)]
         enable: bool,
     },
+    /// Run a plugin's build commands again. One that fails turns it off
+    /// until a build works.
+    Build { name: String },
     /// Remove a plugin you installed.
     #[command(visible_alias = "rm")]
     Remove { name: String },
@@ -1125,13 +1134,19 @@ fn run(cli: Cli) -> Result<()> {
                 plugin,
                 action,
                 event,
+                link,
                 session,
             }) => {
-                let code = match (action, event) {
-                    (_, Some(event)) => plugin_cli::run_event(&socket, &plugin, &event, session)?,
-                    (action, None) => {
+                let code = match (action, event, link) {
+                    (_, Some(event), _) => {
+                        plugin_cli::run_event(&socket, &plugin, &event, session)?
+                    }
+                    (_, None, Some(link)) => {
+                        plugin_cli::run_link(&socket, &plugin, &link, session)?
+                    }
+                    (action, None, None) => {
                         let action = action.unwrap_or_default();
-                        plugin_cli::run(&socket, &plugin, &action, session)?
+                        plugin_cli::run(&socket, &plugin, &action, session, None)?
                     }
                 };
                 // The action's or the hook's own exit code is crystal's.
@@ -1142,6 +1157,7 @@ fn run(cli: Cli) -> Result<()> {
                 yes,
                 enable,
             }) => plugin_cli::install(&socket, &source, yes, enable)?,
+            Some(PluginCommand::Build { name }) => plugin_cli::build(&socket, &name)?,
             Some(PluginCommand::Remove { name }) => plugin_cli::remove(&name)?,
             Some(PluginCommand::New { name }) => plugin_cli::new(&name)?,
             Some(PluginCommand::Log { name }) => plugin_cli::log(&socket, &name)?,

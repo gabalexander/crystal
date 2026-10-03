@@ -649,6 +649,9 @@ pub struct App {
     /// The pane taken by its header line, while the button is down, and
     /// the pane the mouse is over now: letting go there swaps the two.
     grabbed: Option<Grab>,
+    /// Where the mouse is on a pane's screen while Ctrl is held: the link
+    /// there, if there's one, is underlined, for a click to open.
+    link_hover: Option<(Slot, (u16, u16))>,
     /// The id of the session this TUI runs in, if it runs in one. The pane
     /// never shows it: it would be showing itself.
     own_id: Option<String>,
@@ -747,6 +750,7 @@ impl App {
             last_pane: None,
             dragging: None,
             grabbed: None,
+            link_hover: None,
             own_id,
             notice: None,
             showing_keys: false,
@@ -1732,6 +1736,42 @@ impl App {
         self.grabbed
     }
 
+    /// Where on a pane's screen the mouse is with Ctrl held, to underline
+    /// the link there.
+    pub fn link_hover(&self) -> Option<(Slot, (u16, u16))> {
+        self.link_hover
+    }
+
+    /// The mouse moved onto `hit`, with Ctrl held or not: on a pane's
+    /// screen with Ctrl, the link there is to be underlined, and otherwise
+    /// none is. Returns whether that changes what's drawn.
+    pub fn mouse_moved(&mut self, hit: Hit, ctrl: bool) -> bool {
+        let over = if ctrl { self.link_cell(hit) } else { None };
+        let changed = over != self.link_hover;
+        self.link_hover = over;
+        changed
+    }
+
+    /// Where a Ctrl+click on `hit` looks for a link to open: a cell of a
+    /// pane's screen, while nothing over the panes waits on the keyboard.
+    pub fn link_cell(&self, hit: Hit) -> Option<(Slot, (u16, u16))> {
+        match hit {
+            Hit::Pane {
+                slot,
+                cell: Some(cell),
+            } if self.mouse_on_panes() && self.shows_screen(slot) => Some((slot, cell)),
+            _ => None,
+        }
+    }
+
+    /// What a plugin opening a link in the pane at `slot` is told: the
+    /// session the pane shows.
+    pub fn link_context(&self, slot: Slot) -> plugins::Context {
+        self.pane_session(slot)
+            .map(plugins::Context::of_session)
+            .unwrap_or_default()
+    }
+
     /// The session the pane at `slot` is about: the one split off there,
     /// the one floating, or, in the pane that follows the selection, the
     /// selected one. While the selected session has a pane of its own,
@@ -2113,24 +2153,7 @@ impl App {
             }
             return None;
         }
-        // A question on the footer waits for its answer from the keyboard,
-        // and so do the filter, the issues and backlog views, the new-session
-        // panel and the profiles view.
-        let typing = self.filter.is_some()
-            || self.issues.is_some()
-            || self.pull_requests_view.is_some()
-            || self.backlog.is_some()
-            || self.layouts.is_some()
-            || self.launcher.is_some()
-            || self.profiles_view.is_some()
-            || self.plugins_view.is_some()
-            || self.settings.is_some()
-            || self.plugin_pane.is_some();
-        let asking = self.prompt.is_some()
-            || self.confirm.is_some()
-            || self.closing.is_some()
-            || self.moving.is_some();
-        if asking || typing {
+        if self.waiting_on_keyboard() {
             return None;
         }
         let click = kind == MouseEventKind::Down(MouseButton::Left);
@@ -2240,6 +2263,34 @@ impl App {
             _ => {}
         }
         None
+    }
+
+    /// Whether something open waits for the keyboard, and the mouse does
+    /// nothing meanwhile: a question on the footer waits for its answer,
+    /// and so do the filter, the issues and backlog views, the new-session
+    /// panel, the profiles view and the others over the panes.
+    fn waiting_on_keyboard(&self) -> bool {
+        let typing = self.filter.is_some()
+            || self.issues.is_some()
+            || self.pull_requests_view.is_some()
+            || self.backlog.is_some()
+            || self.layouts.is_some()
+            || self.launcher.is_some()
+            || self.profiles_view.is_some()
+            || self.plugins_view.is_some()
+            || self.settings.is_some()
+            || self.plugin_pane.is_some();
+        let asking = self.prompt.is_some()
+            || self.confirm.is_some()
+            || self.closing.is_some()
+            || self.moving.is_some();
+        typing || asking
+    }
+
+    /// Whether the mouse works on the panes: they're showing, and nothing
+    /// over them waits on the keyboard.
+    fn mouse_on_panes(&self) -> bool {
+        self.view.is_none() && !self.showing_keys && !self.waiting_on_keyboard()
     }
 
     /// A click on a sidebar row: on a session, or a worktree with none,
@@ -6091,6 +6142,46 @@ mod tests {
             Some(Action::CopySelection(Slot::Split(0)))
         );
         assert_eq!(app.dragging(), None);
+    }
+
+    #[test]
+    fn with_ctrl_held_the_mouse_over_a_pane_marks_where_to_look_for_a_link() {
+        let mut app = app_with_splits(&["a", "b"], 1);
+        let over = |cell| Hit::Pane {
+            slot: Slot::Split(0),
+            cell,
+        };
+        assert!(!app.mouse_moved(over(Some((2, 3))), false));
+        assert!(app.mouse_moved(over(Some((2, 3))), true));
+        assert_eq!(app.link_hover(), Some((Slot::Split(0), (2, 3))));
+        // Staying on the cell changes nothing to draw.
+        assert!(!app.mouse_moved(over(Some((2, 3))), true));
+        // Its header line has no link, and nor has the sidebar.
+        assert!(app.mouse_moved(over(None), true));
+        assert_eq!(app.link_hover(), None);
+        app.mouse_moved(over(Some((1, 1))), true);
+        assert!(app.mouse_moved(Hit::Sidebar, true));
+        // Letting go of Ctrl lets go of the link.
+        app.mouse_moved(over(Some((1, 1))), true);
+        assert!(app.mouse_moved(over(Some((1, 1))), false));
+        assert_eq!(app.link_hover(), None);
+        assert_eq!(
+            app.link_context(Slot::Split(0)).session.as_deref(),
+            Some("a")
+        );
+    }
+
+    #[test]
+    fn a_link_is_looked_for_only_while_nothing_waits_on_the_keyboard() {
+        let mut app = app_with(&["a"]);
+        let hit = Hit::Pane {
+            slot: Slot::Selected,
+            cell: Some((0, 0)),
+        };
+        assert_eq!(app.link_cell(hit), Some((Slot::Selected, (0, 0))));
+        press(&mut app, KeyCode::Char('/'));
+        assert_eq!(app.link_cell(hit), None);
+        assert!(!app.mouse_moved(hit, true));
     }
 
     #[test]

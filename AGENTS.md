@@ -49,7 +49,8 @@ is: it's the one request every version must understand.
   does as it starts; keep it in step with the commands it teaches, and add its SHA-256 to `SHIPPED` when it
   changes (a test says so)
 - `src/tui/`: the TUI (`crystal` with no command)
-  - `mod.rs`: the event loop: one channel of events, then update and draw
+  - `mod.rs`: the event loop: one channel of events, then update and draw (not for a move of the mouse that
+    changes nothing), and opening the link a Ctrl+click or copy mode's `o` asks for
   - `app.rs`: the state and how keys and the mouse change it; no I/O, so it's unit-tested
   - `ui.rs`: the layout and drawing (top bar and its tabs, pane headers, footer), and what's under the mouse
   - `tabs.rs`: tabs, each holding its own sessions (each session in exactly one) with its own selection,
@@ -93,9 +94,10 @@ is: it's the one request every version must understand.
     drawing
   - `pane.rs`: a viewer of a session on screen, the selected one or a split, and its screen, with copy mode
     over it while that's on
-  - `copy_mode.rs`: copy mode (`v`): vi's keys over a pane's screen and history, selecting, searching, and
-    the text to copy; works on the screen, kept apart from I/O
-  - `screen_widget.rs`: draws a session's screen into ratatui, for the panes and `crystal attach`
+  - `copy_mode.rs`: copy mode (`v`): vi's keys over a pane's screen and history, selecting, searching, the
+    text to copy, and `o` for the link under the cursor; works on the screen, kept apart from I/O
+  - `screen_widget.rs`: draws a session's screen into ratatui, for the panes and `crystal attach`, with the
+    link under the mouse underlined
   - `diff.rs`: reads `git diff`'s patch into files, hunks and lines, marks the words that changed,
     and lays a file out in rows, unified or side by side; pure, so it's unit-tested
   - `diff_view.rs`: the diff view (`d`): its state, keys and drawing, files marked reviewed sinking to the
@@ -118,9 +120,9 @@ is: it's the one request every version must understand.
     event loop, a markdown file's page laid out for its width or its source, scrolling, and drawing them
   - `memory_view.rs`: the memory view (`m`): a project's entries, the filter, forgetting and
     promoting after a `y`, and its drawing
-  - `plugins_view.rs`: the plugins view (`X`): every plugin, on or off, with installed ones' actions and panes,
-    its keys and drawing; the event loop does the switching, runs actions and opens plugins' panes over the
-    others
+  - `plugins_view.rs`: the plugins view (`X`): every plugin, on or off, with installed ones' actions, panes and
+    link handlers, its keys and drawing; the event loop does the switching, runs actions and opens plugins'
+    panes over the others
   - `settings_view.rs`: the settings view (`,`): notifications, the theme, the distiller and search by meaning,
     each changed with a key, and how the model stands; the event loop writes the file (`config::set`) and,
     while it's open, reads the settings and the daemon's `EmbeddingStatus` again every half a second
@@ -153,8 +155,12 @@ is: it's the one request every version must understand.
   it, and what has changed in it (its agent's activity, a task's runs) for the daemon to tell
 - `src/vt.rs`: a terminal's screen, through `alacritty_terminal`: what a program drew and its history, the modes
   it set, its answers to the program's questions (the daemon's screen only), the output that catches a new viewer
-  up, the cells to draw, the input modes `crystal attach` asks your terminal for, and, for a viewer, copy mode's
-  cursor, selection and search, which are Alacritty's vi mode. The only module that uses `alacritty_terminal`
+  up (its hyperlinks included), the cells to draw, the input modes `crystal attach` asks your terminal for, and,
+  for a viewer, copy mode's cursor, selection and search, which are Alacritty's vi mode, and the link on a cell:
+  a hyperlink a program wrote (OSC 8), or a URL in the text across the rows it wrapped onto, as `vt::Link`. The
+  only module that uses `alacritty_terminal`
+- `src/links.rs`: opening a link a pane shows: `open` or `xdg-open`, or over ssh (or with neither) the link put
+  on the user's clipboard instead
 - `src/clipboard.rs`: putting text on the user's clipboard: `pbcopy`, `wl-copy`, `xclip` or `xsel` on their own
   machine, or OSC 52 to their terminal over ssh or when none of those works
 - `src/task.rs`: tasks: Claude Code run without a terminal (`claude -p`): one process taking the prompt and each
@@ -248,15 +254,21 @@ is: it's the one request every version must understand.
 - `src/flow_cli.rs`: `crystal flow` and its commands, `cancel` and `defs` among them
 - `src/notify.rs`: telling the user when a session needs them: desktop notifications, or their own command
 - `src/plugins.rs`: plugins: the registry of crystal's own, `enabled`, the gate every one of them goes through
-  (each module's `enabled` asks it), finding installed plugins, switching one in the config's `[plugins]` with
-  `toml_edit`, the context and environment their commands run with, their logs, and pausing one that fails
-- `src/plugin_manifest.rs`: an installed plugin's `plugin.toml` (actions, events, panes), read and checked, and
-  how event patterns match
-- `src/plugin_hooks.rs`: the daemon's side of plugins' `[[events]]`: a subscriber of the bus, each plugin's hooks
-  run one at a time on a thread of its own, with a timeout, a log, and a pause (and a `plugin.paused` event)
-  after failures in a row; and running a hook here, for `plugin run --event`
+  (each module's `enabled` asks it), finding installed plugins and why one can't run here (it doesn't fit, or
+  its build failed) or be switched on, switching one in the config's `[plugins]` with `toml_edit`, the context
+  and environment their commands run with, each plugin's settings directory (shared, beside the config) and
+  state directory (each server's), their logs, pausing one that fails, and the plugin a link goes to
+- `src/plugin_manifest.rs`: an installed plugin's `plugin.toml` (build and startup commands, actions, events,
+  panes, link handlers, `min_crystal_version` and `platforms`), read and checked, whether it fits this crystal
+  and this system, and how event patterns match
+- `src/plugin_hooks.rs`: the daemon's side of plugins' `[[events]]` and `[[startup]]`: a subscriber of the bus,
+  each plugin's hooks run one at a time on a thread of its own, with a timeout, a log, and a pause (and a
+  `plugin.paused` event) after failures in a row; startup commands queued the same way by `Hooks::start_up`,
+  which the daemon calls once its sessions are back (and a daemon taking over must call too); and running a hook
+  here, for `plugin run --event`
 - `src/plugin_cli.rs`: `crystal plugin`: listing, switching, running an action or trying hooks on a made-up event,
-  installing, making and removing
+  installing and building (`[[build]]`, its output in the plugin's log, a failure noted to keep it off), making
+  and removing
 - `src/env.rs`: the environment a session's program starts with
 - `src/git.rs`: a directory's project, worktree and branch, a project's linked worktrees, and making and
   removing worktrees, a pull request's with its commits fetched from `origin`, the patches the diff reads,
@@ -281,7 +293,7 @@ is: it's the one request every version must understand.
   since a daemon brings the skill there up to date as it starts; a test that opens the new-session panel pins `PATH` to its fake
   agents, so no real agent is found or run, and a background task's `claude` is a fake that speaks stream-json,
   asks for permissions and takes interrupts. vt100 stands in for the user's own terminal: a second emulator,
-  apart from crystal's. A test that copies runs the TUI as over ssh (`SSH_TTY` set), so it asks the terminal
-  with OSC 52 and never touches the machine's clipboard. A test of servers by name runs crystal without
-  `--socket`, in a runtime dir and a state dir of its own, with `CRYSTAL_SOCKET` and `CRYSTAL_SERVER` taken
-  out of its environment, so it never reaches the user's own daemon
+  apart from crystal's. A test that copies, or opens a link, runs the TUI as over ssh (`SSH_TTY` set), so it
+  asks the terminal with OSC 52 and never touches the machine's clipboard or opens a browser. A test of servers
+  by name runs crystal without `--socket`, in a runtime dir and a state dir of its own, with `CRYSTAL_SOCKET`
+  and `CRYSTAL_SERVER` taken out of its environment, so it never reaches the user's own daemon

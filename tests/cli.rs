@@ -196,6 +196,15 @@ impl Terminal {
         mode != vt100::MouseProtocolMode::None
     }
 
+    /// Whether the cell at `(column, row)` of the screen is underlined.
+    fn underlined(&self, column: u16, row: u16) -> bool {
+        let parser = self.screen.lock().unwrap();
+        parser
+            .screen()
+            .cell(row, column)
+            .is_some_and(|cell| cell.underline())
+    }
+
     /// Whether crystal has asked this terminal to mark pastes as pastes.
     fn marks_pastes(&self) -> bool {
         self.screen.lock().unwrap().screen().bracketed_paste()
@@ -3295,6 +3304,19 @@ fn nobody_is_told_about_a_session_someone_is_watching() {
 fn click(column: usize, row: usize) -> String {
     let (x, y) = (column + 1, row + 1);
     format!("\x1b[<0;{x};{y}M\x1b[<0;{x};{y}m")
+}
+
+/// What a terminal sends for a click at `(column, row)` with Ctrl held.
+fn ctrl_click(column: usize, row: usize) -> String {
+    let (x, y) = (column + 1, row + 1);
+    format!("\x1b[<16;{x};{y}M\x1b[<16;{x};{y}m")
+}
+
+/// What a terminal sends for the mouse moving to `(column, row)`, no
+/// button down, with Ctrl held or not.
+fn mouse_move(column: usize, row: usize, ctrl: bool) -> String {
+    let button = if ctrl { 51 } else { 35 };
+    format!("\x1b[<{button};{};{}M", column + 1, row + 1)
 }
 
 /// What a terminal sends for a notch of the wheel, up, at `(column, row)`.
@@ -7770,6 +7792,277 @@ fn a_new_plugin_runs_its_action_and_hears_events() {
     let event: serde_json::Value = serde_json::from_str(line.lines().next().unwrap()).unwrap();
     assert_eq!(event["event"], "session.started");
     assert_eq!(event["session"]["name"], "agent");
+}
+
+/// A session that prints a URL on its first row and a hyperlink, OSC 8,
+/// on its second, its text `the docs`.
+const LINKS: &str = r"printf 'see https://example.com/docs now\n';
+printf '\033]8;;https://example.com/hidden\033\\the docs\033]8;;\033\\\n'; sleep 30";
+
+#[test]
+fn ctrl_click_opens_a_link_in_a_pane_and_over_ssh_copies_it() {
+    let crystal = Crystal::new();
+    crystal.ok(&["new", "-n", "linky", "sh", "-c", LINKS]);
+
+    let mut tui = tui_over_ssh(&crystal);
+    tui.shows("the docs");
+    let (column, row) = (PANE_SCREEN_COLUMN, PANE_SCREEN_ROW);
+    // Held over a link with Ctrl, the mouse underlines all of it.
+    tui.type_keys(&mouse_move(column + 10, row, true));
+    eventually("the link is underlined", || {
+        tui.underlined(column as u16 + 4, row as u16)
+            && tui.underlined(column as u16 + 27, row as u16)
+    });
+    assert!(!tui.underlined(column as u16 + 28, row as u16));
+    tui.type_keys(&mouse_move(column + 10, row, false));
+    eventually("the underline goes", || {
+        !tui.underlined(column as u16 + 10, row as u16)
+    });
+
+    tui.type_keys(&ctrl_click(column + 10, row));
+    tui.copies("https://example.com/docs");
+    tui.shows("copied https://example.com/docs");
+    // The hyperlink's text isn't the link: where it goes is.
+    tui.type_keys(&ctrl_click(column + 2, row + 1));
+    tui.copies("https://example.com/hidden");
+
+    // Copy mode's o opens the link under its cursor.
+    tui.type_keys("v");
+    tui.shows("copying from linky");
+    tui.type_keys("?example.com/docs\r");
+    tui.shows("1 of 1");
+    tui.type_keys("o");
+    let copied = base64(b"https://example.com/docs");
+    eventually("it's copied a second time", || {
+        let written = tui.written.lock().unwrap();
+        String::from_utf8_lossy(&written).matches(&copied).count() == 2
+    });
+    tui.hides("copying from linky");
+}
+
+#[test]
+fn a_plugin_s_link_handler_opens_the_links_it_takes() {
+    let crystal = Crystal::new();
+    let manifest = r#"
+name = "linker"
+version = "1.0.0"
+
+[[actions]]
+id = "issue"
+title = "Open the issue"
+command = ["sh", "issue.sh"]
+
+[[link_handlers]]
+pattern = "^https://example\\.com/issues/[0-9]+$"
+action = "issue"
+"#;
+    let script = r#"echo "$CRYSTAL_LINK|$CRYSTAL_SESSION|$CRYSTAL_PLUGIN|$CRYSTAL_PLUGIN_CONFIG_DIR" > opened"#;
+    let dir = plugin(&crystal, "linker", manifest, &[("issue.sh", script)]);
+    let printing = "echo 'https://example.com/issues/42 or https://e.com/x'; sleep 30";
+    crystal.ok(&["new", "-n", "linky", "sh", "-c", printing]);
+
+    let mut tui = tui_over_ssh(&crystal);
+    tui.shows("issues/42");
+    let issue = ctrl_click(PANE_SCREEN_COLUMN + 5, PANE_SCREEN_ROW);
+    // Off, the plugin takes no links.
+    tui.type_keys(&issue);
+    tui.copies("https://example.com/issues/42");
+    assert!(!dir.join("opened").exists());
+
+    crystal.ok(&["plugin", "enable", "linker"]);
+    tui.type_keys(&issue);
+    let opened = written(&dir.join("opened"));
+    let config_dir = crystal.config_home().join("crystal/plugin-config/linker");
+    assert_eq!(
+        opened,
+        format!(
+            "https://example.com/issues/42|linky|linker|{}\n",
+            config_dir.display()
+        )
+    );
+    tui.shows("ran linker: Open the issue");
+    // A link it doesn't take goes to the browser, or here the clipboard.
+    tui.type_keys(&ctrl_click(PANE_SCREEN_COLUMN + 36, PANE_SCREEN_ROW));
+    tui.copies("https://e.com/x");
+
+    // The plugins view lists what it takes.
+    tui.type_keys("X");
+    tui.shows(r"link ^https://example\.com/issues/[0-9]+$  → Open the issue");
+
+    // And a link can be tried on it from the command line.
+    crystal.ok(&[
+        "plugin",
+        "run",
+        "linker",
+        "--link",
+        "https://example.com/issues/7",
+    ]);
+    let opened = written(&dir.join("opened"));
+    assert!(
+        opened.starts_with("https://example.com/issues/7||linker|"),
+        "{opened}"
+    );
+    let refused = crystal.fails(&["plugin", "run", "linker", "--link", "https://e.com/x"]);
+    assert!(
+        refused.contains("linker has no link handler that takes https://e.com/x"),
+        "{refused}"
+    );
+}
+
+#[test]
+fn a_plugin_builds_as_it_installs_and_a_failed_build_keeps_it_off() {
+    let crystal = Crystal::new();
+    let source = crystal.dir.path().join("builder-source");
+    std::fs::create_dir_all(&source).unwrap();
+    let elsewhere = if cfg!(target_os = "macos") {
+        "linux"
+    } else {
+        "macos"
+    };
+    let manifest = format!(
+        r#"name = "builder"
+version = "1.0.0"
+
+[[build]]
+command = ["sh", "build.sh"]
+
+[[build]]
+command = ["sh", "-c", "echo there > elsewhere"]
+platforms = ["{elsewhere}"]
+"#
+    );
+    std::fs::write(source.join("plugin.toml"), manifest).unwrap();
+    std::fs::write(source.join("build.sh"), "echo compiling\necho ok > built\n").unwrap();
+    let source_arg = source.to_str().unwrap();
+
+    let said = crystal.ok(&["plugin", "install", source_arg, "--yes"]);
+    assert!(said.contains("build  sh build.sh"), "{said}");
+    assert!(said.contains("building builder: sh build.sh\n"), "{said}");
+    let installed = crystal.config_home().join("crystal/plugins/builder");
+    assert_eq!(written(&installed.join("built")), "ok\n");
+    // A build command for another system doesn't run here.
+    assert!(!installed.join("elsewhere").exists());
+    assert!(
+        crystal
+            .ok(&["plugin", "log", "builder"])
+            .contains("compiling")
+    );
+    assert!(
+        crystal
+            .config_home()
+            .join("crystal/plugin-config/builder")
+            .is_dir()
+    );
+
+    // A build that fails turns it off, and keeps it off.
+    crystal.ok(&["plugin", "enable", "builder"]);
+    std::fs::write(installed.join("build.sh"), "echo 'no libfoo' >&2\nexit 2\n").unwrap();
+    let failed = crystal.fails(&["plugin", "build", "builder"]);
+    assert!(
+        failed.contains("its build failed: sh build.sh ended with exit status: 2\n  no libfoo"),
+        "{failed}"
+    );
+    assert!(failed.contains("so builder is off now"), "{failed}");
+    let listed = crystal.ok(&["plugin"]);
+    assert!(listed.contains("builder        unbuilt"), "{listed}");
+    let refused = crystal.fails(&["plugin", "enable", "builder"]);
+    assert!(
+        refused.contains("builder can't be turned on: its build failed"),
+        "{refused}"
+    );
+
+    std::fs::write(installed.join("build.sh"), "echo ok > built\n").unwrap();
+    assert_eq!(
+        crystal.ok(&["plugin", "build", "builder"]),
+        "building builder: sh build.sh\nbuilt builder\n"
+    );
+    crystal.ok(&["plugin", "enable", "builder"]);
+
+    // One whose build fails as it installs stays, but off.
+    crystal.ok(&["plugin", "remove", "builder"]);
+    std::fs::write(source.join("build.sh"), "exit 1\n").unwrap();
+    let failed = crystal.fails(&["plugin", "install", source_arg, "--yes", "--enable"]);
+    assert!(failed.contains("installed builder in"), "{failed}");
+    assert!(
+        failed.contains("but it's off: its build failed"),
+        "{failed}"
+    );
+    assert!(
+        failed.contains("`crystal plugin build builder`"),
+        "{failed}"
+    );
+    assert!(crystal.ok(&["plugin"]).contains("builder        unbuilt"));
+}
+
+#[test]
+fn a_plugin_s_startup_commands_run_each_time_the_daemon_starts() {
+    let crystal = Crystal::new();
+    let manifest = r#"
+name = "starter"
+version = "1.0.0"
+
+[[startup]]
+command = ["sh", "start.sh"]
+"#;
+    let script = r#"echo "$CRYSTAL_EVENT $CRYSTAL_PLUGIN_STATE_DIR $(cat)" >> started"#;
+    let dir = plugin(&crystal, "starter", manifest, &[("start.sh", script)]);
+    crystal.ok(&["plugin", "enable", "starter"]);
+
+    crystal.ok(&["new", "-n", "first", "sleep", "30"]);
+    let state = crystal.socket.with_extension("plugins").join("starter");
+    assert_eq!(
+        written(&dir.join("started")),
+        format!("startup {} \n", state.display())
+    );
+    assert!(state.is_dir());
+    // Once a start, not once a session.
+    crystal.ok(&["new", "-n", "second", "sleep", "30"]);
+    crystal.ok(&["restart-server"]);
+    eventually("it runs again", || {
+        lines_in(&dir.join("started")).len() == 2
+    });
+    crystal.ok(&["ls"]);
+    assert_eq!(lines_in(&dir.join("started")).len(), 2);
+}
+
+#[test]
+fn a_plugin_for_a_newer_crystal_is_listed_but_can_t_be_turned_on() {
+    let crystal = Crystal::new();
+    let manifest = "name = \"future\"\nversion = \"1.0.0\"\nmin_crystal_version = \"99.0\"\n";
+    let dir = plugin(&crystal, "future", manifest, &[]);
+    let listed = crystal.ok(&["plugin"]);
+    let why = format!("needs crystal 99.0 or later; this is {OUR_VERSION}");
+    assert!(
+        listed.contains(&format!("future         unsupported  1.0.0     {why}")),
+        "{listed}"
+    );
+    assert!(listed.contains("handoff        on"), "{listed}");
+    let refused = crystal.fails(&["plugin", "enable", "future"]);
+    assert!(
+        refused.contains(&format!("future can't be turned on: {why}")),
+        "{refused}"
+    );
+
+    // The plugins view says why too, under crystal's own, and won't
+    // switch it on.
+    let mut tui = crystal.tui();
+    tui.type_keys("X");
+    tui.shows("● handoff");
+    tui.shows(&format!("○ future          {why}"));
+    // Down past crystal's own eight, to future.
+    tui.type_keys("jjjjjjjj ");
+    tui.shows(&format!("future can't be turned on: {why}"));
+    tui.type_keys("\x1b");
+    drop(tui);
+
+    // Nor is one installed.
+    let source = crystal.dir.path().join("future-source");
+    std::fs::rename(&dir, &source).unwrap();
+    let refused = crystal.fails(&["plugin", "install", source.to_str().unwrap(), "--yes"]);
+    assert!(
+        refused.contains(&format!("future can't be installed: it {why}")),
+        "{refused}"
+    );
 }
 
 /// Flows for the tests below, with the settings every test has.
