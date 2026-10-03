@@ -38,6 +38,8 @@ use std::path::{Path, PathBuf};
 pub enum Slot {
     Selected,
     Split(usize),
+    /// The pane floating over the others: see [`App::floating`].
+    Float,
 }
 
 /// Where the keyboard goes.
@@ -1146,12 +1148,29 @@ impl App {
     /// The panes on screen, in the order they're drawn: the splits, with
     /// the one that follows the selection where it's been moved to, first
     /// until it's moved. Zoomed, only the pane that shows the selected
-    /// session.
+    /// session. Then, last, over the others, the float, if there is one.
     pub fn slots(&self) -> Vec<Slot> {
-        if self.zoomed() {
-            return vec![self.selected_slot().unwrap_or(Slot::Selected)];
+        let mut slots = if self.zoomed() {
+            let zoomed = self.selected_slot().filter(|slot| *slot != Slot::Float);
+            vec![zoomed.unwrap_or(Slot::Selected)]
+        } else {
+            self.tiled()
+        };
+        if self.floating().is_some() {
+            slots.push(Slot::Float);
         }
-        self.tiled()
+        slots
+    }
+
+    /// The session floating over the panes of the tab in front, if one is.
+    pub fn floating(&self) -> Option<&SessionInfo> {
+        let name = self.tabs.current().floating.as_deref()?;
+        self.sessions.iter().find(|session| session.name == name)
+    }
+
+    /// Whether the session called `name` floats over the panes.
+    fn is_floating(&self, name: &str) -> bool {
+        self.tabs.current().floating.as_deref() == Some(name)
     }
 
     /// Every pane of the tab in front, in the order they're drawn when it
@@ -1179,8 +1198,8 @@ impl App {
         self.grabbed
     }
 
-    /// The session the pane at `slot` is about: the selected one, or the
-    /// one split off there.
+    /// The session the pane at `slot` is about: the selected one, the one
+    /// split off there, or the one floating.
     pub fn pane_session(&self, slot: Slot) -> Option<&SessionInfo> {
         match slot {
             Slot::Selected => self.selected(),
@@ -1188,23 +1207,29 @@ impl App {
                 let name = self.splits().get(index)?;
                 self.sessions.iter().find(|session| session.name == *name)
             }
+            Slot::Float => self.floating(),
         }
     }
 
     /// Whether the pane at `slot` shows its session's screen. The pane that
     /// follows the selection doesn't when the selected session is split
-    /// off, so that no session is drawn twice at two sizes, nor when it's
-    /// the session this TUI runs in. Zoomed, no other pane is on screen.
+    /// off or floats, so that no session is drawn twice at two sizes, nor
+    /// when it's the session this TUI runs in. Zoomed, no other pane is on
+    /// screen but the float.
     pub fn shows_screen(&self, slot: Slot) -> bool {
         let Some(session) = self.pane_session(slot) else {
             return false;
         };
-        if self.zoomed() && Some(slot) != self.selected_slot() {
+        if self.zoomed() && slot != Slot::Float && Some(slot) != self.selected_slot() {
             return false;
         }
         match slot {
-            Slot::Selected => !self.selected_is_own() && !self.is_split(&session.name),
-            Slot::Split(_) => true,
+            Slot::Selected => {
+                !self.selected_is_own()
+                    && !self.is_split(&session.name)
+                    && !self.is_floating(&session.name)
+            }
+            Slot::Split(_) | Slot::Float => true,
         }
     }
 
@@ -1362,10 +1387,14 @@ impl App {
         }
     }
 
-    /// The pane that shows the selected session: its split, if it has one,
-    /// or else the pane that follows the selection.
+    /// The pane that shows the selected session: the float, if it floats,
+    /// its split, if it has one, or else the pane that follows the
+    /// selection.
     fn selected_slot(&self) -> Option<Slot> {
         let selected = self.selected()?;
+        if self.is_floating(&selected.name) {
+            return Some(Slot::Float);
+        }
         let split = self
             .splits()
             .iter()
@@ -1514,7 +1543,7 @@ impl App {
         // another pane, and swaps places with it.
         if let Some(grab) = self.grabbed {
             match (kind, hit) {
-                (MouseEventKind::Drag(_), Hit::Pane { slot, .. }) => {
+                (MouseEventKind::Drag(_), Hit::Pane { slot, .. }) if slot != Slot::Float => {
                     self.grabbed = Some(Grab {
                         over: Some(slot),
                         ..grab
@@ -1547,7 +1576,8 @@ impl App {
                     self.focus_pane(slot);
                 }
                 // On its header line, it takes the pane, to move it.
-                if cell.is_none() && !self.zoomed() && self.tiled().len() > 1 {
+                let tiled = slot != Slot::Float;
+                if tiled && cell.is_none() && !self.zoomed() && self.tiled().len() > 1 {
                     self.grabbed = Some(Grab {
                         from: slot,
                         over: Some(slot),
@@ -1614,6 +1644,7 @@ impl App {
             KeyCode::Char('z') => self.toggle_zoom(),
             KeyCode::Char('v') => self.start_copying(),
             KeyCode::Char('e') => return self.edit_history(),
+            KeyCode::Char('F') => self.toggle_float(),
             KeyCode::Char('H') => self.move_pane(-1),
             KeyCode::Char('L') => self.move_pane(1),
             KeyCode::Char('t') => return self.new_tab(),
@@ -2577,7 +2608,49 @@ impl App {
             let most = tabs::MAX_SPLITS;
             self.notify(format!("{most} splits at most: press s on one to close it"));
         } else {
+            // A session that floats comes down into its split.
+            if self.is_floating(&name) {
+                self.put_float_back();
+            }
             self.tabs.current_mut().splits.push(name);
+        }
+    }
+
+    /// `F`: floats the selected session over the panes, in a pane of its
+    /// own that takes the keyboard, or puts back the one that floats. A
+    /// session split off comes up out of its split.
+    fn toggle_float(&mut self) {
+        if self.tabs.current().floating.is_some() {
+            return self.put_float_back();
+        }
+        let Some(selected) = self.selected() else {
+            return;
+        };
+        if self.selected_is_own() {
+            return self.notify("crystal can't show the session it runs in".into());
+        }
+        let name = selected.name.clone();
+        if let Some(split) = self.splits().iter().position(|split| *split == name) {
+            self.close_split(split);
+        }
+        self.tabs.current_mut().floating = Some(name);
+        if self.can_type_into(Slot::Float) {
+            self.focus_pane(Slot::Float);
+        }
+    }
+
+    /// Puts the session that floats back among the others. The keyboard
+    /// goes back to the sidebar if it was in the float.
+    fn put_float_back(&mut self) {
+        self.tabs.current_mut().floating = None;
+        if matches!(
+            self.focus,
+            Focus::Pane(Slot::Float) | Focus::Copy(Slot::Float)
+        ) {
+            self.focus = Focus::Sidebar;
+        }
+        if self.last_pane == Some(Slot::Float) {
+            self.last_pane = None;
         }
     }
 
@@ -2602,6 +2675,9 @@ impl App {
         };
         if self.zoomed() {
             return self.notify("zoomed: z puts the panes back first".into());
+        }
+        if slot == Slot::Float {
+            return self.notify("it floats: F puts it back among the panes".into());
         }
         let mut order = self.tiled();
         if order.len() == 1 {
@@ -2636,7 +2712,7 @@ impl App {
             .iter()
             .filter_map(|slot| match slot {
                 Slot::Split(index) => before.get(*index).cloned(),
-                Slot::Selected => None,
+                Slot::Selected | Slot::Float => None,
             })
             .collect();
         let moved = |slot: Slot| match slot {
@@ -2644,7 +2720,7 @@ impl App {
                 .get(index)
                 .and_then(|name| splits.iter().position(|split| split == name))
                 .map_or(slot, Slot::Split),
-            Slot::Selected => slot,
+            Slot::Selected | Slot::Float => slot,
         };
         self.focus = match self.focus {
             Focus::Pane(slot) => Focus::Pane(moved(slot)),
@@ -4036,6 +4112,121 @@ mod tests {
         press(&mut app, KeyCode::Char('z'));
         app.on_mouse(down, header);
         assert_eq!(app.grabbed(), None);
+    }
+
+    #[test]
+    fn f_floats_the_selected_session_with_the_keyboard_and_again_puts_it_back() {
+        let mut app = app_with(&["a", "b"]);
+        press(&mut app, KeyCode::Char('F'));
+        assert_eq!(app.slots(), [Slot::Selected, Slot::Float]);
+        assert_eq!(app.floating().unwrap().name, "a");
+        assert_eq!(app.focus(), Focus::Pane(Slot::Float));
+        // The selection's pane doesn't draw it a second time.
+        assert!(app.shows_screen(Slot::Float));
+        assert!(!app.shows_screen(Slot::Selected));
+
+        // The float stays over the panes while the selection moves on.
+        hand_back(&mut app);
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(drawn(&app), ["b", "a"]);
+        assert_eq!(app.tabs_to_keep().current().floating.as_deref(), Some("a"));
+
+        // F puts it back, whatever is selected.
+        press(&mut app, KeyCode::Char('F'));
+        assert_eq!(app.slots(), [Slot::Selected]);
+        assert!(app.floating().is_none());
+        assert_eq!(app.focus(), Focus::Sidebar);
+    }
+
+    #[test]
+    fn tab_goes_round_to_the_float_last_and_keys_go_to_it() {
+        let mut app = app_with_splits(&["a", "b", "c"], 1);
+        press(&mut app, KeyCode::Char('F'));
+        hand_back(&mut app);
+        press(&mut app, KeyCode::Char('k'));
+        assert_eq!(app.slots(), [Slot::Selected, Slot::Split(0), Slot::Float]);
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.focus(), Focus::Pane(Slot::Selected));
+        hand_back(&mut app);
+        press(&mut app, KeyCode::Tab);
+        hand_back(&mut app);
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.focus(), Focus::Pane(Slot::Float));
+        let key = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE);
+        assert_eq!(
+            app.on_key(key),
+            Some(Action::Type {
+                to: Slot::Float,
+                key
+            })
+        );
+    }
+
+    #[test]
+    fn a_split_comes_up_into_the_float_and_s_puts_the_float_in_a_split() {
+        let mut app = app_with_splits(&["a", "b"], 1);
+        app.select("a");
+        press(&mut app, KeyCode::Char('F'));
+        assert!(app.splits().is_empty());
+        assert_eq!(app.floating().unwrap().name, "a");
+        hand_back(&mut app);
+        press(&mut app, KeyCode::Char('s'));
+        assert_eq!(app.splits(), ["a"]);
+        assert!(app.floating().is_none());
+        assert_eq!(app.focus(), Focus::Sidebar);
+    }
+
+    #[test]
+    fn the_float_floats_over_a_zoomed_tab_too() {
+        let mut app = app_with(&["a", "b"]);
+        press(&mut app, KeyCode::Char('F'));
+        hand_back(&mut app);
+        press(&mut app, KeyCode::Char('z'));
+        // a floats: the zoomed pane follows the selection, under it.
+        assert_eq!(app.slots(), [Slot::Selected, Slot::Float]);
+        assert!(app.shows_screen(Slot::Float));
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(drawn(&app), ["b", "a"]);
+    }
+
+    #[test]
+    fn the_float_goes_with_its_session() {
+        let mut app = app_with(&["a", "b"]);
+        press(&mut app, KeyCode::Char('F'));
+        app.set_sessions(vec![session("b")]);
+        assert!(app.floating().is_none());
+        assert_eq!(app.slots(), [Slot::Selected]);
+        assert_eq!(app.focus(), Focus::Sidebar);
+        assert_eq!(app.tabs_to_keep().current().floating, None);
+    }
+
+    #[test]
+    fn the_float_is_the_tabs_and_leaves_it_with_its_session() {
+        let mut app = app_with_a_second_tab(&["a"]);
+        press(&mut app, KeyCode::Char('F'));
+        hand_back(&mut app);
+        press(&mut app, KeyCode::Char('['));
+        assert!(app.floating().is_none());
+        press(&mut app, KeyCode::Char(']'));
+        assert_eq!(app.floating().unwrap().name, "shell");
+        press(&mut app, KeyCode::Char('>'));
+        press(&mut app, KeyCode::Char('1'));
+        assert!(app.floating().is_none());
+    }
+
+    #[test]
+    fn the_tuis_own_session_doesnt_float_and_a_float_doesnt_move() {
+        let mut app = App::new(Some("me".into()));
+        app.set_sessions(vec![session("me")]);
+        press(&mut app, KeyCode::Char('F'));
+        assert!(app.floating().is_none());
+        assert!(app.notice().unwrap().contains("runs in"));
+
+        let mut app = app_with_splits(&["a", "b"], 1);
+        press(&mut app, KeyCode::Char('F'));
+        hand_back(&mut app);
+        press(&mut app, KeyCode::Char('L'));
+        assert!(app.notice().unwrap().contains("F puts it back"));
     }
 
     #[test]

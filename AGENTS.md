@@ -48,8 +48,9 @@ is: it's the one request every version must understand.
   - `app.rs`: the state and how keys and the mouse change it; no I/O, so it's unit-tested
   - `ui.rs`: the layout and drawing (top bar and its tabs, pane headers, footer), and what's under the mouse
   - `tabs.rs`: tabs, each holding its own sessions (each session in exactly one) with its own selection,
-    splits and the order of its panes, and which is in front; the sidebar shows only that tab's sessions.
-    Kept apart from I/O but for keeping them in a file beside the daemon's state
+    splits, the order of its panes and the session floating over them, and which is in front; the sidebar
+    shows only that tab's sessions. Kept apart from I/O but for keeping them in a file beside the daemon's
+    state
   - `sidebar.rs`: the sidebar's rows: headings, worktree lines, sessions with their mark and how long ago,
     terminals drawn apart from agents
   - `status.rs`: a session's status as the TUI shows it, and its mark

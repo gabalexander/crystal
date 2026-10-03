@@ -1290,6 +1290,62 @@ fn z_zooms_the_pane_over_the_whole_screen_and_back() {
     });
 }
 
+#[test]
+fn f_floats_a_session_over_the_panes_and_puts_it_back() {
+    let crystal = Crystal::new();
+    crystal.ok(&[
+        "new",
+        "-n",
+        "sizer",
+        "sh",
+        "-c",
+        "trap 'stty size > size' WINCH; echo watching; while :; do sleep 0.05; done",
+    ]);
+    let size = crystal.dir.path().join("size");
+    let size_is = |expected: &str| std::fs::read_to_string(&size).is_ok_and(|s| s == expected);
+
+    let mut tui = crystal.tui();
+    tui.shows("watching");
+    eventually("the session is the pane's size", || size_is("21 51\n"));
+
+    // Beside the sidebar there are 51 columns and 22 rows. The float's
+    // frame takes all 51 and 17 of the rows; inside the frame, below its
+    // header line, the session has 49 by 14.
+    tui.type_keys("F");
+    tui.shows("sizer · floating");
+    tui.shows("typing into sizer");
+    eventually("the session is the float's size", || size_is("14 49\n"));
+
+    // Back in the sidebar, it goes on floating, until F puts it back.
+    tui.type_keys("\x1c");
+    tui.shows("F puts it back");
+    tui.type_keys("F");
+    tui.hides("floating");
+    eventually("the session is the pane's size again", || {
+        size_is("21 51\n")
+    });
+}
+
+#[test]
+fn keys_go_to_the_session_that_floats() {
+    let crystal = Crystal::new();
+    crystal.ok(&[
+        "new",
+        "-n",
+        "reader",
+        "sh",
+        "-c",
+        "read line; echo \"$line\" > got; sleep 30",
+    ]);
+
+    let mut tui = crystal.tui();
+    tui.shows("❯ reader");
+    tui.type_keys("F");
+    tui.shows("typing into reader");
+    tui.type_keys("hello float\r");
+    assert_eq!(written(&crystal.dir.path().join("got")), "hello float\n");
+}
+
 /// Opens the TUI the way it runs over ssh, so that what it copies goes to
 /// the terminal, with OSC 52, rather than to this machine's clipboard.
 fn tui_over_ssh(crystal: &Crystal) -> Terminal {
