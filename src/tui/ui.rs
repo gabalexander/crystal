@@ -1,19 +1,23 @@
-//! Drawing the TUI: the sidebar of sessions, the pane with the selected one
-//! and the panes of the sessions split off, and a footer with the keys.
-//! Drawing only reads the state; it never changes it.
+//! Drawing the TUI: a bar along the top, the sidebar of sessions, the pane
+//! with the selected session and the panes of those split off, each under a
+//! header line, and the footer. There are no boxes: thin rules and the
+//! theme's colors tell the parts apart. Drawing only reads the state; it
+//! never changes it.
 
 use super::app::{App, Focus, Hit, Prompt, Question, Slot};
-use super::groups::Row;
 use super::help;
 use super::pane::Pane;
 use super::screen_widget::ScreenWidget;
-use crate::protocol::{Activity, SessionInfo, State};
+use super::sidebar::{self, fit};
+use super::status::Status;
+use super::theme::Theme;
+use crate::protocol::{SessionInfo, State};
 use crate::shell;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style, Stylize};
-use ratatui::text::Line;
-use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph};
+use ratatui::style::{Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Paragraph};
 
 const SIDEBAR_WIDTH: u16 = 28;
 
@@ -21,11 +25,24 @@ const SIDEBAR_WIDTH: u16 = 28;
 /// most agents' screens; narrower than that, they're stacked.
 const MIN_PANE_WIDTH: u16 = 80;
 
+/// What drawing needs besides the state.
+pub struct Look<'a> {
+    pub theme: &'a Theme,
+    /// Seconds since the Unix epoch, to say how long ago sessions changed.
+    pub now: u64,
+    /// How far the working mark has turned: a number that goes up with
+    /// time.
+    pub spin: usize,
+}
+
 /// Where each part of the TUI goes on a screen of a given size.
 pub struct Areas {
+    pub top: Rect,
     pub sidebar: Rect,
+    /// The column with the rule between the sidebar and the panes.
+    pub rule: Rect,
     /// One per pane, in the app's [`App::slots`] order: the selection's
-    /// pane, then each split.
+    /// pane, then each split. Each is its header line, then its screen.
     pub panes: Vec<Rect>,
     pub footer: Rect,
 }
@@ -34,43 +51,58 @@ impl Areas {
     /// Lays out a screen with `splits` sessions split off beside the
     /// selection's pane.
     pub fn new(screen: Rect, splits: usize) -> Areas {
-        let [main, footer] =
-            Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(screen);
-        let [sidebar, panes] =
-            Layout::horizontal([Constraint::Length(SIDEBAR_WIDTH), Constraint::Min(0)]).areas(main);
+        let [top, main, footer] = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Min(0),
+            Constraint::Length(1),
+        ])
+        .areas(screen);
+        let [sidebar, rule, panes] = Layout::horizontal([
+            Constraint::Length(SIDEBAR_WIDTH),
+            Constraint::Length(1),
+            Constraint::Min(0),
+        ])
+        .areas(main);
         Areas {
+            top,
             sidebar,
+            rule,
             panes: pane_areas(panes, 1 + splits),
             footer,
         }
     }
 }
 
-/// Shares `area` out evenly between `count` panes: side by side when each
-/// is still at least [`MIN_PANE_WIDTH`] wide, stacked otherwise.
+/// Shares `area` out evenly between `count` panes: side by side, a column
+/// apart for the rule between them, when each is still at least
+/// [`MIN_PANE_WIDTH`] wide; stacked otherwise, where each pane's header
+/// line is what sets it apart.
 pub fn pane_areas(area: Rect, count: usize) -> Vec<Rect> {
-    let count = count.max(1);
-    let constraints = vec![Constraint::Ratio(1, count as u32); count];
-    let side_by_side = area.width / count as u16 >= MIN_PANE_WIDTH;
+    let count = count.max(1) as u16;
+    let constraints = vec![Constraint::Ratio(1, u32::from(count)); usize::from(count)];
+    let rules = count - 1;
+    let side_by_side = area.width.saturating_sub(rules) / count >= MIN_PANE_WIDTH;
     let layout = if side_by_side {
-        Layout::horizontal(constraints)
+        Layout::horizontal(constraints).spacing(1)
     } else {
         Layout::vertical(constraints)
     };
     layout.split(area).to_vec()
 }
 
-/// The inside of a pane's border, where its session's screen goes. The
-/// session is sized to fit it exactly.
+/// Where a pane's session's screen goes: all of the pane below its header
+/// line. The session is sized to fit it exactly.
 pub fn screen_area(pane: Rect) -> Rect {
-    Block::bordered().inner(pane)
+    let [_header, screen] =
+        Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(pane);
+    screen
 }
 
 /// What's at `(column, row)` on a screen laid out as `areas`, for `app`.
 pub fn hit(areas: &Areas, app: &App, column: u16, row: u16) -> Hit {
     let at = |area: Rect| area.contains((column, row).into());
     if at(areas.sidebar) {
-        return sidebar_hit(areas.sidebar, app, row);
+        return sidebar::hit(areas.sidebar, app, row);
     }
     let panes = app.slots().into_iter().zip(&areas.panes);
     for (slot, area) in panes {
@@ -83,116 +115,85 @@ pub fn hit(areas: &Areas, app: &App, column: u16, row: u16) -> Hit {
     Hit::Elsewhere
 }
 
-/// Which sidebar row is on screen `row`, if any.
-fn sidebar_hit(sidebar: Rect, app: &App, row: u16) -> Hit {
-    let inside = Block::bordered().inner(sidebar);
-    if row < inside.y || row >= inside.bottom() {
-        return Hit::Sidebar;
-    }
-    let offset = sidebar_offset(app, inside.height);
-    let index = offset + usize::from(row - inside.y);
-    if index < app.rows().len() {
-        Hit::SidebarRow(index)
-    } else {
-        Hit::Sidebar
-    }
-}
-
-/// The first sidebar row on screen, when the rows don't all fit in
-/// `height`: the list scrolls just far enough to keep the selection in
-/// sight. Drawing and clicking both go by this, so a click lands on the
-/// row drawn there.
-fn sidebar_offset(app: &App, height: u16) -> usize {
-    let height = usize::from(height.max(1));
-    match selected_row(app) {
-        Some(selected) if selected >= height => selected + 1 - height,
-        _ => 0,
-    }
-}
-
-/// The sidebar row the selected session is drawn on.
-fn selected_row(app: &App) -> Option<usize> {
-    let index = app.selected_index()?;
-    app.rows()
-        .iter()
-        .position(|row| *row == Row::Session(index))
-}
-
 /// Draws the whole TUI. `panes` are the viewers of the sessions on screen.
-pub fn draw(frame: &mut Frame, app: &App, panes: &[Pane]) {
+pub fn draw(frame: &mut Frame, app: &App, panes: &[Pane], look: &Look) {
+    frame.render_widget(Block::new().style(look.theme.base()), frame.area());
     let areas = Areas::new(frame.area(), app.splits().len());
-    draw_sidebar(frame, app, areas.sidebar);
+    draw_top_bar(frame, app, look, areas.top);
+    sidebar::draw(frame, app, look, areas.sidebar);
+    draw_rule(frame, look, areas.rule);
     for (slot, area) in app.slots().into_iter().zip(&areas.panes) {
-        draw_pane(frame, app, slot, *area, panes);
+        draw_pane(frame, app, look, slot, *area, panes);
     }
-    draw_footer(frame, app, areas.footer);
+    draw_rules_between(frame, look, &areas.panes);
+    draw_footer(frame, app, look, areas.footer);
     if app.showing_keys() {
-        help::draw(frame, frame.area());
+        help::draw(frame, look.theme, frame.area());
     }
 }
 
-fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect) {
-    let block = Block::bordered()
-        .title(" sessions ")
-        .border_style(border_style(app.focus() == Focus::Sidebar));
-    let rows = app.rows();
-    let items: Vec<ListItem> = rows
+/// crystal's name on the left, and on the right how many sessions there
+/// are and how many wait on the user.
+fn draw_top_bar(frame: &mut Frame, app: &App, look: &Look, area: Rect) {
+    let theme = look.theme;
+    let name = Line::from(vec![
+        Span::raw(" "),
+        Span::styled(
+            "crystal",
+            Style::new().fg(theme.accent).add_modifier(Modifier::BOLD),
+        ),
+    ]);
+    frame.render_widget(name, area);
+    frame.render_widget(summary(app.sessions(), theme).right_aligned(), area);
+}
+
+/// "6 sessions · 2 waiting": the waiting count only when some are, in the
+/// color that says so.
+pub fn summary<'a>(sessions: &[SessionInfo], theme: &Theme) -> Line<'a> {
+    let count = sessions.len();
+    let noun = if count == 1 { "session" } else { "sessions" };
+    let mut spans = vec![Span::styled(
+        format!("{count} {noun}"),
+        Style::new().fg(theme.muted),
+    )];
+    let waiting = sessions
         .iter()
-        .map(|row| ListItem::new(sidebar_row(app, row)))
-        .collect();
-    let height = block.inner(area).height;
-    let list = List::new(items)
-        .block(block)
-        .highlight_style(Style::new().add_modifier(Modifier::REVERSED));
-    let mut state = ListState::default()
-        .with_offset(sidebar_offset(app, height))
-        .with_selected(selected_row(app));
-    frame.render_stateful_widget(list, area, &mut state);
+        .filter(|session| Status::of(session) == Status::Waiting)
+        .count();
+    if waiting > 0 {
+        spans.push(Span::styled(" · ", Style::new().fg(theme.muted)));
+        spans.push(Span::styled(
+            format!("{waiting} waiting"),
+            Style::new().fg(theme.waiting),
+        ));
+    }
+    spans.push(Span::raw(" "));
+    Line::from(spans)
 }
 
-/// One row of the sidebar. Headings name a project, then a worktree's
-/// branch (`⌂` for the main worktree, `⎇` for a linked one); the sessions
-/// sit indented under them.
-fn sidebar_row<'a>(app: &'a App, row: &Row) -> Line<'a> {
-    match row {
-        Row::Project(name) => Line::from(name.clone()).bold(),
-        Row::OutsideGit => Line::from("outside git").bold().dark_gray(),
-        Row::Worktree { branch, main } => {
-            let mark = if *main { "⌂ " } else { "⎇ " };
-            let branch = branch.as_deref().unwrap_or("(detached)").to_string();
-            Line::from(vec!["  ".into(), mark.dark_gray(), branch.into()])
-        }
-        Row::Directory(dir) => Line::from(format!("  {}", shell::home_relative(dir))).dark_gray(),
-        Row::Session(index) => {
-            let mut line = session_row(&app.sessions()[*index]);
-            line.spans.insert(0, "    ".into());
-            line
+/// A thin vertical rule down `area`.
+fn draw_rule(frame: &mut Frame, look: &Look, area: Rect) {
+    let lines: Vec<Line> = (0..area.height).map(|_| Line::from("│")).collect();
+    let rule = Paragraph::new(lines).style(Style::new().fg(look.theme.rule));
+    frame.render_widget(rule, area);
+}
+
+/// The rules between panes that sit side by side, in the column left
+/// between each pair.
+fn draw_rules_between(frame: &mut Frame, look: &Look, panes: &[Rect]) {
+    for pair in panes.windows(2) {
+        let (left, right) = (pair[0], pair[1]);
+        if right.x > left.right() {
+            let column = Rect::new(left.right(), left.y, 1, left.height);
+            draw_rule(frame, look, column);
         }
     }
 }
 
-/// A session's row: a mark for what it's doing, its name, and a word on
-/// it, unless it's simply running.
-fn session_row(session: &SessionInfo) -> Line<'_> {
-    let (mark, word) = match (&session.state, session.activity) {
-        (State::Running, Some(Activity::Waiting)) => ("▲ ".yellow(), "waiting".yellow()),
-        (State::Running, Some(Activity::Working)) => ("◐ ".cyan(), "working".dark_gray()),
-        (State::Running, Some(Activity::Done)) => ("✓ ".green(), "done".dark_gray()),
-        (State::Running, _) => ("▶ ".green(), "".into()),
-        (State::Exited { code: 0 }, _) => ("■ ".dark_gray(), session.state.to_string().dark_gray()),
-        (_, _) => ("■ ".red(), session.state.to_string().dark_gray()),
-    };
-    let mut row = Line::from(vec![mark, session.name.as_str().into()]);
-    if !word.content.is_empty() {
-        row.push_span(" ");
-        row.push_span(word);
-    }
-    row
-}
-
-/// Draws the pane at `slot` in `area`: its session's screen, or a word on
-/// why there's none to show. Only the focused pane shows the cursor.
-fn draw_pane(frame: &mut Frame, app: &App, slot: Slot, area: Rect, panes: &[Pane]) {
+/// Draws the pane at `slot` in `area`: a header line naming its session,
+/// then the session's screen, or a word on why there's none to show. Only
+/// the pane with the keyboard shows the cursor.
+fn draw_pane(frame: &mut Frame, app: &App, look: &Look, slot: Slot, area: Rect, panes: &[Pane]) {
     let focused = app.focus() == Focus::Pane(slot);
     let session = app.pane_session(slot);
     // Until a viewer has attached to the session, there's nothing to show
@@ -201,35 +202,38 @@ fn draw_pane(frame: &mut Frame, app: &App, slot: Slot, area: Rect, panes: &[Pane
         .filter(|_| app.shows_screen(slot))
         .and_then(|session| panes.iter().find(|pane| pane.session_id == session.id));
     let back = pane.map_or(0, Pane::scrolled_back);
-    let mut block = Block::bordered().border_style(border_style(focused));
-    if let Some(session) = session {
-        block = block.title(pane_title(app, slot, session, back));
-    }
-    frame.render_widget(block, area);
-
     let screen = screen_area(area);
+    let header = Rect::new(area.x, area.y, area.width, 1);
+
     let Some(session) = session else {
         if slot == Slot::Selected {
-            draw_message(frame, "No sessions yet. Press n to start a shell.", screen);
+            draw_message(frame, look, "No sessions yet: n starts one", screen);
         }
         return;
     };
+    let notes = header_notes(app, slot, session, back);
+    let line = pane_header(session, &notes, focused, look, header.width);
+    frame.render_widget(line, header);
+
     if slot == Slot::Selected && app.selected_is_own() {
-        draw_message(frame, "This is the session crystal is running in.", screen);
+        let message = "This is the session crystal is running in.";
+        draw_message(frame, look, message, screen);
         return;
     }
     if !app.shows_screen(slot) {
         // The selected session is split off: point at its pane rather than
         // draw it twice at two sizes.
         let message = format!("{} has a pane of its own", session.name);
-        draw_message(frame, &message, screen);
+        draw_message(frame, look, &message, screen);
         return;
     }
     let Some(pane) = pane else {
         return;
     };
     let session_screen = pane.screen.screen();
-    frame.render_widget(ScreenWidget::new(session_screen), screen);
+    let widget =
+        ScreenWidget::new(session_screen).with_defaults(look.theme.text, look.theme.background);
+    frame.render_widget(widget, screen);
     // Back in the history, the cursor's place on the live screen means
     // nothing.
     if focused && back == 0 && !session_screen.hide_cursor() {
@@ -240,90 +244,287 @@ fn draw_pane(frame: &mut Frame, app: &App, slot: Slot, area: Rect, panes: &[Pane
     }
 }
 
-/// A pane's title: its session's name and, once it has ended, how. A split
-/// showing the selected session says so, since the selection's own pane
-/// points to it. A pane looking `back` rows into its history says how far.
-fn pane_title(app: &App, slot: Slot, session: &SessionInfo, back: usize) -> String {
-    let mut words = vec![session.name.clone()];
+/// The short notes after a pane's session name: how it ended, that it's the
+/// selected session when a split shows it, and how far back in its history
+/// the pane is.
+fn header_notes(app: &App, slot: Slot, session: &SessionInfo, back: usize) -> Vec<String> {
+    let mut notes = Vec::new();
     if session.state != State::Running {
-        words.push(session.state.to_string());
+        notes.push(session.state.to_string());
     }
     let selected = app.selected().is_some_and(|s| s.name == session.name);
     if slot != Slot::Selected && selected {
-        words.push("selected".to_string());
+        notes.push("selected".to_string());
     }
     if back > 0 {
-        words.push(format!("↑ {back} lines"));
+        notes.push(format!("↑ {back} lines"));
     }
-    format!(" {} ", words.join(" · "))
+    notes
+}
+
+/// A pane's header line, `width` columns wide: the session's mark and name,
+/// in the accent color when the pane has the keyboard, and its `notes`;
+/// then a rule; then, muted on the right, where the session runs and its
+/// command. When that doesn't all fit, the command goes first, then where
+/// it runs.
+pub fn pane_header<'a>(
+    session: &SessionInfo,
+    notes: &[String],
+    focused: bool,
+    look: &Look,
+    width: u16,
+) -> Line<'a> {
+    let theme = look.theme;
+    let status = Status::of(session);
+    let name_color = if focused { theme.accent } else { theme.text };
+    let mut spans = vec![
+        Span::raw(" "),
+        Span::styled(
+            status.mark(look.spin),
+            Style::new().fg(theme.status(status)),
+        ),
+        Span::raw(" "),
+        Span::styled(
+            session.name.clone(),
+            Style::new().fg(name_color).add_modifier(Modifier::BOLD),
+        ),
+    ];
+    for note in notes {
+        spans.push(Span::styled(" · ", Style::new().fg(theme.muted)));
+        spans.push(Span::styled(note.clone(), Style::new().fg(theme.muted)));
+    }
+    let left: usize = spans.iter().map(Span::width).sum();
+    let width = usize::from(width);
+
+    // The longest right side that still leaves a few columns of rule: a
+    // space, three of rule, a space, the right side, and a space to end.
+    let fits = |right: &String| {
+        let needed = left + 1 + 3 + 1 + right.chars().count() + 1;
+        needed <= width
+    };
+    let right = right_sides(session)
+        .into_iter()
+        .find(fits)
+        .unwrap_or_default();
+    let right_width = if right.is_empty() {
+        0
+    } else {
+        right.chars().count() + 2
+    };
+    let rule = width.saturating_sub(left + 1 + right_width);
+    spans.push(Span::raw(" "));
+    spans.push(Span::styled("─".repeat(rule), Style::new().fg(theme.rule)));
+    if !right.is_empty() {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(right, Style::new().fg(theme.muted)));
+        spans.push(Span::raw(" "));
+    }
+    Line::from(spans)
+}
+
+/// What can go on the right of a pane's header, longest first: where the
+/// session runs and its command, then only where it runs.
+fn right_sides(session: &SessionInfo) -> Vec<String> {
+    let command: Vec<String> = session
+        .command
+        .iter()
+        .map(|arg| shell::quote(arg))
+        .collect();
+    let command = fit(&command.join(" "), 32);
+    let place = match &session.worktree {
+        Some(worktree) => {
+            // The same marks as the sidebar's worktree lines.
+            let mark = if worktree.main { "⌂" } else { "⎇" };
+            let branch = worktree.branch.as_deref().unwrap_or("(detached)");
+            format!("{} {mark} {branch}", worktree.project)
+        }
+        None => shell::home_relative(&session.cwd),
+    };
+    vec![format!("{place} · {command}"), place]
 }
 
 /// One line of text across the middle of `area`.
-fn draw_message(frame: &mut Frame, message: &str, area: Rect) {
+fn draw_message(frame: &mut Frame, look: &Look, message: &str, area: Rect) {
     let [_, middle, _] = Layout::vertical([
         Constraint::Fill(1),
         Constraint::Length(1),
         Constraint::Fill(1),
     ])
     .areas(area);
-    frame.render_widget(Paragraph::new(message).centered().dark_gray(), middle);
+    let message = Paragraph::new(message)
+        .centered()
+        .style(Style::new().fg(look.theme.muted));
+    frame.render_widget(message, middle);
 }
 
-fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
+/// The footer: a question being asked, a notice, or else where the keyboard
+/// is and the keys that matter there, with "? keys" on the right.
+fn draw_footer(frame: &mut Frame, app: &App, look: &Look, area: Rect) {
+    let theme = look.theme;
     if let Some(prompt) = app.prompt() {
-        draw_prompt(frame, prompt, area);
-        return;
-    }
-    let footer = if let Some(confirm) = app.confirm() {
-        Line::from(confirm.question()).yellow()
+        draw_prompt(frame, theme, prompt, area);
+    } else if let Some(confirm) = app.confirm() {
+        frame.render_widget(question_line(&confirm.question(), theme), area);
     } else if let Some(notice) = app.notice() {
-        Line::from(notice.to_string()).red()
-    } else if app.focus() == Focus::Sidebar {
-        Line::from("j/k · enter type · s split · n new · w worktree · x kill · ? keys · q quit")
-            .dark_gray()
+        let notice = Line::styled(format!(" {notice}"), Style::new().fg(theme.failed));
+        frame.render_widget(notice, area);
     } else {
-        Line::from("typing into the session · ctrl+\\ back to the list · shift+pgup history")
-            .dark_gray()
+        frame.render_widget(hints_line(app, theme, area.width), area);
+        frame.render_widget(keys_hint(app, theme).right_aligned(), area);
+    }
+}
+
+/// A yes-or-no question: the question in the accent color, the answers
+/// muted.
+fn question_line<'a>(question: &str, theme: &Theme) -> Line<'a> {
+    let (asked, answers) = question.split_once("? ").unwrap_or((question, ""));
+    Line::from(vec![
+        Span::raw(" "),
+        Span::styled(
+            format!("{asked}?"),
+            Style::new().fg(theme.accent).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(format!(" {answers}"), Style::new().fg(theme.muted)),
+    ])
+}
+
+/// The keys the footer offers in the sidebar, most needed first; the rest
+/// are behind `?`.
+const SIDEBAR_HINTS: &[(&str, &str)] = &[
+    ("enter", "type"),
+    ("n", "new"),
+    ("s", "split"),
+    ("x", "kill"),
+    ("q", "quit"),
+    ("w", "worktree"),
+    ("u", "next"),
+];
+
+/// The keys that don't go to the program, while a pane has the keyboard.
+const PANE_HINTS: &[(&str, &str)] = &[("ctrl+\\", "sidebar"), ("shift+pgup", "history")];
+
+/// Where the keyboard is, then the keys that matter most there, as many as
+/// fit beside "? keys".
+fn hints_line<'a>(app: &App, theme: &Theme, width: u16) -> Line<'a> {
+    let (mut spans, hints) = match app.focus() {
+        Focus::Sidebar => (whereabouts(app, theme, width), SIDEBAR_HINTS),
+        Focus::Pane(slot) => {
+            let name = app.pane_session(slot).map_or("", |s| s.name.as_str());
+            let spans = vec![
+                Span::styled(" typing into ", Style::new().fg(theme.muted)),
+                Span::styled(name.to_string(), Style::new().fg(theme.accent)),
+            ];
+            (spans, PANE_HINTS)
+        }
     };
-    frame.render_widget(footer, area);
+    // Room left for "? keys" on the right.
+    let room = usize::from(width).saturating_sub(8);
+    for (key, does) in hints {
+        let used: usize = spans.iter().map(Span::width).sum();
+        let hint = 2 + key.chars().count() + 1 + does.chars().count();
+        if used + hint > room {
+            break;
+        }
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(key.to_string(), Style::new().fg(theme.text)));
+        spans.push(Span::styled(
+            format!(" {does}"),
+            Style::new().fg(theme.muted),
+        ));
+    }
+    Line::from(spans)
+}
+
+/// Where the selected session is: its project, branch and name. Cut from
+/// the left to a third of the footer, so the keys keep their room.
+fn whereabouts<'a>(app: &App, theme: &Theme, width: u16) -> Vec<Span<'a>> {
+    let Some(session) = app.selected() else {
+        return vec![Span::raw(" ")];
+    };
+    let place = match &session.worktree {
+        Some(worktree) => {
+            let branch = worktree.branch.as_deref().unwrap_or("(detached)");
+            format!("{} ▸ {branch} ▸ ", worktree.project)
+        }
+        None => String::new(),
+    };
+    let full = format!("{place}{}", session.name);
+    let room = usize::from(width / 3);
+    let shown = if full.chars().count() <= room {
+        full
+    } else {
+        let skip = full.chars().count() + 1 - room;
+        format!("…{}", full.chars().skip(skip).collect::<String>())
+    };
+    vec![
+        Span::raw(" "),
+        Span::styled(shown, Style::new().fg(theme.text)),
+    ]
+}
+
+/// "? keys", where `?` opens the list of every key: from the sidebar only,
+/// since in a pane `?` goes to the program.
+fn keys_hint<'a>(app: &App, theme: &Theme) -> Line<'a> {
+    if app.focus() != Focus::Sidebar {
+        return Line::default();
+    }
+    Line::from(vec![
+        Span::styled("?", Style::new().fg(theme.text)),
+        Span::styled(" keys ", Style::new().fg(theme.muted)),
+    ])
 }
 
 /// Asks the prompt's question, with the cursor in the answer.
-fn draw_prompt(frame: &mut Frame, prompt: &Prompt, area: Rect) {
+fn draw_prompt(frame: &mut Frame, theme: &Theme, prompt: &Prompt, area: Rect) {
     let question = match prompt.question {
-        Question::Branch => "branch for the new worktree: ",
-        Question::Command(_) => "new session: ",
-        Question::Rename(_) => "new name: ",
+        Question::Branch => " branch for the new worktree: ",
+        Question::Command(_) => " new session: ",
+        Question::Rename(_) => " new name: ",
     };
-    let line = Line::from(vec![question.cyan(), prompt.input.text().into()]);
+    let line = Line::from(vec![
+        Span::styled(
+            question,
+            Style::new().fg(theme.accent).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(prompt.input.text().to_string(), Style::new().fg(theme.text)),
+    ]);
     frame.render_widget(line, area);
     // The question is plain ASCII, so its length in bytes is its width.
     let column = area.x + (question.len() + prompt.input.cursor()) as u16;
     frame.set_cursor_position((column.min(area.right().saturating_sub(1)), area.y));
 }
 
-/// The focused part stands out; the other fades.
-fn border_style(focused: bool) -> Style {
-    if focused {
-        Style::new().fg(Color::Cyan)
-    } else {
-        Style::new().fg(Color::DarkGray)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::Worktree;
+    use crate::config::ThemeName;
+    use crate::protocol::{Activity, Worktree};
+    use crate::tui::groups::Row;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use std::path::PathBuf;
 
-    /// Draws `app` on an 80 by 12 screen and returns it as lines of text.
-    fn screen_text(app: &App) -> Vec<String> {
-        let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
-        terminal.draw(|frame| draw(frame, app, &[])).unwrap();
+    fn theme() -> Theme {
+        Theme::new(ThemeName::Dark, false)
+    }
+
+    fn look(theme: &Theme) -> Look<'_> {
+        Look {
+            theme,
+            now: 1_000,
+            spin: 0,
+        }
+    }
+
+    /// Draws `app` on a `width` by `height` screen and returns it as lines
+    /// of text.
+    fn screen_text_at(app: &App, width: u16, height: u16) -> Vec<String> {
+        let theme = theme();
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, app, &[], &look(&theme)))
+            .unwrap();
         let buffer = terminal.backend().buffer();
         (0..buffer.area.height)
             .map(|y| {
@@ -331,6 +532,20 @@ mod tests {
                     .map(|x| buffer[(x, y)].symbol())
                     .collect()
             })
+            .collect()
+    }
+
+    /// Draws `app` on an 80 by 12 screen.
+    fn screen_text(app: &App) -> Vec<String> {
+        screen_text_at(app, 80, 12)
+    }
+
+    /// The sidebar's rows on an 80 by 12 screen, up to the rule: what's
+    /// beside them, like the pane's header, left out.
+    fn sidebar_text(app: &App) -> Vec<String> {
+        screen_text(app)
+            .iter()
+            .map(|line| line.chars().take(usize::from(SIDEBAR_WIDTH) + 1).collect())
             .collect()
     }
 
@@ -348,23 +563,37 @@ mod tests {
         }
     }
 
+    fn in_worktree(name: &str, branch: &str, main: bool) -> SessionInfo {
+        SessionInfo {
+            worktree: Some(Worktree {
+                project: "app".into(),
+                project_path: PathBuf::from("/code/app"),
+                path: PathBuf::from(format!("/code/app/{branch}")),
+                main,
+                branch: Some(branch.into()),
+            }),
+            ..session(name, State::Running)
+        }
+    }
+
     /// The number of the first line that holds `text`.
     fn line_with(lines: &[String], text: &str) -> usize {
         let found = lines.iter().position(|line| line.contains(text));
         found.unwrap_or_else(|| panic!("{text:?} isn't on screen:\n{}", lines.join("\n")))
     }
 
+    fn text_of(line: &Line) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
     #[test]
     fn the_keys_overlay_draws_over_an_80_by_24_screen() {
         let mut app = App::new(None);
         app.on_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
-        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        terminal.draw(|frame| draw(frame, &app, &[])).unwrap();
-        let buffer = terminal.backend().buffer();
-        let text: String = (0..buffer.area.height)
-            .flat_map(|y| (0..buffer.area.width).map(move |x| (x, y)))
-            .map(|cell| buffer[cell].symbol().to_string())
-            .collect();
+        let text = screen_text_at(&app, 80, 24).join("\n");
         let expected = [
             "In the sidebar",
             "In a pane",
@@ -381,24 +610,53 @@ mod tests {
     fn with_no_sessions_the_pane_says_how_to_start_one() {
         let app = App::new(None);
         let text = screen_text(&app).join("\n");
-        assert!(text.contains("No sessions yet. Press n to start a shell."));
+        assert!(text.contains("No sessions yet: n starts one"));
         assert!(text.contains("q quit"));
+        assert!(text.contains("? keys"));
     }
 
     #[test]
-    fn the_sidebar_lists_sessions_with_how_they_ended() {
+    fn the_top_bar_names_crystal_and_counts_the_sessions() {
+        let mut app = App::new(None);
+        app.set_sessions(vec![session("a", State::Running)]);
+        let text = screen_text(&app);
+        assert!(text[0].starts_with(" crystal"), "{}", text[0]);
+        assert!(text[0].trim_end().ends_with("1 session"), "{}", text[0]);
+    }
+
+    #[test]
+    fn the_summary_counts_the_waiting_only_when_some_wait() {
+        let theme = theme();
+        let quiet = vec![session("a", State::Running), session("b", State::Running)];
+        assert_eq!(text_of(&summary(&quiet, &theme)), "2 sessions ");
+
+        let mut waiting = quiet.clone();
+        waiting[1].activity = Some(Activity::Waiting);
+        let line = summary(&waiting, &theme);
+        assert_eq!(text_of(&line), "2 sessions · 1 waiting ");
+        let count = line.spans.iter().find(|span| span.content == "1 waiting");
+        assert_eq!(count.unwrap().style.fg, Some(theme.waiting));
+    }
+
+    #[test]
+    fn the_sidebar_lists_sessions_under_a_heading_with_marks() {
         let mut app = App::new(None);
         app.set_sessions(vec![
             session("claude", State::Running),
             session("codex", State::Exited { code: 1 }),
         ]);
-        let text = screen_text(&app);
-        assert!(line_with(&text, "▶ claude") < line_with(&text, "■ codex exited 1"));
-        assert!(text[0].contains(" claude "), "the pane is titled after it");
+        let sidebar = sidebar_text(&app);
+        assert!(line_with(&sidebar, "outside git ─") < line_with(&sidebar, "▸ claude"));
+        assert!(line_with(&sidebar, "▸ claude") < line_with(&sidebar, "■ codex"));
+        let screen = screen_text(&app);
+        assert!(
+            screen[1].contains("▸ claude ─"),
+            "the pane's header names it"
+        );
     }
 
     #[test]
-    fn the_sidebar_says_what_each_agent_is_doing() {
+    fn the_sidebar_marks_what_each_agent_is_doing() {
         let mut app = App::new(None);
         let mut sessions = Vec::new();
         for (name, activity) in [
@@ -413,45 +671,87 @@ mod tests {
         }
         app.set_sessions(sessions);
         let text = screen_text(&app);
-        line_with(&text, "▲ asks waiting");
-        line_with(&text, "◐ busy working");
-        line_with(&text, "✓ finished done");
-        line_with(&text, "▶ resting ");
+        line_with(&text, "▲ asks");
+        line_with(&text, "◐ busy");
+        line_with(&text, "✓ finished");
+        line_with(&text, "▸ resting");
+    }
+
+    #[test]
+    fn a_session_row_says_how_long_ago_it_changed() {
+        let mut app = App::new(None);
+        let mut old = session("old", State::Running);
+        old.changed = 1_000 - 12 * 60;
+        app.set_sessions(vec![old]);
+        let text = sidebar_text(&app);
+        let row = &text[line_with(&text, "▸ old")];
+        // Right-aligned against the rule.
+        assert!(row.contains("12m │"), "{row}");
+    }
+
+    #[test]
+    fn a_name_too_long_for_the_time_beside_it_keeps_its_room() {
+        let mut app = App::new(None);
+        let mut long = session("a-very-long-session-name", State::Running);
+        long.changed = 1_000 - 45;
+        app.set_sessions(vec![long]);
+        let text = sidebar_text(&app);
+        let row = &text[line_with(&text, "▸ a-very-long")];
+        assert!(!row.contains("45s"), "{row}");
     }
 
     #[test]
     fn sessions_sit_under_their_project_and_worktree() {
-        let in_worktree = |name: &str, branch: &str, main: bool| SessionInfo {
-            worktree: Some(Worktree {
-                project: "app".into(),
-                project_path: PathBuf::from("/code/app"),
-                path: PathBuf::from(format!("/code/app/{branch}")),
-                main,
-                branch: Some(branch.into()),
-            }),
-            ..session(name, State::Running)
-        };
         let mut app = App::new(None);
         app.set_sessions(vec![
             in_worktree("fixer", "fix", false),
             in_worktree("planner", "main", true),
             session("shell", State::Running),
         ]);
-        let text = screen_text(&app);
+        let text = sidebar_text(&app);
         let order = [
-            line_with(&text, "│app"),
+            line_with(&text, "app ─"),
             line_with(&text, "⌂ main"),
-            line_with(&text, "▶ planner"),
+            line_with(&text, "▸ planner"),
             line_with(&text, "⎇ fix"),
-            line_with(&text, "▶ fixer"),
+            line_with(&text, "▸ fixer"),
             line_with(&text, "outside git"),
-            line_with(&text, "▶ shell"),
+            line_with(&text, "▸ shell"),
         ];
         assert!(
             order.is_sorted(),
             "out of order: {order:?}\n{}",
             text.join("\n")
         );
+    }
+
+    #[test]
+    fn a_pane_header_drops_the_command_then_the_place_as_it_narrows() {
+        let theme = theme();
+        let look = look(&theme);
+        let session = in_worktree("planner", "main", true);
+        let header = |width| text_of(&pane_header(&session, &[], false, &look, width));
+
+        let wide = header(60);
+        assert!(wide.contains("app ⌂ main · sh"), "{wide}");
+        assert_eq!(wide.chars().count(), 60);
+
+        let middling = header(30);
+        assert!(middling.contains("app ⌂ main"), "{middling}");
+        assert!(!middling.contains("· sh"), "{middling}");
+
+        let narrow = header(18);
+        assert!(narrow.starts_with(" ▸ planner ─"), "{narrow}");
+        assert!(!narrow.contains("app"), "{narrow}");
+    }
+
+    #[test]
+    fn a_pane_header_notes_how_its_session_ended() {
+        let theme = theme();
+        let ended = session("done", State::Exited { code: 3 });
+        let notes = vec!["exited 3".to_string()];
+        let header = text_of(&pane_header(&ended, &notes, false, &look(&theme), 60));
+        assert!(header.starts_with(" ■ done · exited 3 ─"), "{header}");
     }
 
     #[test]
@@ -481,34 +781,48 @@ mod tests {
     }
 
     #[test]
-    fn the_session_screen_sits_inside_the_panes_border() {
+    fn the_footer_says_where_the_selection_is() {
+        let mut app = App::new(None);
+        app.set_sessions(vec![in_worktree("planner", "main", true)]);
+        let text = screen_text(&app);
+        assert!(
+            text[11].starts_with(" app ▸ main ▸ planner"),
+            "{}",
+            text[11]
+        );
+    }
+
+    #[test]
+    fn the_session_screen_sits_below_its_header() {
         let areas = Areas::new(Rect::new(0, 0, 80, 24), 0);
-        assert_eq!(screen_area(areas.panes[0]), Rect::new(29, 1, 50, 21));
+        assert_eq!(areas.top, Rect::new(0, 0, 80, 1));
+        assert_eq!(areas.rule, Rect::new(28, 1, 1, 22));
+        assert_eq!(screen_area(areas.panes[0]), Rect::new(29, 2, 51, 21));
     }
 
     #[test]
     fn one_pane_takes_the_whole_area() {
-        let area = Rect::new(28, 0, 52, 23);
+        let area = Rect::new(29, 1, 51, 22);
         assert_eq!(pane_areas(area, 1), [area]);
     }
 
     #[test]
-    fn panes_go_side_by_side_when_each_is_wide_enough() {
-        let panes = pane_areas(Rect::new(0, 0, 240, 40), 3);
+    fn panes_go_side_by_side_a_rule_apart_when_each_is_wide_enough() {
+        let panes = pane_areas(Rect::new(0, 0, 242, 40), 3);
         assert_eq!(
             panes,
             [
                 Rect::new(0, 0, 80, 40),
-                Rect::new(80, 0, 80, 40),
-                Rect::new(160, 0, 80, 40),
+                Rect::new(81, 0, 80, 40),
+                Rect::new(162, 0, 80, 40),
             ]
         );
     }
 
     #[test]
     fn panes_are_stacked_when_side_by_side_would_be_too_narrow() {
-        let panes = pane_areas(Rect::new(0, 0, 159, 40), 2);
-        assert_eq!(panes, [Rect::new(0, 0, 159, 20), Rect::new(0, 20, 159, 20)]);
+        let panes = pane_areas(Rect::new(0, 0, 160, 40), 2);
+        assert_eq!(panes, [Rect::new(0, 0, 160, 20), Rect::new(0, 20, 160, 20)]);
     }
 
     #[test]
@@ -521,7 +835,7 @@ mod tests {
         app.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
         let text = screen_text(&app).join("\n");
         assert!(text.contains("left has a pane of its own"));
-        assert!(text.contains(" left · selected "));
+        assert!(text.contains("left · selected"));
     }
 
     /// An app with `count` sessions, outside git, so under two headings.
@@ -538,8 +852,8 @@ mod tests {
     fn a_click_finds_the_sidebar_row_under_it() {
         let app = app_with_sessions(3);
         let areas = Areas::new(Rect::new(0, 0, 80, 24), 0);
-        // Row 0 is the sidebar's border; the list starts below it.
-        assert_eq!(hit(&areas, &app, 5, 0), Hit::Sidebar);
+        // Row 0 is the top bar; the sidebar's rows start below it.
+        assert_eq!(hit(&areas, &app, 5, 0), Hit::Elsewhere);
         assert_eq!(hit(&areas, &app, 5, 1), Hit::SidebarRow(0));
         assert_eq!(hit(&areas, &app, 5, 3), Hit::SidebarRow(2));
         // Below the last of the 5 rows: still the sidebar, but no row.
@@ -550,23 +864,24 @@ mod tests {
     fn a_click_finds_the_cell_on_the_panes_screen() {
         let app = app_with_sessions(1);
         let areas = Areas::new(Rect::new(0, 0, 80, 24), 0);
-        // The pane starts after the 28-column sidebar; its screen inside
-        // the border at column 29, row 1.
+        // The pane starts after the 28-column sidebar and its rule; its
+        // screen below the header line, at column 29, row 2.
         assert_eq!(
-            hit(&areas, &app, 31, 2),
+            hit(&areas, &app, 31, 3),
             Hit::Pane {
                 slot: Slot::Selected,
                 cell: Some((1, 2))
             }
         );
-        let on_the_border = hit(&areas, &app, 28, 2);
+        let on_the_header = hit(&areas, &app, 40, 1);
         assert_eq!(
-            on_the_border,
+            on_the_header,
             Hit::Pane {
                 slot: Slot::Selected,
                 cell: None
             }
         );
+        assert_eq!(hit(&areas, &app, 28, 5), Hit::Elsewhere, "the rule");
         assert_eq!(hit(&areas, &app, 40, 23), Hit::Elsewhere, "the footer");
     }
 
@@ -588,13 +903,13 @@ mod tests {
         let mut app = app_with_sessions(30);
         app.select("s29");
         let areas = Areas::new(Rect::new(0, 0, 80, 12), 0);
-        // Above the footer and inside the border, 9 rows fit: the selection
-        // is drawn on the last of them, screen row 9.
-        let last_visible = hit(&areas, &app, 5, 9);
+        // Between the top bar and the footer, 10 rows fit: the selection is
+        // drawn on the last of them, screen row 10.
+        let last_visible = hit(&areas, &app, 5, 10);
         let Hit::SidebarRow(row) = last_visible else {
             panic!("not a row");
         };
         assert_eq!(app.rows()[row], Row::Session(29));
-        assert!(screen_text(&app)[9].contains("s29"));
+        assert!(screen_text(&app)[10].contains("s29"));
     }
 }

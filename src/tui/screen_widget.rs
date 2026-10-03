@@ -9,11 +9,51 @@ use ratatui::widgets::Widget;
 
 pub struct ScreenWidget<'a> {
     screen: &'a vt100::Screen,
+    /// What a program's "default" colors stand for: the terminal's own,
+    /// unless the theme paints its own.
+    default_fg: Color,
+    default_bg: Color,
 }
 
 impl<'a> ScreenWidget<'a> {
     pub fn new(screen: &'a vt100::Screen) -> ScreenWidget<'a> {
-        ScreenWidget { screen }
+        ScreenWidget {
+            screen,
+            default_fg: Color::Reset,
+            default_bg: Color::Reset,
+        }
+    }
+
+    /// Draws the program's default colors as `fg` and `bg`, so that a
+    /// session sits on the theme's background rather than the terminal's.
+    pub fn with_defaults(self, fg: Color, bg: Color) -> ScreenWidget<'a> {
+        ScreenWidget {
+            default_fg: fg,
+            default_bg: bg,
+            ..self
+        }
+    }
+
+    fn style(&self, cell: &vt100::Cell) -> Style {
+        let fg = color(cell.fgcolor()).unwrap_or(self.default_fg);
+        let bg = color(cell.bgcolor()).unwrap_or(self.default_bg);
+        let mut style = Style::default().fg(fg).bg(bg);
+        if cell.bold() {
+            style = style.add_modifier(Modifier::BOLD);
+        }
+        if cell.dim() {
+            style = style.add_modifier(Modifier::DIM);
+        }
+        if cell.italic() {
+            style = style.add_modifier(Modifier::ITALIC);
+        }
+        if cell.underline() {
+            style = style.add_modifier(Modifier::UNDERLINED);
+        }
+        if cell.inverse() {
+            style = style.add_modifier(Modifier::REVERSED);
+        }
+        style
     }
 }
 
@@ -38,39 +78,18 @@ impl Widget for ScreenWidget<'_> {
                 } else {
                     target.set_symbol(" ");
                 }
-                target.set_style(style(cell));
+                target.set_style(self.style(cell));
             }
         }
     }
 }
 
-fn style(cell: &vt100::Cell) -> Style {
-    let mut style = Style::default()
-        .fg(color(cell.fgcolor()))
-        .bg(color(cell.bgcolor()));
-    if cell.bold() {
-        style = style.add_modifier(Modifier::BOLD);
-    }
-    if cell.dim() {
-        style = style.add_modifier(Modifier::DIM);
-    }
-    if cell.italic() {
-        style = style.add_modifier(Modifier::ITALIC);
-    }
-    if cell.underline() {
-        style = style.add_modifier(Modifier::UNDERLINED);
-    }
-    if cell.inverse() {
-        style = style.add_modifier(Modifier::REVERSED);
-    }
-    style
-}
-
-fn color(color: vt100::Color) -> Color {
+/// The color a vt100 cell asks for, or `None` for the default one.
+fn color(color: vt100::Color) -> Option<Color> {
     match color {
-        vt100::Color::Default => Color::Reset,
-        vt100::Color::Idx(index) => Color::Indexed(index),
-        vt100::Color::Rgb(r, g, b) => Color::Rgb(r, g, b),
+        vt100::Color::Default => None,
+        vt100::Color::Idx(index) => Some(Color::Indexed(index)),
+        vt100::Color::Rgb(r, g, b) => Some(Color::Rgb(r, g, b)),
     }
 }
 
@@ -122,6 +141,23 @@ mod tests {
         assert_eq!(truecolor.fg, Some(Color::Rgb(1, 2, 3)));
         assert!(truecolor.add_modifier.contains(Modifier::REVERSED));
         assert!(!truecolor.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn default_colors_take_the_themes_and_others_stay_the_programs() {
+        let parser = screen(1, 4, b"a\x1b[31mb");
+        let area = Rect::new(0, 0, 4, 1);
+        let mut buf = Buffer::empty(area);
+        let ink = Color::Rgb(1, 1, 1);
+        let paper = Color::Rgb(9, 9, 9);
+        ScreenWidget::new(parser.screen())
+            .with_defaults(ink, paper)
+            .render(area, &mut buf);
+
+        assert_eq!(buf[(0, 0)].style().fg, Some(ink));
+        assert_eq!(buf[(0, 0)].style().bg, Some(paper));
+        assert_eq!(buf[(1, 0)].style().fg, Some(Color::Indexed(1)));
+        assert_eq!(buf[(1, 0)].style().bg, Some(paper));
     }
 
     #[test]

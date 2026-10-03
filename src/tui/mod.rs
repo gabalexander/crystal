@@ -13,7 +13,10 @@ mod help;
 mod mouse;
 mod pane;
 mod screen_widget;
+mod sidebar;
+mod status;
 mod text_input;
+mod theme;
 mod ui;
 
 use crate::config::Config;
@@ -28,13 +31,18 @@ use ratatui::DefaultTerminal;
 use ratatui::layout::Rect;
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use theme::Theme;
 
 /// How often the session list is asked for. The daemon doesn't announce
 /// changes, so this is how far behind the list can be.
 const POLL_EVERY: Duration = Duration::from_millis(500);
+
+/// How often the working mark turns a quarter, while an agent works. With
+/// nothing working, the TUI waits for something to happen instead.
+const SPIN_EVERY: Duration = Duration::from_millis(150);
 
 pub enum Event {
     Key(KeyEvent),
@@ -73,6 +81,8 @@ pub fn run(socket: &Path) -> Result<()> {
         last_pane_id: 0,
         events: sender,
         screen: Rect::default(),
+        theme: Theme::from_env(config.theme),
+        started: Instant::now(),
         quitting: false,
     };
     tui.app.set_first_command(config.new_session);
@@ -131,6 +141,9 @@ struct Tui {
     events: Sender<Event>,
     /// The whole screen as it was last drawn, to find what the mouse is on.
     screen: Rect,
+    theme: Theme,
+    /// When the TUI started: the working mark turns with the time since.
+    started: Instant,
     quitting: bool,
 }
 
@@ -152,17 +165,36 @@ impl Tui {
             self.screen = Rect::new(0, 0, size.width, size.height);
             let areas = ui::Areas::new(self.screen, self.app.splits().len());
             self.sync_panes(&areas);
-            terminal.draw(|frame| ui::draw(frame, &self.app, &self.panes))?;
+            let look = ui::Look {
+                theme: &self.theme,
+                now: seconds_since_epoch(),
+                spin: (self.started.elapsed().as_millis() / SPIN_EVERY.as_millis()) as usize,
+            };
+            terminal.draw(|frame| ui::draw(frame, &self.app, &self.panes, &look))?;
 
             // Wait for something to happen, then take whatever else has
             // happened meanwhile, so a burst of output is drawn once.
-            let event = events.recv()?;
-            self.handle(event);
+            if let Some(event) = self.next_event(&events)? {
+                self.handle(event);
+            }
             while let Ok(event) = events.try_recv() {
                 self.handle(event);
             }
         }
         Ok(())
+    }
+
+    /// The next event. While an agent works, the wait is cut short in time
+    /// to turn its mark, and there's no event: only a frame to draw.
+    fn next_event(&self, events: &Receiver<Event>) -> Result<Option<Event>> {
+        if !self.app.anything_working() {
+            return Ok(Some(events.recv()?));
+        }
+        match events.recv_timeout(SPIN_EVERY) {
+            Ok(event) => Ok(Some(event)),
+            Err(RecvTimeoutError::Timeout) => Ok(None),
+            Err(RecvTimeoutError::Disconnected) => bail!("the TUI's events stopped"),
+        }
     }
 
     fn handle(&mut self, event: Event) {
@@ -390,6 +422,13 @@ fn directory_for(place: Place) -> Result<PathBuf> {
             git::add_worktree(&base, &branch)
         }
     }
+}
+
+fn seconds_since_epoch() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|since| since.as_secs())
+        .unwrap_or(0)
 }
 
 fn list_sessions(socket: &Path, start: bool) -> Result<Vec<SessionInfo>> {

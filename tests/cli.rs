@@ -652,8 +652,8 @@ fn the_tui_lists_the_sessions_and_shows_the_selected_one() {
     }
 
     let mut tui = crystal.tui();
-    tui.shows("▶ alpha");
-    tui.shows("▶ beta");
+    tui.shows("▸ alpha");
+    tui.shows("▸ beta");
     tui.shows("alpha is here");
 
     tui.type_keys("j");
@@ -666,9 +666,9 @@ fn keys_go_to_the_pane_after_enter_and_back_to_the_list_after_ctrl_backslash() {
     crystal.ok(&["new", "-n", "cat", "cat"]);
 
     let mut tui = crystal.tui();
-    tui.shows("▶ cat");
+    tui.shows("▸ cat");
     tui.type_keys("\r");
-    tui.shows("typing into the session");
+    tui.shows("typing into");
     tui.type_keys("hello pane\r");
     tui.shows("hello pane");
 
@@ -690,8 +690,8 @@ fn n_with_an_empty_line_starts_a_shell_and_hands_it_the_keyboard() {
     tui.shows("new session: claude");
     // Ctrl+U clears the line, and an empty line is the shell.
     tui.type_keys("\x15\r");
-    tui.shows("▶ sh");
-    tui.shows("typing into the session");
+    tui.shows("▸ sh");
+    tui.shows("typing into");
     tui.type_keys("echo I am $CRYSTAL_SESSION\r");
     tui.shows("I am sh");
 }
@@ -706,7 +706,7 @@ fn n_starts_claude_with_its_hooks_and_the_rest_of_the_line_as_its_prompt() {
     tui.type_keys("n");
     tui.shows("new session: claude");
     tui.type_keys(" fix the login bug\r");
-    tui.shows("▶ claude");
+    tui.shows("▸ claude");
 
     let args = written(&crystal.dir.path().join("args"));
     let args: Vec<&str> = args.lines().collect();
@@ -722,7 +722,7 @@ fn x_asks_first_and_only_y_kills_the_selected_session() {
     let pid = crystal.pid("doomed");
 
     let mut tui = crystal.tui();
-    tui.shows("▶ doomed");
+    tui.shows("▸ doomed");
     tui.type_keys("x");
     tui.shows("kill doomed? y/n");
     tui.type_keys("n");
@@ -742,7 +742,7 @@ fn q_quits_the_tui_and_the_sessions_keep_running() {
     crystal.ok(&["new", "-n", "stays", "sleep", "30"]);
 
     let mut tui = crystal.tui();
-    tui.shows("▶ stays");
+    tui.shows("▸ stays");
     tui.type_keys("q");
     assert!(tui.exit());
     assert_eq!(crystal.row("stays").unwrap()[1], "running");
@@ -765,7 +765,7 @@ fn a_question_mark_shows_every_key_and_the_next_key_only_closes_it() {
     eventually("the keys are put away", || {
         !tui.text().contains("In the sidebar")
     });
-    tui.shows("▶ stays");
+    tui.shows("▸ stays");
     tui.type_keys("q");
     assert!(tui.exit());
 }
@@ -779,7 +779,7 @@ fn an_ended_session_shows_how_it_ended() {
     });
 
     let tui = crystal.tui();
-    tui.shows("■ done exited 3");
+    tui.shows("■ done · exited 3");
     tui.shows("last words");
 }
 
@@ -797,14 +797,15 @@ fn the_session_in_the_pane_is_sized_to_the_pane() {
     let size = crystal.dir.path().join("size");
     let size_is = |expected: &str| std::fs::read_to_string(&size).is_ok_and(|s| s == expected);
 
-    // The terminal is 24 by 80; inside the pane's border, beside the
-    // sidebar and above the footer, that leaves 21 by 50.
+    // The terminal is 24 by 80. Beside the 28-column sidebar and its rule,
+    // and between the top bar and the footer, below the pane's header line,
+    // that leaves 21 by 51.
     let tui = crystal.tui();
     tui.shows("watching");
-    eventually("the session is the pane's size", || size_is("21 50\n"));
+    eventually("the session is the pane's size", || size_is("21 51\n"));
 
     tui.resize(30, 100);
-    eventually("the session follows the pane", || size_is("27 70\n"));
+    eventually("the session follows the pane", || size_is("27 71\n"));
 }
 
 #[test]
@@ -958,6 +959,17 @@ fn line_with(text: &str, needle: &str) -> usize {
     found.unwrap_or_else(|| panic!("{needle:?} isn't on screen:\n{text}"))
 }
 
+/// The TUI's sidebar out of the whole screen's `text`: each line up to
+/// the rule after the sidebar's 28 columns, leaving out the pane beside it,
+/// whose header can name a session too.
+fn sidebar_of(text: &str) -> String {
+    let lines: Vec<String> = text
+        .lines()
+        .map(|line| line.chars().take(29).collect())
+        .collect();
+    lines.join("\n")
+}
+
 #[test]
 fn ls_shows_the_project_and_branch_of_each_session() {
     let crystal = Crystal::new();
@@ -1088,16 +1100,16 @@ fn the_tui_groups_sessions_by_project_then_worktree() {
     crystal.ok(&["new", "-n", "shell", "sleep", "30"]);
 
     let tui = crystal.tui();
-    tui.shows("▶ shell");
-    let text = tui.text();
+    tui.shows("▸ shell");
+    let text = sidebar_of(&tui.text());
     let order = [
-        line_with(&text, "│app"),
+        line_with(&text, " app ─"),
         line_with(&text, "⌂ main"),
-        line_with(&text, "▶ planner"),
+        line_with(&text, "▸ planner"),
         line_with(&text, "⎇ fix"),
-        line_with(&text, "▶ fixer"),
+        line_with(&text, "▸ fixer"),
         line_with(&text, "outside git"),
-        line_with(&text, "▶ shell"),
+        line_with(&text, "▸ shell"),
     ];
     assert!(order.is_sorted(), "out of order: {order:?}\n{text}");
 }
@@ -1117,14 +1129,14 @@ fn w_in_the_tui_starts_a_command_in_a_new_worktree() {
     ]);
 
     let mut tui = crystal.tui();
-    tui.shows("▶ planner");
+    tui.shows("▸ planner");
     tui.type_keys("w");
     tui.shows("branch for the new worktree:");
     tui.type_keys("spike\r");
     tui.shows("new session: claude");
     tui.type_keys("\x15sh -c 'pwd > where; sleep 30'\r");
     tui.shows("⎇ spike");
-    tui.shows("typing into the session");
+    tui.shows("typing into");
 
     let worktree = crystal.dir.path().join("app.worktrees/spike");
     let written = written(&worktree.join("where"));
@@ -1480,17 +1492,17 @@ fn tab_takes_the_keyboard_on_to_a_split_and_its_session_gets_the_keys() {
     crystal.ok(&["new", "-n", "other", "sleep", "30"]);
 
     let mut tui = crystal.tui();
-    tui.shows("▶ reader");
+    tui.shows("▸ reader");
     tui.type_keys("s");
     tui.type_keys("j");
 
     // The first Tab goes to the selection's pane, the next to the split.
     tui.type_keys("\t");
-    tui.shows("typing into the session");
+    tui.shows("typing into");
     tui.type_keys("\x1c");
     tui.shows("q quit");
     tui.type_keys("\t");
-    tui.shows("typing into the session");
+    tui.shows("typing into");
     tui.type_keys("hello split\r");
 
     assert_eq!(written(&crystal.dir.path().join("got")), "hello split\n");
@@ -1520,18 +1532,20 @@ fn each_pane_sizes_its_own_session() {
     tui.shows("right watching");
     tui.shows("left watching");
 
-    // At 24 by 80 there are 52 columns beside the sidebar, too few to share
-    // side by side, so the panes are stacked: each 50 columns inside its
-    // border, with the 23 rows above the footer shared between them.
+    // At 24 by 80 there are 51 columns beside the sidebar, too few to share
+    // side by side, so the panes are stacked: each 51 columns wide, with
+    // the 22 rows between the top bar and the footer shared between them,
+    // less a header line each.
     eventually("the panes are stacked", || {
         let (left, right) = (size_of("left"), size_of("right"));
-        left.1 == 50 && right.1 == 50 && left.0 + right.0 + 4 == 23
+        left.1 == 51 && right.1 == 51 && left.0 + right.0 + 2 == 22
     });
 
-    // At 200 columns each pane is 86 wide, so they go side by side.
+    // At 200 columns there are 171 beside the sidebar: two panes of 85,
+    // with a rule between them, so they go side by side.
     tui.resize(30, 200);
     eventually("the panes are side by side", || {
-        size_of("left") == (27, 84) && size_of("right") == (27, 84)
+        size_of("left") == (27, 85) && size_of("right") == (27, 85)
     });
 }
 
@@ -1721,7 +1735,7 @@ fn typing_into_a_pane_brings_it_back_from_its_history() {
     let mut tui = crystal.tui();
     tui.shows("line 40");
     tui.type_keys("\r");
-    tui.shows("typing into the session");
+    tui.shows("typing into");
 
     // Shift+Page Up, as a terminal sends it.
     tui.type_keys("\x1b[5;2~");
@@ -1856,7 +1870,7 @@ fn wheel_up(column: usize, row: usize) -> String {
 /// In the harness's 80-column terminal, the pane starts after the
 /// 28-column sidebar, and its session's screen inside the pane's border.
 const PANE_SCREEN_COLUMN: usize = 29;
-const PANE_SCREEN_ROW: usize = 1;
+const PANE_SCREEN_ROW: usize = 2;
 
 #[test]
 fn the_tui_hands_the_mouse_back_to_the_terminal_when_it_quits() {
@@ -1864,7 +1878,7 @@ fn the_tui_hands_the_mouse_back_to_the_terminal_when_it_quits() {
     crystal.ok(&["new", "-n", "stays", "sleep", "30"]);
 
     let mut tui = crystal.tui();
-    tui.shows("▶ stays");
+    tui.shows("▸ stays");
     assert!(tui.sends_the_mouse());
     tui.type_keys("q");
     assert!(tui.exit());
@@ -1882,7 +1896,7 @@ fn clicking_a_session_row_selects_it() {
 
     let mut tui = crystal.tui();
     tui.shows("alpha is here");
-    let row = line_with(&tui.text(), "▶ beta");
+    let row = line_with(&tui.text(), "▸ beta");
     tui.type_keys(&click(10, row));
     tui.shows("beta is here");
 }
@@ -1893,9 +1907,9 @@ fn clicking_a_pane_hands_it_the_keyboard() {
     crystal.ok(&["new", "-n", "cat", "cat"]);
 
     let mut tui = crystal.tui();
-    tui.shows("▶ cat");
+    tui.shows("▸ cat");
     tui.type_keys(&click(50, 10));
-    tui.shows("typing into the session");
+    tui.shows("typing into");
     tui.type_keys("hello by mouse\r");
     tui.shows("hello by mouse");
 }
@@ -1923,10 +1937,10 @@ fn a_program_that_asks_for_the_mouse_gets_clicks_where_it_drew() {
     written(&crystal.dir.path().join("listening"));
 
     let mut tui = crystal.tui();
-    tui.shows("▶ mousy");
+    tui.shows("▸ mousy");
     // A program has the mouse in the pane that has the keyboard.
     tui.type_keys("\r");
-    tui.shows("typing into the session");
+    tui.shows("typing into");
     // Row 1, column 2 of the program's own screen.
     tui.type_keys(&click(PANE_SCREEN_COLUMN + 2, PANE_SCREEN_ROW + 1));
 
@@ -1994,12 +2008,12 @@ fn r_in_the_tui_renames_the_selected_session() {
     crystal.ok(&["new", "-n", "agent", "sleep", "30"]);
 
     let mut tui = crystal.tui();
-    tui.shows("▶ agent");
+    tui.shows("▸ agent");
     tui.type_keys("r");
     tui.shows("new name: agent");
     // Ctrl+U clears the old name first.
     tui.type_keys("\x15reviewer\r");
-    tui.shows("▶ reviewer");
+    tui.shows("▸ reviewer");
     assert!(crystal.row("reviewer").is_some());
 }
 
@@ -2025,7 +2039,7 @@ fn the_tui_still_knows_the_session_it_runs_in_once_renamed() {
     terminal.shows("This is the session crystal is running in.");
 
     crystal.ok(&["rename", "host", "renamed"]);
-    terminal.shows("▶ renamed");
+    terminal.shows("▸ renamed");
     terminal.shows("This is the session crystal is running in.");
 }
 
@@ -2116,7 +2130,7 @@ fn enter_on_an_ended_session_starts_it_again_once_you_say_yes() {
     });
 
     let mut tui = crystal.tui();
-    tui.shows("■ once exited 3");
+    tui.shows("■ once · exited 3");
     tui.type_keys("\r");
     tui.shows("start once again? y/n");
     tui.type_keys("y");
@@ -2166,7 +2180,7 @@ fn shift_w_removes_a_worktree_once_nothing_runs_in_it() {
     assert!(worktree.is_dir());
 
     crystal.ok(&["kill", "tests"]);
-    tui.hides("▶ tests");
+    tui.hides("▸ tests");
     tui.type_keys("W");
     tui.shows("remove worktree fix? y/n");
     tui.type_keys("y");

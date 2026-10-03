@@ -21,6 +21,19 @@ pub struct Config {
     pub notify_command: Option<String>,
     /// The command line the TUI's new-session prompt starts out with.
     pub new_session: String,
+    /// The TUI's colors.
+    pub theme: ThemeName,
+}
+
+/// The TUI's colors to choose from. `dark` and `light` paint their own
+/// background, so they look the same in any terminal; `terminal` paints
+/// nothing and keeps to the terminal's own colors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThemeName {
+    Dark,
+    Light,
+    Terminal,
 }
 
 impl Default for Config {
@@ -29,6 +42,7 @@ impl Default for Config {
             notify: true,
             notify_command: None,
             new_session: "claude".to_string(),
+            theme: ThemeName::Dark,
         }
     }
 }
@@ -104,11 +118,27 @@ mod tests {
     }
 
     #[test]
+    fn a_theme_is_chosen_by_name() {
+        assert_eq!(
+            parse("theme = \"light\"\n").unwrap().theme,
+            ThemeName::Light
+        );
+        assert_eq!(Config::default().theme, ThemeName::Dark);
+    }
+
+    #[test]
+    fn a_theme_crystal_doesnt_have_is_an_error_that_names_it() {
+        let err = parse("theme = \"neon\"\n").unwrap_err();
+        assert!(format!("{err:#}").contains("neon"), "{err:#}");
+    }
+
+    #[test]
     fn the_settings_written_out_read_back_the_same() {
         let config = Config {
             notify: false,
             notify_command: Some("say \"$CRYSTAL_NOTICE\"".into()),
             new_session: "codex --model o3".into(),
+            theme: ThemeName::Terminal,
         };
         assert_eq!(parse(&config.to_toml()).unwrap(), config);
         assert_eq!(

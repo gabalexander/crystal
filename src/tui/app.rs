@@ -229,6 +229,14 @@ impl App {
         &self.sessions
     }
 
+    /// Whether any session's agent is working, which is when the TUI keeps
+    /// drawing to turn its mark.
+    pub fn anything_working(&self) -> bool {
+        self.sessions.iter().any(|session| {
+            session.state == State::Running && session.activity == Some(Activity::Working)
+        })
+    }
+
     /// The sidebar's rows: the sessions under their projects and worktrees.
     pub fn rows(&self) -> Vec<Row> {
         groups::rows(&self.sessions)
@@ -807,6 +815,15 @@ mod tests {
             activity: Some(activity),
             ..session(name)
         }
+    }
+
+    #[test]
+    fn something_is_working_only_while_an_agent_works() {
+        let mut app = App::new(None);
+        app.set_sessions(vec![session("quiet"), doing("finished", Activity::Done)]);
+        assert!(!app.anything_working());
+        app.set_sessions(vec![session("quiet"), doing("busy", Activity::Working)]);
+        assert!(app.anything_working());
     }
 
     #[test]

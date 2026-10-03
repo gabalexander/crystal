@@ -2,10 +2,11 @@
 //! works. It's drawn from [`KEYS`], one table, so that what it says and
 //! what the README says can be checked against each other.
 
+use super::theme::Theme;
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::Stylize;
-use ratatui::text::Line;
+use ratatui::layout::{Constraint, Layout, Margin, Rect};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph};
 
 /// Where a key works, which is the heading it's listed under.
@@ -103,26 +104,41 @@ const LEFT: &[Section] = &[Section::Sidebar];
 /// The overlay's right column: everything else.
 const RIGHT: &[Section] = &[Section::Pane, Section::Question, Section::Mouse];
 
-/// Space between the two columns, and around them inside the border.
+/// Space between the two columns.
 const GAP: u16 = 2;
-const PADDING: u16 = 1;
 
-/// Draws the overlay over the middle of `area`.
-pub fn draw(frame: &mut Frame, area: Rect) {
-    let left = column(LEFT);
-    let right = column(RIGHT);
+/// Columns kept clear on each side of the overlay, inside its edge.
+const SIDE: u16 = 2;
+
+/// Draws the overlay over the middle of `area`: a panel of the theme's
+/// own, or, where the theme paints nothing, a thin frame.
+pub fn draw(frame: &mut Frame, theme: &Theme, area: Rect) {
+    let left = column(LEFT, theme);
+    let right = column(RIGHT, theme);
     let (width, height) = size(&left, &right);
     let overlay = centered(area, width, height);
 
     frame.render_widget(Clear, overlay);
-    let block = Block::bordered()
-        .title(" keys ")
-        .title_bottom(" any key closes this ")
-        .cyan();
-    let inside = block.inner(overlay);
+    let framed = theme.panel == Color::Reset;
+    let block = if framed {
+        Block::bordered().border_style(Style::new().fg(theme.rule))
+    } else {
+        Block::new()
+    };
+    let title = Style::new().fg(theme.accent).add_modifier(Modifier::BOLD);
+    let block = block
+        .style(Style::new().bg(theme.panel).fg(theme.text))
+        .title(Line::styled(" keys ", title))
+        .title_bottom(Line::styled(
+            " any key closes this ",
+            Style::new().fg(theme.muted),
+        ));
+    // The title rows are kept either way; a frame takes a column a side of
+    // the room around the columns.
+    let margin = if framed { SIDE - 1 } else { SIDE };
+    let inside = block.inner(overlay).inner(Margin::new(margin, 0));
     frame.render_widget(block, overlay);
 
-    let inside = inside.inner(ratatui::layout::Margin::new(PADDING, 0));
     let [left_area, _, right_area] = Layout::horizontal([
         Constraint::Length(widest(&left)),
         Constraint::Length(GAP),
@@ -135,7 +151,7 @@ pub fn draw(frame: &mut Frame, area: Rect) {
 
 /// The lines of one column: each section's heading, then its keys, with
 /// the keys lined up and a blank line between sections.
-fn column(sections: &[Section]) -> Vec<Line<'static>> {
+fn column(sections: &[Section], theme: &Theme) -> Vec<Line<'static>> {
     let keys: Vec<&Key> = KEYS
         .iter()
         .filter(|key| sections.contains(&key.section))
@@ -147,22 +163,24 @@ fn column(sections: &[Section]) -> Vec<Line<'static>> {
         if !lines.is_empty() {
             lines.push(Line::from(""));
         }
-        lines.push(Line::from(section.heading()).bold());
+        let heading = Style::new().fg(theme.text).add_modifier(Modifier::BOLD);
+        lines.push(Line::styled(section.heading(), heading));
         for key in keys.iter().filter(|key| key.section == section) {
             let padding = " ".repeat(label_width - width(key.label) + 2);
             lines.push(Line::from(vec![
-                key.label.cyan(),
-                padding.into(),
-                key.does.into(),
+                Span::styled(key.label, Style::new().fg(theme.accent)),
+                Span::raw(padding),
+                Span::styled(key.does, Style::new().fg(theme.text)),
             ]));
         }
     }
     lines
 }
 
-/// The overlay's size: both columns side by side, inside the border.
+/// The overlay's size: both columns side by side, the room on each side,
+/// and a row above and below for its title and how to close it.
 fn size(left: &[Line], right: &[Line]) -> (u16, u16) {
-    let width = 2 + PADDING * 2 + widest(left) + GAP + widest(right);
+    let width = SIDE * 2 + widest(left) + GAP + widest(right);
     let height = 2 + left.len().max(right.len()) as u16;
     (width, height)
 }
@@ -197,6 +215,11 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ThemeName;
+
+    fn theme() -> Theme {
+        Theme::new(ThemeName::Dark, false)
+    }
 
     /// The keys a label stands for: `j/k ↓/↑` is j, k, ↓ and ↑.
     fn keys_in(label: &str) -> Vec<String> {
@@ -246,7 +269,7 @@ mod tests {
 
     #[test]
     fn the_overlay_fits_an_80_by_24_terminal() {
-        let (width, height) = size(&column(LEFT), &column(RIGHT));
+        let (width, height) = size(&column(LEFT, &theme()), &column(RIGHT, &theme()));
         assert!(width <= 80, "the overlay is {width} columns wide");
         // The footer keeps the bottom row.
         assert!(height <= 23, "the overlay is {height} rows high");
@@ -265,7 +288,7 @@ mod tests {
 
     #[test]
     fn a_key_label_lines_up_with_the_others() {
-        let lines = column(LEFT);
+        let lines = column(LEFT, &theme());
         // Heading first, then `j/k ↓/↑`, padded out to `PageUp/PageDown`.
         let first: String = lines[1]
             .spans
