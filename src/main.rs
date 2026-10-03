@@ -14,6 +14,7 @@ mod notify;
 mod protocol;
 mod session;
 mod shell;
+mod skill;
 mod socket;
 mod state;
 mod tui;
@@ -76,7 +77,11 @@ enum Command {
     },
     /// List the sessions.
     #[command(visible_alias = "list")]
-    Ls,
+    Ls {
+        /// Print them as a JSON array, for scripts and agents.
+        #[arg(long)]
+        json: bool,
+    },
     /// Show a session in this terminal; Ctrl+\ detaches.
     #[command(visible_alias = "a")]
     Attach {
@@ -160,6 +165,17 @@ enum Command {
     /// Show where the config file is, and the settings in effect, as the
     /// file would hold them.
     Config,
+    /// Print the Claude Code skill that teaches an agent to drive crystal.
+    Skill {
+        /// Install it into Claude Code's skills, in $CLAUDE_CONFIG_DIR or
+        /// ~/.claude.
+        #[arg(long)]
+        install: bool,
+
+        /// With --install, write over a skill file that has been changed.
+        #[arg(long, requires = "install")]
+        force: bool,
+    },
     /// Run the daemon in the foreground.
     #[command(hide = true)]
     Daemon,
@@ -206,10 +222,15 @@ fn run(cli: Cli) -> Result<()> {
             command: WorktreeCommand::Rm { worktree },
         } => remove_worktree(&socket, &worktree)?,
         Command::Attach { name } => attach::run(&socket, name.as_deref())?,
-        Command::Ls => {
-            if let Some(Response::Sessions { sessions }) =
-                client::ask(&socket, &Request::List, false)?
-            {
+        Command::Ls { json } => {
+            // Without a daemon, there are no sessions.
+            let sessions = match client::ask(&socket, &Request::List, false)? {
+                Some(Response::Sessions { sessions }) => sessions,
+                _ => Vec::new(),
+            };
+            if json {
+                print_sessions_json(&sessions)?;
+            } else {
                 print_sessions(&sessions);
             }
         }
@@ -265,6 +286,13 @@ fn run(cli: Cli) -> Result<()> {
             }
         }
         Command::Config => print_config()?,
+        Command::Skill { install, force } => {
+            if install {
+                skill::install(force)?;
+            } else {
+                skill::print();
+            }
+        }
         Command::Daemon => daemon::run(&socket)?,
         Command::Hook { agent } => hook::run(&socket, &agent),
     }
@@ -325,6 +353,29 @@ fn seconds(seconds: Option<f64>) -> Option<Duration> {
 
 fn no_daemon(socket: &Path) -> Result<()> {
     bail!("no daemon is running on {}", socket.display())
+}
+
+/// A session as `ls --json` prints it: every field the daemon sends, so
+/// that a field added to the protocol shows up here too, plus `status`, the
+/// one word the STATE column shows, which is easier for a script to test
+/// than `state` and `activity` together.
+#[derive(serde::Serialize)]
+struct ListedSession<'a> {
+    #[serde(flatten)]
+    session: &'a SessionInfo,
+    status: String,
+}
+
+fn print_sessions_json(sessions: &[SessionInfo]) -> Result<()> {
+    let listed: Vec<ListedSession> = sessions
+        .iter()
+        .map(|session| ListedSession {
+            session,
+            status: status(session),
+        })
+        .collect();
+    println!("{}", serde_json::to_string_pretty(&listed)?);
+    Ok(())
 }
 
 fn print_sessions(sessions: &[SessionInfo]) {

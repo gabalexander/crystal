@@ -2175,3 +2175,63 @@ fn shift_w_removes_a_worktree_once_nothing_runs_in_it() {
         crystal.row("fixer").is_none()
     });
 }
+
+#[test]
+fn ls_json_lists_every_session_with_its_status() {
+    let crystal = Crystal::new();
+    assert_eq!(crystal.ok(&["ls", "--json"]).trim(), "[]");
+
+    crystal.ok(&["new", "-n", "worker", "sleep", "30"]);
+    crystal.ok(&["new", "-n", "quitter", "sh", "-c", "exit 3"]);
+    eventually("quitter has ended", || {
+        crystal.row("quitter").unwrap()[1] == "exited 3"
+    });
+
+    let listed: serde_json::Value = serde_json::from_str(&crystal.ok(&["ls", "--json"])).unwrap();
+    let sessions = listed.as_array().unwrap();
+    assert_eq!(sessions.len(), 2);
+    let worker = &sessions[0];
+    assert_eq!(worker["name"], "worker");
+    assert_eq!(worker["status"], "running");
+    assert_eq!(worker["state"], "running");
+    assert_eq!(worker["command"], serde_json::json!(["sleep", "30"]));
+    assert!(worker["id"].as_str().is_some_and(|id| !id.is_empty()));
+    assert!(worker["pid"].as_u64().is_some());
+    assert!(worker["cwd"].as_str().is_some());
+    assert_eq!(sessions[1]["status"], "exited 3");
+}
+
+#[test]
+fn skill_install_writes_the_skill_and_keeps_a_changed_one() {
+    let crystal = Crystal::new();
+    let claude_dir = crystal.dir.path().join("claude-config");
+    let install = |args: &[&str]| {
+        crystal
+            .command(args)
+            .env("CLAUDE_CONFIG_DIR", &claude_dir)
+            .output()
+            .unwrap()
+    };
+    let skill_file = claude_dir.join("skills/crystal/SKILL.md");
+    let printed = crystal.ok(&["skill"]);
+    assert!(printed.starts_with("---\nname: crystal\n"));
+
+    let out = install(&["skill", "--install"]);
+    assert!(out.status.success());
+    assert_eq!(std::fs::read_to_string(&skill_file).unwrap(), printed);
+    let said = String::from_utf8_lossy(&out.stdout);
+    assert!(said.contains(skill_file.to_str().unwrap()), "{said}");
+
+    // Changed by the user, it's kept unless they say otherwise.
+    std::fs::write(&skill_file, "my own notes\n").unwrap();
+    let refused = install(&["skill", "--install"]);
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("--force"));
+    assert_eq!(
+        std::fs::read_to_string(&skill_file).unwrap(),
+        "my own notes\n"
+    );
+
+    assert!(install(&["skill", "--install", "--force"]).status.success());
+    assert_eq!(std::fs::read_to_string(&skill_file).unwrap(), printed);
+}
