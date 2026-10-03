@@ -71,6 +71,12 @@ pub fn project_dirs(socket: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
+/// Where the daemon at `socket` keeps the files kept with the task numbered
+/// `task`: a directory of its own, beside the database.
+pub fn task_dir(socket: &Path, task: u64) -> PathBuf {
+    kept(socket, "tasks", "tasks").join(format!("t{task}"))
+}
+
 /// Where the daemon at `socket` keeps the logs of the plugins it runs.
 pub fn plugins_dir(socket: &Path) -> PathBuf {
     kept(socket, "plugins", "plugins")

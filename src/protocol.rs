@@ -93,6 +93,20 @@ pub enum Request {
         name: Option<String>,
         failed: bool,
         summary: String,
+        /// Files in the session's worktree to keep with the task, by their
+        /// absolute paths: the daemon checks and copies them itself.
+        #[serde(default)]
+        artifacts: Vec<PathBuf>,
+    },
+    /// Add a note to the handoff file of a session's worktree, for the
+    /// sessions after it there. `id` and `name` say which session, as for
+    /// [`Request::Close`].
+    Handoff {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(default)]
+        name: Option<String>,
+        note: String,
     },
     /// Have the distiller read what the session called `name` did, now,
     /// and keep what a later session would need in its project's memory.
@@ -222,6 +236,11 @@ pub enum Request {
     /// Run the step that stopped the run called `run` again: it failed, or
     /// a restart cut it short.
     RetryFlow {
+        run: String,
+    },
+    /// Cancel the run called `run`: its step's open task is cancelled and
+    /// its session stopped, and the run goes no further.
+    CancelFlow {
         run: String,
     },
     /// What's on a session's screen, as text.
@@ -681,6 +700,9 @@ pub struct TaskRecord {
     /// `None` while it's open.
     #[serde(default)]
     pub outcome: Option<TaskOutcome>,
+    /// The files kept with it as it closed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifacts: Vec<Artifact>,
 }
 
 impl TaskRecord {
@@ -722,6 +744,43 @@ impl TaskView {
             asking: None,
             cost_usd: None,
         }
+    }
+}
+
+/// A file kept with a task as it closed: copied out of its worktree into
+/// crystal's state directory, so it outlives the worktree.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Artifact {
+    pub kind: ArtifactKind,
+    /// The copy's name, which is the file's own unless two had one name.
+    pub name: String,
+    /// Where the copy is.
+    pub path: PathBuf,
+    pub bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactKind {
+    /// A file `crystal done --artifact` named.
+    File,
+    /// The worktree's handoff file as it was when the task closed.
+    Handoff,
+}
+
+impl ArtifactKind {
+    pub fn word(self) -> &'static str {
+        match self {
+            ArtifactKind::File => "file",
+            ArtifactKind::Handoff => "handoff",
+        }
+    }
+
+    /// The kind called `word`, as [`ArtifactKind::word`] says it.
+    pub fn named(word: &str) -> Option<ArtifactKind> {
+        [ArtifactKind::File, ArtifactKind::Handoff]
+            .into_iter()
+            .find(|kind| kind.word() == word)
     }
 }
 

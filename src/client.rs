@@ -183,6 +183,7 @@ pub fn close_task(socket: &Path, name: &str, failed: bool, summary: &str) -> Res
         name: Some(name.to_string()),
         failed,
         summary: summary.to_string(),
+        artifacts: Vec::new(),
     };
     ask_running(socket, &request)?;
     Ok(())

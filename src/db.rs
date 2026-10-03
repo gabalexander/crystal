@@ -20,7 +20,7 @@
 use crate::backlog;
 use crate::events::{Event, Since};
 use crate::flow_run::FlowRun;
-use crate::protocol::{BacklogItem, PendingTask, TaskOutcome, TaskRecord};
+use crate::protocol::{Artifact, ArtifactKind, BacklogItem, PendingTask, TaskOutcome, TaskRecord};
 use crate::state::{self, SavedSession};
 use crate::tasks;
 use anyhow::{Context, Result};
@@ -154,10 +154,27 @@ CREATE TABLE events (
 CREATE INDEX events_at ON events(at);
 ";
 
+/// The files kept with tasks as they closed: each under its task's number
+/// and the name of its copy, which is unique in the task's directory; what
+/// it is (`file` or `handoff`), where the copy is, how big, and when it was
+/// kept. A task that closes again, a background task given a follow-up,
+/// keeps its handoff file again in the same row.
+const ARTIFACTS: &str = "
+CREATE TABLE task_artifacts (
+  task  INTEGER NOT NULL,
+  name  TEXT NOT NULL,
+  kind  TEXT NOT NULL,
+  path  TEXT NOT NULL,
+  bytes INTEGER NOT NULL,
+  kept  INTEGER NOT NULL,
+  PRIMARY KEY (task, name)
+);
+";
+
 /// What makes the database as it is now, a step for each version: a
 /// database at version `v`, kept in its `user_version`, takes the steps
 /// after the first `v`.
-const MIGRATIONS: &[&str] = &[TABLES, TASK_STATES, EVENTS];
+const MIGRATIONS: &[&str] = &[TABLES, TASK_STATES, EVENTS, ARTIFACTS];
 
 /// The file each project kept its backlog in before the database.
 const OLD_BACKLOG: &str = "backlog.json";
@@ -169,6 +186,7 @@ const TASK_COLUMNS: &str = "project_name, goal, session, branch, background, bac
                             summary, closed, number, created, cancelled";
 const PENDING_COLUMNS: &str = "number, goal, cwd, name, start, backlog, created";
 const ITEM_COLUMNS: &str = "number, text, tags, done, created, closed";
+const ARTIFACT_COLUMNS: &str = "kind, name, path, bytes";
 
 /// The database of the daemon at `socket`, open.
 pub struct Db {
@@ -347,6 +365,36 @@ impl Db {
             params![number],
         )?;
         Ok(removed > 0)
+    }
+
+    /// Keeps `artifact` with the task numbered `task`, at `kept`, in place
+    /// of one of the same name.
+    pub fn add_artifact(&self, task: u64, artifact: &Artifact, kept: u64) -> Result<()> {
+        self.conn.execute(
+            &format!(
+                "INSERT OR REPLACE INTO task_artifacts (task, {ARTIFACT_COLUMNS}, kept) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
+            ),
+            params![
+                task,
+                artifact.kind.word(),
+                artifact.name,
+                artifact.path.to_string_lossy(),
+                artifact.bytes,
+                kept,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// The files kept with the task numbered `task`, in the order they
+    /// were kept.
+    pub fn artifacts(&self, task: u64) -> Result<Vec<Artifact>> {
+        let mut statement = self.conn.prepare(&format!(
+            "SELECT {ARTIFACT_COLUMNS} FROM task_artifacts WHERE task = ?1 ORDER BY kept, rowid"
+        ))?;
+        let rows = statement.query_map(params![task], |row| Ok(artifact_of(row)))?;
+        readable(rows, "a kept file")
     }
 
     /// What background tasks spent on `day`, like `2026-10-03`.
@@ -795,6 +843,17 @@ fn task_of(row: &Row) -> Result<TaskRecord> {
         waiting: false,
         created: row.get(10)?,
         outcome,
+        artifacts: Vec::new(),
+    })
+}
+
+fn artifact_of(row: &Row) -> Result<Artifact> {
+    let kind: String = row.get(0)?;
+    Ok(Artifact {
+        kind: ArtifactKind::named(&kind).with_context(|| format!("no kind of file is {kind}"))?,
+        name: row.get(1)?,
+        path: PathBuf::from(row.get::<_, String>(2)?),
+        bytes: row.get(3)?,
     })
 }
 
@@ -911,9 +970,11 @@ mod tests {
                 name: "plan".into(),
                 profile: None,
                 prompt: "Plan {goal}".into(),
+                placement: None,
                 worktree: false,
                 gate: true,
                 back_to: None,
+                max_rounds: None,
             }],
         };
         let env = BTreeMap::from([("TOKEN".to_string(), "secret".to_string())]);
@@ -943,6 +1004,7 @@ mod tests {
             waiting: false,
             created: 1,
             outcome: Some(TaskOutcome::new(TaskState::Done, "did it", at)),
+            artifacts: Vec::new(),
         }
     }
 
@@ -1138,6 +1200,36 @@ mod tests {
         assert!(!other.remove_pending_task(2).unwrap());
         assert_eq!(db.pending_task(2).unwrap(), None);
         assert_eq!(db.new_task_number().unwrap(), 4);
+    }
+
+    #[test]
+    fn a_tasks_kept_files_come_back_in_the_order_they_were_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&socket_in(&dir)).unwrap();
+        assert!(db.artifacts(12).unwrap().is_empty());
+        let artifact = |kind, name: &str, bytes| Artifact {
+            kind,
+            name: name.into(),
+            path: PathBuf::from("/state/tasks/t12").join(name),
+            bytes,
+        };
+        db.add_artifact(12, &artifact(ArtifactKind::File, "plan.md", 10), 1)
+            .unwrap();
+        db.add_artifact(12, &artifact(ArtifactKind::Handoff, "handoff.md", 20), 2)
+            .unwrap();
+        db.add_artifact(13, &artifact(ArtifactKind::File, "other.md", 30), 2)
+            .unwrap();
+        // Closing again keeps the handoff file again, in its place.
+        db.add_artifact(12, &artifact(ArtifactKind::Handoff, "handoff.md", 25), 3)
+            .unwrap();
+        let kept = db.artifacts(12).unwrap();
+        assert_eq!(
+            kept,
+            [
+                artifact(ArtifactKind::File, "plan.md", 10),
+                artifact(ArtifactKind::Handoff, "handoff.md", 25)
+            ]
+        );
     }
 
     #[test]

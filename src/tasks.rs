@@ -32,6 +32,11 @@ pub fn ensure_enabled(config: &Config) -> Result<()> {
     plugins::ensure_enabled(config, "tasks")
 }
 
+/// The most a prompt crystal puts together to start an agent may be: a flow
+/// step's, or what an agent is told on top of its task. It may go on the
+/// agent's command line, so it's kept well within what one can hold.
+pub const MAX_PROMPT_BYTES: usize = 16 * 1024;
+
 /// What an agent given a task is told about it: how to close it, and, with
 /// `backlog` on, where to put what it notices for later.
 pub fn instructions(backlog: bool) -> String {
@@ -79,6 +84,7 @@ pub fn pending_record(task: &PendingTask) -> TaskRecord {
         waiting: false,
         created: task.created,
         outcome: None,
+        artifacts: Vec::new(),
     }
 }
 

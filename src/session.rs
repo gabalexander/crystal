@@ -441,6 +441,7 @@ impl Session {
             waiting: goal.waiting,
             created: goal.created,
             outcome: goal.outcome.clone(),
+            artifacts: Vec::new(),
         })
     }
 

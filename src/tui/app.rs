@@ -2862,8 +2862,8 @@ impl App {
                 self.notify(format!("{} is still running", run.name));
                 None
             }
-            RunState::Done => {
-                self.notify(format!("{} is done", run.name));
+            RunState::Done | RunState::Cancelled => {
+                self.notify(format!("{} is {}", run.name, run.state().word()));
                 None
             }
         }
@@ -3076,7 +3076,7 @@ impl App {
             .cloned()
             .map(Run::Profile)
             .collect();
-        // A flow's steps are Claude Code's background tasks.
+        // A flow's steps run Claude Code unless their profiles say otherwise.
         let has_claude = self.agents.iter().any(|agent| agent.program == "claude");
         if self.flows_on && has_claude {
             runs.extend(self.flow_defs.iter().cloned().map(Run::Flow));

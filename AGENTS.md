@@ -184,25 +184,34 @@ is: it's the one request every version must understand.
   which server a socket is, however it's spelled and whoever starts its daemon, so the same socket always gets
   the same state
 - `src/state.rs`: where the daemon's state is: a server's directory in the state dir (the default server's is
-  the state dir itself), or beside a socket given by its path; the database, and the files kept before it (the
-  sessions, the flow runs, each project's directory); a running session as it's written down to start it again
+  the state dir itself), or beside a socket given by its path; the database, the directory of the files each
+  task kept, and the files kept before the database (the sessions, the flow runs, each project's directory); a
+  running session as it's written down to start it again
 - `src/server_cli.rs`: `crystal server`: every server with whether it's running and how many sessions it has,
   stopping one, and deleting a stopped one's state
 - `src/db.rs`: the SQLite database the daemon and the TUI keep their state in (WAL, `synchronous=NORMAL`,
   migrations by `user_version`, as docket does): the sessions to start again, flow runs, each project's backlog
-  and closed tasks, the tasks waiting to start and the last task number, what background tasks spent each day,
-  the event log, and the TUI's tabs, layouts, the new-session panel's memory and the diff view's reviewed
-  marks, each a JSON document; and
-  bringing in the JSON files from before, a project's the first time it's asked for. Settings stay in the
-  config file and memory in `memory.db`
+  and closed tasks, the files tasks kept, the tasks waiting to start and the last task number, what background
+  tasks spent each day, the event log, and the TUI's tabs, layouts, the new-session panel's memory and the diff
+  view's reviewed marks, each a JSON document; and bringing in the JSON files from before, a project's the first
+  time it's asked for. Settings stay in the config file and memory in `memory.db`
 - `src/project.rs`: the project a directory is in: its git main worktree, or the directory itself outside git
 - `src/tasks.rs`: tasks, sessions started with something to do: the paragraph an agent is told about
   `crystal done`, the reminder for one that ends a turn with its task open, reading a project's closed tasks
   from the file they were kept in before the database, numbering tasks (`t12`) and showing a task waiting to
-  start, and `enabled`, the one gate everything tasks add goes through
+  start, the most a prompt crystal puts together may be, and `enabled`, the one gate everything tasks add goes
+  through
+- `src/handoff.rs`: the handoff file, `.crystal/handoff.md` at the top of a git worktree: a note's heading and
+  tidying, adding a section and letting the oldest go past the cap, the `.gitignore` beside it unless the config
+  keeps a project's notes in git, the end of the file read for an agent starting there and the rule it's told,
+  and `enabled`, the one gate everything it adds goes through; the daemon is its only writer
+- `src/artifacts.rs`: the files a task keeps as it closes (`crystal done --artifact`): checking each is a small
+  file in the task's worktree, copying them into the task's directory in the state directory under names of
+  their own, and keeping the worktree's handoff file there too
 - `src/backlog.rs`: a project's backlog, numbered items kept in the database by the daemon alone, its
   markdown export, and `enabled`, the one gate everything the backlog adds goes through
-- `src/work.rs`: `crystal done`, `tasks` and its commands (`new`, `start`, `show`, `cancel`, `log`), and `backlog`
+- `src/work.rs`: `crystal done` (with `--artifact`), `handoff`, `tasks` and its commands (`new`, `start`, `show`,
+  `cancel`, `log`), and `backlog`
 - `src/config.rs`: the settings in `~/.config/crystal/config.toml`, read and checked
 - `src/memory.rs`: what a project's sessions learned: the SQLite store in the state directory with its FTS5
   index (bm25, prefix and porter-stemmed words), each entry's vector and search by meaning merged with it by
@@ -225,12 +234,15 @@ is: it's the one request every version must understand.
   entry in full as `show` and the `memory_show` tool print it
 - `src/profile.rs`: agent profiles: what one runs, checking it, and saving or removing one in the config file
   with `toml_edit`, so the user's comments and layout stay; `enabled` is the one switch for the feature
-- `src/flows.rs`: flows, chains of background tasks on one goal: the `[[flow]]` tables in the config file,
-  checking them, filling in a step's prompt, the example `crystal flow example` prints, and `enabled`, the one
-  gate everything flows add goes through
-- `src/flow_run.rs`: a flow run and how it changes as its steps end and the user answers its gates, kept apart
-  from I/O, so it's unit-tested; the daemon starts the steps and writes the runs down in the database
-- `src/flow_cli.rs`: `crystal flow` and its commands
+- `src/flows.rs`: flows, chains of tasks on one goal: the `[[flow]]` tables in the config file and in a project's
+  `.crystal/flows.toml`, which take the place of the config's of the same name, checking them, where a step is
+  placed, filling in a step's prompt and cutting it to fit, a goal's slug, the example `crystal flow example`
+  prints, and `enabled`, the one gate everything flows add goes through
+- `src/flow_run.rs`: a flow run and how it changes as its steps end, the user answers its gates (within their
+  rounds) and cancels it; where each step runs, what it's asked, and whether it runs in the background or, on
+  an agent other than Claude Code, in a terminal; kept apart from I/O, so it's unit-tested; the daemon starts
+  the steps and writes the runs down in the database
+- `src/flow_cli.rs`: `crystal flow` and its commands, `cancel` and `defs` among them
 - `src/notify.rs`: telling the user when a session needs them: desktop notifications, or their own command
 - `src/plugins.rs`: plugins: the registry of crystal's own, `enabled`, the gate every one of them goes through
   (each module's `enabled` asks it), finding installed plugins, switching one in the config's `[plugins]` with

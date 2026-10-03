@@ -1,5 +1,6 @@
 mod agent_screen;
 mod agents;
+mod artifacts;
 mod attach;
 mod backlog;
 mod catalog;
@@ -23,6 +24,7 @@ mod flows;
 mod forge;
 mod front;
 mod git;
+mod handoff;
 mod hook;
 mod keys;
 mod markdown;
@@ -135,9 +137,28 @@ enum Command {
         #[arg(long)]
         failed: bool,
 
+        /// A file in the session's worktree to keep with the task, copied
+        /// into crystal's state directory. Can be given more than once.
+        #[arg(long = "artifact", value_name = "PATH")]
+        artifacts: Vec<PathBuf>,
+
         /// What was done, or why it couldn't be. Several words are joined
         /// with spaces.
         summary: Vec<String>,
+    },
+    /// Leave a note for the sessions that work in this worktree after
+    /// this one, in its `.crystal/handoff.md`: every agent started there is
+    /// told to read it.
+    Handoff {
+        /// The session whose worktree it's for [default: the one this runs
+        /// in]
+        #[arg(short, long)]
+        name: Option<String>,
+
+        /// What the next session should know. Several words are joined
+        /// with spaces.
+        #[arg(required = true)]
+        note: Vec<String>,
     },
     /// List the tasks of the project this directory is in: those still
     /// open, then those waiting to start, then those closed, the latest
@@ -230,8 +251,9 @@ enum Command {
         #[arg(last = true, value_name = "CLAUDE ARGS")]
         claude_args: Vec<String>,
     },
-    /// Run flows: chains of background tasks on one goal, from the config
-    /// file's `[[flow]]` tables. With no command, lists the runs.
+    /// Run flows: chains of tasks on one goal, from the config file's
+    /// `[[flow]]` tables and the project's `.crystal/flows.toml`. With no
+    /// command, lists the runs.
     Flow {
         /// With no command: print the runs as JSON.
         #[arg(long)]
@@ -616,7 +638,7 @@ enum MemoryCommand {
 enum FlowCommand {
     /// Start a run of a flow on a goal. Prints the run's name.
     Run {
-        /// The flow, by its name in the config file.
+        /// The flow, by its name: the project's own, or the config file's.
         flow: String,
 
         /// What the flow is to do: `{goal}` in its steps' prompts. Several
@@ -655,6 +677,16 @@ enum FlowCommand {
     /// Run the step that stopped a run again: it failed, or a restart cut it
     /// short.
     Retry { run: String },
+    /// Cancel a run: the task of the step it's at is cancelled and its
+    /// session stopped, and the run goes no further.
+    Cancel { run: String },
+    /// List the flows a run started here would find, and where each is
+    /// written: the config file, or the project's `.crystal/flows.toml`.
+    Defs {
+        /// The project's directory [default: the current one]
+        #[arg(short = 'C', long = "dir", value_name = "DIR")]
+        dir: Option<PathBuf>,
+    },
     /// Wait until a run stops running, at a gate or at its end, and print
     /// which. A step that failed or was cut short is an error.
     Wait {
@@ -819,8 +851,10 @@ fn run(cli: Cli) -> Result<()> {
         Command::Done {
             name,
             failed,
+            artifacts,
             summary,
-        } => work::done(&socket, name, failed, &summary.join(" "))?,
+        } => work::done(&socket, name, failed, &summary.join(" "), artifacts)?,
+        Command::Handoff { name, note } => work::handoff(&socket, name, &note.join(" "))?,
         Command::Tasks {
             all,
             dir,
@@ -1248,6 +1282,8 @@ fn flow(socket: &Path, json: bool, command: Option<FlowCommand>) -> Result<()> {
         Some(FlowCommand::Approve { run }) => flow_cli::approve(socket, &run),
         Some(FlowCommand::Back { run, notes }) => flow_cli::back(socket, &run, &notes.join(" ")),
         Some(FlowCommand::Retry { run }) => flow_cli::retry(socket, &run),
+        Some(FlowCommand::Cancel { run }) => flow_cli::cancel(socket, &run),
+        Some(FlowCommand::Defs { dir }) => flow_cli::defs(&here(dir)?),
         Some(FlowCommand::Wait { run, timeout }) => flow_cli::wait(socket, &run, seconds(timeout)),
         Some(FlowCommand::Example) => {
             flow_cli::example();

@@ -411,9 +411,11 @@ mod tests {
             name: name.into(),
             profile: None,
             prompt: "x".into(),
+            placement: None,
             worktree: false,
             gate: false,
             back_to: None,
+            max_rounds: None,
         };
         let flow = Flow {
             name: "ship".into(),

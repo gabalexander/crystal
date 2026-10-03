@@ -6712,6 +6712,174 @@ fn a_task_whose_session_ends_with_it_open_fails_saying_how() {
 }
 
 #[test]
+fn a_handoff_note_stays_in_the_worktree_and_the_next_agent_there_is_told_of_it() {
+    let crystal = Crystal::new();
+    let dir = crystal.dir.path();
+    let repo = git_repo(dir, "app");
+    let repo_arg = repo.to_str().unwrap();
+    crystal.ok(&[
+        "new",
+        "-d",
+        "-n",
+        "porter",
+        "-c",
+        repo_arg,
+        "-t",
+        "port the codec",
+        "sleep",
+        "30",
+    ]);
+    crystal.ok(&[
+        "handoff",
+        "-n",
+        "porter",
+        "The fixtures live in tests/fixtures;",
+        "cargo test codec runs them",
+    ]);
+    let file = repo.join(".crystal/handoff.md");
+    let notes = std::fs::read_to_string(&file).unwrap();
+    let heading = notes.lines().next().unwrap();
+    assert!(
+        heading.starts_with("## 20") && heading.ends_with(" · porter · task \"port the codec\""),
+        "{notes}"
+    );
+    assert!(
+        notes.contains("\nThe fixtures live in tests/fixtures; cargo test codec runs them\n"),
+        "{notes}"
+    );
+    // Kept out of git.
+    assert_eq!(git(&repo, &["status", "--porcelain"]), "");
+
+    // Closing the task adds how it went.
+    crystal.ok(&["done", "-n", "porter", "ported", "it"]);
+    let notes = std::fs::read_to_string(&file).unwrap();
+    assert!(
+        notes.contains(" · porter · task \"port the codec\" done\nported it\n"),
+        "{notes}"
+    );
+
+    // The next agent there is told to read them, and what they say.
+    let bin = fake_claude(dir);
+    let out = crystal
+        .command(&["new", "-d", "-n", "next", "-c", repo_arg, "claude"])
+        .env("PATH", path_of(&[&bin]))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let args = written(&repo.join("args"));
+    assert!(
+        args.contains("This worktree has notes left by the sessions before you"),
+        "{args}"
+    );
+    assert!(args.contains("crystal handoff \"<note>\""), "{args}");
+    assert!(args.contains("cargo test codec runs them"), "{args}");
+    assert!(args.contains("ported it"), "{args}");
+
+    let logged = events(&crystal, &["-k", "handoff.added"]);
+    assert_eq!(logged.len(), 2);
+    assert_eq!(logged[1]["handoff"]["note"], "ported it");
+    assert_eq!(logged[1]["session"]["name"], "porter");
+
+    // Outside git there's no worktree to keep notes in, and an empty note
+    // is no note.
+    crystal.ok(&["new", "-d", "-n", "loose", "sleep", "30"]);
+    let err = crystal.fails(&["handoff", "-n", "loose", "x"]);
+    assert!(err.contains("loose isn't in a git worktree"), "{err}");
+    let err = crystal.fails(&["handoff", "-n", "porter", " "]);
+    assert!(err.contains("the note is empty"), "{err}");
+}
+
+#[test]
+fn done_keeps_the_files_it_names_with_the_task_and_refuses_one_outside_its_worktree() {
+    let crystal = Crystal::new();
+    let dir = crystal.dir.path();
+    let repo = git_repo(dir, "app");
+    let repo_arg = repo.to_str().unwrap();
+    std::fs::create_dir(repo.join("docs")).unwrap();
+    std::fs::write(repo.join("docs/plan.md"), "the plan\n").unwrap();
+    let outside = dir.join("elsewhere.md");
+    std::fs::write(&outside, "not here\n").unwrap();
+    crystal.ok(&[
+        "new",
+        "-d",
+        "-n",
+        "planner",
+        "-c",
+        repo_arg,
+        "-t",
+        "write the plan",
+        "sleep",
+        "30",
+    ]);
+    crystal.ok(&["handoff", "-n", "planner", "the plan is in docs"]);
+
+    let refused = crystal.fails(&[
+        "done",
+        "-n",
+        "planner",
+        "--artifact",
+        outside.to_str().unwrap(),
+        "wrote it",
+    ]);
+    assert!(
+        refused.contains("isn't in the task's worktree") && refused.contains("still open"),
+        "{refused}"
+    );
+    assert_eq!(crystal.row("planner").unwrap()[8], "write the plan");
+
+    // A path is taken from where the command runs.
+    let out = crystal
+        .command(&[
+            "done",
+            "-n",
+            "planner",
+            "--artifact",
+            "docs/plan.md",
+            "wrote",
+            "it",
+        ])
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let kept = crystal.socket.with_extension("tasks").join("t1");
+    assert_eq!(written(&kept.join("plan.md")), "the plan\n");
+    let handoff = std::fs::read_to_string(kept.join("handoff.md")).unwrap();
+    assert!(
+        handoff.contains("the plan is in docs") && handoff.contains("done\nwrote it\n"),
+        "{handoff}"
+    );
+
+    let show = crystal.ok(&["tasks", "show", "t1"]);
+    assert!(show.contains("  kept      "), "{show}");
+    assert!(show.contains("t1/plan.md (9 bytes)\n"), "{show}");
+    assert!(show.contains("t1/handoff.md ("), "{show}");
+    let listed: serde_json::Value =
+        serde_json::from_str(&crystal.ok(&["tasks", "--json", "-C", repo_arg])).unwrap();
+    let artifacts = &listed[0]["artifacts"];
+    assert_eq!(artifacts[0]["kind"], "file");
+    assert_eq!(artifacts[0]["name"], "plan.md");
+    assert_eq!(artifacts[0]["bytes"], 9);
+    assert_eq!(artifacts[1]["kind"], "handoff");
+
+    let logged = events(&crystal, &["-k", "task.artifact"]);
+    let names: Vec<&str> = logged
+        .iter()
+        .map(|event| event["artifact"]["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["plan.md", "handoff.md"]);
+    assert_eq!(logged[0]["task"]["id"], 1);
+}
+
+#[test]
 fn the_backlog_numbers_items_and_ticks_them_off() {
     let crystal = Crystal::new();
     let repo = git_repo(crystal.dir.path(), "shop");
@@ -7184,7 +7352,7 @@ fn with_github_switched_off_gh_is_never_asked_until_it_s_on_again() {
     // Switched on in the plugins view, it's asked straight away.
     tui.type_keys("X");
     tui.shows("crystal's own");
-    tui.type_keys("jjjj ");
+    tui.type_keys("jjjjj ");
     tui.shows("● github");
     eventually("gh is asked about pull requests", || {
         std::fs::read_to_string(&calls).is_ok_and(|calls| calls.contains("pr list"))
@@ -7462,11 +7630,11 @@ command = ["sh", "show.sh"]
     crystal.ok(&["plugin", "enable", "board"]);
 
     let mut tui = crystal.tui();
-    // Down past crystal's own seven, to the pane under board.
+    // Down past crystal's own eight, to the pane under board.
     let open = |tui: &mut Terminal| {
         tui.type_keys("X");
         tui.shows("installed");
-        tui.type_keys("jjjjjjjj\r");
+        tui.type_keys("jjjjjjjjj\r");
         tui.shows("the board says hi");
         tui.shows("board · The board");
     };
@@ -8039,6 +8207,165 @@ fn with_the_flows_plugin_off_its_commands_say_so() {
     assert!(!out.status.success());
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("the flows plugin is off"), "{err}");
+}
+
+#[test]
+fn cancelling_a_flow_cancels_its_steps_task_and_it_goes_no_further() {
+    let crystal = Crystal::new();
+    crystal.configure(FLOWS);
+    let dir = crystal.dir.path();
+    let path = path_with(&flow_claude(dir));
+    assert_eq!(
+        flow_ok(&crystal, &path, &["pair", "SLOW", "down"]),
+        "pair-1\n"
+    );
+    runs(dir, 1);
+
+    crystal.ok(&["flow", "cancel", "pair-1"]);
+    let err = crystal.fails(&["flow", "wait", "pair-1"]);
+    assert!(err.contains("cancelled at plan"), "{err}");
+    let show = crystal.ok(&["flow", "show", "pair-1"]);
+    assert!(show.contains("pair-1 · pair · cancelled at plan"), "{show}");
+    eventually("the step's task is cancelled", || {
+        let tasks = crystal.ok(&["tasks"]);
+        tasks.contains("cancelled") && tasks.contains("pair-1 plan: SLOW down")
+    });
+    assert_ne!(status(&crystal, "pair-1-plan"), "working");
+
+    let again = crystal.fails(&["flow", "cancel", "pair-1"]);
+    assert!(again.contains("pair-1 is cancelled already"), "{again}");
+    let retried = crystal.fails(&["flow", "retry", "pair-1"]);
+    assert!(
+        retried.contains("only a failed or interrupted step"),
+        "{retried}"
+    );
+    let ended = events(&crystal, &["-k", "flow.ended"]);
+    assert_eq!(ended[0]["flow"]["state"], "cancelled");
+    assert_eq!(ended[0]["flow"]["step"], "plan");
+}
+
+#[test]
+fn a_projects_own_flows_run_and_defs_says_where_each_is_written() {
+    let crystal = Crystal::new();
+    crystal.configure(FLOWS);
+    let dir = crystal.dir.path();
+    let repo = git_repo(dir, "app");
+    let repo_arg = repo.to_str().unwrap();
+    std::fs::create_dir(repo.join(".crystal")).unwrap();
+    std::fs::write(
+        repo.join(".crystal/flows.toml"),
+        "[[flow]]\nname = \"pair\"\n\n[[flow.step]]\nname = \"only\"\n\
+         prompt = \"Just {goal} as {slug}, round {round}\"\n",
+    )
+    .unwrap();
+
+    let defs = crystal.ok(&["flow", "defs", "-C", repo_arg]);
+    let line = |name: &str| {
+        let found = defs
+            .lines()
+            .find(|line| line.starts_with(&format!("{name} ")));
+        found
+            .unwrap_or_else(|| panic!("no {name} in {defs}"))
+            .to_string()
+    };
+    assert!(defs.starts_with("FLOW "), "{defs}");
+    let pair = line("pair");
+    assert!(
+        pair.contains(" only ") && pair.ends_with("app/.crystal/flows.toml"),
+        "{defs}"
+    );
+    let ship = line("ship");
+    assert!(
+        ship.contains("plan → build → review") && ship.ends_with("crystal/config.toml"),
+        "{defs}"
+    );
+
+    let path = path_with(&flow_claude(dir));
+    let out = flow_ok(
+        &crystal,
+        &path,
+        &["pair", "add retries", "-c", repo_arg, "--wait"],
+    );
+    assert_eq!(out, "pair-1\ndone\n");
+    let runs = runs(dir, 1);
+    assert!(
+        runs[0].ends_with(" -- Just add retries as add-retries, round 1|"),
+        "{}",
+        runs[0]
+    );
+}
+
+/// A stand-in for Codex in a flow's step: it writes down what it was
+/// asked, closes its task with `crystal done` as it was told to, and waits.
+fn finishing_codex(dir: &Path) -> PathBuf {
+    let bin = dir.join("codex-bin");
+    std::fs::create_dir(&bin).unwrap();
+    script(
+        &bin.join("codex"),
+        &format!(
+            "printf '%s\\n' \"$@\" > codex-args.new && mv codex-args.new codex-args\n\
+             {CRYSTAL} done \"built it in a terminal\"\n\
+             sleep 30\n"
+        ),
+    );
+    bin
+}
+
+#[test]
+fn a_step_on_another_agent_runs_in_a_terminal_and_ends_as_its_task_closes() {
+    let crystal = Crystal::new();
+    crystal.configure(
+        r#"
+notify = false
+
+[plugins]
+memory = false
+
+[[profile]]
+name = "coder"
+agent = "codex"
+
+[[flow]]
+name = "mixed"
+
+[[flow.step]]
+name = "plan"
+prompt = "Plan {goal}"
+
+[[flow.step]]
+name = "build"
+profile = "coder"
+prompt = "Build {goal} following {plan.summary}"
+"#,
+    );
+    let dir = crystal.dir.path();
+    let path = format!(
+        "{}:{}",
+        finishing_codex(dir).display(),
+        path_with(&flow_claude(dir))
+    );
+    let out = flow_ok(&crystal, &path, &["mixed", "add retries", "--wait"]);
+    assert_eq!(out, "mixed-1\ndone\n");
+
+    // Codex was asked its step's prompt, and told how to close its task in
+    // its developer instructions.
+    let args = written(&dir.join("codex-args"));
+    assert!(
+        args.ends_with("\n--\nBuild add retries following answer 1\n"),
+        "{args}"
+    );
+    assert!(
+        args.starts_with("-c\ndeveloper_instructions=") && args.contains("crystal done"),
+        "{args}"
+    );
+    let listed: serde_json::Value = serde_json::from_str(&crystal.ok(&["flow", "--json"])).unwrap();
+    assert_eq!(listed[0]["steps"][1]["answer"], "built it in a terminal");
+    assert_eq!(listed[0]["steps"][1]["session"], "mixed-1-build");
+    let tasks = crystal.ok(&["tasks"]);
+    assert!(
+        tasks.contains("mixed-1 build: add retries — built it in a terminal"),
+        "{tasks}"
+    );
 }
 
 /// The events `crystal events --json` prints with `args`, each one parsed.

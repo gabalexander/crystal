@@ -3,6 +3,7 @@
 //! client goes away.
 
 use crate::agents;
+use crate::artifacts;
 use crate::backlog;
 use crate::catalog;
 use crate::codex;
@@ -13,24 +14,25 @@ use crate::embed;
 use crate::env;
 use crate::event_log::{self, Bus, Subscription};
 use crate::events::{Event, Filter, Kind, Since};
-use crate::flow_run::{self, Ended, FlowRun, Next, RunState, StepState};
+use crate::flow_run::{self, Ended, FlowRun, Next, Place, RunState, StepState};
 use crate::flows;
 use crate::git;
+use crate::handoff;
 use crate::mcp;
 use crate::memory::{self, Added};
 use crate::notify::{self, Notice};
 use crate::plugin_hooks;
 use crate::project;
 use crate::protocol::{
-    self, Activity, AgentEvent, Backlog, Conversation, Frame, NewSession, NewTask, PendingTask,
-    Request, Response, State, TaskInfo, TaskOutcome, TaskRecord, TaskSpec, TaskStart, TaskState,
-    TaskView,
+    self, Activity, AgentEvent, Artifact, ArtifactKind, Backlog, Conversation, Frame, NewSession,
+    NewTask, PendingTask, Request, Response, SessionInfo, State, TaskInfo, TaskOutcome, TaskRecord,
+    TaskSpec, TaskStart, TaskState, TaskView,
 };
 use crate::session::{Change, STOP_GRACE, Session, Term};
 use crate::skill;
 use crate::socket;
 use crate::spending::Spending;
-use crate::state::SavedSession;
+use crate::state::{self, SavedSession};
 use crate::tasks;
 use crate::typing;
 use anyhow::{Context, Result, bail, ensure};
@@ -93,6 +95,7 @@ pub fn run(socket: &Path) -> Result<()> {
         events,
         distilling: Arc::default(),
         preparing: Arc::default(),
+        handoff: Mutex::default(),
     });
     // A daemon starts again after every upgrade, so this is where the skill
     // an earlier crystal installed learns this one's commands: before the
@@ -168,6 +171,10 @@ struct Daemon {
     /// Getting the model that searches memory by meaning ready: what's
     /// being done, and why it last failed.
     preparing: Arc<Mutex<Preparing>>,
+    /// Held while a worktree's handoff file is written: each write reads
+    /// the file, adds to it and writes it back. Never held while taking
+    /// another lock.
+    handoff: Mutex<()>,
 }
 
 /// What [`Daemon::prepare_embeddings`] is doing, or why it failed.
@@ -365,7 +372,20 @@ impl Daemon {
             Vec::new()
         });
         for run in &mut runs {
-            run.interrupt();
+            // A step in a terminal whose session came back with its task
+            // open carries on there; any other was cut short.
+            let carried_on = run.running().is_some_and(|step| {
+                run.in_terminal(step)
+                    && step_session(&mut sessions, run, step).is_some_and(|session| {
+                        let open = session
+                            .task_record()
+                            .is_some_and(|task| task.outcome.is_none());
+                        session.is_running() && open
+                    })
+            });
+            if !carried_on {
+                run.interrupt();
+            }
             run.env = env::current();
             let at_gate = run
                 .current()
@@ -386,9 +406,10 @@ impl Daemon {
             let Some(step) = run.running() else {
                 continue;
             };
-            let Some(ended) = how_step_ended(sessions, run, step) else {
+            let Some(mut ended) = how_step_ended(sessions, run, step) else {
                 continue;
             };
+            ended.artifacts = self.kept_files(run.steps[step].task);
             let cost_usd = ended.cost_usd;
             let next = run.step_ended(step, ended);
             self.events.emit(Event::step_ended(run, step, cost_usd));
@@ -438,10 +459,12 @@ impl Daemon {
         }
     }
 
-    /// Runs `step` of `run`, asking it `prompt`. While the step's session is
-    /// there at rest, it's a follow-up there, in the same conversation. An
-    /// ended one makes way for a new task, which carries its conversation
-    /// on; with none, the step starts in a new task of its own.
+    /// Runs `step` of `run`, asking it `prompt`, where the flow places it.
+    /// A step in the background whose session is there at rest takes it as
+    /// a follow-up, in the same conversation; an ended one makes way for a
+    /// new task, which carries its conversation on. A step in a terminal
+    /// starts afresh in a session of its own, its ended one making way.
+    /// With neither, the step starts in a new task of its own.
     fn start_step(
         &self,
         sessions: &mut Vec<Session>,
@@ -449,6 +472,14 @@ impl Daemon {
         step: usize,
         prompt: &str,
     ) -> Result<()> {
+        let terminal = run.in_terminal(step);
+        // A step in a terminal goes on once its task closes.
+        ensure!(
+            !terminal || tasks::enabled(&settings()),
+            "step {} runs in a terminal, which takes tasks: {}",
+            run.step_name(step),
+            crate::plugins::off("tasks")
+        );
         let mut conversation = None;
         let had = run.steps[step].session.as_ref();
         if let Some(index) = had.and_then(|name| sessions.iter().position(|s| s.name == *name)) {
@@ -459,59 +490,80 @@ impl Daemon {
                     conversation = session.launch().conversation.map(|found| found.id);
                     sessions.remove(index);
                 }
-                // Not a task: a session that has taken the name since.
+                (false, false) if terminal => {
+                    sessions.remove(index);
+                }
+                // The step's agent still there to read, or a session that
+                // has taken the name since.
                 (false, _) => {}
             }
         }
         let cwd = self.step_dir(run, step)?;
         let taken = |name: &str| sessions.iter().any(|session| session.name == name);
         let name = unique_name(&run.session_name(step), taken);
-        let task = NewTask {
-            name: Some(name),
-            cwd,
-            spec: run.task_spec(step, prompt),
-            env: run.env.clone(),
-            backlog: None,
+        let name = if terminal {
+            let (command, asked) = run.command(step, prompt);
+            let new = NewSession {
+                name: Some(name),
+                cwd: cwd.clone(),
+                command,
+                env: run.env.clone(),
+                task: Some(asked),
+                backlog: None,
+            };
+            start(sessions, &self.socket, new, None)?
+        } else {
+            let task = NewTask {
+                name: Some(name),
+                cwd: cwd.clone(),
+                spec: run.task_spec(step, prompt),
+                env: run.env.clone(),
+                backlog: None,
+            };
+            start_task(
+                sessions,
+                &self.socket,
+                &self.spending,
+                task,
+                conversation,
+                true,
+            )?
         };
-        let name = start_task(
-            sessions,
-            &self.socket,
-            &self.spending,
-            task,
-            conversation,
-            true,
-        )?;
         // As a task, it's the step, in the project's history and memory,
         // rather than the whole of its prompt.
-        let session = sessions.last_mut().expect("start_task added it");
+        let session = sessions.last_mut().expect("it was just started");
         if session.task_record().is_some() {
             let goal = format!("{} {}: {}", run.name, run.step_name(step), run.goal);
-            session.give_task(new_task_info(goal, true, None));
+            session.give_task(new_task_info(goal, !terminal, None));
             self.number_tasks(std::slice::from_mut(session));
         }
+        let task = session.task_id();
         self.tell_started(sessions, &name, Kind::TaskOpened);
-        run.steps[step].session = Some(name);
+        let ran = &mut run.steps[step];
+        ran.session = Some(name);
+        ran.cwd = Some(cwd);
+        ran.task = task;
         Ok(())
     }
 
-    /// Where `step` of `run` runs: where the run started, or, from the
-    /// first step that wants one, the worktree the run makes for itself
-    /// then.
+    /// Where `step` of `run` runs, as [`FlowRun::place`] says: the
+    /// worktree the run makes for itself is made the first time a step
+    /// asks for it.
     fn step_dir(&self, run: &mut FlowRun, step: usize) -> Result<PathBuf> {
-        if !run.wants_worktree(step) {
-            return Ok(run.cwd.clone());
+        match run.place(step) {
+            Place::In(dir) => Ok(dir),
+            Place::NewWorktree => {
+                let (worktree, branch) = git::add_new_worktree(&run.cwd, &run.slug())?;
+                self.events
+                    .emit(Event::worktree(true, &worktree, Some(&branch)));
+                run.worktree = Some(worktree.clone());
+                Ok(worktree)
+            }
         }
-        if let Some(worktree) = &run.worktree {
-            return Ok(worktree.clone());
-        }
-        let (worktree, branch) = git::add_new_worktree(&run.cwd, &run.branch())?;
-        self.events
-            .emit(Event::worktree(true, &worktree, Some(&branch)));
-        run.worktree = Some(worktree.clone());
-        Ok(worktree)
     }
 
-    /// Starts a run of the flow called `flow` in the config file, on `goal`.
+    /// Starts a run of the flow called `flow` on `goal`: the project's own
+    /// flow of that name, or the config file's.
     fn start_flow(
         &self,
         flow: &str,
@@ -521,24 +573,13 @@ impl Daemon {
     ) -> Result<String> {
         let config = settings();
         flows::ensure_enabled(&config)?;
-        let Some(found) = config.flows.iter().find(|found| found.name == flow) else {
-            let known: Vec<&str> = config.flows.iter().map(|f| f.name.as_str()).collect();
-            if known.is_empty() {
-                bail!(
-                    "there's no flow called {flow}, nor any other: `crystal flow example` shows one"
-                );
-            }
-            bail!(
-                "there's no flow called {flow}; there's {}",
-                known.join(", ")
-            );
-        };
+        let found = flows::find(&config, &cwd, flow)?;
         let mut sessions = self.sessions.lock().unwrap();
         let mut runs = self.flows.lock().unwrap();
         let name = flow_run::new_name(flow, &runs);
         let mut run = FlowRun::new(
             name.clone(),
-            found.clone(),
+            found,
             &config.profiles,
             goal,
             cwd,
@@ -580,6 +621,33 @@ impl Daemon {
             session.on_agent_event(AgentEvent::Started);
         }
         self.carry_out(&mut sessions, run, next);
+        Ok(())
+    }
+
+    /// Cancels the run called `name`: the task of the step it's at, while
+    /// it's open, is cancelled and its session stopped, and the run goes no
+    /// further.
+    fn cancel_flow(&self, name: &str) -> Result<()> {
+        flows::ensure_enabled(&settings())?;
+        let mut sessions = self.sessions.lock().unwrap();
+        let mut runs = self.flows.lock().unwrap();
+        let run = runs.iter_mut().find(|run| run.name == name);
+        let run = run.with_context(|| format!("there's no flow run called {name}"))?;
+        let at_gate = run.state() == RunState::AtGate;
+        let step = run.cancel()?;
+        if let Some(session) = step_session(&mut sessions, run, step) {
+            if at_gate {
+                session.on_agent_event(AgentEvent::Started);
+            }
+            let cancelled = tasks::enabled(&settings())
+                .then(|| session.cancel_task("its flow was cancelled"))
+                .flatten();
+            if let Some(cancelled) = cancelled {
+                self.write_down_closed(session, &cancelled);
+                session.stop();
+            }
+        }
+        self.events.emit(Event::flow_ended(run));
         Ok(())
     }
 
@@ -632,13 +700,126 @@ impl Daemon {
                 _ => None,
             }
         };
+        let mut task = task.clone();
+        if let Some(info) = session {
+            self.hand_off(info, &task);
+            task.artifacts = self.kept_with(task.id);
+        }
         let closed = match session {
             Some(info) => Event::task(Kind::TaskClosed, info, task.clone()),
             None => Event::pending_task(Kind::TaskClosed, project, task.clone()),
         };
         self.events.emit(closed);
         self.tell_backlog(Kind::BacklogClosed, cwd, ticked);
-        self.remember_outcome(cwd, task);
+        self.remember_outcome(cwd, &task);
+    }
+
+    /// Adds how `task` went, closed in the session `info` is about, to its
+    /// worktree's handoff file, then keeps the file with the task: what the
+    /// sessions after it there should know, and whoever reads the task
+    /// later. A cancelled task leaves nothing to say.
+    fn hand_off(&self, info: &SessionInfo, task: &TaskRecord) {
+        let Some(outcome) = &task.outcome else {
+            return;
+        };
+        let Some(worktree) = info.worktree.as_ref().map(|worktree| &worktree.path) else {
+            return;
+        };
+        if outcome.cancelled || !handoff::enabled(&settings()) {
+            return;
+        }
+        if let Some(note) = handoff::tidy(&outcome.summary) {
+            let how = outcome.state().word();
+            let heading =
+                handoff::heading(&handoff::now(), &info.name, Some(&task.goal), Some(how));
+            match self.add_to_handoff(worktree, &handoff::section(&heading, &note)) {
+                Ok(path) => self.events.emit(Event::handoff(info, path, &note)),
+                Err(err) => eprintln!("crystal daemon: couldn't add to a handoff file: {err:#}"),
+            }
+        }
+        let Some(id) = task.id else {
+            return;
+        };
+        let dir = state::task_dir(&self.socket, id);
+        match artifacts::keep_handoff(&dir, &handoff::path(worktree)) {
+            Ok(Some(kept)) => self.record_kept(info, task, &[kept]),
+            Ok(None) => {}
+            Err(err) => eprintln!("crystal daemon: couldn't keep t{id}'s handoff file: {err:#}"),
+        }
+    }
+
+    /// Adds `section` to the handoff file of the worktree at `worktree`,
+    /// one write at a time, kept out of git unless the config says its
+    /// project keeps its notes there.
+    fn add_to_handoff(&self, worktree: &Path, section: &str) -> Result<PathBuf> {
+        let in_git = handoff::in_git(&settings(), &project::of(worktree).path);
+        let _one_at_a_time = self.handoff.lock().unwrap();
+        handoff::append(worktree, section, in_git)
+    }
+
+    /// Checks the files at `paths` and copies them into the directory of
+    /// `session`'s task, before it closes: a file that can't be kept
+    /// refuses the close, and keeps none of them.
+    fn keep_files(&self, session: &mut Session, paths: &[PathBuf]) -> Result<Vec<Artifact>> {
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.number_tasks(std::slice::from_mut(session));
+        let id = session
+            .task_id()
+            .with_context(|| format!("{} has no task to keep files with", session.name))?;
+        let checked = artifacts::check(paths, &session.checkout_top())?;
+        let mut taken: Vec<String> = self
+            .kept_with(Some(id))
+            .into_iter()
+            .map(|a| a.name)
+            .collect();
+        // The handoff file is kept under its own name as the task closes.
+        taken.push(artifacts::HANDOFF_NAME.to_string());
+        artifacts::keep(&state::task_dir(&self.socket, id), &checked, &taken)
+    }
+
+    /// Writes down the files `kept` with `task`, closed in the session
+    /// `info` is about, and tells of each.
+    fn record_kept(&self, info: &SessionInfo, task: &TaskRecord, kept: &[Artifact]) {
+        let Some(id) = task.id else {
+            return;
+        };
+        for artifact in kept {
+            let added = self
+                .db
+                .lock()
+                .unwrap()
+                .add_artifact(id, artifact, now_seconds());
+            match added {
+                Ok(()) => self
+                    .events
+                    .emit(Event::artifact(info, task.clone(), artifact.clone())),
+                Err(err) => {
+                    eprintln!("crystal daemon: couldn't write down a file t{id} kept: {err:#}")
+                }
+            }
+        }
+    }
+
+    /// The files kept with the task numbered `task`.
+    fn kept_with(&self, task: Option<u64>) -> Vec<Artifact> {
+        let Some(id) = task else {
+            return Vec::new();
+        };
+        let kept = self.db.lock().unwrap().artifacts(id);
+        kept.unwrap_or_else(|err| {
+            eprintln!("crystal daemon: couldn't read the files t{id} kept: {err:#}");
+            Vec::new()
+        })
+    }
+
+    /// The paths of the files `crystal done --artifact` kept with the task
+    /// numbered `task`: what a flow step's `{<step>.artifacts}` says.
+    fn kept_files(&self, task: Option<u64>) -> Vec<PathBuf> {
+        let kept = self.kept_with(task).into_iter();
+        let files = kept.filter(|artifact| artifact.kind == ArtifactKind::File);
+        files.map(|artifact| artifact.path).collect()
     }
 
     /// Has the distiller read what the task that just closed in `session`
@@ -1004,21 +1185,43 @@ impl Daemon {
                 name,
                 failed,
                 summary,
+                artifacts,
             } => {
                 tasks::ensure_enabled(&settings())?;
                 let mut sessions = self.sessions.lock().unwrap();
-                let session = match (id, name) {
-                    (Some(id), _) => with_id(&mut sessions, &id)?,
-                    (None, Some(name)) => named(&mut sessions, &name)?,
-                    (None, None) => bail!("say which session's task to close"),
-                };
+                let session = id_or_name(&mut sessions, id, name)?;
                 let state = if failed {
                     TaskState::Failed
                 } else {
                     TaskState::Done
                 };
+                let kept = self.keep_files(session, &artifacts)?;
                 let closed = session.close_task(state, &summary)?;
+                self.record_kept(&session.info(), &closed, &kept);
                 self.write_down_closed(session, &closed);
+                Ok(Response::Done)
+            }
+            Request::Handoff { id, name, note } => {
+                handoff::ensure_enabled(&settings())?;
+                let note = handoff::tidy(&note).context(
+                    "the note is empty: `crystal handoff \"<what the next session here should know>\"`",
+                )?;
+                let (info, task) = {
+                    let mut sessions = self.sessions.lock().unwrap();
+                    let session = id_or_name(&mut sessions, id, name)?;
+                    let open = session.task_record().filter(|task| task.outcome.is_none());
+                    (session.info(), open.map(|task| task.goal))
+                };
+                let worktree = info.worktree.as_ref().map(|worktree| &worktree.path);
+                let worktree = worktree.with_context(|| {
+                    format!(
+                        "{} isn't in a git worktree, where notes are kept",
+                        info.name
+                    )
+                })?;
+                let heading = handoff::heading(&handoff::now(), &info.name, task.as_deref(), None);
+                let path = self.add_to_handoff(worktree, &handoff::section(&heading, &note))?;
+                self.events.emit(Event::handoff(&info, path, &note));
                 Ok(Response::Done)
             }
             Request::Distill { name } => self.distill_now(&name),
@@ -1062,7 +1265,7 @@ impl Daemon {
             Request::StartTask { id, env } => self.start_pending(id, env),
             Request::ShowTask { task } => {
                 tasks::ensure_enabled(&settings())?;
-                Ok(Response::Task(self.find_task(&task)?))
+                Ok(Response::Task(self.with_kept(self.find_task(&task)?)))
             }
             Request::CancelTask { task } => {
                 self.cancel_task(&task)?;
@@ -1070,7 +1273,7 @@ impl Daemon {
             }
             Request::TaskLog { task } => {
                 tasks::ensure_enabled(&settings())?;
-                let task = self.find_task(&task)?;
+                let task = self.with_kept(self.find_task(&task)?);
                 let transcript = self.transcript_of(&task);
                 Ok(Response::TaskLog { task, transcript })
             }
@@ -1173,6 +1376,10 @@ impl Daemon {
                 self.change_flow(&run, None, FlowRun::retry)?;
                 Ok(Response::Done)
             }
+            Request::CancelFlow { run } => {
+                self.cancel_flow(&run)?;
+                Ok(Response::Done)
+            }
             // Leaving is enough: the sessions' terminals close with the
             // daemon, and the list of them stays as it was last written.
             Request::Shutdown {
@@ -1248,7 +1455,13 @@ impl Daemon {
         let mut listed: HashSet<u64> = tasks.iter().filter_map(|task| task.record.id).collect();
         closed.retain(|task| task.id.is_none_or(|id| listed.insert(id)));
         tasks.extend(closed.into_iter().map(TaskView::of_record));
-        tasks
+        tasks.into_iter().map(|task| self.with_kept(task)).collect()
+    }
+
+    /// `task` with the files kept with it.
+    fn with_kept(&self, mut task: TaskView) -> TaskView {
+        task.record.artifacts = self.kept_with(task.record.id);
+        task
     }
 
     /// The closed tasks of the project whose main worktree is `project`, or
@@ -1708,13 +1921,25 @@ fn how_step_ended(sessions: &[Session], run: &FlowRun, step: usize) -> Option<En
             failed: true,
             answer: format!("its session, {name}, has gone"),
             cost_usd: 0.0,
+            artifacts: Vec::new(),
         });
     };
+    if !session.is_task() {
+        // A step in a terminal ends as its task closes.
+        let outcome = session.task_record()?.outcome?;
+        return Some(Ended {
+            failed: outcome.state() != TaskState::Done,
+            answer: outcome.summary,
+            cost_usd: 0.0,
+            artifacts: Vec::new(),
+        });
+    }
     let result = session.finished_run()?;
     Some(Ended {
         failed: result.failed || !session.is_running(),
         answer: result.text,
         cost_usd: result.cost_usd,
+        artifacts: Vec::new(),
     })
 }
 
@@ -1777,7 +2002,14 @@ fn start(
     let about_task = task
         .as_ref()
         .map(|_| tasks::instructions(backlog::enabled(&config)));
-    let instructions = notes(about_task, remembered(socket, &cwd, &command));
+    let remembered = remembered(socket, &cwd, &command);
+    let said = [
+        task.as_deref(),
+        about_task.as_deref(),
+        remembered.as_deref(),
+    ];
+    let handoff = handoff_note(&cwd, &said);
+    let instructions = notes(about_task, handoff, remembered);
     let argv = agents::argv(
         &command,
         &crystal,
@@ -1804,17 +2036,39 @@ fn start(
 }
 
 /// What crystal tells an agent on top of what it was asked, a paragraph
-/// each: about its task first, the one thing it mustn't forget, then what
-/// the project's memory has, all opened by where they come from. Nothing at
+/// each: about its task first, the one thing it mustn't forget, then the
+/// notes the sessions before it in its worktree left, then what the
+/// project's memory has, all opened by where they come from. Nothing at
 /// all when there's nothing to say.
-fn notes(about_task: Option<String>, remembered: Option<String>) -> Vec<String> {
-    let said: Vec<String> = about_task.into_iter().chain(remembered).collect();
+fn notes(
+    about_task: Option<String>,
+    handoff: Option<String>,
+    remembered: Option<String>,
+) -> Vec<String> {
+    let said: Vec<String> = about_task
+        .into_iter()
+        .chain(handoff)
+        .chain(remembered)
+        .collect();
     if said.is_empty() {
         return said;
     }
     let mut notes = vec![agents::ABOUT_CRYSTAL.to_string()];
     notes.extend(said);
     notes
+}
+
+/// What an agent starting in `cwd` is told of its worktree's handoff file,
+/// when the plugin is on and the file has notes. `said` is what else it's
+/// asked and told as it starts, which the file's end mustn't push past what
+/// a prompt may be.
+fn handoff_note(cwd: &Path, said: &[Option<&str>]) -> Option<String> {
+    if !handoff::enabled(&settings()) {
+        return None;
+    }
+    let worktree = handoff::worktree_of(cwd)?;
+    let said = said.iter().flatten().map(|text| text.len()).sum();
+    handoff::launch_note(&worktree, said)
 }
 
 /// What the project's memory has to tell an agent as it starts in `cwd`,
@@ -1880,16 +2134,21 @@ fn embed_waiting(socket: &Path) {
     }
 }
 
-/// The arguments each of a task's runs gives Claude: the task's own, and,
-/// with memory on, what its project remembers that has to do with its
-/// prompt, in its system prompt, and crystal's MCP server, with its tools
-/// allowed, to search the rest.
+/// The arguments each of a task's runs gives Claude: the task's own; in its
+/// system prompt, the notes its worktree's sessions left and, with memory
+/// on, what its project remembers that has to do with its prompt; and with
+/// memory on, crystal's MCP server, with its tools allowed, to search the
+/// rest.
 fn task_args(socket: &Path, cwd: &Path, spec: &protocol::TaskSpec) -> Vec<String> {
-    if !memory::enabled_now() {
-        return spec.args.clone();
+    let memory_on = memory::enabled_now();
+    let remembered = memory_on
+        .then(|| launch_memory(socket, cwd, &spec.prompt, memory::Reader::Task))
+        .flatten();
+    let handoff = handoff_note(cwd, &[remembered.as_deref()]);
+    let args = agents::with_instructions(&spec.args, &notes(None, handoff, remembered));
+    if !memory_on {
+        return args;
     }
-    let remembered = launch_memory(socket, cwd, &spec.prompt, memory::Reader::Task);
-    let args = agents::with_instructions(&spec.args, &notes(None, remembered));
     let Ok(crystal) = std::env::current_exe() else {
         return args;
     };
@@ -2032,6 +2291,20 @@ impl Reading {
 impl Drop for Reading {
     fn drop(&mut self) {
         self.reading.lock().unwrap().remove(&self.id);
+    }
+}
+
+/// The session a request names by its `id`, from a program in it, or else
+/// by its `name`.
+fn id_or_name(
+    sessions: &mut [Session],
+    id: Option<String>,
+    name: Option<String>,
+) -> Result<&mut Session> {
+    match (id, name) {
+        (Some(id), _) => with_id(sessions, &id),
+        (None, Some(name)) => named(sessions, &name),
+        (None, None) => bail!("say which session"),
     }
 }
 
@@ -2185,17 +2458,27 @@ mod tests {
 
     #[test]
     fn crystal_s_notes_say_where_they_come_from_then_the_task_then_the_memory() {
-        let notes = notes(Some("about the task".into()), Some("remembered".into()));
+        let notes = notes(
+            Some("about the task".into()),
+            Some("handed off".into()),
+            Some("remembered".into()),
+        );
         assert_eq!(
             notes,
-            [agents::ABOUT_CRYSTAL, "about the task", "remembered"]
+            [
+                agents::ABOUT_CRYSTAL,
+                "about the task",
+                "handed off",
+                "remembered"
+            ]
         );
     }
 
     #[test]
     fn with_nothing_to_say_there_are_no_notes_at_all() {
-        assert!(notes(None, None).is_empty());
-        assert_eq!(notes(None, Some("remembered".into())).len(), 2);
+        assert!(notes(None, None, None).is_empty());
+        assert_eq!(notes(None, None, Some("remembered".into())).len(), 2);
+        assert_eq!(notes(None, Some("handed off".into()), None).len(), 2);
     }
 
     #[test]

@@ -773,6 +773,7 @@ mod tests {
             waiting: false,
             created: 0,
             outcome: Some(TaskOutcome::new(TaskState::Done, "redis has to be up", 0)),
+            artifacts: Vec::new(),
         };
         let header = header(&task);
         assert_eq!(

@@ -1,18 +1,23 @@
-//! The commands about work: closing a task with `crystal done`, making,
-//! listing, showing and cancelling tasks with `crystal tasks`, and keeping a
+//! The commands about work: closing a task with `crystal done`, leaving a
+//! note for the sessions after with `crystal handoff`, making, listing,
+//! showing and cancelling tasks with `crystal tasks`, and keeping a
 //! project's backlog with `crystal backlog`. The daemon keeps the tasks,
-//! the history and the backlogs; these ask it, and print what it says.
+//! the history, the handoff files and the backlogs; these ask it, and print
+//! what it says.
 
+use crate::artifacts;
 use crate::backlog;
 use crate::catalog;
 use crate::client::{self, Purpose};
 use crate::config::Config;
 use crate::env;
 use crate::forge;
+use crate::handoff;
 use crate::protocol::{
     BacklogItem, PendingTask, Request, Response, State, TaskSpec, TaskStart, TaskState, TaskView,
     task_label,
 };
+use crate::shell;
 use crate::tasks;
 use crate::tui::sidebar::ago;
 use anyhow::{Context, Result, bail};
@@ -20,22 +25,54 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 /// Closes a task: the one of the session this runs in, or the session
-/// called `name`.
-pub fn done(socket: &Path, name: Option<String>, failed: bool, summary: &str) -> Result<()> {
+/// called `name`, keeping the files at `artifacts` with it.
+pub fn done(
+    socket: &Path,
+    name: Option<String>,
+    failed: bool,
+    summary: &str,
+    artifacts: Vec<PathBuf>,
+) -> Result<()> {
     tasks::ensure_enabled(&settings())?;
-    let id = match &name {
-        Some(_) => None,
-        None => Some(env::own_session_id(socket).context(
-            "this isn't running in a crystal session: say whose task it is with `-n <session>`",
-        )?),
-    };
+    let id = own_session(socket, &name, "whose task it is")?;
+    // The daemon reads them, wherever it runs.
+    let artifacts = artifacts
+        .into_iter()
+        .map(std::path::absolute)
+        .collect::<std::io::Result<Vec<_>>>()?;
     let close = Request::Close {
         id,
         name,
         failed,
         summary: summary.to_string(),
+        artifacts,
     };
     expect_done(client::ask(socket, &close, false)?, socket)
+}
+
+/// Adds `note` to the handoff file of the worktree the session this runs
+/// in works in, or the session called `name`.
+pub fn handoff(socket: &Path, name: Option<String>, note: &str) -> Result<()> {
+    handoff::ensure_enabled(&settings())?;
+    let id = own_session(socket, &name, "whose worktree it's for")?;
+    let request = Request::Handoff {
+        id,
+        name,
+        note: note.to_string(),
+    };
+    expect_done(client::ask(socket, &request, false)?, socket)
+}
+
+/// The id of the session this runs in, unless `name` names another: a
+/// command for a session that says `what` with `-n` from outside one.
+fn own_session(socket: &Path, name: &Option<String>, what: &str) -> Result<Option<String>> {
+    if name.is_some() {
+        return Ok(None);
+    }
+    let id = env::own_session_id(socket).with_context(|| {
+        format!("this isn't running in a crystal session: say {what} with `-n <session>`")
+    })?;
+    Ok(Some(id))
 }
 
 /// Prints the tasks of the project `dir` is in, or every project's with
@@ -273,6 +310,14 @@ fn task_card(task: &TaskView, now: u64) -> String {
             ),
         );
     }
+    for (index, artifact) in record.artifacts.iter().enumerate() {
+        let label = if index == 0 { "kept" } else { "" };
+        let path = shell::home_relative(&artifact.path);
+        line(
+            label,
+            format!("{path} ({})", artifacts::size(artifact.bytes)),
+        );
+    }
     if record.goal.lines().count() > 1 {
         card.push('\n');
         for goal_line in record.goal.lines() {
@@ -444,7 +489,7 @@ fn settings() -> Config {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{Asking, TaskOutcome, TaskRecord};
+    use crate::protocol::{Artifact, ArtifactKind, Asking, TaskOutcome, TaskRecord};
 
     fn task(id: u64, goal: &str, outcome: Option<(TaskState, &str)>) -> TaskView {
         TaskView::of_record(TaskRecord {
@@ -459,6 +504,7 @@ mod tests {
             waiting: false,
             created: 100,
             outcome: outcome.map(|(state, summary)| TaskOutcome::new(state, summary, 1000)),
+            artifacts: Vec::new(),
         })
     }
 
@@ -522,6 +568,29 @@ mod tests {
         let card = task_card(&cancelled, 1000);
         assert!(card.contains("  session   claude, gone\n"), "{card}");
         assert!(card.contains("closed    just now, cancelled: cancelled by the user"));
+    }
+
+    #[test]
+    fn a_card_lists_the_files_kept_with_the_task() {
+        let mut kept = task(9, "write the plan", Some((TaskState::Done, "wrote it")));
+        let artifact = |kind, name: &str, bytes| Artifact {
+            kind,
+            name: name.into(),
+            path: Path::new("/state/tasks/t9").join(name),
+            bytes,
+        };
+        kept.record.artifacts = vec![
+            artifact(ArtifactKind::File, "plan.md", 9),
+            artifact(ArtifactKind::Handoff, "handoff.md", 3000),
+        ];
+        let card = task_card(&kept, 1000);
+        assert!(
+            card.contains(
+                "  kept      /state/tasks/t9/plan.md (9 bytes)\n\
+                 \x20           /state/tasks/t9/handoff.md (3 KiB)\n"
+            ),
+            "{card}"
+        );
     }
 
     #[test]

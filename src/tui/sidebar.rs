@@ -179,6 +179,7 @@ fn flow_heading<'a>(run: &FlowRun, look: &Look, width: u16) -> Line<'a> {
         RunState::AtGate => theme.waiting,
         RunState::Done => theme.done,
         RunState::Failed | RunState::Interrupted => theme.failed,
+        RunState::Cancelled => theme.muted,
     };
     // The indent and the mark before the name; a space at the end.
     let room = usize::from(width).saturating_sub(WORKTREE_INDENT.len() + 2 + 1);
@@ -230,6 +231,7 @@ fn step_line<'a>(
         StepState::Done => ("✓", theme.done),
         StepState::Failed => ("✗", theme.failed),
         StepState::Interrupted => ("■", theme.failed),
+        StepState::Cancelled => ("–", theme.muted),
     };
     let mut name_style = Style::new().fg(if session.is_some() {
         theme.text

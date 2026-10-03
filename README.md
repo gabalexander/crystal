@@ -777,11 +777,12 @@ Each line of `--json` is one event, the same JSON the log keeps and plugins get:
 going back), `at` (milliseconds since the Unix epoch), its name as `event`, the `project` it's about, the
 `session` (its `name`, `id`, `command`, `cwd`, `project`, `worktree`, `branch`, `activity`, `task` and
 `status`, as `ls` words it), and what its kind carries: `from` (a renamed session's old name, or what its agent
-was doing before), `task` (with its `id`, `pending`, `waiting` and, once closed, its `outcome`), `run`
-(`prompt`; `asking`, with its `tool` and `gist`, and the `decision`; then `failed`, `answer` and `cost_usd`),
-`flow` (`run`, `flow`, `goal`, `step`, `state`, `said`, `cost_usd`), `worktree`, `memory` (the entry),
-`backlog` (the item) or `plugin` (`name` and `why`). New fields and events may appear; none goes away. The
-events are listed under [plugins](#events-1).
+was doing before), `task` (with its `id`, `pending`, `waiting` and, once closed, its `outcome` and the
+`artifacts` kept with it), `run` (`prompt`; `asking`, with its `tool` and `gist`, and the `decision`; then
+`failed`, `answer` and `cost_usd`), `flow` (`run`, `flow`, `goal`, `step`, `state`, `said`, `cost_usd`),
+`worktree`, `handoff` (the file's `path` and the `note`'s first line), `artifact` (a kept file's `kind`,
+`name`, `path` and `bytes`), `memory` (the entry), `backlog` (the item) or `plugin` (`name` and `why`). New
+fields and events may appear; none goes away. The events are listed under [plugins](#events-1).
 
 A program can listen on the daemon's socket, as `--follow` does, with one line of JSON:
 
@@ -1084,6 +1085,66 @@ those waiting to start, then those closed, the latest first; `--all` lists every
 project's, and `--json` prints them for scripts. `tasks log` shows a task's transcript while its session is
 still in the list.
 
+#### The handoff file
+
+A task's summary is one line on what it did. What a worktree learned along the way, the next session there
+would otherwise learn again, so each git worktree keeps notes for the sessions after: `.crystal/handoff.md`,
+at its top. An agent adds one when it learns something the next session there should know:
+
+```sh
+crystal handoff "The fixtures live in tests/fixtures; cargo test codec runs just them"
+```
+
+```
+## 2026-10-04T14:03:07+02:00 · porter · task "Port the codec"
+The fixtures live in tests/fixtures; cargo test codec runs just them
+
+## 2026-10-04T14:41:52+02:00 · porter · task "Port the codec" done
+Ported the codec and its tests
+```
+
+- Each note is a section: a heading with the local time, the session's name and the task it has open, then the
+  note, its spaces and blank lines tidied and cut at 8 KiB. `-n <session>` adds one for another session's
+  worktree.
+- A task that closes done or failed adds its summary, or why it failed, under a heading that ends in how it
+  closed. A cancelled one adds nothing.
+- Every agent crystal starts in a worktree whose file has notes is told to read it first and how to add to it,
+  with the file's last 2 KiB, by the same road as its task: Claude Code on top of its system prompt, a
+  background task too, Codex in its developer instructions, and Gemini CLI, OpenCode and Cursor at the top of
+  their first prompt. When the file's end would make what it's asked and told more than 16 KiB, it's told
+  where the file is without it; a first prompt too long even so loses what the memory has first, then the
+  notes.
+- crystal is the file's only writer. It keeps it to 256 KiB, letting the oldest notes go, with `[earlier
+  notes trimmed]` on top.
+- The notes stay out of git: the first note writes a `.gitignore` beside them that ignores everything in
+  `.crystal/` but `flows.toml` (a `.gitignore` there already is left as it is). A project whose notes should
+  travel with its branches lists its main worktree under `[handoff]` in the [settings](#settings), and the
+  `.gitignore` isn't written:
+
+  ```toml
+  [handoff]
+  in_git = ["~/code/app"]
+  ```
+
+- Notes are a git worktree's: a session outside git has none. `crystal plugin disable handoff` turns them off.
+
+#### Kept files
+
+`crystal done "<summary>" --artifact <path>` keeps a copy of a file with the task as it closes: a plan, a
+report, a screenshot, whatever someone will want once the worktree is gone. `--artifact` can be given more
+than once.
+
+- Each must be a file in the session's worktree, not a link or a directory, of 1 MiB at most, and 8 MiB for all
+  of them. A path is taken from the directory the command runs in. One that can't be kept refuses the whole
+  close, saying why, and the task stays open, so the agent can fix the call and run it again.
+- The daemon copies them itself, after checking each again, into its server's state directory, beside its
+  database: `~/.local/state/crystal/tasks/t12/` for the default server. Two files with one name are kept as
+  `plan.md` and `plan-2.md`.
+- A task that closes done or failed keeps its worktree's handoff file too, as it is then, as `handoff.md`.
+- `crystal tasks show t12` lists them, and `crystal tasks --json` gives each task's `artifacts`, with their
+  `kind` (`file` or `handoff`), `name`, `path` and `bytes`. Each is a `task.artifact` in the [event
+  log](#events).
+
 ### The backlog
 
 Each project keeps a backlog: things worth doing later that aren't anyone's task yet. It's the project's, not
@@ -1111,10 +1172,10 @@ after it; that task ticks the item off when it closes done.
 
 ### Flows
 
-A flow is a chain of [background tasks](#background-tasks) on one goal: plan it, build it in a worktree,
-review it, open the pull request. Each step runs with a [profile](#profiles) of its own and starts once the
-step before it is done, given what that step answered. A step can stop the flow at a gate until you've looked
-at what it did, then you go on, or send it back with notes.
+A flow is a chain of [tasks](#tasks) on one goal: plan it, build it in a worktree, review it, open the pull
+request. Each step runs with a [profile](#profiles) of its own and starts once the step before it is done,
+given what that step answered. A step can stop the flow at a gate until you've looked at what it did, then
+you go on, or send it back with notes.
 
 Flows are written in the config file, a `[[flow]]` table each, with a `[[flow.step]]` table for each step.
 `crystal flow example` prints this one, with the profiles it runs with, ready to copy in:
@@ -1132,20 +1193,22 @@ prompt = "Plan how to do this: {goal}. Answer with the files to change and how, 
 [[flow.step]]
 name = "implement"
 profile = "builder"
-worktree = true
+placement = "fresh"
 prompt = """
 Do this: {goal}
 
 Follow this plan:
-{previous}
+{plan.summary}
 
 {feedback}"""
 
 [[flow.step]]
 name = "review"
 profile = "reviewer"
+placement = "same"
 gate = true
 back_to = "implement"
+max_rounds = 3
 prompt = "Review the changes on this branch against what was asked: {goal}"
 
 [[flow.step]]
@@ -1157,15 +1220,39 @@ prompt = "Push this branch and open a pull request for it with `gh pr create --f
 | Step setting | What it does |
 |---|---|
 | `name` | what the step is called; its session is named after the run and it, like `ship-1-plan` |
-| `profile` | optional: the Claude Code [profile](#profiles) it runs with: model, mode, arguments, instructions, prompt |
-| `prompt` | what it's asked, with `{goal}`, `{previous}` and `{feedback}` filled in |
-| `worktree` | optional: `true` runs it in a worktree the flow makes, on a branch named after the goal; the steps after it run there too |
+| `profile` | optional: the [profile](#profiles) it runs with: agent, model, mode, arguments, instructions, prompt; left out, Claude Code as it's set up |
+| `prompt` | what it's asked, with the names below filled in |
+| `placement` | optional: where it runs, below; left out, where the step before it ran, and the first where the run started |
+| `worktree` | optional: `true` is `placement = "fresh"`, as it was first written |
 | `gate` | optional: `true` stops the flow after it until you go on, or send the flow back |
 | `back_to` | optional, on a step with a gate: the step that sending the flow back runs again; left out, this one |
+| `max_rounds` | optional, on a step with a gate: how many rounds the flow may take through it, 1 to 3, left out 3; in the last, it can't be sent back |
 
-`{goal}` is what you asked the flow to do, and `{previous}` what the step before answered. `{feedback}` is
-empty until you send the flow back; from then on it holds your notes and, when it went back to an earlier step,
-what the step at the gate said. The step it goes back to hears that even if its prompt doesn't ask for it.
+| Placement | The step runs |
+|---|---|
+| `root` | where the run was started |
+| `fresh` | in a worktree the run makes for itself, the first time a step asks for it, on a branch named after the goal (`add-retries`, or `add-retries-2` when that's taken); every `fresh` step of the run after that runs there too |
+| `same` | where the step before it ran |
+
+A step in a worktree is told about the [handoff file](#the-handoff-file) there like any agent, so it hears what
+the steps before it there noted, and how each of their tasks ended.
+
+What a prompt can name, in braces:
+
+| Name | What it's filled in with |
+|---|---|
+| `{goal}` | what you asked the flow to do |
+| `{slug}` | the goal's first line as a branch would have it: `add-retries` |
+| `{round}` | 1, and one more each time the flow is sent back |
+| `{previous}` | what the step before this one answered |
+| `{<step>.summary}` | what the step called `<step>`, before this one, answered last |
+| `{<step>.artifacts}` | the paths of the files that step's task [kept](#kept-files), one after another |
+| `{feedback}` | empty until you send the flow back; from then on your notes, and when it went back to an earlier step, what the step at the gate said |
+
+The step the flow goes back to hears the feedback even if its prompt doesn't ask for it. A brace that names
+none of these stays as it is, so a prompt can show code; a `{<step>.summary}` or `{<step>.artifacts}` naming no
+step before it is an error. A prompt is kept to 16 KiB: past that, what steps answered is cut short, the oldest
+first, each ending `[cut short]`, and a step whose own text is too long fails.
 
 ```sh
 crystal flow run ship "Retry the webhook when it times out"    # prints the run's name: ship-1
@@ -1175,33 +1262,47 @@ crystal flow wait ship-1             # until it waits at a gate or is done; a fa
 crystal flow approve ship-1          # go on past the gate
 crystal flow back ship-1 "Keep the old timeout as the default"    # send it back, with notes
 crystal flow retry ship-1            # run a step that failed, or that a restart cut short, again
+crystal flow cancel ship-1           # cancel its step's task, and go no further
+crystal flow defs                    # the flows a run started here finds, and where each is written
 ```
 
-- Each step is a background task, so nobody is there to say yes to a permission: give each step a profile that
-  allows what it needs, with `mode` and `args`. Only Claude Code runs as a background task, so a step's profile
-  is a Claude Code one. Each step's task goes into the project's [history](#tasks) as `ship-1 plan: <goal>`.
-- Sending the flow back runs the step it goes back to again, as a follow-up in that step's own conversation,
-  then the steps after it again, in a new round. A step that fails stops the run until you run it again, and
-  you're told, as you are when a run stops at a gate.
+- A step whose profile is Claude Code's runs as a [background task](#background-tasks), so nobody is there to
+  say yes to a permission: give it a profile that allows what it needs, with `mode` and `args`. A step on any
+  other agent, like Codex, runs in a terminal, a session with the step as its [task](#tasks), and the flow goes
+  on once that task closes: done with its summary as the step's answer, or failed. An agent that can't be given
+  a prompt to start on, like Aider, can't be a step. Each step's task goes into the project's
+  [history](#tasks) as `ship-1 plan: <goal>`.
+- Sending the flow back runs the step it goes back to again, in a new round: a background step as a follow-up
+  in its own conversation, a step in a terminal in a new session, with the old one left for you to read. Then
+  the steps after it run again. In a gate's last round, `max_rounds`, it can't be sent back: approve it, or
+  cancel the run. A step that fails stops the run until you run it again, and you're told, as you are when a run stops at
+  a gate.
+- `crystal flow cancel` cancels the task of the step the run is at, while it's open, stops its session, and
+  the run goes no further: it's `cancelled`.
+- A project can keep flows of its own in `.crystal/flows.toml` in its main worktree, `[[flow]]` tables like the
+  config file's, run with the profiles in your config. They're found by any run started in the project, and
+  one there takes the place of the config file's of the same name. `crystal flow defs` lists the flows a run
+  started in the current directory (or `-C <dir>`) finds, each with its steps, or why it can't run, and the
+  file it's written in.
 - In the sidebar, a run sits under its project after its worktrees: `◇`, the flow's name and the goal, and the
   round once it's been sent back. Under it is a row for each step: `·` still to come, the working mark while it
-  runs, `▲` at its gate, `✓` done, `✗` failed and `■` cut short. A step's row is its task's session, so
-  selecting it shows the step's transcript.
+  runs, `▲` at its gate, `✓` done, `✗` failed, `■` cut short and `–` cancelled. A step's row is its task's
+  session, so selecting it shows the step's transcript.
 - At a gate, the step's session waits on you the way an agent asking something does: you're told, `u` goes to
   it, and `ls` says `waiting`. `g` goes on, and `f` asks for your notes on the footer and sends the flow back.
   On a step that failed or was cut short, `g` runs it again.
-- The new-session panel offers your flows after your profiles, `flow: ship`; what you type as the task is the
-  goal.
+- The new-session panel offers the flows in your config file after your profiles, `flow: ship`; what you type
+  as the task is the goal.
 - Runs are kept with the sessions, in crystal's database. After a restart, a run waiting at a gate waits
-  again, and a step that was running is marked interrupted until you run it again, in its conversation. A
-  run's steps start from the environment of the `crystal flow run` that started it; after a restart, from the
-  daemon's. The daemon reads the flow and its profiles from the config file as the run starts, so changing
-  them never changes a run halfway.
+  again, a step in a terminal whose session comes back carries on there, and a background step that was
+  running is marked interrupted until you run it again, in its conversation. A run's steps start from the
+  environment of the `crystal flow run` that started it; after a restart, from the daemon's. The daemon reads
+  the flow and its profiles as the run starts, so changing them never changes a run halfway.
 
 ### Plugins
 
-Most of what crystal does beyond running sessions is a plugin you can switch off: tasks, the backlog, memory,
-profiles, GitHub and GitLab, flows and notifications. Plugins of your own add actions, panes over the TUI and hooks on what
+Most of what crystal does beyond running sessions is a plugin you can switch off: tasks, handoff notes, the
+backlog, memory, profiles, GitHub and GitLab, flows and notifications. Plugins of your own add actions, panes over the TUI and hooks on what
 happens, and use crystal through its own command line, like any script would.
 
 ```sh
@@ -1218,6 +1319,7 @@ crystal plugin remove notes
 | Plugin | What it adds |
 |---|---|
 | `tasks` | [tasks](#tasks): `c`, a task under its session, `crystal done` and `tasks`, and telling agents how to close theirs |
+| `handoff` | [the handoff file](#the-handoff-file): `crystal handoff`, the note a closing task adds and the copy it keeps, and telling agents to read the notes |
 | `backlog` | [the backlog](#the-backlog): `b`, the counts beside projects, `crystal backlog`, and telling agents to use it |
 | `memory` | [memory](#memory): `m`, `crystal remember` and `memory`, and what Claude Code is shown as it starts |
 | `profiles` | [profiles](#profiles): `P`, the profiles in the new-session panel, and `crystal profile` |
@@ -1300,6 +1402,7 @@ It's in `crystal ls` while it's open, and ends when its program does or when you
 | `task.started` | a task made to start later starts, in a session of its own |
 | `task.waiting` | a task's agent ends a turn with the task still open: it waits on you |
 | `task.closed` | a task closes, done, failed or cancelled |
+| `task.artifact` | a file is kept with a task as it closes: one `crystal done --artifact` named, or its worktree's handoff file |
 | `run.started` | a background task starts a run of Claude: its prompt, or a follow-up |
 | `run.asking` | a background task's Claude asks you for a permission |
 | `run.answered` | you answer it: allowed, allowed always, or denied |
@@ -1310,9 +1413,10 @@ It's in `crystal ls` while it's open, and ends when its program does or when you
 | `flow.step_ended` | a step's run ends: done, at its gate, or failed |
 | `flow.gate` | a flow run waits at a gate for you |
 | `flow.gate_answered` | you approve a gate, or send the run back |
-| `flow.ended` | a flow run ends: every step done, or one failed |
+| `flow.ended` | a flow run ends: every step done, one failed, or you cancelled it |
 | `worktree.created` | crystal makes a worktree |
 | `worktree.removed` | crystal removes one |
+| `handoff.added` | a note goes in a worktree's handoff file: `crystal handoff`, or a task closing there |
 | `memory.added` | an entry is added to a project's memory: remembered, a task's outcome, or by the distiller |
 | `memory.forgotten` | an entry is forgotten |
 | `backlog.added` | an item goes on a project's backlog |
@@ -1364,6 +1468,7 @@ file and change. A setting crystal doesn't know is an error that names it, so a 
 | `[memory]` | | how memory's [distiller](#the-distiller) runs, and whether it [searches by meaning](#search-by-meaning) |
 | `[tasks]` | | what [background tasks](#background-tasks) may spend: `max_budget_usd` each (`5`), `daily_budget_usd` all together (none) |
 | `[events]` | | `keep_days`, how long the [event log](#events) keeps what happened: 30 days, or `0` for ever |
+| `[handoff]` | | `in_git`, the projects, by their main worktree, whose [handoff notes](#the-handoff-file) go in git |
 
 `dark` and `light` paint their own background, so crystal looks the same in any terminal; `terminal` paints
 nothing and uses your terminal's own colors. With `NO_COLOR` set, crystal uses no color at all.
@@ -1381,7 +1486,7 @@ offered as a profile of its own.
 
 The daemon reads the notification settings each time it tells you something, `[plugins]` each time it
 does something a plugin adds, `[memory]` each time a task closes or a search runs, `[tasks]` each time a
-background task's run starts, and a flow each time one starts, so a change counts straight away; the TUI reads `new_session`, `theme`, `[plugins]`, the profiles and
+background task's run starts, `[handoff]` each time a note is written, and a flow each time one starts, so a change counts straight away; the TUI reads `new_session`, `theme`, `[plugins]`, the profiles and
 the flows when it starts, again when you save a profile or switch a plugin, and every half a second while the
 settings view is open.
 

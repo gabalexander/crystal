@@ -9,13 +9,14 @@
 //! `task` that closed. Plugins listen for events by name, so a name, once
 //! given, stays.
 
+use crate::artifacts;
 use crate::flow_run::{FlowRun, StepState};
 use crate::memory::{self, Entry};
 use crate::plugin_manifest;
 use crate::project;
 use crate::protocol::{
-    Activity, Answer, Asking, BacklogItem, SessionInfo, State, TaskOutcome, TaskRecord, TaskResult,
-    TaskState,
+    Activity, Answer, Artifact, ArtifactKind, Asking, BacklogItem, SessionInfo, State, TaskOutcome,
+    TaskRecord, TaskResult, TaskState,
 };
 use crate::shell;
 use serde::{Deserialize, Serialize};
@@ -38,6 +39,7 @@ pub enum Kind {
     TaskStarted,
     TaskWaiting,
     TaskClosed,
+    TaskArtifact,
     RunStarted,
     RunAsking,
     RunAnswered,
@@ -51,6 +53,7 @@ pub enum Kind {
     FlowEnded,
     WorktreeCreated,
     WorktreeRemoved,
+    HandoffAdded,
     MemoryAdded,
     MemoryForgotten,
     BacklogAdded,
@@ -59,7 +62,7 @@ pub enum Kind {
 }
 
 impl Kind {
-    pub const ALL: [Kind; 30] = [
+    pub const ALL: [Kind; 32] = [
         Kind::SessionStarted,
         Kind::SessionRenamed,
         Kind::SessionWorking,
@@ -72,6 +75,7 @@ impl Kind {
         Kind::TaskStarted,
         Kind::TaskWaiting,
         Kind::TaskClosed,
+        Kind::TaskArtifact,
         Kind::RunStarted,
         Kind::RunAsking,
         Kind::RunAnswered,
@@ -85,6 +89,7 @@ impl Kind {
         Kind::FlowEnded,
         Kind::WorktreeCreated,
         Kind::WorktreeRemoved,
+        Kind::HandoffAdded,
         Kind::MemoryAdded,
         Kind::MemoryForgotten,
         Kind::BacklogAdded,
@@ -107,6 +112,7 @@ impl Kind {
             Kind::TaskStarted => "task.started",
             Kind::TaskWaiting => "task.waiting",
             Kind::TaskClosed => "task.closed",
+            Kind::TaskArtifact => "task.artifact",
             Kind::RunStarted => "run.started",
             Kind::RunAsking => "run.asking",
             Kind::RunAnswered => "run.answered",
@@ -120,6 +126,7 @@ impl Kind {
             Kind::FlowEnded => "flow.ended",
             Kind::WorktreeCreated => "worktree.created",
             Kind::WorktreeRemoved => "worktree.removed",
+            Kind::HandoffAdded => "handoff.added",
             Kind::MemoryAdded => "memory.added",
             Kind::MemoryForgotten => "memory.forgotten",
             Kind::BacklogAdded => "backlog.added",
@@ -193,6 +200,11 @@ pub struct Event {
     pub backlog: Option<BacklogItem>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plugin: Option<PluginAbout>,
+    /// A file kept with a task as it closed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact: Option<Artifact>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff: Option<HandoffAbout>,
 }
 
 /// The session an event is about, as it was then.
@@ -272,6 +284,15 @@ pub struct WorktreeAbout {
     pub project: Option<PathBuf>,
 }
 
+/// A note added to a worktree's handoff file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HandoffAbout {
+    /// The handoff file.
+    pub path: PathBuf,
+    /// The note's first line.
+    pub note: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PluginAbout {
     pub name: String,
@@ -296,6 +317,8 @@ impl Event {
             memory: None,
             backlog: None,
             plugin: None,
+            artifact: None,
+            handoff: None,
         }
     }
 
@@ -366,6 +389,28 @@ impl Event {
         Event {
             task: Some(task),
             ..Event::about_project(kind, project)
+        }
+    }
+
+    /// `artifact` was kept with `session`'s task, `task`, as it closed.
+    pub fn artifact(session: &SessionInfo, task: TaskRecord, artifact: Artifact) -> Event {
+        Event {
+            task: Some(task),
+            artifact: Some(artifact),
+            ..Event::about_session(Kind::TaskArtifact, session)
+        }
+    }
+
+    /// `note` was added to the handoff file at `path`, of `session`'s
+    /// worktree: by the session, or as its task closed.
+    pub fn handoff(session: &SessionInfo, path: PathBuf, note: &str) -> Event {
+        let handoff = HandoffAbout {
+            path,
+            note: first_line(note),
+        };
+        Event {
+            handoff: Some(handoff),
+            ..Event::about_session(Kind::HandoffAdded, session)
         }
     }
 
@@ -467,13 +512,13 @@ impl Event {
         event
     }
 
-    /// `run` ended: every step done, or one failed, which it names.
+    /// `run` ended: every step done, or one failed or was cancelled, which
+    /// it names, with why it failed.
     pub fn flow_ended(run: &FlowRun) -> Event {
-        let failed = run
-            .steps
-            .iter()
-            .position(|step| step.state == StepState::Failed);
-        let mut event = Event::about_flow(Kind::FlowEnded, run, failed, run.state().word());
+        let stopped = |state| run.steps.iter().position(|step| step.state == state);
+        let failed = stopped(StepState::Failed);
+        let step = stopped(StepState::Cancelled).or(failed);
+        let mut event = Event::about_flow(Kind::FlowEnded, run, step, run.state().word());
         if let Some(flow) = &mut event.flow {
             flow.said = failed.and_then(|step| run.steps[step].answer.as_deref().map(first_line));
             flow.cost_usd = Some(run.cost_usd());
@@ -583,6 +628,17 @@ impl Event {
                 .session
                 .as_ref()
                 .map_or(String::new(), |session| session.status.clone()),
+            Kind::TaskArtifact => self.artifact.as_ref().map_or(String::new(), |artifact| {
+                format!(
+                    "kept {} ({})",
+                    artifact.name,
+                    artifacts::size(artifact.bytes)
+                )
+            }),
+            Kind::HandoffAdded => self
+                .handoff
+                .as_ref()
+                .map_or(String::new(), |handoff| handoff.note.clone()),
             Kind::TaskOpened | Kind::TaskStarted | Kind::TaskWaiting | Kind::TaskClosed => {
                 self.task.as_ref().map_or(String::new(), |task| {
                     let goal = first_line(&task.goal);
@@ -735,6 +791,7 @@ pub fn example(kind: Kind, session: Option<&SessionInfo>, dir: &Path) -> Event {
         created: now,
         outcome: None,
         id: Some(12),
+        artifacts: Vec::new(),
     };
     let asking = Asking {
         tool: "Bash".into(),
@@ -793,6 +850,23 @@ pub fn example(kind: Kind, session: Option<&SessionInfo>, dir: &Path) -> Event {
                 ..task
             };
             Event::task(kind, &session, task)
+        }
+        Kind::TaskArtifact => {
+            let kept = Artifact {
+                kind: ArtifactKind::File,
+                name: "plan.md".into(),
+                path: dir.join(".crystal-state/tasks/t12/plan.md"),
+                bytes: 2048,
+            };
+            Event::artifact(&session, task, kept)
+        }
+        Kind::HandoffAdded => {
+            let path = dir.join(".crystal/handoff.md");
+            Event::handoff(
+                &session,
+                path,
+                "The ledger tests need the database up: make db",
+            )
         }
         Kind::RunStarted => Event::run_started(&session, goal),
         Kind::RunAsking => Event::asking(&session, asking),

@@ -36,6 +36,10 @@ pub const BUILT_IN: &[BuiltIn] = &[
         description: "sessions with something to do, closed with `crystal done`",
     },
     BuiltIn {
+        name: "handoff",
+        description: "notes a worktree keeps for the sessions after, `crystal handoff`",
+    },
+    BuiltIn {
         name: "backlog",
         description: "each project's list of things to do later",
     },
@@ -53,7 +57,7 @@ pub const BUILT_IN: &[BuiltIn] = &[
     },
     BuiltIn {
         name: "flows",
-        description: "chains of background tasks on one goal, with gates",
+        description: "chains of tasks on one goal, with gates",
     },
     BuiltIn {
         name: "notifications",

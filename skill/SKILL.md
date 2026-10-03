@@ -59,9 +59,9 @@ crystal result tests
 
 ## Or run a flow
 
-A flow is a chain of tasks on one goal, set up in the user's config file (`crystal config` shows it), like
-plan, then implement in a worktree, then a review the user approves. Run one when the user asks for it by
-name:
+A flow is a chain of tasks on one goal, set up in the user's config file (`crystal config` shows it) or the
+project's `.crystal/flows.toml`, like plan, then implement in a worktree, then a review the user approves. Run
+one when the user asks for it by name; `crystal flow defs` lists them:
 
 ```sh
 crystal flow run ship "Retry the webhook when it times out"   # prints the run's name, like ship-1
@@ -75,6 +75,9 @@ crystal result ship-1-review                                   # a step's whole 
 - A gate is the user's to answer. Go on past it (`crystal flow approve <run>`) or send it back with notes
   (`crystal flow back <run> "<notes>"`) only when the user tells you to.
 - `crystal flow retry <run>` runs a failed or interrupted step again. `crystal flow --json` lists every run.
+- `crystal flow cancel <run>` cancels a run and its step's open task: only when the user asks.
+- A step on an agent other than Claude runs in a terminal session, `<run>-<step>`, and the flow goes on once
+  its task closes: `crystal read` it rather than `result`.
 - With flows turned off, these commands say "the flows plugin is off"; run the steps as tasks yourself.
 
 ## Close your task
@@ -85,9 +88,13 @@ with a task, close it when you're through, with one line on how it went:
 ```sh
 crystal done "Fixed the redirect and added a test"
 crystal done --failed "The staging database is down"
+crystal done "Wrote the plan" --artifact docs/plan.md
 ```
 
 - `crystal done` closes the task of the session it runs in. `-n <name>` closes another's.
+- `--artifact <path>`, once for each file, keeps a copy of a file in your worktree with the task, for whoever
+  reads it once the worktree is gone: a plan, a report. A file can be 1 MiB at most. One that can't be kept
+  refuses the close and says why; the task stays open, so fix the call and run it again.
 - End a turn with your task still open and crystal reminds you, once. Close it then if you're through;
   if you're waiting on the user, leave it open and end your turn.
 - An agent you start with a prompt (`crystal new -d claude "…"`, or `-t "…"` for any command) is given a task.
@@ -100,6 +107,21 @@ crystal done --failed "The staging database is down"
   transcript, and `crystal tasks cancel <task>` cancels it and stops its session: only when the user asks.
 - `crystal tasks new "<goal>"` makes a task and starts an agent on it, printing its number; `--background`
   runs it as `crystal task` does, and `--no-launch` leaves it pending until `crystal tasks start <task>`.
+
+## Leave notes for the next session
+
+Each git worktree keeps notes for the sessions that work in it after you, in `.crystal/handoff.md`. When
+you're told it has some, read that file before you start. When you learn something the next session there
+should know, like a decision and why, a dead end, a command that works or what you left undone, add a note:
+
+```sh
+crystal handoff "The fixtures live in tests/fixtures; cargo test codec runs just them"
+```
+
+- Keep each note short and whole on its own; crystal adds the time and your session's name. Never edit the
+  file yourself.
+- Closing your task adds its summary there for you.
+- With the handoff plugin off, `crystal handoff` says so; carry on without it.
 
 ## Keep a backlog
 

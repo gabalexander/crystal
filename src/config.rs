@@ -40,6 +40,8 @@ pub struct Config {
     pub tasks: TaskSettings,
     /// How long the event log keeps what happened: `[events]` in the file.
     pub events: EventSettings,
+    /// Where worktrees' handoff notes go: `[handoff]` in the file.
+    pub handoff: HandoffSettings,
     /// Saved ways to start an agent, offered first in the new-session
     /// panel: `[[profile]]` tables in the file. See [`crate::profile`].
     #[serde(rename = "profile", skip_serializing_if = "Vec::is_empty")]
@@ -113,6 +115,16 @@ impl Default for EventSettings {
     }
 }
 
+/// Where the handoff notes go: see [`crate::handoff`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct HandoffSettings {
+    /// The projects, by their main worktree's directory, whose notes are
+    /// kept in git with their branches, rather than kept out of it.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub in_git: Vec<PathBuf>,
+}
+
 /// The TUI's colors to choose from. `dark` and `light` paint their own
 /// background, so they look the same in any terminal; `terminal` paints
 /// nothing and keeps to the terminal's own colors.
@@ -135,6 +147,7 @@ impl Default for Config {
             memory: MemorySettings::default(),
             tasks: TaskSettings::default(),
             events: EventSettings::default(),
+            handoff: HandoffSettings::default(),
             profiles: Vec::new(),
             flows: Vec::new(),
         }
@@ -303,7 +316,7 @@ pub fn from_text(text: &str) -> Result<Config> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::flows::Step;
+    use crate::flows::{Placement, Step};
     use crate::profile::StartIn;
 
     fn parse(text: &str) -> Result<Config> {
@@ -582,6 +595,9 @@ back_to = "build"
                 daily_budget_usd: 20.0,
             },
             events: EventSettings { keep_days: 7 },
+            handoff: HandoffSettings {
+                in_git: vec![PathBuf::from("~/code/app")],
+            },
             profiles: vec![Profile {
                 name: "review".into(),
                 description: Some("A second pair of eyes".into()),
@@ -602,17 +618,21 @@ back_to = "build"
                         name: "plan".into(),
                         profile: Some("review".into()),
                         prompt: "Plan {goal}".into(),
+                        placement: None,
                         worktree: false,
                         gate: true,
                         back_to: None,
+                        max_rounds: Some(2),
                     },
                     Step {
                         name: "build".into(),
                         profile: None,
                         prompt: "Build it:\n{previous}".into(),
-                        worktree: true,
+                        placement: Some(Placement::Fresh),
+                        worktree: false,
                         gate: false,
                         back_to: None,
+                        max_rounds: None,
                     },
                 ],
             }],
