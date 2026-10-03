@@ -76,8 +76,8 @@ a pane beside it.
 There are no boxes. The sidebar lists each project with a thin rule after its name, its worktrees under it,
 and their sessions under those, each with a mark for what it's doing and how long ago that changed. A thin
 rule separates the sidebar from the panes; each pane has a header line naming its session, with where it runs
-on the right. The bar along the top counts the sessions and how many wait on you, and the footer says where
-you are and offers the keys that matter there.
+on the right. The bar along the top shows your [tabs](#tabs) and counts the sessions and how many wait on you,
+and the footer says where you are and offers the keys that matter there.
 
 | Key | In the sidebar |
 |---|---|
@@ -86,6 +86,10 @@ you are and offers the keys that matter there.
 | `s` | split the selected session off into a pane of its own, or close its split |
 | `Tab` / `Shift+Tab` | type into the next pane, or the one before |
 | `PageUp` / `PageDown` | page the selected session's pane back through its history, or forward to live |
+| `t` | make a new [tab](#tabs) on the selected session, and go to it |
+| `T` | name the tab you're in |
+| `&` | close the tab you're in; its sessions keep running |
+| `[` / `]`, `1-9` | go to the tab before or after this one, or to the tab with that number |
 | `n` | start a new session from [the new-session panel](#starting-a-session), and type into it |
 | `w` | the same, in a new worktree on a branch named after the task |
 | `W` | remove the selected session's worktree, once nothing runs in it and you've said `y` |
@@ -252,6 +256,23 @@ the sessions that were running again, in the same directories. Claude Code and C
 conversation they were in. `crystal kill-server` is asked to stop everything, so after it nothing comes back.
 The list is kept in `~/.local/state/crystal/sessions.json`, without the sessions' environment variables, since
 those can hold secrets; a session started again gets the environment of whoever started the daemon again.
+
+### Tabs
+
+A tab is one way of laying out the panes: the session you had selected and the sessions you split off beside
+it. Keep an agent and the session reviewing it in one tab, a dev server and its logs in another, and switch
+between them without picking each session out of the sidebar again.
+
+The tabs sit in the bar along the top, numbered, the one you're in standing out. `t` makes a new one on the
+selected session, with nothing split off, and takes you to it. `[` and `]` go to the tab before and after,
+`1` to `9` straight to that one, and a click on a tab goes there too. Going to a tab selects the session it
+was on and brings its splits back. `T` names the tab you're in, and the bar shows the name after its number;
+with too many to fit, the bar shows only the numbers.
+
+Tabs only arrange sessions; they don't own them. Every session stays in the sidebar whichever tab you're in,
+the same session can be in a few tabs at once, and `&` closes a tab without stopping anything in it. There's
+always one tab, and nine at most. They're kept beside the daemon's state, in `~/.local/state/crystal/`, so
+they're there when you open the TUI again.
 
 ### Starting a session
 
@@ -843,6 +864,7 @@ commands talk to it over a unix socket, so closing the TUI never stops an agent.
 - [x] Projects and worktrees
 - [x] Resume after a restart
 - [x] Split panes
+- [x] Tabs
 - [x] Agents that start, message, wait on and read other agents
 - [x] Tasks that close done or failed, and a backlog per project
 - [x] Plugins: crystal's own switched on and off, and your own actions, panes and hooks

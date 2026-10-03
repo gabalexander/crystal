@@ -1107,7 +1107,7 @@ fn a_question_mark_shows_every_key_and_the_next_key_only_closes_it() {
     tui.shows("? keys");
     tui.type_keys("?");
     tui.shows("In the sidebar");
-    tui.shows("next one that needs you");
+    tui.shows("next needing you");
     tui.shows("With the mouse");
 
     // q puts the keys away; it doesn't quit.
@@ -1945,6 +1945,93 @@ fn each_pane_sizes_its_own_session() {
     eventually("the panes are side by side", || {
         size_of("left") == (27, 85) && size_of("right") == (27, 85)
     });
+}
+
+/// Starts a session for each of `names` that says it's here, and waits
+/// until each has.
+fn sessions_saying_here(crystal: &Crystal, names: &[&str]) {
+    for name in names {
+        let script = format!("echo {name} is here; echo > {name}-ready; sleep 30");
+        crystal.ok(&["new", "-n", name, "sh", "-c", &script]);
+        written(&crystal.dir.path().join(format!("{name}-ready")));
+    }
+}
+
+#[test]
+fn each_tab_shows_its_own_panes_and_going_back_brings_them_back() {
+    let crystal = Crystal::new();
+    sessions_saying_here(&crystal, &["alpha", "beta", "gamma"]);
+
+    // The first tab: alpha split off beside beta.
+    let mut tui = crystal.tui();
+    tui.shows("alpha is here");
+    tui.type_keys("s");
+    tui.type_keys("j");
+    tui.shows("beta is here");
+    tui.shows("alpha is here");
+
+    // A new tab starts on beta alone; gamma is selected in it.
+    tui.type_keys("t");
+    tui.hides("alpha is here");
+    tui.type_keys("j");
+    tui.shows("gamma is here");
+    tui.hides("beta is here");
+
+    tui.type_keys("[");
+    tui.shows("alpha is here");
+    tui.shows("beta is here");
+    tui.hides("gamma is here");
+
+    // The second tab's label, " 2 ", is drawn from column 13 of the top
+    // bar.
+    tui.type_keys(&click(14, 0));
+    tui.shows("gamma is here");
+    tui.hides("alpha is here");
+}
+
+#[test]
+fn closing_a_tab_leaves_its_sessions_running() {
+    let crystal = Crystal::new();
+    sessions_saying_here(&crystal, &["alpha", "beta"]);
+
+    let mut tui = crystal.tui();
+    tui.shows("alpha is here");
+    tui.type_keys("t");
+    tui.type_keys("j");
+    tui.shows("beta is here");
+    tui.type_keys("&");
+    tui.shows("closed tab 2; its sessions keep running");
+    tui.shows("alpha is here");
+    tui.hides("beta is here");
+    assert_eq!(crystal.row("beta").unwrap()[1], "running");
+}
+
+#[test]
+fn tabs_come_back_when_the_tui_opens_again() {
+    let crystal = Crystal::new();
+    sessions_saying_here(&crystal, &["alpha", "beta"]);
+
+    let mut tui = crystal.tui();
+    tui.shows("alpha is here");
+    tui.type_keys("s");
+    tui.type_keys("t");
+    tui.type_keys("j");
+    tui.shows("beta is here");
+    tui.type_keys("T");
+    tui.shows("tab name:");
+    tui.type_keys("review\r");
+    tui.shows(" 2 review ");
+    tui.type_keys("q");
+    assert!(tui.exit());
+
+    // Back in the named tab, on beta; the first still has alpha split off.
+    let mut tui = crystal.tui();
+    tui.shows(" 2 review ");
+    tui.shows("beta is here");
+    tui.hides("alpha is here");
+    tui.type_keys("1");
+    tui.shows("alpha has a pane of its own");
+    tui.shows("alpha is here");
 }
 
 #[test]

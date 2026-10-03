@@ -1,6 +1,6 @@
 //! The TUI, run as `crystal` with no command: a sidebar with every session,
 //! the selected one live in a pane beside it, and up to two more split off
-//! into panes of their own.
+//! into panes of their own, in tabs that each keep their own.
 //!
 //! Everything that happens arrives as an [`Event`] on one channel: a key,
 //! the mouse, a resize, output from the session in the pane, a fresh
@@ -26,6 +26,7 @@ mod screen_widget;
 mod search;
 pub(crate) mod sidebar;
 mod status;
+mod tabs;
 mod text_area;
 mod text_input;
 mod theme;
@@ -174,6 +175,8 @@ pub fn run(socket: &Path) -> Result<()> {
         theme: Theme::from_env(config.theme),
         started: Instant::now(),
         memory_path: launcher::memory_path(socket),
+        tabs_path: tabs::path(socket),
+        kept_tabs: tabs::Tabs::default(),
         quitting: false,
         overlay: None,
         count_backlog,
@@ -188,6 +191,8 @@ pub fn run(socket: &Path) -> Result<()> {
         tui.app.set_flows(list_flows(socket));
     }
     tui.set_sessions(sessions);
+    tui.app.set_tabs(tabs::load(&tui.tabs_path));
+    tui.kept_tabs = tui.app.tabs_to_keep();
 
     let mut terminal = ratatui::try_init()?;
     let result = tui.run_with_modes(&mut terminal, events);
@@ -259,6 +264,9 @@ struct Tui {
     started: Instant,
     /// Where the new-session panel's memory is kept.
     memory_path: PathBuf,
+    /// Where the tabs are kept, and the tabs as they were last kept there.
+    tabs_path: PathBuf,
+    kept_tabs: tabs::Tabs,
     quitting: bool,
 }
 
@@ -310,8 +318,19 @@ impl Tui {
                 self.handle(event);
             }
             self.fetch_issue_body();
+            self.keep_tabs();
         }
         Ok(())
+    }
+
+    /// Writes the tabs down when they've changed, so that they're there the
+    /// next time the TUI opens, however this one ends.
+    fn keep_tabs(&mut self) {
+        let tabs = self.app.tabs_to_keep();
+        if tabs != self.kept_tabs {
+            tabs::save(&self.tabs_path, &tabs);
+            self.kept_tabs = tabs;
+        }
     }
 
     /// Takes a fresh list of sessions, and tells the pull request poller
