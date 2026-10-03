@@ -1,9 +1,10 @@
 //! `crystal mcp`: an MCP server over its standard input and output, which
-//! crystal gives Claude in a task in the background, to search its
-//! project's memory with `memory_search` and read an entry in full with
-//! `memory_show`. A task has nobody to say yes to a shell command, so tools
-//! of its own are how it reads what earlier sessions learned, beyond the
-//! few entries it's shown as it starts.
+//! crystal gives every Claude Code session it starts, in a terminal or a
+//! task in the background, to search its project's memory with
+//! `memory_search` and read an entry in full with `memory_show`. With tools
+//! of its own, it reads what earlier sessions learned, beyond the few
+//! entries it's shown as it starts, without a shell command, which a task
+//! has nobody to say yes to.
 //!
 //! It speaks JSON-RPC 2.0, a message a line, as MCP's stdio transport does,
 //! and only as much of MCP as a server of two tools needs: `initialize`,
@@ -54,8 +55,8 @@ pub fn run(socket: &Path, dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// The command line that runs the server for a task in `dir`, as Claude's
-/// `--mcp-config` takes it.
+/// The command line that runs the server for a session in `dir`, as
+/// Claude's `--mcp-config` takes it.
 pub fn config(crystal: &Path, socket: &Path, dir: &Path) -> String {
     let path = |path: &Path| path.to_string_lossy().into_owned();
     json!({

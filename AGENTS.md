@@ -11,7 +11,7 @@ roadmap.
 - Lint: `make lint` (`cargo fmt --check` and `cargo clippy --all-targets -- -D warnings`)
 - Format: `cargo fmt`
 - Install: `make install`: a release build into `~/.local/bin`, then `crystal restart-server` so a running
-  daemon picks it up
+  daemon picks it up, and `crystal skill --install` (not with `CRYSTAL_NO_SKILL=1`)
 
 Run lint, format and tests before every commit.
 
@@ -42,7 +42,9 @@ is: it's the one request every version must understand.
   the old way, or in the Kitty keyboard protocol once a program has asked for it
 - `src/remote.rs`: `crystal ssh`: finds (or installs) crystal on another machine, then runs it there over ssh
 - `src/skill.rs`: `crystal skill`: prints or installs `skill/SKILL.md`, the Claude Code skill for driving
-  crystal; keep it in step with the commands it teaches
+  crystal, and brings up to date a copy an earlier crystal installed that nobody has changed, which the daemon
+  does as it starts; keep it in step with the commands it teaches, and add its SHA-256 to `SHIPPED` when it
+  changes (a test says so)
 - `src/tui/`: the TUI (`crystal` with no command)
   - `mod.rs`: the event loop: one channel of events, then update and draw
   - `app.rs`: the state and how keys and the mouse change it; no I/O, so it's unit-tested
@@ -141,8 +143,9 @@ is: it's the one request every version must understand.
 - `src/distill.rs`: the distiller: after a task closes, one tool-less `claude -p` (Haiku by default, `[memory]`
   in the config) over the end of its transcript, told what the memory has already; its answer checked
   against the checkout before it's kept
-- `src/mcp.rs`: `crystal mcp`: an MCP server over stdio with `memory_search` and `memory_show`, which a task in
-  the background is given with `--mcp-config` and its tools allowed
+- `src/mcp.rs`: `crystal mcp`: an MCP server over stdio with `memory_search` and `memory_show`, which every
+  Claude Code session crystal starts, in a terminal or a task in the background, is given with `--mcp-config`
+  and its tools allowed
 - `src/embed.rs`: search by meaning: bge-small-en-v1.5 run through Candle, `Embed` (the model, or a stand-in in
   tests), downloading it at a pinned revision with its SHA-256s checked, and the one copy each process loads
   when `[memory] embeddings` is on; memory.rs keeps the vectors and merges the rankings
@@ -175,8 +178,9 @@ is: it's the one request every version must understand.
 - `src/shell.rs`: quoting arguments and writing paths with `~`, the way a shell reads them
 - `tests/cli.rs`: end-to-end tests that drive the real binary against a private daemon (and read its database
   beside its socket to see what it wrote down), with a config of
-  their own that turns notifications and the memory plugin off (a memory test turns it back on), and plugins
-  of their own in its plugins directory; a test that opens the new-session panel pins `PATH` to its fake
+  their own that turns notifications and the memory plugin off (a memory test turns it back on), plugins
+  of their own in its plugins directory, and a Claude Code config directory of their own (`CLAUDE_CONFIG_DIR`),
+  since a daemon brings the skill there up to date as it starts; a test that opens the new-session panel pins `PATH` to its fake
   agents, so no real agent is found or run. vt100 stands in for the user's own terminal: a second emulator,
   apart from crystal's. A test that copies runs the TUI as over ssh (`SSH_TTY` set), so it asks the terminal
   with OSC 52 and never touches the machine's clipboard

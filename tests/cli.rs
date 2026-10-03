@@ -38,6 +38,13 @@ impl Crystal {
         self.config_home().join("crystal/config.toml")
     }
 
+    /// The test's own Claude Code config directory, its `CLAUDE_CONFIG_DIR`:
+    /// a daemon brings the skill there up to date as it starts, so it must
+    /// never be the user's own.
+    fn claude_config_dir(&self) -> PathBuf {
+        self.dir.path().join("claude-config")
+    }
+
     /// Writes the test's config file.
     fn configure(&self, toml: &str) {
         std::fs::create_dir_all(self.config_home().join("crystal")).unwrap();
@@ -52,6 +59,7 @@ impl Crystal {
             .args(args)
             .current_dir(self.dir.path())
             .env("XDG_CONFIG_HOME", self.config_home())
+            .env("CLAUDE_CONFIG_DIR", self.claude_config_dir())
             .envs(PLAIN_GIT);
         command
     }
@@ -134,6 +142,7 @@ impl Crystal {
         // So that a shell crystal starts is the same everywhere.
         command.env("SHELL", "/bin/sh");
         command.env("XDG_CONFIG_HOME", self.config_home());
+        command.env("CLAUDE_CONFIG_DIR", self.claude_config_dir());
         for (key, value) in PLAIN_GIT.iter().chain(env) {
             command.env(key, value);
         }
@@ -3367,15 +3376,8 @@ fn ls_json_lists_every_session_with_its_status() {
 #[test]
 fn skill_install_writes_the_skill_and_keeps_a_changed_one() {
     let crystal = Crystal::new();
-    let claude_dir = crystal.dir.path().join("claude-config");
-    let install = |args: &[&str]| {
-        crystal
-            .command(args)
-            .env("CLAUDE_CONFIG_DIR", &claude_dir)
-            .output()
-            .unwrap()
-    };
-    let skill_file = claude_dir.join("skills/crystal/SKILL.md");
+    let install = |args: &[&str]| crystal.run(args);
+    let skill_file = crystal.claude_config_dir().join("skills/crystal/SKILL.md");
     let printed = crystal.ok(&["skill"]);
     assert!(printed.starts_with("---\nname: crystal\n"));
 
@@ -3395,8 +3397,22 @@ fn skill_install_writes_the_skill_and_keeps_a_changed_one() {
         "my own notes\n"
     );
 
+    // Nor does a daemon starting write over it.
+    crystal.ok(&["new", "-d", "-n", "worker", "sleep", "30"]);
+    assert_eq!(
+        std::fs::read_to_string(&skill_file).unwrap(),
+        "my own notes\n"
+    );
+
     assert!(install(&["skill", "--install", "--force"]).status.success());
     assert_eq!(std::fs::read_to_string(&skill_file).unwrap(), printed);
+}
+
+#[test]
+fn a_daemon_starting_never_installs_the_skill() {
+    let crystal = Crystal::new();
+    crystal.ok(&["new", "-d", "-n", "worker", "sleep", "30"]);
+    assert!(!crystal.claude_config_dir().join("skills").exists());
 }
 
 /// A crystal with memory on, and a project for it to remember things about.
@@ -3545,13 +3561,32 @@ fn claude_starts_with_what_its_project_remembered_in_its_system_prompt() {
     assert!(
         args.contains(
             "\n\nWhat this project's earlier sessions learned:\n\
-             - (gotcha) The ledger tests need the database up\n"
+             - 1 (gotcha) The ledger tests need the database up\n"
         ),
         "{args}"
     );
+    assert!(args.contains("memory_search tool"), "{args}");
     assert!(args.contains("crystal remember"), "{args}");
     assert!(!args.contains("rounding"), "{args}");
     assert!(args.ends_with("fix the ledger tests\n"), "{args}");
+
+    // And crystal's MCP server, its tools allowed, to search the rest, given
+    // ahead of crystal's settings, so they can't take the prompt.
+    let args: Vec<&str> = args.lines().collect();
+    assert_eq!(args[0], "--mcp-config");
+    let server: serde_json::Value = serde_json::from_str(args[1]).unwrap();
+    let server = &server["mcpServers"]["crystal"];
+    assert_eq!(server["command"], CRYSTAL);
+    assert_eq!(server["args"][2], "mcp");
+    assert_eq!(server["args"][4], repo_dir);
+    assert_eq!(
+        args[2..4],
+        [
+            "--allowedTools",
+            "mcp__crystal__memory_search,mcp__crystal__memory_show"
+        ]
+    );
+    assert_eq!(args[4], "--settings");
 }
 
 #[test]
@@ -4431,7 +4466,8 @@ fn a_relative_socket_path_names_the_same_socket_for_the_daemon() {
         "30",
     ])
     .current_dir(crystal.dir.path())
-    .env("XDG_CONFIG_HOME", crystal.dir.path());
+    .env("XDG_CONFIG_HOME", crystal.dir.path())
+    .env("CLAUDE_CONFIG_DIR", crystal.claude_config_dir());
     let out = new.output().unwrap();
     assert!(
         out.status.success(),
@@ -5445,6 +5481,7 @@ fn with_memory_switched_off_claude_isn_t_shown_what_was_remembered() {
     let args = written(&repo.join("args"));
     assert!(!args.contains("earlier sessions learned"), "{args}");
     assert!(!args.contains("crystal remember"), "{args}");
+    assert!(!args.contains("--mcp-config"), "{args}");
     assert!(args.ends_with("fix it\n"), "{args}");
 }
 

@@ -23,12 +23,15 @@ lint:
 # copying the new one in, it's restarted on it: running sessions come back,
 # Claude Code in its conversation. The old file is removed first, not
 # written over, since macOS kills a program whose signed file changes under
-# it.
+# it. Then the skill that teaches Claude Code to drive crystal is installed
+# or brought up to date, unless CRYSTAL_NO_SKILL=1; one you've changed is
+# kept.
 install: release
 	mkdir -p $(BIN)
 	rm -f $(BIN)/crystal
 	cp target/release/crystal $(BIN)/crystal
 	$(BIN)/crystal restart-server
+	@if [ "$$CRYSTAL_NO_SKILL" != "1" ]; then $(BIN)/crystal skill --install || true; fi
 
 uninstall:
 	-$(BIN)/crystal kill-server

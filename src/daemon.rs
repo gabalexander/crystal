@@ -23,6 +23,7 @@ use crate::protocol::{
     Response, TaskInfo, TaskRecord,
 };
 use crate::session::{STOP_GRACE, Session, Term};
+use crate::skill;
 use crate::socket;
 use crate::state::SavedSession;
 use crate::tasks;
@@ -63,6 +64,14 @@ pub fn run(socket: &Path) -> Result<()> {
         distilling: Arc::default(),
         preparing: Arc::default(),
     });
+    // A daemon starts again after every upgrade, so this is where the skill
+    // an earlier crystal installed learns this one's commands: before the
+    // saved sessions start, so that Claude Code in them reads the new one.
+    match skill::refresh() {
+        Ok(Some(path)) => eprintln!("crystal daemon: updated the skill in {}", path.display()),
+        Ok(None) => {}
+        Err(err) => eprintln!("crystal daemon: couldn't update the skill: {err:#}"),
+    }
     daemon.start_saved_sessions();
     daemon.take_up_flows();
     // With search by meaning on, the model is loaded and every entry
@@ -1209,6 +1218,7 @@ fn start(
         given_task.as_deref(),
         &instructions,
     );
+    let argv = agents::with_options(argv, &memory_tools(socket, &cwd, &command, &crystal));
     let mut session = Session::spawn(id, name.clone(), command, &argv, cwd, &env)?;
     if let Some(goal) = task {
         session.give_task(TaskInfo {
@@ -1261,6 +1271,22 @@ fn remembered(socket: &Path, cwd: &Path, command: &[String]) -> Option<String> {
     memory::for_launch(socket, &project, &asked, false, embed::as_embed(&embedder))
         .ok()
         .flatten()
+}
+
+/// What gives a Claude Code session in `cwd` the tools that search its
+/// project's memory: crystal's MCP server, run by `crystal`, the path of
+/// this program, and its tools allowed, so it searches without asking for a
+/// shell command. Nothing for another program, or with memory off.
+fn memory_tools(socket: &Path, cwd: &Path, command: &[String], crystal: &Path) -> Vec<String> {
+    if agents::program_name(command) != Some("claude") || !memory::enabled_now() {
+        return Vec::new();
+    }
+    vec![
+        "--mcp-config".to_string(),
+        mcp::config(crystal, socket, cwd),
+        "--allowedTools".to_string(),
+        mcp::TOOLS.join(","),
+    ]
 }
 
 /// Loads the embedding model, when the config says to search with it, and

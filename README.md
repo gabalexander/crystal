@@ -49,8 +49,9 @@ curl -fsSL https://raw.githubusercontent.com/gabalexander/crystal/master/install
 ```
 
 It downloads the latest release, checks it against its checksum, and puts `crystal` in `~/.local/bin`.
-`CRYSTAL_VERSION=0.1.0` picks a release, and `CRYSTAL_INSTALL_DIR` another directory. The Linux builds are
-static, so they run on any distribution.
+`CRYSTAL_VERSION=0.1.0` picks a release, and `CRYSTAL_INSTALL_DIR` another directory. With Claude Code on the
+machine, it also installs [the skill](#a-skill-for-claude-code) that teaches Claude Code to drive crystal;
+`CRYSTAL_NO_SKILL=1` leaves it out. The Linux builds are static, so they run on any distribution.
 
 Or build it from source, with Rust 1.88 or newer:
 
@@ -531,9 +532,13 @@ crystal skill --install   # into ~/.claude/skills/crystal, or $CLAUDE_CONFIG_DIR
 crystal skill             # or just print it
 ```
 
+The install script installs it when it finds Claude Code (its `claude` command, or `~/.claude`), and so does
+`make install`; `CRYSTAL_NO_SKILL=1` leaves it out of either.
+
 `--install` won't write over a skill file you've changed; `--force` does. The skill lives in
-[`skill/SKILL.md`](skill/SKILL.md), and each crystal carries its own copy, so installing again after an
-upgrade brings it up to date.
+[`skill/SKILL.md`](skill/SKILL.md), and each crystal carries its own copy. After an upgrade, the daemon brings
+the skill up to date as it starts, when the copy installed is one an earlier crystal wrote and nobody has
+changed since; it never installs the skill where it isn't, or writes over one you've changed.
 
 ### Other machines
 
@@ -619,14 +624,15 @@ crystal memory embed                 # download the model that searches by meani
   beside it, `/` filters, `x` forgets an entry and `p` promotes it, each after a `y`.
 
 When a Claude Code session starts, crystal adds the entries that have most to do with its first prompt (the
-newest, without one) to its system prompt, a few at most and none that's stale, with a line on how to search
-and add more. Codex is told nothing: it has no option for a system prompt, and anything crystal typed in would
+newest, without one) to its system prompt, each with its id, a few at most and none that's stale, with a line
+on how to search and add more. Codex is told nothing: it has no option for a system prompt, and anything crystal typed in would
 read as your first message. `crystal plugin disable memory` turns it all off: see [plugins](#plugins).
 
-A task in the background (`claude -p`) is shown the same, with each entry's id, and gets crystal's own MCP
-server, `crystal mcp`, with its two tools allowed: `memory_search`, which searches the project's memory the way
-`crystal memory search` does, and `memory_show`, which reads one entry in full. A task has nobody to say yes to
-a shell command, so these are how it reads the rest of what was learned.
+Every Claude Code session crystal starts, in a terminal or as a task in the background (`claude -p`), gets
+crystal's own MCP server, `crystal mcp`, with its two tools allowed: `memory_search`, which searches the
+project's memory the way `crystal memory search` does, and `memory_show`, which reads one entry in full. These
+are how it reads the rest of what was learned without a shell command, which a task has nobody to say yes to
+and a session in a terminal would stop to ask about.
 
 #### Search by meaning
 

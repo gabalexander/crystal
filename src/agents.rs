@@ -78,6 +78,18 @@ pub fn argv(
     argv
 }
 
+/// A Claude Code command line from [`argv`] with `options` right after the
+/// program, ahead of `--settings`. An option that takes several values,
+/// like `--mcp-config`, takes every argument up to the next option, which
+/// here is always `--settings`, so it can't take a first prompt given
+/// without `--`. Any other program's command line stays as it is.
+pub fn with_options(mut argv: Vec<String>, options: &[String]) -> Vec<String> {
+    if program_name(&argv) == Some("claude") {
+        argv.splice(1..1, options.iter().cloned());
+    }
+    argv
+}
+
 /// Claude's arguments with `value` given to the option `names` names too:
 /// right after the option where the user gave it, which takes several
 /// values, or else ahead of the rest.
@@ -310,6 +322,27 @@ mod tests {
         let asked = command(&["claude", "--append-system-prompt", "Be brief."]);
         let argv = argv(&asked, Path::new("/bin/crystal"), None, None, &[]);
         assert_eq!(argv[3..], ["--append-system-prompt", "Be brief."]);
+    }
+
+    #[test]
+    fn crystal_s_options_come_ahead_of_settings_so_they_can_t_take_the_prompt() {
+        let asked = command(&["claude", "fix it"]);
+        let argv = argv(&asked, Path::new("/bin/crystal"), None, None, &[]);
+        let options = command(&["--allowedTools", "mcp__crystal__memory_search"]);
+        let with = with_options(argv, &options);
+        assert_eq!(
+            with[..4],
+            [
+                "claude",
+                "--allowedTools",
+                "mcp__crystal__memory_search",
+                "--settings"
+            ]
+        );
+        assert_eq!(with.last().unwrap(), "fix it");
+
+        let other = command(&["aider", "fix it"]);
+        assert_eq!(with_options(other.clone(), &options), other);
     }
 
     #[test]
