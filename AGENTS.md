@@ -59,7 +59,10 @@ is: it's the one request every version must understand.
 - `src/protocol.rs`: requests and responses, one JSON line each, and the frames an attached client sends
 - `src/socket.rs`: where the socket lives
 - `src/state.rs`: the running sessions, written down to start them again after a restart
+- `src/config.rs`: the settings in `~/.config/crystal/config.toml`
+- `src/notify.rs`: telling the user when a session needs them: desktop notifications, or their own command
 - `src/env.rs`: the environment a session's program starts with
 - `src/git.rs`: a directory's project, worktree and branch, and making and removing worktrees (runs `git`)
 - `src/shell.rs`: quoting arguments and writing paths with `~`, the way a shell reads them
-- `tests/cli.rs`: end-to-end tests that drive the real binary against a private daemon
+- `tests/cli.rs`: end-to-end tests that drive the real binary against a private daemon, with a config of
+  their own that turns notifications off

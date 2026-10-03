@@ -83,6 +83,7 @@ a pane beside it.
 | `n` | ask what to run, then start it in a new session beside the selected one, and type into it |
 | `w` | ask for a branch, then what to run in a new worktree on it, and type into it |
 | `x` | kill the selected session, once you've said `y` |
+| `u` | select the next session that needs you: waiting on you first, then done |
 | `q` | quit; the sessions keep running |
 
 While you're typing into a session, every key goes to it, `Tab` included, except `Ctrl+\`, which takes you
@@ -125,6 +126,12 @@ reads the screen: the spinner an agent puts in its title, "esc to interrupt" whi
 it asks before a command. The screen covers agents without hooks, like Codex or a Claude you started from a
 shell, and what hooks never say: a turn you cut short with Esc, or work carrying on once you've said yes.
 
+When a session comes to need you while you're looking elsewhere (its agent asks you something, or finishes a
+turn nobody was watching), crystal shows a desktop notification, like "claude-2 is waiting on you · app
+fix/login". It uses macOS's own notifications, or `notify-send` on Linux when it's installed. You're told once
+each time a session comes to need you, and never about a session you're watching. `u` in the TUI takes you to
+it.
+
 Everything is also a command, for scripts and for agents:
 
 ```sh
@@ -141,6 +148,7 @@ crystal read review --history               # and what scrolled off it before
 crystal kill review                         # stop one session
 crystal kill-server                         # stop every session, and the daemon
 crystal restart-server                      # restart the daemon, say after an upgrade; sessions come back
+crystal config                              # where the config file is, and the settings in effect
 ```
 
 ```
@@ -183,6 +191,29 @@ Enter on its own, so an agent takes it as a prompt and not as pasted text. `--wa
 text starts, not one that ended before it. `wait` returns once the agent isn't working: `done`, `waiting` when
 it asks something, `idle`, or how its program exited. It takes a `--timeout` in seconds, and fails when that
 runs out. A program that doesn't say what it's doing counts as busy until it ends.
+
+### Settings
+
+Settings live in `~/.config/crystal/config.toml` (or `$XDG_CONFIG_HOME/crystal/config.toml`). The file is
+optional, and so is every setting in it. `crystal config` prints the settings in effect, ready to save as the
+file and change. A setting crystal doesn't know is an error that names it, so a typo never goes unnoticed.
+
+| Setting | Default | What it does |
+|---|---|---|
+| `notify` | `true` | tell you when a session needs you |
+| `notify_command` | none | a shell command to run instead of the desktop notification |
+| `new_session` | `"claude"` | what the TUI's new-session line starts out with |
+
+`notify_command` is for telling you some other way, like a message to your phone. It runs with
+`CRYSTAL_NOTICE` (the line a notification would show), `CRYSTAL_NOTICE_SESSION` (the session's name) and
+`CRYSTAL_NOTICE_ACTIVITY` (`waiting` or `done`) in its environment:
+
+```toml
+notify_command = 'curl -s -d "$CRYSTAL_NOTICE" ntfy.sh/my-crystal'
+```
+
+The daemon reads the notification settings each time it tells you something, so a change counts straight
+away; the TUI reads `new_session` when it starts.
 
 ## How it works
 
