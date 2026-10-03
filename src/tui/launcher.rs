@@ -704,6 +704,11 @@ pub fn panel_area(launcher: &Launcher, area: Rect) -> Rect {
 
 /// Draws the panel over `area`, the panes.
 pub fn draw(frame: &mut Frame, launcher: &Launcher, theme: &Theme, area: Rect) {
+    // What's behind the panel stays in view, dimmed, so the panel stands
+    // out from it without hiding where it came from.
+    frame
+        .buffer_mut()
+        .set_style(area, Style::new().add_modifier(Modifier::DIM));
     let panel = panel_area(launcher, area);
     frame.render_widget(Clear, panel);
     let framed = theme.panel == Color::Reset;
