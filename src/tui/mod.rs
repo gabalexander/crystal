@@ -1214,12 +1214,20 @@ fn directory_for(socket: &Path, place: Place) -> Result<PathBuf> {
     match place {
         Place::Directory(Some(dir)) => Ok(dir),
         Place::Directory(None) => Ok(std::env::current_dir()?),
-        Place::NewWorktree { branch, base } => {
+        Place::NewWorktree {
+            branch,
+            base,
+            made_up,
+        } => {
             let base = match base {
                 Some(base) => base,
                 None => std::env::current_dir()?,
             };
-            client::add_worktree(socket, &base, &branch)
+            if made_up {
+                client::add_new_worktree(socket, &base, &branch)
+            } else {
+                client::add_worktree(socket, &base, &branch)
+            }
         }
     }
 }

@@ -20,6 +20,7 @@ mod hook;
 mod keys;
 mod memory;
 mod memory_cli;
+mod names;
 mod notify;
 mod plugin_cli;
 mod plugin_hooks;

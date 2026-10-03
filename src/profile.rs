@@ -65,7 +65,7 @@ pub struct Profile {
 pub enum StartIn {
     /// Where the selected session runs.
     Here,
-    /// In a new worktree, on a branch named after the task.
+    /// In a new worktree, on a branch with a made-up name.
     Worktree,
 }
 

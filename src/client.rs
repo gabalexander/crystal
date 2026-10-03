@@ -213,6 +213,14 @@ pub fn add_worktree(socket: &Path, dir: &Path, branch: &str) -> Result<PathBuf> 
     Ok(path)
 }
 
+/// Makes a worktree on a new branch, `branch` or the first like it that's
+/// free, as [`git::add_new_worktree`] does, and tells the daemon.
+pub fn add_new_worktree(socket: &Path, dir: &Path, branch: &str) -> Result<PathBuf> {
+    let (path, branch) = git::add_new_worktree(dir, branch)?;
+    tell_worktree(socket, &path, Some(branch), true);
+    Ok(path)
+}
+
 /// Tells the daemon a worktree was made or removed. The worktree is made or
 /// gone either way, so a daemon that can't be told is no reason to fail.
 fn tell_worktree(socket: &Path, path: &Path, branch: Option<String>, created: bool) {

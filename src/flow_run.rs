@@ -25,6 +25,9 @@ use std::path::{Path, PathBuf};
 /// flow` to list. Older ones are let go as new ones start.
 const FINISHED_KEPT: usize = 50;
 
+/// The longest a branch named after a goal gets.
+const BRANCH_LENGTH: usize = 40;
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FlowRun {
     /// The flow's name and a number: `ship-1`, `ship-2`…
@@ -343,7 +346,7 @@ impl FlowRun {
     /// The branch the run's worktree is on: the goal's words, or the run's
     /// name when the goal has none that fit a branch.
     pub fn branch(&self) -> String {
-        let branch = crate::tui::launcher::branch_from_task(&self.goal);
+        let branch = branch_from_goal(&self.goal);
         if branch.is_empty() {
             self.name.clone()
         } else {
@@ -476,6 +479,28 @@ pub fn forget_old(runs: &mut Vec<FlowRun>) {
             true
         }
     });
+}
+
+/// A branch named after a goal: its words in lower case, joined by `-`,
+/// as many as fit in [`BRANCH_LENGTH`].
+fn branch_from_goal(goal: &str) -> String {
+    let mut branch = String::new();
+    let words = goal
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .map(str::to_ascii_lowercase);
+    for word in words {
+        let joined = if branch.is_empty() {
+            word
+        } else {
+            format!("{branch}-{word}")
+        };
+        if joined.len() > BRANCH_LENGTH {
+            break;
+        }
+        branch = joined;
+    }
+    branch
 }
 
 /// The runs written down at `path`. A file that's missing or can't be
@@ -743,6 +768,19 @@ mod tests {
         let wants: Vec<bool> = (0..4).map(|step| run.wants_worktree(step)).collect();
         assert_eq!(wants, [false, true, true, true]);
         assert_eq!(run.branch(), "add-retries");
+    }
+
+    #[test]
+    fn branches_from_goals_are_short_and_plain() {
+        assert_eq!(
+            branch_from_goal("Fix issue #42: login redirect"),
+            "fix-issue-42-login-redirect"
+        );
+        assert_eq!(
+            branch_from_goal("make the export of the whole ledger stream instead of buffering"),
+            "make-the-export-of-the-whole-ledger"
+        );
+        assert_eq!(branch_from_goal("  "), "");
     }
 
     #[test]

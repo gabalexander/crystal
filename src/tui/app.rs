@@ -27,7 +27,7 @@ use crate::keys;
 use crate::profile::{self, Profile};
 use crate::protocol::{Activity, Backlog, SessionInfo, State, TaskSpec, Worktree};
 use crate::shell;
-use crate::{backlog, plugins, tasks};
+use crate::{backlog, names, plugins, tasks};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -118,10 +118,14 @@ pub enum Place {
     /// In this directory, or the TUI's own when it's `None`.
     Directory(Option<PathBuf>),
     /// In a new worktree on `branch`, made in the repository at `base`, or
-    /// the TUI's own directory's when that's `None`.
+    /// the TUI's own directory's when that's `None`. A branch that exists
+    /// already is checked out there, unless crystal `made_up` its name:
+    /// then it's always a new branch, `branch-2` or the next number that's
+    /// free when `branch` is taken.
     NewWorktree {
         branch: String,
         base: Option<PathBuf>,
+        made_up: bool,
     },
 }
 
@@ -2143,6 +2147,7 @@ impl App {
             history: self.memory.tasks.clone(),
             codex_models: self.codex_models.clone().unwrap_or_default(),
             background: self.tasks_on,
+            branch: names::random(),
         }
     }
 
@@ -3282,13 +3287,19 @@ mod tests {
     }
 
     #[test]
-    fn w_opens_the_panel_on_a_new_worktree_named_after_the_task() {
+    fn w_opens_the_panel_on_a_new_worktree_with_a_made_up_name() {
         let mut app = with_agents(&["claude"], vec![in_project("agent", "app")]);
         press(&mut app, KeyCode::Char('w'));
         type_text(&mut app, "fix typo");
+        let branch = app.launcher().unwrap().branch_name();
+        assert!(
+            matches!(branch.split_once('-'), Some((a, b)) if !a.is_empty() && !b.is_empty()),
+            "{branch}"
+        );
         let place = Place::NewWorktree {
-            branch: "fix-typo".into(),
+            branch,
             base: Some(PathBuf::from("/code/app")),
+            made_up: true,
         };
         assert_eq!(
             press(&mut app, KeyCode::Enter),
@@ -3302,8 +3313,9 @@ mod tests {
         press(&mut app, KeyCode::Char('w'));
         type_text(&mut app, "feat");
         let place = Place::NewWorktree {
-            branch: "feat".into(),
+            branch: app.launcher().unwrap().branch_name(),
             base: None,
+            made_up: true,
         };
         assert_eq!(
             press(&mut app, KeyCode::Enter),
@@ -4655,6 +4667,7 @@ mod tests {
             Place::NewWorktree {
                 branch: "42-fix-login-redirect".into(),
                 base: Some(PathBuf::from("/code/app")),
+                made_up: false,
             }
         );
         assert_eq!(command[0], "claude");

@@ -94,7 +94,7 @@ and the footer says where you are and offers the keys that matter there.
 | `[` / `]`, `1-9` | go to the tab before or after this one, or to the tab with that number |
 | `>` | move the selected session to another tab: then a tab's number, or `t` for a new one |
 | `n` | start a new session from [the new-session panel](#starting-a-session), and type into it |
-| `w` | the same, in a new worktree on a branch named after the task |
+| `w` | the same, in a new worktree on a branch with a made-up name, like `brave-otter` |
 | `W` | remove the selected worktree, once nothing runs in it and you've said `y` |
 | `r` | rename the selected session |
 | `x` | kill the selected session, once you've said `y` |
@@ -358,9 +358,11 @@ Under the task, `Tab` and `Shift+Tab` go from row to row and `←` / `→` chang
 - **start in**: here (the selected session's worktree, or where you started `crystal`), a new worktree, or
   another project's main worktree.
 
-A new worktree's **branch** is named after the task, its words in lowercase joined by `-`; type in that row to
-change it. With no task, `Enter` asks you to name it. `w` opens the panel with a new worktree chosen, and
-`Enter` on an issue opens it ready to fix that issue, on a branch named after it.
+A new worktree's **branch** gets a made-up name, an adjective and an animal like `brave-otter`, whatever the
+task says; type in that row to change it. A made-up name is always a new branch: if it's taken, the worktree
+goes on `brave-otter-2`. One you type that's a branch already is checked out as it is. `w` opens the panel
+with a new worktree chosen, and `Enter` on an issue opens it ready to fix that issue, on a branch named after
+it.
 
 The panel ends with the command it runs and, for a new worktree, where. `Ctrl+E` hands that command to the
 bottom line, `new session:`, to change it or run anything else: `npm run dev` or `sh -c 'make && make test'`
