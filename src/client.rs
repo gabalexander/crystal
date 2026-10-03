@@ -5,6 +5,7 @@ use crate::events::{Event, Filter, Since};
 use crate::forge::Checkout;
 use crate::git;
 use crate::handover;
+use crate::layout::{self, Layout, Order};
 use crate::protocol::{
     self, Backlog, NewSession, NewTask, PendingTask, Request, Response, SessionInfo, State,
     TaskSpec,
@@ -470,6 +471,21 @@ fn runs_in(session: &SessionInfo, path: &Path) -> bool {
         .worktree
         .as_ref()
         .is_some_and(|worktree| worktree.path == path)
+}
+
+/// Has the TUI used last carry out a layout command, and gives the layout
+/// it came to. A command run in a session says so, for one about "this
+/// session".
+pub fn lay_out(socket: &Path, command: layout::Command) -> Result<Layout> {
+    let order = Order {
+        command,
+        caller: env::own_session_id(socket),
+    };
+    match ask(socket, &Request::Layout(order), false)? {
+        Some(Response::Layout(layout)) => Ok(layout),
+        Some(_) => bail!("the daemon didn't answer with the layout"),
+        None => bail!(layout::NO_TUI),
+    }
 }
 
 /// Asks a daemon that must be running already: the request is about a

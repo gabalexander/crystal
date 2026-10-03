@@ -23,6 +23,7 @@ mod groups;
 mod help;
 mod issues;
 pub(crate) mod launcher;
+mod layout_link;
 mod layouts;
 mod listing;
 mod memory_view;
@@ -38,7 +39,7 @@ pub(crate) mod screen_widget;
 mod search;
 mod settings_view;
 pub(crate) mod sidebar;
-mod split_tree;
+pub(crate) mod split_tree;
 mod status;
 mod switcher;
 mod tabs;
@@ -56,6 +57,7 @@ use crate::flow_run::FlowRun;
 use crate::forge::{
     Checkout, Forge, Issue, IssueDetail, PullRequest, PullRequestDetail, Repo, Topic,
 };
+use crate::layout::{Layout, Order, Relayed};
 use crate::memory::{self, Listed, Memory};
 use crate::plugins::{self, Context};
 use crate::profile;
@@ -118,6 +120,8 @@ pub enum Event {
     Mouse(MouseEvent),
     /// Text pasted into the terminal, whole.
     Paste(String),
+    /// A layout command from the command line, passed on by the daemon.
+    Layout(Relayed),
     /// The models Codex lets the user choose.
     CodexModels(Vec<String>),
     /// The terminal changed size. The next draw lays everything out again
@@ -274,6 +278,7 @@ pub fn run(socket: &Path) -> Result<()> {
 
     let (sender, events) = mpsc::channel();
     spawn_input_reader(sender.clone());
+    let layout = layout_link::Link::open(socket, sender.clone());
     let count_backlog = Arc::new(AtomicBool::new(crate::backlog::enabled(&config)));
     let poll_flows = Arc::new(AtomicBool::new(crate::flows::enabled(&config)));
     let poll_settings = Arc::new(AtomicBool::new(false));
@@ -323,6 +328,7 @@ pub fn run(socket: &Path) -> Result<()> {
         config: config.clone(),
         feed: Arc::new(AtomicU64::new(0)),
         presence: away::Presence::new(events::now_ms()),
+        layout,
     };
     tui.app.set_agents(catalog::installed());
     let server = socket::server_of(socket).filter(|server| server != socket::DEFAULT);
@@ -372,7 +378,8 @@ impl TerminalModes {
         // shifted one is (1 and 4): a program in a pane that asked for the
         // protocol gets them. A terminal without it ignores the request.
         // Last, focus (1004): the terminal says when it gains and loses it,
-        // for "while you were away".
+        // for "while you were away", and so that layout commands from the
+        // command line go to the TUI the user is at.
         let mut out = std::io::stdout();
         out.write_all(
             b"\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h\x1b[?2004h\x1b[>5u\x1b[?1004h",
@@ -422,6 +429,9 @@ struct Tui {
     poll_settings: Arc<AtomicBool>,
     /// The config as the TUI last took it in.
     config: Config,
+    /// Where layout commands from the command line come from, and their
+    /// answers go.
+    layout: layout_link::Link,
     /// The projects the sessions are in, for the thread that asks GitHub
     /// about their pull requests.
     projects: Arc<Mutex<Vec<PathBuf>>>,
@@ -738,6 +748,12 @@ impl Tui {
     }
 
     fn handle(&mut self, event: Event) {
+        if matches!(
+            event,
+            Event::Key(_) | Event::Mouse(_) | Event::Paste(_) | Event::Focus(true)
+        ) {
+            self.layout.used();
+        }
         if matches!(event, Event::Key(_) | Event::Mouse(_) | Event::Paste(_)) {
             self.user_is_here();
         }
@@ -748,6 +764,10 @@ impl Tui {
                 if let Some(action) = self.app.on_paste(text) {
                     self.carry_out(action);
                 }
+            }
+            Event::Layout(relayed) => {
+                let answer = self.obey(relayed.order);
+                self.layout.answer(relayed.id, answer);
             }
             Event::CodexModels(models) => self.app.set_codex_models(models),
             Event::Resize => {}
@@ -870,6 +890,20 @@ impl Tui {
         if let Some(action) = self.app.on_key(key) {
             self.carry_out(action);
         }
+    }
+
+    /// Carries out a layout command from the command line, and what it
+    /// needs done outside the state, and says what the tabs came to, or
+    /// why it couldn't.
+    fn obey(&mut self, order: Order) -> Result<Layout, String> {
+        let failed = |err: anyhow::Error| format!("{err:#}");
+        // A session it names may have started a moment ago, too lately for
+        // the last list.
+        self.refresh_sessions().map_err(failed)?;
+        if let Some(action) = self.app.obey(order)? {
+            self.perform(action).map_err(failed)?;
+        }
+        Ok(self.app.layout())
     }
 
     /// Performs `action`. One that fails, say because its session has just

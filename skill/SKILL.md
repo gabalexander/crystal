@@ -185,6 +185,21 @@ One object per session: `name`, `status` (the word `crystal ls` shows), `state`,
 front in its terminal, `{"kind": "agent", "program": "claude", …}`, a `shell` or another `program`, and `task`
 when it was started with something to do.
 
+## Show a session beside yours
+
+The user watches sessions in crystal's TUI. To put one you started on their screen, beside your own pane:
+
+```sh
+crystal pane split tests          # to the right of your pane; --down below it
+crystal pane close tests          # off the screen again
+crystal layout --json             # the TUI's tabs, the sessions in each, and how their panes split
+```
+
+- These need the TUI open; without one they fail, saying "no TUI is running": carry on without them.
+- They change what the user sees. Split off what helps them follow your work, close it when it's done, and
+  leave their tabs and focus alone unless they ask: `crystal pane focus <name>` hands a session their
+  keyboard, and `crystal tab new <name>` brings a new tab to the front, where sessions started after go.
+
 ## Clean up
 
 ```sh

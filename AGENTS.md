@@ -38,9 +38,17 @@ whenever what's handed over changes in a way the crystal before couldn't read.
 ## Layout
 
 - `src/main.rs`: the CLI (clap) and how it prints
-- `src/client.rs`: connects to the daemon, starting it when needed; `tell` gives it an event from outside, and
-  `subscribe` a stream of its events, for the CLI and a TUI to read, which picks up again after a handover;
-  restarting the daemon, handed over or cold
+- `src/client.rs`: connects to the daemon, starting it when needed; `tell` gives it an event from outside,
+  `subscribe` a stream of its events, for the CLI and a TUI to read, which picks up again after a handover,
+  and `lay_out` a layout command for the TUI; restarting the daemon, handed over or cold
+- `src/layout.rs`: laying out the TUI from the command line: the commands `crystal tab` and `crystal pane` send,
+  the order a TUI gets with the id of the session it was run in, what the TUI reports back, the layout it
+  answers with, and how `crystal layout` prints it
+- `src/layout_relay.rs`: the daemon's side of those commands: the TUIs that take orders and which was used last
+  (a key, a click, its terminal brought to the front), an order written to that one and its answer handed back
+  to the command waiting, a few seconds at most; nothing is handed over, as each TUI offers again after a
+  handover saying when it was last used, and a command just after the daemon starts waits a moment for
+  one to come back
 - `src/attach.rs`: `crystal attach`: draws a session in your terminal and sends it your keys, attaching again
   after a handover
 - `src/viewer.rs`: the client's side of an attach, shared by `crystal attach` and the TUI's pane
@@ -58,6 +66,11 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   - `mod.rs`: the event loop: one channel of events, then update and draw (not for a move of the mouse that
     changes nothing), and opening the link a Ctrl+click or copy mode's `o` asks for
   - `app.rs`: the state and how keys and the mouse change it; no I/O, so it's unit-tested
+    - `app/commands.rs`: the layout commands carried out on the state, each on the tab holding the session it's
+      about, in front or not, and the layout the TUI answers with
+  - `layout_link.rs`: the TUI's end of the layout commands: offering the daemon to take them, again at once
+    after a handover or a restart, each one an event for the loop, and its answers and that it was used (a
+    key, the mouse, a paste, focus gained) sent back
   - `ui.rs`: the layout and drawing (top bar and its tabs, pane headers, footer), and what's under the mouse
   - `tabs.rs`: tabs, each holding its own sessions (each session in exactly one) with its own selection,
     its tree of panes, the session the selection's pane last showed and the session floating over them, and
@@ -65,8 +78,8 @@ whenever what's handed over changes in a way the crystal before couldn't read.
     them in the database, and tabs kept from when a tab's panes were a list are read as a tree
   - `split_tree.rs`: a tab's panes as a tree of splits, right or down at a ratio, at any depth, one pane
     following the selection: laying them out, borders, the pane beside another on screen, splitting, closing,
-    swapping, resizing within each pane's least size, dragging a border and evening them out; pure, so it's
-    unit-tested, and the API a command driving the layout would call
+    swapping, resizing within each pane's least size, dragging a border, evening them out, and folding the tree
+    into a value; pure, so it's unit-tested
   - `layouts.rs`: the layouts view (`S`): the tabs saved under a name and put back, and the tabs a restore
     replaced; its state and keys, kept apart from I/O (the event loop keeps them in the database), and its
     drawing

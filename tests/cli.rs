@@ -3029,6 +3029,123 @@ fn a_daemon_from_before_handovers_is_restarted_cold() {
 }
 
 #[test]
+fn layout_commands_need_a_tui() {
+    let crystal = Crystal::new();
+    let said = crystal.fails(&["layout"]);
+    assert!(said.contains("no TUI is running"), "{said}");
+    crystal.ok(&["new", "-d", "-n", "alpha", "sleep", "30"]);
+    let said = crystal.fails(&["pane", "split", "alpha"]);
+    assert!(said.contains("no TUI is running"), "{said}");
+}
+
+#[test]
+fn a_split_and_a_tab_from_the_command_line_reach_the_tui() {
+    let crystal = Crystal::new();
+    sessions_saying_here(&crystal, &["alpha", "beta"]);
+    let tui = crystal.tui();
+    tui.shows("alpha is here");
+
+    crystal.ok(&["pane", "split", "beta", "--beside", "alpha"]);
+    tui.shows("beta is here");
+    tui.shows("alpha is here");
+    let layout = crystal.ok(&["layout"]);
+    assert!(
+        layout.contains("side by side, 50% first\n      the selection's: alpha\n      beta\n"),
+        "{layout}"
+    );
+    let json: serde_json::Value = serde_json::from_str(&crystal.ok(&["layout", "--json"])).unwrap();
+    assert_eq!(json["tabs"][0]["panes"]["second"]["session"], "beta");
+    let said = crystal.fails(&["pane", "split", "beta", "--beside", "gone"]);
+    assert!(said.contains("there's no session called gone"), "{said}");
+
+    // A new tab comes to the front, and a session started then goes in it.
+    assert_eq!(crystal.ok(&["tab", "new", "review"]), "2\n");
+    tui.shows(" 2 review ");
+    sidebar_hides(&tui, "alpha");
+    sessions_saying_here(&crystal, &["gamma"]);
+    sidebar_shows(&tui, "gamma");
+    tui.shows("gamma is here");
+
+    crystal.ok(&["tab", "select", "1"]);
+    sidebar_shows(&tui, "alpha");
+    tui.shows("beta is here");
+}
+
+#[test]
+fn a_split_from_a_session_goes_beside_it() {
+    let crystal = Crystal::new();
+    sessions_saying_here(&crystal, &["agent", "other", "tests"]);
+    let mut tui = crystal.tui();
+    tui.shows("agent is here");
+    tui.type_keys("j");
+    tui.shows("other is here");
+
+    // Run in agent, the split goes beside it, and it's selected again to
+    // show there.
+    let sessions: serde_json::Value = serde_json::from_str(&crystal.ok(&["ls", "--json"])).unwrap();
+    let agent = sessions
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["name"] == "agent");
+    let id = agent.unwrap()["id"].as_str().unwrap();
+    let out = crystal
+        .command(&["pane", "split", "tests", "--down"])
+        .env("CRYSTAL_SESSION_ID", id)
+        .env("CRYSTAL_SOCKET", &crystal.socket)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    tui.shows("tests is here");
+    tui.shows("agent is here");
+    tui.hides("other is here");
+}
+
+#[test]
+fn layout_commands_go_to_the_tui_used_last() {
+    let crystal = Crystal::new();
+    sessions_saying_here(&crystal, &["alpha"]);
+    let mut first = crystal.tui();
+    first.shows("alpha is here");
+    let second = crystal.tui();
+    second.shows("alpha is here");
+
+    // The second opened last.
+    crystal.ok(&["tab", "rename", "1", "second"]);
+    second.shows(" 1 second ");
+
+    // A key in the first makes it the one used last.
+    first.type_keys("?");
+    first.shows("In the sidebar");
+    first.type_keys("?");
+    first.hides("In the sidebar");
+    crystal.ok(&["tab", "rename", "1", "first"]);
+    first.shows(" 1 first ");
+    second.shows(" 1 second ");
+}
+
+#[test]
+fn layout_commands_reach_the_tui_after_a_handover() {
+    let crystal = Crystal::new();
+    sessions_saying_here(&crystal, &["alpha", "beta"]);
+    let tui = crystal.tui();
+    tui.shows("alpha is here");
+
+    assert_eq!(
+        crystal.ok(&["restart-server"]),
+        "restarted the daemon, and its sessions carried on\n"
+    );
+    // The TUI offers again to the daemon that took over, straight away.
+    crystal.ok(&["pane", "split", "beta", "--beside", "alpha"]);
+    tui.shows("beta is here");
+    tui.shows("alpha is here");
+}
+
+#[test]
 fn restart_server_cold_starts_the_running_sessions_again() {
     let crystal = Crystal::new();
     crystal.ok(&["new", "-n", "keeper", "sleep", "300"]);

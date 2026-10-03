@@ -20,6 +20,7 @@ use crate::front;
 use crate::git;
 use crate::handoff;
 use crate::handover::{self, Gate, Ticket};
+use crate::layout_relay::Relay;
 use crate::mcp;
 use crate::memory::{self, Added};
 use crate::names;
@@ -124,6 +125,7 @@ pub fn run(socket: &Path, handover: Option<RawFd>) -> Result<()> {
         distilling: Arc::default(),
         preparing: Arc::default(),
         handoff: Mutex::default(),
+        layout: Relay::new(),
     });
     // A daemon starts again after every upgrade, or is handed over to the
     // new crystal, so this is where the skill an earlier crystal installed
@@ -233,6 +235,8 @@ struct Daemon {
     /// the file, adds to it and writes it back. Never held while taking
     /// another lock.
     handoff: Mutex<()>,
+    /// The TUIs that take layout commands, which go to the one used last.
+    layout: Relay,
 }
 
 /// What [`Daemon::prepare_embeddings`] is doing, or why it failed.
@@ -289,6 +293,10 @@ impl Daemon {
             Request::Subscribe { filter, since } => {
                 drop(ticket);
                 return self.stream_events(&conn, filter, since);
+            }
+            Request::TakeLayoutOrders { used } => {
+                drop(ticket);
+                return self.layout.serve(&conn, input, used);
             }
             Request::WaitOutput {
                 name,
@@ -1437,9 +1445,13 @@ impl Daemon {
                 self.events.emit(*event);
                 Ok(Response::Done)
             }
-            Request::Subscribe { .. } | Request::WaitOutput { .. } | Request::Handover { .. } => {
+            Request::Subscribe { .. }
+            | Request::WaitOutput { .. }
+            | Request::Handover { .. }
+            | Request::TakeLayoutOrders { .. } => {
                 bail!("this takes the connection over")
             }
+            Request::Layout(order) => Ok(Response::Layout(self.layout.pass(order)?)),
             Request::Rename { name, new_name } => {
                 let mut sessions = self.sessions.lock().unwrap();
                 if new_name != name {

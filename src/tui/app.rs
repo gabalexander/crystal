@@ -1,7 +1,10 @@
 //! The TUI's state and how keys, the mouse and session lists change it.
 //! Nothing here talks to the daemon or draws: when a key needs the outside
 //! world, it comes back as an [`Action`] for the event loop to carry out.
-//! That keeps every state change testable on its own.
+//! That keeps every state change testable on its own. [`commands`] carries
+//! out the layout commands `crystal tab` and `crystal pane` send.
+
+mod commands;
 
 use super::away::{Away, Tally};
 use super::backlog_view::{BacklogChange, BacklogView, Step};
@@ -3916,13 +3919,7 @@ impl App {
             (KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q' | 'R'), _) => self.resizing = false,
             (KeyCode::Char('='), _) => self.equalize_panes(),
             (code, Some(toward)) if shift && arrow(code).is_some() => self.focus_toward(toward),
-            (_, Some(toward)) => {
-                let cells = match toward {
-                    Direction::Left | Direction::Right => RESIZE_COLUMNS,
-                    Direction::Up | Direction::Down => RESIZE_ROWS,
-                };
-                self.resize_pane(toward, cells);
-            }
+            (_, Some(toward)) => self.resize_pane(toward, resize_step(toward)),
             _ => {}
         }
     }
@@ -4024,14 +4021,30 @@ impl App {
         if to >= self.tabs.all().len() {
             return self.notify(format!("there's no tab {number}"));
         }
-        // Closing its split here first moves the keyboard with the panes.
-        let split = Pane::Session(name.to_string());
-        self.change_panes(|panes| {
-            panes.close(&split);
-        });
+        self.move_session(name, to);
+        self.notify(format!("moved {name} to tab {number}"));
+    }
+
+    /// Moves the session called `name` to the tab at `to`, out of its pane
+    /// in the tab it was in. Leaving the tab in front, the keyboard and the
+    /// selection stay in that tab.
+    fn move_session(&mut self, name: &str, to: usize) {
+        if self.tabs.tab_of(name) == Some(to) {
+            return;
+        }
+        if self.tabs.current().holds(name) {
+            // Closing its split here first moves the keyboard with the
+            // panes.
+            let split = Pane::Session(name.to_string());
+            self.change_panes(|panes| {
+                panes.close(&split);
+            });
+            if self.is_floating(name) {
+                self.put_float_back();
+            }
+        }
         self.tabs.put(name, to);
         self.keep_selection_in_tab();
-        self.notify(format!("moved {name} to tab {number}"));
     }
 
     /// The session `>` is moving to another tab, while the footer asks
@@ -4334,6 +4347,14 @@ impl App {
         self.sessions
             .iter()
             .position(|session| session.name == name)
+    }
+}
+
+/// How far a key in resize mode moves a border `toward`.
+fn resize_step(toward: Direction) -> u16 {
+    match toward {
+        Direction::Left | Direction::Right => RESIZE_COLUMNS,
+        Direction::Up | Direction::Down => RESIZE_ROWS,
     }
 }
 

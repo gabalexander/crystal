@@ -28,6 +28,8 @@ mod handoff;
 mod handover;
 mod hook;
 mod keys;
+mod layout;
+mod layout_relay;
 mod links;
 mod markdown;
 mod mcp;
@@ -65,7 +67,7 @@ mod vt;
 mod work;
 
 use anyhow::{Result, bail};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use client::Restart;
 use profile::{Profile, StartIn};
 use protocol::{Request, Response, SessionInfo, TaskSpec, TaskState};
@@ -73,6 +75,7 @@ use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
+use tui::split_tree::{Direction, Way};
 
 /// One terminal for all your coding agents. With no command, opens the
 /// TUI: every session in a sidebar, the selected one live beside it.
@@ -327,6 +330,26 @@ enum Command {
     #[command(visible_alias = "list")]
     Ls {
         /// Print them as a JSON array, for scripts and agents.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Lay out the TUI's tabs: make one, go to one, name one, close one, or
+    /// move a session to one. The TUI used last does it.
+    Tab {
+        #[command(subcommand)]
+        command: TabCommand,
+    },
+    /// Lay out the panes of the TUI's tabs: split a session off beside
+    /// another, focus one, resize, close, zoom or float one, or even them
+    /// out. The TUI used last does it.
+    Pane {
+        #[command(subcommand)]
+        command: PaneCommand,
+    },
+    /// Print the TUI's tabs: each one's sessions, and how its panes split
+    /// the room.
+    Layout {
+        /// Print them as JSON.
         #[arg(long)]
         json: bool,
     },
@@ -781,6 +804,147 @@ enum FlowCommand {
 }
 
 #[derive(Subcommand)]
+enum TabCommand {
+    /// Make a tab after the others and go to it: sessions started from then
+    /// on go in it. Prints its number.
+    New {
+        /// What to call it [default: its number]
+        name: Option<String>,
+    },
+    /// Go to a tab.
+    Select {
+        /// The tab: its number, from 1, or its name.
+        tab: String,
+    },
+    /// Name a tab. An empty name takes it back to its number.
+    Rename { tab: String, name: String },
+    /// Close a tab.
+    Close {
+        /// The tab [default: the one in front]
+        tab: Option<String>,
+
+        /// Kill its sessions with it: a tab with sessions in it doesn't
+        /// close without.
+        #[arg(long)]
+        kill: bool,
+    },
+    /// Move a session to another tab.
+    Move { session: String, tab: String },
+}
+
+#[derive(Subcommand)]
+enum PaneCommand {
+    /// Show a session in a pane of its own, split off to the right of, or
+    /// below, the pane of the session this runs in, or else the selected
+    /// one's.
+    Split {
+        /// The session to show. One in another tab moves to this one.
+        session: String,
+
+        /// The session whose pane to split [default: the one this runs in,
+        /// or else the selected one]
+        #[arg(long, value_name = "SESSION")]
+        beside: Option<String>,
+
+        /// To the right of it: the default.
+        #[arg(long, conflicts_with = "down")]
+        right: bool,
+
+        /// Below it.
+        #[arg(long)]
+        down: bool,
+
+        /// The share of the room the pane split keeps, from 0.1 to 0.9.
+        #[arg(long, default_value_t = 0.5, value_parser = share)]
+        ratio: f32,
+    },
+    /// Select a session, bringing its tab to the front, and type into it;
+    /// or, given left, right, up or down, the session in the pane that way
+    /// from the pane of the session this runs in, or else the selected
+    /// one's.
+    Focus {
+        /// A session's name, or left, right, up or down.
+        target: String,
+    },
+    /// Move a border of a session's pane: the one on that side, which it
+    /// grows into, or else the one on its other side, which it shrinks
+    /// from.
+    Resize {
+        #[arg(value_enum)]
+        direction: Toward,
+
+        /// How many columns or rows [default: 4 columns or 2 rows, as resize
+        /// mode moves]
+        cells: Option<u16>,
+
+        /// The session [default: the one this runs in, or else the selected
+        /// one]
+        #[arg(short, long)]
+        name: Option<String>,
+    },
+    /// Close a session's pane of its own: its split, the pane beside it
+    /// taking the room, or its float.
+    Close {
+        /// The session [default: the one this runs in, or else the selected
+        /// one]
+        session: Option<String>,
+    },
+    /// Zoom a session's pane over the whole of its tab, selecting it there.
+    Zoom {
+        /// The session [default: the one this runs in, or else the selected
+        /// one]
+        session: Option<String>,
+
+        /// Put the tab's panes back instead.
+        #[arg(long)]
+        off: bool,
+    },
+    /// Even out the panes of the tab this runs in, or else the one in front.
+    Equalize,
+    /// Float a session over its tab's panes, in a pane of its own.
+    Float {
+        /// The session [default: the one this runs in, or else the selected
+        /// one]
+        session: Option<String>,
+
+        /// Put the session floating over the tab back among the panes
+        /// instead.
+        #[arg(long)]
+        off: bool,
+    },
+}
+
+/// A way to go from a pane, as the command line says it.
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum Toward {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+impl From<Toward> for Direction {
+    fn from(toward: Toward) -> Direction {
+        match toward {
+            Toward::Left => Direction::Left,
+            Toward::Right => Direction::Right,
+            Toward::Up => Direction::Up,
+            Toward::Down => Direction::Down,
+        }
+    }
+}
+
+/// A share of a pane's room, as `--ratio` takes it.
+fn share(text: &str) -> Result<f32, String> {
+    let share: f32 = text.parse().map_err(|_| format!("{text} isn't a number"))?;
+    if (0.1..=0.9).contains(&share) {
+        Ok(share)
+    } else {
+        Err("it's a share of the room, from 0.1 to 0.9".into())
+    }
+}
+
+#[derive(Subcommand)]
 enum ServerCommand {
     /// Stop a server and every session in it, as kill-server does.
     Stop { name: String },
@@ -1016,6 +1180,16 @@ fn run(cli: Cli) -> Result<()> {
         Command::Worktree {
             command: WorktreeCommand::Rm { worktree, force },
         } => remove_worktree(&socket, &worktree, force)?,
+        Command::Tab { command } => tab(&socket, command)?,
+        Command::Pane { command } => pane(&socket, command)?,
+        Command::Layout { json } => {
+            let layout = client::lay_out(&socket, layout::Command::Show)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&layout)?);
+            } else {
+                print!("{}", layout.text());
+            }
+        }
         Command::Attach { name } => attach::run(&socket, name.as_deref())?,
         Command::Ls { json } => {
             // Without a daemon, there are no sessions.
@@ -1413,6 +1587,64 @@ fn flow(socket: &Path, json: bool, command: Option<FlowCommand>) -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// `crystal tab` and its commands. A new tab's number is printed.
+fn tab(socket: &Path, command: TabCommand) -> Result<()> {
+    let new = matches!(command, TabCommand::New { .. });
+    let command = match command {
+        TabCommand::New { name } => layout::Command::NewTab { name },
+        TabCommand::Select { tab } => layout::Command::SelectTab { tab },
+        TabCommand::Rename { tab, name } => layout::Command::RenameTab { tab, name },
+        TabCommand::Close { tab, kill } => layout::Command::CloseTab { tab, kill },
+        TabCommand::Move { session, tab } => layout::Command::MoveToTab { session, tab },
+    };
+    let layout = client::lay_out(socket, command)?;
+    if new && let Some(tab) = layout.current() {
+        println!("{}", tab.number);
+    }
+    Ok(())
+}
+
+/// `crystal pane` and its commands.
+fn pane(socket: &Path, command: PaneCommand) -> Result<()> {
+    let command = match command {
+        PaneCommand::Split {
+            session,
+            beside,
+            right: _,
+            down,
+            ratio,
+        } => layout::Command::Split {
+            session,
+            beside,
+            way: if down { Way::Down } else { Way::Right },
+            ratio,
+        },
+        // A direction's word is a direction, even where a session has it
+        // for its name.
+        PaneCommand::Focus { target } => match Toward::from_str(&target, false) {
+            Ok(toward) => layout::Command::FocusToward {
+                toward: toward.into(),
+            },
+            Err(_) => layout::Command::Focus { session: target },
+        },
+        PaneCommand::Resize {
+            direction,
+            cells,
+            name,
+        } => layout::Command::Resize {
+            session: name,
+            toward: direction.into(),
+            cells,
+        },
+        PaneCommand::Close { session } => layout::Command::Close { session },
+        PaneCommand::Zoom { session, off } => layout::Command::Zoom { session, on: !off },
+        PaneCommand::Equalize => layout::Command::Equalize,
+        PaneCommand::Float { session, off } => layout::Command::Float { session, on: !off },
+    };
+    client::lay_out(socket, command)?;
+    Ok(())
 }
 
 /// The directory a command about a project is given with `-C`, or the

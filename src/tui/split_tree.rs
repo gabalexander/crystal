@@ -43,7 +43,8 @@ pub enum Way {
 
 /// A way to go from a pane on screen: to the pane there, or to move a
 /// border.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Direction {
     Left,
     Right,
@@ -52,6 +53,16 @@ pub enum Direction {
 }
 
 impl Direction {
+    /// How it's said: `left`, `up`.
+    pub fn word(self) -> &'static str {
+        match self {
+            Direction::Left => "left",
+            Direction::Right => "right",
+            Direction::Up => "up",
+            Direction::Down => "down",
+        }
+    }
+
     /// The way of the splits whose borders lie across this direction.
     fn way(self) -> Way {
         match self {
@@ -360,6 +371,17 @@ impl SplitTree {
         self.root.equalize();
     }
 
+    /// Folds the tree into one value, from the panes up: `pane` makes one
+    /// of each pane, and `split` one of each split, from its way, its ratio
+    /// and what its two sides came to.
+    pub fn fold<T>(
+        &self,
+        pane: &mut impl FnMut(&Pane) -> T,
+        split: &mut impl FnMut(Way, f32, T, T) -> T,
+    ) -> T {
+        self.root.fold(pane, split)
+    }
+
     /// The way down to `pane`, if it's here.
     fn path_of(&self, pane: &Pane) -> Option<Vec<Side>> {
         let mut path = Vec::new();
@@ -455,6 +477,21 @@ impl Node {
             first,
             second,
         }))
+    }
+
+    fn fold<T>(
+        &self,
+        pane: &mut impl FnMut(&Pane) -> T,
+        split: &mut impl FnMut(Way, f32, T, T) -> T,
+    ) -> T {
+        match self {
+            Node::Pane(found) => pane(found),
+            Node::Split(node) => {
+                let first = node.first.fold(pane, split);
+                let second = node.second.fold(pane, split);
+                split(node.way, node.ratio, first, second)
+            }
+        }
     }
 
     fn gather_panes<'a>(&'a self, panes: &mut Vec<&'a Pane>) {
@@ -988,6 +1025,23 @@ mod tests {
         .unwrap();
         tree.retain(|_| true);
         assert_eq!(area(&tree, "*", ROOM).width, 100);
+    }
+
+    #[test]
+    fn a_tree_folds_from_its_panes_up() {
+        let mut tree = three();
+        tree.split(&session("b"), Way::Right, 0.25, session("c"));
+        let drawn = tree.fold(
+            &mut |pane| match pane {
+                Pane::Selection => "*".to_string(),
+                Pane::Session(name) => name.clone(),
+            },
+            &mut |way, ratio, first, second| {
+                let way = if way == Way::Right { "|" } else { "/" };
+                format!("({first} {way}{ratio} {second})")
+            },
+        );
+        assert_eq!(drawn, "(a |0.5 (* /0.5 (b |0.25 c)))");
     }
 
     #[test]

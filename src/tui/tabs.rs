@@ -56,6 +56,11 @@ pub struct Tab {
 }
 
 impl Tab {
+    /// Names the tab. An empty name takes it back to its number.
+    pub fn rename(&mut self, name: &str) {
+        self.name = name.trim().to_string();
+    }
+
     /// Whether the session called `name` is in this tab.
     pub fn holds(&self, name: &str) -> bool {
         self.sessions.iter().any(|held| held == name)
@@ -144,6 +149,11 @@ impl Tabs {
         &mut self.tabs[self.current]
     }
 
+    /// The tab at `index`, which has to be one of them.
+    pub fn tab_mut(&mut self, index: usize) -> &mut Tab {
+        &mut self.tabs[index]
+    }
+
     /// Adds an empty tab after the others, and says where it went: `None`
     /// when there's no room for another. The tab in front stays in front.
     pub fn add(&mut self) -> Option<usize> {
@@ -179,17 +189,26 @@ impl Tabs {
     /// The only tab stays open; says whether it closed. The sessions it
     /// held are in no tab now, for the caller to end.
     pub fn close(&mut self) -> bool {
-        if self.tabs.len() == 1 {
+        self.close_at(self.current)
+    }
+
+    /// Closes the tab at `index`, as [`Tabs::close`] does the one in front.
+    /// Closing another, the one in front stays in front.
+    pub fn close_at(&mut self, index: usize) -> bool {
+        if self.tabs.len() == 1 || index >= self.tabs.len() {
             return false;
         }
-        self.tabs.remove(self.current);
+        self.tabs.remove(index);
+        if index < self.current {
+            self.current -= 1;
+        }
         self.current = self.current.min(self.tabs.len() - 1);
         true
     }
 
     /// Names the tab in front. An empty name takes it back to its number.
     pub fn rename(&mut self, name: &str) {
-        self.current_mut().name = name.trim().to_string();
+        self.current_mut().rename(name);
     }
 
     /// Where the session called `name` is: the index of the tab holding it.
@@ -469,6 +488,18 @@ mod tests {
 
         assert!(tabs.close());
         assert_eq!(tabs.current().name, "a");
+    }
+
+    #[test]
+    fn closing_another_tab_leaves_the_one_in_front_in_front() {
+        let mut tabs = three_tabs();
+        assert!(tabs.close_at(0));
+        assert_eq!(names(&tabs), ["b", "c"]);
+        assert_eq!(tabs.current().name, "c");
+        assert!(tabs.close_at(1), "the one in front, as close does");
+        assert_eq!(tabs.current().name, "b");
+        assert!(!tabs.close_at(5));
+        assert!(!tabs.close_at(0), "the only tab stays");
     }
 
     #[test]

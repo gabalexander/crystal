@@ -257,6 +257,19 @@ pub enum Request {
     CancelFlow {
         run: String,
     },
+    /// Carry out a layout command in the TUI used last, and answer with the
+    /// layout it comes to: `crystal tab`, `crystal pane` and `crystal
+    /// layout`.
+    Layout(crate::layout::Order),
+    /// A TUI offers to carry out layout commands, saying when it was last
+    /// used, in milliseconds since the Unix epoch. After
+    /// [`Response::Done`], the daemon writes it each one as a
+    /// [`crate::layout::Relayed`] line, and it writes back
+    /// [`crate::layout::Report`] lines. A handover cuts it, and the TUI
+    /// offers again.
+    TakeLayoutOrders {
+        used: u64,
+    },
     /// What's on a session's screen, as text.
     Read {
         name: String,
@@ -487,6 +500,8 @@ pub enum Response {
     HandedOver {
         sessions: usize,
     },
+    /// A TUI's tabs and their panes.
+    Layout(crate::layout::Layout),
     Done,
     Error {
         message: String,

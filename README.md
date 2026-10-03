@@ -290,6 +290,9 @@ crystal server                              # list the servers, daemons of their
 crystal config                              # where the config file is, and the settings in effect
 crystal profile                             # list your agent profiles
 crystal profile show review                 # what a profile runs, and where it starts
+crystal pane split review                   # show a session in a pane beside yours in the TUI (see below)
+crystal tab new review                      # a new tab in the TUI, in front
+crystal layout                              # the TUI's tabs and how each splits its panes
 crystal skill --install                     # teach Claude Code to drive crystal (see below)
 crystal mermaid docs/flow.md                # draw a page's mermaid diagrams as text (see below)
 crystal ssh box                             # crystal's TUI on another machine (see below)
@@ -356,7 +359,8 @@ Every session is in exactly one tab. A session you start from the TUI goes in th
 one started any other way, from the command line or another TUI, unless it's a step of a [flow](#flows), which
 goes in the tab with the rest of its run. `>` moves the selected session to another tab: press the tab's
 number next, or `t` to make a new tab for it. `&` closes the tab you're in and kills the sessions in it, once
-you've said `y`; an empty tab closes at once. There's always one tab, and nine at most. They're kept in crystal's
+you've said `y`; an empty tab closes at once. The command line makes, names and closes tabs too: see
+[laying out the TUI](#laying-out-the-tui). There's always one tab, and nine at most. They're kept in crystal's
 database, so they're there when you open the TUI again.
 
 ### Layouts
@@ -844,6 +848,47 @@ session, plus `status`, the word the STATE column shows:
 itself](#teaching-crystal-about-your-agent): its `agent` name, its last `message` and its `resume` command;
 while it's there, `front` is that agent. New fields may appear; none goes away. With no daemon running, it
 prints `[]`.
+
+#### Laying out the TUI
+
+The tabs and panes are the TUI's, and the command line lays them out too, so an agent can put the session it
+started on screen beside its own, or a script can set up a tab for a review:
+
+```sh
+crystal new -d -n tests cargo test
+crystal pane split tests                  # beside the pane of the session this runs in; --down below it
+crystal pane split logs --beside server --down --ratio 0.7   # server keeps 70% of the room
+crystal pane focus tests                  # select it, its tab in front, and type into it; or left, right, up, down
+crystal pane resize left 8 -n tests       # move a border of its pane, as R does; 4 columns or 2 rows by default
+crystal pane close tests                  # close its split, or put its float back
+crystal pane zoom reviewer                # zoom its tab on it; --off puts the panes back
+crystal pane float logs                   # float it over its tab's panes; --off puts it back
+crystal pane equalize                     # even out the panes, as = does in resize mode
+crystal tab new review                    # a tab after the others, in front: sessions started now go in it; prints 2
+crystal tab select 1                      # a tab by its number or its name
+crystal tab rename 2 checks               # an empty name takes it back to its number
+crystal tab move reviewer review          # move a session to another tab, as > does
+crystal tab close review --kill           # a tab with sessions closes only with --kill, which kills them
+crystal layout                            # each tab's sessions and how its panes split the room; --json
+```
+
+A command about a session works on the tab that holds it, whether it's in front or not, and leaves the tab in
+front where it is: an agent in another tab lays out its own without taking you there. Only going somewhere
+moves you: `tab new`, `tab select` and `pane focus`. Without a session named, a command is about the session
+it runs in, or, run outside crystal, the selected one. `pane split` splits the pane that session has of its
+own, or else the selection's pane, which it selects if that pane shows something else; the session split off
+moves into that tab, out of any pane it had. A command that can't be carried out says why, the way the footer
+would: no room for another pane, a session that isn't on screen.
+
+The command goes through the daemon to the TUI you used last, the one where you last pressed a key, clicked
+or brought its terminal to the front, and waits for it to answer, a few seconds at most. With no TUI open,
+it fails, saying so. When `restart-server` hands the daemon over, each TUI offers itself to the new one at
+once, saying when you last used it, so commands carry on going to the same one. What it changes is kept like any change you make, so it's there when the TUI opens again.
+`crystal layout --json` prints the tabs in their order, each with its `number`, `name`, whether it's
+`current` and `zoomed`, its `sessions`, the one `selected`, the one `floating`, and its `panes`: either
+`{"kind": "pane", "session": "tests"}`, with `"selection": true` for the pane that follows the selection, or
+`{"kind": "split", "way": "right", "ratio": 0.5, "first": …, "second": …}`, `way` being `right` for side by
+side and `down` for one above the other, and `ratio` the first side's share.
 
 #### A skill for Claude Code
 
