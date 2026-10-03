@@ -4757,3 +4757,428 @@ fn a_new_plugin_runs_its_action_and_hears_events() {
     assert_eq!(event["event"], "session.started");
     assert_eq!(event["session"]["name"], "agent");
 }
+
+/// Flows for the tests below, with the settings every test has.
+const FLOWS: &str = r#"
+notify = false
+
+[plugins]
+memory = false
+
+[[profile]]
+name = "builder"
+agent = "claude"
+model = "opus"
+
+[[flow]]
+name = "pair"
+
+[[flow.step]]
+name = "plan"
+prompt = "Plan {goal}"
+
+[[flow.step]]
+name = "build"
+profile = "builder"
+prompt = "Build {goal} following {previous}. {feedback}"
+
+[[flow]]
+name = "gated"
+
+[[flow.step]]
+name = "plan"
+prompt = "Plan {goal}"
+gate = true
+
+[[flow.step]]
+name = "build"
+prompt = "Build {previous}"
+
+[[flow]]
+name = "ship"
+
+[[flow.step]]
+name = "plan"
+prompt = "Plan {goal}"
+
+[[flow.step]]
+name = "build"
+prompt = "Build {goal} following {previous}. {feedback}"
+
+[[flow.step]]
+name = "review"
+prompt = "Review {previous}"
+gate = true
+back_to = "build"
+
+[[flow]]
+name = "tree"
+
+[[flow.step]]
+name = "plan"
+prompt = "Plan {goal}"
+
+[[flow.step]]
+name = "build"
+prompt = "Build {previous}"
+worktree = true
+
+[[flow.step]]
+name = "check"
+prompt = "Check {previous}"
+"#;
+
+/// A stand-in for `claude -p` in a flow's steps, which keeps what it does
+/// in `dir`, whatever directory a step runs in. Each run notes its
+/// arguments in `runs`, a line each with the prompt's lines joined by `|`,
+/// and answers at once: `answer <n>` for the n-th run, in a conversation
+/// of its own, `conv-<n>`, or the one it was told to resume. A prompt with
+/// `FAIL` in it fails, until the test makes `fixed`; one with `SLOW` in it
+/// waits for the test to make `go` before it answers.
+fn flow_claude(dir: &Path) -> PathBuf {
+    let bin = dir.join("flow-bin");
+    std::fs::create_dir(&bin).unwrap();
+    let claude = bin.join("claude");
+    let script = format!(
+        r#"#!/bin/sh
+for prompt; do :; done
+cd '{dir}'
+echo "$*" | tr '\n' '|' >> runs
+echo >> runs
+run=$(wc -l < runs | tr -d ' ')
+conversation="conv-$run"
+previous=""
+for arg; do
+    if [ "$previous" = "--resume" ]; then conversation="$arg"; fi
+    previous="$arg"
+done
+echo '{{"type":"system","subtype":"init","session_id":"'"$conversation"'","cwd":"/x","model":"m"}}'
+case "$prompt" in
+*SLOW*) while [ ! -e go ]; do sleep 0.05; done ;;
+esac
+case "$prompt" in
+*FAIL*) if [ ! -e fixed ]; then
+    echo '{{"type":"result","subtype":"error_during_execution","is_error":true,"session_id":"'"$conversation"'","total_cost_usd":0.01,"duration_ms":10}}'
+    exit 1
+fi ;;
+esac
+echo '{{"type":"result","subtype":"success","is_error":false,"result":"answer '"$run"'","session_id":"'"$conversation"'","total_cost_usd":0.5,"duration_ms":10}}'
+"#,
+        dir = dir.display()
+    );
+    std::fs::write(&claude, script).unwrap();
+    let mut permissions = std::fs::metadata(&claude).unwrap().permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+    std::fs::set_permissions(&claude, permissions).unwrap();
+    bin
+}
+
+/// Runs `crystal flow run` with `args`, its steps finding claude on `path`.
+fn run_flow(crystal: &Crystal, path: &str, args: &[&str]) -> Output {
+    let mut command = crystal.command(&["flow", "run"]);
+    command.args(args).env("PATH", path);
+    command.output().unwrap()
+}
+
+/// Runs `crystal flow run` with `args`, which must succeed, and returns
+/// what it printed.
+fn flow_ok(crystal: &Crystal, path: &str, args: &[&str]) -> String {
+    let out = run_flow(crystal, path, args);
+    assert!(
+        out.status.success(),
+        "crystal flow run {args:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout).unwrap()
+}
+
+/// Waits for the flow run called `run` to stop running, and returns how it
+/// stands.
+fn flow_waits(crystal: &Crystal, run: &str) -> String {
+    crystal.ok(&["flow", "wait", run, "--timeout", "10"])
+}
+
+#[test]
+fn a_flow_runs_its_steps_one_after_another_and_finishes_done() {
+    let crystal = Crystal::new();
+    crystal.configure(FLOWS);
+    let dir = crystal.dir.path();
+    let path = path_with(&flow_claude(dir));
+
+    let out = flow_ok(&crystal, &path, &["pair", "add", "retries", "--wait"]);
+    assert_eq!(out, "pair-1\ndone\n");
+
+    // Each step is asked its prompt, the next with the answer before it,
+    // and runs with its profile.
+    let runs = runs(dir, 2);
+    assert!(runs[0].ends_with(" -- Plan add retries|"), "{}", runs[0]);
+    assert!(
+        runs[1].ends_with(" --model opus -- Build add retries following answer 1.|"),
+        "{}",
+        runs[1]
+    );
+    // Each step ran as a task of its own.
+    assert_eq!(crystal.row("pair-1-plan").unwrap()[6], "task");
+    assert_eq!(crystal.row("pair-1-build").unwrap()[6], "task");
+
+    let show = crystal.ok(&["flow", "show", "pair-1"]);
+    assert!(
+        show.starts_with("pair-1 · pair · done · round 1 · $1.00"),
+        "{show}"
+    );
+    assert!(show.contains("goal  add retries"), "{show}");
+    let listed: serde_json::Value = serde_json::from_str(&crystal.ok(&["flow", "--json"])).unwrap();
+    assert_eq!(listed[0]["name"], "pair-1");
+    assert_eq!(listed[0]["state"], "done");
+    assert_eq!(listed[0]["steps"][1]["answer"], "answer 2");
+
+    // The next run of the flow gets the next number.
+    let out = flow_ok(&crystal, &path, &["pair", "again", "--wait"]);
+    assert_eq!(out, "pair-2\ndone\n");
+}
+
+#[test]
+fn a_flow_that_isnt_in_the_config_file_says_which_are() {
+    let crystal = Crystal::new();
+    let none = crystal.ok(&["flow"]);
+    assert!(none.contains("`crystal flow example` prints one"), "{none}");
+
+    crystal.configure(FLOWS);
+    let listed = crystal.ok(&["flow"]);
+    assert!(
+        listed.contains("  ship  plan → build → review\n"),
+        "{listed}"
+    );
+    let out = run_flow(&crystal, "/nowhere", &["nope", "do it"]);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("there's no flow called nope; there's pair, gated, ship, tree"),
+        "{err}"
+    );
+}
+
+#[test]
+fn a_gate_stops_the_flow_waiting_on_the_user_until_they_go_on() {
+    let crystal = Crystal::new();
+    crystal.configure(FLOWS);
+    let dir = crystal.dir.path();
+    let path = path_with(&flow_claude(dir));
+
+    let out = flow_ok(&crystal, &path, &["gated", "add retries", "--wait"]);
+    assert_eq!(out, "gated-1\nwaiting at plan\n");
+    // Its step waits on the user, the way an agent asking something does.
+    assert_eq!(status(&crystal, "gated-1-plan"), "waiting");
+    let sessions: serde_json::Value = serde_json::from_str(&crystal.ok(&["ls", "--json"])).unwrap();
+    assert_eq!(sessions[0]["name"], "gated-1-plan");
+    assert_eq!(sessions[0]["status"], "waiting");
+    let listed: serde_json::Value = serde_json::from_str(&crystal.ok(&["flow", "--json"])).unwrap();
+    assert_eq!(listed[0]["state"], "waiting");
+    assert_eq!(listed[0]["step"], "plan");
+    assert_eq!(runs(dir, 1).len(), 1);
+
+    crystal.ok(&["flow", "approve", "gated-1"]);
+    assert_eq!(flow_waits(&crystal, "gated-1"), "done\n");
+    let runs = runs(dir, 2);
+    assert!(runs[1].ends_with(" -- Build answer 1|"), "{}", runs[1]);
+    assert_ne!(status(&crystal, "gated-1-plan"), "waiting");
+
+    let err = crystal.fails(&["flow", "approve", "gated-1"]);
+    assert!(
+        err.contains("gated-1 isn't waiting at a gate: it's done"),
+        "{err}"
+    );
+}
+
+#[test]
+fn sending_a_flow_back_runs_its_back_to_step_again_with_the_notes() {
+    let crystal = Crystal::new();
+    crystal.configure(FLOWS);
+    let dir = crystal.dir.path();
+    let path = path_with(&flow_claude(dir));
+
+    let out = flow_ok(&crystal, &path, &["ship", "add retries", "--wait"]);
+    assert_eq!(out, "ship-1\nwaiting at review\n");
+    runs(dir, 3);
+
+    crystal.ok(&["flow", "back", "ship-1", "keep", "the", "old", "default"]);
+    assert_eq!(flow_waits(&crystal, "ship-1"), "waiting at review\n");
+    let runs = runs(dir, 5);
+    // Build again, as a follow-up in its own conversation, told the notes
+    // and what the review said.
+    let build = &runs[3];
+    assert!(
+        build.contains("--resume conv-2 -- Build add retries"),
+        "{build}"
+    );
+    assert!(
+        build.contains("sent back at the review step, with these notes: keep the old default"),
+        "{build}"
+    );
+    assert!(build.contains("What review said:|answer 3"), "{build}");
+    // Then the review again, in its own conversation, of the new build.
+    assert!(
+        runs[4].contains("--resume conv-3 -- Review answer 4"),
+        "{}",
+        runs[4]
+    );
+    // In the same sessions, not new ones.
+    assert!(crystal.row("ship-1-build-2").is_none());
+
+    let show = crystal.ok(&["flow", "show", "ship-1"]);
+    assert!(show.contains("waiting at review · round 2"), "{show}");
+    crystal.ok(&["flow", "approve", "ship-1"]);
+    assert_eq!(flow_waits(&crystal, "ship-1"), "done\n");
+}
+
+#[test]
+fn a_failed_step_stops_the_flow_until_it_runs_again() {
+    let crystal = Crystal::new();
+    crystal.configure(FLOWS);
+    let dir = crystal.dir.path();
+    let path = path_with(&flow_claude(dir));
+
+    let out = run_flow(&crystal, &path, &["pair", "FAIL", "--wait"]);
+    assert!(!out.status.success());
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "pair-1\n");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("failed at plan"), "{err}");
+    let show = crystal.ok(&["flow", "show", "pair-1"]);
+    assert!(show.contains("failed at plan"), "{show}");
+    assert_eq!(runs(dir, 1).len(), 1, "build never started");
+
+    std::fs::write(dir.join("fixed"), "").unwrap();
+    crystal.ok(&["flow", "retry", "pair-1"]);
+    assert_eq!(flow_waits(&crystal, "pair-1"), "done\n");
+    // Run again in a task that carries the failed one's conversation on.
+    let runs = runs(dir, 3);
+    assert!(
+        runs[1].contains("--resume conv-1 -- Plan FAIL"),
+        "{}",
+        runs[1]
+    );
+    assert_eq!(status(&crystal, "pair-1-plan"), "idle");
+}
+
+#[test]
+fn a_step_cut_short_by_a_restart_is_interrupted_until_it_runs_again() {
+    let crystal = Crystal::new();
+    crystal.configure(FLOWS);
+    let dir = crystal.dir.path();
+    let path = path_with(&flow_claude(dir));
+    // A daemon of the test's own, to crash, that finds the fake claude:
+    // after a restart, steps start from the daemon's environment.
+    let start_daemon = || {
+        let daemon = crystal
+            .command(&["daemon"])
+            .env("PATH", &path)
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        eventually("the daemon is listening", || crystal.socket.exists());
+        daemon
+    };
+    let daemon = start_daemon();
+    assert_eq!(
+        flow_ok(&crystal, &path, &["pair", "SLOW", "down"]),
+        "pair-1\n"
+    );
+    runs(dir, 1);
+    eventually("the step is saved in its conversation", || {
+        crystal.saved().contains("conv-1")
+    });
+
+    crash(daemon);
+    let daemon = start_daemon();
+    let listed = crystal.ok(&["flow"]);
+    assert!(listed.contains("interrupted"), "{listed}");
+
+    std::fs::write(dir.join("go"), "").unwrap();
+    crystal.ok(&["flow", "retry", "pair-1"]);
+    assert_eq!(flow_waits(&crystal, "pair-1"), "done\n");
+    // Run again in the task that came back at rest, in its conversation.
+    let runs = runs(dir, 3);
+    assert!(
+        runs[1].contains("--resume conv-1 -- Plan SLOW down"),
+        "{}",
+        runs[1]
+    );
+    crash(daemon);
+}
+
+#[test]
+fn a_step_that_wants_a_worktree_runs_in_one_the_flow_makes_as_do_those_after() {
+    let crystal = Crystal::new();
+    crystal.configure(FLOWS);
+    let dir = crystal.dir.path();
+    let path = path_with(&flow_claude(dir));
+    let repo = git_repo(dir, "app");
+
+    let repo_arg = repo.to_string_lossy();
+    let out = flow_ok(
+        &crystal,
+        &path,
+        &["tree", "add retries", "-c", &repo_arg, "--wait"],
+    );
+    assert_eq!(out, "tree-1\ndone\n");
+    // Columns: BRANCH, then DIRECTORY.
+    let plan = crystal.row("tree-1-plan").unwrap();
+    assert_eq!(plan[4], "main");
+    for step in ["tree-1-build", "tree-1-check"] {
+        let row = crystal.row(step).unwrap();
+        assert_eq!(row[4], "add-retries");
+        assert!(row[5].ends_with("app.worktrees/add-retries"), "{}", row[5]);
+    }
+
+    // A second run of the same goal makes a worktree of its own.
+    let out = flow_ok(
+        &crystal,
+        &path,
+        &["tree", "add retries", "-c", &repo_arg, "--wait"],
+    );
+    assert_eq!(out, "tree-2\ndone\n");
+    assert_eq!(crystal.row("tree-2-build").unwrap()[4], "add-retries-2");
+}
+
+#[test]
+fn the_sidebar_groups_a_flow_runs_steps_and_g_goes_on_past_its_gate() {
+    let crystal = Crystal::new();
+    crystal.configure(FLOWS);
+    let dir = crystal.dir.path();
+    let path = path_with(&flow_claude(dir));
+    let out = flow_ok(&crystal, &path, &["gated", "add retries", "--wait"]);
+    assert_eq!(out, "gated-1\nwaiting at plan\n");
+
+    let mut tui = crystal.tui();
+    tui.shows("◇ gated add retries");
+    tui.shows("▲ plan");
+    tui.shows("· build");
+    tui.shows("g go on");
+    tui.type_keys("g");
+    tui.shows("✓ build");
+    assert_eq!(flow_waits(&crystal, "gated-1"), "done\n");
+}
+
+#[test]
+fn f_sends_a_flow_back_from_its_gate_with_the_notes_typed() {
+    let crystal = Crystal::new();
+    crystal.configure(FLOWS);
+    let dir = crystal.dir.path();
+    let path = path_with(&flow_claude(dir));
+    let out = flow_ok(&crystal, &path, &["gated", "add retries", "--wait"]);
+    assert_eq!(out, "gated-1\nwaiting at plan\n");
+
+    let mut tui = crystal.tui();
+    tui.shows("▲ plan");
+    tui.type_keys("f");
+    tui.shows("send back; what to do differently:");
+    tui.type_keys("shorter\r");
+    let runs = runs(dir, 2);
+    assert!(
+        runs[1].contains("--resume conv-1 -- Plan add retries"),
+        "{}",
+        runs[1]
+    );
+    assert!(runs[1].contains("with these notes: shorter"), "{}", runs[1]);
+    tui.shows("round 2");
+}
