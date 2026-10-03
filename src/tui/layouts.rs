@@ -12,10 +12,10 @@
 //! writing it is the event loop's, and nothing else here does any I/O.
 
 use super::sidebar::{ago, fit};
-use super::tabs::{self, Tabs};
+use super::tabs::Tabs;
 use super::text_input::TextInput;
 use super::theme::Theme;
-use anyhow::{Context as _, Result};
+use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout as Split, Rect};
@@ -23,8 +23,6 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear};
 use serde::{Deserialize, Serialize};
-use std::io::ErrorKind;
-use std::path::{Path, PathBuf};
 
 /// Which shape of file [`save`] writes. A file of another shape is shown
 /// as one that can't be read, and isn't written over.
@@ -132,36 +130,18 @@ impl Layouts {
     }
 }
 
-/// Where the TUI of the daemon at `socket` keeps its layouts: beside its
-/// tabs.
-pub fn path(socket: &Path) -> PathBuf {
-    tabs::path(socket).with_file_name("layouts.json")
-}
-
-/// The layouts kept at `path`: none when there's no file yet, or why the
-/// file couldn't be read.
-pub fn load(path: &Path) -> Result<Layouts, String> {
-    let shown = crate::shell::home_relative(path);
-    let text = match std::fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(Layouts::default()),
-        Err(err) => return Err(format!("couldn't read {shown}: {err}")),
+/// The layouts kept as `json`: none when nothing has been kept yet, or why
+/// what was kept couldn't be read.
+pub fn read(json: Option<&str>) -> Result<Layouts, String> {
+    let Some(json) = json else {
+        return Ok(Layouts::default());
     };
-    let layouts: Layouts =
-        serde_json::from_str(&text).map_err(|err| format!("couldn't read {shown}: {err}"))?;
+    let layouts: Layouts = serde_json::from_str(json)
+        .map_err(|err| format!("couldn't read the saved layouts: {err}"))?;
     if layouts.version != VERSION {
-        return Err(format!("{shown} was written by another crystal"));
+        return Err("the saved layouts were written by another crystal".to_string());
     }
     Ok(layouts)
-}
-
-/// Keeps `layouts` at `path`.
-pub fn save(path: &Path, layouts: &Layouts) -> Result<()> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).with_context(|| format!("couldn't make {}", dir.display()))?;
-    }
-    let text = serde_json::to_string_pretty(layouts)?;
-    std::fs::write(path, text).with_context(|| format!("couldn't write {}", path.display()))
 }
 
 /// What a key in the view asks for.
@@ -479,27 +459,26 @@ mod tests {
     }
 
     #[test]
-    fn layouts_kept_on_disk_come_back_as_they_were() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("state/layouts.json");
-        assert_eq!(load(&path), Ok(Layouts::default()));
+    fn layouts_kept_come_back_as_they_were() {
+        assert_eq!(read(None), Ok(Layouts::default()));
         let mut layouts = Layouts::default();
         layouts.save("work", tabs_of("one", &["a", "b"]), 10);
-        save(&path, &layouts).unwrap();
-        assert_eq!(load(&path), Ok(layouts));
+        let json = serde_json::to_string(&layouts).unwrap();
+        assert_eq!(read(Some(&json)), Ok(layouts));
     }
 
     #[test]
-    fn a_file_that_cant_be_read_says_so_and_nothing_can_be_saved_into_it() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("layouts.json");
-        std::fs::write(&path, "not json").unwrap();
-        assert!(load(&path).unwrap_err().contains("couldn't read"));
-        std::fs::write(&path, r#"{"version": 9, "saved": []}"#).unwrap();
-        let reason = load(&path).unwrap_err();
+    fn layouts_that_cant_be_read_say_so_and_nothing_can_be_saved_over_them() {
+        assert!(
+            read(Some("not json"))
+                .unwrap_err()
+                .contains("couldn't read")
+        );
+        let other = r#"{"version": 9, "saved": []}"#;
+        let reason = read(Some(other)).unwrap_err();
         assert!(reason.contains("another crystal"), "{reason}");
 
-        let mut view = LayoutsView::new(load(&path), Vec::new());
+        let mut view = LayoutsView::new(read(Some(other)), Vec::new());
         type_text(&mut view, "s");
         assert!(view.naming.is_none());
     }

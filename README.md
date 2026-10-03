@@ -288,8 +288,16 @@ session that has ended, it prints the last screen and how the program exited.
 If the daemon dies without being asked to, because it crashed or the machine rebooted, the next `crystal` starts
 the sessions that were running again, in the same directories. Claude Code and Codex come back in the
 conversation they were in. `crystal kill-server` is asked to stop everything, so after it nothing comes back.
-The list is kept in `~/.local/state/crystal/sessions.json`, without the sessions' environment variables, since
-those can hold secrets; a session started again gets the environment of whoever started the daemon again.
+The list is kept in crystal's database, `~/.local/state/crystal/crystal.db`, without the sessions' environment
+variables, since those can hold secrets; a session started again gets the environment of whoever started the
+daemon again.
+
+The database is SQLite, and holds everything crystal keeps but its settings and memory: the sessions to start
+again, flow runs, each project's backlog and closed tasks, and the TUI's tabs, layouts and earlier tasks. Each
+change is written whole or not at all, so a crash or a power cut never leaves half of one, and a database that
+can't be read stops the daemon rather than being started over. What an older crystal kept in JSON files there is
+brought in the first time, and each file is kept beside it, renamed `.imported` (or `.broken`, when it couldn't
+be read).
 
 ### Tabs
 
@@ -311,8 +319,8 @@ Every session is in exactly one tab. A session you start from the TUI goes in th
 one started any other way, from the command line or another TUI, unless it's a step of a [flow](#flows), which
 goes in the tab with the rest of its run. `>` moves the selected session to another tab: press the tab's
 number next, or `t` to make a new tab for it. `&` closes the tab you're in and kills the sessions in it, once
-you've said `y`; an empty tab closes at once. There's always one tab, and nine at most. They're kept beside the
-daemon's state, in `~/.local/state/crystal/`, so they're there when you open the TUI again.
+you've said `y`; an empty tab closes at once. There's always one tab, and nine at most. They're kept in crystal's
+database, so they're there when you open the TUI again.
 
 ### Layouts
 
@@ -326,7 +334,7 @@ list.
 A layout names sessions; it doesn't start them. Restoring one arranges the sessions running now: those it
 names that have gone since are left out, and those it doesn't name join the tab in front. The tabs a restore
 replaces are kept, at the top of the list as `↶ before` the layout's name, so `Enter` on that takes you back,
-once. Layouts are kept beside your tabs, in `~/.local/state/crystal/layouts.json`.
+once. Layouts are kept with your tabs, in crystal's database.
 
 ### Zoom, copy mode and search
 
@@ -381,7 +389,7 @@ before, and editing the file changes nothing in it.
 payments ⌂ main`. Type what the agent should do and press `Enter`; the task is its first prompt, given as one
 argument. `Alt+Enter` starts a new line, and a paste keeps its lines. An empty task starts the agent with no
 prompt. `↑` on the first line and `↓` on the last bring back earlier tasks: the panel keeps the last 100, in
-`launcher.json` beside `sessions.json`.
+crystal's database.
 
 Under the task, `Tab` and `Shift+Tab` go from row to row and `←` / `→` change a row's choice:
 
@@ -697,7 +705,7 @@ The sidebar shows a task under its session, what it was asked to do while it's o
 went once it's closed, and so does the pane's header. `crystal ls` has a TASK column, and `ls --json` a `task`
 field.
 
-Closed tasks are kept in the project's history in the state directory: what each was asked, when and how it
+Closed tasks are kept in the project's history in crystal's database: what each was asked, when and how it
 closed, and the session and branch it ran in. `crystal tasks` lists the project's tasks, open ones first, then
 those closed, the latest first; `--all` lists every project's, `-C <dir>` another project's, and `--json`
 prints them for scripts.
@@ -705,7 +713,7 @@ prints them for scripts.
 ### The backlog
 
 Each project keeps a backlog: things worth doing later that aren't anyone's task yet. It's the project's, not
-a worktree's, so every worktree of a repository shares it, and it's kept in the state directory, out of the
+a worktree's, so every worktree of a repository shares it, and it's kept in crystal's database, out of the
 repository. Items are numbered per project, `#1` on, and keep their number.
 
 ```sh
@@ -810,7 +818,7 @@ crystal flow retry ship-1            # run a step that failed, or that a restart
   On a step that failed or was cut short, `g` runs it again.
 - The new-session panel offers your flows after your profiles, `flow: ship`; what you type as the task is the
   goal.
-- Runs are kept beside the sessions in the state directory. After a restart, a run waiting at a gate waits
+- Runs are kept with the sessions, in crystal's database. After a restart, a run waiting at a gate waits
   again, and a step that was running is marked interrupted until you run it again, in its conversation. A
   run's steps start from the environment of the `crystal flow run` that started it; after a restart, from the
   daemon's. The daemon reads the flow and its profiles from the config file as the run starts, so changing

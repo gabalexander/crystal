@@ -2,9 +2,8 @@
 //! its agent closes it with `crystal done`, the user closes it, or, for a
 //! background task, its run ends. Once closed, it goes into its project's
 //! history: what it was asked to do, how it went, and where it ran. The
-//! daemon adds a line to the project's log as each task closes, in the
-//! project's directory in the state dir, so the history outlives the
-//! sessions it happened in.
+//! daemon adds a row to the project's history in the database as each task
+//! closes, so the history outlives the sessions it happened in.
 //!
 //! Everything tasks add to crystal goes through [`enabled`], so they can be
 //! switched off as one.
@@ -13,8 +12,7 @@ use crate::config::Config;
 use crate::plugins;
 use crate::protocol::TaskRecord;
 use anyhow::Result;
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::fs;
 use std::path::Path;
 
 /// Whether tasks are on: the `tasks` plugin.
@@ -55,26 +53,15 @@ pub const REMINDER: &str = "Your crystal task is still open. If you've done it, 
                             through, say you're waiting on the user, leave it open and end \
                             your turn.";
 
-/// The file a project's closed tasks are kept in: one JSON line each, so a
-/// new one is added without reading or writing the others.
-const FILE: &str = "tasks.jsonl";
+/// The file a project's closed tasks were kept in before the database, in
+/// its directory: one JSON line each.
+pub const OLD_FILE: &str = "tasks.jsonl";
 
-pub fn record(dir: &Path, task: &TaskRecord) -> Result<()> {
-    fs::create_dir_all(dir)?;
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(dir.join(FILE))?;
-    let mut line = serde_json::to_vec(task)?;
-    line.push(b'\n');
-    file.write_all(&line)?;
-    Ok(())
-}
-
-/// The project's closed tasks, in the order they closed. A line that can't
-/// be read, say one cut short by a crash, is left out.
-pub fn load(dir: &Path) -> Vec<TaskRecord> {
-    let Ok(text) = fs::read_to_string(dir.join(FILE)) else {
+/// The closed tasks kept in the project directory `dir` before the
+/// database, in the order they closed. A line that can't be read, say one
+/// cut short by a crash, is left out.
+pub fn load_old(dir: &Path) -> Vec<TaskRecord> {
+    let Ok(text) = fs::read_to_string(dir.join(OLD_FILE)) else {
         return Vec::new();
     };
     text.lines()
@@ -85,43 +72,18 @@ pub fn load(dir: &Path) -> Vec<TaskRecord> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::TaskOutcome;
-
-    fn closed(goal: &str, at: u64) -> TaskRecord {
-        TaskRecord {
-            goal: goal.into(),
-            session: "claude".into(),
-            project: "payments".into(),
-            branch: Some("main".into()),
-            background: false,
-            backlog: None,
-            outcome: Some(TaskOutcome {
-                failed: false,
-                summary: "did it".into(),
-                closed: at,
-            }),
-        }
-    }
-
-    #[test]
-    fn closed_tasks_load_back_in_the_order_they_closed() {
-        let dir = tempfile::tempdir().unwrap();
-        record(dir.path(), &closed("first", 1)).unwrap();
-        record(dir.path(), &closed("second", 2)).unwrap();
-        let goals: Vec<String> = load(dir.path()).into_iter().map(|task| task.goal).collect();
-        assert_eq!(goals, ["first", "second"]);
-    }
 
     #[test]
     fn a_broken_line_is_left_out() {
         let dir = tempfile::tempdir().unwrap();
-        record(dir.path(), &closed("kept", 1)).unwrap();
-        let mut file = OpenOptions::new()
-            .append(true)
-            .open(dir.path().join(FILE))
-            .unwrap();
-        file.write_all(b"{\"goal\": \"cut sh").unwrap();
-        assert_eq!(load(dir.path()).len(), 1);
-        assert!(load(&dir.path().join("none")).is_empty());
+        let kept = r#"{"goal": "kept", "session": "claude", "project": "payments"}"#;
+        let text = format!("{kept}\n{{\"goal\": \"cut sh");
+        fs::write(dir.path().join(OLD_FILE), text).unwrap();
+        let goals: Vec<String> = load_old(dir.path())
+            .into_iter()
+            .map(|task| task.goal)
+            .collect();
+        assert_eq!(goals, ["kept"]);
+        assert!(load_old(&dir.path().join("none")).is_empty());
     }
 }

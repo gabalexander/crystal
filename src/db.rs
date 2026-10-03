@@ -1,0 +1,953 @@
+//! The database the daemon and the TUI keep their state in: one SQLite file
+//! in the state directory holding the sessions to start again after a
+//! restart, the flow runs, each project's backlog and closed tasks, and the
+//! TUI's tabs, layouts and what the new-session panel remembers. The
+//! settings stay in the config file, which people edit by hand, and memory
+//! in a database of its own.
+//!
+//! Each write is a transaction, so one cut short by a crash or a power cut
+//! leaves what was there before, never half of it. A database that can't be
+//! read is an error, not a fresh start that would write over it.
+//!
+//! What crystal kept in JSON files before the database is brought in the
+//! first time it's opened, and a project's backlog and tasks the first time
+//! that project is asked for, since their directories are named by a hash
+//! of the project's path. Each file is kept, renamed `.imported`, should
+//! anyone want it; one that can't be read is renamed `.broken` instead.
+
+use crate::backlog;
+use crate::flow_run::FlowRun;
+use crate::protocol::{BacklogItem, TaskOutcome, TaskRecord};
+use crate::state::{self, SavedSession};
+use crate::tasks;
+use anyhow::{Context, Result};
+use rusqlite::{Connection, Row, Transaction, TransactionBehavior, params};
+use serde::Serialize;
+use serde::de::DeserializeOwned;
+use std::fs;
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+/// The tabs, under the name the TUI keeps them by.
+pub const TABS: &str = "tabs";
+/// What the new-session panel remembers between runs.
+pub const LAUNCHER: &str = "launcher";
+/// The layouts saved with `S`.
+pub const LAYOUTS: &str = "layouts";
+
+/// How long a write waits for another to finish: the daemon and every TUI
+/// share the one database.
+const BUSY_WAIT: Duration = Duration::from_secs(5);
+
+/// The tables as they were first. A session's and a flow run's place in
+/// their list is `position`, since the daemon keeps both lists in order and
+/// writes each down whole. A project's row is its main worktree's path, with
+/// the number its last backlog item got, which is never given again; that
+/// it has a row says its files from before were brought in. Lists and
+/// whole values, like a run's flow, are JSON. The TUI's state is a JSON
+/// document under each name.
+const TABLES: &str = "
+CREATE TABLE sessions (
+  position     INTEGER PRIMARY KEY,
+  name         TEXT NOT NULL,
+  command      TEXT NOT NULL,
+  cwd          TEXT NOT NULL,
+  conversation TEXT,
+  task         TEXT,
+  goal         TEXT
+);
+CREATE TABLE flow_runs (
+  position INTEGER PRIMARY KEY,
+  name     TEXT NOT NULL UNIQUE,
+  flow     TEXT NOT NULL,
+  profiles TEXT NOT NULL,
+  goal     TEXT NOT NULL,
+  cwd      TEXT NOT NULL,
+  worktree TEXT,
+  round    INTEGER NOT NULL,
+  feedback TEXT,
+  steps    TEXT NOT NULL,
+  started  INTEGER NOT NULL
+);
+CREATE TABLE projects (
+  path         TEXT PRIMARY KEY,
+  last_backlog INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE backlog (
+  project TEXT NOT NULL REFERENCES projects(path) ON DELETE CASCADE,
+  number  INTEGER NOT NULL,
+  text    TEXT NOT NULL,
+  tags    TEXT NOT NULL DEFAULT '[]',
+  done    INTEGER NOT NULL DEFAULT 0,
+  created INTEGER NOT NULL,
+  closed  INTEGER,
+  PRIMARY KEY (project, number)
+);
+CREATE TABLE tasks (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  project      TEXT NOT NULL REFERENCES projects(path) ON DELETE CASCADE,
+  project_name TEXT NOT NULL,
+  goal         TEXT NOT NULL,
+  session      TEXT NOT NULL,
+  branch       TEXT,
+  background   INTEGER NOT NULL DEFAULT 0,
+  backlog      INTEGER,
+  failed       INTEGER,
+  summary      TEXT,
+  closed       INTEGER
+);
+CREATE INDEX tasks_project ON tasks(project, id);
+CREATE TABLE ui (
+  name TEXT PRIMARY KEY,
+  json TEXT NOT NULL
+);
+";
+
+/// What makes the database as it is now, a step for each version: a
+/// database at version `v`, kept in its `user_version`, takes the steps
+/// after the first `v`.
+const MIGRATIONS: &[&str] = &[TABLES];
+
+/// The file each project kept its backlog in before the database.
+const OLD_BACKLOG: &str = "backlog.json";
+
+const SESSION_COLUMNS: &str = "name, command, cwd, conversation, task, goal";
+const RUN_COLUMNS: &str =
+    "name, flow, profiles, goal, cwd, worktree, round, feedback, steps, started";
+const TASK_COLUMNS: &str =
+    "project_name, goal, session, branch, background, backlog, failed, summary, closed";
+const ITEM_COLUMNS: &str = "number, text, tags, done, created, closed";
+
+/// The database of the daemon at `socket`, open.
+pub struct Db {
+    conn: Connection,
+    socket: PathBuf,
+}
+
+impl Db {
+    /// The database of the daemon at `socket`, made if it isn't there, with
+    /// the files kept before it brought in.
+    pub fn open(socket: &Path) -> Result<Db> {
+        let file = state::db_path(socket);
+        if let Some(dir) = file.parent() {
+            fs::create_dir_all(dir).with_context(|| format!("couldn't make {}", dir.display()))?;
+        }
+        let mut conn =
+            Connection::open(&file).with_context(|| format!("couldn't open {}", file.display()))?;
+        conn.busy_timeout(BUSY_WAIT)?;
+        // Readers then never wait on a writer, nor a writer on them, and a
+        // commit is written once, to the log.
+        conn.query_row("PRAGMA journal_mode = WAL", [], |_| Ok(()))?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+        migrate(&mut conn).with_context(|| format!("couldn't set up {}", file.display()))?;
+        let mut db = Db {
+            conn,
+            socket: socket.to_path_buf(),
+        };
+        db.bring_in_old();
+        Ok(db)
+    }
+
+    /// The sessions written down, in their order. One that can't be read,
+    /// written by another crystal say, is left out.
+    pub fn sessions(&self) -> Result<Vec<SavedSession>> {
+        let mut statement = self.conn.prepare(&format!(
+            "SELECT {SESSION_COLUMNS} FROM sessions ORDER BY position"
+        ))?;
+        let rows = statement.query_map([], |row| Ok(session_of(row)))?;
+        readable(rows, "a session")
+    }
+
+    /// Writes `sessions` down in place of those that were.
+    pub fn save_sessions(&mut self, sessions: &[SavedSession]) -> Result<()> {
+        let tx = self.write()?;
+        write_sessions(&tx, sessions)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The flow runs written down, the oldest first.
+    pub fn flow_runs(&self) -> Result<Vec<FlowRun>> {
+        let mut statement = self.conn.prepare(&format!(
+            "SELECT {RUN_COLUMNS} FROM flow_runs ORDER BY position"
+        ))?;
+        let rows = statement.query_map([], |row| Ok(run_of(row)))?;
+        readable(rows, "a flow run")
+    }
+
+    /// Writes `runs` down in place of those that were.
+    pub fn save_flow_runs(&mut self, runs: &[FlowRun]) -> Result<()> {
+        let tx = self.write()?;
+        write_runs(&tx, runs)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The backlog of the project whose main worktree is `project`.
+    pub fn backlog(&mut self, project: &Path) -> Result<backlog::Store> {
+        let key = self.ready(project)?;
+        read_backlog(&self.conn, &key)
+    }
+
+    /// Changes `project`'s backlog with `change`, and writes it back when
+    /// that worked, all in one transaction.
+    pub fn change_backlog<T>(
+        &mut self,
+        project: &Path,
+        change: impl FnOnce(&mut backlog::Store) -> Result<T>,
+    ) -> Result<T> {
+        let key = self.ready(project)?;
+        let tx = self.write()?;
+        let mut store = read_backlog(&tx, &key)?;
+        let changed = change(&mut store)?;
+        write_backlog(&tx, &key, &store)?;
+        tx.commit()?;
+        Ok(changed)
+    }
+
+    /// Adds a task that has closed to `project`'s history.
+    pub fn record_task(&mut self, project: &Path, task: &TaskRecord) -> Result<()> {
+        let key = self.ready(project)?;
+        insert_task(&self.conn, &key, task)
+    }
+
+    /// The closed tasks of `project`, or of every project, in the order
+    /// they closed. Every project's takes in those of projects whose files
+    /// haven't been brought in yet, read from the files.
+    pub fn closed_tasks(&mut self, project: Option<&Path>) -> Result<Vec<TaskRecord>> {
+        let mut found = match project {
+            Some(project) => {
+                let key = self.ready(project)?;
+                let mut statement = self.conn.prepare(&format!(
+                    "SELECT {TASK_COLUMNS} FROM tasks WHERE project = ?1 ORDER BY id"
+                ))?;
+                let rows = statement.query_map(params![key], |row| Ok(task_of(row)))?;
+                readable(rows, "a closed task")?
+            }
+            None => {
+                let mut statement = self
+                    .conn
+                    .prepare(&format!("SELECT {TASK_COLUMNS} FROM tasks ORDER BY id"))?;
+                let rows = statement.query_map([], |row| Ok(task_of(row)))?;
+                readable(rows, "a closed task")?
+            }
+        };
+        if project.is_none() {
+            for dir in state::project_dirs(&self.socket) {
+                found.extend(tasks::load_old(&dir));
+            }
+        }
+        Ok(found)
+    }
+
+    /// The TUI's document called `name`, when it has kept one.
+    pub fn ui(&self, name: &str) -> Result<Option<String>> {
+        let mut statement = self.conn.prepare("SELECT json FROM ui WHERE name = ?1")?;
+        let mut rows = statement.query(params![name])?;
+        Ok(match rows.next()? {
+            Some(row) => Some(row.get(0)?),
+            None => None,
+        })
+    }
+
+    /// Keeps `value` as the TUI's document called `name`.
+    pub fn keep_ui<T: Serialize>(&self, name: &str, value: &T) -> Result<()> {
+        put_ui(&self.conn, name, &serde_json::to_string(value)?)
+    }
+
+    /// A transaction that writes: it takes the database's one write lock
+    /// at its start, so what it reads stays as it was until it commits.
+    fn write(&mut self) -> Result<Transaction<'_>> {
+        Ok(self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?)
+    }
+
+    /// `project`'s key in the database, once it has its row there: the
+    /// first time, with the backlog and closed tasks it kept in files
+    /// before the database brought in.
+    fn ready(&mut self, project: &Path) -> Result<String> {
+        let key = project.to_string_lossy().into_owned();
+        let known = |conn: &Connection| -> rusqlite::Result<bool> {
+            conn.query_row(
+                "SELECT EXISTS (SELECT 1 FROM projects WHERE path = ?1)",
+                params![key],
+                |row| row.get(0),
+            )
+        };
+        if known(&self.conn)? {
+            return Ok(key);
+        }
+        let dir = state::project_dir(&self.socket, project);
+        let old_backlog = dir.join(OLD_BACKLOG);
+        let old_tasks = dir.join(tasks::OLD_FILE);
+        let tx = self.write()?;
+        // Another process may have got here first.
+        if known(&tx)? {
+            return Ok(key);
+        }
+        tx.execute("INSERT INTO projects (path) VALUES (?1)", params![key])?;
+        let backlog = match fs::read_to_string(&old_backlog) {
+            Ok(text) => match serde_json::from_str::<backlog::Store>(&text) {
+                Ok(store) => Some(store),
+                Err(err) => {
+                    set_aside(&old_backlog, "broken", &err.into());
+                    None
+                }
+            },
+            Err(_) => None,
+        };
+        if let Some(store) = &backlog {
+            write_backlog(&tx, &key, store)?;
+        }
+        let closed = tasks::load_old(&dir);
+        for task in &closed {
+            insert_task(&tx, &key, task)?;
+        }
+        tx.commit()?;
+        // Kept, should anyone want them, but never read again.
+        if backlog.is_some() {
+            let _ = fs::rename(&old_backlog, with_suffix(&old_backlog, "imported"));
+        }
+        if old_tasks.exists() {
+            let _ = fs::rename(&old_tasks, with_suffix(&old_tasks, "imported"));
+        }
+        Ok(key)
+    }
+
+    /// Brings in what was kept in files before the database: the sessions,
+    /// the flow runs and the TUI's documents.
+    fn bring_in_old(&mut self) {
+        let sessions = state::path(&self.socket);
+        self.bring_in(&sessions, |tx, text| {
+            let sessions: Vec<SavedSession> = serde_json::from_str(text)?;
+            write_sessions(tx, &sessions)
+        });
+        let runs = state::flows_path(&self.socket);
+        self.bring_in(&runs, |tx, text| {
+            let runs: Vec<FlowRun> = serde_json::from_str(text)?;
+            write_runs(tx, &runs)
+        });
+        for name in [TABS, LAUNCHER, LAYOUTS] {
+            let file = sessions.with_file_name(format!("{name}.json"));
+            self.bring_in(&file, |tx, text| {
+                serde_json::from_str::<serde_json::Value>(text)?;
+                put_ui(tx, name, text)
+            });
+        }
+    }
+
+    /// Brings in `file` with `put`, when it's there.
+    fn bring_in(&mut self, file: &Path, put: impl FnOnce(&Transaction, &str) -> Result<()>) {
+        if !file.exists() {
+            return;
+        }
+        if let Err(err) = self.try_bring_in(file, put) {
+            eprintln!("crystal: couldn't bring in {}: {err:#}", file.display());
+        }
+    }
+
+    fn try_bring_in(
+        &mut self,
+        file: &Path,
+        put: impl FnOnce(&Transaction, &str) -> Result<()>,
+    ) -> Result<()> {
+        let tx = self.write()?;
+        // Read under the write lock: another process bringing it in first
+        // has renamed it by the time this one has the lock.
+        let text = match fs::read_to_string(file) {
+            Ok(text) => text,
+            Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
+            Err(err) => return Err(err.into()),
+        };
+        if let Err(err) = put(&tx, &text) {
+            drop(tx);
+            set_aside(file, "broken", &err);
+            return Ok(());
+        }
+        let imported = with_suffix(file, "imported");
+        fs::rename(file, &imported)?;
+        if let Err(err) = tx.commit() {
+            let _ = fs::rename(&imported, file);
+            return Err(err.into());
+        }
+        Ok(())
+    }
+}
+
+/// Brings the database up to date: makes its tables, or adds what a newer
+/// crystal keeps.
+fn migrate(conn: &mut Connection) -> Result<()> {
+    let version = |conn: &Connection| -> rusqlite::Result<usize> {
+        conn.query_row("PRAGMA user_version", [], |row| row.get(0))
+    };
+    if version(conn)? >= MIGRATIONS.len() {
+        return Ok(());
+    }
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    // Another process may have got here first.
+    let done = version(&tx)?;
+    for step in MIGRATIONS.iter().skip(done) {
+        tx.execute_batch(step)?;
+    }
+    tx.execute_batch(&format!("PRAGMA user_version = {}", MIGRATIONS.len()))?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn write_sessions(conn: &Connection, sessions: &[SavedSession]) -> Result<()> {
+    conn.execute("DELETE FROM sessions", [])?;
+    for (position, session) in sessions.iter().enumerate() {
+        conn.execute(
+            &format!(
+                "INSERT INTO sessions (position, {SESSION_COLUMNS}) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
+            ),
+            params![
+                position as i64,
+                session.name,
+                json(&session.command)?,
+                session.cwd.to_string_lossy(),
+                json_or_null(&session.conversation)?,
+                json_or_null(&session.task)?,
+                json_or_null(&session.goal)?,
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn session_of(row: &Row) -> Result<SavedSession> {
+    Ok(SavedSession {
+        name: row.get(0)?,
+        command: from_json(&row.get::<_, String>(1)?)?,
+        cwd: PathBuf::from(row.get::<_, String>(2)?),
+        conversation: from_json_or_null(row.get(3)?)?,
+        task: from_json_or_null(row.get(4)?)?,
+        goal: from_json_or_null(row.get(5)?)?,
+    })
+}
+
+fn write_runs(conn: &Connection, runs: &[FlowRun]) -> Result<()> {
+    conn.execute("DELETE FROM flow_runs", [])?;
+    for (position, run) in runs.iter().enumerate() {
+        conn.execute(
+            &format!(
+                "INSERT INTO flow_runs (position, {RUN_COLUMNS}) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"
+            ),
+            params![
+                position as i64,
+                run.name,
+                json(&run.flow)?,
+                json(&run.profiles)?,
+                run.goal,
+                run.cwd.to_string_lossy(),
+                run.worktree.as_ref().map(|path| path.to_string_lossy()),
+                run.round,
+                run.feedback,
+                json(&run.steps)?,
+                run.started,
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+/// A flow run as it was written down, without the environment, which never
+/// is: the daemon gives it its own.
+fn run_of(row: &Row) -> Result<FlowRun> {
+    Ok(FlowRun {
+        name: row.get(0)?,
+        flow: from_json(&row.get::<_, String>(1)?)?,
+        profiles: from_json(&row.get::<_, String>(2)?)?,
+        goal: row.get(3)?,
+        cwd: PathBuf::from(row.get::<_, String>(4)?),
+        worktree: row.get::<_, Option<String>>(5)?.map(PathBuf::from),
+        round: row.get(6)?,
+        feedback: row.get(7)?,
+        steps: from_json(&row.get::<_, String>(8)?)?,
+        started: row.get(9)?,
+        env: Default::default(),
+    })
+}
+
+fn read_backlog(conn: &Connection, project: &str) -> Result<backlog::Store> {
+    let last: u64 = conn.query_row(
+        "SELECT last_backlog FROM projects WHERE path = ?1",
+        params![project],
+        |row| row.get(0),
+    )?;
+    let mut statement = conn.prepare(&format!(
+        "SELECT {ITEM_COLUMNS} FROM backlog WHERE project = ?1 ORDER BY number"
+    ))?;
+    let rows = statement.query_map(params![project], |row| Ok(item_of(row)))?;
+    Ok(backlog::Store {
+        next: last,
+        items: readable(rows, "a backlog item")?,
+    })
+}
+
+fn write_backlog(conn: &Connection, project: &str, store: &backlog::Store) -> Result<()> {
+    conn.execute(
+        "UPDATE projects SET last_backlog = ?2 WHERE path = ?1",
+        params![project, store.next],
+    )?;
+    conn.execute("DELETE FROM backlog WHERE project = ?1", params![project])?;
+    for item in &store.items {
+        conn.execute(
+            &format!(
+                "INSERT INTO backlog (project, {ITEM_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
+            ),
+            params![
+                project,
+                item.number,
+                item.text,
+                json(&item.tags)?,
+                item.done,
+                item.created,
+                item.closed,
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn item_of(row: &Row) -> Result<BacklogItem> {
+    Ok(BacklogItem {
+        number: row.get(0)?,
+        text: row.get(1)?,
+        tags: from_json(&row.get::<_, String>(2)?)?,
+        done: row.get(3)?,
+        created: row.get(4)?,
+        closed: row.get(5)?,
+    })
+}
+
+fn insert_task(conn: &Connection, project: &str, task: &TaskRecord) -> Result<()> {
+    let outcome = task.outcome.as_ref();
+    conn.execute(
+        &format!(
+            "INSERT INTO tasks (project, {TASK_COLUMNS}) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"
+        ),
+        params![
+            project,
+            task.project,
+            task.goal,
+            task.session,
+            task.branch,
+            task.background,
+            task.backlog,
+            outcome.map(|outcome| outcome.failed),
+            outcome.map(|outcome| &outcome.summary),
+            outcome.map(|outcome| outcome.closed),
+        ],
+    )?;
+    Ok(())
+}
+
+fn task_of(row: &Row) -> Result<TaskRecord> {
+    let closed: Option<u64> = row.get(8)?;
+    let outcome = match closed {
+        Some(closed) => Some(TaskOutcome {
+            failed: row.get::<_, Option<bool>>(6)?.unwrap_or(false),
+            summary: row.get::<_, Option<String>>(7)?.unwrap_or_default(),
+            closed,
+        }),
+        None => None,
+    };
+    Ok(TaskRecord {
+        project: row.get(0)?,
+        goal: row.get(1)?,
+        session: row.get(2)?,
+        branch: row.get(3)?,
+        background: row.get(4)?,
+        backlog: row.get(5)?,
+        outcome,
+    })
+}
+
+fn put_ui(conn: &Connection, name: &str, json: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO ui (name, json) VALUES (?1, ?2) \
+         ON CONFLICT (name) DO UPDATE SET json = excluded.json",
+        params![name, json],
+    )?;
+    Ok(())
+}
+
+/// The rows that could be read. One that couldn't is told about and left
+/// out: the rest are still worth having.
+fn readable<T>(
+    rows: impl Iterator<Item = rusqlite::Result<Result<T>>>,
+    what: &str,
+) -> Result<Vec<T>> {
+    let mut found = Vec::new();
+    for row in rows {
+        match row? {
+            Ok(value) => found.push(value),
+            Err(err) => eprintln!("crystal: couldn't read {what}: {err:#}"),
+        }
+    }
+    Ok(found)
+}
+
+/// Moves `file` aside, `backlog.json` to `backlog.json.broken`, and says
+/// why: it's kept for the user, never read again, and never written over.
+fn set_aside(file: &Path, suffix: &str, why: &anyhow::Error) {
+    let aside = with_suffix(file, suffix);
+    if fs::rename(file, &aside).is_ok() {
+        eprintln!(
+            "crystal: couldn't read {}, kept as {}: {why:#}",
+            file.display(),
+            aside.display()
+        );
+    }
+}
+
+fn with_suffix(file: &Path, suffix: &str) -> PathBuf {
+    let mut name = file.as_os_str().to_owned();
+    name.push(".");
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
+fn json<T: Serialize>(value: &T) -> Result<String> {
+    Ok(serde_json::to_string(value)?)
+}
+
+fn json_or_null<T: Serialize>(value: &Option<T>) -> Result<Option<String>> {
+    value.as_ref().map(json).transpose()
+}
+
+fn from_json<T: DeserializeOwned>(text: &str) -> Result<T> {
+    Ok(serde_json::from_str(text)?)
+}
+
+fn from_json_or_null<T: DeserializeOwned>(text: Option<String>) -> Result<Option<T>> {
+    text.as_deref().map(from_json).transpose()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::flows::{Flow, Step};
+    use crate::protocol::{Conversation, TaskInfo, TaskSpec};
+    use std::collections::BTreeMap;
+
+    /// A socket of a test's own, in `dir`, so its database is too.
+    fn socket_in(dir: &tempfile::TempDir) -> PathBuf {
+        dir.path().join("crystal.sock")
+    }
+
+    fn saved(name: &str) -> SavedSession {
+        SavedSession {
+            name: name.into(),
+            command: vec!["claude".into()],
+            cwd: PathBuf::from("/code/app"),
+            conversation: Some(Conversation {
+                id: "abc".into(),
+                transcript: None,
+            }),
+            task: None,
+            goal: None,
+        }
+    }
+
+    fn run(name: &str) -> FlowRun {
+        let flow = Flow {
+            name: "ship".into(),
+            description: None,
+            steps: vec![Step {
+                name: "plan".into(),
+                profile: None,
+                prompt: "Plan {goal}".into(),
+                worktree: false,
+                gate: true,
+                back_to: None,
+            }],
+        };
+        let env = BTreeMap::from([("TOKEN".to_string(), "secret".to_string())]);
+        let mut run = FlowRun::new(
+            name.into(),
+            flow,
+            &[],
+            "add retries".into(),
+            PathBuf::from("/code/app"),
+            env,
+            7,
+        );
+        run.start();
+        run
+    }
+
+    fn closed(goal: &str, at: u64) -> TaskRecord {
+        TaskRecord {
+            goal: goal.into(),
+            session: "claude".into(),
+            project: "app".into(),
+            branch: Some("main".into()),
+            background: false,
+            backlog: Some(3),
+            outcome: Some(TaskOutcome {
+                failed: false,
+                summary: "did it".into(),
+                closed: at,
+            }),
+        }
+    }
+
+    #[test]
+    fn sessions_saved_load_back_the_same_in_their_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Db::open(&socket_in(&dir)).unwrap();
+        assert!(db.sessions().unwrap().is_empty());
+        let mut task = saved("b");
+        task.task = Some(TaskSpec {
+            prompt: "fix the tests".into(),
+            args: vec!["--permission-mode".into(), "acceptEdits".into()],
+        });
+        task.goal = Some(TaskInfo {
+            goal: "fix the tests".into(),
+            background: true,
+            backlog: Some(2),
+            outcome: None,
+        });
+        let sessions = vec![saved("c"), task, saved("a")];
+        db.save_sessions(&sessions).unwrap();
+        assert_eq!(db.sessions().unwrap(), sessions);
+
+        // Saving again replaces them, and another process reads the same.
+        db.save_sessions(&sessions[..1]).unwrap();
+        let other = Db::open(&socket_in(&dir)).unwrap();
+        assert_eq!(other.sessions().unwrap(), &sessions[..1]);
+    }
+
+    #[test]
+    fn a_session_that_cant_be_read_is_left_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Db::open(&socket_in(&dir)).unwrap();
+        db.save_sessions(&[saved("a"), saved("b")]).unwrap();
+        db.conn
+            .execute(
+                "UPDATE sessions SET command = 'not json' WHERE name = 'a'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(db.sessions().unwrap(), [saved("b")]);
+    }
+
+    #[test]
+    fn flow_runs_are_written_down_without_their_environment() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Db::open(&socket_in(&dir)).unwrap();
+        let runs = vec![run("ship-1"), run("ship-2")];
+        db.save_flow_runs(&runs).unwrap();
+        let kept: String = db
+            .conn
+            .query_row(
+                "SELECT group_concat(steps || flow) FROM flow_runs",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!kept.contains("secret"));
+        let loaded = db.flow_runs().unwrap();
+        let without_env: Vec<FlowRun> = runs
+            .into_iter()
+            .map(|mut run| {
+                run.env.clear();
+                run
+            })
+            .collect();
+        assert_eq!(loaded, without_env);
+    }
+
+    #[test]
+    fn a_backlog_change_is_kept_and_one_that_fails_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Db::open(&socket_in(&dir)).unwrap();
+        let app = Path::new("/code/app");
+        let first = db
+            .change_backlog(app, |store| {
+                store.add("write the docs", vec!["docs".into()], 5)
+            })
+            .unwrap();
+        let second = db
+            .change_backlog(app, |store| store.add("fix the cart", Vec::new(), 6))
+            .unwrap();
+        assert_eq!((first, second), (1, 2));
+        db.change_backlog(app, |store| store.mark(1, true, 9))
+            .unwrap();
+        db.change_backlog(app, |store| store.remove(2)).unwrap();
+        assert!(
+            db.change_backlog(app, |store| store.mark(7, true, 9))
+                .is_err()
+        );
+
+        let store = Db::open(&socket_in(&dir)).unwrap().backlog(app).unwrap();
+        assert_eq!(store.items.len(), 1);
+        let item = &store.items[0];
+        assert_eq!((item.number, item.done, item.closed), (1, true, Some(9)));
+        assert_eq!(item.tags, ["docs"]);
+        let third = db
+            .change_backlog(app, |store| store.add("third", Vec::new(), 10))
+            .unwrap();
+        assert_eq!(third, 3, "a removed item's number isn't given again");
+        assert!(
+            db.backlog(Path::new("/code/other"))
+                .unwrap()
+                .items
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn closed_tasks_come_back_by_project_in_the_order_they_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Db::open(&socket_in(&dir)).unwrap();
+        let app = Path::new("/code/app");
+        db.record_task(app, &closed("first", 1)).unwrap();
+        db.record_task(Path::new("/code/other"), &closed("elsewhere", 2))
+            .unwrap();
+        let mut open = closed("open", 3);
+        open.outcome = None;
+        db.record_task(app, &open).unwrap();
+
+        let mine = db.closed_tasks(Some(app)).unwrap();
+        assert_eq!(mine, [closed("first", 1), open]);
+        let goals: Vec<String> = db
+            .closed_tasks(None)
+            .unwrap()
+            .into_iter()
+            .map(|task| task.goal)
+            .collect();
+        assert_eq!(goals, ["first", "elsewhere", "open"]);
+    }
+
+    #[test]
+    fn the_tuis_documents_are_kept_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&socket_in(&dir)).unwrap();
+        assert_eq!(db.ui(TABS).unwrap(), None);
+        db.keep_ui(TABS, &vec!["one"]).unwrap();
+        db.keep_ui(TABS, &vec!["two"]).unwrap();
+        db.keep_ui(LAYOUTS, &0).unwrap();
+        assert_eq!(db.ui(TABS).unwrap().as_deref(), Some(r#"["two"]"#));
+        assert_eq!(db.ui(LAYOUTS).unwrap().as_deref(), Some("0"));
+    }
+
+    #[test]
+    fn the_files_from_before_are_brought_in_once_and_kept_aside() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = socket_in(&dir);
+        let sessions = state::path(&socket);
+        let text = serde_json::to_string(&[saved("a"), saved("b")]).unwrap();
+        fs::write(&sessions, text).unwrap();
+        let runs = state::flows_path(&socket);
+        fs::write(&runs, serde_json::to_string(&[run("ship-1")]).unwrap()).unwrap();
+        let tabs = sessions.with_file_name("tabs.json");
+        fs::write(&tabs, r#"{"version": 2, "tabs": []}"#).unwrap();
+        let layouts = sessions.with_file_name("layouts.json");
+        fs::write(&layouts, "not json").unwrap();
+
+        let mut db = Db::open(&socket).unwrap();
+        assert_eq!(db.sessions().unwrap(), [saved("a"), saved("b")]);
+        assert_eq!(db.flow_runs().unwrap()[0].name, "ship-1");
+        assert_eq!(
+            db.ui(TABS).unwrap().as_deref(),
+            Some(r#"{"version": 2, "tabs": []}"#)
+        );
+        assert!(!sessions.exists() && !runs.exists() && !tabs.exists());
+        assert!(with_suffix(&sessions, "imported").exists());
+        assert!(with_suffix(&tabs, "imported").exists());
+        // What can't be read is kept for the user, and never read again.
+        assert_eq!(db.ui(LAYOUTS).unwrap(), None);
+        assert!(!layouts.exists());
+        assert_eq!(
+            fs::read_to_string(with_suffix(&layouts, "broken")).unwrap(),
+            "not json"
+        );
+
+        // A database that has them doesn't take them again.
+        db.save_sessions(&[saved("c")]).unwrap();
+        drop(db);
+        let db = Db::open(&socket).unwrap();
+        assert_eq!(db.sessions().unwrap(), [saved("c")]);
+    }
+
+    #[test]
+    fn a_projects_files_from_before_are_brought_in_when_its_first_asked_for() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = socket_in(&dir);
+        let app = Path::new("/code/app");
+        let old = state::project_dir(&socket, app);
+        fs::create_dir_all(&old).unwrap();
+        let mut store = backlog::Store::default();
+        store.add("from before", Vec::new(), 1).unwrap();
+        store.add("removed", Vec::new(), 2).unwrap();
+        store.remove(2).unwrap();
+        fs::write(
+            old.join(OLD_BACKLOG),
+            serde_json::to_string(&store).unwrap(),
+        )
+        .unwrap();
+        let line = serde_json::to_string(&closed("before", 1)).unwrap();
+        fs::write(old.join(tasks::OLD_FILE), format!("{line}\n")).unwrap();
+
+        let mut db = Db::open(&socket).unwrap();
+        // Every project's tasks take in those not brought in yet.
+        assert_eq!(db.closed_tasks(None).unwrap(), [closed("before", 1)]);
+
+        assert_eq!(db.backlog(app).unwrap(), store);
+        assert!(!old.join(OLD_BACKLOG).exists());
+        assert!(old.join("backlog.json.imported").exists());
+        assert!(old.join("tasks.jsonl.imported").exists());
+        let next = db
+            .change_backlog(app, |store| store.add("new", Vec::new(), 3))
+            .unwrap();
+        assert_eq!(next, 3);
+        db.record_task(app, &closed("after", 4)).unwrap();
+        let goals: Vec<String> = db
+            .closed_tasks(None)
+            .unwrap()
+            .into_iter()
+            .map(|task| task.goal)
+            .collect();
+        assert_eq!(goals, ["before", "after"]);
+    }
+
+    #[test]
+    fn a_broken_backlog_from_before_is_kept_aside_and_the_project_starts_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = socket_in(&dir);
+        let app = Path::new("/code/app");
+        let old = state::project_dir(&socket, app);
+        fs::create_dir_all(&old).unwrap();
+        fs::write(old.join(OLD_BACKLOG), "{\"next\": 4, \"items\": [").unwrap();
+
+        let mut db = Db::open(&socket).unwrap();
+        assert!(db.backlog(app).unwrap().items.is_empty());
+        assert!(old.join("backlog.json.broken").exists());
+    }
+
+    #[test]
+    fn a_database_that_cant_be_read_is_an_error_and_is_left_as_it_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = socket_in(&dir);
+        let file = state::db_path(&socket);
+        fs::write(
+            &file,
+            "this is not a database, and is long enough to say so",
+        )
+        .unwrap();
+        assert!(Db::open(&socket).is_err());
+        assert_eq!(
+            fs::read_to_string(&file).unwrap(),
+            "this is not a database, and is long enough to say so"
+        );
+    }
+}

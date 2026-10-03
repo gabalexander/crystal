@@ -49,10 +49,9 @@ is: it's the one request every version must understand.
   - `ui.rs`: the layout and drawing (top bar and its tabs, pane headers, footer), and what's under the mouse
   - `tabs.rs`: tabs, each holding its own sessions (each session in exactly one) with its own selection,
     splits, the order of its panes and the session floating over them, and which is in front; the sidebar
-    shows only that tab's sessions. Kept apart from I/O but for keeping them in a file beside the daemon's
-    state
+    shows only that tab's sessions. Kept apart from I/O; the event loop keeps them in the database
   - `layouts.rs`: the layouts view (`S`): the tabs saved under a name and put back, and the tabs a restore
-    replaced; its state and keys, kept apart from I/O but for keeping them in a file beside the tabs, and its
+    replaced; its state and keys, kept apart from I/O (the event loop keeps them in the database), and its
     drawing
   - `sidebar.rs`: the sidebar's rows: headings, worktree lines, sessions with their mark and how long ago,
     terminals drawn apart from agents
@@ -117,13 +116,19 @@ is: it's the one request every version must understand.
 - `src/transcript.rs`: reading `claude -p`'s stream-json events, and drawing them as a task's transcript
 - `src/protocol.rs`: requests and responses, one JSON line each, and the frames an attached client sends
 - `src/socket.rs`: where the socket lives
-- `src/state.rs`: the running sessions, written down to start them again after a restart, and each
-  project's directory in the state dir
+- `src/state.rs`: where the daemon's state is: the database, and the files kept before it (the sessions, the
+  flow runs, each project's directory); a running session as it's written down to start it again
+- `src/db.rs`: the SQLite database the daemon and the TUI keep their state in (WAL, `synchronous=NORMAL`,
+  migrations by `user_version`, as docket does): the sessions to start again, flow runs, each project's backlog
+  and closed tasks, and the TUI's tabs, layouts and the new-session panel's memory, each a JSON document; and
+  bringing in the JSON files from before, a project's the first time it's asked for. Settings stay in the
+  config file and memory in `memory.db`
 - `src/project.rs`: the project a directory is in: its git main worktree, or the directory itself outside git
 - `src/tasks.rs`: tasks, sessions started with something to do: the paragraph an agent is told about
-  `crystal done`, the reminder for one that ends a turn with its task open, each project's history of closed
-  tasks, and `enabled`, the one gate everything tasks add goes through
-- `src/backlog.rs`: a project's backlog, numbered items kept in the state dir by the daemon alone, its
+  `crystal done`, the reminder for one that ends a turn with its task open, reading a project's closed tasks
+  from the file they were kept in before the database, and `enabled`, the one gate everything tasks add goes
+  through
+- `src/backlog.rs`: a project's backlog, numbered items kept in the database by the daemon alone, its
   markdown export, and `enabled`, the one gate everything the backlog adds goes through
 - `src/work.rs`: `crystal done`, `tasks` and `backlog`
 - `src/config.rs`: the settings in `~/.config/crystal/config.toml`, read and checked
@@ -149,7 +154,7 @@ is: it's the one request every version must understand.
   checking them, filling in a step's prompt, the example `crystal flow example` prints, and `enabled`, the one
   gate everything flows add goes through
 - `src/flow_run.rs`: a flow run and how it changes as its steps end and the user answers its gates, kept apart
-  from I/O, so it's unit-tested; the daemon starts the steps and writes the runs down
+  from I/O, so it's unit-tested; the daemon starts the steps and writes the runs down in the database
 - `src/flow_cli.rs`: `crystal flow` and its commands
 - `src/notify.rs`: telling the user when a session needs them: desktop notifications, or their own command
 - `src/plugins.rs`: plugins: the registry of crystal's own, `enabled`, the gate every one of them goes through
@@ -168,7 +173,8 @@ is: it's the one request every version must understand.
 - `src/github.rs`: pull requests and issues from GitHub, through `gh` with a timeout; tests use a fake `gh`,
   never the real one
 - `src/shell.rs`: quoting arguments and writing paths with `~`, the way a shell reads them
-- `tests/cli.rs`: end-to-end tests that drive the real binary against a private daemon, with a config of
+- `tests/cli.rs`: end-to-end tests that drive the real binary against a private daemon (and read its database
+  beside its socket to see what it wrote down), with a config of
   their own that turns notifications and the memory plugin off (a memory test turns it back on), and plugins
   of their own in its plugins directory; a test that opens the new-session panel pins `PATH` to its fake
   agents, so no real agent is found or run. vt100 stands in for the user's own terminal: a second emulator,

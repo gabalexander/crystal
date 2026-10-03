@@ -4,8 +4,8 @@
 //! on past a gate, sends the flow back, or runs a stopped step again. Each
 //! change says what to do [`Next`], and the daemon does it: it starts the
 //! step's task, or tells the user the flow waits on them. Nothing here
-//! starts a process or reads a file, apart from [`load`] and [`save`], so
-//! every change is unit-tested.
+//! starts a process or reads a file, so every change is unit-tested; the
+//! daemon writes the runs down in its database.
 //!
 //! The steps go in order. Those before the current step are done; the
 //! current one is running, waiting at its gate, or stopped; those after it
@@ -18,8 +18,7 @@ use crate::protocol::TaskSpec;
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// How many runs that have finished, done or failed, are kept for `crystal
 /// flow` to list. Older ones are let go as new ones start.
@@ -503,27 +502,6 @@ fn branch_from_goal(goal: &str) -> String {
     branch
 }
 
-/// The runs written down at `path`. A file that's missing or can't be
-/// read means there are none.
-pub fn load(path: &Path) -> Vec<FlowRun> {
-    let Ok(text) = fs::read_to_string(path) else {
-        return Vec::new();
-    };
-    serde_json::from_str(&text).unwrap_or_default()
-}
-
-pub fn save(path: &Path, runs: &[FlowRun]) -> Result<()> {
-    if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir)?;
-    }
-    // Written beside it first, then moved into place in one step, so a
-    // crash halfway through never leaves half a file.
-    let unfinished = path.with_extension("json.unfinished");
-    fs::write(&unfinished, serde_json::to_string_pretty(runs)?)?;
-    fs::rename(&unfinished, path)?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -869,20 +847,5 @@ mod tests {
         assert_eq!(runs.len(), FINISHED_KEPT + 1);
         assert_eq!(runs[0].state(), RunState::Running);
         assert_eq!(runs[1].name, "ship-3");
-    }
-
-    #[test]
-    fn runs_are_written_down_without_their_environment() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("flows.json");
-        let mut run = ship();
-        run.env.insert("TOKEN".into(), "secret".into());
-        run.start();
-        save(&path, std::slice::from_ref(&run)).unwrap();
-        assert!(!fs::read_to_string(&path).unwrap().contains("secret"));
-        let loaded = load(&path);
-        run.env.clear();
-        assert_eq!(loaded, [run]);
-        assert!(load(&dir.path().join("none.json")).is_empty());
     }
 }
