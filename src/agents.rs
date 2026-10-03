@@ -75,7 +75,11 @@ fn with_instructions(args: &[String], instructions: &[String]) -> Vec<String> {
     let mut paragraphs = Vec::new();
     let mut args = args.iter();
     while let Some(arg) = args.next() {
-        if arg == "--append-system-prompt" {
+        if arg == "--" {
+            // What follows is the first prompt, whatever it looks like.
+            kept.push(arg.clone());
+            kept.extend(args.by_ref().cloned());
+        } else if arg == "--append-system-prompt" {
             paragraphs.extend(args.next().cloned());
         } else if let Some(text) = arg.strip_prefix("--append-system-prompt=") {
             paragraphs.push(text.to_string());
@@ -188,6 +192,26 @@ mod tests {
                 "--append-system-prompt",
                 "Be brief.\n\nRun `crystal done` when finished.",
                 "fix it"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_first_prompt_after_the_double_dash_is_left_as_it_is() {
+        let asked = command(&[
+            "claude",
+            "--",
+            "--append-system-prompt=x, explain this flag",
+        ]);
+        let instructions = ["Run `crystal done` when finished.".to_string()];
+        let argv = argv(&asked, Path::new("/bin/crystal"), None, &instructions);
+        assert_eq!(
+            argv[3..],
+            [
+                "--append-system-prompt",
+                "Run `crystal done` when finished.",
+                "--",
+                "--append-system-prompt=x, explain this flag"
             ]
         );
     }

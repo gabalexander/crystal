@@ -23,7 +23,10 @@ pub struct Agent {
 /// How an agent is given its first prompt on its command line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FirstPrompt {
-    /// As its last argument: `claude "fix the tests"`.
+    /// As its last argument, after `--`: `claude -- "fix the tests"`. The
+    /// `--` says that what follows is no option, so a task that starts
+    /// with `-` isn't taken for one, and an option that takes several
+    /// values, like `--allowedTools Read Grep`, doesn't take the task too.
     Argument,
     /// After this option: `gemini -i "fix the tests"`.
     Option(&'static str),
@@ -38,7 +41,10 @@ impl FirstPrompt {
             return;
         }
         match self {
-            FirstPrompt::Argument => command.push(task.to_string()),
+            FirstPrompt::Argument => {
+                command.push("--".to_string());
+                command.push(task.to_string());
+            }
             FirstPrompt::Option(option) => {
                 command.push(option.to_string());
                 command.push(task.to_string());
@@ -223,16 +229,8 @@ fn agent_of(command: &[String]) -> Option<&'static Agent> {
 /// takes one. A program crystal doesn't know is left as it is: there's no
 /// telling where it would want a prompt, if anywhere.
 pub fn add_first_prompt(command: &mut Vec<String>, task: &str) {
-    let Some(agent) = agent_of(command) else {
-        return;
-    };
-    match agent.first_prompt {
-        FirstPrompt::Argument => command.push(task.to_string()),
-        FirstPrompt::Option(option) => {
-            command.push(option.to_string());
-            command.push(task.to_string());
-        }
-        FirstPrompt::None => {}
+    if let Some(agent) = agent_of(command) {
+        agent.first_prompt.add(command, task);
     }
 }
 
@@ -318,7 +316,7 @@ mod tests {
     fn a_task_goes_where_each_agent_takes_its_first_prompt() {
         let mut claude = words(&["claude", "--model", "opus"]);
         add_first_prompt(&mut claude, "fix it");
-        assert_eq!(claude, ["claude", "--model", "opus", "fix it"]);
+        assert_eq!(claude, ["claude", "--model", "opus", "--", "fix it"]);
 
         let mut gemini = words(&["gemini"]);
         add_first_prompt(&mut gemini, "fix it");
@@ -331,6 +329,14 @@ mod tests {
         let mut unknown = words(&["sleep", "30"]);
         add_first_prompt(&mut unknown, "fix it");
         assert_eq!(unknown, ["sleep", "30"], "a program crystal doesn't know");
+    }
+
+    #[test]
+    fn a_task_starting_with_a_dash_is_not_taken_for_an_option() {
+        let mut claude = words(&["claude", "--allowedTools", "Read", "Grep"]);
+        add_first_prompt(&mut claude, "- tidy the docs");
+        assert_eq!(first_prompt_in(&claude).as_deref(), Some("- tidy the docs"));
+        assert_eq!(claude[claude.len() - 2..], ["--", "- tidy the docs"]);
     }
 
     #[test]

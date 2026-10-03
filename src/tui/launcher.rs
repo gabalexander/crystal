@@ -770,9 +770,15 @@ impl Launcher {
 
 /// A background task's run, from the command that would start the agent
 /// in a terminal: its options for each run, and its last argument, the
-/// task, as the prompt.
+/// task, as the prompt. The `--` before the task is left out: the task
+/// puts its own before the prompt.
 pub fn background_spec(command: &[String]) -> Option<TaskSpec> {
-    let (prompt, args) = command.get(1..)?.split_last()?;
+    let (prompt, mut args) = command.get(1..)?.split_last()?;
+    if let Some((last, before)) = args.split_last()
+        && last == "--"
+    {
+        args = before;
+    }
     Some(TaskSpec {
         prompt: prompt.clone(),
         args: args.to_vec(),
@@ -1296,7 +1302,7 @@ mod tests {
         let mut panel = launcher(vec![agent("claude"), Run::Shell]);
         type_text(&mut panel, "fix the flaky test");
         let (place, command) = started(press(&mut panel, KeyCode::Enter));
-        assert_eq!(command, ["claude", "fix the flaky test"]);
+        assert_eq!(command, ["claude", "--", "fix the flaky test"]);
         assert_eq!(
             place,
             Place::Directory(Some(PathBuf::from("/code/payments")))
@@ -1308,7 +1314,7 @@ mod tests {
         let cases = [
             ("gemini", vec!["gemini", "-i", "go"]),
             ("opencode", vec!["opencode", "--prompt", "go"]),
-            ("cursor-agent", vec!["cursor-agent", "go"]),
+            ("cursor-agent", vec!["cursor-agent", "--", "go"]),
             ("aider", vec!["aider"]),
         ];
         for (program, expected) in cases {
@@ -1337,12 +1343,13 @@ mod tests {
                 "opus",
                 "--permission-mode",
                 "plan",
+                "--",
                 "plan it"
             ]
         );
         assert_eq!(
             panel.command_line(),
-            "claude --model opus --permission-mode plan 'plan it'"
+            "claude --model opus --permission-mode plan -- 'plan it'"
         );
     }
 
@@ -1482,7 +1489,7 @@ mod tests {
             outcome,
             Outcome::CommandLine {
                 place: Place::Directory(Some(PathBuf::from("/code/payments"))),
-                line: "claude 'fix it'".into(),
+                line: "claude -- 'fix it'".into(),
             }
         );
     }
@@ -1522,6 +1529,7 @@ mod tests {
                 "opus",
                 "--permission-mode",
                 "plan",
+                "--",
                 "Review the diff.\n\nMind the tests."
             ]
         );
@@ -1607,7 +1615,7 @@ mod tests {
             "{lines:?}"
         );
         assert!(
-            lines.iter().any(|l| l == "runs  claude 'fix it'"),
+            lines.iter().any(|l| l == "runs  claude -- 'fix it'"),
             "{lines:?}"
         );
         assert!(

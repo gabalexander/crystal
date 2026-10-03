@@ -1476,7 +1476,7 @@ mod tests {
         assert!(text.contains("New session · this directory"), "{text}");
         assert!(text.contains("fix it"), "{text}");
         assert!(text.contains("run          Claude Code   shell"), "{text}");
-        assert!(text.contains("runs  claude 'fix it'"), "{text}");
+        assert!(text.contains("runs  claude -- 'fix it'"), "{text}");
         assert!(text.contains("enter start"), "{text}");
     }
 
