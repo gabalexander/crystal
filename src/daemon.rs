@@ -974,10 +974,6 @@ fn start(
     let resume = conversation
         .as_ref()
         .map(|conversation| conversation.id.as_str());
-    // What crystal tells the agent on top of what it was asked. Each part of
-    // crystal that has something to say adds its paragraph here.
-    let mut instructions: Vec<String> = Vec::new();
-    instructions.extend(remembered(socket, &cwd, &command));
     let mut asked = command.clone();
     // What it was started to do: a conversation picked up again has been
     // asked that already, whether tasks are on or off.
@@ -986,9 +982,9 @@ fn start(
     // session.
     let config = settings();
     let task = task.filter(|_| tasks::enabled(&config));
+    let mut about_task = None;
     if let Some(goal) = &task {
-        let about_tasks = tasks::instructions(backlog::enabled(&config));
-        instructions.push(about_tasks.clone());
+        let paragraph = tasks::instructions(backlog::enabled(&config));
         // Codex has no system prompt to add to, so it hears it at the end
         // of what it's asked to do.
         if agents::program_name(&command) == Some("codex")
@@ -996,9 +992,11 @@ fn start(
             && last == goal
         {
             last.push_str("\n\n");
-            last.push_str(&about_tasks);
+            last.push_str(&notes(Some(paragraph.clone()), None).join("\n\n"));
         }
+        about_task = Some(paragraph);
     }
+    let instructions = notes(about_task, remembered(socket, &cwd, &command));
     let argv = agents::argv(
         &asked,
         &crystal,
@@ -1025,6 +1023,20 @@ fn start(
     }
     sessions.push(session);
     Ok(name)
+}
+
+/// What crystal tells an agent on top of what it was asked, a paragraph
+/// each: about its task first, the one thing it mustn't forget, then what
+/// the project's memory has, all opened by where they come from. Nothing at
+/// all when there's nothing to say.
+fn notes(about_task: Option<String>, remembered: Option<String>) -> Vec<String> {
+    let said: Vec<String> = about_task.into_iter().chain(remembered).collect();
+    if said.is_empty() {
+        return said;
+    }
+    let mut notes = vec![agents::ABOUT_CRYSTAL.to_string()];
+    notes.extend(said);
+    notes
 }
 
 /// What the project's memory has to tell a Claude Code session as it
@@ -1252,6 +1264,21 @@ mod tests {
              run `crystal restart-server` to restart the daemon on this crystal"
         );
         assert!(version_mismatch("0.1.0", None).starts_with("this is an older crystal,"));
+    }
+
+    #[test]
+    fn crystal_s_notes_say_where_they_come_from_then_the_task_then_the_memory() {
+        let notes = notes(Some("about the task".into()), Some("remembered".into()));
+        assert_eq!(
+            notes,
+            [agents::ABOUT_CRYSTAL, "about the task", "remembered"]
+        );
+    }
+
+    #[test]
+    fn with_nothing_to_say_there_are_no_notes_at_all() {
+        assert!(notes(None, None).is_empty());
+        assert_eq!(notes(None, Some("remembered".into())).len(), 2);
     }
 
     #[test]
