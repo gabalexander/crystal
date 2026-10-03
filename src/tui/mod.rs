@@ -10,9 +10,11 @@ mod app;
 mod command_line;
 mod groups;
 mod help;
+mod issues;
 mod mouse;
 mod pane;
 mod screen_widget;
+mod search;
 mod sidebar;
 mod status;
 mod text_input;
@@ -20,6 +22,7 @@ mod theme;
 mod ui;
 
 use crate::config::Config;
+use crate::github::{self, Issue, PullRequest};
 use crate::keys;
 use crate::protocol::{Request, Response, SessionInfo};
 use crate::{client, env, git};
@@ -29,9 +32,11 @@ use crossterm::event::{Event as TerminalEvent, KeyEvent, KeyEventKind, MouseEven
 use pane::Pane;
 use ratatui::DefaultTerminal;
 use ratatui::layout::Rect;
+use std::collections::HashMap;
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use theme::Theme;
@@ -43,6 +48,10 @@ const POLL_EVERY: Duration = Duration::from_millis(500);
 /// How often the working mark turns a quarter, while an agent works. With
 /// nothing working, the TUI waits for something to happen instead.
 const SPIN_EVERY: Duration = Duration::from_millis(150);
+
+/// How often GitHub is asked again about a project's pull requests. A
+/// project seen for the first time is asked about straight away.
+const PULL_REQUESTS_EVERY: Duration = Duration::from_secs(60);
 
 pub enum Event {
     Key(KeyEvent),
@@ -60,6 +69,24 @@ pub enum Event {
     OutputEnded {
         pane: u64,
     },
+    /// What GitHub said about the open pull requests of a project.
+    PullRequests {
+        project: PathBuf,
+        found: Result<Vec<PullRequest>, String>,
+    },
+    /// What GitHub said about the open issues of a project.
+    Issues {
+        project: PathBuf,
+        found: Result<Vec<Issue>, String>,
+    },
+    /// The text of one of a project's issues.
+    IssueBody {
+        project: PathBuf,
+        number: u64,
+        body: Result<String, String>,
+    },
+    /// Something to tell the user, from work done off the loop.
+    Notice(String),
 }
 
 pub fn run(socket: &Path) -> Result<()> {
@@ -73,6 +100,8 @@ pub fn run(socket: &Path) -> Result<()> {
     let (sender, events) = mpsc::channel();
     spawn_input_reader(sender.clone());
     spawn_session_poller(socket.to_path_buf(), sender.clone());
+    let projects = Arc::new(Mutex::new(Vec::new()));
+    spawn_pull_request_poller(projects.clone(), sender.clone());
 
     let mut tui = Tui {
         socket: socket.to_path_buf(),
@@ -81,12 +110,13 @@ pub fn run(socket: &Path) -> Result<()> {
         last_pane_id: 0,
         events: sender,
         screen: Rect::default(),
+        projects,
         theme: Theme::from_env(config.theme),
         started: Instant::now(),
         quitting: false,
     };
     tui.app.set_first_command(config.new_session);
-    tui.app.set_sessions(sessions);
+    tui.set_sessions(sessions);
 
     let mut terminal = ratatui::try_init()?;
     let result = tui.run_with_mouse(&mut terminal, events);
@@ -141,6 +171,9 @@ struct Tui {
     events: Sender<Event>,
     /// The whole screen as it was last drawn, to find what the mouse is on.
     screen: Rect,
+    /// The projects the sessions are in, for the thread that asks GitHub
+    /// about their pull requests.
+    projects: Arc<Mutex<Vec<PathBuf>>>,
     theme: Theme,
     /// When the TUI started: the working mark turns with the time since.
     started: Instant,
@@ -180,8 +213,33 @@ impl Tui {
             while let Ok(event) = events.try_recv() {
                 self.handle(event);
             }
+            self.fetch_issue_body();
         }
         Ok(())
+    }
+
+    /// Takes a fresh list of sessions, and tells the pull request poller
+    /// which projects they're in.
+    fn set_sessions(&mut self, sessions: Vec<SessionInfo>) {
+        self.app.set_sessions(sessions);
+        *self.projects.lock().unwrap() = self.app.projects();
+    }
+
+    /// Asks GitHub, off the loop, for the text of the issue the issues
+    /// view's bar is on, the first time the bar is on it.
+    fn fetch_issue_body(&mut self) {
+        let Some((project, number)) = self.app.issue_body_to_fetch() else {
+            return;
+        };
+        let events = self.events.clone();
+        thread::spawn(move || {
+            let body = github::issue_body(&project, number);
+            let _ = events.send(Event::IssueBody {
+                project,
+                number,
+                body,
+            });
+        });
     }
 
     /// The next event. While an agent works, the wait is cut short in time
@@ -202,7 +260,15 @@ impl Tui {
             Event::Key(key) => self.on_key(key),
             Event::Mouse(mouse) => self.on_mouse(mouse),
             Event::Resize => {}
-            Event::Sessions(sessions) => self.app.set_sessions(sessions),
+            Event::Sessions(sessions) => self.set_sessions(sessions),
+            Event::PullRequests { project, found } => self.app.set_pull_requests(project, found),
+            Event::Issues { project, found } => self.app.set_issues(&project, found),
+            Event::IssueBody {
+                project,
+                number,
+                body,
+            } => self.app.set_issue_body(&project, number, body),
+            Event::Notice(notice) => self.app.notify(notice),
             Event::Output { pane, bytes } => {
                 if let Some(pane) = self.pane_with_id(pane) {
                     pane.screen.process(&bytes);
@@ -328,6 +394,23 @@ impl Tui {
                     pane.scroll_forward();
                 }
             }
+            Action::OpenPullRequest { project, number } => {
+                // gh goes over the network: off the loop, saying only what
+                // went wrong.
+                let events = self.events.clone();
+                thread::spawn(move || {
+                    if let Err(reason) = github::open_pull_request(&project, number) {
+                        let _ = events.send(Event::Notice(reason));
+                    }
+                });
+            }
+            Action::ListIssues(project) => {
+                let events = self.events.clone();
+                thread::spawn(move || {
+                    let found = github::issues(&project);
+                    let _ = events.send(Event::Issues { project, found });
+                });
+            }
         }
         Ok(())
     }
@@ -346,7 +429,7 @@ impl Tui {
     /// key's effect shows straight away.
     fn refresh_sessions(&mut self) -> Result<()> {
         let sessions = list_sessions(&self.socket, false)?;
-        self.app.set_sessions(sessions);
+        self.set_sessions(sessions);
         Ok(())
     }
 
@@ -452,6 +535,33 @@ fn spawn_input_reader(events: Sender<Event>) {
             if events.send(event).is_err() {
                 return;
             }
+        }
+    });
+}
+
+/// Asks GitHub about the open pull requests of each project the sessions
+/// are in, on a thread of its own, since gh can take seconds to answer: a
+/// project as soon as it's seen, and every one again each
+/// [`PULL_REQUESTS_EVERY`].
+fn spawn_pull_request_poller(projects: Arc<Mutex<Vec<PathBuf>>>, events: Sender<Event>) {
+    thread::spawn(move || {
+        let mut asked: HashMap<PathBuf, Instant> = HashMap::new();
+        loop {
+            let wanted = projects.lock().unwrap().clone();
+            for project in wanted {
+                let due = asked
+                    .get(&project)
+                    .is_none_or(|at| at.elapsed() >= PULL_REQUESTS_EVERY);
+                if !due {
+                    continue;
+                }
+                asked.insert(project.clone(), Instant::now());
+                let found = github::pull_requests(&project);
+                if events.send(Event::PullRequests { project, found }).is_err() {
+                    return;
+                }
+            }
+            thread::sleep(Duration::from_millis(500));
         }
     });
 }

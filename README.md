@@ -92,6 +92,9 @@ you are and offers the keys that matter there.
 | `r` | rename the selected session |
 | `x` | kill the selected session, once you've said `y` |
 | `u` | select the next session that needs you: waiting on you first, then done |
+| `/` | find a session by typing a little of its name, project, branch or command |
+| `o` | open the pull request of the selected session's branch in your browser |
+| `i` | list the open issues of the selected session's project, and start an agent on one |
 | `?` | show every key, in the sidebar, in a pane, in a question and with the mouse |
 | `q` | quit; the sessions keep running |
 
@@ -146,6 +149,35 @@ turn nobody was watching), crystal shows a desktop notification, like "claude-2 
 fix/login". It uses macOS's own notifications, or `notify-send` on Linux when it's installed. You're told once
 each time a session comes to need you, and never about a session you're watching. `u` in the TUI takes you to
 it.
+
+`/` finds a session by typing a little of it. The sidebar shows only the sessions that match, under their
+project and worktree, with the letters that matched marked in each name. The letters only have to turn up in
+order (`rfx` finds `refund-fix`), and each word you type has to turn up in the name, project, branch or
+command, so `pay fix` finds the fixer in the payments project. Letters type into the filter, so `↑` and `↓`
+(or `Ctrl+P` and `Ctrl+N`) move among the matches; `Enter` selects one and `Esc` leaves the selection where it
+was.
+
+For a project whose `origin` is on GitHub, each worktree line shows its branch's open pull request when there
+is one: `#57`, and a mark for what matters most about it, in this order:
+
+| Mark | Meaning |
+|---|---|
+| `✗` | a check failed |
+| `±` | a reviewer asked for changes |
+| `draft` | it's still a draft |
+| `◌` | checks are still running |
+| `✓` | approved |
+
+A pull request that's simply ready shows its number alone. `o` opens the selected session's pull request in your
+browser. crystal asks [`gh`](https://cli.github.com), GitHub's own command line tool, as soon as it sees a
+project and then once a minute, so your login works as it always does and crystal never sees a token. Without
+`gh`, or logged out of it, or for a project that isn't on GitHub, nothing is shown; `o` and `i` say why.
+
+`i` lists the open issues of the selected session's project, the latest to change first, with the selected
+issue's text under the list. Typing filters them by number, title, label or author. `Enter` on one asks for a
+branch named after it, like `42-fix-login-redirect`, for a new worktree, then what to run there, starting out
+with `claude Fix issue #42: <its title> (<its address>)`, so the agent knows which issue and can read it with
+`gh issue view 42`. `Esc` closes the list.
 
 Everything is also a command, for scripts and for agents:
 

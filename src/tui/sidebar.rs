@@ -4,13 +4,16 @@
 use super::app::{App, Hit};
 use super::groups::Row;
 use super::status::Status;
+use super::theme::Theme;
 use super::ui::Look;
+use crate::github::{PullRequest, PullRequestState};
 use crate::protocol::SessionInfo;
 use crate::shell;
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
+use std::path::Path;
 
 /// The room left at the sidebar's left edge, in line with the top bar and
 /// the footer.
@@ -62,9 +65,10 @@ fn offset(app: &App, height: u16) -> usize {
     }
 }
 
-/// The row the selected session is drawn on.
+/// The row the bar is on: the selected session's, or, while `/`'s filter
+/// is open, the one its bar is on.
 fn selected_row(app: &App) -> Option<usize> {
-    let index = app.selected_index()?;
+    let index = app.sidebar_cursor()?;
     app.rows()
         .iter()
         .position(|row| *row == Row::Session(index))
@@ -76,16 +80,11 @@ fn row_line<'a>(app: &'a App, row: &Row, look: &Look, width: u16, selected: bool
     match row {
         Row::Project(name) => heading(name, Style::new().fg(theme.text), look, width),
         Row::OutsideGit => heading("outside git", Style::new().fg(theme.muted), look, width),
-        Row::Worktree { branch, main } => {
-            let mark = if *main { "⌂ " } else { "⎇ " };
-            let branch = branch.as_deref().unwrap_or("(detached)");
-            let room = usize::from(width).saturating_sub(WORKTREE_INDENT.len() + 2);
-            Line::from(vec![
-                Span::raw(WORKTREE_INDENT),
-                Span::styled(mark, Style::new().fg(theme.muted)),
-                Span::styled(fit(branch, room), Style::new().fg(theme.branch)),
-            ])
-        }
+        Row::Worktree {
+            project,
+            branch,
+            main,
+        } => worktree_line(app, project, branch.as_deref(), *main, theme, width),
         Row::Directory(dir) => {
             let dir = shell::home_relative(dir);
             let room = usize::from(width).saturating_sub(WORKTREE_INDENT.len());
@@ -94,8 +93,90 @@ fn row_line<'a>(app: &'a App, row: &Row, look: &Look, width: u16, selected: bool
                 Span::styled(fit(&dir, room), Style::new().fg(theme.muted)),
             ])
         }
-        Row::Session(index) => session_line(&app.sessions()[*index], look, width, selected),
+        Row::Session(index) => {
+            let marked = app.marked_letters(*index);
+            session_line(&app.sessions()[*index], &marked, look, width, selected)
+        }
     }
+}
+
+/// A worktree's line: its mark and branch, and on the right its pull
+/// request when GitHub knows of one, `#57` and a mark for what matters most
+/// about it. Short of room, the mark goes first, then the number, before
+/// the branch is cut.
+fn worktree_line<'a>(
+    app: &App,
+    project: &Path,
+    branch: Option<&str>,
+    main: bool,
+    theme: &Theme,
+    width: u16,
+) -> Line<'a> {
+    let mark = if main { "⌂ " } else { "⎇ " };
+    let name = branch.unwrap_or("(detached)");
+    // The indent and the mark before the branch; a space at the end.
+    let room = usize::from(width).saturating_sub(WORKTREE_INDENT.len() + 2 + 1);
+    let pull_request = branch.and_then(|branch| app.pull_request(project, branch));
+    let right = pull_request
+        .map(|pull_request| pull_request_spans(pull_request, theme))
+        .unwrap_or_default()
+        .into_iter()
+        .find(|spans| name.chars().count() + 1 + width_of(spans) <= room)
+        .unwrap_or_default();
+
+    let mut line = vec![
+        Span::raw(WORKTREE_INDENT),
+        Span::styled(mark, Style::new().fg(theme.muted)),
+    ];
+    if right.is_empty() {
+        line.push(Span::styled(fit(name, room), Style::new().fg(theme.branch)));
+    } else {
+        let gap = room - name.chars().count() - width_of(&right);
+        line.push(Span::styled(
+            name.to_string(),
+            Style::new().fg(theme.branch),
+        ));
+        line.push(Span::raw(" ".repeat(gap)));
+        line.extend(right);
+    }
+    Line::from(line)
+}
+
+/// What a worktree line can say on the right about its pull request, the
+/// most first: its number and a mark, then its number alone.
+fn pull_request_spans<'a>(pull_request: &PullRequest, theme: &Theme) -> Vec<Vec<Span<'a>>> {
+    let number = Span::styled(
+        format!("#{}", pull_request.number),
+        Style::new().fg(theme.muted),
+    );
+    let mut forms = Vec::new();
+    if let Some((mark, color)) = pull_request_mark(pull_request.state(), theme) {
+        forms.push(vec![
+            number.clone(),
+            Span::raw(" "),
+            Span::styled(mark, Style::new().fg(color)),
+        ]);
+    }
+    forms.push(vec![number]);
+    forms
+}
+
+/// The mark for what matters most about a pull request, in the color that
+/// says how it stands. One that's simply ready has none.
+fn pull_request_mark(state: PullRequestState, theme: &Theme) -> Option<(&'static str, Color)> {
+    let mark = match state {
+        PullRequestState::ChecksFailing => ("✗", theme.failed),
+        PullRequestState::ChangesRequested => ("±", theme.waiting),
+        PullRequestState::Draft => ("draft", theme.muted),
+        PullRequestState::ChecksRunning => ("◌", theme.working),
+        PullRequestState::Approved => ("✓", theme.done),
+        PullRequestState::Ready => return None,
+    };
+    Some(mark)
+}
+
+fn width_of(spans: &[Span]) -> usize {
+    spans.iter().map(Span::width).sum()
 }
 
 /// A heading: the name in bold, then a thin rule nearly to the edge.
@@ -113,8 +194,15 @@ fn heading<'a>(name: &str, style: Style, look: &Look, width: u16) -> Line<'a> {
 }
 
 /// A session's row: its mark, its name, and on the right how long ago it
-/// changed. When the name and the time don't both fit, the time goes.
-fn session_line<'a>(session: &SessionInfo, look: &Look, width: u16, selected: bool) -> Line<'a> {
+/// changed. When the name and the time don't both fit, the time goes. The
+/// letters at `marked` in the name are those `/`'s filter matched.
+fn session_line<'a>(
+    session: &SessionInfo,
+    marked: &[usize],
+    look: &Look,
+    width: u16,
+    selected: bool,
+) -> Line<'a> {
     let theme = look.theme;
     let status = Status::of(session);
     let mut name_style = Style::new().fg(theme.text);
@@ -135,15 +223,51 @@ fn session_line<'a>(session: &SessionInfo, look: &Look, width: u16, selected: bo
         ),
         Span::raw(" "),
     ];
+    let marked_style = name_style
+        .fg(theme.accent)
+        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
     if fits_both {
         let gap = room - name_width - when.chars().count();
-        spans.push(Span::styled(session.name.clone(), name_style));
+        spans.extend(marked_spans(
+            &session.name,
+            marked,
+            name_style,
+            marked_style,
+        ));
         spans.push(Span::raw(" ".repeat(gap)));
         spans.push(Span::styled(when, Style::new().fg(theme.muted)));
     } else {
-        spans.push(Span::styled(fit(&session.name, room), name_style));
+        let name = fit(&session.name, room);
+        spans.extend(marked_spans(&name, marked, name_style, marked_style));
     }
     Line::from(spans)
+}
+
+/// `text` as spans: the characters at `marked` in `marked_style`, the rest
+/// in `style`.
+fn marked_spans<'a>(
+    text: &str,
+    marked: &[usize],
+    style: Style,
+    marked_style: Style,
+) -> Vec<Span<'a>> {
+    let mut spans: Vec<Span> = Vec::new();
+    let mut run = String::new();
+    let mut run_marked = false;
+    for (place, c) in text.chars().enumerate() {
+        let is_marked = marked.contains(&place);
+        if is_marked != run_marked && !run.is_empty() {
+            let style = if run_marked { marked_style } else { style };
+            spans.push(Span::styled(std::mem::take(&mut run), style));
+        }
+        run_marked = is_marked;
+        run.push(c);
+    }
+    if !run.is_empty() {
+        let style = if run_marked { marked_style } else { style };
+        spans.push(Span::styled(run, style));
+    }
+    spans
 }
 
 /// How long ago the session changed, or nothing from a daemon that
@@ -209,6 +333,17 @@ mod tests {
     #[test]
     fn a_clock_that_went_back_says_now() {
         assert_eq!(ago(2000, 1000), "now");
+    }
+
+    #[test]
+    fn marked_letters_get_a_span_of_their_own() {
+        let plain = Style::new();
+        let marked = Style::new().add_modifier(Modifier::BOLD);
+        let spans = marked_spans("refund-fix", &[0, 7, 8, 9], plain, marked);
+        let texts: Vec<&str> = spans.iter().map(|span| span.content.as_ref()).collect();
+        assert_eq!(texts, ["r", "efund-", "fix"]);
+        assert_eq!(spans[0].style, marked);
+        assert_eq!(spans[1].style, plain);
     }
 
     #[test]

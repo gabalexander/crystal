@@ -51,6 +51,9 @@ pub const KEYS: &[Key] = &[
     sidebar("r", "rename it"),
     sidebar("x", "kill it"),
     sidebar("u", "next one that needs you"),
+    sidebar("/", "find a session"),
+    sidebar("o", "open its pull request"),
+    sidebar("i", "its project's issues"),
     sidebar("?", "show these keys"),
     sidebar("q", "quit; sessions keep on"),
     in_pane("Ctrl+\\", "back to the sidebar"),
@@ -221,8 +224,12 @@ mod tests {
         Theme::new(ThemeName::Dark, false)
     }
 
-    /// The keys a label stands for: `j/k ↓/↑` is j, k, ↓ and ↑.
+    /// The keys a label stands for: `j/k ↓/↑` is j, k, ↓ and ↑. A label
+    /// that's only `/` is that key.
     fn keys_in(label: &str) -> Vec<String> {
+        if label == "/" {
+            return vec![label.to_string()];
+        }
         label
             .split(['/', ' '])
             .filter(|key| !key.is_empty())

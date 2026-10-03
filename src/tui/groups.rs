@@ -20,8 +20,13 @@ pub enum Row {
     /// The heading for the sessions outside any repository.
     OutsideGit,
     /// A worktree's branch, heading its sessions. `branch` is `None` when
-    /// the worktree is on no branch.
-    Worktree { branch: Option<String>, main: bool },
+    /// the worktree is on no branch. `project` is the project's main
+    /// worktree, where its pull requests are asked for.
+    Worktree {
+        project: PathBuf,
+        branch: Option<String>,
+        main: bool,
+    },
     /// A directory outside any repository, heading its sessions.
     Directory(PathBuf),
     /// The session at this index in the ordered list.
@@ -67,12 +72,17 @@ pub fn order(sessions: Vec<SessionInfo>) -> Vec<SessionInfo> {
     keyed.into_iter().map(|(_, session)| session).collect()
 }
 
-/// The sidebar's rows for sessions already in [`order`]: a heading wherever
-/// the project or the worktree changes, then each session.
-pub fn rows(sessions: &[SessionInfo]) -> Vec<Row> {
+/// The sidebar's rows for sessions already in [`order`], those that `keep`
+/// keeps by their index: a heading wherever the project or the worktree
+/// changes, then each session. Only a kept session brings its headings.
+pub fn rows(sessions: &[SessionInfo], keep: impl Fn(usize) -> bool) -> Vec<Row> {
     let mut rows = Vec::new();
     let mut previous: Option<(Option<&Path>, &Path)> = None;
-    for (index, session) in sessions.iter().enumerate() {
+    let kept = sessions
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| keep(*index));
+    for (index, session) in kept {
         let (project, worktree) = group(session);
         let same_project = previous.is_some_and(|(p, _)| p == project);
         let same_worktree = same_project && previous.is_some_and(|(_, w)| w == worktree);
@@ -127,6 +137,7 @@ fn project_heading(session: &SessionInfo) -> Row {
 fn worktree_heading(session: &SessionInfo) -> Row {
     match &session.worktree {
         Some(worktree) => Row::Worktree {
+            project: worktree.project_path.clone(),
             branch: worktree.branch.clone(),
             main: worktree.main,
         },
@@ -204,6 +215,18 @@ mod tests {
     }
 
     #[test]
+    fn sessions_left_out_take_their_headings_with_them() {
+        let sessions = order(vec![
+            session("a1", "app", "main"),
+            session("w1", "web", "main"),
+        ]);
+        let rows = rows(&sessions, |index| sessions[index].name == "w1");
+        assert_eq!(rows[0], Row::Project("web".into()));
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[2], Row::Session(1));
+    }
+
+    #[test]
     fn rows_head_each_project_and_worktree_once() {
         let sessions = order(vec![
             session("a1", "app", "main"),
@@ -212,16 +235,18 @@ mod tests {
             session("shell", "", ""),
         ]);
         assert_eq!(
-            rows(&sessions),
+            rows(&sessions, |_| true),
             [
                 Row::Project("app".into()),
                 Row::Worktree {
+                    project: PathBuf::from("/code/app"),
                     branch: Some("main".into()),
                     main: true
                 },
                 Row::Session(0),
                 Row::Session(1),
                 Row::Worktree {
+                    project: PathBuf::from("/code/app"),
                     branch: Some("feat".into()),
                     main: false
                 },

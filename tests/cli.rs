@@ -3045,3 +3045,168 @@ fn a_relative_socket_path_names_the_same_socket_for_the_daemon() {
         .current_dir(crystal.dir.path());
     assert!(stop.output().unwrap().status.success());
 }
+
+#[test]
+fn slash_filters_the_sidebar_and_enter_selects_the_match() {
+    let crystal = Crystal::new();
+    for name in ["planner", "refund-fix", "reviewer"] {
+        let script = format!("echo {name} is here; echo > {name}-ready; sleep 30");
+        crystal.ok(&["new", "-n", name, "sh", "-c", &script]);
+        written(&crystal.dir.path().join(format!("{name}-ready")));
+    }
+    let mut tui = crystal.tui();
+    tui.shows("planner is here");
+
+    tui.type_keys("/fix");
+    tui.shows("find: fix");
+    tui.shows("1 match");
+    eventually("only the match is in the sidebar", || {
+        let sidebar = sidebar_of(&tui.text());
+        sidebar.contains("refund-fix") && !sidebar.contains("planner")
+    });
+    assert!(tui.text().contains("planner is here"), "not selected yet");
+
+    tui.type_keys("\r");
+    tui.shows("refund-fix is here");
+    tui.shows("▸ planner");
+}
+
+/// A stand-in for GitHub's `gh`: it answers `pr list` and `issue list` with
+/// the JSON given, `issue view` with an issue's text, and writes each call
+/// it gets into `gh-calls` beside it. Returns the directory to put first on
+/// the PATH.
+fn fake_gh(dir: &Path, pull_requests: &str, issues: &str) -> PathBuf {
+    let bin = dir.join("gh-bin");
+    std::fs::create_dir(&bin).unwrap();
+    std::fs::write(dir.join("gh-prs.json"), pull_requests).unwrap();
+    std::fs::write(dir.join("gh-issues.json"), issues).unwrap();
+    let dir = dir.display();
+    script(
+        &bin.join("gh"),
+        &format!(
+            r#"echo "$*" >> "{dir}/gh-calls"
+case "$1 $2" in
+    "pr list") cat "{dir}/gh-prs.json" ;;
+    "pr view") ;;
+    "issue list") cat "{dir}/gh-issues.json" ;;
+    "issue view") echo '{{"body": "The login page sends you back to itself."}}' ;;
+    *) echo "unexpected: $*" >&2; exit 1 ;;
+esac
+"#
+        ),
+    );
+    bin
+}
+
+/// A repository called `app` whose origin is on github.com, as far as git
+/// can tell.
+fn github_repo(dir: &Path) -> PathBuf {
+    let repo = git_repo(dir, "app");
+    git(
+        &repo,
+        &["remote", "add", "origin", "https://github.com/acme/app.git"],
+    );
+    repo
+}
+
+const NO_ISSUES: &str = "[]";
+
+#[test]
+fn a_worktree_shows_its_pull_request_and_o_opens_it() {
+    let crystal = Crystal::new();
+    let repo = github_repo(crystal.dir.path());
+    let failing = r#"[{"number": 57, "title": "Fix the login redirect",
+        "headRefName": "fix-login", "isDraft": false, "reviewDecision": "",
+        "statusCheckRollup": [{"__typename": "CheckRun", "status": "COMPLETED", "conclusion": "FAILURE"}],
+        "url": "https://github.com/acme/app/pull/57"}]"#;
+    let bin = fake_gh(crystal.dir.path(), failing, NO_ISSUES);
+    let repo_arg = repo.to_str().unwrap();
+    crystal.ok(&[
+        "new",
+        "-n",
+        "fixer",
+        "-c",
+        repo_arg,
+        "-w",
+        "fix-login",
+        "sleep",
+        "30",
+    ]);
+
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let mut tui = crystal.attach_with_env(&[], &[("PATH", &path)]);
+    tui.shows("#57 ✗");
+
+    tui.type_keys("o");
+    let calls = crystal.dir.path().join("gh-calls");
+    eventually("gh is asked to open the pull request", || {
+        let calls = std::fs::read_to_string(&calls).unwrap_or_default();
+        calls.lines().any(|call| call == "pr view --web 57")
+    });
+}
+
+#[test]
+fn o_says_so_when_the_branch_has_no_pull_request() {
+    let crystal = Crystal::new();
+    let repo = github_repo(crystal.dir.path());
+    let bin = fake_gh(crystal.dir.path(), "[]", NO_ISSUES);
+    let repo_arg = repo.to_str().unwrap();
+    crystal.ok(&["new", "-n", "planner", "-c", repo_arg, "sleep", "30"]);
+
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let mut tui = crystal.attach_with_env(&[], &[("PATH", &path)]);
+    tui.shows("▸ planner");
+    let calls = crystal.dir.path().join("gh-calls");
+    eventually("gh has been asked about pull requests", || {
+        std::fs::read_to_string(&calls).is_ok_and(|calls| calls.contains("pr list"))
+    });
+    // The answer may still be on its way; the notice waits for a key.
+    eventually("the footer says there's none", || {
+        tui.type_keys("o");
+        thread::sleep(Duration::from_millis(100));
+        tui.text().contains("no open pull request for main")
+    });
+}
+
+#[test]
+fn i_lists_the_issues_and_enter_starts_a_session_for_one() {
+    let crystal = Crystal::new();
+    let repo = github_repo(crystal.dir.path());
+    let issues = r#"[
+        {"number": 7, "title": "Dark mode", "labels": [{"name": "idea"}],
+         "updatedAt": "2026-09-01T10:00:00Z", "author": {"login": "bo"},
+         "url": "https://github.com/acme/app/issues/7"},
+        {"number": 42, "title": "Fix login redirect", "labels": [{"name": "bug"}],
+         "updatedAt": "2026-10-01T10:00:00Z", "author": {"login": "ana"},
+         "url": "https://github.com/acme/app/issues/42"}
+    ]"#;
+    let bin = fake_gh(crystal.dir.path(), "[]", issues);
+    let repo_arg = repo.to_str().unwrap();
+    crystal.ok(&["new", "-n", "planner", "-c", repo_arg, "sleep", "30"]);
+
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let mut tui = crystal.attach_with_env(&[], &[("PATH", &path)]);
+    tui.shows("▸ planner");
+    tui.type_keys("i");
+    tui.shows("issues · app");
+    // The latest to change comes first, its text under the list.
+    tui.shows("Fix login redirect");
+    tui.shows("The login page sends you back to itself.");
+    let text = tui.text();
+    assert!(line_with(&text, "#42") < line_with(&text, "#7"), "{text}");
+
+    tui.type_keys("dark");
+    tui.hides("Fix login redirect");
+    tui.shows("Dark mode");
+    tui.type_keys("\x7f\x7f\x7f\x7f");
+    tui.shows("Fix login redirect");
+    // The bar stayed on #7 while it was shown; up goes back to #42.
+    tui.type_keys("\x1b[A");
+
+    tui.type_keys("\r");
+    tui.shows("branch for the new worktree: 42-fix-login-redirect");
+    tui.type_keys("\r");
+    tui.shows("new session: claude Fix issue #42: Fix login redirect");
+    tui.type_keys("\x1b");
+    tui.hides("new session:");
+}

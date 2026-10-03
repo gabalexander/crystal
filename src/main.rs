@@ -8,6 +8,7 @@ mod daemon;
 mod drive;
 mod env;
 mod git;
+mod github;
 mod history;
 mod hook;
 mod keys;

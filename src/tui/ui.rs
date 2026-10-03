@@ -4,8 +4,9 @@
 //! theme's colors tell the parts apart. Drawing only reads the state; it
 //! never changes it.
 
-use super::app::{App, Focus, Hit, Prompt, Question, Slot};
+use super::app::{App, Filter, Focus, Hit, Prompt, Question, Slot};
 use super::help;
+use super::issues;
 use super::pane::Pane;
 use super::screen_widget::ScreenWidget;
 use super::sidebar::{self, fit};
@@ -126,6 +127,12 @@ pub fn draw(frame: &mut Frame, app: &App, panes: &[Pane], look: &Look) {
         draw_pane(frame, app, look, slot, *area, panes);
     }
     draw_rules_between(frame, look, &areas.panes);
+    if let Some(view) = app.issues_view() {
+        // Over everything between the top bar and the footer.
+        let below_top = areas.top.bottom();
+        let middle = Rect::new(0, below_top, frame.area().width, areas.footer.y - below_top);
+        issues::draw(frame, view, look.theme, look.now, middle);
+    }
     draw_footer(frame, app, look, areas.footer);
     if app.showing_keys() {
         help::draw(frame, look.theme, frame.area());
@@ -363,6 +370,10 @@ fn draw_footer(frame: &mut Frame, app: &App, look: &Look, area: Rect) {
     let theme = look.theme;
     if let Some(prompt) = app.prompt() {
         draw_prompt(frame, theme, prompt, area);
+    } else if app.issues_view().is_some() {
+        frame.render_widget(hint_spans(ISSUES_HINTS, theme), area);
+    } else if let Some(filter) = app.filter() {
+        draw_filter(frame, theme, filter, app.matches().len(), area);
     } else if let Some(confirm) = app.confirm() {
         frame.render_widget(question_line(&confirm.question(), theme), area);
     } else if let Some(notice) = app.notice() {
@@ -398,7 +409,47 @@ const SIDEBAR_HINTS: &[(&str, &str)] = &[
     ("q", "quit"),
     ("w", "worktree"),
     ("u", "next"),
+    ("/", "find"),
 ];
+
+/// The keys while the issues view is open.
+const ISSUES_HINTS: &[(&str, &str)] = &[
+    ("↑/↓", "select"),
+    ("enter", "start a session on it"),
+    ("esc", "close"),
+];
+
+/// A line of key hints, keys a touch brighter than what they do.
+fn hint_spans<'a>(hints: &[(&str, &str)], theme: &Theme) -> Line<'a> {
+    let mut spans = vec![Span::raw(" ")];
+    for (key, does) in hints {
+        spans.push(Span::styled(key.to_string(), Style::new().fg(theme.text)));
+        spans.push(Span::styled(
+            format!(" {does}  "),
+            Style::new().fg(theme.muted),
+        ));
+    }
+    Line::from(spans)
+}
+
+/// `/`'s filter, with the cursor in it, and how many sessions match.
+fn draw_filter(frame: &mut Frame, theme: &Theme, filter: &Filter, matches: usize, area: Rect) {
+    let label = " find: ";
+    let line = Line::from(vec![
+        Span::styled(
+            label,
+            Style::new().fg(theme.accent).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(filter.input.text().to_string(), Style::new().fg(theme.text)),
+    ]);
+    frame.render_widget(line, area);
+    let noun = if matches == 1 { "match" } else { "matches" };
+    let count = Line::styled(format!("{matches} {noun} "), Style::new().fg(theme.muted));
+    frame.render_widget(count.right_aligned(), area);
+    // The label is plain ASCII, so its length in bytes is its width.
+    let column = area.x + (label.len() + filter.input.cursor()) as u16;
+    frame.set_cursor_position((column.min(area.right().saturating_sub(1)), area.y));
+}
 
 /// The keys that don't go to the program, while a pane has the keyboard.
 const PANE_HINTS: &[(&str, &str)] = &[("ctrl+\\", "sidebar"), ("shift+pgup", "history")];
@@ -477,7 +528,7 @@ fn keys_hint<'a>(app: &App, theme: &Theme) -> Line<'a> {
 /// Asks the prompt's question, with the cursor in the answer.
 fn draw_prompt(frame: &mut Frame, theme: &Theme, prompt: &Prompt, area: Rect) {
     let question = match prompt.question {
-        Question::Branch => " branch for the new worktree: ",
+        Question::Branch { .. } => " branch for the new worktree: ",
         Question::Command(_) => " new session: ",
         Question::Rename(_) => " new name: ",
     };

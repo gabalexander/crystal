@@ -5,12 +5,16 @@
 
 use super::command_line;
 use super::groups::{self, Row};
+use super::issues::IssuesView;
+use super::search;
 use super::text_input::TextInput;
 use crate::config::Config;
+use crate::github::{self, PullRequest};
 use crate::keys;
 use crate::protocol::{Activity, SessionInfo, State};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 /// How many sessions can be split off into panes of their own at once.
 pub const MAX_SPLITS: usize = 2;
@@ -79,8 +83,13 @@ pub struct Prompt {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Question {
     /// The branch for a new worktree. The command to run there is asked
-    /// for next.
-    Branch,
+    /// for next, starting out with `command`, or else the one used last.
+    /// The worktree is made in the repository at `base`, or else the
+    /// selected session's.
+    Branch {
+        base: Option<PathBuf>,
+        command: Option<String>,
+    },
     /// The command line for a new session, which starts at the place.
     Command(Place),
     /// A new name for the session now called this.
@@ -155,6 +164,26 @@ pub enum Action {
     ScrollBack(Slot),
     /// Show a few lines further toward live in the pane at this slot.
     ScrollForward(Slot),
+    /// Open pull request `number` of the project at `project` in the
+    /// browser.
+    OpenPullRequest {
+        project: PathBuf,
+        number: u64,
+    },
+    /// Ask GitHub for the open issues of the project at this path, for the
+    /// issues view that's now open.
+    ListIssues(PathBuf),
+}
+
+/// The sidebar narrowed to the sessions that match what's typed, while `/`
+/// is open. The selection stays where it was until Enter moves it to the
+/// session the bar is on.
+#[derive(Debug, Default)]
+pub struct Filter {
+    pub input: TextInput,
+    /// The session the bar is on, by its id: the sessions are put in order
+    /// again with every fresh list, so an index wouldn't keep to it.
+    highlighted: Option<String>,
 }
 
 pub struct App {
@@ -185,6 +214,14 @@ pub struct App {
     notice: Option<String>,
     /// Whether the overlay listing every key is open.
     showing_keys: bool,
+    /// `/`'s filter on the sidebar, while it's open.
+    filter: Option<Filter>,
+    /// What GitHub said about each project's open pull requests, by the
+    /// project's main worktree: the pull requests, or why there are none to
+    /// show.
+    pull_requests: HashMap<PathBuf, Result<Vec<PullRequest>, String>>,
+    /// The issues view, while it's open.
+    issues: Option<IssuesView>,
 }
 
 impl App {
@@ -203,6 +240,9 @@ impl App {
             own_id,
             notice: None,
             showing_keys: false,
+            filter: None,
+            pull_requests: HashMap::new(),
+            issues: None,
         }
     }
 
@@ -237,9 +277,108 @@ impl App {
         })
     }
 
-    /// The sidebar's rows: the sessions under their projects and worktrees.
+    /// The sidebar's rows: the sessions under their projects and worktrees,
+    /// only those that match while `/`'s filter is open.
     pub fn rows(&self) -> Vec<Row> {
-        groups::rows(&self.sessions)
+        let shown = self.matches();
+        groups::rows(&self.sessions, |index| shown.contains(&index))
+    }
+
+    /// `/`'s filter, while it's open.
+    pub fn filter(&self) -> Option<&Filter> {
+        self.filter.as_ref()
+    }
+
+    /// The sessions shown in the sidebar, by index: those that match the
+    /// filter while it's open, or else all of them.
+    pub fn matches(&self) -> Vec<usize> {
+        let query = self
+            .filter
+            .as_ref()
+            .map_or("", |filter| filter.input.text());
+        (0..self.sessions.len())
+            .filter(|&index| search::session_match(query, &self.sessions[index]).is_some())
+            .collect()
+    }
+
+    /// Which letters of a session's name to mark, while the filter is open:
+    /// those the query matched.
+    pub fn marked_letters(&self, index: usize) -> Vec<usize> {
+        let Some(filter) = &self.filter else {
+            return Vec::new();
+        };
+        let session = &self.sessions[index];
+        search::session_match(filter.input.text(), session).unwrap_or_default()
+    }
+
+    /// The session the sidebar's bar is on: the one the filter's bar is on
+    /// while it's open, or else the selected one.
+    pub fn sidebar_cursor(&self) -> Option<usize> {
+        match &self.filter {
+            Some(filter) => {
+                let id = filter.highlighted.as_ref()?;
+                self.sessions.iter().position(|session| session.id == *id)
+            }
+            None => self.selected_index(),
+        }
+    }
+
+    /// The projects the sessions are in, by their main worktrees: the ones
+    /// to ask GitHub about.
+    pub fn projects(&self) -> Vec<PathBuf> {
+        let mut projects: Vec<PathBuf> = self
+            .sessions
+            .iter()
+            .filter_map(|session| session.worktree.as_ref())
+            .map(|worktree| worktree.project_path.clone())
+            .collect();
+        projects.sort();
+        projects.dedup();
+        projects
+    }
+
+    /// Takes what GitHub said about the open pull requests of the project
+    /// at `project`.
+    pub fn set_pull_requests(&mut self, project: PathBuf, found: Result<Vec<PullRequest>, String>) {
+        self.pull_requests.insert(project, found);
+    }
+
+    /// The open pull request for `branch` in the project at `project`, if
+    /// GitHub knows of one.
+    pub fn pull_request(&self, project: &Path, branch: &str) -> Option<&PullRequest> {
+        let Some(Ok(pull_requests)) = self.pull_requests.get(project) else {
+            return None;
+        };
+        pull_requests
+            .iter()
+            .find(|pull_request| pull_request.head_ref_name == branch)
+    }
+
+    /// The issues view, while it's open.
+    pub fn issues_view(&self) -> Option<&IssuesView> {
+        self.issues.as_ref()
+    }
+
+    /// Takes the open issues GitHub listed for the project at `project`.
+    pub fn set_issues(&mut self, project: &Path, found: Result<Vec<github::Issue>, String>) {
+        if let Some(view) = self.issues.as_mut().filter(|view| view.project == project) {
+            view.set_issues(found);
+        }
+    }
+
+    /// Takes the text of issue `number` of the project at `project`.
+    pub fn set_issue_body(&mut self, project: &Path, number: u64, body: Result<String, String>) {
+        if let Some(view) = self.issues.as_mut().filter(|view| view.project == project) {
+            view.set_body(number, body);
+        }
+    }
+
+    /// The issue whose text to fetch next, with its project: the one the
+    /// issues view's bar is on, once.
+    pub fn issue_body_to_fetch(&mut self) -> Option<(PathBuf, u64)> {
+        let view = self.issues.as_mut()?;
+        let number = view.body_to_fetch()?;
+        Some((view.project.clone(), number))
     }
 
     /// The question on the footer line and its answer so far, while one
@@ -405,6 +544,13 @@ impl App {
         if self.prompt.is_some() {
             return self.on_prompt_key(key);
         }
+        if self.issues.is_some() {
+            return self.on_issues_key(key);
+        }
+        if self.filter.is_some() {
+            self.on_filter_key(key);
+            return None;
+        }
         match self.focus {
             Focus::Sidebar => self.on_sidebar_key(key),
             Focus::Pane(slot) => self.on_pane_key(slot, key),
@@ -422,8 +568,10 @@ impl App {
             }
             return None;
         }
-        // A question on the footer waits for its answer from the keyboard.
-        if self.prompt.is_some() || self.confirm.is_some() {
+        // A question on the footer waits for its answer from the keyboard,
+        // and so do the filter and the issues view.
+        let typing = self.filter.is_some() || self.issues.is_some();
+        if self.prompt.is_some() || self.confirm.is_some() || typing {
             return None;
         }
         let click = kind == MouseEventKind::Down(MouseButton::Left);
@@ -483,12 +631,15 @@ impl App {
             KeyCode::PageUp => return Some(Action::PageBack(self.selected_slot()?)),
             KeyCode::PageDown => return Some(Action::PageForward(self.selected_slot()?)),
             KeyCode::Char('n') => self.ask_for_command(self.selected_place()),
-            KeyCode::Char('w') => self.ask(Question::Branch, ""),
+            KeyCode::Char('w') => self.ask_for_branch(None, None, ""),
             KeyCode::Char('W') => self.ask_to_remove_worktree(),
             KeyCode::Char('r') => self.ask_for_name(),
             KeyCode::Char('x') => self.confirm = Some(Confirm::Kill(self.selected()?.name.clone())),
             KeyCode::Char('u') => self.select_next_needing_user(),
             KeyCode::Char('?') => self.showing_keys = true,
+            KeyCode::Char('/') => self.open_filter(),
+            KeyCode::Char('o') => return self.open_pull_request(),
+            KeyCode::Char('i') => return self.open_issues(),
             KeyCode::Char('q') => return Some(Action::Quit),
             _ => {}
         }
@@ -555,6 +706,173 @@ impl App {
         }
     }
 
+    /// Asks for the branch of a new worktree, starting out with `branch`.
+    /// `base` and `command` say where it's made and what runs in it, when
+    /// they're known already, as for an issue.
+    fn ask_for_branch(&mut self, base: Option<PathBuf>, command: Option<String>, branch: &str) {
+        self.ask(Question::Branch { base, command }, branch);
+    }
+
+    /// Opens `/`'s filter, its bar on the selected session.
+    fn open_filter(&mut self) {
+        let highlighted = self.selected().map(|session| session.id.clone());
+        self.filter = Some(Filter {
+            input: TextInput::default(),
+            highlighted,
+        });
+    }
+
+    /// Keys while `/`'s filter is open: Enter selects the session the bar
+    /// is on, Esc leaves the selection where it was, ↑ and ↓ (or Ctrl+P
+    /// and Ctrl+N) move the bar among the matches, and every other key
+    /// edits the filter. Letters type, so j and k don't move the bar here.
+    fn on_filter_key(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Esc => self.filter = None,
+            KeyCode::Enter => {
+                if let Some(index) = self.sidebar_cursor() {
+                    self.selected = index;
+                }
+                self.filter = None;
+            }
+            KeyCode::Up => self.move_filter_bar(-1),
+            KeyCode::Down => self.move_filter_bar(1),
+            KeyCode::Char('p') if ctrl => self.move_filter_bar(-1),
+            KeyCode::Char('n') if ctrl => self.move_filter_bar(1),
+            _ => {
+                if let Some(filter) = &mut self.filter {
+                    filter.input.on_key(&key);
+                }
+                self.keep_filter_bar_on_a_match();
+            }
+        }
+    }
+
+    /// Moves the filter's bar `by` matches, stopping at the ends.
+    fn move_filter_bar(&mut self, by: isize) {
+        let matches = self.matches();
+        let at = self
+            .sidebar_cursor()
+            .and_then(|cursor| matches.iter().position(|&index| index == cursor));
+        let Some(at) = at else {
+            return;
+        };
+        let to = matches[at.saturating_add_signed(by).min(matches.len() - 1)];
+        let id = self.sessions[to].id.clone();
+        if let Some(filter) = &mut self.filter {
+            filter.highlighted = Some(id);
+        }
+    }
+
+    /// Puts the filter's bar on the first match when the session it was on
+    /// doesn't match any more.
+    fn keep_filter_bar_on_a_match(&mut self) {
+        let matches = self.matches();
+        let on_a_match = self
+            .sidebar_cursor()
+            .is_some_and(|cursor| matches.contains(&cursor));
+        if !on_a_match {
+            let first = matches
+                .first()
+                .map(|&index| self.sessions[index].id.clone());
+            if let Some(filter) = &mut self.filter {
+                filter.highlighted = first;
+            }
+        }
+    }
+
+    /// `o`: opens the pull request of the selected session's branch, or
+    /// says why there's none to open.
+    fn open_pull_request(&mut self) -> Option<Action> {
+        let selected = self.selected()?;
+        let name = selected.name.clone();
+        let Some(worktree) = selected.worktree.clone() else {
+            self.notify(format!("{name} isn't in a git repository"));
+            return None;
+        };
+        let Some(branch) = worktree.branch else {
+            self.notify(format!("{name} is on no branch"));
+            return None;
+        };
+        let project = worktree.project_path;
+        let number = match self.pull_requests.get(&project) {
+            None => {
+                self.notify(format!("still asking GitHub about {}", worktree.project));
+                return None;
+            }
+            Some(Err(reason)) => {
+                let reason = reason.clone();
+                self.notify(reason);
+                return None;
+            }
+            Some(Ok(_)) => self.pull_request(&project, &branch).map(|pr| pr.number),
+        };
+        match number {
+            Some(number) => Some(Action::OpenPullRequest { project, number }),
+            None => {
+                self.notify(format!("no open pull request for {branch}"));
+                None
+            }
+        }
+    }
+
+    /// `i`: opens the issues view for the selected session's project, or
+    /// says why it can't.
+    fn open_issues(&mut self) -> Option<Action> {
+        let selected = self.selected()?;
+        let name = selected.name.clone();
+        let Some(worktree) = selected.worktree.clone() else {
+            self.notify(format!("{name} isn't in a git repository"));
+            return None;
+        };
+        // What stopped GitHub listing pull requests would stop it listing
+        // issues too.
+        if let Some(Err(reason)) = self.pull_requests.get(&worktree.project_path) {
+            let reason = reason.clone();
+            self.notify(reason);
+            return None;
+        }
+        let project = worktree.project_path;
+        self.issues = Some(IssuesView::new(project.clone(), worktree.project));
+        Some(Action::ListIssues(project))
+    }
+
+    /// Keys while the issues view is open: Esc closes it, Enter goes on to
+    /// start a session for the issue the bar is on, and the view takes the
+    /// rest.
+    fn on_issues_key(&mut self, key: KeyEvent) -> Option<Action> {
+        match key.code {
+            KeyCode::Esc => self.issues = None,
+            KeyCode::Enter => self.start_on_issue(),
+            _ => {
+                if let Some(view) = &mut self.issues {
+                    view.on_key(&key);
+                }
+            }
+        }
+        None
+    }
+
+    /// Closes the issues view and asks for a new worktree for the issue the
+    /// bar was on: a branch named after it, and then, to run there, an
+    /// agent asked to fix it, with the issue's address so it can read it.
+    fn start_on_issue(&mut self) {
+        let Some(view) = self.issues.take() else {
+            return;
+        };
+        let Some(issue) = view.highlighted() else {
+            self.issues = Some(view);
+            return;
+        };
+        let branch = github::branch_for_issue(issue.number, &issue.title);
+        let command = format!(
+            "claude Fix issue #{}: {} ({})",
+            issue.number, issue.title, issue.url
+        );
+        self.ask_for_branch(Some(view.project.clone()), Some(command), &branch);
+    }
+
     fn ask(&mut self, question: Question, answer: &str) {
         self.prompt = Some(Prompt {
             question,
@@ -595,13 +913,15 @@ impl App {
     fn answer(&mut self, prompt: Prompt) -> Option<Action> {
         let answer = prompt.input.text().trim().to_string();
         match prompt.question {
-            Question::Branch => {
+            Question::Branch { base, command } => {
                 if !answer.is_empty() {
-                    let base = self.worktree_base();
-                    self.ask_for_command(Place::NewWorktree {
+                    let base = base.or_else(|| self.worktree_base());
+                    let command = command.unwrap_or_else(|| self.last_command.clone());
+                    let place = Place::NewWorktree {
                         branch: answer,
                         base,
-                    });
+                    };
+                    self.ask(Question::Command(place), &command);
                 }
                 None
             }
@@ -1617,5 +1937,195 @@ mod tests {
         app.on_mouse(CLICK, Hit::SidebarRow(row_of(&app, "b")));
         assert!(!app.showing_keys());
         assert_eq!(selected_name(&app), Some("a"));
+    }
+
+    /// The name of the session the sidebar's bar is on.
+    fn cursor_name(app: &App) -> Option<&str> {
+        let index = app.sidebar_cursor()?;
+        Some(app.sessions()[index].name.as_str())
+    }
+
+    #[test]
+    fn slash_shows_only_the_matching_sessions_and_enter_selects_one() {
+        let mut app = app_with(&["planner", "refund-fix", "reviewer"]);
+        press(&mut app, KeyCode::Char('/'));
+        type_text(&mut app, "fix");
+        let shown: Vec<&str> = app
+            .matches()
+            .iter()
+            .map(|&index| app.sessions()[index].name.as_str())
+            .collect();
+        assert_eq!(shown, ["refund-fix"]);
+        assert_eq!(cursor_name(&app), Some("refund-fix"));
+        assert_eq!(selected_name(&app), Some("planner"), "not until Enter");
+
+        press(&mut app, KeyCode::Enter);
+        assert!(app.filter().is_none());
+        assert_eq!(selected_name(&app), Some("refund-fix"));
+    }
+
+    #[test]
+    fn esc_closes_the_filter_and_leaves_the_selection_where_it_was() {
+        let mut app = app_with(&["planner", "refund-fix"]);
+        press(&mut app, KeyCode::Char('/'));
+        type_text(&mut app, "fix");
+        press(&mut app, KeyCode::Esc);
+        assert!(app.filter().is_none());
+        assert_eq!(selected_name(&app), Some("planner"));
+        assert_eq!(app.matches().len(), 2, "every session shows again");
+    }
+
+    #[test]
+    fn letters_type_into_the_filter_and_the_arrows_move_its_bar() {
+        let mut app = app_with(&["job-one", "job-two", "other"]);
+        press(&mut app, KeyCode::Char('/'));
+        type_text(&mut app, "j");
+        assert_eq!(app.filter().map(|f| f.input.text()), Some("j"));
+        assert_eq!(cursor_name(&app), Some("job-one"));
+        press(&mut app, KeyCode::Down);
+        assert_eq!(cursor_name(&app), Some("job-two"));
+        press(&mut app, KeyCode::Down);
+        assert_eq!(
+            cursor_name(&app),
+            Some("job-two"),
+            "the bar stops at the last"
+        );
+        assert_eq!(app.marked_letters(1), vec![0]);
+    }
+
+    /// A session in the `app` project, on `branch`.
+    fn in_repo(name: &str, branch: &str) -> SessionInfo {
+        SessionInfo {
+            worktree: Some(Worktree {
+                project: "app".into(),
+                project_path: PathBuf::from("/code/app"),
+                path: PathBuf::from(format!("/code/app/{branch}")),
+                main: branch == "main",
+                branch: Some(branch.into()),
+            }),
+            ..session(name)
+        }
+    }
+
+    fn pull_request(number: u64, branch: &str) -> PullRequest {
+        serde_json::from_value(serde_json::json!({
+            "number": number,
+            "title": "a change",
+            "headRefName": branch,
+            "isDraft": false,
+            "reviewDecision": "",
+            "statusCheckRollup": [],
+            "url": format!("https://github.com/acme/app/pull/{number}"),
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn o_opens_the_pull_request_of_the_selected_sessions_branch() {
+        let mut app = App::new(None);
+        app.set_sessions(vec![in_repo("fixer", "fix-login")]);
+        app.set_pull_requests(
+            PathBuf::from("/code/app"),
+            Ok(vec![pull_request(57, "fix-login")]),
+        );
+        assert_eq!(
+            press(&mut app, KeyCode::Char('o')),
+            Some(Action::OpenPullRequest {
+                project: PathBuf::from("/code/app"),
+                number: 57
+            })
+        );
+    }
+
+    #[test]
+    fn o_says_why_there_is_no_pull_request_to_open() {
+        let mut app = App::new(None);
+        app.set_sessions(vec![in_repo("fixer", "fix-login")]);
+        assert_eq!(press(&mut app, KeyCode::Char('o')), None);
+        assert_eq!(app.notice(), Some("still asking GitHub about app"));
+
+        app.set_pull_requests(
+            PathBuf::from("/code/app"),
+            Ok(vec![pull_request(9, "other")]),
+        );
+        press(&mut app, KeyCode::Char('o'));
+        assert_eq!(app.notice(), Some("no open pull request for fix-login"));
+
+        let not_github = "app's origin isn't on GitHub".to_string();
+        app.set_pull_requests(PathBuf::from("/code/app"), Err(not_github.clone()));
+        press(&mut app, KeyCode::Char('o'));
+        assert_eq!(app.notice(), Some(not_github.as_str()));
+    }
+
+    fn issue(number: u64, title: &str) -> github::Issue {
+        serde_json::from_value(serde_json::json!({
+            "number": number,
+            "title": title,
+            "labels": [],
+            "updatedAt": "2026-10-02T09:30:00Z",
+            "author": {"login": "ana"},
+            "url": format!("https://github.com/acme/app/issues/{number}"),
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn enter_on_an_issue_asks_for_its_branch_then_what_to_run() {
+        let mut app = App::new(None);
+        app.set_sessions(vec![in_repo("planner", "main")]);
+        assert_eq!(
+            press(&mut app, KeyCode::Char('i')),
+            Some(Action::ListIssues(PathBuf::from("/code/app")))
+        );
+        app.set_issues(
+            Path::new("/code/app"),
+            Ok(vec![issue(42, "Fix login redirect")]),
+        );
+        press(&mut app, KeyCode::Enter);
+        assert!(app.issues_view().is_none());
+        assert_eq!(prompt_text(&app), Some("42-fix-login-redirect"));
+
+        press(&mut app, KeyCode::Enter);
+        let command = "claude Fix issue #42: Fix login redirect \
+                       (https://github.com/acme/app/issues/42)";
+        assert_eq!(prompt_text(&app), Some(command));
+        let Some(Action::Start { place, command }) = press(&mut app, KeyCode::Enter) else {
+            panic!("Enter should start the session");
+        };
+        assert_eq!(
+            place,
+            Place::NewWorktree {
+                branch: "42-fix-login-redirect".into(),
+                base: Some(PathBuf::from("/code/app")),
+            }
+        );
+        assert_eq!(command[0], "claude");
+        assert!(command[1].starts_with("Fix issue #42"));
+    }
+
+    #[test]
+    fn i_outside_a_repository_or_github_says_why() {
+        let mut app = app_with(&["shell"]);
+        assert_eq!(press(&mut app, KeyCode::Char('i')), None);
+        assert_eq!(app.notice(), Some("shell isn't in a git repository"));
+
+        let mut app = App::new(None);
+        app.set_sessions(vec![in_repo("planner", "main")]);
+        let reason = "gh: not logged in".to_string();
+        app.set_pull_requests(PathBuf::from("/code/app"), Err(reason.clone()));
+        assert_eq!(press(&mut app, KeyCode::Char('i')), None);
+        assert_eq!(app.notice(), Some(reason.as_str()));
+        assert!(app.issues_view().is_none());
+    }
+
+    #[test]
+    fn esc_closes_the_issues_view() {
+        let mut app = App::new(None);
+        app.set_sessions(vec![in_repo("planner", "main")]);
+        press(&mut app, KeyCode::Char('i'));
+        type_text(&mut app, "q");
+        assert!(app.issues_view().is_some(), "q types into its filter");
+        press(&mut app, KeyCode::Esc);
+        assert!(app.issues_view().is_none());
     }
 }

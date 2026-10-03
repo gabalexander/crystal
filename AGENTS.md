@@ -55,6 +55,8 @@ is: it's the one request every version must understand.
   - `groups.rs`: the sidebar's order and headings: sessions by project, then worktree
   - `text_input.rs`: a one-line text box, for the questions asked on the bottom line
   - `command_line.rs`: reads the line typed at `new session:` into the command to run
+  - `search.rs`: `/`'s matching: a session's name, project, branch or command, letters in order
+  - `issues.rs`: the issues view `i` opens: its state, kept apart from I/O, and its drawing
   - `pane.rs`: a viewer of a session on screen, the selected one or a split, and its screen
   - `screen_widget.rs`: draws a vt100 screen into ratatui
 - `src/daemon.rs`: the daemon: listens on the socket and owns the sessions
@@ -76,6 +78,8 @@ is: it's the one request every version must understand.
 - `src/notify.rs`: telling the user when a session needs them: desktop notifications, or their own command
 - `src/env.rs`: the environment a session's program starts with
 - `src/git.rs`: a directory's project, worktree and branch, and making and removing worktrees (runs `git`)
+- `src/github.rs`: pull requests and issues from GitHub, through `gh` with a timeout; tests use a fake `gh`,
+  never the real one
 - `src/shell.rs`: quoting arguments and writing paths with `~`, the way a shell reads them
 - `tests/cli.rs`: end-to-end tests that drive the real binary against a private daemon, with a config of
   their own that turns notifications off
