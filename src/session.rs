@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// How long a stopped session gets to exit after its hang-up before it's
 /// killed outright.
@@ -38,6 +38,9 @@ pub struct Session {
     /// `None` until an agent reports what it's doing; most programs never
     /// do.
     activity: Option<Activity>,
+    /// When the session last changed: it started, its activity changed, or
+    /// its program ended. Shared with the thread that waits for that end.
+    changed: Arc<Mutex<SystemTime>>,
     /// What the screen has been saying the agent is doing.
     screen_watch: ScreenWatch,
     /// The git worktree `cwd` is in, if it's in one.
@@ -98,13 +101,18 @@ impl Session {
 
         let pid = child.process_id();
         let state = Arc::new(Mutex::new(State::Running));
-        let exit = state.clone();
-        thread::spawn(move || {
-            let ended = match child.wait() {
-                Ok(status) => ended(&status),
-                Err(_) => State::Exited { code: 1 },
-            };
-            *exit.lock().unwrap() = ended;
+        let changed = Arc::new(Mutex::new(SystemTime::now()));
+        thread::spawn({
+            let state = state.clone();
+            let changed = changed.clone();
+            move || {
+                let ended = match child.wait() {
+                    Ok(status) => ended(&status),
+                    Err(_) => State::Exited { code: 1 },
+                };
+                *state.lock().unwrap() = ended;
+                *changed.lock().unwrap() = SystemTime::now();
+            }
         });
 
         Ok(Session {
@@ -116,6 +124,7 @@ impl Session {
             pid,
             state,
             activity: None,
+            changed,
             conversation: None,
             told: None,
             screen_watch: ScreenWatch::default(),
@@ -137,12 +146,17 @@ impl Session {
             state: self.state.lock().unwrap().clone(),
             activity: self.activity,
             worktree: self.checkout.as_ref().map(Checkout::worktree),
+            changed: seconds_since_epoch(*self.changed.lock().unwrap()),
         }
     }
 
     /// Works out what the agent is doing from what it just reported.
     pub fn on_agent_event(&mut self, event: AgentEvent) {
-        self.activity = next_activity(self.activity, event, self.term.is_watched());
+        let activity = next_activity(self.activity, event, self.term.is_watched());
+        if activity != self.activity {
+            self.activity = activity;
+            *self.changed.lock().unwrap() = SystemTime::now();
+        }
     }
 
     /// Reads what the agent is doing off the screen, and takes it as an
@@ -421,6 +435,13 @@ impl vt100::Callbacks for Callbacks {
             _ => {}
         }
     }
+}
+
+/// `time` as seconds since the Unix epoch, which is how it travels.
+fn seconds_since_epoch(time: SystemTime) -> u64 {
+    time.duration_since(UNIX_EPOCH)
+        .map(|since| since.as_secs())
+        .unwrap_or(0)
 }
 
 /// What a session's agent is doing after `event`, given what it was doing

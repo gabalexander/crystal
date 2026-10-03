@@ -162,6 +162,7 @@ mod tests {
             state: State::Running,
             activity: None,
             worktree,
+            changed: 0,
         }
     }
 

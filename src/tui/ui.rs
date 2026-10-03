@@ -344,6 +344,7 @@ mod tests {
             state,
             activity: None,
             worktree: None,
+            changed: 0,
         }
     }
 

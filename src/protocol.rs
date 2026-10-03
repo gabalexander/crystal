@@ -141,6 +141,11 @@ pub struct SessionInfo {
     pub activity: Option<Activity>,
     /// `None` when the session's directory isn't in a git repository.
     pub worktree: Option<Worktree>,
+    /// When the session last changed, in seconds since the Unix epoch: it
+    /// started, its agent started or stopped doing something, or its
+    /// program ended. 0 from a daemon that doesn't say.
+    #[serde(default)]
+    pub changed: u64,
 }
 
 /// The git worktree a session runs in, and the project it belongs to.

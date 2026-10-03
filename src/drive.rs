@@ -188,6 +188,7 @@ mod tests {
             state,
             activity,
             worktree: None,
+            changed: 0,
         }
     }
 

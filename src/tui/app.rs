@@ -777,6 +777,7 @@ mod tests {
             state: State::Running,
             activity: None,
             worktree: None,
+            changed: 0,
         }
     }
 
