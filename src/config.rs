@@ -4,6 +4,7 @@
 //! A key crystal doesn't know is an error, not something to skip: a
 //! setting spelled wrong would otherwise do nothing, without a word.
 
+use crate::flows::Flow;
 use crate::plugins;
 use crate::profile::Profile;
 use anyhow::{Context, Result, bail};
@@ -37,6 +38,10 @@ pub struct Config {
     /// panel: `[[profile]]` tables in the file. See [`crate::profile`].
     #[serde(rename = "profile", skip_serializing_if = "Vec::is_empty")]
     pub profiles: Vec<Profile>,
+    /// Chains of steps run one after another on one goal: `[[flow]]`
+    /// tables in the file. See [`crate::flows`].
+    #[serde(rename = "flow", skip_serializing_if = "Vec::is_empty")]
+    pub flows: Vec<Flow>,
 }
 
 /// The TUI's colors to choose from. `dark` and `light` paint their own
@@ -59,6 +64,7 @@ impl Default for Config {
             theme: ThemeName::Dark,
             plugins: BTreeMap::new(),
             profiles: Vec::new(),
+            flows: Vec::new(),
         }
     }
 }
@@ -145,12 +151,22 @@ pub fn from_text(text: &str) -> Result<Config> {
     if let Some(pair) = names.windows(2).find(|pair| pair[0] == pair[1]) {
         bail!("two profiles are called {}", pair[0]);
     }
+    for (index, flow) in config.flows.iter().enumerate() {
+        flow.check(&config.profiles)?;
+        if config.flows[..index]
+            .iter()
+            .any(|before| before.name == flow.name)
+        {
+            bail!("two flows are called {}", flow.name);
+        }
+    }
     Ok(config)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::flows::Step;
     use crate::profile::StartIn;
 
     fn parse(text: &str) -> Result<Config> {
@@ -275,6 +291,67 @@ where = "worktree"
     }
 
     #[test]
+    fn flows_and_their_steps_are_read_in_order() {
+        let config = parse(
+            r#"
+[[profile]]
+name = "reviewer"
+agent = "claude"
+
+[[flow]]
+name = "ship"
+description = "Plan, build, review"
+
+[[flow.step]]
+name = "plan"
+prompt = "Plan {goal}"
+
+[[flow.step]]
+name = "build"
+prompt = "Build {goal} like so: {previous}"
+worktree = true
+
+[[flow.step]]
+name = "review"
+profile = "reviewer"
+prompt = "Review it. {feedback}"
+gate = true
+back_to = "build"
+"#,
+        )
+        .unwrap();
+        let ship = &config.flows[0];
+        assert_eq!(ship.chain(), "plan → build → review");
+        assert!(ship.steps[1].worktree && !ship.steps[1].gate);
+        assert_eq!(ship.steps[2].profile.as_deref(), Some("reviewer"));
+        assert_eq!(ship.steps[2].back_to.as_deref(), Some("build"));
+    }
+
+    #[test]
+    fn a_flow_that_cant_run_is_an_error_that_says_why() {
+        let cases = [
+            ("[[flow]]\nname = \"ship\"\n", "has no steps"),
+            (
+                "[[flow]]\nname = \"ship\"\n[[flow.step]]\nname = \"plan\"\nprompt = \"x\"\nwait = true\n",
+                "wait",
+            ),
+            (
+                "[[flow]]\nname = \"ship\"\n[[flow.step]]\nname = \"plan\"\nprompt = \"x\"\nprofile = \"nope\"\n",
+                "profile nope, which isn't there",
+            ),
+            (
+                "[[flow]]\nname = \"x\"\n[[flow.step]]\nname = \"a\"\nprompt = \"x\"\n\
+                 [[flow]]\nname = \"x\"\n[[flow.step]]\nname = \"a\"\nprompt = \"x\"\n",
+                "two flows are called x",
+            ),
+        ];
+        for (flow, expected) in cases {
+            let err = parse(flow).unwrap_err();
+            assert!(format!("{err:#}").contains(expected), "{err:#}");
+        }
+    }
+
+    #[test]
     fn a_leftover_preset_says_its_now_a_profile() {
         let err = parse("[[preset]]\nname = \"x\"\nagent = \"claude\"\n").unwrap_err();
         assert!(
@@ -301,6 +378,28 @@ where = "worktree"
                 prompt: Some("Review it.".into()),
                 instructions: Some("Be brief.".into()),
                 start_in: Some(StartIn::Worktree),
+            }],
+            flows: vec![Flow {
+                name: "ship".into(),
+                description: Some("Plan, then build".into()),
+                steps: vec![
+                    Step {
+                        name: "plan".into(),
+                        profile: Some("review".into()),
+                        prompt: "Plan {goal}".into(),
+                        worktree: false,
+                        gate: true,
+                        back_to: None,
+                    },
+                    Step {
+                        name: "build".into(),
+                        profile: None,
+                        prompt: "Build it:\n{previous}".into(),
+                        worktree: true,
+                        gate: false,
+                        back_to: None,
+                    },
+                ],
             }],
         };
         assert_eq!(parse(&config.to_toml()).unwrap(), config);

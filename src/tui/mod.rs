@@ -16,7 +16,7 @@ mod fuzzy;
 mod groups;
 mod help;
 mod issues;
-mod launcher;
+pub(crate) mod launcher;
 mod memory_view;
 mod mouse;
 mod pane;

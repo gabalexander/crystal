@@ -9,6 +9,9 @@ mod config;
 mod daemon;
 mod drive;
 mod env;
+mod flow_cli;
+mod flow_run;
+mod flows;
 mod front;
 mod git;
 mod github;
@@ -177,6 +180,16 @@ enum Command {
         /// example `-- --permission-mode acceptEdits`.
         #[arg(last = true, value_name = "CLAUDE ARGS")]
         claude_args: Vec<String>,
+    },
+    /// Run flows: chains of background tasks on one goal, from the config
+    /// file's `[[flow]]` tables. With no command, lists the runs.
+    Flow {
+        /// With no command: print the runs as JSON.
+        #[arg(long)]
+        json: bool,
+
+        #[command(subcommand)]
+        command: Option<FlowCommand>,
     },
     /// Print a task's answer: what Claude said at the end of its last run.
     Result {
@@ -378,6 +391,63 @@ enum MemoryCommand {
 }
 
 #[derive(Subcommand)]
+enum FlowCommand {
+    /// Start a run of a flow on a goal. Prints the run's name.
+    Run {
+        /// The flow, by its name in the config file.
+        flow: String,
+
+        /// What the flow is to do: `{goal}` in its steps' prompts. Several
+        /// words are joined with spaces.
+        #[arg(required = true)]
+        goal: Vec<String>,
+
+        /// The directory to start in [default: the current one]
+        #[arg(short = 'c', long)]
+        cwd: Option<PathBuf>,
+
+        /// Then wait for it, as `crystal flow wait` does.
+        #[arg(long)]
+        wait: bool,
+    },
+    /// Show a run: each step, how it stands, and the first line of what it
+    /// answered.
+    Show {
+        run: String,
+
+        /// Everything about the run, as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Go on past the gate a run waits at.
+    Approve { run: String },
+    /// Send a run back from the gate it waits at, with notes on what to do
+    /// differently: its gate's `back_to` step runs again, with the notes as
+    /// `{feedback}`.
+    Back {
+        run: String,
+
+        /// What to do differently. Several words are joined with spaces.
+        notes: Vec<String>,
+    },
+    /// Run the step that stopped a run again: it failed, or a restart cut it
+    /// short.
+    Retry { run: String },
+    /// Wait until a run stops running, at a gate or at its end, and print
+    /// which. A step that failed or was cut short is an error.
+    Wait {
+        run: String,
+
+        /// Give up after this many seconds.
+        #[arg(long, value_name = "SECONDS")]
+        timeout: Option<f64>,
+    },
+    /// Print an example flow, with the profiles it runs with, to copy into
+    /// the config file.
+    Example,
+}
+
+#[derive(Subcommand)]
 enum WorktreeCommand {
     /// Remove a worktree, given its directory or its branch. Refuses while
     /// a session runs in it.
@@ -532,6 +602,7 @@ fn run(cli: Cli) -> Result<()> {
                 drive::wait_for_turn(&socket, &name, seconds(timeout))?;
             }
         }
+        Command::Flow { json, command } => flow(&socket, json, command)?,
         Command::Result { name, json } => drive::result(&socket, &name, json)?,
         Command::Worktree {
             command: WorktreeCommand::Rm { worktree },
@@ -809,6 +880,31 @@ fn backlog(
         }
     };
     work::change_backlog(socket, dir, action)
+}
+
+/// `crystal flow` and its commands.
+fn flow(socket: &Path, json: bool, command: Option<FlowCommand>) -> Result<()> {
+    match command {
+        None => flow_cli::list(socket, json),
+        Some(FlowCommand::Run {
+            flow,
+            goal,
+            cwd,
+            wait,
+        }) => {
+            let cwd = start_dir(socket, cwd, None)?;
+            flow_cli::run(socket, &flow, &goal.join(" "), cwd, wait)
+        }
+        Some(FlowCommand::Show { run, json }) => flow_cli::show(socket, &run, json),
+        Some(FlowCommand::Approve { run }) => flow_cli::approve(socket, &run),
+        Some(FlowCommand::Back { run, notes }) => flow_cli::back(socket, &run, &notes.join(" ")),
+        Some(FlowCommand::Retry { run }) => flow_cli::retry(socket, &run),
+        Some(FlowCommand::Wait { run, timeout }) => flow_cli::wait(socket, &run, seconds(timeout)),
+        Some(FlowCommand::Example) => {
+            flow_cli::example();
+            Ok(())
+        }
+    }
 }
 
 /// The directory a command about a project is given with `-C`, or the

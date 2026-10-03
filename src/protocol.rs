@@ -8,6 +8,7 @@
 //! installed, and the two may not understand each other: the daemon checks
 //! the version before it reads the request, and says what to do.
 
+use crate::flow_run::FlowRun;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -119,6 +120,31 @@ pub enum Request {
         path: PathBuf,
         branch: Option<String>,
         created: bool,
+    },
+    /// Start a run of the flow called `flow` on `goal`, from `cwd`. Its
+    /// steps' tasks start from the client's environment, `env`.
+    StartFlow {
+        flow: String,
+        goal: String,
+        cwd: PathBuf,
+        env: BTreeMap<String, String>,
+    },
+    /// Every flow run the daemon knows of, the oldest first.
+    ListFlows,
+    /// Go on past the gate the run called `run` waits at.
+    ApproveFlow {
+        run: String,
+    },
+    /// Send the run called `run` back from the gate it waits at, with
+    /// notes on what to do differently.
+    SendFlowBack {
+        run: String,
+        notes: String,
+    },
+    /// Run the step that stopped the run called `run` again: it failed, or
+    /// a restart cut it short.
+    RetryFlow {
+        run: String,
     },
     /// What's on a session's screen, as text.
     Read {
@@ -242,6 +268,14 @@ pub enum Response {
     /// How many items are open on each project's backlog.
     BacklogCounts {
         open: BTreeMap<PathBuf, usize>,
+    },
+    /// The name a new flow run got.
+    FlowStarted {
+        run: String,
+    },
+    /// Flow runs, as `Request::ListFlows` asks for them.
+    Flows {
+        runs: Vec<FlowRun>,
     },
     Done,
     Error {

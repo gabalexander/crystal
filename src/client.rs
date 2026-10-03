@@ -112,6 +112,22 @@ pub fn new_task(
     }
 }
 
+/// Asks the daemon to start a run of the flow called `flow` on `goal`, in
+/// `cwd`, with this process's environment. Starts the daemon if it isn't
+/// running. Returns the run's name.
+pub fn start_flow(socket: &Path, flow: &str, goal: &str, cwd: PathBuf) -> Result<String> {
+    let request = Request::StartFlow {
+        flow: flow.to_string(),
+        goal: goal.to_string(),
+        cwd,
+        env: env::current(),
+    };
+    match ask(socket, &request, true)? {
+        Some(Response::FlowStarted { run }) => Ok(run),
+        _ => bail!("the daemon didn't start the flow"),
+    }
+}
+
 /// Gives the session called `name` another name.
 pub fn rename(socket: &Path, name: &str, new_name: &str) -> Result<()> {
     let request = Request::Rename {

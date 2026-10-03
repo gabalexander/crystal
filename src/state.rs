@@ -42,6 +42,16 @@ pub fn path(socket: &Path) -> PathBuf {
     }
 }
 
+/// Where the flow runs of the daemon at `socket` are written down: beside
+/// its sessions, for the same reason.
+pub fn flows_path(socket: &Path) -> PathBuf {
+    if socket == socket::default_path() {
+        state_dir().join("flows.json")
+    } else {
+        socket.with_extension("flows.json")
+    }
+}
+
 /// The sessions written down at `path`. A file that's missing or can't be
 /// read means there's nothing to start again.
 pub fn load(path: &Path) -> Vec<SavedSession> {
@@ -192,6 +202,10 @@ mod tests {
             Path::new("/tmp/test/crystal.sessions.json")
         );
         assert!(path(&socket::default_path()).ends_with("crystal/sessions.json"));
+        assert_eq!(
+            flows_path(Path::new("/tmp/test/crystal.sock")),
+            Path::new("/tmp/test/crystal.flows.json")
+        );
     }
 
     #[test]

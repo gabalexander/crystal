@@ -80,6 +80,26 @@ pub fn add_worktree(dir: &Path, branch: &str) -> Result<PathBuf> {
     Ok(target)
 }
 
+/// Makes a worktree in the repository `dir` is in on a new branch: `branch`,
+/// or else `branch-2`, `branch-3`… whichever is neither a branch yet nor
+/// has a worktree's directory in the way. Returns its directory, and the
+/// branch it's on.
+pub fn add_new_worktree(dir: &Path, branch: &str) -> Result<(PathBuf, String)> {
+    let checkout = Checkout::find(dir)
+        .with_context(|| format!("{} isn't in a git repository", dir.display()))?;
+    let free = (1..)
+        .map(|n| match n {
+            1 => branch.to_string(),
+            n => format!("{branch}-{n}"),
+        })
+        .find(|name| {
+            !branch_exists(dir, name) && !worktree_dir(&checkout.project_path, name).exists()
+        })
+        .expect("some number is free");
+    let path = add_worktree(dir, &free)?;
+    Ok((path, free))
+}
+
 /// The worktree `target` names: a directory, taken from `dir` when it's
 /// relative, or else a branch that a worktree of `dir`'s repository has
 /// checked out.

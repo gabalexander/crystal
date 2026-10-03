@@ -234,6 +234,16 @@ impl Session {
             .with_context(|| format!("{name} has no answer yet"))
     }
 
+    /// How a task's latest run ended, once it has: `None` while a run is
+    /// going on, before any has ended, and for a session that isn't a task.
+    pub fn finished_run(&self) -> Option<TaskResult> {
+        let task = self.task.as_ref()?;
+        if task.pid().is_some() {
+            return None;
+        }
+        task.result()
+    }
+
     /// A task started again after a restart: it says so, and waits at rest
     /// for a follow-up, which carries its conversation on.
     pub fn came_back(&mut self) {

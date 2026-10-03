@@ -7,14 +7,17 @@ use crate::backlog;
 use crate::codex;
 use crate::config::Config;
 use crate::env;
+use crate::flow_run::{self, Ended, FlowRun, Next, RunState, StepState};
+use crate::flows;
+use crate::git;
 use crate::keys;
 use crate::memory::{self, Memory};
-use crate::notify;
+use crate::notify::{self, Notice};
 use crate::plugin_hooks::{self, Event, Hooks};
 use crate::project::{self, Project};
 use crate::protocol::{
-    self, Backlog, Conversation, Frame, NewSession, NewTask, Request, Response, TaskInfo,
-    TaskRecord,
+    self, Activity, AgentEvent, Backlog, Conversation, Frame, NewSession, NewTask, Request,
+    Response, TaskInfo, TaskRecord,
 };
 use crate::session::{STOP_GRACE, Session, Term};
 use crate::socket;
@@ -48,11 +51,14 @@ pub fn run(socket: &Path) -> Result<()> {
     let daemon = Arc::new(Daemon {
         socket: socket.to_path_buf(),
         state: state::path(socket),
+        flows_file: state::flows_path(socket),
         sessions: Mutex::default(),
+        flows: Mutex::default(),
         stores: Mutex::default(),
         hooks: Hooks::new(socket),
     });
     daemon.start_saved_sessions();
+    daemon.take_up_flows();
     thread::spawn({
         let daemon = daemon.clone();
         move || daemon.keep_up()
@@ -90,8 +96,16 @@ struct Daemon {
     /// Where the running sessions are written down, to start them again
     /// after a restart.
     state: PathBuf,
+    /// Where the flow runs are written down, to take them up again after a
+    /// restart.
+    flows_file: PathBuf,
     /// In the order they were created, which is the order `ls` shows.
     sessions: Mutex<Vec<Session>>,
+    /// Every flow run, the oldest first. A run's steps are sessions, so
+    /// whoever needs both locks `sessions` first, then this, and never the
+    /// other way round, which could leave two threads each waiting on the
+    /// other.
+    flows: Mutex<Vec<FlowRun>>,
     /// Held while a project's backlog or task history is read and written
     /// back, so two requests at once can't each write over the other.
     stores: Mutex<()>,
@@ -190,6 +204,7 @@ impl Daemon {
         // Whether each session was running, and what its agent was doing,
         // the last time round, by id, to tell plugins what changed.
         let mut last_seen: HashMap<String, (bool, Option<protocol::Activity>)> = HashMap::new();
+        let mut last_runs: Vec<FlowRun> = Vec::new();
         loop {
             thread::sleep(KEEP_UP_EVERY);
             let mut sessions = self.sessions.lock().unwrap();
@@ -210,6 +225,11 @@ impl Daemon {
                 for closed in session.take_closed() {
                     self.write_down_closed(session.cwd(), &closed);
                 }
+            }
+            // Before telling the user anything: a step the flow goes on
+            // from needs nobody, and a gate needs them.
+            self.follow_flows(&mut sessions);
+            for session in sessions.iter_mut() {
                 if let Some(notice) = session.notice() {
                     notify::tell(notice);
                 }
@@ -233,7 +253,221 @@ impl Daemon {
                     Err(err) => eprintln!("crystal daemon: couldn't save the sessions: {err:#}"),
                 }
             }
+            let runs = self.flows.lock().unwrap().clone();
+            if runs != last_runs {
+                match flow_run::save(&self.flows_file, &runs) {
+                    Ok(()) => last_runs = runs,
+                    Err(err) => eprintln!("crystal daemon: couldn't save the flow runs: {err:#}"),
+                }
+            }
         }
+    }
+
+    /// Takes up the flow runs the last daemon wrote down. A step that was
+    /// running then was cut short, and waits to be run again; one waiting
+    /// at its gate waits on the user again. Their steps start from this
+    /// daemon's environment, as the sessions it starts again do.
+    fn take_up_flows(&self) {
+        let mut sessions = self.sessions.lock().unwrap();
+        let mut runs = flow_run::load(&self.flows_file);
+        for run in &mut runs {
+            run.interrupt();
+            run.env = env::current();
+            let at_gate = run
+                .current()
+                .filter(|&step| run.steps[step].state == StepState::AtGate);
+            if let Some(session) = at_gate.and_then(|step| step_session(&mut sessions, run, step)) {
+                session.on_agent_event(AgentEvent::Asking);
+            }
+        }
+        *self.flows.lock().unwrap() = runs;
+    }
+
+    /// Keeps each flow run going: once the task of the step running has
+    /// finished its run, the run takes how it went and does what comes
+    /// next.
+    fn follow_flows(&self, sessions: &mut Vec<Session>) {
+        let mut runs = self.flows.lock().unwrap();
+        for run in runs.iter_mut() {
+            let Some(step) = run.running() else {
+                continue;
+            };
+            let Some(ended) = how_step_ended(sessions, run, step) else {
+                continue;
+            };
+            let next = run.step_ended(step, ended);
+            // The flow has taken the step's answer on to the next step:
+            // nobody needs to look at it to know it's done.
+            if matches!(next, Next::Run { .. })
+                && let Some(session) = step_session(sessions, run, step)
+            {
+                session.seen();
+            }
+            self.carry_out(sessions, run, next);
+            // A run that has just stopped needs the user as much as a gate
+            // does, but its step's session has ended and can't say so.
+            if run.state() == RunState::Failed {
+                notify::tell(Notice {
+                    session: run.steps[step].session.clone().unwrap_or_default(),
+                    activity: Activity::Waiting,
+                    text: format!("{} failed at {}", run.name, run.step_name(step)),
+                });
+            }
+        }
+    }
+
+    /// Does what a flow run needs once it has changed: runs its next step,
+    /// or has the session of the step at its gate wait on the user.
+    fn carry_out(&self, sessions: &mut Vec<Session>, run: &mut FlowRun, next: Next) {
+        match next {
+            Next::Run { step, prompt } => {
+                if let Err(err) = self.start_step(sessions, run, step, &prompt) {
+                    run.could_not_start(step, format!("{err:#}"));
+                }
+            }
+            Next::Gate(step) => {
+                if let Some(session) = step_session(sessions, run, step) {
+                    session.on_agent_event(AgentEvent::Asking);
+                }
+            }
+            Next::Finished | Next::Stopped => {}
+        }
+    }
+
+    /// Runs `step` of `run`, asking it `prompt`. While the step's session is
+    /// there at rest, it's a follow-up there, in the same conversation. An
+    /// ended one makes way for a new task, which carries its conversation
+    /// on; with none, the step starts in a new task of its own.
+    fn start_step(
+        &self,
+        sessions: &mut Vec<Session>,
+        run: &mut FlowRun,
+        step: usize,
+        prompt: &str,
+    ) -> Result<()> {
+        let mut conversation = None;
+        let had = run.steps[step].session.as_ref();
+        if let Some(index) = had.and_then(|name| sessions.iter().position(|s| s.name == *name)) {
+            let session = &sessions[index];
+            match (session.is_task(), session.is_running()) {
+                (true, true) => return session.prompt(prompt),
+                (true, false) => {
+                    conversation = session.launch().conversation.map(|found| found.id);
+                    sessions.remove(index);
+                }
+                // Not a task: a session that has taken the name since.
+                (false, _) => {}
+            }
+        }
+        let cwd = self.step_dir(run, step)?;
+        let taken = |name: &str| sessions.iter().any(|session| session.name == name);
+        let name = unique_name(&run.session_name(step), taken);
+        let task = NewTask {
+            name: Some(name),
+            cwd,
+            spec: run.task_spec(step, prompt),
+            env: run.env.clone(),
+            backlog: None,
+        };
+        let name = start_task(sessions, &self.socket, task, conversation, true)?;
+        // As a task, it's the step, in the project's history and memory,
+        // rather than the whole of its prompt.
+        let session = sessions.last_mut().expect("start_task added it");
+        if session.task_record().is_some() {
+            session.give_task(TaskInfo {
+                goal: format!("{} {}: {}", run.name, run.step_name(step), run.goal),
+                background: true,
+                backlog: None,
+                outcome: None,
+            });
+        }
+        run.steps[step].session = Some(name);
+        Ok(())
+    }
+
+    /// Where `step` of `run` runs: where the run started, or, from the
+    /// first step that wants one, the worktree the run makes for itself
+    /// then.
+    fn step_dir(&self, run: &mut FlowRun, step: usize) -> Result<PathBuf> {
+        if !run.wants_worktree(step) {
+            return Ok(run.cwd.clone());
+        }
+        if let Some(worktree) = &run.worktree {
+            return Ok(worktree.clone());
+        }
+        let (worktree, branch) = git::add_new_worktree(&run.cwd, &run.branch())?;
+        // The plugins that listen for new worktrees hear of it, as they do
+        // of one a client makes.
+        let made = Event::about_worktree(true, &worktree, Some(&branch));
+        self.hooks.tell(made);
+        run.worktree = Some(worktree.clone());
+        Ok(worktree)
+    }
+
+    /// Starts a run of the flow called `flow` in the config file, on `goal`.
+    fn start_flow(
+        &self,
+        flow: &str,
+        goal: String,
+        cwd: PathBuf,
+        env: BTreeMap<String, String>,
+    ) -> Result<String> {
+        let config = settings();
+        flows::ensure_enabled(&config)?;
+        let Some(found) = config.flows.iter().find(|found| found.name == flow) else {
+            let known: Vec<&str> = config.flows.iter().map(|f| f.name.as_str()).collect();
+            if known.is_empty() {
+                bail!(
+                    "there's no flow called {flow}, nor any other: `crystal flow example` shows one"
+                );
+            }
+            bail!(
+                "there's no flow called {flow}; there's {}",
+                known.join(", ")
+            );
+        };
+        let mut sessions = self.sessions.lock().unwrap();
+        let mut runs = self.flows.lock().unwrap();
+        let name = flow_run::new_name(flow, &runs);
+        let mut run = FlowRun::new(
+            name.clone(),
+            found.clone(),
+            &config.profiles,
+            goal,
+            cwd,
+            env,
+            now_seconds(),
+        );
+        let next = run.start();
+        self.carry_out(&mut sessions, &mut run, next);
+        runs.push(run);
+        flow_run::forget_old(&mut runs);
+        Ok(name)
+    }
+
+    /// Changes the run called `name` with `change`, then does what that
+    /// leads to.
+    fn change_flow(
+        &self,
+        name: &str,
+        change: impl FnOnce(&mut FlowRun) -> Result<Next>,
+    ) -> Result<()> {
+        flows::ensure_enabled(&settings())?;
+        let mut sessions = self.sessions.lock().unwrap();
+        let mut runs = self.flows.lock().unwrap();
+        let run = runs.iter_mut().find(|run| run.name == name);
+        let run = run.with_context(|| format!("there's no flow run called {name}"))?;
+        // The step at its gate stops waiting on the user, whatever they
+        // said.
+        let gate = run
+            .current()
+            .filter(|&step| run.steps[step].state == StepState::AtGate);
+        let next = change(run)?;
+        if let Some(session) = gate.and_then(|step| step_session(&mut sessions, run, step)) {
+            session.on_agent_event(AgentEvent::Started);
+        }
+        self.carry_out(&mut sessions, run, next);
+        Ok(())
     }
 
     /// Writes a task that has just closed into its project's history, and,
@@ -375,7 +609,15 @@ impl Daemon {
                         sessions.iter().any(|session| session.name == taken)
                     })?;
                 }
-                named(&mut sessions, &name)?.name = new_name;
+                named(&mut sessions, &name)?.name = new_name.clone();
+                // A flow's step keeps to its session under the new name.
+                for run in self.flows.lock().unwrap().iter_mut() {
+                    for step in &mut run.steps {
+                        if step.session.as_ref() == Some(&name) {
+                            step.session = Some(new_name.clone());
+                        }
+                    }
+                }
                 Ok(Response::Done)
             }
             Request::Respawn { name, env } => self.respawn(&name, env),
@@ -482,6 +724,32 @@ impl Daemon {
                     })
                     .collect();
                 Ok(Response::BacklogCounts { open })
+            }
+            Request::StartFlow {
+                flow,
+                goal,
+                cwd,
+                env,
+            } => {
+                let run = self.start_flow(&flow, goal, cwd, env)?;
+                Ok(Response::FlowStarted { run })
+            }
+            Request::ListFlows => {
+                flows::ensure_enabled(&settings())?;
+                let runs = self.flows.lock().unwrap().clone();
+                Ok(Response::Flows { runs })
+            }
+            Request::ApproveFlow { run } => {
+                self.change_flow(&run, FlowRun::approve)?;
+                Ok(Response::Done)
+            }
+            Request::SendFlowBack { run, notes } => {
+                self.change_flow(&run, |run| run.send_back(&notes))?;
+                Ok(Response::Done)
+            }
+            Request::RetryFlow { run } => {
+                self.change_flow(&run, FlowRun::retry)?;
+                Ok(Response::Done)
             }
             // Leaving is enough: the sessions' terminals close with the
             // daemon, and the list of them stays as it was last written.
@@ -626,6 +894,35 @@ impl Daemon {
         self.tell_started(&sessions, name);
         Ok(Response::Done)
     }
+}
+
+/// The session `step` of `run` runs in, while it's there.
+fn step_session<'a>(
+    sessions: &'a mut [Session],
+    run: &FlowRun,
+    step: usize,
+) -> Option<&'a mut Session> {
+    let name = run.steps[step].session.as_ref()?;
+    sessions.iter_mut().find(|session| session.name == *name)
+}
+
+/// How the run of `step` ended, once it has: from what its task's run came
+/// to, or a failure when its session has gone.
+fn how_step_ended(sessions: &[Session], run: &FlowRun, step: usize) -> Option<Ended> {
+    let name = run.steps[step].session.as_ref()?;
+    let Some(session) = sessions.iter().find(|session| session.name == *name) else {
+        return Some(Ended {
+            failed: true,
+            answer: format!("its session, {name}, has gone"),
+            cost_usd: 0.0,
+        });
+    };
+    let result = session.finished_run()?;
+    Some(Ended {
+        failed: result.failed || !session.is_running(),
+        answer: result.text,
+        cost_usd: result.cost_usd,
+    })
 }
 
 /// A session found for a client about to show it.
