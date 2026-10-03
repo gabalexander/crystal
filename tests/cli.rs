@@ -1239,13 +1239,16 @@ fn a_question_mark_shows_every_key_and_the_next_key_only_closes_it() {
     tui.shows("? keys");
     tui.type_keys("?");
     tui.shows("In the sidebar");
-    tui.shows("next/all needing you");
+    tui.shows("all needing you");
+    // 80 by 24 takes two pages; space turns to the next.
+    tui.shows("1/2");
+    tui.type_keys(" ");
     tui.shows("With the mouse");
 
     // q puts the keys away; it doesn't quit.
     tui.type_keys("q");
     eventually("the keys are put away", || {
-        !tui.text().contains("In the sidebar")
+        !tui.text().contains("With the mouse")
     });
     tui.shows("❯ stays");
     tui.type_keys("q");
@@ -8027,7 +8030,10 @@ fn a_plugin_action_s_key_runs_it_from_the_sidebar() {
 
     let mut tui = crystal.tui();
     tui.shows("▸ agent");
+    // The plugins' keys are on the overlay's second page, after the
+    // sidebar's own.
     tui.type_keys("?");
+    tui.type_keys(" ");
     tui.shows("notes: Where am I");
     tui.type_keys("q");
     tui.hides("notes: Where am I");

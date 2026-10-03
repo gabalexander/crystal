@@ -134,7 +134,7 @@ and the footer says where you are and offers the keys that matter there, or, whe
 | `P` | list your [profiles](#profiles), and add, change, copy or remove one |
 | `X` | list the [plugins](#plugins): switch them on and off, run their actions and open their panes |
 | `,` | open the [settings](#the-settings-view): notifications, the theme, and how memory learns and searches, each changed as you go |
-| `?` | show every key, in the sidebar, in a pane, in a question and with the mouse |
+| `?` | show every key, in the sidebar, in a pane, in a question and with the mouse: a page at a time when they don't all fit, `→` and `←` (or `Space`, `PgDn` and `PgUp`) turning the pages |
 | `q` | quit; the sessions keep running |
 
 While you're typing into a session, every key goes to it, `Tab` included, except `Ctrl+\`, which takes you

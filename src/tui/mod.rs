@@ -492,6 +492,7 @@ impl Tui {
         self.screen = Rect::new(0, 0, size.width, size.height);
         let areas = ui::Areas::of(&self.app, self.screen);
         self.app.set_tiles(areas.tiles);
+        self.app.set_screen(self.screen);
         self.sync_panes(&areas);
         if let Some(overlay) = &mut self.overlay {
             let screen = ui::plugin_pane_screen(&areas);

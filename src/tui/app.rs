@@ -10,6 +10,7 @@ use super::diff_view::{self, Against, DiffView};
 use super::finder::Finder;
 use super::grep::Grep;
 use super::groups::{self, Row};
+use super::help;
 use super::issues::{self, IssuesView};
 use super::launcher::{self, Launcher, Memory, Run, Setup, Target};
 use super::layouts::{self, Layouts, LayoutsView, Which};
@@ -670,8 +671,12 @@ pub struct App {
     /// Something to tell the user, like why a key didn't work. It stays
     /// until the next key.
     notice: Option<String>,
-    /// Whether the overlay listing every key is open.
-    showing_keys: bool,
+    /// The page the overlay listing every key is open at, while it's
+    /// open.
+    keys_page: Option<usize>,
+    /// The whole terminal, as the event loop last drew it: what the list of
+    /// keys has to fit.
+    screen: Rect,
     /// `/`'s filter on the sidebar, while it's open.
     filter: Option<Filter>,
     /// What its forge said about each project's open pull requests, by the
@@ -775,7 +780,8 @@ impl App {
             link_hover: None,
             own_id,
             notice: None,
-            showing_keys: false,
+            keys_page: None,
+            screen: Rect::new(0, 0, 80, 24),
             filter: None,
             pull_requests: HashMap::new(),
             issues: None,
@@ -1017,7 +1023,28 @@ impl App {
 
     /// Whether the overlay listing every key is open.
     pub fn showing_keys(&self) -> bool {
-        self.showing_keys
+        self.keys_page.is_some()
+    }
+
+    /// The page of the list of keys that's open.
+    pub fn keys_page(&self) -> usize {
+        self.keys_page.unwrap_or(0)
+    }
+
+    /// Takes the whole terminal's size, as the event loop lays it out.
+    pub fn set_screen(&mut self, screen: Rect) {
+        self.screen = screen;
+    }
+
+    /// How many pages the list of keys takes on the screen.
+    fn keys_pages(&self) -> usize {
+        let plugin_on = |plugin: &str| self.plugin_on(plugin);
+        let plugin_keys = self.plugin_key_rows();
+        let shown = help::Shown {
+            plugin_on: &plugin_on,
+            plugin_keys: &plugin_keys,
+        };
+        help::page_count(&shown, self.screen)
     }
 
     /// The diff or the file finder, while one is open.
@@ -2134,10 +2161,15 @@ impl App {
         if self.view.is_some() {
             return self.on_view_key(key);
         }
-        // Any key closes the list of keys, and does nothing else: the key
-        // that closes it may be one the user was only reading about.
-        if self.showing_keys {
-            self.showing_keys = false;
+        // The arrows turn the list of keys' pages. Any other key closes it,
+        // and does nothing else: the key that closes it may be one the user
+        // was only reading about.
+        if let Some(page) = self.keys_page {
+            let pages = self.keys_pages();
+            self.keys_page = match page_turn(key.code) {
+                Some(by) if pages > 1 => Some((page + pages).wrapping_add_signed(by) % pages),
+                _ => None,
+            };
             return None;
         }
         // Only `y` says yes; any other key says no.
@@ -2245,9 +2277,9 @@ impl App {
             return self.follow(outcome);
         }
         // A click closes the list of keys, like a key does.
-        if self.showing_keys {
+        if self.showing_keys() {
             if kind == MouseEventKind::Down(MouseButton::Left) {
-                self.showing_keys = false;
+                self.keys_page = None;
             }
             return None;
         }
@@ -2390,7 +2422,7 @@ impl App {
     /// Whether the mouse works on the panes: they're showing, and nothing
     /// over them waits on the keyboard.
     fn mouse_on_panes(&self) -> bool {
-        self.view.is_none() && !self.showing_keys && !self.waiting_on_keyboard()
+        self.view.is_none() && !self.showing_keys() && !self.waiting_on_keyboard()
     }
 
     /// A click on a sidebar row: on a session, or a worktree with none,
@@ -2485,7 +2517,7 @@ impl App {
             KeyCode::Char('B') => return self.open_switcher(),
             KeyCode::Char('m') => return self.open_memory(),
             KeyCode::Char('P') => return self.open_profiles(),
-            KeyCode::Char('?') => self.showing_keys = true,
+            KeyCode::Char('?') => self.keys_page = Some(0),
             KeyCode::Char('/') => self.open_filter(),
             KeyCode::Char('o') => return self.open_pull_request(),
             KeyCode::Char('O') => return self.open_pull_requests(),
@@ -3429,7 +3461,7 @@ impl App {
             let outcome = memory.on_paste(&text);
             return self.follow(outcome);
         }
-        if self.view.is_some() || self.showing_keys || self.confirm.is_some() {
+        if self.view.is_some() || self.showing_keys() || self.confirm.is_some() {
             return None;
         }
         if let Some(launcher) = &mut self.launcher {
@@ -4312,6 +4344,15 @@ fn answer_key(code: KeyCode) -> Option<Answer> {
         KeyCode::Char('y') => Some(Answer::Allow),
         KeyCode::Char('n') => Some(Answer::Deny),
         KeyCode::Char('Y') => Some(Answer::Always),
+        _ => None,
+    }
+}
+
+/// Which way a key turns the list of keys' pages: on, or back.
+fn page_turn(code: KeyCode) -> Option<isize> {
+    match code {
+        KeyCode::Right | KeyCode::PageDown | KeyCode::Char(' ' | 'l') => Some(1),
+        KeyCode::Left | KeyCode::PageUp | KeyCode::Char('h') => Some(-1),
         _ => None,
     }
 }
@@ -6865,6 +6906,26 @@ mod tests {
             Some(&Confirm::Kill("a".into())),
             "the question is still asked"
         );
+    }
+
+    #[test]
+    fn the_arrows_turn_the_keys_pages_round_and_round() {
+        let mut app = app_with(&["a"]);
+        press(&mut app, KeyCode::Char('?'));
+        let pages = app.keys_pages();
+        assert!(pages > 1, "80 by 24 takes more than a page");
+        press(&mut app, KeyCode::Right);
+        assert_eq!(app.keys_page(), 1);
+        press(&mut app, KeyCode::Left);
+        press(&mut app, KeyCode::Left);
+        assert_eq!(
+            app.keys_page(),
+            pages - 1,
+            "back from the first is the last"
+        );
+        assert!(app.showing_keys());
+        assert_eq!(press(&mut app, KeyCode::Char('q')), None);
+        assert!(!app.showing_keys());
     }
 
     #[test]

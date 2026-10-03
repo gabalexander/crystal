@@ -468,7 +468,7 @@ pub fn draw(frame: &mut Frame, app: &App, panes: &[Pane], overlay: Option<&Pane>
             plugin_on: &plugin_on,
             plugin_keys: &plugin_keys,
         };
-        help::draw(frame, look.theme, frame.area(), &shown);
+        help::draw(frame, look.theme, frame.area(), &shown, app.keys_page());
     }
 }
 
@@ -1650,18 +1650,16 @@ mod tests {
     }
 
     #[test]
-    fn the_keys_overlay_draws_over_an_80_by_24_screen() {
+    fn the_keys_overlay_draws_over_an_80_by_24_screen_a_page_at_a_time() {
         let mut app = App::new(None);
         app.on_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
         let text = screen_text_at(&app, 80, 24).join("\n");
-        let expected = [
-            "In the sidebar",
-            "In a pane",
-            "Ctrl+\\",
-            "With the mouse",
-            "any key closes this",
-        ];
-        for on_screen in expected {
+        for on_screen in ["In the sidebar", "select a session", "1/2 · ← → turn"] {
+            assert!(text.contains(on_screen), "{on_screen} isn't on screen");
+        }
+        app.on_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        let text = screen_text_at(&app, 80, 24).join("\n");
+        for on_screen in ["In a pane", "Ctrl+\\", "With the mouse", "2/2"] {
             assert!(text.contains(on_screen), "{on_screen} isn't on screen");
         }
     }

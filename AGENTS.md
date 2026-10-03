@@ -75,8 +75,9 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   - `status.rs`: a session's status as the TUI shows it, and its mark
   - `theme.rs`: every color, named for what it's for: `dark`, `light`, `terminal`, and none for `NO_COLOR`
   - `mouse.rs`: writes mouse events the way a program in a pane asked for them
-  - `help.rs`: the overlay `?` opens, drawn from one table of every key, its sections put in two columns to
-    fit the terminal; a test keeps the README's table of sidebar keys in step with it
+  - `help.rs`: the overlay `?` opens, drawn from one table of every key, a key a row: its sections flowed
+    into columns as tall as the terminal, two to a page, the pages turned with the arrows; a test keeps the
+    README's table of sidebar keys in step with it
   - `groups.rs`: the sidebar's order and headings: sessions by project, then worktree, agents before
     terminals, each flow run's steps under it, and linked worktrees with no sessions left at the end of
     their project

@@ -50,26 +50,45 @@ pub struct Key {
 
 /// Every key the TUI takes, in the order the overlay lists them.
 pub const KEYS: &[Key] = &[
-    sidebar("j/k ↓/↑ /", "select a session / find"),
+    sidebar("j/k ↓/↑", "select a session"),
+    sidebar("/", "find a session"),
     sidebar("Enter", "type into it, or rerun"),
     sidebar("Tab/Shift+Tab", "next / previous pane"),
     sidebar("Shift+arrows", "the pane that way"),
-    sidebar("s |/- z/v", "split / zoom / copy"),
-    sidebar("F H/J/K/L R", "float / move / resize"),
-    sidebar("PgUp/PgDn e", "page / edit its history"),
+    sidebar("s", "split it off, or close it"),
+    sidebar("|/-", "split side by side / below"),
+    sidebar("z", "zoom its pane"),
+    sidebar("F", "float it over the panes"),
+    sidebar("H/J/K/L", "swap its pane that way"),
+    sidebar("R", "resize the panes"),
+    sidebar("v", "copy mode"),
+    sidebar("PgUp/PgDn", "page through its history"),
+    sidebar("e", "edit its history"),
     sidebar("t/T/&", "tab: new / name / close"),
-    sidebar("[/] 1-9 > S", "tabs / move it / layouts"),
+    sidebar("[/] 1-9", "switch tabs"),
+    sidebar(">", "move it to another tab"),
+    sidebar("S", "saved layouts"),
     sidebar("n/w", "new, or in a worktree"),
-    sidebar("r/x W", "rename, kill, rm worktree"),
-    of_plugin("tasks", "c y/n/Y", "close it / answer it"),
+    sidebar("W", "remove the worktree"),
+    sidebar("r/x", "rename / kill it"),
+    of_plugin("tasks", "c", "close its task"),
+    of_plugin("tasks", "y/n/Y", "answer what a task asks"),
     of_plugin("flows", "g/f", "flow: go on / send back"),
-    sidebar("u/U a", "next/all needing you, log"),
-    of_plugin("github", "o/O/i", "its PR / all PRs / issues"),
-    sidebar("d/p/E/G B", "diff/file/tree/grep/br"),
+    sidebar("u", "next needing you"),
+    sidebar("U", "all needing you"),
+    sidebar("a", "the timeline"),
+    of_plugin("github", "o/O", "its PR / all PRs"),
+    of_plugin("github", "i", "the project's issues"),
+    sidebar("d", "what changed: the diff"),
+    sidebar("p", "find a file"),
+    sidebar("E", "the files as a tree"),
+    sidebar("G", "find in files"),
+    sidebar("B", "switch branches"),
     of_plugin("backlog", "b", "the project's backlog"),
     of_plugin("memory", "m", "what it has remembered"),
     of_plugin("profiles", "P", "your agent profiles"),
-    sidebar("?/X/,/q", "keys/plugins/options/quit"),
+    sidebar("X/,", "plugins / settings"),
+    sidebar("?/q", "keys / quit"),
     in_pane("Ctrl+\\", "back to the sidebar"),
     in_pane("Shift+PgUp", "page back"),
     in_pane("Shift+PgDn", "page forward"),
@@ -77,6 +96,7 @@ pub const KEYS: &[Key] = &[
     in_pane("Ctrl+C", "stop a task's run"),
     question("y", "yes; any other key, no"),
     question("Enter/Esc", "answer / cancel"),
+    question("Ctrl+U", "clear the answer"),
     new_session("Tab ←/→", "next row, choose"),
     new_session("↑/↓", "earlier tasks"),
     new_session("Alt+Enter", "new line in the task"),
@@ -132,27 +152,22 @@ pub struct Shown<'a> {
 }
 
 /// A row of the overlay: a key, or a few, and what it does.
+#[derive(Debug, PartialEq, Eq)]
 struct Row {
     section: Section,
     label: String,
     does: String,
 }
 
-/// The overlay's left column: the sidebar's keys.
-const LEFT: &[Section] = &[Section::Sidebar, Section::Plugins];
-
-/// The overlay's right column: everything else.
-const RIGHT: &[Section] = &[
+/// The order the sections are listed in, page after page.
+const ORDER: &[Section] = &[
+    Section::Sidebar,
+    Section::Plugins,
     Section::Pane,
     Section::Question,
     Section::NewSession,
     Section::Mouse,
 ];
-
-/// The sections left out, in this order, when there isn't room for them
-/// all: what the new-session panel's own footer says, then how to answer
-/// a question, which the question says.
-const LEFT_OUT_FIRST: &[Section] = &[Section::NewSession, Section::Question];
 
 /// Space between the two columns.
 const GAP: u16 = 2;
@@ -160,17 +175,36 @@ const GAP: u16 = 2;
 /// Columns kept clear on each side of the overlay, inside its edge.
 const SIDE: u16 = 2;
 
-/// Draws the overlay over the middle of `area`: a panel of the theme's
-/// own, or, where the theme paints nothing, a thin frame.
-pub fn draw(frame: &mut Frame, theme: &Theme, area: Rect, shown: &Shown) {
+/// A line of a column: a section's heading, the blank line before a
+/// heading that isn't the first, or a key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Entry<'a> {
+    Heading(Section),
+    Blank,
+    Key(&'a Row),
+}
+
+/// What one page of the overlay shows: a column, and another beside it
+/// when both fit.
+struct Page<'a> {
+    left: Vec<Entry<'a>>,
+    right: Vec<Entry<'a>>,
+}
+
+/// How many pages the overlay takes to list every key in `area`.
+pub fn page_count(shown: &Shown, area: Rect) -> usize {
+    paged(&rows(shown), area).len()
+}
+
+/// Draws page `page` of the overlay over the middle of `area`: a panel of
+/// the theme's own, or, where the theme paints nothing, a thin frame.
+pub fn draw(frame: &mut Frame, theme: &Theme, area: Rect, shown: &Shown, page: usize) {
     let rows = rows(shown);
-    // The footer keeps the bottom row, and the overlay's title and how to
-    // close it take one each.
-    let room = usize::from(area.height.saturating_sub(3));
-    let (left, right) = columns(&rows, room);
-    let left = column(&left, &rows, theme);
-    let right = column(&right, &rows, theme);
-    let (width, height) = size(&left, &right);
+    let pages = paged(&rows, area);
+    let page = page.min(pages.len() - 1);
+    let left = lines(&pages[page].left, theme);
+    let right = lines(&pages[page].right, theme);
+    let (width, height) = size(&pages[page]);
     let overlay = centered(area, width, height);
 
     frame.render_widget(Clear, overlay);
@@ -181,13 +215,14 @@ pub fn draw(frame: &mut Frame, theme: &Theme, area: Rect, shown: &Shown) {
         Block::new()
     };
     let title = Style::new().fg(theme.accent).add_modifier(Modifier::BOLD);
+    let closing = match pages.len() {
+        1 => " any key closes this ".to_string(),
+        count => format!(" {}/{count} · ← → turn · any other key closes ", page + 1),
+    };
     let block = block
         .style(Style::new().bg(theme.panel).fg(theme.text))
         .title(Line::styled(" keys ", title))
-        .title_bottom(Line::styled(
-            " any key closes this ",
-            Style::new().fg(theme.muted),
-        ));
+        .title_bottom(Line::styled(closing, Style::new().fg(theme.muted)));
     // The title rows are kept either way; a frame takes a column a side of
     // the room around the columns.
     let margin = if framed { SIDE - 1 } else { SIDE };
@@ -204,41 +239,61 @@ pub fn draw(frame: &mut Frame, theme: &Theme, area: Rect, shown: &Shown) {
     frame.render_widget(Paragraph::new(right), right_area);
 }
 
-/// Which sections go in each column to fit `room` lines: the sidebar's
-/// keys on the left, with the plugins' under them while they fit, and
-/// everything else on the right. When the left is too long, the plugins'
-/// keys start the right column instead; when the right is too long then,
-/// the sections [`LEFT_OUT_FIRST`] names are left out until it fits.
-fn columns(rows: &[Row], room: usize) -> (Vec<Section>, Vec<Section>) {
-    let lines = |sections: &[Section]| column_lines(sections, rows);
-    let mut left = LEFT.to_vec();
-    let mut right = RIGHT.to_vec();
-    if lines(&left) > room {
-        left.retain(|section| *section != Section::Plugins);
-        right.insert(0, Section::Plugins);
+/// The overlay's pages in `area`: the keys flowed into columns as tall as
+/// it leaves room for, two to a page where both fit its width.
+fn paged(rows: &[Row], area: Rect) -> Vec<Page<'_>> {
+    // The footer keeps the bottom row, and the overlay's title and how to
+    // close it take one each.
+    let room = usize::from(area.height.saturating_sub(3));
+    let mut columns = flow(rows, room).into_iter().peekable();
+    let mut pages = Vec::new();
+    while let Some(left) = columns.next() {
+        let fits = |right: &Vec<Entry>| {
+            let both = Page {
+                left: left.clone(),
+                right: right.clone(),
+            };
+            size(&both).0 <= area.width
+        };
+        let right = columns.next_if(fits).unwrap_or_default();
+        pages.push(Page { left, right });
     }
-    for section in LEFT_OUT_FIRST {
-        if lines(&right) <= room {
-            break;
-        }
-        right.retain(|kept| kept != section);
-    }
-    (left, right)
+    pages
 }
 
-/// How many lines a column of `sections` takes: see [`column`].
-fn column_lines(sections: &[Section], rows: &[Row]) -> usize {
-    let shown: Vec<Section> = sections
-        .iter()
-        .copied()
-        .filter(|section| rows.iter().any(|row| row.section == *section))
-        .collect();
-    let keys = rows
-        .iter()
-        .filter(|row| shown.contains(&row.section))
-        .count();
-    // Each section's heading, and a blank line between sections.
-    keys + shown.len() + shown.len().saturating_sub(1)
+/// The keys in columns of no more than `room` lines, in [`ORDER`]. A
+/// section that doesn't fit what's left of a column starts the next one,
+/// and only one too long for a whole column is split, going on in the next
+/// under its heading again.
+fn flow(rows: &[Row], room: usize) -> Vec<Vec<Entry<'_>>> {
+    // A heading and a key, however small the terminal.
+    let room = room.max(2);
+    let mut columns: Vec<Vec<Entry>> = vec![Vec::new()];
+    for &section in ORDER {
+        let keys: Vec<&Row> = rows.iter().filter(|row| row.section == section).collect();
+        let mut keys = keys.as_slice();
+        while let Some(column) = columns.last_mut()
+            && !keys.is_empty()
+        {
+            let blank = usize::from(!column.is_empty());
+            // How many keys fit under the heading, here.
+            let free = room.saturating_sub(column.len() + blank + 1);
+            let fits_a_column = keys.len() < room;
+            if !column.is_empty() && (free == 0 || free < keys.len() && fits_a_column) {
+                columns.push(Vec::new());
+                continue;
+            }
+            if blank == 1 {
+                column.push(Entry::Blank);
+            }
+            column.push(Entry::Heading(section));
+            let fits = (room - column.len()).min(keys.len());
+            column.extend(keys[..fits].iter().map(|row| Entry::Key(row)));
+            keys = &keys[fits..];
+        }
+    }
+    columns.retain(|column| !column.is_empty());
+    columns
 }
 
 /// Every row the overlay shows: crystal's keys, but those of plugins that
@@ -260,43 +315,65 @@ fn rows(shown: &Shown) -> Vec<Row> {
     own.chain(plugins).collect()
 }
 
-/// The lines of one column: each section's heading, then its keys, with
-/// the keys lined up and a blank line between sections. A section with no
-/// keys isn't shown.
-fn column(sections: &[Section], rows: &[Row], theme: &Theme) -> Vec<Line<'static>> {
-    let rows: Vec<&Row> = rows
+/// The widest key label in `column`, which the others are padded out to.
+fn label_width(column: &[Entry]) -> usize {
+    column
         .iter()
-        .filter(|row| sections.contains(&row.section))
-        .collect();
-    let label_width = rows.iter().map(|row| width(&row.label)).max().unwrap_or(0);
-
-    let mut lines = Vec::new();
-    for &section in sections {
-        if !rows.iter().any(|row| row.section == section) {
-            continue;
-        }
-        if !lines.is_empty() {
-            lines.push(Line::from(""));
-        }
-        let heading = Style::new().fg(theme.text).add_modifier(Modifier::BOLD);
-        lines.push(Line::styled(section.heading(), heading));
-        for row in rows.iter().filter(|row| row.section == section) {
-            let padding = " ".repeat(label_width - width(&row.label) + 2);
-            lines.push(Line::from(vec![
-                Span::styled(row.label.clone(), Style::new().fg(theme.accent)),
-                Span::raw(padding),
-                Span::styled(row.does.clone(), Style::new().fg(theme.text)),
-            ]));
-        }
-    }
-    lines
+        .filter_map(|entry| match entry {
+            Entry::Key(row) => Some(width(&row.label)),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0)
 }
 
-/// The overlay's size: both columns side by side, the room on each side,
-/// and a row above and below for its title and how to close it.
-fn size(left: &[Line], right: &[Line]) -> (u16, u16) {
-    let width = SIDE * 2 + widest(left) + GAP + widest(right);
-    let height = 2 + left.len().max(right.len()) as u16;
+/// How many columns `column` takes on screen, its keys lined up.
+fn column_width(column: &[Entry]) -> u16 {
+    let labels = label_width(column);
+    let widest = column
+        .iter()
+        .map(|entry| match entry {
+            Entry::Heading(section) => width(section.heading()),
+            Entry::Blank => 0,
+            Entry::Key(row) => labels + 2 + width(&row.does),
+        })
+        .max()
+        .unwrap_or(0);
+    widest as u16
+}
+
+/// The lines of one column: the headings in bold, and the keys lined up
+/// after them.
+fn lines(column: &[Entry], theme: &Theme) -> Vec<Line<'static>> {
+    let labels = label_width(column);
+    let heading = Style::new().fg(theme.text).add_modifier(Modifier::BOLD);
+    column
+        .iter()
+        .map(|entry| match entry {
+            Entry::Heading(section) => Line::styled(section.heading(), heading),
+            Entry::Blank => Line::from(""),
+            Entry::Key(row) => {
+                let padding = " ".repeat(labels - width(&row.label) + 2);
+                Line::from(vec![
+                    Span::styled(row.label.clone(), Style::new().fg(theme.accent)),
+                    Span::raw(padding),
+                    Span::styled(row.does.clone(), Style::new().fg(theme.text)),
+                ])
+            }
+        })
+        .collect()
+}
+
+/// A page's size: its columns side by side, the room on each side, and a
+/// row above and below for its title and how to close it.
+fn size(page: &Page) -> (u16, u16) {
+    let right = if page.right.is_empty() {
+        0
+    } else {
+        GAP + column_width(&page.right)
+    };
+    let width = SIDE * 2 + column_width(&page.left) + right;
+    let height = 2 + page.left.len().max(page.right.len()) as u16;
     (width, height)
 }
 
@@ -399,6 +476,21 @@ mod tests {
         })
     }
 
+    /// An 80 by 24 terminal.
+    const SMALL: Rect = Rect::new(0, 0, 80, 24);
+
+    /// Every key on every page, in order.
+    fn keys_on(pages: &[Page]) -> Vec<String> {
+        pages
+            .iter()
+            .flat_map(|page| page.left.iter().chain(&page.right))
+            .filter_map(|entry| match entry {
+                Entry::Key(row) => Some(format!("{} {}", row.label, row.does)),
+                _ => None,
+            })
+            .collect()
+    }
+
     #[test]
     fn the_keys_of_a_plugin_thats_off_arent_listed() {
         let on_but_memory = |plugin: &str| plugin != "memory";
@@ -410,15 +502,17 @@ mod tests {
         let labels: Vec<&str> = rows.iter().map(|row| row.label.as_str()).collect();
         assert!(!labels.contains(&"m"), "{labels:?}");
         assert!(labels.contains(&"b"), "{labels:?}");
-        let text: Vec<String> = column(LEFT, &rows, &theme())
+        let pages = paged(&rows, SMALL);
+        let headings: Vec<Section> = pages
             .iter()
-            .map(|line| line.to_string())
+            .flat_map(|page| page.left.iter().chain(&page.right))
+            .filter_map(|entry| match entry {
+                Entry::Heading(section) => Some(*section),
+                _ => None,
+            })
             .collect();
-        assert!(text.contains(&"Your plugins".to_string()), "{text:?}");
-        assert!(
-            text.iter()
-                .any(|line| line.starts_with("N ") && line.ends_with("notes: add a note"))
-        );
+        assert!(headings.contains(&Section::Plugins), "{headings:?}");
+        assert!(keys_on(&pages).contains(&"N notes: add a note".to_string()));
     }
 
     #[test]
@@ -431,27 +525,6 @@ mod tests {
                     "{part} isn't kept from plugins"
                 );
             }
-        }
-    }
-
-    #[test]
-    fn the_overlay_fits_an_80_by_24_terminal() {
-        let rows = all_rows();
-        let (width, height) = size(
-            &column(LEFT, &rows, &theme()),
-            &column(RIGHT, &rows, &theme()),
-        );
-        assert!(width <= 80, "the overlay is {width} columns wide");
-        // The footer keeps the bottom row.
-        assert!(height <= 23, "the overlay is {height} rows high");
-    }
-
-    #[test]
-    fn a_column_is_as_long_as_it_says() {
-        let rows = all_rows();
-        for sections in [LEFT, RIGHT] {
-            let lines = column(sections, &rows, &theme()).len();
-            assert_eq!(column_lines(sections, &rows), lines);
         }
     }
 
@@ -468,52 +541,92 @@ mod tests {
     }
 
     #[test]
-    fn with_room_the_plugins_keys_go_under_the_sidebars_and_nothing_is_left_out() {
-        let rows = rows_with_installed(2);
-        let (left, right) = columns(&rows, 40);
-        assert_eq!(left, LEFT);
-        assert_eq!(right, RIGHT);
-    }
-
-    #[test]
-    fn at_80_by_24_installed_plugins_keys_are_still_shown() {
-        // 24 rows leave 21 for the columns.
-        for installed in 1..=4 {
-            let rows = rows_with_installed(installed);
-            let (left, right) = columns(&rows, 21);
-            assert!(right.contains(&Section::Plugins), "{installed}: {right:?}");
-            assert!(column_lines(&left, &rows) <= 21);
-            assert!(column_lines(&right, &rows) <= 21, "{installed}: {right:?}");
-            assert!(right.contains(&Section::Pane) && right.contains(&Section::Mouse));
-            assert!(!right.contains(&Section::NewSession));
+    fn every_page_fits_an_80_by_24_terminal() {
+        for installed in 0..=8 {
+            for page in paged(&rows_with_installed(installed), SMALL) {
+                let (width, height) = size(&page);
+                assert!(width <= 80, "a page is {width} columns wide");
+                // The footer keeps the bottom row.
+                assert!(height <= 23, "a page is {height} rows high");
+            }
         }
-        // With more, how to answer a question goes too.
-        let rows = rows_with_installed(8);
-        let (_, right) = columns(&rows, 21);
-        assert_eq!(right, [Section::Plugins, Section::Pane, Section::Mouse]);
     }
 
     #[test]
-    fn every_section_is_in_a_column() {
+    fn every_key_is_on_a_page_once() {
+        for installed in [0, 3, 8] {
+            let rows = rows_with_installed(installed);
+            let listed: Vec<String> = ORDER
+                .iter()
+                .flat_map(|section| rows.iter().filter(|row| row.section == *section))
+                .map(|row| format!("{} {}", row.label, row.does))
+                .collect();
+            assert_eq!(keys_on(&paged(&rows, SMALL)), listed);
+        }
+    }
+
+    #[test]
+    fn with_room_every_key_is_on_one_page() {
+        let rows = all_rows();
+        let pages = paged(&rows, Rect::new(0, 0, 200, 80));
+        assert_eq!(pages.len(), 1);
+    }
+
+    #[test]
+    fn a_narrow_terminal_shows_a_column_a_page() {
+        let rows = all_rows();
+        let pages = paged(&rows, Rect::new(0, 0, 45, 24));
+        assert!(pages.len() > 2);
+        assert!(pages.iter().all(|page| page.right.is_empty()));
+    }
+
+    #[test]
+    fn a_section_too_long_for_a_column_goes_on_under_its_heading() {
+        let rows = all_rows();
+        let columns = flow(&rows, 21);
+        assert_eq!(columns[0][0], Entry::Heading(Section::Sidebar));
+        assert_eq!(columns[1][0], Entry::Heading(Section::Sidebar));
+    }
+
+    #[test]
+    fn a_short_section_isnt_split_and_no_heading_ends_a_column() {
+        let rows = all_rows();
+        for room in 3..40 {
+            for column in flow(&rows, room) {
+                assert!(column.len() <= room, "{room}: {column:?}");
+                let last = column.last();
+                assert!(matches!(last, Some(Entry::Key(_))), "{room}: {column:?}");
+            }
+        }
+        // At 80 by 24 the mouse's three keys go together.
+        let columns = flow(&rows, 21);
+        let mouse_headings = columns
+            .iter()
+            .flatten()
+            .filter(|entry| **entry == Entry::Heading(Section::Mouse))
+            .count();
+        assert_eq!(mouse_headings, 1);
+    }
+
+    #[test]
+    fn every_section_is_listed() {
         for key in KEYS {
-            assert!(
-                LEFT.contains(&key.section) || RIGHT.contains(&key.section),
-                "{} isn't shown",
-                key.label
-            );
+            assert!(ORDER.contains(&key.section), "{} isn't shown", key.label);
         }
     }
 
     #[test]
     fn a_key_label_lines_up_with_the_others() {
-        let lines = column(LEFT, &all_rows(), &theme());
-        // Heading first, then `j/k ↓/↑ /`, padded out to `Tab/Shift+Tab`.
+        let rows = all_rows();
+        let columns = flow(&rows, 21);
+        let lines = lines(&columns[0], &theme());
+        // Heading first, then `j/k ↓/↑`, padded out to `Tab/Shift+Tab`.
         let first: String = lines[1]
             .spans
             .iter()
             .map(|span| span.content.as_ref())
             .collect();
-        let padded = format!("{:<15}select a session / find", "j/k ↓/↑ /");
+        let padded = format!("{:<15}select a session", "j/k ↓/↑");
         assert_eq!(first, padded);
     }
 }
