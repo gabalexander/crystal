@@ -54,7 +54,10 @@ is: it's the one request every version must understand.
     table of sidebar keys in step with it
   - `groups.rs`: the sidebar's order and headings: sessions by project, then worktree
   - `text_input.rs`: a one-line text box, for the questions asked on the bottom line
-  - `command_line.rs`: reads the line typed at `new session:` into the command to run
+  - `text_area.rs`: a text box of several lines that wrap: the new-session panel's task
+  - `launcher.rs`: the new-session panel (`n`, `w`): its state and keys, kept apart from I/O, the command
+    it builds, what it remembers between runs, and its drawing
+  - `command_line.rs`: reads the line typed at `new session:` (the panel's `Ctrl+E`) into the command to run
   - `search.rs`: `/`'s matching: a session's name, project, branch or command, letters in order
   - `issues.rs`: the issues view `i` opens: its state, kept apart from I/O, and its drawing
   - `pane.rs`: a viewer of a session on screen, the selected one or a split, and its screen
@@ -68,6 +71,8 @@ is: it's the one request every version must understand.
     preview off the event loop
 - `src/daemon.rs`: the daemon: listens on the socket and owns the sessions
 - `src/agents.rs`: what crystal knows about particular agents: the hooks it adds to Claude Code, and what they mean
+- `src/catalog.rs`: the agents the new-session panel offers: their names, how each takes a first prompt, their
+  options, and which are installed
 - `src/codex.rs`: what crystal knows about Codex: finding a session's conversation in its rollouts, and
   `codex resume`
 - `src/hook.rs`: `crystal hook <agent>`: what those hooks run, to tell the daemon
@@ -81,7 +86,7 @@ is: it's the one request every version must understand.
 - `src/protocol.rs`: requests and responses, one JSON line each, and the frames an attached client sends
 - `src/socket.rs`: where the socket lives
 - `src/state.rs`: the running sessions, written down to start them again after a restart
-- `src/config.rs`: the settings in `~/.config/crystal/config.toml`
+- `src/config.rs`: the settings in `~/.config/crystal/config.toml`, presets included
 - `src/notify.rs`: telling the user when a session needs them: desktop notifications, or their own command
 - `src/env.rs`: the environment a session's program starts with
 - `src/git.rs`: a directory's project, worktree and branch, and making and removing worktrees (runs `git`)
@@ -89,4 +94,5 @@ is: it's the one request every version must understand.
   never the real one
 - `src/shell.rs`: quoting arguments and writing paths with `~`, the way a shell reads them
 - `tests/cli.rs`: end-to-end tests that drive the real binary against a private daemon, with a config of
-  their own that turns notifications off
+  their own that turns notifications off; a test that opens the new-session panel pins `PATH` to its fake
+  agents, so no real agent is found or run

@@ -86,8 +86,8 @@ you are and offers the keys that matter there.
 | `s` | split the selected session off into a pane of its own, or close its split |
 | `Tab` / `Shift+Tab` | type into the next pane, or the one before |
 | `PageUp` / `PageDown` | page the selected session's pane back through its history, or forward to live |
-| `n` | ask what to run, then start it in a new session beside the selected one, and type into it |
-| `w` | ask for a branch, then what to run in a new worktree on it, and type into it |
+| `n` | start a new session from [the new-session panel](#starting-a-session), and type into it |
+| `w` | the same, in a new worktree on a branch named after the task |
 | `W` | remove the selected session's worktree, once nothing runs in it and you've said `y` |
 | `r` | rename the selected session |
 | `x` | kill the selected session, once you've said `y` |
@@ -114,11 +114,6 @@ moves the selection over the sidebar, and scrolls a pane through its history. A 
 mouse itself, like `vim` with `set mouse=a` or `htop`, gets the clicks, drags and the wheel in its pane while
 that pane has the keyboard. Since crystal takes the mouse, your terminal's own text selection needs a key held:
 `Shift` in most terminals, `Option` in iTerm2 and Terminal on macOS.
-
-`n` asks on the bottom line, `new session:`, starting out with the command you used last, at first `claude`.
-For an agent, the rest of the line is its first prompt: `claude fix the login bug` starts Claude on that.
-Anything else runs as a shell would run it, so `npm run dev` or `sh -c 'make && make test'` work too, and an
-empty line (`Ctrl+U` clears it) starts your shell.
 
 A split keeps a session on screen while the selection moves on: up to two of them, beside the selected
 session's pane when each pane can be at least 80 columns wide, and stacked below it when not. Each pane's
@@ -176,10 +171,10 @@ project and then once a minute, so your login works as it always does and crysta
 `gh`, or logged out of it, or for a project that isn't on GitHub, nothing is shown; `o` and `i` say why.
 
 `i` lists the open issues of the selected session's project, the latest to change first, with the selected
-issue's text under the list. Typing filters them by number, title, label or author. `Enter` on one asks for a
-branch named after it, like `42-fix-login-redirect`, for a new worktree, then what to run there, starting out
-with `claude Fix issue #42: <its title> (<its address>)`, so the agent knows which issue and can read it with
-`gh issue view 42`. `Esc` closes the list.
+issue's text under the list. Typing filters them by number, title, label or author. `Enter` on one opens the
+[new-session panel](#starting-a-session) on a new worktree with a branch named after it, like
+`42-fix-login-redirect`, and the task `Fix issue #42: <its title> (<its address>)`, so the agent knows which
+issue and can read it with `gh issue view 42`. `Esc` closes the list.
 
 Everything is also a command, for scripts and for agents:
 
@@ -238,6 +233,33 @@ the sessions that were running again, in the same directories. Claude Code and C
 conversation they were in. `crystal kill-server` is asked to stop everything, so after it nothing comes back.
 The list is kept in `~/.local/state/crystal/sessions.json`, without the sessions' environment variables, since
 those can hold secrets; a session started again gets the environment of whoever started the daemon again.
+
+### Starting a session
+
+`n` opens the new-session panel over the panes, titled with where the session will start: `New session ·
+payments ⌂ main`. Type what the agent should do and press `Enter`; the task is its first prompt, given as one
+argument. `Alt+Enter` starts a new line, and a paste keeps its lines. An empty task starts the agent with no
+prompt. `↑` on the first line and `↓` on the last bring back earlier tasks: the panel keeps the last 100, in
+`launcher.json` beside `sessions.json`.
+
+Under the task, `Tab` and `Shift+Tab` go from row to row and `←` / `→` change a row's choice:
+
+- **run**: your [presets](#presets), then the agents installed on your `PATH` (Claude Code, Codex, Gemini CLI,
+  OpenCode, Cursor, Aider), then your shell. What you started last is chosen the next time.
+- Claude Code's **model** and **permissions** (`--model`, `--permission-mode`), or Codex's **model** and
+  **approvals** (`-m`, `-a`), its models the ones `codex debug models` lists. Left at `default`, no option is
+  added.
+- **start in**: here (the selected session's worktree, or where you started `crystal`), a new worktree, or
+  another project's main worktree.
+
+A new worktree's **branch** is named after the task, its words in lowercase joined by `-`; type in that row to
+change it. With no task, `Enter` asks you to name it. `w` opens the panel with a new worktree chosen, and
+`Enter` on an issue opens it ready to fix that issue, on a branch named after it.
+
+The panel ends with the command it runs and, for a new worktree, where. `Ctrl+E` hands that command to the
+bottom line, `new session:`, to change it or run anything else: `npm run dev` or `sh -c 'make && make test'`
+work there, and an empty line starts your shell. Aider can't be given a task when it starts, so for it the
+task box gives way to a note.
 
 ### The diff
 
@@ -408,7 +430,7 @@ file and change. A setting crystal doesn't know is an error that names it, so a 
 |---|---|---|
 | `notify` | `true` | tell you when a session needs you |
 | `notify_command` | none | a shell command to run instead of the desktop notification |
-| `new_session` | `"claude"` | what the TUI's new-session line starts out with |
+| `new_session` | `"claude"` | what the new-session panel runs at first, until you start something from it |
 | `theme` | `"dark"` | the TUI's colors: `"dark"`, `"light"`, or `"terminal"` |
 
 `dark` and `light` paint their own background, so crystal looks the same in any terminal; `terminal` paints
@@ -422,8 +444,29 @@ nothing and uses your terminal's own colors. With `NO_COLOR` set, crystal uses n
 notify_command = 'curl -s -d "$CRYSTAL_NOTICE" ntfy.sh/my-crystal'
 ```
 
+`new_session` names an agent (`claude`, `codex`, …) or `shell`. With options, like `codex --full-auto`, it's
+offered as a preset of its own.
+
 The daemon reads the notification settings each time it tells you something, so a change counts straight
-away; the TUI reads `new_session` and `theme` when it starts.
+away; the TUI reads `new_session`, `theme` and the presets when it starts.
+
+#### Presets
+
+A preset is a way of starting an agent you use often, offered first in the new-session panel:
+
+```toml
+[[preset]]
+name = "review"                            # how the panel shows it
+agent = "claude"                           # claude, codex, gemini, opencode, cursor-agent or aider
+model = "opus"                             # optional: Claude Code's or Codex's model
+mode = "plan"                              # optional: Claude Code's permission mode, or Codex's approvals
+args = ["--verbose"]                       # optional: more options, after those
+prompt = "Review the diff on this branch." # optional: put before the task, a blank line between
+```
+
+`mode` is one of `acceptEdits`, `plan` or `bypassPermissions` for Claude Code, and `on-request` or `never` for
+Codex. A preset is shown only when its agent is installed. One that can't start, for an agent crystal doesn't
+know, with a mode that agent doesn't have, or with the name of another, is an error that says why.
 
 ## How it works
 
