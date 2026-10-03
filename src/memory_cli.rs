@@ -8,7 +8,7 @@ use crate::embed::{self, Embedder};
 use crate::env;
 use crate::events::{self, Event};
 use crate::git::Checkout;
-use crate::memory::{self, Added, Kind, Listed, Memory, New, Source, Store};
+use crate::memory::{self, Added, Entry, Freshness, Kind, Listed, Memory, New, Source, Store};
 use crate::protocol::{Request, Response};
 use crate::tui::sidebar::ago;
 use anyhow::{Result, bail};
@@ -28,15 +28,17 @@ pub fn remember(
     check_on()?;
     let dir = dir_or_current(dir)?;
     let project = memory::project_of(&dir);
+    let top = Checkout::find(&dir).map_or_else(|| dir.clone(), |c| c.worktree().path);
     let files = files
         .iter()
-        .map(|file| from_worktree_top(file, &dir))
+        .map(|file| from_top(file, &dir, &top))
         .collect();
     let new = New {
         kind,
         text: text.to_string(),
         files,
         source: source(socket),
+        checkout: Some(top),
     };
     match memory::add(socket, &project, new)? {
         Added::New(entry) => {
@@ -56,6 +58,28 @@ pub fn remember(
 pub fn list(socket: &Path, dir: Option<PathBuf>) -> Result<()> {
     let memory = read(socket, dir)?;
     print_entries(&memory.listed().iter().collect::<Vec<_>>());
+    Ok(())
+}
+
+/// Prints entry `id` in full.
+pub fn show(socket: &Path, dir: Option<PathBuf>, id: u64) -> Result<()> {
+    let memory = read(socket, dir)?;
+    let Some(entry) = memory.get(id) else {
+        bail!("there's no entry {id}");
+    };
+    let freshness = memory::freshness(entry, &memory.project);
+    println!("{}", in_full(entry, freshness, now()));
+    Ok(())
+}
+
+/// Prints the project's memory as markdown, newest first.
+pub fn export(socket: &Path, dir: Option<PathBuf>) -> Result<()> {
+    let memory = read(socket, dir)?;
+    let name = memory.project.file_name().unwrap_or_default();
+    print!(
+        "{}",
+        memory::markdown(&name.to_string_lossy(), &memory.listed())
+    );
     Ok(())
 }
 
@@ -100,7 +124,7 @@ pub fn found(
     let embedder = embed::shared_now();
     let mut store = Store::open(socket)?;
     let found = store.search(&project, query, kind, limit, embed::as_embed(&embedder))?;
-    Ok(memory::stale_last(found, &project))
+    Ok(memory::freshest_first(found, &project))
 }
 
 pub fn remove(socket: &Path, dir: Option<PathBuf>, id: u64) -> Result<()> {
@@ -213,39 +237,68 @@ fn source(socket: &Path) -> Source {
     }
 }
 
-/// `file`, given from `dir`, from the top of its worktree: the same in
-/// every worktree of the project. A file outside the worktree stays as it
-/// was given.
-fn from_worktree_top(file: &str, dir: &Path) -> String {
+/// `file`, given from `dir`, from `top`, the top of its worktree: the same
+/// in every worktree of the project. A file outside the worktree stays as
+/// it was given.
+fn from_top(file: &str, dir: &Path, top: &Path) -> String {
     let path = dir.join(file);
     let path = std::fs::canonicalize(&path).unwrap_or(path);
-    let top = Checkout::find(dir).map_or_else(|| dir.to_path_buf(), |c| c.worktree().path);
-    match path.strip_prefix(&top) {
+    match path.strip_prefix(top) {
         Ok(relative) => relative.to_string_lossy().into_owned(),
         Err(_) => file.to_string(),
     }
 }
 
 /// One line an entry: its id, kind and age, then its text, marked when
-/// it's stale.
+/// it's drifting or stale.
 fn print_entries(entries: &[&Listed]) {
     let now = now();
     for item in entries {
         let entry = &item.entry;
-        let stale = if item.stale { "  [stale]" } else { "" };
+        let mark = item.freshness.mark().map(|mark| format!("  [{mark}]"));
+        let mark = mark.unwrap_or_default();
         let files = if entry.files.is_empty() {
             String::new()
         } else {
             format!("  ({})", entry.files.join(", "))
         };
         println!(
-            "{:>4}  {:<8}  {:>4}  {}{files}{stale}",
+            "{:>4}  {:<8}  {:>4}  {}{files}{mark}",
             entry.id,
             entry.kind.to_string(),
             ago(entry.created, now),
             entry.text.split_whitespace().collect::<Vec<_>>().join(" "),
         );
     }
+}
+
+/// An entry in full, as `crystal memory show` and the `memory_show` tool
+/// give it: its id and kind, how it holds when it's drifting or stale, its
+/// text, its files, where it came from, and how often and how lately it
+/// was said.
+pub fn in_full(entry: &Entry, freshness: Freshness, now: u64) -> String {
+    let mut text = format!("{} · {}", entry.id, entry.kind);
+    match freshness {
+        Freshness::Fresh => {}
+        Freshness::Drifting => text.push_str(" · drifting: some of its files have changed since"),
+        Freshness::Stale => text.push_str(" · stale: the files it's about have changed since"),
+    }
+    text.push_str(&format!("\n\n{}\n", entry.text));
+    if !entry.files.is_empty() {
+        text.push_str(&format!("\nfiles: {}", entry.files.join(", ")));
+    }
+    text.push_str(&format!("\nfrom: {}", entry.source));
+    let times = if entry.seen == 1 {
+        "once".to_string()
+    } else {
+        format!("{} times", entry.seen)
+    };
+    text.push_str(&format!(
+        "\nadded {} ago; said {times}, last {} ago",
+        ago(entry.created, now),
+        ago(entry.last_seen, now)
+    ));
+    text
 }
 
 /// Asks `question` at the terminal, and says whether the answer was yes.

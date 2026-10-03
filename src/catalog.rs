@@ -172,8 +172,7 @@ pub const AGENTS: &[Agent] = &[
         program: "codex",
         name: "Codex",
         first_prompt: FirstPrompt::Argument,
-        // Codex adds these to the session as a developer message.
-        instructions: Instructions::Setting("developer_instructions"),
+        instructions: Instructions::Setting(crate::codex::INSTRUCTIONS),
         settings: &[
             Setting {
                 kind: Kind::Model,
@@ -277,11 +276,31 @@ pub fn first_prompt_in(command: &[String]) -> Option<String> {
     if agent.first_prompt != FirstPrompt::Argument {
         return None;
     }
+    argument_prompt_at(command).map(|at| command[at].clone())
+}
+
+/// Where in `command` its agent's first prompt is, for an agent crystal
+/// knows: after the option it takes one with, or for one that takes it as
+/// an argument, where [`first_prompt_in`] finds it. `None` when it has none.
+pub fn first_prompt_at(command: &[String]) -> Option<usize> {
+    match agent_of(command)?.first_prompt {
+        FirstPrompt::Argument => argument_prompt_at(command),
+        FirstPrompt::Option(option) => {
+            let at = command.iter().rposition(|arg| arg == option)? + 1;
+            (at < command.len()).then_some(at)
+        }
+        FirstPrompt::None => None,
+    }
+}
+
+/// Where the first prompt of an agent that takes it as an argument is, when
+/// that's plain to see: its only argument, or the last, after `--`.
+fn argument_prompt_at(command: &[String]) -> Option<usize> {
     let args = &command[1..];
     match args {
-        [prompt] if !prompt.starts_with('-') => Some(prompt.clone()),
+        [prompt] if !prompt.starts_with('-') => Some(1),
         _ => match args.iter().position(|arg| arg == "--") {
-            Some(at) if at + 2 == args.len() => Some(args[at + 1].clone()),
+            Some(at) if at + 2 == args.len() => Some(at + 2),
             _ => None,
         },
     }
@@ -387,6 +406,17 @@ mod tests {
         assert_eq!(prompt(&["claude", "--model", "opus", "fix it"]), None);
         assert_eq!(prompt(&["vim", "notes.md"]), None);
         assert_eq!(prompt(&["gemini", "-i", "fix it"]), None);
+    }
+
+    #[test]
+    fn a_first_prompt_is_found_after_its_option_too() {
+        let at = |args: &[&str]| first_prompt_at(&words(args));
+        assert_eq!(at(&["gemini", "-m", "pro", "-i", "fix it"]), Some(4));
+        assert_eq!(at(&["opencode", "--prompt", "fix it", "."]), Some(2));
+        assert_eq!(at(&["claude", "--model", "opus", "--", "fix it"]), Some(4));
+        assert_eq!(at(&["gemini", "-i"]), None);
+        assert_eq!(at(&["claude", "--model", "opus"]), None);
+        assert_eq!(at(&["aider", "--message", "fix it"]), None);
     }
 
     #[test]

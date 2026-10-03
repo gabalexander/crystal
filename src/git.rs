@@ -406,6 +406,30 @@ pub fn branch_start(dir: &Path) -> Result<(String, String)> {
     Ok((default, commit.trim().to_string()))
 }
 
+/// The files the worktree at `dir` has changed since its branch left the
+/// repository's default branch, committed or not, by their paths from its
+/// top. One git call when the clone knows `origin`'s default branch: the
+/// working tree against where the two branches meet.
+pub fn branch_changes(dir: &Path) -> Result<Vec<String>> {
+    let since = |base: &str| {
+        let args = [
+            "-c",
+            "core.quotePath=false",
+            "diff",
+            "--name-only",
+            "--no-ext-diff",
+            "--merge-base",
+            base,
+            "--",
+        ];
+        git(dir, &args)
+    };
+    let names = since("origin/HEAD")
+        .or_else(|_| since("main"))
+        .or_else(|_| since("master"))?;
+    Ok(lines(&names))
+}
+
 /// The branch the repository's work goes back into: `origin`'s, when the
 /// clone knows which that is, or else `main` or `master`.
 fn default_branch(dir: &Path) -> Result<String> {

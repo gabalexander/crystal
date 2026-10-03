@@ -12,7 +12,7 @@ use super::app::{Action, Hit, Loading, Outcome};
 use super::sidebar::{ago, fit};
 use super::text_input::TextInput;
 use super::ui::{self, Look, ViewAreas};
-use crate::memory::Listed;
+use crate::memory::{Freshness, Listed};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -366,7 +366,8 @@ fn draw_filter(frame: &mut Frame, view: &MemoryView, look: &Look, list: Rect) {
 }
 
 /// One row an entry: its kind, its text on one line, and how long ago it
-/// was added on the right. A stale entry is muted and says so.
+/// was added on the right. A drifting entry says so; a stale one is muted
+/// too.
 fn draw_list(frame: &mut Frame, view: &MemoryView, look: &Look, area: Rect) {
     let theme = look.theme;
     let shown = view.shown();
@@ -387,10 +388,14 @@ fn draw_list(frame: &mut Frame, view: &MemoryView, look: &Look, area: Rect) {
             frame.buffer_mut().set_style(line_area, theme.selection);
         }
         let age = ago(entry.created, now);
-        let stale = if item.stale { " stale" } else { "" };
+        let mark = item.freshness.mark().map(|mark| format!(" {mark}"));
+        let mark = mark.unwrap_or_default();
         let room = usize::from(area.width)
-            .saturating_sub(1 + KIND_WIDTH + age.chars().count() + stale.len() + 2);
-        let text_color = if item.stale { theme.muted } else { theme.text };
+            .saturating_sub(1 + KIND_WIDTH + age.chars().count() + mark.len() + 2);
+        let text_color = match item.freshness {
+            Freshness::Stale => theme.muted,
+            _ => theme.text,
+        };
         let line = Line::from(vec![
             Span::raw(" "),
             Span::styled(
@@ -404,7 +409,7 @@ fn draw_list(frame: &mut Frame, view: &MemoryView, look: &Look, area: Rect) {
         ]);
         frame.render_widget(line, line_area);
         let right = Line::from(vec![
-            Span::styled(stale, Style::new().fg(theme.waiting)),
+            Span::styled(mark, Style::new().fg(theme.waiting)),
             Span::styled(format!(" {age} "), Style::new().fg(theme.muted)),
         ]);
         frame.render_widget(right.right_aligned(), line_area);
@@ -412,7 +417,7 @@ fn draw_list(frame: &mut Frame, view: &MemoryView, look: &Look, area: Rect) {
 }
 
 /// The entry the bar is on, in full: its kind, when and from whom, the
-/// files it's about, whether it's stale, and its text.
+/// files it's about, whether it's drifting or stale, and its text.
 fn draw_entry(frame: &mut Frame, view: &MemoryView, look: &Look, area: Rect) {
     let theme = look.theme;
     let Some(item) = view.selected() else {
@@ -439,11 +444,18 @@ fn draw_entry(frame: &mut Frame, view: &MemoryView, look: &Look, area: Rect) {
             Style::new().fg(theme.branch),
         ));
     }
-    if item.stale {
-        lines.push(Line::styled(
-            " stale: a file it's about has changed since, so it may no longer hold",
-            Style::new().fg(theme.waiting),
-        ));
+    let holds = match item.freshness {
+        Freshness::Fresh => None,
+        Freshness::Drifting => Some(
+            " drifting: some of the files it's about have changed since, so it may hold only in \
+             part",
+        ),
+        Freshness::Stale => {
+            Some(" stale: the files it's about have changed since, so it may no longer hold")
+        }
+    };
+    if let Some(holds) = holds {
+        lines.push(Line::styled(holds, Style::new().fg(theme.waiting)));
     }
     lines.push(Line::raw(""));
     for text_line in entry.text.lines() {
@@ -475,8 +487,10 @@ mod tests {
                 created: 1_000,
                 seen: 1,
                 last_seen: 1_000,
+                anchors: Default::default(),
+                checkout: None,
             },
-            stale: false,
+            freshness: Freshness::Fresh,
         }
     }
 

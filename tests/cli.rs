@@ -897,15 +897,25 @@ fn codex_starts_with_the_model_chosen_and_the_task() {
     tui.shows("runs  codex -m gpt-test-mini -- 'add a");
     tui.type_keys("\r");
     tui.shows("▸ codex");
-    // Codex hears how to close its task at the end of its first prompt.
+    // Codex hears how to close its task in its developer instructions,
+    // ahead of what it was asked.
     let args = codex_args(&crystal);
-    assert_eq!(args[..4], ["-m", "gpt-test-mini", "--", "add a test"]);
-    assert!(args.last().unwrap().contains("crystal done"), "{args:?}");
-    assert!(
-        args.iter()
-            .any(|line| line.starts_with("You're running inside crystal")),
-        "{args:?}"
-    );
+    assert_eq!(args[0], "-c");
+    let model = args.iter().position(|arg| arg == "-m").unwrap();
+    let told = developer_instructions(&args[1..model].join("\n"));
+    assert!(told.starts_with("You're running inside crystal"), "{told}");
+    assert!(told.contains("crystal done"), "{told}");
+    assert_eq!(args[model..], ["-m", "gpt-test-mini", "--", "add a test"]);
+}
+
+/// The developer instructions a Codex `-c` setting gives, read the way
+/// Codex reads it: as TOML.
+fn developer_instructions(setting: &str) -> String {
+    let setting: toml::Table = toml::from_str(setting).unwrap();
+    setting["developer_instructions"]
+        .as_str()
+        .unwrap()
+        .to_string()
 }
 
 #[test]
@@ -3879,7 +3889,8 @@ fn claude_starts_with_what_its_project_remembered_in_its_system_prompt() {
         "gotcha",
         "The ledger tests need the database up",
     ]);
-    // About a file that isn't there, so stale: Claude isn't shown it.
+    // About a file that has changed since, so stale: Claude isn't shown it.
+    std::fs::write(repo.join("ledger.rs"), "fn round() {}").unwrap();
     crystal.ok(&[
         "remember",
         "-C",
@@ -3888,6 +3899,7 @@ fn claude_starts_with_what_its_project_remembered_in_its_system_prompt() {
         "ledger.rs",
         "Ledger rounding lives in ledger.rs",
     ]);
+    std::fs::write(repo.join("ledger.rs"), "fn round_down() {}").unwrap();
     let bin = fake_claude(crystal.dir.path());
     let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
     let out = crystal
@@ -3935,6 +3947,240 @@ fn claude_starts_with_what_its_project_remembered_in_its_system_prompt() {
         ]
     );
     assert_eq!(args[4], "--settings");
+}
+
+/// A stand-in for an agent crystal knows, `program`: it writes down the
+/// arguments it was started with in `args`, each ended by a NUL, since
+/// crystal's notes run over several lines, and waits. Returns the
+/// directory to put on the PATH.
+fn noting_agent(dir: &Path, program: &str) -> PathBuf {
+    let bin = dir.join(format!("{program}-bin"));
+    std::fs::create_dir(&bin).unwrap();
+    script(
+        &bin.join(program),
+        "printf '%s\\0' \"$@\" > args.new && mv args.new args\nsleep 30\n",
+    );
+    bin
+}
+
+/// The arguments a [`noting_agent`] started in `dir` was given.
+fn noted_args(dir: &Path) -> Vec<String> {
+    let file = dir.join("args");
+    eventually("the agent has started", || file.exists());
+    let args = std::fs::read_to_string(file).unwrap();
+    args.split_terminator('\0').map(String::from).collect()
+}
+
+#[test]
+fn codex_hears_what_its_project_remembered_in_its_developer_instructions() {
+    let (crystal, repo) = crystal_remembering();
+    let repo_dir = repo.to_str().unwrap();
+    crystal.ok(&[
+        "remember",
+        "-C",
+        repo_dir,
+        "-k",
+        "gotcha",
+        "The ledger tests need the database up",
+    ]);
+    let bin = noting_agent(crystal.dir.path(), "codex");
+    let out = crystal
+        .command(&[
+            "new",
+            "-n",
+            "coder",
+            "-c",
+            repo_dir,
+            "codex",
+            "-c",
+            "developer_instructions=\"Keep changes small.\"",
+            "--",
+            "fix the ledger tests",
+        ])
+        .env("PATH", path_of(&[&bin]))
+        .env("CODEX_HOME", crystal.dir.path().join("codex-home"))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Its own instructions, a profile's, then crystal's: its task, and
+    // what the memory has, with the commands that read the rest.
+    let args = noted_args(&repo);
+    assert_eq!(args[0], "-c");
+    let told = developer_instructions(&args[1]);
+    assert!(
+        told.starts_with("Keep changes small.\n\nYou're running inside crystal"),
+        "{told}"
+    );
+    assert!(told.contains("crystal done"), "{told}");
+    assert!(
+        told.contains("\n- 1 (gotcha) The ledger tests need the database up\n"),
+        "{told}"
+    );
+    assert!(told.contains("`crystal memory show <id>`"), "{told}");
+    assert_eq!(args[2..], ["--", "fix the ledger tests"]);
+}
+
+#[test]
+fn another_agent_hears_what_its_project_remembered_atop_its_first_prompt() {
+    let (crystal, repo) = crystal_remembering();
+    let repo_dir = repo.to_str().unwrap();
+    crystal.ok(&[
+        "remember",
+        "-C",
+        repo_dir,
+        "-k",
+        "gotcha",
+        "The ledger tests need the database up",
+    ]);
+    let bin = noting_agent(crystal.dir.path(), "gemini");
+    let out = crystal
+        .command(&[
+            "new",
+            "-n",
+            "helper",
+            "-c",
+            repo_dir,
+            "-t",
+            "fix the ledger tests",
+            "gemini",
+        ])
+        .env("PATH", path_of(&[&bin]))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let args = noted_args(&repo);
+    assert_eq!(args[0], "-i");
+    let prompt = &args[1];
+    assert!(
+        prompt.starts_with("You're running inside crystal"),
+        "{prompt}"
+    );
+    assert!(prompt.contains("crystal done"), "{prompt}");
+    assert!(
+        prompt.contains("\n- 1 (gotcha) The ledger tests need the database up\n"),
+        "{prompt}"
+    );
+    assert!(prompt.ends_with("\n\nfix the ledger tests"), "{prompt}");
+}
+
+#[test]
+fn what_its_worktree_changed_comes_first_in_what_an_agent_is_shown() {
+    let (crystal, repo) = crystal_remembering();
+    let repo_dir = repo.to_str().unwrap();
+    std::fs::write(repo.join("fees.rs"), "fn fee() {}").unwrap();
+    git(&repo, &["add", "fees.rs"]);
+    git(&repo, &["commit", "-q", "-m", "fees"]);
+    crystal.ok(&[
+        "remember",
+        "-C",
+        repo_dir,
+        "-f",
+        "fees.rs",
+        "Fees are kept in cents",
+    ]);
+    crystal.ok(&[
+        "remember",
+        "-C",
+        repo_dir,
+        "-k",
+        "gotcha",
+        "The refund tests need the ledger running",
+    ]);
+    // A worktree that has changed fees.rs, and not committed it yet.
+    let worktree = crystal.dir.path().join("app-fees");
+    let worktree_dir = worktree.to_str().unwrap();
+    git(
+        &repo,
+        &["worktree", "add", "-q", "-b", "fix/fees", worktree_dir],
+    );
+    std::fs::write(worktree.join("fees.rs"), "fn fee() { round() }").unwrap();
+
+    let bin = fake_claude(crystal.dir.path());
+    let out = crystal
+        .command(&[
+            "new",
+            "-n",
+            "agent",
+            "-c",
+            worktree_dir,
+            "claude",
+            "fix the refund tests",
+        ])
+        .env("PATH", path_of(&[&bin]))
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let args = written(&worktree.join("args"));
+    assert!(
+        args.contains(
+            "What this project's earlier sessions learned:\n\
+             - 1 (note) Fees are kept in cents [fees.rs]\n\
+             - 2 (gotcha) The refund tests need the ledger running\n"
+        ),
+        "{args}"
+    );
+}
+
+#[test]
+fn memory_marks_an_entry_drifting_and_shows_and_exports_it_in_full() {
+    let (crystal, repo) = crystal_remembering();
+    let repo_dir = repo.to_str().unwrap();
+    for file in ["a.rs", "b.rs"] {
+        std::fs::write(repo.join(file), file).unwrap();
+    }
+    crystal.ok(&[
+        "remember",
+        "-C",
+        repo_dir,
+        "-k",
+        "gotcha",
+        "-f",
+        "a.rs",
+        "-f",
+        "b.rs",
+        "Refunds wait for the ledger",
+    ]);
+    std::fs::write(repo.join("a.rs"), "changed").unwrap();
+
+    let listed = crystal.ok(&["memory", "-C", repo_dir]);
+    assert!(
+        listed.contains("Refunds wait for the ledger  (a.rs, b.rs)  [drifting]"),
+        "{listed}"
+    );
+    let shown = crystal.ok(&["memory", "-C", repo_dir, "show", "1"]);
+    assert!(
+        shown.starts_with(
+            "1 · gotcha · drifting: some of its files have changed since\n\n\
+             Refunds wait for the ledger\n"
+        ),
+        "{shown}"
+    );
+    assert!(
+        shown.contains("\nfiles: a.rs, b.rs\nfrom: you\n"),
+        "{shown}"
+    );
+    assert_eq!(
+        crystal.ok(&["memory", "-C", repo_dir, "export"]),
+        "# app memory\n\n## 1 · gotcha (drifting)\n\nRefunds wait for the ledger\n\n\
+         About `a.rs`, `b.rs`. From you.\n"
+    );
+
+    // Once all its files have changed, it's stale.
+    std::fs::write(repo.join("b.rs"), "changed").unwrap();
+    let listed = crystal.ok(&["memory", "-C", repo_dir]);
+    assert!(listed.contains("(a.rs, b.rs)  [stale]"), "{listed}");
+    let refused = crystal.fails(&["memory", "-C", repo_dir, "show", "7"]);
+    assert!(refused.contains("there's no entry 7"), "{refused}");
 }
 
 #[test]

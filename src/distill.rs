@@ -653,6 +653,7 @@ fn entry(item: &Value, checkout: &Path) -> Result<New, String> {
         files,
         // Who it's from is the pass's to say.
         source: Source::User,
+        checkout: Some(checkout.to_path_buf()),
     })
 }
 

@@ -4,6 +4,7 @@
 
 use crate::agents;
 use crate::backlog;
+use crate::catalog;
 use crate::codex;
 use crate::config::{Config, MemorySettings};
 use crate::db::Db;
@@ -1039,7 +1040,7 @@ impl Daemon {
                 let found =
                     store.search(&project, &query, kind, limit, embed::as_embed(&embedder))?;
                 Ok(Response::Memory {
-                    entries: memory::stale_last(found, &project),
+                    entries: memory::freshest_first(found, &project),
                 })
             }
             Request::Tasks { dir, all } => {
@@ -1766,7 +1767,6 @@ fn start(
     let resume = conversation
         .as_ref()
         .map(|conversation| conversation.id.as_str());
-    let mut asked = command.clone();
     // What it was started to do: a conversation picked up again has been
     // asked that already, whether tasks are on or off.
     let given_task = task.clone();
@@ -1774,29 +1774,19 @@ fn start(
     // session.
     let config = settings();
     let task = task.filter(|_| tasks::enabled(&config));
-    let mut about_task = None;
-    if let Some(goal) = &task {
-        let paragraph = tasks::instructions(backlog::enabled(&config));
-        // Codex has no system prompt to add to, so it hears it at the end
-        // of what it's asked to do.
-        if agents::program_name(&command) == Some("codex")
-            && let Some(last) = asked.last_mut()
-            && last == goal
-        {
-            last.push_str("\n\n");
-            last.push_str(&notes(Some(paragraph.clone()), None).join("\n\n"));
-        }
-        about_task = Some(paragraph);
-    }
+    let about_task = task
+        .as_ref()
+        .map(|_| tasks::instructions(backlog::enabled(&config)));
     let instructions = notes(about_task, remembered(socket, &cwd, &command));
     let argv = agents::argv(
-        &asked,
+        &command,
         &crystal,
         resume,
         given_task.as_deref(),
         &instructions,
     );
     let argv = agents::with_options(argv, &memory_tools(socket, &cwd, &command, &crystal));
+    let argv = codex::with_instructions(argv, &instructions, codex::home(&env).as_deref());
     let mut session = Session::spawn(id, name.clone(), command, &argv, cwd, &env)?;
     if let Some(goal) = task {
         session.give_task(new_task_info(goal, false, backlog));
@@ -1827,21 +1817,33 @@ fn notes(about_task: Option<String>, remembered: Option<String>) -> Vec<String> 
     notes
 }
 
-/// What the project's memory has to tell a Claude Code session as it
-/// starts, with the words of its command as what it was asked, unless the
-/// config turns memory off. Codex has no way to be told something at
-/// launch without it showing as the user's own first message, so it isn't.
+/// What the project's memory has to tell an agent as it starts in `cwd`,
+/// with the words of its command as what it was asked, unless the config
+/// turns memory off: Claude Code, Codex, or another agent crystal knows
+/// that's given a first prompt to say it in.
 fn remembered(socket: &Path, cwd: &Path, command: &[String]) -> Option<String> {
-    if agents::program_name(command) != Some("claude") {
-        return None;
-    }
+    let reader = match agents::program_name(command)? {
+        "claude" => memory::Reader::Claude,
+        "codex" => memory::Reader::Agent,
+        _ if catalog::first_prompt_at(command).is_some() => memory::Reader::Agent,
+        _ => return None,
+    };
     if !memory::enabled_now() {
         return None;
     }
-    let project = memory::project_of(cwd);
-    let embedder = embed::shared_now();
     let asked = command[1..].join(" ");
-    memory::for_launch(socket, &project, &asked, false, embed::as_embed(&embedder))
+    launch_memory(socket, cwd, &asked, reader)
+}
+
+/// What the memory of the project `cwd` is in tells `reader` as it starts
+/// there, asked `asked`: what has to do with the files its worktree has
+/// changed comes first.
+fn launch_memory(socket: &Path, cwd: &Path, asked: &str, reader: memory::Reader) -> Option<String> {
+    let project = memory::project_of(cwd);
+    let changed = git::branch_changes(cwd).unwrap_or_default();
+    let embedder = embed::shared_now();
+    let embedder = embed::as_embed(&embedder);
+    memory::for_launch(socket, &project, asked, &changed, reader, embedder)
         .ok()
         .flatten()
 }
@@ -1886,12 +1888,7 @@ fn task_args(socket: &Path, cwd: &Path, spec: &protocol::TaskSpec) -> Vec<String
     if !memory::enabled_now() {
         return spec.args.clone();
     }
-    let project = memory::project_of(cwd);
-    let embedder = embed::shared_now();
-    let embedder = embed::as_embed(&embedder);
-    let remembered = memory::for_launch(socket, &project, &spec.prompt, true, embedder)
-        .ok()
-        .flatten();
+    let remembered = launch_memory(socket, cwd, &spec.prompt, memory::Reader::Task);
     let args = agents::with_instructions(&spec.args, &notes(None, remembered));
     let Ok(crystal) = std::env::current_exe() else {
         return args;

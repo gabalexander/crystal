@@ -11,7 +11,8 @@
 //! `ping`, `tools/list` and `tools/call`. It reads the memory's database
 //! itself, so it needs no daemon.
 
-use crate::memory::{self, Entry, Kind, Listed, Store};
+use crate::memory::{self, Kind, Listed, Store};
+use crate::memory_cli;
 use crate::tui::sidebar::ago;
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
@@ -163,8 +164,8 @@ impl Server {
         let entry = Store::open(&self.socket)?
             .get(&self.project, id)?
             .with_context(|| format!("there's no entry {id}"))?;
-        let stale = memory::is_stale(&entry, &self.project);
-        Ok(shown(&entry, stale, now()))
+        let freshness = memory::freshness(&entry, &self.project);
+        Ok(memory_cli::in_full(&entry, freshness, now()))
     }
 }
 
@@ -190,8 +191,9 @@ fn tools() -> Value {
                             learned, like decisions and why, gotchas, commands that work, notes \
                             and how tasks turned out. Give a few words: any of them matches, \
                             and so does a word they start or stem from. Gives the best matches \
-                            first, a line each: id, kind, age, text, the files it's about, and \
-                            [stale] when one of those has changed since.",
+                            first, a line each: id, kind, age, text, the files it's about, \
+                            [drifting] when some of those have changed since, and [stale] when \
+                            all of them have.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -233,34 +235,10 @@ fn row(item: &Listed, now: u64) -> String {
     if !entry.files.is_empty() {
         line.push_str(&format!(" ({})", entry.files.join(", ")));
     }
-    if item.stale {
-        line.push_str(" [stale]");
+    if let Some(mark) = item.freshness.mark() {
+        line.push_str(&format!(" [{mark}]"));
     }
     line
-}
-
-/// An entry in full.
-fn shown(entry: &Entry, stale: bool, now: u64) -> String {
-    let mut text = format!("{} · {}", entry.id, entry.kind);
-    if stale {
-        text.push_str(" · stale: a file it's about has changed since");
-    }
-    text.push_str(&format!("\n\n{}\n", entry.text));
-    if !entry.files.is_empty() {
-        text.push_str(&format!("\nfiles: {}", entry.files.join(", ")));
-    }
-    text.push_str(&format!("\nfrom: {}", entry.source));
-    let times = if entry.seen == 1 {
-        "once".to_string()
-    } else {
-        format!("{} times", entry.seen)
-    };
-    text.push_str(&format!(
-        "\nadded {} ago; said {times}, last {} ago",
-        ago(entry.created, now),
-        ago(entry.last_seen, now)
-    ));
-    text
 }
 
 fn error(id: Value, code: i64, message: &str) -> Value {
@@ -284,7 +262,7 @@ mod tests {
             on: || true,
             search: |socket, project, query, kind, limit| {
                 let found = Store::open(socket)?.search(project, query, kind, limit, None)?;
-                Ok(memory::stale_last(found, project))
+                Ok(memory::freshest_first(found, project))
             },
         };
         std::fs::create_dir(&server.project).unwrap();
@@ -298,6 +276,7 @@ mod tests {
                 text: text.into(),
                 files: Vec::new(),
                 source: Source::Session("fixer".into()),
+                checkout: None,
             };
             store.add(&server.project, new).unwrap();
         }

@@ -412,8 +412,9 @@ enum Command {
         #[arg(short, long, value_enum, default_value_t = memory::Kind::Note)]
         kind: memory::Kind,
 
-        /// A file it's about; once the file changes, the entry is marked
-        /// stale. Give it once a file.
+        /// A file it's about; once some of its files change, the entry is
+        /// marked drifting, and once all of them have, stale. Give it once
+        /// a file.
         #[arg(short = 'f', long = "file", value_name = "FILE")]
         files: Vec<String>,
 
@@ -582,6 +583,11 @@ enum MemoryCommand {
         #[arg(required = true)]
         words: Vec<String>,
     },
+    /// An entry in full, by its id: its text, its files, where it came from
+    /// and how often it was said.
+    Show { id: u64 },
+    /// Print every entry as markdown, newest first.
+    Export,
     /// Forget an entry, by its id.
     #[command(visible_alias = "remove")]
     Rm { id: u64 },
@@ -971,6 +977,8 @@ fn run(cli: Cli) -> Result<()> {
         Command::Memory { dir, command } => match command {
             None => memory_cli::list(&socket, dir)?,
             Some(MemoryCommand::Search { words }) => memory_cli::search(&socket, dir, &words)?,
+            Some(MemoryCommand::Show { id }) => memory_cli::show(&socket, dir, id)?,
+            Some(MemoryCommand::Export) => memory_cli::export(&socket, dir)?,
             Some(MemoryCommand::Rm { id }) => memory_cli::remove(&socket, dir, id)?,
             Some(MemoryCommand::Distill { name }) => memory_cli::distill(&socket, &name)?,
             Some(MemoryCommand::Embed) => memory_cli::embed(&socket)?,

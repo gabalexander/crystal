@@ -134,11 +134,13 @@ is: it's the one request every version must understand.
   every subscriber: clients streaming over the socket, and the plugins' hooks
 - `src/events_cli.rs`: `crystal events`: the log in a shell, filtered, as lines or JSON, or followed, and `--since`
   read as a while back or a time on this machine's clock
-- `src/agents.rs`: what crystal knows about particular agents: the hooks it adds to Claude Code, and what they mean
-- `src/catalog.rs`: the agents the new-session panel offers: their names, how each takes a first prompt, their
-  options, and which are installed
-- `src/codex.rs`: what crystal knows about Codex: finding a session's conversation in its rollouts, and
-  `codex resume`
+- `src/agents.rs`: what crystal knows about particular agents: the hooks it adds to Claude Code, and what they
+  mean, and where an agent hears crystal's notes: Claude Code's system prompt, or the top of another's first
+  prompt
+- `src/catalog.rs`: the agents the new-session panel offers: their names, how each takes a first prompt and
+  where it is on a command line, their options, and which are installed
+- `src/codex.rs`: what crystal knows about Codex: finding a session's conversation in its rollouts, `codex
+  resume`, and crystal's notes given as its developer instructions, after the ones it has already
 - `src/hook.rs`: `crystal hook <agent>`: what those hooks run, to tell the daemon, and to pass on its reminder
   to an agent ending a turn with its task open
 - `src/agent_screen.rs`: reading what an agent is doing off its screen and title
@@ -205,9 +207,10 @@ is: it's the one request every version must understand.
 - `src/memory.rs`: what a project's sessions learned: the SQLite store in the state directory with its FTS5
   index (bm25, prefix and porter-stemmed words), each entry's vector and search by meaning merged with it by
   reciprocal rank fusion, its migrations, the same said again seen again, forgotten entries the
-  distiller can't add back, bringing in a project's JSON file from before, staleness, search, the paragraph
-  Claude Code is shown at launch (with ids for a task in the background), promoting into CLAUDE.md, and
-  `enabled`, the one gate everything memory adds goes through
+  distiller can't add back, bringing in a project's JSON file from before, anchors (each file's SHA-256 when
+  an entry was said) and whether an entry holds, fresh, drifting or stale, search, the paragraph every agent is
+  shown at launch (entries about what its worktree changed first, in docket's 800 bytes), promoting into
+  CLAUDE.md, the markdown export, and `enabled`, the one gate everything memory adds goes through
 - `src/distill.rs`: the distiller: after a task closes, one tool-less `claude -p` (Haiku by default, `[memory]`
   in the config) over the end of its transcript, told what the memory has already; its answer checked
   against the checkout before it's kept
@@ -218,7 +221,8 @@ is: it's the one request every version must understand.
   tests), downloading it at a pinned revision with its SHA-256s checked, and the one copy each process loads
   when `[memory] embeddings` is on; memory.rs keeps the vectors and merges the rankings
 - `src/secrets.rs`: taking credentials out of text before memory keeps it or the distiller reads it
-- `src/memory_cli.rs`: `crystal remember` and `crystal memory`, `distill` included
+- `src/memory_cli.rs`: `crystal remember` and `crystal memory`, `show`, `export` and `distill` included, and an
+  entry in full as `show` and the `memory_show` tool print it
 - `src/profile.rs`: agent profiles: what one runs, checking it, and saving or removing one in the config file
   with `toml_edit`, so the user's comments and layout stay; `enabled` is the one switch for the feature
 - `src/flows.rs`: flows, chains of background tasks on one goal: the `[[flow]]` tables in the config file,
@@ -241,7 +245,8 @@ is: it's the one request every version must understand.
 - `src/env.rs`: the environment a session's program starts with
 - `src/git.rs`: a directory's project, worktree and branch, a project's linked worktrees, and making and
   removing worktrees, a pull request's with its commits fetched from `origin`, the patches the diff reads,
-  and `git grep` stopped once it's no longer wanted (runs `git`)
+  the files a worktree changed since its branch left the default one, and `git grep` stopped once it's no
+  longer wanted (runs `git`)
   - `git/branches.rs`: a worktree's branches, local and remote, its uncommitted changes, and switching it to
     another branch or a new one, the changes stashed, brought along, committed or thrown away, and put back
     when git won't switch

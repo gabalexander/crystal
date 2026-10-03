@@ -1,5 +1,6 @@
 //! What crystal knows about OpenAI's Codex CLI: how to find the
-//! conversation a Codex session is in, and how to start Codex back in it.
+//! conversation a Codex session is in, how to start Codex back in it, and
+//! how to give it crystal's notes, as its developer instructions.
 //!
 //! Codex names its conversation in one place only: the file it records it
 //! to, its "rollout", at `$CODEX_HOME/sessions/YYYY/MM/DD/` (`~/.codex`
@@ -17,6 +18,7 @@
 //! user's own. So crystal reads what Codex is doing off its screen, and
 //! finds its conversation from its rollout.
 
+use crate::catalog::Instructions;
 use crate::protocol::Conversation;
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -24,6 +26,10 @@ use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+/// The setting Codex takes standing instructions in, which it adds to the
+/// session as a developer message.
+pub const INSTRUCTIONS: &str = "developer_instructions";
 
 /// How long before the session started a rollout may say Codex started:
 /// the names only count whole seconds.
@@ -159,6 +165,87 @@ fn options_only(args: &[String]) -> Vec<String> {
     kept
 }
 
+/// `$CODEX_HOME`, where Codex keeps its config and its sessions, for a
+/// Codex run with `env`: `~/.codex` without it.
+pub fn home(env: &BTreeMap<String, String>) -> Option<PathBuf> {
+    match env.get("CODEX_HOME") {
+        Some(home) if !home.is_empty() => Some(PathBuf::from(home)),
+        _ => Some(PathBuf::from(env.get("HOME")?).join(".codex")),
+    }
+}
+
+/// A Codex command line with crystal's `instructions`, a paragraph each,
+/// added to the developer instructions Codex would have had without them:
+/// those given last with `-c`, like a profile's, which are taken out, or
+/// else those in its config file in `home`. Codex keeps only the setting
+/// given last, so crystal gives all of them in one, ahead of the rest. Any
+/// other program's command line, or one with nothing to add, stays as it is.
+pub fn with_instructions(
+    argv: Vec<String>,
+    instructions: &[String],
+    home: Option<&Path>,
+) -> Vec<String> {
+    if instructions.is_empty() || crate::agents::program_name(&argv) != Some("codex") {
+        return argv;
+    }
+    let (args, given) = without_instructions(&argv[1..]);
+    let own = given.or_else(|| configured_instructions(home?));
+    let text: Vec<String> = own.into_iter().chain(instructions.to_vec()).collect();
+    let mut with = vec![argv[0].clone()];
+    with.extend(Instructions::Setting(INSTRUCTIONS).args(&text.join("\n\n")));
+    with.extend(args);
+    with
+}
+
+/// Codex's arguments without the developer instructions given with `-c`,
+/// and the text of the last of them, the one Codex would keep. Everything
+/// after `--` is the first prompt, whatever it says.
+fn without_instructions(args: &[String]) -> (Vec<String>, Option<String>) {
+    let mut kept = Vec::new();
+    let mut given = None;
+    let mut at = 0;
+    while at < args.len() {
+        let arg = &args[at];
+        if arg == "--" {
+            kept.extend_from_slice(&args[at..]);
+            break;
+        }
+        let (setting, taken) = match arg.strip_prefix("--config=") {
+            Some(setting) => (Some(setting), 1),
+            None if arg == "-c" || arg == "--config" => (args.get(at + 1).map(String::as_str), 2),
+            None => (None, 1),
+        };
+        match setting.and_then(instructions_in) {
+            Some(text) => given = Some(text),
+            None => kept.extend_from_slice(&args[at..(at + taken).min(args.len())]),
+        }
+        at += taken;
+    }
+    (kept, given)
+}
+
+/// The text a `-c key=value` gives Codex's developer instructions, if
+/// that's what it sets: the value read as TOML, or as it is when it isn't
+/// TOML, the way Codex reads it.
+fn instructions_in(setting: &str) -> Option<String> {
+    let (key, value) = setting.split_once('=')?;
+    if key.trim() != INSTRUCTIONS {
+        return None;
+    }
+    let value = value.trim();
+    match value.parse::<toml_edit::Value>() {
+        Ok(toml_edit::Value::String(text)) => Some(text.into_value()),
+        _ => Some(value.to_string()),
+    }
+}
+
+/// The developer instructions in Codex's own config file, in `home`.
+fn configured_instructions(home: &Path) -> Option<String> {
+    let text = fs::read_to_string(home.join("config.toml")).ok()?;
+    let config: toml::Table = toml::from_str(&text).ok()?;
+    Some(config.get(INSTRUCTIONS)?.as_str()?.to_string())
+}
+
 /// Where a Codex session's conversation is to be found, looked for until
 /// Codex writes it down.
 ///
@@ -193,12 +280,8 @@ impl Rollouts {
         if program != "codex" {
             return None;
         }
-        let home = match env.get("CODEX_HOME") {
-            Some(home) if !home.is_empty() => PathBuf::from(home),
-            _ => PathBuf::from(env.get("HOME")?).join(".codex"),
-        };
         Some(Rollouts {
-            home,
+            home: home(env)?,
             cwd: canonical(cwd),
             started: SystemTime::now(),
             next_look: Instant::now(),
@@ -495,6 +578,97 @@ mod tests {
     fn other_subcommands_arent_resumed() {
         assert_eq!(resumed(&["codex", "exec", "fix it"]), None);
         assert_eq!(resumed(&["codex", "login"]), None);
+    }
+
+    /// The developer instructions a Codex command line gives, read the way
+    /// Codex reads its `-c`, and the rest of it.
+    fn instructions_of(argv: &[String]) -> (String, Vec<String>) {
+        assert_eq!(argv[1], "-c");
+        let setting: toml::Table = toml::from_str(&argv[2]).unwrap();
+        let text = setting[INSTRUCTIONS].as_str().unwrap().to_string();
+        (text, argv[3..].to_vec())
+    }
+
+    fn notes() -> Vec<String> {
+        vec![
+            "About crystal.".to_string(),
+            "What was learned.".to_string(),
+        ]
+    }
+
+    #[test]
+    fn crystal_s_notes_follow_the_instructions_codex_is_given_on_its_command_line() {
+        let asked = command(&[
+            "codex",
+            "-c",
+            "developer_instructions=\"Be brief.\"",
+            "--config=developer_instructions='Keep changes small.'",
+            "-c",
+            "model_reasoning_effort=high",
+            "--",
+            "-c is a flag",
+        ]);
+        let argv = with_instructions(asked, &notes(), None);
+        let (text, rest) = instructions_of(&argv);
+        // Codex keeps the last given, so crystal's follow that one.
+        assert_eq!(
+            text,
+            "Keep changes small.\n\nAbout crystal.\n\nWhat was learned."
+        );
+        assert_eq!(
+            rest,
+            ["-c", "model_reasoning_effort=high", "--", "-c is a flag"]
+        );
+
+        // A value that isn't TOML is taken as it is, as Codex takes it.
+        let asked = command(&["codex", "-c", "developer_instructions = Be brief."]);
+        let (text, _) = instructions_of(&with_instructions(asked, &notes(), None));
+        assert!(text.starts_with("Be brief.\n\nAbout crystal."), "{text}");
+    }
+
+    #[test]
+    fn without_any_of_its_own_crystal_s_notes_follow_codex_s_config_file() {
+        let home = tempfile::tempdir().unwrap();
+        let asked = command(&["codex", "-m", "o4", "--", "fix it"]);
+        let (text, rest) = instructions_of(&with_instructions(
+            asked.clone(),
+            &notes(),
+            Some(home.path()),
+        ));
+        assert_eq!(text, "About crystal.\n\nWhat was learned.");
+        assert_eq!(rest, ["-m", "o4", "--", "fix it"]);
+
+        let config = "model = \"o4\"\ndeveloper_instructions = \"\"\"\nUse tabs.\"\"\"\n";
+        fs::write(home.path().join("config.toml"), config).unwrap();
+        let (text, _) = instructions_of(&with_instructions(asked, &notes(), Some(home.path())));
+        assert_eq!(text, "Use tabs.\n\nAbout crystal.\n\nWhat was learned.");
+    }
+
+    #[test]
+    fn with_nothing_to_add_or_another_program_the_command_line_stays_as_it_is() {
+        let asked = command(&["codex", "-c", "developer_instructions=\"Be brief.\""]);
+        assert_eq!(with_instructions(asked.clone(), &[], None), asked);
+        let other = command(&["gemini", "-c", "developer_instructions=x"]);
+        assert_eq!(with_instructions(other.clone(), &notes(), None), other);
+    }
+
+    #[test]
+    fn codex_s_home_is_codex_home_or_under_home() {
+        let env = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
+            pairs
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect()
+        };
+        assert_eq!(
+            home(&env(&[("CODEX_HOME", "/c"), ("HOME", "/h")])),
+            Some(PathBuf::from("/c"))
+        );
+        assert_eq!(
+            home(&env(&[("CODEX_HOME", ""), ("HOME", "/h")])),
+            Some(PathBuf::from("/h/.codex"))
+        );
+        assert_eq!(home(&env(&[])), None);
     }
 
     #[test]

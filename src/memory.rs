@@ -11,14 +11,16 @@
 //! again is the one entry seen again, not a second one, and what the user
 //! forgot the distiller can't bring back.
 //!
-//! A Claude Code session, in a terminal or in the background, is shown the
-//! entries that have most to do with what it was asked when it starts. One
-//! in the background searches the rest through crystal's MCP server
-//! ([`crate::mcp`]).
+//! Every agent crystal starts is shown, as it starts, the entries that have
+//! most to do with its launch: first those about files its worktree has
+//! changed, then those about what it was asked. Claude Code searches the
+//! rest through crystal's MCP server ([`crate::mcp`]); other agents with
+//! crystal's commands.
 //!
-//! An entry can name the files it's about. Once one of them changes, the
-//! entry may no longer be true: it's marked stale, and agents aren't shown
-//! it.
+//! An entry can name the files it's about, and keeps a hash of each as it
+//! was when the entry was said: its anchors. Once some of them change, the
+//! entry is drifting, and may hold only in part; once all of them have, it's
+//! stale, and agents aren't shown it.
 //!
 //! The user can turn all of it off: [`enabled`] is the one place that
 //! decides, and everything memory adds asks it first.
@@ -31,6 +33,8 @@ use crate::state;
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -42,6 +46,15 @@ const SHOWN_AT_LAUNCH: usize = 6;
 
 /// The most of an entry's text a session is shown at launch.
 const LAUNCH_TEXT_LENGTH: usize = 300;
+
+/// The most bytes the entries a session is shown at launch take, their
+/// lines together: docket's budget for its index of the same. The least
+/// relevant are left out first.
+const LAUNCH_BYTES: usize = 800;
+
+/// The biggest file an anchor hashes. A file an entry is about is source,
+/// far smaller; one bigger is data, not worth reading through each time.
+const MAX_ANCHORED_BYTES: u64 = 8 * 1024 * 1024;
 
 /// The most entries a search gives back.
 pub const SEARCH_LIMIT: usize = 50;
@@ -153,13 +166,27 @@ CREATE TRIGGER vectors_text_changed AFTER UPDATE OF text ON entries BEGIN
 END;
 ";
 
+/// Each entry's anchors, the hash of each of its files as it was when the
+/// entry was last said, by file; and the worktree they were hashed in,
+/// which the files are looked at in while it's there. With none, they're
+/// looked at in the project's main worktree.
+const ANCHORS: &str = "
+ALTER TABLE entries ADD COLUMN anchors TEXT NOT NULL DEFAULT '{}';
+ALTER TABLE entries ADD COLUMN checkout TEXT;
+";
+
 /// What makes the database as it is now, a step for each version: a
 /// database at version `v`, kept in its `user_version`, takes the steps
 /// after the first `v`.
-const MIGRATIONS: &[&str] = &[TABLES, VECTORS];
+const MIGRATIONS: &[fn(&Connection) -> Result<()>] = &[
+    |conn| Ok(conn.execute_batch(TABLES)?),
+    |conn| Ok(conn.execute_batch(VECTORS)?),
+    add_anchors,
+];
 
 /// The columns [`entry_of`] reads, in its order.
-const COLUMNS: &str = "e.id, e.kind, e.text, e.files, e.source, e.created, e.seen, e.last_seen";
+const COLUMNS: &str = "e.id, e.kind, e.text, e.files, e.source, e.created, e.seen, e.last_seen, \
+                       e.anchors, e.checkout";
 
 /// Whether memory is on, the `memory` plugin: the one gate for everything
 /// it adds, from the launch paragraph to the TUI's view and the commands.
@@ -267,6 +294,14 @@ pub struct Entry {
     /// When it was last said, in seconds since the Unix epoch.
     #[serde(default)]
     pub last_seen: u64,
+    /// The SHA-256 of each of its files that was there when it was last
+    /// said, by file, to tell whether they've changed since.
+    #[serde(default)]
+    pub anchors: BTreeMap<String, String>,
+    /// The worktree its files were hashed in; the project's main worktree
+    /// when it's `None`.
+    #[serde(default)]
+    pub checkout: Option<PathBuf>,
 }
 
 fn once() -> u32 {
@@ -280,6 +315,9 @@ pub struct New {
     pub text: String,
     pub files: Vec<String>,
     pub source: Source,
+    /// The worktree its files are in, from its top; the project's main
+    /// worktree when it's `None`.
+    pub checkout: Option<PathBuf>,
 }
 
 /// What adding an entry came to.
@@ -331,7 +369,7 @@ impl Store {
     /// Adds `new` to `project`'s memory: a new entry, or one it has already
     /// seen again. Credentials in its text are taken out first, and so are
     /// control characters, which would drive the terminal of whoever reads
-    /// it.
+    /// it. Either way, it's anchored to its files as they are now.
     pub fn add(&mut self, project: &Path, new: New) -> Result<Added> {
         let text = clean(&secrets::redact(new.text.trim()));
         if text.trim().is_empty() {
@@ -340,6 +378,7 @@ impl Store {
         let key = key_of(&text);
         let name = self.ready(project)?;
         let now = seconds_since_epoch(SystemTime::now());
+        let checkout = new.checkout.as_deref().unwrap_or(project);
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -358,10 +397,19 @@ impl Store {
         };
         if let Some(said) = said {
             let files = joined(&said.files, &new.files);
+            // Said again, it holds for its files as they are now.
+            let anchors = anchors_in(checkout, &files);
             tx.execute(
-                "UPDATE entries SET seen = seen + 1, last_seen = ?3, files = ?4 \
-                 WHERE project = ?1 AND id = ?2",
-                params![name, said.id, now, serde_json::to_string(&files)?],
+                "UPDATE entries SET seen = seen + 1, last_seen = ?3, files = ?4, anchors = ?5, \
+                 checkout = ?6 WHERE project = ?1 AND id = ?2",
+                params![
+                    name,
+                    said.id,
+                    now,
+                    serde_json::to_string(&files)?,
+                    serde_json::to_string(&anchors)?,
+                    path_text(&new.checkout),
+                ],
             )?;
             let entry = get(&tx, &name, said.id)?.context("the entry just seen is gone")?;
             tx.commit()?;
@@ -395,11 +443,13 @@ impl Store {
             id,
             kind: new.kind,
             text,
+            anchors: anchors_in(checkout, &new.files),
             files: new.files,
             source: new.source,
             created: now,
             seen: 1,
             last_seen: now,
+            checkout: new.checkout,
         };
         insert(&tx, &name, &entry)?;
         tx.commit()?;
@@ -443,6 +493,23 @@ impl Store {
     pub fn get(&mut self, project: &Path, id: u64) -> Result<Option<Entry>> {
         let name = self.ready(project)?;
         get(&self.conn, &name, id)
+    }
+
+    /// The entries of `project` about any of `files`, said most recently
+    /// first.
+    fn about_files(&mut self, project: &Path, files: &[String]) -> Result<Vec<Entry>> {
+        if files.is_empty() {
+            return Ok(Vec::new());
+        }
+        let name = self.ready(project)?;
+        let mut about = self.conn.prepare(&format!(
+            "SELECT {COLUMNS} FROM entries e WHERE e.project = ?1 AND EXISTS \
+             (SELECT 1 FROM json_each(e.files) WHERE value IN (SELECT value FROM json_each(?2))) \
+             ORDER BY e.last_seen DESC, e.id DESC LIMIT ?3"
+        ))?;
+        let files = serde_json::to_string(files)?;
+        let about = about.query_map(params![name, files, SEARCH_LIMIT], entry_of)?;
+        Ok(about.collect::<rusqlite::Result<_>>()?)
     }
 
     /// The entries of `project` that have to do with `text`, of `kind` if
@@ -519,7 +586,7 @@ impl Store {
              WHERE e.project = ?1 AND v.model = ?2 AND (?3 IS NULL OR e.kind = ?3)"
         ))?;
         let rows = rows.query_map(params![project, embedder.model(), kind], |row| {
-            Ok((entry_of(row)?, row.get::<_, Vec<u8>>(8)?))
+            Ok((entry_of(row)?, row.get::<_, Vec<u8>>("vector")?))
         })?;
         let mut alike = Vec::new();
         for row in rows {
@@ -640,6 +707,8 @@ impl Store {
                 if entry.last_seen == 0 {
                     entry.last_seen = entry.created;
                 }
+                let said = entry.last_seen.max(entry.created);
+                entry.anchors = anchors_from_before(&entry.files, said, project);
                 insert(&tx, &name, &entry)?;
             }
         }
@@ -665,10 +734,34 @@ fn migrate(conn: &mut Connection) -> Result<()> {
     // Another process may have got here first.
     let done = version(&tx)?;
     for step in MIGRATIONS.iter().skip(done) {
-        tx.execute_batch(step)?;
+        step(&tx)?;
     }
     tx.execute_batch(&format!("PRAGMA user_version = {}", MIGRATIONS.len()))?;
     tx.commit()?;
+    Ok(())
+}
+
+/// Adds [`ANCHORS`], and anchors the entries already there, once, the
+/// way [`anchors_from_before`] does.
+fn add_anchors(conn: &Connection) -> Result<()> {
+    conn.execute_batch(ANCHORS)?;
+    let old: Vec<(i64, String, String, u64)> = {
+        let mut old = conn.prepare(
+            "SELECT n, project, files, max(created, last_seen) FROM entries WHERE files != '[]'",
+        )?;
+        let old = old.query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?;
+        old.collect::<rusqlite::Result<_>>()?
+    };
+    for (n, project, files, said) in old {
+        let files: Vec<String> = serde_json::from_str(&files).unwrap_or_default();
+        let anchors = anchors_from_before(&files, said, Path::new(&project));
+        conn.execute(
+            "UPDATE entries SET anchors = ?2 WHERE n = ?1",
+            params![n, serde_json::to_string(&anchors)?],
+        )?;
+    }
     Ok(())
 }
 
@@ -684,8 +777,8 @@ fn get(conn: &Connection, project: &str, id: u64) -> Result<Option<Entry>> {
 
 fn insert(conn: &Connection, project: &str, entry: &Entry) -> Result<()> {
     conn.execute(
-        "INSERT INTO entries (project, id, kind, text, key, files, source, created, seen, last_seen) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        "INSERT INTO entries (project, id, kind, text, key, files, source, created, seen, \
+         last_seen, anchors, checkout) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         params![
             project,
             entry.id,
@@ -697,9 +790,17 @@ fn insert(conn: &Connection, project: &str, entry: &Entry) -> Result<()> {
             entry.created,
             entry.seen,
             entry.last_seen,
+            serde_json::to_string(&entry.anchors)?,
+            path_text(&entry.checkout),
         ],
     )?;
     Ok(())
+}
+
+/// A path as the database keeps it.
+fn path_text(path: &Option<PathBuf>) -> Option<String> {
+    path.as_ref()
+        .map(|path| path.to_string_lossy().into_owned())
 }
 
 /// An entry from a row of [`COLUMNS`]. What doesn't read, say a row
@@ -709,6 +810,8 @@ fn entry_of(row: &rusqlite::Row) -> rusqlite::Result<Entry> {
     let kind: String = row.get(1)?;
     let files: String = row.get(3)?;
     let source: String = row.get(4)?;
+    let anchors: String = row.get(8)?;
+    let checkout: Option<String> = row.get(9)?;
     Ok(Entry {
         id: row.get(0)?,
         kind: Kind::parse(&kind).unwrap_or(Kind::Note),
@@ -718,6 +821,8 @@ fn entry_of(row: &rusqlite::Row) -> rusqlite::Result<Entry> {
         created: row.get(5)?,
         seen: row.get(6)?,
         last_seen: row.get(7)?,
+        anchors: serde_json::from_str(&anchors).unwrap_or_default(),
+        checkout: checkout.map(PathBuf::from),
     })
 }
 
@@ -845,11 +950,36 @@ pub struct Memory {
     entries: Vec<Entry>,
 }
 
-/// An entry, with whether it has gone stale.
+/// Whether an entry still holds, by the files it's about. The fresher
+/// sorts first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Freshness {
+    /// None of its files has changed since it was said, or it names none.
+    Fresh,
+    /// Some of its files have changed since: it may hold only in part.
+    Drifting,
+    /// Every one of its files has changed since, or gone: it may no
+    /// longer hold at all.
+    Stale,
+}
+
+impl Freshness {
+    /// What an entry that may not hold as it did is marked with.
+    pub fn mark(self) -> Option<&'static str> {
+        match self {
+            Freshness::Fresh => None,
+            Freshness::Drifting => Some("drifting"),
+            Freshness::Stale => Some("stale"),
+        }
+    }
+}
+
+/// An entry, with whether it still holds.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Listed {
     pub entry: Entry,
-    pub stale: bool,
+    pub freshness: Freshness,
 }
 
 impl Memory {
@@ -863,14 +993,12 @@ impl Memory {
         })
     }
 
-    /// Every entry, newest first, with whether it's stale.
+    /// Every entry, newest first, with whether it still holds.
     pub fn listed(&self) -> Vec<Listed> {
+        let mut hashes = Hashes::default();
         self.entries
             .iter()
-            .map(|entry| Listed {
-                entry: entry.clone(),
-                stale: is_stale(entry, &self.project),
-            })
+            .map(|entry| hashes.listed(entry.clone(), &self.project))
             .collect()
     }
 
@@ -911,6 +1039,7 @@ pub fn record_outcome(
         text: summary.to_string(),
         files: Vec::new(),
         source: Source::Task(task.to_string()),
+        checkout: None,
     };
     Ok(Some(add(socket, project, new)?))
 }
@@ -920,72 +1049,129 @@ pub fn remove(socket: &Path, project: &Path, id: u64) -> Result<Entry> {
     Store::open(socket)?.remove(project, id)
 }
 
-/// `entries` with whether each is stale, those that are after the rest,
-/// each part in the order it was.
-pub fn stale_last(entries: Vec<Entry>, project: &Path) -> Vec<Listed> {
+/// `entries` with whether each still holds: the fresh first, then the
+/// drifting, then the stale, each part in the order it was.
+pub fn freshest_first(entries: Vec<Entry>, project: &Path) -> Vec<Listed> {
+    let mut hashes = Hashes::default();
     let mut listed: Vec<Listed> = entries
         .into_iter()
-        .map(|entry| Listed {
-            stale: is_stale(&entry, project),
-            entry,
-        })
+        .map(|entry| hashes.listed(entry, project))
         .collect();
-    listed.sort_by_key(|item| item.stale);
+    listed.sort_by_key(|item| item.freshness);
     listed
 }
 
-/// What a Claude Code session is told of its project's memory as it
-/// starts: the entries with most to do with what it was asked, `asked`, or
-/// else the newest, leaving out stale ones; then how to search and add to
-/// it. Every session searches through crystal's MCP server, by its tools;
-/// one in the background, `headless`, isn't told how to add, so it has
-/// nothing to be told when nothing is remembered. With an `embedder`, what
-/// has to do with what it was asked goes by meaning as well as by words.
+/// Who [`for_launch`] tells, which says how it reads the rest of the
+/// memory, and whether it's told how to add to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reader {
+    /// Claude Code in a terminal: it has crystal's MCP tools.
+    Claude,
+    /// Claude Code as a task in the background: the tools, but it isn't
+    /// told how to add.
+    Task,
+    /// Any other agent: crystal's commands, to read and to add.
+    Agent,
+}
+
+/// What a session is told of its project's memory as it starts: the
+/// entries about files its worktree has changed since its base, `changed`,
+/// then those with most to do with what it was asked, `asked`, or else the
+/// newest, and how to search and add to it. Stale entries are left out,
+/// and in each part the drifting come after the rest. A task in the
+/// background isn't told how to add, so it has nothing to be told when
+/// nothing is remembered. With an `embedder`, what has to do with what it
+/// was asked goes by meaning as well as by words.
 pub fn for_launch(
     socket: &Path,
     project: &Path,
     asked: &str,
-    headless: bool,
+    changed: &[String],
+    reader: Reader,
     embedder: Option<&dyn Embed>,
 ) -> Result<Option<String>> {
     let mut store = Store::open(socket)?;
-    let fresh = |entries: Vec<Entry>| -> Vec<Entry> {
-        entries
-            .into_iter()
-            .filter(|entry| !is_stale(entry, project))
-            .collect()
-    };
-    let mut shown = fresh(store.search(project, asked, None, SEARCH_LIMIT, embedder)?);
+    let mut hashes = Hashes::default();
+    let about_changes = store.about_files(project, changed)?;
+    let found = store.search(project, asked, None, SEARCH_LIMIT, embedder)?;
+    let mut shown = launch_order(vec![about_changes, found], project, &mut hashes);
     if shown.is_empty() {
-        shown = fresh(store.entries(project)?);
+        shown = launch_order(vec![store.entries(project)?], project, &mut hashes);
     }
-    shown.truncate(SHOWN_AT_LAUNCH);
-    Ok(launch_paragraph(&shown, headless))
+    Ok(launch_paragraph(&shown, reader))
 }
 
-/// The paragraph [`for_launch`] tells a session, showing it `shown`, each
-/// by its id, for the `memory_show` tool.
-fn launch_paragraph(shown: &[Entry], headless: bool) -> Option<String> {
+/// The entries a session may be shown as it starts, from `parts`, the most
+/// relevant part first: each once, none that's stale, and in each part the
+/// fresh ahead of the drifting.
+fn launch_order(parts: Vec<Vec<Entry>>, project: &Path, hashes: &mut Hashes) -> Vec<Listed> {
+    let mut shown: Vec<Listed> = Vec::new();
+    for part in parts {
+        let mut part: Vec<Listed> = part
+            .into_iter()
+            .filter(|entry| !shown.iter().any(|item| item.entry.id == entry.id))
+            .map(|entry| hashes.listed(entry, project))
+            .filter(|item| item.freshness != Freshness::Stale)
+            .collect();
+        part.sort_by_key(|item| item.freshness);
+        shown.extend(part);
+    }
+    shown
+}
+
+/// The paragraph [`for_launch`] tells a session, showing it the first of
+/// `shown` that fit, each by its id, to read in full.
+fn launch_paragraph(shown: &[Listed], reader: Reader) -> Option<String> {
     let how_to_add = "When you learn something a later session here should know, like a \
                       decision, a gotcha or a command that works, keep it with \
                       `crystal remember \"<what>\"` (add `-k decision|gotcha|command|note`, and \
                       `-f <file>` for each file it's about).";
-    if shown.is_empty() {
-        return (!headless).then(|| how_to_add.to_string());
+    let lines = fitted(shown);
+    if lines.is_empty() {
+        return (reader != Reader::Task).then(|| how_to_add.to_string());
     }
     let mut paragraph = String::from("What this project's earlier sessions learned:");
-    for entry in shown {
-        paragraph.push_str(&format!("\n- {} {}", entry.id, launch_line(entry)));
+    for line in lines {
+        paragraph.push_str("\n- ");
+        paragraph.push_str(&line);
     }
-    paragraph.push_str(
-        "\n\nSearch the rest of this project's memory with the memory_search tool, and \
-         read an entry in full with the memory_show tool, by its id.",
-    );
-    if !headless {
+    paragraph.push_str("\n\n");
+    paragraph.push_str(match reader {
+        Reader::Claude | Reader::Task => {
+            "Search the rest of this project's memory with the memory_search tool, and read an \
+             entry in full with the memory_show tool, by its id."
+        }
+        Reader::Agent => {
+            "Search the rest of this project's memory with `crystal memory search <words>`, and \
+             read an entry in full with `crystal memory show <id>`."
+        }
+    });
+    if reader != Reader::Task {
         paragraph.push(' ');
         paragraph.push_str(how_to_add);
     }
     Some(paragraph)
+}
+
+/// The lines of the first of `shown` that fit at launch: at most
+/// [`SHOWN_AT_LAUNCH`] of them, in [`LAUNCH_BYTES`]. One too long for the
+/// room left is passed over for a shorter one after it.
+fn fitted(shown: &[Listed]) -> Vec<String> {
+    let mut room = LAUNCH_BYTES;
+    let mut lines = Vec::new();
+    for item in shown {
+        if lines.len() == SHOWN_AT_LAUNCH {
+            break;
+        }
+        let line = format!("{} {}", item.entry.id, launch_line(item));
+        // With its "\n- " in front.
+        let size = line.len() + 3;
+        if size <= room {
+            room -= size;
+            lines.push(line);
+        }
+    }
+    lines
 }
 
 /// Writes `entry` into the project's CLAUDE.md, or its AGENTS.md if that's
@@ -1045,9 +1231,39 @@ fn with_note(text: &str, note: &str) -> String {
     text
 }
 
+/// The memory of the project called `name` as markdown, for `crystal
+/// memory export`: each of `listed` under a heading of its id and kind,
+/// marked when it's drifting or stale, then its text, the files it's about
+/// and where it came from.
+pub fn markdown(name: &str, listed: &[Listed]) -> String {
+    let mut text = format!("# {name} memory\n");
+    for item in listed {
+        let entry = &item.entry;
+        let mark = item.freshness.mark().map(|mark| format!(" ({mark})"));
+        let mark = mark.unwrap_or_default();
+        text.push_str(&format!(
+            "\n## {} · {}{mark}\n\n{}\n\n",
+            entry.id,
+            entry.kind,
+            entry.text.trim()
+        ));
+        if !entry.files.is_empty() {
+            let files: Vec<String> = entry.files.iter().map(|file| format!("`{file}`")).collect();
+            text.push_str(&format!("About {}. ", files.join(", ")));
+        }
+        text.push_str(&format!("From {}", entry.source));
+        if entry.seen > 1 {
+            text.push_str(&format!(", said {} times", entry.seen));
+        }
+        text.push_str(".\n");
+    }
+    text
+}
+
 /// One entry as a session is shown it: its kind, its text on one line and
-/// not too long, and the files it's about.
-fn launch_line(entry: &Entry) -> String {
+/// not too long, the files it's about, and whether some have changed.
+fn launch_line(item: &Listed) -> String {
+    let entry = &item.entry;
     let mut text = one_line(&entry.text);
     if text.chars().count() > LAUNCH_TEXT_LENGTH {
         text = text.chars().take(LAUNCH_TEXT_LENGTH).collect();
@@ -1057,6 +1273,9 @@ fn launch_line(entry: &Entry) -> String {
     if !entry.files.is_empty() {
         line.push_str(&format!(" [{}]", entry.files.join(", ")));
     }
+    if item.freshness == Freshness::Drifting {
+        line.push_str(" [drifting: some of its files changed since]");
+    }
     line
 }
 
@@ -1064,17 +1283,97 @@ pub fn one_line(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// Whether a file `entry` is about has changed since it was last said, or
-/// is gone. Either way, the entry may no longer be true.
-pub fn is_stale(entry: &Entry, project: &Path) -> bool {
-    let said = UNIX_EPOCH + Duration::from_secs(entry.last_seen.max(entry.created));
-    entry.files.iter().any(|file| {
-        let changed = fs::metadata(project.join(file)).and_then(|meta| meta.modified());
+/// Whether `entry` still holds, by its files as they are now.
+pub fn freshness(entry: &Entry, project: &Path) -> Freshness {
+    Hashes::default().freshness(entry, project)
+}
+
+/// The hash of each file looked at, read once however many entries are
+/// about it.
+#[derive(Default)]
+struct Hashes(HashMap<PathBuf, Option<String>>);
+
+impl Hashes {
+    fn of(&mut self, path: PathBuf) -> Option<&String> {
+        self.0
+            .entry(path)
+            .or_insert_with_key(|path| hash_of(path))
+            .as_ref()
+    }
+
+    /// Whether `entry` still holds: its anchored files looked at in the
+    /// worktree they were hashed in, while it's there, or else in
+    /// `project`, and each that's changed or gone counted.
+    fn freshness(&mut self, entry: &Entry, project: &Path) -> Freshness {
+        let checkout = entry
+            .checkout
+            .as_deref()
+            .filter(|checkout| checkout.is_dir())
+            .unwrap_or(project);
+        let changed = entry
+            .anchors
+            .iter()
+            .filter(|(file, hash)| self.of(checkout.join(file)) != Some(*hash))
+            .count();
         match changed {
-            Ok(changed) => changed > said,
-            Err(_) => true,
+            0 => Freshness::Fresh,
+            all if all == entry.anchors.len() => Freshness::Stale,
+            _ => Freshness::Drifting,
         }
-    })
+    }
+
+    fn listed(&mut self, entry: Entry, project: &Path) -> Listed {
+        Listed {
+            freshness: self.freshness(&entry, project),
+            entry,
+        }
+    }
+}
+
+/// An anchor for each of `files` that's a file in `checkout` now: its
+/// hash, to tell later whether it has changed. A file that isn't there
+/// says nothing either way, so it isn't anchored.
+fn anchors_in(checkout: &Path, files: &[String]) -> BTreeMap<String, String> {
+    files
+        .iter()
+        .filter_map(|file| Some((file.clone(), hash_of(&checkout.join(file))?)))
+        .collect()
+}
+
+/// Anchors for an entry from before anchors, last said at `said`, from
+/// its `files` in `project` as they are now. A file that hasn't changed
+/// since, by its time, is anchored to what it holds; one changed since, or
+/// gone, to nothing, which no file matches, so an entry stale before is
+/// stale still.
+fn anchors_from_before(files: &[String], said: u64, project: &Path) -> BTreeMap<String, String> {
+    let said = UNIX_EPOCH + Duration::from_secs(said);
+    files
+        .iter()
+        .map(|file| {
+            let path = project.join(file);
+            let hash = match fs::metadata(&path).and_then(|meta| meta.modified()) {
+                Ok(changed) if changed <= said => hash_of(&path).unwrap_or_default(),
+                _ => String::new(),
+            };
+            (file.clone(), hash)
+        })
+        .collect()
+}
+
+/// The SHA-256 of what the file at `path` holds, in hex, when it's a file
+/// and not too big to hash.
+fn hash_of(path: &Path) -> Option<String> {
+    let meta = fs::metadata(path).ok()?;
+    if !meta.is_file() || meta.len() > MAX_ANCHORED_BYTES {
+        return None;
+    }
+    let bytes = fs::read(path).ok()?;
+    Some(
+        Sha256::digest(&bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+    )
 }
 
 /// Where the memory of the daemon at `socket` is kept: in crystal's state
@@ -1118,7 +1417,6 @@ pub fn seconds_since_epoch(time: SystemTime) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs::File;
 
     fn entry(id: u64, kind: Kind, text: &str) -> Entry {
         Entry {
@@ -1130,6 +1428,8 @@ mod tests {
             created: 1_000,
             seen: 1,
             last_seen: 1_000,
+            anchors: BTreeMap::new(),
+            checkout: None,
         }
     }
 
@@ -1139,6 +1439,7 @@ mod tests {
             text: text.into(),
             files: Vec::new(),
             source: Source::User,
+            checkout: None,
         }
     }
 
@@ -1335,30 +1636,87 @@ mod tests {
         assert_eq!(found[0].id, 2);
     }
 
-    #[test]
-    fn an_entry_goes_stale_when_its_file_changes_or_goes() {
+    /// A project of the test's own, with `files` in it, each holding its
+    /// own name.
+    fn project_with(files: &[&str]) -> tempfile::TempDir {
         let project = tempfile::tempdir().unwrap();
-        let file = project.path().join("refund.rs");
-        fs::write(&file, "fn refund() {}").unwrap();
-        let now = seconds_since_epoch(SystemTime::now());
-        let mut note = entry(1, Kind::Gotcha, "refund waits for the ledger");
-        note.files = vec!["refund.rs".into()];
-        note.created = now + 60;
-        note.last_seen = now + 60;
-        assert!(!is_stale(&note, project.path()), "unchanged since");
+        for file in files {
+            fs::write(project.path().join(file), file).unwrap();
+        }
+        project
+    }
 
-        note.created = now - 3600;
-        note.last_seen = now - 3600;
-        let file_handle = File::options().write(true).open(&file).unwrap();
-        file_handle.set_modified(SystemTime::now()).unwrap();
-        assert!(is_stale(&note, project.path()), "changed since");
+    /// `files` of the project as a note is about them, as said in `checkout`.
+    fn about(files: &[&str], checkout: &Path) -> New {
+        New {
+            files: files.iter().map(|file| file.to_string()).collect(),
+            checkout: Some(checkout.to_path_buf()),
+            ..note("refund waits for the ledger")
+        }
+    }
 
-        // Said again since the change, it holds again.
-        note.last_seen = now + 60;
-        assert!(!is_stale(&note, project.path()), "said again since");
+    #[test]
+    fn an_entry_drifts_as_some_of_its_files_change_and_goes_stale_once_all_have() {
+        let (_dir, socket) = socket();
+        let project = project_with(&["a.rs", "b.rs"]);
+        let at = project.path();
+        add(&socket, at, about(&["a.rs", "b.rs"], at)).unwrap();
+        let holds = || freshness(Memory::read(&socket, at).unwrap().get(1).unwrap(), at);
+        assert_eq!(holds(), Freshness::Fresh);
 
-        note.files = vec!["gone.rs".into()];
-        assert!(is_stale(&note, project.path()), "gone");
+        fs::write(at.join("a.rs"), "changed").unwrap();
+        assert_eq!(holds(), Freshness::Drifting);
+        fs::remove_file(at.join("b.rs")).unwrap();
+        assert_eq!(holds(), Freshness::Stale, "gone counts as changed");
+
+        // Said again, it holds for its files as they are now.
+        fs::write(at.join("b.rs"), "back").unwrap();
+        add(&socket, at, about(&["a.rs"], at)).unwrap();
+        assert_eq!(holds(), Freshness::Fresh);
+        // A file changed back is the file it was.
+        fs::write(at.join("a.rs"), "changed again").unwrap();
+        assert_eq!(holds(), Freshness::Drifting);
+        fs::write(at.join("a.rs"), "changed").unwrap();
+        assert_eq!(holds(), Freshness::Fresh);
+    }
+
+    #[test]
+    fn a_file_that_isn_t_there_isn_t_anchored() {
+        let (_dir, socket) = socket();
+        let project = project_with(&["a.rs"]);
+        let at = project.path();
+        let added = add(&socket, at, about(&["a.rs", "gone.rs"], at)).unwrap();
+        let entry = added.entry().unwrap();
+        assert_eq!(entry.anchors.keys().collect::<Vec<_>>(), ["a.rs"]);
+        assert_eq!(freshness(entry, at), Freshness::Fresh);
+
+        let nothing = add(
+            &socket,
+            at,
+            New {
+                text: "no file of it is there".into(),
+                ..about(&["gone.rs"], at)
+            },
+        );
+        assert_eq!(
+            freshness(nothing.unwrap().entry().unwrap(), at),
+            Freshness::Fresh
+        );
+    }
+
+    #[test]
+    fn files_are_looked_at_in_the_worktree_they_were_said_in_while_it_s_there() {
+        let (_dir, socket) = socket();
+        let project = project_with(&["a.rs"]);
+        let worktree = tempfile::tempdir().unwrap();
+        fs::write(worktree.path().join("a.rs"), "the worktree's own").unwrap();
+        let added = add(&socket, project.path(), about(&["a.rs"], worktree.path())).unwrap();
+        let entry = added.entry().unwrap().clone();
+        assert_eq!(freshness(&entry, project.path()), Freshness::Fresh);
+
+        // Once the worktree is gone, the project's file is the one.
+        drop(worktree);
+        assert_eq!(freshness(&entry, project.path()), Freshness::Stale);
     }
 
     fn remembering(texts: &[(Kind, &str)]) -> (tempfile::TempDir, PathBuf, Store) {
@@ -1667,15 +2025,38 @@ mod tests {
     }
 
     #[test]
-    fn a_stale_entry_sinks_in_the_search() {
-        let project = tempfile::tempdir().unwrap();
-        let mut stale = entry(1, Kind::Note, "ledger timeout");
-        stale.files = vec!["gone.rs".into()];
-        let fresh = entry(2, Kind::Note, "ledger timeout too");
-        let listed = stale_last(vec![stale, fresh], project.path());
+    fn the_drifting_and_then_the_stale_sink_in_the_search() {
+        let project = project_with(&["a.rs", "b.rs"]);
+        let anchored = |id, anchors: &[(&str, &str)]| Entry {
+            anchors: anchors
+                .iter()
+                .map(|(file, hash)| (file.to_string(), hash.to_string()))
+                .collect(),
+            ..entry(id, Kind::Note, "ledger timeout")
+        };
+        let a = hash_of(&project.path().join("a.rs")).unwrap();
+        let stale = anchored(1, &[("a.rs", "")]);
+        let drifting = anchored(2, &[("a.rs", &a), ("b.rs", "")]);
+        let fresh = anchored(3, &[("a.rs", &a)]);
+        let listed = freshest_first(vec![stale, drifting, fresh], project.path());
         let ids: Vec<u64> = listed.iter().map(|item| item.entry.id).collect();
-        assert_eq!(ids, [2, 1]);
-        assert!(listed[1].stale);
+        assert_eq!(ids, [3, 2, 1]);
+        let freshness: Vec<Freshness> = listed.iter().map(|item| item.freshness).collect();
+        assert_eq!(
+            freshness,
+            [Freshness::Fresh, Freshness::Drifting, Freshness::Stale]
+        );
+    }
+
+    /// What a session asked `asked` in a worktree that changed nothing is
+    /// told as it starts.
+    fn launch(
+        socket: &Path,
+        project: &Path,
+        asked: &str,
+        reader: Reader,
+    ) -> Result<Option<String>> {
+        for_launch(socket, project, asked, &[], reader, None)
     }
 
     #[test]
@@ -1684,12 +2065,11 @@ mod tests {
             (Kind::Gotcha, "the refund test needs the ledger running"),
             (Kind::Note, "the docs build with mdbook"),
         ]);
-        let paragraph = for_launch(
+        let paragraph = launch(
             &socket,
             Path::new(APP),
             "fix the flaky refund test",
-            false,
-            None,
+            Reader::Claude,
         )
         .unwrap()
         .unwrap();
@@ -1710,11 +2090,11 @@ mod tests {
     #[test]
     fn with_nothing_relevant_a_session_is_shown_the_newest() {
         let (_dir, socket, _store) = remembering(&[(Kind::Note, "the docs build with mdbook")]);
-        let paragraph = for_launch(&socket, Path::new(APP), "", false, None)
+        let paragraph = launch(&socket, Path::new(APP), "", Reader::Claude)
             .unwrap()
             .unwrap();
         assert!(paragraph.contains("- 1 (note) the docs build with mdbook"));
-        let paragraph = for_launch(&socket, Path::new(APP), "deploy friday", false, None)
+        let paragraph = launch(&socket, Path::new(APP), "deploy friday", Reader::Claude)
             .unwrap()
             .unwrap();
         assert!(paragraph.contains("- 1 (note) the docs build with mdbook"));
@@ -1723,12 +2103,12 @@ mod tests {
     #[test]
     fn with_nothing_remembered_a_session_is_told_how_to_add() {
         let (_dir, socket) = socket();
-        let paragraph = for_launch(&socket, Path::new(APP), "anything", false, None)
+        let paragraph = launch(&socket, Path::new(APP), "anything", Reader::Claude)
             .unwrap()
             .unwrap();
         assert!(paragraph.starts_with("When you learn something"));
         assert_eq!(
-            for_launch(&socket, Path::new(APP), "anything", true, None).unwrap(),
+            launch(&socket, Path::new(APP), "anything", Reader::Task).unwrap(),
             None,
             "a task in the background has nothing to be told"
         );
@@ -1737,7 +2117,7 @@ mod tests {
     #[test]
     fn a_task_in_the_background_is_shown_ids_and_told_of_its_tools() {
         let (_dir, socket, _store) = remembering(&[(Kind::Gotcha, "the ledger needs redis")]);
-        let paragraph = for_launch(&socket, Path::new(APP), "fix the ledger", true, None)
+        let paragraph = launch(&socket, Path::new(APP), "fix the ledger", Reader::Task)
             .unwrap()
             .unwrap();
         assert!(
@@ -1752,16 +2132,193 @@ mod tests {
     #[test]
     fn a_stale_entry_is_never_shown_at_launch() {
         let (_dir, socket) = socket();
-        let project = tempfile::tempdir().unwrap();
-        let about = New {
-            files: vec!["gone.rs".into()],
-            ..note("refund waits for the ledger")
-        };
-        add(&socket, project.path(), about).unwrap();
-        let paragraph = for_launch(&socket, project.path(), "refund", false, None)
+        let project = project_with(&["refund.rs"]);
+        add(
+            &socket,
+            project.path(),
+            about(&["refund.rs"], project.path()),
+        )
+        .unwrap();
+        fs::write(project.path().join("refund.rs"), "changed").unwrap();
+        let paragraph = launch(&socket, project.path(), "refund", Reader::Claude)
             .unwrap()
             .unwrap();
-        assert!(!paragraph.contains("refund waits"));
+        assert!(!paragraph.contains("refund waits"), "{paragraph}");
+    }
+
+    #[test]
+    fn a_drifting_entry_is_shown_marked_after_the_fresh() {
+        let (_dir, socket) = socket();
+        let project = project_with(&["a.rs", "b.rs"]);
+        let at = project.path();
+        add(&socket, at, about(&["a.rs", "b.rs"], at)).unwrap();
+        add(&socket, at, note("the ledger is slow to start")).unwrap();
+        fs::write(at.join("a.rs"), "changed").unwrap();
+        let paragraph = launch(&socket, at, "refund ledger", Reader::Claude)
+            .unwrap()
+            .unwrap();
+        let lines: Vec<&str> = paragraph.lines().collect();
+        assert_eq!(
+            lines[1..3],
+            [
+                "- 2 (note) the ledger is slow to start",
+                "- 1 (note) refund waits for the ledger [a.rs, b.rs] \
+                 [drifting: some of its files changed since]",
+            ]
+        );
+    }
+
+    #[test]
+    fn entries_about_what_the_worktree_changed_come_first() {
+        let (_dir, socket) = socket();
+        let project = project_with(&["fees.rs"]);
+        let at = project.path();
+        add(
+            &socket,
+            at,
+            note("the refund test needs the ledger running"),
+        )
+        .unwrap();
+        let fees = New {
+            text: "fees are kept in cents".into(),
+            ..about(&["fees.rs"], at)
+        };
+        add(&socket, at, fees).unwrap();
+        add(&socket, at, note("the docs build with mdbook")).unwrap();
+        let changed = ["fees.rs".to_string(), "other.rs".to_string()];
+        let paragraph = for_launch(
+            &socket,
+            at,
+            "fix the refund test",
+            &changed,
+            Reader::Claude,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        let lines: Vec<&str> = paragraph.lines().collect();
+        assert_eq!(
+            lines[1..3],
+            [
+                "- 2 (note) fees are kept in cents [fees.rs]",
+                "- 1 (note) the refund test needs the ledger running",
+            ]
+        );
+        assert!(!paragraph.contains("mdbook"), "{paragraph}");
+    }
+
+    #[test]
+    fn what_a_session_is_shown_keeps_to_its_budget_the_least_relevant_left_out() {
+        let long = |id| Listed {
+            entry: entry(id, Kind::Note, &"ledger ".repeat(40)),
+            freshness: Freshness::Fresh,
+        };
+        let short = |id| Listed {
+            entry: entry(id, Kind::Note, "ledger"),
+            freshness: Freshness::Fresh,
+        };
+        let shown = [long(1), long(2), long(3), short(4)];
+        let lines = fitted(&shown);
+        // The third doesn't fit after two; the shorter one after it does.
+        let ids: Vec<&str> = lines.iter().map(|line| &line[..1]).collect();
+        assert_eq!(ids, ["1", "2", "4"]);
+        let size: usize = lines.iter().map(|line| line.len() + 3).sum();
+        assert!(size <= LAUNCH_BYTES, "{size}");
+
+        let many: Vec<Listed> = (1..=9).map(short).collect();
+        assert_eq!(fitted(&many).len(), SHOWN_AT_LAUNCH);
+    }
+
+    #[test]
+    fn another_agent_is_told_crystal_s_commands_rather_than_its_tools() {
+        let (_dir, socket, _store) = remembering(&[(Kind::Gotcha, "the ledger needs redis")]);
+        let paragraph = launch(&socket, Path::new(APP), "fix the ledger", Reader::Agent)
+            .unwrap()
+            .unwrap();
+        assert!(paragraph.contains("\n- 1 (gotcha) the ledger needs redis"));
+        assert!(
+            paragraph.contains("`crystal memory search <words>`"),
+            "{paragraph}"
+        );
+        assert!(
+            paragraph.contains("`crystal memory show <id>`"),
+            "{paragraph}"
+        );
+        assert!(paragraph.contains("crystal remember"), "{paragraph}");
+        assert!(!paragraph.contains("memory_search tool"), "{paragraph}");
+    }
+
+    #[test]
+    fn a_database_from_before_anchors_anchors_its_entries_once() {
+        let (_dir, socket) = socket();
+        let project = project_with(&["a.rs", "b.rs"]);
+        fs::create_dir_all(dir(&socket)).unwrap();
+        let conn = Connection::open(dir(&socket).join("memory.db")).unwrap();
+        conn.execute_batch(TABLES).unwrap();
+        conn.execute_batch(VECTORS).unwrap();
+        conn.execute_batch("PRAGMA user_version = 2").unwrap();
+        let name = project.path().to_string_lossy();
+        conn.execute(
+            "INSERT INTO projects (path, next_id) VALUES (?1, 4)",
+            params![name],
+        )
+        .unwrap();
+        // Said after its file last changed; said before; about no file.
+        let later = seconds_since_epoch(SystemTime::now()) + 60;
+        for (id, files, said) in [
+            (1, r#"["a.rs"]"#, later),
+            (2, r#"["a.rs", "b.rs"]"#, 1_000),
+            (3, "[]", 1_000),
+        ] {
+            conn.execute(
+                "INSERT INTO entries (project, id, kind, text, key, files, source, created, \
+                 last_seen) VALUES (?1, ?2, 'note', ?3, ?3, ?4, '\"user\"', ?5, ?5)",
+                params![name, id, format!("entry {id}"), files, said],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        let memory = Memory::read(&socket, project.path()).unwrap();
+        let freshness: Vec<Freshness> = memory.listed().iter().map(|item| item.freshness).collect();
+        assert_eq!(
+            freshness,
+            [Freshness::Fresh, Freshness::Stale, Freshness::Fresh],
+            "newest first"
+        );
+        // Anchored to what the file holds, it goes on from there.
+        fs::write(project.path().join("a.rs"), "changed").unwrap();
+        let holds = freshness_of(&memory, 1);
+        assert_eq!(holds, Freshness::Stale);
+    }
+
+    fn freshness_of(memory: &Memory, id: u64) -> Freshness {
+        freshness(memory.get(id).unwrap(), &memory.project)
+    }
+
+    #[test]
+    fn the_export_is_markdown_with_where_each_entry_came_from() {
+        let mut gotcha = entry(2, Kind::Gotcha, "The ledger tests need redis.\n");
+        gotcha.files = vec!["tests/ledger.rs".into()];
+        gotcha.source = Source::Session("fixer".into());
+        gotcha.seen = 3;
+        let listed = [
+            Listed {
+                entry: gotcha,
+                freshness: Freshness::Drifting,
+            },
+            Listed {
+                entry: entry(1, Kind::Note, "Fees are in cents."),
+                freshness: Freshness::Fresh,
+            },
+        ];
+        assert_eq!(
+            markdown("app", &listed),
+            "# app memory\n\
+             \n## 2 · gotcha (drifting)\n\nThe ledger tests need redis.\n\n\
+             About `tests/ledger.rs`. From session fixer, said 3 times.\n\
+             \n## 1 · note\n\nFees are in cents.\n\nFrom you.\n"
+        );
     }
 
     #[test]

@@ -916,6 +916,8 @@ crystal remember -k gotcha -f tests/ledger.rs "The ledger tests need the databas
 crystal remember -k command "make e2e runs the browser tests; they take about 4 minutes"
 crystal memory                       # the list, newest first
 crystal memory search ledger tests   # the entries that have most to do with those words
+crystal memory show 3                # one in full: its files, where it came from, how often it was said
+crystal memory export > MEMORY.md    # the whole list as markdown
 crystal memory rm 3                  # forget one
 crystal memory promote 2             # copy one into the project's CLAUDE.md, under "Notes"
 crystal memory distill fixer         # have a model read what a session did, now
@@ -930,22 +932,37 @@ crystal memory embed                 # download the model that searches by meani
   repository. A project's list from before, a JSON file there, is brought in the first time it's read.
 - `search` uses SQLite's full-text index (FTS5), ranked by bm25: any of the words matches, and so does a word
   they start or stem from (`deploying` finds "Deploys go out on Tuesdays"); the entries with more of the words,
-  and rarer ones, come first, and stale ones last. With [search by meaning](#search-by-meaning) on, entries
-  that mean the same count too, whatever their words.
+  and rarer ones, come first, then drifting ones, and stale ones last. With
+  [search by meaning](#search-by-meaning) on, entries that mean the same count too, whatever their words.
 - The same thing remembered again (the same words, whatever the case or punctuation) is the one entry, seen
   again: `remembered 3 already`. Credentials in an entry, like `API_KEY=…` or a token, are taken out as it's
   kept.
-- `-f` names a file an entry is about, and can be given more than once. Once that file changes, the entry may
-  no longer hold: it's marked stale, and agents aren't shown it. `crystal memory rm` it, or remember it again.
+- `-f` names a file an entry is about, and can be given more than once. crystal keeps a hash of each file as it
+  is then (a file that isn't there isn't counted). Once some of them change, the entry is marked drifting: it
+  may hold only in part, and it comes after the rest. Once all of them have changed, or gone, it's stale, and
+  agents aren't shown it. `crystal memory rm` it, or remember it again, which takes its files as they are now.
+  The files are looked at in the worktree the entry was remembered in while that's there, and in the main
+  worktree after.
 - `promote` asks first at a terminal; `--yes` doesn't. It writes to CLAUDE.md, or to AGENTS.md when that's the
   only one the project has.
-- `m` in the sidebar opens the selected session's project's list: the entry the bar is on is shown in full
-  beside it, `/` filters, `x` forgets an entry and `p` promotes it, each after a `y`.
+- `m` in the sidebar opens the selected session's project's list, drifting and stale entries marked: the entry
+  the bar is on is shown in full beside it, `/` filters, `x` forgets an entry and `p` promotes it, each after a
+  `y`.
 
-When a Claude Code session starts, crystal adds the entries that have most to do with its first prompt (the
-newest, without one) to its system prompt, each with its id, a few at most and none that's stale, with a line
-on how to search and add more. Codex is told nothing: it has no option for a system prompt, and anything crystal typed in would
-read as your first message. `crystal plugin disable memory` turns it all off: see [plugins](#plugins).
+When an agent starts, crystal shows it the entries that have most to do with its launch: first those about files
+its worktree has changed since its branch left the default one (`origin`'s, or `main` or `master`), committed
+or not, then those that have most to do with its first prompt, or the newest when neither finds any. That's a
+few at most, in 800 bytes, the least relevant left out first; none that's stale, and drifting ones marked and
+after the rest. Each comes with its id, and a line on how to read the rest and add more:
+
+- Claude Code gets them in its system prompt, and reads the rest with crystal's MCP tools (below).
+- Codex gets them as its `developer_instructions` (`-c`), after the ones it has already, from a
+  [profile](#profiles) or its own `config.toml`, and reads the rest with `crystal memory search` and `show`.
+- Gemini CLI, OpenCode and Cursor get them at the top of their first prompt, when they're given one. A prompt
+  that would pass 16 KiB with them loses what the memory has first. Aider, which takes no first prompt, isn't
+  told.
+
+`crystal plugin disable memory` turns it all off: see [plugins](#plugins).
 
 Every Claude Code session crystal starts, in a terminal or as a task in the background (`claude -p`), gets
 crystal's own MCP server, `crystal mcp`, with its two tools allowed: `memory_search`, which searches the
@@ -1016,11 +1033,12 @@ started from the [backlog](#the-backlog), or one made with `crystal tasks new`. 
 made, `t1`, `t2`…, and stays open until it's closed, done or failed, with a line on how it went:
 
 - The agent closes it from inside its session: `crystal done "<what was done>"`, or `crystal done --failed
-  "<why>"`. crystal tells Claude Code how, on top of its system prompt, and tells Codex at the end of its first
-  prompt, opening with a line on where that comes from, so the agent doesn't take it for a stranger's
-  instructions. Agents don't always remember to, Haiku least of all, so the first time Claude Code ends a turn
-  with its task still open, its Stop hook reminds it and it carries on: to close the task, or, if it isn't
-  through, to leave it open and end its turn. `-n <session>` closes another session's task.
+  "<why>"`. crystal tells Claude Code how, on top of its system prompt, Codex in its developer instructions,
+  and other agents at the top of their first prompt, opening with a line on where that comes from, so the
+  agent doesn't take it for a stranger's instructions. Agents don't always remember to, Haiku least of all, so
+  the first time Claude Code ends a turn with its task still open, its Stop hook reminds it and it carries on:
+  to close the task, or, if it isn't through, to leave it open and end its turn. `-n <session>` closes another
+  session's task.
 - You close it from the TUI: `c` on the session asks `d` done or `f` failed, then for a line on how it went,
   which can stay empty.
 - A background task closes itself when its run ends: done with the first line of Claude's answer, or failed.
@@ -1405,7 +1423,8 @@ where = "worktree"                         # optional: "here" or "worktree"; els
 ```
 
 `instructions` stay with the agent for the whole session, on top of its own: Claude Code gets them with
-`--append-system-prompt`, and Codex as its `developer_instructions` setting (`-c`). The other agents can't be
+`--append-system-prompt`, and Codex as its `developer_instructions` setting (`-c`), in place of any in its own
+`config.toml`; what crystal adds, about a task or the memory, comes after them. The other agents can't be
 given any, so a profile for them that has some is an error. `prompt`, unlike `instructions`, is only the start
 of the first message.
 
