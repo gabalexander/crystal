@@ -28,7 +28,9 @@ use crate::flows::{self, Flow};
 use crate::forge::{self, Checkout, Forge, Issue, PullRequest, PullRequestDetail, Topic};
 use crate::keys;
 use crate::profile::{self, Profile};
-use crate::protocol::{Activity, Backlog, SessionInfo, State, TaskSpec, Worktree};
+use crate::protocol::{
+    Activity, Answer, Backlog, Front, SessionInfo, Spending, State, TaskSpec, Worktree,
+};
 use crate::shell;
 use crate::{backlog, names, plugins, tasks};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
@@ -274,6 +276,13 @@ pub enum Action {
         failed: bool,
         summary: String,
     },
+    /// Answer the permission the background task called `name` asks for.
+    Answer {
+        name: String,
+        answer: Answer,
+    },
+    /// Stop the run the background task called this is in the middle of.
+    Interrupt(String),
     /// Ask the daemon for the backlog of the project `dir` is in, for the
     /// backlog view that's open.
     ListBacklog(PathBuf),
@@ -615,6 +624,8 @@ pub struct App {
     flow_defs: Vec<Flow>,
     /// Whether flows are on: offered, shown, and answered at their gates.
     flows_on: bool,
+    /// What background tasks have spent today, as the daemon last said.
+    spending: Option<Spending>,
 }
 
 impl App {
@@ -667,6 +678,7 @@ impl App {
             flows: Vec::new(),
             flow_defs: Vec::new(),
             flows_on: true,
+            spending: None,
         }
     }
 
@@ -942,6 +954,17 @@ impl App {
 
     pub fn flows(&self) -> &[FlowRun] {
         &self.flows
+    }
+
+    /// Takes what the daemon says background tasks have spent today.
+    pub fn set_spending(&mut self, spending: Spending) {
+        self.spending = Some(spending);
+    }
+
+    /// What background tasks have spent today, once there's something
+    /// spent to show.
+    pub fn spending(&self) -> Option<Spending> {
+        self.spending.filter(|spending| spending.today_usd > 0.0)
     }
 
     /// The flow run the session at `index` is a step of, and which step.
@@ -1912,9 +1935,24 @@ impl App {
         {
             return None;
         }
+        // On a background task asking for a permission, `y`, `n` and `Y`
+        // answer it; `n` is a new session again once it's answered.
+        if let Some(answer) = answer_key(key.code)
+            && let Some(name) = self.selected().filter(|s| s.asking.is_some())
+        {
+            let name = name.name.clone();
+            return Some(Action::Answer { name, answer });
+        }
         match key.code {
             KeyCode::Char('j') | KeyCode::Down => self.move_selection(1),
             KeyCode::Char('k') | KeyCode::Up => self.move_selection(-1),
+            KeyCode::Char('y' | 'Y') => {
+                let not_asking = |s: &SessionInfo| format!("{} isn't asking for anything", s.name);
+                let notice = self
+                    .selected()
+                    .map_or_else(|| "there's no session selected".into(), not_asking);
+                self.notify(notice);
+            }
             // On a worktree with no sessions, there's nothing to type into:
             // Enter starts something there, as `n` does.
             KeyCode::Enter if self.on_worktree.is_some() => return self.open_launcher(false),
@@ -2948,7 +2986,40 @@ impl App {
             }
             KeyCode::PageUp if shift => Some(Action::PageBack(slot)),
             KeyCode::PageDown if shift => Some(Action::PageForward(slot)),
+            _ if self.pane_shows_task(slot) => self.on_task_pane_key(slot, key),
             _ => Some(Action::Type { to: slot, key }),
+        }
+    }
+
+    /// Whether the pane at `slot` shows a background task, which takes no
+    /// keys but its own.
+    pub fn pane_shows_task(&self, slot: Slot) -> bool {
+        self.pane_session(slot)
+            .is_some_and(|session| session.front == Some(Front::Task))
+    }
+
+    /// A key in a background task's pane: `y`, `n` or `Y` answer what it
+    /// asks for, and Ctrl+C stops its run. It takes no others.
+    fn on_task_pane_key(&mut self, slot: Slot, key: KeyEvent) -> Option<Action> {
+        let session = self.pane_session(slot)?;
+        let name = session.name.clone();
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        if ctrl && key.code == KeyCode::Char('c') {
+            return Some(Action::Interrupt(name));
+        }
+        let answer = answer_key(key.code).filter(|_| !ctrl);
+        match answer {
+            Some(answer) if session.asking.is_some() => Some(Action::Answer { name, answer }),
+            Some(_) => {
+                self.notify(format!("{name} isn't asking for anything"));
+                None
+            }
+            None => {
+                self.notify(format!(
+                    "{name} takes no keys: ctrl+c stops its run, `crystal send` gives it a follow-up"
+                ));
+                None
+            }
         }
     }
 
@@ -3422,6 +3493,17 @@ impl App {
     }
 }
 
+/// The answer a key gives a permission a background task asks for: `y`
+/// yes, `n` no, `Y` yes always.
+fn answer_key(code: KeyCode) -> Option<Answer> {
+    match code {
+        KeyCode::Char('y') => Some(Answer::Allow),
+        KeyCode::Char('n') => Some(Answer::Deny),
+        KeyCode::Char('Y') => Some(Answer::Always),
+        _ => None,
+    }
+}
+
 /// A worktree the way the panel names it: `payments ⌂ main` for a
 /// project's main worktree, `payments ⎇ fix/login` for a linked one.
 fn worktree_label(worktree: &crate::protocol::Worktree) -> String {
@@ -3443,7 +3525,7 @@ fn edit_name(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{Activity, BacklogItem, TaskInfo, TaskOutcome, Worktree};
+    use crate::protocol::{Activity, BacklogItem, TaskInfo, TaskOutcome, TaskState, Worktree};
     use crossterm::event::KeyModifiers;
 
     fn session(name: &str) -> SessionInfo {
@@ -3459,6 +3541,7 @@ mod tests {
             worktree: None,
             changed: 0,
             task: None,
+            asking: None,
         }
     }
 
@@ -5951,16 +6034,23 @@ mod tests {
     /// A session given `goal` to do, closed with `outcome` if it's given:
     /// whether it failed, and how it went.
     fn with_task(name: &str, goal: &str, outcome: Option<(bool, &str)>) -> SessionInfo {
+        let closed = |(failed, summary)| {
+            let state = if failed {
+                TaskState::Failed
+            } else {
+                TaskState::Done
+            };
+            TaskOutcome::new(state, summary, 1)
+        };
         SessionInfo {
             task: Some(TaskInfo {
+                id: Some(1),
                 goal: goal.into(),
                 background: false,
                 backlog: None,
-                outcome: outcome.map(|(failed, summary)| TaskOutcome {
-                    failed,
-                    summary: summary.into(),
-                    closed: 1,
-                }),
+                waiting: false,
+                created: 0,
+                outcome: outcome.map(closed),
             }),
             ..in_project(name, "shop")
         }

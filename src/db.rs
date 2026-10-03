@@ -1,7 +1,9 @@
 //! The database the daemon and the TUI keep their state in: one SQLite file
 //! in the state directory holding the sessions to start again after a
-//! restart, the flow runs, each project's backlog and closed tasks, and the
-//! TUI's tabs, layouts and what the new-session panel remembers. The
+//! restart, the flow runs, each project's backlog and closed tasks, the
+//! tasks waiting to start and the number the next task gets, what
+//! background tasks have spent each day, and the TUI's tabs, layouts and
+//! what the new-session panel remembers. The
 //! settings stay in the config file, which people edit by hand, and memory
 //! in a database of its own.
 //!
@@ -17,7 +19,7 @@
 
 use crate::backlog;
 use crate::flow_run::FlowRun;
-use crate::protocol::{BacklogItem, TaskOutcome, TaskRecord};
+use crate::protocol::{BacklogItem, PendingTask, TaskOutcome, TaskRecord};
 use crate::state::{self, SavedSession};
 use crate::tasks;
 use anyhow::{Context, Result};
@@ -104,10 +106,38 @@ CREATE TABLE ui (
 );
 ";
 
+/// What tasks added: a closed task's number (`t12`), when it was made and
+/// whether it was cancelled; the number the last task got, which is never
+/// given again; the tasks waiting to start, each under its number, with how
+/// it starts as JSON; and what background tasks spent, by the day on this
+/// machine's clock.
+const TASK_STATES: &str = "
+ALTER TABLE tasks ADD COLUMN number INTEGER;
+ALTER TABLE tasks ADD COLUMN created INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE tasks ADD COLUMN cancelled INTEGER NOT NULL DEFAULT 0;
+CREATE TABLE task_numbers (
+  last INTEGER NOT NULL
+);
+INSERT INTO task_numbers (last) VALUES (0);
+CREATE TABLE pending_tasks (
+  number  INTEGER PRIMARY KEY,
+  goal    TEXT NOT NULL,
+  cwd     TEXT NOT NULL,
+  name    TEXT,
+  start   TEXT NOT NULL,
+  backlog INTEGER,
+  created INTEGER NOT NULL
+);
+CREATE TABLE spending (
+  day TEXT PRIMARY KEY,
+  usd REAL NOT NULL
+);
+";
+
 /// What makes the database as it is now, a step for each version: a
 /// database at version `v`, kept in its `user_version`, takes the steps
 /// after the first `v`.
-const MIGRATIONS: &[&str] = &[TABLES];
+const MIGRATIONS: &[&str] = &[TABLES, TASK_STATES];
 
 /// The file each project kept its backlog in before the database.
 const OLD_BACKLOG: &str = "backlog.json";
@@ -115,8 +145,9 @@ const OLD_BACKLOG: &str = "backlog.json";
 const SESSION_COLUMNS: &str = "name, command, cwd, conversation, task, goal";
 const RUN_COLUMNS: &str =
     "name, flow, profiles, goal, cwd, worktree, round, feedback, steps, started";
-const TASK_COLUMNS: &str =
-    "project_name, goal, session, branch, background, backlog, failed, summary, closed";
+const TASK_COLUMNS: &str = "project_name, goal, session, branch, background, backlog, failed, \
+                            summary, closed, number, created, cancelled";
+const PENDING_COLUMNS: &str = "number, goal, cwd, name, start, backlog, created";
 const ITEM_COLUMNS: &str = "number, text, tags, done, created, closed";
 
 /// The database of the daemon at `socket`, open.
@@ -240,6 +271,84 @@ impl Db {
             }
         }
         Ok(found)
+    }
+
+    /// The number for a new task, which is never given again.
+    pub fn new_task_number(&mut self) -> Result<u64> {
+        let tx = self.write()?;
+        let number = next_task_number(&tx)?;
+        tx.commit()?;
+        Ok(number)
+    }
+
+    /// Keeps `task` until it's started, under a new number, which it gives
+    /// back.
+    pub fn add_pending_task(&mut self, task: &PendingTask) -> Result<u64> {
+        let tx = self.write()?;
+        let number = next_task_number(&tx)?;
+        tx.execute(
+            &format!(
+                "INSERT INTO pending_tasks ({PENDING_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
+            ),
+            params![
+                number,
+                task.goal,
+                task.cwd.to_string_lossy(),
+                task.name,
+                json(&task.start)?,
+                task.backlog,
+                task.created,
+            ],
+        )?;
+        tx.commit()?;
+        Ok(number)
+    }
+
+    /// The tasks waiting to start, the oldest first.
+    pub fn pending_tasks(&self) -> Result<Vec<PendingTask>> {
+        let mut statement = self.conn.prepare(&format!(
+            "SELECT {PENDING_COLUMNS} FROM pending_tasks ORDER BY number"
+        ))?;
+        let rows = statement.query_map([], |row| Ok(pending_of(row)))?;
+        readable(rows, "a task waiting to start")
+    }
+
+    /// The task numbered `number`, if it's waiting to start.
+    pub fn pending_task(&self, number: u64) -> Result<Option<PendingTask>> {
+        let tasks = self.pending_tasks()?;
+        Ok(tasks.into_iter().find(|task| task.id == number))
+    }
+
+    /// Forgets the task numbered `number`, which was waiting to start: it
+    /// has, or it was cancelled. Says whether it was there.
+    pub fn remove_pending_task(&self, number: u64) -> Result<bool> {
+        let removed = self.conn.execute(
+            "DELETE FROM pending_tasks WHERE number = ?1",
+            params![number],
+        )?;
+        Ok(removed > 0)
+    }
+
+    /// What background tasks spent on `day`, like `2026-10-03`.
+    pub fn spent_on(&self, day: &str) -> Result<f64> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT usd FROM spending WHERE day = ?1")?;
+        let mut rows = statement.query(params![day])?;
+        Ok(match rows.next()? {
+            Some(row) => row.get(0)?,
+            None => 0.0,
+        })
+    }
+
+    /// Adds `usd` to what background tasks spent on `day`.
+    pub fn add_spending(&self, day: &str, usd: f64) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO spending (day, usd) VALUES (?1, ?2) \
+             ON CONFLICT (day) DO UPDATE SET usd = usd + excluded.usd",
+            params![day, usd],
+        )?;
+        Ok(())
     }
 
     /// The TUI's document called `name`, when it has kept one.
@@ -531,7 +640,7 @@ fn insert_task(conn: &Connection, project: &str, task: &TaskRecord) -> Result<()
     conn.execute(
         &format!(
             "INSERT INTO tasks (project, {TASK_COLUMNS}) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"
         ),
         params![
             project,
@@ -544,29 +653,57 @@ fn insert_task(conn: &Connection, project: &str, task: &TaskRecord) -> Result<()
             outcome.map(|outcome| outcome.failed),
             outcome.map(|outcome| &outcome.summary),
             outcome.map(|outcome| outcome.closed),
+            task.id,
+            task.created,
+            outcome.is_some_and(|outcome| outcome.cancelled),
         ],
     )?;
     Ok(())
 }
 
+/// A task from a project's history. It closed, or it's from a file before
+/// the database that kept it open, so it was never pending or waiting.
 fn task_of(row: &Row) -> Result<TaskRecord> {
     let closed: Option<u64> = row.get(8)?;
     let outcome = match closed {
         Some(closed) => Some(TaskOutcome {
             failed: row.get::<_, Option<bool>>(6)?.unwrap_or(false),
+            cancelled: row.get(11)?,
             summary: row.get::<_, Option<String>>(7)?.unwrap_or_default(),
             closed,
         }),
         None => None,
     };
     Ok(TaskRecord {
+        id: row.get(9)?,
         project: row.get(0)?,
         goal: row.get(1)?,
         session: row.get(2)?,
         branch: row.get(3)?,
         background: row.get(4)?,
         backlog: row.get(5)?,
+        pending: false,
+        waiting: false,
+        created: row.get(10)?,
         outcome,
+    })
+}
+
+/// Takes the next task number, inside the transaction `tx` writes in.
+fn next_task_number(tx: &Transaction) -> Result<u64> {
+    tx.execute("UPDATE task_numbers SET last = last + 1", [])?;
+    Ok(tx.query_row("SELECT last FROM task_numbers", [], |row| row.get(0))?)
+}
+
+fn pending_of(row: &Row) -> Result<PendingTask> {
+    Ok(PendingTask {
+        id: row.get(0)?,
+        goal: row.get(1)?,
+        cwd: PathBuf::from(row.get::<_, String>(2)?),
+        name: row.get(3)?,
+        start: from_json(&row.get::<_, String>(4)?)?,
+        backlog: row.get(5)?,
+        created: row.get(6)?,
     })
 }
 
@@ -635,7 +772,7 @@ fn from_json_or_null<T: DeserializeOwned>(text: Option<String>) -> Result<Option
 mod tests {
     use super::*;
     use crate::flows::{Flow, Step};
-    use crate::protocol::{Conversation, TaskInfo, TaskSpec};
+    use crate::protocol::{Conversation, TaskInfo, TaskSpec, TaskStart, TaskState};
     use std::collections::BTreeMap;
 
     /// A socket of a test's own, in `dir`, so its database is too.
@@ -686,17 +823,31 @@ mod tests {
 
     fn closed(goal: &str, at: u64) -> TaskRecord {
         TaskRecord {
+            id: Some(at),
             goal: goal.into(),
             session: "claude".into(),
             project: "app".into(),
             branch: Some("main".into()),
             background: false,
             backlog: Some(3),
-            outcome: Some(TaskOutcome {
-                failed: false,
-                summary: "did it".into(),
-                closed: at,
-            }),
+            pending: false,
+            waiting: false,
+            created: 1,
+            outcome: Some(TaskOutcome::new(TaskState::Done, "did it", at)),
+        }
+    }
+
+    fn pending(goal: &str) -> PendingTask {
+        PendingTask {
+            id: 0,
+            goal: goal.into(),
+            cwd: PathBuf::from("/code/app"),
+            name: Some("later".into()),
+            start: TaskStart::Background {
+                args: vec!["--model".into(), "opus".into()],
+            },
+            backlog: Some(4),
+            created: 9,
         }
     }
 
@@ -711,9 +862,12 @@ mod tests {
             args: vec!["--permission-mode".into(), "acceptEdits".into()],
         });
         task.goal = Some(TaskInfo {
+            id: Some(5),
             goal: "fix the tests".into(),
             background: true,
             backlog: Some(2),
+            waiting: true,
+            created: 3,
             outcome: None,
         });
         let sessions = vec![saved("c"), task, saved("a")];
@@ -826,6 +980,78 @@ mod tests {
             .map(|task| task.goal)
             .collect();
         assert_eq!(goals, ["first", "elsewhere", "open"]);
+    }
+
+    #[test]
+    fn a_closed_task_keeps_its_number_and_whether_it_was_cancelled() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Db::open(&socket_in(&dir)).unwrap();
+        let app = Path::new("/code/app");
+        let mut cancelled = closed("dropped", 7);
+        cancelled.outcome = Some(TaskOutcome::new(TaskState::Cancelled, "no", 7));
+        db.record_task(app, &cancelled).unwrap();
+        let back = db.closed_tasks(Some(app)).unwrap();
+        assert_eq!(back, [cancelled]);
+        assert_eq!(back[0].state(), TaskState::Cancelled);
+    }
+
+    #[test]
+    fn tasks_waiting_to_start_share_the_numbers_no_task_gets_twice() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Db::open(&socket_in(&dir)).unwrap();
+        assert_eq!(db.new_task_number().unwrap(), 1);
+        assert_eq!(db.add_pending_task(&pending("later")).unwrap(), 2);
+        assert_eq!(db.add_pending_task(&pending("after")).unwrap(), 3);
+
+        let other = Db::open(&socket_in(&dir)).unwrap();
+        let waiting = other.pending_tasks().unwrap();
+        let wanted = PendingTask {
+            id: 2,
+            ..pending("later")
+        };
+        assert_eq!(waiting[0], wanted);
+        assert_eq!(waiting.len(), 2);
+        assert_eq!(other.pending_task(3).unwrap().unwrap().goal, "after");
+        assert!(other.remove_pending_task(2).unwrap());
+        assert!(!other.remove_pending_task(2).unwrap());
+        assert_eq!(db.pending_task(2).unwrap(), None);
+        assert_eq!(db.new_task_number().unwrap(), 4);
+    }
+
+    #[test]
+    fn spending_adds_up_by_the_day() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&socket_in(&dir)).unwrap();
+        assert_eq!(db.spent_on("2026-10-03").unwrap(), 0.0);
+        db.add_spending("2026-10-03", 1.25).unwrap();
+        db.add_spending("2026-10-03", 0.5).unwrap();
+        db.add_spending("2026-10-04", 2.0).unwrap();
+        assert_eq!(db.spent_on("2026-10-03").unwrap(), 1.75);
+        assert_eq!(db.spent_on("2026-10-04").unwrap(), 2.0);
+    }
+
+    #[test]
+    fn a_database_from_before_tasks_had_numbers_takes_the_next_step() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = socket_in(&dir);
+        {
+            let conn = Connection::open(state::db_path(&socket)).unwrap();
+            conn.execute_batch(TABLES).unwrap();
+            conn.execute_batch("PRAGMA user_version = 1").unwrap();
+            conn.execute("INSERT INTO projects (path) VALUES ('/code/app')", [])
+                .unwrap();
+            conn.execute(
+                "INSERT INTO tasks (project, project_name, goal, session, failed, summary, closed) \
+                 VALUES ('/code/app', 'app', 'old', 'claude', 1, 'no', 5)",
+                [],
+            )
+            .unwrap();
+        }
+        let mut db = Db::open(&socket).unwrap();
+        let old = db.closed_tasks(Some(Path::new("/code/app"))).unwrap();
+        assert_eq!(old[0].id, None);
+        assert_eq!(old[0].state(), TaskState::Failed);
+        assert_eq!(db.new_task_number().unwrap(), 1);
     }
 
     #[test]

@@ -25,7 +25,7 @@ use super::status::Status;
 use super::tabs::Tab;
 use super::theme::Theme;
 use crate::flow_run::RunState;
-use crate::protocol::{SessionInfo, State};
+use crate::protocol::{SessionInfo, State, TaskState};
 use crate::shell;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -762,6 +762,10 @@ fn header_notes(app: &App, slot: Slot, session: &SessionInfo, back: usize) -> Ve
             notes.push("let go to swap".to_string());
         }
     }
+    if let Some(asking) = &session.asking {
+        let gist = fit(&asking.gist, TASK_NOTE_LENGTH);
+        notes.push(format!("⚠ {} {gist} · y/n/Y", asking.tool));
+    }
     let index = app.sessions().iter().position(|s| s.name == session.name);
     let flow_step = index.and_then(|index| app.flow_step_of(index));
     if let Some((run, step)) = flow_step {
@@ -783,23 +787,30 @@ fn header_notes(app: &App, slot: Slot, session: &SessionInfo, back: usize) -> Ve
 const TASK_NOTE_LENGTH: usize = 40;
 
 /// A session's task, for its pane's header: what it was asked to do while
-/// it's open, and how it went, ✓ or ✗, once it's closed.
+/// it's open, that it waits on the user, and how it went, ✓, ✗ or –, once
+/// it's closed.
 fn task_note(session: &SessionInfo) -> Option<String> {
     let task = session.task.as_ref()?;
     let goal = task.goal.lines().next().unwrap_or("");
-    let note = match &task.outcome {
-        None => format!("task: {}", fit(goal, TASK_NOTE_LENGTH)),
-        Some(outcome) => {
-            let mark = if outcome.failed { "✗" } else { "✓" };
-            let said = if outcome.summary.is_empty() {
-                goal
-            } else {
-                &outcome.summary
-            };
-            format!("{mark} {}", fit(said, TASK_NOTE_LENGTH))
+    let mark = match task.state() {
+        TaskState::Running | TaskState::Pending => {
+            return Some(format!("task: {}", fit(goal, TASK_NOTE_LENGTH)));
         }
+        TaskState::Waiting => {
+            return Some(format!(
+                "task waits on you: {}",
+                fit(goal, TASK_NOTE_LENGTH)
+            ));
+        }
+        TaskState::Done => "✓",
+        TaskState::Failed => "✗",
+        TaskState::Cancelled => "–",
     };
-    Some(note)
+    let said = match &task.outcome {
+        Some(outcome) if !outcome.summary.is_empty() => &outcome.summary,
+        _ => goal,
+    };
+    Some(format!("{mark} {}", fit(said, TASK_NOTE_LENGTH)))
 }
 
 /// A pane's header line, `width` columns wide: the session's mark and name,
@@ -939,8 +950,10 @@ fn draw_footer(frame: &mut Frame, app: &App, panes: &[Pane], look: &Look, area: 
         let notice = Line::styled(format!(" {notice}"), Style::new().fg(theme.failed));
         frame.render_widget(notice, area);
     } else {
-        frame.render_widget(hints_line(app, copying, theme, area.width), area);
-        frame.render_widget(keys_hint(app, theme).right_aligned(), area);
+        let right = footer_right(app, theme);
+        let room = usize::from(area.width).saturating_sub(right.width() + 1);
+        frame.render_widget(hints_line(app, copying, theme, area.width, room), area);
+        frame.render_widget(right.right_aligned(), area);
     }
 }
 
@@ -1054,6 +1067,18 @@ const GATE_HINTS: &[(&str, &str)] = &[
     ("u", "next"),
     ("/", "find"),
     ("d", "diff"),
+];
+
+/// The sidebar's keys while the selected background task asks for a
+/// permission.
+const ASKING_HINTS: &[(&str, &str)] = &[
+    ("y", "allow"),
+    ("n", "deny"),
+    ("Y", "always"),
+    ("enter", "watch"),
+    ("x", "kill"),
+    ("q", "quit"),
+    ("u", "next"),
 ];
 
 /// The sidebar's keys while the selection is on a worktree with no
@@ -1209,9 +1234,23 @@ fn draw_filter(frame: &mut Frame, theme: &Theme, filter: &Filter, matches: usize
 /// The keys that don't go to the program, while a pane has the keyboard.
 const PANE_HINTS: &[(&str, &str)] = &[("ctrl+\\", "sidebar"), ("shift+pgup", "history")];
 
+/// The keys a background task's pane takes, while it has the keyboard.
+const TASK_PANE_HINTS: &[(&str, &str)] = &[
+    ("ctrl+\\", "sidebar"),
+    ("y/n/Y", "answer"),
+    ("ctrl+c", "stop the run"),
+    ("shift+pgup", "history"),
+];
+
 /// Where the keyboard is, then the keys that matter most there, as many as
-/// fit beside "? keys".
-fn hints_line<'a>(app: &App, copying: Option<&Pane>, theme: &Theme, width: u16) -> Line<'a> {
+/// fit in `room`, what the right of the footer leaves.
+fn hints_line<'a>(
+    app: &App,
+    copying: Option<&Pane>,
+    theme: &Theme,
+    width: u16,
+    room: usize,
+) -> Line<'a> {
     let doing = |what: &str, slot: Slot| {
         let name = app.pane_session(slot).map_or("", |s| s.name.as_str());
         vec![
@@ -1221,14 +1260,13 @@ fn hints_line<'a>(app: &App, copying: Option<&Pane>, theme: &Theme, width: u16) 
     };
     let (mut spans, hints) = match app.focus() {
         Focus::Sidebar => (whereabouts(app, theme, width), sidebar_hints(app)),
+        Focus::Pane(slot) if app.pane_shows_task(slot) => (doing("in", slot), TASK_PANE_HINTS),
         Focus::Pane(slot) => (doing("typing into", slot), PANE_HINTS),
         Focus::Copy(slot) => {
             let hints = copying.map_or(&[][..], |pane| copy_mode::hints(&pane.screen));
             (doing("copying from", slot), hints)
         }
     };
-    // Room left for "? keys" on the right.
-    let room = usize::from(width).saturating_sub(8);
     for (key, does) in hints {
         let used: usize = spans.iter().map(Span::width).sum();
         let hint = 2 + key.chars().count() + 1 + does.chars().count();
@@ -1251,6 +1289,12 @@ fn hints_line<'a>(app: &App, copying: Option<&Pane>, theme: &Theme, width: u16) 
 fn sidebar_hints(app: &App) -> &'static [(&'static str, &'static str)] {
     if app.selected_empty_worktree().is_some() {
         return EMPTY_WORKTREE_HINTS;
+    }
+    if app
+        .selected()
+        .is_some_and(|session| session.asking.is_some())
+    {
+        return ASKING_HINTS;
     }
     let index = app.selected_index();
     let run = index.and_then(|index| app.flow_step_of(index));
@@ -1301,16 +1345,28 @@ fn selection_place(app: &App) -> Option<String> {
     Some(format!("{place}{}", session.name))
 }
 
-/// "? keys", where `?` opens the list of every key: from the sidebar only,
-/// since in a pane `?` goes to the program.
-fn keys_hint<'a>(app: &App, theme: &Theme) -> Line<'a> {
-    if app.focus() != Focus::Sidebar {
-        return Line::default();
+/// The right of the footer: what background tasks have spent today, in
+/// red past the daily budget, and "? keys", where `?` opens the list of
+/// every key: from the sidebar only, since in a pane `?` goes to the
+/// program.
+fn footer_right<'a>(app: &App, theme: &Theme) -> Line<'a> {
+    let mut spans = Vec::new();
+    if let Some(spending) = app.spending() {
+        let today = format!("${:.2} today", spending.today_usd);
+        let said = if spending.over_budget() {
+            let over = format!("{today} · over ${:.2}", spending.daily_budget_usd);
+            Span::styled(over, Style::new().fg(theme.failed))
+        } else {
+            Span::styled(today, Style::new().fg(theme.muted))
+        };
+        spans.push(said);
+        spans.push(Span::raw("  "));
     }
-    Line::from(vec![
-        Span::styled("?", Style::new().fg(theme.text)),
-        Span::styled(" keys ", Style::new().fg(theme.muted)),
-    ])
+    if app.focus() == Focus::Sidebar {
+        spans.push(Span::styled("?", Style::new().fg(theme.text)));
+        spans.push(Span::styled(" keys ", Style::new().fg(theme.muted)));
+    }
+    Line::from(spans)
 }
 
 /// Asks the prompt's question, with the cursor in the answer.
@@ -1404,6 +1460,7 @@ mod tests {
             worktree: None,
             changed: 0,
             task: None,
+            asking: None,
         }
     }
 

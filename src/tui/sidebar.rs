@@ -12,7 +12,7 @@ use super::theme::Theme;
 use super::ui::Look;
 use crate::flow_run::{FlowRun, RunState, StepState};
 use crate::forge::{PullRequest, PullRequestState};
-use crate::protocol::{Front, SessionInfo};
+use crate::protocol::{Front, SessionInfo, TaskState};
 use crate::shell;
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -307,8 +307,10 @@ fn no_sessions_line<'a>(theme: &Theme, width: u16, selected: bool) -> Line<'a> {
     ])
 }
 
-/// The line under a session with a task: what it was asked to do, while
-/// it's open, or how it went, marked done or failed, once it's closed.
+/// The line under a session with a task: what it was asked to do while
+/// it's open, `▲` when it waits on the user, or `⚠` and the permission a
+/// background task asks for; once it's closed, how it went, marked done,
+/// failed or cancelled.
 fn task_line<'a>(session: &SessionInfo, theme: &Theme, width: u16) -> Line<'a> {
     let Some(task) = &session.task else {
         return Line::default();
@@ -317,20 +319,23 @@ fn task_line<'a>(session: &SessionInfo, theme: &Theme, width: u16) -> Line<'a> {
     let indent = format!("{SESSION_INDENT}  ");
     let room = usize::from(width).saturating_sub(indent.len() + 1);
     let goal = task.goal.lines().next().unwrap_or("");
-    let (mark, color, said) = match &task.outcome {
-        None => ("", theme.muted, goal),
-        Some(outcome) => {
-            let said = if outcome.summary.is_empty() {
-                goal
-            } else {
-                outcome.summary.as_str()
-            };
-            if outcome.failed {
-                ("✗ ", theme.failed, said)
-            } else {
-                ("✓ ", theme.done, said)
-            }
+    let summary = task
+        .outcome
+        .as_ref()
+        .map(|outcome| outcome.summary.as_str())
+        .filter(|summary| !summary.is_empty())
+        .unwrap_or(goal);
+    let asked;
+    let (mark, color, said) = match (&session.asking, task.state()) {
+        (Some(asking), _) => {
+            asked = format!("{} {}", asking.tool, asking.gist);
+            ("⚠ ", theme.waiting, asked.as_str())
         }
+        (None, TaskState::Waiting) => ("▲ ", theme.waiting, goal),
+        (None, TaskState::Done) => ("✓ ", theme.done, summary),
+        (None, TaskState::Failed) => ("✗ ", theme.failed, summary),
+        (None, TaskState::Cancelled) => ("– ", theme.muted, summary),
+        (None, TaskState::Running | TaskState::Pending) => ("", theme.muted, goal),
     };
     let room = room.saturating_sub(mark.chars().count());
     Line::from(vec![
@@ -664,7 +669,43 @@ mod tests {
             worktree: None,
             changed: 0,
             task: None,
+            asking: None,
         }
+    }
+
+    /// What a session's task line says, after its indent.
+    fn task_words(session: &SessionInfo) -> String {
+        let theme = Theme::new(crate::config::ThemeName::Dark, false);
+        let line = task_line(session, &theme, 60);
+        let words: String = line.spans[1..].iter().map(|s| s.content.as_ref()).collect();
+        words.trim_end().to_string()
+    }
+
+    #[test]
+    fn a_task_line_says_how_the_task_stands() {
+        use crate::protocol::{Asking, TaskInfo, TaskOutcome};
+        let mut fixer = session("fixer", Front::Task);
+        fixer.task = Some(TaskInfo {
+            id: Some(1),
+            goal: "fix the tests".into(),
+            background: true,
+            backlog: None,
+            waiting: false,
+            created: 0,
+            outcome: None,
+        });
+        assert_eq!(task_words(&fixer), "fix the tests");
+        fixer.task.as_mut().unwrap().waiting = true;
+        assert_eq!(task_words(&fixer), "▲ fix the tests");
+        fixer.asking = Some(Asking {
+            tool: "Bash".into(),
+            gist: "cargo test".into(),
+        });
+        assert_eq!(task_words(&fixer), "⚠ Bash cargo test");
+        fixer.asking = None;
+        let cancelled = TaskOutcome::new(TaskState::Cancelled, "", 1);
+        fixer.task.as_mut().unwrap().outcome = Some(cancelled);
+        assert_eq!(task_words(&fixer), "– fix the tests");
     }
 
     fn claude() -> Front {

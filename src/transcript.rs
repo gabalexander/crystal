@@ -1,6 +1,7 @@
 //! Reading what `claude -p` says as it works, and writing it out as lines
 //! a person reads: the prompt, what Claude says, each tool it uses with the
-//! first line of what came back, and how the run ended.
+//! first line of what came back, the permissions it asks for and how they
+//! were answered, and how the run ended.
 //!
 //! With `--output-format stream-json`, Claude writes one JSON event per
 //! line: `system` (`init` names the conversation), `assistant` (text and
@@ -43,8 +44,9 @@ pub struct Outcome {
     /// Claude's answer, or what went wrong.
     pub result: String,
     pub conversation: String,
-    /// What the conversation has cost so far. A run that continues a
-    /// conversation counts the runs before it too.
+    /// What Claude has cost so far, as it counts: from its process's start,
+    /// so a process that has run several turns counts them all. A task
+    /// shows each turn's own.
     pub cost_usd: f64,
     pub duration_ms: u64,
     /// The tools Claude asked for that weren't allowed: nobody is there to
@@ -108,6 +110,23 @@ pub fn lines(event: &Event) -> String {
 /// Claude's.
 pub fn note_lines(note: &str) -> String {
     format!("{DIM}{note}{RESET}\r\n\r\n")
+}
+
+/// The line for a permission Claude asks for, which waits on the user.
+pub fn asking_lines(tool: &str, gist: &str) -> String {
+    format!("{YELLOW}⚠ {tool}{RESET} {gist} {DIM}· waiting on you{RESET}\r\n")
+}
+
+/// How the user answered a permission: `allowed`, `allowed always · <the
+/// rule kept>`, `denied: <what Claude was told>`, or that Claude took it
+/// back.
+pub fn answered_lines(answer: &str) -> String {
+    let color = if answer.starts_with("allowed") {
+        GREEN
+    } else {
+        DIM
+    };
+    format!("{color}  └ {answer}{RESET}\r\n")
 }
 
 /// The lines for a run that ended without saying how: it crashed, or
@@ -239,7 +258,7 @@ fn refused(event: &Value) -> Vec<String> {
 /// What a tool was asked to do, in a few words: the command a shell ran,
 /// the file read or written, the pattern searched for. Anything else shows
 /// its input as it is.
-fn tool_gist(name: &str, input: &Value) -> String {
+pub fn tool_gist(name: &str, input: &Value) -> String {
     let key = match name {
         "Bash" => "command",
         "Read" | "Edit" | "Write" | "MultiEdit" | "NotebookEdit" => "file_path",
@@ -407,6 +426,15 @@ mod tests {
         assert!(shown.contains("1m 12s"));
         assert!(shown.contains("$0.04"));
         assert!(shown.contains("refused: Bash rm -rf build"));
+    }
+
+    #[test]
+    fn a_permission_shows_what_it_asks_then_its_answer() {
+        let asked = asking_lines("Bash", "cargo test");
+        assert!(asked.contains("⚠ Bash") && asked.contains("cargo test"));
+        assert!(asked.contains("waiting on you"));
+        assert!(answered_lines("allowed always · Bash(cargo test:*)").starts_with(GREEN));
+        assert!(answered_lines("denied").starts_with(DIM));
     }
 
     #[test]

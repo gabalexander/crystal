@@ -4,7 +4,8 @@ use crate::env;
 use crate::forge::Checkout;
 use crate::git;
 use crate::protocol::{
-    self, Backlog, NewSession, NewTask, Request, Response, SessionInfo, State, TaskSpec,
+    self, Backlog, NewSession, NewTask, PendingTask, Request, Response, SessionInfo, State,
+    TaskSpec,
 };
 use crate::socket;
 use anyhow::{Context, Result, bail};
@@ -50,7 +51,24 @@ pub fn new_session(
     cwd: PathBuf,
     command: Vec<String>,
 ) -> Result<String> {
-    new_session_for(socket, name, cwd, command, Purpose::default())
+    let started = new_session_for(socket, name, cwd, command, Purpose::default())?;
+    Ok(started.name)
+}
+
+/// A session the daemon has just started.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Started {
+    pub name: String,
+    /// The number of the task it was started with, if it was.
+    pub task: Option<u64>,
+}
+
+/// The session a request to start one started.
+fn started(response: Option<Response>) -> Result<Started> {
+    match response {
+        Some(Response::Created { name, task }) => Ok(Started { name, task }),
+        _ => bail!("the daemon didn't start it"),
+    }
 }
 
 /// What a session is started to do, when it's started with something to
@@ -71,7 +89,7 @@ pub fn new_session_for(
     cwd: PathBuf,
     mut command: Vec<String>,
     purpose: Purpose,
-) -> Result<String> {
+) -> Result<Started> {
     if command.is_empty() {
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
         command.push(shell);
@@ -84,22 +102,19 @@ pub fn new_session_for(
         task: purpose.task,
         backlog: purpose.backlog,
     });
-    match ask(socket, &request, true)? {
-        Some(Response::Created { name }) => Ok(name),
-        _ => bail!("the daemon didn't create the session"),
-    }
+    started(ask(socket, &request, true)?)
 }
 
 /// Asks the daemon to start a task in `cwd`, with this process's
 /// environment, for backlog item `backlog` if it's for one. Starts the
-/// daemon if it isn't running. Returns the task's name.
+/// daemon if it isn't running.
 pub fn new_task(
     socket: &Path,
     name: Option<String>,
     cwd: PathBuf,
     spec: TaskSpec,
     backlog: Option<u64>,
-) -> Result<String> {
+) -> Result<Started> {
     let request = Request::NewTask(NewTask {
         name,
         cwd,
@@ -107,10 +122,26 @@ pub fn new_task(
         env: env::current(),
         backlog,
     });
-    match ask(socket, &request, true)? {
-        Some(Response::Created { name }) => Ok(name),
-        _ => bail!("the daemon didn't start the task"),
+    started(ask(socket, &request, true)?)
+}
+
+/// Asks the daemon to keep `task` until it's started, and gives back its
+/// number. Starts the daemon if it isn't running.
+pub fn add_task(socket: &Path, task: PendingTask) -> Result<u64> {
+    match ask(socket, &Request::AddTask(task), true)? {
+        Some(Response::TaskAdded { id }) => Ok(id),
+        _ => bail!("the daemon didn't take the task"),
     }
+}
+
+/// Asks the daemon to start task `id`, which waits to, with this process's
+/// environment.
+pub fn start_task(socket: &Path, id: u64) -> Result<Started> {
+    let request = Request::StartTask {
+        id,
+        env: env::current(),
+    };
+    started(Some(ask_running(socket, &request)?))
 }
 
 /// Asks the daemon to start a run of the flow called `flow` on `goal`, in

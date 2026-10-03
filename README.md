@@ -110,6 +110,7 @@ and the footer says where you are and offers the keys that matter there.
 | `i` | list the open [issues](#pull-requests-and-issues) of the selected session's project: read one, comment, edit it, or start an agent on it |
 | `b` | open the selected session's project's [backlog](#the-backlog) |
 | `c` | close the selected session's [task](#tasks): done or failed, with a line on how it went |
+| `y` / `n` / `Y` | on a [background task](#background-tasks) asking for a permission: allow it, deny it, or allow it always; elsewhere `n` is a new session |
 | `g` | on a step of a [flow](#flows): go on past its gate, or run a step that failed or was cut short again |
 | `f` | on a step of a flow waiting at its gate: send it back, with notes on what to do differently |
 | `d` | show what changed in the selected session's worktree: [the diff](#the-diff) |
@@ -222,6 +223,7 @@ crystal new -d -n review -c ~/code/app codex   # start one in the background, na
 crystal new -w fix/login claude             # start one in a new worktree, on a new branch
 crystal task "update the docs"              # run Claude without a terminal, in the background (see below)
 crystal result task                         # a task's answer
+crystal answer task y                       # allow what a task asks for: y, n or always
 crystal worktree rm fix/login               # remove that worktree, once nothing runs in it
 crystal ls                                  # list sessions and how they're doing
 crystal ls --json                           # the same, as JSON, for scripts and agents
@@ -574,9 +576,11 @@ session, plus `status`, the word the STATE column shows:
 `null` for a program that doesn't report what it's doing; `worktree` is `null` outside a git repository;
 `front` is what's in front in the terminal: `{"kind": "agent", …}`, `{"kind": "shell", "name": "zsh"}`,
 `{"kind": "program", "name": "vite"}` or `{"kind": "task"}`, and `null` until it's been looked at.
-`task` is `null` for a session started with nothing to do, and otherwise holds its [task](#tasks): `goal`,
-and once it's closed, `outcome` with `failed` and `summary`. New fields may appear; none goes away. With no
-daemon running, it prints `[]`.
+`task` is `null` for a session started with nothing to do, and otherwise holds its [task](#tasks): `id`,
+`goal`, `waiting` while it waits on you, and once it's closed, `outcome` with `failed`, `cancelled` and
+`summary`. `asking` holds the permission a [background task](#background-tasks) waits on you for, `tool` and
+`gist`, and is `null` otherwise. New fields may appear; none goes away. With no daemon running, it prints
+`[]`.
 
 #### A skill for Claude Code
 
@@ -618,28 +622,48 @@ never installs anything unless you pass `--install`. `CRYSTAL_SSH` names a comma
 
 A task is Claude Code without a terminal: `claude -p`, running a prompt in the background. It sits in the
 session list like any session, with a transcript you can watch in the TUI, attach to, or `read`: the prompt,
-what Claude says, each tool it uses with the first line of what came back, and how the run ended, with how
-long it took and what it cost.
+what Claude says, each tool it uses with the first line of what came back, the permissions it asks for and
+how you answered, and how each run ended, with how long it took and what it cost.
 
 ```sh
 crystal task -n docs "Update the README for the new flags"           # prints the task's name
 crystal task --wait -n tests "Run the tests and fix what fails" -- --permission-mode acceptEdits
 crystal result tests                                                 # Claude's answer at the end of the run
 crystal send docs "Now the changelog too" --wait                     # a follow-up, in the same conversation
+crystal answer docs y                                                # allow what it asks for: y, n or always
+crystal interrupt docs                                               # stop the run it's in the middle of
 ```
 
-- Arguments after `--` go to every `claude -p` the task runs. Nobody is there to say yes to a permission, so
-  Claude is refused what isn't allowed; say what is with `--allowedTools` or `--permission-mode`. The
-  transcript lists what was refused.
-- `crystal send` gives a finished task a follow-up: another run that carries the conversation on with
+- One `claude` takes the task's prompt and each follow-up after it, a run each, over its standard input
+  (`--input-format stream-json`). Arguments after `--` go to every `claude -p` the task starts.
+- When Claude asks for a tool its permission mode and rules don't allow, the run waits on you: the session
+  shows as `waiting`, its transcript and its pane's header say what it asks (`⚠ Bash cargo test`), and `ls
+  --json` has it as `asking`. `y` in the TUI, on the task in the sidebar or in its pane, or `crystal answer
+  <task> y`, lets it run once. `n` says no: Claude is told so, or what `-m` says, and carries on. `Y`, or
+  `always`, lets it run and keeps a rule for calls like it, so they aren't asked about again: for a shell
+  command its first word, or its first two for `git`, `cargo`, `npm`, `go` and the like (`Bash(cargo
+  test:*)`), and for any other tool the tool. Claude adds the rule to the checkout's
+  `.claude/settings.local.json`, so later sessions there have it too. To be asked less to begin with, allow
+  what it needs with `--allowedTools` or `--permission-mode` after `--`.
+- `Ctrl+C` in a task's pane, or `crystal interrupt <task>`, stops the run it's in the middle of. Its task
+  stays open, waiting on you, and a follow-up carries on.
+- `crystal send` gives a task a follow-up: on the `claude` still there, or once that has gone, after five
+  minutes with nothing to do or after a restart, on a new one that carries the conversation on with
   `--resume`. One run at a time: a follow-up sent while Claude is still working is refused. A task takes no
   keys, so `send-keys` is refused too.
 - `crystal result <task>` prints the last answer; `--json` adds whether the run failed, the conversation's id,
   the cost so far and how many runs the task has had.
+- Each task's `claude` is given `--max-budget-usd`: $5, unless `max_budget_usd` under `[tasks]` in the
+  [settings](#settings) says otherwise, and `0` for none. A run that reaches it fails. What every task spends
+  is added up by the day, and the TUI's footer shows it: `$4.12 today`. With `daily_budget_usd` set, past it
+  the footer turns red (`$6.40 today · over $5.00`) and no new run starts until the next day, whether a new
+  task, a follow-up or a flow's step: each is refused, saying why. Runs already going carry on.
 - A run that fails, or crashes before saying anything, ends the task, which shows how it exited and why.
   `crystal respawn` runs its prompt again, in its conversation if it got that far.
 - After a restart, a task comes back at rest rather than running its prompt again, and what it showed before
   is gone; `crystal send` carries its conversation on.
+
+`<task>` is the task's session, or its [task](#tasks) number, like `t12`.
 
 ### Memory
 
@@ -748,9 +772,9 @@ embeddings = false                  # true to search by meaning too: see above
 ### Tasks
 
 A session started with something to do is a task: an agent given a task in the new-session panel, `crystal
-new -t "<task>" claude` (or simply `crystal new claude "<task>"`), a [background task](#background-tasks), or
-one started from the [backlog](#the-backlog). The task stays open until it's closed, done or failed, with a
-line on how it went:
+new -t "<task>" claude` (or simply `crystal new claude "<task>"`), a [background task](#background-tasks), one
+started from the [backlog](#the-backlog), or one made with `crystal tasks new`. Each task is numbered as it's
+made, `t1`, `t2`…, and stays open until it's closed, done or failed, with a line on how it went:
 
 - The agent closes it from inside its session: `crystal done "<what was done>"`, or `crystal done --failed
   "<why>"`. crystal tells Claude Code how, on top of its system prompt, and tells Codex at the end of its first
@@ -763,14 +787,45 @@ line on how it went:
 - A background task closes itself when its run ends: done with the first line of Claude's answer, or failed.
   A follow-up opens it again.
 
-The sidebar shows a task under its session, what it was asked to do while it's open and `✓` or `✗` with how it
-went once it's closed, and so does the pane's header. `crystal ls` has a TASK column, and `ls --json` a `task`
-field.
+| State | Meaning |
+|---|---|
+| `pending` | made with `--no-launch`: nothing works on it yet |
+| `running` | its session is working on it |
+| `waiting` | its agent's turn ended with the task still open: it's asking you something |
+| `done` | closed done |
+| `failed` | closed failed, or its session ended while it was open, leaving nobody who could close it |
+| `cancelled` | you cancelled it, or killed its session while it was open |
+
+A turn that ends with the task still open, once the agent has been reminded, is a question for you: the session
+waits on you (`▲`, and `u` finds it) until its agent works again, and its task line says so. So does a
+background task you interrupted. A program that exits with its task open fails it, saying how it ended; `crystal
+respawn` opens it again, under the same number.
+
+The sidebar shows a task under its session: what it was asked to do while it's open, `▲` when it waits on you,
+`⚠` and the permission a background task asks for, and `✓`, `✗` or `–` with how it went once it's closed. So
+does the pane's header. `crystal ls` has a TASK column, and `ls --json` a `task` field.
+
+```sh
+crystal tasks                                       # the project's tasks: open, waiting to start, then closed
+crystal tasks new "Fix the flaky test"              # the new-session panel's first agent on it; prints t12
+crystal tasks new --background "Bump the deps" -- --model opus   # or Claude in the background
+crystal tasks new --no-launch "Tidy the README"     # made now, started later: prints t13
+crystal tasks start t13                             # start it; prints its session's name
+crystal tasks show t12                              # how it stands, its session, what it asks for and costs
+crystal tasks cancel t12                            # cancel it, and stop its session
+crystal tasks log t12                               # how it stands, then its session's transcript
+```
+
+`tasks new` works from a shell or from inside a session, in the current directory (`-c <dir>`, or `-w
+<branch>` for a new worktree, made at once), and `-n` names its session. A task is named by its number, with
+or without the `t`, or by its session's name. `crystal task <prompt>` still starts a background task;
+`crystal tasks` is about the tasks there are.
 
 Closed tasks are kept in the project's history in crystal's database: what each was asked, when and how it
 closed, and the session and branch it ran in. `crystal tasks` lists the project's tasks, open ones first, then
-those closed, the latest first; `--all` lists every project's, `-C <dir>` another project's, and `--json`
-prints them for scripts.
+those waiting to start, then those closed, the latest first; `--all` lists every project's, `-C <dir>` another
+project's, and `--json` prints them for scripts. `tasks log` shows a task's transcript while its session is
+still in the list.
 
 ### The backlog
 
@@ -1020,6 +1075,7 @@ file and change. A setting crystal doesn't know is an error that names it, so a 
 | `theme` | `"dark"` | the TUI's colors: `"dark"`, `"light"`, or `"terminal"` |
 | `[plugins]` | | which plugins are on and off: [plugins](#plugins) |
 | `[memory]` | | how memory's [distiller](#the-distiller) runs, and whether it [searches by meaning](#search-by-meaning) |
+| `[tasks]` | | what [background tasks](#background-tasks) may spend: `max_budget_usd` each (`5`), `daily_budget_usd` all together (none) |
 
 `dark` and `light` paint their own background, so crystal looks the same in any terminal; `terminal` paints
 nothing and uses your terminal's own colors. With `NO_COLOR` set, crystal uses no color at all.
@@ -1036,8 +1092,8 @@ notify_command = 'curl -s -d "$CRYSTAL_NOTICE" ntfy.sh/my-crystal'
 offered as a profile of its own.
 
 The daemon reads the notification settings each time it tells you something, `[plugins]` each time it
-does something a plugin adds, `[memory]` each time a task closes or a search runs, and a flow each time one
-starts, so a change counts straight away; the TUI reads `new_session`, `theme`, `[plugins]`, the profiles and
+does something a plugin adds, `[memory]` each time a task closes or a search runs, `[tasks]` each time a
+background task's run starts, and a flow each time one starts, so a change counts straight away; the TUI reads `new_session`, `theme`, `[plugins]`, the profiles and
 the flows when it starts, again when you save a profile or switch a plugin, and every half a second while the
 settings view is open.
 

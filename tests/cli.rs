@@ -4242,39 +4242,79 @@ fn two_codex_sessions_in_one_directory_each_find_their_own_conversation() {
     assert_eq!(conversation_of("second"), "second-thread");
 }
 
-/// A stand-in for `claude -p`. Each run notes its arguments in `runs`, one
-/// line each, then writes what a short run of Claude writes as stream-json:
-/// the conversation, some text, a tool and its answer. It waits for the
-/// test to make `finish-<run>` before its answer and result. With
-/// `FAKE_FAIL` set its result says it failed; with `FAKE_CRASH` it writes an
-/// error and exits before saying anything. Returns the directory to put on
-/// the PATH.
+/// The arguments every background task's `claude` gets, by default.
+const PRINT_ARGS: &str = "-p --input-format stream-json --output-format stream-json --verbose \
+                          --permission-prompt-tool stdio --max-budget-usd 5";
+
+/// A stand-in for a background task's `claude -p`, speaking stream-json:
+/// it reads prompts on its standard input, one JSON line each, and answers
+/// each as a turn. For each prompt it notes its arguments and the prompt in
+/// `runs`, a line each (`<args> -- <prompt>`), then writes what a short turn
+/// of Claude writes: some text, a tool and its answer, waiting for the test
+/// to make `finish-<run>` before its answer and result. The cost it gives
+/// is what its process has cost so far, $0.0421 a turn. A prompt with `ASK`
+/// in it asks for a permission instead, writes the answer it gets to
+/// `answers` and goes on; one with `SLOW` works until it's interrupted.
+/// With `FAKE_FAIL` set its result says it failed; with `FAKE_CRASH` it
+/// writes an error and exits before saying anything; with `FAKE_ONE_TURN`
+/// it exits after its first turn. Returns the directory to put on the
+/// PATH.
 fn print_claude(dir: &Path) -> PathBuf {
     let bin = dir.join("print-bin");
     std::fs::create_dir(&bin).unwrap();
-    let claude = bin.join("claude");
-    let script = r#"#!/bin/sh
-echo "$*" >> runs
-run=$(wc -l < runs | tr -d ' ')
-if [ -n "$FAKE_CRASH" ]; then
-    echo 'Error: Invalid API key' >&2
-    exit 1
-fi
-echo '{"type":"system","subtype":"init","session_id":"conv-1","cwd":"/x","model":"m"}'
-echo '{"type":"assistant","parent_tool_use_id":null,"message":{"content":[{"type":"text","text":"Looking at the tests."},{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"cargo test"}}]}}'
-echo '{"type":"user","parent_tool_use_id":null,"message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"test result: ok. 3 passed","is_error":false}]}}'
-while [ ! -e "finish-$run" ]; do sleep 0.05; done
-echo '{"type":"assistant","parent_tool_use_id":null,"message":{"content":[{"type":"text","text":"All green on run '"$run"'."}]}}'
-if [ -n "$FAKE_FAIL" ]; then
-    echo '{"type":"result","subtype":"error_max_turns","is_error":true,"session_id":"conv-1","total_cost_usd":0.01,"duration_ms":900}'
-    exit 1
-fi
-echo '{"type":"result","subtype":"success","is_error":false,"result":"All green on run '"$run"'.","session_id":"conv-1","total_cost_usd":0.0421,"duration_ms":3200,"permission_denials":[{"tool_name":"Bash","tool_use_id":"t9","tool_input":{"command":"rm -rf build"}}]}'
-"#;
-    std::fs::write(&claude, script).unwrap();
-    let mut permissions = std::fs::metadata(&claude).unwrap().permissions();
-    std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
-    std::fs::set_permissions(&claude, permissions).unwrap();
+    script(
+        &bin.join("claude"),
+        r#"turns=0
+while IFS= read -r line; do
+    case "$line" in *'"type":"user"'*) ;; *) continue ;; esac
+    prompt=$(printf '%s\n' "$line" | sed 's/.*"content":"\([^"]*\)".*/\1/')
+    echo "$* -- $prompt" >> runs
+    run=$(wc -l < runs | tr -d ' ')
+    turns=$((turns + 1))
+    if [ -n "$FAKE_CRASH" ]; then
+        echo 'Error: Invalid API key' >&2
+        exit 1
+    fi
+    echo '{"type":"system","subtype":"init","session_id":"conv-1","cwd":"/x","model":"m"}'
+    case "$prompt" in
+    *ASK*)
+        echo '{"type":"control_request","request_id":"perm-'"$run"'","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"cargo test"},"tool_use_id":"t1"}}'
+        while IFS= read -r answer; do
+            case "$answer" in *'"perm-'"$run"'"'*) break ;; esac
+        done
+        echo "$answer" >> answers
+        case "$answer" in
+        *'"behavior":"allow"'*) echo '{"type":"user","parent_tool_use_id":null,"message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"test result: ok. 3 passed","is_error":false}]}}' ;;
+        *) echo '{"type":"user","parent_tool_use_id":null,"message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"the user said no","is_error":true}]}}' ;;
+        esac
+        ;;
+    *SLOW*)
+        echo '{"type":"assistant","parent_tool_use_id":null,"message":{"content":[{"type":"text","text":"Working slowly."}]}}'
+        while IFS= read -r request; do
+            case "$request" in *'"subtype":"interrupt"'*) break ;; esac
+        done
+        id=$(printf '%s\n' "$request" | sed 's/.*"request_id":"\([^"]*\)".*/\1/')
+        echo '{"type":"control_response","response":{"subtype":"success","request_id":"'"$id"'","response":{}}}'
+        echo '{"type":"result","subtype":"error_during_execution","is_error":true,"session_id":"conv-1","total_cost_usd":0.01,"duration_ms":100}'
+        continue
+        ;;
+    *)
+        echo '{"type":"assistant","parent_tool_use_id":null,"message":{"content":[{"type":"text","text":"Looking at the tests."},{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"cargo test"}}]}}'
+        echo '{"type":"user","parent_tool_use_id":null,"message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"test result: ok. 3 passed","is_error":false}]}}'
+        while [ ! -e "finish-$run" ]; do sleep 0.05; done
+        ;;
+    esac
+    echo '{"type":"assistant","parent_tool_use_id":null,"message":{"content":[{"type":"text","text":"All green on run '"$run"'."}]}}'
+    if [ -n "$FAKE_FAIL" ]; then
+        echo '{"type":"result","subtype":"error_max_turns","is_error":true,"session_id":"conv-1","total_cost_usd":0.01,"duration_ms":900}'
+        continue
+    fi
+    cost=$(awk "BEGIN { print $turns * 0.0421 }")
+    echo '{"type":"result","subtype":"success","is_error":false,"result":"All green on run '"$run"'.","session_id":"conv-1","total_cost_usd":'"$cost"',"duration_ms":3200,"permission_denials":[{"tool_name":"Bash","tool_use_id":"t9","tool_input":{"command":"rm -rf build"}}]}'
+    if [ -n "$FAKE_ONE_TURN" ]; then exit 0; fi
+done
+"#,
+    );
     bin
 }
 
@@ -4318,11 +4358,8 @@ fn a_task_runs_claude_without_a_terminal_and_shows_what_it_did() {
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout), "fixer\n");
 
-    // Claude was asked for its events, with the prompt behind `--`.
-    assert_eq!(
-        runs(dir, 1),
-        ["-p --output-format stream-json --verbose -- fix the tests"]
-    );
+    // Claude was asked for its events, and given the prompt on its input.
+    assert_eq!(runs(dir, 1), [format!("{PRINT_ARGS} -- fix the tests")]);
     eventually("the task is working", || {
         status(&crystal, "fixer") == "working"
     });
@@ -4351,7 +4388,7 @@ fn a_task_runs_claude_without_a_terminal_and_shows_what_it_did() {
 }
 
 #[test]
-fn a_follow_up_carries_the_conversation_on_one_run_at_a_time() {
+fn a_follow_up_goes_to_the_same_claude_one_run_at_a_time() {
     let crystal = Crystal::new();
     let dir = crystal.dir.path();
     let path = path_with(&print_claude(dir));
@@ -4373,10 +4410,12 @@ fn a_follow_up_carries_the_conversation_on_one_run_at_a_time() {
     eventually("the task is done", || status(&crystal, "fixer") == "done");
 
     crystal.ok(&["send", "fixer", "now", "the", "docs"]);
+    // The claude still there takes it, in the conversation it's in: it
+    // wasn't started again to resume it.
     let runs = runs(dir, 2);
     assert_eq!(
         runs[1],
-        "-p --output-format stream-json --verbose --resume conv-1 --model opus -- now the docs"
+        format!("{PRINT_ARGS} --model opus -- now the docs")
     );
     eventually("the follow-up is working", || {
         status(&crystal, "fixer") == "working"
@@ -4510,8 +4549,218 @@ fn a_task_comes_back_at_rest_after_a_restart_and_carries_its_conversation_on() {
     crystal.ok(&["send", "fixer", "carry on"]);
     assert_eq!(
         runs(dir, 2)[1],
-        "-p --output-format stream-json --verbose --resume conv-1 -- carry on"
+        format!("{PRINT_ARGS} --resume conv-1 -- carry on")
     );
+}
+
+#[test]
+fn a_follow_up_once_its_claude_has_gone_resumes_the_conversation() {
+    let crystal = Crystal::new();
+    let dir = crystal.dir.path();
+    let path = path_with(&print_claude(dir));
+    let out = crystal
+        .command(&["task", "-n", "fixer", "fix the tests"])
+        .env("PATH", &path)
+        .env("FAKE_ONE_TURN", "1")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    finish_run(dir, 1);
+    eventually("the task is done", || status(&crystal, "fixer") == "done");
+    eventually("its claude has gone", || {
+        listed(&crystal, "fixer")["pid"].is_null()
+    });
+
+    crystal.ok(&["send", "fixer", "and the docs"]);
+    assert_eq!(
+        runs(dir, 2)[1],
+        format!("{PRINT_ARGS} --resume conv-1 -- and the docs")
+    );
+}
+
+/// Starts a background task called `name` on `prompt`, its claude found on
+/// `path`.
+fn start_task(crystal: &Crystal, path: &str, name: &str, prompt: &str) {
+    let out = crystal
+        .command(&["task", "-n", name, prompt])
+        .env("PATH", path)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// The answers the fake claude has been given, a line each.
+fn answers(dir: &Path, count: usize) -> Vec<String> {
+    let file = dir.join("answers");
+    eventually(&format!("claude has had {count} answers"), || {
+        std::fs::read_to_string(&file).is_ok_and(|answers| answers.lines().count() == count)
+    });
+    let answers = std::fs::read_to_string(&file).unwrap();
+    answers.lines().map(String::from).collect()
+}
+
+#[test]
+fn a_permission_a_task_asks_for_waits_on_the_user_until_they_answer() {
+    let crystal = Crystal::new();
+    let dir = crystal.dir.path();
+    let path = path_with(&print_claude(dir));
+    start_task(&crystal, &path, "fixer", "ASK first");
+
+    eventually("the task waits on the user", || {
+        status(&crystal, "fixer") == "waiting"
+    });
+    let asking = &listed(&crystal, "fixer")["asking"];
+    assert_eq!(asking["tool"], "Bash");
+    assert_eq!(asking["gist"], "cargo test");
+    shows_on_screen(&crystal, "fixer", "⚠ Bash cargo test · waiting on you");
+    let show = crystal.ok(&["tasks", "show", "fixer"]);
+    assert!(
+        show.contains("asking    Bash cargo test: crystal answer t1 y|n|always"),
+        "{show}"
+    );
+
+    // Always lets it run, and keeps a rule for calls like it.
+    crystal.ok(&["answer", "t1", "always"]);
+    let answer: serde_json::Value = serde_json::from_str(&answers(dir, 1)[0]).unwrap();
+    let response = &answer["response"]["response"];
+    assert_eq!(response["behavior"], "allow");
+    assert_eq!(response["updatedInput"]["command"], "cargo test");
+    assert_eq!(
+        response["updatedPermissions"][0]["rules"][0]["ruleContent"],
+        "cargo test:*"
+    );
+    assert_eq!(
+        response["updatedPermissions"][0]["destination"],
+        "localSettings"
+    );
+    shows_on_screen(&crystal, "fixer", "└ allowed always · Bash(cargo test:*)");
+    eventually("the task is done", || status(&crystal, "fixer") == "done");
+    assert!(listed(&crystal, "fixer")["asking"].is_null());
+    let late = crystal.fails(&["answer", "fixer", "y"]);
+    assert!(late.contains("isn't asking for anything"), "{late}");
+
+    // No tells Claude why, and it carries on.
+    crystal.ok(&["send", "fixer", "ASK again"]);
+    eventually("the task waits on the user again", || {
+        status(&crystal, "fixer") == "waiting"
+    });
+    crystal.ok(&["answer", "fixer", "n", "-m", "not on main"]);
+    let answer: serde_json::Value = serde_json::from_str(&answers(dir, 2)[1]).unwrap();
+    let response = &answer["response"]["response"];
+    assert_eq!(response["behavior"], "deny");
+    assert_eq!(response["message"], "not on main");
+    shows_on_screen(&crystal, "fixer", "└ denied");
+    eventually("the task is done", || status(&crystal, "fixer") == "done");
+}
+
+#[test]
+fn an_interrupted_run_leaves_its_task_open_waiting_on_the_user() {
+    let crystal = Crystal::new();
+    let dir = crystal.dir.path();
+    let path = path_with(&print_claude(dir));
+    start_task(&crystal, &path, "fixer", "go SLOW");
+    eventually("the task is working", || {
+        status(&crystal, "fixer") == "working"
+    });
+    let idle = crystal.fails(&["interrupt", "nobody"]);
+    assert!(
+        idle.contains("there's no task or session called nobody"),
+        "{idle}"
+    );
+
+    crystal.ok(&["interrupt", "fixer"]);
+    eventually("the task waits on the user", || {
+        status(&crystal, "fixer") == "waiting"
+    });
+    shows_on_screen(&crystal, "fixer", "interrupted");
+    let tasks = crystal.ok(&["tasks"]);
+    assert!(tasks.starts_with("t1    waiting    fixer"), "{tasks}");
+    let again = crystal.fails(&["interrupt", "fixer"]);
+    assert!(again.contains("isn't working on anything"), "{again}");
+
+    // A follow-up gets it going again, on the same claude.
+    crystal.ok(&["send", "fixer", "carry on"]);
+    assert_eq!(runs(dir, 2)[1], format!("{PRINT_ARGS} -- carry on"));
+    finish_run(dir, 2);
+    eventually("the task is done", || status(&crystal, "fixer") == "done");
+    assert!(crystal.ok(&["tasks"]).starts_with("t1    done       fixer"));
+}
+
+#[test]
+fn past_the_daily_budget_no_new_run_starts() {
+    let crystal = Crystal::new();
+    crystal.configure(
+        "notify = false\n\n[plugins]\nmemory = false\n\n\
+         [tasks]\nmax_budget_usd = 2\ndaily_budget_usd = 0.04\n",
+    );
+    let dir = crystal.dir.path();
+    let path = path_with(&print_claude(dir));
+    start_task(&crystal, &path, "fixer", "fix the tests");
+    // Each claude is held to the budget a task has.
+    assert!(
+        runs(dir, 1)[0].contains("--max-budget-usd 2 "),
+        "{:?}",
+        runs(dir, 1)
+    );
+    finish_run(dir, 1);
+    eventually("the task is done", || status(&crystal, "fixer") == "done");
+
+    let refused = crystal
+        .command(&["task", "-n", "more", "and more"])
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert!(!refused.status.success());
+    let err = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        err.contains("background tasks have spent $0.04 today")
+            && err.contains("past the daily budget of $0.04"),
+        "{err}"
+    );
+    assert!(crystal.row("more").is_none());
+    let follow_up = crystal.fails(&["send", "fixer", "again"]);
+    assert!(follow_up.contains("daily_budget_usd"), "{follow_up}");
+
+    let tui = crystal.tui();
+    tui.shows("$0.04 today · over $0.04");
+}
+
+#[test]
+fn y_answers_a_task_from_the_sidebar_and_ctrl_c_stops_its_run_from_its_pane() {
+    let crystal = Crystal::new();
+    let dir = crystal.dir.path();
+    let path = path_with(&print_claude(dir));
+    start_task(&crystal, &path, "fixer", "ASK first");
+    eventually("the task waits on the user", || {
+        status(&crystal, "fixer") == "waiting"
+    });
+
+    let mut tui = crystal.tui();
+    tui.shows("⚠ Bash cargo test");
+    tui.shows("y allow");
+    tui.type_keys("y");
+    let answer = &answers(dir, 1)[0];
+    assert!(answer.contains(r#""behavior":"allow""#), "{answer}");
+    assert!(!answer.contains("updatedPermissions"), "{answer}");
+    // Watched as it ends, its turn has been seen: the task says it's done.
+    eventually("the task is done", || {
+        crystal.row("fixer").unwrap()[8] == "✓ All green on run 1."
+    });
+
+    crystal.ok(&["send", "fixer", "go SLOW"]);
+    eventually("the task is working", || {
+        status(&crystal, "fixer") == "working"
+    });
+    tui.type_keys("\r");
+    tui.shows("ctrl+c stop the run");
+    tui.type_keys("\x03");
+    eventually("the task waits on the user", || {
+        status(&crystal, "fixer") == "waiting"
+    });
 }
 
 #[test]
@@ -5346,7 +5595,8 @@ fn an_agent_closes_its_task_with_crystal_done_and_ls_shows_how_it_went() {
 
     let tasks = crystal.ok(&["tasks"]);
     assert!(
-        tasks.starts_with("done    fixer") && tasks.contains("fix the tests — did what was asked"),
+        tasks.starts_with("t1    done       fixer")
+            && tasks.contains("fix the tests — did what was asked"),
         "{tasks}"
     );
 }
@@ -5371,7 +5621,7 @@ fn done_needs_a_session_with_a_task() {
     assert_eq!(crystal.row("given").unwrap()[8], "✗ no time");
     let tasks = crystal.ok(&["tasks"]);
     assert!(
-        tasks.contains("failed  given") && tasks.contains("tidy up — no time"),
+        tasks.contains("failed     given") && tasks.contains("tidy up — no time"),
         "{tasks}"
     );
 }
@@ -5405,10 +5655,23 @@ fn an_agent_that_ends_its_turn_with_its_task_open_is_reminded_once() {
     assert!(reason.contains("crystal done"), "{reason}");
     assert_eq!(crystal.row("agent").unwrap()[1], "working");
 
-    // …and once is enough: it may have its reasons to leave the task open.
+    // …and once is enough: it may have its reasons to leave the task open,
+    // like a question for the user, so it waits on them.
     run_hook(&crystal, "agent", &hook, stop);
-    assert_eq!(crystal.row("agent").unwrap()[1], "done");
+    assert_eq!(crystal.row("agent").unwrap()[1], "waiting");
     assert_eq!(crystal.row("agent").unwrap()[8], "fix the tests");
+    assert_eq!(listed(&crystal, "agent")["task"]["waiting"], true);
+    assert!(crystal.ok(&["tasks"]).starts_with("t1    waiting    agent"));
+
+    // Back at work once the user answers.
+    run_hook(
+        &crystal,
+        "agent",
+        &hook,
+        r#"{"hook_event_name":"UserPromptSubmit"}"#,
+    );
+    assert_eq!(crystal.row("agent").unwrap()[1], "working");
+    assert!(crystal.ok(&["tasks"]).starts_with("t1    running    agent"));
 }
 
 #[test]
@@ -5454,7 +5717,7 @@ fn a_background_task_closes_itself_with_the_first_line_of_its_answer() {
     eventually("the task is working", || {
         status(&crystal, "fixer") == "working"
     });
-    assert!(crystal.ok(&["tasks"]).starts_with("open    fixer"));
+    assert!(crystal.ok(&["tasks"]).starts_with("t1    running    fixer"));
 
     finish_run(dir, 1);
     eventually("the task has closed", || {
@@ -5465,6 +5728,123 @@ fn a_background_task_closes_itself_with_the_first_line_of_its_answer() {
         tasks.contains("fix the tests — All green on run 1."),
         "{tasks}"
     );
+}
+
+#[test]
+fn a_task_made_to_wait_is_pending_until_it_starts() {
+    let crystal = Crystal::new();
+    let dir = crystal.dir.path();
+    let path = path_with(&print_claude(dir));
+    let made = crystal
+        .command(&[
+            "tasks",
+            "new",
+            "--background",
+            "--no-launch",
+            "-n",
+            "later",
+            "fix the tests",
+        ])
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert!(
+        made.status.success(),
+        "{}",
+        String::from_utf8_lossy(&made.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&made.stdout), "t1\n");
+    let tasks = crystal.ok(&["tasks"]);
+    assert!(tasks.starts_with("t1    pending    -  "), "{tasks}");
+    let show = crystal.ok(&["tasks", "show", "t1"]);
+    assert!(show.starts_with("t1  pending  fix the tests\n"), "{show}");
+    assert!(!dir.join("runs").exists(), "nothing has started on it");
+
+    // Started, it keeps its number.
+    let started = crystal
+        .command(&["tasks", "start", "1"])
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert!(
+        started.status.success(),
+        "{}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&started.stdout), "later\n");
+    assert_eq!(runs(dir, 1), [format!("{PRINT_ARGS} -- fix the tests")]);
+    assert!(crystal.ok(&["tasks"]).starts_with("t1    running    later"));
+    finish_run(dir, 1);
+    eventually("the task is done", || status(&crystal, "later") == "done");
+
+    // Its log is how it stands, then its transcript.
+    let log = crystal.ok(&["tasks", "log", "t1"]);
+    assert!(log.starts_with("t1  done  fix the tests\n"), "{log}");
+    assert!(
+        log.contains("> fix the tests") && log.contains("All green on run 1."),
+        "{log}"
+    );
+    let again = crystal.fails(&["tasks", "start", "t1"]);
+    assert!(
+        again.contains("there's no task t1 waiting to start"),
+        "{again}"
+    );
+}
+
+#[test]
+fn cancelling_a_task_stops_its_session_and_killing_a_session_cancels_its_task() {
+    let crystal = Crystal::new();
+    // One waiting to start goes straight to the history.
+    assert_eq!(
+        crystal.ok(&["tasks", "new", "--no-launch", "tidy up"]),
+        "t1\n"
+    );
+    crystal.ok(&["tasks", "cancel", "t1"]);
+    let tasks = crystal.ok(&["tasks"]);
+    assert!(
+        tasks.contains("t1    cancelled  -")
+            && tasks.contains("tidy up — cancelled before it started"),
+        "{tasks}"
+    );
+
+    // One a session works on stops the session, which stays to be read.
+    crystal.ok(&["new", "-d", "-n", "sleeper", "-t", "nap", "sleep", "30"]);
+    crystal.ok(&["tasks", "cancel", "sleeper"]);
+    eventually("the session has stopped", || {
+        status(&crystal, "sleeper") != "running"
+    });
+    assert_eq!(
+        crystal.row("sleeper").unwrap()[8],
+        "– cancelled by the user"
+    );
+    let show = crystal.ok(&["tasks", "show", "t2"]);
+    assert!(show.starts_with("t2  cancelled  nap\n"), "{show}");
+    let closed = crystal.fails(&["tasks", "cancel", "t2"]);
+    assert!(
+        closed.contains("sleeper has no task that's open"),
+        "{closed}"
+    );
+
+    crystal.ok(&["new", "-d", "-n", "doomed", "-t", "dig", "sleep", "30"]);
+    crystal.ok(&["kill", "doomed"]);
+    let tasks = crystal.ok(&["tasks"]);
+    assert!(
+        tasks.contains("t3    cancelled  doomed") && tasks.contains("dig — its session was killed"),
+        "{tasks}"
+    );
+}
+
+#[test]
+fn a_task_whose_session_ends_with_it_open_fails_saying_how() {
+    let crystal = Crystal::new();
+    crystal.ok(&[
+        "new", "-d", "-n", "quitter", "-t", "tidy up", "sh", "-c", "exit 3",
+    ]);
+    eventually("the task has failed", || {
+        let tasks = crystal.ok(&["tasks"]);
+        tasks.contains("t1    failed     quitter")
+            && tasks.contains("tidy up — its session ended: exited 3")
+    });
 }
 
 #[test]
@@ -5649,10 +6029,7 @@ fn the_panel_starts_claude_in_the_background_as_a_task() {
     tui.shows("runs  claude -p 'fix the tests'");
     tui.type_keys("\r");
 
-    assert_eq!(
-        runs(dir, 1),
-        ["-p --output-format stream-json --verbose -- fix the tests"]
-    );
+    assert_eq!(runs(dir, 1), [format!("{PRINT_ARGS} -- fix the tests")]);
     assert_eq!(crystal.row("task").unwrap()[8], "fix the tests");
     finish_run(dir, 1);
     eventually("the task has closed", || {
@@ -5691,9 +6068,10 @@ fn a_closed_task_is_remembered_in_its_project_s_memory() {
 }
 
 /// A stand-in for Claude that plays both its parts in a task: as the task,
-/// `claude -p --output-format stream-json`, it writes its arguments down
-/// one a line in `task-args`, then a short run: it found redis down, ran
-/// the tests and says so. As the distiller, run with `--json-schema`, it
+/// `claude -p --input-format stream-json`, it writes its arguments down one
+/// a line in `task-args`, and the prompt it reads in `task-prompt`, then a
+/// short run: it found redis down, ran the tests and says so. As the
+/// distiller, run with `--json-schema`, it
 /// writes its arguments to `distill-args` and its message to
 /// `distill-message`, and answers with two entries, one of a kind it may
 /// not give. Returns the directory to put on the PATH.
@@ -5710,10 +6088,14 @@ fn distilling_claude(dir: &Path) -> PathBuf {
     ;;
 *)
     printf '%s\n' "$@" > task-args.new && mv task-args.new task-args
-    echo '{"type":"system","subtype":"init","session_id":"conv-1"}'
-    echo '{"type":"assistant","parent_tool_use_id":null,"message":{"content":[{"type":"text","text":"Found it: redis was down."},{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"cargo test"}}]}}'
-    echo '{"type":"user","parent_tool_use_id":null,"message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"test result: ok","is_error":false}]}}'
-    echo '{"type":"result","subtype":"success","is_error":false,"result":"Fixed: start redis first.","session_id":"conv-1","total_cost_usd":0.04,"duration_ms":100}'
+    while IFS= read -r line; do
+        case "$line" in *'"type":"user"'*) ;; *) continue ;; esac
+        printf '%s\n' "$line" | sed 's/.*"content":"\([^"]*\)".*/\1/' > task-prompt
+        echo '{"type":"system","subtype":"init","session_id":"conv-1"}'
+        echo '{"type":"assistant","parent_tool_use_id":null,"message":{"content":[{"type":"text","text":"Found it: redis was down."},{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"cargo test"}}]}}'
+        echo '{"type":"user","parent_tool_use_id":null,"message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"test result: ok","is_error":false}]}}'
+        echo '{"type":"result","subtype":"success","is_error":false,"result":"Fixed: start redis first.","session_id":"conv-1","total_cost_usd":0.04,"duration_ms":100}'
+    done
     ;;
 esac
 "#,
@@ -5780,7 +6162,7 @@ fn a_task_is_shown_what_was_learned_and_given_crystal_s_mcp_server() {
         "{prompt}"
     );
     assert!(prompt.contains("memory_search tool"), "{prompt}");
-    assert!(prompt.ends_with("--\nfix the ledger"), "{prompt}");
+    assert_eq!(written(&repo.join("task-prompt")), "fix the ledger\n");
 
     eventually("the task is done and its outcome kept", || {
         crystal
@@ -6419,40 +6801,47 @@ prompt = "Check {previous}"
 "#;
 
 /// A stand-in for `claude -p` in a flow's steps, which keeps what it does
-/// in `dir`, whatever directory a step runs in. Each run notes its
-/// arguments in `runs`, a line each with the prompt's lines joined by `|`,
-/// and answers at once: `answer <n>` for the n-th run, in a conversation
-/// of its own, `conv-<n>`, or the one it was told to resume. A prompt with
-/// `FAIL` in it fails, until the test makes `fixed`; one with `SLOW` in it
-/// waits for the test to make `go` before it answers.
+/// in `dir`, whatever directory a step runs in. Each prompt it reads notes
+/// its arguments and the prompt in `runs`, a line each (`<args> --
+/// <prompt>|`, the prompt's lines joined by `|`), and it answers at once:
+/// `answer <n>` for the n-th prompt, in a conversation of its own,
+/// `conv-<n>` for the prompt it started on, or the one it was told to
+/// resume. A prompt with `FAIL` in it fails, until the test makes `fixed`;
+/// one with `SLOW` in it waits for the test to make `go` before it answers.
 fn flow_claude(dir: &Path) -> PathBuf {
     let bin = dir.join("flow-bin");
     std::fs::create_dir(&bin).unwrap();
     let claude = bin.join("claude");
     let script = format!(
         r#"#!/bin/sh
-for prompt; do :; done
 cd '{dir}'
-echo "$*" | tr '\n' '|' >> runs
-echo >> runs
-run=$(wc -l < runs | tr -d ' ')
-conversation="conv-$run"
+conversation=""
 previous=""
 for arg; do
     if [ "$previous" = "--resume" ]; then conversation="$arg"; fi
     previous="$arg"
 done
-echo '{{"type":"system","subtype":"init","session_id":"'"$conversation"'","cwd":"/x","model":"m"}}'
-case "$prompt" in
-*SLOW*) while [ ! -e go ]; do sleep 0.05; done ;;
-esac
-case "$prompt" in
-*FAIL*) if [ ! -e fixed ]; then
-    echo '{{"type":"result","subtype":"error_during_execution","is_error":true,"session_id":"'"$conversation"'","total_cost_usd":0.01,"duration_ms":10}}'
-    exit 1
-fi ;;
-esac
-echo '{{"type":"result","subtype":"success","is_error":false,"result":"answer '"$run"'","session_id":"'"$conversation"'","total_cost_usd":0.5,"duration_ms":10}}'
+turns=0
+while IFS= read -r line; do
+    case "$line" in *'"type":"user"'*) ;; *) continue ;; esac
+    prompt=$(printf '%s\n' "$line" | sed 's/.*"content":"\([^"]*\)".*/\1/; s/\\n/|/g')
+    echo "$* -- $prompt|" >> runs
+    run=$(wc -l < runs | tr -d ' ')
+    turns=$((turns + 1))
+    if [ -z "$conversation" ]; then conversation="conv-$run"; fi
+    echo '{{"type":"system","subtype":"init","session_id":"'"$conversation"'","cwd":"/x","model":"m"}}'
+    case "$prompt" in
+    *SLOW*) while [ ! -e go ]; do sleep 0.05; done ;;
+    esac
+    case "$prompt" in
+    *FAIL*) if [ ! -e fixed ]; then
+        echo '{{"type":"result","subtype":"error_during_execution","is_error":true,"session_id":"'"$conversation"'","total_cost_usd":0.01,"duration_ms":10}}'
+        continue
+    fi ;;
+    esac
+    cost=$(awk "BEGIN {{ print $turns * 0.5 }}")
+    echo '{{"type":"result","subtype":"success","is_error":false,"result":"answer '"$run"'","session_id":"'"$conversation"'","total_cost_usd":'"$cost"',"duration_ms":10}}'
+done
 "#,
         dir = dir.display()
     );
@@ -6594,11 +6983,11 @@ fn sending_a_flow_back_runs_its_back_to_step_again_with_the_notes() {
     crystal.ok(&["flow", "back", "ship-1", "keep", "the", "old", "default"]);
     assert_eq!(flow_waits(&crystal, "ship-1"), "waiting at review\n");
     let runs = runs(dir, 5);
-    // Build again, as a follow-up in its own conversation, told the notes
-    // and what the review said.
+    // Build again, as a follow-up on its own claude, told the notes and
+    // what the review said.
     let build = &runs[3];
     assert!(
-        build.contains("--resume conv-2 -- Build add retries"),
+        build.contains(" -- Build add retries") && !build.contains("--resume"),
         "{build}"
     );
     assert!(
@@ -6606,9 +6995,9 @@ fn sending_a_flow_back_runs_its_back_to_step_again_with_the_notes() {
         "{build}"
     );
     assert!(build.contains("What review said:|answer 3"), "{build}");
-    // Then the review again, in its own conversation, of the new build.
+    // Then the review again, on its own claude, of the new build.
     assert!(
-        runs[4].contains("--resume conv-3 -- Review answer 4"),
+        runs[4].contains(" -- Review answer 4") && !runs[4].contains("--resume"),
         "{}",
         runs[4]
     );
@@ -6764,11 +7153,7 @@ fn f_sends_a_flow_back_from_its_gate_with_the_notes_typed() {
     tui.shows("send back; what to do differently:");
     tui.type_keys("shorter\r");
     let runs = runs(dir, 2);
-    assert!(
-        runs[1].contains("--resume conv-1 -- Plan add retries"),
-        "{}",
-        runs[1]
-    );
+    assert!(runs[1].contains(" -- Plan add retries"), "{}", runs[1]);
     assert!(runs[1].contains("with these notes: shorter"), "{}", runs[1]);
     tui.shows("round 2");
 }

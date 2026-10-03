@@ -37,7 +37,8 @@ is: it's the one request every version must understand.
 - `src/client.rs`: connects to the daemon, starting it when needed
 - `src/attach.rs`: `crystal attach`: draws a session in your terminal and sends it your keys
 - `src/viewer.rs`: the client's side of an attach, shared by `crystal attach` and the TUI's pane
-- `src/drive.rs`: `crystal send`, `wait`, `read` and `result`, for driving one session from another or a script
+- `src/drive.rs`: `crystal send`, `wait`, `read`, `result`, `answer` and `interrupt`, for driving one session from
+  another or a script
 - `src/keys.rs`: turning keys into the bytes a terminal sends: the TUI's keys, and the names `send-keys` takes;
   the old way, or in the Kitty keyboard protocol once a program has asked for it
 - `src/remote.rs`: `crystal ssh`: finds (or installs) crystal on another machine, then runs it there over ssh
@@ -121,8 +122,15 @@ is: it's the one request every version must understand.
   cursor, selection and search, which are Alacritty's vi mode. The only module that uses `alacritty_terminal`
 - `src/clipboard.rs`: putting text on the user's clipboard: `pbcopy`, `wl-copy`, `xclip` or `xsel` on their own
   machine, or OSC 52 to their terminal over ssh or when none of those works
-- `src/task.rs`: tasks: Claude Code run without a terminal (`claude -p`), one run per prompt or follow-up
+- `src/task.rs`: tasks: Claude Code run without a terminal (`claude -p`): one process taking the prompt and each
+  follow-up over its standard input, the permissions it asks for and their answers, interrupts, each run's cost
+  and budget, and letting an idle one go
+- `src/claude_stream.rs`: Claude Code's stream-json protocol, as crystal speaks it with a background task's
+  `claude -p`: prompts in, the control messages that carry a permission prompt out and its answer back, an
+  interrupt, and the rule "always" keeps; adapted from docket's `docket-claude`
 - `src/transcript.rs`: reading `claude -p`'s stream-json events, and drawing them as a task's transcript
+- `src/spending.rs`: what background tasks have spent today, kept in the database by the day: the TUI footer's
+  `$X today`, and what `daily_budget_usd` is held against
 - `src/protocol.rs`: requests and responses, one JSON line each, and the frames an attached client sends
 - `src/socket.rs`: where the socket lives, and whether a socket is the default one, however it's spelled and
   whoever starts its daemon, so the same socket always gets the same state
@@ -130,17 +138,18 @@ is: it's the one request every version must understand.
   flow runs, each project's directory); a running session as it's written down to start it again
 - `src/db.rs`: the SQLite database the daemon and the TUI keep their state in (WAL, `synchronous=NORMAL`,
   migrations by `user_version`, as docket does): the sessions to start again, flow runs, each project's backlog
-  and closed tasks, and the TUI's tabs, layouts and the new-session panel's memory, each a JSON document; and
+  and closed tasks, the tasks waiting to start and the last task number, what background tasks spent each day,
+  and the TUI's tabs, layouts and the new-session panel's memory, each a JSON document; and
   bringing in the JSON files from before, a project's the first time it's asked for. Settings stay in the
   config file and memory in `memory.db`
 - `src/project.rs`: the project a directory is in: its git main worktree, or the directory itself outside git
 - `src/tasks.rs`: tasks, sessions started with something to do: the paragraph an agent is told about
   `crystal done`, the reminder for one that ends a turn with its task open, reading a project's closed tasks
-  from the file they were kept in before the database, and `enabled`, the one gate everything tasks add goes
-  through
+  from the file they were kept in before the database, numbering tasks (`t12`) and showing a task waiting to
+  start, and `enabled`, the one gate everything tasks add goes through
 - `src/backlog.rs`: a project's backlog, numbered items kept in the database by the daemon alone, its
   markdown export, and `enabled`, the one gate everything the backlog adds goes through
-- `src/work.rs`: `crystal done`, `tasks` and `backlog`
+- `src/work.rs`: `crystal done`, `tasks` and its commands (`new`, `start`, `show`, `cancel`, `log`), and `backlog`
 - `src/config.rs`: the settings in `~/.config/crystal/config.toml`, read and checked
 - `src/memory.rs`: what a project's sessions learned: the SQLite store in the state directory with its FTS5
   index (bm25, prefix and porter-stemmed words), each entry's vector and search by meaning merged with it by
@@ -192,6 +201,7 @@ is: it's the one request every version must understand.
   their own that turns notifications and the memory plugin off (a memory test turns it back on), plugins
   of their own in its plugins directory, and a Claude Code config directory of their own (`CLAUDE_CONFIG_DIR`),
   since a daemon brings the skill there up to date as it starts; a test that opens the new-session panel pins `PATH` to its fake
-  agents, so no real agent is found or run. vt100 stands in for the user's own terminal: a second emulator,
+  agents, so no real agent is found or run, and a background task's `claude` is a fake that speaks stream-json,
+  asks for permissions and takes interrupts. vt100 stands in for the user's own terminal: a second emulator,
   apart from crystal's. A test that copies runs the TUI as over ssh (`SSH_TTY` set), so it asks the terminal
   with OSC 52 and never touches the machine's clipboard

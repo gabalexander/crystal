@@ -67,6 +67,22 @@ pub enum Request {
     Result {
         name: String,
     },
+    /// Answer the permission a background task is asking for. `task` is
+    /// the task's id or its session's name; `message` is what Claude is
+    /// told when it's denied.
+    Answer {
+        task: String,
+        answer: Answer,
+        #[serde(default)]
+        message: Option<String>,
+    },
+    /// Stop the run a background task is in the middle of, leaving the
+    /// task open.
+    Interrupt {
+        task: String,
+    },
+    /// What background tasks have spent today, and the daily budget.
+    Spending,
     /// Close a session's task, done or failed. A program in a session says
     /// which by its `id`; from outside, it's the session's `name`.
     Close {
@@ -98,11 +114,34 @@ pub enum Request {
         limit: usize,
     },
     /// The tasks of the project `dir` is in, or of every project with
-    /// `all`: those still open, then those closed, the latest first.
+    /// `all`: those still open, then those waiting to start, then those
+    /// closed, the latest first.
     Tasks {
         dir: PathBuf,
         #[serde(default)]
         all: bool,
+    },
+    /// Make a task that waits to be started: `crystal tasks new
+    /// --no-launch`.
+    AddTask(PendingTask),
+    /// Start the task with this id, which is waiting to, from the client's
+    /// environment.
+    StartTask {
+        id: u64,
+        env: BTreeMap<String, String>,
+    },
+    /// One task, by its id or its session's name.
+    ShowTask {
+        task: String,
+    },
+    /// Close a task as cancelled, and stop the session working on it.
+    CancelTask {
+        task: String,
+    },
+    /// What happened to a task: how it stands, and its session's
+    /// transcript while the session is there.
+    TaskLog {
+        task: String,
     },
     /// The backlog of the project `dir` is in: what's open, or with `all`,
     /// what's done too.
@@ -226,6 +265,48 @@ pub struct NewTask {
     pub backlog: Option<u64>,
 }
 
+/// A task made to start later: what it's to do, where, and how it starts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingTask {
+    /// Given by the daemon as it takes the task.
+    #[serde(default)]
+    pub id: u64,
+    pub goal: String,
+    pub cwd: PathBuf,
+    /// The session's name, once it starts: `None` names it after its
+    /// program.
+    #[serde(default)]
+    pub name: Option<String>,
+    pub start: TaskStart,
+    #[serde(default)]
+    pub backlog: Option<u64>,
+    /// When it was made, in seconds since the Unix epoch.
+    #[serde(default)]
+    pub created: u64,
+}
+
+/// How a task starts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TaskStart {
+    /// An agent in a terminal: this command, with the goal in it as the
+    /// agent's first prompt.
+    Agent { command: Vec<String> },
+    /// In the background, `claude -p` with these arguments.
+    Background { args: Vec<String> },
+}
+
+/// An answer to the permission a background task asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Answer {
+    /// Yes, this once.
+    Allow,
+    Deny,
+    /// Yes, and a rule for calls like it, so they're not asked about again.
+    Always,
+}
+
 /// What a task is asked to do: the prompt it starts with, and arguments
 /// for each `claude -p` it runs, like `--permission-mode acceptEdits`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -257,6 +338,9 @@ pub struct TaskResult {
 pub enum Response {
     Created {
         name: String,
+        /// The id of the task the session was started with, if it was.
+        #[serde(default)]
+        task: Option<u64>,
     },
     Sessions {
         sessions: Vec<SessionInfo>,
@@ -277,8 +361,21 @@ pub enum Response {
     Result(TaskResult),
     /// Tasks, as `Request::Tasks` asks for them.
     Tasks {
-        tasks: Vec<TaskRecord>,
+        tasks: Vec<TaskView>,
     },
+    /// The id a new task got.
+    TaskAdded {
+        id: u64,
+    },
+    /// One task, as `Request::ShowTask` asks for it.
+    Task(TaskView),
+    /// What happened to a task: how it stands, and its session's
+    /// transcript, while the session is still there.
+    TaskLog {
+        task: TaskView,
+        transcript: Option<Vec<String>>,
+    },
+    Spending(Spending),
     /// A project's backlog.
     Backlog(Backlog),
     /// The number a new backlog item got.
@@ -346,6 +443,32 @@ pub struct SessionInfo {
     /// went.
     #[serde(default)]
     pub task: Option<TaskInfo>,
+    /// The permission a background task is waiting on the user for.
+    #[serde(default)]
+    pub asking: Option<Asking>,
+}
+
+/// A permission a background task's Claude asks for: the tool, and what
+/// it's asked to do with it, like `Bash` and `cargo test`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Asking {
+    pub tool: String,
+    pub gist: String,
+}
+
+/// What background tasks have spent today, by Claude's own count, and the
+/// daily budget, if there is one.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Spending {
+    pub today_usd: f64,
+    /// 0 for none.
+    pub daily_budget_usd: f64,
+}
+
+impl Spending {
+    pub fn over_budget(&self) -> bool {
+        self.daily_budget_usd > 0.0 && self.today_usd >= self.daily_budget_usd
+    }
 }
 
 /// What's in front in a session's terminal: the program its keys go to.
@@ -388,6 +511,10 @@ impl Front {
 /// closed, how that went.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskInfo {
+    /// Its number, which `crystal tasks` shows as `t12`. `None` for a task
+    /// from before tasks had one.
+    #[serde(default)]
+    pub id: Option<u64>,
     /// What the agent was asked to do.
     pub goal: String,
     /// Whether it runs in the background, without a terminal.
@@ -396,27 +523,107 @@ pub struct TaskInfo {
     /// The backlog item it's for, which closing it done ticks.
     #[serde(default)]
     pub backlog: Option<u64>,
+    /// Its agent's turn ended with the task still open: it's asking the
+    /// user something.
+    #[serde(default)]
+    pub waiting: bool,
+    /// When it was made, in seconds since the Unix epoch.
+    #[serde(default)]
+    pub created: u64,
     /// `None` while the task is open.
     #[serde(default)]
     pub outcome: Option<TaskOutcome>,
+}
+
+impl TaskInfo {
+    pub fn state(&self) -> TaskState {
+        match &self.outcome {
+            Some(outcome) => outcome.state(),
+            None if self.waiting => TaskState::Waiting,
+            None => TaskState::Running,
+        }
+    }
+
+    pub fn is_open(&self) -> bool {
+        self.outcome.is_none()
+    }
 }
 
 /// How a task went, once it's closed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskOutcome {
     pub failed: bool,
+    /// The user cancelled it, or killed its session while it was open.
+    #[serde(default)]
+    pub cancelled: bool,
     /// A line on what was done, or why it couldn't be.
     pub summary: String,
     /// When it was closed, in seconds since the Unix epoch.
     pub closed: u64,
 }
 
-/// A task as `crystal tasks` lists it: one still open in a session, or one
-/// closed, from its project's history.
+impl TaskOutcome {
+    /// An outcome for a task that has just come to `state`: done, failed
+    /// or cancelled.
+    pub fn new(state: TaskState, summary: &str, closed: u64) -> TaskOutcome {
+        TaskOutcome {
+            failed: state == TaskState::Failed,
+            cancelled: state == TaskState::Cancelled,
+            summary: summary.trim().to_string(),
+            closed,
+        }
+    }
+
+    pub fn state(&self) -> TaskState {
+        if self.cancelled {
+            TaskState::Cancelled
+        } else if self.failed {
+            TaskState::Failed
+        } else {
+            TaskState::Done
+        }
+    }
+}
+
+/// How a task stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskState {
+    /// Made to start later, with `--no-launch`: nothing works on it yet.
+    Pending,
+    /// Its session is working on it.
+    Running,
+    /// Its agent's turn ended with it still open: it's asking the user
+    /// something.
+    Waiting,
+    Done,
+    Failed,
+    /// The user cancelled it, or killed its session while it was open.
+    Cancelled,
+}
+
+impl TaskState {
+    pub fn word(self) -> &'static str {
+        match self {
+            TaskState::Pending => "pending",
+            TaskState::Running => "running",
+            TaskState::Waiting => "waiting",
+            TaskState::Done => "done",
+            TaskState::Failed => "failed",
+            TaskState::Cancelled => "cancelled",
+        }
+    }
+}
+
+/// A task as `crystal tasks` lists it: one still open in a session, one
+/// waiting to start, or one closed, from its project's history.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskRecord {
+    #[serde(default)]
+    pub id: Option<u64>,
     pub goal: String,
-    /// The session it ran in, under the name it had then.
+    /// The session it ran in, under the name it had then. Empty for a task
+    /// that hasn't started.
     pub session: String,
     pub project: String,
     #[serde(default)]
@@ -425,9 +632,66 @@ pub struct TaskRecord {
     pub background: bool,
     #[serde(default)]
     pub backlog: Option<u64>,
+    /// Made with `--no-launch`, and not started yet.
+    #[serde(default)]
+    pub pending: bool,
+    #[serde(default)]
+    pub waiting: bool,
+    #[serde(default)]
+    pub created: u64,
     /// `None` while it's open.
     #[serde(default)]
     pub outcome: Option<TaskOutcome>,
+}
+
+impl TaskRecord {
+    pub fn state(&self) -> TaskState {
+        match &self.outcome {
+            Some(outcome) => outcome.state(),
+            None if self.pending => TaskState::Pending,
+            None if self.waiting => TaskState::Waiting,
+            None => TaskState::Running,
+        }
+    }
+}
+
+/// A task as the CLI shows it: what's kept of it, how it stands, and, while
+/// a session works on it, what that session is doing.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaskView {
+    #[serde(flatten)]
+    pub record: TaskRecord,
+    pub state: TaskState,
+    /// How its session stands, while the session is still there.
+    #[serde(default)]
+    pub session_state: Option<State>,
+    /// The permission a background task is waiting on the user for.
+    #[serde(default)]
+    pub asking: Option<Asking>,
+    /// What a background task has cost so far, in US dollars.
+    #[serde(default)]
+    pub cost_usd: Option<f64>,
+}
+
+impl TaskView {
+    /// A task that no session is working on now.
+    pub fn of_record(record: TaskRecord) -> TaskView {
+        TaskView {
+            state: record.state(),
+            record,
+            session_state: None,
+            asking: None,
+            cost_usd: None,
+        }
+    }
+}
+
+/// How a task is shown: `t12`.
+pub fn task_label(id: Option<u64>) -> String {
+    match id {
+        Some(id) => format!("t{id}"),
+        None => "-".to_string(),
+    }
 }
 
 /// One project's backlog: things to do later.

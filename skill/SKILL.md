@@ -48,10 +48,14 @@ crystal send tests "Now add a test for the bug" --wait
 crystal result tests
 ```
 
-- Nobody can approve a permission for a task: allow what it needs after `--`, with `--allowedTools` or
-  `--permission-mode`. What it was refused shows at the end of its transcript (`crystal read`).
+- A task that asks for a permission waits: `wait` prints `waiting`, and `crystal tasks show <name>` says what
+  it asks for. The user answers it; answer it yourself (`crystal answer <name> y`, `n -m "<why>"`, or
+  `always`) only when the user has said what to allow. Better, allow what it needs up front, after `--`,
+  with `--allowedTools` or `--permission-mode`.
+- `crystal interrupt <name>` stops its run; the task stays open, and a follow-up carries on.
 - A task takes follow-ups with `send`, one at a time, never `send-keys`.
-- A task whose run fails ends: `wait` prints `exited N`, and `result` says why.
+- A task whose run fails ends: `wait` prints `exited N`, and `result` says why. Past the user's daily
+  budget, a new task or follow-up is refused, saying so: tell the user rather than retrying.
 
 ## Or run a flow
 
@@ -87,9 +91,15 @@ crystal done --failed "The staging database is down"
 - End a turn with your task still open and crystal reminds you, once. Close it then if you're through;
   if you're waiting on the user, leave it open and end your turn.
 - An agent you start with a prompt (`crystal new -d claude "…"`, or `-t "…"` for any command) is given a task.
-  `crystal ls --json` shows it: `task.goal`, and once closed, `task.outcome` with `failed` and `summary`.
+  `crystal ls --json` shows it: `task.id`, `task.goal`, and once closed, `task.outcome` with `failed`,
+  `cancelled` and `summary`.
 - A background task (`crystal task`) closes itself when its run ends.
-- `crystal tasks` lists the project's tasks: open ones, then those closed, the latest first.
+- Each task has a number, like `t12`. `crystal tasks` lists the project's tasks with theirs and how each
+  stands: `pending`, `running`, `waiting` (its turn ended with it open: it's asking the user), `done`,
+  `failed` or `cancelled`. `crystal tasks show <task>` shows one, `crystal tasks log <task>` adds its
+  transcript, and `crystal tasks cancel <task>` cancels it and stops its session: only when the user asks.
+- `crystal tasks new "<goal>"` makes a task and starts an agent on it, printing its number; `--background`
+  runs it as `crystal task` does, and `--no-launch` leaves it pending until `crystal tasks start <task>`.
 
 ## Keep a backlog
 
@@ -113,7 +123,7 @@ Every command works on the current directory's project; `-C <dir>` names another
 |---|---|---|
 | `done` | finished its turn | `read` the answer |
 | `idle` | at its prompt, already seen | `read`, or `send` more work |
-| `waiting` | asking something: a permission, a choice | `read` the question, then answer with `send-keys` |
+| `waiting` | asking something: a permission, a choice, or a question it ended its turn on with its task open | `read` it, then answer: a permission or a choice with `send-keys` (a background task's permission with `crystal answer`), a question with `send` |
 | `exited N`, `killed (…)` | the program ended | `read` its last screen; `crystal respawn <name>` runs it again |
 
 ## Answer its questions

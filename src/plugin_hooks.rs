@@ -317,6 +317,7 @@ mod tests {
             changed: 0,
             front: None,
             task: None,
+            asking: None,
         };
         let event = Event::about_session("session.waiting", &session);
         assert_eq!(event.body["event"], "session.waiting");

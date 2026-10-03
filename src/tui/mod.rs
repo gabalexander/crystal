@@ -47,9 +47,9 @@ use crate::forge::{
 use crate::memory::{self, Listed, Memory};
 use crate::plugins::{self, Context};
 use crate::profile;
-use crate::protocol::{Backlog, NewSession, Request, Response, SessionInfo, Worktree};
+use crate::protocol::{Backlog, NewSession, Request, Response, SessionInfo, Spending, Worktree};
 use crate::{catalog, keys, typing};
-use crate::{client, clipboard, env, git};
+use crate::{client, clipboard, drive, env, git};
 use anyhow::{Context as _, Result, bail};
 use app::{Action, App, Focus, Hit, Place, PluginKey, PluginPane, Slot};
 use backlog_view::BacklogChange;
@@ -195,6 +195,8 @@ pub enum Event {
     },
     /// How many backlog items each project has to do.
     BacklogCounts(HashMap<PathBuf, usize>),
+    /// What background tasks have spent today.
+    Spending(Spending),
     /// The settings as they are now, for the settings view.
     Settings(settings_view::Current),
 }
@@ -594,6 +596,7 @@ impl Tui {
             Event::MemoryRead { dir, read } => self.app.memory_read(&dir, read),
             Event::Backlog { dir, found } => self.app.set_backlog(&dir, found),
             Event::BacklogCounts(counts) => self.app.set_backlog_counts(counts),
+            Event::Spending(spending) => self.app.set_spending(spending),
             Event::Settings(current) => {
                 // The file changed by hand, or by another crystal, counts
                 // here too, straight away.
@@ -703,7 +706,7 @@ impl Tui {
                 purpose,
             } => {
                 let cwd = self.start_dir(place)?;
-                let name = client::new_session_for(&self.socket, None, cwd, command, purpose)?;
+                let name = client::new_session_for(&self.socket, None, cwd, command, purpose)?.name;
                 self.show_new_session(&name)?;
                 self.keep_memory();
             }
@@ -713,7 +716,7 @@ impl Tui {
                 backlog,
             } => {
                 let cwd = self.start_dir(place)?;
-                let name = client::new_task(&self.socket, None, cwd, spec, backlog)?;
+                let name = client::new_task(&self.socket, None, cwd, spec, backlog)?.name;
                 // A background task takes no keys: the sidebar keeps them.
                 self.refresh_sessions()?;
                 self.app.select(&name);
@@ -749,6 +752,14 @@ impl Tui {
                 summary,
             } => {
                 client::close_task(&self.socket, &name, failed, &summary)?;
+                self.refresh_sessions()?;
+            }
+            Action::Answer { name, answer } => {
+                drive::answer(&self.socket, &name, answer, None)?;
+                self.refresh_sessions()?;
+            }
+            Action::Interrupt(name) => {
+                drive::interrupt(&self.socket, &name)?;
                 self.refresh_sessions()?;
             }
             Action::ListBacklog(dir) => self.list_backlog(dir),
@@ -1269,7 +1280,8 @@ impl Tui {
             task: None,
             backlog: None,
         });
-        let Some(Response::Created { name }) = client::ask(&self.socket, &request, true)? else {
+        let Some(Response::Created { name, .. }) = client::ask(&self.socket, &request, true)?
+        else {
             bail!("the daemon didn't start {plugin}'s pane");
         };
         let areas = ui::Areas::of(&self.app, self.screen);
@@ -1788,6 +1800,12 @@ fn spawn_session_poller(socket: PathBuf, events: Sender<Event>, polled: Polled) 
             let sessions = list_sessions(&socket, false).unwrap_or_default();
             let projects = projects_of(&sessions);
             if events.send(Event::Sessions(sessions)).is_err() {
+                return;
+            }
+            if let Ok(Some(Response::Spending(spending))) =
+                client::ask(&socket, &Request::Spending, false)
+                && events.send(Event::Spending(spending)).is_err()
+            {
                 return;
             }
             if count_backlog.load(Ordering::Relaxed)

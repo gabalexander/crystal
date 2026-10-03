@@ -3,6 +3,7 @@ mod agents;
 mod attach;
 mod backlog;
 mod catalog;
+mod claude_stream;
 mod client;
 mod clipboard;
 mod codex;
@@ -39,6 +40,7 @@ mod session;
 mod shell;
 mod skill;
 mod socket;
+mod spending;
 mod state;
 mod task;
 mod tasks;
@@ -52,7 +54,7 @@ mod work;
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
 use profile::{Profile, StartIn};
-use protocol::{Request, Response, SessionInfo, State, TaskSpec};
+use protocol::{Request, Response, SessionInfo, State, TaskSpec, TaskState};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -123,19 +125,44 @@ enum Command {
         summary: Vec<String>,
     },
     /// List the tasks of the project this directory is in: those still
-    /// open, then those closed, the latest first.
+    /// open, then those waiting to start, then those closed, the latest
+    /// first. Or make, start, show or cancel one.
     Tasks {
-        /// Every project's tasks.
+        /// With no command: every project's tasks.
         #[arg(long)]
         all: bool,
 
-        /// The project's directory [default: the current one]
+        /// With no command: the project's directory [default: the current
+        /// one]
         #[arg(short = 'C', long = "dir", value_name = "DIR")]
         dir: Option<PathBuf>,
 
-        /// Print them as JSON.
+        /// With no command: print them as JSON.
         #[arg(long)]
         json: bool,
+
+        #[command(subcommand)]
+        command: Option<TasksCommand>,
+    },
+    /// Answer the permission a background task is waiting on you for: `y`
+    /// lets the tool run, `always` lets it and keeps a rule for calls like
+    /// it, so they aren't asked about again, and `n` says no.
+    Answer {
+        /// The task, by its number, like t12, or its session's name.
+        task: String,
+
+        #[arg(value_enum)]
+        answer: Reply,
+
+        /// With `n`, what Claude is told.
+        #[arg(short, long)]
+        message: Option<String>,
+    },
+    /// Stop the run a background task is in the middle of. Its task stays
+    /// open, waiting on you.
+    Interrupt {
+        /// The task, by its number, like t12, or its session's name.
+        task: String,
     },
     /// Keep the project's backlog: things worth doing later. With no
     /// command, lists what's open.
@@ -385,6 +412,79 @@ enum Command {
 }
 
 #[derive(Subcommand)]
+enum TasksCommand {
+    /// Make a task, and start it: the agent the new-session panel starts
+    /// first, given the goal as its first prompt, or Claude in the
+    /// background with --background. Prints the task's number.
+    New {
+        /// The session's name [default: the program's]
+        #[arg(short, long)]
+        name: Option<String>,
+
+        /// The directory to start in [default: the current one]
+        #[arg(short = 'c', long)]
+        cwd: Option<PathBuf>,
+
+        /// Start in a new git worktree on this branch, as `new -w` does,
+        /// made now.
+        #[arg(short, long, value_name = "BRANCH")]
+        worktree: Option<String>,
+
+        /// Run it in the background, as `crystal task` does.
+        #[arg(long)]
+        background: bool,
+
+        /// Don't start it: it waits, pending, until `crystal tasks start`.
+        #[arg(long)]
+        no_launch: bool,
+
+        /// What it's to do. Several words are joined with spaces.
+        #[arg(required = true)]
+        goal: Vec<String>,
+
+        /// With --background, arguments for its `claude -p`, after `--`.
+        #[arg(last = true, value_name = "CLAUDE ARGS", requires = "background")]
+        claude_args: Vec<String>,
+    },
+    /// Start a task made with --no-launch. Prints its session's name.
+    Start {
+        /// The task's number, like t12.
+        id: String,
+    },
+    /// Show a task: how it stands, its session, what it's asking for and
+    /// has cost, and how it went.
+    Show {
+        /// The task, by its number, like t12, or its session's name.
+        task: String,
+
+        /// Print it as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Cancel a task, and stop the session working on it.
+    Cancel {
+        /// The task, by its number, like t12, or its session's name.
+        task: String,
+    },
+    /// What happened to a task: how it stands, then its session's
+    /// transcript, while the session is still there.
+    Log {
+        /// The task, by its number, like t12, or its session's name.
+        task: String,
+    },
+}
+
+/// An answer to a permission a background task asks for.
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum Reply {
+    #[value(name = "y", alias = "yes")]
+    Yes,
+    #[value(name = "n", alias = "no")]
+    No,
+    Always,
+}
+
+#[derive(Subcommand)]
 enum MemoryCommand {
     /// The entries that have to do with these words, the best first.
     Search {
@@ -604,7 +704,25 @@ fn run(cli: Cli) -> Result<()> {
             failed,
             summary,
         } => work::done(&socket, name, failed, &summary.join(" "))?,
-        Command::Tasks { all, dir, json } => work::list_tasks(&socket, here(dir)?, all, json)?,
+        Command::Tasks {
+            all,
+            dir,
+            json,
+            command,
+        } => tasks(&socket, all, dir, json, command)?,
+        Command::Answer {
+            task,
+            answer,
+            message,
+        } => {
+            let answer = match answer {
+                Reply::Yes => protocol::Answer::Allow,
+                Reply::No => protocol::Answer::Deny,
+                Reply::Always => protocol::Answer::Always,
+            };
+            drive::answer(&socket, &task, answer, message)?;
+        }
+        Command::Interrupt { task } => drive::interrupt(&socket, &task)?,
         Command::Backlog {
             dir,
             all,
@@ -625,7 +743,7 @@ fn run(cli: Cli) -> Result<()> {
                 args: claude_args,
             };
             let cwd = start_dir(&socket, cwd, worktree)?;
-            let name = client::new_task(&socket, name, cwd, spec, None)?;
+            let name = client::new_task(&socket, name, cwd, spec, None)?.name;
             println!("{name}");
             if wait {
                 drive::wait_for_turn(&socket, &name, seconds(timeout))?;
@@ -860,7 +978,7 @@ fn new_session(
         task,
         backlog: None,
     };
-    let name = client::new_session_for(socket, name, cwd, command, purpose)?;
+    let name = client::new_session_for(socket, name, cwd, command, purpose)?.name;
     attach_or_print(socket, &name, detached)
 }
 
@@ -909,6 +1027,42 @@ fn backlog(
         }
     };
     work::change_backlog(socket, dir, action)
+}
+
+/// `crystal tasks` and its commands.
+fn tasks(
+    socket: &Path,
+    all: bool,
+    dir: Option<PathBuf>,
+    json: bool,
+    command: Option<TasksCommand>,
+) -> Result<()> {
+    match command {
+        None => work::list_tasks(socket, here(dir)?, all, json),
+        Some(TasksCommand::New {
+            name,
+            cwd,
+            worktree,
+            background,
+            no_launch,
+            goal,
+            claude_args,
+        }) => {
+            let task = work::NewTask {
+                goal: goal.join(" "),
+                cwd: start_dir(socket, cwd, worktree)?,
+                name,
+                background,
+                claude_args,
+                launch: !no_launch,
+            };
+            work::new_task(socket, task)
+        }
+        Some(TasksCommand::Start { id }) => work::start_task(socket, &id),
+        Some(TasksCommand::Show { task, json }) => work::show_task(socket, &task, json),
+        Some(TasksCommand::Cancel { task }) => work::cancel_task(socket, &task),
+        Some(TasksCommand::Log { task }) => work::task_log(socket, &task),
+    }
 }
 
 /// `crystal flow` and its commands.
@@ -1069,7 +1223,11 @@ fn task_cell(session: &SessionInfo) -> String {
     match &task.outcome {
         None => goal.to_string(),
         Some(outcome) => {
-            let mark = if outcome.failed { "✗" } else { "✓" };
+            let mark = match outcome.state() {
+                TaskState::Failed => "✗",
+                TaskState::Cancelled => "–",
+                _ => "✓",
+            };
             let said = if outcome.summary.is_empty() {
                 goal
             } else {

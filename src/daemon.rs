@@ -19,12 +19,13 @@ use crate::notify::{self, Notice};
 use crate::plugin_hooks::{self, Event, Hooks};
 use crate::project;
 use crate::protocol::{
-    self, Activity, AgentEvent, Backlog, Conversation, Frame, NewSession, NewTask, Request,
-    Response, TaskInfo, TaskRecord,
+    self, Activity, AgentEvent, Backlog, Conversation, Frame, NewSession, NewTask, PendingTask,
+    Request, Response, TaskInfo, TaskOutcome, TaskRecord, TaskSpec, TaskStart, TaskState, TaskView,
 };
 use crate::session::{STOP_GRACE, Session, Term};
 use crate::skill;
 use crate::socket;
+use crate::spending::Spending;
 use crate::state::SavedSession;
 use crate::tasks;
 use crate::typing;
@@ -60,6 +61,7 @@ pub fn run(socket: &Path) -> Result<()> {
         db: Mutex::new(db),
         sessions: Mutex::default(),
         flows: Mutex::default(),
+        spending: Arc::new(Spending::new(Db::open(socket)?)),
         hooks: Hooks::new(socket),
         distilling: Arc::default(),
         preparing: Arc::default(),
@@ -126,6 +128,9 @@ struct Daemon {
     /// other way round, which could leave two threads each waiting on the
     /// other.
     flows: Mutex<Vec<FlowRun>>,
+    /// What background tasks have spent today, on a connection to the
+    /// database of its own: each task's runs add to it as they end.
+    spending: Arc<Spending>,
     /// The plugins' hooks, told what happens.
     hooks: Hooks,
     /// The sessions the distiller is reading now, by id: one pass at a
@@ -203,7 +208,14 @@ impl Daemon {
                         backlog,
                     };
                     let conversation = saved.conversation.map(|conversation| conversation.id);
-                    start_task(&mut sessions, &self.socket, task, conversation, false)
+                    start_task(
+                        &mut sessions,
+                        &self.socket,
+                        &self.spending,
+                        task,
+                        conversation,
+                        false,
+                    )
                 }
                 None => {
                     let new = NewSession {
@@ -243,6 +255,7 @@ impl Daemon {
         loop {
             thread::sleep(KEEP_UP_EVERY);
             let mut sessions = self.sessions.lock().unwrap();
+            self.number_tasks(&mut sessions);
             let claimed: Vec<String> = sessions
                 .iter()
                 .filter_map(|session| session.conversation_id().map(String::from))
@@ -408,17 +421,21 @@ impl Daemon {
             env: run.env.clone(),
             backlog: None,
         };
-        let name = start_task(sessions, &self.socket, task, conversation, true)?;
+        let name = start_task(
+            sessions,
+            &self.socket,
+            &self.spending,
+            task,
+            conversation,
+            true,
+        )?;
         // As a task, it's the step, in the project's history and memory,
         // rather than the whole of its prompt.
         let session = sessions.last_mut().expect("start_task added it");
         if session.task_record().is_some() {
-            session.give_task(TaskInfo {
-                goal: format!("{} {}: {}", run.name, run.step_name(step), run.goal),
-                background: true,
-                backlog: None,
-                outcome: None,
-            });
+            let goal = format!("{} {}: {}", run.name, run.step_name(step), run.goal);
+            session.give_task(new_task_info(goal, true, None));
+            self.number_tasks(std::slice::from_mut(session));
         }
         run.steps[step].session = Some(name);
         Ok(())
@@ -509,18 +526,37 @@ impl Daemon {
         Ok(())
     }
 
+    /// Gives every task that has no number yet one: a task just made, or
+    /// one from before tasks were numbered. One the database can't number
+    /// now is numbered the next time round.
+    fn number_tasks(&self, sessions: &mut [Session]) {
+        for session in sessions.iter_mut().filter(|s| s.task_unnumbered()) {
+            match self.db.lock().unwrap().new_task_number() {
+                Ok(number) => session.number_task(number),
+                Err(err) => eprintln!("crystal daemon: couldn't number a task: {err:#}"),
+            }
+        }
+    }
+
     /// Writes a task that has just closed in `session` into its project's
-    /// history, and, when it was done and was for a backlog item, ticks the
-    /// item. Then the distiller reads what it did.
+    /// history, as [`Daemon::write_down`] does. Then the distiller reads
+    /// what it did.
     fn write_down_closed(&self, session: &Session, task: &TaskRecord) {
-        let cwd = session.cwd();
+        self.write_down(session.cwd(), task);
+        self.distill_later(session, task);
+    }
+
+    /// Writes a task that has just closed, which ran in `cwd`, into its
+    /// project's history, and keeps how it went in the project's memory.
+    /// When it was done and was for a backlog item, ticks the item.
+    fn write_down(&self, cwd: &Path, task: &TaskRecord) {
         let project = project::of(cwd).path;
         {
             let mut db = self.db.lock().unwrap();
             if let Err(err) = db.record_task(&project, task) {
                 eprintln!("crystal daemon: couldn't write down a closed task: {err:#}");
             }
-            let done = task.outcome.as_ref().is_some_and(|outcome| !outcome.failed);
+            let done = task.state() == TaskState::Done;
             let ticks = done && backlog::enabled(&settings());
             if let (true, Some(number)) = (ticks, task.backlog) {
                 let ticked =
@@ -532,15 +568,15 @@ impl Daemon {
         }
         self.hooks.tell(Event::task_closed(cwd, task));
         self.remember_outcome(cwd, task);
-        self.distill_later(session, task);
     }
 
     /// Has the distiller read what the task that just closed in `session`
     /// did, on a thread of its own, when memory is on and the config says
-    /// to.
+    /// to. A cancelled task did nothing anyone wanted kept.
     fn distill_later(&self, session: &Session, task: &TaskRecord) {
         let config = settings();
-        if !memory::enabled(&config) || !config.memory.distill || task.outcome.is_none() {
+        let worth_reading = matches!(task.state(), TaskState::Done | TaskState::Failed);
+        if !memory::enabled(&config) || !config.memory.distill || !worth_reading {
             return;
         }
         let Some(job) = self.distill_job(session, Some(task), config.memory) else {
@@ -685,12 +721,12 @@ impl Daemon {
     }
 
     /// Keeps how a closed task turned out in its project's memory, for the
-    /// sessions after it, when it closed with something to say.
+    /// sessions after it, when it was done or failed with something to say.
     fn remember_outcome(&self, cwd: &Path, task: &TaskRecord) {
         let Some(outcome) = &task.outcome else {
             return;
         };
-        if outcome.summary.trim().is_empty() {
+        if outcome.summary.trim().is_empty() || outcome.cancelled {
             return;
         }
         let line = if outcome.failed {
@@ -743,9 +779,15 @@ impl Daemon {
             Request::New(new) => self.new_session(new),
             Request::NewTask(task) => {
                 let mut sessions = self.sessions.lock().unwrap();
-                let name = start_task(&mut sessions, &self.socket, task, None, true)?;
-                self.tell_started(&sessions, &name);
-                Ok(Response::Created { name })
+                let name = start_task(
+                    &mut sessions,
+                    &self.socket,
+                    &self.spending,
+                    task,
+                    None,
+                    true,
+                )?;
+                Ok(self.started(&mut sessions, name))
             }
             Request::List => {
                 let sessions = self.sessions.lock().unwrap();
@@ -786,7 +828,13 @@ impl Daemon {
                     .iter()
                     .position(|session| session.name == name)
                     .with_context(|| format!("no session named {name}"))?;
-                let session = sessions.remove(index);
+                let mut session = sessions.remove(index);
+                let cancelled = tasks::enabled(&settings())
+                    .then(|| session.cancel_task("its session was killed"))
+                    .flatten();
+                if let Some(cancelled) = cancelled {
+                    self.write_down_closed(&session, &cancelled);
+                }
                 if session.is_running() {
                     self.hooks
                         .tell(Event::about_session("session.ended", &session.info()));
@@ -878,7 +926,12 @@ impl Daemon {
                     (None, Some(name)) => named(&mut sessions, &name)?,
                     (None, None) => bail!("say which session's task to close"),
                 };
-                let closed = session.close_task(failed, &summary)?;
+                let state = if failed {
+                    TaskState::Failed
+                } else {
+                    TaskState::Done
+                };
+                let closed = session.close_task(state, &summary)?;
                 self.write_down_closed(session, &closed);
                 Ok(Response::Done)
             }
@@ -910,6 +963,45 @@ impl Daemon {
                     tasks: self.tasks(&dir, all),
                 })
             }
+            Request::AddTask(mut task) => {
+                tasks::ensure_enabled(&settings())?;
+                task.created = now_seconds();
+                let id = self.db.lock().unwrap().add_pending_task(&task)?;
+                Ok(Response::TaskAdded { id })
+            }
+            Request::StartTask { id, env } => self.start_pending(id, env),
+            Request::ShowTask { task } => {
+                tasks::ensure_enabled(&settings())?;
+                Ok(Response::Task(self.find_task(&task)?))
+            }
+            Request::CancelTask { task } => {
+                self.cancel_task(&task)?;
+                Ok(Response::Done)
+            }
+            Request::TaskLog { task } => {
+                tasks::ensure_enabled(&settings())?;
+                let task = self.find_task(&task)?;
+                let transcript = self.transcript_of(&task);
+                Ok(Response::TaskLog { task, transcript })
+            }
+            Request::Answer {
+                task,
+                answer,
+                message,
+            } => {
+                let mut sessions = self.sessions.lock().unwrap();
+                task_session(&mut sessions, &task)?.answer(answer, message.as_deref())?;
+                Ok(Response::Done)
+            }
+            Request::Interrupt { task } => {
+                let mut sessions = self.sessions.lock().unwrap();
+                task_session(&mut sessions, &task)?.interrupt()?;
+                Ok(Response::Done)
+            }
+            Request::Spending => Ok(Response::Spending(protocol::Spending {
+                today_usd: self.spending.today(),
+                daily_budget_usd: settings().tasks.daily_budget_usd,
+            })),
             Request::BacklogList { dir, all } => {
                 backlog::ensure_enabled(&settings())?;
                 let project = project::of(&dir);
@@ -979,8 +1071,15 @@ impl Daemon {
             Request::Shutdown {
                 keep_sessions: false,
             } => {
-                let sessions = std::mem::take(&mut *self.sessions.lock().unwrap());
-                for session in &sessions {
+                let mut sessions = std::mem::take(&mut *self.sessions.lock().unwrap());
+                let tasks_on = tasks::enabled(&settings());
+                for session in &mut sessions {
+                    let cancelled = tasks_on
+                        .then(|| session.cancel_task("crystal was stopped"))
+                        .flatten();
+                    if let Some(cancelled) = cancelled {
+                        self.write_down(session.cwd(), &cancelled);
+                    }
                     session.stop();
                 }
                 let deadline = Instant::now() + STOP_GRACE + Duration::from_millis(500);
@@ -1012,22 +1111,40 @@ impl Daemon {
     }
 
     /// The tasks of the project `dir` is in, or every project's with `all`:
-    /// those still open in sessions, then those closed, the latest first.
-    fn tasks(&self, dir: &Path, all: bool) -> Vec<TaskRecord> {
+    /// those still open in sessions, then those waiting to start, then
+    /// those closed, the latest first. A task closed more than once, say a
+    /// background task given a follow-up, is listed as it last closed.
+    fn tasks(&self, dir: &Path, all: bool) -> Vec<TaskView> {
         let project = project::of(dir);
-        let in_project =
-            |session: &&Session| all || project::of(session.cwd()).path == project.path;
-        let mut tasks: Vec<TaskRecord> = {
+        let in_project = |cwd: &Path| all || project::of(cwd).path == project.path;
+        let mut tasks: Vec<TaskView> = {
             let sessions = self.sessions.lock().unwrap();
             sessions
                 .iter()
-                .filter(in_project)
-                .filter_map(Session::task_record)
-                .filter(|task| task.outcome.is_none())
+                .filter(|session| in_project(session.cwd()))
+                .filter_map(Session::task_view)
+                .filter(|task| task.record.outcome.is_none())
                 .collect()
         };
+        let pending = self.db.lock().unwrap().pending_tasks();
+        let pending = pending.unwrap_or_else(|err| {
+            eprintln!("crystal daemon: couldn't read the tasks waiting to start: {err:#}");
+            Vec::new()
+        });
+        let pending = pending.iter().filter(|task| in_project(&task.cwd));
+        tasks.extend(pending.map(|task| TaskView::of_record(tasks::pending_record(task))));
         let mine = (!all).then_some(project.path.as_path());
-        let closed = self.db.lock().unwrap().closed_tasks(mine);
+        let mut closed = self.closed_tasks(mine);
+        let mut listed: HashSet<u64> = tasks.iter().filter_map(|task| task.record.id).collect();
+        closed.retain(|task| task.id.is_none_or(|id| listed.insert(id)));
+        tasks.extend(closed.into_iter().map(TaskView::of_record));
+        tasks
+    }
+
+    /// The closed tasks of the project whose main worktree is `project`, or
+    /// of every project, the latest to close first.
+    fn closed_tasks(&self, project: Option<&Path>) -> Vec<TaskRecord> {
+        let closed = self.db.lock().unwrap().closed_tasks(project);
         let mut closed = closed.unwrap_or_else(|err| {
             eprintln!("crystal daemon: couldn't read the closed tasks: {err:#}");
             Vec::new()
@@ -1035,15 +1152,152 @@ impl Daemon {
         closed.sort_by_key(|task| {
             std::cmp::Reverse(task.outcome.as_ref().map_or(0, |outcome| outcome.closed))
         });
-        tasks.extend(closed);
-        tasks
+        closed
+    }
+
+    /// The task `handle` names, by its number or its session's name: open
+    /// in a session, waiting to start, or closed.
+    fn find_task(&self, handle: &str) -> Result<TaskView> {
+        {
+            let mut sessions = self.sessions.lock().unwrap();
+            if let Some(session) = handled_session(&mut sessions, handle) {
+                return session
+                    .task_view()
+                    .with_context(|| format!("{} has no task", session.name));
+            }
+        }
+        let id = tasks::parse_id(handle).with_context(|| {
+            format!("there's no task or session called {handle}: give a task's number, like t12")
+        })?;
+        if let Some(task) = self.db.lock().unwrap().pending_task(id)? {
+            return Ok(TaskView::of_record(tasks::pending_record(&task)));
+        }
+        let closed = self.closed_tasks(None);
+        let found = closed.into_iter().find(|task| task.id == Some(id));
+        let found = found.with_context(|| format!("there's no task t{id}"))?;
+        Ok(TaskView::of_record(found))
+    }
+
+    /// The transcript of the session working on `task`, or that worked on
+    /// it, while that session is still there: its history, then its screen.
+    fn transcript_of(&self, task: &TaskView) -> Option<Vec<String>> {
+        let sessions = self.sessions.lock().unwrap();
+        let session = match task.record.id {
+            Some(id) => sessions
+                .iter()
+                .find(|session| session.task_id() == Some(id)),
+            None => sessions
+                .iter()
+                .find(|session| session.name == task.record.session),
+        }?;
+        Some(session.term().rows(true))
+    }
+
+    /// Cancels the task `handle` names, by its number or its session's
+    /// name, and stops its session; or, waiting to start, takes it out of
+    /// the store.
+    fn cancel_task(&self, handle: &str) -> Result<()> {
+        tasks::ensure_enabled(&settings())?;
+        {
+            let mut sessions = self.sessions.lock().unwrap();
+            if let Some(session) = handled_session(&mut sessions, handle) {
+                let name = session.name.clone();
+                let cancelled = session
+                    .cancel_task("cancelled by the user")
+                    .with_context(|| format!("{name} has no task that's open"))?;
+                self.write_down_closed(session, &cancelled);
+                session.stop();
+                return Ok(());
+            }
+        }
+        let id = tasks::parse_id(handle).with_context(|| {
+            format!("there's no task or session called {handle}: give a task's number, like t12")
+        })?;
+        let pending = {
+            let db = self.db.lock().unwrap();
+            let pending = db.pending_task(id)?;
+            let pending = pending.with_context(|| format!("there's no open task t{id}"))?;
+            db.remove_pending_task(id)?;
+            pending
+        };
+        let closed = now_seconds();
+        let cancelled = TaskRecord {
+            outcome: Some(TaskOutcome::new(
+                TaskState::Cancelled,
+                "cancelled before it started",
+                closed,
+            )),
+            pending: false,
+            ..tasks::pending_record(&pending)
+        };
+        self.write_down(&pending.cwd, &cancelled);
+        Ok(())
+    }
+
+    /// Starts the task numbered `id`, which was waiting to, from the
+    /// client's environment `env`. One that won't start waits on.
+    fn start_pending(&self, id: u64, env: BTreeMap<String, String>) -> Result<Response> {
+        tasks::ensure_enabled(&settings())?;
+        // Held to the end, so that the task can't be started twice at once.
+        let mut sessions = self.sessions.lock().unwrap();
+        let task = self.db.lock().unwrap().pending_task(id)?;
+        let task = task.with_context(|| format!("there's no task t{id} waiting to start"))?;
+        let PendingTask {
+            goal,
+            cwd,
+            name,
+            start: how,
+            backlog,
+            ..
+        } = task;
+        let started = match how {
+            TaskStart::Agent { command } => {
+                let new = NewSession {
+                    name,
+                    cwd,
+                    command,
+                    env,
+                    task: Some(goal),
+                    backlog,
+                };
+                start(&mut sessions, &self.socket, new, None)
+            }
+            TaskStart::Background { args } => {
+                let new = NewTask {
+                    name,
+                    cwd,
+                    spec: TaskSpec { prompt: goal, args },
+                    env,
+                    backlog,
+                };
+                start_task(&mut sessions, &self.socket, &self.spending, new, None, true)
+            }
+        };
+        let name = started?;
+        // It keeps the number it was given as it was made.
+        if let Some(session) = sessions.last_mut() {
+            session.number_task(id);
+        }
+        if let Err(err) = self.db.lock().unwrap().remove_pending_task(id) {
+            eprintln!("crystal daemon: couldn't forget that t{id} waits to start: {err:#}");
+        }
+        Ok(self.started(&mut sessions, name))
     }
 
     fn new_session(&self, new: NewSession) -> Result<Response> {
         let mut sessions = self.sessions.lock().unwrap();
         let name = start(&mut sessions, &self.socket, new, None)?;
-        self.tell_started(&sessions, &name);
-        Ok(Response::Created { name })
+        Ok(self.started(&mut sessions, name))
+    }
+
+    /// What's said once the session called `name` has started: the plugins
+    /// are told, its task is numbered, and the client is told both.
+    fn started(&self, sessions: &mut [Session], name: String) -> Response {
+        self.number_tasks(sessions);
+        self.tell_started(sessions, &name);
+        let session = sessions.iter().find(|session| session.name == name);
+        let task = session.and_then(Session::task_id);
+        Response::Created { name, task }
     }
 
     /// Tells the plugins that the session called `name` has started.
@@ -1083,7 +1337,14 @@ impl Daemon {
                     backlog,
                 };
                 let conversation = launch.conversation.map(|conversation| conversation.id);
-                start_task(&mut sessions, &self.socket, task, conversation, true)
+                start_task(
+                    &mut sessions,
+                    &self.socket,
+                    &self.spending,
+                    task,
+                    conversation,
+                    true,
+                )
             }
             None => {
                 let new = NewSession {
@@ -1091,7 +1352,7 @@ impl Daemon {
                     cwd: launch.cwd,
                     command: launch.command,
                     env,
-                    task: launch.goal.map(|goal| goal.goal),
+                    task: launch.goal.as_ref().map(|goal| goal.goal.clone()),
                     backlog,
                 };
                 start(&mut sessions, &self.socket, new, launch.conversation)
@@ -1103,7 +1364,15 @@ impl Daemon {
         }
         // `start` adds the new session at the end; it goes where the old
         // one was.
-        let started = sessions.pop().expect("start added a session");
+        let mut started = sessions.pop().expect("start added a session");
+        // It's the same task, open again, under the same number.
+        if let (Some(goal), true) = (launch.goal, started.task_record().is_some()) {
+            started.give_task(TaskInfo {
+                waiting: false,
+                outcome: None,
+                ..goal
+            });
+        }
         sessions.insert(index, started);
         self.tell_started(&sessions, name);
         Ok(Response::Done)
@@ -1221,12 +1490,7 @@ fn start(
     let argv = agents::with_options(argv, &memory_tools(socket, &cwd, &command, &crystal));
     let mut session = Session::spawn(id, name.clone(), command, &argv, cwd, &env)?;
     if let Some(goal) = task {
-        session.give_task(TaskInfo {
-            goal,
-            background: false,
-            backlog,
-            outcome: None,
-        });
+        session.give_task(new_task_info(goal, false, backlog));
     }
     match conversation {
         Some(conversation) => session.set_conversation(conversation),
@@ -1329,12 +1593,14 @@ fn task_args(socket: &Path, cwd: &Path, spec: &protocol::TaskSpec) -> Vec<String
     agents::with_value(&args, &["--allowedTools", "--allowed-tools"], &tools)
 }
 
-/// Starts a task and adds it to `sessions`. With `run_prompt`, Claude runs
-/// its prompt now; without, the task waits at rest for a follow-up. Given a
-/// `conversation`, its runs carry that on.
+/// Starts a task and adds it to `sessions`, its runs adding to
+/// `spending`. With `run_prompt`, Claude runs its prompt now; without, the
+/// task waits at rest for a follow-up. Given a `conversation`, its runs
+/// carry that on.
 fn start_task(
     sessions: &mut Vec<Session>,
     socket: &Path,
+    spending: &Arc<Spending>,
     task: NewTask,
     conversation: Option<String>,
     run_prompt: bool,
@@ -1363,15 +1629,20 @@ fn start_task(
     let env = env::for_session(&env, &name, &id, socket);
     let prompt = spec.prompt.clone();
     let args = task_args(socket, &cwd, &spec);
-    let mut session = Session::task(id, name.clone(), spec, args, cwd, env, conversation);
+    let spending = spending.clone();
+    let mut session = Session::task(
+        id,
+        name.clone(),
+        spec,
+        args,
+        cwd,
+        env,
+        spending,
+        conversation,
+    );
     // It closes itself when its run ends, from Claude's answer.
     if tasks::enabled(&settings()) {
-        session.give_task(TaskInfo {
-            goal: prompt.clone(),
-            background: true,
-            backlog,
-            outcome: None,
-        });
+        session.give_task(new_task_info(prompt.clone(), true, backlog));
     }
     if run_prompt {
         session.prompt(&prompt)?;
@@ -1380,6 +1651,19 @@ fn start_task(
     }
     sessions.push(session);
     Ok(name)
+}
+
+/// A task just made, open, and numbered by [`Daemon::number_tasks`].
+fn new_task_info(goal: String, background: bool, backlog: Option<u64>) -> TaskInfo {
+    TaskInfo {
+        id: None,
+        goal,
+        background,
+        backlog,
+        waiting: false,
+        created: now_seconds(),
+        outcome: None,
+    }
 }
 
 /// The user's settings, read again each time so that a change counts at
@@ -1443,6 +1727,25 @@ impl Drop for Reading {
     fn drop(&mut self) {
         self.reading.lock().unwrap().remove(&self.id);
     }
+}
+
+/// The session `handle` names: the one working on task `t12`, or else the
+/// one called that.
+fn handled_session<'a>(sessions: &'a mut [Session], handle: &str) -> Option<&'a mut Session> {
+    let by_task = tasks::parse_id(handle).and_then(|id| {
+        sessions
+            .iter()
+            .position(|session| session.task_id() == Some(id))
+    });
+    let index = by_task.or_else(|| sessions.iter().position(|session| session.name == handle))?;
+    Some(&mut sessions[index])
+}
+
+/// The session working on the task `handle` names, by the task's number or
+/// the session's name.
+fn task_session<'a>(sessions: &'a mut [Session], handle: &str) -> Result<&'a mut Session> {
+    handled_session(sessions, handle)
+        .with_context(|| format!("there's no task or session called {handle}"))
 }
 
 fn named<'a>(sessions: &'a mut [Session], name: &str) -> Result<&'a mut Session> {

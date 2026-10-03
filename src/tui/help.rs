@@ -58,8 +58,8 @@ pub const KEYS: &[Key] = &[
     sidebar("PgUp/PgDn e", "page / edit its history"),
     sidebar("t/T/&", "tab: new / name / close"),
     sidebar("[/] 1-9 >", "switch tabs / move it"),
-    sidebar("n/w", "new, or in a worktree"),
-    sidebar("W", "remove its worktree"),
+    sidebar("n/w W", "new, in a worktree / rm"),
+    sidebar("y/n/Y", "answer what a task asks"),
     sidebar("r/x", "rename / kill it"),
     of_plugin("tasks", "c", "close its task"),
     of_plugin("flows", "g/f", "flow: go on / send back"),
@@ -74,6 +74,7 @@ pub const KEYS: &[Key] = &[
     in_pane("Shift+PgUp", "page back"),
     in_pane("Shift+PgDn", "page forward"),
     in_pane("other keys", "go to the program"),
+    in_pane("Ctrl+C", "stop a task's run"),
     question("y", "yes; any other key, no"),
     question("Enter/Esc", "answer / cancel"),
     question("Ctrl+U", "clear the answer"),
@@ -82,8 +83,7 @@ pub const KEYS: &[Key] = &[
     new_session("Alt+Enter", "new line in the task"),
     new_session("Ctrl+E", "edit the command line"),
     mouse("click", "a session, pane, tab"),
-    mouse("wheel", "move, or scroll a pane"),
-    mouse("drag", "select and copy"),
+    mouse("wheel/drag", "scroll / select, copy"),
 ];
 
 const fn key(section: Section, label: &'static str, does: &'static str) -> Key {

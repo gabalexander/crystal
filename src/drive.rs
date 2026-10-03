@@ -1,9 +1,9 @@
-//! `crystal send`, `wait`, `read` and `result`: how one agent drives
-//! another, or a script drives an agent. They work from inside a session as
-//! well, since every session knows its daemon's socket.
+//! `crystal send`, `wait`, `read`, `result`, `answer` and `interrupt`: how
+//! one agent drives another, or a script drives an agent. They work from
+//! inside a session as well, since every session knows its daemon's socket.
 
 use crate::client;
-use crate::protocol::{Activity, Request, Response, SessionInfo, State};
+use crate::protocol::{Activity, Answer, Request, Response, SessionInfo, State};
 use anyhow::{Context, Result, bail};
 use std::path::Path;
 use std::thread;
@@ -36,6 +36,28 @@ pub fn send_keys(socket: &Path, name: &str, keys: Vec<String>) -> Result<()> {
     let request = Request::SendKeys {
         name: name.to_string(),
         keys,
+    };
+    ask(socket, &request)?;
+    Ok(())
+}
+
+/// Answers the permission the background task `task` names, by its number
+/// or its session's name, is waiting on: with a denial, Claude is told
+/// `message`.
+pub fn answer(socket: &Path, task: &str, answer: Answer, message: Option<String>) -> Result<()> {
+    let request = Request::Answer {
+        task: task.to_string(),
+        answer,
+        message,
+    };
+    ask(socket, &request)?;
+    Ok(())
+}
+
+/// Stops the run the background task `task` names is in the middle of.
+pub fn interrupt(socket: &Path, task: &str) -> Result<()> {
+    let request = Request::Interrupt {
+        task: task.to_string(),
     };
     ask(socket, &request)?;
     Ok(())
@@ -210,6 +232,7 @@ mod tests {
             worktree: None,
             changed: 0,
             task: None,
+            asking: None,
         }
     }
 

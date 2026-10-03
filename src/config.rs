@@ -36,6 +36,8 @@ pub struct Config {
     pub plugins: BTreeMap<String, bool>,
     /// How the memory plugin learns: `[memory]` in the file.
     pub memory: MemorySettings,
+    /// What background tasks may spend: `[tasks]` in the file.
+    pub tasks: TaskSettings,
     /// Saved ways to start an agent, offered first in the new-session
     /// panel: `[[profile]]` tables in the file. See [`crate::profile`].
     #[serde(rename = "profile", skip_serializing_if = "Vec::is_empty")]
@@ -73,6 +75,28 @@ impl Default for MemorySettings {
     }
 }
 
+/// What background tasks may spend, in US dollars, by Claude's own count.
+/// 0 is no limit.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TaskSettings {
+    /// The most one task's `claude -p` may spend, as `--max-budget-usd`: a
+    /// run that reaches it fails.
+    pub max_budget_usd: f64,
+    /// The most every background task together may spend in a day: past
+    /// it, no new run starts until tomorrow.
+    pub daily_budget_usd: f64,
+}
+
+impl Default for TaskSettings {
+    fn default() -> TaskSettings {
+        TaskSettings {
+            max_budget_usd: 5.0,
+            daily_budget_usd: 0.0,
+        }
+    }
+}
+
 /// The TUI's colors to choose from. `dark` and `light` paint their own
 /// background, so they look the same in any terminal; `terminal` paints
 /// nothing and keeps to the terminal's own colors.
@@ -93,6 +117,7 @@ impl Default for Config {
             theme: ThemeName::Dark,
             plugins: BTreeMap::new(),
             memory: MemorySettings::default(),
+            tasks: TaskSettings::default(),
             profiles: Vec::new(),
             flows: Vec::new(),
         }
@@ -495,6 +520,16 @@ back_to = "build"
     }
 
     #[test]
+    fn background_tasks_have_a_budget_each_and_none_a_day_unless_given() {
+        let config = parse("").unwrap();
+        assert_eq!(config.tasks.max_budget_usd, 5.0);
+        assert_eq!(config.tasks.daily_budget_usd, 0.0);
+        let config = parse("[tasks]\ndaily_budget_usd = 10\n").unwrap();
+        assert_eq!(config.tasks.daily_budget_usd, 10.0);
+        assert!(parse("[tasks]\nbudget = 1\n").is_err());
+    }
+
+    #[test]
     fn a_leftover_preset_says_its_now_a_profile() {
         let err = parse("[[preset]]\nname = \"x\"\nagent = \"claude\"\n").unwrap_err();
         assert!(
@@ -516,6 +551,10 @@ back_to = "build"
                 distill_model: "claude-sonnet-5-5".into(),
                 distill_budget_usd: 0.5,
                 embeddings: true,
+            },
+            tasks: TaskSettings {
+                max_budget_usd: 2.5,
+                daily_budget_usd: 20.0,
             },
             profiles: vec![Profile {
                 name: "review".into(),

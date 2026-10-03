@@ -4,17 +4,20 @@
 use crate::agent_screen::{self, Looks, ScreenWatch};
 use crate::agents;
 use crate::codex::Rollouts;
+use crate::config::Config;
 use crate::distill::Material;
 use crate::front;
 use crate::git::Checkout;
 use crate::keys;
 use crate::notify::{self, Notice};
 use crate::protocol::{
-    Activity, AgentEvent, Conversation, Front, SessionInfo, State, TaskInfo, TaskOutcome,
-    TaskRecord, TaskResult, TaskSpec,
+    Activity, AgentEvent, Answer, Conversation, Front, SessionInfo, State, TaskInfo, TaskOutcome,
+    TaskRecord, TaskResult, TaskSpec, TaskState, TaskView,
 };
+use crate::spending::Spending;
 use crate::state::SavedSession;
 use crate::task::Task;
+use crate::tasks;
 use crate::vt;
 use anyhow::{Context, Result, ensure};
 use portable_pty::{CommandBuilder, ExitStatus, MasterPty, PtySize, native_pty_system};
@@ -170,9 +173,10 @@ impl Session {
     }
 
     /// Makes a task: a session for `claude -p` runs of `spec`, with `args`,
-    /// whose screen shows what Claude does. It starts at rest;
-    /// [`Session::prompt`] gives it its prompt. Given a `conversation`, its
-    /// runs carry it on.
+    /// whose screen shows what Claude does, and whose runs add to
+    /// `spending`. It starts at rest; [`Session::prompt`] gives it its
+    /// prompt. Given a `conversation`, its runs carry it on.
+    #[allow(clippy::too_many_arguments)]
     pub fn task(
         id: String,
         name: String,
@@ -180,6 +184,7 @@ impl Session {
         args: Vec<String>,
         cwd: PathBuf,
         env: BTreeMap<String, String>,
+        spending: Arc<Spending>,
         conversation: Option<String>,
     ) -> Session {
         let term = Arc::new(Term::without_terminal());
@@ -192,6 +197,7 @@ impl Session {
             env.clone(),
             term.clone(),
             state.clone(),
+            spending,
             conversation,
         );
         Session {
@@ -243,7 +249,7 @@ impl Session {
             .as_ref()
             .with_context(|| format!("{name} isn't a task"))?;
         ensure!(
-            task.pid().is_none(),
+            !task.is_working(),
             "{name} is still working: `crystal wait {name}` for it first"
         );
         task.result()
@@ -254,10 +260,37 @@ impl Session {
     /// going on, before any has ended, and for a session that isn't a task.
     pub fn finished_run(&self) -> Option<TaskResult> {
         let task = self.task.as_ref()?;
-        if task.pid().is_some() {
+        if task.is_working() {
             return None;
         }
         task.result()
+    }
+
+    /// The background task this session runs, or why there's none.
+    fn background(&self) -> Result<&Task> {
+        let name = &self.name;
+        self.task.as_ref().with_context(|| {
+            format!(
+                "{name} isn't a background task: answer it in its pane, or with `crystal send-keys {name}`"
+            )
+        })
+    }
+
+    /// Answers the permission a background task is waiting on the user
+    /// for.
+    pub fn answer(&self, answer: Answer, message: Option<&str>) -> Result<()> {
+        let task = self.background()?;
+        ensure!(self.is_running(), "{} has ended", self.name);
+        task.answer(answer, message)
+            .with_context(|| format!("{} can't take an answer", self.name))
+    }
+
+    /// Stops the run a background task is in the middle of.
+    pub fn interrupt(&self) -> Result<()> {
+        let task = self.background()?;
+        ensure!(self.is_running(), "{} has ended", self.name);
+        task.interrupt()
+            .with_context(|| format!("{} can't be interrupted", self.name))
     }
 
     /// A task started again after a restart: it says so, and waits at rest
@@ -278,20 +311,60 @@ impl Session {
         self.goal = Some(goal);
     }
 
-    /// Closes the session's task, done or failed, saying how it went, and
-    /// gives back the task as the project's history keeps it.
-    pub fn close_task(&mut self, failed: bool, summary: &str) -> Result<TaskRecord> {
+    /// Closes the session's task, saying how it went: `state` is done,
+    /// failed or cancelled. Gives back the task as the project's history
+    /// keeps it.
+    pub fn close_task(&mut self, state: TaskState, summary: &str) -> Result<TaskRecord> {
         let name = &self.name;
         let goal = self.goal.as_mut().with_context(|| {
             format!("{name} has no task: it wasn't started with something to do")
         })?;
-        goal.outcome = Some(TaskOutcome {
-            failed,
-            summary: summary.trim().to_string(),
-            closed: seconds_since_epoch(SystemTime::now()),
-        });
+        let closed = seconds_since_epoch(SystemTime::now());
+        goal.outcome = Some(TaskOutcome::new(state, summary, closed));
+        // A task that waited on the user asks nothing of them any more.
+        if std::mem::take(&mut goal.waiting) && self.activity == Some(Activity::Waiting) {
+            self.activity = Some(Activity::Idle);
+        }
         *self.changed.lock().unwrap() = SystemTime::now();
         Ok(self.task_record().expect("the task was just closed"))
+    }
+
+    /// Cancels the session's task, if it's open, saying `why`, and gives it
+    /// back as the project's history keeps it.
+    pub fn cancel_task(&mut self, why: &str) -> Option<TaskRecord> {
+        if !self.goal.as_ref().is_some_and(TaskInfo::is_open) {
+            return None;
+        }
+        self.close_task(TaskState::Cancelled, why).ok()
+    }
+
+    /// The session's task, as `crystal tasks show` shows it.
+    pub fn task_view(&self) -> Option<TaskView> {
+        let record = self.task_record()?;
+        Some(TaskView {
+            state: record.state(),
+            record,
+            session_state: Some(self.state.lock().unwrap().clone()),
+            asking: self.task.as_ref().and_then(Task::asking),
+            cost_usd: self.task.as_ref().map(Task::cost_usd),
+        })
+    }
+
+    /// The id of the session's task, if it has one.
+    pub fn task_id(&self) -> Option<u64> {
+        self.goal.as_ref()?.id
+    }
+
+    /// Whether the session has a task with no number yet.
+    pub fn task_unnumbered(&self) -> bool {
+        self.goal.as_ref().is_some_and(|goal| goal.id.is_none())
+    }
+
+    /// Gives the session's task the number `number`, unless it has one.
+    pub fn number_task(&mut self, number: u64) {
+        if let Some(goal) = &mut self.goal {
+            goal.id.get_or_insert(number);
+        }
     }
 
     /// Whether to remind the agent, as it ends a turn, that its task is
@@ -325,12 +398,16 @@ impl Session {
             None => crate::project::of(&self.cwd).name,
         };
         Some(TaskRecord {
+            id: goal.id,
             goal: goal.goal.clone(),
             session: self.name.clone(),
             project,
             branch: worktree.and_then(|worktree| worktree.branch),
             background: goal.background,
             backlog: goal.backlog,
+            pending: false,
+            waiting: goal.waiting,
+            created: goal.created,
             outcome: goal.outcome.clone(),
         })
     }
@@ -392,33 +469,52 @@ impl Session {
             worktree: self.checkout.as_ref().map(Checkout::worktree),
             changed: seconds_since_epoch(*self.changed.lock().unwrap()),
             task: self.goal.clone(),
+            asking: self.task.as_ref().and_then(Task::asking),
         }
     }
 
-    /// Works out what the agent is doing from what it just reported.
+    /// Works out what the agent is doing from what it just reported. A
+    /// turn that ends with the session's task still open is a question for
+    /// the user, and the task waits on them until the agent works again.
     pub fn on_agent_event(&mut self, event: AgentEvent) {
-        let activity = next_activity(self.activity, event, self.term.is_watched());
+        let turn_ended = event == AgentEvent::TurnEnded
+            || (event == AgentEvent::StillIdle && self.activity == Some(Activity::Working));
+        let mut activity = next_activity(self.activity, event, self.term.is_watched());
+        if let Some(goal) = self.goal.as_mut().filter(|goal| goal.is_open()) {
+            if turn_ended && tasks_on() {
+                goal.waiting = true;
+                activity = Some(Activity::Waiting);
+            } else if matches!(event, AgentEvent::TurnStarted | AgentEvent::ToolFinished) {
+                goal.waiting = false;
+            }
+        }
         if activity != self.activity {
             self.activity = activity;
             *self.changed.lock().unwrap() = SystemTime::now();
         }
     }
 
-    /// Keeps up with what the session's agent is doing: a task's from its
-    /// runs, any other program's from its screen.
+    /// Keeps up with what the session's agent is doing, a task's from its
+    /// runs, any other program's from its screen, and fails a task whose
+    /// session has ended under it.
     pub fn check(&mut self) {
-        let Some(task) = &mut self.task else {
-            return self.check_screen();
-        };
-        let events = task.events();
-        for event in events {
-            self.on_agent_event(event);
-            self.follow_runs(event);
+        match self.task.as_mut().map(Task::events) {
+            Some(events) => {
+                for event in events {
+                    // How a run ended closes its task first: a task that
+                    // stays open waits on the user.
+                    self.follow_runs(event);
+                    self.on_agent_event(event);
+                }
+            }
+            None => self.check_screen(),
         }
+        self.fail_task_if_ended();
     }
 
     /// A background task closes itself when a run ends, from what Claude
-    /// said at the end, and opens again when a follow-up starts another.
+    /// said at the end, and opens again when a follow-up starts another. A
+    /// run the user stopped leaves it open.
     fn follow_runs(&mut self, event: AgentEvent) {
         let Some(goal) = &mut self.goal else {
             return;
@@ -426,15 +522,36 @@ impl Session {
         match event {
             AgentEvent::TurnStarted if goal.outcome.is_some() => goal.outcome = None,
             AgentEvent::TurnEnded if goal.outcome.is_none() => {
-                let Some(result) = self.task.as_ref().and_then(Task::result) else {
+                let Some(task) = &self.task else {
+                    return;
+                };
+                let Some(result) = task.result().filter(|_| !task.was_interrupted()) else {
                     return;
                 };
                 let summary = result.text.lines().next().unwrap_or("").to_string();
-                if let Ok(record) = self.close_task(result.failed, &summary) {
+                let state = if result.failed {
+                    TaskState::Failed
+                } else {
+                    TaskState::Done
+                };
+                if let Ok(record) = self.close_task(state, &summary) {
                     self.closed.push(record);
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Fails the session's task when the session has ended with it still
+    /// open: nobody is left who could close it.
+    fn fail_task_if_ended(&mut self) {
+        let open = self.goal.as_ref().is_some_and(TaskInfo::is_open);
+        if !open || self.is_running() || !tasks_on() {
+            return;
+        }
+        let why = format!("its session ended: {}", self.state.lock().unwrap());
+        if let Ok(record) = self.close_task(TaskState::Failed, &why) {
+            self.closed.push(record);
         }
     }
 
@@ -803,6 +920,12 @@ impl Term {
             .retain(|viewer| viewer.feed.try_send(chunk.clone()).is_ok());
         screen.vt.take_replies()
     }
+}
+
+/// Whether tasks are on, by the config as it is now: with them off, an
+/// open task is left as it is.
+fn tasks_on() -> bool {
+    tasks::enabled(&Config::load().unwrap_or_default())
 }
 
 /// `time` as seconds since the Unix epoch, which is how it travels.
