@@ -659,8 +659,8 @@ fn the_tui_lists_the_sessions_and_shows_the_selected_one() {
     }
 
     let mut tui = crystal.tui();
-    tui.shows("▸ alpha");
-    tui.shows("▸ beta");
+    tui.shows("❯ alpha");
+    tui.shows("❯ beta");
     tui.shows("alpha is here");
 
     tui.type_keys("j");
@@ -673,7 +673,7 @@ fn keys_go_to_the_pane_after_enter_and_back_to_the_list_after_ctrl_backslash() {
     crystal.ok(&["new", "-n", "cat", "cat"]);
 
     let mut tui = crystal.tui();
-    tui.shows("▸ cat");
+    tui.shows("❯ cat");
     tui.type_keys("\r");
     tui.shows("typing into");
     tui.type_keys("hello pane\r");
@@ -693,7 +693,7 @@ fn a_paste_goes_whole_to_the_pane_typed_into_and_never_to_the_list() {
     let pasted = crystal.dir.path().join("pasted");
 
     let mut tui = crystal.tui();
-    tui.shows("▸ cat");
+    tui.shows("❯ cat");
     // On the list, its letters would be keys: x would ask to kill cat.
     tui.type_keys("\x1b[200~x\x1b[201~");
     tui.type_keys("\r");
@@ -718,7 +718,7 @@ fn n_with_no_agent_installed_starts_a_shell_and_hands_it_the_keyboard() {
     tui.shows("a shell takes no task");
     tui.shows("runs  your shell");
     tui.type_keys("\r");
-    tui.shows("▸ sh");
+    tui.shows("❯ sh");
     tui.shows("typing into");
     tui.type_keys("echo I am $CRYSTAL_SESSION\r");
     tui.shows("I am sh");
@@ -1048,7 +1048,7 @@ fn x_asks_first_and_only_y_kills_the_selected_session() {
     let pid = crystal.pid("doomed");
 
     let mut tui = crystal.tui();
-    tui.shows("▸ doomed");
+    tui.shows("❯ doomed");
     tui.type_keys("x");
     tui.shows("kill doomed? y/n");
     tui.type_keys("n");
@@ -1092,7 +1092,7 @@ fn q_quits_the_tui_and_the_sessions_keep_running() {
     crystal.ok(&["new", "-n", "stays", "sleep", "30"]);
 
     let mut tui = crystal.tui();
-    tui.shows("▸ stays");
+    tui.shows("❯ stays");
     tui.type_keys("q");
     assert!(tui.exit());
     assert_eq!(crystal.row("stays").unwrap()[1], "running");
@@ -1115,7 +1115,7 @@ fn a_question_mark_shows_every_key_and_the_next_key_only_closes_it() {
     eventually("the keys are put away", || {
         !tui.text().contains("In the sidebar")
     });
-    tui.shows("▸ stays");
+    tui.shows("❯ stays");
     tui.type_keys("q");
     assert!(tui.exit());
 }
@@ -1478,16 +1478,16 @@ fn the_tui_groups_sessions_by_project_then_worktree() {
     crystal.ok(&["new", "-n", "shell", "sleep", "30"]);
 
     let tui = crystal.tui();
-    tui.shows("▸ shell");
+    tui.shows("❯ shell");
     let text = sidebar_of(&tui.text());
     let order = [
         line_with(&text, " app ─"),
         line_with(&text, "⌂ main"),
-        line_with(&text, "▸ planner"),
+        line_with(&text, "❯ planner"),
         line_with(&text, "⎇ fix"),
-        line_with(&text, "▸ fixer"),
+        line_with(&text, "❯ fixer"),
         line_with(&text, "outside git"),
-        line_with(&text, "▸ shell"),
+        line_with(&text, "❯ shell"),
     ];
     assert!(order.is_sorted(), "out of order: {order:?}\n{text}");
 }
@@ -1890,7 +1890,7 @@ fn tab_takes_the_keyboard_on_to_a_split_and_its_session_gets_the_keys() {
     crystal.ok(&["new", "-n", "other", "sleep", "30"]);
 
     let mut tui = crystal.tui();
-    tui.shows("▸ reader");
+    tui.shows("❯ reader");
     tui.type_keys("s");
     tui.type_keys("j");
 
@@ -2279,7 +2279,7 @@ fn the_tui_hands_the_mouse_back_to_the_terminal_when_it_quits() {
     crystal.ok(&["new", "-n", "stays", "sleep", "30"]);
 
     let mut tui = crystal.tui();
-    tui.shows("▸ stays");
+    tui.shows("❯ stays");
     assert!(tui.sends_the_mouse());
     assert!(tui.marks_pastes());
     tui.type_keys("q");
@@ -2299,7 +2299,7 @@ fn clicking_a_session_row_selects_it() {
 
     let mut tui = crystal.tui();
     tui.shows("alpha is here");
-    let row = line_with(&tui.text(), "▸ beta");
+    let row = line_with(&tui.text(), "❯ beta");
     tui.type_keys(&click(10, row));
     tui.shows("beta is here");
 }
@@ -2310,7 +2310,7 @@ fn clicking_a_pane_hands_it_the_keyboard() {
     crystal.ok(&["new", "-n", "cat", "cat"]);
 
     let mut tui = crystal.tui();
-    tui.shows("▸ cat");
+    tui.shows("❯ cat");
     tui.type_keys(&click(50, 10));
     tui.shows("typing into");
     tui.type_keys("hello by mouse\r");
@@ -2340,7 +2340,7 @@ fn a_program_that_asks_for_the_mouse_gets_clicks_where_it_drew() {
     written(&crystal.dir.path().join("listening"));
 
     let mut tui = crystal.tui();
-    tui.shows("▸ mousy");
+    tui.shows("❯ mousy");
     // A program has the mouse in the pane that has the keyboard.
     tui.type_keys("\r");
     tui.shows("typing into");
@@ -2411,12 +2411,12 @@ fn r_in_the_tui_renames_the_selected_session() {
     crystal.ok(&["new", "-n", "agent", "sleep", "30"]);
 
     let mut tui = crystal.tui();
-    tui.shows("▸ agent");
+    tui.shows("❯ agent");
     tui.type_keys("r");
     tui.shows("new name: agent");
     // Ctrl+U clears the old name first.
     tui.type_keys("\x15reviewer\r");
-    tui.shows("▸ reviewer");
+    tui.shows("❯ reviewer");
     assert!(crystal.row("reviewer").is_some());
 }
 
@@ -2442,7 +2442,7 @@ fn the_tui_still_knows_the_session_it_runs_in_once_renamed() {
     terminal.shows("This is the session crystal is running in.");
 
     crystal.ok(&["rename", "host", "renamed"]);
-    terminal.shows("▸ renamed");
+    terminal.shows("❯ renamed");
     terminal.shows("This is the session crystal is running in.");
 }
 
@@ -2583,7 +2583,7 @@ fn shift_w_removes_a_worktree_once_nothing_runs_in_it() {
     assert!(worktree.is_dir());
 
     crystal.ok(&["kill", "tests"]);
-    tui.hides("▸ tests");
+    tui.hides("❯ tests");
     tui.type_keys("W");
     tui.shows("remove worktree fix? y/n");
     tui.type_keys("y");
@@ -3630,7 +3630,7 @@ fn slash_filters_the_sidebar_and_enter_selects_the_match() {
 
     tui.type_keys("\r");
     tui.shows("refund-fix is here");
-    tui.shows("▸ planner");
+    tui.shows("❯ planner");
 }
 
 /// A stand-in for GitHub's `gh`: it answers `pr list` and `issue list` with
@@ -4415,7 +4415,7 @@ fn the_keys_of_a_plugin_that_s_off_aren_t_listed() {
     let crystal = Crystal::new();
     crystal.ok(&["new", "-n", "agent", "sleep", "30"]);
     let mut tui = crystal.tui();
-    tui.shows("▸ agent");
+    tui.shows("❯ agent");
     tui.type_keys("?");
     tui.shows("the project's backlog");
     assert!(

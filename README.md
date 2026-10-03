@@ -131,22 +131,24 @@ The sidebar groups sessions by project, then by worktree: `⌂` marks a reposito
 linked one, each named by its branch. Sessions outside any repository come last, under their directory.
 `w` makes its worktree in the selected session's project, or in the repository you started `crystal` in.
 
-Each row says what its session is doing. A project with a session waiting on you moves to the top, and that
-session leads its worktree.
+Each row says what its session is doing. Within a worktree the agents come first, then a `terminals` line and
+the terminals: shells, and any other program that isn't an agent, drawn quieter. A project with a session
+waiting on you moves to the top, and that session leads its worktree.
 
 | Mark | Meaning |
 |---|---|
 | `▲` waiting | the agent is asking you something, like a permission |
 | `◐` working | the agent is working on a turn; the mark turns while it does |
 | `✓` done | the agent finished its turn, and you haven't looked yet |
-| `▸` | running: an agent at its prompt, or any other program |
+| `▸` | running: an agent at its prompt |
+| `❯` | a terminal: muted at a shell's prompt, brighter while a program runs in it |
 | `■` | ended: muted when it exited well, red when it failed; the pane's header says how |
 
 Each row also says what's in front in the session's terminal when its name doesn't already say it: `claude`,
 `codex`, `vite`, `zsh`. crystal asks the terminal which program its keys go to, about once a second, so a
-shell you typed `claude` into shows Claude Code, and shows the shell again when Claude exits. A shell at its
-prompt has a muted `▸`, so the agents stand out. It recognises the agents crystal can start, however they're
-installed: Claude Code's own binary, named after its version, or an agent npm runs with `node`.
+shell you typed `claude` into moves up among the agents, and back among the terminals when Claude exits. It
+recognises the agents crystal can start, however they're installed: Claude Code's own binary, named after its
+version, or an agent npm runs with `node`.
 
 crystal knows what an agent is doing in two ways. When it starts Claude Code itself, it adds hooks with
 `--settings`, so your settings files are left alone and your own hooks still run. And for every session it

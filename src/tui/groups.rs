@@ -6,11 +6,14 @@
 //! Sessions waiting on the user come first without leaving their group: a
 //! project with a waiting session moves to the top, and within its worktree
 //! the waiting session leads. What needs the user is at the top, still next
-//! to the work it belongs to. Everything else stays in the order it was
-//! made in, so the list doesn't shuffle as agents work.
+//! to the work it belongs to. Within a worktree, its agents come before
+//! its terminals, the shells and other programs beside them, with a line
+//! between the two, so an agent never passes for a shell at a glance.
+//! Everything else stays in the order it was made in, so the list doesn't
+//! shuffle as agents work.
 
 use crate::flow_run::FlowRun;
-use crate::protocol::{Activity, SessionInfo};
+use crate::protocol::{Activity, Front, SessionInfo};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -34,6 +37,9 @@ pub enum Row {
     Directory(PathBuf),
     /// The session at this index in the ordered list.
     Session(usize),
+    /// The line between a worktree's agents and its terminals, when it has
+    /// both.
+    Terminals,
     /// The task of the session at this index, under its row: what it was
     /// asked to do, or how that went.
     Task(usize),
@@ -76,6 +82,7 @@ pub fn order(sessions: Vec<SessionInfo>, runs: &[FlowRun]) -> Vec<SessionInfo> {
                 flow_step: flow_step.unwrap_or_default(),
                 linked: session.worktree.as_ref().is_some_and(|w| !w.main),
                 worktree_first: worktree_first[worktree],
+                terminal: is_terminal(session),
                 not_waiting: !is_waiting(session),
                 made,
             }
@@ -90,12 +97,14 @@ pub fn order(sessions: Vec<SessionInfo>, runs: &[FlowRun]) -> Vec<SessionInfo> {
 /// The sidebar's rows for sessions already in [`order`] with `runs`, those
 /// that `keep` keeps by their index: a heading wherever the project or the
 /// worktree changes, then each session, and under one with a task, its
-/// task. A flow run is a heading of its own, then a row for each step: its
-/// session's, or one for the step alone when it has none. Only a kept
-/// session brings its headings, and a run's.
+/// task. Where a worktree's terminals follow its agents, a line goes
+/// between them. A flow run is a heading of its own, then a row for each
+/// step: its session's, or one for the step alone when it has none. Only a
+/// kept session brings its headings, and a run's.
 pub fn rows(sessions: &[SessionInfo], runs: &[FlowRun], keep: impl Fn(usize) -> bool) -> Vec<Row> {
     let mut rows = Vec::new();
-    let mut previous: Option<(Option<&Path>, Under)> = None;
+    // Where the session given a row last went, and whether it's a terminal.
+    let mut previous: Option<(Option<&Path>, Under, bool)> = None;
     let kept = sessions
         .iter()
         .enumerate()
@@ -106,9 +115,12 @@ pub fn rows(sessions: &[SessionInfo], runs: &[FlowRun], keep: impl Fn(usize) -> 
             Some((run, _)) => Under::Run(run),
             None => Under::Worktree(worktree),
         };
-        let same_project = previous.is_some_and(|(p, _)| p == project);
-        let same_group = same_project && previous.is_some_and(|(_, u)| u == under);
-        previous = Some((project, under));
+        let terminal = is_terminal(session);
+        let same_project = previous.is_some_and(|(p, _, _)| p == project);
+        let same_group = same_project && previous.is_some_and(|(_, u, _)| u == under);
+        let after_an_agent =
+            same_group && previous.is_some_and(|(_, _, was_terminal)| !was_terminal);
+        previous = Some((project, under, terminal));
         if !same_project {
             rows.push(project_heading(session));
         }
@@ -122,6 +134,11 @@ pub fn rows(sessions: &[SessionInfo], runs: &[FlowRun], keep: impl Fn(usize) -> 
             Under::Worktree(_) => {
                 if !same_group {
                     rows.push(worktree_heading(session));
+                }
+                // A worktree's agents come first, so its first terminal
+                // after an agent is where the line between them goes.
+                if terminal && after_an_agent {
+                    rows.push(Row::Terminals);
                 }
                 rows.push(Row::Session(index));
                 if session.task.is_some() {
@@ -196,7 +213,10 @@ struct SortKey {
     linked: bool,
     /// …then worktrees in the order their first sessions were made.
     worktree_first: usize,
-    /// Within a worktree, sessions waiting on the user go first…
+    /// Within a worktree, agents go before terminals. Only an agent can be
+    /// waiting on the user, so a waiting session still leads its worktree…
+    terminal: bool,
+    /// …and among the agents, those waiting on the user go first…
     not_waiting: bool,
     /// …then sessions in the order they were made.
     made: usize,
@@ -230,6 +250,13 @@ fn worktree_heading(session: &SessionInfo) -> Row {
         },
         None => Row::Directory(session.cwd.clone()),
     }
+}
+
+/// Whether a session is a terminal rather than an agent: what's in front
+/// in it is a shell or some other program. One not looked at yet counts as
+/// a terminal until it has been, a moment after it starts.
+pub fn is_terminal(session: &SessionInfo) -> bool {
+    !matches!(session.front, Some(Front::Agent { .. } | Front::Task))
 }
 
 fn is_waiting(session: &SessionInfo) -> bool {
@@ -268,6 +295,21 @@ mod tests {
 
     fn waiting(mut session: SessionInfo) -> SessionInfo {
         session.activity = Some(Activity::Waiting);
+        session
+    }
+
+    /// `session` with Claude Code in front.
+    fn agent(mut session: SessionInfo) -> SessionInfo {
+        session.front = Some(Front::Agent {
+            program: "claude".into(),
+            name: "Claude Code".into(),
+        });
+        session
+    }
+
+    /// `session` with zsh in front, at its prompt.
+    fn shell(mut session: SessionInfo) -> SessionInfo {
+        session.front = Some(Front::Shell { name: "zsh".into() });
         session
     }
 
@@ -367,6 +409,50 @@ mod tests {
         ]);
         // app's first session came first; its main worktree leads it.
         assert_eq!(names(&sessions), ["a2", "a1", "a3", "w1"]);
+    }
+
+    #[test]
+    fn within_a_worktree_agents_come_before_terminals() {
+        let sessions = order(vec![
+            shell(session("zsh", "app", "main")),
+            agent(session("claude", "app", "main")),
+            session("server", "app", "main"),
+            waiting(agent(session("claude-2", "app", "main"))),
+        ]);
+        assert_eq!(names(&sessions), ["claude-2", "claude", "zsh", "server"]);
+    }
+
+    #[test]
+    fn a_line_goes_between_a_worktrees_agents_and_its_terminals() {
+        let sessions = order(vec![
+            agent(session("claude", "app", "main")),
+            shell(session("zsh", "app", "main")),
+            shell(session("zsh-2", "app", "main")),
+            shell(session("only-a-shell", "app", "feat")),
+        ]);
+        let rows = rows(&sessions, |_| true);
+        assert_eq!(
+            rows[2..6],
+            [
+                Row::Session(0),
+                Row::Terminals,
+                Row::Session(1),
+                Row::Session(2),
+            ]
+        );
+        // A worktree of terminals alone has nothing to tell them from.
+        assert_eq!(rows[6..].len(), 2);
+        assert_eq!(rows[7], Row::Session(3));
+    }
+
+    #[test]
+    fn a_task_counts_as_an_agent_and_a_session_not_looked_at_as_a_terminal() {
+        let mut task = session("task", "app", "main");
+        task.front = Some(Front::Task);
+        assert!(!is_terminal(&task));
+        assert!(!is_terminal(&agent(session("claude", "app", "main"))));
+        assert!(is_terminal(&shell(session("zsh", "app", "main"))));
+        assert!(is_terminal(&session("new", "app", "main")));
     }
 
     #[test]
