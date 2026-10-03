@@ -46,9 +46,10 @@ pub enum Looks {
     Settled,
 }
 
-/// Reads `screen`, and `title`, the title the program gave its terminal.
-pub fn read(screen: &vt100::Screen, title: &str) -> Looks {
-    let bottom = last_rows(screen);
+/// Reads `rows`, what's on the screen a row at a time, and `title`, the
+/// title the program gave its terminal.
+pub fn read(rows: &[String], title: &str) -> Looks {
+    let bottom = last_rows(rows);
     // Codex says so in its title while it waits on the user.
     if WAITING_TEXT.iter().any(|text| bottom.contains(text)) || title.contains("Action Required") {
         return Looks::Waiting;
@@ -60,10 +61,10 @@ pub fn read(screen: &vt100::Screen, title: &str) -> Looks {
 }
 
 /// The last [`LAST_ROWS`] rows that aren't blank, as one lower-case string.
-fn last_rows(screen: &vt100::Screen) -> String {
-    let (_, cols) = screen.size();
-    let rows: Vec<String> = screen
-        .rows(0, cols)
+fn last_rows(rows: &[String]) -> String {
+    let rows: Vec<&str> = rows
+        .iter()
+        .map(String::as_str)
         .filter(|row| !row.trim().is_empty())
         .collect();
     let first = rows.len().saturating_sub(LAST_ROWS);
@@ -119,14 +120,10 @@ impl ScreenWatch {
 mod tests {
     use super::*;
 
-    fn screen(output: &str) -> vt100::Parser {
-        let mut parser = vt100::Parser::new(24, 80, 0);
-        parser.process(output.as_bytes());
-        parser
-    }
-
     fn looks(output: &str, title: &str) -> Looks {
-        read(screen(output).screen(), title)
+        let mut screen = crate::vt::Screen::new(24, 80);
+        screen.process(output.as_bytes());
+        read(&screen.rows(false), title)
     }
 
     #[test]

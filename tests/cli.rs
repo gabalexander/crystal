@@ -496,6 +496,37 @@ fn attach_shows_the_session_until_ctrl_backslash() {
 }
 
 #[test]
+fn attach_asks_your_terminal_for_what_the_program_asked_and_gives_it_back() {
+    let crystal = Crystal::new();
+    let script = r"printf '\033[?2004h\033[?1000h\033[?1006hasking'; sleep 30";
+    crystal.ok(&["new", "-n", "asker", "sh", "-c", script]);
+
+    let mut terminal = crystal.attach(&["attach", "asker"]);
+    terminal.shows("asking");
+    eventually("pastes are marked", || terminal.marks_pastes());
+    assert!(terminal.sends_the_mouse());
+
+    terminal.type_keys("\x1c");
+    terminal.shows("[detached from asker]");
+    assert!(!terminal.marks_pastes());
+    assert!(!terminal.sends_the_mouse());
+}
+
+#[test]
+fn attach_detaches_on_ctrl_backslash_in_the_kitty_keyboard_protocol() {
+    let crystal = Crystal::new();
+    let script = r"printf '\033[>1ukitty'; sleep 30";
+    crystal.ok(&["new", "-n", "kitty", "sh", "-c", script]);
+
+    let mut terminal = crystal.attach(&["attach", "kitty"]);
+    terminal.shows("kitty");
+    // How a terminal that speaks the protocol writes Ctrl+\.
+    terminal.type_keys("\x1b[92;5u");
+    terminal.shows("[detached from kitty]");
+    assert!(terminal.exit());
+}
+
+#[test]
 fn attach_starts_from_what_is_already_on_screen() {
     let crystal = Crystal::new();
     crystal.ok(&[
@@ -1731,6 +1762,23 @@ fn send_keys_presses_keys_never_pasting_them() {
 }
 
 #[test]
+fn send_keys_speaks_the_kitty_keyboard_protocol_to_a_program_that_asks() {
+    let crystal = Crystal::new();
+    // A program that pushes the protocol's first flag, which tells apart
+    // keys the old way can't, like Escape. It keeps the first 14 bytes:
+    // Escape, Ctrl+C, `ok`.
+    let script = r"stty raw -echo; printf '\033[>1uready'; head -c 14 > received; echo >> received; sleep 30";
+    crystal.ok(&["new", "-n", "kitty", "sh", "-c", script]);
+    shows_on_screen(&crystal, "kitty", "ready");
+
+    crystal.ok(&["send-keys", "kitty", "Escape", "C-c", "ok"]);
+    assert_eq!(
+        written(&crystal.dir.path().join("received")),
+        "\x1b[27u\x1b[99;5uok\n"
+    );
+}
+
+#[test]
 fn send_no_enter_types_and_leaves_it_there() {
     let crystal = Crystal::new();
     let script = r"stty raw -echo; printf ready; head -c 6 > received; echo >> received; sleep 30";
@@ -2349,7 +2397,7 @@ fn the_tui_pages_back_through_output_from_before_it_opened_and_returns_to_live()
     written(&crystal.dir.path().join("printed"));
 
     let mut tui = crystal.tui();
-    tui.shows("line 40");
+    tui.shows("line 60");
     assert!(!tui.text().contains("first-line"));
 
     // Page Up in the sidebar pages the selected session's pane, as far
@@ -2376,7 +2424,7 @@ fn typing_into_a_pane_brings_it_back_from_its_history() {
     written(&crystal.dir.path().join("printed"));
 
     let mut tui = crystal.tui();
-    tui.shows("line 40");
+    tui.shows("line 60");
     tui.type_keys("\r");
     tui.shows("typing into");
 
@@ -2569,7 +2617,7 @@ fn the_wheel_over_a_pane_scrolls_it_back_through_its_history() {
     written(&crystal.dir.path().join("printed"));
 
     let mut tui = crystal.tui();
-    tui.shows("line 40");
+    tui.shows("line 60");
     tui.type_keys(&wheel_up(50, 10));
     tui.shows("↑ 3 lines");
 }
@@ -2594,6 +2642,24 @@ fn a_program_that_asks_for_the_mouse_gets_clicks_where_it_drew() {
 
     let clicks = written(&crystal.dir.path().join("clicks"));
     assert_eq!(clicks, "\x1b[<0;3;2M\x1b[<0;3;2m\n");
+}
+
+#[test]
+fn a_pane_speaks_the_kitty_keyboard_protocol_to_a_program_that_asks() {
+    let crystal = Crystal::new();
+    // Pushes the protocol's first flag, then writes down the first key it
+    // hears: Escape, which the protocol writes as an escape of its own.
+    let script = r"stty raw -echo; printf '\033[>1u'; echo > listening;
+        dd bs=1 count=5 2>/dev/null > key; echo >> key; sleep 30";
+    crystal.ok(&["new", "-n", "kitty", "sh", "-c", script]);
+    written(&crystal.dir.path().join("listening"));
+
+    let mut tui = crystal.tui();
+    tui.shows("❯ kitty");
+    tui.type_keys("\r");
+    tui.shows("typing into");
+    tui.type_keys("\x1b");
+    assert_eq!(written(&crystal.dir.path().join("key")), "\x1b[27u\n");
 }
 
 #[test]

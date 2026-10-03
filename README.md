@@ -116,10 +116,16 @@ While you're typing into a session, every key goes to it, `Tab` included, except
 back to the sidebar, and `Shift+PageUp` / `Shift+PageDown`, which page through the pane's history. Some
 terminals keep `Shift+PageUp` for their own scrolling; `Ctrl+\` and then `PageUp` does the same.
 
+A program that asks for the [Kitty keyboard protocol](https://sw.kovidgoyal.net/kitty/keyboard-protocol/), as
+Codex does, gets its keys that way, in a pane, through `crystal attach` and from `crystal send-keys`: keys the
+old way can't tell apart, like `Esc`, `Shift+Enter` or `Ctrl+I` and `Tab`, reach it as themselves. From your
+keyboard that takes a terminal that speaks the protocol too, like Ghostty, kitty, foot or Alacritty; in any
+other, keys arrive the old way.
+
 Each session keeps the last 2,000 rows that scrolled off its screen, so a pane can page back through what an
 agent wrote before you opened it. The title says how far back you are (`↑ 120 lines`), new output doesn't pull
 you away while you read, and typing into the session brings you back to live. That includes agents that print
-inline through a scroll region, like Codex, whose rows a plain terminal emulator would lose.
+inline through a scroll region, like Codex.
 
 The mouse works too. Click a session in the sidebar to select it, or click a pane to type into it. The wheel
 moves the selection over the sidebar, and scrolls a pane through its history. A program that asks for the
@@ -893,6 +899,7 @@ If you're an AI agent working on this repository, read [`AGENTS.md`](AGENTS.md) 
 ## Acknowledgements
 
 crystal builds on ideas from [tmux](https://github.com/tmux/tmux) and [herdr](https://github.com/herdrdev/herdr).
+Its terminal emulator is [Alacritty](https://github.com/alacritty/alacritty)'s, the `alacritty_terminal` crate.
 
 ## License
 

@@ -22,7 +22,7 @@ mod mouse;
 mod pane;
 mod plugins_view;
 mod profiles;
-mod screen_widget;
+pub(crate) mod screen_widget;
 mod search;
 pub(crate) mod sidebar;
 mod status;
@@ -200,10 +200,11 @@ pub fn run(socket: &Path) -> Result<()> {
     result
 }
 
-/// The terminal sending the TUI what the mouse does, and pastes marked as
-/// pastes, for as long as this lives. However the TUI ends, by returning,
-/// failing or panicking, both go back to how the terminal had them: left
-/// on, a shell would fill with the sequences the terminal sends for them.
+/// The terminal sending the TUI what the mouse does, pastes marked as
+/// pastes, and keys it can tell apart, for as long as this lives. However
+/// the TUI ends, by returning, failing or panicking, all of it goes back to
+/// how the terminal had it: left on, a shell would fill with the sequences
+/// the terminal sends for them.
 struct TerminalModes;
 
 impl TerminalModes {
@@ -218,8 +219,13 @@ impl TerminalModes {
         // (1006). Not the mouse just moving (1003): nothing here needs it,
         // and it would wake the TUI at every move. Then bracketed paste
         // (2004): a paste comes whole, its lines kept, not as typed keys.
+        // Last, pushed on the terminal's stack, the Kitty keyboard
+        // protocol's flags to tell apart keys the old way can't, like Esc
+        // or Shift+Enter, and to say which key a shifted one is (1 and 4):
+        // a program in a pane that asked for the protocol gets them. A
+        // terminal without it ignores the request.
         let mut out = std::io::stdout();
-        out.write_all(b"\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[?2004h")?;
+        out.write_all(b"\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[?2004h\x1b[>5u")?;
         out.flush()?;
         Ok(TerminalModes)
     }
@@ -233,7 +239,7 @@ impl Drop for TerminalModes {
 
 fn modes_off() {
     let mut out = std::io::stdout();
-    let _ = out.write_all(b"\x1b[?2004l\x1b[?1006l\x1b[?1002l\x1b[?1000l");
+    let _ = out.write_all(b"\x1b[<u\x1b[?2004l\x1b[?1006l\x1b[?1002l\x1b[?1000l");
     let _ = out.flush();
 }
 
@@ -474,15 +480,15 @@ impl Tui {
         let Some(pane) = self.pane_in(slot) else {
             return false;
         };
-        if !pane.wants_mouse() || pane.scrolled_back() > 0 {
+        let Some(protocol) = mouse::Protocol::of(&pane.screen) else {
+            return false;
+        };
+        if pane.scrolled_back() > 0 {
             return false;
         }
-        let screen = pane.screen.screen();
-        let mode = screen.mouse_protocol_mode();
-        let encoding = screen.mouse_protocol_encoding();
         // An event the program didn't ask for, like a drag when it asked
         // only for clicks, is still the program's: it has the mouse here.
-        if let Some(bytes) = mouse::encode(mouse.kind, mouse.modifiers, cell, mode, encoding) {
+        if let Some(bytes) = mouse::encode(mouse.kind, mouse.modifiers, cell, protocol) {
             pane.send_keys(&bytes);
         }
         true
@@ -659,11 +665,10 @@ impl Tui {
                 context,
             } => self.open_plugin_pane(&plugin, &pane, context)?,
             Action::TypeInPluginPane(key) => {
-                if let Some(pane) = &mut self.overlay {
-                    let application_cursor = pane.screen.screen().application_cursor();
-                    if let Some(bytes) = keys::encode(&key, application_cursor) {
-                        pane.send_keys(&bytes);
-                    }
+                if let Some(pane) = &mut self.overlay
+                    && let Some(bytes) = keys::encode_for(&key, &pane.screen)
+                {
+                    pane.send_keys(&bytes);
                 }
             }
             Action::PasteInPluginPane(text) => {
@@ -706,11 +711,10 @@ impl Tui {
                 self.refresh_sessions()?;
             }
             Action::Type { to, key } => {
-                if let Some(pane) = self.pane_in(to) {
-                    let application_cursor = pane.screen.screen().application_cursor();
-                    if let Some(bytes) = keys::encode(&key, application_cursor) {
-                        pane.send_keys(&bytes);
-                    }
+                if let Some(pane) = self.pane_in(to)
+                    && let Some(bytes) = keys::encode_for(&key, &pane.screen)
+                {
+                    pane.send_keys(&bytes);
                 }
             }
             Action::PageBack(slot) => {

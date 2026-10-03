@@ -15,7 +15,6 @@ mod flows;
 mod front;
 mod git;
 mod github;
-mod history;
 mod hook;
 mod keys;
 mod memory;
@@ -40,6 +39,7 @@ mod transcript;
 mod tui;
 mod typing;
 mod viewer;
+mod vt;
 mod work;
 
 use anyhow::{Result, bail};

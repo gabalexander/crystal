@@ -38,7 +38,8 @@ is: it's the one request every version must understand.
 - `src/attach.rs`: `crystal attach`: draws a session in your terminal and sends it your keys
 - `src/viewer.rs`: the client's side of an attach, shared by `crystal attach` and the TUI's pane
 - `src/drive.rs`: `crystal send`, `wait`, `read` and `result`, for driving one session from another or a script
-- `src/keys.rs`: turning keys into the bytes a terminal sends: the TUI's keys, and the names `send-keys` takes
+- `src/keys.rs`: turning keys into the bytes a terminal sends: the TUI's keys, and the names `send-keys` takes;
+  the old way, or in the Kitty keyboard protocol once a program has asked for it
 - `src/remote.rs`: `crystal ssh`: finds (or installs) crystal on another machine, then runs it there over ssh
 - `src/skill.rs`: `crystal skill`: prints or installs `skill/SKILL.md`, the Claude Code skill for driving
   crystal; keep it in step with the commands it teaches
@@ -70,7 +71,7 @@ is: it's the one request every version must understand.
   - `backlog_view.rs`: the backlog view `b` opens: its state and keys, kept apart from I/O, and its
     drawing
   - `pane.rs`: a viewer of a session on screen, the selected one or a split, and its screen
-  - `screen_widget.rs`: draws a vt100 screen into ratatui
+  - `screen_widget.rs`: draws a session's screen into ratatui, for the panes and `crystal attach`
   - `diff.rs`: reads `git diff`'s patch into files, hunks and lines, marks the words that changed,
     and lays a file out in rows, unified or side by side; pure, so it's unit-tested
   - `diff_view.rs`: the diff view (`d`): its state, keys and drawing, and reading the diff off the
@@ -94,11 +95,13 @@ is: it's the one request every version must understand.
 - `src/agent_screen.rs`: reading what an agent is doing off its screen and title
 - `src/front.rs`: what's in front in a session's terminal (agent, shell or program), from its foreground process
 - `src/typing.rs`: typing into a session the way a person would: pastes marked, Enter on its own
-- `src/session.rs`: one program in a PTY, or a task: spawn, exit status, stop, and its screen (vt100) and viewers
+- `src/session.rs`: one program in a PTY, or a task: spawn, exit status, stop, and its screen and viewers
+- `src/vt.rs`: a terminal's screen, through `alacritty_terminal`: what a program drew and its history, the modes
+  it set, its answers to the program's questions (the daemon's screen only), the output that catches a new viewer
+  up, the cells to draw, and the input modes `crystal attach` asks your terminal for. The only module that uses
+  `alacritty_terminal`
 - `src/task.rs`: tasks: Claude Code run without a terminal (`claude -p`), one run per prompt or follow-up
 - `src/transcript.rs`: reading `claude -p`'s stream-json events, and drawing them as a task's transcript
-- `src/history.rs`: the rows that scroll off a session's screen: keeping them (inline agents' too), reading
-  them, and replaying them to a new viewer
 - `src/protocol.rs`: requests and responses, one JSON line each, and the frames an attached client sends
 - `src/socket.rs`: where the socket lives
 - `src/state.rs`: the running sessions, written down to start them again after a restart, and each
@@ -141,4 +144,5 @@ is: it's the one request every version must understand.
 - `tests/cli.rs`: end-to-end tests that drive the real binary against a private daemon, with a config of
   their own that turns notifications and the memory plugin off (a memory test turns it back on), and plugins
   of their own in its plugins directory; a test that opens the new-session panel pins `PATH` to its fake
-  agents, so no real agent is found or run
+  agents, so no real agent is found or run. vt100 stands in for the user's own terminal: a second emulator,
+  apart from crystal's
