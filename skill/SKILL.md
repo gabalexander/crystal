@@ -165,6 +165,8 @@ crystal memory search ledger
 - Don't remember what the code, the git log or CLAUDE.md already says, or anything that only matters now.
 - `crystal memory search` matches any of its words, or a word they start or stem from, best first; with
   search by meaning on, entries that mean the same count too, so a few plain words do.
+- In a Claude Code session crystal started, the `memory_search` and `memory_show` tools search the memory and
+  read an entry by its id without a shell command; use them when you have them.
 - `crystal memory` lists every entry; `crystal memory rm <id>` forgets one that's wrong.
 - Once your task closes, a model reads what you did and keeps what it finds worth keeping, so remember what
   only you know, like why you chose something; it never repeats what's there already.

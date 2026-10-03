@@ -9,6 +9,7 @@
 #   CRYSTAL_INSTALL_DIR  where to put crystal, rather than ~/.local/bin
 #   CRYSTAL_RELEASES     where to download releases from, for a mirror or a test
 #   CRYSTAL_DRY_RUN=1    say what would be installed, and stop there
+#   CRYSTAL_NO_SKILL=1   leave out the skill that teaches Claude Code to drive crystal
 #
 # Everything happens in main, called on the last line, so a download cut off
 # halfway never runs half a script.
@@ -64,6 +65,11 @@ resolve_version() {
     esac
 }
 
+# Whether Claude Code is on this machine: its command, or its config.
+has_claude_code() {
+    command -v claude > /dev/null 2>&1 || [ -d "${CLAUDE_CONFIG_DIR:-$HOME/.claude}" ]
+}
+
 # The SHA-256 checksum of a file, with whichever tool this machine has.
 sha256() {
     if command -v sha256sum > /dev/null 2>&1; then
@@ -117,6 +123,13 @@ main() {
     # until it's restarted on this one. Its running sessions come back.
     "$install_dir/crystal" restart-server ||
         say "couldn't restart the daemon: run crystal kill-server, then crystal"
+
+    # Claude Code learns to drive crystal from a skill: put where Claude Code
+    # looks for it, or brought up to date. A skill you've changed is kept.
+    if [ "${CRYSTAL_NO_SKILL:-}" != "1" ] && has_claude_code; then
+        "$install_dir/crystal" skill --install ||
+            say "kept the skill you changed: crystal skill --install --force replaces it"
+    fi
 }
 
 main "$@"

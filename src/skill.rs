@@ -1,20 +1,43 @@
 //! `crystal skill`: a Claude Code skill that teaches an agent to drive
 //! crystal, so that it can start other agents, hand them work, wait for
 //! them and answer their questions. The skill is a file built into crystal;
-//! `--install` puts it where Claude Code looks for the user's skills.
+//! `--install` puts it where Claude Code looks for the user's skills, and
+//! the daemon, as it starts, brings a copy an earlier crystal put there up
+//! to date, unless the user has changed it.
 
 use anyhow::{Context, Result, bail};
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
 
 /// The skill, as written in the repository's `skill/SKILL.md`.
 pub const SKILL: &str = include_str!("../skill/SKILL.md");
 
+/// The SHA-256 of every skill crystal has shipped, this one's included: a
+/// file at the skill's path with one of these is a copy crystal wrote that
+/// nobody has changed since, so it can be written over. A change to
+/// `skill/SKILL.md` adds its hash here, which a test checks.
+const SHIPPED: &[&str] = &[
+    "4437c3be3fcb799e409750aca0de3c16b43821f093b2548e4b05ad278f8803ec",
+    "4fd05e10003a08fcd6da45c2b4bd99249c18d1e556024b67ece4a28abd839434",
+    "8f50dd76a639125d2159082e5546df993d13e4296277c9a8fd588e8940cce4bc",
+    "ec3c8498f1520fe727f285394439a749b9402fda1660389029b6a2a92d954dab",
+    "3e85415be5d034c0861bc76ea32e2958da23ec0530ff081fa09c8af3fbf86497",
+    "f1bb028d6b0d5c739504ddc1e79fdcdc5761fcbe80c4f0993d349a5ee33924a5",
+    "9049ada1dd83cb9047dafbf570da2d0479e715ff0060a1eb5957b30f233a83ec",
+    "a841c270796bb9e84e65ef578c5630702e3edc92a5f902a5cb4d497ded03abb2",
+    "c01d214e229e3e0aaa8fb170fd3b1b7e2235dc038c3a62154326bd96e21a2273",
+    "5db71591fc37ca852c64542c79426f24dd5cbaeb6fd67a113a6db5848a192591",
+    "6b69e3a4a3d95ea0af92aabeca854dad51789edfcaa3fb24b6e75cbf617d2d1b",
+];
+
 /// What installing the skill comes to, given what's at its path already.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Install {
     /// Nothing is there, or `--force` was given: write the skill.
     Write,
+    /// An earlier crystal's skill is there, as it wrote it: write this one.
+    Update,
     /// The same skill is there already.
     UpToDate,
     /// A different file is there, which may hold the user's own edits.
@@ -27,29 +50,63 @@ pub fn print() {
 
 /// Writes the skill to Claude Code's skills directory, and says where.
 pub fn install(force: bool) -> Result<()> {
-    let config_dir = claude_config_dir(
-        std::env::var_os("CLAUDE_CONFIG_DIR"),
-        std::env::var_os("HOME"),
-    )
-    .context("can't tell where Claude Code keeps its skills: HOME isn't set")?;
-    let path = skill_path(&config_dir);
+    let path = path()?;
     let existing = fs::read_to_string(&path).ok();
-    match decide(existing.as_deref(), force) {
+    match decide(existing.as_deref(), force, SHIPPED) {
         Install::UpToDate => println!("the skill is already in {}", path.display()),
         Install::Refuse => bail!(
             "{} has been changed; run `crystal skill --install --force` to write over it",
             path.display()
         ),
         Install::Write => {
-            if let Some(dir) = path.parent() {
-                fs::create_dir_all(dir)?;
-            }
-            fs::write(&path, SKILL)
-                .with_context(|| format!("couldn't write {}", path.display()))?;
+            write(&path)?;
             println!("installed the skill in {}", path.display());
+        }
+        Install::Update => {
+            write(&path)?;
+            println!("updated the skill in {}", path.display());
         }
     }
     Ok(())
+}
+
+/// Brings the skill up to date where an earlier crystal installed it and
+/// nobody has changed it since, and returns where. Nothing is written where
+/// it was never installed, or has been changed.
+pub fn refresh() -> Result<Option<PathBuf>> {
+    let path = path()?;
+    Ok(refresh_at(&path, SHIPPED)?.then_some(path))
+}
+
+/// Writes the skill at `path` when what's there is one of the skills
+/// `shipped` names, other than this one, and says whether it did.
+fn refresh_at(path: &Path, shipped: &[&str]) -> Result<bool> {
+    let Ok(existing) = fs::read_to_string(path) else {
+        return Ok(false);
+    };
+    if decide(Some(&existing), false, shipped) != Install::Update {
+        return Ok(false);
+    }
+    write(path)?;
+    Ok(true)
+}
+
+/// Where the skill goes, in the Claude Code config directory this
+/// process's environment names.
+fn path() -> Result<PathBuf> {
+    let config_dir = claude_config_dir(
+        std::env::var_os("CLAUDE_CONFIG_DIR"),
+        std::env::var_os("HOME"),
+    )
+    .context("can't tell where Claude Code keeps its skills: HOME isn't set")?;
+    Ok(skill_path(&config_dir))
+}
+
+fn write(path: &Path) -> Result<()> {
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    fs::write(path, SKILL).with_context(|| format!("couldn't write {}", path.display()))
 }
 
 /// Claude Code's config directory: `$CLAUDE_CONFIG_DIR` when it's set,
@@ -70,14 +127,25 @@ fn skill_path(config_dir: &Path) -> PathBuf {
 }
 
 /// Whether to write the skill over `existing`, the file at its path if
-/// there is one. A file that isn't this skill may hold the user's edits,
-/// so it's only written over when they say so.
-fn decide(existing: Option<&str>, force: bool) -> Install {
+/// there is one, given the hashes of the skills crystal `shipped`. A file
+/// that isn't one of them may hold the user's edits, so it's only written
+/// over when they say so.
+fn decide(existing: Option<&str>, force: bool, shipped: &[&str]) -> Install {
     match existing {
+        None => Install::Write,
         Some(text) if text == SKILL => Install::UpToDate,
-        Some(_) if !force => Install::Refuse,
-        _ => Install::Write,
+        Some(text) if shipped.contains(&sha256(text).as_str()) => Install::Update,
+        Some(_) if force => Install::Write,
+        Some(_) => Install::Refuse,
     }
+}
+
+/// The SHA-256 of `text`, in hex.
+fn sha256(text: &str) -> String {
+    Sha256::digest(text.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 #[cfg(test)]
@@ -104,10 +172,70 @@ mod tests {
 
     #[test]
     fn a_changed_file_is_only_written_over_when_forced() {
-        assert_eq!(decide(None, false), Install::Write);
-        assert_eq!(decide(Some(SKILL), false), Install::UpToDate);
-        assert_eq!(decide(Some("my own notes"), false), Install::Refuse);
-        assert_eq!(decide(Some("my own notes"), true), Install::Write);
+        assert_eq!(decide(None, false, SHIPPED), Install::Write);
+        assert_eq!(decide(Some(SKILL), false, SHIPPED), Install::UpToDate);
+        assert_eq!(
+            decide(Some("my own notes"), false, SHIPPED),
+            Install::Refuse
+        );
+        assert_eq!(decide(Some("my own notes"), true, SHIPPED), Install::Write);
+    }
+
+    #[test]
+    fn an_earlier_crystal_s_skill_is_brought_up_to_date() {
+        let shipped = sha256("the skill crystal 0.1 wrote");
+        let shipped = [shipped.as_str()];
+        assert_eq!(
+            decide(Some("the skill crystal 0.1 wrote"), false, &shipped),
+            Install::Update
+        );
+        assert_eq!(
+            decide(
+                Some("the skill crystal 0.1 wrote, and mine"),
+                false,
+                &shipped
+            ),
+            Install::Refuse
+        );
+    }
+
+    #[test]
+    fn refreshing_writes_only_over_an_earlier_crystal_s_skill() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = skill_path(dir.path());
+        let shipped = sha256("the skill crystal 0.1 wrote");
+        let shipped = [shipped.as_str()];
+        // Never installed: it stays that way.
+        assert!(!refresh_at(&path, &shipped).unwrap());
+        assert!(!path.exists());
+
+        write(&path).unwrap();
+        fs::write(&path, "the skill crystal 0.1 wrote").unwrap();
+        assert!(refresh_at(&path, &shipped).unwrap());
+        assert_eq!(fs::read_to_string(&path).unwrap(), SKILL);
+        assert!(!refresh_at(&path, &shipped).unwrap(), "up to date already");
+
+        fs::write(&path, "my own notes").unwrap();
+        assert!(!refresh_at(&path, &shipped).unwrap());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "my own notes");
+    }
+
+    #[test]
+    fn hashes_are_sha_256_in_hex() {
+        assert_eq!(
+            sha256(""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
+
+    #[test]
+    fn the_skill_is_among_those_shipped() {
+        let hash = sha256(SKILL);
+        assert!(
+            SHIPPED.contains(&hash.as_str()),
+            "skill/SKILL.md has changed: add \"{hash}\" to SHIPPED in src/skill.rs, so that the \
+             next crystal knows this copy as its own and brings it up to date"
+        );
     }
 
     #[test]

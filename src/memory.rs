@@ -937,10 +937,10 @@ pub fn stale_last(entries: Vec<Entry>, project: &Path) -> Vec<Listed> {
 /// What a Claude Code session is told of its project's memory as it
 /// starts: the entries with most to do with what it was asked, `asked`, or
 /// else the newest, leaving out stale ones; then how to search and add to
-/// it. A session in the background, `headless`, searches through crystal's
-/// MCP server, and has nothing to be told when nothing is remembered. With
-/// an `embedder`, what has to do with what it was asked goes by meaning as
-/// well as by words.
+/// it. Every session searches through crystal's MCP server, by its tools;
+/// one in the background, `headless`, isn't told how to add, so it has
+/// nothing to be told when nothing is remembered. With an `embedder`, what
+/// has to do with what it was asked goes by meaning as well as by words.
 pub fn for_launch(
     socket: &Path,
     project: &Path,
@@ -963,38 +963,28 @@ pub fn for_launch(
     Ok(launch_paragraph(&shown, headless))
 }
 
-/// The paragraph [`for_launch`] tells a session, showing it `shown`.
+/// The paragraph [`for_launch`] tells a session, showing it `shown`, each
+/// by its id, for the `memory_show` tool.
 fn launch_paragraph(shown: &[Entry], headless: bool) -> Option<String> {
-    if headless {
-        if shown.is_empty() {
-            return None;
-        }
-        let mut paragraph = String::from("What this project's earlier sessions learned:");
-        for entry in shown {
-            paragraph.push_str(&format!("\n- {} {}", entry.id, launch_line(entry)));
-        }
-        paragraph.push_str(
-            "\n\nSearch the rest of this project's memory with the memory_search tool, and \
-             read an entry in full with the memory_show tool, by its id.",
-        );
-        return Some(paragraph);
-    }
     let how_to_add = "When you learn something a later session here should know, like a \
                       decision, a gotcha or a command that works, keep it with \
                       `crystal remember \"<what>\"` (add `-k decision|gotcha|command|note`, and \
                       `-f <file>` for each file it's about).";
     if shown.is_empty() {
-        return Some(how_to_add.to_string());
+        return (!headless).then(|| how_to_add.to_string());
     }
     let mut paragraph = String::from("What this project's earlier sessions learned:");
     for entry in shown {
-        paragraph.push_str("\n- ");
-        paragraph.push_str(&launch_line(entry));
+        paragraph.push_str(&format!("\n- {} {}", entry.id, launch_line(entry)));
     }
-    paragraph
-        .push_str("\n\n`crystal memory search <words>` finds the rest of what was learned here.");
-    paragraph.push(' ');
-    paragraph.push_str(how_to_add);
+    paragraph.push_str(
+        "\n\nSearch the rest of this project's memory with the memory_search tool, and \
+         read an entry in full with the memory_show tool, by its id.",
+    );
+    if !headless {
+        paragraph.push(' ');
+        paragraph.push_str(how_to_add);
+    }
     Some(paragraph)
 }
 
@@ -1701,12 +1691,16 @@ mod tests {
         .unwrap()
         .unwrap();
         assert!(paragraph.starts_with("What this project's earlier sessions learned:"));
-        assert!(paragraph.contains("- (gotcha) the refund test needs the ledger running"));
+        assert!(
+            paragraph.contains("\n- 1 (gotcha) the refund test needs the ledger running"),
+            "{paragraph}"
+        );
         assert!(
             !paragraph.contains("mdbook"),
             "only what has to do with the task"
         );
-        assert!(paragraph.contains("crystal memory search"));
+        assert!(paragraph.contains("memory_search tool"));
+        assert!(paragraph.contains("memory_show tool"));
         assert!(paragraph.contains("crystal remember"));
     }
 
@@ -1716,11 +1710,11 @@ mod tests {
         let paragraph = for_launch(&socket, Path::new(APP), "", false, None)
             .unwrap()
             .unwrap();
-        assert!(paragraph.contains("- (note) the docs build with mdbook"));
+        assert!(paragraph.contains("- 1 (note) the docs build with mdbook"));
         let paragraph = for_launch(&socket, Path::new(APP), "deploy friday", false, None)
             .unwrap()
             .unwrap();
-        assert!(paragraph.contains("- (note) the docs build with mdbook"));
+        assert!(paragraph.contains("- 1 (note) the docs build with mdbook"));
     }
 
     #[test]
