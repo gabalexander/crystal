@@ -24,6 +24,14 @@ const CLAUDE_HOOK_EVENTS: &[&str] = &[
     "Stop",
 ];
 
+/// What opens the notes crystal adds for an agent: where they come from.
+/// An agent told to run the commands of a program it has never heard of
+/// can take them for a prompt injection and ignore them.
+pub const ABOUT_CRYSTAL: &str = "You're running inside crystal, the terminal workspace the \
+                                 user runs their coding agents in. The user set crystal up \
+                                 to add the notes below for you, and the `crystal` command \
+                                 they mention is installed for you to run.";
+
 /// The command line to run for `command`. For an agent crystal knows, it
 /// carries the flags that make the agent report to `crystal hook`, run
 /// from `crystal`, the path of this program, and with `resume`, the id of

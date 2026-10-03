@@ -30,9 +30,10 @@ pub fn ensure_enabled(config: &Config) -> Result<()> {
 /// What an agent given a task is told about it: how to close it, and, with
 /// `backlog` on, where to put what it notices for later.
 pub fn instructions(backlog: bool) -> String {
-    let mut text = "crystal is tracking what you were asked to do as a task. When it's \
-                    finished, run `crystal done \"<one line on what you did>\"`; if you \
-                    can't finish it, run `crystal done --failed \"<why>\"`."
+    let mut text = "What you were asked to do is a task, and crystal shows the user \
+                    whether it's still open. Once you've done it, the last step is to \
+                    close it: run `crystal done \"<one line on what you did>\"`. If you \
+                    can't do it, run `crystal done --failed \"<why>\"` instead."
         .to_string();
     if backlog {
         text.push_str(

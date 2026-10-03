@@ -739,14 +739,20 @@ fn n_starts_claude_with_its_hooks_and_the_task_as_its_prompt() {
     tui.type_keys("\r");
     tui.shows("▸ claude");
 
-    // Given a task, Claude is told how to close it, ahead of the prompt.
+    // Given a task, Claude is told how to close it, ahead of the prompt,
+    // after a word on where that comes from. One argument a line, and a
+    // blank line between the paragraphs.
     let args = written(&crystal.dir.path().join("args"));
     let args: Vec<&str> = args.lines().collect();
-    assert_eq!(args.len(), 6, "{args:?}");
+    assert_eq!(args.len(), 8, "{args:?}");
     assert_eq!(args[0], "--settings");
     assert_eq!(args[2], "--append-system-prompt");
-    assert!(args[3].contains("crystal done"), "{args:?}");
-    assert_eq!(args[4..], ["--", "fix the login bug"]);
+    assert!(
+        args[3].starts_with("You're running inside crystal"),
+        "{args:?}"
+    );
+    assert!(args[5].contains("crystal done"), "{args:?}");
+    assert_eq!(args[6..], ["--", "fix the login bug"]);
 }
 
 #[test]
@@ -800,6 +806,11 @@ fn codex_starts_with_the_model_chosen_and_the_task() {
     let args = codex_args(&crystal);
     assert_eq!(args[..4], ["-m", "gpt-test-mini", "--", "add a test"]);
     assert!(args.last().unwrap().contains("crystal done"), "{args:?}");
+    assert!(
+        args.iter()
+            .any(|line| line.starts_with("You're running inside crystal")),
+        "{args:?}"
+    );
 }
 
 #[test]
@@ -874,9 +885,10 @@ prompt = "Review the change."
 
     // After the hooks and what crystal tells Claude about its task.
     let args = written(&crystal.dir.path().join("args"));
-    let after_hooks: Vec<&str> = args.lines().skip(4).collect();
+    let lines: Vec<&str> = args.lines().collect();
+    let options = lines.iter().position(|line| *line == "--model").unwrap();
     assert_eq!(
-        after_hooks,
+        lines[options..],
         [
             "--model",
             "opus",
@@ -2969,7 +2981,7 @@ fn claude_starts_with_what_its_project_remembered_in_its_system_prompt() {
     let args = written(&repo.join("args"));
     assert!(
         args.contains(
-            "--append-system-prompt\nWhat this project's earlier sessions learned:\n\
+            "\n\nWhat this project's earlier sessions learned:\n\
              - (gotcha) The ledger tests need the database up\n"
         ),
         "{args}"
