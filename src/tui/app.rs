@@ -14,6 +14,7 @@ use super::memory_view::MemoryView;
 use super::plugins_view::{self, PluginsView};
 use super::profiles::{self, ProfilesView};
 use super::search;
+use super::status::Status;
 use super::tabs::{self, Tabs};
 use super::text_input::TextInput;
 use crate::catalog::{self, Agent};
@@ -158,6 +159,11 @@ pub enum Confirm {
         path: PathBuf,
         branch: String,
     },
+    /// Close the tab in front, tab `number`, and kill the sessions in it.
+    CloseTab {
+        number: usize,
+        sessions: Vec<String>,
+    },
 }
 
 impl Confirm {
@@ -167,6 +173,11 @@ impl Confirm {
             Confirm::Kill(name) => format!("kill {name}? y/n"),
             Confirm::Respawn(name) => format!("start {name} again? y/n"),
             Confirm::RemoveWorktree { branch, .. } => format!("remove worktree {branch}? y/n"),
+            Confirm::CloseTab { number, sessions } => {
+                let count = sessions.len();
+                let noun = if count == 1 { "session" } else { "sessions" };
+                format!("close tab {number} and kill its {count} {noun}? y/n")
+            }
         }
     }
 
@@ -176,6 +187,7 @@ impl Confirm {
             Confirm::Kill(name) => Action::Kill(name),
             Confirm::Respawn(name) => Action::Respawn(name),
             Confirm::RemoveWorktree { path, .. } => Action::RemoveWorktree(path),
+            Confirm::CloseTab { sessions, .. } => Action::KillAll(sessions),
         }
     }
 }
@@ -229,6 +241,8 @@ pub enum Action {
         change: BacklogChange,
     },
     Kill(String),
+    /// Kill each of these sessions: those of a tab that was closed.
+    KillAll(Vec<String>),
     Rename {
         name: String,
         new_name: String,
@@ -397,10 +411,14 @@ pub struct App {
     codex_models: Option<Vec<String>>,
     /// A yes-or-no question on the footer line, until it's answered.
     confirm: Option<Confirm>,
-    /// The tabs, each with the sessions it splits off into panes of their
-    /// own, and which one is in front. A split stays on its session while
-    /// the selection moves.
+    /// The tabs, each with its own sessions and the ones it splits off
+    /// into panes of their own, and which one is in front. The sidebar
+    /// shows only the sessions of the tab in front. A split stays on its
+    /// session while the selection moves.
     tabs: Tabs,
+    /// The session `>` is moving to another tab, while the footer asks
+    /// which.
+    moving: Option<String>,
     focus: Focus,
     /// The pane the keyboard was in last, so that Tab in the sidebar goes
     /// on to the next one.
@@ -475,6 +493,7 @@ impl App {
             codex_models: None,
             confirm: None,
             tabs: Tabs::default(),
+            moving: None,
             focus: Focus::Sidebar,
             last_pane: None,
             own_id,
@@ -786,16 +805,45 @@ impl App {
         self.filter.as_ref()
     }
 
-    /// The sessions shown in the sidebar, by index: those that match the
-    /// filter while it's open, or else all of them.
+    /// The sessions shown in the sidebar, by index: those of the tab in
+    /// front that match the filter while it's open, or else all of them.
     pub fn matches(&self) -> Vec<usize> {
         let query = self
             .filter
             .as_ref()
             .map_or("", |filter| filter.input.text());
-        (0..self.sessions.len())
+        self.in_tab()
+            .into_iter()
             .filter(|&index| search::session_match(query, &self.sessions[index]).is_some())
             .collect()
+    }
+
+    /// The sessions in the tab in front, by index, in the sidebar's order.
+    fn in_tab(&self) -> Vec<usize> {
+        self.sessions_in(self.tabs.current_index())
+    }
+
+    /// The sessions in the tab at `tab`, by index, in the sidebar's order.
+    fn sessions_in(&self, tab: usize) -> Vec<usize> {
+        let tab = &self.tabs.all()[tab];
+        (0..self.sessions.len())
+            .filter(|&index| tab.holds(&self.sessions[index].name))
+            .collect()
+    }
+
+    /// What most needs the user in the tab at `index`, for the tab bar to
+    /// show: an agent waiting on them, then a finished turn nobody has
+    /// looked at, then an agent working. Nothing waiting in another tab
+    /// goes unseen.
+    pub fn tab_status(&self, index: usize) -> Option<Status> {
+        let statuses: Vec<Status> = self
+            .sessions_in(index)
+            .into_iter()
+            .map(|session| Status::of(&self.sessions[session]))
+            .collect();
+        [Status::Waiting, Status::Done, Status::Working]
+            .into_iter()
+            .find(|wanted| statuses.contains(wanted))
     }
 
     /// Which letters of a session's name to mark, while the filter is open:
@@ -940,11 +988,11 @@ impl App {
     }
 
     /// Takes the tabs kept from the last time the TUI ran, and selects the
-    /// session the one in front was on. Splits of sessions that have gone
-    /// since are closed.
+    /// session the one in front was on. Sessions that have gone since leave
+    /// their tabs, and those started since join the one in front.
     pub fn set_tabs(&mut self, tabs: Tabs) {
         self.tabs = tabs;
-        self.close_splits_of_gone_sessions();
+        self.place_sessions();
         self.arrive_at_tab();
     }
 
@@ -992,17 +1040,16 @@ impl App {
         self.splits().iter().any(|split| split == name)
     }
 
-    /// The index of the selected session, or `None` when there are none.
+    /// The index of the selected session, or `None` when the tab in front
+    /// has none.
     pub fn selected_index(&self) -> Option<usize> {
-        if self.sessions.is_empty() {
-            None
-        } else {
-            Some(self.selected)
-        }
+        let session = self.sessions.get(self.selected)?;
+        let in_tab = self.tabs.current().holds(&session.name);
+        in_tab.then_some(self.selected)
     }
 
     pub fn selected(&self) -> Option<&SessionInfo> {
-        self.sessions.get(self.selected)
+        self.sessions.get(self.selected_index()?)
     }
 
     fn selected_name(&self) -> Option<String> {
@@ -1019,18 +1066,19 @@ impl App {
     }
 
     /// Takes a fresh list from the daemon and puts it in the sidebar's
-    /// order. The selected session stays selected wherever it moved to; if
-    /// it's gone, the selection stays at the same place in the list, or the
-    /// end of it.
+    /// order, each session in its tab. The selected session stays selected
+    /// wherever it moved to; if it's gone, the selection goes to the next
+    /// session in the tab, or the last.
     pub fn set_sessions(&mut self, sessions: Vec<SessionInfo>) {
-        let selected_name = self.selected_name();
+        let selected_name = self.sessions.get(self.selected).map(|s| s.name.clone());
         self.sessions = groups::order(sessions, self.shown_flows());
         let still_there = selected_name.and_then(|name| self.position(&name));
         if let Some(index) = still_there {
             self.selected = index;
         }
-        self.selected = self.selected.min(self.sessions.len().saturating_sub(1));
         self.close_splits_of_gone_sessions();
+        self.place_sessions();
+        self.keep_selection_in_tab();
         if let Focus::Pane(slot) = self.focus
             && !self.can_type_into(slot)
         {
@@ -1038,8 +1086,9 @@ impl App {
         }
     }
 
-    /// Closes the splits of sessions that have gone, in every tab. In the
-    /// tab in front, the keyboard moves with its pane.
+    /// Closes the splits of the tab in front whose sessions have gone, the
+    /// keyboard moving with its pane. The other tabs' go as
+    /// [`Self::place_sessions`] puts their sessions right.
     fn close_splits_of_gone_sessions(&mut self) {
         // Going from the end keeps the splits still to check where they
         // were.
@@ -1048,16 +1097,58 @@ impl App {
                 self.close_split(index);
             }
         }
-        let sessions = &self.sessions;
-        self.tabs
-            .forget_gone(|name| sessions.iter().any(|session| session.name == name));
     }
 
-    /// Selects the session called `name`, if there is one.
-    pub fn select(&mut self, name: &str) {
-        if let Some(index) = self.position(name) {
+    /// Puts every session in a tab: those that have gone leave theirs, and
+    /// those no tab holds yet join one. A step of a flow run joins the tab
+    /// its run's other steps are in, so a run stays together; any other
+    /// session joins the tab in front, which is where a session started
+    /// from this TUI was started.
+    fn place_sessions(&mut self) {
+        let homes: HashMap<String, usize> = self
+            .sessions
+            .iter()
+            .filter(|session| self.tabs.tab_of(&session.name).is_none())
+            .filter_map(|session| Some((session.name.clone(), self.flow_tab(session)?)))
+            .collect();
+        let names: Vec<&str> = self.sessions.iter().map(|s| s.name.as_str()).collect();
+        self.tabs.take_in(&names, |name| homes.get(name).copied());
+    }
+
+    /// The tab holding the other steps of the flow run `session` is a step
+    /// of, if it's one and they're in a tab.
+    fn flow_tab(&self, session: &SessionInfo) -> Option<usize> {
+        let (run, _) = groups::flow_step(session, self.shown_flows())?;
+        let steps = self.flows[run].steps.iter();
+        steps
+            .filter_map(|step| step.session.as_deref())
+            .find_map(|name| self.tabs.tab_of(name))
+    }
+
+    /// Keeps the selection on a session in the tab in front: when the one
+    /// it was on has gone, or left the tab, it goes to the next one down
+    /// the sidebar, or else the last. In an empty tab, nothing is selected.
+    fn keep_selection_in_tab(&mut self) {
+        let in_tab = self.in_tab();
+        if in_tab.contains(&self.selected) {
+            return;
+        }
+        let next = in_tab.iter().find(|&&index| index > self.selected);
+        if let Some(&index) = next.or(in_tab.last()) {
             self.selected = index;
         }
+    }
+
+    /// Selects the session called `name`, if there is one, bringing its tab
+    /// to the front when it's in another.
+    pub fn select(&mut self, name: &str) {
+        let Some(index) = self.position(name) else {
+            return;
+        };
+        if let Some(tab) = self.tabs.tab_of(name) {
+            self.go_to_tab(tab);
+        }
+        self.selected = index;
     }
 
     /// The session called `from` is called `to` now: a split of it stays
@@ -1110,9 +1201,20 @@ impl App {
         }
         // Only `y` says yes; any other key says no.
         if let Some(confirm) = self.confirm.take() {
-            if key.code == KeyCode::Char('y') {
-                return Some(confirm.action());
+            if key.code != KeyCode::Char('y') {
+                return None;
             }
+            // The tab is the TUI's to close; its sessions, the daemon's to
+            // kill.
+            if matches!(confirm, Confirm::CloseTab { .. }) {
+                self.close_tab_in_front();
+            }
+            return Some(confirm.action());
+        }
+        // A digit or `t` says which tab the session goes to; any other key
+        // leaves it where it is.
+        if let Some(name) = self.moving.take() {
+            self.move_to_tab(&name, key.code);
             return None;
         }
         // `d` says the task was done, `f` that it failed; any other key
@@ -1183,7 +1285,10 @@ impl App {
             || self.profiles_view.is_some()
             || self.plugins_view.is_some()
             || self.plugin_pane.is_some();
-        let asking = self.prompt.is_some() || self.confirm.is_some() || self.closing.is_some();
+        let asking = self.prompt.is_some()
+            || self.confirm.is_some()
+            || self.closing.is_some()
+            || self.moving.is_some();
         if asking || typing {
             return None;
         }
@@ -1242,9 +1347,10 @@ impl App {
             KeyCode::Tab => self.move_to_pane(Direction::Forward),
             KeyCode::BackTab => self.move_to_pane(Direction::Back),
             KeyCode::Char('s') => self.toggle_split(),
-            KeyCode::Char('t') => self.new_tab(),
+            KeyCode::Char('t') => return self.new_tab(),
             KeyCode::Char('T') => self.ask_for_tab_name(),
             KeyCode::Char('&') => self.close_tab(),
+            KeyCode::Char('>') => self.ask_where_to_move(),
             KeyCode::Char('[') => self.go_to_tab(self.tabs.previous()),
             KeyCode::Char(']') => self.go_to_tab(self.tabs.next()),
             KeyCode::Char(digit @ '1'..='9') => self.go_to_tab_numbered(digit),
@@ -2135,16 +2241,67 @@ impl App {
         };
     }
 
-    /// Makes a new tab on the selected session, with nothing split off, and
-    /// brings it to the front.
-    fn new_tab(&mut self) {
-        self.leave_tab();
-        if self.tabs.add(self.selected_name()) {
-            self.arrive_at_tab();
-        } else {
-            let most = tabs::MAX_TABS;
-            self.notify(format!("{most} tabs at most: & closes the one in front"));
+    /// `t`: makes a new tab, brings it to the front, and starts a shell in
+    /// it, in the selected session's directory: a new tab is somewhere to
+    /// start new work, and a shell is where that starts.
+    fn new_tab(&mut self) -> Option<Action> {
+        let Some(index) = self.tabs.add() else {
+            self.notify_tabs_at_most();
+            return None;
+        };
+        let dir = self.selected().map(|session| session.cwd.clone());
+        self.go_to_tab(index);
+        Some(Action::Start {
+            place: Place::Directory(dir),
+            command: Vec::new(),
+            purpose: Purpose::default(),
+        })
+    }
+
+    fn notify_tabs_at_most(&mut self) {
+        let most = tabs::MAX_TABS;
+        self.notify(format!("{most} tabs at most: & closes the one in front"));
+    }
+
+    /// `>`: asks, on the footer, which tab to move the selected session to.
+    fn ask_where_to_move(&mut self) {
+        if let Some(selected) = self.selected() {
+            self.moving = Some(selected.name.clone());
         }
+    }
+
+    /// Moves the session called `name` to the tab `key` names: a digit for
+    /// that tab, `t` for a new one. It leaves the sidebar, and the tab in
+    /// front stays in front. Any other key leaves it where it is.
+    fn move_to_tab(&mut self, name: &str, key: KeyCode) {
+        let to = match key {
+            KeyCode::Char(digit @ '1'..='9') => digit as usize - '1' as usize,
+            KeyCode::Char('t') => match self.tabs.add() {
+                Some(index) => index,
+                None => return self.notify_tabs_at_most(),
+            },
+            _ => return,
+        };
+        let number = to + 1;
+        if to == self.tabs.current_index() {
+            return self.notify(format!("{name} is in tab {number} already"));
+        }
+        if to >= self.tabs.all().len() {
+            return self.notify(format!("there's no tab {number}"));
+        }
+        // Closing its split here first moves the keyboard with the panes.
+        if let Some(split) = self.splits().iter().position(|split| split == name) {
+            self.close_split(split);
+        }
+        self.tabs.put(name, to);
+        self.keep_selection_in_tab();
+        self.notify(format!("moved {name} to tab {number}"));
+    }
+
+    /// The session `>` is moving to another tab, while the footer asks
+    /// which.
+    pub fn moving(&self) -> Option<&str> {
+        self.moving.as_deref()
     }
 
     /// Brings the tab at `index` to the front.
@@ -2167,15 +2324,35 @@ impl App {
         }
     }
 
-    /// Closes the tab in front, leaving its sessions running, and brings
-    /// the one that takes its place to the front.
+    /// `&`: closes the tab in front. Its sessions go with it, so a tab with
+    /// some asks first; an empty one closes at once. The session this TUI
+    /// runs in is never killed with it: it joins the tab in front instead.
     fn close_tab(&mut self) {
-        let number = self.tabs.current_index() + 1;
-        if self.tabs.close() {
-            self.arrive_at_tab();
-            self.notify(format!("closed tab {number}; its sessions keep running"));
-        } else {
+        if self.tabs.all().len() == 1 {
             self.notify("this is the only tab".into());
+            return;
+        }
+        let sessions: Vec<String> = self
+            .in_tab()
+            .into_iter()
+            .map(|index| &self.sessions[index])
+            .filter(|session| Some(&session.id) != self.own_id.as_ref())
+            .map(|session| session.name.clone())
+            .collect();
+        if sessions.is_empty() {
+            self.close_tab_in_front();
+        } else {
+            let number = self.tabs.current_index() + 1;
+            self.confirm = Some(Confirm::CloseTab { number, sessions });
+        }
+    }
+
+    /// Closes the tab in front, and brings the one that takes its place to
+    /// the front.
+    fn close_tab_in_front(&mut self) {
+        if self.tabs.close() {
+            self.place_sessions();
+            self.arrive_at_tab();
         }
     }
 
@@ -2184,12 +2361,17 @@ impl App {
         self.tabs.current_mut().selected = self.selected_name();
     }
 
-    /// Selects the session the tab now in front was on, if it's still
-    /// there. The keyboard goes back to the sidebar: the panes it could
-    /// have been in have gone.
+    /// Selects the session the tab now in front was on, if it's still in
+    /// it, or else its first. The keyboard goes back to the sidebar: the
+    /// panes it could have been in have gone.
     fn arrive_at_tab(&mut self) {
-        if let Some(name) = self.tabs.current().selected.clone() {
-            self.select(&name);
+        let in_tab = self.in_tab();
+        let remembered = self.tabs.current().selected.as_deref();
+        let was_on = remembered
+            .and_then(|name| self.position(name))
+            .filter(|index| in_tab.contains(index));
+        if let Some(index) = was_on.or(in_tab.first().copied()) {
+            self.selected = index;
         }
         self.focus = Focus::Sidebar;
         self.last_pane = None;
@@ -2229,28 +2411,33 @@ impl App {
         self.last_pane = Some(slot);
     }
 
+    /// Moves the selection `by` sessions up or down the tab in front,
+    /// stopping at the ends.
     fn move_selection(&mut self, by: isize) {
-        let last = self.sessions.len().saturating_sub(1);
-        self.selected = self.selected.saturating_add_signed(by).min(last);
+        let in_tab = self.in_tab();
+        let Some(at) = in_tab.iter().position(|&index| index == self.selected) else {
+            return;
+        };
+        let to = at.saturating_add_signed(by).min(in_tab.len() - 1);
+        self.selected = in_tab[to];
     }
 
-    /// Selects the next session that needs the user, or says there's none.
+    /// Selects the next session that needs the user, bringing its tab to
+    /// the front, or says there's none.
     fn select_next_needing_user(&mut self) {
         match self.next_needing_user() {
-            Some(index) => self.selected = index,
+            Some(index) => {
+                let name = self.sessions[index].name.clone();
+                self.select(&name);
+            }
             None => self.notify("nothing needs you".to_string()),
         }
     }
 
-    /// The next session that needs the user, going down the sidebar from
-    /// the selected one and round again: one waiting on them comes before
-    /// one that's done. Starting after the selection means that pressing
-    /// the key again moves on to the next.
+    /// The next session that needs the user, in any tab: one waiting on
+    /// them comes before one that's done. See [`Self::sessions_in_turn`].
     fn next_needing_user(&self) -> Option<usize> {
-        let count = self.sessions.len();
-        let in_turn: Vec<usize> = (1..=count)
-            .map(|step| (self.selected + step) % count)
-            .collect();
+        let in_turn = self.sessions_in_turn();
         for wanted in [Activity::Waiting, Activity::Done] {
             let found = in_turn.iter().copied().find(|&index| {
                 let session = &self.sessions[index];
@@ -2261,6 +2448,25 @@ impl App {
             }
         }
         None
+    }
+
+    /// Every session, by index, in the order `u` looks through them: down
+    /// the tab in front from just after the selected one, on through the
+    /// other tabs in their order, and round to the selected one last.
+    /// Starting after the selection means that pressing the key again
+    /// moves on to the next.
+    fn sessions_in_turn(&self) -> Vec<usize> {
+        let count = self.tabs.all().len();
+        let first = self.tabs.current_index();
+        let mut in_turn: Vec<usize> = (0..count)
+            .flat_map(|step| self.sessions_in((first + step) % count))
+            .collect();
+        let selected = self.selected_index();
+        let at = in_turn.iter().position(|&index| Some(index) == selected);
+        if let Some(at) = at {
+            in_turn.rotate_left(at + 1);
+        }
+        in_turn
     }
 
     /// Only a pane that shows a running session takes keys.
@@ -3217,31 +3423,165 @@ mod tests {
         shown.map(|session| session.name.as_str()).collect()
     }
 
-    #[test]
-    fn t_makes_a_tab_on_the_selected_session_with_nothing_split_off() {
-        let mut app = app_with_splits(&["a", "b"], 1);
-        assert_eq!(on_screen(&app), ["b", "a"]);
+    /// The names of the sessions the sidebar shows: the tab in front's.
+    fn in_sidebar(app: &App) -> Vec<&str> {
+        let shown = app.matches().into_iter();
+        shown
+            .map(|index| app.sessions()[index].name.as_str())
+            .collect()
+    }
+
+    /// An app with `names` in the first tab, and a second tab in front
+    /// holding only `shell`, started in it the way `t` starts one.
+    fn app_with_a_second_tab(names: &[&str]) -> App {
+        let mut app = app_with(names);
         press(&mut app, KeyCode::Char('t'));
-        assert_eq!(app.tabs().all().len(), 2);
-        assert_eq!(app.tabs().current_index(), 1);
-        assert_eq!(on_screen(&app), ["b"]);
+        let mut sessions: Vec<SessionInfo> = names.iter().map(|name| session(name)).collect();
+        sessions.push(session("shell"));
+        app.set_sessions(sessions);
+        app.select("shell");
+        app
     }
 
     #[test]
-    fn each_tab_comes_back_on_its_own_session_with_its_own_splits() {
-        let mut app = app_with_splits(&["a", "b", "c"], 1);
+    fn t_makes_an_empty_tab_and_starts_a_shell_where_the_selected_session_is() {
+        let mut app = App::new(None);
+        let b = SessionInfo {
+            cwd: PathBuf::from("/code/b"),
+            ..session("b")
+        };
+        app.set_sessions(vec![session("a"), b]);
         app.select("b");
-        press(&mut app, KeyCode::Char('t'));
-        press(&mut app, KeyCode::Char('j'));
-        assert_eq!(on_screen(&app), ["c"]);
+        let action = press(&mut app, KeyCode::Char('t'));
+        assert_eq!(
+            action,
+            Some(Action::Start {
+                place: Place::Directory(Some(PathBuf::from("/code/b"))),
+                command: Vec::new(),
+                purpose: Purpose::default(),
+            })
+        );
+        assert_eq!(app.tabs().all().len(), 2);
+        assert_eq!(app.tabs().current_index(), 1);
+        assert!(in_sidebar(&app).is_empty());
+        assert!(app.selected().is_none());
+    }
 
-        press(&mut app, KeyCode::Char('['));
+    #[test]
+    fn the_shell_t_starts_is_all_its_tab_has() {
+        let app = app_with_a_second_tab(&["a", "b"]);
+        assert_eq!(in_sidebar(&app), ["shell"]);
+        assert_eq!(selected_name(&app), Some("shell"));
+        assert_eq!(on_screen(&app), ["shell"]);
+    }
+
+    #[test]
+    fn going_to_another_tab_changes_the_sidebar_and_the_panes() {
+        let mut app = app_with_a_second_tab(&["a", "b"]);
+        press(&mut app, KeyCode::Char('1'));
+        assert_eq!(in_sidebar(&app), ["a", "b"]);
+        assert_eq!(on_screen(&app), ["a"]);
+        press(&mut app, KeyCode::Char('j'));
         assert_eq!(selected_name(&app), Some("b"));
-        assert_eq!(on_screen(&app), ["b", "a"]);
 
         press(&mut app, KeyCode::Char(']'));
-        assert_eq!(selected_name(&app), Some("c"));
-        assert_eq!(on_screen(&app), ["c"]);
+        assert_eq!(in_sidebar(&app), ["shell"]);
+        assert_eq!(on_screen(&app), ["shell"]);
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(selected_name(&app), Some("shell"), "j stays in the tab");
+
+        press(&mut app, KeyCode::Char('['));
+        assert_eq!(selected_name(&app), Some("b"), "the tab kept its selection");
+    }
+
+    #[test]
+    fn each_tab_keeps_its_own_splits() {
+        let mut app = app_with_splits(&["a", "b", "c"], 1);
+        assert_eq!(on_screen(&app), ["c", "a"]);
+        press(&mut app, KeyCode::Char('t'));
+        app.set_sessions(["a", "b", "c", "shell"].map(session).to_vec());
+        assert!(app.splits().is_empty());
+        press(&mut app, KeyCode::Char('1'));
+        assert_eq!(on_screen(&app), ["c", "a"]);
+    }
+
+    #[test]
+    fn sessions_started_elsewhere_join_the_tab_in_front() {
+        let mut app = app_with_a_second_tab(&["a"]);
+        app.set_sessions(["a", "shell", "from-the-cli"].map(session).to_vec());
+        assert_eq!(in_sidebar(&app), ["shell", "from-the-cli"]);
+        press(&mut app, KeyCode::Char('1'));
+        app.set_sessions(
+            ["a", "shell", "from-the-cli", "later"]
+                .map(session)
+                .to_vec(),
+        );
+        assert_eq!(in_sidebar(&app), ["a", "later"]);
+    }
+
+    #[test]
+    fn a_renamed_session_stays_in_its_tab() {
+        let mut app = app_with_a_second_tab(&["a"]);
+        app.renamed("a", "z");
+        app.set_sessions(["z", "shell"].map(session).to_vec());
+        assert_eq!(in_sidebar(&app), ["shell"]);
+        press(&mut app, KeyCode::Char('1'));
+        assert_eq!(in_sidebar(&app), ["z"]);
+    }
+
+    #[test]
+    fn greater_than_moves_the_session_to_the_tab_named_next() {
+        let mut app = app_with_a_second_tab(&["a", "b"]);
+        press(&mut app, KeyCode::Char('1'));
+        press(&mut app, KeyCode::Char('>'));
+        assert_eq!(app.moving(), Some("a"));
+        assert_eq!(press(&mut app, KeyCode::Char('2')), None);
+        assert_eq!(app.moving(), None);
+        assert_eq!(app.notice(), Some("moved a to tab 2"));
+        assert_eq!(in_sidebar(&app), ["b"]);
+        assert_eq!(selected_name(&app), Some("b"));
+        assert_eq!(app.tabs().current_index(), 0, "the tab in front stays");
+
+        press(&mut app, KeyCode::Char('2'));
+        assert_eq!(in_sidebar(&app), ["a", "shell"]);
+    }
+
+    #[test]
+    fn greater_than_then_t_moves_the_session_to_a_new_tab() {
+        let mut app = app_with(&["a", "b"]);
+        press(&mut app, KeyCode::Char('>'));
+        press(&mut app, KeyCode::Char('t'));
+        assert_eq!(app.tabs().all().len(), 2);
+        assert_eq!(app.tabs().current_index(), 0);
+        assert_eq!(in_sidebar(&app), ["b"]);
+        assert_eq!(app.tabs().all()[1].sessions, ["a"]);
+    }
+
+    #[test]
+    fn moving_a_session_nowhere_new_says_so_and_other_keys_leave_it() {
+        let mut app = app_with(&["a"]);
+        press(&mut app, KeyCode::Char('>'));
+        press(&mut app, KeyCode::Char('1'));
+        assert_eq!(app.notice(), Some("a is in tab 1 already"));
+        press(&mut app, KeyCode::Char('>'));
+        press(&mut app, KeyCode::Char('4'));
+        assert_eq!(app.notice(), Some("there's no tab 4"));
+        press(&mut app, KeyCode::Char('>'));
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.moving(), None);
+        assert_eq!(in_sidebar(&app), ["a"]);
+    }
+
+    #[test]
+    fn a_session_moved_away_takes_its_split_with_it() {
+        let mut app = app_with_a_second_tab(&["a", "b"]);
+        press(&mut app, KeyCode::Char('1'));
+        press(&mut app, KeyCode::Char('s'));
+        assert_eq!(app.splits(), ["a"]);
+        press(&mut app, KeyCode::Char('>'));
+        press(&mut app, KeyCode::Char('2'));
+        assert!(app.splits().is_empty());
+        assert_eq!(on_screen(&app), ["b"]);
     }
 
     #[test]
@@ -3282,19 +3622,44 @@ mod tests {
     }
 
     #[test]
-    fn ampersand_closes_the_tab_but_never_a_session() {
-        let mut app = app_with_splits(&["a", "b"], 1);
+    fn ampersand_closes_an_empty_tab_at_once() {
+        let mut app = app_with(&["a"]);
         press(&mut app, KeyCode::Char('t'));
-        press(&mut app, KeyCode::Char('s'));
-        assert_eq!(
-            press(&mut app, KeyCode::Char('&')),
-            None,
-            "nothing is killed"
-        );
+        assert_eq!(press(&mut app, KeyCode::Char('&')), None);
+        assert!(app.confirm().is_none());
         assert_eq!(app.tabs().all().len(), 1);
-        assert_eq!(app.sessions().len(), 2);
-        assert!(app.notice().unwrap().contains("its sessions keep running"));
-        assert_eq!(on_screen(&app), ["b", "a"], "the first tab, as it was");
+        assert_eq!(selected_name(&app), Some("a"));
+    }
+
+    #[test]
+    fn ampersand_asks_before_closing_a_tab_and_killing_its_sessions() {
+        let mut app = app_with_a_second_tab(&["a"]);
+        press(&mut app, KeyCode::Char('&'));
+        let question = app.confirm().map(Confirm::question);
+        assert_eq!(
+            question.as_deref(),
+            Some("close tab 2 and kill its 1 session? y/n")
+        );
+        press(&mut app, KeyCode::Char('n'));
+        assert_eq!(app.tabs().all().len(), 2, "no keeps it");
+
+        press(&mut app, KeyCode::Char('&'));
+        let action = press(&mut app, KeyCode::Char('y'));
+        assert_eq!(action, Some(Action::KillAll(vec!["shell".into()])));
+        assert_eq!(app.tabs().all().len(), 1);
+        assert_eq!(selected_name(&app), Some("a"));
+    }
+
+    #[test]
+    fn the_session_crystal_runs_in_is_never_killed_with_its_tab() {
+        let mut app = App::new(Some("shell".into()));
+        app.set_sessions(vec![session("a")]);
+        press(&mut app, KeyCode::Char('t'));
+        app.set_sessions(["a", "shell", "helper"].map(session).to_vec());
+        press(&mut app, KeyCode::Char('&'));
+        let action = press(&mut app, KeyCode::Char('y'));
+        assert_eq!(action, Some(Action::KillAll(vec!["helper".into()])));
+        assert!(in_sidebar(&app).contains(&"shell"), "it joined tab 1");
     }
 
     #[test]
@@ -3306,29 +3671,66 @@ mod tests {
     }
 
     #[test]
-    fn a_split_of_a_session_that_goes_closes_in_every_tab() {
+    fn a_split_of_a_session_that_goes_closes() {
         let mut app = app_with_splits(&["a", "b", "c"], 1);
-        press(&mut app, KeyCode::Char('t'));
-        app.select("a");
-        press(&mut app, KeyCode::Char('s'));
         app.set_sessions(vec![session("b"), session("c")]);
         assert!(app.tabs().all().iter().all(|tab| tab.splits.is_empty()));
     }
 
     #[test]
-    fn a_tab_whose_session_has_gone_leaves_the_selection_where_it_is() {
-        let mut app = app_with(&["a", "b"]);
+    fn a_tab_whose_selected_session_has_gone_selects_its_first() {
+        let mut app = app_with(&["a", "b", "c"]);
+        app.select("b");
         press(&mut app, KeyCode::Char('t'));
-        press(&mut app, KeyCode::Char('j'));
-        app.set_sessions(vec![session("b")]);
+        app.set_sessions(vec![session("a"), session("c")]);
         press(&mut app, KeyCode::Char('1'));
+        assert_eq!(selected_name(&app), Some("a"));
+    }
+
+    #[test]
+    fn u_goes_to_an_agent_waiting_in_another_tab() {
+        let mut app = app_with_a_second_tab(&["a", "b"]);
+        let waiting = doing("b", Activity::Waiting);
+        app.set_sessions(vec![session("a"), waiting, session("shell")]);
+        assert_eq!(app.tabs().current_index(), 1);
+        press(&mut app, KeyCode::Char('u'));
+        assert_eq!(app.tabs().current_index(), 0);
         assert_eq!(selected_name(&app), Some("b"));
     }
 
     #[test]
-    fn clicking_a_tab_goes_to_it_and_gives_the_sidebar_the_keyboard() {
-        let mut app = app_with(&["a"]);
+    fn a_tab_shows_what_most_needs_the_user_in_it() {
+        let mut app = app_with_a_second_tab(&["a", "b"]);
+        assert_eq!(app.tab_status(0), None);
+        let sessions = |a, b| vec![doing("a", a), doing("b", b), session("shell")];
+        app.set_sessions(sessions(Activity::Working, Activity::Idle));
+        assert_eq!(app.tab_status(0), Some(Status::Working));
+        app.set_sessions(sessions(Activity::Working, Activity::Done));
+        assert_eq!(app.tab_status(0), Some(Status::Done));
+        app.set_sessions(sessions(Activity::Waiting, Activity::Done));
+        assert_eq!(app.tab_status(0), Some(Status::Waiting));
+        assert_eq!(app.tab_status(1), None);
+    }
+
+    #[test]
+    fn a_flow_step_joins_the_tab_its_run_is_in() {
+        let mut app = app_with_a_run(crate::flow_run::StepState::Running);
         press(&mut app, KeyCode::Char('t'));
+        let mut run = app.flows()[0].clone();
+        run.steps[1].session = Some("ship-1-review-2".into());
+        app.set_flows(vec![run]);
+        app.set_sessions(
+            ["ship-1-review-2", "shell", "ship-1-plan", "elsewhere"]
+                .map(session)
+                .to_vec(),
+        );
+        assert_eq!(in_sidebar(&app), ["elsewhere"]);
+        assert_eq!(app.tabs().tab_of("ship-1-review-2"), Some(0));
+    }
+
+    #[test]
+    fn clicking_a_tab_goes_to_it_and_gives_the_sidebar_the_keyboard() {
+        let mut app = app_with_a_second_tab(&["a"]);
         press(&mut app, KeyCode::Enter);
         assert_eq!(app.focus(), Focus::Pane(Slot::Selected));
         app.on_mouse(CLICK, Hit::Tab(0));
@@ -3337,29 +3739,30 @@ mod tests {
     }
 
     #[test]
-    fn the_tabs_kept_come_back_on_the_session_the_one_in_front_was_on() {
-        let mut app = app_with_splits(&["a", "b", "c"], 1);
+    fn the_tabs_kept_come_back_with_their_own_sessions_and_selections() {
+        let mut app = app_with(&["a", "b"]);
         app.select("b");
         press(&mut app, KeyCode::Char('t'));
-        press(&mut app, KeyCode::Char('j'));
+        app.set_sessions(["a", "b", "shell"].map(session).to_vec());
         let kept = app.tabs_to_keep();
-        assert_eq!(kept.current().selected.as_deref(), Some("c"));
 
-        let mut reopened = app_with(&["a", "b", "c"]);
+        let mut reopened = app_with(&["a", "b", "shell"]);
         reopened.set_tabs(kept);
         assert_eq!(reopened.tabs().current_index(), 1);
-        assert_eq!(selected_name(&reopened), Some("c"));
+        assert_eq!(in_sidebar(&reopened), ["shell"]);
         press(&mut reopened, KeyCode::Char('1'));
-        assert_eq!(on_screen(&reopened), ["b", "a"]);
+        assert_eq!(in_sidebar(&reopened), ["a", "b"]);
+        assert_eq!(selected_name(&reopened), Some("b"));
     }
 
     #[test]
-    fn tabs_kept_with_sessions_since_gone_drop_their_splits() {
+    fn tabs_kept_with_sessions_since_gone_drop_them() {
         let app = app_with_splits(&["a", "b"], 1);
         let kept = app.tabs_to_keep();
-        let mut reopened = app_with(&["b"]);
+        let mut reopened = app_with(&["b", "new"]);
         reopened.set_tabs(kept);
         assert!(reopened.splits().is_empty());
+        assert_eq!(in_sidebar(&reopened), ["b", "new"]);
     }
 
     const CLICK: MouseEventKind = MouseEventKind::Down(MouseButton::Left);

@@ -56,7 +56,7 @@ pub const KEYS: &[Key] = &[
     sidebar("s", "split off, or unsplit"),
     sidebar("PageUp/PageDown", "page its history"),
     sidebar("t/T/&", "tab: new / name / close"),
-    sidebar("[/] 1-9", "switch tabs"),
+    sidebar("[/] 1-9 >", "switch tabs / move it"),
     sidebar("n/w", "new, or in a worktree"),
     sidebar("W", "remove its worktree"),
     sidebar("r/x", "rename / kill it"),

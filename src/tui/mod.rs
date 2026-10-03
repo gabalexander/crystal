@@ -676,6 +676,19 @@ impl Tui {
                 client::ask(&self.socket, &Request::Kill { name }, false)?;
                 self.refresh_sessions()?;
             }
+            Action::KillAll(names) => {
+                // One that has gone already is no reason to spare the rest.
+                let mut failed = None;
+                for name in names {
+                    if let Err(err) = client::ask(&self.socket, &Request::Kill { name }, false) {
+                        failed.get_or_insert(err);
+                    }
+                }
+                self.refresh_sessions()?;
+                if let Some(err) = failed {
+                    return Err(err);
+                }
+            }
             Action::Rename { name, new_name } => {
                 client::rename(&self.socket, &name, &new_name)?;
                 self.app.renamed(&name, &new_name);

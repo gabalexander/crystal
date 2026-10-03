@@ -37,6 +37,10 @@ const TERMINAL_MARK: &str = "❯";
 
 pub fn draw(frame: &mut Frame, app: &App, look: &Look, area: Rect) {
     let rows = app.rows();
+    if rows.is_empty() && app.filter().is_none() && !app.sessions().is_empty() {
+        draw_empty_tab(frame, look.theme, area);
+        return;
+    }
     let first = offset(app, area.height);
     let selected = selected_row(app);
     let shown = rows.iter().enumerate().skip(first).take(area.height.into());
@@ -54,6 +58,29 @@ pub fn draw(frame: &mut Frame, app: &App, look: &Look, area: Rect) {
                 .set_style(line_area, look.theme.selection);
         }
         let line = row_line(app, row, look, area.width, is_selected);
+        frame.render_widget(line, line_area);
+    }
+}
+
+/// The sidebar of a tab with no sessions in it, while other tabs have
+/// some: how to start something there, or close it.
+fn draw_empty_tab(frame: &mut Frame, theme: &Theme, area: Rect) {
+    let muted = Style::new().fg(theme.muted);
+    let key = Style::new().fg(theme.text);
+    let lines = vec![
+        Line::styled(" nothing in this tab yet", muted),
+        Line::from(vec![
+            Span::styled(" n", key),
+            Span::styled(" starts a session here", muted),
+        ]),
+        Line::from(vec![
+            Span::styled(" &", key),
+            Span::styled(" closes the tab", muted),
+        ]),
+    ];
+    let shown = lines.into_iter().take(area.height.into());
+    for (offset, line) in shown.enumerate() {
+        let line_area = Rect::new(area.x, area.y + offset as u16, area.width, 1);
         frame.render_widget(line, line_area);
     }
 }

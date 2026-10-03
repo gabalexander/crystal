@@ -86,10 +86,11 @@ and the footer says where you are and offers the keys that matter there.
 | `s` | split the selected session off into a pane of its own, or close its split |
 | `Tab` / `Shift+Tab` | type into the next pane, or the one before |
 | `PageUp` / `PageDown` | page the selected session's pane back through its history, or forward to live |
-| `t` | make a new [tab](#tabs) on the selected session, and go to it |
+| `t` | make a new [tab](#tabs) with a shell in it, and go to it |
 | `T` | name the tab you're in |
-| `&` | close the tab you're in; its sessions keep running |
+| `&` | close the tab you're in, and kill its sessions once you've said `y` |
 | `[` / `]`, `1-9` | go to the tab before or after this one, or to the tab with that number |
+| `>` | move the selected session to another tab: then a tab's number, or `t` for a new one |
 | `n` | start a new session from [the new-session panel](#starting-a-session), and type into it |
 | `w` | the same, in a new worktree on a branch named after the task |
 | `W` | remove the selected session's worktree, once nothing runs in it and you've said `y` |
@@ -259,20 +260,26 @@ those can hold secrets; a session started again gets the environment of whoever 
 
 ### Tabs
 
-A tab is one way of laying out the panes: the session you had selected and the sessions you split off beside
-it. Keep an agent and the session reviewing it in one tab, a dev server and its logs in another, and switch
-between them without picking each session out of the sidebar again.
+A tab is a space of its own: it holds its own sessions, and the sidebar lists only the sessions of the tab
+you're in, with that tab's panes beside them. Keep the agents on one feature in one tab, a dev server and its
+logs in another, a review in a third, and switch between them.
 
-The tabs sit in the bar along the top, numbered, the one you're in standing out. `t` makes a new one on the
-selected session, with nothing split off, and takes you to it. `[` and `]` go to the tab before and after,
-`1` to `9` straight to that one, and a click on a tab goes there too. Going to a tab selects the session it
-was on and brings its splits back. `T` names the tab you're in, and the bar shows the name after its number;
-with too many to fit, the bar shows only the numbers.
+The tabs sit in the bar along the top, numbered, the one you're in standing out. `t` makes a new one, starts
+your shell in it, in the selected session's directory, and takes you there. `[` and `]` go to the tab before
+and after, `1` to `9` straight to that one, and a click on a tab goes there too. Each tab keeps its own
+selection and splits. `T` names the tab you're in, and the bar shows the name after its number; with too many
+to fit, the bar shows only the numbers.
 
-Tabs only arrange sessions; they don't own them. Every session stays in the sidebar whichever tab you're in,
-the same session can be in a few tabs at once, and `&` closes a tab without stopping anything in it. There's
-always one tab, and nine at most. They're kept beside the daemon's state, in `~/.local/state/crystal/`, so
-they're there when you open the TUI again.
+A tab with something going on in it shows that on its label, the way the sidebar marks a session: `▲` when an
+agent in it is waiting on you, `✓` when one has finished a turn you haven't looked at, the turning `◐` while
+one works. `u` looks through every tab for the next session that needs you, and takes you to its tab.
+
+Every session is in exactly one tab. A session you start from the TUI goes in the tab you're in, and so does
+one started any other way, from the command line or another TUI, unless it's a step of a [flow](#flows), which
+goes in the tab with the rest of its run. `>` moves the selected session to another tab: press the tab's
+number next, or `t` to make a new tab for it. `&` closes the tab you're in and kills the sessions in it, once
+you've said `y`; an empty tab closes at once. There's always one tab, and nine at most. They're kept beside the
+daemon's state, in `~/.local/state/crystal/`, so they're there when you open the TUI again.
 
 ### Starting a session
 

@@ -355,16 +355,19 @@ fn draw_top_bar(frame: &mut Frame, app: &App, look: &Look, area: Rect) {
         ),
     ]);
     frame.render_widget(name, area);
-    draw_tabs(frame, app, theme, area);
+    draw_tabs(frame, app, look, area);
     frame.render_widget(summary(app.sessions(), theme).right_aligned(), area);
 }
 
 /// The tabs, after crystal's name in the top bar in `area`: the one in
 /// front stands out the way the sidebar's selection does, the others are
-/// muted.
-fn draw_tabs(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
+/// muted. A tab with something going on in it ends in that thing's mark,
+/// in its color: `▲` for an agent waiting on the user.
+fn draw_tabs(frame: &mut Frame, app: &App, look: &Look, area: Rect) {
+    let theme = look.theme;
     let in_front = app.tabs().current_index();
-    let labels = tab_labels(app.tabs().all(), area.width);
+    let statuses = tab_statuses(app);
+    let labels = tab_labels(app.tabs().all(), &statuses, area.width);
     for (index, (column, label)) in labels.into_iter().enumerate() {
         let style = if index == in_front {
             theme
@@ -374,21 +377,37 @@ fn draw_tabs(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         } else {
             Style::new().fg(theme.muted)
         };
-        let place = Rect::new(area.x + column, area.y, width_of(&label), 1);
+        let width = width_of(&label);
+        let place = Rect::new(area.x + column, area.y, width, 1);
         frame.render_widget(Span::styled(label, style), place);
+        // The mark is the label's last but one column; drawn again over
+        // it, it turns as the sidebar's does, and takes its own color.
+        if let Some(status) = statuses[index] {
+            let mark_at = Rect::new(place.right() - 2, area.y, 1, 1);
+            let color = Style::new().fg(theme.status(status));
+            let mark = Span::styled(status.mark(look.spin), color);
+            frame.render_widget(mark, mark_at);
+        }
     }
 }
 
+/// What each tab's label ends with: see [`App::tab_status`].
+fn tab_statuses(app: &App) -> Vec<Option<Status>> {
+    let count = app.tabs().all().len();
+    (0..count).map(|index| app.tab_status(index)).collect()
+}
+
 /// The tabs' labels in a top bar `width` columns wide, each with the column
-/// it starts at: ` 1 `, or ` 2 review ` once the tab has a name. While they
-/// all fit they show their names; when they don't, only their numbers, and
-/// any that still don't fit are left off.
-pub fn tab_labels(tabs: &[Tab], width: u16) -> Vec<(u16, String)> {
+/// it starts at: ` 1 `, or ` 2 review ` once the tab has a name, and
+/// ` 2 review ▲ ` with its status's mark when `statuses` gives it one.
+/// While they all fit they show their names; when they don't, only their
+/// numbers, and any that still don't fit are left off.
+pub fn tab_labels(tabs: &[Tab], statuses: &[Option<Status>], width: u16) -> Vec<(u16, String)> {
     let room = width.saturating_sub(TABS_START + SUMMARY_ROOM);
     let labels = |named: bool| -> Vec<String> {
-        let numbered = tabs.iter().enumerate();
+        let numbered = tabs.iter().zip(statuses).enumerate();
         numbered
-            .map(|(index, tab)| tab_label(index + 1, tab, named))
+            .map(|(index, (tab, status))| tab_label(index + 1, tab, *status, named))
             .collect()
     };
     let mut shown = labels(true);
@@ -409,13 +428,14 @@ pub fn tab_labels(tabs: &[Tab], width: u16) -> Vec<(u16, String)> {
     placed
 }
 
-/// Tab `number`'s label: its number, and its name if it has one and
-/// `named` says to show it.
-fn tab_label(number: usize, tab: &Tab, named: bool) -> String {
+/// Tab `number`'s label: its number, its name if it has one and `named`
+/// says to show it, and its status's mark, if it has one.
+fn tab_label(number: usize, tab: &Tab, status: Option<Status>, named: bool) -> String {
+    let mark = status.map_or(String::new(), |status| format!(" {}", status.mark(0)));
     if named && !tab.name.is_empty() {
-        format!(" {number} {} ", fit(&tab.name, TAB_NAME_LENGTH))
+        format!(" {number} {}{mark} ", fit(&tab.name, TAB_NAME_LENGTH))
     } else {
-        format!(" {number} ")
+        format!(" {number}{mark} ")
     }
 }
 
@@ -423,7 +443,7 @@ fn tab_label(number: usize, tab: &Tab, named: bool) -> String {
 /// there.
 fn tab_hit(app: &App, area: Rect, column: u16) -> Hit {
     let column = column - area.x;
-    let labels = tab_labels(app.tabs().all(), area.width);
+    let labels = tab_labels(app.tabs().all(), &tab_statuses(app), area.width);
     let under = labels.iter().position(|(start, label)| {
         let end = start + width_of(label);
         (*start..end).contains(&column)
@@ -495,8 +515,10 @@ fn draw_pane(frame: &mut Frame, app: &App, look: &Look, slot: Slot, area: Rect, 
     let header = Rect::new(area.x, area.y, area.width, 1);
 
     let Some(session) = session else {
-        if slot == Slot::Selected {
+        if slot == Slot::Selected && app.sessions().is_empty() {
             draw_message(frame, look, "No sessions yet: n starts one", screen);
+        } else if slot == Slot::Selected {
+            draw_message(frame, look, "Nothing in this tab yet", screen);
         }
         return;
     };
@@ -697,6 +719,9 @@ fn draw_footer(frame: &mut Frame, app: &App, look: &Look, area: Rect) {
         draw_backlog_footer(frame, view, theme, area);
     } else if let Some(name) = app.closing() {
         let question = format!("close {name}'s task? d done · f failed · any other key, not yet");
+        frame.render_widget(question_line(&question, theme), area);
+    } else if let Some(name) = app.moving() {
+        let question = format!("move {name} to tab 1-9, or t a new one · any other key, not yet");
         frame.render_widget(question_line(&question, theme), area);
     } else if let Some(filter) = app.filter() {
         draw_filter(frame, theme, filter, app.matches().len(), area);
@@ -1187,12 +1212,42 @@ mod tests {
         };
         let tabs = [named("agents"), named("a-long-name-for-a-tab"), named("")];
         let labels = |width| -> Vec<String> {
-            let labels: Vec<(u16, String)> = tab_labels(&tabs, width);
+            let labels: Vec<(u16, String)> = tab_labels(&tabs, &[None; 3], width);
             labels.into_iter().map(|(_, label)| label).collect()
         };
         assert_eq!(labels(120), [" 1 agents ", " 2 a-long-name-for… ", " 3 "]);
         assert_eq!(labels(60), [" 1 ", " 2 ", " 3 "]);
         assert_eq!(labels(42), [" 1 ", " 2 "], "the last doesn't fit");
+    }
+
+    #[test]
+    fn a_tab_with_an_agent_waiting_shows_it_from_another_tab() {
+        let theme = theme();
+        let mut waiting = session("a", State::Running);
+        waiting.activity = Some(Activity::Waiting);
+        let mut app = App::new(None);
+        app.set_sessions(vec![waiting.clone()]);
+        app.on_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
+        app.set_sessions(vec![waiting, session("b", State::Running)]);
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, &app, &[], None, &look(&theme)))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let top: String = (0..30).map(|x| buffer[(x, 0)].symbol()).collect();
+        assert!(top.starts_with(" crystal   1 ▲  2 "), "{top}");
+        assert_eq!(buffer[(13, 0)].fg, theme.waiting);
+        // The one waiting is in the first tab, out of this one's sidebar.
+        let sidebar = sidebar_text(&app);
+        assert!(
+            sidebar.iter().any(|line| line.contains("❯ b")),
+            "{sidebar:?}"
+        );
+        assert!(
+            !sidebar.iter().any(|line| line.contains("▲ a")),
+            "{sidebar:?}"
+        );
     }
 
     #[test]

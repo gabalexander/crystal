@@ -1957,53 +1957,138 @@ fn sessions_saying_here(crystal: &Crystal, names: &[&str]) {
     }
 }
 
-#[test]
-fn each_tab_shows_its_own_panes_and_going_back_brings_them_back() {
-    let crystal = Crystal::new();
-    sessions_saying_here(&crystal, &["alpha", "beta", "gamma"]);
+/// Waits until the TUI's sidebar shows `text`.
+fn sidebar_shows(tui: &Terminal, text: &str) {
+    eventually(&format!("the sidebar shows {text:?}"), || {
+        sidebar_of(&tui.text()).contains(text)
+    });
+}
 
-    // The first tab: alpha split off beside beta.
-    let mut tui = crystal.tui();
-    tui.shows("alpha is here");
-    tui.type_keys("s");
-    tui.type_keys("j");
-    tui.shows("beta is here");
-    tui.shows("alpha is here");
+/// Waits until the TUI's sidebar no longer shows `text`.
+fn sidebar_hides(tui: &Terminal, text: &str) {
+    eventually(&format!("the sidebar doesn't show {text:?}"), || {
+        !sidebar_of(&tui.text()).contains(text)
+    });
+}
 
-    // A new tab starts on beta alone; gamma is selected in it.
+/// Presses `t` in the TUI: a new tab, with a shell in it, which has the
+/// keyboard. Waits for the shell, then gives the sidebar the keyboard back.
+fn new_tab_with_a_shell(tui: &mut Terminal) {
     tui.type_keys("t");
-    tui.hides("alpha is here");
-    tui.type_keys("j");
-    tui.shows("gamma is here");
-    tui.hides("beta is here");
-
-    tui.type_keys("[");
-    tui.shows("alpha is here");
-    tui.shows("beta is here");
-    tui.hides("gamma is here");
-
-    // The second tab's label, " 2 ", is drawn from column 13 of the top
-    // bar.
-    tui.type_keys(&click(14, 0));
-    tui.shows("gamma is here");
-    tui.hides("alpha is here");
+    // Keys typed before the pane shows the shell's prompt would be lost.
+    tui.shows("$ ");
+    tui.type_keys("echo in the new tab\r");
+    tui.shows("in the new tab");
+    sidebar_shows(tui, "❯ sh");
+    tui.type_keys("\x1c");
 }
 
 #[test]
-fn closing_a_tab_leaves_its_sessions_running() {
+fn t_makes_a_tab_of_its_own_and_going_between_tabs_changes_the_sidebar() {
     let crystal = Crystal::new();
     sessions_saying_here(&crystal, &["alpha", "beta"]);
 
     let mut tui = crystal.tui();
     tui.shows("alpha is here");
-    tui.type_keys("t");
-    tui.type_keys("j");
-    tui.shows("beta is here");
-    tui.type_keys("&");
-    tui.shows("closed tab 2; its sessions keep running");
+    new_tab_with_a_shell(&mut tui);
+    // The new tab has its shell and nothing else.
+    sidebar_hides(&tui, "❯ alpha");
+    sidebar_hides(&tui, "❯ beta");
+    tui.shows(" 1  2 ");
+
+    tui.type_keys("1");
+    sidebar_shows(&tui, "❯ alpha");
+    sidebar_shows(&tui, "❯ beta");
+    sidebar_hides(&tui, "❯ sh");
     tui.shows("alpha is here");
-    tui.hides("beta is here");
-    assert_eq!(crystal.row("beta").unwrap()[1], "running");
+
+    // The second tab's label, " 2 ", is drawn from column 13 of the top
+    // bar.
+    tui.type_keys(&click(14, 0));
+    sidebar_shows(&tui, "❯ sh");
+    sidebar_hides(&tui, "❯ alpha");
+    tui.shows("in the new tab");
+}
+
+#[test]
+fn a_session_moved_to_another_tab_leaves_this_one() {
+    let crystal = Crystal::new();
+    sessions_saying_here(&crystal, &["alpha", "beta"]);
+
+    let mut tui = crystal.tui();
+    tui.shows("alpha is here");
+    new_tab_with_a_shell(&mut tui);
+    tui.type_keys("1");
+    sidebar_shows(&tui, "❯ alpha");
+
+    tui.type_keys(">");
+    tui.shows("move alpha to tab 1-9");
+    tui.type_keys("2");
+    tui.shows("moved alpha to tab 2");
+    sidebar_hides(&tui, "❯ alpha");
+    tui.shows("beta is here");
+
+    tui.type_keys("2");
+    sidebar_shows(&tui, "❯ alpha");
+    sidebar_shows(&tui, "❯ sh");
+}
+
+#[test]
+fn an_agent_waiting_in_another_tab_shows_on_its_tab_and_u_goes_there() {
+    let crystal = Crystal::new();
+    sessions_saying_here(&crystal, &["alpha"]);
+    let mut tui = crystal.tui();
+    tui.shows("alpha is here");
+    new_tab_with_a_shell(&mut tui);
+
+    // Started from the command line, the agent joins the tab in front.
+    let bin = fake_claude(crystal.dir.path());
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let out = crystal
+        .command(&["new", "-n", "agent", "claude"])
+        .env("PATH", path)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    sidebar_shows(&tui, "agent");
+
+    tui.type_keys("1");
+    sidebar_hides(&tui, "agent");
+    let args = written(&crystal.dir.path().join("args"));
+    let settings: serde_json::Value = serde_json::from_str(args.lines().nth(1).unwrap()).unwrap();
+    let hook = settings["hooks"]["Stop"][0]["hooks"][0]["command"]
+        .as_str()
+        .unwrap();
+    run_hook(
+        &crystal,
+        "agent",
+        hook,
+        r#"{"hook_event_name":"PermissionRequest"}"#,
+    );
+    tui.shows(" 2 ▲ ");
+
+    tui.type_keys("u");
+    sidebar_shows(&tui, "▲ agent");
+    sidebar_hides(&tui, "❯ alpha");
+}
+
+#[test]
+fn closing_a_tab_with_a_session_in_it_asks_then_kills_the_session() {
+    let crystal = Crystal::new();
+    sessions_saying_here(&crystal, &["alpha"]);
+
+    let mut tui = crystal.tui();
+    tui.shows("alpha is here");
+    new_tab_with_a_shell(&mut tui);
+    assert!(crystal.row("sh").is_some());
+
+    tui.type_keys("&");
+    tui.shows("close tab 2 and kill its 1 session? y/n");
+    tui.type_keys("y");
+    sidebar_shows(&tui, "❯ alpha");
+    tui.hides(" 2 ");
+    eventually("the tab's shell is killed", || crystal.row("sh").is_none());
+    assert_eq!(crystal.row("alpha").unwrap()[1], "running");
 }
 
 #[test]
@@ -2013,10 +2098,7 @@ fn tabs_come_back_when_the_tui_opens_again() {
 
     let mut tui = crystal.tui();
     tui.shows("alpha is here");
-    tui.type_keys("s");
-    tui.type_keys("t");
-    tui.type_keys("j");
-    tui.shows("beta is here");
+    new_tab_with_a_shell(&mut tui);
     tui.type_keys("T");
     tui.shows("tab name:");
     tui.type_keys("review\r");
@@ -2024,14 +2106,15 @@ fn tabs_come_back_when_the_tui_opens_again() {
     tui.type_keys("q");
     assert!(tui.exit());
 
-    // Back in the named tab, on beta; the first still has alpha split off.
+    // Back in the named tab, with its shell alone; the first has the rest.
     let mut tui = crystal.tui();
     tui.shows(" 2 review ");
-    tui.shows("beta is here");
-    tui.hides("alpha is here");
+    sidebar_shows(&tui, "❯ sh");
+    sidebar_hides(&tui, "❯ alpha");
     tui.type_keys("1");
-    tui.shows("alpha has a pane of its own");
-    tui.shows("alpha is here");
+    sidebar_shows(&tui, "❯ alpha");
+    sidebar_shows(&tui, "❯ beta");
+    sidebar_hides(&tui, "❯ sh");
 }
 
 #[test]
