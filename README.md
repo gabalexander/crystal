@@ -149,6 +149,7 @@ crystal new -d -n review -c ~/code/app codex   # start one in the background, na
 crystal new -w fix/login claude             # start one in a new worktree, on a new branch
 crystal worktree rm fix/login               # remove that worktree, once nothing runs in it
 crystal ls                                  # list sessions and how they're doing
+crystal ls --json                           # the same, as JSON, for scripts and agents
 crystal attach review                       # show a session; Ctrl+\ hands your terminal back
 crystal send review "check the diff"        # type into a session and press Enter
 crystal send-keys review 1                  # press keys: an answer, Enter, Escape, C-c, Up…
@@ -161,6 +162,7 @@ crystal kill review                         # stop one session
 crystal kill-server                         # stop every session, and the daemon
 crystal restart-server                      # restart the daemon, say after an upgrade; sessions come back
 crystal config                              # where the config file is, and the settings in effect
+crystal skill --install                     # teach Claude Code to drive crystal (see below)
 ```
 
 ```
@@ -215,6 +217,49 @@ runs out. A program that doesn't say what it's doing counts as busy until it end
 `send-keys` presses keys instead, the way tmux's does: key names like `Enter`, `Escape`, `Tab`, `Up`, `Down`,
 `BSpace`, `C-c` or `M-x`, and any other word typed as keys. That's what answers an agent's question, since
 agents don't act on a pasted answer. With `--wait`, it waits for the turn the answer lets carry on.
+
+`crystal ls --json` prints the sessions as a JSON array. Each object holds what the daemon knows about the
+session, plus `status`, the word the STATE column shows:
+
+```json
+[
+  {
+    "name": "reviewer",
+    "id": "18daf82437703c98-0",
+    "command": ["claude"],
+    "cwd": "/code/app",
+    "pid": 41210,
+    "state": "running",
+    "activity": "waiting",
+    "worktree": {
+      "project": "app",
+      "project_path": "/code/app",
+      "path": "/code/app",
+      "main": true,
+      "branch": "main"
+    },
+    "status": "waiting"
+  }
+]
+```
+
+`state` is `"running"`, `{"exited": {"code": 3}}` or `{"signaled": {"signal": "Terminated"}}`; `activity` is
+`null` for a program that doesn't report what it's doing; `worktree` is `null` outside a git repository. New
+fields may appear; none goes away. With no daemon running, it prints `[]`.
+
+#### A skill for Claude Code
+
+Claude Code learns all of this from a skill: when to hand work to another agent, the commands, what each
+status means, and the traps, like answering a question with `send-keys` rather than `send`.
+
+```sh
+crystal skill --install   # into ~/.claude/skills/crystal, or $CLAUDE_CONFIG_DIR/skills/crystal
+crystal skill             # or just print it
+```
+
+`--install` won't write over a skill file you've changed; `--force` does. The skill lives in
+[`skill/SKILL.md`](skill/SKILL.md), and each crystal carries its own copy, so installing again after an
+upgrade brings it up to date.
 
 ### Settings
 
