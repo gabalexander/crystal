@@ -519,8 +519,9 @@ line on how it went:
 - The agent closes it from inside its session: `crystal done "<what was done>"`, or `crystal done --failed
   "<why>"`. crystal tells Claude Code how, on top of its system prompt, and tells Codex at the end of its first
   prompt, opening with a line on where that comes from, so the agent doesn't take it for a stranger's
-  instructions. Agents don't always remember to: Haiku often doesn't. `-n <session>` closes another session's
-  task.
+  instructions. Agents don't always remember to, Haiku least of all, so the first time Claude Code ends a turn
+  with its task still open, its Stop hook reminds it and it carries on: to close the task, or, if it isn't
+  through, to leave it open and end its turn. `-n <session>` closes another session's task.
 - You close it from the TUI: `c` on the session asks `d` done or `f` failed, then for a line on how it went,
   which can stay empty.
 - A background task closes itself when its run ends: done with the first line of Claude's answer, or failed.

@@ -45,6 +45,16 @@ pub fn instructions(backlog: bool) -> String {
     text
 }
 
+/// What an agent is told when it ends a turn with its task still open, once
+/// a task: agents don't always remember to close theirs, Haiku least of all.
+/// One that isn't through, say because it's waiting on the user, is told to
+/// leave it open.
+pub const REMINDER: &str = "Your crystal task is still open. If you've done it, close it now: \
+                            run `crystal done \"<one line on what you did>\"`, or `crystal \
+                            done --failed \"<why>\"` if you couldn't do it. If you aren't \
+                            through, say you're waiting on the user, leave it open and end \
+                            your turn.";
+
 /// The file a project's closed tasks are kept in: one JSON line each, so a
 /// new one is added without reading or writing the others.
 const FILE: &str = "tasks.jsonl";

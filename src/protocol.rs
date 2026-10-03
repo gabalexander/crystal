@@ -277,6 +277,11 @@ pub enum Response {
     Flows {
         runs: Vec<FlowRun>,
     },
+    /// What the hook that reported a turn ending tells its agent: its task
+    /// is still open. The agent carries on, so the turn hasn't ended.
+    Remind {
+        text: String,
+    },
     Done,
     Error {
         message: String,

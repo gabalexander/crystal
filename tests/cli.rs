@@ -1217,9 +1217,18 @@ fn run_hook(crystal: &Crystal, session: &str, hook: &str, event: &str) {
 
 /// Like [`run_hook`], with the session's part of the environment as given.
 fn run_hook_with(crystal: &Crystal, session_env: &[(&str, &str)], hook: &str, event: &str) {
+    let said = hook_says(crystal, session_env, hook, event);
+    assert!(said.is_empty(), "the hook printed for {event}: {said}");
+}
+
+/// Runs a hook the way [`run_hook_with`] does, and gives back what it
+/// printed, which Claude Code reads. A hook must succeed.
+fn hook_says(crystal: &Crystal, session_env: &[(&str, &str)], hook: &str, event: &str) -> String {
     let mut child = Command::new("sh")
         .arg("-c")
         .arg(hook)
+        // Not the id of a session these tests are run in.
+        .env_remove("CRYSTAL_SESSION_ID")
         .envs(session_env.iter().copied())
         .env("CRYSTAL_SOCKET", &crystal.socket)
         .stdin(Stdio::piped())
@@ -1234,7 +1243,7 @@ fn run_hook_with(crystal: &Crystal, session_env: &[(&str, &str)], hook: &str, ev
         .unwrap();
     let out = child.wait_with_output().unwrap();
     assert!(out.status.success(), "the hook failed for {event}");
-    assert!(out.stdout.is_empty(), "the hook printed for {event}");
+    String::from_utf8(out.stdout).unwrap()
 }
 
 #[test]
@@ -4309,6 +4318,66 @@ fn done_needs_a_session_with_a_task() {
         tasks.contains("failed  given") && tasks.contains("tidy up — no time"),
         "{tasks}"
     );
+}
+
+#[test]
+fn an_agent_that_ends_its_turn_with_its_task_open_is_reminded_once() {
+    let crystal = Crystal::new();
+    let bin = fake_claude(crystal.dir.path());
+    let out = crystal
+        .command(&["new", "-d", "-n", "agent", "claude", "fix the tests"])
+        .env("PATH", path_of(&[&bin]))
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let hook = format!("{CRYSTAL} hook claude");
+    let session = [("CRYSTAL_SESSION", "agent")];
+    let stop = r#"{"hook_event_name":"Stop"}"#;
+    run_hook(
+        &crystal,
+        "agent",
+        &hook,
+        r#"{"hook_event_name":"UserPromptSubmit"}"#,
+    );
+
+    // Its Stop hook keeps it going, told to close its task, so it's still
+    // working…
+    let said: serde_json::Value =
+        serde_json::from_str(&hook_says(&crystal, &session, &hook, stop)).unwrap();
+    assert_eq!(said["decision"], "block", "{said}");
+    let reason = said["reason"].as_str().unwrap();
+    assert!(reason.contains("crystal done"), "{reason}");
+    assert_eq!(crystal.row("agent").unwrap()[1], "working");
+
+    // …and once is enough: it may have its reasons to leave the task open.
+    run_hook(&crystal, "agent", &hook, stop);
+    assert_eq!(crystal.row("agent").unwrap()[1], "done");
+    assert_eq!(crystal.row("agent").unwrap()[8], "fix the tests");
+}
+
+#[test]
+fn an_agent_is_never_reminded_of_a_task_it_has_closed_or_never_had() {
+    let crystal = Crystal::new();
+    let hook = format!("{CRYSTAL} hook claude");
+    let stop = r#"{"hook_event_name":"Stop"}"#;
+    // The turn ends quietly, every time.
+    let ends_quietly = |name: &str| {
+        for _ in 0..2 {
+            run_hook(&crystal, name, &hook, stop);
+            assert_eq!(crystal.row(name).unwrap()[1], "done", "{name}");
+        }
+    };
+    crystal.ok(&["new", "-d", "-n", "plain", "sleep", "30"]);
+    ends_quietly("plain");
+
+    crystal.ok(&["new", "-d", "-n", "closed", "-t", "tidy up", "sleep", "30"]);
+    crystal.ok(&["done", "-n", "closed", "tidied"]);
+    ends_quietly("closed");
+
+    // With tasks off, an open one is left to the user.
+    crystal.ok(&["new", "-d", "-n", "open", "-t", "tidy up", "sleep", "30"]);
+    crystal.ok(&["plugin", "disable", "tasks"]);
+    ends_quietly("open");
 }
 
 #[test]

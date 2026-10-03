@@ -2,12 +2,14 @@
 //! reads the event the agent passes on stdin and tells the daemon.
 //!
 //! A hook must never get in its agent's way. This one prints nothing, since
-//! an agent may take a hook's output as input, and it always succeeds: a
-//! failing hook can hold the agent up.
+//! an agent may take a hook's output as input, but for the one thing meant
+//! as input: the reminder the daemon sends back when an agent ends a turn
+//! with its task still open. And it always succeeds: a failing hook can
+//! hold the agent up.
 
 use crate::agents;
 use crate::client;
-use crate::protocol::Request;
+use crate::protocol::{Request, Response};
 use anyhow::Result;
 use std::io::Read;
 use std::path::Path;
@@ -39,14 +41,19 @@ fn report(socket: &Path, agent: &str) -> Result<()> {
         ),
         _ => (None, None),
     };
-    if let Some(event) = event {
-        let report = Request::Report {
-            name,
-            id,
-            event,
-            conversation,
-        };
-        client::ask(socket, &report, false)?;
+    let Some(event) = event else {
+        return Ok(());
+    };
+    let report = Request::Report {
+        name,
+        id,
+        event,
+        conversation,
+    };
+    if let Some(Response::Remind { text }) = client::ask(socket, &report, false)?
+        && agent == "claude"
+    {
+        println!("{}", agents::claude_keep_going(&text));
     }
     Ok(())
 }

@@ -84,6 +84,8 @@ crystal done --failed "The staging database is down"
 ```
 
 - `crystal done` closes the task of the session it runs in. `-n <name>` closes another's.
+- End a turn with your task still open and crystal reminds you, once. Close it then if you're through;
+  if you're waiting on the user, leave it open and end your turn.
 - An agent you start with a prompt (`crystal new -d claude "…"`, or `-t "…"` for any command) is given a task.
   `crystal ls --json` shows it: `task.goal`, and once closed, `task.outcome` with `failed` and `summary`.
 - A background task (`crystal task`) closes itself when its run ends.

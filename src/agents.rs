@@ -182,6 +182,12 @@ pub fn claude_event(input: &Value) -> Option<AgentEvent> {
     Some(event)
 }
 
+/// What a Claude Code Stop hook prints to keep Claude from ending its turn:
+/// it carries on, with `reason` as what it's told next.
+pub fn claude_keep_going(reason: &str) -> String {
+    json!({ "decision": "block", "reason": reason }).to_string()
+}
+
 /// Settings for Claude Code that add a hook, `crystal hook claude`, to
 /// each event in [`CLAUDE_HOOK_EVENTS`].
 fn claude_settings(crystal: &Path) -> String {
@@ -361,6 +367,15 @@ mod tests {
             let hook = &settings["hooks"][event][0]["hooks"][0];
             assert_eq!(hook["command"], "'/opt/my tools/crystal' hook claude");
         }
+    }
+
+    #[test]
+    fn a_stop_hook_keeps_claude_going_with_a_reason() {
+        let output: Value = serde_json::from_str(&claude_keep_going("Close \"it\".")).unwrap();
+        assert_eq!(
+            output,
+            json!({"decision": "block", "reason": "Close \"it\"."})
+        );
     }
 
     #[test]

@@ -89,7 +89,8 @@ is: it's the one request every version must understand.
   options, and which are installed
 - `src/codex.rs`: what crystal knows about Codex: finding a session's conversation in its rollouts, and
   `codex resume`
-- `src/hook.rs`: `crystal hook <agent>`: what those hooks run, to tell the daemon
+- `src/hook.rs`: `crystal hook <agent>`: what those hooks run, to tell the daemon, and to pass on its reminder
+  to an agent ending a turn with its task open
 - `src/agent_screen.rs`: reading what an agent is doing off its screen and title
 - `src/front.rs`: what's in front in a session's terminal (agent, shell or program), from its foreground process
 - `src/typing.rs`: typing into a session the way a person would: pastes marked, Enter on its own
@@ -104,8 +105,8 @@ is: it's the one request every version must understand.
   project's directory in the state dir
 - `src/project.rs`: the project a directory is in: its git main worktree, or the directory itself outside git
 - `src/tasks.rs`: tasks, sessions started with something to do: the paragraph an agent is told about
-  `crystal done`, each project's history of closed tasks, and `enabled`, the one gate everything tasks add
-  goes through
+  `crystal done`, the reminder for one that ends a turn with its task open, each project's history of closed
+  tasks, and `enabled`, the one gate everything tasks add goes through
 - `src/backlog.rs`: a project's backlog, numbered items kept in the state dir by the daemon alone, its
   markdown export, and `enabled`, the one gate everything the backlog adds goes through
 - `src/work.rs`: `crystal done`, `tasks` and `backlog`
