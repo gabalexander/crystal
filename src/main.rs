@@ -2,12 +2,14 @@ mod agent_screen;
 mod agents;
 mod attach;
 mod client;
+mod config;
 mod daemon;
 mod drive;
 mod env;
 mod git;
 mod history;
 mod hook;
+mod notify;
 mod protocol;
 mod session;
 mod shell;
@@ -130,6 +132,9 @@ enum Command {
     /// Running sessions come back: Claude Code in its conversation, other
     /// programs from the start.
     RestartServer,
+    /// Show where the config file is, and the settings in effect, as the
+    /// file would hold them.
+    Config,
     /// Run the daemon in the foreground.
     #[command(hide = true)]
     Daemon,
@@ -221,9 +226,24 @@ fn run(cli: Cli) -> Result<()> {
                 println!("no daemon was running");
             }
         }
+        Command::Config => print_config()?,
         Command::Daemon => daemon::run(&socket)?,
         Command::Hook { agent } => hook::run(&socket, &agent),
     }
+    Ok(())
+}
+
+/// Prints the config file's path, as a comment, then the settings in
+/// effect: a file to start from.
+fn print_config() -> Result<()> {
+    let settings = config::Config::load()?;
+    let path = config::path();
+    if path.exists() {
+        println!("# {}", path.display());
+    } else {
+        println!("# {} (no file yet: these are the defaults)", path.display());
+    }
+    print!("{}", settings.to_toml());
     Ok(())
 }
 

@@ -3,6 +3,7 @@
 use crate::agent_screen::{self, Looks, ScreenWatch};
 use crate::git::Checkout;
 use crate::history::{self, HISTORY_LINES, HistoryKeeper};
+use crate::notify::{self, Notice};
 use crate::protocol::{Activity, AgentEvent, Conversation, SessionInfo, State};
 use crate::state::SavedSession;
 use anyhow::Result;
@@ -39,6 +40,9 @@ pub struct Session {
     checkout: Option<Checkout>,
     /// The agent's conversation, once its hooks have named it.
     conversation: Option<Conversation>,
+    /// What the user was last told about the session, while it still
+    /// holds: it waits on them, or it's done.
+    told: Option<Activity>,
     term: Arc<Term>,
 }
 
@@ -107,6 +111,7 @@ impl Session {
             state,
             activity: None,
             conversation: None,
+            told: None,
             screen_watch: ScreenWatch::default(),
             term,
         })
@@ -142,6 +147,22 @@ impl Session {
         let looks = self.term.looks();
         if let Some(event) = self.screen_watch.update(looks) {
             self.on_agent_event(event);
+        }
+    }
+
+    /// Something to tell the user, when the session has just come to need
+    /// them: its agent is asking them something, or is done with a turn
+    /// nobody watched.
+    pub fn notice(&mut self) -> Option<Notice> {
+        let now = self.activity;
+        let watched = self.term.is_watched();
+        let tell = self.is_running() && notify::worth_telling(now, self.told, watched);
+        // Kept even when the user isn't told, say because they were
+        // watching: they've seen it, so it isn't news later either.
+        self.told = if notify::needs_user(now) { now } else { None };
+        match now {
+            Some(activity) if tell => Some(Notice::about(&self.info(), activity)),
+            _ => None,
         }
     }
 

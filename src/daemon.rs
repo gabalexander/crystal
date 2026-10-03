@@ -4,6 +4,7 @@
 
 use crate::agents;
 use crate::env;
+use crate::notify;
 use crate::protocol::{self, Conversation, Frame, NewSession, Request, Response};
 use crate::session::{STOP_GRACE, Session, Term};
 use crate::socket;
@@ -19,7 +20,8 @@ use std::time::{Duration, Instant};
 use std::{fs, process, thread};
 
 /// How often the daemon reads every session's screen for what its agent is
-/// doing, and writes down the sessions that are running.
+/// doing, tells the user about the sessions that need them, and writes
+/// down the sessions that are running.
 const KEEP_UP_EVERY: Duration = Duration::from_millis(250);
 
 pub fn run(socket: &Path) -> Result<()> {
@@ -142,6 +144,9 @@ impl Daemon {
             let mut sessions = self.sessions.lock().unwrap();
             for session in sessions.iter_mut() {
                 session.check_screen();
+                if let Some(notice) = session.notice() {
+                    notify::tell(notice);
+                }
             }
             // Written while the list is still locked, so that an older list
             // can never be written after a shutdown has emptied it.

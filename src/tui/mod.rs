@@ -15,6 +15,7 @@ mod screen_widget;
 mod text_input;
 mod ui;
 
+use crate::config::Config;
 use crate::protocol::{Request, Response, SessionInfo};
 use crate::{client, env, git};
 use anyhow::{Result, bail};
@@ -54,6 +55,7 @@ pub fn run(socket: &Path) -> Result<()> {
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         bail!("crystal needs a terminal; see crystal --help for the commands");
     }
+    let config = Config::load()?;
     // Asking for the list starts the daemon if it isn't running.
     let sessions = list_sessions(socket, true)?;
 
@@ -69,6 +71,7 @@ pub fn run(socket: &Path) -> Result<()> {
         events: sender,
         quitting: false,
     };
+    tui.app.set_first_command(config.new_session);
     tui.app.set_sessions(sessions);
 
     let mut terminal = ratatui::try_init()?;

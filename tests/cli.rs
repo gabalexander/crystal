@@ -20,7 +20,26 @@ impl Crystal {
     fn new() -> Crystal {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("crystal.sock");
-        Crystal { dir, socket }
+        let crystal = Crystal { dir, socket };
+        // A config of the test's own: the developer's can't change what
+        // the test sees, and no test pops up a real notification.
+        crystal.configure("notify = false\n");
+        crystal
+    }
+
+    /// Where the test's config lives: its `XDG_CONFIG_HOME`.
+    fn config_home(&self) -> PathBuf {
+        self.dir.path().join("config")
+    }
+
+    fn config_file(&self) -> PathBuf {
+        self.config_home().join("crystal/config.toml")
+    }
+
+    /// Writes the test's config file.
+    fn configure(&self, toml: &str) {
+        std::fs::create_dir_all(self.config_home().join("crystal")).unwrap();
+        std::fs::write(self.config_file(), toml).unwrap();
     }
 
     fn command(&self, args: &[&str]) -> Command {
@@ -30,6 +49,7 @@ impl Crystal {
             .arg(&self.socket)
             .args(args)
             .current_dir(self.dir.path())
+            .env("XDG_CONFIG_HOME", self.config_home())
             .envs(PLAIN_GIT);
         command
     }
@@ -110,6 +130,7 @@ impl Crystal {
         command.env_remove("CRYSTAL_SESSION");
         // So that a shell crystal starts is the same everywhere.
         command.env("SHELL", "/bin/sh");
+        command.env("XDG_CONFIG_HOME", self.config_home());
         for (key, value) in PLAIN_GIT.iter().chain(env) {
             command.env(key, value);
         }
@@ -1656,4 +1677,115 @@ fn typing_into_a_pane_brings_it_back_from_its_history() {
     tui.shows("↑");
     tui.type_keys("x");
     eventually("the pane is live again", || !tui.text().contains("↑"));
+}
+
+#[test]
+fn config_shows_the_settings_in_effect() {
+    let crystal = Crystal::new();
+    let out = crystal.ok(&["config"]);
+    let path = crystal.config_file();
+    assert!(out.starts_with(&format!("# {}\n", path.display())), "{out}");
+    assert!(out.contains("notify = false"), "{out}");
+    assert!(out.contains("new_session = \"claude\""), "{out}");
+
+    std::fs::remove_file(&path).unwrap();
+    let out = crystal.ok(&["config"]);
+    assert!(out.contains("no file yet"), "{out}");
+    assert!(out.contains("notify = true"), "{out}");
+}
+
+#[test]
+fn a_setting_spelled_wrong_is_an_error_that_names_it_and_its_file() {
+    let crystal = Crystal::new();
+    crystal.configure("notfy = false\n");
+    let err = crystal.fails(&["config"]);
+    assert!(
+        err.contains("notfy") && err.contains("config.toml"),
+        "{err}"
+    );
+
+    let mut tui = crystal.terminal(&[]);
+    tui.shows("notfy");
+    assert!(!tui.exit());
+}
+
+#[test]
+fn the_config_chooses_what_the_new_session_line_starts_with() {
+    let crystal = Crystal::new();
+    crystal.configure("notify = false\nnew_session = \"codex --full-auto\"\n");
+    let mut tui = crystal.tui();
+    tui.type_keys("n");
+    tui.shows("new session: codex --full-auto");
+}
+
+/// A pretend agent that asks the user something once the test creates
+/// `ask`, and finishes its turn once it creates `rest`, drawing what agents
+/// draw for each.
+const ASKING_AGENT: &str = r#"
+    wait_for() { while [ ! -e "$1" ]; do sleep 0.05; done; }
+    printf '> '
+    wait_for ask; printf '\r\033[2KDo you want to proceed?'
+    wait_for rest; printf '\r\033[2K> '
+    sleep 30
+"#;
+
+impl Crystal {
+    /// Has notices go to a file, one line each, rather than the desktop,
+    /// and returns the file.
+    fn notices_to_file(&self) -> PathBuf {
+        let notices = self.dir.path().join("notices");
+        let line = "$CRYSTAL_NOTICE_SESSION $CRYSTAL_NOTICE_ACTIVITY: $CRYSTAL_NOTICE";
+        self.configure(&format!(
+            "notify_command = '''echo \"{line}\" >> {}'''\n",
+            notices.display()
+        ));
+        notices
+    }
+}
+
+fn lines_in(file: &Path) -> Vec<String> {
+    let text = std::fs::read_to_string(file).unwrap_or_default();
+    text.lines().map(String::from).collect()
+}
+
+#[test]
+fn the_user_is_told_once_each_time_a_session_comes_to_need_them() {
+    let crystal = Crystal::new();
+    let notices = crystal.notices_to_file();
+    crystal.ok(&["new", "-n", "agent", "sh", "-c", ASKING_AGENT]);
+
+    std::fs::write(crystal.dir.path().join("ask"), "").unwrap();
+    eventually("the user is told it's waiting", || {
+        lines_in(&notices) == ["agent waiting: agent is waiting on you"]
+    });
+    // It's still waiting a while later, which isn't news.
+    thread::sleep(Duration::from_millis(800));
+    assert_eq!(lines_in(&notices).len(), 1);
+
+    std::fs::write(crystal.dir.path().join("rest"), "").unwrap();
+    eventually("the user is told it's done", || {
+        lines_in(&notices).last().map(String::as_str) == Some("agent done: agent is done")
+    });
+    assert_eq!(lines_in(&notices).len(), 2);
+}
+
+#[test]
+fn nobody_is_told_about_a_session_someone_is_watching() {
+    let crystal = Crystal::new();
+    let notices = crystal.notices_to_file();
+    crystal.ok(&["new", "-n", "agent", "sh", "-c", ASKING_AGENT]);
+
+    let mut terminal = crystal.attach(&["attach", "agent"]);
+    std::fs::write(crystal.dir.path().join("ask"), "").unwrap();
+    eventually("the session is waiting", || {
+        crystal.row("agent").unwrap()[1] == "waiting"
+    });
+    thread::sleep(Duration::from_millis(800));
+    assert!(lines_in(&notices).is_empty());
+
+    // Seen while it waited, it isn't news once the user looks away.
+    terminal.type_keys("\x1c");
+    assert!(terminal.exit());
+    thread::sleep(Duration::from_millis(800));
+    assert!(lines_in(&notices).is_empty());
 }

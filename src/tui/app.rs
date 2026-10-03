@@ -7,7 +7,8 @@ use super::command_line;
 use super::groups::{self, Row};
 use super::keys;
 use super::text_input::TextInput;
-use crate::protocol::{SessionInfo, State};
+use crate::config::Config;
+use crate::protocol::{Activity, SessionInfo, State};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::path::PathBuf;
 
@@ -37,10 +38,6 @@ enum Direction {
     Forward,
     Back,
 }
-
-/// What the TUI starts a new session with before anything else has been
-/// typed at the "new session:" prompt.
-const FIRST_COMMAND: &str = "claude";
 
 /// Where a new session starts.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -127,7 +124,7 @@ impl App {
             sessions: Vec::new(),
             selected: 0,
             prompt: None,
-            last_command: FIRST_COMMAND.to_string(),
+            last_command: Config::default().new_session,
             kill_asked: None,
             splits: Vec::new(),
             focus: Focus::Sidebar,
@@ -135,6 +132,12 @@ impl App {
             own_session,
             notice: None,
         }
+    }
+
+    /// Sets what the new-session prompt starts out with, until a session
+    /// has been started from it: the config's `new_session`.
+    pub fn set_first_command(&mut self, command: String) {
+        self.last_command = command;
     }
 
     pub fn notice(&self) -> Option<&str> {
@@ -319,6 +322,7 @@ impl App {
             KeyCode::Char('n') => self.ask_for_command(self.selected_place()),
             KeyCode::Char('w') => self.ask(Question::Branch, ""),
             KeyCode::Char('x') => self.kill_asked = Some(self.selected()?.name.clone()),
+            KeyCode::Char('u') => self.select_next_needing_user(),
             KeyCode::Char('q') => return Some(Action::Quit),
             _ => {}
         }
@@ -493,6 +497,35 @@ impl App {
         self.selected = self.selected.saturating_add_signed(by).min(last);
     }
 
+    /// Selects the next session that needs the user, or says there's none.
+    fn select_next_needing_user(&mut self) {
+        match self.next_needing_user() {
+            Some(index) => self.selected = index,
+            None => self.notify("nothing needs you".to_string()),
+        }
+    }
+
+    /// The next session that needs the user, going down the sidebar from
+    /// the selected one and round again: one waiting on them comes before
+    /// one that's done. Starting after the selection means that pressing
+    /// the key again moves on to the next.
+    fn next_needing_user(&self) -> Option<usize> {
+        let count = self.sessions.len();
+        let in_turn: Vec<usize> = (1..=count)
+            .map(|step| (self.selected + step) % count)
+            .collect();
+        for wanted in [Activity::Waiting, Activity::Done] {
+            let found = in_turn.iter().copied().find(|&index| {
+                let session = &self.sessions[index];
+                session.state == State::Running && session.activity == Some(wanted)
+            });
+            if found.is_some() {
+                return found;
+            }
+        }
+        None
+    }
+
     /// Only a pane that shows a running session takes keys.
     fn can_type_into(&self, slot: Slot) -> bool {
         let running = self
@@ -545,6 +578,78 @@ mod tests {
 
     fn selected_name(app: &App) -> Option<&str> {
         app.selected().map(|session| session.name.as_str())
+    }
+
+    fn doing(name: &str, activity: Activity) -> SessionInfo {
+        SessionInfo {
+            activity: Some(activity),
+            ..session(name)
+        }
+    }
+
+    #[test]
+    fn u_goes_to_a_session_waiting_on_the_user_before_one_thats_done() {
+        let mut app = App::new(None);
+        app.set_sessions(vec![
+            doing("finished", Activity::Done),
+            session("quiet"),
+            doing("asking", Activity::Waiting),
+        ]);
+        app.select("quiet");
+        press(&mut app, KeyCode::Char('u'));
+        assert_eq!(selected_name(&app), Some("asking"));
+    }
+
+    #[test]
+    fn u_again_moves_on_to_the_next_and_round() {
+        let mut app = App::new(None);
+        app.set_sessions(vec![
+            doing("one", Activity::Waiting),
+            session("rest"),
+            doing("two", Activity::Waiting),
+        ]);
+        app.select("rest");
+        let mut visited = Vec::new();
+        for _ in 0..3 {
+            press(&mut app, KeyCode::Char('u'));
+            visited.push(selected_name(&app).unwrap().to_string());
+        }
+        assert_eq!(visited, ["one", "two", "one"]);
+    }
+
+    #[test]
+    fn done_sessions_are_next_once_nothing_is_waiting() {
+        let mut app = App::new(None);
+        app.set_sessions(vec![
+            doing("a", Activity::Done),
+            session("b"),
+            doing("c", Activity::Done),
+        ]);
+        press(&mut app, KeyCode::Char('u'));
+        assert_eq!(selected_name(&app), Some("c"));
+        press(&mut app, KeyCode::Char('u'));
+        assert_eq!(selected_name(&app), Some("a"));
+    }
+
+    #[test]
+    fn with_nothing_needing_the_user_u_says_so() {
+        let mut app = App::new(None);
+        let gone = SessionInfo {
+            activity: Some(Activity::Done),
+            ..ended("gone")
+        };
+        app.set_sessions(vec![session("a"), gone]);
+        press(&mut app, KeyCode::Char('u'));
+        assert_eq!(selected_name(&app), Some("a"));
+        assert_eq!(app.notice(), Some("nothing needs you"));
+    }
+
+    #[test]
+    fn the_config_sets_what_a_new_session_starts_out_with() {
+        let mut app = app_with(&["a"]);
+        app.set_first_command("codex".to_string());
+        press(&mut app, KeyCode::Char('n'));
+        assert_eq!(app.prompt().unwrap().input.text(), "codex");
     }
 
     #[test]
