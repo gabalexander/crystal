@@ -475,7 +475,7 @@ crystal memory promote 2             # copy one into the project's CLAUDE.md, un
 When a Claude Code session starts, crystal adds the entries that have most to do with its first prompt (the
 newest, without one) to its system prompt, a few at most and none that's stale, with a line on how to add
 more. Codex is told nothing: it has no option for a system prompt, and anything crystal typed in would read as
-your first message. Turn it all off with `memory = false` in the settings.
+your first message. `crystal plugin disable memory` turns it all off: see [plugins](#plugins).
 
 ### Tasks
 
@@ -526,6 +526,125 @@ to do beside its name: `payments ──── 3 to do`. In the view, what's to d
 filters the list as you type. `Enter` opens the new-session panel with the item as its task, on a branch named
 after it; that task ticks the item off when it closes done.
 
+### Plugins
+
+Most of what crystal does beyond running sessions is a plugin you can switch off: tasks, the backlog, memory,
+profiles, GitHub and notifications. Plugins of your own add actions, panes over the TUI and hooks on what
+happens, and use crystal through its own command line, like any script would.
+
+```sh
+crystal plugin                     # every plugin, and whether it's on
+crystal plugin disable github      # or enable; written under [plugins] in the config file
+crystal plugin new notes           # a plugin to start from, in ~/.config/crystal/plugins/notes
+crystal plugin install <git-url>   # or a directory; shows what it runs and asks first
+crystal plugin run notes hello     # run one of its actions
+crystal plugin log notes           # what its commands printed, and how they failed
+crystal plugin remove notes
+```
+
+| Plugin | What it adds |
+|---|---|
+| `tasks` | [tasks](#tasks): `c`, a task under its session, `crystal done` and `tasks`, and telling agents how to close theirs |
+| `backlog` | [the backlog](#the-backlog): `b`, the counts beside projects, `crystal backlog`, and telling agents to use it |
+| `memory` | [memory](#memory): `m`, `crystal remember` and `memory`, and what Claude Code is shown as it starts |
+| `profiles` | [profiles](#profiles): `P`, the profiles in the new-session panel, and `crystal profile` |
+| `github` | pull requests on worktree lines, `o` and `i`; switched off, crystal never runs `gh` |
+| `notifications` | telling you when a session needs you |
+
+crystal's own plugins are on until you switch one off. Then everything it adds is gone: its keys (`?` stops
+listing them), what it shows in the sidebar and the new-session panel, what it tells agents, and the work it
+does in the background. Its commands still run, to say that it's off and how to turn it on. `X` in the TUI lists
+every plugin, and `Space` switches the one the bar is on, straight away. Either way it's written to the config
+file, keeping your comments:
+
+```toml
+[plugins]
+github = false
+notes = true
+```
+
+The `notify` setting came before the `notifications` plugin and still works: notifications are on only while
+both are. `memory` used to be a setting of its own; crystal says where it went if it finds one.
+
+#### Writing a plugin
+
+A plugin is a directory in `~/.config/crystal/plugins/` (or `$XDG_CONFIG_HOME/crystal/plugins/`) named after
+it, with a `plugin.toml`. `crystal plugin new <name>` makes one with one of everything to start from. A plugin
+you add is off until you turn it on.
+
+```toml
+name = "notes"                # its directory's name: lowercase letters, digits and dashes
+version = "0.1.0"
+description = "Notes on sessions"
+
+[[actions]]                   # run from X, its key, or `crystal plugin run notes add`
+id = "add"
+title = "Add a note"
+command = ["sh", "add.sh"]
+key = "N"                     # optional: a key crystal and other plugins don't use
+
+[[events]]                    # run by the daemon when something happens
+on = "session.waiting"        # or a family of events, like "session.*", or "*" for all
+command = ["./on-wait.sh"]
+
+[[panes]]                     # a program shown over the panes
+id = "board"
+title = "The notes board"
+command = ["sh", "board.sh"]
+```
+
+A command is a list of words, run without a shell from the plugin's directory; a program given as a path is
+found from there too. Every command finds crystal in its environment:
+
+- `CRYSTAL_BIN`: the crystal running it, for crystal's own commands, like `"$CRYSTAL_BIN" send
+  "$CRYSTAL_SESSION" "…"`
+- `CRYSTAL_SOCKET`: that crystal's daemon
+- `CRYSTAL_SESSION`, `CRYSTAL_SESSION_ID`: the session it's about, when there is one
+- `CRYSTAL_PROJECT`, `CRYSTAL_WORKTREE`: the project's main worktree, and the worktree, it's about
+
+An action is about the session selected in the TUI; for `crystal plugin run`, the session `--session` names,
+or else the one it's run in, or else the current directory. Run from the TUI, what it prints goes to the
+plugin's log; `plugin run` prints it, and exits as the action did.
+
+A pane is a session of its own, started in the plugin's directory and shown over the panes with the keyboard.
+It's in `crystal ls` while it's open, and ends when its program does or when you press `Ctrl+\`. Its
+`CRYSTAL_SESSION` is its own; `CRYSTAL_PROJECT` and `CRYSTAL_WORKTREE` are the selected session's.
+
+#### Events
+
+| Event | When |
+|---|---|
+| `session.started` | a session starts, or starts again |
+| `session.waiting` | a session's agent comes to wait on you |
+| `session.done` | a session's agent finishes a turn |
+| `session.ended` | a session's program ends, or the session is killed |
+| `task.closed` | a task closes, done or failed |
+| `worktree.created` | crystal makes a worktree |
+| `worktree.removed` | crystal removes one |
+
+A hook gets the event as a line of JSON on its standard input, and its name in `CRYSTAL_EVENT`:
+
+```json
+{"event":"session.waiting","session":{"name":"claude-2","id":"k3x9…","command":["claude"],"cwd":"/code/app",
+ "project":"/code/app","worktree":"/code/app","branch":"main","activity":"waiting","task":"Fix the login redirect"}}
+```
+
+`task.closed` has a `task`, with its `goal`, `session`, `project`, `branch` and `outcome` (whether it `failed`,
+its `summary`, and when it `closed`). The worktree events have a `worktree`, with its `path`, `branch` and,
+once it's made, `project`.
+
+A plugin's hooks run one at a time, in the order things happened, and what they print goes to its log, kept in
+crystal's state directory. A hook still running after 30 seconds is stopped. After 5 failures in a row the
+plugin is paused, with a notification, and `crystal plugin` shows it `paused` until `crystal plugin enable
+<name>` turns it back on.
+
+#### Security
+
+A plugin is code that runs as you, with everything you can reach: your files, your keys, your logins. Its
+hooks run in the background, whenever something happens. Add only plugins you'd run as a script of your own.
+`crystal plugin install` shows every command a plugin would run and asks before it installs it, and installs
+it switched off.
+
 ### Settings
 
 Settings live in `~/.config/crystal/config.toml` (or `$XDG_CONFIG_HOME/crystal/config.toml`). The file is
@@ -538,7 +657,7 @@ file and change. A setting crystal doesn't know is an error that names it, so a 
 | `notify_command` | none | a shell command to run instead of the desktop notification |
 | `new_session` | `"claude"` | what the new-session panel runs at first, until you start something from it |
 | `theme` | `"dark"` | the TUI's colors: `"dark"`, `"light"`, or `"terminal"` |
-| `memory` | `true` | keep what sessions learn, and show it to Claude Code: [memory](#memory) |
+| `[plugins]` | | which plugins are on and off: [plugins](#plugins) |
 
 `dark` and `light` paint their own background, so crystal looks the same in any terminal; `terminal` paints
 nothing and uses your terminal's own colors. With `NO_COLOR` set, crystal uses no color at all.
@@ -554,9 +673,9 @@ notify_command = 'curl -s -d "$CRYSTAL_NOTICE" ntfy.sh/my-crystal'
 `new_session` names an agent (`claude`, `codex`, …) or `shell`. With options, like `codex --full-auto`, it's
 offered as a profile of its own.
 
-The daemon reads the notification settings each time it tells you something, and `memory` each time a session
-starts, so a change counts straight away; the TUI reads `new_session`, `theme`, `memory` and the profiles when
-it starts, and again when you save a profile.
+The daemon reads the notification settings each time it tells you something, and `[plugins]` each time it
+does something a plugin adds, so a change counts straight away; the TUI reads `new_session`, `theme`,
+`[plugins]` and the profiles when it starts, and again when you save a profile or switch a plugin.
 
 #### Profiles
 
@@ -631,6 +750,7 @@ commands talk to it over a unix socket, so closing the TUI never stops an agent.
 - [x] Split panes
 - [x] Agents that start, message, wait on and read other agents
 - [x] Tasks that close done or failed, and a backlog per project
+- [x] Plugins: crystal's own switched on and off, and your own actions, panes and hooks
 
 ## Development
 

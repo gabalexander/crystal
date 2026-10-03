@@ -75,6 +75,9 @@ is: it's the one request every version must understand.
     preview off the event loop
   - `memory_view.rs`: the memory view (`m`): a project's entries, the filter, forgetting and
     promoting after a `y`, and its drawing
+  - `plugins_view.rs`: the plugins view (`X`): every plugin, on or off, with installed ones' actions and panes,
+    its keys and drawing; the event loop does the switching, runs actions and opens plugins' panes over the
+    others
 - `src/daemon.rs`: the daemon: listens on the socket and owns the sessions
 - `src/agents.rs`: what crystal knows about particular agents: the hooks it adds to Claude Code, and what they mean
 - `src/catalog.rs`: the agents the new-session panel offers: their names, how each takes a first prompt, their
@@ -109,11 +112,21 @@ is: it's the one request every version must understand.
 - `src/profile.rs`: agent profiles: what one runs, checking it, and saving or removing one in the config file
   with `toml_edit`, so the user's comments and layout stay; `enabled` is the one switch for the feature
 - `src/notify.rs`: telling the user when a session needs them: desktop notifications, or their own command
+- `src/plugins.rs`: plugins: the registry of crystal's own, `enabled`, the gate every one of them goes through
+  (each module's `enabled` asks it), finding installed plugins, switching one in the config's `[plugins]` with
+  `toml_edit`, the context and environment their commands run with, their logs, and pausing one that fails
+- `src/plugin_manifest.rs`: an installed plugin's `plugin.toml` (actions, events, panes), read and checked, and
+  how event patterns match
+- `src/plugin_hooks.rs`: the daemon's side of plugins' `[[events]]`: the events, and each plugin's hooks run one
+  at a time on a thread of its own, with a timeout, a log, and a pause after failures in a row
+- `src/plugin_cli.rs`: `crystal plugin`: listing, switching, running an action, installing, making and
+  removing
 - `src/env.rs`: the environment a session's program starts with
 - `src/git.rs`: a directory's project, worktree and branch, and making and removing worktrees (runs `git`)
 - `src/github.rs`: pull requests and issues from GitHub, through `gh` with a timeout; tests use a fake `gh`,
   never the real one
 - `src/shell.rs`: quoting arguments and writing paths with `~`, the way a shell reads them
 - `tests/cli.rs`: end-to-end tests that drive the real binary against a private daemon, with a config of
-  their own that turns notifications and memory off (a memory test turns it back on); a test that opens the new-session panel pins `PATH` to its fake
+  their own that turns notifications and the memory plugin off (a memory test turns it back on), and plugins
+  of their own in its plugins directory; a test that opens the new-session panel pins `PATH` to its fake
   agents, so no real agent is found or run
