@@ -14,6 +14,7 @@ use super::copy_mode::{self, SearchPrompt};
 use super::diff_view;
 use super::finder;
 use super::grep;
+use super::handoff_view;
 use super::help;
 use super::issues;
 use super::keymap::{Command, Extent, ModeKey};
@@ -199,6 +200,7 @@ pub fn view_areas(view: &View, area: Rect) -> ViewAreas {
         View::Grep(_) => grep::list_width(area.width),
         View::Branches(_) => switcher::list_width(area.width),
         View::Memory(_) => memory_view::list_width(area.width),
+        View::Handoff(_) => handoff_view::list_width(area.width),
     };
     let [header, body] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
     let [list, rule, content] = Layout::horizontal([
@@ -361,6 +363,7 @@ pub fn hit(areas: &Areas, app: &App, column: u16, row: u16) -> Hit {
                 View::Grep(grep) => grep::list_hit(grep, parts.list, row),
                 View::Branches(switcher) => switcher::list_hit(switcher, parts.list, row),
                 View::Memory(memory) => memory_view::list_hit(memory, parts.list, row),
+                View::Handoff(handoff) => handoff_view::list_hit(handoff, parts.list, row),
             };
         }
         if at(parts.content) {
@@ -479,6 +482,7 @@ fn draw_everything(
             View::Grep(grep) => grep::draw(frame, grep, look, &parts),
             View::Branches(switcher) => switcher::draw(frame, switcher, look, &parts),
             View::Memory(memory) => memory_view::draw(frame, memory, look, &parts),
+            View::Handoff(handoff) => handoff_view::draw(frame, handoff, look, &parts),
         }
         draw_view_footer(frame, app, view, look, areas.footer);
         return;
@@ -1307,8 +1311,8 @@ fn draw_footer(frame: &mut Frame, app: &App, panes: &[Pane], look: &Look, area: 
     } else if let Some(view) = app.needs_you_view() {
         let hints = as_keys_are(app, needs_you::hints(view), true);
         draw_notice_or(frame, app.notice(), &borrowed(&hints), theme, area);
-    } else if app.timeline_view().is_some() {
-        draw_notice_or(frame, app.notice(), timeline::HINTS, theme, area);
+    } else if let Some(view) = app.timeline_view() {
+        draw_notice_or(frame, app.notice(), timeline::hints(view), theme, area);
     } else if let Some(view) = app.issues_view() {
         draw_notice_or(frame, app.notice(), issues::hints(view), theme, area);
     } else if let Some(view) = app.pull_requests_view() {
@@ -1436,6 +1440,7 @@ fn draw_view_footer(frame: &mut Frame, app: &App, view: &View, look: &Look, area
         View::Grep(_) => owned(grep::hints()),
         View::Branches(switcher) => owned(switcher::hints(switcher)),
         View::Memory(memory) => memory_view::hints(memory),
+        View::Handoff(handoff) => owned(handoff_view::hints(handoff)),
     };
     let mut spans = vec![Span::raw(" ")];
     for (key, does) in hints {

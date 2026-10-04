@@ -266,6 +266,10 @@ pub struct SessionAbout {
     pub activity: Option<Activity>,
     /// What it was asked to do, when it has a task.
     pub task: Option<String>,
+    /// That task's number, when it has one: what a task's timeline takes
+    /// its session's events by.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<u64>,
     /// The word `ls` shows for it: `waiting`, `running`, `exited 0`.
     #[serde(default)]
     pub status: String,
@@ -989,6 +993,7 @@ impl SessionAbout {
             branch: worktree.and_then(|worktree| worktree.branch.clone()),
             activity: session.activity,
             task: session.task.as_ref().map(|task| task.goal.clone()),
+            task_id: session.task.as_ref().and_then(|task| task.id),
             status: session.status(),
             reporter: session.reporter.clone(),
         }
@@ -1252,6 +1257,42 @@ impl Filter {
         });
         let project_wanted = self.project.is_none() || self.project == event.project;
         kind_wanted && session_wanted && project_wanted
+    }
+}
+
+/// What a timeline is about: everything, or one session, task or project.
+/// The log is read a page at a time for one (see [`crate::db::Db`]'s
+/// `events_before`), and the events that happen meanwhile are taken by
+/// [`Scope::matches`]: the two say the same.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Scope {
+    All,
+    /// The session with this id, whatever it's called: what's about it,
+    /// and the messages it sent.
+    Session(String),
+    /// The task with this number: its own events, and its session's while
+    /// it has the task.
+    Task(u64),
+    /// The project whose main worktree this is.
+    Project(PathBuf),
+}
+
+impl Scope {
+    pub fn matches(&self, event: &Event) -> bool {
+        match self {
+            Scope::All => true,
+            Scope::Session(id) => {
+                let about = event.session.as_ref().is_some_and(|s| s.id == *id);
+                let sent = event.message.as_ref();
+                about || sent.is_some_and(|message| message.from_id.as_ref() == Some(id))
+            }
+            Scope::Task(id) => {
+                let task = event.task.as_ref().and_then(|task| task.id);
+                let session = event.session.as_ref().and_then(|s| s.task_id);
+                task == Some(*id) || session == Some(*id)
+            }
+            Scope::Project(path) => event.project.as_ref() == Some(path),
+        }
     }
 }
 
