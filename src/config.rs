@@ -94,6 +94,294 @@ pub struct Config {
     pub keys: BTreeMap<String, Binding>,
     /// How the TUI's sidebar is laid out: `[sidebar]` in the file.
     pub sidebar: SidebarSettings,
+    /// The shell a new terminal runs, and where the TUI starts one:
+    /// `[terminal]` in the file.
+    pub terminal: TerminalSettings,
+    /// The title the TUI gives the terminal it runs in: `[window]` in the
+    /// file. See [`crate::tui::window`].
+    pub window: WindowSettings,
+    /// Where the TUI's tab bar goes, and what it shows at its right:
+    /// `[tab_bar]` in the file.
+    pub tab_bar: TabBarSettings,
+    /// The theme following the system's light or dark: `[appearance]` in
+    /// the file. See [`crate::tui::appearance`].
+    pub appearance: AppearanceSettings,
+}
+
+/// The shell a new terminal runs, and where the TUI starts one when
+/// nothing says where.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TerminalSettings {
+    /// The shell's program, a name on the `PATH` or a path, not a command
+    /// line. Empty is `$SHELL`, or else `/bin/sh`.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub default_shell: String,
+    /// Whether the shell starts as a login shell.
+    pub shell_mode: ShellMode,
+    /// Where a terminal the TUI starts goes when nothing says where.
+    pub new_cwd: NewCwd,
+}
+
+/// Whether a new terminal's shell starts as a login shell, which reads the
+/// profile that sets the `PATH` up.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShellMode {
+    /// A login shell on a Mac, where a terminal's shell always is one and
+    /// the profile is what puts Homebrew and `path_helper`'s directories
+    /// on the `PATH`; not elsewhere.
+    #[default]
+    Auto,
+    Login,
+    NonLogin,
+}
+
+/// Where a terminal the TUI starts goes when nothing says where: a new
+/// tab's shell, and the new-session panel's first place.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub enum NewCwd {
+    /// The selected session's directory, or the TUI's own with none.
+    #[default]
+    Follow,
+    /// The home directory.
+    Home,
+    /// The directory the TUI was started in.
+    Current,
+    /// A directory of the user's, which may start with `~`.
+    Path(PathBuf),
+}
+
+/// Shells that start as login shells with `-l`. One not listed, like
+/// elvish, has no such thing, and starts as it is.
+const LOGIN_SHELLS: &[&str] = &[
+    "sh", "bash", "zsh", "fish", "ksh", "mksh", "oksh", "dash", "ash", "yash", "tcsh", "csh", "nu",
+    "xonsh", "pwsh",
+];
+
+impl TerminalSettings {
+    /// The command a new terminal runs: the shell, with `-l` when it
+    /// starts as a login shell.
+    pub fn shell(&self) -> Vec<String> {
+        let from_env = std::env::var("SHELL").ok();
+        self.shell_on(from_env.as_deref(), cfg!(target_os = "macos"))
+    }
+
+    /// [`TerminalSettings::shell`], with `$SHELL` as `from_env`, on a Mac
+    /// when `mac` is set.
+    fn shell_on(&self, from_env: Option<&str>, mac: bool) -> Vec<String> {
+        let shell = [Some(self.default_shell.trim()), from_env]
+            .into_iter()
+            .flatten()
+            .find(|shell| !shell.is_empty())
+            .unwrap_or("/bin/sh")
+            .to_string();
+        let login = match self.shell_mode {
+            ShellMode::Auto => mac,
+            ShellMode::Login => true,
+            ShellMode::NonLogin => false,
+        };
+        let name = Path::new(&shell)
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let mut command = vec![shell];
+        if login && LOGIN_SHELLS.contains(&name.as_str()) {
+            command.push("-l".to_string());
+        }
+        command
+    }
+
+    /// The directory a terminal the TUI starts goes in when nothing says
+    /// where, with `home` the home directory and `current` the TUI's own;
+    /// `None` to follow the selection.
+    pub fn start_dir(&self, home: &Path, current: &Path) -> Option<PathBuf> {
+        match &self.new_cwd {
+            NewCwd::Follow => None,
+            NewCwd::Home => Some(home.to_path_buf()),
+            NewCwd::Current => Some(current.to_path_buf()),
+            NewCwd::Path(path) => Some(match path.strip_prefix("~") {
+                Ok(rest) => home.join(rest),
+                Err(_) => path.clone(),
+            }),
+        }
+    }
+}
+
+impl TryFrom<String> for NewCwd {
+    type Error = String;
+
+    fn try_from(text: String) -> Result<NewCwd, String> {
+        match text.trim() {
+            "follow" => Ok(NewCwd::Follow),
+            "home" => Ok(NewCwd::Home),
+            "current" => Ok(NewCwd::Current),
+            path if path.starts_with('/') || path == "~" || path.starts_with("~/") => {
+                Ok(NewCwd::Path(PathBuf::from(path)))
+            }
+            other => Err(format!(
+                "new_cwd is `follow`, `home`, `current` or a directory from / or ~, not `{other}`"
+            )),
+        }
+    }
+}
+
+impl From<NewCwd> for String {
+    fn from(new_cwd: NewCwd) -> String {
+        match new_cwd {
+            NewCwd::Follow => "follow".to_string(),
+            NewCwd::Home => "home".to_string(),
+            NewCwd::Current => "current".to_string(),
+            NewCwd::Path(path) => path.display().to_string(),
+        }
+    }
+}
+
+/// The title the TUI gives the terminal it runs in.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WindowSettings {
+    /// What the title says, its tokens filled in: see
+    /// [`crate::tui::window`]. Empty leaves the terminal's title alone.
+    pub title: String,
+}
+
+impl Default for WindowSettings {
+    fn default() -> WindowSettings {
+        WindowSettings {
+            title: "crystal · {session}".to_string(),
+        }
+    }
+}
+
+/// Where the TUI's tab bar goes, and what it shows at its right.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TabBarSettings {
+    /// Above the panes, or below them, over the footer.
+    pub position: BarPosition,
+    /// Leave the bar out while there's only one tab, for the panes to have
+    /// its row.
+    pub hide_when_single: bool,
+    /// What the bar shows at its right, after the sessions' count, in
+    /// order: see [`crate::tui::status_bar`].
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub right: Vec<StatusEntry>,
+    /// What goes between two of them.
+    pub separator: String,
+}
+
+impl Default for TabBarSettings {
+    fn default() -> TabBarSettings {
+        TabBarSettings {
+            position: BarPosition::Top,
+            hide_when_single: false,
+            right: Vec::new(),
+            separator: " · ".to_string(),
+        }
+    }
+}
+
+/// Where the tab bar goes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BarPosition {
+    #[default]
+    Top,
+    Bottom,
+}
+
+/// One thing the tab bar shows at its right.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
+pub enum StatusEntry {
+    /// This machine's name.
+    Hostname {},
+    /// The time, as `strftime` writes `format`.
+    Clock {
+        #[serde(default = "StatusEntry::default_clock")]
+        format: String,
+    },
+    /// Text that says what it says.
+    Text { text: String },
+    /// The last line a shell command prints, run again `every` while, and
+    /// stopped once it has taken `timeout`.
+    Command {
+        command: String,
+        #[serde(default = "StatusEntry::default_every")]
+        every: String,
+        #[serde(default = "StatusEntry::default_timeout")]
+        timeout: String,
+    },
+}
+
+impl StatusEntry {
+    fn default_clock() -> String {
+        "%H:%M".to_string()
+    }
+
+    fn default_every() -> String {
+        "10s".to_string()
+    }
+
+    fn default_timeout() -> String {
+        "2s".to_string()
+    }
+
+    /// For a command, how often it runs and how long it may take.
+    pub fn command_times(&self) -> Option<(Duration, Duration)> {
+        let StatusEntry::Command { every, timeout, .. } = self else {
+            return None;
+        };
+        let every = duration(every).ok().flatten()?;
+        let timeout = duration(timeout).ok().flatten()?;
+        Some((every, timeout))
+    }
+
+    /// Says what doesn't make sense in it.
+    fn check(&self) -> Result<()> {
+        match self {
+            StatusEntry::Clock { format } if format.trim().is_empty() => {
+                bail!("a clock's format is empty: write it like \"%H:%M\"")
+            }
+            StatusEntry::Command { command, .. } if command.trim().is_empty() => {
+                bail!("a command entry runs nothing: give it a command")
+            }
+            StatusEntry::Command { every, timeout, .. } => {
+                for (name, when) in [("every", every), ("timeout", timeout)] {
+                    duration(when)
+                        .with_context(|| format!("in a command entry's {name}"))?
+                        .with_context(|| format!("a command entry's {name} can't be off"))?;
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+/// The theme following the system's appearance, light or dark.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AppearanceSettings {
+    /// Switch between `light_theme` and `dark_theme` as the system's
+    /// appearance changes, or over ssh, where the system isn't the user's,
+    /// the terminal's background says: see [`crate::tui::appearance`].
+    pub auto_switch: bool,
+    /// The theme while it's light: unless given, `theme` when it's a light
+    /// one, else its light side, else crystal's own `light`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub light_theme: Option<ThemeName>,
+    /// The theme while it's dark, chosen the same way.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dark_theme: Option<ThemeName>,
+    /// Colors of the user's own while it's light, over `[colors]`.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub light_colors: BTreeMap<ColorToken, ColorValue>,
+    /// Colors of the user's own while it's dark, over `[colors]`.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub dark_colors: BTreeMap<ColorToken, ColorValue>,
 }
 
 /// One project's commands, which take the place of those in its own
@@ -445,6 +733,10 @@ impl Default for Config {
             projects: Vec::new(),
             keys: BTreeMap::new(),
             sidebar: SidebarSettings::default(),
+            terminal: TerminalSettings::default(),
+            window: WindowSettings::default(),
+            tab_bar: TabBarSettings::default(),
+            appearance: AppearanceSettings::default(),
         }
     }
 }
@@ -733,6 +1025,11 @@ pub fn from_text(text: &str) -> Result<Config> {
             SIDEBAR_WIDTHS.end()
         );
     }
+    for entry in &config.tab_bar.right {
+        entry.check().context("in [tab_bar] right")?;
+    }
+    crate::tui::window::check(&config.window.title)
+        .map_err(|err| anyhow::anyhow!("in [window] title, {err}"))?;
     for profile in &config.profiles {
         profile.check()?;
     }
@@ -1185,6 +1482,127 @@ back_to = "build"
     }
 
     #[test]
+    fn a_new_terminal_runs_the_users_shell_a_login_one_on_a_mac() {
+        let terminal = TerminalSettings::default();
+        assert_eq!(
+            terminal.shell_on(Some("/bin/zsh"), true),
+            ["/bin/zsh", "-l"]
+        );
+        assert_eq!(terminal.shell_on(Some("/bin/zsh"), false), ["/bin/zsh"]);
+        assert_eq!(terminal.shell_on(None, false), ["/bin/sh"]);
+        assert_eq!(terminal.shell_on(Some(""), true), ["/bin/sh", "-l"]);
+        // A shell with no login of its own starts as it is.
+        assert_eq!(terminal.shell_on(Some("elvish"), true), ["elvish"]);
+
+        let config = parse("[terminal]\ndefault_shell = \"nu\"\nshell_mode = \"login\"\n").unwrap();
+        assert_eq!(
+            config.terminal.shell_on(Some("/bin/zsh"), false),
+            ["nu", "-l"]
+        );
+        let config = parse("[terminal]\nshell_mode = \"non_login\"\n").unwrap();
+        assert_eq!(
+            config.terminal.shell_on(Some("/bin/zsh"), true),
+            ["/bin/zsh"]
+        );
+        let err = parse("[terminal]\nshell_mode = \"sometimes\"\n").unwrap_err();
+        assert!(format!("{err:#}").contains("sometimes"), "{err:#}");
+    }
+
+    #[test]
+    fn a_new_terminal_follows_the_selection_unless_told_where() {
+        let (home, current) = (Path::new("/home/ann"), Path::new("/code/app"));
+        let start_dir = |text: &str| {
+            let config = parse(&format!("[terminal]\nnew_cwd = \"{text}\"\n")).unwrap();
+            config.terminal.start_dir(home, current)
+        };
+        assert_eq!(TerminalSettings::default().start_dir(home, current), None);
+        assert_eq!(start_dir("follow"), None);
+        assert_eq!(start_dir("home"), Some(PathBuf::from("/home/ann")));
+        assert_eq!(start_dir("current"), Some(PathBuf::from("/code/app")));
+        assert_eq!(start_dir("~/code"), Some(PathBuf::from("/home/ann/code")));
+        assert_eq!(start_dir("/srv/work"), Some(PathBuf::from("/srv/work")));
+        let err = parse("[terminal]\nnew_cwd = \"code\"\n").unwrap_err();
+        assert!(format!("{err:#}").contains("`code`"), "{err:#}");
+    }
+
+    #[test]
+    fn the_tab_bar_is_on_top_with_nothing_at_its_right_unless_told() {
+        assert_eq!(Config::default().tab_bar.position, BarPosition::Top);
+        assert!(Config::default().tab_bar.right.is_empty());
+        let config = parse(
+            "[tab_bar]\nposition = \"bottom\"\nhide_when_single = true\nright = [\n\
+             { type = \"hostname\" },\n{ type = \"clock\" },\n\
+             { type = \"command\", command = \"date\" },\n]\n",
+        )
+        .unwrap();
+        assert_eq!(config.tab_bar.position, BarPosition::Bottom);
+        assert!(config.tab_bar.hide_when_single);
+        assert_eq!(
+            config.tab_bar.right[1],
+            StatusEntry::Clock {
+                format: "%H:%M".into()
+            }
+        );
+        assert_eq!(
+            config.tab_bar.right[2].command_times(),
+            Some((Duration::from_secs(10), Duration::from_secs(2)))
+        );
+        let cases = [
+            ("{ type = \"weather\" }", "weather"),
+            ("{ type = \"text\" }", "text"),
+            ("{ type = \"clock\", format = \"\" }", "format is empty"),
+            ("{ type = \"command\", command = \" \" }", "runs nothing"),
+            (
+                "{ type = \"command\", command = \"date\", every = \"soon\" }",
+                "isn't a while",
+            ),
+            (
+                "{ type = \"command\", command = \"date\", timeout = \"off\" }",
+                "can't be off",
+            ),
+            ("{ type = \"hostname\", name = \"x\" }", "name"),
+        ];
+        for (entry, expected) in cases {
+            let err = parse(&format!("[tab_bar]\nright = [{entry}]\n")).unwrap_err();
+            assert!(format!("{err:#}").contains(expected), "{entry}: {err:#}");
+        }
+    }
+
+    #[test]
+    fn the_theme_stays_put_unless_told_to_follow_the_appearance() {
+        assert!(!Config::default().appearance.auto_switch);
+        let config = parse(
+            "[appearance]\nauto_switch = true\nlight_theme = \"Rose Pine Dawn\"\n\
+             dark_theme = \"rose-pine\"\n",
+        )
+        .unwrap();
+        assert!(config.appearance.auto_switch);
+        assert_eq!(config.appearance.light_theme, ThemeName::find("dawn"));
+        assert_eq!(config.appearance.dark_theme, ThemeName::find("rosepine"));
+        let err = parse("[appearance]\ndark_theme = \"neon\"\n").unwrap_err();
+        assert!(format!("{err:#}").contains("neon"), "{err:#}");
+        let colored = parse("[appearance.dark_colors]\naccent = \"#89b4fa\"\n").unwrap();
+        assert_eq!(
+            colored.appearance.dark_colors[&ColorToken::Accent],
+            ColorValue(Color::Rgb(137, 180, 250))
+        );
+        let err = parse("[appearance.light_colors]\nacent = \"red\"\n").unwrap_err();
+        assert!(format!("{err:#}").contains("acent"), "{err:#}");
+    }
+
+    #[test]
+    fn the_window_is_titled_after_the_session_unless_told() {
+        assert_eq!(Config::default().window.title, "crystal · {session}");
+        let config = parse("[window]\ntitle = \"\"\n").unwrap();
+        assert_eq!(config.window.title, "");
+        let err = parse("[window]\ntitle = \"{workspace}\"\n").unwrap_err();
+        assert!(
+            format!("{err:#}").contains("`{workspace}` isn't a token"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
     fn the_settings_written_out_read_back_the_same() {
         let config = Config {
             notify: false,
@@ -1287,6 +1705,43 @@ back_to = "build"
                 folded: true,
                 fold: Fold::Hidden,
                 needs_you: false,
+            },
+            terminal: TerminalSettings {
+                default_shell: "fish".into(),
+                shell_mode: ShellMode::NonLogin,
+                new_cwd: NewCwd::Path(PathBuf::from("~/code")),
+            },
+            window: WindowSettings {
+                title: "{hostname}: {session}".into(),
+            },
+            tab_bar: TabBarSettings {
+                position: BarPosition::Bottom,
+                hide_when_single: true,
+                right: vec![
+                    StatusEntry::Hostname {},
+                    StatusEntry::Clock {
+                        format: "%a %H:%M".into(),
+                    },
+                    StatusEntry::Text {
+                        text: "prod".into(),
+                    },
+                    StatusEntry::Command {
+                        command: "uptime".into(),
+                        every: "30s".into(),
+                        timeout: "1s".into(),
+                    },
+                ],
+                separator: " | ".into(),
+            },
+            appearance: AppearanceSettings {
+                auto_switch: true,
+                light_theme: ThemeName::find("latte"),
+                dark_theme: None,
+                light_colors: BTreeMap::from([(
+                    ColorToken::Panel,
+                    ColorValue(Color::Rgb(239, 241, 245)),
+                )]),
+                dark_colors: BTreeMap::new(),
             },
         };
         assert_eq!(parse(&config.to_toml()).unwrap(), config);

@@ -43,7 +43,7 @@ use super::timeline::{self, TimelineView};
 use super::tree_browser::TreeBrowser;
 use crate::catalog::{self, Agent};
 use crate::client::Purpose;
-use crate::config::{Config, Fold, SIDEBAR_WIDTHS};
+use crate::config::{BarPosition, Config, Fold, SIDEBAR_WIDTHS, TabBarSettings};
 use crate::events::Event;
 use crate::flow_run::{FlowRun, RunState};
 use crate::flows::{self, Flow};
@@ -844,6 +844,28 @@ pub struct App {
     pin_needs_you: bool,
     /// Whether the sidebar's edge is being dragged with the mouse.
     dragging_sidebar: bool,
+    /// Where the tab bar goes and what it shows at its right.
+    tab_bar: TabBar,
+    /// What the terminal's title says in place of `[window] title`, as
+    /// `crystal title set` gave it, until `crystal title clear`.
+    title_override: Option<String>,
+    /// Where a new tab's shell starts, and a session started with none
+    /// selected: `None` follows the selection. See
+    /// [`crate::config::NewCwd`].
+    start_dir: Option<PathBuf>,
+}
+
+/// The tab bar as the settings have it, and what its right shows.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TabBar {
+    pub position: BarPosition,
+    /// Left out while there's only one tab.
+    pub hide_when_single: bool,
+    /// What goes between two things at its right.
+    pub separator: String,
+    /// What each of `[tab_bar] right` shows, as it was last worked out:
+    /// see [`super::status_bar`].
+    pub status: Vec<String>,
 }
 
 /// How wide the sidebar is and whether it's folded, as the user left it,
@@ -951,6 +973,12 @@ impl App {
             fold: Fold::Marks,
             pin_needs_you: true,
             dragging_sidebar: false,
+            tab_bar: TabBar {
+                separator: TabBarSettings::default().separator,
+                ..TabBar::default()
+            },
+            title_override: None,
+            start_dir: None,
         }
     }
 
@@ -966,6 +994,43 @@ impl App {
         }
         self.fold = settings.fold;
         self.pin_needs_you = settings.needs_you;
+        let bar = &config.tab_bar;
+        self.tab_bar.position = bar.position;
+        self.tab_bar.hide_when_single = bar.hide_when_single;
+        self.tab_bar.separator = bar.separator.clone();
+        // What's shown follows the entries: a line for each, once it's
+        // worked out.
+        if bar.right.len() != self.tab_bar.status.len() {
+            self.tab_bar.status = vec![String::new(); bar.right.len()];
+        }
+    }
+
+    /// The tab bar's settings, and what its right shows.
+    pub fn tab_bar(&self) -> &TabBar {
+        &self.tab_bar
+    }
+
+    /// Whether the tab bar is drawn: unless it's left out while there's
+    /// only one tab, and there is.
+    pub fn tab_bar_shown(&self) -> bool {
+        !(self.tab_bar.hide_when_single && self.tabs.all().len() == 1)
+    }
+
+    /// Takes what each thing at the tab bar's right shows now.
+    pub fn set_status(&mut self, status: Vec<String>) {
+        self.tab_bar.status = status;
+    }
+
+    /// What `crystal title set` gave the terminal's title, until `crystal
+    /// title clear`.
+    pub fn title_override(&self) -> Option<&str> {
+        self.title_override.as_deref()
+    }
+
+    /// Takes where a new tab's shell starts, and a session started with
+    /// none selected: `None` to follow the selection.
+    pub fn set_start_dir(&mut self, dir: Option<PathBuf>) {
+        self.start_dir = dir;
     }
 
     /// Takes the sidebar's shape the TUI kept, and whether the config has it
@@ -4230,9 +4295,15 @@ impl App {
                 dir: Some(session.cwd.clone()),
                 label: shell::home_relative(&session.cwd),
             },
-            (None, None) => Target::Here {
-                dir: None,
-                label: "this directory".to_string(),
+            (None, None) => match &self.start_dir {
+                Some(dir) => Target::Here {
+                    dir: Some(dir.clone()),
+                    label: shell::home_relative(dir),
+                },
+                None => Target::Here {
+                    dir: None,
+                    label: "this directory".to_string(),
+                },
             },
         };
         let mut targets = vec![
@@ -4907,7 +4978,8 @@ impl App {
     /// start new work, and a shell is where that starts.
     fn new_tab(&mut self) -> Option<Action> {
         let index = self.tabs.add();
-        let dir = self.selected().map(|session| session.cwd.clone());
+        let followed = self.selected().map(|session| session.cwd.clone());
+        let dir = self.start_dir.clone().or(followed);
         self.go_to_tab(index);
         Some(Action::Start {
             place: Place::Directory(dir),
@@ -5827,6 +5899,29 @@ mod tests {
         assert_eq!(
             press(&mut app, KeyCode::Enter),
             start(Place::Directory(None), &[], "")
+        );
+    }
+
+    #[test]
+    fn with_nothing_selected_the_panel_starts_where_the_settings_say() {
+        let mut app = App::new(None);
+        app.set_start_dir(Some(PathBuf::from("/home/ann/code")));
+        press(&mut app, KeyCode::Char('n'));
+        assert_eq!(
+            press(&mut app, KeyCode::Enter),
+            start(
+                Place::Directory(Some(PathBuf::from("/home/ann/code"))),
+                &[],
+                ""
+            )
+        );
+        // A session selected is still where the panel starts.
+        let mut app = with_agents(&[], vec![in_project("agent", "app")]);
+        app.set_start_dir(Some(PathBuf::from("/home/ann/code")));
+        press(&mut app, KeyCode::Char('n'));
+        assert_eq!(
+            press(&mut app, KeyCode::Enter),
+            start(Place::Directory(Some(PathBuf::from("/code/app"))), &[], "")
         );
     }
 
@@ -7773,6 +7868,32 @@ mod tests {
     }
 
     #[test]
+    fn t_starts_its_shell_where_the_settings_say_when_they_do() {
+        let mut app = App::new(None);
+        app.set_sessions(vec![SessionInfo {
+            cwd: PathBuf::from("/code/b"),
+            ..session("b")
+        }]);
+        app.select("b");
+        app.set_start_dir(Some(PathBuf::from("/home/ann")));
+        let Some(Action::Start { place, .. }) = press(&mut app, KeyCode::Char('t')) else {
+            panic!("t starts a shell");
+        };
+        assert_eq!(place, Place::Directory(Some(PathBuf::from("/home/ann"))));
+    }
+
+    #[test]
+    fn the_tab_bar_is_left_out_with_one_tab_only_when_told() {
+        let mut app = App::new(None);
+        assert!(app.tab_bar_shown());
+        let config = crate::config::from_text("[tab_bar]\nhide_when_single = true\n").unwrap();
+        app.set_interface(&config);
+        assert!(!app.tab_bar_shown());
+        press(&mut app, KeyCode::Char('t'));
+        assert!(app.tab_bar_shown());
+    }
+
+    #[test]
     fn the_shell_t_starts_is_all_its_tab_has() {
         let app = app_with_a_second_tab(&["a", "b"]);
         assert_eq!(in_sidebar(&app), ["shell"]);
@@ -9017,7 +9138,8 @@ gate = true
         });
         // `x` would kill the session from the sidebar; here it's nothing.
         assert_eq!(press(&mut app, KeyCode::Char('x')), None);
-        for _ in 0..7 {
+        // The bar stops at the last.
+        for _ in 0..30 {
             press(&mut app, KeyCode::Char('j'));
         }
         assert_eq!(

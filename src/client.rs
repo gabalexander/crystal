@@ -112,18 +112,35 @@ pub fn new_session_for(
     socket: &Path,
     name: Option<String>,
     cwd: PathBuf,
-    mut command: Vec<String>,
+    command: Vec<String>,
     purpose: Purpose,
 ) -> Result<Started> {
+    new_session_with(socket, name, cwd, command, purpose, &[])
+}
+
+/// [`new_session_for`], with the variables `env` over this process's in
+/// the session's environment. An empty `command` is the shell `[terminal]`
+/// says, or the user's.
+pub fn new_session_with(
+    socket: &Path,
+    name: Option<String>,
+    cwd: PathBuf,
+    mut command: Vec<String>,
+    purpose: Purpose,
+    env: &[(String, String)],
+) -> Result<Started> {
     if command.is_empty() {
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
-        command.push(shell);
+        // A config that can't be read is no reason not to start a shell.
+        let terminal = Config::load().map(|config| config.terminal);
+        command = terminal.unwrap_or_default().shell();
     }
+    let mut environment = env::current();
+    environment.extend(env.iter().cloned());
     let request = Request::New(NewSession {
         name,
         cwd,
         command,
-        env: env::current(),
+        env: environment,
         task: purpose.task,
         backlog: purpose.backlog,
     });

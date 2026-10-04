@@ -35,6 +35,7 @@ use super::tabs::Tab;
 use super::theme::Theme;
 use super::timeline;
 use super::tree_browser;
+use crate::config::BarPosition;
 use crate::flow_run::RunState;
 use crate::protocol::{SessionInfo, State, TaskState};
 use crate::shell;
@@ -66,9 +67,11 @@ pub struct Look<'a> {
 
 /// Where each part of the TUI goes on a screen of a given size.
 pub struct Areas {
+    /// The tab bar: the top row, or the one over the footer, or no row at
+    /// all while it's left out.
     pub top: Rect,
-    /// Everything between the top bar and the footer: where an open view
-    /// goes, in place of the sidebar and the panes.
+    /// Everything but the tab bar and the footer: where an open view goes,
+    /// in place of the sidebar and the panes.
     pub main: Rect,
     pub sidebar: Rect,
     /// The column with the rule between the sidebar and the panes.
@@ -86,10 +89,10 @@ pub struct Areas {
 
 impl Areas {
     /// Lays out a screen the way `app` has it: its panes split as the tab's
-    /// tree has them, or zoomed, one pane taking everything between the top
-    /// bar and the footer, the sidebar and its rule with no room.
+    /// tree has them, or zoomed, one pane taking everything but the tab bar
+    /// and the footer, the sidebar and its rule with no room.
     pub fn of(app: &App, screen: Rect) -> Areas {
-        let [top, main, footer] = rows(screen);
+        let [top, main, footer] = rows(app, screen);
         // A sidebar folded away has no rule either.
         let sidebar_width = app.sidebar_columns(screen.width);
         let [sidebar, rule, tiles] = Layout::horizontal([
@@ -158,14 +161,18 @@ fn float_frame(areas: &Areas) -> Rect {
     )
 }
 
-/// The top bar, everything between, and the footer.
-fn rows(screen: Rect) -> [Rect; 3] {
-    Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Min(0),
-        Constraint::Length(1),
-    ])
-    .areas(screen)
+/// The tab bar, everything else, and the footer: the bar on top or over
+/// the footer, as the settings say, and with no row while it's left out.
+fn rows(app: &App, screen: Rect) -> [Rect; 3] {
+    let bar = Constraint::Length(u16::from(app.tab_bar_shown()));
+    let (main, footer) = (Constraint::Min(0), Constraint::Length(1));
+    match app.tab_bar().position {
+        BarPosition::Top => Layout::vertical([bar, main, footer]).areas(screen),
+        BarPosition::Bottom => {
+            let [main, bar, footer] = Layout::vertical([main, bar, footer]).areas(screen);
+            [bar, main, footer]
+        }
+    }
 }
 
 /// Where an open view's parts go: a header line across the top, then its
@@ -423,9 +430,8 @@ pub fn draw(frame: &mut Frame, app: &App, panes: &[Pane], overlay: Option<&Pane>
         sidebar::draw(frame, app, look, drawer);
         draw_rule(frame, look, rule);
     }
-    // Over everything between the top bar and the footer.
-    let below_top = areas.top.bottom();
-    let middle = Rect::new(0, below_top, frame.area().width, areas.footer.y - below_top);
+    // Over everything but the tab bar and the footer.
+    let middle = Rect::new(0, areas.main.y, frame.area().width, areas.main.height);
     if let Some(view) = app.issues_view() {
         issues::draw(frame, view, look.theme, look.now, middle);
     }
@@ -462,8 +468,6 @@ pub fn draw(frame: &mut Frame, app: &App, panes: &[Pane], overlay: Option<&Pane>
         reply::draw(frame, reply, look.theme, middle);
     }
     if let Some(view) = app.profiles_view() {
-        let below_top = areas.top.bottom();
-        let middle = Rect::new(0, below_top, frame.area().width, areas.footer.y - below_top);
         profiles::draw(frame, view, look.theme, middle);
     }
     if let Some(view) = app.plugins_view() {
@@ -550,6 +554,10 @@ fn draw_plugin_pane(
 /// when it isn't the default, then how many sessions there are and how
 /// many wait on the user.
 fn draw_top_bar(frame: &mut Frame, app: &App, look: &Look, area: Rect) {
+    // Left out, it has no row to draw on.
+    if area.height == 0 {
+        return;
+    }
     let theme = look.theme;
     let name = Line::from(vec![
         Span::raw(" "),
@@ -560,8 +568,51 @@ fn draw_top_bar(frame: &mut Frame, app: &App, look: &Look, area: Rect) {
     ]);
     frame.render_widget(name, area);
     draw_tabs(frame, app, look, area);
-    let summary = summary(app.sessions(), app.server(), theme);
-    frame.render_widget(summary.right_aligned(), area);
+    let mut right = summary(app.sessions(), app.server(), theme);
+    if let Some(status) = status_shown(app, area.width) {
+        // After the count, before the space the summary ends with.
+        let end = right.spans.pop();
+        let separator = Span::styled(
+            app.tab_bar().separator.clone(),
+            Style::new().fg(theme.muted),
+        );
+        for text in status {
+            right.spans.push(separator.clone());
+            right
+                .spans
+                .push(Span::styled(text, Style::new().fg(theme.text)));
+        }
+        right.spans.extend(end);
+    }
+    frame.render_widget(right.right_aligned(), area);
+}
+
+/// The columns the tabs keep at least, before what the tab bar shows at
+/// its right is left out to give them room.
+const TABS_KEEP: u16 = 12;
+
+/// What the tab bar shows at its right, after the count, on a bar `width`
+/// columns wide: each thing with something to show, unless all of them
+/// together would leave the tabs less than [`TABS_KEEP`].
+fn status_shown(app: &App, width: u16) -> Option<Vec<String>> {
+    let shown: Vec<String> = (app.tab_bar().status.iter())
+        .filter(|text| !text.is_empty())
+        .cloned()
+        .collect();
+    if shown.is_empty() {
+        return None;
+    }
+    let separator = width_of(&app.tab_bar().separator);
+    let needs: u16 = shown.iter().map(|text| separator + width_of(text)).sum();
+    (TABS_START + SUMMARY_ROOM + TABS_KEEP + needs <= width).then_some(shown)
+}
+
+/// How many columns what the tab bar shows at its right takes.
+fn status_width(app: &App, width: u16) -> u16 {
+    let separator = width_of(&app.tab_bar().separator);
+    status_shown(app, width).map_or(0, |shown| {
+        shown.iter().map(|text| separator + width_of(text)).sum()
+    })
 }
 
 /// The tabs, after crystal's name in the top bar in `area`: the one in
@@ -660,12 +711,14 @@ fn tab_label(number: usize, tab: &Tab, status: Option<Status>, named: bool) -> S
 }
 
 /// How much of the top bar in `area` the tabs share with the summary: all
-/// of it, but for the server's name the summary starts with, if it does.
+/// of it, but for the server's name the summary starts with, if it does,
+/// and what the bar shows at its right.
 fn tabs_width(app: &App, area: Rect) -> u16 {
     let server = app
         .server()
         .map_or(0, |server| width_of(&server_label(server)));
-    area.width.saturating_sub(server)
+    let status = status_width(app, area.width);
+    area.width.saturating_sub(server + status)
 }
 
 /// What the summary says of the server, before the sessions.
@@ -1836,6 +1889,75 @@ mod tests {
             text[0]
         );
         assert!(text[0].contains(" 2 review "), "{}", text[0]);
+    }
+
+    /// `app` with the settings in `text`, a config file's.
+    fn configured(mut app: App, text: &str) -> App {
+        app.set_interface(&crate::config::from_text(text).unwrap());
+        app
+    }
+
+    #[test]
+    fn the_tab_bar_goes_over_the_footer_when_told() {
+        let app = configured(app_with_three_tabs(), "[tab_bar]\nposition = \"bottom\"\n");
+        let text = screen_text(&app);
+        assert!(
+            text[10].starts_with(" crystal   1  2 review  3 "),
+            "{}",
+            text[10]
+        );
+        assert!(!text[0].contains("crystal"), "{}", text[0]);
+        let areas = Areas::of(&app, Rect::new(0, 0, 80, 12));
+        assert_eq!((areas.main.y, areas.main.height, areas.top.y), (0, 10, 10));
+        // A click on a tab finds it there.
+        assert_eq!(hit(&areas, &app, 15, 10), Hit::Tab(1));
+    }
+
+    #[test]
+    fn the_tab_bar_can_be_left_out_while_there_is_one_tab() {
+        let mut app = App::new(None);
+        app.set_sessions(vec![session("a", State::Running)]);
+        let app = configured(app, "[tab_bar]\nhide_when_single = true\n");
+        let text = screen_text(&app);
+        assert!(
+            !text.iter().any(|line| line.contains("crystal")),
+            "{text:?}"
+        );
+        assert_eq!(Areas::of(&app, Rect::new(0, 0, 80, 12)).main.height, 11);
+        // With a second tab it's back.
+        let app = configured(
+            app_with_three_tabs(),
+            "[tab_bar]\nhide_when_single = true\n",
+        );
+        assert!(screen_text(&app)[0].starts_with(" crystal"));
+    }
+
+    #[test]
+    fn the_tab_bar_shows_its_status_after_the_count_while_the_tabs_have_room() {
+        let config = "[tab_bar]\nright = [{ type = \"text\", text = \"prod\" }, \
+                      { type = \"hostname\" }, { type = \"clock\" }]\n";
+        let mut app = configured(app_with_three_tabs(), config);
+        app.set_status(vec!["prod".into(), String::new(), "14:03".into()]);
+        let text = screen_text(&app);
+        assert!(
+            text[0].trim_end().ends_with("1 session · prod · 14:03"),
+            "{}",
+            text[0]
+        );
+        assert!(
+            text[0].starts_with(" crystal   1  2 review  3 "),
+            "{}",
+            text[0]
+        );
+        // On a narrow bar, the tabs keep their room.
+        app.set_status(vec![
+            "a much longer status line".into(),
+            String::new(),
+            "14:03".into(),
+        ]);
+        let narrow = screen_text_at(&app, 60, 12);
+        assert!(narrow[0].trim_end().ends_with("1 session"), "{}", narrow[0]);
+        assert!(narrow[0].contains(" 1 "), "{}", narrow[0]);
     }
 
     /// An app with one session and three tabs, the second named `review`

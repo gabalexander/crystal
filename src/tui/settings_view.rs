@@ -8,8 +8,9 @@
 //!
 //! The view is state and logic only, apart from [`draw`] at the end.
 
-use super::theme::Theme;
-use crate::config::{Config, SessionSettings, ThemeName};
+use super::appearance::Appearance;
+use super::theme::{self, Theme};
+use crate::config::{BarPosition, Config, SessionSettings, ThemeName};
 use crate::embed::Status;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
@@ -37,6 +38,9 @@ pub enum Setting {
     UnfocusedOnly,
     Sound,
     Theme,
+    AutoSwitch,
+    TabBar,
+    HideSingleTab,
     StopIdle,
     Distill,
     Embeddings,
@@ -49,7 +53,12 @@ pub enum Change {
     NotifyAfter(u64),
     UnfocusedOnly(bool),
     Sound(bool),
+    /// The theme, which, picked by hand, stops it following the system's
+    /// appearance.
     Theme(ThemeName),
+    AutoSwitch(bool),
+    TabBar(BarPosition),
+    HideSingleTab(bool),
     /// How long an agent may sit idle, one of [`SessionSettings::CHOICES`].
     StopIdle(&'static str),
     Distill(bool),
@@ -65,6 +74,9 @@ impl Change {
             Change::UnfocusedOnly(_) => &["notifications", "unfocused_only"],
             Change::Sound(_) => &["sound", "enabled"],
             Change::Theme(_) => &["theme"],
+            Change::AutoSwitch(_) => &["appearance", "auto_switch"],
+            Change::TabBar(_) => &["tab_bar", "position"],
+            Change::HideSingleTab(_) => &["tab_bar", "hide_when_single"],
             Change::StopIdle(_) => &["sessions", "stop_idle_after"],
             Change::Distill(_) => &["memory", "distill"],
             Change::Embeddings(_) => &["memory", "embeddings"],
@@ -77,7 +89,11 @@ impl Change {
             | Change::UnfocusedOnly(on)
             | Change::Sound(on)
             | Change::Distill(on)
-            | Change::Embeddings(on) => on.into(),
+            | Change::Embeddings(on)
+            | Change::AutoSwitch(on)
+            | Change::HideSingleTab(on) => on.into(),
+            Change::TabBar(BarPosition::Top) => "top".into(),
+            Change::TabBar(BarPosition::Bottom) => "bottom".into(),
             Change::NotifyAfter(secs) => i64::try_from(secs).unwrap_or(i64::MAX).into(),
             Change::Theme(theme) => theme.name().into(),
             Change::StopIdle(after) => after.into(),
@@ -122,12 +138,15 @@ pub enum Outcome {
 }
 
 /// The settings the bar can be on, in the order they're listed.
-const SETTINGS: [Setting; 8] = [
+const SETTINGS: [Setting; 11] = [
     Setting::Notify,
     Setting::NotifyAfter,
     Setting::UnfocusedOnly,
     Setting::Sound,
     Setting::Theme,
+    Setting::AutoSwitch,
+    Setting::TabBar,
+    Setting::HideSingleTab,
     Setting::StopIdle,
     Setting::Distill,
     Setting::Embeddings,
@@ -221,6 +240,12 @@ impl SettingsView {
             Setting::Sound => Change::Sound(!config.sound.enabled),
             Setting::Theme if forward => Change::Theme(config.theme.next()),
             Setting::Theme => Change::Theme(config.theme.previous()),
+            Setting::AutoSwitch => Change::AutoSwitch(!config.appearance.auto_switch),
+            Setting::TabBar => Change::TabBar(match config.tab_bar.position {
+                BarPosition::Top => BarPosition::Bottom,
+                BarPosition::Bottom => BarPosition::Top,
+            }),
+            Setting::HideSingleTab => Change::HideSingleTab(!config.tab_bar.hide_when_single),
             Setting::StopIdle => {
                 let choices = SessionSettings::CHOICES;
                 let now = &config.sessions.stop_idle_after;
@@ -363,6 +388,9 @@ fn lines(view: &SettingsView, theme: &Theme) -> Vec<Line<'static>> {
             Setting::UnfocusedOnly => "  only when away",
             Setting::Sound => "sounds",
             Setting::Theme => "theme",
+            Setting::AutoSwitch => "  follow the system",
+            Setting::TabBar => "tab bar",
+            Setting::HideSingleTab => "  hide with one tab",
             Setting::StopIdle => "stop idle agents",
             Setting::Distill => "distill closed tasks",
             Setting::Embeddings => "search by meaning",
@@ -439,6 +467,35 @@ fn lines(view: &SettingsView, theme: &Theme) -> Vec<Line<'static>> {
         None,
         config.theme.name().to_string(),
         format!("{whose}: ←/→ ({at} of {themes})"),
+    ));
+    let appearance = &config.appearance;
+    let sides = format!(
+        "{} when it's light, {} when dark",
+        theme::for_appearance(config, Appearance::Light).name(),
+        theme::for_appearance(config, Appearance::Dark).name()
+    );
+    lines.push(row(
+        Setting::AutoSwitch,
+        Some(appearance.auto_switch),
+        on_off(appearance.auto_switch),
+        sides,
+    ));
+    let bar = &config.tab_bar;
+    lines.push(row(
+        Setting::TabBar,
+        None,
+        match bar.position {
+            BarPosition::Top => "top",
+            BarPosition::Bottom => "bottom",
+        }
+        .to_string(),
+        "above the panes, or over the footer: ←/→".to_string(),
+    ));
+    lines.push(row(
+        Setting::HideSingleTab,
+        Some(bar.hide_when_single),
+        on_off(bar.hide_when_single),
+        "while there's only the one tab".to_string(),
     ));
     let idle = &config.sessions.stop_idle_after;
     lines.push(row(
@@ -571,6 +628,21 @@ mod tests {
         );
         press(&mut view, KeyCode::Down);
         assert_eq!(
+            press(&mut view, KeyCode::Char(' ')),
+            Outcome::Change(Change::AutoSwitch(true))
+        );
+        press(&mut view, KeyCode::Down);
+        assert_eq!(
+            press(&mut view, KeyCode::Right),
+            Outcome::Change(Change::TabBar(BarPosition::Bottom))
+        );
+        press(&mut view, KeyCode::Down);
+        assert_eq!(
+            press(&mut view, KeyCode::Char(' ')),
+            Outcome::Change(Change::HideSingleTab(true))
+        );
+        press(&mut view, KeyCode::Down);
+        assert_eq!(
             press(&mut view, KeyCode::Right),
             Outcome::Change(Change::StopIdle("15m"))
         );
@@ -625,7 +697,41 @@ mod tests {
     }
 
     #[test]
+    fn following_the_system_says_which_theme_each_side_is() {
+        let config = Config {
+            theme: ThemeName::find("kanagawa").unwrap(),
+            ..Config::default()
+        };
+        let shown = text(&view_of(config.clone(), None));
+        let row = "○   follow the system   off              \
+                   kanagawa-lotus when it's light, kanagawa when dark";
+        assert!(shown.contains(row), "{shown}");
+        assert!(shown.contains("  tab bar               top"), "{shown}");
+        let mut config = config;
+        config.appearance.auto_switch = true;
+        config.appearance.dark_theme = ThemeName::find("dracula");
+        let shown = text(&view_of(config, None));
+        assert!(shown.contains("●   follow the system   on "), "{shown}");
+        assert!(
+            shown.contains("when it's light, dracula when dark"),
+            "{shown}"
+        );
+    }
+
+    #[test]
     fn a_change_says_where_it_goes_in_the_file() {
+        assert_eq!(
+            Change::AutoSwitch(true).keys(),
+            ["appearance", "auto_switch"]
+        );
+        assert_eq!(
+            Change::TabBar(BarPosition::Bottom).value().as_str(),
+            Some("bottom")
+        );
+        assert_eq!(
+            Change::HideSingleTab(true).keys(),
+            ["tab_bar", "hide_when_single"]
+        );
         assert_eq!(Change::Embeddings(true).keys(), ["memory", "embeddings"]);
         assert_eq!(
             Change::NotifyAfter(30).keys(),
@@ -649,7 +755,7 @@ mod tests {
         let mut off = Config::default();
         off.memory.embeddings = false;
         let mut view = view_of(off, Some(status()));
-        for _ in 0..7 {
+        for _ in 0..SETTINGS.len() - 1 {
             press(&mut view, KeyCode::Down);
         }
         assert_eq!(press(&mut view, KeyCode::Enter), Outcome::Stay);
