@@ -608,11 +608,15 @@ fn kill_stops_the_program_and_drops_the_row() {
 #[test]
 fn kill_falls_back_to_sigkill_when_the_hang_up_is_ignored() {
     let crystal = Crystal::new();
-    crystal.ok(&["new", "-n", "stubborn", "sh", "-c", "trap '' HUP; sleep 30"]);
+    // It notes the hang-up, and carries on.
+    let script = "trap 'touch hung-up' HUP; while true; do sleep 1; done";
+    crystal.ok(&["new", "-n", "stubborn", "sh", "-c", script]);
     let pid = crystal.pid("stubborn");
 
     crystal.ok(&["kill", "stubborn"]);
-    thread::sleep(Duration::from_millis(500));
+    eventually("it has been hung up on", || {
+        crystal.dir.path().join("hung-up").exists()
+    });
     assert!(alive(pid), "the hang-up alone shouldn't have stopped it");
     eventually("the program has been killed", || !alive(pid));
 }
@@ -811,11 +815,14 @@ fn attach_puts_what_its_program_copies_on_the_clipboard_unless_told_not_to() {
     );
     let script = copies_when("copy-again", "kept off");
     crystal.ok(&["new", "-n", "kept", "sh", "-c", &script]);
-    let terminal = crystal.attach_with_env(&["attach", "kept"], &over_ssh);
+    let mut terminal = crystal.attach_with_env(&["attach", "kept"], &over_ssh);
     terminal.shows("waiting");
     std::fs::write(dir.join("copy-again"), "").unwrap();
     terminal.shows("done copying");
-    thread::sleep(Duration::from_millis(300));
+    // What the terminal echoes of a key is drawn after the copy, which an
+    // attach that passed it on would have asked for by then.
+    terminal.type_keys("echoed");
+    terminal.shows("echoed");
     let written = String::from_utf8_lossy(&terminal.written.lock().unwrap()).into_owned();
     assert!(!written.contains("\x1b]52;"), "{written:?}");
 }
@@ -1512,11 +1519,15 @@ fn a_closing_terminal_never_marks_a_session_seen() {
 
     // A terminal that closes sends a line feed, Ctrl+J, on its way out. Had
     // it moved the selection, the second session would be shown, and so
-    // seen, within moments; nothing to wait for, so give it half a second.
+    // seen. Keys are read in turn: once the help a `?` after it opens shows,
+    // the line feed has been read.
     let mut tui = crystal.tui();
-    tui.shows("first");
-    tui.type_keys("\n");
-    thread::sleep(Duration::from_millis(500));
+    tui.shows("❯ first");
+    tui.type_keys("\n?");
+    tui.shows("In the sidebar");
+    tui.type_keys("?");
+    tui.hides("In the sidebar");
+    assert!(tui.text().contains("❯ first"), "{}", tui.text());
     assert_eq!(crystal.row("second").unwrap()[1], "done");
     tui.type_keys("q");
     assert!(tui.exit());
@@ -2660,6 +2671,7 @@ fn an_agent_typed_into_a_shell_is_resumed_once_it_has_had_a_prompt() {
         r#"
 hook() {{ printf '%s' "$1" | '{CRYSTAL}' hook droid; }}
 hook '{{"hook_event_name":"SessionStart","session_id":"d-1"}}'
+touch named
 while [ ! -e prompt ]; do sleep 0.05; done
 hook '{{"hook_event_name":"UserPromptSubmit","session_id":"d-1","prompt":"go"}}'
 sleep 30
@@ -2676,13 +2688,20 @@ sleep 30
     eventually("Droid is in front", || {
         crystal.listed("box")["front"]["program"] == "droid"
     });
-    // Named but never sent a prompt, its session has nothing to pick up.
-    thread::sleep(Duration::from_millis(300));
-    assert!(
-        crystal.saved().contains(r#""resume":null"#),
-        "{}",
-        crystal.saved()
-    );
+    // Named but never sent a prompt, its session has nothing to pick up:
+    // not in the sessions written down once another has started since.
+    eventually("Droid has named its conversation", || {
+        crystal.dir.path().join("named").exists()
+    });
+    crystal.ok(&["new", "-n", "later", "sleep", "30"]);
+    let mut written = serde_json::Value::Null;
+    eventually("the sessions are written down since", || {
+        written = serde_json::from_str(&crystal.saved()).unwrap_or_default();
+        written.to_string().contains(r#""name":"later""#)
+    });
+    let sessions = written.as_array().unwrap();
+    let saved = sessions.iter().find(|session| session["name"] == "box");
+    assert!(saved.unwrap()["resume"].is_null(), "{written}");
     crystal.stage("prompt");
     eventually("its resume command is saved", || {
         crystal
@@ -4478,7 +4497,9 @@ fn wait_output_carries_on_through_a_handover() {
         .spawn()
         .unwrap();
     // It's waiting once the daemon is looking at the screen for it.
-    thread::sleep(Duration::from_millis(200));
+    eventually("the daemon is looking for it", || {
+        crystal.listed("echo")["output_waits"] == 1
+    });
     crystal.ok(&["restart-server"]);
     crystal.ok(&["send", "echo", "later"]);
     let out = waiting.wait_with_output().unwrap();
@@ -4796,6 +4817,8 @@ fn a_split_and_a_tab_from_the_command_line_reach_the_tui() {
     );
     let json: serde_json::Value = serde_json::from_str(&crystal.ok(&["layout", "--json"])).unwrap();
     assert_eq!(json["tabs"][0]["panes"]["second"]["session"], "beta");
+    // Its terminal never says whether it has the focus.
+    assert_eq!(json["presence"], "unknown");
     let said = crystal.fails(&["pane", "split", "beta", "--beside", "gone"]);
     assert!(said.contains("there's no session called gone"), "{said}");
 
@@ -5662,6 +5685,14 @@ fn a_question_answered_before_its_time_is_never_told_of() {
     assert_eq!(lines_in(&notices), ["agent done: agent is done"]);
 }
 
+/// Where the daemon has the user, by what the TUIs' terminals say of their
+/// focus: `here`, `away` or `unknown`.
+fn presence(crystal: &Crystal) -> String {
+    let layout = crystal.ok(&["layout", "--json"]);
+    let layout: serde_json::Value = serde_json::from_str(&layout).unwrap();
+    layout["presence"].as_str().unwrap().to_string()
+}
+
 #[test]
 fn a_session_shown_in_a_terminal_without_the_focus_isn_t_watched() {
     let crystal = Crystal::new();
@@ -5673,7 +5704,7 @@ fn a_session_shown_in_a_terminal_without_the_focus_isn_t_watched() {
 
     // The terminal says it has lost the focus.
     tui.type_keys("\x1b[O");
-    thread::sleep(Duration::from_millis(500));
+    eventually("the daemon hears it", || presence(&crystal) == "away");
     std::fs::write(crystal.dir.path().join("ask"), "").unwrap();
     eventually("the user is told it's waiting", || {
         lines_in(&notices) == ["agent waiting: agent is waiting on you"]
@@ -5692,7 +5723,7 @@ fn unfocused_only_keeps_quiet_while_crystal_has_the_focus() {
     crystal.ok(&["pane", "focus", "other"]);
     tui.shows("❯ other");
     tui.type_keys("\x1b[I");
-    thread::sleep(Duration::from_millis(500));
+    eventually("the daemon hears it", || presence(&crystal) == "here");
 
     std::fs::write(crystal.dir.path().join("ask"), "").unwrap();
     eventually("the session is waiting", || {
@@ -5702,7 +5733,7 @@ fn unfocused_only_keeps_quiet_while_crystal_has_the_focus() {
     assert!(lines_in(&notices).is_empty(), "{:?}", lines_in(&notices));
 
     tui.type_keys("\x1b[O");
-    thread::sleep(Duration::from_millis(500));
+    eventually("the daemon hears it", || presence(&crystal) == "away");
     std::fs::write(crystal.dir.path().join("rest"), "").unwrap();
     eventually("the user is told it's done", || {
         lines_in(&notices) == ["agent done: agent is done"]

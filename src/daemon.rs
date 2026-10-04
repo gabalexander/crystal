@@ -1977,10 +1977,15 @@ impl Daemon {
             | Request::TakeLayoutOrders { .. } => {
                 bail!("this takes the connection over")
             }
-            Request::Layout(order) => match self.layout.pass(order.clone()) {
-                Err(err) if err.is::<NoTui>() => Ok(Response::Layout(self.lay_out_alone(order)?)),
-                passed => Ok(Response::Layout(passed?)),
-            },
+            Request::Layout(order) => {
+                let mut layout = match self.layout.pass(order.clone()) {
+                    Err(err) if err.is::<NoTui>() => self.lay_out_alone(order)?,
+                    passed => passed?,
+                };
+                // A TUI knows only whether its own terminal has the focus.
+                layout.presence = notify::presence();
+                Ok(Response::Layout(layout))
+            }
             Request::Rename { name, new_name } => {
                 let mut sessions = self.sessions.lock().unwrap();
                 if new_name != name {
@@ -2675,7 +2680,7 @@ impl Daemon {
                 named(&mut sessions, name)?.term()
             };
             let hung_up = watch_for_hang_up(conn)?;
-            matching_row(&term, name, &pattern, timeout, &hung_up)
+            term.waiting_for_output(|| matching_row(&term, name, &pattern, timeout, &hung_up))
         })();
         let response = match watched {
             Ok(None) => None,

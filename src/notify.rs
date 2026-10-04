@@ -32,6 +32,7 @@ use crate::printable;
 use crate::protocol::{Activity, Front, SessionInfo};
 use crate::sound::{self, Sound};
 use anyhow::{Result, bail};
+use serde::{Deserialize, Serialize};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -93,10 +94,12 @@ impl Notice {
 }
 
 /// Whether the user is at crystal, by what its TUIs' terminals say of their
-/// focus.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// focus. `crystal layout --json` has it as `presence`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Presence {
     /// No TUI says, or one whose terminal never says.
+    #[default]
     Unknown,
     /// A TUI's terminal has the focus.
     Here,
@@ -462,6 +465,7 @@ mod tests {
             bell: false,
             unseen_copies: 0,
             context: None,
+            output_waits: 0,
         }
     }
 

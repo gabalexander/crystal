@@ -305,7 +305,10 @@ mod tests {
         let done: Response = protocol::recv(&mut tui).unwrap().unwrap();
         assert!(matches!(done, Response::Done));
         let relayed = next_order(&mut tui);
-        let layout = Layout { tabs: Vec::new() };
+        let layout = Layout {
+            tabs: Vec::new(),
+            presence: Presence::Unknown,
+        };
         let answer = Report::Answer {
             id: relayed.id,
             answer: Ok(layout.clone()),

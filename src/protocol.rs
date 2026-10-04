@@ -685,6 +685,14 @@ pub struct SessionInfo {
     /// How full a background task's conversation is, once Claude has said.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<ContextUse>,
+    /// How many `crystal wait --output` the daemon is looking at its screen
+    /// for: a script can tell its wait has reached the daemon.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub output_waits: u32,
+}
+
+fn is_zero(count: &u32) -> bool {
+    *count == 0
 }
 
 /// How full a conversation's context is: the tokens the model was given for

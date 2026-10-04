@@ -986,6 +986,7 @@ pub fn example(kind: Kind, session: Option<&SessionInfo>, dir: &Path) -> Event {
             bell: false,
             unseen_copies: 0,
             context: None,
+            output_waits: 0,
         },
     };
     let now = now_ms() / 1000;
@@ -1301,6 +1302,7 @@ mod tests {
             bell: false,
             unseen_copies: 0,
             context: None,
+            output_waits: 0,
         }
     }
 

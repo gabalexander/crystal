@@ -6,6 +6,7 @@
 //! the next TUI to open finds them. This is what goes between them, and how
 //! `crystal layout` prints a layout.
 
+use crate::notify::Presence;
 use crate::tui::split_tree::{Direction, Way};
 use serde::{Deserialize, Serialize};
 
@@ -113,6 +114,10 @@ pub enum Report {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Layout {
     pub tabs: Vec<TabLayout>,
+    /// Whether the user is at crystal, by what every TUI's terminal says of
+    /// its focus: the daemon says, as a TUI knows only its own.
+    #[serde(default)]
+    pub presence: Presence,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -272,6 +277,7 @@ mod tests {
         };
         Layout {
             tabs: vec![review, empty],
+            presence: Presence::Unknown,
         }
     }
 
@@ -308,6 +314,17 @@ mod tests {
         let back: Layout = serde_json::from_value(json).unwrap();
         assert_eq!(back, layout);
         assert_eq!(back.current().unwrap().number, 1);
+    }
+
+    #[test]
+    fn a_layout_says_where_the_user_is() {
+        let mut layout = two_tabs();
+        layout.presence = Presence::Away;
+        let json = serde_json::to_value(&layout).unwrap();
+        assert_eq!(json["presence"], "away");
+        // Without it, nobody knows.
+        let layout: Layout = serde_json::from_value(serde_json::json!({"tabs": []})).unwrap();
+        assert_eq!(layout.presence, Presence::Unknown);
     }
 
     #[test]

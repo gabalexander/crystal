@@ -8,6 +8,7 @@
 use super::{Action, App, Slot, resize_step};
 use crate::flow_run::FlowRun;
 use crate::layout::{Command, Layout, NO_TUI, Order, TabLayout, Tile};
+use crate::notify::Presence;
 use crate::protocol::SessionInfo;
 use crate::session::UNSEEN_SIZE;
 use crate::tui::split_tree::{Direction, Pane, SplitTree, Way};
@@ -105,6 +106,8 @@ impl App {
         });
         Layout {
             tabs: tabs.collect(),
+            // Where the user is, the daemon says, from every TUI.
+            presence: Presence::Unknown,
         }
     }
 
@@ -560,6 +563,7 @@ mod tests {
             bell: false,
             unseen_copies: 0,
             context: None,
+            output_waits: 0,
         }
     }
 
