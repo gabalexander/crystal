@@ -879,6 +879,25 @@ impl Chord {
         self.written(true)
     }
 
+    /// How the settings view writes it in `[keys]`: as the footer does,
+    /// but for the arrows, by their names, and the F keys in lower case:
+    /// `ctrl+b`, `N`, `shift+left`, `f2`.
+    pub fn config(&self) -> String {
+        let key = match self.code {
+            KeyCode::Up => "up".to_string(),
+            KeyCode::Down => "down".to_string(),
+            KeyCode::Left => "left".to_string(),
+            KeyCode::Right => "right".to_string(),
+            KeyCode::F(n) => format!("f{n}"),
+            _ => return self.hint(),
+        };
+        let hint = self.hint();
+        match hint.rsplit_once('+') {
+            Some((modifiers, _)) => format!("{modifiers}+{key}"),
+            None => key,
+        }
+    }
+
     fn written(&self, lower: bool) -> String {
         let case = |text: &str| {
             if lower {
@@ -1751,6 +1770,231 @@ fn is_near(typed: &str, known: &str) -> bool {
     row[b.len()] <= 2
 }
 
+/// What the prefixes and the hand-back key do, for `crystal keys` and the
+/// settings view.
+const PREFIX_DOES: &str = "from a pane: then a command's key";
+const HAND_BACK_DOES: &str = "from a pane back to the sidebar";
+
+/// One of the things `[keys]` gives keys by an id: the prefixes, the key
+/// that hands the keyboard back, a command, or a mode's key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum KeyId {
+    Prefix,
+    HandBack,
+    Command(Command),
+    Mode(ModeKey),
+}
+
+impl KeyId {
+    /// Every one, in the order `crystal keys` and the settings view list
+    /// them.
+    pub fn all() -> impl Iterator<Item = KeyId> {
+        let commands = COMMANDS.iter().map(|spec| KeyId::Command(spec.command));
+        let modes = MODE_KEYS.iter().map(|spec| KeyId::Mode(spec.key));
+        [KeyId::Prefix, KeyId::HandBack]
+            .into_iter()
+            .chain(commands)
+            .chain(modes)
+    }
+
+    /// What `[keys]` calls it.
+    pub fn id(self) -> &'static str {
+        match self {
+            KeyId::Prefix => PREFIX,
+            KeyId::HandBack => HAND_BACK,
+            KeyId::Command(command) => spec_of(command).id,
+            KeyId::Mode(key) => mode_spec_of(key).id,
+        }
+    }
+
+    pub fn does(self) -> &'static str {
+        match self {
+            KeyId::Prefix => PREFIX_DOES,
+            KeyId::HandBack => HAND_BACK_DOES,
+            KeyId::Command(command) => spec_of(command).does,
+            KeyId::Mode(key) => mode_spec_of(key).does,
+        }
+    }
+
+    /// The mode it's a key of, or `None` for the sidebar's.
+    pub fn mode(self) -> Option<Mode> {
+        match self {
+            KeyId::Mode(key) => Some(mode_spec_of(key).mode),
+            _ => None,
+        }
+    }
+
+    /// The plugin of crystal's it's part of, if any.
+    pub fn plugin(self) -> Option<&'static str> {
+        match self {
+            KeyId::Command(command) => spec_of(command).plugin,
+            _ => None,
+        }
+    }
+}
+
+/// What has a key: one of those `[keys]` names, or one of the user's
+/// `[[keys.command]]`s, by its place among them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Holder {
+    Key(KeyId),
+    Custom(usize),
+}
+
+/// A change to `[keys]`, as the settings view makes it: the lines to write,
+/// by what they give keys, a line set to its keys or, with none, taken out
+/// for the defaults; and what had the key it gives and loses it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rebinding {
+    pub lines: Vec<(KeyId, Option<Binding>)>,
+    pub taken_from: Option<KeyId>,
+}
+
+impl Keymap {
+    /// The keys `key` has, the first the one shown.
+    pub fn keys_of(&self, key: KeyId) -> Vec<Chord> {
+        match key {
+            KeyId::Prefix => self.prefixes.clone(),
+            KeyId::HandBack => vec![self.hand_back],
+            KeyId::Command(command) => self.keys(command).to_vec(),
+            KeyId::Mode(mode_key) => self.mode_keys(mode_key).to_vec(),
+        }
+    }
+
+    /// What has `chord` where `key` would have it: in the sidebar, where
+    /// the prefixes, the hand-back key, the commands and the user's own
+    /// keys are one table; or in `key`'s mode, with answering's and the
+    /// views' as one, since the needs-you view takes both.
+    pub fn holder(&self, key: KeyId, chord: Chord) -> Option<Holder> {
+        let Some(mode) = key.mode() else {
+            if self.prefixes.contains(&chord) {
+                return Some(Holder::Key(KeyId::Prefix));
+            }
+            if self.hand_back == chord {
+                return Some(Holder::Key(KeyId::HandBack));
+            }
+            return match self.bound.get(&chord)? {
+                Bound::Command(command) => Some(Holder::Key(KeyId::Command(*command))),
+                Bound::Custom(index) => Some(Holder::Custom(*index)),
+            };
+        };
+        let other = match mode {
+            Mode::Answer => Some(Mode::View),
+            Mode::View => Some(Mode::Answer),
+            Mode::Resize => None,
+        };
+        let holder = self
+            .modes
+            .get(&(mode, chord))
+            .or_else(|| other.and_then(|other| self.modes.get(&(other, chord))))?;
+        Some(Holder::Key(KeyId::Mode(*holder)))
+    }
+
+    /// `chords` as `[keys]` writes them for `key`: `"none"` for none, one,
+    /// or a list; a command's keys that work in a pane without the prefix
+    /// written `direct+`.
+    fn binding(&self, key: KeyId, chords: &[Chord]) -> Binding {
+        let direct = matches!(key, KeyId::Command(_));
+        let mut written: Vec<String> = chords
+            .iter()
+            .map(|chord| match direct && self.is_direct(*chord) {
+                true => format!("{DIRECT}+{}", chord.config()),
+                false => chord.config(),
+            })
+            .collect();
+        match written.len() {
+            0 => Binding::One("none".to_string()),
+            1 => Binding::One(written.remove(0)),
+            _ => Binding::Many(written),
+        }
+    }
+}
+
+/// `[keys]` with `chord` given to `key`, in place of its keys or, with
+/// `add`, beside them, and taken from what had it, which keeps the rest of
+/// its keys: the lines to write, or why it can't be. The hand-back key
+/// can't lose its one key, nor a `[[keys.command]]` its key here, which is
+/// the config file's to change; what the keys come to is checked as the
+/// config file's are.
+pub fn rebind(
+    settings: &KeySettings,
+    key: KeyId,
+    chord: Chord,
+    add: bool,
+) -> Result<Rebinding, String> {
+    let keymap = Keymap::new(settings)?;
+    if add && key == KeyId::HandBack {
+        return Err("hand-back is one key: enter gives it another".to_string());
+    }
+    let mut lines = Vec::new();
+    let mut taken_from = None;
+    match keymap.holder(key, chord) {
+        Some(Holder::Key(holder)) if holder == key => {
+            if add {
+                return Err(format!("{} has {chord} already", key.id()));
+            }
+        }
+        Some(Holder::Key(KeyId::HandBack)) => {
+            return Err(format!(
+                "{chord} is {HAND_BACK}'s, which always has a key: give {HAND_BACK} another first"
+            ));
+        }
+        Some(Holder::Custom(index)) => {
+            let label = keymap.custom[index].0.label();
+            return Err(format!(
+                "{chord} is your [[keys.command]] {label:?}'s: change it in the config file"
+            ));
+        }
+        Some(Holder::Key(holder)) => {
+            let rest: Vec<Chord> = (keymap.keys_of(holder).into_iter())
+                .filter(|kept| *kept != chord)
+                .collect();
+            lines.push((holder, Some(keymap.binding(holder, &rest))));
+            taken_from = Some(holder);
+        }
+        None => {}
+    }
+    let mut chords = if add { keymap.keys_of(key) } else { Vec::new() };
+    chords.push(chord);
+    lines.insert(0, (key, Some(keymap.binding(key, &chords))));
+    checked(settings, lines, taken_from)
+}
+
+/// `[keys]` with `key`'s line taken out, for it to have its default keys.
+pub fn reset(settings: &KeySettings, key: KeyId) -> Result<Rebinding, String> {
+    checked(settings, vec![(key, None)], None)
+}
+
+/// `[keys]` with no key for `key`.
+pub fn unbind(settings: &KeySettings, key: KeyId) -> Result<Rebinding, String> {
+    if key == KeyId::HandBack {
+        return Err(format!(
+            "{HAND_BACK} always has a key: enter gives it another"
+        ));
+    }
+    let none = Binding::One("none".to_string());
+    checked(settings, vec![(key, Some(none))], None)
+}
+
+/// The rebinding `lines` make, once the keys they come to are checked.
+fn checked(
+    settings: &KeySettings,
+    lines: Vec<(KeyId, Option<Binding>)>,
+    taken_from: Option<KeyId>,
+) -> Result<Rebinding, String> {
+    let mut changed = settings.clone();
+    for (key, binding) in &lines {
+        match binding {
+            Some(binding) => changed
+                .bindings
+                .insert(key.id().to_string(), binding.clone()),
+            None => changed.bindings.remove(key.id()),
+        };
+    }
+    Keymap::new(&changed)?;
+    Ok(Rebinding { lines, taken_from })
+}
+
 /// A row of the `?` overlay's sidebar keys: a few commands that go
 /// together, how the row writes their keys while they're the defaults, and
 /// what they do.
@@ -1966,16 +2210,8 @@ pub fn listing(keymap: &Keymap) -> String {
             .collect();
         keys.join(" ")
     };
-    let mut out = line(
-        PREFIX,
-        written(keymap.prefixes()),
-        "from a pane: then a command's key",
-    );
-    out += &line(
-        HAND_BACK,
-        keymap.hand_back().hint(),
-        "from a pane back to the sidebar",
-    );
+    let mut out = line(PREFIX, written(keymap.prefixes()), PREFIX_DOES);
+    out += &line(HAND_BACK, keymap.hand_back().hint(), HAND_BACK_DOES);
     for spec in COMMANDS {
         out += &line(spec.id, written(keymap.keys(spec.command)), spec.does);
     }
@@ -2436,5 +2672,165 @@ height = 30
             assert!(listing.contains(spec.id), "{}", spec.id);
         }
         assert!(!listing.contains("[[keys.command]]"));
+    }
+
+    fn settings(toml: &str) -> KeySettings {
+        toml::from_str(toml).unwrap()
+    }
+
+    fn one(written: &str) -> Option<Binding> {
+        Some(Binding::One(written.to_string()))
+    }
+
+    fn chord(written: &str) -> Chord {
+        Chord::parse(written).unwrap()
+    }
+
+    #[test]
+    fn a_key_as_the_settings_view_writes_it_reads_back_the_same() {
+        for written in [
+            "n",
+            "N",
+            "ctrl+b",
+            "ctrl+\\",
+            "shift+tab",
+            "pgup",
+            "space",
+            "+",
+            "alt+-",
+            "f5",
+            "up",
+            "shift+left",
+            "ctrl+alt+right",
+            "esc",
+            "|",
+            "?",
+        ] {
+            let chord = chord(written);
+            assert_eq!(Chord::parse(&chord.config()), Ok(chord), "{written}");
+        }
+        assert_eq!(chord("shift+left").config(), "shift+left");
+        assert_eq!(chord("Ctrl+B").config(), "ctrl+b");
+        assert_eq!(chord("alt+F12").config(), "alt+f12");
+    }
+
+    #[test]
+    fn a_key_given_in_the_settings_takes_it_from_what_had_it() {
+        let none = KeySettings::default();
+        let free = rebind(
+            &none,
+            KeyId::Command(Command::NewSession),
+            chord("N"),
+            false,
+        );
+        assert_eq!(
+            free,
+            Ok(Rebinding {
+                lines: vec![(KeyId::Command(Command::NewSession), one("N"))],
+                taken_from: None,
+            })
+        );
+        // `x` was kill's only key.
+        let taken = rebind(&none, KeyId::Command(Command::Archive), chord("x"), false).unwrap();
+        assert_eq!(
+            taken.lines,
+            [
+                (KeyId::Command(Command::Archive), one("x")),
+                (KeyId::Command(Command::Kill), one("none")),
+            ]
+        );
+        assert_eq!(taken.taken_from, Some(KeyId::Command(Command::Kill)));
+        // Beside up's keys, and down keeps its other.
+        let added = rebind(&none, KeyId::Command(Command::Up), chord("j"), true).unwrap();
+        assert_eq!(
+            added.lines,
+            [
+                (
+                    KeyId::Command(Command::Up),
+                    Some(Binding::Many(vec!["k".into(), "up".into(), "j".into()]))
+                ),
+                (KeyId::Command(Command::Down), one("down")),
+            ]
+        );
+        // The prefix gives up its key like any other.
+        let prefix = rebind(&none, KeyId::Command(Command::Quit), chord("ctrl+b"), false).unwrap();
+        assert_eq!(prefix.lines[1], (KeyId::Prefix, one("none")));
+        // Its own key again is nothing to take.
+        let same = rebind(&none, KeyId::Command(Command::Kill), chord("x"), false).unwrap();
+        assert_eq!(same.lines, [(KeyId::Command(Command::Kill), one("x"))]);
+        assert_eq!(same.taken_from, None);
+    }
+
+    #[test]
+    fn a_key_the_settings_cant_take_says_why() {
+        let none = KeySettings::default();
+        let kill = KeyId::Command(Command::Kill);
+        let hand_back = rebind(&none, kill, chord("ctrl+\\"), false).unwrap_err();
+        assert!(
+            hand_back.contains("give hand-back another first"),
+            "{hand_back}"
+        );
+        let twice = rebind(&none, kill, chord("x"), true).unwrap_err();
+        assert_eq!(twice, "kill has x already");
+        assert!(rebind(&none, KeyId::HandBack, chord("ctrl+g"), true).is_err());
+        assert!(unbind(&none, KeyId::HandBack).is_err());
+        let own = settings("[[command]]\nkey = \"g\"\ntype = \"popup\"\ncommand = \"lazygit\"\n");
+        let custom = rebind(&own, kill, chord("g"), false).unwrap_err();
+        assert!(
+            custom.contains("[[keys.command]] \"lazygit\"'s"),
+            "{custom}"
+        );
+        // As the config file's keys are checked: a view's own key is its.
+        let view_down = KeyId::Mode(ModeKey::ViewDown);
+        let enter = rebind(&none, view_down, chord("enter"), false).unwrap_err();
+        assert!(enter.contains("view-open's in every view"), "{enter}");
+        // A key that works in a pane without the prefix still does, moved.
+        let direct = settings("kill = \"direct+ctrl+alt+k\"\n");
+        let moved = rebind(
+            &direct,
+            KeyId::Command(Command::Archive),
+            chord("ctrl+alt+k"),
+            false,
+        );
+        assert_eq!(
+            moved.unwrap().lines[0],
+            (KeyId::Command(Command::Archive), one("direct+ctrl+alt+k"))
+        );
+    }
+
+    #[test]
+    fn a_modes_key_given_in_the_settings_is_taken_in_its_own_table() {
+        let none = KeySettings::default();
+        // q closes a view; view-down can have it, and view-close keeps
+        // Esc, its own.
+        let q = rebind(&none, KeyId::Mode(ModeKey::ViewDown), chord("q"), true).unwrap();
+        assert_eq!(q.taken_from, Some(KeyId::Mode(ModeKey::ViewClose)));
+        assert_eq!(q.lines[1], (KeyId::Mode(ModeKey::ViewClose), one("none")));
+        // The needs-you view takes answers and the views' keys both.
+        let y = rebind(&none, KeyId::Mode(ModeKey::ViewDown), chord("y"), false).unwrap();
+        assert_eq!(y.taken_from, Some(KeyId::Mode(ModeKey::AnswerYes)));
+        // But a command's key is another table's.
+        let x = rebind(&none, KeyId::Mode(ModeKey::ResizeEven), chord("x"), false).unwrap();
+        assert_eq!(x.taken_from, None);
+    }
+
+    #[test]
+    fn the_settings_put_a_keys_default_back_or_leave_it_none() {
+        let given = settings("kill = \"X\"\narchive = \"x\"\n");
+        let kill = KeyId::Command(Command::Kill);
+        assert_eq!(
+            reset(&given, kill),
+            Ok(Rebinding {
+                lines: vec![(kill, None)],
+                taken_from: None,
+            })
+        );
+        assert_eq!(unbind(&given, kill).unwrap().lines, [(kill, one("none"))]);
+        // The prefix back would be a key a command has.
+        let taken = settings("prefix = \"ctrl+a\"\nkill = \"ctrl+b\"\n");
+        assert!(reset(&taken, KeyId::Prefix).is_err());
+        assert_eq!(KeyId::all().count(), COMMANDS.len() + MODE_KEYS.len() + 2);
+        assert_eq!(KeyId::Command(Command::Kill).id(), "kill");
+        assert_eq!(KeyId::Prefix.does(), PREFIX_DOES);
     }
 }

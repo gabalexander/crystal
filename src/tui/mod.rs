@@ -94,6 +94,7 @@ use layouts::{Layouts, Which};
 use pane::Pane;
 use ratatui::DefaultTerminal;
 use ratatui::layout::Rect;
+use settings_view::Setting;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -1816,29 +1817,20 @@ impl Tui {
             }
             Action::CloseSettings => self.poll_settings.store(false, Ordering::Relaxed),
             Action::ChangeSetting(change) => {
-                let path = config::path();
-                let mut changed = config::set(&path, change.keys(), change.value());
+                let mut edits = vec![change.edit()];
                 // A theme picked by hand is the one wanted, whatever the
                 // system's appearance.
-                let stop_following = settings_view::Change::AutoSwitch(false);
-                if let settings_view::Change::Theme(_) = change
-                    && self.config.appearance.auto_switch
+                if change.setting == Setting::Theme && self.config.appearance.auto_switch {
+                    edits.push(settings_view::Change::set(Setting::AutoSwitch, false).edit());
+                }
+                if self.write_settings(&edits)
+                    && change == settings_view::Change::set(Setting::Embeddings, true)
                 {
-                    changed = changed.and_then(|()| {
-                        config::set(&path, stop_following.keys(), stop_following.value())
-                    });
+                    self.prepare_embeddings();
                 }
-                let changed = changed.and_then(|()| Config::load());
-                match changed {
-                    Ok(config) => {
-                        self.config_changed(&config);
-                        if change == settings_view::Change::Embeddings(true) {
-                            self.prepare_embeddings();
-                        }
-                    }
-                    Err(err) => self.app.setting_failed(format!("{err:#}")),
-                }
-                self.read_settings_now();
+            }
+            Action::ChangeKeys(rebinding) => {
+                self.write_settings(&settings_view::key_edits(&rebinding));
             }
             Action::PrepareEmbeddings => {
                 self.prepare_embeddings();
@@ -2380,6 +2372,25 @@ impl Tui {
         let flows = crate::flows::enabled(config);
         self.poll_flows.store(flows, Ordering::Relaxed);
         self.set_sessions(self.app.sessions().to_vec());
+    }
+
+    /// Makes the settings view's `edits` to the config file and follows
+    /// them, or says in the view why they couldn't be made; and reads the
+    /// settings again for it. Whether they were made.
+    fn write_settings(&mut self, edits: &[config::Edit]) -> bool {
+        let changed = config::apply(&config::path(), edits).and_then(|()| Config::load());
+        let written = match changed {
+            Ok(config) => {
+                self.config_changed(&config);
+                true
+            }
+            Err(err) => {
+                self.app.setting_failed(format!("{err:#}"));
+                false
+            }
+        };
+        self.read_settings_now();
+        written
     }
 
     /// Reads the settings as they are now, off the loop, for the settings
