@@ -6,7 +6,7 @@
 //! listed while that plugin is on, and the keys installed plugins' actions
 //! took are listed after the sidebar's own.
 
-use super::keymap::{self, Keymap};
+use super::keymap::{self, Chord, Keymap, ModeKey};
 use super::theme::Theme;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Margin, Rect};
@@ -20,7 +20,11 @@ pub enum Section {
     Sidebar,
     /// Keys that run installed plugins' actions.
     Plugins,
+    /// The user's own, from `[[keys.command]]`.
+    Commands,
     Pane,
+    Resize,
+    View,
     Question,
     NewSession,
     TextBox,
@@ -32,7 +36,10 @@ impl Section {
         match self {
             Section::Sidebar => "In the sidebar",
             Section::Plugins => "Your plugins",
+            Section::Commands => "Your commands",
             Section::Pane => "In a pane",
+            Section::Resize => "In resize mode",
+            Section::View => "In a view",
             Section::Question => "Answering a question",
             Section::NewSession => "Starting a session",
             Section::TextBox => "In a text box",
@@ -129,7 +136,10 @@ struct Row {
 const ORDER: &[Section] = &[
     Section::Sidebar,
     Section::Plugins,
+    Section::Commands,
     Section::Pane,
+    Section::Resize,
+    Section::View,
     Section::Question,
     Section::NewSession,
     Section::TextBox,
@@ -196,9 +206,11 @@ pub fn draw(frame: &mut Frame, theme: &Theme, area: Rect, shown: &Shown, page: u
     let inside = block.inner(overlay).inner(Margin::new(margin, 0));
     frame.render_widget(block, overlay);
 
+    // A page of one column has no gap to keep beside it.
+    let gap = if right.is_empty() { 0 } else { GAP };
     let [left_area, _, right_area] = Layout::horizontal([
         Constraint::Length(widest(&left)),
-        Constraint::Length(GAP),
+        Constraint::Length(gap),
         Constraint::Fill(1),
     ])
     .areas(inside);
@@ -263,10 +275,15 @@ fn flow(rows: &[Row], room: usize) -> Vec<Vec<Entry<'_>>> {
     columns
 }
 
+/// How long what a key of the user's own does may be in the overlay, the
+/// rest cut, so that it fits a column.
+const COMMAND_WIDTH: usize = 28;
+
 /// Every row the overlay shows: the sidebar's commands, but those of
 /// plugins that are off and those the user left with no key, then the keys
-/// installed plugins took, then the prefix and the hand-back key, then the
-/// rest.
+/// installed plugins took, then the user's own, then the prefix, the
+/// hand-back key and the keys the user gave to work in a pane, then resize
+/// mode's and the views', then the rest.
 fn rows(shown: &Shown) -> Vec<Row> {
     let keymap = shown.keymap;
     let sidebar = keymap::HELP
@@ -289,10 +306,43 @@ fn rows(shown: &Shown) -> Vec<Row> {
         label: keymap.hand_back().label(),
         does: "back to the sidebar".to_string(),
     };
-    let prefix = keymap.prefix().map(|prefix| Row {
+    let commands = keymap.custom().iter().filter_map(|(command, chords)| {
+        let mut does: String = command.label().chars().take(COMMAND_WIDTH).collect();
+        if command.label().chars().count() > COMMAND_WIDTH {
+            does.push('…');
+        }
+        Some(Row {
+            section: Section::Commands,
+            label: chords.first()?.label(),
+            does,
+        })
+    });
+    let prefixes: Vec<String> = keymap.prefixes().iter().map(|key| key.label()).collect();
+    let prefix = (!prefixes.is_empty()).then(|| Row {
         section: Section::Pane,
-        label: format!("{}, a key", prefix.label()),
+        label: format!("{}, a key", prefixes.join("/")),
         does: "that key's command".to_string(),
+    });
+    // The keys the user gave to work in a pane without the prefix.
+    let direct = keymap::COMMANDS.iter().flat_map(|spec| {
+        let keys = keymap.keys(spec.command).iter();
+        keys.filter(|key| keymap.is_direct(**key)).map(|key| Row {
+            section: Section::Pane,
+            label: key.label(),
+            does: spec.does.to_string(),
+        })
+    });
+    let resize = keymap::RESIZE_HELP.iter().filter_map(|row| {
+        Some(Row {
+            section: Section::Resize,
+            label: keymap.row_label(row)?,
+            does: row.does.to_string(),
+        })
+    });
+    let views = VIEW_ROWS.iter().map(|&(one, other, does)| Row {
+        section: Section::View,
+        label: view_label(keymap, one, other),
+        does: does.to_string(),
     });
     let own = KEYS.iter().map(|key| Row {
         section: key.section,
@@ -301,10 +351,49 @@ fn rows(shown: &Shown) -> Vec<Row> {
     });
     sidebar
         .chain(plugins)
+        .chain(commands)
         .chain([hand_back])
         .chain(prefix)
+        .chain(direct)
+        .chain(resize)
+        .chain(views)
         .chain(own)
         .collect()
+}
+
+/// The views' keys in the overlay, two to a row.
+const VIEW_ROWS: &[(ModeKey, ModeKey, &str)] = &[
+    (ModeKey::ViewDown, ModeKey::ViewUp, "the row below / above"),
+    (
+        ModeKey::ViewPageDown,
+        ModeKey::ViewPageUp,
+        "a page on / back",
+    ),
+    (
+        ModeKey::ViewOpen,
+        ModeKey::ViewClose,
+        "open / close, or back",
+    ),
+];
+
+/// How the overlay writes two of the views' keys: their own keys, which
+/// always work, then the first of the others each has, as the user's
+/// `[keys]` or the defaults give them: `↓/↑ j/k`, `Enter/Esc q`.
+fn view_label(keymap: &Keymap, one: ModeKey, other: ModeKey) -> String {
+    let own = |key: ModeKey| {
+        let own = keymap::mode_spec_of(key).own;
+        own.and_then(|own| Chord::parse(own).ok())
+            .map_or(String::new(), |own| own.label())
+    };
+    let first = |key: ModeKey| keymap.mode_keys(key).first().map(Chord::label);
+    let mut label = format!("{}/{}", own(one), own(other));
+    match (first(one), first(other)) {
+        (None, None) => {}
+        (Some(one), None) => label += &format!(" {one}/-"),
+        (None, Some(other)) => label += &format!(" {other}"),
+        (Some(one), Some(other)) => label += &format!(" {one}/{other}"),
+    }
+    label
 }
 
 /// The widest key label in `column`, which the others are padded out to.
@@ -630,6 +719,49 @@ mod tests {
         assert!(labels.contains(&"Ctrl+G"), "{labels:?}");
         assert!(labels.contains(&"Ctrl+A, a key"), "{labels:?}");
         assert!(!labels.contains(&"|/-"), "{labels:?}");
+    }
+
+    #[test]
+    fn the_overlay_lists_the_users_own_keys_where_they_work() {
+        let toml = r#"
+prefix = ["ctrl+b", "ctrl+a"]
+pane-left = ["shift+left", "direct+ctrl+alt+h"]
+view-down = "ctrl+j"
+resize-even = "e"
+
+[[command]]
+key = "direct+ctrl+alt+g"
+type = "popup"
+command = "lazygit"
+description = "git in a popup, over everything, until it ends"
+"#;
+        let settings: keymap::KeySettings = toml::from_str(toml).unwrap();
+        let keymap = Keymap::new(&settings).unwrap();
+        let rows = rows(&Shown {
+            plugin_on: &|_| true,
+            plugin_keys: &[],
+            keymap: &keymap,
+        });
+        let row = |section: Section, label: &str| {
+            rows.iter()
+                .find(|row| row.section == section && row.label == label)
+                .map(|row| row.does.as_str())
+        };
+        assert_eq!(
+            row(Section::Commands, "Ctrl+Alt+G"),
+            Some("git in a popup, over everyth…")
+        );
+        assert_eq!(
+            row(Section::Pane, "Ctrl+Alt+H"),
+            Some("the pane to the left")
+        );
+        assert!(row(Section::Pane, "Ctrl+B/Ctrl+A, a key").is_some());
+        assert!(row(Section::View, "↓/↑ Ctrl+J/k").is_some(), "{rows:?}");
+        assert!(row(Section::Resize, "e").is_some(), "{rows:?}");
+        let defaults = all_rows();
+        assert!(defaults.iter().all(|row| row.section != Section::Commands));
+        assert!(defaults.iter().any(|row| row.label == "↓/↑ j/k"));
+        assert!(defaults.iter().any(|row| row.label == "Enter/Esc q"));
     }
 
     #[test]

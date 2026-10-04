@@ -86,10 +86,13 @@ whenever what's handed over changes in a way the crystal before couldn't read.
     having rung, putting on the clipboard what a pane's program copies (not a background task's); taking the
     mouse from the terminal or leaving it there (`[mouse] capture`), counting clicks for double- and
     triple-clicks, scrolling a pane's history on a timer while a drag selecting in it is held past its edge,
-    and sending a pager the wheel as arrow keys; and having git count the changes of the worktrees the sidebar
-    shows, off the loop
+    and sending a pager the wheel as arrow keys; having git count the changes of the worktrees the sidebar
+    shows, off the loop; and running the user's own keys' commands: a popup over everything, a session in a
+    pane or a tab, or a command in the background that says only when it fails
   - `app.rs`: the state and how keys and the mouse change it: a sidebar key looked up in the keymap and its
-    command run, from the sidebar, the `:` list or after the prefix in a pane; the sidebar's width, folded or
+    command run, from the sidebar, the `:` list, after the prefix in a pane or in a pane without it for a key
+    written `direct+`; a plugin's first key waiting for its second; a key in a view taken as the key the user
+    gave it stands for; the user's own keys' commands made ready (a split, a tab); the sidebar's width, folded or
     not, what needs the user pinned at its top, and the projects folded down to their headings, the selection
     resting on one out of sight; no I/O, so it's unit-tested
     - `app/commands.rs`: the layout commands carried out on the state, each on the tab holding the session it's
@@ -128,10 +131,16 @@ whenever what's handed over changes in a way the crystal before couldn't read.
     out
   - `keymap.rs`: the sidebar's commands, each with the id `[keys]` names it by, what it does and its default
     keys; keys as the config writes them and as terminals send them, folded into one form; the config's
-    keys laid over the defaults, a key given to one command taken from the one that had it; the prefix and
-    the key that hands the keyboard back; the `?` overlay's rows of sidebar keys; and `crystal keys`'s list
-  - `command_list.rs`: the command list (`:`): every command and plugin action by name, with its keys,
-    filtered as you type, the latest run first; its state and keys, kept apart from I/O, and its drawing
+    keys laid over the defaults, a key given to one command taken from the one that had it, and those written
+    `direct+`, which work in a pane without the prefix; the prefixes and the key that hands the keyboard back;
+    the modes' keys, each mode a table of its own (answering, resize mode and the views', a view's standing
+    for the key every view takes for it); the user's own keys, `[[keys.command]]`, and what each runs (a
+    popup, a pane, a tab, a command in the background or a plugin's action); a plugin's key, one or two
+    pressed one after the other, and the keys kept from plugins; the `?` overlay's rows of sidebar keys and
+    resize mode's; and `crystal keys`'s list
+  - `command_list.rs`: the command list (`:`): every command, the user's own keys' commands and plugin action
+    by name, with its keys, filtered as you type, the latest run first; its state and keys, kept apart from
+    I/O, and its drawing
   - `status.rs`: a session's status as the TUI shows it, and its mark
   - `theme.rs`: every color, named for what it's for, and `THEMES`, the one table of every theme by its names:
     crystal's own `dark`, `light` and `terminal`, and the well-known schemes (catppuccin, nord, …), each a
@@ -147,10 +156,11 @@ whenever what's handed over changes in a way the crystal before couldn't read.
     killed; worked out on threads that stop with their `Watch`, the event loop told only of a change
   - `mouse.rs`: writes mouse events the way a program in a pane asked for them, and the wheel as arrow keys for
     a program on the alternate screen that didn't ask (xterm's alternate scroll)
-  - `help.rs`: the overlay `?` opens, a key a row: the sidebar's from the keymap, written as the user's
-    `[keys]` has them, the rest from one table; its sections flowed into columns as tall as the terminal, two
-    to a page, the pages turned with the arrows; a test keeps the README's table of sidebar keys in step with
-    the defaults
+  - `help.rs`: the overlay `?` opens, a key a row: the sidebar's, the user's own, those that work in a pane
+    without the prefix, resize mode's and the views' from the keymap, written as the user's `[keys]` has
+    them, the rest from one table; its sections flowed into columns as tall as the terminal, two to a page,
+    the pages turned with the arrows; a test keeps the README's table of sidebar keys in step with the
+    defaults
   - `groups.rs`: the sidebar's order and headings: sessions by project, then worktree, agents before
     terminals, a session's task and the line reported for it under it, each flow run's steps under it, and
     linked worktrees with no sessions left at the end of their project, Claude Code's own last

@@ -1511,8 +1511,10 @@ fn a_question_mark_shows_every_key_and_the_next_key_only_closes_it() {
     tui.type_keys("?");
     tui.shows("In the sidebar");
     tui.shows("all needing you");
-    // 80 by 24 takes two pages; space turns to the next.
-    tui.shows("1/2");
+    // 80 by 24 takes three pages; space turns to the next.
+    tui.shows("1/3");
+    tui.type_keys(" ");
+    tui.shows("In resize mode");
     tui.type_keys(" ");
     tui.shows("With the mouse");
 
@@ -12546,6 +12548,68 @@ fn keys_the_config_gives_run_their_commands_and_colon_lists_every_one() {
     tui.shows("quit the TUI");
     tui.type_keys("\r");
     assert!(tui.exit());
+}
+
+#[test]
+fn a_key_of_the_users_own_opens_a_popup_from_a_pane_or_runs_in_the_background() {
+    let crystal = Crystal::new();
+    let dir = crystal.dir.path();
+    let config = format!(
+        r#"
+[keys]
+prefix = ["ctrl+b", "ctrl+a"]
+
+[[keys.command]]
+key = "direct+ctrl+alt+g"
+type = "popup"
+command = "echo 'the popup says hi'; read -r line; echo \"got $line\" > {got}"
+description = "the board"
+width = "60%"
+
+[[keys.command]]
+key = "ctrl+t"
+type = "shell"
+command = "echo \"$CRYSTAL_SESSION\" > {ran}"
+
+[[keys.command]]
+key = "ctrl+e"
+type = "shell"
+command = "echo 'it broke' >&2; exit 3"
+description = "break"
+"#,
+        got = dir.join("got").display(),
+        ran = dir.join("ran").display(),
+    );
+    crystal.configure(&config);
+    let keys = crystal.ok(&["keys"]);
+    assert!(keys.contains("[[keys.command]]"), "{keys}");
+    assert!(keys.contains("direct+ctrl+alt+g"), "{keys}");
+    assert!(keys.contains("ctrl+b ctrl+a"), "{keys}");
+
+    let mut tui = crystal.tui();
+    crystal.ok(&["new", "-n", "agent", "sleep", "30"]);
+    tui.shows("agent");
+    // A sidebar key runs its command in the background, about the session.
+    tui.type_keys("\x14");
+    assert_eq!(written(&dir.join("ran")), "agent\n");
+    // One that fails says so, with the last of what it said.
+    tui.type_keys("\x05");
+    tui.shows("break failed (exit status: 3): it broke");
+
+    // From inside the pane, with no prefix, the popup opens with the
+    // keyboard; its program ending closes it.
+    tui.type_keys("\r");
+    tui.shows("typing into");
+    tui.type_keys("\x1b\x07");
+    tui.shows("the popup says hi");
+    tui.shows(" the board ");
+    assert!(crystal.row("board").is_some());
+    tui.type_keys("hello\r");
+    assert_eq!(written(&dir.join("got")), "got hello\n");
+    tui.hides("the popup says hi");
+    eventually("its session ends with it", || {
+        crystal.row("board").is_none()
+    });
 }
 
 #[test]

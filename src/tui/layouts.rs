@@ -278,6 +278,12 @@ impl LayoutsView {
         Some(format!("remove {name}? y/n"))
     }
 
+    /// Whether a key typed is a character, not a move: while a name is
+    /// typed, or `x` asks.
+    pub fn typing(&self) -> bool {
+        self.naming.is_some() || self.removing.is_some()
+    }
+
     pub fn on_key(&mut self, key: &KeyEvent) -> Step {
         if let Some(which) = self.removing.take() {
             return match key.code {

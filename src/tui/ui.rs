@@ -5,7 +5,7 @@
 //! it never changes it.
 
 use super::app::{
-    App, Counted, Filter, Focus, Hit, OpenOnForge, PluginPane, Prompt, Question, Slot, View,
+    App, Counted, Filter, Focus, Hit, OpenOnForge, PluginPane, Popup, Prompt, Question, Slot, View,
 };
 use super::archived_view;
 use super::backlog_view::{self, BacklogView};
@@ -16,7 +16,7 @@ use super::finder;
 use super::grep;
 use super::help;
 use super::issues;
-use super::keymap::Command;
+use super::keymap::{Command, Extent, ModeKey};
 use super::launcher;
 use super::layouts::{self, LayoutsView};
 use super::memory_view;
@@ -560,17 +560,28 @@ pub fn draw(frame: &mut Frame, app: &App, panes: &[Pane], overlay: Option<&Pane>
     }
 }
 
-/// Where a plugin's pane goes: over every pane, beside the sidebar.
-fn plugin_pane_area(areas: &Areas) -> Rect {
-    let left = areas.rule.right();
+/// Where a plugin's pane goes: over every pane, beside the sidebar; or a
+/// popup, as big as it says, in the middle of everything but the tab bar
+/// and the footer.
+fn plugin_pane_area(areas: &Areas, popup: Option<&Popup>) -> Rect {
     let main = areas.main;
-    Rect::new(left, main.y, main.right().saturating_sub(left), main.height)
+    let Some(popup) = popup else {
+        let left = areas.rule.right();
+        return Rect::new(left, main.y, main.right().saturating_sub(left), main.height);
+    };
+    // A frame and a cell inside it, however small the terminal.
+    let width = Extent::of(popup.width.as_ref(), main.width).max(3);
+    let height = Extent::of(popup.height.as_ref(), main.height).max(3);
+    let (width, height) = (width.min(main.width), height.min(main.height));
+    let x = main.x + (main.width - width) / 2;
+    let y = main.y + (main.height - height) / 2;
+    Rect::new(x, y, width, height)
 }
 
-/// The part of a plugin's pane its program's screen takes: inside its
-/// frame.
-pub fn plugin_pane_screen(areas: &Areas) -> Rect {
-    Block::bordered().inner(plugin_pane_area(areas))
+/// The part of a plugin's pane or a popup its program's screen takes:
+/// inside its frame.
+pub fn plugin_pane_screen(areas: &Areas, popup: Option<&Popup>) -> Rect {
+    Block::bordered().inner(plugin_pane_area(areas, popup))
 }
 
 /// A plugin's pane: its program's screen in a frame, its title on top and
@@ -584,16 +595,13 @@ fn draw_plugin_pane(
     look_hand_back: &str,
 ) {
     let theme = look.theme;
-    let area = plugin_pane_area(areas);
+    let area = plugin_pane_area(areas, open.popup.as_ref());
     frame.render_widget(Clear, area);
     let title = Style::new().fg(theme.accent).add_modifier(Modifier::BOLD);
     let block = Block::bordered()
         .border_style(Style::new().fg(theme.accent))
         .style(theme.base())
-        .title(Line::styled(
-            format!(" {} · {} ", open.plugin, open.title),
-            title,
-        ))
+        .title(Line::styled(open.heading(), title))
         .title_bottom(Line::styled(
             format!(" {} closes ", look_hand_back),
             Style::new().fg(theme.muted),
@@ -1269,13 +1277,16 @@ fn draw_footer(frame: &mut Frame, app: &App, panes: &[Pane], look: &Look, area: 
     } else if let Some(view) = app.profiles_view() {
         frame.render_widget(hint_spans(profiles::hints(view), theme), area);
     } else if app.plugins_view().is_some() {
-        frame.render_widget(hint_spans(plugins_view::HINTS, theme), area);
+        let hints = as_keys_are(app, plugins_view::HINTS, false);
+        frame.render_widget(hint_spans(&borrowed(&hints), theme), area);
     } else if app.settings_view().is_some() {
-        frame.render_widget(hint_spans(settings_view::HINTS, theme), area);
+        let hints = as_keys_are(app, settings_view::HINTS, false);
+        frame.render_widget(hint_spans(&borrowed(&hints), theme), area);
     } else if let Some(prompt) = app.prompt() {
         draw_prompt(frame, theme, prompt, area);
     } else if let Some(view) = app.needs_you_view() {
-        draw_notice_or(frame, app.notice(), needs_you::hints(view), theme, area);
+        let hints = as_keys_are(app, needs_you::hints(view), true);
+        draw_notice_or(frame, app.notice(), &borrowed(&hints), theme, area);
     } else if app.timeline_view().is_some() {
         draw_notice_or(frame, app.notice(), timeline::HINTS, theme, area);
     } else if let Some(view) = app.issues_view() {
@@ -1408,6 +1419,9 @@ fn draw_view_footer(frame: &mut Frame, app: &App, view: &View, look: &Look, area
     };
     let mut spans = vec![Span::raw(" ")];
     for (key, does) in hints {
+        let Some(key) = as_key_is(app, &key, false) else {
+            continue;
+        };
         spans.push(Span::styled(key, Style::new().fg(theme.text)));
         spans.push(Span::styled(
             format!(" {does}  "),
@@ -1437,6 +1451,16 @@ fn question_line<'a>(question: &str, theme: &Theme) -> Line<'a> {
 #[derive(Debug, Clone, Copy)]
 enum Hint {
     Run(Command, &'static str),
+    /// A mode's key, like answering's.
+    Mode(ModeKey, &'static str),
+    /// A few commands' or modes' keys, written as the label says while
+    /// they're the defaults, or else each one's first, `/` between them.
+    Keys(
+        &'static str,
+        &'static [Command],
+        &'static [ModeKey],
+        &'static str,
+    ),
     Key(&'static str, &'static str),
     HandBack(&'static str),
     Prefix(&'static str),
@@ -1450,6 +1474,10 @@ fn written(app: &App, hints: &[Hint]) -> Vec<(String, String)> {
         .filter_map(|hint| {
             let (key, does) = match *hint {
                 Hint::Run(command, does) => (keymap.hint(command)?, does),
+                Hint::Mode(key, does) => (keymap.mode_keys(key).first()?.hint(), does),
+                Hint::Keys(label, commands, modes, does) => {
+                    (keymap.row_hint(label, commands, modes)?, does)
+                }
                 Hint::Key(key, does) => (key.to_string(), does),
                 Hint::HandBack(does) => (keymap.hand_back().hint(), does),
                 Hint::Prefix(does) => (keymap.prefix()?.hint(), does),
@@ -1505,9 +1533,9 @@ const GATE_HINTS: &[Hint] = &[
 /// The sidebar's keys while the selected background task asks for a
 /// permission.
 const ASKING_HINTS: &[Hint] = &[
-    Hint::Key("y", "allow"),
-    Hint::Key("n", "deny"),
-    Hint::Key("Y", "always"),
+    Hint::Mode(ModeKey::AnswerYes, "allow"),
+    Hint::Mode(ModeKey::AnswerNo, "deny"),
+    Hint::Mode(ModeKey::AnswerAlways, "always"),
     Hint::Run(Command::Open, "watch"),
     Hint::Run(Command::Kill, "kill"),
     Hint::Run(Command::Quit, "quit"),
@@ -1639,6 +1667,36 @@ fn draw_layouts_footer(
     }
 }
 
+/// A key a view's hints name, as the user's `[keys]` has it: the views'
+/// `j/k`, and with `answers`, the answer keys; `None` when the user left
+/// it with no key.
+fn as_key_is(app: &App, key: &str, answers: bool) -> Option<String> {
+    let keymap = app.keymap();
+    let moved = |modes: &[ModeKey]| keymap.row_hint(key, &[], modes);
+    match key {
+        "j/k" => Some(moved(&[ModeKey::ViewDown, ModeKey::ViewUp]).unwrap_or("↓/↑".into())),
+        "y" if answers => moved(&[ModeKey::AnswerYes]),
+        "n" if answers => moved(&[ModeKey::AnswerNo]),
+        "Y" if answers => moved(&[ModeKey::AnswerAlways]),
+        key => Some(key.to_string()),
+    }
+}
+
+/// [`as_key_is`] for each of `hints`.
+fn as_keys_are<'a>(app: &App, hints: &[(&str, &'a str)], answers: bool) -> Vec<(String, &'a str)> {
+    hints
+        .iter()
+        .filter_map(|&(key, does)| Some((as_key_is(app, key, answers)?, does)))
+        .collect()
+}
+
+fn borrowed<'a>(hints: &'a [(String, &'a str)]) -> Vec<(&'a str, &'a str)> {
+    hints
+        .iter()
+        .map(|(key, does)| (key.as_str(), *does))
+        .collect()
+}
+
 /// A line of key hints, keys a touch brighter than what they do.
 fn hint_spans<'a>(hints: &[(&str, &str)], theme: &Theme) -> Line<'a> {
     let mut spans = vec![Span::raw(" ")];
@@ -1701,7 +1759,7 @@ const PANE_HINTS: &[Hint] = &[
 /// The keys a background task's pane takes, while it has the keyboard.
 const TASK_PANE_HINTS: &[Hint] = &[
     Hint::HandBack("sidebar"),
-    Hint::Key("y/n/Y", "answer"),
+    Hint::Keys("y/n/Y", &[], ANSWERS, "answer"),
     Hint::Key("ctrl+c", "stop the run"),
     Hint::Key("space", "follow-up"),
     Hint::Prefix("then a command's key"),
@@ -1716,12 +1774,41 @@ const PREFIXED_HINTS: &[Hint] = &[
     Hint::Key("esc", "never mind"),
 ];
 
+/// The keys after the first of a plugin's two.
+const PENDING_HINTS: &[Hint] = &[
+    Hint::Key("its second key", "runs it"),
+    Hint::Key("esc", "never mind"),
+];
+
+/// The answer keys.
+const ANSWERS: &[ModeKey] = &[ModeKey::AnswerYes, ModeKey::AnswerNo, ModeKey::AnswerAlways];
+
 /// The keys in resize mode.
 const RESIZE_HINTS: &[Hint] = &[
-    Hint::Key("h/j/k/l", "move a border"),
-    Hint::Key("=", "even out"),
-    Hint::Key("esc", "done"),
-    Hint::Key("shift+arrows", "another pane"),
+    Hint::Keys(
+        "h/j/k/l",
+        &[],
+        &[
+            ModeKey::ResizeLeft,
+            ModeKey::ResizeDown,
+            ModeKey::ResizeUp,
+            ModeKey::ResizeRight,
+        ],
+        "move a border",
+    ),
+    Hint::Mode(ModeKey::ResizeEven, "even out"),
+    Hint::Mode(ModeKey::ResizeDone, "done"),
+    Hint::Keys(
+        "shift+arrows",
+        &[
+            Command::PaneLeft,
+            Command::PaneDown,
+            Command::PaneUp,
+            Command::PaneRight,
+        ],
+        &[],
+        "another pane",
+    ),
 ];
 
 /// Where the keyboard is, then the keys that matter most there, as many as
@@ -1740,7 +1827,17 @@ fn hints_line<'a>(
             Span::styled(name.to_string(), Style::new().fg(theme.accent)),
         ]
     };
+    let lead = |text: String| {
+        vec![Span::styled(
+            text,
+            Style::new().fg(theme.accent).add_modifier(Modifier::BOLD),
+        )]
+    };
     let (mut spans, hints) = match app.focus() {
+        _ if app.pending().is_some() => {
+            let first = app.pending().map(|first| first.hint()).unwrap_or_default();
+            (lead(format!(" {first} …")), written(app, PENDING_HINTS))
+        }
         Focus::Sidebar if app.resizing() => (
             doing("resizing", app.selected()),
             written(app, RESIZE_HINTS),
@@ -1751,11 +1848,7 @@ fn hints_line<'a>(
         ),
         Focus::Pane(_) if app.prefixed() => {
             let prefix = app.keymap().prefix().map(|p| p.hint()).unwrap_or_default();
-            let lead = vec![Span::styled(
-                format!(" {prefix} …"),
-                Style::new().fg(theme.accent).add_modifier(Modifier::BOLD),
-            )];
-            (lead, written(app, PREFIXED_HINTS))
+            (lead(format!(" {prefix} …")), written(app, PREFIXED_HINTS))
         }
         Focus::Pane(slot) if app.pane_shows_task(slot) => (
             doing("in", app.pane_session(slot)),
@@ -2100,13 +2193,24 @@ mod tests {
         let mut app = App::new(None);
         app.on_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
         let text = screen_text_at(&app, 80, 24).join("\n");
-        for on_screen in ["In the sidebar", "select a session", "1/2 · ← → turn"] {
+        for on_screen in ["In the sidebar", "select a session", "1/3 · ← → turn"] {
             assert!(text.contains(on_screen), "{on_screen} isn't on screen");
         }
-        app.on_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
-        let text = screen_text_at(&app, 80, 24).join("\n");
-        for on_screen in ["In a pane", "Ctrl+\\", "With the mouse", "2/2"] {
-            assert!(text.contains(on_screen), "{on_screen} isn't on screen");
+        let mut rest = String::new();
+        for _ in 0..2 {
+            app.on_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+            rest += &screen_text_at(&app, 80, 24).join("\n");
+        }
+        let pages = [
+            "In a pane",
+            "Ctrl+\\",
+            "In resize mode",
+            "In a view",
+            "With the mouse",
+            "3/3",
+        ];
+        for on_screen in pages {
+            assert!(rest.contains(on_screen), "{on_screen} isn't on screen");
         }
     }
 

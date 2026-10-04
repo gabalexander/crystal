@@ -376,6 +376,12 @@ impl DiffView {
         !files.is_empty() && files.iter().all(|file| self.is_reviewed(*file))
     }
 
+    /// Whether a key typed is a character, not a move: while the filter
+    /// has the keyboard.
+    pub fn typing(&self) -> bool {
+        self.filtering
+    }
+
     /// How many files are marked reviewed.
     pub fn reviewed_count(&self) -> usize {
         (0..self.files().len())

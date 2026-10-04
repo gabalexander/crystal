@@ -20,7 +20,10 @@ use super::grep::Grep;
 use super::groups::{self, Row};
 use super::help;
 use super::issues::{self, IssuesView};
-use super::keymap::{Command, Keymap};
+use super::keymap::{
+    Bound, Chord, Command, CommandKind, KeyCommand, Keymap, Mode, ModeKey, Sequence, SplitWay,
+    Translated,
+};
 use super::launcher::{self, Launcher, Memory, Run, Setup, Target};
 use super::layouts::{self, Layouts, LayoutsView, Program, Programs, Which};
 use super::memory_view::MemoryView;
@@ -626,6 +629,14 @@ pub enum Action {
         pane: String,
         context: plugins::Context,
     },
+    /// Run one of the user's `[[keys.command]]`s, about `context`: in a
+    /// popup, in a session in `dir` (the pane or tab it's in made ready
+    /// already), or in the background.
+    RunKeyCommand {
+        command: Box<KeyCommand>,
+        dir: Option<PathBuf>,
+        context: plugins::Context,
+    },
     /// Type into the plugin's pane that's open.
     TypeInPluginPane(KeyEvent),
     PasteInPluginPane(String),
@@ -664,20 +675,43 @@ impl Action {
 /// took, if it took one: the `:` list offers every one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PluginKey {
-    pub key: Option<char>,
+    pub key: Option<Sequence>,
     pub plugin: String,
     pub action: String,
     pub title: String,
 }
 
 /// A plugin's pane, open over the panes: a session of its own, which ends
-/// when the pane closes.
+/// when the pane closes. A `[[keys.command]]` popup is one too, with no
+/// plugin.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PluginPane {
     pub plugin: String,
     pub title: String,
     /// The session's name.
     pub session: String,
+    /// A popup's width and height: a plugin's pane takes all the room
+    /// beside the sidebar.
+    pub popup: Option<Popup>,
+}
+
+/// How big a `[[keys.command]]` popup is: see [`keymap::Extent`].
+///
+/// [`keymap::Extent`]: super::keymap::Extent
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Popup {
+    pub width: Option<super::keymap::Extent>,
+    pub height: Option<super::keymap::Extent>,
+}
+
+impl PluginPane {
+    /// What its frame says on top.
+    pub fn heading(&self) -> String {
+        match self.popup {
+            Some(_) => format!(" {} ", self.title),
+            None => format!(" {} · {} ", self.plugin, self.title),
+        }
+    }
 }
 
 /// The sidebar narrowed to what matches what's typed, while `/` is open:
@@ -941,6 +975,9 @@ pub struct App {
     /// Whether the prefix was pressed in a pane: the next key is a
     /// command's.
     prefixed: bool,
+    /// The first of a plugin's two keys, pressed: the next key is the
+    /// second.
+    pending: Option<Chord>,
     /// The `:` list, while it's open.
     command_list: Option<CommandList>,
     /// What was run from the `:` list lately, the latest first.
@@ -1090,6 +1127,7 @@ impl App {
             restarted: None,
             keymap: Keymap::default(),
             prefixed: false,
+            pending: None,
             command_list: None,
             recent_commands: Vec::new(),
             sidebar: Shape::default(),
@@ -1293,10 +1331,7 @@ impl App {
             .iter()
             .filter_map(|taken| {
                 let key = taken.key?;
-                Some((
-                    key.to_string(),
-                    format!("{}: {}", taken.plugin, taken.title),
-                ))
+                Some((key.label(), format!("{}: {}", taken.plugin, taken.title)))
             })
             .collect()
     }
@@ -3235,8 +3270,10 @@ impl App {
         self.notice = None;
         self.away_shown = false;
         self.restarted = None;
-        // The prefix is for the very next key, wherever it goes.
+        // The prefix is for the very next key, wherever it goes, and so is
+        // a plugin's first key.
         let prefixed = std::mem::take(&mut self.prefixed);
+        let pending = self.pending.take();
         // A plugin's pane is over everything, and has every key but the one
         // that closes it.
         if self.plugin_pane.is_some() {
@@ -3245,6 +3282,8 @@ impl App {
             }
             return Some(Action::TypeInPluginPane(key));
         }
+        // The keys the user gave the views stand for the views' own.
+        let key = self.as_views_take(key)?;
         // An open view has every key until it's closed.
         if self.view.is_some() {
             return self.on_view_key(key);
@@ -3346,6 +3385,9 @@ impl App {
         if self.resizing {
             self.on_resize_key(key);
             return None;
+        }
+        if let Some(first) = pending {
+            return self.second_key(first, key);
         }
         match self.focus {
             Focus::Sidebar => self.on_sidebar_key(key),
@@ -3873,39 +3915,83 @@ impl App {
         if self.keymap.is_prefix(&key) {
             return None;
         }
-        let ctrl_or_alt = key
-            .modifiers
-            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
-        // On a background task asking for a permission, `y`, `n` and `Y`
-        // answer it; `n` is a new session again once it's answered.
-        if !ctrl_or_alt
-            && let Some(answer) = answer_key(key.code)
+        // On a background task asking for a permission, the answer keys,
+        // `y`, `n` and `Y`, answer it; `n` is a new session again once it's
+        // answered.
+        let answer = self.keymap.mode_key(Mode::Answer, &key).map(answer_of);
+        if let Some(answer) = answer
             && let Some(name) = self.selected().filter(|s| s.asking.is_some())
         {
             let name = name.name.clone();
             return Some(Action::Answer { name, answer });
         }
-        if let Some(command) = self.keymap.command(&key) {
-            return self.run(command);
+        if let Some(bound) = self.keymap.bound(&key) {
+            return self.run_bound(bound);
         }
-        // Ctrl or Alt with a letter isn't that letter. Ctrl+J is a line feed,
-        // which a terminal sends as it closes, and it mustn't move the
-        // selection: showing a session counts as having seen it.
-        if ctrl_or_alt {
-            return None;
+        if let Some(ran) = self.plugin_key(&key) {
+            return ran;
         }
-        match key.code {
-            KeyCode::Char('y' | 'Y') => {
-                let not_asking = |s: &SessionInfo| format!("{} isn't asking for anything", s.name);
-                let notice = self
-                    .selected()
-                    .map_or_else(|| "there's no session selected".into(), not_asking);
-                self.notify(notice);
-                None
+        if answer.is_some() {
+            let not_asking = |s: &SessionInfo| format!("{} isn't asking for anything", s.name);
+            let notice = self
+                .selected()
+                .map_or_else(|| "there's no session selected".into(), not_asking);
+            self.notify(notice);
+        }
+        None
+    }
+
+    /// Runs what a key is bound to: one of crystal's commands, or one of
+    /// the user's own.
+    fn run_bound(&mut self, bound: Bound) -> Option<Action> {
+        match bound {
+            Bound::Command(command) => self.run(command),
+            Bound::Custom(index) => {
+                let command = self.keymap.custom().get(index)?.0.clone();
+                self.run_key_command(command)
             }
-            KeyCode::Char(c) => self.run_plugin_key(c),
-            _ => None,
         }
+    }
+
+    /// Runs one of the user's `[[keys.command]]`s, about the selected
+    /// session: a plugin's action, as its own key would; for a pane or a
+    /// tab, it's split off the selected session's pane or made first, for
+    /// the session that runs the command to go to; a popup's and one in the
+    /// background, the event loop starts as they are.
+    fn run_key_command(&mut self, command: KeyCommand) -> Option<Action> {
+        let context = self.selected_context();
+        if command.kind == CommandKind::Plugin {
+            let (plugin, action) = command.plugin_action()?;
+            let (plugin, action) = (plugin.to_string(), action.to_string());
+            return Some(Action::RunPlugin {
+                plugin,
+                action,
+                context,
+            });
+        }
+        let followed = self.selected().map(|session| session.cwd.clone());
+        let dir = match command.kind {
+            CommandKind::Tab => {
+                let index = self.tabs.add();
+                self.go_to_tab(index);
+                self.start_dir.clone().or(followed)
+            }
+            CommandKind::Pane => {
+                let way = match command.split {
+                    Some(SplitWay::Right) => Way::Right,
+                    Some(SplitWay::Down) => Way::Down,
+                    None => self.way_to_split(),
+                };
+                self.split_pane(way, HALF);
+                followed
+            }
+            _ => followed,
+        };
+        Some(Action::RunKeyCommand {
+            command: Box::new(command),
+            dir,
+            context,
+        })
     }
 
     /// Runs `command`, as its key does in the sidebar: from the sidebar,
@@ -4055,6 +4141,7 @@ impl App {
                         action,
                         context: self.selected_context(),
                     }),
+                    Pick::Custom(command) => self.run_key_command(command),
                 }
             }
         }
@@ -4078,33 +4165,69 @@ impl App {
             self.focus = Focus::Sidebar;
             return None;
         }
-        match self.keymap.command(&key) {
-            Some(command) => self.run(command),
+        if let Some(bound) = self.keymap.bound(&key) {
+            return self.run_bound(bound);
+        }
+        if let Some(ran) = self.plugin_key(&key) {
+            return ran;
+        }
+        let prefix = self.keymap.prefix().map(|p| p.hint()).unwrap_or_default();
+        let commands = self.keymap.hint(Command::Commands);
+        let list = commands.map_or(String::new(), |key| format!(": {prefix} {key} lists them"));
+        let written = Chord::of(&key).hint();
+        self.notify(format!("{written} runs no command{list}"));
+        None
+    }
+
+    /// What `key` does as an installed plugin's: runs the action that took
+    /// it, about the selected session, or waits for the second of the two
+    /// keys an action took. `None` when it's no plugin's.
+    fn plugin_key(&mut self, key: &KeyEvent) -> Option<Option<Action>> {
+        let chord = Chord::of(key);
+        let taken = self
+            .plugin_keys
+            .iter()
+            .find(|taken| taken.key.is_some_and(|key| key.first() == chord))?;
+        if taken.key.and_then(|key| key.then()).is_some() {
+            self.pending = Some(chord);
+            return Some(None);
+        }
+        Some(self.run_plugin_action(taken))
+    }
+
+    /// The key after the first of a plugin's two: the second of an action's
+    /// runs it; Esc lets the first go, and any other runs nothing.
+    fn second_key(&mut self, first: Chord, key: KeyEvent) -> Option<Action> {
+        if key.code == KeyCode::Esc {
+            return None;
+        }
+        let second = Chord::of(&key);
+        let taken = self.plugin_keys.iter().find(|taken| {
+            taken
+                .key
+                .is_some_and(|key| key.first() == first && key.then() == Some(second))
+        });
+        match taken {
+            Some(taken) => self.run_plugin_action(taken),
             None => {
-                let prefix = self.keymap.prefix().map(|p| p.hint()).unwrap_or_default();
-                let commands = self.keymap.hint(Command::Commands);
-                let list =
-                    commands.map_or(String::new(), |key| format!(": {prefix} {key} lists them"));
-                let written = super::keymap::Chord::of(&key).hint();
-                self.notify(format!("{written} runs no command{list}"));
+                self.notify(format!("{first} {second} runs nothing"));
                 None
             }
         }
     }
 
-    /// Runs the plugin action that took `key`, about the selected session,
-    /// if one did.
-    fn run_plugin_key(&mut self, key: char) -> Option<Action> {
-        let taken = self
-            .plugin_keys
-            .iter()
-            .find(|taken| taken.key == Some(key))?;
-        let (plugin, action) = (taken.plugin.clone(), taken.action.clone());
+    /// Runs `taken`'s action, about the selected session.
+    fn run_plugin_action(&self, taken: &PluginKey) -> Option<Action> {
         Some(Action::RunPlugin {
-            plugin,
-            action,
+            plugin: taken.plugin.clone(),
+            action: taken.action.clone(),
             context: self.selected_context(),
         })
+    }
+
+    /// The first of a plugin's two keys, while the next key is its second.
+    pub fn pending(&self) -> Option<Chord> {
+        self.pending
     }
 
     /// What a plugin's action or pane is told about where it was run from:
@@ -4260,6 +4383,87 @@ impl App {
     }
 
     /// Keys while a view is open: they're all the view's.
+    /// `key` as what has the keyboard takes it, by the keys the user gave
+    /// the views and the needs-you view's answers: itself, or the key it
+    /// stands for; `None` for a default the user took from them.
+    fn as_views_take(&self, key: KeyEvent) -> Option<KeyEvent> {
+        let Some((typing, answers)) = self.view_taking_keys() else {
+            return Some(key);
+        };
+        if answers {
+            match self.keymap.translate(Mode::Answer, &key, typing) {
+                Translated::Same => {}
+                Translated::As(own) => return Some(own),
+                Translated::Nothing => return None,
+            }
+        }
+        match self.keymap.translate(Mode::View, &key, typing) {
+            Translated::Same => Some(key),
+            Translated::As(own) => Some(own),
+            Translated::Nothing => None,
+        }
+    }
+
+    /// Whether what has the keyboard is a view that takes the views' keys,
+    /// in the order [`App::take_key`] hands keys out; and if it is,
+    /// whether a character is typed there just now, and whether it takes
+    /// the answers too, as the needs-you view does. A form, a question or
+    /// a menu takes none.
+    fn view_taking_keys(&self) -> Option<(bool, bool)> {
+        if let Some(view) = &self.view {
+            let typing = match view {
+                View::Diff(diff) => diff.typing(),
+                View::Memory(memory) => memory.typing(),
+                View::Files(_) | View::Tree(_) | View::Grep(_) | View::Branches(_) => true,
+            };
+            return Some((typing, false));
+        }
+        let asking = self.menu.is_some()
+            || self.keys_page.is_some()
+            || self.confirm.is_some()
+            || self.moving.is_some()
+            || self.closing.is_some()
+            || self.reply.is_some();
+        if asking {
+            return None;
+        }
+        if self.command_list.is_some() {
+            return Some((true, false));
+        }
+        if let Some(backlog) = &self.backlog {
+            return Some((backlog.typing(), false));
+        }
+        if let Some(layouts) = &self.layouts {
+            return Some((layouts.typing(), false));
+        }
+        if let Some(archived) = &self.archived {
+            return Some((archived.typing(), false));
+        }
+        if self.launcher.is_some() || self.profiles_view.is_some() {
+            return None;
+        }
+        if self.plugins_view.is_some() || self.settings.is_some() {
+            return Some((false, false));
+        }
+        if self.prompt.is_some() {
+            return None;
+        }
+        if self.needs_you.is_some() {
+            return Some((false, true));
+        }
+        if self.timeline.is_some() {
+            return Some((true, false));
+        }
+        if let Some(issues) = &self.issues {
+            let writing = issues.comment.is_some() || issues.form.is_some();
+            return (!writing).then_some((true, false));
+        }
+        if let Some(view) = &self.pull_requests_view {
+            return view.comment.is_none().then_some((true, false));
+        }
+        self.filter.is_some().then_some((true, false))
+    }
+
     fn on_view_key(&mut self, key: KeyEvent) -> Option<Action> {
         let outcome = match self.view.as_mut()? {
             View::Diff(diff) => diff.on_key(key),
@@ -5347,6 +5551,10 @@ impl App {
     /// scrolled back: they page through the pane's history. Unshifted, the
     /// page keys go to the session like any other.
     fn on_pane_key(&mut self, slot: Slot, key: KeyEvent) -> Option<Action> {
+        // A key the user wrote `direct+` is theirs, not the program's.
+        if let Some(bound) = self.keymap.direct(&key) {
+            return self.run_bound(bound);
+        }
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         match key.code {
             _ if self.keymap.is_hand_back(&key) => {
@@ -5385,7 +5593,7 @@ impl App {
             self.open_reply(&name);
             return None;
         }
-        let answer = answer_key(key.code).filter(|_| !ctrl);
+        let answer = self.keymap.mode_key(Mode::Answer, &key).map(answer_of);
         match answer {
             Some(answer) if session.asking.is_some() => Some(Action::Answer { name, answer }),
             Some(_) => {
@@ -5679,25 +5887,34 @@ impl App {
     }
 
     /// Keys in resize mode: `h` `j` `k` `l` or the arrows move a border of
-    /// the selected session's pane that way, Shift and an arrow go on to
-    /// the pane that way, `=` evens the panes out, and `Esc`, `Enter`, `q`
-    /// or `R` again are done. Other keys do nothing.
+    /// the selected session's pane that way, the keys that select the pane
+    /// that way (Shift and an arrow) go on to it, `=` evens the panes out,
+    /// and `Esc`, `Enter`, `q` or resize's own key again are done, unless
+    /// `[keys]` says other keys. Other keys do nothing.
     fn on_resize_key(&mut self, key: KeyEvent) {
-        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
-        let toward = match key.code {
-            KeyCode::Char('h') => Some(Direction::Left),
-            KeyCode::Char('j') => Some(Direction::Down),
-            KeyCode::Char('k') => Some(Direction::Up),
-            KeyCode::Char('l') => Some(Direction::Right),
-            code => arrow(code),
+        let toward = match self.keymap.mode_key(Mode::Resize, &key) {
+            Some(ModeKey::ResizeLeft) => Direction::Left,
+            Some(ModeKey::ResizeDown) => Direction::Down,
+            Some(ModeKey::ResizeUp) => Direction::Up,
+            Some(ModeKey::ResizeRight) => Direction::Right,
+            Some(ModeKey::ResizeEven) => return self.equalize_panes(),
+            Some(ModeKey::ResizeDone) => {
+                self.resizing = false;
+                return;
+            }
+            _ => {
+                match self.keymap.command(&key) {
+                    Some(Command::Resize) => self.resizing = false,
+                    Some(Command::PaneLeft) => self.focus_toward(Direction::Left),
+                    Some(Command::PaneDown) => self.focus_toward(Direction::Down),
+                    Some(Command::PaneUp) => self.focus_toward(Direction::Up),
+                    Some(Command::PaneRight) => self.focus_toward(Direction::Right),
+                    _ => {}
+                }
+                return;
+            }
         };
-        match (key.code, toward) {
-            (KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q' | 'R'), _) => self.resizing = false,
-            (KeyCode::Char('='), _) => self.equalize_panes(),
-            (code, Some(toward)) if shift && arrow(code).is_some() => self.focus_toward(toward),
-            (_, Some(toward)) => self.resize_pane(toward, resize_step(toward)),
-            _ => {}
-        }
+        self.resize_pane(toward, resize_step(toward));
     }
 
     /// Moves a border of the selected session's pane `cells` columns or
@@ -6165,14 +6382,13 @@ fn resize_step(toward: Direction) -> u16 {
     }
 }
 
-/// The answer a key gives a permission a background task asks for: `y`
-/// yes, `n` no, `Y` yes always.
-fn answer_key(code: KeyCode) -> Option<Answer> {
-    match code {
-        KeyCode::Char('y') => Some(Answer::Allow),
-        KeyCode::Char('n') => Some(Answer::Deny),
-        KeyCode::Char('Y') => Some(Answer::Always),
-        _ => None,
+/// The answer an answer key gives a permission a background task asks
+/// for: `y` yes, `n` no, `Y` yes always, unless `[keys]` says other keys.
+fn answer_of(key: ModeKey) -> Answer {
+    match key {
+        ModeKey::AnswerNo => Answer::Deny,
+        ModeKey::AnswerAlways => Answer::Always,
+        _ => Answer::Allow,
     }
 }
 
@@ -6181,17 +6397,6 @@ fn page_turn(code: KeyCode) -> Option<isize> {
     match code {
         KeyCode::Right | KeyCode::PageDown | KeyCode::Char(' ' | 'l') => Some(1),
         KeyCode::Left | KeyCode::PageUp | KeyCode::Char('h') => Some(-1),
-        _ => None,
-    }
-}
-
-/// The way an arrow key points.
-fn arrow(code: KeyCode) -> Option<Direction> {
-    match code {
-        KeyCode::Left => Some(Direction::Left),
-        KeyCode::Right => Some(Direction::Right),
-        KeyCode::Up => Some(Direction::Up),
-        KeyCode::Down => Some(Direction::Down),
         _ => None,
     }
 }
@@ -8296,6 +8501,276 @@ mod tests {
             matches!(&ran, Some(Action::RunPlugin { plugin, action, .. }) if plugin == "notes" && action == "add"),
             "{ran:?}"
         );
+    }
+
+    fn ctrl_alt(app: &mut App, c: char) -> Option<Action> {
+        let both = KeyModifiers::CONTROL | KeyModifiers::ALT;
+        app.on_key(KeyEvent::new(KeyCode::Char(c), both))
+    }
+
+    #[test]
+    fn a_direct_key_runs_its_command_from_a_pane_and_other_chords_go_to_the_program() {
+        let mut app = with_keys(
+            app_with(&["a", "b"]),
+            "down = [\"j\", \"direct+ctrl+alt+j\"]",
+        );
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.focus(), Focus::Pane(Slot::Selected));
+        assert_eq!(ctrl_alt(&mut app, 'j'), None);
+        assert_eq!(selected_name(&app), Some("b"));
+        assert_eq!(app.focus(), Focus::Pane(Slot::Selected));
+        // One the user didn't write direct+ is the program's.
+        let typed = ctrl_alt(&mut app, 'k');
+        assert!(matches!(typed, Some(Action::Type { .. })), "{typed:?}");
+        // In the sidebar it's a key like any other.
+        ctrl(&mut app, '\\');
+        press(&mut app, KeyCode::Char('k'));
+        ctrl_alt(&mut app, 'j');
+        assert_eq!(selected_name(&app), Some("b"));
+    }
+
+    #[test]
+    fn any_of_the_prefixes_starts_a_command_from_a_pane() {
+        let mut app = with_keys(app_with(&["a", "b"]), "prefix = [\"ctrl+b\", \"ctrl+a\"]");
+        press(&mut app, KeyCode::Enter);
+        ctrl(&mut app, 'a');
+        assert!(app.prefixed());
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(selected_name(&app), Some("b"));
+        ctrl(&mut app, 'b');
+        press(&mut app, KeyCode::Char('k'));
+        assert_eq!(selected_name(&app), Some("a"));
+        // Either, twice, goes to the program as itself.
+        ctrl(&mut app, 'a');
+        let sent = ctrl(&mut app, 'a');
+        assert!(
+            matches!(sent, Some(Action::Type { key, .. }) if key.code == KeyCode::Char('a')),
+            "{sent:?}"
+        );
+    }
+
+    /// `app` with one `[[keys.command]]`, on Ctrl+G, of `kind`.
+    fn with_command(app: App, kind: &str, command: &str) -> App {
+        let toml = format!(
+            "\n[[keys.command]]\nkey = \"direct+ctrl+g\"\ntype = \"{kind}\"\ncommand = \"{command}\"\n"
+        );
+        with_keys(app, &toml)
+    }
+
+    #[test]
+    fn a_popup_or_a_shell_command_of_the_users_runs_about_the_selected_session() {
+        let mut app = with_command(app_with(&["a", "b"]), "popup", "lazygit");
+        press(&mut app, KeyCode::Char('j'));
+        let ran = ctrl(&mut app, 'g');
+        let Some(Action::RunKeyCommand {
+            command,
+            dir,
+            context,
+        }) = ran
+        else {
+            panic!("{ran:?}");
+        };
+        assert_eq!(command.kind, CommandKind::Popup);
+        assert_eq!(command.command, "lazygit");
+        let b = app
+            .sessions
+            .iter()
+            .find(|session| session.name == "b")
+            .unwrap();
+        assert_eq!(dir.as_ref(), Some(&b.cwd));
+        assert_eq!(context.session.as_deref(), Some("b"));
+        // From a pane too, written direct+.
+        let mut app = with_command(app_with(&["a"]), "shell", "make");
+        press(&mut app, KeyCode::Enter);
+        let ran = ctrl(&mut app, 'g');
+        assert!(
+            matches!(&ran, Some(Action::RunKeyCommand { command, .. }) if command.kind == CommandKind::Shell),
+            "{ran:?}"
+        );
+    }
+
+    #[test]
+    fn a_pane_or_tab_command_of_the_users_makes_room_for_its_session_first() {
+        let mut app = with_command(app_with(&["a", "b"]), "pane", "make test");
+        app.set_tiles(WIDE);
+        let ran = ctrl(&mut app, 'g');
+        assert!(matches!(ran, Some(Action::RunKeyCommand { .. })), "{ran:?}");
+        assert_eq!(app.splits(), vec!["a"], "a stays, beside the new one");
+        let mut app = with_command(app_with(&["a"]), "tab", "htop");
+        let a = app.sessions[0].cwd.clone();
+        let ran = ctrl(&mut app, 'g');
+        assert_eq!(app.tabs().all().len(), 2);
+        assert_eq!(app.tabs().current_index(), 1);
+        let Some(Action::RunKeyCommand { dir, .. }) = ran else {
+            panic!("{ran:?}");
+        };
+        assert_eq!(dir, Some(a), "where a was");
+    }
+
+    #[test]
+    fn a_plugin_action_of_the_users_runs_as_its_own_key_would_and_the_list_has_it() {
+        let mut app = with_command(app_with(&["a"]), "plugin", "notes:add");
+        let ran = ctrl(&mut app, 'g');
+        assert!(
+            matches!(&ran, Some(Action::RunPlugin { plugin, action, .. }) if plugin == "notes" && action == "add"),
+            "{ran:?}"
+        );
+        let mut app = with_command(app_with(&["a"]), "shell", "make docs");
+        press(&mut app, KeyCode::Char(':'));
+        type_text(&mut app, "make docs");
+        let ran = press(&mut app, KeyCode::Enter);
+        assert!(
+            matches!(&ran, Some(Action::RunKeyCommand { command, .. }) if command.command == "make docs"),
+            "{ran:?}"
+        );
+    }
+
+    /// A background task called `name`, asking for a permission.
+    fn asking(name: &str) -> SessionInfo {
+        SessionInfo {
+            front: Some(Front::Task),
+            asking: Some(crate::protocol::Asking {
+                tool: "Bash".into(),
+                gist: "cargo test".into(),
+            }),
+            ..doing(name, Activity::Waiting)
+        }
+    }
+
+    #[test]
+    fn the_answer_keys_the_config_gives_answer_in_the_sidebar_its_pane_and_the_list() {
+        let toml = "answer-yes = \"a\"\nanswer-no = \"d\"";
+        let mut app = with_keys(App::new(None), toml);
+        app.set_sessions(vec![asking("fixer")]);
+        let answer = |answer| {
+            Some(Action::Answer {
+                name: "fixer".into(),
+                answer,
+            })
+        };
+        assert_eq!(press(&mut app, KeyCode::Char('a')), answer(Answer::Allow));
+        assert_eq!(
+            press(&mut app, KeyCode::Char('y')),
+            None,
+            "y answers no more"
+        );
+        // `n` is a new session's key again, and `d` says no.
+        assert_eq!(press(&mut app, KeyCode::Char('d')), answer(Answer::Deny));
+        // In its pane.
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(press(&mut app, KeyCode::Char('a')), answer(Answer::Allow));
+        let shifted = app.on_key(KeyEvent::new(KeyCode::Char('Y'), KeyModifiers::SHIFT));
+        assert_eq!(shifted, answer(Answer::Always));
+        // And in the list of what needs the user, `y` there is nothing.
+        ctrl(&mut app, '\\');
+        press(&mut app, KeyCode::Char('U'));
+        assert_eq!(press(&mut app, KeyCode::Char('y')), None);
+        assert_eq!(press(&mut app, KeyCode::Char('d')), answer(Answer::Deny));
+    }
+
+    #[test]
+    fn resize_modes_keys_follow_the_config() {
+        let toml = "resize-right = \"ctrl+l\"\nresize-done = \"ctrl+c\"";
+        let mut app = with_keys(app_with(&["a", "b"]), toml);
+        app.set_tiles(WIDE);
+        press(&mut app, KeyCode::Char('|'));
+        press(&mut app, KeyCode::Char('R'));
+        let width = |app: &App| placed(app, WIDE)[0].1.width;
+        press(&mut app, KeyCode::Char('l'));
+        assert_eq!(width(&app), 50, "l moves nothing now");
+        ctrl(&mut app, 'l');
+        assert_eq!(width(&app), 50 + RESIZE_COLUMNS);
+        press(&mut app, KeyCode::Esc);
+        assert!(app.resizing(), "esc isn't done now");
+        ctrl(&mut app, 'c');
+        assert!(!app.resizing());
+        // Resize's own key again is done, whatever the config says.
+        press(&mut app, KeyCode::Char('R'));
+        press(&mut app, KeyCode::Char('R'));
+        assert!(!app.resizing());
+    }
+
+    #[test]
+    fn a_views_keys_the_config_gives_stand_for_its_own() {
+        let toml = "view-down = \"ctrl+j\"\nview-close = \"ctrl+g\"";
+        let mut app = with_keys(App::new(None), toml);
+        app.set_sessions(vec![
+            doing("first", Activity::Waiting),
+            doing("second", Activity::Waiting),
+        ]);
+        press(&mut app, KeyCode::Char('U'));
+        let highlighted = |app: &App| {
+            app.needs_you_view()
+                .unwrap()
+                .highlighted()
+                .unwrap()
+                .name
+                .clone()
+        };
+        let first = highlighted(&app);
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(highlighted(&app), first, "j is taken away");
+        ctrl(&mut app, 'j');
+        assert_ne!(highlighted(&app), first);
+        press(&mut app, KeyCode::Up);
+        assert_eq!(highlighted(&app), first, "↑ is always the view's");
+        press(&mut app, KeyCode::Char('q'));
+        assert!(app.needs_you_view().is_some(), "q is taken away");
+        ctrl(&mut app, 'g');
+        assert!(app.needs_you_view().is_none());
+        // Where a view takes typing, a letter is typed.
+        let mut app = with_keys(app_with(&["a", "b"]), "view-down = \"m\"");
+        press(&mut app, KeyCode::Char('/'));
+        press(&mut app, KeyCode::Char('m'));
+        assert_eq!(app.filter().unwrap().input.text(), "m");
+    }
+
+    #[test]
+    fn a_plugins_two_keys_run_its_action_one_after_the_other() {
+        let mut app = app_with(&["a"]);
+        app.set_plugin_keys(vec![PluginKey {
+            key: Some(Sequence::parse("N t").unwrap()),
+            plugin: "notes".into(),
+            action: "add".into(),
+            title: "add a note".into(),
+        }]);
+        assert_eq!(app.plugin_key_rows()[0].0, "N t");
+        let shift_n = KeyEvent::new(KeyCode::Char('N'), KeyModifiers::SHIFT);
+        assert_eq!(app.on_key(shift_n), None);
+        assert!(app.pending().is_some());
+        let ran = press(&mut app, KeyCode::Char('t'));
+        assert!(
+            matches!(&ran, Some(Action::RunPlugin { plugin, .. }) if plugin == "notes"),
+            "{ran:?}"
+        );
+        assert!(app.pending().is_none());
+        app.on_key(shift_n);
+        assert_eq!(press(&mut app, KeyCode::Char('x')), None);
+        assert!(app.notice().unwrap().contains("N x runs nothing"));
+        assert!(app.confirm().is_none(), "x killed nothing");
+        app.on_key(shift_n);
+        assert_eq!(press(&mut app, KeyCode::Esc), None);
+        assert_eq!(app.notice(), None);
+        // From a pane, after the prefix.
+        press(&mut app, KeyCode::Enter);
+        ctrl(&mut app, 'b');
+        app.on_key(shift_n);
+        let ran = press(&mut app, KeyCode::Char('t'));
+        assert!(matches!(ran, Some(Action::RunPlugin { .. })), "{ran:?}");
+        assert_eq!(app.focus(), Focus::Pane(Slot::Selected));
+    }
+
+    #[test]
+    fn a_plugins_chord_runs_its_action() {
+        let mut app = app_with(&["a"]);
+        app.set_plugin_keys(vec![PluginKey {
+            key: Some(Sequence::parse("ctrl+alt+n").unwrap()),
+            plugin: "notes".into(),
+            action: "add".into(),
+            title: "add a note".into(),
+        }]);
+        let ran = ctrl_alt(&mut app, 'n');
+        assert!(matches!(ran, Some(Action::RunPlugin { .. })), "{ran:?}");
     }
 
     #[test]
