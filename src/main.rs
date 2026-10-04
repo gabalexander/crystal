@@ -1,5 +1,6 @@
 mod agent_cli;
 mod agent_hooks;
+mod agent_plugins;
 mod agent_rules;
 mod agent_screen;
 mod agents;
@@ -713,10 +714,11 @@ enum Command {
         #[arg(long, requires = "install")]
         force: bool,
     },
-    /// Put crystal's hooks in Claude Code's or Codex's own settings, so one
-    /// you start yourself in a session's shell says what it's doing and is
-    /// resumed after a restart; and Codex sessions crystal starts report
-    /// too.
+    /// Put crystal's hooks in an agent's own settings, or its plugin in its
+    /// plugins: Claude Code, Codex, Cursor, Droid, Qoder, Qwen Code, Copilot,
+    /// Devin, Kimi, Letta, MastraCode, Grok, Antigravity, Pi, OpenCode, Kilo
+    /// or Hermes. Then the agent says what it's doing, as far as it can,
+    /// and which conversation it's in, which a restart picks up again.
     Integration {
         #[command(subcommand)]
         command: IntegrationCommand,
@@ -758,6 +760,11 @@ enum Command {
         /// agent crystal started with hooks of its own to those.
         #[arg(long)]
         installed: bool,
+
+        /// The event to take the hook for, in place of the one its input
+        /// names.
+        #[arg(long)]
+        event: Option<String>,
     },
     /// Print the running sessions' names, a line each, for a shell
     /// completing one: never starts the daemon, and says nothing when it
@@ -790,7 +797,7 @@ enum IntegrationCommand {
     },
     /// Whether crystal's hooks are installed, for this crystal.
     Status {
-        /// The agent [default: both]
+        /// The agent [default: every one]
         agent: Option<integration::Agent>,
     },
 }
@@ -1836,7 +1843,11 @@ fn run(cli: Cli) -> Result<()> {
             Some(AgentCommand::Rules { agent }) => agent_cli::rules(&agent)?,
         },
         Command::Daemon { handover } => daemon::run(&socket, handover)?,
-        Command::Hook { agent, installed } => hook::run(&socket, &agent, installed),
+        Command::Hook {
+            agent,
+            installed,
+            event,
+        } => hook::run(&socket, &agent, installed, event.as_deref()),
         Command::CompleteSessions => {
             if let Ok(Some(Response::Sessions { sessions })) =
                 client::ask(&socket, &Request::List, false)

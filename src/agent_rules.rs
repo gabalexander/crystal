@@ -51,6 +51,7 @@ const BUNDLED: &[(&str, &str)] = &[
     ("kiro", include_str!("../agents/kiro.toml")),
     ("letta", include_str!("../agents/letta.toml")),
     ("maki", include_str!("../agents/maki.toml")),
+    ("mastracode", include_str!("../agents/mastracode.toml")),
     ("muse", include_str!("../agents/muse.toml")),
     ("opencode", include_str!("../agents/opencode.toml")),
     ("pi", include_str!("../agents/pi.toml")),
@@ -1600,6 +1601,9 @@ mod tests {
                 "",
                 Some(Looks::Waiting),
             ),
+            // MastraCode's screen says nothing: its hooks do.
+            ("mastracode", "⠋ Working  esc to interrupt", "", "", None),
+            ("mastracode", "", "", "", None),
             (
                 "muse",
                 "Do you trust this workspace?\n  Trust and continue",

@@ -2035,17 +2035,27 @@ impl Crystal {
         self.dir.path().join("codex-home")
     }
 
-    /// Runs `crystal integration` with `args`, in the test's own Claude
-    /// Code and Codex directories, and gives back what it printed, or why
-    /// it failed.
+    /// A home directory of the test's own, where the agents keep their
+    /// settings when no variable moves them: `crystal integration` must
+    /// never reach the user's own.
+    fn home(&self) -> PathBuf {
+        self.dir.path().join("home")
+    }
+
+    /// Runs `crystal integration` with `args`, in the test's own home and
+    /// Claude Code and Codex directories, and gives back what it printed,
+    /// or why it failed.
     fn integration(&self, args: &[&str]) -> Result<String, String> {
         let mut all = vec!["integration"];
         all.extend(args);
-        let out = self
-            .command(&all)
+        let mut command = self.command(&all);
+        command
             .env("CODEX_HOME", self.codex_home())
-            .output()
-            .unwrap();
+            .env("HOME", self.home());
+        for moved in AGENT_DIRS {
+            command.env_remove(moved);
+        }
+        let out = command.output().unwrap();
         let said = |bytes: Vec<u8>| String::from_utf8(bytes).unwrap();
         if out.status.success() {
             Ok(said(out.stdout))
@@ -2054,6 +2064,21 @@ impl Crystal {
         }
     }
 }
+
+/// The variables that move agents' settings directories elsewhere than
+/// the home directory.
+const AGENT_DIRS: &[&str] = &[
+    "CURSOR_CONFIG_DIR",
+    "QODER_CONFIG_DIR",
+    "QWEN_HOME",
+    "COPILOT_HOME",
+    "KIMI_CODE_HOME",
+    "GROK_CONFIG_DIR",
+    "GROK_HOME",
+    "ANTIGRAVITY_CLI_CONFIG_DIR",
+    "HERMES_HOME",
+    "PI_CODING_AGENT_DIR",
+];
 
 /// The commands of the hooks on `event` in `settings`.
 fn hook_commands(settings: &serde_json::Value, event: &str) -> Vec<String> {
@@ -2468,6 +2493,169 @@ fn integration_puts_hooks_in_other_agents_settings_and_takes_them_out() {
 
     let gemini = crystal.fails(&["integration", "install", "gemini"]);
     assert!(gemini.contains("gemini"), "{gemini}");
+}
+
+#[test]
+fn integration_gives_the_agents_that_take_plugins_or_toml_theirs() {
+    let crystal = Crystal::new();
+    let home = crystal.home();
+    let kimi = home.join(".kimi-code");
+    let pi = home.join(".pi/agent");
+    let hermes = home.join(".hermes");
+    for dir in [&kimi, &pi, &hermes] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    let kimi_config = "# mine\ndefault_model = \"k2\"\n";
+    std::fs::write(kimi.join("config.toml"), kimi_config).unwrap();
+    let hermes_config = "model: x\n";
+    std::fs::write(hermes.join("config.yaml"), hermes_config).unwrap();
+
+    // Without an agent named, each that's installed: these three here.
+    let said = crystal.integration(&["install"]).unwrap();
+    assert!(said.contains("kimi: added crystal's hooks to"), "{said}");
+    assert!(said.contains("pi: added crystal's plugin to"), "{said}");
+    assert!(said.contains("hermes: added crystal's plugin to"), "{said}");
+    assert!(!said.contains("letta"), "{said}");
+
+    let config = std::fs::read_to_string(kimi.join("config.toml")).unwrap();
+    assert!(config.starts_with(kimi_config), "{config}");
+    assert!(config.contains("[[hooks]]\nevent = \"Stop\"\n"), "{config}");
+    assert!(
+        config.contains(&format!("{CRYSTAL} hook kimi --event Stop || true")),
+        "{config}"
+    );
+    let extension = std::fs::read_to_string(pi.join("extensions/crystal.ts")).unwrap();
+    assert!(
+        extension.contains(&format!("const CRYSTAL = \"{CRYSTAL}\";")),
+        "{extension}"
+    );
+    let enabled = std::fs::read_to_string(hermes.join("config.yaml")).unwrap();
+    assert_eq!(enabled, "model: x\nplugins:\n  enabled:\n    - crystal\n");
+    assert!(hermes.join("plugins/crystal/__init__.py").is_file());
+
+    let status = crystal.integration(&["status"]).unwrap();
+    for (agent, standing) in [
+        ("kimi", "installed"),
+        ("pi", "installed"),
+        ("hermes", "installed"),
+        ("letta", "not installed"),
+        ("opencode", "not installed"),
+    ] {
+        assert!(
+            status.contains(&format!("\n{agent}  {standing}  ")),
+            "{status}"
+        );
+    }
+    let again = crystal.integration(&["install", "pi"]).unwrap();
+    assert!(again.contains("already"), "{again}");
+
+    for agent in ["kimi", "pi", "hermes"] {
+        let said = crystal.integration(&["uninstall", agent]).unwrap();
+        assert!(said.contains("took crystal's"), "{said}");
+    }
+    assert_eq!(
+        std::fs::read_to_string(kimi.join("config.toml")).unwrap(),
+        kimi_config
+    );
+    assert!(!pi.join("extensions/crystal.ts").exists());
+    assert_eq!(
+        std::fs::read_to_string(hermes.join("config.yaml")).unwrap(),
+        hermes_config
+    );
+    assert!(!hermes.join("plugins/crystal").exists());
+}
+
+/// A stand-in for Kimi Code, its hooks installed: it writes down its
+/// arguments, then, unless it was started in a session of its own, runs
+/// crystal's hook as Kimi would as it starts and as it's sent a prompt, in
+/// its session `k-1`, and waits.
+fn fake_kimi(dir: &Path) -> PathBuf {
+    let bin = dir.join("kimi-bin");
+    std::fs::create_dir(&bin).unwrap();
+    let body = format!(
+        r#"
+printf '%s\n' "$@" > kimi-args.new && mv kimi-args.new kimi-args
+if [ "$1" != --session ]; then
+    printf '{{"session_id":"k-1"}}' | '{CRYSTAL}' hook kimi --event SessionStart
+    printf '{{"session_id":"k-1","prompt":"fix it"}}' | '{CRYSTAL}' hook kimi --event UserPromptSubmit
+fi
+sleep 30
+"#
+    );
+    script(&bin.join("kimi"), &body);
+    bin
+}
+
+#[test]
+fn an_agent_comes_back_in_the_conversation_its_hooks_named() {
+    let crystal = Crystal::new();
+    let bin = fake_kimi(crystal.dir.path());
+    let path = path_of(&[&bin]);
+    let args = crystal.dir.path().join("kimi-args");
+    let daemon = crystal.start_daemon();
+    let out = crystal
+        .command(&["new", "-d", "-n", "kimi", "kimi", "--yolo"])
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(written(&args), "--yolo\n");
+    eventually("its conversation, prompted, is saved", || {
+        crystal
+            .saved()
+            .contains(r#""conversation":{"id":"k-1","transcript":null,"prompted":true}"#)
+    });
+
+    crash(daemon);
+    std::fs::remove_file(&args).unwrap();
+    let out = crystal
+        .command(&["new", "-d", "-n", "other", "sleep", "300"])
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    // Kimi starts again in its session, with the options it was given.
+    assert_eq!(written(&args), "--session\nk-1\n--yolo\n");
+}
+
+#[test]
+fn an_agent_typed_into_a_shell_is_resumed_once_it_has_had_a_prompt() {
+    let crystal = Crystal::new();
+    let bin = crystal.dir.path().join("droid-bin");
+    std::fs::create_dir(&bin).unwrap();
+    let body = format!(
+        r#"
+hook() {{ printf '%s' "$1" | '{CRYSTAL}' hook droid; }}
+hook '{{"hook_event_name":"SessionStart","session_id":"d-1"}}'
+while [ ! -e prompt ]; do sleep 0.05; done
+hook '{{"hook_event_name":"UserPromptSubmit","session_id":"d-1","prompt":"go"}}'
+sleep 30
+"#
+    );
+    script(&bin.join("droid"), &body);
+    let out = crystal
+        .command(&["new", "-d", "-n", "box", "sh"])
+        .env("PATH", path_of(&[&bin]))
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    crystal.ok(&["send", "box", "droid"]);
+    eventually("Droid is in front", || {
+        crystal.listed("box")["front"]["program"] == "droid"
+    });
+    // Named but never sent a prompt, its session has nothing to pick up.
+    thread::sleep(Duration::from_millis(300));
+    assert!(
+        crystal.saved().contains(r#""resume":null"#),
+        "{}",
+        crystal.saved()
+    );
+    crystal.stage("prompt");
+    eventually("its resume command is saved", || {
+        crystal
+            .saved()
+            .contains(r#""resume":["droid","--resume","d-1"]"#)
+    });
 }
 
 #[test]

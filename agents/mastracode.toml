@@ -1,0 +1,19 @@
+# MastraCode says what it's doing only through its hooks, which `crystal
+# integration install mastracode` puts in its settings: herdr has no rules
+# for its screen, and neither has crystal. So its screen is never read, and
+# without its hooks its session shows no status.
+#
+# Its package's CLI, node_modules/mastracode/dist/cli.js, is how it's found
+# when node is what's in front.
+id = "mastracode"
+name = "MastraCode"
+aliases = ["mastra-code"]
+packages = ["mastracode"]
+
+[[rules]]
+id = "hooks_say"
+looks = "skip"
+priority = 0
+region = "screen"
+# Anything at all, even an empty screen.
+regex = ['']
