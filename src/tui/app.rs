@@ -65,6 +65,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventK
 use ratatui::layout::Rect;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 /// Where a pane sits beside the sidebar: the one that follows the
 /// selection, or one of the splits, counted in the order they're drawn
@@ -776,6 +777,15 @@ impl Counted {
     }
 }
 
+/// The title and text an issue was given in the issues view, and when the
+/// forge said it had saved them.
+#[derive(Debug, Clone)]
+struct IssueEdit {
+    title: String,
+    body: String,
+    saved: Instant,
+}
+
 pub struct App {
     /// In the sidebar's order: see [`groups`].
     sessions: Vec<SessionInfo>,
@@ -899,6 +909,15 @@ pub struct App {
     pull_requests: HashMap<PathBuf, Result<(Forge, Vec<PullRequest>), String>>,
     /// What its forge said about each project's open issues, the same way.
     open_issues: HashMap<PathBuf, Result<(Forge, Vec<Issue>), String>>,
+    /// When each of those lists was asked of the forge, by project: a list
+    /// asked before lands after it only when the forge took longer over it,
+    /// and it's dropped.
+    pull_requests_asked: HashMap<PathBuf, Instant>,
+    issues_asked: HashMap<PathBuf, Instant>,
+    /// The issues given a new title and text in the issues view, by project
+    /// and number: laid over what the forge answers to anything asked before
+    /// it saved them, which may not have them yet. Kept while the TUI runs.
+    issue_edits: HashMap<(PathBuf, u64), IssueEdit>,
     /// Whether draft pull requests are left out of the pull requests view,
     /// the tab bar's count and `/`, as the settings say.
     hide_draft_prs: bool,
@@ -1098,6 +1117,9 @@ impl App {
             filter: None,
             pull_requests: HashMap::new(),
             open_issues: HashMap::new(),
+            pull_requests_asked: HashMap::new(),
+            issues_asked: HashMap::new(),
+            issue_edits: HashMap::new(),
             hide_draft_prs: false,
             issues: None,
             pull_requests_view: None,
@@ -2503,13 +2525,18 @@ impl App {
     }
 
     /// Takes what its forge said about the open pull requests of the
-    /// project at `project`, for the worktree lines and the pull requests
-    /// view, if it's open on that project.
+    /// project at `project`, asked at `asked`, for the worktree lines and
+    /// the pull requests view, if it's open on that project; unless the
+    /// list the TUI has was asked later.
     pub fn set_pull_requests(
         &mut self,
         project: PathBuf,
         found: Result<(Forge, Vec<PullRequest>), String>,
+        asked: Instant,
     ) {
+        if !latest_asked(&mut self.pull_requests_asked, &project, asked) {
+            return;
+        }
         if let Some(view) = &mut self.pull_requests_view
             && view.project == project
         {
@@ -2664,9 +2691,25 @@ impl App {
     }
 
     /// Takes the open issues its forge listed for the project at
-    /// `project`, for the tab bar's count and the issues view, if it's
-    /// open on that project.
-    pub fn set_issues(&mut self, project: &Path, found: Result<(Forge, Vec<Issue>), String>) {
+    /// `project`, asked at `asked`, for the tab bar's count and the issues
+    /// view, if it's open on that project; unless the list the TUI has was
+    /// asked later. The titles changed here since it was asked stay.
+    pub fn set_issues(
+        &mut self,
+        project: &Path,
+        mut found: Result<(Forge, Vec<Issue>), String>,
+        asked: Instant,
+    ) {
+        if !latest_asked(&mut self.issues_asked, project, asked) {
+            return;
+        }
+        if let Ok((_, issues)) = &mut found {
+            for issue in issues {
+                if let Some(edit) = self.edit_since(project, issue.number, asked) {
+                    issue.title = edit.title.clone();
+                }
+            }
+        }
         if let Some(view) = self.issues.as_mut().filter(|view| view.project == project) {
             view.set_issues(found.clone());
         }
@@ -2707,29 +2750,44 @@ impl App {
         })
     }
 
-    /// Takes issue `number` of the project at `project`, read whole.
+    /// Takes issue `number` of the project at `project`, read whole as
+    /// asked at `asked`, with the text it was given here since.
     pub fn set_issue(
         &mut self,
         project: &Path,
         number: u64,
-        read: Result<forge::IssueDetail, String>,
+        mut read: Result<forge::IssueDetail, String>,
+        asked: Instant,
     ) {
+        if let (Ok(detail), Some(edit)) = (&mut read, self.edit_since(project, number, asked)) {
+            detail.body = edit.body.clone();
+        }
         if let Some(view) = self.issues.as_mut().filter(|view| view.project == project) {
-            view.list.set_detail(number, read);
+            view.list.set_detail(number, read, asked);
         }
     }
 
-    /// Takes pull request `number` of the project at `project`, read whole.
+    /// Takes pull request `number` of the project at `project`, read whole
+    /// as asked at `asked`.
     pub fn set_pull_request(
         &mut self,
         project: &Path,
         number: u64,
         read: Result<PullRequestDetail, String>,
+        asked: Instant,
     ) {
         let view = self.pull_requests_view.as_mut();
         if let Some(view) = view.filter(|view| view.project == project) {
-            view.list.set_detail(number, read);
+            view.list.set_detail(number, read, asked);
         }
+    }
+
+    /// The title and text issue `number` of the project at `project` was
+    /// given here, if the forge saved them after `asked`: what an answer
+    /// to something asked then may not have yet.
+    fn edit_since(&self, project: &Path, number: u64, asked: Instant) -> Option<&IssueEdit> {
+        let edit = self.issue_edits.get(&(project.to_path_buf(), number))?;
+        (asked < edit.saved).then_some(edit)
     }
 
     /// The issue or pull request to read whole next, with its project: the
@@ -2773,16 +2831,31 @@ impl App {
     }
 
     /// Issue `number` of the project at `project` was given this title and
-    /// text, or why it wasn't.
+    /// text, or why it wasn't, as the forge said `at`. Saved, they stay
+    /// over what the forge answers to anything asked before.
     pub fn issue_edited(
         &mut self,
         project: &Path,
         number: u64,
         (title, body): (String, String),
         saved: Result<(), String>,
+        at: Instant,
     ) {
         if saved.is_ok() {
             self.notify(format!("updated issue #{number}"));
+            // The list the tab bar counts, which the view opens on next.
+            if let Some(Ok((_, issues))) = self.open_issues.get_mut(project)
+                && let Some(issue) = issues.iter_mut().find(|issue| issue.number == number)
+            {
+                issue.title = title.clone();
+            }
+            let edit = IssueEdit {
+                title: title.clone(),
+                body: body.clone(),
+                saved: at,
+            };
+            let key = (project.to_path_buf(), number);
+            self.issue_edits.insert(key, edit);
         }
         if let Some(view) = self.issues.as_mut().filter(|view| view.project == project) {
             view.edited(number, title, body, saved);
@@ -6420,6 +6493,17 @@ impl App {
     }
 }
 
+/// Whether what a forge answered about `project`, asked at `asked`, is to
+/// be taken: unless what's kept was asked later, as `kept` says. Taken, it
+/// is what's kept from then on.
+fn latest_asked(kept: &mut HashMap<PathBuf, Instant>, project: &Path, asked: Instant) -> bool {
+    if kept.get(project).is_some_and(|kept| asked < *kept) {
+        return false;
+    }
+    kept.insert(project.to_path_buf(), asked);
+    true
+}
+
 /// How far a key in resize mode moves a border `toward`.
 fn resize_step(toward: Direction) -> u16 {
     match toward {
@@ -6470,6 +6554,7 @@ mod tests {
     use super::*;
     use crate::protocol::{Activity, BacklogItem, TaskInfo, TaskOutcome, TaskState, Worktree};
     use crossterm::event::KeyModifiers;
+    use std::time::Duration;
 
     fn session(name: &str) -> SessionInfo {
         SessionInfo {
@@ -10064,7 +10149,7 @@ mod tests {
             ..pull_request(58, "dark")
         };
         let app_path = PathBuf::from("/code/app");
-        app.set_pull_requests(app_path.clone(), on_github(vec![fix, dark]));
+        app.set_pull_requests(app_path.clone(), on_github(vec![fix, dark]), Instant::now());
         press(&mut app, KeyCode::Char('/'));
         type_text(&mut app, "dark");
         let found = Found::PullRequest {
@@ -10114,7 +10199,11 @@ mod tests {
             ..pull_request(58, "new-login")
         };
         let app_path = PathBuf::from("/code/app");
-        app.set_pull_requests(app_path.clone(), on_github(vec![merged, draft]));
+        app.set_pull_requests(
+            app_path.clone(),
+            on_github(vec![merged, draft]),
+            Instant::now(),
+        );
         press(&mut app, KeyCode::Char('/'));
         type_text(&mut app, "login");
         let draft = Found::PullRequest {
@@ -10142,7 +10231,7 @@ mod tests {
             title: "Rate limits".into(),
             ..pull_request(3, "limits")
         };
-        app.set_pull_requests(api.clone(), on_github(vec![none]));
+        app.set_pull_requests(api.clone(), on_github(vec![none]), Instant::now());
         assert_eq!(press(&mut app, KeyCode::Char('/')), None);
         type_text(&mut app, "rate");
         assert_eq!(
@@ -10278,7 +10367,7 @@ mod tests {
         let mut app = App::new(None);
         app.set_sessions(vec![in_repo("fixer", "fix-login")]);
         let found = on_github(vec![pull_request(57, "fix-login")]);
-        app.set_pull_requests(PathBuf::from("/code/app"), found);
+        app.set_pull_requests(PathBuf::from("/code/app"), found, Instant::now());
         assert_eq!(
             press(&mut app, KeyCode::Char('o')),
             Some(Action::OpenInBrowser {
@@ -10296,17 +10385,21 @@ mod tests {
         assert_eq!(app.notice(), Some("still asking about app's pull requests"));
 
         let found = on_github(vec![pull_request(9, "other")]);
-        app.set_pull_requests(PathBuf::from("/code/app"), found);
+        app.set_pull_requests(PathBuf::from("/code/app"), found, Instant::now());
         press(&mut app, KeyCode::Char('o'));
         assert_eq!(app.notice(), Some("no open pull request for fix-login"));
 
         let found = Ok((Forge::GitLab, Vec::new()));
-        app.set_pull_requests(PathBuf::from("/code/app"), found);
+        app.set_pull_requests(PathBuf::from("/code/app"), found, Instant::now());
         press(&mut app, KeyCode::Char('o'));
         assert_eq!(app.notice(), Some("no open merge request for fix-login"));
 
         let not_on_one = "app's remote is on this machine, not GitHub or GitLab".to_string();
-        app.set_pull_requests(PathBuf::from("/code/app"), Err(not_on_one.clone()));
+        app.set_pull_requests(
+            PathBuf::from("/code/app"),
+            Err(not_on_one.clone()),
+            Instant::now(),
+        );
         press(&mut app, KeyCode::Char('o'));
         assert_eq!(app.notice(), Some(not_on_one.as_str()));
     }
@@ -10320,7 +10413,11 @@ mod tests {
             local_branch: "ana/main".into(),
             ..pull_request(58, "main")
         };
-        app.set_pull_requests(PathBuf::from("/code/app"), on_github(vec![fork]));
+        app.set_pull_requests(
+            PathBuf::from("/code/app"),
+            on_github(vec![fork]),
+            Instant::now(),
+        );
         assert!(app.pull_request(Path::new("/code/app"), "main").is_none());
         assert!(
             app.pull_request(Path::new("/code/app"), "ana/main")
@@ -10332,7 +10429,7 @@ mod tests {
     fn capital_o_lists_the_pull_requests_and_enter_starts_in_one() {
         let mut app = with_agents(&["claude"], vec![in_repo("planner", "main")]);
         let found = on_github(vec![pull_request(57, "fix-login")]);
-        app.set_pull_requests(PathBuf::from("/code/app"), found);
+        app.set_pull_requests(PathBuf::from("/code/app"), found, Instant::now());
         assert_eq!(
             press(&mut app, KeyCode::Char('O')),
             Some(Action::ListPullRequests(PathBuf::from("/code/app")))
@@ -10373,7 +10470,7 @@ mod tests {
         let mut app = App::new(None);
         app.set_sessions(vec![in_repo("planner", "main")]);
         let found = on_github(vec![pull_request(57, "fix-login")]);
-        app.set_pull_requests(PathBuf::from("/code/app"), found);
+        app.set_pull_requests(PathBuf::from("/code/app"), found, Instant::now());
         press(&mut app, KeyCode::Char('O'));
         let ctrl_d = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL);
         assert_eq!(
@@ -10429,7 +10526,7 @@ mod tests {
         let mut app = App::new(None);
         app.set_sessions(vec![in_repo("planner", "main")]);
         let found = on_github(vec![pull_request(57, "fix-login")]);
-        app.set_pull_requests(PathBuf::from("/code/app"), found);
+        app.set_pull_requests(PathBuf::from("/code/app"), found, Instant::now());
         press(&mut app, KeyCode::Char('O'));
         app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
         type_text(&mut app, "LGTM");
@@ -10472,6 +10569,7 @@ mod tests {
         app.set_issues(
             Path::new("/code/app"),
             Ok((Forge::GitHub, vec![issue(42, "Fix login redirect")])),
+            Instant::now(),
         );
         press(&mut app, KeyCode::Enter);
         assert!(app.issues_view().is_none());
@@ -10512,7 +10610,7 @@ mod tests {
             merged: true,
             ..pull_request(41, "startup")
         };
-        app.set_pull_requests(project.clone(), on_github(vec![merged]));
+        app.set_pull_requests(project.clone(), on_github(vec![merged]), Instant::now());
         press(&mut app, KeyCode::Char('O'));
         assert_eq!(
             app.on_key(ctrl_r),
@@ -10528,7 +10626,7 @@ mod tests {
 
         // The poller's issues are there as the view opens.
         let listed = Ok((Forge::GitHub, vec![issue(42, "Fix login redirect")]));
-        app.set_issues(&project, listed);
+        app.set_issues(&project, listed, Instant::now());
         assert_eq!(
             press(&mut app, KeyCode::Char('i')),
             Some(Action::ListIssues(project.clone()))
@@ -10536,6 +10634,84 @@ mod tests {
         let view = app.issues_view().unwrap();
         assert_eq!(view.highlighted().map(|issue| issue.number), Some(42));
         assert_eq!(app.on_key(ctrl_r), Some(Action::ListIssues(project)));
+    }
+
+    #[test]
+    fn an_issue_edited_keeps_its_title_and_text_over_what_was_asked_before_it_was_saved() {
+        let mut app = App::new(None);
+        app.set_sessions(vec![in_repo("planner", "main")]);
+        let project = PathBuf::from("/code/app");
+        let start = Instant::now();
+        let at = |seconds| start + Duration::from_secs(seconds);
+        let (opened, refreshed, saved, after) = (at(0), at(1), at(2), at(3));
+        let listed = |title: &str| Ok((Forge::GitHub, vec![issue(42, title)]));
+        let read = |body: &str| {
+            Ok(forge::IssueDetail {
+                body: body.into(),
+                comments: Vec::new(),
+            })
+        };
+        let title = |app: &App| {
+            app.issues_view()
+                .unwrap()
+                .highlighted()
+                .unwrap()
+                .title
+                .clone()
+        };
+        let body = |app: &App| match app.issues_view().unwrap().list.detail(42) {
+            Some(Ok(detail)) => detail.body.clone(),
+            other => panic!("{other:?}"),
+        };
+        press(&mut app, KeyCode::Char('i'));
+        app.set_issues(&project, listed("Fix login"), opened);
+        app.set_issue(&project, 42, read("It loops."), opened);
+
+        // The forge is asked again just before the edit is saved, and
+        // answers after it: the edit stays.
+        let edit = (
+            "Fix login on Safari".to_string(),
+            "It loops on Safari.".to_string(),
+        );
+        app.issue_edited(&project, 42, edit, Ok(()), saved);
+        app.set_issues(&project, listed("Fix login"), refreshed);
+        app.set_issue(&project, 42, read("It loops."), refreshed);
+        assert_eq!(title(&app), "Fix login on Safari");
+        assert_eq!(body(&app), "It loops on Safari.");
+
+        // A list asked before the one kept is dropped.
+        let more = Ok((
+            Forge::GitHub,
+            vec![issue(42, "Fix login"), issue(7, "Dark mode")],
+        ));
+        app.set_issues(&project, more, opened);
+        let view = app.issues_view().unwrap();
+        assert_eq!(view.list.shown().len(), 1);
+
+        // The view opens again on the title given.
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('i'));
+        assert_eq!(title(&app), "Fix login on Safari");
+
+        // Asked after it was saved, what the forge says goes: someone may
+        // have changed it since.
+        app.set_issues(&project, listed("Fix the login loop"), after);
+        app.set_issue(&project, 42, read("Loops."), after);
+        assert_eq!(title(&app), "Fix the login loop");
+        assert_eq!(body(&app), "Loops.");
+    }
+
+    #[test]
+    fn a_pull_request_list_asked_before_the_one_kept_is_dropped() {
+        let mut app = App::new(None);
+        app.set_sessions(vec![in_repo("planner", "main")]);
+        let project = PathBuf::from("/code/app");
+        let earlier = Instant::now();
+        let later = earlier + Duration::from_secs(1);
+        let open = pull_request(57, "fix-login");
+        app.set_pull_requests(project.clone(), on_github(vec![open]), later);
+        app.set_pull_requests(project.clone(), on_github(Vec::new()), earlier);
+        assert!(app.pull_request(&project, "fix-login").is_some());
     }
 
     #[test]
@@ -10547,7 +10723,11 @@ mod tests {
         let mut app = App::new(None);
         app.set_sessions(vec![in_repo("planner", "main")]);
         let reason = "gh: not logged in".to_string();
-        app.set_pull_requests(PathBuf::from("/code/app"), Err(reason.clone()));
+        app.set_pull_requests(
+            PathBuf::from("/code/app"),
+            Err(reason.clone()),
+            Instant::now(),
+        );
         assert_eq!(press(&mut app, KeyCode::Char('i')), None);
         assert_eq!(app.notice(), Some(reason.as_str()));
         assert!(app.issues_view().is_none());
