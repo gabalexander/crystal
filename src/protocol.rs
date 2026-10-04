@@ -44,6 +44,17 @@ pub enum Request {
         /// names a session crystal named after its program.
         #[serde(default)]
         prompt: Option<String>,
+        /// The agent whose hooks sent it, by its program: `claude` or
+        /// `codex`. `None` from a crystal that didn't say, which meant
+        /// Claude Code.
+        #[serde(default)]
+        agent: Option<String>,
+        /// The directory the agent runs in, as its hooks say.
+        #[serde(default)]
+        cwd: Option<PathBuf>,
+        /// The subagent a subagent's event is about.
+        #[serde(default)]
+        subagent: Option<Subagent>,
     },
     /// What an agent says about itself with `crystal report`. A program in
     /// a session says which by its `id`; from outside, it's the session's
@@ -545,6 +556,18 @@ pub struct SessionInfo {
     /// while it holds the session.
     #[serde(default)]
     pub reporter: Option<Reporter>,
+    /// How many subagents its agent has running, as its hooks say.
+    #[serde(default)]
+    pub subagents: u32,
+}
+
+/// A subagent an agent started, as its hooks name it: its id, and its
+/// type, like `Explore`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Subagent {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_type: Option<String>,
 }
 
 /// An agent that says what it's doing itself, with `crystal report`, and
@@ -976,6 +999,11 @@ pub enum AgentEvent {
     TurnEnded,
     /// The agent has sat at its prompt for a while.
     StillIdle,
+    /// The agent started a subagent, which says nothing about what the
+    /// agent itself is doing.
+    SubagentStarted,
+    /// One of its subagents finished. The agent's turn goes on.
+    SubagentStopped,
 }
 
 /// What the agent in a session is doing.

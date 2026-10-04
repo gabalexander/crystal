@@ -16,7 +16,7 @@ use crate::plugin_manifest;
 use crate::project;
 use crate::protocol::{
     Activity, Answer, Artifact, ArtifactKind, Asking, BacklogItem, Reporter, SessionInfo, State,
-    TaskOutcome, TaskRecord, TaskResult, TaskState,
+    Subagent, TaskOutcome, TaskRecord, TaskResult, TaskState,
 };
 use crate::shell;
 use serde::{Deserialize, Serialize};
@@ -37,6 +37,8 @@ pub enum Kind {
     SessionRemoved,
     SessionClaimed,
     SessionReleased,
+    SubagentStarted,
+    SubagentStopped,
     TaskOpened,
     TaskStarted,
     TaskWaiting,
@@ -65,7 +67,7 @@ pub enum Kind {
 }
 
 impl Kind {
-    pub const ALL: [Kind; 35] = [
+    pub const ALL: [Kind; 37] = [
         Kind::SessionStarted,
         Kind::SessionRenamed,
         Kind::SessionWorking,
@@ -76,6 +78,8 @@ impl Kind {
         Kind::SessionRemoved,
         Kind::SessionClaimed,
         Kind::SessionReleased,
+        Kind::SubagentStarted,
+        Kind::SubagentStopped,
         Kind::TaskOpened,
         Kind::TaskStarted,
         Kind::TaskWaiting,
@@ -116,6 +120,8 @@ impl Kind {
             Kind::SessionRemoved => "session.removed",
             Kind::SessionClaimed => "session.claimed",
             Kind::SessionReleased => "session.released",
+            Kind::SubagentStarted => "subagent.started",
+            Kind::SubagentStopped => "subagent.stopped",
             Kind::TaskOpened => "task.opened",
             Kind::TaskStarted => "task.started",
             Kind::TaskWaiting => "task.waiting",
@@ -216,6 +222,9 @@ pub struct Event {
     pub handoff: Option<HandoffAbout>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub daemon: Option<DaemonAbout>,
+    /// The subagent a session's agent started, or that finished.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent: Option<Subagent>,
 }
 
 /// The session an event is about, as it was then.
@@ -344,6 +353,7 @@ impl Event {
             artifact: None,
             handoff: None,
             daemon: None,
+            subagent: None,
         }
     }
 
@@ -623,6 +633,15 @@ impl Event {
         }
     }
 
+    /// `session`'s agent started `subagent`, or it finished, as `kind`
+    /// says; `session` counts it already.
+    pub fn subagent(kind: Kind, session: &SessionInfo, subagent: Subagent) -> Event {
+        Event {
+            subagent: Some(subagent),
+            ..Event::about_session(kind, session)
+        }
+    }
+
     /// The daemon, which ran crystal `from`, was handed over to this one,
     /// and `sessions` carried on through it.
     pub fn handed_over(from: &str, version: &str, sessions: usize) -> Event {
@@ -687,6 +706,14 @@ impl Event {
                 .and_then(|session| session.reporter.as_ref())
                 .map_or(String::new(), |reporter| format!("by {}", reporter.agent)),
             Kind::SessionReleased => format!("by {}", self.from.as_deref().unwrap_or("?")),
+            Kind::SubagentStarted | Kind::SubagentStopped => {
+                self.subagent.as_ref().map_or(String::new(), |subagent| {
+                    match &subagent.agent_type {
+                        Some(agent_type) => format!("{agent_type} ({})", subagent.id),
+                        None => subagent.id.clone(),
+                    }
+                })
+            }
             Kind::SessionEnded => self
                 .session
                 .as_ref()
@@ -848,6 +875,7 @@ pub fn example(kind: Kind, session: Option<&SessionInfo>, dir: &Path) -> Event {
             task: None,
             asking: None,
             reporter: None,
+            subagents: 0,
         },
     };
     let now = now_ms() / 1000;
@@ -929,6 +957,21 @@ pub fn example(kind: Kind, session: Option<&SessionInfo>, dir: &Path) -> Event {
             Event::about_session(kind, &session)
         }
         Kind::SessionReleased => Event::released(&session, "my-agent"),
+        Kind::SubagentStarted | Kind::SubagentStopped => {
+            let subagent = Subagent {
+                id: "a1b2c3".into(),
+                agent_type: Some("Explore".into()),
+            };
+            let subagents = u32::from(kind == Kind::SubagentStarted);
+            Event::subagent(
+                kind,
+                &SessionInfo {
+                    subagents,
+                    ..session
+                },
+                subagent,
+            )
+        }
         Kind::TaskOpened | Kind::TaskStarted | Kind::TaskWaiting => {
             Event::task(kind, &session, task)
         }
@@ -1122,6 +1165,7 @@ mod tests {
             task: None,
             asking: None,
             reporter: None,
+            subagents: 0,
         }
     }
 

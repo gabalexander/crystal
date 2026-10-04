@@ -112,6 +112,13 @@ pub struct Session {
     /// Whether crystal named the session after its program, and nothing
     /// has named it since: its first prompt can, then.
     named_after_program: bool,
+    /// The agent whose conversation `conversation` is, by its program,
+    /// when that isn't the session's own program: one typed into its
+    /// shell, whose hooks `crystal integration` installed. A restart types
+    /// the command that resumes it into the shell again.
+    typed_agent: Option<String>,
+    /// How many subagents its agent has running, as its hooks say.
+    subagents: u32,
     /// Tasks that closed of themselves, like a background task whose run
     /// ended, for the daemon to write down.
     closed: Vec<TaskRecord>,
@@ -170,6 +177,12 @@ pub struct Handed {
     reporter: Option<Reporter>,
     reporter_job: Option<i32>,
     named_after_program: bool,
+    /// Handed over by crystals since these were, and left out by those
+    /// before them, which a crystal reads as none.
+    #[serde(default)]
+    typed_agent: Option<String>,
+    #[serde(default)]
+    subagents: u32,
     screen: vt::Saved,
     /// There will be no more output.
     ended: bool,
@@ -210,6 +223,12 @@ impl Handed {
             }),
             None => self.conversation.clone(),
         };
+        let (conversation, resume) = restart_with(
+            conversation,
+            self.reporter.as_ref(),
+            self.typed_agent.as_deref(),
+            self.front.as_ref(),
+        );
         Some(SavedSession {
             name: self.name.clone(),
             command: self.command.clone(),
@@ -217,12 +236,36 @@ impl Handed {
             conversation,
             task: self.task.as_ref().map(|task| task.spec().clone()),
             goal: self.goal.clone(),
-            resume: self
-                .reporter
-                .as_ref()
-                .and_then(|reporter| reporter.resume.clone()),
+            resume,
         })
     }
+}
+
+/// What a restart picks a session's agent up again with: the conversation,
+/// for an agent crystal started itself, and the command that resumes it,
+/// typed into the session's shell, or run in place of its command. An
+/// agent that reports for itself said that command; one typed into the
+/// shell by hand is resumed with its own command for its conversation,
+/// while it's still in front, which a restart types in again; one that
+/// has left the front is gone, and stays gone.
+fn restart_with(
+    conversation: Option<Conversation>,
+    reporter: Option<&Reporter>,
+    typed_agent: Option<&str>,
+    front: Option<&Front>,
+) -> (Option<Conversation>, Option<Vec<String>>) {
+    if let Some(resume) = reporter.and_then(|reporter| reporter.resume.clone()) {
+        return (conversation, Some(resume));
+    }
+    let Some(agent) = typed_agent else {
+        return (conversation, None);
+    };
+    let in_front = matches!(front, Some(Front::Agent { program, .. }) if program == agent);
+    let resume = conversation
+        .filter(|_| in_front)
+        .filter(Conversation::can_resume)
+        .and_then(|conversation| agents::resume_typed(agent, &conversation.id));
+    (None, resume)
 }
 
 impl Session {
@@ -292,6 +335,8 @@ impl Session {
             reporter: None,
             reporter_job: None,
             named_after_program: false,
+            typed_agent: None,
+            subagents: 0,
             closed: Vec::new(),
             changes: Vec::new(),
             term,
@@ -350,6 +395,8 @@ impl Session {
             reporter: None,
             reporter_job: None,
             named_after_program: false,
+            typed_agent: None,
+            subagents: 0,
             closed: Vec::new(),
             changes: Vec::new(),
             term,
@@ -612,6 +659,12 @@ impl Session {
             task: self.goal.clone(),
             asking: self.task.as_ref().and_then(Task::asking),
             reporter: self.reporter.clone(),
+            // An agent gone before it was seen in front can't have taken
+            // its subagents with it.
+            subagents: match &self.front {
+                Some(front) if !front.is_agent() => 0,
+                _ => self.subagents,
+            },
         }
     }
 
@@ -728,6 +781,7 @@ impl Session {
     /// turn that ends with the session's task still open is a question for
     /// the user, and the task waits on them until the agent works again.
     pub fn on_agent_event(&mut self, event: AgentEvent) {
+        self.subagents = subagents_after(self.subagents, event);
         let turn_ended = event == AgentEvent::TurnEnded
             || (event == AgentEvent::StillIdle && self.activity == Some(Activity::Working));
         let mut activity = next_activity(self.activity, event, self.term.is_watched());
@@ -865,7 +919,9 @@ impl Session {
 
     /// Takes what's in front now. An agent that leaves the front takes what
     /// it was doing with it: the shell it gives the terminal back to isn't
-    /// working or waiting on anyone.
+    /// working or waiting on anyone, and has no subagents. One typed into
+    /// the shell takes its conversation too, which a restart mustn't bring
+    /// back once the user has quit it.
     fn set_front(&mut self, front: Front) {
         if self.front.as_ref() == Some(&front) {
             return;
@@ -874,6 +930,12 @@ impl Session {
         if agent_left && self.activity.is_some() {
             self.set_activity(None);
             *self.changed.lock().unwrap() = SystemTime::now();
+        }
+        if agent_left {
+            self.subagents = 0;
+            if self.typed_agent.take().is_some() {
+                self.conversation = None;
+            }
         }
         self.screen_watch = ScreenWatch::default();
         self.front = Some(front);
@@ -917,6 +979,34 @@ impl Session {
 
     pub fn set_conversation(&mut self, conversation: Conversation) {
         self.conversation = Some(conversation);
+    }
+
+    /// Takes the conversation `agent`'s hooks name, `agent` by its program.
+    /// One that isn't the session's own program was typed into its shell:
+    /// a restart resumes it by typing its command for that conversation.
+    pub fn set_hooked_conversation(&mut self, agent: &str, mut conversation: Conversation) {
+        let own = agents::program_name(&self.command) == Some(agent);
+        self.typed_agent = (!own).then(|| agent.to_string());
+        // A hook that doesn't say where the conversation is kept, as
+        // Codex's needn't, leaves the file known already.
+        if conversation.transcript.is_none()
+            && let Some(known) = self.conversation.take()
+            && known.id == conversation.id
+        {
+            conversation.transcript = known.transcript;
+        }
+        self.conversation = Some(conversation);
+    }
+
+    /// Whether `agent`, by its program, can be what's in front: it is, or
+    /// it's the session's own program and nothing has been seen in front
+    /// yet.
+    pub fn may_run(&self, agent: &str) -> bool {
+        match &self.front {
+            Some(Front::Agent { program, .. }) => program == agent,
+            Some(_) => false,
+            None => agents::program_name(&self.command) == Some(agent),
+        }
     }
 
     /// The id of the agent's conversation, once it's known.
@@ -973,7 +1063,8 @@ impl Session {
 
     /// What it takes to start the session's program again: its name,
     /// command and directory, and the agent's conversation to pick up, or
-    /// the command an agent that reports for itself resumes with.
+    /// the command that resumes an agent that reports for itself, or one
+    /// typed into the session's shell (see [`restart_with`]).
     pub fn launch(&self) -> SavedSession {
         // A task's conversation comes from Claude's own events, which need
         // no transcript file to resume it.
@@ -984,6 +1075,12 @@ impl Session {
             }),
             None => self.conversation.clone(),
         };
+        let (conversation, resume) = restart_with(
+            conversation,
+            self.reporter.as_ref(),
+            self.typed_agent.as_deref(),
+            self.front.as_ref(),
+        );
         SavedSession {
             name: self.name.clone(),
             command: self.command.clone(),
@@ -991,10 +1088,7 @@ impl Session {
             conversation,
             task: self.task.as_ref().map(|task| task.spec().clone()),
             goal: self.goal.clone(),
-            resume: self
-                .reporter
-                .as_ref()
-                .and_then(|reporter| reporter.resume.clone()),
+            resume,
         }
     }
 
@@ -1029,6 +1123,8 @@ impl Session {
             reporter: self.reporter.clone(),
             reporter_job: self.reporter_job,
             named_after_program: self.named_after_program,
+            typed_agent: self.typed_agent.clone(),
+            subagents: self.subagents,
             screen,
             ended,
             pty,
@@ -1096,6 +1192,8 @@ impl Session {
             reporter: handed.reporter,
             reporter_job: handed.reporter_job,
             named_after_program: handed.named_after_program,
+            typed_agent: handed.typed_agent,
+            subagents: handed.subagents,
             closed: Vec::new(),
             changes: Vec::new(),
             term,
@@ -1469,12 +1567,26 @@ fn next_activity(before: Option<Activity>, event: AgentEvent, watched: bool) -> 
         // cut short reports no end.
         AgentEvent::StillIdle if before == Some(Activity::Working) => Activity::Done,
         AgentEvent::StillIdle => return before,
+        // A subagent's start and end are the agent's work, not its turn.
+        AgentEvent::SubagentStarted | AgentEvent::SubagentStopped => return before,
     };
     // A turn that ends while someone's watching has been seen.
     if after == Activity::Done && watched {
         Some(Activity::Idle)
     } else {
         Some(after)
+    }
+}
+
+/// How many subagents an agent that had `count` running has after `event`:
+/// one more as one starts, one fewer as one stops, never below none, and
+/// none when it starts afresh.
+fn subagents_after(count: u32, event: AgentEvent) -> u32 {
+    match event {
+        AgentEvent::SubagentStarted => count + 1,
+        AgentEvent::SubagentStopped => count.saturating_sub(1),
+        AgentEvent::Started => 0,
+        _ => count,
     }
 }
 
@@ -1573,6 +1685,8 @@ mod tests {
             }),
             reporter_job: Some(4242),
             named_after_program: true,
+            typed_agent: Some("codex".into()),
+            subagents: 2,
             screen: screen.save(),
             ended: true,
             pty: None,
@@ -1603,6 +1717,172 @@ mod tests {
         let resume = session.launch().resume.unwrap();
         assert_eq!(resume, ["pi", "--resume", "s 1"]);
         assert!(session.is_named_after_program());
+        assert_eq!(session.subagents, 2);
+        // With the shell in front, there are none to show.
+        assert_eq!(info.subagents, 0);
+    }
+
+    /// A shell session's, handed over, that ended with `front` in front,
+    /// in Claude Code's conversation `conv-1`, typed into it by hand, with
+    /// two subagents running.
+    fn typed_claude(front: Front) -> Session {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::Db::open(&dir.path().join("crystal.sock")).unwrap();
+        let spending = Arc::new(Spending::new(db));
+        let handed = Handed {
+            name: "shell".into(),
+            id: "id-1".into(),
+            command: vec!["zsh".into()],
+            cwd: dir.path().to_path_buf(),
+            env: BTreeMap::new(),
+            pid: None,
+            state: State::Exited { code: 0 },
+            activity: Some(Working),
+            changed: UNIX_EPOCH,
+            looks: Looks::default(),
+            front: Some(front),
+            conversation: Some(Conversation {
+                id: "conv-1".into(),
+                transcript: None,
+            }),
+            rollouts: None,
+            told: None,
+            goal: None,
+            reminded: false,
+            reporter: None,
+            reporter_job: None,
+            named_after_program: false,
+            typed_agent: Some("claude".into()),
+            subagents: 2,
+            screen: vt::Screen::answering(5, 20).save(),
+            ended: true,
+            pty: None,
+            task: None,
+        };
+        Session::adopt(handed, &spending).unwrap()
+    }
+
+    fn claude() -> Front {
+        Front::Agent {
+            program: "claude".into(),
+            name: "Claude Code".into(),
+        }
+    }
+
+    #[test]
+    fn an_agent_typed_into_the_shell_takes_its_conversation_with_it_as_it_leaves() {
+        let mut session = typed_claude(claude());
+        session.set_front(Front::Shell { name: "zsh".into() });
+        assert_eq!(session.conversation_id(), None);
+        assert_eq!(session.info().subagents, 0);
+        assert_eq!(session.info().activity, None);
+        assert_eq!(session.launch().resume, None);
+    }
+
+    #[test]
+    fn the_session_s_own_agent_s_conversation_isn_t_one_typed_in() {
+        let mut session = typed_claude(claude());
+        let conversation = Conversation {
+            id: "conv-2".into(),
+            transcript: None,
+        };
+        session.set_hooked_conversation("claude", conversation.clone());
+        assert_eq!(session.typed_agent.as_deref(), Some("claude"));
+        session.command = vec!["/usr/local/bin/claude".into()];
+        session.set_hooked_conversation("claude", conversation);
+        assert_eq!(session.typed_agent, None);
+        assert_eq!(session.launch().conversation.unwrap().id, "conv-2");
+    }
+
+    #[test]
+    fn a_hook_that_doesn_t_say_where_the_conversation_is_kept_leaves_it_known() {
+        let mut session = typed_claude(claude());
+        let kept = |id: &str, file: Option<&str>| Conversation {
+            id: id.into(),
+            transcript: file.map(PathBuf::from),
+        };
+        session.set_hooked_conversation("claude", kept("conv-1", Some("/t/conv-1.jsonl")));
+        session.set_hooked_conversation("claude", kept("conv-1", None));
+        assert_eq!(
+            session.conversation,
+            Some(kept("conv-1", Some("/t/conv-1.jsonl")))
+        );
+        // Another conversation's file isn't this one's.
+        session.set_hooked_conversation("claude", kept("conv-2", None));
+        assert_eq!(session.conversation, Some(kept("conv-2", None)));
+    }
+
+    #[test]
+    fn an_agent_typed_into_the_shell_is_resumed_by_its_command_while_in_front() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join("conv-1.jsonl");
+        let conversation = Conversation {
+            id: "conv-1".into(),
+            transcript: Some(transcript.clone()),
+        };
+        let restart = |front: Option<Front>, reporter: Option<&Reporter>| {
+            restart_with(
+                Some(conversation.clone()),
+                reporter,
+                Some("claude"),
+                front.as_ref(),
+            )
+        };
+        // Never sent a prompt, it has no transcript to pick up.
+        assert_eq!(restart(Some(claude()), None), (None, None));
+        std::fs::write(&transcript, "{}\n").unwrap();
+        let resume = vec!["claude".to_string(), "--resume".into(), "conv-1".into()];
+        assert_eq!(restart(Some(claude()), None), (None, Some(resume)));
+        assert_eq!(
+            restart(Some(Front::Shell { name: "zsh".into() }), None),
+            (None, None)
+        );
+        assert_eq!(restart(None, None), (None, None));
+        // An agent that reports for itself says how it resumes.
+        let reporter = Reporter {
+            agent: "pi".into(),
+            message: None,
+            resume: Some(vec!["pi".into(), "--resume".into()]),
+        };
+        let (_, resume) = restart(Some(claude()), Some(&reporter));
+        assert_eq!(resume.unwrap(), ["pi", "--resume"]);
+        // crystal's own agent picks its conversation up itself.
+        let own = restart_with(Some(conversation.clone()), None, None, None);
+        assert_eq!(own, (Some(conversation.clone()), None));
+        let codex = restart_with(
+            Some(conversation),
+            None,
+            Some("codex"),
+            Some(&Front::Agent {
+                program: "codex".into(),
+                name: "Codex".into(),
+            }),
+        );
+        assert_eq!(codex.1.unwrap(), ["codex", "resume", "conv-1"]);
+    }
+
+    #[test]
+    fn subagents_are_counted_as_they_start_and_stop() {
+        use AgentEvent::*;
+        assert_eq!(subagents_after(0, SubagentStarted), 1);
+        assert_eq!(subagents_after(1, SubagentStarted), 2);
+        assert_eq!(subagents_after(2, SubagentStopped), 1);
+        assert_eq!(subagents_after(0, SubagentStopped), 0, "never below none");
+        assert_eq!(subagents_after(2, TurnEnded), 2, "they can outlive a turn");
+        assert_eq!(subagents_after(2, Started), 0);
+    }
+
+    #[test]
+    fn a_subagent_stopping_never_ends_the_turn() {
+        assert_eq!(
+            after(Some(Working), AgentEvent::SubagentStopped),
+            Some(Working)
+        );
+        assert_eq!(
+            after(Some(Waiting), AgentEvent::SubagentStarted),
+            Some(Waiting)
+        );
+        assert_eq!(after(None, AgentEvent::SubagentStarted), None);
     }
 
     fn after(before: Option<Activity>, event: AgentEvent) -> Option<Activity> {

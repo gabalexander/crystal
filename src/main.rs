@@ -27,6 +27,7 @@ mod git;
 mod handoff;
 mod handover;
 mod hook;
+mod integration;
 mod keys;
 mod layout;
 mod layout_relay;
@@ -581,6 +582,14 @@ enum Command {
         #[arg(long, requires = "install")]
         force: bool,
     },
+    /// Put crystal's hooks in Claude Code's or Codex's own settings, so one
+    /// you start yourself in a session's shell says what it's doing and is
+    /// resumed after a restart; and Codex sessions crystal starts report
+    /// too.
+    Integration {
+        #[command(subcommand)]
+        command: IntegrationCommand,
+    },
     /// Run crystal on another machine, over your own ssh: its TUI, or a
     /// crystal command there, like `crystal ssh box ls`.
     Ssh {
@@ -605,7 +614,14 @@ enum Command {
     },
     /// Tell the daemon about an agent's event; what the agent's hooks run.
     #[command(hide = true)]
-    Hook { agent: String },
+    Hook {
+        agent: String,
+
+        /// Run by the hooks `crystal integration` installed, which leave an
+        /// agent crystal started with hooks of its own to those.
+        #[arg(long)]
+        installed: bool,
+    },
     /// Serve a project's memory to Claude over MCP, on standard input and
     /// output: what a task in the background searches it with.
     #[command(hide = true)]
@@ -613,6 +629,27 @@ enum Command {
         /// The project's directory [default: the current one]
         #[arg(short = 'C', long = "dir", value_name = "DIR")]
         dir: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum IntegrationCommand {
+    /// Add crystal's hooks, beside your own, to every event crystal
+    /// listens to. Codex runs them once you've reviewed them in its
+    /// `/hooks`.
+    Install {
+        /// The agent [default: each one installed here]
+        agent: Option<integration::Agent>,
+    },
+    /// Take crystal's hooks out again, and only those.
+    Uninstall {
+        /// The agent [default: each one installed here]
+        agent: Option<integration::Agent>,
+    },
+    /// Whether crystal's hooks are installed, for this crystal.
+    Status {
+        /// The agent [default: both]
+        agent: Option<integration::Agent>,
     },
 }
 
@@ -1391,6 +1428,7 @@ fn run(cli: Cli) -> Result<()> {
                 skill::print();
             }
         }
+        Command::Integration { command } => run_integration(command)?,
         Command::Ssh {
             install,
             destination,
@@ -1405,7 +1443,7 @@ fn run(cli: Cli) -> Result<()> {
             std::process::exit(code);
         }
         Command::Daemon { handover } => daemon::run(&socket, handover)?,
-        Command::Hook { agent } => hook::run(&socket, &agent),
+        Command::Hook { agent, installed } => hook::run(&socket, &agent, installed),
         Command::Mcp { dir } => mcp::run(&socket, &here(dir)?)?,
     }
     Ok(())
@@ -1617,6 +1655,33 @@ fn flow(socket: &Path, json: bool, command: Option<FlowCommand>) -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// `crystal integration` and its commands, for the agent named or, without
+/// one, each installed here; `status` without one is about both.
+fn run_integration(command: IntegrationCommand) -> Result<()> {
+    let crystal = std::env::current_exe()?;
+    match command {
+        IntegrationCommand::Install { agent } => {
+            for agent in integration::chosen(agent)? {
+                for line in integration::install(agent, &crystal)? {
+                    println!("{line}");
+                }
+            }
+        }
+        IntegrationCommand::Uninstall { agent } => {
+            for agent in integration::chosen(agent)? {
+                println!("{}", integration::uninstall(agent)?);
+            }
+        }
+        IntegrationCommand::Status { agent } => {
+            let agents = agent.map_or(integration::Agent::ALL.to_vec(), |agent| vec![agent]);
+            for agent in agents {
+                println!("{}", integration::status(agent, &crystal)?);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// `crystal tab` and its commands. A new tab's number is printed.

@@ -172,25 +172,31 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   every subscriber: clients streaming over the socket, and the plugins' hooks
 - `src/events_cli.rs`: `crystal events`: the log in a shell, filtered, as lines or JSON, or followed, and `--since`
   read as a while back or a time on this machine's clock
-- `src/agents.rs`: what crystal knows about particular agents: the hooks it adds to Claude Code, and what they
-  mean, and where an agent hears crystal's notes: Claude Code's system prompt, or the top of another's first
-  prompt
+- `src/agents.rs`: what crystal knows about particular agents: the hooks it adds to Claude Code, the events it
+  listens to from Claude Code and Codex and what they mean, subagents' among them, the variable that quiets
+  the installed hooks for an agent crystal hooked itself, the command that resumes one typed into a shell, and
+  where an agent hears crystal's notes: Claude Code's system prompt, or the top of another's first prompt
 - `src/catalog.rs`: the agents the new-session panel offers: their names, how each takes a first prompt and
   where it is on a command line, their options, and which are installed
 - `src/codex.rs`: what crystal knows about Codex: finding a session's conversation in its rollouts, `codex
   resume`, and crystal's notes given as its developer instructions, after the ones it has already
-- `src/hook.rs`: `crystal hook <agent>`: what those hooks run, to tell the daemon, the prompt sent included, and
-  to pass on its reminder to an agent ending a turn with its task open
+- `src/hook.rs`: `crystal hook <agent>`: what those hooks run, Claude Code's and Codex's, to tell the daemon,
+  the prompt sent, the conversation and a subagent included, and to pass on its reminder to an agent ending a
+  turn with its task open; with `--installed`, the hooks `crystal integration` installed
+- `src/integration.rs`: `crystal integration install|uninstall|status`: crystal's hooks put in Claude Code's
+  `settings.json` and Codex's `hooks.json` (and `[features] hooks` in its `config.toml`, with `toml_edit`),
+  beside the user's own, replacing those of a crystal at another path, taken out again alone, written in one
+  go through symbolic links; pure edits on the JSON, so they're unit-tested
 - `src/report.rs`: `crystal report`: any agent, or a script wrapped around one, saying what it's doing and the
   command that resumes it; checking that command, and what's typed into a shell to run it after a restart
 - `src/agent_screen.rs`: reading what an agent is doing off its screen and title
 - `src/front.rs`: what's in front in a session's terminal (agent, shell or program), from its foreground process
 - `src/typing.rs`: typing into a session the way a person would: pastes marked, Enter on its own
 - `src/session.rs`: one program in a PTY, or a task: spawn, exit status, stop, its screen (120 by 40 until a viewer
-  sizes it), viewers and listeners,
-  the agent that says what it's doing itself while it holds the session, whether its first prompt can name
-  it, and what has changed in it (its agent's activity, a task's runs) for the daemon to tell; handing it over
-  and adopting it, its PTY on a descriptor of crystal's own
+  sizes it), viewers and listeners, the agent that says what it's doing itself while it holds the session, an
+  agent typed into its shell whose conversation a restart resumes while it's in front, its agent's subagents,
+  whether its first prompt can name it, and what has changed in it (its agent's activity, a task's runs) for the
+  daemon to tell; handing it over and adopting it, its PTY on a descriptor of crystal's own
 - `src/vt.rs`: a terminal's screen, through `alacritty_terminal`: what a program drew and its history, the modes
   it set, its answers to the program's questions (the daemon's screen only), the output that catches a new viewer
   up (its hyperlinks included), the cells to draw, the input modes `crystal attach` asks your terminal for, and,

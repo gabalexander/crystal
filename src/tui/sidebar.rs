@@ -472,8 +472,8 @@ fn session_line<'a>(
     // The indent, the mark and a space before the name; a space at the end.
     let room = usize::from(width).saturating_sub(SESSION_INDENT.len() + 2 + 1);
     let when = changed_ago(session, look.now);
-    let label = front_label(session).unwrap_or_default();
-    let (label, when) = fitting_extras(session.name.chars().count(), label, &when, room);
+    let label = extras_label(session);
+    let (label, when) = fitting_extras(session.name.chars().count(), &label, &when, room);
 
     let mut spans = vec![
         Span::raw(SESSION_INDENT),
@@ -527,6 +527,18 @@ fn front_label(session: &SessionInfo) -> Option<&str> {
     let word = session.front.as_ref()?.word();
     let named = session.name.to_lowercase().contains(&word.to_lowercase());
     if named { None } else { Some(word) }
+}
+
+/// What a row says of the session beside its name: what's in front, as
+/// [`front_label`] has it, and `+2` after it while its agent has two
+/// subagents running.
+fn extras_label(session: &SessionInfo) -> String {
+    let front = front_label(session).unwrap_or_default();
+    match session.subagents {
+        0 => front.to_string(),
+        count if front.is_empty() => format!("+{count}"),
+        count => format!("{front} +{count}"),
+    }
 }
 
 /// Which of a row's extras fit beside a name `name_width` wide in `room`
@@ -673,6 +685,7 @@ mod tests {
             task: None,
             asking: None,
             reporter: None,
+            subagents: 0,
         }
     }
 
