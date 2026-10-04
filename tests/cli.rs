@@ -11705,7 +11705,9 @@ fn a_gate_stops_the_flow_waiting_on_the_user_until_they_go_on() {
     let out = flow_ok(&crystal, &path, &["gated", "add retries", "--wait"]);
     assert_eq!(out, "gated-1\nwaiting at plan\n");
     // Its step waits on the user, the way an agent asking something does.
-    assert_eq!(status(&crystal, "gated-1-plan"), "waiting");
+    eventually("the plan step's session is waiting", || {
+        status(&crystal, "gated-1-plan") == "waiting"
+    });
     let sessions: serde_json::Value = serde_json::from_str(&crystal.ok(&["ls", "--json"])).unwrap();
     assert_eq!(sessions[0]["name"], "gated-1-plan");
     assert_eq!(sessions[0]["status"], "waiting");
@@ -11796,7 +11798,11 @@ fn a_failed_step_stops_the_flow_until_it_runs_again() {
         "{}",
         runs[1]
     );
-    assert_eq!(status(&crystal, "pair-1-plan"), "idle");
+    // The step's session reads idle once its turn has been seen, a moment
+    // after the flow is done.
+    eventually("the plan step's session is idle", || {
+        status(&crystal, "pair-1-plan") == "idle"
+    });
 }
 
 #[test]
