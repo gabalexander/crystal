@@ -44,9 +44,15 @@ whenever what's handed over changes in a way the crystal before couldn't read.
 - `src/client.rs`: connects to the daemon, starting it when needed; `tell` gives it an event from outside,
   `subscribe` a stream of its events, for the CLI and a TUI to read, which picks up again after a handover,
   and `lay_out` a layout command for the TUI; restarting the daemon, handed over or cold
-- `src/layout.rs`: laying out the TUI from the command line: the commands `crystal tab`, `crystal pane` and
-  `crystal title` send, the order a TUI gets with the id of the session it was run in, what the TUI reports
-  back, the layout it answers with, where the daemon says the user is, and how `crystal layout` prints it
+- `src/layout.rs`: laying out the TUI from the command line: the commands `crystal tab`, `crystal pane`,
+  `crystal title` and `crystal layout apply` send, the order a TUI gets with the id of the session it was run
+  in, what the TUI reports back, the layout it answers with, where the daemon says the user is, and how
+  `crystal layout` prints it
+- `src/layout_file.rs`: layout files, as herdr's `layout.export` and `layout.apply` take them: `crystal layout
+  export` writing the tabs with what starts each session again, and `crystal layout apply` reading one (the
+  shape `crystal layout --json` prints, with a session's `cwd`, `command` and `env` where it's named),
+  checking it, starting what isn't there that it says how to, and the tabs it comes to, what couldn't start
+  left out; pure but for reading the file and asking the daemon, so it's unit-tested
 - `src/layout_relay.rs`: the daemon's side of those commands: the TUIs that take orders and which was used last
   (a key, a click, its terminal brought to the front), whether each one's terminal has the focus, which says
   where the user is for notifications, an order written to that one and its answer handed back to the command
@@ -100,8 +106,10 @@ whenever what's handed over changes in a way the crystal before couldn't read.
     edited in the issues view laid over what was asked before the forge saved them; no I/O, so it's
     unit-tested
     - `app/commands.rs`: the layout commands carried out on the state, each on the tab holding the session it's
-      about, in front or not, and the layout the TUI answers with; and carried out with no TUI open, on a state
-      made for it from the tabs kept, the sessions and the flow runs, on a screen of an unseen session's size
+      about, in front or not, a layout applied (each of its tabs in place of the tab of its name or after the
+      others, or in place of every tab), and the layout the TUI answers with; and carried out with no TUI
+      open, on a state made for it from the tabs kept, the sessions and the flow runs, on a screen of an unseen
+      session's size
   - `layout_link.rs`: the TUI's end of the layout commands: offering the daemon to take them, again at once
     after a handover or a restart, each one an event for the loop, and its answers, that it was used (a
     key, the mouse, a paste, focus gained) and when its terminal gains and loses the focus  sent back
@@ -116,8 +124,9 @@ whenever what's handed over changes in a way the crystal before couldn't read.
     them in the database, and tabs kept from when a tab's panes were a list are read as a tree
   - `split_tree.rs`: a tab's panes as a tree of splits, right or down at a ratio, at any depth, one pane
     following the selection: laying them out, borders, the pane beside another on screen, splitting, closing,
-    swapping, resizing within each pane's least size, dragging a border, evening them out, and folding the tree
-    into a value; pure, so it's unit-tested
+    swapping, resizing within each pane's least size, dragging a border, giving a pane's side of a split a share
+    of its room, evening them out, folding the tree into a value and putting one together; pure, so it's
+    unit-tested
   - `archived_view.rs`: the archive (`Z`): the sessions `A` archived, the latest first, one started again or
     deleted after a `y`; its state and keys, kept apart from I/O (the event loop asks the daemon), and its
     drawing
