@@ -557,6 +557,7 @@ mod tests {
                 agent: "pi".into(),
                 message: Some("Which database, staging or prod?".into()),
                 resume: None,
+                source: None,
             }),
             ..session("pi", Some(Activity::Waiting), 1)
         };

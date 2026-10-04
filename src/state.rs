@@ -7,7 +7,7 @@
 //! session started again gets the environment of whoever started the
 //! daemon again.
 
-use crate::protocol::{Conversation, TaskInfo, TaskSpec};
+use crate::protocol::{Conversation, TaskBrief, TaskInfo, TaskSpec};
 use crate::socket;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -33,6 +33,10 @@ pub struct SavedSession {
     /// its session up again: see [`crate::report`].
     #[serde(default)]
     pub resume: Option<Vec<String>>,
+    /// The pull request and the issue it's about, task or not, which its
+    /// agent is told of each time it starts.
+    #[serde(default, skip_serializing_if = "TaskBrief::is_empty")]
+    pub about: TaskBrief,
 }
 
 /// The database of the daemon at `socket`. A server's socket lives in
@@ -147,6 +151,18 @@ fn fnv1a(bytes: &[u8]) -> u64 {
         hash = hash.wrapping_mul(0x0100_0000_01b3);
     }
     hash
+}
+
+/// Where `crystal mermaid --open` writes the pages it opens, one for each
+/// diagram it was given: every server's.
+pub fn diagrams_dir() -> PathBuf {
+    state_dir().join("diagrams")
+}
+
+/// Where `crystal update` keeps the notes of the release it updated to, for
+/// the TUI of the new crystal to show: every server's.
+pub fn release_notes_path() -> PathBuf {
+    state_dir().join("release-notes.json")
 }
 
 /// `$XDG_STATE_HOME/crystal`, or `~/.local/state/crystal`.

@@ -437,11 +437,7 @@ impl FlowRun {
         let profile = self.profile_of(step);
         let prompt = asked(&profile, prompt);
         // The profile's command with no prompt is the agent and its options.
-        let options = Profile {
-            prompt: None,
-            ..profile
-        }
-        .command("");
+        let options = profile.without_prompts().command("");
         TaskSpec {
             prompt,
             args: options[1..].to_vec(),
@@ -454,11 +450,7 @@ impl FlowRun {
     pub fn command(&self, step: usize, prompt: &str) -> (Vec<String>, String) {
         let profile = self.profile_of(step);
         let asked = asked(&profile, prompt);
-        let command = Profile {
-            prompt: None,
-            ..profile
-        }
-        .command(&asked);
+        let command = profile.without_prompts().command(&asked);
         (command, asked)
     }
 
@@ -582,10 +574,7 @@ impl FlowRun {
 /// What an agent started with `profile` is asked to do `prompt`: the
 /// profile's own prompt ahead of it.
 fn asked(profile: &Profile, prompt: &str) -> String {
-    match profile.prompt.as_deref().map(str::trim) {
-        Some(asks) if !asks.is_empty() => format!("{asks}\n\n{prompt}"),
-        _ => prompt.to_string(),
-    }
+    profile.asked(prompt)
 }
 
 /// What `{feedback}` says once the flow has been sent back from the step

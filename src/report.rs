@@ -18,8 +18,14 @@
 //! under its session's row in the sidebar, or the model it runs on, as
 //! herdr's `report-metadata` does: for the sidebar alone, which doesn't
 //! take the status over. Each stays until it's said again or taken off, or
-//! for as long as `--ttl` gives it, and a report numbered with `--seq`
-//! that comes after a later one from the same `--source` is passed over.
+//! for as long as `--ttl` gives it.
+//!
+//! Any report can say who sent it, with `--source`, and number it, with
+//! `--seq`: one numbered no higher than the last from the same source came
+//! late, and is passed over, so a hook that runs late can't put back what
+//! its agent was doing before. What an agent is doing and what's on its
+//! row are numbered apart, so one command can say both under one number.
+//! A source that took the session over is the one that lets go of it.
 
 use crate::client;
 use crate::printable;
@@ -56,22 +62,31 @@ pub const LONGEST_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 const MOST_SOURCES: usize = 32;
 
 /// Tells the daemon what the agent in the session called `name`, or the
-/// one this runs in, says about itself: what it puts on its row, then what
-/// it's doing.
+/// one this runs in, says about itself: what it puts on its row, if
+/// `metadata` puts anything there, then what it's doing. Both are sent by
+/// `metadata`'s source, under its number.
 pub fn run(
     socket: &Path,
     name: Option<String>,
-    metadata: Option<Metadata>,
+    metadata: Metadata,
     report: Option<AgentReport>,
 ) -> Result<()> {
     let id = work::own_session(socket, &name, "which session it's about")?;
-    if let Some(metadata) = metadata {
-        check_source(metadata.source.as_deref())?;
+    let (source, seq) = (metadata.source.clone(), metadata.seq);
+    check_source(source.as_deref())?;
+    if metadata.shows() {
         let (id, name) = (id.clone(), name.clone());
         ask(socket, &Request::ReportMetadata { id, name, metadata })?;
     }
     if let Some(report) = report {
-        ask(socket, &Request::ReportAgent { id, name, report })?;
+        let request = Request::ReportAgent {
+            id,
+            name,
+            report,
+            source,
+            seq,
+        };
+        ask(socket, &request)?;
     }
     Ok(())
 }
@@ -100,7 +115,7 @@ fn check_source(source: Option<&str>) -> Result<()> {
 
 /// What's on a session's row by `crystal report --line` and `--model`, in
 /// the daemon: each with when it goes, and the last number each source
-/// gave its reports.
+/// gave its reports, of what's on the row and of what its agent is doing.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Shown {
     #[serde(default)]
@@ -109,6 +124,9 @@ pub struct Shown {
     model: Option<Kept>,
     #[serde(default)]
     seqs: BTreeMap<String, u64>,
+    /// Handed over by crystals since these were.
+    #[serde(default)]
+    status_seqs: BTreeMap<String, u64>,
 }
 
 /// Something said for a row, and when it goes, if it does.
@@ -144,17 +162,8 @@ impl Shown {
             }
             None => None,
         };
-        check_source(metadata.source.as_deref())?;
-        if let Some(seq) = metadata.seq {
-            let source = metadata.source.clone().unwrap_or_default();
-            match self.seqs.get(&source) {
-                Some(&last) if seq <= last => return Ok(false),
-                None if self.seqs.len() >= MOST_SOURCES => {
-                    bail!("this session has taken numbered reports from {MOST_SOURCES} sources")
-                }
-                _ => {}
-            }
-            self.seqs.insert(source, seq);
+        if !in_order(&mut self.seqs, metadata.source.as_deref(), metadata.seq)? {
+            return Ok(false);
         }
         let kept = |text: &str| {
             let text = tidy(text);
@@ -169,6 +178,13 @@ impl Shown {
         Ok(true)
     }
 
+    /// Whether a report of what the agent is doing, numbered `seq` by
+    /// `source`, comes in order: false when it came after a later one from
+    /// the same source, and is to be passed over.
+    pub fn status_in_order(&mut self, source: Option<&str>, seq: Option<u64>) -> Result<bool> {
+        in_order(&mut self.status_seqs, source, seq)
+    }
+
     /// The line on the row at `now`, while it lasts.
     pub fn line(&self, now: SystemTime) -> Option<&str> {
         self.line.as_ref()?.at(now)
@@ -178,6 +194,31 @@ impl Shown {
     pub fn model(&self, now: SystemTime) -> Option<&str> {
         self.model.as_ref()?.at(now)
     }
+}
+
+/// Whether the report numbered `seq` by `source` comes after the last one
+/// that source numbered, in `seqs`, which it then takes the place of. A
+/// report with no number is always in order; a session takes numbered
+/// reports from [`MOST_SOURCES`] sources at most.
+fn in_order(
+    seqs: &mut BTreeMap<String, u64>,
+    source: Option<&str>,
+    seq: Option<u64>,
+) -> Result<bool> {
+    check_source(source)?;
+    let Some(seq) = seq else {
+        return Ok(true);
+    };
+    let source = source.unwrap_or_default();
+    match seqs.get(source) {
+        Some(&last) if seq <= last => return Ok(false),
+        None if seqs.len() >= MOST_SOURCES => {
+            bail!("this session has taken numbered reports from {MOST_SOURCES} sources")
+        }
+        _ => {}
+    }
+    seqs.insert(source.to_string(), seq);
+    Ok(true)
 }
 
 /// `text` as a row can show it: on one line, without control characters
@@ -375,6 +416,26 @@ mod tests {
                 .unwrap();
         }
         assert!(shown.take(&numbered("x", "one-too-many", 1), now).is_err());
+    }
+
+    #[test]
+    fn what_an_agent_is_doing_is_numbered_apart_from_its_row() {
+        let now = SystemTime::now();
+        let mut shown = Shown::default();
+        let numbered = Metadata {
+            source: Some("hook".into()),
+            seq: Some(5),
+            ..line("indexing")
+        };
+        // One command says both under one number.
+        assert!(shown.take(&numbered, now).unwrap());
+        assert!(shown.status_in_order(Some("hook"), Some(5)).unwrap());
+        assert!(!shown.status_in_order(Some("hook"), Some(4)).unwrap());
+        assert!(!shown.status_in_order(Some("hook"), Some(5)).unwrap());
+        assert!(shown.status_in_order(Some("hook"), Some(6)).unwrap());
+        assert!(shown.status_in_order(Some("hook"), None).unwrap());
+        assert!(shown.status_in_order(None, Some(1)).unwrap());
+        assert!(shown.status_in_order(Some("a b"), Some(1)).is_err());
     }
 
     #[test]

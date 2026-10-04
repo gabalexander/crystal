@@ -36,6 +36,7 @@ mod memory_view;
 mod menu;
 pub(crate) mod mouse;
 mod needs_you;
+pub(crate) mod page;
 mod pane;
 mod plugins_view;
 mod preview;
@@ -94,6 +95,7 @@ use crossterm::event::{
 use diff_view::Against;
 use keymap::{CommandKind, KeyCommand, Sequence, SplitWay};
 use layouts::{Layouts, Which};
+use page::Page;
 use pane::Pane;
 use ratatui::DefaultTerminal;
 use ratatui::layout::Rect;
@@ -272,6 +274,9 @@ pub enum Event {
     Resources(crate::resources::Resources),
     /// Something to tell the user, from work done off the loop.
     Notice(String),
+    /// What's new in this crystal: its release's notes, asked for as its
+    /// TUI first opened after an update.
+    WhatsNew(String),
     /// A worktree's diff, read for the diff view.
     DiffRead {
         dir: PathBuf,
@@ -381,6 +386,7 @@ pub fn run(socket: &Path) -> Result<()> {
     }
     let config = Config::load()?;
     crate::vt::set_history_lines(config.scrollback_lines);
+    crate::mermaid::set_ascii(config.mermaid_ascii);
     // Asking for the list starts the daemon if it isn't running.
     let sessions = list_sessions(socket, true)?;
 
@@ -506,6 +512,7 @@ pub fn run(socket: &Path) -> Result<()> {
     if config.update.check {
         tui.look_for_update();
     }
+    tui.show_whats_new(config.update.check);
 
     let mut terminal = ratatui::try_init()?;
     let result = tui.run_with_modes(&mut terminal, events);
@@ -731,9 +738,10 @@ impl Tui {
     fn draw(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
         let size = terminal.size()?;
         self.screen = Rect::new(0, 0, size.width, size.height);
+        // First, for what's laid out to go by it: one column or not.
+        self.app.set_screen(self.screen);
         let areas = ui::Areas::of(&self.app, self.screen);
         self.app.set_tiles(areas.tiles);
-        self.app.set_screen(self.screen);
         self.sync_panes(&areas);
         if let Some(overlay) = &mut self.overlay {
             let popup = self.app.plugin_pane().and_then(|pane| pane.popup.as_ref());
@@ -865,6 +873,34 @@ impl Tui {
         thread::spawn(move || {
             if let Some(notice) = update::newer_notice() {
                 let _ = events.send(Event::Notice(notice));
+            }
+        });
+    }
+
+    /// Shows what's new in this crystal, once, as its TUI first opens after
+    /// an update: the release's notes an update kept, or else, unless `ask`
+    /// says not to, asked of where the releases are, off the loop.
+    fn show_whats_new(&mut self, ask: bool) {
+        let Ok(db) = &self.db else {
+            return;
+        };
+        let kept = self.ui(db::OPENED);
+        let opened_before = self.ui(db::TABS).is_some();
+        let _ = db.keep_ui(db::OPENED, &update::Opened::now());
+        if !update::has_news(kept.as_deref(), opened_before) {
+            return;
+        }
+        if let Some(body) = update::this_crystals_kept_notes() {
+            self.app.show_page(Page::new(&update::notes_title(), &body));
+            return;
+        }
+        if !ask {
+            return;
+        }
+        let events = self.events.clone();
+        thread::spawn(move || {
+            if let Some(body) = update::this_crystals_notes() {
+                let _ = events.send(Event::WhatsNew(body));
             }
         });
     }
@@ -1122,14 +1158,20 @@ impl Tui {
     }
 
     /// The next event. While an agent works, the wait is cut short in time
-    /// to turn its mark, and while a drag is held past the edge of a pane,
-    /// to scroll it again, and there's no event: only a frame to draw.
+    /// to turn its mark, while a drag is held past the edge of a pane, to
+    /// scroll it again, and while a key shows at the footer, to take it off,
+    /// and there's no event: only a frame to draw.
     fn next_event(&self, events: &Receiver<Event>) -> Result<Option<Event>> {
         let spin = self.app.anything_working().then_some(SPIN_EVERY);
         let edge = self
             .edge
             .map(|edge| edge.next.saturating_duration_since(Instant::now()));
-        let Some(wait) = spin.into_iter().chain(edge).min() else {
+        // A key shown at the footer goes when its time is up.
+        let shown_key = self
+            .app
+            .shown_key_goes()
+            .map(|goes| goes.saturating_duration_since(Instant::now()));
+        let Some(wait) = spin.into_iter().chain(edge).chain(shown_key).min() else {
             return Ok(Some(events.recv()?));
         };
         match events.recv_timeout(wait) {
@@ -1239,6 +1281,9 @@ impl Tui {
                 self.carry_out(*start);
             }
             Event::Notice(notice) => self.app.notify(notice),
+            Event::WhatsNew(body) => {
+                self.app.show_page(Page::new(&update::notes_title(), &body));
+            }
             Event::Resources(taken) => self.app.set_resources(taken),
             Event::Output { pane, bytes } => {
                 let Some(pane) = self.pane_with_id(pane) else {
@@ -2511,6 +2556,7 @@ impl Tui {
         }
         self.app.set_start_dir(start_dir(config));
         crate::vt::set_history_lines(config.scrollback_lines);
+        crate::mermaid::set_ascii(config.mermaid_ascii);
         if config.mouse.capture != self.config.mouse.capture {
             capture_mouse(config.mouse.capture);
         }

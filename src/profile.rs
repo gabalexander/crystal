@@ -1,7 +1,8 @@
 //! Profiles: named, saved ways of starting an agent. A profile says which
 //! agent, set up how (its model, how hard it thinks, how it asks before
-//! acting, more arguments), what it's asked on top of every task, the
-//! standing instructions it keeps all session, and where it starts. The
+//! acting, more arguments), what it's asked before and after every task,
+//! or instead of one, the standing instructions it keeps all session, where
+//! it starts, and how: a session, a task or a background task. The
 //! new-session panel offers them first.
 //!
 //! They live in the config file as `[[profile]]` tables. The TUI changes
@@ -51,6 +52,14 @@ pub struct Profile {
     /// Text put in front of the task: what this profile always asks for.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt: Option<String>,
+    /// Text put after the task, like how to go about it or what to end
+    /// with.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub postfix: Option<String>,
+    /// Starts without asking for a task: its prompt and postfix alone are
+    /// what it's asked.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub skip_task: bool,
     /// What the agent keeps in mind all session, on top of its own
     /// instructions: added to Claude Code's system prompt, or given to
     /// Codex as developer instructions.
@@ -60,6 +69,55 @@ pub struct Profile {
     /// starts wherever the panel is set to.
     #[serde(rename = "where", default, skip_serializing_if = "Option::is_none")]
     pub start_in: Option<StartIn>,
+    /// How it's meant to start, which choosing it in the panel sets: left
+    /// out, as the panel is set.
+    #[serde(default, skip_serializing_if = "Launch::is_either")]
+    pub launch: Launch,
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
+}
+
+/// How a profile's agent is meant to start.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Launch {
+    /// As the new-session panel is set.
+    #[default]
+    Either,
+    /// In a terminal, what it's asked only its first prompt: a session,
+    /// not a task, with nothing to close.
+    Session,
+    /// In a terminal, as a task, which `crystal done` closes.
+    Task,
+    /// As a background task, `claude -p`, for Claude Code; another agent
+    /// starts as a task in a terminal.
+    Background,
+}
+
+impl Launch {
+    /// Every one, in the order the profiles view goes through them.
+    pub const ALL: [Launch; 4] = [
+        Launch::Either,
+        Launch::Session,
+        Launch::Task,
+        Launch::Background,
+    ];
+
+    fn is_either(&self) -> bool {
+        *self == Launch::Either
+    }
+
+    /// Its word, as the config file has it.
+    pub fn word(self) -> &'static str {
+        match self {
+            Launch::Either => "either",
+            Launch::Session => "session",
+            Launch::Task => "task",
+            Launch::Background => "background",
+        }
+    }
 }
 
 /// Where a profile starts its agent.
@@ -85,9 +143,38 @@ impl Profile {
             mode: None,
             args: Vec::new(),
             prompt: None,
+            postfix: None,
+            skip_task: false,
             instructions: None,
             start_in: None,
+            launch: Launch::Either,
         }
+    }
+
+    /// The same, but for what it's asked before and after a task: its
+    /// agent and its options.
+    pub fn without_prompts(&self) -> Profile {
+        Profile {
+            prompt: None,
+            postfix: None,
+            ..self.clone()
+        }
+    }
+
+    /// What it asks its agent on `task`: its prompt, the task and its
+    /// postfix, those there are, a blank line apart.
+    pub fn asked(&self, task: &str) -> String {
+        let parts = [
+            filled(&self.prompt),
+            Some(task.trim()),
+            filled(&self.postfix),
+        ];
+        let parts: Vec<&str> = parts
+            .into_iter()
+            .flatten()
+            .filter(|p| !p.is_empty())
+            .collect();
+        parts.join("\n\n")
     }
 
     /// What it sets the agent's row of `kind` to, if anything.
@@ -110,7 +197,8 @@ impl Profile {
 
     /// The command line that starts it on `task`: the agent, its options in
     /// the order of its rows, its instructions and arguments, then its
-    /// prompt and the task, the way the agent takes a first prompt.
+    /// prompt, the task and its postfix, the way the agent takes a first
+    /// prompt.
     pub fn command(&self, task: &str) -> Vec<String> {
         let agent = catalog::find(&self.agent);
         let mut command = vec![self.agent.clone()];
@@ -125,11 +213,7 @@ impl Profile {
             command.extend(instructions.args(text));
         }
         command.extend(self.args.iter().cloned());
-        let prompt = match (filled(&self.prompt), task) {
-            (Some(asks), "") => asks.to_string(),
-            (Some(asks), task) => format!("{asks}\n\n{task}"),
-            (None, task) => task.to_string(),
-        };
+        let prompt = self.asked(task);
         let first_prompt = agent.map_or(FirstPrompt::Argument, |agent| agent.first_prompt);
         first_prompt.add(&mut command, &prompt);
         command
@@ -281,12 +365,25 @@ fn fill(table: &mut Table, profile: &Profile) {
     set_text(table, "mode", profile.mode.as_deref());
     set_words(table, "args", &profile.args);
     set_text(table, "prompt", filled(&profile.prompt));
+    set_text(table, "postfix", filled(&profile.postfix));
+    set_flag(table, "skip_task", profile.skip_task);
     set_text(table, "instructions", filled(&profile.instructions));
     let start_in = profile.start_in.map(|start_in| match start_in {
         StartIn::Here => "here",
         StartIn::Worktree => "worktree",
     });
     set_text(table, "where", start_in);
+    let launch = (profile.launch != Launch::Either).then(|| profile.launch.word());
+    set_text(table, "launch", launch);
+}
+
+/// Sets `key` to true, or takes it out for false, the default.
+fn set_flag(table: &mut Table, key: &str, on: bool) {
+    if !on {
+        table.remove(key);
+    } else if table.get(key).and_then(Item::as_bool) != Some(true) {
+        table.insert(key, value(true));
+    }
 }
 
 fn set_text(table: &mut Table, key: &str, text: Option<&str>) {
@@ -328,8 +425,11 @@ mod tests {
             mode: Some("plan".into()),
             args: vec!["--verbose".into()],
             prompt: Some("Review the diff on this branch.".into()),
+            postfix: None,
+            skip_task: false,
             instructions: Some("Point out risks before style.".into()),
             start_in: Some(StartIn::Here),
+            launch: Launch::Either,
         }
     }
 
@@ -389,6 +489,61 @@ mod tests {
         );
         profile.prompt = None;
         assert_eq!(profile.command("").last().unwrap(), "--verbose");
+    }
+
+    #[test]
+    fn a_postfix_goes_after_the_task_and_alone_with_the_prompt_without_one() {
+        let profile = Profile {
+            postfix: Some("End with what you tested.".into()),
+            ..review()
+        };
+        assert_eq!(
+            profile.command("Mind the tests.").last().unwrap(),
+            "Review the diff on this branch.\n\nMind the tests.\n\nEnd with what you tested."
+        );
+        assert_eq!(
+            profile.asked(""),
+            "Review the diff on this branch.\n\nEnd with what you tested."
+        );
+        let options = profile.without_prompts().command("");
+        assert_eq!(options.last().unwrap(), "--verbose");
+    }
+
+    #[test]
+    fn launch_and_skip_task_are_written_only_when_set() {
+        let (_dir, path) = file("");
+        let committer = Profile {
+            name: "committer".into(),
+            prompt: Some("Commit the working tree.".into()),
+            postfix: Some("Don't push.".into()),
+            skip_task: true,
+            launch: Launch::Session,
+            ..Profile::for_agent("claude")
+        };
+        save(&path, None, &committer).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("skip_task = true\n"), "{text}");
+        assert!(text.contains("launch = \"session\"\n"), "{text}");
+        assert_eq!(
+            config::from_text(&text).unwrap().profiles,
+            std::slice::from_ref(&committer)
+        );
+        let either = Profile {
+            skip_task: false,
+            launch: Launch::Either,
+            ..committer
+        };
+        save(&path, Some("committer"), &either).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !text.contains("skip_task") && !text.contains("launch"),
+            "{text}"
+        );
+        let err = config::from_text(
+            "[[profile]]\nname = \"x\"\nagent = \"claude\"\nlaunch = \"remote\"\n",
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("remote"), "{err:#}");
     }
 
     #[test]

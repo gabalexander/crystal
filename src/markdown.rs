@@ -26,7 +26,7 @@
 //!
 //! Adapted from docket's `markdown.rs`.
 
-use crate::mermaid::{self, Glyphs, Rendered};
+use crate::mermaid::{self, Rendered};
 use crate::syntax::{Highlighter, TokenKind};
 use pulldown_cmark::{
     Alignment, BlockQuoteKind, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd,
@@ -515,7 +515,7 @@ impl Page {
     /// any other code block, with why for the caption.
     fn mermaid_block(&mut self, text: &str) {
         let muted = Mark::new(Ink::Muted);
-        match mermaid::render(text, self.room(), Glyphs::BOX_DRAWING) {
+        match mermaid::render(text, self.room(), mermaid::glyphs()) {
             Rendered::Diagram { lines, kind } => {
                 for line in lines {
                     self.emit(vec![Piece::new(line, Mark::new(Ink::Accent))]);

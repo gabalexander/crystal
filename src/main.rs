@@ -17,6 +17,7 @@ mod clipboard;
 mod codex;
 mod completions;
 mod config;
+mod config_bundle;
 mod daemon;
 mod db;
 mod distill;
@@ -93,7 +94,7 @@ mod worktree_hooks;
 use anyhow::{Result, bail};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use client::Restart;
-use profile::{Profile, StartIn};
+use profile::{Launch, Profile, StartIn};
 use protocol::{ArchivedSession, Request, Response, SessionInfo, TaskSpec, TaskState};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -252,13 +253,15 @@ enum Command {
         #[arg(long, value_name = "WHILE")]
         ttl: Option<String>,
 
-        /// Who reports the --line and --model, for --seq: letters, digits
-        /// and `:._-`.
+        /// Who sends the report, for --seq: letters, digits and `:._-`. A
+        /// source that takes the session over is the one that lets go of
+        /// it.
         #[arg(long, value_name = "ID")]
         source: Option<String>,
 
         /// The report's number from its --source: one numbered no higher
-        /// than the last came late, and is passed over.
+        /// than the last came late, and is passed over. What the agent is
+        /// doing and what's on its row are numbered apart.
         #[arg(long, value_name = "N")]
         seq: Option<u64>,
 
@@ -716,6 +719,11 @@ enum Command {
         /// Only say whether a newer crystal is out.
         #[arg(long)]
         check: bool,
+
+        /// Print what the release changed instead, its notes: the one
+        /// given, or this crystal's.
+        #[arg(long, conflicts_with = "check")]
+        notes: bool,
     },
     /// List the servers, each a daemon with its own sessions and state: the
     /// default one and those named with --server, with whether each is
@@ -730,8 +738,11 @@ enum Command {
         command: Option<ServerCommand>,
     },
     /// Show where the config file is, and the settings in effect, as the
-    /// file would hold them.
-    Config,
+    /// file would hold them; or export them, or import some.
+    Config {
+        #[command(subcommand)]
+        command: Option<ConfigCommand>,
+    },
     /// Remember something about this project for its later sessions: a
     /// decision, a gotcha, a command that works, a note.
     Remember {
@@ -798,13 +809,23 @@ enum Command {
         #[arg(short, long, value_name = "COLUMNS")]
         width: Option<usize>,
 
-        /// Draw with ASCII rather than box drawing.
+        /// Draw with ASCII rather than box drawing, as the mermaid_ascii
+        /// setting does.
         #[arg(long)]
         ascii: bool,
+
+        /// Have mermaid draw it in the browser instead: written on a page
+        /// in crystal's state directory, whose path is printed.
+        #[arg(long, conflicts_with_all = ["width", "ascii"])]
+        open: bool,
     },
     /// List the TUI's commands, the ids `[keys]` in the config file takes,
     /// and the keys that run them, as your config has them.
     Keys,
+    /// Print the guide: what to start, the keys that matter most, what
+    /// agents call and where things live, on one page. The TUI shows it
+    /// too: `?`, then Tab.
+    Guide,
     /// Print the Claude Code skill that teaches an agent to drive crystal.
     Skill {
         /// Install it into Claude Code's skills, in $CLAUDE_CONFIG_DIR or
@@ -1497,6 +1518,21 @@ enum ServerCommand {
 }
 
 #[derive(Subcommand)]
+enum ConfigCommand {
+    /// Write the settings, the config file and your agent rule files, as
+    /// one file to keep or take to another machine: on standard output,
+    /// into a file, or as crystal-settings.json into a directory.
+    Export {
+        /// Where to write it [default: standard output]
+        path: Option<String>,
+    },
+    /// Merge settings into yours: what they set replaces what's here, the
+    /// rest stays, and profiles and flows merge by name. From an export, a
+    /// config file, a directory holding either, or - for standard input.
+    Import { source: String },
+}
+
+#[derive(Subcommand)]
 enum WorktreeCommand {
     /// List the project's worktrees, the main one first, with each one's
     /// label and how many sessions run in it.
@@ -1946,19 +1982,17 @@ fn run(cli: Cli) -> Result<()> {
             resume,
         } => {
             let shows = line.is_some() || model.is_some();
-            if !shows && (ttl.is_some() || source.is_some() || seq.is_some()) {
-                bail!("--ttl, --source and --seq go with --line or --model");
+            if !shows && ttl.is_some() {
+                bail!("--ttl goes with --line or --model");
             }
-            let metadata = if shows {
-                Some(protocol::Metadata {
-                    line,
-                    model,
-                    ttl_secs: ttl.as_deref().map(report_ttl).transpose()?,
-                    source,
-                    seq,
-                })
-            } else {
-                None
+            // Who sent the report, and its number, go with what's on the row
+            // and with what the agent is doing alike.
+            let metadata = protocol::Metadata {
+                line,
+                model,
+                ttl_secs: ttl.as_deref().map(report_ttl).transpose()?,
+                source,
+                seq,
             };
             let resume = (!resume.is_empty()).then_some(resume);
             let report = match (state, resume) {
@@ -2226,13 +2260,21 @@ fn run(cli: Cli) -> Result<()> {
                 println!("restarted the daemon; its sessions started again, since {why}");
             }
         },
-        Command::Update { version, check } => update::run(&socket, version, check)?,
+        Command::Update {
+            version,
+            check,
+            notes,
+        } => update::run(&socket, version, check, notes)?,
         Command::Server { json, command } => match command {
             None => server_cli::list(json)?,
             Some(ServerCommand::Stop { name }) => server_cli::stop(&name)?,
             Some(ServerCommand::Delete { name }) => server_cli::delete(&name)?,
         },
-        Command::Config => print_config()?,
+        Command::Config { command } => match command {
+            None => print_config()?,
+            Some(ConfigCommand::Export { path }) => config_bundle::export(path.as_deref())?,
+            Some(ConfigCommand::Import { source }) => config_bundle::import(&source)?,
+        },
         Command::Remember {
             kind,
             files,
@@ -2339,7 +2381,17 @@ fn run(cli: Cli) -> Result<()> {
                 }
             }
         }
-        Command::Mermaid { file, width, ascii } => mermaid_cli::run(file.as_deref(), width, ascii)?,
+        Command::Mermaid {
+            file,
+            width,
+            ascii,
+            open,
+        } => {
+            // A config that can't be read draws no diagram the less.
+            let ascii = ascii || config::Config::load().is_ok_and(|config| config.mermaid_ascii);
+            mermaid_cli::run(file.as_deref(), width, ascii, open)?
+        }
+        Command::Guide => print!("{}", tui::page::GUIDE),
         Command::Keys => {
             let config = config::Config::load()?;
             let keymap = tui::keymap::Keymap::new(&config.keys).map_err(anyhow::Error::msg)?;
@@ -2465,17 +2517,30 @@ fn print_profile(profiles: &[Profile], name: &str) -> Result<()> {
         Some(StartIn::Worktree) => "in a new worktree",
         None => "wherever the new-session panel is set",
     };
+    let task = if profile.skip_task { "" } else { "<task>" };
     let command: Vec<String> = profile
-        .command("<task>")
+        .command(task)
         .iter()
         .map(|arg| shell::quote(arg))
         .collect();
+    let launch = match profile.launch {
+        Launch::Either => None,
+        Launch::Session => Some("a session, not a task"),
+        Launch::Task => Some("a task"),
+        Launch::Background => Some("a background task, Claude Code's; others a task"),
+    };
     println!("{}", profile.name);
     if let Some(description) = &profile.description {
         println!("  {description}");
     }
     println!("agent   {agent}");
     println!("starts  {place}");
+    if let Some(launch) = launch {
+        println!("as      {launch}");
+    }
+    if profile.skip_task {
+        println!("task    none: it starts at once");
+    }
     println!("runs    {}", command.join(" "));
     Ok(())
 }

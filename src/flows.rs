@@ -157,9 +157,9 @@ impl Step {
     /// The profile it runs with: the one it names among `profiles`, or
     /// Claude Code as it's set up, with its own agent, model, effort and
     /// mode in place of the profile's. On an agent other than its
-    /// profile's, it keeps only the profile's prompt and instructions, the
-    /// rest being for the profile's agent. `None` when the profile it
-    /// names isn't there.
+    /// profile's, it keeps only the profile's prompt, postfix and
+    /// instructions, the rest being for the profile's agent. `None` when
+    /// the profile it names isn't there.
     pub fn profile_in(&self, profiles: &[Profile]) -> Option<Profile> {
         let claude = Profile::for_agent("claude");
         let named = match &self.profile {
@@ -170,6 +170,7 @@ impl Step {
             Some(agent) if *agent != named.agent => Profile {
                 name: named.name.clone(),
                 prompt: named.prompt.clone(),
+                postfix: named.postfix.clone(),
                 instructions: named.instructions.clone(),
                 ..Profile::for_agent(agent)
             },

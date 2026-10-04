@@ -558,10 +558,7 @@ impl Daemon {
         let id = id.unwrap_or_else(new_id);
         let goal = saved.goal.clone();
         let backlog = goal.as_ref().and_then(|goal| goal.backlog);
-        let brief = goal
-            .as_ref()
-            .map(|goal| goal.brief.clone())
-            .unwrap_or_default();
+        let brief = brief_of(&saved);
         let name = match saved.task {
             // A task comes back at rest: a run it was in the middle of
             // can't be picked up halfway, so it isn't run again either.
@@ -2017,7 +2014,13 @@ impl Daemon {
                     None => Ok(Response::Done),
                 }
             }
-            Request::ReportAgent { id, name, report } => {
+            Request::ReportAgent {
+                id,
+                name,
+                report,
+                source,
+                seq,
+            } => {
                 let mut sessions = self.sessions.lock().unwrap();
                 let session = match (id, name) {
                     (Some(id), _) => with_id(&mut sessions, &id)?,
@@ -2030,7 +2033,9 @@ impl Daemon {
                     session.name
                 );
                 ensure!(session.is_running(), "{} has ended", session.name);
-                session.take_report(report)?;
+                // One passed over is answered all the same, as herdr's
+                // are: a hook that ran late has nothing to put right.
+                session.take_report(report, source, seq)?;
                 self.tell_changes(session);
                 Ok(Response::Done)
             }
@@ -2698,10 +2703,7 @@ impl Daemon {
         command.extend(task::terminal_args(&spec.args));
         let goal = launch.goal.clone();
         let backlog = goal.as_ref().and_then(|goal| goal.backlog);
-        let brief = goal
-            .as_ref()
-            .map(|goal| goal.brief.clone())
-            .unwrap_or_default();
+        let brief = brief_of(&launch);
         // An open task is said as Claude's task, so that it's told how to
         // close it; one closed already is only carried over.
         let open = goal.as_ref().filter(|goal| goal.is_open());
@@ -2945,11 +2947,7 @@ impl Daemon {
         let launch = ended.launch();
         // Run again, its task is open again: the work goes on.
         let backlog = launch.goal.as_ref().and_then(|goal| goal.backlog);
-        let brief = launch
-            .goal
-            .as_ref()
-            .map(|goal| goal.brief.clone())
-            .unwrap_or_default();
+        let brief = brief_of(&launch);
         let started = match launch.task {
             // A task runs its prompt again, in its conversation if it had
             // got as far as one.
@@ -3381,11 +3379,11 @@ fn start_as(
     // session.
     let task = task.filter(|_| tasks::enabled(&config));
     // The pull request and the issue it's about, which it's told of beside
-    // its task, whether tasks are on or off.
+    // its task, whether tasks are on or off, and with no task at all.
     let about_task = paragraphs([
         task.as_ref()
             .map(|_| tasks::instructions(backlog::enabled(&config))),
-        tasks::forge_notes(&brief, &cwd),
+        tasks::forge_notes(&brief, &cwd, task.is_some()),
     ]);
     let parallel = (agents::program_name(&command) == Some("claude"))
         .then(|| agents::PARALLEL_WORK.to_string());
@@ -3427,6 +3425,7 @@ fn start_as(
     if named_after_program {
         session.mark_named_after_program();
     }
+    session.set_about(&brief);
     if let Some(goal) = task {
         session.give_task(new_task_info(goal, false, backlog, brief));
     }
@@ -3671,7 +3670,7 @@ fn task_args(
         .flatten();
     // Its runs close it, so it's told nothing of closing it: only of the
     // pull request and the issue it's about.
-    let about = tasks::forge_notes(brief, cwd);
+    let about = tasks::forge_notes(brief, cwd, true);
     let handoff = handoff_note(cwd, &[about.as_deref(), remembered.as_deref()]);
     let mut args = agents::with_instructions(&spec.args, &notes(about, None, handoff, remembered));
     let mut tools = crystal_commands(&config);
@@ -3771,6 +3770,7 @@ fn start_task_as(
         spending,
         conversation,
     );
+    session.set_about(&brief);
     // It closes itself when its run ends, from Claude's answer.
     if tasks::enabled(&settings()) {
         session.give_task(new_task_info(prompt, true, backlog, brief));
@@ -3803,15 +3803,28 @@ fn new_task_info(
     }
 }
 
+/// What a session written down is about: its task's goal, criteria, pull
+/// request and issue, or with no task, the pull request and the issue it's
+/// about all the same.
+fn brief_of(saved: &SavedSession) -> TaskBrief {
+    match &saved.goal {
+        Some(goal) => goal.brief.clone(),
+        None => saved.about.clone(),
+    }
+}
+
 /// The user's settings, read again each time so that a change counts at
 /// once. A file that can't be read leaves the defaults.
 fn settings() -> Config {
     Config::load().unwrap_or_default()
 }
 
-/// Has the screens made from now on keep the history the settings say.
+/// Has the screens made from now on keep the history the settings say,
+/// and the diagrams in the transcripts drawn from now on drawn as they say.
 fn keep_scrollback() {
-    vt::set_history_lines(settings().scrollback_lines);
+    let settings = settings();
+    vt::set_history_lines(settings.scrollback_lines);
+    crate::mermaid::set_ascii(settings.mermaid_ascii);
 }
 
 /// Now, in seconds since the Unix epoch.

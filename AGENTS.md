@@ -29,7 +29,10 @@ and ARM, static with musl), and installed by `install.sh`.
    the archives and their checksums.
 
 `install.sh` and `crystal update` (`src/update.rs`) both find a release's archive and checksum by the names the
-workflow gives them: change one, change all three.
+workflow gives them, and so does the Homebrew formula (`packaging/homebrew/crystal.rb`): change one, change all
+four (a test in `update.rs` checks the formula and the workflow). For a tap, `packaging/homebrew/formula.sh
+0.2.0` prints the formula with that release's version and checksums filled in; `flake.nix` builds from source
+and reads the version from `Cargo.toml`.
 
 The daemon refuses requests from a crystal of another version (except a shutdown and a handover), so a user
 who upgrades is told to run `crystal restart-server` rather than getting odd errors, and one left on an older
@@ -89,8 +92,10 @@ whenever what's handed over changes in a way the crystal before couldn't read.
 - `src/update.rs`: `crystal update`: the latest release (where GitHub's `releases/latest` redirects, or
   `CRYSTAL_RELEASES`), downloaded with `curl`, checked against its SHA-256, unpacked, tried, and renamed over
   this crystal, unless a package manager, cargo or a build from source put it there; then the new crystal
-  restarts every running daemon and installs its skill, since only it reads its own handover; and the TUI's
-  look for a newer release, once a day, kept in the database
+  restarts every running daemon and installs its skill, since only it reads its own handover; the TUI's
+  look for a newer release, once a day, kept in the database; and a release's notes (its body from GitHub's
+  API, or `release-notes.md` beside a mirror's files), kept in the state directory by the update for the new
+  crystal's TUI to show once, which crystal it last opened as kept in the database, and `--notes`
 - `src/completions.rs`: `crystal completions`: clap's script for each shell, without the hidden commands, and
   in bash, zsh and fish the running sessions' names (`crystal complete-sessions`, which never starts a daemon)
   where a command takes one, the arguments in `SESSION_ARGS`; keep that list in step with the commands
@@ -98,6 +103,15 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   crystal, and brings up to date a copy an earlier crystal installed that nobody has changed, which the daemon
   does as it starts; keep it in step with the commands it teaches, and add its SHA-256 to `SHIPPED` when it
   changes (a test says so)
+- `src/config_bundle.rs`: `crystal config export` and `import`: the config file's text and the user's agent
+  rule files as one JSON bundle, and a bundle, a config file or a directory of either merged in with
+  `toml_edit`, a setting the bundle has replacing this one, profiles and flows by name, projects by path, keys'
+  commands by key, nothing written unless the result makes sense; pure but for the files, so it's unit-tested
+- `docs/guide.md`: the guide, one page on what to start, the keys that matter most, what agents call and
+  where things live, which the `?` overlay's second tab shows and `crystal guide` prints
+- `packaging/homebrew/`: the Homebrew formula for a tap, `crystal.rb`, installing a release's archive for the
+  machine, and `formula.sh`, which fills in a release's version and checksums; `flake.nix` builds crystal
+  from source with Nix
 - `src/tui/`: the TUI (`crystal` with no command)
   - `mod.rs`: the event loop: one channel of events, then update and draw (not for a move of the mouse that
     changes nothing), opening the link a Ctrl+click or copy mode's `o` asks for, bringing the TUI's terminal to
@@ -133,8 +147,9 @@ whenever what's handed over changes in a way the crystal before couldn't read.
     key, the mouse, a paste, focus gained) and when its terminal gains and loses the focus  sent back
   - `ui.rs`: the layout and drawing (the tab bar, on top or over the footer or left out, its tabs and what
     it shows at its right, the counts of what's open on the selected session's forge first, pane headers,
-    footer and its readout of the memory crystal takes, the column each pane's scrollbar takes), and what's
-    under the mouse
+    footer and its readout of the memory crystal takes, the column each pane's scrollbar takes, the key
+    pressed last while `show_keys` is on), one column on a terminal as narrow as a phone's (`[sidebar]
+    phone_width`), the sidebar over the pane while it has the keyboard, and what's under the mouse
   - `scrollbar.rs`: a pane's scrollbar: where its thumb is for how far back the pane is, how far back a
     dragged thumb takes it, and drawing it; pure, so it's unit-tested
   - `tabs.rs`: tabs, as many as the user likes, each holding its own sessions (each session in exactly one)
@@ -191,8 +206,11 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   - `help.rs`: the overlay `?` opens, a key a row: the sidebar's, the user's own, those that work in a pane
     without the prefix, resize mode's and the views' from the keymap, written as the user's `[keys]` has
     them, the rest from one table; its sections flowed into columns as tall as the terminal, two to a page,
-    the pages turned with the arrows; a test keeps the README's table of sidebar keys in step with the
-    defaults
+    the pages turned with the arrows, `Tab` going to the guide; a test keeps the README's table of sidebar
+    keys in step with the defaults
+  - `page.rs`: a markdown page over everything, scrolled with the arrows and any other key closing it: the
+    guide (`docs/guide.md`), the `?` overlay's second tab, and what's new in crystal after an update; its
+    state and keys, and its drawing
   - `groups.rs`: the sidebar's order and headings: sessions by project, then worktree, agents before
     terminals, a session's task and the line reported for it under it, each flow run's steps under it, and
     linked worktrees with no sessions left at the end of their project, Claude Code's own last
@@ -206,7 +224,8 @@ whenever what's handed over changes in a way the crystal before couldn't read.
     sent without going into its pane; its state and keys, kept apart from I/O, what's typed kept until the
     daemon takes it, and its drawing
   - `launcher.rs`: the new-session panel (`n`, `w`): its state and keys, kept apart from I/O, the command
-    it builds, what it remembers between runs, the draft it leaves when it's put away with a task in it and
+    it builds, a profile's `launch` setting its "how" row as it's chosen and whether what it starts is a
+    task, what it remembers between runs, the draft it leaves when it's put away with a task in it and
     opens on again, the panel `D` opens like a session (the profile its command fits or its agent, its
     rows from its options, the rest of its arguments kept), and its drawing
   - `command_line.rs`: reads the line typed at `new session:` (the panel's `Ctrl+E`) into the command to run
@@ -371,7 +390,8 @@ whenever what's handed over changes in a way the crystal before couldn't read.
 - `src/report.rs`: `crystal report`: any agent, or a script wrapped around one, saying what it's doing and the
   command that resumes it; checking that command, and what's typed into a shell to run it after a restart; and
   what `--line` and `--model` put on a session's row, for the sidebar alone: tidied, each with when it goes
-  (`--ttl`), and a source's late reports (`--seq`) passed over
+  (`--ttl`); and a source's late reports (`--seq`) passed over, what's on the row and what the agent is doing
+  numbered apart
 - `src/model.rs`: the model a session's agent runs on: its command's `--model`, what its hooks say, then the
   newest switch in its conversation's transcript, Claude Code's `/model` or Codex's turn context, read a little
   at a time as it's written; and a model's name shortened for a row (adapted from docket's)
@@ -385,7 +405,7 @@ whenever what's handed over changes in a way the crystal before couldn't read.
 - `src/session.rs`: one program in a PTY, or a task: spawn, exit status, stop, its screen (120 by 40 until a viewer
   sizes it), viewers (the user, or a program, which doesn't count as watching) and listeners, the output lately
   in an `OutputRing` and reading the screen as `crystal read` asks, the waits for output looking at it, the agent that says what it's doing
-  itself while it holds the session, the
+  itself while it holds the session, the pull request and the issue it's about apart from any task, the
   conversation its agent's hooks named, which counts once the agent has worked on a turn in it, an agent typed
   into its shell whose conversation a restart resumes while it's in front, its agent's subagents,
   whether its first prompt can name it, whether the user or a script gave its name, the name Claude Code gives
@@ -439,7 +459,9 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   - `sequence.rs`: sequence diagrams, read and laid out on their own
   - `flowchart.rs`, `state.rs`, `class.rs`, `er.rs`: each kind read into a graph
   - `width.rs`: how many columns text takes, and cutting it to fit
-- `src/mermaid_cli.rs`: `crystal mermaid`: a diagram, or a markdown file's, drawn on standard output
+- `src/mermaid_cli.rs`: `crystal mermaid`: a diagram, or a markdown file's, drawn on standard output, in ASCII
+  with `--ascii` or `mermaid_ascii`; or with `--open`, put on a page in the state directory, named by its hash,
+  for mermaid to draw in the browser
 - `src/spending.rs`: what background tasks have spent today, kept in the database by the day: the TUI footer's
   `$X today`, and what `daily_budget_usd` is held against
 - `src/protocol.rs`: requests and responses, one JSON line each, and the frames an attached client sends
@@ -471,7 +493,7 @@ whenever what's handed over changes in a way the crystal before couldn't read.
 - `src/tasks.rs`: tasks, sessions started with something to do: the paragraph an agent is told about
   `crystal done`, the reminder for one that ends a turn with its task open, a task's acceptance criteria and
   where they go in its first prompt, the goal of a task on a pull request or an issue and what its agent is
-  told of them, reading a project's closed tasks from the file they were kept in before the database,
+  told of them, a session with no task too, reading a project's closed tasks from the file they were kept in before the database,
   numbering tasks (`t12`) and showing a task waiting to start, the most a prompt crystal puts together may be,
   and `enabled`, the one gate everything tasks add goes through
 - `src/handoff.rs`: the handoff file, `.crystal/handoff.md` at the top of a git worktree: a note's heading and
@@ -525,8 +547,10 @@ whenever what's handed over changes in a way the crystal before couldn't read.
 - `src/secrets.rs`: taking credentials out of text before memory keeps it or the distiller reads it
 - `src/memory_cli.rs`: `crystal remember` and `crystal memory`, `show`, `export` and `distill` included, and an
   entry in full as `show` and the `memory_show` tool print it
-- `src/profile.rs`: agent profiles: what one runs, checking it, and saving or removing one in the config file
-  with `toml_edit`, so the user's comments and layout stay; `enabled` is the one switch for the feature
+- `src/profile.rs`: agent profiles: what one runs, its prompt and postfix around the task or alone with no
+  task (`skip_task`), how it's meant to start (`launch`: a session, a task or a background task), checking it,
+  and saving or removing one in the config file with `toml_edit`, so the user's comments and layout stay;
+  `enabled` is the one switch for the feature
 - `src/flows.rs`: flows, chains of tasks on one goal: the `[[flow]]` tables in the config file and in a project's
   `.crystal/flows.toml`, which take the place of the config's of the same name, checking them, the profile a
   step runs with, its own agent, model, effort and mode over it, and whether it runs in the background, where

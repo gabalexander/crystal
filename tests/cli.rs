@@ -1614,6 +1614,35 @@ instructions = "Keep changes small."
 }
 
 #[test]
+fn profile_show_says_how_a_profile_starts_and_what_it_asks_with_no_task() {
+    let crystal = Crystal::new();
+    crystal.configure(
+        r#"notify = false
+
+[[profile]]
+name = "committer"
+agent = "claude"
+prompt = "Commit the working tree."
+postfix = "Don't push."
+skip_task = true
+launch = "session"
+"#,
+    );
+    assert_eq!(
+        crystal.ok(&["profile", "show", "committer"]),
+        "committer\n\
+         agent   Claude Code\n\
+         starts  wherever the new-session panel is set\n\
+         as      a session, not a task\n\
+         task    none: it starts at once\n\
+         runs    claude -- 'Commit the working tree.\n\nDon'\\''t push.'\n"
+    );
+    crystal.configure("[[profile]]\nname = \"x\"\nagent = \"claude\"\nlaunch = \"remote\"\n");
+    let error = crystal.fails(&["profile"]);
+    assert!(error.contains("remote"), "{error}");
+}
+
+#[test]
 fn a_leftover_preset_table_says_it_s_now_a_profile() {
     let crystal = Crystal::new();
     crystal.configure("[[preset]]\nname = \"review\"\nagent = \"claude\"\n");
@@ -6343,6 +6372,62 @@ fn config_shows_the_settings_in_effect() {
 }
 
 #[test]
+fn config_export_and_import_carry_the_settings_to_another_machine() {
+    let here = Crystal::new();
+    let config = std::fs::read_to_string(here.config_file()).unwrap();
+    here.configure(&format!(
+        "# mine\ntheme = \"nord\"\n{config}\n[[profile]]\nname = \"review\"\nagent = \"claude\"\n"
+    ));
+    let agents = here.config_home().join("crystal/agents");
+    std::fs::create_dir_all(&agents).unwrap();
+    let rules = here.ok(&["agent", "rules", "claude"]);
+    std::fs::write(agents.join("claude.toml"), &rules).unwrap();
+
+    // Into a directory, under its own name; on standard output, the same.
+    let out = here.dir.path().join("backup");
+    std::fs::create_dir_all(&out).unwrap();
+    let said = here.ok(&["config", "export", "backup"]);
+    assert!(said.contains("crystal-settings.json"), "{said}");
+    let bundle = std::fs::read_to_string(out.join("crystal-settings.json")).unwrap();
+    assert_eq!(here.ok(&["config", "export"]), bundle);
+    let json: serde_json::Value = serde_json::from_str(&bundle).unwrap();
+    assert!(
+        json["config"].as_str().unwrap().starts_with("# mine\n"),
+        "{json}"
+    );
+
+    // Another machine keeps its own settings but for those the bundle has.
+    let there = Crystal::new();
+    there.configure("theme = \"dracula\"\nnotify = false\n\n[sidebar]\nwidth = 40\n");
+    let path = out.join("crystal-settings.json");
+    let said = there.ok(&["config", "import", path.to_str().unwrap()]);
+    assert!(
+        said.contains("theme") && said.contains("profile review (new)"),
+        "{said}"
+    );
+    assert!(said.contains("agents/claude.toml"), "{said}");
+    let settings = there.ok(&["config"]);
+    assert!(settings.contains("theme = \"nord\""), "{settings}");
+    assert!(settings.contains("width = 40"), "{settings}");
+    assert!(there.ok(&["profile"]).contains("review"));
+    let copied = there.config_home().join("crystal/agents/claude.toml");
+    assert_eq!(std::fs::read_to_string(copied).unwrap(), rules);
+    let said = there.ok(&["config", "import", out.to_str().unwrap()]);
+    assert!(said.contains("nothing to change"), "{said}");
+
+    // What wouldn't make sense is refused whole.
+    std::fs::write(here.dir.path().join("bad.toml"), "notfy = true\n").unwrap();
+    let before = std::fs::read_to_string(there.config_file()).unwrap();
+    let path = here.dir.path().join("bad.toml");
+    let err = there.fails(&["config", "import", path.to_str().unwrap()]);
+    assert!(err.contains("notfy"), "{err}");
+    assert_eq!(
+        std::fs::read_to_string(there.config_file()).unwrap(),
+        before
+    );
+}
+
+#[test]
 fn a_setting_spelled_wrong_is_an_error_that_names_it_and_its_file() {
     let crystal = Crystal::new();
     crystal.configure("notfy = false\n");
@@ -9858,6 +9943,58 @@ fn i_lists_the_issues_and_enter_starts_a_session_for_one() {
     );
 }
 
+#[test]
+fn a_session_on_an_issue_is_told_of_it_each_time_it_starts_task_or_not() {
+    let crystal = Crystal::new();
+    // With tasks off, a session on an issue is no task, but it's still
+    // about the issue.
+    let config = std::fs::read_to_string(crystal.config_file()).unwrap();
+    crystal.configure(&config.replace("memory = false\n", "memory = false\ntasks = false\n"));
+    let repo = github_repo(crystal.dir.path());
+    let issues = r#"[
+        {"number": 42, "title": "Fix login redirect", "labels": [],
+         "updatedAt": "2026-10-01T10:00:00Z", "author": {"login": "ana"},
+         "url": "https://github.com/acme/app/issues/42"}
+    ]"#;
+    let bin = fake_gh(crystal.dir.path(), "[]", issues);
+    let repo_arg = repo.to_str().unwrap();
+    crystal.ok(&["new", "-n", "planner", "-c", repo_arg, "sleep", "30"]);
+    let claude = fake_claude(crystal.dir.path());
+    let path = path_of(&[&bin, &claude]);
+    let mut tui = crystal.attach_with_env(&[], &[("PATH", &path)]);
+    tui.shows("▸ planner");
+    tui.type_keys("i");
+    tui.shows("Fix login redirect");
+    tui.type_keys("\r");
+    tui.shows("New session · app ⎇ 42-fix-login-redirect");
+    tui.type_keys("\r");
+    tui.shows("⎇ 42-fix-login-redirect");
+    let worktree = crystal
+        .dir
+        .path()
+        .join("app.worktrees/42-fix-login-redirect");
+    let told = "This session is for GitHub issue #42, \"Fix login redirect\"";
+    assert!(written(&worktree.join("args")).contains(told));
+    drop(tui);
+
+    // Started again after a crash or a reboot, it's told again: what it's
+    // about is written down with it.
+    eventually("the session is written down with its issue", || {
+        crystal
+            .query("SELECT group_concat(about) FROM sessions")
+            .is_some_and(|about| about.contains("issues/42"))
+    });
+    std::fs::remove_file(worktree.join("args")).unwrap();
+    let out = crystal
+        .command(&["restart-server", "--cold"])
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let args = written(&worktree.join("args"));
+    assert!(args.contains(told), "{args}");
+}
+
 const OPEN_PULL_REQUEST: &str = r#"[{"number": 57, "title": "Fix the login redirect",
     "author": {"login": "ana"}, "headRefName": "fix-login", "isDraft": false,
     "isCrossRepository": false, "headRepositoryOwner": {"login": "acme"},
@@ -10533,6 +10670,33 @@ fn dragging_the_tree_browsers_border_makes_the_tree_wider() {
 }
 
 #[test]
+fn a_terminal_as_narrow_as_a_phone_shows_the_sidebar_or_the_pane() {
+    let crystal = Crystal::new();
+    crystal.ok(&[
+        "new",
+        "-d",
+        "-n",
+        "planner",
+        "sh",
+        "-c",
+        "echo ready-in-planner; sleep 30",
+    ]);
+    let mut tui = crystal.tui();
+    tui.shows("ready-in-planner");
+    tui.resize(24, 50);
+    // The sidebar across all of it, over the pane.
+    tui.hides("ready-in-planner");
+    tui.shows("planner");
+    // Typing into the session, its pane takes it all; Ctrl+\ goes back.
+    tui.type_keys("\r");
+    tui.shows("ready-in-planner");
+    tui.type_keys("\x1c");
+    tui.hides("ready-in-planner");
+    tui.resize(24, 80);
+    tui.shows("ready-in-planner");
+}
+
+#[test]
 fn mermaid_draws_a_diagram_and_fails_on_one_it_cant() {
     let crystal = Crystal::new();
     let draw = |args: &[&str], diagram: &str| {
@@ -10568,6 +10732,49 @@ fn mermaid_draws_a_diagram_and_fails_on_one_it_cant() {
         why.contains("not drawn: pie diagrams are not drawn in a terminal"),
         "{why}"
     );
+
+    // The settings can say ASCII too.
+    let config = std::fs::read_to_string(crystal.config_file()).unwrap();
+    crystal.configure(&format!("mermaid_ascii = true\n{config}"));
+    let out = draw(&["--width", "40"], "flowchart LR\n  a --> b\n");
+    let drawn = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(drawn, "+---+   +---+\n| a +-->| b |\n+---+   +---+\n");
+}
+
+#[test]
+fn mermaid_open_puts_the_diagrams_on_a_page_for_the_browser() {
+    let crystal = Crystal::new();
+    let page = crystal.dir.path().join("page.md");
+    std::fs::write(
+        &page,
+        "# Flow\n\n```mermaid\nflowchart LR\n a --> b\n```\n\n```mermaid\npie\n \"a\": 1\n```\n",
+    )
+    .unwrap();
+    let state = crystal.dir.path().join("state");
+    // As over ssh, the link goes on the clipboard: no browser opens.
+    let out = crystal
+        .command(&["mermaid", "--open", "page.md"])
+        .env("XDG_STATE_HOME", &state)
+        .env("SSH_TTY", "/dev/pts/9")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let printed = String::from_utf8(out.stdout).unwrap();
+    let path = PathBuf::from(printed.lines().next().unwrap());
+    assert!(
+        path.starts_with(state.join("crystal/diagrams")),
+        "{printed}"
+    );
+    let html = std::fs::read_to_string(&path).unwrap();
+    assert!(html.contains("flowchart LR\n a --&gt; b\n</pre>"), "{html}");
+    // What a terminal can't draw, the browser can.
+    assert!(html.contains("pie\n \"a\": 1\n</pre>"), "{html}");
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(said.contains("copied file://"), "{said}");
 }
 
 #[test]
@@ -14706,6 +14913,37 @@ fn a_report_that_cant_be_taken_says_why() {
 }
 
 #[test]
+fn a_status_report_from_a_source_comes_in_order_and_that_source_lets_go() {
+    let crystal = Crystal::new();
+    crystal.ok(&["new", "-d", "-n", "agent", "sleep", "30"]);
+    let report = |args: &[&str]| {
+        let mut all = vec!["report", "-n", "agent", "--agent", "pi"];
+        all.extend(args);
+        crystal.ok(&all);
+    };
+    report(&["--source", "hook", "--seq", "2", "working"]);
+    let listed = crystal.listed("agent");
+    assert_eq!(listed["status"], "working", "{listed}");
+    assert_eq!(listed["reporter"]["source"], "hook", "{listed}");
+    // A hook that ran late puts nothing back; one with no number is taken.
+    report(&["--source", "hook", "--seq", "1", "idle"]);
+    assert_eq!(crystal.listed("agent")["status"], "working");
+    // The same number goes for the row, said apart.
+    report(&["--source", "hook", "--seq", "3", "--line", "40%", "waiting"]);
+    let listed = crystal.listed("agent");
+    assert_eq!(listed["status"], "waiting", "{listed}");
+    assert_eq!(listed["line"], "40%", "{listed}");
+
+    // Only the source that holds the session lets go of it.
+    crystal.ok(&["report", "-n", "agent", "--source", "other", "--release"]);
+    assert_eq!(crystal.listed("agent")["reporter"]["agent"], "pi");
+    crystal.ok(&["report", "-n", "agent", "--source", "hook", "--release"]);
+    let listed = crystal.listed("agent");
+    assert!(listed["reporter"].is_null(), "{listed}");
+    assert_eq!(listed["status"], "running", "{listed}");
+}
+
+#[test]
 fn a_line_and_a_model_reported_for_a_session_show_on_its_row() {
     let crystal = Crystal::new();
     crystal.ok(&["new", "-d", "-n", "indexer", "sleep", "30"]);
@@ -15631,6 +15869,8 @@ fn update_puts_the_latest_release_in_place_and_restarts_every_daemon_on_it() {
     let releases = Releases::new("9.9.9");
     let log = servers.dir().join("new-crystal.log");
     releases.publish("9.9.9", &logging_crystal(&log), None);
+    let notes = releases.dir.path().join("download/v9.9.9/release-notes.md");
+    std::fs::write(&notes, "## Added\n\n- one column on a phone\n").unwrap();
     let installed = installed_copy(servers.dir());
     // Claude Code is on this machine: its config directory is there.
     std::fs::create_dir_all(servers.crystal.claude_config_dir()).unwrap();
@@ -15650,6 +15890,16 @@ fn update_puts_the_latest_release_in_place_and_restarts_every_daemon_on_it() {
         said.contains(&format!("updated crystal {VERSION} to 9.9.9")),
         "{said}"
     );
+    // What's new, kept for the new crystal's TUI.
+    assert!(
+        said.contains("`crystal update --notes` prints it"),
+        "{said}"
+    );
+    let kept = servers.dir().join("state/crystal/release-notes.json");
+    let kept: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(kept).unwrap()).unwrap();
+    assert_eq!(kept["version"], "9.9.9");
+    assert_eq!(kept["body"], "## Added\n\n- one column on a phone");
     assert_eq!(
         std::fs::read_to_string(&installed).unwrap(),
         logging_crystal(&log)
@@ -15749,6 +15999,87 @@ fn the_tui_says_once_a_day_that_a_newer_crystal_is_out() {
     thread::sleep(Duration::from_millis(500));
     assert_eq!(releases.asked(), 1);
     assert!(!tui.text().contains("is out"));
+}
+
+#[test]
+fn the_tui_shows_what_s_new_once_after_an_update() {
+    let crystal = Crystal::new();
+    let state = crystal.dir.path().join("state");
+    let kept = state.join("crystal/release-notes.json");
+    std::fs::create_dir_all(kept.parent().unwrap()).unwrap();
+    let notes = serde_json::json!({
+        "version": VERSION,
+        "body": "## Added\n\n- **one column** on a phone",
+    });
+    std::fs::write(&kept, notes.to_string()).unwrap();
+    // A first TUI has nothing to compare with, and no news.
+    let env = [("XDG_STATE_HOME", state.to_str().unwrap())];
+    let mut tui = crystal.attach_with_env(&[], &env);
+    tui.shows("crystal");
+    tui.type_keys("q");
+    assert!(tui.exit());
+    // Then one last opened on an older crystal.
+    let db = crystal.socket.with_extension("db");
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.busy_timeout(Duration::from_secs(5)).unwrap();
+    conn.execute(
+        "INSERT OR REPLACE INTO ui (name, json) VALUES ('opened', '{\"version\":\"0.0.1\"}')",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    let mut tui = crystal.attach_with_env(&[], &env);
+    tui.shows(&format!("what's new in crystal {VERSION}"));
+    tui.shows("• one column on a phone");
+    // Any key puts it away, and it isn't shown again.
+    tui.type_keys("x");
+    tui.hides("what's new");
+    tui.type_keys("q");
+    assert!(tui.exit());
+    let tui = crystal.attach_with_env(&[], &env);
+    tui.shows("crystal");
+    thread::sleep(Duration::from_millis(300));
+    assert!(!tui.text().contains("what's new"));
+
+    // And the command line prints them.
+    let out = crystal
+        .command(&["update", "--notes"])
+        .env("XDG_STATE_HOME", &state)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "## Added\n\n- **one column** on a phone\n"
+    );
+}
+
+#[test]
+fn the_help_has_a_guide_and_keys_can_show_as_they_are_pressed() {
+    let crystal = Crystal::new();
+    crystal.ok(&["new", "-d", "-n", "planner", "sleep", "30"]);
+    let mut tui = crystal.tui();
+    tui.shows("planner");
+    tui.type_keys("?");
+    tui.shows("tab: the guide");
+    tui.type_keys("\t");
+    tui.shows("The crystal guide");
+    tui.shows("tab: the keys");
+    tui.type_keys("\t");
+    tui.shows("In the sidebar");
+    tui.type_keys("x");
+    tui.hides("In the sidebar");
+    assert_eq!(crystal.ok(&["guide"]), include_str!("../docs/guide.md"));
+    tui.type_keys("q");
+    assert!(tui.exit());
+
+    let config = std::fs::read_to_string(crystal.config_file()).unwrap();
+    crystal.configure(&format!("show_keys = true\n{config}"));
+    let mut tui = crystal.tui();
+    tui.shows("planner");
+    tui.type_keys("a");
+    tui.shows(" a  timeline ");
 }
 
 #[test]

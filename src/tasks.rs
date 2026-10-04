@@ -161,21 +161,24 @@ pub fn goal_for(brief: &TaskBrief) -> Option<String> {
     ))
 }
 
-/// What an agent working on a task in `worktree` is told of the pull
-/// request and the issue it's about, a paragraph each: what to read
-/// first, and to keep to it. `None` for a task about neither.
-pub fn forge_notes(brief: &TaskBrief, worktree: &Path) -> Option<String> {
+/// What an agent in `worktree` is told of the pull request and the issue
+/// its session is about, a paragraph each: what to read first, and to keep
+/// to it. Its task's, when it was started as a `task`, or else the
+/// session's, which it's told each time it starts all the same. `None` for
+/// a session about neither.
+pub fn forge_notes(brief: &TaskBrief, worktree: &Path, task: bool) -> Option<String> {
     let mut notes = Vec::new();
+    let what = if task { "Your task" } else { "This session" };
     if let Some(pull_request) = &brief.pull_request {
-        notes.push(pull_request_note(pull_request, worktree));
+        notes.push(pull_request_note(pull_request, worktree, what));
     }
     if let Some(issue) = &brief.issue {
-        notes.push(issue_note(issue));
+        notes.push(issue_note(issue, what));
     }
     (!notes.is_empty()).then(|| notes.join("\n\n"))
 }
 
-fn pull_request_note(pull_request: &ForgeLink, worktree: &Path) -> String {
+fn pull_request_note(pull_request: &ForgeLink, worktree: &Path, what_is: &str) -> String {
     let forge = pull_request.forge;
     let what = forge.pull_request();
     let view = match forge {
@@ -187,7 +190,7 @@ fn pull_request_note(pull_request: &ForgeLink, worktree: &Path) -> String {
         None => String::new(),
     };
     format!(
-        "Your task is about {} {what} {}, \"{}\" ({}). You're in its worktree, {}{branch}: \
+        "{what_is} is about {} {what} {}, \"{}\" ({}). You're in its worktree, {}{branch}: \
          read the {what} and its conversation first (`{} {view} view {} --comments`), then do \
          every edit, test, commit and push there, and keep to what the {what} needs. Other \
          sessions may work in this worktree too, so pull before you push.",
@@ -201,10 +204,10 @@ fn pull_request_note(pull_request: &ForgeLink, worktree: &Path) -> String {
     )
 }
 
-fn issue_note(issue: &ForgeLink) -> String {
+fn issue_note(issue: &ForgeLink, what_is: &str) -> String {
     let forge = issue.forge;
     format!(
-        "Your task is for {} issue #{}, \"{}\" ({}): read it first (`{} issue view {} \
+        "{what_is} is for {} issue #{}, \"{}\" ({}): read it first (`{} issue view {} \
          --comments`), then keep to what resolves it. Mention it in your commit messages, and \
          close it from the {} that fixes it (`Closes #{}`).",
         forge.name(),
@@ -364,7 +367,7 @@ mod tests {
             issue: Some(link(Forge::GitHub, 7, None)),
             ..TaskBrief::default()
         };
-        let notes = forge_notes(&brief, Path::new("/work/app-fix-login")).unwrap();
+        let notes = forge_notes(&brief, Path::new("/work/app-fix-login"), true).unwrap();
         let (pull_request, issue) = notes.split_once("\n\n").unwrap();
         assert!(
             pull_request.starts_with(
@@ -385,10 +388,24 @@ mod tests {
             pull_request: Some(link(Forge::GitLab, 57, None)),
             ..TaskBrief::default()
         };
-        let notes = forge_notes(&on_gitlab, Path::new("/w")).unwrap();
+        let notes = forge_notes(&on_gitlab, Path::new("/w"), true).unwrap();
         assert!(notes.contains("GitLab merge request !57"), "{notes}");
         assert!(notes.contains("`glab mr view 57 --comments`"), "{notes}");
-        assert_eq!(forge_notes(&TaskBrief::default(), Path::new("/w")), None);
+        assert_eq!(
+            forge_notes(&TaskBrief::default(), Path::new("/w"), true),
+            None
+        );
+
+        // A session with no task is told of them all the same.
+        let notes = forge_notes(&brief, Path::new("/w"), false).unwrap();
+        assert!(
+            notes.starts_with("This session is about GitHub pull request #57"),
+            "{notes}"
+        );
+        assert!(
+            notes.contains("\n\nThis session is for GitHub issue #7"),
+            "{notes}"
+        );
     }
 
     #[test]

@@ -54,6 +54,8 @@ pub const SIDEBAR: &str = "sidebar";
 pub const FOLDED: &str = "folded";
 /// When the TUI last looked for a newer crystal.
 pub const UPDATE: &str = "update";
+/// The crystal whose TUI opened last: what's new in another is news.
+pub const OPENED: &str = "opened";
 
 /// How long a write waits for another to finish: the daemon and every TUI
 /// share the one database.
@@ -227,6 +229,14 @@ ALTER TABLE tasks ADD COLUMN brief TEXT;
 ALTER TABLE pending_tasks ADD COLUMN brief TEXT;
 ";
 
+/// The pull request and the issue a session is about, apart from any task
+/// it has, as JSON (see [`crate::protocol::TaskBrief`]): its agent is told
+/// of them each time it starts. `NULL` for a session about neither.
+const ABOUT: &str = "
+ALTER TABLE sessions ADD COLUMN about TEXT;
+ALTER TABLE archived ADD COLUMN about TEXT;
+";
+
 /// What makes the database as it is now, a step for each version: a
 /// database at version `v`, kept in its `user_version`, takes the steps
 /// after the first `v`.
@@ -239,12 +249,13 @@ const MIGRATIONS: &[&str] = &[
     PROJECTS,
     ARCHIVED,
     BRIEFS,
+    ABOUT,
 ];
 
 /// The file each project kept its backlog in before the database.
 const OLD_BACKLOG: &str = "backlog.json";
 
-const SESSION_COLUMNS: &str = "name, command, cwd, conversation, task, goal, resume";
+const SESSION_COLUMNS: &str = "name, command, cwd, conversation, task, goal, resume, about";
 const RUN_COLUMNS: &str =
     "name, flow, profiles, goal, cwd, worktree, round, feedback, steps, started";
 const TASK_COLUMNS: &str = "project_name, goal, session, branch, background, backlog, failed, \
@@ -308,7 +319,7 @@ impl Db {
         self.conn.execute(
             &format!(
                 "INSERT OR REPLACE INTO archived (id, {SESSION_COLUMNS}, worktree, archived) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"
             ),
             params![
                 archived.id,
@@ -319,6 +330,7 @@ impl Db {
                 json_or_null(&session.task)?,
                 json_or_null(&session.goal)?,
                 json_or_null(&session.resume)?,
+                brief_json(&session.about)?,
                 json_or_null(&archived.worktree)?,
                 archived.archived as i64,
             ],
@@ -848,7 +860,7 @@ fn write_sessions(conn: &Connection, sessions: &[SavedSession]) -> Result<()> {
         conn.execute(
             &format!(
                 "INSERT INTO sessions (position, {SESSION_COLUMNS}) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"
             ),
             params![
                 position as i64,
@@ -859,6 +871,7 @@ fn write_sessions(conn: &Connection, sessions: &[SavedSession]) -> Result<()> {
                 json_or_null(&session.task)?,
                 json_or_null(&session.goal)?,
                 json_or_null(&session.resume)?,
+                brief_json(&session.about)?,
             ],
         )?;
     }
@@ -874,15 +887,16 @@ fn session_of(row: &Row) -> Result<SavedSession> {
         task: from_json_or_null(row.get(4)?)?,
         goal: from_json_or_null(row.get(5)?)?,
         resume: from_json_or_null(row.get(6)?)?,
+        about: from_json_or_null(row.get(7)?)?.unwrap_or_default(),
     })
 }
 
 fn archived_of(row: &Row) -> Result<ArchivedSession> {
     Ok(ArchivedSession {
         session: session_of(row)?,
-        id: row.get(7)?,
-        worktree: from_json_or_null(row.get(8)?)?,
-        archived: row.get::<_, i64>(9)? as u64,
+        id: row.get(8)?,
+        worktree: from_json_or_null(row.get(9)?)?,
+        archived: row.get::<_, i64>(10)? as u64,
     })
 }
 
@@ -1160,6 +1174,7 @@ mod tests {
             task: None,
             goal: None,
             resume: None,
+            about: Default::default(),
         }
     }
 
@@ -1253,6 +1268,14 @@ mod tests {
         });
         let mut reported = saved("c");
         reported.resume = Some(vec!["pi".into(), "--session".into(), "s1".into()]);
+        // What a session with no task is about goes with it all the same.
+        reported.about.issue = Some(Box::new(crate::protocol::ForgeLink {
+            forge: crate::forge::Forge::GitHub,
+            number: 7,
+            title: "Login loops".into(),
+            url: "https://github.com/o/r/issues/7".into(),
+            branch: None,
+        }));
         let sessions = vec![reported, task, saved("a")];
         db.save_sessions(&sessions).unwrap();
         assert_eq!(db.sessions().unwrap(), sessions);
@@ -1532,7 +1555,19 @@ mod tests {
         let db = Db::open(&socket_in(&dir)).unwrap();
         let archived = |id: &str, name: &str, at: u64| ArchivedSession {
             id: id.into(),
-            session: saved(name),
+            session: SavedSession {
+                about: crate::protocol::TaskBrief {
+                    issue: Some(Box::new(crate::protocol::ForgeLink {
+                        forge: crate::forge::Forge::GitLab,
+                        number: 3,
+                        title: "Slow".into(),
+                        url: "https://gitlab.com/o/r/-/issues/3".into(),
+                        branch: None,
+                    })),
+                    ..Default::default()
+                },
+                ..saved(name)
+            },
             worktree: None,
             archived: at,
         };

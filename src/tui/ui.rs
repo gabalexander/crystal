@@ -5,7 +5,8 @@
 //! it never changes it.
 
 use super::app::{
-    App, Counted, Filter, Focus, Hit, OpenOnForge, PluginPane, Popup, Prompt, Question, Slot, View,
+    App, Counted, Filter, Focus, Help, Hit, OpenOnForge, PluginPane, Popup, Prompt, Question, Slot,
+    View,
 };
 use super::archived_view;
 use super::backlog_view::{self, BacklogView};
@@ -23,6 +24,7 @@ use super::layouts::{self, LayoutsView};
 use super::memory_view;
 use super::menu;
 use super::needs_you;
+use super::page;
 use super::pane::Pane;
 use super::plugins_view;
 use super::profiles;
@@ -101,8 +103,13 @@ impl Areas {
     /// and the footer, the sidebar and its rule with no room.
     pub fn of(app: &App, screen: Rect) -> Areas {
         let [top, main, footer] = rows(app, screen);
-        // A sidebar folded away has no rule either.
-        let sidebar_width = app.sidebar_columns(screen.width);
+        let one_column = app.one_column_at(screen.width);
+        // A sidebar folded away has no rule either, nor one in one column.
+        let sidebar_width = if one_column {
+            0
+        } else {
+            app.sidebar_columns(screen.width)
+        };
         let [sidebar, rule, tiles] = Layout::horizontal([
             Constraint::Length(sidebar_width),
             Constraint::Length(u16::from(sidebar_width > 0)),
@@ -121,11 +128,18 @@ impl Areas {
             float: None,
             footer,
         };
-        if app.zoomed() {
+        if app.zoomed() || one_column {
             let nowhere = Rect::new(main.x, main.y, 0, main.height);
             areas.sidebar = nowhere;
             areas.rule = nowhere;
             areas.panes = vec![main];
+        }
+        // In one column, the sidebar takes all of it while it has the
+        // keyboard, over the pane, which keeps its size so its program
+        // isn't drawn again each time the keyboard goes from one to the
+        // other.
+        if one_column && app.focus() == Focus::Sidebar {
+            areas.sidebar = main;
         }
         if app.floating().is_some() {
             areas.add_float();
@@ -429,9 +443,10 @@ pub fn hit(areas: &Areas, app: &App, column: u16, row: u16) -> Hit {
     Hit::Elsewhere
 }
 
-/// The borders between the tab's panes on screen: none while it's zoomed.
+/// The borders between the tab's panes on screen: none while it's zoomed,
+/// or in one column.
 fn borders(areas: &Areas, app: &App) -> Vec<Border> {
-    if app.zoomed() {
+    if app.zoomed() || app.one_column() {
         return Vec::new();
     }
     app.panes().borders(areas.tiles)
@@ -495,19 +510,24 @@ fn draw_everything(
     }
     sidebar::draw(frame, app, look, areas.sidebar);
     draw_rule(frame, look, areas.rule);
-    let slots = app.slots();
-    for (slot, area) in slots.iter().zip(areas.tiled()) {
-        draw_pane(frame, app, look, *slot, *area, panes);
-    }
-    draw_borders(frame, app, look, &areas);
-    if let (Some(around), Some(area)) = (areas.float, areas.panes.last()) {
-        draw_float_frame(frame, app, look, around);
-        draw_pane(frame, app, look, Slot::Float, *area, panes);
+    // In one column, the sidebar is over the pane while it has the
+    // keyboard.
+    if !app.sidebar_over_panes() {
+        let slots = app.slots();
+        for (slot, area) in slots.iter().zip(areas.tiled()) {
+            draw_pane(frame, app, look, *slot, *area, panes);
+        }
+        draw_borders(frame, app, look, &areas);
+        if let (Some(around), Some(area)) = (areas.float, areas.panes.last()) {
+            draw_float_frame(frame, app, look, around);
+            draw_pane(frame, app, look, Slot::Float, *area, panes);
+        }
     }
     // Zoomed or folded, the sidebar comes out over the panes while `/`
     // looks through it, rather than squeezing them, which their programs
     // would redraw for.
-    if (app.zoomed() || app.sidebar_folded()) && app.filter().is_some() {
+    let drawer = app.zoomed() || app.sidebar_folded();
+    if drawer && !app.one_column() && app.filter().is_some() {
         let main = areas.main;
         let width = app.sidebar_shape().width.min(main.width.saturating_sub(1));
         let drawer = Rect::new(main.x, main.y, width, main.height);
@@ -574,18 +594,34 @@ fn draw_everything(
         command_list::draw(frame, list, look.theme, middle);
     }
     draw_footer(frame, app, panes, look, areas.footer);
+    draw_shown_key(frame, app, look.theme, areas.footer);
     if let Some(open) = app.menu() {
         menu::draw(frame, open, look.theme, frame.area());
     }
-    if app.showing_keys() {
-        let plugin_on = |plugin: &str| app.plugin_on(plugin);
-        let plugin_keys = app.plugin_key_rows();
-        let shown = help::Shown {
-            plugin_on: &plugin_on,
-            plugin_keys: &plugin_keys,
-            keymap: app.keymap(),
-        };
-        help::draw(frame, look.theme, frame.area(), &shown, app.keys_page());
+    match app.help() {
+        Some(Help::Keys(page)) => {
+            let plugin_on = |plugin: &str| app.plugin_on(plugin);
+            let plugin_keys = app.plugin_key_rows();
+            let shown = help::Shown {
+                plugin_on: &plugin_on,
+                plugin_keys: &plugin_keys,
+                keymap: app.keymap(),
+            };
+            help::draw(frame, look.theme, frame.area(), &shown, *page);
+        }
+        Some(Help::Guide(guide)) => {
+            page::draw(
+                frame,
+                look.theme,
+                frame.area(),
+                guide,
+                Some(page::Tab::Guide),
+            );
+        }
+        None => {}
+    }
+    if let Some(shown) = app.page() {
+        page::draw(frame, look.theme, frame.area(), shown, None);
     }
 }
 
@@ -1990,6 +2026,35 @@ fn selection_place(app: &App) -> Option<String> {
     Some(format!("{place}{}", session.name))
 }
 
+/// The key pressed last, while keys are shown, over the right of the footer:
+/// the key as a keycap, then what it did, like `[n] new-session`.
+fn draw_shown_key(frame: &mut Frame, app: &App, theme: &Theme, footer: Rect) {
+    let Some(shown) = app.shown_key() else {
+        return;
+    };
+    let keycap = Style::new()
+        .fg(theme.accent)
+        .add_modifier(Modifier::REVERSED | Modifier::BOLD);
+    let mut spans = vec![Span::styled(format!(" {} ", shown.keys), keycap)];
+    if !shown.did.is_empty() {
+        spans.push(Span::styled(
+            format!(" {} ", shown.did),
+            Style::new().fg(theme.text),
+        ));
+    }
+    let line = Line::from(spans);
+    let width = (line.width() as u16).min(footer.width);
+    let area = Rect::new(
+        footer.right() - width,
+        footer.y,
+        width,
+        footer.height.min(1),
+    );
+    frame.render_widget(Clear, area);
+    frame.render_widget(Block::new().style(theme.base()), area);
+    frame.render_widget(line, area);
+}
+
 /// The right of the footer: the `readout` of the memory crystal takes, once
 /// the daemon has said, what background tasks have spent today, in red
 /// past the daily budget, and "? keys", where `?` opens the list of every
@@ -2899,6 +2964,54 @@ mod tests {
     }
 
     #[test]
+    fn a_phone_s_width_shows_the_sidebar_or_the_pane_across_all_of_it() {
+        let mut app = App::new(None);
+        app.set_sessions(vec![
+            session("planner", State::Running),
+            session("other", State::Running),
+        ]);
+        let phone = Rect::new(0, 0, 50, 20);
+        app.set_screen(phone);
+        let areas = Areas::of(&app, phone);
+        assert_eq!(areas.sidebar, areas.main);
+        assert_eq!(
+            areas.panes,
+            [areas.main],
+            "the pane keeps its size under it"
+        );
+        assert!(matches!(hit(&areas, &app, 40, 3), Hit::SidebarRow(_)));
+        let text = screen_text_at(&app, 50, 20);
+        assert!(text.iter().any(|line| line.contains("other")), "{text:#?}");
+        assert!(!text[1].contains("❯"), "{text:#?}");
+
+        // Typing into it, the pane takes it all.
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.focus(), Focus::Pane(Slot::Selected));
+        let areas = Areas::of(&app, phone);
+        assert_eq!(areas.sidebar.width, 0);
+        assert_eq!(areas.panes, [areas.main]);
+        assert!(matches!(hit(&areas, &app, 40, 3), Hit::Pane { .. }));
+        let text = screen_text_at(&app, 50, 20);
+        assert!(text[1].starts_with(" ❯ planner"), "{text:#?}");
+        assert!(!text.iter().any(|line| line.contains("other")), "{text:#?}");
+
+        // Wider, the sidebar is beside the pane again; and with the setting
+        // at 0, at any width.
+        let wide = Rect::new(0, 0, 80, 24);
+        app.set_screen(wide);
+        assert_eq!(Areas::of(&app, wide).sidebar.width, SIDEBAR);
+        let mut config = crate::config::Config::default();
+        config.sidebar.phone_width = 0;
+        app.set_features(&config);
+        app.set_screen(phone);
+        assert!(!app.one_column());
+        assert_eq!(
+            Areas::of(&app, phone).sidebar.width,
+            app.sidebar_columns(50)
+        );
+    }
+
+    #[test]
     fn zoomed_the_pane_takes_the_sidebars_room_and_says_so() {
         let mut app = App::new(None);
         app.set_sessions(vec![
@@ -3280,6 +3393,7 @@ mod tests {
                     agent: hostile.to_string(),
                     message: Some(hostile.to_string()),
                     resume: None,
+                    source: None,
                 });
                 session
             })

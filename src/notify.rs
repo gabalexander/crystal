@@ -699,6 +699,7 @@ mod tests {
             agent: "pi".into(),
             message: Some("approve the deploy".into()),
             resume: None,
+            source: None,
         });
         let notice = Notice::about(&waiting, Waiting);
         assert_eq!(
@@ -796,6 +797,7 @@ mod tests {
             agent: "pi".into(),
             message: Some("ok\x1b]0;pwned\x07\nnext".into()),
             resume: None,
+            source: None,
         });
         assert_eq!(
             Notice::about(&waiting, Waiting).text,

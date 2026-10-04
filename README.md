@@ -55,7 +55,26 @@ It downloads the latest release, checks it against its checksum, and puts `cryst
 machine, it also installs [the skill](#a-skill-for-claude-code) that teaches Claude Code to drive crystal;
 `CRYSTAL_NO_SKILL=1` leaves it out. The Linux builds are static, so they run on any distribution.
 
-Or build it from source, with Rust 1.88 or newer:
+### Homebrew and Nix
+
+```sh
+brew install gabalexander/crystal/crystal     # from a tap of crystal's own
+nix run github:gabalexander/crystal           # or build it with Nix
+nix profile install github:gabalexander/crystal
+```
+
+Homebrew's own `crystal` is the Crystal programming language, so crystal is installed from its tap by the tap's
+name, and `brew upgrade` keeps it up to date. The tap's formula installs the release built for your machine,
+checked against its checksum, with completions for bash, zsh and fish; [`packaging/homebrew`](packaging/homebrew)
+holds it, and `formula.sh` there fills in a release's version and checksums for the tap. The flake builds crystal
+from source with the nixpkgs it pins, completions too, and `nix develop` gives a shell with the toolchain. Neither
+restarts a daemon that's running, as the install script does: after an upgrade, run `crystal restart-server`, and
+`crystal skill --install` for Claude Code. `crystal update` leaves a crystal either installed alone, and says what
+updates it.
+
+### From source
+
+Build it from source, with Rust 1.88 or newer:
 
 ```sh
 git clone https://github.com/gabalexander/crystal
@@ -81,6 +100,7 @@ it; a TUI left open on an older crystal asks you to start it again.
 crystal update            # install the latest release, if it's newer
 crystal update --check    # only say whether a newer one is out
 crystal update 0.2.0      # install that release instead, even an older one
+crystal update --notes    # print what this crystal changed, its release notes
 ```
 
 `crystal update` does what the install script does, in place: it downloads the release for this machine,
@@ -93,6 +113,13 @@ download releases from, as it does for the install script.
 
 Once a day, as it opens, the TUI looks for a newer release and says so on its bottom line when there is one.
 `check = false` under `[update]` in the [settings](#settings) turns that off.
+
+The first time the TUI opens on a new crystal, it shows what's new in it: the release's notes, as GitHub has
+them, scrolled with the arrows and put away with any other key, and never shown again. `crystal update` keeps
+them as it installs the release, so the TUI has them at once; updated some other way, the TUI asks for them
+itself, unless `check = false` says not to. `crystal update --notes` prints them, or another release's, like
+`crystal update --notes 0.2.0`. A mirror named by `CRYSTAL_RELEASES` keeps each release's notes as
+`release-notes.md` among its files.
 
 ### Shell completions
 
@@ -189,7 +216,7 @@ and the footer says where you are and offers the keys that matter there, or, whe
 | `X` | list the [plugins](#plugins): switch them on and off, run their actions and open their panes |
 | `,` | open the [settings](#the-settings-view): notifications, sounds, the theme, and how memory learns and searches, each changed as you go |
 | `#` | the memory each session's processes take, and crystal's own: [RAM](#ram) |
-| `?` | show every key, in the sidebar, in a pane, in resize mode, in a view, in a question and with the mouse, your own included: a page at a time when they don't all fit, `→` and `←` (or `Space`, `PgDn` and `PgUp`) turning the pages |
+| `?` | show every key, in the sidebar, in a pane, in resize mode, in a view, in a question and with the mouse, your own included: a page at a time when they don't all fit, `→` and `←` (or `Space`, `PgDn` and `PgUp`) turning the pages; `Tab` goes to the [guide](docs/guide.md), a page on what to start, the keys that matter most and what agents call, and back |
 | `q` | quit, once you've said `y`; the sessions keep running |
 
 While you're typing into a session, every key goes to it, `Tab` included, except `Ctrl+\`, which takes you
@@ -483,6 +510,9 @@ crystal update                              # install the latest release, the da
 crystal completions zsh                     # complete crystal's commands in your shell (see above)
 crystal server                              # list the servers, daemons of their own (see below)
 crystal config                              # where the config file is, and the settings in effect
+crystal config export ~/backups             # the settings in one file, to keep or take elsewhere (see below)
+crystal config import ~/backups             # merge them in, here or on another machine
+crystal guide                               # a page on what to start, the keys that matter and what agents call
 crystal profile                             # list your agent profiles
 crystal profile show review                 # what a profile runs, and where it starts
 crystal pane split review                   # show a session in a pane beside yours in the TUI (see below)
@@ -493,6 +523,7 @@ crystal layout apply dev.json               # lay them out as a file says, start
 crystal skill --install                     # teach Claude Code to drive crystal (see below)
 crystal integration install                 # hooks or plugins for the agents installed here (see above)
 crystal mermaid docs/flow.md                # draw a page's mermaid diagrams as text (see below)
+crystal mermaid --open docs/flow.md         # or have mermaid draw them in your browser
 crystal ssh box                             # crystal's TUI on another machine (see below)
 ```
 
@@ -772,7 +803,18 @@ width = 32             # 16 to 80 columns
 folded = false         # start folded
 fold = "marks"         # what folding keeps: "marks", or "hidden" for nothing
 needs_you = true       # pin what needs you at the top
+phone_width = 64       # one column at this width or narrower; 0 never
 ```
+
+#### On a phone
+
+crystal works on a phone without an app: ssh into the machine your agents run on, from any ssh client, and run
+`crystal` there, or `crystal ssh box` from another machine. A terminal 64 columns wide or narrower, as a
+phone's is, shows one column instead of the sidebar beside the panes. While the sidebar has the keyboard, it
+takes all of the screen, over the pane; `Enter` on a session gives its pane all of it instead, as though it
+were zoomed, and `Ctrl+\` brings the sidebar back. The pane keeps its size either way, so its program isn't
+drawn again as you go between them. `phone_width` under `[sidebar]` moves the line, and `0` keeps the sidebar
+beside the panes at any width.
 
 ### Finding with `/`
 
@@ -1230,7 +1272,15 @@ the same way.
 `crystal mermaid` draws a diagram on the command line the same way, from a file or standard input: a diagram, or
 each mermaid fence of a markdown file, as wide as the terminal (`--width` gives another width) and in box drawing
 (`--ascii` in ASCII). One that can't be drawn is printed as it is, and the command fails saying why, so an agent
-can check a diagram before it writes it into a page.
+can check a diagram before it writes it into a page. `mermaid_ascii = true` in the [settings](#settings) draws
+every diagram in ASCII, `+ - | > v`, in previews, transcripts and `crystal mermaid` alike, for a font or a
+terminal without box drawing.
+
+`crystal mermaid --open` has mermaid itself draw them instead, in your browser: for the exact picture, curves and
+all, and the kinds a terminal can't draw. The diagrams go on a page in crystal's state directory
+(`~/.local/state/crystal/diagrams/`), named for what's on it, so the same diagrams are always the same file; the
+command prints its path and opens it, or over ssh puts its link on your clipboard. The page loads mermaid from
+the jsDelivr CDN, so it needs the network the first time, and follows your system's light or dark.
 
 ```
 $ printf 'sequenceDiagram\n  Alice->>Bob: hello\n  Bob-->>Alice: hi\n' | crystal mermaid
@@ -1528,16 +1578,30 @@ crystal already knows, or a script running beside it, can say what it's on witho
 read. With a state, `crystal report working --line "reading the docs"`, they go along with it. Each stays until
 it's said again or taken off with `""`, or for as long as `--ttl` gives it (`30s`, `5m` or `2h`, a day at most);
 `--model ""` gives back the model crystal reads. Text is put on one line, without control characters, and cut to
-80 characters. `--seq` numbers a source's reports, `--source` naming it with letters, digits and `:._-`: a
-report that arrives after a later one from the same source is passed over, so reports sent at once from
-several processes can't leave an older line showing. A session takes numbered reports from up to 32 sources.
+80 characters.
+
+#### Numbered reports
+
+```sh
+crystal report working --source my-agent --seq 41      # one numbered no higher than 41 from my-agent is dropped
+crystal report --release --source my-agent             # lets go only of a session my-agent holds
+```
+
+Any report can name who sends it, with `--source` (letters, digits and `:._-`), and number it with `--seq`,
+which goes up with every report from that source, across your agent's restarts too: a timestamp works. A
+report that arrives after a later one from the same source is passed over, so a hook that runs late, or
+reports sent at once from several processes, can't put back what your agent was doing before, or leave an
+older line showing. What it's doing and what's on its row are numbered apart, so one command can say both
+under one number. The source whose report took the session over is the one that lets go of it: a
+`--release` from another source is passed over, and one with no `--source` always lets go. A session takes
+numbered reports from up to 32 sources.
 
 #### Keep it out of the way
 
 - Don't let crystal hold your agent up: report with a short timeout, one report at a time, and ignore
   failures.
-- `crystal ls --json` shows what crystal has: `reporter`, with the agent's name, its last `message` and the
-  `resume` command, `front`, the agent by its name, and the `line` and `model` its row shows.
+- `crystal ls --json` shows what crystal has: `reporter`, with the agent's name, its last `message`, the
+  `resume` command and the `source` that holds the session, `front`, the agent by its name, and the `line` and `model` its row shows.
 - `crystal events -n <session>` shows each report that changed something, and `session.claimed` and
   `session.released` as your agent takes the session over and lets go.
 
@@ -2289,6 +2353,12 @@ prompt: to read the pull request or the issue and its conversation first (`gh pr
 `task.issue`. Both ask the forge, so they need the github plugin and `gh` or `glab`; a number it doesn't know
 starts nothing.
 
+The pull request and the issue stay with the session as standing context, task or not: a session started on
+one from `O` or `i` with tasks off, or by a [profile](#profiles) that starts a plain session, is told of it the
+same way, as what the session is for. Each time its agent starts again, after a crash or a reboot, from the
+archive or with `crystal respawn`, in its conversation or afresh, it's told again, so it never loses track of
+what it was there to do.
+
 Closed tasks are kept in the project's history in crystal's database: what each was asked, when and how it
 closed, and the session and branch it ran in. `crystal tasks` lists the project's tasks, open ones first, then
 those waiting to start, then those closed, the latest first; `--all` lists every project's, `-C <dir>` another
@@ -2441,8 +2511,8 @@ prompt = "Push this branch and open a pull request for it with `gh pr create --f
 | Step setting | What it does |
 |---|---|
 | `name` | what the step is called; its session is named after the run and it, like `ship-1-plan` |
-| `profile` | optional: the [profile](#profiles) it runs with: agent, model, mode, arguments, instructions, prompt; left out, Claude Code as it's set up |
-| `agent` | optional: the agent it runs, like `codex`, in place of its profile's; on an agent other than its profile's, it keeps only the profile's prompt and instructions |
+| `profile` | optional: the [profile](#profiles) it runs with: agent, model, mode, arguments, instructions, and its prompt and postfix around the step's; left out, Claude Code as it's set up |
+| `agent` | optional: the agent it runs, like `codex`, in place of its profile's; on an agent other than its profile's, it keeps only the profile's prompt, postfix and instructions |
 | `model`, `effort`, `mode` | optional: its agent's model, how hard it thinks and how it asks before acting, in place of its profile's, checked as a profile's are |
 | `background` | optional: `false` runs Claude Code in a terminal rather than the background; left out, Claude Code runs in the background and any other agent in a terminal, and only Claude Code can |
 | `prompt` | what it's asked, with the names below filled in |
@@ -2863,6 +2933,8 @@ that makes no sense is said there too, and the settings stay as they were until 
 | `name_from_prompt` | `true` | name a session you don't name for the [first thing it's asked](#starting-a-session) |
 | `resume_reported_agents` | `true` | after a restart, run the command an agent [said resumes it](#teaching-crystal-about-your-agent), or the one that resumes an agent [typed into a shell](#usage) whose hooks named its conversation |
 | `confirm_quit` | `true` | `q` asks before it quits the TUI, since a key meant for an agent can land on the sidebar; the sessions keep running either way |
+| `show_keys` | `false` | show each key that runs a command at the right of the footer, with the command, for a few seconds: for whoever watches your screen shared or recorded |
+| `mermaid_ascii` | `false` | draw [mermaid diagrams](#the-file-finder-and-the-tree-browser) with ASCII rather than box drawing |
 | `scrollback_lines` | `10000` | how many rows that scrolled off a session's screen it keeps, up to 1,000,000, for scrolling back, copy mode, `e` and `crystal read --history` |
 | `[plugins]` | | which plugins are on and off: [plugins](#plugins) |
 | `[memory]` | | how memory's [distiller](#the-distiller) runs, and whether it [searches by meaning](#search-by-meaning) |
@@ -2874,7 +2946,7 @@ that makes no sense is said there too, and the settings stay as they were until 
 | `[sessions]` | | `stop_idle_after`, how long an agent may sit [idle](#archiving-and-idle-agents) before crystal stops it, like `"30m"`: `"off"`; `restart_spacing_ms`, how far apart the agents a [crash or a reboot](#usage) starts again start (`250`, or `0` for all at once) |
 | `[[project]]` | | a project's [run and open commands](#projects), by its main worktree's `path`, in place of its own file's, and the [plugins it ships](#a-projects-own-plugins) that are on for it, `plugins` |
 | `[keys]` | | the TUI's keys, by command, its prefixes, the key back to the sidebar, answering's, resize mode's and the views', and `[[keys.command]]`, keys of your own that run commands: [keys and commands](#keys-and-commands) |
-| `[sidebar]` | | the sidebar's `width`, whether it starts `folded`, what folding keeps, and whether what needs you is pinned: [the sidebar](#the-sidebar) |
+| `[sidebar]` | | the sidebar's `width`, whether it starts `folded`, what folding keeps, whether what needs you is pinned, and how narrow a terminal shows [one column](#on-a-phone): [the sidebar](#the-sidebar) |
 | `[terminal]` | | the shell a new terminal runs, `default_shell`, whether it's a login shell, `shell_mode`, and where `t` starts one, `new_cwd`: [terminals](#terminals-the-window-and-the-tab-bar) |
 | `[window]` | | `title`, what the TUI titles its terminal: [the window](#terminals-the-window-and-the-tab-bar) |
 | `[tab_bar]` | | where the tab bar goes, whether it's left out with one tab, and what it shows at its right: [the tab bar](#terminals-the-window-and-the-tab-bar) |
@@ -2901,13 +2973,35 @@ background task's run starts, `[handoff]` each time a note is written, `[session
 starts sessions again, a flow
 each time one starts, `[[project]]` each time a project's commands run,
 `name_from_prompt` each time it names a session, `resume_reported_agents` as it starts sessions again,
-`[clipboard]` each time a program copies out of sight and
-`scrollback_lines` as each session starts, so a change counts straight away (a session already running keeps
+`[clipboard]` each time a program copies out of sight,
+`scrollback_lines` as each session starts and `mermaid_ascii` as each session starts and each background task's
+run does, so a change counts straight away (a session already running keeps
 what it had); `crystal new` and the TUI read `[terminal]` each time they start a shell, and `crystal attach`
 reads `[clipboard]` as it attaches; the TUI reads
-`new_session`, `theme`, `[colors]`, `[appearance]`, `[window]`, `[tab_bar]`, `scrollback_lines`, `[plugins]`,
-`[update]`, `[mouse]`, `[clipboard]`, `[forge]`, `confirm_quit`, the profiles and the flows when it starts,
-again when you save a profile or switch a plugin, and every half a second while the settings view is open.
+`new_session`, `theme`, `[colors]`, `[appearance]`, `[window]`, `[tab_bar]`, `scrollback_lines`, `mermaid_ascii`,
+`[plugins]`, `[update]`, `[mouse]`, `[clipboard]`, `[forge]`, `confirm_quit`, `show_keys`, the profiles and the
+flows when it starts, again when you save a profile or switch a plugin, and every half a second while the
+settings view is open.
+
+#### Backups and other machines
+
+```sh
+crystal config export ~/backups             # write ~/backups/crystal-settings.json
+crystal config export > settings.json       # or on standard output
+crystal config import ~/backups             # merge it in, here or on another machine
+crystal config import ~/dotfiles/crystal    # a config.toml, its agents/ beside it, or both
+```
+
+An export is one JSON file holding the config file as it is, comments and all, and your own [agent rule
+files](#how-crystal-reads-an-agent) from `agents/` beside it. It never holds your plugins, nor what they keep
+beside the config (`plugin-config/`, where a plugin's token goes), nor anything a server keeps: sessions,
+layouts, the backlog, memory. An import takes an export, a config file on its own, a directory holding
+either, the way a copy of `~/.config/crystal` does, or `-` for standard input. It merges rather than
+replaces: a setting it has takes the place of yours, one it doesn't have stays as it is, profiles and flows
+merge by their names, projects by their paths and your own keys' commands by their keys, and a rules file
+replaces yours of the same name. Your config file keeps its comments and its order, nothing is written unless
+all of it, merged, makes sense, and the import lists what it changed. The daemon goes by the new settings as
+it next reads them; a TUI that's open shows all of them once it starts again.
 
 #### Themes
 
@@ -3098,11 +3192,14 @@ effort = "high"                            # optional: Claude Code's effort: low
 mode = "plan"                              # optional: Claude Code's permission mode, or Codex's approvals
 args = ["--verbose"]                       # optional: more options, after those
 prompt = "Review the diff on this branch." # optional: put before the task, a blank line between
+postfix = "End with the risks you found."  # optional: put after the task, the same way
 instructions = """
 You are reviewing, not writing. Point out risks before style,
 and say which lines each comment is about.
 """                                        # optional: kept for the whole session, see below
 where = "worktree"                         # optional: "here" or "worktree"; else as the panel is set
+launch = "background"                      # optional: "session", "task" or "background"; else as the panel is set
+skip_task = false                          # optional: true starts it without asking for a task
 ```
 
 `instructions` stay with the agent for the whole session, on top of its own: Claude Code gets them with
@@ -3110,6 +3207,15 @@ where = "worktree"                         # optional: "here" or "worktree"; els
 `config.toml`; what crystal adds, about a task or the memory, comes after them. The other agents can't be
 given any, so a profile for them that has some is an error. `prompt`, unlike `instructions`, is only the start
 of the first message.
+
+`launch` says how the profile is meant to start, and choosing it in the panel sets the panel's "how" row to
+match, which you can still change: `session` starts the agent in a terminal with what you typed as its first
+prompt only, a session rather than a [task](#tasks), with nothing to close; `task` starts it in a terminal as a
+task, which `crystal done` closes; and `background` as a [background task](#background-tasks), which only Claude
+Code can be, so another agent starts as a task in a terminal. Left out, the panel decides as it's set: what's
+given something to do is a task. `skip_task = true` starts it at once, without asking for a task: its `prompt`
+and `postfix` alone are what it's asked, and as a task, what it's to do, like a profile that commits the
+working tree in small commits.
 
 `mode` is one of `acceptEdits`, `plan` or `bypassPermissions` for Claude Code, and `on-request` or `never` for
 Codex. A profile is offered only when its agent is installed. One that can't start, for an agent crystal
@@ -3122,7 +3228,7 @@ changing only that profile's lines, so your comments and layout stay as they wer
 the file one crystal can't read isn't written, and the form says why.
 
 `crystal profile` lists them, and `crystal profile show <name>` prints the command one runs, quoted the way a
-shell reads it, with `<task>` where the task goes:
+shell reads it, with `<task>` where the task goes, and how it starts when it says:
 
 ```
 $ crystal profile show quick

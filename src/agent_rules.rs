@@ -730,6 +730,12 @@ fn parse(text: &str, source: Source) -> Result<AgentRules, String> {
     Ok(rules)
 }
 
+/// Why a rules file of the user's with `text` in it can't be read, if it
+/// can't: what `crystal config import` checks before it writes one.
+pub fn check_text(text: &str) -> Result<(), String> {
+    parse(text, Source::Added(PathBuf::new())).map(|_| ())
+}
+
 /// crystal's own rules, read once.
 fn bundled_agents() -> &'static [Arc<AgentRules>] {
     static AGENTS: OnceLock<Vec<Arc<AgentRules>>> = OnceLock::new();

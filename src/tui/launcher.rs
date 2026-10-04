@@ -14,7 +14,7 @@ use super::theme::Theme;
 use crate::catalog::{self, Agent, Choices, FirstPrompt, Setting};
 use crate::flows::Flow;
 use crate::forge::Checkout;
-use crate::profile::{Profile, StartIn};
+use crate::profile::{Launch, Profile, StartIn};
 use crate::protocol::{Front, TaskBrief, TaskSpec};
 use crate::{front, git, shell};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -76,12 +76,26 @@ impl Run {
     }
 
     /// Whether it can be given a task on its command line, or for a flow,
-    /// a goal.
+    /// a goal. A profile that starts without one doesn't ask.
     pub fn takes_task(&self) -> bool {
+        if let Run::Profile(profile) = self
+            && profile.skip_task
+        {
+            return false;
+        }
         let agent_takes = self
             .agent()
             .is_some_and(|agent| agent.first_prompt != FirstPrompt::None);
         agent_takes || matches!(self, Run::Flow(_))
+    }
+
+    /// How a profile is meant to start; anything else, as the panel is
+    /// set.
+    fn launch(&self) -> Launch {
+        match self {
+            Run::Profile(profile) => profile.launch,
+            _ => Launch::Either,
+        }
     }
 
     /// The rows of choices the panel shows for it: its agent's. A profile
@@ -179,14 +193,16 @@ pub enum Outcome {
     Stay,
     Cancel,
     /// Start `command` at `place`: in a terminal, or with `background`,
-    /// without one, as a background task. `task` is what the agent was
-    /// asked, and with `run`, what the panel remembers. `backlog` is the
-    /// backlog item the session is for, and `brief` the pull request or
-    /// the issue.
+    /// without one, as a background task. `task` is what was typed for the
+    /// agent, and with `run`, what the panel remembers; `goal` what the
+    /// session is a task to do, or `None` for a session that isn't one.
+    /// `backlog` is the backlog item the session is for, and `brief` the
+    /// pull request or the issue.
     Start {
         place: Place,
         command: Vec<String>,
         task: String,
+        goal: Option<String>,
         run: String,
         background: bool,
         backlog: Option<u64>,
@@ -702,6 +718,13 @@ impl Launcher {
         {
             self.start_in(*start_in);
         }
+        // How a profile is meant to start counts as it's chosen; the row
+        // can still be changed after.
+        match self.run().launch() {
+            Launch::Either => {}
+            Launch::Session | Launch::Task => self.how = 0,
+            Launch::Background => self.how = 1,
+        }
         if self.focus == Field::Task && !self.run().takes_task() {
             self.focus = Field::Run;
         }
@@ -825,6 +848,20 @@ impl Launcher {
         }
     }
 
+    /// What the session is a task to do: what was typed, or for a profile
+    /// that starts without a task, what it asks; `None` when it isn't a
+    /// task, with nothing to do, or started by a profile as a plain
+    /// session.
+    fn goal(&self) -> Option<String> {
+        let typed = self.task_text();
+        let goal = match self.run() {
+            Run::Profile(profile) if profile.skip_task => profile.asked(""),
+            _ => typed,
+        };
+        let session = self.run().launch() == Launch::Session && !self.in_background();
+        (!goal.is_empty() && !session).then_some(goal)
+    }
+
     /// The command line the session runs: what's chosen, as a profile with
     /// the rows' choices, on the task. An empty one is the user's shell.
     pub fn command(&self) -> Vec<String> {
@@ -842,13 +879,26 @@ impl Launcher {
         profile.command(&self.task_text())
     }
 
-    /// The chosen profile's description, if it has one.
-    pub fn description(&self) -> Option<&str> {
-        match self.run() {
-            Run::Profile(profile) => profile.description.as_deref(),
-            Run::Flow(flow) => flow.description.as_deref(),
-            _ => None,
+    /// The chosen profile's description, if it has one, and how it's
+    /// meant to start.
+    pub fn description(&self) -> Option<String> {
+        let mut parts: Vec<String> = match self.run() {
+            Run::Profile(profile) => profile.description.iter().cloned().collect(),
+            Run::Flow(flow) => return flow.description.clone(),
+            _ => return None,
+        };
+        if let Run::Profile(profile) = self.run() {
+            match profile.launch {
+                Launch::Either => {}
+                Launch::Session => parts.push("a session, not a task".to_string()),
+                Launch::Task => parts.push("a task".to_string()),
+                Launch::Background => parts.push("a background task".to_string()),
+            }
+            if profile.skip_task {
+                parts.push("asks for no task".to_string());
+            }
         }
+        (!parts.is_empty()).then(|| parts.join(" · "))
     }
 
     /// The command as the user would type it: what the panel shows, and
@@ -919,7 +969,7 @@ impl Launcher {
             return Outcome::Stay;
         }
         // In the background there's no terminal to type a task into later.
-        if self.in_background() && self.task_text().is_empty() {
+        if self.in_background() && self.goal().is_none() {
             self.problem = Some("say what the background task should do".to_string());
             self.focus = Field::Task;
             return Outcome::Stay;
@@ -941,6 +991,7 @@ impl Launcher {
             place: self.place(),
             command: self.command(),
             task: self.task_text(),
+            goal: self.goal(),
             run: self.run().key(),
             background: self.in_background(),
             backlog: self.backlog,
@@ -1033,6 +1084,16 @@ fn fit(profile: &Profile, command: &[String], task: Option<&str>) -> Option<usiz
         }
         fit += 1;
     }
+    if let Some(after) = profile
+        .postfix
+        .as_deref()
+        .filter(|after| !after.trim().is_empty())
+    {
+        if !task?.ends_with(after.trim()) {
+            return None;
+        }
+        fit += 1;
+    }
     let settings = catalog::find(&profile.agent).map_or(&[][..], |agent| agent.settings);
     let sets_rows = settings.iter().any(|s| profile.choice(s.kind).is_some());
     let rows_fit = settings
@@ -1051,8 +1112,7 @@ fn extras(profile: &Profile) -> Vec<String> {
         model: None,
         effort: None,
         mode: None,
-        prompt: None,
-        ..profile.clone()
+        ..profile.without_prompts()
     };
     bare.command("").split_off(1)
 }
@@ -1263,7 +1323,7 @@ pub fn panel_lines(launcher: &Launcher, width: u16) -> Vec<PanelLine> {
             let room = width.saturating_sub(LABEL_WIDTH);
             lines.push(PanelLine::new(vec![
                 (" ".repeat(LABEL_WIDTH), Ink::Muted),
-                (cut(description, room), Ink::Muted),
+                (cut(&description, room), Ink::Muted),
             ]));
         }
     }
@@ -1522,6 +1582,87 @@ mod tests {
         let spec = background_spec(&command).unwrap();
         assert_eq!(spec.prompt, "fix the tests");
         assert_eq!(spec.args, ["--model", "fable"]);
+    }
+
+    #[test]
+    fn a_profile_says_how_it_starts_as_it_is_chosen() {
+        let profile = |name: &str, launch| {
+            Run::Profile(Profile {
+                name: name.into(),
+                prompt: Some("Review it.".into()),
+                postfix: Some("End with the risks.".into()),
+                launch,
+                ..Profile::for_agent("claude")
+            })
+        };
+        let runs = vec![
+            agent("claude"),
+            profile("talk", Launch::Session),
+            profile("audit", Launch::Background),
+        ];
+        let mut panel = launcher_with_background(runs);
+        type_text(&mut panel, "the login");
+        press(&mut panel, KeyCode::Tab); // run
+        press(&mut panel, KeyCode::Right);
+        assert_eq!(
+            panel.description().as_deref(),
+            Some("a session, not a task")
+        );
+        assert!(!panel.in_background());
+        let Outcome::Start { command, goal, .. } = panel.start() else {
+            panic!("didn't start");
+        };
+        // What it's asked is its first prompt, and it isn't a task.
+        assert_eq!(
+            command.last().unwrap(),
+            "Review it.\n\nthe login\n\nEnd with the risks."
+        );
+        assert_eq!(goal, None);
+
+        press(&mut panel, KeyCode::Right);
+        assert!(panel.in_background());
+        let Outcome::Start {
+            goal, background, ..
+        } = panel.start()
+        else {
+            panic!("didn't start");
+        };
+        assert!(background);
+        assert_eq!(goal.as_deref(), Some("the login"));
+        // Changed by hand, the row holds until another profile is chosen.
+        press(&mut panel, KeyCode::Tab); // how
+        press(&mut panel, KeyCode::Left);
+        assert!(!panel.in_background());
+    }
+
+    #[test]
+    fn a_profile_that_asks_for_no_task_is_a_task_to_do_what_it_asks() {
+        let committer = Run::Profile(Profile {
+            name: "committer".into(),
+            prompt: Some("Commit the working tree.".into()),
+            postfix: Some("Don't push.".into()),
+            skip_task: true,
+            launch: Launch::Background,
+            ..Profile::for_agent("claude")
+        });
+        let mut panel = launcher_with_background(vec![committer]);
+        assert!(!panel.fields().contains(&Field::Task));
+        assert_eq!(panel.focus(), Field::Run);
+        let Outcome::Start {
+            command,
+            task,
+            goal,
+            background,
+            ..
+        } = panel.start()
+        else {
+            panic!("didn't start");
+        };
+        assert!(background);
+        assert_eq!(task, "");
+        let asked = "Commit the working tree.\n\nDon't push.";
+        assert_eq!(goal.as_deref(), Some(asked));
+        assert_eq!(background_spec(&command).unwrap().prompt, asked);
     }
 
     #[test]
@@ -1915,7 +2056,10 @@ mod tests {
         };
         let mut panel = launcher(vec![Run::Profile(review), agent("claude")]);
         assert_eq!(panel.run().key(), "profile:review");
-        assert_eq!(panel.description(), Some("A second pair of eyes"));
+        assert_eq!(
+            panel.description().as_deref(),
+            Some("A second pair of eyes")
+        );
         assert!(panel.is_new_worktree());
         assert_eq!(
             panel.fields(),
@@ -1984,6 +2128,26 @@ mod tests {
         press(&mut panel, KeyCode::Tab);
         press(&mut panel, KeyCode::Right);
         assert_eq!(panel.command()[1..3], ["--model", "sonnet"]);
+    }
+
+    #[test]
+    fn like_a_session_the_panel_picks_the_profile_whose_prompt_and_postfix_its_task_has() {
+        let committer = Profile {
+            name: "committer".into(),
+            prompt: Some("Commit it.".into()),
+            postfix: Some("Don't push.".into()),
+            ..Profile::for_agent("claude")
+        };
+        let runs = vec![Run::Profile(committer), agent("claude")];
+        let asked = |task: &str| vec!["claude".to_string(), "--".into(), task.to_string()];
+        let panel = launcher(runs.clone())
+            .like(&asked("Commit it.\n\nthe docs\n\nDon't push."), false)
+            .unwrap();
+        assert_eq!(panel.run().key(), "profile:committer");
+        let panel = launcher(runs)
+            .like(&asked("Commit it.\n\nthe docs"), false)
+            .unwrap();
+        assert_eq!(panel.run().key(), "claude");
     }
 
     #[test]

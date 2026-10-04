@@ -44,6 +44,14 @@ pub struct Config {
     pub confirm_quit: bool,
     /// The TUI's colors.
     pub theme: ThemeName,
+    /// Show each key that runs a command at the right of the TUI's footer,
+    /// with the command, for a few seconds: for whoever watches a screen
+    /// shared or recorded.
+    pub show_keys: bool,
+    /// Draw the mermaid diagrams in pages, transcripts and `crystal
+    /// mermaid` with ASCII, `+ - | > v`, rather than box drawing, for a
+    /// font or a terminal without those characters.
+    pub mermaid_ascii: bool,
     /// How many rows that scrolled off a session's screen are kept, for
     /// copy mode, `crystal read --history` and the editor `e` opens: in the
     /// daemon, and again in each pane showing the session. A session keeps
@@ -445,6 +453,10 @@ pub struct SidebarSettings {
     /// The sessions that need the user, from every tab, in a group of their
     /// own at its top.
     pub needs_you: bool,
+    /// A terminal this many columns wide or narrower, like a phone's over
+    /// ssh, shows one column: the sidebar across all of it, or the pane
+    /// being typed into. 0 never does.
+    pub phone_width: u16,
 }
 
 /// The narrowest and widest the sidebar can be, unfolded.
@@ -457,6 +469,7 @@ impl Default for SidebarSettings {
             folded: false,
             fold: Fold::Marks,
             needs_you: true,
+            phone_width: 64,
         }
     }
 }
@@ -904,6 +917,8 @@ impl Default for Config {
             resume_reported_agents: true,
             confirm_quit: true,
             theme: ThemeName::DARK,
+            show_keys: false,
+            mermaid_ascii: false,
             colors: BTreeMap::new(),
             scrollback_lines: vt::DEFAULT_HISTORY_LINES,
             plugins: BTreeMap::new(),
@@ -1923,6 +1938,8 @@ back_to = "build"
             resume_reported_agents: false,
             confirm_quit: false,
             theme: ThemeName::find("nord").unwrap(),
+            show_keys: true,
+            mermaid_ascii: true,
             scrollback_lines: 50_000,
             colors: BTreeMap::from([
                 (ColorToken::Accent, ColorValue(Color::Rgb(245, 194, 231))),
@@ -1979,8 +1996,11 @@ back_to = "build"
                 mode: Some("plan".into()),
                 args: vec!["--verbose".into()],
                 prompt: Some("Review it.".into()),
+                postfix: Some("End with the risks.".into()),
+                skip_task: true,
                 instructions: Some("Be brief.".into()),
                 start_in: Some(StartIn::Worktree),
+                launch: crate::profile::Launch::Background,
             }],
             flows: vec![Flow {
                 name: "ship".into(),
@@ -2068,6 +2088,7 @@ back_to = "build"
                 folded: true,
                 fold: Fold::Hidden,
                 needs_you: false,
+                phone_width: 50,
             },
             terminal: TerminalSettings {
                 default_shell: "fish".into(),

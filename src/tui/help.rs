@@ -7,6 +7,7 @@
 //! took are listed after the sidebar's own.
 
 use super::keymap::{self, Chord, Keymap, ModeKey};
+use super::page::{self, Tab};
 use super::theme::Theme;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Margin, Rect};
@@ -191,14 +192,16 @@ pub fn draw(frame: &mut Frame, theme: &Theme, area: Rect, shown: &Shown, page: u
     } else {
         Block::new()
     };
-    let title = Style::new().fg(theme.accent).add_modifier(Modifier::BOLD);
     let closing = match pages.len() {
-        1 => " any key closes this ".to_string(),
-        count => format!(" {}/{count} · ← → turn · any other key closes ", page + 1),
+        1 => " tab: the guide · any other key closes ".to_string(),
+        count => format!(
+            " {}/{count} · ← → turn · tab: the guide · any other key closes ",
+            page + 1
+        ),
     };
     let block = block
         .style(Style::new().bg(theme.panel).fg(theme.text))
-        .title(Line::styled(" keys ", title))
+        .title(page::tabs_title(Tab::Keys, theme))
         .title_bottom(Line::styled(closing, Style::new().fg(theme.muted)));
     // The title rows are kept either way; a frame takes a column a side of
     // the room around the columns.

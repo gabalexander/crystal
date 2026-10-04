@@ -11,7 +11,7 @@ use super::text_area::TextArea;
 use super::text_input::TextInput;
 use super::theme::Theme;
 use crate::catalog::{self, Agent, Choices, Instructions, Kind};
-use crate::profile::{Profile, StartIn};
+use crate::profile::{Launch, Profile, StartIn};
 use crate::shell;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
@@ -33,6 +33,9 @@ const PLACES: &[(&str, Option<StartIn>)] = &[
     ("here", Some(StartIn::Here)),
     ("new worktree", Some(StartIn::Worktree)),
 ];
+
+/// What the form's "task" row offers: whether the profile asks for one.
+const TASK_CHOICES: [&str; 2] = ["asked for", "none, starts at once"];
 
 /// What a key in the view leads to.
 #[derive(Debug, PartialEq, Eq)]
@@ -218,8 +221,11 @@ pub enum Field {
     Effort,
     Mode,
     Where,
+    Launch,
     Args,
     Prompt,
+    Postfix,
+    SkipTask,
     Instructions,
 }
 
@@ -252,8 +258,12 @@ pub struct Form {
     mode: usize,
     /// Which of [`PLACES`].
     place: usize,
+    /// Which of [`Launch::ALL`].
+    launch: usize,
     args: TextInput,
     prompt: TextArea,
+    postfix: TextArea,
+    skip_task: bool,
     instructions: TextArea,
     focus: Field,
 }
@@ -266,6 +276,8 @@ impl Form {
             .unwrap_or(0);
         let mut prompt = TextArea::default();
         prompt.set_text(profile.prompt.as_deref().unwrap_or(""));
+        let mut postfix = TextArea::default();
+        postfix.set_text(profile.postfix.as_deref().unwrap_or(""));
         let mut instructions = TextArea::default();
         instructions.set_text(profile.instructions.as_deref().unwrap_or(""));
         let args: Vec<String> = profile.args.iter().map(|arg| shell::quote(arg)).collect();
@@ -283,8 +295,14 @@ impl Form {
                 .iter()
                 .position(|(_, start_in)| *start_in == profile.start_in)
                 .unwrap_or(0),
+            launch: Launch::ALL
+                .iter()
+                .position(|launch| *launch == profile.launch)
+                .unwrap_or(0),
             args: TextInput::with_text(&args.join(" ")),
             prompt,
+            postfix,
+            skip_task: profile.skip_task,
             instructions,
             focus: Field::Name,
         };
@@ -334,7 +352,14 @@ impl Form {
                 fields.push(field);
             }
         }
-        fields.extend([Field::Where, Field::Args, Field::Prompt]);
+        fields.extend([
+            Field::Where,
+            Field::Launch,
+            Field::Args,
+            Field::Prompt,
+            Field::Postfix,
+            Field::SkipTask,
+        ]);
         if agent.instructions != Instructions::None {
             fields.push(Field::Instructions);
         }
@@ -388,7 +413,13 @@ impl Form {
     fn is_choice(&self) -> bool {
         matches!(
             self.focus,
-            Field::Agent | Field::Model | Field::Effort | Field::Mode | Field::Where
+            Field::Agent
+                | Field::Model
+                | Field::Effort
+                | Field::Mode
+                | Field::Where
+                | Field::Launch
+                | Field::SkipTask
         )
     }
 
@@ -412,6 +443,8 @@ impl Form {
                 self.mode = step(self.mode, by, count);
             }
             Field::Where => self.place = step(self.place, by, PLACES.len()),
+            Field::Launch => self.launch = step(self.launch, by, Launch::ALL.len()),
+            Field::SkipTask => self.skip_task = !self.skip_task,
             _ => {}
         }
     }
@@ -423,6 +456,9 @@ impl Form {
             Field::Args => self.args.on_key(key),
             Field::Prompt => {
                 self.prompt.on_key(key);
+            }
+            Field::Postfix => {
+                self.postfix.on_key(key);
             }
             Field::Instructions => {
                 self.instructions.on_key(key);
@@ -438,6 +474,7 @@ impl Form {
             Field::Description => self.description.insert_str(&one_line),
             Field::Args => self.args.insert_str(&one_line),
             Field::Prompt => self.prompt.insert_str(text),
+            Field::Postfix => self.postfix.insert_str(text),
             Field::Instructions => self.instructions.insert_str(text),
             _ => {}
         }
@@ -446,6 +483,7 @@ impl Form {
     fn text_area(&mut self) -> Option<&mut TextArea> {
         match self.focus {
             Field::Prompt => Some(&mut self.prompt),
+            Field::Postfix => Some(&mut self.postfix),
             Field::Instructions => Some(&mut self.instructions),
             _ => None,
         }
@@ -486,8 +524,11 @@ impl Form {
             mode: fixed(Kind::Mode, self.mode),
             args,
             prompt: filled(self.prompt.text()),
+            postfix: filled(self.postfix.text()),
+            skip_task: self.skip_task,
             instructions,
             start_in: PLACES[self.place].1,
+            launch: Launch::ALL[self.launch],
         })
     }
 
@@ -520,8 +561,17 @@ impl Form {
                 let shown = PLACES.iter().map(|(shown, _)| shown.to_string()).collect();
                 Value::Choices(shown, self.place)
             }
+            Field::Launch => {
+                let shown = Launch::ALL.iter().map(|l| l.word().to_string()).collect();
+                Value::Choices(shown, self.launch)
+            }
             Field::Args => Value::Text(vec![self.args.text().to_string()]),
             Field::Prompt => Value::Text(area_lines(&self.prompt, width)),
+            Field::Postfix => Value::Text(area_lines(&self.postfix, width)),
+            Field::SkipTask => {
+                let shown = TASK_CHOICES.iter().map(|c| c.to_string()).collect();
+                Value::Choices(shown, usize::from(self.skip_task))
+            }
             Field::Instructions => Value::Text(area_lines(&self.instructions, width)),
         }
     }
@@ -537,8 +587,11 @@ impl Form {
             Field::Effort => "effort",
             Field::Mode => self.agent().setting(Kind::Mode).map_or("mode", |s| s.label),
             Field::Where => "where",
+            Field::Launch => "starts as",
             Field::Args => "arguments",
             Field::Prompt => "prompt",
+            Field::Postfix => "after task",
+            Field::SkipTask => "task",
             Field::Instructions => "instructions",
         }
     }
@@ -551,6 +604,7 @@ impl Form {
             Field::Description => Some((0, self.description.cursor())),
             Field::Args => Some((0, self.args.cursor())),
             Field::Prompt => Some(area_cursor(&self.prompt, width)),
+            Field::Postfix => Some(area_cursor(&self.postfix, width)),
             Field::Instructions => Some(area_cursor(&self.instructions, width)),
             _ => None,
         }
@@ -812,6 +866,12 @@ fn summary(profile: &Profile) -> String {
         Some(StartIn::Worktree) => parts.push("new worktree".to_string()),
         None => {}
     }
+    if profile.launch != Launch::Either {
+        parts.push(profile.launch.word().to_string());
+    }
+    if profile.skip_task {
+        parts.push("no task".to_string());
+    }
     parts.join(" · ")
 }
 
@@ -1004,6 +1064,52 @@ mod tests {
     }
 
     #[test]
+    fn the_form_sets_how_it_starts_what_goes_after_the_task_and_whether_it_asks_for_one() {
+        let mut view = view();
+        press(&mut view, KeyCode::Enter);
+        let to = |view: &mut ProfilesView, field: Field| {
+            while view.form().unwrap().focus() != field {
+                press(view, KeyCode::Tab);
+            }
+        };
+        to(&mut view, Field::Launch);
+        press(&mut view, KeyCode::Right);
+        to(&mut view, Field::Postfix);
+        type_text(&mut view, "Don't push.");
+        to(&mut view, Field::SkipTask);
+        press(&mut view, KeyCode::Right);
+        let lines: Vec<String> = form_lines(view.form().unwrap(), 80)
+            .iter()
+            .map(ViewLine::text)
+            .collect();
+        let starts = lines
+            .iter()
+            .find(|line| line.starts_with("starts as "))
+            .unwrap();
+        assert!(
+            starts.contains("either   session   task   background"),
+            "{starts}"
+        );
+        assert!(
+            lines.iter().any(|line| line == "after task    Don't push."),
+            "{lines:#?}"
+        );
+        let task = lines.iter().find(|line| line.starts_with("task ")).unwrap();
+        assert!(task.contains("asked for   none, starts at once"), "{task}");
+        let Outcome::Save { profile, .. } = press(&mut view, KeyCode::Enter) else {
+            panic!("didn't save");
+        };
+        assert_eq!(profile.launch, Launch::Session);
+        assert_eq!(profile.postfix.as_deref(), Some("Don't push."));
+        assert!(profile.skip_task);
+        assert!(
+            summary(&profile).ends_with(" · session · no task"),
+            "{}",
+            summary(&profile)
+        );
+    }
+
+    #[test]
     fn a_new_profile_needs_a_name() {
         let mut view = view();
         press(&mut view, KeyCode::Char('a'));
@@ -1097,9 +1203,9 @@ mod tests {
         let mut view = view();
         press(&mut view, KeyCode::Char('a'));
         type_text(&mut view, "x");
-        // Name, description, agent, model, effort, mode, where, then
-        // arguments.
-        for _ in 0..7 {
+        // Name, description, agent, model, effort, mode, where, how it
+        // starts, then arguments.
+        for _ in 0..8 {
             press(&mut view, KeyCode::Tab);
         }
         assert_eq!(view.form().unwrap().focus(), Field::Args);

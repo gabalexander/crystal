@@ -14,8 +14,12 @@
 //! installs the skill, as `restart-server` and `skill --install` do: a
 //! daemon hands over only to a crystal that reads what it hands over, and
 //! the skill to install is the new crystal's.
+//!
+//! An update keeps the new release's notes, its body on GitHub, in the state
+//! directory, and the TUI shows them, once, the first time it opens on the
+//! new crystal; updated some other way, the TUI asks for them itself.
 
-use crate::{embed, server_cli, shell, skill, socket};
+use crate::{embed, printable, server_cli, shell, skill, socket, state};
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -38,18 +42,34 @@ const LOOK_EVERY: u64 = 24 * 60 * 60;
 /// The most asking which release is the latest may take, in seconds.
 const ASK_TIMEOUT: &str = "15";
 
+/// What a release's notes are called among its files, for releases kept
+/// anywhere but GitHub, which has them as the release's body.
+const NOTES_FILE: &str = "release-notes.md";
+
 /// `crystal update`: installs `version`, or else the latest release when
-/// it's newer than this crystal; with `check`, only says whether it is.
-pub fn run(socket: &Path, version: Option<String>, check: bool) -> Result<()> {
-    let wanted = match &version {
-        Some(version) => {
+/// it's newer than this crystal; with `check`, only says whether it is;
+/// with `notes`, prints what `version`, or this crystal, changed.
+pub fn run(socket: &Path, version: Option<String>, check: bool, notes: bool) -> Result<()> {
+    let version = version
+        .map(|version| {
             let version = version.trim_start_matches('v');
             ensure!(
                 numbers(version).is_some(),
                 "{version} isn't a release's version, like 0.4.0"
             );
-            version.to_string()
-        }
+            Ok(version.to_string())
+        })
+        .transpose()?;
+    if notes {
+        let version = version.as_deref().unwrap_or(VERSION);
+        let body = kept_notes(version)
+            .or_else(|| fetch_notes(version))
+            .with_context(|| format!("there are no notes for crystal {version} to be found"))?;
+        println!("{}", printable::text(&body).trim_end());
+        return Ok(());
+    }
+    let wanted = match &version {
+        Some(version) => version.clone(),
         None => latest()?,
     };
     if check {
@@ -83,6 +103,13 @@ pub fn run(socket: &Path, version: Option<String>, check: bool) -> Result<()> {
         "updated crystal {VERSION} to {wanted} in {}",
         shell::home_relative(&exe)
     );
+    // What's new, for the TUI to show as it next opens; none is no matter.
+    if let Some(body) = fetch_notes(&wanted) {
+        keep_notes(&wanted, &body);
+        println!(
+            "crystal's TUI shows what's new as it next opens: `crystal update --notes` prints it"
+        );
+    }
     restart_daemons(&exe, socket);
     install_skill(&exe);
     Ok(())
@@ -133,6 +160,135 @@ pub struct Looked {
 pub fn due(kept: Option<&str>, now: u64) -> bool {
     let last = kept.and_then(|json| serde_json::from_str::<Looked>(json).ok());
     last.is_none_or(|last| now.saturating_sub(last.at) >= LOOK_EVERY)
+}
+
+/// What a release's notes were kept as, by the crystal that updated to it.
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct KeptNotes {
+    version: String,
+    body: String,
+}
+
+/// The crystal whose TUI last opened, as the TUI keeps it: the notes of one
+/// it hasn't opened as yet are news.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Opened {
+    pub version: String,
+}
+
+impl Opened {
+    /// This crystal.
+    pub fn now() -> Opened {
+        Opened {
+            version: VERSION.to_string(),
+        }
+    }
+}
+
+/// Whether what this crystal changed is news to whoever opens its TUI,
+/// given the crystal it last opened as, as the TUI kept it, and whether it
+/// had opened before at all: a crystal from before this was kept had. A
+/// first TUI ever has nothing to compare with, and no news.
+pub fn has_news(kept: Option<&str>, opened_before: bool) -> bool {
+    let last = kept.and_then(|json| serde_json::from_str::<Opened>(json).ok());
+    match last {
+        Some(last) => last.version != VERSION,
+        None => opened_before,
+    }
+}
+
+/// What a page of this crystal's notes is titled.
+pub fn notes_title() -> String {
+    format!("what's new in crystal {VERSION}")
+}
+
+/// This crystal's notes, as an update kept them.
+pub fn this_crystals_kept_notes() -> Option<String> {
+    kept_notes(VERSION)
+}
+
+/// This crystal's notes, asked of where the releases are. Not being able
+/// to ask is no notes.
+pub fn this_crystals_notes() -> Option<String> {
+    fetch_notes(VERSION)
+}
+
+/// Keeps `body` as the notes of `version`, for the TUI of the crystal it
+/// is to show. Not being able to is no matter: the TUI asks for them.
+fn keep_notes(version: &str, body: &str) {
+    let path = state::release_notes_path();
+    let kept = KeptNotes {
+        version: version.to_string(),
+        body: body.to_string(),
+    };
+    if let Some(dir) = path.parent() {
+        let _ = fs::create_dir_all(dir);
+    }
+    if let Ok(json) = serde_json::to_string(&kept) {
+        let _ = fs::write(path, json);
+    }
+}
+
+/// The notes of `version`, if an update kept them.
+fn kept_notes(version: &str) -> Option<String> {
+    let json = fs::read_to_string(state::release_notes_path()).ok()?;
+    let kept: KeptNotes = serde_json::from_str(&json).ok()?;
+    (kept.version == version).then_some(kept.body)
+}
+
+/// The notes of the release `version`, from where the releases are: none
+/// when it has none, or they can't be had.
+fn fetch_notes(version: &str) -> Option<String> {
+    let (url, json) = notes_url(&releases(), version);
+    let mut command = Command::new("curl");
+    command.args([
+        "--fail",
+        "--silent",
+        "--location",
+        "--max-time",
+        ASK_TIMEOUT,
+    ]);
+    if json {
+        command.args(["--header", "Accept: application/vnd.github+json"]);
+    }
+    let out = command.arg(&url).stdin(Stdio::null()).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let body = if json {
+        release_body(&text)?
+    } else {
+        text.into_owned()
+    };
+    let body = body.replace("\r\n", "\n");
+    (!body.trim().is_empty()).then(|| body.trim().to_string())
+}
+
+/// Where the notes of the release `version` are, and whether they're the
+/// body of a release as GitHub's API gives it, in JSON: for releases on
+/// GitHub, that; anywhere else, [`NOTES_FILE`] among the release's files.
+fn notes_url(releases: &str, version: &str) -> (String, bool) {
+    let repo = releases
+        .strip_prefix("https://github.com/")
+        .and_then(|rest| rest.strip_suffix("/releases"))
+        .filter(|repo| repo.split('/').count() == 2);
+    match repo {
+        Some(repo) => (
+            format!("https://api.github.com/repos/{repo}/releases/tags/v{version}"),
+            true,
+        ),
+        None => (
+            format!("{releases}/download/v{version}/{NOTES_FILE}"),
+            false,
+        ),
+    }
+}
+
+/// The body of a release, from GitHub's JSON for it.
+fn release_body(json: &str) -> Option<String> {
+    let release: serde_json::Value = serde_json::from_str(json).ok()?;
+    Some(release.get("body")?.as_str()?.to_string())
 }
 
 /// Where the releases are: GitHub's, or `CRYSTAL_RELEASES`.
@@ -465,6 +621,42 @@ mod tests {
     }
 
     #[test]
+    fn a_releases_notes_are_its_body_on_github_and_a_file_beside_it_elsewhere() {
+        assert_eq!(
+            notes_url("https://github.com/gabalexander/crystal/releases", "0.4.0"),
+            (
+                "https://api.github.com/repos/gabalexander/crystal/releases/tags/v0.4.0".into(),
+                true
+            )
+        );
+        assert_eq!(
+            notes_url("http://127.0.0.1:9/mirror", "0.4.0"),
+            (
+                "http://127.0.0.1:9/mirror/download/v0.4.0/release-notes.md".into(),
+                false
+            )
+        );
+        let json = r###"{"tag_name": "v0.4.0", "body": "## Added\r\n- phones"}"###;
+        assert_eq!(release_body(json).as_deref(), Some("## Added\r\n- phones"));
+        assert_eq!(release_body(r#"{"message": "Not Found"}"#), None);
+    }
+
+    #[test]
+    fn whats_new_is_news_once_after_an_update_and_never_on_a_first_tui() {
+        let opened = |version: &str| {
+            serde_json::to_string(&Opened {
+                version: version.into(),
+            })
+            .unwrap()
+        };
+        assert!(has_news(Some(&opened("0.0.1")), true));
+        assert!(!has_news(Some(&opened(VERSION)), true));
+        // A TUI opened before, by a crystal that kept no version.
+        assert!(has_news(None, true));
+        assert!(!has_news(None, false));
+    }
+
+    #[test]
     fn versions_are_compared_by_their_numbers() {
         assert!(is_newer("0.4.0", "0.3.0"));
         assert!(is_newer("0.10.0", "0.9.9"));
@@ -521,5 +713,18 @@ mod tests {
             "aarch64-unknown-linux-musl",
         ];
         assert!(built.contains(&target().unwrap().as_str()));
+        // The workflow builds each, and the Homebrew formula installs each,
+        // by the names the install script and an update download.
+        let workflow = include_str!("../.github/workflows/release.yml");
+        let formula = include_str!("../packaging/homebrew/crystal.rb");
+        for target in built {
+            assert!(workflow.contains(&format!("target: {target}")), "{target}");
+            let archive = format!("/download/v@VERSION@/crystal-@VERSION@-{target}.tar.gz\"");
+            assert!(formula.contains(&archive), "{target}");
+            assert!(
+                formula.contains(&format!("sha256 \"@SHA256_{target}@\"")),
+                "{target}"
+            );
+        }
     }
 }
