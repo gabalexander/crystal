@@ -10,6 +10,7 @@
 
 use crate::events::{Event, Filter, Since};
 use crate::flow_run::FlowRun;
+use crate::state::SavedSession;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -80,6 +81,26 @@ pub enum Request {
     Rename {
         name: String,
         new_name: String,
+    },
+    /// Stop a session and keep it in the archive, out of the list, to
+    /// start again in its conversation when it's wanted.
+    Archive {
+        name: String,
+    },
+    /// The sessions in the archive, the latest archived first.
+    Archived,
+    /// Start an archived session again, under its name or the next one
+    /// free, from the client's environment, and take it out of the
+    /// archive. `name` is its name, the latest archived under it when
+    /// there are more, or its id.
+    Unarchive {
+        name: String,
+        env: BTreeMap<String, String>,
+    },
+    /// Take an archived session out of the archive for good: by its name,
+    /// as for [`Request::Unarchive`], or its id.
+    DeleteArchived {
+        name: String,
     },
     /// Run an ended session's command again, in the same directory and
     /// under the same name, from the client's environment.
@@ -231,6 +252,18 @@ pub enum Request {
     /// path of the project's main worktree.
     BacklogCounts {
         projects: Vec<PathBuf>,
+    },
+    /// The projects crystal knows: those sessions have run in, and those
+    /// added, until they're taken off the list.
+    Projects,
+    /// Put the project `dir` is in on the list of those crystal knows.
+    AddProject {
+        dir: PathBuf,
+    },
+    /// Take the project `dir` is in off that list. Its backlog, tasks and
+    /// memory stay, and it's listed again once a session runs there.
+    RemoveProject {
+        dir: PathBuf,
     },
     /// Something that happened outside the daemon, like a worktree a
     /// client made or an entry it added to memory: the daemon numbers it,
@@ -454,6 +487,10 @@ pub enum Response {
     Sessions {
         sessions: Vec<SessionInfo>,
     },
+    /// The sessions in the archive, the latest archived first.
+    Archived {
+        sessions: Vec<ArchivedSession>,
+    },
     /// `running` is false when the session has already ended: the daemon
     /// sends its last screen and hangs up.
     Attached {
@@ -494,6 +531,11 @@ pub enum Response {
     /// How many items are open on each project's backlog.
     BacklogCounts {
         open: BTreeMap<PathBuf, usize>,
+    },
+    /// The projects crystal knows, by their main worktrees, as they are
+    /// now: each one's branch included.
+    Projects {
+        projects: Vec<Worktree>,
     },
     /// The name a new flow run got.
     FlowStarted {
@@ -578,6 +620,10 @@ pub struct SessionInfo {
     /// How many subagents its agent has running, as its hooks say.
     #[serde(default)]
     pub subagents: u32,
+    /// crystal stopped it after its agent sat idle for as long as the
+    /// settings allow: it starts again in its conversation.
+    #[serde(default)]
+    pub stopped_idle: bool,
 }
 
 /// A subagent an agent started, as its hooks name it: its id, and its
@@ -587,6 +633,32 @@ pub struct Subagent {
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_type: Option<String>,
+}
+
+/// A session kept in the archive: what it takes to start it again, where
+/// it ran, and when it was archived.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArchivedSession {
+    /// The id it had, which it keeps in the archive.
+    pub id: String,
+    pub session: SavedSession,
+    /// The worktree it ran in, as it was then.
+    #[serde(default)]
+    pub worktree: Option<Worktree>,
+    /// When it was archived, in seconds since the Unix epoch.
+    pub archived: u64,
+}
+
+impl ArchivedSession {
+    pub fn name(&self) -> &str {
+        &self.session.name
+    }
+
+    /// Whether it starts again where it was: in its agent's conversation,
+    /// or with the command its agent gave.
+    pub fn resumes(&self) -> bool {
+        self.session.conversation.is_some() || self.session.resume.is_some()
+    }
 }
 
 /// An agent that says what it's doing itself, with `crystal report`, and
@@ -661,6 +733,7 @@ impl SessionInfo {
     pub fn status(&self) -> String {
         match (&self.state, self.activity) {
             (State::Running, Some(activity)) => activity.to_string(),
+            _ if self.stopped_idle => "stopped idle".to_string(),
             (state, _) => state.to_string(),
         }
     }

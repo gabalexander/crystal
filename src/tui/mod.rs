@@ -8,6 +8,7 @@
 //! session list. The loop takes each event, updates the state, and draws.
 
 mod app;
+mod archived_view;
 mod away;
 mod backlog_view;
 mod command_line;
@@ -27,6 +28,7 @@ mod layout_link;
 mod layouts;
 mod listing;
 mod memory_view;
+mod menu;
 mod mouse;
 mod needs_you;
 mod pane;
@@ -62,6 +64,8 @@ use crate::layout::{Layout, Order, Relayed};
 use crate::memory::{self, Listed, Memory};
 use crate::plugins::{self, Context};
 use crate::profile;
+use crate::project_cli;
+use crate::project_commands::{self, Commands, Verb};
 use crate::protocol::{
     Backlog, NewSession, Request, Response, SessionInfo, Spending, State, Worktree,
 };
@@ -93,6 +97,9 @@ use theme::Theme;
 /// How often the session list is asked for. The daemon doesn't announce
 /// changes, so this is how far behind the list can be.
 const POLL_EVERY: Duration = Duration::from_millis(500);
+
+/// How many polls go by between asking which projects crystal knows.
+const PROJECTS_EVERY: u64 = 6;
 
 /// How often the working mark turns a quarter, while an agent works. With
 /// nothing working, the TUI waits for something to happen instead.
@@ -135,6 +142,8 @@ pub enum Event {
     },
     /// Every flow run, as the daemon listed them.
     Flows(Vec<FlowRun>),
+    /// The projects crystal knows, by their main worktrees.
+    Projects(Vec<Worktree>),
     /// Output from the session in the pane with this id.
     Output {
         pane: u64,
@@ -259,7 +268,7 @@ pub enum Event {
     /// What background tasks have spent today.
     Spending(Spending),
     /// The settings as they are now, for the settings view.
-    Settings(settings_view::Current),
+    Settings(Box<settings_view::Current>),
     /// The terminal has focus again, or has lost it.
     Focus(bool),
     /// A page of the event log, the newest first, read for the timeline
@@ -742,8 +751,8 @@ impl Tui {
     /// and the worktree lister which projects they're in.
     fn set_sessions(&mut self, sessions: Vec<SessionInfo>) {
         self.app.set_sessions(sessions);
+        self.list_worktrees_of_projects();
         let projects = self.app.projects();
-        *self.worktree_projects.lock().unwrap() = projects.clone();
         // With the github plugin off, the poller has nothing to ask about.
         let asked = if self.app.github_on() {
             projects
@@ -751,6 +760,22 @@ impl Tui {
             Vec::new()
         };
         *self.projects.lock().unwrap() = asked;
+    }
+
+    /// Tells the worktree lister which projects to list the worktrees of:
+    /// those the sessions are in, and those crystal knows.
+    fn list_worktrees_of_projects(&mut self) {
+        let mut projects = self.app.projects();
+        projects.extend(self.app.known_projects().iter().map(|w| w.path.clone()));
+        projects.sort();
+        projects.dedup();
+        *self.worktree_projects.lock().unwrap() = projects;
+    }
+
+    /// Takes the projects crystal knows, as the daemon listed them.
+    fn set_known_projects(&mut self, projects: Vec<Worktree>) {
+        self.app.set_known_projects(projects);
+        self.list_worktrees_of_projects();
     }
 
     /// Asks the forge, off the loop, for the issue or pull request the
@@ -822,6 +847,7 @@ impl Tui {
                 self.set_sessions(sessions);
             }
             Event::Flows(runs) => self.app.set_flows(runs),
+            Event::Projects(projects) => self.set_known_projects(projects),
             Event::PullRequests { project, found } => self.app.set_pull_requests(project, found),
             Event::Worktrees { project, worktrees } => self.app.set_worktrees(project, worktrees),
             Event::WorktreeRemoved { path, removed } => self.worktree_removed(&path, removed),
@@ -910,7 +936,7 @@ impl Tui {
                 if let Ok(config) = &current.config {
                     self.config_changed(config);
                 }
-                self.app.show_settings(current);
+                self.app.show_settings(*current);
             }
             Event::Focus(true) => {
                 self.layout.focus(true);
@@ -1002,6 +1028,17 @@ impl Tui {
         if self.overlay.is_some() {
             return;
         }
+        // An open menu has the mouse; a right click elsewhere closes it and
+        // opens another there.
+        let right_click = mouse.kind == MouseEventKind::Down(MouseButton::Right);
+        if self.app.menu().is_some() {
+            if let Some(action) = self.app.menu_mouse(mouse.kind, mouse.column, mouse.row) {
+                self.carry_out(action);
+            }
+            if !right_click {
+                return;
+            }
+        }
         let areas = ui::Areas::of(&self.app, self.screen);
         let mut hit = ui::hit(&areas, &self.app, mouse.column, mouse.row);
         if self.click_on_link(&mouse, hit) {
@@ -1018,6 +1055,13 @@ impl Tui {
         } else if self.app.grabbed().is_none() && self.pass_to_program(&mouse, hit) {
             return;
         }
+        // A right click the program in a pane didn't take opens a menu.
+        if right_click {
+            if let Some(action) = self.app.right_click(hit, (mouse.column, mouse.row)) {
+                self.carry_out(action);
+            }
+            return;
+        }
         if let Some(action) = self.app.on_mouse(mouse.kind, hit) {
             self.carry_out(action);
         }
@@ -1028,6 +1072,11 @@ impl Tui {
     fn mouse_moved(&mut self, mouse: &MouseEvent) -> bool {
         if self.overlay.is_some() {
             return false;
+        }
+        // Over a menu, the bar follows the mouse.
+        if let Some(was) = self.app.menu().map(|menu| menu.highlighted) {
+            self.app.menu_mouse(mouse.kind, mouse.column, mouse.row);
+            return self.app.menu().map(|menu| menu.highlighted) != Some(was);
         }
         let areas = ui::Areas::of(&self.app, self.screen);
         let hit = ui::hit(&areas, &self.app, mouse.column, mouse.row);
@@ -1464,6 +1513,49 @@ impl Tui {
                 client::ask(&self.socket, &Request::Kill { name }, false)?;
                 self.refresh_sessions()?;
             }
+            Action::ForgetProject(path) => {
+                client::ask(&self.socket, &Request::RemoveProject { dir: path }, false)?;
+                if let Some(projects) = list_projects(&self.socket) {
+                    self.set_known_projects(projects);
+                }
+            }
+            Action::Archive(name) => {
+                client::ask(
+                    &self.socket,
+                    &Request::Archive { name: name.clone() },
+                    false,
+                )?;
+                self.refresh_sessions()?;
+                self.app
+                    .notify(format!("archived {name}: Z starts it again where it was"));
+            }
+            Action::ListArchived => {
+                let found = match client::ask(&self.socket, &Request::Archived, false) {
+                    Ok(Some(Response::Archived { sessions })) => Ok(sessions),
+                    Ok(_) => Ok(Vec::new()),
+                    Err(err) => Err(format!("{err:#}")),
+                };
+                self.app.show_archived(found);
+            }
+            Action::Unarchive(id) => {
+                let request = Request::Unarchive {
+                    name: id,
+                    env: env::current(),
+                };
+                let name = match client::ask(&self.socket, &request, true)? {
+                    Some(Response::Created { name, .. }) => name,
+                    _ => bail!("the daemon didn't start it"),
+                };
+                self.refresh_sessions()?;
+                self.app.unarchived(&name);
+            }
+            Action::DeleteArchived(id) => {
+                client::ask(&self.socket, &Request::DeleteArchived { name: id }, false)?;
+                self.carry_out(Action::ListArchived);
+            }
+            Action::ProjectCommand { which, worktree } => {
+                self.project_command(which, &worktree)?;
+            }
             Action::KillAll(names) => {
                 // One that has gone already is no reason to spare the rest.
                 let mut failed = None;
@@ -1662,6 +1754,48 @@ impl Tui {
 
     /// Selects the session just started, called `name`, and hands it the
     /// keyboard.
+    /// Runs the project's command for `which` in `worktree`. Run starts a
+    /// session of its own there, or starts the one that ended again, or
+    /// asks to stop the one running; open runs in the background.
+    fn project_command(&mut self, which: Verb, worktree: &Worktree) -> Result<()> {
+        let config = Config::load()?;
+        let commands = Commands::of(&config, &worktree.path, &worktree.project_path)?;
+        let line = commands.line(which, &worktree.project)?;
+        let place = worktree.branch.as_deref().unwrap_or(&worktree.project);
+        if which == Verb::Open {
+            project_commands::open(line, &worktree.path)?;
+            self.app.notify(format!("opened {place}: {line}"));
+            return Ok(());
+        }
+        let found = self
+            .app
+            .sessions()
+            .iter()
+            .find(|session| project_commands::is_run_of(session, &worktree.path, line))
+            .cloned();
+        let name = match found {
+            Some(session) if session.state == State::Running => {
+                self.app.select(&session.name);
+                self.app.confirm_kill(session.name);
+                return Ok(());
+            }
+            Some(session) => {
+                client::respawn(&self.socket, &session.name)?;
+                session.name
+            }
+            None => {
+                let base = project_commands::run_name(&worktree.path);
+                let name = project_cli::free_name(&base, self.app.sessions());
+                let command = project_commands::shell_command(line);
+                client::new_session(&self.socket, Some(name), worktree.path.clone(), command)?
+            }
+        };
+        // It runs on its own: the sidebar keeps the keys.
+        self.refresh_sessions()?;
+        self.app.select(&name);
+        Ok(())
+    }
+
     fn show_new_session(&mut self, name: &str) -> Result<()> {
         self.refresh_sessions()?;
         self.app.select(name);
@@ -1712,7 +1846,7 @@ impl Tui {
     /// view.
     fn read_settings_now(&self) {
         let socket = self.socket.clone();
-        self.read_in_background(move || Event::Settings(read_settings(&socket)));
+        self.read_in_background(move || Event::Settings(Box::new(read_settings(&socket))));
     }
 
     /// Asks the daemon to get the model that searches memory by meaning
@@ -2460,7 +2594,16 @@ fn spawn_session_poller(socket: PathBuf, events: Sender<Event>, polled: Polled) 
     thread::spawn(move || {
         // Why the list couldn't be had, last time, once it has been said.
         let mut said = None;
+        let mut polls: u64 = 0;
         loop {
+            // The projects change rarely: they're asked for every few polls.
+            if polls.is_multiple_of(PROJECTS_EVERY)
+                && let Some(projects) = list_projects(&socket)
+                && events.send(Event::Projects(projects)).is_err()
+            {
+                return;
+            }
+            polls += 1;
             thread::sleep(POLL_EVERY);
             if poll_flows.load(Ordering::Relaxed)
                 && events.send(Event::Flows(list_flows(&socket))).is_err()
@@ -2469,7 +2612,7 @@ fn spawn_session_poller(socket: PathBuf, events: Sender<Event>, polled: Polled) 
             }
             if poll_settings.load(Ordering::Relaxed)
                 && events
-                    .send(Event::Settings(read_settings(&socket)))
+                    .send(Event::Settings(Box::new(read_settings(&socket))))
                     .is_err()
             {
                 return;
@@ -2510,6 +2653,15 @@ fn spawn_session_poller(socket: PathBuf, events: Sender<Event>, polled: Polled) 
             }
         }
     });
+}
+
+/// The projects crystal knows, by their main worktrees, or `None` when the
+/// daemon can't say.
+fn list_projects(socket: &Path) -> Option<Vec<Worktree>> {
+    match client::ask(socket, &Request::Projects, false) {
+        Ok(Some(Response::Projects { projects })) => Some(projects),
+        _ => None,
+    }
 }
 
 /// The settings as they are now: the config file, and how the model that

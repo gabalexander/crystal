@@ -414,6 +414,7 @@ mod tests {
 
     fn session(worktree: Option<Worktree>) -> SessionInfo {
         SessionInfo {
+            stopped_idle: false,
             front: None,
             id: "1a2b".into(),
             name: "claude-2".into(),

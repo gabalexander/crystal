@@ -416,6 +416,7 @@ mod tests {
 
     fn session(name: &str, activity: Option<Activity>, changed: u64) -> SessionInfo {
         SessionInfo {
+            stopped_idle: false,
             name: name.into(),
             id: format!("id-{name}"),
             command: vec!["claude".into()],

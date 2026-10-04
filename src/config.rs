@@ -12,6 +12,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -60,6 +61,9 @@ pub struct Config {
     pub handoff: HandoffSettings,
     /// How new worktrees are made: `[worktrees]` in the file.
     pub worktrees: WorktreeSettings,
+    /// What crystal does with sessions left alone: `[sessions]` in the
+    /// file.
+    pub sessions: SessionSettings,
     /// Saved ways to start an agent, offered first in the new-session
     /// panel: `[[profile]]` tables in the file. See [`crate::profile`].
     #[serde(rename = "profile", skip_serializing_if = "Vec::is_empty")]
@@ -68,6 +72,28 @@ pub struct Config {
     /// tables in the file. See [`crate::flows`].
     #[serde(rename = "flow", skip_serializing_if = "Vec::is_empty")]
     pub flows: Vec<Flow>,
+    /// What runs a project and what opens it, for projects that don't say
+    /// in their own `.crystal/project.toml`, or to say otherwise:
+    /// `[[project]]` tables in the file. See [`crate::project_commands`].
+    #[serde(rename = "project", skip_serializing_if = "Vec::is_empty")]
+    pub projects: Vec<ProjectSettings>,
+}
+
+/// One project's commands, which take the place of those in its own
+/// `.crystal/project.toml`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectSettings {
+    /// The project's main worktree, which may start with `~`.
+    pub path: PathBuf,
+    /// A shell command that runs the project, like `npm run dev`, in a
+    /// terminal of its own in the worktree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<String>,
+    /// A shell command that opens the worktree, like `code .`, run once
+    /// there with its output thrown away.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open: Option<String>,
 }
 
 /// When the user is told a session needs them: see [`crate::notify`].
@@ -167,6 +193,54 @@ pub struct WorktreeSettings {
     pub base: Option<String>,
 }
 
+/// What crystal does with sessions left alone.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SessionSettings {
+    /// How long an agent may sit idle at its prompt, with nobody watching
+    /// or typing, before crystal stops it, to start again in its
+    /// conversation when it's wanted: like `30m`, `2h` or `90s`, or `off`.
+    pub stop_idle_after: String,
+}
+
+impl Default for SessionSettings {
+    fn default() -> SessionSettings {
+        SessionSettings {
+            stop_idle_after: "off".to_string(),
+        }
+    }
+}
+
+impl SessionSettings {
+    /// The choices the settings view goes round.
+    pub const CHOICES: [&str; 6] = ["off", "15m", "30m", "1h", "2h", "8h"];
+
+    /// How long an agent may sit idle, or `None` when it may for good.
+    pub fn idle_limit(&self) -> Option<Duration> {
+        duration(&self.stop_idle_after).ok().flatten()
+    }
+}
+
+/// A while, as the settings write it: a number, then `s`, `m` or `h`; or
+/// `off`, or `0`, for none.
+pub fn duration(text: &str) -> Result<Option<Duration>> {
+    let text = text.trim();
+    if text == "off" || text == "0" {
+        return Ok(None);
+    }
+    let bad = || format!("`{text}` isn't a while: write it like `30m`, `2h` or `90s`, or `off`");
+    let split = text.len().checked_sub(1).with_context(bad)?;
+    let (number, unit) = text.split_at(split);
+    let number: u64 = number.trim().parse().ok().with_context(bad)?;
+    let seconds = match unit {
+        "s" => number,
+        "m" => number * 60,
+        "h" => number * 3600,
+        _ => bail!(bad()),
+    };
+    Ok((seconds > 0).then(|| Duration::from_secs(seconds)))
+}
+
 /// The TUI's colors to choose from. `dark` and `light` paint their own
 /// background, so they look the same in any terminal; `terminal` paints
 /// nothing and keeps to the terminal's own colors.
@@ -195,8 +269,10 @@ impl Default for Config {
             events: EventSettings::default(),
             handoff: HandoffSettings::default(),
             worktrees: WorktreeSettings::default(),
+            sessions: SessionSettings::default(),
             profiles: Vec::new(),
             flows: Vec::new(),
+            projects: Vec::new(),
         }
     }
 }
@@ -347,6 +423,7 @@ pub fn from_text(text: &str) -> Result<Config> {
             config.scrollback_lines
         );
     }
+    duration(&config.sessions.stop_idle_after).context("in [sessions], stop_idle_after")?;
     for profile in &config.profiles {
         profile.check()?;
     }
@@ -375,6 +452,26 @@ mod tests {
 
     fn parse(text: &str) -> Result<Config> {
         from_text(text)
+    }
+
+    #[test]
+    fn how_long_an_agent_may_sit_idle_is_read_as_a_while() {
+        assert_eq!(Config::default().sessions.idle_limit(), None);
+        let config = parse("[sessions]\nstop_idle_after = \"30m\"\n").unwrap();
+        assert_eq!(
+            config.sessions.idle_limit(),
+            Some(Duration::from_secs(1800))
+        );
+        assert_eq!(duration("2h").unwrap(), Some(Duration::from_secs(7200)));
+        assert_eq!(duration("90s").unwrap(), Some(Duration::from_secs(90)));
+        assert_eq!(duration("0").unwrap(), None);
+        for choice in SessionSettings::CHOICES {
+            duration(choice).unwrap();
+        }
+        let err = parse("[sessions]\nstop_idle_after = \"soon\"\n").unwrap_err();
+        assert!(format!("{err:#}").contains("isn't a while"), "{err:#}");
+        assert!(duration("m").is_err());
+        assert!(duration("").is_err());
     }
 
     #[test]
@@ -694,6 +791,9 @@ back_to = "build"
             worktrees: WorktreeSettings {
                 base: Some("develop".into()),
             },
+            sessions: SessionSettings {
+                stop_idle_after: "45m".into(),
+            },
             profiles: vec![Profile {
                 name: "review".into(),
                 description: Some("A second pair of eyes".into()),
@@ -731,6 +831,11 @@ back_to = "build"
                         max_rounds: None,
                     },
                 ],
+            }],
+            projects: vec![ProjectSettings {
+                path: PathBuf::from("~/code/app"),
+                run: Some("npm run dev".into()),
+                open: Some("code .".into()),
             }],
         };
         assert_eq!(parse(&config.to_toml()).unwrap(), config);

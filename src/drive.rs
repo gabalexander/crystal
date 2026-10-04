@@ -351,6 +351,9 @@ impl<'a> Watch<'a> {
             if event.kind == Kind::SessionRemoved {
                 bail!("{} was killed", self.name);
             }
+            if event.kind == Kind::SessionArchived {
+                bail!("{} was archived", self.name);
+            }
             let status = event
                 .session
                 .map(|session| session.status)
@@ -402,6 +405,7 @@ mod tests {
 
     fn session(state: State, activity: Option<Activity>) -> SessionInfo {
         SessionInfo {
+            stopped_idle: false,
             front: None,
             name: "agent".into(),
             id: "1".into(),

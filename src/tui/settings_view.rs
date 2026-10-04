@@ -9,7 +9,7 @@
 //! The view is state and logic only, apart from [`draw`] at the end.
 
 use super::theme::Theme;
-use crate::config::{Config, ThemeName};
+use crate::config::{Config, SessionSettings, ThemeName};
 use crate::embed::{self, Status};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
@@ -36,6 +36,7 @@ pub enum Setting {
     NotifyAfter,
     UnfocusedOnly,
     Theme,
+    StopIdle,
     Distill,
     Embeddings,
 }
@@ -47,6 +48,8 @@ pub enum Change {
     NotifyAfter(u64),
     UnfocusedOnly(bool),
     Theme(ThemeName),
+    /// How long an agent may sit idle, one of [`SessionSettings::CHOICES`].
+    StopIdle(&'static str),
     Distill(bool),
     Embeddings(bool),
 }
@@ -59,6 +62,7 @@ impl Change {
             Change::NotifyAfter(_) => &["notifications", "after_secs"],
             Change::UnfocusedOnly(_) => &["notifications", "unfocused_only"],
             Change::Theme(_) => &["theme"],
+            Change::StopIdle(_) => &["sessions", "stop_idle_after"],
             Change::Distill(_) => &["memory", "distill"],
             Change::Embeddings(_) => &["memory", "embeddings"],
         }
@@ -72,6 +76,7 @@ impl Change {
             | Change::Embeddings(on) => on.into(),
             Change::NotifyAfter(secs) => i64::try_from(secs).unwrap_or(i64::MAX).into(),
             Change::Theme(theme) => theme.name().into(),
+            Change::StopIdle(after) => after.into(),
         }
     }
 }
@@ -113,11 +118,12 @@ pub enum Outcome {
 }
 
 /// The settings the bar can be on, in the order they're listed.
-const SETTINGS: [Setting; 6] = [
+const SETTINGS: [Setting; 7] = [
     Setting::Notify,
     Setting::NotifyAfter,
     Setting::UnfocusedOnly,
     Setting::Theme,
+    Setting::StopIdle,
     Setting::Distill,
     Setting::Embeddings,
 ];
@@ -209,6 +215,18 @@ impl SettingsView {
             Setting::UnfocusedOnly => Change::UnfocusedOnly(!config.notifications.unfocused_only),
             Setting::Theme if forward => Change::Theme(config.theme.next()),
             Setting::Theme => Change::Theme(config.theme.next().next()),
+            Setting::StopIdle => {
+                let choices = SessionSettings::CHOICES;
+                let now = &config.sessions.stop_idle_after;
+                // One written by hand goes on to the first choice.
+                let at = choices.iter().position(|choice| choice == now);
+                let next = match (at, forward) {
+                    (Some(at), true) => (at + 1) % choices.len(),
+                    (Some(at), false) => (at + choices.len() - 1) % choices.len(),
+                    (None, _) => 0,
+                };
+                Change::StopIdle(choices[next])
+            }
             Setting::Distill => Change::Distill(!config.memory.distill),
             Setting::Embeddings => Change::Embeddings(!config.memory.embeddings),
         };
@@ -338,6 +356,7 @@ fn lines(view: &SettingsView, theme: &Theme) -> Vec<Line<'static>> {
             Setting::NotifyAfter => "  after",
             Setting::UnfocusedOnly => "  only when away",
             Setting::Theme => "theme",
+            Setting::StopIdle => "stop idle agents",
             Setting::Distill => "distill closed tasks",
             Setting::Embeddings => "search by meaning",
         };
@@ -399,6 +418,17 @@ fn lines(view: &SettingsView, theme: &Theme) -> Vec<Line<'static>> {
         None,
         config.theme.name().to_string(),
         "the TUI's colors: ←/→ to change".to_string(),
+    ));
+    let idle = &config.sessions.stop_idle_after;
+    lines.push(row(
+        Setting::StopIdle,
+        Some(config.sessions.idle_limit().is_some()),
+        if config.sessions.idle_limit().is_some() {
+            format!("after {idle}")
+        } else {
+            "off".to_string()
+        },
+        "at their prompt, unwatched: they start again where they were".to_string(),
     ));
 
     lines.push(Line::from(""));
@@ -513,6 +543,15 @@ mod tests {
         );
         press(&mut view, KeyCode::Down);
         assert_eq!(
+            press(&mut view, KeyCode::Right),
+            Outcome::Change(Change::StopIdle("15m"))
+        );
+        assert_eq!(
+            press(&mut view, KeyCode::Left),
+            Outcome::Change(Change::StopIdle("8h"))
+        );
+        press(&mut view, KeyCode::Down);
+        assert_eq!(
             press(&mut view, KeyCode::Char(' ')),
             Outcome::Change(Change::Distill(false))
         );
@@ -551,12 +590,16 @@ mod tests {
             Some("light")
         );
         assert_eq!(Change::Notify(false).value().as_bool(), Some(false));
+        assert_eq!(
+            Change::StopIdle("30m").keys(),
+            ["sessions", "stop_idle_after"]
+        );
     }
 
     #[test]
     fn enter_gets_the_model_only_once_search_by_meaning_is_on() {
         let mut view = view_of(Config::default(), Some(status()));
-        for _ in 0..5 {
+        for _ in 0..6 {
             press(&mut view, KeyCode::Down);
         }
         assert_eq!(press(&mut view, KeyCode::Enter), Outcome::Stay);

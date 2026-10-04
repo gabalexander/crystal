@@ -672,6 +672,7 @@ mod tests {
     /// A running session called `name`, with `front` in front.
     fn session(name: &str, front: Front) -> SessionInfo {
         SessionInfo {
+            stopped_idle: false,
             front: Some(front),
             name: name.into(),
             id: "1".into(),

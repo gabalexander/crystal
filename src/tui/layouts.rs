@@ -505,6 +505,7 @@ mod tests {
             asking: None,
             reporter: None,
             subagents: 0,
+            stopped_idle: false,
         };
         let claude = Program::of(&session(&["claude", "--model", "opus", "--", "fix it"]));
         assert_eq!(claude.unwrap().command, ["claude", "--model", "opus"]);

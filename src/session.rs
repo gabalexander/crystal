@@ -28,7 +28,7 @@ use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{self, Write};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -119,6 +119,8 @@ pub struct Session {
     typed_agent: Option<String>,
     /// How many subagents its agent has running, as its hooks say.
     subagents: u32,
+    /// crystal stopped it after its agent sat idle: see [`Session::idle_for`].
+    stopped_idle: bool,
     /// Tasks that closed of themselves, like a background task whose run
     /// ended, for the daemon to write down.
     closed: Vec<TaskRecord>,
@@ -183,6 +185,8 @@ pub struct Handed {
     typed_agent: Option<String>,
     #[serde(default)]
     subagents: u32,
+    #[serde(default)]
+    stopped_idle: bool,
     screen: vt::Saved,
     /// There will be no more output.
     ended: bool,
@@ -337,6 +341,7 @@ impl Session {
             named_after_program: false,
             typed_agent: None,
             subagents: 0,
+            stopped_idle: false,
             closed: Vec::new(),
             changes: Vec::new(),
             term,
@@ -397,6 +402,7 @@ impl Session {
             named_after_program: false,
             typed_agent: None,
             subagents: 0,
+            stopped_idle: false,
             closed: Vec::new(),
             changes: Vec::new(),
             term,
@@ -641,6 +647,12 @@ impl Session {
         }
     }
 
+    /// The main worktree of the repository the session runs in, if it runs
+    /// in one.
+    pub fn project_path(&self) -> Option<&Path> {
+        self.checkout.as_ref().map(Checkout::project_path)
+    }
+
     pub fn env(&self) -> &BTreeMap<String, String> {
         &self.env
     }
@@ -696,7 +708,42 @@ impl Session {
                 Some(front) if !front.is_agent() => 0,
                 _ => self.subagents,
             },
+            stopped_idle: self.stopped_idle,
         }
+    }
+
+    /// How long the session's agent has sat idle at its prompt: its turn
+    /// seen, nobody watching it or typing into it, and nothing changed. Only
+    /// an agent that can come back where it was, in its conversation or with
+    /// the command it gave, counts; never a task, nor one with its task
+    /// open, which waits on the user. `None` when it isn't idle that way.
+    pub fn idle_for(&self) -> Option<Duration> {
+        if !self.is_running() || self.task.is_some() || self.activity != Some(Activity::Idle) {
+            return None;
+        }
+        if self.goal.as_ref().is_some_and(TaskInfo::is_open) {
+            return None;
+        }
+        let agent = match &self.reporter {
+            Some(reporter) => reporter.resume.is_some(),
+            None => {
+                let in_front = self.front.as_ref().is_some_and(Front::is_agent);
+                in_front && self.conversation.is_some()
+            }
+        };
+        if !agent {
+            return None;
+        }
+        let untouched = self.term.untouched_for()?;
+        let unchanged = self.changed.lock().unwrap().elapsed().unwrap_or_default();
+        Some(untouched.min(unchanged))
+    }
+
+    /// Stops the session's agent, which has sat idle: it stays in the list,
+    /// to start again in its conversation.
+    pub fn stop_idle(&mut self) {
+        self.stopped_idle = true;
+        self.stop();
     }
 
     /// Takes what the session's agent says about itself with `crystal
@@ -1164,6 +1211,7 @@ impl Session {
             named_after_program: self.named_after_program,
             typed_agent: self.typed_agent.clone(),
             subagents: self.subagents,
+            stopped_idle: self.stopped_idle,
             screen,
             ended,
             pty,
@@ -1233,6 +1281,7 @@ impl Session {
             named_after_program: handed.named_after_program,
             typed_agent: handed.typed_agent,
             subagents: handed.subagents,
+            stopped_idle: handed.stopped_idle,
             closed: Vec::new(),
             changes: Vec::new(),
             term,
@@ -1355,6 +1404,10 @@ struct Screen {
     listeners: Vec<SyncSender<()>>,
     /// The program has closed its end: there will be no more output.
     ended: bool,
+    /// When someone last had anything to do with the session: typed into
+    /// it, or started or stopped watching it. Its program's own output
+    /// doesn't count: an agent at its prompt can redraw as it likes.
+    touched: Instant,
 }
 
 struct Viewer {
@@ -1386,6 +1439,7 @@ impl Term {
                 viewers: Vec::new(),
                 listeners: Vec::new(),
                 ended: false,
+                touched: Instant::now(),
             }),
             pump: Mutex::default(),
         }
@@ -1430,6 +1484,7 @@ impl Term {
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         let mut screen = self.screen.lock().unwrap();
         let snapshot = screen.vt.state_formatted(with_history);
+        screen.touched = Instant::now();
         let feed = (!screen.ended).then(|| {
             let (feed, rx) = mpsc::sync_channel(VIEWER_BACKLOG);
             screen.viewers.push(Viewer { id, feed });
@@ -1503,9 +1558,20 @@ impl Term {
     pub fn unwatch(&self, id: u64) {
         let mut screen = self.screen.lock().unwrap();
         screen.viewers.retain(|viewer| viewer.id != id);
+        screen.touched = Instant::now();
     }
 
+    /// How long it's been since anyone had anything to do with the
+    /// session: `None` while someone watches it.
+    pub fn untouched_for(&self) -> Option<Duration> {
+        let screen = self.screen.lock().unwrap();
+        screen.viewers.is_empty().then(|| screen.touched.elapsed())
+    }
+
+    /// Writes `bytes` to the program, as from the user: typed, pasted or
+    /// sent.
     pub fn write(&self, bytes: &[u8]) -> io::Result<()> {
+        self.screen.lock().unwrap().touched = Instant::now();
         match &self.pty {
             Some(pty) => pty.write(bytes),
             None => Err(io::Error::other("a task takes no keys")),
@@ -1548,8 +1614,9 @@ impl Term {
             match handover::readers().read(&pty.master, &mut buf) {
                 Ok(Got::Bytes(n)) => {
                     let replies = self.take_output(&buf[..n]);
+                    // The terminal's own answers, not the user's.
                     if !replies.is_empty() {
-                        let _ = self.write(&replies);
+                        let _ = pty.write(&replies);
                     }
                 }
                 Ok(Got::Stopped) => return,
@@ -1726,6 +1793,7 @@ mod tests {
             named_after_program: true,
             typed_agent: Some("codex".into()),
             subagents: 2,
+            stopped_idle: false,
             screen: screen.save(),
             ended: true,
             pty: None,
@@ -1793,6 +1861,7 @@ mod tests {
             named_after_program: false,
             typed_agent: Some("claude".into()),
             subagents: 2,
+            stopped_idle: false,
             screen: vt::Screen::answering(5, 20).save(),
             ended: true,
             pty: None,

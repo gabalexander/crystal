@@ -36,6 +36,7 @@ pub enum Kind {
     SessionIdle,
     SessionEnded,
     SessionRemoved,
+    SessionArchived,
     SessionClaimed,
     SessionReleased,
     SubagentStarted,
@@ -69,7 +70,7 @@ pub enum Kind {
 }
 
 impl Kind {
-    pub const ALL: [Kind; 38] = [
+    pub const ALL: [Kind; 39] = [
         Kind::SessionStarted,
         Kind::SessionRenamed,
         Kind::SessionWorking,
@@ -78,6 +79,7 @@ impl Kind {
         Kind::SessionIdle,
         Kind::SessionEnded,
         Kind::SessionRemoved,
+        Kind::SessionArchived,
         Kind::SessionClaimed,
         Kind::SessionReleased,
         Kind::SubagentStarted,
@@ -121,6 +123,7 @@ impl Kind {
             Kind::SessionIdle => "session.idle",
             Kind::SessionEnded => "session.ended",
             Kind::SessionRemoved => "session.removed",
+            Kind::SessionArchived => "session.archived",
             Kind::SessionClaimed => "session.claimed",
             Kind::SessionReleased => "session.released",
             Kind::SubagentStarted => "subagent.started",
@@ -859,7 +862,7 @@ impl Event {
                     format!("#{} {}", item.number, first_line(&item.text))
                 })
             }
-            Kind::SessionRemoved => String::new(),
+            Kind::SessionRemoved | Kind::SessionArchived => String::new(),
             Kind::PluginPaused => self
                 .plugin
                 .as_ref()
@@ -905,6 +908,7 @@ pub fn example(kind: Kind, session: Option<&SessionInfo>, dir: &Path) -> Event {
     let session = match session {
         Some(session) => session.clone(),
         None => SessionInfo {
+            stopped_idle: false,
             name: "example".into(),
             id: "example".into(),
             command: vec!["claude".into()],
@@ -978,7 +982,9 @@ pub fn example(kind: Kind, session: Option<&SessionInfo>, dir: &Path) -> Event {
         closed: (kind == Kind::BacklogClosed).then_some(now),
     };
     let event = match kind {
-        Kind::SessionStarted | Kind::SessionRemoved => Event::about_session(kind, &session),
+        Kind::SessionStarted | Kind::SessionRemoved | Kind::SessionArchived => {
+            Event::about_session(kind, &session)
+        }
         Kind::SessionRenamed => Event::renamed(&session, "old-name"),
         Kind::SessionWorking => Event::activity(&session, Some(Activity::Idle), Activity::Working),
         Kind::SessionWaiting => {
@@ -1194,6 +1200,7 @@ mod tests {
 
     fn session() -> SessionInfo {
         SessionInfo {
+            stopped_idle: false,
             name: "claude".into(),
             id: "s1".into(),
             command: vec!["claude".into()],
@@ -1360,7 +1367,12 @@ mod tests {
             let event = example(kind, Some(&session()), dir);
             assert_eq!(event.kind, kind);
             // The name says all there is to say of these.
-            let said_by_name = [Kind::SessionRemoved, Kind::RunInterrupted].contains(&kind);
+            let said_by_name = [
+                Kind::SessionRemoved,
+                Kind::SessionArchived,
+                Kind::RunInterrupted,
+            ]
+            .contains(&kind);
             assert!(!event.text().is_empty() || said_by_name, "{kind:?}");
         }
         let closed = example(Kind::TaskClosed, None, dir);

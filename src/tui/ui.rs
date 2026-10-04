@@ -5,6 +5,7 @@
 //! it never changes it.
 
 use super::app::{App, Filter, Focus, Hit, PluginPane, Prompt, Question, Slot, View};
+use super::archived_view;
 use super::backlog_view::{self, BacklogView};
 use super::copy_mode::{self, SearchPrompt};
 use super::diff_view;
@@ -15,6 +16,7 @@ use super::issues;
 use super::launcher;
 use super::layouts::{self, LayoutsView};
 use super::memory_view;
+use super::menu;
 use super::needs_you;
 use super::pane::Pane;
 use super::plugins_view;
@@ -430,6 +432,9 @@ pub fn draw(frame: &mut Frame, app: &App, panes: &[Pane], overlay: Option<&Pane>
     if let Some(view) = app.layouts_view() {
         layouts::draw(frame, view, look.theme, look.now, middle);
     }
+    if let Some(view) = app.archived_view() {
+        archived_view::draw(frame, view, look.theme, look.now, middle);
+    }
     if let Some(view) = app.timeline_view() {
         timeline::draw(frame, view, look.theme, look.now * 1000, middle);
     }
@@ -465,6 +470,9 @@ pub fn draw(frame: &mut Frame, app: &App, panes: &[Pane], overlay: Option<&Pane>
         draw_plugin_pane(frame, open, pane, look, &areas);
     }
     draw_footer(frame, app, panes, look, areas.footer);
+    if let Some(open) = app.menu() {
+        menu::draw(frame, open, look.theme, frame.area());
+    }
     if app.showing_keys() {
         let plugin_on = |plugin: &str| app.plugin_on(plugin);
         let plugin_keys = app.plugin_key_rows();
@@ -841,7 +849,7 @@ fn draw_pane(frame: &mut Frame, app: &App, look: &Look, slot: Slot, area: Rect, 
 fn header_notes(app: &App, slot: Slot, session: &SessionInfo, back: usize) -> Vec<String> {
     let mut notes = Vec::new();
     if session.state != State::Running {
-        notes.push(session.state.to_string());
+        notes.push(session.status());
     }
     // Zoomed, the one pane is the selected session's, and says why the
     // sidebar has gone.
@@ -1042,8 +1050,15 @@ fn draw_footer(frame: &mut Frame, app: &App, panes: &[Pane], look: &Look, area: 
         draw_notice_or(frame, app.notice(), pull_requests::hints(view), theme, area);
     } else if let Some(view) = app.backlog_view() {
         draw_backlog_footer(frame, view, theme, area);
+    } else if app.menu().is_some() {
+        frame.render_widget(hint_spans(menu::HINTS, theme), area);
     } else if let Some(view) = app.layouts_view() {
         draw_layouts_footer(frame, app.notice(), view, theme, area);
+    } else if let Some(view) = app.archived_view() {
+        match (view.deleting(), app.notice()) {
+            (Some(question), _) => frame.render_widget(question_line(&question, theme), area),
+            (None, notice) => draw_notice_or(frame, notice, archived_view::HINTS, theme, area),
+        }
     } else if let Some(name) = app.closing() {
         let question = format!("close {name}'s task? d done · f failed · any other key, not yet");
         frame.render_widget(question_line(&question, theme), area);
@@ -1601,6 +1616,7 @@ mod tests {
 
     fn session(name: &str, state: State) -> SessionInfo {
         SessionInfo {
+            stopped_idle: false,
             front: None,
             name: name.into(),
             id: name.into(),

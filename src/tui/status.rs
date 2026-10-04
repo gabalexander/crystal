@@ -31,6 +31,8 @@ impl Status {
             (State::Running, Some(Activity::Done)) => Status::Done,
             (State::Running, _) => Status::Running,
             (State::Exited { code: 0 }, _) => Status::Ended,
+            // Stopped by crystal, which isn't the program failing.
+            _ if session.stopped_idle => Status::Ended,
             _ => Status::Failed,
         }
     }
@@ -55,6 +57,7 @@ mod tests {
 
     fn session(state: State, activity: Option<Activity>) -> SessionInfo {
         SessionInfo {
+            stopped_idle: false,
             front: None,
             name: "s".into(),
             id: "s".into(),
