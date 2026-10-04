@@ -621,11 +621,16 @@ impl Session {
             .with_context(|| format!("{name} has no answer yet"))
     }
 
-    /// How a task's latest run ended, once it has: `None` while a run is
-    /// going on, before any has ended, and for a session that isn't a task.
+    /// How a task's latest run ended, once it has and the session has seen
+    /// it end: `None` while a run is going on, before any has ended, and for
+    /// a session that isn't a task. A run that ended since [`Session::check`]
+    /// last looked isn't over for the session yet: its agent still reads as
+    /// working, and whoever acts on the end, like a flow taking a step's
+    /// answer and marking it seen, would act on it before the session turns
+    /// done, which would undo what they did.
     pub fn finished_run(&self) -> Option<TaskResult> {
         let task = self.task.as_ref()?;
-        if task.is_working() {
+        if task.is_working() || !task.caught_up() {
             return None;
         }
         task.result()
@@ -2681,6 +2686,59 @@ mod tests {
         assert_eq!(after(Some(Working), AgentEvent::StillIdle), Some(Done));
         assert_eq!(after(Some(Idle), AgentEvent::StillIdle), Some(Idle));
         assert_eq!(after(Some(Waiting), AgentEvent::StillIdle), Some(Waiting));
+    }
+
+    #[test]
+    fn a_run_s_end_is_taken_only_once_the_session_has_seen_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        // A `claude` that answers each prompt at once.
+        let claude = dir.path().join("claude");
+        let answers = r#"#!/bin/sh
+while IFS= read -r line; do
+    echo '{"type":"system","subtype":"init","session_id":"c1","model":"m"}'
+    echo '{"type":"result","subtype":"success","is_error":false,"result":"done","session_id":"c1","total_cost_usd":0.01,"duration_ms":1}'
+done
+"#;
+        std::fs::write(&claude, answers).unwrap();
+        std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let db = crate::db::Db::open(&dir.path().join("crystal.sock")).unwrap();
+        let env = BTreeMap::from([("PATH".to_string(), dir.path().display().to_string())]);
+        let spec = TaskSpec {
+            prompt: "plan it".into(),
+            args: Vec::new(),
+        };
+        let mut session = Session::task(
+            "id-1".into(),
+            "planner".into(),
+            spec,
+            Vec::new(),
+            dir.path().to_path_buf(),
+            env,
+            Arc::new(Spending::new(db)),
+            None,
+        );
+        session.prompt("plan it").unwrap();
+        // The daemon looks while the run goes on.
+        session.check();
+        assert_eq!(session.info().activity, Some(Activity::Working));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while session.result().is_err() {
+            assert!(Instant::now() < deadline, "the run never ended");
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        // Ended, but not looked at since: as a flow would find it between
+        // the daemon's look at its sessions and its look at the flows. Not
+        // over for whoever acts on it, who would mark it seen while it still
+        // reads as working, for the next look to turn it done.
+        assert!(session.finished_run().is_none());
+        session.check();
+        assert_eq!(session.info().activity, Some(Activity::Done));
+        assert_eq!(session.finished_run().unwrap().text, "done");
+        session.seen();
+        assert_eq!(session.info().activity, Some(Activity::Idle));
+        session.stop();
     }
 
     #[test]

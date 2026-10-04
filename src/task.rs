@@ -257,6 +257,13 @@ impl Task {
         self.runs.lock().unwrap().working()
     }
 
+    /// Whether the session has taken how the runs stand now: no run has
+    /// started or ended since it last looked ([`Task::events`]).
+    pub fn caught_up(&self) -> bool {
+        let runs = self.runs.lock().unwrap();
+        (self.seen.started, self.seen.ended) == (runs.started, runs.ended)
+    }
+
     /// Runs `prompt`, the task's own to start with, then each follow-up,
     /// which carries the conversation on: on the `claude` there is, or a
     /// new one. One turn at a time, and none once today's spending is past
