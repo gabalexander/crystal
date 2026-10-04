@@ -2255,9 +2255,9 @@ after it; that task ticks the item off when it closes done.
 ### Flows
 
 A flow is a chain of [tasks](#tasks) on one goal: plan it, build it in a worktree, review it, open the pull
-request. Each step runs with a [profile](#profiles) of its own and starts once the step before it is done,
-given what that step answered. A step can stop the flow at a gate until you've looked at what it did, then
-you go on, or send it back with notes.
+request. Each step runs with a [profile](#profiles) of its own, or an agent, model and effort it sets itself,
+and starts once the step before it is done, given what that step answered. A step can stop the flow at a gate
+until you've looked at what it did, then you go on, or send it back with notes.
 
 Flows are written in the config file, a `[[flow]]` table each, with a `[[flow.step]]` table for each step.
 `crystal flow example` prints this one, with the profiles it runs with, ready to copy in:
@@ -2276,6 +2276,7 @@ prompt = "Plan how to do this: {goal}. Answer with the files to change and how, 
 name = "implement"
 profile = "builder"
 placement = "fresh"
+accept = ["The tests pass", "The work is committed"]
 prompt = """
 Do this: {goal}
 
@@ -2296,6 +2297,7 @@ prompt = "Review the changes on this branch against what was asked: {goal}"
 [[flow.step]]
 name = "pr"
 profile = "shipper"
+model = "sonnet"
 prompt = "Push this branch and open a pull request for it with `gh pr create --fill`."
 ```
 
@@ -2303,7 +2305,11 @@ prompt = "Push this branch and open a pull request for it with `gh pr create --f
 |---|---|
 | `name` | what the step is called; its session is named after the run and it, like `ship-1-plan` |
 | `profile` | optional: the [profile](#profiles) it runs with: agent, model, mode, arguments, instructions, prompt; left out, Claude Code as it's set up |
+| `agent` | optional: the agent it runs, like `codex`, in place of its profile's; on an agent other than its profile's, it keeps only the profile's prompt and instructions |
+| `model`, `effort`, `mode` | optional: its agent's model, how hard it thinks and how it asks before acting, in place of its profile's, checked as a profile's are |
+| `background` | optional: `false` runs Claude Code in a terminal rather than the background; left out, Claude Code runs in the background and any other agent in a terminal, and only Claude Code can |
 | `prompt` | what it's asked, with the names below filled in |
+| `accept` | optional: its [acceptance criteria](#tasks), a list of what has to hold before it's done: its agent is told them under its prompt, and its task carries them |
 | `placement` | optional: where it runs, below; left out, where the step before it ran, and the first where the run started |
 | `worktree` | optional: `true` is `placement = "fresh"`, as it was first written |
 | `gate` | optional: `true` stops the flow after it until you go on, or send the flow back |
@@ -2348,12 +2354,12 @@ crystal flow cancel ship-1           # cancel its step's task, and go no further
 crystal flow defs                    # the flows a run started here finds, and where each is written
 ```
 
-- A step whose profile is Claude Code's runs as a [background task](#background-tasks), so nobody is there to
-  say yes to a permission: give it a profile that allows what it needs, with `mode` and `args`. A step on any
-  other agent, like Codex, runs in a terminal, a session with the step as its [task](#tasks), and the flow goes
-  on once that task closes: done with its summary as the step's answer, or failed. An agent that can't be given
-  a prompt to start on, like Aider, can't be a step. Each step's task goes into the project's
-  [history](#tasks) as `ship-1 plan: <goal>`.
+- A step on Claude Code runs as a [background task](#background-tasks), so nobody is there to say yes to a
+  permission: give it a profile that allows what it needs, with `mode` and `args`. A step on any other agent,
+  like Codex, or on Claude Code with `background = false`, runs in a terminal, a session with the step as its
+  [task](#tasks), where you can watch it and answer it, and the flow goes on once that task closes: done with
+  its summary as the step's answer, or failed. An agent that can't be given a prompt to start on, like Aider,
+  can't be a step. Each step's task goes into the project's [history](#tasks) as `ship-1 plan: <goal>`.
 - Sending the flow back runs the step it goes back to again, in a new round: a background step as a follow-up
   in its own conversation, a step in a terminal in a new session, with the old one left for you to read. Then
   the steps after it run again. In a gate's last round, `max_rounds`, it can't be sent back: approve it, or

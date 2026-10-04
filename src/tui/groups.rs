@@ -445,7 +445,13 @@ mod tests {
         let step = |name: &str| Step {
             name: name.into(),
             profile: None,
+            agent: None,
+            model: None,
+            effort: None,
+            mode: None,
+            background: None,
             prompt: "x".into(),
+            accept: Vec::new(),
             placement: None,
             worktree: false,
             gate: false,

@@ -479,13 +479,15 @@ whenever what's handed over changes in a way the crystal before couldn't read.
 - `src/profile.rs`: agent profiles: what one runs, checking it, and saving or removing one in the config file
   with `toml_edit`, so the user's comments and layout stay; `enabled` is the one switch for the feature
 - `src/flows.rs`: flows, chains of tasks on one goal: the `[[flow]]` tables in the config file and in a project's
-  `.crystal/flows.toml`, which take the place of the config's of the same name, checking them, where a step is
-  placed, filling in a step's prompt and cutting it to fit, a goal's slug, the example `crystal flow example`
-  prints, and `enabled`, the one gate everything flows add goes through
+  `.crystal/flows.toml`, which take the place of the config's of the same name, checking them, the profile a
+  step runs with, its own agent, model, effort and mode over it, and whether it runs in the background, where
+  a step is placed, filling in a step's prompt and cutting it to fit, a goal's slug, the example `crystal flow
+  example` prints, and `enabled`, the one gate everything flows add goes through
 - `src/flow_run.rs`: a flow run and how it changes as its steps end, the user answers its gates (within their
-  rounds) and cancels it; where each step runs, what it's asked, and whether it runs in the background or, on
-  an agent other than Claude Code, in a terminal; kept apart from I/O, so it's unit-tested; the daemon starts
-  the steps and writes the runs down in the database
+  rounds) and cancels it; where each step runs, what it's asked, its acceptance criteria under it, and whether
+  it runs in the background or in a terminal (an agent other than Claude Code, or Claude Code with `background
+  = false`); kept apart from I/O, so it's unit-tested; the daemon starts the steps and writes the runs down in
+  the database
 - `src/flow_cli.rs`: `crystal flow` and its commands, `cancel` and `defs` among them
 - `src/notify.rs`: telling the user when a session needs them, once it has for `[notifications] after_secs`
   and, with `unfocused_only`, while no TUI's terminal has the focus (where the user is, as the TUIs say, kept

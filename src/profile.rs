@@ -143,10 +143,17 @@ impl Profile {
         if name.trim().is_empty() {
             bail!("a profile has no name");
         }
+        self.check_settings(&format!("profile {name}"))
+    }
+
+    /// What [`Profile::check`] checks but its name, each error starting
+    /// with `what`: for a profile a flow's step puts together, which may
+    /// have none.
+    pub fn check_settings(&self, what: &str) -> Result<()> {
         let Some(agent) = catalog::find(&self.agent) else {
             let known: Vec<&str> = catalog::AGENTS.iter().map(|a| a.program).collect();
             bail!(
-                "profile {name}: crystal doesn't know the agent {}; it knows {}",
+                "{what}: crystal doesn't know the agent {}; it knows {}",
                 self.agent,
                 known.join(", ")
             );
@@ -156,18 +163,14 @@ impl Profile {
                 continue;
             };
             if agent.setting(kind).is_none() {
-                bail!(
-                    "profile {name}: {} doesn't take {}",
-                    agent.name,
-                    kind.noun()
-                );
+                bail!("{what}: {} doesn't take {}", agent.name, kind.noun());
             }
             // Models are too many to know, and Codex's change as it ships
             // them; the rest are fixed.
             let values = agent.values(kind);
             if kind != Kind::Model && !values.contains(&chosen.as_str()) {
                 bail!(
-                    "profile {name}: {chosen} isn't {} of {}; it takes {}",
+                    "{what}: {chosen} isn't {} of {}; it takes {}",
                     kind.noun(),
                     agent.name,
                     values.join(", ")
@@ -175,7 +178,7 @@ impl Profile {
             }
         }
         if filled(&self.instructions).is_some() && agent.instructions == Instructions::None {
-            bail!("profile {name}: {} can't be given instructions", agent.name);
+            bail!("{what}: {} can't be given instructions", agent.name);
         }
         Ok(())
     }

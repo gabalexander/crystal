@@ -107,8 +107,8 @@ crystal result ship-1-review                                   # a step's whole 
   (`crystal flow back <run> "<notes>"`) only when the user tells you to.
 - `crystal flow retry <run>` runs a failed or interrupted step again. `crystal flow --json` lists every run.
 - `crystal flow cancel <run>` cancels a run and its step's open task: only when the user asks.
-- A step on an agent other than Claude runs in a terminal session, `<run>-<step>`, and the flow goes on once
-  its task closes: `crystal read` it rather than `result`.
+- A step on an agent other than Claude, or on Claude with `background = false`, runs in a terminal session,
+  `<run>-<step>`, and the flow goes on once its task closes: `crystal read` it rather than `result`.
 - With flows turned off, these commands say "the flows plugin is off"; run the steps as tasks yourself.
 
 ## Close your task

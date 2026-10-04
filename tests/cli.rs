@@ -12880,6 +12880,74 @@ prompt = "Build {goal} following {plan.summary}"
 }
 
 #[test]
+fn a_step_sets_its_own_agent_and_model_runs_claude_in_a_terminal_and_carries_criteria() {
+    let crystal = Crystal::new();
+    crystal.configure(
+        r#"
+notify = false
+
+[plugins]
+memory = false
+
+[[flow]]
+name = "own"
+
+[[flow.step]]
+name = "plan"
+background = false
+model = "opus"
+accept = ["names the files", "says the order"]
+prompt = "Plan {goal}"
+
+[[flow.step]]
+name = "build"
+agent = "codex"
+model = "gpt-5"
+prompt = "Build {goal} following {plan.summary}"
+"#,
+    );
+    let dir = crystal.dir.path();
+    // A Claude Code in a terminal that closes its task as Codex does.
+    let bin = dir.join("claude-bin");
+    std::fs::create_dir(&bin).unwrap();
+    script(
+        &bin.join("claude"),
+        &format!(
+            "printf '%s\\n' \"$@\" > claude-args.new && mv claude-args.new claude-args\n\
+             {CRYSTAL} done \"planned it in a terminal\"\n\
+             sleep 30\n"
+        ),
+    );
+    let path = format!("{}:{}", bin.display(), path_with(&finishing_codex(dir)));
+    let out = flow_ok(&crystal, &path, &["own", "add retries", "--wait"]);
+    assert_eq!(out, "own-1\ndone\n");
+
+    // Claude Code ran in a terminal, on the step's model, asked its prompt
+    // with the criteria under it, and told how to close its task.
+    let args = written(&dir.join("claude-args"));
+    assert!(args.contains("\n--model\nopus\n--\n"), "{args}");
+    assert!(
+        args.ends_with(
+            "\n--\nPlan add retries\n\nAcceptance criteria:\n- names the files\n- says the order\n"
+        ),
+        "{args}"
+    );
+    assert!(args.contains("crystal done"), "{args}");
+    let card = crystal.ok(&["tasks", "show", "own-1-plan"]);
+    assert!(
+        card.contains("  accept    names the files\n            says the order\n"),
+        "{card}"
+    );
+    // Codex, with no profile, on the step's model.
+    let args = written(&dir.join("codex-args"));
+    assert!(args.contains("-m\ngpt-5\n"), "{args}");
+    assert!(
+        args.ends_with("\n--\nBuild add retries following planned it in a terminal\n"),
+        "{args}"
+    );
+}
+
+#[test]
 fn a_step_in_a_terminal_carries_on_through_a_handover() {
     let crystal = Crystal::new();
     crystal.configure(
