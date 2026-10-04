@@ -1,21 +1,26 @@
 //! What a project's sessions have learned, kept for the sessions after
-//! them: decisions made, gotchas hit, commands that work, notes, and how
-//! tasks turned out.
+//! them: decisions made, gotchas hit, commands that work, and notes.
 //!
 //! Every project's entries are kept in one SQLite database in crystal's
 //! state directory, with a full-text index over them (SQLite's FTS5, ranked
 //! by bm25), so a search finds an entry by any of its words, or a word they
 //! start or stem from. Anyone can add to it: the user, an agent in a
-//! session (`crystal remember`), a task as it ends, and the distiller
-//! ([`crate::distill`]), from what a closed task did. The same thing said
-//! again is the one entry seen again, not a second one, and what the user
-//! forgot the distiller can't bring back.
+//! session (`crystal remember`), and the distiller ([`crate::distill`]),
+//! from what a closed task did. The same thing said again is the one entry
+//! seen again, not a second one, and what the user forgot the distiller
+//! can't bring back.
 //!
 //! Every agent crystal starts is shown, as it starts, the entries that have
 //! most to do with its launch: first those about files its worktree has
 //! changed, then those about what it was asked. Claude Code searches the
 //! rest through crystal's MCP server ([`crate::mcp`]); other agents with
 //! crystal's commands.
+//!
+//! How each task turned out is kept with the task, in its project's
+//! history (`crystal tasks`). The outcome entries an earlier crystal kept
+//! for each one are still found by a search, but not shown at launch: true
+//! only when they were written, and one for each `crystal done`, they
+//! crowded out what still holds.
 //!
 //! An entry can name the files it's about, and keeps a hash of each as it
 //! was when the entry was said: its anchors. Once some of them change, the
@@ -218,7 +223,10 @@ pub enum Kind {
     /// A command that does something useful here.
     Command,
     Note,
-    /// How a task turned out.
+    /// How a task turned out, as an earlier crystal kept it as each task
+    /// closed: found by a search, never shown at launch, and not something
+    /// to add any more.
+    #[value(skip)]
     Outcome,
 }
 
@@ -247,6 +255,28 @@ impl fmt::Display for Kind {
             Kind::Outcome => "outcome",
         };
         f.write_str(name)
+    }
+}
+
+/// The kinds of entry a search looks among.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kinds {
+    All,
+    Only(Kind),
+    /// Every kind but tasks' outcomes, for what a session is shown as it
+    /// starts.
+    Lasting,
+}
+
+impl Kinds {
+    /// The kind it keeps to and the kind it leaves out, as the SQL's
+    /// parameters, `NULL` for none.
+    fn params(self) -> (Option<String>, Option<String>) {
+        match self {
+            Kinds::All => (None, None),
+            Kinds::Only(kind) => (Some(kind.to_string()), None),
+            Kinds::Lasting => (None, Some(Kind::Outcome.to_string())),
+        }
     }
 }
 
@@ -536,18 +566,32 @@ impl Store {
         limit: usize,
         embedder: Option<&dyn Embed>,
     ) -> Result<Vec<Entry>> {
+        let kinds = kind.map_or(Kinds::All, Kinds::Only);
+        self.search_among(project, text, kinds, limit, embedder)
+    }
+
+    /// [`Store::search`], among the entries of `kinds` alone, so that those
+    /// left out take no place in either ranking, nor among those the
+    /// reranker reads.
+    fn search_among(
+        &mut self,
+        project: &Path,
+        text: &str,
+        kinds: Kinds,
+        limit: usize,
+        embedder: Option<&dyn Embed>,
+    ) -> Result<Vec<Entry>> {
         let name = self.ready(project)?;
-        let kind = kind.map(|kind| kind.to_string());
         let Some(query) = fts_query(text) else {
-            return self.newest(&name, kind.as_deref(), limit);
+            return self.newest(&name, kinds, limit);
         };
         let pool = limit.max(POOL);
-        let mut by_words = self.by_words(&name, &query, kind.as_deref(), pool)?;
+        let mut by_words = self.by_words(&name, &query, kinds, pool)?;
         let Some(embedder) = embedder else {
             by_words.truncate(limit);
             return Ok(by_words);
         };
-        match self.by_meaning(&name, text, kind.as_deref(), pool, embedder) {
+        match self.by_meaning(&name, text, kinds, pool, embedder) {
             Ok(by_meaning) => Ok(reranked(
                 fused(&[by_words, by_meaning], pool),
                 text,
@@ -569,15 +613,16 @@ impl Store {
         &self,
         project: &str,
         query: &str,
-        kind: Option<&str>,
+        kinds: Kinds,
         limit: usize,
     ) -> Result<Vec<Entry>> {
+        let (only, but) = kinds.params();
         let mut found = self.conn.prepare(&format!(
             "SELECT {COLUMNS} FROM entries_fts JOIN entries e ON e.n = entries_fts.rowid \
              WHERE entries_fts MATCH ?2 AND e.project = ?1 AND (?3 IS NULL OR e.kind = ?3) \
-             ORDER BY {RANK}, e.last_seen DESC, e.id DESC LIMIT ?4"
+             AND e.kind IS NOT ?5 ORDER BY {RANK}, e.last_seen DESC, e.id DESC LIMIT ?4"
         ))?;
-        let found = found.query_map(params![project, query, kind, limit], entry_of)?;
+        let found = found.query_map(params![project, query, only, limit, but], entry_of)?;
         Ok(found.collect::<rusqlite::Result<_>>()?)
     }
 
@@ -588,18 +633,20 @@ impl Store {
         &mut self,
         project: &str,
         text: &str,
-        kind: Option<&str>,
+        kinds: Kinds,
         limit: usize,
         embedder: &dyn Embed,
     ) -> Result<Vec<Entry>> {
         self.embed_missing_in(Some(project), embedder)?;
         let asked = embedder.embed_query(text)?;
         let asked = &asked;
+        let (only, but) = kinds.params();
         let mut rows = self.conn.prepare(&format!(
             "SELECT {COLUMNS}, v.vector FROM entries e JOIN vectors v ON v.n = e.n \
-             WHERE e.project = ?1 AND v.model = ?2 AND (?3 IS NULL OR e.kind = ?3)"
+             WHERE e.project = ?1 AND v.model = ?2 AND (?3 IS NULL OR e.kind = ?3) \
+             AND e.kind IS NOT ?4"
         ))?;
-        let rows = rows.query_map(params![project, embedder.model(), kind], |row| {
+        let rows = rows.query_map(params![project, embedder.model(), only, but], |row| {
             Ok((entry_of(row)?, row.get::<_, Vec<u8>>("vector")?))
         })?;
         let mut alike = Vec::new();
@@ -621,14 +668,16 @@ impl Store {
             .collect())
     }
 
-    /// The entries of the project called `project`, of `kind` if it's
-    /// given, said most recently first.
-    fn newest(&self, project: &str, kind: Option<&str>, limit: usize) -> Result<Vec<Entry>> {
+    /// The entries of the project called `project`, of `kinds`, said most
+    /// recently first.
+    fn newest(&self, project: &str, kinds: Kinds, limit: usize) -> Result<Vec<Entry>> {
+        let (only, but) = kinds.params();
         let mut newest = self.conn.prepare(&format!(
             "SELECT {COLUMNS} FROM entries e WHERE e.project = ?1 \
-             AND (?2 IS NULL OR e.kind = ?2) ORDER BY e.last_seen DESC, e.id DESC LIMIT ?3"
+             AND (?2 IS NULL OR e.kind = ?2) AND e.kind IS NOT ?4 \
+             ORDER BY e.last_seen DESC, e.id DESC LIMIT ?3"
         ))?;
-        let newest = newest.query_map(params![project, kind, limit], entry_of)?;
+        let newest = newest.query_map(params![project, only, limit, but], entry_of)?;
         Ok(newest.collect::<rusqlite::Result<_>>()?)
     }
 
@@ -1087,29 +1136,6 @@ pub fn add(socket: &Path, project: &Path, new: New) -> Result<Added> {
     Store::open(socket)?.add(project, new)
 }
 
-/// Keeps how a task turned out, for the sessions after it: what the tasks
-/// part of crystal calls when a task ends with something to say. With
-/// memory off it keeps nothing, and says so with `None`.
-pub fn record_outcome(
-    config: &Config,
-    socket: &Path,
-    project: &Path,
-    task: &str,
-    summary: &str,
-) -> Result<Option<Added>> {
-    if !enabled(config) {
-        return Ok(None);
-    }
-    let new = New {
-        kind: Kind::Outcome,
-        text: summary.to_string(),
-        files: Vec::new(),
-        source: Source::Task(task.to_string()),
-        checkout: None,
-    };
-    Ok(Some(add(socket, project, new)?))
-}
-
 /// Takes the entry `id` out of `project`'s memory, and returns it.
 pub fn remove(socket: &Path, project: &Path, id: u64) -> Result<Entry> {
     Store::open(socket)?.remove(project, id)
@@ -1142,11 +1168,11 @@ pub enum Reader {
 /// What a session is told of its project's memory as it starts: the
 /// entries about files its worktree has changed since its base, `changed`,
 /// then those with most to do with what it was asked, `asked`, or else the
-/// newest, and how to search and add to it. Stale entries are left out,
-/// and the drifting are marked where they rank. A task in the
-/// background isn't told how to add, so it has nothing to be told when
-/// nothing is remembered. With an `embedder`, what has to do with what it
-/// was asked goes by meaning as well as by words.
+/// newest, and how to search and add to it. Stale entries and tasks'
+/// outcomes are left out, and the drifting are marked where they rank. A
+/// task in the background isn't told how to add, so it has nothing to be
+/// told when nothing is remembered. With an `embedder`, what has to do with
+/// what it was asked goes by meaning as well as by words.
 pub fn for_launch(
     socket: &Path,
     project: &Path,
@@ -1158,7 +1184,7 @@ pub fn for_launch(
     let mut store = Store::open(socket)?;
     let mut hashes = Hashes::default();
     let about_changes = store.about_files(project, changed)?;
-    let found = store.search(project, asked, None, SEARCH_LIMIT, embedder)?;
+    let found = store.search_among(project, asked, Kinds::Lasting, SEARCH_LIMIT, embedder)?;
     let mut shown = launch_order(vec![about_changes, found], project, &mut hashes);
     if shown.is_empty() {
         shown = launch_order(vec![store.entries(project)?], project, &mut hashes);
@@ -1167,13 +1193,15 @@ pub fn for_launch(
 }
 
 /// The entries a session may be shown as it starts, from `parts`, the most
-/// relevant part first: each once, none that's stale, and in each part in
-/// the order it ranked, the drifting marked where they rank.
+/// relevant part first: each once, none that's stale or a task's outcome,
+/// and in each part in the order it ranked, the drifting marked where they
+/// rank.
 fn launch_order(parts: Vec<Vec<Entry>>, project: &Path, hashes: &mut Hashes) -> Vec<Listed> {
     let mut shown: Vec<Listed> = Vec::new();
     for part in parts {
         let part: Vec<Listed> = part
             .into_iter()
+            .filter(|entry| entry.kind != Kind::Outcome)
             .filter(|entry| !shown.iter().any(|item| item.entry.id == entry.id))
             .map(|entry| hashes.listed(entry, project))
             .filter(|item| item.freshness != Freshness::Stale)
@@ -1635,33 +1663,6 @@ mod tests {
             added.entry().unwrap().text,
             "deploy with DEPLOY_TOKEN=[redacted] [31mfast[0m"
         );
-    }
-
-    #[test]
-    fn a_task_s_outcome_is_kept_as_one() {
-        let (_dir, socket) = socket();
-        let config = Config::default();
-        let added = record_outcome(&config, &socket, Path::new(APP), "fixer", "fixed the race")
-            .unwrap()
-            .unwrap();
-        let Added::New(entry) = added else {
-            panic!("{added:?}");
-        };
-        assert_eq!(entry.kind, Kind::Outcome);
-        assert_eq!(entry.source, Source::Task("fixer".into()));
-    }
-
-    #[test]
-    fn with_memory_off_an_outcome_is_not_kept() {
-        let (_dir, socket) = socket();
-        let project = Path::new(APP);
-        let config = Config {
-            plugins: [("memory".to_string(), false)].into(),
-            ..Config::default()
-        };
-        let kept = record_outcome(&config, &socket, project, "fixer", "done").unwrap();
-        assert_eq!(kept, None);
-        assert!(Memory::read(&socket, project).unwrap().listed().is_empty());
     }
 
     #[test]
@@ -2291,6 +2292,113 @@ mod tests {
             None,
             "a task in the background has nothing to be told"
         );
+    }
+
+    #[test]
+    fn a_task_s_outcome_is_found_by_a_search_but_never_shown_at_launch() {
+        let (_dir, socket, mut store) = remembering(&[
+            (Kind::Gotcha, "the refund test needs the ledger running"),
+            (
+                Kind::Outcome,
+                "fix the flaky refund test: fixed it, uncommitted",
+            ),
+        ]);
+        let project = Path::new(APP);
+        for asked in ["fix the flaky refund test", ""] {
+            let paragraph = launch(&socket, project, asked, Reader::Claude)
+                .unwrap()
+                .unwrap();
+            assert!(
+                paragraph.contains("\n- 1 (gotcha) the refund test needs the ledger running"),
+                "{paragraph}"
+            );
+            assert!(!paragraph.contains("uncommitted"), "{paragraph}");
+        }
+        assert_eq!(
+            ids(&store
+                .search(project, "uncommitted", None, 10, None)
+                .unwrap()),
+            [2]
+        );
+        assert_eq!(
+            ids(&store
+                .search(project, "", Some(Kind::Outcome), 10, None)
+                .unwrap()),
+            [2]
+        );
+
+        // With only outcomes, there's nothing to show.
+        let (_dir, socket, _store) = remembering(&[(Kind::Outcome, "fix it: fixed it")]);
+        let paragraph = launch(&socket, project, "fix it", Reader::Claude)
+            .unwrap()
+            .unwrap();
+        assert!(
+            paragraph.starts_with("When you learn something"),
+            "{paragraph}"
+        );
+    }
+
+    #[test]
+    fn outcomes_take_no_place_from_what_a_session_is_shown() {
+        // More outcomes than the reranker reads, each ahead of the gotcha by
+        // its words and by its meaning.
+        let mut outcomes = Vec::new();
+        for money in 0..5 {
+            for fees in [[0, 1], [0, 2], [0, 3], [1, 2], [1, 3], [2, 3]] {
+                let mut words = vec!["cents"; 4];
+                words[fees[0]] = "fees";
+                words[fees[1]] = "fees";
+                words.insert(money, "money");
+                outcomes.push(words.join(" "));
+            }
+        }
+        assert!(outcomes.len() > RERANK_POOL);
+        let mut texts = vec![(Kind::Gotcha, "fees are kept in cents")];
+        texts.extend(outcomes.iter().map(|text| (Kind::Outcome, text.as_str())));
+        texts.push((Kind::Note, "the deploy checklist"));
+        let (_dir, socket, _store) = remembering(&texts);
+
+        /// A reranker every passage answers.
+        struct Answering;
+        impl Embed for Answering {
+            fn model(&self) -> &str {
+                MEANINGS.model()
+            }
+            fn embed_passages(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+                MEANINGS.embed_passages(texts)
+            }
+            fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
+                MEANINGS.embed_query(text)
+            }
+            fn min_similarity(&self) -> f32 {
+                0.1
+            }
+            fn near_best(&self) -> f32 {
+                1.0
+            }
+            fn rerank(&self, _: &str, passages: &[&str]) -> Result<Option<Vec<f32>>> {
+                Ok(Some(vec![1.0; passages.len()]))
+            }
+        }
+        let project = Path::new(APP);
+        let answering: Option<&dyn Embed> = Some(&Answering);
+        let paragraph = for_launch(
+            &socket,
+            project,
+            "fees cents",
+            &[],
+            Reader::Claude,
+            answering,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            paragraph.contains("\n- 1 (gotcha) fees are kept in cents"),
+            "{paragraph}"
+        );
+        assert!(!paragraph.contains("(outcome)"), "{paragraph}");
+        // Found, so the newest aren't shown in its place.
+        assert!(!paragraph.contains("deploy checklist"), "{paragraph}");
     }
 
     #[test]
