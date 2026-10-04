@@ -426,7 +426,12 @@ pub fn start_from_backlog(
     }
     let command = agent_command(&config, &item.text);
     let cwd = if worktree {
-        client::add_worktree(socket, &dir, &forge::branch_for_issue(number, &item.text))?
+        client::add_worktree(
+            socket,
+            &dir,
+            &forge::branch_for_issue(number, &item.text),
+            None,
+        )?
     } else {
         dir
     };

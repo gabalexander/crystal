@@ -1729,6 +1729,42 @@ fn new_with_a_branch_that_exists_checks_it_out() {
 }
 
 #[test]
+fn a_new_branch_starts_from_origins_main_unless_given_a_base() {
+    let crystal = Crystal::new();
+    let dir = crystal.dir.path();
+    let repo = git_repo(dir, "app");
+    local_origin(dir, &repo, "https://example.com/app.git");
+    let pushed = git(&repo, &["rev-parse", "HEAD"]);
+    git(
+        &repo,
+        &["commit", "-q", "--allow-empty", "-m", "not pushed"],
+    );
+    let mine = git(&repo, &["rev-parse", "HEAD"]);
+    let repo_arg = repo.to_str().unwrap();
+
+    crystal.ok(&["new", "-d", "-c", repo_arg, "-w", "fresh", "sleep", "30"]);
+    let fresh = dir.join("app.worktrees/fresh");
+    assert_eq!(git(&fresh, &["rev-parse", "HEAD"]), pushed);
+
+    crystal.ok(&[
+        "new", "-d", "-c", repo_arg, "-w", "mine", "--base", "HEAD", "sleep", "30",
+    ]);
+    let here = dir.join("app.worktrees/mine");
+    assert_eq!(git(&here, &["rev-parse", "HEAD"]), mine);
+
+    let err = crystal.fails(&[
+        "new", "-d", "-c", repo_arg, "-w", "lost", "--base", "nope", "sleep", "30",
+    ]);
+    assert!(
+        err.contains("there's no branch, tag or commit called nope"),
+        "{err}"
+    );
+    assert!(!dir.join("app.worktrees/lost").exists());
+    let err = crystal.fails(&["new", "-d", "-c", repo_arg, "--base", "HEAD", "true"]);
+    assert!(err.contains("--worktree"), "{err}");
+}
+
+#[test]
 fn new_with_a_worktree_needs_a_repository() {
     let crystal = Crystal::new();
     let err = crystal.fails(&["new", "-w", "feat", "sleep", "30"]);
@@ -6072,15 +6108,27 @@ fn calls(file: &Path) -> String {
     std::fs::read_to_string(file).unwrap_or_default()
 }
 
-/// A repository called `app` whose origin is on github.com, as far as git
-/// can tell.
+/// A repository called `app` whose origin is on github.com, as far as
+/// crystal can tell.
 fn github_repo(dir: &Path) -> PathBuf {
     let repo = git_repo(dir, "app");
-    git(
-        &repo,
-        &["remote", "add", "origin", "https://github.com/acme/app.git"],
-    );
+    local_origin(dir, &repo, "https://github.com/acme/app.git");
     repo
+}
+
+/// Gives `repo` an origin at `url`, which git goes to a bare repository in
+/// `dir` for, with `main` pushed: a new worktree fetches from its origin,
+/// and a test never reaches the forge.
+fn local_origin(dir: &Path, repo: &Path, url: &str) {
+    let origin = dir.join("origin.git");
+    let origin_arg = origin.to_str().unwrap();
+    git(dir, &["init", "-q", "--bare", "-b", "main", origin_arg]);
+    git(repo, &["remote", "add", "origin", url]);
+    git(
+        repo,
+        &["config", &format!("url.{origin_arg}.insteadOf"), url],
+    );
+    git(repo, &["push", "-q", "origin", "main"]);
 }
 
 const NO_ISSUES: &str = "[]";
@@ -6404,10 +6452,7 @@ fn an_issue_takes_a_comment_and_a_new_title() {
 fn on_gitlab_merge_requests_and_issues_go_through_glab() {
     let crystal = Crystal::new();
     let repo = git_repo(crystal.dir.path(), "app");
-    git(
-        &repo,
-        &["remote", "add", "origin", "git@gitlab.com:acme/app.git"],
-    );
+    local_origin(crystal.dir.path(), &repo, "git@gitlab.com:acme/app.git");
     let merge_requests = r#"[{"iid": 57, "title": "Draft: Fix the login redirect", "draft": true,
         "author": {"username": "ana"}, "source_branch": "fix-login",
         "source_project_id": 7, "target_project_id": 7,

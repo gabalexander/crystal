@@ -13,6 +13,7 @@ use std::ffi::OsStr;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
 
 /// Where a directory sits in git, found once. A session's directory never
 /// changes, so neither does this; the branch can, so it's read again each
@@ -68,27 +69,178 @@ impl Checkout {
     }
 }
 
+/// Where a new worktree's branch starts, when the branch is a new one.
+#[derive(Debug, Clone, Default)]
+pub struct Base {
+    /// The branch, tag or commit asked for this time, like `--base`'s:
+    /// one the repository doesn't have is an error.
+    pub named: Option<String>,
+    /// The branch the settings say new worktrees start from: one the
+    /// repository doesn't have is passed over, since the setting is the
+    /// same for every project.
+    pub configured: Option<String>,
+    /// Whether to fetch it from `origin` first. Without, it's `origin`'s
+    /// branch as the last fetch left it.
+    pub fetch: bool,
+}
+
+/// How long a call that talks to `origin` may take before a new worktree
+/// is made from what the clone has instead: a connection that has
+/// stalled mustn't hold up a new session for good.
+const REMOTE_TIMEOUT: Duration = Duration::from_secs(20);
+
 /// Makes a worktree for `branch` in the repository `dir` is in, and returns
-/// its directory. A new branch starts from the commit `dir`'s worktree is
-/// on; a branch that exists already is checked out as it is.
-pub fn add_worktree(dir: &Path, branch: &str) -> Result<PathBuf> {
+/// its directory. A branch that exists already is checked out as it is; a
+/// new one starts where [`start_point`] says for `base`.
+pub fn add_worktree(dir: &Path, branch: &str, base: &Base) -> Result<PathBuf> {
     let checkout = Checkout::find(dir)
         .with_context(|| format!("{} isn't in a git repository", dir.display()))?;
     let target = worktree_dir(&checkout.project_path, branch);
     let target_arg = target.to_string_lossy();
     if branch_exists(dir, branch) {
         git(dir, &["worktree", "add", &target_arg, branch])?;
-    } else {
-        git(dir, &["worktree", "add", "-b", branch, &target_arg])?;
+        return Ok(target);
     }
+    let start = start_point(dir, base)?;
+    let mut args = vec!["worktree", "add"];
+    // A branch made from `origin/main` would follow it, and a plain `git
+    // push` would aim at main: it's new work, with no upstream yet.
+    if start.remote {
+        args.push("--no-track");
+    }
+    args.extend(["-b", branch, &target_arg, &start.rev]);
+    git(dir, &args)?;
     Ok(target)
+}
+
+/// Where a new branch starts.
+#[derive(Debug, PartialEq, Eq)]
+struct Start {
+    /// The revision, as git takes it: `origin/main`, a tag, a commit.
+    rev: String,
+    /// Whether it's one of `origin`'s branches.
+    remote: bool,
+}
+
+/// Where a new branch in the repository `dir` is in starts, for `base`:
+/// what it names, or else what it's configured to, or else `origin`'s
+/// default branch. A branch `origin` has is `origin`'s copy, fetched
+/// first when `base` says to, rather than the clone's own, which is only as
+/// new as its last pull; anything else, a tag, a commit, a branch only
+/// this clone has, is used as it's named. With no `origin`, it's the
+/// commit `dir`'s worktree is on, as it was before any of this.
+fn start_point(dir: &Path, base: &Base) -> Result<Start> {
+    let origin = git(dir, &["remote", "get-url", "origin"]).is_ok();
+    if let Some(named) = base.named.as_deref() {
+        return revision(dir, named, origin, base.fetch)
+            .with_context(|| format!("there's no branch, tag or commit called {named}"));
+    }
+    if let Some(start) = base
+        .configured
+        .as_deref()
+        .and_then(|configured| revision(dir, configured, origin, base.fetch))
+    {
+        return Ok(start);
+    }
+    let default = origin.then(|| origin_default(dir, base.fetch)).flatten();
+    Ok(default.unwrap_or_else(|| Start {
+        rev: "HEAD".to_string(),
+        remote: false,
+    }))
+}
+
+/// Where `name` is, in the repository `dir` is in: `origin`'s branch of
+/// that name when it has one (`origin/main` is taken to mean the same as
+/// `main`), or else whatever git makes of it, or `None` when that's
+/// nothing. `HEAD` is always this worktree's.
+fn revision(dir: &Path, name: &str, origin: bool, fetch: bool) -> Option<Start> {
+    let name = name.trim();
+    if name.is_empty() || name.starts_with('-') {
+        return None;
+    }
+    let branch = name.strip_prefix("origin/").unwrap_or(name);
+    if origin && branch != "HEAD" {
+        if fetch {
+            // Offline, it's origin's branch as last fetched.
+            let _ = fetch_branch(dir, branch);
+        }
+        let remote = format!("refs/remotes/origin/{branch}");
+        if git(dir, &["show-ref", "--verify", "--quiet", &remote]).is_ok() {
+            return Some(Start {
+                rev: format!("origin/{branch}"),
+                remote: true,
+            });
+        }
+    }
+    let commit = format!("{name}^{{commit}}");
+    git(dir, &["rev-parse", "--verify", "--quiet", &commit]).ok()?;
+    Some(Start {
+        rev: name.to_string(),
+        remote: false,
+    })
+}
+
+/// `origin`'s default branch, like `origin/main`, fetched first when
+/// `fetch` says to. A clone whose `origin` was added by hand doesn't know
+/// which that is: when it may talk to `origin`, it asks once, and
+/// remembers.
+fn origin_default(dir: &Path, fetch: bool) -> Option<Start> {
+    let args = [
+        "symbolic-ref",
+        "--quiet",
+        "--short",
+        "refs/remotes/origin/HEAD",
+    ];
+    let known = git(dir, &args).ok();
+    let branch = match known
+        .as_deref()
+        .and_then(|known| known.trim().strip_prefix("origin/"))
+    {
+        Some(branch) => {
+            if fetch {
+                let _ = fetch_branch(dir, branch);
+            }
+            branch.to_string()
+        }
+        None if fetch => {
+            let said = git_remote(dir, &["ls-remote", "--symref", "origin", "HEAD"]).ok()?;
+            let branch = remote_head(&said)?;
+            fetch_branch(dir, &branch).ok()?;
+            // Only sets the name: origin isn't asked again.
+            let _ = git(dir, &["remote", "set-head", "origin", &branch]);
+            branch
+        }
+        None => return None,
+    };
+    let remote = format!("refs/remotes/origin/{branch}");
+    git(dir, &["show-ref", "--verify", "--quiet", &remote]).ok()?;
+    Some(Start {
+        rev: format!("origin/{branch}"),
+        remote: true,
+    })
+}
+
+/// The branch a remote's HEAD is on, from `git ls-remote --symref`, which
+/// says `ref: refs/heads/main\tHEAD` first.
+fn remote_head(said: &str) -> Option<String> {
+    let line = said.lines().next()?.strip_prefix("ref: refs/heads/")?;
+    let (branch, _) = line.split_once('\t')?;
+    Some(branch.to_string())
+}
+
+/// Fetches `branch` from `origin`, which brings `origin/<branch>` up to
+/// date, and only that, not every branch and tag `origin` has.
+fn fetch_branch(dir: &Path, branch: &str) -> Result<()> {
+    let refspec = format!("refs/heads/{branch}");
+    git_remote(dir, &["fetch", "--quiet", "--no-tags", "origin", &refspec])?;
+    Ok(())
 }
 
 /// Makes a worktree in the repository `dir` is in on a new branch: `branch`,
 /// or else `branch-2`, `branch-3`… whichever is neither a branch yet nor
-/// has a worktree's directory in the way. Returns its directory, and the
-/// branch it's on.
-pub fn add_new_worktree(dir: &Path, branch: &str) -> Result<(PathBuf, String)> {
+/// has a worktree's directory in the way, starting where `base` says.
+/// Returns its directory, and the branch it's on.
+pub fn add_new_worktree(dir: &Path, branch: &str, base: &Base) -> Result<(PathBuf, String)> {
     let checkout = Checkout::find(dir)
         .with_context(|| format!("{} isn't in a git repository", dir.display()))?;
     let free = (1..)
@@ -100,7 +252,7 @@ pub fn add_new_worktree(dir: &Path, branch: &str) -> Result<(PathBuf, String)> {
             !branch_exists(dir, name) && !worktree_dir(&checkout.project_path, name).exists()
         })
         .expect("some number is free");
-    let path = add_worktree(dir, &free)?;
+    let path = add_worktree(dir, &free, base)?;
     Ok((path, free))
 }
 
@@ -556,6 +708,51 @@ fn git(dir: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+/// Runs git in `dir` for a call that talks to a remote, and gives back
+/// what it printed. It's stopped, and is an error, once it has taken
+/// [`REMOTE_TIMEOUT`].
+fn git_remote(dir: &Path, args: &[&str]) -> Result<String> {
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("couldn't run git")?;
+    // Read while it runs, so that it never waits on a full pipe.
+    let stdout = read_all(child.stdout.take());
+    let stderr = read_all(child.stderr.take());
+    let deadline = Instant::now() + REMOTE_TIMEOUT;
+    let status = loop {
+        match child.try_wait()? {
+            Some(status) => break status,
+            None if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+            None => {
+                stop(&mut child);
+                bail!("git {} took too long", args.join(" "));
+            }
+        }
+    };
+    if !status.success() {
+        bail!("{}", stderr.join().unwrap_or_default().trim());
+    }
+    Ok(stdout.join().unwrap_or_default())
+}
+
+/// Reads all of `pipe` on a thread of its own.
+fn read_all(pipe: Option<impl Read + Send + 'static>) -> std::thread::JoinHandle<String> {
+    std::thread::spawn(move || {
+        let mut read = String::new();
+        if let Some(mut pipe) = pipe {
+            let _ = pipe.read_to_string(&mut read);
+        }
+        read
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -665,6 +862,181 @@ mod tests {
         let (name, path) = project_of(Path::new("/srv/app.git"));
         assert_eq!(name, "app");
         assert_eq!(path, Path::new("/srv/app.git"));
+    }
+
+    /// Runs git in `dir` for a test, with the machine's config left out.
+    fn run(dir: &Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["-c", "user.name=crystal", "-c", "user.email=c@example.com"])
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    }
+
+    /// A repository, the origin, and a clone of it called `app` in a
+    /// directory of its own, where its worktrees go too. The origin has
+    /// gone on a commit since, which the clone hasn't fetched.
+    struct Cloned {
+        origin: tempfile::TempDir,
+        dir: tempfile::TempDir,
+        /// The commit the clone had.
+        cloned: String,
+        /// The commit the origin has gone on to.
+        newer: String,
+    }
+
+    impl Cloned {
+        fn new() -> Cloned {
+            let origin = repo();
+            let dir = tempfile::tempdir().unwrap();
+            let from = origin.path().to_string_lossy().into_owned();
+            run(dir.path(), &["clone", "-q", &from, "app"]);
+            let cloned = run(origin.path(), &["rev-parse", "HEAD"]);
+            run(
+                origin.path(),
+                &["commit", "-q", "--allow-empty", "-m", "on"],
+            );
+            let newer = run(origin.path(), &["rev-parse", "HEAD"]);
+            Cloned {
+                origin,
+                dir,
+                cloned,
+                newer,
+            }
+        }
+
+        fn app(&self) -> PathBuf {
+            self.dir.path().join("app")
+        }
+
+        fn start(&self, base: &Base) -> Result<Start> {
+            start_point(&self.app(), base)
+        }
+
+        fn at(&self, rev: &str) -> String {
+            run(&self.app(), &["rev-parse", rev])
+        }
+    }
+
+    fn fetched() -> Base {
+        Base {
+            fetch: true,
+            ..Base::default()
+        }
+    }
+
+    fn remote(rev: &str) -> Start {
+        Start {
+            rev: rev.to_string(),
+            remote: true,
+        }
+    }
+
+    fn local(rev: &str) -> Start {
+        Start {
+            rev: rev.to_string(),
+            remote: false,
+        }
+    }
+
+    #[test]
+    fn a_new_branch_starts_from_origins_default_branch_fetched_first() {
+        let cloned = Cloned::new();
+        let app = cloned.app();
+        // The clone's own main is ahead of origin's in a way of its own.
+        run(&app, &["commit", "-q", "--allow-empty", "-m", "mine"]);
+
+        let path = add_worktree(&app, "fix", &fetched()).unwrap();
+        assert_eq!(run(&path, &["rev-parse", "HEAD"]), cloned.newer);
+        // New work, which follows no branch of origin's.
+        let upstream = Command::new("git")
+            .arg("-C")
+            .arg(&path)
+            .args(["rev-parse", "--abbrev-ref", "fix@{upstream}"])
+            .output()
+            .unwrap();
+        assert!(!upstream.status.success());
+    }
+
+    #[test]
+    fn without_fetching_its_origins_branch_as_the_last_fetch_left_it() {
+        let cloned = Cloned::new();
+        let base = Base::default();
+        assert_eq!(cloned.start(&base).unwrap(), remote("origin/main"));
+        assert_eq!(cloned.at("origin/main"), cloned.cloned);
+    }
+
+    #[test]
+    fn a_named_base_is_origins_branch_or_else_whatever_git_makes_of_it() {
+        let cloned = Cloned::new();
+        let app = cloned.app();
+        run(&app, &["tag", "v1"]);
+        run(&app, &["branch", "mine"]);
+        let named = |name: &str| {
+            cloned.start(&Base {
+                named: Some(name.to_string()),
+                ..fetched()
+            })
+        };
+        assert_eq!(named("main").unwrap(), remote("origin/main"));
+        assert_eq!(named("origin/main").unwrap(), remote("origin/main"));
+        assert_eq!(cloned.at("origin/main"), cloned.newer);
+        assert_eq!(named("HEAD").unwrap(), local("HEAD"));
+        assert_eq!(named("v1").unwrap(), local("v1"));
+        assert_eq!(named("mine").unwrap(), local("mine"));
+        let err = named("nope").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "there's no branch, tag or commit called nope"
+        );
+        assert!(named("--orphan").is_err());
+    }
+
+    #[test]
+    fn a_configured_base_the_project_doesnt_have_is_passed_over() {
+        let cloned = Cloned::new();
+        let configured = |name: &str| {
+            cloned.start(&Base {
+                configured: Some(name.to_string()),
+                ..fetched()
+            })
+        };
+        assert_eq!(configured("develop").unwrap(), remote("origin/main"));
+        run(cloned.origin.path(), &["branch", "develop"]);
+        assert_eq!(configured("develop").unwrap(), remote("origin/develop"));
+        assert_eq!(cloned.at("origin/develop"), cloned.newer);
+    }
+
+    #[test]
+    fn without_origin_a_new_branch_starts_where_the_worktree_is() {
+        let lone = repo();
+        assert_eq!(start_point(lone.path(), &fetched()).unwrap(), local("HEAD"));
+
+        // An origin added by hand: which is its default branch is asked
+        // once, and remembered.
+        let other = repo();
+        let url = other.path().to_string_lossy().into_owned();
+        run(lone.path(), &["remote", "add", "origin", &url]);
+        let start = start_point(lone.path(), &fetched()).unwrap();
+        assert_eq!(start, remote("origin/main"));
+    }
+
+    #[test]
+    fn a_remotes_head_is_the_branch_ls_remote_says_first() {
+        let said = "ref: refs/heads/trunk\tHEAD\n9fceb02d0ae598e95dc970b74767f19372d61af8\tHEAD\n";
+        assert_eq!(remote_head(said), Some("trunk".into()));
+        assert_eq!(remote_head("9fceb02\tHEAD\n"), None);
+        assert_eq!(remote_head(""), None);
     }
 
     #[test]

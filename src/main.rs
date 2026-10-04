@@ -118,9 +118,16 @@ enum Command {
 
         /// Start in a new git worktree on this branch, beside the
         /// repository in <repo>.worktrees/. The branch is made if it
-        /// doesn't exist.
+        /// doesn't exist, from origin's default branch, fetched first.
         #[arg(short, long, value_name = "BRANCH")]
         worktree: Option<String>,
+
+        /// With -w, where a new branch starts: a branch (origin's copy, when
+        /// it has one, fetched first), a tag, a commit, or HEAD for the one
+        /// you're on [default: `[worktrees] base`, or else origin's default
+        /// branch]
+        #[arg(long, value_name = "REF", requires = "worktree")]
+        base: Option<String>,
 
         /// Give the session this to do, which makes it a task: open until
         /// it's closed with `crystal done`. An agent crystal knows gets it
@@ -282,6 +289,10 @@ enum Command {
         /// Start in a new git worktree on this branch, as `new -w` does.
         #[arg(short, long, value_name = "BRANCH")]
         worktree: Option<String>,
+
+        /// With -w, where a new branch starts, as `new --base` says.
+        #[arg(long, value_name = "REF", requires = "worktree")]
+        base: Option<String>,
 
         /// Then wait for the run to end, and print how it ended.
         #[arg(long)]
@@ -624,6 +635,10 @@ enum TasksCommand {
         /// made now.
         #[arg(short, long, value_name = "BRANCH")]
         worktree: Option<String>,
+
+        /// With -w, where a new branch starts, as `new --base` says.
+        #[arg(long, value_name = "REF", requires = "worktree")]
+        base: Option<String>,
 
         /// Run it in the background, as `crystal task` does.
         #[arg(long)]
@@ -1097,9 +1112,13 @@ fn run(cli: Cli) -> Result<()> {
             cwd,
             detached,
             worktree,
+            base,
             task,
             command,
-        } => new_session(&socket, name, cwd, worktree, detached, command, task)?,
+        } => {
+            let worktree = NewWorktree::from_args(worktree, base);
+            new_session(&socket, name, cwd, worktree, detached, command, task)?
+        }
         Command::Done {
             name,
             failed,
@@ -1159,6 +1178,7 @@ fn run(cli: Cli) -> Result<()> {
             name,
             cwd,
             worktree,
+            base,
             wait,
             timeout,
             prompt,
@@ -1168,7 +1188,7 @@ fn run(cli: Cli) -> Result<()> {
                 prompt: prompt.join(" "),
                 args: claude_args,
             };
-            let cwd = start_dir(&socket, cwd, worktree)?;
+            let cwd = start_dir(&socket, cwd, NewWorktree::from_args(worktree, base))?;
             let name = client::new_task(&socket, name, cwd, spec, None)?.name;
             println!("{name}");
             if wait {
@@ -1456,7 +1476,7 @@ fn new_session(
     socket: &Path,
     name: Option<String>,
     cwd: Option<PathBuf>,
-    worktree: Option<String>,
+    worktree: Option<NewWorktree>,
     detached: bool,
     mut command: Vec<String>,
     task: Option<String>,
@@ -1540,6 +1560,7 @@ fn tasks(
             name,
             cwd,
             worktree,
+            base,
             background,
             no_launch,
             goal,
@@ -1547,7 +1568,7 @@ fn tasks(
         }) => {
             let task = work::NewTask {
                 goal: goal.join(" "),
-                cwd: start_dir(socket, cwd, worktree)?,
+                cwd: start_dir(socket, cwd, NewWorktree::from_args(worktree, base))?,
                 name,
                 background,
                 claude_args,
@@ -1656,15 +1677,37 @@ fn here(dir: Option<PathBuf>) -> Result<PathBuf> {
     }
 }
 
+/// A new worktree to start in, as `-w` and `--base` ask for it.
+struct NewWorktree {
+    branch: String,
+    /// Where the branch starts, when it's a new one: `--base`.
+    base: Option<String>,
+}
+
+impl NewWorktree {
+    fn from_args(branch: Option<String>, base: Option<String>) -> Option<NewWorktree> {
+        Some(NewWorktree {
+            branch: branch?,
+            base,
+        })
+    }
+}
+
 /// Where a new session or task starts: `cwd`, or the current directory,
-/// or else a new worktree on the branch `worktree` made from there.
-fn start_dir(socket: &Path, cwd: Option<PathBuf>, worktree: Option<String>) -> Result<PathBuf> {
+/// or else a new worktree made from there.
+fn start_dir(
+    socket: &Path,
+    cwd: Option<PathBuf>,
+    worktree: Option<NewWorktree>,
+) -> Result<PathBuf> {
     let cwd = match cwd {
         Some(cwd) => std::path::absolute(cwd)?,
         None => std::env::current_dir()?,
     };
     match worktree {
-        Some(branch) => client::add_worktree(socket, &cwd, &branch),
+        Some(NewWorktree { branch, base }) => {
+            client::add_worktree(socket, &cwd, &branch, base.as_deref())
+        }
         None => Ok(cwd),
     }
 }

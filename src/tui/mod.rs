@@ -2061,7 +2061,7 @@ fn directory_for(socket: &Path, place: Place) -> Result<PathBuf> {
             if made_up {
                 client::add_new_worktree(socket, &base, &branch)
             } else {
-                client::add_worktree(socket, &base, &branch)
+                client::add_worktree(socket, &base, &branch, None)
             }
         }
         Place::PullRequest(checkout) => client::pull_request_worktree(socket, &checkout),

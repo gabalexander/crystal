@@ -821,7 +821,14 @@ impl Daemon {
         match run.place(step) {
             Place::In(dir) => Ok(dir),
             Place::NewWorktree => {
-                let (worktree, branch) = git::add_new_worktree(&run.cwd, &run.slug())?;
+                // Not fetched: the daemon mustn't wait on the network
+                // here, so it's `origin`'s branch as the last fetch left it.
+                let base = git::Base {
+                    named: None,
+                    configured: settings().worktrees.base,
+                    fetch: false,
+                };
+                let (worktree, branch) = git::add_new_worktree(&run.cwd, &run.slug(), &base)?;
                 self.events
                     .emit(Event::worktree(true, &worktree, Some(&branch)));
                 run.worktree = Some(worktree.clone());

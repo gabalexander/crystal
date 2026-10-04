@@ -48,6 +48,8 @@ pub struct Config {
     pub events: EventSettings,
     /// Where worktrees' handoff notes go: `[handoff]` in the file.
     pub handoff: HandoffSettings,
+    /// How new worktrees are made: `[worktrees]` in the file.
+    pub worktrees: WorktreeSettings,
     /// Saved ways to start an agent, offered first in the new-session
     /// panel: `[[profile]]` tables in the file. See [`crate::profile`].
     #[serde(rename = "profile", skip_serializing_if = "Vec::is_empty")]
@@ -131,6 +133,17 @@ pub struct HandoffSettings {
     pub in_git: Vec<PathBuf>,
 }
 
+/// How new worktrees are made: see [`crate::git::add_worktree`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WorktreeSettings {
+    /// The branch a new worktree's new branch starts from, as `origin` has
+    /// it when it has one, in place of `origin`'s default branch. A project
+    /// without a branch of that name starts from the default all the same.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base: Option<String>,
+}
+
 /// The TUI's colors to choose from. `dark` and `light` paint their own
 /// background, so they look the same in any terminal; `terminal` paints
 /// nothing and keeps to the terminal's own colors.
@@ -156,6 +169,7 @@ impl Default for Config {
             tasks: TaskSettings::default(),
             events: EventSettings::default(),
             handoff: HandoffSettings::default(),
+            worktrees: WorktreeSettings::default(),
             profiles: Vec::new(),
             flows: Vec::new(),
         }
@@ -576,6 +590,14 @@ back_to = "build"
     }
 
     #[test]
+    fn new_worktrees_start_from_origins_default_unless_told() {
+        assert_eq!(Config::default().worktrees.base, None);
+        let config = parse("[worktrees]\nbase = \"develop\"\n").unwrap();
+        assert_eq!(config.worktrees.base.as_deref(), Some("develop"));
+        assert!(parse("[worktrees]\nbranch = \"develop\"\n").is_err());
+    }
+
+    #[test]
     fn a_leftover_preset_says_its_now_a_profile() {
         let err = parse("[[preset]]\nname = \"x\"\nagent = \"claude\"\n").unwrap_err();
         assert!(
@@ -607,6 +629,9 @@ back_to = "build"
             events: EventSettings { keep_days: 7 },
             handoff: HandoffSettings {
                 in_git: vec![PathBuf::from("~/code/app")],
+            },
+            worktrees: WorktreeSettings {
+                base: Some("develop".into()),
             },
             profiles: vec![Profile {
                 name: "review".into(),

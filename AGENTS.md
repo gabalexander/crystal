@@ -309,7 +309,8 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   and removing
 - `src/env.rs`: the environment a session's program starts with
 - `src/git.rs`: a directory's project, worktree and branch, a project's linked worktrees, and making and
-  removing worktrees, a pull request's with its commits fetched from `origin`, the patches the diff reads,
+  removing worktrees, a new branch from `origin`'s default (fetched, with a timeout), the settings' base or
+  `--base`, a pull request's with its commits fetched from `origin`, the patches the diff reads,
   the files a worktree changed since its branch left the default one, and `git grep` stopped once it's no
   longer wanted (runs `git`)
   - `git/branches.rs`: a worktree's branches, local and remote, its uncommitted changes, and switching it to
