@@ -10,7 +10,7 @@
 
 use super::theme::Theme;
 use crate::config::{Config, SessionSettings, ThemeName};
-use crate::embed::{self, Status};
+use crate::embed::Status;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::{Margin, Rect};
@@ -266,7 +266,7 @@ pub const HINTS: &[(&str, &str)] = &[
     ("esc", "close"),
 ];
 
-/// What the model line says of how the model stands.
+/// What the models line says of how the models stand.
 fn model_says(status: Option<&Status>, on: bool) -> (String, Option<bool>) {
     let Some(status) = status else {
         return ("the daemon didn't say".to_string(), None);
@@ -280,13 +280,13 @@ fn model_says(status: Option<&Status>, on: bool) -> (String, Option<bool>) {
         return (format!("{doing}…"), None);
     }
     if let Some(failed) = &status.failed {
-        return (format!("couldn't get it ready: {failed}"), Some(false));
+        return (format!("couldn't get them ready: {failed}"), Some(false));
     }
     if !status.is_downloaded() {
         let size = mb(status.size);
         return match on {
             true => (
-                format!("not downloaded: enter gets it ({size} MB)"),
+                format!("not downloaded: enter gets them ({size} MB)"),
                 Some(false),
             ),
             false => (format!("not downloaded ({size} MB)"), None),
@@ -468,13 +468,14 @@ fn lines(view: &SettingsView, theme: &Theme) -> Vec<Line<'static>> {
         Setting::Embeddings,
         Some(memory.embeddings),
         on_off(memory.embeddings),
-        format!(
-            "{}, on this machine",
-            embed::MODEL.rsplit('/').next().unwrap_or(embed::MODEL)
-        ),
+        match memory.rerank {
+            true => "jina v5 and its reranker, on this machine",
+            false => "jina v5, on this machine",
+        }
+        .to_string(),
     ));
     let (said, good) = model_says(view.model(), memory.embeddings);
-    lines.push(detail("model", said, good));
+    lines.push(detail("models", said, good));
     if let Some(status) = view.model()
         && (memory.embeddings || status.is_downloaded())
     {
@@ -587,7 +588,7 @@ mod tests {
         press(&mut view, KeyCode::Down);
         assert_eq!(
             press(&mut view, KeyCode::Char(' ')),
-            Outcome::Change(Change::Embeddings(true))
+            Outcome::Change(Change::Embeddings(false))
         );
         assert_eq!(press(&mut view, KeyCode::Char(',')), Outcome::Close);
     }
@@ -645,7 +646,9 @@ mod tests {
 
     #[test]
     fn enter_gets_the_model_only_once_search_by_meaning_is_on() {
-        let mut view = view_of(Config::default(), Some(status()));
+        let mut off = Config::default();
+        off.memory.embeddings = false;
+        let mut view = view_of(off, Some(status()));
         for _ in 0..7 {
             press(&mut view, KeyCode::Down);
         }
@@ -681,16 +684,15 @@ mod tests {
 
     #[test]
     fn the_model_line_follows_the_download_and_the_daemon() {
-        let mut config = Config::default();
-        config.memory.embeddings = true;
+        let config = Config::default();
         let downloading = Status {
             on_disk: 42_000_000,
-            preparing: Some("downloading the model".into()),
+            preparing: Some("downloading the models".into()),
             ..status()
         };
         let view = view_of(config.clone(), Some(downloading));
         assert!(
-            text(&view).contains("downloading the model · 42 of 134 MB"),
+            text(&view).contains("downloading the models · 42 of 134 MB"),
             "{}",
             text(&view)
         );
@@ -706,15 +708,19 @@ mod tests {
         assert!(text(&view).contains("37 of 40 have their vector"));
 
         let missing = view_of(config, Some(status()));
-        assert!(text(&missing).contains("not downloaded: enter gets it (134 MB)"));
-        let off = view_of(Config::default(), Some(status()));
+        assert!(text(&missing).contains("not downloaded: enter gets them (134 MB)"));
+        let mut config = Config::default();
+        config.memory.embeddings = false;
+        let off = view_of(config, Some(status()));
         assert!(text(&off).contains("not downloaded (134 MB)"));
         assert!(!text(&off).contains("have their vector"));
         let failed = Status {
             failed: Some("couldn't download it".into()),
             ..ready
         };
-        assert!(text(&view_of(Config::default(), Some(failed))).contains("couldn't get it ready"));
+        assert!(
+            text(&view_of(Config::default(), Some(failed))).contains("couldn't get them ready")
+        );
     }
 
     #[test]

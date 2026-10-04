@@ -211,9 +211,12 @@ pub struct MemorySettings {
     pub distill_model: String,
     /// The most it may spend on one task, in US dollars.
     pub distill_budget_usd: f64,
-    /// Search by what entries mean as well as by their words, with a model
+    /// Search by what entries mean as well as by their words, with models
     /// run on this machine: see [`crate::embed`].
     pub embeddings: bool,
+    /// Have the reranker read the best of a search again, putting what
+    /// answers it first and leaving out what doesn't.
+    pub rerank: bool,
 }
 
 impl Default for MemorySettings {
@@ -222,7 +225,8 @@ impl Default for MemorySettings {
             distill: true,
             distill_model: "claude-haiku-4-5".to_string(),
             distill_budget_usd: 0.25,
-            embeddings: false,
+            embeddings: true,
+            rerank: true,
         }
     }
 }
@@ -1043,16 +1047,16 @@ back_to = "build"
         )
         .unwrap();
         set(&path, &["notify"], false.into()).unwrap();
-        set(&path, &["memory", "embeddings"], true.into()).unwrap();
+        set(&path, &["memory", "embeddings"], false.into()).unwrap();
         set(&path, &["theme"], "light".into()).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(
             text.starts_with("# mine\nnotify = false # loud\n"),
             "{text}"
         );
-        assert!(text.contains("[memory]\nembeddings = true\n"), "{text}");
+        assert!(text.contains("[memory]\nembeddings = false\n"), "{text}");
         let config = from_text(&text).unwrap();
-        assert!(!config.notify && config.memory.embeddings);
+        assert!(!config.notify && !config.memory.embeddings);
         assert_eq!(config.theme, ThemeName::LIGHT);
 
         // What crystal wouldn't take is never written.
@@ -1087,7 +1091,7 @@ back_to = "build"
         assert!(!config.memory.distill);
         assert_eq!(config.memory.distill_model, "claude-haiku-4-5");
         assert_eq!(config.memory.distill_budget_usd, 0.25);
-        assert!(!config.memory.embeddings, "off until the model is wanted");
+        assert!(config.memory.embeddings && config.memory.rerank);
         let config = parse("[memory]\ndistill_model = \"sonnet\"\ndistill_budget_usd = 1\n");
         let config = config.unwrap();
         assert_eq!(config.memory.distill_model, "sonnet");
@@ -1211,6 +1215,7 @@ back_to = "build"
                 distill_model: "claude-sonnet-5-5".into(),
                 distill_budget_usd: 0.5,
                 embeddings: true,
+                rerank: false,
             },
             tasks: TaskSettings {
                 max_budget_usd: 2.5,

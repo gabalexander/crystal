@@ -198,7 +198,7 @@ whenever what's handed over changes in a way the crystal before couldn't read.
     no key for a while where focus isn't told), what the event log gained meanwhile counted into the
     footer's line, and the latest event seen, which the event loop keeps in the database
   - `settings_view.rs`: the settings view (`,`): notifications, sounds, the theme, the distiller and search by meaning,
-    each changed with a key, and how the model stands; the event loop writes the file (`config::set`) and,
+    each changed with a key, and how the models stand; the event loop writes the file (`config::set`) and,
     while it's open, reads the settings and the daemon's `EmbeddingStatus` again every half a second
 - `src/daemon.rs`: the daemon: listens on the socket and owns the sessions, and emits an event wherever something
   happens to them, their tasks, flows, worktrees, memory or backlog; archives sessions and starts them again,
@@ -338,8 +338,8 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   names, and the colors `[colors]` takes
 - `src/memory.rs`: what a project's sessions learned: the SQLite store in the state directory with its FTS5
   index (bm25, prefix and porter-stemmed words), each entry's vector and search by meaning merged with it by
-  reciprocal rank fusion, its migrations, the same said again seen again, forgotten entries the
-  distiller can't add back, bringing in a project's JSON file from before, anchors (each file's SHA-256 when
+  reciprocal rank fusion, then the reranker's read of the best (nothing when none answers), its migrations,
+  the same said again seen again, forgotten entries the distiller can't add back, bringing in a project's JSON file from before, anchors (each file's SHA-256 when
   an entry was said) and whether an entry holds, fresh, drifting or stale, search, the paragraph every agent is
   shown at launch (entries about what its worktree changed first, in docket's 800 bytes), promoting into
   CLAUDE.md, the markdown export, and `enabled`, the one gate everything memory adds goes through
@@ -349,9 +349,17 @@ whenever what's handed over changes in a way the crystal before couldn't read.
 - `src/mcp.rs`: `crystal mcp`: an MCP server over stdio with `memory_search` and `memory_show`, which every
   Claude Code session crystal starts, in a terminal or a task in the background, is given with `--mcp-config`
   and its tools allowed
-- `src/embed.rs`: search by meaning: bge-small-en-v1.5 run through Candle, `Embed` (the model, or a stand-in in
-  tests), downloading it at a pinned revision with its SHA-256s checked, and the one copy each process loads
-  when `[memory] embeddings` is on; memory.rs keeps the vectors and merges the rankings
+- `src/embed.rs`: search by meaning: jina-embeddings-v5-text-small (its retrieval LoRA adapter folded into
+  its weights as it loads) and jina-reranker-v3, both run through Candle on a Mac's GPU (Metal, bfloat16) or
+  the CPU, one call at a time (Candle on Metal answers wrong to threads running models at once); `Embed` (the
+  models, or a stand-in in tests), with the scores from which the reranker counts an entry; downloading both at pinned revisions with their SHA-256s checked, by the daemon as it starts unless
+  `CRYSTAL_NO_MODEL_DOWNLOAD` is set; and the one copy each process loads when `[memory] embeddings` is on;
+  memory.rs keeps the vectors and merges the rankings
+- `src/qwen3.rs`: Qwen3, the transformer both models are, adapted from candle-transformers' to read texts whole:
+  no cache, a batch padded at its end, causal attention through Candle's fused kernel on Metal (past 8 tokens,
+  below which Candle's kernel isn't causal)
+- `src/rerank.rs`: the reranker: every passage and the query in one prompt, each marked at its end, the
+  projector over the model's state at the marks, and each passage's cosine with the query
 - `src/secrets.rs`: taking credentials out of text before memory keeps it or the distiller reads it
 - `src/memory_cli.rs`: `crystal remember` and `crystal memory`, `show`, `export` and `distill` included, and an
   entry in full as `show` and the `memory_show` tool print it
@@ -411,7 +419,8 @@ whenever what's handed over changes in a way the crystal before couldn't read.
 - `tests/cli.rs`: end-to-end tests that drive the real binary against a private daemon (and read its database
   beside its socket to see what it wrote down), with a config of
   their own that turns notifications, sounds, the memory plugin and naming sessions from their prompts off (a
-  test of memory or naming turns it back on, and `CRYSTAL_NO_SOUND` keeps sounds off even then), plugins
+  test of memory or naming turns it back on, and `CRYSTAL_NO_SOUND` keeps sounds off even then; memory's models
+  are kept out by a cache that can't hold them and `CRYSTAL_NO_MODEL_DOWNLOAD`), plugins
   of their own in its plugins directory, and a Claude Code config directory of their own (`CLAUDE_CONFIG_DIR`),
   since a daemon brings the skill there up to date as it starts; a test that opens the new-session panel pins `PATH` to its fake
   agents, so no real agent is found or run, and a background task's `claude` is a fake that speaks stream-json,

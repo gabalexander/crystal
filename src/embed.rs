@@ -1,74 +1,140 @@
-//! Embeddings for memory's search: what an entry says as a vector, from a
-//! small model run on this machine, BAAI/bge-small-en-v1.5 through Candle,
-//! so a search finds an entry by what it means as well as by its words:
-//! "db" finds "the database", "flaky" finds "fails now and then".
-//! [`crate::memory`] keeps the vectors beside the entries and merges the two
-//! rankings.
+//! Search by meaning, for memory: two models run on this machine through
+//! Candle. One turns texts into vectors, jinaai/jina-embeddings-v5-text-small
+//! with its retrieval adapter, so a search finds an entry by what it means
+//! as well as by its words: "db" finds "the database", "flaky" finds "fails
+//! now and then". The other, jinaai/jina-reranker-v3 ([`crate::rerank`]),
+//! reads a query with the entries found best and says how well each answers
+//! it, so the right one comes first and a search about something the memory
+//! doesn't hold finds nothing. [`crate::memory`] keeps the vectors beside the
+//! entries and merges the rankings.
 //!
-//! It's off unless `embeddings = true` is under `[memory]` in the config.
-//! The model isn't part of crystal: `crystal memory embed` downloads it
-//! once, at a pinned revision, checks each file against its SHA-256, and
-//! keeps it in crystal's cache directory. Until it's there, a search goes
-//! by words alone.
+//! Both are Qwen3 ([`crate::qwen3`]), about 1.2 GB each, run on a Mac's GPU
+//! (Metal) where there is one and otherwise on the CPU. They're on unless
+//! `embeddings = false` is under `[memory]` in the config; `rerank = false`
+//! leaves the second out. They aren't part of crystal: the daemon, or
+//! `crystal memory embed`, downloads them once, at pinned revisions, checks
+//! each file against its SHA-256, and keeps them in crystal's cache
+//! directory. Until they're there, a search goes by words alone.
+//!
+//! Both models are licensed CC BY-NC 4.0: for use that isn't commercial.
 
 use crate::config::{Config, MemorySettings};
+use crate::qwen3::{self, Qwen3};
+use crate::rerank::Reranker;
 use anyhow::{Context, Result, anyhow, bail};
-use candle_core::{DType, Device, IndexOp, Tensor};
+use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
-use candle_transformers::models::bert::{BertModel, Config as BertConfig};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Arc, Mutex};
-use tokenizers::{PaddingParams, Tokenizer, TruncationParams};
+use std::sync::{Arc, Mutex, PoisonError};
+use tokenizers::{Tokenizer, TruncationParams};
 
-/// The model, as Hugging Face names it.
-pub const MODEL: &str = "BAAI/bge-small-en-v1.5";
+/// The model that turns texts into vectors, as Hugging Face names it, which
+/// each vector is kept under.
+pub const MODEL: &str = "jinaai/jina-embeddings-v5-text-small";
 
-/// The revision of it crystal downloads: a commit, so the files never
-/// change under the hashes below.
-const REVISION: &str = "5c38ec7c405ec4b44b94cc5a9bb96e735b38267a";
+/// The two models, as crystal downloads them: each at a commit, so its files
+/// never change under their hashes.
+pub const EMBEDDER: Spec = Spec {
+    repo: MODEL,
+    revision: "dd76d535f5447ca3897a9c893fb1e612ead98192",
+    files: &[
+        ModelFile {
+            name: "config.json",
+            size: 991,
+            sha256: "1af1e1269488c83d8b2332e42099f0d2201d687fbe074d1ed096c6201f283546",
+        },
+        ModelFile {
+            name: "tokenizer.json",
+            size: 11_422_654,
+            sha256: "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4",
+        },
+        ModelFile {
+            name: "model.safetensors",
+            size: 1_192_133_208,
+            sha256: "045fa75ff963a528cda2589fb1ca0a9ad848b53511780ed4f08f6fe10f6167c3",
+        },
+        ModelFile {
+            name: "adapters/retrieval/adapter_config.json",
+            size: 883,
+            sha256: "f37c5d6dd368e2675e54e01b685252d4d44eed042c773a48f56ebe1565cd0320",
+        },
+        ModelFile {
+            name: "adapters/retrieval/adapter_model.safetensors",
+            size: 40_420_176,
+            sha256: "2bc6ab71895eb04664e4d995ee29e1620603f3a3fc4dfc573bc2383dfc85bb94",
+        },
+    ],
+};
 
-/// The files the model is, with their sizes and SHA-256 hashes at
-/// [`REVISION`].
-const FILES: [ModelFile; 3] = [
-    ModelFile {
-        name: "config.json",
-        size: 743,
-        sha256: "094f8e891b932f2000c92cfc663bac4c62069f5d8af5b5278c4306aef3084750",
-    },
-    ModelFile {
-        name: "tokenizer.json",
-        size: 711_396,
-        sha256: "d241a60d5e8f04cc1b2b3e9ef7a4921b27bf526d9f6050ab90f9267a1f9e5c66",
-    },
-    ModelFile {
-        name: "model.safetensors",
-        size: 133_466_304,
-        sha256: "3c9f31665447c8911517620762200d2245a2518d6e7208acc78cd9db317e21ad",
-    },
-];
+pub const RERANKER: Spec = Spec {
+    repo: "jinaai/jina-reranker-v3",
+    revision: "d7d7e73b6ea138ced340b83865931b5dfb6c97aa",
+    files: &[
+        ModelFile {
+            name: "config.json",
+            size: 828,
+            sha256: "625aea6b08e6062e334c4a5009af01ba50140d2d3994084f6f1b05c67dadf98a",
+        },
+        ModelFile {
+            name: "tokenizer.json",
+            size: 11_423_225,
+            sha256: "4e95945ab0cef486709f760b81efcc7a6e75747f9165d13ead29159737455803",
+        },
+        ModelFile {
+            name: "model.safetensors",
+            size: 1_193_708_120,
+            sha256: "200d852626fd18ce3f3a97c55b689f1f842031f1488055b4cdcfa274924b8f3d",
+        },
+    ],
+};
+
+const SPECS: [&Spec; 2] = [&EMBEDDER, &RERANKER];
 
 /// The most tokens the model reads of a text: the rest is left off.
 const MAX_TOKENS: usize = 512;
 
 /// How many texts go through the model at once.
-const BATCH: usize = 32;
+const BATCH: usize = 16;
+
+/// What goes ahead of a query and of an entry, as the model was trained.
+const QUERY: &str = "Query: ";
+const PASSAGE: &str = "Document: ";
 
 /// How alike a query and an entry have to be, by this model, for the entry
-/// to be worth ranking at all. Short notes all score between about 0.45 and
-/// 0.75 against a short query, and an unrelated one can score above a real
-/// match, so this only leaves out what's plainly about something else: the
-/// ranking, merged with bm25's, does the rest.
-const MIN_SIMILARITY: f32 = 0.5;
+/// to be worth ranking at all. On crystal's notes no score told a match
+/// from the rest (a query nothing answered scored up to 0.38, a real match
+/// as little as 0.28), so nothing is left out for its score alone: the
+/// window below the best, and the reranker, do that.
+const MIN_SIMILARITY: f32 = 0.0;
 
 /// How far below the best match, by this model, another may score and
-/// still count. On crystal's notes, the right entry led the next by 0.01 to
-/// 0.13, and what came after was rarely within 0.05 of it.
-const NEAR_BEST: f32 = 0.05;
+/// still count: 0.08 ranked crystal's notes best, out of 0.03 to 0.12.
+const NEAR_BEST: f32 = 0.08;
+
+/// The score the reranker gives the best entry for a query something
+/// answers: on crystal's notes, the best entry for a query nothing answered
+/// scored at most 0.014, and for one something did, at least 0.057. Below
+/// it, a search finds nothing.
+const ANSWERS_FROM: f32 = 0.03;
+
+/// The score below which an entry the reranker read is left out, once
+/// something answers the query: an entry that answers in part scores less
+/// than the best, often below zero, and on crystal's notes this kept every
+/// one while leaving out two in three of the rest.
+const KEPT_FROM: f32 = -0.05;
+
+/// A model's files at a revision.
+pub struct Spec {
+    pub repo: &'static str,
+    revision: &'static str,
+    files: &'static [ModelFile],
+}
 
 struct ModelFile {
     name: &'static str,
@@ -76,15 +142,35 @@ struct ModelFile {
     sha256: &'static str,
 }
 
-/// What turns texts into vectors: the model, or a stand-in in tests.
+impl Spec {
+    /// The model's name without its owner.
+    fn name(&self) -> &str {
+        self.repo.rsplit('/').next().unwrap_or(self.repo)
+    }
+
+    /// Where it's kept in `root`: a directory named after the revision, so
+    /// another never mixes with it.
+    fn dir(&self, root: &Path) -> PathBuf {
+        root.join(format!("{}-{}", self.name(), &self.revision[..8]))
+    }
+
+    fn size(&self) -> u64 {
+        self.files.iter().map(|file| file.size).sum()
+    }
+}
+
+/// What a search asks of the models: the real ones, or a stand-in in tests.
 pub trait Embed {
-    /// Its name, which each vector is kept under: vectors from two models
-    /// can't be compared.
+    /// The name each vector is kept under: vectors from two models can't be
+    /// compared.
     fn model(&self) -> &str;
 
-    /// Each text's vector, of length one, so two vectors' dot product is
+    /// Each entry's vector, of length one, so two vectors' dot product is
     /// how alike they are.
-    fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>>;
+    fn embed_passages(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>>;
+
+    /// A query's vector, to hold against the entries'.
+    fn embed_query(&self, text: &str) -> Result<Vec<f32>>;
 
     /// How alike a query and a passage have to be to count as a match:
     /// below it, they're no more alike than any two sentences are.
@@ -94,44 +180,184 @@ pub trait Embed {
     /// the model's scores are close together, so a match well behind the
     /// best is one in name only.
     fn near_best(&self) -> f32;
+
+    /// How well each of `passages` answers `query`, in their order, by a
+    /// model that reads them together; `None` with no such model.
+    fn rerank(&self, _query: &str, _passages: &[&str]) -> Result<Option<Vec<f32>>> {
+        Ok(None)
+    }
+
+    /// The score from [`Embed::rerank`] the best passage has to reach for
+    /// any to count as answering the query.
+    fn answers_from(&self) -> f32 {
+        ANSWERS_FROM
+    }
+
+    /// The score from [`Embed::rerank`] below which a passage is left out,
+    /// once one answers the query.
+    fn kept_from(&self) -> f32 {
+        KEPT_FROM
+    }
 }
 
-/// The model, loaded.
+/// Where the models run: on a Mac's GPU in bfloat16, the weights as they
+/// come, unless it can't be had (or `CRYSTAL_MODELS_ON_CPU` is set);
+/// otherwise on the CPU in float32, which Candle multiplies there.
+fn device() -> (Device, DType) {
+    #[cfg(target_os = "macos")]
+    if std::env::var_os("CRYSTAL_MODELS_ON_CPU").is_none() {
+        match Device::new_metal(0) {
+            Ok(device) => return (device, DType::BF16),
+            Err(err) => eprintln!("crystal: no GPU for memory's models, so the CPU: {err}"),
+        }
+    }
+    (Device::Cpu, DType::F32)
+}
+
+/// The model that turns texts into vectors, loaded.
 pub struct Embedder {
-    model: BertModel,
+    model: Qwen3,
     tokenizer: Tokenizer,
-    device: Device,
 }
 
 impl Embedder {
-    /// The model whose files are in `dir`.
-    pub fn load(dir: &Path) -> Result<Embedder> {
-        let device = Device::Cpu;
-        let config = fs::read_to_string(dir.join("config.json"))?;
-        let config: BertConfig = serde_json::from_str(&config)?;
+    /// The model whose files are in `dir`, its retrieval adapter folded into
+    /// its weights.
+    fn load(dir: &Path, device: &Device, dtype: DType) -> Result<Embedder> {
+        let config: qwen3::Config =
+            serde_json::from_str(&fs::read_to_string(dir.join("config.json"))?)?;
+        let adapter = dir.join("adapters/retrieval");
+        let lora: LoraConfig =
+            serde_json::from_str(&fs::read_to_string(adapter.join("adapter_config.json"))?)?;
+        let weights = with_adapter(
+            &dir.join("model.safetensors"),
+            &adapter.join("adapter_model.safetensors"),
+            lora.lora_alpha / lora.r,
+        )?;
+        let weights = weights
+            .into_iter()
+            .map(|(name, weight)| Ok((name, weight.to_dtype(dtype)?.to_device(device)?)))
+            .collect::<Result<HashMap<_, _>>>()?;
+        let model = Qwen3::load(VarBuilder::from_tensors(weights, dtype, device), &config)?;
         let mut tokenizer =
             Tokenizer::from_file(dir.join("tokenizer.json")).map_err(|err| anyhow!(err))?;
-        tokenizer.with_padding(Some(PaddingParams::default()));
         tokenizer
             .with_truncation(Some(TruncationParams {
                 max_length: MAX_TOKENS,
                 ..TruncationParams::default()
             }))
             .map_err(|err| anyhow!(err))?;
-        let weights = dir.join("model.safetensors");
-        // SAFETY: the file is only read, and nothing else writes it once
-        // it's in place: a download goes to a file beside it, then is moved.
-        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[weights], DType::F32, &device)? };
-        let model = BertModel::load(vb, &config)?;
-        Ok(Embedder {
-            model,
-            tokenizer,
-            device,
-        })
+        Ok(Embedder { model, tokenizer })
+    }
+
+    /// Each text's vector: its last token's state (the end-of-text token the
+    /// tokenizer adds), scaled to length one. Texts of about the same length
+    /// go through together, so little of a batch is padding.
+    fn vectors(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
+        let encodings = self
+            .tokenizer
+            .encode_batch(texts, true)
+            .map_err(|err| anyhow!(err))?;
+        let mut order: Vec<usize> = (0..encodings.len()).collect();
+        order.sort_by_key(|&n| encodings[n].get_ids().len());
+        let mut vectors = vec![Vec::new(); encodings.len()];
+        let device = self.model.device();
+        for batch in order.chunks(BATCH) {
+            let lengths: Vec<usize> = batch
+                .iter()
+                .map(|&n| encodings[n].get_ids().len())
+                .collect();
+            let padded = lengths.iter().copied().max().unwrap_or(1).max(1);
+            let mut ids = vec![0u32; batch.len() * padded];
+            for (row, &n) in batch.iter().enumerate() {
+                let tokens = encodings[n].get_ids();
+                ids[row * padded..row * padded + tokens.len()].copy_from_slice(tokens);
+            }
+            let ids = Tensor::from_vec(ids, (batch.len(), padded), device)?;
+            let hidden = self.model.forward(&ids)?.flatten(0, 1)?;
+            let last = qwen3::last_tokens(&lengths, padded, device)?;
+            let unit = qwen3::unit_rows(&hidden.index_select(&last, 0)?)?;
+            for (&n, vector) in batch.iter().zip(unit.to_vec2::<f32>()?) {
+                vectors[n] = vector;
+            }
+        }
+        Ok(vectors)
     }
 }
 
-impl Embed for Embedder {
+/// What a LoRA adapter's `adapter_config.json` says of its scale.
+#[derive(Deserialize)]
+struct LoraConfig {
+    r: f64,
+    lora_alpha: f64,
+}
+
+/// The weights in the safetensors file `base`, on the CPU, with the LoRA
+/// adapter in `adapter` folded in: each weight it adapts plus `scale` times
+/// B·A, worked out in float32.
+fn with_adapter(base: &Path, adapter: &Path, scale: f64) -> Result<HashMap<String, Tensor>> {
+    let cpu = Device::Cpu;
+    let mut weights = candle_core::safetensors::load(base, &cpu)?;
+    let lora = candle_core::safetensors::load(adapter, &cpu)?;
+    for (name, a) in &lora {
+        let Some(adapted) = name
+            .strip_prefix("base_model.model.")
+            .and_then(|name| name.strip_suffix(".lora_A.weight"))
+        else {
+            continue;
+        };
+        let b = lora
+            .get(&format!("base_model.model.{adapted}.lora_B.weight"))
+            .with_context(|| format!("the adapter has no B for {adapted}"))?;
+        let key = format!("{adapted}.weight");
+        let weight = weights
+            .get(&key)
+            .with_context(|| format!("the adapter adapts {adapted}, which the model hasn't"))?;
+        let delta = (b.to_dtype(DType::F32)?.matmul(&a.to_dtype(DType::F32)?)? * scale)?;
+        let merged = (weight.to_dtype(DType::F32)? + delta)?;
+        weights.insert(key, merged);
+    }
+    Ok(weights)
+}
+
+/// Both models, loaded: the one that turns texts into vectors, and the
+/// reranker, unless the config leaves it out.
+pub struct Models {
+    embedder: Embedder,
+    reranker: Option<Reranker>,
+    /// Held while either model runs: Candle on a Mac's GPU gives wrong
+    /// answers to threads that run models at once, and the GPU would run
+    /// them one after another anyway.
+    lane: Mutex<()>,
+}
+
+impl Models {
+    /// The models whose files are under `root`.
+    pub fn load(root: &Path, rerank: bool) -> Result<Models> {
+        let (device, dtype) = device();
+        let embedder = Embedder::load(&EMBEDDER.dir(root), &device, dtype)
+            .with_context(|| format!("couldn't load {MODEL}"))?;
+        let reranker = if rerank {
+            Some(
+                Reranker::load(&RERANKER.dir(root), &device, dtype)
+                    .with_context(|| format!("couldn't load {}", RERANKER.repo))?,
+            )
+        } else {
+            None
+        };
+        Ok(Models {
+            embedder,
+            reranker,
+            lane: Mutex::new(()),
+        })
+    }
+
+    fn has_reranker(&self) -> bool {
+        self.reranker.is_some()
+    }
+}
+
+impl Embed for Models {
     fn model(&self) -> &str {
         MODEL
     }
@@ -144,93 +370,92 @@ impl Embed for Embedder {
         NEAR_BEST
     }
 
-    /// Queries go as they are, without the instruction the model card
-    /// offers for them: on crystal's short notes, it ranked worse.
-    fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
-        let mut vectors = Vec::with_capacity(texts.len());
-        for batch in texts.chunks(BATCH) {
-            let encodings = self
-                .tokenizer
-                .encode_batch(batch.to_vec(), true)
-                .map_err(|err| anyhow!(err))?;
-            let tensor = |part: fn(&tokenizers::Encoding) -> &[u32]| -> Result<Tensor> {
-                let rows = encodings
-                    .iter()
-                    .map(|encoding| Tensor::new(part(encoding), &self.device))
-                    .collect::<candle_core::Result<Vec<_>>>()?;
-                Ok(Tensor::stack(&rows, 0)?)
-            };
-            let ids = tensor(tokenizers::Encoding::get_ids)?;
-            let mask = tensor(tokenizers::Encoding::get_attention_mask)?;
-            let types = ids.zeros_like()?;
-            let hidden = self.model.forward(&ids, &types, Some(&mask))?;
-            // The model's own pooling: the first token's state, [CLS].
-            let first = hidden.i((.., 0))?;
-            let length = first.sqr()?.sum_keepdim(1)?.sqrt()?;
-            let unit = first.broadcast_div(&length)?;
-            vectors.extend(unit.to_vec2::<f32>()?);
+    fn embed_passages(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+        let _lane = self.lane.lock().unwrap_or_else(PoisonError::into_inner);
+        self.embedder.vectors(
+            texts
+                .iter()
+                .map(|text| format!("{PASSAGE}{text}"))
+                .collect(),
+        )
+    }
+
+    fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
+        let _lane = self.lane.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut vectors = self.embedder.vectors(vec![format!("{QUERY}{text}")])?;
+        vectors.pop().context("the model gave no vector")
+    }
+
+    fn rerank(&self, query: &str, passages: &[&str]) -> Result<Option<Vec<f32>>> {
+        let _lane = self.lane.lock().unwrap_or_else(PoisonError::into_inner);
+        match &self.reranker {
+            Some(reranker) => Ok(Some(reranker.scores(query, passages)?)),
+            None => Ok(None),
         }
-        Ok(vectors)
     }
 }
 
-/// The model, once a process has loaded it.
-static LOADED: Mutex<Option<Arc<Embedder>>> = Mutex::new(None);
+/// The models, once a process has loaded them.
+static LOADED: Mutex<Option<Arc<Models>>> = Mutex::new(None);
 
-/// The model, loaded once in each process and kept, when the config says to
-/// search with it and it's been downloaded. With the config saying not to,
-/// a process that had it loaded lets it go.
-pub fn shared(settings: &MemorySettings) -> Option<Arc<Embedder>> {
+/// The models, loaded once in each process and kept, when the config says
+/// to search with them and they've been downloaded. With the config saying
+/// not to, a process that had them loaded lets them go; with it leaving the
+/// reranker out, or putting it back, they're loaded again to match.
+pub fn shared(settings: &MemorySettings) -> Option<Arc<Models>> {
     let mut loaded = LOADED.lock().unwrap();
     if !settings.embeddings {
         *loaded = None;
         return None;
     }
-    if let Some(embedder) = &*loaded {
-        return Some(embedder.clone());
+    if let Some(models) = &*loaded {
+        if models.has_reranker() == settings.rerank {
+            return Some(models.clone());
+        }
+        *loaded = None;
     }
-    let dir = model_dir()?;
-    if !is_downloaded(&dir) {
+    let root = models_dir()?;
+    if !is_downloaded(&root) {
         return None;
     }
-    match Embedder::load(&dir) {
-        Ok(embedder) => {
-            let embedder = Arc::new(embedder);
-            *loaded = Some(embedder.clone());
-            Some(embedder)
+    match Models::load(&root, settings.rerank) {
+        Ok(models) => {
+            let models = Arc::new(models);
+            *loaded = Some(models.clone());
+            Some(models)
         }
         Err(err) => {
-            eprintln!("crystal: couldn't load {MODEL}: {err:#}");
+            eprintln!("crystal: couldn't load memory's models: {err:#}");
             None
         }
     }
 }
 
-/// Whether this process has the model loaded.
+/// Whether this process has the models loaded.
 pub fn is_loaded() -> bool {
     LOADED.lock().unwrap().is_some()
 }
 
-/// Lets the model go, when this process has it and the config now says
-/// not to search with it.
+/// Lets the models go, when this process has them and the config now says
+/// not to search with them.
 pub fn let_go_unless(settings: &MemorySettings) {
     if !settings.embeddings {
         LOADED.lock().unwrap().take();
     }
 }
 
-/// How the model stands, as the settings view shows it.
+/// How the models stand, as the settings view shows them.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Status {
-    /// How much of the model is on disk, in bytes, downloaded or on its
-    /// way, and how much it is in all.
+    /// How much of the models is on disk, in bytes, downloaded or on its
+    /// way, and how much they are in all.
     pub on_disk: u64,
     pub size: u64,
-    /// Whether the daemon has it loaded.
+    /// Whether the daemon has them loaded.
     pub loaded: bool,
-    /// What the daemon is doing to get it ready, while it does.
+    /// What the daemon is doing to get them ready, while it does.
     pub preparing: Option<String>,
-    /// Why getting it ready last failed.
+    /// Why getting them ready last failed.
     pub failed: Option<String>,
     /// How many entries every project has, and how many of them have their
     /// vector from the model.
@@ -244,12 +469,13 @@ impl Status {
     }
 }
 
-/// How much of the model is in `dir`, in bytes: the files there, and those
-/// on their way, each counted up to its size.
-pub fn on_disk(dir: &Path) -> u64 {
-    FILES
+/// How much of the models is under `root`, in bytes: the files there, and
+/// those on their way, each counted up to its size.
+pub fn on_disk(root: &Path) -> u64 {
+    SPECS
         .iter()
-        .map(|file| {
+        .flat_map(|spec| spec.files.iter().map(move |file| (spec.dir(root), file)))
+        .map(|(dir, file)| {
             let size = |name: &str| fs::metadata(dir.join(name)).map_or(0, |meta| meta.len());
             let done = size(file.name);
             let coming = size(&format!("{}.part", file.name));
@@ -258,34 +484,25 @@ pub fn on_disk(dir: &Path) -> u64 {
         .sum()
 }
 
-/// How big the model is, all its files together, in bytes.
+/// How big the models are, all their files together, in bytes.
 pub fn size() -> u64 {
-    FILES.iter().map(|file| file.size).sum()
+    SPECS.iter().map(|spec| spec.size()).sum()
 }
 
 /// [`shared`], by the config file as it is now.
-pub fn shared_now() -> Option<Arc<Embedder>> {
+pub fn shared_now() -> Option<Arc<Models>> {
     shared(&Config::load().ok()?.memory)
 }
 
 /// What a search is given of [`shared`]'s answer.
-pub fn as_embed(embedder: &Option<Arc<Embedder>>) -> Option<&dyn Embed> {
-    embedder.as_deref().map(|embedder| embedder as &dyn Embed)
+pub fn as_embed(models: &Option<Arc<Models>>) -> Option<&dyn Embed> {
+    models.as_deref().map(|models| models as &dyn Embed)
 }
 
-/// Where the model is kept: in crystal's cache directory, in a directory
-/// named after the revision, so another never mixes with it.
-pub fn model_dir() -> Option<PathBuf> {
+/// Where the models are kept: crystal's models directory in its cache.
+pub fn models_dir() -> Option<PathBuf> {
     let cache = cache_dir(std::env::var_os("XDG_CACHE_HOME"), std::env::var_os("HOME"))?;
-    Some(model_dir_in(&cache))
-}
-
-fn model_dir_in(cache: &Path) -> PathBuf {
-    let name = MODEL.rsplit('/').next().unwrap_or(MODEL);
-    cache
-        .join("crystal")
-        .join("models")
-        .join(format!("{name}-{}", &REVISION[..8]))
+    Some(cache.join("crystal").join("models"))
 }
 
 /// `$XDG_CACHE_HOME`, or else `~/.cache`.
@@ -299,62 +516,76 @@ fn cache_dir(
     }
 }
 
-/// Whether every file of the model is in `dir`, each the size it should be.
-/// Its hash was checked as it was downloaded.
-pub fn is_downloaded(dir: &Path) -> bool {
-    FILES
-        .iter()
-        .all(|file| fs::metadata(dir.join(file.name)).is_ok_and(|meta| meta.len() == file.size))
+/// Whether every file of both models is under `root`, each the size it
+/// should be. Its hash was checked as it was downloaded.
+pub fn is_downloaded(root: &Path) -> bool {
+    SPECS.iter().all(|spec| {
+        let dir = spec.dir(root);
+        spec.files
+            .iter()
+            .all(|file| fs::metadata(dir.join(file.name)).is_ok_and(|meta| meta.len() == file.size))
+    })
 }
 
-/// How big the model is, all its files together, in megabytes.
+/// How big the models are, all their files together, in megabytes.
 pub fn size_mb() -> u64 {
     size() / 1_000_000
 }
 
-/// Downloads the model into [`model_dir`], each file it doesn't have yet,
+/// The models, as `crystal memory embed` names them.
+pub fn names() -> String {
+    format!("{} and {}", EMBEDDER.repo, RERANKER.repo)
+}
+
+/// Downloads both models under [`models_dir`], each file not there yet,
 /// with `curl`, showing how it goes when `progress` says to. Each file goes
 /// beside its place first and is moved there only once its hash is right.
 pub fn download(progress: bool) -> Result<PathBuf> {
-    let dir = model_dir().context("can't tell where to keep the model: HOME isn't set")?;
-    fs::create_dir_all(&dir).with_context(|| format!("couldn't make {}", dir.display()))?;
-    for file in &FILES {
-        let path = dir.join(file.name);
-        if fs::metadata(&path).is_ok_and(|meta| meta.len() == file.size) {
-            continue;
-        }
-        let partial = dir.join(format!("{}.part", file.name));
-        let url = format!(
-            "https://huggingface.co/{MODEL}/resolve/{REVISION}/{}",
-            file.name
-        );
-        let mut curl = Command::new("curl");
-        curl.args(["--fail", "--location", "--retry", "3", "--show-error"]);
-        curl.arg(if progress {
-            "--progress-bar"
-        } else {
-            "--silent"
-        });
-        curl.arg("--output").arg(&partial).arg(&url);
-        let status = curl
-            .status()
-            .context("couldn't run curl, which downloads the model")?;
-        if !status.success() {
-            let _ = fs::remove_file(&partial);
-            bail!("couldn't download {url}");
-        }
-        let sha256 = sha256_of(&partial)?;
-        if sha256 != file.sha256 {
-            let _ = fs::remove_file(&partial);
-            bail!(
-                "{} came with the wrong SHA-256: {sha256}, not {}",
-                file.name,
-                file.sha256
+    let root = models_dir().context("can't tell where to keep the models: HOME isn't set")?;
+    for spec in SPECS {
+        let dir = spec.dir(&root);
+        for file in spec.files {
+            let path = dir.join(file.name);
+            if fs::metadata(&path).is_ok_and(|meta| meta.len() == file.size) {
+                continue;
+            }
+            let parent = path.parent().unwrap_or(&dir);
+            fs::create_dir_all(parent)
+                .with_context(|| format!("couldn't make {}", parent.display()))?;
+            let partial = dir.join(format!("{}.part", file.name));
+            let url = format!(
+                "https://huggingface.co/{}/resolve/{}/{}",
+                spec.repo, spec.revision, file.name
             );
+            let mut curl = Command::new("curl");
+            curl.args(["--fail", "--location", "--retry", "3", "--show-error"]);
+            curl.arg(if progress {
+                "--progress-bar"
+            } else {
+                "--silent"
+            });
+            curl.arg("--output").arg(&partial).arg(&url);
+            let status = curl
+                .status()
+                .context("couldn't run curl, which downloads the models")?;
+            if !status.success() {
+                let _ = fs::remove_file(&partial);
+                bail!("couldn't download {url}");
+            }
+            let sha256 = sha256_of(&partial)?;
+            if sha256 != file.sha256 {
+                let _ = fs::remove_file(&partial);
+                bail!(
+                    "{}'s {} came with the wrong SHA-256: {sha256}, not {}",
+                    spec.repo,
+                    file.name,
+                    file.sha256
+                );
+            }
+            fs::rename(&partial, &path)?;
         }
-        fs::rename(&partial, &path)?;
     }
-    Ok(dir)
+    Ok(root)
 }
 
 /// The SHA-256 of the file at `path`, in hex.
@@ -380,14 +611,37 @@ pub fn sha256_of(path: &Path) -> Result<String> {
 mod tests {
     use super::*;
 
+    /// Lays out `root` with every file of both models the right size, but
+    /// for the files named in `short`, which are there but too small.
+    fn lay_out(root: &Path, short: &[&str]) {
+        for spec in SPECS {
+            let dir = spec.dir(root);
+            for file in spec.files {
+                let path = dir.join(file.name);
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                let size = if short.contains(&file.name) {
+                    5
+                } else {
+                    file.size
+                };
+                File::create(&path).unwrap().set_len(size).unwrap();
+            }
+        }
+    }
+
     #[test]
-    fn the_model_is_kept_in_crystal_s_cache_by_its_revision() {
+    fn the_models_are_kept_in_crystal_s_cache_by_their_revisions() {
         let cache = cache_dir(None, Some("/home/ann".into())).unwrap();
         assert_eq!(cache, PathBuf::from("/home/ann/.cache"));
         let cache = cache_dir(Some("/xdg".into()), Some("/home/ann".into())).unwrap();
+        let root = cache.join("crystal").join("models");
         assert_eq!(
-            model_dir_in(&cache),
-            PathBuf::from("/xdg/crystal/models/bge-small-en-v1.5-5c38ec7c")
+            EMBEDDER.dir(&root),
+            PathBuf::from("/xdg/crystal/models/jina-embeddings-v5-text-small-dd76d535")
+        );
+        assert_eq!(
+            RERANKER.dir(&root),
+            PathBuf::from("/xdg/crystal/models/jina-reranker-v3-d7d7e73b")
         );
         assert_eq!(cache_dir(None, None), None);
     }
@@ -404,24 +658,31 @@ mod tests {
     }
 
     #[test]
-    fn a_model_with_a_file_missing_or_short_isn_t_downloaded() {
+    fn models_with_a_file_missing_or_short_aren_t_downloaded() {
         let dir = tempfile::tempdir().unwrap();
         assert!(!is_downloaded(dir.path()));
-        for file in &FILES[..2] {
-            fs::write(dir.path().join(file.name), vec![0; file.size as usize]).unwrap();
-        }
-        fs::write(dir.path().join("model.safetensors"), "short").unwrap();
+        lay_out(
+            dir.path(),
+            &["adapters/retrieval/adapter_model.safetensors"],
+        );
         assert!(!is_downloaded(dir.path()));
-        assert_eq!(size_mb(), 134);
+        lay_out(dir.path(), &[]);
+        assert!(is_downloaded(dir.path()));
+        assert_eq!(size_mb(), 2449);
     }
 
     #[test]
     fn what_s_on_disk_counts_the_files_on_their_way() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(on_disk(dir.path()), 0);
-        fs::write(dir.path().join("config.json"), vec![0; 743]).unwrap();
-        fs::write(dir.path().join("model.safetensors.part"), vec![0; 1000]).unwrap();
-        assert_eq!(on_disk(dir.path()), 1743);
+        let embedder = EMBEDDER.dir(dir.path());
+        fs::create_dir_all(&embedder).unwrap();
+        fs::write(embedder.join("config.json"), vec![0; 991]).unwrap();
+        fs::write(embedder.join("model.safetensors.part"), vec![0; 1000]).unwrap();
+        let reranker = RERANKER.dir(dir.path());
+        fs::create_dir_all(&reranker).unwrap();
+        fs::write(reranker.join("config.json"), vec![0; 828]).unwrap();
+        assert_eq!(on_disk(dir.path()), 991 + 1000 + 828);
         let status = Status {
             on_disk: size(),
             size: size(),
@@ -431,14 +692,52 @@ mod tests {
         assert!(!Status::default().is_downloaded());
     }
 
-    /// Runs the real model, when `crystal memory embed` has downloaded it:
-    /// `cargo test -- --ignored the_real_model`.
+    #[test]
+    fn an_adapter_is_folded_into_the_weights_it_adapts() {
+        let dir = tempfile::tempdir().unwrap();
+        let cpu = Device::Cpu;
+        let base = HashMap::from([
+            (
+                "layers.0.mlp.up_proj.weight".to_string(),
+                Tensor::new(&[[1f32, 0.0], [0.0, 1.0]], &cpu).unwrap(),
+            ),
+            (
+                "norm.weight".to_string(),
+                Tensor::new(&[1f32, 1.0], &cpu).unwrap(),
+            ),
+        ]);
+        let adapter = HashMap::from([
+            (
+                "base_model.model.layers.0.mlp.up_proj.lora_A.weight".to_string(),
+                Tensor::new(&[[1f32, 2.0]], &cpu).unwrap(),
+            ),
+            (
+                "base_model.model.layers.0.mlp.up_proj.lora_B.weight".to_string(),
+                Tensor::new(&[[1f32], [0.0]], &cpu).unwrap(),
+            ),
+        ]);
+        candle_core::safetensors::save(&base, dir.path().join("base.safetensors")).unwrap();
+        candle_core::safetensors::save(&adapter, dir.path().join("lora.safetensors")).unwrap();
+        let merged = with_adapter(
+            &dir.path().join("base.safetensors"),
+            &dir.path().join("lora.safetensors"),
+            0.5,
+        )
+        .unwrap();
+        let up: Vec<Vec<f32>> = merged["layers.0.mlp.up_proj.weight"].to_vec2().unwrap();
+        assert_eq!(up, vec![vec![1.5, 1.0], vec![0.0, 1.0]]);
+        let norm: Vec<f32> = merged["norm.weight"].to_vec1().unwrap();
+        assert_eq!(norm, vec![1.0, 1.0]);
+    }
+
+    /// Runs the real models, once `crystal memory embed` has downloaded
+    /// them: `cargo test -- --ignored the_real_models`.
     #[test]
     #[ignore]
-    fn the_real_model_finds_what_means_the_same() {
-        let dir = model_dir().unwrap();
-        assert!(is_downloaded(&dir), "run `crystal memory embed` first");
-        let model = Embedder::load(&dir).unwrap();
+    fn the_real_models_find_what_means_the_same_and_nothing_else() {
+        let root = models_dir().unwrap();
+        assert!(is_downloaded(&root), "run `crystal memory embed` first");
+        let models = Models::load(&root, true).unwrap();
         let passages = [
             "Postgres has to be running before the ledger tests",
             "Deploys go out on Tuesdays",
@@ -447,32 +746,98 @@ mod tests {
             "make e2e runs the browser tests; they take about 4 minutes",
             "Releases are built by the release workflow for macOS and Linux with musl",
         ];
-        let vectors = model.embed(&passages).unwrap();
-        assert_eq!(vectors[0].len(), 384);
+        let vectors = models.embed_passages(&passages).unwrap();
+        assert_eq!(vectors[0].len(), 1024);
         let length: f32 = vectors[0].iter().map(|x| x * x).sum();
-        assert!((length - 1.0).abs() < 1e-4);
+        assert!((length - 1.0).abs() < 1e-3);
+        // Whether the reranker holds the passage for an answer too: it
+        // doesn't take "release day" for when deploys go out.
         let queries = [
-            ("start the db", 0),
-            ("release day", 1),
-            ("flaky tests", 2),
-            ("money rounding", 3),
-            ("how long do end to end tests take", 4),
-            ("static linux binary build", 5),
+            ("start the db", 0, true),
+            ("release day", 1, false),
+            ("flaky tests", 2, true),
+            ("money rounding", 3, true),
+            ("how long do end to end tests take", 4, true),
+            ("static linux binary build", 5, true),
         ];
-        for (query, want) in queries {
-            let asked = &model.embed(&[query]).unwrap()[0];
+        for (query, want, answers) in queries {
+            let asked = models.embed_query(query).unwrap();
             let scores: Vec<f32> = vectors
                 .iter()
-                .map(|vector| vector.iter().zip(asked).map(|(a, b)| a * b).sum())
+                .map(|vector| vector.iter().zip(&asked).map(|(a, b)| a * b).sum())
                 .collect();
-            eprintln!("{query}: {scores:?}");
-            let best = scores
-                .iter()
-                .enumerate()
-                .max_by(|a, b| a.1.total_cmp(b.1))
-                .unwrap()
-                .0;
-            assert_eq!(best, want, "{query}: {scores:?}");
+            let best = |scores: &[f32]| {
+                scores
+                    .iter()
+                    .enumerate()
+                    .max_by(|a, b| a.1.total_cmp(b.1))
+                    .unwrap()
+                    .0
+            };
+            assert_eq!(best(&scores), want, "{query}: {scores:?}");
+            let reranked = models.rerank(query, &passages).unwrap().unwrap();
+            eprintln!("{query}: {scores:?} {reranked:?}");
+            if answers {
+                assert_eq!(best(&reranked), want, "{query}: {reranked:?}");
+                assert!(reranked[want] >= ANSWERS_FROM, "{query}: {reranked:?}");
+            }
+        }
+        let nothing = models
+            .rerank("kubernetes ingress certificate renewal", &passages)
+            .unwrap()
+            .unwrap();
+        assert!(
+            nothing.iter().all(|score| *score < ANSWERS_FROM),
+            "{nothing:?}"
+        );
+    }
+
+    /// Runs the real models from several threads at once, as the daemon's
+    /// connections do: each gets what one thread alone does.
+    #[test]
+    #[ignore]
+    fn the_real_models_answer_threads_running_them_at_once_alike() {
+        let root = models_dir().unwrap();
+        assert!(is_downloaded(&root), "run `crystal memory embed` first");
+        let models = Arc::new(Models::load(&root, true).unwrap());
+        let texts: Vec<String> = (0..24)
+            .map(|n| {
+                format!(
+                    "note {n}: the ledger test fails under load {}",
+                    "now and then ".repeat(n)
+                )
+            })
+            .collect();
+        let alone = |models: &Models, texts: &[String]| {
+            let texts: Vec<&str> = texts.iter().map(String::as_str).collect();
+            let mut all = models.embed_passages(&texts).unwrap().concat();
+            all.extend(models.embed_query("flaky ledger tests").unwrap());
+            all.extend(
+                models
+                    .rerank("flaky ledger tests", &texts[..10])
+                    .unwrap()
+                    .unwrap(),
+            );
+            all
+        };
+        let want = alone(&models, &texts);
+        let threads: Vec<_> = (0..4)
+            .map(|_| {
+                let (models, texts) = (models.clone(), texts.clone());
+                std::thread::spawn(move || {
+                    (0..3).map(|_| alone(&models, &texts)).collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        for thread in threads {
+            for got in thread.join().unwrap() {
+                let worst = got
+                    .iter()
+                    .zip(&want)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0, f32::max);
+                assert!(worst < 1e-3, "off by {worst}");
+            }
         }
     }
 }

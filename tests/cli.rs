@@ -371,8 +371,15 @@ const PLAIN_GIT: [(&str, &str); 2] = [
     ("GIT_CONFIG_NOSYSTEM", "1"),
 ];
 
-/// No sound from any daemon a test starts, whatever its config says.
-const QUIET: [(&str, &str); 1] = [("CRYSTAL_NO_SOUND", "1")];
+/// No sound from any daemon a test starts, whatever its config says; and
+/// none of memory's models, which search by meaning is on for by default: a
+/// cache with none of them in it, and no daemon downloading them as it
+/// starts (a test that asks for them gives a cache of its own).
+const QUIET: [(&str, &str); 3] = [
+    ("CRYSTAL_NO_SOUND", "1"),
+    ("XDG_CACHE_HOME", "/nonexistent/crystal-tests/cache"),
+    ("CRYSTAL_NO_MODEL_DOWNLOAD", "1"),
+];
 
 /// Runs git in `dir` the way the tests need it, failing the test if git
 /// fails, and returns what it printed.
@@ -5835,7 +5842,7 @@ fn search_by_meaning_without_its_model_goes_by_words_and_says_how_to_get_it() {
     let found = String::from_utf8_lossy(&out.stdout);
     assert!(found.contains("Deploys go out on Tuesdays"), "{found}");
     let said = String::from_utf8_lossy(&out.stderr);
-    assert!(said.contains("`crystal memory embed` gets it"), "{said}");
+    assert!(said.contains("`crystal memory embed` does now"), "{said}");
 }
 
 #[test]
@@ -9114,7 +9121,7 @@ fn with_github_switched_off_gh_is_never_asked_until_it_s_on_again() {
 #[test]
 fn the_settings_view_changes_the_config_and_follows_it_live() {
     let crystal = Crystal::new();
-    crystal.configure("notify = false\n");
+    crystal.configure("notify = false\n\n[memory]\nembeddings = false\n");
     // The daemon the TUI starts gets a curl that can't download anything,
     // and a cache of the test's own with no model in it.
     let bin = crystal.dir.path().join("curl-bin");
@@ -9136,7 +9143,7 @@ fn the_settings_view_changes_the_config_and_follows_it_live() {
 
     tui.type_keys(",");
     tui.shows("○ notifications");
-    tui.shows("not downloaded (134 MB)");
+    tui.shows("not downloaded (2449 MB)");
     tui.type_keys(" ");
     tui.shows("● notifications");
     assert!(config().starts_with("notify = true\n"), "{}", config());
@@ -9152,10 +9159,12 @@ fn the_settings_view_changes_the_config_and_follows_it_live() {
     assert!(config().contains("theme = \"vesper\""), "{}", config());
 
     // Changed by hand, the file is shown as it is now.
-    crystal.configure("notify = true\ntheme = \"light\"\n\n[memory]\ndistill = false\n");
+    crystal.configure(
+        "notify = true\ntheme = \"light\"\n\n[memory]\ndistill = false\nembeddings = false\n",
+    );
     tui.shows("○ distill closed tasks");
 
-    // Turned on, search by meaning has the daemon get the model, and the
+    // Turned on, search by meaning has the daemon get the models, and the
     // view follows how that goes: here, a download that fails.
     tui.type_keys("jjj ");
     tui.shows("● search by meaning");
@@ -9164,7 +9173,7 @@ fn the_settings_view_changes_the_config_and_follows_it_live() {
         "{}",
         config()
     );
-    tui.shows("couldn't get it ready");
+    tui.shows("couldn't get them ready");
 
     tui.type_keys("\x1b");
     tui.hides("search by meaning");

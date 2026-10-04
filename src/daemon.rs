@@ -169,12 +169,13 @@ pub fn run(socket: &Path, handover: Option<RawFd>) -> Result<()> {
     // Once the sessions are back, or carried on: a daemon handed over to
     // starts up as any other does.
     hooks.start_up();
-    // With search by meaning on, the model is loaded and every entry
-    // without a vector given one now, rather than when a session starts.
-    thread::spawn({
-        let socket = socket.to_path_buf();
-        move || embed_waiting(&socket)
-    });
+    // With search by meaning on, the models are got ready now, rather than
+    // when a session starts: downloaded if they aren't here (unless
+    // `CRYSTAL_NO_MODEL_DOWNLOAD` is set, as in crystal's tests), loaded, and
+    // every entry without a vector given one.
+    if memory::enabled_now() && settings().memory.embeddings {
+        daemon.prepare_embeddings(std::env::var_os("CRYSTAL_NO_MODEL_DOWNLOAD").is_none());
+    }
     thread::spawn({
         let daemon = daemon.clone();
         move || daemon.keep_up()
@@ -1373,10 +1374,10 @@ impl Daemon {
     fn embedding_status(&self) -> Result<embed::Status> {
         let settings = settings().memory;
         embed::let_go_unless(&settings);
-        let on_disk = embed::model_dir().map_or(0, |dir| embed::on_disk(&dir));
+        let on_disk = embed::models_dir().map_or(0, |dir| embed::on_disk(&dir));
         let (entries, embedded) = memory::Store::open(&self.socket)?.counts(embed::MODEL)?;
         if embed::is_loaded() && embedded < entries {
-            self.prepare_embeddings();
+            self.prepare_embeddings(true);
         }
         let preparing = self.preparing.lock().unwrap();
         Ok(embed::Status {
@@ -1390,18 +1391,19 @@ impl Daemon {
         })
     }
 
-    /// Gets the model that searches memory by meaning ready, on a thread of
-    /// its own, unless that's being done already: downloads it if it isn't
-    /// here, then, while the config still says to search with it, loads it
-    /// and gives every entry its vector.
-    fn prepare_embeddings(&self) {
+    /// Gets the models that search memory by meaning ready, on a thread of
+    /// their own, unless that's being done already: downloads them if they
+    /// aren't here and `download` says to, then, while the config still says
+    /// to search with them, loads them, lets go of other models' vectors and
+    /// gives every entry its vector.
+    fn prepare_embeddings(&self, download: bool) {
         {
             let mut preparing = self.preparing.lock().unwrap();
             if preparing.doing.is_some() {
                 return;
             }
             *preparing = Preparing {
-                doing: Some("downloading the model"),
+                doing: Some("downloading the models"),
                 failed: None,
             };
         }
@@ -1410,22 +1412,31 @@ impl Daemon {
         thread::spawn(move || {
             let doing = |what| preparing.lock().unwrap().doing = Some(what);
             let prepared = (|| -> Result<()> {
-                let downloaded = embed::model_dir().is_some_and(|dir| embed::is_downloaded(&dir));
+                let downloaded = embed::models_dir().is_some_and(|dir| embed::is_downloaded(&dir));
                 if !downloaded {
+                    if !download {
+                        return Ok(());
+                    }
+                    eprintln!("crystal daemon: downloading {}", embed::names());
                     embed::download(false)?;
                 }
-                doing("loading the model");
-                let Some(embedder) = embed::shared_now() else {
+                doing("loading the models");
+                let Some(models) = embed::shared_now() else {
                     return Ok(());
                 };
                 doing("embedding the entries");
-                memory::Store::open(&socket)?.embed_missing(&*embedder)?;
+                let mut store = memory::Store::open(&socket)?;
+                store.forget_vectors_but(embed::MODEL)?;
+                match store.embed_missing(&*models)? {
+                    0 => {}
+                    count => eprintln!("crystal daemon: embedded {count} entries of memory"),
+                }
                 Ok(())
             })();
             let mut preparing = preparing.lock().unwrap();
             preparing.doing = None;
             if let Err(err) = prepared {
-                eprintln!("crystal daemon: couldn't get the model ready: {err:#}");
+                eprintln!("crystal daemon: couldn't get memory's models ready: {err:#}");
                 preparing.failed = Some(format!("{err:#}"));
             }
         });
@@ -1925,7 +1936,7 @@ impl Daemon {
             Request::Distill { name } => self.distill_now(&name),
             Request::EmbeddingStatus => Ok(Response::EmbeddingStatus(self.embedding_status()?)),
             Request::PrepareEmbeddings => {
-                self.prepare_embeddings();
+                self.prepare_embeddings(true);
                 Ok(Response::Done)
             }
             Request::SearchMemory {
@@ -1941,7 +1952,7 @@ impl Daemon {
                 let found =
                     store.search(&project, &query, kind, limit, embed::as_embed(&embedder))?;
                 Ok(Response::Memory {
-                    entries: memory::freshest_first(found, &project),
+                    entries: memory::marked(found, &project),
                 })
             }
             Request::Tasks { dir, all } => {
@@ -3033,22 +3044,6 @@ fn crystal_commands(config: &Config) -> Vec<&'static str> {
         ]);
     }
     rules
-}
-
-/// Loads the embedding model, when the config says to search with it, and
-/// gives every entry without a vector one.
-fn embed_waiting(socket: &Path) {
-    if !memory::enabled_now() {
-        return;
-    }
-    let Some(embedder) = embed::shared_now() else {
-        return;
-    };
-    match memory::Store::open(socket).and_then(|mut store| store.embed_missing(&*embedder)) {
-        Ok(0) => {}
-        Ok(count) => eprintln!("crystal daemon: embedded {count} entries of memory"),
-        Err(err) => eprintln!("crystal daemon: couldn't embed memory's entries: {err:#}"),
-    }
 }
 
 /// The arguments each of a task's runs gives Claude: the task's own; in its

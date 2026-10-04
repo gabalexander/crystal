@@ -1513,15 +1513,16 @@ crystal memory embed                 # download the model that searches by meani
   repository. A project's list from before, a JSON file there, is brought in the first time it's read.
 - `search` uses SQLite's full-text index (FTS5), ranked by bm25: any of the words matches, and so does a word
   they start or stem from (`deploying` finds "Deploys go out on Tuesdays"); the entries with more of the words,
-  and rarer ones, come first, then drifting ones, and stale ones last. With
-  [search by meaning](#search-by-meaning) on, entries that mean the same count too, whatever their words.
+  and rarer ones, come first, drifting and stale ones marked where they rank. With
+  [search by meaning](#search-by-meaning), on unless you turn it off, entries that mean the same count too,
+  whatever their words, and what doesn't answer the search is left out.
 - The same thing remembered again (the same words, whatever the case or punctuation) is the one entry, seen
   again: `remembered 3 already`. Credentials in an entry, like `API_KEY=…` or a token, are taken out as it's
   kept.
 - `-f` names a file an entry is about, and can be given more than once. crystal keeps a hash of each file as it
   is then (a file that isn't there isn't counted). Once some of them change, the entry is marked drifting: it
-  may hold only in part, and it comes after the rest. Once all of them have changed, or gone, it's stale, and
-  agents aren't shown it. `crystal memory rm` it, or remember it again, which takes its files as they are now.
+  may hold only in part. Once all of them have changed, or gone, it's stale: a search marks it, and agents
+  starting aren't shown it. `crystal memory rm` it, or remember it again, which takes its files as they are now.
   The files are looked at in the worktree the entry was remembered in while that's there, and in the main
   worktree after.
 - `promote` asks first at a terminal; `--yes` doesn't. It writes to CLAUDE.md, or to AGENTS.md when that's the
@@ -1533,8 +1534,8 @@ crystal memory embed                 # download the model that searches by meani
 When an agent starts, crystal shows it the entries that have most to do with its launch: first those about files
 its worktree has changed since its branch left the default one (`origin`'s, or `main` or `master`), committed
 or not, then those that have most to do with its first prompt, or the newest when neither finds any. That's a
-few at most, in 800 bytes, the least relevant left out first; none that's stale, and drifting ones marked and
-after the rest. Each comes with its id, and a line on how to read the rest and add more:
+few at most, in 800 bytes, the least relevant left out first; none that's stale, and drifting ones marked where
+they rank. Each comes with its id, and a line on how to read the rest and add more:
 
 - Claude Code gets them in its system prompt, and reads the rest with crystal's MCP tools (below).
 - Codex gets them as its `developer_instructions` (`-c`), after the ones it has already, from a
@@ -1553,28 +1554,44 @@ and a session in a terminal would stop to ask about.
 
 #### Search by meaning
 
-Words only find words: "db" never finds "Postgres has to be running". With `embeddings = true` under
-`[memory]`, crystal also searches by what entries mean, with a small model run on your machine,
-[BAAI/bge-small-en-v1.5](https://huggingface.co/BAAI/bge-small-en-v1.5) through
-[Candle](https://github.com/huggingface/candle): no API, no key, and nothing leaves the machine.
+Words only find words: "db" never finds "Postgres has to be running". So crystal also searches by what entries
+mean, with two models run on your machine through [Candle](https://github.com/huggingface/candle): no API, no
+key, and nothing leaves the machine.
+
+- [jinaai/jina-embeddings-v5-text-small](https://huggingface.co/jinaai/jina-embeddings-v5-text-small) turns
+  each entry, and each query, into a vector, so an entry that means what a query asks is found whatever its
+  words.
+- [jinaai/jina-reranker-v3](https://huggingface.co/jinaai/jina-reranker-v3) then reads the query with the 20
+  entries found best, by words and meaning together, and scores how well each answers it: what answers comes
+  first, what doesn't is left out, and a search about something the memory doesn't hold finds nothing, rather
+  than whatever is nearest.
+
+Asked 97 questions about crystal's own memory, it had the right entry among the first five for 92% of them,
+against 75% by words alone, and found nothing for most questions the memory couldn't answer.
 
 ```sh
-crystal memory embed   # once: downloads the model (134 MB), then gives every entry its vector
+crystal memory embed   # downloads both models now (2.4 GB), and gives every entry its vector
 ```
 
-- The model isn't part of crystal. `crystal memory embed` downloads it with `curl`, at a pinned revision,
-  checks each file against its SHA-256, and keeps it in `~/.cache/crystal/models/` (or `$XDG_CACHE_HOME`).
-  Until it's there, searches go by words alone, and `crystal memory search` says so.
+- The models aren't part of crystal. The daemon downloads them in the background as it starts, when they
+  aren't there yet, or `crystal memory embed` does now: with `curl`, at pinned revisions, each file checked
+  against its SHA-256, kept in `~/.cache/crystal/models/` (or `$XDG_CACHE_HOME`). Until they're there,
+  searches go by words alone, and `crystal memory search` says so.
+- They run on a Mac's GPU (Metal), or on the CPU elsewhere; `CRYSTAL_MODELS_ON_CPU=1` keeps them on the CPU
+  on a Mac too. The daemon keeps them loaded, about 2.5 GB, once for every client: `crystal memory search`
+  and every task's `memory_search` ask it, and only search in their own process when no daemon is running. A
+  search takes about half a second on an Apple silicon Mac, most of it the reranker's; on a CPU, a few
+  seconds.
 - Each entry's vector is kept beside it in `memory.db`. An entry without one, say one just remembered, gets it
-  the first time a search needs it.
-- A search ranks by words (bm25) and by meaning (the model), and merges the two by reciprocal rank fusion, so
-  an entry high in both comes first. By meaning, only the entries close to the best match count: the model's
-  scores sit close together, and one far behind the best is a match in name only.
-- The daemon keeps the model loaded (about 150 MB), once for every client: `crystal memory search` and every
-  task's `memory_search` ask it, and only search in their own process when no daemon is running. What a
-  session is shown as it starts, and what the distiller is shown the memory has already, go by meaning too.
-- It finds paraphrases and near-synonyms that words miss, but it's a small model: a one-word query can rank
-  oddly, and a query about something the memory doesn't hold still brings back what's nearest.
+  the first time a search needs it, and vectors from a model crystal no longer uses are let go.
+- A search ranks by words (bm25) and by meaning, and merges the two by reciprocal rank fusion, so an entry
+  high in both comes first; by meaning, only the entries close to the best match count. Then the reranker
+  reads the first 20: when not even the best answers the query, the search finds nothing; otherwise the ones
+  it rules out are left out, and its ranking is merged in too. What a session is shown as it starts, and what
+  the distiller is shown the memory has already, go the same way.
+- Both models are licensed [CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/): yours to use,
+  but not commercially. `embeddings = false` under `[memory]` turns search by meaning off, and `rerank =
+  false` leaves the reranker out: faster on a CPU, but a search then always brings back what's nearest.
 
 #### The distiller
 
@@ -1603,7 +1620,8 @@ ends, commands that work, traps. It's one `claude -p` run on Haiku, in the backg
 distill = true                      # false to turn it off
 distill_model = "claude-haiku-4-5"  # the model, as `claude --model` takes it
 distill_budget_usd = 0.25           # the most one task's pass may spend
-embeddings = false                  # true to search by meaning too: see above
+embeddings = true                   # false to search by words alone: see above
+rerank = true                       # false to leave the reranker out
 ```
 
 ### Tasks
@@ -2228,11 +2246,11 @@ keeping the rest of it as you wrote it, comments and all, and counts straight aw
 theme, and the daemon reads the rest as it goes.
 
 While it's open, the view reads the file and asks the daemon again every half a second, so it follows a
-change made by hand in the file too, and shows how the model that searches by meaning stands: downloading
-(`42 of 134 MB`), loaded in the daemon or not, and how many entries have their vector. Turning search by
-meaning on has the daemon get the model ready: it downloads it if it isn't here, loads it and gives every
-entry its vector, and `enter` on that row does it again. Turned off, the daemon lets the model go, and the
-memory it took with it.
+change made by hand in the file too, and shows how the models that search by meaning stand: downloading
+(`42 of 2449 MB`), loaded in the daemon or not, and how many entries have their vector. Turning search by
+meaning on has the daemon get the models ready: it downloads them if they aren't here, loads them and gives
+every entry its vector, and `enter` on that row does it again. Turned off, the daemon lets the models go, and
+the memory they took with them.
 
 #### Profiles
 
