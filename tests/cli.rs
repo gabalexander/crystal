@@ -7438,19 +7438,20 @@ fn pull_requests_are_marked_merged_or_conflicting_and_counted_in_the_top_bar() {
     tui.type_keys("\x1b");
     tui.hides("pull requests · app");
 
-    // Hidden in the settings, drafts leave the list and the count.
-    tui.resize(40, 100);
+    // Hidden in the settings, drafts leave the list and the count. Its row
+    // is the last, below what 24 rows show: it's found by moving down.
     tui.type_keys(",");
-    tui.shows("hide drafts");
+    tui.shows("○ notifications");
     tui.type_keys("jjjjjjjj ");
-    tui.shows("● hide drafts");
-    let config = std::fs::read_to_string(crystal.config_file()).unwrap();
-    assert!(
-        config.contains("[forge]\nhide_draft_prs = true"),
-        "{config}"
-    );
-    tui.type_keys("\x1b");
+    let config = || std::fs::read_to_string(crystal.config_file()).unwrap();
+    eventually("hiding drafts is written down", || {
+        config().contains("[forge]\nhide_draft_prs = true")
+    });
+    // The count follows at once, the settings still open; an `O` typed
+    // before the Esc has closed them would be read with it as Alt+O.
     tui.shows("1 session · 1 pr · 2 issues");
+    tui.type_keys("\x1b");
+    tui.hides("○ notifications");
     tui.type_keys("O");
     tui.shows("1 open · 1 draft hidden");
     tui.shows("Fix the login redirect");
