@@ -1,107 +1,55 @@
 //! A one-line text box: the text typed so far, and where the cursor is.
+//! Its editing is [`editing`]'s, which the box of several lines shares.
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use super::editing::{self, Editor};
+use crossterm::event::KeyEvent;
 
 #[derive(Debug, Default)]
 pub struct TextInput {
-    text: String,
-    /// The cursor's place, counted in characters from the start. It sits
-    /// before the character at that place, or at the end.
-    cursor: usize,
+    editor: Editor,
 }
 
 impl TextInput {
     /// A box that starts out holding `text`, with the cursor at its end.
     pub fn with_text(text: &str) -> TextInput {
         TextInput {
-            text: text.to_string(),
-            cursor: text.chars().count(),
+            editor: Editor::with_text(text),
         }
     }
 
     pub fn text(&self) -> &str {
-        &self.text
+        self.editor.text()
     }
 
+    /// The cursor's place, counted in characters from the start.
     pub fn cursor(&self) -> usize {
-        self.cursor
+        self.editor.cursor()
     }
 
-    /// Edits the text for `key`: a character goes in at the cursor,
-    /// Backspace and Delete take out the character before or after it,
-    /// Ctrl+U everything before it, as in a shell, and the arrows, Home and
-    /// End move it. Other keys do nothing.
+    /// Edits the text for `key` the way a shell's line does: a character
+    /// goes in at the cursor, and the rest are [`editing::edit_for`]'s
+    /// keys, Backspace, `Ctrl+W` and the arrows among them. Other keys do
+    /// nothing.
     pub fn on_key(&mut self, key: &KeyEvent) {
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        match key.code {
-            KeyCode::Char('u') if ctrl => self.clear_before_cursor(),
-            KeyCode::Char(c) if !ctrl => self.insert(c),
-            KeyCode::Backspace => self.backspace(),
-            KeyCode::Delete => self.delete(),
-            KeyCode::Left => self.cursor = self.cursor.saturating_sub(1),
-            KeyCode::Right => self.cursor = (self.cursor + 1).min(self.len()),
-            KeyCode::Home => self.cursor = 0,
-            KeyCode::End => self.cursor = self.len(),
-            _ => {}
+        if let Some(edit) = editing::edit_for(key) {
+            self.editor.apply(edit);
         }
     }
 
     /// Puts `text` in at the cursor, the way a paste does. The box holds
     /// one line, so the text's line breaks become spaces.
     pub fn insert_str(&mut self, text: &str) {
-        for c in text.trim_end_matches(['\r', '\n']).chars() {
-            let c = if c == '\n' || c == '\r' { ' ' } else { c };
-            self.insert(c);
-        }
-    }
-
-    fn insert(&mut self, c: char) {
-        let at = self.byte_index(self.cursor);
-        self.text.insert(at, c);
-        self.cursor += 1;
-    }
-
-    fn backspace(&mut self) {
-        if self.cursor == 0 {
-            return;
-        }
-        self.cursor -= 1;
-        let at = self.byte_index(self.cursor);
-        self.text.remove(at);
-    }
-
-    fn clear_before_cursor(&mut self) {
-        let at = self.byte_index(self.cursor);
-        self.text.replace_range(..at, "");
-        self.cursor = 0;
-    }
-
-    fn delete(&mut self) {
-        if self.cursor < self.len() {
-            let at = self.byte_index(self.cursor);
-            self.text.remove(at);
-        }
-    }
-
-    /// The length in characters, which is what the cursor counts in.
-    fn len(&self) -> usize {
-        self.text.chars().count()
-    }
-
-    /// Where the character at `place` starts, in bytes. A Rust string is
-    /// UTF-8, where one character can take several bytes, so the two
-    /// counts differ as soon as there's an `é` in the text.
-    fn byte_index(&self, place: usize) -> usize {
-        match self.text.char_indices().nth(place) {
-            Some((index, _)) => index,
-            None => self.text.len(),
-        }
+        let line = text
+            .trim_end_matches(['\r', '\n'])
+            .replace(['\r', '\n'], " ");
+        self.editor.insert_str(&line);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::{KeyCode, KeyModifiers};
 
     fn press(input: &mut TextInput, code: KeyCode) {
         input.on_key(&KeyEvent::new(code, KeyModifiers::NONE));
@@ -173,6 +121,26 @@ mod tests {
         press(&mut input, KeyCode::Left);
         input.on_key(&KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
         assert_eq!((input.text(), input.cursor()), ("fix", 0));
+    }
+
+    #[test]
+    fn words_are_deleted_and_crossed_as_in_a_shell() {
+        let mut input = typed("feat/text-boxes");
+        input.on_key(&KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert_eq!((input.text(), input.cursor()), ("feat/text-", 10));
+        input.on_key(&KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT));
+        input.on_key(&KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
+        assert_eq!((input.text(), input.cursor()), ("feat/", 5));
+        input.on_key(&KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        input.on_key(&KeyEvent::new(KeyCode::Char('d'), KeyModifiers::ALT));
+        assert_eq!((input.text(), input.cursor()), ("/", 0));
+    }
+
+    #[test]
+    fn a_paste_is_one_line() {
+        let mut input = typed("a");
+        input.insert_str("b\nc\n");
+        assert_eq!((input.text(), input.cursor()), ("ab c", 4));
     }
 
     #[test]
