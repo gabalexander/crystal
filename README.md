@@ -153,7 +153,7 @@ and the footer says where you are and offers the keys that matter there, or, whe
 | `w` | the same, in a new worktree on a branch with a made-up name, like `brave-otter` |
 | `W` | remove the selected worktree, once nothing runs in it and you've said `y` |
 | `r` | rename the selected session |
-| `x` | kill the selected session, once you've said `y` |
+| `x` | kill the selected session, once you've said `y`; the last in a linked worktree asks whether the worktree goes too |
 | `A` | [archive](#archiving-and-idle-agents) the selected session, once you've said `y`: it stops and leaves the list, to start again where it was |
 | `Z` | the archive: start an archived session again, in its conversation, or delete it |
 | `!` | run the selected worktree's [project](#projects), with its `run` command, in a terminal of its own; again, stop it |
@@ -297,8 +297,11 @@ off floats up out of its split, and `s` on the one floating puts it down into a 
 pane was.
 
 The sidebar groups sessions by project, then by worktree: `⌂` marks a repository's main worktree and `⎇` a
-linked one, each named by its branch. Sessions outside any repository come last, under their directory.
-`w` makes its worktree in the selected session's project, or in the repository you started `crystal` in.
+linked one, each named by its branch, or by the label it was given (`crystal worktree create --label`), then
+its branch. Sessions outside any repository come last, under their directory. `w` makes its worktree in the
+selected session's project, or in the repository you started `crystal` in. Killing the last session in a
+linked worktree with `x` asks next whether the worktree goes too: `y` removes it, as `W` would, and any other
+key keeps it.
 
 A linked worktree with no sessions left stays at the end of its project, with a `· no sessions` row under it,
 until it's removed: it's still on disk, maybe with work in it. Select it, and `n` or `Enter` starts something
@@ -439,6 +442,10 @@ crystal new -d -e PORT=4000 npm run dev     # with a variable set in its environ
 crystal task "update the docs"              # run Claude without a terminal, in the background (see below)
 crystal result task                         # a task's answer
 crystal answer task y                       # allow what a task asks for: y, n or always
+crystal worktree list                       # this project's worktrees and the sessions in each
+crystal worktree create spike --label "try sqlite"   # a worktree on its own, its directory printed
+crystal worktree open spike claude          # start a session in a worktree, by its branch or directory
+crystal worktree move fix/login             # move this session into a worktree, its agent carried on there
 crystal worktree rm fix/login               # remove that worktree, once nothing runs in it
 crystal ls                                  # list sessions and how they're doing
 crystal ls --json                           # the same, as JSON, for scripts and agents
@@ -485,7 +492,8 @@ review  exited 0  41388  app      main       ~/code/app                      cod
 ```
 
 `crystal new -w <branch>` makes the worktree beside the repository, in `<repo>.worktrees/<branch>`, with any
-`/` in the branch made a `-`. A branch that does exist is checked out as it is. One that doesn't yet starts
+`/` in the branch made a `-`; with `directory` under `[worktrees]` in the [settings](#settings), in that
+directory instead, each project's in a directory named after it, like `~/worktrees/app/fix-login`. A branch that does exist is checked out as it is. One that doesn't yet starts
 from `origin`'s default branch, fetched first, so it's what everyone else has as `main`, not whatever your
 checkout last pulled; it follows no branch of `origin`'s, so its first `git push` makes a branch of its own.
 `--base <ref>` starts it somewhere else: a branch (`origin`'s copy, fetched, when it has one), a tag, a commit,
@@ -493,6 +501,23 @@ or `HEAD` for the commit you're on. `base` under `[worktrees]` in the [settings]
 every new worktree you don't give a base, the TUI's included, and a project without that branch starts from the
 default. Offline, it's `origin`'s branch as your last fetch left it, and with no `origin`, the commit you're on.
 A [flow](#flows) makes its worktree from the branch as last fetched, without fetching.
+
+`crystal worktree create [<branch>]` makes a worktree on its own, the way `-w` does, and prints its
+directory: with no branch, a new one with a made-up name, like `brave-otter`; `--base` as for `-w`; `--path
+<dir>` to make it there instead; and `--label <text>`, a few words on what it's for, which the sidebar names it
+by. `crystal worktree label <worktree> <text>` changes a label, and `""` takes it off; it's kept in the
+worktree's own git directory, so it goes with the worktree. `crystal worktree open <worktree>` starts a
+session in a worktree you have, given its branch or its directory, as `crystal new` would there: your shell,
+or the command after it. `crystal worktree list` lists the project's worktrees, the main one first, with each
+one's label and how many sessions run in it (`--json` for their names).
+
+`crystal worktree move [<branch>]` moves a session, the one it's run in unless `-n` names another, into a
+worktree of its project: the one on that branch, or else a new one, made as `create` makes it. Its program
+stops and starts again there, under its name, an agent in its conversation (Claude Code and Codex are told
+where they are now, and to carry on). An agent in the middle of a turn moves once the turn ends, so an agent
+can run it about itself: Claude Code is told to, when you ask it to work in a worktree, rather than make one
+of its own, then end its turn. What it changed and didn't commit stays where it was. A background task can't
+move, and a move still to come is carried over `crystal restart-server`, but not a cold restart.
 
 `crystal worktree rm` (or `W` in the TUI) takes the worktree's directory or its branch, refuses while a
 session is still running in it, and leaves the rest to `git worktree remove`, which keeps a worktree with
@@ -504,7 +529,24 @@ doesn't stop it, and neither does `crystal restart-server`. Every TUI's sidebar 
 TUI, `crystal worktree rm`, or this one before you quit and opened it again; and `W` leaves it be meanwhile.
 
 To set a new worktree up, say install its dependencies or copy in an `.env`, have a [plugin](#plugins) run a
-command on `worktree.created`, and on `worktree.removed` to tidy up after it.
+command on `worktree.created`, and on `worktree.removed` to tidy up after it. What a worktree has outside its
+directory, a port, a database, a route, is the repository's business, so a repository can name two programs of
+its own in git config instead, which the daemon runs once crystal has made a worktree, or removed one:
+
+```sh
+git config crystal.worktreeCreateHook ~/bin/worktree-setup
+git config crystal.worktreeDeleteHook ~/bin/worktree-cleanup
+```
+
+`--global` names one for every repository, and a repository's own wins. They're never read from a file in the
+worktree, which would run whatever a clone brought with it. Each is run as it's named, not by a shell, with the
+main worktree and the worktree as its arguments, in the main worktree (a removed one has gone), and with
+`CRYSTAL_HOOK` (`worktree-create` or `worktree-delete`), `CRYSTAL_WORKTREE` and `CRYSTAL_WORKTREE_BRANCH` set.
+They run one at a time, in the order things happened, and only for worktrees crystal made or removed, not for
+those made or removed outside it; making one starts the daemon if it isn't running. What they print goes to `worktree-hooks.log` in crystal's state directory.
+One that fails, or runs past 30 seconds, when it's stopped with everything it started, is a
+`worktree.hook_failed` event in the [timeline](#timeline): the worktree is made, or gone, already. The
+daemon runs them with its own environment, not a login shell's, so a hook that needs your `PATH` sets it.
 
 `crystal new` with no command starts your shell: the one `default_shell` under `[terminal]` in the
 [settings](#terminals-the-window-and-the-tab-bar) names, or else `$SHELL`, as a login shell on a Mac. `--env
@@ -2233,9 +2275,9 @@ after it; that task ticks the item off when it closes done.
 ### Flows
 
 A flow is a chain of [tasks](#tasks) on one goal: plan it, build it in a worktree, review it, open the pull
-request. Each step runs with a [profile](#profiles) of its own and starts once the step before it is done,
-given what that step answered. A step can stop the flow at a gate until you've looked at what it did, then
-you go on, or send it back with notes.
+request. Each step runs with a [profile](#profiles) of its own, or an agent, model and effort it sets itself,
+and starts once the step before it is done, given what that step answered. A step can stop the flow at a gate
+until you've looked at what it did, then you go on, or send it back with notes.
 
 Flows are written in the config file, a `[[flow]]` table each, with a `[[flow.step]]` table for each step.
 `crystal flow example` prints this one, with the profiles it runs with, ready to copy in:
@@ -2254,6 +2296,7 @@ prompt = "Plan how to do this: {goal}. Answer with the files to change and how, 
 name = "implement"
 profile = "builder"
 placement = "fresh"
+accept = ["The tests pass", "The work is committed"]
 prompt = """
 Do this: {goal}
 
@@ -2274,6 +2317,7 @@ prompt = "Review the changes on this branch against what was asked: {goal}"
 [[flow.step]]
 name = "pr"
 profile = "shipper"
+model = "sonnet"
 prompt = "Push this branch and open a pull request for it with `gh pr create --fill`."
 ```
 
@@ -2281,7 +2325,11 @@ prompt = "Push this branch and open a pull request for it with `gh pr create --f
 |---|---|
 | `name` | what the step is called; its session is named after the run and it, like `ship-1-plan` |
 | `profile` | optional: the [profile](#profiles) it runs with: agent, model, mode, arguments, instructions, prompt; left out, Claude Code as it's set up |
+| `agent` | optional: the agent it runs, like `codex`, in place of its profile's; on an agent other than its profile's, it keeps only the profile's prompt and instructions |
+| `model`, `effort`, `mode` | optional: its agent's model, how hard it thinks and how it asks before acting, in place of its profile's, checked as a profile's are |
+| `background` | optional: `false` runs Claude Code in a terminal rather than the background; left out, Claude Code runs in the background and any other agent in a terminal, and only Claude Code can |
 | `prompt` | what it's asked, with the names below filled in |
+| `accept` | optional: its [acceptance criteria](#tasks), a list of what has to hold before it's done: its agent is told them under its prompt, and its task carries them |
 | `placement` | optional: where it runs, below; left out, where the step before it ran, and the first where the run started |
 | `worktree` | optional: `true` is `placement = "fresh"`, as it was first written |
 | `gate` | optional: `true` stops the flow after it until you go on, or send the flow back |
@@ -2326,12 +2374,12 @@ crystal flow cancel ship-1           # cancel its step's task, and go no further
 crystal flow defs                    # the flows a run started here finds, and where each is written
 ```
 
-- A step whose profile is Claude Code's runs as a [background task](#background-tasks), so nobody is there to
-  say yes to a permission: give it a profile that allows what it needs, with `mode` and `args`. A step on any
-  other agent, like Codex, runs in a terminal, a session with the step as its [task](#tasks), and the flow goes
-  on once that task closes: done with its summary as the step's answer, or failed. An agent that can't be given
-  a prompt to start on, like Aider, can't be a step. Each step's task goes into the project's
-  [history](#tasks) as `ship-1 plan: <goal>`.
+- A step on Claude Code runs as a [background task](#background-tasks), so nobody is there to say yes to a
+  permission: give it a profile that allows what it needs, with `mode` and `args`. A step on any other agent,
+  like Codex, or on Claude Code with `background = false`, runs in a terminal, a session with the step as its
+  [task](#tasks), where you can watch it and answer it, and the flow goes on once that task closes: done with
+  its summary as the step's answer, or failed. An agent that can't be given a prompt to start on, like Aider,
+  can't be a step. Each step's task goes into the project's [history](#tasks) as `ship-1 plan: <goal>`.
 - Sending the flow back runs the step it goes back to again, in a new round: a background step as a follow-up
   in its own conversation, a step in a terminal in a new session, with the old one left for you to read. Then
   the steps after it run again. In a gate's last round, `max_rounds`, it can't be sent back: approve it, or
@@ -2547,6 +2595,7 @@ matched anywhere in the link unless `^` and `$` pin it. `X` lists each plugin's 
 | `flow.ended` | a flow run ends: every step done, one failed, or you cancelled it |
 | `worktree.created` | crystal makes a worktree |
 | `worktree.removed` | crystal removes one |
+| `worktree.hook_failed` | a [worktree hook](#usage) failed, or ran too long |
 | `handoff.added` | a note goes in a worktree's handoff file: `crystal handoff`, or a task closing there |
 | `memory.added` | an entry is added to a project's memory: remembered, or by the distiller |
 | `memory.forgotten` | an entry is forgotten |
@@ -2566,9 +2615,10 @@ and its name in `CRYSTAL_EVENT`:
 ```
 
 `task.closed` has a `task`, with its `goal`, `session`, `project`, `branch` and `outcome` (whether it `failed`,
-its `summary`, and when it `closed`). The worktree events have a `worktree`, with its `path`, `branch` and,
-once it's made, `project`. `session.message` has a `message`, with its first `line` and, when another session
-sent it, that session's name (`from`) and id (`from_id`). The rest are under [events](#events).
+its `summary`, and when it `closed`). The worktree events have a `worktree`, with its `path`, `branch` and
+`project`, and for `worktree.hook_failed`, `why`. `session.message` has a `message`, with its first `line` and,
+when another session sent it, that session's name (`from`) and id (`from_id`). The rest are under
+[events](#events).
 
 `crystal plugin run <name> --event <event>` runs the plugin's hooks on that event, here and now, whether the
 plugin is on or not, on a made-up event with everything its kind carries, about the session `--session` names,
@@ -2610,7 +2660,7 @@ file and change. A setting crystal doesn't know is an error that names it, so a 
 | `[tasks]` | | what [background tasks](#background-tasks) may spend: `max_budget_usd` each (`5`), `daily_budget_usd` all together (none); and what they may do without asking: `permission_mode` (`"default"`), `allowed_tools` (none) and `allow_bypass` (`false`) |
 | `[events]` | | `keep_days`, how long the [event log](#events) keeps what happened: 30 days, or `0` for ever |
 | `[handoff]` | | `in_git`, the projects, by their main worktree, whose [handoff notes](#the-handoff-file) go in git |
-| `[worktrees]` | | `base`, the branch new worktrees' new branches [start from](#usage): `origin`'s default branch unless set |
+| `[worktrees]` | | `base`, the branch new worktrees' new branches [start from](#usage): `origin`'s default branch unless set; `directory`, where new worktrees [go](#usage), each project's in a directory of its own, from `/` or `~`: beside the project, in `<repo>.worktrees`, unless set |
 | `[forge]` | | `hide_draft_prs`, leave draft pull requests out of [the pull requests](#pull-requests), the tab bar's count and `/` (`false`) |
 | `[sessions]` | | `stop_idle_after`, how long an agent may sit [idle](#archiving-and-idle-agents) before crystal stops it, like `"30m"`: `"off"`; `restart_spacing_ms`, how far apart the agents a [crash or a reboot](#usage) starts again start (`250`, or `0` for all at once) |
 | `[[project]]` | | a project's [run and open commands](#projects), by its main worktree's `path`, in place of its own file's |

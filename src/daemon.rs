@@ -2,6 +2,7 @@
 //! terminal it was started from, so sessions keep running when the
 //! client goes away.
 
+mod moving;
 mod removal;
 
 use crate::agent_rules;
@@ -50,7 +51,9 @@ use crate::task;
 use crate::tasks;
 use crate::typing;
 use crate::vt;
+use crate::worktree_hooks;
 use anyhow::{Context, Result, anyhow, bail, ensure};
+use moving::Move;
 use regex::Regex;
 use removal::Removal;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -127,6 +130,7 @@ pub fn run(socket: &Path, handover: Option<RawFd>) -> Result<()> {
     };
     let events = Arc::new(Bus::new(socket));
     let hooks = plugin_hooks::follow(&events, socket);
+    worktree_hooks::follow(&events, socket);
     // A rules file of the user's that can't be used is said in the log,
     // each time it's read.
     agent_rules::log_problems();
@@ -156,6 +160,7 @@ pub fn run(socket: &Path, handover: Option<RawFd>) -> Result<()> {
         sends: messages::Guard::default(),
         projects: Mutex::default(),
         removals: Mutex::default(),
+        moves: Mutex::default(),
     });
     // A daemon starts again after every upgrade, or is handed over to the
     // new crystal, so this is where the skill an earlier crystal installed
@@ -306,6 +311,9 @@ struct Daemon {
     /// The worktrees being removed, with who's waiting to hear each is
     /// done. Taken after `sessions` and `flows`, never before them.
     removals: Mutex<Vec<Removal>>,
+    /// The sessions on their way into other worktrees. Taken after
+    /// `sessions`, never before it.
+    moves: Mutex<Vec<Move>>,
 }
 
 /// The projects the sessions run in that are on the list already, as
@@ -578,6 +586,7 @@ impl Daemon {
                     new,
                     saved.conversation,
                     saved.resume,
+                    None,
                 )?
             }
         };
@@ -692,6 +701,9 @@ impl Daemon {
                     self.write_down_closed(session, &closed);
                 }
             }
+            // Before an ended session is told of: one moving into another
+            // worktree starts again there instead.
+            self.carry_out_moves(&mut sessions);
             // Before telling the user anything: a step the flow goes on
             // from needs nobody, and a gate needs them.
             self.follow_flows(&mut sessions);
@@ -721,7 +733,11 @@ impl Daemon {
                     self.events.emit(Event::ended(&info, status));
                 }
             }
-            told_ended.retain(|id| sessions.iter().any(|session| &session.id == id));
+            // One running again under its id, moved into another worktree,
+            // is told of again when it ends.
+            told_ended.retain(|id| {
+                (sessions.iter()).any(|session| &session.id == id && !session.is_running())
+            });
             self.list_projects_of(&sessions);
             // Written while the list is still locked, so that an older list
             // can never be written after a shutdown has emptied it.
@@ -893,6 +909,7 @@ impl Daemon {
         // Held until the exec, so each removal's git is handed over either
         // running, for the next crystal to wait for, or reaped.
         let removals = self.removals.lock().unwrap();
+        let moves = self.moves.lock().unwrap();
         // What has happened so far is told, and a task that closed written
         // down, before the sessions go.
         for session in sessions.iter_mut() {
@@ -939,6 +956,7 @@ impl Daemon {
                 .iter()
                 .map(Removal::hand_over)
                 .collect::<std::io::Result<_>>()?,
+            moves: moves.iter().map(Move::hand_over).collect(),
         };
         let dir = self.socket.parent().unwrap_or(Path::new("/"));
         let file = handover::write(dir, &state)?;
@@ -964,6 +982,7 @@ impl Daemon {
             sessions: handed_sessions,
             flows,
             removals,
+            moves,
             ..
         } = handed;
         let mut sessions = self.sessions.lock().unwrap();
@@ -1011,6 +1030,7 @@ impl Daemon {
         *self.flows.lock().unwrap() = flows;
         drop(sessions);
         self.carry_on_removals(removals);
+        self.carry_on_moves(moves);
         eprintln!("crystal daemon: took over from crystal {from}: {carried} sessions carried on");
         self.events
             .emit(Event::handed_over(&from, &protocol::version(), carried));
@@ -1108,6 +1128,7 @@ impl Daemon {
         prompt: &str,
     ) -> Result<()> {
         let terminal = run.in_terminal(step);
+        let accept = run.criteria(step)?;
         // A step in a terminal goes on once its task closes.
         ensure!(
             !terminal || tasks::enabled(&settings()),
@@ -1167,11 +1188,16 @@ impl Daemon {
             )?
         };
         // As a task, it's the step, in the project's history and memory,
-        // rather than the whole of its prompt.
+        // rather than the whole of its prompt, with the step's acceptance
+        // criteria, which its prompt has under it already.
         let session = sessions.last_mut().expect("it was just started");
         if session.task_record().is_some() {
             let goal = format!("{} {}: {}", run.name, run.step_name(step), run.goal);
-            session.give_task(new_task_info(goal, !terminal, None, TaskBrief::default()));
+            let brief = TaskBrief {
+                accept,
+                ..TaskBrief::default()
+            };
+            session.give_task(new_task_info(goal, !terminal, None, brief));
             self.number_tasks(std::slice::from_mut(session));
         }
         let task = session.task_id();
@@ -1198,8 +1224,13 @@ impl Daemon {
                     configured: settings().worktrees.base,
                     fetch: false,
                 };
+                let location = git::Location {
+                    path: None,
+                    directory: settings().worktrees.directory(),
+                };
                 let branch = names::random();
-                let (worktree, branch) = git::add_new_worktree(&run.cwd, &branch, &base)?;
+                let (worktree, branch) =
+                    git::add_new_worktree(&run.cwd, &branch, &base, &location)?;
                 self.events
                     .emit(Event::worktree(true, &worktree, Some(&branch)));
                 run.worktree = Some(worktree.clone());
@@ -1853,6 +1884,7 @@ impl Daemon {
                 if let Some(prompt) = prompt {
                     self.name_from_prompt(&mut sessions, &id, &prompt);
                 }
+                let moving = self.is_moving(&id);
                 let session = with_id(&mut sessions, &id)?;
                 if let Some(conversation) = conversation {
                     session.set_hooked_conversation(&agent, conversation);
@@ -1864,10 +1896,12 @@ impl Daemon {
                 // written to it from here on is news.
                 session.check_model();
                 // Reminded that its task is open, the agent carries on: its
-                // turn hasn't ended, and it isn't done.
+                // turn hasn't ended, and it isn't done. One moving into
+                // another worktree carries on there.
                 if event == AgentEvent::TurnEnded
                     && can_remind
                     && tasks::enabled(&settings())
+                    && !moving
                     && session.remind_of_task()
                 {
                     return Ok(Response::Remind {
@@ -1961,6 +1995,7 @@ impl Daemon {
             Request::Projects => Ok(Response::Projects {
                 projects: self.known_projects()?,
             }),
+            Request::MoveSession { name, path } => self.move_session(&name, &path),
             Request::AddProject { dir } => self.list_project(&dir, true),
             Request::RemoveProject { dir } => self.list_project(&dir, false),
             Request::Removals => Ok(Response::Removals {
@@ -3069,13 +3104,16 @@ fn start(
         new,
         conversation,
         resume_command,
+        None,
     )
 }
 
 /// Starts a session under the id `id` and adds it to `sessions`. Given a
 /// `conversation`, an agent that can pick one up starts back in it; given a
 /// `resume_command`, the command an agent said resumes it, it's resumed
-/// with that instead. Never anywhere but its directory.
+/// with that instead. Never anywhere but its directory. An agent picked up
+/// in its conversation after a move into another worktree is given
+/// `moved`, which tells it so, as its next prompt: see [`moving`].
 fn start_as(
     id: String,
     sessions: &mut Vec<Session>,
@@ -3083,6 +3121,7 @@ fn start_as(
     new: NewSession,
     conversation: Option<Conversation>,
     resume_command: Option<Vec<String>>,
+    moved: Option<&str>,
 ) -> Result<String> {
     let NewSession {
         name,
@@ -3191,6 +3230,10 @@ fn start_as(
     );
     let argv = agents::with_options(argv, &claude_tools(socket, &cwd, &asked, &crystal, &config));
     let argv = codex::with_instructions(argv, &instructions, codex::home(&env).as_deref());
+    let argv = match moved.filter(|_| resume.is_some()) {
+        Some(notice) => agents::moved(argv, notice, &cwd),
+        None => argv,
+    };
     keep_scrollback();
     let mut session = Session::spawn(id, name.clone(), command, &argv, cwd, &env)?;
     if let Some(typed) = typed

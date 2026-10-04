@@ -380,7 +380,7 @@ fn tone(event: &Event, theme: &Theme) -> Color {
             Some("exited 0") => theme.muted,
             _ => theme.failed,
         },
-        Kind::PluginPaused | Kind::SessionStartFailed => theme.failed,
+        Kind::PluginPaused | Kind::SessionStartFailed | Kind::WorktreeHookFailed => theme.failed,
         Kind::DaemonRestarted => match event.daemon.as_ref() {
             Some(daemon) if !daemon.failed.is_empty() => theme.failed,
             _ => theme.muted,

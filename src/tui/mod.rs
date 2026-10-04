@@ -199,6 +199,7 @@ pub enum Event {
         project: PathBuf,
         worktrees: Vec<Worktree>,
         subjects: HashMap<PathBuf, String>,
+        labels: HashMap<PathBuf, String>,
     },
     /// The worktrees the daemon is removing, whoever asked, as it listed
     /// them.
@@ -1162,8 +1163,10 @@ impl Tui {
                 project,
                 worktrees,
                 subjects,
+                labels,
             } => {
                 self.app.set_subjects(&project, subjects);
+                self.app.set_labels(&project, labels);
                 self.app.set_worktrees(project, worktrees);
             }
             Event::Stat { path, stat } => self.app.set_stat(path, stat),
@@ -2999,9 +3002,9 @@ fn directory_for(socket: &Path, place: Place) -> Result<PathBuf> {
                 None => std::env::current_dir()?,
             };
             if made_up {
-                client::add_new_worktree(socket, &base, &branch)
+                client::add_new_worktree(socket, &base, &branch, None, None)
             } else {
-                client::add_worktree(socket, &base, &branch, None)
+                client::add_worktree(socket, &base, &branch, None, None)
             }
         }
         Place::PullRequest(checkout) => client::pull_request_worktree(socket, &checkout),
@@ -3290,6 +3293,7 @@ fn spawn_worktree_lister(
                     project,
                     worktrees: linked.worktrees,
                     subjects: linked.subjects,
+                    labels: linked.labels,
                 };
                 if events.send(listed).is_err() {
                     return;
