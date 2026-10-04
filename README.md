@@ -247,9 +247,27 @@ as waiting, and when an agent exits back to its shell, what it was doing goes wi
 
 When a session comes to need you while you're looking elsewhere (its agent asks you something, or finishes a
 turn nobody was watching), crystal shows a desktop notification, like "claude-2 is waiting on you · app
-fix/login". It uses macOS's own notifications, or `notify-send` on Linux when it's installed. You're told once
-each time a session comes to need you, and never about a session you're watching. `u` in the TUI takes you to
-it, and `U` [lists everything](#timeline) that needs you.
+fix/login". You're told once each time a session comes to need you, and never about a session you're watching:
+one shown in the TUI counts as watched only while the TUI's terminal has the focus, as most terminals say. `u`
+in the TUI takes you to it, and `U` [lists everything](#timeline) that needs you.
+
+On macOS, crystal uses [`terminal-notifier`](https://github.com/julienXX/terminal-notifier) when it's
+installed (`brew install terminal-notifier`), and macOS's own notifications otherwise; on Linux, `notify-send`.
+Clicking a notification from `terminal-notifier`, or from a `notify-send` that takes actions (libnotify 0.7.10
+on), takes you to the session: the TUI you used last selects it, hands it the keyboard and brings its terminal
+to the front (on macOS the terminal's app, on X11 its window with `xdotool`, and inside tmux its window and
+pane). The click runs `crystal pane focus --raise <session>`, which you can run yourself.
+
+Two settings, in `[notifications]`, say when to tell you; the [settings view](#the-settings-view) changes both:
+
+```toml
+[notifications]
+after_secs = 30         # only once a session has needed you this long; one answered sooner is never told
+unfocused_only = true   # only while no crystal TUI's terminal has the focus
+```
+
+`crystal notify` sends a notification of your own, through the same settings: a script's `crystal notify
+"deploy finished"`, or an agent's, which a click takes you back to its session (`-n <name>` names another).
 
 `/` finds a session by typing a little of it. The sidebar shows only the sessions that match, under their
 project and worktree, with the letters that matched marked in each name. The letters only have to turn up in
@@ -871,6 +889,7 @@ crystal new -d -n tests cargo test
 crystal pane split tests                  # beside the pane of the session this runs in; --down below it
 crystal pane split logs --beside server --down --ratio 0.7   # server keeps 70% of the room
 crystal pane focus tests                  # select it, its tab in front, and type into it; or left, right, up, down
+crystal pane focus tests --raise          # the same, and bring the TUI's terminal to the front, as a notification's click does
 crystal pane resize left 8 -n tests       # move a border of its pane, as R does; 4 columns or 2 rows by default
 crystal pane close tests                  # close its split, or put its float back
 crystal pane zoom reviewer                # zoom its tab on it; --off puts the panes back
@@ -1735,6 +1754,7 @@ file and change. A setting crystal doesn't know is an error that names it, so a 
 |---|---|---|
 | `notify` | `true` | tell you when a session needs you |
 | `notify_command` | none | a shell command to run instead of the desktop notification |
+| `[notifications]` | | when to tell you: `after_secs`, how long a session must need you first (`0`), and `unfocused_only`, only while crystal's terminal hasn't the focus (`false`): [notifications](#usage) |
 | `new_session` | `"claude"` | what the new-session panel runs at first, until you start something from it |
 | `theme` | `"dark"` | the TUI's colors: `"dark"`, `"light"`, or `"terminal"` |
 | `name_from_prompt` | `true` | name a session you don't name for the [first thing it's asked](#starting-a-session) |
@@ -1751,8 +1771,9 @@ file and change. A setting crystal doesn't know is an error that names it, so a 
 nothing and uses your terminal's own colors. With `NO_COLOR` set, crystal uses no color at all.
 
 `notify_command` is for telling you some other way, like a message to your phone. It runs with
-`CRYSTAL_NOTICE` (the line a notification would show), `CRYSTAL_NOTICE_SESSION` (the session's name) and
-`CRYSTAL_NOTICE_ACTIVITY` (`waiting` or `done`) in its environment:
+`CRYSTAL_NOTICE` (the line a notification would show), `CRYSTAL_NOTICE_SESSION` (the session's name),
+`CRYSTAL_NOTICE_ACTIVITY` (`waiting` or `done`) and `CRYSTAL_NOTICE_JUMP` (a shell command that takes you to the
+session, for a notifier that runs one when it's clicked) in its environment:
 
 ```toml
 notify_command = 'curl -s -d "$CRYSTAL_NOTICE" ntfy.sh/my-crystal'
@@ -1772,9 +1793,9 @@ settings view is open.
 
 #### The settings view
 
-`,` in the sidebar opens the settings you'd otherwise change in the file: notifications, the theme, and how
-memory learns ([the distiller](#the-distiller)) and searches ([by meaning](#search-by-meaning)). `space`
-changes the one the bar is on, and `←/→` go through the themes. Each change is written to the file at once,
+`,` in the sidebar opens the settings you'd otherwise change in the file: notifications and when they come,
+the theme, and how memory learns ([the distiller](#the-distiller)) and searches ([by meaning](#search-by-meaning)). `space`
+changes the one the bar is on, and `←/→` go through the themes and the waits before a notification. Each change is written to the file at once,
 keeping the rest of it as you wrote it, comments and all, and counts straight away: the TUI repaints in a new
 theme, and the daemon reads the rest as it goes.
 

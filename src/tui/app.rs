@@ -7717,7 +7717,7 @@ gate = true
         });
         // `x` would kill the session from the sidebar; here it's nothing.
         assert_eq!(press(&mut app, KeyCode::Char('x')), None);
-        for _ in 0..3 {
+        for _ in 0..5 {
             press(&mut app, KeyCode::Char('j'));
         }
         assert_eq!(

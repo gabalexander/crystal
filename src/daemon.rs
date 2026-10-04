@@ -441,9 +441,17 @@ impl Daemon {
             // Before telling the user anything: a step the flow goes on
             // from needs nobody, and a gate needs them.
             self.follow_flows(&mut sessions);
+            // Read only when a session has something to tell, at most once
+            // a round.
+            let mut read = None;
+            let mut after = || {
+                *read.get_or_insert_with(|| {
+                    Duration::from_secs(notify::settings().notifications.after_secs)
+                })
+            };
             for session in sessions.iter_mut() {
-                if let Some(notice) = session.notice() {
-                    notify::tell(notice);
+                if let Some(notice) = session.notice(&mut after) {
+                    notify::tell(notice, &self.socket);
                 }
                 self.tell_changes(session);
                 if !session.is_running() && told_ended.insert(session.id.clone()) {
@@ -696,11 +704,14 @@ impl Daemon {
             // A run that has just stopped needs the user as much as a gate
             // does, but its step's session has ended and can't say so.
             if run.state() == RunState::Failed {
-                notify::tell(Notice {
-                    session: run.steps[step].session.clone().unwrap_or_default(),
+                let session = run.steps[step].session.clone();
+                let notice = Notice {
+                    session: session.clone().unwrap_or_default(),
                     activity: Activity::Waiting,
                     text: format!("{} failed at {}", run.name, run.step_name(step)),
-                });
+                    jump: session,
+                };
+                notify::tell(notice, &self.socket);
             }
         }
     }
@@ -1454,6 +1465,27 @@ impl Daemon {
             }
             Request::Emit { event } => {
                 self.events.emit(*event);
+                Ok(Response::Done)
+            }
+            Request::Notify { text, id, name } => {
+                ensure!(!text.trim().is_empty(), "say what to tell the user");
+                let mut sessions = self.sessions.lock().unwrap();
+                let session = match (id, name) {
+                    (Some(id), _) => Some(with_id(&mut sessions, &id)?.name.clone()),
+                    (None, Some(name)) => Some(named(&mut sessions, &name)?.name.clone()),
+                    (None, None) => None,
+                };
+                drop(sessions);
+                let notice = Notice {
+                    text: match &session {
+                        Some(session) => format!("{session}: {text}"),
+                        None => text,
+                    },
+                    session: session.clone().unwrap_or_default(),
+                    activity: Activity::Waiting,
+                    jump: session,
+                };
+                notify::tell(notice, &self.socket);
                 Ok(Response::Done)
             }
             Request::Subscribe { .. }

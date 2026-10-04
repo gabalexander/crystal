@@ -289,12 +289,14 @@ fn pause(socket: &Path, bus: &Weak<Bus>, plugin: &str) {
     if let Some(bus) = bus.upgrade() {
         bus.emit(Event::plugin_paused(plugin, &text));
     }
-    notify::tell(Notice {
+    let notice = Notice {
         session: plugin.to_string(),
         // It's waiting on the user to look at it.
         activity: Activity::Waiting,
         text,
-    });
+        jump: None,
+    };
+    notify::tell(notice, socket);
 }
 
 #[cfg(test)]

@@ -46,6 +46,8 @@ pub struct Config {
     /// until switched on. See [`crate::plugins`].
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub plugins: BTreeMap<String, bool>,
+    /// When to tell: `[notifications]` in the file.
+    pub notifications: NotifySettings,
     /// How the memory plugin learns: `[memory]` in the file.
     pub memory: MemorySettings,
     /// What background tasks may spend: `[tasks]` in the file.
@@ -64,6 +66,19 @@ pub struct Config {
     /// tables in the file. See [`crate::flows`].
     #[serde(rename = "flow", skip_serializing_if = "Vec::is_empty")]
     pub flows: Vec<Flow>,
+}
+
+/// When the user is told a session needs them: see [`crate::notify`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct NotifySettings {
+    /// How many seconds a session has to go on needing the user before
+    /// they're told: a question answered, or a turn looked at, in that
+    /// while is never told of. 0 tells at once.
+    pub after_secs: u64,
+    /// Tell only while no crystal TUI's terminal has the focus: the user
+    /// looking at crystal sees what needs them in its sidebar.
+    pub unfocused_only: bool,
 }
 
 /// How the memory plugin learns, beyond what it's told.
@@ -172,6 +187,7 @@ impl Default for Config {
             theme: ThemeName::Dark,
             scrollback_lines: vt::DEFAULT_HISTORY_LINES,
             plugins: BTreeMap::new(),
+            notifications: NotifySettings::default(),
             memory: MemorySettings::default(),
             tasks: TaskSettings::default(),
             events: EventSettings::default(),
@@ -608,6 +624,18 @@ back_to = "build"
     }
 
     #[test]
+    fn notifications_come_at_once_whatever_has_the_focus_unless_told() {
+        let config = Config::default();
+        assert_eq!(config.notifications, NotifySettings::default());
+        assert_eq!(config.notifications.after_secs, 0);
+        assert!(!config.notifications.unfocused_only);
+        let config = parse("[notifications]\nafter_secs = 20\nunfocused_only = true\n").unwrap();
+        assert_eq!(config.notifications.after_secs, 20);
+        assert!(config.notifications.unfocused_only);
+        assert!(parse("[notifications]\ndelay = 3\n").is_err());
+    }
+
+    #[test]
     fn the_event_log_keeps_a_month_unless_told() {
         assert_eq!(Config::default().events.keep_days, 30);
         let config = parse("[events]\nkeep_days = 0\n").unwrap();
@@ -643,6 +671,10 @@ back_to = "build"
             theme: ThemeName::Terminal,
             scrollback_lines: 50_000,
             plugins: BTreeMap::from([("memory".to_string(), false)]),
+            notifications: NotifySettings {
+                after_secs: 30,
+                unfocused_only: true,
+            },
             memory: MemorySettings {
                 distill: false,
                 distill_model: "claude-sonnet-5-5".into(),

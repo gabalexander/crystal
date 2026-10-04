@@ -175,6 +175,19 @@ enum Command {
         #[arg(required = true)]
         note: Vec<String>,
     },
+    /// Tell the user something with a notification, the way crystal tells
+    /// them a session needs them; a click on it takes them to the session.
+    /// The notification settings count, `unfocused_only` among them.
+    Notify {
+        /// The session it's about, which a click takes the user to
+        /// [default: the one this runs in, if any]
+        #[arg(short, long)]
+        name: Option<String>,
+
+        /// What to tell them. Several words are joined with spaces.
+        #[arg(required = true)]
+        message: Vec<String>,
+    },
     /// Say what the agent in this session is doing, for an agent crystal
     /// doesn't know or a script wrapped around one, and how to resume it
     /// after a restart: the command after `--`. Its reports are the
@@ -880,6 +893,11 @@ enum PaneCommand {
     Focus {
         /// A session's name, or left, right, up or down.
         target: String,
+
+        /// Bring the TUI's terminal to the front too, as a click on a
+        /// notification does.
+        #[arg(long)]
+        raise: bool,
     },
     /// Move a border of a session's pane: the one on that side, which it
     /// grows into, or else the one on its other side, which it shrinks
@@ -1126,6 +1144,21 @@ fn run(cli: Cli) -> Result<()> {
             summary,
         } => work::done(&socket, name, failed, &summary.join(" "), artifacts)?,
         Command::Handoff { name, note } => work::handoff(&socket, name, &note.join(" "))?,
+        Command::Notify { name, message } => {
+            let id = name
+                .is_none()
+                .then(|| env::own_session_id(&socket))
+                .flatten();
+            let request = Request::Notify {
+                text: message.join(" "),
+                id,
+                name,
+            };
+            match client::ask(&socket, &request, true)? {
+                Some(Response::Done) => {}
+                _ => bail!("the daemon answered something else"),
+            }
+        }
         Command::Report {
             state,
             agent,
@@ -1644,11 +1677,14 @@ fn pane(socket: &Path, command: PaneCommand) -> Result<()> {
         },
         // A direction's word is a direction, even where a session has it
         // for its name.
-        PaneCommand::Focus { target } => match Toward::from_str(&target, false) {
-            Ok(toward) => layout::Command::FocusToward {
+        PaneCommand::Focus { target, raise } => match Toward::from_str(&target, false) {
+            Ok(toward) if !raise => layout::Command::FocusToward {
                 toward: toward.into(),
             },
-            Err(_) => layout::Command::Focus { session: target },
+            _ => layout::Command::Focus {
+                session: target,
+                raise,
+            },
         },
         PaneCommand::Resize {
             direction,

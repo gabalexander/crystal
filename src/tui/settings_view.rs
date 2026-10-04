@@ -33,6 +33,8 @@ pub struct Current {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Setting {
     Notify,
+    NotifyAfter,
+    UnfocusedOnly,
     Theme,
     Distill,
     Embeddings,
@@ -42,6 +44,8 @@ pub enum Setting {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Change {
     Notify(bool),
+    NotifyAfter(u64),
+    UnfocusedOnly(bool),
     Theme(ThemeName),
     Distill(bool),
     Embeddings(bool),
@@ -52,6 +56,8 @@ impl Change {
     pub fn keys(self) -> &'static [&'static str] {
         match self {
             Change::Notify(_) => &["notify"],
+            Change::NotifyAfter(_) => &["notifications", "after_secs"],
+            Change::UnfocusedOnly(_) => &["notifications", "unfocused_only"],
             Change::Theme(_) => &["theme"],
             Change::Distill(_) => &["memory", "distill"],
             Change::Embeddings(_) => &["memory", "embeddings"],
@@ -60,9 +66,38 @@ impl Change {
 
     pub fn value(self) -> toml_edit::Value {
         match self {
-            Change::Notify(on) | Change::Distill(on) | Change::Embeddings(on) => on.into(),
+            Change::Notify(on)
+            | Change::UnfocusedOnly(on)
+            | Change::Distill(on)
+            | Change::Embeddings(on) => on.into(),
+            Change::NotifyAfter(secs) => i64::try_from(secs).unwrap_or(i64::MAX).into(),
             Change::Theme(theme) => theme.name().into(),
         }
+    }
+}
+
+/// The waits `←/→` go through for how long a session needs the user
+/// before they're told, in seconds.
+const NOTIFY_AFTER: [u64; 6] = [0, 10, 30, 60, 120, 300];
+
+/// The wait after `secs` among [`NOTIFY_AFTER`], or before it: one set by
+/// hand between two goes to the next, or the one before.
+fn next_wait(secs: u64, forward: bool) -> u64 {
+    if forward {
+        let next = NOTIFY_AFTER.iter().find(|&&wait| wait > secs);
+        *next.unwrap_or(&NOTIFY_AFTER[0])
+    } else {
+        let before = NOTIFY_AFTER.iter().rev().find(|&&wait| wait < secs);
+        *before.unwrap_or(&NOTIFY_AFTER[NOTIFY_AFTER.len() - 1])
+    }
+}
+
+/// A wait as the view shows it.
+fn wait_text(secs: u64) -> String {
+    match secs {
+        0 => "at once".to_string(),
+        secs if secs % 60 == 0 => format!("{}m", secs / 60),
+        secs => format!("{secs}s"),
     }
 }
 
@@ -78,8 +113,10 @@ pub enum Outcome {
 }
 
 /// The settings the bar can be on, in the order they're listed.
-const SETTINGS: [Setting; 4] = [
+const SETTINGS: [Setting; 6] = [
     Setting::Notify,
+    Setting::NotifyAfter,
+    Setting::UnfocusedOnly,
     Setting::Theme,
     Setting::Distill,
     Setting::Embeddings,
@@ -166,6 +203,10 @@ impl SettingsView {
         };
         let change = match SETTINGS[self.selected] {
             Setting::Notify => Change::Notify(!config.notify),
+            Setting::NotifyAfter => {
+                Change::NotifyAfter(next_wait(config.notifications.after_secs, forward))
+            }
+            Setting::UnfocusedOnly => Change::UnfocusedOnly(!config.notifications.unfocused_only),
             Setting::Theme if forward => Change::Theme(config.theme.next()),
             Setting::Theme => Change::Theme(config.theme.next().next()),
             Setting::Distill => Change::Distill(!config.memory.distill),
@@ -294,11 +335,14 @@ fn lines(view: &SettingsView, theme: &Theme) -> Vec<Line<'static>> {
         let selected = SETTINGS[view.selected] == setting;
         let name = match setting {
             Setting::Notify => "notifications",
+            Setting::NotifyAfter => "  after",
+            Setting::UnfocusedOnly => "  only when away",
             Setting::Theme => "theme",
             Setting::Distill => "distill closed tasks",
             Setting::Embeddings => "search by meaning",
         };
-        let dim = matches!(setting, Setting::Distill | Setting::Embeddings) && !memory_on;
+        let dim = (matches!(setting, Setting::Distill | Setting::Embeddings) && !memory_on)
+            || (matches!(setting, Setting::NotifyAfter | Setting::UnfocusedOnly) && !config.notify);
         let (mark, color) = match on {
             Some(true) => ("● ", theme.done),
             Some(false) => ("○ ", theme.muted),
@@ -336,6 +380,19 @@ fn lines(view: &SettingsView, theme: &Theme) -> Vec<Line<'static>> {
         Some(config.notify),
         on_off(config.notify),
         "tell you when a session needs you".to_string(),
+    ));
+    let notifications = &config.notifications;
+    lines.push(row(
+        Setting::NotifyAfter,
+        None,
+        wait_text(notifications.after_secs),
+        "once it has needed you this long: ←/→ to change".to_string(),
+    ));
+    lines.push(row(
+        Setting::UnfocusedOnly,
+        Some(notifications.unfocused_only),
+        on_off(notifications.unfocused_only),
+        "only while crystal's terminal hasn't the focus".to_string(),
     ));
     lines.push(row(
         Setting::Theme,
@@ -434,6 +491,20 @@ mod tests {
         press(&mut view, KeyCode::Down);
         assert_eq!(
             press(&mut view, KeyCode::Right),
+            Outcome::Change(Change::NotifyAfter(10))
+        );
+        assert_eq!(
+            press(&mut view, KeyCode::Left),
+            Outcome::Change(Change::NotifyAfter(300))
+        );
+        press(&mut view, KeyCode::Down);
+        assert_eq!(
+            press(&mut view, KeyCode::Char(' ')),
+            Outcome::Change(Change::UnfocusedOnly(true))
+        );
+        press(&mut view, KeyCode::Down);
+        assert_eq!(
+            press(&mut view, KeyCode::Right),
             Outcome::Change(Change::Theme(ThemeName::Light))
         );
         assert_eq!(
@@ -456,8 +527,25 @@ mod tests {
     }
 
     #[test]
+    fn the_wait_goes_through_its_steps_and_round() {
+        assert_eq!(next_wait(0, true), 10);
+        assert_eq!(next_wait(300, true), 0);
+        assert_eq!(next_wait(45, true), 60);
+        assert_eq!(next_wait(45, false), 30);
+        assert_eq!(next_wait(0, false), 300);
+        assert_eq!(wait_text(0), "at once");
+        assert_eq!(wait_text(120), "2m");
+        assert_eq!(wait_text(45), "45s");
+    }
+
+    #[test]
     fn a_change_says_where_it_goes_in_the_file() {
         assert_eq!(Change::Embeddings(true).keys(), ["memory", "embeddings"]);
+        assert_eq!(
+            Change::NotifyAfter(30).keys(),
+            ["notifications", "after_secs"]
+        );
+        assert_eq!(Change::NotifyAfter(30).value().as_integer(), Some(30));
         assert_eq!(
             Change::Theme(ThemeName::Light).value().as_str(),
             Some("light")
@@ -468,7 +556,7 @@ mod tests {
     #[test]
     fn enter_gets_the_model_only_once_search_by_meaning_is_on() {
         let mut view = view_of(Config::default(), Some(status()));
-        for _ in 0..3 {
+        for _ in 0..5 {
             press(&mut view, KeyCode::Down);
         }
         assert_eq!(press(&mut view, KeyCode::Enter), Outcome::Stay);
