@@ -697,6 +697,9 @@ impl Session {
     /// Cancels the session's task, if it's open, saying `why`, and gives it
     /// back as the project's history keeps it.
     pub fn cancel_task(&mut self, why: &str) -> Option<TaskRecord> {
+        // A task's run that started before it was last looked at would open
+        // it again once it was: it's looked at first.
+        self.check_runs();
         if !self.goal.as_ref().is_some_and(TaskInfo::is_open) {
             return None;
         }
@@ -1110,20 +1113,25 @@ impl Session {
     /// runs, any other program's from its screen, and fails a task whose
     /// session has ended under it.
     pub fn check(&mut self) {
-        match self.task.as_mut().map(Task::events) {
-            Some(events) => {
-                for event in events {
-                    // How a run ended closes its task first: a task that
-                    // stays open waits on the user.
-                    self.follow_runs(event);
-                    self.on_agent_event(event);
-                }
-            }
-            None => self.check_screen(),
+        if self.task.is_some() {
+            self.check_runs();
+        } else {
+            self.check_screen();
         }
         self.check_bell();
         self.check_copies();
         self.fail_task_if_ended();
+    }
+
+    /// Keeps up with a task's runs since it last looked.
+    fn check_runs(&mut self) {
+        let events = self.task.as_mut().map(Task::events).unwrap_or_default();
+        for event in events {
+            // How a run ended closes its task first: a task that stays
+            // open waits on the user.
+            self.follow_runs(event);
+            self.on_agent_event(event);
+        }
     }
 
     /// Marks the session when its program has rung the bell while nobody
@@ -2665,5 +2673,58 @@ mod tests {
         assert_eq!(after(Some(Working), AgentEvent::StillIdle), Some(Done));
         assert_eq!(after(Some(Idle), AgentEvent::StillIdle), Some(Idle));
         assert_eq!(after(Some(Waiting), AgentEvent::StillIdle), Some(Waiting));
+    }
+
+    #[test]
+    fn a_task_cancelled_before_its_run_was_looked_at_stays_cancelled() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        // A `claude` that works until it's stopped.
+        let claude = dir.path().join("claude");
+        std::fs::write(&claude, "#!/bin/sh\nexec /bin/sleep 30\n").unwrap();
+        std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let db = crate::db::Db::open(&dir.path().join("crystal.sock")).unwrap();
+        let env = BTreeMap::from([("PATH".to_string(), dir.path().display().to_string())]);
+        let spec = TaskSpec {
+            prompt: "fix the tests".into(),
+            args: Vec::new(),
+        };
+        let mut session = Session::task(
+            "id-1".into(),
+            "fixer".into(),
+            spec,
+            Vec::new(),
+            dir.path().to_path_buf(),
+            env,
+            Arc::new(Spending::new(db)),
+            None,
+        );
+        session.give_task(TaskInfo {
+            id: Some(1),
+            goal: "fix the tests".into(),
+            background: true,
+            backlog: None,
+            waiting: false,
+            created: 1,
+            outcome: None,
+        });
+        session.prompt("fix the tests").unwrap();
+
+        // Cancelled and stopped before the daemon looked at the run that
+        // started, as a flow's cancel can come.
+        let cancelled = session.cancel_task("its flow was cancelled").unwrap();
+        assert_eq!(cancelled.state(), TaskState::Cancelled);
+        session.stop();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while session.is_running() {
+            assert!(Instant::now() < deadline, "the task never stopped");
+            thread::sleep(Duration::from_millis(20));
+        }
+        // Looked at since, the run neither opens it again nor has it fail
+        // for the session that ended under it.
+        session.check();
+        assert!(session.take_closed().is_empty());
+        let record = session.task_record().unwrap();
+        assert_eq!(record.state(), TaskState::Cancelled);
     }
 }

@@ -66,7 +66,7 @@ impl Crystal {
 
     /// Like [`Crystal::command`], run by the crystal at `program`.
     fn command_of(&self, program: &Path, args: &[&str]) -> Command {
-        let mut command = Command::new(program);
+        let mut command = outside_crystal(program);
         command
             .arg("--socket")
             .arg(&self.socket)
@@ -152,8 +152,9 @@ impl Crystal {
         command.arg(&self.socket);
         command.args(args);
         command.cwd(self.dir.path());
-        command.env_remove("CRYSTAL_SESSION");
-        command.env_remove("CRYSTAL_SESSION_ID");
+        for variable in crystal_variables() {
+            command.env_remove(variable);
+        }
         // A notification's click brings the TUI's terminal to the front by
         // these: never the developer's own.
         for raises in ["TMUX", "TMUX_PANE", "__CFBundleIdentifier", "WINDOWID"] {
@@ -175,7 +176,7 @@ impl Crystal {
         let screen = Arc::new(Mutex::new(vt100::Parser::new(24, 80, 0)));
         let written = Arc::new(Mutex::new(Vec::new()));
         let mut output = pty.master.try_clone_reader().unwrap();
-        thread::spawn({
+        let reader = thread::spawn({
             let screen = screen.clone();
             let written = written.clone();
             move || {
@@ -192,6 +193,7 @@ impl Crystal {
             keys: pty.master.take_writer().unwrap(),
             pty: pty.master,
             child,
+            reader,
         }
     }
 }
@@ -204,6 +206,9 @@ struct Terminal {
     keys: Box<dyn Write + Send>,
     pty: Box<dyn MasterPty + Send>,
     child: Box<dyn Child + Send + Sync>,
+    /// Reads what crystal writes onto `screen` and `written`, until the
+    /// terminal closes.
+    reader: thread::JoinHandle<()>,
 }
 
 impl Terminal {
@@ -340,11 +345,15 @@ impl Terminal {
             .set_size(rows, cols);
     }
 
-    /// Waits for crystal to exit, and says whether it succeeded.
+    /// Waits for crystal to exit, and for what it wrote on its way out to
+    /// be read, and says whether it succeeded.
     fn exit(&mut self) -> bool {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             if let Some(status) = self.child.try_wait().unwrap() {
+                eventually("the terminal is read to its end", || {
+                    self.reader.is_finished()
+                });
                 return status.success();
             }
             assert!(Instant::now() < deadline, "crystal never exited");
@@ -411,10 +420,32 @@ const QUIET: [(&str, &str); 3] = [
     ("CRYSTAL_NO_MODEL_DOWNLOAD", "1"),
 ];
 
+/// The `CRYSTAL_*` variables the tests were run with: those of the crystal
+/// session they may be run in, as every agent crystal starts is. Its
+/// session, its daemon's socket and server, and the hooks it was given would
+/// reach the commands the tests run and the hooks those run, so every one of
+/// them is taken out; a test that wants one sets it itself.
+fn crystal_variables() -> Vec<std::ffi::OsString> {
+    std::env::vars_os()
+        .map(|(name, _)| name)
+        .filter(|name| name.to_string_lossy().starts_with("CRYSTAL_"))
+        .collect()
+}
+
+/// A command for `program`, without [`crystal_variables`]: how every test
+/// runs anything.
+fn outside_crystal(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    let mut command = Command::new(program);
+    for variable in crystal_variables() {
+        command.env_remove(variable);
+    }
+    command
+}
+
 /// Runs git in `dir` the way the tests need it, failing the test if git
 /// fails, and returns what it printed.
 fn git(dir: &Path, args: &[&str]) -> String {
-    let out = Command::new("git")
+    let out = outside_crystal("git")
         .arg("-C")
         .arg(dir)
         .args([
@@ -631,7 +662,7 @@ fn a_stale_socket_does_not_stop_the_daemon_from_starting() {
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
-    eventually("the daemon is listening", || crystal.socket.exists());
+    eventually("the daemon is listening", || crystal.listening());
     daemon.kill().unwrap();
     daemon.wait().unwrap();
     assert!(crystal.socket.exists());
@@ -1138,7 +1169,9 @@ fn a_task_pasted_whole_keeps_its_lines() {
     let bin = fake_claude(crystal.dir.path());
     let path = path_of(&[&bin]);
     let mut tui = crystal.attach_with_env(&[], &[("PATH", &path)]);
-    assert!(tui.marks_pastes());
+    // Asked for once the TUI has the alternate screen, which the attach
+    // waits for.
+    eventually("the TUI asks for pastes marked", || tui.marks_pastes());
 
     tui.type_keys("n");
     tui.shows("What should it do?");
@@ -1937,11 +1970,9 @@ fn run_hook_with(crystal: &Crystal, session_env: &[(&str, &str)], hook: &str, ev
 /// Runs a hook the way [`run_hook_with`] does, and gives back what it
 /// printed, which Claude Code reads. A hook must succeed.
 fn hook_says(crystal: &Crystal, session_env: &[(&str, &str)], hook: &str, event: &str) -> String {
-    let mut child = Command::new("sh")
+    let mut child = outside_crystal("sh")
         .arg("-c")
         .arg(hook)
-        // Not the id of a session these tests are run in.
-        .env_remove("CRYSTAL_SESSION_ID")
         .envs(session_env.iter().copied())
         .env("CRYSTAL_SOCKET", &crystal.socket)
         .stdin(Stdio::piped())
@@ -2939,7 +2970,7 @@ fn a_session_started_while_a_list_of_sessions_was_on_its_way_keeps_the_keyboard(
 /// Puts a `git` in `bin` that takes a second and a half over `worktree
 /// add`, then runs the real one.
 fn slow_worktree_add(bin: &Path) {
-    let found = std::process::Command::new("sh")
+    let found = outside_crystal("sh")
         .args(["-c", "command -v git"])
         .output()
         .unwrap();
@@ -2999,13 +3030,27 @@ impl Crystal {
     /// Starts the daemon in a process of this test's own, so the test can
     /// kill it the way a crash would.
     fn start_daemon(&self) -> std::process::Child {
+        self.start_daemon_with(&[])
+    }
+
+    /// Like [`Crystal::start_daemon`], with `env` added to its environment,
+    /// and waits until it's listening: a command run before that would start
+    /// a daemon of its own, without `env`.
+    fn start_daemon_with(&self, env: &[(&str, &str)]) -> std::process::Child {
         let daemon = self
             .command(&["daemon"])
+            .envs(env.iter().copied())
             .stderr(Stdio::null())
             .spawn()
             .unwrap();
-        eventually("the daemon is listening", || self.socket.exists());
+        eventually("the daemon is listening", || self.listening());
         daemon
+    }
+
+    /// Whether a daemon is listening on the test's socket: one killed
+    /// outright leaves the socket behind, with nothing listening on it.
+    fn listening(&self) -> bool {
+        std::os::unix::net::UnixStream::connect(&self.socket).is_ok()
     }
 
     /// The sessions the daemon has written down in its database, as a JSON
@@ -3454,13 +3499,14 @@ fn wait_gives_up_after_its_timeout() {
 fn send_wait_waits_for_the_turn_it_started() {
     let crystal = Crystal::new();
     // A pretend agent without hooks: for each line it's sent, it shows a
-    // spinner in its title while it works for a second, then answers.
+    // spinner in its title while it works for a second, then answers, and
+    // the spinner goes: its answer is on screen once its turn is done.
     let script = r#"
         while read line; do
             printf '\033]0;⠋ working\007'
             sleep 1
-            printf '\033]0;\007'
             echo "answer to $line"
+            printf '\033]0;\007'
         done
     "#;
     crystal.new_pretend_agent("agent", script);
@@ -4376,8 +4422,10 @@ fn the_tui_carries_on_through_a_handover() {
 #[test]
 fn following_events_carries_on_through_a_handover_with_none_missed() {
     let crystal = Crystal::new();
+    // From a while back: it may only have subscribed once the first session
+    // below has started.
     let mut follower = crystal
-        .command(&["events", "--follow"])
+        .command(&["events", "--follow", "--since", "1h"])
         .stdout(Stdio::piped())
         .spawn()
         .unwrap();
@@ -4867,7 +4915,7 @@ fn the_default_socket_keeps_its_state_however_its_daemon_is_started() {
     std::os::unix::fs::symlink(&run, &link).unwrap();
     let state = crystal.dir.path().join("state");
     let at = |socket: &Path, args: &[&str]| {
-        let out = Command::new(CRYSTAL)
+        let out = outside_crystal(CRYSTAL)
             .arg("--socket")
             .arg(socket)
             .args(args)
@@ -4953,12 +5001,10 @@ impl Servers {
 
     /// Like [`Servers::command`], run by the crystal at `program`.
     fn command_of(&self, program: &Path, args: &[&str]) -> Command {
-        let mut command = Command::new(program);
+        let mut command = outside_crystal(program);
         command
             .args(args)
             .current_dir(self.dir())
-            .env_remove("CRYSTAL_SOCKET")
-            .env_remove("CRYSTAL_SERVER")
             .env("XDG_RUNTIME_DIR", self.run_dir())
             .env("XDG_STATE_HOME", self.dir().join("state"))
             .env("XDG_CONFIG_HOME", self.crystal.config_home())
@@ -5211,14 +5257,7 @@ impl Crystal {
     /// Starts a daemon that takes itself for crystal 0.0.1, the way one left
     /// running from an older install would be.
     fn start_older_daemon(&self) -> std::process::Child {
-        let daemon = self
-            .command(&["daemon"])
-            .env("CRYSTAL_PRETEND_VERSION", "0.0.1")
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
-        eventually("the daemon is listening", || self.socket.exists());
-        daemon
+        self.start_daemon_with(&[("CRYSTAL_PRETEND_VERSION", "0.0.1")])
     }
 }
 
@@ -5311,6 +5350,9 @@ fn read_with_history_shows_what_scrolled_off_the_screen() {
     let crystal = Crystal::new();
     crystal.ok(&["new", "-n", "printer", "sh", "-c", LONG_OUTPUT]);
     written(&crystal.dir.path().join("printed"));
+    // The file is written as the last line goes out, before the daemon may
+    // have read it off the terminal.
+    shows_on_screen(&crystal, "printer", "line 60");
 
     let screen = crystal.ok(&["read", "printer"]);
     assert!(!screen.lines().any(|line| line == "first-line"));
@@ -5350,6 +5392,7 @@ fn scrollback_lines_in_the_config_is_how_much_history_a_session_keeps() {
     );
     crystal.ok(&["new", "-n", "printer", "sh", "-c", LONG_OUTPUT]);
     written(&crystal.dir.path().join("printed"));
+    shows_on_screen(&crystal, "printer", "line 60");
 
     // 40 rows on the screen of a session nobody has looked at, the last of
     // them the empty one under the cursor, and 10 above it.
@@ -5375,6 +5418,7 @@ fn rows_an_inline_agent_scrolls_up_through_a_region_reach_the_history() {
     "#;
     crystal.ok(&["new", "-n", "inline", "sh", "-c", script]);
     written(&crystal.dir.path().join("printed"));
+    shows_on_screen(&crystal, "inline", "out 30");
 
     let all = crystal.ok(&["read", "inline", "--history"]);
     let lines: Vec<&str> = all.lines().map(str::trim_end).collect();
@@ -5570,21 +5614,33 @@ fn the_user_is_told_only_once_a_session_has_needed_them_for_a_while() {
     eventually("the session is waiting", || {
         crystal.row("agent").unwrap()[1] == "waiting"
     });
-    let asked = Instant::now();
-    thread::sleep(Duration::from_millis(1000));
-    assert!(lines_in(&notices).is_empty(), "{:?}", lines_in(&notices));
     eventually("the user is told it's waiting", || {
         lines_in(&notices) == ["agent waiting: agent is waiting on you"]
     });
-    assert!(asked.elapsed() >= Duration::from_millis(1500));
+    let after = told_after(&crystal, &notices, "session.waiting");
+    assert!(after >= Duration::from_millis(1500), "told {after:?} after");
 
     // Done straight after, it's told of only once it has stayed done.
     std::fs::write(crystal.dir.path().join("rest"), "").unwrap();
-    thread::sleep(Duration::from_millis(1000));
-    assert_eq!(lines_in(&notices).len(), 1);
+    eventually("the session is done", || {
+        crystal.row("agent").unwrap()[1] == "done"
+    });
     eventually("the user is told it's done", || {
         lines_in(&notices).len() == 2
     });
+    let after = told_after(&crystal, &notices, "session.done");
+    assert!(after >= Duration::from_millis(1500), "told {after:?} after");
+}
+
+/// How long after the daemon logged the latest `kind` of the session called
+/// `agent` the last notice was written to `notices`: both by the clock, not
+/// by when this test, which can be slow to look, saw them.
+fn told_after(crystal: &Crystal, notices: &Path, kind: &str) -> Duration {
+    let logged = events(crystal, &["-n", "agent", "-k", kind]);
+    let happened = logged.last().unwrap()["at"].as_u64().unwrap();
+    let written = std::fs::metadata(notices).unwrap().modified().unwrap();
+    let written = written.duration_since(std::time::UNIX_EPOCH).unwrap();
+    written.saturating_sub(Duration::from_millis(happened))
 }
 
 #[test]
@@ -5677,7 +5733,7 @@ fn crystal_notify_tells_the_user_and_its_click_goes_to_the_session() {
     assert!(jump.ends_with("pane focus --raise -- agent"), "{jump}");
 
     // A click runs the jump.
-    let clicked = Command::new("sh").arg("-c").arg(jump).output().unwrap();
+    let clicked = outside_crystal("sh").arg("-c").arg(jump).output().unwrap();
     assert!(
         clicked.status.success(),
         "{}",
@@ -6156,7 +6212,7 @@ fn a_worktree_in_the_middle_of_a_rebase_keeps_its_branch_and_says_so() {
         "new", "-n", "fixer", "-c", repo_arg, "-w", "fix", "sleep", "30",
     ]);
     let worktree = crystal.dir.path().join("app.worktrees/fix");
-    let rebase = Command::new("git")
+    let rebase = outside_crystal("git")
         .args(["-C", worktree.to_str().unwrap(), "rebase", "main"])
         .envs(PLAIN_GIT)
         .output()
@@ -7954,7 +8010,7 @@ fn space_gives_a_task_a_follow_up_from_the_sidebar() {
 #[test]
 fn a_relative_socket_path_names_the_same_socket_for_the_daemon() {
     let crystal = Crystal::new();
-    let mut new = Command::new(CRYSTAL);
+    let mut new = outside_crystal(CRYSTAL);
     new.args([
         "--socket",
         "relative.sock",
@@ -7975,7 +8031,7 @@ fn a_relative_socket_path_names_the_same_socket_for_the_daemon() {
     );
     assert!(crystal.dir.path().join("relative.sock").exists());
 
-    let mut stop = Command::new(CRYSTAL);
+    let mut stop = outside_crystal(CRYSTAL);
     stop.args(["--socket", "relative.sock", "kill-server"])
         .current_dir(crystal.dir.path());
     assert!(stop.output().unwrap().status.success());
@@ -8574,9 +8630,14 @@ fn an_issue_takes_a_comment_and_a_new_title() {
     let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
     let mut tui = crystal.attach_with_env(&[], &[("PATH", &path)]);
     tui.shows("▸ planner");
+    // The issues are listed as the TUI starts, counted on the top bar, and
+    // again as the view opens, which says so meanwhile: a list that came
+    // after the title is changed below would put the old one back.
+    tui.shows("1 issue");
     tui.type_keys("i");
     tui.shows("The login page sends you back to itself.");
     tui.shows("Me too, on Safari.");
+    tui.hides("asking GitHub");
 
     tui.type_keys("\x03");
     tui.shows("comment on #42");
@@ -11294,16 +11355,7 @@ fn a_step_cut_short_by_a_restart_is_interrupted_until_it_runs_again() {
     let path = path_with(&flow_claude(dir));
     // A daemon of the test's own, to crash, that finds the fake claude:
     // after a restart, steps start from the daemon's environment.
-    let start_daemon = || {
-        let daemon = crystal
-            .command(&["daemon"])
-            .env("PATH", &path)
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
-        eventually("the daemon is listening", || crystal.socket.exists());
-        daemon
-    };
+    let start_daemon = || crystal.start_daemon_with(&[("PATH", &path)]);
     let daemon = start_daemon();
     assert_eq!(
         flow_ok(&crystal, &path, &["pair", "SLOW", "down"]),
@@ -12067,12 +12119,11 @@ command = ["sh", "hook.sh"]
     let hook = r#"{ printf '%s ' "$CRYSTAL_EVENT"; cat; } >> heard"#;
     let dir = plugin(&crystal, "listener", manifest, &[("hook.sh", hook)]);
     crystal.ok(&["plugin", "enable", "listener"]);
+    // The first request the daemon answers: its hooks hear it all the same.
     crystal.ok(&["backlog", "add", "Retry", "the", "webhook"]);
-    let heard = dir.join("heard");
-    // The hook writes the event's name before its JSON: wait for the whole.
-    let whole = || std::fs::read_to_string(&heard).is_ok_and(|text| text.trim_end().ends_with('}'));
-    eventually("the plugin hears of it", whole);
-    let heard = std::fs::read_to_string(&heard).unwrap();
+    // The hook writes the event's name, then its JSON, which the daemon
+    // ends with a newline.
+    let heard = written(&dir.join("heard"));
     let json = heard
         .strip_prefix("backlog.added ")
         .unwrap_or_else(|| panic!("{heard}"));
@@ -12894,7 +12945,7 @@ impl Releases {
         let download = self.dir.path().join(format!("download/v{version}"));
         std::fs::create_dir_all(&download).unwrap();
         let archive = download.join(format!("{name}.tar.gz"));
-        let tar = Command::new("tar")
+        let tar = outside_crystal("tar")
             .arg("-czf")
             .arg(&archive)
             .arg("-C")
@@ -13046,7 +13097,10 @@ fn an_update_that_doesnt_match_its_checksum_changes_nothing() {
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("doesn't match its checksum"), "{err}");
     // The crystal there is the one that was, and the new one never ran.
-    let version = Command::new(&installed).arg("--version").output().unwrap();
+    let version = outside_crystal(&installed)
+        .arg("--version")
+        .output()
+        .unwrap();
     assert_eq!(
         String::from_utf8_lossy(&version.stdout),
         format!("crystal {VERSION}\n")
@@ -13133,7 +13187,7 @@ at crystal done -n b
 at crystal send review ''
 at crystal new -n ''
 "#;
-    let out = Command::new("bash")
+    let out = outside_crystal("bash")
         .arg("-c")
         .arg(driver)
         .current_dir(dir)
@@ -13169,7 +13223,7 @@ fn zsh_and_fish_completions_offer_the_sessions() {
     if Path::new("/bin/zsh").exists() {
         let file = crystal.dir.path().join("_crystal");
         std::fs::write(&file, &zsh).unwrap();
-        let checked = Command::new("/bin/zsh")
+        let checked = outside_crystal("/bin/zsh")
             .arg("-n")
             .arg(&file)
             .output()
