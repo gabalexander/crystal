@@ -321,7 +321,13 @@ mod tests {
         let step = Step {
             name: "plan".into(),
             profile: None,
+            agent: None,
+            model: None,
+            effort: None,
+            mode: None,
+            background: None,
             prompt: "{goal}".into(),
+            accept: Vec::new(),
             placement: None,
             worktree: false,
             gate: true,

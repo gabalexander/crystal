@@ -1108,6 +1108,7 @@ impl Daemon {
         prompt: &str,
     ) -> Result<()> {
         let terminal = run.in_terminal(step);
+        let accept = run.criteria(step)?;
         // A step in a terminal goes on once its task closes.
         ensure!(
             !terminal || tasks::enabled(&settings()),
@@ -1167,11 +1168,16 @@ impl Daemon {
             )?
         };
         // As a task, it's the step, in the project's history and memory,
-        // rather than the whole of its prompt.
+        // rather than the whole of its prompt, with the step's acceptance
+        // criteria, which its prompt has under it already.
         let session = sessions.last_mut().expect("it was just started");
         if session.task_record().is_some() {
             let goal = format!("{} {}: {}", run.name, run.step_name(step), run.goal);
-            session.give_task(new_task_info(goal, !terminal, None, TaskBrief::default()));
+            let brief = TaskBrief {
+                accept,
+                ..TaskBrief::default()
+            };
+            session.give_task(new_task_info(goal, !terminal, None, brief));
             self.number_tasks(std::slice::from_mut(session));
         }
         let task = session.task_id();
