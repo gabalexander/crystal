@@ -1080,6 +1080,10 @@ crystal interrupt docs                                               # stop the 
   test:*)`), and for any other tool the tool. Claude adds the rule to the checkout's
   `.claude/settings.local.json`, so later sessions there have it too. To be asked less to begin with, allow
   what it needs with `--allowedTools` or `--permission-mode` after `--`.
+- Every Claude Code session crystal starts, a task or in a terminal, may run the crystal commands it's told
+  to without asking: `crystal done`, `crystal backlog add` and reading the backlog, `crystal handoff`,
+  `crystal remember`, and `crystal memory search` and `show`, each only while its plugin is on. Anything
+  that changes or removes what's there, like `crystal backlog rm` or `crystal memory rm`, still asks.
 - `Ctrl+C` in a task's pane, or `crystal interrupt <task>`, stops the run it's in the middle of. Its task
   stays open, waiting on you, and a follow-up carries on.
 - `crystal send` gives a task a follow-up: on the `claude` still there, or once that has gone, after five

@@ -374,6 +374,14 @@ fn written(file: &Path) -> String {
     std::fs::read_to_string(file).unwrap()
 }
 
+/// The settings crystal gave Claude Code, written down one argument a
+/// line in `args`: what follows `--settings`.
+fn claude_settings(args: &str) -> serde_json::Value {
+    let mut args = args.lines();
+    args.find(|arg| *arg == "--settings").unwrap();
+    serde_json::from_str(args.next().unwrap()).unwrap()
+}
+
 impl Drop for Crystal {
     fn drop(&mut self) {
         let _ = self.run(&["kill-server"]);
@@ -850,15 +858,17 @@ fn n_starts_claude_with_its_hooks_and_the_task_as_its_prompt() {
     // blank line between the paragraphs.
     let args = written(&crystal.dir.path().join("args"));
     let args: Vec<&str> = args.lines().collect();
-    assert_eq!(args.len(), 8, "{args:?}");
-    assert_eq!(args[0], "--settings");
-    assert_eq!(args[2], "--append-system-prompt");
+    // It may run the crystal commands it's told to without asking.
+    assert_eq!(args.len(), 10, "{args:?}");
+    assert_eq!(args[..2], ["--allowedTools", ALLOWED]);
+    assert_eq!(args[2], "--settings");
+    assert_eq!(args[4], "--append-system-prompt");
     assert!(
-        args[3].starts_with("You're running inside crystal"),
+        args[5].starts_with("You're running inside crystal"),
         "{args:?}"
     );
-    assert!(args[5].contains("crystal done"), "{args:?}");
-    assert_eq!(args[6..], ["--", "fix the login bug"]);
+    assert!(args[7].contains("crystal done"), "{args:?}");
+    assert_eq!(args[8..], ["--", "fix the login bug"]);
 }
 
 #[test]
@@ -1557,9 +1567,9 @@ fn claude_reports_what_it_is_doing_through_its_hooks() {
     // crystal added its hooks ahead of the arguments it was given.
     let args = written(&crystal.dir.path().join("args"));
     let args: Vec<&str> = args.lines().collect();
-    assert_eq!(args[0], "--settings");
-    assert_eq!(args[2], "--resume");
-    let settings: serde_json::Value = serde_json::from_str(args[1]).unwrap();
+    assert_eq!(args[2], "--settings");
+    assert_eq!(args[4], "--resume");
+    let settings: serde_json::Value = serde_json::from_str(args[3]).unwrap();
     let hook = settings["hooks"]["Stop"][0]["hooks"][0]["command"]
         .as_str()
         .unwrap();
@@ -2029,7 +2039,7 @@ fn claude_picks_its_conversation_up_again_after_a_restart() {
     // Claude's hooks name its conversation, whose transcript exists once a
     // prompt has been sent.
     let args = written(&crystal.dir.path().join("args"));
-    let settings: serde_json::Value = serde_json::from_str(args.lines().nth(1).unwrap()).unwrap();
+    let settings: serde_json::Value = claude_settings(&args);
     let hook = settings["hooks"]["Stop"][0]["hooks"][0]["command"]
         .as_str()
         .unwrap();
@@ -2057,7 +2067,7 @@ fn claude_picks_its_conversation_up_again_after_a_restart() {
     // Started again with crystal's resume in place of its own --continue.
     let args = written(&crystal.dir.path().join("args"));
     let args: Vec<&str> = args.lines().collect();
-    assert_eq!(args[2..], ["--resume", "abc-123"]);
+    assert_eq!(args[4..], ["--resume", "abc-123"]);
 }
 
 /// Waits until the session's screen shows `text`, as `crystal read` sees it.
@@ -2668,7 +2678,7 @@ fn an_agent_waiting_in_another_tab_shows_on_its_tab_and_u_goes_there() {
     tui.type_keys("1");
     sidebar_hides(&tui, "agent");
     let args = written(&crystal.dir.path().join("args"));
-    let settings: serde_json::Value = serde_json::from_str(args.lines().nth(1).unwrap()).unwrap();
+    let settings: serde_json::Value = claude_settings(&args);
     let hook = settings["hooks"]["Stop"][0]["hooks"][0]["command"]
         .as_str()
         .unwrap();
@@ -3510,7 +3520,7 @@ fn a_claude_session_picked_up_again_isn_t_asked_its_task_again() {
 
     // Claude's hooks name its conversation, whose transcript exists once
     // the task has been sent.
-    let settings: serde_json::Value = serde_json::from_str(args.lines().nth(1).unwrap()).unwrap();
+    let settings: serde_json::Value = claude_settings(&args);
     let hook = settings["hooks"]["Stop"][0]["hooks"][0]["command"]
         .as_str()
         .unwrap();
@@ -3537,7 +3547,7 @@ fn a_claude_session_picked_up_again_isn_t_asked_its_task_again() {
     // Back in its conversation, which has had the task already.
     let args = written(&crystal.dir.path().join("args"));
     let args: Vec<&str> = args.lines().collect();
-    assert_eq!(args[2..4], ["--resume", "abc-123"]);
+    assert_eq!(args[4..6], ["--resume", "abc-123"]);
     assert!(!args.contains(&"fix the login bug"), "{args:?}");
     assert!(!args.contains(&"--"), "{args:?}");
     // Still a task, open as it was.
@@ -4121,7 +4131,7 @@ fn respawned_claude_picks_its_conversation_up_again() {
     // Claude's hooks name its conversation, whose transcript exists once a
     // prompt has been sent.
     let args = written(&crystal.dir.path().join("args"));
-    let settings: serde_json::Value = serde_json::from_str(args.lines().nth(1).unwrap()).unwrap();
+    let settings: serde_json::Value = claude_settings(&args);
     let hook = settings["hooks"]["Stop"][0]["hooks"][0]["command"]
         .as_str()
         .unwrap();
@@ -4153,7 +4163,7 @@ fn respawned_claude_picks_its_conversation_up_again() {
     assert!(out.status.success());
     let args = written(&crystal.dir.path().join("args"));
     let args: Vec<&str> = args.lines().collect();
-    assert_eq!(args[2..], ["--resume", "abc-123"]);
+    assert_eq!(args[4..], ["--resume", "abc-123"]);
 }
 
 #[test]
@@ -4524,13 +4534,7 @@ fn claude_starts_with_what_its_project_remembered_in_its_system_prompt() {
     assert_eq!(server["command"], CRYSTAL);
     assert_eq!(server["args"][2], "mcp");
     assert_eq!(server["args"][4], repo_dir);
-    assert_eq!(
-        args[2..4],
-        [
-            "--allowedTools",
-            "mcp__crystal__memory_search,mcp__crystal__memory_show"
-        ]
-    );
+    assert_eq!(args[2..4], ["--allowedTools", ALLOWED_WITH_MEMORY]);
     assert_eq!(args[4], "--settings");
 }
 
@@ -5363,6 +5367,11 @@ fn two_codex_sessions_in_one_directory_each_find_their_own_conversation() {
 const PRINT_ARGS: &str = "-p --input-format stream-json --output-format stream-json --verbose \
                           --permission-prompt-tool stdio --max-budget-usd 5";
 
+/// The crystal commands a Claude Code session or task is allowed to run
+/// without asking, by default in these tests, memory being off.
+const ALLOWED: &str = "Bash(crystal done:*),Bash(crystal backlog add:*),Bash(crystal backlog),\
+                       Bash(crystal backlog export),Bash(crystal handoff:*)";
+
 /// A stand-in for a background task's `claude -p`, speaking stream-json:
 /// it reads prompts on its standard input, one JSON line each, and answers
 /// each as a turn. For each prompt it notes its arguments and the prompt in
@@ -5476,7 +5485,12 @@ fn a_task_runs_claude_without_a_terminal_and_shows_what_it_did() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "fixer\n");
 
     // Claude was asked for its events, and given the prompt on its input.
-    assert_eq!(runs(dir, 1), [format!("{PRINT_ARGS} -- fix the tests")]);
+    assert_eq!(
+        runs(dir, 1),
+        [format!(
+            "{PRINT_ARGS} --allowedTools {ALLOWED} -- fix the tests"
+        )]
+    );
     eventually("the task is working", || {
         status(&crystal, "fixer") == "working"
     });
@@ -5532,7 +5546,7 @@ fn a_follow_up_goes_to_the_same_claude_one_run_at_a_time() {
     let runs = runs(dir, 2);
     assert_eq!(
         runs[1],
-        format!("{PRINT_ARGS} --model opus -- now the docs")
+        format!("{PRINT_ARGS} --allowedTools {ALLOWED} --model opus -- now the docs")
     );
     eventually("the follow-up is working", || {
         status(&crystal, "fixer") == "working"
@@ -5666,7 +5680,7 @@ fn a_task_comes_back_at_rest_after_a_restart_and_carries_its_conversation_on() {
     crystal.ok(&["send", "fixer", "carry on"]);
     assert_eq!(
         runs(dir, 2)[1],
-        format!("{PRINT_ARGS} --resume conv-1 -- carry on")
+        format!("{PRINT_ARGS} --resume conv-1 --allowedTools {ALLOWED} -- carry on")
     );
 }
 
@@ -5691,7 +5705,7 @@ fn a_follow_up_once_its_claude_has_gone_resumes_the_conversation() {
     crystal.ok(&["send", "fixer", "and the docs"]);
     assert_eq!(
         runs(dir, 2)[1],
-        format!("{PRINT_ARGS} --resume conv-1 -- and the docs")
+        format!("{PRINT_ARGS} --resume conv-1 --allowedTools {ALLOWED} -- and the docs")
     );
 }
 
@@ -5815,7 +5829,10 @@ fn an_interrupted_run_leaves_its_task_open_waiting_on_the_user() {
 
     // A follow-up gets it going again, on the same claude.
     crystal.ok(&["send", "fixer", "carry on"]);
-    assert_eq!(runs(dir, 2)[1], format!("{PRINT_ARGS} -- carry on"));
+    assert_eq!(
+        runs(dir, 2)[1],
+        format!("{PRINT_ARGS} --allowedTools {ALLOWED} -- carry on")
+    );
     finish_run(dir, 2);
     eventually("the task is done", || status(&crystal, "fixer") == "done");
     assert!(crystal.ok(&["tasks"]).starts_with("t1    done       fixer"));
@@ -7201,7 +7218,12 @@ fn a_task_made_to_wait_is_pending_until_it_starts() {
         String::from_utf8_lossy(&started.stderr)
     );
     assert_eq!(String::from_utf8_lossy(&started.stdout), "later\n");
-    assert_eq!(runs(dir, 1), [format!("{PRINT_ARGS} -- fix the tests")]);
+    assert_eq!(
+        runs(dir, 1),
+        [format!(
+            "{PRINT_ARGS} --allowedTools {ALLOWED} -- fix the tests"
+        )]
+    );
     assert!(crystal.ok(&["tasks"]).starts_with("t1    running    later"));
     finish_run(dir, 1);
     eventually("the task is done", || status(&crystal, "later") == "done");
@@ -7646,7 +7668,12 @@ fn the_panel_starts_claude_in_the_background_as_a_task() {
     tui.shows("runs  claude -p 'fix the tests'");
     tui.type_keys("\r");
 
-    assert_eq!(runs(dir, 1), [format!("{PRINT_ARGS} -- fix the tests")]);
+    assert_eq!(
+        runs(dir, 1),
+        [format!(
+            "{PRINT_ARGS} --allowedTools {ALLOWED} -- fix the tests"
+        )]
+    );
     assert_eq!(crystal.row("task").unwrap()[8], "fix the tests");
     finish_run(dir, 1);
     eventually("the task has closed", || {
@@ -7720,6 +7747,34 @@ esac
     bin
 }
 
+/// What a Claude Code session or task crystal starts is allowed to run
+/// without asking, with every plugin on: the crystal commands it's told
+/// to run, then the tools of crystal's MCP server.
+const ALLOWED_WITH_MEMORY: &str = "Bash(crystal done:*),Bash(crystal backlog add:*),\
+Bash(crystal backlog),Bash(crystal backlog export),Bash(crystal handoff:*),\
+Bash(crystal remember:*),Bash(crystal memory search:*),Bash(crystal memory show:*),\
+mcp__crystal__memory_search,mcp__crystal__memory_show";
+
+#[test]
+fn a_task_may_close_itself_without_asking_whatever_is_off() {
+    let crystal = Crystal::new();
+    crystal.configure("notify = false\n\n[plugins]\nmemory = false\nbacklog = false\n");
+    let repo = git_repo(crystal.dir.path(), "app");
+    let bin = distilling_claude(crystal.dir.path());
+    start_fixer(&crystal, &repo, &bin);
+
+    eventually("the task starts", || repo.join("task-args").exists());
+    let args = written(&repo.join("task-args"));
+    let args: Vec<&str> = args.lines().collect();
+    let at = args
+        .iter()
+        .position(|arg| *arg == "--allowedTools")
+        .unwrap();
+    // Neither memory's commands nor its server, nor the backlog's.
+    assert_eq!(args[at + 1], "Bash(crystal done:*),Bash(crystal handoff:*)");
+    assert!(!args.contains(&"--mcp-config"), "{args:?}");
+}
+
 /// Starts a task called fixer in `repo`, on the ledger, with `bin` for its
 /// PATH.
 fn start_fixer(crystal: &Crystal, repo: &Path, bin: &Path) {
@@ -7764,10 +7819,7 @@ fn a_task_is_shown_what_was_learned_and_given_crystal_s_mcp_server() {
         let at = args.iter().position(|arg| *arg == flag).unwrap();
         args[at + 1]
     };
-    assert_eq!(
-        after("--allowedTools"),
-        "mcp__crystal__memory_search,mcp__crystal__memory_show"
-    );
+    assert_eq!(after("--allowedTools"), ALLOWED_WITH_MEMORY);
     let server: serde_json::Value = serde_json::from_str(after("--mcp-config")).unwrap();
     let server = &server["mcpServers"]["crystal"];
     assert_eq!(server["command"], CRYSTAL);
@@ -8041,7 +8093,7 @@ command = ["sh", "hook.sh"]
         .unwrap();
     assert!(out.status.success());
     let args = written(&crystal.dir.path().join("args"));
-    let settings: serde_json::Value = serde_json::from_str(args.lines().nth(1).unwrap()).unwrap();
+    let settings: serde_json::Value = claude_settings(&args);
     let hook = settings["hooks"]["Stop"][0]["hooks"][0]["command"]
         .as_str()
         .unwrap();
@@ -8932,7 +8984,9 @@ fn a_failed_step_stops_the_flow_until_it_runs_again() {
     // Run again in a task that carries the failed one's conversation on.
     let runs = runs(dir, 3);
     assert!(
-        runs[1].contains("--resume conv-1 -- Plan FAIL"),
+        runs[1].contains(&format!(
+            "--resume conv-1 --allowedTools {ALLOWED} -- Plan FAIL"
+        )),
         "{}",
         runs[1]
     );
@@ -8978,7 +9032,9 @@ fn a_step_cut_short_by_a_restart_is_interrupted_until_it_runs_again() {
     // Run again in the task that came back at rest, in its conversation.
     let runs = runs(dir, 3);
     assert!(
-        runs[1].contains("--resume conv-1 -- Plan SLOW down"),
+        runs[1].contains(&format!(
+            "--resume conv-1 --allowedTools {ALLOWED} -- Plan SLOW down"
+        )),
         "{}",
         runs[1]
     );
@@ -10001,7 +10057,7 @@ fn a_session_crystal_named_takes_its_name_from_its_first_prompt() {
     // Asked nothing, it's named after its program until its first prompt.
     assert_eq!(new(&["new", "-d", "claude"]), "claude\n");
     let args = written(&crystal.dir.path().join("args"));
-    let settings: serde_json::Value = serde_json::from_str(args.lines().nth(1).unwrap()).unwrap();
+    let settings: serde_json::Value = claude_settings(&args);
     let hook = settings["hooks"]["Stop"][0]["hooks"][0]["command"]
         .as_str()
         .unwrap();
