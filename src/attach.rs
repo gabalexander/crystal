@@ -3,8 +3,11 @@
 //!
 //! What the session writes is drawn through a screen of our own rather than
 //! passed straight through, so whatever the program does to its terminal,
-//! like switching screens, stays inside the attach. Its bell is passed on
-//! to your terminal, as often as [`crate::bell`] lets it, and what it copies
+//! like switching screens, stays inside the attach. Your terminal is asked
+//! for what the program asked of its keyboard and mouse, the wheel sending
+//! arrow keys only while the program is on its alternate screen, though
+//! the attach is on your terminal's all along. Its bell is passed on to
+//! your terminal, as often as [`crate::bell`] lets it, and what it copies
 //! goes on your clipboard, as [`crate::clipboard`] puts it there.
 
 use crate::bell::Ringer;
@@ -41,9 +44,18 @@ const BACKSLASH: u32 = 92;
 const TICK: Duration = Duration::from_millis(50);
 
 /// Puts back every mode a session may have turned on, pops the Kitty
-/// keyboard flags the attach pushed, then leaves the alternate screen.
+/// keyboard flags the attach pushed, then leaves the alternate screen. The
+/// wheel's alternate scroll is turned back on, as most terminals have it,
+/// then put back as [`ENTER`] saved it, in a terminal that saves modes.
 const RESET: &[u8] = b"\x1b[<u\x1b[0m\x1b[?25h\x1b[?1l\x1b>\x1b[?2004l\x1b[?1004l\
-\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1016l\x1b[?1049l";
+\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1016l\
+\x1b[?1007h\x1b[?1007r\x1b[?1049l";
+
+/// Saves your terminal's alternate scroll (XTSAVE) and turns it off, since
+/// a session starts on the main screen, then goes to the alternate screen,
+/// clears it, and pushes an entry of the attach's own on the terminal's
+/// stack of Kitty keyboard flags, for the session's flags to go in.
+const ENTER: &[u8] = b"\x1b[?1007s\x1b[?1007l\x1b[?1049h\x1b[H\x1b[2J\x1b[>0u";
 
 pub fn run(socket: &Path, name: Option<&str>) -> Result<()> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
@@ -366,9 +378,7 @@ impl RawTerminal {
     fn enter() -> Result<RawTerminal> {
         terminal::enable_raw_mode()?;
         let raw = RawTerminal;
-        // An entry of the attach's own on the terminal's stack of Kitty
-        // keyboard flags, for the session's flags to go in.
-        draw(b"\x1b[?1049h\x1b[H\x1b[2J\x1b[>0u")?;
+        draw(ENTER)?;
         Ok(raw)
     }
 }

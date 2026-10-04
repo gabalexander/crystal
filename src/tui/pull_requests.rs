@@ -449,6 +449,7 @@ mod tests {
     use crate::config::ThemeName;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use std::time::Instant;
 
     fn pull_request(number: u64, title: &str, branch: &str) -> PullRequest {
         PullRequest {
@@ -580,7 +581,7 @@ mod tests {
                 verdict: Some(Review::ChangesRequested),
             }],
         };
-        view.list.set_detail(57, Ok(detail));
+        view.list.set_detail(57, Ok(detail), Instant::now());
         let screen = drawn(&view);
         assert!(screen.contains("pull requests · app"), "{screen}");
         assert!(
@@ -634,6 +635,7 @@ mod tests {
                 base: "main".into(),
                 ..PullRequestDetail::default()
             }),
+            Instant::now(),
         );
         let screen = drawn(&view);
         assert!(screen.contains("1 open"), "{screen}");
@@ -653,6 +655,7 @@ mod tests {
                 base: "main".into(),
                 ..PullRequestDetail::default()
             }),
+            Instant::now(),
         );
         assert!(drawn(&view).contains("ana's dark merged into main"));
         assert_eq!(
