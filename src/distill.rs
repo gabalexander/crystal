@@ -1,6 +1,7 @@
-//! The distiller: once a task has closed, a model reads what was done and
-//! keeps, in the project's memory, what a later session there would need to
-//! know and couldn't find by reading the code.
+//! The distiller: once a task has closed, done or failed, or a session is
+//! archived without its task having closed so, a model reads what was done
+//! and keeps, in the project's memory, what a later session there would
+//! need to know and couldn't find by reading the code.
 //!
 //! It reads the end of what the task's session did: for a task in the
 //! background, Claude's runs as crystal read them; for Claude Code in a

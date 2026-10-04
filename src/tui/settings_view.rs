@@ -1,11 +1,12 @@
 //! The settings view, `,`: the settings crystal reads as it goes, in tabs,
 //! each changed with a key or typed in and written to the config file at
-//! once; the keys `[keys]` gives, each given by pressing it; and how the
-//! models that search memory by meaning stand, as the daemon says they do.
-//! While the view is open, the event loop reads both again every half a
-//! second, so what it shows follows the file, a download or the daemon,
-//! whoever changed them. The event loop does the writing (see
-//! [`crate::config::apply`]).
+//! once; how the models that search memory by meaning stand, as the daemon
+//! says they do; crystal's hooks in each agent installed here, put there,
+//! brought up to date or taken out with a key; and the keys `[keys]` gives,
+//! each given by pressing it. While the view is open, the event loop reads
+//! them again every half a second, so what it shows follows the file, a
+//! download or the daemon, whoever changed them. The event loop does the
+//! writing (see [`crate::config::apply`]).
 //!
 //! A key pressed for a command goes through the checks the config file's
 //! keys do ([`keymap::rebind`]): one another command has is taken from it
@@ -22,6 +23,7 @@ use crate::config::{
     self, BarPosition, Config, Fold, NewCwd, SessionSettings, ShellMode, TaskSettings, ThemeName,
 };
 use crate::embed::Status;
+use crate::integration::{self, Standing};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::{Margin, Position, Rect};
@@ -38,6 +40,9 @@ pub struct Current {
     pub config: Result<Config, String>,
     /// How the model stands, as the daemon said; `None` when it couldn't.
     pub model: Option<Status>,
+    /// The agents installed here that crystal can hook, and how its hooks
+    /// in each stand.
+    pub integrations: Vec<(integration::Agent, Standing)>,
 }
 
 /// A setting the view changes.
@@ -48,6 +53,7 @@ pub enum Setting {
     UnfocusedOnly,
     NotifyCommand,
     Sound,
+    ConfirmQuit,
     UpdateCheck,
     KeepEvents,
     HideDrafts,
@@ -99,6 +105,7 @@ impl Setting {
             Setting::UnfocusedOnly => &["notifications", "unfocused_only"],
             Setting::NotifyCommand => &["notify_command"],
             Setting::Sound => &["sound", "enabled"],
+            Setting::ConfirmQuit => &["confirm_quit"],
             Setting::UpdateCheck => &["update", "check"],
             Setting::KeepEvents => &["events", "keep_days"],
             Setting::HideDrafts => &["forge", "hide_draft_prs"],
@@ -150,6 +157,7 @@ impl Setting {
             Setting::UnfocusedOnly => "  only when away",
             Setting::NotifyCommand => "  command",
             Setting::Sound => "sounds",
+            Setting::ConfirmQuit => "ask before quitting",
             Setting::UpdateCheck => "look for updates",
             Setting::KeepEvents => "keep events",
             Setting::HideDrafts => "hide drafts",
@@ -386,15 +394,17 @@ fn dollars(cents: i64) -> String {
     }
 }
 
-/// A row the bar can be on: a setting, or what `[keys]` gives keys.
+/// A row the bar can be on: a setting, crystal's hooks in an agent, or
+/// what `[keys]` gives keys.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Row {
     Setting(Setting),
+    Hooks(integration::Agent),
     Key(KeyId),
 }
 
 /// A tab of the view: its settings under their headings, or, with none,
-/// every key.
+/// the agents' hooks or every key.
 struct Tab {
     name: &'static str,
     sections: &'static [(&'static str, &'static [Setting])],
@@ -402,8 +412,8 @@ struct Tab {
 
 use Setting as S;
 
-/// The tabs, in order, the keys' last.
-const TABS: [Tab; 7] = [
+/// The tabs, in order, the agents' hooks and the keys last.
+const TABS: [Tab; 8] = [
     Tab {
         name: "General",
         sections: &[
@@ -417,7 +427,8 @@ const TABS: [Tab; 7] = [
                     S::Sound,
                 ],
             ),
-            ("Updates and events", &[S::UpdateCheck, S::KeepEvents]),
+            ("Quitting and updates", &[S::ConfirmQuit, S::UpdateCheck]),
+            ("Events", &[S::KeepEvents]),
             ("Pull requests", &[S::HideDrafts]),
         ],
     },
@@ -495,16 +506,25 @@ const TABS: [Tab; 7] = [
         )],
     },
     Tab {
+        name: "Integrations",
+        sections: &[],
+    },
+    Tab {
         name: "Keys",
         sections: &[],
     },
 ];
 
-/// The keys' tab.
+/// The agents' hooks' tab, and the keys'.
+const HOOKS_TAB: usize = TABS.len() - 2;
 const KEYS_TAB: usize = TABS.len() - 1;
 
-/// The rows of tab `tab`, in the order they're listed.
-fn rows(tab: usize) -> Vec<Row> {
+/// The rows of tab `tab`, in the order they're listed, with `hooked` the
+/// agents installed here.
+fn rows(tab: usize, hooked: &[(integration::Agent, Standing)]) -> Vec<Row> {
+    if tab == HOOKS_TAB {
+        return hooked.iter().map(|&(agent, _)| Row::Hooks(agent)).collect();
+    }
     if tab == KEYS_TAB {
         return KeyId::all().map(Row::Key).collect();
     }
@@ -535,6 +555,12 @@ pub enum Outcome {
     /// Have the daemon download the model if it isn't here, and give every
     /// entry its vector.
     Prepare,
+    /// Put crystal's hooks in the agent's settings, or bring them up to
+    /// date, or with `install` false, take them out.
+    Integrate {
+        agent: integration::Agent,
+        install: bool,
+    },
 }
 
 /// What the row the bar is on is in the middle of.
@@ -560,6 +586,9 @@ pub struct SettingsView {
     editing: Option<Editing>,
     /// Why the last thing asked for couldn't be done.
     problem: Option<String>,
+    /// What the last thing asked for came to, when there's something to
+    /// say, like what's next for Codex's hooks.
+    note: Option<String>,
 }
 
 impl SettingsView {
@@ -570,7 +599,13 @@ impl SettingsView {
             selected: 0,
             editing: None,
             problem: None,
+            note: None,
         }
+    }
+
+    /// Says what came of the last thing asked for.
+    pub fn set_note(&mut self, note: String) {
+        self.note = Some(note);
     }
 
     /// Takes the settings as they are now.
@@ -602,12 +637,29 @@ impl SettingsView {
         self.current.as_ref()?.model.as_ref()
     }
 
-    fn row(&self) -> Row {
-        rows(self.tab)[self.selected]
+    /// The agents installed here crystal can hook, as last read.
+    fn hooked(&self) -> &[(integration::Agent, Standing)] {
+        self.current
+            .as_ref()
+            .map_or(&[], |current| current.integrations.as_slice())
+    }
+
+    /// The rows of the tab in front.
+    fn rows(&self) -> Vec<Row> {
+        rows(self.tab, self.hooked())
+    }
+
+    /// The row the bar is on: the tab's last, after an agent has gone
+    /// between two reads; none in a tab with none.
+    fn row(&self) -> Option<Row> {
+        let rows = self.rows();
+        let last = rows.len().checked_sub(1)?;
+        Some(rows[self.selected.min(last)])
     }
 
     pub fn on_key(&mut self, key: KeyEvent) -> Outcome {
         self.problem = None;
+        self.note = None;
         match self.editing.take() {
             Some(Editing::Text(input)) => return self.on_text_key(input, key),
             Some(Editing::Capture { add }) => return self.on_captured(key, add),
@@ -622,7 +674,7 @@ impl SettingsView {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             return Outcome::Stay;
         }
-        let last = rows(self.tab).len() - 1;
+        let last = self.rows().len().saturating_sub(1);
         match key.code {
             KeyCode::Esc | KeyCode::Char('q' | ',') => return Outcome::Close,
             KeyCode::Tab | KeyCode::Char(']') => self.show_tab((self.tab + 1) % TABS.len()),
@@ -636,15 +688,19 @@ impl SettingsView {
                 }
             }
             KeyCode::Char('j') | KeyCode::Down => self.selected = (self.selected + 1).min(last),
-            KeyCode::Char('k') | KeyCode::Up => self.selected = self.selected.saturating_sub(1),
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.selected = self.selected.min(last).saturating_sub(1);
+            }
             KeyCode::PageDown => self.selected = (self.selected + PAGE).min(last),
             KeyCode::PageUp => self.selected = self.selected.saturating_sub(PAGE),
             KeyCode::Home | KeyCode::Char('g') => self.selected = 0,
             KeyCode::End | KeyCode::Char('G') => self.selected = last,
             _ => {
                 return match self.row() {
-                    Row::Setting(setting) => self.on_setting_key(setting, key.code),
-                    Row::Key(id) => self.on_key_row_key(id, key.code),
+                    Some(Row::Setting(setting)) => self.on_setting_key(setting, key.code),
+                    Some(Row::Hooks(agent)) => self.on_hooks_key(agent, key.code),
+                    Some(Row::Key(id)) => self.on_key_row_key(id, key.code),
+                    None => Outcome::Stay,
                 };
             }
         }
@@ -672,6 +728,17 @@ impl SettingsView {
             },
             _ => Outcome::Stay,
         }
+    }
+
+    /// A key on an agent's row: space or Enter puts crystal's hooks in it,
+    /// or brings them up to date, or takes them out once they're in.
+    fn on_hooks_key(&mut self, agent: integration::Agent, code: KeyCode) -> Outcome {
+        if !matches!(code, KeyCode::Char(' ') | KeyCode::Enter) {
+            return Outcome::Stay;
+        }
+        let standing = self.hooked().iter().find(|(hooked, _)| *hooked == agent);
+        let install = standing.is_none_or(|(_, standing)| *standing != Standing::Installed);
+        Outcome::Integrate { agent, install }
     }
 
     /// A key on a key's row: Enter or space waits for the key to give it,
@@ -713,7 +780,7 @@ impl SettingsView {
             self.problem = Some("crystal can't write that key down: press another".to_string());
             return Outcome::Stay;
         }
-        let (Row::Key(id), Some(config)) = (self.row(), self.config()) else {
+        let (Some(Row::Key(id)), Some(config)) = (self.row(), self.config()) else {
             return Outcome::Stay;
         };
         match keymap::rebind(&config.keys, id, chord, add) {
@@ -738,7 +805,7 @@ impl SettingsView {
     /// A key while a setting is typed in: Enter writes it, Esc leaves it
     /// as it was, and the rest edit it.
     fn on_text_key(&mut self, mut input: TextInput, key: KeyEvent) -> Outcome {
-        let Row::Setting(setting) = self.row() else {
+        let Some(Row::Setting(setting)) = self.row() else {
             return Outcome::Stay;
         };
         match key.code {
@@ -810,6 +877,7 @@ impl SettingsView {
             }
             S::UnfocusedOnly => on(!config.notifications.unfocused_only),
             S::Sound => on(!config.sound.enabled),
+            S::ConfirmQuit => on(!config.confirm_quit),
             S::UpdateCheck => on(!config.update.check),
             S::KeepEvents => number(next_of(&KEEP_DAYS, config.events.keep_days, forward).into()),
             S::HideDrafts => on(!config.forge.hide_draft_prs),
@@ -964,7 +1032,14 @@ pub fn hints(view: &SettingsView) -> &'static [(&'static str, &'static str)] {
         Some(Editing::Capture { .. }) => &[("a key", "give it"), ("esc", "leave it")],
         Some(Editing::Taking { .. }) => &[("enter", "take it"), ("esc", "leave it")],
         None => match view.row() {
-            Row::Key(_) => &[
+            None => &[("tab", "next tab"), ("esc", "close")],
+            Some(Row::Hooks(_)) => &[
+                ("space", "put in, update or take out"),
+                ("tab", "next tab"),
+                ("j/k", "move"),
+                ("esc", "close"),
+            ],
+            Some(Row::Key(_)) => &[
                 ("enter", "press its key"),
                 ("a", "add one"),
                 ("x", "none"),
@@ -972,21 +1047,21 @@ pub fn hints(view: &SettingsView) -> &'static [(&'static str, &'static str)] {
                 ("tab", "next tab"),
                 ("esc", "close"),
             ],
-            Row::Setting(Setting::Embeddings) => &[
+            Some(Row::Setting(Setting::Embeddings)) => &[
                 ("space", "change"),
                 ("enter", "get the model"),
                 ("del", "default"),
                 ("tab", "next tab"),
                 ("esc", "close"),
             ],
-            Row::Setting(setting) if setting.typed() => &[
+            Some(Row::Setting(setting)) if setting.typed() => &[
                 ("enter", "type it"),
                 ("del", "default"),
                 ("tab", "next tab"),
                 ("j/k", "move"),
                 ("esc", "close"),
             ],
-            Row::Setting(_) => &[
+            Some(Row::Setting(_)) => &[
                 ("space", "change"),
                 ("del", "default"),
                 ("tab", "next tab"),
@@ -1130,8 +1205,9 @@ fn head(view: &SettingsView, theme: &Theme) -> Vec<Line<'static>> {
     ]
 }
 
-/// The view's bottom: what's said of the last thing asked, or of the key
-/// pressed that something else has, in lines `width` wide.
+/// The view's bottom: what's said of the last thing asked, or what came of
+/// it, or of the key pressed that something else has, in lines `width`
+/// wide.
 fn foot(view: &SettingsView, theme: &Theme, width: usize) -> Vec<Line<'static>> {
     let (said, color) = match (&view.editing, &view.problem) {
         (Some(Editing::Taking { chord, rebinding }), _) => {
@@ -1140,7 +1216,10 @@ fn foot(view: &SettingsView, theme: &Theme, width: usize) -> Vec<Line<'static>> 
             (said, theme.waiting)
         }
         (_, Some(problem)) => (problem.clone(), theme.failed),
-        _ => return Vec::new(),
+        _ => match &view.note {
+            Some(note) => (note.clone(), theme.muted),
+            None => return Vec::new(),
+        },
     };
     let lines = wrapped(&said, width).into_iter();
     let lines = lines.map(|line| Line::styled(line, Style::new().fg(color)));
@@ -1216,6 +1295,10 @@ fn shown(setting: Setting, config: &Config) -> Shown {
             "runs in place of the desktop's, as for a phone",
         ),
         S::Sound => switch(config.sound.enabled, "a chime at the same moments"),
+        S::ConfirmQuit => switch(
+            config.confirm_quit,
+            "q asks first; the sessions keep running either way",
+        ),
         S::UpdateCheck => switch(
             config.update.check,
             "once a day, as the TUI opens, for a newer crystal",
@@ -1538,6 +1621,10 @@ fn body(view: &SettingsView, theme: &Theme) -> Vec<Line<'static>> {
     let Some(current) = &view.current else {
         return vec![Line::from(""), Line::styled("reading the settings…", muted)];
     };
+    // The agents' own settings, whatever crystal's file says.
+    if view.tab == HOOKS_TAB {
+        return hooks_lines(view, theme);
+    }
     let config = match &current.config {
         Ok(config) => config,
         Err(why) => {
@@ -1571,7 +1658,7 @@ fn setting_line(
     config: &Config,
     theme: &Theme,
 ) -> Line<'static> {
-    let selected = view.row() == Row::Setting(setting);
+    let selected = view.row() == Some(Row::Setting(setting));
     let shown = shown(setting, config);
     let mark = match shown.on {
         Some(true) => ("● ", theme.done),
@@ -1654,6 +1741,54 @@ fn after_section(
     lines
 }
 
+/// The agents' hooks' tab: each agent installed here that crystal can hook,
+/// with how its hooks stand.
+fn hooks_lines(view: &SettingsView, theme: &Theme) -> Vec<Line<'static>> {
+    let muted = Style::new().fg(theme.muted);
+    let mut lines = vec![
+        Line::from(""),
+        Line::styled(
+            "crystal's hooks in each agent's own settings, for it to say what it's doing",
+            muted,
+        ),
+        Line::from(""),
+    ];
+    if view.hooked().is_empty() {
+        lines.push(Line::styled(
+            "none of the agents crystal can hook is installed here",
+            muted,
+        ));
+    }
+    for &(agent, standing) in view.hooked() {
+        let (mark, about) = match standing {
+            Standing::Installed => (
+                ("● ", theme.done),
+                "it says what it's doing: space takes them out",
+            ),
+            Standing::OutOfDate => (
+                ("○ ", theme.muted),
+                "another crystal's, or older: space brings them up to date",
+            ),
+            Standing::NotInstalled => (
+                ("○ ", theme.muted),
+                "space puts crystal's hooks in its settings",
+            ),
+        };
+        let selected = view.row() == Some(Row::Hooks(agent));
+        let value = value_span(standing.word(), theme);
+        let flags = (selected, false);
+        lines.push(row_line(
+            theme,
+            mark,
+            agent.name(),
+            value,
+            about.into(),
+            flags,
+        ));
+    }
+    lines
+}
+
 /// The keys' tab: every key `[keys]` gives, under the heading of where it
 /// works, then the user's own, which the file changes.
 fn key_lines(view: &SettingsView, config: &Config, theme: &Theme) -> Vec<Line<'static>> {
@@ -1687,7 +1822,7 @@ fn key_lines(view: &SettingsView, config: &Config, theme: &Theme) -> Vec<Line<'s
             lines.push(Line::from(""));
             lines.push(Line::styled(heading, bold));
         }
-        let selected = view.row() == Row::Key(key);
+        let selected = view.row() == Some(Row::Key(key));
         let given = config.keys.bindings.contains_key(key.id());
         let mark = match given {
             true => ("• ", theme.accent),
@@ -1755,6 +1890,7 @@ mod tests {
             path: PathBuf::from("/home/ann/.config/crystal/config.toml"),
             config: Ok(config),
             model,
+            integrations: Vec::new(),
         });
         view
     }
@@ -1788,10 +1924,10 @@ mod tests {
     /// Puts the bar on `setting`, in its tab.
     fn go_to(view: &mut SettingsView, setting: Setting) {
         let tab = (0..TABS.len())
-            .find(|&tab| rows(tab).contains(&Row::Setting(setting)))
+            .find(|&tab| rows(tab, &[]).contains(&Row::Setting(setting)))
             .unwrap();
         press(view, KeyCode::Char(char::from(b'1' + tab as u8)));
-        while view.row() != Row::Setting(setting) {
+        while view.row() != Some(Row::Setting(setting)) {
             press(view, KeyCode::Down);
         }
     }
@@ -1813,6 +1949,7 @@ mod tests {
         );
         let switches = [
             (S::Sound, false),
+            (S::ConfirmQuit, false),
             (S::UpdateCheck, false),
             (S::HideSingleTab, true),
             (S::AutoSwitch, true),
@@ -1990,14 +2127,14 @@ mod tests {
             Some(30)
         );
         // Every setting is somewhere in the file, and in a tab.
-        for tab in 0..KEYS_TAB {
-            for row in rows(tab) {
+        for tab in 0..HOOKS_TAB {
+            for row in rows(tab, &[]) {
                 let Row::Setting(setting) = row else { panic!() };
                 assert!(!setting.keys().is_empty());
             }
         }
-        let settings: usize = (0..KEYS_TAB).map(|tab| rows(tab).len()).sum();
-        assert_eq!(settings, 45);
+        let settings: usize = (0..KEYS_TAB).map(|tab| rows(tab, &[]).len()).sum();
+        assert_eq!(settings, 46);
     }
 
     /// Writes `change` to a config file made of `text`, and reads it back.
@@ -2012,8 +2149,8 @@ mod tests {
     #[test]
     fn what_each_choice_writes_the_config_reads() {
         let mut view = view_of(Config::default(), None);
-        for tab in 0..KEYS_TAB {
-            for row in rows(tab) {
+        for tab in 0..HOOKS_TAB {
+            for row in rows(tab, &[]) {
                 let Row::Setting(setting) = row else { continue };
                 if setting.typed() {
                     continue;
@@ -2104,7 +2241,7 @@ mod tests {
         let mut view = view_of(Config::default(), None);
         press(&mut view, KeyCode::Down);
         press(&mut view, KeyCode::Tab);
-        assert_eq!(view.row(), Row::Setting(S::Theme));
+        assert_eq!(view.row(), Some(Row::Setting(S::Theme)));
         assert!(
             text(&view).contains("Tab bar and window"),
             "{}",
@@ -2112,23 +2249,28 @@ mod tests {
         );
         press(&mut view, KeyCode::BackTab);
         press(&mut view, KeyCode::BackTab);
-        assert_eq!(view.row(), Row::Key(KeyId::Prefix));
+        assert_eq!(view.row(), Some(Row::Key(KeyId::Prefix)));
         press(&mut view, KeyCode::Char(']'));
-        assert_eq!(view.row(), Row::Setting(S::Notify));
-        press(&mut view, KeyCode::Char('8'));
-        assert_eq!(view.row(), Row::Setting(S::Notify));
+        assert_eq!(view.row(), Some(Row::Setting(S::Notify)));
+        press(&mut view, KeyCode::Char('9'));
+        assert_eq!(view.row(), Some(Row::Setting(S::Notify)));
         press(&mut view, KeyCode::End);
-        assert_eq!(view.row(), Row::Setting(S::HideDrafts));
-        press(&mut view, KeyCode::Char('7'));
+        assert_eq!(view.row(), Some(Row::Setting(S::HideDrafts)));
+        press(&mut view, KeyCode::Char('8'));
         press(&mut view, KeyCode::PageDown);
-        assert_eq!(view.row(), rows(KEYS_TAB)[PAGE]);
+        assert_eq!(view.row(), Some(rows(KEYS_TAB, &[])[PAGE]));
+        // A tab with no rows has no bar.
+        press(&mut view, KeyCode::Char('7'));
+        assert_eq!(view.row(), None);
+        assert_eq!(press(&mut view, KeyCode::Char(' ')), Outcome::Stay);
+        assert!(text(&view).contains("none of the agents crystal can hook"));
     }
 
     /// The keys' tab, the bar on `key`.
     fn on_key_row(config: Config, key: KeyId) -> SettingsView {
         let mut view = view_of(config, None);
-        press(&mut view, KeyCode::Char('7'));
-        while view.row() != Row::Key(key) {
+        press(&mut view, KeyCode::Char('8'));
+        while view.row() != Some(Row::Key(key)) {
             press(&mut view, KeyCode::Down);
         }
         view
@@ -2227,6 +2369,63 @@ mod tests {
                 lines: vec![(kill, Some(Binding::One("none".into())))],
                 taken_from: None,
             })
+        );
+    }
+
+    #[test]
+    fn an_agents_hooks_go_in_come_up_to_date_and_come_out_with_space() {
+        use integration::Agent;
+        let mut view = view_of(Config::default(), None);
+        let hooked = |integrations| Current {
+            path: PathBuf::from("/c"),
+            config: Ok(Config::default()),
+            model: None,
+            integrations,
+        };
+        view.set_current(hooked(vec![
+            (Agent::Claude, Standing::Installed),
+            (Agent::Codex, Standing::OutOfDate),
+            (Agent::Pi, Standing::NotInstalled),
+        ]));
+        press(&mut view, KeyCode::Char('7'));
+        let shown = text(&view);
+        assert!(shown.contains("Claude Code"), "{shown}");
+        assert!(shown.contains("out of date"), "{shown}");
+        assert_eq!(
+            press(&mut view, KeyCode::Char(' ')),
+            Outcome::Integrate {
+                agent: Agent::Claude,
+                install: false
+            }
+        );
+        press(&mut view, KeyCode::Char('j'));
+        assert_eq!(
+            press(&mut view, KeyCode::Enter),
+            Outcome::Integrate {
+                agent: Agent::Codex,
+                install: true
+            }
+        );
+        // The bar stops at the last.
+        press(&mut view, KeyCode::Char('j'));
+        press(&mut view, KeyCode::Char('j'));
+        assert_eq!(
+            press(&mut view, KeyCode::Char(' ')),
+            Outcome::Integrate {
+                agent: Agent::Pi,
+                install: true
+            }
+        );
+        view.set_note("codex: review them in its /hooks".into());
+        assert!(text(&view).contains("review them in its /hooks"));
+        // An agent gone between two reads leaves the bar on a row there is.
+        view.set_current(hooked(vec![(Agent::Claude, Standing::NotInstalled)]));
+        assert_eq!(
+            press(&mut view, KeyCode::Char(' ')),
+            Outcome::Integrate {
+                agent: Agent::Claude,
+                install: true
+            }
         );
     }
 
@@ -2369,6 +2568,7 @@ mod tests {
             path: PathBuf::from("/c"),
             config: Ok(config),
             model: Some(status()),
+            integrations: Vec::new(),
         });
         assert_eq!(press(&mut view, KeyCode::Enter), Outcome::Prepare);
     }
@@ -2382,11 +2582,12 @@ mod tests {
             path: PathBuf::from("/c"),
             config: Err("`notfy` is not a setting".into()),
             model: None,
+            integrations: Vec::new(),
         });
         assert_eq!(press(&mut view, KeyCode::Char(' ')), Outcome::Stay);
         assert!(view.problem().unwrap().contains("can't be read"));
         assert!(text(&view).contains("`notfy` is not a setting"));
-        press(&mut view, KeyCode::Char('7'));
+        press(&mut view, KeyCode::Char('8'));
         assert_eq!(press(&mut view, KeyCode::Enter), Outcome::Stay);
         assert!(!view.takes_keys_as_they_come());
     }

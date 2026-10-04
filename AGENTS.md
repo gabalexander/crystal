@@ -45,9 +45,10 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   `subscribe` a stream of its events, for the CLI and a TUI to read, which picks up again after a handover,
   and `lay_out` a layout command for the TUI; restarting the daemon, handed over or cold
 - `src/layout.rs`: laying out the TUI from the command line: the commands `crystal tab`, `crystal pane`,
-  `crystal title` and `crystal layout apply` send, the order a TUI gets with the id of the session it was run
-  in, what the TUI reports back, the layout it answers with, where the daemon says the user is, and how
-  `crystal layout` prints it
+  `crystal title`, `crystal layout apply` and `crystal plugin pane open` send (a session shown over the panes
+  or in a popup only by a TUI), the order a TUI gets with the id of the session it was run in, what the TUI
+  reports back, the layout it answers with, where the daemon says the user is, and how `crystal layout` prints
+  it
 - `src/layout_file.rs`: layout files, as herdr's `layout.export` and `layout.apply` take them: `crystal layout
   export` writing the tabs with what starts each session again, and `crystal layout apply` reading one (the
   shape `crystal layout --json` prints, with a session's `cwd`, `command` and `env` where it's named),
@@ -67,13 +68,21 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   session's history, and back to live as you type
 - `src/bell.rs`: passing a session's terminal bell on to the user's own terminal, at most one every half a
   second
-- `src/viewer.rs`: the client's side of an attach, shared by `crystal attach` and the TUI's pane
-- `src/drive.rs`: `crystal send`, `wait`, `read`, `result`, `answer` and `interrupt`, for driving one session from
-  another or a script; waits listen to the daemon's events about their session, and `wait --output` has the
-  daemon look at its screen, asking again when a handover cuts it; `task --wait`'s run, done or failed
+- `src/viewer.rs`: the client's side of an attach, shared by `crystal attach`, the TUI's pane and the streams,
+  which attach as a program rather than the user
+- `src/drive.rs`: `crystal send` (its text from standard input with `-`, a task's run stopped first with
+  `--interrupt`), `wait`, `read` (`--ansi`, `--unwrap`, `--since`), `process-info`, `result`, `answer` and
+  `interrupt`, for driving one session from another or a script; waits listen to the daemon's events about their
+  session, and `wait --output` has the daemon look at its screen, asking again when a handover cuts it; `task
+  --wait`'s run, done or failed; a wait that gives up is a `TimedOut`, which `crystal` exits 2 for
+- `src/stream.rs`: `crystal observe` and `control`: a session's terminal as JSON lines, its output base64,
+  attached again after a handover, and `control`'s commands on standard input (input, keys, resize, release)
+- `src/api.rs`: `crystal api snapshot`: the sessions, layout, projects, open tasks, flow runs and archive in one
+  JSON document, with the latest event's seq to follow on from
 - `src/messages.rs`: what `crystal send` carries from one session to another: the text tidied and cut to 8 KiB,
-  the line ahead of it saying which session sent it, the guard that holds a session to 20 sends a minute, and
-  the `agent_blocked:` refusal for an agent asking the user something; adapted from docket's
+  the line ahead of it saying which session sent it, the guard that holds a session to 20 sends a minute, the
+  refusal of a message that only acknowledges (`ok`, `thanks`, `👍`), and the `agent_blocked:` refusal for an
+  agent asking the user something; adapted from docket's
 - `src/keys.rs`: turning keys into the bytes a terminal sends: the TUI's keys, and the names `send-keys` takes;
   the old way, or in the Kitty keyboard protocol once a program has asked for it
 - `src/remote.rs`: `crystal ssh`: finds (or installs) crystal on another machine, then runs it there over ssh
@@ -97,8 +106,11 @@ whenever what's handed over changes in a way the crystal before couldn't read.
     mouse from the terminal or leaving it there (`[mouse] capture`), counting clicks for double- and
     triple-clicks, scrolling a pane's history on a timer while a drag selecting in it is held past its edge,
     and sending a pager the wheel as arrow keys; having git count the changes of the worktrees the sidebar
-    shows, off the loop; and running the user's own keys' commands: a popup over everything, a session in a
-    pane or a tab, or a command in the background that says only when it fails
+    shows, off the loop; asking the daemon what crystal's processes take, every few seconds and every second
+    while the RAM view is open, off the loop; adding a project `+` asked for, made a git repository first
+    once the user said so; running the user's own keys' commands: a popup over everything, a session in a
+    pane or a tab, or a command in the background that says only when it fails; and watching the config
+    file, taking a change made by hand in at once, or saying why it can't be read
   - `app.rs`: the state and how keys and the mouse change it: a sidebar key looked up in the keymap and its
     command run, from the sidebar, the `:` list, after the prefix in a pane or in a pane without it for a key
     written `direct+`; a plugin's first key waiting for its second; a key in a view taken as the key the user
@@ -107,18 +119,22 @@ whenever what's handed over changes in a way the crystal before couldn't read.
     resting on one out of sight; the forge's lists, one asked before the one kept dropped, and the issues
     edited in the issues view laid over what was asked before the forge saved them; the worktrees being
     removed, for this TUI and for anyone else, as the daemon lists them; killing the last session in a linked
-    worktree asking whether the worktree goes too; no I/O, so it's unit-tested
+    worktree asking whether the worktree goes too; `q` asking first (`confirm_quit`); `D` opening the
+    new-session panel like the selected session; `+`'s question, its `Tab` handed to the event loop to finish
+    the directory; what crystal's processes take, and where the footer drew its readout of it, for a click;
+    no I/O, so it's unit-tested
     - `app/commands.rs`: the layout commands carried out on the state, each on the tab holding the session it's
       about, in front or not, a layout applied (each of its tabs in place of the tab of its name or after the
       others, or in place of every tab), and the layout the TUI answers with; and carried out with no TUI
       open, on a state made for it from the tabs kept, the sessions and the flow runs, on a screen of an unseen
-      session's size
+      session's size; a plugin's pane over the panes left to the event loop to show
   - `layout_link.rs`: the TUI's end of the layout commands: offering the daemon to take them, again at once
     after a handover or a restart, each one an event for the loop, and its answers, that it was used (a
     key, the mouse, a paste, focus gained) and when its terminal gains and loses the focus  sent back
   - `ui.rs`: the layout and drawing (the tab bar, on top or over the footer or left out, its tabs and what
     it shows at its right, the counts of what's open on the selected session's forge first, pane headers,
-    footer, the column each pane's scrollbar takes), and what's under the mouse
+    footer and its readout of the memory crystal takes, the column each pane's scrollbar takes), and what's
+    under the mouse
   - `scrollbar.rs`: a pane's scrollbar: where its thumb is for how far back the pane is, how far back a
     dragged thumb takes it, and drawing it; pure, so it's unit-tested
   - `tabs.rs`: tabs, as many as the user likes, each holding its own sessions (each session in exactly one)
@@ -192,7 +208,8 @@ whenever what's handed over changes in a way the crystal before couldn't read.
     daemon takes it, and its drawing
   - `launcher.rs`: the new-session panel (`n`, `w`): its state and keys, kept apart from I/O, the command
     it builds, what it remembers between runs, the draft it leaves when it's put away with a task in it and
-    opens on again, and its drawing
+    opens on again, the panel `D` opens like a session (the profile its command fits or its agent, its
+    rows from its options, the rest of its arguments kept), and its drawing
   - `command_line.rs`: reads the line typed at `new session:` (the panel's `Ctrl+E`) into the command to run
   - `profiles.rs`: the profiles view (`P`): the list, the form that edits one, its keys and drawing; the
     event loop does the writing
@@ -211,8 +228,9 @@ whenever what's handed over changes in a way the crystal before couldn't read.
     list asked for again and the heading saying so, the reading pane, and drawing them
   - `compose.rs`: writing back to the forge from those views: the comment box and the form that edits an
     issue, which keep what's typed until the forge takes it
-  - `backlog_view.rs`: the backlog view `b` opens: its state and keys, kept apart from I/O, and its
-    drawing
+  - `backlog_view.rs`: the backlog view `b` opens: its state and keys, kept apart from I/O, an item's line
+    changed (`e`), the list kept to a tag (`t`), and its drawing, the item the bar is on under the list with
+    its tags, the tasks started for it and its body
   - `pane.rs`: a viewer of a session on screen, the selected one or a split, and its screen, with copy mode
     over it while that's on; what the mouse selects on it, by characters, words or lines (`Clicks` counts
     them), following the history as a drag scrolls it, kept in copy mode without `copy_on_select`, and its
@@ -241,20 +259,31 @@ whenever what's handed over changes in a way the crystal before couldn't read.
     that narrows it to the files that match and their directories, edited as a text box is but for the keys
     the tree and the preview take, the border dragged, its keys and drawing; kept apart from I/O, so it's
     unit-tested
-  - `preview.rs`: the file finder's and the tree browser's preview: a file read and highlighted off the
-    event loop, a markdown file's page laid out for its width or its source, scrolling, and drawing them
-  - `memory_view.rs`: the memory view (`m`): a project's entries, the filter, forgetting and
+  - `preview.rs`: the file finder's, the tree browser's and the handoff view's preview: a file read and
+    highlighted off the event loop, a markdown file's page laid out for its width or its source, scrolling,
+    and drawing them
+  - `memory_view.rs`: the memory view (`m`): a project's entries by their titles, the filter, the entry's
+    file opened in the editor (Enter), in the worktree it was said in while that's there, forgetting and
     promoting after a `y`, and its drawing
   - `plugins_view.rs`: the plugins view (`X`): every plugin, on or off, with installed ones' actions, panes and
-    link handlers, its keys and drawing; the event loop does the switching, runs actions and opens plugins'
-    panes over the others
-  - `timeline.rs`: the timeline (`a`): the event log read back a page at a time, the newest first, and
-    followed while it's open, filtered as you type and by kind, what's new since the user was away marked,
-    the line the bar is on read whole, and its drawing; kept apart from I/O, and events of kinds it doesn't
-    know are listed by their name and what they say
+    link handlers, and those the selected session's project ships under its name, which the view turns off
+    but leaves the command line to turn on; its keys and drawing; the event loop does the switching, runs
+    actions and opens plugins' panes where their manifests place them, through the layout commands for those
+    among the panes
+  - `timeline.rs`: the timeline (`a`, and `I` for the selected session's): the event log of everything or
+    of one scope, a session, its task or its project, read back a page at a time, the newest first, and
+    followed while it's open, `Ctrl+S` going through the selection's scopes, filtered as you type and by
+    kind, what's new since the user was away marked, the line the bar is on read whole, and its drawing;
+    kept apart from I/O, and events of kinds it doesn't know are listed by their name and what they say
+  - `handoff_view.rs`: the handoff view (`M`): the selected session's worktree's handoff notes and the files
+    its task kept, listed, the one the bar is on previewed, and opened in the editor; its state and keys,
+    kept apart from I/O (the event loop looks for the notes and reads the kept files), and its drawing
   - `needs_you.rs`: the needs-you view (`U`): everything waiting on the user, in every tab, the most urgent
     first, from the sessions and flow runs the TUI has; answering a permission or a gate in place, the bar
     kept on its row as rows come and go, and its drawing
+  - `ram_view.rs`: the RAM view (`#`): the memory each session's processes take, the biggest first, its
+    share of all of it, and crystal's own; Enter goes to the session, the bar kept on its session as a new
+    look reorders the rows; its state, keys and drawing, and the footer's readout
   - `away.rs`: "while you were away": when the user is gone (a quit, the terminal's focus lost for a while, or
     no key for a while where focus isn't told), what the event log gained meanwhile counted into the
     footer's line, and the latest event seen, which the event loop keeps in the database
@@ -262,12 +291,15 @@ whenever what's handed over changes in a way the crystal before couldn't read.
     from the sessions the TUI sees waiting their turn, and those that failed, said once; pure
   - `settings_view.rs`: the settings view (`,`): the settings in tabs (general, look, sessions, mouse, tasks,
     memory), each under its heading, changed with a key, gone through with the arrows or typed in, or taken out
-    of the file for its default, and how the models stand; and the keys' tab, every key `[keys]` gives, the key
+    of the file for its default, and how the models stand; crystal's hooks in each agent installed here, put
+    in, brought up to date or taken out with a key; and the keys' tab, every key `[keys]` gives, the key
     pressed next given one, one another has taken from it once the user says so; kept apart from I/O, so it's
-    unit-tested; the event loop writes the file (`config::apply`) and, while it's open, reads the settings and
-    the daemon's `EmbeddingStatus` again every half a second
+    unit-tested; the event loop writes the file (`config::apply`) or the agent's hooks (`integration`) and,
+    while it's open, reads the settings, the hooks and the daemon's `EmbeddingStatus` again every half a second
 - `src/daemon.rs`: the daemon: listens on the socket and owns the sessions, and emits an event wherever something
-  happens to them, their tasks, flows, worktrees, memory or backlog; archives sessions and starts them again,
+  happens to them, their tasks, flows, worktrees, memory or backlog, and for the entries of memory gone stale,
+  looked for hourly and as each task closes; archives sessions, the distiller reading what one did, and starts
+  them again,
   stops agents left idle past `[sessions] stop_idle_after`, and keeps the list of projects sessions ran in;
   after a cold restart, puts the sessions written down back in their places and starts them again, agents
   `[sessions] restart_spacing_ms` apart on a thread of their own, those that can't start kept, failed, saying
@@ -291,13 +323,15 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   descriptors open across the exec, the readers it stops, the gate connections come in through, the helpers
   (hooks, the distiller) it waits for, and waiting for a child by its pid
 - `src/events.rs`: what happens, as events: the one `Event` type, its kinds (a public contract plugins listen
-  for), what each carries, how one reads in a line, the filter a reader gives, and the made-up event `plugin run
-  --event` tries hooks on; pure, so it's unit-tested
+  for: add one, never rename one) and when each happens, what each carries, how one reads in a line, the filter
+  a reader gives, the scope a timeline shows (a session, a task or a project), and the made-up event `plugin
+  run --event` tries hooks on; pure, so it's unit-tested
 - `src/event_log.rs`: the event log, the `events` table in the database, read and pruned by age and count; and
   the daemon's `Bus`, which numbers each event (a `seq` that never goes back), writes it down and sends it to
   every subscriber: clients streaming over the socket, and the plugins' hooks
-- `src/events_cli.rs`: `crystal events`: the log in a shell, filtered, as lines or JSON, or followed, and `--since`
-  read as a while back or a time on this machine's clock
+- `src/events_cli.rs`: `crystal events`: the log in a shell, filtered (by kind, session, project or task), the
+  newest few with `--limit`, after a seq with `--after`, as lines or JSON, or followed, and `--since` read as a
+  while back or a time on this machine's clock, which `read --since` takes too
 - `src/agents.rs`: what crystal knows about particular agents: the hooks it adds to Claude Code, the events it
   listens to and what they mean (Claude Code's, which others copied adding a few, Cursor's spelled its own
   way, Letta's, and Codex's), subagents' among them, the variable that quiets the installed hooks for an agent
@@ -311,7 +345,8 @@ whenever what's handed over changes in a way the crystal before couldn't read.
 - `src/agent_hooks.rs`: crystal's hooks in the own settings of Cursor, Droid, Qoder, Qwen, Copilot, Devin, Kimi
   (TOML, with `toml_edit`), Letta, MastraCode, Grok and Antigravity, each in its shape and place, naming their
   events with `--event` where their input may not, for `crystal integration`: put there and taken out on the
-  user's word, the user's own hooks left alone
+  user's word, the user's own hooks left alone, and whether they're as this crystal would put them or out of
+  date
 - `src/agent_plugins.rs`: crystal's plugins for the agents that take plugins: Pi's extension, OpenCode's and
   Kilo's plugin and Hermes's, from `assets/integrations/` with crystal's path written in, each running `crystal
   hook <agent> --event`; written, out of date or not, and taken out, only files crystal wrote, and Hermes's
@@ -325,13 +360,19 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   resume`, and crystal's notes given as its developer instructions, after the ones it has already
 - `src/hook.rs`: `crystal hook <agent>`: what those hooks run, any agent's, to tell the daemon, the prompt sent,
   the conversation, the agent and a subagent included (the daemon passes over an agent's that isn't the one in
-  front), and to pass on its reminder to an agent ending a turn with its task open; with `--installed`, the
-  hooks `crystal integration` installed, and with `--event`, the event a hook or plugin names itself
+  front), and to pass on its reminder to an agent ending a turn with its task open, and to Claude Code, as the
+  user sends a prompt, the name the session was renamed to in crystal; with `--installed`, the hooks `crystal
+  integration` installed, and with `--event`, the event a hook or plugin names itself
+- `src/claude_title.rs`: keeping a session's name and Claude Code's name for its conversation (`/rename`) in
+  step: the file Claude Code keeps it in beside the transcript, looked at with each check, a rename since the
+  first look followed unless the user named the session; and a rename in crystal, given once as the prompt
+  hook's `sessionTitle` (adapted from docket's)
 - `src/integration.rs`: `crystal integration install|uninstall|status`: crystal's hooks put in Claude Code's
   `settings.json` and Codex's `hooks.json` (and `[features] hooks` in its `config.toml`, with `toml_edit`),
   beside the user's own, replacing those of a crystal at another path, taken out again alone, written in one
   go through symbolic links; pure edits on the JSON, so they're unit-tested; and the other agents' through
-  `agent_hooks.rs` and `agent_plugins.rs`
+  `agent_hooks.rs` and `agent_plugins.rs`; how each stands, installed, out of date or not
+  (`--outdated-only`), and the agents installed here, for the settings view
 - `src/report.rs`: `crystal report`: any agent, or a script wrapped around one, saying what it's doing and the
   command that resumes it; checking that command, and what's typed into a shell to run it after a restart; and
   what `--line` and `--model` put on a session's row, for the sidebar alone: tidied, each with when it goes
@@ -342,22 +383,28 @@ whenever what's handed over changes in a way the crystal before couldn't read.
 - `src/agent_screen.rs`: reading what an agent is doing off its screen, title and progress, by its rules, and
   the watch that counts a new look once it holds for two checks
 - `src/front.rs`: what's in front in a session's terminal (agent, shell or program), from its foreground process:
-  an agent by its program's name, the catalog's or one its rules give, or by the npm package its rules name
+  an agent by its program's name, the catalog's or one its rules give, or by the npm package its rules name,
+  or by `CRYSTAL_AGENT` in its environment for a wrapper that hides it; and the processes in the foreground
+  process group, each with its command and working directory, for `crystal process-info`
 - `src/typing.rs`: typing into a session the way a person would: pastes marked, Enter on its own
 - `src/session.rs`: one program in a PTY, or a task: spawn, exit status, stop, its screen (120 by 40 until a viewer
-  sizes it), viewers and listeners, the waits for output looking at it, the agent that says what it's doing
+  sizes it), viewers (the user, or a program, which doesn't count as watching) and listeners, the output lately
+  in an `OutputRing` and reading the screen as `crystal read` asks, the waits for output looking at it, the agent that says what it's doing
   itself while it holds the session, the
   conversation its agent's hooks named, which counts once the agent has worked on a turn in it, an agent typed
   into its shell whose conversation a restart resumes while it's in front, its agent's subagents,
-  whether its first prompt can name it, whether its agent is blocked on the user, how long its agent has sat
+  whether its first prompt can name it, whether the user or a script gave its name, the name Claude Code gives
+  its conversation, whether its agent is blocked on the user, how long its agent has sat
   idle (nobody watching or typing, its turn seen), the model its agent runs on and what was reported for its
   row, why its screen reads the way it does (`crystal agent explain`), and what has changed in it (its agent's
   activity, a task's runs, its bell rung or a copy its program made while nobody watched) for the daemon to
   tell; one written down before
   a restart, with no program, while it waits its turn to start again or once it couldn't, saying why on its
   screen; handing it over and adopting it, its PTY on a descriptor of crystal's own
-- `src/vt.rs`: a terminal's screen, through `alacritty_terminal`: what a program drew and its history, the modes
-  it set, its answers to the program's questions (the daemon's screen only), the output that catches a new viewer
+- `src/output_ring.rs`: the last MiB a session's program wrote, with a mark of when at most every second, and
+  what came since a time, or that it can't say, for `crystal read --since`; adapted from docket's
+- `src/vt.rs`: a terminal's screen, through `alacritty_terminal`: what a program drew and its history, read as
+  text a row or a line at a time, with its colors as SGR codes or not, the modes it set, its answers to the program's questions (the daemon's screen only), the output that catches a new viewer
   up (its hyperlinks included), the cells to draw, the input modes `crystal attach` asks your terminal for, and,
   for a viewer, copy mode's cursor, selection (of characters, words, lines or a block) and search, which are
   Alacritty's vi mode, and the link on a cell: a hyperlink a program wrote (OSC 8), or a URL in the text across
@@ -413,9 +460,10 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   stopping one, and deleting a stopped one's state
 - `src/db.rs`: the SQLite database the daemon and the TUI keep their state in (WAL, `synchronous=NORMAL`,
   migrations by `user_version`, as docket does): the sessions to start again, the archived sessions, flow runs,
-  the projects on crystal's list, each project's backlog and closed tasks, the files tasks kept, the tasks waiting to start and the last task number, what each
+  the projects on crystal's list, each project's backlog (each item's line, body and tags) and closed tasks, the files tasks kept, the tasks waiting to start and the last task number, what each
   task carried beside its goal (its acceptance criteria, pull request and issue), what background
-  tasks spent each day, the event log, read from a point on or a page at a time back from its end, and the TUI's
+  tasks spent each day, the event log, read from a point on or a page of a timeline's scope at a time back
+  from its end, and the TUI's
   tabs, layouts, the new-session panel's memory, the diff view's reviewed marks, the projects folded in the
   sidebar and the latest event the user had seen, each a JSON document; and bringing in the JSON files from before, a project's the first time it's
   asked for. Settings stay in the config file and memory in `memory.db`
@@ -438,13 +486,17 @@ whenever what's handed over changes in a way the crystal before couldn't read.
 - `src/artifacts.rs`: the files a task keeps as it closes (`crystal done --artifact`): checking each is a small
   file in the task's worktree, copying them into the task's directory in the state directory under names of
   their own, and keeping the worktree's handoff file there too
-- `src/backlog.rs`: a project's backlog, numbered items kept in the database by the daemon alone, its
-  markdown export, and `enabled`, the one gate everything the backlog adds goes through
+- `src/backlog.rs`: a project's backlog, numbered items kept in the database by the daemon alone, each a line
+  and a body, changed, imported (those whose line is there already passed over) and filtered by tag; what a
+  task started for one is asked; its markdown export and reading a markdown list of checkboxes back, and
+  `enabled`, the one gate everything the backlog adds goes through
 - `src/worktree_cli.rs`: `crystal worktree list`, `create`, `open` (finding the worktree; `main.rs` starts the
   session), `label` and `move`, which makes the worktree a session moves into when there's none
 - `src/work.rs`: `crystal done` (with `--artifact`), `handoff`, `tasks` and its commands (`new`, `start`, `show`,
   `cancel`, `log`, `terminal`), reading what a new task carries (`--accept`, and `--pr` and `--issue` from the
-  forge, a pull request's worktree found or made), and `backlog`
+  forge, a pull request's worktree found or made), and `backlog` with its commands, an item's card with the
+  tasks started for it, and starting a task for one with a profile, in a worktree, on a pull request or in the
+  background
 - `src/config.rs`: the settings in `~/.config/crystal/config.toml`, read and checked: a theme by any of its
   names, the colors `[colors]` takes, what the mouse does (`[mouse]`) and whether programs' copies go on the
   clipboard (`[clipboard]`); what background tasks may spend and do unasked (`[tasks]`); the shell a new terminal runs
@@ -455,12 +507,16 @@ whenever what's handed over changes in a way the crystal before couldn't read.
 - `src/memory.rs`: what a project's sessions learned: the SQLite store in the state directory with its FTS5
   index (bm25, prefix and porter-stemmed words), each entry's vector and search by meaning merged with it by
   reciprocal rank fusion, then the reranker's read of the best (nothing when none answers), its migrations,
-  the same said again seen again, forgotten entries the distiller can't add back, bringing in a project's JSON file from before, anchors (each file's SHA-256 when
-  an entry was said) and whether an entry holds, fresh, drifting or stale, search, the paragraph every agent is
+  the same said again seen again, forgotten entries the distiller can't add back, kept as they were to list,
+  bringing in a project's JSON file from before, anchors (each file's SHA-256 when
+  an entry was said) and whether an entry holds, fresh, drifting or stale, the entries gone stale the daemon
+  hasn't told of, search (of a kind, about some files or directories, the stale left out or not), an entry's
+  title, its first line, or one of its own, the paragraph every agent is
   shown at launch (entries about what its worktree changed first, in docket's 800 bytes, tasks' outcomes kept
   by an earlier crystal left out of it), promoting into
   CLAUDE.md, the markdown export, and `enabled`, the one gate everything memory adds goes through
-- `src/distill.rs`: the distiller: after a task closes, one tool-less `claude -p` (Haiku by default, `[memory]`
+- `src/distill.rs`: the distiller: after a task closes, or a session is archived that wasn't read as its task
+  closed, one tool-less `claude -p` (Haiku by default, `[memory]`
   in the config) over the end of its transcript, told what the memory has already; its answer checked
   against the checkout before it's kept
 - `src/mcp.rs`: `crystal mcp`: an MCP server over stdio with `memory_search` and `memory_show`, which every
@@ -475,11 +531,15 @@ whenever what's handed over changes in a way the crystal before couldn't read.
 - `src/qwen3.rs`: Qwen3, the transformer both models are, adapted from candle-transformers' to read texts whole:
   no cache, a batch padded at its end, causal attention through Candle's fused kernel on Metal (past 8 tokens,
   below which Candle's kernel isn't causal)
+- `src/resources.rs`: the memory crystal's processes take, for the RAM view: every process on the machine read
+  once (`/proc` on Linux, `ps` elsewhere), each session's program summed with every process under it, the
+  daemon's own and the asking client's, and the machine's memory; the counting pure, so it's unit-tested
 - `src/rerank.rs`: the reranker: every passage and the query in one prompt, each marked at its end, the
   projector over the model's state at the marks, and each passage's cosine with the query
 - `src/secrets.rs`: taking credentials out of text before memory keeps it or the distiller reads it
-- `src/memory_cli.rs`: `crystal remember` and `crystal memory`, `show`, `export` and `distill` included, and an
-  entry in full as `show` and the `memory_show` tool print it
+- `src/memory_cli.rs`: `crystal remember` and `crystal memory`, `add`, `list` (by kind, or what was
+  forgotten), `search` (by kind, files, the stale too, and how many), `show`, `export` and `distill` included,
+  and an entry in full as `show` and the `memory_show` tool print it
 - `src/profile.rs`: agent profiles: what one runs, checking it, and saving or removing one in the config file
   with `toml_edit`, so the user's comments and layout stay; `enabled` is the one switch for the feature
 - `src/flows.rs`: flows, chains of tasks on one goal: the `[[flow]]` tables in the config file and in a project's
@@ -502,21 +562,29 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   files and the agents they're off for (`[sound]`), and playing one with the system's player, off the thread
   that asked, stopped if it hangs
 - `src/plugins.rs`: plugins: the registry of crystal's own, `enabled`, the gate every one of them goes through
-  (each module's `enabled` asks it), finding installed plugins and why one can't run here (it doesn't fit, or
-  its build failed) or be switched on, switching one in the config's `[plugins]` with `toml_edit`, the context
-  and environment their commands run with, each plugin's settings directory (shared, beside the config) and
-  state directory (each server's), their logs, pausing one that fails, and the plugin a link goes to
-- `src/plugin_manifest.rs`: an installed plugin's `plugin.toml` (build and startup commands, actions, events,
-  panes, link handlers, `min_crystal_version` and `platforms`), read and checked, whether it fits this crystal
-  and this system, and how event patterns match
+  (each module's `enabled` asks it), finding installed plugins and those a project ships in its
+  `.crystal/plugins/` (each known by its `Id`, its name and the project's), why one can't run here (it doesn't
+  fit, or its build failed) or be switched on, switching one in the config's `[plugins]`, or a project's in
+  its `[[project]]` table, with `toml_edit`, the plugins running, the context and environment their commands
+  run with, each plugin's settings directory (shared, beside the config) and state directory (each server's),
+  a project's kept apart under the project's name and hash, their logs, pausing one that fails, and the plugin
+  a link goes to
+- `src/plugin_manifest.rs`: a plugin's `plugin.toml` (build and startup commands, actions, events, panes and where
+  each is placed, link handlers, `min_crystal_version`, `platforms` and `timeout_secs`), read and checked,
+  whether it fits this crystal and this system, and how event patterns match
 - `src/plugin_hooks.rs`: the daemon's side of plugins' `[[events]]` and `[[startup]]`: a subscriber of the bus,
-  each plugin's hooks run one at a time on a thread of its own, with a timeout, a log, and a pause (and a
-  `plugin.paused` event) after failures in a row; startup commands queued the same way by `Hooks::start_up`,
-  which the daemon calls once its sessions are back (and a daemon taking over must call too); and running a hook
-  here, for `plugin run --event`
-- `src/plugin_cli.rs`: `crystal plugin`: listing, switching, running an action or trying hooks on a made-up event,
-  installing and building (`[[build]]`, its output in the plugin's log, a failure noted to keep it off), making
-  and removing
+  each plugin's hooks run one at a time on a thread of its own, with its timeout, a log, and a pause (and a
+  `plugin.paused` event) after failures in a row, a project's hearing only its project's events, each given the
+  event on its standard input, in `CRYSTAL_EVENT_JSON` and in words in `CRYSTAL_EVENT_TEXT`; startup commands
+  queued the same way by `Hooks::start_up`, which the daemon calls once its sessions are back (and a daemon
+  taking over must call too); and running a hook here, for `plugin run --event`
+- `src/plugin_cli.rs`: `crystal plugin`: listing, the project's own too, and the events hooks hear, switching
+  (a project's shown, asked about and built first), running an action, or trying hooks on an event made up,
+  given as JSON or both, opening a pane where it's placed (a session started, then shown over the TUI's panes,
+  or laid out with the layout commands), installing and building (`[[build]]`, its output in the plugin's log,
+  a failure noted to keep it off), making and removing
+- `examples/plugins/`: example plugins, each a `plugin.toml` and its scripts, which a unit test reads and
+  `tests/cli.rs` installs and runs
 - `src/env.rs`: the environment a session's program starts with
 - `src/git.rs`: a directory's project, worktree and branch, a project's linked worktrees, and making and
   removing worktrees, a new branch from `origin`'s default (fetched, with a timeout), the settings' base or
@@ -527,20 +595,21 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   worktree (a merge, a rebase, a cherry-pick or a revert) and the branch a rebase keeps though HEAD is
   detached, the subject of the commit each of Claude Code's own worktrees (`.claude/worktrees`) is at, what a
   worktree's line in the sidebar counts (its changes not committed, files and lines, and how far its branch is
-  ahead of its upstream and behind it, read without taking the index's lock), and `git grep` stopped once it's
-  no longer wanted (runs `git`)
+  ahead of its upstream and behind it, read without taking the index's lock), `git grep` stopped once it's
+  no longer wanted, and making a directory a repository for a new project (runs `git`)
   - `git/branches.rs`: a worktree's branches, local and remote, fetching its remotes in a session of their own
     with a timeout, its uncommitted changes, and switching it to another branch or a new one, the changes
     stashed, brought along, committed or thrown away, and put back when git won't switch
 - `src/names.rs`: made-up names for new worktrees' branches, like `brave-otter`, and a session's name from its
-  first prompt, like `fix-login-redirect`
+  first prompt, like `fix-login-redirect`, or from the name Claude Code gave its conversation
 - `src/forge.rs`: pull requests (open, and merged lately) and issues from the forge a project's remote is on,
   GitHub or GitLab, told apart by its host and the hosts `gh` and `glab` know: the types both read into,
   `Repo`'s calls, one pull request or issue among them read on its own, and running the CLI with a timeout; tests use a fake `gh` and `glab`, never the real ones.
   Was `github.rs`
   - `forge/github.rs`: each call as a `gh` command, and reading its `--json`
   - `forge/gitlab.rs`: each call as a `glab` command, and reading its JSON, a merge request as a pull request
-- `src/shell.rs`: quoting arguments and writing paths with `~`, the way a shell reads them
+- `src/shell.rs`: quoting arguments and writing paths with `~`, the way a shell reads them, and finishing a
+  directory's name as a shell's `Tab` does
 - `src/printable.rs`: text crystal didn't write made fit for the user's terminal: control characters, the escape
   sequences they start and the explicit bidi controls taken out, on one line or keeping its lines; and the TUI's
   frame scrubbed of them last, since ratatui hands a zero-width one on to the terminal. A background task's
@@ -554,8 +623,9 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   sounds off even then; memory's models are kept out by a cache that can't hold them and
   `CRYSTAL_NO_MODEL_DOWNLOAD`), plugins
   of their own in its plugins directory, and a Claude Code config directory of their own (`CLAUDE_CONFIG_DIR`),
-  since a daemon brings the skill there up to date as it starts; `crystal integration` runs with a home of its
-  own, and none of the variables that move agents' settings elsewhere; a test that opens the new-session panel pins `PATH` to its fake
+  since a daemon brings the skill there up to date as it starts; `crystal integration` and every TUI run with a
+  home of their own (the settings view puts agents' hooks in), and none of the variables that move agents'
+  settings elsewhere; a test that opens the new-session panel pins `PATH` to its fake
   agents, so no real agent is found or run, and a background task's `claude` is a fake that speaks stream-json,
   asks for permissions and takes interrupts. vt100 stands in for the user's own terminal: a second emulator,
   apart from crystal's. A test that copies, or opens a link, runs the TUI as over ssh (`SSH_TTY` set), so it

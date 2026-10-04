@@ -171,6 +171,12 @@ pub enum Request {
     },
     /// What background tasks have spent today, and the daily budget.
     Spending,
+    /// The memory each running session's processes take, the daemon's
+    /// own, and the asking client's, whose process is `client`.
+    Resources {
+        #[serde(default)]
+        client: Option<u32>,
+    },
     /// Close a session's task, done or failed. A program in a session says
     /// which by its `id`; from outside, it's the session's `name`.
     Close {
@@ -212,8 +218,8 @@ pub enum Request {
     SearchMemory {
         dir: PathBuf,
         query: String,
-        kind: Option<crate::memory::Kind>,
-        limit: usize,
+        #[serde(flatten)]
+        wanted: crate::memory::Wanted,
     },
     /// The tasks of the project `dir` is in, or of every project with
     /// `all`: those still open, then those waiting to start, then those
@@ -256,8 +262,29 @@ pub enum Request {
     BacklogAdd {
         dir: PathBuf,
         text: String,
+        /// More than its line says, when there's more to say.
+        #[serde(default)]
+        body: String,
         #[serde(default)]
         tags: Vec<String>,
+    },
+    /// Change a backlog item: each of its line, its body and its tags that's
+    /// given, in place of what it was.
+    BacklogEdit {
+        dir: PathBuf,
+        number: u64,
+        #[serde(default)]
+        text: Option<String>,
+        #[serde(default)]
+        body: Option<String>,
+        #[serde(default)]
+        tags: Option<Vec<String>>,
+    },
+    /// Put these items on the backlog of the project `dir` is in, all or
+    /// none, but for those whose line it has already.
+    BacklogImport {
+        dir: PathBuf,
+        items: Vec<NewItem>,
     },
     /// Mark a backlog item done, or open again.
     BacklogMark {
@@ -385,14 +412,31 @@ pub enum Request {
         #[serde(default)]
         agent: Option<String>,
     },
+    /// What runs in a session's terminal: its program, and the processes
+    /// in front, each with its command and the directory it works in.
+    ProcessInfo {
+        name: String,
+    },
     /// What's on a session's screen, as text.
     Read {
         name: String,
         /// The rows that have scrolled up off the screen too, ahead of it.
         #[serde(default)]
         history: bool,
+        /// A line a program wrote, however many rows it wrapped onto, as
+        /// one.
+        #[serde(default)]
+        unwrap: bool,
+        /// With the SGR sequences that color it.
+        #[serde(default)]
+        ansi: bool,
+        /// Only what the program wrote from then on, in milliseconds since
+        /// the Unix epoch.
+        #[serde(default)]
+        since_ms: Option<u64>,
     },
-    /// With no name, the newest session.
+    /// With no name, the newest session. A size of 0 by 0 leaves the
+    /// session's as it is.
     Attach {
         name: Option<String>,
         rows: u16,
@@ -401,6 +445,10 @@ pub enum Request {
         /// can scroll back through it.
         #[serde(default)]
         history: bool,
+        /// A program watches, like `crystal observe`, not the user: the
+        /// session isn't seen or watched for it.
+        #[serde(default)]
+        program: bool,
     },
     /// Stop the daemon. With `keep_sessions`, the running sessions stay
     /// written down, so that the next daemon starts them again.
@@ -560,11 +608,16 @@ pub enum Response {
         #[serde(default)]
         id: String,
         running: bool,
+        /// The session's size, rows by columns, as the output starts.
+        #[serde(default)]
+        size: (u16, u16),
     },
     /// A session's screen, one string per row.
     Screen {
         rows: Vec<String>,
     },
+    /// What runs in a session's terminal.
+    Processes(Processes),
     Explained(Box<ScreenExplained>),
     /// A task's answer, and what it has come to.
     Result(TaskResult),
@@ -585,11 +638,24 @@ pub enum Response {
         transcript: Option<Vec<String>>,
     },
     Spending(Spending),
+    Resources(crate::resources::Resources),
+    /// What the hook reporting a prompt the user sent tells Claude Code:
+    /// the title to give the conversation, the name the user renamed the
+    /// session to in crystal.
+    Retitle {
+        title: String,
+    },
     /// A project's backlog.
     Backlog(Backlog),
     /// The number a new backlog item got.
     Added {
         number: u64,
+    },
+    /// What an import put on the backlog: the numbers its new items got,
+    /// and how many it passed over as there already.
+    Imported {
+        added: Vec<u64>,
+        skipped: usize,
     },
     /// How many items are open on each project's backlog.
     BacklogCounts {
@@ -633,6 +699,11 @@ pub enum Response {
     /// The line on a session's screen that matched.
     Matched {
         line: String,
+    },
+    /// A wait gave up before what it waited for came, saying so: the
+    /// client exits 2 for it, not 1 as for an error.
+    TimedOut {
+        message: String,
     },
     /// The daemon a handover was asked of has been handed over: it runs the
     /// new crystal now, which says so, with how many sessions carried on.
@@ -725,6 +796,30 @@ pub struct SessionInfo {
 
 fn is_zero(count: &u32) -> bool {
     *count == 0
+}
+
+/// What runs in a session's terminal: `crystal process-info`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Processes {
+    /// The session's own program.
+    pub pid: Option<u32>,
+    /// The foreground process group, the job the terminal's keys go to,
+    /// while the terminal says.
+    pub group: Option<i32>,
+    /// The processes in that group, its leader first.
+    pub foreground: Vec<ProcessInfo>,
+}
+
+/// A process, as `crystal process-info` shows it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessInfo {
+    pub pid: i32,
+    /// Its program's name.
+    pub name: String,
+    /// What it was run with, its name first.
+    pub argv: Vec<String>,
+    /// The directory it works in, when the system says.
+    pub cwd: Option<PathBuf>,
 }
 
 /// How full a conversation's context is: the tokens the model was given for
@@ -1229,13 +1324,30 @@ pub fn task_label(id: Option<u64>) -> String {
 }
 
 /// One project's backlog: things to do later.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Backlog {
     /// The project's name, as the sidebar shows it.
     pub project: String,
     /// The project's main worktree, or the directory itself outside git.
     pub path: PathBuf,
     pub items: Vec<BacklogItem>,
+    /// The project's tasks started for an item, open, waiting or closed,
+    /// with tasks on: each item's history.
+    #[serde(default)]
+    pub tasks: Vec<TaskView>,
+}
+
+impl Backlog {
+    /// The tasks started for item `number`, the oldest first.
+    pub fn tasks_for(&self, number: u64) -> Vec<&TaskView> {
+        let mut tasks: Vec<&TaskView> = self
+            .tasks
+            .iter()
+            .filter(|task| task.record.backlog == Some(number))
+            .collect();
+        tasks.sort_by_key(|task| (task.record.created, task.record.id));
+        tasks
+    }
 }
 
 /// A thing to do later.
@@ -1243,7 +1355,11 @@ pub struct Backlog {
 pub struct BacklogItem {
     /// Its number in the project's backlog, which never changes: #1, #2…
     pub number: u64,
+    /// One line on what's to do.
     pub text: String,
+    /// More on it, when one line isn't enough: empty, or a few lines.
+    #[serde(default)]
+    pub body: String,
     #[serde(default)]
     pub tags: Vec<String>,
     pub done: bool,
@@ -1252,6 +1368,19 @@ pub struct BacklogItem {
     /// When it was done, while it is.
     #[serde(default)]
     pub closed: Option<u64>,
+}
+
+/// An item to put on the backlog, as `crystal backlog import` read it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NewItem {
+    pub text: String,
+    #[serde(default)]
+    pub body: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// Whether it's done already: ticked off as it's put there.
+    #[serde(default)]
+    pub done: bool,
 }
 
 /// The git worktree a session runs in, and the project it belongs to.

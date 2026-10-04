@@ -88,6 +88,8 @@ pub enum Command {
     Layouts,
     NewSession,
     NewWorktree,
+    Duplicate,
+    AddProject,
     RemoveWorktree,
     Rename,
     Kill,
@@ -100,6 +102,10 @@ pub enum Command {
     FlowGoOn,
     FlowSendBack,
     Timeline,
+    SessionTimeline,
+    TaskTimeline,
+    ProjectTimeline,
+    Handoff,
     Diff,
     FindFile,
     FileTree,
@@ -118,6 +124,7 @@ pub enum Command {
     UnfoldProject,
     Plugins,
     Settings,
+    Ram,
     Quit,
 }
 
@@ -220,6 +227,18 @@ pub const COMMANDS: &[Spec] = &[
         "new-worktree",
         "start a session in a new worktree",
         &["w"],
+    ),
+    spec(
+        Command::Duplicate,
+        "duplicate",
+        "start a session like the selected one: its agent, its options, its place",
+        &["D"],
+    ),
+    spec(
+        Command::AddProject,
+        "add-project",
+        "put a directory on the list of projects, made a git repository if need be",
+        &["+"],
     ),
     spec(
         Command::RemoveWorktree,
@@ -435,6 +454,31 @@ pub const COMMANDS: &[Spec] = &[
         &["a"],
     ),
     spec(
+        Command::SessionTimeline,
+        "session-timeline",
+        "the timeline of the selected session, or of its project",
+        &["I"],
+    ),
+    of_plugin(
+        "tasks",
+        Command::TaskTimeline,
+        "task-timeline",
+        "the timeline of the selected session's task",
+        &[],
+    ),
+    spec(
+        Command::ProjectTimeline,
+        "project-timeline",
+        "the timeline of the selected session's project",
+        &[],
+    ),
+    spec(
+        Command::Handoff,
+        "handoff",
+        "the selected session's handoff notes, and the files its task kept",
+        &["M"],
+    ),
+    spec(
         Command::Diff,
         "diff",
         "what changed in the worktree: the diff",
@@ -528,6 +572,12 @@ pub const COMMANDS: &[Spec] = &[
     ),
     spec(Command::Plugins, "plugins", "the plugins", &["X"]),
     spec(Command::Settings, "settings", "the settings", &[","]),
+    spec(
+        Command::Ram,
+        "ram",
+        "the memory each session's processes take, and crystal's own",
+        &["#"],
+    ),
     spec(Command::Keys, "keys", "every key", &["?"]),
     spec(
         Command::Quit,
@@ -1245,6 +1295,12 @@ pub enum Extent {
 const POPUP_SHARE: u16 = 80;
 
 impl Extent {
+    /// What's wrong with it, if anything: no cells, or a share that isn't
+    /// one.
+    pub fn check(&self) -> Result<(), String> {
+        self.read().map(drop)
+    }
+
     /// The share it is, from 1 to 100, or so many cells.
     fn read(&self) -> Result<Result<u16, u16>, String> {
         match self {
@@ -2100,9 +2156,9 @@ pub const HELP: &[HelpRow] = &[
     row(">", &[C::MoveToTab], "move it to another tab"),
     row("S", &[C::Layouts], "saved layouts"),
     row(
-        "n/w",
-        &[C::NewSession, C::NewWorktree],
-        "new, or in a worktree",
+        "n/w/D",
+        &[C::NewSession, C::NewWorktree, C::Duplicate],
+        "new, worktree, or like it",
     ),
     row("W", &[C::RemoveWorktree], "remove the worktree"),
     row("r/x", &[C::Rename, C::Kill], "rename / kill it"),
@@ -2112,9 +2168,9 @@ pub const HELP: &[HelpRow] = &[
         "archive it / the archive",
     ),
     row(
-        "!/.",
-        &[C::RunProject, C::OpenProject],
-        "run / open the project",
+        "!/./+",
+        &[C::RunProject, C::OpenProject, C::AddProject],
+        "run / open / add project",
     ),
     plugin_row(
         "tasks",
@@ -2134,7 +2190,17 @@ pub const HELP: &[HelpRow] = &[
     ),
     row("u", &[C::NextNeedingYou], "next needing you"),
     row("U", &[C::NeedsYou], "all needing you"),
-    row("a", &[C::Timeline], "the timeline"),
+    row(
+        "a/I",
+        &[
+            C::Timeline,
+            C::SessionTimeline,
+            C::TaskTimeline,
+            C::ProjectTimeline,
+        ],
+        "timeline: all / its own",
+    ),
+    row("M", &[C::Handoff], "its notes, kept files"),
     plugin_row(
         "github",
         "o/O",
@@ -2161,7 +2227,11 @@ pub const HELP: &[HelpRow] = &[
         ],
         "sidebar: size / folding",
     ),
-    row("X/,", &[C::Plugins, C::Settings], "plugins / settings"),
+    row(
+        "X/,/#",
+        &[C::Plugins, C::Settings, C::Ram],
+        "plugins / settings / RAM",
+    ),
     row("?/q", &[C::Keys, C::Quit], "keys / quit"),
 ];
 

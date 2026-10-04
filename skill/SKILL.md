@@ -58,7 +58,9 @@ crystal read reviewer --lines 40
 ```
 
 `read` prints the screen as text. `--lines N` keeps the last N rows that aren't blank. `--history` adds what
-has scrolled off the screen.
+has scrolled off the screen. `--since 10m` keeps only what it wrote in the last ten minutes, and `--unwrap`
+joins a long line the screen wrapped. A long message goes in from a file or a pipe: `crystal send reviewer -
+< notes.md`.
 
 ## Or run a task
 
@@ -166,12 +168,16 @@ your task, put it there rather than into your change:
 
 ```sh
 crystal backlog add "Retry the webhook on a timeout" -t payments   # prints its number, like #4
-crystal backlog                   # what's to do
+crystal backlog add "Retry the webhook" -b "On a timeout only, not a 4xx."   # more than a line: a body
+crystal backlog                   # what's to do; -t payments for one tag's
+crystal backlog show 4            # one item: its body, and the tasks started for it and how they went
+crystal backlog edit 4 -b "Twice, then give up"   # its line, -b its body, -t its tags
 crystal backlog done 4            # tick it off; reopen 4 or rm 4 undo it
 crystal backlog start 4 -w -d     # an agent on #4 in a new worktree; closing its task done ticks #4
 ```
 
-Every command works on the current directory's project; `-C <dir>` names another.
+Every command works on the current directory's project; `-C <dir>` names another. `backlog start` takes `-p
+<profile>`, `--pr <number>` to work in a pull request's worktree, and `--background` for `claude -p`.
 
 ## Statuses
 
@@ -192,6 +198,7 @@ crystal wait reviewer --until waiting --timeout 600   # or working, done, idle, 
 crystal wait server --output 'listening on' --timeout 60   # a regular expression; prints the line
 ```
 
+- A wait that runs out of time exits 2; anything else that goes wrong exits 1. `--quiet` prints nothing.
 - `--until` fails when the program ends first, unless `ended` is one it waits for.
 - A turn that ends while the user watches it is `idle` at once, never `done`: wait for `done,idle`.
 - `--output` counts what's on the screen already, and the rows just above it.
@@ -264,7 +271,9 @@ their prompt. Add to it when you find something the next session would otherwise
 
 ```sh
 crystal remember -k gotcha -f tests/ledger.rs "The ledger tests need the database up: make db"
+crystal remember -k decision --title "Fees are kept in cents" "A float loses a cent in a refund."
 crystal memory search ledger
+crystal memory search ledger -k gotcha -f tests   # of a kind, about the files in tests/
 ```
 
 - `-k` is `decision`, `gotcha`, `command` or `note` (the default). Keep each entry to a sentence or two.
@@ -272,11 +281,13 @@ crystal memory search ledger
   once all of them have, stale.
 - Don't remember what the code, the git log or CLAUDE.md already says, or anything that only matters now.
 - `crystal memory search` matches any of its words, or a word they start or stem from, best first; with
-  search by meaning on, entries that mean the same count too, so a few plain words do.
+  search by meaning on, entries that mean the same count too, so a few plain words do. It leaves out stale
+  entries; `--all` brings them back.
+- An entry's first line is what lists show of it; `--title` gives it one of its own, over the rest.
 - In a Claude Code session crystal started, the `memory_search` and `memory_show` tools search the memory and
   read an entry by its id without a shell command; use them when you have them.
 - `crystal memory` lists every entry; `crystal memory show <id>` reads one in full; `crystal memory rm <id>`
-  forgets one that's wrong.
+  forgets one that's wrong, and `crystal memory list --forgotten` lists what was.
 - Once your task closes, a model reads what you did and keeps what it finds worth keeping, so remember what
   only you know, like why you chose something; it never repeats what's there already.
 - With memory turned off, these commands say "the memory plugin is off"; carry on without them.
@@ -287,11 +298,14 @@ crystal memory search ledger
 - `wait` returns at once when the session is already `done`, `idle` or `waiting`. To wait for the turn your
   input starts, use `send --wait` or `send-keys --wait`, not `send` then `wait`.
 - A program that doesn't report what it's doing (a shell, a build) counts as busy until it exits: `wait`
-  blocks until then. Pass `--timeout <seconds>`; it fails when the time runs out.
+  blocks until then. Pass `--timeout <seconds>`; it exits 2 when the time runs out.
 - `send` refuses an agent that's asking the user something, with an error starting `agent_blocked:`: the
   text would land in its question. Answer it with `send-keys` (`crystal answer` for a background task) if
   that's yours to answer, or leave it to the user; `--force` types it anyway.
 - What you `send` another session starts with a line saying it's from yours, and what you work on. Send 20 a
   minute at most: past that it's refused, as two agents answering each other are probably in a loop; stop
-  sending and carry on with your own work. Never send only to say you got a message.
+  sending and carry on with your own work. Never send only to say you got a message: a message that only
+  acknowledges, like `ok` or `thanks!`, is refused.
+- A background task works on one prompt at a time: `send --interrupt` stops its run and sends yours in its
+  place. An agent in a terminal is stopped with `send-keys <name> Escape`.
 - Don't `kill` or `send` to your own session. `$CRYSTAL_SESSION` is its name when it started.

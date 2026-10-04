@@ -1,8 +1,9 @@
 //! The memory view, `m` in the sidebar: what the selected session's
 //! project has remembered, newest first, with the entry the bar is on in
-//! full beside the list. `/` filters the list as you type; `x` forgets the
-//! entry and `p` writes it into the project's CLAUDE.md or AGENTS.md, each
-//! once the user says `y`.
+//! full beside the list. `/` filters the list as you type; Enter opens the
+//! entry's file in the user's editor; `x` forgets the entry and `p` writes
+//! it into the project's CLAUDE.md or AGENTS.md, each once the user says
+//! `y`.
 //!
 //! The state here is plain data: the entries arrive through
 //! [`MemoryView::read_done`], and what the user asks for goes out as an
@@ -12,7 +13,7 @@ use super::app::{Action, Hit, Loading, Outcome};
 use super::sidebar::{ago, fit};
 use super::text_input::TextInput;
 use super::ui::{self, Look, ViewAreas};
-use crate::memory::{Freshness, Listed};
+use crate::memory::{self, Freshness, Listed};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -160,9 +161,33 @@ impl MemoryView {
             KeyCode::PageUp => self.move_by(-page),
             KeyCode::Char('x') => self.asking = self.selected.map(Ask::Forget),
             KeyCode::Char('p') => self.asking = self.selected.map(Ask::Promote),
+            KeyCode::Enter => {
+                if let Some((_, path)) = self.file_to_open() {
+                    return Outcome::Edit { path, line: None };
+                }
+            }
             _ => {}
         }
         Outcome::Stay
+    }
+
+    /// The file Enter opens of the entry the bar is on, and the worktree
+    /// it's opened in: the one the entry's files were said in, while it's
+    /// there, or else the project's; the first of its files that's there,
+    /// or else its first. `None` for an entry about no file.
+    pub fn file_to_open(&self) -> Option<(PathBuf, String)> {
+        let entry = &self.selected()?.entry;
+        let checkout = entry
+            .checkout
+            .clone()
+            .filter(|checkout| checkout.is_dir())
+            .unwrap_or_else(|| self.dir.clone());
+        let file = entry
+            .files
+            .iter()
+            .find(|file| checkout.join(file).is_file())
+            .or(entry.files.first())?;
+        Some((checkout, file.clone()))
     }
 
     /// Pasted text goes into the filter, which opens for it.
@@ -268,16 +293,15 @@ pub fn hints(view: &MemoryView) -> Vec<(String, String)> {
             ("esc".into(), "clear it".into()),
         ];
     }
-    [
-        ("j/k", "move"),
-        ("/", "filter"),
-        ("x", "forget"),
-        ("p", "add to CLAUDE.md"),
-        ("esc", "close"),
-    ]
-    .into_iter()
-    .map(|(key, does)| (key.to_string(), does.to_string()))
-    .collect()
+    let mut hints = vec![("j/k", "move"), ("/", "filter")];
+    if view.file_to_open().is_some() {
+        hints.push(("enter", "edit its file"));
+    }
+    hints.extend([("x", "forget"), ("p", "add to CLAUDE.md"), ("esc", "close")]);
+    hints
+        .into_iter()
+        .map(|(key, does)| (key.to_string(), does.to_string()))
+        .collect()
 }
 
 /// Which entry's row is on screen `row`, in a list drawn in `area`.
@@ -409,7 +433,7 @@ fn draw_list(frame: &mut Frame, view: &MemoryView, look: &Look, area: Rect) {
                 Style::new().fg(theme.muted),
             ),
             Span::styled(
-                fit(&one_line(&entry.text), room),
+                fit(&memory::title(&entry.text), room),
                 Style::new().fg(text_color),
             ),
         ]);
@@ -471,10 +495,6 @@ fn draw_entry(frame: &mut Frame, view: &MemoryView, look: &Look, area: Rect) {
         ));
     }
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
-}
-
-fn one_line(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 #[cfg(test)]
@@ -577,6 +597,67 @@ mod tests {
                 id: 5
             })
         );
+    }
+
+    #[test]
+    fn enter_opens_the_entry_s_file_where_it_was_said_while_that_s_there() {
+        let worktree = tempfile::tempdir().unwrap();
+        std::fs::write(worktree.path().join("there.rs"), "").unwrap();
+        let mut about = item(6, Kind::Gotcha, "the ledger needs redis");
+        about.entry.files = vec!["gone.rs".into(), "there.rs".into()];
+        about.entry.checkout = Some(worktree.path().to_path_buf());
+        let mut view = view_of(vec![about, item(5, Kind::Note, "about nothing")]);
+        assert_eq!(
+            view.file_to_open(),
+            Some((worktree.path().to_path_buf(), "there.rs".into()))
+        );
+        let edit = Outcome::Edit {
+            path: "there.rs".into(),
+            line: None,
+        };
+        assert_eq!(press(&mut view, KeyCode::Enter), edit);
+        assert!(hints(&view).iter().any(|(key, _)| key == "enter"));
+
+        // An entry about no file has nothing to open.
+        press(&mut view, KeyCode::Down);
+        assert_eq!(press(&mut view, KeyCode::Enter), Outcome::Stay);
+        assert!(!hints(&view).iter().any(|(key, _)| key == "enter"));
+
+        // With its worktree gone, its first file, in the project.
+        let mut moved = item(7, Kind::Note, "x");
+        moved.entry.files = vec!["src/a.rs".into()];
+        moved.entry.checkout = Some(PathBuf::from("/nowhere/at/all"));
+        let view = view_of(vec![moved]);
+        assert_eq!(
+            view.file_to_open(),
+            Some((PathBuf::from("/code/app"), "src/a.rs".into()))
+        );
+    }
+
+    #[test]
+    fn a_list_row_is_an_entry_s_title() {
+        let view = view_of(vec![item(
+            1,
+            Kind::Note,
+            "Fees are in cents\n\nNever floats.",
+        )]);
+        let theme = super::super::theme::Theme::new(crate::config::ThemeName::DARK, false);
+        let look = Look {
+            theme: &theme,
+            now: 2_000,
+            spin: 0,
+        };
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 4)).unwrap();
+        terminal
+            .draw(|frame| draw_list(frame, &view, &look, frame.area()))
+            .unwrap();
+        let row: String = terminal.backend().buffer().content()[..60]
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(row.contains("Fees are in cents"), "{row}");
+        assert!(!row.contains("Never"), "{row}");
     }
 
     #[test]

@@ -19,6 +19,7 @@
 //! conversation, and its screen says the rest.
 
 use crate::agent_rules;
+use crate::integration::Standing;
 use crate::shell;
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Map, Value, json};
@@ -357,6 +358,80 @@ impl Target {
     }
 
     /// Whether crystal's hooks are in the settings in `dir`.
+    /// How crystal's hooks in the settings in `dir` stand for `crystal` at
+    /// its path: each one there as this crystal would put it, some of them
+    /// there but not so (another crystal's, or one an earlier crystal put
+    /// on events it no longer listens to), or none.
+    pub fn standing(&self, dir: &Path, crystal: &Path) -> Standing {
+        if !self.installed(dir) {
+            return Standing::NotInstalled;
+        }
+        let path = self.file(dir);
+        let current = match self.shape {
+            Shape::Tables => self.current_tables(&path, crystal),
+            _ => self.current_entries(&path, crystal),
+        };
+        match current {
+            true => Standing::Installed,
+            false => Standing::OutOfDate,
+        }
+    }
+
+    /// Whether crystal's hooks in the JSON at `path` are as `crystal`
+    /// would put them: one for each hook, on its event, and no others.
+    fn current_entries(&self, path: &Path, crystal: &Path) -> bool {
+        let Ok(mut settings) = read_json(path) else {
+            return false;
+        };
+        let Some(hooks) = self.hooks_in(&mut settings) else {
+            return false;
+        };
+        let ours = hooks
+            .values()
+            .filter_map(Value::as_array)
+            .flatten()
+            .filter(|entry| holds_ours(entry, self.agent))
+            .count();
+        let each_there = self.hooks.iter().all(|hook| {
+            let wanted = self.entry(hook, &self.command(crystal, hook));
+            hooks
+                .get(hook.event)
+                .and_then(Value::as_array)
+                .is_some_and(|entries| entries.contains(&wanted))
+        });
+        each_there && ours == self.hooks.len()
+    }
+
+    /// Whether crystal's tables in the TOML at `path` are as `crystal`
+    /// would put them, as for [`Target::current_entries`].
+    fn current_tables(&self, path: &Path, crystal: &Path) -> bool {
+        let Ok(document) = read_toml(path) else {
+            return false;
+        };
+        let Some(tables) = tables(&document) else {
+            return false;
+        };
+        let ours: Vec<&toml_edit::Table> = tables
+            .iter()
+            .filter(|table| table_is_ours(table, self.agent))
+            .collect();
+        let field = |table: &toml_edit::Table, key: &str| {
+            table
+                .get(key)
+                .and_then(toml_edit::Item::as_str)
+                .map(String::from)
+        };
+        let each_there = self.hooks.iter().all(|hook| {
+            let command = self.command(crystal, hook);
+            ours.iter().any(|table| {
+                field(table, "event").as_deref() == Some(hook.event)
+                    && field(table, "matcher").as_deref() == hook.matcher
+                    && field(table, "command") == Some(command.clone())
+            })
+        });
+        each_there && ours.len() == self.hooks.len()
+    }
+
     pub fn installed(&self, dir: &Path) -> bool {
         let path = self.file(dir);
         if let Shape::Tables = self.shape {
@@ -790,6 +865,36 @@ mod tests {
         assert_eq!(json_at(&settings), own);
         assert!(!droid.installed(dir.path()));
         assert!(droid.uninstall(dir.path()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn hooks_from_another_crystal_or_on_fewer_events_are_out_of_date() {
+        let dir = dir();
+        let crystal = Path::new(CRYSTAL);
+        let droid = target("droid").unwrap();
+        assert_eq!(droid.standing(dir.path(), crystal), Standing::NotInstalled);
+        droid.install(dir.path(), crystal).unwrap();
+        assert_eq!(droid.standing(dir.path(), crystal), Standing::Installed);
+        // Another crystal's path.
+        let elsewhere = Path::new("/usr/bin/crystal");
+        assert_eq!(droid.standing(dir.path(), elsewhere), Standing::OutOfDate);
+        // One of its events taken out, as an earlier crystal's would lack it.
+        let settings = dir.path().join("settings.json");
+        let mut file = json_at(&settings);
+        let first = droid.hooks[0].event;
+        file["hooks"].as_object_mut().unwrap().remove(first);
+        std::fs::write(&settings, file.to_string()).unwrap();
+        assert_eq!(droid.standing(dir.path(), crystal), Standing::OutOfDate);
+        droid.install(dir.path(), crystal).unwrap();
+        assert_eq!(droid.standing(dir.path(), crystal), Standing::Installed);
+
+        // Kimi's tables the same way.
+        let kimi = target("kimi").unwrap();
+        let kimi_dir = dir.path().join("kimi");
+        std::fs::create_dir_all(&kimi_dir).unwrap();
+        kimi.install(&kimi_dir, crystal).unwrap();
+        assert_eq!(kimi.standing(&kimi_dir, crystal), Standing::Installed);
+        assert_eq!(kimi.standing(&kimi_dir, elsewhere), Standing::OutOfDate);
     }
 
     #[test]

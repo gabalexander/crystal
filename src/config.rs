@@ -39,6 +39,9 @@ pub struct Config {
     /// typed into a shell, whose installed hooks named its conversation,
     /// with the command that resumes it: see [`crate::integration`].
     pub resume_reported_agents: bool,
+    /// Ask before `q` quits the TUI, since a key meant for an agent can
+    /// land on the sidebar. The sessions keep running either way.
+    pub confirm_quit: bool,
     /// The TUI's colors.
     pub theme: ThemeName,
     /// How many rows that scrolled off a session's screen are kept, for
@@ -408,6 +411,10 @@ pub struct ProjectSettings {
     /// there with its output thrown away.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub open: Option<String>,
+    /// The plugins the project ships in its `.crystal/plugins/` that are
+    /// on for it, by name: see [`crate::plugins`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub plugins: Vec<String>,
 }
 
 /// When the user is told a session needs them: see [`crate::notify`].
@@ -562,8 +569,9 @@ impl Default for SoundSettings {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MemorySettings {
-    /// Once a task has closed, have a model read what it did and keep what
-    /// a later session would need to know: see [`crate::distill`].
+    /// Once a task has closed, or a session is archived, have a model read
+    /// what it did and keep what a later session would need to know: see
+    /// [`crate::distill`].
     pub distill: bool,
     /// The model that does it, as `claude --model` takes it.
     pub distill_model: String,
@@ -895,6 +903,7 @@ impl Default for Config {
             new_session: "claude".to_string(),
             name_from_prompt: true,
             resume_reported_agents: true,
+            confirm_quit: true,
             theme: ThemeName::DARK,
             colors: BTreeMap::new(),
             scrollback_lines: vt::DEFAULT_HISTORY_LINES,
@@ -2005,6 +2014,7 @@ back_to = "build"
             new_session: "codex --model o3".into(),
             name_from_prompt: false,
             resume_reported_agents: false,
+            confirm_quit: false,
             theme: ThemeName::find("nord").unwrap(),
             scrollback_lines: 50_000,
             colors: BTreeMap::from([
@@ -2107,6 +2117,7 @@ back_to = "build"
                 path: PathBuf::from("~/code/app"),
                 run: Some("npm run dev".into()),
                 open: Some("code .".into()),
+                plugins: vec!["lint".into()],
             }],
             keys: KeySettings {
                 bindings: BTreeMap::from([

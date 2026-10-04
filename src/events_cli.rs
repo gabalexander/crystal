@@ -15,32 +15,57 @@ use std::path::{Path, PathBuf};
 pub struct Options {
     /// A while back, like `2h`, or a time, like `14:00`.
     pub since: Option<String>,
+    /// The `seq` of the event to start after.
+    pub after: Option<u64>,
     pub kinds: Vec<String>,
     pub session: Option<String>,
     /// The project this directory is in.
     pub dir: Option<PathBuf>,
+    /// A task's number.
+    pub task: Option<u64>,
+    /// Only the newest this many of those in the log.
+    pub limit: Option<usize>,
     pub json: bool,
     pub follow: bool,
 }
 
-/// Prints the events in the log that `options` asks for, and with
-/// `follow`, each new one as it happens: after those since `--since`, or
-/// without it, only new ones.
+/// Prints the events in the log that `options` asks for, the newest
+/// `limit` of them, and with `follow`, each new one as it happens: after
+/// those since `--since`, or without it, only new ones, but for the newest
+/// `limit` before them.
 pub fn run(socket: &Path, options: Options) -> Result<()> {
     for kind in &options.kinds {
         events::check_pattern(kind)?;
     }
-    let since = match &options.since {
-        Some(when) => Some(Since::At(parse_since(when, now_ms())?)),
-        None => None,
+    let since = match (&options.since, options.after) {
+        (Some(when), _) => Some(Since::At(parse_since(when, now_ms())?)),
+        (None, Some(seq)) => Some(Since::Seq(seq)),
+        (None, None) => None,
     };
     let filter = Filter {
         kinds: options.kinds,
         session: options.session.map(|name| session_key(socket, name)),
         project: options.dir.map(|dir| project::of(&dir).path),
+        task: options.task,
     };
     let json = options.json;
     if options.follow {
+        // The newest before the new ones are read from the log, then the
+        // stream picks up after the last of them.
+        let since = match options.limit {
+            Some(limit) => {
+                let logged = event_log::read(socket, &filter, since.unwrap_or(Since::Seq(0)))?;
+                let last = logged.last().map_or(0, |event| event.seq);
+                for event in newest(logged, limit) {
+                    if !print(&event, json)? {
+                        return Ok(());
+                    }
+                }
+                // Nothing logged: only new ones.
+                (last > 0).then_some(Since::Seq(last)).or(since)
+            }
+            None => since,
+        };
         for event in client::subscribe(socket, filter, since)? {
             if !print(&event?, json)? {
                 break;
@@ -48,12 +73,23 @@ pub fn run(socket: &Path, options: Options) -> Result<()> {
         }
         return Ok(());
     }
-    for event in event_log::read(socket, &filter, since.unwrap_or(Since::Seq(0)))? {
+    let logged = event_log::read(socket, &filter, since.unwrap_or(Since::Seq(0)))?;
+    let logged = match options.limit {
+        Some(limit) => newest(logged, limit),
+        None => logged,
+    };
+    for event in logged {
         if !print(&event, json)? {
             break;
         }
     }
     Ok(())
+}
+
+/// The newest `limit` of `events`, the oldest first still.
+fn newest(mut events: Vec<Event>, limit: usize) -> Vec<Event> {
+    let first = events.len().saturating_sub(limit);
+    events.split_off(first)
 }
 
 /// Prints `event`, as a line or as JSON, and says whether to go on: not
@@ -120,7 +156,7 @@ pub fn when(at: u64, now: u64) -> String {
 /// a while back, like `90s`, `30m`, `2h`, `3d` or `1w`, or a time on this
 /// machine's clock, like `14:00` today, `2026-10-01` or
 /// `2026-10-01T09:30`.
-fn parse_since(when: &str, now: u64) -> Result<u64> {
+pub fn parse_since(when: &str, now: u64) -> Result<u64> {
     if let Some(back) = parse_while(when) {
         return Ok(now.saturating_sub(back));
     }
@@ -231,6 +267,20 @@ mod tests {
         };
         let line = line(&event, 0);
         assert!(line.ends_with("was old]0;pwned name"), "{line:?}");
+    }
+
+    #[test]
+    fn a_limit_keeps_the_newest_the_oldest_first() {
+        let events: Vec<Event> = (1..=5)
+            .map(|seq| Event {
+                seq,
+                ..Event::new(events::Kind::SessionStarted)
+            })
+            .collect();
+        let seqs = |events: Vec<Event>| events.iter().map(|event| event.seq).collect::<Vec<_>>();
+        assert_eq!(seqs(newest(events.clone(), 2)), [4, 5]);
+        assert_eq!(seqs(newest(events.clone(), 9)), [1, 2, 3, 4, 5]);
+        assert_eq!(seqs(newest(events, 0)), Vec::<u64>::new());
     }
 
     #[test]

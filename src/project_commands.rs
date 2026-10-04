@@ -197,6 +197,7 @@ mod tests {
                 path: main.clone(),
                 run: Some("cargo run".to_string()),
                 open: None,
+                plugins: Vec::new(),
             }],
             ..Config::default()
         };
