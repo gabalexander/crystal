@@ -680,6 +680,35 @@ impl Screen {
             .collect()
     }
 
+    /// What's on the screen as text to read, after its history with
+    /// `history`: a string a row, without the blanks at its end; with
+    /// `unwrap`, a string a line the program wrote, the rows a long one
+    /// wrapped onto joined again; with `ansi`, its colors and looks as SGR
+    /// sequences, and nothing that moves the cursor or makes a link.
+    pub fn lines(&self, history: bool, unwrap: bool, ansi: bool) -> Vec<String> {
+        let grid = self.term.grid();
+        let first = if history {
+            -(grid.history_size() as i32)
+        } else {
+            0
+        };
+        let mut lines = Vec::new();
+        let mut line = TextLine::default();
+        for at in first..grid.screen_lines() as i32 {
+            let row = &grid[Line(at)];
+            let wraps = unwrap && row[grid.last_column()].flags.contains(Flags::WRAPLINE);
+            line.add(row, grid.columns(), ansi);
+            if !wraps {
+                lines.push(line.finish(ansi));
+            }
+        }
+        // The last row wrapping, it's a line all the same.
+        if !line.text.is_empty() {
+            lines.push(line.finish(ansi));
+        }
+        lines
+    }
+
     /// The screen's rows, after the last `history` rows of the history.
     pub fn recent_rows(&self, history: usize) -> Vec<String> {
         let grid = self.term.grid();
@@ -1269,6 +1298,62 @@ fn cell_text(cell: &GridCell, text: &mut String) {
     }
 }
 
+/// A line of text being read off the screen's rows, for
+/// [`Screen::lines`].
+#[derive(Default)]
+struct TextLine {
+    text: String,
+    /// The style the text has got to, with SGR sequences.
+    style: Style,
+}
+
+impl TextLine {
+    /// Adds `row`'s cells, with a style sequence wherever the style changes
+    /// when `ansi`.
+    fn add(&mut self, row: &alacritty_terminal::grid::Row<GridCell>, cols: usize, ansi: bool) {
+        let cells: Vec<&GridCell> = (0..cols).map(|col| &row[Column(col)]).collect();
+        // With styles, the blanks at the end that look like nothing are
+        // left out; without, they're trimmed with the rest as it finishes.
+        let used = match ansi {
+            true => cells
+                .iter()
+                .rposition(|cell| {
+                    let blank = cell.c == ' ' || cell.c == '\0';
+                    !blank || Style::of(cell) != Style::default()
+                })
+                .map_or(0, |last| last + 1),
+            false => cols,
+        };
+        for cell in &cells[..used] {
+            if cell
+                .flags
+                .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+            {
+                continue;
+            }
+            let cell_style = Style::of(cell);
+            if ansi && cell_style != self.style {
+                self.text.push_str(&cell_style.sequence());
+                self.style = cell_style;
+            }
+            cell_text(cell, &mut self.text);
+        }
+    }
+
+    /// The line, styled back to the default at its end, or without the
+    /// blanks at its end; and a new one begun.
+    fn finish(&mut self, ansi: bool) -> String {
+        let mut text = std::mem::take(&mut self.text);
+        if ansi && std::mem::take(&mut self.style) != Style::default() {
+            text.push_str("\x1b[m");
+        }
+        if !ansi {
+            text.truncate(text.trim_end().len());
+        }
+        text
+    }
+}
+
 /// A row's text, without the blanks at its end.
 fn row_text(grid: &Grid<GridCell>, line: Line) -> String {
     let row = &grid[line];
@@ -1587,6 +1672,38 @@ mod tests {
     fn rows_are_the_text_without_the_blanks_at_their_end() {
         let screen = screen(3, 10, b"hi\r\n  there   ");
         assert_eq!(screen.rows(false), ["hi", "  there", ""]);
+    }
+
+    #[test]
+    fn lines_are_the_rows_or_the_lines_they_wrapped_from() {
+        let screen = screen(5, 6, b"one\r\nlong line\r\nwide \xe4\xb8\xad end");
+        assert_eq!(screen.lines(false, false, false), screen.rows(false));
+        assert_eq!(
+            screen.lines(false, false, false),
+            ["one", "long l", "ine", "wide", "中 end"]
+        );
+        // The rows a line wrapped onto are one again, its wide character
+        // that went on to the next row too.
+        assert_eq!(
+            screen.lines(false, true, false),
+            ["one", "long line", "wide 中 end"]
+        );
+        let history = screen.lines(true, true, false);
+        assert_eq!(history.last().unwrap(), "wide 中 end");
+    }
+
+    #[test]
+    fn ansi_lines_keep_the_colors_and_nothing_else() {
+        let output = b"\x1b[1;31mred\x1b[m plain\x1b]8;;https://x.y\x1b\\link\x1b]8;;\x1b\\\r\n\x1b[44m  \x1b[m";
+        let screen = screen(3, 20, output);
+        let lines = screen.lines(false, false, true);
+        assert_eq!(lines[0], "\x1b[0;1;38;5;1mred\x1b[0m plainlink");
+        // A colored blank is kept, and the style ends where the line does.
+        assert_eq!(lines[1], "\x1b[0;48;5;4m  \x1b[m");
+        assert_eq!(lines[2], "");
+        assert!(!lines[0].contains("]8;"), "{:?}", lines[0]);
+        let plain = screen.lines(false, false, false);
+        assert_eq!(plain[..2], ["red plainlink", ""]);
     }
 
     #[test]

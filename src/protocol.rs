@@ -391,14 +391,31 @@ pub enum Request {
         #[serde(default)]
         agent: Option<String>,
     },
+    /// What runs in a session's terminal: its program, and the processes
+    /// in front, each with its command and the directory it works in.
+    ProcessInfo {
+        name: String,
+    },
     /// What's on a session's screen, as text.
     Read {
         name: String,
         /// The rows that have scrolled up off the screen too, ahead of it.
         #[serde(default)]
         history: bool,
+        /// A line a program wrote, however many rows it wrapped onto, as
+        /// one.
+        #[serde(default)]
+        unwrap: bool,
+        /// With the SGR sequences that color it.
+        #[serde(default)]
+        ansi: bool,
+        /// Only what the program wrote from then on, in milliseconds since
+        /// the Unix epoch.
+        #[serde(default)]
+        since_ms: Option<u64>,
     },
-    /// With no name, the newest session.
+    /// With no name, the newest session. A size of 0 by 0 leaves the
+    /// session's as it is.
     Attach {
         name: Option<String>,
         rows: u16,
@@ -407,6 +424,10 @@ pub enum Request {
         /// can scroll back through it.
         #[serde(default)]
         history: bool,
+        /// A program watches, like `crystal observe`, not the user: the
+        /// session isn't seen or watched for it.
+        #[serde(default)]
+        program: bool,
     },
     /// Stop the daemon. With `keep_sessions`, the running sessions stay
     /// written down, so that the next daemon starts them again.
@@ -566,11 +587,16 @@ pub enum Response {
         #[serde(default)]
         id: String,
         running: bool,
+        /// The session's size, rows by columns, as the output starts.
+        #[serde(default)]
+        size: (u16, u16),
     },
     /// A session's screen, one string per row.
     Screen {
         rows: Vec<String>,
     },
+    /// What runs in a session's terminal.
+    Processes(Processes),
     Explained(Box<ScreenExplained>),
     /// A task's answer, and what it has come to.
     Result(TaskResult),
@@ -646,6 +672,11 @@ pub enum Response {
     /// The line on a session's screen that matched.
     Matched {
         line: String,
+    },
+    /// A wait gave up before what it waited for came, saying so: the
+    /// client exits 2 for it, not 1 as for an error.
+    TimedOut {
+        message: String,
     },
     /// The daemon a handover was asked of has been handed over: it runs the
     /// new crystal now, which says so, with how many sessions carried on.
@@ -738,6 +769,30 @@ pub struct SessionInfo {
 
 fn is_zero(count: &u32) -> bool {
     *count == 0
+}
+
+/// What runs in a session's terminal: `crystal process-info`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Processes {
+    /// The session's own program.
+    pub pid: Option<u32>,
+    /// The foreground process group, the job the terminal's keys go to,
+    /// while the terminal says.
+    pub group: Option<i32>,
+    /// The processes in that group, its leader first.
+    pub foreground: Vec<ProcessInfo>,
+}
+
+/// A process, as `crystal process-info` shows it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessInfo {
+    pub pid: i32,
+    /// Its program's name.
+    pub name: String,
+    /// What it was run with, its name first.
+    pub argv: Vec<String>,
+    /// The directory it works in, when the system says.
+    pub cwd: Option<PathBuf>,
 }
 
 /// How full a conversation's context is: the tokens the model was given for

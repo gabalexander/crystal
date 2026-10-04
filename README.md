@@ -364,8 +364,14 @@ crystal integration install claude   # into $CLAUDE_CONFIG_DIR/settings.json, or
 crystal integration install codex    # into $CODEX_HOME/hooks.json, or ~/.codex/hooks.json
 crystal integration install kimi     # and 14 more agents' hooks or plugins: see below
 crystal integration status           # whether they're there, for this crystal
+crystal integration status --outdated-only   # only those out of date: install brings them up to date
 crystal integration uninstall        # take them out again, and only them
 ```
+
+`status` says `installed` when each of crystal's hooks is there as this crystal would put it, `out of date`
+when some are there but not so (another crystal's, at another path, or an earlier one's, before crystal
+listened to an event it does now), and `not installed`. The [settings view](#the-settings-view) lists the
+agents installed here too, and puts their hooks in, brings them up to date or takes them out with `space`.
 
 Then the agent you typed says what it's doing through its hooks, the same as one crystal starts, and which
 conversation it's in: after a restart, the session's shell starts again and `claude --resume <id>` (or `codex
@@ -458,6 +464,10 @@ crystal send-keys review 1                  # press keys: an answer, Enter, Esca
 crystal wait review                         # block until its agent stops working; print how it ended
 crystal read review --lines 20              # print the last 20 rows of its screen
 crystal read review --history               # and what scrolled off it before
+crystal read review --since 10m             # only what it wrote in the last ten minutes
+crystal ps review                           # what runs in its terminal, and where (process-info)
+crystal observe review                      # its terminal as JSON lines, for a program; `control` drives it
+crystal api snapshot                        # everything at once, as JSON, for a client of your own
 crystal rename review reviewer              # give a session another name
 crystal respawn reviewer                    # run an ended session again; an agent in its conversation
 crystal kill review                         # stop one session
@@ -1309,6 +1319,13 @@ started with, but not its first prompt again. The limits:
 
 ### How crystal reads an agent
 
+An agent is known by what's in front in its session's terminal: the program, as it was run, or the script an
+interpreter like `node` runs. A wrapper that hides the agent's own process, like a sandbox, says which agent it
+runs with `CRYSTAL_AGENT` in its environment: `CRYSTAL_AGENT=claude fence -- claude`. Only the process in front
+is looked at, so set it on the wrapper's command rather than exporting it, which would make every program you
+run that agent. A Mac keeps the environment of the programs it ships, like `env` or `sh`, to itself, so there it
+works for a wrapper you installed.
+
 crystal reads each agent's screen by a file of rules for that agent. It comes with one for each of Claude
 Code, Codex, Gemini CLI, OpenCode, Cursor, Qwen Code, Pi, GitHub Copilot, Amp, Droid, Kimi Code, Kiro, Cline,
 Kilo Code, Devin, Grok, Qoder CLI, Letta Code, Hermes Agent, Antigravity, Maki and Muse, adapted from
@@ -1537,10 +1554,13 @@ crystal send-keys reviewer 1 --wait                       # answer a question: t
 ```
 
 `send` types the way a person does: the text first, marked as a paste when the program asks for that, then
-Enter on its own, so an agent takes it as a prompt and not as pasted text. `--wait` waits for the turn the
-text starts, not one that ended before it. `wait` returns once the agent isn't working: `done`, `waiting` when
-it asks something, `idle`, or how its program exited. It takes a `--timeout` in seconds, and fails when that
-runs out. A program that doesn't say what it's doing counts as busy until it ends.
+Enter on its own, so an agent takes it as a prompt and not as pasted text. `-` as the text reads it from
+standard input: `git diff | crystal send reviewer -`. `--wait` waits for the turn the text starts, not one that
+ended before it. `wait` returns once the agent isn't working: `done`, `waiting` when it asks something,
+`idle`, or how its program exited. It takes a `--timeout` in seconds, and gives up when that runs out, with
+exit status 2; anything else that goes wrong, a mistyped flag included, is 1, so 2 always means "not yet".
+`--quiet` (`-q`) prints nothing once it's there. `send --wait`, `send-keys --wait`, `task --wait` and `flow
+wait` give up the same way. A program that doesn't say what it's doing counts as busy until it ends.
 
 An agent asking you something takes nothing `send` types, since the text would land in its question: `send`
 refuses with an error that starts `agent_blocked:`, saying what it asks and how to answer it, with `crystal
@@ -1552,8 +1572,16 @@ Sent from another session, a message says so on a line ahead of it, `[crystal] M
 working on task "Port the codec":`, so the agent knows who asks, and that `crystal send` answers. Such a
 message loses its control characters but for line breaks, and is cut at 8 KiB. A session may send 20
 messages a minute, the most crystal allows: the next is refused, since two agents answering each other are
-most likely in a loop. A session can't send to itself. From you, a script or the TUI's `Space`, the text goes
-as it is, with no line ahead of it and no limit. Each message is a `session.message` [event](#events).
+most likely in a loop. So is a message that only acknowledges: under 20 characters, made of nothing but `ok`,
+`thanks`, `received`, `ack`, `done` and `noted` (any case, any punctuation), or with no letters at all, like
+`👍`. `ok, 3 tests fail` goes; `ok, thanks!` doesn't. A session can't send to itself. From you, a script or the
+TUI's `Space`, the text goes as it is, with no line ahead of it and no limit. Each message is a
+`session.message` [event](#events).
+
+`send --interrupt` stops the run a [background task](#background-tasks) is in the middle of first, waits for it
+to end, and sends the text as its next prompt: a change of course without waiting for the turn. An agent in a
+terminal is stopped by its own key, which crystal doesn't press for another session: `crystal send-keys
+<session> Escape`.
 
 `wait` can wait for something else instead:
 
@@ -1574,6 +1602,52 @@ writes.
 `send-keys` presses keys instead, the way tmux's does: key names like `Enter`, `Escape`, `Tab`, `Up`, `Down`,
 `BSpace`, `C-c` or `M-x`, and any other word typed as keys. That's what answers an agent's question, since
 agents don't act on a pasted answer. With `--wait`, it waits for the turn the answer lets carry on.
+
+`read` prints the screen as text, each row without the blanks at its end:
+
+```sh
+crystal read reviewer --lines 40              # the last 40 rows that aren't blank
+crystal read reviewer --history               # and what scrolled up off it before
+crystal read builder --since 10m              # only what it wrote in the last 10 minutes, history and all
+crystal read builder --unwrap                 # a long line as one, not the rows it wrapped onto
+crystal read reviewer --ansi | less -R        # its colors, bold, italic and underlines kept
+```
+
+`--since` takes a while back (`30s`, `10m`, `2h`) or a time (`14:00`, `2026-10-01T09:30`), as `crystal events`
+does. The daemon keeps the last MiB of what each session's program wrote, with when it came, and lays what came
+since then out on a screen of its own, the session's size: what the program wrote, not the screen it drew
+before, so a line or two from up to a second before may come in. When that MiB doesn't reach back so far, or
+the program wrote before a `restart-server` handed it over, `--since` prints the history and the screen whole.
+`--ansi` keeps the style of the text as SGR codes, and nothing that moves the cursor or makes a link.
+
+`crystal process-info <session>` (or `ps`) lists what runs in its terminal: the processes in front, the job
+its keys go to, a line each, with its pid, its name, the directory it works in and its command; `--json` adds
+the session's own program's pid and the foreground process group.
+
+A program can watch a session's terminal, or drive it, as a stream of JSON lines:
+
+```sh
+crystal observe reviewer                      # its output as it comes, read-only
+crystal control builder --rows 40 --cols 120  # and commands on standard input
+```
+
+Each prints `{"type":"start","session":…,"id":…,"rows":…,"cols":…,"running":…}`, then each `{"type":"output",
+"data":…}` the program writes, base64, the first drawing the screen as it is on a fresh terminal of that size,
+and at the end `{"type":"closed","reason":…}`: `ended` when its program has, `released` when `control` lets
+go. A `restart-server` cuts the stream, which attaches again and says so with a new `start`, for a reader to
+begin its screen afresh. Neither counts as you watching the session, so its notifications and its `done` stay as
+they were, and neither resizes it, unless `control` is given `--rows` and `--cols`. `control` reads a command a
+line: `{"type":"input","text":"ls\r"}` or `{"type":"input","data":"<base64>"}` writes bytes to the program as
+they are, `{"type":"keys","keys":["Enter","C-c"]}` presses keys by name as `send-keys` does,
+`{"type":"resize","rows":40,"cols":120}` resizes it, and `{"type":"release"}`, or the end of its input, lets go.
+A command it can't carry out is a `{"type":"error","message":…}` line, and it goes on.
+
+`crystal api snapshot` prints everything a client that keeps its own picture of crystal starts from, as one
+JSON object: crystal's `version`, the daemon's `socket`, `seq`, the latest event's, `sessions` as `ls --json`
+lists them, `layout` as `crystal layout --json` prints it, `projects`, the `tasks` not closed, every flow run
+in `flows`, and the `archived` sessions. `crystal events --follow --after <seq>` then carries on from it with
+nothing missed: an event says what changed, and the client asks again for what it shows. It never starts the
+daemon.
 
 `crystal ls --json` prints the sessions as a JSON array. Each object holds what the daemon knows about the
 session, plus `status`, the word the STATE column shows:
@@ -1755,6 +1829,9 @@ crystal events --since 2h             # or 30m, 3d, 14:00, 2026-10-01T09:30
 crystal events -n reviewer -k 'task.*'   # one session, through its renames; kinds or families, repeatable
 crystal events -C ~/code/app --json   # one project's, as JSON lines
 crystal events --follow               # new ones as they happen; with --since, catch up first
+crystal events --task t12             # one task's: the task, and its session while it works on it
+crystal events --limit 20             # only the newest 20; with --follow, of those before the new ones
+crystal events --after 4120 --follow  # those after that seq, like the one `api snapshot` gives
 ```
 
 ```
@@ -1790,8 +1867,8 @@ A program can listen on the daemon's socket, as `--follow` does, with one line o
 {"type": "subscribe", "version": "0.3.0", "filter": {"kinds": ["session.waiting", "task.*"], "session": "reviewer"}, "since": {"seq": 41}}
 ```
 
-`filter` takes `kinds` (names or patterns), a `session` by name or id and a `project` by the path of its main
-worktree, all optional. `since` is `{"seq": N}` for the events after that one, or `{"at": ms}` for those from
+`filter` takes `kinds` (names or patterns), a `session` by name or id, a `project` by the path of its main
+worktree and a `task` by its number, all optional. `since` is `{"seq": N}` for the events after that one, or `{"at": ms}` for those from
 that time; leave it out for new ones only. The daemon answers `{"type":"subscribed","seq":N}`, sends what the
 log has from `since` up to that `seq`, then each new event as it happens, one line each, so a client that
 reconnects with the last `seq` it saw misses nothing. One that falls more than 4096 events behind gets a last
@@ -1912,6 +1989,7 @@ crystal task --accept "cargo test passes" "Fix the flaky test"       # with what
 crystal task --pr 57                                                 # work on pull request 57, in its worktree
 crystal result tests                                                 # Claude's answer at the end of the run
 crystal send docs "Now the changelog too" --wait                     # a follow-up, in the same conversation
+crystal send --interrupt docs "Leave the tests alone"               # stop the run, and carry on from there
 crystal answer docs y                                                # allow what it asks for: y, n or always
 crystal interrupt docs                                               # stop the run it's in the middle of
 crystal tasks terminal docs                                          # carry on with it yourself, in a terminal
@@ -1955,8 +2033,8 @@ crystal tasks terminal docs                                          # carry on 
 - `crystal send`, or `Space` in the TUI, gives a task a follow-up: on the `claude` still there, or once that
   has gone, after five minutes with nothing to do or after a restart, on a new one that carries the
   conversation on with `--resume`. One run at a time: a follow-up sent while Claude is still working is
-  refused, and so is one sent while it asks for a permission. A task takes no keys, so `send-keys` is refused
-  too.
+  refused, unless `send --interrupt` stops the run first, and so is one sent while it asks for a permission. A
+  task takes no keys, so `send-keys` is refused too.
 - `crystal result <task>` prints the last answer; `--json` adds whether the run failed, the conversation's id,
   the cost so far and how many runs the task has had.
 - Each task's `claude` is given `--max-budget-usd`: $5, unless `max_budget_usd` under `[tasks]` in the
@@ -2769,6 +2847,10 @@ Settings live in `~/.config/crystal/config.toml` (or `$XDG_CONFIG_HOME/crystal/c
 optional, and so is every setting in it. `crystal config` prints the settings in effect, ready to save as the
 file and change. A setting crystal doesn't know is an error that names it, so a typo never goes unnoticed.
 
+A change counts without a restart: the daemon reads the file each time it needs a setting, and the TUI watches
+it, takes a change in at once (its theme, its keys, the tab bar, the mouse…) and says so on its footer. A file
+that makes no sense is said there too, and the settings stay as they were until it's mended.
+
 | Setting | Default | What it does |
 |---|---|---|
 | `notify` | `true` | tell you when a session needs you |
@@ -2995,6 +3077,11 @@ change made by hand in the file too, and shows how the models that search by mea
 meaning on has the daemon get the models ready: it downloads them if they aren't here, loads them and gives
 every entry its vector, and `enter` on that row does it again. Turned off, the daemon lets the models go, and
 the memory they took with them.
+
+Last come the agents installed here that crystal can [hook](#hooks-in-other-agents-own-settings), each with how
+its hooks stand, as `crystal integration status` says: `installed`, `out of date` or `not installed`. `space`
+or `enter` puts crystal's hooks in the agent's own settings, or brings them up to date, and on one installed,
+takes them out again; the view says what's left to do, like reviewing Codex's in its `/hooks`.
 
 #### Profiles
 

@@ -3,14 +3,18 @@
 //! inside a session as well, since every session knows its daemon's socket.
 //!
 //! A wait listens to the daemon's events about its session rather than
-//! asking again and again: each one is a reason to look again.
+//! asking again and again: each one is a reason to look again. A wait that
+//! gives up is a [`TimedOut`], which `crystal` exits 2 for, so a script can
+//! tell "not yet" from anything else going wrong.
 
 use crate::client::{self, Subscription};
 use crate::env;
 use crate::events::{Filter, Kind};
 use crate::printable;
-use crate::protocol::{Activity, Answer, Request, Response, SessionInfo, State};
-use anyhow::{Context, Result, bail};
+use crate::protocol::{Activity, Answer, Front, Request, Response, SessionInfo, State};
+use crate::shell;
+use anyhow::{Context, Result, bail, ensure};
+use std::fmt;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -19,11 +23,42 @@ use std::time::{Duration, Instant};
 /// goes on to the end of the turn either way.
 const START_GRACE: Duration = Duration::from_secs(5);
 
+/// How long `send --interrupt` waits for the run it stopped to end.
+const STOP_GRACE: Duration = Duration::from_secs(30);
+
+/// A wait that gave up before what it waited for came: `crystal` exits 2
+/// for it, and 1 for anything else, a mistyped flag included, so 2 always
+/// means "not yet".
+#[derive(Debug)]
+pub struct TimedOut(pub String);
+
+impl fmt::Display for TimedOut {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for TimedOut {}
+
+/// What `crystal send` reads its text from when it's given as `-`.
+pub const FROM_STDIN: &str = "-";
+
 /// Types `text` into the session called `name`, and presses Enter after it
 /// when `enter` is set; with `force`, even while its agent is asking the
 /// user something. Run in a session, the message says it comes from that
-/// session.
-pub fn send(socket: &Path, name: &str, text: &str, enter: bool, force: bool) -> Result<()> {
+/// session. With `interrupt`, a background task's run is stopped first,
+/// and the text carries on from there.
+pub fn send(
+    socket: &Path,
+    name: &str,
+    text: &str,
+    enter: bool,
+    force: bool,
+    interrupt: bool,
+) -> Result<()> {
+    if interrupt {
+        stop_run(socket, name)?;
+    }
     let request = Request::Send {
         name: name.to_string(),
         text: text.to_string(),
@@ -33,6 +68,39 @@ pub fn send(socket: &Path, name: &str, text: &str, enter: bool, force: bool) -> 
     };
     ask(socket, &request)?;
     Ok(())
+}
+
+/// Stops the run the background task `name` is in the middle of, if it's
+/// in one, and waits for it to end: a task takes a follow-up only between
+/// runs. A terminal's agent is stopped by its own key, which crystal doesn't
+/// press for it.
+fn stop_run(socket: &Path, name: &str) -> Result<()> {
+    let mut watch = Watch::start(socket, name)?;
+    let now = watch.now()?;
+    ensure!(
+        now.front == Some(Front::Task),
+        "--interrupt stops a background task's run, and {name} isn't a task: an agent in a \
+         terminal is stopped by its own key, like `crystal send-keys {name} Escape`"
+    );
+    if now.activity != Some(Activity::Working) {
+        return Ok(());
+    }
+    interrupt(socket, name)?;
+    match watch.settle(deadline(Some(STOP_GRACE)))? {
+        Some(_) => Ok(()),
+        None => bail!(
+            "{name} was still working {}s after it was interrupted",
+            STOP_GRACE.as_secs()
+        ),
+    }
+}
+
+/// Reads what `crystal send -` sends from standard input, to its end.
+pub fn read_stdin() -> Result<String> {
+    let mut text = String::new();
+    std::io::Read::read_to_string(&mut std::io::stdin(), &mut text)
+        .context("couldn't read the text from standard input")?;
+    Ok(text)
 }
 
 /// Presses `keys` in the session called `name`: key names like `Enter`,
@@ -124,12 +192,13 @@ impl Until {
 }
 
 /// Waits until the session's agent isn't working, or its program has
-/// ended, and prints which. Gives up after `timeout`, if there is one.
-pub fn wait(socket: &Path, name: &str, timeout: Option<Duration>) -> Result<()> {
+/// ended, and prints which, unless `quiet`. Gives up after `timeout`, if
+/// there is one.
+pub fn wait(socket: &Path, name: &str, timeout: Option<Duration>, quiet: bool) -> Result<()> {
     let mut watch = Watch::start(socket, name)?;
     match watch.settle(deadline(timeout))? {
         Some(settled) => {
-            println!("{settled}");
+            say(&settled, quiet);
             Ok(())
         }
         None => timed_out(name, timeout),
@@ -137,23 +206,26 @@ pub fn wait(socket: &Path, name: &str, timeout: Option<Duration>) -> Result<()> 
 }
 
 /// Waits until the session's agent comes to do one of `until`, or, with
-/// `Ended` among them, its program ends, and prints which. Its program
-/// ending first is an error. Gives up after `timeout`, if there is one.
+/// `Ended` among them, its program ends, and prints which, unless `quiet`.
+/// Its program ending first is an error. Gives up after `timeout`, if
+/// there is one.
 pub fn wait_until(
     socket: &Path,
     name: &str,
     until: &[Until],
     timeout: Option<Duration>,
+    quiet: bool,
 ) -> Result<()> {
     let mut watch = Watch::start(socket, name)?;
     match watch.reach(until, deadline(timeout))? {
         Some(status) => {
-            println!("{status}");
+            say(&status, quiet);
             Ok(())
         }
         None => {
             let seconds = timeout.unwrap_or_default().as_secs_f64();
-            bail!("{name} wasn't {} after {seconds}s", words(until))
+            let words = words(until);
+            Err(TimedOut(format!("{name} wasn't {words} after {seconds}s")).into())
         }
     }
 }
@@ -164,13 +236,14 @@ pub fn wait_until(
 const ASK_AGAIN: usize = 3;
 
 /// Waits until a row on the session's screen, or just scrolled off it,
-/// matches the regular expression `pattern`, and prints the row. The
-/// daemon looks each time the program writes something.
+/// matches the regular expression `pattern`, and prints the row, unless
+/// `quiet`. The daemon looks each time the program writes something.
 pub fn wait_for_output(
     socket: &Path,
     name: &str,
     pattern: &str,
     timeout: Option<Duration>,
+    quiet: bool,
 ) -> Result<()> {
     let deadline = deadline(timeout);
     let mut left = timeout;
@@ -189,10 +262,12 @@ pub fn wait_for_output(
             response => break response?,
         }
     };
-    let Response::Matched { line } = response else {
-        bail!("the daemon didn't say what matched");
+    let line = match response {
+        Response::Matched { line } => line,
+        Response::TimedOut { message } => return Err(TimedOut(message).into()),
+        _ => bail!("the daemon didn't say what matched"),
     };
-    println!("{line}");
+    say(&line, quiet);
     Ok(())
 }
 
@@ -200,10 +275,15 @@ pub fn wait_for_output(
 /// to start working, then as [`wait`] does. Right after the send the agent
 /// may not have started yet, and whatever it said about the turn before
 /// would end the wait at once.
-pub fn wait_for_turn(socket: &Path, name: &str, timeout: Option<Duration>) -> Result<()> {
+pub fn wait_for_turn(
+    socket: &Path,
+    name: &str,
+    timeout: Option<Duration>,
+    quiet: bool,
+) -> Result<()> {
     match turn_settled(socket, name, timeout)? {
         Some(settled) => {
-            println!("{settled}");
+            say(&settled, quiet);
             Ok(())
         }
         None => timed_out(name, timeout),
@@ -243,9 +323,6 @@ fn turn_settled(socket: &Path, name: &str, timeout: Option<Duration>) -> Result<
     watch.settle(deadline)
 }
 
-/// Prints what's on the session's screen, after its history with
-/// `history`. With `lines`, only that many of the last rows that aren't
-/// blank.
 /// Prints a task's answer: what Claude said at the end of its last run. With
 /// `json`, everything the task has come to, for scripts: whether the run
 /// failed, the conversation's id, the cost so far and how many runs it's
@@ -266,16 +343,100 @@ pub fn result(socket: &Path, name: &str, json: bool) -> Result<()> {
     Ok(())
 }
 
-pub fn read(socket: &Path, name: &str, lines: Option<usize>, history: bool) -> Result<()> {
+/// What `crystal read` was asked for.
+#[derive(Debug, Default)]
+pub struct Reading {
+    /// Only that many of the last rows that aren't blank.
+    pub lines: Option<usize>,
+    /// The history ahead of the screen.
+    pub history: bool,
+    /// The rows a long line wrapped onto joined again.
+    pub unwrap: bool,
+    /// With its colors.
+    pub ansi: bool,
+    /// Only what came since then: a while back, like `10m`, or a time, as
+    /// `crystal events --since` takes it.
+    pub since: Option<String>,
+}
+
+/// Prints what's on the session's screen, as `reading` asks.
+pub fn read(socket: &Path, name: &str, reading: Reading) -> Result<()> {
+    let since_ms = reading
+        .since
+        .as_deref()
+        .map(|when| crate::events_cli::parse_since(when, crate::events::now_ms()))
+        .transpose()?;
     let request = Request::Read {
         name: name.to_string(),
-        history,
+        history: reading.history,
+        unwrap: reading.unwrap,
+        ansi: reading.ansi,
+        since_ms,
     };
     let Response::Screen { rows } = ask(socket, &request)? else {
         bail!("the daemon didn't send the screen");
     };
-    print!("{}", screen_text(&rows, lines));
+    print!("{}", screen_text(&rows, reading.lines));
     Ok(())
+}
+
+/// Prints what runs in the session's terminal: the processes in front, a
+/// line each, or with `json`, all the daemon said.
+pub fn process_info(socket: &Path, name: &str, json: bool) -> Result<()> {
+    let request = Request::ProcessInfo {
+        name: name.to_string(),
+    };
+    let Response::Processes(processes) = ask(socket, &request)? else {
+        bail!("the daemon didn't say what runs there");
+    };
+    if json {
+        println!("{}", serde_json::to_string_pretty(&processes)?);
+        return Ok(());
+    }
+    if processes.foreground.is_empty() {
+        bail!("{name}'s terminal doesn't say what's in front");
+    }
+    print!("{}", process_lines(&processes.foreground));
+    Ok(())
+}
+
+/// The processes as `process-info` prints them: a header, then a line each,
+/// in columns, with nothing a terminal would take as an order.
+fn process_lines(processes: &[crate::protocol::ProcessInfo]) -> String {
+    let rows: Vec<[String; 4]> = processes
+        .iter()
+        .map(|process| {
+            let command: Vec<String> = process.argv.iter().map(|arg| shell::quote(arg)).collect();
+            [
+                process.pid.to_string(),
+                process.name.clone(),
+                process
+                    .cwd
+                    .as_deref()
+                    .map_or("-".to_string(), shell::home_relative),
+                command.join(" "),
+            ]
+            .map(|cell| printable::line(&cell).into_owned())
+        })
+        .collect();
+    let header = ["PID", "NAME", "DIRECTORY", "COMMAND"].map(String::from);
+    let mut widths = [0; 4];
+    for row in std::iter::once(&header).chain(&rows) {
+        for (width, cell) in widths.iter_mut().zip(row) {
+            *width = (*width).max(cell.chars().count());
+        }
+    }
+    let mut out = String::new();
+    for row in std::iter::once(&header).chain(&rows) {
+        let cells: Vec<String> = row
+            .iter()
+            .zip(widths)
+            .map(|(cell, width)| format!("{cell:width$}"))
+            .collect();
+        out.push_str(cells.join("  ").trim_end());
+        out.push('\n');
+    }
+    out
 }
 
 /// What a session has settled on, once it isn't busy: how its program
@@ -332,7 +493,7 @@ impl<'a> Watch<'a> {
         let filter = Filter {
             kinds: vec!["session.*".to_string()],
             session: Some(id.clone()),
-            project: None,
+            ..Filter::default()
         };
         // Listening before looking: whatever happens after the look is
         // heard.
@@ -432,7 +593,14 @@ fn ask(socket: &Path, request: &Request) -> Result<Response> {
 
 fn timed_out(name: &str, timeout: Option<Duration>) -> Result<()> {
     let seconds = timeout.unwrap_or_default().as_secs_f64();
-    bail!("{name} was still busy after {seconds}s")
+    Err(TimedOut(format!("{name} was still busy after {seconds}s")).into())
+}
+
+/// Prints what a wait came to, unless it's `quiet`.
+fn say(what: &str, quiet: bool) {
+    if !quiet {
+        println!("{what}");
+    }
 }
 
 #[cfg(test)]
@@ -510,6 +678,33 @@ mod tests {
         assert_eq!(Until::of_event(Kind::SessionWaiting), Some(Until::Waiting));
         assert_eq!(Until::of_event(Kind::SessionRenamed), None);
         assert_eq!(words(&[Until::Waiting, Until::Done]), "waiting or done");
+    }
+
+    #[test]
+    fn processes_line_up_in_columns() {
+        use crate::protocol::ProcessInfo;
+        let processes = [
+            ProcessInfo {
+                pid: 41388,
+                name: "claude".into(),
+                argv: vec!["claude".into(), "--resume".into(), "a b".into()],
+                cwd: Some(PathBuf::from("/code/app")),
+            },
+            ProcessInfo {
+                pid: 7,
+                name: "evil\x1b]0;x\x07".into(),
+                argv: Vec::new(),
+                cwd: None,
+            },
+        ];
+        let lines = process_lines(&processes);
+        let lines: Vec<&str> = lines.lines().collect();
+        assert_eq!(lines[0], "PID    NAME      DIRECTORY  COMMAND");
+        assert_eq!(
+            lines[1],
+            "41388  claude    /code/app  claude --resume 'a b'"
+        );
+        assert_eq!(lines[2], "7      evil]0;x  -");
     }
 
     #[test]

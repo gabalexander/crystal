@@ -674,6 +674,12 @@ pub enum Action {
     ChangeSetting(settings_view::Change),
     /// Have the daemon get the model that searches memory by meaning ready.
     PrepareEmbeddings,
+    /// Put crystal's hooks in an agent's own settings, or bring them up to
+    /// date, or with `install` false, take them out.
+    Integrate {
+        agent: crate::integration::Agent,
+        install: bool,
+    },
     /// Turn the plugin called `name` on, or off, in the config file: the
     /// user's own, or the one the project whose main worktree is `project`
     /// ships, for that project.
@@ -1510,6 +1516,14 @@ impl App {
     pub fn show_settings(&mut self, current: settings_view::Current) {
         if let Some(view) = &mut self.settings {
             view.set_current(current);
+        }
+    }
+
+    /// Says, in the settings view if it's open, what a change came to.
+    pub fn setting_noted(&mut self, note: String) {
+        match &mut self.settings {
+            Some(view) => view.set_note(note),
+            None => self.notify(note),
         }
     }
 
@@ -4560,6 +4574,9 @@ impl App {
             }
             settings_view::Outcome::Change(change) => Some(Action::ChangeSetting(change)),
             settings_view::Outcome::Prepare => Some(Action::PrepareEmbeddings),
+            settings_view::Outcome::Integrate { agent, install } => {
+                Some(Action::Integrate { agent, install })
+            }
         }
     }
 
@@ -11782,6 +11799,7 @@ gate = true
             path: PathBuf::from("/c"),
             config: Ok(Config::default()),
             model: None,
+            integrations: Vec::new(),
         });
         // `x` would kill the session from the sidebar; here it's nothing.
         assert_eq!(press(&mut app, KeyCode::Char('x')), None);

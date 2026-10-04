@@ -1464,6 +1464,10 @@ pub struct Filter {
     /// Only those about the project whose main worktree this is.
     #[serde(default)]
     pub project: Option<PathBuf>,
+    /// Only those about the task with this number: the task itself, and
+    /// its session while it works on it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<u64>,
 }
 
 impl Filter {
@@ -1481,7 +1485,10 @@ impl Filter {
                 .is_some_and(|session| session.name == *wanted || session.id == *wanted)
         });
         let project_wanted = self.project.is_none() || self.project == event.project;
-        kind_wanted && session_wanted && project_wanted
+        let task_wanted = self
+            .task
+            .is_none_or(|wanted| Scope::Task(wanted).matches(event));
+        kind_wanted && session_wanted && project_wanted && task_wanted
     }
 }
 
@@ -1667,6 +1674,7 @@ mod tests {
             kinds: kinds.iter().map(|kind| kind.to_string()).collect(),
             session: session.map(String::from),
             project: project.map(PathBuf::from),
+            task: None,
         };
         assert!(filter(&[], None, None).matches(&event));
         assert!(filter(&["session.*"], None, None).matches(&event));
@@ -1679,6 +1687,53 @@ mod tests {
         assert!(!filter(&[], None, Some("/code/other")).matches(&event));
         let memory = Event::new(Kind::MemoryAdded);
         assert!(!filter(&[], Some("claude"), None).matches(&memory));
+    }
+
+    #[test]
+    fn a_filter_takes_a_task_and_its_session_while_it_works_on_it() {
+        use crate::protocol::TaskInfo;
+        let by_task = Filter {
+            task: Some(12),
+            ..Filter::default()
+        };
+        let mut working = session();
+        working.task = Some(TaskInfo {
+            id: Some(12),
+            goal: "Port the codec".into(),
+            background: false,
+            backlog: None,
+            waiting: false,
+            created: 0,
+            outcome: None,
+            brief: Default::default(),
+        });
+        let about = Event::about_session(Kind::SessionWaiting, &working);
+        assert_eq!(about.session.as_ref().unwrap().task_id, Some(12));
+        assert!(by_task.matches(&about));
+        // Another task's session, and a session with none, are left out.
+        working.task.as_mut().unwrap().id = Some(13);
+        assert!(!by_task.matches(&Event::about_session(Kind::SessionWaiting, &working)));
+        assert!(!by_task.matches(&Event::about_session(Kind::SessionWaiting, &session())));
+        // The task's own events carry it.
+        let closed = Event {
+            task: Some(TaskRecord {
+                id: Some(12),
+                goal: "Port the codec".into(),
+                session: "porter".into(),
+                project: "app".into(),
+                branch: None,
+                background: false,
+                backlog: None,
+                pending: false,
+                waiting: false,
+                created: 0,
+                outcome: None,
+                artifacts: Vec::new(),
+                brief: Default::default(),
+            }),
+            ..Event::new(Kind::TaskClosed)
+        };
+        assert!(by_task.matches(&closed));
     }
 
     #[test]
