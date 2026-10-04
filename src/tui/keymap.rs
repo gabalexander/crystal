@@ -88,6 +88,8 @@ pub enum Command {
     Layouts,
     NewSession,
     NewWorktree,
+    Duplicate,
+    AddProject,
     RemoveWorktree,
     Rename,
     Kill,
@@ -118,6 +120,7 @@ pub enum Command {
     UnfoldProject,
     Plugins,
     Settings,
+    Ram,
     Quit,
 }
 
@@ -220,6 +223,18 @@ pub const COMMANDS: &[Spec] = &[
         "new-worktree",
         "start a session in a new worktree",
         &["w"],
+    ),
+    spec(
+        Command::Duplicate,
+        "duplicate",
+        "start a session like the selected one: its agent, its options, its place",
+        &["D"],
+    ),
+    spec(
+        Command::AddProject,
+        "add-project",
+        "put a directory on the list of projects, made a git repository if need be",
+        &["+"],
     ),
     spec(
         Command::RemoveWorktree,
@@ -528,6 +543,12 @@ pub const COMMANDS: &[Spec] = &[
     ),
     spec(Command::Plugins, "plugins", "the plugins", &["X"]),
     spec(Command::Settings, "settings", "the settings", &[","]),
+    spec(
+        Command::Ram,
+        "ram",
+        "the memory each session's processes take, and crystal's own",
+        &["M"],
+    ),
     spec(Command::Keys, "keys", "every key", &["?"]),
     spec(
         Command::Quit,
@@ -1856,9 +1877,9 @@ pub const HELP: &[HelpRow] = &[
     row(">", &[C::MoveToTab], "move it to another tab"),
     row("S", &[C::Layouts], "saved layouts"),
     row(
-        "n/w",
-        &[C::NewSession, C::NewWorktree],
-        "new, or in a worktree",
+        "n/w/D",
+        &[C::NewSession, C::NewWorktree, C::Duplicate],
+        "new, worktree, or like it",
     ),
     row("W", &[C::RemoveWorktree], "remove the worktree"),
     row("r/x", &[C::Rename, C::Kill], "rename / kill it"),
@@ -1868,9 +1889,9 @@ pub const HELP: &[HelpRow] = &[
         "archive it / the archive",
     ),
     row(
-        "!/.",
-        &[C::RunProject, C::OpenProject],
-        "run / open the project",
+        "!/./+",
+        &[C::RunProject, C::OpenProject, C::AddProject],
+        "run / open / add project",
     ),
     plugin_row(
         "tasks",
@@ -1917,7 +1938,11 @@ pub const HELP: &[HelpRow] = &[
         ],
         "sidebar: size / folding",
     ),
-    row("X/,", &[C::Plugins, C::Settings], "plugins / settings"),
+    row(
+        "X/,/M",
+        &[C::Plugins, C::Settings, C::Ram],
+        "plugins / settings / RAM",
+    ),
     row("?/q", &[C::Keys, C::Quit], "keys / quit"),
 ];
 

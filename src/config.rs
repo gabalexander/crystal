@@ -39,6 +39,9 @@ pub struct Config {
     /// typed into a shell, whose installed hooks named its conversation,
     /// with the command that resumes it: see [`crate::integration`].
     pub resume_reported_agents: bool,
+    /// Ask before `q` quits the TUI, since a key meant for an agent can
+    /// land on the sidebar. The sessions keep running either way.
+    pub confirm_quit: bool,
     /// The TUI's colors.
     pub theme: ThemeName,
     /// How many rows that scrolled off a session's screen are kept, for
@@ -859,6 +862,7 @@ impl Default for Config {
             new_session: "claude".to_string(),
             name_from_prompt: true,
             resume_reported_agents: true,
+            confirm_quit: true,
             theme: ThemeName::DARK,
             colors: BTreeMap::new(),
             scrollback_lines: vt::DEFAULT_HISTORY_LINES,
@@ -1852,6 +1856,7 @@ back_to = "build"
             new_session: "codex --model o3".into(),
             name_from_prompt: false,
             resume_reported_agents: false,
+            confirm_quit: false,
             theme: ThemeName::find("nord").unwrap(),
             scrollback_lines: 50_000,
             colors: BTreeMap::from([

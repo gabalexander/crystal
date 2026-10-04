@@ -29,9 +29,10 @@ impl Crystal {
         // its name does. So are panes' scrollbars, so a pane's screen is as
         // wide as the pane, as the tests that count its columns expect. A
         // shell isn't a login shell, which on a Mac it would be, so it starts
-        // the same on every machine.
+        // the same on every machine. And `q` quits without asking first.
         crystal.configure(
-            "notify = false\nname_from_prompt = false\n\n[plugins]\nmemory = false\n\n\
+            "notify = false\nname_from_prompt = false\nconfirm_quit = false\n\n\
+             [plugins]\nmemory = false\n\n\
              [sound]\nenabled = false\n\n[mouse]\nscrollbars = false\n\n\
              [terminal]\nshell_mode = \"non_login\"\n",
         );
@@ -1312,6 +1313,40 @@ fn ctrl_e_turns_the_panel_into_the_command_line_it_would_run() {
 }
 
 #[test]
+fn capital_d_starts_a_session_like_the_selected_one() {
+    let crystal = Crystal::new();
+    let bin = fake_claude(crystal.dir.path());
+    let path = path_of(&[&bin]);
+    let out = crystal
+        .command(&[
+            "new", "-n", "first", "-t", "fix it", "claude", "--model", "opus",
+        ])
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let args = crystal.dir.path().join("args");
+    written(&args);
+
+    let mut tui = crystal.attach_with_env(&[], &[("PATH", &path)]);
+    tui.shows("first");
+    tui.type_keys("D");
+    tui.shows("New session");
+    tui.shows("claude --model opus");
+    tui.type_keys("now the docs\r");
+    eventually("the new session has started", || {
+        std::fs::read_to_string(&args).is_ok_and(|args| args.contains("now the docs"))
+    });
+    let args = written(&args);
+    let args: Vec<&str> = args.lines().collect();
+    assert!(
+        args.windows(2).any(|w| w == ["--model", "opus"]),
+        "{args:?}"
+    );
+    assert!(!args.contains(&"fix it"), "{args:?}");
+}
+
+#[test]
 fn a_profile_from_the_config_starts_with_its_options_and_prompt() {
     let crystal = Crystal::new();
     crystal.configure(
@@ -1576,6 +1611,62 @@ fn q_quits_the_tui_and_the_sessions_keep_running() {
     tui.type_keys("q");
     assert!(tui.exit());
     assert_eq!(crystal.row("stays").unwrap()[1], "running");
+}
+
+#[test]
+fn q_asks_before_it_quits_unless_the_settings_say_not_to() {
+    let crystal = Crystal::new();
+    crystal.configure("notify = false\n\n[plugins]\nmemory = false\n\n[sound]\nenabled = false\n");
+    crystal.ok(&["new", "-n", "stays", "sleep", "30"]);
+
+    let mut tui = crystal.tui();
+    tui.shows("❯ stays");
+    tui.type_keys("q");
+    tui.shows("quit crystal? The sessions keep running. y/n");
+    // Any key but `y` stays.
+    tui.type_keys("n");
+    tui.hides("quit crystal?");
+    tui.shows("❯ stays");
+    tui.type_keys("q");
+    tui.shows("quit crystal?");
+    tui.type_keys("y");
+    assert!(tui.exit());
+    assert_eq!(crystal.row("stays").unwrap()[1], "running");
+}
+
+#[test]
+fn capital_m_shows_the_memory_each_session_takes() {
+    let crystal = Crystal::new();
+    crystal.ok(&["new", "-n", "stays", "sleep", "30"]);
+    crystal.ok(&["new", "-n", "other", "sleep", "30"]);
+
+    let mut tui = crystal.tui();
+    tui.shows("❯ stays");
+    tui.type_keys("M");
+    tui.shows(" RAM · ");
+    tui.shows("1 process");
+    tui.shows("crystal itself");
+    tui.shows("the daemon");
+    tui.shows("this TUI");
+    // Enter goes to the session the bar is on.
+    tui.type_keys("j\r");
+    tui.hides("crystal itself");
+}
+
+#[test]
+fn plus_adds_a_project_and_makes_it_a_git_repository_first() {
+    let crystal = Crystal::new();
+    let mut tui = crystal.tui();
+    tui.shows("No sessions yet");
+    tui.type_keys("+");
+    tui.shows("add project:");
+    let dir = crystal.dir.path().join("payments");
+    tui.type_keys(&format!("\x15{}\r", dir.display()));
+    tui.shows("make a new git repository and add it:");
+    tui.type_keys("y");
+    tui.shows("payments is on the list of projects");
+    assert!(dir.join(".git").exists());
+    assert!(crystal.ok(&["project"]).contains("payments"));
 }
 
 #[test]
@@ -1908,9 +1999,9 @@ fn without_mouse_capture_the_terminal_keeps_the_mouse() {
     // Switched on in the settings view, the TUI takes it straight away.
     tui.type_keys(",");
     tui.shows("take the mouse");
-    // Ten rows down, past the theme's, the appearance's, the tab bar's and
-    // the sessions'.
-    tui.type_keys("jjjjjjjjjj ");
+    // Eleven rows down, past the theme's, the appearance's, the tab bar's,
+    // the sessions' and quitting's.
+    tui.type_keys("jjjjjjjjjjj ");
     eventually("the TUI takes the mouse", || tui.sends_the_mouse());
     assert!(
         std::fs::read_to_string(crystal.config_file())
@@ -2081,6 +2172,65 @@ fn claude_reports_what_it_is_doing_through_its_hooks() {
     terminal.type_keys("\x1c");
     assert!(terminal.exit());
     assert_eq!(crystal.row("agent").unwrap()[1], "idle");
+}
+
+#[test]
+fn claude_code_s_rename_names_the_session_and_a_name_given_in_crystal_goes_back() {
+    let crystal = Crystal::new();
+    let bin = fake_claude(crystal.dir.path());
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let out = crystal
+        .command(&["new", "claude"])
+        .env("PATH", path)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let args = written(&crystal.dir.path().join("args"));
+    let args: Vec<&str> = args.lines().collect();
+    let settings: serde_json::Value = serde_json::from_str(args[3]).unwrap();
+    let hook = settings["hooks"]["Stop"][0]["hooks"][0]["command"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let sessions: serde_json::Value = serde_json::from_str(&crystal.ok(&["ls", "--json"])).unwrap();
+    let id = sessions[0]["id"].as_str().unwrap().to_string();
+    let env = [
+        ("CRYSTAL_SESSION", "claude"),
+        ("CRYSTAL_SESSION_ID", id.as_str()),
+    ];
+
+    // Where Claude Code keeps the conversation, and its name beside it.
+    let projects = crystal.dir.path().join("projects");
+    let transcript = projects.join("talk-1.jsonl");
+    let named = projects.join("talk-1").join("custom-title.json");
+    let event = |name: &str, more: &str| {
+        format!(
+            r#"{{"hook_event_name":"{name}","session_id":"talk-1","transcript_path":"{}"{more}}}"#,
+            transcript.display()
+        )
+    };
+    let says = |event: &str| hook_says(&crystal, &env, &hook, event);
+    assert_eq!(says(&event("SessionStart", "")), "");
+
+    // `/rename` in Claude Code names the session.
+    std::fs::create_dir_all(named.parent().unwrap()).unwrap();
+    std::fs::write(&named, r#"{"customTitle":"Fix refund rounding"}"#).unwrap();
+    eventually("the session follows the rename", || {
+        crystal.row("fix-refund-rounding").is_some()
+    });
+
+    // A name given in crystal goes to Claude Code with the next prompt, once.
+    crystal.ok(&["rename", "fix-refund-rounding", "refunds"]);
+    let prompt = event("UserPromptSubmit", r#","prompt":"and the docs""#);
+    let answer: serde_json::Value = serde_json::from_str(&says(&prompt)).unwrap();
+    assert_eq!(answer["hookSpecificOutput"]["sessionTitle"], "refunds");
+    assert_eq!(says(&prompt), "");
+
+    // A name the user gave stays through a rename in Claude Code.
+    std::fs::write(&named, r#"{"customTitle":"Something else"}"#).unwrap();
+    assert_eq!(says(&event("Stop", "")), "");
+    assert!(crystal.row("refunds").is_some());
+    assert!(crystal.row("something-else").is_none());
 }
 
 #[test]
@@ -11057,11 +11207,11 @@ fn the_settings_view_changes_the_config_and_follows_it_live() {
     crystal.configure(
         "notify = true\ntheme = \"light\"\n\n[memory]\ndistill = false\nembeddings = false\n",
     );
-    // Memory's rows are twelve down from the theme, past the appearance's,
-    // the tab bar's, the spacing of restarts, the mouse's, the clipboard's
-    // and background tasks', which the view scrolls to on a screen too
-    // short for all of them.
-    tui.type_keys("jjjjjjjjjjjj");
+    // Memory's rows are thirteen down from the theme, past the
+    // appearance's, the tab bar's, the spacing of restarts, quitting's, the
+    // mouse's, the clipboard's and background tasks', which the view
+    // scrolls to on a screen too short for all of them.
+    tui.type_keys("jjjjjjjjjjjjj");
     tui.shows("○ distill closed tasks");
     tui.shows("not downloaded (2449 MB)");
 
@@ -13568,7 +13718,10 @@ fn keys_the_config_gives_run_their_commands_and_colon_lists_every_one() {
     tui.shows("select the session below");
     tui.type_keys("quit");
     tui.shows("quit the TUI");
+    // Run from the list, it asks first too.
     tui.type_keys("\r");
+    tui.shows("quit crystal?");
+    tui.type_keys("y");
     assert!(tui.exit());
 }
 

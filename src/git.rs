@@ -523,6 +523,13 @@ pub fn still_has_worktree(project_path: &Path, path: &Path) -> Result<bool> {
     Ok(there)
 }
 
+/// Makes the directory `dir` a git repository of its own, for a project
+/// that isn't one yet.
+pub fn init(dir: &Path) -> Result<()> {
+    git(dir, &["init", "--quiet"])?;
+    Ok(())
+}
+
 /// Whether the worktree at `dir` has changes that `git worktree remove`
 /// would only remove when forced: files changed or new and not committed,
 /// found the way it finds them.

@@ -151,7 +151,9 @@ and the footer says where you are and offers the keys that matter there, or, whe
 | `S` | your saved [layouts](#layouts): save your tabs as one, or put them back the way one has them |
 | `n` | start a new session from [the new-session panel](#starting-a-session), and type into it |
 | `w` | the same, in a new worktree on a branch with a made-up name, like `brave-otter` |
+| `D` | start a session [like the selected one](#starting-a-session): the new-session panel, set to what it runs and where |
 | `W` | remove the selected worktree, once nothing runs in it and you've said `y` |
+| `+` | add a [project](#projects): a directory, made a git repository first if it isn't one, once you've said `y` |
 | `r` | rename the selected session |
 | `x` | kill the selected session, once you've said `y` |
 | `A` | [archive](#archiving-and-idle-agents) the selected session, once you've said `y`: it stops and leaves the list, to start again where it was |
@@ -184,8 +186,9 @@ and the footer says where you are and offers the keys that matter there, or, whe
 | `P` | list your [profiles](#profiles), and add, change, copy or remove one |
 | `X` | list the [plugins](#plugins): switch them on and off, run their actions and open their panes |
 | `,` | open the [settings](#the-settings-view): notifications, sounds, the theme, and how memory learns and searches, each changed as you go |
+| `M` | the memory each session's processes take, and crystal's own: [RAM](#ram) |
 | `?` | show every key, in the sidebar, in a pane, in resize mode, in a view, in a question and with the mouse, your own included: a page at a time when they don't all fit, `→` and `←` (or `Space`, `PgDn` and `PgUp`) turning the pages |
-| `q` | quit; the sessions keep running |
+| `q` | quit, once you've said `y`; the sessions keep running |
 
 While you're typing into a session, every key goes to it, `Tab` included, except `Ctrl+\`, which takes you
 back to the sidebar, `Shift+PageUp` / `Shift+PageDown`, which page through the pane's history, and the prefix,
@@ -588,7 +591,7 @@ everywhere else. `[keys]` names them the same way:
 | `view-close` | `q` | in a view: close it, or step back out of what's open in it |
 
 A view is any of the lists that take the keyboard: the diff, the file finder, the tree browser, find in files,
-the branch switcher, memory, the backlog, layouts, the archive, the plugins, the settings, what needs you, the
+the branch switcher, memory, the backlog, layouts, the archive, the plugins, the settings, what needs you, RAM, the
 timeline, the issues, the pull requests, `/` and the command list. A key you give a view's name stands in every
 one of them for the key they all take for it, `↓`, `↑`, `PgDn`, `PgUp`, `Enter` or `Esc`, which go on working
 whatever you give; the defaults you leave it without do nothing. While a view is taking what you type, like
@@ -865,6 +868,23 @@ to, stays, and so does one a script has typed into the session by with `crystal 
 `crystal new` and `crystal task` name a session the same way when you don't, and print the name.
 `name_from_prompt = false` in the [settings](#settings) names sessions after their programs.
 
+Claude Code's own name for a conversation, the one `/rename` gives it, and the session's name in crystal are
+kept in step, as far as Claude Code lets them be. `/rename Fix refund rounding` renames the session
+`fix-refund-rounding` within a moment, as crystal reads the name Claude Code keeps beside its transcript,
+unless you named the session yourself: a name you gave it, with `r`, `crystal rename` or `-n`, stays, since
+scripts and other agents may know it by it. The other way, a name you rename a session to in crystal becomes
+Claude Code's for the conversation, shown in its prompt box and `/resume`, but only with the next prompt you
+send it: nothing renames a Claude Code session from outside but its hook's answer to a prompt. The name a
+session started with isn't given to Claude Code, nor one crystal made up: Claude Code has its own. Only Claude Code has such a name to keep in step; a
+background task has none.
+
+`D` starts a session like the selected one: it opens the panel set to what that session runs, the profile its
+command fits or else its agent, each row at the option its command gives, in the background for a background
+task, and in its place, so only the task is left to write. Anything on its command line the panel has no row
+for, like `--dangerously-skip-permissions`, comes along, there to see in the command the panel shows. Its
+conversation doesn't: the new session starts fresh. On a program that's no agent crystal knows, `D` hands its
+command to the bottom line, `new session:`, to run again or change first.
+
 Under the task, `Tab` and `Shift+Tab` go from row to row and `←` / `→` change a row's choice:
 
 - **run**: your [profiles](#profiles), then the agents installed on your `PATH` (Claude Code, Codex, Gemini
@@ -915,6 +935,17 @@ an agent that said how to resume it. A turn that ended while you were away waits
 does one asking you something; terminals, background tasks and sessions with their task open are never
 stopped. It's off until you set it, from the file or the [settings view](#the-settings-view).
 
+### RAM
+
+`M` shows the memory each session takes: its program and every process under it, since an agent runs node
+workers, shells and MCP servers of its own, the biggest first, with how many processes that is and its share of
+the whole. Under them is what crystal takes itself, the daemon and the TUI, and in the heading all of it, and
+its share of the machine's memory. `Enter` goes to the session the bar is on. The daemon looks at the
+processes, `ps` on a Mac and `/proc` on Linux, every second while the view is open, and every five seconds
+otherwise for the footer, which shows all of it beside `? keys` while the sidebar has the keyboard, like
+`1.2 GB`: a click on that opens the view.
+What's counted is each process's resident memory, so what processes share is counted in each.
+
 ### Projects
 
 crystal keeps a list of the projects you work in: every git repository a session has run in, and those you
@@ -923,6 +954,12 @@ start something there without a terminal of your own in it. `crystal project` li
 sessions each has (`--json` for scripts), `crystal project add [dir]` adds the repository a directory is in, and
 `crystal project rm [dir]` (or `W` on its row in the sidebar) takes one off the list. Its backlog, tasks and
 memory stay, and it's back as soon as a session runs there again.
+
+`+` in the sidebar adds one from the TUI: the bottom line asks for its directory, starting in the one the
+selected project is in, and `Tab` finishes a directory's name as a shell does. A directory in a project already,
+at its top or not, adds that project. One that isn't in a git repository is made one once you've said `y`, and
+one that isn't there yet is made, then made one; crystal's projects are git repositories. The new project is
+selected, ready for `n`.
 
 A project can say how it's run and how it's opened, in `.crystal/project.toml` at the top of a worktree:
 
@@ -2528,6 +2565,7 @@ file and change. A setting crystal doesn't know is an error that names it, so a 
 | `[colors]` | | colors of your own over the theme's: [themes](#themes) |
 | `name_from_prompt` | `true` | name a session you don't name for the [first thing it's asked](#starting-a-session) |
 | `resume_reported_agents` | `true` | after a restart, run the command an agent [said resumes it](#teaching-crystal-about-your-agent), or the one that resumes an agent [typed into a shell](#usage) whose hooks named its conversation |
+| `confirm_quit` | `true` | `q` asks before it quits the TUI, since a key meant for an agent can land on the sidebar; the sessions keep running either way |
 | `scrollback_lines` | `10000` | how many rows that scrolled off a session's screen it keeps, up to 1,000,000, for scrolling back, copy mode, `e` and `crystal read --history` |
 | `[plugins]` | | which plugins are on and off: [plugins](#plugins) |
 | `[memory]` | | how memory's [distiller](#the-distiller) runs, and whether it [searches by meaning](#search-by-meaning) |
@@ -2571,8 +2609,8 @@ each time one starts, `[[project]]` each time a project's commands run,
 what it had); `crystal new` and the TUI read `[terminal]` each time they start a shell, and `crystal attach`
 reads `[clipboard]` as it attaches; the TUI reads
 `new_session`, `theme`, `[colors]`, `[appearance]`, `[window]`, `[tab_bar]`, `scrollback_lines`, `[plugins]`,
-`[update]`, `[mouse]`, `[clipboard]`, `[forge]`, the profiles and the flows when it starts, again when you save
-a profile or switch a plugin, and every half a second while the settings view is open.
+`[update]`, `[mouse]`, `[clipboard]`, `[forge]`, `confirm_quit`, the profiles and the flows when it starts,
+again when you save a profile or switch a plugin, and every half a second while the settings view is open.
 
 #### Themes
 
@@ -2723,8 +2761,8 @@ issues give way before it.
 sounds, the theme and whether it follows your system's [appearance](#themes) (the row says which theme each
 side is), whether the [tab bar](#terminals-the-window-and-the-tab-bar) goes on top or over the footer and is
 left out with one tab, how long an agent may sit [idle](#archiving-and-idle-agents), how far apart agents
-start again after a [crash or a reboot](#usage), [the mouse](#usage), whether programs' copies go on [your
-clipboard](#zoom-copy-mode-and-search), how memory learns ([the
+start again after a [crash or a reboot](#usage), whether `q` asks before it quits, [the mouse](#usage),
+whether programs' copies go on [your clipboard](#zoom-copy-mode-and-search), how memory learns ([the
 distiller](#the-distiller)) and searches ([by meaning](#search-by-meaning)), the permission mode [background
 tasks](#background-tasks) start in, and whether [draft pull requests](#pull-requests) are hidden. `space`
 changes the one the bar is on, and `←/→` go through the [themes](#themes), forward and back (the row says which

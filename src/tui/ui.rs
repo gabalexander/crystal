@@ -26,6 +26,7 @@ use super::pane::Pane;
 use super::plugins_view;
 use super::profiles;
 use super::pull_requests;
+use super::ram_view;
 use super::reply;
 use super::restarted::Restarted;
 use super::screen_widget::{Marks, ScreenWidget};
@@ -345,6 +346,9 @@ pub fn scrollbar_row(areas: &Areas, app: &App, slot: Slot, row: u16) -> Option<u
 /// What's at `(column, row)` on a screen laid out as `areas`, for `app`.
 pub fn hit(areas: &Areas, app: &App, column: u16, row: u16) -> Hit {
     let at = |area: Rect| area.contains((column, row).into());
+    if app.readout_at().is_some_and(at) {
+        return Hit::Readout;
+    }
     if let Some(view) = app.view() {
         let parts = view_areas(view, areas.main);
         // The tree browser's border is the mouse's while it's dragged.
@@ -468,6 +472,8 @@ fn draw_everything(
     look: &Look,
 ) {
     frame.render_widget(Block::new().style(look.theme.base()), frame.area());
+    // Drawn again, the footer says where its readout is, if it's there.
+    app.drew_readout(None);
     let areas = Areas::of(app, frame.area());
     draw_top_bar(frame, app, look, areas.top);
     if let Some(view) = app.view() {
@@ -529,6 +535,9 @@ fn draw_everything(
     }
     if let Some(view) = app.needs_you_view() {
         needs_you::draw(frame, view, look.theme, look.now, middle);
+    }
+    if let Some(view) = app.ram_view() {
+        ram_view::draw(frame, view, app.resources(), look.theme, middle);
     }
     if let Some(panel) = app.launcher() {
         // Over the panes, beside the sidebar.
@@ -1307,6 +1316,9 @@ fn draw_footer(frame: &mut Frame, app: &App, panes: &[Pane], look: &Look, area: 
     } else if let Some(view) = app.needs_you_view() {
         let hints = as_keys_are(app, needs_you::hints(view), true);
         draw_notice_or(frame, app.notice(), &borrowed(&hints), theme, area);
+    } else if app.ram_view().is_some() {
+        let hints = as_keys_are(app, ram_view::HINTS, false);
+        draw_notice_or(frame, app.notice(), &borrowed(&hints), theme, area);
     } else if app.timeline_view().is_some() {
         draw_notice_or(frame, app.notice(), timeline::HINTS, theme, area);
     } else if let Some(view) = app.issues_view() {
@@ -1344,9 +1356,17 @@ fn draw_footer(frame: &mut Frame, app: &App, panes: &[Pane], look: &Look, area: 
     } else if let Some(away) = app.away_line() {
         frame.render_widget(away_line(away, theme), area);
     } else {
-        let right = footer_right(app, theme);
+        // Beside `? keys`, in the sidebar, where it leaves a pane's keys the
+        // room.
+        let sidebar = app.focus() == Focus::Sidebar && !app.resizing();
+        let readout = app.resources().filter(|_| sidebar).map(ram_view::readout);
+        let right = footer_right(app, readout.as_deref(), theme);
         let room = usize::from(area.width).saturating_sub(right.width() + 1);
         frame.render_widget(hints_line(app, copying, theme, area.width, room), area);
+        if let Some(readout) = &readout {
+            let left = area.right().saturating_sub(right.width() as u16);
+            app.drew_readout(Some(Rect::new(left, area.y, width_of(readout), 1)));
+        }
         frame.render_widget(right.right_aligned(), area);
     }
 }
@@ -1965,12 +1985,20 @@ fn selection_place(app: &App) -> Option<String> {
     Some(format!("{place}{}", session.name))
 }
 
-/// The right of the footer: what background tasks have spent today, in
-/// red past the daily budget, and "? keys", where `?` opens the list of
-/// every key: from the sidebar only, since in a pane `?` goes to the
-/// program.
-fn footer_right<'a>(app: &App, theme: &Theme) -> Line<'a> {
+/// The right of the footer: the `readout` of the memory crystal takes, once
+/// the daemon has said, what background tasks have spent today, in red
+/// past the daily budget, and "? keys", where `?` opens the list of every
+/// key: from the sidebar only, since in a pane `?` goes to the program.
+fn footer_right<'a>(app: &App, readout: Option<&str>, theme: &Theme) -> Line<'a> {
     let mut spans = Vec::new();
+    // What crystal takes, which a click on opens the RAM view.
+    if let Some(readout) = readout {
+        spans.push(Span::styled(
+            readout.to_string(),
+            Style::new().fg(theme.muted),
+        ));
+        spans.push(Span::raw("  "));
+    }
     if let Some(spending) = app.spending() {
         let today = format!("${:.2} today", spending.today_usd);
         let said = if spending.over_budget() {
@@ -1998,6 +2026,7 @@ fn draw_prompt(frame: &mut Frame, theme: &Theme, prompt: &Prompt, area: Rect) {
         Question::CloseTask { failed: false, .. } => " done; what was done: ",
         Question::CloseTask { failed: true, .. } => " failed; why: ",
         Question::SendFlowBack(_) => " send back; what to do differently: ",
+        Question::AddProject => " add project: ",
     };
     let line = Line::from(vec![
         Span::styled(

@@ -43,6 +43,7 @@ pub enum Setting {
     HideSingleTab,
     StopIdle,
     RestartSpacing,
+    ConfirmQuit,
     MouseCapture,
     CopyOnSelect,
     ScrollLines,
@@ -72,6 +73,7 @@ pub enum Change {
     /// How far apart agents start again after a restart, in milliseconds,
     /// one of [`SessionSettings::SPACINGS`].
     RestartSpacing(u64),
+    ConfirmQuit(bool),
     MouseCapture(bool),
     CopyOnSelect(bool),
     /// How many lines a notch of the wheel scrolls, one of
@@ -101,6 +103,7 @@ impl Change {
             Change::HideSingleTab(_) => &["tab_bar", "hide_when_single"],
             Change::StopIdle(_) => &["sessions", "stop_idle_after"],
             Change::RestartSpacing(_) => &["sessions", "restart_spacing_ms"],
+            Change::ConfirmQuit(_) => &["confirm_quit"],
             Change::MouseCapture(_) => &["mouse", "capture"],
             Change::CopyOnSelect(_) => &["mouse", "copy_on_select"],
             Change::ScrollLines(_) => &["mouse", "scroll_lines"],
@@ -126,6 +129,7 @@ impl Change {
             | Change::Embeddings(on)
             | Change::AutoSwitch(on)
             | Change::HideSingleTab(on)
+            | Change::ConfirmQuit(on)
             | Change::HideDrafts(on) => on.into(),
             Change::TabBar(BarPosition::Top) => "top".into(),
             Change::TabBar(BarPosition::Bottom) => "bottom".into(),
@@ -206,7 +210,7 @@ pub enum Outcome {
 }
 
 /// The settings the bar can be on, in the order they're listed.
-const SETTINGS: [Setting; 19] = [
+const SETTINGS: [Setting; 20] = [
     Setting::Notify,
     Setting::NotifyAfter,
     Setting::UnfocusedOnly,
@@ -217,6 +221,7 @@ const SETTINGS: [Setting; 19] = [
     Setting::HideSingleTab,
     Setting::StopIdle,
     Setting::RestartSpacing,
+    Setting::ConfirmQuit,
     Setting::MouseCapture,
     Setting::CopyOnSelect,
     Setting::ScrollLines,
@@ -338,6 +343,7 @@ impl SettingsView {
                 let now = config.sessions.restart_spacing_ms;
                 Change::RestartSpacing(next_spacing(now, forward))
             }
+            Setting::ConfirmQuit => Change::ConfirmQuit(!config.confirm_quit),
             Setting::MouseCapture => Change::MouseCapture(!config.mouse.capture),
             Setting::CopyOnSelect => Change::CopyOnSelect(!config.mouse.copy_on_select),
             Setting::ScrollLines => {
@@ -504,6 +510,7 @@ fn lines(view: &SettingsView, theme: &Theme) -> Vec<Line<'static>> {
             Setting::HideSingleTab => "  hide with one tab",
             Setting::StopIdle => "stop idle agents",
             Setting::RestartSpacing => "space out restarts",
+            Setting::ConfirmQuit => "ask before quitting",
             Setting::MouseCapture => "take the mouse",
             Setting::CopyOnSelect => "copy on select",
             Setting::ScrollLines => "wheel scrolls",
@@ -642,6 +649,12 @@ fn lines(view: &SettingsView, theme: &Theme) -> Vec<Line<'static>> {
             ms => format!("{ms}ms apart"),
         },
         "the agents a crash or a reboot starts again: ←/→".to_string(),
+    ));
+    lines.push(row(
+        Setting::ConfirmQuit,
+        Some(config.confirm_quit),
+        on_off(config.confirm_quit),
+        "q asks first; the sessions keep running either way".to_string(),
     ));
 
     lines.push(Line::from(""));
@@ -867,6 +880,11 @@ mod tests {
         assert_eq!(
             press(&mut view, KeyCode::Left),
             Outcome::Change(Change::RestartSpacing(100))
+        );
+        press(&mut view, KeyCode::Down);
+        assert_eq!(
+            press(&mut view, KeyCode::Char(' ')),
+            Outcome::Change(Change::ConfirmQuit(false))
         );
         press(&mut view, KeyCode::Down);
         assert_eq!(

@@ -89,7 +89,9 @@ whenever what's handed over changes in a way the crystal before couldn't read.
     mouse from the terminal or leaving it there (`[mouse] capture`), counting clicks for double- and
     triple-clicks, scrolling a pane's history on a timer while a drag selecting in it is held past its edge,
     and sending a pager the wheel as arrow keys; having git count the changes of the worktrees the sidebar
-    shows, off the loop; and running the user's own keys' commands: a popup over everything, a session in a
+    shows, off the loop; asking the daemon what crystal's processes take, every few seconds and every second
+    while the RAM view is open, off the loop; adding a project `+` asked for, made a git repository first
+    once the user said so; and running the user's own keys' commands: a popup over everything, a session in a
     pane or a tab, or a command in the background that says only when it fails
   - `app.rs`: the state and how keys and the mouse change it: a sidebar key looked up in the keymap and its
     command run, from the sidebar, the `:` list, after the prefix in a pane or in a pane without it for a key
@@ -97,8 +99,10 @@ whenever what's handed over changes in a way the crystal before couldn't read.
     gave it stands for; the user's own keys' commands made ready (a split, a tab); the sidebar's width, folded or
     not, what needs the user pinned at its top, and the projects folded down to their headings, the selection
     resting on one out of sight; the forge's lists, one asked before the one kept dropped, and the issues
-    edited in the issues view laid over what was asked before the forge saved them; no I/O, so it's
-    unit-tested
+    edited in the issues view laid over what was asked before the forge saved them; `q` asking first
+    (`confirm_quit`); `D` opening the new-session panel like the selected session; `+`'s question, its `Tab`
+    handed to the event loop to finish the directory; what crystal's processes take, and where the footer
+    drew its readout of it, for a click; no I/O, so it's unit-tested
     - `app/commands.rs`: the layout commands carried out on the state, each on the tab holding the session it's
       about, in front or not, and the layout the TUI answers with; and carried out with no TUI open, on a state
       made for it from the tabs kept, the sessions and the flow runs, on a screen of an unseen session's size
@@ -107,7 +111,8 @@ whenever what's handed over changes in a way the crystal before couldn't read.
     key, the mouse, a paste, focus gained) and when its terminal gains and loses the focus  sent back
   - `ui.rs`: the layout and drawing (the tab bar, on top or over the footer or left out, its tabs and what
     it shows at its right, the counts of what's open on the selected session's forge first, pane headers,
-    footer, the column each pane's scrollbar takes), and what's under the mouse
+    footer and its readout of the memory crystal takes, the column each pane's scrollbar takes), and what's
+    under the mouse
   - `scrollbar.rs`: a pane's scrollbar: where its thumb is for how far back the pane is, how far back a
     dragged thumb takes it, and drawing it; pure, so it's unit-tested
   - `tabs.rs`: tabs, as many as the user likes, each holding its own sessions (each session in exactly one)
@@ -179,7 +184,8 @@ whenever what's handed over changes in a way the crystal before couldn't read.
     daemon takes it, and its drawing
   - `launcher.rs`: the new-session panel (`n`, `w`): its state and keys, kept apart from I/O, the command
     it builds, what it remembers between runs, the draft it leaves when it's put away with a task in it and
-    opens on again, and its drawing
+    opens on again, the panel `D` opens like a session (the profile its command fits or its agent, its
+    rows from its options, the rest of its arguments kept), and its drawing
   - `command_line.rs`: reads the line typed at `new session:` (the panel's `Ctrl+E`) into the command to run
   - `profiles.rs`: the profiles view (`P`): the list, the form that edits one, its keys and drawing; the
     event loop does the writing
@@ -242,13 +248,16 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   - `needs_you.rs`: the needs-you view (`U`): everything waiting on the user, in every tab, the most urgent
     first, from the sessions and flow runs the TUI has; answering a permission or a gate in place, the bar
     kept on its row as rows come and go, and its drawing
+  - `ram_view.rs`: the RAM view (`M`): the memory each session's processes take, the biggest first, its
+    share of all of it, and crystal's own; Enter goes to the session, the bar kept on its session as a new
+    look reorders the rows; its state, keys and drawing, and the footer's readout
   - `away.rs`: "while you were away": when the user is gone (a quit, the terminal's focus lost for a while, or
     no key for a while where focus isn't told), what the event log gained meanwhile counted into the
     footer's line, and the latest event seen, which the event loop keeps in the database
   - `restarted.rs`: the footer's line on what a cold restart brought back and what couldn't start, worked out
     from the sessions the TUI sees waiting their turn, and those that failed, said once; pure
   - `settings_view.rs`: the settings view (`,`): notifications, sounds, the theme, the mouse, programs' copies,
-    idle agents, the spacing of restarts, background tasks' permission mode, the distiller, search by meaning
+    idle agents, the spacing of restarts, whether `q` asks first, background tasks' permission mode, the distiller, search by meaning
     and hiding draft pull requests, each changed with a key, and how the models stand; the event loop writes
     the file (`config::set`) and, while it's open, reads the settings and the daemon's `EmbeddingStatus` again
     every half a second
@@ -303,8 +312,13 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   resume`, and crystal's notes given as its developer instructions, after the ones it has already
 - `src/hook.rs`: `crystal hook <agent>`: what those hooks run, any agent's, to tell the daemon, the prompt sent,
   the conversation, the agent and a subagent included (the daemon passes over an agent's that isn't the one in
-  front), and to pass on its reminder to an agent ending a turn with its task open; with `--installed`, the
-  hooks `crystal integration` installed, and with `--event`, the event a hook or plugin names itself
+  front), and to pass on its reminder to an agent ending a turn with its task open, and to Claude Code, as the
+  user sends a prompt, the name the session was renamed to in crystal; with `--installed`, the hooks `crystal
+  integration` installed, and with `--event`, the event a hook or plugin names itself
+- `src/claude_title.rs`: keeping a session's name and Claude Code's name for its conversation (`/rename`) in
+  step: the file Claude Code keeps it in beside the transcript, looked at with each check, a rename since the
+  first look followed unless the user named the session; and a rename in crystal, given once as the prompt
+  hook's `sessionTitle` (adapted from docket's)
 - `src/integration.rs`: `crystal integration install|uninstall|status`: crystal's hooks put in Claude Code's
   `settings.json` and Codex's `hooks.json` (and `[features] hooks` in its `config.toml`, with `toml_edit`),
   beside the user's own, replacing those of a crystal at another path, taken out again alone, written in one
@@ -327,7 +341,8 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   itself while it holds the session, the
   conversation its agent's hooks named, which counts once the agent has worked on a turn in it, an agent typed
   into its shell whose conversation a restart resumes while it's in front, its agent's subagents,
-  whether its first prompt can name it, whether its agent is blocked on the user, how long its agent has sat
+  whether its first prompt can name it, whether the user or a script gave its name, the name Claude Code gives
+  its conversation, whether its agent is blocked on the user, how long its agent has sat
   idle (nobody watching or typing, its turn seen), the model its agent runs on and what was reported for its
   row, why its screen reads the way it does (`crystal agent explain`), and what has changed in it (its agent's
   activity, a task's runs, its bell rung or a copy its program made while nobody watched) for the daemon to
@@ -449,6 +464,9 @@ whenever what's handed over changes in a way the crystal before couldn't read.
 - `src/qwen3.rs`: Qwen3, the transformer both models are, adapted from candle-transformers' to read texts whole:
   no cache, a batch padded at its end, causal attention through Candle's fused kernel on Metal (past 8 tokens,
   below which Candle's kernel isn't causal)
+- `src/resources.rs`: the memory crystal's processes take, for the RAM view: every process on the machine read
+  once (`/proc` on Linux, `ps` elsewhere), each session's program summed with every process under it, the
+  daemon's own and the asking client's, and the machine's memory; the counting pure, so it's unit-tested
 - `src/rerank.rs`: the reranker: every passage and the query in one prompt, each marked at its end, the
   projector over the model's state at the marks, and each passage's cosine with the query
 - `src/secrets.rs`: taking credentials out of text before memory keeps it or the distiller reads it
@@ -497,20 +515,21 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   worktree (a merge, a rebase, a cherry-pick or a revert) and the branch a rebase keeps though HEAD is
   detached, the subject of the commit each of Claude Code's own worktrees (`.claude/worktrees`) is at, what a
   worktree's line in the sidebar counts (its changes not committed, files and lines, and how far its branch is
-  ahead of its upstream and behind it, read without taking the index's lock), and `git grep` stopped once it's
-  no longer wanted (runs `git`)
+  ahead of its upstream and behind it, read without taking the index's lock), `git grep` stopped once it's
+  no longer wanted, and making a directory a repository for a new project (runs `git`)
   - `git/branches.rs`: a worktree's branches, local and remote, fetching its remotes in a session of their own
     with a timeout, its uncommitted changes, and switching it to another branch or a new one, the changes
     stashed, brought along, committed or thrown away, and put back when git won't switch
 - `src/names.rs`: made-up names for new worktrees' branches, like `brave-otter`, and a session's name from its
-  first prompt, like `fix-login-redirect`
+  first prompt, like `fix-login-redirect`, or from the name Claude Code gave its conversation
 - `src/forge.rs`: pull requests (open, and merged lately) and issues from the forge a project's remote is on,
   GitHub or GitLab, told apart by its host and the hosts `gh` and `glab` know: the types both read into,
   `Repo`'s calls, one pull request or issue among them read on its own, and running the CLI with a timeout; tests use a fake `gh` and `glab`, never the real ones.
   Was `github.rs`
   - `forge/github.rs`: each call as a `gh` command, and reading its `--json`
   - `forge/gitlab.rs`: each call as a `glab` command, and reading its JSON, a merge request as a pull request
-- `src/shell.rs`: quoting arguments and writing paths with `~`, the way a shell reads them
+- `src/shell.rs`: quoting arguments and writing paths with `~`, the way a shell reads them, and finishing a
+  directory's name as a shell's `Tab` does
 - `src/printable.rs`: text crystal didn't write made fit for the user's terminal: control characters, the escape
   sequences they start and the explicit bidi controls taken out, on one line or keeping its lines; and the TUI's
   frame scrubbed of them last, since ratatui hands a zero-width one on to the terminal. A background task's

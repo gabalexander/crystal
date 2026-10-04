@@ -2,10 +2,11 @@
 //! reads the event the agent passes on stdin and tells the daemon.
 //!
 //! A hook must never get in its agent's way. This one prints nothing, since
-//! an agent may take a hook's output as input, but for the one thing meant
+//! an agent may take a hook's output as input, but for the two things meant
 //! as input: the reminder the daemon sends back when an agent ends a turn
-//! with its task still open. And it always succeeds: a failing hook can
-//! hold the agent up.
+//! with its task still open, and the name a session was renamed to in
+//! crystal, for Claude Code's conversation, as the user sends a prompt. And it always
+//! succeeds: a failing hook can hold the agent up.
 //!
 //! The hooks crystal adds as it starts Claude Code run `crystal hook
 //! claude`; those `crystal integration` puts in an agent's own settings run
@@ -16,6 +17,7 @@
 //! agent's input may not, or means something crystal reads as another.
 
 use crate::agents;
+use crate::claude_title;
 use crate::client;
 use crate::protocol::{AgentEvent, Request, Response};
 use anyhow::Result;
@@ -93,9 +95,11 @@ fn report(socket: &Path, agent: &str, installed: bool, event: Option<&str>) -> R
         subagent: agents::subagent(&input).filter(|_| about_subagent),
         model: agents::hook_model(&input),
     };
-    // Codex's Stop hook takes the same answer as Claude Code's.
-    if let Some(Response::Remind { text }) = client::ask(socket, &report, false)? {
-        println!("{}", agents::claude_keep_going(&text));
+    match client::ask(socket, &report, false)? {
+        // Codex's Stop hook takes the same answer as Claude Code's.
+        Some(Response::Remind { text }) => println!("{}", agents::claude_keep_going(&text)),
+        Some(Response::Retitle { title }) => println!("{}", claude_title::hook_answer(&title)),
+        _ => {}
     }
     Ok(())
 }

@@ -40,6 +40,7 @@ mod plugins_view;
 mod preview;
 mod profiles;
 mod pull_requests;
+mod ram_view;
 mod reply;
 mod restarted;
 mod review;
@@ -78,9 +79,9 @@ use crate::project_commands::{self, Commands, Verb};
 use crate::protocol::{
     Backlog, NewSession, Request, Response, SessionInfo, Spending, State, Worktree,
 };
-use crate::{catalog, keys, links, names, socket, typing, update};
+use crate::{catalog, keys, links, names, project, shell, socket, typing, update};
 use crate::{client, clipboard, drive, env, event_log, events, git};
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Context as _, Result, bail, ensure};
 use app::{Action, App, Focus, Hit, Place, PluginKey, PluginPane, Popup, Slot};
 use appearance::Appearance;
 use backlog_view::BacklogChange;
@@ -143,6 +144,11 @@ const WORKTREES_EVERY: Duration = Duration::from_secs(5);
 /// when nothing says it has: a worktree is counted again straight away
 /// once a session in it changes.
 const STATS_EVERY: Duration = Duration::from_secs(10);
+
+/// How often the daemon is asked what crystal's processes take, for the
+/// footer's readout; and how often while the RAM view is open.
+const RESOURCES_EVERY: Duration = Duration::from_secs(5);
+const RESOURCES_OPEN_EVERY: Duration = Duration::from_secs(1);
 
 /// How often the thread following the event log for the timeline looks up
 /// from waiting, to see whether the timeline is still open.
@@ -256,6 +262,8 @@ pub enum Event {
     /// A pull request's worktree is there now: the start that waited on it
     /// can go on, in it.
     Fetched(Box<Action>),
+    /// What the daemon found crystal's processes take.
+    Resources(crate::resources::Resources),
     /// Something to tell the user, from work done off the loop.
     Notice(String),
     /// A worktree's diff, read for the diff view.
@@ -404,6 +412,8 @@ pub fn run(socket: &Path) -> Result<()> {
     let stat_worktrees = Arc::new(Mutex::new(Vec::new()));
     let stats_now = Arc::new(Mutex::new(HashSet::new()));
     spawn_stat_counter(stat_worktrees.clone(), stats_now.clone(), sender.clone());
+    let ram_open = Arc::new(AtomicBool::new(false));
+    spawn_resource_poller(socket.to_path_buf(), sender.clone(), ram_open.clone());
 
     // Losing the tabs is no reason not to start: without the database, the
     // TUI starts with one tab, and says why when asked for a layout.
@@ -441,6 +451,7 @@ pub fn run(socket: &Path) -> Result<()> {
         count_backlog,
         poll_flows,
         poll_settings,
+        ram_open,
         config: config.clone(),
         feed: Arc::new(AtomicU64::new(0)),
         presence: away::Presence::new(events::now_ms()),
@@ -589,6 +600,9 @@ struct Tui {
     /// Whether the session poller reads the settings too: the settings
     /// view is open.
     poll_settings: Arc<AtomicBool>,
+    /// Whether the RAM view is open, which has the daemon asked what the
+    /// sessions take more often.
+    ram_open: Arc<AtomicBool>,
     /// The config as the TUI last took it in.
     config: Config,
     /// Where layout commands from the command line come from, and their
@@ -1198,6 +1212,7 @@ impl Tui {
                 self.carry_out(*start);
             }
             Event::Notice(notice) => self.app.notify(notice),
+            Event::Resources(taken) => self.app.set_resources(taken),
             Event::Output { pane, bytes } => {
                 let Some(pane) = self.pane_with_id(pane) else {
                     return;
@@ -1562,6 +1577,37 @@ impl Tui {
         true
     }
 
+    /// Puts the project in `dir` on the list, once it's one: a directory
+    /// that isn't there, or isn't in a git repository, is asked about
+    /// first. One in a project already, its root or not, puts that project
+    /// on the list, if it isn't on it yet.
+    fn add_project(&mut self, dir: PathBuf) -> Result<()> {
+        let dir = std::path::absolute(&dir).unwrap_or(dir);
+        if !dir.exists() {
+            self.app.confirm_new_project(dir, true);
+            return Ok(());
+        }
+        ensure!(
+            dir.is_dir(),
+            "{} isn't a directory",
+            shell::home_relative(&dir)
+        );
+        if git::Checkout::find(&dir).is_none() {
+            self.app.confirm_new_project(dir, false);
+            return Ok(());
+        }
+        client::ask(
+            &self.socket,
+            &Request::AddProject { dir: dir.clone() },
+            false,
+        )?;
+        if let Some(projects) = list_projects(&self.socket) {
+            self.set_known_projects(projects);
+        }
+        self.app.project_added(&project::of(&dir).path);
+        Ok(())
+    }
+
     fn perform(&mut self, action: Action) -> Result<()> {
         match action {
             Action::Quit => self.quitting = true,
@@ -1911,6 +1957,8 @@ impl Tui {
             Action::StopFollowing => {
                 self.feed.fetch_add(1, Ordering::Relaxed);
             }
+            Action::OpenRam => self.ram_open.store(true, Ordering::Relaxed),
+            Action::CloseRam => self.ram_open.store(false, Ordering::Relaxed),
             Action::ReadOlderEvents(before) => {
                 let feed = self.feed.load(Ordering::Relaxed);
                 let socket = self.socket.clone();
@@ -1937,6 +1985,19 @@ impl Tui {
                 if let Some(projects) = list_projects(&self.socket) {
                     self.set_known_projects(projects);
                 }
+            }
+            Action::AddProject(dir) => self.add_project(dir)?,
+            Action::NewProject { dir, create } => {
+                if create {
+                    std::fs::create_dir_all(&dir)
+                        .with_context(|| format!("couldn't make {}", shell::home_relative(&dir)))?;
+                }
+                git::init(&dir)?;
+                self.add_project(dir)?;
+            }
+            Action::CompleteDirectory(typed) => {
+                let completed = shell::complete_dir(&typed, shell::subdirectories);
+                self.app.complete_answer(&completed);
             }
             Action::Archive(name) => {
                 client::ask(
@@ -3265,6 +3326,37 @@ fn spawn_stat_counter(
                 }
             }
             thread::sleep(Duration::from_millis(200));
+        }
+    });
+}
+
+/// Asks the daemon what crystal's processes take, on a thread of its own:
+/// every [`RESOURCES_EVERY`], and every [`RESOURCES_OPEN_EVERY`] while
+/// `open` says the RAM view is, straight away as it opens.
+fn spawn_resource_poller(socket: PathBuf, events: Sender<Event>, open: Arc<AtomicBool>) {
+    thread::spawn(move || {
+        let request = Request::Resources {
+            client: Some(std::process::id()),
+        };
+        let mut asked: Option<Instant> = None;
+        let mut was_open = false;
+        loop {
+            let is_open = open.load(Ordering::Relaxed);
+            let every = match is_open {
+                true => RESOURCES_OPEN_EVERY,
+                false => RESOURCES_EVERY,
+            };
+            let due = asked.is_none_or(|at| at.elapsed() >= every) || (is_open && !was_open);
+            was_open = is_open;
+            if due {
+                asked = Some(Instant::now());
+                if let Ok(Some(Response::Resources(taken))) = client::ask(&socket, &request, false)
+                    && events.send(Event::Resources(taken)).is_err()
+                {
+                    return;
+                }
+            }
+            thread::sleep(Duration::from_millis(100));
         }
     });
 }
