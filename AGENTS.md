@@ -98,7 +98,10 @@ whenever what's handed over changes in a way the crystal before couldn't read.
     terminals, each flow run's steps under it, and linked worktrees with no sessions left at the end of
     their project
   - `text_input.rs`: a one-line text box, for the questions asked on the bottom line
-  - `text_area.rs`: a text box of several lines that wrap: the new-session panel's task
+  - `text_area.rs`: a text box of several lines that wrap: the new-session panel's task, and the reply box
+  - `reply.rs`: the reply box (`Space`): the next prompt for a session, or a background task's follow-up,
+    sent without going into its pane; its state and keys, kept apart from I/O, what's typed kept until the
+    daemon takes it, and its drawing
   - `launcher.rs`: the new-session panel (`n`, `w`): its state and keys, kept apart from I/O, the command
     it builds, what it remembers between runs, and its drawing
   - `command_line.rs`: reads the line typed at `new session:` (the panel's `Ctrl+E`) into the command to run

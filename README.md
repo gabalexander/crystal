@@ -91,6 +91,7 @@ and the footer says where you are and offers the keys that matter there, or, whe
 |---|---|
 | `j` / `k`, `↓` / `↑` | select a session, or a worktree with no sessions |
 | `Enter` | type into the selected session, or start an ended one again, once you've said `y`; on a worktree with no sessions, start one there |
+| `Space` | reply to the selected session without going into its pane: a box takes what to say, and `Enter` sends it, typed in with `Enter` after it, or as a [background task](#background-tasks)'s follow-up (`Alt+Enter` or `Ctrl+J` for a new line, `Esc` to cancel) |
 | `s` | split the selected session off into a pane of its own, beside its pane or below it, or close its split |
 | `\|` / `-` | split the selected session's pane in two, side by side or one above the other |
 | `Shift+arrows` | select the session in the pane to the left, right, above or below |
@@ -813,8 +814,8 @@ Sent from another session, a message says so on a line ahead of it, `[crystal] M
 working on task "Port the codec":`, so the agent knows who asks, and that `crystal send` answers. Such a
 message loses its control characters but for line breaks, and is cut at 8 KiB. A session may send 20
 messages a minute, the most crystal allows: the next is refused, since two agents answering each other are
-most likely in a loop. A session can't send to itself. From you or a script, the text goes as it is, with no
-line ahead of it and no limit. Each message is a `session.message` [event](#events).
+most likely in a loop. A session can't send to itself. From you, a script or the TUI's `Space`, the text goes
+as it is, with no line ahead of it and no limit. Each message is a `session.message` [event](#events).
 
 `wait` can wait for something else instead:
 
@@ -1111,10 +1112,11 @@ crystal interrupt docs                                               # stop the 
   that changes or removes what's there, like `crystal backlog rm` or `crystal memory rm`, still asks.
 - `Ctrl+C` in a task's pane, or `crystal interrupt <task>`, stops the run it's in the middle of. Its task
   stays open, waiting on you, and a follow-up carries on.
-- `crystal send` gives a task a follow-up: on the `claude` still there, or once that has gone, after five
-  minutes with nothing to do or after a restart, on a new one that carries the conversation on with
-  `--resume`. One run at a time: a follow-up sent while Claude is still working is refused. A task takes no
-  keys, so `send-keys` is refused too.
+- `crystal send`, or `Space` in the TUI, gives a task a follow-up: on the `claude` still there, or once that
+  has gone, after five minutes with nothing to do or after a restart, on a new one that carries the
+  conversation on with `--resume`. One run at a time: a follow-up sent while Claude is still working is
+  refused, and so is one sent while it asks for a permission. A task takes no keys, so `send-keys` is refused
+  too.
 - `crystal result <task>` prints the last answer; `--json` adds whether the run failed, the conversation's id,
   the cost so far and how many runs the task has had.
 - Each task's `claude` is given `--max-budget-usd`: $5, unless `max_budget_usd` under `[tasks]` in the

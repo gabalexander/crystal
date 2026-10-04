@@ -20,6 +20,7 @@ use super::pane::Pane;
 use super::plugins_view;
 use super::profiles;
 use super::pull_requests;
+use super::reply;
 use super::screen_widget::{Marks, ScreenWidget};
 use super::settings_view;
 use super::sidebar::{self, fit};
@@ -445,6 +446,9 @@ pub fn draw(frame: &mut Frame, app: &App, panes: &[Pane], overlay: Option<&Pane>
             areas.main.height,
         );
         launcher::draw(frame, panel, look.theme, over);
+    }
+    if let Some(reply) = app.reply() {
+        reply::draw(frame, reply, look.theme, middle);
     }
     if let Some(view) = app.profiles_view() {
         let below_top = areas.top.bottom();
@@ -996,6 +1000,8 @@ fn draw_footer(frame: &mut Frame, app: &App, panes: &[Pane], look: &Look, area: 
     let searching = copying.and_then(|pane| pane.copy.as_ref()?.prompt.as_ref());
     if app.plugin_pane().is_some() {
         frame.render_widget(hint_spans(&[("ctrl+\\", "close")], theme), area);
+    } else if app.reply().is_some() {
+        frame.render_widget(hint_spans(REPLY_HINTS, theme), area);
     } else if app.launcher().is_some() {
         frame.render_widget(hint_spans(LAUNCHER_HINTS, theme), area);
     } else if let Some(view) = app.profiles_view() {
@@ -1137,6 +1143,7 @@ fn question_line<'a>(question: &str, theme: &Theme) -> Line<'a> {
 /// are behind `?`.
 const SIDEBAR_HINTS: &[(&str, &str)] = &[
     ("enter", "type"),
+    ("space", "reply"),
     ("n", "new"),
     ("s", "split"),
     ("x", "kill"),
@@ -1218,6 +1225,13 @@ const LAUNCHER_HINTS: &[(&str, &str)] = &[
     ("←/→", "choose"),
     ("alt+enter", "new line"),
     ("ctrl+e", "command line"),
+    ("esc", "cancel"),
+];
+
+/// The keys while the reply box is open.
+const REPLY_HINTS: &[(&str, &str)] = &[
+    ("enter", "send"),
+    ("alt+enter", "new line"),
     ("esc", "cancel"),
 ];
 
@@ -1345,6 +1359,7 @@ const TASK_PANE_HINTS: &[(&str, &str)] = &[
     ("ctrl+\\", "sidebar"),
     ("y/n/Y", "answer"),
     ("ctrl+c", "stop the run"),
+    ("space", "follow-up"),
     ("shift+pgup", "history"),
 ];
 

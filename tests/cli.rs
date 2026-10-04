@@ -6072,6 +6072,42 @@ fn y_answers_a_task_from_the_sidebar_and_ctrl_c_stops_its_run_from_its_pane() {
 }
 
 #[test]
+fn space_gives_a_task_a_follow_up_from_the_sidebar() {
+    let crystal = Crystal::new();
+    let dir = crystal.dir.path();
+    let path = path_with(&print_claude(dir));
+    start_task(&crystal, &path, "fixer", "ASK first");
+    eventually("the task waits on the user", || {
+        status(&crystal, "fixer") == "waiting"
+    });
+
+    let mut tui = crystal.tui();
+    tui.shows("⚠ Bash cargo test");
+    // Asking, it takes no follow-up: the box says why, and keeps it.
+    tui.type_keys(" ");
+    tui.shows("Reply · fixer");
+    tui.type_keys("now the docs\r");
+    tui.shows("agent_blocked: fixer is asking to use Bash");
+    tui.shows("now the docs");
+    tui.type_keys("\x1b");
+    tui.hides("Reply · fixer");
+    tui.type_keys("y");
+    eventually("the task is done", || {
+        crystal.row("fixer").unwrap()[8] == "✓ All green on run 1."
+    });
+
+    tui.type_keys(" ");
+    tui.shows("Reply · fixer");
+    tui.type_keys("now the docs\r");
+    tui.shows("sent to fixer");
+    tui.hides("Reply · fixer");
+    assert_eq!(
+        runs(dir, 2)[1],
+        format!("{PRINT_ARGS} --allowedTools {ALLOWED} -- now the docs")
+    );
+}
+
+#[test]
 fn a_relative_socket_path_names_the_same_socket_for_the_daemon() {
     let crystal = Crystal::new();
     let mut new = Command::new(CRYSTAL);
