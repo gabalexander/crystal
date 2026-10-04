@@ -815,8 +815,9 @@ pub struct App {
     /// listed them: those with no sessions stay in the sidebar, and the
     /// new-session panel offers them all.
     known: Vec<Worktree>,
-    /// The worktrees git is removing, off the loop, by their directories:
-    /// their lines say so, and `W` leaves them be until git is done.
+    /// The worktrees the daemon is removing, by their directories: their
+    /// lines say so, and `W` leaves them be until the daemon says it's
+    /// done.
     removing: HashSet<PathBuf>,
     /// The question on the footer line, while one is being answered.
     prompt: Option<Prompt>,
@@ -2294,7 +2295,7 @@ impl App {
 
     /// Asks again before removing the worktree at `path`, on `branch`,
     /// which git found changes not committed in: a yes forces it, and they
-    /// go with it. Until then, git isn't removing it.
+    /// go with it. Until then, nothing is removing it.
     pub fn ask_to_force_removal(&mut self, path: PathBuf, branch: String) {
         self.removing.remove(&path);
         self.confirm = Some(Confirm::RemoveWorktree {
@@ -2314,14 +2315,14 @@ impl App {
         self.keep_selection_on_a_row();
     }
 
-    /// git didn't remove the worktree at `path`, for `reason`: it stays,
-    /// and can be asked about again.
+    /// The worktree at `path` wasn't removed, for `reason`: it stays, and
+    /// can be asked about again.
     pub fn worktree_not_removed(&mut self, path: &Path, reason: String) {
         self.removing.remove(path);
         self.notify(reason);
     }
 
-    /// Whether git is removing the worktree at `path`.
+    /// Whether the daemon is removing the worktree at `path`.
     pub fn removing(&self, path: &Path) -> bool {
         self.removing.contains(path)
     }
@@ -3390,8 +3391,8 @@ impl App {
             if matches!(confirm, Confirm::CloseTab { .. }) {
                 self.close_tab_in_front();
             }
-            // git removes a worktree off the loop; its line says so until
-            // it's done.
+            // The daemon removes a worktree; its line says so until the
+            // daemon says it's done.
             if let Confirm::RemoveWorktree { path, .. } = &confirm {
                 self.removing.insert(path.clone());
             }
@@ -4698,8 +4699,8 @@ impl App {
         }
     }
 
-    /// Asks before removing the worktree at `path`, on `branch`, unless git
-    /// is removing it already.
+    /// Asks before removing the worktree at `path`, on `branch`, unless the
+    /// daemon is removing it already.
     fn confirm_removal(&mut self, path: PathBuf, branch: String) {
         if self.removing(&path) {
             self.notify(format!("already removing {branch}"));

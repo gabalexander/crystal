@@ -38,7 +38,7 @@ use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{self, Command, ExitStatus};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
@@ -66,6 +66,10 @@ pub struct State {
     /// In the order `ls` shows them.
     pub sessions: Vec<session::Handed>,
     pub flows: Vec<HandedFlow>,
+    /// The worktrees the daemon was removing: the new daemon finishes
+    /// removing them, and answers the clients that asked.
+    #[serde(default)]
+    pub removals: Vec<HandedRemoval>,
 }
 
 /// A flow run as it's handed over: with the environment its steps start
@@ -90,6 +94,21 @@ impl HandedFlow {
             ..self.run
         }
     }
+}
+
+/// A worktree the daemon was removing as it handed over.
+#[derive(Serialize, Deserialize)]
+pub struct HandedRemoval {
+    pub path: PathBuf,
+    /// Its repository's main worktree.
+    pub project: PathBuf,
+    pub branch: Option<String>,
+    pub force: bool,
+    /// git, if it was still removing the worktree: this process's child
+    /// still, which the new daemon waits for, then reaps.
+    pub git: Option<u32>,
+    /// The connections waiting to hear it's done.
+    pub asking: Vec<RawFd>,
 }
 
 /// Refuses to hand over to the crystal at `exe` when it couldn't take
@@ -483,6 +502,7 @@ mod tests {
             waiting: vec![5],
             sessions: Vec::new(),
             flows: Vec::new(),
+            removals: Vec::new(),
         };
         let fd = write(dir.path(), &state).unwrap();
         // Unlinked: nothing is left on disk.

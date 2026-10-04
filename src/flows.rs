@@ -111,9 +111,9 @@ pub struct Step {
 pub enum Placement {
     /// Where the run was started.
     Root,
-    /// In the worktree the run makes for itself, on a branch named after
-    /// the goal, the first time a step asks for it; every `fresh` step of
-    /// the run after that runs there too.
+    /// In the worktree the run makes for itself, on a new branch with a
+    /// made-up name like `brave-otter`, the first time a step asks for it;
+    /// every `fresh` step of the run after that runs there too.
     Fresh,
     /// Where the step before it ran.
     Same,
@@ -390,9 +390,9 @@ pub fn fill(template: &str, values: &[(&str, Value)]) -> Filled {
     filled
 }
 
-/// A goal as a branch's name and `{slug}`: the words of its first line in
-/// lower case, joined by `-`, as many as fit in 40 bytes. Empty when it has
-/// no letters or digits.
+/// A goal as `{slug}`, the way a branch would have it: the words of its
+/// first line in lower case, joined by `-`, as many as fit in 40 bytes.
+/// Empty when it has no letters or digits.
 pub fn slug(goal: &str) -> String {
     let line = goal.lines().find(|line| !line.trim().is_empty());
     let words = line
@@ -589,8 +589,8 @@ and how, in the order to change them."""
 
 # {plan.summary} is what the plan step answered; {previous} is what the
 # step just before answered. placement = "fresh" runs this step in a
-# worktree the run makes for itself, on a branch named after the goal
-# ({slug}).
+# worktree the run makes for itself, on a new branch with a made-up name
+# like brave-otter.
 [[flow.step]]
 name = "implement"
 profile = "builder"

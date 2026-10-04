@@ -596,11 +596,11 @@ fn reported_line<'a>(session: &SessionInfo, theme: &Theme, width: u16) -> Line<'
 /// ↑2 ↓1` (files changed and not committed, the lines changed in them,
 /// commits ahead of its upstream and behind it), then its pull request when
 /// its forge knows of one, `#57` (`!57` on GitLab) and a mark for what
-/// matters most about it; or `removing…` while git removes it. Short of
-/// room, the lines go first, then the counts but the files, then the rest
-/// of the counts, then the pull request's mark, then its number, then
-/// what's said after the branch is cut, before the branch itself is. One
-/// Claude Code made for itself is named
+/// matters most about it; or `removing…` while the daemon removes it.
+/// Short of room, the lines go first, then the counts but the files, then
+/// the rest of the counts, then the pull request's mark, then its number,
+/// then what's said after the branch is cut, before the branch itself is.
+/// One Claude Code made for itself is named
 /// `claude`, then the subject of the commit it's at, which says what it
 /// holds where its branch's name doesn't, or its directory's name until
 /// git has said.
