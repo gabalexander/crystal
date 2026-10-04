@@ -133,6 +133,12 @@ impl MemoryView {
         }
     }
 
+    /// Whether a key typed is a character, not a move: while the filter
+    /// has the keyboard, or a question waits.
+    pub fn typing(&self) -> bool {
+        self.filtering || self.asking.is_some()
+    }
+
     pub fn on_key(&mut self, key: KeyEvent) -> Outcome {
         // Only `y` says yes; any other key says no, and does nothing else.
         if let Some(ask) = self.asking.take() {

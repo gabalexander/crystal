@@ -17,6 +17,7 @@
 //! own directory: `["sh", "hook.sh"]`.
 
 use crate::events;
+use crate::tui::keymap::Sequence;
 use anyhow::{Context, Result, bail};
 use regex::Regex;
 use serde::Deserialize;
@@ -101,8 +102,9 @@ pub struct Action {
     pub id: String,
     pub title: String,
     pub command: Vec<String>,
-    /// A key in the TUI's sidebar that runs it: one character crystal
-    /// doesn't use itself.
+    /// A key in the TUI's sidebar that runs it, one crystal doesn't use
+    /// itself: a character, a chord like `ctrl+alt+n`, or two keys one
+    /// after the other, like `N t`.
     #[serde(default)]
     pub key: Option<String>,
 }
@@ -341,16 +343,13 @@ fn check_command(command: &[String], what: &str) -> Result<()> {
     Ok(())
 }
 
-/// An action's key: one character, and not one crystal's sidebar uses.
+/// An action's key: one, or two pressed one after the other, and not one
+/// crystal's sidebar uses.
 fn check_key(key: &str, action: &str) -> Result<()> {
-    let mut chars = key.chars();
-    let (Some(c), None) = (chars.next(), chars.next()) else {
-        bail!("action {action}: a key is one character, not `{key}`");
-    };
-    if crate::plugins::RESERVED_KEYS.contains(c) || c.is_whitespace() {
-        bail!("action {action}: crystal uses `{key}` itself");
-    }
-    Ok(())
+    let sequence = Sequence::parse(key).map_err(|why| anyhow::anyhow!("action {action}: {why}"))?;
+    sequence
+        .check()
+        .map_err(|why| anyhow::anyhow!("action {action}: {why}"))
 }
 
 #[cfg(test)]
@@ -454,7 +453,18 @@ command = ["sh", "board.sh"]
                 GOOD.replace("key = \"N\"", "key = \"j\""),
                 "crystal uses `j`",
             ),
-            (GOOD.replace("key = \"N\"", "key = \"NN\""), "one character"),
+            (
+                GOOD.replace("key = \"N\"", "key = \"NN\""),
+                "isn't a key crystal knows",
+            ),
+            (
+                GOOD.replace("key = \"N\"", "key = \"j t\""),
+                "crystal uses `j`",
+            ),
+            (
+                GOOD.replace("key = \"N\"", "key = \"N t u\""),
+                "more than two keys",
+            ),
             (
                 GOOD.replace("on = \"session.*\"", "on = \"sesion.*\""),
                 "matches no event",

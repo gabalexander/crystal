@@ -183,7 +183,7 @@ and the footer says where you are and offers the keys that matter there, or, whe
 | `P` | list your [profiles](#profiles), and add, change, copy or remove one |
 | `X` | list the [plugins](#plugins): switch them on and off, run their actions and open their panes |
 | `,` | open the [settings](#the-settings-view): notifications, sounds, the theme, and how memory learns and searches, each changed as you go |
-| `?` | show every key, in the sidebar, in a pane, in a question and with the mouse: a page at a time when they don't all fit, `→` and `←` (or `Space`, `PgDn` and `PgUp`) turning the pages |
+| `?` | show every key, in the sidebar, in a pane, in resize mode, in a view, in a question and with the mouse, your own included: a page at a time when they don't all fit, `→` and `←` (or `Space`, `PgDn` and `PgUp`) turning the pages |
 | `q` | quit; the sessions keep running |
 
 While you're typing into a session, every key goes to it, `Tab` included, except `Ctrl+\`, which takes you
@@ -191,7 +191,9 @@ back to the sidebar, `Shift+PageUp` / `Shift+PageDown`, which page through the p
 `Ctrl+B`: press it, then any key in the table above, and that key's command runs without the keyboard leaving
 the pane, as in tmux. `Ctrl+B` twice sends `Ctrl+B` to the program, and `Esc` after it does nothing. Some
 terminals keep `Shift+PageUp` for their own scrolling; `Ctrl+B` and then `PageUp` does the same. Every key in
-the table, the prefix and `Ctrl+\` included, can be changed: see [keys and commands](#keys-and-commands).
+the table, the prefix and `Ctrl+\` included, can be changed, a command can have a key that works in a pane with
+no prefix at all, and keys of your own can open a popup or run a command: see
+[keys and commands](#keys-and-commands).
 
 A program that asks for the [Kitty keyboard protocol](https://sw.kovidgoyal.net/kitty/keyboard-protocol/), as
 Codex does, gets its keys that way, in a pane, through `crystal attach` and from `crystal send-keys`: keys the
@@ -271,6 +273,7 @@ another, beside its name; or press `R` for resize mode, where the footer shows i
 | `=` | even the panes out: those in a line the same way get the same room each |
 | `Esc`, `Enter`, `q`, `R` | done |
 
+`[keys]` can change these too, as `resize-left` to `resize-done`: see [keys and commands](#keys-and-commands).
 No pane gets smaller than 12 columns or 3 rows. Each tab keeps its panes, how they're split and how big each
 is, the next time you open the TUI too; panes kept by an older crystal, as a list, come back two side by side,
 or more stacked.
@@ -536,20 +539,96 @@ Every key in the sidebar's table runs a command with a name: `n` is `new-session
 
 ```toml
 [keys]
-prefix = "ctrl+a"          # the prefix, from inside a pane; "none" for no prefix
-hand-back = "ctrl+g"       # from a pane back to the sidebar
+prefix = ["ctrl+b", "ctrl+a"]  # the prefixes, from inside a pane; "none" for no prefix
+hand-back = "ctrl+g"           # from a pane back to the sidebar
 new-session = ["n", "ctrl+n"]
-kill = "X"                 # x is free now
-split-right = "v"          # v was copy mode's: copy mode has no key now
-quit = "none"              # the command list still runs it
+kill = "X"                     # x is free now
+split-right = "v"              # v was copy mode's: copy mode has no key now
+quit = "none"                  # the command list still runs it
+pane-left = ["shift+left", "direct+ctrl+alt+h"]   # in a pane too, without the prefix
 ```
 
 A key you give one command is taken from the command that had it, which is left with its other keys, or none.
-Two commands given the same key, a command or a key crystal doesn't know, are errors that name them, so a
-typo never goes unnoticed. Keys are written as `n`, `N` (or `shift+n`), `ctrl+b`, `alt+enter`, `shift+left`,
-`pageup`, `space`, `f5`, or the character itself, like `|`, `(` or `:`. The `?` overlay, the footer and the
-command list all say the keys you chose. The keys inside the views (the diff, the file finder and the rest),
-copy mode's and the questions' on the footer line stay as they are.
+Two commands given the same key, a command or a key crystal doesn't know, are errors that name them, and a
+name that's nearly one crystal knows says which, so a typo never goes unnoticed. Keys are written as `n`, `N`
+(or `shift+n`), `ctrl+b`, `alt+enter`, `ctrl+alt+h`, `shift+left`, `pageup`, `space`, `f5`, or the character
+itself, like `|`, `(` or `:`. The `?` overlay, the footer and the command list all say the keys you chose.
+
+Every prefix in the list starts the same thing: the first is the one the footer shows. Inside a pane every key
+goes to the program but the prefixes and the hand-back key, so a command's key works there only after a prefix,
+unless you write it `direct+`: then it works in a pane straight away, as well as in the sidebar. Only the keys
+you write that way are taken from the programs, and only ones a program can spare: a `direct+` key has `ctrl` or
+`alt`, or is an `F` key. `ctrl+alt` is the family terminals and desktops leave alone the most; some of it is
+taken all the same, like `ctrl+alt+arrows` by GNOME's workspaces and `ctrl+alt+t` by Ubuntu's terminal, and on
+a Mac plain `alt` makes characters unless the terminal sends `Option` as `Meta`. If a `direct+` key does
+nothing, your terminal or your desktop kept it.
+
+Answering a background task, resize mode and the views have keys of their own, each set apart from the
+sidebar's, so one of them can have a key a command has, as `n` answers no on a task asking and starts a session
+everywhere else. `[keys]` names them the same way:
+
+| Name | Keys | What it does |
+|---|---|---|
+| `answer-yes`, `answer-no`, `answer-always` | `y`, `n`, `Y` | on a [background task](#background-tasks) asking for a permission, in the sidebar, its pane and the needs-you view |
+| `resize-left`, `resize-down`, `resize-up`, `resize-right` | `h` `←`, `j` `↓`, `k` `↑`, `l` `→` | resize mode: move a border that way |
+| `resize-even` | `=` | resize mode: even the panes out |
+| `resize-done` | `Esc`, `Enter`, `q` | resize mode: done; `resize`'s own key again is done too |
+| `view-down`, `view-up` | `j` `Ctrl+N`, `k` `Ctrl+P` | in a view: the row below, or above |
+| `view-page-down`, `view-page-up` | none | in a view: a page on, or back |
+| `view-open` | none | in a view: open or run what the bar is on |
+| `view-close` | `q` | in a view: close it, or step back out of what's open in it |
+
+A view is any of the lists that take the keyboard: the diff, the file finder, the tree browser, find in files,
+the branch switcher, memory, the backlog, layouts, the archive, the plugins, the settings, what needs you, the
+timeline, the issues, the pull requests, `/` and the command list. A key you give a view's name stands in every
+one of them for the key they all take for it, `↓`, `↑`, `PgDn`, `PgUp`, `Enter` or `Esc`, which go on working
+whatever you give; the defaults you leave it without do nothing. While a view is taking what you type, like
+the file finder's query or a filter, a letter is typed rather than standing for anything, so a key there is
+best given with `ctrl` or `alt`. The rest of each view's keys, copy mode's and the questions' on the footer line
+are their own.
+
+Keys of your own run commands, in `[[keys.command]]` tables: a key, written as `[keys]` writes one, `direct+`
+or not, and what it runs.
+
+```toml
+[[keys.command]]
+key = "direct+ctrl+alt+g"
+type = "popup"               # over everything, with the keyboard, until it ends
+command = "lazygit"
+description = "lazygit"      # what ? and : call it, in place of the command
+width = "80%"                # or so many cells; 80% of the screen each way, left out
+height = "80%"
+
+[[keys.command]]
+key = "ctrl+t"
+type = "pane"                # a session of its own, split off the selected session's pane
+command = "make test"
+split = "down"               # or "right"; as s would split, left out
+
+[[keys.command]]
+key = "T"
+type = "tab"                 # a session of its own, in a new tab
+command = "htop"
+
+[[keys.command]]
+key = "direct+ctrl+alt+s"
+type = "shell"               # in the background; the footer says only if it fails
+command = "git fetch --all"
+
+[[keys.command]]
+key = "N"
+type = "plugin"              # one of an installed plugin's actions
+command = "notes:add"
+```
+
+A command is a line for `/bin/sh -c`, run in the selected session's directory, or the TUI's with none
+selected. It finds `CRYSTAL_BIN` and `CRYSTAL_SOCKET` in its environment, and the selected session's
+`CRYSTAL_SESSION`, `CRYSTAL_SESSION_ID`, `CRYSTAL_PROJECT` and `CRYSTAL_WORKTREE`, as a [plugin](#plugins)'s
+action does; a popup, a pane and a tab are sessions of their own, so their `CRYSTAL_SESSION` is their own. A
+popup is in `crystal ls` while it's open, ends when its program does or when you press `Ctrl+\`, and takes
+every other key, `Esc` included. A pane's or a tab's session stays when its command ends, to read what it said
+or run it again with `Enter`, like any other. Your commands are in the command list and the `?` overlay, under
+what they're called.
 
 Every text box edits the way a shell's line does: the new-session panel's task and branch, the reply box, the
 questions on the footer line, `/`, the command list, the views' filters, comments and forms.
@@ -2198,7 +2277,7 @@ command = ["sh", "restore.sh"]
 id = "add"
 title = "Add a note"
 command = ["sh", "add.sh"]
-key = "N"                     # optional: a key crystal and other plugins don't use
+key = "N"                     # optional: a key crystal and other plugins don't use, or "ctrl+alt+n", or "N t"
 
 [[events]]                    # run by the daemon when something happens
 on = "session.waiting"        # or a family of events, like "session.*", or "*" for all
@@ -2236,6 +2315,12 @@ installed again. What it keeps is each server's, like the sessions it's about, a
 An action is about the session selected in the TUI; for `crystal plugin run`, the session `--session` names,
 or else the one it's run in, or else the current directory. Run from the TUI, what it prints goes to the
 plugin's log; `plugin run` prints it, and exits as the action did.
+
+An action's `key` runs it from the sidebar, and from a pane after the prefix: a character, a chord like
+`ctrl+alt+n`, or two keys pressed one after the other, written with a space between them, like `N t`, the
+footer showing the first while it waits for the second and `Esc` letting it go. It can't be a key crystal's
+sidebar has, nor start with one, and two plugins can't share a key or have one's be the first of the other's
+two. A key your `[keys]` gives a command, or one of your own, comes before a plugin's.
 
 A pane is a session of its own, started in the plugin's directory and shown over the panes with the keyboard.
 It's in `crystal ls` while it's open, and ends when its program does or when you press `Ctrl+\`. Its
@@ -2376,7 +2461,7 @@ file and change. A setting crystal doesn't know is an error that names it, so a 
 | `[forge]` | | `hide_draft_prs`, leave draft pull requests out of [the pull requests](#pull-requests), the tab bar's count and `/` (`false`) |
 | `[sessions]` | | `stop_idle_after`, how long an agent may sit [idle](#archiving-and-idle-agents) before crystal stops it, like `"30m"`: `"off"`; `restart_spacing_ms`, how far apart the agents a [crash or a reboot](#usage) starts again start (`250`, or `0` for all at once) |
 | `[[project]]` | | a project's [run and open commands](#projects), by its main worktree's `path`, in place of its own file's |
-| `[keys]` | | the TUI's keys, by command, its prefix and the key back to the sidebar: [keys and commands](#keys-and-commands) |
+| `[keys]` | | the TUI's keys, by command, its prefixes, the key back to the sidebar, answering's, resize mode's and the views', and `[[keys.command]]`, keys of your own that run commands: [keys and commands](#keys-and-commands) |
 | `[sidebar]` | | the sidebar's `width`, whether it starts `folded`, what folding keeps, and whether what needs you is pinned: [the sidebar](#the-sidebar) |
 | `[terminal]` | | the shell a new terminal runs, `default_shell`, whether it's a login shell, `shell_mode`, and where `t` starts one, `new_cwd`: [terminals](#terminals-the-window-and-the-tab-bar) |
 | `[window]` | | `title`, what the TUI titles its terminal: [the window](#terminals-the-window-and-the-tab-bar) |

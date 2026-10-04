@@ -25,6 +25,7 @@ use crate::git::Checkout;
 use crate::plugin_manifest::Manifest;
 use crate::protocol::SessionInfo;
 use crate::state;
+use crate::tui::keymap::Sequence;
 use anyhow::{Context as _, Result, bail};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -191,13 +192,15 @@ pub fn check_can_enable(plugin: &Installed, installed: &[Installed]) -> Result<(
 }
 
 /// The first of `manifest`'s keys another installed plugin's action has
-/// already taken, with that plugin's name. Two plugins can't share a key.
+/// already taken, with that plugin's name. Two plugins can't share a key,
+/// nor can one's be the first of another's two.
 pub fn key_taken(manifest: &Manifest, others: &[Installed]) -> Option<(String, String)> {
+    let read = |key: &String| Some((key.clone(), Sequence::parse(key).ok()?));
     let keys = manifest
         .actions
         .iter()
-        .filter_map(|action| action.key.as_ref());
-    for key in keys {
+        .filter_map(|action| action.key.as_ref().and_then(read));
+    for (key, ours) in keys {
         for other in others.iter().filter(|other| other.name != manifest.name) {
             let Ok(theirs) = &other.manifest else {
                 continue;
@@ -205,9 +208,10 @@ pub fn key_taken(manifest: &Manifest, others: &[Installed]) -> Option<(String, S
             let taken = theirs
                 .actions
                 .iter()
-                .any(|action| action.key.as_ref() == Some(key));
+                .filter_map(|action| action.key.as_ref().and_then(read))
+                .any(|(_, theirs)| theirs.clashes(&ours));
             if taken {
-                return Some((key.clone(), other.name.clone()));
+                return Some((key, other.name.clone()));
             }
         }
     }
@@ -677,6 +681,17 @@ mod tests {
         assert_eq!(key_taken(manifest, &others[1..]), None);
         // Its own key isn't taken from itself.
         assert_eq!(key_taken(manifest, &[installed("notes", "N")]), None);
+        // Nor can one's key be the first of another's two.
+        let two = [installed("news", "N t")];
+        assert_eq!(
+            key_taken(manifest, &two),
+            Some(("N".to_string(), "news".to_string()))
+        );
+        let pair = installed("todo", "N u");
+        let pair = pair.manifest.as_ref().unwrap();
+        assert_eq!(key_taken(pair, &two), None);
+        let chord = installed("todo", "ctrl+alt+n");
+        assert_eq!(key_taken(chord.manifest.as_ref().unwrap(), &others), None);
     }
 
     #[test]

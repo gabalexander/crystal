@@ -443,7 +443,8 @@ description = "What NAME does, in a line"
 
 # Run from the plugins view (X in the TUI), or with
 # `crystal plugin run NAME hello`. Give it a key crystal doesn't use, and
-# that key runs it from the sidebar too.
+# that key runs it from the sidebar too: a character, a chord like
+# "ctrl+alt+h", or two keys pressed one after the other, like "H i".
 [[actions]]
 id = "hello"
 title = "Say hello"

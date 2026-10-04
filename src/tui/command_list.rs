@@ -7,7 +7,7 @@
 //! Before anything is typed, the commands run from it most lately come
 //! first. The state is kept apart from I/O: the app runs what it picks.
 
-use super::keymap::{COMMANDS, Command, Keymap};
+use super::keymap::{COMMANDS, Command, KeyCommand, Keymap, Sequence};
 use super::search::letters_in;
 use super::text_input::TextInput;
 use super::theme::Theme;
@@ -30,6 +30,8 @@ pub enum Pick {
         plugin: String,
         action: String,
     },
+    /// One of the user's own, from `[[keys.command]]`.
+    Custom(KeyCommand),
 }
 
 /// One row: what it runs, its name, what it does and its key.
@@ -48,11 +50,12 @@ pub struct PluginAction<'a> {
     pub plugin: &'a str,
     pub action: &'a str,
     pub title: &'a str,
-    pub key: Option<char>,
+    pub key: Option<Sequence>,
 }
 
 /// The rows the list offers: crystal's commands, but those of its plugins
-/// that are off and the list itself, then the plugins' actions.
+/// that are off and the list itself, then the user's own, then the
+/// plugins' actions.
 pub fn rows(
     keymap: &Keymap,
     plugin_on: &dyn Fn(&str) -> bool,
@@ -75,9 +78,18 @@ pub fn rows(
         },
         name: format!("{}:{}", action.plugin, action.action),
         does: action.title.to_string(),
-        keys: action.key.map(String::from).unwrap_or_default(),
+        keys: action.key.map(|key| key.label()).unwrap_or_default(),
     });
-    commands.chain(plugins).collect()
+    let own = keymap.custom().iter().map(|(command, chords)| {
+        let keys: Vec<String> = chords.iter().map(|chord| chord.label()).collect();
+        Row {
+            pick: Pick::Custom(command.clone()),
+            name: command.label().to_string(),
+            does: format!("your {}: {}", command.kind.name(), command.command),
+            keys: keys.join(" "),
+        }
+    });
+    commands.chain(own).chain(plugins).collect()
 }
 
 /// What a key did to the list.
@@ -374,7 +386,7 @@ mod tests {
             plugin: "notes",
             action: "add",
             title: "add a note",
-            key: Some('N'),
+            key: Some(Sequence::parse("N").unwrap()),
         }];
         let rows = rows(&Keymap::default(), &|_| true, &actions);
         CommandList::new(rows, recents)
