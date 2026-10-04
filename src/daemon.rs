@@ -2411,7 +2411,7 @@ fn start(
         given_task.as_deref(),
         &instructions,
     );
-    let argv = agents::with_options(argv, &memory_tools(socket, &cwd, &asked, &crystal));
+    let argv = agents::with_options(argv, &claude_tools(socket, &cwd, &asked, &crystal, &config));
     let argv = codex::with_instructions(argv, &instructions, codex::home(&env).as_deref());
     let mut session = Session::spawn(id, name.clone(), command, &argv, cwd, &env)?;
     if let Some(typed) = typed
@@ -2524,20 +2524,67 @@ fn launch_memory(socket: &Path, cwd: &Path, asked: &str, reader: memory::Reader)
         .flatten()
 }
 
-/// What gives a Claude Code session in `cwd` the tools that search its
-/// project's memory: crystal's MCP server, run by `crystal`, the path of
-/// this program, and its tools allowed, so it searches without asking for a
-/// shell command. Nothing for another program, or with memory off.
-fn memory_tools(socket: &Path, cwd: &Path, command: &[String], crystal: &Path) -> Vec<String> {
-    if agents::program_name(command) != Some("claude") || !memory::enabled_now() {
+/// What gives a Claude Code session in `cwd` the tools crystal tells it
+/// to use, allowed up front so it never stops to ask for them: the crystal
+/// commands its notes name, and with memory on, crystal's MCP server, run
+/// by `crystal`, the path of this program, and its tools. Nothing for
+/// another program.
+fn claude_tools(
+    socket: &Path,
+    cwd: &Path,
+    command: &[String],
+    crystal: &Path,
+    config: &Config,
+) -> Vec<String> {
+    if agents::program_name(command) != Some("claude") {
         return Vec::new();
     }
-    vec![
-        "--mcp-config".to_string(),
-        mcp::config(crystal, socket, cwd),
-        "--allowedTools".to_string(),
-        mcp::TOOLS.join(","),
-    ]
+    let mut tools = crystal_commands(config);
+    let mut options = Vec::new();
+    if memory::enabled(config) {
+        options.extend([
+            "--mcp-config".to_string(),
+            mcp::config(crystal, socket, cwd),
+        ]);
+        tools.extend(mcp::TOOLS);
+    }
+    if !tools.is_empty() {
+        options.extend(["--allowedTools".to_string(), tools.join(",")]);
+    }
+    options
+}
+
+/// Claude Code's permission rules for the crystal commands an agent is
+/// told to run, so that one closing its task, or noting something for
+/// later, doesn't wait on the user to say it may: a background task that
+/// did would sit there with its work done. Only what's on: `crystal done`
+/// with tasks, `crystal backlog add` and reading the backlog with it,
+/// `crystal handoff` with the handoff file, and `crystal remember` and
+/// reading memory with memory. What changes or removes what's there
+/// already, like `crystal backlog rm` or `crystal memory rm`, still asks.
+fn crystal_commands(config: &Config) -> Vec<&'static str> {
+    let mut rules = Vec::new();
+    if tasks::enabled(config) {
+        rules.push("Bash(crystal done:*)");
+    }
+    if backlog::enabled(config) {
+        rules.extend([
+            "Bash(crystal backlog add:*)",
+            "Bash(crystal backlog)",
+            "Bash(crystal backlog export)",
+        ]);
+    }
+    if handoff::enabled(config) {
+        rules.push("Bash(crystal handoff:*)");
+    }
+    if memory::enabled(config) {
+        rules.extend([
+            "Bash(crystal remember:*)",
+            "Bash(crystal memory search:*)",
+            "Bash(crystal memory show:*)",
+        ]);
+    }
+    rules
 }
 
 /// Loads the embedding model, when the config says to search with it, and
@@ -2558,26 +2605,31 @@ fn embed_waiting(socket: &Path) {
 
 /// The arguments each of a task's runs gives Claude: the task's own; in its
 /// system prompt, the notes its worktree's sessions left and, with memory
-/// on, what its project remembers that has to do with its prompt; and with
-/// memory on, crystal's MCP server, with its tools allowed, to search the
-/// rest.
+/// on, what its project remembers that has to do with its prompt; with
+/// memory on, crystal's MCP server, to search the rest; and the crystal
+/// commands it's told to run and that server's tools allowed.
 fn task_args(socket: &Path, cwd: &Path, spec: &protocol::TaskSpec) -> Vec<String> {
-    let memory_on = memory::enabled_now();
+    let config = settings();
+    let memory_on = memory::enabled(&config);
     let remembered = memory_on
         .then(|| launch_memory(socket, cwd, &spec.prompt, memory::Reader::Task))
         .flatten();
     let handoff = handoff_note(cwd, &[remembered.as_deref()]);
-    let args = agents::with_instructions(&spec.args, &notes(None, handoff, remembered));
-    if !memory_on {
+    let mut args = agents::with_instructions(&spec.args, &notes(None, handoff, remembered));
+    let mut tools = crystal_commands(&config);
+    if memory_on && let Ok(crystal) = std::env::current_exe() {
+        let server = mcp::config(&crystal, socket, cwd);
+        args = agents::with_value(&args, &["--mcp-config"], &server);
+        tools.extend(mcp::TOOLS);
+    }
+    if tools.is_empty() {
         return args;
     }
-    let Ok(crystal) = std::env::current_exe() else {
-        return args;
-    };
-    let server = mcp::config(&crystal, socket, cwd);
-    let args = agents::with_value(&args, &["--mcp-config"], &server);
-    let tools = mcp::TOOLS.join(",");
-    agents::with_value(&args, &["--allowedTools", "--allowed-tools"], &tools)
+    agents::with_value(
+        &args,
+        &["--allowedTools", "--allowed-tools"],
+        &tools.join(","),
+    )
 }
 
 /// Starts a task and adds it to `sessions`, its runs adding to
