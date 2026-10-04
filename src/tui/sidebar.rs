@@ -218,10 +218,11 @@ fn offset(app: &App, height: u16) -> usize {
 /// no sessions the selection is on, or, while `/`'s filter is open, the
 /// one its bar is on.
 fn selected_row(app: &App) -> Option<usize> {
+    if app.filter().is_some() {
+        return app.filter_row();
+    }
     let rows = app.rows();
-    if app.filter().is_none()
-        && let Some(worktree) = app.selected_empty_worktree()
-    {
+    if let Some(worktree) = app.selected_empty_worktree() {
         let row = Row::NoSessions(worktree.path.clone());
         return rows.iter().position(|shown| *shown == row);
     }
@@ -307,7 +308,62 @@ fn row_line<'a>(app: &'a App, row: &Row, look: &Look, width: u16, selected: bool
                 false,
             )
         }
+        Row::PullRequest { project, number } => {
+            pull_request_line(app, project, *number, look, width, selected)
+        }
     }
+}
+
+/// An open pull request `/` found, under its project, in line with the
+/// worktrees: its number, its title with the letters the filter matched
+/// marked, and on the right the mark for what matters most about it.
+/// Short of room, the title is cut, down to a few letters before the mark
+/// goes.
+fn pull_request_line<'a>(
+    app: &App,
+    project: &Path,
+    number: u64,
+    look: &Look,
+    width: u16,
+    selected: bool,
+) -> Line<'a> {
+    let theme = look.theme;
+    let Some((pull_request, marked)) = app.found_pull_request(project, number) else {
+        return Line::default();
+    };
+    let label = pull_request.label();
+    // The indent, the number and a space before the title; a space at the
+    // end.
+    let room =
+        usize::from(width).saturating_sub(WORKTREE_INDENT.len() + label.chars().count() + 1 + 1);
+    let mark = pull_request_mark(pull_request.state(), theme);
+    let title_width = pull_request.title.chars().count();
+    let mark = mark.filter(|(mark, _)| title_width.min(8) + 1 + mark.chars().count() <= room);
+    let title_room = match mark {
+        Some((mark, _)) => room - 1 - mark.chars().count(),
+        None => room,
+    };
+    let title = fit(&pull_request.title, title_room);
+    let mut title_style = Style::new().fg(theme.text);
+    if selected {
+        title_style = title_style.add_modifier(Modifier::BOLD);
+    }
+    let marked_style = title_style
+        .fg(theme.accent)
+        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+    let mut spans = vec![
+        Span::raw(WORKTREE_INDENT),
+        Span::styled(label, Style::new().fg(theme.muted)),
+        Span::raw(" "),
+    ];
+    let title_width = title.chars().count();
+    spans.extend(marked_spans(&title, &marked, title_style, marked_style));
+    if let Some((mark, color)) = mark {
+        let gap = room.saturating_sub(title_width + mark.chars().count());
+        spans.push(Span::raw(" ".repeat(gap)));
+        spans.push(Span::styled(mark, Style::new().fg(color)));
+    }
+    Line::from(spans)
 }
 
 /// A flow run's heading, in line with the worktrees: a mark in the color

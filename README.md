@@ -161,7 +161,7 @@ and the footer says where you are and offers the keys that matter there, or, whe
 | `u` | select the next session that needs you: waiting on you first, then done |
 | `U` | list everything that [needs you](#timeline), in every tab, and answer a permission or a gate where it stands |
 | `a` | the [timeline](#timeline): what happened, the newest first, as it happens |
-| `/` | find a session, in any tab, by typing a little of its name, project, branch or command; one in another tab says which, and picking it takes you there |
+| `/` | find a session in any tab, a project or worktree with nothing running, a flow run or an open pull request, by typing a little of it; `Tab` keeps to one status; picking a session in another tab takes you there: [finding with `/`](#finding-with-) |
 | `:` | the [command list](#keys-and-commands): every command by its name, with its key, the latest you ran first; `Enter` runs one |
 | `(` / `)` | make the [sidebar](#the-sidebar) narrower or wider; its edge drags with the mouse too |
 | `\` | fold the [sidebar](#the-sidebar) down to a rail of marks, or unfold it |
@@ -383,12 +383,9 @@ beeps, flashes or marks its tab, the way you set it up to. A session out of sigh
 its time in the sidebar until you look at it, rings your terminal from the TUI too, and the event log gets a
 `session.bell`. A program ringing over and over rings yours at most twice a second.
 
-`/` finds a session by typing a little of it. The sidebar shows only the sessions that match, under their
-project and worktree, with the letters that matched marked in each name. The letters only have to turn up in
-order (`rfx` finds `refund-fix`), and each word you type has to turn up in the name, project, branch or
-command, so `pay fix` finds the fixer in the payments project. Letters type into the filter, so `↑` and `↓`
-(or `Ctrl+P` and `Ctrl+N`) move among the matches; `Enter` selects one and `Esc` leaves the selection where it
-was.
+`/` finds a session by typing a little of it, in any tab, and a project or worktree with nothing running, a
+flow run or an open pull request too; `Tab` keeps it to the sessions with one status: see [finding with
+`/`](#finding-with-).
 
 For a project on GitHub or GitLab, each worktree line shows its branch's open pull request, `#57` (a merge
 request, `!57`, on GitLab), with a mark for what matters most about it; `o` opens it in your browser, `O` lists
@@ -538,6 +535,32 @@ folded = false         # start folded
 fold = "marks"         # what folding keeps: "marks", or "hidden" for nothing
 needs_you = true       # pin what needs you at the top
 ```
+
+### Finding with `/`
+
+`/` finds anything in the sidebar, and more, by typing a little of it. The sidebar shows only what matches,
+from every tab, under its project and worktree, with the letters that matched marked. The letters only have
+to turn up in order (`rfx` finds `refund-fix`), and each word you type has to turn up somewhere in what it
+finds, so `pay fix` finds the fixer in the payments project. Letters type into the filter, so `↑` and `↓` (or
+`Ctrl+P` and `Ctrl+N`) move among the matches; `Enter` picks one, as does a click, and `Esc` leaves the
+selection where it was. What it finds, and what picking it does:
+
+| What | Found by | Picking it |
+|---|---|---|
+| a session, in any tab | its name, project, branch, command, the agent in front, its tab's name, its directory, or the name or goal of the flow run it's a step of | selects it, bringing its tab to the front |
+| a flow run | its name, its flow's or its goal, which find its steps too | selects the step it's at |
+| a project nothing runs in, or a worktree with no sessions | its project, its branch, or its directory | puts the selection on it, where `Enter` starts something |
+| an open pull request (a merge request on GitLab) | its title, number (`57` or `#57`), branch, author or project | opens it in [the pull requests view](#pull-requests-and-issues) |
+
+A directory or a goal only counts where a word turns up in it whole, or nearly anything would find it. Before
+you type, only sessions show; projects, worktrees and pull requests join them as you type. The pull requests are
+those the sidebar already asked the forge for, and `/` asks, in the background, about the projects with nothing
+running the first time it opens, so typing never waits on the forge.
+
+`Tab` keeps to the sessions with one status, the footer saying which, round `waiting`, `working`, `done` (a
+finished turn nobody has looked at), `idle` (at the prompt) and `ended`, then back to all of them; `Shift+Tab`
+goes the other way. Typing narrows them further. Projects and pull requests have no status, so they don't show
+while it keeps to one.
 
 ### Tabs
 

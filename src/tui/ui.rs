@@ -1088,7 +1088,7 @@ fn draw_footer(frame: &mut Frame, app: &App, panes: &[Pane], look: &Look, area: 
         let question = format!("move {name} to tab 1-9, or t a new one · any other key, not yet");
         frame.render_widget(question_line(&question, theme), area);
     } else if let Some(filter) = app.filter() {
-        draw_filter(frame, theme, filter, app.matches().len(), area);
+        draw_filter(frame, theme, filter, app.found().len(), area);
     } else if let Some(confirm) = app.confirm() {
         frame.render_widget(question_line(&confirm.question(), theme), area);
     } else if let Some(prompt) = searching {
@@ -1417,22 +1417,42 @@ fn hint_spans<'a>(hints: &[(&str, &str)], theme: &Theme) -> Line<'a> {
     Line::from(spans)
 }
 
-/// `/`'s filter, with the cursor in it, and how many sessions match.
+/// `/`'s filter, with the cursor in it and the status it keeps to before
+/// it, in that status's color; and on the right how many things it found,
+/// and the key that changes the status.
 fn draw_filter(frame: &mut Frame, theme: &Theme, filter: &Filter, matches: usize, area: Rect) {
-    let label = " find: ";
-    let line = Line::from(vec![
-        Span::styled(
-            label,
-            Style::new().fg(theme.accent).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(filter.input.text().to_string(), Style::new().fg(theme.text)),
-    ]);
+    let bold = Modifier::BOLD;
+    let mut label = vec![Span::styled(
+        " find",
+        Style::new().fg(theme.accent).add_modifier(bold),
+    )];
+    if let Some(status) = filter.status {
+        let color = theme.status(status.status());
+        label.push(Span::raw(" "));
+        label.push(Span::styled(
+            status.name(),
+            Style::new().fg(color).add_modifier(bold),
+        ));
+    }
+    label.push(Span::styled(
+        ": ",
+        Style::new().fg(theme.accent).add_modifier(bold),
+    ));
+    let label_width: usize = label.iter().map(Span::width).sum();
+    let mut line = Line::from(label);
+    line.push_span(Span::styled(
+        filter.input.text().to_string(),
+        Style::new().fg(theme.text),
+    ));
     frame.render_widget(line, area);
     let noun = if matches == 1 { "match" } else { "matches" };
-    let count = Line::styled(format!("{matches} {noun} "), Style::new().fg(theme.muted));
-    frame.render_widget(count.right_aligned(), area);
-    // The label is plain ASCII, so its length in bytes is its width.
-    let column = area.x + (label.len() + filter.input.cursor()) as u16;
+    let right = Line::from(vec![
+        Span::styled(format!("{matches} {noun}  "), Style::new().fg(theme.muted)),
+        Span::styled("tab", Style::new().fg(theme.text)),
+        Span::styled(" status ", Style::new().fg(theme.muted)),
+    ]);
+    frame.render_widget(right.right_aligned(), area);
+    let column = area.x + (label_width + filter.input.cursor()) as u16;
     frame.set_cursor_position((column.min(area.right().saturating_sub(1)), area.y));
 }
 
@@ -1790,6 +1810,49 @@ mod tests {
         assert!(screen.contains("No sessions in ⎇ old"), "{screen}");
         assert!(screen.contains("n start one here"), "{screen}");
         assert!(screen.contains("W remove it"), "{screen}");
+    }
+
+    #[test]
+    fn slash_shows_a_pull_request_it_found_under_its_project_and_the_status_it_keeps_to() {
+        use crate::forge::{Checks, Forge, PullRequest, Review};
+        let mut app = App::new(None);
+        app.set_sessions(vec![in_worktree("planner", "main", true)]);
+        let pull_request = PullRequest {
+            forge: Forge::GitHub,
+            number: 57,
+            title: "Fix the login redirect".into(),
+            author: "ana".into(),
+            branch: "fix-login".into(),
+            from_fork: false,
+            local_branch: "fix-login".into(),
+            draft: false,
+            checks: Checks::Failed,
+            review: Review::None,
+            updated_at: "2026-10-02T09:30:00Z".into(),
+            url: "https://github.com/acme/app/pull/57".into(),
+        };
+        app.set_pull_requests(
+            PathBuf::from("/code/app"),
+            Ok((Forge::GitHub, vec![pull_request])),
+        );
+        let press = |app: &mut App, code| app.on_key(KeyEvent::new(code, KeyModifiers::NONE));
+        press(&mut app, KeyCode::Char('/'));
+        for letter in "login".chars() {
+            press(&mut app, KeyCode::Char(letter));
+        }
+        let lines = sidebar_text(&app);
+        let heading = line_with(&lines, "app ─");
+        let row = line_with(&lines, "#57 Fix the login");
+        assert!(row > heading, "{lines:?}");
+        assert!(lines[row].contains('✗'), "its checks failed: {lines:?}");
+        let screen = screen_text(&app).join("\n");
+        assert!(screen.contains("find: login"), "{screen}");
+        assert!(screen.contains("1 match  tab status"), "{screen}");
+
+        press(&mut app, KeyCode::Tab);
+        let screen = screen_text(&app).join("\n");
+        assert!(screen.contains("find waiting: login"), "{screen}");
+        assert!(screen.contains("0 matches"), "{screen}");
     }
 
     #[test]
