@@ -343,16 +343,16 @@ doesn't start it. `crystal integration install` puts crystal's hooks in their ow
 crystal integration install          # each agent crystal can hook that's installed here
 crystal integration install claude   # into $CLAUDE_CONFIG_DIR/settings.json, or ~/.claude/settings.json
 crystal integration install codex    # into $CODEX_HOME/hooks.json, or ~/.codex/hooks.json
-crystal integration install cursor   # and droid, qodercli, qwen, copilot: see below
+crystal integration install kimi     # and 14 more agents' hooks or plugins: see below
 crystal integration status           # whether they're there, for this crystal
 crystal integration uninstall        # take them out again, and only them
 ```
 
 Then the agent you typed says what it's doing through its hooks, the same as one crystal starts, and which
 conversation it's in: after a restart, the session's shell starts again and `claude --resume <id>` (or `codex
-resume <id>`) is typed into it, so you're back where you were. Only while the agent is in front, though: quit
-it, and the shell comes back on its own. `resume_reported_agents = false` in the [settings](#settings) turns
-that off. Each hook runs `crystal hook <agent> --installed`, crystal by its path, so run `install` again if
+resume <id>`, or [the other agents' own](#hooks-in-other-agents-own-settings)) is typed into it, so you're
+back where you were. Only while the agent is in front, though: quit it, and the shell comes back on its own.
+`resume_reported_agents = false` in the [settings](#settings) turns that off. Each hook runs `crystal hook <agent> --installed`, crystal by its path, so run `install` again if
 you move crystal; `status` says when the hooks are out of date. Outside crystal, and for an agent crystal
 started with hooks of its own, they do nothing.
 
@@ -454,7 +454,7 @@ crystal tab new review                      # a new tab in the TUI, in front
 crystal title set "deploying"               # the title of the TUI's terminal, until `crystal title clear`
 crystal layout                              # the TUI's tabs and how each splits its panes
 crystal skill --install                     # teach Claude Code to drive crystal (see below)
-crystal integration install                 # hooks for a claude or codex you start in a shell (see above)
+crystal integration install                 # hooks or plugins for the agents installed here (see above)
 crystal mermaid docs/flow.md                # draw a page's mermaid diagrams as text (see below)
 crystal ssh box                             # crystal's TUI on another machine (see below)
 ```
@@ -780,7 +780,7 @@ Under the task, `Tab` and `Shift+Tab` go from row to row and `←` / `→` chang
 
 - **run**: your [profiles](#profiles), then the agents installed on your `PATH` (Claude Code, Codex, Gemini
   CLI, OpenCode, Cursor, Qwen Code, Pi, GitHub Copilot, Amp, Droid, Kimi Code, Kiro, Cline, Kilo Code,
-  Devin, Grok, Qoder CLI, Letta Code, Hermes Agent, Antigravity, Aider), then your shell. What you started
+  Devin, Grok, Qoder CLI, Letta Code, Hermes Agent, Antigravity, MastraCode, Aider), then your shell. What you started
   last is chosen the next time. A profile's
   description shows under the row, and choosing it sets the rows below from it; you can still change them.
 - **how**, for Claude Code: **in a terminal**, or **in the background**, as a [background
@@ -810,8 +810,9 @@ checked against their own code or documentation, so for them the task box gives 
 crystal keeps what it takes to start it again, in the archive. `Z` opens the archive, the latest archived
 first, each with where it ran and how long ago: `Enter` starts the one the bar is on again, under its name (or
 the next one free, if that's been taken since), and `x` deletes it for good once you've said `y`. Claude Code
-and Codex come back in the conversation they were in, as after a restart, and so does an agent that
-[said how to resume it](#teaching-crystal-about-your-agent); anything else starts its command again from the
+and Codex come back in the conversation they were in, as after a restart, and so does an agent whose
+[hooks](#hooks-in-other-agents-own-settings) named its conversation, or that [said how to resume
+it](#teaching-crystal-about-your-agent); anything else starts its command again from the
 top, and the archive says which. An archived session's open task is cancelled, and open again when it comes
 back. From the command line, `crystal archive <name>`, `crystal unarchive <name>` and `crystal ls --archived`
 do the same, and `crystal kill` on an archived name deletes it.
@@ -820,8 +821,8 @@ An agent you've left alone can be stopped for you, to free what it holds. With `
 `[sessions]` in the [settings](#settings), say `"30m"`, crystal stops an agent that has sat at its prompt that
 long, its turn seen, with nobody watching it or typing into it. It stays in the list, its row saying
 `stopped idle`, and `Enter` (or `crystal respawn`) starts it again in its conversation. Only an agent that can
-come back where it was is stopped: Claude Code or Codex once crystal knows its conversation, or an agent that
-said how to resume it. A turn that ended while you were away waits for you (`✓`) however long it takes, and so
+come back where it was is stopped: Claude Code, Codex or another agent once crystal knows its conversation, or
+an agent that said how to resume it. A turn that ended while you were away waits for you (`✓`) however long it takes, and so
 does one asking you something; terminals, background tasks and sessions with their task open are never
 stopped. It's off until you set it, from the file or the [settings view](#the-settings-view).
 
@@ -1128,7 +1129,9 @@ started with, but not its first prompt again. The limits:
 crystal reads each agent's screen by a file of rules for that agent. It comes with one for each of Claude
 Code, Codex, Gemini CLI, OpenCode, Cursor, Qwen Code, Pi, GitHub Copilot, Amp, Droid, Kimi Code, Kiro, Cline,
 Kilo Code, Devin, Grok, Qoder CLI, Letta Code, Hermes Agent, Antigravity, Maki and Muse, adapted from
-[herdr](https://github.com/herdrdev/herdr)'s, and a common one for any other agent in front, like Aider. An
+[herdr](https://github.com/herdrdev/herdr)'s, and a common one for any other agent in front, like Aider.
+MastraCode's file only names it: it says what it's doing through [its hooks](#hooks-in-other-agents-own-settings)
+alone. An
 agent changes what it draws from one version to the next, so when crystal reads one wrong you can mend its
 rules yourself without waiting for a release:
 
@@ -1184,7 +1187,7 @@ A new look counts once two checks in a row see it, so a screen caught halfway th
 #### Hooks in other agents' own settings
 
 Beyond Claude Code and Codex, some agents take hooks only in their own settings files, never on the command
-line. crystal leaves those files alone unless you ask, with the same [`crystal
+line, and some take plugins instead. crystal leaves those files alone unless you ask, with the same [`crystal
 integration`](#usage) command, as for those two:
 
 ```sh
@@ -1192,12 +1195,45 @@ crystal integration install cursor     # ~/.cursor/hooks.json, or $CURSOR_CONFIG
 crystal integration uninstall cursor   # takes crystal's out, and leaves yours
 ```
 
-It can for Cursor, Droid (`~/.factory/settings.json`), Qoder CLI (`qodercli`), Qwen Code and GitHub Copilot,
-with the events each has that say what it's doing or which conversation it's in. The hook runs `crystal hook
-<agent>` inside a crystal session only, so the agent anywhere else runs as before, and it never fails the
-agent. What a hook says counts only while that agent is in front: an agent that Claude Code runs in the
-session doesn't speak for the session. `crystal agent list` says whose hooks are in. The settings file is
-written again as formatted JSON, its keys in order.
+| Agent | `crystal integration install …` | Where | What it says | Resumed with |
+|---|---|---|---|---|
+| Cursor | `cursor` | `~/.cursor/hooks.json` (`$CURSOR_CONFIG_DIR`) | a turn ending, its conversation | `cursor-agent --resume <id>` |
+| Droid | `droid` | `~/.factory/settings.json` | its turns, its session | `droid --resume <id>` |
+| Qoder CLI | `qodercli` | `~/.qoder/settings.json` (`$QODER_CONFIG_DIR`) | its turns, what it asks, its session | `qodercli --resume <id>` |
+| Qwen Code | `qwen` | `~/.qwen/settings.json` (`$QWEN_HOME`) | its session | `qwen --resume <id>` |
+| GitHub Copilot | `copilot` | `~/.copilot/settings.json` (`$COPILOT_HOME`) | its session | `copilot --resume=<id>` |
+| Devin | `devin` | `~/.config/devin/config.json` (`$XDG_CONFIG_HOME`) | its turns, its session | `devin --resume <id>` |
+| Kimi Code | `kimi` | `[[hooks]]` in `~/.kimi-code/config.toml` (`$KIMI_CODE_HOME`) | its turns, what it asks, its session | `kimi --session <id>` |
+| Letta Code | `letta` | `~/.letta/settings.json` | its conversation | `letta --conversation <id>` |
+| MastraCode | `mastracode` | `~/.mastracode/hooks.json` | its turns, what it asks, its thread | `mastracode --thread <id>` |
+| Grok | `grok` | `~/.grok/hooks/crystal.json` (`$GROK_HOME`) | its session | `grok --resume <id>` |
+| Antigravity | `agy` | a `crystal` block in `~/.gemini/config/hooks.json` (`$ANTIGRAVITY_CLI_CONFIG_DIR`) | its conversation | `agy --conversation <id>` |
+| Pi | `pi` | an extension, `~/.pi/agent/extensions/crystal.ts` (`$PI_CODING_AGENT_DIR`) | its turns, its session file | `pi --session <file>` |
+| OpenCode | `opencode` | a plugin, `~/.config/opencode/plugins/crystal.js` | its turns, what it asks, its session | `opencode --session <id>` |
+| Kilo Code | `kilo` | a plugin, `~/.config/kilo/plugin/crystal.js` | its turns, what it asks, its session | `kilo --session <id>` |
+| Hermes Agent | `hermes` | a plugin in `~/.hermes/plugins/crystal/`, switched on in its `config.yaml` (`$HERMES_HOME`) | its session | `hermes --resume <id>` |
+
+Each gets the events it has that say what it's doing or which conversation it's in, as far as they can be
+trusted, as [herdr](https://github.com/herdrdev/herdr) installs its own: where an agent's hooks miss a turn
+cut short or a permission it cancels, crystal takes only those that name its conversation, and reads the rest
+off its screen, by its [rules](#how-crystal-reads-an-agent). MastraCode has no rules for its screen, so it
+shows a status only with its hooks in. A hook runs `crystal hook <agent>` inside a crystal session only, so the
+agent anywhere else runs as before, and it never fails the agent; a plugin runs it the same way. What a hook
+says counts only while that agent is in front: an agent that Claude Code runs in the session doesn't speak for
+the session. `crystal agent list` says whose hooks are in. A JSON settings file is written again as formatted
+JSON, its keys in order; Kimi's TOML and Hermes's YAML keep the rest as it was. A plugin is loaded as its
+agent starts, so start again one that's running; `status` says when a plugin is out of date.
+
+Once its hooks have named the conversation, an agent crystal started comes back in it after a restart, with
+`crystal respawn`, or from the archive, with the options it was started with but not its first prompt again,
+the way Claude Code and Codex do; one typed into a shell has that command typed in again. A conversation only
+counts once the agent has worked on a turn in it (or written the file its hooks say it keeps it in): before
+that there's nothing to pick up, and the agent starts afresh. The limits:
+
+- OpenCode's plugin runs in its server: an OpenCode attached to a server it shares with other sessions
+  (`opencode attach`) reports to the session that started the server, if any.
+- Letta's default conversation is resumed with its agent, `letta --conversation default --agent <agent>`.
+- An option of the agent's own that chose a conversation, like `--continue`, gives way to crystal's choice.
 
 ### Teaching crystal about your agent
 
@@ -2329,7 +2365,7 @@ file and change. A setting crystal doesn't know is an error that names it, so a 
 | `theme` | `"dark"` | the TUI's colors: one of the [themes](#themes) |
 | `[colors]` | | colors of your own over the theme's: [themes](#themes) |
 | `name_from_prompt` | `true` | name a session you don't name for the [first thing it's asked](#starting-a-session) |
-| `resume_reported_agents` | `true` | after a restart, run the command an agent [said resumes it](#teaching-crystal-about-your-agent), or the one that resumes a Claude Code or Codex [typed into a shell](#usage) |
+| `resume_reported_agents` | `true` | after a restart, run the command an agent [said resumes it](#teaching-crystal-about-your-agent), or the one that resumes an agent [typed into a shell](#usage) whose hooks named its conversation |
 | `scrollback_lines` | `10000` | how many rows that scrolled off a session's screen it keeps, up to 1,000,000, for scrolling back, copy mode, `e` and `crystal read --history` |
 | `[plugins]` | | which plugins are on and off: [plugins](#plugins) |
 | `[memory]` | | how memory's [distiller](#the-distiller) runs, and whether it [searches by meaning](#search-by-meaning) |
@@ -2637,6 +2673,7 @@ over, the daemon is restarted cold from the sessions it wrote down first.
 - [x] Any agent saying what it's doing and how to resume it, and sessions named from their first prompt
 - [x] Restart the daemon on a new crystal without stopping its sessions
 - [x] Hooks for a Claude Code or Codex typed into a shell, resumed after a restart, and subagents counted
+- [x] Hooks or plugins for 15 more agents, each resumed in its conversation after a restart
 - [x] Archived sessions, idle agents stopped, right-click menus, and projects kept with their run and open commands
 
 ## Development
