@@ -877,6 +877,69 @@ fn attach_has_the_wheel_send_arrows_only_while_the_program_is_on_the_alternate_s
     terminal.wrote("\x1b[?1007r", 1);
 }
 
+/// The test's config, with the attach taking the mouse, and a notch of
+/// the wheel five lines.
+const ATTACH_TAKES_THE_MOUSE: &str = "notify = false\nname_from_prompt = false\n\n\
+    [plugins]\nmemory = false\n\n[sound]\nenabled = false\n\n\
+    [mouse]\nattach_capture = true\nscroll_lines = 5\n";
+
+#[test]
+fn attach_taking_the_mouse_scrolls_the_history_with_the_wheel_until_you_type() {
+    let crystal = Crystal::new();
+    crystal.configure(ATTACH_TAKES_THE_MOUSE);
+    let script = "seq 1 100; read line; echo \"got $line\"; sleep 30";
+    crystal.ok(&["new", "-n", "counter", "sh", "-c", script]);
+    crystal.ok(&["wait", "counter", "--output", "100"]);
+
+    let mut terminal = crystal.attach(&["attach", "counter"]);
+    terminal.shows("100");
+    eventually("the mouse is taken", || terminal.sends_the_mouse());
+    let top = |terminal: &Terminal| {
+        terminal.rows()[0]
+            .split_whitespace()
+            .next()
+            .map(String::from)
+    };
+    assert_eq!(top(&terminal).as_deref(), Some("78"));
+
+    // A notch of the wheel up, as your terminal writes it the SGR way:
+    // back into rows from before the attach.
+    terminal.type_keys("\x1b[<64;10;10M");
+    terminal.shows("↑ 5 lines");
+    assert_eq!(top(&terminal).as_deref(), Some("73"));
+    terminal.type_keys("\x1b[<64;10;10M\x1b[<64;10;10M\x1b[<65;10;10M");
+    terminal.shows("↑ 10 lines");
+    assert_eq!(top(&terminal).as_deref(), Some("68"));
+
+    // Typing brings it back to live.
+    terminal.type_keys("hi\r");
+    terminal.shows("got hi");
+    terminal.hides("↑");
+
+    terminal.type_keys("\x1c");
+    terminal.shows("[detached from counter]");
+    assert!(!terminal.sends_the_mouse());
+}
+
+#[test]
+fn attach_taking_the_mouse_hands_it_to_a_program_that_asked_written_its_way() {
+    let crystal = Crystal::new();
+    crystal.configure(ATTACH_TAKES_THE_MOUSE);
+    // It asks for clicks the old way, one byte a number.
+    let script = r"stty raw -echo; printf '\033[?1000hasking'; head -c 6 > clicked; \
+                   printf ' clicked'; sleep 30";
+    crystal.ok(&["new", "-n", "clicker", "sh", "-c", script]);
+
+    let mut terminal = crystal.attach(&["attach", "clicker"]);
+    terminal.shows("asking");
+    eventually("the mouse is taken", || terminal.sends_the_mouse());
+    terminal.wrote("\x1b[?1006h", 1);
+    terminal.type_keys("\x1b[<0;3;2M");
+    terminal.shows("clicked");
+    let clicked = std::fs::read(crystal.dir.path().join("clicked")).unwrap();
+    assert_eq!(clicked, b"\x1b[M #\"");
+}
+
 #[test]
 fn attach_detaches_on_ctrl_backslash_in_the_kitty_keyboard_protocol() {
     let crystal = Crystal::new();
@@ -6250,6 +6313,52 @@ fn quitting_the_tui_doesn_t_stop_the_worktree_it_asked_to_remove() {
 }
 
 #[test]
+fn a_tui_opened_while_a_worktree_is_being_removed_says_so() {
+    let crystal = Crystal::new();
+    let dir = crystal.dir.path();
+    let repo = git_repo(dir, "app");
+    let repo_arg = repo.to_str().unwrap();
+    let bin = dir.join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let log = held_worktree_remove(&bin, dir);
+    let daemon = crystal.start_daemon_with(&[("PATH", &path_with(&bin))]);
+    crystal.ok(&[
+        "new", "-n", "fixer", "-c", repo_arg, "-w", "fix", "sh", "-c", "exit 0",
+    ]);
+    eventually("fixer has ended", || {
+        crystal.row("fixer").unwrap()[1] == "exited 0"
+    });
+    let removal = crystal
+        .command(&["worktree", "rm", "app.worktrees/fix"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    eventually("git is removing it", || {
+        git_ran(&log, "worktree remove") == 1
+    });
+
+    // Asked for on the command line before the TUI opened, it's the
+    // daemon that says so.
+    let mut tui = crystal.tui();
+    tui.shows("■ fixer");
+    tui.shows("removing…");
+    tui.type_keys("W");
+    tui.shows("already removing fix");
+
+    std::fs::write(dir.join("go"), "").unwrap();
+    let out = answered(removal);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    tui.hides("removing…");
+    tui.hides("■ fixer");
+    crash(daemon);
+}
+
+#[test]
 fn a_worktree_being_removed_as_the_daemon_hands_over_is_finished_by_the_next() {
     let crystal = Crystal::new();
     let dir = crystal.dir.path();
@@ -11057,11 +11166,11 @@ fn the_settings_view_changes_the_config_and_follows_it_live() {
     crystal.configure(
         "notify = true\ntheme = \"light\"\n\n[memory]\ndistill = false\nembeddings = false\n",
     );
-    // Memory's rows are twelve down from the theme, past the appearance's,
-    // the tab bar's, the spacing of restarts, the mouse's, the clipboard's
-    // and background tasks', which the view scrolls to on a screen too
-    // short for all of them.
-    tui.type_keys("jjjjjjjjjjjj");
+    // Memory's rows are thirteen down from the theme, past the
+    // appearance's, the tab bar's, the spacing of restarts, the mouse's,
+    // the clipboard's and background tasks', which the view scrolls to on
+    // a screen too short for all of them.
+    tui.type_keys("jjjjjjjjjjjjj");
     tui.shows("○ distill closed tasks");
     tui.shows("not downloaded (2449 MB)");
 

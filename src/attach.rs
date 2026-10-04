@@ -6,9 +6,13 @@
 //! like switching screens, stays inside the attach. Your terminal is asked
 //! for what the program asked of its keyboard and mouse, the wheel sending
 //! arrow keys only while the program is on its alternate screen, though
-//! the attach is on your terminal's all along. Its bell is passed on to
-//! your terminal, as often as [`crate::bell`] lets it, and what it copies
-//! goes on your clipboard, as [`crate::clipboard`] puts it there.
+//! the attach is on your terminal's all along. With `[mouse]
+//! attach_capture`, the attach takes the mouse from your terminal instead:
+//! a program that asked for it gets it, written its way; the wheel sends a
+//! program on its alternate screen that didn't the arrow keys, and anywhere
+//! else scrolls the session's history, until you type. Its bell is passed
+//! on to your terminal, as often as [`crate::bell`] lets it, and what it
+//! copies goes on your clipboard, as [`crate::clipboard`] puts it there.
 
 use crate::bell::Ringer;
 use crate::client;
@@ -16,13 +20,18 @@ use crate::clipboard;
 use crate::config::Config;
 use crate::env;
 use crate::protocol::{Request, Response, State};
+use crate::tui::mouse;
 use crate::tui::screen_widget::ScreenWidget;
 use crate::viewer::{Output, Viewer};
 use crate::vt;
 use anyhow::{Result, bail};
+use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use crossterm::terminal;
-use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
+use ratatui::layout::Rect;
+use ratatui::style::{Modifier, Style};
+use ratatui::widgets::Paragraph;
+use ratatui::{Frame, Terminal};
 use std::fs::File;
 use std::io::{self, ErrorKind, IsTerminal, Read, Write};
 use std::os::fd::{AsFd, AsRawFd};
@@ -42,6 +51,10 @@ const BACKSLASH: u32 = 92;
 /// How long the input loop waits on the keyboard before it checks the
 /// terminal's size and whether the session is still there.
 const TICK: Duration = Duration::from_millis(50);
+
+/// How long the start of a mouse report at the end of what was read waits
+/// for the rest of it, before it's taken for keys after all.
+const HELD: Duration = Duration::from_millis(20);
 
 /// Puts back every mode a session may have turned on, pops the Kitty
 /// keyboard flags the attach pushed, then leaves the alternate screen. The
@@ -65,9 +78,10 @@ pub fn run(socket: &Path, name: Option<&str>) -> Result<()> {
     let config = Config::load().unwrap_or_default();
     vt::set_history_lines(config.scrollback_lines);
     let (cols, rows) = terminal::size()?;
-    // Your own terminal keeps what scrolls by while you're attached; the
-    // history from before is for the TUI's panes and `crystal read`.
-    let (viewer, output) = Viewer::connect(socket, name, (rows, cols), false)?;
+    // The history from before is for the wheel to scroll through, once the
+    // attach takes the mouse; your terminal's own wheel can't reach it.
+    let history = config.mouse.attach_capture;
+    let (viewer, output) = Viewer::connect(socket, name, (rows, cols), history)?;
     let name = viewer.name.clone();
     if env::own_session_id(socket).as_deref() == Some(viewer.id.as_str()) {
         bail!("can't attach {name} to itself");
@@ -85,10 +99,13 @@ pub fn run(socket: &Path, name: Option<&str>) -> Result<()> {
         return Ok(());
     }
 
-    let copies = config.clipboard.allow_programs && !in_background(socket, &viewer.id);
+    let options = Options {
+        copies: config.clipboard.allow_programs && !in_background(socket, &viewer.id),
+        wheel: history.then_some(config.mouse.scroll_lines),
+    };
     let detached = {
         let _raw = RawTerminal::enter()?;
-        relay(socket, viewer, output, (rows, cols), copies)?
+        relay(socket, viewer, output, (rows, cols), options)?
     };
     if detached {
         println!("[detached from {name}]");
@@ -111,23 +128,35 @@ fn in_background(socket: &Path, id: &str) -> bool {
     task.is_some_and(|task| task.background)
 }
 
-/// Draws the session and sends it the keyboard until the user detaches
-/// (`true`) or the session goes (`false`). With `copies`, what its program
-/// copies goes on the clipboard.
+/// What the settings have the attach do.
+#[derive(Debug, Clone, Copy)]
+struct Options {
+    /// What the session's program copies goes on your clipboard.
+    copies: bool,
+    /// The attach takes the mouse, and a notch of the wheel is this many
+    /// lines; `None` leaves the mouse to your terminal.
+    wheel: Option<u16>,
+}
+
+/// Draws the session and sends it the keyboard, and the mouse as
+/// `options` say, until the user detaches (`true`) or the session goes
+/// (`false`).
 fn relay(
     socket: &Path,
     viewer: Viewer,
     output: Output,
     (rows, cols): (u16, u16),
-    copies: bool,
+    options: Options,
 ) -> Result<bool> {
-    let drawn = Arc::new(Mutex::new(Drawn::new(rows, cols)?));
+    let drawn = Drawn::new(rows, cols, options.wheel.is_some())?;
+    let drawn = Arc::new(Mutex::new(drawn));
     let mut viewer = viewer;
-    let mut drawing = Drawing::start(&drawn, output, copies);
+    let mut drawing = Drawing::start(&drawn, output, options.copies);
 
     // Our own handle on the keyboard, unbuffered, so that waiting on it
     // and reading from it agree.
     let keyboard = File::from(io::stdin().as_fd().try_clone_to_owned()?);
+    let mut reader = Reader::new(options.wheel.is_some());
     let mut size = (rows, cols);
     let mut buf = [0; 4096];
     let detached = loop {
@@ -136,23 +165,26 @@ fn relay(
             // The output ended: the session's program has, or the daemon
             // was handed over to a new crystal, which hangs up on every
             // attach. Attaching again says which.
-            let Some((again, output)) = attach_again(socket, &viewer, size) else {
+            let history = options.wheel.is_some();
+            let Some((again, output)) = attach_again(socket, &viewer, size, history) else {
                 break false;
             };
             viewer = again;
             drawn.lock().unwrap().screen = vt::Screen::new(size.0, size.1);
-            drawing = Drawing::start(&drawn, output, copies);
+            drawing = Drawing::start(&drawn, output, options.copies);
         }
-        if readable(&keyboard, TICK)? {
+        // The start of a mouse report waits only a moment for its end.
+        let wait = if reader.holds() { HELD } else { TICK };
+        if readable(&keyboard, wait)? {
             let n = (&keyboard).read(&mut buf)?;
-            let detach = detach_key(&buf[..n]);
-            let keys = &buf[..detach.unwrap_or(n)];
-            if !keys.is_empty() {
-                let _ = viewer.send_keys(keys);
-            }
-            if detach.is_some() || n == 0 {
+            let inputs = reader.read(&buf[..n]);
+            if n == 0 || take(inputs, &viewer, &drawn, options.wheel)? {
                 break true;
             }
+        } else if let Some(held) = reader.give_up()
+            && take(vec![held], &viewer, &drawn, options.wheel)?
+        {
+            break true;
         }
         let (cols, rows) = terminal::size()?;
         if (rows, cols) != size {
@@ -171,14 +203,276 @@ fn relay(
 }
 
 /// The session `viewer` showed, attached again at `(rows, cols)`, while its
-/// program still runs.
+/// program still runs, and with its history, for the wheel to scroll.
 fn attach_again(
     socket: &Path,
     viewer: &Viewer,
     (rows, cols): (u16, u16),
+    history: bool,
 ) -> Option<(Viewer, Output)> {
-    let (again, output) = Viewer::connect(socket, Some(&viewer.name), (rows, cols), false).ok()?;
+    let name = Some(viewer.name.as_str());
+    let (again, output) = Viewer::connect(socket, name, (rows, cols), history).ok()?;
     (again.running && again.id == viewer.id).then_some((again, output))
+}
+
+/// Hands on what came from your terminal: keys to the session, up to a
+/// Ctrl+\, and the mouse as [`on_mouse`] says, while the attach takes it
+/// and a notch of the `wheel` is so many lines; then the keys bring the
+/// screen back to live from the history first. Returns whether a Ctrl+\
+/// detaches.
+fn take(
+    inputs: Vec<Input>,
+    viewer: &Viewer,
+    drawn: &Mutex<Drawn>,
+    wheel: Option<u16>,
+) -> io::Result<bool> {
+    for input in inputs {
+        match input {
+            Input::Keys(keys) => {
+                let detach = detach_key(&keys);
+                let keys = &keys[..detach.unwrap_or(keys.len())];
+                if wheel.is_some() && typed(keys) {
+                    let mut drawn = drawn.lock().unwrap();
+                    if drawn.screen.scrolled_back() > 0 {
+                        drawn.screen.scroll_to_live();
+                        drawn.draw()?;
+                    }
+                }
+                if !keys.is_empty() {
+                    let _ = viewer.send_keys(keys);
+                }
+                if detach.is_some() {
+                    return Ok(true);
+                }
+            }
+            Input::Mouse(event) => {
+                let mut drawn = drawn.lock().unwrap();
+                match on_mouse(&mut drawn.screen, event, wheel.unwrap_or(0)) {
+                    Mouse::Keys(keys) => {
+                        let _ = viewer.send_keys(&keys);
+                    }
+                    Mouse::Scrolled => drawn.draw()?,
+                    Mouse::Nothing => {}
+                }
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Whether `keys` are something typed: not your terminal saying it gained
+/// or lost the focus, which it does for a program that asked, and which
+/// leaves the screen as far back in the history as it was.
+fn typed(keys: &[u8]) -> bool {
+    !keys.is_empty() && !matches!(keys, b"\x1b[I" | b"\x1b[O")
+}
+
+/// What a mouse event did on the screen of the attach.
+#[derive(Debug, PartialEq, Eq)]
+enum Mouse {
+    /// It's for the session's program, as these keys.
+    Keys(Vec<u8>),
+    /// It scrolled the screen through the history.
+    Scrolled,
+    Nothing,
+}
+
+/// What `event` does on `screen`, which fills your terminal: a program that
+/// asked for the mouse gets it, written its way, while the screen is live
+/// (back in the history, the program's screen isn't what's under the
+/// mouse). Otherwise a notch of the wheel is `lines` presses of an arrow
+/// key for a program on its alternate screen, as [`mouse::alternate_scroll`]
+/// has it, or scrolls the history `lines` rows. Nothing else does anything.
+fn on_mouse(screen: &mut vt::Screen, event: MouseEvent, lines: u16) -> Mouse {
+    let protocol = mouse::Protocol::of(screen).filter(|_| screen.scrolled_back() == 0);
+    if let Some(protocol) = protocol {
+        let cell = (event.row, event.column);
+        let keys = mouse::encode(event.kind, event.modifiers, cell, protocol);
+        return keys.map_or(Mouse::Nothing, Mouse::Keys);
+    }
+    let back = match event.kind {
+        MouseEventKind::ScrollUp => true,
+        MouseEventKind::ScrollDown => false,
+        _ => return Mouse::Nothing,
+    };
+    if let Some(arrows) = mouse::alternate_scroll(screen, back, lines) {
+        return Mouse::Keys(arrows);
+    }
+    let was = screen.scrolled_back();
+    let rows = usize::from(lines) as isize;
+    screen.scroll_back(if back { rows } else { -rows });
+    if screen.scrolled_back() == was {
+        Mouse::Nothing
+    } else {
+        Mouse::Scrolled
+    }
+}
+
+/// What came from your terminal: keys for the session, or the mouse.
+#[derive(Debug, PartialEq, Eq)]
+enum Input {
+    Keys(Vec<u8>),
+    Mouse(MouseEvent),
+}
+
+/// Reads what comes from your terminal into [`Input`]s: all keys, unless
+/// the attach takes the mouse, when its reports are picked out of them.
+/// The start of one at the end of a read is held for the next to end; if
+/// nothing comes, it was keys after all, like an `Esc` on its own.
+struct Reader {
+    mouse: bool,
+    held: Vec<u8>,
+}
+
+impl Reader {
+    fn new(mouse: bool) -> Reader {
+        Reader {
+            mouse,
+            held: Vec::new(),
+        }
+    }
+
+    fn read(&mut self, bytes: &[u8]) -> Vec<Input> {
+        if !self.mouse {
+            return vec![Input::Keys(bytes.to_vec())];
+        }
+        self.held.extend_from_slice(bytes);
+        let (inputs, held) = split(&self.held);
+        self.held.drain(..self.held.len() - held);
+        inputs
+    }
+
+    /// Whether the start of a mouse report is waiting for its end.
+    fn holds(&self) -> bool {
+        !self.held.is_empty()
+    }
+
+    /// What was held, as keys, once nothing came to end it.
+    fn give_up(&mut self) -> Option<Input> {
+        self.holds()
+            .then(|| Input::Keys(std::mem::take(&mut self.held)))
+    }
+}
+
+/// How SGR mouse reports start: `CSI <`, then the button, the column and
+/// the row, and `M` for a press or `m` for a release.
+const SGR_MOUSE: &[u8] = b"\x1b[<";
+
+/// The most a report's numbers take: a button, and a column and a row of
+/// up to five digits each, with the semicolons between.
+const SGR_LONGEST: usize = 15;
+
+/// `bytes` split into keys and the mouse reports among them, and how many
+/// bytes at their end may be the start of one the next read ends.
+fn split(bytes: &[u8]) -> (Vec<Input>, usize) {
+    let mut inputs = Vec::new();
+    // Where the keys not yet handed on start.
+    let mut keys = 0;
+    let mut at = 0;
+    while at < bytes.len() {
+        let report = sgr_report(&bytes[at..]);
+        if matches!(report, Report::Not) {
+            at += 1;
+            continue;
+        }
+        if keys < at {
+            inputs.push(Input::Keys(bytes[keys..at].to_vec()));
+        }
+        let Report::Whole { len, event } = report else {
+            return (inputs, bytes.len() - at);
+        };
+        inputs.extend(event.map(Input::Mouse));
+        at += len;
+        keys = at;
+    }
+    if keys < at {
+        inputs.push(Input::Keys(bytes[keys..].to_vec()));
+    }
+    (inputs, 0)
+}
+
+/// What the start of some bytes is, as a mouse report.
+enum Report {
+    Not,
+    /// The start of one, cut off.
+    Cut,
+    /// One `len` bytes long, saying `event`, or nothing crossterm has words
+    /// for, like a button past the wheel's.
+    Whole {
+        len: usize,
+        event: Option<MouseEvent>,
+    },
+}
+
+/// Whether `bytes` start with an SGR mouse report.
+fn sgr_report(bytes: &[u8]) -> Report {
+    let Some(numbers) = bytes.strip_prefix(SGR_MOUSE) else {
+        let cut = bytes.len() < SGR_MOUSE.len() && SGR_MOUSE.starts_with(bytes);
+        return if cut { Report::Cut } else { Report::Not };
+    };
+    let number = |byte: &u8| matches!(byte, b'0'..=b'9' | b';');
+    match numbers.iter().position(|byte| !number(byte)) {
+        Some(end) if end <= SGR_LONGEST && matches!(numbers[end], b'M' | b'm') => Report::Whole {
+            len: SGR_MOUSE.len() + end + 1,
+            event: sgr_event(&numbers[..end], numbers[end] == b'm'),
+        },
+        None if numbers.len() <= SGR_LONGEST => Report::Cut,
+        _ => Report::Not,
+    }
+}
+
+/// The event an SGR report's `numbers` say, ended with `m` for a
+/// `release`: the button's bits (the wheel's, a move's, the keys held),
+/// then the column and the row, counted from 1.
+fn sgr_event(numbers: &[u8], release: bool) -> Option<MouseEvent> {
+    let numbers = std::str::from_utf8(numbers).ok()?;
+    let mut numbers = numbers.split(';').map(|number| number.parse::<u16>().ok());
+    let (Some(Some(code)), Some(Some(column)), Some(Some(row)), None) = (
+        numbers.next(),
+        numbers.next(),
+        numbers.next(),
+        numbers.next(),
+    ) else {
+        return None;
+    };
+    let button = match code & 3 {
+        0 => Some(MouseButton::Left),
+        1 => Some(MouseButton::Middle),
+        2 => Some(MouseButton::Right),
+        _ => None,
+    };
+    let kind = if code & 128 != 0 {
+        return None;
+    } else if code & 64 != 0 {
+        match code & 3 {
+            0 => MouseEventKind::ScrollUp,
+            1 => MouseEventKind::ScrollDown,
+            2 => MouseEventKind::ScrollLeft,
+            _ => MouseEventKind::ScrollRight,
+        }
+    } else if code & 32 != 0 {
+        button.map_or(MouseEventKind::Moved, MouseEventKind::Drag)
+    } else if release {
+        MouseEventKind::Up(button?)
+    } else {
+        MouseEventKind::Down(button?)
+    };
+    let mut modifiers = KeyModifiers::NONE;
+    for (bit, held) in [
+        (4, KeyModifiers::SHIFT),
+        (8, KeyModifiers::ALT),
+        (16, KeyModifiers::CONTROL),
+    ] {
+        if code & bit != 0 {
+            modifiers |= held;
+        }
+    }
+    Some(MouseEvent {
+        kind,
+        column: column.checked_sub(1)?,
+        row: row.checked_sub(1)?,
+        modifiers,
+    })
 }
 
 /// The thread that draws a session's output as it comes, until it ends,
@@ -317,26 +611,42 @@ struct Drawn {
     /// program asked for, as of the last draw. Your keys go to it as they
     /// come, so your terminal has to write them its way.
     modes: vt::InputModes,
+    /// Whether the attach takes the mouse, which your terminal is asked
+    /// for besides.
+    mouse: bool,
 }
 
 impl Drawn {
-    fn new(rows: u16, cols: u16) -> io::Result<Drawn> {
+    fn new(rows: u16, cols: u16, mouse: bool) -> io::Result<Drawn> {
         Ok(Drawn {
             screen: vt::Screen::new(rows, cols),
             terminal: Terminal::new(CrosstermBackend::new(io::stdout()))?,
             modes: vt::InputModes::default(),
+            mouse,
         })
     }
 
+    /// Draws the screen, as far back in the history as it's scrolled,
+    /// which its top right says, with no cursor.
     fn draw(&mut self) -> io::Result<()> {
         let screen = &self.screen;
         self.terminal.draw(|frame| {
             frame.render_widget(ScreenWidget::new(screen), frame.area());
-            if let Some((row, col)) = screen.cursor() {
-                frame.set_cursor_position((col, row));
+            match screen.scrolled_back() {
+                0 => {
+                    if let Some((row, col)) = screen.cursor() {
+                        frame.set_cursor_position((col, row));
+                    }
+                }
+                back => draw_back(frame, back),
             }
         })?;
         let modes = self.screen.input_modes();
+        let modes = if self.mouse {
+            modes.taking_the_mouse()
+        } else {
+            modes
+        };
         let changes = modes.changes_from(&self.modes);
         if !changes.is_empty() {
             draw(&changes)?;
@@ -344,6 +654,22 @@ impl Drawn {
         }
         Ok(())
     }
+}
+
+/// Says how far back into the history the screen is, `↑ 120 lines` as a
+/// pane's title has it, at the right of its top row.
+fn draw_back(frame: &mut Frame, back: usize) {
+    let text = format!(" ↑ {back} lines ");
+    let area = frame.area();
+    let width = u16::try_from(text.chars().count()).map_or(area.width, |w| w.min(area.width));
+    let corner = Rect {
+        x: area.right() - width,
+        y: area.y,
+        width,
+        height: area.height.min(1),
+    };
+    let reversed = Style::new().add_modifier(Modifier::REVERSED);
+    frame.render_widget(Paragraph::new(text).style(reversed), corner);
 }
 
 fn draw(bytes: &[u8]) -> io::Result<()> {
@@ -393,6 +719,146 @@ impl Drop for RawTerminal {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn wheel(kind: MouseEventKind, row: u16, column: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn mouse_reports_are_picked_out_of_the_keys() {
+        let mut reader = Reader::new(true);
+        let inputs = reader.read(b"ls\x1b[<64;3;2Mx\x1b[<0;10;5m");
+        assert_eq!(
+            inputs,
+            [
+                Input::Keys(b"ls".to_vec()),
+                Input::Mouse(wheel(MouseEventKind::ScrollUp, 1, 2)),
+                Input::Keys(b"x".to_vec()),
+                Input::Mouse(wheel(MouseEventKind::Up(MouseButton::Left), 4, 9)),
+            ]
+        );
+        assert!(!reader.holds());
+        // Left to your terminal, the mouse's reports are all keys.
+        let mut keys = Reader::new(false);
+        let inputs = keys.read(b"\x1b[<64;3;2M");
+        assert_eq!(inputs, [Input::Keys(b"\x1b[<64;3;2M".to_vec())]);
+    }
+
+    #[test]
+    fn a_report_cut_off_is_held_for_the_next_read() {
+        let mut reader = Reader::new(true);
+        assert_eq!(reader.read(b"a\x1b[<65;1"), [Input::Keys(b"a".to_vec())]);
+        assert!(reader.holds());
+        let ended = reader.read(b";1M");
+        assert_eq!(
+            ended,
+            [Input::Mouse(wheel(MouseEventKind::ScrollDown, 0, 0))]
+        );
+
+        // An Esc on its own, with nothing after it, was a key after all.
+        assert_eq!(reader.read(b"\x1b"), []);
+        assert_eq!(reader.give_up(), Some(Input::Keys(b"\x1b".to_vec())));
+        assert_eq!(reader.give_up(), None);
+    }
+
+    #[test]
+    fn what_isn_t_a_report_stays_keys() {
+        let mut reader = Reader::new(true);
+        // Alt+[ then <, a Kitty key, and numbers too long for a report.
+        for keys in [
+            &b"\x1b[<x"[..],
+            b"\x1b[92;5u",
+            b"\x1b[<1234567890123456;1;1M",
+        ] {
+            assert_eq!(reader.read(keys), [Input::Keys(keys.to_vec())]);
+            assert!(!reader.holds());
+        }
+    }
+
+    #[test]
+    fn a_report_says_its_button_and_the_keys_held() {
+        let event = |report: &[u8]| match sgr_report(report) {
+            Report::Whole { event, .. } => event,
+            _ => panic!("not a report"),
+        };
+        let drag = event(b"\x1b[<52;7;3M").unwrap();
+        assert_eq!(drag.kind, MouseEventKind::Drag(MouseButton::Left));
+        assert_eq!(drag.modifiers, KeyModifiers::SHIFT | KeyModifiers::CONTROL);
+        assert_eq!((drag.row, drag.column), (2, 6));
+        let moved = event(b"\x1b[<35;1;1M").unwrap();
+        assert_eq!(moved.kind, MouseEventKind::Moved);
+        let right = event(b"\x1b[<2;1;1M").unwrap();
+        assert_eq!(right.kind, MouseEventKind::Down(MouseButton::Right));
+        // A button past the wheel's, and a cell at 0, say nothing.
+        assert_eq!(event(b"\x1b[<128;1;1M"), None);
+        assert_eq!(event(b"\x1b[<0;0;1M"), None);
+    }
+
+    #[test]
+    fn the_wheel_scrolls_the_history_on_the_main_screen() {
+        let mut screen = vt::Screen::new(3, 10);
+        screen.process(b"1\r\n2\r\n3\r\n4\r\n5\r\n6\r\n7");
+        let up = wheel(MouseEventKind::ScrollUp, 0, 0);
+        assert_eq!(on_mouse(&mut screen, up, 3), Mouse::Scrolled);
+        assert_eq!(screen.scrolled_back(), 3);
+        assert_eq!(on_mouse(&mut screen, up, 3), Mouse::Scrolled);
+        assert_eq!(screen.scrolled_back(), 4, "as far back as there is");
+        assert_eq!(on_mouse(&mut screen, up, 3), Mouse::Nothing);
+        let down = wheel(MouseEventKind::ScrollDown, 0, 0);
+        assert_eq!(on_mouse(&mut screen, down, 3), Mouse::Scrolled);
+        assert_eq!(screen.scrolled_back(), 1);
+        // A click there is nobody's.
+        let click = wheel(MouseEventKind::Down(MouseButton::Left), 0, 0);
+        assert_eq!(on_mouse(&mut screen, click, 3), Mouse::Nothing);
+    }
+
+    #[test]
+    fn a_program_that_asked_gets_the_mouse_its_way_while_the_screen_is_live() {
+        let mut screen = vt::Screen::new(3, 10);
+        screen.process(b"1\r\n2\r\n3\r\n4\r\n5\x1b[?1000h");
+        let up = wheel(MouseEventKind::ScrollUp, 1, 2);
+        assert_eq!(
+            on_mouse(&mut screen, up, 3),
+            Mouse::Keys(b"\x1b[M`#\"".to_vec())
+        );
+        screen.process(b"\x1b[?1006h");
+        let click = wheel(MouseEventKind::Down(MouseButton::Left), 1, 2);
+        assert_eq!(
+            on_mouse(&mut screen, click, 3),
+            Mouse::Keys(b"\x1b[<0;3;2M".to_vec())
+        );
+        // Back in the history, the wheel is the attach's.
+        screen.scroll_back(1);
+        assert_eq!(on_mouse(&mut screen, up, 3), Mouse::Scrolled);
+        assert_eq!(on_mouse(&mut screen, click, 3), Mouse::Nothing);
+    }
+
+    #[test]
+    fn the_wheel_sends_a_pager_the_arrow_keys() {
+        let mut screen = vt::Screen::new(3, 10);
+        screen.process(b"\x1b[?1049hless");
+        let down = wheel(MouseEventKind::ScrollDown, 0, 0);
+        assert_eq!(
+            on_mouse(&mut screen, down, 2),
+            Mouse::Keys(b"\x1b[B\x1b[B".to_vec())
+        );
+        // Unless it turned that off: there's no history to scroll either.
+        screen.process(b"\x1b[?1007l");
+        assert_eq!(on_mouse(&mut screen, down, 2), Mouse::Nothing);
+    }
+
+    #[test]
+    fn focus_reports_aren_t_typing() {
+        assert!(typed(b"a"));
+        assert!(!typed(b"\x1b[I"));
+        assert!(!typed(b"\x1b[O"));
+        assert!(!typed(b""));
+    }
 
     #[test]
     fn ctrl_backslash_detaches_the_old_way() {
