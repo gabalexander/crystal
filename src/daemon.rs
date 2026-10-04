@@ -3202,24 +3202,71 @@ fn claude_tools(
     options
 }
 
-/// Claude Code's permission rules for the crystal commands an agent is
-/// told to run, so that one closing its task, or noting something for
-/// later, doesn't wait on the user to say it may: a background task that
-/// did would sit there with its work done. Only what's on: `crystal done`
-/// with tasks, `crystal backlog add` and reading the backlog with it,
-/// `crystal handoff` with the handoff file, and `crystal remember` and
-/// reading memory with memory. What changes or removes what's there
-/// already, like `crystal backlog rm` or `crystal memory rm`, still asks.
+/// Claude Code's permission rules for crystal's own commands, so that an
+/// agent doing what its notes and crystal's skill teach (starting and
+/// driving sessions of its own, reading them, closing its task, noting
+/// something for later) doesn't stop for the user at every step: a task in
+/// the background that did would sit there with its work done, and one
+/// driving workers would wait on each. A plugin's commands only while it's
+/// on. What removes or cancels what's there (`crystal kill`, `worktree rm`,
+/// `tasks cancel`, `flow cancel`, `backlog rm`, `memory rm`), what's the
+/// user's to decide (a flow's gate: `flow approve` and `back`), and what
+/// answers another agent's question for it (`send-keys` and `answer`, which
+/// can say yes to a permission) still ask.
+///
+/// A rule ending `:*` matches the command with any arguments or none, but
+/// only as whole words: `crystal send:*` isn't `crystal send-keys`, and
+/// `crystal task:*` isn't `crystal tasks cancel`.
 fn crystal_commands(config: &Config) -> Vec<&'static str> {
-    let mut rules = Vec::new();
+    // Sessions: starting, driving and reading them, and what's on screen.
+    let mut rules = vec![
+        "Bash(crystal ls:*)",
+        "Bash(crystal new:*)",
+        "Bash(crystal send:*)",
+        "Bash(crystal wait:*)",
+        "Bash(crystal read:*)",
+        "Bash(crystal result:*)",
+        "Bash(crystal interrupt:*)",
+        "Bash(crystal events:*)",
+        "Bash(crystal rename:*)",
+        "Bash(crystal report:*)",
+        "Bash(crystal notify:*)",
+        "Bash(crystal layout:*)",
+        "Bash(crystal pane split:*)",
+        "Bash(crystal pane close:*)",
+    ];
     if tasks::enabled(config) {
-        rules.push("Bash(crystal done:*)");
+        rules.extend([
+            "Bash(crystal done:*)",
+            "Bash(crystal task:*)",
+            "Bash(crystal tasks)",
+            "Bash(crystal tasks --all)",
+            "Bash(crystal tasks show:*)",
+            "Bash(crystal tasks log:*)",
+            "Bash(crystal tasks new:*)",
+            "Bash(crystal tasks start:*)",
+        ]);
+    }
+    if flows::enabled(config) {
+        rules.extend([
+            "Bash(crystal flow)",
+            "Bash(crystal flow --json)",
+            "Bash(crystal flow run:*)",
+            "Bash(crystal flow wait:*)",
+            "Bash(crystal flow show:*)",
+            "Bash(crystal flow defs:*)",
+            "Bash(crystal flow retry:*)",
+        ]);
     }
     if backlog::enabled(config) {
         rules.extend([
             "Bash(crystal backlog add:*)",
             "Bash(crystal backlog)",
+            "Bash(crystal backlog --all)",
             "Bash(crystal backlog export)",
+            "Bash(crystal backlog done:*)",
+            "Bash(crystal backlog reopen:*)",
+            "Bash(crystal backlog start:*)",
         ]);
     }
     if handoff::enabled(config) {
@@ -3228,6 +3275,7 @@ fn crystal_commands(config: &Config) -> Vec<&'static str> {
     if memory::enabled(config) {
         rules.extend([
             "Bash(crystal remember:*)",
+            "Bash(crystal memory)",
             "Bash(crystal memory search:*)",
             "Bash(crystal memory show:*)",
         ]);
@@ -3700,6 +3748,59 @@ fn unique_name(program: &str, taken: impl Fn(&str) -> bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn claude_may_run_crystal_s_own_commands_but_not_those_that_remove_or_answer() {
+        let mut config = Config::default();
+        let rules = crystal_commands(&config);
+        for allowed in [
+            "Bash(crystal new:*)",
+            "Bash(crystal send:*)",
+            "Bash(crystal wait:*)",
+            "Bash(crystal read:*)",
+            "Bash(crystal task:*)",
+            "Bash(crystal flow run:*)",
+            "Bash(crystal backlog done:*)",
+            "Bash(crystal memory search:*)",
+        ] {
+            assert!(rules.contains(&allowed), "{allowed}: {rules:?}");
+        }
+        // Each of these still asks the user: no rule is a prefix of it.
+        for asks in [
+            "crystal kill",
+            "crystal worktree rm",
+            "crystal send-keys",
+            "crystal answer",
+            "crystal tasks cancel",
+            "crystal flow cancel",
+            "crystal flow approve",
+            "crystal flow back",
+            "crystal backlog rm",
+            "crystal memory rm",
+            "crystal memory promote",
+            "crystal kill-server",
+        ] {
+            let covers = |rule: &&str| {
+                let rule = rule.trim_start_matches("Bash(").trim_end_matches(')');
+                match rule.strip_suffix(":*") {
+                    Some(prefix) => asks == prefix || asks.starts_with(&format!("{prefix} ")),
+                    None => asks == rule,
+                }
+            };
+            assert!(!rules.iter().any(covers), "{asks}");
+        }
+        for plugin in ["tasks", "flows", "backlog", "handoff", "memory"] {
+            config.plugins.insert(plugin.into(), false);
+        }
+        let rules = crystal_commands(&config);
+        assert!(rules.contains(&"Bash(crystal send:*)"));
+        assert!(!rules.iter().any(|rule| rule.contains("done")
+            || rule.contains("flow")
+            || rule.contains("backlog")
+            || rule.contains("handoff")
+            || rule.contains("memory")
+            || rule.contains("task")));
+    }
 
     fn candidate<'a>(id: &'a str, conversation: Option<&'a str>, cwd: &'a str) -> Candidate<'a> {
         Candidate {
