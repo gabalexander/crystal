@@ -7,7 +7,7 @@
 
 use super::{Action, App, Slot, resize_step};
 use crate::flow_run::FlowRun;
-use crate::layout::{Command, Layout, Order, TabLayout, Tile};
+use crate::layout::{Command, Layout, NO_TUI, Order, TabLayout, Tile};
 use crate::protocol::SessionInfo;
 use crate::session::UNSEEN_SIZE;
 use crate::tui::split_tree::{Direction, Pane, SplitTree, Way};
@@ -36,6 +36,10 @@ impl App {
         tabs: Tabs,
         order: Order,
     ) -> Result<Alone, String> {
+        // The title is the TUI's terminal's, and there's none.
+        if let Command::Title { .. } = order.command {
+            return Err(format!("{NO_TUI} to show it"));
+        }
         let mut app = App::new(None);
         let (rows, cols) = UNSEEN_SIZE;
         let screen = Rect::new(0, 0, cols, rows);
@@ -189,6 +193,7 @@ impl App {
                 let index = self.tab_for(session.as_deref(), caller)?;
                 self.put_float_back_in(index);
             }
+            Command::Title { text } => self.title_override = text,
         }
         Ok(None)
     }
@@ -603,6 +608,28 @@ mod tests {
 
     fn selected(app: &App) -> Option<String> {
         app.selected().map(|session| session.name.clone())
+    }
+
+    #[test]
+    fn a_title_given_stands_until_it_is_cleared_and_needs_a_tui() {
+        let mut app = app_with(&["a"]);
+        assert_eq!(app.title_override(), None);
+        let title = |text: Option<&str>| Command::Title {
+            text: text.map(String::from),
+        };
+        obey(&mut app, title(Some("deploying"))).unwrap();
+        assert_eq!(app.title_override(), Some("deploying"));
+        obey(&mut app, title(None)).unwrap();
+        assert_eq!(app.title_override(), None);
+        let order = Order {
+            command: title(Some("deploying")),
+            caller: None,
+        };
+        let alone = App::obey_alone(vec![session("a")], Vec::new(), Tabs::default(), order);
+        let Err(said) = alone else {
+            panic!("a title was given with no TUI to show it");
+        };
+        assert!(said.contains(NO_TUI), "{said}");
     }
 
     /// Two tabs: a and b in the first, c in the second, which is in front.

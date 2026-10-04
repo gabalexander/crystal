@@ -72,6 +72,9 @@ pub enum Command {
     /// Float a session over its tab's panes, or with `on` false, put the
     /// tab's float back among them.
     Float { session: Option<String>, on: bool },
+    /// Give the TUI's terminal the title `text`, in place of the one the
+    /// settings make, or with none, go back to that one.
+    Title { text: Option<String> },
 }
 
 /// A command as a TUI gets it.

@@ -44,9 +44,9 @@ whenever what's handed over changes in a way the crystal before couldn't read.
 - `src/client.rs`: connects to the daemon, starting it when needed; `tell` gives it an event from outside,
   `subscribe` a stream of its events, for the CLI and a TUI to read, which picks up again after a handover,
   and `lay_out` a layout command for the TUI; restarting the daemon, handed over or cold
-- `src/layout.rs`: laying out the TUI from the command line: the commands `crystal tab` and `crystal pane` send,
-  the order a TUI gets with the id of the session it was run in, what the TUI reports back, the layout it
-  answers with, and how `crystal layout` prints it
+- `src/layout.rs`: laying out the TUI from the command line: the commands `crystal tab`, `crystal pane` and
+  `crystal title` send, the order a TUI gets with the id of the session it was run in, what the TUI reports
+  back, the layout it answers with, and how `crystal layout` prints it
 - `src/layout_relay.rs`: the daemon's side of those commands: the TUIs that take orders and which was used last
   (a key, a click, its terminal brought to the front), whether each one's terminal has the focus, which says
   where the user is for notifications, an order written to that one and its answer handed back to the command
@@ -95,8 +95,9 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   - `layout_link.rs`: the TUI's end of the layout commands: offering the daemon to take them, again at once
     after a handover or a restart, each one an event for the loop, and its answers, that it was used (a
     key, the mouse, a paste, focus gained) and when its terminal gains and loses the focus  sent back
-  - `ui.rs`: the layout and drawing (top bar and its tabs, pane headers, footer, the column each pane's
-    scrollbar takes), and what's under the mouse
+  - `ui.rs`: the layout and drawing (the tab bar, on top or over the footer or left out, its tabs and what
+    it shows at its right, pane headers, footer, the column each pane's scrollbar takes), and what's under
+    the mouse
   - `scrollbar.rs`: a pane's scrollbar: where its thumb is for how far back the pane is, how far back a
     dragged thumb takes it, and drawing it; pure, so it's unit-tested
   - `tabs.rs`: tabs, as many as the user likes, each holding its own sessions (each session in exactly one)
@@ -129,8 +130,16 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   - `status.rs`: a session's status as the TUI shows it, and its mark
   - `theme.rs`: every color, named for what it's for, and `THEMES`, the one table of every theme by its names:
     crystal's own `dark`, `light` and `terminal`, and the well-known schemes (catppuccin, nord, …), each a
-    palette of ten colors given their roles, its tints blended toward the background; the user's `[colors]`
-    over it, and none for `NO_COLOR`
+    palette of ten colors given their roles, its tints blended toward the background; the theme for a light
+    or dark appearance, a scheme's other side; the user's `[colors]` over it, and none for `NO_COLOR`
+  - `appearance.rs`: light or dark, which the theme follows with `[appearance] auto_switch`: the system's (a
+    Mac's defaults, the desktop portal, GNOME's), asked every two seconds off the event loop, or over ssh the
+    terminal's background, asked once as the TUI starts, before the input reader reads anything
+  - `window.rs`: the title the TUI gives its terminal: `[window] title`'s tokens filled in and checked, what
+    an empty token leaves at either end taken off, and the title stack it's saved on and put back from
+  - `status_bar.rs`: what the tab bar shows at its right (`[tab_bar] right`): the hostname, a clock through
+    `strftime`, text, and a command's last line, run again on an interval with a timeout, its process group
+    killed; worked out on threads that stop with their `Watch`, the event loop told only of a change
   - `mouse.rs`: writes mouse events the way a program in a pane asked for them
   - `help.rs`: the overlay `?` opens, a key a row: the sidebar's from the keymap, written as the user's
     `[keys]` has them, the rest from one table; its sections flowed into columns as tall as the terminal, two
@@ -345,7 +354,9 @@ whenever what's handed over changes in a way the crystal before couldn't read.
 - `src/work.rs`: `crystal done` (with `--artifact`), `handoff`, `tasks` and its commands (`new`, `start`, `show`,
   `cancel`, `log`), and `backlog`
 - `src/config.rs`: the settings in `~/.config/crystal/config.toml`, read and checked: a theme by any of its
-  names, the colors `[colors]` takes, and what the mouse does (`[mouse]`)
+  names, the colors `[colors]` takes, and what the mouse does (`[mouse]`); the shell a new terminal runs
+  (`[terminal]`, `-l` for a login shell) and where the TUI starts one, the window's title, the tab bar and
+  the appearance
 - `src/memory.rs`: what a project's sessions learned: the SQLite store in the state directory with its FTS5
   index (bm25, prefix and porter-stemmed words), each entry's vector and search by meaning merged with it by
   reciprocal rank fusion, then the reranker's read of the best (nothing when none answers), its migrations,

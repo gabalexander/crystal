@@ -8,8 +8,9 @@
 //!
 //! The view is state and logic only, apart from [`draw`] at the end.
 
-use super::theme::Theme;
-use crate::config::{Config, SessionSettings, ThemeName};
+use super::appearance::Appearance;
+use super::theme::{self, Theme};
+use crate::config::{BarPosition, Config, SessionSettings, ThemeName};
 use crate::embed::Status;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
@@ -37,6 +38,9 @@ pub enum Setting {
     UnfocusedOnly,
     Sound,
     Theme,
+    AutoSwitch,
+    TabBar,
+    HideSingleTab,
     StopIdle,
     MouseCapture,
     CopyOnSelect,
@@ -53,7 +57,12 @@ pub enum Change {
     NotifyAfter(u64),
     UnfocusedOnly(bool),
     Sound(bool),
+    /// The theme, which, picked by hand, stops it following the system's
+    /// appearance.
     Theme(ThemeName),
+    AutoSwitch(bool),
+    TabBar(BarPosition),
+    HideSingleTab(bool),
     /// How long an agent may sit idle, one of [`SessionSettings::CHOICES`].
     StopIdle(&'static str),
     MouseCapture(bool),
@@ -75,6 +84,9 @@ impl Change {
             Change::UnfocusedOnly(_) => &["notifications", "unfocused_only"],
             Change::Sound(_) => &["sound", "enabled"],
             Change::Theme(_) => &["theme"],
+            Change::AutoSwitch(_) => &["appearance", "auto_switch"],
+            Change::TabBar(_) => &["tab_bar", "position"],
+            Change::HideSingleTab(_) => &["tab_bar", "hide_when_single"],
             Change::StopIdle(_) => &["sessions", "stop_idle_after"],
             Change::MouseCapture(_) => &["mouse", "capture"],
             Change::CopyOnSelect(_) => &["mouse", "copy_on_select"],
@@ -94,7 +106,11 @@ impl Change {
             | Change::CopyOnSelect(on)
             | Change::Scrollbars(on)
             | Change::Distill(on)
-            | Change::Embeddings(on) => on.into(),
+            | Change::Embeddings(on)
+            | Change::AutoSwitch(on)
+            | Change::HideSingleTab(on) => on.into(),
+            Change::TabBar(BarPosition::Top) => "top".into(),
+            Change::TabBar(BarPosition::Bottom) => "bottom".into(),
             Change::ScrollLines(lines) => i64::from(lines).into(),
             Change::NotifyAfter(secs) => i64::try_from(secs).unwrap_or(i64::MAX).into(),
             Change::Theme(theme) => theme.name().into(),
@@ -156,12 +172,15 @@ pub enum Outcome {
 }
 
 /// The settings the bar can be on, in the order they're listed.
-const SETTINGS: [Setting; 12] = [
+const SETTINGS: [Setting; 15] = [
     Setting::Notify,
     Setting::NotifyAfter,
     Setting::UnfocusedOnly,
     Setting::Sound,
     Setting::Theme,
+    Setting::AutoSwitch,
+    Setting::TabBar,
+    Setting::HideSingleTab,
     Setting::StopIdle,
     Setting::MouseCapture,
     Setting::CopyOnSelect,
@@ -259,6 +278,12 @@ impl SettingsView {
             Setting::Sound => Change::Sound(!config.sound.enabled),
             Setting::Theme if forward => Change::Theme(config.theme.next()),
             Setting::Theme => Change::Theme(config.theme.previous()),
+            Setting::AutoSwitch => Change::AutoSwitch(!config.appearance.auto_switch),
+            Setting::TabBar => Change::TabBar(match config.tab_bar.position {
+                BarPosition::Top => BarPosition::Bottom,
+                BarPosition::Bottom => BarPosition::Top,
+            }),
+            Setting::HideSingleTab => Change::HideSingleTab(!config.tab_bar.hide_when_single),
             Setting::StopIdle => {
                 let choices = SessionSettings::CHOICES;
                 let now = &config.sessions.stop_idle_after;
@@ -352,6 +377,8 @@ pub fn draw(frame: &mut Frame, view: &SettingsView, theme: &Theme, area: Rect) {
         .buffer_mut()
         .set_style(area, Style::new().add_modifier(Modifier::DIM));
     let lines = lines(view, theme);
+    // The row the bar is on is the one drawn as the selection.
+    let selected = lines.iter().position(|line| line.style == theme.selection);
     let width = area.width.saturating_sub(4).clamp(40.min(area.width), 84);
     let height = (lines.len() as u16 + 2).min(area.height);
     let top = if area.height > height { 1 } else { 0 };
@@ -373,7 +400,14 @@ pub fn draw(frame: &mut Frame, view: &SettingsView, theme: &Theme, area: Rect) {
         .inner(panel)
         .inner(Margin::new(if framed { 1 } else { 2 }, 1));
     frame.render_widget(block, panel);
-    frame.render_widget(Paragraph::new(lines), inside);
+    // Taller than the room, the view scrolls to keep the setting the bar is
+    // on in sight, and what's said under it.
+    let room = usize::from(inside.height);
+    let scroll = selected
+        .map_or(0, |at| (at + 3).saturating_sub(room))
+        .min(lines.len().saturating_sub(room));
+    let scroll = u16::try_from(scroll).unwrap_or(u16::MAX);
+    frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), inside);
 }
 
 /// The view's lines: where the file is, then each part's settings, each
@@ -407,6 +441,9 @@ fn lines(view: &SettingsView, theme: &Theme) -> Vec<Line<'static>> {
             Setting::UnfocusedOnly => "  only when away",
             Setting::Sound => "sounds",
             Setting::Theme => "theme",
+            Setting::AutoSwitch => "  follow the system",
+            Setting::TabBar => "tab bar",
+            Setting::HideSingleTab => "  hide with one tab",
             Setting::StopIdle => "stop idle agents",
             Setting::MouseCapture => "take the mouse",
             Setting::CopyOnSelect => "copy on select",
@@ -492,6 +529,35 @@ fn lines(view: &SettingsView, theme: &Theme) -> Vec<Line<'static>> {
         None,
         config.theme.name().to_string(),
         format!("{whose}: ←/→ ({at} of {themes})"),
+    ));
+    let appearance = &config.appearance;
+    let sides = format!(
+        "{} when it's light, {} when dark",
+        theme::for_appearance(config, Appearance::Light).name(),
+        theme::for_appearance(config, Appearance::Dark).name()
+    );
+    lines.push(row(
+        Setting::AutoSwitch,
+        Some(appearance.auto_switch),
+        on_off(appearance.auto_switch),
+        sides,
+    ));
+    let bar = &config.tab_bar;
+    lines.push(row(
+        Setting::TabBar,
+        None,
+        match bar.position {
+            BarPosition::Top => "top",
+            BarPosition::Bottom => "bottom",
+        }
+        .to_string(),
+        "above the panes, or over the footer: ←/→".to_string(),
+    ));
+    lines.push(row(
+        Setting::HideSingleTab,
+        Some(bar.hide_when_single),
+        on_off(bar.hide_when_single),
+        "while there's only the one tab".to_string(),
     ));
     let idle = &config.sessions.stop_idle_after;
     lines.push(row(
@@ -657,6 +723,21 @@ mod tests {
         );
         press(&mut view, KeyCode::Down);
         assert_eq!(
+            press(&mut view, KeyCode::Char(' ')),
+            Outcome::Change(Change::AutoSwitch(true))
+        );
+        press(&mut view, KeyCode::Down);
+        assert_eq!(
+            press(&mut view, KeyCode::Right),
+            Outcome::Change(Change::TabBar(BarPosition::Bottom))
+        );
+        press(&mut view, KeyCode::Down);
+        assert_eq!(
+            press(&mut view, KeyCode::Char(' ')),
+            Outcome::Change(Change::HideSingleTab(true))
+        );
+        press(&mut view, KeyCode::Down);
+        assert_eq!(
             press(&mut view, KeyCode::Right),
             Outcome::Change(Change::StopIdle("15m"))
         );
@@ -701,6 +782,32 @@ mod tests {
             Outcome::Change(Change::Embeddings(false))
         );
         assert_eq!(press(&mut view, KeyCode::Char(',')), Outcome::Close);
+    }
+
+    #[test]
+    fn a_view_taller_than_the_screen_scrolls_to_the_bar() {
+        let theme = Theme::new(ThemeName::DARK, false);
+        let shown = |view: &SettingsView| {
+            let backend = ratatui::backend::TestBackend::new(80, 16);
+            let mut terminal = ratatui::Terminal::new(backend).unwrap();
+            terminal
+                .draw(|frame| draw(frame, view, &theme, frame.area()))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let cells = buffer.content().iter().map(|cell| cell.symbol());
+            cells.collect::<String>()
+        };
+        let mut view = view_of(Config::default(), Some(status()));
+        let top = shown(&view);
+        assert!(top.contains("notifications"), "{top}");
+        assert!(!top.contains("search by meaning"), "{top}");
+        for _ in 0..SETTINGS.len() {
+            press(&mut view, KeyCode::Down);
+        }
+        let bottom = shown(&view);
+        assert!(bottom.contains("search by meaning"), "{bottom}");
+        assert!(bottom.contains("not downloaded"), "{bottom}");
+        assert!(!bottom.contains("notifications"), "{bottom}");
     }
 
     #[test]
@@ -758,7 +865,41 @@ mod tests {
     }
 
     #[test]
+    fn following_the_system_says_which_theme_each_side_is() {
+        let config = Config {
+            theme: ThemeName::find("kanagawa").unwrap(),
+            ..Config::default()
+        };
+        let shown = text(&view_of(config.clone(), None));
+        let row = "○   follow the system   off              \
+                   kanagawa-lotus when it's light, kanagawa when dark";
+        assert!(shown.contains(row), "{shown}");
+        assert!(shown.contains("  tab bar               top"), "{shown}");
+        let mut config = config;
+        config.appearance.auto_switch = true;
+        config.appearance.dark_theme = ThemeName::find("dracula");
+        let shown = text(&view_of(config, None));
+        assert!(shown.contains("●   follow the system   on "), "{shown}");
+        assert!(
+            shown.contains("when it's light, dracula when dark"),
+            "{shown}"
+        );
+    }
+
+    #[test]
     fn a_change_says_where_it_goes_in_the_file() {
+        assert_eq!(
+            Change::AutoSwitch(true).keys(),
+            ["appearance", "auto_switch"]
+        );
+        assert_eq!(
+            Change::TabBar(BarPosition::Bottom).value().as_str(),
+            Some("bottom")
+        );
+        assert_eq!(
+            Change::HideSingleTab(true).keys(),
+            ["tab_bar", "hide_when_single"]
+        );
         assert_eq!(Change::Embeddings(true).keys(), ["memory", "embeddings"]);
         assert_eq!(
             Change::NotifyAfter(30).keys(),

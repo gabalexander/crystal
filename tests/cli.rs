@@ -27,10 +27,13 @@ impl Crystal {
         // off unless a test turns it on, so Claude's arguments stay as each
         // test expects them, and so is naming a session from its prompt, so
         // its name does. So are panes' scrollbars, so a pane's screen is as
-        // wide as the pane, as the tests that count its columns expect.
+        // wide as the pane, as the tests that count its columns expect. A
+        // shell isn't a login shell, which on a Mac it would be, so it starts
+        // the same on every machine.
         crystal.configure(
             "notify = false\nname_from_prompt = false\n\n[plugins]\nmemory = false\n\n\
-             [sound]\nenabled = false\n\n[mouse]\nscrollbars = false\n",
+             [sound]\nenabled = false\n\n[mouse]\nscrollbars = false\n\n\
+             [terminal]\nshell_mode = \"non_login\"\n",
         );
         crystal
     }
@@ -277,6 +280,32 @@ impl Terminal {
             );
             thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    /// Waits until crystal has written `bytes` to this terminal `times`
+    /// times, like a sequence vt100 doesn't keep.
+    fn wrote(&self, bytes: &str, times: usize) {
+        let count = || {
+            let written = self.written.lock().unwrap();
+            let windows = written.windows(bytes.len());
+            windows.filter(|window| *window == bytes.as_bytes()).count()
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while count() < times {
+            assert!(
+                Instant::now() < deadline,
+                "{bytes:?} was written {} times, not {times}",
+                count()
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// The rows of the screen, each as wide as the screen.
+    fn rows(&self) -> Vec<String> {
+        let parser = self.screen.lock().unwrap();
+        let (_, width) = parser.screen().size();
+        parser.screen().rows(0, width).collect()
     }
 
     /// How many times crystal rang this terminal's bell: each BEL that
@@ -1690,7 +1719,8 @@ fn without_mouse_capture_the_terminal_keeps_the_mouse() {
     // Switched on in the settings view, the TUI takes it straight away.
     tui.type_keys(",");
     tui.shows("take the mouse");
-    tui.type_keys("jjjjjj ");
+    // Nine rows down, past the theme's, the appearance's and the tab bar's.
+    tui.type_keys("jjjjjjjjj ");
     eventually("the TUI takes the mouse", || tui.sends_the_mouse());
     assert!(
         std::fs::read_to_string(crystal.config_file())
@@ -3944,6 +3974,156 @@ fn a_daemon_from_before_handovers_is_restarted_cold() {
     );
     older.join().unwrap();
     assert_eq!(crystal.ok(&["ls"]), "");
+}
+
+#[test]
+fn a_session_and_a_shell_split_off_take_the_variables_env_gives() {
+    let crystal = Crystal::new();
+    let script = r#"echo "said $GREETING $EMPTY."; sleep 30"#;
+    let env = ["--env", "GREETING=hello=there", "-e", "EMPTY="];
+    let name = crystal.ok(&[
+        &["new", "-d", "-n", "greeter"][..],
+        &env,
+        &["sh", "-c", script],
+    ]
+    .concat());
+    assert_eq!(name, "greeter\n");
+    shows_on_screen(&crystal, "greeter", "said hello=there .");
+    let said = crystal.fails(&["new", "-d", "--env", "GREETING", "true"]);
+    assert!(said.contains("KEY=VALUE"), "{said}");
+
+    // With no session to show, a split is a new shell's, which says its
+    // name.
+    let split = crystal.ok(&[
+        "pane",
+        "split",
+        "--beside",
+        "greeter",
+        "--env",
+        "PLACE=split",
+    ]);
+    let split = split.trim();
+    let layout = crystal.ok(&["layout"]);
+    assert!(
+        layout.contains(&format!("the selection's: greeter\n      {split}\n")),
+        "{layout}"
+    );
+    crystal.ok(&["send", split, "echo at $PLACE"]);
+    shows_on_screen(&crystal, split, "at split");
+    let said = crystal.fails(&["pane", "split", "greeter", "--env", "A=b"]);
+    assert!(said.contains("cannot be used with"), "{said}");
+}
+
+#[test]
+fn a_new_terminal_runs_the_shell_the_settings_name() {
+    let crystal = Crystal::new();
+    crystal.configure(
+        "notify = false\n\n[plugins]\nmemory = false\n\n\
+         [terminal]\ndefault_shell = \"/bin/sh\"\nshell_mode = \"login\"\n",
+    );
+    crystal.ok(&["new", "-d", "-n", "login"]);
+    let sessions: serde_json::Value = serde_json::from_str(&crystal.ok(&["ls", "--json"])).unwrap();
+    assert_eq!(sessions[0]["command"], serde_json::json!(["/bin/sh", "-l"]));
+}
+
+#[test]
+fn the_tui_titles_its_terminal_after_the_selection_until_told_otherwise() {
+    let crystal = Crystal::new();
+    sessions_saying_here(&crystal, &["alpha"]);
+    let said = crystal.fails(&["title", "set", "nowhere"]);
+    assert!(said.contains("no TUI is running to show it"), "{said}");
+
+    let tui = crystal.tui();
+    // The terminal's own title is kept, for the end.
+    tui.wrote("\x1b[22;0t", 1);
+    tui.wrote("\x1b]2;crystal · alpha\x07", 1);
+    crystal.ok(&["title", "set", "deploying", "now"]);
+    tui.wrote("\x1b]2;deploying now\x07", 1);
+    crystal.ok(&["title", "clear"]);
+    tui.wrote("\x1b]2;crystal · alpha\x07", 2);
+}
+
+#[test]
+fn the_tab_bar_goes_over_the_footer_with_what_the_settings_put_at_its_right() {
+    let crystal = Crystal::new();
+    crystal.configure(
+        "notify = false\n\n[plugins]\nmemory = false\n\n[tab_bar]\nposition = \"bottom\"\n\
+         right = [{ type = \"text\", text = \"prod\" }, \
+         { type = \"command\", command = \"echo; echo $((1 + 1)) up\", every = \"1s\" }]\n",
+    );
+    sessions_saying_here(&crystal, &["alpha"]);
+    let tui = crystal.tui();
+    tui.shows("1 session · prod · 2 up");
+    let rows = tui.rows();
+    assert!(rows[22].starts_with(" crystal   1 "), "{rows:?}");
+    assert!(
+        rows[22].trim_end().ends_with("1 session · prod · 2 up"),
+        "{rows:?}"
+    );
+    assert!(!rows[0].contains("crystal"), "{rows:?}");
+}
+
+#[test]
+fn the_tab_bar_is_left_out_while_there_is_one_tab_when_told() {
+    let crystal = Crystal::new();
+    crystal.configure(
+        "notify = false\n\n[plugins]\nmemory = false\n\n[tab_bar]\nhide_when_single = true\n",
+    );
+    sessions_saying_here(&crystal, &["alpha"]);
+    let mut tui = crystal.tui();
+    sidebar_shows(&tui, "alpha");
+    tui.shows("alpha is here");
+    assert!(!tui.text().contains(" crystal "), "{}", tui.text());
+    tui.type_keys("t");
+    tui.shows(" crystal   1  2 ");
+}
+
+#[test]
+fn the_theme_follows_the_systems_appearance_while_the_tui_runs() {
+    let crystal = Crystal::new();
+    crystal.configure(
+        "notify = false\n\n[plugins]\nmemory = false\n\n[appearance]\nauto_switch = true\n",
+    );
+    // The system, as a Mac's defaults and a Linux desktop's settings say it,
+    // is dark until the file says light.
+    let bin = crystal.dir.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let appearance = crystal.dir.path().join("appearance");
+    std::fs::write(&appearance, "dark").unwrap();
+    let file = appearance.display();
+    script(
+        &bin.join("defaults"),
+        &format!(
+            "if [ \"$(cat {file})\" = dark ]; then echo Dark; \
+             else echo 'The domain/default pair does not exist' >&2; exit 1; fi\n"
+        ),
+    );
+    script(&bin.join("dbus-send"), "exit 1\n");
+    script(
+        &bin.join("gsettings"),
+        &format!(
+            "if [ \"$(cat {file})\" = dark ]; then echo \"'prefer-dark'\"; else echo \"'default'\"; fi\n"
+        ),
+    );
+    let path = path_of(&[&bin]);
+    let env = [
+        ("PATH", path.as_str()),
+        ("SSH_CONNECTION", ""),
+        ("SSH_TTY", ""),
+    ];
+    let tui = crystal.attach_with_env(&[], &env);
+    tui.shows("No sessions yet");
+    // How light the background behind crystal's name is.
+    let brightness = || {
+        let parser = tui.screen.lock().unwrap();
+        match parser.screen().cell(0, 1).map(|cell| cell.bgcolor()) {
+            Some(vt100::Color::Rgb(r, g, b)) => u32::from(r) + u32::from(g) + u32::from(b),
+            other => panic!("the background is {other:?}"),
+        }
+    };
+    assert!(brightness() < 200, "the dark theme");
+    std::fs::write(&appearance, "light").unwrap();
+    eventually("the theme turns light", || brightness() > 600);
 }
 
 #[test]
@@ -9333,7 +9513,6 @@ fn the_settings_view_changes_the_config_and_follows_it_live() {
 
     tui.type_keys(",");
     tui.shows("○ notifications");
-    tui.shows("not downloaded (2449 MB)");
     tui.type_keys(" ");
     tui.shows("● notifications");
     assert!(config().starts_with("notify = true\n"), "{}", config());
@@ -9352,12 +9531,16 @@ fn the_settings_view_changes_the_config_and_follows_it_live() {
     crystal.configure(
         "notify = true\ntheme = \"light\"\n\n[memory]\ndistill = false\nembeddings = false\n",
     );
+    // Memory's rows are nine down from the theme, past the appearance's,
+    // the tab bar's and the mouse's, which the view scrolls to on a screen
+    // too short for all of them.
+    tui.type_keys("jjjjjjjjj");
     tui.shows("○ distill closed tasks");
+    tui.shows("not downloaded (2449 MB)");
 
     // Turned on, search by meaning has the daemon get the models, and the
-    // view follows how that goes: here, a download that fails. It's seven
-    // rows down from the theme, past the mouse's.
-    tui.type_keys("jjjjjjj ");
+    // view follows how that goes: here, a download that fails.
+    tui.type_keys("j ");
     tui.shows("● search by meaning");
     assert!(
         config().contains("[memory]\ndistill = false\nembeddings = true\n"),

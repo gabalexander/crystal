@@ -8,6 +8,7 @@
 //! session list. The loop takes each event, updates the state, and draws.
 
 mod app;
+pub(crate) mod appearance;
 mod archived_view;
 mod away;
 mod backlog_view;
@@ -47,6 +48,7 @@ mod settings_view;
 pub(crate) mod sidebar;
 pub(crate) mod split_tree;
 mod status;
+pub(crate) mod status_bar;
 mod switcher;
 mod tabs;
 mod text_area;
@@ -55,6 +57,7 @@ pub(crate) mod theme;
 mod timeline;
 mod tree_browser;
 mod ui;
+pub(crate) mod window;
 
 use crate::bell::Ringer;
 use crate::config::{self, Config};
@@ -77,6 +80,7 @@ use crate::{catalog, keys, links, socket, typing, update};
 use crate::{client, clipboard, drive, env, event_log, events, git};
 use anyhow::{Context as _, Result, bail};
 use app::{Action, App, Focus, Hit, Place, PluginKey, PluginPane, Slot};
+use appearance::Appearance;
 use backlog_view::BacklogChange;
 use crossterm::event::{
     Event as TerminalEvent, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
@@ -293,6 +297,10 @@ pub enum Event {
     },
     /// What the event log gained while the user was away.
     Away(Result<away::Tally, String>),
+    /// The system's appearance, light or dark, has changed.
+    Appearance(Appearance),
+    /// What each thing at the tab bar's right shows now.
+    Status(Vec<String>),
 }
 
 /// Carries out a layout command with no TUI open, on the tabs as the TUIs
@@ -315,8 +323,23 @@ pub fn run(socket: &Path) -> Result<()> {
     // Asking for the list starts the daemon if it isn't running.
     let sessions = list_sessions(socket, true)?;
 
+    // The terminal is asked about its background, where it's asked, before
+    // anything else reads what it sends.
+    let appearance = config
+        .appearance
+        .auto_switch
+        .then(appearance::at_start)
+        .flatten();
     let (sender, events) = mpsc::channel();
     spawn_input_reader(sender.clone());
+    let follow_appearance = Arc::new(AtomicBool::new(config.appearance.auto_switch));
+    appearance::follow(sender.clone(), follow_appearance.clone(), appearance);
+    let status = status_bar::watch(
+        &config.tab_bar.right,
+        std::env::current_dir().unwrap_or_default(),
+        socket,
+        sender.clone(),
+    );
     let layout = layout_link::Link::open(socket, sender.clone());
     let count_backlog = Arc::new(AtomicBool::new(crate::backlog::enabled(&config)));
     let poll_flows = Arc::new(AtomicBool::new(crate::flows::enabled(&config)));
@@ -354,7 +377,12 @@ pub fn run(socket: &Path) -> Result<()> {
         projects,
         worktree_projects,
         list_worktrees_now,
-        theme: Theme::from_config(&config),
+        theme: Theme::from_config(&config, appearance),
+        appearance,
+        follow_appearance,
+        status,
+        title: None,
+        hostname: window::hostname(),
         started: Instant::now(),
         sessions_asked: Instant::now(),
         searches: Arc::new(AtomicU64::new(0)),
@@ -380,6 +408,7 @@ pub fn run(socket: &Path) -> Result<()> {
     tui.app.set_launch_settings(&config);
     tui.app.set_features(&config);
     tui.app.set_interface(&config);
+    tui.app.set_start_dir(start_dir(&config));
     tui.app.set_plugin_keys(plugin_keys(&config));
     let sidebar = tui
         .ui(db::SIDEBAR)
@@ -430,14 +459,16 @@ impl TerminalModes {
         // old way can't, like Esc or Shift+Enter, and to say which key a
         // shifted one is (1 and 4): a program in a pane that asked for the
         // protocol gets them. A terminal without it ignores the request.
-        // Last, focus (1004): the terminal says when it gains and loses it,
+        // Then focus (1004): the terminal says when it gains and loses it,
         // for "while you were away", and so that layout commands from the
-        // command line go to the TUI the user is at.
+        // command line go to the TUI the user is at. Last, the terminal's
+        // title is saved on its stack, for the TUI's own to go over.
         let mut out = std::io::stdout();
         if mouse {
             out.write_all(MOUSE_ON)?;
         }
         out.write_all(b"\x1b[?2004h\x1b[>5u\x1b[?1004h")?;
+        out.write_all(window::SAVE)?;
         out.flush()?;
         Ok(TerminalModes)
     }
@@ -451,6 +482,7 @@ impl Drop for TerminalModes {
 
 fn modes_off() {
     let mut out = std::io::stdout();
+    let _ = out.write_all(window::RESTORE);
     let _ = out.write_all(b"\x1b[?1004l\x1b[<u\x1b[?2004l");
     let _ = out.write_all(MOUSE_OFF);
     let _ = out.flush();
@@ -520,6 +552,20 @@ struct Tui {
     /// thread to ask git again straight away.
     list_worktrees_now: Arc<AtomicBool>,
     theme: Theme,
+    /// The system's appearance, light or dark, as it was last told, which
+    /// the theme follows when the settings say: see [`appearance`].
+    appearance: Option<Appearance>,
+    /// Whether the thread that asks the system about its appearance asks:
+    /// `[appearance] auto_switch` is on.
+    follow_appearance: Arc<AtomicBool>,
+    /// The threads working out what the tab bar shows at its right, while
+    /// it shows anything.
+    status: Option<status_bar::Watch>,
+    /// The title last given the terminal, `None` while the TUI has given it
+    /// none.
+    title: Option<String>,
+    /// This machine's name, for the title.
+    hostname: String,
     /// When the TUI started: the working mark turns with the time since.
     started: Instant,
     /// When the daemon was asked for the sessions the TUI shows: a list
@@ -616,7 +662,61 @@ impl Tui {
         };
         let overlay = self.overlay.as_ref();
         terminal.draw(|frame| ui::draw(frame, &self.app, &self.panes, overlay, &look))?;
+        self.give_title();
         Ok(())
+    }
+
+    /// Gives the terminal the title `crystal title set` gave, or the one
+    /// the settings make, when it doesn't have it already. With neither,
+    /// a title the TUI gave it is taken back.
+    fn give_title(&mut self) {
+        let template = &self.config.window.title;
+        let title = match self.app.title_override() {
+            Some(text) => text.to_string(),
+            None if template.is_empty() => {
+                if self.title.take().is_some() {
+                    // The terminal's own, and saved again for the end.
+                    self.write_out(&[window::RESTORE, window::SAVE].concat());
+                }
+                return;
+            }
+            None => window::fill(template, &self.title_values()),
+        };
+        if self.title.as_ref() != Some(&title) {
+            self.write_out(&window::set(&title));
+            self.title = Some(title);
+        }
+    }
+
+    /// What the title's tokens are filled with.
+    fn title_values(&self) -> window::Values {
+        let selected = self.app.selected();
+        let worktree = selected.and_then(|session| session.worktree.as_ref());
+        let tab = self.app.tabs().current();
+        let number = self.app.tabs().current_index() + 1;
+        let title = selected.and_then(|session| {
+            let pane = self.panes.iter().find(|pane| pane.session_id == session.id);
+            pane.map(|pane| pane.screen.title())
+        });
+        window::Values {
+            hostname: self.hostname.clone(),
+            session: selected.map_or_else(String::new, |session| session.name.clone()),
+            project: worktree.map_or_else(String::new, |worktree| worktree.project.clone()),
+            branch: worktree
+                .and_then(|worktree| worktree.branch.clone())
+                .unwrap_or_default(),
+            tab: match tab.name.is_empty() {
+                true => number.to_string(),
+                false => tab.name.clone(),
+            },
+            title: title.unwrap_or_default(),
+        }
+    }
+
+    /// Writes `bytes` to the terminal, between draws.
+    fn write_out(&self, bytes: &[u8]) {
+        let mut out = std::io::stdout();
+        let _ = out.write_all(bytes).and_then(|()| out.flush());
     }
 
     /// Takes in `event`, and says whether that may have changed what's
@@ -1070,6 +1170,13 @@ impl Tui {
             Event::Logged { feed, event } if self.following(feed) => self.app.logged(*event),
             // Read for a timeline that has closed since.
             Event::EventsRead { .. } | Event::Logged { .. } => {}
+            Event::Appearance(appearance) => {
+                if Some(appearance) != self.appearance {
+                    self.appearance = Some(appearance);
+                    self.theme = Theme::from_config(&self.config, self.appearance);
+                }
+            }
+            Event::Status(status) => self.app.set_status(status),
             Event::Away(Ok(tally)) => self.app.set_away(&tally),
             Event::Away(Err(reason)) => {
                 self.app
@@ -1567,8 +1674,19 @@ impl Tui {
             }
             Action::CloseSettings => self.poll_settings.store(false, Ordering::Relaxed),
             Action::ChangeSetting(change) => {
-                let changed = config::set(&config::path(), change.keys(), change.value())
-                    .and_then(|()| Config::load());
+                let path = config::path();
+                let mut changed = config::set(&path, change.keys(), change.value());
+                // A theme picked by hand is the one wanted, whatever the
+                // system's appearance.
+                let stop_following = settings_view::Change::AutoSwitch(false);
+                if let settings_view::Change::Theme(_) = change
+                    && self.config.appearance.auto_switch
+                {
+                    changed = changed.and_then(|()| {
+                        config::set(&path, stop_following.keys(), stop_following.value())
+                    });
+                }
+                let changed = changed.and_then(|()| Config::load());
                 match changed {
                     Ok(config) => {
                         self.config_changed(&config);
@@ -2027,9 +2145,24 @@ impl Tui {
         if *config == self.config {
             return;
         }
-        if config.theme != self.config.theme || config.colors != self.config.colors {
-            self.theme = Theme::from_config(config);
+        if config.theme != self.config.theme
+            || config.colors != self.config.colors
+            || config.appearance != self.config.appearance
+        {
+            self.theme = Theme::from_config(config, self.appearance);
         }
+        let follow = config.appearance.auto_switch;
+        self.follow_appearance.store(follow, Ordering::Relaxed);
+        if config.tab_bar.right != self.config.tab_bar.right {
+            // The old threads stop as their watch goes.
+            self.status = status_bar::watch(
+                &config.tab_bar.right,
+                std::env::current_dir().unwrap_or_default(),
+                &self.socket,
+                self.events.clone(),
+            );
+        }
+        self.app.set_start_dir(start_dir(config));
         crate::vt::set_history_lines(config.scrollback_lines);
         if config.mouse.capture != self.config.mouse.capture {
             capture_mouse(config.mouse.capture);
@@ -2439,6 +2572,16 @@ fn placed(context: Context) -> Result<Context> {
         return Ok(context);
     }
     Ok(Context::of_dir(&std::env::current_dir()?))
+}
+
+/// Where `config` has a new tab's shell start, and a session started with
+/// none selected: `None` to follow the selection.
+fn start_dir(config: &Config) -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_default();
+    let current = std::env::current_dir().unwrap_or_default();
+    config.terminal.start_dir(&home, &current)
 }
 
 /// `base`, or `base-2`, `base-3`, …, whichever no session has yet.
