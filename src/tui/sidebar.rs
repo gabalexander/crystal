@@ -849,8 +849,12 @@ fn marked_spans<'a>(
 }
 
 /// How long ago the session changed, or nothing from a daemon that
-/// doesn't say.
+/// doesn't say. One yet to start again after a restart, or that couldn't,
+/// says that instead.
 fn changed_ago(session: &SessionInfo, now: u64) -> String {
+    if session.state.is_unstarted() {
+        return session.state.to_string();
+    }
     if session.changed == 0 {
         return String::new();
     }
@@ -945,6 +949,20 @@ mod tests {
             subagents: 0,
             bell: false,
         }
+    }
+
+    #[test]
+    fn a_session_yet_to_start_again_says_so_in_place_of_when() {
+        use crate::protocol::State;
+        let mut fixer = session("fixer", claude());
+        fixer.changed = 100;
+        assert_eq!(changed_ago(&fixer, 160), "1m");
+        fixer.state = State::Starting;
+        assert_eq!(changed_ago(&fixer, 160), "starting");
+        fixer.state = State::Failed {
+            why: "command not found: claude".into(),
+        };
+        assert_eq!(changed_ago(&fixer, 160), "couldn't start");
     }
 
     /// What a session's task line says, after its indent.

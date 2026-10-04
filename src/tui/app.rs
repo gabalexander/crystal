@@ -31,6 +31,7 @@ use super::preview::Content;
 use super::profiles::{self, ProfilesView};
 use super::pull_requests::{self, PullRequestsView};
 use super::reply::ReplyBox;
+use super::restarted::{Restarted, Restarts};
 use super::review;
 use super::search::{self, Around, StatusFilter};
 use super::settings_view::{self, SettingsView};
@@ -43,7 +44,7 @@ use super::timeline::{self, TimelineView};
 use super::tree_browser::TreeBrowser;
 use crate::catalog::{self, Agent};
 use crate::client::Purpose;
-use crate::config::{Config, Fold, SIDEBAR_WIDTHS};
+use crate::config::{BarPosition, Config, Fold, MouseSettings, SIDEBAR_WIDTHS, TabBarSettings};
 use crate::events::Event;
 use crate::flow_run::{FlowRun, RunState};
 use crate::flows::{self, Flow};
@@ -102,6 +103,9 @@ pub enum Hit {
         slot: Slot,
         cell: Option<(u16, u16)>,
     },
+    /// The scrollbar beside the screen of the pane at `slot`: `row` of it,
+    /// counted from 0 at the screen's top row.
+    Scrollbar { slot: Slot, row: u16 },
     /// The border between the two sides of a split of the tab's panes: the
     /// rule between panes side by side, or, beside the name on it, the
     /// header line of a pane below another. `split` counts the splits in
@@ -461,6 +465,21 @@ pub enum Action {
     /// The mouse let go: put what it selected in the pane at this slot on
     /// the clipboard.
     CopySelection(Slot),
+    /// The mouse let go, and what it selected is copied with copy mode's
+    /// keys: copy mode comes on in the pane at this slot, if anything was
+    /// selected, the selection kept.
+    HoldSelection(Slot),
+    /// The mouse went down on `row` of the scrollbar of the pane at
+    /// `slot`: it takes the thumb there, or the thumb jumps there.
+    GrabThumb {
+        slot: Slot,
+        row: u16,
+    },
+    /// The mouse dragged the thumb it took to `row` of the scrollbar.
+    DragThumb {
+        slot: Slot,
+        row: u16,
+    },
     /// Open `topic`, of the project at `project`, in the browser.
     OpenInBrowser {
         project: PathBuf,
@@ -692,7 +711,7 @@ pub enum Found {
 }
 
 /// How many pull requests and issues are open on a project's forge, for
-/// the top bar: each `None` until its forge has listed them.
+/// the tab bar: each `None` until its forge has listed them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OpenOnForge {
     pub forge: Forge,
@@ -792,6 +811,12 @@ pub struct App {
     /// The pane a drag of the mouse started in, while the button is down:
     /// the drag is a selection in that pane to the end, wherever it goes.
     dragging: Option<Slot>,
+    /// The pane whose scrollbar's thumb the mouse took, while the button
+    /// is down: the thumb follows it, wherever it goes.
+    holding_thumb: Option<Slot>,
+    /// The pane the keyboard was typing into when the mouse put it in copy
+    /// mode, to go back to when copy mode is over.
+    copied_from: Option<Slot>,
     /// The pane taken by its header line, while the button is down, and
     /// the pane the mouse is over now: letting go there swaps the two.
     grabbed: Option<Grab>,
@@ -819,7 +844,7 @@ pub struct App {
     /// What its forge said about each project's open issues, the same way.
     open_issues: HashMap<PathBuf, Result<(Forge, Vec<Issue>), String>>,
     /// Whether draft pull requests are left out of the pull requests view,
-    /// the top bar's count and `/`, as the settings say.
+    /// the tab bar's count and `/`, as the settings say.
     hide_draft_prs: bool,
     /// The issues view, while it's open.
     issues: Option<IssuesView>,
@@ -887,6 +912,11 @@ pub struct App {
     /// Whether the footer says what happened while the user was away: until
     /// the next key.
     away_shown: bool,
+    /// What the TUI has seen of sessions starting again after a restart.
+    restarts: Restarts,
+    /// The footer's line on what a restart brought back and what it
+    /// couldn't, until the next key.
+    restarted: Option<Restarted>,
     /// Which command each sidebar key runs, the prefix and the key that
     /// hands the keyboard back: see [`super::keymap`].
     keymap: Keymap,
@@ -906,6 +936,30 @@ pub struct App {
     pin_needs_you: bool,
     /// Whether the sidebar's edge is being dragged with the mouse.
     dragging_sidebar: bool,
+    /// Where the tab bar goes and what it shows at its right.
+    tab_bar: TabBar,
+    /// What the terminal's title says in place of `[window] title`, as
+    /// `crystal title set` gave it, until `crystal title clear`.
+    title_override: Option<String>,
+    /// Where a new tab's shell starts, and a session started with none
+    /// selected: `None` follows the selection. See
+    /// [`crate::config::NewCwd`].
+    start_dir: Option<PathBuf>,
+    /// What the mouse does, as the config has it.
+    mouse: MouseSettings,
+}
+
+/// The tab bar as the settings have it, and what its right shows.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TabBar {
+    pub position: BarPosition,
+    /// Left out while there's only one tab.
+    pub hide_when_single: bool,
+    /// What goes between two things at its right.
+    pub separator: String,
+    /// What each of `[tab_bar] right` shows, as it was last worked out:
+    /// see [`super::status_bar`].
+    pub status: Vec<String>,
 }
 
 /// How wide the sidebar is and whether it's folded, as the user left it,
@@ -969,6 +1023,8 @@ impl App {
             focus: Focus::Sidebar,
             last_pane: None,
             dragging: None,
+            holding_thumb: None,
+            copied_from: None,
             grabbed: None,
             link_hover: None,
             own_id,
@@ -1007,6 +1063,8 @@ impl App {
             needs_you: None,
             away: None,
             away_shown: false,
+            restarts: Restarts::default(),
+            restarted: None,
             keymap: Keymap::default(),
             prefixed: false,
             command_list: None,
@@ -1015,6 +1073,13 @@ impl App {
             fold: Fold::Marks,
             pin_needs_you: true,
             dragging_sidebar: false,
+            tab_bar: TabBar {
+                separator: TabBarSettings::default().separator,
+                ..TabBar::default()
+            },
+            title_override: None,
+            start_dir: None,
+            mouse: MouseSettings::default(),
         }
     }
 
@@ -1030,6 +1095,49 @@ impl App {
         }
         self.fold = settings.fold;
         self.pin_needs_you = settings.needs_you;
+        self.mouse = config.mouse.clone();
+        let bar = &config.tab_bar;
+        self.tab_bar.position = bar.position;
+        self.tab_bar.hide_when_single = bar.hide_when_single;
+        self.tab_bar.separator = bar.separator.clone();
+        // What's shown follows the entries: a line for each, once it's
+        // worked out.
+        if bar.right.len() != self.tab_bar.status.len() {
+            self.tab_bar.status = vec![String::new(); bar.right.len()];
+        }
+    }
+
+    /// The tab bar's settings, and what its right shows.
+    pub fn tab_bar(&self) -> &TabBar {
+        &self.tab_bar
+    }
+
+    /// Whether the tab bar is drawn: unless it's left out while there's
+    /// only one tab, and there is.
+    pub fn tab_bar_shown(&self) -> bool {
+        !(self.tab_bar.hide_when_single && self.tabs.all().len() == 1)
+    }
+
+    /// Takes what each thing at the tab bar's right shows now.
+    pub fn set_status(&mut self, status: Vec<String>) {
+        self.tab_bar.status = status;
+    }
+
+    /// What `crystal title set` gave the terminal's title, until `crystal
+    /// title clear`.
+    pub fn title_override(&self) -> Option<&str> {
+        self.title_override.as_deref()
+    }
+
+    /// Takes where a new tab's shell starts, and a session started with
+    /// none selected: `None` to follow the selection.
+    pub fn set_start_dir(&mut self, dir: Option<PathBuf>) {
+        self.start_dir = dir;
+    }
+
+    /// Whether each pane has a scrollbar beside its screen.
+    pub fn scrollbars(&self) -> bool {
+        self.mouse.scrollbars
     }
 
     /// Takes the sidebar's shape the TUI kept, and whether the config has it
@@ -1599,6 +1707,12 @@ impl App {
     pub fn away_line(&self) -> Option<&str> {
         let away = self.away.as_ref().filter(|_| self.away_shown)?;
         Some(&away.line)
+    }
+
+    /// The footer's line on what a restart brought back and what it
+    /// couldn't, until the next key.
+    pub fn restarted(&self) -> Option<&Restarted> {
+        self.restarted.as_ref()
     }
 
     /// Takes what the event log gained while the user was away. When
@@ -2352,7 +2466,7 @@ impl App {
     }
 
     /// Takes the open issues its forge listed for the project at
-    /// `project`, for the top bar's count and the issues view, if it's
+    /// `project`, for the tab bar's count and the issues view, if it's
     /// open on that project.
     pub fn set_issues(&mut self, project: &Path, found: Result<(Forge, Vec<Issue>), String>) {
         if let Some(view) = self.issues.as_mut().filter(|view| view.project == project) {
@@ -2362,7 +2476,7 @@ impl App {
     }
 
     /// How many pull requests and issues are open on the forge of the
-    /// selected session's project, for the top bar: the pull requests
+    /// selected session's project, for the tab bar: the pull requests
     /// without the drafts while they're hidden, and each once its forge
     /// has listed them.
     pub fn open_on_forge(&self) -> Option<OpenOnForge> {
@@ -2621,6 +2735,11 @@ impl App {
         self.dragging
     }
 
+    /// The pane whose scrollbar's thumb the mouse holds, while it does.
+    pub fn holding_thumb(&self) -> Option<Slot> {
+        self.holding_thumb
+    }
+
     /// The pane being moved by its header line, while the button is down.
     pub fn grabbed(&self) -> Option<Grab> {
         self.grabbed
@@ -2783,6 +2902,9 @@ impl App {
                 self.tabs.renamed(&was.name, &now.name);
             }
         }
+        if let Some(restarted) = self.restarts.take(&sessions) {
+            self.restarted = Some(restarted);
+        }
         let before = self.sessions.get(self.selected).cloned();
         let on_a_session = self.on_worktree.is_none();
         self.sessions = groups::order(sessions, self.shown_flows());
@@ -2928,6 +3050,7 @@ impl App {
     fn take_key(&mut self, key: KeyEvent) -> Option<Action> {
         self.notice = None;
         self.away_shown = false;
+        self.restarted = None;
         // The prefix is for the very next key, wherever it goes.
         let prefixed = std::mem::take(&mut self.prefixed);
         // A plugin's pane is over everything, and has every key but the one
@@ -3050,8 +3173,9 @@ impl App {
 
     /// What the mouse does, when no program in a pane has taken it: a click
     /// selects a session or hands a pane the keyboard, a drag moves a
-    /// border between panes, and the wheel moves the selection, or scrolls
-    /// a pane through its history.
+    /// border between panes, selects in a pane or moves its scrollbar's
+    /// thumb, and the wheel moves the selection, or scrolls a pane through
+    /// its history.
     pub fn on_mouse(&mut self, kind: MouseEventKind, hit: Hit) -> Option<Action> {
         let action = self.take_mouse(kind, hit);
         self.remember_shown();
@@ -3134,11 +3258,33 @@ impl App {
                 }
                 (MouseEventKind::Up(_), _) => {
                     self.dragging = None;
-                    return Some(Action::CopySelection(slot));
+                    if self.mouse.copy_on_select {
+                        return Some(Action::CopySelection(slot));
+                    }
+                    return Some(Action::HoldSelection(slot));
                 }
+                // The wheel scrolls the pane meanwhile, and the selection
+                // goes on with it.
+                (MouseEventKind::ScrollUp, _) => return Some(Action::ScrollBack(slot)),
+                (MouseEventKind::ScrollDown, _) => return Some(Action::ScrollForward(slot)),
                 // The button came up somewhere nothing heard it: this is a
                 // new click.
                 (MouseEventKind::Down(_), _) => self.dragging = None,
+                _ => return None,
+            }
+        }
+        // A scrollbar's thumb taken by the mouse follows it until the
+        // button comes up.
+        if let Some(slot) = self.holding_thumb {
+            match (kind, hit) {
+                (MouseEventKind::Drag(_), Hit::Scrollbar { slot: at, row }) if at == slot => {
+                    return Some(Action::DragThumb { slot, row });
+                }
+                (MouseEventKind::Up(_), _) => {
+                    self.holding_thumb = None;
+                    return None;
+                }
+                (MouseEventKind::Down(_), _) => self.holding_thumb = None,
                 _ => return None,
             }
         }
@@ -3197,16 +3343,22 @@ impl App {
                     return Some(Action::SelectFrom { slot, cell });
                 }
             }
+            // A scrollbar takes the click as it is, the keyboard staying
+            // where it was.
+            (_, Hit::Scrollbar { slot, row }) if click && self.shows_screen(slot) => {
+                self.holding_thumb = Some(slot);
+                return Some(Action::GrabThumb { slot, row });
+            }
             (MouseEventKind::ScrollUp, Hit::SidebarRow(_) | Hit::Sidebar) => {
                 self.move_selection(-1);
             }
             (MouseEventKind::ScrollDown, Hit::SidebarRow(_) | Hit::Sidebar) => {
                 self.move_selection(1);
             }
-            (MouseEventKind::ScrollUp, Hit::Pane { slot, .. }) => {
+            (MouseEventKind::ScrollUp, Hit::Pane { slot, .. } | Hit::Scrollbar { slot, .. }) => {
                 return Some(Action::ScrollBack(slot));
             }
-            (MouseEventKind::ScrollDown, Hit::Pane { slot, .. }) => {
+            (MouseEventKind::ScrollDown, Hit::Pane { slot, .. } | Hit::Scrollbar { slot, .. }) => {
                 return Some(Action::ScrollForward(slot));
             }
             _ => {}
@@ -3234,7 +3386,7 @@ impl App {
                 self.go_to_tab(index);
                 tab_menu()
             }
-            Hit::Pane { slot, .. } => {
+            Hit::Pane { slot, .. } | Hit::Scrollbar { slot, .. } => {
                 let name = self.pane_session(slot)?.name.clone();
                 self.select(&name);
                 self.session_menu(true)?
@@ -4664,9 +4816,15 @@ impl App {
                 dir: Some(session.cwd.clone()),
                 label: shell::home_relative(&session.cwd),
             },
-            (None, None) => Target::Here {
-                dir: None,
-                label: "this directory".to_string(),
+            (None, None) => match &self.start_dir {
+                Some(dir) => Target::Here {
+                    dir: Some(dir.clone()),
+                    label: shell::home_relative(dir),
+                },
+                None => Target::Here {
+                    dir: None,
+                    label: "this directory".to_string(),
+                },
             },
         };
         let mut targets = vec![
@@ -5025,6 +5183,7 @@ impl App {
             return;
         };
         if self.shows_screen(slot) {
+            self.copied_from = None;
             self.focus = Focus::Copy(slot);
         } else if self.selected_is_own() {
             self.notify("crystal can't show the session it runs in".into());
@@ -5048,11 +5207,25 @@ impl App {
         Some(Action::EditHistory { slot, dir, name })
     }
 
-    /// Copy mode is over: the keyboard goes back to the sidebar it came
-    /// from.
+    /// What the mouse selected in the pane at `slot` is kept to be copied
+    /// with copy mode's keys: copy mode has the keyboard there, to give it
+    /// back to the pane it was typing into, if it was, when it's over.
+    pub fn hold_selection(&mut self, slot: Slot) {
+        if !self.shows_screen(slot) || self.focus == Focus::Copy(slot) {
+            return;
+        }
+        self.copied_from = (self.focus == Focus::Pane(slot)).then_some(slot);
+        self.focus = Focus::Copy(slot);
+    }
+
+    /// Copy mode is over: the keyboard goes back to where it came from,
+    /// the sidebar, or the pane the mouse took it from.
     pub fn stop_copying(&mut self) {
         if let Focus::Copy(_) = self.focus {
-            self.focus = Focus::Sidebar;
+            self.focus = match self.copied_from.take() {
+                Some(slot) if self.can_type_into(slot) => Focus::Pane(slot),
+                _ => Focus::Sidebar,
+            };
         }
     }
 
@@ -5329,6 +5502,8 @@ impl App {
         };
         let last_pane = self.last_pane.and_then(moved);
         let dragging = self.dragging.and_then(moved);
+        let holding_thumb = self.holding_thumb.and_then(moved);
+        let copied_from = self.copied_from.and_then(moved);
         let grabbed = self.grabbed.and_then(|grab| {
             let from = moved(grab.from)?;
             let over = grab.over.and_then(moved);
@@ -5337,6 +5512,8 @@ impl App {
         self.focus = focus;
         self.last_pane = last_pane;
         self.dragging = dragging;
+        self.holding_thumb = holding_thumb;
+        self.copied_from = copied_from;
         self.grabbed = grabbed;
     }
 
@@ -5345,7 +5522,8 @@ impl App {
     /// start new work, and a shell is where that starts.
     fn new_tab(&mut self) -> Option<Action> {
         let index = self.tabs.add();
-        let dir = self.selected().map(|session| session.cwd.clone());
+        let followed = self.selected().map(|session| session.cwd.clone());
+        let dir = self.start_dir.clone().or(followed);
         self.go_to_tab(index);
         Some(Action::Start {
             place: Place::Directory(dir),
@@ -5999,6 +6177,39 @@ mod tests {
     }
 
     #[test]
+    fn what_a_restart_brought_back_is_said_until_the_next_key_and_kept_in_its_place() {
+        let starting = |name: &str| SessionInfo {
+            state: State::Starting,
+            ..session(name)
+        };
+        let mut app = App::new(None);
+        app.set_sessions(vec![session("api"), starting("docs"), starting("web")]);
+        app.select("docs");
+        assert_eq!(app.restarted(), None);
+        let failed = SessionInfo {
+            state: State::Failed {
+                why: "its directory, ~/web, isn't there".into(),
+            },
+            ..session("web")
+        };
+        app.set_sessions(vec![session("api"), session("docs"), failed]);
+        let said = app.restarted().unwrap();
+        assert_eq!(
+            said.line,
+            "after the restart: 1 session back · 1 couldn't start: web"
+        );
+        assert!(said.failed);
+        // Each kept its place, and the selection stayed on its session.
+        assert_eq!(selected_name(&app), Some("docs"));
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.restarted(), None);
+        // Enter on the one that couldn't start offers to start it again.
+        assert_eq!(selected_name(&app), Some("web"));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.confirm(), Some(&Confirm::Respawn("web".into())));
+    }
+
+    #[test]
     fn sessions_waiting_on_the_user_come_first() {
         let mut waiting = session("asks");
         waiting.activity = Some(Activity::Waiting);
@@ -6265,6 +6476,29 @@ mod tests {
         assert_eq!(
             press(&mut app, KeyCode::Enter),
             start(Place::Directory(None), &[], "")
+        );
+    }
+
+    #[test]
+    fn with_nothing_selected_the_panel_starts_where_the_settings_say() {
+        let mut app = App::new(None);
+        app.set_start_dir(Some(PathBuf::from("/home/ann/code")));
+        press(&mut app, KeyCode::Char('n'));
+        assert_eq!(
+            press(&mut app, KeyCode::Enter),
+            start(
+                Place::Directory(Some(PathBuf::from("/home/ann/code"))),
+                &[],
+                ""
+            )
+        );
+        // A session selected is still where the panel starts.
+        let mut app = with_agents(&[], vec![in_project("agent", "app")]);
+        app.set_start_dir(Some(PathBuf::from("/home/ann/code")));
+        press(&mut app, KeyCode::Char('n'));
+        assert_eq!(
+            press(&mut app, KeyCode::Enter),
+            start(Place::Directory(Some(PathBuf::from("/code/app"))), &[], "")
         );
     }
 
@@ -8076,6 +8310,90 @@ mod tests {
     }
 
     #[test]
+    fn without_copy_on_select_letting_go_holds_the_selection_in_copy_mode() {
+        let mut app = app_with_splits(&["a", "b"], 1);
+        let config = crate::config::from_text("[mouse]\ncopy_on_select = false").unwrap();
+        app.set_interface(&config);
+        let in_split = Hit::Pane {
+            slot: Slot::Split(0),
+            cell: Some((2, 3)),
+        };
+        app.on_mouse(MouseEventKind::Down(MouseButton::Left), in_split);
+        assert_eq!(app.focus(), Focus::Pane(Slot::Split(0)));
+        assert_eq!(
+            app.on_mouse(MouseEventKind::Up(MouseButton::Left), in_split),
+            Some(Action::HoldSelection(Slot::Split(0)))
+        );
+        // With something selected, copy mode takes the keyboard, and gives
+        // it back to the pane it was typing into when it's over.
+        app.hold_selection(Slot::Split(0));
+        assert_eq!(app.focus(), Focus::Copy(Slot::Split(0)));
+        app.stop_copying();
+        assert_eq!(app.focus(), Focus::Pane(Slot::Split(0)));
+        // From the sidebar, it goes back there.
+        app.focus = Focus::Sidebar;
+        app.hold_selection(Slot::Split(0));
+        app.stop_copying();
+        assert_eq!(app.focus(), Focus::Sidebar);
+    }
+
+    #[test]
+    fn the_wheel_scrolls_the_pane_a_drag_is_selecting_in() {
+        let mut app = app_with_splits(&["a", "b"], 1);
+        let in_split = Hit::Pane {
+            slot: Slot::Split(0),
+            cell: Some((2, 3)),
+        };
+        app.on_mouse(MouseEventKind::Down(MouseButton::Left), in_split);
+        // Wherever the mouse is, the wheel is the drag's pane's.
+        assert_eq!(
+            app.on_mouse(MouseEventKind::ScrollUp, Hit::Sidebar),
+            Some(Action::ScrollBack(Slot::Split(0)))
+        );
+        assert_eq!(
+            app.on_mouse(MouseEventKind::ScrollDown, in_split),
+            Some(Action::ScrollForward(Slot::Split(0)))
+        );
+        assert_eq!(app.dragging(), Some(Slot::Split(0)));
+    }
+
+    #[test]
+    fn a_scrollbars_thumb_follows_the_mouse_until_it_lets_go() {
+        let mut app = app_with_splits(&["a", "b"], 1);
+        let bar = |row| Hit::Scrollbar {
+            slot: Slot::Split(0),
+            row,
+        };
+        let slot = Slot::Split(0);
+        assert_eq!(
+            app.on_mouse(MouseEventKind::Down(MouseButton::Left), bar(4)),
+            Some(Action::GrabThumb { slot, row: 4 })
+        );
+        // The keyboard stays where it was.
+        assert_eq!(app.focus(), Focus::Sidebar);
+        assert_eq!(app.holding_thumb(), Some(slot));
+        let drag = MouseEventKind::Drag(MouseButton::Left);
+        assert_eq!(
+            app.on_mouse(drag, bar(9)),
+            Some(Action::DragThumb { slot, row: 9 })
+        );
+        assert_eq!(app.on_mouse(drag, Hit::Sidebar), None);
+        assert_eq!(
+            app.on_mouse(MouseEventKind::Up(MouseButton::Left), Hit::Sidebar),
+            None
+        );
+        assert_eq!(app.holding_thumb(), None);
+        // The wheel over it scrolls the pane, as over its screen, and a
+        // right click opens the pane's menu.
+        assert_eq!(
+            app.on_mouse(MouseEventKind::ScrollUp, bar(0)),
+            Some(Action::ScrollBack(slot))
+        );
+        app.right_click(bar(0), (79, 2));
+        assert!(app.menu().is_some());
+    }
+
+    #[test]
     fn with_ctrl_held_the_mouse_over_a_pane_marks_where_to_look_for_a_link() {
         let mut app = app_with_splits(&["a", "b"], 1);
         let over = |cell| Hit::Pane {
@@ -8208,6 +8526,32 @@ mod tests {
         assert_eq!(app.tabs().current_index(), 1);
         assert!(in_sidebar(&app).is_empty());
         assert!(app.selected().is_none());
+    }
+
+    #[test]
+    fn t_starts_its_shell_where_the_settings_say_when_they_do() {
+        let mut app = App::new(None);
+        app.set_sessions(vec![SessionInfo {
+            cwd: PathBuf::from("/code/b"),
+            ..session("b")
+        }]);
+        app.select("b");
+        app.set_start_dir(Some(PathBuf::from("/home/ann")));
+        let Some(Action::Start { place, .. }) = press(&mut app, KeyCode::Char('t')) else {
+            panic!("t starts a shell");
+        };
+        assert_eq!(place, Place::Directory(Some(PathBuf::from("/home/ann"))));
+    }
+
+    #[test]
+    fn the_tab_bar_is_left_out_with_one_tab_only_when_told() {
+        let mut app = App::new(None);
+        assert!(app.tab_bar_shown());
+        let config = crate::config::from_text("[tab_bar]\nhide_when_single = true\n").unwrap();
+        app.set_interface(&config);
+        assert!(!app.tab_bar_shown());
+        press(&mut app, KeyCode::Char('t'));
+        assert!(app.tab_bar_shown());
     }
 
     #[test]
@@ -9747,13 +10091,14 @@ gate = true
         });
         // `x` would kill the session from the sidebar; here it's nothing.
         assert_eq!(press(&mut app, KeyCode::Char('x')), None);
-        for _ in 0..7 {
+        // The bar stops at the last.
+        for _ in 0..30 {
             press(&mut app, KeyCode::Char('j'));
         }
         assert_eq!(
             press(&mut app, KeyCode::Char(' ')),
-            Some(Action::ChangeSetting(settings_view::Change::Embeddings(
-                false
+            Some(Action::ChangeSetting(settings_view::Change::HideDrafts(
+                true
             )))
         );
         app.setting_failed("the file is read-only".into());

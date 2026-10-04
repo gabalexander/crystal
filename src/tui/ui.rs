@@ -27,7 +27,9 @@ use super::plugins_view;
 use super::profiles;
 use super::pull_requests;
 use super::reply;
+use super::restarted::Restarted;
 use super::screen_widget::{Marks, ScreenWidget};
+use super::scrollbar;
 use super::settings_view;
 use super::sidebar::{self, fit};
 use super::split_tree::{Border, Way};
@@ -37,6 +39,7 @@ use super::tabs::Tab;
 use super::theme::Theme;
 use super::timeline;
 use super::tree_browser;
+use crate::config::BarPosition;
 use crate::flow_run::RunState;
 use crate::protocol::{SessionInfo, State, TaskState};
 use crate::shell;
@@ -56,10 +59,6 @@ const SUMMARY_ROOM: u16 = 26;
 /// The longest a tab's name gets in the top bar.
 const TAB_NAME_LENGTH: usize = 16;
 
-/// The columns the tabs keep however much the top bar has to say: the
-/// forge's counts give way first.
-const TABS_LEAST: u16 = 16;
-
 /// What drawing needs besides the state.
 pub struct Look<'a> {
     pub theme: &'a Theme,
@@ -72,9 +71,11 @@ pub struct Look<'a> {
 
 /// Where each part of the TUI goes on a screen of a given size.
 pub struct Areas {
+    /// The tab bar: the top row, or the one over the footer, or no row at
+    /// all while it's left out.
     pub top: Rect,
-    /// Everything between the top bar and the footer: where an open view
-    /// goes, in place of the sidebar and the panes.
+    /// Everything but the tab bar and the footer: where an open view goes,
+    /// in place of the sidebar and the panes.
     pub main: Rect,
     pub sidebar: Rect,
     /// The column with the rule between the sidebar and the panes.
@@ -92,10 +93,10 @@ pub struct Areas {
 
 impl Areas {
     /// Lays out a screen the way `app` has it: its panes split as the tab's
-    /// tree has them, or zoomed, one pane taking everything between the top
-    /// bar and the footer, the sidebar and its rule with no room.
+    /// tree has them, or zoomed, one pane taking everything but the tab bar
+    /// and the footer, the sidebar and its rule with no room.
     pub fn of(app: &App, screen: Rect) -> Areas {
-        let [top, main, footer] = rows(screen);
+        let [top, main, footer] = rows(app, screen);
         // A sidebar folded away has no rule either.
         let sidebar_width = app.sidebar_columns(screen.width);
         let [sidebar, rule, tiles] = Layout::horizontal([
@@ -164,14 +165,18 @@ fn float_frame(areas: &Areas) -> Rect {
     )
 }
 
-/// The top bar, everything between, and the footer.
-fn rows(screen: Rect) -> [Rect; 3] {
-    Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Min(0),
-        Constraint::Length(1),
-    ])
-    .areas(screen)
+/// The tab bar, everything else, and the footer: the bar on top or over
+/// the footer, as the settings say, and with no row while it's left out.
+fn rows(app: &App, screen: Rect) -> [Rect; 3] {
+    let bar = Constraint::Length(u16::from(app.tab_bar_shown()));
+    let (main, footer) = (Constraint::Min(0), Constraint::Length(1));
+    match app.tab_bar().position {
+        BarPosition::Top => Layout::vertical([bar, main, footer]).areas(screen),
+        BarPosition::Bottom => {
+            let [main, bar, footer] = Layout::vertical([main, bar, footer]).areas(screen);
+            [bar, main, footer]
+        }
+    }
 }
 
 /// Where an open view's parts go: a header line across the top, then its
@@ -258,11 +263,36 @@ pub fn view_header<'a>(
 }
 
 /// Where a pane's session's screen goes: all of the pane below its header
-/// line. The session is sized to fit it exactly.
-pub fn screen_area(pane: Rect) -> Rect {
+/// line, but for the column on its right its scrollbar takes, with
+/// `scrollbars` on. The session is sized to fit it exactly.
+pub fn screen_area(pane: Rect, scrollbars: bool) -> Rect {
     let [_header, screen] =
         Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(pane);
-    screen
+    match scrollbar_area(pane, scrollbars) {
+        Some(_) => Rect {
+            width: screen.width - 1,
+            ..screen
+        },
+        None => screen,
+    }
+}
+
+/// The narrowest a pane is to have a scrollbar beside its screen.
+const SCROLLBAR_FROM: u16 = 8;
+
+/// Where a pane's scrollbar goes, with `scrollbars` on: the column on its
+/// right, beside its screen. A pane too narrow to spare one has none.
+pub fn scrollbar_area(pane: Rect, scrollbars: bool) -> Option<Rect> {
+    if !scrollbars || pane.width < SCROLLBAR_FROM || pane.height < 2 {
+        return None;
+    }
+    Some(Rect::new(pane.right() - 1, pane.y + 1, 1, pane.height - 1))
+}
+
+/// The area of the pane at `slot`, as `areas` lays it out.
+fn pane_area(areas: &Areas, app: &App, slot: Slot) -> Option<Rect> {
+    let index = app.slots().iter().position(|at| *at == slot)?;
+    areas.panes.get(index).copied()
 }
 
 /// The cell of the screen of the pane at `slot` nearest `(column, row)`:
@@ -275,14 +305,39 @@ pub fn nearest_cell(
     column: u16,
     row: u16,
 ) -> Option<(u16, u16)> {
-    let index = app.slots().iter().position(|at| *at == slot)?;
-    let screen = screen_area(*areas.panes.get(index)?);
+    let screen = screen_area(pane_area(areas, app, slot)?, app.scrollbars());
     if screen.is_empty() {
         return None;
     }
     let column = column.clamp(screen.x, screen.right() - 1);
     let row = row.clamp(screen.y, screen.bottom() - 1);
     Some((row - screen.y, column - screen.x))
+}
+
+/// How many rows above the screen of the pane at `slot` the mouse is, at
+/// `row`, as less than 0, or below it, or 0 when it's level with it: how
+/// far past the edge a drag selecting there has gone.
+pub fn rows_past(areas: &Areas, app: &App, slot: Slot, row: u16) -> i32 {
+    let Some(pane) = pane_area(areas, app, slot) else {
+        return 0;
+    };
+    let screen = screen_area(pane, app.scrollbars());
+    let row = i32::from(row);
+    let (top, bottom) = (i32::from(screen.y), i32::from(screen.bottom()));
+    if row < top {
+        row - top
+    } else if row >= bottom {
+        row - bottom + 1
+    } else {
+        0
+    }
+}
+
+/// The row of the scrollbar of the pane at `slot` nearest the screen's
+/// `row`: where a drag of its thumb has got to, wherever the mouse is.
+pub fn scrollbar_row(areas: &Areas, app: &App, slot: Slot, row: u16) -> Option<u16> {
+    let track = scrollbar_area(pane_area(areas, app, slot)?, app.scrollbars())?;
+    Some(row.clamp(track.y, track.bottom() - 1) - track.y)
 }
 
 /// What's at `(column, row)` on a screen laid out as `areas`, for `app`.
@@ -330,7 +385,13 @@ pub fn hit(areas: &Areas, app: &App, column: u16, row: u16) -> Hit {
             _ => *area,
         };
         if at(frame) {
-            let screen = screen_area(*area);
+            if let Some(track) = scrollbar_area(*area, app.scrollbars())
+                && at(track)
+            {
+                let row = row - track.y;
+                return Hit::Scrollbar { slot, row };
+            }
+            let screen = screen_area(*area, app.scrollbars());
             let cell = at(screen).then(|| (row - screen.y, column - screen.x));
             // A header line below another pane is the border between
             // them, but for the name on it, which takes the pane to move.
@@ -429,9 +490,8 @@ pub fn draw(frame: &mut Frame, app: &App, panes: &[Pane], overlay: Option<&Pane>
         sidebar::draw(frame, app, look, drawer);
         draw_rule(frame, look, rule);
     }
-    // Over everything between the top bar and the footer.
-    let below_top = areas.top.bottom();
-    let middle = Rect::new(0, below_top, frame.area().width, areas.footer.y - below_top);
+    // Over everything but the tab bar and the footer.
+    let middle = Rect::new(0, areas.main.y, frame.area().width, areas.main.height);
     if let Some(view) = app.issues_view() {
         issues::draw(frame, view, look.theme, look.now, middle);
     }
@@ -468,8 +528,6 @@ pub fn draw(frame: &mut Frame, app: &App, panes: &[Pane], overlay: Option<&Pane>
         reply::draw(frame, reply, look.theme, middle);
     }
     if let Some(view) = app.profiles_view() {
-        let below_top = areas.top.bottom();
-        let middle = Rect::new(0, below_top, frame.area().width, areas.footer.y - below_top);
         profiles::draw(frame, view, look.theme, middle);
     }
     if let Some(view) = app.plugins_view() {
@@ -557,6 +615,10 @@ fn draw_plugin_pane(
 /// many wait on the user, then, when there's room, how many pull requests
 /// and issues are open on the selected session's project's forge.
 fn draw_top_bar(frame: &mut Frame, app: &App, look: &Look, area: Rect) {
+    // Left out, it has no row to draw on.
+    if area.height == 0 {
+        return;
+    }
     let theme = look.theme;
     let name = Line::from(vec![
         Span::raw(" "),
@@ -567,31 +629,77 @@ fn draw_top_bar(frame: &mut Frame, app: &App, look: &Look, area: Rect) {
     ]);
     frame.render_widget(name, area);
     draw_tabs(frame, app, look, area);
-    let mut summary = summary(app.sessions(), app.server(), theme);
-    if counts_width(app, area.width) > 0 {
-        // Before the space it ends with.
-        let end = summary.spans.len() - 1;
-        let counts = forge_counts(app.open_on_forge(), theme);
-        summary.spans.splice(end..end, counts);
+    let mut right = summary(app.sessions(), app.server(), theme);
+    let counts = counts_width(app, area.width) > 0;
+    let status = status_shown(app, area.width);
+    if counts || status.is_some() {
+        // After the count, before the space the summary ends with.
+        let end = right.spans.pop();
+        let separator = Span::styled(
+            app.tab_bar().separator.clone(),
+            Style::new().fg(theme.muted),
+        );
+        let mut shown = Vec::new();
+        if counts {
+            shown.extend(forge_counts(app.open_on_forge(), theme));
+        }
+        let text = Style::new().fg(theme.text);
+        shown.extend(
+            status
+                .into_iter()
+                .flatten()
+                .map(|said| Span::styled(said, text)),
+        );
+        for said in shown {
+            right.spans.push(separator.clone());
+            right.spans.push(said);
+        }
+        right.spans.extend(end);
     }
-    frame.render_widget(summary.right_aligned(), area);
+    frame.render_widget(right.right_aligned(), area);
 }
 
-/// What the top bar counts on the forge of the selected session's project,
-/// each after a ` · `: ` · 3 prs` in the accent and ` · 5 issues` in green.
+/// The columns the tabs keep at least, before what the tab bar shows at
+/// its right is left out to give them room.
+const TABS_KEEP: u16 = 12;
+
+/// What the tab bar shows at its right, after the count, on a bar `width`
+/// columns wide: each thing with something to show, unless all of them
+/// together would leave the tabs less than [`TABS_KEEP`].
+fn status_shown(app: &App, width: u16) -> Option<Vec<String>> {
+    let shown: Vec<String> = (app.tab_bar().status.iter())
+        .filter(|text| !text.is_empty())
+        .cloned()
+        .collect();
+    if shown.is_empty() {
+        return None;
+    }
+    let separator = width_of(&app.tab_bar().separator);
+    let needs: u16 = shown.iter().map(|text| separator + width_of(text)).sum();
+    (TABS_START + SUMMARY_ROOM + TABS_KEEP + needs <= width).then_some(shown)
+}
+
+/// How many columns what the tab bar shows at its right takes.
+fn status_width(app: &App, width: u16) -> u16 {
+    let separator = width_of(&app.tab_bar().separator);
+    status_shown(app, width).map_or(0, |shown| {
+        shown.iter().map(|text| separator + width_of(text)).sum()
+    })
+}
+
+/// What the tab bar counts on the forge of the selected session's
+/// project, after the sessions: `3 prs` in the accent and `5 issues` in
+/// green.
 fn forge_counts<'a>(open: Option<OpenOnForge>, theme: &Theme) -> Vec<Span<'a>> {
     count_words(open)
         .into_iter()
-        .flat_map(|(said, pull_requests)| {
+        .map(|(said, pull_requests)| {
             let color = if pull_requests {
                 theme.accent
             } else {
                 theme.done
             };
-            [
-                Span::styled(" · ", Style::new().fg(theme.muted)),
-                Span::styled(said, Style::new().fg(color)),
-            ]
+            Span::styled(said, Style::new().fg(color))
         })
         .collect()
 }
@@ -622,13 +730,19 @@ fn count_words(open: Option<OpenOnForge>) -> Vec<(String, bool)> {
     pull_requests.into_iter().chain(issues).collect()
 }
 
-/// How many columns the forge's counts take in a top bar `width` columns
+/// How many columns the forge's counts take in a tab bar `width` columns
 /// wide: none when there are none, or they'd leave the tabs fewer than
-/// [`TABS_LEAST`] columns.
+/// [`TABS_KEEP`] columns beside what the bar shows at its right, which
+/// they give way to.
 fn counts_width(app: &App, width: u16) -> u16 {
+    let separator = width_of(&app.tab_bar().separator);
     let words = count_words(app.open_on_forge());
-    let counts: u16 = words.iter().map(|(said, _)| 3 + width_of(said)).sum();
-    let room = TABS_START + SUMMARY_ROOM + server_width(app) + counts + TABS_LEAST;
+    let counts: u16 = words
+        .iter()
+        .map(|(said, _)| separator + width_of(said))
+        .sum();
+    let beside = server_width(app) + status_width(app, width);
+    let room = TABS_START + SUMMARY_ROOM + beside + counts + TABS_KEEP;
     if counts > 0 && width >= room {
         counts
     } else {
@@ -733,11 +847,13 @@ fn tab_label(number: usize, tab: &Tab, status: Option<Status>, named: bool) -> S
 
 /// How much of the top bar in `area` the tabs share with the summary: all
 /// of it, but for the server's name the summary starts with, if it does,
-/// and the forge's counts it ends with, if they're shown.
+/// what the bar shows at its right, and the forge's counts before that,
+/// if they're shown.
 fn tabs_width(app: &App, area: Rect) -> u16 {
+    let status = status_width(app, area.width);
+    let counts = counts_width(app, area.width);
     area.width
-        .saturating_sub(server_width(app))
-        .saturating_sub(counts_width(app, area.width))
+        .saturating_sub(server_width(app) + status + counts)
 }
 
 /// How many columns the server's name takes at the start of the summary.
@@ -861,7 +977,7 @@ fn draw_pane(frame: &mut Frame, app: &App, look: &Look, slot: Slot, area: Rect, 
     // yet.
     let pane = pane_in(app, panes, slot);
     let back = pane.map_or(0, Pane::scrolled_back);
-    let screen = screen_area(area);
+    let screen = screen_area(area, app.scrollbars());
     let header = Rect::new(area.x, area.y, area.width, 1);
 
     let Some(session) = session else {
@@ -922,6 +1038,14 @@ fn draw_pane(frame: &mut Frame, app: &App, look: &Look, slot: Slot, area: Rect, 
         .with_marks(marks)
         .with_link(link);
     frame.render_widget(widget, screen);
+    if let (Some(track), Some(thumb)) = (scrollbar_area(area, app.scrollbars()), pane.thumb()) {
+        // The thumb stands out while the mouse holds it.
+        let held = app.holding_thumb() == Some(slot);
+        let thumb_color = if held { theme.accent } else { theme.muted };
+        let line = Style::new().fg(theme.rule);
+        let held = Style::new().fg(thumb_color);
+        scrollbar::draw(frame.buffer_mut(), track, thumb, line, held);
+    }
     // In copy mode, the cursor is copy mode's. Back in the history, the
     // program's cursor's place on the live screen means nothing.
     let cursor = if copying {
@@ -1174,6 +1298,8 @@ fn draw_footer(frame: &mut Frame, app: &App, panes: &[Pane], look: &Look, area: 
     } else if let Some(notice) = app.notice() {
         let notice = Line::styled(format!(" {notice}"), Style::new().fg(theme.failed));
         frame.render_widget(notice, area);
+    } else if let Some(restarted) = app.restarted() {
+        frame.render_widget(restarted_line(restarted, theme), area);
     } else if let Some(away) = app.away_line() {
         frame.render_widget(away_line(away, theme), area);
     } else {
@@ -1198,6 +1324,27 @@ fn away_line<'a>(away: &str, theme: &Theme) -> Line<'a> {
     ];
     spans.extend(hint_spans(&[("a", "timeline"), ("U", "needs you")], theme).spans);
     Line::from(spans)
+}
+
+/// What a restart brought back, `after the restart:` standing out, and
+/// what it couldn't in the failed color.
+fn restarted_line<'a>(restarted: &Restarted, theme: &Theme) -> Line<'a> {
+    let (lead, said) = restarted
+        .line
+        .split_once(": ")
+        .unwrap_or((&restarted.line, ""));
+    let color = if restarted.failed {
+        theme.failed
+    } else {
+        theme.text
+    };
+    Line::from(vec![
+        Span::styled(
+            format!(" {lead}: "),
+            Style::new().fg(theme.accent).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(said.to_string(), Style::new().fg(color)),
+    ])
 }
 
 /// The viewer of the session the pane at `slot` shows, once it has one.
@@ -1981,6 +2128,75 @@ mod tests {
         assert!(text[0].contains(" 2 review "), "{}", text[0]);
     }
 
+    /// `app` with the settings in `text`, a config file's.
+    fn configured(mut app: App, text: &str) -> App {
+        app.set_interface(&crate::config::from_text(text).unwrap());
+        app
+    }
+
+    #[test]
+    fn the_tab_bar_goes_over_the_footer_when_told() {
+        let app = configured(app_with_three_tabs(), "[tab_bar]\nposition = \"bottom\"\n");
+        let text = screen_text(&app);
+        assert!(
+            text[10].starts_with(" crystal   1  2 review  3 "),
+            "{}",
+            text[10]
+        );
+        assert!(!text[0].contains("crystal"), "{}", text[0]);
+        let areas = Areas::of(&app, Rect::new(0, 0, 80, 12));
+        assert_eq!((areas.main.y, areas.main.height, areas.top.y), (0, 10, 10));
+        // A click on a tab finds it there.
+        assert_eq!(hit(&areas, &app, 15, 10), Hit::Tab(1));
+    }
+
+    #[test]
+    fn the_tab_bar_can_be_left_out_while_there_is_one_tab() {
+        let mut app = App::new(None);
+        app.set_sessions(vec![session("a", State::Running)]);
+        let app = configured(app, "[tab_bar]\nhide_when_single = true\n");
+        let text = screen_text(&app);
+        assert!(
+            !text.iter().any(|line| line.contains("crystal")),
+            "{text:?}"
+        );
+        assert_eq!(Areas::of(&app, Rect::new(0, 0, 80, 12)).main.height, 11);
+        // With a second tab it's back.
+        let app = configured(
+            app_with_three_tabs(),
+            "[tab_bar]\nhide_when_single = true\n",
+        );
+        assert!(screen_text(&app)[0].starts_with(" crystal"));
+    }
+
+    #[test]
+    fn the_tab_bar_shows_its_status_after_the_count_while_the_tabs_have_room() {
+        let config = "[tab_bar]\nright = [{ type = \"text\", text = \"prod\" }, \
+                      { type = \"hostname\" }, { type = \"clock\" }]\n";
+        let mut app = configured(app_with_three_tabs(), config);
+        app.set_status(vec!["prod".into(), String::new(), "14:03".into()]);
+        let text = screen_text(&app);
+        assert!(
+            text[0].trim_end().ends_with("1 session · prod · 14:03"),
+            "{}",
+            text[0]
+        );
+        assert!(
+            text[0].starts_with(" crystal   1  2 review  3 "),
+            "{}",
+            text[0]
+        );
+        // On a narrow bar, the tabs keep their room.
+        app.set_status(vec![
+            "a much longer status line".into(),
+            String::new(),
+            "14:03".into(),
+        ]);
+        let narrow = screen_text_at(&app, 60, 12);
+        assert!(narrow[0].trim_end().ends_with("1 session"), "{}", narrow[0]);
+        assert!(narrow[0].contains(" 1 "), "{}", narrow[0]);
+    }
+
     /// An app with one session and three tabs, the second named `review`
     /// and in front.
     fn app_with_three_tabs() -> App {
@@ -2132,7 +2348,7 @@ mod tests {
             issues: counted(1, false),
         };
         let said = Line::from(forge_counts(Some(open), &theme));
-        assert_eq!(text_of(&said), " · 3 prs · 1 issue");
+        assert_eq!(text_of(&said), "3 prs1 issue");
         let prs = said.spans.iter().find(|span| span.content == "3 prs");
         assert_eq!(prs.unwrap().style.fg, Some(theme.accent));
 
@@ -2142,7 +2358,7 @@ mod tests {
             issues: counted(0, false),
         };
         let said = Line::from(forge_counts(Some(gitlab), &theme));
-        assert_eq!(text_of(&said), " · 100+ mrs");
+        assert_eq!(text_of(&said), "100+ mrs");
         let unlisted = OpenOnForge {
             issues: None,
             pull_requests: None,
@@ -2222,7 +2438,19 @@ mod tests {
             "{}",
             top(&app, 100)
         );
-        // Short of room, the counts give way.
+        // What the user has the bar show at its right comes after them,
+        // and the counts give way to it first when room runs short.
+        app.set_status(vec!["devbox".into()]);
+        assert!(
+            top(&app, 100).ends_with("1 session · 1 pr · devbox "),
+            "{}",
+            top(&app, 100)
+        );
+        assert!(
+            top(&app, 60).ends_with("1 session · devbox "),
+            "{}",
+            top(&app, 60)
+        );
         assert!(top(&app, 50).ends_with("1 session "), "{}", top(&app, 50));
     }
 
@@ -2472,7 +2700,7 @@ mod tests {
         app.on_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE));
         let areas = Areas::of(&app, Rect::new(0, 0, 80, 24));
         assert_eq!(areas.panes, [Rect::new(0, 1, 80, 22)]);
-        assert_eq!(screen_area(areas.panes[0]), Rect::new(0, 2, 80, 21));
+        assert_eq!(screen_area(areas.panes[0], false), Rect::new(0, 2, 80, 21));
         assert_eq!(
             hit(&areas, &app, 0, 5),
             Hit::Pane {
@@ -2510,12 +2738,48 @@ mod tests {
     fn a_drag_keeps_to_the_edge_of_the_pane_it_started_in() {
         let app = app_with_sessions(1);
         let areas = Areas::of(&app, Rect::new(0, 0, 80, 24));
-        // The screen is at column 29, row 2, 51 by 21.
+        // The screen is at column 29, row 2, 50 by 21, the scrollbar on
+        // its right.
         let nearest = |column, row| nearest_cell(&areas, &app, Slot::Selected, column, row);
         assert_eq!(nearest(31, 3), Some((1, 2)));
         assert_eq!(nearest(5, 0), Some((0, 0)));
-        assert_eq!(nearest(200, 200), Some((20, 50)));
+        assert_eq!(nearest(200, 200), Some((20, 49)));
         assert_eq!(nearest_cell(&areas, &app, Slot::Split(0), 31, 3), None);
+        // Past its top, on the header line and the top bar, or below its
+        // bottom, on the footer, it says how far.
+        let past = |row| rows_past(&areas, &app, Slot::Selected, row);
+        assert_eq!(
+            [past(0), past(1), past(2), past(22), past(23)],
+            [-2, -1, 0, 0, 1]
+        );
+    }
+
+    #[test]
+    fn a_click_beside_a_panes_screen_is_on_its_scrollbar() {
+        let app = app_with_sessions(1);
+        let areas = Areas::of(&app, Rect::new(0, 0, 80, 24));
+        let selected = Slot::Selected;
+        assert_eq!(
+            hit(&areas, &app, 79, 2),
+            Hit::Scrollbar {
+                slot: selected,
+                row: 0
+            }
+        );
+        assert_eq!(
+            hit(&areas, &app, 78, 22),
+            Hit::Pane {
+                slot: selected,
+                cell: Some((20, 49))
+            }
+        );
+        // Above it is the header line; a drag of the thumb keeps to it.
+        assert!(matches!(
+            hit(&areas, &app, 79, 1),
+            Hit::Pane { cell: None, .. }
+        ));
+        let row = |at| scrollbar_row(&areas, &app, selected, at);
+        assert_eq!([row(0), row(10), row(23)], [Some(0), Some(8), Some(20)]);
     }
 
     #[test]
@@ -2525,7 +2789,17 @@ mod tests {
         assert_eq!(areas.rule, Rect::new(28, 1, 1, 22));
         assert_eq!(areas.tiles, Rect::new(29, 1, 51, 22));
         assert_eq!(areas.panes, [areas.tiles], "one pane takes all the room");
-        assert_eq!(screen_area(areas.panes[0]), Rect::new(29, 2, 51, 21));
+        assert_eq!(screen_area(areas.panes[0], false), Rect::new(29, 2, 51, 21));
+        // A scrollbar takes the column on its right.
+        assert_eq!(screen_area(areas.panes[0], true), Rect::new(29, 2, 50, 21));
+        let track = scrollbar_area(areas.panes[0], true);
+        assert_eq!(track, Some(Rect::new(79, 2, 1, 21)));
+        assert_eq!(scrollbar_area(areas.panes[0], false), None);
+        assert_eq!(
+            scrollbar_area(Rect::new(0, 0, 7, 10), true),
+            None,
+            "too narrow"
+        );
     }
 
     #[test]

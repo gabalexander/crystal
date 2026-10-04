@@ -10,6 +10,7 @@
 //! go over whichever it is. With `NO_COLOR` set there's no color at all, as
 //! that convention asks: only bold and reversed text tell things apart.
 
+use super::appearance::Appearance;
 use super::status::Status;
 use crate::config::{ColorToken, ColorValue, Config, ThemeName};
 use crate::markdown::{Ink, Mark};
@@ -352,6 +353,64 @@ pub const THEMES: &[Named] = &[
     ),
 ];
 
+/// The schemes that have two sides, dark first, then light.
+const SIDES: &[(&str, &str)] = &[
+    ("dark", "light"),
+    ("catppuccin", "catppuccin-latte"),
+    ("tokyo-night", "tokyo-night-day"),
+    ("gruvbox", "gruvbox-light"),
+    ("one-dark", "one-light"),
+    ("solarized", "solarized-light"),
+    ("kanagawa", "kanagawa-lotus"),
+    ("rose-pine", "rose-pine-dawn"),
+];
+
+/// The theme `config` asks for while the system's appearance is
+/// `appearance`: its `theme`, unless `[appearance]` follows the system and
+/// the appearance is known, when it's the theme named for that appearance,
+/// or else `theme`'s side of it.
+pub fn chosen(config: &Config, appearance: Option<Appearance>) -> ThemeName {
+    let settings = &config.appearance;
+    let Some(appearance) = appearance.filter(|_| settings.auto_switch) else {
+        return config.theme;
+    };
+    for_appearance(config, appearance)
+}
+
+/// The theme `config` has for `appearance` when the theme follows it: the
+/// one named for it, or else `theme`'s side of it.
+pub fn for_appearance(config: &Config, appearance: Appearance) -> ThemeName {
+    let settings = &config.appearance;
+    let named = match appearance {
+        Appearance::Light => settings.light_theme,
+        Appearance::Dark => settings.dark_theme,
+    };
+    named.unwrap_or_else(|| side_of(config.theme, appearance))
+}
+
+/// `theme`'s side for `appearance`: itself when it's of that appearance,
+/// or paints nothing (the terminal's own colors follow the terminal); else
+/// its scheme's other side; else crystal's own.
+pub fn side_of(theme: ThemeName, appearance: Appearance) -> ThemeName {
+    let own = match Theme::new(theme, false).background {
+        Color::Rgb(r, g, b) => Appearance::of_background((r, g, b)),
+        _ => return theme,
+    };
+    if own == appearance {
+        return theme;
+    }
+    let other = SIDES.iter().find_map(|&(dark, light)| match theme.name() {
+        name if name == dark => Some(light),
+        name if name == light => Some(dark),
+        _ => None,
+    });
+    let fallback = match appearance {
+        Appearance::Light => ThemeName::LIGHT,
+        Appearance::Dark => ThemeName::DARK,
+    };
+    other.and_then(ThemeName::find).unwrap_or(fallback)
+}
+
 pub struct Theme {
     /// Painted behind everything. `Color::Reset` leaves the terminal's own.
     pub background: Color,
@@ -420,21 +479,28 @@ impl Theme {
         }
     }
 
-    /// The theme the user asked for in their config, with their colors
-    /// over it, unless the environment asks for no color.
-    pub fn from_config(config: &Config) -> Theme {
+    /// The theme the user asked for in their config while the system's
+    /// appearance is `appearance`, with their colors over it, unless the
+    /// environment asks for no color.
+    pub fn from_config(config: &Config, appearance: Option<Appearance>) -> Theme {
         let no_color = std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty());
-        Theme::configured(config, no_color)
+        Theme::configured(config, appearance, no_color)
     }
 
-    /// The config's theme and colors, or none at all when `no_color` is
-    /// set: no color the user picked outweighs the environment's asking for
-    /// none.
-    fn configured(config: &Config, no_color: bool) -> Theme {
+    /// The config's theme for `appearance` and its colors, those for the
+    /// appearance over the rest, or none at all when `no_color` is set: no
+    /// color the user picked outweighs the environment's asking for none.
+    fn configured(config: &Config, appearance: Option<Appearance>, no_color: bool) -> Theme {
         if no_color {
             return Theme::plain();
         }
-        Theme::new(config.theme, false).with_colors(&config.colors)
+        let theme = Theme::new(chosen(config, appearance), false).with_colors(&config.colors);
+        let settings = &config.appearance;
+        match appearance.filter(|_| settings.auto_switch) {
+            Some(Appearance::Light) => theme.with_colors(&settings.light_colors),
+            Some(Appearance::Dark) => theme.with_colors(&settings.dark_colors),
+            None => theme,
+        }
     }
 
     /// The theme with `colors`, the user's `[colors]`, over its own. A
@@ -716,6 +782,7 @@ impl Theme {
             Status::Running => self.running,
             Status::Ended => self.ended,
             Status::Failed => self.failed,
+            Status::Starting => self.muted,
         }
     }
 }
@@ -843,7 +910,7 @@ mod tests {
              keyword = \"bright-green\"\nfound_current = \"#00ff00\"\n",
         )
         .unwrap();
-        let theme = Theme::configured(&config, false);
+        let theme = Theme::configured(&config, None, false);
         let nord = Theme::new(config.theme, false);
         assert_eq!(theme.accent, Color::Rgb(255, 0, 0));
         assert_eq!(theme.selection.bg, Some(Color::Blue));
@@ -858,9 +925,80 @@ mod tests {
         // one's own is painted behind it instead.
         let mut config = config;
         config.theme = ThemeName::TERMINAL;
-        let theme = Theme::configured(&config, false);
+        let theme = Theme::configured(&config, None, false);
         assert_eq!(theme.selection.bg, Some(Color::Blue));
         assert!(theme.selection.sub_modifier.contains(Modifier::REVERSED));
+    }
+
+    #[test]
+    fn each_side_of_a_scheme_is_of_its_appearance() {
+        for &(dark, light) in SIDES {
+            let theme = |name| Theme::new(ThemeName::find(name).unwrap(), false);
+            let appearance = |theme: Theme| match theme.background {
+                Color::Rgb(r, g, b) => Appearance::of_background((r, g, b)),
+                other => panic!("{other:?} isn't painted"),
+            };
+            assert_eq!(appearance(theme(dark)), Appearance::Dark, "{dark}");
+            assert_eq!(appearance(theme(light)), Appearance::Light, "{light}");
+        }
+    }
+
+    #[test]
+    fn a_theme_goes_to_its_other_side_or_else_crystals_own() {
+        let side =
+            |name: &str, appearance| side_of(ThemeName::find(name).unwrap(), appearance).name();
+        assert_eq!(side("catppuccin", Appearance::Light), "catppuccin-latte");
+        assert_eq!(side("catppuccin-latte", Appearance::Dark), "catppuccin");
+        assert_eq!(side("catppuccin", Appearance::Dark), "catppuccin");
+        assert_eq!(
+            side("tokyo-night-day", Appearance::Light),
+            "tokyo-night-day"
+        );
+        assert_eq!(side("nord", Appearance::Light), "light");
+        assert_eq!(side("nord", Appearance::Dark), "nord");
+        assert_eq!(side("dark", Appearance::Light), "light");
+        // The terminal's own colors follow the terminal already.
+        assert_eq!(side("terminal", Appearance::Light), "terminal");
+    }
+
+    #[test]
+    fn the_theme_follows_the_appearance_only_when_told_to() {
+        let config = |text: &str| crate::config::from_text(text).unwrap();
+        let chosen_for = |config: &Config, appearance| chosen(config, appearance).name();
+        let still = config("theme = \"gruvbox\"\n");
+        assert_eq!(chosen_for(&still, Some(Appearance::Light)), "gruvbox");
+        let follows = config("theme = \"gruvbox\"\n[appearance]\nauto_switch = true\n");
+        assert_eq!(
+            chosen_for(&follows, Some(Appearance::Light)),
+            "gruvbox-light"
+        );
+        assert_eq!(chosen_for(&follows, Some(Appearance::Dark)), "gruvbox");
+        // Until the appearance is known, the theme is the one named.
+        assert_eq!(chosen_for(&follows, None), "gruvbox");
+        let named = config(
+            "theme = \"nord\"\n[appearance]\nauto_switch = true\n\
+             light_theme = \"solarized-light\"\ndark_theme = \"dracula\"\n",
+        );
+        assert_eq!(
+            chosen_for(&named, Some(Appearance::Light)),
+            "solarized-light"
+        );
+        assert_eq!(chosen_for(&named, Some(Appearance::Dark)), "dracula");
+        // Colors of one's own go over whichever it is.
+        let colored = config("[appearance]\nauto_switch = true\n[colors]\naccent = \"#ff0000\"\n");
+        let theme = Theme::configured(&colored, Some(Appearance::Light), false);
+        assert_eq!(theme.accent, Color::Rgb(255, 0, 0));
+        assert_eq!(theme.background, Theme::light().background);
+        // And the appearance's own over those.
+        let sided = config(
+            "[appearance]\nauto_switch = true\n[appearance.dark_colors]\naccent = \"#00ff00\"\n\
+             [colors]\naccent = \"#ff0000\"\ntext = \"#0000ff\"\n",
+        );
+        let dark = Theme::configured(&sided, Some(Appearance::Dark), false);
+        assert_eq!(dark.accent, Color::Rgb(0, 255, 0));
+        assert_eq!(dark.text, Color::Rgb(0, 0, 255));
+        let light = Theme::configured(&sided, Some(Appearance::Light), false);
+        assert_eq!(light.accent, Color::Rgb(255, 0, 0));
     }
 
     #[test]
@@ -869,7 +1007,7 @@ mod tests {
             "theme = \"dracula\"\n[colors]\naccent = \"#ff0000\"\nbackground = \"#000000\"\n",
         )
         .unwrap();
-        let theme = Theme::configured(&config, true);
+        let theme = Theme::configured(&config, None, true);
         assert_eq!(theme.accent, Color::Reset);
         assert_eq!(theme.background, Color::Reset);
     }

@@ -149,7 +149,13 @@ enum Command {
         #[arg(short, long, value_name = "TEXT")]
         task: Option<String>,
 
-        /// The command and its arguments.
+        /// Set a variable in the session's environment, over the one this
+        /// runs with. Can be given more than once.
+        #[arg(short, long = "env", value_name = "KEY=VALUE", value_parser = variable)]
+        env: Vec<(String, String)>,
+
+        /// The command and its arguments [default: the shell `[terminal]`
+        /// says, or yours]
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },
@@ -399,6 +405,13 @@ enum Command {
         #[command(subcommand)]
         command: PaneCommand,
     },
+    /// Give the terminal the TUI runs in a title, in place of the one
+    /// `[window] title` makes, or clear it to go back to that one. The TUI
+    /// used last does it.
+    Title {
+        #[command(subcommand)]
+        command: TitleCommand,
+    },
     /// Print the TUI's tabs: each one's sessions, and how its panes split
     /// the room.
     Layout {
@@ -529,7 +542,8 @@ enum Command {
     /// Give a session another name.
     Rename { name: String, new_name: String },
     /// Run an ended session's command again, in the same directory and
-    /// under the same name. Claude Code comes back in its conversation.
+    /// under the same name. Claude Code comes back in its conversation. One
+    /// that couldn't start again after a restart tries again.
     Respawn { name: String },
     /// Stop a session and remove it from the list. An archived one is
     /// taken out of the archive.
@@ -1041,13 +1055,41 @@ enum TabCommand {
 }
 
 #[derive(Subcommand)]
+enum TitleCommand {
+    /// Set the title.
+    Set {
+        /// The title. Several words are joined with spaces.
+        #[arg(required = true)]
+        text: Vec<String>,
+    },
+    /// Go back to the title `[window] title` makes.
+    Clear,
+}
+
+#[derive(Subcommand)]
 enum PaneCommand {
     /// Show a session in a pane of its own, split off to the right of, or
     /// below, the pane of the session this runs in, or else the selected
-    /// one's.
+    /// one's; with no session, a new shell, whose name it prints.
     Split {
         /// The session to show. One in another tab moves to this one.
-        session: String,
+        /// [default: a new shell, in the current directory]
+        session: Option<String>,
+
+        /// The new shell's directory [default: the current one]
+        #[arg(short = 'c', long, conflicts_with = "session")]
+        cwd: Option<PathBuf>,
+
+        /// Set a variable in the new shell's environment, over the one
+        /// this runs with. Can be given more than once.
+        #[arg(
+            short,
+            long = "env",
+            value_name = "KEY=VALUE",
+            value_parser = variable,
+            conflicts_with = "session"
+        )]
+        env: Vec<(String, String)>,
 
         /// The session whose pane to split [default: the one this runs in,
         /// or else the selected one]
@@ -1144,6 +1186,17 @@ impl From<Toward> for Direction {
             Toward::Up => Direction::Up,
             Toward::Down => Direction::Down,
         }
+    }
+}
+
+/// A variable for a session's environment, as `--env` takes it:
+/// `KEY=VALUE`, the value maybe empty or with `=` in it.
+fn variable(text: &str) -> Result<(String, String), String> {
+    match text.split_once('=') {
+        Some((key, value)) if !key.is_empty() && !key.contains(char::is_whitespace) => {
+            Ok((key.to_string(), value.to_string()))
+        }
+        _ => Err("write it KEY=VALUE".into()),
     }
 }
 
@@ -1351,10 +1404,20 @@ fn run(cli: Cli) -> Result<()> {
             worktree,
             base,
             task,
+            env,
             command,
         } => {
             let worktree = NewWorktree::from_args(worktree, base);
-            new_session(&socket, name, cwd, worktree, detached, command, task)?
+            let new = NewArgs {
+                name,
+                cwd,
+                worktree,
+                detached,
+                command,
+                task,
+                env,
+            };
+            new_session(&socket, new)?
         }
         Command::Done {
             name,
@@ -1455,6 +1518,13 @@ fn run(cli: Cli) -> Result<()> {
         Command::Project { json, command } => project(&socket, json, command)?,
         Command::Tab { command } => tab(&socket, command)?,
         Command::Pane { command } => pane(&socket, command)?,
+        Command::Title { command } => {
+            let text = match command {
+                TitleCommand::Set { text } => Some(text.join(" ")),
+                TitleCommand::Clear => None,
+            };
+            client::lay_out(&socket, layout::Command::Title { text })?;
+        }
         Command::Layout { json } => {
             let layout = client::lay_out(&socket, layout::Command::Show)?;
             if json {
@@ -1798,15 +1868,27 @@ fn print_profile(profiles: &[Profile], name: &str) -> Result<()> {
     Ok(())
 }
 
-fn new_session(
-    socket: &Path,
+/// What `crystal new` was asked for.
+struct NewArgs {
     name: Option<String>,
     cwd: Option<PathBuf>,
     worktree: Option<NewWorktree>,
     detached: bool,
-    mut command: Vec<String>,
+    command: Vec<String>,
     task: Option<String>,
-) -> Result<()> {
+    env: Vec<(String, String)>,
+}
+
+fn new_session(socket: &Path, new: NewArgs) -> Result<()> {
+    let NewArgs {
+        name,
+        cwd,
+        worktree,
+        detached,
+        mut command,
+        task,
+        env,
+    } = new;
     let cwd = start_dir(socket, cwd, worktree)?;
     // A task given with `-t` goes to the agent as its first prompt; one
     // given as the agent's only argument is a task all the same.
@@ -1821,7 +1903,7 @@ fn new_session(
         task,
         backlog: None,
     };
-    let name = client::new_session_for(socket, name, cwd, command, purpose)?.name;
+    let name = client::new_session_with(socket, name, cwd, command, purpose, &env)?.name;
     attach_or_print(socket, &name, detached)
 }
 
@@ -2007,16 +2089,32 @@ fn pane(socket: &Path, command: PaneCommand) -> Result<()> {
     let command = match command {
         PaneCommand::Split {
             session,
+            cwd,
+            env,
             beside,
             right: _,
             down,
             ratio,
-        } => layout::Command::Split {
-            session,
-            beside,
-            way: if down { Way::Down } else { Way::Right },
-            ratio,
-        },
+        } => {
+            let session = match session {
+                Some(session) => session,
+                None => {
+                    let cwd = here(cwd)?;
+                    let purpose = client::Purpose::default();
+                    let new =
+                        client::new_session_with(socket, None, cwd, Vec::new(), purpose, &env);
+                    let name = new?.name;
+                    println!("{name}");
+                    name
+                }
+            };
+            layout::Command::Split {
+                session,
+                beside,
+                way: if down { Way::Down } else { Way::Right },
+                ratio,
+            }
+        }
         // A direction's word is a direction, even where a session has it
         // for its name.
         PaneCommand::Focus { target, raise } => match Toward::from_str(&target, false) {
@@ -2170,6 +2268,13 @@ fn print_sessions(sessions: &[SessionInfo]) {
         "TASK",
     ];
     print_table(header, &rows);
+    // Why a session couldn't start again is too long for its row, and on
+    // standard error it's out of the way of a script reading the rows.
+    for session in sessions {
+        if let protocol::State::Failed { why } = &session.state {
+            eprintln!("{} couldn't start again: {why}", session.name);
+        }
+    }
 }
 
 /// Prints the archived sessions, the latest archived first, with how long

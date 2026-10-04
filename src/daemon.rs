@@ -159,16 +159,45 @@ pub fn run(socket: &Path, handover: Option<RawFd>) -> Result<()> {
         Ok(None) => {}
         Err(err) => eprintln!("crystal daemon: couldn't update the skill: {err:#}"),
     }
-    match handed {
-        Some(handed) => daemon.take_over(handed),
+    let cold = handed.is_none();
+    // The sessions written down start again before the daemon answers,
+    // but for the agents after the first, which wait their turns.
+    let first = match handed {
+        Some(handed) => {
+            daemon.take_over(handed);
+            daemon.start_waiting(false)
+        }
         None => {
             daemon.start_saved_sessions();
+            let first = daemon.start_waiting(false);
             daemon.take_up_flows();
+            first
         }
-    }
-    // Once the sessions are back, or carried on: a daemon handed over to
-    // starts up as any other does.
-    hooks.start_up();
+    };
+    // Those start a moment apart, on a thread of their own, while the
+    // daemon answers. Once they're back, or carried on, a daemon handed
+    // over to starts up as any other does.
+    thread::spawn({
+        let daemon = daemon.clone();
+        let hooks = hooks.clone();
+        move || {
+            let (back, mut failed) = daemon.start_waiting(true);
+            let back = first.0 + back;
+            failed.splice(0..0, first.1);
+            if !failed.is_empty() {
+                eprintln!(
+                    "crystal daemon: started {back} sessions again; {} couldn't start: {}",
+                    failed.len(),
+                    failed.join(", ")
+                );
+            }
+            if cold && back + failed.len() > 0 {
+                let version = protocol::version();
+                daemon.events.emit(Event::restarted(&version, back, failed));
+            }
+            hooks.start_up();
+        }
+    });
     // With search by meaning on, the models are got ready now, rather than
     // when a session starts: downloaded if they aren't here (unless
     // `CRYSTAL_NO_MODEL_DOWNLOAD` is set, as in crystal's tests), loaded, and
@@ -361,8 +390,10 @@ impl Daemon {
         Ok(())
     }
 
-    /// Starts again the sessions that were running when the last daemon
-    /// stopped without being asked to: it crashed, or the machine rebooted.
+    /// Puts the sessions that were running when the last daemon stopped
+    /// without being asked to, because it crashed or the machine rebooted,
+    /// back in the list in their places, each waiting its turn to start
+    /// again: see [`Daemon::start_waiting`].
     fn start_saved_sessions(&self) {
         let mut sessions = self.sessions.lock().unwrap();
         let saved = self.db.lock().unwrap().sessions();
@@ -370,32 +401,124 @@ impl Daemon {
             eprintln!("crystal daemon: couldn't read the sessions to start again: {err:#}");
             Vec::new()
         });
-        self.start_again(&mut sessions, saved);
+        sessions.extend(
+            saved
+                .into_iter()
+                .map(|saved| Session::to_start(new_id(), saved)),
+        );
     }
 
-    /// Starts sessions again from what was written down of them, adding
-    /// them to `sessions`: an agent in its conversation, a task at rest,
-    /// any other program from the start.
-    fn start_again(&self, sessions: &mut Vec<Session>, saved: Vec<SavedSession>) {
-        for saved in saved {
-            let name = saved.name.clone();
-            if let Err(err) = self.start_saved(sessions, saved, env::current()) {
-                eprintln!("crystal daemon: couldn't start {name} again: {err:#}");
+    /// Starts the sessions waiting their turn to start again, in the list's
+    /// order, each in its place and from this daemon's environment: an
+    /// agent `[sessions] restart_spacing_ms` after the agent before it, so
+    /// they don't all start at once, any other program straight away; or
+    /// without `wait`, only those that needn't wait, and the first agent.
+    /// One that can't start stays where it was, failed, saying why. Gives
+    /// back how many started, and the names of those that couldn't.
+    fn start_waiting(&self, wait: bool) -> (usize, Vec<String>) {
+        let spacing = settings().sessions.restart_spacing();
+        let env = env::current();
+        let mut back = 0;
+        let mut failed = Vec::new();
+        // The first agent waits for nothing: it's started straight away,
+        // before the daemon answers, so it needn't wait after it either.
+        let mut agent_started = wait.then(Instant::now);
+        loop {
+            let mut sessions = self.sessions.lock().unwrap();
+            let wait_for =
+                agent_started.map_or(Duration::ZERO, |at| spacing.saturating_sub(at.elapsed()));
+            let next = sessions.iter().position(|session| {
+                session.is_starting() && (wait_for.is_zero() || !starts_an_agent(&session.launch()))
+            });
+            let Some(index) = next else {
+                if !wait || !sessions.iter().any(Session::is_starting) {
+                    break;
+                }
+                // Not held meanwhile: the daemon answers, and the list may
+                // change, so the next is looked for again.
+                drop(sessions);
+                thread::sleep(wait_for);
+                continue;
+            };
+            let saved = sessions[index].launch();
+            let agent = starts_an_agent(&saved);
+            match self.start_in_place(&mut sessions, index, saved, env.clone()) {
+                Ok(_) => back += 1,
+                Err(_) => failed.push(sessions[index].name.clone()),
+            }
+            if agent {
+                agent_started = Some(Instant::now());
+            }
+        }
+        (back, failed)
+    }
+
+    /// Starts the session at `index`, yet to start again, from `saved`, in
+    /// the environment `env`, keeping its place in the list and its id, and
+    /// tells of it. One that can't start stays there, failed, saying why,
+    /// and that's told instead.
+    fn start_in_place(
+        &self,
+        sessions: &mut Vec<Session>,
+        index: usize,
+        saved: SavedSession,
+        env: BTreeMap<String, String>,
+    ) -> Result<String> {
+        // It makes way, so that its name is free for the session started.
+        let mut waiting = sessions.remove(index);
+        let id = waiting.id.clone();
+        match self.start_saved(sessions, saved.clone(), env, Some(id)) {
+            Ok(name) => {
+                // Whoever was looking at the one waiting is let go, to look
+                // again at the session started under its id.
+                waiting.term().close();
+                // `start` adds the session at the end; it goes where the
+                // one waiting was.
+                let mut started = sessions.pop().expect("start added a session");
+                // A step of a flow run waiting at its gate waits on the user
+                // again, as after any restart.
+                let runs = self.flows.lock().unwrap();
+                if runs.iter().any(|run| waits_at_gate(run, &name)) {
+                    started.on_agent_event(AgentEvent::Asking);
+                }
+                drop(runs);
+                sessions.insert(index, started);
+                let info = sessions[index].info();
+                self.events
+                    .emit(Event::about_session(Kind::SessionStarted, &info));
+                Ok(name)
+            }
+            Err(err) => {
+                let why = format!("{err:#}");
+                eprintln!("crystal daemon: couldn't start {} again: {why}", saved.name);
+                let failed = if waiting.is_starting() {
+                    waiting.fail_to_start(&why);
+                    waiting
+                } else {
+                    // One that had failed already says why afresh, under an
+                    // id of its own, so that whoever shows it looks again.
+                    Session::failed_to_start(new_id(), saved, &why)
+                };
+                self.events.emit(Event::start_failed(&failed.info()));
+                sessions.insert(index, failed);
+                Err(err)
             }
         }
     }
 
     /// Starts a session again from what was written down of it, from the
-    /// environment `env`, at the end of `sessions`, and gives back its
-    /// name: an agent in its conversation, a task at rest, any other
-    /// program from the start. It comes back with its task as it was,
-    /// closed or not.
+    /// environment `env`, at the end of `sessions`, under the id `id` or a
+    /// new one, and gives back its name: an agent in its conversation, a
+    /// task at rest, any other program from the start. It comes back with
+    /// its task as it was, closed or not.
     fn start_saved(
         &self,
         sessions: &mut Vec<Session>,
         saved: SavedSession,
         env: BTreeMap<String, String>,
+        id: Option<String>,
     ) -> Result<String> {
+        let id = id.unwrap_or_else(new_id);
         let goal = saved.goal.clone();
         let backlog = goal.as_ref().and_then(|goal| goal.backlog);
         let name = match saved.task {
@@ -410,7 +533,8 @@ impl Daemon {
                     backlog,
                 };
                 let conversation = saved.conversation.map(|conversation| conversation.id);
-                start_task(
+                start_task_as(
+                    id,
                     sessions,
                     &self.socket,
                     &self.spending,
@@ -428,7 +552,8 @@ impl Daemon {
                     task: goal.as_ref().map(|goal| goal.goal.clone()),
                     backlog,
                 };
-                start(
+                start_as(
+                    id,
                     sessions,
                     &self.socket,
                     new,
@@ -495,7 +620,7 @@ impl Daemon {
                 .expect("some number is free");
             archived.session.name = free;
         }
-        let started = match self.start_saved(&mut sessions, archived.session.clone(), env) {
+        let started = match self.start_saved(&mut sessions, archived.session.clone(), env, None) {
             Ok(started) => started,
             Err(err) => {
                 db.archive(&archived)?;
@@ -518,7 +643,7 @@ impl Daemon {
             .lock()
             .unwrap()
             .iter()
-            .filter(|session| !session.is_running())
+            .filter(|session| !session.is_running() && !session.is_unstarted())
             .map(|session| session.id.clone())
             .collect();
         let mut last_runs: Vec<FlowRun> = Vec::new();
@@ -567,7 +692,10 @@ impl Daemon {
                     notify::tell(notice, &self.socket);
                 }
                 self.tell_changes(session);
-                if !session.is_running() && told_ended.insert(session.id.clone()) {
+                // One yet to start again hasn't ended, and keeps its id once
+                // it has started.
+                let ended = !session.is_running() && !session.is_unstarted();
+                if ended && told_ended.insert(session.id.clone()) {
                     let info = session.info();
                     let status = info.status();
                     self.events.emit(Event::ended(&info, status));
@@ -832,7 +960,12 @@ impl Daemon {
         }
         let carried = sessions.len();
         let restarted: Vec<String> = again.iter().map(|saved| saved.name.clone()).collect();
-        self.start_again(&mut sessions, again);
+        // They wait their turn to start again, as after any restart.
+        sessions.extend(
+            again
+                .into_iter()
+                .map(|saved| Session::to_start(new_id(), saved)),
+        );
         let mut flows: Vec<FlowRun> = flows
             .into_iter()
             .map(handover::HandedFlow::taken_over)
@@ -2478,7 +2611,9 @@ impl Daemon {
 
     /// Runs an ended session's command again, in its directory and under
     /// its name, keeping its place in the list. An agent whose conversation
-    /// can be picked up starts back in it.
+    /// can be picked up starts back in it. One yet to start again after a
+    /// restart, or that couldn't, starts now, as the restart would have
+    /// started it.
     fn respawn(&self, name: &str, env: BTreeMap<String, String>) -> Result<Response> {
         let mut sessions = self.sessions.lock().unwrap();
         let index = sessions
@@ -2486,6 +2621,11 @@ impl Daemon {
             .position(|session| session.name == name)
             .with_context(|| format!("no session named {name}"))?;
         ensure!(!sessions[index].is_running(), "{name} is still running");
+        if sessions[index].is_unstarted() {
+            let saved = sessions[index].launch();
+            self.start_in_place(&mut sessions, index, saved, env)?;
+            return Ok(Response::Done);
+        }
 
         // The ended session makes way for the new one, and comes back if
         // that doesn't start.
@@ -2577,7 +2717,8 @@ fn stop_idle_agents(sessions: &mut [Session]) {
 }
 
 /// Takes up `run` as the last daemon left it when it stopped: a step in a
-/// terminal whose session came back with its task open carries on there;
+/// terminal whose session came back, or waits its turn to, with its task
+/// open carries on there;
 /// any other that was running then was cut short, and waits to be run
 /// again; one waiting at its gate waits on the user again. Its steps start
 /// from this daemon's environment, as the sessions it starts again do.
@@ -2588,7 +2729,7 @@ fn take_up(sessions: &mut [Session], run: &mut FlowRun) {
                 let open = session
                     .task_record()
                     .is_some_and(|task| task.outcome.is_none());
-                session.is_running() && open
+                (session.is_running() || session.is_starting()) && open
             })
     });
     if !carried_on {
@@ -2601,6 +2742,14 @@ fn take_up(sessions: &mut [Session], run: &mut FlowRun) {
     if let Some(session) = at_gate.and_then(|step| step_session(sessions, run, step)) {
         session.on_agent_event(AgentEvent::Asking);
     }
+}
+
+/// Whether the session called `name` runs the step of `run` waiting at its
+/// gate.
+fn waits_at_gate(run: &FlowRun, name: &str) -> bool {
+    run.current()
+        .filter(|&step| run.steps[step].state == StepState::AtGate)
+        .is_some_and(|step| run.steps[step].session.as_deref() == Some(name))
 }
 
 /// The session `step` of `run` runs in, while it's there.
@@ -2764,10 +2913,31 @@ struct Found {
     term: Arc<Term>,
 }
 
-/// Starts a session and adds it to `sessions`. Given a `conversation`, an
-/// agent that can pick one up starts back in it; given a `resume_command`,
-/// the command an agent said resumes it, it's resumed with that instead.
+/// Starts a session and adds it to `sessions`, under an id of its own:
+/// see [`start_as`].
 fn start(
+    sessions: &mut Vec<Session>,
+    socket: &Path,
+    new: NewSession,
+    conversation: Option<Conversation>,
+    resume_command: Option<Vec<String>>,
+) -> Result<String> {
+    start_as(
+        new_id(),
+        sessions,
+        socket,
+        new,
+        conversation,
+        resume_command,
+    )
+}
+
+/// Starts a session under the id `id` and adds it to `sessions`. Given a
+/// `conversation`, an agent that can pick one up starts back in it; given a
+/// `resume_command`, the command an agent said resumes it, it's resumed
+/// with that instead. Never anywhere but its directory.
+fn start_as(
+    id: String,
     sessions: &mut Vec<Session>,
     socket: &Path,
     new: NewSession,
@@ -2785,6 +2955,7 @@ fn start(
     let Some(program) = command.first() else {
         bail!("no command to run");
     };
+    check_dir(&cwd)?;
     ensure!(
         exists(program, &cwd, env.get("PATH")),
         "command not found: {program}"
@@ -2806,7 +2977,6 @@ fn start(
         None => unique_name(from_prompt.as_deref().unwrap_or(program), taken),
     };
 
-    let id = new_id();
     let rollouts = codex::Rollouts::for_session(&command, &cwd, &env);
     // An agent that said how to resume it comes back with that command:
     // typed into the session's shell, or else run in place of its command.
@@ -3087,6 +3257,27 @@ fn start_task(
     conversation: Option<String>,
     run_prompt: bool,
 ) -> Result<String> {
+    start_task_as(
+        new_id(),
+        sessions,
+        socket,
+        spending,
+        task,
+        conversation,
+        run_prompt,
+    )
+}
+
+/// Makes a task under the id `id`, as [`start_task`] does.
+fn start_task_as(
+    id: String,
+    sessions: &mut Vec<Session>,
+    socket: &Path,
+    spending: &Arc<Spending>,
+    task: NewTask,
+    conversation: Option<String>,
+    run_prompt: bool,
+) -> Result<String> {
     let NewTask {
         name,
         cwd,
@@ -3094,6 +3285,7 @@ fn start_task(
         env,
         backlog,
     } = task;
+    check_dir(&cwd)?;
     ensure!(
         exists("claude", &cwd, env.get("PATH")),
         "command not found: claude"
@@ -3113,7 +3305,6 @@ fn start_task(
         }
     };
 
-    let id = new_id();
     let mut env = env::for_session(&env, &name, &id, socket);
     // The task follows its Claude's own events: the hooks the user
     // installed stay quiet.
@@ -3442,6 +3633,25 @@ impl From<anyhow::Error> for Response {
 
 /// Whether `program` names a file to run: a path, taken from `cwd`, or a
 /// name found on the client's `PATH`.
+/// Refuses to start a session in a directory that isn't there, which the
+/// terminal would start it somewhere else for: in the home directory.
+fn check_dir(cwd: &Path) -> Result<()> {
+    let dir = crate::shell::home_relative(cwd);
+    ensure!(cwd.is_dir(), "its directory, {dir}, isn't there");
+    Ok(())
+}
+
+/// Whether `saved` starts an agent again, which a restart spaces out: one
+/// with a conversation to pick up or a command to resume it, or whose
+/// program is an agent's. A task comes back at rest, with nothing to run.
+fn starts_an_agent(saved: &SavedSession) -> bool {
+    if saved.task.is_some() {
+        return false;
+    }
+    let agent = matches!(front::of_command(&saved.command), Some(Front::Agent { .. }));
+    agent || saved.conversation.is_some() || saved.resume.is_some()
+}
+
 fn exists(program: &str, cwd: &Path, path: Option<&String>) -> bool {
     if program.contains('/') {
         return cwd.join(program).is_file();
