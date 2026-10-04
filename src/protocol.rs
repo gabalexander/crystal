@@ -17,7 +17,7 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::io::{self, BufRead, ErrorKind, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -1074,8 +1074,67 @@ pub struct Worktree {
     /// Whether this is the repository's main worktree, rather than one
     /// linked to it with `git worktree add`.
     pub main: bool,
-    /// The branch checked out, or `None` when HEAD is detached.
+    /// The branch checked out, or `None` when HEAD is detached. In the
+    /// middle of a rebase, where git detaches HEAD until it's through, the
+    /// branch being rebased.
     pub branch: Option<String>,
+    /// What git is in the middle of here, if anything, which leaves the
+    /// worktree as it is until it's finished or aborted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_progress: Option<InProgress>,
+}
+
+impl Worktree {
+    /// Whether this is a worktree Claude Code made for itself: see
+    /// [`claude_codes_own`].
+    pub fn claude_codes_own(&self) -> bool {
+        claude_codes_own(&self.project_path, &self.path)
+    }
+}
+
+/// Whether the worktree at `path` is one Claude Code made for itself in
+/// the project whose main worktree is `project`: under `.claude/worktrees`
+/// there, room for a subagent to work apart, named by a hash, which it
+/// leaves behind once it holds a change. No session of crystal's runs in
+/// one.
+pub fn claude_codes_own(project: &Path, path: &Path) -> bool {
+    path.starts_with(project.join(".claude").join("worktrees"))
+}
+
+/// What git is in the middle of in a worktree: a merge, a rebase, a
+/// cherry-pick or a revert that stopped, on conflicts say, and waits to be
+/// finished or aborted. Nothing should cut through it: no switch of branch,
+/// and no task closed done.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum InProgress {
+    Merge,
+    Rebase,
+    CherryPick,
+    Revert,
+}
+
+impl InProgress {
+    /// What's under way, as a sentence names it: "a rebase".
+    pub fn what(self) -> &'static str {
+        match self {
+            InProgress::Merge => "a merge",
+            InProgress::Rebase => "a rebase",
+            InProgress::CherryPick => "a cherry-pick",
+            InProgress::Revert => "a revert",
+        }
+    }
+
+    /// What the worktree is doing, as its line in the sidebar says:
+    /// "rebasing".
+    pub fn doing(self) -> &'static str {
+        match self {
+            InProgress::Merge => "merging",
+            InProgress::Rebase => "rebasing",
+            InProgress::CherryPick => "cherry-picking",
+            InProgress::Revert => "reverting",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

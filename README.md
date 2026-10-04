@@ -273,6 +273,15 @@ until it's removed: it's still on disk, maybe with work in it. Select it, and `n
 there, `d` and `p` show its changes and files, and `W` removes it. It shows in every tab its project has
 sessions in. One made or removed outside crystal comes or goes within a few seconds.
 
+A worktree in the middle of a rebase, a merge, a cherry-pick or a revert, stopped on conflicts say, says so
+after its branch, `⎇ fix-login · rebasing`, until it's finished or aborted. A rebase detaches HEAD meanwhile,
+but the line keeps the branch being rebased, and its pull request with it. Claude Code makes worktrees of its
+own for its subagents, under `.claude/worktrees` in the project, and leaves one behind once it holds a change.
+Those come last in their project, named `claude` and the subject of the commit each is at, `⎇ claude · feat:
+add the thing`, since their branches are hashes. `Enter` starts a session in one and `W` removes it, as with
+any worktree. Better, crystal tells Claude Code to run several fixes as sessions of crystal's instead: see
+[agents driving agents](#agents-driving-agents).
+
 A [project](#projects) with no sessions at all stays too: after those with sessions, in every tab, its main
 worktree with a `· no sessions` row under it, and its linked worktrees after. `n` or `Enter` there starts
 something in it, and `W` takes it off the list, which changes nothing on disk.
@@ -1195,7 +1204,9 @@ session, plus `status`, the word the STATE column shows:
 ```
 
 `state` is `"running"`, `{"exited": {"code": 3}}` or `{"signaled": {"signal": "Terminated"}}`; `activity` is
-`null` for a program that doesn't report what it's doing; `worktree` is `null` outside a git repository;
+`null` for a program that doesn't report what it's doing; `worktree` is `null` outside a git repository, its
+`branch` `null` on a detached HEAD, but for a rebase under way the branch being rebased, and it carries
+`in_progress` only while git is in the middle of something there, `merge`, `rebase`, `cherry-pick` or `revert`;
 `front` is what's in front in the terminal: `{"kind": "agent", …}`, `{"kind": "shell", "name": "zsh"}`,
 `{"kind": "program", "name": "vite"}` or `{"kind": "task"}`, and `null` until it's been looked at.
 `task` is `null` for a session started with nothing to do, and otherwise holds its [task](#tasks): `id`,
@@ -1264,6 +1275,11 @@ crystal skill             # or just print it
 
 The install script installs it when it finds Claude Code (its `claude` command, or `~/.claude`), and so does
 `make install`; `CRYSTAL_NO_SKILL=1` leaves it out of either.
+
+Every Claude Code session crystal starts is also told, on top of its system prompt, to work on several things
+at once as sessions of crystal's, one `crystal new -d -w <branch>` each, rather than in worktrees or subagents
+of its own: a session shows in the sidebar with its status, its diff and its screen, where you can step in,
+while a worktree Claude Code makes for itself shows only once it's left behind.
 
 `--install` won't write over a skill file you've changed; `--force` does. The skill lives in
 [`skill/SKILL.md`](skill/SKILL.md), and each crystal carries its own copy. After an upgrade, the daemon brings
@@ -1603,7 +1619,9 @@ made, `t1`, `t2`…, and stays open until it's closed, done or failed, with a li
   agent doesn't take it for a stranger's instructions. Agents don't always remember to, Haiku least of all, so
   the first time Claude Code ends a turn with its task still open, its Stop hook reminds it and it carries on:
   to close the task, or, if it isn't through, to leave it open and end its turn. `-n <session>` closes another
-  session's task.
+  session's task. A task isn't done while its worktree is in the middle of a rebase or a merge, stopped on
+  conflicts say: `crystal done` refuses then and says so, until the agent finishes or aborts it; `--failed`
+  closes it anyway.
 - You close it from the TUI: `c` on the session asks `d` done or `f` failed, then for a line on how it went,
   which can stay empty.
 - A background task closes itself when its run ends: done with the first line of Claude's answer, or failed.

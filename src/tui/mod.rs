@@ -161,10 +161,13 @@ pub enum Event {
         project: PathBuf,
         found: Result<(Forge, Vec<PullRequest>), String>,
     },
-    /// The linked worktrees of a project, as git listed them.
+    /// The linked worktrees of a project, as git listed them, and for
+    /// those Claude Code made for itself, the subject of the commit each
+    /// is at.
     Worktrees {
         project: PathBuf,
         worktrees: Vec<Worktree>,
+        subjects: HashMap<PathBuf, String>,
     },
     /// git is done removing the worktree at `path`: it's gone, or why not.
     WorktreeRemoved {
@@ -909,7 +912,14 @@ impl Tui {
             Event::Flows(runs) => self.app.set_flows(runs),
             Event::Projects(projects) => self.set_known_projects(projects),
             Event::PullRequests { project, found } => self.app.set_pull_requests(project, found),
-            Event::Worktrees { project, worktrees } => self.app.set_worktrees(project, worktrees),
+            Event::Worktrees {
+                project,
+                worktrees,
+                subjects,
+            } => {
+                self.app.set_subjects(&project, subjects);
+                self.app.set_worktrees(project, worktrees);
+            }
             Event::WorktreeRemoved { path, removed } => self.worktree_removed(&path, removed),
             Event::WorktreeHasChanges { path, branch } => {
                 self.app.ask_to_force_removal(path, branch);
@@ -2589,13 +2599,15 @@ fn spawn_worktree_lister(
                     continue;
                 }
                 listed.insert(project.clone(), Instant::now());
-                let Ok(worktrees) = git::linked_worktrees(&project) else {
+                let Ok(linked) = git::linked_worktrees(&project) else {
                     continue;
                 };
-                if events
-                    .send(Event::Worktrees { project, worktrees })
-                    .is_err()
-                {
+                let listed = Event::Worktrees {
+                    project,
+                    worktrees: linked.worktrees,
+                    subjects: linked.subjects,
+                };
+                if events.send(listed).is_err() {
                     return;
                 }
             }

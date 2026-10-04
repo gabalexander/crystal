@@ -672,6 +672,10 @@ pub struct App {
     /// Each project's linked worktrees, by its main worktree, as git last
     /// listed them. Those with no sessions stay in the sidebar.
     worktrees: HashMap<PathBuf, Vec<Worktree>>,
+    /// For the worktrees Claude Code made for itself, the subject of the
+    /// commit each is at, by its directory, as git last said: what the
+    /// sidebar names one by.
+    subjects: HashMap<PathBuf, String>,
     /// The main worktrees of the projects crystal knows, as the daemon last
     /// listed them: those with no sessions stay in the sidebar, and the
     /// new-session panel offers them all.
@@ -880,6 +884,7 @@ impl App {
             selected: 0,
             on_worktree: None,
             worktrees: HashMap::new(),
+            subjects: HashMap::new(),
             known: Vec::new(),
             removing: HashSet::new(),
             prompt: None,
@@ -1622,6 +1627,7 @@ impl App {
                     path: project.path.clone(),
                     branch: project.branch.clone(),
                     main: true,
+                    in_progress: project.in_progress,
                 });
                 quiet.push(Row::NoSessions(project.path.clone()));
                 quiet.extend(groups::empty_rows(&empty, &project.path));
@@ -1746,6 +1752,20 @@ impl App {
         self.worktrees.insert(project, worktrees);
         self.know_sessions_worktrees();
         self.keep_selection_on_a_row();
+    }
+
+    /// Takes the subject of the commit each of the worktrees Claude Code
+    /// made for itself in `project` is at, by its directory, in place of
+    /// those known before.
+    pub fn set_subjects(&mut self, project: &Path, subjects: HashMap<PathBuf, String>) {
+        self.subjects.retain(|path, _| !path.starts_with(project));
+        self.subjects.extend(subjects);
+    }
+
+    /// The subject of the commit the worktree at `path` is at, when it's
+    /// one Claude Code made for itself and git has said.
+    pub fn subject_of(&self, path: &Path) -> Option<&str> {
+        self.subjects.get(path).map(String::as_str)
     }
 
     /// Asks again before removing the worktree at `path`, on `branch`,
@@ -5587,6 +5607,7 @@ mod tests {
                 path: PathBuf::from(format!("/code/{project}")),
                 main: true,
                 branch: Some("main".into()),
+                in_progress: None,
             }),
             ..session(name)
         }
@@ -6013,6 +6034,7 @@ mod tests {
                 path: PathBuf::from(format!("/code/app.worktrees/{branch}")),
                 main: branch == "main",
                 branch: Some(branch.into()),
+                in_progress: None,
             }),
             ..session(name)
         }
@@ -6202,6 +6224,7 @@ mod tests {
             path: PathBuf::from(format!("/code/app.worktrees/{branch}")),
             main: false,
             branch: Some(branch.into()),
+            in_progress: None,
         }
     }
 
@@ -6359,6 +6382,7 @@ mod tests {
             path: PathBuf::from(format!("/code/{name}")),
             main: true,
             branch: Some("main".into()),
+            in_progress: None,
         }
     }
 
@@ -8317,6 +8341,7 @@ mod tests {
                 path: PathBuf::from(format!("/code/app/{branch}")),
                 main: branch == "main",
                 branch: Some(branch.into()),
+                in_progress: None,
             }),
             ..session(name)
         }

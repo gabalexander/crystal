@@ -1732,6 +1732,7 @@ mod tests {
                 path: PathBuf::from(format!("/code/app/{branch}")),
                 main,
                 branch: Some(branch.into()),
+                in_progress: None,
             }),
             ..session(name, State::Running)
         }
@@ -1775,6 +1776,7 @@ mod tests {
             path: PathBuf::from("/code/app/old"),
             main: false,
             branch: Some("old".into()),
+            in_progress: None,
         };
         app.set_worktrees(PathBuf::from("/code/app"), vec![old]);
         let lines = sidebar_text(&app);

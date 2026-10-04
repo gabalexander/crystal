@@ -271,8 +271,11 @@ pub fn switch(dir: &Path, target: &Branch, carry: &Carry) -> Outcome {
 /// changed.
 fn try_switch(dir: &Path, target: &Branch, carry: &Carry) -> Result<Outcome> {
     let to = target.local_name();
-    if let Some(what) = in_progress(dir)? {
-        bail!("the worktree is in the middle of {what}: finish it or abort it first");
+    if let Some(what) = super::in_progress(dir) {
+        bail!(
+            "the worktree is in the middle of {}: finish it or abort it first",
+            what.what()
+        );
     }
     let all = all_changes(dir)?;
     if let Some(change) = all.iter().find(|change| change.conflicted()) {
@@ -389,29 +392,6 @@ fn try_switch(dir: &Path, target: &Branch, carry: &Carry) -> Result<Outcome> {
         return Ok(Outcome::Stopped(error));
     }
     Ok(Outcome::Failed(error))
-}
-
-/// What git is in the middle of in the worktree at `dir`, if anything: no
-/// switch is safe then, and a commit would end a merge with its conflicts
-/// in.
-fn in_progress(dir: &Path) -> Result<Option<&'static str>> {
-    const UNDER_WAY: [(&str, &str); 5] = [
-        ("MERGE_HEAD", "a merge"),
-        ("rebase-merge", "a rebase"),
-        ("rebase-apply", "a rebase"),
-        ("CHERRY_PICK_HEAD", "a cherry-pick"),
-        ("REVERT_HEAD", "a revert"),
-    ];
-    let mut args = vec!["rev-parse"];
-    for (file, _) in UNDER_WAY {
-        args.extend(["--git-path", file]);
-    }
-    let paths = git(dir, &args)?;
-    let found = paths
-        .lines()
-        .zip(UNDER_WAY)
-        .find(|(path, _)| dir.join(path).exists());
-    Ok(found.map(|(_, (_, what))| what))
 }
 
 /// The branch the worktree at `dir` is on: `None` when HEAD is detached.

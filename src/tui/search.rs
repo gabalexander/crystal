@@ -102,6 +102,7 @@ mod tests {
                 path: PathBuf::from(format!("/code/{project}")),
                 main: true,
                 branch: Some(branch.into()),
+                in_progress: None,
             }),
             changed: 0,
             task: None,

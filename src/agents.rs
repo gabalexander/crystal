@@ -74,6 +74,19 @@ pub const ABOUT_CRYSTAL: &str = "You're running inside crystal, the terminal wor
                                  to add the notes below for you, and the `crystal` command \
                                  they mention is installed for you to run.";
 
+/// What Claude Code is told about working on several things at once: to
+/// start a session of crystal's for each, which the user sees, rather
+/// than worktrees or subagents of its own, which they don't. Only Claude
+/// Code makes those, and only it has a system prompt to say this in
+/// without touching what the user asked.
+pub const PARALLEL_WORK: &str = "To work on several things at once, start a crystal session \
+                                 for each, `crystal new -d -w <branch> claude \"<task>\"` \
+                                 (with `--base HEAD` when it should start from your \
+                                 commits), rather than worktrees or subagents of your own: \
+                                 each shows in the user's sidebar with its status, its diff \
+                                 and its screen, where they can step in. The crystal skill \
+                                 says more.";
+
 /// The command line to run for `command`. For an agent crystal knows, it
 /// carries the flags that make the agent report to `crystal hook`, run
 /// from `crystal`, the path of this program, and with `resume`, the id of

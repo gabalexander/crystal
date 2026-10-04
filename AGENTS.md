@@ -111,9 +111,10 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   - `layouts.rs`: the layouts view (`S`): the tabs saved under a name, with what starts each of their
     terminals' programs again, and put back, and the tabs a restore replaced; its state and keys, kept apart
     from I/O (the event loop keeps them in the database and starts the sessions gone), and its drawing
-  - `sidebar.rs`: the sidebar's rows: headings, worktree lines, sessions with their mark and how long ago,
-    terminals drawn apart from agents, the sessions that need the user pinned on top with the tab each is
-    in, and the rail of marks a folded sidebar keeps
+  - `sidebar.rs`: the sidebar's rows: headings, worktree lines with what git is in the middle of there and
+    Claude Code's own named by their commits, sessions with their mark and how long ago, terminals drawn
+    apart from agents, the sessions that need the user pinned on top with the tab each is in, and the rail
+    of marks a folded sidebar keeps
   - `keymap.rs`: the sidebar's commands, each with the id `[keys]` names it by, what it does and its default
     keys; keys as the config writes them and as terminals send them, folded into one form; the config's
     keys laid over the defaults, a key given to one command taken from the one that had it; the prefix and
@@ -132,7 +133,7 @@ whenever what's handed over changes in a way the crystal before couldn't read.
     the defaults
   - `groups.rs`: the sidebar's order and headings: sessions by project, then worktree, agents before
     terminals, each flow run's steps under it, and linked worktrees with no sessions left at the end of
-    their project
+    their project, Claude Code's own last
   - `text_input.rs`: a one-line text box, for the questions asked on the bottom line
   - `text_area.rs`: a text box of several lines that wrap: the new-session panel's task, and the reply box
   - `reply.rs`: the reply box (`Space`): the next prompt for a session, or a background task's follow-up,
@@ -392,8 +393,10 @@ whenever what's handed over changes in a way the crystal before couldn't read.
 - `src/git.rs`: a directory's project, worktree and branch, a project's linked worktrees, and making and
   removing worktrees, a new branch from `origin`'s default (fetched, with a timeout), the settings' base or
   `--base`, a pull request's with its commits fetched from `origin`, the patches the diff reads,
-  the files a worktree changed since its branch left the default one, and `git grep` stopped once it's no
-  longer wanted (runs `git`)
+  the files a worktree changed since its branch left the default one, what git is in the middle of in a
+  worktree (a merge, a rebase, a cherry-pick or a revert) and the branch a rebase keeps though HEAD is
+  detached, the subject of the commit each of Claude Code's own worktrees (`.claude/worktrees`) is at, and
+  `git grep` stopped once it's no longer wanted (runs `git`)
   - `git/branches.rs`: a worktree's branches, local and remote, its uncommitted changes, and switching it to
     another branch or a new one, the changes stashed, brought along, committed or thrown away, and put back
     when git won't switch

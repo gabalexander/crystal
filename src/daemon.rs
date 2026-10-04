@@ -1883,6 +1883,16 @@ impl Daemon {
                 } else {
                     TaskState::Done
                 };
+                // Work left in the middle of a rebase or a merge isn't
+                // done, whatever the summary says.
+                if !failed && let Some(what) = session.worktree_in_progress() {
+                    bail!(
+                        "{}'s worktree is in the middle of {}: finish it or abort it \
+                         first, or close the task with `crystal done --failed`",
+                        session.info().name,
+                        what.what()
+                    );
+                }
                 let kept = self.keep_files(session, &artifacts)?;
                 let closed = session.close_task(state, &summary)?;
                 self.record_kept(&session.info(), &closed, &kept);
@@ -2821,10 +2831,13 @@ fn start(
     let about_task = task
         .as_ref()
         .map(|_| tasks::instructions(backlog::enabled(&config)));
+    let parallel = (agents::program_name(&command) == Some("claude"))
+        .then(|| agents::PARALLEL_WORK.to_string());
     let remembered = remembered(socket, &cwd, &command);
     let said = [
         task.as_deref(),
         about_task.as_deref(),
+        parallel.as_deref(),
         remembered.as_deref(),
     ];
     let handoff = handoff_note(&cwd, &said);
@@ -2833,7 +2846,7 @@ fn start(
     let instructions = if resumed {
         Vec::new()
     } else {
-        notes(about_task, handoff, remembered)
+        notes(about_task, parallel, handoff, remembered)
     };
     let argv = agents::argv(
         &asked,
@@ -2890,17 +2903,20 @@ fn resumable(
 }
 
 /// What crystal tells an agent on top of what it was asked, a paragraph
-/// each: about its task first, the one thing it mustn't forget, then the
-/// notes the sessions before it in its worktree left, then what the
-/// project's memory has, all opened by where they come from. Nothing at
-/// all when there's nothing to say.
+/// each: about its task first, the one thing it mustn't forget, then how
+/// to work on several things at once here, then the notes the sessions
+/// before it in its worktree left, then what the project's memory has, all
+/// opened by where they come from. Nothing at all when there's nothing to
+/// say.
 fn notes(
     about_task: Option<String>,
+    parallel: Option<String>,
     handoff: Option<String>,
     remembered: Option<String>,
 ) -> Vec<String> {
     let said: Vec<String> = about_task
         .into_iter()
+        .chain(parallel)
         .chain(handoff)
         .chain(remembered)
         .collect();
@@ -3047,7 +3063,7 @@ fn task_args(socket: &Path, cwd: &Path, spec: &protocol::TaskSpec) -> Vec<String
         .then(|| launch_memory(socket, cwd, &spec.prompt, memory::Reader::Task))
         .flatten();
     let handoff = handoff_note(cwd, &[remembered.as_deref()]);
-    let mut args = agents::with_instructions(&spec.args, &notes(None, handoff, remembered));
+    let mut args = agents::with_instructions(&spec.args, &notes(None, None, handoff, remembered));
     let mut tools = crystal_commands(&config);
     if memory_on && let Ok(crystal) = std::env::current_exe() {
         let server = mcp::config(&crystal, socket, cwd);
@@ -3542,6 +3558,7 @@ mod tests {
     fn crystal_s_notes_say_where_they_come_from_then_the_task_then_the_memory() {
         let notes = notes(
             Some("about the task".into()),
+            Some("in parallel".into()),
             Some("handed off".into()),
             Some("remembered".into()),
         );
@@ -3550,6 +3567,7 @@ mod tests {
             [
                 agents::ABOUT_CRYSTAL,
                 "about the task",
+                "in parallel",
                 "handed off",
                 "remembered"
             ]
@@ -3558,9 +3576,9 @@ mod tests {
 
     #[test]
     fn with_nothing_to_say_there_are_no_notes_at_all() {
-        assert!(notes(None, None, None).is_empty());
-        assert_eq!(notes(None, None, Some("remembered".into())).len(), 2);
-        assert_eq!(notes(None, Some("handed off".into()), None).len(), 2);
+        assert!(notes(None, None, None, None).is_empty());
+        assert_eq!(notes(None, None, None, Some("remembered".into())).len(), 2);
+        assert_eq!(notes(None, None, Some("handed off".into()), None).len(), 2);
     }
 
     #[test]

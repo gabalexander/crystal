@@ -963,12 +963,13 @@ fn n_starts_claude_with_its_hooks_and_the_task_as_its_prompt() {
     tui.shows("▸ claude");
 
     // Given a task, Claude is told how to close it, ahead of the prompt,
-    // after a word on where that comes from. One argument a line, and a
-    // blank line between the paragraphs.
+    // after a word on where that comes from, then how to work on several
+    // things at once. One argument a line, and a blank line between the
+    // paragraphs.
     let args = written(&crystal.dir.path().join("args"));
     let args: Vec<&str> = args.lines().collect();
     // It may run the crystal commands it's told to without asking.
-    assert_eq!(args.len(), 10, "{args:?}");
+    assert_eq!(args.len(), 12, "{args:?}");
     assert_eq!(args[..2], ["--allowedTools", ALLOWED]);
     assert_eq!(args[2], "--settings");
     assert_eq!(args[4], "--append-system-prompt");
@@ -977,7 +978,11 @@ fn n_starts_claude_with_its_hooks_and_the_task_as_its_prompt() {
         "{args:?}"
     );
     assert!(args[7].contains("crystal done"), "{args:?}");
-    assert_eq!(args[8..], ["--", "fix the login bug"]);
+    assert!(
+        args[9].starts_with("To work on several things at once"),
+        "{args:?}"
+    );
+    assert_eq!(args[10..], ["--", "fix the login bug"]);
 }
 
 #[test]
@@ -1673,11 +1678,13 @@ fn claude_reports_what_it_is_doing_through_its_hooks() {
     assert!(out.status.success());
     assert_eq!(crystal.row("agent").unwrap()[7], "claude --resume");
 
-    // crystal added its hooks ahead of the arguments it was given.
+    // crystal added its hooks and its notes ahead of the arguments it was
+    // given.
     let args = written(&crystal.dir.path().join("args"));
     let args: Vec<&str> = args.lines().collect();
     assert_eq!(args[2], "--settings");
-    assert_eq!(args[4], "--resume");
+    assert_eq!(args[4], "--append-system-prompt");
+    assert_eq!(args.last(), Some(&"--resume"));
     let settings: serde_json::Value = serde_json::from_str(args[3]).unwrap();
     let hook = settings["hooks"]["Stop"][0]["hooks"][0]["command"]
         .as_str()
@@ -2626,10 +2633,20 @@ fn claude_picks_its_conversation_up_again_after_a_restart() {
         .unwrap();
     assert!(out.status.success());
 
-    // Started again with crystal's resume in place of its own --continue.
+    // Started again with crystal's resume in place of its own --continue,
+    // and crystal's notes in its system prompt as before, but not its
+    // first prompt again.
     let args = written(&crystal.dir.path().join("args"));
     let args: Vec<&str> = args.lines().collect();
-    assert_eq!(args[4..], ["--resume", "abc-123"]);
+    assert_eq!(
+        args[4..7],
+        ["--resume", "abc-123", "--append-system-prompt"]
+    );
+    assert!(
+        args[7].starts_with("You're running inside crystal"),
+        "{args:?}"
+    );
+    assert!(!args.contains(&"--"), "{args:?}");
 }
 
 /// Waits until the session's screen shows `text`, as `crystal read` sees it.
@@ -5078,7 +5095,11 @@ fn respawned_claude_picks_its_conversation_up_again() {
     assert!(out.status.success());
     let args = written(&crystal.dir.path().join("args"));
     let args: Vec<&str> = args.lines().collect();
-    assert_eq!(args[4..], ["--resume", "abc-123"]);
+    assert_eq!(
+        args[4..7],
+        ["--resume", "abc-123", "--append-system-prompt"]
+    );
+    assert!(!args.contains(&"--"), "{args:?}");
 }
 
 #[test]
@@ -5180,6 +5201,95 @@ fn a_worktree_whose_last_session_is_killed_stays_until_shift_w_removes_it() {
     eventually("the worktree is gone", || !worktree.exists());
     tui.hides("no sessions");
     tui.hides("⎇ fix");
+}
+
+#[test]
+fn a_worktree_in_the_middle_of_a_rebase_keeps_its_branch_and_says_so() {
+    let crystal = Crystal::new();
+    let repo = git_repo(crystal.dir.path(), "app");
+    let repo_arg = repo.to_str().unwrap();
+    // `fix` and `main` change the same line, so a rebase stops on it.
+    std::fs::write(repo.join("f.txt"), "first\n").unwrap();
+    git(&repo, &["add", "f.txt"]);
+    git(&repo, &["commit", "-q", "-m", "a file"]);
+    git(&repo, &["checkout", "-q", "-b", "fix"]);
+    std::fs::write(repo.join("f.txt"), "the fix\n").unwrap();
+    git(&repo, &["commit", "-q", "-am", "the fix"]);
+    git(&repo, &["checkout", "-q", "main"]);
+    std::fs::write(repo.join("f.txt"), "on main\n").unwrap();
+    git(&repo, &["commit", "-q", "-am", "on main"]);
+    crystal.ok(&["new", "-n", "planner", "-c", repo_arg, "sleep", "30"]);
+    crystal.ok(&[
+        "new", "-n", "fixer", "-c", repo_arg, "-w", "fix", "sleep", "30",
+    ]);
+    let worktree = crystal.dir.path().join("app.worktrees/fix");
+    let rebase = Command::new("git")
+        .args(["-C", worktree.to_str().unwrap(), "rebase", "main"])
+        .envs(PLAIN_GIT)
+        .output()
+        .unwrap();
+    assert!(!rebase.status.success(), "the rebase should stop");
+
+    // git calls the worktree detached meanwhile; crystal keeps its branch
+    // and says what it's in the middle of.
+    let fixer = listed(&crystal, "fixer");
+    assert_eq!(fixer["worktree"]["branch"], "fix", "{fixer}");
+    assert_eq!(fixer["worktree"]["in_progress"], "rebase", "{fixer}");
+    let tui = crystal.tui();
+    tui.shows("⎇ fix · rebasing");
+    tui.hides("detached");
+
+    // Aborted, the worktree is on its branch again, which `ls` says at
+    // once; a session's line in the sidebar follows as the session changes.
+    git(&worktree, &["rebase", "--abort"]);
+    let fixer = listed(&crystal, "fixer");
+    assert_eq!(fixer["worktree"]["branch"], "fix", "{fixer}");
+    assert!(fixer["worktree"].get("in_progress").is_none(), "{fixer}");
+}
+
+#[test]
+fn a_worktree_claude_code_made_for_itself_is_named_by_its_commit() {
+    let crystal = Crystal::new();
+    let repo = git_repo(crystal.dir.path(), "app");
+    let repo_arg = repo.to_str().unwrap();
+    std::fs::create_dir_all(repo.join(".claude/worktrees")).unwrap();
+    let own = repo.join(".claude/worktrees/agent-a2d61d640a4ff454d");
+    let own_arg = own.to_str().unwrap();
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "worktree-agent-a2d61d640a4ff454d",
+            own_arg,
+        ],
+    );
+    std::fs::write(own.join("new.txt"), "x\n").unwrap();
+    git(&own, &["add", "."]);
+    git(&own, &["commit", "-q", "-m", "feat: add x"]);
+    crystal.ok(&["new", "-n", "planner", "-c", repo_arg, "sleep", "30"]);
+    crystal.ok(&["new", "-n", "fixer", "-c", repo_arg, "-w", "fix", "true"]);
+    crystal.ok(&["kill", "fixer"]);
+
+    // Claude Code's worktree is named by what it holds, after the others.
+    let mut tui = crystal.tui();
+    tui.shows("⎇ claude · feat: add x");
+    tui.hides("worktree-agent");
+    let screen = tui.text();
+    let fix = screen.find("⎇ fix").unwrap();
+    let claude = screen.find("⎇ claude").unwrap();
+    assert!(fix < claude, "{screen}");
+
+    // It's a worktree like any other: `W` removes it.
+    tui.type_keys("jj");
+    tui.shows("No sessions in ⎇ worktree-agent-a2d61d640a4ff454d");
+    tui.type_keys("W");
+    tui.shows("remove worktree worktree-agent-a2d61d640a4ff454d? y/n");
+    tui.type_keys("y");
+    eventually("the worktree is gone", || !own.exists());
+    tui.hides("⎇ claude");
 }
 
 #[test]
@@ -8014,6 +8124,40 @@ fn an_agent_closes_its_task_with_crystal_done_and_ls_shows_how_it_went() {
             && tasks.contains("fix the tests — did what was asked"),
         "{tasks}"
     );
+}
+
+#[test]
+fn done_refuses_while_the_task_s_worktree_is_in_the_middle_of_a_merge() {
+    let crystal = Crystal::new();
+    let repo = git_repo(crystal.dir.path(), "app");
+    let repo_arg = repo.to_str().unwrap();
+    let task = |name: &str| {
+        crystal.ok(&[
+            "new", "-d", "-n", name, "-c", repo_arg, "-t", "fix it", "sleep", "30",
+        ]);
+    };
+    task("fixer");
+    task("quitter");
+    // A merge stopped on conflicts leaves MERGE_HEAD behind until it's
+    // finished or aborted.
+    let head = git(&repo, &["rev-parse", "HEAD"]);
+    std::fs::write(repo.join(".git/MERGE_HEAD"), head).unwrap();
+
+    let refused = crystal.fails(&["done", "-n", "fixer", "fixed it"]);
+    assert!(
+        refused.contains("fixer's worktree is in the middle of a merge")
+            && refused.contains("crystal done --failed"),
+        "{refused}"
+    );
+    assert_eq!(crystal.row("fixer").unwrap()[8], "fix it");
+    // Failed, it closes whatever the worktree is in the middle of.
+    crystal.ok(&["done", "-n", "quitter", "--failed", "the merge conflicts"]);
+    assert_eq!(crystal.row("quitter").unwrap()[8], "✗ the merge conflicts");
+
+    // The merge aborted, the task closes done.
+    std::fs::remove_file(repo.join(".git/MERGE_HEAD")).unwrap();
+    crystal.ok(&["done", "-n", "fixer", "fixed it"]);
+    assert_eq!(crystal.row("fixer").unwrap()[8], "✓ fixed it");
 }
 
 #[test]

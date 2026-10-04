@@ -584,6 +584,7 @@ mod tests {
             path: PathBuf::from("/code/app.worktrees/fix-login"),
             main: false,
             branch: Some("fix/login".into()),
+            in_progress: None,
         };
         let notice = Notice::about(&session(Some(worktree)), Waiting);
         assert_eq!(notice.text, "claude-2 is waiting on you · app fix/login");
