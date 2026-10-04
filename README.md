@@ -1602,9 +1602,17 @@ crystal interrupt docs                                               # stop the 
   `.claude/settings.local.json`, so later sessions there have it too. To be asked less to begin with, allow
   what it needs with `--allowedTools` or `--permission-mode` after `--`.
 - Every Claude Code session crystal starts, a task or in a terminal, may run the crystal commands it's told
-  to without asking: `crystal done`, `crystal backlog add` and reading the backlog, `crystal handoff`,
-  `crystal remember`, and `crystal memory search` and `show`, each only while its plugin is on. Anything
-  that changes or removes what's there, like `crystal backlog rm` or `crystal memory rm`, still asks.
+  to without asking, so one driving others doesn't stop at every step:
+  - starting and driving sessions: `ls`, `new`, `send`, `wait`, `read`, `result`, `interrupt`, `events`,
+    `rename`, `report`, `notify`, `layout`, `pane split` and `pane close`
+  - with tasks on, `done`, `task`, and `tasks` with `show`, `log`, `new` and `start`; with flows on, `flow`
+    with `run`, `wait`, `show`, `defs` and `retry`
+  - with the backlog on, reading it and `add`, `export`, `done`, `reopen` and `start`; with the handoff file
+    on, `handoff`; with memory on, `remember`, and `memory` with `search` and `show`
+
+  What removes or cancels what's there (`kill`, `worktree rm`, `tasks cancel`, `flow cancel`, `backlog rm`,
+  `memory rm`), what's yours to decide (a flow's gate: `flow approve` and `back`), and what answers another
+  agent's question for it (`send-keys`, and `answer`, which can say yes to a permission) still ask.
 - `Ctrl+C` in a task's pane, or `crystal interrupt <task>`, stops the run it's in the middle of. Its task
   stays open, waiting on you, and a follow-up carries on.
 - `crystal send`, or `Space` in the TUI, gives a task a follow-up: on the `claude` still there, or once that

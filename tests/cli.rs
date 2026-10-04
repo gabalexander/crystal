@@ -6920,8 +6920,45 @@ const PRINT_ARGS: &str = "-p --input-format stream-json --output-format stream-j
 
 /// The crystal commands a Claude Code session or task is allowed to run
 /// without asking, by default in these tests, memory being off.
-const ALLOWED: &str = "Bash(crystal done:*),Bash(crystal backlog add:*),Bash(crystal backlog),\
-                       Bash(crystal backlog export),Bash(crystal handoff:*)";
+/// The rules for crystal's own commands a Claude Code session crystal starts
+/// is given, as `crystal_commands` in daemon.rs makes them: its sessions'
+/// always, then each plugin's while it's on.
+macro_rules! session_rules {
+    () => {
+        "Bash(crystal ls:*),Bash(crystal new:*),Bash(crystal send:*),Bash(crystal wait:*),\
+         Bash(crystal read:*),Bash(crystal result:*),Bash(crystal interrupt:*),\
+         Bash(crystal events:*),Bash(crystal rename:*),Bash(crystal report:*),\
+         Bash(crystal notify:*),Bash(crystal layout:*),Bash(crystal pane split:*),\
+         Bash(crystal pane close:*)"
+    };
+}
+
+macro_rules! task_and_flow_rules {
+    () => {
+        "Bash(crystal done:*),Bash(crystal task:*),Bash(crystal tasks),Bash(crystal tasks --all),\
+         Bash(crystal tasks show:*),Bash(crystal tasks log:*),Bash(crystal tasks new:*),\
+         Bash(crystal tasks start:*),Bash(crystal flow),Bash(crystal flow --json),\
+         Bash(crystal flow run:*),Bash(crystal flow wait:*),Bash(crystal flow show:*),\
+         Bash(crystal flow defs:*),Bash(crystal flow retry:*)"
+    };
+}
+
+macro_rules! backlog_and_handoff_rules {
+    () => {
+        "Bash(crystal backlog add:*),Bash(crystal backlog),Bash(crystal backlog --all),\
+         Bash(crystal backlog export),Bash(crystal backlog done:*),\
+         Bash(crystal backlog reopen:*),Bash(crystal backlog start:*),Bash(crystal handoff:*)"
+    };
+}
+
+/// With every plugin on but memory, as the tests' own config has them.
+const ALLOWED: &str = concat!(
+    session_rules!(),
+    ",",
+    task_and_flow_rules!(),
+    ",",
+    backlog_and_handoff_rules!()
+);
 
 /// A stand-in for a background task's `claude -p`, speaking stream-json:
 /// it reads prompts on its standard input, one JSON line each, and answers
@@ -9572,10 +9609,15 @@ esac
 /// What a Claude Code session or task crystal starts is allowed to run
 /// without asking, with every plugin on: the crystal commands it's told
 /// to run, then the tools of crystal's MCP server.
-const ALLOWED_WITH_MEMORY: &str = "Bash(crystal done:*),Bash(crystal backlog add:*),\
-Bash(crystal backlog),Bash(crystal backlog export),Bash(crystal handoff:*),\
-Bash(crystal remember:*),Bash(crystal memory search:*),Bash(crystal memory show:*),\
-mcp__crystal__memory_search,mcp__crystal__memory_show";
+const ALLOWED_WITH_MEMORY: &str = concat!(
+    session_rules!(),
+    ",",
+    task_and_flow_rules!(),
+    ",",
+    backlog_and_handoff_rules!(),
+    ",Bash(crystal remember:*),Bash(crystal memory),Bash(crystal memory search:*),\
+     Bash(crystal memory show:*),mcp__crystal__memory_search,mcp__crystal__memory_show"
+);
 
 #[test]
 fn a_task_may_close_itself_without_asking_whatever_is_off() {
@@ -9593,7 +9635,15 @@ fn a_task_may_close_itself_without_asking_whatever_is_off() {
         .position(|arg| *arg == "--allowedTools")
         .unwrap();
     // Neither memory's commands nor its server, nor the backlog's.
-    assert_eq!(args[at + 1], "Bash(crystal done:*),Bash(crystal handoff:*)");
+    assert_eq!(
+        args[at + 1],
+        concat!(
+            session_rules!(),
+            ",",
+            task_and_flow_rules!(),
+            ",Bash(crystal handoff:*)"
+        )
+    );
     assert!(!args.contains(&"--mcp-config"), "{args:?}");
 }
 
