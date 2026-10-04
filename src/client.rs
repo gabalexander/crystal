@@ -490,18 +490,17 @@ fn runs_in(session: &SessionInfo, path: &Path) -> bool {
         .is_some_and(|worktree| worktree.path == path)
 }
 
-/// Has the TUI used last carry out a layout command, and gives the layout
-/// it came to. A command run in a session says so, for one about "this
-/// session".
+/// Has the TUI used last carry out a layout command, or with none open the
+/// daemon, starting it if it isn't running, and gives the layout it came
+/// to. A command run in a session says so, for one about "this session".
 pub fn lay_out(socket: &Path, command: layout::Command) -> Result<Layout> {
     let order = Order {
         command,
         caller: env::own_session_id(socket),
     };
-    match ask(socket, &Request::Layout(order), false)? {
+    match ask(socket, &Request::Layout(order), true)? {
         Some(Response::Layout(layout)) => Ok(layout),
-        Some(_) => bail!("the daemon didn't answer with the layout"),
-        None => bail!(layout::NO_TUI),
+        _ => bail!("the daemon didn't answer with the layout"),
     }
 }
 

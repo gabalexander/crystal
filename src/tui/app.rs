@@ -6,10 +6,13 @@
 
 mod commands;
 
+pub use commands::Alone;
+
 use super::archived_view::{self, ArchivedView};
 use super::away::{Away, Tally};
 use super::backlog_view::{BacklogChange, BacklogView, Step};
 use super::command_line;
+use super::compose::Typed;
 use super::diff_view::{self, Against, DiffView};
 use super::finder::Finder;
 use super::grep::Grep;
@@ -17,7 +20,7 @@ use super::groups::{self, Row};
 use super::help;
 use super::issues::{self, IssuesView};
 use super::launcher::{self, Launcher, Memory, Run, Setup, Target};
-use super::layouts::{self, Layouts, LayoutsView, Which};
+use super::layouts::{self, Layouts, LayoutsView, Program, Programs, Which};
 use super::memory_view::MemoryView;
 use super::menu::{self, Item, Menu};
 use super::needs_you::{self, NeedsYouView};
@@ -25,13 +28,14 @@ use super::plugins_view::{self, PluginsView};
 use super::preview::Content;
 use super::profiles::{self, ProfilesView};
 use super::pull_requests::{self, PullRequestsView};
+use super::reply::ReplyBox;
 use super::review;
 use super::search;
 use super::settings_view::{self, SettingsView};
 use super::split_tree::{Direction, Pane, SplitTree, Way};
 use super::status::Status;
 use super::switcher::{self, Switcher};
-use super::tabs::{self, Tabs};
+use super::tabs::Tabs;
 use super::text_input::TextInput;
 use super::timeline::{self, TimelineView};
 use super::tree_browser::TreeBrowser;
@@ -360,6 +364,12 @@ pub enum Action {
     },
     /// Stop the run the background task called this is in the middle of.
     Interrupt(String),
+    /// Send `text` to the session called `name` as the user: typed in with
+    /// Enter after it, or a background task's follow-up.
+    Reply {
+        name: String,
+        text: String,
+    },
     /// Ask the daemon for the backlog of the project `dir` is in, for the
     /// backlog view that's open.
     ListBacklog(PathBuf),
@@ -668,6 +678,8 @@ pub struct App {
     prompt: Option<Prompt>,
     /// The new-session panel, while it's open.
     launcher: Option<Launcher>,
+    /// The box a reply to a session is written in, while it's open.
+    reply: Option<ReplyBox>,
     /// The agents installed on this machine, which the panel offers.
     agents: Vec<&'static Agent>,
     /// The profiles in the config file, which the panel offers first and
@@ -819,6 +831,7 @@ impl App {
             removing: HashSet::new(),
             prompt: None,
             launcher: None,
+            reply: None,
             agents: Vec::new(),
             profiles: Vec::new(),
             profiles_on: profile::enabled(&Config::default()),
@@ -1066,6 +1079,69 @@ impl App {
     /// The new-session panel, while it's open.
     pub fn launcher(&self) -> Option<&Launcher> {
         self.launcher.as_ref()
+    }
+
+    /// The reply box, while it's open.
+    pub fn reply(&self) -> Option<&ReplyBox> {
+        self.reply.as_ref()
+    }
+
+    /// Space: opens the reply box for the session called `name`, to send
+    /// it what to do next without going into its pane. Not for one that
+    /// has ended, nor the session this TUI runs in, which would be typing
+    /// into the TUI.
+    fn open_reply(&mut self, name: &str) {
+        let Some(session) = self.position(name).map(|at| &self.sessions[at]) else {
+            return self.notify("there's no session selected".into());
+        };
+        if self.is_own(session) {
+            return self.notify("crystal can't reply to the session it runs in".into());
+        }
+        if session.state != State::Running {
+            return self.notify(format!("{name} has ended: Enter starts it again"));
+        }
+        let label = match &session.front {
+            Some(Front::Task) => "a follow-up: its next run, which carries its conversation on",
+            Some(front) if front.is_agent() => {
+                "its agent's next prompt, typed in with Enter after it"
+            }
+            _ => "typed into it, with Enter after it",
+        };
+        self.reply = Some(ReplyBox::new(name, label));
+    }
+
+    /// A key in the reply box, which has every key while it's open.
+    fn on_reply_key(&mut self, key: KeyEvent) -> Option<Action> {
+        let reply = self.reply.as_mut()?;
+        match reply.on_key(&key) {
+            Typed::Stay => None,
+            Typed::Cancel => {
+                self.reply = None;
+                None
+            }
+            Typed::Send(text) => Some(Action::Reply {
+                name: reply.name.clone(),
+                text,
+            }),
+        }
+    }
+
+    /// The reply to the session called `name` was sent, or why it wasn't:
+    /// sent, the box goes; refused, it stays, what's written and all, and
+    /// says why.
+    pub fn replied(&mut self, name: &str, sent: Result<(), String>) {
+        match sent {
+            Ok(()) => {
+                if self.reply.as_ref().is_some_and(|reply| reply.name == name) {
+                    self.reply = None;
+                }
+                self.notify(format!("sent to {name}"));
+            }
+            Err(reason) => match self.reply.as_mut().filter(|reply| reply.name == name) {
+                Some(reply) => reply.refused(reason),
+                None => self.notify(reason),
+            },
+        }
     }
 
     /// Takes the models Codex lets the user choose.
@@ -1698,19 +1774,43 @@ impl App {
     /// Puts the tabs back the way the layout called `name` had them, and
     /// closes the layouts view: see [`Self::set_tabs`]. Says how many of
     /// the layout's sessions have gone since, which it leaves out.
-    pub fn restore_layout(&mut self, tabs: Tabs, name: &str) {
+    pub fn restore_layout(&mut self, tabs: Tabs, name: &str, started: usize) {
         let gone = tabs
             .sessions()
             .filter(|name| self.position(name).is_none())
             .count();
         self.layouts = None;
         self.set_tabs(tabs);
-        let notice = match gone {
-            0 => format!("restored {name}"),
-            1 => format!("restored {name}: one of its sessions has gone"),
-            gone => format!("restored {name}: {gone} of its sessions have gone"),
+        let started = match started {
+            0 => None,
+            1 => Some("one of its sessions started again".to_string()),
+            started => Some(format!("{started} of its sessions started again")),
+        };
+        let gone = match gone {
+            0 => None,
+            1 => Some("one of its sessions has gone".to_string()),
+            gone => Some(format!("{gone} of its sessions have gone")),
+        };
+        let said: Vec<String> = started.into_iter().chain(gone).collect();
+        let notice = match said.is_empty() {
+            true => format!("restored {name}"),
+            false => format!("restored {name}: {}", said.join(", ")),
         };
         self.notify(notice);
+    }
+
+    /// What starts each session again, by name, but the one this TUI runs
+    /// in: those a layout saved now names, should they go.
+    pub fn programs(&self) -> Programs {
+        (self.sessions.iter())
+            .filter(|session| !self.is_own(session))
+            .filter_map(|session| Some((session.name.clone(), Program::of(session)?)))
+            .collect()
+    }
+
+    /// Whether there's a session called `name`.
+    pub fn has_session(&self, name: &str) -> bool {
+        self.position(name).is_some()
     }
 
     /// The backlog view, while it's open.
@@ -2344,6 +2444,9 @@ impl App {
             self.ask(Question::CloseTask { name, failed }, "");
             return None;
         }
+        if self.reply.is_some() {
+            return self.on_reply_key(key);
+        }
         if self.backlog.is_some() {
             return self.on_backlog_key(key);
         }
@@ -2773,6 +2876,7 @@ impl App {
             || self.layouts.is_some()
             || self.archived.is_some()
             || self.launcher.is_some()
+            || self.reply.is_some()
             || self.profiles_view.is_some()
             || self.plugins_view.is_some()
             || self.settings.is_some()
@@ -2842,6 +2946,11 @@ impl App {
             // Enter starts something there, as `n` does.
             KeyCode::Enter if self.on_worktree.is_some() => return self.open_launcher(false),
             KeyCode::Enter => self.enter(),
+            KeyCode::Char(' ') if self.on_worktree.is_some() => {}
+            KeyCode::Char(' ') => match self.selected_name() {
+                Some(name) => self.open_reply(&name),
+                None => self.notify("there's no session selected".into()),
+            },
             KeyCode::Tab => self.move_to_pane(Round::Forward),
             KeyCode::BackTab => self.move_to_pane(Round::Back),
             KeyCode::Char('s') => self.toggle_split(),
@@ -2863,6 +2972,8 @@ impl App {
             KeyCode::Char('>') => self.ask_where_to_move(),
             KeyCode::Char('[') => self.go_to_tab(self.tabs.previous()),
             KeyCode::Char(']') => self.go_to_tab(self.tabs.next()),
+            KeyCode::Char('{') => self.shift_tab(-1),
+            KeyCode::Char('}') => self.shift_tab(1),
             KeyCode::Char(digit @ '1'..='9') => self.go_to_tab_numbered(digit),
             KeyCode::PageUp => return Some(Action::PageBack(self.selected_slot()?)),
             KeyCode::PageDown => return Some(Action::PageForward(self.selected_slot()?)),
@@ -3873,7 +3984,9 @@ impl App {
         if self.view.is_some() || self.showing_keys() || self.confirm.is_some() {
             return None;
         }
-        if let Some(launcher) = &mut self.launcher {
+        if let Some(reply) = &mut self.reply {
+            reply.on_paste(&text);
+        } else if let Some(launcher) = &mut self.launcher {
             launcher.on_paste(&text);
         } else if let Some(view) = &mut self.profiles_view {
             view.on_paste(&text);
@@ -4022,13 +4135,18 @@ impl App {
     }
 
     /// A key in a background task's pane: `y`, `n` or `Y` answer what it
-    /// asks for, and Ctrl+C stops its run. It takes no others.
+    /// asks for, Space opens the reply box for a follow-up, and Ctrl+C
+    /// stops its run. It takes no others.
     fn on_task_pane_key(&mut self, slot: Slot, key: KeyEvent) -> Option<Action> {
         let session = self.pane_session(slot)?;
         let name = session.name.clone();
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         if ctrl && key.code == KeyCode::Char('c') {
             return Some(Action::Interrupt(name));
+        }
+        if key.code == KeyCode::Char(' ') && !ctrl {
+            self.open_reply(&name);
+            return None;
         }
         let answer = answer_key(key.code).filter(|_| !ctrl);
         match answer {
@@ -4039,7 +4157,7 @@ impl App {
             }
             None => {
                 self.notify(format!(
-                    "{name} takes no keys: ctrl+c stops its run, `crystal send` gives it a follow-up"
+                    "{name} takes no keys: space gives it a follow-up, ctrl+c stops its run"
                 ));
                 None
             }
@@ -4383,10 +4501,7 @@ impl App {
     /// it, in the selected session's directory: a new tab is somewhere to
     /// start new work, and a shell is where that starts.
     fn new_tab(&mut self) -> Option<Action> {
-        let Some(index) = self.tabs.add() else {
-            self.notify_tabs_at_most();
-            return None;
-        };
+        let index = self.tabs.add();
         let dir = self.selected().map(|session| session.cwd.clone());
         self.go_to_tab(index);
         Some(Action::Start {
@@ -4394,11 +4509,6 @@ impl App {
             command: Vec::new(),
             purpose: Purpose::default(),
         })
-    }
-
-    fn notify_tabs_at_most(&mut self) {
-        let most = tabs::MAX_TABS;
-        self.notify(format!("{most} tabs at most: & closes the one in front"));
     }
 
     /// `>`: asks, on the footer, which tab to move the selected session to.
@@ -4414,10 +4524,7 @@ impl App {
     fn move_to_tab(&mut self, name: &str, key: KeyCode) {
         let to = match key {
             KeyCode::Char(digit @ '1'..='9') => digit as usize - '1' as usize,
-            KeyCode::Char('t') => match self.tabs.add() {
-                Some(index) => index,
-                None => return self.notify_tabs_at_most(),
-            },
+            KeyCode::Char('t') => self.tabs.add(),
             _ => return,
         };
         let number = to + 1;
@@ -4476,6 +4583,18 @@ impl App {
     fn go_to_tab_numbered(&mut self, digit: char) {
         if let Some(number) = digit.to_digit(10) {
             self.go_to_tab(number as usize - 1);
+        }
+    }
+
+    /// `{` and `}`: moves the tab in front one place to the left, `by` -1,
+    /// or to the right, `by` 1, past its neighbor. It stays in front.
+    fn shift_tab(&mut self, by: isize) {
+        let from = self.tabs.current_index();
+        let Some(to) = from.checked_add_signed(by) else {
+            return self.notify("this tab is the first already".into());
+        };
+        if !self.tabs.move_tab(from, to) {
+            self.notify("this tab is the last already".into());
         }
     }
 
@@ -4841,6 +4960,7 @@ mod tests {
             task: None,
             asking: None,
             reporter: None,
+            subagents: 0,
         }
     }
 
@@ -6528,7 +6648,7 @@ mod tests {
     fn enter_in_the_layouts_asks_for_the_one_the_bar_is_on() {
         let mut app = app_with(&["a"]);
         let mut layouts = Layouts::default();
-        layouts.save("work", app.tabs_to_keep(), 10);
+        layouts.save("work", app.tabs_to_keep(), app.programs(), 10);
         app.show_layouts(Ok(layouts), None);
         assert_eq!(
             press(&mut app, KeyCode::Enter),
@@ -6558,7 +6678,7 @@ mod tests {
         // a has gone since the layout was saved; d is new.
         app.set_sessions(vec![session("b"), session("c"), session("d")]);
         app.show_layouts(Ok(Layouts::default()), None);
-        app.restore_layout(saved, "work");
+        app.restore_layout(saved.clone(), "work", 0);
         assert!(app.layouts_view().is_none());
         assert_eq!(app.tabs().all().len(), 1);
         assert_eq!(app.tabs().current().name, "work");
@@ -6571,6 +6691,20 @@ mod tests {
             app.notice(),
             Some("restored work: one of its sessions has gone")
         );
+        app.restore_layout(saved, "work", 2);
+        assert_eq!(
+            app.notice(),
+            Some("restored work: 2 of its sessions started again, one of its sessions has gone")
+        );
+    }
+
+    #[test]
+    fn a_layout_saves_what_starts_each_session_but_the_tui_s_own() {
+        let mut app = App::new(Some("me".into()));
+        app.set_sessions(vec![session("a"), session("me")]);
+        let programs = app.programs();
+        assert_eq!(programs.keys().collect::<Vec<_>>(), ["a"]);
+        assert_eq!(programs["a"].command, ["sh"]);
     }
 
     #[test]
@@ -7162,13 +7296,43 @@ mod tests {
     }
 
     #[test]
-    fn nine_tabs_at_most_and_a_tenth_says_so() {
+    fn there_can_be_a_tenth_tab_and_more() {
         let mut app = app_with(&["a"]);
-        for _ in 0..9 {
+        for _ in 0..11 {
             press(&mut app, KeyCode::Char('t'));
         }
-        assert_eq!(app.tabs().all().len(), 9);
-        assert!(app.notice().unwrap().contains("9 tabs at most"));
+        assert_eq!(app.tabs().all().len(), 12);
+        assert_eq!(app.tabs().current_index(), 11);
+        press(&mut app, KeyCode::Char('9'));
+        assert_eq!(app.tabs().current_index(), 8);
+    }
+
+    #[test]
+    fn braces_move_the_tab_in_front_and_it_stays_in_front() {
+        let mut app = app_with(&["a"]);
+        press(&mut app, KeyCode::Char('T'));
+        answer(&mut app, "one");
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('t'));
+        let names = |app: &App| -> Vec<String> {
+            app.tabs()
+                .all()
+                .iter()
+                .map(|tab| tab.name.clone())
+                .collect()
+        };
+        press(&mut app, KeyCode::Char('{'));
+        assert_eq!(names(&app), ["", "one"]);
+        assert_eq!(app.tabs().current_index(), 0);
+        press(&mut app, KeyCode::Char('{'));
+        assert_eq!(app.notice(), Some("this tab is the first already"));
+        press(&mut app, KeyCode::Char('}'));
+        assert_eq!(names(&app), ["one", ""]);
+        assert_eq!(app.tabs().current_index(), 1);
+        press(&mut app, KeyCode::Char('}'));
+        assert_eq!(app.notice(), Some("this tab is the last already"));
+        // The session stays in its tab, which moved with it.
+        assert_eq!(app.tabs().all()[0].sessions, ["a"]);
     }
 
     #[test]
@@ -8317,6 +8481,126 @@ gate = true
         // Nothing worth saying says nothing.
         app.set_away(&Tally::of(&[]));
         assert_eq!(app.away_line(), None);
+    }
+
+    fn type_in(app: &mut App, text: &str) {
+        for c in text.chars() {
+            press(app, KeyCode::Char(c));
+        }
+    }
+
+    #[test]
+    fn space_opens_a_reply_box_and_enter_sends_it_as_the_user() {
+        let mut app = app_with(&["a", "b"]);
+        assert_eq!(press(&mut app, KeyCode::Char(' ')), None);
+        let reply = app.reply().unwrap();
+        assert_eq!(reply.name, "a");
+        assert_eq!(reply.label, "typed into it, with Enter after it");
+        // The box has every key: `q` is a letter, not quitting.
+        type_in(&mut app, "quick");
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT));
+        type_in(&mut app, "fix");
+        let sent = Action::Reply {
+            name: "a".into(),
+            text: "quick\nfix".into(),
+        };
+        assert_eq!(press(&mut app, KeyCode::Enter), Some(sent));
+        assert!(app.reply().unwrap().sending);
+
+        app.replied("a", Ok(()));
+        assert!(app.reply().is_none());
+        assert_eq!(app.notice(), Some("sent to a"));
+        // The sidebar has its keys back.
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(selected_name(&app), Some("b"));
+    }
+
+    #[test]
+    fn a_refused_reply_keeps_what_was_written_and_says_why() {
+        let mut app = app_with(&["a"]);
+        press(&mut app, KeyCode::Char(' '));
+        type_in(&mut app, "go on");
+        press(&mut app, KeyCode::Enter);
+        let why = "agent_blocked: a is asking to use Bash: cargo test";
+        app.replied("a", Err(why.into()));
+        let reply = app.reply().unwrap();
+        assert!(!reply.sending);
+        assert_eq!(reply.problem.as_deref(), Some(why));
+        assert_eq!(reply.text.text(), "go on");
+        assert_eq!(press(&mut app, KeyCode::Esc), None);
+        assert!(app.reply().is_none());
+        // Nothing written, Enter sends nothing.
+        press(&mut app, KeyCode::Char(' '));
+        assert_eq!(press(&mut app, KeyCode::Enter), None);
+        assert!(app.reply().is_none());
+    }
+
+    #[test]
+    fn space_takes_no_reply_for_an_ended_session_or_the_tui_s_own() {
+        let mut app = App::new(Some("me".into()));
+        app.set_sessions(vec![session("me"), ended("gone")]);
+        press(&mut app, KeyCode::Char(' '));
+        assert!(app.reply().is_none());
+        assert_eq!(
+            app.notice(),
+            Some("crystal can't reply to the session it runs in")
+        );
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(selected_name(&app), Some("gone"));
+        press(&mut app, KeyCode::Char(' '));
+        assert!(app.reply().is_none());
+        assert!(app.notice().unwrap().contains("gone has ended"));
+        // In a tab with nothing in it, there's nothing to reply to.
+        let mut empty = App::new(None);
+        press(&mut empty, KeyCode::Char(' '));
+        assert!(empty.reply().is_none());
+        assert_eq!(empty.notice(), Some("there's no session selected"));
+    }
+
+    #[test]
+    fn space_in_a_task_s_pane_gives_it_a_follow_up() {
+        let mut app = App::new(None);
+        let task = SessionInfo {
+            front: Some(Front::Task),
+            ..doing("fixer", Activity::Done)
+        };
+        app.set_sessions(vec![task]);
+        press(&mut app, KeyCode::Enter);
+        assert!(matches!(app.focus(), Focus::Pane(_)));
+        press(&mut app, KeyCode::Char('x'));
+        assert!(app.notice().unwrap().contains("space gives it a follow-up"));
+        press(&mut app, KeyCode::Char(' '));
+        let reply = app.reply().unwrap();
+        assert_eq!(reply.name, "fixer");
+        assert!(reply.label.starts_with("a follow-up"), "{}", reply.label);
+        type_in(&mut app, "now the docs");
+        let sent = Action::Reply {
+            name: "fixer".into(),
+            text: "now the docs".into(),
+        };
+        assert_eq!(press(&mut app, KeyCode::Enter), Some(sent));
+    }
+
+    #[test]
+    fn a_reply_box_takes_a_paste_whole() {
+        let mut app = App::new(None);
+        let agent = SessionInfo {
+            front: Some(Front::Agent {
+                program: "claude".into(),
+                name: "Claude Code".into(),
+            }),
+            ..session("claude")
+        };
+        app.set_sessions(vec![agent]);
+        press(&mut app, KeyCode::Char(' '));
+        assert!(
+            app.reply()
+                .unwrap()
+                .label
+                .starts_with("its agent's next prompt")
+        );
+        assert_eq!(app.on_paste("line one\nline two".into()), None);
+        assert_eq!(app.reply().unwrap().text.text(), "line one\nline two");
     }
 
     fn labels(app: &App) -> Vec<&'static str> {

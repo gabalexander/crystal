@@ -1,10 +1,12 @@
 //! Layouts, `S` in the sidebar: the tabs saved under a name, to put back
 //! later. A layout is the tabs as they were: their names, which sessions
 //! each holds, its panes with how they're split and how big each is, its
-//! float, whether it's zoomed, and which tab was in front. Restoring one
-//! arranges the sessions running now that way; those it names that have
-//! gone since are left out, and those it doesn't name join the tab in
-//! front. The tabs a restore replaces are kept, to go back to.
+//! float, whether it's zoomed, and which tab was in front; and what starts
+//! each of its terminals' programs again, its command and directory.
+//! Restoring one starts again those it names that have gone since, then
+//! arranges the sessions that way; those it can't start are left out, and
+//! those it doesn't name join the tab in front. The tabs a restore replaces
+//! are kept, to go back to.
 //!
 //! The view's keys: Enter restores the layout the bar is on, `s` saves the
 //! tabs as one under a name typed on the footer, and `x` removes one once
@@ -15,6 +17,8 @@ use super::sidebar::{ago, fit};
 use super::tabs::Tabs;
 use super::text_input::TextInput;
 use super::theme::Theme;
+use crate::catalog;
+use crate::protocol::{Front, SessionInfo};
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
@@ -23,6 +27,8 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 /// Which shape of file [`save`] writes. A file of another shape is shown
 /// as one that can't be read, and isn't written over.
@@ -36,6 +42,45 @@ pub struct Layout {
     /// When it was saved, in seconds since the Unix epoch.
     pub saved: u64,
     pub tabs: Tabs,
+    /// What starts the sessions it names again, by name, when they've gone.
+    /// None for a layout saved before layouts started them.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub programs: Programs,
+}
+
+/// What starts sessions again, by their names.
+pub type Programs = BTreeMap<String, Program>;
+
+/// What starts a session's program again: its command, as it was started
+/// but for an agent's first prompt, and its directory.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Program {
+    pub command: Vec<String>,
+    pub cwd: PathBuf,
+}
+
+impl Program {
+    /// What starts `session` again, for one running in a terminal: a
+    /// background task has no program of its own. An agent given a first
+    /// prompt starts without it, as it would be asked that again.
+    pub fn of(session: &SessionInfo) -> Option<Program> {
+        let background = session.task.as_ref().is_some_and(|task| task.background);
+        if background || session.front == Some(Front::Task) || session.command.is_empty() {
+            return None;
+        }
+        Some(Program {
+            command: catalog::without_first_prompt(&session.command),
+            cwd: session.cwd.clone(),
+        })
+    }
+}
+
+/// A layout put back: its tabs, and what starts the sessions they name
+/// again.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Restored {
+    pub tabs: Tabs,
+    pub programs: Programs,
 }
 
 impl Layout {
@@ -84,13 +129,15 @@ impl Layouts {
         }
     }
 
-    /// Saves `tabs` as the layout called `name`, in place of the one called
-    /// that, if there is one. Says whether there was.
-    pub fn save(&mut self, name: &str, tabs: Tabs, now: u64) -> bool {
+    /// Saves `tabs` as the layout called `name`, with `programs` to start
+    /// their sessions again, in place of the one called that, if there is
+    /// one. Says whether there was.
+    pub fn save(&mut self, name: &str, tabs: Tabs, programs: Programs, now: u64) -> bool {
         let layout = Layout {
             name: name.to_string(),
             saved: now,
             tabs,
+            programs,
         };
         match self.saved.iter_mut().find(|saved| saved.name == name) {
             Some(saved) => {
@@ -111,12 +158,19 @@ impl Layouts {
         }
     }
 
-    /// Restores `which` in place of the tabs there are now, `current`: gives
-    /// back the tabs it saved, put right, and keeps `current` to go back
-    /// to. Going back is once only: the tabs it replaces aren't kept.
+    /// Restores `which` in place of the tabs there are now, `current`, with
+    /// `programs` to start their sessions again: gives back the tabs it
+    /// saved, put right, and what starts theirs, and keeps `current` to go
+    /// back to. Going back is once only: the tabs it replaces aren't kept.
     /// `None`, and nothing changes, when there's no such layout, or it was
     /// saved by a crystal that kept tabs another way.
-    pub fn restore(&mut self, which: &Which, current: Tabs, now: u64) -> Option<Tabs> {
+    pub fn restore(
+        &mut self,
+        which: &Which,
+        current: Tabs,
+        programs: Programs,
+        now: u64,
+    ) -> Option<Restored> {
         let layout = self.get(which)?.clone();
         let tabs = layout.tabs.kept()?;
         self.before = match which {
@@ -124,10 +178,14 @@ impl Layouts {
                 name: name.clone(),
                 saved: now,
                 tabs: current,
+                programs,
             }),
             Which::Before => None,
         };
-        Some(tabs)
+        Some(Restored {
+            tabs,
+            programs: layout.programs,
+        })
     }
 }
 
@@ -419,6 +477,45 @@ mod tests {
         }
     }
 
+    /// What starts each session named, with its program, in /tmp.
+    fn programs(named: &[(&str, &str)]) -> Programs {
+        let program = |command: &str| Program {
+            command: vec![command.to_string()],
+            cwd: PathBuf::from("/tmp"),
+        };
+        (named.iter())
+            .map(|(name, command)| (name.to_string(), program(command)))
+            .collect()
+    }
+
+    #[test]
+    fn a_terminal_s_program_starts_again_and_an_agent_without_its_prompt() {
+        let session = |command: &[&str]| SessionInfo {
+            name: "x".into(),
+            id: "x".into(),
+            command: command.iter().map(|word| word.to_string()).collect(),
+            cwd: PathBuf::from("/work"),
+            pid: Some(1),
+            state: crate::protocol::State::Running,
+            activity: None,
+            worktree: None,
+            changed: 0,
+            front: None,
+            task: None,
+            asking: None,
+            reporter: None,
+            subagents: 0,
+            stopped_idle: false,
+        };
+        let claude = Program::of(&session(&["claude", "--model", "opus", "--", "fix it"]));
+        assert_eq!(claude.unwrap().command, ["claude", "--model", "opus"]);
+        let shell = Program::of(&session(&["zsh"])).unwrap();
+        assert_eq!(shell.cwd, PathBuf::from("/work"));
+        let mut task = session(&["claude", "-p"]);
+        task.front = Some(Front::Task);
+        assert_eq!(Program::of(&task), None);
+    }
+
     /// Tabs with one tab, named `name`, holding `sessions`.
     fn tabs_of(name: &str, sessions: &[&str]) -> Tabs {
         let mut tabs = Tabs::default();
@@ -432,9 +529,9 @@ mod tests {
     #[test]
     fn saving_under_a_name_there_is_already_replaces_it() {
         let mut layouts = Layouts::default();
-        assert!(!layouts.save("work", tabs_of("one", &["a"]), 10));
-        assert!(!layouts.save("review", tabs_of("two", &["b"]), 20));
-        assert!(layouts.save("work", tabs_of("three", &["c"]), 30));
+        assert!(!layouts.save("work", tabs_of("one", &["a"]), Programs::new(), 10));
+        assert!(!layouts.save("review", tabs_of("two", &["b"]), Programs::new(), 20));
+        assert!(layouts.save("work", tabs_of("three", &["c"]), Programs::new(), 30));
         let names: Vec<&str> = layouts.saved.iter().map(|l| l.name.as_str()).collect();
         assert_eq!(names, ["work", "review"]);
         let work = layouts.get(&Which::Saved("work".into())).unwrap();
@@ -445,26 +542,38 @@ mod tests {
     #[test]
     fn a_restore_keeps_the_tabs_it_replaces_to_go_back_to_once() {
         let mut layouts = Layouts::default();
-        layouts.save("work", tabs_of("saved", &["a"]), 10);
+        let saved = programs(&[("a", "vim")]);
+        layouts.save("work", tabs_of("saved", &["a"]), saved.clone(), 10);
         let now = tabs_of("now", &["b"]);
+        let running = programs(&[("b", "htop")]);
         let work = Which::Saved("work".into());
-        let restored = layouts.restore(&work, now.clone(), 20).unwrap();
-        assert_eq!(restored.current().name, "saved");
+        let restored = layouts.restore(&work, now.clone(), running.clone(), 20);
+        let restored = restored.unwrap();
+        assert_eq!(restored.tabs.current().name, "saved");
+        assert_eq!(restored.programs, saved);
         let before = layouts.before.clone().unwrap();
         assert_eq!((before.name.as_str(), before.saved), ("work", 20));
         assert_eq!(before.tabs, now);
 
-        let back = layouts.restore(&Which::Before, restored, 30).unwrap();
-        assert_eq!(back, now);
+        let back = layouts.restore(&Which::Before, restored.tabs, saved, 30);
+        let back = back.unwrap();
+        assert_eq!(back.tabs, now);
+        assert_eq!(back.programs, running);
         assert_eq!(layouts.before, None);
-        assert_eq!(layouts.restore(&Which::Before, back, 40), None);
+        let again = layouts.restore(&Which::Before, back.tabs, running, 40);
+        assert_eq!(again, None);
     }
 
     #[test]
     fn layouts_kept_come_back_as_they_were() {
         assert_eq!(read(None), Ok(Layouts::default()));
         let mut layouts = Layouts::default();
-        layouts.save("work", tabs_of("one", &["a", "b"]), 10);
+        layouts.save(
+            "work",
+            tabs_of("one", &["a", "b"]),
+            programs(&[("a", "vim")]),
+            10,
+        );
         let json = serde_json::to_string(&layouts).unwrap();
         assert_eq!(read(Some(&json)), Ok(layouts));
     }
@@ -476,7 +585,8 @@ mod tests {
             "selection_at": 1}], "current": 0}}]}"#;
         let mut layouts = read(Some(old)).unwrap();
         let work = Which::Saved("work".into());
-        let tabs = layouts.restore(&work, Tabs::default(), 20).unwrap();
+        let restored = layouts.restore(&work, Tabs::default(), Programs::new(), 20);
+        let tabs = restored.unwrap().tabs;
         assert_eq!(tabs.current().splits(), ["a"]);
         let panes = tabs.current().panes.panes();
         assert_eq!(panes.last(), Some(&&Pane::Selection));
@@ -501,10 +611,11 @@ mod tests {
     fn view_with(names: &[(&str, u64)], before: bool) -> LayoutsView {
         let mut layouts = Layouts::default();
         for (name, saved) in names {
-            layouts.save(name, tabs_of(name, &["a"]), *saved);
+            layouts.save(name, tabs_of(name, &["a"]), Programs::new(), *saved);
         }
         if before {
-            layouts.restore(&Which::Saved(names[0].0.into()), tabs_of("old", &[]), 100);
+            let first = Which::Saved(names[0].0.into());
+            layouts.restore(&first, tabs_of("old", &[]), Programs::new(), 100);
         }
         LayoutsView::new(Ok(layouts), vec!["a".into()])
     }
@@ -557,9 +668,9 @@ mod tests {
         let mut view = view_with(&[("a", 10), ("b", 20)], false);
         press(&mut view, KeyCode::Down);
         let mut layouts = Layouts::default();
-        layouts.save("a", tabs_of("a", &[]), 10);
-        layouts.save("b", tabs_of("b", &[]), 20);
-        layouts.save("c", tabs_of("c", &[]), 30);
+        layouts.save("a", tabs_of("a", &[]), Programs::new(), 10);
+        layouts.save("b", tabs_of("b", &[]), Programs::new(), 20);
+        layouts.save("c", tabs_of("c", &[]), Programs::new(), 30);
         view.set_layouts(Ok(layouts.clone()), None);
         assert_eq!(view.rows()[view.highlighted], Which::Saved("a".into()));
         let c = Which::Saved("c".into());

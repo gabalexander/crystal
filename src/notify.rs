@@ -428,6 +428,7 @@ mod tests {
             task: None,
             asking: None,
             reporter: None,
+            subagents: 0,
         }
     }
 

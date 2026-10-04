@@ -12,11 +12,12 @@
 use crate::artifacts;
 use crate::flow_run::{FlowRun, StepState};
 use crate::memory::{self, Entry};
+use crate::messages::{self, Sender};
 use crate::plugin_manifest;
 use crate::project;
 use crate::protocol::{
     Activity, Answer, Artifact, ArtifactKind, Asking, BacklogItem, Reporter, SessionInfo, State,
-    TaskOutcome, TaskRecord, TaskResult, TaskState,
+    Subagent, TaskOutcome, TaskRecord, TaskResult, TaskState,
 };
 use crate::shell;
 use serde::{Deserialize, Serialize};
@@ -38,6 +39,9 @@ pub enum Kind {
     SessionArchived,
     SessionClaimed,
     SessionReleased,
+    SubagentStarted,
+    SubagentStopped,
+    SessionMessage,
     TaskOpened,
     TaskStarted,
     TaskWaiting,
@@ -66,7 +70,7 @@ pub enum Kind {
 }
 
 impl Kind {
-    pub const ALL: [Kind; 36] = [
+    pub const ALL: [Kind; 39] = [
         Kind::SessionStarted,
         Kind::SessionRenamed,
         Kind::SessionWorking,
@@ -78,6 +82,9 @@ impl Kind {
         Kind::SessionArchived,
         Kind::SessionClaimed,
         Kind::SessionReleased,
+        Kind::SubagentStarted,
+        Kind::SubagentStopped,
+        Kind::SessionMessage,
         Kind::TaskOpened,
         Kind::TaskStarted,
         Kind::TaskWaiting,
@@ -119,6 +126,9 @@ impl Kind {
             Kind::SessionArchived => "session.archived",
             Kind::SessionClaimed => "session.claimed",
             Kind::SessionReleased => "session.released",
+            Kind::SubagentStarted => "subagent.started",
+            Kind::SubagentStopped => "subagent.stopped",
+            Kind::SessionMessage => "session.message",
             Kind::TaskOpened => "task.opened",
             Kind::TaskStarted => "task.started",
             Kind::TaskWaiting => "task.waiting",
@@ -219,6 +229,11 @@ pub struct Event {
     pub handoff: Option<HandoffAbout>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub daemon: Option<DaemonAbout>,
+    /// The subagent a session's agent started, or that finished.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent: Option<Subagent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<MessageAbout>,
 }
 
 /// The session an event is about, as it was then.
@@ -317,6 +332,20 @@ pub struct PluginAbout {
     pub why: String,
 }
 
+/// A message a session was sent with `crystal send`, or from the TUI.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageAbout {
+    /// The session that sent it, by name, when another session did; `None`
+    /// from the user, or a script.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+    /// That session's id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_id: Option<String>,
+    /// The first line of what it says, after the line saying who sent it.
+    pub line: String,
+}
+
 /// The daemon, handed over to another crystal: the version it runs now,
 /// and how many sessions carried on through it. The version it ran before
 /// is the event's `from`.
@@ -347,6 +376,8 @@ impl Event {
             artifact: None,
             handoff: None,
             daemon: None,
+            subagent: None,
+            message: None,
         }
     }
 
@@ -626,6 +657,33 @@ impl Event {
         }
     }
 
+    /// `session`'s agent started `subagent`, or it finished, as `kind`
+    /// says; `session` counts it already.
+    pub fn subagent(kind: Kind, session: &SessionInfo, subagent: Subagent) -> Event {
+        Event {
+            subagent: Some(subagent),
+            ..Event::about_session(kind, session)
+        }
+    }
+
+    /// `session` was sent `text`: by the session `from`, whose header
+    /// starts it, or by the user.
+    pub fn message(session: &SessionInfo, from: Option<&Sender>, text: &str) -> Event {
+        let said = match from {
+            Some(_) => text.split_once('\n').map_or("", |(_, said)| said),
+            None => text,
+        };
+        let message = MessageAbout {
+            from: from.map(|sender| sender.name.clone()),
+            from_id: from.map(|sender| sender.id.clone()),
+            line: first_line(said),
+        };
+        Event {
+            message: Some(message),
+            ..Event::about_session(Kind::SessionMessage, session)
+        }
+    }
+
     /// The daemon, which ran crystal `from`, was handed over to this one,
     /// and `sessions` carried on through it.
     pub fn handed_over(from: &str, version: &str, sessions: usize) -> Event {
@@ -690,6 +748,18 @@ impl Event {
                 .and_then(|session| session.reporter.as_ref())
                 .map_or(String::new(), |reporter| format!("by {}", reporter.agent)),
             Kind::SessionReleased => format!("by {}", self.from.as_deref().unwrap_or("?")),
+            Kind::SubagentStarted | Kind::SubagentStopped => {
+                self.subagent.as_ref().map_or(String::new(), |subagent| {
+                    match &subagent.agent_type {
+                        Some(agent_type) => format!("{agent_type} ({})", subagent.id),
+                        None => subagent.id.clone(),
+                    }
+                })
+            }
+            Kind::SessionMessage => self.message.as_ref().map_or(String::new(), |message| {
+                let from = message.from.as_deref().unwrap_or("you");
+                format!("from {from}: {}", message.line)
+            }),
             Kind::SessionEnded => self
                 .session
                 .as_ref()
@@ -852,6 +922,7 @@ pub fn example(kind: Kind, session: Option<&SessionInfo>, dir: &Path) -> Event {
             task: None,
             asking: None,
             reporter: None,
+            subagents: 0,
         },
     };
     let now = now_ms() / 1000;
@@ -935,6 +1006,26 @@ pub fn example(kind: Kind, session: Option<&SessionInfo>, dir: &Path) -> Event {
             Event::about_session(kind, &session)
         }
         Kind::SessionReleased => Event::released(&session, "my-agent"),
+        Kind::SubagentStarted | Kind::SubagentStopped => {
+            let subagent = Subagent {
+                id: "a1b2c3".into(),
+                agent_type: Some("Explore".into()),
+            };
+            let subagents = u32::from(kind == Kind::SubagentStarted);
+            Event::subagent(
+                kind,
+                &SessionInfo {
+                    subagents,
+                    ..session
+                },
+                subagent,
+            )
+        }
+        Kind::SessionMessage => {
+            let from = Sender::new("p8w2…", "scout", None);
+            let text = messages::compose(&from, "The codec moved to crates/codec");
+            Event::message(&session, Some(&from), &text)
+        }
         Kind::TaskOpened | Kind::TaskStarted | Kind::TaskWaiting => {
             Event::task(kind, &session, task)
         }
@@ -1129,6 +1220,7 @@ mod tests {
             task: None,
             asking: None,
             reporter: None,
+            subagents: 0,
         }
     }
 

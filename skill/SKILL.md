@@ -197,7 +197,8 @@ crystal pane close tests          # off the screen again
 crystal layout --json             # the TUI's tabs, the sessions in each, and how their panes split
 ```
 
-- These need the TUI open; without one they fail, saying "no TUI is running": carry on without them.
+- They go to the TUI the user used last. With none open, the daemon lays the tabs out itself, and the TUI
+  opens on them.
 - They change what the user sees. Split off what helps them follow your work, close it when it's done, and
   leave their tabs and focus alone unless they ask: `crystal pane focus <name>` hands a session their
   keyboard, and `crystal tab new <name>` brings a new tab to the front, where sessions started after go.
@@ -253,4 +254,10 @@ crystal memory search ledger
   input starts, use `send --wait` or `send-keys --wait`, not `send` then `wait`.
 - A program that doesn't report what it's doing (a shell, a build) counts as busy until it exits: `wait`
   blocks until then. Pass `--timeout <seconds>`; it fails when the time runs out.
+- `send` refuses an agent that's asking the user something, with an error starting `agent_blocked:`: the
+  text would land in its question. Answer it with `send-keys` (`crystal answer` for a background task) if
+  that's yours to answer, or leave it to the user; `--force` types it anyway.
+- What you `send` another session starts with a line saying it's from yours, and what you work on. Send 20 a
+  minute at most: past that it's refused, as two agents answering each other are probably in a loop; stop
+  sending and carry on with your own work. Never send only to say you got a message.
 - Don't `kill` or `send` to your own session. `$CRYSTAL_SESSION` is its name when it started.

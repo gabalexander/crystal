@@ -6,26 +6,36 @@
 //! as input: the reminder the daemon sends back when an agent ends a turn
 //! with its task still open. And it always succeeds: a failing hook can
 //! hold the agent up.
+//!
+//! The hooks crystal adds as it starts Claude Code run `crystal hook
+//! claude`; those `crystal integration` puts in an agent's own settings run
+//! it with `--installed`, for an agent typed into a session's shell.
 
 use crate::agents;
 use crate::client;
-use crate::protocol::{Request, Response};
+use crate::protocol::{AgentEvent, Request, Response};
 use anyhow::Result;
 use std::io::Read;
 use std::path::Path;
 
-pub fn run(socket: &Path, agent: &str) {
+pub fn run(socket: &Path, agent: &str, installed: bool) {
     // There's nowhere to say what went wrong, and nothing to be done about
     // it: the agent carries on either way.
-    let _ = report(socket, agent);
+    let _ = report(socket, agent, installed);
 }
 
-fn report(socket: &Path, agent: &str) -> Result<()> {
-    // Run outside a session, say by a hook the user copied elsewhere,
-    // there's no one to tell.
+fn report(socket: &Path, agent: &str, installed: bool) -> Result<()> {
+    // Run outside a session, say by a hook the user copied elsewhere, or
+    // one installed in their settings for an agent they started outside
+    // crystal, there's no one to tell.
     let Ok(name) = std::env::var("CRYSTAL_SESSION") else {
         return Ok(());
     };
+    // An agent crystal started with hooks of its own reports through
+    // those.
+    if installed && std::env::var(agents::HOOKED).is_ok_and(|hooked| hooked == agent) {
+        return Ok(());
+    }
     let mut input = String::new();
     std::io::stdin().read_to_string(&mut input)?;
     let input = serde_json::from_str(&input)?;
@@ -40,21 +50,32 @@ fn report(socket: &Path, agent: &str) -> Result<()> {
             agents::claude_conversation(&input),
             agents::claude_prompt(&input),
         ),
+        "codex" => (
+            agents::codex_event(&input),
+            agents::codex_conversation(&input),
+            agents::claude_prompt(&input),
+        ),
         _ => (None, None, None),
     };
     let Some(event) = event else {
         return Ok(());
     };
+    let about_subagent = matches!(
+        event,
+        AgentEvent::SubagentStarted | AgentEvent::SubagentStopped
+    );
     let report = Request::Report {
         name,
         id,
         event,
         conversation,
         prompt,
+        agent: Some(agent.to_string()),
+        cwd: agents::hook_cwd(&input),
+        subagent: agents::subagent(&input).filter(|_| about_subagent),
     };
-    if let Some(Response::Remind { text }) = client::ask(socket, &report, false)?
-        && agent == "claude"
-    {
+    // Codex's Stop hook takes the same answer as Claude Code's.
+    if let Some(Response::Remind { text }) = client::ask(socket, &report, false)? {
         println!("{}", agents::claude_keep_going(&text));
     }
     Ok(())

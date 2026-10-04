@@ -27,6 +27,7 @@ mod git;
 mod handoff;
 mod handover;
 mod hook;
+mod integration;
 mod keys;
 mod layout;
 mod layout_relay;
@@ -37,6 +38,7 @@ mod memory;
 mod memory_cli;
 mod mermaid;
 mod mermaid_cli;
+mod messages;
 mod names;
 mod notify;
 mod plugin_cli;
@@ -433,6 +435,11 @@ enum Command {
         #[arg(long)]
         no_enter: bool,
 
+        /// Type it even while the agent is asking the user something, which
+        /// is refused otherwise: the text would land in the question.
+        #[arg(long)]
+        force: bool,
+
         /// Then wait for the turn it starts to end, and print how it ended.
         #[arg(long)]
         wait: bool,
@@ -630,6 +637,14 @@ enum Command {
         #[arg(long, requires = "install")]
         force: bool,
     },
+    /// Put crystal's hooks in Claude Code's or Codex's own settings, so one
+    /// you start yourself in a session's shell says what it's doing and is
+    /// resumed after a restart; and Codex sessions crystal starts report
+    /// too.
+    Integration {
+        #[command(subcommand)]
+        command: IntegrationCommand,
+    },
     /// Run crystal on another machine, over your own ssh: its TUI, or a
     /// crystal command there, like `crystal ssh box ls`.
     Ssh {
@@ -654,7 +669,14 @@ enum Command {
     },
     /// Tell the daemon about an agent's event; what the agent's hooks run.
     #[command(hide = true)]
-    Hook { agent: String },
+    Hook {
+        agent: String,
+
+        /// Run by the hooks `crystal integration` installed, which leave an
+        /// agent crystal started with hooks of its own to those.
+        #[arg(long)]
+        installed: bool,
+    },
     /// Serve a project's memory to Claude over MCP, on standard input and
     /// output: what a task in the background searches it with.
     #[command(hide = true)]
@@ -662,6 +684,27 @@ enum Command {
         /// The project's directory [default: the current one]
         #[arg(short = 'C', long = "dir", value_name = "DIR")]
         dir: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum IntegrationCommand {
+    /// Add crystal's hooks, beside your own, to every event crystal
+    /// listens to. Codex runs them once you've reviewed them in its
+    /// `/hooks`.
+    Install {
+        /// The agent [default: each one installed here]
+        agent: Option<integration::Agent>,
+    },
+    /// Take crystal's hooks out again, and only those.
+    Uninstall {
+        /// The agent [default: each one installed here]
+        agent: Option<integration::Agent>,
+    },
+    /// Whether crystal's hooks are installed, for this crystal.
+    Status {
+        /// The agent [default: both]
+        agent: Option<integration::Agent>,
     },
 }
 
@@ -894,6 +937,15 @@ enum TabCommand {
     },
     /// Move a session to another tab.
     Move { session: String, tab: String },
+    /// Move a tab to another place among the tabs, the others making room.
+    Reorder {
+        /// The tab: its number, from 1, or its name.
+        tab: String,
+
+        /// The number it takes, from 1.
+        #[arg(value_parser = clap::value_parser!(u64).range(1..))]
+        position: u64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1350,10 +1402,11 @@ fn run(cli: Cli) -> Result<()> {
             name,
             text,
             no_enter,
+            force,
             wait,
             timeout,
         } => {
-            drive::send(&socket, &name, &text.join(" "), !no_enter)?;
+            drive::send(&socket, &name, &text.join(" "), !no_enter, force)?;
             if wait {
                 drive::wait_for_turn(&socket, &name, seconds(timeout))?;
             }
@@ -1523,6 +1576,7 @@ fn run(cli: Cli) -> Result<()> {
                 skill::print();
             }
         }
+        Command::Integration { command } => run_integration(command)?,
         Command::Ssh {
             install,
             destination,
@@ -1537,7 +1591,7 @@ fn run(cli: Cli) -> Result<()> {
             std::process::exit(code);
         }
         Command::Daemon { handover } => daemon::run(&socket, handover)?,
-        Command::Hook { agent } => hook::run(&socket, &agent),
+        Command::Hook { agent, installed } => hook::run(&socket, &agent, installed),
         Command::Mcp { dir } => mcp::run(&socket, &here(dir)?)?,
     }
     Ok(())
@@ -1769,6 +1823,33 @@ fn flow(socket: &Path, json: bool, command: Option<FlowCommand>) -> Result<()> {
     }
 }
 
+/// `crystal integration` and its commands, for the agent named or, without
+/// one, each installed here; `status` without one is about both.
+fn run_integration(command: IntegrationCommand) -> Result<()> {
+    let crystal = std::env::current_exe()?;
+    match command {
+        IntegrationCommand::Install { agent } => {
+            for agent in integration::chosen(agent)? {
+                for line in integration::install(agent, &crystal)? {
+                    println!("{line}");
+                }
+            }
+        }
+        IntegrationCommand::Uninstall { agent } => {
+            for agent in integration::chosen(agent)? {
+                println!("{}", integration::uninstall(agent)?);
+            }
+        }
+        IntegrationCommand::Status { agent } => {
+            let agents = agent.map_or(integration::Agent::ALL.to_vec(), |agent| vec![agent]);
+            for agent in agents {
+                println!("{}", integration::status(agent, &crystal)?);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// `crystal tab` and its commands. A new tab's number is printed.
 fn tab(socket: &Path, command: TabCommand) -> Result<()> {
     let new = matches!(command, TabCommand::New { .. });
@@ -1778,6 +1859,10 @@ fn tab(socket: &Path, command: TabCommand) -> Result<()> {
         TabCommand::Rename { tab, name } => layout::Command::RenameTab { tab, name },
         TabCommand::Close { tab, kill } => layout::Command::CloseTab { tab, kill },
         TabCommand::Move { session, tab } => layout::Command::MoveToTab { session, tab },
+        TabCommand::Reorder { tab, position } => layout::Command::ReorderTab {
+            tab,
+            position: position as usize,
+        },
     };
     let layout = client::lay_out(socket, command)?;
     if new && let Some(tab) = layout.current() {

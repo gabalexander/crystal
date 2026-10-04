@@ -45,6 +45,17 @@ pub enum Request {
         /// names a session crystal named after its program.
         #[serde(default)]
         prompt: Option<String>,
+        /// The agent whose hooks sent it, by its program: `claude` or
+        /// `codex`. `None` from a crystal that didn't say, which meant
+        /// Claude Code.
+        #[serde(default)]
+        agent: Option<String>,
+        /// The directory the agent runs in, as its hooks say.
+        #[serde(default)]
+        cwd: Option<PathBuf>,
+        /// The subagent a subagent's event is about.
+        #[serde(default)]
+        subagent: Option<Subagent>,
     },
     /// What an agent says about itself with `crystal report`. A program in
     /// a session says which by its `id`; from outside, it's the session's
@@ -97,11 +108,20 @@ pub enum Request {
         name: String,
         env: BTreeMap<String, String>,
     },
-    /// Type `text` into a session, then press Enter if `enter` is set.
+    /// Type `text` into a session, then press Enter if `enter` is set; a
+    /// background task takes it as a follow-up. An agent asking the user
+    /// something takes nothing, unless `force` says to type it all the same.
     Send {
         name: String,
         text: String,
         enter: bool,
+        /// The id of the session it comes from, when it's sent from one:
+        /// the message then says so, and counts toward what that session
+        /// may send in a minute. `None` from the user, a script or the TUI.
+        #[serde(default)]
+        from: Option<String>,
+        #[serde(default)]
+        force: bool,
     },
     /// Press keys in a session: each one a key name, like `Enter` or
     /// `C-c`, or else text typed as it is, never as a paste.
@@ -597,10 +617,22 @@ pub struct SessionInfo {
     /// while it holds the session.
     #[serde(default)]
     pub reporter: Option<Reporter>,
+    /// How many subagents its agent has running, as its hooks say.
+    #[serde(default)]
+    pub subagents: u32,
     /// crystal stopped it after its agent sat idle for as long as the
     /// settings allow: it starts again in its conversation.
     #[serde(default)]
     pub stopped_idle: bool,
+}
+
+/// A subagent an agent started, as its hooks name it: its id, and its
+/// type, like `Explore`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Subagent {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_type: Option<String>,
 }
 
 /// A session kept in the archive: what it takes to start it again, where
@@ -1059,6 +1091,11 @@ pub enum AgentEvent {
     TurnEnded,
     /// The agent has sat at its prompt for a while.
     StillIdle,
+    /// The agent started a subagent, which says nothing about what the
+    /// agent itself is doing.
+    SubagentStarted,
+    /// One of its subagents finished. The agent's turn goes on.
+    SubagentStopped,
 }
 
 /// What the agent in a session is doing.

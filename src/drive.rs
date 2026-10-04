@@ -6,6 +6,7 @@
 //! asking again and again: each one is a reason to look again.
 
 use crate::client::{self, Subscription};
+use crate::env;
 use crate::events::{Filter, Kind};
 use crate::protocol::{Activity, Answer, Request, Response, SessionInfo, State};
 use anyhow::{Context, Result, bail};
@@ -18,12 +19,16 @@ use std::time::{Duration, Instant};
 const START_GRACE: Duration = Duration::from_secs(5);
 
 /// Types `text` into the session called `name`, and presses Enter after it
-/// when `enter` is set.
-pub fn send(socket: &Path, name: &str, text: &str, enter: bool) -> Result<()> {
+/// when `enter` is set; with `force`, even while its agent is asking the
+/// user something. Run in a session, the message says it comes from that
+/// session.
+pub fn send(socket: &Path, name: &str, text: &str, enter: bool, force: bool) -> Result<()> {
     let request = Request::Send {
         name: name.to_string(),
         text: text.to_string(),
         enter,
+        from: env::own_session_id(socket),
+        force,
     };
     ask(socket, &request)?;
     Ok(())
@@ -414,6 +419,7 @@ mod tests {
             task: None,
             asking: None,
             reporter: None,
+            subagents: 0,
         }
     }
 

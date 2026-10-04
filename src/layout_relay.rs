@@ -8,6 +8,9 @@
 //! and, whenever the user does something in it, that it was used. A
 //! command (`Request::Layout`) waits for the answer, a while at most.
 //!
+//! With no TUI to pass an order on to, it fails with [`NoTui`], and the
+//! daemon carries it out itself, on the tabs the TUIs keep.
+//!
 //! A TUI also says when its terminal gains and loses the focus, so the
 //! daemon knows whether the user is at crystal at all: see
 //! [`notify::Presence`].
@@ -38,6 +41,18 @@ const ANSWER_WITHIN: Duration = Duration::from_secs(5);
 const TUIS_BACK_WITHIN: Duration = Duration::from_secs(2);
 
 type Answer = Result<Layout, String>;
+
+/// What passing an order on fails with when no TUI takes orders.
+#[derive(Debug)]
+pub struct NoTui;
+
+impl std::fmt::Display for NoTui {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str(NO_TUI)
+    }
+}
+
+impl std::error::Error for NoTui {}
 
 pub struct Relay {
     state: Mutex<State>,
@@ -199,7 +214,7 @@ impl State {
         let number = self.last_order;
         let tui = (self.tuis.iter_mut())
             .max_by_key(|held| (held.used, held.id))
-            .context(NO_TUI)?;
+            .ok_or(NoTui)?;
         let relayed = Relayed { id: number, order };
         protocol::send(&tui.conn, &relayed).context("couldn't reach the TUI")?;
         tui.waiting.insert(number, answer);
@@ -345,6 +360,6 @@ mod tests {
 
         let (answer, _answered) = mpsc::channel();
         let err = state.give(order(), answer).unwrap_err();
-        assert!(err.to_string().contains("no TUI is running"), "{err}");
+        assert!(err.is::<NoTui>(), "{err}");
     }
 }

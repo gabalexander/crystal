@@ -36,6 +36,7 @@ mod plugins_view;
 mod preview;
 mod profiles;
 mod pull_requests;
+mod reply;
 mod review;
 pub(crate) mod screen_widget;
 mod search;
@@ -190,6 +191,11 @@ pub enum Event {
         number: u64,
         read: Result<PullRequestDetail, String>,
     },
+    /// A reply was sent to the session called `name`, or why it wasn't.
+    Replied {
+        name: String,
+        sent: Result<(), String>,
+    },
     /// A comment was posted on `topic`, or why it wasn't.
     Commented {
         project: PathBuf,
@@ -279,6 +285,17 @@ pub enum Event {
     },
     /// What the event log gained while the user was away.
     Away(Result<away::Tally, String>),
+}
+
+/// Carries out a layout command with no TUI open, on the tabs as the TUIs
+/// last kept them, `kept`: see [`App::obey_alone`].
+pub(crate) fn obey_alone(
+    sessions: Vec<SessionInfo>,
+    flows: Vec<FlowRun>,
+    kept: Option<&str>,
+    order: Order,
+) -> Result<app::Alone, String> {
+    App::obey_alone(sessions, flows, tabs::read(kept), order)
 }
 
 pub fn run(socket: &Path) -> Result<()> {
@@ -647,6 +664,22 @@ impl Tui {
         self.feed.load(Ordering::Relaxed) == feed
     }
 
+    /// Starts again the sessions a layout being restored names that have
+    /// gone, those it has `programs` for, each under its name, and says how
+    /// many started. One that can't, its directory gone, say, stays gone.
+    fn start_again(&self, programs: &layouts::Programs) -> usize {
+        let gone = programs
+            .iter()
+            .filter(|(name, _)| !self.app.has_session(name));
+        let started = gone.filter(|(name, program)| {
+            let name = Some(name.to_string());
+            let (cwd, command) = (program.cwd.clone(), program.command.clone());
+            let purpose = client::Purpose::default();
+            client::new_session_for(&self.socket, name, cwd, command, purpose).is_ok()
+        });
+        started.count()
+    }
+
     /// Writes the tabs down when they've changed, so that they're there the
     /// next time the TUI opens, however this one ends.
     fn keep_tabs(&mut self) {
@@ -832,6 +865,11 @@ impl Tui {
                 number,
                 read,
             } => self.app.set_pull_request(&project, number, read),
+            Event::Replied { name, sent } => {
+                self.app.replied(&name, sent);
+                // A background task's follow-up has started a run.
+                let _ = self.refresh_sessions();
+            }
             Event::Commented {
                 project,
                 topic,
@@ -1188,6 +1226,26 @@ impl Tui {
                 drive::interrupt(&self.socket, &name)?;
                 self.refresh_sessions()?;
             }
+            Action::Reply { name, text } => {
+                // Typing into a terminal takes a moment, off the loop. From
+                // the user, it goes as typed: no session is said to send it,
+                // even when the TUI runs in one.
+                let socket = self.socket.clone();
+                self.read_in_background(move || {
+                    let request = Request::Send {
+                        name: name.clone(),
+                        text,
+                        enter: true,
+                        from: None,
+                        force: false,
+                    };
+                    let sent = client::ask(&socket, &request, false)
+                        .and_then(|answer| answer.context("no daemon is running"))
+                        .map(|_| ())
+                        .map_err(|err| format!("{err:#}"));
+                    Event::Replied { name, sent }
+                });
+            }
             Action::ListBacklog(dir) => self.list_backlog(dir),
             Action::ChangeBacklog { dir, change } => {
                 let request = match change {
@@ -1403,7 +1461,8 @@ impl Tui {
             Action::SaveLayout(name) => {
                 let mut kept = self.layouts().map_err(anyhow::Error::msg)?;
                 let tabs = self.app.tabs_to_keep();
-                let replaced = kept.save(&name, tabs, seconds_since_epoch());
+                let programs = self.app.programs();
+                let replaced = kept.save(&name, tabs, programs, seconds_since_epoch());
                 self.keep_layouts(&kept)?;
                 self.app
                     .show_layouts(Ok(kept), Some(&Which::Saved(name.clone())));
@@ -1417,11 +1476,17 @@ impl Tui {
                     Which::Saved(name) => name.clone(),
                     Which::Before => "the tabs from before".to_string(),
                 };
-                let Some(tabs) = kept.restore(&which, current, seconds_since_epoch()) else {
+                let programs = self.app.programs();
+                let now = seconds_since_epoch();
+                let Some(restored) = kept.restore(&which, current, programs, now) else {
                     bail!("{name} can't be restored: it's from another crystal");
                 };
                 self.keep_layouts(&kept)?;
-                self.app.restore_layout(tabs, &name);
+                let started = self.start_again(&restored.programs);
+                if started > 0 {
+                    self.refresh_sessions()?;
+                }
+                self.app.restore_layout(restored.tabs, &name, started);
             }
             Action::FollowEvents => self.follow_events(),
             Action::StopFollowing => {

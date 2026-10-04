@@ -8,6 +8,7 @@ use crate::backlog;
 use crate::catalog;
 use crate::codex;
 use crate::config::{Config, MemorySettings};
+use crate::db;
 use crate::db::Db;
 use crate::distill::{self, Job};
 use crate::embed;
@@ -20,9 +21,11 @@ use crate::front;
 use crate::git::{self, Checkout};
 use crate::handoff;
 use crate::handover::{self, Gate, Ticket};
-use crate::layout_relay::Relay;
+use crate::layout::{Layout, Order};
+use crate::layout_relay::{NoTui, Relay};
 use crate::mcp;
 use crate::memory::{self, Added};
+use crate::messages::{self, Sender};
 use crate::names;
 use crate::notify::{self, Notice};
 use crate::plugin_hooks;
@@ -41,7 +44,7 @@ use crate::state::{self, SavedSession};
 use crate::tasks;
 use crate::typing;
 use crate::vt;
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use regex::Regex;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::convert::Infallible;
@@ -140,6 +143,7 @@ pub fn run(socket: &Path, handover: Option<RawFd>) -> Result<()> {
         preparing: Arc::default(),
         handoff: Mutex::default(),
         layout: Relay::new(),
+        sends: messages::Guard::default(),
         projects: Mutex::default(),
     });
     // A daemon starts again after every upgrade, or is handed over to the
@@ -252,6 +256,9 @@ struct Daemon {
     handoff: Mutex<()>,
     /// The TUIs that take layout commands, which go to the one used last.
     layout: Relay,
+    /// How many messages each session has sent others in the last minute,
+    /// which `crystal send` holds to a most.
+    sends: messages::Guard,
     /// What the daemon knows of the projects crystal keeps a list of.
     /// Taken after `sessions` and before `db`.
     projects: Mutex<KnownProjects>,
@@ -1496,6 +1503,93 @@ impl Daemon {
         Ok(named(&mut sessions, name)?.is_task())
     }
 
+    /// Types `text` into the session called `name`, and presses Enter after
+    /// it with `enter`; a task takes it as a follow-up, another run that
+    /// carries its conversation on. Sent from another session, the one
+    /// with id `from`, it's tidied, says which session sent it, and counts
+    /// toward what that session may send in a minute. An agent asking the
+    /// user something takes nothing, unless `force` says to type it anyway.
+    fn send(
+        &self,
+        name: &str,
+        text: &str,
+        enter: bool,
+        from: Option<&str>,
+        force: bool,
+    ) -> Result<Response> {
+        // In a block of its own, so the sessions are let go before the
+        // typing below, which takes a moment.
+        let (text, info, sender) = {
+            let mut sessions = self.sessions.lock().unwrap();
+            // A sender the daemon doesn't know, say one killed since, sends
+            // as a script would.
+            let sender = from.and_then(|id| {
+                let session = sessions.iter().find(|session| session.id == id)?;
+                let info = session.info();
+                Some(Sender::new(&info.id, &info.name, info.task.as_ref()))
+            });
+            let text = match &sender {
+                Some(_) => messages::tidy(text)?,
+                None => text.to_string(),
+            };
+            let session = named(&mut sessions, name)?;
+            ensure!(session.is_running(), "{name} has ended");
+            if let Some(sender) = &sender {
+                ensure!(
+                    sender.id != session.id,
+                    "{name} is this session: a session can't send a message to itself"
+                );
+            }
+            if let Some(why) = session.blocked().filter(|_| !force) {
+                bail!(messages::blocked(name, &why, session.is_task()));
+            }
+            // Counted only once it can go, so a refused send costs nothing.
+            if let Some(sender) = &sender {
+                self.sends.admit(&sender.id, Instant::now())?;
+            }
+            let text = match &sender {
+                Some(sender) => messages::compose(sender, &text),
+                None => text,
+            };
+            if session.is_task() {
+                let prompted = session.prompt(&text);
+                let info = session.info();
+                drop(sessions);
+                return self.sent(prompted, &info, sender.as_ref(), &text);
+            }
+            (text, session.info(), sender)
+        };
+        let typed = self.running_term(name).and_then(|term| {
+            term.write(&typing::keystrokes(&text, term.wants_bracketed_paste()))?;
+            if enter {
+                thread::sleep(typing::ENTER_PAUSE);
+                term.write(typing::ENTER)?;
+            }
+            Ok(())
+        });
+        self.sent(typed, &info, sender.as_ref(), &text)
+    }
+
+    /// What came of sending `text` to the session `info` is about, from
+    /// `sender`: sent, it's an event; not sent after all, the sender has it
+    /// back from what it may send in a minute.
+    fn sent(
+        &self,
+        sent: Result<()>,
+        info: &SessionInfo,
+        sender: Option<&Sender>,
+        text: &str,
+    ) -> Result<Response> {
+        if let Err(err) = sent {
+            if let Some(sender) = sender {
+                self.sends.give_back(&sender.id);
+            }
+            return Err(err);
+        }
+        self.events.emit(Event::message(info, sender, text));
+        Ok(Response::Done)
+    }
+
     /// The terminal of the session called `name`, to type into, which
     /// only makes sense while its program runs. The sessions are let go
     /// before any typing, which takes a moment. A session typed into by
@@ -1570,18 +1664,36 @@ impl Daemon {
                 event,
                 conversation,
                 prompt,
+                agent,
+                cwd,
+                subagent,
             } => {
+                let agent = agent.unwrap_or_else(|| "claude".to_string());
                 let mut sessions = self.sessions.lock().unwrap();
                 let id = match id {
                     Some(id) => id,
                     None => named(&mut sessions, &name)?.id.clone(),
                 };
+                let Some(id) = reporting_session(
+                    &sessions,
+                    &agent,
+                    &id,
+                    conversation.as_ref(),
+                    cwd.as_deref(),
+                ) else {
+                    return Ok(Response::Done);
+                };
+                // A background task knows what its Claude does from
+                // Claude's own events, not hooks the user installed.
+                if with_id(&mut sessions, &id)?.is_task() {
+                    return Ok(Response::Done);
+                }
                 if let Some(prompt) = prompt {
                     self.name_from_prompt(&mut sessions, &id, &prompt);
                 }
                 let session = with_id(&mut sessions, &id)?;
                 if let Some(conversation) = conversation {
-                    session.set_conversation(conversation);
+                    session.set_hooked_conversation(&agent, conversation);
                 }
                 // Reminded that its task is open, the agent carries on: its
                 // turn hasn't ended, and it isn't done.
@@ -1597,6 +1709,15 @@ impl Daemon {
                 // status: what hooks say counts again once it lets go.
                 if !session.is_claimed() {
                     session.on_agent_event(event);
+                    let kind = match event {
+                        AgentEvent::SubagentStarted => Some(Kind::SubagentStarted),
+                        AgentEvent::SubagentStopped => Some(Kind::SubagentStopped),
+                        _ => None,
+                    };
+                    if let (Some(kind), Some(subagent)) = (kind, subagent) {
+                        self.events
+                            .emit(Event::subagent(kind, &session.info(), subagent));
+                    }
                 }
                 self.tell_changes(session);
                 Ok(Response::Done)
@@ -1619,29 +1740,16 @@ impl Daemon {
                 Ok(Response::Done)
             }
             Request::Kill { name } => {
-                let mut sessions = self.sessions.lock().unwrap();
-                let index = sessions.iter().position(|session| session.name == name);
                 // An archived session is killed by taking it out of the
                 // archive.
-                let Some(index) = index else {
+                let running =
+                    (self.sessions.lock().unwrap().iter()).any(|session| session.name == name);
+                if !running {
                     let gone = self.db.lock().unwrap().unarchive(&name)?;
                     ensure!(gone.is_some(), "no session named {name}");
                     return Ok(Response::Done);
-                };
-                let mut session = sessions.remove(index);
-                let cancelled = tasks::enabled(&settings())
-                    .then(|| session.cancel_task("its session was killed"))
-                    .flatten();
-                if let Some(cancelled) = cancelled {
-                    self.write_down_closed(&session, &cancelled);
                 }
-                let info = session.info();
-                session.stop();
-                if info.state == State::Running {
-                    self.events.emit(Event::ended(&info, "killed".into()));
-                }
-                self.events
-                    .emit(Event::about_session(Kind::SessionRemoved, &info));
+                self.kill(&name)?;
                 Ok(Response::Done)
             }
             Request::Emit { event } => {
@@ -1680,7 +1788,10 @@ impl Daemon {
             | Request::TakeLayoutOrders { .. } => {
                 bail!("this takes the connection over")
             }
-            Request::Layout(order) => Ok(Response::Layout(self.layout.pass(order)?)),
+            Request::Layout(order) => match self.layout.pass(order.clone()) {
+                Err(err) if err.is::<NoTui>() => Ok(Response::Layout(self.lay_out_alone(order)?)),
+                passed => Ok(Response::Layout(passed?)),
+            },
             Request::Rename { name, new_name } => {
                 let mut sessions = self.sessions.lock().unwrap();
                 if new_name != name {
@@ -1707,27 +1818,13 @@ impl Daemon {
                 ensure!(gone.is_some(), "no session named {name} in the archive");
                 Ok(Response::Done)
             }
-            Request::Send { name, text, enter } => {
-                // In a block of its own, so the sessions are let go before
-                // the typing below, which takes a moment.
-                {
-                    let mut sessions = self.sessions.lock().unwrap();
-                    let session = named(&mut sessions, &name)?;
-                    // A task takes text as a follow-up: another run that
-                    // carries its conversation on.
-                    if session.is_task() {
-                        session.prompt(&text)?;
-                        return Ok(Response::Done);
-                    }
-                }
-                let term = self.running_term(&name)?;
-                term.write(&typing::keystrokes(&text, term.wants_bracketed_paste()))?;
-                if enter {
-                    thread::sleep(typing::ENTER_PAUSE);
-                    term.write(typing::ENTER)?;
-                }
-                Ok(Response::Done)
-            }
+            Request::Send {
+                name,
+                text,
+                enter,
+                from,
+                force,
+            } => self.send(&name, &text, enter, from.as_deref(), force),
             Request::SendKeys { name, keys } => {
                 ensure!(
                     !self.is_task(&name)?,
@@ -2290,6 +2387,52 @@ impl Daemon {
         Ok(())
     }
 
+    /// Kills the session called `name` and lets go of it, cancelling its
+    /// task if it has one open.
+    fn kill(&self, name: &str) -> Result<()> {
+        let mut sessions = self.sessions.lock().unwrap();
+        let index = sessions
+            .iter()
+            .position(|session| session.name == name)
+            .with_context(|| format!("no session named {name}"))?;
+        let mut session = sessions.remove(index);
+        let cancelled = tasks::enabled(&settings())
+            .then(|| session.cancel_task("its session was killed"))
+            .flatten();
+        if let Some(cancelled) = cancelled {
+            self.write_down_closed(&session, &cancelled);
+        }
+        let info = session.info();
+        session.stop();
+        if info.state == State::Running {
+            self.events.emit(Event::ended(&info, "killed".into()));
+        }
+        self.events
+            .emit(Event::about_session(Kind::SessionRemoved, &info));
+        Ok(())
+    }
+
+    /// Carries out a layout command with no TUI open to: on the tabs as the
+    /// TUIs last kept them, the way the TUI would have, and keeps them in
+    /// their place, for the next TUI to open with. A tab closed with its
+    /// sessions has them killed.
+    fn lay_out_alone(&self, order: Order) -> Result<Layout> {
+        let sessions = self.sessions.lock().unwrap();
+        let infos = sessions.iter().map(Session::info).collect();
+        drop(sessions);
+        let flows = self.flows.lock().unwrap().clone();
+        let db = self.db.lock().unwrap();
+        let kept = db.ui(db::TABS)?;
+        let alone = crate::tui::obey_alone(infos, flows, kept.as_deref(), order)
+            .map_err(|why| anyhow!(why))?;
+        db.keep_ui(db::TABS, &alone.tabs)?;
+        drop(db);
+        for name in &alone.kill {
+            self.kill(name)?;
+        }
+        Ok(alone.layout)
+    }
+
     /// Runs an ended session's command again, in its directory and under
     /// its name, keeping its place in the list. An agent whose conversation
     /// can be picked up starts back in it.
@@ -2633,7 +2776,11 @@ fn start(
         Some(argv) => (argv, None),
         None => (command.clone(), None),
     };
-    let env = env::for_session(&env, &name, &id, socket);
+    let mut env = env::for_session(&env, &name, &id, socket);
+    // Claude Code started here gets crystal's hooks with `--settings`.
+    if agents::program_name(&asked) == Some("claude") {
+        env.insert(agents::HOOKED.into(), "claude".into());
+    }
     let crystal = std::env::current_exe()?;
     // A conversation that can't be picked up any more is left behind: the
     // agent starts a new one, which its hooks or its rollout will name.
@@ -2934,7 +3081,10 @@ fn start_task(
     };
 
     let id = new_id();
-    let env = env::for_session(&env, &name, &id, socket);
+    let mut env = env::for_session(&env, &name, &id, socket);
+    // The task follows its Claude's own events: the hooks the user
+    // installed stay quiet.
+    env.insert(agents::HOOKED.into(), "claude".into());
     let prompt = spec.prompt.clone();
     let args = task_args(socket, &cwd, &spec);
     let spending = spending.clone();
@@ -3083,6 +3233,81 @@ fn named<'a>(sessions: &'a mut [Session], name: &str) -> Result<&'a mut Session>
         .with_context(|| format!("no session named {name}"))
 }
 
+/// The session a hook's report is about, by its id: `id` is the one the
+/// hook's environment names. Claude Code runs its hooks itself, so that's
+/// the one. Codex runs them in a server its sessions share, started from
+/// whichever ran Codex first, so its environment can name another session:
+/// a Codex report goes to the session in the conversation it names; or to
+/// the one its environment names, if Codex may be running there in no
+/// conversation yet; or to the only session that fits, of those Codex may
+/// be running in with no conversation yet, by the report's directory when
+/// there are several, or of all those Codex may be running in. `None` when
+/// none of them is sure: crystal reads Codex's screen all the same.
+fn reporting_session(
+    sessions: &[Session],
+    agent: &str,
+    id: &str,
+    conversation: Option<&Conversation>,
+    cwd: Option<&Path>,
+) -> Option<String> {
+    if agent != "codex" {
+        return Some(id.to_string());
+    }
+    let candidates: Vec<Candidate> = sessions
+        .iter()
+        .map(|session| Candidate {
+            id: &session.id,
+            conversation: session.conversation_id(),
+            may_run: session.is_running() && session.may_run(agent),
+            cwd: session.cwd(),
+        })
+        .collect();
+    let named = conversation.map(|conversation| conversation.id.as_str());
+    pick_reporting(&candidates, id, named, cwd).map(String::from)
+}
+
+/// A session as [`pick_reporting`] sees it.
+struct Candidate<'a> {
+    id: &'a str,
+    conversation: Option<&'a str>,
+    /// Whether the agent can be running in it.
+    may_run: bool,
+    cwd: &'a Path,
+}
+
+/// The id of the session a Codex report is about, of `sessions`, as
+/// [`reporting_session`] picks it: `id` is the one the hook's environment
+/// names, `conversation` the one the report names.
+fn pick_reporting<'a>(
+    sessions: &[Candidate<'a>],
+    id: &str,
+    conversation: Option<&str>,
+    cwd: Option<&Path>,
+) -> Option<&'a str> {
+    if let Some(found) = sessions
+        .iter()
+        .find(|session| conversation.is_some() && session.conversation == conversation)
+    {
+        return Some(found.id);
+    }
+    let only = |found: Vec<&Candidate<'a>>| match found[..] {
+        [session] => Some(session.id),
+        _ => None,
+    };
+    let fresh: Vec<&Candidate> = (sessions.iter())
+        .filter(|session| session.may_run && session.conversation.is_none())
+        .collect();
+    if let Some(named) = fresh.iter().find(|session| session.id == id) {
+        return Some(named.id);
+    }
+    let in_cwd = (fresh.iter().copied())
+        .filter(|session| cwd == Some(session.cwd))
+        .collect();
+    only(in_cwd)
+        .or_else(|| only(fresh))
+        .or_else(|| only(sessions.iter().filter(|session| session.may_run).collect()))
+}
+
 fn with_id<'a>(sessions: &'a mut [Session], id: &str) -> Result<&'a mut Session> {
     sessions
         .iter_mut()
@@ -3213,6 +3438,55 @@ fn unique_name(program: &str, taken: impl Fn(&str) -> bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn candidate<'a>(id: &'a str, conversation: Option<&'a str>, cwd: &'a str) -> Candidate<'a> {
+        Candidate {
+            id,
+            conversation,
+            may_run: true,
+            cwd: Path::new(cwd),
+        }
+    }
+
+    #[test]
+    fn a_codex_report_goes_to_the_session_in_the_conversation_it_names() {
+        let sessions = [
+            candidate("a", Some("conv-a"), "/app"),
+            candidate("b", Some("conv-b"), "/app"),
+        ];
+        // Whatever session the shared server's environment names.
+        let pick = |conversation| pick_reporting(&sessions, "a", conversation, None);
+        assert_eq!(pick(Some("conv-b")), Some("b"));
+        assert_eq!(pick(Some("conv-a")), Some("a"));
+        // A conversation nobody's in, with two sessions it could be from.
+        assert_eq!(pick(Some("conv-c")), None);
+    }
+
+    #[test]
+    fn a_new_codex_conversation_goes_where_it_can_only_be() {
+        let sessions = [
+            candidate("old", Some("conv-1"), "/app"),
+            candidate("named", None, "/app"),
+            candidate("here", None, "/lib"),
+            Candidate {
+                may_run: false,
+                ..candidate("shell", None, "/lib")
+            },
+        ];
+        let pick = |id, cwd: &str| pick_reporting(&sessions, id, Some("new"), Some(Path::new(cwd)));
+        // The session the environment names, if Codex can be new there.
+        assert_eq!(pick("named", "/lib"), Some("named"));
+        // Or else the one in the report's directory.
+        assert_eq!(pick("old", "/lib"), Some("here"));
+        assert_eq!(pick("shell", "/elsewhere"), None, "two could be it");
+        // The only Codex session there is takes a conversation of its own
+        // started from inside it.
+        let one = [candidate("only", Some("conv-1"), "/app")];
+        assert_eq!(
+            pick_reporting(&one, "gone", Some("new"), None),
+            Some("only")
+        );
+    }
 
     #[test]
     fn a_mismatch_says_both_versions_and_the_way_out() {

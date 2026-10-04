@@ -91,6 +91,7 @@ and the footer says where you are and offers the keys that matter there, or, whe
 |---|---|
 | `j` / `k`, `↓` / `↑` | select a session, or a worktree with no sessions |
 | `Enter` | type into the selected session, or start an ended one again, once you've said `y`; on a worktree with no sessions, start one there |
+| `Space` | reply to the selected session without going into its pane: a box takes what to say, and `Enter` sends it, typed in with `Enter` after it, or as a [background task](#background-tasks)'s follow-up (`Alt+Enter` or `Ctrl+J` for a new line, `Esc` to cancel) |
 | `s` | split the selected session off into a pane of its own, beside its pane or below it, or close its split |
 | `\|` / `-` | split the selected session's pane in two, side by side or one above the other |
 | `Shift+arrows` | select the session in the pane to the left, right, above or below |
@@ -106,6 +107,7 @@ and the footer says where you are and offers the keys that matter there, or, whe
 | `T` | name the tab you're in |
 | `&` | close the tab you're in, and kill its sessions once you've said `y` |
 | `[` / `]`, `1-9` | go to the tab before or after this one, or to the tab with that number |
+| `{` / `}` | move the tab you're in one place to the left or right |
 | `>` | move the selected session to another tab: then a tab's number, or `t` for a new one |
 | `S` | your saved [layouts](#layouts): save your tabs as one, or put them back the way one has them |
 | `n` | start a new session from [the new-session panel](#starting-a-session), and type into it |
@@ -184,7 +186,8 @@ the next session you select, beside it when both halves can be at least 80 colum
 own already, they split that pane: the selection's pane comes beside it, and what it showed stays where it was,
 split off. Split any pane again, as often as there's room, to lay the panes out any way you like. `s` on a
 session split off closes its split, and the pane beside it takes the room. Each pane's session is sized to its
-pane.
+pane. A session nobody has looked at yet is 120 columns by 40 rows, so an agent started in the background lays
+its output out for a real screen; once seen, it keeps the size of the last pane it was in.
 
 While the selection is on a session with a pane of its own, the selection's pane goes on showing the last
 session it showed, so no session is drawn twice and going from pane to pane changes none of them. Shift and an
@@ -254,7 +257,27 @@ reads the screen: the spinner an agent puts in its title, "esc to interrupt" whi
 it asks before a command. The screen covers agents without hooks, like Codex or a Claude you started from a
 shell, and what hooks never say: a turn you cut short with Esc, or work carrying on once you've said yes.
 The screen only counts while an agent is in front: a shell or a build printing an agent's words never shows
-as waiting, and when an agent exits back to its shell, what it was doing goes with it.
+as waiting, and when an agent exits back to its shell, what it was doing goes with it. While Claude Code's
+agent has subagents running, its row says how many after what's in front: `claude +2`.
+
+A Claude Code or Codex you start yourself, typed into a session's shell, has no hooks of crystal's: crystal
+doesn't start it. `crystal integration install` puts crystal's hooks in their own settings, beside yours:
+
+```sh
+crystal integration install          # Claude Code and Codex, each that's installed here
+crystal integration install claude   # into $CLAUDE_CONFIG_DIR/settings.json, or ~/.claude/settings.json
+crystal integration install codex    # into $CODEX_HOME/hooks.json, or ~/.codex/hooks.json
+crystal integration status           # whether they're there, for this crystal
+crystal integration uninstall        # take them out again, and only them
+```
+
+Then the agent you typed says what it's doing through its hooks, the same as one crystal starts, and which
+conversation it's in: after a restart, the session's shell starts again and `claude --resume <id>` (or `codex
+resume <id>`) is typed into it, so you're back where you were. Only while the agent is in front, though: quit
+it, and the shell comes back on its own. `resume_reported_agents = false` in the [settings](#settings) turns
+that off. Each hook runs `crystal hook <agent> --installed`, crystal by its path, so run `install` again if
+you move crystal; `status` says when the hooks are out of date. Outside crystal, and for an agent crystal
+started with hooks of its own, they do nothing.
 
 When a session comes to need you while you're looking elsewhere (its agent asks you something, or finishes a
 turn nobody was watching), crystal shows a desktop notification, like "claude-2 is waiting on you · app
@@ -329,6 +352,7 @@ crystal pane split review                   # show a session in a pane beside yo
 crystal tab new review                      # a new tab in the TUI, in front
 crystal layout                              # the TUI's tabs and how each splits its panes
 crystal skill --install                     # teach Claude Code to drive crystal (see below)
+crystal integration install                 # hooks for a claude or codex you start in a shell (see above)
 crystal mermaid docs/flow.md                # draw a page's mermaid diagrams as text (see below)
 crystal ssh box                             # crystal's TUI on another machine (see below)
 ```
@@ -393,9 +417,10 @@ logs in another, a review in a third, and switch between them.
 
 The tabs sit in the bar along the top, numbered, the one you're in standing out. `t` makes a new one, starts
 your shell in it, in the selected session's directory, and takes you there. `[` and `]` go to the tab before
-and after, `1` to `9` straight to that one, and a click on a tab goes there too. Each tab keeps its own
-selection and panes, split and sized its own way. `T` names the tab you're in, and the bar shows the name after its number; with too many
-to fit, the bar shows only the numbers.
+and after, `1` to `9` straight to the first nine, and a click on a tab goes there too. `{` and `}` move the
+tab you're in one place to the left or right. Each tab keeps its own selection and panes, split and sized its
+own way. `T` names the tab you're in, and the bar shows the name after its number; with too many to fit, the
+bar shows only the numbers, and with more still, as many as fit around the tab you're in.
 
 A tab with something going on in it shows that on its label, the way the sidebar marks a session: `▲` when an
 agent in it is waiting on you, `✓` when one has finished a turn you haven't looked at, the turning `◐` while
@@ -406,8 +431,8 @@ one started any other way, from the command line or another TUI, unless it's a s
 goes in the tab with the rest of its run. `>` moves the selected session to another tab: press the tab's
 number next, or `t` to make a new tab for it. `&` closes the tab you're in and kills the sessions in it, once
 you've said `y`; an empty tab closes at once. The command line makes, names and closes tabs too: see
-[laying out the TUI](#laying-out-the-tui). There's always one tab, and nine at most. They're kept in crystal's
-database, so they're there when you open the TUI again.
+[laying out the TUI](#laying-out-the-tui). There's always one tab, and as many more as you like. They're kept
+in crystal's database, so they're there when you open the TUI again.
 
 ### Layouts
 
@@ -418,8 +443,11 @@ tabs as they are now under a name you type, in place of the layout of that name 
 `Enter` puts your tabs back the way the layout has them; `x` removes it, once you've said `y`; `Esc` closes the
 list.
 
-A layout names sessions; it doesn't start them. Restoring one arranges the sessions running now: those it
-names that have gone since are left out, and those it doesn't name join the tab in front. The tabs a restore
+A layout keeps what starts each of its sessions again: the command it was started with and its directory.
+Restoring one starts again the sessions it names that have gone since, each under its name, then arranges
+the sessions that way; an agent given a first prompt starts without it, so it isn't asked that again, and a
+background task, with no terminal of its own, isn't started. Those it can't start, their directory gone, say,
+are left out, and those it doesn't name join the tab in front. The tabs a restore
 replaces are kept, at the top of the list as `↶ before` the layout's name, so `Enter` on that takes you back,
 once. Layouts are kept with your tabs, in crystal's database.
 
@@ -774,20 +802,32 @@ for, and stays on it.
 
 crystal reads what Codex is doing off its screen: `Working (… esc to interrupt)` while it works, and its
 approval questions ("Would you like to run the following command?") while it waits on you. Codex has hooks
-too, but crystal can't add its own the way it does for Claude Code: Codex only reads hooks from its config
-files, never from the command line, and skips any hook you haven't reviewed in `/hooks`. Its `notify` setting
-can be given on the command line, but that would replace yours, so crystal leaves it alone.
+too, but crystal can't add its own as it starts Codex, the way it does for Claude Code: Codex only reads hooks
+from its config files, never from the command line, and skips any hook you haven't reviewed. Its `notify`
+setting can be given on the command line, but that would replace yours, so crystal leaves it alone.
+
+`crystal integration install codex` puts crystal's hooks in Codex's `hooks.json` instead, and turns on
+`[features] hooks` in its `config.toml`, keeping the rest as it was. Codex asks you to review new hooks as it
+starts, or in `/hooks`; once you've trusted them, every Codex reports through them, the ones crystal starts and
+the ones you type into a shell: a turn starting and ending, the permissions it asks for, its subagents and its
+conversation. A turn you cut short with Esc ends it too. Codex runs hooks in the background server its
+sessions share, so they can't tell crystal which session they're in: crystal goes by the conversation they
+name, and for a conversation it doesn't know yet, by the session Codex was just started in. Codex sessions
+started at the same moment may not be told apart until each has been sent a prompt; `codex --no-daemon` keeps
+a Codex's hooks to itself.
 
 To pick a conversation up again, crystal finds the file Codex records it in,
 `$CODEX_HOME/sessions/YYYY/MM/DD/rollout-…jsonl` (`~/.codex` without `CODEX_HOME`): the one for the session's
-directory that Codex started closest to when the session did, within a minute. After a restart, or with
-`crystal respawn`, the session runs `codex resume <id>` with the options it was started with, but not its first
-prompt again. The limits:
+directory that Codex started closest to when the session did, within a minute, unless its hooks have named
+it. After a restart, or with `crystal respawn`, the session runs `codex resume <id>` with the options it was
+started with, but not its first prompt again. The limits:
 
 - Codex writes that file once it has been sent a prompt, so a Codex that was never sent one starts afresh.
-- A conversation you begin from inside Codex with `/new` isn't followed: crystal picks the first one up again.
+- A conversation you begin from inside Codex with `/new` isn't followed, unless its hooks are installed:
+  crystal picks the first one up again.
 - `codex exec` and Codex's other subcommands run as they were asked, without resuming.
-- A Codex you start yourself in a shell session gets its status from the screen, but isn't resumed.
+- A Codex you start yourself in a shell session gets its status from the screen, and is resumed only with
+  crystal's hooks installed.
 
 ### Teaching crystal about your agent
 
@@ -893,6 +933,19 @@ text starts, not one that ended before it. `wait` returns once the agent isn't w
 it asks something, `idle`, or how its program exited. It takes a `--timeout` in seconds, and fails when that
 runs out. A program that doesn't say what it's doing counts as busy until it ends.
 
+An agent asking you something takes nothing `send` types, since the text would land in its question: `send`
+refuses with an error that starts `agent_blocked:`, saying what it asks and how to answer it, with `crystal
+answer` for a background task or in its pane or with `send-keys` for one in a terminal. `--force` types it
+anyway. An agent waiting only because it ended a turn with its [task](#tasks) open is at its prompt, and takes
+it. `send-keys` is never refused, since that's how a question is answered.
+
+Sent from another session, a message says so on a line ahead of it, `[crystal] Message from session "scout",
+working on task "Port the codec":`, so the agent knows who asks, and that `crystal send` answers. Such a
+message loses its control characters but for line breaks, and is cut at 8 KiB. A session may send 20
+messages a minute, the most crystal allows: the next is refused, since two agents answering each other are
+most likely in a loop. A session can't send to itself. From you, a script or the TUI's `Space`, the text goes
+as it is, with no line ahead of it and no limit. Each message is a `session.message` [event](#events).
+
 `wait` can wait for something else instead:
 
 ```sh
@@ -953,8 +1006,8 @@ prints `[]`.
 
 #### Laying out the TUI
 
-The tabs and panes are the TUI's, and the command line lays them out too, so an agent can put the session it
-started on screen beside its own, or a script can set up a tab for a review:
+The command line lays out the tabs and panes too, so an agent can put the session it started on screen
+beside its own, or a script can set up a tab for a review, with the TUI open or not:
 
 ```sh
 crystal new -d -n tests cargo test
@@ -971,6 +1024,7 @@ crystal tab new review                    # a tab after the others, in front: se
 crystal tab select 1                      # a tab by its number or its name
 crystal tab rename 2 checks               # an empty name takes it back to its number
 crystal tab move reviewer review          # move a session to another tab, as > does
+crystal tab reorder review 1              # move a tab to be the first, as { and } do a place at a time
 crystal tab close review --kill           # a tab with sessions closes only with --kill, which kills them
 crystal layout                            # each tab's sessions and how its panes split the room; --json
 ```
@@ -984,9 +1038,12 @@ moves into that tab, out of any pane it had. A command that can't be carried out
 would: no room for another pane, a session that isn't on screen.
 
 The command goes through the daemon to the TUI you used last, the one where you last pressed a key, clicked
-or brought its terminal to the front, and waits for it to answer, a few seconds at most. With no TUI open,
-it fails, saying so. When `restart-server` hands the daemon over, each TUI offers itself to the new one at
-once, saying when you last used it, so commands carry on going to the same one. What it changes is kept like any change you make, so it's there when the TUI opens again.
+or brought its terminal to the front, and waits for it to answer, a few seconds at most. When `restart-server`
+hands the daemon over, each TUI offers itself to the new one at once, saying when you last used it, so
+commands carry on going to the same one. What it changes is kept like any change you make, so it's there when
+the TUI opens again. With no TUI open, the daemon carries the command out itself, the way the TUI would, on
+the tabs as the TUI last kept them, starting if it isn't running; a tab closed with `--kill` has its sessions
+killed. The next TUI to open shows the tabs as the commands left them.
 `crystal layout --json` prints the tabs in their order, each with its `number`, `name`, whether it's
 `current` and `zoomed`, its `sessions`, the one `selected`, the one `floating`, and its `panes`: either
 `{"kind": "pane", "session": "tests"}`, with `"selection": true` for the pane that follows the selection, or
@@ -1189,10 +1246,11 @@ crystal interrupt docs                                               # stop the 
   that changes or removes what's there, like `crystal backlog rm` or `crystal memory rm`, still asks.
 - `Ctrl+C` in a task's pane, or `crystal interrupt <task>`, stops the run it's in the middle of. Its task
   stays open, waiting on you, and a follow-up carries on.
-- `crystal send` gives a task a follow-up: on the `claude` still there, or once that has gone, after five
-  minutes with nothing to do or after a restart, on a new one that carries the conversation on with
-  `--resume`. One run at a time: a follow-up sent while Claude is still working is refused. A task takes no
-  keys, so `send-keys` is refused too.
+- `crystal send`, or `Space` in the TUI, gives a task a follow-up: on the `claude` still there, or once that
+  has gone, after five minutes with nothing to do or after a restart, on a new one that carries the
+  conversation on with `--resume`. One run at a time: a follow-up sent while Claude is still working is
+  refused, and so is one sent while it asks for a permission. A task takes no keys, so `send-keys` is refused
+  too.
 - `crystal result <task>` prints the last answer; `--json` adds whether the run failed, the conversation's id,
   the cost so far and how many runs the task has had.
 - Each task's `claude` is given `--max-budget-usd`: $5, unless `max_budget_usd` under `[tasks]` in the
@@ -1761,6 +1819,9 @@ matched anywhere in the link unless `^` and `$` pin it. `X` lists each plugin's 
 | `session.archived` | a session is stopped and kept in the archive: `A`, or `crystal archive` |
 | `session.claimed` | an agent takes over saying what a session is doing, with [`crystal report`](#teaching-crystal-about-your-agent) |
 | `session.released` | it lets go: `crystal report --release`, or it left and the shell is back in front |
+| `subagent.started` | a session's agent starts a subagent, as its hooks say: its `subagent`, with its `id` and `agent_type` |
+| `subagent.stopped` | that subagent finishes |
+| `session.message` | a session is sent a message: by another session with `crystal send`, which its `message` names, or by you |
 | `task.opened` | a task is made: given to a session as it starts, made to start later, or opened again by a follow-up |
 | `task.started` | a task made to start later starts, in a session of its own |
 | `task.waiting` | a task's agent ends a turn with the task still open: it waits on you |
@@ -1798,7 +1859,8 @@ and its name in `CRYSTAL_EVENT`:
 
 `task.closed` has a `task`, with its `goal`, `session`, `project`, `branch` and `outcome` (whether it `failed`,
 its `summary`, and when it `closed`). The worktree events have a `worktree`, with its `path`, `branch` and,
-once it's made, `project`. The rest are under [events](#events).
+once it's made, `project`. `session.message` has a `message`, with its first `line` and, when another session
+sent it, that session's name (`from`) and id (`from_id`). The rest are under [events](#events).
 
 `crystal plugin run <name> --event <event>` runs the plugin's hooks on that event, here and now, whether the
 plugin is on or not, on a made-up event with everything its kind carries, about the session `--session` names,
@@ -1831,7 +1893,7 @@ file and change. A setting crystal doesn't know is an error that names it, so a 
 | `new_session` | `"claude"` | what the new-session panel runs at first, until you start something from it |
 | `theme` | `"dark"` | the TUI's colors: `"dark"`, `"light"`, or `"terminal"` |
 | `name_from_prompt` | `true` | name a session you don't name for the [first thing it's asked](#starting-a-session) |
-| `resume_reported_agents` | `true` | after a restart, run the command an agent [said resumes it](#teaching-crystal-about-your-agent) |
+| `resume_reported_agents` | `true` | after a restart, run the command an agent [said resumes it](#teaching-crystal-about-your-agent), or the one that resumes a Claude Code or Codex [typed into a shell](#usage) |
 | `scrollback_lines` | `10000` | how many rows that scrolled off a session's screen it keeps, up to 1,000,000, for scrolling back, copy mode, `e` and `crystal read --history` |
 | `[plugins]` | | which plugins are on and off: [plugins](#plugins) |
 | `[memory]` | | how memory's [distiller](#the-distiller) runs, and whether it [searches by meaning](#search-by-meaning) |
@@ -1974,6 +2036,7 @@ over, the daemon is restarted cold from the sessions it wrote down first.
 - [x] An event log, a stream of events on the socket, and waits on it
 - [x] Any agent saying what it's doing and how to resume it, and sessions named from their first prompt
 - [x] Restart the daemon on a new crystal without stopping its sessions
+- [x] Hooks for a Claude Code or Codex typed into a shell, resumed after a restart, and subagents counted
 - [x] Archived sessions, idle agents stopped, right-click menus, and projects kept with their run and open commands
 
 ## Development
