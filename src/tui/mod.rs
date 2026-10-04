@@ -86,7 +86,7 @@ use layouts::{Layouts, Which};
 use pane::Pane;
 use ratatui::DefaultTerminal;
 use ratatui::layout::Rect;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -111,6 +111,15 @@ const SPIN_EVERY: Duration = Duration::from_millis(150);
 /// How often its forge is asked again about a project's pull requests. A
 /// project seen for the first time is asked about straight away.
 const PULL_REQUESTS_EVERY: Duration = Duration::from_secs(60);
+
+/// How often its forge is asked again about a project's issues, for the
+/// top bar's count: they change less, and the issues view asks for itself.
+const ISSUES_EVERY: Duration = Duration::from_secs(300);
+
+/// The least time between two fetches of a worktree's remotes the branch
+/// switcher starts on its own, so opening and closing it never hammers a
+/// remote. Ctrl+R fetches whenever it's asked.
+const FETCH_EVERY: Duration = Duration::from_secs(60);
 
 /// How long find in files waits after a key before it searches: the time
 /// between keys of someone typing a word, so a search runs once it's typed.
@@ -242,6 +251,12 @@ pub enum Event {
         dir: PathBuf,
         listed: Result<switcher::Listed, String>,
     },
+    /// The remotes of the worktree at `dir` have been fetched, or why they
+    /// couldn't.
+    BranchesFetched {
+        dir: PathBuf,
+        fetched: Result<(), String>,
+    },
     /// What switching the worktree at `dir` to another branch came to.
     BranchSwitched {
         dir: PathBuf,
@@ -330,7 +345,7 @@ pub fn run(socket: &Path) -> Result<()> {
         },
     );
     let projects = Arc::new(Mutex::new(Vec::new()));
-    spawn_pull_request_poller(projects.clone(), sender.clone());
+    spawn_forge_poller(projects.clone(), sender.clone());
     let worktree_projects = Arc::new(Mutex::new(Vec::new()));
     let list_worktrees_now = Arc::new(AtomicBool::new(false));
     spawn_worktree_lister(
@@ -370,6 +385,8 @@ pub fn run(socket: &Path) -> Result<()> {
         presence: away::Presence::new(events::now_ms()),
         layout,
         ringer: Ringer::default(),
+        fetched_remotes: HashMap::new(),
+        fetching_remotes: HashSet::new(),
     };
     tui.app.set_agents(catalog::installed());
     let server = socket::server_of(socket).filter(|server| server != socket::DEFAULT);
@@ -517,6 +534,10 @@ struct Tui {
     /// Passes on to the user's terminal the bells of the sessions in panes,
     /// and of those out of sight the daemon marked as having rung.
     ringer: Ringer,
+    /// When the branch switcher last fetched each worktree's remotes, and
+    /// the worktrees whose fetch is still going: one at a time in each.
+    fetched_remotes: HashMap<PathBuf, Instant>,
+    fetching_remotes: HashSet<PathBuf>,
 }
 
 impl Tui {
@@ -801,8 +822,8 @@ impl Tui {
         self.list_worktrees_now.store(true, Ordering::Relaxed);
     }
 
-    /// Takes a fresh list of sessions, and tells the pull request poller
-    /// and the worktree lister which projects they're in.
+    /// Takes a fresh list of sessions, and tells the forge poller and the
+    /// worktree lister which projects they're in.
     fn set_sessions(&mut self, sessions: Vec<SessionInfo>) {
         // A session the TUI knew of that has come to be marked as having
         // rung its bell, out of sight, rings the user's terminal.
@@ -986,7 +1007,20 @@ impl Tui {
                 }
             }
             Event::PreviewRead { dir, path, read } => self.app.preview_read(&dir, &path, read),
-            Event::BranchesListed { dir, listed } => self.app.branches_listed(&dir, listed),
+            Event::BranchesListed { dir, listed } => {
+                if let Some(action) = self.app.branches_listed(&dir, listed) {
+                    self.carry_out(action);
+                }
+            }
+            Event::BranchesFetched { dir, fetched } => {
+                self.fetching_remotes.remove(&dir);
+                if fetched.is_ok() {
+                    self.fetched_remotes.insert(dir.clone(), Instant::now());
+                }
+                if let Some(action) = self.app.branches_fetched(&dir, fetched) {
+                    self.carry_out(action);
+                }
+            }
             Event::BranchSwitched { dir, outcome } => {
                 if let Some(action) = self.app.branch_switched(&dir, outcome) {
                     self.carry_out(action);
@@ -1429,6 +1463,7 @@ impl Tui {
                     Event::BranchesListed { dir, listed }
                 });
             }
+            Action::FetchBranches { dir, now } => self.fetch_remotes(dir, now),
             Action::SwitchBranch { dir, target, carry } => {
                 // git can take a while, over a commit's hooks say.
                 self.read_in_background(move || {
@@ -1761,8 +1796,7 @@ impl Tui {
             }
             Action::ListIssues(project) => {
                 self.read_in_background(move || {
-                    let found =
-                        Repo::find(&project).and_then(|repo| Ok((repo.forge, repo.issues()?)));
+                    let found = list_issues(&project);
                     Event::Issues { project, found }
                 });
             }
@@ -1933,6 +1967,31 @@ impl Tui {
     fn read_settings_now(&self) {
         let socket = self.socket.clone();
         self.read_in_background(move || Event::Settings(Box::new(read_settings(&socket))));
+    }
+
+    /// Fetches the remotes of the worktree at `dir` off the loop, for the
+    /// branch switcher, which hears when it's done: `now`, or unless they
+    /// were fetched less than [`FETCH_EVERY`] ago, when what that brought
+    /// is as good. A fetch still going there answers for this one too.
+    fn fetch_remotes(&mut self, dir: PathBuf, now: bool) {
+        if self.fetching_remotes.contains(&dir) {
+            return;
+        }
+        let lately = self
+            .fetched_remotes
+            .get(&dir)
+            .is_some_and(|at| at.elapsed() < FETCH_EVERY);
+        if lately && !now {
+            if let Some(action) = self.app.branches_fetched(&dir, Ok(())) {
+                self.carry_out(action);
+            }
+            return;
+        }
+        self.fetching_remotes.insert(dir.clone());
+        self.read_in_background(move || {
+            let fetched = git::branches::fetch(&dir);
+            Event::BranchesFetched { dir, fetched }
+        });
     }
 
     /// Asks the daemon to get the model that searches memory by meaning
@@ -2631,26 +2690,40 @@ fn list_pull_requests(project: &Path) -> Result<(Forge, Vec<PullRequest>), Strin
     Ok((repo.forge, repo.pull_requests()?))
 }
 
-/// Asks their forge about the open pull requests of each project the
-/// sessions are in, on a thread of its own, since its CLI can take seconds
-/// to answer: a project as soon as it's seen, and every one again each
-/// [`PULL_REQUESTS_EVERY`].
-fn spawn_pull_request_poller(projects: Arc<Mutex<Vec<PathBuf>>>, events: Sender<Event>) {
+/// The issues open on the project at `project`, and the forge they're on.
+fn list_issues(project: &Path) -> Result<(Forge, Vec<Issue>), String> {
+    let repo = Repo::find(project)?;
+    Ok((repo.forge, repo.issues()?))
+}
+
+/// Asks their forge about the pull requests and the open issues of each
+/// project the sessions are in, on a thread of its own, since its CLI can
+/// take seconds to answer: a project as soon as it's seen, and every one
+/// again each [`PULL_REQUESTS_EVERY`], and [`ISSUES_EVERY`] for its issues.
+fn spawn_forge_poller(projects: Arc<Mutex<Vec<PathBuf>>>, events: Sender<Event>) {
     thread::spawn(move || {
         let mut asked: HashMap<PathBuf, Instant> = HashMap::new();
+        let mut asked_issues: HashMap<PathBuf, Instant> = HashMap::new();
+        let due = |asked: &HashMap<PathBuf, Instant>, project: &PathBuf, every: Duration| {
+            asked.get(project).is_none_or(|at| at.elapsed() >= every)
+        };
         loop {
             let wanted = projects.lock().unwrap().clone();
             for project in wanted {
-                let due = asked
-                    .get(&project)
-                    .is_none_or(|at| at.elapsed() >= PULL_REQUESTS_EVERY);
-                if !due {
-                    continue;
+                if due(&asked, &project, PULL_REQUESTS_EVERY) {
+                    asked.insert(project.clone(), Instant::now());
+                    let found = list_pull_requests(&project);
+                    let project = project.clone();
+                    if events.send(Event::PullRequests { project, found }).is_err() {
+                        return;
+                    }
                 }
-                asked.insert(project.clone(), Instant::now());
-                let found = list_pull_requests(&project);
-                if events.send(Event::PullRequests { project, found }).is_err() {
-                    return;
+                if due(&asked_issues, &project, ISSUES_EVERY) {
+                    asked_issues.insert(project.clone(), Instant::now());
+                    let found = list_issues(&project);
+                    if events.send(Event::Issues { project, found }).is_err() {
+                        return;
+                    }
                 }
             }
             thread::sleep(Duration::from_millis(500));

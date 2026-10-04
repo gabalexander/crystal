@@ -7044,15 +7044,17 @@ fn slash_filters_the_sidebar_and_enter_selects_the_match() {
 }
 
 /// A stand-in for GitHub's `gh`: it answers `pr list` and `issue list` with
-/// the JSON given, `pr view`, `pr diff` and `issue view` with a pull
-/// request and an issue of its own, and takes comments and edits. It
-/// writes each call it gets into `gh-calls` beside it, and what it's given
-/// on its standard input into `gh-input`. Returns the directory to put
-/// first on the PATH.
+/// the JSON given, and `pr list --state merged` with what's in
+/// `gh-merged.json` beside it (none, until a test writes some), `pr view`,
+/// `pr diff` and `issue view` with a pull request and an issue of its own,
+/// and takes comments and edits. It writes each call it gets into
+/// `gh-calls` beside it, and what it's given on its standard input into
+/// `gh-input`. Returns the directory to put first on the PATH.
 fn fake_gh(dir: &Path, pull_requests: &str, issues: &str) -> PathBuf {
     let bin = dir.join("gh-bin");
     std::fs::create_dir(&bin).unwrap();
     std::fs::write(dir.join("gh-prs.json"), pull_requests).unwrap();
+    std::fs::write(dir.join("gh-merged.json"), "[]").unwrap();
     std::fs::write(dir.join("gh-issues.json"), issues).unwrap();
     std::fs::write(dir.join("gh-pr.json"), PULL_REQUEST_READ).unwrap();
     std::fs::write(dir.join("gh-issue.json"), ISSUE_READ).unwrap();
@@ -7062,8 +7064,9 @@ fn fake_gh(dir: &Path, pull_requests: &str, issues: &str) -> PathBuf {
         &bin.join("gh"),
         &format!(
             r#"echo "$*" >> "{dir}/gh-calls"
-case "$1 $2 $3" in
-    "pr view --web") ;;
+case "$*" in
+    "pr view --web "*) ;;
+    "pr list --state merged "*) cat "{dir}/gh-merged.json" ;;
     "pr list "*) cat "{dir}/gh-prs.json" ;;
     "pr view "*) cat "{dir}/gh-pr.json" ;;
     "pr diff "*) cat "{dir}/forge.diff" ;;
@@ -7114,14 +7117,16 @@ index 3b18e51..a1b2c3d 100644
 ";
 
 /// A stand-in for GitLab's `glab`, like [`fake_gh`]: it answers `mr list`
-/// and `issue list` with the JSON given, `mr view`, `mr diff` and `issue
-/// view` with a merge request and an issue of its own, and takes notes. It
-/// writes each call it gets into `glab-calls` beside it, and what it's
-/// given on its standard input into `glab-input`.
+/// and `issue list` with the JSON given, `mr list --merged` with what's in
+/// `glab-merged.json`, `mr view`, `mr diff` and `issue view` with a merge
+/// request and an issue of its own, and takes notes. It writes each call it
+/// gets into `glab-calls` beside it, and what it's given on its standard
+/// input into `glab-input`.
 fn fake_glab(dir: &Path, merge_requests: &str, issues: &str) -> PathBuf {
     let bin = dir.join("glab-bin");
     std::fs::create_dir(&bin).unwrap();
     std::fs::write(dir.join("glab-mrs.json"), merge_requests).unwrap();
+    std::fs::write(dir.join("glab-merged.json"), "[]").unwrap();
     std::fs::write(dir.join("glab-issues.json"), issues).unwrap();
     std::fs::write(dir.join("glab-mr.json"), MERGE_REQUEST_READ).unwrap();
     std::fs::write(dir.join("forge.diff"), PULL_REQUEST_DIFF).unwrap();
@@ -7132,14 +7137,15 @@ fn fake_glab(dir: &Path, merge_requests: &str, issues: &str) -> PathBuf {
         &bin.join("glab"),
         &format!(
             r#"echo "$*" >> "{dir}/glab-calls"
-case "$1 $2" in
-    "mr list") cat "{dir}/glab-mrs.json" ;;
-    "mr view") cat "{dir}/glab-mr.json" ;;
-    "mr diff") cat "{dir}/forge.diff" ;;
-    "mr note"|"issue update") cat > "{dir}/glab-input" ;;
-    "issue list") cat "{dir}/glab-issues.json" ;;
-    "issue view") cat "{dir}/glab-issue.json" ;;
-    "issue note") ;;
+case "$*" in
+    "mr list --merged"*) cat "{dir}/glab-merged.json" ;;
+    "mr list"*) cat "{dir}/glab-mrs.json" ;;
+    "mr view"*) cat "{dir}/glab-mr.json" ;;
+    "mr diff"*) cat "{dir}/forge.diff" ;;
+    "mr note"*|"issue update"*) cat > "{dir}/glab-input" ;;
+    "issue list"*) cat "{dir}/glab-issues.json" ;;
+    "issue view"*) cat "{dir}/glab-issue.json" ;;
+    "issue note"*) ;;
     *) echo "unexpected: $*" >&2; exit 1 ;;
 esac
 "#
@@ -7375,6 +7381,83 @@ fn capital_o_reads_a_pull_request_shows_its_diff_and_comments_on_it() {
 }
 
 #[test]
+fn pull_requests_are_marked_merged_or_conflicting_and_counted_in_the_top_bar() {
+    let crystal = Crystal::new();
+    let dir = crystal.dir.path();
+    let repo = github_repo(dir);
+    let open = r#"[
+        {"number": 57, "title": "Fix the login redirect", "author": {"login": "ana"},
+         "headRefName": "fix-login", "isDraft": false, "mergeable": "CONFLICTING",
+         "updatedAt": "2026-10-02T09:30:00Z", "url": "https://github.com/acme/app/pull/57"},
+        {"number": 58, "title": "Dark mode", "author": {"login": "bo"},
+         "headRefName": "dark", "isDraft": true, "mergeable": "MERGEABLE",
+         "updatedAt": "2026-10-01T09:30:00Z", "url": "https://github.com/acme/app/pull/58"}
+    ]"#;
+    let issues = r#"[
+        {"number": 7, "title": "Dark mode", "labels": [], "updatedAt": "2026-09-01T10:00:00Z",
+         "author": {"login": "bo"}, "url": "https://github.com/acme/app/issues/7"},
+        {"number": 42, "title": "Fix login redirect", "labels": [],
+         "updatedAt": "2026-10-01T10:00:00Z", "author": {"login": "ana"},
+         "url": "https://github.com/acme/app/issues/42"}
+    ]"#;
+    let bin = fake_gh(dir, open, issues);
+    let merged = r#"[{"number": 41, "title": "Faster startup", "author": {"login": "cy"},
+        "headRefName": "startup", "updatedAt": "2026-09-30T09:30:00Z",
+        "url": "https://github.com/acme/app/pull/41"}]"#;
+    std::fs::write(dir.join("gh-merged.json"), merged).unwrap();
+    let repo_arg = repo.to_str().unwrap();
+    // The worktree of a pull request that has merged.
+    crystal.ok(&[
+        "new", "-n", "starter", "-c", repo_arg, "-w", "startup", "sleep", "30",
+    ]);
+
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let mut tui = crystal.attach_with_env(&[], &[("PATH", &path)]);
+    tui.shows("#41 merged");
+    tui.shows("1 session · 2 prs · 2 issues");
+
+    tui.type_keys("O");
+    tui.shows("pull requests · app");
+    tui.shows("2 open");
+    tui.shows("Fix the login redirect  conflicts");
+    tui.shows("conflicts with main: it can't merge as it stands");
+    tui.shows("Dark mode  draft");
+    tui.shows("Faster startup  merged");
+
+    // Ctrl+R asks the forge again.
+    let gh_calls = dir.join("gh-calls");
+    let listed = || {
+        calls(&gh_calls)
+            .lines()
+            .filter(|call| call.starts_with("pr list --state open"))
+            .count()
+    };
+    let before = listed();
+    tui.type_keys("\x12");
+    eventually("gh is asked for the list again", || listed() > before);
+    tui.type_keys("\x1b");
+    tui.hides("pull requests · app");
+
+    // Hidden in the settings, drafts leave the list and the count.
+    tui.resize(40, 100);
+    tui.type_keys(",");
+    tui.shows("hide drafts");
+    tui.type_keys("jjjjjjjj ");
+    tui.shows("● hide drafts");
+    let config = std::fs::read_to_string(crystal.config_file()).unwrap();
+    assert!(
+        config.contains("[forge]\nhide_draft_prs = true"),
+        "{config}"
+    );
+    tui.type_keys("\x1b");
+    tui.shows("1 session · 1 pr · 2 issues");
+    tui.type_keys("O");
+    tui.shows("1 open · 1 draft hidden");
+    tui.shows("Fix the login redirect");
+    tui.hides("Dark mode");
+}
+
+#[test]
 fn enter_on_a_pull_request_starts_a_session_in_its_worktree_forks_too() {
     let crystal = Crystal::new();
     let dir = crystal.dir.path();
@@ -7564,6 +7647,11 @@ fn on_gitlab_merge_requests_and_issues_go_through_glab() {
         "updated_at": "2026-10-01T10:00:00Z", "author": {"username": "di"},
         "web_url": "https://gitlab.com/acme/app/-/work_items/8"}]"#;
     let glab = fake_glab(crystal.dir.path(), merge_requests, issues);
+    let merged = r#"[{"iid": 50, "title": "Faster startup", "author": {"username": "cy"},
+        "source_branch": "startup", "source_project_id": 7, "target_project_id": 7,
+        "updated_at": "2026-09-30T09:30:00Z",
+        "web_url": "https://gitlab.com/acme/app/-/merge_requests/50"}]"#;
+    std::fs::write(crystal.dir.path().join("glab-merged.json"), merged).unwrap();
     let repo_arg = repo.to_str().unwrap();
     crystal.ok(&[
         "new",
@@ -7583,6 +7671,7 @@ fn on_gitlab_merge_requests_and_issues_go_through_glab() {
     tui.type_keys("O");
     tui.shows("merge requests · app");
     tui.shows("Fix the login redirect  draft");
+    tui.shows("Faster startup  merged");
     tui.shows("✗ pipeline");
     tui.shows("Why here?");
     tui.shows("cy approved");
@@ -7668,6 +7757,17 @@ fn d_shows_what_changed_in_the_selected_sessions_worktree() {
     tui.shows("notes.md");
     tui.shows("todo.txt");
     tui.shows("+ - ask about fees");
+
+    // `/` filters the files by a few letters of their paths.
+    tui.type_keys("/tdo");
+    tui.shows("1 match");
+    tui.hides("notes.md");
+    tui.shows("+ write the tests");
+    // Enter keeps the filter; Esc then clears it.
+    tui.type_keys("\r");
+    tui.type_keys("\x1b");
+    tui.shows("notes.md");
+    tui.hides("1 match");
 
     // The branch, the way its pull request would read.
     tui.type_keys("b");
@@ -8043,6 +8143,41 @@ fn capital_b_makes_a_branch_and_switches_back_stashing_the_changes() {
         stashed.contains("crystal: spike before switching to main"),
         "{stashed}"
     );
+}
+
+#[test]
+fn capital_b_fetches_the_remotes_so_their_new_branches_are_listed() {
+    let crystal = Crystal::new();
+    let dir = crystal.dir.path();
+    let repo = git_repo(dir, "app");
+    let origin = dir.join("origin.git");
+    let origin_arg = origin.to_str().unwrap();
+    git(dir, &["init", "-q", "--bare", "-b", "main", origin_arg]);
+    git(&repo, &["remote", "add", "origin", origin_arg]);
+    git(&repo, &["push", "-q", "origin", "main"]);
+    // Pushed from somewhere else: the repository hasn't fetched it.
+    git(&origin, &["branch", "from-elsewhere", "main"]);
+    crystal.ok(&[
+        "new",
+        "-n",
+        "agent",
+        "-c",
+        repo.to_str().unwrap(),
+        "sleep",
+        "30",
+    ]);
+
+    let mut tui = crystal.tui();
+    tui.shows("agent");
+    tui.type_keys("B");
+    tui.shows("switch branch");
+    tui.shows("origin/from-elsewhere");
+    tui.hides("fetching…");
+
+    // Ctrl+R fetches again, however lately it did.
+    git(&origin, &["branch", "later", "main"]);
+    tui.type_keys("\x12");
+    tui.shows("origin/later");
 }
 
 #[test]

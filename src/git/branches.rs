@@ -1,7 +1,8 @@
 //! A worktree's branches, and moving it onto another, for the branch
 //! switcher: the local branches, and the remote ones no local branch has
-//! the name of, each with its last commit; what isn't committed in the
-//! worktree; and the switch, which asks what's to become of that first:
+//! the name of, each with its last commit; fetching the remotes, so theirs
+//! are as they are now; what isn't committed in the worktree; and the
+//! switch, which asks what's to become of that first:
 //! stashed, brought along, committed, or thrown away.
 //!
 //! Agents run git in the same repository while a switch runs, so nothing
@@ -13,8 +14,20 @@ use super::git;
 use anyhow::{Context, Result, bail};
 use std::collections::HashSet;
 use std::io::Write;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::time::UNIX_EPOCH;
+use std::process::{Child, Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant, UNIX_EPOCH};
+
+/// How long fetching the remotes may take: a fetch writes packs, and one
+/// cut short starts over the next time, but a remote that has stalled
+/// mustn't hold it for good.
+const FETCH_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// How long a fetch that's stopped gets to tidy its lock and its half
+/// written packs away before it's killed.
+const FETCH_GRACE: Duration = Duration::from_secs(2);
 
 /// A branch the worktree can be switched to.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,6 +88,73 @@ pub fn list(dir: &Path) -> Result<Vec<Branch>> {
         "refs/remotes",
     ];
     Ok(parse_refs(&git(dir, &args)?))
+}
+
+/// Fetches every remote of the repository the worktree at `dir` is in,
+/// `git fetch --all`, so their branches are as they are now. It's a session
+/// of its own, with nothing on its standard input, so an ssh asking for a
+/// passphrase or about a host can't take the terminal, which may be the
+/// TUI's, and fails instead; and it's stopped, with the ssh it started,
+/// once it has taken [`FETCH_TIMEOUT`]. An error is the line of what git
+/// said that says what failed.
+pub fn fetch(dir: &Path) -> Result<(), String> {
+    let mut command = Command::new("git");
+    command
+        .arg("-C")
+        .arg(dir)
+        .args(["fetch", "--all", "--quiet"])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    // SAFETY: setsid is safe to call between fork and exec, and has no
+    // preconditions.
+    unsafe {
+        command.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|_| "couldn't run git".to_string())?;
+    let said = super::read_all(child.stderr.take());
+    let deadline = Instant::now() + FETCH_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => return Ok(()),
+            Ok(Some(_)) => return Err(first_line(&said.join().unwrap_or_default())),
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(50)),
+            _ => {
+                stop_all(&mut child);
+                return Err("git fetch took too long".to_string());
+            }
+        }
+    }
+}
+
+/// Stops `child` and whatever it started, all in its process group: asked
+/// first, so git can take its lock away, then, after [`FETCH_GRACE`],
+/// killed.
+fn stop_all(child: &mut Child) {
+    let Ok(group) = i32::try_from(child.id()) else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return;
+    };
+    // SAFETY: plain signals to a process group this process started and
+    // hasn't waited for the leader of, so its number can't be another's.
+    unsafe { libc::kill(-group, libc::SIGTERM) };
+    let grace = Instant::now() + FETCH_GRACE;
+    while Instant::now() < grace {
+        if let Ok(Some(_)) = child.try_wait() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    // SAFETY: as above.
+    unsafe { libc::kill(-group, libc::SIGKILL) };
+    let _ = child.wait();
 }
 
 /// The branches in what `git for-each-ref` printed in [`REF_FORMAT`], in
@@ -614,6 +694,31 @@ mod tests {
 
     fn read(dir: &Path, file: &str) -> String {
         std::fs::read_to_string(dir.join(file)).unwrap()
+    }
+
+    #[test]
+    fn fetching_brings_a_remotes_new_branches_and_says_why_it_cant() {
+        let origin = repo();
+        let clone = tempfile::tempdir().unwrap();
+        let from = origin.path().to_str().unwrap();
+        run(clone.path(), &["clone", "-q", from, "."]);
+        run(origin.path(), &["branch", "fresh"]);
+        let has_fresh = || {
+            list(clone.path())
+                .unwrap()
+                .iter()
+                .any(|branch| branch.name == "origin/fresh")
+        };
+        assert!(!has_fresh());
+        fetch(clone.path()).unwrap();
+        assert!(has_fresh());
+
+        run(
+            clone.path(),
+            &["remote", "set-url", "origin", "/no/such/repository"],
+        );
+        let why = fetch(clone.path()).unwrap_err();
+        assert!(!why.is_empty() && !why.contains('\n'), "{why}");
     }
 
     #[test]

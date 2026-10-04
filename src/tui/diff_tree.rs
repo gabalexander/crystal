@@ -61,12 +61,22 @@ impl Tree {
     /// The tree of `paths`, the diff's files in their order, every
     /// directory open: directories first at each level, then files, each
     /// by name.
+    #[cfg(test)]
     pub fn new(paths: &[&str]) -> Tree {
+        let files: Vec<(usize, &str)> = paths.iter().copied().enumerate().collect();
+        Tree::of(&files)
+    }
+
+    /// The tree of the diff's files, or some of them, each by its place in
+    /// the diff's list and its path, every directory open: directories
+    /// first at each level, then files, each by name. Given only the files
+    /// a filter kept, it's those and the directories they're in.
+    pub fn of(files: &[(usize, &str)]) -> Tree {
         let mut root = Level::default();
-        for (file, path) in paths.iter().enumerate() {
+        for &(file, path) in files {
             let (dirs, name) = match path.rsplit_once('/') {
                 Some((dirs, name)) => (dirs.split('/').collect(), name),
-                None => (Vec::new(), *path),
+                None => (Vec::new(), path),
             };
             let level = dirs
                 .into_iter()
@@ -305,6 +315,14 @@ mod tests {
             })
             .collect();
         assert_eq!(files, [None, Some(1), None, Some(0), Some(2)]);
+    }
+
+    #[test]
+    fn a_tree_of_some_files_keeps_their_places_in_the_diff() {
+        // What a filter kept of `a/one.rs`, `a/two.rs` and `b/three.rs`.
+        let tree = Tree::of(&[(0, "a/one.rs"), (2, "b/three.rs")]);
+        assert_eq!(shown(&tree), ["0:a", "1:one.rs", "0:b", "1:three.rs"]);
+        assert_eq!(tree.files_under(tree.rows()[2]), [2]);
     }
 
     #[test]

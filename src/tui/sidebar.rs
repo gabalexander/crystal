@@ -647,6 +647,8 @@ fn pull_request_spans<'a>(pull_request: &PullRequest, theme: &Theme) -> Vec<Vec<
 /// says how it stands. One that's simply ready has none.
 fn pull_request_mark(state: PullRequestState, theme: &Theme) -> Option<(&'static str, Color)> {
     let mark = match state {
+        PullRequestState::Merged => ("merged", theme.accent),
+        PullRequestState::Conflicts => ("conflicts", theme.failed),
         PullRequestState::ChecksFailing => ("✗", theme.failed),
         PullRequestState::ChangesRequested => ("±", theme.waiting),
         PullRequestState::Draft => ("draft", theme.muted),

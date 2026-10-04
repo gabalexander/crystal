@@ -93,7 +93,8 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   - `layout_link.rs`: the TUI's end of the layout commands: offering the daemon to take them, again at once
     after a handover or a restart, each one an event for the loop, and its answers, that it was used (a
     key, the mouse, a paste, focus gained) and when its terminal gains and loses the focus  sent back
-  - `ui.rs`: the layout and drawing (top bar and its tabs, pane headers, footer), and what's under the mouse
+  - `ui.rs`: the layout and drawing (top bar with its tabs and the counts of what's open on the selected
+    session's forge, pane headers, footer), and what's under the mouse
   - `tabs.rs`: tabs, as many as the user likes, each holding its own sessions (each session in exactly one)
     with its own selection, its tree of panes, the session the selection's pane last showed and the session
     floating over them, their order and which is in front; the sidebar shows only that tab's sessions. Kept apart from I/O; the event loop keeps
@@ -150,10 +151,13 @@ whenever what's handed over changes in a way the crystal before couldn't read.
     under its project in the sidebar's rows
   - `issues.rs`: the issues view (`i`): its state and keys, kept apart from I/O, commenting on an issue and
     changing its title and text, and its drawing
-  - `pull_requests.rs`: the pull requests view (`O`): its state and keys, kept apart from I/O, reading one with
-    its checks and conversation, its diff, commenting, starting a session in its worktree, and its drawing
+  - `pull_requests.rs`: the pull requests view (`O`): its state and keys, kept apart from I/O, the open ones
+    marked as drafts, conflicting and by their checks and reviews, then those merged lately, drafts left out
+    while the settings hide them, reading one with its checks and conversation, its diff, commenting, asking
+    the forge again (`Ctrl+R`), starting a session in its worktree, and its drawing
   - `listing.rs`: what the issues and pull requests views and the timeline share: a list filtered as you
-    type, the bar kept on its item, each item read whole once, the reading pane, and drawing them
+    type, the bar kept on its item, each item read whole once, the list asked for again and the heading
+    saying so, the reading pane, and drawing them
   - `compose.rs`: writing back to the forge from those views: the comment box and the form that edits an
     issue, which keep what's typed until the forge takes it
   - `backlog_view.rs`: the backlog view `b` opens: its state and keys, kept apart from I/O, and its
@@ -167,9 +171,9 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   - `diff.rs`: reads `git diff`'s patch into files, hunks and lines, marks the words that changed,
     and lays a file out in rows, unified or side by side; pure, so it's unit-tested
   - `diff_view.rs`: the diff view (`d`): its state, keys and drawing, files marked reviewed sinking to the
-    bottom, and reading the diff off the event loop
-  - `diff_tree.rs`: the diff view's files folded into a tree of directories (`t`), a chain of directories
-    that hold only one another as one row; pure
+    bottom, the list filtered by a few letters of a path (`/`), and reading the diff off the event loop
+  - `diff_tree.rs`: the diff view's files, or those its filter keeps, folded into a tree of directories
+    (`t`), a chain of directories that hold only one another as one row; pure
   - `review.rs`: what the diff view keeps between runs, a document the event loop keeps in the database: the
     files marked reviewed, for each worktree's diff at its commit or each pull request's, with their hashes,
     and whether it lists files as a tree
@@ -177,8 +181,9 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   - `finder.rs`: the file finder (`p`): its state, keys and drawing, and listing files off the event loop
   - `grep.rs`: find in files (`G`): `git grep` as you type, run off the event loop once the typing stops,
     the lines found under their files, the preview around one, and its drawing
-  - `switcher.rs`: the branch switcher (`B`): the branches filtered as you type, the question about the
-    worktree's uncommitted changes and the commit message, kept apart from I/O, and its drawing
+  - `switcher.rs`: the branch switcher (`B`): the branches filtered as you type, the remotes fetched once
+    they're listed (or on `Ctrl+R`) and the branches listed again, the question about the worktree's
+    uncommitted changes and the commit message, kept apart from I/O, and its drawing
   - `tree_browser.rs`: the tree browser (`E`): a worktree's files as a tree, folded and opened, the filter
     that narrows it to the files that match and their directories, the border dragged, its keys and drawing;
     kept apart from I/O, so it's unit-tested
@@ -199,9 +204,10 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   - `away.rs`: "while you were away": when the user is gone (a quit, the terminal's focus lost for a while, or
     no key for a while where focus isn't told), what the event log gained meanwhile counted into the
     footer's line, and the latest event seen, which the event loop keeps in the database
-  - `settings_view.rs`: the settings view (`,`): notifications, sounds, the theme, the distiller and search by meaning,
-    each changed with a key, and how the models stand; the event loop writes the file (`config::set`) and,
-    while it's open, reads the settings and the daemon's `EmbeddingStatus` again every half a second
+  - `settings_view.rs`: the settings view (`,`): notifications, sounds, the theme, the distiller, search by
+    meaning and hiding draft pull requests, each changed with a key, and how the models stand; the event loop
+    writes the file (`config::set`) and, while it's open, reads the settings and the daemon's
+    `EmbeddingStatus` again every half a second
 - `src/daemon.rs`: the daemon: listens on the socket and owns the sessions, and emits an event wherever something
   happens to them, their tasks, flows, worktrees, memory or backlog; archives sessions and starts them again,
   stops agents left idle past `[sessions] stop_idle_after`, and keeps the list of projects sessions ran in;
@@ -407,14 +413,15 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   worktree (a merge, a rebase, a cherry-pick or a revert) and the branch a rebase keeps though HEAD is
   detached, the subject of the commit each of Claude Code's own worktrees (`.claude/worktrees`) is at, and
   `git grep` stopped once it's no longer wanted (runs `git`)
-  - `git/branches.rs`: a worktree's branches, local and remote, its uncommitted changes, and switching it to
-    another branch or a new one, the changes stashed, brought along, committed or thrown away, and put back
-    when git won't switch
+  - `git/branches.rs`: a worktree's branches, local and remote, fetching its remotes in a session of their own
+    with a timeout, its uncommitted changes, and switching it to another branch or a new one, the changes
+    stashed, brought along, committed or thrown away, and put back when git won't switch
 - `src/names.rs`: made-up names for new worktrees' branches, like `brave-otter`, and a session's name from its
   first prompt, like `fix-login-redirect`
-- `src/forge.rs`: pull requests and issues from the forge a project's remote is on, GitHub or GitLab, told
-  apart by its host and the hosts `gh` and `glab` know: the types both read into, `Repo`'s calls, and running
-  the CLI with a timeout; tests use a fake `gh` and `glab`, never the real ones. Was `github.rs`
+- `src/forge.rs`: pull requests (open, and merged lately) and issues from the forge a project's remote is on,
+  GitHub or GitLab, told apart by its host and the hosts `gh` and `glab` know: the types both read into,
+  `Repo`'s calls, and running the CLI with a timeout; tests use a fake `gh` and `glab`, never the real ones.
+  Was `github.rs`
   - `forge/github.rs`: each call as a `gh` command, and reading its `--json`
   - `forge/gitlab.rs`: each call as a `glab` command, and reading its JSON, a merge request as a pull request
 - `src/shell.rs`: quoting arguments and writing paths with `~`, the way a shell reads them

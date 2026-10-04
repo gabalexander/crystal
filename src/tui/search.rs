@@ -303,6 +303,8 @@ mod tests {
             from_fork: false,
             local_branch: branch.into(),
             draft: false,
+            conflicts: false,
+            merged: false,
             checks: Checks::None,
             review: Review::None,
             updated_at: "2026-10-02T09:30:00Z".into(),
