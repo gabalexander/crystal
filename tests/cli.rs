@@ -3624,6 +3624,96 @@ fn send_refuses_an_agent_asking_something_unless_forced() {
     assert_eq!(once_lines(&dir.join("got"), 3), "y\ncarry on\nnext\n");
 }
 
+/// Whether `text` holds anything a terminal would take as an order: a
+/// control character but a line break, or a bidi control.
+fn holds_orders(text: &str) -> bool {
+    let bidi = |c: char| matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}');
+    text.chars()
+        .any(|c| (c.is_control() && c != '\n') || bidi(c))
+}
+
+#[test]
+fn what_agents_say_reaches_the_terminal_as_text_alone() {
+    let crystal = Crystal::new();
+    let refused = crystal.fails(&["new", "-n", "evil\x1b]0;pwned\x07", "sh"]);
+    assert!(
+        refused.contains("can't contain control characters"),
+        "{refused}"
+    );
+    assert!(!holds_orders(&refused), "{refused:?}");
+
+    crystal.ok(&["new", "-n", "agent", "sh", "-c", "sleep 30"]);
+    let message = "Allow\x1b]52;c;aGk=\x07 it?\u{202e}";
+    crystal.ok(&[
+        "report", "-n", "agent", "--agent", "pi", "waiting", "-m", message,
+    ]);
+    let refused = crystal.fails(&["send", "agent", "carry on"]);
+    assert!(refused.contains("(Allow]52;c;aGk= it?)"), "{refused}");
+    assert!(!holds_orders(&refused), "{refused:?}");
+    let events = crystal.ok(&["events"]);
+    assert!(events.contains("Allow]52;c;aGk= it?"), "{events}");
+    assert!(!holds_orders(&events), "{events:?}");
+
+    crystal.ok(&["backlog", "add", "Retry\x1b[?1049h\r\nthe \u{9b}2Jwebhook"]);
+    let backlog = crystal.ok(&["backlog"]);
+    assert!(backlog.contains("Retry[?1049h"), "{backlog}");
+    assert!(!holds_orders(&backlog), "{backlog:?}");
+}
+
+/// A stand-in for a background task's `claude -p` that answers every
+/// prompt with orders for the terminal in all it says: its text (and a
+/// character reference markdown reads as ESC), a tool's name and what it
+/// was asked, the tool's answer, and its result.
+fn hostile_claude(dir: &Path) -> PathBuf {
+    let bin = dir.join("hostile-bin");
+    std::fs::create_dir(&bin).unwrap();
+    script(
+        &bin.join("claude"),
+        r#"while IFS= read -r line; do
+    case "$line" in *'"type":"user"'*) ;; *) continue ;; esac
+    printf '%s\n' '{"type":"system","subtype":"init","session_id":"conv-1","cwd":"/x","model":"m"}'
+    printf '%s\n' '{"type":"assistant","parent_tool_use_id":null,"message":{"content":[{"type":"text","text":"Said \u001b]0;pwned\u0007 then \u001b]52;c;aGk=\u0007 then \u001b[?1049h then &#x1b;]2;ref&#7; end"},{"type":"tool_use","id":"t1","name":"Bash\u001b[2J","input":{"command":"ls \u009b2J here"}}]}}'
+    printf '%s\n' '{"type":"user","parent_tool_use_id":null,"message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"out \u001b]8;;https://evil.example\u001b\\link\u001b]8;;\u001b\\ \u202eabc","is_error":false}]}}'
+    printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"done \u001b]0;r\u0007","session_id":"conv-1","total_cost_usd":0.01,"duration_ms":100}'
+done
+"#,
+    );
+    bin
+}
+
+#[test]
+fn a_task_s_screen_draws_what_claude_says_and_takes_no_orders_from_it() {
+    let crystal = Crystal::new();
+    let path = path_with(&hostile_claude(crystal.dir.path()));
+    let out = crystal
+        .command(&["task", "-n", "hostile", "look", "around"])
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    eventually("the task is done", || status(&crystal, "hostile") == "done");
+    // Had the screen taken them as orders, the sequences would be gone,
+    // and the alternate screen would hide everything drawn before it.
+    shows_on_screen(
+        &crystal,
+        "hostile",
+        "Said ]0;pwned then ]52;c;aGk= then [?1049h then ]2;ref end",
+    );
+    // Not Bash's name, so what it was asked shows whole.
+    shows_on_screen(&crystal, "hostile", r#"▸ Bash[2J {"command":"ls 2J here"}"#);
+    shows_on_screen(
+        &crystal,
+        "hostile",
+        "└ out ]8;;https://evil.example\\link]8;;\\ abc",
+    );
+    let result = crystal.ok(&["result", "hostile"]);
+    assert_eq!(result, "done ]0;r\n");
+}
+
 #[test]
 fn s_splits_a_session_off_and_it_stays_while_the_selection_moves() {
     let crystal = Crystal::new();

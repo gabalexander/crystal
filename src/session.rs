@@ -13,6 +13,7 @@ use crate::handover::{self, Got};
 use crate::keys;
 use crate::model;
 use crate::notify::{self, Notice};
+use crate::printable;
 use crate::protocol::{
     Activity, AgentEvent, AgentReport, Answer, Asking, Conversation, Front, InProgress, Metadata,
     Reporter, ScreenExplained, SessionInfo, State, TaskInfo, TaskOutcome, TaskRecord, TaskResult,
@@ -470,7 +471,7 @@ impl Session {
     /// its turn to start again from `saved`, with no program yet: its screen
     /// says so to whoever looks. It keeps its `id` once it has started.
     pub fn to_start(id: String, saved: SavedSession) -> Session {
-        let name = saved.name.clone();
+        let name = printable::line(&saved.name).into_owned();
         let session = Session::unstarted(id, saved);
         session.term.show(
             format!("\x1b[2mstarting {name} again after crystal's restart…\x1b[0m").as_bytes(),
@@ -544,10 +545,10 @@ impl Session {
     /// The session waiting its turn couldn't start, for the reason `why`:
     /// its screen says so, and the start it waited for is over.
     pub fn fail_to_start(&mut self, why: &str) {
-        let name = &self.name;
+        let (name, shown) = (printable::line(&self.name), printable::line(why));
         let said = format!(
             "\r\n\x1b[1mcrystal couldn't start {name} again after the restart:\x1b[0m\r\n\r\n  \
-             {why}\r\n\r\nIt's kept as it was: once that's put right, Enter in crystal's \
+             {shown}\r\n\r\nIt's kept as it was: once that's put right, Enter in crystal's \
              sidebar or `crystal respawn {name}` starts it again, and `crystal kill {name}` \
              lets it go.\r\n"
         );
@@ -945,7 +946,10 @@ impl Session {
                     resume: None,
                 });
                 reporter.agent = agent;
-                reporter.message = message.filter(|message| !message.trim().is_empty());
+                // Shown on the user's screen, and in their notifications.
+                reporter.message = message
+                    .map(|message| printable::line(&message).trim().to_string())
+                    .filter(|message| !message.is_empty());
                 if resume.is_some() {
                     reporter.resume = resume;
                 }

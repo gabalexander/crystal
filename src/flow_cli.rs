@@ -6,6 +6,7 @@ use crate::client;
 use crate::config::Config;
 use crate::flow_run::{FlowRun, RunState};
 use crate::flows;
+use crate::printable;
 use crate::protocol::{Request, Response};
 use crate::shell;
 use anyhow::{Context, Result, bail};
@@ -78,7 +79,7 @@ pub fn show(socket: &Path, name: &str, json: bool) -> Result<()> {
         run.round,
         dollars(run.cost_usd())
     );
-    println!("goal  {}", run.goal);
+    println!("goal  {}", printable::text(&run.goal));
     let mut place = shell::home_relative(&run.cwd);
     if let Some(worktree) = &run.worktree {
         place.push_str(&format!(", then {}", shell::home_relative(worktree)));
@@ -216,11 +217,12 @@ fn describe(run: &FlowRun) -> String {
         RunState::Interrupted => format!("interrupted at {step}"),
         RunState::Cancelled => format!("cancelled at {step}"),
         RunState::Failed => {
+            // The step's agent's answer, which the user reads as it is.
             let why = run
                 .current()
                 .and_then(|step| run.steps[step].answer.as_deref())
                 .map_or("", first_line);
-            format!("failed at {step}: {why}")
+            format!("failed at {step}: {}", printable::line(why))
         }
     }
 }

@@ -333,7 +333,7 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   `claude -p`: prompts in, the control messages that carry a permission prompt out and its answer back, an
   interrupt, and the rule "always" keeps; adapted from docket's `docket-claude`
 - `src/transcript.rs`: reading `claude -p`'s stream-json events, and drawing them as a task's transcript,
-  Claude's answers as markdown pages
+  Claude's answers as markdown pages, everything in it that isn't crystal's own made printable first
 - `src/markdown.rs`: markdown laid out as a page for one width (pulldown-cmark), each piece marked with what
   it is for the TUI's theme or a transcript's colors to draw, mermaid fences drawn as diagrams; adapted from
   docket's
@@ -478,6 +478,11 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   - `forge/github.rs`: each call as a `gh` command, and reading its `--json`
   - `forge/gitlab.rs`: each call as a `glab` command, and reading its JSON, a merge request as a pull request
 - `src/shell.rs`: quoting arguments and writing paths with `~`, the way a shell reads them
+- `src/printable.rs`: text crystal didn't write made fit for the user's terminal: control characters, the escape
+  sequences they start and the explicit bidi controls taken out, on one line or keeping its lines; and the TUI's
+  frame scrubbed of them last, since ratatui hands a zero-width one on to the terminal. A background task's
+  transcript, the window's title, notifications, session names, reports, the backlog, memory and what the CLI
+  prints for people go through it
 - `tests/cli.rs`: end-to-end tests that drive the real binary against a private daemon (and read its database
   beside its socket to see what it wrote down), with a config of
   their own that turns notifications, sounds, the memory plugin, naming sessions from their prompts and panes'

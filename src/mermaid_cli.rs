@@ -10,6 +10,7 @@
 
 use crate::markdown;
 use crate::mermaid::{self, Glyphs, Rendered};
+use crate::printable;
 use anyhow::{Context, Result, bail};
 use std::io::{IsTerminal, Read, Write};
 
@@ -80,14 +81,16 @@ fn draw(text: &str, width: usize, glyphs: Glyphs, out: &mut impl Write) -> Resul
             }
             writeln!(out, "── diagram {number} ──")?;
         }
+        // A diagram comes from anywhere, and a label's entities are read
+        // as the characters they stand for.
         match mermaid::render(source, width, glyphs) {
             Rendered::Diagram { lines, .. } => {
                 for line in lines {
-                    writeln!(out, "{line}")?;
+                    writeln!(out, "{}", printable::line(&line))?;
                 }
             }
             Rendered::Unsupported { reason } => {
-                writeln!(out, "{}", source.trim_end())?;
+                writeln!(out, "{}", printable::text(source.trim_end()))?;
                 let which = if several {
                     format!("diagram {number} ")
                 } else {
@@ -138,5 +141,20 @@ mod tests {
         );
         let (_, not_drawn) = drawn("sequenceDiagram\n A->>B: x\n B->>C: y\n C->>D: z", 12);
         assert!(not_drawn[0].contains("columns"), "{not_drawn:?}");
+    }
+
+    #[test]
+    fn a_diagram_draws_nothing_a_terminal_would_take_as_an_order() {
+        let (out, _) = drawn(
+            "flowchart LR\n a[\"x\x1b]0;t\x07\"] --> b[\"\u{202e}y\"]\n",
+            80,
+        );
+        let held = out
+            .lines()
+            .any(|line| line.contains(printable::is_unprintable));
+        assert!(!held, "{out:?}");
+        assert!(out.contains("]0;t"), "{out}");
+        let (out, _) = drawn("pie\n \"\x1b[?1049h\": 1\n", 80);
+        assert_eq!(out, "pie\n \"[?1049h\": 1\n");
     }
 }
