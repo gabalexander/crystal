@@ -243,7 +243,27 @@ reads the screen: the spinner an agent puts in its title, "esc to interrupt" whi
 it asks before a command. The screen covers agents without hooks, like Codex or a Claude you started from a
 shell, and what hooks never say: a turn you cut short with Esc, or work carrying on once you've said yes.
 The screen only counts while an agent is in front: a shell or a build printing an agent's words never shows
-as waiting, and when an agent exits back to its shell, what it was doing goes with it.
+as waiting, and when an agent exits back to its shell, what it was doing goes with it. While Claude Code's
+agent has subagents running, its row says how many after what's in front: `claude +2`.
+
+A Claude Code or Codex you start yourself, typed into a session's shell, has no hooks of crystal's: crystal
+doesn't start it. `crystal integration install` puts crystal's hooks in their own settings, beside yours:
+
+```sh
+crystal integration install          # Claude Code and Codex, each that's installed here
+crystal integration install claude   # into $CLAUDE_CONFIG_DIR/settings.json, or ~/.claude/settings.json
+crystal integration install codex    # into $CODEX_HOME/hooks.json, or ~/.codex/hooks.json
+crystal integration status           # whether they're there, for this crystal
+crystal integration uninstall        # take them out again, and only them
+```
+
+Then the agent you typed says what it's doing through its hooks, the same as one crystal starts, and which
+conversation it's in: after a restart, the session's shell starts again and `claude --resume <id>` (or `codex
+resume <id>`) is typed into it, so you're back where you were. Only while the agent is in front, though: quit
+it, and the shell comes back on its own. `resume_reported_agents = false` in the [settings](#settings) turns
+that off. Each hook runs `crystal hook <agent> --installed`, crystal by its path, so run `install` again if
+you move crystal; `status` says when the hooks are out of date. Outside crystal, and for an agent crystal
+started with hooks of its own, they do nothing.
 
 When a session comes to need you while you're looking elsewhere (its agent asks you something, or finishes a
 turn nobody was watching), crystal shows a desktop notification, like "claude-2 is waiting on you · app
@@ -295,6 +315,7 @@ crystal pane split review                   # show a session in a pane beside yo
 crystal tab new review                      # a new tab in the TUI, in front
 crystal layout                              # the TUI's tabs and how each splits its panes
 crystal skill --install                     # teach Claude Code to drive crystal (see below)
+crystal integration install                 # hooks for a claude or codex you start in a shell (see above)
 crystal mermaid docs/flow.md                # draw a page's mermaid diagrams as text (see below)
 crystal ssh box                             # crystal's TUI on another machine (see below)
 ```
@@ -684,20 +705,32 @@ for, and stays on it.
 
 crystal reads what Codex is doing off its screen: `Working (… esc to interrupt)` while it works, and its
 approval questions ("Would you like to run the following command?") while it waits on you. Codex has hooks
-too, but crystal can't add its own the way it does for Claude Code: Codex only reads hooks from its config
-files, never from the command line, and skips any hook you haven't reviewed in `/hooks`. Its `notify` setting
-can be given on the command line, but that would replace yours, so crystal leaves it alone.
+too, but crystal can't add its own as it starts Codex, the way it does for Claude Code: Codex only reads hooks
+from its config files, never from the command line, and skips any hook you haven't reviewed. Its `notify`
+setting can be given on the command line, but that would replace yours, so crystal leaves it alone.
+
+`crystal integration install codex` puts crystal's hooks in Codex's `hooks.json` instead, and turns on
+`[features] hooks` in its `config.toml`, keeping the rest as it was. Codex asks you to review new hooks as it
+starts, or in `/hooks`; once you've trusted them, every Codex reports through them, the ones crystal starts and
+the ones you type into a shell: a turn starting and ending, the permissions it asks for, its subagents and its
+conversation. A turn you cut short with Esc ends it too. Codex runs hooks in the background server its
+sessions share, so they can't tell crystal which session they're in: crystal goes by the conversation they
+name, and for a conversation it doesn't know yet, by the session Codex was just started in. Codex sessions
+started at the same moment may not be told apart until each has been sent a prompt; `codex --no-daemon` keeps
+a Codex's hooks to itself.
 
 To pick a conversation up again, crystal finds the file Codex records it in,
 `$CODEX_HOME/sessions/YYYY/MM/DD/rollout-…jsonl` (`~/.codex` without `CODEX_HOME`): the one for the session's
-directory that Codex started closest to when the session did, within a minute. After a restart, or with
-`crystal respawn`, the session runs `codex resume <id>` with the options it was started with, but not its first
-prompt again. The limits:
+directory that Codex started closest to when the session did, within a minute, unless its hooks have named
+it. After a restart, or with `crystal respawn`, the session runs `codex resume <id>` with the options it was
+started with, but not its first prompt again. The limits:
 
 - Codex writes that file once it has been sent a prompt, so a Codex that was never sent one starts afresh.
-- A conversation you begin from inside Codex with `/new` isn't followed: crystal picks the first one up again.
+- A conversation you begin from inside Codex with `/new` isn't followed, unless its hooks are installed:
+  crystal picks the first one up again.
 - `codex exec` and Codex's other subcommands run as they were asked, without resuming.
-- A Codex you start yourself in a shell session gets its status from the screen, but isn't resumed.
+- A Codex you start yourself in a shell session gets its status from the screen, and is resumed only with
+  crystal's hooks installed.
 
 ### Teaching crystal about your agent
 
@@ -1669,6 +1702,8 @@ matched anywhere in the link unless `^` and `$` pin it. `X` lists each plugin's 
 | `session.removed` | a session leaves the list: killed, or its worktree removed |
 | `session.claimed` | an agent takes over saying what a session is doing, with [`crystal report`](#teaching-crystal-about-your-agent) |
 | `session.released` | it lets go: `crystal report --release`, or it left and the shell is back in front |
+| `subagent.started` | a session's agent starts a subagent, as its hooks say: its `subagent`, with its `id` and `agent_type` |
+| `subagent.stopped` | that subagent finishes |
 | `task.opened` | a task is made: given to a session as it starts, made to start later, or opened again by a follow-up |
 | `task.started` | a task made to start later starts, in a session of its own |
 | `task.waiting` | a task's agent ends a turn with the task still open: it waits on you |
@@ -1738,7 +1773,7 @@ file and change. A setting crystal doesn't know is an error that names it, so a 
 | `new_session` | `"claude"` | what the new-session panel runs at first, until you start something from it |
 | `theme` | `"dark"` | the TUI's colors: `"dark"`, `"light"`, or `"terminal"` |
 | `name_from_prompt` | `true` | name a session you don't name for the [first thing it's asked](#starting-a-session) |
-| `resume_reported_agents` | `true` | after a restart, run the command an agent [said resumes it](#teaching-crystal-about-your-agent) |
+| `resume_reported_agents` | `true` | after a restart, run the command an agent [said resumes it](#teaching-crystal-about-your-agent), or the one that resumes a Claude Code or Codex [typed into a shell](#usage) |
 | `[plugins]` | | which plugins are on and off: [plugins](#plugins) |
 | `[memory]` | | how memory's [distiller](#the-distiller) runs, and whether it [searches by meaning](#search-by-meaning) |
 | `[tasks]` | | what [background tasks](#background-tasks) may spend: `max_budget_usd` each (`5`), `daily_budget_usd` all together (none) |
@@ -1873,6 +1908,7 @@ over, the daemon is restarted cold from the sessions it wrote down first.
 - [x] An event log, a stream of events on the socket, and waits on it
 - [x] Any agent saying what it's doing and how to resume it, and sessions named from their first prompt
 - [x] Restart the daemon on a new crystal without stopping its sessions
+- [x] Hooks for a Claude Code or Codex typed into a shell, resumed after a restart, and subagents counted
 
 ## Development
 

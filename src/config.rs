@@ -31,7 +31,9 @@ pub struct Config {
     /// thing it's asked instead: see [`crate::names::from_prompt`].
     pub name_from_prompt: bool,
     /// After a restart, start an agent that said how to resume it, with
-    /// `crystal report`, with that command: see [`crate::report`].
+    /// `crystal report`, with that command: see [`crate::report`]. And one
+    /// typed into a shell, whose installed hooks named its conversation,
+    /// with the command that resumes it: see [`crate::integration`].
     pub resume_reported_agents: bool,
     /// The TUI's colors.
     pub theme: ThemeName,

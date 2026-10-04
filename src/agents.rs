@@ -9,7 +9,7 @@
 
 use crate::catalog;
 use crate::codex;
-use crate::protocol::{AgentEvent, Conversation};
+use crate::protocol::{AgentEvent, Conversation, Subagent};
 use crate::shell;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -20,14 +20,49 @@ const FIRST_PROMPT_BYTES: usize = 16 * 1024;
 
 /// The Claude Code hook events crystal listens to; [`claude_event`] says
 /// what each one means.
-const CLAUDE_HOOK_EVENTS: &[&str] = &[
+pub const CLAUDE_HOOK_EVENTS: &[&str] = &[
     "SessionStart",
     "UserPromptSubmit",
     "PostToolUse",
     "PermissionRequest",
     "Notification",
     "Stop",
+    "SubagentStart",
+    "SubagentStop",
 ];
+
+/// The Codex hook events crystal listens to; [`codex_event`] says what each
+/// one means. Codex has no `Notification`: the questions it asks while
+/// it waits on the user are read off its screen.
+pub const CODEX_HOOK_EVENTS: &[&str] = &[
+    "SessionStart",
+    "UserPromptSubmit",
+    "PostToolUse",
+    "PermissionRequest",
+    "Stop",
+    "Interrupt",
+    "SubagentStart",
+    "SubagentStop",
+];
+
+/// What crystal puts in the environment of a Claude Code it starts with its
+/// own hooks, `--settings`, the agent's program as its value. The hooks
+/// `crystal integration` installs in the user's own settings run as well,
+/// and stay quiet under it, so the agent isn't reported twice. A task's
+/// `claude -p` has it too: a task knows what its Claude does from Claude's
+/// own events.
+pub const HOOKED: &str = "CRYSTAL_AGENT_HOOKS";
+
+/// What a hook crystal adds runs: `crystal hook <agent>`, with crystal by
+/// its path. With `installed`, it's the one `crystal integration` puts in
+/// the agent's own settings.
+pub fn hook_command(crystal: &Path, agent: &str, installed: bool) -> String {
+    let mut command = format!("{} hook {agent}", shell::quote(&crystal.to_string_lossy()));
+    if installed {
+        command.push_str(" --installed");
+    }
+    command
+}
 
 /// What opens the notes crystal adds for an agent: where they come from.
 /// An agent told to run the commands of a program it has never heard of
@@ -239,7 +274,11 @@ fn without_resume_flags(args: &[String]) -> Vec<String> {
 /// What a Claude Code hook's input means, or `None` if it's nothing that
 /// changes what the session is doing.
 pub fn claude_event(input: &Value) -> Option<AgentEvent> {
-    let event = match input["hook_event_name"].as_str()? {
+    let name = input["hook_event_name"].as_str()?;
+    if in_subagent(input) && !matches!(name, "PostToolUse" | "PermissionRequest" | "Notification") {
+        return None;
+    }
+    let event = match name {
         // A session starts again after its context is compacted, which can
         // happen mid-turn.
         "SessionStart" if input["source"] == "compact" => return None,
@@ -253,9 +292,79 @@ pub fn claude_event(input: &Value) -> Option<AgentEvent> {
             "idle_prompt" => AgentEvent::StillIdle,
             _ => return None,
         },
+        "SubagentStart" => AgentEvent::SubagentStarted,
+        "SubagentStop" => AgentEvent::SubagentStopped,
         _ => return None,
     };
     Some(event)
+}
+
+/// Whether a hook's input comes from inside a subagent, which names itself
+/// in it, rather than the agent the user talks to. A subagent's own start
+/// and end aren't the agent's turn starting and ending: they come as
+/// `SubagentStart` and `SubagentStop`, about it, from the agent. Its tools
+/// and the permissions it asks for are the agent's work all the same.
+fn in_subagent(input: &Value) -> bool {
+    let name = input["hook_event_name"].as_str().unwrap_or_default();
+    !name.starts_with("Subagent") && input["agent_id"].as_str().is_some()
+}
+
+/// The subagent a `SubagentStart` or `SubagentStop` hook's input is about.
+pub fn subagent(input: &Value) -> Option<Subagent> {
+    let id = input["agent_id"].as_str()?;
+    Some(Subagent {
+        id: id.to_string(),
+        agent_type: input["agent_type"].as_str().map(String::from),
+    })
+}
+
+/// What a Codex hook's input means, or `None` if it's nothing that changes
+/// what the session is doing. Codex's hooks are Claude Code's, mostly, with
+/// `Interrupt` for a turn the user cut short, which is no turn ending the
+/// agent's own way: it's only news if the agent was still working. What a
+/// subagent does inside is left out: it may run in a conversation of its
+/// own, which says nothing about where its agent runs, and the questions
+/// it asks are read off the screen.
+pub fn codex_event(input: &Value) -> Option<AgentEvent> {
+    if in_subagent(input) {
+        return None;
+    }
+    let event = match input["hook_event_name"].as_str()? {
+        "SessionStart" if input["source"] == "compact" => return None,
+        "SessionStart" => AgentEvent::Started,
+        "UserPromptSubmit" => AgentEvent::TurnStarted,
+        "PostToolUse" => AgentEvent::ToolFinished,
+        "PermissionRequest" => AgentEvent::Asking,
+        "Stop" => AgentEvent::TurnEnded,
+        "Interrupt" => AgentEvent::StillIdle,
+        "SubagentStart" => AgentEvent::SubagentStarted,
+        "SubagentStop" => AgentEvent::SubagentStopped,
+        _ => return None,
+    };
+    Some(event)
+}
+
+/// The conversation a Codex hook's input names, if it does: its thread,
+/// and the rollout file it's recorded in, the same as Claude Code's.
+pub fn codex_conversation(input: &Value) -> Option<Conversation> {
+    claude_conversation(input)
+}
+
+/// What a hook's input says the agent's directory is.
+pub fn hook_cwd(input: &Value) -> Option<PathBuf> {
+    input["cwd"].as_str().map(PathBuf::from)
+}
+
+/// The command that picks `agent`'s conversation `id` up again, typed into
+/// the shell of a session it was started in by hand: `None` for an agent
+/// crystal can't resume.
+pub fn resume_typed(agent: &str, id: &str) -> Option<Vec<String>> {
+    let argv = match agent {
+        "claude" => ["claude", "--resume", id],
+        "codex" => ["codex", "resume", id],
+        _ => return None,
+    };
+    Some(argv.map(String::from).to_vec())
 }
 
 /// What a Claude Code Stop hook prints to keep Claude from ending its turn:
@@ -267,7 +376,7 @@ pub fn claude_keep_going(reason: &str) -> String {
 /// Settings for Claude Code that add a hook, `crystal hook claude`, to
 /// each event in [`CLAUDE_HOOK_EVENTS`].
 fn claude_settings(crystal: &Path) -> String {
-    let command = format!("{} hook claude", shell::quote(&crystal.to_string_lossy()));
+    let command = hook_command(crystal, "claude", false);
     // Each event takes a list of matcher groups; with no matcher, a group
     // matches everything.
     let groups = json!([{
@@ -292,6 +401,116 @@ mod tests {
 
     fn command(args: &[&str]) -> Vec<String> {
         args.iter().map(|arg| arg.to_string()).collect()
+    }
+
+    fn input(json: &str) -> Value {
+        serde_json::from_str(json).unwrap()
+    }
+
+    #[test]
+    fn a_subagent_s_start_and_end_are_counted_not_taken_for_turns() {
+        let start =
+            input(r#"{"hook_event_name":"SubagentStart","agent_id":"a1","agent_type":"Explore"}"#);
+        assert_eq!(claude_event(&start), Some(AgentEvent::SubagentStarted));
+        assert_eq!(
+            subagent(&start),
+            Some(Subagent {
+                id: "a1".into(),
+                agent_type: Some("Explore".into())
+            })
+        );
+        let stop = input(r#"{"hook_event_name":"SubagentStop","agent_id":"a1"}"#);
+        assert_eq!(claude_event(&stop), Some(AgentEvent::SubagentStopped));
+        assert_eq!(subagent(&stop).unwrap().agent_type, None);
+    }
+
+    #[test]
+    fn what_happens_inside_a_subagent_is_its_agent_s_work_but_not_its_turn() {
+        let inside = |event: &str| {
+            claude_event(&input(&format!(
+                r#"{{"hook_event_name":"{event}","agent_id":"a1","notification_type":"permission_prompt"}}"#
+            )))
+        };
+        assert_eq!(inside("PostToolUse"), Some(AgentEvent::ToolFinished));
+        assert_eq!(inside("PermissionRequest"), Some(AgentEvent::Asking));
+        assert_eq!(inside("Notification"), Some(AgentEvent::Asking));
+        assert_eq!(inside("Stop"), None);
+        assert_eq!(inside("SessionStart"), None);
+        assert_eq!(inside("UserPromptSubmit"), None);
+    }
+
+    #[test]
+    fn codex_s_hooks_mean_what_claude_code_s_do_and_an_interrupt_cuts_a_turn_short() {
+        let codex = |json: &str| codex_event(&input(json));
+        assert_eq!(
+            codex(r#"{"hook_event_name":"SessionStart","source":"startup"}"#),
+            Some(AgentEvent::Started)
+        );
+        assert_eq!(
+            codex(r#"{"hook_event_name":"SessionStart","source":"compact"}"#),
+            None
+        );
+        assert_eq!(
+            codex(r#"{"hook_event_name":"UserPromptSubmit"}"#),
+            Some(AgentEvent::TurnStarted)
+        );
+        assert_eq!(
+            codex(r#"{"hook_event_name":"PermissionRequest"}"#),
+            Some(AgentEvent::Asking)
+        );
+        assert_eq!(
+            codex(r#"{"hook_event_name":"Stop"}"#),
+            Some(AgentEvent::TurnEnded)
+        );
+        assert_eq!(
+            codex(r#"{"hook_event_name":"Interrupt"}"#),
+            Some(AgentEvent::StillIdle)
+        );
+        assert_eq!(
+            codex(r#"{"hook_event_name":"SubagentStop","agent_id":"a1"}"#),
+            Some(AgentEvent::SubagentStopped)
+        );
+        // What a subagent does inside says nothing of where its agent runs.
+        assert_eq!(
+            codex(r#"{"hook_event_name":"PostToolUse","agent_id":"a1"}"#),
+            None
+        );
+        assert_eq!(codex(r#"{"hook_event_name":"PreToolUse"}"#), None);
+        let conversation = codex_conversation(&input(
+            r#"{"session_id":"t-1","transcript_path":"/c/rollout.jsonl","cwd":"/app"}"#,
+        ))
+        .unwrap();
+        assert_eq!(conversation.id, "t-1");
+        assert_eq!(
+            hook_cwd(&input(r#"{"cwd":"/app"}"#)),
+            Some(PathBuf::from("/app"))
+        );
+    }
+
+    #[test]
+    fn an_agent_typed_into_a_shell_resumes_with_its_own_command() {
+        assert_eq!(
+            resume_typed("claude", "c-1").unwrap(),
+            ["claude", "--resume", "c-1"]
+        );
+        assert_eq!(
+            resume_typed("codex", "t-1").unwrap(),
+            ["codex", "resume", "t-1"]
+        );
+        assert_eq!(resume_typed("gemini", "x"), None);
+    }
+
+    #[test]
+    fn the_installed_hook_is_crystal_s_own_with_a_flag() {
+        let crystal = Path::new("/my apps/crystal");
+        assert_eq!(
+            hook_command(crystal, "claude", false),
+            "'/my apps/crystal' hook claude"
+        );
+        assert_eq!(
+            hook_command(crystal, "codex", true),
+            "'/my apps/crystal' hook codex --installed"
+        );
     }
 
     #[test]

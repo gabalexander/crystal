@@ -1378,18 +1378,36 @@ impl Daemon {
                 event,
                 conversation,
                 prompt,
+                agent,
+                cwd,
+                subagent,
             } => {
+                let agent = agent.unwrap_or_else(|| "claude".to_string());
                 let mut sessions = self.sessions.lock().unwrap();
                 let id = match id {
                     Some(id) => id,
                     None => named(&mut sessions, &name)?.id.clone(),
                 };
+                let Some(id) = reporting_session(
+                    &sessions,
+                    &agent,
+                    &id,
+                    conversation.as_ref(),
+                    cwd.as_deref(),
+                ) else {
+                    return Ok(Response::Done);
+                };
+                // A background task knows what its Claude does from
+                // Claude's own events, not hooks the user installed.
+                if with_id(&mut sessions, &id)?.is_task() {
+                    return Ok(Response::Done);
+                }
                 if let Some(prompt) = prompt {
                     self.name_from_prompt(&mut sessions, &id, &prompt);
                 }
                 let session = with_id(&mut sessions, &id)?;
                 if let Some(conversation) = conversation {
-                    session.set_conversation(conversation);
+                    session.set_hooked_conversation(&agent, conversation);
                 }
                 // Reminded that its task is open, the agent carries on: its
                 // turn hasn't ended, and it isn't done.
@@ -1405,6 +1423,15 @@ impl Daemon {
                 // status: what hooks say counts again once it lets go.
                 if !session.is_claimed() {
                     session.on_agent_event(event);
+                    let kind = match event {
+                        AgentEvent::SubagentStarted => Some(Kind::SubagentStarted),
+                        AgentEvent::SubagentStopped => Some(Kind::SubagentStopped),
+                        _ => None,
+                    };
+                    if let (Some(kind), Some(subagent)) = (kind, subagent) {
+                        self.events
+                            .emit(Event::subagent(kind, &session.info(), subagent));
+                    }
                 }
                 self.tell_changes(session);
                 Ok(Response::Done)
@@ -2378,7 +2405,11 @@ fn start(
         Some(argv) => (argv, None),
         None => (command.clone(), None),
     };
-    let env = env::for_session(&env, &name, &id, socket);
+    let mut env = env::for_session(&env, &name, &id, socket);
+    // Claude Code started here gets crystal's hooks with `--settings`.
+    if agents::program_name(&asked) == Some("claude") {
+        env.insert(agents::HOOKED.into(), "claude".into());
+    }
     let crystal = std::env::current_exe()?;
     // A conversation that can't be picked up any more is left behind: the
     // agent starts a new one, which its hooks or its rollout will name.
@@ -2678,7 +2709,10 @@ fn start_task(
     };
 
     let id = new_id();
-    let env = env::for_session(&env, &name, &id, socket);
+    let mut env = env::for_session(&env, &name, &id, socket);
+    // The task follows its Claude's own events: the hooks the user
+    // installed stay quiet.
+    env.insert(agents::HOOKED.into(), "claude".into());
     let prompt = spec.prompt.clone();
     let args = task_args(socket, &cwd, &spec);
     let spending = spending.clone();
@@ -2821,6 +2855,81 @@ fn named<'a>(sessions: &'a mut [Session], name: &str) -> Result<&'a mut Session>
         .with_context(|| format!("no session named {name}"))
 }
 
+/// The session a hook's report is about, by its id: `id` is the one the
+/// hook's environment names. Claude Code runs its hooks itself, so that's
+/// the one. Codex runs them in a server its sessions share, started from
+/// whichever ran Codex first, so its environment can name another session:
+/// a Codex report goes to the session in the conversation it names; or to
+/// the one its environment names, if Codex may be running there in no
+/// conversation yet; or to the only session that fits, of those Codex may
+/// be running in with no conversation yet, by the report's directory when
+/// there are several, or of all those Codex may be running in. `None` when
+/// none of them is sure: crystal reads Codex's screen all the same.
+fn reporting_session(
+    sessions: &[Session],
+    agent: &str,
+    id: &str,
+    conversation: Option<&Conversation>,
+    cwd: Option<&Path>,
+) -> Option<String> {
+    if agent != "codex" {
+        return Some(id.to_string());
+    }
+    let candidates: Vec<Candidate> = sessions
+        .iter()
+        .map(|session| Candidate {
+            id: &session.id,
+            conversation: session.conversation_id(),
+            may_run: session.is_running() && session.may_run(agent),
+            cwd: session.cwd(),
+        })
+        .collect();
+    let named = conversation.map(|conversation| conversation.id.as_str());
+    pick_reporting(&candidates, id, named, cwd).map(String::from)
+}
+
+/// A session as [`pick_reporting`] sees it.
+struct Candidate<'a> {
+    id: &'a str,
+    conversation: Option<&'a str>,
+    /// Whether the agent can be running in it.
+    may_run: bool,
+    cwd: &'a Path,
+}
+
+/// The id of the session a Codex report is about, of `sessions`, as
+/// [`reporting_session`] picks it: `id` is the one the hook's environment
+/// names, `conversation` the one the report names.
+fn pick_reporting<'a>(
+    sessions: &[Candidate<'a>],
+    id: &str,
+    conversation: Option<&str>,
+    cwd: Option<&Path>,
+) -> Option<&'a str> {
+    if let Some(found) = sessions
+        .iter()
+        .find(|session| conversation.is_some() && session.conversation == conversation)
+    {
+        return Some(found.id);
+    }
+    let only = |found: Vec<&Candidate<'a>>| match found[..] {
+        [session] => Some(session.id),
+        _ => None,
+    };
+    let fresh: Vec<&Candidate> = (sessions.iter())
+        .filter(|session| session.may_run && session.conversation.is_none())
+        .collect();
+    if let Some(named) = fresh.iter().find(|session| session.id == id) {
+        return Some(named.id);
+    }
+    let in_cwd = (fresh.iter().copied())
+        .filter(|session| cwd == Some(session.cwd))
+        .collect();
+    only(in_cwd)
+        .or_else(|| only(fresh))
+        .or_else(|| only(sessions.iter().filter(|session| session.may_run).collect()))
+}
+
 fn with_id<'a>(sessions: &'a mut [Session], id: &str) -> Result<&'a mut Session> {
     sessions
         .iter_mut()
@@ -2951,6 +3060,55 @@ fn unique_name(program: &str, taken: impl Fn(&str) -> bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn candidate<'a>(id: &'a str, conversation: Option<&'a str>, cwd: &'a str) -> Candidate<'a> {
+        Candidate {
+            id,
+            conversation,
+            may_run: true,
+            cwd: Path::new(cwd),
+        }
+    }
+
+    #[test]
+    fn a_codex_report_goes_to_the_session_in_the_conversation_it_names() {
+        let sessions = [
+            candidate("a", Some("conv-a"), "/app"),
+            candidate("b", Some("conv-b"), "/app"),
+        ];
+        // Whatever session the shared server's environment names.
+        let pick = |conversation| pick_reporting(&sessions, "a", conversation, None);
+        assert_eq!(pick(Some("conv-b")), Some("b"));
+        assert_eq!(pick(Some("conv-a")), Some("a"));
+        // A conversation nobody's in, with two sessions it could be from.
+        assert_eq!(pick(Some("conv-c")), None);
+    }
+
+    #[test]
+    fn a_new_codex_conversation_goes_where_it_can_only_be() {
+        let sessions = [
+            candidate("old", Some("conv-1"), "/app"),
+            candidate("named", None, "/app"),
+            candidate("here", None, "/lib"),
+            Candidate {
+                may_run: false,
+                ..candidate("shell", None, "/lib")
+            },
+        ];
+        let pick = |id, cwd: &str| pick_reporting(&sessions, id, Some("new"), Some(Path::new(cwd)));
+        // The session the environment names, if Codex can be new there.
+        assert_eq!(pick("named", "/lib"), Some("named"));
+        // Or else the one in the report's directory.
+        assert_eq!(pick("old", "/lib"), Some("here"));
+        assert_eq!(pick("shell", "/elsewhere"), None, "two could be it");
+        // The only Codex session there is takes a conversation of its own
+        // started from inside it.
+        let one = [candidate("only", Some("conv-1"), "/app")];
+        assert_eq!(
+            pick_reporting(&one, "gone", Some("new"), None),
+            Some("only")
+        );
+    }
 
     #[test]
     fn a_mismatch_says_both_versions_and_the_way_out() {
