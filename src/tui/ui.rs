@@ -25,6 +25,7 @@ use super::plugins_view;
 use super::profiles;
 use super::pull_requests;
 use super::reply;
+use super::restarted::Restarted;
 use super::screen_widget::{Marks, ScreenWidget};
 use super::scrollbar;
 use super::settings_view;
@@ -1214,6 +1215,8 @@ fn draw_footer(frame: &mut Frame, app: &App, panes: &[Pane], look: &Look, area: 
     } else if let Some(notice) = app.notice() {
         let notice = Line::styled(format!(" {notice}"), Style::new().fg(theme.failed));
         frame.render_widget(notice, area);
+    } else if let Some(restarted) = app.restarted() {
+        frame.render_widget(restarted_line(restarted, theme), area);
     } else if let Some(away) = app.away_line() {
         frame.render_widget(away_line(away, theme), area);
     } else {
@@ -1238,6 +1241,27 @@ fn away_line<'a>(away: &str, theme: &Theme) -> Line<'a> {
     ];
     spans.extend(hint_spans(&[("a", "timeline"), ("U", "needs you")], theme).spans);
     Line::from(spans)
+}
+
+/// What a restart brought back, `after the restart:` standing out, and
+/// what it couldn't in the failed color.
+fn restarted_line<'a>(restarted: &Restarted, theme: &Theme) -> Line<'a> {
+    let (lead, said) = restarted
+        .line
+        .split_once(": ")
+        .unwrap_or((&restarted.line, ""));
+    let color = if restarted.failed {
+        theme.failed
+    } else {
+        theme.text
+    };
+    Line::from(vec![
+        Span::styled(
+            format!(" {lead}: "),
+            Style::new().fg(theme.accent).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(said.to_string(), Style::new().fg(color)),
+    ])
 }
 
 /// The viewer of the session the pane at `slot` shows, once it has one.

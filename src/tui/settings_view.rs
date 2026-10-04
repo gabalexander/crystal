@@ -42,6 +42,7 @@ pub enum Setting {
     TabBar,
     HideSingleTab,
     StopIdle,
+    RestartSpacing,
     MouseCapture,
     CopyOnSelect,
     ScrollLines,
@@ -65,6 +66,9 @@ pub enum Change {
     HideSingleTab(bool),
     /// How long an agent may sit idle, one of [`SessionSettings::CHOICES`].
     StopIdle(&'static str),
+    /// How far apart agents start again after a restart, in milliseconds,
+    /// one of [`SessionSettings::SPACINGS`].
+    RestartSpacing(u64),
     MouseCapture(bool),
     CopyOnSelect(bool),
     /// How many lines a notch of the wheel scrolls, one of
@@ -88,6 +92,7 @@ impl Change {
             Change::TabBar(_) => &["tab_bar", "position"],
             Change::HideSingleTab(_) => &["tab_bar", "hide_when_single"],
             Change::StopIdle(_) => &["sessions", "stop_idle_after"],
+            Change::RestartSpacing(_) => &["sessions", "restart_spacing_ms"],
             Change::MouseCapture(_) => &["mouse", "capture"],
             Change::CopyOnSelect(_) => &["mouse", "copy_on_select"],
             Change::ScrollLines(_) => &["mouse", "scroll_lines"],
@@ -112,7 +117,9 @@ impl Change {
             Change::TabBar(BarPosition::Top) => "top".into(),
             Change::TabBar(BarPosition::Bottom) => "bottom".into(),
             Change::ScrollLines(lines) => i64::from(lines).into(),
-            Change::NotifyAfter(secs) => i64::try_from(secs).unwrap_or(i64::MAX).into(),
+            Change::NotifyAfter(secs) | Change::RestartSpacing(secs) => {
+                i64::try_from(secs).unwrap_or(i64::MAX).into()
+            }
             Change::Theme(theme) => theme.name().into(),
             Change::StopIdle(after) => after.into(),
         }
@@ -132,6 +139,20 @@ fn next_wait(secs: u64, forward: bool) -> u64 {
     } else {
         let before = NOTIFY_AFTER.iter().rev().find(|&&wait| wait < secs);
         *before.unwrap_or(&NOTIFY_AFTER[NOTIFY_AFTER.len() - 1])
+    }
+}
+
+/// The spacing after `ms` among [`SessionSettings::SPACINGS`], or before
+/// it, round from the last to the first: one set by hand between two goes
+/// to the next, or the one before.
+fn next_spacing(ms: u64, forward: bool) -> u64 {
+    let spacings = SessionSettings::SPACINGS;
+    if forward {
+        let next = spacings.iter().find(|&&spacing| spacing > ms);
+        *next.unwrap_or(&spacings[0])
+    } else {
+        let before = spacings.iter().rev().find(|&&spacing| spacing < ms);
+        *before.unwrap_or(&spacings[spacings.len() - 1])
     }
 }
 
@@ -172,7 +193,7 @@ pub enum Outcome {
 }
 
 /// The settings the bar can be on, in the order they're listed.
-const SETTINGS: [Setting; 15] = [
+const SETTINGS: [Setting; 16] = [
     Setting::Notify,
     Setting::NotifyAfter,
     Setting::UnfocusedOnly,
@@ -182,6 +203,7 @@ const SETTINGS: [Setting; 15] = [
     Setting::TabBar,
     Setting::HideSingleTab,
     Setting::StopIdle,
+    Setting::RestartSpacing,
     Setting::MouseCapture,
     Setting::CopyOnSelect,
     Setting::ScrollLines,
@@ -295,6 +317,10 @@ impl SettingsView {
                     (None, _) => 0,
                 };
                 Change::StopIdle(choices[next])
+            }
+            Setting::RestartSpacing => {
+                let now = config.sessions.restart_spacing_ms;
+                Change::RestartSpacing(next_spacing(now, forward))
             }
             Setting::MouseCapture => Change::MouseCapture(!config.mouse.capture),
             Setting::CopyOnSelect => Change::CopyOnSelect(!config.mouse.copy_on_select),
@@ -445,6 +471,7 @@ fn lines(view: &SettingsView, theme: &Theme) -> Vec<Line<'static>> {
             Setting::TabBar => "tab bar",
             Setting::HideSingleTab => "  hide with one tab",
             Setting::StopIdle => "stop idle agents",
+            Setting::RestartSpacing => "space out restarts",
             Setting::MouseCapture => "take the mouse",
             Setting::CopyOnSelect => "copy on select",
             Setting::ScrollLines => "wheel scrolls",
@@ -569,6 +596,16 @@ fn lines(view: &SettingsView, theme: &Theme) -> Vec<Line<'static>> {
             "off".to_string()
         },
         "at their prompt, unwatched: they start again where they were".to_string(),
+    ));
+    let spacing = config.sessions.restart_spacing_ms;
+    lines.push(row(
+        Setting::RestartSpacing,
+        Some(spacing > 0),
+        match spacing {
+            0 => "all at once".to_string(),
+            ms => format!("{ms}ms apart"),
+        },
+        "the agents a crash or a reboot starts again: ←/→".to_string(),
     ));
 
     lines.push(Line::from(""));
@@ -747,6 +784,15 @@ mod tests {
         );
         press(&mut view, KeyCode::Down);
         assert_eq!(
+            press(&mut view, KeyCode::Right),
+            Outcome::Change(Change::RestartSpacing(500))
+        );
+        assert_eq!(
+            press(&mut view, KeyCode::Left),
+            Outcome::Change(Change::RestartSpacing(100))
+        );
+        press(&mut view, KeyCode::Down);
+        assert_eq!(
             press(&mut view, KeyCode::Char(' ')),
             Outcome::Change(Change::MouseCapture(false))
         );
@@ -843,6 +889,22 @@ mod tests {
         config.mouse.scroll_lines = 1;
         let shown = text(&view_of(config, None));
         assert!(shown.contains("1 line "), "{shown}");
+    }
+
+    #[test]
+    fn the_restart_spacing_goes_through_its_steps_and_round() {
+        assert_eq!(next_spacing(250, true), 500);
+        assert_eq!(next_spacing(2000, true), 0);
+        assert_eq!(next_spacing(0, false), 2000);
+        assert_eq!(next_spacing(300, false), 250);
+        assert_eq!(
+            Change::RestartSpacing(100).keys(),
+            ["sessions", "restart_spacing_ms"]
+        );
+        assert_eq!(Change::RestartSpacing(100).value().as_integer(), Some(100));
+        let shown = text(&view_of(Config::default(), None));
+        assert!(shown.contains("space out restarts"), "{shown}");
+        assert!(shown.contains("250ms apart"), "{shown}");
     }
 
     #[test]

@@ -93,6 +93,11 @@ impl Until {
 
     /// Where `session` has got to now, if it's anywhere a wait can be for.
     fn of_session(session: &SessionInfo) -> Option<Until> {
+        // One waiting its turn to start again after a restart is on its
+        // way, under the same id.
+        if session.state == State::Starting {
+            return None;
+        }
         if session.state != State::Running {
             return Some(Until::Ended);
         }
@@ -111,7 +116,7 @@ impl Until {
             Kind::SessionWaiting => Some(Until::Waiting),
             Kind::SessionDone => Some(Until::Done),
             Kind::SessionIdle => Some(Until::Idle),
-            Kind::SessionEnded => Some(Until::Ended),
+            Kind::SessionEnded | Kind::SessionStartFailed => Some(Until::Ended),
             _ => None,
         }
     }
@@ -248,6 +253,9 @@ pub fn read(socket: &Path, name: &str, lines: Option<usize>, history: bool) -> R
 /// ended, or what its agent is doing when that isn't working. A program
 /// that doesn't say what it's doing is busy until it ends.
 fn settled(session: &SessionInfo) -> Option<String> {
+    if session.state == State::Starting {
+        return None;
+    }
     if session.state != State::Running {
         return Some(session.state.to_string());
     }
@@ -442,6 +450,19 @@ mod tests {
         assert_eq!(settled(&session(State::Running, None)), None);
         let ended = session(State::Exited { code: 4 }, Some(Activity::Working));
         assert_eq!(settled(&ended), Some("exited 4".into()));
+    }
+
+    #[test]
+    fn a_session_waiting_to_start_again_is_waited_for_until_it_has() {
+        let starting = session(State::Starting, None);
+        assert_eq!(settled(&starting), None);
+        assert_eq!(Until::of_session(&starting), None);
+        let why = "command not found: claude".to_string();
+        let failed = session(State::Failed { why }, None);
+        assert_eq!(settled(&failed), Some("couldn't start".into()));
+        assert_eq!(Until::of_session(&failed), Some(Until::Ended));
+        let failing = Kind::SessionStartFailed;
+        assert_eq!(Until::of_event(failing), Some(Until::Ended));
     }
 
     #[test]

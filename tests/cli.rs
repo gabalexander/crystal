@@ -1719,8 +1719,9 @@ fn without_mouse_capture_the_terminal_keeps_the_mouse() {
     // Switched on in the settings view, the TUI takes it straight away.
     tui.type_keys(",");
     tui.shows("take the mouse");
-    // Nine rows down, past the theme's, the appearance's and the tab bar's.
-    tui.type_keys("jjjjjjjjj ");
+    // Ten rows down, past the theme's, the appearance's, the tab bar's and
+    // the sessions'.
+    tui.type_keys("jjjjjjjjjj ");
     eventually("the TUI takes the mouse", || tui.sends_the_mouse());
     assert!(
         std::fs::read_to_string(crystal.config_file())
@@ -2761,6 +2762,170 @@ fn running_sessions_come_back_after_the_daemon_dies() {
     assert_eq!(row[1], "running");
     assert_ne!(crystal.pid("keeper"), old_pid);
     assert!(crystal.row("finished").is_none());
+}
+
+#[test]
+fn a_session_that_can_t_start_again_after_a_crash_stays_in_its_place_saying_why() {
+    let crystal = Crystal::new();
+    let daemon = crystal.start_daemon();
+    let gone = crystal.dir.path().join("gone");
+    std::fs::create_dir(&gone).unwrap();
+    let out = crystal
+        .command(&["new", "-n", "lost", "sleep", "300"])
+        .current_dir(&gone)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    crystal.ok(&["new", "-n", "keeper", "sleep", "300"]);
+    eventually("both are saved", || {
+        let saved = crystal.saved();
+        saved.contains("lost") && saved.contains("keeper")
+    });
+
+    crash(daemon);
+    std::fs::remove_dir(&gone).unwrap();
+    // Left behind by the crash, it would pass for the next daemon's.
+    std::fs::remove_file(&crystal.socket).unwrap();
+    let daemon = crystal.start_daemon();
+
+    // Not dropped, nor started in another directory: it stays first, and
+    // says why.
+    let listed = crystal.ok(&["ls"]);
+    let names: Vec<&str> = listed.lines().skip(1).map(|line| &line[..6]).collect();
+    assert_eq!(names, ["lost  ", "keeper"]);
+    assert_eq!(status(&crystal, "lost"), "couldn't start");
+    assert_eq!(status(&crystal, "keeper"), "running");
+    let ls = crystal.run(&["ls"]);
+    let why = String::from_utf8(ls.stderr).unwrap();
+    assert!(
+        why.contains("lost couldn't start again: its directory, ")
+            && why.contains("gone, isn't there"),
+        "{why}"
+    );
+    shows_on_screen(
+        &crystal,
+        "lost",
+        "crystal couldn't start lost again after the restart",
+    );
+    eventually("the log says what came back and what didn't", || {
+        let events = crystal.ok(&["events"]);
+        events.contains("session.start_failed  lost  couldn't start: its directory")
+            && events.contains("started cold: 1 session back, 1 couldn't start: lost")
+    });
+    // It's still written down, to start again with the next restart.
+    eventually("it's still saved", || {
+        let saved = crystal.saved();
+        saved.contains("lost") && saved.contains("keeper")
+    });
+
+    // Started again once its directory is back, in its place and under
+    // the same id.
+    let err = crystal.fails(&["respawn", "lost"]);
+    assert!(err.contains("isn't there"), "{err}");
+    let id = |name: &str| {
+        let listed: serde_json::Value =
+            serde_json::from_str(&crystal.ok(&["ls", "--json"])).unwrap();
+        let session = listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["name"] == name);
+        session.unwrap()["id"].as_str().unwrap().to_string()
+    };
+    let before = id("lost");
+    std::fs::create_dir(&gone).unwrap();
+    crystal.ok(&["respawn", "lost"]);
+    assert_eq!(status(&crystal, "lost"), "running");
+    assert_eq!(id("lost"), before);
+    let listed = crystal.ok(&["ls"]);
+    assert!(
+        listed.lines().nth(1).unwrap().starts_with("lost "),
+        "{listed}"
+    );
+    crash(daemon);
+}
+
+#[test]
+fn agents_start_again_a_moment_apart_after_a_crash() {
+    let crystal = Crystal::new();
+    crystal.configure(
+        "notify = false\nname_from_prompt = false\n\n[plugins]\nmemory = false\n\n\
+         [sound]\nenabled = false\n\n[sessions]\nrestart_spacing_ms = 1500\n",
+    );
+    let bin = fake_claude(crystal.dir.path());
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let daemon = crystal.start_daemon();
+    for name in ["first", "second"] {
+        let out = crystal
+            .command(&["new", "-n", name, "claude"])
+            .env("PATH", &path)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+    }
+    crystal.ok(&["new", "-n", "shell", "sleep", "300"]);
+    eventually("all three are saved", || crystal.saved().contains("shell"));
+
+    crash(daemon);
+    let restarted = Instant::now();
+    // The next daemon starts the sessions again from this command's
+    // environment, which finds the fake claude.
+    let out = crystal
+        .command(&["new", "-n", "fresh", "sleep", "300"])
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    // The first agent and the shell are back as soon as the daemon answers;
+    // the second agent waits its turn.
+    assert_eq!(status(&crystal, "first"), "running");
+    assert_eq!(status(&crystal, "shell"), "running");
+    assert_eq!(status(&crystal, "second"), "starting");
+    // Attached meanwhile, its screen says so, then follows it as it starts.
+    let attached = crystal.attach(&["attach", "second"]);
+    attached.shows("starting second again after crystal's restart");
+    eventually("the second agent has started", || {
+        status(&crystal, "second") == "running"
+    });
+    assert!(restarted.elapsed() >= Duration::from_millis(1500));
+    attached.hides("starting second again");
+    eventually("the log says they're all back", || {
+        crystal
+            .ok(&["events"])
+            .contains("started cold: 3 sessions back")
+    });
+}
+
+#[test]
+fn the_tui_says_what_a_restart_couldn_t_start_and_starts_it_again() {
+    let crystal = Crystal::new();
+    let daemon = crystal.start_daemon();
+    let gone = crystal.dir.path().join("gone");
+    std::fs::create_dir(&gone).unwrap();
+    let out = crystal
+        .command(&["new", "-n", "lost", "sleep", "300"])
+        .current_dir(&gone)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    eventually("it's saved", || crystal.saved().contains("lost"));
+    crash(daemon);
+    std::fs::remove_dir(&gone).unwrap();
+    // Left behind by the crash, it would pass for the next daemon's.
+    std::fs::remove_file(&crystal.socket).unwrap();
+    let daemon = crystal.start_daemon();
+
+    let mut tui = crystal.tui();
+    tui.shows("after the restart: 1 couldn't start: lost");
+    tui.shows("couldn't start");
+    tui.shows("isn't there");
+    // Put right, Enter starts it again.
+    std::fs::create_dir(&gone).unwrap();
+    tui.type_keys("\r");
+    tui.shows("start lost again? y/n");
+    tui.type_keys("y");
+    eventually("it has started", || status(&crystal, "lost") == "running");
+    crash(daemon);
 }
 
 #[test]
@@ -9531,10 +9696,10 @@ fn the_settings_view_changes_the_config_and_follows_it_live() {
     crystal.configure(
         "notify = true\ntheme = \"light\"\n\n[memory]\ndistill = false\nembeddings = false\n",
     );
-    // Memory's rows are nine down from the theme, past the appearance's,
-    // the tab bar's and the mouse's, which the view scrolls to on a screen
-    // too short for all of them.
-    tui.type_keys("jjjjjjjjj");
+    // Memory's rows are ten down from the theme, past the appearance's,
+    // the tab bar's, the spacing of restarts and the mouse's, which the
+    // view scrolls to on a screen too short for all of them.
+    tui.type_keys("jjjjjjjjjj");
     tui.shows("○ distill closed tasks");
     tui.shows("not downloaded (2449 MB)");
 

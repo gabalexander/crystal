@@ -312,7 +312,8 @@ waiting on you moves to the top, and that session leads its worktree.
 | `✓` done | the agent finished its turn, and you haven't looked yet |
 | `▸` | running: an agent at its prompt |
 | `❯` | a terminal: muted at a shell's prompt, brighter while a program runs in it |
-| `■` | ended: muted when it exited well, red when it failed; the pane's header says how |
+| `■` | ended: muted when it exited well, red when it failed or [couldn't start again](#usage); the pane's header says how |
+| `◌` starting | waiting its turn to start again after crystal [restarted](#usage) |
 
 Each row also says what's in front in the session's terminal when its name doesn't already say it: `claude`,
 `codex`, `vite`, `zsh`. crystal asks the terminal which program its keys go to, about once a second, so a
@@ -488,7 +489,8 @@ would have from yours: `-e PORT=4000`, `-e DEBUG=` for an empty one. crystal's o
 
 `crystal rename` changes what a session is called; its program and its saved place after a restart follow the
 new name. `crystal respawn`, or `Enter` on an ended session in the TUI, runs its command again in the same
-directory, under the same name and in the same place in the list, with your environment. Claude Code and Codex
+directory, under the same name and in the same place in the list, with your environment; on one that couldn't
+start again after a restart, it tries again. Claude Code and Codex
 come back in the conversation they were in, without being asked their task again. Every session's program also gets `CRYSTAL_SESSION_ID`, which stays the same
 when the session is renamed, while `CRYSTAL_SESSION` keeps the name the program started under.
 
@@ -497,8 +499,18 @@ The first `crystal new` starts the daemon. Sessions keep running after you detac
 session that has ended, it prints the last screen and how the program exited.
 
 If the daemon dies without being asked to, because it crashed or the machine rebooted, the next `crystal` starts
-the sessions that were running again, in the same directories. Claude Code and Codex come back in the
-conversation they were in. `crystal kill-server` is asked to stop everything, so after it nothing comes back.
+the sessions that were running again, in the same directories and in their places in the list. Claude Code and
+Codex come back in the conversation they were in. Shells and other programs start straight away, and so does
+the first agent, but the agents after it start a quarter of a second apart (`restart_spacing_ms` under
+`[sessions]`, `0` for all at once), so a dozen of them don't all load at once; until its turn, an agent's row
+says `starting`. A session that can't start again, because its directory has gone or its command isn't there
+any more, isn't dropped, and never starts somewhere else instead: it stays in its place, its row says
+`couldn't start`, its screen and `crystal ls` say why, and it stays written down, to try again with the next
+restart. Put it right and `Enter` on it (or `crystal respawn`) starts it, or kill it. Once they've all started
+or failed, the TUI's footer says how it went, like `after the restart: 6 sessions back · 1 couldn't start:
+docs`, and the [event log](#events) has a `session.start_failed` for each that couldn't and a
+`daemon.restarted` for the lot. `crystal kill-server` is asked to stop everything, so after it nothing comes
+back.
 The list is kept in crystal's database, `~/.local/state/crystal/crystal.db`, without the sessions' environment
 variables, since those can hold secrets; a session started again gets the environment of whoever started the
 daemon again.
@@ -2107,6 +2119,7 @@ matched anywhere in the link unless `^` and `$` pin it. `X` lists each plugin's 
 | `session.done` | a session's agent finishes a turn nobody was watching |
 | `session.idle` | a session's agent is at its prompt, its turn seen |
 | `session.ended` | a session's program ends, or the session is killed |
+| `session.start_failed` | a session can't start again after a [restart](#usage): its directory or its command has gone; its `status` says why |
 | `session.removed` | a session leaves the list: killed, or its worktree removed |
 | `session.archived` | a session is stopped and kept in the archive: `A`, or `crystal archive` |
 | `session.claimed` | an agent takes over saying what a session is doing, with [`crystal report`](#teaching-crystal-about-your-agent) |
@@ -2140,6 +2153,7 @@ matched anywhere in the link unless `^` and `$` pin it. `X` lists each plugin's 
 | `backlog.closed` | an item is marked done |
 | `plugin.paused` | a plugin is paused for failing |
 | `daemon.handed_over` | the daemon is handed over to another crystal, its sessions carrying on (see `restart-server`) |
+| `daemon.restarted` | the daemon, restarted cold, has started the sessions that were running again: its `daemon` says how many came back (`sessions`) and which couldn't (`failed`) |
 
 A hook gets the event as a line of JSON on its standard input, the same as the [event log](#events) keeps it,
 and its name in `CRYSTAL_EVENT`:
@@ -2196,7 +2210,7 @@ file and change. A setting crystal doesn't know is an error that names it, so a 
 | `[events]` | | `keep_days`, how long the [event log](#events) keeps what happened: 30 days, or `0` for ever |
 | `[handoff]` | | `in_git`, the projects, by their main worktree, whose [handoff notes](#the-handoff-file) go in git |
 | `[worktrees]` | | `base`, the branch new worktrees' new branches [start from](#usage): `origin`'s default branch unless set |
-| `[sessions]` | | `stop_idle_after`, how long an agent may sit [idle](#archiving-and-idle-agents) before crystal stops it, like `"30m"`: `"off"` |
+| `[sessions]` | | `stop_idle_after`, how long an agent may sit [idle](#archiving-and-idle-agents) before crystal stops it, like `"30m"`: `"off"`; `restart_spacing_ms`, how far apart the agents a [crash or a reboot](#usage) starts again start (`250`, or `0` for all at once) |
 | `[[project]]` | | a project's [run and open commands](#projects), by its main worktree's `path`, in place of its own file's |
 | `[keys]` | | the TUI's keys, by command, its prefix and the key back to the sidebar: [keys and commands](#keys-and-commands) |
 | `[sidebar]` | | the sidebar's `width`, whether it starts `folded`, what folding keeps, and whether what needs you is pinned: [the sidebar](#the-sidebar) |
@@ -2221,7 +2235,8 @@ offered as a profile of its own.
 
 The daemon reads the notification and sound settings each time it tells you something, `[plugins]` each time it
 does something a plugin adds, `[memory]` each time a task closes or a search runs, `[tasks]` each time a
-background task's run starts, `[handoff]` each time a note is written, `[sessions]` every 15 seconds, a flow
+background task's run starts, `[handoff]` each time a note is written, `[sessions]` every 15 seconds and as it
+starts sessions again, a flow
 each time one starts, `[[project]]` each time a project's commands run,
 `name_from_prompt` each time it names a session, `resume_reported_agents` as it starts sessions again and
 `scrollback_lines` as each session starts, so a change counts straight away (a session already running keeps
@@ -2375,12 +2390,13 @@ out, and on a bar too narrow for it and the tabs, all of it is, the tabs coming 
 `,` in the sidebar opens the settings you'd otherwise change in the file: notifications and when they come,
 sounds, the theme and whether it follows your system's [appearance](#themes) (the row says which theme each
 side is), whether the [tab bar](#terminals-the-window-and-the-tab-bar) goes on top or over the footer and is
-left out with one tab, how long an agent may sit [idle](#archiving-and-idle-agents), [the mouse](#usage), and
-how memory learns ([the distiller](#the-distiller)) and searches ([by meaning](#search-by-meaning)). `space`
-changes the one the bar is on, and `←/→` go through the [themes](#themes), forward and back (the row says
-which of the twenty it's on), the waits before a notification, the times an agent may sit idle: off, 15
-minutes, 30, an hour, two or eight, and how far a notch of the wheel scrolls: 1, 2, 3, 5 or 10 lines. Each
-change is written to the file at once,
+left out with one tab, how long an agent may sit [idle](#archiving-and-idle-agents), how far apart agents
+start again after a [crash or a reboot](#usage), [the mouse](#usage), and how memory learns ([the
+distiller](#the-distiller)) and searches ([by meaning](#search-by-meaning)). `space` changes the one the bar
+is on, and `←/→` go through the [themes](#themes), forward and back (the row says which of the twenty it's
+on), the waits before a notification, the times an agent may sit idle: off, 15 minutes, 30, an hour, two or
+eight, the spacing of restarts: all at once, 100 milliseconds, 250, 500, a second or two, and how far a notch
+of the wheel scrolls: 1, 2, 3, 5 or 10 lines. Each change is written to the file at once,
 keeping the rest of it as you wrote it, comments and all, and counts straight away: the TUI repaints in a new
 theme, and the daemon reads the rest as it goes. On a screen too short for every row, the view scrolls to keep
 the one the bar is on in sight.
@@ -2474,6 +2490,7 @@ over, the daemon is restarted cold from the sessions it wrote down first.
 - [x] Rules for reading each agent's screen in files you can change, and why a session reads as it does
 - [x] Projects and worktrees
 - [x] Resume after a restart
+- [x] Restarts after a crash that start agents a moment apart and keep what can't start, saying why
 - [x] Split panes
 - [x] Tabs
 - [x] Agents that start, message, wait on and read other agents
