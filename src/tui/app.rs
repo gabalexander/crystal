@@ -774,6 +774,13 @@ pub struct App {
     prompt: Option<Prompt>,
     /// The new-session panel, while it's open.
     launcher: Option<Launcher>,
+    /// What the panel held when `n` or `w` last opened it and it was put
+    /// away with a task in it, for the next to open on. Kept while this TUI
+    /// runs, and gone once a session has started from it.
+    launch_draft: Option<launcher::Draft>,
+    /// Whether the session being started was started from `launch_draft`,
+    /// which goes once it has.
+    draft_starting: bool,
     /// The box a reply to a session is written in, while it's open.
     reply: Option<ReplyBox>,
     /// The agents installed on this machine, which the panel offers.
@@ -1019,6 +1026,8 @@ impl App {
             removing: HashSet::new(),
             prompt: None,
             launcher: None,
+            launch_draft: None,
+            draft_starting: false,
             reply: None,
             agents: Vec::new(),
             profiles: Vec::new(),
@@ -4932,9 +4941,12 @@ impl App {
 
     /// Opens the new-session panel, set to start in a new worktree when
     /// `worktree` is set, or else where the selected session runs.
+    /// It opens on the draft the last one put away left, if one did.
     fn open_launcher(&mut self, worktree: bool) -> Option<Action> {
         let setup = self.launch_setup(worktree);
-        self.launcher = Some(Launcher::new(setup));
+        let draft = self.launch_draft.take();
+        self.draft_starting = false;
+        self.launcher = Some(Launcher::new(setup).with_draft(draft));
         self.codex_models_wanted()
     }
 
@@ -5078,7 +5090,7 @@ impl App {
         match outcome {
             launcher::Outcome::Stay => None,
             launcher::Outcome::Cancel => {
-                self.launcher = None;
+                self.close_launcher(false);
                 None
             }
             launcher::Outcome::Start {
@@ -5089,7 +5101,7 @@ impl App {
                 background,
                 backlog,
             } => {
-                self.launcher = None;
+                self.close_launcher(true);
                 self.memory.remember(&task, &run);
                 if background {
                     let spec = launcher::background_spec(&command)?;
@@ -5116,15 +5128,39 @@ impl App {
                 goal,
                 run,
             } => {
-                self.launcher = None;
+                self.close_launcher(true);
                 self.memory.remember(&goal, &run);
                 Some(Action::StartFlow { place, flow, goal })
             }
+            // The draft is kept until the command line starts a session.
             launcher::Outcome::CommandLine { place, line } => {
-                self.launcher = None;
+                self.close_launcher(true);
                 self.ask(Question::Command(place), &line);
                 None
             }
+        }
+    }
+
+    /// Puts the new-session panel away. One `n` or `w` opened leaves what
+    /// it holds as a draft for the next to open on, unless no task is
+    /// written in it. `starting` says a session is being started from it,
+    /// and the draft goes once that session has started.
+    fn close_launcher(&mut self, starting: bool) {
+        let Some(launcher) = self.launcher.take() else {
+            return;
+        };
+        if launcher.keeps_draft() {
+            self.launch_draft = launcher.draft();
+            self.draft_starting = starting && self.launch_draft.is_some();
+        }
+    }
+
+    /// A session the event loop was asked to start has started, or
+    /// couldn't. Started from the new-session panel's draft, the draft goes;
+    /// not started, it's kept for the next `n` to bring back.
+    pub fn start_done(&mut self, started: bool) {
+        if std::mem::take(&mut self.draft_starting) && started {
+            self.launch_draft = None;
         }
     }
 
@@ -5208,6 +5244,8 @@ impl App {
         match key.code {
             KeyCode::Esc => {
                 self.prompt = None;
+                // Nothing starts from the new-session panel's command line.
+                self.draft_starting = false;
                 None
             }
             KeyCode::Enter => {
@@ -5243,6 +5281,7 @@ impl App {
                     })
                 }
                 Err(err) => {
+                    self.draft_starting = false;
                     self.notify(err);
                     None
                 }
@@ -6758,6 +6797,62 @@ mod tests {
         let rows = app.launcher().unwrap().choice_rows();
         let places = &rows.last().unwrap().2;
         assert_eq!(places, &["here", "new worktree", "billing"]);
+    }
+
+    #[test]
+    fn the_panel_keeps_a_task_put_away_until_a_session_starts_from_it() {
+        let mut app = with_agents(&["claude"], vec![in_project("agent", "app")]);
+        press(&mut app, KeyCode::Char('n'));
+        type_text(&mut app, "fix the login bug");
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('n'));
+        assert_eq!(app.launcher().unwrap().task().text(), "fix the login bug");
+        assert!(app.launcher().unwrap().shows_draft());
+
+        // A session that couldn't start leaves it for the next `n`.
+        assert!(matches!(
+            press(&mut app, KeyCode::Enter),
+            Some(Action::Start { .. })
+        ));
+        app.start_done(false);
+        press(&mut app, KeyCode::Char('n'));
+        assert_eq!(app.launcher().unwrap().task().text(), "fix the login bug");
+
+        // One that started takes it.
+        press(&mut app, KeyCode::Enter);
+        app.start_done(true);
+        press(&mut app, KeyCode::Char('n'));
+        assert!(app.launcher().unwrap().task().is_empty());
+        assert!(!app.launcher().unwrap().shows_draft());
+
+        // Emptied and put away, it's gone.
+        type_text(&mut app, "x");
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('n'));
+        press(&mut app, KeyCode::Backspace);
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('n'));
+        assert!(app.launcher().unwrap().task().is_empty());
+    }
+
+    #[test]
+    fn the_command_line_keeps_the_panel_s_draft_until_it_starts_a_session() {
+        let mut app = with_agents(&["claude"], vec![]);
+        let ctrl_e = KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('n'));
+        type_text(&mut app, "fix it");
+        app.on_key(ctrl_e);
+        press(&mut app, KeyCode::Esc);
+        // Another session started meanwhile doesn't take it.
+        app.start_done(true);
+        press(&mut app, KeyCode::Char('n'));
+        assert_eq!(app.launcher().unwrap().task().text(), "fix it");
+
+        app.on_key(ctrl_e);
+        assert!(press(&mut app, KeyCode::Enter).is_some());
+        app.start_done(true);
+        press(&mut app, KeyCode::Char('n'));
+        assert!(app.launcher().unwrap().task().is_empty());
     }
 
     #[test]

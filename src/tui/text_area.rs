@@ -1,15 +1,15 @@
-//! A text box of several lines: the task in the new-session panel. The text
-//! breaks only where a newline was typed or pasted; to fit the box, each of
-//! its lines is wrapped into rows when it's drawn, at a space where there's
-//! one.
+//! A text box of several lines: the task in the new-session panel, and the
+//! reply box. The text breaks only where a newline was typed or pasted; to
+//! fit the box, each of its lines is wrapped into rows when it's drawn, at a
+//! space where there's one. Its editing is [`editing`]'s, which the one-line
+//! box shares.
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use super::editing::{self, Editor};
+use crossterm::event::KeyEvent;
 
 #[derive(Debug, Default)]
 pub struct TextArea {
-    text: String,
-    /// The cursor's place, counted in characters from the start.
-    cursor: usize,
+    editor: Editor,
 }
 
 /// One row of the box as drawn: the characters from `start` up to `end`,
@@ -22,49 +22,37 @@ pub struct Row {
 
 impl TextArea {
     pub fn text(&self) -> &str {
-        &self.text
+        self.editor.text()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.text.is_empty()
+        self.editor.is_empty()
     }
 
     /// Puts `text` in the box in place of what's there, with the cursor at
     /// its end.
     pub fn set_text(&mut self, text: &str) {
-        self.text = text.to_string();
-        self.cursor = self.len();
+        self.editor.set_text(text);
     }
 
-    /// Edits the text for `key`: a character goes in at the cursor,
-    /// Backspace and Delete take out the one before or after it, Ctrl+U
-    /// the rest of the line before it, and Left, Right, Home and End move
-    /// it, Home and End to the ends of its line. Up and Down are for the
-    /// box's owner: see [`TextArea::line_up`]. Returns whether the text
-    /// changed.
+    /// Edits the text for `key` the way a shell's line does, on the line
+    /// the cursor is on: a character goes in at the cursor, and the rest
+    /// are [`editing::edit_for`]'s keys, `Ctrl+U` back to the start of the
+    /// line, Home and End to its ends and `Ctrl+Home` and `Ctrl+End` to the
+    /// text's among them. Up and Down are for the box's owner: see
+    /// [`TextArea::line_up`]. Returns whether the text changed.
     pub fn on_key(&mut self, key: &KeyEvent) -> bool {
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        match key.code {
-            KeyCode::Char('u') if ctrl => return self.clear_line_before_cursor(),
-            KeyCode::Char(c) if !ctrl => self.insert_str(&c.to_string()),
-            KeyCode::Backspace => return self.backspace(),
-            KeyCode::Delete => return self.delete(),
-            KeyCode::Left => self.cursor = self.cursor.saturating_sub(1),
-            KeyCode::Right => self.cursor = (self.cursor + 1).min(self.len()),
-            KeyCode::Home => self.cursor = self.line_start(),
-            KeyCode::End => self.cursor = self.line_end(),
-            _ => return false,
+        match editing::edit_for(key) {
+            Some(edit) => self.editor.apply(edit),
+            None => false,
         }
-        matches!(key.code, KeyCode::Char(_))
     }
 
     /// Puts `text` in at the cursor, the way a paste does. A carriage
     /// return, which terminals send for a newline, is a newline here.
     pub fn insert_str(&mut self, text: &str) {
         let text = text.replace("\r\n", "\n").replace('\r', "\n");
-        let at = self.byte_index(self.cursor);
-        self.text.insert_str(at, &text);
-        self.cursor += text.chars().count();
+        self.editor.insert_str(&text);
     }
 
     /// Breaks the line at the cursor.
@@ -75,12 +63,12 @@ impl TextArea {
     /// Whether the cursor is on the text's first line, where Up has
     /// nowhere further up to go.
     pub fn on_first_line(&self) -> bool {
-        !self.before_cursor().contains('\n')
+        self.line_start() == 0
     }
 
     /// Whether the cursor is on the text's last line.
     pub fn on_last_line(&self) -> bool {
-        !self.after_cursor().contains('\n')
+        self.line_end() == self.editor.len()
     }
 
     /// Moves the cursor to the line above, as near its column as that
@@ -89,10 +77,11 @@ impl TextArea {
         if self.on_first_line() {
             return;
         }
-        let column = self.cursor - self.line_start();
+        let column = self.cursor() - self.line_start();
         let above_end = self.line_start() - 1;
-        let above_start = self.start_of_line_at(above_end);
-        self.cursor = (above_start + column).min(above_end);
+        let above_start = self.editor.start_of_line_at(above_end);
+        self.editor
+            .set_cursor((above_start + column).min(above_end));
     }
 
     /// Moves the cursor to the line below, as near its column as that
@@ -101,10 +90,11 @@ impl TextArea {
         if self.on_last_line() {
             return;
         }
-        let column = self.cursor - self.line_start();
+        let column = self.cursor() - self.line_start();
         let below_start = self.line_end() + 1;
-        let below_end = self.end_of_line_at(below_start);
-        self.cursor = (below_start + column).min(below_end);
+        let below_end = self.editor.end_of_line_at(below_start);
+        self.editor
+            .set_cursor((below_start + column).min(below_end));
     }
 
     /// The rows the text takes in a box `width` characters wide: each
@@ -112,7 +102,7 @@ impl TextArea {
     /// where a word is longer than that.
     pub fn rows(&self, width: usize) -> Vec<Row> {
         let width = width.max(1);
-        let chars: Vec<char> = self.text.chars().collect();
+        let chars: Vec<char> = self.text().chars().collect();
         let mut rows = Vec::new();
         let mut line_start = 0;
         loop {
@@ -152,10 +142,11 @@ impl TextArea {
             // At the very end of a row that wrapped, the cursor is at the
             // start of the next one, where what's typed will go.
             let last_of_its_line = rows.get(index + 1).is_none_or(|next| next.start != row.end);
-            let on_it = self.cursor >= row.start
-                && (self.cursor < row.end || (self.cursor == row.end && last_of_its_line));
+            let cursor = self.cursor();
+            let on_it = cursor >= row.start
+                && (cursor < row.end || (cursor == row.end && last_of_its_line));
             if on_it {
-                return (index, self.cursor - row.start);
+                return (index, cursor - row.start);
             }
         }
         (rows.len() - 1, 0)
@@ -163,91 +154,32 @@ impl TextArea {
 
     /// The characters of `row`, as a string to draw.
     pub fn row_text(&self, row: Row) -> String {
-        self.text
+        self.text()
             .chars()
             .skip(row.start)
             .take(row.end - row.start)
             .collect()
     }
 
-    fn backspace(&mut self) -> bool {
-        if self.cursor == 0 {
-            return false;
-        }
-        self.cursor -= 1;
-        let at = self.byte_index(self.cursor);
-        self.text.remove(at);
-        true
-    }
-
-    fn delete(&mut self) -> bool {
-        if self.cursor == self.len() {
-            return false;
-        }
-        let at = self.byte_index(self.cursor);
-        self.text.remove(at);
-        true
-    }
-
-    fn clear_line_before_cursor(&mut self) -> bool {
-        let start = self.line_start();
-        if start == self.cursor {
-            return false;
-        }
-        let (from, to) = (self.byte_index(start), self.byte_index(self.cursor));
-        self.text.replace_range(from..to, "");
-        self.cursor = start;
-        true
-    }
-
-    fn before_cursor(&self) -> &str {
-        &self.text[..self.byte_index(self.cursor)]
-    }
-
-    fn after_cursor(&self) -> &str {
-        &self.text[self.byte_index(self.cursor)..]
+    fn cursor(&self) -> usize {
+        self.editor.cursor()
     }
 
     /// Where the cursor's line starts, in characters.
     fn line_start(&self) -> usize {
-        self.start_of_line_at(self.cursor)
+        self.editor.start_of_line_at(self.cursor())
     }
 
     /// Where the cursor's line ends: the newline after it, or the end.
     fn line_end(&self) -> usize {
-        self.end_of_line_at(self.cursor)
-    }
-
-    fn start_of_line_at(&self, at: usize) -> usize {
-        let before: Vec<char> = self.text.chars().take(at).collect();
-        before
-            .iter()
-            .rposition(|&c| c == '\n')
-            .map_or(0, |newline| newline + 1)
-    }
-
-    fn end_of_line_at(&self, at: usize) -> usize {
-        let after = self.text.chars().skip(at).position(|c| c == '\n');
-        after.map_or(self.len(), |newline| at + newline)
-    }
-
-    fn len(&self) -> usize {
-        self.text.chars().count()
-    }
-
-    /// Where the character at `place` starts, in bytes: a Rust string is
-    /// UTF-8, where a character can take more than one byte.
-    fn byte_index(&self, place: usize) -> usize {
-        self.text
-            .char_indices()
-            .nth(place)
-            .map_or(self.text.len(), |(index, _)| index)
+        self.editor.end_of_line_at(self.cursor())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::{KeyCode, KeyModifiers};
 
     fn press(area: &mut TextArea, code: KeyCode) {
         area.on_key(&KeyEvent::new(code, KeyModifiers::NONE));
@@ -322,6 +254,25 @@ mod tests {
         press(&mut area, KeyCode::End);
         area.on_key(&KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
         assert_eq!(area.text(), "first\n");
+    }
+
+    #[test]
+    fn words_and_lines_are_edited_as_in_a_shell() {
+        let mut area = with("fix the bug\nin the panel");
+        let ctrl = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+        assert!(area.on_key(&ctrl('w')));
+        assert_eq!(area.text(), "fix the bug\nin the ");
+        area.on_key(&KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT));
+        area.on_key(&ctrl('a'));
+        assert_eq!(area.cursor_at(40), (1, 0));
+        assert!(!area.on_key(&ctrl('a')), "moving changes no text");
+        // Ctrl+U at the start of a line takes the line break before it.
+        assert!(area.on_key(&ctrl('u')));
+        assert_eq!(area.text(), "fix the bugin the ");
+        area.on_key(&KeyEvent::new(KeyCode::Home, KeyModifiers::CONTROL));
+        assert_eq!(area.cursor_at(40), (0, 0));
+        area.on_key(&KeyEvent::new(KeyCode::End, KeyModifiers::CONTROL));
+        assert!(area.on_last_line());
     }
 
     #[test]

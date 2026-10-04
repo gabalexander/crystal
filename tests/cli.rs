@@ -1023,6 +1023,47 @@ fn n_starts_claude_with_its_hooks_and_the_task_as_its_prompt() {
 }
 
 #[test]
+fn the_task_is_edited_by_words_and_kept_as_a_draft_until_a_session_starts() {
+    let crystal = Crystal::new();
+    let bin = fake_claude(crystal.dir.path());
+    let path = path_of(&[&bin]);
+    let mut tui = crystal.attach_with_env(&[], &[("PATH", &path)]);
+
+    tui.type_keys("n");
+    tui.shows("What should it do?");
+    tui.type_keys("fix the flaky login test");
+    tui.shows("runs  claude -- 'fix the flaky login test'");
+    // Ctrl+W takes the word before the cursor.
+    tui.type_keys("\x17");
+    tui.shows("runs  claude -- 'fix the flaky login'");
+    // Alt+B goes back a word, and Alt+Backspace takes the one before that.
+    tui.type_keys("\x1bb\x1b\x7f");
+    tui.shows("runs  claude -- 'fix the login'");
+    // Ctrl+K takes the rest of the line.
+    tui.type_keys("\x0bbug");
+    tui.shows("runs  claude -- 'fix the bug'");
+
+    // Esc puts the panel away, and the next `n` opens on what was in it.
+    tui.type_keys("\x1b");
+    tui.hides("New session");
+    tui.type_keys("n");
+    tui.shows("draft left last time; esc keeps it");
+    tui.shows("runs  claude -- 'fix the bug'");
+    tui.type_keys("\r");
+    tui.shows("▸ claude");
+    let args = written(&crystal.dir.path().join("args"));
+    assert!(args.ends_with("\n--\nfix the bug\n"), "{args:?}");
+
+    // A session started from it, it's gone. The session has the keyboard:
+    // Ctrl+\\ hands it back to the sidebar.
+    tui.type_keys("\x1c");
+    tui.hides("typing into");
+    tui.type_keys("n");
+    tui.shows("What should it do?");
+    assert!(!tui.text().contains("draft left"), "{}", tui.text());
+}
+
+#[test]
 fn a_task_pasted_whole_keeps_its_lines() {
     let crystal = Crystal::new();
     let bin = fake_claude(crystal.dir.path());

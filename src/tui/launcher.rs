@@ -202,6 +202,29 @@ pub enum Outcome {
     },
 }
 
+/// What the panel held when it was put away with a task written in it,
+/// for the next `n` or `w` to open on: the task, what runs it and the
+/// choices in its rows, and where it was to start.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Draft {
+    task: String,
+    /// What runs it, by [`Run::key`].
+    run: String,
+    /// The choice in each of its rows, as the row shows it.
+    rows: Vec<String>,
+    touched: bool,
+    how: usize,
+    /// Where the panel was opened to start, which says whether the panel
+    /// it comes back in is the same one.
+    opened_at: Target,
+    /// Where it was to start.
+    target: Target,
+    /// The new worktree's branch, when one was typed in place of the
+    /// made-up name.
+    branch: Option<String>,
+    focus: Field,
+}
+
 pub struct Launcher {
     task: TextArea,
     focus: Field,
@@ -231,6 +254,14 @@ pub struct Launcher {
     how: usize,
     /// The backlog item the session is for, when it was started from one.
     backlog: Option<u64>,
+    /// Where the panel was opened to start, by its place in `targets`.
+    opened_at: usize,
+    /// Whether what the panel holds is kept as a draft when it's put away:
+    /// opened by `n` or `w`, it is; for an issue, a pull request or a
+    /// backlog item, which bring their own task, it isn't.
+    keeps_draft: bool,
+    /// Whether it opened on the draft left last time, which it says.
+    from_draft: bool,
 }
 
 impl Launcher {
@@ -253,6 +284,9 @@ impl Launcher {
             offers_background: setup.background,
             how: 0,
             backlog: None,
+            opened_at: setup.target,
+            keeps_draft: false,
+            from_draft: false,
         };
         launcher.choose_run(setup.run);
         // Opened for a new worktree, as by `w`, it stays one whatever the
@@ -281,6 +315,85 @@ impl Launcher {
     pub fn for_backlog_item(mut self, number: u64) -> Launcher {
         self.backlog = Some(number);
         self
+    }
+
+    /// Has the panel keep what it holds as a draft when it's put away, and
+    /// opens it on `draft`, what it held when it was last put away. The
+    /// task always comes back, and what runs it and the choices in its rows
+    /// while they're still offered; where it starts, and the branch, only
+    /// when the panel opens where it did before, since `n` on another
+    /// session, or `w`, aims it elsewhere.
+    pub fn with_draft(mut self, draft: Option<Draft>) -> Launcher {
+        self.keeps_draft = true;
+        let Some(draft) = draft else {
+            return self;
+        };
+        self.from_draft = true;
+        self.task.set_text(&draft.task);
+        if let Some(run) = self.runs.iter().position(|run| run.key() == draft.run) {
+            self.choose_run(run);
+            // As in `new`: opened for a new worktree, it stays one.
+            if self.opened_at != 0 {
+                self.target = self.opened_at;
+            }
+            for (row, setting) in self.run().settings().iter().enumerate() {
+                let choices = self.choices(setting);
+                let wanted = draft.rows.get(row);
+                if let Some(at) = choices.iter().position(|choice| Some(choice) == wanted) {
+                    self.chosen[row] = at;
+                }
+            }
+            self.touched = draft.touched;
+            self.how = draft.how.min(HOW.len() - 1);
+        }
+        if self.targets.get(self.opened_at) == Some(&draft.opened_at) {
+            if let Some(at) = self.targets.iter().position(|t| *t == draft.target) {
+                self.target = at;
+            }
+            if let Some(branch) = &draft.branch {
+                self.branch = TextInput::with_text(branch);
+            }
+        }
+        if self.fields().contains(&draft.focus) {
+            self.focus = draft.focus;
+        }
+        self
+    }
+
+    /// Whether what the panel holds is kept as a draft when it's put away.
+    pub fn keeps_draft(&self) -> bool {
+        self.keeps_draft
+    }
+
+    /// What the panel holds, to keep as it's put away, or `None` when it
+    /// has no task written in it: an empty panel put away is a change of
+    /// mind.
+    pub fn draft(&self) -> Option<Draft> {
+        if self.task.text().trim().is_empty() {
+            return None;
+        }
+        let rows = self.run().settings().iter().zip(&self.chosen);
+        let rows = rows.map(|(setting, &chosen)| {
+            let choices = self.choices(setting);
+            choices.get(chosen).cloned().unwrap_or_default()
+        });
+        Some(Draft {
+            task: self.task.text().to_string(),
+            run: self.run().key(),
+            rows: rows.collect(),
+            touched: self.touched,
+            how: self.how,
+            opened_at: self.targets[self.opened_at].clone(),
+            target: self.target().clone(),
+            branch: (self.branch.text() != self.made_up).then(|| self.branch.text().to_string()),
+            focus: self.focus,
+        })
+    }
+
+    /// Whether the panel opened on the draft left last time, and still has
+    /// its task, for it to say so.
+    pub fn shows_draft(&self) -> bool {
+        self.from_draft && !self.task.text().trim().is_empty()
     }
 
     /// Whether the "how" row is shown: what's chosen can work without a
@@ -967,11 +1080,22 @@ pub fn panel_lines(launcher: &Launcher, width: u16) -> Vec<PanelLine> {
             (cut_front(&dir, width - 6), Ink::Muted),
         ]));
     }
+    // Text the user didn't type just now: say where it came from, and that
+    // Esc won't lose it.
+    if launcher.shows_draft() {
+        lines.push(PanelLine::new(vec![
+            ("draft ".to_string(), Ink::Muted),
+            (cut(DRAFT_NOTE, width - 6), Ink::Muted),
+        ]));
+    }
     if let Some(problem) = launcher.problem() {
         lines.push(PanelLine::new(vec![(problem.to_string(), Ink::Problem)]));
     }
     lines
 }
+
+/// What the panel says when it opens on the draft left last time.
+const DRAFT_NOTE: &str = "left last time; esc keeps it";
 
 /// The task box: its rows, scrolled to keep the cursor in sight, or a
 /// note saying why there's no task to type.
@@ -1206,6 +1330,125 @@ mod tests {
         assert_eq!(press(&mut panel, KeyCode::Enter), Outcome::Stay);
         assert_eq!(panel.focus(), Field::Task);
         assert!(panel.problem().unwrap().contains("background task"));
+    }
+
+    /// A panel at `targets`, opened to start at the one at `target`, the
+    /// way `n` (0) and `w` (1) open it.
+    fn opened_at(runs: Vec<Run>, targets: Vec<Target>, target: usize) -> Launcher {
+        Launcher::new(Setup {
+            runs,
+            run: 0,
+            targets,
+            target,
+            history: Vec::new(),
+            codex_models: Vec::new(),
+            background: false,
+            branch: "calm-heron".into(),
+        })
+    }
+
+    /// The choice made in the row called `label`.
+    fn chosen(panel: &Launcher, label: &str) -> String {
+        let rows = panel.choice_rows();
+        let (_, _, choices, at) = rows.iter().find(|row| row.1 == label).unwrap();
+        choices[*at].clone()
+    }
+
+    /// A panel by `n`, with a task, Claude Code on fable, starting in a new
+    /// worktree on a branch typed in, put away with the keys on the branch.
+    fn drafted() -> Draft {
+        let mut panel = launcher(vec![agent("claude"), agent("codex")]).with_draft(None);
+        type_text(&mut panel, "fix the refunds");
+        press(&mut panel, KeyCode::Tab); // run
+        press(&mut panel, KeyCode::Tab); // model
+        press(&mut panel, KeyCode::Right);
+        press(&mut panel, KeyCode::BackTab); // run
+        press(&mut panel, KeyCode::BackTab); // task
+        press(&mut panel, KeyCode::BackTab); // start in, going round
+        assert_eq!(panel.focus(), Field::Where);
+        press(&mut panel, KeyCode::Right);
+        press(&mut panel, KeyCode::Tab);
+        type_text(&mut panel, "-2");
+        assert_eq!(press(&mut panel, KeyCode::Esc), Outcome::Cancel);
+        panel.draft().expect("a draft")
+    }
+
+    #[test]
+    fn a_draft_brings_the_panel_back_whole_where_it_was_opened_before() {
+        let panel = launcher(vec![agent("claude"), agent("codex")]).with_draft(Some(drafted()));
+        assert_eq!(panel.task().text(), "fix the refunds");
+        assert_eq!(panel.run().key(), "claude");
+        assert_eq!(chosen(&panel, "model"), "fable");
+        assert!(panel.is_new_worktree());
+        assert_eq!(panel.branch_name(), "brave-otter-2");
+        assert_eq!(panel.focus(), Field::Branch);
+        let lines: Vec<String> = panel_lines(&panel, 80)
+            .iter()
+            .map(PanelLine::text)
+            .collect();
+        assert!(
+            lines.contains(&"draft left last time; esc keeps it".to_string()),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_draft_opened_elsewhere_keeps_what_was_chosen_but_starts_where_it_s_opened() {
+        let billing = vec![
+            Target::Here {
+                dir: Some(PathBuf::from("/code/billing")),
+                label: "billing ⌂ main".into(),
+            },
+            Target::NewWorktree {
+                base: Some(PathBuf::from("/code/billing")),
+                project: Some("billing".into()),
+            },
+        ];
+        let runs = vec![agent("claude"), agent("codex")];
+        let panel = opened_at(runs.clone(), billing, 0).with_draft(Some(drafted()));
+        assert_eq!(panel.task().text(), "fix the refunds");
+        assert_eq!(chosen(&panel, "model"), "fable");
+        assert_eq!(chosen(&panel, "start in"), "here");
+        assert_eq!(panel.focus(), Field::Task, "there's no branch row here");
+
+        // `w` where `n` was: a new worktree, on a branch of its own.
+        let panel = opened_at(runs, vec![here(), worktree()], 1).with_draft(Some(drafted()));
+        assert!(panel.is_new_worktree());
+        assert_eq!(panel.branch_name(), "calm-heron");
+        assert_eq!(chosen(&panel, "model"), "fable");
+    }
+
+    #[test]
+    fn a_draft_whose_agent_has_gone_brings_back_its_task() {
+        let mut draft = drafted();
+        draft.run = "gone".into();
+        let panel = launcher(vec![agent("codex"), agent("claude")]).with_draft(Some(draft));
+        assert_eq!(panel.task().text(), "fix the refunds");
+        assert_eq!(panel.run().key(), "codex");
+    }
+
+    #[test]
+    fn only_a_panel_with_a_task_written_leaves_a_draft() {
+        let mut panel = launcher(vec![agent("claude")]).with_draft(None);
+        assert!(panel.keeps_draft());
+        type_text(&mut panel, "  ");
+        assert_eq!(panel.draft(), None);
+        type_text(&mut panel, "go");
+        assert_eq!(panel.draft().unwrap().task, "  go");
+        // Opened for an issue or a backlog item, it brings its own task.
+        assert!(
+            !launcher(vec![agent("claude")])
+                .with_task("Fix issue #4")
+                .keeps_draft()
+        );
+        // A panel with its draft emptied says nothing about one.
+        let mut panel = launcher(vec![agent("claude")]).with_draft(Some(drafted()));
+        assert!(panel.shows_draft());
+        press(&mut panel, KeyCode::Tab); // from the branch round to the task
+        for _ in 0..3 {
+            panel.on_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        }
+        assert!(!panel.shows_draft());
     }
 
     #[test]
