@@ -4429,7 +4429,11 @@ fn the_history_keeps_more_than_tmuxs_two_thousand_rows() {
     crystal.ok(&["new", "-n", "printer", "sh", "-c", printing]);
     written(&crystal.dir.path().join("printed"));
 
-    let all = crystal.ok(&["read", "printer", "--history"]);
+    // The file is written as the last line goes out, before the daemon has
+    // read it all off the terminal.
+    let read = || crystal.ok(&["read", "printer", "--history"]);
+    eventually("the last line is in", || read().contains("line 3000\n"));
+    let all = read();
     let lines: Vec<&str> = all.lines().collect();
     assert_eq!(lines[0], "line 1");
     assert_eq!(lines[2999], "line 3000");
