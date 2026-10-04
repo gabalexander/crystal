@@ -226,7 +226,11 @@ as many times as it would scroll lines, the way xterm's alternate scroll does; a
 (`\e[?1007l`) gets nothing. Copy mode and a selection being dragged keep the wheel scrolling the pane.
 `crystal attach` leaves the mouse to your terminal, and has it send the arrow keys for the wheel the same way,
 only while the program is on the alternate screen: a shell at its prompt doesn't page through its history as
-you scroll.
+you scroll, though that leaves the wheel nothing to do there. With `attach_capture = true` under `[mouse]`, the
+attach takes the mouse itself, as the TUI does, which works in a terminal that has no alternate scroll too: a
+program that asks for the mouse gets it, a pager the arrow keys, and anywhere else the wheel scrolls the
+session's history, from before you attached as well, the top right saying how far back (`↑ 120 lines`) until
+you type. Your terminal's own selection then takes a key held, as in the TUI.
 
 Beside each pane's screen, in a column of its own, a scrollbar shows where in its history the pane is, once it
 has some: drag its thumb to scroll, or click the track and the thumb jumps there. The wheel over it scrolls the
@@ -493,7 +497,8 @@ changes you haven't committed. `crystal worktree rm --force` removes it anyway, 
 asks a second time, naming them, and a second `y` does the same. Sessions that had ended in it leave the list
 with it: their directory is gone, so they could never start again. The daemon does the removing, and the
 sidebar says `removing…` until it's done, which for a big worktree can take a while: quitting the TUI meanwhile
-doesn't stop it, and neither does `crystal restart-server`.
+doesn't stop it, and neither does `crystal restart-server`. Every TUI's sidebar says so, whoever asked: another
+TUI, `crystal worktree rm`, or this one before you quit and opened it again; and `W` leaves it be meanwhile.
 
 To set a new worktree up, say install its dependencies or copy in an `.env`, have a [plugin](#plugins) run a
 command on `worktree.created`, and on `worktree.removed` to tidy up after it.
@@ -2544,7 +2549,7 @@ file and change. A setting crystal doesn't know is an error that names it, so a 
 | `[window]` | | `title`, what the TUI titles its terminal: [the window](#terminals-the-window-and-the-tab-bar) |
 | `[tab_bar]` | | where the tab bar goes, whether it's left out with one tab, and what it shows at its right: [the tab bar](#terminals-the-window-and-the-tab-bar) |
 | `[appearance]` | | `auto_switch`, the theme following your system's light or dark, and the theme for each: [themes](#themes) |
-| `[mouse]` | | `capture`, whether the TUI takes the mouse from your terminal (`true`); `copy_on_select`, whether a selection is copied as you let go or waits in copy mode for `y` (`true`); `scroll_lines`, how far a notch of the wheel scrolls a pane, up to 100, or how many arrow keys it sends a pager (`3`); `scrollbars`, a scrollbar beside each pane (`true`): [the mouse](#usage) |
+| `[mouse]` | | `capture`, whether the TUI takes the mouse from your terminal (`true`); `copy_on_select`, whether a selection is copied as you let go or waits in copy mode for `y` (`true`); `scroll_lines`, how far a notch of the wheel scrolls a pane, up to 100, or how many arrow keys it sends a pager (`3`); `scrollbars`, a scrollbar beside each pane (`true`); `attach_capture`, whether `crystal attach` takes the mouse, for the wheel to scroll a session's history (`false`): [the mouse](#usage) |
 | `[clipboard]` | | `allow_programs`, whether what a program in a session copies goes on your clipboard (`true`): [copying](#zoom-copy-mode-and-search) |
 | `[update]` | | `check`, whether the TUI looks once a day for a [newer crystal](#updating) (`true`) |
 

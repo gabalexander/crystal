@@ -1963,6 +1963,9 @@ impl Daemon {
             }),
             Request::AddProject { dir } => self.list_project(&dir, true),
             Request::RemoveProject { dir } => self.list_project(&dir, false),
+            Request::Removals => Ok(Response::Removals {
+                worktrees: self.removing(),
+            }),
             Request::Subscribe { .. }
             | Request::WaitOutput { .. }
             | Request::Handover { .. }
