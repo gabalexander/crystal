@@ -33,7 +33,7 @@ use std::fs::File;
 use std::io::{self, Write};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
@@ -894,6 +894,7 @@ impl Session {
             bell: self.bell,
             unseen_copies: self.unseen_copies,
             context: self.task.as_ref().and_then(Task::context),
+            output_waits: self.term.output_waits(),
         }
     }
 
@@ -1694,6 +1695,8 @@ pub struct Term {
     /// The thread reading the program's output, for a handover to wait for
     /// once it has stopped it.
     pump: Mutex<Option<JoinHandle<()>>>,
+    /// How many waits for a line on the screen are looking at it.
+    output_waits: AtomicU32,
 }
 
 /// The daemon's side of a PTY, its master side: read for what the program
@@ -1810,6 +1813,7 @@ impl Term {
                 unseen_copies: 0,
             }),
             pump: Mutex::default(),
+            output_waits: AtomicU32::new(0),
         }
     }
 
@@ -1876,6 +1880,21 @@ impl Term {
             screen.listeners.push(signal);
         }
         listener
+    }
+
+    /// Runs `wait`, a wait for a line on the screen, counted in
+    /// [`Term::output_waits`] while it lasts.
+    pub fn waiting_for_output<T>(&self, wait: impl FnOnce() -> T) -> T {
+        self.output_waits.fetch_add(1, Ordering::Relaxed);
+        let waited = wait();
+        self.output_waits.fetch_sub(1, Ordering::Relaxed);
+        waited
+    }
+
+    /// How many waits for a line on the screen, `crystal wait --output`'s,
+    /// are looking at it.
+    pub fn output_waits(&self) -> u32 {
+        self.output_waits.load(Ordering::Relaxed)
     }
 
     /// The screen, one string per row, after the last `history` rows of
@@ -2273,6 +2292,13 @@ mod tests {
             }),
             resume: None,
         }
+    }
+
+    #[test]
+    fn a_wait_for_output_is_counted_while_it_lasts() {
+        let term = Term::without_terminal();
+        assert_eq!(term.waiting_for_output(|| term.output_waits()), 1);
+        assert_eq!(term.output_waits(), 0);
     }
 
     #[test]

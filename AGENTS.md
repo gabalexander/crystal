@@ -46,7 +46,7 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   and `lay_out` a layout command for the TUI; restarting the daemon, handed over or cold
 - `src/layout.rs`: laying out the TUI from the command line: the commands `crystal tab`, `crystal pane` and
   `crystal title` send, the order a TUI gets with the id of the session it was run in, what the TUI reports
-  back, the layout it answers with, and how `crystal layout` prints it
+  back, the layout it answers with, where the daemon says the user is, and how `crystal layout` prints it
 - `src/layout_relay.rs`: the daemon's side of those commands: the TUIs that take orders and which was used last
   (a key, a click, its terminal brought to the front), whether each one's terminal has the focus, which says
   where the user is for notifications, an order written to that one and its answer handed back to the command
@@ -323,7 +323,8 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   an agent by its program's name, the catalog's or one its rules give, or by the npm package its rules name
 - `src/typing.rs`: typing into a session the way a person would: pastes marked, Enter on its own
 - `src/session.rs`: one program in a PTY, or a task: spawn, exit status, stop, its screen (120 by 40 until a viewer
-  sizes it), viewers and listeners, the agent that says what it's doing itself while it holds the session, the
+  sizes it), viewers and listeners, the waits for output looking at it, the agent that says what it's doing
+  itself while it holds the session, the
   conversation its agent's hooks named, which counts once the agent has worked on a turn in it, an agent typed
   into its shell whose conversation a restart resumes while it's in front, its agent's subagents,
   whether its first prompt can name it, whether its agent is blocked on the user, how long its agent has sat

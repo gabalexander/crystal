@@ -1525,8 +1525,9 @@ the permission a [background task](#background-tasks) waits on you for, `tool` a
 otherwise; `context`, how full a background task's conversation is, `tokens` of its model's `window`, once
 Claude has said. `reporter` holds an agent that [says what it's doing
 itself](#teaching-crystal-about-your-agent): its `agent` name, its last `message` and its `resume` command;
-while it's there, `front` is that agent. New fields may appear; none goes away. With no daemon running, it
-prints `[]`.
+while it's there, `front` is that agent. `output_waits`, there only while there are some, counts the `crystal
+wait --output` looking at its screen, so a script can tell its wait has reached the daemon. New fields may
+appear; none goes away. With no daemon running, it prints `[]`.
 
 #### Laying out the TUI
 
@@ -1577,7 +1578,9 @@ killed. The next TUI to open shows the tabs as the commands left them.
 `current` and `zoomed`, its `sessions`, the one `selected`, the one `floating`, and its `panes`: either
 `{"kind": "pane", "session": "tests"}`, with `"selection": true` for the pane that follows the selection, or
 `{"kind": "split", "way": "right", "ratio": 0.5, "first": …, "second": …}`, `way` being `right` for side by
-side and `down` for one above the other, and `ratio` the first side's share.
+side and `down` for one above the other, and `ratio` the first side's share. Beside the tabs, `presence` says
+whether you're at crystal, as the TUIs' terminals say of their focus: `here` while one has it, `away` once
+every one has lost it, and `unknown` with no TUI open or one whose terminal doesn't say.
 
 #### A skill for Claude Code
 
