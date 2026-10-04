@@ -22,8 +22,8 @@ use super::handoff_view::{self, HandoffView};
 use super::help;
 use super::issues::{self, IssuesView};
 use super::keymap::{
-    self, Bound, Chord, Command, CommandKind, KeyCommand, Keymap, Mode, ModeKey, Sequence,
-    SplitWay, Translated,
+    self, Bound, Chord, Command, CommandKind, KeyCommand, Keymap, Mode, ModeKey, Rebinding,
+    Sequence, SplitWay, Translated,
 };
 use super::launcher::{self, Launcher, Memory, Run, Setup, Target};
 use super::layouts::{self, Layouts, LayoutsView, Program, Programs, Which};
@@ -696,6 +696,9 @@ pub enum Action {
     CloseSettings,
     /// Write a change to a setting to the config file, and follow it.
     ChangeSetting(settings_view::Change),
+    /// Write the keys the settings view gave to the config file's
+    /// `[keys]`, and follow them.
+    ChangeKeys(Rebinding),
     /// Have the daemon get the model that searches memory by meaning ready.
     PrepareEmbeddings,
     /// Put crystal's hooks in an agent's own settings, or bring them up to
@@ -4745,6 +4748,7 @@ impl App {
                 Some(Action::CloseSettings)
             }
             settings_view::Outcome::Change(change) => Some(Action::ChangeSetting(change)),
+            settings_view::Outcome::Keys(rebinding) => Some(Action::ChangeKeys(rebinding)),
             settings_view::Outcome::Prepare => Some(Action::PrepareEmbeddings),
             settings_view::Outcome::Integrate { agent, install } => {
                 Some(Action::Integrate { agent, install })
@@ -5004,8 +5008,13 @@ impl App {
         if self.launcher.is_some() || self.profiles_view.is_some() {
             return None;
         }
-        if self.plugins_view.is_some() || self.settings.is_some() {
+        if self.plugins_view.is_some() {
             return Some((false, false));
+        }
+        // A setting typed in, or a key pressed for a command, is the key
+        // as it comes.
+        if let Some(settings) = &self.settings {
+            return (!settings.takes_keys_as_they_come()).then_some((false, false));
         }
         if self.prompt.is_some() {
             return None;
@@ -5065,6 +5074,7 @@ impl App {
                     View::Files(finder) => finder.dir,
                     View::Tree(tree) => tree.dir,
                     View::Grep(grep) => grep.dir,
+                    View::Memory(memory) => memory.file_to_open()?.0,
                     View::Handoff(view) => view.selected()?.dir.clone(),
                     _ => return None,
                 };
@@ -5630,7 +5640,7 @@ impl App {
                 let branch = forge::branch_for_issue(item.number, &item.text);
                 let setup = self.launch_setup(false);
                 let launcher = Launcher::new(setup)
-                    .with_task(&item.text)
+                    .with_task(&crate::backlog::goal(&item))
                     .with_branch(&branch)
                     .for_backlog_item(item.number);
                 self.launcher = Some(launcher);
@@ -6072,6 +6082,8 @@ impl App {
         } else if let Some(launcher) = &mut self.launcher {
             launcher.on_paste(&text);
         } else if let Some(view) = &mut self.profiles_view {
+            view.on_paste(&text);
+        } else if let Some(view) = &mut self.settings {
             view.on_paste(&text);
         } else if let Some(prompt) = &mut self.prompt {
             prompt.input.insert_str(&text);
@@ -11649,6 +11661,40 @@ mod tests {
     }
 
     #[test]
+    fn enter_in_the_memory_view_edits_the_entry_s_file_in_a_session_of_its_own() {
+        let mut app = App::new(None);
+        app.set_sessions(vec![in_repo("fixer", "fix/ledger")]);
+        press(&mut app, KeyCode::Char('m'));
+        let entry = crate::memory::Entry {
+            id: 3,
+            kind: crate::memory::Kind::Gotcha,
+            text: "the ledger needs redis".into(),
+            files: vec!["src/ledger.rs".into()],
+            source: crate::memory::Source::User,
+            created: 0,
+            seen: 1,
+            last_seen: 0,
+            anchors: Default::default(),
+            checkout: None,
+        };
+        let listed = crate::memory::Listed {
+            entry,
+            freshness: crate::memory::Freshness::Fresh,
+        };
+        app.memory_read(Path::new("/code/app"), Ok(vec![listed]));
+        assert_eq!(
+            press(&mut app, KeyCode::Enter),
+            Some(Action::Edit {
+                dir: PathBuf::from("/code/app"),
+                path: "src/ledger.rs".into(),
+                line: None,
+                name: "ledger.rs".into(),
+            })
+        );
+        assert!(app.view().is_none());
+    }
+
+    #[test]
     fn m_with_memory_off_says_so_and_opens_nothing() {
         let mut app = App::new(None);
         app.set_sessions(vec![in_repo("fixer", "main")]);
@@ -11693,12 +11739,14 @@ mod tests {
                 .map(|(number, text)| BacklogItem {
                     number: *number,
                     text: text.to_string(),
+                    body: String::new(),
                     tags: Vec::new(),
                     done: false,
                     created: 0,
                     closed: None,
                 })
                 .collect(),
+            tasks: Vec::new(),
         }
     }
 
@@ -11792,6 +11840,15 @@ mod tests {
         };
         assert_eq!(purpose.task.as_deref(), Some("write the docs"));
         assert_eq!(purpose.backlog, Some(3));
+
+        // An item's body goes with it, under its line.
+        press(&mut app, KeyCode::Char('b'));
+        let mut backlog = backlog_of(&[(4, "ship it")]);
+        backlog.items[0].body = "once it's green".into();
+        app.set_backlog(Path::new("/code/shop"), Ok(backlog));
+        press(&mut app, KeyCode::Enter);
+        let panel = app.launcher().unwrap();
+        assert_eq!(panel.task().text(), "ship it\n\nonce it's green");
     }
 
     #[test]
@@ -12052,7 +12109,8 @@ gate = true
         }
         assert_eq!(
             press(&mut app, KeyCode::Char(' ')),
-            Some(Action::ChangeSetting(settings_view::Change::HideDrafts(
+            Some(Action::ChangeSetting(settings_view::Change::set(
+                settings_view::Setting::HideDrafts,
                 true
             )))
         );

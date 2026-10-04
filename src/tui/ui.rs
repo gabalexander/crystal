@@ -546,7 +546,7 @@ fn draw_everything(
         pull_requests::draw(frame, view, look.theme, look.now, middle);
     }
     if let Some(view) = app.backlog_view() {
-        backlog_view::draw(frame, view, look.theme, middle);
+        backlog_view::draw(frame, view, look.theme, look.now, middle);
     }
     if let Some(view) = app.layouts_view() {
         layouts::draw(frame, view, look.theme, look.now, middle);
@@ -1348,8 +1348,8 @@ fn draw_footer(frame: &mut Frame, app: &App, panes: &[Pane], look: &Look, area: 
     } else if app.plugins_view().is_some() {
         let hints = as_keys_are(app, plugins_view::HINTS, false);
         frame.render_widget(hint_spans(&borrowed(&hints), theme), area);
-    } else if app.settings_view().is_some() {
-        let hints = as_keys_are(app, settings_view::HINTS, false);
+    } else if let Some(view) = app.settings_view() {
+        let hints = as_keys_are(app, settings_view::hints(view), false);
         frame.render_widget(hint_spans(&borrowed(&hints), theme), area);
     } else if let Some(prompt) = app.prompt() {
         draw_prompt(frame, theme, prompt, area);
@@ -1686,27 +1686,32 @@ fn draw_notice_or(
 const BACKLOG_HINTS: &[(&str, &str)] = &[
     ("enter", "start a task"),
     ("a", "add"),
+    ("e", "edit"),
     ("space", "done/undone"),
     ("x", "remove"),
     ("/", "filter"),
+    ("t", "tag"),
     ("esc", "close"),
 ];
 
-/// The footer while the backlog view is open: the item being added, the
+/// The footer while the backlog view is open: the line being written, the
 /// question `x` asks, or the view's keys.
 fn draw_backlog_footer(frame: &mut Frame, view: &BacklogView, theme: &Theme, area: Rect) {
-    if let Some(adding) = &view.adding {
-        let label = " add to the backlog: ";
+    if let Some(writing) = &view.writing {
+        let label = writing.label();
         let line = Line::from(vec![
             Span::styled(
-                label,
+                label.clone(),
                 Style::new().fg(theme.accent).add_modifier(Modifier::BOLD),
             ),
-            Span::styled(adding.text().to_string(), Style::new().fg(theme.text)),
+            Span::styled(
+                writing.input.text().to_string(),
+                Style::new().fg(theme.text),
+            ),
         ]);
         frame.render_widget(line, area);
         // The label is plain ASCII, so its length in bytes is its width.
-        let column = area.x + (label.len() + adding.cursor()) as u16;
+        let column = area.x + (label.len() + writing.input.cursor()) as u16;
         frame.set_cursor_position((column.min(area.right().saturating_sub(1)), area.y));
     } else if let Some(question) = view.removing() {
         frame.render_widget(question_line(&question, theme), area);

@@ -655,7 +655,8 @@ A key you give one command is taken from the command that had it, which is left 
 Two commands given the same key, a command or a key crystal doesn't know, are errors that name them, and a
 name that's nearly one crystal knows says which, so a typo never goes unnoticed. Keys are written as `n`, `N`
 (or `shift+n`), `ctrl+b`, `alt+enter`, `ctrl+alt+h`, `shift+left`, `pageup`, `space`, `f5`, or the character
-itself, like `|`, `(` or `:`. The `?` overlay, the footer and the command list all say the keys you chose.
+itself, like `|`, `(` or `:`. The `?` overlay, the footer and the command list all say the keys you chose. The
+[settings view](#the-settings-view)'s keys tab gives a command the key you press, with the same checks.
 
 Every prefix in the list starts the same thing: the first is the one the footer shows. Inside a pane every key
 goes to the program but the prefixes and the hand-back key, so a command's key works there only after a prefix,
@@ -2086,12 +2087,14 @@ crystal tasks terminal docs                                          # carry on 
     `rename`, `report`, `notify`, `layout` and `layout export`, `pane split` and `pane close`
   - with tasks on, `done`, `task`, and `tasks` with `show`, `log`, `new` and `start`; with flows on, `flow`
     with `run`, `wait`, `show`, `defs` and `retry`
-  - with the backlog on, reading it and `add`, `export`, `done`, `reopen` and `start`; with the handoff file
-    on, `handoff`; with memory on, `remember`, and `memory` with `search` and `show`
+  - with the backlog on, reading it and `add`, `list`, `show`, `edit`, `export`, `done`, `reopen` and
+    `start`; with the handoff file on, `handoff`; with memory on, `remember`, and `memory` with `add`,
+    `list`, `search` and `show`
 
   What removes or cancels what's there (`kill`, `worktree rm`, `tasks cancel`, `flow cancel`, `backlog rm`,
-  `memory rm`), what's yours to decide (a flow's gate: `flow approve` and `back`), and what answers another
-  agent's question for it (`send-keys`, and `answer`, which can say yes to a permission) still ask.
+  `memory rm`), what writes in bulk from a file (`backlog import`), what's yours to decide (a flow's gate:
+  `flow approve` and `back`), and what answers another agent's question for it (`send-keys`, and `answer`,
+  which can say yes to a permission) still ask.
 - `Ctrl+C` in a task's pane, or `crystal interrupt <task>`, stops the run it's in the middle of. Its task
   stays open, waiting on you, and a follow-up carries on.
 - `crystal send`, or `Space` in the TUI, gives a task a follow-up: on the `claude` still there, or once that
@@ -2144,11 +2147,14 @@ it:
 crystal remember "Fees are kept in cents; never store a float"
 crystal remember -k gotcha -f tests/ledger.rs "The ledger tests need the database up: make db"
 crystal remember -k command "make e2e runs the browser tests; they take about 4 minutes"
-crystal memory                       # the list, newest first
+crystal memory add -k decision --title "Refunds go through the ledger" "Never call the processor directly: ..."
+crystal memory                       # the list, newest first; `memory list -k gotcha` keeps to a kind
 crystal memory search ledger tests   # the entries that have most to do with those words
+crystal memory search db -k command -f src/ledger --all -n 5   # of a kind, about those files, stale too
 crystal memory show 3                # one in full: its files, where it came from, how often it was said
 crystal memory export > MEMORY.md    # the whole list as markdown
 crystal memory rm 3                  # forget one
+crystal memory list --forgotten      # what was forgotten, the latest first
 crystal memory promote 2             # copy one into the project's CLAUDE.md, under "Notes"
 crystal memory distill fixer         # have a model read what a session did, now
 crystal memory embed                 # download the model that searches by meaning
@@ -2156,7 +2162,10 @@ crystal memory embed                 # download the model that searches by meani
 
 - `-k` is `decision`, `gotcha`, `command` or `note` (the default). Inside a session, an entry goes to the
   session's project and says which session added it; elsewhere it goes to the project of the current
-  directory, or of `-C <dir>`.
+  directory, or of `-C <dir>`. `crystal memory add` is the same as `crystal remember`.
+- An entry's first line is its title: what the list, a search and an agent starting are shown of it, and
+  `show` gives the rest. `--title` gives it one of its own, a line of 120 characters at most, over what it
+  says.
 - How a task turned out isn't kept here: its project's [tasks](#tasks) keep that (`crystal tasks`). The
   `outcome` entries an earlier crystal added as each task closed are still listed and found by a search, but
   agents starting aren't shown them; `crystal memory rm` those you don't want.
@@ -2165,23 +2174,29 @@ crystal memory embed                 # download the model that searches by meani
   repository. A project's list from before, a JSON file there, is brought in the first time it's read.
 - `search` uses SQLite's full-text index (FTS5), ranked by bm25: any of the words matches, and so does a word
   they start or stem from (`deploying` finds "Deploys go out on Tuesdays"); the entries with more of the words,
-  and rarer ones, come first, drifting and stale ones marked where they rank. With
-  [search by meaning](#search-by-meaning), on unless you turn it off, entries that mean the same count too,
-  whatever their words, and what doesn't answer the search is left out.
+  and rarer ones, come first, drifting ones marked where they rank. Stale ones are left out; `--all` (`-a`)
+  brings them back, marked. `-k` keeps to a kind, `-f` to the entries about a file, or about any file in a
+  directory, named from where you are (give it more than once for more), and `-n` says how many at most (50
+  unless it's told). With [search by meaning](#search-by-meaning), on unless you turn it off, entries that mean
+  the same count too, whatever their words, and what doesn't answer the search is left out.
 - The same thing remembered again (the same words, whatever the case or punctuation) is the one entry, seen
   again: `remembered 3 already`. Credentials in an entry, like `API_KEY=…` or a token, are taken out as it's
   kept.
 - `-f` names a file an entry is about, and can be given more than once. crystal keeps a hash of each file as it
   is then (a file that isn't there isn't counted). Once some of them change, the entry is marked drifting: it
-  may hold only in part. Once all of them have changed, or gone, it's stale: a search marks it, and agents
-  starting aren't shown it. `crystal memory rm` it, or remember it again, which takes its files as they are now.
+  may hold only in part. Once all of them have changed, or gone, it's stale: a search leaves it out unless
+  `--all`, and agents starting aren't shown it. `crystal memory rm` it, or remember it again, which takes its
+  files as they are now.
   The files are looked at in the worktree the entry was remembered in while that's there, and in the main
   worktree after.
 - `promote` asks first at a terminal; `--yes` doesn't. It writes to CLAUDE.md, or to AGENTS.md when that's the
   only one the project has.
+- `rm` forgets an entry: it leaves the list, and the distiller never adds it back. `memory list --forgotten`
+  (or `--wrong`) lists what was forgotten, as it was; remembering it again brings it back.
 - `m` in the sidebar opens the selected session's project's list, drifting and stale entries marked: the entry
-  the bar is on is shown in full beside it, `/` filters, `x` forgets an entry and `p` promotes it, each after a
-  `y`.
+  the bar is on is shown in full beside it, `/` filters, `Enter` opens its file in your `$EDITOR` (in the
+  worktree it was remembered in while that's there, as a session of its own), and `x` forgets an entry and `p`
+  promotes it, each after a `y`.
 
 When an agent starts, crystal shows it the entries that have most to do with its launch: first those about files
 its worktree has changed since its branch left the default one (`origin`'s, or `main` or `master`), committed
@@ -2200,7 +2215,7 @@ drifting ones marked where they rank. Each comes with its id, and a line on how 
 
 Every Claude Code session crystal starts, in a terminal or as a task in the background (`claude -p`), gets
 crystal's own MCP server, `crystal mcp`, with its two tools allowed: `memory_search`, which searches the
-project's memory the way `crystal memory search` does, and `memory_show`, which reads one entry in full. These
+project's memory the way `crystal memory search --all` does, and `memory_show`, which reads one entry in full. These
 are how it reads the rest of what was learned without a shell command, which a task has nobody to say yes to
 and a session in a terminal would stop to ask about.
 
@@ -2249,7 +2264,8 @@ crystal memory embed   # downloads both models now (2.4 GB), and gives every ent
 
 Agents don't always remember what they learned. So once a task closes, done or failed, a model reads what it
 did and keeps what a later session would need to know and couldn't find in the code: decisions and why, dead
-ends, commands that work, traps. It's one `claude -p` run on Haiku, in the background:
+ends, commands that work, traps. So it does once a session is archived (`A`, or `crystal archive`), unless its
+task closed done or failed and it was read then. It's one `claude -p` run on Haiku, in the background:
 
 - It reads the end of what the task did: a task's transcript, as Claude Code keeps it (or, when it doesn't,
   what crystal read of its runs), or for Claude Code in a terminal, the transcript its hooks named. Codex leaves
@@ -2269,7 +2285,7 @@ ends, commands that work, traps. It's one `claude -p` run on Haiku, in the backg
 
 ```toml
 [memory]
-distill = true                      # false to turn it off
+distill = true                      # false to turn it off, as tasks close and sessions are archived
 distill_model = "claude-haiku-4-5"  # the model, as `claude --model` takes it
 distill_budget_usd = 0.25           # the most one task's pass may spend
 embeddings = true                   # false to search by words alone: see above
@@ -2441,23 +2457,44 @@ a worktree's, so every worktree of a repository shares it, and it's kept in crys
 repository. Items are numbered per project, `#1` on, and keep their number.
 
 ```sh
-crystal backlog add "Retry the webhook on a timeout" -t payments   # prints #4
-crystal backlog                     # what's still to do; --all for what's done too, --json for scripts
+crystal backlog add "Retry the webhook on a timeout" -t payments -b "On a timeout only, not a 4xx."  # prints #4
+crystal backlog                     # what's still to do; --all for what's done too, -t payments for a tag
+crystal backlog show 4              # one item: its tags, its body, and the tasks started for it
+crystal backlog edit 4 -b "Twice, then give up" -t payments -t ci   # its line, body or tags
 crystal backlog done 4              # or reopen 4, or rm 4
 crystal backlog start 4 -w          # an agent on #4, in a new worktree named after it
-crystal backlog export > TODO.md    # markdown checkboxes, done items ticked
+crystal backlog start 4 -p builder  # with a profile: its agent, options, prompt and where it starts
+crystal backlog start 4 --pr 57 --background   # in the background, on a pull request's worktree
+crystal backlog export > TODO.md    # markdown checkboxes, done items ticked, bodies under them
+crystal backlog import TODO.md      # and back, from a file or `-` for standard input
 ```
 
+- An item is a line, with a body under it when one line isn't enough (`-b`, 8 KiB at most); a line given in
+  several lines is the item's line and the start of its body. A list marks an item with a body with a `+`.
+- `edit` changes the line given, `-b` the body (an empty one takes it away), and `-t` the tags, in place of
+  those it had (`--no-tags` takes them all away).
+- `list` (or `crystal backlog` alone) takes `-t` once for each tag an item must have, `--all` and `--json`.
+  `show` gives the tasks started for an item, oldest first, with how each went: an item a task failed on stays
+  open, and starting it again adds another. `--json` prints it with its `tasks`.
+- `import` reads every `- [ ]` or `- [x]` at the start of a line, done when it's ticked, the `#tags` at its end
+  its tags (a number, like an issue's `#12`, stays in the line), and the indented lines under it its body,
+  leaving out the `(#4)` an export writes. An item whose line the backlog has already is passed over, so
+  importing an export into its own project adds nothing.
+
 `backlog start` starts the agent the new-session panel picks first (`new_session` in the
-[settings](#settings)) with the item as its task. When that task closes done, the item is ticked off. Agents
-are told to put what they notice along the way on the backlog with `crystal backlog add`, rather than into the
-change at hand. Every command works on the current directory's project; `-C <dir>` names another.
+[settings](#settings)), or a [profile](#profiles)'s with `-p`, with the item's line and body as its task, here,
+in a new worktree named after it with `-w` (or when the profile starts in one), or in a pull request's worktree
+with `--pr`, told of it. `--background` runs it as a [background task](#background-tasks), with `claude -p`'s
+arguments after `--`. When that task closes done, the item is ticked off. Agents are told to put what they
+notice along the way on the backlog with `crystal backlog add`, rather than into the change at hand. Every
+command works on the current directory's project; `-C <dir>` names another.
 
 In the TUI, `b` opens the selected session's project's backlog, and the sidebar counts what each project has
-to do beside its name: `payments ──── 3 to do`. In the view, what's to do comes first and what's done after.
-`a` adds an item, `Space` ticks one off or opens it again, `x` removes one once you've said `y`, and `/`
-filters the list as you type. `Enter` opens the new-session panel with the item as its task, on a branch named
-after it; that task ticks the item off when it closes done.
+to do beside its name: `payments ──── 3 to do`. In the view, what's to do comes first and what's done after,
+and under the list, the item the bar is on: its tags, the tasks started for it and its body. `a` adds an item
+and `e` changes its line, `Space` ticks one off or opens it again, `x` removes one once you've said `y`, `/`
+filters the list as you type, and `t` keeps it to each tag in turn. `Enter` opens the new-session panel with
+the item as its task, on a branch named after it; that task ticks the item off when it closes done.
 
 ### Flows
 
@@ -3148,22 +3185,41 @@ issues give way before it.
 
 #### The settings view
 
-`,` in the sidebar opens the settings you'd otherwise change in the file: notifications and when they come,
-sounds, the theme and whether it follows your system's [appearance](#themes) (the row says which theme each
-side is), whether the [tab bar](#terminals-the-window-and-the-tab-bar) goes on top or over the footer and is
-left out with one tab, how long an agent may sit [idle](#archiving-and-idle-agents), how far apart agents
-start again after a [crash or a reboot](#usage), whether `q` asks before it quits, [the mouse](#usage),
-whether programs' copies go on [your clipboard](#zoom-copy-mode-and-search), how memory learns ([the
-distiller](#the-distiller)) and searches ([by meaning](#search-by-meaning)), the permission mode [background
-tasks](#background-tasks) start in, and whether [draft pull requests](#pull-requests) are hidden. `space`
-changes the one the bar is on, and `←/→` go through the [themes](#themes), forward and back (the row says which
-of the twenty it's on), the waits before a notification, the times an agent may sit idle: off, 15 minutes, 30,
-an hour, two or eight, the spacing of restarts: all at once, 100 milliseconds, 250, 500, a second or two, how
-far a notch of the wheel scrolls: 1, 2, 3, 5 or 10 lines, and the permission modes: `default`, `acceptEdits`,
-`auto`, `dontAsk` and `plan`. Each change is written to the file at once,
-keeping the rest of it as you wrote it, comments and all, and counts straight away: the TUI repaints in a new
-theme, and the daemon reads the rest as it goes. On a screen too short for every row, the view scrolls to keep
-the one the bar is on in sight.
+`,` in the sidebar opens the settings you'd otherwise change in the file, in tabs: `Tab` and `Shift+Tab` (or `]`
+and `[`) go from one to the next, and `1` to `8` straight to one.
+
+| Tab | What's in it |
+|---|---|
+| General | [notifications](#usage): whether, after how long, only while you're away, and a command of your own in place of them; sounds; whether `q` asks before it quits; looking for a [newer crystal](#updating); how long the [event log](#events) keeps what happened; and whether [draft pull requests](#pull-requests) are hidden |
+| Look | the [theme](#themes), whether it follows your system's appearance (the row says which theme each side is) and the theme for each side; the [tab bar](#terminals-the-window-and-the-tab-bar)'s place, whether it's left out with one tab, and its separator; the window's title; the [sidebar](#the-sidebar)'s width, whether it starts folded, what folding keeps, whether what needs you is pinned, and how narrow a terminal shows [one column](#on-a-phone); whether keys pressed show at the footer (`show_keys`), and whether [mermaid diagrams](#the-file-finder-and-the-tree-browser) are drawn in ASCII |
+| Sessions | what the [new-session panel](#starting-a-session) offers first, naming sessions for their prompt, how long an agent may sit [idle](#archiving-and-idle-agents), how far apart agents start again after a [crash or a reboot](#usage) and whether one resumes as it said; a new terminal's shell, whether it's a login shell and where it starts; how much a session's history keeps; and the branch new worktrees start from and where they go |
+| Mouse | [the mouse](#usage), and whether programs' copies go on [your clipboard](#zoom-copy-mode-and-search) |
+| Tasks | the permission mode [background tasks](#background-tasks) start in, and what a run and a day may spend |
+| Memory | how memory learns ([the distiller](#the-distiller), its model and what it may spend) and whether it searches [by meaning](#search-by-meaning) and reranks |
+| Integrations | the agents installed here that crystal can [hook](#hooks-in-other-agents-own-settings): below |
+| Keys | every key `[keys]` gives, each given by pressing it: below |
+
+`space` changes the setting the bar is on: a switch turns over, and a choice goes to the next, `←/→` going
+through them forward and back: the [themes](#themes) (the row says which of the twenty it's on), the waits before
+a notification, the times an agent may sit idle (off, 15 minutes, 30, an hour, two or eight), the spacing of
+restarts, the permission modes (`default`, `acceptEdits`, `auto`, `dontAsk` and `plan`), the budgets, and the
+rest. A setting that's text, like the window's title, the shell or the base branch, is typed in: `enter` opens
+it, `enter` again writes it, and `esc` leaves it as it was; emptied, a command, the agent, the base branch or the
+distiller's model goes back to its default. `del` on any row takes its line out of the file, for its default.
+Each change is written to the file at once, keeping the rest of it as you wrote it, comments and all, and counts
+straight away: the TUI repaints in a new theme, and the daemon reads the rest as it goes. A change crystal
+couldn't read isn't written, and the view says why. On a screen too short for a tab's rows, the view scrolls to
+keep the one the bar is on in sight. `[[profile]]`s have their own view (`P`), plugins theirs (`X`), and the
+settings that are lists or tables, like `[colors]` and `[tab_bar] right`, are the file's.
+
+The keys' tab lists the prefixes, the key back from a pane, every command and each mode's keys, with the keys
+each has and a `•` beside those the file gives. `enter` on one waits for the key you press next and gives it that
+key in place of its own, and `a` gives it the key beside them; `x` leaves it with none, and `del` puts its own
+back. A key is checked as the file's keys are: one another command has asks first, saying whose it is, and
+`enter` takes it from that one, which keeps its other keys, while `esc` leaves it; a key a view always has, or
+the key back from a pane, isn't given, and the view says why. Your own `[[keys.command]]` keys are listed under
+the rest, for the file to change. `esc` can't be given this way, since it stops the waiting; the file can give
+it.
 
 While it's open, the view reads the file and asks the daemon again every half a second, so it follows a
 change made by hand in the file too, and shows how the models that search by meaning stand: downloading
@@ -3172,10 +3228,10 @@ meaning on has the daemon get the models ready: it downloads them if they aren't
 every entry its vector, and `enter` on that row does it again. Turned off, the daemon lets the models go, and
 the memory they took with them.
 
-Last come the agents installed here that crystal can [hook](#hooks-in-other-agents-own-settings), each with how
-its hooks stand, as `crystal integration status` says: `installed`, `out of date` or `not installed`. `space`
-or `enter` puts crystal's hooks in the agent's own settings, or brings them up to date, and on one installed,
-takes them out again; the view says what's left to do, like reviewing Codex's in its `/hooks`.
+The integrations' tab lists the agents installed here that crystal can [hook](#hooks-in-other-agents-own-settings),
+each with how its hooks stand, as `crystal integration status` says: `installed`, `out of date` or `not
+installed`. `space` or `enter` puts crystal's hooks in the agent's own settings, or brings them up to date, and on
+one installed, takes them out again; the view says what's left to do, like reviewing Codex's in its `/hooks`.
 
 #### Profiles
 

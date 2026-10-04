@@ -612,7 +612,8 @@ impl Daemon {
     /// Stops the session called `name` and keeps it in the archive, out of
     /// the list. Written down before it stops: a session that couldn't be
     /// kept isn't stopped. Its open task is cancelled, as a kill does, but
-    /// it's kept open, to be open again when it starts again.
+    /// it's kept open, to be open again when it starts again. Then the
+    /// distiller reads what it did, as it would have once its task closed.
     fn archive(&self, name: &str) -> Result<Response> {
         let mut sessions = self.sessions.lock().unwrap();
         let index = sessions
@@ -631,9 +632,10 @@ impl Daemon {
         let cancelled = tasks::enabled(&settings())
             .then(|| session.cancel_task("its session was archived"))
             .flatten();
-        if let Some(cancelled) = cancelled {
-            self.write_down_closed(&session, &cancelled);
+        if let Some(cancelled) = &cancelled {
+            self.write_down_closed(&session, cancelled);
         }
+        self.distill_archived(&session, cancelled.as_ref());
         session.stop();
         if info.state == State::Running {
             self.events.emit(Event::ended(&info, "archived".into()));
@@ -1531,16 +1533,34 @@ impl Daemon {
     /// did, on a thread of its own, when memory is on and the config says
     /// to. A cancelled task did nothing anyone wanted kept.
     fn distill_later(&self, session: &Session, task: &TaskRecord) {
+        if read_as_it_closed(task) {
+            self.distill_in_background(session, Some(task));
+        }
+    }
+
+    /// Has the distiller read what `session` did as it's archived, when it
+    /// wasn't read as its task closed: a session with no task, or whose
+    /// task archiving it `cancelled`.
+    fn distill_archived(&self, session: &Session, cancelled: Option<&TaskRecord>) {
+        let task = cancelled.cloned().or_else(|| session.task_record());
+        if !task.as_ref().is_some_and(read_as_it_closed) {
+            self.distill_in_background(session, task.as_ref());
+        }
+    }
+
+    /// Has the distiller read what `session` did, on `task` if it had one,
+    /// on a thread of its own, when memory is on and the config says to,
+    /// and the session left something it can read.
+    fn distill_in_background(&self, session: &Session, task: Option<&TaskRecord>) {
         let config = settings();
-        let worth_reading = matches!(task.state(), TaskState::Done | TaskState::Failed);
-        if !memory::enabled(&config) || !config.memory.distill || !worth_reading {
+        if !memory::enabled(&config) || !config.memory.distill {
             return;
         }
         // A handover underway would only stop it halfway.
         if handover::underway() {
             return;
         }
-        let Some(job) = self.distill_job(session, Some(task), config.memory) else {
+        let Some(job) = self.distill_job(session, task, config.memory) else {
             return;
         };
         let Some(reading) = Reading::start(&self.distilling, &session.id) else {
@@ -2263,21 +2283,13 @@ impl Daemon {
                 self.prepare_embeddings(true);
                 Ok(Response::Done)
             }
-            Request::SearchMemory {
-                dir,
-                query,
-                kind,
-                limit,
-            } => {
+            Request::SearchMemory { dir, query, wanted } => {
                 crate::plugins::ensure_enabled(&settings(), "memory")?;
                 let project = memory::project_of(&dir);
                 let embedder = embed::shared_now();
                 let mut store = memory::Store::open(&self.socket)?;
-                let found =
-                    store.search(&project, &query, kind, limit, embed::as_embed(&embedder))?;
-                Ok(Response::Memory {
-                    entries: memory::marked(found, &project),
-                })
+                let entries = store.find(&project, &query, &wanted, embed::as_embed(&embedder))?;
+                Ok(Response::Memory { entries })
             }
             Request::Tasks { dir, all } => {
                 tasks::ensure_enabled(&settings())?;
@@ -2353,22 +2365,64 @@ impl Daemon {
                 daily_budget_usd: settings().tasks.daily_budget_usd,
             })),
             Request::BacklogList { dir, all } => {
-                backlog::ensure_enabled(&settings())?;
+                let config = settings();
+                backlog::ensure_enabled(&config)?;
                 let project = project::of(&dir);
                 let store = self.db.lock().unwrap().backlog(&project.path)?;
+                // Each item's history: the tasks started for one.
+                let tasks = if tasks::enabled(&config) {
+                    self.tasks(&dir, false)
+                } else {
+                    Vec::new()
+                };
+                let tasks = tasks
+                    .into_iter()
+                    .filter(|task| task.record.backlog.is_some());
                 Ok(Response::Backlog(Backlog {
                     project: project.name,
                     path: project.path,
                     items: store.items(all),
+                    tasks: tasks.collect(),
                 }))
             }
-            Request::BacklogAdd { dir, text, tags } => {
+            Request::BacklogAdd {
+                dir,
+                text,
+                body,
+                tags,
+            } => {
                 let (number, item) = self.change_backlog(&dir, |store| {
-                    let number = store.add(&text, tags, now_seconds())?;
+                    let number = store.add(&text, &body, tags, now_seconds())?;
                     Ok((number, store.get(number).cloned()))
                 })?;
                 self.tell_backlog(Kind::BacklogAdded, &dir, item);
                 Ok(Response::Added { number })
+            }
+            Request::BacklogEdit {
+                dir,
+                number,
+                text,
+                body,
+                tags,
+            } => {
+                self.change_backlog(&dir, |store| {
+                    store.edit(number, text.as_deref(), body.as_deref(), tags)
+                })?;
+                Ok(Response::Done)
+            }
+            Request::BacklogImport { dir, items } => {
+                let (added, skipped, new) = self.change_backlog(&dir, |store| {
+                    let (added, skipped) = store.import(&items, now_seconds())?;
+                    let new: Vec<_> = added
+                        .iter()
+                        .filter_map(|n| store.get(*n).cloned())
+                        .collect();
+                    Ok((added, skipped, new))
+                })?;
+                for item in new {
+                    self.tell_backlog(Kind::BacklogAdded, &dir, Some(item));
+                }
+                Ok(Response::Imported { added, skipped })
             }
             Request::BacklogMark { dir, number, done } => {
                 let item = self.change_backlog(&dir, |store| {
@@ -3180,6 +3234,12 @@ fn watch_for_hang_up(conn: &UnixStream) -> Result<Arc<AtomicBool>> {
     Ok(hung_up)
 }
 
+/// Whether the distiller reads what `task` did as it closes: once it's
+/// done or failed. A cancelled task did nothing anyone wanted kept.
+fn read_as_it_closed(task: &TaskRecord) -> bool {
+    matches!(task.state(), TaskState::Done | TaskState::Failed)
+}
+
 /// Tells of each entry of memory that goes stale, every file it's about
 /// changed since it was said: looks as the daemon starts, then each time
 /// `sweeps` asks and every [`STALE_SWEEP_EVERY`], while memory is on.
@@ -3575,10 +3635,11 @@ fn claude_tools(
 /// the background that did would sit there with its work done, and one
 /// driving workers would wait on each. A plugin's commands only while it's
 /// on. What removes or cancels what's there (`crystal kill`, `worktree rm`,
-/// `tasks cancel`, `flow cancel`, `backlog rm`, `memory rm`), what's the
-/// user's to decide (a flow's gate: `flow approve` and `back`), and what
-/// answers another agent's question for it (`send-keys` and `answer`, which
-/// can say yes to a permission) still ask.
+/// `tasks cancel`, `flow cancel`, `backlog rm`, `memory rm`), what writes
+/// in bulk from a file (`backlog import`), what's the user's to decide (a
+/// flow's gate: `flow approve` and `back`), and what answers another
+/// agent's question for it (`send-keys` and `answer`, which can say yes to
+/// a permission) still ask.
 ///
 /// A rule ending `:*` matches the command with any arguments or none, but
 /// only as whole words: `crystal send:*` isn't `crystal send-keys`, and
@@ -3631,6 +3692,9 @@ fn crystal_commands(config: &Config) -> Vec<&'static str> {
             "Bash(crystal backlog add:*)",
             "Bash(crystal backlog)",
             "Bash(crystal backlog --all)",
+            "Bash(crystal backlog list:*)",
+            "Bash(crystal backlog show:*)",
+            "Bash(crystal backlog edit:*)",
             "Bash(crystal backlog export)",
             "Bash(crystal backlog done:*)",
             "Bash(crystal backlog reopen:*)",
@@ -3644,6 +3708,8 @@ fn crystal_commands(config: &Config) -> Vec<&'static str> {
         rules.extend([
             "Bash(crystal remember:*)",
             "Bash(crystal memory)",
+            "Bash(crystal memory add:*)",
+            "Bash(crystal memory list:*)",
             "Bash(crystal memory search:*)",
             "Bash(crystal memory show:*)",
         ]);
@@ -4178,7 +4244,11 @@ mod tests {
             "Bash(crystal task:*)",
             "Bash(crystal flow run:*)",
             "Bash(crystal backlog done:*)",
+            "Bash(crystal backlog show:*)",
+            "Bash(crystal backlog edit:*)",
             "Bash(crystal memory search:*)",
+            "Bash(crystal memory list:*)",
+            "Bash(crystal memory add:*)",
         ] {
             assert!(rules.contains(&allowed), "{allowed}: {rules:?}");
         }
@@ -4193,7 +4263,9 @@ mod tests {
             "crystal flow approve",
             "crystal flow back",
             "crystal backlog rm",
+            "crystal backlog import",
             "crystal memory rm",
+            "crystal memory distill",
             "crystal memory promote",
             "crystal kill-server",
         ] {

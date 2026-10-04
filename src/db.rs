@@ -229,6 +229,12 @@ ALTER TABLE tasks ADD COLUMN brief TEXT;
 ALTER TABLE pending_tasks ADD COLUMN brief TEXT;
 ";
 
+/// A backlog item's body: more on it than its line says, empty for one
+/// with none.
+const BACKLOG_BODIES: &str = "
+ALTER TABLE backlog ADD COLUMN body TEXT NOT NULL DEFAULT '';
+";
+
 /// The pull request and the issue a session is about, apart from any task
 /// it has, as JSON (see [`crate::protocol::TaskBrief`]): its agent is told
 /// of them each time it starts. `NULL` for a session about neither.
@@ -249,6 +255,7 @@ const MIGRATIONS: &[&str] = &[
     PROJECTS,
     ARCHIVED,
     BRIEFS,
+    BACKLOG_BODIES,
     ABOUT,
 ];
 
@@ -261,7 +268,7 @@ const RUN_COLUMNS: &str =
 const TASK_COLUMNS: &str = "project_name, goal, session, branch, background, backlog, failed, \
                             summary, closed, number, created, cancelled, brief";
 const PENDING_COLUMNS: &str = "number, goal, cwd, name, start, backlog, created, brief";
-const ITEM_COLUMNS: &str = "number, text, tags, done, created, closed";
+const ITEM_COLUMNS: &str = "number, text, tags, done, created, closed, body";
 const ARTIFACT_COLUMNS: &str = "kind, name, path, bytes";
 
 /// The database of the daemon at `socket`, open.
@@ -969,7 +976,8 @@ fn write_backlog(conn: &Connection, project: &str, store: &backlog::Store) -> Re
     for item in &store.items {
         conn.execute(
             &format!(
-                "INSERT INTO backlog (project, {ITEM_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
+                "INSERT INTO backlog (project, {ITEM_COLUMNS}) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
             ),
             params![
                 project,
@@ -979,6 +987,7 @@ fn write_backlog(conn: &Connection, project: &str, store: &backlog::Store) -> Re
                 item.done,
                 item.created,
                 item.closed,
+                item.body,
             ],
         )?;
     }
@@ -993,6 +1002,7 @@ fn item_of(row: &Row) -> Result<BacklogItem> {
         done: row.get(3)?,
         created: row.get(4)?,
         closed: row.get(5)?,
+        body: row.get(6)?,
     })
 }
 
@@ -1333,11 +1343,11 @@ mod tests {
         let app = Path::new("/code/app");
         let first = db
             .change_backlog(app, |store| {
-                store.add("write the docs", vec!["docs".into()], 5)
+                store.add("write the docs", "the guide", vec!["docs".into()], 5)
             })
             .unwrap();
         let second = db
-            .change_backlog(app, |store| store.add("fix the cart", Vec::new(), 6))
+            .change_backlog(app, |store| store.add("fix the cart", "", Vec::new(), 6))
             .unwrap();
         assert_eq!((first, second), (1, 2));
         db.change_backlog(app, |store| store.mark(1, true, 9))
@@ -1352,9 +1362,12 @@ mod tests {
         assert_eq!(store.items.len(), 1);
         let item = &store.items[0];
         assert_eq!((item.number, item.done, item.closed), (1, true, Some(9)));
-        assert_eq!(item.tags, ["docs"]);
+        assert_eq!(
+            (&item.tags[..], &item.body[..]),
+            (&["docs".to_string()][..], "the guide")
+        );
         let third = db
-            .change_backlog(app, |store| store.add("third", Vec::new(), 10))
+            .change_backlog(app, |store| store.add("third", "", Vec::new(), 10))
             .unwrap();
         assert_eq!(third, 3, "a removed item's number isn't given again");
         assert!(
@@ -1598,7 +1611,7 @@ mod tests {
         let (app, api) = (Path::new("/code/app"), Path::new("/code/api"));
         db.list_project(app, true).unwrap();
         db.list_project(api, true).unwrap();
-        db.change_backlog(api, |store| store.add("tidy up", Vec::new(), 1))
+        db.change_backlog(api, |store| store.add("tidy up", "", Vec::new(), 1))
             .unwrap();
         assert_eq!(db.listed_projects().unwrap(), vec![api, app]);
         db.list_project(api, false).unwrap();
@@ -1667,8 +1680,8 @@ mod tests {
         let old = state::project_dir(&socket, app);
         fs::create_dir_all(&old).unwrap();
         let mut store = backlog::Store::default();
-        store.add("from before", Vec::new(), 1).unwrap();
-        store.add("removed", Vec::new(), 2).unwrap();
+        store.add("from before", "", Vec::new(), 1).unwrap();
+        store.add("removed", "", Vec::new(), 2).unwrap();
         store.remove(2).unwrap();
         fs::write(
             old.join(OLD_BACKLOG),
@@ -1687,7 +1700,7 @@ mod tests {
         assert!(old.join("backlog.json.imported").exists());
         assert!(old.join("tasks.jsonl.imported").exists());
         let next = db
-            .change_backlog(app, |store| store.add("new", Vec::new(), 3))
+            .change_backlog(app, |store| store.add("new", "", Vec::new(), 3))
             .unwrap();
         assert_eq!(next, 3);
         db.record_task(app, &closed("after", 4)).unwrap();
