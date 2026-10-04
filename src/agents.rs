@@ -14,6 +14,7 @@
 use crate::agent_rules;
 use crate::catalog;
 use crate::codex;
+use crate::printable;
 use crate::protocol::{AgentEvent, Conversation, Subagent};
 use crate::shell;
 use serde_json::{Value, json};
@@ -459,10 +460,30 @@ pub fn resume_typed(agent: &str, id: &str) -> Option<Vec<String>> {
     Some(argv)
 }
 
+/// The longest conversation id crystal puts on a command line, as herdr
+/// takes them.
+const LONGEST_ID: usize = 512;
+
+/// Whether `id`, as an agent's hooks named it, can go on a command line,
+/// and be typed into any shell and read the same: something, not too long,
+/// not taken for an option, with no quote, and nothing a terminal takes as
+/// an order (see [`printable`]).
+fn fits_a_command_line(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= LONGEST_ID
+        && !id.starts_with('-')
+        && !id.contains('\'')
+        && !id.contains(printable::is_unprintable)
+}
+
 /// What chooses `agent`'s conversation `id` on its command line, as each
 /// agent takes it (herdr's list): `None` for an agent crystal can't
-/// resume. Claude Code's and Codex's own command lines are [`argv`]'s.
+/// resume, or an id that can't go on a command line. Claude Code's and
+/// Codex's own command lines are [`argv`]'s.
 fn resume_args(agent: &str, id: &str) -> Option<Vec<String>> {
+    if !fits_a_command_line(id) {
+        return None;
+    }
     let option = match agent {
         "codex" => "resume",
         "claude" | "cursor" | "droid" | "qodercli" | "qwen" | "devin" | "hermes" | "grok" => {
@@ -697,6 +718,24 @@ mod tests {
         );
         assert_eq!(resume_typed("letta", "default:"), None);
         assert_eq!(resume_typed("gemini", "x"), None);
+        // An id a shell or a terminal could take for more than an id isn't
+        // typed in, or run.
+        for hostile in [
+            "",
+            "--yolo",
+            "k'1",
+            "k-1\nrm -rf ~",
+            "k-1\u{1b}]52;c;eA==\u{7}",
+            "\u{202e}1-k",
+        ] {
+            assert_eq!(resume_typed("kimi", hostile), None, "{hostile:?}");
+        }
+        assert_eq!(resume_typed("kimi", &"k".repeat(LONGEST_ID + 1)), None);
+        let typed = resume_typed("pi", "/s/my session.jsonl").unwrap();
+        assert!(crate::report::check_resume(&typed).is_ok());
+        let asked = command(&["kimi"]);
+        let crystal = Path::new("/bin/crystal");
+        assert_eq!(argv(&asked, crystal, Some("--yolo"), None, &[]), asked);
     }
 
     #[test]
