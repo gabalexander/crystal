@@ -113,6 +113,10 @@ and the footer says where you are and offers the keys that matter there, or, whe
 | `W` | remove the selected worktree, once nothing runs in it and you've said `y` |
 | `r` | rename the selected session |
 | `x` | kill the selected session, once you've said `y` |
+| `A` | [archive](#archiving-and-idle-agents) the selected session, once you've said `y`: it stops and leaves the list, to start again where it was |
+| `Z` | the archive: start an archived session again, in its conversation, or delete it |
+| `!` | run the selected worktree's [project](#projects), with its `run` command, in a terminal of its own; again, stop it |
+| `.` | open the selected worktree with its project's `open` command, like `code .` |
 | `u` | select the next session that needs you: waiting on you first, then done |
 | `U` | list everything that [needs you](#timeline), in every tab, and answer a permission or a gate where it stands |
 | `a` | the [timeline](#timeline): what happened, the newest first, as it happens |
@@ -154,7 +158,10 @@ inline through a scroll region, like Codex. To search that history, or copy from
 [copy mode](#zoom-copy-mode-and-search), and `e` opens it in your editor.
 
 The mouse works too. Click a session in the sidebar to select it, or click a pane to type into it. The wheel
-moves the selection over the sidebar, and scrolls a pane through its history. Drag across a pane to select
+moves the selection over the sidebar, and scrolls a pane through its history. A right click opens a menu of
+what you can do with what it's on: a session, a worktree or a project in the sidebar, a tab, or a pane. Each
+item is a key from the table above, shown beside it, and does just what that key would there; choose one with
+a click, `Enter`, or its key, and `Esc` or a click elsewhere closes the menu. Drag across a pane to select
 text: it goes to your clipboard as you let go, and stays marked until you click or type. A program that asks
 for the mouse itself, like `vim` with `set mouse=a` or `htop`, gets the clicks, drags and the wheel in its pane
 while that pane has the keyboard; there, your terminal's own selection still works with a key held: `Shift` in
@@ -217,6 +224,10 @@ A linked worktree with no sessions left stays at the end of its project, with a 
 until it's removed: it's still on disk, maybe with work in it. Select it, and `n` or `Enter` starts something
 there, `d` and `p` show its changes and files, and `W` removes it. It shows in every tab its project has
 sessions in. One made or removed outside crystal comes or goes within a few seconds.
+
+A [project](#projects) with no sessions at all stays too: after those with sessions, in every tab, its main
+worktree with a `· no sessions` row under it, and its linked worktrees after. `n` or `Enter` there starts
+something in it, and `W` takes it off the list, which changes nothing on disk.
 
 Each row says what its session is doing. Within a worktree the agents come first, then a `terminals` line and
 the terminals: shells, and any other program that isn't an agent, drawn quieter. A project with a session
@@ -302,6 +313,11 @@ crystal read review --history               # and what scrolled off it before
 crystal rename review reviewer              # give a session another name
 crystal respawn reviewer                    # run an ended session again; an agent in its conversation
 crystal kill review                         # stop one session
+crystal archive review                      # stop it and keep it in the archive, out of the list
+crystal unarchive review                    # start it again where it was, in its conversation
+crystal ls --archived                       # the archived sessions
+crystal project                             # the projects crystal knows, running or not
+crystal project run                         # run this worktree's project in a session of its own
 crystal kill-server                         # stop every session, and the daemon
 crystal restart-server                      # restart the daemon on this crystal, say after an upgrade
 crystal restart-server --cold               # stop it and start it again: sessions start again too
@@ -483,7 +499,7 @@ Under the task, `Tab` and `Shift+Tab` go from row to row and `←` / `→` chang
   `--effort`, `--permission-mode`), or Codex's **model** and **approvals** (`-m`, `-a`), its models the ones
   `codex debug models` lists. Left at `default`, no option is added.
 - **start in**: here (the selected session's worktree, or where you started `crystal`), a new worktree, or
-  another project's main worktree.
+  the main worktree of another of the [projects](#projects) crystal knows, sessions running there or not.
 
 A new worktree's **branch** gets a made-up name, an adjective and an animal like `brave-otter`, whatever the
 task says; type in that row to change it. A made-up name is always a new branch: if it's taken, the worktree
@@ -495,6 +511,62 @@ The panel ends with the command it runs and, for a new worktree, where. `Ctrl+E`
 bottom line, `new session:`, to change it or run anything else: `npm run dev` or `sh -c 'make && make test'`
 work there, and an empty line starts your shell. Aider can't be given a task when it starts, so for it the
 task box gives way to a note.
+
+### Archiving and idle agents
+
+`A` archives the selected session, once you've said `y`: it stops, as `x` would, and leaves the list, but
+crystal keeps what it takes to start it again, in the archive. `Z` opens the archive, the latest archived
+first, each with where it ran and how long ago: `Enter` starts the one the bar is on again, under its name (or
+the next one free, if that's been taken since), and `x` deletes it for good once you've said `y`. Claude Code
+and Codex come back in the conversation they were in, as after a restart, and so does an agent that
+[said how to resume it](#teaching-crystal-about-your-agent); anything else starts its command again from the
+top, and the archive says which. An archived session's open task is cancelled, and open again when it comes
+back. From the command line, `crystal archive <name>`, `crystal unarchive <name>` and `crystal ls --archived`
+do the same, and `crystal kill` on an archived name deletes it.
+
+An agent you've left alone can be stopped for you, to free what it holds. With `stop_idle_after` under
+`[sessions]` in the [settings](#settings), say `"30m"`, crystal stops an agent that has sat at its prompt that
+long, its turn seen, with nobody watching it or typing into it. It stays in the list, its row saying
+`stopped idle`, and `Enter` (or `crystal respawn`) starts it again in its conversation. Only an agent that can
+come back where it was is stopped: Claude Code or Codex once crystal knows its conversation, or an agent that
+said how to resume it. A turn that ended while you were away waits for you (`✓`) however long it takes, and so
+does one asking you something; terminals, background tasks and sessions with their task open are never
+stopped. It's off until you set it, from the file or the [settings view](#the-settings-view).
+
+### Projects
+
+crystal keeps a list of the projects you work in: every git repository a session has run in, and those you
+add. A project with no sessions stays in the sidebar and in the new-session panel's "start in", so you can
+start something there without a terminal of your own in it. `crystal project` lists them with how many
+sessions each has (`--json` for scripts), `crystal project add [dir]` adds the repository a directory is in, and
+`crystal project rm [dir]` (or `W` on its row in the sidebar) takes one off the list. Its backlog, tasks and
+memory stay, and it's back as soon as a session runs there again.
+
+A project can say how it's run and how it's opened, in `.crystal/project.toml` at the top of a worktree:
+
+```toml
+run = "npm run dev"     # runs the project, in a terminal of its own
+open = "code ."         # opens the worktree, say in your editor
+```
+
+`!` in the sidebar runs the selected session's worktree's `run` command in a session of its own there, called
+`run-` and the worktree's directory (`run-app`, `run-fix-login`), and leaves the keyboard where it was; `!`
+again asks to stop it, and on one that has ended starts it again. `.` runs the `open` command in the worktree,
+in the background, its output thrown away. Both are shell lines, run by your `$SHELL` in the worktree's
+directory. A linked worktree without a file of its own uses the main worktree's, so commit the file and every
+worktree has it. To keep it out of the repository, or to say otherwise for yourself, a `[[project]]` table in the
+[settings](#settings) takes its place:
+
+```toml
+[[project]]
+path = "~/code/app"     # the project's main worktree
+run = "npm run dev -- --port 3001"
+open = "cursor ."
+```
+
+`crystal project run` and `crystal project open` do the same from the command line, in the worktree you're in
+or the one `-C` names; `crystal project run --stop` stops it. The command opens on the machine crystal runs on,
+so over [ssh](#other-machines) `open` runs on the other machine.
 
 ### The diff
 
@@ -1686,6 +1758,7 @@ matched anywhere in the link unless `^` and `$` pin it. `X` lists each plugin's 
 | `session.idle` | a session's agent is at its prompt, its turn seen |
 | `session.ended` | a session's program ends, or the session is killed |
 | `session.removed` | a session leaves the list: killed, or its worktree removed |
+| `session.archived` | a session is stopped and kept in the archive: `A`, or `crystal archive` |
 | `session.claimed` | an agent takes over saying what a session is doing, with [`crystal report`](#teaching-crystal-about-your-agent) |
 | `session.released` | it lets go: `crystal report --release`, or it left and the shell is back in front |
 | `task.opened` | a task is made: given to a session as it starts, made to start later, or opened again by a follow-up |
@@ -1766,6 +1839,8 @@ file and change. A setting crystal doesn't know is an error that names it, so a 
 | `[events]` | | `keep_days`, how long the [event log](#events) keeps what happened: 30 days, or `0` for ever |
 | `[handoff]` | | `in_git`, the projects, by their main worktree, whose [handoff notes](#the-handoff-file) go in git |
 | `[worktrees]` | | `base`, the branch new worktrees' new branches [start from](#usage): `origin`'s default branch unless set |
+| `[sessions]` | | `stop_idle_after`, how long an agent may sit [idle](#archiving-and-idle-agents) before crystal stops it, like `"30m"`: `"off"` |
+| `[[project]]` | | a project's [run and open commands](#projects), by its main worktree's `path`, in place of its own file's |
 
 `dark` and `light` paint their own background, so crystal looks the same in any terminal; `terminal` paints
 nothing and uses your terminal's own colors. With `NO_COLOR` set, crystal uses no color at all.
@@ -1784,7 +1859,8 @@ offered as a profile of its own.
 
 The daemon reads the notification settings each time it tells you something, `[plugins]` each time it
 does something a plugin adds, `[memory]` each time a task closes or a search runs, `[tasks]` each time a
-background task's run starts, `[handoff]` each time a note is written, a flow each time one starts,
+background task's run starts, `[handoff]` each time a note is written, `[sessions]` every 15 seconds, a flow
+each time one starts, `[[project]]` each time a project's commands run,
 `name_from_prompt` each time it names a session, `resume_reported_agents` as it starts sessions again and
 `scrollback_lines` as each session starts, so a change counts straight away (a session already running keeps
 what it had); the TUI reads `new_session`, `theme`, `scrollback_lines`, `[plugins]`, the profiles and
@@ -1794,8 +1870,10 @@ settings view is open.
 #### The settings view
 
 `,` in the sidebar opens the settings you'd otherwise change in the file: notifications and when they come,
-the theme, and how memory learns ([the distiller](#the-distiller)) and searches ([by meaning](#search-by-meaning)). `space`
-changes the one the bar is on, and `←/→` go through the themes and the waits before a notification. Each change is written to the file at once,
+the theme, how long an agent may sit [idle](#archiving-and-idle-agents), and how memory learns
+([the distiller](#the-distiller)) and searches ([by meaning](#search-by-meaning)). `space` changes the one the
+bar is on, and `←/→` go through the themes, the waits before a notification, and the times an agent may sit
+idle: off, 15 minutes, 30, an hour, two or eight. Each change is written to the file at once,
 keeping the rest of it as you wrote it, comments and all, and counts straight away: the TUI repaints in a new
 theme, and the daemon reads the rest as it goes.
 
@@ -1896,6 +1974,7 @@ over, the daemon is restarted cold from the sessions it wrote down first.
 - [x] An event log, a stream of events on the socket, and waits on it
 - [x] Any agent saying what it's doing and how to resume it, and sessions named from their first prompt
 - [x] Restart the daemon on a new crystal without stopping its sessions
+- [x] Archived sessions, idle agents stopped, right-click menus, and projects kept with their run and open commands
 
 ## Development
 

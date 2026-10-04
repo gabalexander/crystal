@@ -82,6 +82,12 @@ whenever what's handed over changes in a way the crystal before couldn't read.
     following the selection: laying them out, borders, the pane beside another on screen, splitting, closing,
     swapping, resizing within each pane's least size, dragging a border, evening them out, and folding the tree
     into a value; pure, so it's unit-tested
+  - `archived_view.rs`: the archive (`Z`): the sessions `A` archived, the latest first, one started again or
+    deleted after a `y`; its state and keys, kept apart from I/O (the event loop asks the daemon), and its
+    drawing
+  - `menu.rs`: the menu a right click opens on a session, a worktree, a project, a tab or a pane: each item a
+    sidebar key in words, chosen with a click, Enter or the key itself; its state, keys, where it's drawn and
+    what's under the mouse. The App says what's in it, and carries an item out by pressing its key
   - `layouts.rs`: the layouts view (`S`): the tabs saved under a name and put back, and the tabs a restore
     replaced; its state and keys, kept apart from I/O (the event loop keeps them in the database), and its
     drawing
@@ -159,8 +165,9 @@ whenever what's handed over changes in a way the crystal before couldn't read.
     each changed with a key, and how the model stands; the event loop writes the file (`config::set`) and,
     while it's open, reads the settings and the daemon's `EmbeddingStatus` again every half a second
 - `src/daemon.rs`: the daemon: listens on the socket and owns the sessions, and emits an event wherever something
-  happens to them, their tasks, flows, worktrees, memory or backlog; hands itself over to a new crystal, and
-  takes over from the daemon that handed over
+  happens to them, their tasks, flows, worktrees, memory or backlog; archives sessions and starts them again,
+  stops agents left idle past `[sessions] stop_idle_after`, and keeps the list of projects sessions ran in;
+  hands itself over to a new crystal, and takes over from the daemon that handed over
 - `src/handover.rs`: handing the daemon over to a newly installed crystal by exec in its own process, the
   sessions carrying on: what's handed over and its `FORMAT`, the file it's written to and read from, keeping
   descriptors open across the exec, the readers it stops, the gate connections come in through, the helpers
@@ -189,7 +196,7 @@ whenever what's handed over changes in a way the crystal before couldn't read.
 - `src/typing.rs`: typing into a session the way a person would: pastes marked, Enter on its own
 - `src/session.rs`: one program in a PTY, or a task: spawn, exit status, stop, its screen, viewers and listeners,
   the agent that says what it's doing itself while it holds the session, whether its first prompt can name
-  it, and what has changed in it (its agent's activity, a task's runs) for the daemon to tell; handing it over
+  it, how long its agent has sat idle (nobody watching or typing, its turn seen), and what has changed in it (its agent's activity, a task's runs) for the daemon to tell; handing it over
   and adopting it, its PTY on a descriptor of crystal's own
 - `src/vt.rs`: a terminal's screen, through `alacritty_terminal`: what a program drew and its history, the modes
   it set, its answers to the program's questions (the daemon's screen only), the output that catches a new viewer
@@ -238,13 +245,18 @@ whenever what's handed over changes in a way the crystal before couldn't read.
 - `src/server_cli.rs`: `crystal server`: every server with whether it's running and how many sessions it has,
   stopping one, and deleting a stopped one's state
 - `src/db.rs`: the SQLite database the daemon and the TUI keep their state in (WAL, `synchronous=NORMAL`,
-  migrations by `user_version`, as docket does): the sessions to start again, flow runs, each project's backlog
-  and closed tasks, the files tasks kept, the tasks waiting to start and the last task number, what background
+  migrations by `user_version`, as docket does): the sessions to start again, the archived sessions, flow runs,
+  the projects on crystal's list, each project's backlog and closed tasks, the files tasks kept, the tasks waiting to start and the last task number, what background
   tasks spent each day, the event log, read from a point on or a page at a time back from its end, and the TUI's
   tabs, layouts, the new-session panel's memory, the diff view's reviewed marks and the latest event the user
   had seen, each a JSON document; and bringing in the JSON files from before, a project's the first time it's
   asked for. Settings stay in the config file and memory in `memory.db`
 - `src/project.rs`: the project a directory is in: its git main worktree, or the directory itself outside git
+- `src/project_commands.rs`: a project's `run` and `open` commands, from the config's `[[project]]`, or else the
+  worktree's `.crystal/project.toml`, or else the main worktree's; the command a run session runs and its name
+  (`run-app`), which session is a worktree's run, and running `open` in the background
+- `src/project_cli.rs`: `crystal project`: the projects crystal knows, adding and taking one off the list, and
+  running or opening the project in a worktree
 - `src/tasks.rs`: tasks, sessions started with something to do: the paragraph an agent is told about
   `crystal done`, the reminder for one that ends a turn with its task open, reading a project's closed tasks
   from the file they were kept in before the database, numbering tasks (`t12`) and showing a task waiting to

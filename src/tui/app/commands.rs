@@ -484,6 +484,7 @@ mod tests {
 
     fn session(name: &str) -> SessionInfo {
         SessionInfo {
+            stopped_idle: false,
             name: name.into(),
             id: format!("id-{name}"),
             command: vec!["sh".into()],

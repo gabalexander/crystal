@@ -179,7 +179,7 @@ pub fn rows(
 
 /// The rows of the worktrees in `empty` that are `project`'s, in the order
 /// they come: each one's heading, and the row saying it has no sessions.
-fn empty_rows(empty: &[Worktree], project: &Path) -> Vec<Row> {
+pub fn empty_rows(empty: &[Worktree], project: &Path) -> Vec<Row> {
     let mut rows = Vec::new();
     for worktree in empty.iter().filter(|w| w.project_path == project) {
         rows.push(Row::Worktree {
@@ -343,6 +343,7 @@ mod tests {
             branch: Some(branch.into()),
         });
         SessionInfo {
+            stopped_idle: false,
             front: None,
             name: name.into(),
             id: name.into(),

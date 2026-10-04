@@ -6,6 +6,7 @@
 
 mod commands;
 
+use super::archived_view::{self, ArchivedView};
 use super::away::{Away, Tally};
 use super::backlog_view::{BacklogChange, BacklogView, Step};
 use super::command_line;
@@ -18,6 +19,7 @@ use super::issues::{self, IssuesView};
 use super::launcher::{self, Launcher, Memory, Run, Setup, Target};
 use super::layouts::{self, Layouts, LayoutsView, Which};
 use super::memory_view::MemoryView;
+use super::menu::{self, Item, Menu};
 use super::needs_you::{self, NeedsYouView};
 use super::plugins_view::{self, PluginsView};
 use super::preview::Content;
@@ -42,8 +44,10 @@ use crate::flows::{self, Flow};
 use crate::forge::{self, Checkout, Forge, Issue, PullRequest, PullRequestDetail, Topic};
 use crate::keys;
 use crate::profile::{self, Profile};
+use crate::project_commands::Verb;
 use crate::protocol::{
-    Activity, Answer, Backlog, Front, SessionInfo, Spending, State, TaskSpec, Worktree,
+    Activity, Answer, ArchivedSession, Backlog, Front, SessionInfo, Spending, State, TaskSpec,
+    Worktree,
 };
 use crate::shell;
 use crate::{backlog, names, plugins, tasks};
@@ -224,6 +228,8 @@ pub enum Question {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Confirm {
     Kill(String),
+    /// Stop this session and keep it in the archive.
+    Archive(String),
     /// Start this ended session's command again.
     Respawn(String),
     /// Remove the linked worktree at `path`, which is on `branch`: with
@@ -238,6 +244,12 @@ pub enum Confirm {
         number: usize,
         sessions: Vec<String>,
     },
+    /// Take the project called `name`, whose main worktree is `path`, off
+    /// the list of those crystal knows.
+    ForgetProject {
+        path: PathBuf,
+        name: String,
+    },
 }
 
 impl Confirm {
@@ -245,6 +257,9 @@ impl Confirm {
     pub fn question(&self) -> String {
         match self {
             Confirm::Kill(name) => format!("kill {name}? y/n"),
+            Confirm::Archive(name) => {
+                format!("archive {name}? It stops; Z starts it again where it was. y/n")
+            }
             Confirm::Respawn(name) => format!("start {name} again? y/n"),
             Confirm::RemoveWorktree {
                 branch,
@@ -261,6 +276,9 @@ impl Confirm {
                 let noun = if count == 1 { "session" } else { "sessions" };
                 format!("close tab {number} and kill its {count} {noun}? y/n")
             }
+            Confirm::ForgetProject { name, .. } => {
+                format!("take {name} off the list? Nothing on disk changes. y/n")
+            }
         }
     }
 
@@ -268,6 +286,7 @@ impl Confirm {
     fn action(self) -> Action {
         match self {
             Confirm::Kill(name) => Action::Kill(name),
+            Confirm::Archive(name) => Action::Archive(name),
             Confirm::Respawn(name) => Action::Respawn(name),
             Confirm::RemoveWorktree {
                 path,
@@ -279,8 +298,20 @@ impl Confirm {
                 force,
             },
             Confirm::CloseTab { sessions, .. } => Action::KillAll(sessions),
+            Confirm::ForgetProject { path, .. } => Action::ForgetProject(path),
         }
     }
+}
+
+/// The menu for a tab, once it's in front.
+fn tab_menu() -> Vec<Item> {
+    vec![
+        Item::new("new tab", 't'),
+        Item::new("name it", 'T'),
+        Item::new("saved layouts", 'S'),
+        Item::new("the archive", 'Z'),
+        Item::danger("close it", '&'),
+    ]
 }
 
 /// What a key asks the event loop to do.
@@ -339,8 +370,25 @@ pub enum Action {
         change: BacklogChange,
     },
     Kill(String),
+    /// Stop this session and keep it in the archive.
+    Archive(String),
+    /// Ask the daemon for the archive, and open the archive on it.
+    ListArchived,
+    /// Start the archived session with this id again.
+    Unarchive(String),
+    /// Take the archived session with this id out of the archive for good.
+    DeleteArchived(String),
     /// Kill each of these sessions: those of a tab that was closed.
     KillAll(Vec<String>),
+    /// Take the project whose main worktree is this off the list of those
+    /// crystal knows.
+    ForgetProject(PathBuf),
+    /// Run the project's run command in `worktree`, or stop it, or its open
+    /// command there.
+    ProjectCommand {
+        which: Verb,
+        worktree: Worktree,
+    },
     Rename {
         name: String,
         new_name: String,
@@ -603,12 +651,16 @@ pub struct App {
     sessions: Vec<SessionInfo>,
     /// An index into `sessions`, kept in range while there are any.
     selected: usize,
-    /// The linked worktree with no sessions the selection is on instead,
-    /// by its directory, when it's on one: see [`Row::NoSessions`].
+    /// The worktree with no sessions the selection is on instead, by its
+    /// directory, when it's on one: see [`Row::NoSessions`].
     on_worktree: Option<PathBuf>,
     /// Each project's linked worktrees, by its main worktree, as git last
     /// listed them. Those with no sessions stay in the sidebar.
     worktrees: HashMap<PathBuf, Vec<Worktree>>,
+    /// The main worktrees of the projects crystal knows, as the daemon last
+    /// listed them: those with no sessions stay in the sidebar, and the
+    /// new-session panel offers them all.
+    known: Vec<Worktree>,
     /// The worktrees git is removing, off the loop, by their directories:
     /// their lines say so, and `W` leaves them be until git is done.
     removing: HashSet<PathBuf>,
@@ -723,6 +775,10 @@ pub struct App {
     backlog: Option<BacklogView>,
     /// The layouts view, while it's open.
     layouts: Option<LayoutsView>,
+    /// The archive, while it's open.
+    archived: Option<ArchivedView>,
+    /// The menu a right click opened, while it's open.
+    menu: Option<Menu>,
     /// How many backlog items each project has to do, by its main
     /// worktree.
     backlog_counts: HashMap<PathBuf, usize>,
@@ -759,6 +815,7 @@ impl App {
             selected: 0,
             on_worktree: None,
             worktrees: HashMap::new(),
+            known: Vec::new(),
             removing: HashSet::new(),
             prompt: None,
             launcher: None,
@@ -803,6 +860,8 @@ impl App {
             closing: None,
             backlog: None,
             layouts: None,
+            archived: None,
+            menu: None,
             backlog_counts: HashMap::new(),
             flows: Vec::new(),
             flow_defs: Vec::new(),
@@ -1308,10 +1367,60 @@ impl App {
         let mut rows = groups::rows(&self.sessions, self.shown_flows(), &empty, |index| {
             shown.contains(&index)
         });
+        // The projects with no sessions go after those with some, ahead of
+        // the sessions outside any repository.
+        if self.filter.is_none() {
+            let mut quiet = Vec::new();
+            for project in self.quiet_projects() {
+                quiet.push(Row::Project {
+                    name: project.project.clone(),
+                    path: project.path.clone(),
+                });
+                quiet.push(Row::Worktree {
+                    project: project.path.clone(),
+                    path: project.path.clone(),
+                    branch: project.branch.clone(),
+                    main: true,
+                });
+                quiet.push(Row::NoSessions(project.path.clone()));
+                quiet.extend(groups::empty_rows(&empty, &project.path));
+            }
+            let at = rows
+                .iter()
+                .position(|row| *row == Row::OutsideGit)
+                .unwrap_or(rows.len());
+            rows.splice(at..at, quiet);
+        }
         if !self.tasks_on {
             rows.retain(|row| !matches!(row, Row::Task(_)));
         }
         rows
+    }
+
+    /// The projects crystal knows that no session is in, in any tab, by
+    /// their main worktrees: they come last in the sidebar, in every tab.
+    fn quiet_projects(&self) -> Vec<&Worktree> {
+        self.known
+            .iter()
+            .filter(|project| {
+                !self.sessions.iter().any(|session| {
+                    let worktree = session.worktree.as_ref();
+                    worktree.is_some_and(|w| w.project_path == project.path)
+                })
+            })
+            .collect()
+    }
+
+    /// Takes the projects crystal knows, by their main worktrees, as the
+    /// daemon listed them.
+    pub fn set_known_projects(&mut self, projects: Vec<Worktree>) {
+        self.known = projects;
+        self.keep_selection_on_a_row();
+    }
+
+    /// The projects crystal knows, by their main worktrees.
+    pub fn known_projects(&self) -> &[Worktree] {
+        &self.known
     }
 
     /// The linked worktrees git listed that no session is in, in any tab.
@@ -1390,6 +1499,7 @@ impl App {
         self.worktrees
             .values()
             .flatten()
+            .chain(&self.known)
             .find(|worktree| worktree.path == *path)
     }
 
@@ -1549,6 +1659,27 @@ impl App {
     /// The layouts view, while it's open.
     pub fn layouts_view(&self) -> Option<&LayoutsView> {
         self.layouts.as_ref()
+    }
+
+    /// The archive, while it's open.
+    pub fn archived_view(&self) -> Option<&ArchivedView> {
+        self.archived.as_ref()
+    }
+
+    /// Takes the archive as the daemon gave it, or why it couldn't: opens
+    /// the view on it, or shows it there if it's open.
+    pub fn show_archived(&mut self, found: Result<Vec<ArchivedSession>, String>) {
+        match &mut self.archived {
+            Some(view) => view.set_archived(found),
+            None => self.archived = Some(ArchivedView::new(found)),
+        }
+    }
+
+    /// The archived session called `name` has started again: the archive
+    /// closes, and the selection goes to it.
+    pub fn unarchived(&mut self, name: &str) {
+        self.archived = None;
+        self.select(name);
     }
 
     /// Takes the layouts as they were read, or why they couldn't be: opens
@@ -2164,6 +2295,10 @@ impl App {
         if self.view.is_some() {
             return self.on_view_key(key);
         }
+        if let Some(menu) = &mut self.menu {
+            let step = menu.on_key(&key);
+            return self.follow_menu(step);
+        }
         // The arrows turn the list of keys' pages. Any other key closes it,
         // and does nothing else: the key that closes it may be one the user
         // was only reading about.
@@ -2214,6 +2349,9 @@ impl App {
         }
         if self.layouts.is_some() {
             return self.on_layouts_key(key);
+        }
+        if self.archived.is_some() {
+            return self.on_archived_key(key);
         }
         if self.launcher.is_some() {
             return self.on_launcher_key(key);
@@ -2400,6 +2538,227 @@ impl App {
         None
     }
 
+    /// The menu a right click opened, while it's open.
+    pub fn menu(&self) -> Option<&Menu> {
+        self.menu.as_ref()
+    }
+
+    /// Opens the menu for what the right click at the screen's `at` was on:
+    /// a session, a worktree or a project in the sidebar, which it selects
+    /// first, a tab, which it goes to, or a pane, whose session it selects.
+    /// Not while something else waits on the keyboard.
+    pub fn right_click(&mut self, hit: Hit, at: (u16, u16)) -> Option<Action> {
+        self.menu = None;
+        if self.view.is_some() || self.showing_keys() || self.waiting_on_keyboard() {
+            return None;
+        }
+        let items = match hit {
+            Hit::SidebarRow(row) => self.sidebar_menu(row)?,
+            Hit::Tab(index) => {
+                self.go_to_tab(index);
+                tab_menu()
+            }
+            Hit::Pane { slot, .. } => {
+                let name = self.pane_session(slot)?.name.clone();
+                self.select(&name);
+                self.session_menu(true)?
+            }
+            _ => return None,
+        };
+        self.notice = None;
+        self.resizing = false;
+        if matches!(self.focus, Focus::Copy(_)) {
+            self.stop_copying();
+        }
+        self.focus = Focus::Sidebar;
+        self.menu = Some(Menu::new(at, items));
+        self.remember_shown();
+        None
+    }
+
+    /// What the mouse does while the menu is open, at the screen's `column`
+    /// and `row`: moving over an item puts the bar on it, a click on one
+    /// chooses it, and a click anywhere else closes the menu.
+    pub fn menu_mouse(&mut self, kind: MouseEventKind, column: u16, row: u16) -> Option<Action> {
+        let screen = self.screen;
+        let menu = self.menu.as_mut()?;
+        let on = menu.item_at(screen, column, row);
+        match kind {
+            MouseEventKind::Moved | MouseEventKind::Drag(_) => {
+                if let Some(index) = on {
+                    menu.highlight(index);
+                }
+                None
+            }
+            MouseEventKind::Down(MouseButton::Left) => match on {
+                Some(index) => {
+                    let step = menu.choose(index);
+                    self.follow_menu(step)
+                }
+                // On its frame, the click does nothing.
+                None if menu.covers(screen, column, row) => None,
+                None => {
+                    self.menu = None;
+                    None
+                }
+            },
+            MouseEventKind::Down(_) => {
+                self.menu = None;
+                None
+            }
+            _ => None,
+        }
+    }
+
+    /// Carries out what the menu's key or click asked for.
+    fn follow_menu(&mut self, step: menu::Step) -> Option<Action> {
+        match step {
+            menu::Step::Stay => None,
+            menu::Step::Close => {
+                self.menu = None;
+                None
+            }
+            menu::Step::Press(code) => {
+                self.menu = None;
+                let action = self.on_sidebar_key(KeyEvent::new(code, KeyModifiers::NONE));
+                self.remember_shown();
+                action
+            }
+        }
+    }
+
+    /// The menu for the sidebar row at `row`, once the selection is on it:
+    /// a session's, a worktree's with no sessions, or for a heading, its
+    /// first session's or empty worktree's, with what the heading is for.
+    fn sidebar_menu(&mut self, row: usize) -> Option<Vec<Item>> {
+        let rows = self.rows();
+        let clicked = rows.get(row)?.clone();
+        // A heading selects the first row it heads that the selection can
+        // be on.
+        let first_under = |ends: fn(&Row) -> bool| {
+            rows[row + 1..]
+                .iter()
+                .take_while(|row| !ends(row))
+                .find(|row| matches!(row, Row::Session(_) | Row::NoSessions(_)))
+                .cloned()
+        };
+        match &clicked {
+            Row::Session(_) | Row::Task(_) | Row::NoSessions(_) => self.select_row(&clicked),
+            Row::Project { .. } => {
+                self.select_row(&first_under(|row| {
+                    matches!(row, Row::Project { .. } | Row::OutsideGit)
+                })?);
+                return Some(self.project_menu());
+            }
+            Row::Worktree { .. } | Row::Directory(_) => self.select_row(&first_under(|row| {
+                matches!(
+                    row,
+                    Row::Project { .. }
+                        | Row::OutsideGit
+                        | Row::Worktree { .. }
+                        | Row::Directory(_)
+                        | Row::Flow(_)
+                )
+            })?),
+            Row::OutsideGit | Row::Terminals | Row::Flow(_) | Row::Step { .. } => return None,
+        }
+        self.focus = Focus::Sidebar;
+        if self.on_worktree.is_some() {
+            return Some(self.empty_worktree_menu());
+        }
+        self.session_menu(false)
+    }
+
+    /// The menu for the selected session; `on_pane` when it was opened on
+    /// its pane, which offers the pane's keys too.
+    fn session_menu(&self, on_pane: bool) -> Option<Vec<Item>> {
+        let session = self.selected()?;
+        let running = session.state == State::Running;
+        let mut items = vec![if running {
+            Item::enter("type into it")
+        } else {
+            Item::enter("start it again")
+        }];
+        items.push(if self.is_split(&session.name) {
+            Item::new("close its split", 's')
+        } else {
+            Item::new("split it off", 's')
+        });
+        if on_pane {
+            items.push(Item::new("split side by side", '|'));
+            items.push(Item::new("split below", '-'));
+        }
+        items.push(if self.is_floating(&session.name) {
+            Item::new("put it back", 'F')
+        } else {
+            Item::new("float it", 'F')
+        });
+        items.push(Item::new("zoom", 'z'));
+        if on_pane {
+            items.push(Item::new("copy mode", 'v'));
+            items.push(Item::new("edit its history", 'e'));
+        }
+        items.push(Item::new("rename", 'r'));
+        items.push(Item::new("move to another tab", '>'));
+        if session.worktree.is_some() {
+            items.push(Item::new("what changed", 'd'));
+            items.push(Item::new("find a file", 'p'));
+            items.push(Item::new("browse its files", 'E'));
+            items.push(Item::new("run the project, or stop it", '!'));
+            items.push(Item::new("open the project", '.'));
+            if self.github_on() {
+                items.push(Item::new("its pull request", 'o'));
+            }
+        }
+        if self.tasks_on && session.task.as_ref().is_some_and(|task| task.is_open()) {
+            items.push(Item::new("close its task", 'c'));
+        }
+        items.push(Item::new("archive it", 'A'));
+        items.push(Item::danger("kill it", 'x'));
+        Some(items)
+    }
+
+    /// The menu for the worktree with no sessions the selection is on.
+    fn empty_worktree_menu(&self) -> Vec<Item> {
+        let main = self.selected_empty_worktree().is_some_and(|w| w.main);
+        let mut items = vec![
+            Item::new("start a session here", 'n'),
+            Item::new("new worktree", 'w'),
+            Item::new("run the project", '!'),
+            Item::new("open the project", '.'),
+            Item::new("what changed", 'd'),
+            Item::new("find a file", 'p'),
+            Item::new("browse its files", 'E'),
+        ];
+        items.push(if main {
+            Item::danger("take the project off the list", 'W')
+        } else {
+            Item::danger("remove the worktree", 'W')
+        });
+        items
+    }
+
+    /// The menu for a project's heading.
+    fn project_menu(&self) -> Vec<Item> {
+        let mut items = vec![
+            Item::new("new session", 'n'),
+            Item::new("new worktree", 'w'),
+            Item::new("run the project, or stop it", '!'),
+            Item::new("open the project", '.'),
+        ];
+        if self.github_on() {
+            items.push(Item::new("pull requests", 'O'));
+            items.push(Item::new("issues", 'i'));
+        }
+        if self.backlog_on {
+            items.push(Item::new("the backlog", 'b'));
+        }
+        if self.memory_on {
+            items.push(Item::new("what it remembers", 'm'));
+        }
+        items
+    }
+
     /// Whether something open waits for the keyboard, and the mouse does
     /// nothing meanwhile: a question on the footer waits for its answer,
     /// and so do the filter, the issues and backlog views, the new-session
@@ -2412,6 +2771,7 @@ impl App {
             || self.pull_requests_view.is_some()
             || self.backlog.is_some()
             || self.layouts.is_some()
+            || self.archived.is_some()
             || self.launcher.is_some()
             || self.profiles_view.is_some()
             || self.plugins_view.is_some()
@@ -2506,11 +2866,17 @@ impl App {
             KeyCode::Char(digit @ '1'..='9') => self.go_to_tab_numbered(digit),
             KeyCode::PageUp => return Some(Action::PageBack(self.selected_slot()?)),
             KeyCode::PageDown => return Some(Action::PageForward(self.selected_slot()?)),
+            KeyCode::Char('!') => return self.project_command(Verb::Run),
+            KeyCode::Char('.') => return self.project_command(Verb::Open),
             KeyCode::Char('n') => return self.open_launcher(false),
             KeyCode::Char('w') => return self.open_launcher(true),
             KeyCode::Char('W') => self.ask_to_remove_worktree(),
             KeyCode::Char('r') => self.ask_for_name(),
             KeyCode::Char('x') => self.confirm = Some(Confirm::Kill(self.selected()?.name.clone())),
+            KeyCode::Char('A') => {
+                self.confirm = Some(Confirm::Archive(self.selected()?.name.clone()));
+            }
+            KeyCode::Char('Z') => return Some(Action::ListArchived),
             KeyCode::Char('u') => self.select_next_needing_user(),
             KeyCode::Char('U') => self.open_needs_you(),
             KeyCode::Char('a') => return Some(self.open_timeline()),
@@ -2543,6 +2909,21 @@ impl App {
             _ => {}
         }
         None
+    }
+
+    /// Asks for the project's run or open command in the worktree the
+    /// selection is in.
+    fn project_command(&mut self, which: Verb) -> Option<Action> {
+        let Some(worktree) = self.selection_worktree().cloned() else {
+            self.notify("select a session in a git worktree".into());
+            return None;
+        };
+        Some(Action::ProjectCommand { which, worktree })
+    }
+
+    /// Asks before stopping the session called `name`, as `x` does.
+    pub fn confirm_kill(&mut self, name: String) {
+        self.confirm = Some(Confirm::Kill(name));
     }
 
     /// Runs the plugin action that took `key`, about the selected session,
@@ -2817,6 +3198,15 @@ impl App {
     /// worktree goes, and only once nothing runs in it any more: removing
     /// it would pull the directory out from under them.
     fn ask_to_remove_worktree(&mut self) {
+        // A project with no sessions is on its main worktree's row: what
+        // goes is the project, off the list, never anything on disk.
+        if let Some(project) = self.selected_empty_worktree().filter(|w| w.main) {
+            self.confirm = Some(Confirm::ForgetProject {
+                path: project.path.clone(),
+                name: project.project.clone(),
+            });
+            return;
+        }
         if let Some(worktree) = self.selected_empty_worktree() {
             let branch = worktree.branch.as_deref().unwrap_or("(detached)");
             let (path, branch) = (worktree.path.clone(), branch.to_string());
@@ -3093,6 +3483,20 @@ impl App {
         Some(Action::ListBacklog(dir))
     }
 
+    /// Keys while the archive is open: all of them are its.
+    fn on_archived_key(&mut self, key: KeyEvent) -> Option<Action> {
+        let view = self.archived.as_mut()?;
+        match view.on_key(&key) {
+            archived_view::Step::Stay => None,
+            archived_view::Step::Close => {
+                self.archived = None;
+                None
+            }
+            archived_view::Step::Restore(id) => Some(Action::Unarchive(id)),
+            archived_view::Step::Delete(id) => Some(Action::DeleteArchived(id)),
+        }
+    }
+
     /// Keys while the layouts view is open: all of them are its.
     fn on_layouts_key(&mut self, key: KeyEvent) -> Option<Action> {
         let view = self.layouts.as_mut()?;
@@ -3330,7 +3734,8 @@ impl App {
         ];
         let current = worktree.map(|worktree| &worktree.project_path);
         let mut others: Vec<Target> = Vec::new();
-        for worktree in self.sessions.iter().filter_map(|s| s.worktree.as_ref()) {
+        let sessions = self.sessions.iter().filter_map(|s| s.worktree.as_ref());
+        for worktree in sessions.chain(&self.known) {
             let path = &worktree.project_path;
             let seen = others
                 .iter()
@@ -4171,10 +4576,16 @@ impl App {
             .into_iter()
             .filter(|row| matches!(row, Row::Session(_) | Row::NoSessions(_)))
             .collect();
-        let Some(at) = stops.iter().position(|row| self.is_selected(row)) else {
+        if stops.is_empty() {
             return;
+        }
+        // With nothing selected, as in a tab with only quiet projects, the
+        // first move lands on the first row, or the last going up.
+        let to = match stops.iter().position(|row| self.is_selected(row)) {
+            Some(at) => at.saturating_add_signed(by).min(stops.len() - 1),
+            None if by < 0 => stops.len() - 1,
+            None => 0,
         };
-        let to = at.saturating_add_signed(by).min(stops.len() - 1);
         self.select_row(&stops[to]);
     }
 
@@ -4416,6 +4827,7 @@ mod tests {
 
     fn session(name: &str) -> SessionInfo {
         SessionInfo {
+            stopped_idle: false,
             front: None,
             name: name.into(),
             id: name.into(),
@@ -5439,6 +5851,76 @@ mod tests {
             press(&mut app, KeyCode::Enter),
             start(place, &["claude", "--", "pick it up"], "pick it up")
         );
+    }
+
+    fn known(name: &str) -> Worktree {
+        Worktree {
+            project: name.into(),
+            project_path: PathBuf::from(format!("/code/{name}")),
+            path: PathBuf::from(format!("/code/{name}")),
+            main: true,
+            branch: Some("main".into()),
+        }
+    }
+
+    #[test]
+    fn a_known_project_with_no_sessions_stays_in_the_sidebar_and_starts_there() {
+        let mut app = app_with_an_empty_worktree();
+        app.set_known_projects(vec![known("app"), known("api")]);
+        let rows = app.rows();
+        // app has a session, so only api is listed on its own, at the end.
+        let api = Row::NoSessions(PathBuf::from("/code/api"));
+        assert_eq!(rows.last(), Some(&api));
+        assert_eq!(
+            rows.iter()
+                .filter(|row| matches!(row, Row::Project { .. }))
+                .count(),
+            2
+        );
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(
+            app.selected_empty_worktree().map(|w| w.project.as_str()),
+            Some("api")
+        );
+        press(&mut app, KeyCode::Char('n'));
+        type_text(&mut app, "look around");
+        let place = Place::Directory(Some(PathBuf::from("/code/api")));
+        assert_eq!(
+            press(&mut app, KeyCode::Enter),
+            start(place, &["claude", "--", "look around"], "look around")
+        );
+    }
+
+    #[test]
+    fn shift_w_on_a_known_project_with_no_sessions_takes_it_off_the_list() {
+        let mut app = with_agents(&["claude"], Vec::new());
+        app.set_known_projects(vec![known("api")]);
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('W'));
+        assert_eq!(
+            app.confirm().map(Confirm::question).as_deref(),
+            Some("take api off the list? Nothing on disk changes. y/n")
+        );
+        assert_eq!(
+            press(&mut app, KeyCode::Char('y')),
+            Some(Action::ForgetProject(PathBuf::from("/code/api")))
+        );
+    }
+
+    #[test]
+    fn the_new_session_panel_offers_every_known_project() {
+        let mut app = app_with_an_empty_worktree();
+        app.set_known_projects(vec![known("app"), known("api")]);
+        let targets = app.launch_targets();
+        let projects: Vec<&Path> = targets
+            .iter()
+            .filter_map(|target| match target {
+                Target::Project { path, .. } => Some(path.as_path()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(projects, vec![Path::new("/code/api")]);
     }
 
     #[test]
@@ -7717,7 +8199,7 @@ gate = true
         });
         // `x` would kill the session from the sidebar; here it's nothing.
         assert_eq!(press(&mut app, KeyCode::Char('x')), None);
-        for _ in 0..5 {
+        for _ in 0..6 {
             press(&mut app, KeyCode::Char('j'));
         }
         assert_eq!(
@@ -7835,5 +8317,147 @@ gate = true
         // Nothing worth saying says nothing.
         app.set_away(&Tally::of(&[]));
         assert_eq!(app.away_line(), None);
+    }
+
+    fn labels(app: &App) -> Vec<&'static str> {
+        app.menu()
+            .unwrap()
+            .items
+            .iter()
+            .map(|item| item.label)
+            .collect()
+    }
+
+    #[test]
+    fn a_right_click_on_a_session_selects_it_and_its_menu_does_what_its_keys_do() {
+        let mut app = app_with(&["a", "b", "c"]);
+        app.right_click(Hit::SidebarRow(row_of(&app, "b")), (3, 4));
+        assert_eq!(selected_name(&app), Some("b"));
+        let labels = labels(&app);
+        assert_eq!(labels.first(), Some(&"type into it"));
+        assert_eq!(labels.last(), Some(&"kill it"));
+        // Outside git, there's no worktree to run or diff.
+        assert!(!labels.contains(&"what changed"));
+        // Its key chooses an item straight away: here, asking to kill it.
+        assert_eq!(press(&mut app, KeyCode::Char('x')), None);
+        assert!(app.menu().is_none());
+        assert_eq!(app.confirm(), Some(&Confirm::Kill("b".into())));
+    }
+
+    #[test]
+    fn a_click_chooses_a_menu_item_and_one_outside_closes_it() {
+        let mut app = app_with(&["a", "b"]);
+        app.set_screen(Rect::new(0, 0, 100, 30));
+        app.right_click(Hit::SidebarRow(row_of(&app, "a")), (5, 5));
+        // The frame's top is row 5, so the first item is on row 6.
+        let archive = labels(&app)
+            .iter()
+            .position(|l| *l == "archive it")
+            .unwrap();
+        app.menu_mouse(MouseEventKind::Moved, 8, 6 + archive as u16);
+        assert_eq!(app.menu().unwrap().highlighted, archive);
+        assert_eq!(app.menu_mouse(CLICK, 8, 6 + archive as u16), None);
+        assert_eq!(app.confirm(), Some(&Confirm::Archive("a".into())));
+        assert_eq!(
+            press(&mut app, KeyCode::Char('y')),
+            Some(Action::Archive("a".into()))
+        );
+
+        app.right_click(Hit::SidebarRow(row_of(&app, "b")), (5, 5));
+        assert_eq!(app.menu_mouse(CLICK, 90, 25), None);
+        assert!(app.menu().is_none());
+        assert_eq!(app.confirm(), None);
+    }
+
+    #[test]
+    fn a_right_click_on_a_heading_offers_what_its_project_or_worktree_does() {
+        let mut app = app_with_an_empty_worktree();
+        app.right_click(Hit::SidebarRow(0), (1, 1));
+        assert!(matches!(app.rows()[0], Row::Project { .. }));
+        assert_eq!(selected_name(&app), Some("planner"));
+        assert!(labels(&app).contains(&"new worktree"));
+        press(&mut app, KeyCode::Esc);
+        assert!(app.menu().is_none());
+
+        let empty = app
+            .rows()
+            .iter()
+            .position(|row| matches!(row, Row::NoSessions(_)))
+            .unwrap();
+        // The worktree's heading, above its row, selects it.
+        app.right_click(Hit::SidebarRow(empty - 1), (1, 1));
+        assert_eq!(empty_branch(&app), Some("old"));
+        assert_eq!(labels(&app).last(), Some(&"remove the worktree"));
+        assert_eq!(press(&mut app, KeyCode::Enter), None);
+        assert!(
+            app.launcher().is_some(),
+            "Enter on it starts a session there"
+        );
+    }
+
+    #[test]
+    fn a_right_click_on_a_tab_goes_to_it_and_offers_the_tabs_keys() {
+        let mut app = app_with(&["a"]);
+        press(&mut app, KeyCode::Char('t'));
+        app.right_click(Hit::Tab(0), (1, 0));
+        assert_eq!(app.tabs().current_index(), 0);
+        assert_eq!(labels(&app).last(), Some(&"close it"));
+        press(&mut app, KeyCode::Char('T'));
+        assert!(app.prompt().is_some(), "it asks for the tab's name");
+    }
+
+    #[test]
+    fn nothing_opens_a_menu_while_a_question_waits() {
+        let mut app = app_with(&["a"]);
+        press(&mut app, KeyCode::Char('x'));
+        app.right_click(Hit::SidebarRow(row_of(&app, "a")), (1, 1));
+        assert!(app.menu().is_none());
+    }
+
+    #[test]
+    fn capital_a_asks_before_archiving_and_capital_z_lists_the_archive() {
+        let mut app = app_with(&["a"]);
+        press(&mut app, KeyCode::Char('A'));
+        assert_eq!(
+            app.confirm().map(Confirm::question).as_deref(),
+            Some("archive a? It stops; Z starts it again where it was. y/n")
+        );
+        assert_eq!(press(&mut app, KeyCode::Char('n')), None);
+        assert_eq!(
+            press(&mut app, KeyCode::Char('Z')),
+            Some(Action::ListArchived)
+        );
+        app.show_archived(Ok(Vec::new()));
+        assert!(app.archived_view().is_some());
+        // The archive has the keys while it's open.
+        assert_eq!(press(&mut app, KeyCode::Char('x')), None);
+        assert_eq!(press(&mut app, KeyCode::Esc), None);
+        assert!(app.archived_view().is_none());
+    }
+
+    #[test]
+    fn bang_and_dot_ask_for_the_projects_commands_in_the_selections_worktree() {
+        let mut app = app_with_an_empty_worktree();
+        let main = in_worktree("planner", "main", State::Running)
+            .worktree
+            .unwrap();
+        assert_eq!(
+            press(&mut app, KeyCode::Char('!')),
+            Some(Action::ProjectCommand {
+                which: Verb::Run,
+                worktree: main,
+            })
+        );
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(
+            press(&mut app, KeyCode::Char('.')),
+            Some(Action::ProjectCommand {
+                which: Verb::Open,
+                worktree: linked("old"),
+            })
+        );
+        let mut outside = app_with(&["a"]);
+        assert_eq!(press(&mut outside, KeyCode::Char('!')), None);
+        assert!(outside.notice().unwrap().contains("git worktree"));
     }
 }

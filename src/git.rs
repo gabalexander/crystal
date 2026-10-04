@@ -55,6 +55,11 @@ impl Checkout {
         })
     }
 
+    /// The repository's main worktree.
+    pub fn project_path(&self) -> &Path {
+        &self.project_path
+    }
+
     /// The worktree as it is now: reading one small file tells which
     /// branch it's on, much cheaper than running git.
     pub fn worktree(&self) -> Worktree {

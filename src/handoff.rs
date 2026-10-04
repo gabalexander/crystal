@@ -20,6 +20,7 @@
 use crate::config::Config;
 use crate::git::Checkout;
 use crate::plugins;
+use crate::shell;
 use crate::tasks::MAX_PROMPT_BYTES;
 use anyhow::{Context, Result};
 use std::fs;
@@ -265,7 +266,7 @@ fn fitting(notes: &Notes, said: usize) -> String {
 /// keeps its notes in git.
 pub fn in_git(config: &Config, project: &Path) -> bool {
     let real = |path: &Path| fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    let same = |listed: &PathBuf| real(&expand_home(listed)) == real(project);
+    let same = |listed: &PathBuf| real(&shell::expand_home(listed)) == real(project);
     config.handoff.in_git.iter().any(same)
 }
 
@@ -338,17 +339,6 @@ fn cut(text: &str, max: usize) -> String {
         end -= 1;
     }
     format!("{}…", &text[..end])
-}
-
-/// `path` with a leading `~` made the home directory.
-fn expand_home(path: &Path) -> PathBuf {
-    match path.strip_prefix("~") {
-        Ok(rest) => {
-            let home = std::env::var_os("HOME").unwrap_or_default();
-            PathBuf::from(home).join(rest)
-        }
-        Err(_) => path.to_path_buf(),
-    }
 }
 
 #[cfg(test)]

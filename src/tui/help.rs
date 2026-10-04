@@ -71,6 +71,8 @@ pub const KEYS: &[Key] = &[
     sidebar("n/w", "new, or in a worktree"),
     sidebar("W", "remove the worktree"),
     sidebar("r/x", "rename / kill it"),
+    sidebar("A/Z", "archive it / the archive"),
+    sidebar("!/.", "run / open the project"),
     of_plugin("tasks", "c", "close its task"),
     of_plugin("tasks", "y/n/Y", "answer what a task asks"),
     of_plugin("flows", "g/f", "flow: go on / send back"),
@@ -102,6 +104,7 @@ pub const KEYS: &[Key] = &[
     new_session("Alt+Enter", "new line in the task"),
     new_session("Ctrl+E", "edit the command line"),
     mouse("click", "a session, pane, tab"),
+    mouse("right click", "a menu of what it does"),
     mouse("wheel/drag", "scroll / select, copy"),
     mouse("Ctrl+click", "open a link"),
 ];

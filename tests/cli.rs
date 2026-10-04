@@ -8255,7 +8255,7 @@ fn the_settings_view_changes_the_config_and_follows_it_live() {
 
     // Turned on, search by meaning has the daemon get the model, and the
     // view follows how that goes: here, a download that fails.
-    tui.type_keys("jj ");
+    tui.type_keys("jjj ");
     tui.shows("● search by meaning");
     assert!(
         config().contains("[memory]\ndistill = false\nembeddings = true\n"),
@@ -10407,4 +10407,208 @@ fn coming_back_the_footer_says_what_happened_while_you_were_away() {
     tui.type_keys("a");
     tui.shows("task.closed");
     tui.shows(" • ");
+}
+
+/// What a terminal sends for a right click at `(column, row)`.
+fn right_click(column: usize, row: usize) -> String {
+    let (x, y) = (column + 1, row + 1);
+    format!("\x1b[<2;{x};{y}M\x1b[<2;{x};{y}m")
+}
+
+#[test]
+fn a_right_click_on_a_session_opens_its_menu_and_an_item_does_what_its_key_does() {
+    let crystal = Crystal::new();
+    for name in ["alpha", "beta"] {
+        let script = format!("echo {name} is here; echo > {name}-ready; sleep 30");
+        crystal.ok(&["new", "-n", name, "sh", "-c", &script]);
+        written(&crystal.dir.path().join(format!("{name}-ready")));
+    }
+
+    let mut tui = crystal.tui();
+    tui.shows("alpha is here");
+    let row = line_with(&tui.text(), "❯ beta");
+    tui.type_keys(&right_click(10, row));
+    tui.shows("archive it");
+    tui.shows("beta is here");
+    tui.type_keys("x");
+    tui.shows("kill beta? y/n");
+    tui.type_keys("y");
+    eventually("beta is killed", || crystal.row("beta").is_none());
+}
+
+#[test]
+fn projects_stay_listed_with_no_session_until_taken_off() {
+    let crystal = Crystal::new();
+    let dir = crystal.dir.path();
+    let app = git_repo(dir, "app");
+    let app = app.to_str().unwrap();
+    crystal.ok(&["new", "-d", "-n", "s", "-c", app, "sleep", "30"]);
+    eventually("app is listed", || crystal.ok(&["project"]).contains("app"));
+    let refused = crystal.fails(&["project", "rm", app]);
+    assert!(refused.contains("has 1 session in it"), "{refused}");
+
+    // With its last session gone, it stays.
+    crystal.ok(&["kill", "s"]);
+    let listed: serde_json::Value =
+        serde_json::from_str(&crystal.ok(&["project", "--json"])).unwrap();
+    assert_eq!(listed[0]["name"], "app");
+    assert_eq!(listed[0]["branch"], "main");
+    assert_eq!(listed[0]["sessions"], 0);
+
+    crystal.ok(&["project", "rm", app]);
+    assert!(!crystal.ok(&["project"]).contains("app"));
+
+    let api = git_repo(dir, "api");
+    crystal.ok(&["project", "add", api.join(".").to_str().unwrap()]);
+    let listed = crystal.ok(&["project"]);
+    assert!(
+        listed.lines().any(|line| line.starts_with("api ")),
+        "{listed}"
+    );
+
+    let plain = dir.join("plain");
+    std::fs::create_dir(&plain).unwrap();
+    let refused = crystal.fails(&["project", "add", plain.to_str().unwrap()]);
+    assert!(refused.contains("isn't in a git repository"), "{refused}");
+}
+
+#[test]
+fn a_projects_run_command_runs_in_a_session_of_its_own_and_open_runs_once() {
+    let crystal = Crystal::new();
+    let app = git_repo(crystal.dir.path(), "app");
+    std::fs::create_dir(app.join(".crystal")).unwrap();
+    std::fs::write(
+        app.join(".crystal/project.toml"),
+        "run = \"echo running > ran; sleep 30\"\nopen = \"pwd > opened\"\n",
+    )
+    .unwrap();
+    let here = app.to_str().unwrap();
+
+    let name = crystal.ok(&["project", "run", "-d", "-C", here]);
+    assert_eq!(name, "run-app\n");
+    assert_eq!(written(&app.join("ran")), "running\n");
+    let again = crystal.fails(&["project", "run", "-d", "-C", here]);
+    assert!(again.contains("run-app runs it already"), "{again}");
+    crystal.ok(&["project", "run", "--stop", "-C", here]);
+    assert!(crystal.row("run-app").is_none());
+
+    crystal.ok(&["project", "open", "-C", here]);
+    let opened = written(&app.join("opened"));
+    assert_eq!(
+        Path::new(opened.trim()).canonicalize().unwrap(),
+        app.canonicalize().unwrap()
+    );
+
+    // The config's [[project]] takes the place of the project's own file.
+    crystal.configure(&format!(
+        "notify = false\nname_from_prompt = false\n\n[plugins]\nmemory = false\n\n\
+         [[project]]\npath = \"{here}\"\nrun = \"echo configured > ran; sleep 30\"\n"
+    ));
+    crystal.ok(&["project", "run", "-d", "-C", here]);
+    eventually("the configured command ran", || {
+        std::fs::read_to_string(app.join("ran")).is_ok_and(|text| text == "configured\n")
+    });
+
+    let none = crystal.fails(&[
+        "project",
+        "open",
+        "-C",
+        crystal.dir.path().to_str().unwrap(),
+    ]);
+    assert!(none.contains("isn't in a git repository"), "{none}");
+}
+
+#[test]
+fn an_archived_agent_leaves_the_list_and_comes_back_where_it_was() {
+    let crystal = Crystal::new();
+    let bin = fake_reporting_agent(crystal.dir.path());
+    let path = path_of(&[&bin]);
+    let args = crystal.dir.path().join("pi-args");
+    crystal.stage("rest");
+    let out = crystal
+        .command(&["new", "-d", "-n", "agent", "pi", "--fresh"])
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(written(&args), "--fresh\n");
+    eventually("it said how to resume it", || {
+        !crystal.listed("agent")["reporter"]["resume"].is_null()
+    });
+    let pid = crystal.pid("agent");
+
+    crystal.ok(&["archive", "agent"]);
+    assert!(crystal.row("agent").is_none());
+    eventually("its program has gone", || !alive(pid));
+    let archived = crystal.ok(&["ls", "--archived"]);
+    let row = archived.lines().nth(1).unwrap();
+    assert!(row.starts_with("agent "), "{archived}");
+    assert!(row.contains(" yes "), "it resumes: {archived}");
+
+    std::fs::remove_file(&args).unwrap();
+    let out = crystal
+        .command(&["unarchive", "-d", "agent"])
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "agent\n");
+    assert_eq!(written(&args), "--resume\ns 1\n");
+    assert_eq!(crystal.ok(&["ls", "--archived"]), "");
+
+    // Killing an archived session takes it out of the archive.
+    crystal.ok(&["archive", "agent"]);
+    crystal.ok(&["kill", "agent"]);
+    assert_eq!(crystal.ok(&["ls", "--archived"]), "");
+    let none = crystal.fails(&["unarchive", "agent"]);
+    assert!(
+        none.contains("no session named agent in the archive"),
+        "{none}"
+    );
+}
+
+#[test]
+fn an_agent_left_idle_is_stopped_and_starts_again_where_it_was() {
+    let crystal = Crystal::new();
+    crystal.configure(
+        "notify = false\nname_from_prompt = false\n\n[plugins]\nmemory = false\n\n\
+         [sessions]\nstop_idle_after = \"1s\"\n",
+    );
+    let bin = fake_reporting_agent(crystal.dir.path());
+    let path = path_of(&[&bin]);
+    let args = crystal.dir.path().join("pi-args");
+    crystal.stage("rest");
+    let out = crystal
+        .command(&["new", "-d", "-n", "agent", "pi"])
+        .env("PATH", &path)
+        .env("CRYSTAL_IDLE_CHECK_MS", "100")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    // A program that isn't an agent is never stopped.
+    crystal.ok(&["new", "-d", "-n", "plain", "sleep", "30"]);
+    assert_eq!(written(&args), "\n");
+    // Its turn ended with nobody watching: it's done, news to the user,
+    // and stays until they've seen it.
+    eventually("its turn has ended", || {
+        crystal.listed("agent")["activity"] == "done"
+    });
+    thread::sleep(Duration::from_millis(1500));
+    assert_eq!(crystal.row("agent").unwrap()[1], "done");
+    let mut seen = crystal.attach(&["attach", "agent"]);
+    seen.type_keys("\x1c");
+    assert!(seen.exit());
+    eventually("the idle agent is stopped", || {
+        crystal.row("agent").unwrap()[1] == "stopped idle"
+    });
+    assert_eq!(crystal.row("plain").unwrap()[1], "running");
+
+    std::fs::remove_file(&args).unwrap();
+    let out = crystal
+        .command(&["respawn", "agent"])
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(written(&args), "--resume\ns 1\n");
 }
