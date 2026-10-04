@@ -164,6 +164,15 @@ impl Crystal {
         command.env("SHELL", "/bin/sh");
         command.env("XDG_CONFIG_HOME", self.config_home());
         command.env("CLAUDE_CONFIG_DIR", self.claude_config_dir());
+        // The settings view lists the agents installed in the home, and puts
+        // crystal's hooks in their settings: a home of the test's own, as
+        // `crystal integration` has, never the user's.
+        std::fs::create_dir_all(self.home()).unwrap();
+        command.env("HOME", self.home());
+        command.env("CODEX_HOME", self.codex_home());
+        for moved in AGENT_DIRS {
+            command.env_remove(moved);
+        }
         // No TUI asks GitHub whether a newer crystal is out: the releases
         // are nowhere, unless a test says where.
         command.env("CRYSTAL_RELEASES", NO_RELEASES);
@@ -3687,6 +3696,472 @@ fn a_session_sends_twenty_messages_a_minute_at_most() {
     );
     // You aren't held to it.
     crystal.ok(&["send", "--no-enter", "inbox", "from you"]);
+}
+
+#[test]
+fn send_reads_its_text_from_stdin_and_a_bare_ok_between_sessions_is_refused() {
+    let crystal = Crystal::new();
+    let dir = crystal.dir.path();
+    crystal.ok(&["new", "-n", "inbox", "sh", "-c", "cat > got"]);
+
+    let mut send = crystal
+        .command(&["send", "inbox", "-"])
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    send.stdin
+        .take()
+        .unwrap()
+        .write_all(b"from a pipe")
+        .unwrap();
+    assert!(send.wait().unwrap().success());
+    assert_eq!(once_lines(&dir.join("got"), 1), "from a pipe\n");
+
+    in_session(
+        &crystal,
+        "polite",
+        r#""$C" send inbox 'ok, thanks!' 2> err; echo $? > sent; "$C" send inbox 'ok, 3 tests fail'"#,
+    );
+    assert_eq!(written(&dir.join("sent")), "1\n");
+    let err = std::fs::read_to_string(dir.join("err")).unwrap();
+    assert!(err.contains("a message that only acknowledges"), "{err}");
+    assert!(
+        once_lines(&dir.join("got"), 3)
+            .ends_with("[crystal] Message from session \"polite\":\nok, 3 tests fail\n")
+    );
+    // From you, it goes as typed.
+    crystal.ok(&["send", "inbox", "ok"]);
+    assert!(once_lines(&dir.join("got"), 4).ends_with("fail\nok\n"));
+}
+
+#[test]
+fn send_interrupt_stops_a_task_s_run_and_carries_on_from_there() {
+    let crystal = Crystal::new();
+    let dir = crystal.dir.path();
+    let path = path_with(&print_claude(dir));
+    start_task(&crystal, &path, "fixer", "go SLOW");
+    eventually("the task is working", || {
+        status(&crystal, "fixer") == "working"
+    });
+
+    crystal.ok(&["send", "--interrupt", "fixer", "do this instead"]);
+    assert_eq!(
+        runs(dir, 2)[1],
+        format!("{PRINT_ARGS} --allowedTools {ALLOWED} -- do this instead")
+    );
+    let logged = events(&crystal, &["-n", "fixer", "-k", "run.interrupted"]);
+    assert_eq!(logged.len(), 1);
+    finish_run(dir, 2);
+    eventually("the task is done", || status(&crystal, "fixer") == "done");
+    // A task between runs is sent to as ever.
+    crystal.ok(&["send", "--interrupt", "fixer", "and the docs"]);
+    assert_eq!(runs(dir, 3).len(), 3);
+
+    crystal.ok(&["new", "-n", "term", "sleep", "30"]);
+    let refused = crystal.fails(&["send", "--interrupt", "term", "stop"]);
+    assert!(refused.contains("term isn't a task"), "{refused}");
+    assert!(
+        refused.contains("crystal send-keys term Escape"),
+        "{refused}"
+    );
+}
+
+#[test]
+fn a_wait_that_gives_up_exits_2_and_quiet_prints_nothing() {
+    let crystal = Crystal::new();
+    crystal.ok(&["new", "-n", "busy", "sleep", "30"]);
+    let code = |args: &[&str]| crystal.run(args).status.code();
+
+    assert_eq!(code(&["wait", "busy", "--timeout", "0.2"]), Some(2));
+    assert_eq!(
+        code(&["wait", "busy", "--until", "waiting", "--timeout", "0.2"]),
+        Some(2)
+    );
+    let out = crystal.run(&["wait", "busy", "--output", "never", "--timeout", "0.2"]);
+    assert_eq!(out.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("nothing on busy's screen matched `never`"),
+        "{err}"
+    );
+    // Anything else that goes wrong is 1, a mistyped flag included, so 2
+    // always means not yet.
+    assert_eq!(code(&["wait", "busy", "--nope"]), Some(1));
+    assert_eq!(code(&["wait", "nobody", "--timeout", "0.2"]), Some(1));
+
+    crystal.ok(&["new", "-n", "says", "sh", "-c", "echo ready; sleep 30"]);
+    assert_eq!(crystal.ok(&["wait", "says", "--output", "ready", "-q"]), "");
+    crystal.ok(&["new", "-n", "quick", "true"]);
+    assert_eq!(crystal.ok(&["wait", "quick", "--quiet"]), "");
+    assert_eq!(crystal.ok(&["wait", "quick"]), "exited 0\n");
+}
+
+#[test]
+fn read_keeps_colors_joins_wrapped_lines_and_reads_what_came_since() {
+    let crystal = Crystal::new();
+    let script = r#"printf '\033[31mred\033[0m plain\n'; printf '%0150d\n' 7; sleep 3; echo later; sleep 30"#;
+    crystal.ok(&["new", "-n", "printer", "sh", "-c", script]);
+    shows_on_screen(&crystal, "printer", "later");
+    // Right after it: the first lines came 3s before.
+    let since = crystal.ok(&["read", "printer", "--since", "2s"]);
+    assert_eq!(since, "later\n");
+
+    let ansi = crystal.ok(&["read", "printer", "--ansi"]);
+    assert!(
+        ansi.starts_with("\x1b[0;38;5;1mred\x1b[0m plain\n"),
+        "{ansi:?}"
+    );
+    let plain = crystal.ok(&["read", "printer"]);
+    assert!(plain.starts_with("red plain\n"), "{plain:?}");
+    // The 150 digits wrapped onto two rows of the 120 the screen has.
+    let digits = format!("{:0150}", 7);
+    assert!(!plain.contains(&digits), "{plain}");
+    let unwrapped = crystal.ok(&["read", "printer", "--unwrap"]);
+    assert!(unwrapped.contains(&format!("{digits}\n")), "{unwrapped}");
+
+    // Since before the program began, it's all of it.
+    let all = crystal.ok(&["read", "printer", "--since", "1h"]);
+    assert!(
+        all.starts_with("red plain\n") && all.ends_with("later\n"),
+        "{all}"
+    );
+    let err = crystal.fails(&["read", "printer", "--since", "yesterday"]);
+    assert!(err.contains("nor a time"), "{err}");
+}
+
+#[test]
+fn events_keep_to_a_task_and_the_newest_few() {
+    let crystal = Crystal::new();
+    let dir = crystal.dir.path();
+    let path = path_with(&print_claude(dir));
+    crystal.ok(&["new", "-n", "bystander", "sleep", "30"]);
+    start_task(&crystal, &path, "fixer", "go");
+    finish_run(dir, 1);
+    eventually("the task is done", || status(&crystal, "fixer") == "done");
+
+    let task = events(&crystal, &["--task", "t1"]);
+    assert!(!task.is_empty());
+    for event in &task {
+        let about_it = event["task"]["id"] == 1 || event["session"]["task_id"] == 1;
+        assert!(about_it, "{event}");
+    }
+    let kinds = names(&task);
+    assert!(kinds.contains(&"task.opened".to_string()), "{kinds:?}");
+    assert!(kinds.contains(&"run.started".to_string()), "{kinds:?}");
+    assert_eq!(events(&crystal, &["--task", "12"]).len(), 0);
+    let err = crystal.fails(&["events", "--task", "twelve"]);
+    assert!(err.contains("isn't a task's number"), "{err}");
+
+    let all = events(&crystal, &[]);
+    let newest = events(&crystal, &["--limit", "2"]);
+    assert_eq!(newest, all[all.len() - 2..]);
+    let lines = crystal.ok(&["events", "-l", "1"]);
+    assert_eq!(lines.lines().count(), 1);
+}
+
+#[test]
+fn process_info_lists_what_is_in_front_and_where_it_works() {
+    let crystal = Crystal::new();
+    let sub = crystal.dir.path().join("sub");
+    std::fs::create_dir(&sub).unwrap();
+    crystal.ok(&["new", "-n", "box", "sh", "-c", "cd sub && exec sleep 30"]);
+    eventually("sleep is in front", || {
+        crystal.ok(&["process-info", "box"]).contains("sleep")
+    });
+    let table = crystal.ok(&["ps", "box"]);
+    let mut lines = table.lines();
+    assert!(lines.next().unwrap().starts_with("PID"), "{table}");
+    let row = lines.next().unwrap();
+    assert!(
+        row.contains("sleep") && row.ends_with("sleep 30"),
+        "{table}"
+    );
+
+    let info: serde_json::Value =
+        serde_json::from_str(&crystal.ok(&["process-info", "box", "--json"])).unwrap();
+    let front = &info["foreground"][0];
+    assert_eq!(front["name"], "sleep");
+    assert_eq!(front["argv"], serde_json::json!(["sleep", "30"]));
+    assert_eq!(info["group"], front["pid"]);
+    let cwd = PathBuf::from(front["cwd"].as_str().unwrap());
+    assert_eq!(cwd.canonicalize().unwrap(), sub.canonicalize().unwrap());
+}
+
+#[test]
+fn crystal_agent_names_the_agent_a_wrapper_runs() {
+    let crystal = Crystal::new();
+    crystal.ok(&["new", "-n", "plain", "sleep", "30"]);
+    // A wrapper of the user's own: a Mac keeps the environment of the
+    // programs it ships, like sleep, to itself. crystal waiting on another
+    // session stands in for one.
+    let wrapper = format!("CRYSTAL_AGENT=claude exec '{CRYSTAL}' wait plain");
+    crystal.ok(&["new", "-n", "wrapped", "sh", "-c", &wrapper]);
+    let front = |name: &str| -> serde_json::Value {
+        let sessions: serde_json::Value =
+            serde_json::from_str(&crystal.ok(&["ls", "--json"])).unwrap();
+        let session = sessions
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|session| session["name"] == name)
+            .unwrap()
+            .clone();
+        session["front"].clone()
+    };
+    eventually("the wrapper reads as Claude Code", || {
+        front("wrapped")["program"] == "claude"
+    });
+    assert_eq!(front("wrapped")["kind"], "agent");
+    eventually("sleep reads as itself", || {
+        front("plain")["name"] == "sleep"
+    });
+}
+
+/// The bytes `text`, base64 with or without padding, stands for.
+fn unbase64(text: &str) -> Vec<u8> {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut bytes = Vec::new();
+    let (mut bits, mut held) = (0u32, 0);
+    for c in text.trim_end_matches('=').bytes() {
+        let value = ALPHABET.iter().position(|&a| a == c).unwrap() as u32;
+        bits = (bits << 6) | value;
+        held += 6;
+        if held >= 8 {
+            held -= 8;
+            bytes.push((bits >> held) as u8);
+            bits &= (1 << held) - 1;
+        }
+    }
+    bytes
+}
+
+/// What a stream's `output` lines have carried so far, as text.
+fn streamed(lines: &std::sync::mpsc::Receiver<String>, until: &str) -> String {
+    let mut text = String::new();
+    while !text.contains(until) {
+        let line: serde_json::Value = serde_json::from_str(&next_line(lines)).unwrap();
+        if line["type"] == "output" {
+            text.push_str(&String::from_utf8_lossy(&unbase64(
+                line["data"].as_str().unwrap(),
+            )));
+        }
+    }
+    text
+}
+
+#[test]
+fn observe_streams_a_session_as_json_and_control_drives_it() {
+    let crystal = Crystal::new();
+    crystal.ok(&["new", "-n", "echoer", "cat"]);
+
+    // Observing it changes nothing: not its size, which no viewer has set.
+    let mut observe = crystal
+        .command(&["observe", "echoer"])
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let observed = lines_of(&mut observe);
+    let start: serde_json::Value = serde_json::from_str(&next_line(&observed)).unwrap();
+    assert_eq!(start["type"], "start");
+    assert_eq!(start["session"], "echoer");
+    assert_eq!(
+        (start["rows"].clone(), start["cols"].clone()),
+        (40.into(), 120.into())
+    );
+
+    let mut control = crystal
+        .command(&["control", "echoer", "--rows", "10", "--cols", "50"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let controlled = lines_of(&mut control);
+    let start: serde_json::Value = serde_json::from_str(&next_line(&controlled)).unwrap();
+    assert_eq!(
+        (start["rows"].clone(), start["cols"].clone()),
+        (10.into(), 50.into())
+    );
+    let mut commands = control.stdin.take().unwrap();
+    commands
+        .write_all(b"{\"type\":\"input\",\"text\":\"hello there\\r\"}\n")
+        .unwrap();
+    assert!(streamed(&controlled, "hello there").contains("hello there"));
+    assert!(streamed(&observed, "hello there").contains("hello there"));
+    commands.write_all(b"not json\n").unwrap();
+    let error: serde_json::Value = loop {
+        let line: serde_json::Value = serde_json::from_str(&next_line(&controlled)).unwrap();
+        if line["type"] == "error" {
+            break line;
+        }
+    };
+    assert!(
+        error["message"]
+            .as_str()
+            .unwrap()
+            .contains("isn't a command"),
+        "{error}"
+    );
+
+    // Keys by name: C-c ends cat, and both streams with it.
+    commands
+        .write_all(b"{\"type\":\"keys\",\"keys\":[\"C-c\"]}\n")
+        .unwrap();
+    for lines in [&controlled, &observed] {
+        let closed: serde_json::Value = loop {
+            let line: serde_json::Value = serde_json::from_str(&next_line(lines)).unwrap();
+            if line["type"] == "closed" {
+                break line;
+            }
+        };
+        assert_eq!(closed["reason"], "ended");
+    }
+    assert!(control.wait().unwrap().success());
+    assert!(observe.wait().unwrap().success());
+}
+
+#[test]
+fn control_lets_go_when_told_or_when_its_input_ends() {
+    let crystal = Crystal::new();
+    crystal.ok(&["new", "-n", "echoer", "cat"]);
+    let mut control = crystal
+        .command(&["control", "echoer"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let lines = lines_of(&mut control);
+    next_line(&lines);
+    control
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"{\"type\":\"release\"}\n")
+        .unwrap();
+    let closed: serde_json::Value = loop {
+        let line: serde_json::Value = serde_json::from_str(&next_line(&lines)).unwrap();
+        if line["type"] == "closed" {
+            break line;
+        }
+    };
+    assert_eq!(closed["reason"], "released");
+    assert!(control.wait().unwrap().success());
+    assert_eq!(status(&crystal, "echoer"), "running");
+
+    let out = crystal
+        .command(&["control", "echoer"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let said = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        said.ends_with("{\"type\":\"closed\",\"reason\":\"released\"}\n"),
+        "{said}"
+    );
+}
+
+#[test]
+fn api_snapshot_holds_everything_and_the_seq_to_follow_on_from() {
+    let crystal = Crystal::new();
+    let err = crystal.fails(&["api", "snapshot"]);
+    assert!(err.contains("no daemon is running"), "{err}");
+    crystal.ok(&["new", "-n", "first", "sleep", "30"]);
+
+    let snapshot: serde_json::Value =
+        serde_json::from_str(&crystal.ok(&["api", "snapshot"])).unwrap();
+    assert_eq!(snapshot["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(snapshot["sessions"][0]["name"], "first");
+    assert_eq!(snapshot["sessions"][0]["status"], "running");
+    assert_eq!(snapshot["layout"]["tabs"][0]["sessions"][0], "first");
+    for list in ["projects", "tasks", "flows", "archived"] {
+        assert!(snapshot[list].is_array(), "{list}: {snapshot}");
+    }
+    let seq = snapshot["seq"].as_u64().unwrap();
+    assert!(seq > 0, "{snapshot}");
+
+    let after = seq.to_string();
+    assert_eq!(crystal.ok(&["events", "--after", &after]), "");
+    crystal.ok(&["new", "-n", "second", "sleep", "30"]);
+    let news = events(&crystal, &["--after", &after]);
+    assert_eq!(names(&news), ["session.started"]);
+    assert_eq!(news[0]["session"]["name"], "second");
+}
+
+#[test]
+fn integration_status_lists_only_those_out_of_date_when_asked() {
+    let crystal = Crystal::new();
+    std::fs::create_dir_all(crystal.claude_config_dir()).unwrap();
+    crystal.integration(&["install", "claude"]).unwrap();
+    assert_eq!(
+        crystal.integration(&["status", "--outdated-only"]).unwrap(),
+        ""
+    );
+
+    // An earlier crystal listened to fewer events.
+    let file = crystal.claude_config_dir().join("settings.json");
+    let mut settings: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    settings["hooks"]
+        .as_object_mut()
+        .unwrap()
+        .remove("SubagentStop");
+    std::fs::write(&file, settings.to_string()).unwrap();
+    let outdated = crystal.integration(&["status", "--outdated-only"]).unwrap();
+    assert!(outdated.starts_with("claude  out of date  "), "{outdated}");
+    assert_eq!(outdated.lines().count(), 1, "{outdated}");
+
+    crystal.integration(&["install", "claude"]).unwrap();
+    assert_eq!(
+        crystal.integration(&["status", "--outdated-only"]).unwrap(),
+        ""
+    );
+}
+
+#[test]
+fn the_settings_view_puts_an_agent_s_hooks_in_and_takes_them_out() {
+    let crystal = Crystal::new();
+    // The TUI looks for agents in a home of the test's own: Claude Code is
+    // the only one there.
+    std::fs::create_dir_all(crystal.claude_config_dir()).unwrap();
+    let mut tui = crystal.tui();
+    tui.type_keys(",");
+    tui.shows("General");
+    // To the last row, which the view scrolls to: Claude Code, the only
+    // agent installed here.
+    tui.type_keys(&"j".repeat(40));
+    tui.shows("Integrations");
+    tui.shows("Claude Code");
+    tui.type_keys(" ");
+    let file = crystal.claude_config_dir().join("settings.json");
+    eventually("the hooks are in", || {
+        std::fs::read_to_string(&file).is_ok_and(|text| text.contains("hook claude --installed"))
+    });
+    // The view reads them again, and marks the row.
+    tui.shows("● Claude Code");
+    tui.type_keys(" ");
+    eventually("the hooks are out", || {
+        std::fs::read_to_string(&file).is_ok_and(|text| !text.contains("hook claude"))
+    });
+}
+
+#[test]
+fn the_tui_follows_the_config_file_as_it_changes() {
+    let crystal = Crystal::new();
+    crystal.ok(&["new", "-n", "agent", "sleep", "30"]);
+    let mut tui = crystal.tui();
+    tui.shows("agent");
+    let config = std::fs::read_to_string(crystal.config_file()).unwrap();
+
+    // Set by hand, the tab bar goes where it says, without a restart.
+    let moved = format!("{config}\n[tab_bar]\nposition = \"bottom\"\nhide_when_single = false\n");
+    std::fs::write(crystal.config_file(), &moved).unwrap();
+    tui.shows("the config file changed: the settings follow it");
+
+    // A file that makes no sense is said, and the settings stay.
+    std::fs::write(crystal.config_file(), "notfy = true\n").unwrap();
+    tui.shows("the settings stay as they were");
+    tui.type_keys(",");
+    tui.shows("settings");
 }
 
 #[test]
@@ -8774,10 +9249,10 @@ fn pull_requests_are_marked_merged_or_conflicting_and_counted_in_the_top_bar() {
     tui.hides("pull requests · app");
 
     // Hidden in the settings, drafts leave the list and the count. Theirs
-    // is the last row, which the view scrolls to.
+    // is the last of the settings, which the view scrolls to.
     tui.type_keys(",");
     tui.shows("○ notifications");
-    tui.type_keys(&"j".repeat(20));
+    tui.type_keys(&"j".repeat(18));
     tui.shows("○ hide drafts");
     tui.type_keys(" ");
     tui.shows("● hide drafts");

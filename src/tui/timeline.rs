@@ -691,6 +691,7 @@ mod tests {
                 branch: Some("main".into()),
                 activity: None,
                 task: None,
+                task_id: None,
                 status: "running".into(),
                 reporter: None,
             }),

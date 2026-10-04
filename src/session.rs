@@ -7,12 +7,14 @@ use crate::agents;
 use crate::codex::Rollouts;
 use crate::config::Config;
 use crate::distill::Material;
+use crate::events::now_ms;
 use crate::front;
 use crate::git::Checkout;
 use crate::handover::{self, Got};
 use crate::keys;
 use crate::model;
 use crate::notify::{self, Notice};
+use crate::output_ring::OutputRing;
 use crate::printable;
 use crate::protocol::{
     Activity, AgentEvent, AgentReport, Answer, Asking, Conversation, Front, InProgress, Metadata,
@@ -1589,7 +1591,9 @@ impl Session {
             .transpose()
             .with_context(|| format!("{}'s terminal wasn't handed over", handed.name))?;
         let screen = vt::Screen::restored(&handed.screen);
-        let term = Arc::new(Term::with_screen(pty, screen));
+        // What the program wrote before the handover is on the screen, but
+        // not in the ring.
+        let term = Arc::new(Term::with_screen(pty, screen, false));
         let state = Arc::new(Mutex::new(handed.state.clone()));
         let changed = Arc::new(Mutex::new(handed.changed));
         let task = match handed.task {
@@ -1778,11 +1782,23 @@ struct Screen {
     /// The copies the program asked its terminal for while nobody was
     /// watching, since they were last taken.
     unseen_copies: u32,
+    /// The output lately, with when it came, for `crystal read --since`.
+    ring: OutputRing,
 }
 
 struct Viewer {
     id: u64,
     feed: SyncSender<Arc<[u8]>>,
+    /// A program watching, like `crystal observe`, not the user: the
+    /// session isn't watched for it.
+    program: bool,
+}
+
+impl Viewer {
+    /// Whether it's the user watching.
+    fn is_user(&self) -> bool {
+        !self.program
+    }
 }
 
 /// A new viewer's start: the screen as it is now, with the history ahead
@@ -1798,10 +1814,12 @@ impl Term {
     /// A screen of [`UNSEEN_SIZE`], until a viewer gives it another size.
     fn new(pty: Option<Pty>) -> Term {
         let (rows, cols) = UNSEEN_SIZE;
-        Term::with_screen(pty, vt::Screen::answering(rows, cols))
+        Term::with_screen(pty, vt::Screen::answering(rows, cols), true)
     }
 
-    fn with_screen(pty: Option<Pty>, vt: vt::Screen) -> Term {
+    /// A terminal showing `vt`: a new program's, `from_the_start`, or one
+    /// that has written to it before, as a handover carries on.
+    fn with_screen(pty: Option<Pty>, vt: vt::Screen, from_the_start: bool) -> Term {
         Term {
             pty,
             screen: Mutex::new(Screen {
@@ -1811,6 +1829,7 @@ impl Term {
                 ended: false,
                 touched: Instant::now(),
                 unseen_copies: 0,
+                ring: OutputRing::new(now_ms(), from_the_start),
             }),
             pump: Mutex::default(),
             output_waits: AtomicU32::new(0),
@@ -1850,16 +1869,20 @@ impl Term {
 
     /// Starts showing the session to a new viewer. With `with_history`, the
     /// viewer's screen gets the history too, so that it can scroll back
-    /// through output from before it came.
-    pub fn watch(&self, with_history: bool) -> Watch {
+    /// through output from before it came. A `program` watching, like
+    /// `crystal observe`, isn't the user: the session isn't watched or
+    /// touched for it.
+    pub fn watch(&self, with_history: bool, program: bool) -> Watch {
         static NEXT_ID: AtomicU64 = AtomicU64::new(0);
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         let mut screen = self.screen.lock().unwrap();
         let snapshot = screen.vt.state_formatted(with_history);
-        screen.touched = Instant::now();
+        if !program {
+            screen.touched = Instant::now();
+        }
         let feed = (!screen.ended).then(|| {
             let (feed, rx) = mpsc::sync_channel(VIEWER_BACKLOG);
-            screen.viewers.push(Viewer { id, feed });
+            screen.viewers.push(Viewer { id, feed, program });
             rx
         });
         Watch {
@@ -1941,14 +1964,47 @@ impl Term {
         self.screen.lock().unwrap().vt.rows(with_history)
     }
 
+    /// What's on the screen as `crystal read` asks for it, as
+    /// [`vt::Screen::lines`] reads it. With `since`, in milliseconds since
+    /// the Unix epoch, only what the program wrote from then on, laid out
+    /// on a screen of its own of this one's size, history and all; or the
+    /// history and the screen whole, when the output kept can't tell what
+    /// came since then from what came before.
+    pub fn read(&self, history: bool, unwrap: bool, ansi: bool, since: Option<u64>) -> Vec<String> {
+        let screen = self.screen.lock().unwrap();
+        let Some(since) = since else {
+            return screen.vt.lines(history, unwrap, ansi);
+        };
+        let Some(output) = screen.ring.since(since) else {
+            return screen.vt.lines(true, unwrap, ansi);
+        };
+        let (rows, cols) = screen.vt.size();
+        // Laid out off the lock: the program goes on writing meanwhile.
+        drop(screen);
+        let mut replayed = vt::Screen::new(rows, cols);
+        replayed.process(&output);
+        replayed.lines(true, unwrap, ansi)
+    }
+
     /// The process group in front in the terminal: the job its keys go to.
     /// `None` without a terminal, or when the terminal won't say.
     pub fn foreground_group(&self) -> Option<i32> {
         self.pty.as_ref()?.foreground_group()
     }
 
+    /// Whether the user is watching it, not only a program.
     pub fn is_watched(&self) -> bool {
-        !self.screen.lock().unwrap().viewers.is_empty()
+        self.screen
+            .lock()
+            .unwrap()
+            .viewers
+            .iter()
+            .any(Viewer::is_user)
+    }
+
+    /// The screen's size, rows by columns.
+    pub fn size(&self) -> (u16, u16) {
+        self.screen.lock().unwrap().vt.size()
     }
 
     /// How many times the program rang the bell since the last call.
@@ -1964,15 +2020,22 @@ impl Term {
 
     pub fn unwatch(&self, id: u64) {
         let mut screen = self.screen.lock().unwrap();
+        let user = screen
+            .viewers
+            .iter()
+            .any(|viewer| viewer.id == id && viewer.is_user());
         screen.viewers.retain(|viewer| viewer.id != id);
-        screen.touched = Instant::now();
+        if user {
+            screen.touched = Instant::now();
+        }
     }
 
     /// How long it's been since anyone had anything to do with the
     /// session: `None` while someone watches it.
     pub fn untouched_for(&self) -> Option<Duration> {
         let screen = self.screen.lock().unwrap();
-        screen.viewers.is_empty().then(|| screen.touched.elapsed())
+        let watched = screen.viewers.iter().any(Viewer::is_user);
+        (!watched).then(|| screen.touched.elapsed())
     }
 
     /// Writes `bytes` to the program, as from the user: typed, pasted or
@@ -2038,6 +2101,7 @@ impl Term {
     fn take_output(&self, output: &[u8]) -> Vec<u8> {
         let mut screen = self.screen.lock().unwrap();
         screen.vt.process(output);
+        screen.ring.push(output, now_ms());
         // Viewers get the same output, so that their own screens keep the
         // same history.
         let chunk: Arc<[u8]> = output.into();
@@ -2048,7 +2112,8 @@ impl Term {
             .retain(|viewer| viewer.feed.try_send(chunk.clone()).is_ok());
         // What the program copies, a viewer's own screen sees, and puts on
         // the clipboard; with none, nobody does.
-        if screen.vt.take_copied().is_some() && screen.viewers.is_empty() {
+        let watched = screen.viewers.iter().any(Viewer::is_user);
+        if screen.vt.take_copied().is_some() && !watched {
             screen.unseen_copies = screen.unseen_copies.saturating_add(1);
         }
         // One signal waiting is enough: the listener looks at the screen as
@@ -2247,7 +2312,10 @@ mod tests {
         assert_eq!(info.task, Some(goal));
         assert_eq!(session.conversation_id(), Some("conv-1"));
         assert_eq!(session.term().rows(false)[0], "bye");
-        assert!(session.term().watch(false).feed.is_none(), "it had ended");
+        assert!(
+            session.term().watch(false, false).feed.is_none(),
+            "it had ended"
+        );
         // Reminded of its task once already, it isn't again.
         assert!(!session.remind_of_task());
         // Still held by the agent that reports for itself, which resumes
@@ -2331,7 +2399,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let saved = written_down(dir.path());
         let mut session = Session::to_start("id-1".into(), saved.clone());
-        let watching = session.term().watch(false).feed.unwrap();
+        let watching = session.term().watch(false, false).feed.unwrap();
         session.fail_to_start("command not found: claude");
         let why = "command not found: claude".to_string();
         assert_eq!(session.info().state, State::Failed { why });
@@ -2658,7 +2726,7 @@ mod tests {
         assert_eq!(session.info().unseen_copies, 2);
 
         // A viewer puts what it sees copied on the clipboard itself.
-        let watch = session.term().watch(false);
+        let watch = session.term().watch(false, false);
         session.term().show(b"\x1b]52;c;aGk=\x07");
         session.term().unwatch(watch.id);
         session.check();
@@ -2670,7 +2738,7 @@ mod tests {
     fn a_bell_someone_watches_doesn_t_mark_the_session() {
         let dir = tempfile::tempdir().unwrap();
         let mut session = shell_session(dir.path());
-        let watch = session.term().watch(false);
+        let watch = session.term().watch(false, false);
         session.term().show(b"\x07");
         session.check();
         assert!(!session.info().bell);

@@ -8,12 +8,23 @@
 //! executable and its arguments say what it is. Neither is always named
 //! after the agent: Claude Code's own binary is named after its version,
 //! and an agent installed with npm runs as `node` with the agent's package
-//! as its script. So [`classify`] looks at all of them.
+//! as its script. So [`classify`] looks at all of them. A wrapper that hides
+//! the agent, like a sandbox, says which agent it runs with
+//! [`AGENT_HINT`] in its environment.
+//!
+//! [`foreground`] lists the processes in front for `crystal process-info`:
+//! each one's command and the directory it works in.
 
 use crate::agent_rules;
 use crate::catalog;
-use crate::protocol::Front;
-use std::path::Path;
+use crate::protocol::{Front, ProcessInfo};
+use std::path::{Path, PathBuf};
+
+/// The variable a program in front sets to say it runs that agent, for a
+/// wrapper that hides the agent's own process: `CRYSTAL_AGENT=claude fence
+/// -- claude`. Only the process in front is looked at, so it's for the
+/// wrapper's command, not for exporting.
+pub const AGENT_HINT: &str = "CRYSTAL_AGENT";
 
 /// The shells crystal recognises, by program name.
 const SHELLS: &[&str] = &[
@@ -31,7 +42,38 @@ const INTERPRETERS: &[&str] = &[
 /// or this system doesn't say).
 pub fn of_process(leader: i32) -> Option<Front> {
     let process = read_process(leader)?;
-    Some(classify(&process.exe, &process.args))
+    let hinted = process.hint.as_deref().and_then(agent_named);
+    Some(hinted.unwrap_or_else(|| classify(&process.exe, &process.args)))
+}
+
+/// The processes in the foreground process group `group`, the job a
+/// terminal's keys go to: its leader first, then the rest by their pids.
+/// Those that can't be read, say ended since, are left out.
+pub fn foreground(group: i32) -> Vec<ProcessInfo> {
+    let mut pids = group_members(group);
+    pids.sort_by_key(|&pid| (pid != group, pid));
+    pids.dedup();
+    pids.into_iter()
+        .filter_map(|pid| {
+            let process = read_process(pid)?;
+            let name = process
+                .args
+                .first()
+                .map(|first| program_name(first))
+                .filter(|name| !name.is_empty())
+                .or_else(|| {
+                    let name = process.exe.file_name()?;
+                    Some(name.to_string_lossy().into_owned())
+                })
+                .unwrap_or_default();
+            Some(ProcessInfo {
+                pid,
+                name,
+                argv: process.args,
+                cwd: working_dir(pid),
+            })
+        })
+        .collect()
 }
 
 /// What a session's own command is, as if it were in front: until the
@@ -163,8 +205,20 @@ fn program_name(path: &str) -> String {
 
 /// A running process, as much of it as tells what it is.
 struct Process {
-    exe: std::path::PathBuf,
+    exe: PathBuf,
     args: Vec<String>,
+    /// The agent its environment says it runs, by [`AGENT_HINT`].
+    hint: Option<String>,
+}
+
+/// The agent an environment's strings, `NAME=value` each, say a process
+/// runs: a value of [`AGENT_HINT`] that isn't empty.
+fn hint<'a>(env: impl IntoIterator<Item = &'a str>) -> Option<String> {
+    env.into_iter()
+        .filter_map(|var| var.strip_prefix(AGENT_HINT)?.strip_prefix('='))
+        .map(str::trim)
+        .find(|agent| !agent.is_empty())
+        .map(String::from)
 }
 
 #[cfg(target_os = "linux")]
@@ -176,19 +230,72 @@ fn read_process(pid: i32) -> Option<Process> {
         .filter(|arg| !arg.is_empty())
         .map(|arg| String::from_utf8_lossy(arg).into_owned())
         .collect();
-    Some(Process { exe, args })
+    // Another user's process keeps its environment to itself.
+    let environ = std::fs::read(format!("/proc/{pid}/environ")).unwrap_or_default();
+    let env = environ
+        .split(|&byte| byte == 0)
+        .map(|var| String::from_utf8_lossy(var).into_owned())
+        .collect::<Vec<String>>();
+    let hint = hint(env.iter().map(String::as_str));
+    Some(Process { exe, args, hint })
 }
 
 #[cfg(target_os = "macos")]
 fn read_process(pid: i32) -> Option<Process> {
+    let (args, env) = macos::arguments(pid)?;
     Some(Process {
         exe: macos::executable(pid).unwrap_or_default(),
-        args: macos::arguments(pid)?,
+        args,
+        hint: hint(env.iter().map(String::as_str)),
     })
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn read_process(_pid: i32) -> Option<Process> {
+    None
+}
+
+/// The pids of the processes in the process group `group`.
+#[cfg(target_os = "linux")]
+fn group_members(group: i32) -> Vec<i32> {
+    let Ok(dir) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    let group_of = |pid: i32| -> Option<i32> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        // After the name in brackets, which may hold anything: the state,
+        // the parent, then the process group.
+        let (_, after) = stat.rsplit_once(')')?;
+        after.split_whitespace().nth(2)?.parse().ok()
+    };
+    dir.filter_map(|entry| entry.ok()?.file_name().to_str()?.parse::<i32>().ok())
+        .filter(|&pid| group_of(pid) == Some(group))
+        .collect()
+}
+
+#[cfg(target_os = "macos")]
+fn group_members(group: i32) -> Vec<i32> {
+    macos::group_members(group)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn group_members(group: i32) -> Vec<i32> {
+    vec![group]
+}
+
+/// The directory process `pid` works in, when the system says.
+#[cfg(target_os = "linux")]
+fn working_dir(pid: i32) -> Option<PathBuf> {
+    std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
+}
+
+#[cfg(target_os = "macos")]
+fn working_dir(pid: i32) -> Option<PathBuf> {
+    macos::working_dir(pid)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn working_dir(_pid: i32) -> Option<PathBuf> {
     None
 }
 
@@ -211,10 +318,54 @@ mod macos {
         Some(PathBuf::from(String::from_utf8_lossy(&buffer).into_owned()))
     }
 
-    /// The arguments process `pid` was started with, from the kernel's
-    /// copy: the count of them, the executable's path, and then each
-    /// argument, all ended by NULs.
-    pub fn arguments(pid: i32) -> Option<Vec<String>> {
+    /// The pids of the processes in the process group `group`.
+    pub fn group_members(group: i32) -> Vec<i32> {
+        let mut pids = vec![0 as libc::pid_t; 1024];
+        let room = (pids.len() * std::mem::size_of::<libc::pid_t>()) as libc::c_int;
+        // SAFETY: the buffer is as long as the size given, and
+        // proc_listpgrppids writes at most that, giving back how many pids.
+        let count = unsafe { libc::proc_listpgrppids(group, pids.as_mut_ptr().cast(), room) };
+        if count <= 0 {
+            return Vec::new();
+        }
+        pids.truncate(count as usize);
+        pids.retain(|&pid| pid > 0);
+        pids
+    }
+
+    /// The directory process `pid` works in.
+    pub fn working_dir(pid: i32) -> Option<PathBuf> {
+        // SAFETY: an all-zero proc_vnodepathinfo is a valid value for
+        // proc_pidinfo to fill in, and the size given is its own.
+        let mut info: libc::proc_vnodepathinfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<libc::proc_vnodepathinfo>() as libc::c_int;
+        let written = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDVNODEPATHINFO,
+                0,
+                (&mut info as *mut libc::proc_vnodepathinfo).cast(),
+                size,
+            )
+        };
+        if written != size {
+            return None;
+        }
+        let path: Vec<u8> = info
+            .pvi_cdir
+            .vip_path
+            .iter()
+            .flatten()
+            .map(|&byte| byte as u8)
+            .take_while(|&byte| byte != 0)
+            .collect();
+        (!path.is_empty()).then(|| PathBuf::from(String::from_utf8_lossy(&path).into_owned()))
+    }
+
+    /// The arguments process `pid` was started with, and its environment,
+    /// from the kernel's copy: the count of the arguments, the executable's
+    /// path, then each argument, then each `NAME=value`, all ended by NULs.
+    pub fn arguments(pid: i32) -> Option<(Vec<String>, Vec<String>)> {
         let mut buffer = vec![0u8; argument_space()];
         let mut size = buffer.len();
         let mut name = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
@@ -263,26 +414,28 @@ mod macos {
         })
     }
 
-    /// The arguments in what KERN_PROCARGS2 gives: a count, then the
-    /// executable's path and NUL padding, then the arguments.
-    pub fn parse_arguments(buffer: &[u8]) -> Vec<String> {
+    /// The arguments and the environment in what KERN_PROCARGS2 gives: a
+    /// count, then the executable's path and NUL padding, then the
+    /// arguments, then the environment, up to an empty string.
+    pub fn parse_arguments(buffer: &[u8]) -> (Vec<String>, Vec<String>) {
         let Some(count) = buffer.get(..4) else {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         };
-        let count = i32::from_ne_bytes([count[0], count[1], count[2], count[3]]);
+        let count = i32::from_ne_bytes([count[0], count[1], count[2], count[3]]).max(0) as usize;
         let rest = &buffer[4..];
         // Past the executable's path, then the NULs after it.
         let Some(path_end) = rest.iter().position(|&byte| byte == 0) else {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         };
         let Some(start) = rest[path_end..].iter().position(|&byte| byte != 0) else {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         };
-        rest[path_end + start..]
+        let mut strings = rest[path_end + start..]
             .split(|&byte| byte == 0)
-            .take(count.max(0) as usize)
-            .map(|arg| String::from_utf8_lossy(arg).into_owned())
-            .collect()
+            .map(|string| String::from_utf8_lossy(string).into_owned());
+        let args = strings.by_ref().take(count).collect();
+        let env = strings.take_while(|var| !var.is_empty()).collect();
+        (args, env)
     }
 }
 
@@ -404,15 +557,40 @@ mod tests {
     #[test]
     fn macos_arguments_skip_the_path_and_its_padding() {
         let mut buffer = 2i32.to_ne_bytes().to_vec();
-        buffer.extend_from_slice(b"/bin/zsh\0\0\0\0zsh\0-l\0HOME=/x\0");
-        assert_eq!(macos::parse_arguments(&buffer), ["zsh", "-l"]);
+        buffer
+            .extend_from_slice(b"/bin/zsh\0\0\0\0zsh\0-l\0HOME=/x\0CRYSTAL_AGENT=claude\0\0junk\0");
+        let (args, env) = macos::parse_arguments(&buffer);
+        assert_eq!(args, ["zsh", "-l"]);
+        assert_eq!(env, ["HOME=/x", "CRYSTAL_AGENT=claude"]);
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn this_process_reads_as_itself() {
         let me = read_process(std::process::id() as i32).unwrap();
         assert!(!me.args.is_empty());
         assert!(me.exe.is_absolute());
+        let group = unsafe { libc::getpgrp() };
+        let pids: Vec<i32> = foreground(group)
+            .iter()
+            .map(|process| process.pid)
+            .collect();
+        assert!(pids.contains(&(std::process::id() as i32)), "{pids:?}");
+        let mine = foreground(group)
+            .into_iter()
+            .find(|process| process.pid == std::process::id() as i32)
+            .unwrap();
+        assert_eq!(mine.cwd, std::env::current_dir().ok());
+    }
+
+    #[test]
+    fn a_wrapper_says_which_agent_it_runs() {
+        assert_eq!(
+            hint(["HOME=/x", "CRYSTAL_AGENT=claude"]),
+            Some("claude".into())
+        );
+        assert_eq!(hint(["CRYSTAL_AGENT=", "PATH=/bin"]), None);
+        assert_eq!(hint(["CRYSTAL_AGENT_HOOKS=1"]), None);
+        assert_eq!(hint(Vec::<&str>::new()), None);
     }
 }

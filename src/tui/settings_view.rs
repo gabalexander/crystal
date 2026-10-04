@@ -1,6 +1,8 @@
 //! The settings view, `,`: the settings crystal reads as it goes, each
-//! changed with a key and written to the config file at once, and how the
-//! model that searches memory by meaning stands, as the daemon says it does.
+//! changed with a key and written to the config file at once, how the model
+//! that searches memory by meaning stands, as the daemon says it does, and
+//! crystal's hooks in each agent installed here, put there, brought up to
+//! date or taken out with a key.
 //! While the view is open, the event loop reads both again every half a
 //! second, so what it shows follows the file, a download or the daemon,
 //! whoever changed them. The event loop does the writing (see
@@ -12,6 +14,7 @@ use super::appearance::Appearance;
 use super::theme::{self, Theme};
 use crate::config::{BarPosition, Config, SessionSettings, TaskSettings, ThemeName};
 use crate::embed::Status;
+use crate::integration::{self, Standing};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::{Margin, Rect};
@@ -28,6 +31,9 @@ pub struct Current {
     pub config: Result<Config, String>,
     /// How the model stands, as the daemon said; `None` when it couldn't.
     pub model: Option<Status>,
+    /// The agents installed here that crystal can hook, and how its hooks
+    /// in each stand.
+    pub integrations: Vec<(integration::Agent, Standing)>,
 }
 
 /// A setting the view changes.
@@ -52,6 +58,8 @@ pub enum Setting {
     Distill,
     Embeddings,
     HideDrafts,
+    /// crystal's hooks in an agent's own settings.
+    Integration(integration::Agent),
 }
 
 /// A change to one setting, to write to the config file.
@@ -203,6 +211,12 @@ pub enum Outcome {
     /// Have the daemon download the model if it isn't here, and give every
     /// entry its vector.
     Prepare,
+    /// Put crystal's hooks in the agent's settings, or bring them up to
+    /// date, or with `install` false, take them out.
+    Integrate {
+        agent: integration::Agent,
+        install: bool,
+    },
 }
 
 /// The settings the bar can be on, in the order they're listed.
@@ -235,6 +249,9 @@ pub struct SettingsView {
     selected: usize,
     /// Why the last thing asked for couldn't be done.
     problem: Option<String>,
+    /// What the last thing asked for came to, when there's something to
+    /// say, like what's next for Codex's hooks.
+    note: Option<String>,
 }
 
 impl SettingsView {
@@ -243,7 +260,36 @@ impl SettingsView {
             current: None,
             selected: 0,
             problem: None,
+            note: None,
         }
+    }
+
+    /// The rows the bar goes through: the settings, then the agents' hooks.
+    fn rows(&self) -> Vec<Setting> {
+        let agents = self
+            .current
+            .iter()
+            .flat_map(|current| &current.integrations)
+            .map(|&(agent, _)| Setting::Integration(agent));
+        SETTINGS.into_iter().chain(agents).collect()
+    }
+
+    /// The setting the bar is on.
+    fn selected_row(&self) -> Setting {
+        let rows = self.rows();
+        rows[self.selected.min(rows.len() - 1)]
+    }
+
+    /// How crystal's hooks in `agent` stand, as last read.
+    fn standing(&self, agent: integration::Agent) -> Option<Standing> {
+        let current = self.current.as_ref()?;
+        let (_, standing) = current.integrations.iter().find(|(a, _)| *a == agent)?;
+        Some(*standing)
+    }
+
+    /// Says what came of the last thing asked for.
+    pub fn set_note(&mut self, note: String) {
+        self.note = Some(note);
     }
 
     /// Takes the settings as they are now.
@@ -270,22 +316,23 @@ impl SettingsView {
 
     pub fn on_key(&mut self, key: KeyEvent) -> Outcome {
         self.problem = None;
+        self.note = None;
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             return Outcome::Stay;
         }
         match key.code {
             KeyCode::Esc | KeyCode::Char('q' | ',') => Outcome::Close,
             KeyCode::Char('j') | KeyCode::Down => {
-                self.selected = (self.selected + 1).min(SETTINGS.len() - 1);
+                self.selected = (self.selected + 1).min(self.rows().len() - 1);
                 Outcome::Stay
             }
             KeyCode::Char('k') | KeyCode::Up => {
-                self.selected = self.selected.saturating_sub(1);
+                self.selected = self.selected.min(self.rows().len() - 1).saturating_sub(1);
                 Outcome::Stay
             }
             KeyCode::Char(' ') | KeyCode::Right | KeyCode::Char('l') => self.change(true),
             KeyCode::Left | KeyCode::Char('h') => self.change(false),
-            KeyCode::Enter => match SETTINGS[self.selected] {
+            KeyCode::Enter => match self.selected_row() {
                 Setting::Embeddings => self.prepare(),
                 _ => self.change(true),
             },
@@ -307,7 +354,12 @@ impl SettingsView {
             }
             Some(Current { config: Ok(c), .. }) => c,
         };
-        let change = match SETTINGS[self.selected] {
+        let change = match self.selected_row() {
+            // Not a setting in the file: the agent's own settings change.
+            Setting::Integration(agent) => {
+                let install = self.standing(agent) != Some(Standing::Installed);
+                return Outcome::Integrate { agent, install };
+            }
             Setting::Notify => Change::Notify(!config.notify),
             Setting::NotifyAfter => {
                 Change::NotifyAfter(next_wait(config.notifications.after_secs, forward))
@@ -492,7 +544,7 @@ fn lines(view: &SettingsView, theme: &Theme) -> Vec<Line<'static>> {
     let memory_on = crate::memory::enabled(config);
     let forge_on = crate::forge::enabled(config);
     let row = |setting: Setting, on: Option<bool>, value: String, about: String| {
-        let selected = SETTINGS[view.selected] == setting;
+        let selected = view.selected_row() == setting;
         let name = match setting {
             Setting::Notify => "notifications",
             Setting::NotifyAfter => "  after",
@@ -513,6 +565,7 @@ fn lines(view: &SettingsView, theme: &Theme) -> Vec<Line<'static>> {
             Setting::Distill => "distill closed tasks",
             Setting::Embeddings => "search by meaning",
             Setting::HideDrafts => "hide drafts",
+            Setting::Integration(agent) => agent.name(),
         };
         let mouse = matches!(
             setting,
@@ -759,6 +812,35 @@ fn lines(view: &SettingsView, theme: &Theme) -> Vec<Line<'static>> {
             muted,
         ));
     }
+
+    lines.push(Line::from(""));
+    lines.push(Line::styled("Integrations", bold));
+    if current.integrations.is_empty() {
+        lines.push(Line::styled(
+            "none of the agents crystal can hook is installed here",
+            muted,
+        ));
+    }
+    for &(agent, standing) in &current.integrations {
+        let (on, about) = match standing {
+            Standing::Installed => (Some(true), "it says what it's doing: space takes them out"),
+            Standing::OutOfDate => (
+                Some(false),
+                "another crystal's, or older: space brings them up to date",
+            ),
+            Standing::NotInstalled => (Some(false), "space puts crystal's hooks in its settings"),
+        };
+        lines.push(row(
+            Setting::Integration(agent),
+            on,
+            standing.word().to_string(),
+            about.to_string(),
+        ));
+    }
+    if let Some(note) = &view.note {
+        lines.push(Line::from(""));
+        lines.push(Line::styled(note.clone(), muted));
+    }
     if let Some(problem) = &view.problem {
         lines.push(Line::from(""));
         lines.push(Line::styled(problem.clone(), Style::new().fg(theme.failed)));
@@ -780,6 +862,7 @@ mod tests {
             path: PathBuf::from("/home/ann/.config/crystal/config.toml"),
             config: Ok(config),
             model,
+            integrations: Vec::new(),
         });
         view
     }
@@ -924,6 +1007,68 @@ mod tests {
             Outcome::Change(Change::HideDrafts(true))
         );
         assert_eq!(press(&mut view, KeyCode::Char(',')), Outcome::Close);
+    }
+
+    #[test]
+    fn an_agent_s_hooks_go_in_come_up_to_date_and_come_out_with_space() {
+        use integration::Agent;
+        let mut view = SettingsView::new();
+        view.set_current(Current {
+            path: PathBuf::from("/c"),
+            config: Ok(Config::default()),
+            model: None,
+            integrations: vec![
+                (Agent::Claude, Standing::Installed),
+                (Agent::Codex, Standing::OutOfDate),
+                (Agent::Pi, Standing::NotInstalled),
+            ],
+        });
+        let shown = text(&view);
+        assert!(shown.contains("Integrations"), "{shown}");
+        assert!(shown.contains("Claude Code"), "{shown}");
+        assert!(shown.contains("out of date"), "{shown}");
+        // The agents come after the last setting.
+        for _ in 0..SETTINGS.len() {
+            press(&mut view, KeyCode::Char('j'));
+        }
+        assert_eq!(
+            press(&mut view, KeyCode::Char(' ')),
+            Outcome::Integrate {
+                agent: Agent::Claude,
+                install: false
+            }
+        );
+        press(&mut view, KeyCode::Char('j'));
+        assert_eq!(
+            press(&mut view, KeyCode::Enter),
+            Outcome::Integrate {
+                agent: Agent::Codex,
+                install: true
+            }
+        );
+        press(&mut view, KeyCode::Char('j'));
+        // The bar stops at the last.
+        press(&mut view, KeyCode::Char('j'));
+        assert_eq!(
+            press(&mut view, KeyCode::Char(' ')),
+            Outcome::Integrate {
+                agent: Agent::Pi,
+                install: true
+            }
+        );
+        view.set_note("codex: review them in its /hooks".into());
+        assert!(text(&view).contains("review them in its /hooks"));
+        // An agent gone between two reads leaves the bar on a row there is.
+        view.set_current(Current {
+            path: PathBuf::from("/c"),
+            config: Ok(Config::default()),
+            model: None,
+            integrations: Vec::new(),
+        });
+        assert_eq!(
+            press(&mut view, KeyCode::Char(' ')),
+            Outcome::Change(Change::HideDrafts(true))
+        );
     }
 
     #[test]
@@ -1111,6 +1256,7 @@ mod tests {
             path: PathBuf::from("/c"),
             config: Ok(config),
             model: Some(status()),
+            integrations: Vec::new(),
         });
         assert_eq!(press(&mut view, KeyCode::Enter), Outcome::Prepare);
     }
@@ -1124,6 +1270,7 @@ mod tests {
             path: PathBuf::from("/c"),
             config: Err("`notfy` is not a setting".into()),
             model: None,
+            integrations: Vec::new(),
         });
         assert_eq!(press(&mut view, KeyCode::Char(' ')), Outcome::Stay);
         assert!(view.problem().unwrap().contains("can't be read"));

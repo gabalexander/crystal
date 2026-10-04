@@ -41,7 +41,9 @@ crystal read reviewer --lines 40
 ```
 
 `read` prints the screen as text. `--lines N` keeps the last N rows that aren't blank. `--history` adds what
-has scrolled off the screen.
+has scrolled off the screen. `--since 10m` keeps only what it wrote in the last ten minutes, and `--unwrap`
+joins a long line the screen wrapped. A long message goes in from a file or a pipe: `crystal send reviewer -
+< notes.md`.
 
 ## Or run a task
 
@@ -175,6 +177,7 @@ crystal wait reviewer --until waiting --timeout 600   # or working, done, idle, 
 crystal wait server --output 'listening on' --timeout 60   # a regular expression; prints the line
 ```
 
+- A wait that runs out of time exits 2; anything else that goes wrong exits 1. `--quiet` prints nothing.
 - `--until` fails when the program ends first, unless `ended` is one it waits for.
 - A turn that ends while the user watches it is `idle` at once, never `done`: wait for `done,idle`.
 - `--output` counts what's on the screen already, and the rows just above it.
@@ -270,11 +273,14 @@ crystal memory search ledger
 - `wait` returns at once when the session is already `done`, `idle` or `waiting`. To wait for the turn your
   input starts, use `send --wait` or `send-keys --wait`, not `send` then `wait`.
 - A program that doesn't report what it's doing (a shell, a build) counts as busy until it exits: `wait`
-  blocks until then. Pass `--timeout <seconds>`; it fails when the time runs out.
+  blocks until then. Pass `--timeout <seconds>`; it exits 2 when the time runs out.
 - `send` refuses an agent that's asking the user something, with an error starting `agent_blocked:`: the
   text would land in its question. Answer it with `send-keys` (`crystal answer` for a background task) if
   that's yours to answer, or leave it to the user; `--force` types it anyway.
 - What you `send` another session starts with a line saying it's from yours, and what you work on. Send 20 a
   minute at most: past that it's refused, as two agents answering each other are probably in a loop; stop
-  sending and carry on with your own work. Never send only to say you got a message.
+  sending and carry on with your own work. Never send only to say you got a message: a message that only
+  acknowledges, like `ok` or `thanks!`, is refused.
+- A background task works on one prompt at a time: `send --interrupt` stops its run and sends yours in its
+  place. An agent in a terminal is stopped with `send-keys <name> Escape`.
 - Don't `kill` or `send` to your own session. `$CRYSTAL_SESSION` is its name when it started.

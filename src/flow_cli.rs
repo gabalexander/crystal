@@ -180,7 +180,8 @@ pub fn wait(socket: &Path, name: &str, timeout: Option<Duration>) -> Result<()> 
         }
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             let seconds = timeout.unwrap_or_default().as_secs_f64();
-            bail!("{name} was still running after {seconds}s");
+            let said = format!("{name} was still running after {seconds}s");
+            return Err(crate::drive::TimedOut(said).into());
         }
         thread::sleep(POLL_EVERY);
     }

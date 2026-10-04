@@ -68,6 +68,41 @@ pub fn tidy(text: &str) -> Result<String> {
     Ok(tidied)
 }
 
+/// The words a message that only acknowledges is made of, as docket has
+/// them.
+const ACKNOWLEDGEMENTS: [&str; 6] = ["ok", "thanks", "received", "ack", "done", "noted"];
+
+/// How long a message that only acknowledges can be, in characters: past
+/// it, a message is taken to say something, whatever its words.
+const ACKNOWLEDGEMENT_MOST: usize = 20;
+
+/// Refuses `text`, from another session, when all it does is acknowledge:
+/// short, and made of nothing but [`ACKNOWLEDGEMENTS`] in any case with any
+/// punctuation, or of no letters at all, like `👍`. Two agents that answer
+/// each other's thanks never stop. `ok, 3 tests fail` says something; `ok,
+/// thanks!` doesn't.
+pub fn check_says_something(text: &str) -> Result<()> {
+    if text.chars().count() >= ACKNOWLEDGEMENT_MOST {
+        return Ok(());
+    }
+    let words: Vec<String> = text
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .map(str::to_lowercase)
+        .collect();
+    let acknowledges = words
+        .iter()
+        .all(|word| ACKNOWLEDGEMENTS.contains(&word.as_str()));
+    let lettered = text.chars().any(char::is_alphanumeric);
+    ensure!(
+        lettered && !acknowledges,
+        "not sent: a message that only acknowledges (`{text}`) starts another turn for nothing, and \
+         two sessions thanking each other never stop. Send what the other session needs to know, \
+         or nothing, and carry on with your own work"
+    );
+    Ok(())
+}
+
 /// `text` cut to at most `most` bytes, on a character's edge, with `…`
 /// where it was cut.
 fn cut(text: &str, most: usize) -> String {
@@ -217,6 +252,35 @@ mod tests {
         assert!(cut.ends_with("é…"));
         let fits = "x".repeat(MOST_BYTES);
         assert_eq!(tidy(&fits).unwrap(), fits);
+    }
+
+    #[test]
+    fn a_message_that_only_acknowledges_is_refused() {
+        for bare in [
+            "ok",
+            "OK.",
+            "ok, thanks!",
+            "Thanks",
+            "noted",
+            "ack",
+            "done!",
+            "👍",
+            "...",
+        ] {
+            let err = check_says_something(bare).unwrap_err().to_string();
+            assert!(err.contains("only acknowledges"), "{bare}: {err}");
+        }
+        for says in [
+            "ok, 3 tests fail",
+            "done: the codec moved to src/codec.rs",
+            "thanks: the test was the problem",
+            "2",
+            "fixed",
+        ] {
+            check_says_something(says).unwrap_or_else(|err| panic!("{says}: {err}"));
+        }
+        // Long enough, it says something whatever its words.
+        check_says_something("ok ok ok ok ok ok ok ok").unwrap();
     }
 
     #[test]

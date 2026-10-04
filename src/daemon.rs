@@ -14,6 +14,7 @@ use crate::config::{Config, MemorySettings};
 use crate::db;
 use crate::db::Db;
 use crate::distill::{self, Job};
+use crate::drive;
 use crate::embed;
 use crate::env;
 use crate::event_log::{self, Bus, Subscription};
@@ -361,10 +362,11 @@ impl Daemon {
                 rows,
                 cols,
                 history,
+                program,
             } => {
                 drop(ticket);
-                return match self.find(name.as_deref()) {
-                    Ok(found) => attach(&conn, input, found, (rows, cols), history),
+                return match self.find(name.as_deref(), !program) {
+                    Ok(found) => attach(&conn, input, found, (rows, cols), history, program),
                     Err(err) => Ok(protocol::send(&conn, &Response::from(err))?),
                 };
             }
@@ -1635,15 +1637,18 @@ impl Daemon {
     }
 
     /// The session called `name`, or the newest one, for a client about to
-    /// show it. That counts as having seen it.
-    fn find(&self, name: Option<&str>) -> Result<Found> {
+    /// show it. That counts as having seen it, when it's the user who `sees`
+    /// it.
+    fn find(&self, name: Option<&str>, sees: bool) -> Result<Found> {
         let mut sessions = self.sessions.lock().unwrap();
         let session = match name {
             Some(name) => named(&mut sessions, name)?,
             None => sessions.last_mut().context("there are no sessions")?,
         };
-        session.seen();
-        self.tell_changes(session);
+        if sees {
+            session.seen();
+            self.tell_changes(session);
+        }
         Ok(Found {
             name: session.name.clone(),
             id: session.id.clone(),
@@ -1682,7 +1687,11 @@ impl Daemon {
                 Some(Sender::new(&info.id, &info.name, info.task.as_ref()))
             });
             let text = match &sender {
-                Some(_) => messages::tidy(text)?,
+                Some(_) => {
+                    let tidied = messages::tidy(text)?;
+                    messages::check_says_something(&tidied)?;
+                    tidied
+                }
                 None => text.to_string(),
             };
             let session = named(&mut sessions, name)?;
@@ -2035,9 +2044,37 @@ impl Daemon {
                 let explained = session.explain_screen(agent.as_deref());
                 Ok(Response::Explained(Box::new(explained)))
             }
-            Request::Read { name, history } => {
-                let mut sessions = self.sessions.lock().unwrap();
-                let rows = named(&mut sessions, &name)?.term().rows(history);
+            Request::ProcessInfo { name } => {
+                let (pid, term) = {
+                    let mut sessions = self.sessions.lock().unwrap();
+                    let session = named(&mut sessions, &name)?;
+                    ensure!(
+                        !session.is_task(),
+                        "{name} is a background task, which runs in no terminal"
+                    );
+                    ensure!(session.is_running(), "{name} has ended");
+                    (session.info().pid, session.term())
+                };
+                let group = term.foreground_group();
+                let foreground = group.map(front::foreground).unwrap_or_default();
+                Ok(Response::Processes(protocol::Processes {
+                    pid,
+                    group,
+                    foreground,
+                }))
+            }
+            Request::Read {
+                name,
+                history,
+                unwrap,
+                ansi,
+                since_ms,
+            } => {
+                let term = {
+                    let mut sessions = self.sessions.lock().unwrap();
+                    named(&mut sessions, &name)?.term()
+                };
+                let rows = term.read(history, unwrap, ansi, since_ms);
                 Ok(Response::Screen { rows })
             }
             Request::Close {
@@ -2678,7 +2715,12 @@ impl Daemon {
         let response = match watched {
             Ok(None) => None,
             Ok(Some(line)) => Some(Response::Matched { line }),
-            Err(err) => Some(Response::from(err)),
+            Err(err) => match err.downcast::<drive::TimedOut>() {
+                Ok(timed_out) => Some(Response::TimedOut {
+                    message: timed_out.0,
+                }),
+                Err(err) => Some(Response::from(err)),
+            },
         };
         if let Some(response) = response {
             protocol::send(conn, &response)?;
@@ -2969,7 +3011,8 @@ fn matching_row(
         let left = deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
         if left == Some(Duration::ZERO) {
             let seconds = timeout.unwrap_or_default().as_secs_f64();
-            bail!("nothing on {name}'s screen matched `{pattern}` after {seconds}s");
+            let said = format!("nothing on {name}'s screen matched `{pattern}` after {seconds}s");
+            return Err(drive::TimedOut(said).into());
         }
         let wait = left.map_or(LOOK_FOR_HANG_UP, |left| left.min(LOOK_FOR_HANG_UP));
         match output.recv_timeout(wait) {
@@ -3776,12 +3819,24 @@ fn attach(
     found: Found,
     (rows, cols): (u16, u16),
     with_history: bool,
+    program: bool,
 ) -> Result<()> {
     let Found { name, id, term } = found;
-    term.resize(rows, cols)?;
-    let watch = term.watch(with_history);
+    // No size keeps the one it has: a program watching it may not want to
+    // change what the user sees.
+    if rows > 0 && cols > 0 {
+        term.resize(rows, cols)?;
+    }
+    let watch = term.watch(with_history, program);
     let running = watch.feed.is_some();
-    protocol::send(conn, &Response::Attached { name, id, running })?;
+    let size = term.size();
+    let attached = Response::Attached {
+        name,
+        id,
+        running,
+        size,
+    };
+    protocol::send(conn, &attached)?;
     let mut output = conn.try_clone()?;
     output.write_all(&watch.screen)?;
     match watch.feed {

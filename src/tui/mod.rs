@@ -320,6 +320,9 @@ pub enum Event {
     /// The settings as they are now, for the settings view: boxed, as the
     /// config is the biggest thing an event carries.
     Settings(Box<settings_view::Current>),
+    /// The config file has changed: what it says now, or why it can't be
+    /// read.
+    ConfigFile(Box<Result<Config, String>>),
     /// The terminal has focus again, or has lost it.
     Focus(bool),
     /// A page of the event log, the newest first, read for the timeline
@@ -380,6 +383,7 @@ pub fn run(socket: &Path) -> Result<()> {
         sender.clone(),
     );
     let layout = layout_link::Link::open(socket, sender.clone());
+    watch_config(sender.clone());
     let count_backlog = Arc::new(AtomicBool::new(crate::backlog::enabled(&config)));
     let poll_flows = Arc::new(AtomicBool::new(crate::flows::enabled(&config)));
     let poll_settings = Arc::new(AtomicBool::new(false));
@@ -1273,6 +1277,18 @@ impl Tui {
                 }
                 self.app.show_settings(*current);
             }
+            Event::ConfigFile(read) => match *read {
+                // A change the settings view made is the config already.
+                Ok(config) if config != self.config => {
+                    self.config_changed(&config);
+                    self.app
+                        .notify("the config file changed: the settings follow it".into());
+                }
+                Ok(_) => {}
+                Err(why) => self.app.notify(format!(
+                    "the config file can't be read, so the settings stay as they were: {why}"
+                )),
+            },
             Event::Focus(true) => {
                 self.layout.focus(true);
                 if let Some(went) = self.presence.focus_gained(events::now_ms()) {
@@ -1829,6 +1845,23 @@ impl Tui {
             }
             Action::PrepareEmbeddings => {
                 self.prepare_embeddings();
+                self.read_settings_now();
+            }
+            Action::Integrate { agent, install } => {
+                let integrated = std::env::current_exe()
+                    .map_err(anyhow::Error::from)
+                    .and_then(|crystal| match install {
+                        true => crate::integration::install(agent, &crystal),
+                        false => crate::integration::uninstall(agent).map(|said| vec![said]),
+                    });
+                match integrated {
+                    // The last line says what's left to do, like Codex's
+                    // review of its hooks.
+                    Ok(said) => self
+                        .app
+                        .setting_noted(said.last().cloned().unwrap_or_default()),
+                    Err(err) => self.app.setting_failed(format!("{err:#}")),
+                }
                 self.read_settings_now();
             }
             Action::ListPlugins => {
@@ -3341,6 +3374,37 @@ struct Polled {
     settings: Arc<AtomicBool>,
 }
 
+/// How often the config file is looked at for a change.
+const CONFIG_EVERY: Duration = Duration::from_secs(1);
+
+/// Watches the config file, on a thread of its own, and reads it again
+/// whenever it changes, so that a change made by hand, or by another
+/// crystal, counts at once without starting the TUI again. Stops once the
+/// event loop has gone.
+fn watch_config(events: Sender<Event>) {
+    thread::spawn(move || {
+        let path = config::path();
+        // What tells a change: when it was written, and how long it is.
+        let stamp = || {
+            let meta = std::fs::metadata(&path).ok()?;
+            Some((meta.modified().ok()?, meta.len()))
+        };
+        let mut last = stamp();
+        loop {
+            thread::sleep(CONFIG_EVERY);
+            let now = stamp();
+            if now == last {
+                continue;
+            }
+            last = now;
+            let read = Config::load().map_err(|err| format!("{err:#}"));
+            if events.send(Event::ConfigFile(Box::new(read))).is_err() {
+                return;
+            }
+        }
+    });
+}
+
 fn spawn_session_poller(socket: PathBuf, events: Sender<Event>, polled: Polled) {
     let Polled {
         backlog_counts: count_backlog,
@@ -3427,10 +3491,14 @@ fn read_settings(socket: &Path) -> settings_view::Current {
         Ok(Some(Response::EmbeddingStatus(status))) => Some(status),
         _ => None,
     };
+    let integrations = std::env::current_exe()
+        .map(|crystal| crate::integration::here(&crystal))
+        .unwrap_or_default();
     settings_view::Current {
         path: config::path(),
         config: Config::load().map_err(|err| format!("{err:#}")),
         model,
+        integrations,
     }
 }
 
