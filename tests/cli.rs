@@ -2002,6 +2002,191 @@ fn the_screen_says_what_an_agent_without_hooks_is_doing() {
     }
 }
 
+#[test]
+fn agent_explain_shows_the_rule_that_read_a_session_s_screen() {
+    let crystal = Crystal::new();
+    crystal.new_pretend_agent("agent", "printf '\\033]0;⠋ Thinking\\007> '; sleep 30");
+    eventually("the agent is working", || {
+        crystal.row("agent").unwrap()[1] == "working"
+    });
+    let out = crystal.ok(&["agent", "explain", "agent"]);
+    assert!(
+        out.starts_with("agent: Aider (aider) is in front\n"),
+        "{out}"
+    );
+    assert!(
+        out.contains("\ncrystal has its screen as working\n"),
+        "{out}"
+    );
+    assert!(
+        out.contains("\nAny other agent (default) rules read the screen now as working, by rule title_spinner\nrules: crystal's own\n"),
+        "{out}"
+    );
+    let decided = out.lines().find(|line| line.starts_with('→')).unwrap();
+    assert!(decided.contains("title_spinner"), "{decided}");
+
+    let json = crystal.ok(&["agent", "explain", "agent", "--json"]);
+    let json: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(json["rules"]["decided_by"], "title_spinner");
+    assert_eq!(json["watch"], "working");
+    // Another agent's rules, on the same screen.
+    let codex = crystal.ok(&["agent", "explain", "agent", "--agent", "codex"]);
+    assert!(
+        codex.contains("\nCodex (codex) rules read the screen now as "),
+        "{codex}"
+    );
+    let err = crystal.fails(&["agent", "explain", "nobody"]);
+    assert!(err.contains("nobody"), "{err}");
+}
+
+#[test]
+fn agent_explain_tries_an_agent_s_rules_on_a_saved_screen() {
+    let crystal = Crystal::new();
+    let screen = crystal.dir.path().join("screen.txt");
+    std::fs::write(
+        &screen,
+        "  Would you like to run the following command?\n\n› 1. Yes, proceed (y)\n",
+    )
+    .unwrap();
+    let file = screen.to_str().unwrap();
+    let out = crystal.ok(&["agent", "explain", "--file", file, "--agent", "codex"]);
+    assert!(
+        out.starts_with(
+            "Codex (codex) rules read the screen now as waiting, by rule approval_question\n"
+        ),
+        "{out}"
+    );
+    let titled = crystal.ok(&[
+        "agent",
+        "explain",
+        "--file",
+        file,
+        "--agent",
+        "codex",
+        "--title",
+        "Action Required",
+    ]);
+    assert!(titled.contains("by rule osc_title_blocked"), "{titled}");
+    let err = crystal.fails(&["agent", "explain", "--file", file, "--agent", "nobody"]);
+    assert!(err.contains("crystal has no rules for nobody"), "{err}");
+    // The file it read is the one `rules` prints, under any of its names.
+    let rules = crystal.ok(&["agent", "rules", "cursor-agent"]);
+    assert!(rules.contains("\nid = \"cursor\"\n"), "{rules}");
+    assert!(
+        crystal
+            .fails(&["agent", "rules", "nobody"])
+            .contains("no rules for nobody")
+    );
+}
+
+#[test]
+fn a_rules_file_of_the_user_s_changes_how_an_agent_is_read() {
+    let crystal = Crystal::new();
+    let agents = crystal.config_home().join("crystal/agents");
+    std::fs::create_dir_all(&agents).unwrap();
+    // Aider has no rules of its own: these say its hum is work.
+    let hum = "id = \"aider\"\nname = \"Aider\"\n\n[[rules]]\nid = \"hum\"\nlooks = \"working\"\ncontains = [\"hmm\"]\n";
+    std::fs::write(agents.join("aider.toml"), hum).unwrap();
+    crystal.new_pretend_agent("agent", "printf 'hmm'; sleep 30");
+    eventually("the agent is working", || {
+        crystal.row("agent").unwrap()[1] == "working"
+    });
+    let list = crystal.ok(&["agent", "list"]);
+    assert!(list.starts_with("AGENT "), "{list}");
+    let aider = list
+        .lines()
+        .find(|line| line.starts_with("aider "))
+        .unwrap();
+    assert!(aider.contains("agents/aider.toml"), "{aider}");
+    let claude = list
+        .lines()
+        .find(|line| line.starts_with("claude "))
+        .unwrap();
+    assert!(claude.ends_with("built in"), "{claude}");
+
+    // A broken file says so, and crystal's own rules stand in for it.
+    std::fs::write(agents.join("codex.toml"), "id = \"codex\"\n[[rules]\n").unwrap();
+    let list = crystal.ok(&["agent", "list"]);
+    let codex = list
+        .lines()
+        .find(|line| line.starts_with("codex "))
+        .unwrap();
+    assert!(codex.contains(" bundled "), "{codex}");
+    assert!(list.contains("\n! couldn't use "), "{list}");
+    let json = crystal.ok(&["agent", "list", "--json"]);
+    let json: serde_json::Value = serde_json::from_str(&json).unwrap();
+    let codex = json["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|agent| agent["id"] == "codex")
+        .unwrap();
+    assert!(codex["problem"].as_str().unwrap().contains("codex.toml"));
+}
+
+#[test]
+fn integration_puts_hooks_in_other_agents_settings_and_takes_them_out() {
+    let crystal = Crystal::new();
+    let cursor = crystal.dir.path().join("cursor-config");
+    std::fs::create_dir_all(&cursor).unwrap();
+    let run = |args: &[&str]| {
+        let out = crystal
+            .command(args)
+            .env("CURSOR_CONFIG_DIR", &cursor)
+            .output()
+            .unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "crystal {args:?}: {err}");
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let hooks_line = |list: &str| {
+        list.lines()
+            .find(|line| line.starts_with("cursor "))
+            .unwrap()
+            .to_string()
+    };
+    let out = run(&["integration", "install", "cursor"]);
+    assert!(out.contains("cursor: added crystal's hooks to"), "{out}");
+    let hooks: serde_json::Value =
+        serde_json::from_str(&written(&cursor.join("hooks.json"))).unwrap();
+    let command = hooks["hooks"]["stop"][0]["command"].as_str().unwrap();
+    assert!(command.contains(CRYSTAL), "{command}");
+    assert!(command.ends_with(" hook cursor || true"), "{command}");
+    let listed = hooks_line(&run(&["agent", "list"]));
+    assert!(
+        listed.ends_with(" installed") && !listed.contains("not installed"),
+        "{listed}"
+    );
+    let status = run(&["integration", "status", "cursor"]);
+    assert!(status.starts_with("cursor  installed"), "{status}");
+
+    let out = run(&["integration", "uninstall", "cursor"]);
+    assert!(out.contains("took crystal's hooks out"), "{out}");
+    let listed = hooks_line(&run(&["agent", "list"]));
+    assert!(listed.ends_with("not installed"), "{listed}");
+
+    let gemini = crystal.fails(&["integration", "install", "gemini"]);
+    assert!(gemini.contains("gemini"), "{gemini}");
+}
+
+#[test]
+fn a_hook_from_another_agent_than_the_one_in_front_is_left_out() {
+    let crystal = Crystal::new();
+    crystal.new_pretend_agent("agent", "printf '> '; sleep 30");
+    eventually("the agent is in front", || {
+        crystal
+            .ok(&["agent", "explain", "agent"])
+            .starts_with("agent: Aider (aider) is in front")
+    });
+    let prompt = r#"{"hook_event_name":"UserPromptSubmit","session_id":"s1"}"#;
+    // A Codex the agent started, with hooks in its own settings.
+    run_hook(&crystal, "agent", &format!("{CRYSTAL} hook codex"), prompt);
+    assert_eq!(crystal.row("agent").unwrap()[1], "running");
+    // The agent's own hooks count.
+    run_hook(&crystal, "agent", &format!("{CRYSTAL} hook aider"), prompt);
+    assert_eq!(crystal.row("agent").unwrap()[1], "working");
+}
+
 /// The line number of the first line of `text` that holds `needle`.
 fn line_with(text: &str, needle: &str) -> usize {
     let found = text.lines().position(|line| line.contains(needle));

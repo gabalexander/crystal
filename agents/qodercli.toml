@@ -1,0 +1,34 @@
+# Adapted from herdr's detection rules (Apache-2.0).
+id = "qodercli"
+name = "Qoder CLI"
+aliases = ["qoderclicn", "qoder", "qodercn"]
+
+[[rules]]
+id = "confirmation_or_input_blocker"
+looks = "waiting"
+priority = 300
+region = "screen"
+any = [
+  { contains = ["waiting for user confirmation"], any = [{ contains = ["yes"] }, { contains = ["no"] }, { contains = ["allow"] }, { contains = ["reject"] }] },
+  { contains = ["awaiting approval"], any = [{ contains = ["allow"] }, { contains = ["reject"] }] },
+  { contains = ["permission required"] },
+  { contains = ["allow once or always?"] },
+  { contains = ["asking user"] },
+  { contains = ["enter your response"] },
+  { contains = ["review your answers:"] },
+  { contains = ["shell awaiting input"] },
+]
+
+[[rules]]
+id = "cancel_hint_working"
+looks = "working"
+priority = 100
+region = "screen"
+contains = ["(esc to cancel,"]
+
+[[rules]]
+id = "spinner_working"
+looks = "working"
+priority = 90
+region = "screen"
+line_regex = ['^\s*[\u2800-\u28FF]\s+.*\p{Alphabetic}']

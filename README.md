@@ -298,20 +298,23 @@ version, or an agent npm runs with `node`.
 
 crystal knows what an agent is doing in two ways. When it starts Claude Code itself, it adds hooks with
 `--settings`, so your settings files are left alone and your own hooks still run. And for every session it
-reads the screen: the spinner an agent puts in its title, "esc to interrupt" while it works, the question
-it asks before a command. The screen covers agents without hooks, like Codex or a Claude you started from a
-shell, and what hooks never say: a turn you cut short with Esc, or work carrying on once you've said yes.
-The screen only counts while an agent is in front: a shell or a build printing an agent's words never shows
-as waiting, and when an agent exits back to its shell, what it was doing goes with it. While Claude Code's
-agent has subagents running, its row says how many after what's in front: `claude +2`.
+reads the screen, by [rules for each agent](#how-crystal-reads-an-agent): the spinner an agent puts in its
+title, "esc to interrupt" while it works, the question it asks before a command. The screen covers agents
+without hooks, like Codex or a Claude you started from a shell, and what hooks never say: a turn you cut short
+with Esc, or work carrying on once you've said yes. The screen only counts while an agent is in front: a shell
+or a build printing an agent's words never shows as waiting, and when an agent exits back to its shell, what
+it was doing goes with it. `crystal agent explain <session>` shows why crystal reads a session the way it
+does. While Claude Code's agent has subagents running, its row says how many after
+what's in front: `claude +2`.
 
 A Claude Code or Codex you start yourself, typed into a session's shell, has no hooks of crystal's: crystal
 doesn't start it. `crystal integration install` puts crystal's hooks in their own settings, beside yours:
 
 ```sh
-crystal integration install          # Claude Code and Codex, each that's installed here
+crystal integration install          # each agent crystal can hook that's installed here
 crystal integration install claude   # into $CLAUDE_CONFIG_DIR/settings.json, or ~/.claude/settings.json
 crystal integration install codex    # into $CODEX_HOME/hooks.json, or ~/.codex/hooks.json
+crystal integration install cursor   # and droid, qodercli, qwen, copilot: see below
 crystal integration status           # whether they're there, for this crystal
 crystal integration uninstall        # take them out again, and only them
 ```
@@ -637,7 +640,9 @@ to, stays, and so does one a script has typed into the session by with `crystal 
 Under the task, `Tab` and `Shift+Tab` go from row to row and `←` / `→` change a row's choice:
 
 - **run**: your [profiles](#profiles), then the agents installed on your `PATH` (Claude Code, Codex, Gemini
-  CLI, OpenCode, Cursor, Aider), then your shell. What you started last is chosen the next time. A profile's
+  CLI, OpenCode, Cursor, Qwen Code, Pi, GitHub Copilot, Amp, Droid, Kimi Code, Kiro, Cline, Kilo Code,
+  Devin, Grok, Qoder CLI, Letta Code, Hermes Agent, Antigravity, Aider), then your shell. What you started
+  last is chosen the next time. A profile's
   description shows under the row, and choosing it sets the rows below from it; you can still change them.
 - **how**, for Claude Code: **in a terminal**, or **in the background**, as a [background
   task](#background-tasks) that needs no terminal. Only Claude Code offers it: crystal reads `claude -p`'s
@@ -656,8 +661,9 @@ it.
 
 The panel ends with the command it runs and, for a new worktree, where. `Ctrl+E` hands that command to the
 bottom line, `new session:`, to change it or run anything else: `npm run dev` or `sh -c 'make && make test'`
-work there, and an empty line starts your shell. Aider can't be given a task when it starts, so for it the
-task box gives way to a note.
+work there, and an empty line starts your shell. Claude Code, Codex, Gemini CLI, OpenCode, Cursor, Qwen Code
+and Pi are given the task as they start, each the way it takes one. For the others crystal knows of no way to,
+checked against their own code or documentation, so for them the task box gives way to a note.
 
 ### Archiving and idle agents
 
@@ -948,11 +954,88 @@ started with, but not its first prompt again. The limits:
 - A Codex you start yourself in a shell session gets its status from the screen, and is resumed only with
   crystal's hooks installed.
 
+### How crystal reads an agent
+
+crystal reads each agent's screen by a file of rules for that agent. It comes with one for each of Claude
+Code, Codex, Gemini CLI, OpenCode, Cursor, Qwen Code, Pi, GitHub Copilot, Amp, Droid, Kimi Code, Kiro, Cline,
+Kilo Code, Devin, Grok, Qoder CLI, Letta Code, Hermes Agent, Antigravity, Maki and Muse, adapted from
+[herdr](https://github.com/herdrdev/herdr)'s, and a common one for any other agent in front, like Aider. An
+agent changes what it draws from one version to the next, so when crystal reads one wrong you can mend its
+rules yourself without waiting for a release:
+
+```sh
+crystal agent list                        # the agents, where their rules come from, installed, hooks
+crystal agent explain fix-login           # why crystal reads that session the way it does
+crystal agent explain fix-login --agent codex -v   # Codex's rules on its screen, with what each looked at
+crystal agent explain --file screen.txt --agent codex --title "⠋ codex"   # rules on a saved screen
+crystal agent rules codex > ~/.config/crystal/agents/codex.toml           # start from crystal's own
+```
+
+A file in `~/.config/crystal/agents/` takes the place of crystal's rules for the agent its `id` (or one of its
+`aliases`) names, and a file for an agent crystal has none for adds it: it's then taken for an agent when it's
+in front, and read by its rules. The daemon reads the files again within a couple of seconds of a change. A
+file that can't be used is said in `crystal agent list`, `explain` and the daemon's log, and crystal's own
+rules stand in for it, so a typo never stops the reading.
+
+```toml
+# A file's fields, and every test a rule can make.
+id = "codex"                     # the agent, by its program's name
+name = "Codex"                   # how crystal shows it
+aliases = ["codex-cli"]          # other names its program goes by
+packages = ["@openai/codex"]     # npm packages it runs from, as `node …/node_modules/<package>/…`
+
+[[rules]]
+id = "approval_question"         # what explain calls it
+looks = "waiting"                # working, waiting, settled, or skip
+priority = 890                   # of the rules that match, the highest wins; the first in the file on a tie
+region = "last_rows(15)"         # where it looks
+contains = ["would you like to"] # all of these, in any case
+regex = ['\(y\)']                # all of these patterns match
+line_regex = ['^› ']             # each of these matches a line
+any = [{ contains = ["yes"] }, { contains = ["❯"] }]   # one of these passes
+all = [{ contains = ["proceed"] }]                     # every one of these passes
+not = [{ contains = ["esc to interrupt"] }]            # none of these passes
+```
+
+`skip` is for a screen that says nothing either way, like a menu or a transcript viewer over the prompt: the
+status stays as it was. When no rule matches, the agent is settled. A rule looks in one region:
+
+| Region | What it is |
+|---|---|
+| `screen` | the whole screen (the default) |
+| `title` | the title the agent gave its terminal |
+| `progress` | the progress it reports (OSC 9;4), as `4;1;-1`: a state, then a percentage |
+| `last_rows(N)`, `first_rows(N)` | the last or first N rows with something on them |
+| `after_last_rule` | the rows after the last horizontal rule (`───`) |
+| `prompt_box`, `above_prompt_box`, `last_row_above_prompt_box` | inside the box between the last two rules, what's above it, and its last row |
+| `after_last_prompt`, `before_current_prompt`, `without_current_prompt` | around Codex's prompt line, `›`: the rows after the last one, the rows before the one the user is at, or the whole screen unless the user is at one |
+
+A new look counts once two checks in a row see it, so a screen caught halfway through a redraw doesn't.
+
+#### Hooks in other agents' own settings
+
+Beyond Claude Code and Codex, some agents take hooks only in their own settings files, never on the command
+line. crystal leaves those files alone unless you ask, with the same [`crystal
+integration`](#usage) command, as for those two:
+
+```sh
+crystal integration install cursor     # ~/.cursor/hooks.json, or $CURSOR_CONFIG_DIR's
+crystal integration uninstall cursor   # takes crystal's out, and leaves yours
+```
+
+It can for Cursor, Droid (`~/.factory/settings.json`), Qoder CLI (`qodercli`), Qwen Code and GitHub Copilot,
+with the events each has that say what it's doing or which conversation it's in. The hook runs `crystal hook
+<agent>` inside a crystal session only, so the agent anywhere else runs as before, and it never fails the
+agent. What a hook says counts only while that agent is in front: an agent that Claude Code runs in the
+session doesn't speak for the session. `crystal agent list` says whose hooks are in. The settings file is
+written again as formatted JSON, its keys in order.
+
 ### Teaching crystal about your agent
 
-crystal knows Claude Code by its hooks, and reads Codex and the other agents it knows off their screens. Any
-other agent, or a script wrapped around one, can tell crystal what it's doing itself, and how to pick its
-session up again, with `crystal report`: no change to crystal, and no waiting for a release of it. Once your
+crystal knows Claude Code by its hooks, and reads Codex and the other agents it has
+[rules](#how-crystal-reads-an-agent) for off their screens. Any other agent, or a script wrapped around one,
+can tell crystal what it's doing itself, and how to pick its session up again, with `crystal report`: no
+change to crystal, and no waiting for a release of it. Once your
 agent reports, its status shows in the sidebar and in `crystal ls`, the user is told when it's done with a turn
 or waits on them, `crystal wait` and the [events](#events) follow it, and, once it says how, its session comes
 back in the same conversation after crystal restarts.
@@ -1440,9 +1523,9 @@ after the rest. Each comes with its id, and a line on how to read the rest and a
 - Claude Code gets them in its system prompt, and reads the rest with crystal's MCP tools (below).
 - Codex gets them as its `developer_instructions` (`-c`), after the ones it has already, from a
   [profile](#profiles) or its own `config.toml`, and reads the rest with `crystal memory search` and `show`.
-- Gemini CLI, OpenCode and Cursor get them at the top of their first prompt, when they're given one. A prompt
-  that would pass 16 KiB with them loses what the memory has first. Aider, which takes no first prompt, isn't
-  told.
+- Gemini CLI, OpenCode, Cursor, Qwen Code and Pi get them at the top of their first prompt, when they're given
+  one. A prompt that would pass 16 KiB with them loses what the memory has first. An agent that takes no first
+  prompt, like Aider, isn't told.
 
 `crystal plugin disable memory` turns it all off: see [plugins](#plugins).
 
@@ -1591,10 +1674,10 @@ Ported the codec and its tests
   closed. A cancelled one adds nothing.
 - Every agent crystal starts in a worktree whose file has notes is told to read it first and how to add to it,
   with the file's last 2 KiB, by the same road as its task: Claude Code on top of its system prompt, a
-  background task too, Codex in its developer instructions, and Gemini CLI, OpenCode and Cursor at the top of
-  their first prompt. When the file's end would make what it's asked and told more than 16 KiB, it's told
-  where the file is without it; a first prompt too long even so loses what the memory has first, then the
-  notes.
+  background task too, Codex in its developer instructions, and Gemini CLI, OpenCode, Cursor, Qwen Code and
+  Pi at the top of their first prompt. When the file's end would make what it's asked and told more than 16
+  KiB, it's told where the file is without it; a first prompt too long even so loses what the memory has
+  first, then the notes.
 - crystal is the file's only writer. It keeps it to 256 KiB, letting the oldest notes go, with `[earlier
   notes trimmed]` on top.
 - The notes stay out of git: the first note writes a `.gitignore` beside them that ignores everything in
@@ -2142,7 +2225,7 @@ where. The new-session panel offers your profiles first.
 [[profile]]
 name = "review"                            # how the panel shows it
 description = "Reads the branch's diff"    # optional: shown under it in the panel
-agent = "claude"                           # claude, codex, gemini, opencode, cursor-agent or aider
+agent = "claude"                           # an agent the new-session panel knows: claude, codex, qwen, …
 model = "opus"                             # optional: Claude Code's or Codex's model
 effort = "high"                            # optional: Claude Code's effort: low, medium, high, xhigh or max
 mode = "plan"                              # optional: Claude Code's permission mode, or Codex's approvals
@@ -2212,6 +2295,7 @@ over, the daemon is restarted cold from the sessions it wrote down first.
 - [x] Session list in a sidebar
 - [x] Session status from Claude Code's hooks
 - [x] Session status from the screen, for agents without hooks
+- [x] Rules for reading each agent's screen in files you can change, and why a session reads as it does
 - [x] Projects and worktrees
 - [x] Resume after a restart
 - [x] Split panes

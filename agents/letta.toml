@@ -1,0 +1,88 @@
+# Adapted from herdr's detection rules (Apache-2.0).
+# Letta keeps completed tool rows and spinners in the transcript. A standalone
+# screen spinner is not working evidence. Prefer its live OSC title/progress
+# signals, with visible status chrome and running tool rows as fallbacks.
+id = "letta"
+name = "Letta Code"
+aliases = ["letta-code"]
+packages = ["@letta-ai/letta-code"]
+
+[[rules]]
+id = "osc_progress_blocked"
+looks = "waiting"
+priority = 1400
+region = "progress"
+regex = ['^4;3(?:;|$)']
+
+[[rules]]
+id = "osc_title_blocked"
+looks = "waiting"
+priority = 1300
+region = "title"
+regex = ['^\[ [!.] \] Action Required(?: \| |$)']
+
+[[rules]]
+id = "command_approval"
+looks = "waiting"
+priority = 1200
+region = "last_rows(20)"
+contains = ["Run this command?", "Enter to select · Esc to cancel"]
+
+[[rules]]
+id = "osc_title_working"
+looks = "working"
+priority = 900
+region = "title"
+regex = ['(?:^| )[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏](?: |$)']
+
+[[rules]]
+id = "active_status"
+looks = "working"
+priority = 850
+region = "last_rows(8)"
+line_regex = ['^\s*(?:\S+\s+)+is(?: \S+)*… \((?:esc to interrupt(?: · .*)?|interrupting)\)\s*$']
+
+[[rules]]
+id = "running_tool"
+looks = "working"
+priority = 800
+region = "last_rows(8)"
+line_regex = ['^\s*(?:└\s*)?Running\.\.\.\s*(?:\(.*\))?$']
+
+[[rules]]
+id = "profile_selector"
+looks = "settled"
+priority = 700
+region = "last_rows(12)"
+contains = ["Create a new agent (--new)", "Enter select · Esc exit"]
+
+[[rules]]
+id = "composer_input"
+looks = "settled"
+priority = 150
+region = "last_rows(8)"
+line_regex = ['^\s*›\s+\S.*$']
+not = [
+  { line_regex = ['^\s*›\s+Try\s+"'] },
+]
+
+[[rules]]
+id = "composer_idle"
+looks = "settled"
+priority = 100
+region = "last_rows(8)"
+any = [
+  { line_regex = ['^\s*›\s*$'] },
+  { line_regex = ['^\s*›\s+Try\s+"'] },
+]
+not = [
+  { line_regex = ['^\s*(?:\S+\s+)+is(?: \S+)*… \((?:esc to interrupt(?: · .*)?|interrupting)\)\s*$'] },
+  { line_regex = ['^\s*(?:└\s*)?Running\.\.\.\s*(?:\(.*\))?$'] },
+]
+
+[[rules]]
+id = "no_live_state_evidence"
+looks = "settled"
+priority = 0
+region = "screen"
+regex = ['(?s)^.*$']

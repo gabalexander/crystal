@@ -216,37 +216,53 @@ whenever what's handed over changes in a way the crystal before couldn't read.
 - `src/events_cli.rs`: `crystal events`: the log in a shell, filtered, as lines or JSON, or followed, and `--since`
   read as a while back or a time on this machine's clock
 - `src/agents.rs`: what crystal knows about particular agents: the hooks it adds to Claude Code, the events it
-  listens to from Claude Code and Codex and what they mean, subagents' among them, the variable that quiets
-  the installed hooks for an agent crystal hooked itself, the command that resumes one typed into a shell, and
-  where an agent hears crystal's notes: Claude Code's system prompt, or the top of another's first prompt
+  listens to and what they mean (Claude Code's, which others copied, Cursor's spelled its own way, and
+  Codex's), subagents' among them, the variable that quiets the installed hooks for an agent crystal hooked
+  itself, the command that resumes one typed into a shell, and where an agent hears crystal's notes: Claude
+  Code's system prompt, or the top of another's first prompt
+- `src/agent_rules.rs`: the rules agents' screens are read by: a file for each agent in `agents/` (adapted from
+  herdr's), bundled, each rule a look, a priority, a region and tests; a file of the user's in the config's
+  `agents/` directory in place of one, or adding an agent, read again when it changes, and a broken one said
+  and passed over; reading a screen, and explaining a reading rule by rule
+- `src/agent_hooks.rs`: crystal's hooks in the own settings of Cursor, Droid, Qoder, Qwen and Copilot, each in
+  its shape, for `crystal integration`: put there and taken out on the user's word, the user's own hooks left
+  alone
+- `src/agent_cli.rs`: `crystal agent`: listing the agents with their rules and hooks, `explain` (a session's
+  reading, from the daemon, or a saved screen's) and `rules`
 - `src/catalog.rs`: the agents the new-session panel offers: their names, how each takes a first prompt and
   where it is on a command line, their options, and which are installed
 - `src/codex.rs`: what crystal knows about Codex: finding a session's conversation in its rollouts, `codex
   resume`, and crystal's notes given as its developer instructions, after the ones it has already
-- `src/hook.rs`: `crystal hook <agent>`: what those hooks run, Claude Code's and Codex's, to tell the daemon,
-  the prompt sent, the conversation and a subagent included, and to pass on its reminder to an agent ending a
-  turn with its task open; with `--installed`, the hooks `crystal integration` installed
+- `src/hook.rs`: `crystal hook <agent>`: what those hooks run, any agent's, to tell the daemon, the prompt sent,
+  the conversation, the agent and a subagent included (the daemon passes over an agent's that isn't the one in
+  front), and to pass on its reminder to an agent ending a turn with its task open; with `--installed`, the
+  hooks `crystal integration` installed
 - `src/integration.rs`: `crystal integration install|uninstall|status`: crystal's hooks put in Claude Code's
   `settings.json` and Codex's `hooks.json` (and `[features] hooks` in its `config.toml`, with `toml_edit`),
   beside the user's own, replacing those of a crystal at another path, taken out again alone, written in one
-  go through symbolic links; pure edits on the JSON, so they're unit-tested
+  go through symbolic links; pure edits on the JSON, so they're unit-tested; and the other agents' through
+  `agent_hooks.rs`
 - `src/report.rs`: `crystal report`: any agent, or a script wrapped around one, saying what it's doing and the
   command that resumes it; checking that command, and what's typed into a shell to run it after a restart
-- `src/agent_screen.rs`: reading what an agent is doing off its screen and title
-- `src/front.rs`: what's in front in a session's terminal (agent, shell or program), from its foreground process
+- `src/agent_screen.rs`: reading what an agent is doing off its screen, title and progress, by its rules, and
+  the watch that counts a new look once it holds for two checks
+- `src/front.rs`: what's in front in a session's terminal (agent, shell or program), from its foreground process:
+  an agent by its program's name, the catalog's or one its rules give, or by the npm package its rules name
 - `src/typing.rs`: typing into a session the way a person would: pastes marked, Enter on its own
 - `src/session.rs`: one program in a PTY, or a task: spawn, exit status, stop, its screen (120 by 40 until a viewer
   sizes it), viewers and listeners, the agent that says what it's doing itself while it holds the session, an
   agent typed into its shell whose conversation a restart resumes while it's in front, its agent's subagents,
   whether its first prompt can name it, whether its agent is blocked on the user, how long its agent has sat
-  idle (nobody watching or typing, its turn seen), and what has changed in it (its agent's activity, a task's
-  runs, its bell rung while nobody watched) for the daemon to tell; handing it over and adopting it, its PTY on a descriptor of crystal's own
+  idle (nobody watching or typing, its turn seen), why its screen reads the way it does (`crystal agent
+  explain`), and what has changed in it (its agent's activity, a task's runs, its bell rung while nobody
+  watched) for the daemon to tell; handing it over and adopting it, its PTY on a descriptor of crystal's own
 - `src/vt.rs`: a terminal's screen, through `alacritty_terminal`: what a program drew and its history, the modes
   it set, its answers to the program's questions (the daemon's screen only), the output that catches a new viewer
   up (its hyperlinks included), the cells to draw, the input modes `crystal attach` asks your terminal for, and,
   for a viewer, copy mode's cursor, selection and search, which are Alacritty's vi mode, and the link on a cell:
   a hyperlink a program wrote (OSC 8), or a URL in the text across the rows it wrapped onto, as `vt::Link`; the
-  times the program rang the bell; and a screen saved for a handover, both its screens and the history, and
+  times the program rang the bell; the progress a program reports (OSC 9;4), picked out of its output, which
+  alacritty_terminal passes over; and a screen saved for a handover, both its screens and the history, and
   restored. The only module that uses
   `alacritty_terminal`
 - `src/links.rs`: opening a link a pane shows: `open` or `xdg-open`, or over ssh (or with neither) the link put

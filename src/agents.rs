@@ -5,7 +5,9 @@
 //! Claude Code reports through hooks: commands it runs on events like a
 //! prompt being sent or a turn ending. crystal adds its own with
 //! `--settings`, so the user's settings files are never touched, and its
-//! hooks run alongside any the user has.
+//! hooks run alongside any the user has. Other agents take hooks only in
+//! their own settings, where crystal puts them when the user asks it to
+//! (see [`crate::agent_hooks`]); what they report is read here too.
 
 use crate::catalog;
 use crate::codex;
@@ -18,7 +20,7 @@ use std::path::{Path, PathBuf};
 /// docket's limit for a starting prompt.
 const FIRST_PROMPT_BYTES: usize = 16 * 1024;
 
-/// The Claude Code hook events crystal listens to; [`claude_event`] says
+/// The Claude Code hook events crystal listens to; [`hook_event`] says
 /// what each one means.
 pub const CLAUDE_HOOK_EVENTS: &[&str] = &[
     "SessionStart",
@@ -213,23 +215,41 @@ fn in_first_prompt(command: &[String], instructions: &[String]) -> Vec<String> {
     command
 }
 
-/// The conversation a Claude Code hook's input names, if it does.
-pub fn claude_conversation(input: &Value) -> Option<Conversation> {
-    let id = input["session_id"].as_str()?;
-    let transcript = input["transcript_path"].as_str().map(PathBuf::from);
+/// The first of `names` a hook's input has as text: agents that copied
+/// Claude Code's hooks spell their fields their own way.
+fn text_field<'a>(input: &'a Value, names: &[&str]) -> Option<&'a str> {
+    names
+        .iter()
+        .find_map(|name| input[name].as_str().filter(|text| !text.is_empty()))
+}
+
+/// The event a hook's input is for.
+fn event_name(input: &Value) -> Option<&str> {
+    text_field(input, &["hook_event_name", "hookEventName"])
+}
+
+/// The conversation a hook's input names, if it does.
+pub fn hook_conversation(input: &Value) -> Option<Conversation> {
+    let names = [
+        "session_id",
+        "sessionId",
+        "conversation_id",
+        "conversationId",
+    ];
+    let id = text_field(input, &names)?;
+    let transcript = text_field(input, &["transcript_path", "transcriptPath"]).map(PathBuf::from);
     Some(Conversation {
         id: id.to_string(),
         transcript,
     })
 }
 
-/// What the user asked, when a Claude Code hook's input is for a prompt
-/// they sent.
-pub fn claude_prompt(input: &Value) -> Option<String> {
-    if input["hook_event_name"] != "UserPromptSubmit" {
-        return None;
+/// What the user asked, when a hook's input is for a prompt they sent.
+pub fn hook_prompt(input: &Value) -> Option<String> {
+    match event_name(input)? {
+        "UserPromptSubmit" | "beforeSubmitPrompt" => input["prompt"].as_str().map(String::from),
+        _ => None,
     }
-    input["prompt"].as_str().map(String::from)
 }
 
 /// Claude's arguments without its first prompt, for a conversation that
@@ -271,10 +291,12 @@ fn without_resume_flags(args: &[String]) -> Vec<String> {
     kept
 }
 
-/// What a Claude Code hook's input means, or `None` if it's nothing that
-/// changes what the session is doing.
-pub fn claude_event(input: &Value) -> Option<AgentEvent> {
-    let name = input["hook_event_name"].as_str()?;
+/// What a hook's input means, or `None` if it's nothing that changes what
+/// the session is doing: Claude Code's events, which Droid, Qoder and Qwen
+/// Code copied, and Cursor's, spelled its own way. Codex's are
+/// [`codex_event`]'s.
+pub fn hook_event(input: &Value) -> Option<AgentEvent> {
+    let name = event_name(input)?;
     if in_subagent(input) && !matches!(name, "PostToolUse" | "PermissionRequest" | "Notification") {
         return None;
     }
@@ -282,11 +304,11 @@ pub fn claude_event(input: &Value) -> Option<AgentEvent> {
         // A session starts again after its context is compacted, which can
         // happen mid-turn.
         "SessionStart" if input["source"] == "compact" => return None,
-        "SessionStart" => AgentEvent::Started,
-        "UserPromptSubmit" => AgentEvent::TurnStarted,
+        "SessionStart" | "sessionStart" => AgentEvent::Started,
+        "UserPromptSubmit" | "beforeSubmitPrompt" => AgentEvent::TurnStarted,
         "PostToolUse" => AgentEvent::ToolFinished,
         "PermissionRequest" => AgentEvent::Asking,
-        "Stop" => AgentEvent::TurnEnded,
+        "Stop" | "stop" => AgentEvent::TurnEnded,
         "Notification" => match input["notification_type"].as_str()? {
             "permission_prompt" | "elicitation_dialog" => AgentEvent::Asking,
             "idle_prompt" => AgentEvent::StillIdle,
@@ -305,7 +327,7 @@ pub fn claude_event(input: &Value) -> Option<AgentEvent> {
 /// `SubagentStart` and `SubagentStop`, about it, from the agent. Its tools
 /// and the permissions it asks for are the agent's work all the same.
 fn in_subagent(input: &Value) -> bool {
-    let name = input["hook_event_name"].as_str().unwrap_or_default();
+    let name = event_name(input).unwrap_or_default();
     !name.starts_with("Subagent") && input["agent_id"].as_str().is_some()
 }
 
@@ -347,7 +369,7 @@ pub fn codex_event(input: &Value) -> Option<AgentEvent> {
 /// The conversation a Codex hook's input names, if it does: its thread,
 /// and the rollout file it's recorded in, the same as Claude Code's.
 pub fn codex_conversation(input: &Value) -> Option<Conversation> {
-    claude_conversation(input)
+    hook_conversation(input)
 }
 
 /// What a hook's input says the agent's directory is.
@@ -411,7 +433,7 @@ mod tests {
     fn a_subagent_s_start_and_end_are_counted_not_taken_for_turns() {
         let start =
             input(r#"{"hook_event_name":"SubagentStart","agent_id":"a1","agent_type":"Explore"}"#);
-        assert_eq!(claude_event(&start), Some(AgentEvent::SubagentStarted));
+        assert_eq!(hook_event(&start), Some(AgentEvent::SubagentStarted));
         assert_eq!(
             subagent(&start),
             Some(Subagent {
@@ -420,14 +442,14 @@ mod tests {
             })
         );
         let stop = input(r#"{"hook_event_name":"SubagentStop","agent_id":"a1"}"#);
-        assert_eq!(claude_event(&stop), Some(AgentEvent::SubagentStopped));
+        assert_eq!(hook_event(&stop), Some(AgentEvent::SubagentStopped));
         assert_eq!(subagent(&stop).unwrap().agent_type, None);
     }
 
     #[test]
     fn what_happens_inside_a_subagent_is_its_agent_s_work_but_not_its_turn() {
         let inside = |event: &str| {
-            claude_event(&input(&format!(
+            hook_event(&input(&format!(
                 r#"{{"hook_event_name":"{event}","agent_id":"a1","notification_type":"permission_prompt"}}"#
             )))
         };
@@ -767,10 +789,10 @@ mod tests {
     #[test]
     fn a_hook_names_its_conversation() {
         let input = json!({"session_id": "abc", "transcript_path": "/t/abc.jsonl"});
-        let conversation = claude_conversation(&input).unwrap();
+        let conversation = hook_conversation(&input).unwrap();
         assert_eq!(conversation.id, "abc");
         assert_eq!(conversation.transcript, Some(PathBuf::from("/t/abc.jsonl")));
-        assert_eq!(claude_conversation(&json!({})), None);
+        assert_eq!(hook_conversation(&json!({})), None);
     }
 
     #[test]
@@ -840,15 +862,38 @@ mod tests {
             (json!({"not": "a hook"}), None),
         ];
         for (input, expected) in cases {
-            assert_eq!(claude_event(&input), expected, "for {input}");
+            assert_eq!(hook_event(&input), expected, "for {input}");
         }
     }
 
     #[test]
     fn only_a_prompt_sent_says_what_the_user_asked() {
         let sent = json!({"hook_event_name": "UserPromptSubmit", "prompt": "fix the tests"});
-        assert_eq!(claude_prompt(&sent).as_deref(), Some("fix the tests"));
+        assert_eq!(hook_prompt(&sent).as_deref(), Some("fix the tests"));
         let stop = json!({"hook_event_name": "Stop", "prompt": "not one"});
-        assert_eq!(claude_prompt(&stop), None);
+        assert_eq!(hook_prompt(&stop), None);
+    }
+
+    #[test]
+    fn other_agents_hooks_are_read_the_way_they_spell_them() {
+        // Codex says when a turn is cut short, which its own reading takes.
+        let interrupt = json!({"hook_event_name": "Interrupt", "session_id": "t1"});
+        assert_eq!(hook_event(&interrupt), None);
+        assert_eq!(codex_event(&interrupt), Some(AgentEvent::StillIdle));
+        // Cursor's events, and its conversation's id.
+        let started = json!({"hook_event_name": "sessionStart", "conversation_id": "c9"});
+        assert_eq!(hook_event(&started), Some(AgentEvent::Started));
+        assert_eq!(hook_conversation(&started).unwrap().id, "c9");
+        let sent = json!({"hook_event_name": "beforeSubmitPrompt", "prompt": "go"});
+        assert_eq!(hook_event(&sent), Some(AgentEvent::TurnStarted));
+        assert_eq!(hook_prompt(&sent).as_deref(), Some("go"));
+        assert_eq!(
+            hook_event(&json!({"hook_event_name": "stop"})),
+            Some(AgentEvent::TurnEnded)
+        );
+        // Copilot's, in camel case.
+        let copilot = json!({"hookEventName": "SessionStart", "sessionId": "p2"});
+        assert_eq!(hook_event(&copilot), Some(AgentEvent::Started));
+        assert_eq!(hook_conversation(&copilot).unwrap().id, "p2");
     }
 }

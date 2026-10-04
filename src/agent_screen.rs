@@ -5,37 +5,13 @@
 //!
 //! Agents draw tell-tale text while they work or wait: a spinner at the
 //! start of the terminal's title, "esc to interrupt" under the prompt, a
-//! question with choices. That text changes between versions, so these
-//! lists need keeping up with the agents.
+//! question with choices. That text changes between versions, so it's kept
+//! in a file of rules for each agent, which the user can change: see
+//! [`crate::agent_rules`].
 
+use crate::agent_rules::{self, Input};
 use crate::protocol::AgentEvent;
 use serde::{Deserialize, Serialize};
-
-/// How many of the last rows with something on them to read: where agents
-/// draw their prompt, their status line and their questions. Agents draw
-/// inline, so on a fresh screen that's near the top, not at the bottom.
-const LAST_ROWS: usize = 15;
-
-/// Text, in lower case, that agents show only while they wait for the user
-/// to answer them.
-const WAITING_TEXT: &[&str] = &[
-    // Claude Code
-    "do you want to proceed?",
-    "waiting for permission",
-    // Codex: each of its approvals asks "would you like to …?", and ends
-    // with how to answer. "Allow command?" is from older versions.
-    "would you like to run the following command?",
-    "would you like to make the following edits?",
-    "would you like to grant these permissions?",
-    "press enter to confirm or esc to cancel",
-    "allow command?",
-    // Codex's other questions, like reviewing new hooks when it starts,
-    // end with their keys in this shorter form.
-    "enter confirm · esc",
-];
-
-/// Text, in lower case, that agents show only while they work on a turn.
-const WORKING_TEXT: &[&str] = &["esc to interrupt"];
 
 /// What an agent's screen says it's doing.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -47,40 +23,18 @@ pub enum Looks {
     Settled,
 }
 
-/// Reads `rows`, what's on the screen a row at a time, and `title`, the
-/// title the program gave its terminal.
-pub fn read(rows: &[String], title: &str) -> Looks {
-    let bottom = last_rows(rows);
-    // Codex says so in its title while it waits on the user.
-    if WAITING_TEXT.iter().any(|text| bottom.contains(text)) || title.contains("Action Required") {
-        return Looks::Waiting;
-    }
-    if WORKING_TEXT.iter().any(|text| bottom.contains(text)) || starts_with_spinner(title) {
-        return Looks::Working;
-    }
-    Looks::Settled
-}
-
-/// The last [`LAST_ROWS`] rows that aren't blank, as one lower-case string.
-fn last_rows(rows: &[String]) -> String {
-    let rows: Vec<&str> = rows
-        .iter()
-        .map(String::as_str)
-        .filter(|row| !row.trim().is_empty())
-        .collect();
-    let first = rows.len().saturating_sub(LAST_ROWS);
-    rows[first..].join("\n").to_lowercase()
-}
-
-/// Claude Code and Codex start their title with a spinner while they work:
-/// a braille pattern, or a circle a quarter of which is filled in.
-fn starts_with_spinner(title: &str) -> bool {
-    let Some(first) = title.chars().next() else {
-        return false;
+/// Reads the screen of `agent`, the program in front: `rows`, what's on it
+/// a row at a time, `title`, the title the program gave its terminal, and
+/// `progress`, the progress it reports. `None` when the screen says nothing
+/// either way, like a menu over the agent's prompt: the look stays as it
+/// was.
+pub fn read(agent: &str, rows: &[String], title: &str, progress: &str) -> Option<Looks> {
+    let screen = Input {
+        rows,
+        title,
+        progress,
     };
-    let braille = ('\u{2800}'..='\u{28FF}').contains(&first);
-    let circle = ('\u{25D0}'..='\u{25D3}').contains(&first);
-    braille || circle
+    agent_rules::current().for_program(agent).read(&screen)
 }
 
 /// Turns how a session's screen looks, read again at every check, into the
@@ -109,6 +63,11 @@ impl ScreenWatch {
         self.current
     }
 
+    /// A different look seen once, which counts if it's seen again.
+    pub fn candidate(&self) -> Option<Looks> {
+        self.candidate
+    }
+
     pub fn update(&mut self, looks: Looks) -> Option<AgentEvent> {
         if looks == self.current {
             self.candidate = None;
@@ -135,34 +94,48 @@ impl ScreenWatch {
 mod tests {
     use super::*;
 
-    fn looks(output: &str, title: &str) -> Looks {
+    fn looks(agent: &str, output: &str, title: &str) -> Option<Looks> {
         let mut screen = crate::vt::Screen::new(24, 80);
         screen.process(output.as_bytes());
-        read(&screen.rows(false), title)
+        read(agent, &screen.rows(false), title, screen.progress())
     }
 
     #[test]
     fn a_prompt_with_nothing_going_on_is_settled() {
         assert_eq!(
-            looks("> \r\n  ? for shortcuts", "✳ Claude Code"),
-            Looks::Settled
+            looks("claude", "> \r\n  ? for shortcuts", "✳ Claude Code"),
+            Some(Looks::Settled)
         );
     }
 
     #[test]
     fn work_shows_in_the_status_line_or_the_title() {
         let status = "✻ Thinking… (3s)\r\n> \r\n  ⏵⏵ auto mode on · esc to interrupt";
-        assert_eq!(looks(status, ""), Looks::Working);
-        assert_eq!(looks("> ", "⠋ Fixing the tests"), Looks::Working);
-        assert_eq!(looks("> ", "◐ Fixing the tests"), Looks::Working);
+        assert_eq!(looks("claude", status, ""), Some(Looks::Working));
+        let working = Some(Looks::Working);
+        assert_eq!(looks("claude", "> ", "⠋ Fixing the tests"), working);
+        assert_eq!(looks("claude", "> ", "◐ Fixing the tests"), working);
     }
 
     #[test]
-    fn a_question_outweighs_the_signs_of_work() {
+    fn a_question_is_waiting() {
         let question =
             "Bash command\r\n  echo hi\r\nDo you want to proceed?\r\n❯ 1. Yes\r\n  2. No";
-        assert_eq!(looks(question, "⠋ Running"), Looks::Waiting);
-        assert_eq!(looks("> ", "Action Required"), Looks::Waiting);
+        let title = "✳ Claude Code";
+        assert_eq!(looks("claude", question, title), Some(Looks::Waiting));
+        assert_eq!(
+            looks("codex", "› ", "Action Required"),
+            Some(Looks::Waiting)
+        );
+    }
+
+    #[test]
+    fn claude_s_spinner_outweighs_a_question_left_on_screen() {
+        // Claude Code stops its spinner while it asks: one that turns says
+        // it's at work, whatever the screen still shows.
+        let question =
+            "Bash command\r\n  echo hi\r\nDo you want to proceed?\r\n❯ 1. Yes\r\n  2. No";
+        assert_eq!(looks("claude", question, "⠋ Running"), Some(Looks::Working));
     }
 
     // The Codex screens below are from its own TUI snapshot tests.
@@ -170,17 +143,17 @@ mod tests {
     #[test]
     fn codex_at_work_says_so_in_its_status_line() {
         let working = "• Working (0s • esc to interrupt)\r\n\r\n› Ask Codex to do anything\r\n\r\n  gpt-5 default · /tmp/project";
-        assert_eq!(looks(working, ""), Looks::Working);
+        assert_eq!(looks("codex", working, ""), Some(Looks::Working));
         let resting = "› Ask Codex to do anything\r\n\r\n  gpt-5 default · /tmp/project";
-        assert_eq!(looks(resting, ""), Looks::Settled);
+        assert_eq!(looks("codex", resting, ""), Some(Looks::Settled));
     }
 
     #[test]
     fn codex_asking_to_run_a_command_waits() {
         let question = "  Would you like to run the following command?\r\n\r\n  $ echo hello world\r\n\r\n› 1. Yes, proceed (y)\r\n  2. Yes, and don't ask again (p)\r\n  3. No, and tell Codex what to do differently (esc)\r\n\r\n  Press enter to confirm or esc to cancel";
-        assert_eq!(looks(question, ""), Looks::Waiting);
+        assert_eq!(looks("codex", question, ""), Some(Looks::Waiting));
         let edits = "  Would you like to make the following edits?\r\n\r\n› 1. Yes, proceed (y)";
-        assert_eq!(looks(edits, ""), Looks::Waiting);
+        assert_eq!(looks("codex", edits, ""), Some(Looks::Waiting));
     }
 
     #[test]
@@ -188,7 +161,17 @@ mod tests {
         let hooks = "  Hooks need review\r\n  12 hooks are new or changed.\r\n\
                      › 1. Review hooks\r\n  2. Trust all and continue\r\n\
                      \r\n  enter confirm · esc skip";
-        assert_eq!(looks(hooks, ""), Looks::Waiting);
+        assert_eq!(looks("codex", hooks, ""), Some(Looks::Waiting));
+    }
+
+    #[test]
+    fn an_agent_with_no_rules_of_its_own_is_read_the_common_way() {
+        let working = "> fix it\r\n  thinking · esc to interrupt";
+        assert_eq!(looks("aider", working, ""), Some(Looks::Working));
+        let asking = "Allow command?\r\n  rm -rf build";
+        assert_eq!(looks("aider", asking, ""), Some(Looks::Waiting));
+        assert_eq!(looks("aider", "> ", "⠋ aider"), Some(Looks::Working));
+        assert_eq!(looks("aider", "> ", ""), Some(Looks::Settled));
     }
 
     #[test]
@@ -198,7 +181,20 @@ mod tests {
             output.push_str(&format!("line {line}\r\n"));
         }
         output.push_str("> ");
-        assert_eq!(looks(&output, ""), Looks::Settled);
+        assert_eq!(looks("aider", &output, ""), Some(Looks::Settled));
+    }
+
+    #[test]
+    fn a_screen_that_says_nothing_leaves_the_look() {
+        // Claude Code's transcript viewer, over its prompt.
+        let viewer = "  ⎿ Read 20 lines\r\n\r\nShowing detailed transcript · ctrl+o to toggle";
+        assert_eq!(looks("claude", viewer, ""), None);
+    }
+
+    #[test]
+    fn progress_an_agent_reports_counts() {
+        // Kiro says it's at work with OSC 9;4's state 3.
+        assert_eq!(looks("kiro", "\x1b]9;4;3\x07> ", ""), Some(Looks::Working));
     }
 
     #[test]

@@ -57,6 +57,7 @@ const SESSION_ARGS: &[(&[&str], &str)] = &[
     (&["archive"], "names"),
     (&["notify"], "name"),
     (&["memory", "distill"], "name"),
+    (&["agent", "explain"], "session"),
     (&["tab", "move"], "session"),
     (&["pane", "split"], "session"),
     (&["pane", "split"], "beside"),

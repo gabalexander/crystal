@@ -1,6 +1,7 @@
 //! A program running in a PTY of its own, or a task: Claude Code run
 //! without a terminal.
 
+use crate::agent_rules;
 use crate::agent_screen::{self, Looks, ScreenWatch};
 use crate::agents;
 use crate::codex::Rollouts;
@@ -12,8 +13,9 @@ use crate::handover::{self, Got};
 use crate::keys;
 use crate::notify::{self, Notice};
 use crate::protocol::{
-    Activity, AgentEvent, AgentReport, Answer, Asking, Conversation, Front, Reporter, SessionInfo,
-    State, TaskInfo, TaskOutcome, TaskRecord, TaskResult, TaskSpec, TaskState, TaskView,
+    Activity, AgentEvent, AgentReport, Answer, Asking, Conversation, Front, Reporter,
+    ScreenExplained, SessionInfo, State, TaskInfo, TaskOutcome, TaskRecord, TaskResult, TaskSpec,
+    TaskState, TaskView,
 };
 use crate::report;
 use crate::spending::Spending;
@@ -1040,23 +1042,75 @@ impl Session {
         self.front = Some(front);
     }
 
-    /// Whether an agent is in front in the terminal, the only time its
-    /// screen says anything about what an agent is doing.
-    fn agent_in_front(&self) -> bool {
-        self.front.as_ref().is_some_and(Front::is_agent)
-    }
-
     /// Reads what the agent is doing off the screen, and takes it as an
     /// event when that has changed. Only while an agent is in front: a
     /// shell or any other program can print an agent's words. An agent
     /// that reports for itself knows better than its screen.
     fn check_screen(&mut self) {
-        if !self.is_running() || !self.agent_in_front() || self.is_claimed() {
+        if !self.is_running() || self.is_claimed() {
             return;
         }
-        let looks = self.term.looks();
+        let Some(Front::Agent { program, .. }) = &self.front else {
+            return;
+        };
+        // A screen that says nothing either way leaves the look as it was.
+        let Some(looks) = self.term.looks(program) else {
+            return;
+        };
         if let Some(event) = self.screen_watch.update(looks) {
             self.on_agent_event(event);
+        }
+    }
+
+    /// Whether what `agent`'s hooks report is about this session: it is,
+    /// unless another agent is in front, which `agent` was started by.
+    pub fn reports_for(&self, agent: &str) -> bool {
+        match &self.front {
+            Some(Front::Agent { program, .. }) => agent_rules::current().same_agent(agent, program),
+            _ => true,
+        }
+    }
+
+    /// Why crystal reads the session's agent the way it does: what's in
+    /// front, whether its screen is read, and the rules tried on it, those
+    /// of `agent` when it's given, or else of the agent in front.
+    pub fn explain_screen(&self, agent: Option<&str>) -> ScreenExplained {
+        let in_front = match &self.front {
+            Some(Front::Agent { program, .. }) => Some(program.as_str()),
+            _ => None,
+        };
+        let not_read = if self.task.is_some() {
+            Some("it's a background task, which says what it's doing itself".to_string())
+        } else if !self.is_running() {
+            Some("it has ended".to_string())
+        } else if self.is_claimed() {
+            Some("its agent says what it's doing itself, with `crystal report`".to_string())
+        } else if in_front.is_none() {
+            let what = self.front.as_ref().map_or("nothing yet", Front::word);
+            Some(format!("no agent is in front, but {what}"))
+        } else {
+            None
+        };
+        let rules = agent
+            .or(in_front)
+            .filter(|_| self.task.is_none())
+            .map(|agent| {
+                let (rows, title, progress) = self.term.screen_for_rules();
+                let screen = agent_rules::Input {
+                    rows: &rows,
+                    title: &title,
+                    progress: &progress,
+                };
+                agent_rules::current().for_program(agent).explain(&screen)
+            });
+        ScreenExplained {
+            session: self.name.clone(),
+            front: self.front.clone(),
+            not_read,
+            watch: self.screen_watch.looks().into(),
+            candidate: self.screen_watch.candidate().map(Into::into),
+            activity: self.activity,
+            rules,
         }
     }
 
@@ -1539,10 +1593,19 @@ impl Term {
         self.screen.lock().unwrap().vt.recent_rows(history)
     }
 
-    /// What the screen says the agent is doing.
-    pub fn looks(&self) -> Looks {
+    /// What the screen says `agent`, the program in front, is doing: `None`
+    /// when it says nothing either way.
+    pub fn looks(&self, agent: &str) -> Option<Looks> {
+        let (rows, title, progress) = self.screen_for_rules();
+        agent_screen::read(agent, &rows, &title, &progress)
+    }
+
+    /// The screen as the rules that read agents take it: its rows, its
+    /// title and the progress its program reports.
+    pub fn screen_for_rules(&self) -> (Vec<String>, String, String) {
         let screen = self.screen.lock().unwrap();
-        agent_screen::read(&screen.vt.rows(false), &screen.vt.title())
+        let progress = screen.vt.progress().to_string();
+        (screen.vt.rows(false), screen.vt.title(), progress)
     }
 
     /// What pressing `key`, a key's name or some text, sends the program:

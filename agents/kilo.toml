@@ -1,0 +1,22 @@
+# Adapted from herdr's detection rules (Apache-2.0).
+id = "kilo"
+name = "Kilo Code"
+aliases = ["kilo-code"]
+packages = ["@kilocode/cli"]
+
+[[rules]]
+id = "opencode_permission"
+looks = "waiting"
+priority = 300
+region = "screen"
+any = [
+  { contains = ["△ Permission required"] },
+  { contains = ["esc dismiss"], any = [{ contains = ["enter confirm"] }, { contains = ["enter submit"] }, { contains = ["enter toggle"] }], all = [{ any = [{ contains = ["↑↓ select"] }, { contains = ["⇆ tab"] }] }] },
+]
+
+[[rules]]
+id = "esc_interrupt_working"
+looks = "working"
+priority = 100
+region = "screen"
+contains = ["esc interrupt"]

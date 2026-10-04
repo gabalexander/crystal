@@ -102,6 +102,84 @@ pub struct Screen {
     /// What finds URLs in the text, made the first time a link is looked
     /// for, and borrowed mutably for the cache it keeps as it goes.
     urls: RefCell<Option<RegexSearch>>,
+    /// The progress the program reports, which alacritty_terminal passes
+    /// over.
+    progress: Progress,
+}
+
+/// Picks the progress a program reports out of its output: OSC 9;4, which
+/// ConEmu began and Windows Terminal and Ghostty draw. Agents report with
+/// it that they're working. It's kept as written after `9;`, like `4;1;-1`
+/// (a state, then a percentage), for the rules that read agents' screens.
+#[derive(Default)]
+struct Progress {
+    /// What the last report said.
+    last: String,
+    /// Where in an escape sequence the output has got to.
+    at: Sniff,
+    /// The OSC sequence so far, up to [`Progress::LONGEST`] bytes.
+    osc: Vec<u8>,
+}
+
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+enum Sniff {
+    #[default]
+    Text,
+    /// After an ESC.
+    Escape,
+    /// Inside an OSC sequence.
+    Osc,
+    /// After an ESC inside one, which a `\` ends it with.
+    OscEscape,
+}
+
+impl Progress {
+    /// The longest OSC sequence kept: a progress report is short.
+    const LONGEST: usize = 32;
+
+    fn read(&mut self, output: &[u8]) {
+        let mut rest = output;
+        while !rest.is_empty() {
+            if self.at == Sniff::Text {
+                // Most output is text: skip to the next escape.
+                match rest.iter().position(|&byte| byte == 0x1b) {
+                    Some(at) => rest = &rest[at..],
+                    None => return,
+                }
+            }
+            let byte = rest[0];
+            rest = &rest[1..];
+            self.at = match (self.at, byte) {
+                (_, 0x1b) if self.at != Sniff::Osc => Sniff::Escape,
+                (Sniff::Escape, b']') => {
+                    self.osc.clear();
+                    Sniff::Osc
+                }
+                (Sniff::Osc, 0x07) | (Sniff::OscEscape, b'\\') => {
+                    self.finish();
+                    Sniff::Text
+                }
+                (Sniff::Osc, 0x1b) => Sniff::OscEscape,
+                (Sniff::Osc, byte) => {
+                    if self.osc.len() <= Self::LONGEST {
+                        self.osc.push(byte);
+                    }
+                    Sniff::Osc
+                }
+                _ => Sniff::Text,
+            };
+        }
+    }
+
+    fn finish(&mut self) {
+        // `9;` and text is a notification, which could start with a 4.
+        if self.osc.len() <= Self::LONGEST
+            && let Some(report) = self.osc.strip_prefix(b"9;4")
+            && (report.is_empty() || report.starts_with(b";"))
+        {
+            self.last = format!("4{}", String::from_utf8_lossy(report));
+        }
+    }
 }
 
 /// What a URL written out in a screen's text looks like: a scheme a
@@ -362,6 +440,7 @@ impl Screen {
             heard,
             search: None,
             urls: RefCell::default(),
+            progress: Progress::default(),
         }
     }
 
@@ -377,6 +456,13 @@ impl Screen {
     /// Reads what the program wrote.
     pub fn process(&mut self, output: &[u8]) {
         self.parser.advance(&mut self.term, output);
+        self.progress.read(output);
+    }
+
+    /// The progress the program last reported (OSC 9;4), as it wrote it
+    /// after `9;`, like `4;1;-1`: empty when it reported none.
+    pub fn progress(&self) -> &str {
+        &self.progress.last
     }
 
     /// The answers to the program's questions since the last call, to send
@@ -1507,6 +1593,22 @@ mod tests {
         }
         assert_eq!(cells(&bytewise), cells(&whole));
         assert_eq!(bytewise.title(), "title");
+    }
+
+    #[test]
+    fn the_progress_a_program_reports_is_kept() {
+        let mut screen = screen(2, 10, b"\x1b]9;4;1;-1\x07work");
+        assert_eq!(screen.progress(), "4;1;-1");
+        // Split anywhere, and ended with ST rather than BEL.
+        for byte in b"\x1b]9;4;3\x1b\\" {
+            screen.process(std::slice::from_ref(byte));
+        }
+        assert_eq!(screen.progress(), "4;3");
+        // A notification isn't progress, and neither is a title.
+        screen.process(b"\x1b]9;4 tests failed\x07\x1b]0;9;4;0\x07");
+        assert_eq!(screen.progress(), "4;3");
+        screen.process(b"\x1b]9;4;0\x07");
+        assert_eq!(screen.progress(), "4;0");
     }
 
     #[test]

@@ -33,6 +33,9 @@ const DROPPED: &[&str] = &[
     "CLAUDE_CODE_SESSION_ATTENDED",
     "CLAUDE_CODE_SESSION_ID",
     "CLAUDE_PID",
+    // Codex marks what it runs with the conversation it's in. A Codex
+    // started in a session would take its own hooks for another's.
+    "CODEX_THREAD_ID",
 ];
 
 /// Whole families of variables that terminals set about themselves.
