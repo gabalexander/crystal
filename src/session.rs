@@ -270,6 +270,7 @@ impl Handed {
             Some(task) => task.conversation().map(|id| Conversation {
                 id,
                 transcript: None,
+                prompted: false,
             }),
             None => self.conversation.clone(),
         };
@@ -1089,8 +1090,16 @@ impl Session {
     }
 
     /// Takes what the agent is doing now, noting the change for the daemon
-    /// to tell.
+    /// to tell. A conversation the agent works on a turn in has something
+    /// to pick up again, which only one with no file to look for needs
+    /// told.
     fn set_activity(&mut self, activity: Option<Activity>) {
+        if activity == Some(Activity::Working)
+            && let Some(conversation) = self.conversation.as_mut()
+            && conversation.transcript.is_none()
+        {
+            conversation.prompted = true;
+        }
         if activity != self.activity {
             self.changes.push(Change::Activity {
                 from: self.activity,
@@ -1367,15 +1376,25 @@ impl Session {
     /// One that isn't the session's own program was typed into its shell:
     /// a restart resumes it by typing its command for that conversation.
     pub fn set_hooked_conversation(&mut self, agent: &str, mut conversation: Conversation) {
-        let own = agents::program_name(&self.command) == Some(agent);
+        // An agent's hooks may call it otherwise than its program is
+        // called, as Cursor's do `cursor-agent`.
+        let own = agents::program_name(&self.command)
+            .is_some_and(|program| agent_rules::current().same_agent(program, agent));
         self.typed_agent = (!own).then(|| agent.to_string());
         // A hook that doesn't say where the conversation is kept, as
-        // Codex's needn't, leaves the file known already.
-        if conversation.transcript.is_none()
-            && let Some(known) = self.conversation.take()
+        // Codex's needn't, leaves the file known already, and the turns
+        // seen in it.
+        if let Some(known) = self.conversation.take()
             && known.id == conversation.id
         {
-            conversation.transcript = known.transcript;
+            if conversation.transcript.is_none() {
+                conversation.transcript = known.transcript;
+            }
+            conversation.prompted |= known.prompted;
+        }
+        // Named as it works, the agent is working in it.
+        if conversation.transcript.is_none() && self.activity == Some(Activity::Working) {
+            conversation.prompted = true;
         }
         self.conversation = Some(conversation);
     }
@@ -1463,6 +1482,7 @@ impl Session {
             Some(task) => task.conversation().map(|id| Conversation {
                 id,
                 transcript: None,
+                prompted: false,
             }),
             None => self.conversation.clone(),
         };
@@ -2043,6 +2063,7 @@ fn next_activity(before: Option<Activity>, event: AgentEvent, watched: bool) -> 
         AgentEvent::StillIdle => return before,
         // A subagent's start and end are the agent's work, not its turn.
         AgentEvent::SubagentStarted | AgentEvent::SubagentStopped => return before,
+        AgentEvent::Named => return before,
     };
     // A turn that ends while someone's watching has been seen.
     if after == Activity::Done && watched {
@@ -2156,6 +2177,7 @@ mod tests {
             conversation: Some(Conversation {
                 id: "conv-1".into(),
                 transcript: None,
+                prompted: false,
             }),
             rollouts: None,
             told: Some(Waiting),
@@ -2224,6 +2246,7 @@ mod tests {
             conversation: Some(Conversation {
                 id: "conv-1".into(),
                 transcript: None,
+                prompted: false,
             }),
             task: None,
             goal: Some(TaskInfo {
@@ -2333,6 +2356,7 @@ mod tests {
             conversation: Some(Conversation {
                 id: "conv-1".into(),
                 transcript: None,
+                prompted: false,
             }),
             rollouts: None,
             told: None,
@@ -2378,6 +2402,7 @@ mod tests {
         let conversation = Conversation {
             id: "conv-2".into(),
             transcript: None,
+            prompted: false,
         };
         session.set_hooked_conversation("claude", conversation.clone());
         assert_eq!(session.typed_agent.as_deref(), Some("claude"));
@@ -2393,6 +2418,7 @@ mod tests {
         let kept = |id: &str, file: Option<&str>| Conversation {
             id: id.into(),
             transcript: file.map(PathBuf::from),
+            prompted: false,
         };
         session.set_hooked_conversation("claude", kept("conv-1", Some("/t/conv-1.jsonl")));
         session.set_hooked_conversation("claude", kept("conv-1", None));
@@ -2400,9 +2426,49 @@ mod tests {
             session.conversation,
             Some(kept("conv-1", Some("/t/conv-1.jsonl")))
         );
-        // Another conversation's file isn't this one's.
+        // Another conversation's file isn't this one's. With none, it has
+        // had a turn once it's named as its agent works.
         session.set_hooked_conversation("claude", kept("conv-2", None));
-        assert_eq!(session.conversation, Some(kept("conv-2", None)));
+        let worked = Conversation {
+            prompted: true,
+            ..kept("conv-2", None)
+        };
+        assert_eq!(session.conversation, Some(worked));
+    }
+
+    #[test]
+    fn a_conversation_with_no_file_counts_once_its_agent_works_in_it() {
+        let mut session = typed_claude(claude());
+        session.on_agent_event(AgentEvent::Started);
+        let named = Conversation {
+            id: "k-1".into(),
+            transcript: None,
+            prompted: false,
+        };
+        session.set_hooked_conversation("claude", named.clone());
+        let resumes = |session: &Session| session.conversation.as_ref().unwrap().can_resume();
+        assert!(!resumes(&session), "never sent a prompt");
+        session.on_agent_event(AgentEvent::Named);
+        assert!(!resumes(&session));
+        session.on_agent_event(AgentEvent::TurnStarted);
+        assert!(resumes(&session));
+        // Named again, it keeps the turns it had.
+        session.on_agent_event(AgentEvent::TurnEnded);
+        session.set_hooked_conversation("claude", named);
+        assert!(resumes(&session));
+    }
+
+    #[test]
+    fn an_agent_s_hooks_may_name_it_otherwise_than_its_program() {
+        let mut session = typed_claude(claude());
+        session.command = vec!["/usr/local/bin/cursor-agent".into()];
+        let named = Conversation {
+            id: "c-1".into(),
+            transcript: None,
+            prompted: false,
+        };
+        session.set_hooked_conversation("cursor", named);
+        assert_eq!(session.typed_agent, None, "it's the session's own");
     }
 
     #[test]
@@ -2412,6 +2478,7 @@ mod tests {
         let conversation = Conversation {
             id: "conv-1".into(),
             transcript: Some(transcript.clone()),
+            prompted: false,
         };
         let restart = |front: Option<Front>, reporter: Option<&Reporter>| {
             restart_with(

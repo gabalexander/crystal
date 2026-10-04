@@ -344,6 +344,7 @@ impl Rollouts {
                     let conversation = Conversation {
                         id: meta.id,
                         transcript: Some(path),
+                        prompted: false,
                     };
                     found = Some((apart, conversation));
                 }

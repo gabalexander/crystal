@@ -333,6 +333,13 @@ pub const AGENTS: &[Agent] = &[
         settings: &[],
     },
     Agent {
+        program: "mastracode",
+        name: "MastraCode",
+        first_prompt: FirstPrompt::None,
+        instructions: Instructions::None,
+        settings: &[],
+    },
+    Agent {
         program: "aider",
         name: "Aider",
         // `--message` runs one message and exits, which isn't a session.
