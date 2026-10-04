@@ -1,5 +1,6 @@
 //! The CLI's side of the socket.
 
+use crate::config::Config;
 use crate::env;
 use crate::events::{Event, Filter, Since};
 use crate::forge::Checkout;
@@ -263,9 +264,15 @@ pub fn remove_worktree(socket: &Path, path: &Path, force: bool) -> Result<()> {
 
 /// Makes a worktree for `branch` in the repository `dir` is in, as
 /// [`git::add_worktree`] does, and tells the daemon, for the plugins that
-/// listen for new worktrees.
-pub fn add_worktree(socket: &Path, dir: &Path, branch: &str) -> Result<PathBuf> {
-    let path = git::add_worktree(dir, branch)?;
+/// listen for new worktrees. A new branch starts from `base`, when it's
+/// given, or else where the settings say, fetched first.
+pub fn add_worktree(
+    socket: &Path,
+    dir: &Path,
+    branch: &str,
+    base: Option<&str>,
+) -> Result<PathBuf> {
+    let path = git::add_worktree(dir, branch, &worktree_base(base))?;
     tell_worktree(socket, &path, Some(branch.to_string()), true);
     Ok(path)
 }
@@ -273,9 +280,19 @@ pub fn add_worktree(socket: &Path, dir: &Path, branch: &str) -> Result<PathBuf> 
 /// Makes a worktree on a new branch, `branch` or the first like it that's
 /// free, as [`git::add_new_worktree`] does, and tells the daemon.
 pub fn add_new_worktree(socket: &Path, dir: &Path, branch: &str) -> Result<PathBuf> {
-    let (path, branch) = git::add_new_worktree(dir, branch)?;
+    let (path, branch) = git::add_new_worktree(dir, branch, &worktree_base(None))?;
     tell_worktree(socket, &path, Some(branch), true);
     Ok(path)
+}
+
+/// Where a new worktree's new branch starts: `named`, or the settings'
+/// branch, fetched from `origin` first.
+fn worktree_base(named: Option<&str>) -> git::Base {
+    git::Base {
+        named: named.map(String::from),
+        configured: Config::load().unwrap_or_default().worktrees.base,
+        fetch: true,
+    }
 }
 
 /// The worktree for a pull request: the one its project has on its branch

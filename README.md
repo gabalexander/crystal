@@ -267,7 +267,8 @@ Everything is also a command, for scripts and for agents:
 ```sh
 crystal new claude                          # start Claude Code here and attach to it
 crystal new -d -n review -c ~/code/app codex   # start one in the background, named, somewhere else
-crystal new -w fix/login claude             # start one in a new worktree, on a new branch
+crystal new -w fix/login claude             # start one in a new worktree, on a new branch off origin's main
+crystal new -w spike --base HEAD claude     # the same, its branch off the commit you're on
 crystal task "update the docs"              # run Claude without a terminal, in the background (see below)
 crystal result task                         # a task's answer
 crystal answer task y                       # allow what a task asks for: y, n or always
@@ -307,12 +308,23 @@ review  exited 0  41388  app      main       ~/code/app                      cod
 ```
 
 `crystal new -w <branch>` makes the worktree beside the repository, in `<repo>.worktrees/<branch>`, with any
-`/` in the branch made a `-`. A branch that doesn't exist yet starts from the commit you're on; one that does
-is checked out as it is. `crystal worktree rm` (or `W` in the TUI) takes the worktree's directory or its
-branch, refuses while a session is still running in it, and leaves the rest to `git worktree remove`, which
-keeps a worktree with changes you haven't committed. `crystal worktree rm --force` removes it anyway, and
-those changes with it; `W` asks a second time, naming them, and a second `y` does the same. Sessions that had
-ended in it leave the list with it: their directory is gone, so they could never start again.
+`/` in the branch made a `-`. A branch that does exist is checked out as it is. One that doesn't yet starts
+from `origin`'s default branch, fetched first, so it's what everyone else has as `main`, not whatever your
+checkout last pulled; it follows no branch of `origin`'s, so its first `git push` makes a branch of its own.
+`--base <ref>` starts it somewhere else: a branch (`origin`'s copy, fetched, when it has one), a tag, a commit,
+or `HEAD` for the commit you're on. `base` under `[worktrees]` in the [settings](#settings) does the same for
+every new worktree you don't give a base, the TUI's included, and a project without that branch starts from the
+default. Offline, it's `origin`'s branch as your last fetch left it, and with no `origin`, the commit you're on.
+A [flow](#flows) makes its worktree from the branch as last fetched, without fetching.
+
+`crystal worktree rm` (or `W` in the TUI) takes the worktree's directory or its branch, refuses while a
+session is still running in it, and leaves the rest to `git worktree remove`, which keeps a worktree with
+changes you haven't committed. `crystal worktree rm --force` removes it anyway, and those changes with it; `W`
+asks a second time, naming them, and a second `y` does the same. Sessions that had ended in it leave the list
+with it: their directory is gone, so they could never start again.
+
+To set a new worktree up, say install its dependencies or copy in an `.env`, have a [plugin](#plugins) run a
+command on `worktree.created`, and on `worktree.removed` to tidy up after it.
 
 `crystal rename` changes what a session is called; its program and its saved place after a restart follow the
 new name. `crystal respawn`, or `Enter` on an ended session in the TUI, runs its command again in the same
@@ -1732,6 +1744,7 @@ file and change. A setting crystal doesn't know is an error that names it, so a 
 | `[tasks]` | | what [background tasks](#background-tasks) may spend: `max_budget_usd` each (`5`), `daily_budget_usd` all together (none) |
 | `[events]` | | `keep_days`, how long the [event log](#events) keeps what happened: 30 days, or `0` for ever |
 | `[handoff]` | | `in_git`, the projects, by their main worktree, whose [handoff notes](#the-handoff-file) go in git |
+| `[worktrees]` | | `base`, the branch new worktrees' new branches [start from](#usage): `origin`'s default branch unless set |
 
 `dark` and `light` paint their own background, so crystal looks the same in any terminal; `terminal` paints
 nothing and uses your terminal's own colors. With `NO_COLOR` set, crystal uses no color at all.
