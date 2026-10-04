@@ -425,7 +425,8 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   reciprocal rank fusion, then the reranker's read of the best (nothing when none answers), its migrations,
   the same said again seen again, forgotten entries the distiller can't add back, bringing in a project's JSON file from before, anchors (each file's SHA-256 when
   an entry was said) and whether an entry holds, fresh, drifting or stale, search, the paragraph every agent is
-  shown at launch (entries about what its worktree changed first, in docket's 800 bytes), promoting into
+  shown at launch (entries about what its worktree changed first, in docket's 800 bytes, tasks' outcomes kept
+  by an earlier crystal left out of it), promoting into
   CLAUDE.md, the markdown export, and `enabled`, the one gate everything memory adds goes through
 - `src/distill.rs`: the distiller: after a task closes, one tool-less `claude -p` (Haiku by default, `[memory]`
   in the config) over the end of its transcript, told what the memory has already; its answer checked
@@ -460,7 +461,8 @@ whenever what's handed over changes in a way the crystal before couldn't read.
 - `src/flow_cli.rs`: `crystal flow` and its commands, `cancel` and `defs` among them
 - `src/notify.rs`: telling the user when a session needs them, once it has for `[notifications] after_secs`
   and, with `unfocused_only`, while no TUI's terminal has the focus (where the user is, as the TUIs say, kept
-  for the daemon): desktop notifications a click on takes them to the session, or their own command;
+  for the daemon): desktop notifications a click on takes them to the session, `notify-send`'s text escaped
+  for a server that says it reads markup (asked once, with `gdbus` or `dbus-send`), or their own command;
   `crystal notify`'s too; and the sound at the same moments
 - `src/sound.rs`: the sounds (`assets/sounds/`, herdr's): which plays for an agent asking or done, the user's own
   files and the agents they're off for (`[sound]`), and playing one with the system's player, off the thread
