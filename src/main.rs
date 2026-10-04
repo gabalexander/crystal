@@ -36,6 +36,7 @@ mod hook;
 mod integration;
 mod keys;
 mod layout;
+mod layout_file;
 mod layout_relay;
 mod links;
 mod markdown;
@@ -81,6 +82,8 @@ mod update;
 mod viewer;
 mod vt;
 mod work;
+mod worktree_cli;
+mod worktree_hooks;
 
 use anyhow::{Result, bail};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
@@ -133,8 +136,9 @@ enum Command {
         detached: bool,
 
         /// Start in a new git worktree on this branch, beside the
-        /// repository in <repo>.worktrees/. The branch is made if it
-        /// doesn't exist, from origin's default branch, fetched first.
+        /// repository in <repo>.worktrees/, or in `[worktrees] directory`.
+        /// The branch is made if it doesn't exist, from origin's default
+        /// branch, fetched first.
         #[arg(short, long, value_name = "BRANCH")]
         worktree: Option<String>,
 
@@ -449,11 +453,16 @@ enum Command {
         command: TitleCommand,
     },
     /// Print the TUI's tabs: each one's sessions, and how its panes split
-    /// the room.
+    /// the room. Or write them to a layout file, or lay them out the way
+    /// one says, starting what isn't there.
+    #[command(args_conflicts_with_subcommands = true)]
     Layout {
         /// Print them as JSON.
         #[arg(long)]
         json: bool,
+
+        #[command(subcommand)]
+        command: Option<LayoutCommand>,
     },
     /// Show a session in this terminal; Ctrl+\ detaches.
     #[command(visible_alias = "a")]
@@ -1167,6 +1176,30 @@ enum TabCommand {
 }
 
 #[derive(Subcommand)]
+enum LayoutCommand {
+    /// Print the tabs as a layout file, for `layout apply`: as `layout
+    /// --json` prints them, with the command and directory that start each
+    /// session again.
+    Export {
+        /// Only this tab: its number, from 1, or its name.
+        #[arg(long)]
+        tab: Option<String>,
+    },
+    /// Lay the tabs out the way a layout file says: each in place of the
+    /// tab with its name, or else after the others. Sessions it names that
+    /// aren't there start, when it says how; it prints the name of each.
+    Apply {
+        /// The file [default: standard input, as - is]
+        file: Option<PathBuf>,
+
+        /// Take the place of every tab, as restoring a saved layout does:
+        /// the sessions the file doesn't name join the tab in front.
+        #[arg(long)]
+        replace: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum TitleCommand {
     /// Set the title.
     Set {
@@ -1248,6 +1281,38 @@ enum PaneCommand {
         /// one]
         #[arg(short, long)]
         name: Option<String>,
+    },
+    /// Swap a session's pane with another, the splits and how big each is
+    /// left as they are: the pane that way from it, given left, right, up
+    /// or down, or the pane of another session in its tab.
+    Swap {
+        /// left, right, up or down, or a session's name.
+        target: String,
+
+        /// The session whose pane to swap [default: the one this runs in,
+        /// or else the selected one]
+        #[arg(short, long)]
+        name: Option<String>,
+    },
+    /// Give a session's pane a share of the room of the split it's in: the
+    /// nearest split above it, or with --right or --down, the nearest that
+    /// splits that way.
+    Ratio {
+        /// Its share of the room, from 0.1 to 0.9.
+        #[arg(value_parser = share)]
+        share: f32,
+
+        /// The session [default: the one this runs in, or else the selected
+        /// one]
+        session: Option<String>,
+
+        /// The nearest split side by side.
+        #[arg(long, conflicts_with = "down")]
+        right: bool,
+
+        /// The nearest split one above the other.
+        #[arg(long)]
+        down: bool,
     },
     /// Close a session's pane of its own: its split, the pane beside it
     /// taking the room, or its float.
@@ -1335,6 +1400,110 @@ enum ServerCommand {
 
 #[derive(Subcommand)]
 enum WorktreeCommand {
+    /// List the project's worktrees, the main one first, with each one's
+    /// label and how many sessions run in it.
+    #[command(visible_alias = "ls")]
+    List {
+        /// A directory in the project [default: the current one]
+        #[arg(short = 'C', long = "dir", value_name = "DIR")]
+        dir: Option<PathBuf>,
+
+        /// Print them as JSON, each with the names of its sessions.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Make a worktree, and print its directory. A branch that exists is
+    /// checked out as it is; a new one starts from origin's default
+    /// branch, fetched first. It goes beside the repository in
+    /// <repo>.worktrees/, or in `[worktrees] directory`.
+    Create {
+        /// Its branch [default: a new one with a made-up name, like
+        /// brave-otter]
+        branch: Option<String>,
+
+        /// Where a new branch starts, as `new --base` says.
+        #[arg(long, value_name = "REF")]
+        base: Option<String>,
+
+        /// Make it in this directory instead.
+        #[arg(long, value_name = "PATH")]
+        path: Option<PathBuf>,
+
+        /// A few words on what it's for, which the sidebar shows in place
+        /// of its branch.
+        #[arg(long, value_name = "TEXT")]
+        label: Option<String>,
+
+        /// A directory in the project [default: the current one]
+        #[arg(short = 'C', long = "dir", value_name = "DIR")]
+        dir: Option<PathBuf>,
+    },
+    /// Start a session in a worktree, given its directory or its branch,
+    /// and attach to it when run in a terminal: your shell, or the command
+    /// given.
+    Open {
+        /// The worktree's directory, or the branch it has checked out.
+        worktree: String,
+
+        /// Give the worktree this label, as `create --label` does.
+        #[arg(long, value_name = "TEXT")]
+        label: Option<String>,
+
+        /// The session's name [default: from its first prompt, or else the
+        /// program's name]
+        #[arg(short, long)]
+        name: Option<String>,
+
+        /// Don't attach; print the session's name instead.
+        #[arg(short, long)]
+        detached: bool,
+
+        /// Set a variable in the session's environment, as `new -e` does.
+        #[arg(short, long = "env", value_name = "KEY=VALUE", value_parser = variable)]
+        env: Vec<(String, String)>,
+
+        /// A directory in the project [default: the current one]
+        #[arg(short = 'C', long = "dir", value_name = "DIR")]
+        dir: Option<PathBuf>,
+
+        /// The command and its arguments [default: the shell `[terminal]`
+        /// says, or yours]
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
+    },
+    /// Give a worktree a label, a few words on what it's for, which the
+    /// sidebar shows in place of its branch; "" takes it off.
+    Label {
+        /// The worktree's directory, or the branch it has checked out.
+        worktree: String,
+
+        label: String,
+
+        /// A directory in the project [default: the current one]
+        #[arg(short = 'C', long = "dir", value_name = "DIR")]
+        dir: Option<PathBuf>,
+    },
+    /// Move a session into a worktree of its project: its program stops
+    /// and starts again there, an agent in its conversation, told where it
+    /// is now. One in the middle of a turn moves once the turn ends, so an
+    /// agent asked to work in a worktree runs this and ends its turn.
+    Move {
+        /// The worktree on this branch, made if there's none [default: a
+        /// new one, on a branch with a made-up name]
+        branch: Option<String>,
+
+        /// The session to move [default: the one this runs in]
+        #[arg(short, long)]
+        name: Option<String>,
+
+        /// Where a new branch starts, as `new --base` says.
+        #[arg(long, value_name = "REF")]
+        base: Option<String>,
+
+        /// Make a new worktree in this directory.
+        #[arg(long, value_name = "PATH")]
+        path: Option<PathBuf>,
+    },
     /// Remove a worktree, given its directory or its branch. Refuses while
     /// a session runs in it, and when it has changes not committed.
     #[command(visible_alias = "remove")]
@@ -1739,9 +1908,7 @@ fn run(cli: Cli) -> Result<()> {
         }
         Command::Flow { json, command } => flow(&socket, json, command)?,
         Command::Result { name, json } => drive::result(&socket, &name, json)?,
-        Command::Worktree {
-            command: WorktreeCommand::Rm { worktree, force },
-        } => remove_worktree(&socket, &worktree, force)?,
+        Command::Worktree { command } => worktree(&socket, command)?,
         Command::Project { json, command } => project(&socket, json, command)?,
         Command::Tab { command } => tab(&socket, command)?,
         Command::Pane { command } => pane(&socket, command)?,
@@ -1752,7 +1919,18 @@ fn run(cli: Cli) -> Result<()> {
             };
             client::lay_out(&socket, layout::Command::Title { text })?;
         }
-        Command::Layout { json } => {
+        Command::Layout {
+            command: Some(LayoutCommand::Export { tab }),
+            ..
+        } => layout_file::export(&socket, tab.as_deref())?,
+        Command::Layout {
+            command: Some(LayoutCommand::Apply { file, replace }),
+            ..
+        } => layout_file::apply(&socket, file.as_deref(), replace)?,
+        Command::Layout {
+            json,
+            command: None,
+        } => {
             let layout = client::lay_out(&socket, layout::Command::Show)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&layout)?);
@@ -2415,6 +2593,30 @@ fn pane(socket: &Path, command: PaneCommand) -> Result<()> {
             toward: direction.into(),
             cells,
         },
+        PaneCommand::Swap { target, name } => match Toward::from_str(&target, false) {
+            Ok(toward) => layout::Command::SwapToward {
+                session: name,
+                toward: toward.into(),
+            },
+            Err(_) => layout::Command::Swap {
+                session: name,
+                with: target,
+            },
+        },
+        PaneCommand::Ratio {
+            share,
+            session,
+            right,
+            down,
+        } => layout::Command::Ratio {
+            session,
+            way: match (right, down) {
+                (true, _) => Some(Way::Right),
+                (_, true) => Some(Way::Down),
+                _ => None,
+            },
+            share,
+        },
         PaneCommand::Close { session } => layout::Command::Close { session },
         PaneCommand::Zoom { session, off } => layout::Command::Zoom { session, on: !off },
         PaneCommand::Equalize => layout::Command::Equalize,
@@ -2462,9 +2664,72 @@ fn start_dir(
     };
     match worktree {
         Some(NewWorktree { branch, base }) => {
-            client::add_worktree(socket, &cwd, &branch, base.as_deref())
+            client::add_worktree(socket, &cwd, &branch, base.as_deref(), None)
         }
         None => Ok(cwd),
+    }
+}
+
+/// `crystal worktree` and its commands.
+fn worktree(socket: &Path, command: WorktreeCommand) -> Result<()> {
+    match command {
+        WorktreeCommand::List { dir, json } => worktree_cli::list(socket, &here(dir)?, json),
+        WorktreeCommand::Create {
+            branch,
+            base,
+            path,
+            label,
+            dir,
+        } => {
+            let new = worktree_cli::NewWorktree {
+                branch,
+                base,
+                path,
+                label,
+            };
+            worktree_cli::create(socket, &here(dir)?, new)
+        }
+        WorktreeCommand::Open {
+            worktree,
+            label,
+            name,
+            detached,
+            env,
+            dir,
+            command,
+        } => {
+            let path = worktree_cli::find(&here(dir)?, &worktree, label.as_deref())?;
+            let new = NewArgs {
+                name,
+                cwd: Some(path),
+                worktree: None,
+                detached,
+                command,
+                task: None,
+                env,
+            };
+            new_session(socket, new)
+        }
+        WorktreeCommand::Label {
+            worktree,
+            label,
+            dir,
+        } => worktree_cli::label(&here(dir)?, &worktree, &label),
+        WorktreeCommand::Move {
+            branch,
+            name,
+            base,
+            path,
+        } => {
+            let to = worktree_cli::MoveTo {
+                session: name,
+                branch,
+                base,
+                path,
+            };
+            worktree_cli::move_session(socket, to)
+        }
+        WorktreeCommand::Rm { worktree, force } => remove_worktree(socket, &worktree, force),
     }
 }
 

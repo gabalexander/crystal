@@ -24,16 +24,17 @@ mod finder;
 mod fuzzy;
 mod grep;
 mod groups;
+mod handoff_view;
 mod help;
 mod issues;
 pub(crate) mod keymap;
 pub(crate) mod launcher;
 mod layout_link;
-mod layouts;
+pub(crate) mod layouts;
 mod listing;
 mod memory_view;
 mod menu;
-mod mouse;
+pub(crate) mod mouse;
 mod needs_you;
 mod pane;
 mod plugins_view;
@@ -64,7 +65,7 @@ pub(crate) mod window;
 use crate::bell::Ringer;
 use crate::config::{self, Config};
 use crate::db::{self, Db};
-use crate::events::{Filter, Since};
+use crate::events::{Filter, Scope, Since};
 use crate::flow_run::FlowRun;
 use crate::forge::{
     Checkout, Forge, Issue, IssueDetail, PullRequest, PullRequestDetail, Repo, Topic,
@@ -80,7 +81,7 @@ use crate::protocol::{
     Backlog, NewSession, Request, Response, SessionInfo, Spending, State, Worktree,
 };
 use crate::{catalog, keys, links, names, socket, typing, update};
-use crate::{client, clipboard, drive, env, event_log, events, git};
+use crate::{client, clipboard, drive, env, event_log, events, git, handoff};
 use anyhow::{Context as _, Result, bail};
 use app::{Action, App, Focus, Hit, Place, PluginKey, PluginPane, Popup, Slot};
 use appearance::Appearance;
@@ -199,7 +200,11 @@ pub enum Event {
         project: PathBuf,
         worktrees: Vec<Worktree>,
         subjects: HashMap<PathBuf, String>,
+        labels: HashMap<PathBuf, String>,
     },
+    /// The worktrees the daemon is removing, whoever asked, as it listed
+    /// them.
+    Removals(Vec<PathBuf>),
     /// The daemon is done removing the worktree at `path`: it's gone, or
     /// why not.
     WorktreeRemoved {
@@ -337,6 +342,11 @@ pub enum Event {
     },
     /// What the event log gained while the user was away.
     Away(Result<away::Tally, String>),
+    /// What the handoff view on `session` shows.
+    HandoffFound {
+        session: String,
+        found: handoff_view::Found,
+    },
     /// The system's appearance, light or dark, has changed.
     Appearance(Appearance),
     /// What each thing at the tab bar's right shows now.
@@ -860,22 +870,25 @@ impl Tui {
         }
     }
 
-    /// Reads the newest page of the event log for the timeline, then
-    /// follows the log from there, on a thread of its own, until the
-    /// timeline closes. Subscribing from the page's newest event leaves no
-    /// gap between the two, and the subscription picks up again after the
-    /// last event it gave when a handover cuts it.
-    fn follow_events(&self) {
+    /// Reads the newest page of the event log of `scope` for the timeline,
+    /// then follows the log from there, on a thread of its own, until the
+    /// timeline closes or is switched to another scope. Subscribing from
+    /// the latest event the log had as the page was read leaves no gap
+    /// between the two (an event in both is taken once), and the
+    /// subscription picks up again after the last event it gave when a
+    /// handover cuts it.
+    fn follow_events(&self, scope: Scope) {
         let feed = self.feed.fetch_add(1, Ordering::Relaxed) + 1;
         let current = self.feed.clone();
         let socket = self.socket.clone();
         let events = self.events.clone();
         thread::spawn(move || {
-            let read = read_events(&socket, None);
+            let read = read_events(&socket, &scope, None);
             let since = match &read {
-                Ok(page) => Some(Since::Seq(page.first().map_or(0, |event| event.seq))),
+                Ok((latest, _)) => Some(Since::Seq(*latest)),
                 Err(_) => None,
             };
+            let read = read.map(|(_, page)| page);
             if events.send(Event::EventsRead { feed, read }).is_err() {
                 return;
             }
@@ -1151,11 +1164,20 @@ impl Tui {
                 project,
                 worktrees,
                 subjects,
+                labels,
             } => {
                 self.app.set_subjects(&project, subjects);
+                self.app.set_labels(&project, labels);
                 self.app.set_worktrees(project, worktrees);
             }
             Event::Stat { path, stat } => self.app.set_stat(path, stat),
+            // One someone else asked for that's done with has git list the
+            // worktrees again, for it to leave the sidebar if it's gone.
+            Event::Removals(worktrees) => {
+                if self.app.set_removals(worktrees) {
+                    self.list_worktrees_again();
+                }
+            }
             Event::WorktreeRemoved { path, removed } => self.worktree_removed(&path, removed),
             Event::WorktreeHasChanges { path, branch } => {
                 self.app.ask_to_force_removal(path, branch);
@@ -1301,6 +1323,11 @@ impl Tui {
             }
             Event::Status(status) => self.app.set_status(status),
             Event::Away(Ok(tally)) => self.app.set_away(&tally),
+            Event::HandoffFound { session, found } => {
+                if let Some(action) = self.app.handoff_found(&session, found) {
+                    self.carry_out(action);
+                }
+            }
             Event::Away(Err(reason)) => {
                 self.app
                     .notify(format!("couldn't read the event log: {reason}"));
@@ -1925,16 +1952,27 @@ impl Tui {
                 }
                 self.app.restore_layout(restored.tabs, &name, started);
             }
-            Action::FollowEvents => self.follow_events(),
+            Action::FollowEvents(scope) => self.follow_events(scope),
             Action::StopFollowing => {
                 self.feed.fetch_add(1, Ordering::Relaxed);
             }
-            Action::ReadOlderEvents(before) => {
+            Action::ReadOlderEvents { scope, before } => {
                 let feed = self.feed.load(Ordering::Relaxed);
                 let socket = self.socket.clone();
                 self.read_in_background(move || Event::EventsRead {
                     feed,
-                    read: read_events(&socket, Some(before)),
+                    read: read_events(&socket, &scope, Some(before)).map(|(_, page)| page),
+                });
+            }
+            Action::ReadHandoff {
+                session,
+                worktree,
+                task,
+            } => {
+                let socket = self.socket.clone();
+                self.read_in_background(move || Event::HandoffFound {
+                    found: find_handoff(&socket, worktree, task),
+                    session,
                 });
             }
             Action::RemoveLayout(which) => {
@@ -3073,9 +3111,9 @@ fn directory_for(socket: &Path, place: Place) -> Result<PathBuf> {
                 None => std::env::current_dir()?,
             };
             if made_up {
-                client::add_new_worktree(socket, &base, &branch)
+                client::add_new_worktree(socket, &base, &branch, None, None)
             } else {
-                client::add_worktree(socket, &base, &branch, None)
+                client::add_worktree(socket, &base, &branch, None, None)
             }
         }
         Place::PullRequest(checkout) => client::pull_request_worktree(socket, &checkout),
@@ -3272,11 +3310,40 @@ fn list_sessions(socket: &Path, start: bool) -> Result<Vec<SessionInfo>> {
     }
 }
 
-/// A page of the event log of the daemon at `socket`, the newest first:
-/// its end, or from before the event numbered `before`.
-fn read_events(socket: &Path, before: Option<u64>) -> Result<Vec<events::Event>, String> {
-    let page = Db::open(socket).and_then(|db| db.events_before(before, timeline::PAGE));
-    page.map_err(|err| format!("{err:#}"))
+/// A page of the event log of the daemon at `socket` that `scope` takes,
+/// the newest first: its end, or from before the event numbered `before`;
+/// and the latest event the log had before it was read.
+fn read_events(
+    socket: &Path,
+    scope: &Scope,
+    before: Option<u64>,
+) -> Result<(u64, Vec<events::Event>), String> {
+    let read = || -> Result<_> {
+        let db = Db::open(socket)?;
+        let latest = db.latest_event()?;
+        Ok((latest, db.events_before(scope, before, timeline::PAGE)?))
+    };
+    read().map_err(|err| format!("{err:#}"))
+}
+
+/// What the handoff view shows: whether the worktree at `worktree` has
+/// notes, and the files the daemon at `socket` kept with task `task`.
+fn find_handoff(
+    socket: &Path,
+    worktree: Option<PathBuf>,
+    task: Option<u64>,
+) -> handoff_view::Found {
+    let notes = worktree.filter(|worktree| {
+        let path = handoff::path(worktree);
+        std::fs::metadata(path).is_ok_and(|meta| meta.is_file() && meta.len() > 0)
+    });
+    let kept = match task {
+        Some(task) => Db::open(socket)
+            .and_then(|db| db.artifacts(task))
+            .map_err(|err| format!("couldn't read what its task kept: {err:#}")),
+        None => Ok(Vec::new()),
+    };
+    handoff_view::Found { notes, kept }
 }
 
 /// Every flow run, or none when the daemon can't say.
@@ -3339,6 +3406,7 @@ fn spawn_worktree_lister(
                     project,
                     worktrees: linked.worktrees,
                     subjects: linked.subjects,
+                    labels: linked.labels,
                 };
                 if events.send(listed).is_err() {
                     return;
@@ -3508,6 +3576,11 @@ fn spawn_session_poller(socket: PathBuf, events: Sender<Event>, polled: Polled) 
             if events.send(Event::Sessions { sessions, asked }).is_err() {
                 return;
             }
+            if let Some(worktrees) = list_removals(&socket)
+                && events.send(Event::Removals(worktrees)).is_err()
+            {
+                return;
+            }
             if let Ok(Some(Response::Spending(spending))) =
                 client::ask(&socket, &Request::Spending, false)
                 && events.send(Event::Spending(spending)).is_err()
@@ -3522,6 +3595,15 @@ fn spawn_session_poller(socket: PathBuf, events: Sender<Event>, polled: Polled) 
             }
         }
     });
+}
+
+/// The worktrees the daemon is removing, whoever asked, or `None` when it
+/// can't say.
+fn list_removals(socket: &Path) -> Option<Vec<PathBuf>> {
+    match client::ask(socket, &Request::Removals, false) {
+        Ok(Some(Response::Removals { worktrees })) => Some(worktrees),
+        _ => None,
+    }
 }
 
 /// The projects crystal knows, by their main worktrees, or `None` when the

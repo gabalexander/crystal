@@ -67,6 +67,7 @@ pub enum Kind {
     FlowEnded,
     WorktreeCreated,
     WorktreeRemoved,
+    WorktreeHookFailed,
     HandoffAdded,
     MemoryAdded,
     MemoryForgotten,
@@ -82,7 +83,7 @@ pub enum Kind {
 }
 
 impl Kind {
-    pub const ALL: [Kind; 51] = [
+    pub const ALL: [Kind; 52] = [
         Kind::SessionStarted,
         Kind::SessionRenamed,
         Kind::SessionWorking,
@@ -122,6 +123,7 @@ impl Kind {
         Kind::FlowEnded,
         Kind::WorktreeCreated,
         Kind::WorktreeRemoved,
+        Kind::WorktreeHookFailed,
         Kind::HandoffAdded,
         Kind::MemoryAdded,
         Kind::MemoryForgotten,
@@ -178,6 +180,7 @@ impl Kind {
             Kind::FlowEnded => "flow.ended",
             Kind::WorktreeCreated => "worktree.created",
             Kind::WorktreeRemoved => "worktree.removed",
+            Kind::WorktreeHookFailed => "worktree.hook_failed",
             Kind::HandoffAdded => "handoff.added",
             Kind::MemoryAdded => "memory.added",
             Kind::MemoryForgotten => "memory.forgotten",
@@ -239,6 +242,7 @@ impl Kind {
             Kind::FlowEnded => "a flow run ends",
             Kind::WorktreeCreated => "crystal makes a worktree",
             Kind::WorktreeRemoved => "crystal removes one",
+            Kind::WorktreeHookFailed => "a worktree's create or delete hook fails",
             Kind::HandoffAdded => "a note goes in a worktree's handoff file",
             Kind::MemoryAdded => "an entry is added to a project's memory",
             Kind::MemoryForgotten => "an entry is forgotten",
@@ -351,6 +355,10 @@ pub struct SessionAbout {
     pub activity: Option<Activity>,
     /// What it was asked to do, when it has a task.
     pub task: Option<String>,
+    /// That task's number, when it has one: what a task's timeline takes
+    /// its session's events by.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<u64>,
     /// The word `ls` shows for it: `waiting`, `running`, `exited 0`.
     #[serde(default)]
     pub status: String,
@@ -416,8 +424,11 @@ pub struct WorktreeAbout {
     pub path: PathBuf,
     pub branch: Option<String>,
     /// Its project's main worktree. A removed worktree's directory is gone,
-    /// so git can't say which project it was in.
+    /// so git can't say which project it was in, unless crystal removed it.
     pub project: Option<PathBuf>,
+    /// Why the hook run on it failed, for `worktree.hook_failed`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub why: Option<String>,
 }
 
 /// A note added to a worktree's handoff file.
@@ -791,11 +802,36 @@ impl Event {
             path: path.to_path_buf(),
             branch: branch.map(String::from),
             project: project.clone(),
+            why: None,
         };
         Event {
             project,
             worktree: Some(worktree),
             ..Event::new(kind)
+        }
+    }
+
+    /// The daemon removed the worktree at `path`, of the project whose main
+    /// worktree is `project`.
+    pub fn worktree_removed(path: &Path, branch: Option<&str>, project: &Path) -> Event {
+        let mut event = Event::worktree(false, path, branch);
+        event.project = Some(project.to_path_buf());
+        if let Some(worktree) = &mut event.worktree {
+            worktree.project = Some(project.to_path_buf());
+        }
+        event
+    }
+
+    /// The hook run on `worktree`, made or removed, failed, for `why`: see
+    /// [`crate::worktree_hooks`].
+    pub fn worktree_hook_failed(worktree: &WorktreeAbout, why: &str) -> Event {
+        Event {
+            project: worktree.project.clone(),
+            worktree: Some(WorktreeAbout {
+                why: Some(why.to_string()),
+                ..worktree.clone()
+            }),
+            ..Event::new(Kind::WorktreeHookFailed)
         }
     }
 
@@ -1080,6 +1116,11 @@ impl Event {
                     }
                 })
             }
+            Kind::WorktreeHookFailed => self.worktree.as_ref().map_or(String::new(), |worktree| {
+                let path = shell::home_relative(&worktree.path);
+                let why = worktree.why.as_deref().unwrap_or("it failed");
+                format!("{path}: {why}")
+            }),
             Kind::MemoryAdded
             | Kind::MemoryForgotten
             | Kind::MemoryStale
@@ -1152,6 +1193,7 @@ impl SessionAbout {
             branch: worktree.and_then(|worktree| worktree.branch.clone()),
             activity: session.activity,
             task: session.task.as_ref().map(|task| task.goal.clone()),
+            task_id: session.task.as_ref().and_then(|task| task.id),
             status: session.status(),
             reporter: session.reporter.clone(),
         }
@@ -1367,6 +1409,16 @@ pub fn example(kind: Kind, session: Option<&SessionInfo>, dir: &Path) -> Event {
                 .map_or(dir, |worktree| &worktree.path);
             Event::worktree(kind == Kind::WorktreeCreated, path, Some("fix-login"))
         }
+        Kind::WorktreeHookFailed => {
+            let path = session
+                .worktree
+                .as_ref()
+                .map_or(dir, |worktree| &worktree.path);
+            let made = Event::worktree(true, path, Some("fix-login"));
+            let worktree = made.worktree.expect("a worktree event has its worktree");
+            let why = "the worktree create hook exited with exit status: 1";
+            Event::worktree_hook_failed(&worktree, why)
+        }
         Kind::MemoryAdded | Kind::MemoryForgotten | Kind::MemoryStale => {
             Event::memory(kind, project::of(dir).path, entry)
         }
@@ -1430,6 +1482,42 @@ impl Filter {
         });
         let project_wanted = self.project.is_none() || self.project == event.project;
         kind_wanted && session_wanted && project_wanted
+    }
+}
+
+/// What a timeline is about: everything, or one session, task or project.
+/// The log is read a page at a time for one (see [`crate::db::Db`]'s
+/// `events_before`), and the events that happen meanwhile are taken by
+/// [`Scope::matches`]: the two say the same.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Scope {
+    All,
+    /// The session with this id, whatever it's called: what's about it,
+    /// and the messages it sent.
+    Session(String),
+    /// The task with this number: its own events, and its session's while
+    /// it has the task.
+    Task(u64),
+    /// The project whose main worktree this is.
+    Project(PathBuf),
+}
+
+impl Scope {
+    pub fn matches(&self, event: &Event) -> bool {
+        match self {
+            Scope::All => true,
+            Scope::Session(id) => {
+                let about = event.session.as_ref().is_some_and(|s| s.id == *id);
+                let sent = event.message.as_ref();
+                about || sent.is_some_and(|message| message.from_id.as_ref() == Some(id))
+            }
+            Scope::Task(id) => {
+                let task = event.task.as_ref().and_then(|task| task.id);
+                let session = event.session.as_ref().and_then(|s| s.task_id);
+                task == Some(*id) || session == Some(*id)
+            }
+            Scope::Project(path) => event.project.as_ref() == Some(path),
+        }
     }
 }
 

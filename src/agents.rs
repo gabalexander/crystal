@@ -80,16 +80,23 @@ pub const ABOUT_CRYSTAL: &str = "You're running inside crystal, the terminal wor
 
 /// What Claude Code is told about working on several things at once: to
 /// start a session of crystal's for each, which the user sees, rather
-/// than worktrees or subagents of its own, which they don't. Only Claude
-/// Code makes those, and only it has a system prompt to say this in
-/// without touching what the user asked.
+/// than worktrees or subagents of its own, which they don't; and about
+/// working in a worktree itself: to have crystal move its session into
+/// one, rather than enter one of its own, which crystal's sidebar would
+/// only find after the fact, under `.claude/worktrees`. Only Claude Code
+/// makes those, and only it has a system prompt to say this in without
+/// touching what the user asked.
 pub const PARALLEL_WORK: &str = "To work on several things at once, start a crystal session \
                                  for each, `crystal new -d -w <branch> claude \"<task>\"` \
                                  (with `--base HEAD` when it should start from your \
                                  commits), rather than worktrees or subagents of your own: \
                                  each shows in the user's sidebar with its status, its diff \
-                                 and its screen, where they can step in. The crystal skill \
-                                 says more.";
+                                 and its screen, where they can step in. When you're asked \
+                                 to work in a worktree yourself, run `crystal worktree move \
+                                 <branch>` once, rather than entering or making a worktree \
+                                 of your own, then end your turn: crystal moves this session \
+                                 into it and picks your conversation up there. The crystal \
+                                 skill says more.";
 
 /// The command line to run for `command`. For an agent crystal knows, it
 /// carries the flags that make the agent report to `crystal hook`, run
@@ -152,6 +159,27 @@ pub fn with_options(mut argv: Vec<String>, options: &[String]) -> Vec<String> {
     if program_name(&argv) == Some("claude") {
         argv.splice(1..1, options.iter().cloned());
     }
+    argv
+}
+
+/// A command line from [`argv`] that picks an agent's conversation up again,
+/// for a session moved into another worktree, at `cwd`. Claude Code and
+/// Codex take `notice` as the next prompt in their conversation, after
+/// their options, so they carry on there; Codex, which would go back to the
+/// directory its conversation began in, is told `cwd` as well. Whether any
+/// other agent would take a prompt there isn't known, so its command line
+/// stays as it is, and it picks its conversation up waiting for the user.
+pub fn moved(mut argv: Vec<String>, notice: &str, cwd: &Path) -> Vec<String> {
+    let program = program_name(&argv);
+    if !matches!(program, Some("claude" | "codex")) || argv.iter().any(|arg| arg == "--") {
+        return argv;
+    }
+    if program == Some("codex") {
+        argv.push("--cd".to_string());
+        argv.push(cwd.to_string_lossy().into_owned());
+    }
+    argv.push("--".to_string());
+    argv.push(notice.to_string());
     argv
 }
 
@@ -610,6 +638,44 @@ mod tests {
 
     fn input(json: &str) -> Value {
         serde_json::from_str(json).unwrap()
+    }
+
+    #[test]
+    fn a_moved_agent_picks_its_conversation_up_on_a_prompt_saying_where_it_is() {
+        let cwd = Path::new("/code/app.worktrees/fix");
+        let claude = command(&["claude", "--settings", "{}", "--resume", "c1"]);
+        assert_eq!(
+            moved(claude, "moved", cwd),
+            command(&[
+                "claude",
+                "--settings",
+                "{}",
+                "--resume",
+                "c1",
+                "--",
+                "moved"
+            ])
+        );
+        let codex = command(&["codex", "resume", "c1", "-m", "o3"]);
+        assert_eq!(
+            moved(codex, "moved", cwd),
+            command(&[
+                "codex",
+                "resume",
+                "c1",
+                "-m",
+                "o3",
+                "--cd",
+                "/code/app.worktrees/fix",
+                "--",
+                "moved"
+            ])
+        );
+        // Not known to take a prompt there, or given one already.
+        let other = command(&["gemini", "--resume", "c1"]);
+        assert_eq!(moved(other.clone(), "moved", cwd), other);
+        let prompted = command(&["claude", "--resume", "c1", "--", "go on"]);
+        assert_eq!(moved(prompted.clone(), "moved", cwd), prompted);
     }
 
     #[test]

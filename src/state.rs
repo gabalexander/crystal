@@ -86,6 +86,11 @@ pub fn plugins_dir(socket: &Path) -> PathBuf {
     kept(socket, "plugins", "plugins")
 }
 
+/// Where the daemon at `socket` keeps what the worktree hooks printed.
+pub fn worktree_hooks_log(socket: &Path) -> PathBuf {
+    kept(socket, "worktree-hooks.log", "worktree-hooks.log")
+}
+
 fn projects_dir(socket: &Path) -> PathBuf {
     kept(socket, "projects", "projects")
 }

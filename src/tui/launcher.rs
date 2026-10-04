@@ -168,6 +168,9 @@ pub struct Setup {
     pub background: bool,
     /// The made-up name a new worktree's branch starts with.
     pub branch: String,
+    /// Where new worktrees go, when the settings say: `[worktrees]
+    /// directory`.
+    pub worktree_directory: Option<PathBuf>,
 }
 
 /// What a key in the panel leads to.
@@ -267,6 +270,8 @@ pub struct Launcher {
     keeps_draft: bool,
     /// Whether it opened on the draft left last time, which it says.
     from_draft: bool,
+    /// Where new worktrees go, when the settings say.
+    worktree_directory: Option<PathBuf>,
 }
 
 impl Launcher {
@@ -293,6 +298,7 @@ impl Launcher {
             opened_at: setup.target,
             keeps_draft: false,
             from_draft: false,
+            worktree_directory: setup.worktree_directory,
         };
         launcher.choose_run(setup.run);
         // Opened for a new worktree, as by `w`, it stays one whatever the
@@ -829,7 +835,8 @@ impl Launcher {
             return None;
         };
         let branch = self.branch_name();
-        (!branch.is_empty()).then(|| git::worktree_dir(base, &branch))
+        let directory = self.worktree_directory.as_deref();
+        (!branch.is_empty()).then(|| git::worktree_dir(base, &branch, directory))
     }
 
     /// Enter: starts the session, unless a new worktree has no branch yet.
@@ -1287,6 +1294,7 @@ mod tests {
             codex_models: vec!["gpt-6-luna".into(), "gpt-5.5".into()],
             background: false,
             branch: "brave-otter".into(),
+            worktree_directory: None,
         })
     }
 
@@ -1358,6 +1366,7 @@ mod tests {
             codex_models: Vec::new(),
             background: false,
             branch: "calm-heron".into(),
+            worktree_directory: None,
         })
     }
 
@@ -1786,6 +1795,7 @@ mod tests {
             codex_models: Vec::new(),
             background: false,
             branch: "brave-otter".into(),
+            worktree_directory: None,
         });
         assert!(panel.is_new_worktree());
     }

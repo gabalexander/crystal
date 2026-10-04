@@ -138,6 +138,22 @@ impl Side {
 }
 
 impl SplitTree {
+    /// `pane` alone, taking all the room.
+    pub fn of(pane: Pane) -> SplitTree {
+        SplitTree {
+            root: Node::Pane(pane),
+        }
+    }
+
+    /// `first` and `second` put together, `way`: `first` has `ratio` of the
+    /// room, and `second` the rest. The tree may have no selection's pane,
+    /// or several, until [`SplitTree::retain`] puts it right.
+    pub fn joined(way: Way, ratio: f32, first: SplitTree, second: SplitTree) -> SplitTree {
+        SplitTree {
+            root: Node::split(way, ratio, first.root, second.root),
+        }
+    }
+
     /// `panes` in a line, `way`, each with the same room.
     pub fn in_line(panes: Vec<Pane>, way: Way) -> SplitTree {
         let mut nodes = panes.into_iter().rev().map(Node::Pane);
@@ -348,6 +364,34 @@ impl SplitTree {
             -i32::from(cells)
         };
         self.put_border(at, now + by, room)
+    }
+
+    /// Gives `pane`'s side of the nearest split above it, or the nearest
+    /// `way` when that's given, `share` of the split's room, whatever the
+    /// panes on either side are left with. Says whether there's such a
+    /// split.
+    pub fn set_share(&mut self, pane: &Pane, way: Option<Way>, share: f32) -> bool {
+        let Some(path) = self.path_of(pane) else {
+            return false;
+        };
+        let depth = (0..path.len())
+            .rev()
+            .find(|&depth| match self.node(&path[..depth]) {
+                Node::Split(split) => way.is_none_or(|way| split.way == way),
+                Node::Pane(_) => false,
+            });
+        let Some(depth) = depth else {
+            return false;
+        };
+        let Node::Split(split) = self.node_mut(&path[..depth]) else {
+            return false;
+        };
+        let share = share.clamp(0.0, 1.0);
+        split.ratio = match path[depth] {
+            Side::First => share,
+            Side::Second => 1.0 - share,
+        };
+        true
     }
 
     /// Puts the border of the split [`SplitTree::borders`] counts as
@@ -996,6 +1040,37 @@ mod tests {
         assert_eq!(names(&tree), ["a", "*", "c"]);
         tree.retain(|_| false);
         assert_eq!(tree, SplitTree::default());
+    }
+
+    #[test]
+    fn a_share_goes_to_the_panes_side_of_the_nearest_split_or_the_nearest_that_way() {
+        let mut tree = three();
+        // b is the second side of the split one above the other.
+        assert!(tree.set_share(&session("b"), None, 0.25));
+        assert_eq!(area(&tree, "b", ROOM), Rect::new(51, 30, 50, 10));
+        assert_eq!(area(&tree, "*", ROOM), Rect::new(51, 0, 50, 30));
+        // Side by side, its side is the second of the split at the top.
+        assert!(tree.set_share(&session("b"), Some(Way::Right), 0.7));
+        assert_eq!(area(&tree, "a", ROOM).width, 30);
+        assert_eq!(area(&tree, "b", ROOM), Rect::new(31, 30, 70, 10));
+
+        assert!(!tree.set_share(&session("a"), Some(Way::Down), 0.5));
+        assert!(!tree.set_share(&session("gone"), None, 0.5));
+        assert!(!SplitTree::default().set_share(&Pane::Selection, None, 0.5));
+    }
+
+    #[test]
+    fn trees_join_into_one_split_each_side_kept_whole() {
+        let below = SplitTree::joined(
+            Way::Down,
+            0.25,
+            SplitTree::of(Pane::Selection),
+            SplitTree::of(session("b")),
+        );
+        let tree = SplitTree::joined(Way::Right, 0.5, SplitTree::of(session("a")), below);
+        assert_eq!(names(&tree), ["a", "*", "b"]);
+        assert_eq!(area(&tree, "*", ROOM), Rect::new(51, 0, 50, 10));
+        assert_eq!(area(&tree, "b", ROOM), Rect::new(51, 10, 50, 30));
     }
 
     #[test]

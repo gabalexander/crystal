@@ -603,7 +603,7 @@ fn reported_line<'a>(session: &SessionInfo, theme: &Theme, width: u16) -> Line<'
 /// One Claude Code made for itself is named
 /// `claude`, then the subject of the commit it's at, which says what it
 /// holds where its branch's name doesn't, or its directory's name until
-/// git has said.
+/// git has said. One given a label is named by it, then its branch.
 #[allow(clippy::too_many_arguments)]
 fn worktree_line<'a>(
     app: &App,
@@ -616,15 +616,22 @@ fn worktree_line<'a>(
     width: u16,
 ) -> Line<'a> {
     let mark = if main { "⌂ " } else { "⎇ " };
+    let doing = in_progress.map(|what| what.doing().to_string());
+    let branch_name = branch.unwrap_or("(detached)");
     let (name, about) = if protocol::claude_codes_own(project, path) {
         let subject = app.subject_of(path).map(str::to_string);
         let directory = path
             .file_name()
             .map(|name| name.to_string_lossy().into_owned());
         ("claude", subject.or(directory))
+    } else if let Some(label) = app.label_of(path) {
+        let about = match doing {
+            Some(doing) => format!("{branch_name} · {doing}"),
+            None => branch_name.to_string(),
+        };
+        (label, Some(about))
     } else {
-        let doing = in_progress.map(|what| what.doing().to_string());
-        (branch.unwrap_or("(detached)"), doing)
+        (branch_name, doing)
     };
     // The indent and the mark before the branch; a space at the end.
     let room = usize::from(width).saturating_sub(WORKTREE_INDENT.len() + 2 + 1);
@@ -1291,6 +1298,31 @@ mod tests {
         // On its branch again, nothing is said.
         let line = worktree_line(&app, project, path, Some("fix"), false, None, &theme, 28);
         assert_eq!(line.to_string().trim_end(), "   ⎇ fix");
+    }
+
+    #[test]
+    fn a_labelled_worktree_is_named_by_its_label_then_its_branch() {
+        let theme = Theme::new(crate::config::ThemeName::DARK, false);
+        let mut app = App::new(None);
+        let project = Path::new("/code/app");
+        let path = Path::new("/work/trees/app/brave-otter");
+        let line = |app: &App, doing| {
+            let branch = Some("brave-otter");
+            worktree_line(app, project, path, branch, false, doing, &theme, 40)
+        };
+        let labels = HashMap::from([(path.to_path_buf(), "login fix".to_string())]);
+        app.set_labels(project, labels);
+        assert_eq!(
+            line(&app, None).to_string().trim_end(),
+            "   ⎇ login fix · brave-otter"
+        );
+        assert_eq!(
+            line(&app, Some(InProgress::Rebase)).to_string().trim_end(),
+            "   ⎇ login fix · brave-otter · rebasing"
+        );
+        app.set_labels(project, HashMap::new());
+        assert_eq!(app.label_of(path), None);
+        assert_eq!(line(&app, None).to_string().trim_end(), "   ⎇ brave-otter");
     }
 
     #[test]

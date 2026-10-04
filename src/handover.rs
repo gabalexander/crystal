@@ -70,6 +70,10 @@ pub struct State {
     /// removing them, and answers the clients that asked.
     #[serde(default)]
     pub removals: Vec<HandedRemoval>,
+    /// The sessions on their way into other worktrees: the new daemon
+    /// moves them.
+    #[serde(default)]
+    pub moves: Vec<HandedMove>,
 }
 
 /// A flow run as it's handed over: with the environment its steps start
@@ -109,6 +113,20 @@ pub struct HandedRemoval {
     pub git: Option<u32>,
     /// The connections waiting to hear it's done.
     pub asking: Vec<RawFd>,
+}
+
+/// A session the daemon was moving into another worktree as it handed
+/// over.
+#[derive(Serialize, Deserialize)]
+pub struct HandedMove {
+    /// The session's id.
+    pub session: String,
+    /// The worktree it moves into.
+    pub path: PathBuf,
+    pub branch: Option<String>,
+    /// Whether its program had been stopped, to start again in the
+    /// worktree once it has ended.
+    pub stopping: bool,
 }
 
 /// Refuses to hand over to the crystal at `exe` when it couldn't take
@@ -503,6 +521,7 @@ mod tests {
             sessions: Vec::new(),
             flows: Vec::new(),
             removals: Vec::new(),
+            moves: Vec::new(),
         };
         let fd = write(dir.path(), &state).unwrap();
         // Unlinked: nothing is left on disk.
