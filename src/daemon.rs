@@ -27,7 +27,7 @@ use crate::handover::{self, Gate, Ticket};
 use crate::layout::{Layout, Order};
 use crate::layout_relay::{NoTui, Relay};
 use crate::mcp;
-use crate::memory::{self, Added};
+use crate::memory;
 use crate::messages::{self, Sender};
 use crate::names;
 use crate::notify::{self, Notice};
@@ -1318,9 +1318,8 @@ impl Daemon {
     }
 
     /// Writes a task that has just closed, which ran in `cwd`, in `session`
-    /// if it had started, into its project's history, tells of it, and
-    /// keeps how it went in the project's memory. When it was done and was
-    /// for a backlog item, ticks the item.
+    /// if it had started, into its project's history, and tells of it.
+    /// When it was done and was for a backlog item, ticks the item.
     fn write_down(&self, cwd: &Path, session: Option<&protocol::SessionInfo>, task: &TaskRecord) {
         let project = project::of(cwd).path;
         let ticked = {
@@ -1357,7 +1356,6 @@ impl Daemon {
         };
         self.events.emit(closed);
         self.tell_backlog(Kind::BacklogClosed, cwd, ticked);
-        self.remember_outcome(cwd, &task);
     }
 
     /// Adds how `task` went, closed in the session `info` is about, to its
@@ -1634,33 +1632,6 @@ impl Daemon {
         let report = report?;
         tell_distilled(&self.events, &job, &report.added);
         Ok(Response::Distilled(report))
-    }
-
-    /// Keeps how a closed task turned out in its project's memory, for the
-    /// sessions after it, when it was done or failed with something to say.
-    fn remember_outcome(&self, cwd: &Path, task: &TaskRecord) {
-        let Some(outcome) = &task.outcome else {
-            return;
-        };
-        if outcome.summary.trim().is_empty() || outcome.cancelled {
-            return;
-        }
-        let line = if outcome.failed {
-            format!("{} (failed): {}", task.goal, outcome.summary)
-        } else {
-            format!("{}: {}", task.goal, outcome.summary)
-        };
-        let project = project::of(cwd).path;
-        let kept =
-            memory::record_outcome(&settings(), &self.socket, &project, &task.session, &line);
-        match kept {
-            Ok(Some(Added::New(entry))) => {
-                self.events
-                    .emit(Event::memory(Kind::MemoryAdded, project, entry));
-            }
-            Ok(_) => {}
-            Err(err) => eprintln!("crystal daemon: couldn't remember how a task went: {err:#}"),
-        }
     }
 
     /// The session called `name`, or the newest one, for a client about to
