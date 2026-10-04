@@ -75,6 +75,45 @@ daemon from before handovers is restarted: running sessions come back, Claude Co
 programs from the start. A crystal that finds a daemon of another version says so, rather than misunderstanding
 it; a TUI left open on an older crystal asks you to start it again.
 
+### Updating
+
+```sh
+crystal update            # install the latest release, if it's newer
+crystal update --check    # only say whether a newer one is out
+crystal update 0.2.0      # install that release instead, even an older one
+```
+
+`crystal update` does what the install script does, in place: it downloads the release for this machine,
+checks it against its checksum, runs it once to see that it runs here, and only then puts it in place of the
+crystal you ran. Then the new crystal restarts every daemon that's running, each server's, handed over as
+`crystal restart-server` does, so your sessions carry on, and brings the skill up to date where Claude Code is
+(`CRYSTAL_NO_SKILL=1` leaves it). A crystal installed by Homebrew, mise, Nix or cargo, or one built from
+source, is left alone, and the command says what updates it instead. `CRYSTAL_RELEASES` names another place to
+download releases from, as it does for the install script.
+
+Once a day, as it opens, the TUI looks for a newer release and says so on its bottom line when there is one.
+`check = false` under `[update]` in the [settings](#settings) turns that off.
+
+### Shell completions
+
+`crystal completions <shell>` prints the script that completes crystal's commands and options in bash, zsh,
+fish, elvish or PowerShell. In bash, zsh and fish, a command that takes a session's name, like `attach`, `send`
+or `kill`, completes the names of the sessions running now; with no daemon running there are none, and none is
+started.
+
+```sh
+# bash: in ~/.bashrc
+eval "$(crystal completions bash)"
+# zsh: in a directory on your $fpath, then start a new shell (compinit must run in ~/.zshrc)
+crystal completions zsh > ~/.zfunc/_crystal
+# fish
+crystal completions fish > ~/.config/fish/completions/crystal.fish
+# elvish: in ~/.config/elvish/rc.elv
+eval (crystal completions elvish | slurp)
+# PowerShell: in your $PROFILE
+crystal completions powershell | Out-String | Invoke-Expression
+```
+
 ## Usage
 
 Run `crystal` on its own to open the TUI: every session in a sidebar on the left, and the selected one live in
@@ -373,6 +412,8 @@ crystal project run                         # run this worktree's project in a s
 crystal kill-server                         # stop every session, and the daemon
 crystal restart-server                      # restart the daemon on this crystal, say after an upgrade
 crystal restart-server --cold               # stop it and start it again: sessions start again too
+crystal update                              # install the latest release, the daemons restarted on it
+crystal completions zsh                     # complete crystal's commands in your shell (see above)
 crystal server                              # list the servers, daemons of their own (see below)
 crystal config                              # where the config file is, and the settings in effect
 crystal profile                             # list your agent profiles
@@ -1986,6 +2027,7 @@ file and change. A setting crystal doesn't know is an error that names it, so a 
 | `[[project]]` | | a project's [run and open commands](#projects), by its main worktree's `path`, in place of its own file's |
 | `[keys]` | | the TUI's keys, by command, its prefix and the key back to the sidebar: [keys and commands](#keys-and-commands) |
 | `[sidebar]` | | the sidebar's `width`, whether it starts `folded`, what folding keeps, and whether what needs you is pinned: [the sidebar](#the-sidebar) |
+| `[update]` | | `check`, whether the TUI looks once a day for a [newer crystal](#updating) (`true`) |
 
 `notify_command` is for telling you some other way, like a message to your phone. It runs with
 `CRYSTAL_NOTICE` (the line a notification would show), `CRYSTAL_NOTICE_SESSION` (the session's name),
@@ -2005,7 +2047,7 @@ background task's run starts, `[handoff]` each time a note is written, `[session
 each time one starts, `[[project]]` each time a project's commands run,
 `name_from_prompt` each time it names a session, `resume_reported_agents` as it starts sessions again and
 `scrollback_lines` as each session starts, so a change counts straight away (a session already running keeps
-what it had); the TUI reads `new_session`, `theme`, `[colors]`, `scrollback_lines`, `[plugins]`, the profiles and
+what it had); the TUI reads `new_session`, `theme`, `[colors]`, `scrollback_lines`, `[plugins]`, `[update]`, the profiles and
 the flows when it starts, again when you save a profile or switch a plugin, and every half a second while the
 settings view is open.
 

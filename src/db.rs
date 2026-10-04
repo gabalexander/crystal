@@ -48,6 +48,8 @@ pub const DIFF: &str = "diff";
 pub const SEEN: &str = "seen";
 /// How wide the sidebar was left.
 pub const SIDEBAR: &str = "sidebar";
+/// When the TUI last looked for a newer crystal.
+pub const UPDATE: &str = "update";
 
 /// How long a write waits for another to finish: the daemon and every TUI
 /// share the one database.

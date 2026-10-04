@@ -57,7 +57,12 @@ impl Crystal {
     }
 
     fn command(&self, args: &[&str]) -> Command {
-        let mut command = Command::new(CRYSTAL);
+        self.command_of(Path::new(CRYSTAL), args)
+    }
+
+    /// Like [`Crystal::command`], run by the crystal at `program`.
+    fn command_of(&self, program: &Path, args: &[&str]) -> Command {
+        let mut command = Command::new(program);
         command
             .arg("--socket")
             .arg(&self.socket)
@@ -154,6 +159,9 @@ impl Crystal {
         command.env("SHELL", "/bin/sh");
         command.env("XDG_CONFIG_HOME", self.config_home());
         command.env("CLAUDE_CONFIG_DIR", self.claude_config_dir());
+        // No TUI asks GitHub whether a newer crystal is out: the releases
+        // are nowhere, unless a test says where.
+        command.env("CRYSTAL_RELEASES", NO_RELEASES);
         for (key, value) in PLAIN_GIT.iter().chain(&QUIET).chain(env) {
             command.env(key, value);
         }
@@ -351,6 +359,10 @@ fn size(rows: u16, cols: u16) -> PtySize {
         pixel_height: 0,
     }
 }
+
+/// Where a TUI looks for crystal's releases unless a test says: a port
+/// nothing listens on, so it learns nothing, at once.
+const NO_RELEASES: &str = "http://127.0.0.1:9/releases";
 
 /// Keeps the machine's own git config, like signed commits or hooks, out of
 /// the git that tests and crystal run.
@@ -3848,7 +3860,12 @@ impl Servers {
     }
 
     fn command(&self, args: &[&str]) -> Command {
-        let mut command = Command::new(CRYSTAL);
+        self.command_of(Path::new(CRYSTAL), args)
+    }
+
+    /// Like [`Servers::command`], run by the crystal at `program`.
+    fn command_of(&self, program: &Path, args: &[&str]) -> Command {
+        let mut command = Command::new(program);
         command
             .args(args)
             .current_dir(self.dir())
@@ -11217,4 +11234,364 @@ fn a_key_the_config_cant_make_sense_of_is_an_error_that_names_it() {
         err.contains("new-sesion") && err.contains("config.toml"),
         "{err}"
     );
+}
+
+/// This crystal's version.
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// What this machine's release is called, as `crystal update` picks it.
+fn release_target() -> String {
+    let os = if cfg!(target_os = "macos") {
+        "apple-darwin"
+    } else {
+        "unknown-linux-musl"
+    };
+    format!("{}-{os}", std::env::consts::ARCH)
+}
+
+/// crystal's releases, on a web server of the test's own that serves them
+/// the way GitHub does: `latest` redirects to the latest release's page,
+/// and each release's files are under `download/v<version>/`.
+struct Releases {
+    dir: TempDir,
+    url: String,
+    /// How many times it has been asked which release is the latest.
+    asked: Arc<Mutex<usize>>,
+}
+
+impl Releases {
+    /// Releases whose latest is `latest`.
+    fn new(latest: &str) -> Releases {
+        let dir = tempfile::tempdir().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/releases", listener.local_addr().unwrap());
+        let asked = Arc::new(Mutex::new(0));
+        let (root, base, latest) = (dir.path().to_path_buf(), url.clone(), latest.to_string());
+        let counted = asked.clone();
+        thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                serve_release(stream, &root, &base, &latest, &counted);
+            }
+        });
+        Releases { dir, url, asked }
+    }
+
+    fn asked(&self) -> usize {
+        *self.asked.lock().unwrap()
+    }
+
+    /// Publishes the release `version`, its crystal the script `crystal`,
+    /// with its checksum, or `sum` in its place.
+    fn publish(&self, version: &str, crystal: &str, sum: Option<&str>) {
+        use std::os::unix::fs::PermissionsExt;
+        let name = format!("crystal-{version}-{}", release_target());
+        let build = self.dir.path().join("build");
+        std::fs::create_dir_all(build.join(&name)).unwrap();
+        let binary = build.join(&name).join("crystal");
+        std::fs::write(&binary, crystal).unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let download = self.dir.path().join(format!("download/v{version}"));
+        std::fs::create_dir_all(&download).unwrap();
+        let archive = download.join(format!("{name}.tar.gz"));
+        let tar = Command::new("tar")
+            .arg("-czf")
+            .arg(&archive)
+            .arg("-C")
+            .arg(&build)
+            .arg(&name)
+            .status()
+            .unwrap();
+        assert!(tar.success());
+        let sum = sum.map_or_else(
+            || sha256_hex(&std::fs::read(&archive).unwrap()),
+            String::from,
+        );
+        let line = format!("{sum}  {name}.tar.gz\n");
+        std::fs::write(download.join(format!("{name}.tar.gz.sha256")), line).unwrap();
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// Answers one request to the releases' web server.
+fn serve_release(
+    mut stream: std::net::TcpStream,
+    root: &Path,
+    base: &str,
+    latest: &str,
+    asked: &Mutex<usize>,
+) {
+    use std::io::BufRead;
+    let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+    let mut request = String::new();
+    let _ = reader.read_line(&mut request);
+    let mut header = String::new();
+    while reader.read_line(&mut header).is_ok_and(|read| read > 2) {
+        header.clear();
+    }
+    let mut words = request.split_whitespace();
+    let (method, path) = (words.next().unwrap_or(""), words.next().unwrap_or(""));
+    let file = path
+        .strip_prefix("/releases/download/")
+        .and_then(|file| std::fs::read(root.join("download").join(file)).ok());
+    let (head, body) = if path == "/releases/latest" {
+        *asked.lock().unwrap() += 1;
+        let location = format!("{base}/tag/v{latest}");
+        (format!("302 Found\r\nLocation: {location}"), Vec::new())
+    } else if let Some(body) = file {
+        ("200 OK".to_string(), body)
+    } else {
+        ("404 Not Found".to_string(), Vec::new())
+    };
+    let head = format!(
+        "HTTP/1.1 {head}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    let _ = stream.write_all(head.as_bytes());
+    if method != "HEAD" {
+        let _ = stream.write_all(&body);
+    }
+}
+
+/// A crystal for a release that only says what it was asked to do, in
+/// `log`, and its version, 9.9.9.
+fn logging_crystal(log: &Path) -> String {
+    format!(
+        "#!/bin/sh\necho \"$*\" >> '{}'\nif [ \"$1\" = --version ]; then echo 'crystal 9.9.9'; fi\n",
+        log.display()
+    )
+}
+
+/// A copy of the crystal under test in `dir`'s `bin`, for an update to
+/// replace.
+fn installed_copy(dir: &Path) -> PathBuf {
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let installed = bin.join("crystal");
+    std::fs::copy(CRYSTAL, &installed).unwrap();
+    installed
+}
+
+#[test]
+fn update_puts_the_latest_release_in_place_and_restarts_every_daemon_on_it() {
+    let servers = Servers::new();
+    servers.ok(&["new", "-d", "-n", "keeper", "sleep", "300"]);
+    servers.ok(&[
+        "--server", "work", "new", "-d", "-n", "other", "sleep", "300",
+    ]);
+    let releases = Releases::new("9.9.9");
+    let log = servers.dir().join("new-crystal.log");
+    releases.publish("9.9.9", &logging_crystal(&log), None);
+    let installed = installed_copy(servers.dir());
+    // Claude Code is on this machine: its config directory is there.
+    std::fs::create_dir_all(servers.crystal.claude_config_dir()).unwrap();
+
+    let out = servers
+        .command_of(&installed, &["update"])
+        .env("CRYSTAL_RELEASES", &releases.url)
+        .output()
+        .unwrap();
+    let said = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{said}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        said.contains(&format!("updated crystal {VERSION} to 9.9.9")),
+        "{said}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&installed).unwrap(),
+        logging_crystal(&log)
+    );
+    // Nothing is left beside it.
+    let beside = std::fs::read_dir(installed.parent().unwrap()).unwrap();
+    assert_eq!(beside.count(), 1);
+
+    // The new crystal was tried, then restarted each daemon and installed
+    // its skill.
+    let ran = std::fs::read_to_string(&log).unwrap();
+    let ran: Vec<&str> = ran.lines().collect();
+    assert_eq!(ran[0], "--version", "{ran:?}");
+    for server in ["default", "work"] {
+        let socket = servers.run_dir().join(format!("crystal/{server}.sock"));
+        let restart = format!("--socket {} restart-server", socket.display());
+        assert!(ran.contains(&restart.as_str()), "{ran:?}");
+    }
+    assert_eq!(ran.last(), Some(&"skill --install"), "{ran:?}");
+}
+
+#[test]
+fn an_update_that_doesnt_match_its_checksum_changes_nothing() {
+    let crystal = Crystal::new();
+    let releases = Releases::new("9.9.9");
+    let log = crystal.dir.path().join("new-crystal.log");
+    releases.publish("9.9.9", &logging_crystal(&log), Some(&"0".repeat(64)));
+    let installed = installed_copy(crystal.dir.path());
+
+    let out = crystal
+        .command_of(&installed, &["update"])
+        .env("CRYSTAL_RELEASES", &releases.url)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("doesn't match its checksum"), "{err}");
+    // The crystal there is the one that was, and the new one never ran.
+    let version = Command::new(&installed).arg("--version").output().unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&version.stdout),
+        format!("crystal {VERSION}\n")
+    );
+    assert!(!log.exists());
+    let beside = std::fs::read_dir(installed.parent().unwrap()).unwrap();
+    assert_eq!(beside.count(), 1);
+}
+
+#[test]
+fn update_check_says_whether_a_newer_crystal_is_out() {
+    let crystal = Crystal::new();
+    let said = |releases: &Releases, args: &[&str]| {
+        let out = crystal
+            .command(args)
+            .env("CRYSTAL_RELEASES", &releases.url)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let newer = Releases::new("9.9.9");
+    assert_eq!(
+        said(&newer, &["update", "--check"]),
+        format!("crystal 9.9.9 is out, and this is {VERSION}: `crystal update` installs it\n")
+    );
+    let same = Releases::new(VERSION);
+    let latest = format!("crystal {VERSION} is the latest\n");
+    assert_eq!(said(&same, &["update", "--check"]), latest);
+    // With nothing newer, an update has nothing to do.
+    assert_eq!(said(&same, &["update"]), latest);
+}
+
+#[test]
+fn the_tui_says_once_a_day_that_a_newer_crystal_is_out() {
+    let crystal = Crystal::new();
+    let releases = Releases::new("9.9.9");
+    let env = [("CRYSTAL_RELEASES", releases.url.as_str())];
+    let mut tui = crystal.attach_with_env(&[], &env);
+    tui.shows("crystal 9.9.9 is out: `crystal update` installs it");
+    assert_eq!(releases.asked(), 1);
+    // Any key and it's gone.
+    tui.type_keys("j");
+    tui.hides("is out");
+    tui.type_keys("q");
+    assert!(tui.exit());
+
+    // Opened again the same day, it doesn't ask again.
+    let tui = crystal.attach_with_env(&[], &env);
+    tui.shows("crystal");
+    thread::sleep(Duration::from_millis(500));
+    assert_eq!(releases.asked(), 1);
+    assert!(!tui.text().contains("is out"));
+}
+
+#[test]
+fn bash_completes_the_names_of_running_sessions() {
+    let crystal = Crystal::new();
+    let dir = crystal.dir.path();
+    std::fs::write(
+        dir.join("crystal.bash"),
+        crystal.ok(&["completions", "bash"]),
+    )
+    .unwrap();
+    let driver = r#"
+source ./crystal.bash
+crystal() { printf 'review\nreviewer\nbuild\n'; }
+at() {
+    COMP_WORDS=("$@")
+    COMP_CWORD=$((${#COMP_WORDS[@]} - 1))
+    COMPREPLY=()
+    _crystal_with_sessions crystal "${COMP_WORDS[COMP_CWORD]}" "${COMP_WORDS[COMP_CWORD-1]}"
+    echo "${COMPREPLY[*]}"
+}
+at crystal attach rev
+at crystal a b
+at crystal -L work kill ''
+at crystal pane split --beside r
+at crystal done -n b
+at crystal send review ''
+at crystal new -n ''
+"#;
+    let out = Command::new("bash")
+        .arg("-c")
+        .arg(driver)
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let said = String::from_utf8(out.stdout).unwrap();
+    let lines: Vec<&str> = said.lines().collect();
+    assert_eq!(
+        lines[..5],
+        [
+            "review reviewer",
+            "build",
+            "review reviewer build",
+            "review reviewer",
+            "build"
+        ]
+    );
+    // A message to send, and a new session's name, aren't sessions.
+    assert!(!lines[5].contains("review"), "{said}");
+    assert!(!lines[6].contains("review"), "{said}");
+}
+
+#[test]
+fn zsh_and_fish_completions_offer_the_sessions() {
+    let crystal = Crystal::new();
+    let zsh = crystal.ok(&["completions", "zsh"]);
+    assert!(zsh.contains("_crystal_sessions"));
+    if Path::new("/bin/zsh").exists() {
+        let file = crystal.dir.path().join("_crystal");
+        std::fs::write(&file, &zsh).unwrap();
+        let checked = Command::new("/bin/zsh")
+            .arg("-n")
+            .arg(&file)
+            .output()
+            .unwrap();
+        assert!(
+            checked.status.success(),
+            "{}",
+            String::from_utf8_lossy(&checked.stderr)
+        );
+    }
+    let fish = crystal.ok(&["completions", "fish"]);
+    assert!(fish.contains("-a \"(crystal complete-sessions)\""));
+}
+
+#[test]
+fn complete_sessions_lists_running_sessions_and_never_starts_the_daemon() {
+    let crystal = Crystal::new();
+    assert_eq!(crystal.ok(&["complete-sessions"]), "");
+    assert!(!crystal.socket.exists());
+    crystal.ok(&["new", "-d", "-n", "review", "sleep", "30"]);
+    crystal.ok(&["new", "-d", "-n", "build", "sleep", "30"]);
+    let listed = crystal.ok(&["complete-sessions"]);
+    let mut names: Vec<&str> = listed.lines().collect();
+    names.sort_unstable();
+    assert_eq!(names, ["build", "review"]);
 }

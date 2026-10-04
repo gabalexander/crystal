@@ -9,6 +9,7 @@ mod claude_stream;
 mod client;
 mod clipboard;
 mod codex;
+mod completions;
 mod config;
 mod daemon;
 mod db;
@@ -68,12 +69,13 @@ mod tasks;
 mod transcript;
 mod tui;
 mod typing;
+mod update;
 mod viewer;
 mod vt;
 mod work;
 
 use anyhow::{Result, bail};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use client::Restart;
 use profile::{Profile, StartIn};
 use protocol::{ArchivedSession, Request, Response, SessionInfo, TaskSpec, TaskState};
@@ -556,6 +558,18 @@ enum Command {
         #[arg(long)]
         cold: bool,
     },
+    /// Update crystal to its latest release, or to the one given: download
+    /// it, check it against its checksum, put it in place of this one, and
+    /// restart every running daemon on it, their sessions carrying on.
+    Update {
+        /// The release to install, like 0.4.0, rather than the latest.
+        #[arg(conflicts_with = "check")]
+        version: Option<String>,
+
+        /// Only say whether a newer crystal is out.
+        #[arg(long)]
+        check: bool,
+    },
     /// List the servers, each a daemon with its own sessions and state: the
     /// default one and those named with --server, with whether each is
     /// running and how many sessions it has. Or stop one, or delete one.
@@ -650,6 +664,12 @@ enum Command {
         #[command(subcommand)]
         command: IntegrationCommand,
     },
+    /// Print the script that completes crystal's commands in your shell:
+    /// see the README for where each shell wants it.
+    Completions {
+        #[arg(value_enum)]
+        shell: completions::Target,
+    },
     /// Run crystal on another machine, over your own ssh: its TUI, or a
     /// crystal command there, like `crystal ssh box ls`.
     Ssh {
@@ -682,6 +702,11 @@ enum Command {
         #[arg(long)]
         installed: bool,
     },
+    /// Print the running sessions' names, a line each, for a shell
+    /// completing one: never starts the daemon, and says nothing when it
+    /// can't ask.
+    #[command(hide = true)]
+    CompleteSessions,
     /// Serve a project's memory to Claude over MCP, on standard input and
     /// output: what a task in the background searches it with.
     #[command(hide = true)]
@@ -1505,6 +1530,7 @@ fn run(cli: Cli) -> Result<()> {
                 println!("restarted the daemon; its sessions started again, since {why}");
             }
         },
+        Command::Update { version, check } => update::run(&socket, version, check)?,
         Command::Server { json, command } => match command {
             None => server_cli::list(json)?,
             Some(ServerCommand::Stop { name }) => server_cli::stop(&name)?,
@@ -1587,6 +1613,7 @@ fn run(cli: Cli) -> Result<()> {
             }
         }
         Command::Integration { command } => run_integration(command)?,
+        Command::Completions { shell } => print!("{}", completions::script(shell, Cli::command())),
         Command::Ssh {
             install,
             destination,
@@ -1602,6 +1629,15 @@ fn run(cli: Cli) -> Result<()> {
         }
         Command::Daemon { handover } => daemon::run(&socket, handover)?,
         Command::Hook { agent, installed } => hook::run(&socket, &agent, installed),
+        Command::CompleteSessions => {
+            if let Ok(Some(Response::Sessions { sessions })) =
+                client::ask(&socket, &Request::List, false)
+            {
+                for session in sessions {
+                    println!("{}", session.name);
+                }
+            }
+        }
         Command::Mcp { dir } => mcp::run(&socket, &here(dir)?)?,
     }
     Ok(())

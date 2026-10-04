@@ -28,6 +28,9 @@ and ARM, static with musl), and installed by `install.sh`.
    workflow checks the tag against `Cargo.toml`, builds each target, and publishes the GitHub release with
    the archives and their checksums.
 
+`install.sh` and `crystal update` (`src/update.rs`) both find a release's archive and checksum by the names the
+workflow gives them: change one, change all three.
+
 The daemon refuses requests from a crystal of another version (except a shutdown and a handover), so a user
 who upgrades is told to run `crystal restart-server` rather than getting odd errors, and one left on an older
 crystal to start it again. Keep `Request::Shutdown` and `Request::Handover` exactly as they are: they're the
@@ -64,6 +67,14 @@ whenever what's handed over changes in a way the crystal before couldn't read.
 - `src/keys.rs`: turning keys into the bytes a terminal sends: the TUI's keys, and the names `send-keys` takes;
   the old way, or in the Kitty keyboard protocol once a program has asked for it
 - `src/remote.rs`: `crystal ssh`: finds (or installs) crystal on another machine, then runs it there over ssh
+- `src/update.rs`: `crystal update`: the latest release (where GitHub's `releases/latest` redirects, or
+  `CRYSTAL_RELEASES`), downloaded with `curl`, checked against its SHA-256, unpacked, tried, and renamed over
+  this crystal, unless a package manager, cargo or a build from source put it there; then the new crystal
+  restarts every running daemon and installs its skill, since only it reads its own handover; and the TUI's
+  look for a newer release, once a day, kept in the database
+- `src/completions.rs`: `crystal completions`: clap's script for each shell, without the hidden commands, and
+  in bash, zsh and fish the running sessions' names (`crystal complete-sessions`, which never starts a daemon)
+  where a command takes one, the arguments in `SESSION_ARGS`; keep that list in step with the commands
 - `src/skill.rs`: `crystal skill`: prints or installs `skill/SKILL.md`, the Claude Code skill for driving
   crystal, and brings up to date a copy an earlier crystal installed that nobody has changed, which the daemon
   does as it starts; keep it in step with the commands it teaches, and add its SHA-256 to `SHIPPED` when it
@@ -389,4 +400,7 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   apart from crystal's. A test that copies, or opens a link, runs the TUI as over ssh (`SSH_TTY` set), so it
   asks the terminal with OSC 52 and never touches the machine's clipboard or opens a browser. A test of servers
   by name runs crystal without `--socket`, in a runtime dir and a state dir of its own, with `CRYSTAL_SOCKET`
-  and `CRYSTAL_SERVER` taken out of its environment, so it never reaches the user's own daemon
+  and `CRYSTAL_SERVER` taken out of its environment, so it never reaches the user's own daemon. A TUI looks for
+  crystal's releases on a port nothing listens on (`CRYSTAL_RELEASES`), and a test of updating serves fake
+  releases from a web server of its own on 127.0.0.1, its crystal a script that logs what it's asked, and
+  updates a copy of the binary, never the one under test

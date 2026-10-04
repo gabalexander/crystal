@@ -72,7 +72,7 @@ use crate::project_commands::{self, Commands, Verb};
 use crate::protocol::{
     Backlog, NewSession, Request, Response, SessionInfo, Spending, State, Worktree,
 };
-use crate::{catalog, keys, links, socket, typing};
+use crate::{catalog, keys, links, socket, typing, update};
 use crate::{client, clipboard, drive, env, event_log, events, git};
 use anyhow::{Context as _, Result, bail};
 use app::{Action, App, Focus, Hit, Place, PluginKey, PluginPane, Slot};
@@ -390,6 +390,9 @@ pub fn run(socket: &Path) -> Result<()> {
     tui.app.set_tabs(tabs::read(tui.ui(db::TABS).as_deref()));
     tui.kept_tabs = tui.app.tabs_to_keep();
     tui.look_back_from_last_seen();
+    if config.update.check {
+        tui.look_for_update();
+    }
 
     let mut terminal = ratatui::try_init()?;
     let result = tui.run_with_modes(&mut terminal, events);
@@ -610,6 +613,28 @@ impl Tui {
             let read = event_log::read(&socket, &Filter::default(), since);
             let tally = read.map(|events| away::Tally::of(&events));
             Event::Away(tally.map_err(|err| format!("{err:#}")))
+        });
+    }
+
+    /// Once a day, has whether a newer crystal is out looked up off the
+    /// loop, and said when it is. The look is kept as it starts, so one that
+    /// can't ask, offline say, waits a day too.
+    fn look_for_update(&self) {
+        let Ok(db) = &self.db else {
+            return;
+        };
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |since| since.as_secs());
+        if !update::due(self.ui(db::UPDATE).as_deref(), now) {
+            return;
+        }
+        let _ = db.keep_ui(db::UPDATE, &update::Looked { at: now });
+        let events = self.events.clone();
+        thread::spawn(move || {
+            if let Some(notice) = update::newer_notice() {
+                let _ = events.send(Event::Notice(notice));
+            }
         });
     }
 

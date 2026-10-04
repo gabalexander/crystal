@@ -72,6 +72,9 @@ pub struct Config {
     /// What crystal does with sessions left alone: `[sessions]` in the
     /// file.
     pub sessions: SessionSettings,
+    /// Whether the TUI says when a newer crystal is out: `[update]` in the
+    /// file.
+    pub update: UpdateSettings,
     /// Saved ways to start an agent, offered first in the new-session
     /// panel: `[[profile]]` tables in the file. See [`crate::profile`].
     #[serde(rename = "profile", skip_serializing_if = "Vec::is_empty")]
@@ -281,6 +284,20 @@ pub struct WorktreeSettings {
     pub base: Option<String>,
 }
 
+/// Whether the TUI says when a newer crystal is out: see [`crate::update`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct UpdateSettings {
+    /// Once a day, as the TUI opens, look for a newer release.
+    pub check: bool,
+}
+
+impl Default for UpdateSettings {
+    fn default() -> UpdateSettings {
+        UpdateSettings { check: true }
+    }
+}
+
 /// What crystal does with sessions left alone.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -418,6 +435,7 @@ impl Default for Config {
             handoff: HandoffSettings::default(),
             worktrees: WorktreeSettings::default(),
             sessions: SessionSettings::default(),
+            update: UpdateSettings::default(),
             profiles: Vec::new(),
             flows: Vec::new(),
             projects: Vec::new(),
@@ -1123,6 +1141,14 @@ back_to = "build"
     }
 
     #[test]
+    fn the_tui_looks_for_a_newer_crystal_unless_told_not_to() {
+        assert!(Config::default().update.check);
+        let config = parse("[update]\ncheck = false\n").unwrap();
+        assert!(!config.update.check);
+        assert!(parse("[update]\nauto = true\n").is_err());
+    }
+
+    #[test]
     fn new_worktrees_start_from_origins_default_unless_told() {
         assert_eq!(Config::default().worktrees.base, None);
         let config = parse("[worktrees]\nbase = \"develop\"\n").unwrap();
@@ -1200,6 +1226,7 @@ back_to = "build"
             sessions: SessionSettings {
                 stop_idle_after: "45m".into(),
             },
+            update: UpdateSettings { check: false },
             profiles: vec![Profile {
                 name: "review".into(),
                 description: Some("A second pair of eyes".into()),
