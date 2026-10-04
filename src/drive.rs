@@ -8,6 +8,7 @@
 use crate::client::{self, Subscription};
 use crate::env;
 use crate::events::{Filter, Kind};
+use crate::printable;
 use crate::protocol::{Activity, Answer, Request, Response, SessionInfo, State};
 use anyhow::{Context, Result, bail};
 use std::path::Path;
@@ -232,7 +233,8 @@ pub fn result(socket: &Path, name: &str, json: bool) -> Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(&result)?);
     } else {
-        println!("{}", result.text.trim_end());
+        // What Claude said: text to read, never orders for the terminal.
+        println!("{}", printable::text(result.text.trim_end()));
     }
     Ok(())
 }
