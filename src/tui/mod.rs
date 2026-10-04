@@ -277,6 +277,7 @@ pub fn run(socket: &Path) -> Result<()> {
         bail!("crystal needs a terminal; see crystal --help for the commands");
     }
     let config = Config::load()?;
+    crate::vt::set_history_lines(config.scrollback_lines);
     // Asking for the list starts the daemon if it isn't running.
     let sessions = list_sessions(socket, true)?;
 
@@ -1621,6 +1622,7 @@ impl Tui {
         if config.theme != self.config.theme {
             self.theme = Theme::from_env(config.theme);
         }
+        crate::vt::set_history_lines(config.scrollback_lines);
         self.config = config.clone();
         self.app.set_launch_settings(config);
         self.app.set_features(config);

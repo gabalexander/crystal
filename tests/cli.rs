@@ -3716,6 +3716,37 @@ fn read_with_history_shows_what_scrolled_off_the_screen() {
 }
 
 #[test]
+fn the_history_keeps_more_than_tmuxs_two_thousand_rows() {
+    let crystal = Crystal::new();
+    let printing = "for i in $(seq 1 3000); do echo line $i; done; echo > printed; sleep 30";
+    crystal.ok(&["new", "-n", "printer", "sh", "-c", printing]);
+    written(&crystal.dir.path().join("printed"));
+
+    let all = crystal.ok(&["read", "printer", "--history"]);
+    let lines: Vec<&str> = all.lines().collect();
+    assert_eq!(lines[0], "line 1");
+    assert_eq!(lines[2999], "line 3000");
+}
+
+#[test]
+fn scrollback_lines_in_the_config_is_how_much_history_a_session_keeps() {
+    let crystal = Crystal::new();
+    crystal.configure(
+        "notify = false\nname_from_prompt = false\nscrollback_lines = 10\n\n[plugins]\nmemory = false\n",
+    );
+    crystal.ok(&["new", "-n", "printer", "sh", "-c", LONG_OUTPUT]);
+    written(&crystal.dir.path().join("printed"));
+
+    // 24 rows on the screen, the last of them the empty one under the
+    // cursor, and 10 above it.
+    let all = crystal.ok(&["read", "printer", "--history"]);
+    let lines: Vec<&str> = all.lines().collect();
+    assert_eq!(lines.len(), 33, "{all}");
+    assert_eq!(lines[0], "line 28");
+    assert_eq!(lines[32], "line 60");
+}
+
+#[test]
 fn rows_an_inline_agent_scrolls_up_through_a_region_reach_the_history() {
     let crystal = Crystal::new();
     // How an agent like Codex prints above its prompt: a scroll region from

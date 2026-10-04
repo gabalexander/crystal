@@ -6,6 +6,7 @@
 //! like switching screens, stays inside the attach.
 
 use crate::client;
+use crate::config::Config;
 use crate::env;
 use crate::protocol::{Request, Response, State};
 use crate::tui::screen_widget::ScreenWidget;
@@ -43,6 +44,10 @@ const RESET: &[u8] = b"\x1b[<u\x1b[0m\x1b[?25h\x1b[?1l\x1b>\x1b[?2004l\x1b[?1004
 pub fn run(socket: &Path, name: Option<&str>) -> Result<()> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         bail!("attach needs a terminal");
+    }
+    // A config that can't be read is for the TUI to say; attaching goes on.
+    if let Ok(config) = Config::load() {
+        vt::set_history_lines(config.scrollback_lines);
     }
     let (cols, rows) = terminal::size()?;
     // Your own terminal keeps what scrolls by while you're attached; the

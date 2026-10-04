@@ -40,6 +40,7 @@ use crate::spending::Spending;
 use crate::state::{self, SavedSession};
 use crate::tasks;
 use crate::typing;
+use crate::vt;
 use anyhow::{Context, Result, bail, ensure};
 use regex::Regex;
 use std::collections::{BTreeMap, HashSet};
@@ -87,6 +88,9 @@ pub fn run(socket: &Path, handover: Option<RawFd>) -> Result<()> {
         libc::setsid();
     }
     let handed = handover.map(|fd| handover::read(fd).unwrap_or_else(|err| give_up(socket, err)));
+    // The sessions handed over, or started again, keep the history the
+    // settings say.
+    keep_scrollback();
     // Before listening: a daemon that can't keep its state doesn't start,
     // rather than run with none and write over it.
     let db = match Db::open(socket) {
@@ -2420,6 +2424,7 @@ fn start(
     );
     let argv = agents::with_options(argv, &claude_tools(socket, &cwd, &asked, &crystal, &config));
     let argv = codex::with_instructions(argv, &instructions, codex::home(&env).as_deref());
+    keep_scrollback();
     let mut session = Session::spawn(id, name.clone(), command, &argv, cwd, &env)?;
     if let Some(typed) = typed
         && let Err(err) = session.term().write(&typed)
@@ -2682,6 +2687,7 @@ fn start_task(
     let prompt = spec.prompt.clone();
     let args = task_args(socket, &cwd, &spec);
     let spending = spending.clone();
+    keep_scrollback();
     let mut session = Session::task(
         id,
         name.clone(),
@@ -2722,6 +2728,11 @@ fn new_task_info(goal: String, background: bool, backlog: Option<u64>) -> TaskIn
 /// once. A file that can't be read leaves the defaults.
 fn settings() -> Config {
     Config::load().unwrap_or_default()
+}
+
+/// Has the screens made from now on keep the history the settings say.
+fn keep_scrollback() {
+    vt::set_history_lines(settings().scrollback_lines);
 }
 
 /// Now, in seconds since the Unix epoch.
