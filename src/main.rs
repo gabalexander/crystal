@@ -45,6 +45,8 @@ mod plugin_manifest;
 mod plugins;
 mod profile;
 mod project;
+mod project_cli;
+mod project_commands;
 mod protocol;
 mod remote;
 mod report;
@@ -70,7 +72,7 @@ use anyhow::{Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use client::Restart;
 use profile::{Profile, StartIn};
-use protocol::{Request, Response, SessionInfo, TaskSpec, TaskState};
+use protocol::{ArchivedSession, Request, Response, SessionInfo, TaskSpec, TaskState};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -350,12 +352,28 @@ enum Command {
         #[command(subcommand)]
         command: WorktreeCommand,
     },
+    /// The projects crystal knows, which the TUI lists even with no session
+    /// running in them: those sessions have run in, and those added. Or add
+    /// one, take one off the list, or run or open the project here with
+    /// its own commands.
+    Project {
+        /// With no command: print them as JSON.
+        #[arg(long)]
+        json: bool,
+
+        #[command(subcommand)]
+        command: Option<ProjectCommand>,
+    },
     /// List the sessions.
     #[command(visible_alias = "list")]
     Ls {
         /// Print them as a JSON array, for scripts and agents.
         #[arg(long)]
         json: bool,
+
+        /// List the archived sessions instead.
+        #[arg(long)]
+        archived: bool,
     },
     /// Lay out the TUI's tabs: make one, go to one, name one, close one, or
     /// move a session to one. The TUI used last does it.
@@ -497,8 +515,26 @@ enum Command {
     /// Run an ended session's command again, in the same directory and
     /// under the same name. Claude Code comes back in its conversation.
     Respawn { name: String },
-    /// Stop a session and remove it from the list.
+    /// Stop a session and remove it from the list. An archived one is
+    /// taken out of the archive.
     Kill { name: String },
+    /// Stop sessions and keep them in the archive, out of the list, to
+    /// start again where they were with `unarchive`: an agent in its
+    /// conversation. `ls --archived` lists them.
+    Archive {
+        #[arg(required = true)]
+        names: Vec<String>,
+    },
+    /// Start an archived session again, under its name or the next one
+    /// free, and take it out of the archive. Attaches to it when run in a
+    /// terminal.
+    Unarchive {
+        name: String,
+
+        /// Don't attach: print the session's name.
+        #[arg(short, long)]
+        detached: bool,
+    },
     /// Stop every session and the daemon.
     KillServer,
     /// Restart the daemon on this crystal, say after installing a new one.
@@ -1004,6 +1040,45 @@ enum WorktreeCommand {
 }
 
 #[derive(Subcommand)]
+enum ProjectCommand {
+    /// Put a project on the list: the repository a directory is in.
+    Add {
+        /// A directory in the project [default: the current one]
+        dir: Option<PathBuf>,
+    },
+    /// Take a project off the list. Its backlog, tasks and memory stay,
+    /// and it's back once a session runs there. Refuses while one does.
+    #[command(visible_alias = "remove")]
+    Rm {
+        /// A directory in the project [default: the current one]
+        dir: Option<PathBuf>,
+    },
+    /// Run the project in this worktree, with the `run` command from its
+    /// `.crystal/project.toml` or the config's `[[project]]`: a session of
+    /// its own, called `run-` and the worktree's directory. Attaches to it
+    /// when run in a terminal.
+    Run {
+        /// A directory in the worktree [default: the current one]
+        #[arg(short = 'C', long = "dir", value_name = "DIR")]
+        dir: Option<PathBuf>,
+
+        /// Stop the session running it instead.
+        #[arg(long)]
+        stop: bool,
+
+        /// Don't attach: print the session's name.
+        #[arg(short, long)]
+        detached: bool,
+    },
+    /// Open this worktree with the project's `open` command, like `code .`.
+    Open {
+        /// A directory in the worktree [default: the current one]
+        #[arg(short = 'C', long = "dir", value_name = "DIR")]
+        dir: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
 enum ProfileCommand {
     /// Show a profile: its agent, where it starts, and the command it runs
     /// for a task.
@@ -1233,6 +1308,7 @@ fn run(cli: Cli) -> Result<()> {
         Command::Worktree {
             command: WorktreeCommand::Rm { worktree, force },
         } => remove_worktree(&socket, &worktree, force)?,
+        Command::Project { json, command } => project(&socket, json, command)?,
         Command::Tab { command } => tab(&socket, command)?,
         Command::Pane { command } => pane(&socket, command)?,
         Command::Layout { json } => {
@@ -1244,7 +1320,21 @@ fn run(cli: Cli) -> Result<()> {
             }
         }
         Command::Attach { name } => attach::run(&socket, name.as_deref())?,
-        Command::Ls { json } => {
+        Command::Ls {
+            json,
+            archived: true,
+        } => {
+            let archived = match client::ask(&socket, &Request::Archived, false)? {
+                Some(Response::Archived { sessions }) => sessions,
+                _ => Vec::new(),
+            };
+            if json {
+                println!("{}", serde_json::to_string_pretty(&archived)?);
+            } else {
+                print_archived(&archived);
+            }
+        }
+        Command::Ls { json, .. } => {
             // Without a daemon, there are no sessions.
             let sessions = match client::ask(&socket, &Request::List, false)? {
                 Some(Response::Sessions { sessions }) => sessions,
@@ -1317,6 +1407,24 @@ fn run(cli: Cli) -> Result<()> {
         } => drive::read(&socket, &name, lines, history)?,
         Command::Rename { name, new_name } => client::rename(&socket, &name, &new_name)?,
         Command::Respawn { name } => client::respawn(&socket, &name)?,
+        Command::Archive { names } => {
+            for name in names {
+                if client::ask(&socket, &Request::Archive { name }, false)?.is_none() {
+                    no_daemon(&socket)?;
+                }
+            }
+        }
+        Command::Unarchive { name, detached } => {
+            let request = Request::Unarchive {
+                name,
+                env: env::current(),
+            };
+            let name = match client::ask(&socket, &request, true)? {
+                Some(Response::Created { name, .. }) => name,
+                _ => bail!("the daemon didn't start it"),
+            };
+            attach_or_print(&socket, &name, detached)?;
+        }
         Command::Kill { name } => {
             if client::ask(&socket, &Request::Kill { name }, false)?.is_none() {
                 no_daemon(&socket)?;
@@ -1541,6 +1649,24 @@ fn attach_or_print(socket: &Path, name: &str, detached: bool) -> Result<()> {
     } else {
         println!("{name}");
         Ok(())
+    }
+}
+
+/// `crystal project` and its commands.
+fn project(socket: &Path, json: bool, command: Option<ProjectCommand>) -> Result<()> {
+    match command {
+        None => project_cli::list(socket, json),
+        Some(ProjectCommand::Add { dir }) => project_cli::change(socket, &here(dir)?, true),
+        Some(ProjectCommand::Rm { dir }) => project_cli::change(socket, &here(dir)?, false),
+        Some(ProjectCommand::Run {
+            dir,
+            stop,
+            detached,
+        }) => match project_cli::run(socket, &here(dir)?, stop)? {
+            Some(name) => attach_or_print(socket, &name, detached),
+            None => Ok(()),
+        },
+        Some(ProjectCommand::Open { dir }) => project_cli::open(&here(dir)?),
     }
 }
 
@@ -1826,6 +1952,45 @@ fn print_sessions(sessions: &[SessionInfo]) {
         "PROGRAM",
         "COMMAND",
         "TASK",
+    ];
+    print_table(header, &rows);
+}
+
+/// Prints the archived sessions, the latest archived first, with how long
+/// ago each was archived and whether it starts again where it was.
+fn print_archived(archived: &[ArchivedSession]) {
+    if archived.is_empty() {
+        return;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs());
+    let rows: Vec<[String; 6]> = archived
+        .iter()
+        .map(|archived| {
+            let (project, branch) = match &archived.worktree {
+                Some(worktree) => (
+                    worktree.project.clone(),
+                    worktree
+                        .branch
+                        .clone()
+                        .unwrap_or_else(|| "(detached)".into()),
+                ),
+                None => ("-".into(), "-".into()),
+            };
+            let command = archived.session.command.iter().map(|arg| shell::quote(arg));
+            [
+                archived.name().to_string(),
+                tui::sidebar::ago(archived.archived, now),
+                project,
+                branch,
+                if archived.resumes() { "yes" } else { "no" }.to_string(),
+                command.collect::<Vec<_>>().join(" "),
+            ]
+        })
+        .collect();
+    let header = [
+        "NAME", "ARCHIVED", "PROJECT", "BRANCH", "RESUMES", "COMMAND",
     ];
     print_table(header, &rows);
 }

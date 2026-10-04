@@ -1,12 +1,23 @@
 //! Writing commands and paths the way a shell reads them.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// `path` with the home directory written as `~`, as you'd type it.
 pub fn home_relative(path: &Path) -> String {
     match std::env::var_os("HOME") {
         Some(home) if !home.is_empty() => relative_to(path, Path::new(&home)),
         _ => path.display().to_string(),
+    }
+}
+
+/// `path` with a leading `~` made the home directory, as a shell would.
+pub fn expand_home(path: &Path) -> PathBuf {
+    match path.strip_prefix("~") {
+        Ok(rest) => {
+            let home = std::env::var_os("HOME").unwrap_or_default();
+            PathBuf::from(home).join(rest)
+        }
+        Err(_) => path.to_path_buf(),
     }
 }
 

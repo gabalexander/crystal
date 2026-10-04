@@ -87,6 +87,7 @@ mod tests {
 
     fn session(name: &str, project: &str, branch: &str, command: &str) -> SessionInfo {
         SessionInfo {
+            stopped_idle: false,
             front: None,
             name: name.into(),
             id: name.into(),

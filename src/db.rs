@@ -20,7 +20,9 @@
 use crate::backlog;
 use crate::events::{Event, Since};
 use crate::flow_run::FlowRun;
-use crate::protocol::{Artifact, ArtifactKind, BacklogItem, PendingTask, TaskOutcome, TaskRecord};
+use crate::protocol::{
+    ArchivedSession, Artifact, ArtifactKind, BacklogItem, PendingTask, TaskOutcome, TaskRecord,
+};
 use crate::state::{self, SavedSession};
 use crate::tasks;
 use anyhow::{Context, Result};
@@ -180,10 +182,47 @@ const RESUME: &str = "
 ALTER TABLE sessions ADD COLUMN resume TEXT;
 ";
 
+/// Whether a project is in the list of those crystal knows, which the
+/// sidebar and the new-session panel offer with no session running there:
+/// every project a session has run in, or that was added, until it's
+/// taken off the list. Those with a row already had a backlog or tasks, so
+/// they're on it.
+const PROJECTS: &str = "
+ALTER TABLE projects ADD COLUMN listed INTEGER NOT NULL DEFAULT 1;
+";
+
+/// The sessions in the archive, out of the list until they're started
+/// again: each by the id it had, with what it takes to start it again as
+/// the sessions table keeps it, the worktree it ran in as JSON, and when it
+/// was archived.
+const ARCHIVED: &str = "
+CREATE TABLE archived (
+  id           TEXT PRIMARY KEY,
+  name         TEXT NOT NULL,
+  command      TEXT NOT NULL,
+  cwd          TEXT NOT NULL,
+  conversation TEXT,
+  task         TEXT,
+  goal         TEXT,
+  resume       TEXT,
+  worktree     TEXT,
+  archived     INTEGER NOT NULL
+);
+CREATE INDEX archived_name ON archived(name, archived);
+";
+
 /// What makes the database as it is now, a step for each version: a
 /// database at version `v`, kept in its `user_version`, takes the steps
 /// after the first `v`.
-const MIGRATIONS: &[&str] = &[TABLES, TASK_STATES, EVENTS, ARTIFACTS, RESUME];
+const MIGRATIONS: &[&str] = &[
+    TABLES,
+    TASK_STATES,
+    EVENTS,
+    ARTIFACTS,
+    RESUME,
+    PROJECTS,
+    ARCHIVED,
+];
 
 /// The file each project kept its backlog in before the database.
 const OLD_BACKLOG: &str = "backlog.json";
@@ -244,6 +283,57 @@ impl Db {
         write_sessions(&tx, sessions)?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// Keeps `archived` in the archive.
+    pub fn archive(&self, archived: &ArchivedSession) -> Result<()> {
+        let session = &archived.session;
+        self.conn.execute(
+            &format!(
+                "INSERT OR REPLACE INTO archived (id, {SESSION_COLUMNS}, worktree, archived) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"
+            ),
+            params![
+                archived.id,
+                session.name,
+                json(&session.command)?,
+                session.cwd.to_string_lossy(),
+                json_or_null(&session.conversation)?,
+                json_or_null(&session.task)?,
+                json_or_null(&session.goal)?,
+                json_or_null(&session.resume)?,
+                json_or_null(&archived.worktree)?,
+                archived.archived as i64,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// The sessions in the archive, the latest archived first. One that
+    /// can't be read is left out.
+    pub fn archived(&self) -> Result<Vec<ArchivedSession>> {
+        let mut statement = self.conn.prepare(&format!(
+            "SELECT {SESSION_COLUMNS}, id, worktree, archived FROM archived \
+             ORDER BY archived DESC, rowid DESC"
+        ))?;
+        let rows = statement.query_map([], |row| Ok(archived_of(row)))?;
+        readable(rows, "an archived session")
+    }
+
+    /// Takes the session archived with the id `which`, or else under the
+    /// name `which`, the latest archived when there are more, out of the
+    /// archive, and gives it back.
+    pub fn unarchive(&self, which: &str) -> Result<Option<ArchivedSession>> {
+        let archived = self.archived()?;
+        let found = match archived.iter().position(|a| a.id == which) {
+            Some(at) => Some(archived[at].clone()),
+            None => archived.into_iter().find(|a| a.name() == which),
+        };
+        if let Some(found) = &found {
+            self.conn
+                .execute("DELETE FROM archived WHERE id = ?1", params![found.id])?;
+        }
+        Ok(found)
     }
 
     /// The flow runs written down, the oldest first.
@@ -538,6 +628,32 @@ impl Db {
             .transaction_with_behavior(TransactionBehavior::Immediate)?)
     }
 
+    /// The projects in the list of those crystal knows, by their main
+    /// worktrees, in the order of their paths.
+    pub fn listed_projects(&self) -> Result<Vec<PathBuf>> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT path FROM projects WHERE listed = 1 ORDER BY path")?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        Ok(rows
+            .collect::<rusqlite::Result<Vec<String>>>()?
+            .into_iter()
+            .map(PathBuf::from)
+            .collect())
+    }
+
+    /// Puts `project`, by its main worktree, in the list of those crystal
+    /// knows, or takes it off with `listed` false. Its backlog and tasks
+    /// stay either way.
+    pub fn list_project(&mut self, project: &Path, listed: bool) -> Result<()> {
+        let key = self.ready(project)?;
+        self.conn.execute(
+            "UPDATE projects SET listed = ?2 WHERE path = ?1",
+            params![key, listed],
+        )?;
+        Ok(())
+    }
+
     /// `project`'s key in the database, once it has its row there: the
     /// first time, with the backlog and closed tasks it kept in files
     /// before the database brought in.
@@ -717,6 +833,15 @@ fn session_of(row: &Row) -> Result<SavedSession> {
         task: from_json_or_null(row.get(4)?)?,
         goal: from_json_or_null(row.get(5)?)?,
         resume: from_json_or_null(row.get(6)?)?,
+    })
+}
+
+fn archived_of(row: &Row) -> Result<ArchivedSession> {
+    Ok(ArchivedSession {
+        session: session_of(row)?,
+        id: row.get(7)?,
+        worktree: from_json_or_null(row.get(8)?)?,
+        archived: row.get::<_, i64>(9)? as u64,
     })
 }
 
@@ -1293,6 +1418,53 @@ mod tests {
         assert_eq!(old[0].id, None);
         assert_eq!(old[0].state(), TaskState::Failed);
         assert_eq!(db.new_task_number().unwrap(), 1);
+    }
+
+    #[test]
+    fn an_archived_session_comes_back_the_latest_first_and_leaves_once_taken() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&socket_in(&dir)).unwrap();
+        let archived = |id: &str, name: &str, at: u64| ArchivedSession {
+            id: id.into(),
+            session: saved(name),
+            worktree: None,
+            archived: at,
+        };
+        db.archive(&archived("1", "claude", 10)).unwrap();
+        db.archive(&archived("2", "codex", 20)).unwrap();
+        db.archive(&archived("3", "claude", 30)).unwrap();
+        let ids: Vec<String> = db.archived().unwrap().into_iter().map(|a| a.id).collect();
+        assert_eq!(ids, ["3", "2", "1"]);
+        assert_eq!(
+            db.unarchive("claude").unwrap(),
+            Some(archived("3", "claude", 30))
+        );
+        assert_eq!(
+            db.unarchive("claude").unwrap().map(|a| a.id),
+            Some("1".into())
+        );
+        assert_eq!(db.unarchive("claude").unwrap(), None);
+        assert_eq!(db.archived().unwrap().len(), 1);
+        // By its id, whatever it's called.
+        assert_eq!(db.unarchive("2").unwrap().map(|a| a.id), Some("2".into()));
+        assert!(db.archived().unwrap().is_empty());
+    }
+
+    #[test]
+    fn projects_stay_listed_until_taken_off_and_keep_their_backlog() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Db::open(&socket_in(&dir)).unwrap();
+        let (app, api) = (Path::new("/code/app"), Path::new("/code/api"));
+        db.list_project(app, true).unwrap();
+        db.list_project(api, true).unwrap();
+        db.change_backlog(api, |store| store.add("tidy up", Vec::new(), 1))
+            .unwrap();
+        assert_eq!(db.listed_projects().unwrap(), vec![api, app]);
+        db.list_project(api, false).unwrap();
+        assert_eq!(db.listed_projects().unwrap(), vec![app]);
+        assert_eq!(db.backlog(api).unwrap().items.len(), 1);
+        db.list_project(api, true).unwrap();
+        assert_eq!(db.listed_projects().unwrap(), vec![api, app]);
     }
 
     #[test]

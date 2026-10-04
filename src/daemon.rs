@@ -17,7 +17,7 @@ use crate::events::{Event, Filter, Kind, Since};
 use crate::flow_run::{self, Ended, FlowRun, Next, Place, RunState, StepState};
 use crate::flows;
 use crate::front;
-use crate::git;
+use crate::git::{self, Checkout};
 use crate::handoff;
 use crate::handover::{self, Gate, Ticket};
 use crate::layout_relay::Relay;
@@ -28,9 +28,9 @@ use crate::notify::{self, Notice};
 use crate::plugin_hooks;
 use crate::project;
 use crate::protocol::{
-    self, Activity, AgentEvent, Artifact, ArtifactKind, Backlog, Conversation, Frame, Front,
-    NewSession, NewTask, PendingTask, Request, Response, SessionInfo, State, TaskInfo, TaskOutcome,
-    TaskRecord, TaskSpec, TaskStart, TaskState, TaskView,
+    self, Activity, AgentEvent, ArchivedSession, Artifact, ArtifactKind, Backlog, Conversation,
+    Frame, Front, NewSession, NewTask, PendingTask, Request, Response, SessionInfo, State,
+    TaskInfo, TaskOutcome, TaskRecord, TaskSpec, TaskStart, TaskState, TaskView, Worktree,
 };
 use crate::report;
 use crate::session::{Change, STOP_GRACE, Session, Term, signal_group};
@@ -43,7 +43,7 @@ use crate::typing;
 use crate::vt;
 use anyhow::{Context, Result, bail, ensure};
 use regex::Regex;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::convert::Infallible;
 use std::io::{BufReader, ErrorKind, Read, Write};
 use std::net::Shutdown;
@@ -60,6 +60,16 @@ use std::{fs, process, thread};
 /// doing, tells the user about the sessions that need them, and writes
 /// down the sessions that are running.
 const KEEP_UP_EVERY: Duration = Duration::from_millis(250);
+
+/// How often the keep-up loop looks for agents that have sat idle for too
+/// long: the settings are read each time. `CRYSTAL_IDLE_CHECK_MS` sets it
+/// otherwise, for tests.
+fn idle_check_every() -> Duration {
+    std::env::var("CRYSTAL_IDLE_CHECK_MS")
+        .ok()
+        .and_then(|ms| ms.parse().ok())
+        .map_or(Duration::from_secs(15), Duration::from_millis)
+}
 
 /// How often a client that only listens is checked for having hung up.
 const LOOK_FOR_HANG_UP: Duration = Duration::from_secs(1);
@@ -130,6 +140,7 @@ pub fn run(socket: &Path, handover: Option<RawFd>) -> Result<()> {
         preparing: Arc::default(),
         handoff: Mutex::default(),
         layout: Relay::new(),
+        projects: Mutex::default(),
     });
     // A daemon starts again after every upgrade, or is handed over to the
     // new crystal, so this is where the skill an earlier crystal installed
@@ -241,6 +252,18 @@ struct Daemon {
     handoff: Mutex<()>,
     /// The TUIs that take layout commands, which go to the one used last.
     layout: Relay,
+    /// What the daemon knows of the projects crystal keeps a list of.
+    /// Taken after `sessions` and before `db`.
+    projects: Mutex<KnownProjects>,
+}
+
+/// The projects the sessions run in that are on the list already, as
+/// this daemon has put them there, and each listed project's repository,
+/// found once: reading which branch it's on is cheap after that.
+#[derive(Default)]
+struct KnownProjects {
+    listed: HashSet<PathBuf>,
+    checkouts: HashMap<PathBuf, Option<Checkout>>,
 }
 
 /// What [`Daemon::prepare_embeddings`] is doing, or why it failed.
@@ -343,60 +366,132 @@ impl Daemon {
     /// any other program from the start.
     fn start_again(&self, sessions: &mut Vec<Session>, saved: Vec<SavedSession>) {
         for saved in saved {
-            let goal = saved.goal.clone();
-            let backlog = goal.as_ref().and_then(|goal| goal.backlog);
-            let started = match saved.task {
-                // A task comes back at rest: a run it was in the middle of
-                // can't be picked up halfway, so it isn't run again either.
-                Some(spec) => {
-                    let task = NewTask {
-                        name: Some(saved.name.clone()),
-                        cwd: saved.cwd,
-                        spec,
-                        env: env::current(),
-                        backlog,
-                    };
-                    let conversation = saved.conversation.map(|conversation| conversation.id);
-                    start_task(
-                        sessions,
-                        &self.socket,
-                        &self.spending,
-                        task,
-                        conversation,
-                        false,
-                    )
-                }
-                None => {
-                    let new = NewSession {
-                        name: Some(saved.name.clone()),
-                        cwd: saved.cwd,
-                        command: saved.command,
-                        env: env::current(),
-                        task: goal.as_ref().map(|goal| goal.goal.clone()),
-                        backlog,
-                    };
-                    start(
-                        sessions,
-                        &self.socket,
-                        new,
-                        saved.conversation,
-                        saved.resume,
-                    )
-                }
-            };
-            match started {
-                // It comes back with its task as it was, closed or not.
-                Ok(_) => {
-                    if let (Some(goal), Some(session)) = (goal, sessions.last_mut()) {
-                        session.give_task(goal);
-                    }
-                }
-                Err(err) => eprintln!(
-                    "crystal daemon: couldn't start {} again: {err:#}",
-                    saved.name
-                ),
+            let name = saved.name.clone();
+            if let Err(err) = self.start_saved(sessions, saved, env::current()) {
+                eprintln!("crystal daemon: couldn't start {name} again: {err:#}");
             }
         }
+    }
+
+    /// Starts a session again from what was written down of it, from the
+    /// environment `env`, at the end of `sessions`, and gives back its
+    /// name: an agent in its conversation, a task at rest, any other
+    /// program from the start. It comes back with its task as it was,
+    /// closed or not.
+    fn start_saved(
+        &self,
+        sessions: &mut Vec<Session>,
+        saved: SavedSession,
+        env: BTreeMap<String, String>,
+    ) -> Result<String> {
+        let goal = saved.goal.clone();
+        let backlog = goal.as_ref().and_then(|goal| goal.backlog);
+        let name = match saved.task {
+            // A task comes back at rest: a run it was in the middle of
+            // can't be picked up halfway, so it isn't run again either.
+            Some(spec) => {
+                let task = NewTask {
+                    name: Some(saved.name),
+                    cwd: saved.cwd,
+                    spec,
+                    env,
+                    backlog,
+                };
+                let conversation = saved.conversation.map(|conversation| conversation.id);
+                start_task(
+                    sessions,
+                    &self.socket,
+                    &self.spending,
+                    task,
+                    conversation,
+                    false,
+                )?
+            }
+            None => {
+                let new = NewSession {
+                    name: Some(saved.name),
+                    cwd: saved.cwd,
+                    command: saved.command,
+                    env,
+                    task: goal.as_ref().map(|goal| goal.goal.clone()),
+                    backlog,
+                };
+                start(
+                    sessions,
+                    &self.socket,
+                    new,
+                    saved.conversation,
+                    saved.resume,
+                )?
+            }
+        };
+        if let (Some(goal), Some(session)) = (goal, sessions.last_mut()) {
+            session.give_task(goal);
+        }
+        Ok(name)
+    }
+
+    /// Stops the session called `name` and keeps it in the archive, out of
+    /// the list. Written down before it stops: a session that couldn't be
+    /// kept isn't stopped. Its open task is cancelled, as a kill does, but
+    /// it's kept open, to be open again when it starts again.
+    fn archive(&self, name: &str) -> Result<Response> {
+        let mut sessions = self.sessions.lock().unwrap();
+        let index = sessions
+            .iter()
+            .position(|session| session.name == name)
+            .with_context(|| format!("no session named {name}"))?;
+        let info = sessions[index].info();
+        let archived = ArchivedSession {
+            id: info.id.clone(),
+            session: sessions[index].launch(),
+            worktree: info.worktree.clone(),
+            archived: now_seconds(),
+        };
+        self.db.lock().unwrap().archive(&archived)?;
+        let mut session = sessions.remove(index);
+        let cancelled = tasks::enabled(&settings())
+            .then(|| session.cancel_task("its session was archived"))
+            .flatten();
+        if let Some(cancelled) = cancelled {
+            self.write_down_closed(&session, &cancelled);
+        }
+        session.stop();
+        if info.state == State::Running {
+            self.events.emit(Event::ended(&info, "archived".into()));
+        }
+        self.events
+            .emit(Event::about_session(Kind::SessionArchived, &info));
+        Ok(Response::Done)
+    }
+
+    /// Starts the session archived under `name` again, under that name or
+    /// the next one free, and takes it out of the archive. One that can't
+    /// start, say because its directory has gone, stays in it.
+    fn unarchive(&self, name: &str, env: BTreeMap<String, String>) -> Result<Response> {
+        let mut sessions = self.sessions.lock().unwrap();
+        let db = self.db.lock().unwrap();
+        let mut archived = db
+            .unarchive(name)?
+            .with_context(|| format!("no session named {name} in the archive"))?;
+        let name = archived.name().to_string();
+        let taken = |name: &str| sessions.iter().any(|session| session.name == name);
+        if taken(&name) {
+            let free = (2..)
+                .map(|number| format!("{name}-{number}"))
+                .find(|name| !taken(name))
+                .expect("some number is free");
+            archived.session.name = free;
+        }
+        let started = match self.start_saved(&mut sessions, archived.session.clone(), env) {
+            Ok(started) => started,
+            Err(err) => {
+                db.archive(&archived)?;
+                return Err(err);
+            }
+        };
+        drop(db);
+        Ok(self.started(&mut sessions, started, Kind::TaskOpened))
     }
 
     /// Again and again: reads every session's screen for what its agent is
@@ -415,6 +510,8 @@ impl Daemon {
             .map(|session| session.id.clone())
             .collect();
         let mut last_runs: Vec<FlowRun> = Vec::new();
+        let mut idle_checked = Instant::now();
+        let idle_check_every = idle_check_every();
         loop {
             thread::sleep(KEEP_UP_EVERY);
             let mut sessions = self.sessions.lock().unwrap();
@@ -441,6 +538,10 @@ impl Daemon {
             // Before telling the user anything: a step the flow goes on
             // from needs nobody, and a gate needs them.
             self.follow_flows(&mut sessions);
+            if idle_checked.elapsed() >= idle_check_every {
+                idle_checked = Instant::now();
+                stop_idle_agents(&mut sessions);
+            }
             // Read only when a session has something to tell, at most once
             // a round.
             let mut read = None;
@@ -456,11 +557,12 @@ impl Daemon {
                 self.tell_changes(session);
                 if !session.is_running() && told_ended.insert(session.id.clone()) {
                     let info = session.info();
-                    let status = info.state.to_string();
+                    let status = info.status();
                     self.events.emit(Event::ended(&info, status));
                 }
             }
             told_ended.retain(|id| sessions.iter().any(|session| &session.id == id));
+            self.list_projects_of(&sessions);
             // Written while the list is still locked, so that an older list
             // can never be written after a shutdown has emptied it.
             let saved: Vec<SavedSession> = sessions.iter().filter_map(Session::saved).collect();
@@ -478,6 +580,81 @@ impl Daemon {
                 }
             }
         }
+    }
+
+    /// Puts the projects `sessions` run in on the list of those crystal
+    /// knows, those this daemon hasn't put there already.
+    fn list_projects_of(&self, sessions: &[Session]) {
+        let mut known = self.projects.lock().unwrap();
+        for project in sessions.iter().filter_map(Session::project_path) {
+            if known.listed.contains(project) {
+                continue;
+            }
+            match self.db.lock().unwrap().list_project(project, true) {
+                Ok(()) => {
+                    known.listed.insert(project.to_path_buf());
+                }
+                Err(err) => eprintln!(
+                    "crystal daemon: couldn't keep {} in the list of projects: {err:#}",
+                    project.display()
+                ),
+            }
+        }
+    }
+
+    /// The projects crystal knows, by their main worktrees, as they are
+    /// now. One whose repository has gone is left out, but stays listed:
+    /// a disk not mounted today may be back tomorrow.
+    fn known_projects(&self) -> Result<Vec<Worktree>> {
+        let paths = self.db.lock().unwrap().listed_projects()?;
+        let mut known = self.projects.lock().unwrap();
+        let mut projects = Vec::new();
+        for path in paths {
+            if !path.join(".git").exists() {
+                known.checkouts.remove(&path);
+                continue;
+            }
+            let checkout = known
+                .checkouts
+                .entry(path.clone())
+                .or_insert_with(|| Checkout::find(&path));
+            let worktree = checkout.as_ref().map(Checkout::worktree);
+            if let Some(worktree) = worktree.filter(|w| w.main && w.path == path) {
+                projects.push(worktree);
+            }
+        }
+        Ok(projects)
+    }
+
+    /// Puts the project `dir` is in on the list, or takes it off: not while
+    /// a session is in it, which would put it back.
+    fn list_project(&self, dir: &Path, listed: bool) -> Result<Response> {
+        let checkout = Checkout::find(dir)
+            .with_context(|| format!("{} isn't in a git repository", dir.display()))?;
+        let project = checkout.project_path().to_path_buf();
+        let sessions = self.sessions.lock().unwrap();
+        if !listed {
+            let in_it = sessions
+                .iter()
+                .filter(|session| session.project_path() == Some(project.as_path()))
+                .count();
+            ensure!(
+                in_it == 0,
+                "{} has {in_it} session{} in it: kill {} first",
+                project.display(),
+                if in_it == 1 { "" } else { "s" },
+                if in_it == 1 { "it" } else { "them" },
+            );
+        }
+        let mut known = self.projects.lock().unwrap();
+        self.db.lock().unwrap().list_project(&project, listed)?;
+        if listed {
+            known.checkouts.insert(project.clone(), Some(checkout));
+        } else {
+            known.listed.remove(&project);
+            known.checkouts.remove(&project);
+        }
+        Ok(Response::Done)
     }
 
     /// Takes up the flow runs the last daemon wrote down. A step that was
@@ -1443,10 +1620,14 @@ impl Daemon {
             }
             Request::Kill { name } => {
                 let mut sessions = self.sessions.lock().unwrap();
-                let index = sessions
-                    .iter()
-                    .position(|session| session.name == name)
-                    .with_context(|| format!("no session named {name}"))?;
+                let index = sessions.iter().position(|session| session.name == name);
+                // An archived session is killed by taking it out of the
+                // archive.
+                let Some(index) = index else {
+                    let gone = self.db.lock().unwrap().unarchive(&name)?;
+                    ensure!(gone.is_some(), "no session named {name}");
+                    return Ok(Response::Done);
+                };
                 let mut session = sessions.remove(index);
                 let cancelled = tasks::enabled(&settings())
                     .then(|| session.cancel_task("its session was killed"))
@@ -1488,6 +1669,11 @@ impl Daemon {
                 notify::tell(notice, &self.socket);
                 Ok(Response::Done)
             }
+            Request::Projects => Ok(Response::Projects {
+                projects: self.known_projects()?,
+            }),
+            Request::AddProject { dir } => self.list_project(&dir, true),
+            Request::RemoveProject { dir } => self.list_project(&dir, false),
             Request::Subscribe { .. }
             | Request::WaitOutput { .. }
             | Request::Handover { .. }
@@ -1511,6 +1697,16 @@ impl Daemon {
                 Ok(Response::Done)
             }
             Request::Respawn { name, env } => self.respawn(&name, env),
+            Request::Archive { name } => self.archive(&name),
+            Request::Archived => Ok(Response::Archived {
+                sessions: self.db.lock().unwrap().archived()?,
+            }),
+            Request::Unarchive { name, env } => self.unarchive(&name, env),
+            Request::DeleteArchived { name } => {
+                let gone = self.db.lock().unwrap().unarchive(&name)?;
+                ensure!(gone.is_some(), "no session named {name} in the archive");
+                Ok(Response::Done)
+            }
             Request::Send { name, text, enter } => {
                 // In a block of its own, so the sessions are let go before
                 // the typing below, which takes a moment.
@@ -2168,6 +2364,29 @@ impl Daemon {
         sessions.insert(index, started);
         self.tell_started(&sessions, name, Kind::TaskOpened);
         Ok(Response::Done)
+    }
+}
+
+/// Stops the agents that have sat idle for longer than the settings allow:
+/// see [`Session::idle_for`]. They stay in the list, ended, to start again
+/// in their conversations.
+fn stop_idle_agents(sessions: &mut [Session]) {
+    let idle: Vec<(usize, Duration)> = sessions
+        .iter()
+        .enumerate()
+        .filter_map(|(index, session)| Some((index, session.idle_for()?)))
+        .collect();
+    // The settings are only read when there's an agent they could stop.
+    if idle.is_empty() {
+        return;
+    }
+    let Some(limit) = settings().sessions.idle_limit() else {
+        return;
+    };
+    for (index, for_how_long) in idle {
+        if for_how_long >= limit {
+            sessions[index].stop_idle();
+        }
     }
 }
 
