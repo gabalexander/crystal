@@ -154,13 +154,18 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   - `groups.rs`: the sidebar's order and headings: sessions by project, then worktree, agents before
     terminals, a session's task and the line reported for it under it, each flow run's steps under it, and
     linked worktrees with no sessions left at the end of their project, Claude Code's own last
-  - `text_input.rs`: a one-line text box, for the questions asked on the bottom line
+  - `editing.rs`: the editing every text box shares: the text and the cursor, the motions (a character, a word
+    as readline splits them, a line's ends, the text's), deleting to where one goes, and a shell's keys for
+    them (`Ctrl+W`, `Alt+B`, `Ctrl+K`, …) looked up apart from what they do, for a vim mode to drive the same
+    ones; pure, so it's unit-tested
+  - `text_input.rs`: a one-line text box, for the questions asked on the bottom line, `/` and the filters
   - `text_area.rs`: a text box of several lines that wrap: the new-session panel's task, and the reply box
   - `reply.rs`: the reply box (`Space`): the next prompt for a session, or a background task's follow-up,
     sent without going into its pane; its state and keys, kept apart from I/O, what's typed kept until the
     daemon takes it, and its drawing
   - `launcher.rs`: the new-session panel (`n`, `w`): its state and keys, kept apart from I/O, the command
-    it builds, what it remembers between runs, and its drawing
+    it builds, what it remembers between runs, the draft it leaves when it's put away with a task in it and
+    opens on again, and its drawing
   - `command_line.rs`: reads the line typed at `new session:` (the panel's `Ctrl+E`) into the command to run
   - `profiles.rs`: the profiles view (`P`): the list, the form that edits one, its keys and drawing; the
     event loop does the writing

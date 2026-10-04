@@ -19,6 +19,7 @@ mod copy_mode;
 mod diff;
 mod diff_tree;
 mod diff_view;
+mod editing;
 mod finder;
 mod fuzzy;
 mod grep;
@@ -1315,7 +1316,12 @@ impl Tui {
             self.fetch_then_start(checkout, action);
             return;
         }
-        if let Err(err) = self.perform(action) {
+        let starts = action.place_mut().is_some();
+        let done = self.perform(action);
+        if starts {
+            self.app.start_done(done.is_ok());
+        }
+        if let Err(err) = done {
             self.app.notify(format!("{err:#}"));
         }
     }

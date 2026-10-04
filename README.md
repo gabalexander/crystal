@@ -551,6 +551,26 @@ typo never goes unnoticed. Keys are written as `n`, `N` (or `shift+n`), `ctrl+b`
 command list all say the keys you chose. The keys inside the views (the diff, the file finder and the rest),
 copy mode's and the questions' on the footer line stay as they are.
 
+Every text box edits the way a shell's line does: the new-session panel's task and branch, the reply box, the
+questions on the footer line, `/`, the command list, the views' filters, comments and forms.
+
+| Key | In a text box |
+| --- | --- |
+| `←` / `→` | a character back, or on |
+| `Alt+B` / `Alt+F`, `Ctrl+←` / `Ctrl+→`, `Alt+←` / `Alt+→` | a word back, or on |
+| `Ctrl+A` / `Ctrl+E`, `Home` / `End` | to the start, or the end, of the line |
+| `Ctrl+Home` / `Ctrl+End` | to the start, or the end, of all the text |
+| `Backspace` / `Delete` | delete the character before the cursor, or after it |
+| `Ctrl+W`, `Alt+Backspace`, `Ctrl+Backspace` | delete the word before the cursor |
+| `Alt+D`, `Ctrl+Delete` | delete the word after the cursor |
+| `Ctrl+U` / `Ctrl+K` | delete back to the start of the line, or on to its end; at the start or the end already, the line break |
+
+A word is letters and digits, as readline has it: spaces and punctuation, `/`, `-`, `.` and `_` among them, come
+between words. macOS's terminals send `Alt+B` and `Alt+F` for `Option+←` and `Option+→`, once `Option` is set
+to act as `Meta` (`Alt`). A view keeps the keys it had: `Ctrl+E` is the new-session panel's command line, the
+issues view's edit and the tree browser's editor, so `End` goes to the end there, and the tree browser's arrows,
+`Home` and `End` are its tree's and its preview's.
+
 `:` opens the command list: every command by its name, with what it does and its key, and your plugins'
 actions after them. Type a little of a name, or of what it does, and `Enter` runs the one the bar is on, as
 its key would. Before you type, the five you ran from it last come first, so it's also a quick way back to
@@ -737,7 +757,16 @@ before, and editing the file changes nothing in it.
 payments ⌂ main`. Type what the agent should do and press `Enter`; the task is its first prompt, given as one
 argument. `Alt+Enter` starts a new line, and a paste keeps its lines. An empty task starts the agent with no
 prompt. `↑` on the first line and `↓` on the last bring back earlier tasks: the panel keeps the last 100, in
-crystal's database.
+crystal's database. The task box edits [as a shell's line does](#keys-and-commands), `Ctrl+W` and `Alt+B` among
+its keys, all but `Ctrl+E`, which is the panel's.
+
+`Esc` puts the panel away without losing what's in it: the next `n` or `w` opens on it, `draft left last time`
+under it. Opened where it was before, it comes back whole, the task, what runs it, its rows' choices, where it
+starts and the branch; opened somewhere else, `n` on another session or `w` after `n`, the task and the rows'
+choices come back, and it starts where it's opened now. The draft lasts while the TUI runs, and goes once a
+session has started from it; a session that couldn't start leaves it for the next `n`. Empty the task and put
+the panel away to drop it. A panel opened for an issue, a pull request or a backlog item brings its own task,
+and leaves the draft as it was.
 
 The session is named for its task: its first few words that say what it's about, like `fix-refund-rounding`
 for "Fix the refund rounding, please", with `-2`, `-3` added if that's taken. Started with no task, it's named
@@ -1614,9 +1643,17 @@ crystal interrupt docs                                               # stop the 
   `.claude/settings.local.json`, so later sessions there have it too. To be asked less to begin with, allow
   what it needs with `--allowedTools` or `--permission-mode` after `--`.
 - Every Claude Code session crystal starts, a task or in a terminal, may run the crystal commands it's told
-  to without asking: `crystal done`, `crystal backlog add` and reading the backlog, `crystal handoff`,
-  `crystal remember`, and `crystal memory search` and `show`, each only while its plugin is on. Anything
-  that changes or removes what's there, like `crystal backlog rm` or `crystal memory rm`, still asks.
+  to without asking, so one driving others doesn't stop at every step:
+  - starting and driving sessions: `ls`, `new`, `send`, `wait`, `read`, `result`, `interrupt`, `events`,
+    `rename`, `report`, `notify`, `layout`, `pane split` and `pane close`
+  - with tasks on, `done`, `task`, and `tasks` with `show`, `log`, `new` and `start`; with flows on, `flow`
+    with `run`, `wait`, `show`, `defs` and `retry`
+  - with the backlog on, reading it and `add`, `export`, `done`, `reopen` and `start`; with the handoff file
+    on, `handoff`; with memory on, `remember`, and `memory` with `search` and `show`
+
+  What removes or cancels what's there (`kill`, `worktree rm`, `tasks cancel`, `flow cancel`, `backlog rm`,
+  `memory rm`), what's yours to decide (a flow's gate: `flow approve` and `back`), and what answers another
+  agent's question for it (`send-keys`, and `answer`, which can say yes to a permission) still ask.
 - `Ctrl+C` in a task's pane, or `crystal interrupt <task>`, stops the run it's in the middle of. Its task
   stays open, waiting on you, and a follow-up carries on.
 - `crystal send`, or `Space` in the TUI, gives a task a follow-up: on the `claude` still there, or once that

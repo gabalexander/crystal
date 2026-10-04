@@ -23,6 +23,7 @@ pub enum Section {
     Pane,
     Question,
     NewSession,
+    TextBox,
     Mouse,
 }
 
@@ -34,6 +35,7 @@ impl Section {
             Section::Pane => "In a pane",
             Section::Question => "Answering a question",
             Section::NewSession => "Starting a session",
+            Section::TextBox => "In a text box",
             Section::Mouse => "With the mouse",
         }
     }
@@ -59,11 +61,16 @@ pub const KEYS: &[Key] = &[
     in_pane("Space", "a task's follow-up"),
     question("y", "yes; any other key, no"),
     question("Enter/Esc", "answer / cancel"),
-    question("Ctrl+U", "clear the answer"),
     new_session("Tab ←/→", "next row, choose"),
     new_session("↑/↓", "earlier tasks"),
     new_session("Alt+Enter", "new line in the task"),
     new_session("Ctrl+E", "edit the command line"),
+    new_session("Esc", "close, keeping a draft"),
+    text_box("Alt+B/F", "a word back / on"),
+    text_box("Ctrl+A/E", "start / end of line"),
+    text_box("Ctrl+W", "delete a word back"),
+    text_box("Alt+D", "delete a word on"),
+    text_box("Ctrl+U/K", "delete to start / end"),
     mouse("click", "a session, pane, tab"),
     mouse("right click", "a menu of what it does"),
     mouse("wheel/drag", "scroll / select, copy"),
@@ -90,6 +97,10 @@ const fn question(label: &'static str, does: &'static str) -> Key {
 
 const fn new_session(label: &'static str, does: &'static str) -> Key {
     key(Section::NewSession, label, does)
+}
+
+const fn text_box(label: &'static str, does: &'static str) -> Key {
+    key(Section::TextBox, label, does)
 }
 
 const fn mouse(label: &'static str, does: &'static str) -> Key {
@@ -121,6 +132,7 @@ const ORDER: &[Section] = &[
     Section::Pane,
     Section::Question,
     Section::NewSession,
+    Section::TextBox,
     Section::Mouse,
 ];
 
