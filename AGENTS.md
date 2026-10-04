@@ -169,7 +169,8 @@ whenever what's handed over changes in a way the crystal before couldn't read.
     for the key every view takes for it); the user's own keys, `[[keys.command]]`, and what each runs (a
     popup, a pane, a tab, a command in the background or a plugin's action); a plugin's key, one or two
     pressed one after the other, and the keys kept from plugins; the `?` overlay's rows of sidebar keys and
-    resize mode's; and `crystal keys`'s list
+    resize mode's; `crystal keys`'s list; and what a key the settings view gives a command, takes from
+    another, leaves none or puts back does to `[keys]` (`rebind`, `unbind`, `reset`), checked as the config's
   - `command_list.rs`: the command list (`:`): every command, the user's own keys' commands and plugin action
     by name, with its keys, filtered as you type, the latest run first; its state and keys, kept apart from
     I/O, and its drawing
@@ -288,12 +289,13 @@ whenever what's handed over changes in a way the crystal before couldn't read.
     footer's line, and the latest event seen, which the event loop keeps in the database
   - `restarted.rs`: the footer's line on what a cold restart brought back and what couldn't start, worked out
     from the sessions the TUI sees waiting their turn, and those that failed, said once; pure
-  - `settings_view.rs`: the settings view (`,`): notifications, sounds, the theme, the mouse, programs' copies,
-    idle agents, the spacing of restarts, whether `q` asks first, background tasks' permission mode, the
-    distiller, search by meaning and hiding draft pull requests, each changed with a key, and how the models
-    stand; then crystal's hooks in each agent installed here, put in, brought up to date or taken out with a
-    key; the event loop writes the file (`config::set`) or the agent's hooks (`integration`) and, while it's
-    open, reads the settings, the hooks and the daemon's `EmbeddingStatus` again every half a second
+  - `settings_view.rs`: the settings view (`,`): the settings in tabs (general, look, sessions, mouse, tasks,
+    memory), each under its heading, changed with a key, gone through with the arrows or typed in, or taken out
+    of the file for its default, and how the models stand; crystal's hooks in each agent installed here, put
+    in, brought up to date or taken out with a key; and the keys' tab, every key `[keys]` gives, the key
+    pressed next given one, one another has taken from it once the user says so; kept apart from I/O, so it's
+    unit-tested; the event loop writes the file (`config::apply`) or the agent's hooks (`integration`) and,
+    while it's open, reads the settings, the hooks and the daemon's `EmbeddingStatus` again every half a second
 - `src/daemon.rs`: the daemon: listens on the socket and owns the sessions, and emits an event wherever something
   happens to them, their tasks, flows, worktrees, memory or backlog, and for the entries of memory gone stale,
   looked for hourly and as each task closes; archives sessions, the distiller reading what one did, and starts
@@ -499,7 +501,9 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   names, the colors `[colors]` takes, what the mouse does (`[mouse]`) and whether programs' copies go on the
   clipboard (`[clipboard]`); what background tasks may spend and do unasked (`[tasks]`); the shell a new terminal runs
   (`[terminal]`, `-l` for a login shell) and where the TUI starts one, the window's title, the tab bar and
-  the appearance; where new worktrees start and go (`[worktrees]`)
+  the appearance; where new worktrees start and go (`[worktrees]`); and the settings view's edits to the
+  file (`apply`), several at once, a line set or taken out for its default, the rest of the file as the user
+  wrote it, written only if what they come to is read
 - `src/memory.rs`: what a project's sessions learned: the SQLite store in the state directory with its FTS5
   index (bm25, prefix and porter-stemmed words), each entry's vector and search by meaning merged with it by
   reciprocal rank fusion, then the reranker's read of the best (nothing when none answers), its migrations,

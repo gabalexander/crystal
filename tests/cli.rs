@@ -2068,12 +2068,11 @@ fn without_mouse_capture_the_terminal_keeps_the_mouse() {
     assert!(!tui.sends_the_mouse());
     assert!(tui.marks_pastes(), "pastes are still the TUI's");
 
-    // Switched on in the settings view, the TUI takes it straight away.
-    tui.type_keys(",");
-    tui.shows("take the mouse");
-    // Eleven rows down, past the theme's, the appearance's, the tab bar's,
-    // the sessions' and quitting's.
-    tui.type_keys("jjjjjjjjjjj ");
+    // Switched on in the settings view's mouse tab, the TUI takes it
+    // straight away.
+    tui.type_keys(",4");
+    tui.shows("○ take the mouse");
+    tui.type_keys(" ");
     eventually("the TUI takes the mouse", || tui.sends_the_mouse());
     assert!(
         std::fs::read_to_string(crystal.config_file())
@@ -4339,10 +4338,9 @@ fn the_settings_view_puts_an_agent_s_hooks_in_and_takes_them_out() {
     let mut tui = crystal.tui();
     tui.type_keys(",");
     tui.shows("General");
-    // To the last row, which the view scrolls to: Claude Code, the only
-    // agent installed here.
-    tui.type_keys(&"j".repeat(40));
-    tui.shows("Integrations");
+    // The integrations' tab: Claude Code, the only agent installed here.
+    tui.type_keys("7");
+    tui.shows("crystal's hooks in each agent's own settings");
     tui.shows("Claude Code");
     tui.type_keys(" ");
     let file = crystal.claude_config_dir().join("settings.json");
@@ -10146,8 +10144,7 @@ fn pull_requests_are_marked_merged_or_conflicting_and_counted_in_the_top_bar() {
     tui.hides("pull requests · app");
 
     // Hidden in the settings, drafts leave the list and the count. Theirs
-    // is the last of the 21 settings, which the view scrolls to; the agents'
-    // hooks come after them.
+    // is the last row of the first tab.
     tui.type_keys(",");
     tui.shows("○ notifications");
     tui.type_keys(&"j".repeat(20));
@@ -12743,7 +12740,8 @@ fn the_settings_view_changes_the_config_and_follows_it_live() {
     tui.shows("● notifications");
     assert!(config().starts_with("notify = true\n"), "{}", config());
     tui.shows("● sounds");
-    tui.type_keys("jjjjl");
+    // The theme is the look's.
+    tui.type_keys("2l");
     tui.shows("(2 of 20)");
     assert!(config().contains("theme = \"light\""), "{}", config());
     // Back past the first is the last.
@@ -12757,17 +12755,14 @@ fn the_settings_view_changes_the_config_and_follows_it_live() {
     crystal.configure(
         "notify = true\ntheme = \"light\"\n\n[memory]\ndistill = false\nembeddings = false\n",
     );
-    // Memory's rows are fourteen down from the theme, past the
-    // appearance's, the tab bar's, the spacing of restarts, quitting's, the
-    // mouse's, the clipboard's and background tasks', which the view
-    // scrolls to on a screen too short for all of them.
-    tui.type_keys("jjjjjjjjjjjjjj");
+    tui.type_keys("6");
     tui.shows("○ distill closed tasks");
     tui.shows("not downloaded (2449 MB)");
 
     // Turned on, search by meaning has the daemon get the models, and the
-    // view follows how that goes: here, a download that fails.
-    tui.type_keys("j ");
+    // view follows how that goes: here, a download that fails. It's below
+    // the distiller's model and budget.
+    tui.type_keys("jjj ");
     tui.shows("● search by meaning");
     assert!(
         config().contains("[memory]\ndistill = false\nembeddings = true\n"),
@@ -12776,9 +12771,57 @@ fn the_settings_view_changes_the_config_and_follows_it_live() {
     );
     tui.shows("couldn't get them ready");
 
+    // A setting typed in, one up from the last of the sessions' tab, and
+    // its default put back.
+    tui.type_keys("3Gk\r");
+    tui.type_keys("develop\r");
+    eventually("the base branch is written down", || {
+        config().contains("[worktrees]\nbase = \"develop\"")
+    });
+    tui.shows("base branch           develop");
+    tui.type_keys("\x1b[3~");
+    tui.shows("base branch           origin's default");
+    assert!(!config().contains("base = "), "{}", config());
+
     tui.type_keys("\x1b");
-    tui.hides("search by meaning");
+    tui.hides("base branch");
     tui.shows("agent");
+}
+
+#[test]
+fn a_key_pressed_in_the_settings_is_given_its_command_at_once() {
+    let crystal = Crystal::new();
+    crystal.ok(&["new", "-n", "agent", "sleep", "30"]);
+    let mut tui = crystal.tui();
+    tui.shows("❯ agent");
+    let config = || std::fs::read_to_string(crystal.config_file()).unwrap_or_default();
+
+    // The keys' tab: the prefix, the key back from a pane, then the
+    // sidebar's commands, `commands` the sixth.
+    tui.type_keys(",8");
+    tui.shows("From a pane");
+    tui.type_keys("jjjjjjj\r");
+    tui.shows("press a key…");
+    tui.type_keys("\x1bOQ");
+    eventually("F2 is written down", || {
+        config().contains("[keys]\ncommands = \"f2\"")
+    });
+    tui.shows("• commands              F2");
+
+    // One another command has is taken from it once you say so.
+    tui.type_keys("jj\ru");
+    tui.shows("u is next-needing-you's: enter takes it from it, esc leaves it");
+    tui.type_keys("\r");
+    eventually("u moves", || {
+        config().contains("needs-you = \"u\"\nnext-needing-you = \"none\"")
+    });
+    tui.shows("• next-needing-you      none");
+
+    // And it counts straight away: F2 lists the commands.
+    tui.type_keys("\x1b");
+    tui.hides("From a pane");
+    tui.type_keys("\x1bOQ");
+    tui.shows("enter runs · ↑/↓ choose · esc closes");
 }
 
 #[test]

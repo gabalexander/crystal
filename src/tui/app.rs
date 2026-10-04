@@ -22,8 +22,8 @@ use super::handoff_view::{self, HandoffView};
 use super::help;
 use super::issues::{self, IssuesView};
 use super::keymap::{
-    Bound, Chord, Command, CommandKind, KeyCommand, Keymap, Mode, ModeKey, Sequence, SplitWay,
-    Translated,
+    Bound, Chord, Command, CommandKind, KeyCommand, Keymap, Mode, ModeKey, Rebinding, Sequence,
+    SplitWay, Translated,
 };
 use super::launcher::{self, Launcher, Memory, Run, Setup, Target};
 use super::layouts::{self, Layouts, LayoutsView, Program, Programs, Which};
@@ -672,6 +672,9 @@ pub enum Action {
     CloseSettings,
     /// Write a change to a setting to the config file, and follow it.
     ChangeSetting(settings_view::Change),
+    /// Write the keys the settings view gave to the config file's
+    /// `[keys]`, and follow them.
+    ChangeKeys(Rebinding),
     /// Have the daemon get the model that searches memory by meaning ready.
     PrepareEmbeddings,
     /// Put crystal's hooks in an agent's own settings, or bring them up to
@@ -4573,6 +4576,7 @@ impl App {
                 Some(Action::CloseSettings)
             }
             settings_view::Outcome::Change(change) => Some(Action::ChangeSetting(change)),
+            settings_view::Outcome::Keys(rebinding) => Some(Action::ChangeKeys(rebinding)),
             settings_view::Outcome::Prepare => Some(Action::PrepareEmbeddings),
             settings_view::Outcome::Integrate { agent, install } => {
                 Some(Action::Integrate { agent, install })
@@ -4832,8 +4836,13 @@ impl App {
         if self.launcher.is_some() || self.profiles_view.is_some() {
             return None;
         }
-        if self.plugins_view.is_some() || self.settings.is_some() {
+        if self.plugins_view.is_some() {
             return Some((false, false));
+        }
+        // A setting typed in, or a key pressed for a command, is the key
+        // as it comes.
+        if let Some(settings) = &self.settings {
+            return (!settings.takes_keys_as_they_come()).then_some((false, false));
         }
         if self.prompt.is_some() {
             return None;
@@ -5899,6 +5908,8 @@ impl App {
         } else if let Some(launcher) = &mut self.launcher {
             launcher.on_paste(&text);
         } else if let Some(view) = &mut self.profiles_view {
+            view.on_paste(&text);
+        } else if let Some(view) = &mut self.settings {
             view.on_paste(&text);
         } else if let Some(prompt) = &mut self.prompt {
             prompt.input.insert_str(&text);
@@ -11855,7 +11866,8 @@ gate = true
         }
         assert_eq!(
             press(&mut app, KeyCode::Char(' ')),
-            Some(Action::ChangeSetting(settings_view::Change::HideDrafts(
+            Some(Action::ChangeSetting(settings_view::Change::set(
+                settings_view::Setting::HideDrafts,
                 true
             )))
         );

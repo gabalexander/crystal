@@ -961,13 +961,38 @@ impl Config {
     }
 }
 
-/// Sets the setting at `keys`, like `["memory", "embeddings"]`, to `value`
-/// in the config file at `path`, making the table it's in if there isn't
-/// one, and keeping the rest of the file as the user wrote it, comments and
-/// all: what the settings view writes. A file the change would leave
-/// meaning nothing crystal knows is left as it was, with an error.
-pub fn set(path: &Path, keys: &[&str], value: toml_edit::Value) -> Result<()> {
-    let (last, tables) = keys.split_last().context("say which setting")?;
+/// One change to the config file: the setting at `keys`, like `["memory",
+/// "embeddings"]`, set to `value`, or with none, its line taken out, for
+/// the setting to have its default.
+#[derive(Debug, Clone)]
+pub struct Edit {
+    pub keys: Vec<String>,
+    pub value: Option<toml_edit::Value>,
+}
+
+impl Edit {
+    pub fn set(keys: &[&str], value: toml_edit::Value) -> Edit {
+        Edit {
+            keys: keys.iter().map(|key| key.to_string()).collect(),
+            value: Some(value),
+        }
+    }
+
+    pub fn remove(keys: &[&str]) -> Edit {
+        Edit {
+            keys: keys.iter().map(|key| key.to_string()).collect(),
+            value: None,
+        }
+    }
+}
+
+/// Makes the `edits` to the config file at `path`, making the tables they
+/// go in if there aren't any, and keeping the rest of the file as the user
+/// wrote it, comments and all: what the settings view writes. The file is
+/// written once, if what they come to together makes sense, and otherwise
+/// left as it was, with an error. A line taken out that isn't there is
+/// nothing to do.
+pub fn apply(path: &Path, edits: &[Edit]) -> Result<()> {
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -976,14 +1001,43 @@ pub fn set(path: &Path, keys: &[&str], value: toml_edit::Value) -> Result<()> {
     let mut document: toml_edit::DocumentMut = text
         .parse()
         .with_context(|| format!("couldn't read {}", path.display()))?;
+    for edit in edits {
+        edit_document(&mut document, edit)?;
+    }
+    let new_text = document.to_string();
+    from_text(&new_text).with_context(|| format!("in {}", path.display()))?;
+    // Nothing to write, as for a default put back that was the default
+    // already.
+    if new_text == text {
+        return Ok(());
+    }
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let unfinished = path.with_extension("toml.saving");
+    std::fs::write(&unfinished, &new_text)?;
+    std::fs::rename(&unfinished, path)?;
+    Ok(())
+}
+
+/// Makes one edit to the file's `document`.
+fn edit_document(document: &mut toml_edit::DocumentMut, edit: &Edit) -> Result<()> {
+    let (last, tables) = edit.keys.split_last().context("say which setting")?;
     let mut table = document.as_table_mut();
     for key in tables {
+        if edit.value.is_none() && !table.contains_key(key) {
+            return Ok(());
+        }
         table = table
             .entry(key)
             .or_insert(toml_edit::Item::Table(toml_edit::Table::new()))
             .as_table_mut()
             .with_context(|| format!("`{key}` in the config file isn't a [{key}] table"))?;
     }
+    let Some(value) = edit.value.clone() else {
+        table.remove(last);
+        return Ok(());
+    };
     // A line that's there already keeps its comment.
     match table.get_mut(last).and_then(toml_edit::Item::as_value_mut) {
         Some(said) => {
@@ -995,14 +1049,6 @@ pub fn set(path: &Path, keys: &[&str], value: toml_edit::Value) -> Result<()> {
             table.insert(last, toml_edit::Item::Value(value));
         }
     }
-    let new_text = document.to_string();
-    from_text(&new_text).with_context(|| format!("in {}", path.display()))?;
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let unfinished = path.with_extension("toml.saving");
-    std::fs::write(&unfinished, &new_text)?;
-    std::fs::rename(&unfinished, path)?;
     Ok(())
 }
 
@@ -1556,9 +1602,10 @@ back_to = "build"
             "# mine\nnotify = true # loud\n\n[plugins]\nmemory = true\n",
         )
         .unwrap();
-        set(&path, &["notify"], false.into()).unwrap();
-        set(&path, &["memory", "embeddings"], false.into()).unwrap();
-        set(&path, &["theme"], "light".into()).unwrap();
+        let set = |keys: &[&str], value: toml_edit::Value| apply(&path, &[Edit::set(keys, value)]);
+        set(&["notify"], false.into()).unwrap();
+        set(&["memory", "embeddings"], false.into()).unwrap();
+        set(&["theme"], "light".into()).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(
             text.starts_with("# mine\nnotify = false # loud\n"),
@@ -1570,7 +1617,52 @@ back_to = "build"
         assert_eq!(config.theme, ThemeName::LIGHT);
 
         // What crystal wouldn't take is never written.
-        assert!(set(&path, &["theme"], "pink".into()).is_err());
+        assert!(set(&["theme"], "pink".into()).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+    }
+
+    #[test]
+    fn edits_go_in_together_and_a_line_taken_out_has_its_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[keys]\nkill = \"X\"\n\n[[keys.command]]\nkey = \"g\"\ntype = \"popup\"\n\
+             command = \"lazygit\"\n",
+        )
+        .unwrap();
+        // The first alone would give `X` to two commands; with the second,
+        // it moves.
+        let edits = [
+            Edit::set(&["keys", "archive"], "X".into()),
+            Edit::set(&["keys", "kill"], "none".into()),
+        ];
+        apply(&path, &edits).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.starts_with("[keys]\nkill = \"none\"\narchive = \"X\"\n"),
+            "{text}"
+        );
+        let edits = [
+            Edit::remove(&["keys", "kill"]),
+            Edit::remove(&["worktrees", "base"]),
+        ];
+        apply(&path, &edits).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.starts_with("[keys]\narchive = \"X\"\n"), "{text}");
+        assert!(!text.contains("worktrees"), "{text}");
+        let config = from_text(&text).unwrap();
+        assert_eq!(config.keys.commands.len(), 1);
+
+        // A default put back where there's no file makes none.
+        let none = dir.path().join("none.toml");
+        apply(&none, &[Edit::remove(&["theme"])]).unwrap();
+        assert!(!none.exists());
+
+        // Together they'd give `g` to a command and the user's own: nothing
+        // is written.
+        let edits = [Edit::set(&["keys", "kill"], "g".into())];
+        assert!(apply(&path, &edits).is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
     }
 

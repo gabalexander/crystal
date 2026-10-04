@@ -1312,8 +1312,8 @@ fn draw_footer(frame: &mut Frame, app: &App, panes: &[Pane], look: &Look, area: 
     } else if app.plugins_view().is_some() {
         let hints = as_keys_are(app, plugins_view::HINTS, false);
         frame.render_widget(hint_spans(&borrowed(&hints), theme), area);
-    } else if app.settings_view().is_some() {
-        let hints = as_keys_are(app, settings_view::HINTS, false);
+    } else if let Some(view) = app.settings_view() {
+        let hints = as_keys_are(app, settings_view::hints(view), false);
         frame.render_widget(hint_spans(&borrowed(&hints), theme), area);
     } else if let Some(prompt) = app.prompt() {
         draw_prompt(frame, theme, prompt, area);

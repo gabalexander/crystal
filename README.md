@@ -624,7 +624,8 @@ A key you give one command is taken from the command that had it, which is left 
 Two commands given the same key, a command or a key crystal doesn't know, are errors that name them, and a
 name that's nearly one crystal knows says which, so a typo never goes unnoticed. Keys are written as `n`, `N`
 (or `shift+n`), `ctrl+b`, `alt+enter`, `ctrl+alt+h`, `shift+left`, `pageup`, `space`, `f5`, or the character
-itself, like `|`, `(` or `:`. The `?` overlay, the footer and the command list all say the keys you chose.
+itself, like `|`, `(` or `:`. The `?` overlay, the footer and the command list all say the keys you chose. The
+[settings view](#the-settings-view)'s keys tab gives a command the key you press, with the same checks.
 
 Every prefix in the list starts the same thing: the first is the one the footer shows. Inside a pane every key
 goes to the program but the prefixes and the hand-back key, so a command's key works there only after a prefix,
@@ -3090,22 +3091,41 @@ issues give way before it.
 
 #### The settings view
 
-`,` in the sidebar opens the settings you'd otherwise change in the file: notifications and when they come,
-sounds, the theme and whether it follows your system's [appearance](#themes) (the row says which theme each
-side is), whether the [tab bar](#terminals-the-window-and-the-tab-bar) goes on top or over the footer and is
-left out with one tab, how long an agent may sit [idle](#archiving-and-idle-agents), how far apart agents
-start again after a [crash or a reboot](#usage), whether `q` asks before it quits, [the mouse](#usage),
-whether programs' copies go on [your clipboard](#zoom-copy-mode-and-search), how memory learns ([the
-distiller](#the-distiller)) and searches ([by meaning](#search-by-meaning)), the permission mode [background
-tasks](#background-tasks) start in, and whether [draft pull requests](#pull-requests) are hidden. `space`
-changes the one the bar is on, and `←/→` go through the [themes](#themes), forward and back (the row says which
-of the twenty it's on), the waits before a notification, the times an agent may sit idle: off, 15 minutes, 30,
-an hour, two or eight, the spacing of restarts: all at once, 100 milliseconds, 250, 500, a second or two, how
-far a notch of the wheel scrolls: 1, 2, 3, 5 or 10 lines, and the permission modes: `default`, `acceptEdits`,
-`auto`, `dontAsk` and `plan`. Each change is written to the file at once,
-keeping the rest of it as you wrote it, comments and all, and counts straight away: the TUI repaints in a new
-theme, and the daemon reads the rest as it goes. On a screen too short for every row, the view scrolls to keep
-the one the bar is on in sight.
+`,` in the sidebar opens the settings you'd otherwise change in the file, in tabs: `Tab` and `Shift+Tab` (or `]`
+and `[`) go from one to the next, and `1` to `8` straight to one.
+
+| Tab | What's in it |
+|---|---|
+| General | [notifications](#usage): whether, after how long, only while you're away, and a command of your own in place of them; sounds; whether `q` asks before it quits; looking for a [newer crystal](#updating); how long the [event log](#events) keeps what happened; and whether [draft pull requests](#pull-requests) are hidden |
+| Look | the [theme](#themes), whether it follows your system's appearance (the row says which theme each side is) and the theme for each side; the [tab bar](#terminals-the-window-and-the-tab-bar)'s place, whether it's left out with one tab, and its separator; the window's title; the [sidebar](#the-sidebar)'s width, whether it starts folded, what folding keeps, and whether what needs you is pinned |
+| Sessions | what the [new-session panel](#starting-a-session) offers first, naming sessions for their prompt, how long an agent may sit [idle](#archiving-and-idle-agents), how far apart agents start again after a [crash or a reboot](#usage) and whether one resumes as it said; a new terminal's shell, whether it's a login shell and where it starts; how much a session's history keeps; and the branch new worktrees start from and where they go |
+| Mouse | [the mouse](#usage), and whether programs' copies go on [your clipboard](#zoom-copy-mode-and-search) |
+| Tasks | the permission mode [background tasks](#background-tasks) start in, and what a run and a day may spend |
+| Memory | how memory learns ([the distiller](#the-distiller), its model and what it may spend) and whether it searches [by meaning](#search-by-meaning) and reranks |
+| Integrations | the agents installed here that crystal can [hook](#hooks-in-other-agents-own-settings): below |
+| Keys | every key `[keys]` gives, each given by pressing it: below |
+
+`space` changes the setting the bar is on: a switch turns over, and a choice goes to the next, `←/→` going
+through them forward and back: the [themes](#themes) (the row says which of the twenty it's on), the waits before
+a notification, the times an agent may sit idle (off, 15 minutes, 30, an hour, two or eight), the spacing of
+restarts, the permission modes (`default`, `acceptEdits`, `auto`, `dontAsk` and `plan`), the budgets, and the
+rest. A setting that's text, like the window's title, the shell or the base branch, is typed in: `enter` opens
+it, `enter` again writes it, and `esc` leaves it as it was; emptied, a command, the agent, the base branch or the
+distiller's model goes back to its default. `del` on any row takes its line out of the file, for its default.
+Each change is written to the file at once, keeping the rest of it as you wrote it, comments and all, and counts
+straight away: the TUI repaints in a new theme, and the daemon reads the rest as it goes. A change crystal
+couldn't read isn't written, and the view says why. On a screen too short for a tab's rows, the view scrolls to
+keep the one the bar is on in sight. `[[profile]]`s have their own view (`P`), plugins theirs (`X`), and the
+settings that are lists or tables, like `[colors]` and `[tab_bar] right`, are the file's.
+
+The keys' tab lists the prefixes, the key back from a pane, every command and each mode's keys, with the keys
+each has and a `•` beside those the file gives. `enter` on one waits for the key you press next and gives it that
+key in place of its own, and `a` gives it the key beside them; `x` leaves it with none, and `del` puts its own
+back. A key is checked as the file's keys are: one another command has asks first, saying whose it is, and
+`enter` takes it from that one, which keeps its other keys, while `esc` leaves it; a key a view always has, or
+the key back from a pane, isn't given, and the view says why. Your own `[[keys.command]]` keys are listed under
+the rest, for the file to change. `esc` can't be given this way, since it stops the waiting; the file can give
+it.
 
 While it's open, the view reads the file and asks the daemon again every half a second, so it follows a
 change made by hand in the file too, and shows how the models that search by meaning stand: downloading
@@ -3114,10 +3134,10 @@ meaning on has the daemon get the models ready: it downloads them if they aren't
 every entry its vector, and `enter` on that row does it again. Turned off, the daemon lets the models go, and
 the memory they took with them.
 
-Last come the agents installed here that crystal can [hook](#hooks-in-other-agents-own-settings), each with how
-its hooks stand, as `crystal integration status` says: `installed`, `out of date` or `not installed`. `space`
-or `enter` puts crystal's hooks in the agent's own settings, or brings them up to date, and on one installed,
-takes them out again; the view says what's left to do, like reviewing Codex's in its `/hooks`.
+The integrations' tab lists the agents installed here that crystal can [hook](#hooks-in-other-agents-own-settings),
+each with how its hooks stand, as `crystal integration status` says: `installed`, `out of date` or `not
+installed`. `space` or `enter` puts crystal's hooks in the agent's own settings, or brings them up to date, and on
+one installed, takes them out again; the view says what's left to do, like reviewing Codex's in its `/hooks`.
 
 #### Profiles
 
