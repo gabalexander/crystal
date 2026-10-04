@@ -56,6 +56,9 @@ whenever what's handed over changes in a way the crystal before couldn't read.
 - `src/drive.rs`: `crystal send`, `wait`, `read`, `result`, `answer` and `interrupt`, for driving one session from
   another or a script; waits listen to the daemon's events about their session, and `wait --output` has the
   daemon look at its screen, asking again when a handover cuts it
+- `src/messages.rs`: what `crystal send` carries from one session to another: the text tidied and cut to 8 KiB,
+  the line ahead of it saying which session sent it, the guard that holds a session to 20 sends a minute, and
+  the `agent_blocked:` refusal for an agent asking the user something; adapted from docket's
 - `src/keys.rs`: turning keys into the bytes a terminal sends: the TUI's keys, and the names `send-keys` takes;
   the old way, or in the Kitty keyboard protocol once a program has asked for it
 - `src/remote.rs`: `crystal ssh`: finds (or installs) crystal on another machine, then runs it there over ssh
@@ -98,7 +101,10 @@ whenever what's handed over changes in a way the crystal before couldn't read.
     terminals, each flow run's steps under it, and linked worktrees with no sessions left at the end of
     their project
   - `text_input.rs`: a one-line text box, for the questions asked on the bottom line
-  - `text_area.rs`: a text box of several lines that wrap: the new-session panel's task
+  - `text_area.rs`: a text box of several lines that wrap: the new-session panel's task, and the reply box
+  - `reply.rs`: the reply box (`Space`): the next prompt for a session, or a background task's follow-up,
+    sent without going into its pane; its state and keys, kept apart from I/O, what's typed kept until the
+    daemon takes it, and its drawing
   - `launcher.rs`: the new-session panel (`n`, `w`): its state and keys, kept apart from I/O, the command
     it builds, what it remembers between runs, and its drawing
   - `command_line.rs`: reads the line typed at `new session:` (the panel's `Ctrl+E`) into the command to run
@@ -197,8 +203,9 @@ whenever what's handed over changes in a way the crystal before couldn't read.
 - `src/session.rs`: one program in a PTY, or a task: spawn, exit status, stop, its screen (120 by 40 until a viewer
   sizes it), viewers and listeners, the agent that says what it's doing itself while it holds the session, an
   agent typed into its shell whose conversation a restart resumes while it's in front, its agent's subagents,
-  whether its first prompt can name it, and what has changed in it (its agent's activity, a task's runs) for the
-  daemon to tell; handing it over and adopting it, its PTY on a descriptor of crystal's own
+  whether its first prompt can name it, whether its agent is blocked on the user, and what has changed in it
+  (its agent's activity, a task's runs) for the daemon to tell; handing it over and adopting it, its PTY on a
+  descriptor of crystal's own
 - `src/vt.rs`: a terminal's screen, through `alacritty_terminal`: what a program drew and its history, the modes
   it set, its answers to the program's questions (the daemon's screen only), the output that catches a new viewer
   up (its hyperlinks included), the cells to draw, the input modes `crystal attach` asks your terminal for, and,

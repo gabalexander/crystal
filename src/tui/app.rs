@@ -11,6 +11,7 @@ pub use commands::Alone;
 use super::away::{Away, Tally};
 use super::backlog_view::{BacklogChange, BacklogView, Step};
 use super::command_line;
+use super::compose::Typed;
 use super::diff_view::{self, Against, DiffView};
 use super::finder::Finder;
 use super::grep::Grep;
@@ -25,6 +26,7 @@ use super::plugins_view::{self, PluginsView};
 use super::preview::Content;
 use super::profiles::{self, ProfilesView};
 use super::pull_requests::{self, PullRequestsView};
+use super::reply::ReplyBox;
 use super::review;
 use super::search;
 use super::settings_view::{self, SettingsView};
@@ -331,6 +333,12 @@ pub enum Action {
     },
     /// Stop the run the background task called this is in the middle of.
     Interrupt(String),
+    /// Send `text` to the session called `name` as the user: typed in with
+    /// Enter after it, or a background task's follow-up.
+    Reply {
+        name: String,
+        text: String,
+    },
     /// Ask the daemon for the backlog of the project `dir` is in, for the
     /// backlog view that's open.
     ListBacklog(PathBuf),
@@ -618,6 +626,8 @@ pub struct App {
     prompt: Option<Prompt>,
     /// The new-session panel, while it's open.
     launcher: Option<Launcher>,
+    /// The box a reply to a session is written in, while it's open.
+    reply: Option<ReplyBox>,
     /// The agents installed on this machine, which the panel offers.
     agents: Vec<&'static Agent>,
     /// The profiles in the config file, which the panel offers first and
@@ -764,6 +774,7 @@ impl App {
             removing: HashSet::new(),
             prompt: None,
             launcher: None,
+            reply: None,
             agents: Vec::new(),
             profiles: Vec::new(),
             profiles_on: profile::enabled(&Config::default()),
@@ -1009,6 +1020,69 @@ impl App {
     /// The new-session panel, while it's open.
     pub fn launcher(&self) -> Option<&Launcher> {
         self.launcher.as_ref()
+    }
+
+    /// The reply box, while it's open.
+    pub fn reply(&self) -> Option<&ReplyBox> {
+        self.reply.as_ref()
+    }
+
+    /// Space: opens the reply box for the session called `name`, to send
+    /// it what to do next without going into its pane. Not for one that
+    /// has ended, nor the session this TUI runs in, which would be typing
+    /// into the TUI.
+    fn open_reply(&mut self, name: &str) {
+        let Some(session) = self.position(name).map(|at| &self.sessions[at]) else {
+            return self.notify("there's no session selected".into());
+        };
+        if self.is_own(session) {
+            return self.notify("crystal can't reply to the session it runs in".into());
+        }
+        if session.state != State::Running {
+            return self.notify(format!("{name} has ended: Enter starts it again"));
+        }
+        let label = match &session.front {
+            Some(Front::Task) => "a follow-up: its next run, which carries its conversation on",
+            Some(front) if front.is_agent() => {
+                "its agent's next prompt, typed in with Enter after it"
+            }
+            _ => "typed into it, with Enter after it",
+        };
+        self.reply = Some(ReplyBox::new(name, label));
+    }
+
+    /// A key in the reply box, which has every key while it's open.
+    fn on_reply_key(&mut self, key: KeyEvent) -> Option<Action> {
+        let reply = self.reply.as_mut()?;
+        match reply.on_key(&key) {
+            Typed::Stay => None,
+            Typed::Cancel => {
+                self.reply = None;
+                None
+            }
+            Typed::Send(text) => Some(Action::Reply {
+                name: reply.name.clone(),
+                text,
+            }),
+        }
+    }
+
+    /// The reply to the session called `name` was sent, or why it wasn't:
+    /// sent, the box goes; refused, it stays, what's written and all, and
+    /// says why.
+    pub fn replied(&mut self, name: &str, sent: Result<(), String>) {
+        match sent {
+            Ok(()) => {
+                if self.reply.as_ref().is_some_and(|reply| reply.name == name) {
+                    self.reply = None;
+                }
+                self.notify(format!("sent to {name}"));
+            }
+            Err(reason) => match self.reply.as_mut().filter(|reply| reply.name == name) {
+                Some(reply) => reply.refused(reason),
+                None => self.notify(reason),
+            },
+        }
     }
 
     /// Takes the models Codex lets the user choose.
@@ -2235,6 +2309,9 @@ impl App {
             self.ask(Question::CloseTask { name, failed }, "");
             return None;
         }
+        if self.reply.is_some() {
+            return self.on_reply_key(key);
+        }
         if self.backlog.is_some() {
             return self.on_backlog_key(key);
         }
@@ -2439,6 +2516,7 @@ impl App {
             || self.backlog.is_some()
             || self.layouts.is_some()
             || self.launcher.is_some()
+            || self.reply.is_some()
             || self.profiles_view.is_some()
             || self.plugins_view.is_some()
             || self.settings.is_some()
@@ -2508,6 +2586,11 @@ impl App {
             // Enter starts something there, as `n` does.
             KeyCode::Enter if self.on_worktree.is_some() => return self.open_launcher(false),
             KeyCode::Enter => self.enter(),
+            KeyCode::Char(' ') if self.on_worktree.is_some() => {}
+            KeyCode::Char(' ') => match self.selected_name() {
+                Some(name) => self.open_reply(&name),
+                None => self.notify("there's no session selected".into()),
+            },
             KeyCode::Tab => self.move_to_pane(Round::Forward),
             KeyCode::BackTab => self.move_to_pane(Round::Back),
             KeyCode::Char('s') => self.toggle_split(),
@@ -3496,7 +3579,9 @@ impl App {
         if self.view.is_some() || self.showing_keys() || self.confirm.is_some() {
             return None;
         }
-        if let Some(launcher) = &mut self.launcher {
+        if let Some(reply) = &mut self.reply {
+            reply.on_paste(&text);
+        } else if let Some(launcher) = &mut self.launcher {
             launcher.on_paste(&text);
         } else if let Some(view) = &mut self.profiles_view {
             view.on_paste(&text);
@@ -3645,13 +3730,18 @@ impl App {
     }
 
     /// A key in a background task's pane: `y`, `n` or `Y` answer what it
-    /// asks for, and Ctrl+C stops its run. It takes no others.
+    /// asks for, Space opens the reply box for a follow-up, and Ctrl+C
+    /// stops its run. It takes no others.
     fn on_task_pane_key(&mut self, slot: Slot, key: KeyEvent) -> Option<Action> {
         let session = self.pane_session(slot)?;
         let name = session.name.clone();
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         if ctrl && key.code == KeyCode::Char('c') {
             return Some(Action::Interrupt(name));
+        }
+        if key.code == KeyCode::Char(' ') && !ctrl {
+            self.open_reply(&name);
+            return None;
         }
         let answer = answer_key(key.code).filter(|_| !ctrl);
         match answer {
@@ -3662,7 +3752,7 @@ impl App {
             }
             None => {
                 self.notify(format!(
-                    "{name} takes no keys: ctrl+c stops its run, `crystal send` gives it a follow-up"
+                    "{name} takes no keys: space gives it a follow-up, ctrl+c stops its run"
                 ));
                 None
             }
@@ -7909,5 +7999,125 @@ gate = true
         // Nothing worth saying says nothing.
         app.set_away(&Tally::of(&[]));
         assert_eq!(app.away_line(), None);
+    }
+
+    fn type_in(app: &mut App, text: &str) {
+        for c in text.chars() {
+            press(app, KeyCode::Char(c));
+        }
+    }
+
+    #[test]
+    fn space_opens_a_reply_box_and_enter_sends_it_as_the_user() {
+        let mut app = app_with(&["a", "b"]);
+        assert_eq!(press(&mut app, KeyCode::Char(' ')), None);
+        let reply = app.reply().unwrap();
+        assert_eq!(reply.name, "a");
+        assert_eq!(reply.label, "typed into it, with Enter after it");
+        // The box has every key: `q` is a letter, not quitting.
+        type_in(&mut app, "quick");
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT));
+        type_in(&mut app, "fix");
+        let sent = Action::Reply {
+            name: "a".into(),
+            text: "quick\nfix".into(),
+        };
+        assert_eq!(press(&mut app, KeyCode::Enter), Some(sent));
+        assert!(app.reply().unwrap().sending);
+
+        app.replied("a", Ok(()));
+        assert!(app.reply().is_none());
+        assert_eq!(app.notice(), Some("sent to a"));
+        // The sidebar has its keys back.
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(selected_name(&app), Some("b"));
+    }
+
+    #[test]
+    fn a_refused_reply_keeps_what_was_written_and_says_why() {
+        let mut app = app_with(&["a"]);
+        press(&mut app, KeyCode::Char(' '));
+        type_in(&mut app, "go on");
+        press(&mut app, KeyCode::Enter);
+        let why = "agent_blocked: a is asking to use Bash: cargo test";
+        app.replied("a", Err(why.into()));
+        let reply = app.reply().unwrap();
+        assert!(!reply.sending);
+        assert_eq!(reply.problem.as_deref(), Some(why));
+        assert_eq!(reply.text.text(), "go on");
+        assert_eq!(press(&mut app, KeyCode::Esc), None);
+        assert!(app.reply().is_none());
+        // Nothing written, Enter sends nothing.
+        press(&mut app, KeyCode::Char(' '));
+        assert_eq!(press(&mut app, KeyCode::Enter), None);
+        assert!(app.reply().is_none());
+    }
+
+    #[test]
+    fn space_takes_no_reply_for_an_ended_session_or_the_tui_s_own() {
+        let mut app = App::new(Some("me".into()));
+        app.set_sessions(vec![session("me"), ended("gone")]);
+        press(&mut app, KeyCode::Char(' '));
+        assert!(app.reply().is_none());
+        assert_eq!(
+            app.notice(),
+            Some("crystal can't reply to the session it runs in")
+        );
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(selected_name(&app), Some("gone"));
+        press(&mut app, KeyCode::Char(' '));
+        assert!(app.reply().is_none());
+        assert!(app.notice().unwrap().contains("gone has ended"));
+        // In a tab with nothing in it, there's nothing to reply to.
+        let mut empty = App::new(None);
+        press(&mut empty, KeyCode::Char(' '));
+        assert!(empty.reply().is_none());
+        assert_eq!(empty.notice(), Some("there's no session selected"));
+    }
+
+    #[test]
+    fn space_in_a_task_s_pane_gives_it_a_follow_up() {
+        let mut app = App::new(None);
+        let task = SessionInfo {
+            front: Some(Front::Task),
+            ..doing("fixer", Activity::Done)
+        };
+        app.set_sessions(vec![task]);
+        press(&mut app, KeyCode::Enter);
+        assert!(matches!(app.focus(), Focus::Pane(_)));
+        press(&mut app, KeyCode::Char('x'));
+        assert!(app.notice().unwrap().contains("space gives it a follow-up"));
+        press(&mut app, KeyCode::Char(' '));
+        let reply = app.reply().unwrap();
+        assert_eq!(reply.name, "fixer");
+        assert!(reply.label.starts_with("a follow-up"), "{}", reply.label);
+        type_in(&mut app, "now the docs");
+        let sent = Action::Reply {
+            name: "fixer".into(),
+            text: "now the docs".into(),
+        };
+        assert_eq!(press(&mut app, KeyCode::Enter), Some(sent));
+    }
+
+    #[test]
+    fn a_reply_box_takes_a_paste_whole() {
+        let mut app = App::new(None);
+        let agent = SessionInfo {
+            front: Some(Front::Agent {
+                program: "claude".into(),
+                name: "Claude Code".into(),
+            }),
+            ..session("claude")
+        };
+        app.set_sessions(vec![agent]);
+        press(&mut app, KeyCode::Char(' '));
+        assert!(
+            app.reply()
+                .unwrap()
+                .label
+                .starts_with("its agent's next prompt")
+        );
+        assert_eq!(app.on_paste("line one\nline two".into()), None);
+        assert_eq!(app.reply().unwrap().text.text(), "line one\nline two");
     }
 }

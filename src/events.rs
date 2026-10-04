@@ -12,6 +12,7 @@
 use crate::artifacts;
 use crate::flow_run::{FlowRun, StepState};
 use crate::memory::{self, Entry};
+use crate::messages::{self, Sender};
 use crate::plugin_manifest;
 use crate::project;
 use crate::protocol::{
@@ -39,6 +40,7 @@ pub enum Kind {
     SessionReleased,
     SubagentStarted,
     SubagentStopped,
+    SessionMessage,
     TaskOpened,
     TaskStarted,
     TaskWaiting,
@@ -67,7 +69,7 @@ pub enum Kind {
 }
 
 impl Kind {
-    pub const ALL: [Kind; 37] = [
+    pub const ALL: [Kind; 38] = [
         Kind::SessionStarted,
         Kind::SessionRenamed,
         Kind::SessionWorking,
@@ -80,6 +82,7 @@ impl Kind {
         Kind::SessionReleased,
         Kind::SubagentStarted,
         Kind::SubagentStopped,
+        Kind::SessionMessage,
         Kind::TaskOpened,
         Kind::TaskStarted,
         Kind::TaskWaiting,
@@ -122,6 +125,7 @@ impl Kind {
             Kind::SessionReleased => "session.released",
             Kind::SubagentStarted => "subagent.started",
             Kind::SubagentStopped => "subagent.stopped",
+            Kind::SessionMessage => "session.message",
             Kind::TaskOpened => "task.opened",
             Kind::TaskStarted => "task.started",
             Kind::TaskWaiting => "task.waiting",
@@ -225,6 +229,8 @@ pub struct Event {
     /// The subagent a session's agent started, or that finished.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subagent: Option<Subagent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<MessageAbout>,
 }
 
 /// The session an event is about, as it was then.
@@ -323,6 +329,20 @@ pub struct PluginAbout {
     pub why: String,
 }
 
+/// A message a session was sent with `crystal send`, or from the TUI.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageAbout {
+    /// The session that sent it, by name, when another session did; `None`
+    /// from the user, or a script.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+    /// That session's id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_id: Option<String>,
+    /// The first line of what it says, after the line saying who sent it.
+    pub line: String,
+}
+
 /// The daemon, handed over to another crystal: the version it runs now,
 /// and how many sessions carried on through it. The version it ran before
 /// is the event's `from`.
@@ -354,6 +374,7 @@ impl Event {
             handoff: None,
             daemon: None,
             subagent: None,
+            message: None,
         }
     }
 
@@ -642,6 +663,24 @@ impl Event {
         }
     }
 
+    /// `session` was sent `text`: by the session `from`, whose header
+    /// starts it, or by the user.
+    pub fn message(session: &SessionInfo, from: Option<&Sender>, text: &str) -> Event {
+        let said = match from {
+            Some(_) => text.split_once('\n').map_or("", |(_, said)| said),
+            None => text,
+        };
+        let message = MessageAbout {
+            from: from.map(|sender| sender.name.clone()),
+            from_id: from.map(|sender| sender.id.clone()),
+            line: first_line(said),
+        };
+        Event {
+            message: Some(message),
+            ..Event::about_session(Kind::SessionMessage, session)
+        }
+    }
+
     /// The daemon, which ran crystal `from`, was handed over to this one,
     /// and `sessions` carried on through it.
     pub fn handed_over(from: &str, version: &str, sessions: usize) -> Event {
@@ -714,6 +753,10 @@ impl Event {
                     }
                 })
             }
+            Kind::SessionMessage => self.message.as_ref().map_or(String::new(), |message| {
+                let from = message.from.as_deref().unwrap_or("you");
+                format!("from {from}: {}", message.line)
+            }),
             Kind::SessionEnded => self
                 .session
                 .as_ref()
@@ -971,6 +1014,11 @@ pub fn example(kind: Kind, session: Option<&SessionInfo>, dir: &Path) -> Event {
                 },
                 subagent,
             )
+        }
+        Kind::SessionMessage => {
+            let from = Sender::new("p8w2…", "scout", None);
+            let text = messages::compose(&from, "The codec moved to crates/codec");
+            Event::message(&session, Some(&from), &text)
         }
         Kind::TaskOpened | Kind::TaskStarted | Kind::TaskWaiting => {
             Event::task(kind, &session, task)

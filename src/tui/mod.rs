@@ -34,6 +34,7 @@ mod plugins_view;
 mod preview;
 mod profiles;
 mod pull_requests;
+mod reply;
 mod review;
 pub(crate) mod screen_widget;
 mod search;
@@ -180,6 +181,11 @@ pub enum Event {
         project: PathBuf,
         number: u64,
         read: Result<PullRequestDetail, String>,
+    },
+    /// A reply was sent to the session called `name`, or why it wasn't.
+    Replied {
+        name: String,
+        sent: Result<(), String>,
     },
     /// A comment was posted on `topic`, or why it wasn't.
     Commented {
@@ -833,6 +839,11 @@ impl Tui {
                 number,
                 read,
             } => self.app.set_pull_request(&project, number, read),
+            Event::Replied { name, sent } => {
+                self.app.replied(&name, sent);
+                // A background task's follow-up has started a run.
+                let _ = self.refresh_sessions();
+            }
             Event::Commented {
                 project,
                 topic,
@@ -1165,6 +1176,26 @@ impl Tui {
             Action::Interrupt(name) => {
                 drive::interrupt(&self.socket, &name)?;
                 self.refresh_sessions()?;
+            }
+            Action::Reply { name, text } => {
+                // Typing into a terminal takes a moment, off the loop. From
+                // the user, it goes as typed: no session is said to send it,
+                // even when the TUI runs in one.
+                let socket = self.socket.clone();
+                self.read_in_background(move || {
+                    let request = Request::Send {
+                        name: name.clone(),
+                        text,
+                        enter: true,
+                        from: None,
+                        force: false,
+                    };
+                    let sent = client::ask(&socket, &request, false)
+                        .and_then(|answer| answer.context("no daemon is running"))
+                        .map(|_| ())
+                        .map_err(|err| format!("{err:#}"));
+                    Event::Replied { name, sent }
+                });
             }
             Action::ListBacklog(dir) => self.list_backlog(dir),
             Action::ChangeBacklog { dir, change } => {

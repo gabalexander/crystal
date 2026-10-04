@@ -87,11 +87,20 @@ pub enum Request {
         name: String,
         env: BTreeMap<String, String>,
     },
-    /// Type `text` into a session, then press Enter if `enter` is set.
+    /// Type `text` into a session, then press Enter if `enter` is set; a
+    /// background task takes it as a follow-up. An agent asking the user
+    /// something takes nothing, unless `force` says to type it all the same.
     Send {
         name: String,
         text: String,
         enter: bool,
+        /// The id of the session it comes from, when it's sent from one:
+        /// the message then says so, and counts toward what that session
+        /// may send in a minute. `None` from the user, a script or the TUI.
+        #[serde(default)]
+        from: Option<String>,
+        #[serde(default)]
+        force: bool,
     },
     /// Press keys in a session: each one a key name, like `Enter` or
     /// `C-c`, or else text typed as it is, never as a paste.

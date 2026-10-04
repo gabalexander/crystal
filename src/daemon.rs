@@ -25,6 +25,7 @@ use crate::layout::{Layout, Order};
 use crate::layout_relay::{NoTui, Relay};
 use crate::mcp;
 use crate::memory::{self, Added};
+use crate::messages::{self, Sender};
 use crate::names;
 use crate::notify::{self, Notice};
 use crate::plugin_hooks;
@@ -132,6 +133,7 @@ pub fn run(socket: &Path, handover: Option<RawFd>) -> Result<()> {
         preparing: Arc::default(),
         handoff: Mutex::default(),
         layout: Relay::new(),
+        sends: messages::Guard::default(),
     });
     // A daemon starts again after every upgrade, or is handed over to the
     // new crystal, so this is where the skill an earlier crystal installed
@@ -243,6 +245,9 @@ struct Daemon {
     handoff: Mutex<()>,
     /// The TUIs that take layout commands, which go to the one used last.
     layout: Relay,
+    /// How many messages each session has sent others in the last minute,
+    /// which `crystal send` holds to a most.
+    sends: messages::Guard,
 }
 
 /// What [`Daemon::prepare_embeddings`] is doing, or why it failed.
@@ -1321,6 +1326,93 @@ impl Daemon {
         Ok(named(&mut sessions, name)?.is_task())
     }
 
+    /// Types `text` into the session called `name`, and presses Enter after
+    /// it with `enter`; a task takes it as a follow-up, another run that
+    /// carries its conversation on. Sent from another session, the one
+    /// with id `from`, it's tidied, says which session sent it, and counts
+    /// toward what that session may send in a minute. An agent asking the
+    /// user something takes nothing, unless `force` says to type it anyway.
+    fn send(
+        &self,
+        name: &str,
+        text: &str,
+        enter: bool,
+        from: Option<&str>,
+        force: bool,
+    ) -> Result<Response> {
+        // In a block of its own, so the sessions are let go before the
+        // typing below, which takes a moment.
+        let (text, info, sender) = {
+            let mut sessions = self.sessions.lock().unwrap();
+            // A sender the daemon doesn't know, say one killed since, sends
+            // as a script would.
+            let sender = from.and_then(|id| {
+                let session = sessions.iter().find(|session| session.id == id)?;
+                let info = session.info();
+                Some(Sender::new(&info.id, &info.name, info.task.as_ref()))
+            });
+            let text = match &sender {
+                Some(_) => messages::tidy(text)?,
+                None => text.to_string(),
+            };
+            let session = named(&mut sessions, name)?;
+            ensure!(session.is_running(), "{name} has ended");
+            if let Some(sender) = &sender {
+                ensure!(
+                    sender.id != session.id,
+                    "{name} is this session: a session can't send a message to itself"
+                );
+            }
+            if let Some(why) = session.blocked().filter(|_| !force) {
+                bail!(messages::blocked(name, &why, session.is_task()));
+            }
+            // Counted only once it can go, so a refused send costs nothing.
+            if let Some(sender) = &sender {
+                self.sends.admit(&sender.id, Instant::now())?;
+            }
+            let text = match &sender {
+                Some(sender) => messages::compose(sender, &text),
+                None => text,
+            };
+            if session.is_task() {
+                let prompted = session.prompt(&text);
+                let info = session.info();
+                drop(sessions);
+                return self.sent(prompted, &info, sender.as_ref(), &text);
+            }
+            (text, session.info(), sender)
+        };
+        let typed = self.running_term(name).and_then(|term| {
+            term.write(&typing::keystrokes(&text, term.wants_bracketed_paste()))?;
+            if enter {
+                thread::sleep(typing::ENTER_PAUSE);
+                term.write(typing::ENTER)?;
+            }
+            Ok(())
+        });
+        self.sent(typed, &info, sender.as_ref(), &text)
+    }
+
+    /// What came of sending `text` to the session `info` is about, from
+    /// `sender`: sent, it's an event; not sent after all, the sender has it
+    /// back from what it may send in a minute.
+    fn sent(
+        &self,
+        sent: Result<()>,
+        info: &SessionInfo,
+        sender: Option<&Sender>,
+        text: &str,
+    ) -> Result<Response> {
+        if let Err(err) = sent {
+            if let Some(sender) = sender {
+                self.sends.give_back(&sender.id);
+            }
+            return Err(err);
+        }
+        self.events.emit(Event::message(info, sender, text));
+        Ok(Response::Done)
+    }
+
     /// The terminal of the session called `name`, to type into, which
     /// only makes sense while its program runs. The sessions are let go
     /// before any typing, which takes a moment. A session typed into by
@@ -1525,27 +1617,13 @@ impl Daemon {
                 Ok(Response::Done)
             }
             Request::Respawn { name, env } => self.respawn(&name, env),
-            Request::Send { name, text, enter } => {
-                // In a block of its own, so the sessions are let go before
-                // the typing below, which takes a moment.
-                {
-                    let mut sessions = self.sessions.lock().unwrap();
-                    let session = named(&mut sessions, &name)?;
-                    // A task takes text as a follow-up: another run that
-                    // carries its conversation on.
-                    if session.is_task() {
-                        session.prompt(&text)?;
-                        return Ok(Response::Done);
-                    }
-                }
-                let term = self.running_term(&name)?;
-                term.write(&typing::keystrokes(&text, term.wants_bracketed_paste()))?;
-                if enter {
-                    thread::sleep(typing::ENTER_PAUSE);
-                    term.write(typing::ENTER)?;
-                }
-                Ok(Response::Done)
-            }
+            Request::Send {
+                name,
+                text,
+                enter,
+                from,
+                force,
+            } => self.send(&name, &text, enter, from.as_deref(), force),
             Request::SendKeys { name, keys } => {
                 ensure!(
                     !self.is_task(&name)?,

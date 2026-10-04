@@ -38,6 +38,7 @@ mod memory;
 mod memory_cli;
 mod mermaid;
 mod mermaid_cli;
+mod messages;
 mod names;
 mod notify;
 mod plugin_cli;
@@ -415,6 +416,11 @@ enum Command {
         /// Type the text without pressing Enter.
         #[arg(long)]
         no_enter: bool,
+
+        /// Type it even while the agent is asking the user something, which
+        /// is refused otherwise: the text would land in the question.
+        #[arg(long)]
+        force: bool,
 
         /// Then wait for the turn it starts to end, and print how it ended.
         #[arg(long)]
@@ -1306,10 +1312,11 @@ fn run(cli: Cli) -> Result<()> {
             name,
             text,
             no_enter,
+            force,
             wait,
             timeout,
         } => {
-            drive::send(&socket, &name, &text.join(" "), !no_enter)?;
+            drive::send(&socket, &name, &text.join(" "), !no_enter, force)?;
             if wait {
                 drive::wait_for_turn(&socket, &name, seconds(timeout))?;
             }
