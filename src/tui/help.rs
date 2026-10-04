@@ -67,6 +67,8 @@ pub const KEYS: &[Key] = &[
     mouse("click", "a session, pane, tab"),
     mouse("right click", "a menu of what it does"),
     mouse("wheel/drag", "scroll / select, copy"),
+    mouse("2×/3× click", "select a word / a line"),
+    mouse("scrollbar", "drag it to scroll"),
     mouse("Ctrl+click", "open a link"),
 ];
 
@@ -578,7 +580,7 @@ mod tests {
                 assert!(matches!(last, Some(Entry::Key(_))), "{room}: {column:?}");
             }
         }
-        // At 80 by 24 the mouse's three keys go together.
+        // At 80 by 24 the mouse's keys go together.
         let columns = flow(&rows, 21);
         let mouse_headings = columns
             .iter()

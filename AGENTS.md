@@ -83,7 +83,9 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   - `mod.rs`: the event loop: one channel of events, then update and draw (not for a move of the mouse that
     changes nothing), opening the link a Ctrl+click or copy mode's `o` asks for, bringing the TUI's terminal to
     the front for `pane focus --raise`, and ringing the user's terminal for a pane's bell or a session marked as
-    having rung
+    having rung; taking the mouse from the terminal or leaving it there (`[mouse] capture`), counting clicks
+    for double- and triple-clicks, and scrolling a pane's history on a timer while a drag selecting in it is
+    held past its edge
   - `app.rs`: the state and how keys and the mouse change it: a sidebar key looked up in the keymap and its
     command run, from the sidebar, the `:` list or after the prefix in a pane; the sidebar's width, folded or
     not, and what needs the user pinned at its top; no I/O, so it's unit-tested
@@ -93,7 +95,10 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   - `layout_link.rs`: the TUI's end of the layout commands: offering the daemon to take them, again at once
     after a handover or a restart, each one an event for the loop, and its answers, that it was used (a
     key, the mouse, a paste, focus gained) and when its terminal gains and loses the focus  sent back
-  - `ui.rs`: the layout and drawing (top bar and its tabs, pane headers, footer), and what's under the mouse
+  - `ui.rs`: the layout and drawing (top bar and its tabs, pane headers, footer, the column each pane's
+    scrollbar takes), and what's under the mouse
+  - `scrollbar.rs`: a pane's scrollbar: where its thumb is for how far back the pane is, how far back a
+    dragged thumb takes it, and drawing it; pure, so it's unit-tested
   - `tabs.rs`: tabs, as many as the user likes, each holding its own sessions (each session in exactly one)
     with its own selection, its tree of panes, the session the selection's pane last showed and the session
     floating over them, their order and which is in front; the sidebar shows only that tab's sessions. Kept apart from I/O; the event loop keeps
@@ -157,7 +162,9 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   - `backlog_view.rs`: the backlog view `b` opens: its state and keys, kept apart from I/O, and its
     drawing
   - `pane.rs`: a viewer of a session on screen, the selected one or a split, and its screen, with copy mode
-    over it while that's on
+    over it while that's on; what the mouse selects on it, by characters, words or lines (`Clicks` counts
+    them), following the history as a drag scrolls it, kept in copy mode without `copy_on_select`, and its
+    scrollbar's thumb dragged
   - `copy_mode.rs`: copy mode (`v`): vi's keys over a pane's screen and history, selecting, searching, the
     text to copy, and `o` for the link under the cursor; works on the screen, kept apart from I/O
   - `screen_widget.rs`: draws a session's screen into ratatui, for the panes and `crystal attach`, with the
@@ -197,7 +204,7 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   - `away.rs`: "while you were away": when the user is gone (a quit, the terminal's focus lost for a while, or
     no key for a while where focus isn't told), what the event log gained meanwhile counted into the
     footer's line, and the latest event seen, which the event loop keeps in the database
-  - `settings_view.rs`: the settings view (`,`): notifications, sounds, the theme, the distiller and search by meaning,
+  - `settings_view.rs`: the settings view (`,`): notifications, sounds, the theme, the mouse, the distiller and search by meaning,
     each changed with a key, and how the models stand; the event loop writes the file (`config::set`) and,
     while it's open, reads the settings and the daemon's `EmbeddingStatus` again every half a second
 - `src/daemon.rs`: the daemon: listens on the socket and owns the sessions, and emits an event wherever something
@@ -260,8 +267,9 @@ whenever what's handed over changes in a way the crystal before couldn't read.
 - `src/vt.rs`: a terminal's screen, through `alacritty_terminal`: what a program drew and its history, the modes
   it set, its answers to the program's questions (the daemon's screen only), the output that catches a new viewer
   up (its hyperlinks included), the cells to draw, the input modes `crystal attach` asks your terminal for, and,
-  for a viewer, copy mode's cursor, selection and search, which are Alacritty's vi mode, and the link on a cell:
-  a hyperlink a program wrote (OSC 8), or a URL in the text across the rows it wrapped onto, as `vt::Link`; the
+  for a viewer, copy mode's cursor, selection (of characters, words, lines or a block) and search, which are
+  Alacritty's vi mode, and the link on a cell: a hyperlink a program wrote (OSC 8), or a URL in the text across
+  the rows it wrapped onto, as `vt::Link`; the
   times the program rang the bell; the progress a program reports (OSC 9;4), picked out of its output, which
   alacritty_terminal passes over; and a screen saved for a handover, both its screens and the history, and
   restored. The only module that uses
@@ -335,7 +343,7 @@ whenever what's handed over changes in a way the crystal before couldn't read.
 - `src/work.rs`: `crystal done` (with `--artifact`), `handoff`, `tasks` and its commands (`new`, `start`, `show`,
   `cancel`, `log`), and `backlog`
 - `src/config.rs`: the settings in `~/.config/crystal/config.toml`, read and checked: a theme by any of its
-  names, and the colors `[colors]` takes
+  names, the colors `[colors]` takes, and what the mouse does (`[mouse]`)
 - `src/memory.rs`: what a project's sessions learned: the SQLite store in the state directory with its FTS5
   index (bm25, prefix and porter-stemmed words), each entry's vector and search by meaning merged with it by
   reciprocal rank fusion, then the reranker's read of the best (nothing when none answers), its migrations,
@@ -418,9 +426,10 @@ whenever what's handed over changes in a way the crystal before couldn't read.
 - `src/shell.rs`: quoting arguments and writing paths with `~`, the way a shell reads them
 - `tests/cli.rs`: end-to-end tests that drive the real binary against a private daemon (and read its database
   beside its socket to see what it wrote down), with a config of
-  their own that turns notifications, sounds, the memory plugin and naming sessions from their prompts off (a
-  test of memory or naming turns it back on, and `CRYSTAL_NO_SOUND` keeps sounds off even then; memory's models
-  are kept out by a cache that can't hold them and `CRYSTAL_NO_MODEL_DOWNLOAD`), plugins
+  their own that turns notifications, sounds, the memory plugin, naming sessions from their prompts and panes'
+  scrollbars off (a test of memory, naming or the scrollbar turns it back on, and `CRYSTAL_NO_SOUND` keeps
+  sounds off even then; memory's models are kept out by a cache that can't hold them and
+  `CRYSTAL_NO_MODEL_DOWNLOAD`), plugins
   of their own in its plugins directory, and a Claude Code config directory of their own (`CLAUDE_CONFIG_DIR`),
   since a daemon brings the skill there up to date as it starts; a test that opens the new-session panel pins `PATH` to its fake
   agents, so no real agent is found or run, and a background task's `claude` is a fake that speaks stream-json,
