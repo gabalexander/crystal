@@ -10307,6 +10307,12 @@ fn an_issue_takes_a_comment_and_a_new_title() {
     let hold = crystal.dir.path().join("gh-hold-issues");
     std::fs::write(&hold, "").unwrap();
     tui.type_keys("i");
+    // The issue is read whole as the view opens, apart from the list: once
+    // the forge has been asked for it, its text shows.
+    let gh_calls = crystal.dir.path().join("gh-calls");
+    eventually("the forge is asked for issue #42 whole", || {
+        calls(&gh_calls).contains("issue view 42 --json body,comments")
+    });
     tui.shows("The login page sends you back to itself.");
     tui.shows("Me too, on Safari.");
     tui.shows("asking GitHub");
@@ -10315,7 +10321,6 @@ fn an_issue_takes_a_comment_and_a_new_title() {
     tui.shows("comment on #42");
     tui.type_keys("Same here\r");
     tui.shows("commented on #42");
-    let gh_calls = crystal.dir.path().join("gh-calls");
     let input = crystal.dir.path().join("gh-input");
     assert!(calls(&gh_calls).contains("issue comment 42 --body-file -"));
     assert_eq!(std::fs::read_to_string(&input).unwrap(), "Same here");
