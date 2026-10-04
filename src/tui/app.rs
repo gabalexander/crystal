@@ -2360,6 +2360,8 @@ impl App {
         match (kind, hit) {
             (_, Hit::Tab(index)) if click => self.go_to_tab(index),
             (_, Hit::SidebarRow(row)) if click => self.click_row(row),
+            // Anywhere else in the sidebar, the click only takes the keyboard.
+            (_, Hit::Sidebar) if click => self.focus = Focus::Sidebar,
             (_, Hit::Border { split, .. }) if click && !self.zoomed() => self.border = Some(split),
             (_, Hit::Pane { slot, cell }) if click => {
                 // A click hands a pane the keyboard, but copy mode keeps it.
@@ -2428,17 +2430,16 @@ impl App {
         self.view.is_none() && !self.showing_keys() && !self.waiting_on_keyboard()
     }
 
-    /// A click on a sidebar row: on a session, or a worktree with none,
-    /// selects it and gives the sidebar the keyboard. Headings don't do
-    /// anything.
+    /// A click on a sidebar row gives the sidebar the keyboard, and on a
+    /// session, or a worktree with none, selects it. A heading leaves the
+    /// selection where it was.
     fn click_row(&mut self, row: usize) {
+        self.focus = Focus::Sidebar;
         let rows = self.rows();
-        let Some(row) = rows.get(row) else {
-            return;
-        };
-        if matches!(row, Row::Session(_) | Row::Task(_) | Row::NoSessions(_)) {
+        if let Some(row) = rows.get(row)
+            && matches!(row, Row::Session(_) | Row::Task(_) | Row::NoSessions(_))
+        {
             self.select_row(row);
-            self.focus = Focus::Sidebar;
         }
     }
 
@@ -6874,6 +6875,23 @@ mod tests {
         press(&mut app, KeyCode::Enter);
         app.on_mouse(CLICK, Hit::SidebarRow(row_of(&app, "b")));
         assert_eq!(app.focus(), Focus::Sidebar);
+    }
+
+    #[test]
+    fn clicking_anywhere_in_the_sidebar_gives_it_the_keyboard() {
+        let mut app = app_with(&["a", "b"]);
+        press(&mut app, KeyCode::Enter);
+        app.on_mouse(CLICK, Hit::Sidebar);
+        assert_eq!(app.focus(), Focus::Sidebar);
+        assert_eq!(selected_name(&app), Some("a"));
+
+        // A heading takes the keyboard too, the selection staying put.
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.focus(), Focus::Pane(Slot::Selected));
+        assert!(matches!(app.rows()[0], Row::OutsideGit));
+        app.on_mouse(CLICK, Hit::SidebarRow(0));
+        assert_eq!(app.focus(), Focus::Sidebar);
+        assert_eq!(selected_name(&app), Some("a"));
     }
 
     #[test]
