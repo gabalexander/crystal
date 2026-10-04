@@ -440,6 +440,7 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::widgets::{Paragraph, Wrap};
+    use std::time::Instant;
 
     fn issue(number: u64, title: &str, label: &str) -> Issue {
         Issue {
@@ -571,7 +572,7 @@ mod tests {
             body: "It loops.".into(),
             comments: Vec::new(),
         };
-        view.list.set_detail(42, Ok(detail));
+        view.list.set_detail(42, Ok(detail), Instant::now());
         ctrl(&mut view, 'e');
         type_text(&mut view, " forever");
         let step = press(&mut view, KeyCode::Enter);

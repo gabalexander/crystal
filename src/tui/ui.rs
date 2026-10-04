@@ -2022,6 +2022,7 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use std::path::PathBuf;
+    use std::time::Instant;
 
     fn theme() -> Theme {
         Theme::new(ThemeName::DARK, false)
@@ -2188,6 +2189,7 @@ mod tests {
         app.set_pull_requests(
             PathBuf::from("/code/app"),
             Ok((Forge::GitHub, vec![pull_request])),
+            Instant::now(),
         );
         let press = |app: &mut App, code| app.on_key(KeyEvent::new(code, KeyModifiers::NONE));
         press(&mut app, KeyCode::Char('/'));
@@ -2541,7 +2543,11 @@ mod tests {
             pull_request(2, true, false),
             pull_request(3, false, true),
         ];
-        app.set_pull_requests(PathBuf::from("/code/app"), Ok((Forge::GitHub, listed)));
+        app.set_pull_requests(
+            PathBuf::from("/code/app"),
+            Ok((Forge::GitHub, listed)),
+            Instant::now(),
+        );
         let top = |app: &App, width: u16| {
             let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
             let theme = theme();

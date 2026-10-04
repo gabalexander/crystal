@@ -321,9 +321,15 @@ impl TreeBrowser {
         Some((tree.files, self.matching))
     }
 
+    /// Keys: the preview's scroll keys, then the tree's (`↑` and `↓`, `→`
+    /// and `←`, Enter), `Ctrl+E`, `Ctrl+Y` and `Ctrl+R`, and the rest edit
+    /// the filter, as a text box does. `Ctrl` or `Alt` with an arrow is
+    /// the filter's, a word back or on, and so are `Ctrl+A`, `Ctrl+Home`
+    /// and `Ctrl+End`, to its ends: `Home`, `End` and `Ctrl+E` are taken.
     pub fn on_key(&mut self, key: KeyEvent) -> Outcome {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        let by_word = ctrl || key.modifiers.contains(KeyModifiers::ALT);
         if self.preview.scroll_key(&key) {
             return Outcome::Stay;
         }
@@ -338,8 +344,8 @@ impl TreeBrowser {
             KeyCode::Down if !shift => doing(self.select_by(1)),
             KeyCode::Char('p') if ctrl => doing(self.select_by(-1)),
             KeyCode::Char('n') if ctrl => doing(self.select_by(1)),
-            KeyCode::Right => doing(self.open_selected()),
-            KeyCode::Left => doing(self.fold_selected()),
+            KeyCode::Right if !by_word => doing(self.open_selected()),
+            KeyCode::Left if !by_word => doing(self.fold_selected()),
             KeyCode::Char('e') if ctrl => match self.selected_file() {
                 Some(path) => Outcome::Edit {
                     line: self.preview.top_line(path),
@@ -856,6 +862,36 @@ mod tests {
         browser.on_key(key(KeyCode::Home));
         assert_eq!(browser.preview.scroll, 0);
         assert_eq!(browser.filter.text(), "");
+    }
+
+    #[test]
+    fn ctrl_or_alt_with_the_arrows_and_ctrl_with_home_and_end_move_in_the_filter() {
+        let mut browser = browser_of(&["a/sub/z.rs", "a/x.rs"]);
+        type_text(&mut browser, "a/sub/z");
+        let with = |code, modifiers| KeyEvent::new(code, modifiers);
+        let mut cursor_after = |key| {
+            assert_eq!(browser.on_key(key), Outcome::Stay);
+            browser.filter.cursor()
+        };
+        assert_eq!(cursor_after(with(KeyCode::Left, KeyModifiers::CONTROL)), 6);
+        assert_eq!(cursor_after(with(KeyCode::Left, KeyModifiers::ALT)), 2);
+        assert_eq!(cursor_after(with(KeyCode::Home, KeyModifiers::CONTROL)), 0);
+        assert_eq!(cursor_after(with(KeyCode::Right, KeyModifiers::ALT)), 1);
+        assert_eq!(cursor_after(with(KeyCode::Right, KeyModifiers::CONTROL)), 5);
+        assert_eq!(cursor_after(with(KeyCode::End, KeyModifiers::CONTROL)), 7);
+        assert_eq!(cursor_after(ctrl('a')), 0);
+        // The tree and the preview stay as they were.
+        assert_eq!(browser.filter.text(), "a/sub/z");
+        assert_eq!(browser.selected_path(), Some("a/sub/z.rs"));
+        assert_eq!(browser.preview.scroll, 0);
+        // Without them, the arrows are the tree's again.
+        browser.on_key(key(KeyCode::Left));
+        assert_eq!(
+            browser.selected_path(),
+            Some("a/sub"),
+            "up to its directory"
+        );
+        assert_eq!(browser.filter.cursor(), 0);
     }
 
     #[test]

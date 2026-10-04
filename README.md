@@ -224,6 +224,9 @@ has the keyboard; there, your terminal's own selection still works with a key he
 pager or `man`, keeps no history for the wheel to scroll, so a notch sends it the arrow keys instead, Up or Down
 as many times as it would scroll lines, the way xterm's alternate scroll does; a program that turns that off
 (`\e[?1007l`) gets nothing. Copy mode and a selection being dragged keep the wheel scrolling the pane.
+`crystal attach` leaves the mouse to your terminal, and has it send the arrow keys for the wheel the same way,
+only while the program is on the alternate screen: a shell at its prompt doesn't page through its history as
+you scroll.
 
 Beside each pane's screen, in a column of its own, a scrollbar shows where in its history the pane is, once it
 has some: drag its thumb to scroll, or click the track and the thumb jumps there. The wheel over it scrolls the
@@ -654,7 +657,8 @@ A word is letters and digits, as readline has it: spaces and punctuation, `/`, `
 between words. macOS's terminals send `Alt+B` and `Alt+F` for `Option+←` and `Option+→`, once `Option` is set
 to act as `Meta` (`Alt`). A view keeps the keys it had: `Ctrl+E` is the new-session panel's command line, the
 issues view's edit and the tree browser's editor, so `End` goes to the end there, and the tree browser's arrows,
-`Home` and `End` are its tree's and its preview's.
+`Home` and `End` are its tree's and its preview's, so its filter takes the arrows with `Ctrl` or `Alt` for a word,
+and `Ctrl+Home` and `Ctrl+End` for its ends.
 
 `:` opens the command list: every command by its name, with what it does and its key, and your plugins'
 actions after them. Type a little of a name, or of what it does, and `Enter` runs the one the bar is on, as
@@ -1071,6 +1075,9 @@ author. It opens on the issues listed last, and `Ctrl+R` asks the forge again.
 | `Ctrl+R` | ask the forge for the list again, and the selected one with it |
 | `Esc` | close the list |
 
+A title and text you give an issue stay, even when the forge answers a list or a read it was asked for before
+it saved them, which may not have them yet; what it says after that goes, should someone change them again.
+
 #### On GitLab
 
 Everything above works on a GitLab project, through `glab`, with merge requests where GitHub has pull requests.
@@ -1097,6 +1104,8 @@ tree and the preview to make the tree wider or narrower.
 |---|---|
 | `↑` / `↓` | the file or directory above or below |
 | `→` / `←` | open a directory, or go into one that's open; fold it, or go up to the directory a file is in |
+| `Ctrl+←` / `Ctrl+→`, `Alt+←` / `Alt+→` | a word back, or on, in what's typed |
+| `Ctrl+A`, `Ctrl+Home` / `Ctrl+End` | to the start, or the end, of what's typed |
 | `Enter` | open or fold a directory; read a file into the preview again, with whatever an agent changed since |
 | `Space` / `Shift+Space`, `PageDown` / `PageUp` | page through the preview |
 | `Home` / `End`, `Shift+↑` / `Shift+↓` | the top or end of the preview; a line up or down |

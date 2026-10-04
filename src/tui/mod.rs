@@ -178,10 +178,12 @@ pub enum Event {
     OutputEnded {
         pane: u64,
     },
-    /// What its forge said about the open pull requests of a project.
+    /// What its forge said about the open pull requests of a project, and
+    /// when it was asked.
     PullRequests {
         project: PathBuf,
         found: Result<(Forge, Vec<PullRequest>), String>,
+        asked: Instant,
     },
     /// What git counted of the worktree at `path`, or `None` when it
     /// couldn't say.
@@ -209,22 +211,27 @@ pub enum Event {
         path: PathBuf,
         branch: String,
     },
-    /// What its forge said about the open issues of a project.
+    /// What its forge said about the open issues of a project, and when it
+    /// was asked.
     Issues {
         project: PathBuf,
         found: Result<(Forge, Vec<Issue>), String>,
+        asked: Instant,
     },
-    /// One of a project's issues, read whole.
+    /// One of a project's issues, read whole, and when it was asked for.
     IssueRead {
         project: PathBuf,
         number: u64,
         read: Result<IssueDetail, String>,
+        asked: Instant,
     },
-    /// One of a project's pull requests, read whole.
+    /// One of a project's pull requests, read whole, and when it was asked
+    /// for.
     PullRequestRead {
         project: PathBuf,
         number: u64,
         read: Result<PullRequestDetail, String>,
+        asked: Instant,
     },
     /// A reply was sent to the session called `name`, or why it wasn't.
     Replied {
@@ -237,12 +244,14 @@ pub enum Event {
         topic: Topic,
         posted: Result<(), String>,
     },
-    /// An issue was given a new title and text, or why it wasn't.
+    /// An issue was given a new title and text, or why it wasn't, and when
+    /// the forge answered: what it's asked from then on has them.
     IssueEdited {
         project: PathBuf,
         number: u64,
         edit: (String, String),
         saved: Result<(), String>,
+        at: Instant,
     },
     /// A pull request's worktree is there now: the start that waited on it
     /// can go on, in it.
@@ -1061,17 +1070,20 @@ impl Tui {
             return;
         };
         self.read_in_background(move || {
+            let asked = Instant::now();
             let repo = Repo::find(&project);
             match topic {
                 Topic::Issue(number) => Event::IssueRead {
                     read: repo.and_then(|repo| repo.issue(number)),
                     project,
                     number,
+                    asked,
                 },
                 Topic::PullRequest(number) => Event::PullRequestRead {
                     read: repo.and_then(|repo| repo.pull_request(number)),
                     project,
                     number,
+                    asked,
                 },
             }
         });
@@ -1129,7 +1141,11 @@ impl Tui {
             }
             Event::Flows(runs) => self.app.set_flows(runs),
             Event::Projects(projects) => self.set_known_projects(projects),
-            Event::PullRequests { project, found } => self.app.set_pull_requests(project, found),
+            Event::PullRequests {
+                project,
+                found,
+                asked,
+            } => self.app.set_pull_requests(project, found, asked),
             Event::Worktrees {
                 project,
                 worktrees,
@@ -1143,17 +1159,23 @@ impl Tui {
             Event::WorktreeHasChanges { path, branch } => {
                 self.app.ask_to_force_removal(path, branch);
             }
-            Event::Issues { project, found } => self.app.set_issues(&project, found),
+            Event::Issues {
+                project,
+                found,
+                asked,
+            } => self.app.set_issues(&project, found, asked),
             Event::IssueRead {
                 project,
                 number,
                 read,
-            } => self.app.set_issue(&project, number, read),
+                asked,
+            } => self.app.set_issue(&project, number, read, asked),
             Event::PullRequestRead {
                 project,
                 number,
                 read,
-            } => self.app.set_pull_request(&project, number, read),
+                asked,
+            } => self.app.set_pull_request(&project, number, read, asked),
             Event::Replied { name, sent } => {
                 self.app.replied(&name, sent);
                 // A background task's follow-up has started a run.
@@ -1169,7 +1191,8 @@ impl Tui {
                 number,
                 edit,
                 saved,
-            } => self.app.issue_edited(&project, number, edit, saved),
+                at,
+            } => self.app.issue_edited(&project, number, edit, saved, at),
             Event::Fetched(start) => {
                 self.list_worktrees_again();
                 self.carry_out(*start);
@@ -2127,21 +2150,36 @@ impl Tui {
             }
             Action::ListIssues(project) => {
                 self.read_in_background(move || {
+                    let asked = Instant::now();
                     let found = list_issues(&project);
-                    Event::Issues { project, found }
+                    Event::Issues {
+                        project,
+                        found,
+                        asked,
+                    }
                 });
             }
             Action::ListPullRequests(project) => {
                 self.read_in_background(move || {
+                    let asked = Instant::now();
                     let found = list_pull_requests(&project);
-                    Event::PullRequests { project, found }
+                    Event::PullRequests {
+                        project,
+                        found,
+                        asked,
+                    }
                 });
             }
             Action::FindPullRequests(projects) => {
                 for project in projects {
                     self.read_in_background(move || {
+                        let asked = Instant::now();
                         let found = list_pull_requests(&project);
-                        Event::PullRequests { project, found }
+                        Event::PullRequests {
+                            project,
+                            found,
+                            asked,
+                        }
                     });
                 }
             }
@@ -2173,6 +2211,7 @@ impl Tui {
                         number,
                         edit: (title, body),
                         saved,
+                        at: Instant::now(),
                     }
                 });
             }
@@ -3258,17 +3297,29 @@ fn spawn_forge_poller(projects: Arc<Mutex<Vec<PathBuf>>>, events: Sender<Event>)
             let wanted = projects.lock().unwrap().clone();
             for project in wanted {
                 if due(&asked, &project, PULL_REQUESTS_EVERY) {
-                    asked.insert(project.clone(), Instant::now());
+                    let now = Instant::now();
+                    asked.insert(project.clone(), now);
                     let found = list_pull_requests(&project);
                     let project = project.clone();
-                    if events.send(Event::PullRequests { project, found }).is_err() {
+                    let listed = Event::PullRequests {
+                        project,
+                        found,
+                        asked: now,
+                    };
+                    if events.send(listed).is_err() {
                         return;
                     }
                 }
                 if due(&asked_issues, &project, ISSUES_EVERY) {
-                    asked_issues.insert(project.clone(), Instant::now());
+                    let now = Instant::now();
+                    asked_issues.insert(project.clone(), now);
                     let found = list_issues(&project);
-                    if events.send(Event::Issues { project, found }).is_err() {
+                    let listed = Event::Issues {
+                        project,
+                        found,
+                        asked: now,
+                    };
+                    if events.send(listed).is_err() {
                         return;
                     }
                 }

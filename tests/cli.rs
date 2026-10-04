@@ -236,6 +236,14 @@ impl Terminal {
         self.screen.lock().unwrap().screen().bracketed_paste()
     }
 
+    /// Whether crystal last asked this terminal to have the wheel send the
+    /// arrow keys on its alternate screen (1007), which vt100 doesn't keep.
+    fn wheel_sends_arrows(&self) -> bool {
+        let written = self.written.lock().unwrap();
+        let written = String::from_utf8_lossy(&written);
+        written.rfind("\x1b[?1007h") > written.rfind("\x1b[?1007l")
+    }
+
     fn shows(&self, text: &str) {
         let deadline = Instant::now() + Duration::from_secs(5);
         while !self.text().contains(text) {
@@ -835,6 +843,31 @@ fn attach_asks_your_terminal_for_what_the_program_asked_and_gives_it_back() {
     terminal.shows("[detached from asker]");
     assert!(!terminal.marks_pastes());
     assert!(!terminal.sends_the_mouse());
+}
+
+#[test]
+fn attach_has_the_wheel_send_arrows_only_while_the_program_is_on_the_alternate_screen() {
+    let crystal = Crystal::new();
+    let script = "echo at the prompt; while [ ! -f paging ]; do sleep 0.05; done; \
+                  printf '\\033[?1049hin a pager'; sleep 30";
+    crystal.ok(&["new", "-n", "scroller", "sh", "-c", script]);
+
+    // Your terminal is on its alternate screen under the attach, but a
+    // shell on the main one would take the arrows for its history.
+    let mut terminal = crystal.attach(&["attach", "scroller"]);
+    terminal.shows("at the prompt");
+    terminal.wrote("\x1b[?1007l", 1);
+    assert!(!terminal.wheel_sends_arrows());
+
+    std::fs::write(crystal.dir.path().join("paging"), "").unwrap();
+    terminal.shows("in a pager");
+    eventually("the wheel sends arrows", || terminal.wheel_sends_arrows());
+
+    // Detached, your terminal has it as it was before.
+    terminal.type_keys("\x1c");
+    terminal.shows("[detached from scroller]");
+    terminal.wrote("\x1b[?1007s", 1);
+    terminal.wrote("\x1b[?1007r", 1);
 }
 
 #[test]
@@ -8315,7 +8348,9 @@ fn slash_filters_the_sidebar_and_enter_selects_the_match() {
 /// `pr diff` and `issue view` with a pull request and an issue of its own,
 /// and takes comments and edits. It writes each call it gets into
 /// `gh-calls` beside it, and what it's given on its standard input into
-/// `gh-input`. Returns the directory to put first on the PATH.
+/// `gh-input`. While `gh-hold-issues` is there, an `issue list` reads the
+/// issues as they are and waits to answer. Returns the directory to put
+/// first on the PATH.
 fn fake_gh(dir: &Path, pull_requests: &str, issues: &str) -> PathBuf {
     let bin = dir.join("gh-bin");
     std::fs::create_dir(&bin).unwrap();
@@ -8336,7 +8371,10 @@ case "$*" in
     "pr list "*) cat "{dir}/gh-prs.json" ;;
     "pr view "*) cat "{dir}/gh-pr.json" ;;
     "pr diff "*) cat "{dir}/forge.diff" ;;
-    "issue list "*) cat "{dir}/gh-issues.json" ;;
+    "issue list "*)
+        listed=$(cat "{dir}/gh-issues.json")
+        while [ -f "{dir}/gh-hold-issues" ]; do sleep 0.05; done
+        printf '%s\n' "$listed" ;;
     "issue view "*) cat "{dir}/gh-issue.json" ;;
     "pr comment "*|"issue comment "*|"issue edit "*) cat > "{dir}/gh-input" ;;
     *) echo "unexpected: $*" >&2; exit 1 ;;
@@ -8878,13 +8916,15 @@ fn an_issue_takes_a_comment_and_a_new_title() {
     let mut tui = crystal.attach_with_env(&[], &[("PATH", &path)]);
     tui.shows("▸ planner");
     // The issues are listed as the TUI starts, counted on the top bar, and
-    // again as the view opens, which says so meanwhile: a list that came
-    // after the title is changed below would put the old one back.
+    // again as the view opens, which says so meanwhile. That list is held
+    // until after the title is changed below.
     tui.shows("1 issue");
+    let hold = crystal.dir.path().join("gh-hold-issues");
+    std::fs::write(&hold, "").unwrap();
     tui.type_keys("i");
     tui.shows("The login page sends you back to itself.");
     tui.shows("Me too, on Safari.");
-    tui.hides("asking GitHub");
+    tui.shows("asking GitHub");
 
     tui.type_keys("\x03");
     tui.shows("comment on #42");
@@ -8906,6 +8946,12 @@ fn an_issue_takes_a_comment_and_a_new_title() {
         std::fs::read_to_string(&input).unwrap(),
         "The login page sends you back to itself."
     );
+
+    // The list asked before the change, with the old title, lands after
+    // it: the new title stays.
+    std::fs::remove_file(&hold).unwrap();
+    tui.hides("asking GitHub");
+    assert!(tui.text().contains("Fix login redirect on Safari"));
 }
 
 #[test]
