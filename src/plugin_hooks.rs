@@ -47,10 +47,17 @@ const FAILURES_TO_PAUSE: u32 = 5;
 pub fn follow(bus: &Arc<Bus>, socket: &Path) -> Arc<Hooks> {
     let hooks = Arc::new(Hooks::new(socket, Arc::downgrade(bus)));
     let following = hooks.clone();
+    // Subscribed before the daemon answers anyone, so the hooks hear what
+    // its first requests do.
+    let first = bus.subscribe(Filter::default());
     let bus = Arc::downgrade(bus);
     thread::spawn(move || {
-        while let Some(subscription) = bus.upgrade().map(|bus| bus.subscribe(Filter::default())) {
-            for event in subscription.feed {
+        let mut subscription = Some(first);
+        while let Some(subscribed) = subscription
+            .take()
+            .or_else(|| bus.upgrade().map(|bus| bus.subscribe(Filter::default())))
+        {
+            for event in subscribed.feed {
                 following.tell(&event);
             }
             // Dropped for falling behind: what was missed is lost, and the

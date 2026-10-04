@@ -73,6 +73,11 @@ impl ArchivedView {
         ))
     }
 
+    /// Whether a key typed is a character, not a move: while `x` asks.
+    pub fn typing(&self) -> bool {
+        self.deleting.is_some()
+    }
+
     pub fn on_key(&mut self, key: &KeyEvent) -> Step {
         if let Some((id, _)) = self.deleting.take() {
             return match key.code {

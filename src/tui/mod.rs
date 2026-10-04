@@ -78,10 +78,10 @@ use crate::project_commands::{self, Commands, Verb};
 use crate::protocol::{
     Backlog, NewSession, Request, Response, SessionInfo, Spending, State, Worktree,
 };
-use crate::{catalog, keys, links, socket, typing, update};
+use crate::{catalog, keys, links, names, socket, typing, update};
 use crate::{client, clipboard, drive, env, event_log, events, git};
 use anyhow::{Context as _, Result, bail};
-use app::{Action, App, Focus, Hit, Place, PluginKey, PluginPane, Slot};
+use app::{Action, App, Focus, Hit, Place, PluginKey, PluginPane, Popup, Slot};
 use appearance::Appearance;
 use backlog_view::BacklogChange;
 use crossterm::event::{
@@ -89,6 +89,7 @@ use crossterm::event::{
     MouseEventKind,
 };
 use diff_view::Against;
+use keymap::{CommandKind, KeyCommand, Sequence};
 use layouts::{Layouts, Which};
 use pane::Pane;
 use ratatui::DefaultTerminal;
@@ -696,7 +697,8 @@ impl Tui {
         self.app.set_screen(self.screen);
         self.sync_panes(&areas);
         if let Some(overlay) = &mut self.overlay {
-            let screen = ui::plugin_pane_screen(&areas);
+            let popup = self.app.plugin_pane().and_then(|pane| pane.popup.as_ref());
+            let screen = ui::plugin_pane_screen(&areas, popup);
             let size = (screen.height.max(1), screen.width.max(1));
             if overlay.size() != size {
                 overlay.resize(size.0, size.1);
@@ -1842,6 +1844,11 @@ impl Tui {
                 }
             }
             Action::ClosePluginPane => self.close_plugin_pane(),
+            Action::RunKeyCommand {
+                command,
+                dir,
+                context,
+            } => self.run_key_command(*command, dir, context)?,
             Action::ListLayouts => {
                 let found = self.layouts();
                 self.app.show_layouts(found, None);
@@ -2397,6 +2404,119 @@ impl Tui {
         Ok(())
     }
 
+    /// Runs one of the user's `[[keys.command]]`s in `dir`, about
+    /// `context`: a popup's in a session of its own shown over everything,
+    /// with the keyboard, until it ends; a pane's or a tab's in a session
+    /// of its own, typed into where the app made room for it; and a
+    /// shell's in the background.
+    fn run_key_command(
+        &mut self,
+        command: KeyCommand,
+        dir: Option<PathBuf>,
+        context: Context,
+    ) -> Result<()> {
+        let context = placed(context)?;
+        let dir = match dir.or_else(|| context.worktree.clone()) {
+            Some(dir) => dir,
+            None => std::env::current_dir()?,
+        };
+        let vars = key_command_env(&self.socket, &context);
+        let argv = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            command.command.clone(),
+        ];
+        if command.kind == CommandKind::Shell {
+            return self.run_in_background(&command, argv, &dir, vars);
+        }
+        let taken = list_sessions(&self.socket, false)?;
+        let base = names::from_prompt(command.label()).unwrap_or_else(|| "command".to_string());
+        let mut environment = env::current();
+        for (key, said) in vars {
+            match said {
+                Some(value) => environment.insert(key.to_string(), value),
+                None => environment.remove(key),
+            };
+        }
+        let request = Request::New(NewSession {
+            name: Some(free_name(&base, &taken)),
+            cwd: dir,
+            command: argv,
+            env: environment,
+            task: None,
+            backlog: None,
+            brief: Default::default(),
+        });
+        let Some(Response::Created { name, .. }) = client::ask(&self.socket, &request, true)?
+        else {
+            bail!("the daemon didn't start {}", command.label());
+        };
+        if command.kind != CommandKind::Popup {
+            return self.show_new_session(&name);
+        }
+        let popup = Popup {
+            width: command.width.clone(),
+            height: command.height.clone(),
+        };
+        let areas = ui::Areas::of(&self.app, self.screen);
+        let screen = ui::plugin_pane_screen(&areas, Some(&popup));
+        self.last_pane_id += 1;
+        let (id, events) = (self.last_pane_id, self.events.clone());
+        let (rows, cols) = (screen.height.max(1), screen.width.max(1));
+        self.overlay = Some(Pane::open(&self.socket, &name, rows, cols, id, events)?);
+        self.app.plugin_pane_opened(PluginPane {
+            plugin: String::new(),
+            title: command.label().to_string(),
+            session: name,
+            popup: Some(popup),
+        });
+        self.refresh_sessions()
+    }
+
+    /// Runs `argv`, a `[[keys.command]]`'s, in `dir` with `vars` over the
+    /// TUI's environment, on its own: nothing on screen, unless it fails,
+    /// when the footer says so with the last line it wrote to its errors.
+    fn run_in_background(
+        &self,
+        command: &KeyCommand,
+        argv: Vec<String>,
+        dir: &Path,
+        vars: Vec<(&'static str, Option<String>)>,
+    ) -> Result<()> {
+        let mut shell = std::process::Command::new(&argv[0]);
+        shell.args(&argv[1..]).current_dir(dir);
+        for (key, said) in vars {
+            match said {
+                Some(value) => shell.env(key, value),
+                None => shell.env_remove(key),
+            };
+        }
+        let mut child = shell
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .with_context(|| format!("couldn't run {}", command.command))?;
+        let what = command.label().to_string();
+        let events = self.events.clone();
+        thread::spawn(move || {
+            let stderr = child.stderr.take().map(std::io::BufReader::new);
+            let lines = stderr.into_iter().flat_map(std::io::BufRead::lines);
+            let last = lines
+                .map_while(Result::ok)
+                .filter(|line| !line.trim().is_empty())
+                .last();
+            let notice = match (child.wait(), last) {
+                (Ok(status), _) if status.success() => return,
+                (Ok(status), Some(last)) => format!("{what} failed ({status}): {}", last.trim()),
+                (Ok(status), None) => format!("{what} failed ({status})"),
+                (Err(err), _) => format!("{what}: {err}"),
+            };
+            let _ = events.send(Event::Notice(notice));
+        });
+        Ok(())
+    }
+
     /// Starts one of a plugin's panes in a session of its own, and shows it
     /// over the panes, with the keyboard.
     fn open_plugin_pane(&mut self, plugin: &str, pane: &str, context: Context) -> Result<()> {
@@ -2432,7 +2552,7 @@ impl Tui {
             bail!("the daemon didn't start {plugin}'s pane");
         };
         let areas = ui::Areas::of(&self.app, self.screen);
-        let screen = ui::plugin_pane_screen(&areas);
+        let screen = ui::plugin_pane_screen(&areas, None);
         self.last_pane_id += 1;
         let (id, events) = (self.last_pane_id, self.events.clone());
         let rows = screen.height.max(1);
@@ -2442,6 +2562,7 @@ impl Tui {
             plugin: plugin.to_string(),
             title: spec.title,
             session: name,
+            popup: None,
         });
         self.refresh_sessions()
     }
@@ -2694,8 +2815,14 @@ fn plugin_keys(config: &Config) -> Vec<PluginKey> {
             continue;
         };
         for action in manifest.actions {
-            let key = action.key.as_ref().and_then(|key| key.chars().next());
-            let free = key.is_some_and(|key| keys.iter().all(|taken| taken.key != Some(key)));
+            let key = action
+                .key
+                .as_deref()
+                .and_then(|key| Sequence::parse(key).ok());
+            let free = key.is_some_and(|key| {
+                let clashes = |taken: &PluginKey| taken.key.is_some_and(|it| it.clashes(&key));
+                !keys.iter().any(clashes)
+            });
             keys.push(PluginKey {
                 key: key.filter(|_| free),
                 plugin: plugin.name.clone(),
@@ -2731,6 +2858,20 @@ fn can_switch(name: &str, on: bool) -> Result<()> {
         Some(plugin) => plugins::check_can_enable(plugin, &installed),
         None => bail!("there's no plugin called {name}"),
     }
+}
+
+/// What a `[[keys.command]]`'s command finds in its environment, over the
+/// TUI's own: the crystal running it and its daemon, and where it was run
+/// from, as a plugin's action does. A session's `CRYSTAL_SESSION` is its
+/// own.
+fn key_command_env(socket: &Path, context: &Context) -> Vec<(&'static str, Option<String>)> {
+    let crystal = std::env::current_exe().ok();
+    let path = |path: PathBuf| Some(path.display().to_string());
+    let crystal = [
+        ("CRYSTAL_BIN", crystal.and_then(path)),
+        ("CRYSTAL_SOCKET", path(socket.to_path_buf())),
+    ];
+    crystal.into_iter().chain(context.vars()).collect()
 }
 
 /// `context`, or, with no session selected to say where, the TUI's own

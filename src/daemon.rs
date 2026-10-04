@@ -30,6 +30,7 @@ use crate::messages::{self, Sender};
 use crate::names;
 use crate::notify::{self, Notice};
 use crate::plugin_hooks;
+use crate::printable;
 use crate::project;
 use crate::protocol::{
     self, Activity, AgentEvent, ArchivedSession, Artifact, ArtifactKind, Backlog, Conversation,
@@ -2522,6 +2523,7 @@ impl Daemon {
         let conversation = Conversation {
             id,
             transcript: Some(transcript),
+            prompted: true,
         };
         let spec = launch.task.clone().expect("a background task has its spec");
         let mut command = vec!["claude".to_string()];
@@ -3584,12 +3586,17 @@ fn now_seconds() -> u64 {
         .map_or(0, |since| since.as_secs())
 }
 
-/// Refuses a name a session can't have: an empty one, one with spaces, or
-/// one another session has.
+/// Refuses a name a session can't have: an empty one, one with spaces or
+/// a character a terminal would take as an order (it's printed as it is),
+/// or one another session has.
 fn check_name(name: &str, taken: impl Fn(&str) -> bool) -> Result<()> {
     ensure!(
         !name.is_empty() && !name.contains(char::is_whitespace),
         "a session name can't be empty or contain spaces"
+    );
+    ensure!(
+        !name.contains(printable::is_unprintable),
+        "a session name can't contain control characters"
     );
     ensure!(!taken(name), "a session named {name} already exists");
     Ok(())
@@ -3883,7 +3890,7 @@ fn exists(program: &str, cwd: &Path, path: Option<&String>) -> bool {
 fn unique_name(program: &str, taken: impl Fn(&str) -> bool) -> String {
     let base = Path::new(program)
         .file_name()
-        .map(|name| name.to_string_lossy().replace(char::is_whitespace, "-"))
+        .map(|name| printable::line(&name.to_string_lossy()).replace(char::is_whitespace, "-"))
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| "session".into());
     (1..)
@@ -4073,6 +4080,7 @@ mod tests {
     #[test]
     fn a_program_without_a_usable_name_falls_back() {
         assert_eq!(unique_name("/", |_| false), "session");
+        assert_eq!(unique_name("/bin/\x1b]0;t\x07", |_| false), "]0;t");
     }
 
     #[test]
@@ -4082,6 +4090,9 @@ mod tests {
         assert!(check_name("claude", taken).is_err());
         assert!(check_name("", taken).is_err());
         assert!(check_name("two words", taken).is_err());
+        for hostile in ["a\x1b]0;t\x07", "b\u{9b}2J", "c\u{202e}d", "e\x7f"] {
+            assert!(check_name(hostile, taken).is_err(), "{hostile:?}");
+        }
     }
 
     #[test]

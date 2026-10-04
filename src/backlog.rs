@@ -11,6 +11,7 @@
 
 use crate::config::Config;
 use crate::plugins;
+use crate::printable;
 use crate::protocol::BacklogItem;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -37,7 +38,13 @@ pub struct Store {
 impl Store {
     /// Puts `text` on the backlog, at `now`, and gives back its number.
     pub fn add(&mut self, text: &str, tags: Vec<String>, now: u64) -> Result<u64> {
+        // An agent may say anything, and the user reads it in a terminal.
+        let text = printable::text(text);
         let text = text.trim();
+        let tags = tags
+            .iter()
+            .map(|tag| printable::line(tag).into_owned())
+            .collect();
         if text.is_empty() {
             bail!("say what to put on the backlog");
         }
@@ -176,6 +183,18 @@ mod tests {
         assert!(store.mark(7, true, 0).is_err());
         assert!(store.remove(7).is_err());
         assert!(store.add("   ", Vec::new(), 0).is_err());
+    }
+
+    #[test]
+    fn an_item_is_kept_without_what_a_terminal_would_take_as_an_order() {
+        let mut store = Store::default();
+        let tags = vec!["ui\x1b[2J".into()];
+        store
+            .add("fix\x1b]0;pwned\x07 it\r\nlater \u{202e}", tags, 0)
+            .unwrap();
+        let item = &store.items(true)[0];
+        assert_eq!(item.text, "fix]0;pwned it\nlater");
+        assert_eq!(item.tags, ["ui[2J"]);
     }
 
     #[test]

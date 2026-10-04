@@ -13,6 +13,7 @@ use crate::config::Config;
 use crate::env;
 use crate::forge;
 use crate::handoff;
+use crate::printable;
 use crate::protocol::{
     BacklogItem, ForgeLink, PendingTask, Request, Response, State, TaskBrief, TaskSpec, TaskStart,
     TaskState, TaskView, task_label,
@@ -87,7 +88,7 @@ pub fn list_tasks(socket: &Path, dir: PathBuf, all: bool, json: bool) -> Result<
     if json {
         println!("{}", serde_json::to_string_pretty(&tasks)?);
     } else {
-        print!("{}", task_lines(&tasks, all));
+        print!("{}", printable::text(&task_lines(&tasks, all)));
     }
     Ok(())
 }
@@ -269,7 +270,7 @@ pub fn show_task(socket: &Path, task: &str, json: bool) -> Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(&task)?);
     } else {
-        print!("{}", task_card(&task, now()));
+        print!("{}", printable::text(&task_card(&task, now())));
     }
     Ok(())
 }
@@ -309,7 +310,7 @@ pub fn task_log(socket: &Path, task: &str) -> Result<()> {
     let Response::TaskLog { task, transcript } = ask_running(socket, &request)? else {
         bail!("the daemon didn't send the task's log");
     };
-    print!("{}", task_card(&task, now()));
+    print!("{}", printable::text(&task_card(&task, now())));
     println!();
     match transcript {
         Some(rows) => print!("{}", transcript_text(&rows)),
@@ -508,7 +509,7 @@ pub fn change_backlog(socket: &Path, dir: PathBuf, action: BacklogAction) -> Res
             if json {
                 println!("{}", serde_json::to_string_pretty(&backlog.items)?);
             } else {
-                print!("{}", backlog_lines(&backlog.items));
+                print!("{}", printable::text(&backlog_lines(&backlog.items)));
             }
         }
         BacklogAction::Add { text, tags } => {
@@ -528,7 +529,8 @@ pub fn change_backlog(socket: &Path, dir: PathBuf, action: BacklogAction) -> Res
         }
         BacklogAction::Export => {
             let backlog = client::backlog(socket, dir, true)?;
-            print!("{}", backlog::markdown(&backlog.project, &backlog.items));
+            let markdown = backlog::markdown(&backlog.project, &backlog.items);
+            print!("{}", printable::text(&markdown));
         }
     }
     Ok(())

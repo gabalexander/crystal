@@ -86,10 +86,13 @@ whenever what's handed over changes in a way the crystal before couldn't read.
     having rung, putting on the clipboard what a pane's program copies (not a background task's); taking the
     mouse from the terminal or leaving it there (`[mouse] capture`), counting clicks for double- and
     triple-clicks, scrolling a pane's history on a timer while a drag selecting in it is held past its edge,
-    and sending a pager the wheel as arrow keys; and having git count the changes of the worktrees the sidebar
-    shows, off the loop
+    and sending a pager the wheel as arrow keys; having git count the changes of the worktrees the sidebar
+    shows, off the loop; and running the user's own keys' commands: a popup over everything, a session in a
+    pane or a tab, or a command in the background that says only when it fails
   - `app.rs`: the state and how keys and the mouse change it: a sidebar key looked up in the keymap and its
-    command run, from the sidebar, the `:` list or after the prefix in a pane; the sidebar's width, folded or
+    command run, from the sidebar, the `:` list, after the prefix in a pane or in a pane without it for a key
+    written `direct+`; a plugin's first key waiting for its second; a key in a view taken as the key the user
+    gave it stands for; the user's own keys' commands made ready (a split, a tab); the sidebar's width, folded or
     not, what needs the user pinned at its top, and the projects folded down to their headings, the selection
     resting on one out of sight; no I/O, so it's unit-tested
     - `app/commands.rs`: the layout commands carried out on the state, each on the tab holding the session it's
@@ -128,10 +131,16 @@ whenever what's handed over changes in a way the crystal before couldn't read.
     out
   - `keymap.rs`: the sidebar's commands, each with the id `[keys]` names it by, what it does and its default
     keys; keys as the config writes them and as terminals send them, folded into one form; the config's
-    keys laid over the defaults, a key given to one command taken from the one that had it; the prefix and
-    the key that hands the keyboard back; the `?` overlay's rows of sidebar keys; and `crystal keys`'s list
-  - `command_list.rs`: the command list (`:`): every command and plugin action by name, with its keys,
-    filtered as you type, the latest run first; its state and keys, kept apart from I/O, and its drawing
+    keys laid over the defaults, a key given to one command taken from the one that had it, and those written
+    `direct+`, which work in a pane without the prefix; the prefixes and the key that hands the keyboard back;
+    the modes' keys, each mode a table of its own (answering, resize mode and the views', a view's standing
+    for the key every view takes for it); the user's own keys, `[[keys.command]]`, and what each runs (a
+    popup, a pane, a tab, a command in the background or a plugin's action); a plugin's key, one or two
+    pressed one after the other, and the keys kept from plugins; the `?` overlay's rows of sidebar keys and
+    resize mode's; and `crystal keys`'s list
+  - `command_list.rs`: the command list (`:`): every command, the user's own keys' commands and plugin action
+    by name, with its keys, filtered as you type, the latest run first; its state and keys, kept apart from
+    I/O, and its drawing
   - `status.rs`: a session's status as the TUI shows it, and its mark
   - `theme.rs`: every color, named for what it's for, and `THEMES`, the one table of every theme by its names:
     crystal's own `dark`, `light` and `terminal`, and the well-known schemes (catppuccin, nord, …), each a
@@ -147,10 +156,11 @@ whenever what's handed over changes in a way the crystal before couldn't read.
     killed; worked out on threads that stop with their `Watch`, the event loop told only of a change
   - `mouse.rs`: writes mouse events the way a program in a pane asked for them, and the wheel as arrow keys for
     a program on the alternate screen that didn't ask (xterm's alternate scroll)
-  - `help.rs`: the overlay `?` opens, a key a row: the sidebar's from the keymap, written as the user's
-    `[keys]` has them, the rest from one table; its sections flowed into columns as tall as the terminal, two
-    to a page, the pages turned with the arrows; a test keeps the README's table of sidebar keys in step with
-    the defaults
+  - `help.rs`: the overlay `?` opens, a key a row: the sidebar's, the user's own, those that work in a pane
+    without the prefix, resize mode's and the views' from the keymap, written as the user's `[keys]` has
+    them, the rest from one table; its sections flowed into columns as tall as the terminal, two to a page,
+    the pages turned with the arrows; a test keeps the README's table of sidebar keys in step with the
+    defaults
   - `groups.rs`: the sidebar's order and headings: sessions by project, then worktree, agents before
     terminals, a session's task and the line reported for it under it, each flow run's steps under it, and
     linked worktrees with no sessions left at the end of their project, Claude Code's own last
@@ -257,17 +267,24 @@ whenever what's handed over changes in a way the crystal before couldn't read.
 - `src/events_cli.rs`: `crystal events`: the log in a shell, filtered, as lines or JSON, or followed, and `--since`
   read as a while back or a time on this machine's clock
 - `src/agents.rs`: what crystal knows about particular agents: the hooks it adds to Claude Code, the events it
-  listens to and what they mean (Claude Code's, which others copied, Cursor's spelled its own way, and
-  Codex's), subagents' among them, the variable that quiets the installed hooks for an agent crystal hooked
-  itself, the command that resumes one typed into a shell, the model a hook names, and where an agent hears
+  listens to and what they mean (Claude Code's, which others copied adding a few, Cursor's spelled its own
+  way, Letta's, and Codex's), subagents' among them, the variable that quiets the installed hooks for an agent
+  crystal hooked itself, each agent's command that resumes a conversation, typed into a shell or run in place
+  of the one it was started with, without its first prompt, the model a hook names, and where an agent hears
   crystal's notes: Claude Code's system prompt, or the top of another's first prompt
 - `src/agent_rules.rs`: the rules agents' screens are read by: a file for each agent in `agents/` (adapted from
   herdr's), bundled, each rule a look, a priority, a region and tests; a file of the user's in the config's
   `agents/` directory in place of one, or adding an agent, read again when it changes, and a broken one said
   and passed over; reading a screen, and explaining a reading rule by rule
-- `src/agent_hooks.rs`: crystal's hooks in the own settings of Cursor, Droid, Qoder, Qwen and Copilot, each in
-  its shape, for `crystal integration`: put there and taken out on the user's word, the user's own hooks left
-  alone
+- `src/agent_hooks.rs`: crystal's hooks in the own settings of Cursor, Droid, Qoder, Qwen, Copilot, Devin, Kimi
+  (TOML, with `toml_edit`), Letta, MastraCode, Grok and Antigravity, each in its shape and place, naming their
+  events with `--event` where their input may not, for `crystal integration`: put there and taken out on the
+  user's word, the user's own hooks left alone
+- `src/agent_plugins.rs`: crystal's plugins for the agents that take plugins: Pi's extension, OpenCode's and
+  Kilo's plugin and Hermes's, from `assets/integrations/` with crystal's path written in, each running `crystal
+  hook <agent> --event`; written, out of date or not, and taken out, only files crystal wrote, and Hermes's
+  switched on and off in its `config.yaml` by changing only its `plugins.enabled` list's lines; pure, so it's
+  unit-tested
 - `src/agent_cli.rs`: `crystal agent`: listing the agents with their rules and hooks, `explain` (a session's
   reading, from the daemon, or a saved screen's) and `rules`
 - `src/catalog.rs`: the agents the new-session panel offers: their names, how each takes a first prompt and
@@ -277,12 +294,12 @@ whenever what's handed over changes in a way the crystal before couldn't read.
 - `src/hook.rs`: `crystal hook <agent>`: what those hooks run, any agent's, to tell the daemon, the prompt sent,
   the conversation, the agent and a subagent included (the daemon passes over an agent's that isn't the one in
   front), and to pass on its reminder to an agent ending a turn with its task open; with `--installed`, the
-  hooks `crystal integration` installed
+  hooks `crystal integration` installed, and with `--event`, the event a hook or plugin names itself
 - `src/integration.rs`: `crystal integration install|uninstall|status`: crystal's hooks put in Claude Code's
   `settings.json` and Codex's `hooks.json` (and `[features] hooks` in its `config.toml`, with `toml_edit`),
   beside the user's own, replacing those of a crystal at another path, taken out again alone, written in one
   go through symbolic links; pure edits on the JSON, so they're unit-tested; and the other agents' through
-  `agent_hooks.rs`
+  `agent_hooks.rs` and `agent_plugins.rs`
 - `src/report.rs`: `crystal report`: any agent, or a script wrapped around one, saying what it's doing and the
   command that resumes it; checking that command, and what's typed into a shell to run it after a restart; and
   what `--line` and `--model` put on a session's row, for the sidebar alone: tidied, each with when it goes
@@ -296,8 +313,9 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   an agent by its program's name, the catalog's or one its rules give, or by the npm package its rules name
 - `src/typing.rs`: typing into a session the way a person would: pastes marked, Enter on its own
 - `src/session.rs`: one program in a PTY, or a task: spawn, exit status, stop, its screen (120 by 40 until a viewer
-  sizes it), viewers and listeners, the agent that says what it's doing itself while it holds the session, an
-  agent typed into its shell whose conversation a restart resumes while it's in front, its agent's subagents,
+  sizes it), viewers and listeners, the agent that says what it's doing itself while it holds the session, the
+  conversation its agent's hooks named, which counts once the agent has worked on a turn in it, an agent typed
+  into its shell whose conversation a restart resumes while it's in front, its agent's subagents,
   whether its first prompt can name it, whether its agent is blocked on the user, how long its agent has sat
   idle (nobody watching or typing, its turn seen), the model its agent runs on and what was reported for its
   row, why its screen reads the way it does (`crystal agent explain`), and what has changed in it (its agent's
@@ -330,8 +348,9 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   `claude -p`: prompts in, the control messages that carry a permission prompt out and its answer back, an
   interrupt, and the rule "always" keeps; adapted from docket's `docket-claude`
 - `src/transcript.rs`: reading `claude -p`'s stream-json events, and drawing them as a task's transcript,
-  Claude's answers as markdown pages; how many tokens each message took and each model takes; and the
-  transcript Claude Code keeps of a conversation, its prompts too, read the same way
+  Claude's answers as markdown pages, everything in it that isn't crystal's own made printable first; how
+  many tokens each message took and each model takes; and the transcript Claude Code keeps of a
+  conversation, its prompts too, read the same way
 - `src/markdown.rs`: markdown laid out as a page for one width (pulldown-cmark), each piece marked with what
   it is for the TUI's theme or a transcript's colors to draw, mermaid fences drawn as diagrams; adapted from
   docket's
@@ -479,14 +498,21 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   - `forge/github.rs`: each call as a `gh` command, and reading its `--json`
   - `forge/gitlab.rs`: each call as a `glab` command, and reading its JSON, a merge request as a pull request
 - `src/shell.rs`: quoting arguments and writing paths with `~`, the way a shell reads them
+- `src/printable.rs`: text crystal didn't write made fit for the user's terminal: control characters, the escape
+  sequences they start and the explicit bidi controls taken out, on one line or keeping its lines; and the TUI's
+  frame scrubbed of them last, since ratatui hands a zero-width one on to the terminal. A background task's
+  transcript, the window's title, notifications, session names, reports, the backlog, memory and what the CLI
+  prints for people go through it
 - `tests/cli.rs`: end-to-end tests that drive the real binary against a private daemon (and read its database
-  beside its socket to see what it wrote down), with a config of
+  beside its socket to see what it wrote down), every command they run without the `CRYSTAL_*` variables of a
+  crystal session they may be run in (`outside_crystal`), with a config of
   their own that turns notifications, sounds, the memory plugin, naming sessions from their prompts and panes'
   scrollbars off (a test of memory, naming or the scrollbar turns it back on, and `CRYSTAL_NO_SOUND` keeps
   sounds off even then; memory's models are kept out by a cache that can't hold them and
   `CRYSTAL_NO_MODEL_DOWNLOAD`), plugins
   of their own in its plugins directory, and a Claude Code config directory of their own (`CLAUDE_CONFIG_DIR`),
-  since a daemon brings the skill there up to date as it starts; a test that opens the new-session panel pins `PATH` to its fake
+  since a daemon brings the skill there up to date as it starts; `crystal integration` runs with a home of its
+  own, and none of the variables that move agents' settings elsewhere; a test that opens the new-session panel pins `PATH` to its fake
   agents, so no real agent is found or run, and a background task's `claude` is a fake that speaks stream-json,
   asks for permissions and takes interrupts. vt100 stands in for the user's own terminal: a second emulator,
   apart from crystal's. A test that copies, or opens a link, runs the TUI as over ssh (`SSH_TTY` set), so it

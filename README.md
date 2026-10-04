@@ -184,7 +184,7 @@ and the footer says where you are and offers the keys that matter there, or, whe
 | `P` | list your [profiles](#profiles), and add, change, copy or remove one |
 | `X` | list the [plugins](#plugins): switch them on and off, run their actions and open their panes |
 | `,` | open the [settings](#the-settings-view): notifications, sounds, the theme, and how memory learns and searches, each changed as you go |
-| `?` | show every key, in the sidebar, in a pane, in a question and with the mouse: a page at a time when they don't all fit, `→` and `←` (or `Space`, `PgDn` and `PgUp`) turning the pages |
+| `?` | show every key, in the sidebar, in a pane, in resize mode, in a view, in a question and with the mouse, your own included: a page at a time when they don't all fit, `→` and `←` (or `Space`, `PgDn` and `PgUp`) turning the pages |
 | `q` | quit; the sessions keep running |
 
 While you're typing into a session, every key goes to it, `Tab` included, except `Ctrl+\`, which takes you
@@ -192,7 +192,9 @@ back to the sidebar, `Shift+PageUp` / `Shift+PageDown`, which page through the p
 `Ctrl+B`: press it, then any key in the table above, and that key's command runs without the keyboard leaving
 the pane, as in tmux. `Ctrl+B` twice sends `Ctrl+B` to the program, and `Esc` after it does nothing. Some
 terminals keep `Shift+PageUp` for their own scrolling; `Ctrl+B` and then `PageUp` does the same. Every key in
-the table, the prefix and `Ctrl+\` included, can be changed: see [keys and commands](#keys-and-commands).
+the table, the prefix and `Ctrl+\` included, can be changed, a command can have a key that works in a pane with
+no prefix at all, and keys of your own can open a popup or run a command: see
+[keys and commands](#keys-and-commands).
 
 A program that asks for the [Kitty keyboard protocol](https://sw.kovidgoyal.net/kitty/keyboard-protocol/), as
 Codex does, gets its keys that way, in a pane, through `crystal attach` and from `crystal send-keys`: keys the
@@ -272,6 +274,7 @@ another, beside its name; or press `R` for resize mode, where the footer shows i
 | `=` | even the panes out: those in a line the same way get the same room each |
 | `Esc`, `Enter`, `q`, `R` | done |
 
+`[keys]` can change these too, as `resize-left` to `resize-done`: see [keys and commands](#keys-and-commands).
 No pane gets smaller than 12 columns or 3 rows. Each tab keeps its panes, how they're split and how big each
 is, the next time you open the TUI too; panes kept by an older crystal, as a list, come back two side by side,
 or more stacked.
@@ -344,16 +347,16 @@ doesn't start it. `crystal integration install` puts crystal's hooks in their ow
 crystal integration install          # each agent crystal can hook that's installed here
 crystal integration install claude   # into $CLAUDE_CONFIG_DIR/settings.json, or ~/.claude/settings.json
 crystal integration install codex    # into $CODEX_HOME/hooks.json, or ~/.codex/hooks.json
-crystal integration install cursor   # and droid, qodercli, qwen, copilot: see below
+crystal integration install kimi     # and 14 more agents' hooks or plugins: see below
 crystal integration status           # whether they're there, for this crystal
 crystal integration uninstall        # take them out again, and only them
 ```
 
 Then the agent you typed says what it's doing through its hooks, the same as one crystal starts, and which
 conversation it's in: after a restart, the session's shell starts again and `claude --resume <id>` (or `codex
-resume <id>`) is typed into it, so you're back where you were. Only while the agent is in front, though: quit
-it, and the shell comes back on its own. `resume_reported_agents = false` in the [settings](#settings) turns
-that off. Each hook runs `crystal hook <agent> --installed`, crystal by its path, so run `install` again if
+resume <id>`, or [the other agents' own](#hooks-in-other-agents-own-settings)) is typed into it, so you're
+back where you were. Only while the agent is in front, though: quit it, and the shell comes back on its own.
+`resume_reported_agents = false` in the [settings](#settings) turns that off. Each hook runs `crystal hook <agent> --installed`, crystal by its path, so run `install` again if
 you move crystal; `status` says when the hooks are out of date. Outside crystal, and for an agent crystal
 started with hooks of its own, they do nothing.
 
@@ -455,7 +458,7 @@ crystal tab new review                      # a new tab in the TUI, in front
 crystal title set "deploying"               # the title of the TUI's terminal, until `crystal title clear`
 crystal layout                              # the TUI's tabs and how each splits its panes
 crystal skill --install                     # teach Claude Code to drive crystal (see below)
-crystal integration install                 # hooks for a claude or codex you start in a shell (see above)
+crystal integration install                 # hooks or plugins for the agents installed here (see above)
 crystal mermaid docs/flow.md                # draw a page's mermaid diagrams as text (see below)
 crystal ssh box                             # crystal's TUI on another machine (see below)
 ```
@@ -537,20 +540,96 @@ Every key in the sidebar's table runs a command with a name: `n` is `new-session
 
 ```toml
 [keys]
-prefix = "ctrl+a"          # the prefix, from inside a pane; "none" for no prefix
-hand-back = "ctrl+g"       # from a pane back to the sidebar
+prefix = ["ctrl+b", "ctrl+a"]  # the prefixes, from inside a pane; "none" for no prefix
+hand-back = "ctrl+g"           # from a pane back to the sidebar
 new-session = ["n", "ctrl+n"]
-kill = "X"                 # x is free now
-split-right = "v"          # v was copy mode's: copy mode has no key now
-quit = "none"              # the command list still runs it
+kill = "X"                     # x is free now
+split-right = "v"              # v was copy mode's: copy mode has no key now
+quit = "none"                  # the command list still runs it
+pane-left = ["shift+left", "direct+ctrl+alt+h"]   # in a pane too, without the prefix
 ```
 
 A key you give one command is taken from the command that had it, which is left with its other keys, or none.
-Two commands given the same key, a command or a key crystal doesn't know, are errors that name them, so a
-typo never goes unnoticed. Keys are written as `n`, `N` (or `shift+n`), `ctrl+b`, `alt+enter`, `shift+left`,
-`pageup`, `space`, `f5`, or the character itself, like `|`, `(` or `:`. The `?` overlay, the footer and the
-command list all say the keys you chose. The keys inside the views (the diff, the file finder and the rest),
-copy mode's and the questions' on the footer line stay as they are.
+Two commands given the same key, a command or a key crystal doesn't know, are errors that name them, and a
+name that's nearly one crystal knows says which, so a typo never goes unnoticed. Keys are written as `n`, `N`
+(or `shift+n`), `ctrl+b`, `alt+enter`, `ctrl+alt+h`, `shift+left`, `pageup`, `space`, `f5`, or the character
+itself, like `|`, `(` or `:`. The `?` overlay, the footer and the command list all say the keys you chose.
+
+Every prefix in the list starts the same thing: the first is the one the footer shows. Inside a pane every key
+goes to the program but the prefixes and the hand-back key, so a command's key works there only after a prefix,
+unless you write it `direct+`: then it works in a pane straight away, as well as in the sidebar. Only the keys
+you write that way are taken from the programs, and only ones a program can spare: a `direct+` key has `ctrl` or
+`alt`, or is an `F` key. `ctrl+alt` is the family terminals and desktops leave alone the most; some of it is
+taken all the same, like `ctrl+alt+arrows` by GNOME's workspaces and `ctrl+alt+t` by Ubuntu's terminal, and on
+a Mac plain `alt` makes characters unless the terminal sends `Option` as `Meta`. If a `direct+` key does
+nothing, your terminal or your desktop kept it.
+
+Answering a background task, resize mode and the views have keys of their own, each set apart from the
+sidebar's, so one of them can have a key a command has, as `n` answers no on a task asking and starts a session
+everywhere else. `[keys]` names them the same way:
+
+| Name | Keys | What it does |
+|---|---|---|
+| `answer-yes`, `answer-no`, `answer-always` | `y`, `n`, `Y` | on a [background task](#background-tasks) asking for a permission, in the sidebar, its pane and the needs-you view |
+| `resize-left`, `resize-down`, `resize-up`, `resize-right` | `h` `←`, `j` `↓`, `k` `↑`, `l` `→` | resize mode: move a border that way |
+| `resize-even` | `=` | resize mode: even the panes out |
+| `resize-done` | `Esc`, `Enter`, `q` | resize mode: done; `resize`'s own key again is done too |
+| `view-down`, `view-up` | `j` `Ctrl+N`, `k` `Ctrl+P` | in a view: the row below, or above |
+| `view-page-down`, `view-page-up` | none | in a view: a page on, or back |
+| `view-open` | none | in a view: open or run what the bar is on |
+| `view-close` | `q` | in a view: close it, or step back out of what's open in it |
+
+A view is any of the lists that take the keyboard: the diff, the file finder, the tree browser, find in files,
+the branch switcher, memory, the backlog, layouts, the archive, the plugins, the settings, what needs you, the
+timeline, the issues, the pull requests, `/` and the command list. A key you give a view's name stands in every
+one of them for the key they all take for it, `↓`, `↑`, `PgDn`, `PgUp`, `Enter` or `Esc`, which go on working
+whatever you give; the defaults you leave it without do nothing. While a view is taking what you type, like
+the file finder's query or a filter, a letter is typed rather than standing for anything, so a key there is
+best given with `ctrl` or `alt`. The rest of each view's keys, copy mode's and the questions' on the footer line
+are their own.
+
+Keys of your own run commands, in `[[keys.command]]` tables: a key, written as `[keys]` writes one, `direct+`
+or not, and what it runs.
+
+```toml
+[[keys.command]]
+key = "direct+ctrl+alt+g"
+type = "popup"               # over everything, with the keyboard, until it ends
+command = "lazygit"
+description = "lazygit"      # what ? and : call it, in place of the command
+width = "80%"                # or so many cells; 80% of the screen each way, left out
+height = "80%"
+
+[[keys.command]]
+key = "ctrl+t"
+type = "pane"                # a session of its own, split off the selected session's pane
+command = "make test"
+split = "down"               # or "right"; as s would split, left out
+
+[[keys.command]]
+key = "T"
+type = "tab"                 # a session of its own, in a new tab
+command = "htop"
+
+[[keys.command]]
+key = "direct+ctrl+alt+s"
+type = "shell"               # in the background; the footer says only if it fails
+command = "git fetch --all"
+
+[[keys.command]]
+key = "N"
+type = "plugin"              # one of an installed plugin's actions
+command = "notes:add"
+```
+
+A command is a line for `/bin/sh -c`, run in the selected session's directory, or the TUI's with none
+selected. It finds `CRYSTAL_BIN` and `CRYSTAL_SOCKET` in its environment, and the selected session's
+`CRYSTAL_SESSION`, `CRYSTAL_SESSION_ID`, `CRYSTAL_PROJECT` and `CRYSTAL_WORKTREE`, as a [plugin](#plugins)'s
+action does; a popup, a pane and a tab are sessions of their own, so their `CRYSTAL_SESSION` is their own. A
+popup is in `crystal ls` while it's open, ends when its program does or when you press `Ctrl+\`, and takes
+every other key, `Esc` included. A pane's or a tab's session stays when its command ends, to read what it said
+or run it again with `Enter`, like any other. Your commands are in the command list and the `?` overlay, under
+what they're called.
 
 Every text box edits the way a shell's line does: the new-session panel's task and branch, the reply box, the
 questions on the footer line, `/`, the command list, the views' filters, comments and forms.
@@ -781,7 +860,7 @@ Under the task, `Tab` and `Shift+Tab` go from row to row and `←` / `→` chang
 
 - **run**: your [profiles](#profiles), then the agents installed on your `PATH` (Claude Code, Codex, Gemini
   CLI, OpenCode, Cursor, Qwen Code, Pi, GitHub Copilot, Amp, Droid, Kimi Code, Kiro, Cline, Kilo Code,
-  Devin, Grok, Qoder CLI, Letta Code, Hermes Agent, Antigravity, Aider), then your shell. What you started
+  Devin, Grok, Qoder CLI, Letta Code, Hermes Agent, Antigravity, MastraCode, Aider), then your shell. What you started
   last is chosen the next time. A profile's
   description shows under the row, and choosing it sets the rows below from it; you can still change them.
 - **how**, for Claude Code: **in a terminal**, or **in the background**, as a [background
@@ -811,8 +890,9 @@ checked against their own code or documentation, so for them the task box gives 
 crystal keeps what it takes to start it again, in the archive. `Z` opens the archive, the latest archived
 first, each with where it ran and how long ago: `Enter` starts the one the bar is on again, under its name (or
 the next one free, if that's been taken since), and `x` deletes it for good once you've said `y`. Claude Code
-and Codex come back in the conversation they were in, as after a restart, and so does an agent that
-[said how to resume it](#teaching-crystal-about-your-agent); anything else starts its command again from the
+and Codex come back in the conversation they were in, as after a restart, and so does an agent whose
+[hooks](#hooks-in-other-agents-own-settings) named its conversation, or that [said how to resume
+it](#teaching-crystal-about-your-agent); anything else starts its command again from the
 top, and the archive says which. An archived session's open task is cancelled, and open again when it comes
 back. From the command line, `crystal archive <name>`, `crystal unarchive <name>` and `crystal ls --archived`
 do the same, and `crystal kill` on an archived name deletes it.
@@ -821,8 +901,8 @@ An agent you've left alone can be stopped for you, to free what it holds. With `
 `[sessions]` in the [settings](#settings), say `"30m"`, crystal stops an agent that has sat at its prompt that
 long, its turn seen, with nobody watching it or typing into it. It stays in the list, its row saying
 `stopped idle`, and `Enter` (or `crystal respawn`) starts it again in its conversation. Only an agent that can
-come back where it was is stopped: Claude Code or Codex once crystal knows its conversation, or an agent that
-said how to resume it. A turn that ended while you were away waits for you (`✓`) however long it takes, and so
+come back where it was is stopped: Claude Code, Codex or another agent once crystal knows its conversation, or
+an agent that said how to resume it. A turn that ended while you were away waits for you (`✓`) however long it takes, and so
 does one asking you something; terminals, background tasks and sessions with their task open are never
 stopped. It's off until you set it, from the file or the [settings view](#the-settings-view).
 
@@ -1129,7 +1209,9 @@ started with, but not its first prompt again. The limits:
 crystal reads each agent's screen by a file of rules for that agent. It comes with one for each of Claude
 Code, Codex, Gemini CLI, OpenCode, Cursor, Qwen Code, Pi, GitHub Copilot, Amp, Droid, Kimi Code, Kiro, Cline,
 Kilo Code, Devin, Grok, Qoder CLI, Letta Code, Hermes Agent, Antigravity, Maki and Muse, adapted from
-[herdr](https://github.com/herdrdev/herdr)'s, and a common one for any other agent in front, like Aider. An
+[herdr](https://github.com/herdrdev/herdr)'s, and a common one for any other agent in front, like Aider.
+MastraCode's file only names it: it says what it's doing through [its hooks](#hooks-in-other-agents-own-settings)
+alone. An
 agent changes what it draws from one version to the next, so when crystal reads one wrong you can mend its
 rules yourself without waiting for a release:
 
@@ -1185,7 +1267,7 @@ A new look counts once two checks in a row see it, so a screen caught halfway th
 #### Hooks in other agents' own settings
 
 Beyond Claude Code and Codex, some agents take hooks only in their own settings files, never on the command
-line. crystal leaves those files alone unless you ask, with the same [`crystal
+line, and some take plugins instead. crystal leaves those files alone unless you ask, with the same [`crystal
 integration`](#usage) command, as for those two:
 
 ```sh
@@ -1193,12 +1275,45 @@ crystal integration install cursor     # ~/.cursor/hooks.json, or $CURSOR_CONFIG
 crystal integration uninstall cursor   # takes crystal's out, and leaves yours
 ```
 
-It can for Cursor, Droid (`~/.factory/settings.json`), Qoder CLI (`qodercli`), Qwen Code and GitHub Copilot,
-with the events each has that say what it's doing or which conversation it's in. The hook runs `crystal hook
-<agent>` inside a crystal session only, so the agent anywhere else runs as before, and it never fails the
-agent. What a hook says counts only while that agent is in front: an agent that Claude Code runs in the
-session doesn't speak for the session. `crystal agent list` says whose hooks are in. The settings file is
-written again as formatted JSON, its keys in order.
+| Agent | `crystal integration install …` | Where | What it says | Resumed with |
+|---|---|---|---|---|
+| Cursor | `cursor` | `~/.cursor/hooks.json` (`$CURSOR_CONFIG_DIR`) | a turn ending, its conversation | `cursor-agent --resume <id>` |
+| Droid | `droid` | `~/.factory/settings.json` | its turns, its session | `droid --resume <id>` |
+| Qoder CLI | `qodercli` | `~/.qoder/settings.json` (`$QODER_CONFIG_DIR`) | its turns, what it asks, its session | `qodercli --resume <id>` |
+| Qwen Code | `qwen` | `~/.qwen/settings.json` (`$QWEN_HOME`) | its session | `qwen --resume <id>` |
+| GitHub Copilot | `copilot` | `~/.copilot/settings.json` (`$COPILOT_HOME`) | its session | `copilot --resume=<id>` |
+| Devin | `devin` | `~/.config/devin/config.json` (`$XDG_CONFIG_HOME`) | its turns, its session | `devin --resume <id>` |
+| Kimi Code | `kimi` | `[[hooks]]` in `~/.kimi-code/config.toml` (`$KIMI_CODE_HOME`) | its turns, what it asks, its session | `kimi --session <id>` |
+| Letta Code | `letta` | `~/.letta/settings.json` | its conversation | `letta --conversation <id>` |
+| MastraCode | `mastracode` | `~/.mastracode/hooks.json` | its turns, what it asks, its thread | `mastracode --thread <id>` |
+| Grok | `grok` | `~/.grok/hooks/crystal.json` (`$GROK_HOME`) | its session | `grok --resume <id>` |
+| Antigravity | `agy` | a `crystal` block in `~/.gemini/config/hooks.json` (`$ANTIGRAVITY_CLI_CONFIG_DIR`) | its conversation | `agy --conversation <id>` |
+| Pi | `pi` | an extension, `~/.pi/agent/extensions/crystal.ts` (`$PI_CODING_AGENT_DIR`) | its turns, its session file | `pi --session <file>` |
+| OpenCode | `opencode` | a plugin, `~/.config/opencode/plugins/crystal.js` | its turns, what it asks, its session | `opencode --session <id>` |
+| Kilo Code | `kilo` | a plugin, `~/.config/kilo/plugin/crystal.js` | its turns, what it asks, its session | `kilo --session <id>` |
+| Hermes Agent | `hermes` | a plugin in `~/.hermes/plugins/crystal/`, switched on in its `config.yaml` (`$HERMES_HOME`) | its session | `hermes --resume <id>` |
+
+Each gets the events it has that say what it's doing or which conversation it's in, as far as they can be
+trusted, as [herdr](https://github.com/herdrdev/herdr) installs its own: where an agent's hooks miss a turn
+cut short or a permission it cancels, crystal takes only those that name its conversation, and reads the rest
+off its screen, by its [rules](#how-crystal-reads-an-agent). MastraCode has no rules for its screen, so it
+shows a status only with its hooks in. A hook runs `crystal hook <agent>` inside a crystal session only, so the
+agent anywhere else runs as before, and it never fails the agent; a plugin runs it the same way. What a hook
+says counts only while that agent is in front: an agent that Claude Code runs in the session doesn't speak for
+the session. `crystal agent list` says whose hooks are in. A JSON settings file is written again as formatted
+JSON, its keys in order; Kimi's TOML and Hermes's YAML keep the rest as it was. A plugin is loaded as its
+agent starts, so start again one that's running; `status` says when a plugin is out of date.
+
+Once its hooks have named the conversation, an agent crystal started comes back in it after a restart, with
+`crystal respawn`, or from the archive, with the options it was started with but not its first prompt again,
+the way Claude Code and Codex do; one typed into a shell has that command typed in again. A conversation only
+counts once the agent has worked on a turn in it (or written the file its hooks say it keeps it in): before
+that there's nothing to pick up, and the agent starts afresh. The limits:
+
+- OpenCode's plugin runs in its server: an OpenCode attached to a server it shares with other sessions
+  (`opencode attach`) reports to the session that started the server, if any.
+- Letta's default conversation is resumed with its agent, `letta --conversation default --agent <agent>`.
+- An option of the agent's own that chose a conversation, like `--continue`, gives way to crystal's choice.
 
 ### Teaching crystal about your agent
 
@@ -2219,7 +2334,7 @@ command = ["sh", "restore.sh"]
 id = "add"
 title = "Add a note"
 command = ["sh", "add.sh"]
-key = "N"                     # optional: a key crystal and other plugins don't use
+key = "N"                     # optional: a key crystal and other plugins don't use, or "ctrl+alt+n", or "N t"
 
 [[events]]                    # run by the daemon when something happens
 on = "session.waiting"        # or a family of events, like "session.*", or "*" for all
@@ -2257,6 +2372,12 @@ installed again. What it keeps is each server's, like the sessions it's about, a
 An action is about the session selected in the TUI; for `crystal plugin run`, the session `--session` names,
 or else the one it's run in, or else the current directory. Run from the TUI, what it prints goes to the
 plugin's log; `plugin run` prints it, and exits as the action did.
+
+An action's `key` runs it from the sidebar, and from a pane after the prefix: a character, a chord like
+`ctrl+alt+n`, or two keys pressed one after the other, written with a space between them, like `N t`, the
+footer showing the first while it waits for the second and `Esc` letting it go. It can't be a key crystal's
+sidebar has, nor start with one, and two plugins can't share a key or have one's be the first of the other's
+two. A key your `[keys]` gives a command, or one of your own, comes before a plugin's.
 
 A pane is a session of its own, started in the plugin's directory and shown over the panes with the keyboard.
 It's in `crystal ls` while it's open, and ends when its program does or when you press `Ctrl+\`. Its
@@ -2386,7 +2507,7 @@ file and change. A setting crystal doesn't know is an error that names it, so a 
 | `theme` | `"dark"` | the TUI's colors: one of the [themes](#themes) |
 | `[colors]` | | colors of your own over the theme's: [themes](#themes) |
 | `name_from_prompt` | `true` | name a session you don't name for the [first thing it's asked](#starting-a-session) |
-| `resume_reported_agents` | `true` | after a restart, run the command an agent [said resumes it](#teaching-crystal-about-your-agent), or the one that resumes a Claude Code or Codex [typed into a shell](#usage) |
+| `resume_reported_agents` | `true` | after a restart, run the command an agent [said resumes it](#teaching-crystal-about-your-agent), or the one that resumes an agent [typed into a shell](#usage) whose hooks named its conversation |
 | `scrollback_lines` | `10000` | how many rows that scrolled off a session's screen it keeps, up to 1,000,000, for scrolling back, copy mode, `e` and `crystal read --history` |
 | `[plugins]` | | which plugins are on and off: [plugins](#plugins) |
 | `[memory]` | | how memory's [distiller](#the-distiller) runs, and whether it [searches by meaning](#search-by-meaning) |
@@ -2397,7 +2518,7 @@ file and change. A setting crystal doesn't know is an error that names it, so a 
 | `[forge]` | | `hide_draft_prs`, leave draft pull requests out of [the pull requests](#pull-requests), the tab bar's count and `/` (`false`) |
 | `[sessions]` | | `stop_idle_after`, how long an agent may sit [idle](#archiving-and-idle-agents) before crystal stops it, like `"30m"`: `"off"`; `restart_spacing_ms`, how far apart the agents a [crash or a reboot](#usage) starts again start (`250`, or `0` for all at once) |
 | `[[project]]` | | a project's [run and open commands](#projects), by its main worktree's `path`, in place of its own file's |
-| `[keys]` | | the TUI's keys, by command, its prefix and the key back to the sidebar: [keys and commands](#keys-and-commands) |
+| `[keys]` | | the TUI's keys, by command, its prefixes, the key back to the sidebar, answering's, resize mode's and the views', and `[[keys.command]]`, keys of your own that run commands: [keys and commands](#keys-and-commands) |
 | `[sidebar]` | | the sidebar's `width`, whether it starts `folded`, what folding keeps, and whether what needs you is pinned: [the sidebar](#the-sidebar) |
 | `[terminal]` | | the shell a new terminal runs, `default_shell`, whether it's a login shell, `shell_mode`, and where `t` starts one, `new_cwd`: [terminals](#terminals-the-window-and-the-tab-bar) |
 | `[window]` | | `title`, what the TUI titles its terminal: [the window](#terminals-the-window-and-the-tab-bar) |
@@ -2673,6 +2794,14 @@ only waits. Attaches and event streams are cut, and come back by themselves: an 
 the last event it had, with none missed, and the log has a `daemon.handed_over`. If the new crystal can't take
 over, the daemon is restarted cold from the sessions it wrote down first.
 
+Text crystal didn't write, like a session's name, what an agent reports, Claude's answers in a background task,
+a pull request's title, a branch, a commit or a file in a preview, reaches your terminal only as text. Control
+characters, the escape sequences they start (a window title, the clipboard, a link, the alternate screen) and
+the bidi controls that turn text around are taken out of every frame the TUI draws, of a background task's
+transcript before its screen draws it, and of what the CLI prints for you to read (`--json` is for scripts). A
+session's name can't hold them. A program draws its own pane: its output goes through the terminal crystal
+emulates for it, as it would through any terminal.
+
 ## Roadmap
 
 - [x] Project skeleton
@@ -2695,6 +2824,7 @@ over, the daemon is restarted cold from the sessions it wrote down first.
 - [x] Any agent saying what it's doing and how to resume it, and sessions named from their first prompt
 - [x] Restart the daemon on a new crystal without stopping its sessions
 - [x] Hooks for a Claude Code or Codex typed into a shell, resumed after a restart, and subagents counted
+- [x] Hooks or plugins for 15 more agents, each resumed in its conversation after a restart
 - [x] Archived sessions, idle agents stopped, right-click menus, and projects kept with their run and open commands
 
 ## Development

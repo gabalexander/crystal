@@ -9,6 +9,7 @@ use crate::memory_cli::confirm;
 use crate::plugin_hooks;
 use crate::plugin_manifest::{self, Manifest};
 use crate::plugins::{self, Context, Installed};
+use crate::printable;
 use crate::protocol::{Request, Response, SessionInfo};
 use crate::shell;
 use anyhow::{Context as _, Result, anyhow, bail};
@@ -363,11 +364,17 @@ fn last_printed(path: &Path, start: u64) -> String {
 }
 
 /// Shows what a plugin is and every command it would run, for the user to
-/// read before saying yes.
+/// read before saying yes: each line with nothing a terminal would take as
+/// an order, so that nothing in the manifest can hide a command or draw
+/// another over it.
 fn describe(manifest: &Manifest, source: &str) {
-    println!("{} {}, from {source}", manifest.name, manifest.version);
+    let say = |line: String| println!("{}", printable::line(&line));
+    say(format!(
+        "{} {}, from {source}",
+        manifest.name, manifest.version
+    ));
     if !manifest.description.is_empty() {
-        println!("{}", manifest.description);
+        say(manifest.description.clone());
     }
     println!();
     println!("It runs these commands as you, from its own directory:");
@@ -379,7 +386,7 @@ fn describe(manifest: &Manifest, source: &str) {
         .unwrap_or(0);
     for (what, words) in commands {
         let words: Vec<String> = words.iter().map(|word| shell::quote(word)).collect();
-        println!("  {what:width$}  {}", words.join(" "));
+        say(format!("  {what:width$}  {}", words.join(" ")));
     }
     println!();
 }
@@ -436,7 +443,8 @@ description = "What NAME does, in a line"
 
 # Run from the plugins view (X in the TUI), or with
 # `crystal plugin run NAME hello`. Give it a key crystal doesn't use, and
-# that key runs it from the sidebar too.
+# that key runs it from the sidebar too: a character, a chord like
+# "ctrl+alt+h", or two keys pressed one after the other, like "H i".
 [[actions]]
 id = "hello"
 title = "Say hello"

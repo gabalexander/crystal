@@ -18,11 +18,14 @@
 //! once its config has `[features] hooks = true`, which installing makes
 //! sure of, and once the user has reviewed them in Codex's `/hooks`.
 //!
-//! Cursor, Droid, Qoder, Qwen Code and GitHub Copilot take hooks from their
-//! own settings too, each in a shape of its own: [`crate::agent_hooks`]
-//! puts crystal's there and takes them out.
+//! Cursor, Droid, Qoder, Qwen Code, GitHub Copilot, Devin, Kimi Code, Letta
+//! Code, MastraCode, Grok and Antigravity take hooks from their own settings
+//! too, each in a shape of its own: [`crate::agent_hooks`] puts crystal's
+//! there and takes them out. Pi, OpenCode, Kilo Code and Hermes Agent take
+//! plugins instead, which [`crate::agent_plugins`] writes.
 
 use crate::agent_hooks::{self, Target};
+use crate::agent_plugins::{self, Plugin};
 use crate::agents;
 use crate::shell;
 use crate::skill;
@@ -43,6 +46,29 @@ pub enum Agent {
     Qoder,
     Qwen,
     Copilot,
+    Devin,
+    Kimi,
+    Letta,
+    #[value(name = "mastracode")]
+    MastraCode,
+    Grok,
+    #[value(name = "agy", alias = "antigravity")]
+    Antigravity,
+    Pi,
+    #[value(name = "opencode")]
+    OpenCode,
+    Kilo,
+    Hermes,
+}
+
+/// How crystal hooks an agent.
+enum Way {
+    /// Claude Code's and Codex's hooks, this module's own.
+    Own,
+    /// Hooks in its own settings, [`crate::agent_hooks`]'.
+    Hooks(&'static Target),
+    /// A plugin, [`crate::agent_plugins`]'.
+    Plugin(&'static Plugin),
 }
 
 /// How long a hook may take, in seconds, as crystal's own Claude Code hooks
@@ -71,7 +97,7 @@ impl Standing {
 }
 
 impl Agent {
-    pub const ALL: [Agent; 7] = [
+    pub const ALL: [Agent; 17] = [
         Agent::Claude,
         Agent::Codex,
         Agent::Cursor,
@@ -79,6 +105,16 @@ impl Agent {
         Agent::Qoder,
         Agent::Qwen,
         Agent::Copilot,
+        Agent::Devin,
+        Agent::Kimi,
+        Agent::Letta,
+        Agent::MastraCode,
+        Agent::Grok,
+        Agent::Antigravity,
+        Agent::Pi,
+        Agent::OpenCode,
+        Agent::Kilo,
+        Agent::Hermes,
     ];
 
     /// Its program, which is how `crystal hook` knows it.
@@ -91,6 +127,16 @@ impl Agent {
             Agent::Qoder => "qodercli",
             Agent::Qwen => "qwen",
             Agent::Copilot => "copilot",
+            Agent::Devin => "devin",
+            Agent::Kimi => "kimi",
+            Agent::Letta => "letta",
+            Agent::MastraCode => "mastracode",
+            Agent::Grok => "grok",
+            Agent::Antigravity => "agy",
+            Agent::Pi => "pi",
+            Agent::OpenCode => "opencode",
+            Agent::Kilo => "kilo",
+            Agent::Hermes => "hermes",
         }
     }
 
@@ -111,15 +157,32 @@ impl Agent {
             Agent::Qoder => "Qoder",
             Agent::Qwen => "Qwen Code",
             Agent::Copilot => "GitHub Copilot",
+            Agent::Devin => "Devin",
+            Agent::Kimi => "Kimi Code",
+            Agent::Letta => "Letta Code",
+            Agent::MastraCode => "MastraCode",
+            Agent::Grok => "Grok",
+            Agent::Antigravity => "Antigravity",
+            Agent::Pi => "Pi",
+            Agent::OpenCode => "OpenCode",
+            Agent::Kilo => "Kilo Code",
+            Agent::Hermes => "Hermes Agent",
         }
     }
 
-    /// How [`crate::agent_hooks`] puts hooks in its settings: for every
-    /// agent but Claude Code and Codex, which this module does itself.
-    fn other(self) -> Option<&'static Target> {
-        match self {
-            Agent::Claude | Agent::Codex => None,
-            agent => agent_hooks::target(agent.program()),
+    /// How crystal hooks it: Claude Code and Codex by this module itself,
+    /// the agents that take plugins by [`crate::agent_plugins`], and the
+    /// rest by [`crate::agent_hooks`].
+    fn way(self) -> Way {
+        if matches!(self, Agent::Claude | Agent::Codex) {
+            return Way::Own;
+        }
+        if let Some(plugin) = agent_plugins::plugin(self.program()) {
+            return Way::Plugin(plugin);
+        }
+        match agent_hooks::target(self.program()) {
+            Some(target) => Way::Hooks(target),
+            None => unreachable!("{} has a target", self.program()),
         }
     }
 
@@ -134,8 +197,10 @@ impl Agent {
     /// Where the agent keeps its settings, as the environment says:
     /// `$CLAUDE_CONFIG_DIR` or `~/.claude`, `$CODEX_HOME` or `~/.codex`.
     fn dir(self) -> Result<PathBuf> {
-        if let Some(target) = self.other() {
-            return Ok(target.dir());
+        match self.way() {
+            Way::Hooks(target) => return Ok(target.dir()),
+            Way::Plugin(plugin) => return Ok(plugin.dir()),
+            Way::Own => {}
         }
         let home = std::env::var_os("HOME");
         let dir = match self {
@@ -152,9 +217,10 @@ impl Agent {
 
     /// The file it keeps its hooks in, in `dir`.
     fn hooks_file(self, dir: &Path) -> PathBuf {
-        match (self, self.other()) {
-            (_, Some(target)) => target.file(dir),
-            (Agent::Codex, None) => dir.join("hooks.json"),
+        match (self, self.way()) {
+            (_, Way::Hooks(target)) => target.file(dir),
+            (_, Way::Plugin(plugin)) => plugin.file(dir),
+            (Agent::Codex, Way::Own) => dir.join("hooks.json"),
             _ => dir.join("settings.json"),
         }
     }
@@ -196,7 +262,30 @@ pub fn chosen(agent: Option<Agent>) -> Result<Vec<Agent>> {
 /// program, and says what it did.
 pub fn install(agent: Agent, crystal: &Path) -> Result<Vec<String>> {
     let dir = agent.dir()?;
-    if let Some(target) = agent.other() {
+    if let Way::Plugin(plugin) = agent.way() {
+        let changed = plugin.install(&dir, crystal)?;
+        if changed.is_empty() {
+            return Ok(vec![format!(
+                "{}: crystal's plugin is in {} already",
+                agent.program(),
+                shell::home_relative(&plugin.file(&dir))
+            )]);
+        }
+        let mut said: Vec<String> = changed
+            .iter()
+            .map(|path| {
+                let path = shell::home_relative(path);
+                format!("{}: added crystal's plugin to {path}", agent.program())
+            })
+            .collect();
+        said.push(format!(
+            "{}: {} loads it as it starts: start again any that's running",
+            agent.program(),
+            agent.name()
+        ));
+        return Ok(said);
+    }
+    if let Way::Hooks(target) = agent.way() {
         let changed = target.install(&dir, crystal)?;
         if changed.is_empty() {
             return Ok(vec![format!(
@@ -261,7 +350,14 @@ pub fn install(agent: Agent, crystal: &Path) -> Result<Vec<String>> {
 pub fn uninstall(agent: Agent) -> Result<String> {
     let dir = agent.dir()?;
     let file = agent.hooks_file(&dir);
-    if let Some(target) = agent.other() {
+    if let Way::Plugin(plugin) = agent.way() {
+        let said = match plugin.uninstall(&dir)?.is_empty() {
+            true => "crystal's plugin isn't in",
+            false => "took crystal's plugin out of",
+        };
+        return Ok(format!("{}: {said} {}", agent.program(), dir.display()));
+    }
+    if let Way::Hooks(target) = agent.way() {
         let said = match target.uninstall(&dir)?.is_empty() {
             true => "there are no crystal hooks in",
             false => "took crystal's hooks out of",
@@ -307,12 +403,11 @@ pub fn status(agent: Agent, crystal: &Path) -> Result<String> {
 /// How `agent`'s hooks stand, for `crystal` at its path.
 pub fn standing_of(agent: Agent, crystal: &Path) -> Result<Standing> {
     let dir = agent.dir()?;
-    if let Some(target) = agent.other() {
-        return Ok(if target.installed(&dir) {
-            Standing::Installed
-        } else {
-            Standing::NotInstalled
-        });
+    match agent.way() {
+        Way::Hooks(target) if target.installed(&dir) => return Ok(Standing::Installed),
+        Way::Hooks(_) => return Ok(Standing::NotInstalled),
+        Way::Plugin(plugin) => return Ok(plugin.standing(&dir, crystal)),
+        Way::Own => {}
     }
     let file = agent.hooks_file(&dir);
     let command = agents::hook_command(crystal, agent.program(), true);
@@ -719,6 +814,23 @@ mod tests {
         assert_eq!(fs::read_to_string(&real).unwrap(), "{\n  \"a\": 1\n}\n");
         let left: Vec<_> = fs::read_dir(dir.path()).unwrap().collect();
         assert_eq!(left.len(), 2, "nothing is left behind");
+    }
+
+    #[test]
+    fn every_agent_is_hooked_one_way_or_another_by_its_names() {
+        use clap::ValueEnum;
+        for agent in Agent::ALL {
+            // No agent is left without a way to hook it.
+            let _ = agent.way();
+            assert_eq!(Agent::of_program(agent.program()), Some(agent));
+            assert_eq!(Agent::from_str(agent.program(), false), Ok(agent));
+        }
+        assert_eq!(Agent::of_program("cursor-agent"), Some(Agent::Cursor));
+        assert_eq!(Agent::of_program("antigravity"), Some(Agent::Antigravity));
+        assert_eq!(
+            Agent::from_str("antigravity", false),
+            Ok(Agent::Antigravity)
+        );
     }
 
     #[test]

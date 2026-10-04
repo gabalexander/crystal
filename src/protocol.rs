@@ -1325,16 +1325,21 @@ pub struct Conversation {
     pub id: String,
     /// The file the agent keeps the conversation in.
     pub transcript: Option<PathBuf>,
+    /// Whether the agent has worked on a turn in it, for a conversation
+    /// whose hooks don't say where it's kept.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub prompted: bool,
 }
 
 impl Conversation {
     /// Whether there's anything to pick up: an agent that was never sent a
     /// prompt hasn't written its transcript, and can't resume it. Codex
     /// compresses the transcripts it hasn't touched in a while, adding
-    /// `.zst` to the name, and resumes those all the same.
+    /// `.zst` to the name, and resumes those all the same. One whose file
+    /// nobody named can be once its agent has worked on a turn in it.
     pub fn can_resume(&self) -> bool {
         let Some(path) = &self.transcript else {
-            return false;
+            return self.prompted;
         };
         let compressed = PathBuf::from(format!("{}.zst", path.display()));
         path.is_file() || compressed.is_file()
@@ -1362,6 +1367,10 @@ pub enum AgentEvent {
     SubagentStarted,
     /// One of its subagents finished. The agent's turn goes on.
     SubagentStopped,
+    /// The agent named the conversation it's in, which says nothing about
+    /// what it's doing: a hook that runs at no point of a turn crystal can
+    /// tell, or one whose agent says too little to read its turns by.
+    Named,
 }
 
 /// What the agent in a session is doing.
@@ -1566,10 +1575,30 @@ mod tests {
         let conversation = Conversation {
             id: "abc".into(),
             transcript: Some(transcript.clone()),
+            prompted: true,
         };
         assert!(!conversation.can_resume());
         std::fs::write(&transcript, "{}\n").unwrap();
         assert!(conversation.can_resume());
+    }
+
+    #[test]
+    fn a_conversation_with_no_file_resumes_once_it_has_had_a_turn() {
+        let mut conversation = Conversation {
+            id: "abc".into(),
+            transcript: None,
+            prompted: false,
+        };
+        assert!(!conversation.can_resume());
+        let saved = serde_json::to_string(&conversation).unwrap();
+        assert_eq!(saved, r#"{"id":"abc","transcript":null}"#);
+        conversation.prompted = true;
+        assert!(conversation.can_resume());
+        let saved = serde_json::to_string(&conversation).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Conversation>(&saved).unwrap(),
+            conversation
+        );
     }
 
     #[test]

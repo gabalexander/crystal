@@ -13,6 +13,7 @@ use crate::handover::{self, Got};
 use crate::keys;
 use crate::model;
 use crate::notify::{self, Notice};
+use crate::printable;
 use crate::protocol::{
     Activity, AgentEvent, AgentReport, Answer, Asking, Conversation, Front, InProgress, Metadata,
     Reporter, ScreenExplained, SessionInfo, State, TaskInfo, TaskOutcome, TaskRecord, TaskResult,
@@ -269,6 +270,7 @@ impl Handed {
             Some(task) => task.conversation().map(|id| Conversation {
                 id,
                 transcript: None,
+                prompted: false,
             }),
             None => self.conversation.clone(),
         };
@@ -469,7 +471,7 @@ impl Session {
     /// its turn to start again from `saved`, with no program yet: its screen
     /// says so to whoever looks. It keeps its `id` once it has started.
     pub fn to_start(id: String, saved: SavedSession) -> Session {
-        let name = saved.name.clone();
+        let name = printable::line(&saved.name).into_owned();
         let session = Session::unstarted(id, saved);
         session.term.show(
             format!("\x1b[2mstarting {name} again after crystal's restart…\x1b[0m").as_bytes(),
@@ -543,10 +545,10 @@ impl Session {
     /// The session waiting its turn couldn't start, for the reason `why`:
     /// its screen says so, and the start it waited for is over.
     pub fn fail_to_start(&mut self, why: &str) {
-        let name = &self.name;
+        let (name, shown) = (printable::line(&self.name), printable::line(why));
         let said = format!(
             "\r\n\x1b[1mcrystal couldn't start {name} again after the restart:\x1b[0m\r\n\r\n  \
-             {why}\r\n\r\nIt's kept as it was: once that's put right, Enter in crystal's \
+             {shown}\r\n\r\nIt's kept as it was: once that's put right, Enter in crystal's \
              sidebar or `crystal respawn {name}` starts it again, and `crystal kill {name}` \
              lets it go.\r\n"
         );
@@ -698,6 +700,9 @@ impl Session {
     /// Cancels the session's task, if it's open, saying `why`, and gives it
     /// back as the project's history keeps it.
     pub fn cancel_task(&mut self, why: &str) -> Option<TaskRecord> {
+        // A task's run that started before it was last looked at would open
+        // it again once it was: it's looked at first.
+        self.check_runs();
         if !self.goal.as_ref().is_some_and(TaskInfo::is_open) {
             return None;
         }
@@ -950,7 +955,10 @@ impl Session {
                     resume: None,
                 });
                 reporter.agent = agent;
-                reporter.message = message.filter(|message| !message.trim().is_empty());
+                // Shown on the user's screen, and in their notifications.
+                reporter.message = message
+                    .map(|message| printable::line(&message).trim().to_string())
+                    .filter(|message| !message.is_empty());
                 if resume.is_some() {
                     reporter.resume = resume;
                 }
@@ -1088,8 +1096,16 @@ impl Session {
     }
 
     /// Takes what the agent is doing now, noting the change for the daemon
-    /// to tell.
+    /// to tell. A conversation the agent works on a turn in has something
+    /// to pick up again, which only one with no file to look for needs
+    /// told.
     fn set_activity(&mut self, activity: Option<Activity>) {
+        if activity == Some(Activity::Working)
+            && let Some(conversation) = self.conversation.as_mut()
+            && conversation.transcript.is_none()
+        {
+            conversation.prompted = true;
+        }
         if activity != self.activity {
             self.changes.push(Change::Activity {
                 from: self.activity,
@@ -1103,20 +1119,25 @@ impl Session {
     /// runs, any other program's from its screen, and fails a task whose
     /// session has ended under it.
     pub fn check(&mut self) {
-        match self.task.as_mut().map(Task::events) {
-            Some(events) => {
-                for event in events {
-                    // How a run ended closes its task first: a task that
-                    // stays open waits on the user.
-                    self.follow_runs(event);
-                    self.on_agent_event(event);
-                }
-            }
-            None => self.check_screen(),
+        if self.task.is_some() {
+            self.check_runs();
+        } else {
+            self.check_screen();
         }
         self.check_bell();
         self.check_copies();
         self.fail_task_if_ended();
+    }
+
+    /// Keeps up with a task's runs since it last looked.
+    fn check_runs(&mut self) {
+        let events = self.task.as_mut().map(Task::events).unwrap_or_default();
+        for event in events {
+            // How a run ended closes its task first: a task that stays
+            // open waits on the user.
+            self.follow_runs(event);
+            self.on_agent_event(event);
+        }
     }
 
     /// Marks the session when its program has rung the bell while nobody
@@ -1361,15 +1382,25 @@ impl Session {
     /// One that isn't the session's own program was typed into its shell:
     /// a restart resumes it by typing its command for that conversation.
     pub fn set_hooked_conversation(&mut self, agent: &str, mut conversation: Conversation) {
-        let own = agents::program_name(&self.command) == Some(agent);
+        // An agent's hooks may call it otherwise than its program is
+        // called, as Cursor's do `cursor-agent`.
+        let own = agents::program_name(&self.command)
+            .is_some_and(|program| agent_rules::current().same_agent(program, agent));
         self.typed_agent = (!own).then(|| agent.to_string());
         // A hook that doesn't say where the conversation is kept, as
-        // Codex's needn't, leaves the file known already.
-        if conversation.transcript.is_none()
-            && let Some(known) = self.conversation.take()
+        // Codex's needn't, leaves the file known already, and the turns
+        // seen in it.
+        if let Some(known) = self.conversation.take()
             && known.id == conversation.id
         {
-            conversation.transcript = known.transcript;
+            if conversation.transcript.is_none() {
+                conversation.transcript = known.transcript;
+            }
+            conversation.prompted |= known.prompted;
+        }
+        // Named as it works, the agent is working in it.
+        if conversation.transcript.is_none() && self.activity == Some(Activity::Working) {
+            conversation.prompted = true;
         }
         self.conversation = Some(conversation);
     }
@@ -1457,6 +1488,7 @@ impl Session {
             Some(task) => task.conversation().map(|id| Conversation {
                 id,
                 transcript: None,
+                prompted: false,
             }),
             None => self.conversation.clone(),
         };
@@ -2037,6 +2069,7 @@ fn next_activity(before: Option<Activity>, event: AgentEvent, watched: bool) -> 
         AgentEvent::StillIdle => return before,
         // A subagent's start and end are the agent's work, not its turn.
         AgentEvent::SubagentStarted | AgentEvent::SubagentStopped => return before,
+        AgentEvent::Named => return before,
     };
     // A turn that ends while someone's watching has been seen.
     if after == Activity::Done && watched {
@@ -2151,6 +2184,7 @@ mod tests {
             conversation: Some(Conversation {
                 id: "conv-1".into(),
                 transcript: None,
+                prompted: false,
             }),
             rollouts: None,
             told: Some(Waiting),
@@ -2219,6 +2253,7 @@ mod tests {
             conversation: Some(Conversation {
                 id: "conv-1".into(),
                 transcript: None,
+                prompted: false,
             }),
             task: None,
             goal: Some(TaskInfo {
@@ -2329,6 +2364,7 @@ mod tests {
             conversation: Some(Conversation {
                 id: "conv-1".into(),
                 transcript: None,
+                prompted: false,
             }),
             rollouts: None,
             told: None,
@@ -2374,6 +2410,7 @@ mod tests {
         let conversation = Conversation {
             id: "conv-2".into(),
             transcript: None,
+            prompted: false,
         };
         session.set_hooked_conversation("claude", conversation.clone());
         assert_eq!(session.typed_agent.as_deref(), Some("claude"));
@@ -2389,6 +2426,7 @@ mod tests {
         let kept = |id: &str, file: Option<&str>| Conversation {
             id: id.into(),
             transcript: file.map(PathBuf::from),
+            prompted: false,
         };
         session.set_hooked_conversation("claude", kept("conv-1", Some("/t/conv-1.jsonl")));
         session.set_hooked_conversation("claude", kept("conv-1", None));
@@ -2396,9 +2434,49 @@ mod tests {
             session.conversation,
             Some(kept("conv-1", Some("/t/conv-1.jsonl")))
         );
-        // Another conversation's file isn't this one's.
+        // Another conversation's file isn't this one's. With none, it has
+        // had a turn once it's named as its agent works.
         session.set_hooked_conversation("claude", kept("conv-2", None));
-        assert_eq!(session.conversation, Some(kept("conv-2", None)));
+        let worked = Conversation {
+            prompted: true,
+            ..kept("conv-2", None)
+        };
+        assert_eq!(session.conversation, Some(worked));
+    }
+
+    #[test]
+    fn a_conversation_with_no_file_counts_once_its_agent_works_in_it() {
+        let mut session = typed_claude(claude());
+        session.on_agent_event(AgentEvent::Started);
+        let named = Conversation {
+            id: "k-1".into(),
+            transcript: None,
+            prompted: false,
+        };
+        session.set_hooked_conversation("claude", named.clone());
+        let resumes = |session: &Session| session.conversation.as_ref().unwrap().can_resume();
+        assert!(!resumes(&session), "never sent a prompt");
+        session.on_agent_event(AgentEvent::Named);
+        assert!(!resumes(&session));
+        session.on_agent_event(AgentEvent::TurnStarted);
+        assert!(resumes(&session));
+        // Named again, it keeps the turns it had.
+        session.on_agent_event(AgentEvent::TurnEnded);
+        session.set_hooked_conversation("claude", named);
+        assert!(resumes(&session));
+    }
+
+    #[test]
+    fn an_agent_s_hooks_may_name_it_otherwise_than_its_program() {
+        let mut session = typed_claude(claude());
+        session.command = vec!["/usr/local/bin/cursor-agent".into()];
+        let named = Conversation {
+            id: "c-1".into(),
+            transcript: None,
+            prompted: false,
+        };
+        session.set_hooked_conversation("cursor", named);
+        assert_eq!(session.typed_agent, None, "it's the session's own");
     }
 
     #[test]
@@ -2408,6 +2486,7 @@ mod tests {
         let conversation = Conversation {
             id: "conv-1".into(),
             transcript: Some(transcript.clone()),
+            prompted: false,
         };
         let restart = |front: Option<Front>, reporter: Option<&Reporter>| {
             restart_with(
@@ -2602,5 +2681,59 @@ mod tests {
         assert_eq!(after(Some(Working), AgentEvent::StillIdle), Some(Done));
         assert_eq!(after(Some(Idle), AgentEvent::StillIdle), Some(Idle));
         assert_eq!(after(Some(Waiting), AgentEvent::StillIdle), Some(Waiting));
+    }
+
+    #[test]
+    fn a_task_cancelled_before_its_run_was_looked_at_stays_cancelled() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        // A `claude` that works until it's stopped.
+        let claude = dir.path().join("claude");
+        std::fs::write(&claude, "#!/bin/sh\nexec /bin/sleep 30\n").unwrap();
+        std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let db = crate::db::Db::open(&dir.path().join("crystal.sock")).unwrap();
+        let env = BTreeMap::from([("PATH".to_string(), dir.path().display().to_string())]);
+        let spec = TaskSpec {
+            prompt: "fix the tests".into(),
+            args: Vec::new(),
+        };
+        let mut session = Session::task(
+            "id-1".into(),
+            "fixer".into(),
+            spec,
+            Vec::new(),
+            dir.path().to_path_buf(),
+            env,
+            Arc::new(Spending::new(db)),
+            None,
+        );
+        session.give_task(TaskInfo {
+            id: Some(1),
+            goal: "fix the tests".into(),
+            background: true,
+            backlog: None,
+            waiting: false,
+            created: 1,
+            outcome: None,
+            brief: Default::default(),
+        });
+        session.prompt("fix the tests").unwrap();
+
+        // Cancelled and stopped before the daemon looked at the run that
+        // started, as a flow's cancel can come.
+        let cancelled = session.cancel_task("its flow was cancelled").unwrap();
+        assert_eq!(cancelled.state(), TaskState::Cancelled);
+        session.stop();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while session.is_running() {
+            assert!(Instant::now() < deadline, "the task never stopped");
+            thread::sleep(Duration::from_millis(20));
+        }
+        // Looked at since, the run neither opens it again nor has it fail
+        // for the session that ended under it.
+        session.check();
+        assert!(session.take_closed().is_empty());
+        let record = session.task_record().unwrap();
+        assert_eq!(record.state(), TaskState::Cancelled);
     }
 }

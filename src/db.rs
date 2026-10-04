@@ -1131,6 +1131,7 @@ mod tests {
             conversation: Some(Conversation {
                 id: "abc".into(),
                 transcript: None,
+                prompted: false,
             }),
             task: None,
             goal: None,

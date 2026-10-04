@@ -459,16 +459,21 @@ impl Subscription {
         &mut self,
         deadline: Option<Instant>,
     ) -> Result<Option<T>> {
-        let socket = self.input.get_ref();
-        match deadline {
+        let timeout = match deadline {
             Some(deadline) => {
                 let left = deadline.saturating_duration_since(Instant::now());
                 if left.is_zero() {
                     return Ok(None);
                 }
-                socket.set_read_timeout(Some(left))?;
+                Some(left)
             }
-            None => socket.set_read_timeout(None)?,
+            None => None,
+        };
+        // A Mac refuses it on a connection the daemon has closed, as a
+        // handover does: the read below gives what's left, then the end.
+        match self.input.get_ref().set_read_timeout(timeout) {
+            Err(err) if err.kind() != ErrorKind::InvalidInput => return Err(err.into()),
+            _ => {}
         }
         match self.input.read_until(b'\n', &mut self.line) {
             Ok(_) if self.line.ends_with(b"\n") => {
@@ -596,8 +601,10 @@ fn hand_over(socket: &Path) -> Result<HandOver> {
         exe: std::env::current_exe()?,
         format: handover::FORMAT,
     };
-    protocol::send_request(&conn, &request)?;
+    // Before asking: once a daemon from before handovers has answered, and
+    // closed the connection, a Mac refuses it.
     conn.set_read_timeout(Some(HANDOVER_TIMEOUT))?;
+    protocol::send_request(&conn, &request)?;
     let answer = match protocol::recv(BufReader::new(&conn)) {
         Ok(Some(Response::HandedOver { sessions })) => return Ok(HandOver::Done { sessions }),
         Ok(Some(Response::Error { message })) => match message.strip_prefix("couldn't hand over: ")
@@ -693,6 +700,33 @@ mod tests {
         assert!(stop_daemon(&socket, false).unwrap());
         assert!(!socket.exists());
         daemon.join().unwrap();
+    }
+
+    #[test]
+    fn a_subscription_reads_what_came_before_the_daemon_hung_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("test.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let (go, going) = std::sync::mpsc::channel();
+        // A daemon that starts the stream, then sends an event and hangs
+        // up, as one handing over does.
+        let daemon = thread::spawn(move || {
+            let (conn, _) = listener.accept().unwrap();
+            let mut request = String::new();
+            BufReader::new(&conn).read_line(&mut request).unwrap();
+            protocol::send(&conn, &Response::Subscribed { seq: 0 }).unwrap();
+            going.recv().unwrap();
+            let mut event = Event::handed_over("0.1.0", "0.2.0", 1);
+            event.seq = 1;
+            protocol::send(&conn, &event).unwrap();
+        });
+        let mut subscription = subscribe(&socket, Filter::default(), None).unwrap();
+        go.send(()).unwrap();
+        daemon.join().unwrap();
+        // A Mac won't set a timeout on the connection now, but what came
+        // before the end is read all the same.
+        let event = subscription.next_before(None).unwrap().unwrap();
+        assert_eq!(event.seq, 1);
     }
 
     #[test]

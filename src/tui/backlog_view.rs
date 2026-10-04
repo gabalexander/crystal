@@ -105,6 +105,12 @@ impl BacklogView {
         self.removing.map(|number| format!("remove #{number}? y/n"))
     }
 
+    /// Whether a key typed is a character, not a move: while an item or
+    /// the filter is typed, or `x` asks.
+    pub fn typing(&self) -> bool {
+        self.adding.is_some() || self.filtering || self.removing.is_some()
+    }
+
     pub fn on_key(&mut self, key: &KeyEvent) -> Step {
         if let Some(number) = self.removing.take() {
             return match key.code {

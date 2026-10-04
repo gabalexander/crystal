@@ -7,7 +7,7 @@
 use crate::flows::Flow;
 use crate::plugins;
 use crate::profile::Profile;
-use crate::tui::keymap::{Binding, Keymap};
+use crate::tui::keymap::{KeySettings, Keymap};
 use crate::vt;
 use anyhow::{Context, Result, bail};
 use ratatui::style::Color;
@@ -90,10 +90,11 @@ pub struct Config {
     /// `[[project]]` tables in the file. See [`crate::project_commands`].
     #[serde(rename = "project", skip_serializing_if = "Vec::is_empty")]
     pub projects: Vec<ProjectSettings>,
-    /// The TUI's keys, by command, and its prefix: `[keys]` in the file.
-    /// See [`crate::tui::keymap`].
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    pub keys: BTreeMap<String, Binding>,
+    /// The TUI's keys, by command, its prefixes, the modes' keys and the
+    /// user's own: `[keys]` and `[[keys.command]]` in the file. See
+    /// [`crate::tui::keymap`].
+    #[serde(skip_serializing_if = "KeySettings::is_empty")]
+    pub keys: KeySettings,
     /// How the TUI's sidebar is laid out: `[sidebar]` in the file.
     pub sidebar: SidebarSettings,
     /// The shell a new terminal runs, and where the TUI starts one:
@@ -875,7 +876,7 @@ impl Default for Config {
             profiles: Vec::new(),
             flows: Vec::new(),
             projects: Vec::new(),
-            keys: BTreeMap::new(),
+            keys: KeySettings::default(),
             sidebar: SidebarSettings::default(),
             terminal: TerminalSettings::default(),
             window: WindowSettings::default(),
@@ -1210,6 +1211,7 @@ mod tests {
     use super::*;
     use crate::flows::{Placement, Step};
     use crate::profile::StartIn;
+    use crate::tui::keymap::{Binding, CommandKind, Extent, KeyCommand, SplitWay};
 
     fn parse(text: &str) -> Result<Config> {
         from_text(text)
@@ -1695,11 +1697,25 @@ back_to = "build"
     #[test]
     fn keys_and_the_sidebar_are_checked() {
         let keys = parse("[keys]\nkill = \"n\"\nnew-session = \"N\"").unwrap();
-        assert_eq!(keys.keys.len(), 2);
+        assert_eq!(keys.keys.bindings.len(), 2);
         let unknown = parse("[keys]\nkil = \"n\"").unwrap_err();
         assert!(format!("{unknown:#}").contains("kil"), "{unknown:#}");
         let twice = parse("[keys]\nkill = \"q\"\nquit = \"q\"").unwrap_err();
         assert!(format!("{twice:#}").contains("both"), "{twice:#}");
+        let own = "[keys]\nkill = \"X\"\n\n[[keys.command]]\nkey = \"ctrl+g\"\ntype = \"popup\"\n\
+                   command = \"lazygit\"\n";
+        let own = parse(own).unwrap();
+        assert_eq!(own.keys.bindings.len(), 1);
+        assert_eq!(own.keys.commands[0].command, "lazygit");
+        let kind = parse("[[keys.command]]\nkey = \"g\"\ntype = \"window\"\ncommand = \"x\"");
+        assert!(format!("{:#}", kind.unwrap_err()).contains("window"));
+        let field = parse("[[keys.command]]\nkey = \"g\"\ntype = \"tab\"\ncmd = \"x\"");
+        assert!(format!("{:#}", field.unwrap_err()).contains("cmd"));
+        let value = parse("[keys]\nkill = 5").unwrap_err();
+        assert!(
+            format!("{value:#}").contains("a key, a list of keys"),
+            "{value:#}"
+        );
         let narrow = parse("[sidebar]\nwidth = 4").unwrap_err();
         assert!(format!("{narrow:#}").contains("width"), "{narrow:#}");
         let folded = parse("[sidebar]\nfolded = true\nfold = \"hidden\"").unwrap();
@@ -1926,13 +1942,43 @@ back_to = "build"
                 run: Some("npm run dev".into()),
                 open: Some("code .".into()),
             }],
-            keys: BTreeMap::from([
-                ("prefix".to_string(), Binding::One("ctrl+a".into())),
-                (
-                    "new-session".to_string(),
-                    Binding::Many(vec!["n".into(), "ctrl+n".into()]),
-                ),
-            ]),
+            keys: KeySettings {
+                bindings: BTreeMap::from([
+                    (
+                        "prefix".to_string(),
+                        Binding::Many(vec!["ctrl+a".into(), "ctrl+b".into()]),
+                    ),
+                    (
+                        "new-session".to_string(),
+                        Binding::Many(vec!["n".into(), "ctrl+n".into()]),
+                    ),
+                    (
+                        "pane-left".to_string(),
+                        Binding::Many(vec!["shift+left".into(), "direct+ctrl+alt+h".into()]),
+                    ),
+                    ("answer-yes".to_string(), Binding::One("a".into())),
+                ]),
+                commands: vec![
+                    KeyCommand {
+                        key: Binding::One("direct+ctrl+alt+g".into()),
+                        kind: CommandKind::Popup,
+                        command: "lazygit".into(),
+                        description: Some("git, in a popup".into()),
+                        width: Some(Extent::Share("80%".into())),
+                        height: Some(Extent::Cells(30)),
+                        split: None,
+                    },
+                    KeyCommand {
+                        key: Binding::One("ctrl+t".into()),
+                        kind: CommandKind::Pane,
+                        command: "make test".into(),
+                        description: None,
+                        width: None,
+                        height: None,
+                        split: Some(SplitWay::Down),
+                    },
+                ],
+            },
             sidebar: SidebarSettings {
                 width: 36,
                 folded: true,
