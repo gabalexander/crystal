@@ -34,6 +34,7 @@ use super::plugins_view::{self, PluginsView};
 use super::preview::Content;
 use super::profiles::{self, ProfilesView};
 use super::pull_requests::{self, PullRequestsView};
+use super::ram_view::{self, RamView};
 use super::reply::ReplyBox;
 use super::restarted::{Restarted, Restarts};
 use super::review;
@@ -60,10 +61,12 @@ use crate::protocol::{
     Activity, Answer, ArchivedSession, Backlog, ForgeLink, Front, SessionInfo, Spending, State,
     TaskBrief, TaskSpec, Worktree, task_label,
 };
+use crate::resources::Resources;
 use crate::shell;
 use crate::{backlog, handoff, names, plugins, project, tasks};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
 use ratatui::layout::Rect;
+use std::cell::Cell;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -126,6 +129,9 @@ pub enum Hit {
     /// browser's is dragged: the column the mouse is at, counted from the
     /// view's left edge.
     ViewBorder(u16),
+    /// The footer's readout of the memory crystal takes, which opens the
+    /// RAM view.
+    Readout,
     /// The footer, or anywhere else.
     Elsewhere,
 }
@@ -239,6 +245,9 @@ pub enum Question {
     /// Notes on what the flow run called this is to do differently,
     /// sending it back from its gate.
     SendFlowBack(String),
+    /// The directory of a project to put on the list of those crystal
+    /// knows.
+    AddProject,
 }
 
 /// A question on the footer line that `y` answers yes and any other key
@@ -275,6 +284,14 @@ pub enum Confirm {
         path: PathBuf,
         name: String,
     },
+    /// Quit the TUI, the sessions carrying on in the daemon.
+    Quit,
+    /// Make the directory `dir` a git repository, and first the directory,
+    /// with `create`, then put it on the list of projects.
+    NewProject {
+        dir: PathBuf,
+        create: bool,
+    },
 }
 
 impl Confirm {
@@ -307,6 +324,16 @@ impl Confirm {
             Confirm::ForgetProject { name, .. } => {
                 format!("take {name} off the list? Nothing on disk changes. y/n")
             }
+            Confirm::Quit => "quit crystal? The sessions keep running. y/n".to_string(),
+            // The directory last, where a long one cut short loses least.
+            Confirm::NewProject { dir, create: true } => {
+                let dir = shell::home_relative(dir);
+                format!("make a new git repository and add it: {dir}? y/n")
+            }
+            Confirm::NewProject { dir, create: false } => {
+                let dir = shell::home_relative(dir);
+                format!("make it a git repository and add it: {dir}? y/n")
+            }
         }
     }
 
@@ -332,6 +359,8 @@ impl Confirm {
             },
             Confirm::CloseTab { sessions, .. } => Action::KillAll(sessions),
             Confirm::ForgetProject { path, .. } => Action::ForgetProject(path),
+            Confirm::Quit => Action::Quit,
+            Confirm::NewProject { dir, create } => Action::NewProject { dir, create },
         }
     }
 }
@@ -424,6 +453,19 @@ pub enum Action {
     /// Take the project whose main worktree is this off the list of those
     /// crystal knows.
     ForgetProject(PathBuf),
+    /// Put the project in this directory on the list of those crystal
+    /// knows, once it's one: a directory that isn't there, or isn't in a
+    /// git repository, is asked about first.
+    AddProject(PathBuf),
+    /// Make the directory `dir` a git repository, and first the directory,
+    /// with `create`, then put it on the list of projects.
+    NewProject {
+        dir: PathBuf,
+        create: bool,
+    },
+    /// Finish the directory typed so far as the answer to the question
+    /// asked, as Tab does in a shell.
+    CompleteDirectory(String),
     /// Run the project's run command in `worktree`, or stop it, or its open
     /// command there.
     ProjectCommand {
@@ -684,6 +726,10 @@ pub enum Action {
     FollowEvents(Scope),
     /// The timeline has closed: stop following the log.
     StopFollowing,
+    /// The RAM view has opened: look at what the sessions take often.
+    OpenRam,
+    /// The RAM view has closed: look only as often as the footer needs.
+    CloseRam,
     /// Read the page of the event log of `scope` before the event with
     /// this `seq`, for the timeline.
     ReadOlderEvents {
@@ -986,6 +1032,8 @@ pub struct App {
     memory_on: bool,
     /// Whether tasks are on: closing them, and showing how they stand.
     tasks_on: bool,
+    /// Whether `q` asks before it quits: see [`Config::confirm_quit`].
+    confirm_quit: bool,
     /// Whether the handoff file is on: the notes `M` reads.
     handoff_on: bool,
     /// Whether the backlog is on: its view, and its counts in the sidebar.
@@ -1031,6 +1079,13 @@ pub struct App {
     timeline: Option<TimelineView>,
     /// The list of everything waiting on the user, while it's open.
     needs_you: Option<NeedsYouView>,
+    /// The RAM view, while it's open.
+    ram: Option<RamView>,
+    /// What the daemon last found crystal's processes take.
+    resources: Option<Resources>,
+    /// Where the footer last drew its readout of that, for a click on it;
+    /// `None` while something else has the footer.
+    readout_at: Cell<Option<Rect>>,
     /// What happened while the user was away, and since when, until the
     /// timeline is opened at that point.
     away: Option<Away>,
@@ -1182,6 +1237,7 @@ impl App {
             memory_on: true,
             handoff_on: true,
             tasks_on: true,
+            confirm_quit: true,
             backlog_on: true,
             github_on: true,
             plugins_view: None,
@@ -1201,6 +1257,9 @@ impl App {
             server: None,
             timeline: None,
             needs_you: None,
+            ram: None,
+            resources: None,
+            readout_at: Cell::new(None),
             away: None,
             away_shown: false,
             restarts: Restarts::default(),
@@ -1372,6 +1431,7 @@ impl App {
     /// Takes which of crystal's plugins the config has on.
     pub fn set_features(&mut self, config: &Config) {
         self.tasks_on = tasks::enabled(config);
+        self.confirm_quit = config.confirm_quit;
         self.backlog_on = backlog::enabled(config);
         self.memory_on = crate::memory::enabled(config);
         self.handoff_on = handoff::enabled(config);
@@ -1833,6 +1893,34 @@ impl App {
 
     pub fn timeline_view(&self) -> Option<&TimelineView> {
         self.timeline.as_ref()
+    }
+
+    /// The RAM view, while it's open.
+    pub fn ram_view(&self) -> Option<&RamView> {
+        self.ram.as_ref()
+    }
+
+    /// What the daemon last found crystal's processes take, once it has.
+    pub fn resources(&self) -> Option<&Resources> {
+        self.resources.as_ref()
+    }
+
+    /// Takes what the daemon found crystal's processes take now.
+    pub fn set_resources(&mut self, resources: Resources) {
+        if let Some(view) = &mut self.ram {
+            view.refresh(ram_view::rows(&resources, &self.sessions));
+        }
+        self.resources = Some(resources);
+    }
+
+    /// Where the footer drew its readout this time, if it did.
+    pub fn drew_readout(&self, at: Option<Rect>) {
+        self.readout_at.set(at);
+    }
+
+    /// Where the footer last drew its readout, if it did.
+    pub fn readout_at(&self) -> Option<Rect> {
+        self.readout_at.get()
     }
 
     pub fn needs_you_view(&self) -> Option<&NeedsYouView> {
@@ -3546,6 +3634,9 @@ impl App {
         if self.needs_you.is_some() {
             return self.on_needs_you_key(key);
         }
+        if self.ram.is_some() {
+            return self.on_ram_key(key);
+        }
         if self.timeline.is_some() {
             return self.on_timeline_key(key);
         }
@@ -3721,6 +3812,7 @@ impl App {
         }
         match (kind, hit) {
             (_, Hit::Tab(index)) if click => self.go_to_tab(index),
+            (_, Hit::Readout) if click => return Some(self.open_ram()),
             (_, Hit::SidebarRow(row)) if click => self.click_row(row),
             // Anywhere else in the sidebar, the click only takes the keyboard.
             (_, Hit::Sidebar) if click => self.focus = Focus::Sidebar,
@@ -3945,6 +4037,7 @@ impl App {
             items.push(Item::new("copy mode", Command::Copy));
             items.push(Item::new("edit its history", Command::EditHistory));
         }
+        items.push(Item::new("start one like it", Command::Duplicate));
         items.push(Item::new("rename", Command::Rename));
         items.push(Item::new("move to another tab", Command::MoveToTab));
         if session.worktree.is_some() {
@@ -4036,6 +4129,7 @@ impl App {
             || self.command_list.is_some()
             || self.timeline.is_some()
             || self.needs_you.is_some()
+            || self.ram.is_some()
             || self.issues.is_some()
             || self.pull_requests_view.is_some()
             || self.backlog.is_some()
@@ -4234,6 +4328,8 @@ impl App {
             Command::PageDown => return Some(Action::PageForward(self.selected_slot()?)),
             Command::NewSession => return self.open_launcher(false),
             Command::NewWorktree => return self.open_launcher(true),
+            Command::Duplicate => return self.duplicate(),
+            Command::AddProject => self.ask_for_project(),
             Command::RemoveWorktree => self.ask_to_remove_worktree(),
             Command::Rename => self.ask_for_name(),
             Command::Kill => self.confirm = Some(Confirm::Kill(self.selected()?.name.clone())),
@@ -4296,6 +4392,8 @@ impl App {
                 self.settings = Some(SettingsView::new());
                 return Some(Action::OpenSettings);
             }
+            Command::Ram => return Some(self.open_ram()),
+            Command::Quit if self.confirm_quit => self.confirm = Some(Confirm::Quit),
             Command::Quit => return Some(Action::Quit),
         }
         None
@@ -4725,6 +4823,9 @@ impl App {
         }
         if self.needs_you.is_some() {
             return Some((false, true));
+        }
+        if self.ram.is_some() {
+            return Some((false, false));
         }
         if self.timeline.is_some() {
             return Some((true, false));
@@ -5501,6 +5602,26 @@ impl App {
         self.codex_models_wanted()
     }
 
+    /// `D`: the new-session panel, set to start a session like the selected
+    /// one, where it runs; for a program the panel doesn't start, the
+    /// command line, holding the program's.
+    fn duplicate(&mut self) -> Option<Action> {
+        let Some(session) = self.selected().cloned() else {
+            self.notify("select the session to start one like".into());
+            return None;
+        };
+        let background = session.front == Some(Front::Task);
+        let like = Launcher::new(self.launch_setup(false)).like(&session.command, background);
+        let Some(launcher) = like else {
+            let line: Vec<String> = session.command.iter().map(|a| shell::quote(a)).collect();
+            let place = Place::Directory(Some(session.cwd.clone()));
+            self.ask(Question::Command(place), &line.join(" "));
+            return None;
+        };
+        self.launcher = Some(launcher);
+        self.codex_models_wanted()
+    }
+
     /// What the panel opens with: what can run, with what to pick first,
     /// where it can start, and the tasks given before.
     fn launch_setup(&self, worktree: bool) -> Setup {
@@ -5763,7 +5884,7 @@ impl App {
             view.on_paste(&text);
         } else if let Some(prompt) = &mut self.prompt {
             prompt.input.insert_str(&text);
-        } else if self.needs_you.is_some() {
+        } else if self.needs_you.is_some() || self.ram.is_some() {
             return None;
         } else if let Some(view) = &mut self.timeline {
             view.on_paste(&text);
@@ -5807,6 +5928,11 @@ impl App {
                 let prompt = self.prompt.take()?;
                 self.answer(prompt)
             }
+            KeyCode::Tab => {
+                let prompt = self.prompt.as_ref()?;
+                (prompt.question == Question::AddProject)
+                    .then(|| Action::CompleteDirectory(prompt.input.text().to_string()))
+            }
             _ => {
                 if let Some(prompt) = &mut self.prompt {
                     prompt.input.on_key(&key);
@@ -5814,6 +5940,52 @@ impl App {
                 None
             }
         }
+    }
+
+    /// `+`: asks for the directory of a project to add, starting in the one
+    /// the selection's project, or else the TUI, is in, for a project
+    /// beside it.
+    fn ask_for_project(&mut self) {
+        let project = self.selection_worktree().map(|w| w.project_path.clone());
+        let beside = project.or_else(|| self.start_dir.clone());
+        let parent = beside.as_deref().and_then(Path::parent);
+        let start = match parent.map(shell::home_relative) {
+            Some(parent) if parent.ends_with('/') => parent,
+            Some(parent) => format!("{parent}/"),
+            None => String::new(),
+        };
+        self.ask(Question::AddProject, &start);
+    }
+
+    /// Takes `completed` as the directory typed so far, as Tab finished it.
+    pub fn complete_answer(&mut self, completed: &str) {
+        if let Some(prompt) = &mut self.prompt
+            && prompt.question == Question::AddProject
+        {
+            prompt.input = TextInput::with_text(completed);
+        }
+    }
+
+    /// Asks before making `dir`, which isn't a git repository, one, and
+    /// with `create`, the directory too, which isn't there.
+    pub fn confirm_new_project(&mut self, dir: PathBuf, create: bool) {
+        self.confirm = Some(Confirm::NewProject { dir, create });
+    }
+
+    /// The project whose main worktree is `path` is on the list now, and
+    /// among the projects known: the selection goes to it, and the footer
+    /// says so.
+    pub fn project_added(&mut self, path: &Path) {
+        let name = crate::project::name_of(path);
+        let has_sessions = self
+            .sessions
+            .iter()
+            .any(|s| s.worktree.as_ref().is_some_and(|w| w.project_path == path));
+        if !has_sessions {
+            self.select_worktree(path.to_path_buf());
+            self.keep_selection_on_a_row();
+        }
+        self.notify(format!("{name} is on the list of projects"));
     }
 
     /// What an answered question leads to: a command line, to a new
@@ -5847,6 +6019,12 @@ impl App {
                 summary: answer,
             }),
             Question::SendFlowBack(run) => Some(Action::SendFlowBack { run, notes: answer }),
+            Question::AddProject if answer.is_empty() => None,
+            Question::AddProject => {
+                let typed = answer.trim_end_matches('/');
+                let typed = if typed.is_empty() { "/" } else { typed };
+                Some(Action::AddProject(shell::expand_home(Path::new(typed))))
+            }
             Question::TabName => {
                 self.tabs.rename(&answer);
                 None
@@ -6616,6 +6794,33 @@ impl App {
         }
     }
 
+    /// `#`: opens the RAM view, on what the daemon last found, and has it
+    /// look more often while it's open.
+    fn open_ram(&mut self) -> Action {
+        let rows = self
+            .resources
+            .as_ref()
+            .map(|r| ram_view::rows(r, &self.sessions));
+        self.ram = Some(RamView::new(rows.unwrap_or_default()));
+        Action::OpenRam
+    }
+
+    /// Keys while the RAM view is open: all of them are its.
+    fn on_ram_key(&mut self, key: KeyEvent) -> Option<Action> {
+        match self.ram.as_mut()?.on_key(&key) {
+            ram_view::Step::Stay => None,
+            ram_view::Step::Close => {
+                self.ram = None;
+                Some(Action::CloseRam)
+            }
+            ram_view::Step::Go(name) => {
+                self.ram = None;
+                self.select(&name);
+                Some(Action::CloseRam)
+            }
+        }
+    }
+
     /// `a`: opens the timeline of everything, which marks what's new
     /// since the user was away when the footer has just said what that
     /// was, and has the log read for it. Ctrl+S narrows it to the
@@ -7108,6 +7313,23 @@ mod tests {
     #[test]
     fn q_asks_to_quit() {
         let mut app = app_with(&["a"]);
+        assert_eq!(press(&mut app, KeyCode::Char('q')), None);
+        assert_eq!(app.confirm(), Some(&Confirm::Quit));
+        // Any key but `y` stays.
+        assert_eq!(press(&mut app, KeyCode::Char('j')), None);
+        assert_eq!(app.confirm(), None);
+        press(&mut app, KeyCode::Char('q'));
+        assert_eq!(press(&mut app, KeyCode::Char('y')), Some(Action::Quit));
+    }
+
+    #[test]
+    fn q_quits_at_once_when_the_settings_say_not_to_ask() {
+        let mut app = app_with(&["a"]);
+        let config = Config {
+            confirm_quit: false,
+            ..Config::default()
+        };
+        app.set_features(&config);
         assert_eq!(press(&mut app, KeyCode::Char('q')), Some(Action::Quit));
     }
 
@@ -7209,6 +7431,44 @@ mod tests {
         assert!(app.launcher().is_none());
         assert_eq!(app.memory().tasks, ["fix the login bug"]);
         assert_eq!(app.memory().last_run.as_deref(), Some("claude"));
+    }
+
+    #[test]
+    fn capital_d_opens_the_panel_like_the_selected_session_where_it_runs() {
+        let agent = SessionInfo {
+            command: vec!["claude".into(), "--model".into(), "opus".into()],
+            ..in_project("agent", "app")
+        };
+        let mut app = with_agents(&["codex", "claude"], vec![agent]);
+        press(&mut app, KeyCode::Char('D'));
+        assert_eq!(run_key(&app), "claude");
+        type_text(&mut app, "now the docs");
+        let place = Place::Directory(Some(PathBuf::from("/code/app")));
+        assert_eq!(
+            press(&mut app, KeyCode::Enter),
+            start(
+                place,
+                &["claude", "--model", "opus", "--", "now the docs"],
+                "now the docs"
+            )
+        );
+    }
+
+    #[test]
+    fn capital_d_on_a_program_the_panel_doesnt_start_asks_for_its_command_line() {
+        let program = SessionInfo {
+            command: vec!["tail".into(), "-f".into(), "my log".into()],
+            ..session("logs")
+        };
+        let mut app = with_agents(&["claude"], vec![program]);
+        press(&mut app, KeyCode::Char('D'));
+        assert!(app.launcher().is_none());
+        let prompt = app.prompt().unwrap();
+        assert_eq!(prompt.input.text(), "tail -f 'my log'");
+        assert_eq!(
+            prompt.question,
+            Question::Command(Place::Directory(Some(PathBuf::from("/"))))
+        );
     }
 
     #[test]
@@ -11555,6 +11815,111 @@ gate = true
         assert!(app.needs_you_view().is_none());
         assert_eq!(selected_name(&app), Some("a"));
         assert_eq!(app.tabs().current_index(), 0);
+    }
+
+    fn resources(sessions: &[(&str, u64)]) -> Resources {
+        use crate::resources::{SessionUsage, Usage};
+        Resources {
+            daemon: Usage {
+                pid: 1,
+                bytes: 20 << 20,
+                processes: 1,
+            },
+            client: None,
+            sessions: sessions
+                .iter()
+                .map(|(name, mb)| SessionUsage {
+                    name: name.to_string(),
+                    usage: Usage {
+                        pid: 2,
+                        bytes: mb << 20,
+                        processes: 3,
+                    },
+                })
+                .collect(),
+            total: 16 << 30,
+        }
+    }
+
+    #[test]
+    fn hash_shows_what_each_session_takes_and_enter_goes_there() {
+        let mut app = app_with(&["small", "big"]);
+        app.set_resources(resources(&[("small", 30), ("big", 600)]));
+        assert_eq!(press(&mut app, KeyCode::Char('#')), Some(Action::OpenRam));
+        let row = app.ram_view().unwrap().highlighted().unwrap();
+        assert_eq!(row.name, "big");
+        // A new look reorders the rows; the bar stays on its session.
+        app.set_resources(resources(&[("small", 900), ("big", 600)]));
+        assert_eq!(app.ram_view().unwrap().highlighted().unwrap().name, "big");
+        // Its keys are the view's: in the sidebar, `x` would ask to kill.
+        press(&mut app, KeyCode::Char('x'));
+        assert!(app.confirm().is_none());
+        press(&mut app, KeyCode::Char('k'));
+        assert_eq!(press(&mut app, KeyCode::Enter), Some(Action::CloseRam));
+        assert!(app.ram_view().is_none());
+        assert_eq!(selected_name(&app), Some("small"));
+    }
+
+    #[test]
+    fn a_click_on_the_footer_s_readout_opens_the_ram_view() {
+        let mut app = app_with(&["a"]);
+        app.set_resources(resources(&[("a", 30)]));
+        let click = MouseEventKind::Down(MouseButton::Left);
+        assert_eq!(app.on_mouse(click, Hit::Readout), Some(Action::OpenRam));
+        assert!(app.ram_view().is_some());
+        assert_eq!(press(&mut app, KeyCode::Esc), Some(Action::CloseRam));
+    }
+
+    #[test]
+    fn plus_asks_for_a_project_beside_this_one_and_tab_finishes_the_directory() {
+        let mut app = with_agents(&["claude"], vec![in_project("agent", "app")]);
+        press(&mut app, KeyCode::Char('+'));
+        let prompt = app.prompt().unwrap();
+        assert_eq!(prompt.question, Question::AddProject);
+        assert_eq!(prompt.input.text(), "/code/");
+        type_text(&mut app, "pay");
+        assert_eq!(
+            press(&mut app, KeyCode::Tab),
+            Some(Action::CompleteDirectory("/code/pay".into()))
+        );
+        app.complete_answer("/code/payments/");
+        assert_eq!(
+            press(&mut app, KeyCode::Enter),
+            Some(Action::AddProject(PathBuf::from("/code/payments")))
+        );
+        // One that isn't a git repository yet is asked about.
+        app.confirm_new_project(PathBuf::from("/code/payments"), false);
+        assert_eq!(
+            app.confirm().unwrap().question(),
+            "make it a git repository and add it: /code/payments? y/n"
+        );
+        assert_eq!(
+            press(&mut app, KeyCode::Char('y')),
+            Some(Action::NewProject {
+                dir: PathBuf::from("/code/payments"),
+                create: false
+            })
+        );
+    }
+
+    #[test]
+    fn a_project_added_with_nothing_running_in_it_is_selected() {
+        let mut app = with_agents(&["claude"], vec![in_project("agent", "app")]);
+        let payments = Worktree {
+            path: PathBuf::from("/code/payments"),
+            project: "payments".into(),
+            project_path: PathBuf::from("/code/payments"),
+            branch: Some("main".into()),
+            main: true,
+            in_progress: None,
+        };
+        app.set_known_projects(vec![payments]);
+        app.project_added(Path::new("/code/payments"));
+        assert_eq!(
+            app.selected_empty_worktree().map(|w| w.path.clone()),
+            Some(PathBuf::from("/code/payments"))
+        );
+        assert_eq!(app.notice(), Some("payments is on the list of projects"));
     }
 
     #[test]

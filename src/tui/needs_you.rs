@@ -164,7 +164,7 @@ fn session_row(session: &SessionInfo, tier: Tier, what: String, detail: String) 
 }
 
 /// Where a session runs: its project and branch, or its directory.
-fn place(session: &SessionInfo) -> String {
+pub fn place(session: &SessionInfo) -> String {
     match &session.worktree {
         Some(worktree) => {
             let mark = if worktree.main { "⌂" } else { "⎇" };

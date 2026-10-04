@@ -171,6 +171,12 @@ pub enum Request {
     },
     /// What background tasks have spent today, and the daily budget.
     Spending,
+    /// The memory each running session's processes take, the daemon's
+    /// own, and the asking client's, whose process is `client`.
+    Resources {
+        #[serde(default)]
+        client: Option<u32>,
+    },
     /// Close a session's task, done or failed. A program in a session says
     /// which by its `id`; from outside, it's the session's `name`.
     Close {
@@ -585,6 +591,13 @@ pub enum Response {
         transcript: Option<Vec<String>>,
     },
     Spending(Spending),
+    Resources(crate::resources::Resources),
+    /// What the hook reporting a prompt the user sent tells Claude Code:
+    /// the title to give the conversation, the name the user renamed the
+    /// session to in crystal.
+    Retitle {
+        title: String,
+    },
     /// A project's backlog.
     Backlog(Backlog),
     /// The number a new backlog item got.

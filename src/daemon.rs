@@ -42,6 +42,7 @@ use crate::protocol::{
     Worktree,
 };
 use crate::report;
+use crate::resources;
 use crate::session::{Change, STOP_GRACE, Session, Term, signal_group};
 use crate::skill;
 use crate::socket;
@@ -711,15 +712,22 @@ impl Daemon {
                 .filter_map(Session::looking_for_conversation)
                 .map(|rollouts| (rollouts.cwd().to_path_buf(), rollouts.started()))
                 .collect();
+            let mut retitled = Vec::new();
             for session in sessions.iter_mut() {
                 session.find_conversation(&claimed, &looking);
                 session.check_front();
                 session.check();
                 session.check_model();
+                if let Some(title) = session.check_title() {
+                    retitled.push((session.id.clone(), title));
+                }
                 self.tell_changes(session);
                 for closed in session.take_closed() {
                     self.write_down_closed(session, &closed);
                 }
+            }
+            for (id, title) in retitled {
+                self.follow_claude_title(&mut sessions, &id, &title);
             }
             // Before an ended session is told of: one moving into another
             // worktree starts again there instead.
@@ -1836,6 +1844,35 @@ impl Daemon {
         self.tell_renamed(session, &old_name);
     }
 
+    /// Names the session with id `id` after `title`, the name Claude Code
+    /// was just given for its conversation, as `/rename` gives one, unless
+    /// the user or a script named the session.
+    fn follow_claude_title(&self, sessions: &mut [Session], id: &str, title: &str) {
+        let Some(index) = sessions.iter().position(|session| session.id == id) else {
+            return;
+        };
+        let Some(base) = names::from_title(title) else {
+            return;
+        };
+        if sessions[index].name_given() || sessions[index].name == base {
+            return;
+        }
+        let taken = |name: &str| {
+            let others = sessions.iter().enumerate().filter(|(at, _)| *at != index);
+            others
+                .map(|(_, session)| session)
+                .any(|session| session.name == name)
+        };
+        let new_name = unique_name(&base, taken);
+        let session = &mut sessions[index];
+        if session.name == new_name {
+            return;
+        }
+        let old_name = std::mem::replace(&mut session.name, new_name);
+        session.keep_name();
+        self.tell_renamed(session, &old_name);
+    }
+
     /// Tells that `session` was called `from` until now, and keeps a flow's
     /// step to it under its new name.
     fn tell_renamed(&self, session: &Session, from: &str) {
@@ -1910,6 +1947,9 @@ impl Daemon {
                 // Only Claude Code's and Codex's Stop hooks take the answer
                 // that keeps the agent from ending its turn.
                 let can_remind = matches!(agent.as_str(), "claude" | "codex");
+                // Only Claude Code's prompt hook takes a name for its
+                // conversation.
+                let can_retitle = agent == "claude" && prompt.is_some();
                 if let Some(prompt) = prompt {
                     self.name_from_prompt(&mut sessions, &id, &prompt);
                 }
@@ -1922,8 +1962,13 @@ impl Daemon {
                     session.heard_model(&model);
                 }
                 // A conversation just named is looked at now: what's
-                // written to it from here on is news.
+                // written to it from here on is news, its model and its
+                // name.
                 session.check_model();
+                if let Some(title) = session.check_title() {
+                    self.follow_claude_title(&mut sessions, &id, &title);
+                }
+                let session = with_id(&mut sessions, &id)?;
                 // Reminded that its task is open, the agent carries on: its
                 // turn hasn't ended, and it isn't done. One moving into
                 // another worktree carries on there.
@@ -1942,6 +1987,7 @@ impl Daemon {
                         text: tasks::REMINDER.to_string(),
                     });
                 }
+                let retitle = can_retitle.then(|| session.title_to_give()).flatten();
                 // An agent that reports for itself holds the session's
                 // status: what hooks say counts again once it lets go.
                 if !session.is_claimed() {
@@ -1957,7 +2003,10 @@ impl Daemon {
                     }
                 }
                 self.tell_changes(session);
-                Ok(Response::Done)
+                match retitle {
+                    Some(title) => Ok(Response::Retitle { title }),
+                    None => Ok(Response::Done),
+                }
             }
             Request::ReportAgent { id, name, report } => {
                 let mut sessions = self.sessions.lock().unwrap();
@@ -2060,7 +2109,7 @@ impl Daemon {
                 }
                 let session = named(&mut sessions, &name)?;
                 session.name = new_name.clone();
-                session.keep_name();
+                session.renamed();
                 if new_name != name {
                     self.tell_renamed(session, &name);
                 }
@@ -2245,6 +2294,18 @@ impl Daemon {
                 Ok(Response::Done)
             }
             Request::TaskToTerminal { task, env } => self.task_to_terminal(&task, env),
+            Request::Resources { client } => {
+                // `ps` takes a moment: the sessions aren't held meanwhile.
+                let running: Vec<(String, u32)> = {
+                    let sessions = self.sessions.lock().unwrap();
+                    let running = sessions
+                        .iter()
+                        .filter_map(|session| Some((session.name.clone(), session.running_pid()?)));
+                    running.collect()
+                };
+                let taken = resources::measure(std::process::id(), client, &running);
+                Ok(Response::Resources(taken))
+            }
             Request::Spending => Ok(Response::Spending(protocol::Spending {
                 today_usd: self.spending.today(),
                 daily_budget_usd: settings().tasks.daily_budget_usd,
@@ -2648,7 +2709,11 @@ impl Daemon {
 
     fn new_session(&self, new: NewSession) -> Result<Response> {
         let mut sessions = self.sessions.lock().unwrap();
+        let given = new.name.is_some();
         let name = start(&mut sessions, &self.socket, new, None, None)?;
+        if given {
+            named(&mut sessions, &name)?.keep_given_name();
+        }
         Ok(self.started(&mut sessions, name, Kind::TaskOpened))
     }
 

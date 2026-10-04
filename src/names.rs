@@ -1,8 +1,8 @@
 //! Names: made-up ones for new worktrees' branches, like `brave-otter`:
 //! short, easy to say and to tell apart, and nothing to do with the task,
 //! which can change while the branch can't; and a session's, from the
-//! first thing it's asked, like `fix-login-redirect`, which a session can
-//! change.
+//! first thing it's asked, like `fix-login-redirect`, or from the name
+//! Claude Code gave its conversation, which a session can change.
 
 use std::hash::{BuildHasher, RandomState};
 use std::time::SystemTime;
@@ -32,6 +32,9 @@ const PROMPT_WORDS: usize = 3;
 
 /// The longest a name from a prompt gets, in characters.
 const PROMPT_LONGEST: usize = 30;
+
+/// The longest a name from a conversation's name gets, in characters.
+const TITLE_LONGEST: usize = 40;
 
 /// Words that say little of what a prompt asks: asking nicely, who's to do
 /// it, and the small words between the ones that matter.
@@ -74,6 +77,29 @@ pub fn from_prompt(prompt: &str) -> Option<String> {
     (!name.is_empty()).then_some(name)
 }
 
+/// A session's name from `title`, the name Claude Code gave its
+/// conversation: every word of it, in lower case, joined by dashes, as a
+/// session's name has no spaces. `None` for one with no words.
+pub fn from_title(title: &str) -> Option<String> {
+    let words = title
+        .split(|c: char| !c.is_alphanumeric() && c != '\'' && c != '’')
+        .map(|word| word.replace(['\'', '’'], "").to_lowercase())
+        .filter(|word| !word.is_empty());
+    let mut name = String::new();
+    for word in words {
+        let longer = name.chars().count() + word.chars().count() + 1;
+        if !name.is_empty() && longer > TITLE_LONGEST {
+            break;
+        }
+        if !name.is_empty() {
+            name.push('-');
+        }
+        name.push_str(&word);
+    }
+    let name: String = name.chars().take(TITLE_LONGEST).collect();
+    (!name.is_empty()).then_some(name)
+}
+
 /// A new made-up name, picked at random.
 pub fn random() -> String {
     // std's hash keys are random for each process, and differ for each
@@ -93,6 +119,25 @@ fn name(number: u64) -> String {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    #[test]
+    fn a_conversation_s_name_keeps_every_word_joined_by_dashes() {
+        assert_eq!(
+            from_title("Fix the refund rounding").as_deref(),
+            Some("fix-the-refund-rounding")
+        );
+        assert_eq!(
+            from_title("API v2: don't break it").as_deref(),
+            Some("api-v2-dont-break-it")
+        );
+        assert_eq!(
+            from_title("payments-refactor").as_deref(),
+            Some("payments-refactor")
+        );
+        assert_eq!(from_title(" — ").as_deref(), None);
+        let long = from_title(&"word ".repeat(20)).unwrap();
+        assert!(long.chars().count() <= TITLE_LONGEST, "{long}");
+    }
 
     #[test]
     fn the_words_are_plain_and_each_is_there_once() {
