@@ -471,7 +471,8 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   - `forge/gitlab.rs`: each call as a `glab` command, and reading its JSON, a merge request as a pull request
 - `src/shell.rs`: quoting arguments and writing paths with `~`, the way a shell reads them
 - `tests/cli.rs`: end-to-end tests that drive the real binary against a private daemon (and read its database
-  beside its socket to see what it wrote down), with a config of
+  beside its socket to see what it wrote down), every command they run without the `CRYSTAL_*` variables of a
+  crystal session they may be run in (`outside_crystal`), with a config of
   their own that turns notifications, sounds, the memory plugin, naming sessions from their prompts and panes'
   scrollbars off (a test of memory, naming or the scrollbar turns it back on, and `CRYSTAL_NO_SOUND` keeps
   sounds off even then; memory's models are kept out by a cache that can't hold them and
