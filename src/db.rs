@@ -18,7 +18,7 @@
 //! anyone want it; one that can't be read is renamed `.broken` instead.
 
 use crate::backlog;
-use crate::events::{Event, Since};
+use crate::events::{Event, Scope, Since};
 use crate::flow_run::FlowRun;
 use crate::protocol::{
     ArchivedSession, Artifact, ArtifactKind, BacklogItem, PendingTask, TaskBrief, TaskOutcome,
@@ -27,6 +27,7 @@ use crate::protocol::{
 use crate::state::{self, SavedSession};
 use crate::tasks;
 use anyhow::{Context, Result};
+use rusqlite::types::Value;
 use rusqlite::{Connection, OpenFlags, Row, Transaction, TransactionBehavior, params};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -584,14 +585,37 @@ impl Db {
         readable(rows, "an event")
     }
 
-    /// The newest `count` events from before the one numbered `before`, or
-    /// from the end of the log without it, the newest first: a page of the
-    /// TUI's timeline.
-    pub fn events_before(&self, before: Option<u64>, count: usize) -> Result<Vec<Event>> {
-        let mut statement = self.conn.prepare(
-            "SELECT json FROM events WHERE ?1 IS NULL OR seq < ?1 ORDER BY seq DESC LIMIT ?2",
-        )?;
-        let rows = statement.query_map(params![before, count], |row| {
+    /// The newest `count` events `scope` takes from before the one numbered
+    /// `before`, or from the end of the log without it, the newest first: a
+    /// page of the TUI's timeline. What it takes is what
+    /// [`Scope::matches`] does.
+    pub fn events_before(
+        &self,
+        scope: &Scope,
+        before: Option<u64>,
+        count: usize,
+    ) -> Result<Vec<Event>> {
+        let (taken, about) = match scope {
+            Scope::All => ("?3 IS NULL", Value::Null),
+            Scope::Session(id) => (
+                "(session = ?3 OR json_extract(json, '$.message.from_id') = ?3)",
+                Value::Text(id.clone()),
+            ),
+            Scope::Task(id) => (
+                "(json_extract(json, '$.task.id') = ?3 \
+                 OR json_extract(json, '$.session.task_id') = ?3)",
+                Value::Integer(i64::try_from(*id).unwrap_or(i64::MAX)),
+            ),
+            Scope::Project(path) => (
+                "project = ?3",
+                Value::Text(path.to_string_lossy().into_owned()),
+            ),
+        };
+        let mut statement = self.conn.prepare(&format!(
+            "SELECT json FROM events WHERE (?1 IS NULL OR seq < ?1) AND {taken} \
+             ORDER BY seq DESC LIMIT ?2"
+        ))?;
+        let rows = statement.query_map(params![before, count, about], |row| {
             Ok(from_json::<Event>(&row.get::<_, String>(0)?))
         })?;
         readable(rows, "an event")
@@ -1662,9 +1686,86 @@ mod tests {
             db.add_event(&event).unwrap();
         }
         let seqs = |events: Vec<Event>| -> Vec<u64> { events.iter().map(|e| e.seq).collect() };
-        assert_eq!(seqs(db.events_before(None, 2).unwrap()), [5, 4]);
-        assert_eq!(seqs(db.events_before(Some(4), 2).unwrap()), [3, 2]);
-        assert_eq!(seqs(db.events_before(Some(2), 2).unwrap()), [1]);
+        let all = Scope::All;
+        assert_eq!(seqs(db.events_before(&all, None, 2).unwrap()), [5, 4]);
+        assert_eq!(seqs(db.events_before(&all, Some(4), 2).unwrap()), [3, 2]);
+        assert_eq!(seqs(db.events_before(&all, Some(2), 2).unwrap()), [1]);
+    }
+
+    #[test]
+    fn a_timeline_of_one_session_task_or_project_reads_what_its_scope_takes() {
+        use crate::events::{Kind, MessageAbout, SessionAbout};
+        use crate::protocol::TaskRecord;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&socket_in(&dir)).unwrap();
+        let about = |id: &str, task_id: Option<u64>| SessionAbout {
+            name: id.into(),
+            id: id.into(),
+            command: Vec::new(),
+            cwd: "/code/app".into(),
+            project: None,
+            worktree: None,
+            branch: None,
+            activity: None,
+            task: None,
+            task_id,
+            status: String::new(),
+            reporter: None,
+        };
+        let task = |id: u64| TaskRecord {
+            id: Some(id),
+            goal: "Fix it".into(),
+            session: String::new(),
+            project: "app".into(),
+            branch: None,
+            background: false,
+            backlog: None,
+            pending: true,
+            waiting: false,
+            created: 0,
+            outcome: None,
+            artifacts: Vec::new(),
+            brief: Default::default(),
+        };
+        let in_app = |kind| Event::about_project(kind, "/code/app".into());
+        let events = [
+            // 1: a task made to start later, in the project.
+            Event {
+                task: Some(task(12)),
+                ..in_app(Kind::TaskOpened)
+            },
+            // 2: its session working on it.
+            Event {
+                session: Some(about("s1", Some(12))),
+                ..in_app(Kind::SessionWorking)
+            },
+            // 3: a message s1 sent s2.
+            Event {
+                session: Some(about("s2", None)),
+                message: Some(MessageAbout {
+                    from: Some("s1".into()),
+                    from_id: Some("s1".into()),
+                    line: "look".into(),
+                }),
+                ..in_app(Kind::SessionMessage)
+            },
+            // 4: another project's.
+            Event::about_project(Kind::BacklogAdded, "/code/web".into()),
+        ];
+        for (seq, event) in (1..).zip(events) {
+            db.add_event(&Event { seq, ..event }).unwrap();
+        }
+        let read = |scope: Scope| -> Vec<u64> {
+            let page = db.events_before(&scope, None, 10).unwrap();
+            assert!(page.iter().all(|event| scope.matches(event)));
+            page.iter().map(|event| event.seq).collect()
+        };
+        assert_eq!(read(Scope::Session("s1".into())), [3, 2]);
+        assert_eq!(read(Scope::Session("s2".into())), [3]);
+        assert_eq!(read(Scope::Task(12)), [2, 1]);
+        assert_eq!(read(Scope::Task(13)), Vec::<u64>::new());
+        assert_eq!(read(Scope::Project("/code/web".into())), [4]);
+        assert_eq!(read(Scope::All), [4, 3, 2, 1]);
     }
 
     #[test]

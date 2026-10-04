@@ -161,6 +161,8 @@ and the footer says where you are and offers the keys that matter there, or, whe
 | `u` | select the next session that needs you: waiting on you first, then done |
 | `U` | list everything that [needs you](#timeline), in every tab, and answer a permission or a gate where it stands |
 | `a` | the [timeline](#timeline): what happened, the newest first, as it happens |
+| `I` | the [timeline](#timeline) of the selected session; `Ctrl+S` there goes on to its task's, its project's and everything |
+| `M` | what the selected session leaves for the next: its worktree's [handoff notes](#the-handoff-file) and the files its task [kept](#kept-files), each read beside the list |
 | `/` | find a session in any tab, a project or worktree with nothing running, a flow run or an open pull request, by typing a little of it; `Tab` keeps to one status; picking a session in another tab takes you there: [finding with `/`](#finding-with-) |
 | `:` | the [command list](#keys-and-commands): every command by its name, with its key, the latest you ran first; `Enter` runs one |
 | `(` / `)` | make the [sidebar](#the-sidebar) narrower or wider; its edge drags with the mouse too |
@@ -594,8 +596,8 @@ everywhere else. `[keys]` names them the same way:
 | `view-close` | `q` | in a view: close it, or step back out of what's open in it |
 
 A view is any of the lists that take the keyboard: the diff, the file finder, the tree browser, find in files,
-the branch switcher, memory, the backlog, layouts, the archive, the plugins, the settings, what needs you, the
-timeline, the issues, the pull requests, `/` and the command list. A key you give a view's name stands in every
+the branch switcher, memory, the handoff notes, the backlog, layouts, the archive, the plugins, the settings,
+what needs you, the timeline, the issues, the pull requests, `/` and the command list. A key you give a view's name stands in every
 one of them for the key they all take for it, `↓`, `↑`, `PgDn`, `PgUp`, `Enter` or `Esc`, which go on working
 whatever you give; the defaults you leave it without do nothing. While a view is taking what you type, like
 the file finder's query or a filter, a letter is typed rather than standing for anything, so a key there is
@@ -1691,8 +1693,8 @@ shows the same lines as the [timeline](#timeline).
 
 Each line of `--json` is one event, the same JSON the log keeps and plugins get: its `seq` (1, 2, 3…, never
 going back), `at` (milliseconds since the Unix epoch), its name as `event`, the `project` it's about, the
-`session` (its `name`, `id`, `command`, `cwd`, `project`, `worktree`, `branch`, `activity`, `task`, `status`,
-as `ls` words it, and `reporter` while an agent that reports for itself holds it), and what its kind carries:
+`session` (its `name`, `id`, `command`, `cwd`, `project`, `worktree`, `branch`, `activity`, `task`, and its
+number as `task_id`, `status`, as `ls` words it, and `reporter` while an agent that reports for itself holds it), and what its kind carries:
 `from` (a renamed session's old name, what its agent was doing before, or the agent that let go), `task` (with
 its `id`, `pending`, `waiting` and, once closed, its `outcome` and the `artifacts` kept with it), `run`
 (`prompt`; `asking`, with its `tool` and `gist`, and the `decision`; then `failed`, `answer` and `cost_usd`),
@@ -1730,6 +1732,15 @@ and the backlog, flows, memory, or the others. `↑` and `↓` move; the line th
 the list, with everything its event carries, and `PgUp` and `PgDn` scroll it. `Enter` goes to the session the
 line is about, whatever it's called now (for a flow run, its latest step's); `Esc` clears the filter, then
 closes. The timeline reads the log a page at a time, and further back as the bar reaches the end.
+
+A timeline can be of one thing, too. `I` opens the selected session's: everything about it, whatever it was
+called then, and the messages it sent. `Ctrl+S` goes on to its task's (what the task did and kept, and its
+session's events while it had the task), then its project's (every session, worktree, flow, memory entry and
+backlog item there), then everything, and round again; the heading says which it shows, and `a` starts at
+everything and goes the same way. A session's right-click menu has **its timeline** and **its task's
+timeline**, and a project's heading **its timeline**; `session-timeline`, `task-timeline` and
+`project-timeline` are in the [command list](#keys-and-commands) to give keys to. On a worktree with no
+sessions, `I` opens its project's.
 
 `U` lists everything that needs you now, in every tab, the most urgent first: background tasks asking for a
 permission, flow runs at a gate, tasks whose agent ended its turn with the task still open, agents asking you
@@ -2167,6 +2178,7 @@ Ported the codec and its tests
   ```
 
 - Notes are a git worktree's: a session outside git has none. `crystal plugin disable handoff` turns them off.
+- `M` in the TUI reads them, with the selected session's [kept files](#kept-files): see below.
 
 #### Kept files
 
@@ -2184,6 +2196,14 @@ than once.
 - `crystal tasks show t12` lists them, and `crystal tasks --json` gives each task's `artifacts`, with their
   `kind` (`file` or `handoff`), `name`, `path` and `bytes`. Each is a `task.artifact` in the [event
   log](#events).
+
+`M` in the TUI, or **its handoff notes and files** in a session's right-click menu, shows what the selected
+session leaves for the next: its worktree's handoff file as it is now, then the files its task kept, the
+handoff file as it was when the task closed among them. The list is on the left, each file with what it is
+and its size, and the one the bar is on is read on the right, a markdown file as its page (`Ctrl+R` flips it
+to its source). `↑`/`↓` (or `j`/`k`) choose, `PgUp`, `PgDn` and `Space` scroll, `Enter` opens the file in
+your `$EDITOR`, as [the file finder](#the-file-finder-and-the-tree-browser) does, and `Esc` closes. With the
+handoff plugin off it shows only the kept files, and with tasks off only the notes.
 
 ### The backlog
 

@@ -239,17 +239,22 @@ whenever what's handed over changes in a way the crystal before couldn't read.
     that narrows it to the files that match and their directories, edited as a text box is but for the keys
     the tree and the preview take, the border dragged, its keys and drawing; kept apart from I/O, so it's
     unit-tested
-  - `preview.rs`: the file finder's and the tree browser's preview: a file read and highlighted off the
-    event loop, a markdown file's page laid out for its width or its source, scrolling, and drawing them
+  - `preview.rs`: the file finder's, the tree browser's and the handoff view's preview: a file read and
+    highlighted off the event loop, a markdown file's page laid out for its width or its source, scrolling,
+    and drawing them
   - `memory_view.rs`: the memory view (`m`): a project's entries, the filter, forgetting and
     promoting after a `y`, and its drawing
   - `plugins_view.rs`: the plugins view (`X`): every plugin, on or off, with installed ones' actions, panes and
     link handlers, its keys and drawing; the event loop does the switching, runs actions and opens plugins'
     panes over the others
-  - `timeline.rs`: the timeline (`a`): the event log read back a page at a time, the newest first, and
-    followed while it's open, filtered as you type and by kind, what's new since the user was away marked,
-    the line the bar is on read whole, and its drawing; kept apart from I/O, and events of kinds it doesn't
-    know are listed by their name and what they say
+  - `timeline.rs`: the timeline (`a`, and `I` for the selected session's): the event log of everything or
+    of one scope, a session, its task or its project, read back a page at a time, the newest first, and
+    followed while it's open, `Ctrl+S` going through the selection's scopes, filtered as you type and by
+    kind, what's new since the user was away marked, the line the bar is on read whole, and its drawing;
+    kept apart from I/O, and events of kinds it doesn't know are listed by their name and what they say
+  - `handoff_view.rs`: the handoff view (`M`): the selected session's worktree's handoff notes and the files
+    its task kept, listed, the one the bar is on previewed, and opened in the editor; its state and keys,
+    kept apart from I/O (the event loop looks for the notes and reads the kept files), and its drawing
   - `needs_you.rs`: the needs-you view (`U`): everything waiting on the user, in every tab, the most urgent
     first, from the sessions and flow runs the TUI has; answering a permission or a gate in place, the bar
     kept on its row as rows come and go, and its drawing
@@ -280,8 +285,9 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   descriptors open across the exec, the readers it stops, the gate connections come in through, the helpers
   (hooks, the distiller) it waits for, and waiting for a child by its pid
 - `src/events.rs`: what happens, as events: the one `Event` type, its kinds (a public contract plugins listen
-  for), what each carries, how one reads in a line, the filter a reader gives, and the made-up event `plugin run
-  --event` tries hooks on; pure, so it's unit-tested
+  for), what each carries, how one reads in a line, the filter a reader gives, the scope a timeline shows (a
+  session, a task or a project), and the made-up event `plugin run --event` tries hooks on; pure, so it's
+  unit-tested
 - `src/event_log.rs`: the event log, the `events` table in the database, read and pruned by age and count; and
   the daemon's `Bus`, which numbers each event (a `seq` that never goes back), writes it down and sends it to
   every subscriber: clients streaming over the socket, and the plugins' hooks
@@ -404,7 +410,8 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   migrations by `user_version`, as docket does): the sessions to start again, the archived sessions, flow runs,
   the projects on crystal's list, each project's backlog and closed tasks, the files tasks kept, the tasks waiting to start and the last task number, what each
   task carried beside its goal (its acceptance criteria, pull request and issue), what background
-  tasks spent each day, the event log, read from a point on or a page at a time back from its end, and the TUI's
+  tasks spent each day, the event log, read from a point on or a page of a timeline's scope at a time back
+  from its end, and the TUI's
   tabs, layouts, the new-session panel's memory, the diff view's reviewed marks, the projects folded in the
   sidebar and the latest event the user had seen, each a JSON document; and bringing in the JSON files from before, a project's the first time it's
   asked for. Settings stay in the config file and memory in `memory.db`

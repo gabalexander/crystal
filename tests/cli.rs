@@ -11299,6 +11299,9 @@ fn the_keys_of_a_plugin_that_s_off_aren_t_listed() {
     let mut tui = crystal.tui();
     tui.shows("❯ agent");
     tui.type_keys("?");
+    // At 80 by 24, the plugins' sidebar keys are on the second page.
+    tui.shows("1/3");
+    tui.type_keys(" ");
     tui.shows("the project's backlog");
     assert!(
         !tui.text().contains("what it has remembered"),
@@ -13475,6 +13478,83 @@ fn the_timeline_shows_what_happens_as_it_happens_and_enter_goes_to_the_session()
             .last()
             .is_some_and(|footer| footer.contains("builder"))
     });
+}
+
+#[test]
+fn a_sessions_own_timeline_widens_with_ctrl_s_and_capital_m_reads_what_it_left() {
+    let crystal = Crystal::new();
+    let dir = crystal.dir.path();
+    let repo = git_repo(dir, "app");
+    let repo_arg = repo.to_str().unwrap();
+    let plan = repo.join("plan.md");
+    std::fs::write(&plan, "# The plan\n\nPort the codec first.\n").unwrap();
+    crystal.ok(&[
+        "new",
+        "-d",
+        "-n",
+        "planner",
+        "-c",
+        repo_arg,
+        "-t",
+        "write the plan",
+        "sleep",
+        "30",
+    ]);
+    crystal.ok(&["handoff", "-n", "planner", "the fixtures live in tests"]);
+    crystal.ok(&[
+        "done",
+        "-n",
+        "planner",
+        "--artifact",
+        plan.to_str().unwrap(),
+        "wrote it",
+    ]);
+    crystal.ok(&["new", "-d", "-n", "bystander", "sleep", "30"]);
+    crystal.ok(&["rename", "bystander", "onlooker"]);
+
+    let mut tui = crystal.tui();
+    tui.type_keys("/planner");
+    tui.shows("1 match");
+    tui.type_keys("\r");
+    tui.shows("❯ planner");
+
+    // Its own timeline: what happened to it, and nobody else's.
+    tui.type_keys("I");
+    tui.shows("timeline of session planner");
+    tui.shows("task.artifact");
+    tui.shows("kept plan.md");
+    assert!(!tui.text().contains("was bystander"), "{}", tui.text());
+    tui.type_keys("\x13");
+    tui.shows("timeline of task t1");
+    tui.shows("handoff.added");
+    tui.type_keys("\x13");
+    tui.shows("timeline of project app");
+    tui.type_keys("\x13");
+    tui.hides("timeline of");
+    tui.shows("was bystander");
+    // While it's open, what happens to it comes in on top, and only that.
+    tui.type_keys("\x13");
+    tui.shows("timeline of session planner");
+    crystal.ok(&["rename", "onlooker", "watcher"]);
+    crystal.ok(&["rename", "planner", "writer"]);
+    tui.shows("was planner");
+    assert!(!tui.text().contains("was onlooker"), "{}", tui.text());
+    tui.type_keys("\x1b");
+    tui.hides("timeline of");
+    tui.shows("❯ writer");
+
+    // What it left: the worktree's notes, then what its task kept, each
+    // read beside the list.
+    tui.type_keys("M");
+    tui.shows("handoff · writer · t1");
+    tui.shows("notes now");
+    tui.shows("the fixtures live in tests");
+    tui.shows("kept · 34 bytes");
+    tui.shows("notes as t1 closed");
+    tui.type_keys("j");
+    tui.shows("Port the codec first.");
+    tui.type_keys("\x1b");
+    tui.hides("notes now");
 }
 
 #[test]
