@@ -1,4 +1,4 @@
-//! The RAM view, `M` in the sidebar: the memory each session takes, its
+//! The RAM view, `#` in the sidebar: the memory each session takes, its
 //! program and every process under it, the biggest first, how many
 //! processes that is and what share of the machine's; then what crystal
 //! takes itself, the daemon and this TUI, and all of it together. The

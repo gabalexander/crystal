@@ -547,7 +547,7 @@ pub const COMMANDS: &[Spec] = &[
         Command::Ram,
         "ram",
         "the memory each session's processes take, and crystal's own",
-        &["M"],
+        &["#"],
     ),
     spec(Command::Keys, "keys", "every key", &["?"]),
     spec(
@@ -1939,7 +1939,7 @@ pub const HELP: &[HelpRow] = &[
         "sidebar: size / folding",
     ),
     row(
-        "X/,/M",
+        "X/,/#",
         &[C::Plugins, C::Settings, C::Ram],
         "plugins / settings / RAM",
     ),

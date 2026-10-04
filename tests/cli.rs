@@ -1635,14 +1635,14 @@ fn q_asks_before_it_quits_unless_the_settings_say_not_to() {
 }
 
 #[test]
-fn capital_m_shows_the_memory_each_session_takes() {
+fn hash_shows_the_memory_each_session_takes() {
     let crystal = Crystal::new();
     crystal.ok(&["new", "-n", "stays", "sleep", "30"]);
     crystal.ok(&["new", "-n", "other", "sleep", "30"]);
 
     let mut tui = crystal.tui();
     tui.shows("❯ stays");
-    tui.type_keys("M");
+    tui.type_keys("#");
     tui.shows(" RAM · ");
     tui.shows("1 process");
     tui.shows("crystal itself");

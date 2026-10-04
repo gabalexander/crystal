@@ -248,7 +248,7 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   - `needs_you.rs`: the needs-you view (`U`): everything waiting on the user, in every tab, the most urgent
     first, from the sessions and flow runs the TUI has; answering a permission or a gate in place, the bar
     kept on its row as rows come and go, and its drawing
-  - `ram_view.rs`: the RAM view (`M`): the memory each session's processes take, the biggest first, its
+  - `ram_view.rs`: the RAM view (`#`): the memory each session's processes take, the biggest first, its
     share of all of it, and crystal's own; Enter goes to the session, the bar kept on its session as a new
     look reorders the rows; its state, keys and drawing, and the footer's readout
   - `away.rs`: "while you were away": when the user is gone (a quit, the terminal's focus lost for a while, or

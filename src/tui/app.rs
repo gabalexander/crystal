@@ -6565,7 +6565,7 @@ impl App {
         }
     }
 
-    /// `M`: opens the RAM view, on what the daemon last found, and has it
+    /// `#`: opens the RAM view, on what the daemon last found, and has it
     /// look more often while it's open.
     fn open_ram(&mut self) -> Action {
         let rows = self
@@ -11471,10 +11471,10 @@ gate = true
     }
 
     #[test]
-    fn capital_m_shows_what_each_session_takes_and_enter_goes_there() {
+    fn hash_shows_what_each_session_takes_and_enter_goes_there() {
         let mut app = app_with(&["small", "big"]);
         app.set_resources(resources(&[("small", 30), ("big", 600)]));
-        assert_eq!(press(&mut app, KeyCode::Char('M')), Some(Action::OpenRam));
+        assert_eq!(press(&mut app, KeyCode::Char('#')), Some(Action::OpenRam));
         let row = app.ram_view().unwrap().highlighted().unwrap();
         assert_eq!(row.name, "big");
         // A new look reorders the rows; the bar stays on its session.

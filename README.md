@@ -186,7 +186,7 @@ and the footer says where you are and offers the keys that matter there, or, whe
 | `P` | list your [profiles](#profiles), and add, change, copy or remove one |
 | `X` | list the [plugins](#plugins): switch them on and off, run their actions and open their panes |
 | `,` | open the [settings](#the-settings-view): notifications, sounds, the theme, and how memory learns and searches, each changed as you go |
-| `M` | the memory each session's processes take, and crystal's own: [RAM](#ram) |
+| `#` | the memory each session's processes take, and crystal's own: [RAM](#ram) |
 | `?` | show every key, in the sidebar, in a pane, in resize mode, in a view, in a question and with the mouse, your own included: a page at a time when they don't all fit, `→` and `←` (or `Space`, `PgDn` and `PgUp`) turning the pages |
 | `q` | quit, once you've said `y`; the sessions keep running |
 
@@ -937,7 +937,7 @@ stopped. It's off until you set it, from the file or the [settings view](#the-se
 
 ### RAM
 
-`M` shows the memory each session takes: its program and every process under it, since an agent runs node
+`#` shows the memory each session takes: its program and every process under it, since an agent runs node
 workers, shells and MCP servers of its own, the biggest first, with how many processes that is and its share of
 the whole. Under them is what crystal takes itself, the daemon and the TUI, and in the heading all of it, and
 its share of the machine's memory. `Enter` goes to the session the bar is on. The daemon looks at the
