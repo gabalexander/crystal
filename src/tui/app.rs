@@ -4893,6 +4893,7 @@ impl App {
                     View::Files(finder) => finder.dir,
                     View::Tree(tree) => tree.dir,
                     View::Grep(grep) => grep.dir,
+                    View::Memory(memory) => memory.file_to_open()?.0,
                     View::Handoff(view) => view.selected()?.dir.clone(),
                     _ => return None,
                 };
@@ -5458,7 +5459,7 @@ impl App {
                 let branch = forge::branch_for_issue(item.number, &item.text);
                 let setup = self.launch_setup(false);
                 let launcher = Launcher::new(setup)
-                    .with_task(&item.text)
+                    .with_task(&crate::backlog::goal(&item))
                     .with_branch(&branch)
                     .for_backlog_item(item.number);
                 self.launcher = Some(launcher);
@@ -11406,6 +11407,40 @@ mod tests {
     }
 
     #[test]
+    fn enter_in_the_memory_view_edits_the_entry_s_file_in_a_session_of_its_own() {
+        let mut app = App::new(None);
+        app.set_sessions(vec![in_repo("fixer", "fix/ledger")]);
+        press(&mut app, KeyCode::Char('m'));
+        let entry = crate::memory::Entry {
+            id: 3,
+            kind: crate::memory::Kind::Gotcha,
+            text: "the ledger needs redis".into(),
+            files: vec!["src/ledger.rs".into()],
+            source: crate::memory::Source::User,
+            created: 0,
+            seen: 1,
+            last_seen: 0,
+            anchors: Default::default(),
+            checkout: None,
+        };
+        let listed = crate::memory::Listed {
+            entry,
+            freshness: crate::memory::Freshness::Fresh,
+        };
+        app.memory_read(Path::new("/code/app"), Ok(vec![listed]));
+        assert_eq!(
+            press(&mut app, KeyCode::Enter),
+            Some(Action::Edit {
+                dir: PathBuf::from("/code/app"),
+                path: "src/ledger.rs".into(),
+                line: None,
+                name: "ledger.rs".into(),
+            })
+        );
+        assert!(app.view().is_none());
+    }
+
+    #[test]
     fn m_with_memory_off_says_so_and_opens_nothing() {
         let mut app = App::new(None);
         app.set_sessions(vec![in_repo("fixer", "main")]);
@@ -11450,12 +11485,14 @@ mod tests {
                 .map(|(number, text)| BacklogItem {
                     number: *number,
                     text: text.to_string(),
+                    body: String::new(),
                     tags: Vec::new(),
                     done: false,
                     created: 0,
                     closed: None,
                 })
                 .collect(),
+            tasks: Vec::new(),
         }
     }
 
@@ -11549,6 +11586,15 @@ mod tests {
         };
         assert_eq!(purpose.task.as_deref(), Some("write the docs"));
         assert_eq!(purpose.backlog, Some(3));
+
+        // An item's body goes with it, under its line.
+        press(&mut app, KeyCode::Char('b'));
+        let mut backlog = backlog_of(&[(4, "ship it")]);
+        backlog.items[0].body = "once it's green".into();
+        app.set_backlog(Path::new("/code/shop"), Ok(backlog));
+        press(&mut app, KeyCode::Enter);
+        let panel = app.launcher().unwrap();
+        assert_eq!(panel.task().text(), "ship it\n\nonce it's green");
     }
 
     #[test]

@@ -344,6 +344,11 @@ enum Command {
         #[arg(long)]
         json: bool,
 
+        /// With no command: only the items with this tag; give it more than
+        /// once for items with them all.
+        #[arg(short, long = "tag", value_name = "TAG")]
+        tags: Vec<String>,
+
         #[command(subcommand)]
         command: Option<BacklogCommand>,
     },
@@ -735,23 +740,12 @@ enum Command {
     /// Remember something about this project for its later sessions: a
     /// decision, a gotcha, a command that works, a note.
     Remember {
-        /// What sort of thing it is.
-        #[arg(short, long, value_enum, default_value_t = memory::Kind::Note)]
-        kind: memory::Kind,
-
-        /// A file it's about; once some of its files change, the entry is
-        /// marked drifting, and once all of them have, stale. Give it once
-        /// a file.
-        #[arg(short = 'f', long = "file", value_name = "FILE")]
-        files: Vec<String>,
+        #[command(flatten)]
+        entry: EntryArgs,
 
         /// The project's directory [default: the current one]
         #[arg(short = 'C', long = "dir", value_name = "DIR")]
         dir: Option<PathBuf>,
-
-        /// What to remember. Several words are joined with spaces.
-        #[arg(required = true)]
-        text: Vec<String>,
     },
     /// What this project's sessions have remembered, newest first.
     Memory {
@@ -1132,12 +1126,72 @@ enum Reply {
     Always,
 }
 
+/// An entry to remember, for `crystal remember` and `memory add`.
+#[derive(clap::Args)]
+struct EntryArgs {
+    /// What sort of thing it is.
+    #[arg(short, long, value_enum, default_value_t = memory::Kind::Note)]
+    kind: memory::Kind,
+
+    /// A file it's about; once some of its files change, the entry is
+    /// marked drifting, and once all of them have, stale. Give it once a
+    /// file.
+    #[arg(short = 'f', long = "file", value_name = "FILE")]
+    files: Vec<String>,
+
+    /// A line of its own to list it by, over what it says: what lists and
+    /// agents starting are shown of it.
+    #[arg(long)]
+    title: Option<String>,
+
+    /// What to remember. Several words are joined with spaces. With
+    /// --title, it can be left out.
+    #[arg(required_unless_present = "title")]
+    text: Vec<String>,
+}
+
 #[derive(Subcommand)]
 enum MemoryCommand {
-    /// The entries that have to do with these words, the best first.
+    /// Remember something, as `crystal remember` does.
+    Add {
+        #[command(flatten)]
+        entry: EntryArgs,
+    },
+    /// Every entry, newest first, drifting and stale ones marked: what
+    /// `crystal memory` with no command does.
+    #[command(visible_alias = "ls")]
+    List {
+        /// Only the entries of this kind.
+        #[arg(short, long, value_enum)]
+        kind: Option<memory::Kind>,
+
+        /// The entries forgotten instead, the latest first: the distiller
+        /// never adds one back, but remembering it again does.
+        #[arg(long, visible_alias = "wrong")]
+        forgotten: bool,
+    },
+    /// The entries that have to do with these words, the best first,
+    /// those that are stale left out.
     Search {
         #[arg(required = true)]
         words: Vec<String>,
+
+        /// Only the entries of this kind.
+        #[arg(short, long, value_enum)]
+        kind: Option<memory::Kind>,
+
+        /// Only the entries about this file, or a file in this directory.
+        /// Give it once a file.
+        #[arg(short = 'f', long = "file", value_name = "PATH")]
+        files: Vec<String>,
+
+        /// Stale entries too, marked.
+        #[arg(short, long)]
+        all: bool,
+
+        /// The most entries to print [default: 50]
+        #[arg(short = 'n', long, value_name = "N")]
+        limit: Option<usize>,
     },
     /// An entry in full, by its id: its text, its files, where it came from
     /// and how often it was said.
@@ -1812,13 +1866,63 @@ enum PluginPaneCommand {
 enum BacklogCommand {
     /// Put something on the backlog. Prints its number.
     Add {
-        /// What to do later. Several words are joined with spaces.
+        /// What to do later. Several words are joined with spaces. A text
+        /// of several lines is the item's line and the start of its body.
         #[arg(required = true)]
         text: Vec<String>,
+
+        /// More on it than its line says.
+        #[arg(short, long)]
+        body: Option<String>,
 
         /// A tag for it, like `ui`; give it more than once for more.
         #[arg(short, long = "tag", value_name = "TAG")]
         tags: Vec<String>,
+    },
+    /// List what's still to do, oldest first: what `crystal backlog` with
+    /// no command does.
+    #[command(visible_alias = "ls")]
+    List {
+        /// What's done too, the latest done first.
+        #[arg(long)]
+        all: bool,
+
+        /// Print it as JSON.
+        #[arg(long)]
+        json: bool,
+
+        /// Only the items with this tag; give it more than once for items
+        /// with them all.
+        #[arg(short, long = "tag", value_name = "TAG")]
+        tags: Vec<String>,
+    },
+    /// Show an item: whether it's done, its tags, when it was added, the
+    /// tasks started for it and how they went, and its body.
+    Show {
+        number: u64,
+
+        /// Print it as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Change an item: its line, its body or its tags.
+    Edit {
+        number: u64,
+
+        /// Its new line. Several words are joined with spaces.
+        text: Vec<String>,
+
+        /// Its new body; an empty one takes it away.
+        #[arg(short, long)]
+        body: Option<String>,
+
+        /// Its tags, in place of those it has; give it once a tag.
+        #[arg(short, long = "tag", value_name = "TAG", conflicts_with = "no_tags")]
+        tags: Vec<String>,
+
+        /// Take its tags away.
+        #[arg(long)]
+        no_tags: bool,
     },
     /// Mark an item done.
     Done { number: u64 },
@@ -1828,13 +1932,29 @@ enum BacklogCommand {
     #[command(visible_alias = "remove")]
     Rm { number: u64 },
     /// Start a task for an item, with the agent the new-session panel
-    /// starts first. Closing the task done ticks the item.
+    /// starts first, or a profile's. Closing the task done ticks the item.
     Start {
         number: u64,
 
         /// In a new worktree, on a branch named after the item.
-        #[arg(short, long)]
+        #[arg(short, long, conflicts_with = "pr")]
         worktree: bool,
+
+        /// Start it with this profile: its agent, options and prompt, and
+        /// in a new worktree when it says so.
+        #[arg(short, long, conflicts_with = "background")]
+        profile: Option<String>,
+
+        /// On this pull request, by its number: in its worktree, the
+        /// project's own on its branch or else one made for it, and told
+        /// of it.
+        #[arg(long, value_name = "NUMBER")]
+        pr: Option<u64>,
+
+        /// Run it in the background, as `crystal task` does, and print its
+        /// session's name.
+        #[arg(long)]
+        background: bool,
 
         /// The session's name [default: from the item, or else the agent's
         /// name]
@@ -1844,9 +1964,23 @@ enum BacklogCommand {
         /// Don't attach; print the session's name instead.
         #[arg(short, long)]
         detached: bool,
+
+        /// With --background, arguments for its `claude -p`, after `--`.
+        #[arg(last = true, value_name = "CLAUDE ARGS", requires = "background")]
+        claude_args: Vec<String>,
     },
-    /// Print the backlog as markdown checkboxes, done items too.
+    /// Print the backlog as markdown checkboxes, done items too, each one's
+    /// body indented under it.
     Export,
+    /// Put the items of a markdown list of checkboxes on the backlog, as
+    /// `export` writes them or a README's list of things to do: `- [ ]`
+    /// and `- [x]` at the start of a line, `#tags` at its end, and the
+    /// indented lines under it its body. Those whose line the backlog has
+    /// already are passed over.
+    Import {
+        /// The markdown file, or `-` for standard input.
+        file: PathBuf,
+    },
 }
 
 /// What `crystal` exits with when a wait gives up: 2, and only then, so a
@@ -1998,8 +2132,9 @@ fn run(cli: Cli) -> Result<()> {
             dir,
             all,
             json,
+            tags,
             command,
-        } => backlog(&socket, here(dir)?, all, json, command)?,
+        } => backlog(&socket, here(dir)?, all, json, tags, command)?,
         Command::Task {
             name,
             cwd,
@@ -2233,15 +2368,28 @@ fn run(cli: Cli) -> Result<()> {
             Some(ServerCommand::Delete { name }) => server_cli::delete(&name)?,
         },
         Command::Config => print_config()?,
-        Command::Remember {
-            kind,
-            files,
-            dir,
-            text,
-        } => memory_cli::remember(&socket, dir, kind, files, &text.join(" "))?,
+        Command::Remember { entry, dir } => remember(&socket, dir, entry)?,
         Command::Memory { dir, command } => match command {
-            None => memory_cli::list(&socket, dir)?,
-            Some(MemoryCommand::Search { words }) => memory_cli::search(&socket, dir, &words)?,
+            None => memory_cli::list(&socket, dir, None, false)?,
+            Some(MemoryCommand::Add { entry }) => remember(&socket, dir, entry)?,
+            Some(MemoryCommand::List { kind, forgotten }) => {
+                memory_cli::list(&socket, dir, kind, forgotten)?;
+            }
+            Some(MemoryCommand::Search {
+                words,
+                kind,
+                files,
+                all,
+                limit,
+            }) => {
+                let args = memory_cli::SearchArgs {
+                    kind,
+                    files,
+                    all,
+                    limit,
+                };
+                memory_cli::search(&socket, dir, &words, args)?;
+            }
             Some(MemoryCommand::Show { id }) => memory_cli::show(&socket, dir, id)?,
             Some(MemoryCommand::Export) => memory_cli::export(&socket, dir)?,
             Some(MemoryCommand::Rm { id }) => memory_cli::remove(&socket, dir, id)?,
@@ -2549,20 +2697,48 @@ fn project(socket: &Path, json: bool, command: Option<ProjectCommand>) -> Result
     }
 }
 
+/// `crystal remember` and `memory add`: remembers `entry` for the project
+/// `dir` is in.
+fn remember(socket: &Path, dir: Option<PathBuf>, entry: EntryArgs) -> Result<()> {
+    let EntryArgs {
+        kind,
+        files,
+        title,
+        text,
+    } = entry;
+    memory_cli::remember(socket, dir, kind, files, title, &text.join(" "))
+}
+
 /// `crystal backlog` and its commands, for the project `dir` is in.
 fn backlog(
     socket: &Path,
     dir: PathBuf,
     all: bool,
     json: bool,
+    tags: Vec<String>,
     command: Option<BacklogCommand>,
 ) -> Result<()> {
     use work::BacklogAction;
     let action = match command {
-        None => BacklogAction::List { all, json },
-        Some(BacklogCommand::Add { text, tags }) => BacklogAction::Add {
+        None => BacklogAction::List { all, json, tags },
+        Some(BacklogCommand::List { all, json, tags }) => BacklogAction::List { all, json, tags },
+        Some(BacklogCommand::Add { text, body, tags }) => BacklogAction::Add {
             text: text.join(" "),
+            body: body.unwrap_or_default(),
             tags,
+        },
+        Some(BacklogCommand::Show { number, json }) => BacklogAction::Show { number, json },
+        Some(BacklogCommand::Edit {
+            number,
+            text,
+            body,
+            tags,
+            no_tags,
+        }) => BacklogAction::Edit {
+            number,
+            text: (!text.is_empty()).then(|| text.join(" ")),
+            body,
+            tags: (no_tags || !tags.is_empty()).then_some(tags),
         },
         Some(BacklogCommand::Done { number }) => BacklogAction::Mark { number, done: true },
         Some(BacklogCommand::Reopen { number }) => BacklogAction::Mark {
@@ -2571,13 +2747,32 @@ fn backlog(
         },
         Some(BacklogCommand::Rm { number }) => BacklogAction::Remove { number },
         Some(BacklogCommand::Export) => BacklogAction::Export,
+        Some(BacklogCommand::Import { file }) => BacklogAction::Import { file },
         Some(BacklogCommand::Start {
             number,
             worktree,
+            profile,
+            pr,
+            background,
             name,
             detached,
+            claude_args,
         }) => {
-            let name = work::start_from_backlog(socket, dir, number, worktree, name)?;
+            let start = work::BacklogStart {
+                number,
+                worktree,
+                profile,
+                pull_request: pr,
+                background,
+                claude_args,
+                name,
+            };
+            let name = work::start_from_backlog(socket, dir, start)?;
+            // A task in the background has no terminal to attach to.
+            if background {
+                println!("{name}");
+                return Ok(());
+            }
             return attach_or_print(socket, &name, detached);
         }
     };

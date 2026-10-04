@@ -8231,6 +8231,123 @@ fn memory_search_lists_the_entries_that_share_its_words() {
 }
 
 #[test]
+fn memory_search_keeps_to_a_kind_and_files_and_leaves_the_stale_out() {
+    let (crystal, repo) = crystal_remembering();
+    let repo_dir = repo.to_str().unwrap();
+    std::fs::create_dir(repo.join("src")).unwrap();
+    std::fs::write(repo.join("src/ledger.rs"), "ledger").unwrap();
+    std::fs::write(repo.join("src/fees.rs"), "fees").unwrap();
+    let remember = |args: &[&str]| {
+        let mut all = vec!["remember", "-C", repo_dir];
+        all.extend(args);
+        crystal.ok(&all)
+    };
+    remember(&[
+        "-k",
+        "gotcha",
+        "-f",
+        "src/ledger.rs",
+        "The ledger tests need redis",
+    ]);
+    remember(&[
+        "-k",
+        "decision",
+        "-f",
+        "src/fees.rs",
+        "Ledger fees are kept in cents",
+    ]);
+    remember(&["-k", "command", "make ledger runs the ledger tests"]);
+    let search = |dir: &str, args: &[&str]| {
+        let mut all = vec!["memory", "-C", dir, "search"];
+        all.extend(args);
+        let found = crystal.ok(&all);
+        let mut ids: Vec<u64> = found
+            .lines()
+            .map(|line| line.split_whitespace().next().unwrap().parse().unwrap())
+            .collect();
+        ids.sort();
+        ids
+    };
+    assert_eq!(search(repo_dir, &["ledger"]), [1, 2, 3]);
+    assert_eq!(search(repo_dir, &["ledger", "-k", "command"]), [3]);
+    assert_eq!(search(repo_dir, &["ledger", "-f", "src/ledger.rs"]), [1]);
+    assert_eq!(search(repo_dir, &["ledger", "-f", "src"]), [1, 2]);
+    // A file is named from where the command runs.
+    let src = repo.join("src");
+    assert_eq!(
+        search(src.to_str().unwrap(), &["ledger", "-f", "fees.rs"]),
+        [2]
+    );
+    assert_eq!(search(repo_dir, &["ledger", "-n", "1"]).len(), 1);
+
+    // Stale, it's left out, unless --all says otherwise.
+    std::fs::write(repo.join("src/ledger.rs"), "changed").unwrap();
+    assert_eq!(search(repo_dir, &["ledger"]), [2, 3]);
+    assert_eq!(search(repo_dir, &["ledger", "--all"]), [1, 2, 3]);
+    let found = crystal.ok(&["memory", "-C", repo_dir, "search", "redis", "-a"]);
+    assert!(found.contains("[stale]"), "{found}");
+}
+
+#[test]
+fn memory_lists_by_kind_by_title_and_what_was_forgotten() {
+    let (crystal, repo) = crystal_remembering();
+    let repo_dir = repo.to_str().unwrap();
+    let added = crystal.ok(&[
+        "memory",
+        "-C",
+        repo_dir,
+        "add",
+        "-k",
+        "decision",
+        "--title",
+        "Fees are kept in cents",
+        "Never",
+        "store",
+        "a",
+        "float: rounding loses money.",
+    ]);
+    assert_eq!(added, "remembered 1\n");
+    crystal.ok(&["remember", "-C", repo_dir, "Deploys go out on Tuesdays"]);
+
+    // A list shows an entry by its title; show, all of it.
+    let listed = crystal.ok(&["memory", "-C", repo_dir, "list"]);
+    assert!(
+        listed.contains("decision   now  Fees are kept in cents\n"),
+        "{listed}"
+    );
+    assert!(!listed.contains("Never store"), "{listed}");
+    let shown = crystal.ok(&["memory", "-C", repo_dir, "show", "1"]);
+    assert!(
+        shown
+            .contains("\n\nFees are kept in cents\n\nNever store a float: rounding loses money.\n"),
+        "{shown}"
+    );
+    let decisions = crystal.ok(&["memory", "-C", repo_dir, "list", "-k", "decision"]);
+    assert_eq!(decisions.lines().count(), 1, "{decisions}");
+    let long = "a title ".repeat(20);
+    let refused = crystal.fails(&["remember", "-C", repo_dir, "--title", &long]);
+    assert!(refused.contains("120 characters at most"), "{refused}");
+
+    // What was forgotten is listed apart until it's remembered again.
+    crystal.ok(&["memory", "-C", repo_dir, "rm", "2"]);
+    let forgotten = crystal.ok(&["memory", "-C", repo_dir, "list", "--forgotten"]);
+    assert_eq!(
+        forgotten,
+        "   2  note       now  Deploys go out on Tuesdays\n"
+    );
+    assert_eq!(
+        crystal.ok(&["memory", "-C", repo_dir, "list", "--wrong"]),
+        forgotten
+    );
+    assert!(!crystal.ok(&["memory", "-C", repo_dir]).contains("Deploys"));
+    crystal.ok(&["remember", "-C", repo_dir, "Deploys go out on Tuesdays"]);
+    assert_eq!(
+        crystal.ok(&["memory", "-C", repo_dir, "list", "--forgotten"]),
+        ""
+    );
+}
+
+#[test]
 fn search_by_meaning_without_its_model_goes_by_words_and_says_how_to_get_it() {
     let (crystal, repo) = crystal_remembering();
     crystal.configure("notify = false\n\n[memory]\nembeddings = true\ndistill = false\n");
@@ -8357,6 +8474,44 @@ fn m_in_the_tui_shows_the_project_s_memory_and_x_forgets_an_entry() {
 
     tui.type_keys("\x1b");
     tui.shows("▸ agent");
+}
+
+#[test]
+fn enter_in_the_tui_s_memory_opens_an_entry_s_file_in_the_editor() {
+    let (crystal, repo) = crystal_remembering();
+    let repo_dir = repo.to_str().unwrap();
+    std::fs::write(repo.join("ledger.rs"), "fn ledger() {}").unwrap();
+    crystal.ok(&[
+        "remember",
+        "-C",
+        repo_dir,
+        "-f",
+        "ledger.rs",
+        "The ledger tests need redis",
+    ]);
+    crystal.ok(&["new", "-n", "agent", "-c", repo_dir, "sleep", "30"]);
+    // An editor that notes the file it was asked to open, and where.
+    let editor = crystal.dir.path().join("editor");
+    let edited = crystal.dir.path().join("edited");
+    script(
+        &editor,
+        "printf '%s %s\\n' \"$PWD\" \"$1\" > \"$EDITED\"\nsleep 30\n",
+    );
+
+    let mut tui = crystal.attach_with_env(
+        &[],
+        &[
+            ("EDITOR", editor.to_str().unwrap()),
+            ("EDITED", edited.to_str().unwrap()),
+        ],
+    );
+    tui.shows("agent");
+    tui.type_keys("m");
+    tui.shows("enter edit its file");
+    tui.type_keys("\r");
+    let repo = std::fs::canonicalize(&repo).unwrap();
+    assert_eq!(written(&edited), format!("{} ledger.rs\n", repo.display()));
+    tui.shows("typing into ledger.rs");
 }
 
 /// Another machine for `crystal ssh` to reach: a fake ssh that runs the
@@ -8869,6 +9024,7 @@ macro_rules! task_and_flow_rules {
 macro_rules! backlog_and_handoff_rules {
     () => {
         "Bash(crystal backlog add:*),Bash(crystal backlog),Bash(crystal backlog --all),\
+         Bash(crystal backlog list:*),Bash(crystal backlog show:*),Bash(crystal backlog edit:*),\
          Bash(crystal backlog export),Bash(crystal backlog done:*),\
          Bash(crystal backlog reopen:*),Bash(crystal backlog start:*),Bash(crystal handoff:*)"
     };
@@ -11875,6 +12031,262 @@ fn b_opens_the_projects_backlog_to_add_to_and_tick_off() {
     tui.shows("✓ write the docs");
     tui.type_keys("\x1b");
     tui.hides("backlog · shop");
+
+    // The item the bar is on shows its body under the list, and `e`
+    // changes its line.
+    crystal.ok(&[
+        "backlog",
+        "-C",
+        repo_dir,
+        "edit",
+        "2",
+        "-b",
+        "The total is off by a cent.",
+    ]);
+    tui.type_keys("b");
+    tui.shows("The total is off by a cent.");
+    tui.type_keys("e");
+    tui.shows("#2's line:");
+    tui.type_keys(" again\r");
+    eventually("#2's line is changed", || {
+        crystal.ok(&["backlog", "-C", repo_dir]) == "#2    fix the cart again +\n"
+    });
+}
+
+#[test]
+fn a_backlog_item_has_a_body_and_tags_to_edit_show_filter_and_import() {
+    let crystal = Crystal::new();
+    let dir = crystal.dir.path();
+    let repo = git_repo(dir, "shop");
+    let repo_dir = repo.to_str().unwrap();
+    let backlog = |args: &[&str]| {
+        let mut all = vec!["backlog", "-C", repo_dir];
+        all.extend(args);
+        crystal.ok(&all)
+    };
+    let added = backlog(&[
+        "add",
+        "retry",
+        "the",
+        "webhook",
+        "-b",
+        "On a timeout only.",
+        "-t",
+        "payments",
+        "-t",
+        "#ci",
+    ]);
+    assert_eq!(added, "#1\n");
+    assert_eq!(backlog(&["add", "fix the cart", "-t", "ui"]), "#2\n");
+    // A `+` says there's more to it than its line.
+    assert_eq!(
+        backlog(&[]),
+        "#1    retry the webhook +  #payments  #ci\n#2    fix the cart  #ui\n"
+    );
+    assert_eq!(backlog(&["-t", "ui"]), "#2    fix the cart  #ui\n");
+    assert_eq!(
+        backlog(&["list", "-t", "ci", "-t", "payments"]),
+        "#1    retry the webhook +  #payments  #ci\n"
+    );
+    assert_eq!(
+        backlog(&["show", "1"]),
+        "#1  open  retry the webhook\n  tags      #payments #ci\n  added     just now\n\n  \
+         On a timeout only.\n"
+    );
+
+    backlog(&["edit", "1", "retry", "the", "webhook", "twice"]);
+    backlog(&[
+        "edit",
+        "2",
+        "--no-tags",
+        "-b",
+        "The total is off by a cent.",
+    ]);
+    let shown: serde_json::Value =
+        serde_json::from_str(&backlog(&["show", "2", "--json"])).unwrap();
+    assert_eq!(shown["text"], "fix the cart");
+    assert_eq!(shown["body"], "The total is off by a cent.");
+    assert_eq!(shown["tags"], serde_json::json!([]));
+    assert_eq!(shown["tasks"], serde_json::json!([]));
+    let refused = crystal.fails(&["backlog", "-C", repo_dir, "edit", "2"]);
+    assert!(refused.contains("say what to change"), "{refused}");
+    let missing = crystal.fails(&["backlog", "-C", repo_dir, "show", "9"]);
+    assert!(
+        missing.contains("there's no #9 on the backlog"),
+        "{missing}"
+    );
+
+    // The export reads back: into its own project it adds nothing, and
+    // into another, every item, done or not, with its body and tags.
+    backlog(&["done", "2"]);
+    let export = backlog(&["export"]);
+    assert_eq!(
+        export,
+        "# shop backlog\n\n\
+         - [ ] retry the webhook twice (#1) #payments #ci\n  On a timeout only.\n\
+         - [x] fix the cart (#2)\n  The total is off by a cent.\n"
+    );
+    let file = dir.join("TODO.md");
+    std::fs::write(&file, &export).unwrap();
+    let file = file.to_str().unwrap();
+    assert_eq!(
+        backlog(&["import", file]),
+        "added nothing\npassed over 2 already on the backlog\n"
+    );
+    let other = git_repo(dir, "other");
+    let other_dir = other.to_str().unwrap();
+    assert_eq!(
+        crystal.ok(&["backlog", "-C", other_dir, "import", file]),
+        "added #1 #2\n"
+    );
+    assert_eq!(
+        crystal.ok(&["backlog", "-C", other_dir, "--all"]),
+        "#1    retry the webhook twice +  #payments  #ci\n#2    ✓ fix the cart +\n"
+    );
+    std::fs::write(dir.join("empty.md"), "# nothing\n\n- not a box\n").unwrap();
+    let empty = dir.join("empty.md");
+    let refused = crystal.fails(&[
+        "backlog",
+        "-C",
+        other_dir,
+        "import",
+        empty.to_str().unwrap(),
+    ]);
+    assert!(refused.contains("no `- [ ]` item"), "{refused}");
+}
+
+#[test]
+fn a_backlog_item_starts_with_a_profile_in_a_worktree_and_shows_its_tasks() {
+    let crystal = Crystal::new();
+    crystal.configure(
+        "notify = false\n\n[plugins]\nmemory = false\n\n\
+         [[profile]]\nname = \"builder\"\nagent = \"claude\"\nmodel = \"opus\"\n\
+         prompt = \"Test first.\"\nwhere = \"worktree\"\n",
+    );
+    let dir = crystal.dir.path();
+    let repo = git_repo(dir, "shop");
+    let repo_dir = repo.to_str().unwrap();
+    crystal.ok(&[
+        "backlog",
+        "-C",
+        repo_dir,
+        "add",
+        "write the docs",
+        "-b",
+        "The guide first.",
+    ]);
+    let refused = crystal.fails(&["backlog", "-C", repo_dir, "start", "1", "-p", "nobody"]);
+    assert!(
+        refused.contains("there's no profile called nobody"),
+        "{refused}"
+    );
+
+    let bin = finishing_claude(dir);
+    let finish = dir.join("finish");
+    let out = crystal
+        .command(&[
+            "backlog", "-C", repo_dir, "start", "1", "-p", "builder", "-d", "-n", "docs",
+        ])
+        .env("PATH", path_of(&[&bin]))
+        .env("FINISH", &finish)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // In a worktree named after the item, as the profile says, with its
+    // model, and its prompt ahead of the item's line and body.
+    let worktree = PathBuf::from(listed(&crystal, "docs")["cwd"].as_str().unwrap());
+    assert!(
+        worktree.to_str().unwrap().contains("write-the-docs"),
+        "{worktree:?}"
+    );
+    let args = written(&worktree.join("args"));
+    assert!(args.contains("\n--model\nopus\n"), "{args}");
+    assert!(
+        args.ends_with("\n--\nTest first.\n\nwrite the docs\n\nThe guide first.\n"),
+        "{args}"
+    );
+    let shown = crystal.ok(&["backlog", "-C", repo_dir, "show", "1"]);
+    assert!(
+        shown.contains("  tasks     t1    running, in docs\n"),
+        "{shown}"
+    );
+
+    std::fs::write(&finish, "").unwrap();
+    eventually("the item is ticked", || {
+        crystal.ok(&["backlog", "-C", repo_dir]).is_empty()
+    });
+    let shown = crystal.ok(&["backlog", "-C", repo_dir, "show", "1"]);
+    assert!(shown.starts_with("#1  done  write the docs\n"), "{shown}");
+    assert!(
+        shown.contains("  tasks     t1    done, just now: did what was asked\n"),
+        "{shown}"
+    );
+}
+
+#[test]
+fn a_backlog_item_starts_in_the_background_on_a_pull_request() {
+    let crystal = Crystal::new();
+    let dir = crystal.dir.path();
+    let repo = github_repo(dir);
+    git(&repo, &["checkout", "-q", "-b", "fix-login"]);
+    git(
+        &repo,
+        &["commit", "-q", "--allow-empty", "-m", "send them home"],
+    );
+    git(&repo, &["push", "-q", "origin", "fix-login"]);
+    git(&repo, &["checkout", "-q", "main"]);
+    git(&repo, &["branch", "-q", "-D", "fix-login"]);
+    let path = format!(
+        "{}:{}",
+        task_gh(dir).display(),
+        path_with(&print_claude(dir))
+    );
+    let repo_arg = repo.to_str().unwrap();
+    crystal.ok(&["backlog", "-C", repo_arg, "add", "send them home"]);
+
+    let out = crystal
+        .command(&[
+            "backlog",
+            "-C",
+            repo_arg,
+            "start",
+            "1",
+            "--pr",
+            "57",
+            "--background",
+            "-n",
+            "home",
+            "--",
+            "--model",
+            "haiku",
+        ])
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "home\n");
+    // In the pull request's worktree, told of it, asked what the item says.
+    let ran = dir.join("app.worktrees/fix-login/runs");
+    eventually("claude has run", || {
+        std::fs::read_to_string(&ran).is_ok_and(|runs| runs.ends_with("-- send them home\n"))
+    });
+    let runs = std::fs::read_to_string(&ran).unwrap();
+    assert!(runs.contains("--model haiku"), "{runs}");
+    assert!(
+        runs.contains("Your task is about GitHub pull request #57"),
+        "{runs}"
+    );
+    let card = crystal.ok(&["tasks", "show", "home"]);
+    assert!(card.contains("  backlog   #1\n"), "{card}");
+    assert!(card.contains("in the background"), "{card}");
 }
 
 #[test]
@@ -11984,7 +12396,8 @@ const ALLOWED_WITH_MEMORY: &str = concat!(
     task_and_flow_rules!(),
     ",",
     backlog_and_handoff_rules!(),
-    ",Bash(crystal remember:*),Bash(crystal memory),Bash(crystal memory search:*),\
+    ",Bash(crystal remember:*),Bash(crystal memory),Bash(crystal memory add:*),\
+     Bash(crystal memory list:*),Bash(crystal memory search:*),\
      Bash(crystal memory show:*),mcp__crystal__memory_search,mcp__crystal__memory_show"
 );
 
@@ -12161,6 +12574,61 @@ fn a_session_with_nothing_to_read_can_t_be_distilled() {
     assert!(
         refused.contains("left nothing the distiller can read"),
         "{refused}"
+    );
+}
+
+#[test]
+fn archiving_a_claude_session_has_the_distiller_read_what_it_did() {
+    let (crystal, repo) = crystal_remembering();
+    let repo_dir = repo.to_str().unwrap();
+    std::fs::write(repo.join("ledger.rs"), "fn ledger() {}").unwrap();
+    let bin = distilling_claude(crystal.dir.path());
+    let out = crystal
+        .command(&["new", "-d", "-n", "plain", "-c", repo_dir, "claude"])
+        .env("PATH", path_of(&[&bin]))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // Its hooks name its conversation's transcript, which says what it did.
+    let args = written(&repo.join("task-args"));
+    let settings = claude_settings(&args);
+    let hook = settings["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"]
+        .as_str()
+        .unwrap();
+    let transcript = crystal.dir.path().join("conv-9.jsonl");
+    std::fs::write(
+        &transcript,
+        "{\"type\":\"user\",\"message\":{\"content\":\"why do the ledger tests fail?\"}}\n",
+    )
+    .unwrap();
+    let event = serde_json::json!({
+        "hook_event_name": "UserPromptSubmit",
+        "session_id": "conv-9",
+        "transcript_path": transcript,
+    });
+    run_hook(&crystal, "plain", hook, &event.to_string());
+    eventually("the conversation is known", || {
+        crystal.saved().contains("conv-9")
+    });
+
+    crystal.ok(&["archive", "plain"]);
+    eventually("the distiller's entry is kept", || {
+        crystal
+            .ok(&["memory", "-C", repo_dir])
+            .contains("The ledger tests need redis up  (ledger.rs)")
+    });
+    let message = std::fs::read_to_string(repo.join("distill-message")).unwrap();
+    assert!(
+        message.starts_with("The work of session plain, which wasn't started with a task."),
+        "{message}"
+    );
+    assert!(
+        message.contains("USER: why do the ledger tests fail?\n"),
+        "{message}"
     );
 }
 

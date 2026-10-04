@@ -11,7 +11,7 @@
 //! `ping`, `tools/list` and `tools/call`. It reads the memory's database
 //! itself, so it needs no daemon.
 
-use crate::memory::{self, Kind, Listed, Store};
+use crate::memory::{self, Kind, Listed, Store, Wanted};
 use crate::memory_cli;
 use crate::tui::sidebar::ago;
 use anyhow::{Context, Result, bail};
@@ -83,9 +83,9 @@ struct Server {
     search: Search,
 }
 
-/// A search of a project's memory: the socket, the project, the words, the
-/// kind and the most to give.
-type Search = fn(&Path, &Path, &str, Option<Kind>, usize) -> Result<Vec<Listed>>;
+/// A search of a project's memory: the socket, the project, the words,
+/// and what it keeps to and the most to give.
+type Search = fn(&Path, &Path, &str, &Wanted) -> Result<Vec<Listed>>;
 
 impl Server {
     /// The reply to one message, or `None` for a notification, which
@@ -140,7 +140,12 @@ impl Server {
         };
         let limit = arguments["limit"].as_u64().unwrap_or(DEFAULT_LIMIT);
         let limit = limit.clamp(1, memory::SEARCH_LIMIT as u64) as usize;
-        let found = (self.search)(&self.socket, &self.project, query, kind, limit)?;
+        // Stale entries too, marked: the model can tell.
+        let wanted = Wanted {
+            kind,
+            ..Wanted::best(limit)
+        };
+        let found = (self.search)(&self.socket, &self.project, query, &wanted)?;
         if found.is_empty() {
             return Ok("Nothing in this project's memory matches that.".to_string());
         }
@@ -231,7 +236,7 @@ fn row(item: &Listed, now: u64) -> String {
         entry.id,
         entry.kind,
         ago(entry.last_seen, now),
-        memory::one_line(&entry.text)
+        memory::title(&entry.text)
     );
     if !entry.files.is_empty() {
         line.push_str(&format!(" ({})", entry.files.join(", ")));
@@ -261,9 +266,8 @@ mod tests {
             socket: dir.path().join("crystal.sock"),
             project: dir.path().join("app"),
             on: || true,
-            search: |socket, project, query, kind, limit| {
-                let found = Store::open(socket)?.search(project, query, kind, limit, None)?;
-                Ok(memory::marked(found, project))
+            search: |socket, project, query, wanted| {
+                Store::open(socket)?.find(project, query, wanted, None)
             },
         };
         std::fs::create_dir(&server.project).unwrap();

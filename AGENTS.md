@@ -227,8 +227,9 @@ whenever what's handed over changes in a way the crystal before couldn't read.
     list asked for again and the heading saying so, the reading pane, and drawing them
   - `compose.rs`: writing back to the forge from those views: the comment box and the form that edits an
     issue, which keep what's typed until the forge takes it
-  - `backlog_view.rs`: the backlog view `b` opens: its state and keys, kept apart from I/O, and its
-    drawing
+  - `backlog_view.rs`: the backlog view `b` opens: its state and keys, kept apart from I/O, an item's line
+    changed (`e`), the list kept to a tag (`t`), and its drawing, the item the bar is on under the list with
+    its tags, the tasks started for it and its body
   - `pane.rs`: a viewer of a session on screen, the selected one or a split, and its screen, with copy mode
     over it while that's on; what the mouse selects on it, by characters, words or lines (`Clicks` counts
     them), following the history as a drag scrolls it, kept in copy mode without `copy_on_select`, and its
@@ -260,7 +261,8 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   - `preview.rs`: the file finder's, the tree browser's and the handoff view's preview: a file read and
     highlighted off the event loop, a markdown file's page laid out for its width or its source, scrolling,
     and drawing them
-  - `memory_view.rs`: the memory view (`m`): a project's entries, the filter, forgetting and
+  - `memory_view.rs`: the memory view (`m`): a project's entries by their titles, the filter, the entry's
+    file opened in the editor (Enter), in the worktree it was said in while that's there, forgetting and
     promoting after a `y`, and its drawing
   - `plugins_view.rs`: the plugins view (`X`): every plugin, on or off, with installed ones' actions, panes and
     link handlers, and those the selected session's project ships under its name, which the view turns off
@@ -294,7 +296,8 @@ whenever what's handed over changes in a way the crystal before couldn't read.
     open, reads the settings, the hooks and the daemon's `EmbeddingStatus` again every half a second
 - `src/daemon.rs`: the daemon: listens on the socket and owns the sessions, and emits an event wherever something
   happens to them, their tasks, flows, worktrees, memory or backlog, and for the entries of memory gone stale,
-  looked for hourly and as each task closes; archives sessions and starts them again,
+  looked for hourly and as each task closes; archives sessions, the distiller reading what one did, and starts
+  them again,
   stops agents left idle past `[sessions] stop_idle_after`, and keeps the list of projects sessions ran in;
   after a cold restart, puts the sessions written down back in their places and starts them again, agents
   `[sessions] restart_spacing_ms` apart on a thread of their own, those that can't start kept, failed, saying
@@ -455,7 +458,7 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   stopping one, and deleting a stopped one's state
 - `src/db.rs`: the SQLite database the daemon and the TUI keep their state in (WAL, `synchronous=NORMAL`,
   migrations by `user_version`, as docket does): the sessions to start again, the archived sessions, flow runs,
-  the projects on crystal's list, each project's backlog and closed tasks, the files tasks kept, the tasks waiting to start and the last task number, what each
+  the projects on crystal's list, each project's backlog (each item's line, body and tags) and closed tasks, the files tasks kept, the tasks waiting to start and the last task number, what each
   task carried beside its goal (its acceptance criteria, pull request and issue), what background
   tasks spent each day, the event log, read from a point on or a page of a timeline's scope at a time back
   from its end, and the TUI's
@@ -481,13 +484,17 @@ whenever what's handed over changes in a way the crystal before couldn't read.
 - `src/artifacts.rs`: the files a task keeps as it closes (`crystal done --artifact`): checking each is a small
   file in the task's worktree, copying them into the task's directory in the state directory under names of
   their own, and keeping the worktree's handoff file there too
-- `src/backlog.rs`: a project's backlog, numbered items kept in the database by the daemon alone, its
-  markdown export, and `enabled`, the one gate everything the backlog adds goes through
+- `src/backlog.rs`: a project's backlog, numbered items kept in the database by the daemon alone, each a line
+  and a body, changed, imported (those whose line is there already passed over) and filtered by tag; what a
+  task started for one is asked; its markdown export and reading a markdown list of checkboxes back, and
+  `enabled`, the one gate everything the backlog adds goes through
 - `src/worktree_cli.rs`: `crystal worktree list`, `create`, `open` (finding the worktree; `main.rs` starts the
   session), `label` and `move`, which makes the worktree a session moves into when there's none
 - `src/work.rs`: `crystal done` (with `--artifact`), `handoff`, `tasks` and its commands (`new`, `start`, `show`,
   `cancel`, `log`, `terminal`), reading what a new task carries (`--accept`, and `--pr` and `--issue` from the
-  forge, a pull request's worktree found or made), and `backlog`
+  forge, a pull request's worktree found or made), and `backlog` with its commands, an item's card with the
+  tasks started for it, and starting a task for one with a profile, in a worktree, on a pull request or in the
+  background
 - `src/config.rs`: the settings in `~/.config/crystal/config.toml`, read and checked: a theme by any of its
   names, the colors `[colors]` takes, what the mouse does (`[mouse]`) and whether programs' copies go on the
   clipboard (`[clipboard]`); what background tasks may spend and do unasked (`[tasks]`); the shell a new terminal runs
@@ -496,13 +503,16 @@ whenever what's handed over changes in a way the crystal before couldn't read.
 - `src/memory.rs`: what a project's sessions learned: the SQLite store in the state directory with its FTS5
   index (bm25, prefix and porter-stemmed words), each entry's vector and search by meaning merged with it by
   reciprocal rank fusion, then the reranker's read of the best (nothing when none answers), its migrations,
-  the same said again seen again, forgotten entries the distiller can't add back, bringing in a project's JSON file from before, anchors (each file's SHA-256 when
+  the same said again seen again, forgotten entries the distiller can't add back, kept as they were to list,
+  bringing in a project's JSON file from before, anchors (each file's SHA-256 when
   an entry was said) and whether an entry holds, fresh, drifting or stale, the entries gone stale the daemon
-  hasn't told of, search, the paragraph every agent is
+  hasn't told of, search (of a kind, about some files or directories, the stale left out or not), an entry's
+  title, its first line, or one of its own, the paragraph every agent is
   shown at launch (entries about what its worktree changed first, in docket's 800 bytes, tasks' outcomes kept
   by an earlier crystal left out of it), promoting into
   CLAUDE.md, the markdown export, and `enabled`, the one gate everything memory adds goes through
-- `src/distill.rs`: the distiller: after a task closes, one tool-less `claude -p` (Haiku by default, `[memory]`
+- `src/distill.rs`: the distiller: after a task closes, or a session is archived that wasn't read as its task
+  closed, one tool-less `claude -p` (Haiku by default, `[memory]`
   in the config) over the end of its transcript, told what the memory has already; its answer checked
   against the checkout before it's kept
 - `src/mcp.rs`: `crystal mcp`: an MCP server over stdio with `memory_search` and `memory_show`, which every
@@ -523,8 +533,9 @@ whenever what's handed over changes in a way the crystal before couldn't read.
 - `src/rerank.rs`: the reranker: every passage and the query in one prompt, each marked at its end, the
   projector over the model's state at the marks, and each passage's cosine with the query
 - `src/secrets.rs`: taking credentials out of text before memory keeps it or the distiller reads it
-- `src/memory_cli.rs`: `crystal remember` and `crystal memory`, `show`, `export` and `distill` included, and an
-  entry in full as `show` and the `memory_show` tool print it
+- `src/memory_cli.rs`: `crystal remember` and `crystal memory`, `add`, `list` (by kind, or what was
+  forgotten), `search` (by kind, files, the stale too, and how many), `show`, `export` and `distill` included,
+  and an entry in full as `show` and the `memory_show` tool print it
 - `src/profile.rs`: agent profiles: what one runs, checking it, and saving or removing one in the config file
   with `toml_edit`, so the user's comments and layout stay; `enabled` is the one switch for the feature
 - `src/flows.rs`: flows, chains of tasks on one goal: the `[[flow]]` tables in the config file and in a project's

@@ -1744,7 +1744,15 @@ impl Tui {
                     BacklogChange::Add(text) => Request::BacklogAdd {
                         dir: dir.clone(),
                         text,
+                        body: String::new(),
                         tags: Vec::new(),
+                    },
+                    BacklogChange::Edit { number, text } => Request::BacklogEdit {
+                        dir: dir.clone(),
+                        number,
+                        text: Some(text),
+                        body: None,
+                        tags: None,
                     },
                     BacklogChange::Mark { number, done } => Request::BacklogMark {
                         dir: dir.clone(),

@@ -15,8 +15,8 @@ use crate::forge;
 use crate::handoff;
 use crate::printable;
 use crate::protocol::{
-    BacklogItem, ForgeLink, PendingTask, Request, Response, State, TaskBrief, TaskSpec, TaskStart,
-    TaskState, TaskView, task_label,
+    Backlog, BacklogItem, ForgeLink, PendingTask, Request, Response, State, TaskBrief, TaskSpec,
+    TaskStart, TaskState, TaskView, task_label,
 };
 use crate::shell;
 use crate::tasks;
@@ -493,31 +493,97 @@ fn agent_command(config: &Config, goal: &str) -> Vec<String> {
 
 /// What `crystal backlog` can do.
 pub enum BacklogAction {
-    List { all: bool, json: bool },
-    Add { text: String, tags: Vec<String> },
-    Mark { number: u64, done: bool },
-    Remove { number: u64 },
+    List {
+        all: bool,
+        json: bool,
+        tags: Vec<String>,
+    },
+    Add {
+        text: String,
+        body: String,
+        tags: Vec<String>,
+    },
+    Show {
+        number: u64,
+        json: bool,
+    },
+    Edit {
+        number: u64,
+        text: Option<String>,
+        body: Option<String>,
+        tags: Option<Vec<String>>,
+    },
+    Mark {
+        number: u64,
+        done: bool,
+    },
+    Remove {
+        number: u64,
+    },
     Export,
+    /// Reads the items of a markdown file, or of standard input for `-`.
+    Import {
+        file: PathBuf,
+    },
 }
 
 /// Does `action` to the backlog of the project `dir` is in.
 pub fn change_backlog(socket: &Path, dir: PathBuf, action: BacklogAction) -> Result<()> {
     backlog::ensure_enabled(&settings())?;
     match action {
-        BacklogAction::List { all, json } => {
+        BacklogAction::List { all, json, tags } => {
             let backlog = client::backlog(socket, dir, all)?;
+            let items: Vec<&BacklogItem> = backlog
+                .items
+                .iter()
+                .filter(|item| backlog::has_tags(item, &tags))
+                .collect();
             if json {
-                println!("{}", serde_json::to_string_pretty(&backlog.items)?);
+                println!("{}", serde_json::to_string_pretty(&items)?);
             } else {
-                print!("{}", printable::text(&backlog_lines(&backlog.items)));
+                print!("{}", printable::text(&backlog_lines(&items)));
             }
         }
-        BacklogAction::Add { text, tags } => {
-            let add = Request::BacklogAdd { dir, text, tags };
+        BacklogAction::Add { text, body, tags } => {
+            let add = Request::BacklogAdd {
+                dir,
+                text,
+                body,
+                tags,
+            };
             match client::ask(socket, &add, true)? {
                 Some(Response::Added { number }) => println!("#{number}"),
                 _ => bail!("the daemon didn't add it"),
             }
+        }
+        BacklogAction::Show { number, json } => {
+            let backlog = client::backlog(socket, dir, true)?;
+            let item = backlog_item(&backlog, number)?;
+            let tasks = backlog.tasks_for(number);
+            if json {
+                let shown = ShownItem { item, tasks };
+                println!("{}", serde_json::to_string_pretty(&shown)?);
+            } else {
+                print!("{}", printable::text(&item_card(item, &tasks, now())));
+            }
+        }
+        BacklogAction::Edit {
+            number,
+            text,
+            body,
+            tags,
+        } => {
+            if text.is_none() && body.is_none() && tags.is_none() {
+                bail!("say what to change: its line, --body, or --tag or --no-tags");
+            }
+            let edit = Request::BacklogEdit {
+                dir,
+                number,
+                text,
+                body,
+                tags,
+            };
+            expect_done(client::ask(socket, &edit, true)?, socket)?;
         }
         BacklogAction::Mark { number, done } => {
             let mark = Request::BacklogMark { dir, number, done };
@@ -532,66 +598,223 @@ pub fn change_backlog(socket: &Path, dir: PathBuf, action: BacklogAction) -> Res
             let markdown = backlog::markdown(&backlog.project, &backlog.items);
             print!("{}", printable::text(&markdown));
         }
+        BacklogAction::Import { file } => {
+            let text = if file == Path::new("-") {
+                std::io::read_to_string(std::io::stdin()).context("couldn't read the input")?
+            } else {
+                std::fs::read_to_string(&file)
+                    .with_context(|| format!("couldn't read {}", file.display()))?
+            };
+            let items = backlog::read_markdown(&text);
+            if items.is_empty() {
+                bail!("there's no `- [ ]` item at the start of a line to import");
+            }
+            let import = Request::BacklogImport { dir, items };
+            let Some(Response::Imported { added, skipped }) = client::ask(socket, &import, true)?
+            else {
+                bail!("the daemon didn't import them");
+            };
+            print!("{}", imported_lines(&added, skipped));
+        }
     }
     Ok(())
 }
 
-/// Starts a task for backlog item `number`: the agent the new-session
-/// panel would start first, asked to do what the item says, here or with
-/// `worktree` in a new worktree named after it. Closing the task done ticks
-/// the item. Gives back the new session's name.
-pub fn start_from_backlog(
-    socket: &Path,
-    dir: PathBuf,
-    number: u64,
-    worktree: bool,
-    name: Option<String>,
-) -> Result<String> {
-    let config = settings();
-    backlog::ensure_enabled(&config)?;
-    let backlog = client::backlog(socket, dir.clone(), true)?;
-    let item = backlog
+/// An item as `crystal backlog show --json` prints it: its fields, and
+/// the tasks started for it.
+#[derive(serde::Serialize)]
+struct ShownItem<'a> {
+    #[serde(flatten)]
+    item: &'a BacklogItem,
+    tasks: Vec<&'a TaskView>,
+}
+
+/// Item `number` of `backlog`, or an error that says it isn't there.
+fn backlog_item(backlog: &Backlog, number: u64) -> Result<&BacklogItem> {
+    backlog
         .items
         .iter()
         .find(|item| item.number == number)
-        .with_context(|| format!("there's no #{number} on the backlog"))?;
+        .with_context(|| format!("there's no #{number} on the backlog"))
+}
+
+/// What an import says it did: the numbers its items got, and how many it
+/// passed over.
+fn imported_lines(added: &[u64], skipped: usize) -> String {
+    let mut text = match added {
+        [] => "added nothing\n".to_string(),
+        added => {
+            let numbers: Vec<String> = added.iter().map(|number| format!("#{number}")).collect();
+            format!("added {}\n", numbers.join(" "))
+        }
+    };
+    match skipped {
+        0 => {}
+        1 => text.push_str("passed over 1 already on the backlog\n"),
+        n => text.push_str(&format!("passed over {n} already on the backlog\n")),
+    }
+    text
+}
+
+/// How `crystal backlog start` starts a task for an item.
+#[derive(Debug, Default)]
+pub struct BacklogStart {
+    pub number: u64,
+    /// In a new worktree, on a branch named after the item.
+    pub worktree: bool,
+    /// The profile it runs with: its agent, its options and its prompt,
+    /// and a new worktree when it says so.
+    pub profile: Option<String>,
+    /// The pull request it's on, by its number: it runs in its worktree,
+    /// and is told of it.
+    pub pull_request: Option<u64>,
+    /// In the background, `claude -p` with `claude_args`.
+    pub background: bool,
+    pub claude_args: Vec<String>,
+    /// Its session's name: `None` names it for the item.
+    pub name: Option<String>,
+}
+
+/// Starts a task for a backlog item: the agent the new-session panel would
+/// start first, or the one its profile says, or Claude in the background,
+/// asked to do what the item says, here, in a new worktree named after it,
+/// or in a pull request's. Closing the task done ticks the item. Gives back
+/// the new session's name.
+pub fn start_from_backlog(socket: &Path, dir: PathBuf, start: BacklogStart) -> Result<String> {
+    let config = settings();
+    backlog::ensure_enabled(&config)?;
+    let BacklogStart {
+        number,
+        worktree,
+        profile,
+        pull_request,
+        background,
+        claude_args,
+        name,
+    } = start;
+    let backlog = client::backlog(socket, dir.clone(), true)?;
+    let item = backlog_item(&backlog, number)?;
     if item.done {
         bail!("#{number} is done already: `crystal backlog reopen {number}` first");
     }
-    let command = agent_command(&config, &item.text);
-    let cwd = if worktree {
-        client::add_worktree(
+    let profile = match profile {
+        Some(name) => {
+            crate::plugins::ensure_enabled(&config, "profiles")?;
+            let found = config.profiles.iter().find(|profile| profile.name == name);
+            let found = found.with_context(|| {
+                format!("there's no profile called {name}; `crystal profile` lists them")
+            })?;
+            Some(found.clone())
+        }
+        None => None,
+    };
+    let goal = backlog::goal(item);
+    let brief = Brief {
+        pull_request,
+        ..Brief::default()
+    };
+    let (brief, on_pull_request) = read_brief(socket, &dir, brief)?;
+    let in_worktree = profile
+        .as_ref()
+        .is_some_and(|profile| profile.start_in == Some(crate::profile::StartIn::Worktree));
+    let cwd = match on_pull_request {
+        Some(path) => path,
+        None if worktree || in_worktree => client::add_worktree(
             socket,
             &dir,
             &forge::branch_for_issue(number, &item.text),
             None,
             None,
-        )?
-    } else {
-        dir
+        )?,
+        None => dir,
+    };
+    if background {
+        let spec = TaskSpec {
+            prompt: goal,
+            args: claude_args,
+        };
+        return Ok(client::new_task(socket, name, cwd, spec, Some(number), brief)?.name);
+    }
+    let command = match &profile {
+        Some(profile) => profile.command(&goal),
+        None => agent_command(&config, &goal),
     };
     let purpose = Purpose {
-        task: Some(item.text.clone()),
+        task: Some(goal),
         backlog: Some(number),
-        ..Purpose::default()
+        brief,
     };
     Ok(client::new_session_for(socket, name, cwd, command, purpose)?.name)
 }
 
 /// Backlog items as `crystal backlog` prints them: number, a tick for one
-/// that's done, text, tags.
-fn backlog_lines(items: &[BacklogItem]) -> String {
+/// that's done, text, tags, and a `+` for one with more in its body.
+fn backlog_lines(items: &[&BacklogItem]) -> String {
     let mut text = String::new();
     for item in items {
         let tick = if item.done { "✓ " } else { "" };
+        let more = if item.body.is_empty() { "" } else { " +" };
         let tags: String = item.tags.iter().map(|tag| format!("  #{tag}")).collect();
         let number = format!("#{}", item.number);
         text.push_str(&format!(
-            "{number:<4}  {tick}{}{tags}\n",
+            "{number:<4}  {tick}{}{more}{tags}\n",
             first_line(&item.text)
         ));
     }
     text
+}
+
+/// One item, as `crystal backlog show` prints it: whether it's done, its
+/// tags, when it was added and done, the tasks started for it, then its
+/// body.
+fn item_card(item: &BacklogItem, tasks: &[&TaskView], now: u64) -> String {
+    let state = if item.done { "done" } else { "open" };
+    let mut card = format!("#{}  {state}  {}\n", item.number, first_line(&item.text));
+    let mut line = |name: &str, said: String| card.push_str(&format!("  {name:<8}  {said}\n"));
+    if !item.tags.is_empty() {
+        let tags: Vec<String> = item.tags.iter().map(|tag| format!("#{tag}")).collect();
+        line("tags", tags.join(" "));
+    }
+    if item.created > 0 {
+        line("added", when(item.created, now));
+    }
+    if let Some(closed) = item.closed {
+        line("done", when(closed, now));
+    }
+    for (index, task) in tasks.iter().enumerate() {
+        let label = if index == 0 { "tasks" } else { "" };
+        line(label, task_history_line(task, now));
+    }
+    if !item.body.is_empty() {
+        card.push('\n');
+        for body_line in item.body.lines() {
+            card.push_str(format!("  {body_line}").trim_end());
+            card.push('\n');
+        }
+    }
+    card
+}
+
+/// A task started for an item, on its card: its number and how it stands,
+/// then how it went or where it runs.
+fn task_history_line(task: &TaskView, now: u64) -> String {
+    let record = &task.record;
+    let mut said = format!("{:<4}  {}", task_label(record.id), task.state.word());
+    match &record.outcome {
+        Some(outcome) if outcome.summary.is_empty() => {
+            said.push_str(&format!(", {}", when(outcome.closed, now)));
+        }
+        Some(outcome) => {
+            said.push_str(&format!(
+                ", {}: {}",
+                when(outcome.closed, now),
+                outcome.summary
+            ));
+        }
+        None if record.session.is_empty() => {}
+        None => said.push_str(&format!(", in {}", record.session)),
+    }
+    said
 }
 
 fn first_line(text: &str) -> &str {
@@ -777,20 +1000,80 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_backlog_line_has_its_number_text_and_tags() {
-        let item = |number, text: &str, done, tags: &[&str]| BacklogItem {
+    fn item(number: u64, text: &str, done: bool, tags: &[&str]) -> BacklogItem {
+        BacklogItem {
             number,
             text: text.into(),
+            body: String::new(),
             tags: tags.iter().map(|tag| tag.to_string()).collect(),
             done,
             created: 0,
             closed: None,
-        };
+        }
+    }
+
+    #[test]
+    fn a_backlog_line_has_its_number_text_and_tags() {
+        let mut more = item(3, "ship it", false, &[]);
+        more.body = "once it's green".into();
         let lines = backlog_lines(&[
-            item(1, "write the docs", false, &["docs"]),
-            item(12, "fix it", true, &[]),
+            &item(1, "write the docs", false, &["docs"]),
+            &item(12, "fix it", true, &[]),
+            &more,
         ]);
-        assert_eq!(lines, "#1    write the docs  #docs\n#12   ✓ fix it\n");
+        assert_eq!(
+            lines,
+            "#1    write the docs  #docs\n#12   ✓ fix it\n#3    ship it +\n"
+        );
+    }
+
+    #[test]
+    fn an_item_s_card_has_its_tasks_oldest_first_then_its_body() {
+        let mut shown = item(4, "retry the webhook", false, &["payments", "ci"]);
+        shown.created = 100;
+        shown.body = "On a timeout only.\n\nNot on a 4xx.".into();
+        let mut failed = task(
+            7,
+            "retry the webhook",
+            Some((TaskState::Failed, "no network")),
+        );
+        failed.record.created = 200;
+        let mut running = task(9, "retry the webhook", None);
+        running.record.created = 900;
+        let backlog = Backlog {
+            project: "shop".into(),
+            path: PathBuf::from("/code/shop"),
+            items: vec![shown.clone()],
+            tasks: [running, failed]
+                .into_iter()
+                .map(|mut task| {
+                    task.record.backlog = Some(4);
+                    task
+                })
+                .chain([task(8, "something else", None)])
+                .collect(),
+        };
+        let tasks = backlog.tasks_for(4);
+        assert_eq!(
+            item_card(&shown, &tasks, 1000),
+            "#4  open  retry the webhook\n\
+             \x20 tags      #payments #ci\n\
+             \x20 added     15m ago\n\
+             \x20 tasks     t7    failed, just now: no network\n\
+             \x20           t9    running, in claude\n\
+             \n\
+             \x20 On a timeout only.\n\
+             \n\
+             \x20 Not on a 4xx.\n"
+        );
+    }
+
+    #[test]
+    fn an_import_says_what_it_added_and_passed_over() {
+        assert_eq!(imported_lines(&[4, 5], 0), "added #4 #5\n");
+        assert_eq!(
+            imported_lines(&[], 2),
+            "added nothing\npassed over 2 already on the backlog\n"
+        );
     }
 }
