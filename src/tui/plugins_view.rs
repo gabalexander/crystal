@@ -1,8 +1,11 @@
-//! The plugins view, `X`: crystal's own plugins and the ones installed,
-//! each on or off, with the actions, panes and link handlers of the
-//! installed ones under them. Space switches the plugin the bar is on, and
-//! Enter runs the action, or opens the pane, the bar is on. The event loop does the writing and
-//! the running (see [`crate::plugins`]).
+//! The plugins view, `X`: crystal's own plugins, the ones installed and
+//! those the selected session's project ships, each on or off, with the
+//! actions, panes and link handlers of the installed ones under them.
+//! Space switches the plugin the bar is on, but for a project's that's
+//! off, which `crystal plugin enable --project` turns on once it has shown
+//! what it runs; and Enter runs the action, or opens the pane, the bar is
+//! on. The event loop does the writing and the running (see
+//! [`crate::plugins`]).
 //!
 //! The view is state and logic only, apart from [`draw`] at the end.
 
@@ -13,6 +16,7 @@ use ratatui::layout::{Margin, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph};
+use std::path::PathBuf;
 
 /// A plugin as the view lists it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -20,6 +24,8 @@ pub struct Listed {
     pub name: String,
     pub description: String,
     pub built_in: bool,
+    /// The main worktree of the project that ships it, for a project's.
+    pub project: Option<PathBuf>,
     pub on: bool,
     /// Why it doesn't run, though it may be on: paused for failing, or a
     /// manifest that doesn't make sense.
@@ -51,19 +57,23 @@ pub struct Item {
 pub enum Outcome {
     Stay,
     Close,
-    /// Turn the plugin called `name` on, or off.
+    /// Turn the plugin called `name`, the project's when it's given, on,
+    /// or off.
     Switch {
         name: String,
+        project: Option<PathBuf>,
         on: bool,
     },
     /// Run one of a plugin's actions.
     Run {
         plugin: String,
+        project: Option<PathBuf>,
         action: String,
     },
     /// Open one of a plugin's panes.
     Open {
         plugin: String,
+        project: Option<PathBuf>,
         pane: String,
     },
 }
@@ -72,6 +82,8 @@ pub enum Outcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Row {
     Heading(&'static str),
+    /// The heading over the plugins of the project of the plugin it names.
+    ProjectHeading(usize),
     Plugin(usize),
     Action(usize, usize),
     Pane(usize, usize),
@@ -162,7 +174,7 @@ impl PluginsView {
     /// The plugin the bar's row belongs to.
     fn plugin(&self) -> Option<&Listed> {
         let index = match self.rows.get(self.selected)? {
-            Row::Heading(_) => return None,
+            Row::Heading(_) | Row::ProjectHeading(_) => return None,
             Row::Plugin(index)
             | Row::Action(index, _)
             | Row::Pane(index, _)
@@ -172,12 +184,21 @@ impl PluginsView {
     }
 
     fn switch(&mut self) -> Outcome {
-        match self.plugin() {
-            Some(plugin) => Outcome::Switch {
-                name: plugin.name.clone(),
-                on: !plugin.on,
-            },
-            None => Outcome::Stay,
+        let Some(plugin) = self.plugin() else {
+            return Outcome::Stay;
+        };
+        // Code a repository ships runs once its commands have been seen.
+        if plugin.project.is_some() && !plugin.on {
+            self.problem = Some(format!(
+                "`crystal plugin enable {} --project` shows what it runs, then turns it on",
+                plugin.name
+            ));
+            return Outcome::Stay;
+        }
+        Outcome::Switch {
+            name: plugin.name.clone(),
+            project: plugin.project.clone(),
+            on: !plugin.on,
         }
     }
 
@@ -186,13 +207,16 @@ impl PluginsView {
             return Outcome::Stay;
         };
         let (plugin_name, on) = (plugin.name.clone(), plugin.on);
+        let project = plugin.project.clone();
         let outcome = match self.rows[self.selected] {
             Row::Action(index, action) => Outcome::Run {
                 plugin: plugin_name.clone(),
+                project,
                 action: self.plugins[index].actions[action].id.clone(),
             },
             Row::Pane(index, pane) => Outcome::Open {
                 plugin: plugin_name.clone(),
+                project,
                 pane: self.plugins[index].panes[pane].id.clone(),
             },
             _ => return Outcome::Stay,
@@ -206,11 +230,11 @@ impl PluginsView {
 }
 
 fn is_heading(row: &Row) -> bool {
-    matches!(row, Row::Heading(_))
+    matches!(row, Row::Heading(_) | Row::ProjectHeading(_))
 }
 
-/// The list's rows: crystal's own plugins, then the installed ones, each
-/// with its actions and panes.
+/// The list's rows: crystal's own plugins, then the installed ones, then
+/// the project's, each with its actions and panes.
 fn rows(plugins: &[Listed]) -> Vec<Row> {
     let mut rows = vec![Row::Heading("crystal's own")];
     let own = plugins
@@ -219,11 +243,23 @@ fn rows(plugins: &[Listed]) -> Vec<Row> {
         .filter(|(_, plugin)| plugin.built_in);
     rows.extend(own.map(|(index, _)| Row::Plugin(index)));
     rows.push(Row::Heading("installed"));
-    for (index, plugin) in plugins.iter().enumerate().filter(|(_, p)| !p.built_in) {
-        rows.push(Row::Plugin(index));
-        rows.extend((0..plugin.actions.len()).map(|action| Row::Action(index, action)));
-        rows.extend((0..plugin.panes.len()).map(|pane| Row::Pane(index, pane)));
-        rows.extend((0..plugin.links.len()).map(|link| Row::Link(index, link)));
+    let installed = |plugin: &&Listed| !plugin.built_in && plugin.project.is_none();
+    let projects = |plugin: &&Listed| plugin.project.is_some();
+    for (shipped, kept) in [(false, installed as fn(&&Listed) -> bool), (true, projects)] {
+        let mut listed = plugins
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| kept(p))
+            .peekable();
+        if let (true, Some((first, _))) = (shipped, listed.peek()) {
+            rows.push(Row::ProjectHeading(*first));
+        }
+        for (index, plugin) in listed {
+            rows.push(Row::Plugin(index));
+            rows.extend((0..plugin.actions.len()).map(|action| Row::Action(index, action)));
+            rows.extend((0..plugin.panes.len()).map(|pane| Row::Pane(index, pane)));
+            rows.extend((0..plugin.links.len()).map(|link| Row::Link(index, link)));
+        }
     }
     rows
 }
@@ -247,7 +283,11 @@ pub fn draw(frame: &mut Frame, view: &PluginsView, theme: &Theme, area: Rect) {
         .enumerate()
         .map(|(at, row)| row_line(view, *row, at == view.selected, theme))
         .collect();
-    if view.plugins.iter().all(|plugin| plugin.built_in) {
+    if view
+        .plugins
+        .iter()
+        .all(|plugin| plugin.built_in || plugin.project.is_some())
+    {
         lines.push(Line::styled(
             "  none yet: `crystal plugin new <name>` makes one",
             Style::new().fg(theme.muted),
@@ -288,6 +328,12 @@ fn row_line(view: &PluginsView, row: Row, selected: bool, theme: &Theme) -> Line
     let muted = Style::new().fg(theme.muted);
     let line = match row {
         Row::Heading(heading) => {
+            return Line::styled(heading, Style::new().add_modifier(Modifier::BOLD));
+        }
+        Row::ProjectHeading(index) => {
+            let project = view.plugins[index].project.as_deref();
+            let name = project.map(crate::project::name_of).unwrap_or_default();
+            let heading = format!("{name}'s own, on for it alone");
             return Line::styled(heading, Style::new().add_modifier(Modifier::BOLD));
         }
         Row::Plugin(index) => {
@@ -364,6 +410,7 @@ mod tests {
             name: name.into(),
             description: String::new(),
             built_in,
+            project: None,
             on,
             trouble: None,
             actions: if built_in { vec![] } else { vec![item("note")] },
@@ -391,6 +438,7 @@ mod tests {
             press(&mut view, KeyCode::Char(' ')),
             Outcome::Switch {
                 name: "memory".into(),
+                project: None,
                 on: false
             }
         );
@@ -401,6 +449,7 @@ mod tests {
             press(&mut view, KeyCode::Char(' ')),
             Outcome::Switch {
                 name: "notes".into(),
+                project: None,
                 on: false
             }
         );
@@ -416,6 +465,7 @@ mod tests {
             press(&mut view, KeyCode::Enter),
             Outcome::Run {
                 plugin: "notes".into(),
+                project: None,
                 action: "note".into()
             }
         );
@@ -424,6 +474,7 @@ mod tests {
             press(&mut view, KeyCode::Enter),
             Outcome::Open {
                 plugin: "notes".into(),
+                project: None,
                 pane: "board".into()
             }
         );
@@ -456,6 +507,64 @@ mod tests {
             press(&mut view, KeyCode::Char(' ')),
             Outcome::Switch {
                 name: "notes".into(),
+                project: None,
+                on: false
+            }
+        );
+    }
+
+    #[test]
+    fn a_projects_plugins_come_under_its_name_and_only_the_command_line_turns_one_on() {
+        let project = |plugin: Listed| Listed {
+            project: Some(PathBuf::from("/code/app")),
+            ..plugin
+        };
+        let mut view = PluginsView::new(vec![
+            plugin("memory", true, true),
+            project(plugin("lint", false, false)),
+            plugin("notes", false, true),
+            project(plugin("deploy", false, true)),
+        ]);
+        let headings: Vec<Row> = view.rows.iter().copied().filter(is_heading).collect();
+        assert_eq!(
+            headings,
+            [
+                Row::Heading("crystal's own"),
+                Row::Heading("installed"),
+                Row::ProjectHeading(1)
+            ]
+        );
+        // memory, notes and its two, then the project's lint.
+        for _ in 0..4 {
+            press(&mut view, KeyCode::Down);
+        }
+        assert_eq!(view.rows[view.selected], Row::Plugin(1));
+        assert_eq!(press(&mut view, KeyCode::Char(' ')), Outcome::Stay);
+        assert!(
+            view.problem()
+                .unwrap()
+                .contains("crystal plugin enable lint --project")
+        );
+        // One that's on goes off here, and runs for its project: past
+        // lint's action and pane, to deploy's action.
+        for _ in 0..4 {
+            press(&mut view, KeyCode::Down);
+        }
+        assert_eq!(view.rows[view.selected], Row::Action(3, 0));
+        let app = Some(PathBuf::from("/code/app"));
+        assert_eq!(
+            press(&mut view, KeyCode::Enter),
+            Outcome::Run {
+                plugin: "deploy".into(),
+                project: app.clone(),
+                action: "note".into()
+            }
+        );
+        assert_eq!(
+            press(&mut view, KeyCode::Char(' ')),
+            Outcome::Switch {
+                name: "deploy".into(),
+                project: app,
                 on: false
             }
         );
@@ -472,6 +581,7 @@ mod tests {
             press(&mut view, KeyCode::Char(' ')),
             Outcome::Switch {
                 name: "notes".into(),
+                project: None,
                 on: true
             }
         );

@@ -8,8 +8,9 @@
 //!   key of their own in the sidebar, or `crystal plugin run`;
 //! - `[[events]]`: commands the daemon runs when something happens, like a
 //!   session starting to wait on the user;
-//! - `[[panes]]`: programs the TUI shows over its panes, with the keyboard,
-//!   so a plugin can be a whole TUI of its own;
+//! - `[[panes]]`: programs the TUI shows with the keyboard, over its panes,
+//!   in a popup, or as a session of their own in a split or a tab, so a
+//!   plugin can be a whole TUI of its own;
 //! - `[[link_handlers]]`: links a Ctrl+click in a pane hands to one of its
 //!   actions rather than to the browser.
 //!
@@ -17,10 +18,17 @@
 //! own directory: `["sh", "hook.sh"]`.
 
 use crate::events;
-use crate::tui::keymap::Sequence;
+use crate::tui::keymap::{Extent, Sequence, SplitWay};
 use anyhow::{Context, Result, bail};
 use regex::Regex;
 use serde::Deserialize;
+use std::time::Duration;
+
+/// How long a hook or a startup command may run, unless its plugin says.
+pub const TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The longest a plugin may give one.
+const LONGEST_TIMEOUT: u64 = 60 * 60;
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -36,6 +44,11 @@ pub struct Manifest {
     /// The systems the plugin runs on; any, when it doesn't say.
     #[serde(default)]
     pub platforms: Option<Vec<Platform>>,
+    /// How many seconds one of its hooks or startup commands may run
+    /// before it's stopped, unless it says itself: [`TIMEOUT`], when this
+    /// doesn't.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
     #[serde(default)]
     pub build: Vec<Once>,
     #[serde(default)]
@@ -86,6 +99,10 @@ pub struct Once {
     /// say.
     #[serde(default)]
     pub platforms: Option<Vec<Platform>>,
+    /// How many seconds a startup command may run, in place of its
+    /// plugin's: a build runs as long as it takes.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
 }
 
 impl Once {
@@ -117,15 +134,103 @@ pub struct EventHook {
     /// or `*` for every one. See [`events::Kind`].
     pub on: String,
     pub command: Vec<String>,
+    /// How many seconds it may run, in place of its plugin's.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
 }
 
-/// A program shown over the TUI's panes.
+/// A program the TUI shows, with the keyboard.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PaneSpec {
     pub id: String,
     pub title: String,
     pub command: Vec<String>,
+    #[serde(default)]
+    pub placement: Placement,
+    /// A popup's size: so many cells, or a share of the screen, `"80%"`.
+    #[serde(default)]
+    pub width: Option<Extent>,
+    #[serde(default)]
+    pub height: Option<Extent>,
+    /// Which way a split or a zoomed pane splits off: as `s` would, unless
+    /// it says.
+    #[serde(default)]
+    pub split: Option<SplitWay>,
+}
+
+/// Where a plugin's pane opens.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum Placement {
+    /// Over the panes beside the sidebar, until its program ends or the
+    /// user closes it, which ends its session.
+    #[default]
+    Overlay,
+    /// The same, in a frame over everything, as big as its `width` and
+    /// `height` say.
+    Popup,
+    /// A session of its own, in a pane split off the selected session's.
+    Split,
+    /// A session of its own, in a new tab.
+    Tab,
+    /// A split, zoomed over its tab.
+    Zoomed,
+}
+
+impl Placement {
+    pub fn name(self) -> &'static str {
+        match self {
+            Placement::Overlay => "overlay",
+            Placement::Popup => "popup",
+            Placement::Split => "split",
+            Placement::Tab => "tab",
+            Placement::Zoomed => "zoomed",
+        }
+    }
+
+    /// Whether the pane is shown over the TUI's panes, which takes a TUI,
+    /// rather than as a session of its own among them.
+    pub fn is_over(self) -> bool {
+        matches!(self, Placement::Overlay | Placement::Popup)
+    }
+
+    /// Whether it splits a pane off.
+    pub fn splits(self) -> bool {
+        matches!(self, Placement::Split | Placement::Zoomed)
+    }
+}
+
+impl PaneSpec {
+    /// What's wrong with a pane placed at `placement`, `width` by
+    /// `height`, split `split`, if anything: a size for what isn't a popup,
+    /// one that isn't a size, or a way to split what doesn't split.
+    pub fn check_placing(
+        placement: Placement,
+        width: Option<&Extent>,
+        height: Option<&Extent>,
+        split: Option<SplitWay>,
+    ) -> Result<(), String> {
+        for (field, extent) in [("width", width), ("height", height)] {
+            let Some(extent) = extent else {
+                continue;
+            };
+            if placement != Placement::Popup {
+                return Err(format!(
+                    "only a popup has a {field}, not a pane placed as {}",
+                    placement.name()
+                ));
+            }
+            extent.check().map_err(|why| format!("{field}: {why}"))?;
+        }
+        if split.is_some() && !placement.splits() {
+            return Err(format!(
+                "a pane placed as {} doesn't split",
+                placement.name()
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Links one of the plugin's actions opens, in place of the browser.
@@ -172,11 +277,19 @@ impl Manifest {
             bail!("min_crystal_version `{min}` isn't a version like 0.3.0");
         }
         check_platforms(self.platforms.as_deref(), "platforms")?;
+        check_timeout(self.timeout_secs, "timeout_secs")?;
         for (what, commands) in [("build", &self.build), ("startup", &self.startup)] {
             for once in commands {
                 check_command(&once.command, &format!("a {what} command"))?;
                 let platforms = format!("a {what} command's platforms");
                 check_platforms(once.platforms.as_deref(), &platforms)?;
+                if what == "build" && once.timeout_secs.is_some() {
+                    bail!("a build command runs as long as it takes: it has no timeout_secs");
+                }
+                check_timeout(
+                    once.timeout_secs,
+                    &format!("a {what} command's timeout_secs"),
+                )?;
             }
         }
         let mut ids: Vec<&str> = Vec::new();
@@ -190,10 +303,15 @@ impl Manifest {
         for pane in &self.panes {
             check_id(&pane.id, &mut ids)?;
             check_command(&pane.command, &format!("pane {}", pane.id))?;
+            let (width, height) = (pane.width.as_ref(), pane.height.as_ref());
+            PaneSpec::check_placing(pane.placement, width, height, pane.split)
+                .map_err(|why| anyhow::anyhow!("pane {}: {why}", pane.id))?;
         }
         for hook in &self.events {
             events::check_pattern(&hook.on).context("events")?;
             check_command(&hook.command, &format!("the hook on {}", hook.on))?;
+            let what = format!("the hook on {}'s timeout_secs", hook.on);
+            check_timeout(hook.timeout_secs, &what)?;
         }
         for handler in &self.link_handlers {
             if let Err(err) = Regex::new(&handler.pattern) {
@@ -212,6 +330,19 @@ impl Manifest {
     /// The action called `id`.
     pub fn action(&self, id: &str) -> Option<&Action> {
         self.actions.iter().find(|action| action.id == id)
+    }
+
+    /// The pane called `id`.
+    pub fn pane(&self, id: &str) -> Option<&PaneSpec> {
+        self.panes.iter().find(|pane| pane.id == id)
+    }
+
+    /// How long a hook or startup command that says `own` of it may run:
+    /// so many seconds as it says, or else as the plugin says, or else
+    /// [`TIMEOUT`].
+    pub fn timeout(&self, own: Option<u64>) -> Duration {
+        own.or(self.timeout_secs)
+            .map_or(TIMEOUT, Duration::from_secs)
     }
 
     /// Why the plugin can't run in this crystal, on this system, if it
@@ -269,6 +400,13 @@ impl Manifest {
 /// runs on `platform`.
 fn runs_on(platforms: Option<&[Platform]>, platform: Platform) -> bool {
     platforms.is_none_or(|platforms| platforms.contains(&platform))
+}
+
+fn check_timeout(timeout: Option<u64>, what: &str) -> Result<()> {
+    if timeout.is_some_and(|secs| !(1..=LONGEST_TIMEOUT).contains(&secs)) {
+        bail!("{what} is from 1 to {LONGEST_TIMEOUT} seconds");
+    }
+    Ok(())
 }
 
 fn check_platforms(platforms: Option<&[Platform]>, what: &str) -> Result<()> {
@@ -355,6 +493,7 @@ fn check_key(key: &str, action: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     const GOOD: &str = r#"
 name = "notes"
@@ -502,6 +641,52 @@ command = ["sh", "board.sh"]
                 "runs action open, which the plugin doesn't have",
             ),
             (GOOD.replace("[0-9]+$", "[0-9+$"), "link handler `^https"),
+            (
+                GOOD.replace("title = \"Board\"", "title = \"Board\"\nwidth = 40"),
+                "pane board: only a popup has a width, not a pane placed as overlay",
+            ),
+            (
+                GOOD.replace(
+                    "title = \"Board\"",
+                    "title = \"Board\"\nplacement = \"popup\"\nheight = \"120%\"",
+                ),
+                "pane board: height: \"120%\" isn't a share of the screen",
+            ),
+            (
+                GOOD.replace(
+                    "title = \"Board\"",
+                    "title = \"Board\"\nplacement = \"tab\"\nsplit = \"down\"",
+                ),
+                "a pane placed as tab doesn't split",
+            ),
+            (
+                GOOD.replace(
+                    "title = \"Board\"",
+                    "title = \"Board\"\nplacement = \"window\"",
+                ),
+                "unknown variant `window`",
+            ),
+            (
+                GOOD.replace(
+                    "platforms = [\"macos\", \"linux\"]\n",
+                    "platforms = [\"macos\", \"linux\"]\ntimeout_secs = 0\n",
+                ),
+                "timeout_secs is from 1 to 3600 seconds",
+            ),
+            (
+                GOOD.replace(
+                    "on = \"session.*\"",
+                    "on = \"session.*\"\ntimeout_secs = 7200",
+                ),
+                "the hook on session.*'s timeout_secs is from 1 to 3600",
+            ),
+            (
+                GOOD.replace(
+                    "command = [\"make\"]",
+                    "command = [\"make\"]\ntimeout_secs = 60",
+                ),
+                "a build command runs as long as it takes",
+            ),
         ];
         for (text, expected) in cases {
             let dir = if expected.contains("directory") {
@@ -512,6 +697,69 @@ command = ["sh", "board.sh"]
             let err = Manifest::parse(&text, dir).unwrap_err();
             assert!(format!("{err:#}").contains(expected), "{expected}: {err:#}");
         }
+    }
+
+    #[test]
+    fn a_pane_opens_where_it_says_at_the_size_it_says() {
+        let manifest = Manifest::parse(GOOD, "notes").unwrap();
+        assert_eq!(
+            manifest.pane("board").unwrap().placement,
+            Placement::Overlay
+        );
+        let popup = GOOD.replace(
+            "title = \"Board\"",
+            "title = \"Board\"\nplacement = \"popup\"\nwidth = \"80%\"\nheight = 20",
+        );
+        let manifest = Manifest::parse(&popup, "notes").unwrap();
+        let pane = manifest.pane("board").unwrap();
+        assert_eq!(pane.placement, Placement::Popup);
+        assert_eq!(pane.width, Some(Extent::Share("80%".into())));
+        assert_eq!(pane.height, Some(Extent::Cells(20)));
+        let zoomed = GOOD.replace(
+            "title = \"Board\"",
+            "title = \"Board\"\nplacement = \"zoomed\"\nsplit = \"down\"",
+        );
+        let manifest = Manifest::parse(&zoomed, "notes").unwrap();
+        assert_eq!(manifest.pane("board").unwrap().split, Some(SplitWay::Down));
+        assert!(Placement::Popup.is_over() && !Placement::Tab.is_over());
+    }
+
+    #[test]
+    fn a_hook_runs_as_long_as_it_says_or_its_plugin_does() {
+        let manifest = Manifest::parse(GOOD, "notes").unwrap();
+        assert_eq!(manifest.timeout(None), TIMEOUT);
+        assert_eq!(manifest.timeout(Some(5)), Duration::from_secs(5));
+        let slow = GOOD.replace(
+            "version = \"0.1.0\"",
+            "version = \"0.1.0\"\ntimeout_secs = 120",
+        );
+        let manifest = Manifest::parse(&slow, "notes").unwrap();
+        assert_eq!(manifest.timeout(None), Duration::from_secs(120));
+        assert_eq!(manifest.timeout(Some(5)), Duration::from_secs(5));
+    }
+
+    #[test]
+    fn the_example_plugins_make_sense_and_have_their_scripts() {
+        let examples = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/plugins");
+        let mut names = Vec::new();
+        for entry in std::fs::read_dir(&examples).unwrap() {
+            let dir = entry.unwrap().path();
+            if !dir.is_dir() {
+                continue;
+            }
+            let name = dir.file_name().unwrap().to_str().unwrap().to_string();
+            let text = std::fs::read_to_string(dir.join("plugin.toml")).unwrap();
+            let manifest =
+                Manifest::parse(&text, &name).unwrap_or_else(|err| panic!("{name}: {err:#}"));
+            assert_eq!(manifest.unfit(), None, "{name}");
+            for (what, command) in manifest.commands() {
+                let script = &command[1];
+                assert!(dir.join(script).is_file(), "{name}'s {what} runs {script}");
+            }
+            names.push(name);
+        }
+        names.sort();
+        assert_eq!(names, ["event-log", "slack", "worktree-env"]);
     }
 
     #[test]

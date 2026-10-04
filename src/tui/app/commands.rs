@@ -5,7 +5,7 @@
 //! whose point is to go somewhere: making a tab, going to one, and focusing
 //! a session.
 
-use super::{Action, App, Slot, resize_step};
+use super::{Action, App, PluginPane, Popup, Slot, resize_step};
 use crate::flow_run::FlowRun;
 use crate::layout::{Command, Layout, NO_TUI, Order, TabLayout, Tile};
 use crate::notify::Presence;
@@ -37,8 +37,9 @@ impl App {
         tabs: Tabs,
         order: Order,
     ) -> Result<Alone, String> {
-        // The title is the TUI's terminal's, and there's none.
-        if let Command::Title { .. } = order.command {
+        // The title is the TUI's terminal's, and there's none; nor is
+        // there anything to show a pane over.
+        if let Command::Title { .. } | Command::Overlay { .. } = order.command {
             return Err(format!("{NO_TUI} to show it"));
         }
         let mut app = App::new(None);
@@ -197,6 +198,27 @@ impl App {
                 self.put_float_back_in(index);
             }
             Command::Title { text } => self.title_override = text,
+            Command::Overlay {
+                session,
+                plugin,
+                title,
+                popup,
+            } => {
+                let name = self.session_named(&session)?;
+                if let Some(open) = &self.plugin_pane {
+                    return Err(format!("{} is open over the panes already", open.title));
+                }
+                let popup = popup.map(|popup| Popup {
+                    width: popup.width,
+                    height: popup.height,
+                });
+                return Ok(Some(Action::ShowPluginPane(PluginPane {
+                    plugin,
+                    title,
+                    session: name,
+                    popup,
+                })));
+            }
         }
         Ok(None)
     }
@@ -616,6 +638,51 @@ mod tests {
 
     fn selected(app: &App) -> Option<String> {
         app.selected().map(|session| session.name.clone())
+    }
+
+    #[test]
+    fn a_session_is_shown_over_the_panes_once_and_only_by_a_tui() {
+        let mut app = app_with(&["claude", "notes-board"]);
+        let over = || Command::Overlay {
+            session: "notes-board".into(),
+            plugin: "notes".into(),
+            title: "Board".into(),
+            popup: Some(crate::layout::Popup {
+                width: None,
+                height: Some(crate::tui::keymap::Extent::Cells(20)),
+            }),
+        };
+        let Ok(Some(Action::ShowPluginPane(pane))) = obey(&mut app, over()) else {
+            panic!("it isn't shown");
+        };
+        assert_eq!(pane.heading(), " notes · Board ");
+        assert_eq!(
+            pane.popup.unwrap().height,
+            Some(crate::tui::keymap::Extent::Cells(20))
+        );
+        let missing = Command::Overlay {
+            session: "nope".into(),
+            plugin: "notes".into(),
+            title: "Board".into(),
+            popup: None,
+        };
+        assert!(obey(&mut app, missing).is_err());
+        app.plugin_pane_opened(PluginPane {
+            plugin: "notes".into(),
+            title: "Board".into(),
+            session: "notes-board".into(),
+            popup: None,
+        });
+        let said = obey(&mut app, over()).unwrap_err();
+        assert_eq!(said, "Board is open over the panes already");
+
+        let order = Order {
+            command: over(),
+            caller: None,
+        };
+        let tabs = Tabs::default();
+        let alone = App::obey_alone(vec![session("notes-board")], Vec::new(), tabs, order);
+        assert_eq!(alone.err().unwrap(), format!("{NO_TUI} to show it"));
     }
 
     #[test]

@@ -17,7 +17,7 @@ use crate::distill::{self, Job};
 use crate::embed;
 use crate::env;
 use crate::event_log::{self, Bus, Subscription};
-use crate::events::{Event, Filter, Kind, Since};
+use crate::events::{DistillAbout, Event, Filter, Kind, Since};
 use crate::flow_run::{self, Ended, FlowRun, Next, Place, RunState, StepState};
 use crate::flows;
 use crate::front;
@@ -61,7 +61,7 @@ use std::os::fd::{AsFd, AsRawFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::RecvTimeoutError;
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{fs, process, thread};
@@ -95,6 +95,10 @@ const LOOK_AT_MOST_EVERY: Duration = Duration::from_millis(50);
 /// How long a handover waits for the requests the daemon is answering, and
 /// for plugins' hooks and the distiller, before it stops them.
 const HANDOVER_GRACE: Duration = Duration::from_secs(3);
+
+/// How often the daemon looks for entries of memory gone stale, besides
+/// each time a task closes.
+const STALE_SWEEP_EVERY: Duration = Duration::from_secs(60 * 60);
 
 /// Runs the daemon on `socket`, or with `handover`, the descriptor of what
 /// the last daemon handed over as it ran this crystal in its place (see
@@ -139,6 +143,12 @@ pub fn run(socket: &Path, handover: Option<RawFd>) -> Result<()> {
             }
         }
     });
+    let (sweep, sweeps) = mpsc::sync_channel(1);
+    thread::spawn({
+        let events = events.clone();
+        let socket = socket.to_path_buf();
+        move || tell_stale(&socket, &events, &sweeps)
+    });
     let daemon = Arc::new(Daemon {
         socket: socket.to_path_buf(),
         listener: listener.as_raw_fd(),
@@ -156,6 +166,7 @@ pub fn run(socket: &Path, handover: Option<RawFd>) -> Result<()> {
         sends: messages::Guard::default(),
         projects: Mutex::default(),
         removals: Mutex::default(),
+        sweep,
     });
     // A daemon starts again after every upgrade, or is handed over to the
     // new crystal, so this is where the skill an earlier crystal installed
@@ -306,6 +317,8 @@ struct Daemon {
     /// The worktrees being removed, with who's waiting to hear each is
     /// done. Taken after `sessions` and `flows`, never before them.
     removals: Mutex<Vec<Removal>>,
+    /// Asks for a look for entries of memory gone stale: see [`tell_stale`].
+    sweep: SyncSender<()>,
 }
 
 /// The projects the sessions run in that are on the list already, as
@@ -647,7 +660,14 @@ impl Daemon {
             }
         };
         drop(db);
-        Ok(self.started(&mut sessions, started, Kind::TaskOpened))
+        let response = self.started(&mut sessions, started.clone(), Kind::TaskOpened);
+        if let Some(session) = sessions.iter().find(|session| session.name == started) {
+            self.events.emit(Event::about_session(
+                Kind::SessionUnarchived,
+                &session.info(),
+            ));
+        }
+        Ok(response)
     }
 
     /// Again and again: reads every session's screen for what its agent is
@@ -1315,6 +1335,9 @@ impl Daemon {
     fn write_down_closed(&self, session: &Session, task: &TaskRecord) {
         self.write_down(session.cwd(), Some(&session.info()), task);
         self.distill_later(session, task);
+        // What the task changed may leave entries of memory stale. One
+        // look asked for already will do.
+        let _ = self.sweep.try_send(());
     }
 
     /// Writes a task that has just closed, which ran in `cwd`, in `session`
@@ -1486,9 +1509,11 @@ impl Daemon {
             return;
         };
         let events = self.events.clone();
+        let info = session.info();
         thread::spawn(move || {
             let name = &job.session;
-            match distill::run(&job) {
+            let report = distill::run(&job);
+            match &report {
                 Ok(report) => {
                     eprintln!("crystal daemon: distilled {name}: {}", report.line());
                     for why in &report.rejected {
@@ -1498,6 +1523,7 @@ impl Daemon {
                 }
                 Err(err) => eprintln!("crystal daemon: couldn't distill {name}: {err:#}"),
             }
+            events.emit(Event::distilled(&info, distill_about(&report)));
             drop(reading);
         });
     }
@@ -1611,7 +1637,7 @@ impl Daemon {
     fn distill_now(&self, name: &str) -> Result<Response> {
         let config = settings();
         crate::plugins::ensure_enabled(&config, "memory")?;
-        let (job, reading) = {
+        let (job, reading, info) = {
             let mut sessions = self.sessions.lock().unwrap();
             let session = named(&mut sessions, name)?;
             let task = session.task_record();
@@ -1625,13 +1651,16 @@ impl Daemon {
                 })?;
             let reading = Reading::start(&self.distilling, &session.id)
                 .with_context(|| format!("the distiller is reading what {name} did already"))?;
-            (job, reading)
+            (job, reading, session.info())
         };
         let report = distill::run(&job);
         drop(reading);
-        let report = report?;
-        tell_distilled(&self.events, &job, &report.added);
-        Ok(Response::Distilled(report))
+        if let Ok(report) = &report {
+            tell_distilled(&self.events, &job, &report.added);
+        }
+        self.events
+            .emit(Event::distilled(&info, distill_about(&report)));
+        Ok(Response::Distilled(report?))
     }
 
     /// The session called `name`, or the newest one, for a client about to
@@ -1870,6 +1899,11 @@ impl Daemon {
                     && tasks::enabled(&settings())
                     && session.remind_of_task()
                 {
+                    if let Some(task) = session.task_record() {
+                        let info = session.info();
+                        self.events
+                            .emit(Event::task(Kind::TaskReminded, &info, task));
+                    }
                     return Ok(Response::Remind {
                         text: tasks::REMINDER.to_string(),
                     });
@@ -2566,6 +2600,8 @@ impl Daemon {
         let info = sessions[index].info();
         self.events
             .emit(Event::about_session(Kind::SessionStarted, &info));
+        self.events
+            .emit(Event::about_session(Kind::SessionOpenedInTerminal, &info));
         Ok(Response::Created {
             name,
             task: task_id,
@@ -2624,6 +2660,7 @@ impl Daemon {
                 Change::RunStarted { prompt } => Some(Event::run_started(&info, &prompt)),
                 Change::RunEnded(result) => Some(Event::run_ended(&info, &result)),
                 Change::Asking(asking) => Some(Event::asking(&info, asking)),
+                Change::ToolUsed(tool) => Some(Event::tool_use(&info, tool)),
                 Change::Reopened => task(Kind::TaskOpened),
                 Change::TaskWaiting => task(Kind::TaskWaiting),
                 Change::Claimed => Some(Event::about_session(Kind::SessionClaimed, &info)),
@@ -2997,6 +3034,44 @@ fn watch_for_hang_up(conn: &UnixStream) -> Result<Arc<AtomicBool>> {
         }
     });
     Ok(hung_up)
+}
+
+/// Tells of each entry of memory that goes stale, every file it's about
+/// changed since it was said: looks as the daemon starts, then each time
+/// `sweeps` asks and every [`STALE_SWEEP_EVERY`], while memory is on.
+fn tell_stale(socket: &Path, events: &Bus, sweeps: &Receiver<()>) {
+    loop {
+        if memory::enabled_now() {
+            match memory::newly_stale(socket) {
+                Ok(stale) => {
+                    for (project, entry) in stale {
+                        events.emit(Event::memory(Kind::MemoryStale, project, entry));
+                    }
+                }
+                Err(err) => eprintln!("crystal daemon: couldn't look at memory: {err:#}"),
+            }
+        }
+        if let Err(RecvTimeoutError::Disconnected) = sweeps.recv_timeout(STALE_SWEEP_EVERY) {
+            return;
+        }
+    }
+}
+
+/// What came of a pass of the distiller, for its event.
+fn distill_about(report: &Result<distill::Report>) -> DistillAbout {
+    match report {
+        Ok(report) => DistillAbout {
+            added: report.added.len(),
+            again: report.again.len(),
+            rejected: report.rejected.len(),
+            cost_usd: report.cost_usd,
+            failed: None,
+        },
+        Err(err) => DistillAbout {
+            failed: Some(format!("{err:#}")),
+            ..DistillAbout::default()
+        },
+    }
 }
 
 /// Tells of the entries the distiller added to the memory of `job`'s

@@ -407,6 +407,10 @@ pub struct ProjectSettings {
     /// there with its output thrown away.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub open: Option<String>,
+    /// The plugins the project ships in its `.crystal/plugins/` that are
+    /// on for it, by name: see [`crate::plugins`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub plugins: Vec<String>,
 }
 
 /// When the user is told a session needs them: see [`crate::notify`].
@@ -1941,6 +1945,7 @@ back_to = "build"
                 path: PathBuf::from("~/code/app"),
                 run: Some("npm run dev".into()),
                 open: Some("code .".into()),
+                plugins: vec!["lint".into()],
             }],
             keys: KeySettings {
                 bindings: BTreeMap::from([

@@ -675,9 +675,15 @@ enum Command {
         #[command(subcommand)]
         command: Option<ProfileCommand>,
     },
-    /// List plugins, crystal's own and yours, with whether they're on; or
-    /// switch, run, install, build, make or remove one.
+    /// List plugins, crystal's own, yours and the project's, with whether
+    /// they're on; or the events they hear; or switch, run, install, build,
+    /// make or remove one, or open one of its panes.
     Plugin {
+        /// The directory of the project whose plugins `--project` means,
+        /// and which the list shows [default: the current one]
+        #[arg(short = 'C', long = "dir", value_name = "DIR", global = true)]
+        dir: Option<PathBuf>,
+
         #[command(subcommand)]
         command: Option<PluginCommand>,
     },
@@ -1390,16 +1396,36 @@ enum ProfileCommand {
 
 #[derive(Subcommand)]
 enum PluginCommand {
-    /// Turn a plugin on.
-    Enable { name: String },
+    /// Turn a plugin on. A project's shows what it runs and asks first,
+    /// then builds it.
+    Enable {
+        name: String,
+
+        /// The plugin the project ships in its .crystal/plugins, on for it
+        /// alone.
+        #[arg(long)]
+        project: bool,
+
+        /// Don't ask first.
+        #[arg(long, requires = "project")]
+        yes: bool,
+    },
     /// Turn a plugin off.
-    Disable { name: String },
+    Disable {
+        name: String,
+
+        /// The plugin the project ships.
+        #[arg(long)]
+        project: bool,
+    },
+    /// List the events a plugin's hooks can hear, and when each happens.
+    Events,
     /// Run one of a plugin's actions, or try its hooks out on an event.
     Run {
         plugin: String,
 
         /// The action, by its id.
-        #[arg(required_unless_present_any = ["event", "link"])]
+        #[arg(required_unless_present_any = ["event", "json", "link"])]
         action: Option<String>,
 
         /// Run the plugin's hooks on a made-up event of this kind, like
@@ -1408,15 +1434,30 @@ enum PluginCommand {
         #[arg(long, value_name = "KIND", conflicts_with = "action")]
         event: Option<String>,
 
+        /// Run its hooks on the event this JSON says, or - to read it from
+        /// standard input, like a line of `crystal events --json`: what it
+        /// gives over a made-up one of its kind, or of --event's.
+        #[arg(long, value_name = "JSON", conflicts_with = "action")]
+        json: Option<String>,
+
         /// Run the action the plugin's link handlers give this link, with
         /// it in CRYSTAL_LINK, as a Ctrl+click on it in a pane would.
-        #[arg(long, value_name = "URL", conflicts_with_all = ["action", "event"])]
+        #[arg(long, value_name = "URL", conflicts_with_all = ["action", "event", "json"])]
         link: Option<String>,
 
         /// The session to run it for [default: the one this runs in, if
         /// any]
         #[arg(short, long)]
         session: Option<String>,
+
+        /// The plugin the project ships.
+        #[arg(long)]
+        project: bool,
+    },
+    /// Open one of a plugin's panes.
+    Pane {
+        #[command(subcommand)]
+        command: PluginPaneCommand,
     },
     /// Install a plugin from a git repository or a directory, once you've
     /// seen what it runs and said yes, and build it. It starts off.
@@ -1434,14 +1475,70 @@ enum PluginCommand {
     },
     /// Run a plugin's build commands again. One that fails turns it off
     /// until a build works.
-    Build { name: String },
+    Build {
+        name: String,
+
+        /// The plugin the project ships.
+        #[arg(long)]
+        project: bool,
+    },
     /// Remove a plugin you installed.
     #[command(visible_alias = "rm")]
     Remove { name: String },
     /// Make a plugin to start from, in your plugins directory.
     New { name: String },
     /// Print what a plugin's commands printed, and how they failed.
-    Log { name: String },
+    Log {
+        name: String,
+
+        /// The plugin the project ships.
+        #[arg(long)]
+        project: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum PluginPaneCommand {
+    /// Start one of a plugin's panes in a session of its own and show it
+    /// where its manifest says, or --placement does: over the TUI's panes
+    /// or in a popup, which take a TUI, or split off a session's pane,
+    /// zoomed, or in a tab of its own. Prints the session's name.
+    Open {
+        plugin: String,
+
+        /// The pane, by its id.
+        pane: String,
+
+        /// Where it goes, in place of where its manifest says.
+        #[arg(long, value_enum)]
+        placement: Option<plugin_manifest::Placement>,
+
+        /// A popup's width: so many cells, or a share of the screen, like
+        /// 80%.
+        #[arg(long, value_name = "SIZE")]
+        width: Option<String>,
+
+        /// A popup's height.
+        #[arg(long, value_name = "SIZE")]
+        height: Option<String>,
+
+        /// A split's new pane to the right of the session's.
+        #[arg(long, conflicts_with = "down")]
+        right: bool,
+
+        /// A split's new pane below the session's.
+        #[arg(long)]
+        down: bool,
+
+        /// The session it's about, and a split goes beside [default: the
+        /// one this runs in, or else the one selected]
+        #[arg(short, long)]
+        session: Option<String>,
+
+        /// The plugin the project ships.
+        #[arg(long)]
+        project: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1825,42 +1922,86 @@ fn run(cli: Cli) -> Result<()> {
                 Some(ProfileCommand::Show { name }) => print_profile(&settings.profiles, &name)?,
             }
         }
-        Command::Plugin { command } => match command {
-            None => plugin_cli::list(&socket)?,
-            Some(PluginCommand::Enable { name }) => plugin_cli::switch(&socket, &name, true)?,
-            Some(PluginCommand::Disable { name }) => plugin_cli::switch(&socket, &name, false)?,
-            Some(PluginCommand::Run {
-                plugin,
-                action,
-                event,
-                link,
-                session,
-            }) => {
-                let code = match (action, event, link) {
-                    (_, Some(event), _) => {
-                        plugin_cli::run_event(&socket, &plugin, &event, session)?
-                    }
-                    (_, None, Some(link)) => {
-                        plugin_cli::run_link(&socket, &plugin, &link, session)?
-                    }
-                    (action, None, None) => {
-                        let action = action.unwrap_or_default();
-                        plugin_cli::run(&socket, &plugin, &action, session, None)?
-                    }
-                };
-                // The action's or the hook's own exit code is crystal's.
-                std::process::exit(code);
+        Command::Plugin { dir, command } => {
+            let id = |name: &str, project: bool| plugin_cli::id(name, project, dir.clone());
+            match command {
+                None => plugin_cli::list(&socket, dir)?,
+                Some(PluginCommand::Enable { name, project, yes }) => {
+                    plugin_cli::switch(&socket, &id(&name, project)?, true, yes)?
+                }
+                Some(PluginCommand::Disable { name, project }) => {
+                    plugin_cli::switch(&socket, &id(&name, project)?, false, false)?
+                }
+                Some(PluginCommand::Events) => plugin_cli::events(),
+                Some(PluginCommand::Run {
+                    plugin,
+                    action,
+                    event,
+                    json,
+                    link,
+                    session,
+                    project,
+                }) => {
+                    let plugin = id(&plugin, project)?;
+                    let code = match (action, event, json, link) {
+                        (_, event, json, _) if event.is_some() || json.is_some() => {
+                            let (event, json) = (event.as_deref(), json.as_deref());
+                            plugin_cli::run_event(&socket, &plugin, event, json, session)?
+                        }
+                        (_, _, _, Some(link)) => {
+                            plugin_cli::run_link(&socket, &plugin, &link, session)?
+                        }
+                        (action, ..) => {
+                            let action = action.unwrap_or_default();
+                            plugin_cli::run(&socket, &plugin, &action, session, None)?
+                        }
+                    };
+                    // The action's or the hook's own exit code is crystal's.
+                    std::process::exit(code);
+                }
+                Some(PluginCommand::Pane {
+                    command:
+                        PluginPaneCommand::Open {
+                            plugin,
+                            pane,
+                            placement,
+                            width,
+                            height,
+                            right,
+                            down,
+                            session,
+                            project,
+                        },
+                }) => {
+                    let split = match (right, down) {
+                        (true, _) => Some(tui::keymap::SplitWay::Right),
+                        (_, true) => Some(tui::keymap::SplitWay::Down),
+                        _ => None,
+                    };
+                    let placing = plugin_cli::Placing {
+                        placement,
+                        width,
+                        height,
+                        split,
+                    };
+                    let plugin = id(&plugin, project)?;
+                    plugin_cli::open_pane(&socket, &plugin, &pane, placing, session)?
+                }
+                Some(PluginCommand::Install {
+                    source,
+                    yes,
+                    enable,
+                }) => plugin_cli::install(&socket, &source, yes, enable)?,
+                Some(PluginCommand::Build { name, project }) => {
+                    plugin_cli::build(&socket, &id(&name, project)?)?
+                }
+                Some(PluginCommand::Remove { name }) => plugin_cli::remove(&name)?,
+                Some(PluginCommand::New { name }) => plugin_cli::new(&name)?,
+                Some(PluginCommand::Log { name, project }) => {
+                    plugin_cli::log(&socket, &id(&name, project)?)?
+                }
             }
-            Some(PluginCommand::Install {
-                source,
-                yes,
-                enable,
-            }) => plugin_cli::install(&socket, &source, yes, enable)?,
-            Some(PluginCommand::Build { name }) => plugin_cli::build(&socket, &name)?,
-            Some(PluginCommand::Remove { name }) => plugin_cli::remove(&name)?,
-            Some(PluginCommand::New { name }) => plugin_cli::new(&name)?,
-            Some(PluginCommand::Log { name }) => plugin_cli::log(&socket, &name)?,
-        },
+        }
         Command::Mermaid { file, width, ascii } => mermaid_cli::run(file.as_deref(), width, ascii)?,
         Command::Keys => {
             let config = config::Config::load()?;

@@ -7,6 +7,7 @@
 //! `crystal layout` prints a layout.
 
 use crate::notify::Presence;
+use crate::tui::keymap::Extent;
 use crate::tui::split_tree::{Direction, Way};
 use serde::{Deserialize, Serialize};
 
@@ -73,9 +74,29 @@ pub enum Command {
     /// Float a session over its tab's panes, or with `on` false, put the
     /// tab's float back among them.
     Float { session: Option<String>, on: bool },
+    /// Show `session`, the pane of the plugin called `plugin`, over the
+    /// panes with the keyboard, under `title`, or in a popup that size,
+    /// until its program ends or the user closes it, which kills it. Only
+    /// a TUI can.
+    Overlay {
+        session: String,
+        plugin: String,
+        title: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        popup: Option<Popup>,
+    },
     /// Give the TUI's terminal the title `text`, in place of the one the
     /// settings make, or with none, go back to that one.
     Title { text: Option<String> },
+}
+
+/// How big a popup is: so many cells, or a share of the screen, each way.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Popup {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width: Option<Extent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<Extent>,
 }
 
 /// A command as a TUI gets it.

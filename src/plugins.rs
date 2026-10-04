@@ -14,6 +14,13 @@
 //! doesn't fit this crystal or this system, or whose build failed, can't be
 //! switched on, and doesn't run if it was.
 //!
+//! A project can ship plugins in its repository, in [`PROJECT_DIR`] of its
+//! main worktree. Opening a repository mustn't run its code, so each is off
+//! until the user switches it on for that project, in the config file's
+//! `[[project]]` table for it; and then it hears only that project's
+//! events. Its actions' keys and its link handlers aren't used: the
+//! sidebar's keys and the links in panes are every project's.
+//!
 //! Each has a directory for its user's settings, shared by every server
 //! like the config file, and one for what it keeps as it runs, a server's
 //! own like the server's sessions: what a plugin keeps is about what it
@@ -24,13 +31,18 @@ use crate::events::Event;
 use crate::git::Checkout;
 use crate::plugin_manifest::Manifest;
 use crate::protocol::SessionInfo;
+use crate::shell;
 use crate::state;
 use crate::tui::keymap::Sequence;
 use anyhow::{Context as _, Result, bail};
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use toml_edit::{DocumentMut, Item, Table, Value, value};
+use toml_edit::{ArrayOfTables, DocumentMut, Item, Table, Value, value};
+
+/// Where a project keeps the plugins it ships, from its main worktree.
+pub const PROJECT_DIR: &str = ".crystal/plugins";
 
 /// One of crystal's own plugins.
 pub struct BuiltIn {
@@ -105,6 +117,167 @@ pub fn ensure_enabled(config: &Config, name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Which plugin: one of the user's, by its name, or one a project ships,
+/// by its name and the project's main worktree. What crystal keeps for a
+/// plugin, its log, its settings and its state, is kept by it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Id {
+    pub name: String,
+    pub project: Option<PathBuf>,
+}
+
+impl Id {
+    /// The user's own plugin called `name`.
+    pub fn own(name: &str) -> Id {
+        Id {
+            name: name.to_string(),
+            project: None,
+        }
+    }
+
+    /// The plugin called `name` that the project whose main worktree is
+    /// `project` ships.
+    pub fn of_project(name: &str, project: &Path) -> Id {
+        Id {
+            name: name.to_string(),
+            project: Some(project.to_path_buf()),
+        }
+    }
+
+    /// How the user knows it: its name, and for a project's, the
+    /// project's: `lint (app)`.
+    pub fn label(&self) -> String {
+        match &self.project {
+            Some(project) => format!("{} ({})", self.name, crate::project::name_of(project)),
+            None => self.name.clone(),
+        }
+    }
+
+    /// Where what crystal keeps for it goes, under one of crystal's
+    /// directories, apart from every other plugin's: its name, or for a
+    /// project's, `.projects/<project>-<hash of its path>/<name>`, which
+    /// no plugin's name can be, and where two projects with the same name
+    /// don't meet.
+    fn place(&self) -> PathBuf {
+        match &self.project {
+            Some(project) => Path::new(".projects")
+                .join(project_key(project))
+                .join(&self.name),
+            None => PathBuf::from(&self.name),
+        }
+    }
+
+    /// What `crystal plugin` commands add to name it, after its name:
+    /// nothing for the user's own, ` --project` for a project's.
+    pub fn flag(&self) -> &'static str {
+        if self.project.is_some() {
+            " --project"
+        } else {
+            ""
+        }
+    }
+}
+
+/// A project's own name for what crystal keeps of its plugins: its
+/// directory's name and the start of its path's hash.
+fn project_key(project: &Path) -> String {
+    let real = fs::canonicalize(project).unwrap_or_else(|_| project.to_path_buf());
+    let hash: String = Sha256::digest(real.as_os_str().as_encoded_bytes())
+        .iter()
+        .take(4)
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    format!("{}-{hash}", crate::project::name_of(&real))
+}
+
+/// Whether `a` and `b` are the same directory, however each is spelled.
+pub fn same_dir(a: &Path, b: &Path) -> bool {
+    let real = |path: &Path| fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    real(a) == real(b)
+}
+
+/// Whether the plugin `id` is on, by the config: the user's own as
+/// [`enabled`] says, and a project's when its `[[project]]` table names it.
+pub fn is_on(config: &Config, id: &Id) -> bool {
+    match &id.project {
+        Some(project) => on_for_project(config, project).contains(&id.name),
+        None => enabled(config, &id.name),
+    }
+}
+
+/// The names of the plugins switched on for the project whose main
+/// worktree is `project`.
+pub fn on_for_project(config: &Config, project: &Path) -> Vec<String> {
+    config
+        .projects
+        .iter()
+        .filter(|listed| same_dir(&shell::expand_home(&listed.path), project))
+        .flat_map(|listed| listed.plugins.iter().cloned())
+        .collect()
+}
+
+/// Switches the plugin `id` on or off: the user's own as [`set_enabled`]
+/// does, and a project's in its `[[project]]` table, which is made for it
+/// if there's none and goes once it says nothing more. Switching it on also
+/// lets it run again after it was paused for failing.
+pub fn switch(path: &Path, socket: &Path, id: &Id, on: bool) -> Result<()> {
+    let Some(project) = &id.project else {
+        return set_enabled(path, socket, &id.name, on);
+    };
+    edit_config(path, |document| {
+        let projects = document
+            .entry("project")
+            .or_insert(Item::ArrayOfTables(ArrayOfTables::new()))
+            .as_array_of_tables_mut()
+            .context("`project` in the config file isn't a list of [[project]] tables")?;
+        let found = projects.iter().position(|table| {
+            let path = table.get("path").and_then(Item::as_str);
+            path.is_some_and(|path| same_dir(&shell::expand_home(Path::new(path)), project))
+        });
+        let index = match found {
+            Some(index) => index,
+            None if !on => return Ok(()),
+            None => {
+                let mut table = Table::new();
+                table.insert("path", value(shell::home_relative(project)));
+                projects.push(table);
+                projects.len() - 1
+            }
+        };
+        let table = projects.get_mut(index).expect("it was just found");
+        let plugins = table
+            .entry("plugins")
+            .or_insert(value(toml_edit::Array::new()))
+            .as_array_mut()
+            .context("a [[project]] table's `plugins` isn't a list")?;
+        let at = plugins
+            .iter()
+            .position(|said| said.as_str() == Some(&id.name));
+        match (at, on) {
+            (None, true) => plugins.push(id.name.as_str()),
+            (Some(at), false) => {
+                plugins.remove(at);
+            }
+            _ => {}
+        }
+        if plugins.is_empty() {
+            table.remove("plugins");
+        }
+        // A table that says nothing but where its project is goes.
+        if table.iter().all(|(key, _)| key == "path") {
+            projects.remove(index);
+        }
+        if projects.is_empty() {
+            document.remove("project");
+        }
+        Ok(())
+    })?;
+    if on {
+        unpause(socket, id);
+    }
+    Ok(())
+}
+
 /// Switches the plugin called `name` on or off in the config file at
 /// `path`, under `[plugins]`, keeping the rest of the file as the user
 /// wrote it, comments and all. Switching a plugin on also lets it run
@@ -124,7 +297,7 @@ pub fn set_enabled(path: &Path, socket: &Path, name: &str, on: bool) -> Result<(
         }
     })?;
     if on {
-        unpause(socket, name);
+        unpause(socket, &Id::own(name));
     }
     Ok(())
 }
@@ -145,6 +318,23 @@ pub fn forget(path: &Path, name: &str) -> Result<()> {
 /// config file. A table left empty goes. As with profiles, the new file is
 /// written beside the old one and then moved over it.
 fn edit_plugins(path: &Path, change: impl FnOnce(&mut Table)) -> Result<()> {
+    edit_config(path, |document| {
+        let plugins = document
+            .entry("plugins")
+            .or_insert(Item::Table(Table::new()))
+            .as_table_mut()
+            .context("`plugins` in the config file isn't a [plugins] table")?;
+        change(plugins);
+        if plugins.is_empty() {
+            document.remove("plugins");
+        }
+        Ok(())
+    })
+}
+
+/// Reads the config file at `path`, lets `change` change it, and writes it
+/// back, unless the result doesn't make sense as a config file.
+fn edit_config(path: &Path, change: impl FnOnce(&mut DocumentMut) -> Result<()>) -> Result<()> {
     let text = match fs::read_to_string(path) {
         Ok(text) => text,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -153,15 +343,7 @@ fn edit_plugins(path: &Path, change: impl FnOnce(&mut Table)) -> Result<()> {
     let mut document: DocumentMut = text
         .parse()
         .with_context(|| format!("couldn't read {}", path.display()))?;
-    let plugins = document
-        .entry("plugins")
-        .or_insert(Item::Table(Table::new()))
-        .as_table_mut()
-        .context("`plugins` in the config file isn't a [plugins] table")?;
-    change(plugins);
-    if plugins.is_empty() {
-        document.remove("plugins");
-    }
+    change(&mut document)?;
 
     let new_text = document.to_string();
     config::from_text(&new_text).with_context(|| format!("in {}", path.display()))?;
@@ -175,12 +357,14 @@ fn edit_plugins(path: &Path, change: impl FnOnce(&mut Table)) -> Result<()> {
 }
 
 /// Refuses, saying why, to switch on the plugin `plugin` of those
-/// `installed`: it can't run here, or it wants a key another has.
+/// `installed`: it can't run here, or it wants a key another has. A
+/// project's plugin takes no keys.
 pub fn check_can_enable(plugin: &Installed, installed: &[Installed]) -> Result<()> {
     if let Some(why) = plugin.blocked() {
         bail!("{} can't be turned on: {why}", plugin.name);
     }
     if let Ok(manifest) = &plugin.manifest
+        && plugin.project.is_none()
         && let Some((key, other)) = key_taken(manifest, installed)
     {
         bail!(
@@ -295,11 +479,11 @@ impl Context {
     }
 }
 
-/// `words`, a command of the plugin called `plugin`, ready to run from the
+/// `words`, a command of the plugin `plugin`, ready to run from the
 /// plugin's directory `dir`, with [`env`] in its environment and the
 /// plugin's state directory made.
 pub fn command(
-    plugin: &str,
+    plugin: &Id,
     dir: &Path,
     words: &[String],
     socket: &Path,
@@ -310,7 +494,7 @@ pub fn command(
     let (program, args) = argv.split_first().expect("a checked command has a program");
     let mut command = Command::new(program);
     command.args(args).current_dir(dir);
-    for (key, said) in env(socket, plugin, context) {
+    for (key, said) in env(socket, plugin, dir, context) {
         match said {
             Some(value) => command.env(key, value),
             None => command.env_remove(key),
@@ -331,24 +515,34 @@ pub fn argv(dir: &Path, words: &[String]) -> Vec<String> {
     argv
 }
 
-/// What a command of the plugin called `plugin` finds in its environment:
-/// `CRYSTAL_BIN`, the crystal that runs it, and `CRYSTAL_SOCKET`, its
-/// daemon, so the plugin can use crystal's own commands; `CRYSTAL_PLUGIN`,
-/// its name, and its directories, `CRYSTAL_PLUGIN_DIR`, the plugin's own,
-/// `CRYSTAL_PLUGIN_CONFIG_DIR` and `CRYSTAL_PLUGIN_STATE_DIR`; and then
-/// `context`.
-pub fn env(socket: &Path, plugin: &str, context: &Context) -> Vec<(&'static str, Option<String>)> {
+/// What a command of the plugin `plugin`, kept in `dir`, finds in its
+/// environment: `CRYSTAL_BIN`, the crystal that runs it, and
+/// `CRYSTAL_SOCKET`, its daemon, so the plugin can use crystal's own
+/// commands; `CRYSTAL_PLUGIN`, its name, and its directories,
+/// `CRYSTAL_PLUGIN_DIR`, the plugin's own, `CRYSTAL_PLUGIN_CONFIG_DIR` and
+/// `CRYSTAL_PLUGIN_STATE_DIR`; `CRYSTAL_PLUGIN_PROJECT`, for a project's,
+/// the project's main worktree; and then `context`.
+pub fn env(
+    socket: &Path,
+    plugin: &Id,
+    dir: &Path,
+    context: &Context,
+) -> Vec<(&'static str, Option<String>)> {
     let crystal = std::env::current_exe().ok();
     let path = |path: PathBuf| Some(path.display().to_string());
     let mut env = vec![
         ("CRYSTAL_BIN", crystal.and_then(path)),
         ("CRYSTAL_SOCKET", path(socket.to_path_buf())),
-        ("CRYSTAL_PLUGIN", Some(plugin.to_string())),
-        ("CRYSTAL_PLUGIN_DIR", path(plugins_dir().join(plugin))),
+        ("CRYSTAL_PLUGIN", Some(plugin.name.clone())),
+        ("CRYSTAL_PLUGIN_DIR", path(dir.to_path_buf())),
         ("CRYSTAL_PLUGIN_CONFIG_DIR", path(config_dir(plugin))),
         (
             "CRYSTAL_PLUGIN_STATE_DIR",
             path(own_state_dir(socket, plugin)),
+        ),
+        (
+            "CRYSTAL_PLUGIN_PROJECT",
+            plugin.project.clone().and_then(path),
         ),
     ];
     env.extend(context.vars());
@@ -358,7 +552,7 @@ pub fn env(socket: &Path, plugin: &str, context: &Context) -> Vec<(&'static str,
 /// Makes the plugin's state directory on the daemon at `socket`, before
 /// something of the plugin's runs there. One that can't be made is the
 /// plugin's to find missing.
-pub fn make_state_dir(socket: &Path, plugin: &str) {
+pub fn make_state_dir(socket: &Path, plugin: &Id) {
     let _ = fs::create_dir_all(own_state_dir(socket, plugin));
 }
 
@@ -368,11 +562,12 @@ pub fn plugins_dir() -> PathBuf {
     config_root().join("plugins")
 }
 
-/// Where the plugin called `plugin` keeps its user's settings, like a
-/// token: beside the config file, apart from the plugin's own files, so
-/// installing it again keeps them. It's made as the plugin is installed.
-pub fn config_dir(plugin: &str) -> PathBuf {
-    config_root().join("plugin-config").join(plugin)
+/// Where the plugin `plugin` keeps its user's settings, like a token:
+/// beside the config file, apart from the plugin's own files, so
+/// installing it again keeps them. It's made as the plugin is installed,
+/// or a project's switched on.
+pub fn config_dir(plugin: &Id) -> PathBuf {
+    config_root().join("plugin-config").join(plugin.place())
 }
 
 /// The directory of crystal's config file.
@@ -381,15 +576,24 @@ fn config_root() -> PathBuf {
     config.parent().unwrap_or(Path::new(".")).to_path_buf()
 }
 
-/// An installed plugin: its directory, and its manifest, or why the
-/// manifest can't be used.
+/// An installed plugin, or one a project ships: its directory, and its
+/// manifest, or why the manifest can't be used.
 pub struct Installed {
     pub name: String,
     pub dir: PathBuf,
     pub manifest: Result<Manifest, String>,
+    /// The main worktree of the project that ships it, for a project's.
+    pub project: Option<PathBuf>,
 }
 
 impl Installed {
+    pub fn id(&self) -> Id {
+        Id {
+            name: self.name.clone(),
+            project: self.project.clone(),
+        }
+    }
+
     /// Why the plugin can't run here, whatever the config says: a manifest
     /// that doesn't make sense, or doesn't fit this crystal or this system,
     /// or a build that failed.
@@ -399,11 +603,13 @@ impl Installed {
             Err(why) => return Some(why.clone()),
         };
         manifest.unfit().or_else(|| {
-            let failed = build_failed(&self.name)?;
+            let id = self.id();
+            let failed = build_failed(&id)?;
             let why = failed.lines().next().unwrap_or_default();
             Some(format!(
-                "{why}; `crystal plugin build {}` tries again",
-                self.name
+                "{why}; `crystal plugin build {}{}` tries again",
+                self.name,
+                id.flag()
             ))
         })
     }
@@ -411,8 +617,18 @@ impl Installed {
 
 /// The plugins installed in [`plugins_dir`], by name.
 pub fn installed() -> Vec<Installed> {
-    let dir = plugins_dir();
-    installed_names()
+    read_plugins(&plugins_dir(), None)
+}
+
+/// The plugins the project whose main worktree is `project` ships, in its
+/// [`PROJECT_DIR`], by name.
+pub fn of_project(project: &Path) -> Vec<Installed> {
+    read_plugins(&project.join(PROJECT_DIR), Some(project))
+}
+
+/// The plugins in `dir`, shipped by `project` if it's given.
+fn read_plugins(dir: &Path, project: Option<&Path>) -> Vec<Installed> {
+    names_in(dir)
         .into_iter()
         .map(|name| {
             let dir = dir.join(&name);
@@ -421,6 +637,7 @@ pub fn installed() -> Vec<Installed> {
                 name,
                 dir,
                 manifest,
+                project: project.map(Path::to_path_buf),
             }
         })
         .collect()
@@ -429,7 +646,12 @@ pub fn installed() -> Vec<Installed> {
 /// The names of the plugins installed, in order: the directories in
 /// [`plugins_dir`] with a `plugin.toml`, whether it makes sense or not.
 pub fn installed_names() -> Vec<String> {
-    let Ok(entries) = fs::read_dir(plugins_dir()) else {
+    names_in(&plugins_dir())
+}
+
+/// The names of the plugins in `dir`, in order.
+fn names_in(dir: &Path) -> Vec<String> {
+    let Ok(entries) = fs::read_dir(dir) else {
         return Vec::new();
     };
     let mut names: Vec<String> = entries
@@ -441,34 +663,63 @@ pub fn installed_names() -> Vec<String> {
     names
 }
 
-/// The installed plugin called `name`, if there is one.
-pub fn find(name: &str) -> Option<Installed> {
-    installed().into_iter().find(|plugin| plugin.name == name)
+/// The plugin `id`, the user's own or a project's, if it's there.
+pub fn find_id(id: &Id) -> Option<Installed> {
+    let plugins = match &id.project {
+        Some(project) => of_project(project),
+        None => installed(),
+    };
+    plugins.into_iter().find(|plugin| plugin.name == id.name)
 }
 
-/// The installed plugins that are on, can run here, and aren't paused for
-/// failing, in order by name.
-pub fn running(config: &Config, socket: &Path) -> Vec<(PathBuf, Manifest)> {
+/// A plugin that's on and can run here.
+pub struct Running {
+    pub id: Id,
+    pub dir: PathBuf,
+    pub manifest: Manifest,
+}
+
+/// The plugins that are on, can run here, and aren't paused for failing:
+/// the user's own in order by name, then those of each project in the
+/// config file that has some on.
+pub fn running(config: &Config, socket: &Path) -> Vec<Running> {
+    let projects = config
+        .projects
+        .iter()
+        .filter(|listed| !listed.plugins.is_empty())
+        .flat_map(|listed| of_project(&shell::expand_home(&listed.path)));
     installed()
         .into_iter()
-        .filter(|plugin| enabled(config, &plugin.name) && paused(socket, &plugin.name).is_none())
+        .chain(projects)
+        .filter(|plugin| {
+            let id = plugin.id();
+            is_on(config, &id) && paused(socket, &id).is_none()
+        })
         .filter(|plugin| plugin.blocked().is_none())
-        .filter_map(|plugin| Some((plugin.dir, plugin.manifest.ok()?)))
+        .filter_map(|plugin| {
+            Some(Running {
+                id: plugin.id(),
+                dir: plugin.dir,
+                manifest: plugin.manifest.ok()?,
+            })
+        })
         .collect()
 }
 
 /// The plugin, and its action, that opens `url` in place of the browser:
-/// the first running plugin by name with a link handler that takes it,
-/// its handlers tried in their order.
+/// the first of the user's running plugins by name with a link handler
+/// that takes it, its handlers tried in their order.
 pub fn link_handler(config: &Config, socket: &Path, url: &str) -> Option<(String, String)> {
     running(config, socket)
         .into_iter()
-        .find_map(|(_, manifest)| {
-            let handler = manifest
+        .filter(|plugin| plugin.id.project.is_none())
+        .find_map(|plugin| {
+            let handler = plugin
+                .manifest
                 .link_handlers
                 .iter()
                 .find(|handler| handler.takes(url))?;
-            Some((manifest.name.clone(), handler.action.clone()))
+            Some((plugin.manifest.name.clone(), handler.action.clone()))
         })
 }
 
@@ -484,23 +735,26 @@ pub fn state_dir(socket: &Path) -> PathBuf {
     state::plugins_dir(socket)
 }
 
-/// Where the plugin called `plugin` keeps what it needs as it runs on the
+/// Where the plugin `plugin` keeps what it needs as it runs on the
 /// daemon at `socket`.
-pub fn own_state_dir(socket: &Path, plugin: &str) -> PathBuf {
-    state_dir(socket).join(plugin)
+pub fn own_state_dir(socket: &Path, plugin: &Id) -> PathBuf {
+    state_dir(socket).join(plugin.place())
 }
 
-/// Why the plugin called `name` failed to build, if its last build did.
-fn build_failed(name: &str) -> Option<String> {
-    fs::read_to_string(unbuilt_path(name)).ok()
+/// Why the plugin `plugin` failed to build, if its last build did.
+fn build_failed(plugin: &Id) -> Option<String> {
+    fs::read_to_string(unbuilt_path(plugin)).ok()
 }
 
-/// Notes why the plugin called `name` failed to build, or with `None` that
-/// it built.
-pub fn set_build_failed(name: &str, why: Option<&str>) -> Result<()> {
-    let path = unbuilt_path(name);
+/// Notes why the plugin `plugin` failed to build, or with `None` that it
+/// built.
+pub fn set_build_failed(plugin: &Id, why: Option<&str>) -> Result<()> {
+    let path = unbuilt_path(plugin);
     match why {
         Some(why) => {
+            if let Some(dir) = path.parent() {
+                fs::create_dir_all(dir)?;
+            }
             fs::write(&path, why).with_context(|| format!("couldn't write {}", path.display()))?
         }
         None => {
@@ -511,14 +765,17 @@ pub fn set_build_failed(name: &str, why: Option<&str>) -> Result<()> {
 }
 
 /// Where a plugin's failed build is noted: beside the plugin, since its
-/// files are every server's, out of the way of its own.
-fn unbuilt_path(name: &str) -> PathBuf {
-    plugins_dir().join(format!(".{name}.unbuilt"))
+/// files are every server's, out of the way of its own; for a project's,
+/// out of the project's way, beside the user's.
+fn unbuilt_path(plugin: &Id) -> PathBuf {
+    plugins_dir()
+        .join(plugin.place())
+        .with_file_name(format!(".{}.unbuilt", plugin.name))
 }
 
-/// The log of the plugin called `name`: what its commands printed.
-pub fn log_path(socket: &Path, name: &str) -> PathBuf {
-    state_dir(socket).join(format!("{name}.log"))
+/// The log of the plugin `plugin`: what its commands printed.
+pub fn log_path(socket: &Path, plugin: &Id) -> PathBuf {
+    state_dir(socket).join(plugin.place().with_extension("log"))
 }
 
 /// How big a log may grow before it starts over.
@@ -526,9 +783,9 @@ const LOG_MAX: u64 = 1 << 20;
 
 /// The plugin's log, open to add to, made if there's none yet. One that
 /// has grown past [`LOG_MAX`] starts over.
-pub fn open_log(socket: &Path, name: &str) -> Result<fs::File> {
-    fs::create_dir_all(state_dir(socket))?;
-    let path = log_path(socket, name);
+pub fn open_log(socket: &Path, plugin: &Id) -> Result<fs::File> {
+    let path = log_path(socket, plugin);
+    fs::create_dir_all(path.parent().unwrap_or(&state_dir(socket)))?;
     let full = fs::metadata(&path).is_ok_and(|meta| meta.len() > LOG_MAX);
     let file = fs::OpenOptions::new()
         .create(true)
@@ -542,9 +799,9 @@ pub fn open_log(socket: &Path, name: &str) -> Result<fs::File> {
 
 /// Adds a line to the plugin's log, after the time. What can't be written
 /// is lost: a log is never worth failing over.
-pub fn log(socket: &Path, name: &str, line: &str) {
+pub fn log(socket: &Path, plugin: &Id, line: &str) {
     use std::io::Write;
-    if let Ok(mut file) = open_log(socket, name) {
+    if let Ok(mut file) = open_log(socket, plugin) {
         let _ = writeln!(file, "[{}] {line}", local_time());
     }
 }
@@ -568,24 +825,25 @@ fn local_time() -> String {
     )
 }
 
-/// Why the plugin called `name` was paused, if it was: its event hooks
-/// failed too many times in a row. Turning it on again unpauses it.
-pub fn paused(socket: &Path, name: &str) -> Option<String> {
-    fs::read_to_string(pause_path(socket, name)).ok()
+/// Why the plugin `plugin` was paused, if it was: its event hooks failed
+/// too many times in a row. Turning it on again unpauses it.
+pub fn paused(socket: &Path, plugin: &Id) -> Option<String> {
+    fs::read_to_string(pause_path(socket, plugin)).ok()
 }
 
-pub fn pause(socket: &Path, name: &str, why: &str) -> Result<()> {
-    fs::create_dir_all(state_dir(socket))?;
-    fs::write(pause_path(socket, name), why)?;
+pub fn pause(socket: &Path, plugin: &Id, why: &str) -> Result<()> {
+    let path = pause_path(socket, plugin);
+    fs::create_dir_all(path.parent().unwrap_or(&state_dir(socket)))?;
+    fs::write(path, why)?;
     Ok(())
 }
 
-pub fn unpause(socket: &Path, name: &str) {
-    let _ = fs::remove_file(pause_path(socket, name));
+pub fn unpause(socket: &Path, plugin: &Id) {
+    let _ = fs::remove_file(pause_path(socket, plugin));
 }
 
-fn pause_path(socket: &Path, name: &str) -> PathBuf {
-    state_dir(socket).join(format!("{name}.paused"))
+fn pause_path(socket: &Path, plugin: &Id) -> PathBuf {
+    state_dir(socket).join(plugin.place().with_extension("paused"))
 }
 
 #[cfg(test)]
@@ -666,6 +924,7 @@ mod tests {
             name: name.into(),
             dir: PathBuf::from(name),
             manifest: Manifest::parse(&text, name).map_err(|err| err.to_string()),
+            project: None,
         }
     }
 
@@ -722,10 +981,59 @@ mod tests {
     fn switching_a_plugin_on_lets_a_paused_one_run_again() {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("crystal.sock");
-        pause(&socket, "notes", "it failed").unwrap();
-        assert_eq!(paused(&socket, "notes").as_deref(), Some("it failed"));
+        let notes = Id::own("notes");
+        pause(&socket, &notes, "it failed").unwrap();
+        assert_eq!(paused(&socket, &notes).as_deref(), Some("it failed"));
         set_enabled(&dir.path().join("config.toml"), &socket, "notes", true).unwrap();
-        assert_eq!(paused(&socket, "notes"), None);
+        assert_eq!(paused(&socket, &notes), None);
+    }
+
+    #[test]
+    fn a_projects_plugin_is_switched_in_its_project_table_and_keeps_its_own_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let socket = dir.path().join("crystal.sock");
+        let app = dir.path().join("app");
+        fs::create_dir_all(&app).unwrap();
+        let written = format!(
+            "# mine\n[[project]]\npath = {:?}\nrun = \"make dev\"\n",
+            app.display().to_string()
+        );
+        fs::write(&path, &written).unwrap();
+        let lint = Id::of_project("lint", &app);
+        let deploy = Id::of_project("deploy", &app);
+        pause(&socket, &lint, "it failed").unwrap();
+        switch(&path, &socket, &lint, true).unwrap();
+        switch(&path, &socket, &deploy, true).unwrap();
+        let config = config::from_text(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(is_on(&config, &lint) && is_on(&config, &deploy));
+        assert_eq!(paused(&socket, &lint), None, "switched on, it runs again");
+        // The user's own of that name is another plugin.
+        assert!(!is_on(&config, &Id::own("lint")));
+        assert!(!is_on(&config, &Id::of_project("lint", dir.path())));
+
+        switch(&path, &socket, &lint, false).unwrap();
+        switch(&path, &socket, &deploy, false).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), written);
+
+        // A project with no table gets one, which goes when it's all off.
+        let other = dir.path().join("other");
+        fs::create_dir_all(&other).unwrap();
+        let lint = Id::of_project("lint", &other);
+        switch(&path, &socket, &lint, true).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("plugins = [\"lint\"]"), "{text}");
+        switch(&path, &socket, &lint, false).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), written);
+
+        // Its log and state are its own, apart from another project's.
+        let two = Id::of_project("lint", dir.path());
+        assert_ne!(log_path(&socket, &lint), log_path(&socket, &two));
+        assert_ne!(
+            own_state_dir(&socket, &lint),
+            own_state_dir(&socket, &Id::own("lint"))
+        );
+        assert_eq!(lint.label(), "lint (other)");
     }
 
     #[test]
@@ -739,7 +1047,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("s.sock");
         let command = command(
-            "notes",
+            &Id::own("notes"),
             Path::new("/plugins/notes"),
             &words,
             &socket,
@@ -761,6 +1069,9 @@ mod tests {
         let socket_var = Some(socket.display().to_string());
         assert!(env.contains(&("CRYSTAL_SOCKET".into(), socket_var)));
         assert!(env.contains(&("CRYSTAL_PLUGIN".into(), Some("notes".into()))));
+        let dir_var = Some("/plugins/notes".to_string());
+        assert!(env.contains(&("CRYSTAL_PLUGIN_DIR".into(), dir_var)));
+        assert!(env.contains(&("CRYSTAL_PLUGIN_PROJECT".into(), None)));
         // Its state is the server's, and made before it runs.
         let state = dir.path().join("s.plugins/notes");
         let state_var = Some(state.display().to_string());
