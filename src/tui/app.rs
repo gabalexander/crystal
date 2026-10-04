@@ -43,7 +43,7 @@ use super::timeline::{self, TimelineView};
 use super::tree_browser::TreeBrowser;
 use crate::catalog::{self, Agent};
 use crate::client::Purpose;
-use crate::config::{Config, Fold, SIDEBAR_WIDTHS};
+use crate::config::{Config, Fold, MouseSettings, SIDEBAR_WIDTHS};
 use crate::events::Event;
 use crate::flow_run::{FlowRun, RunState};
 use crate::flows::{self, Flow};
@@ -102,6 +102,9 @@ pub enum Hit {
         slot: Slot,
         cell: Option<(u16, u16)>,
     },
+    /// The scrollbar beside the screen of the pane at `slot`: `row` of it,
+    /// counted from 0 at the screen's top row.
+    Scrollbar { slot: Slot, row: u16 },
     /// The border between the two sides of a split of the tab's panes: the
     /// rule between panes side by side, or, beside the name on it, the
     /// header line of a pane below another. `split` counts the splits in
@@ -461,6 +464,21 @@ pub enum Action {
     /// The mouse let go: put what it selected in the pane at this slot on
     /// the clipboard.
     CopySelection(Slot),
+    /// The mouse let go, and what it selected is copied with copy mode's
+    /// keys: copy mode comes on in the pane at this slot, if anything was
+    /// selected, the selection kept.
+    HoldSelection(Slot),
+    /// The mouse went down on `row` of the scrollbar of the pane at
+    /// `slot`: it takes the thumb there, or the thumb jumps there.
+    GrabThumb {
+        slot: Slot,
+        row: u16,
+    },
+    /// The mouse dragged the thumb it took to `row` of the scrollbar.
+    DragThumb {
+        slot: Slot,
+        row: u16,
+    },
     /// Open `topic`, of the project at `project`, in the browser.
     OpenInBrowser {
         project: PathBuf,
@@ -759,6 +777,12 @@ pub struct App {
     /// The pane a drag of the mouse started in, while the button is down:
     /// the drag is a selection in that pane to the end, wherever it goes.
     dragging: Option<Slot>,
+    /// The pane whose scrollbar's thumb the mouse took, while the button
+    /// is down: the thumb follows it, wherever it goes.
+    holding_thumb: Option<Slot>,
+    /// The pane the keyboard was typing into when the mouse put it in copy
+    /// mode, to go back to when copy mode is over.
+    copied_from: Option<Slot>,
     /// The pane taken by its header line, while the button is down, and
     /// the pane the mouse is over now: letting go there swaps the two.
     grabbed: Option<Grab>,
@@ -868,6 +892,8 @@ pub struct App {
     pin_needs_you: bool,
     /// Whether the sidebar's edge is being dragged with the mouse.
     dragging_sidebar: bool,
+    /// What the mouse does, as the config has it.
+    mouse: MouseSettings,
 }
 
 /// How wide the sidebar is and whether it's folded, as the user left it,
@@ -931,6 +957,8 @@ impl App {
             focus: Focus::Sidebar,
             last_pane: None,
             dragging: None,
+            holding_thumb: None,
+            copied_from: None,
             grabbed: None,
             link_hover: None,
             own_id,
@@ -975,6 +1003,7 @@ impl App {
             fold: Fold::Marks,
             pin_needs_you: true,
             dragging_sidebar: false,
+            mouse: MouseSettings::default(),
         }
     }
 
@@ -990,6 +1019,12 @@ impl App {
         }
         self.fold = settings.fold;
         self.pin_needs_you = settings.needs_you;
+        self.mouse = config.mouse.clone();
+    }
+
+    /// Whether each pane has a scrollbar beside its screen.
+    pub fn scrollbars(&self) -> bool {
+        self.mouse.scrollbars
     }
 
     /// Takes the sidebar's shape the TUI kept, and whether the config has it
@@ -2526,6 +2561,11 @@ impl App {
         self.dragging
     }
 
+    /// The pane whose scrollbar's thumb the mouse holds, while it does.
+    pub fn holding_thumb(&self) -> Option<Slot> {
+        self.holding_thumb
+    }
+
     /// The pane being moved by its header line, while the button is down.
     pub fn grabbed(&self) -> Option<Grab> {
         self.grabbed
@@ -2955,8 +2995,9 @@ impl App {
 
     /// What the mouse does, when no program in a pane has taken it: a click
     /// selects a session or hands a pane the keyboard, a drag moves a
-    /// border between panes, and the wheel moves the selection, or scrolls
-    /// a pane through its history.
+    /// border between panes, selects in a pane or moves its scrollbar's
+    /// thumb, and the wheel moves the selection, or scrolls a pane through
+    /// its history.
     pub fn on_mouse(&mut self, kind: MouseEventKind, hit: Hit) -> Option<Action> {
         let action = self.take_mouse(kind, hit);
         self.remember_shown();
@@ -3039,11 +3080,33 @@ impl App {
                 }
                 (MouseEventKind::Up(_), _) => {
                     self.dragging = None;
-                    return Some(Action::CopySelection(slot));
+                    if self.mouse.copy_on_select {
+                        return Some(Action::CopySelection(slot));
+                    }
+                    return Some(Action::HoldSelection(slot));
                 }
+                // The wheel scrolls the pane meanwhile, and the selection
+                // goes on with it.
+                (MouseEventKind::ScrollUp, _) => return Some(Action::ScrollBack(slot)),
+                (MouseEventKind::ScrollDown, _) => return Some(Action::ScrollForward(slot)),
                 // The button came up somewhere nothing heard it: this is a
                 // new click.
                 (MouseEventKind::Down(_), _) => self.dragging = None,
+                _ => return None,
+            }
+        }
+        // A scrollbar's thumb taken by the mouse follows it until the
+        // button comes up.
+        if let Some(slot) = self.holding_thumb {
+            match (kind, hit) {
+                (MouseEventKind::Drag(_), Hit::Scrollbar { slot: at, row }) if at == slot => {
+                    return Some(Action::DragThumb { slot, row });
+                }
+                (MouseEventKind::Up(_), _) => {
+                    self.holding_thumb = None;
+                    return None;
+                }
+                (MouseEventKind::Down(_), _) => self.holding_thumb = None,
                 _ => return None,
             }
         }
@@ -3102,16 +3165,22 @@ impl App {
                     return Some(Action::SelectFrom { slot, cell });
                 }
             }
+            // A scrollbar takes the click as it is, the keyboard staying
+            // where it was.
+            (_, Hit::Scrollbar { slot, row }) if click && self.shows_screen(slot) => {
+                self.holding_thumb = Some(slot);
+                return Some(Action::GrabThumb { slot, row });
+            }
             (MouseEventKind::ScrollUp, Hit::SidebarRow(_) | Hit::Sidebar) => {
                 self.move_selection(-1);
             }
             (MouseEventKind::ScrollDown, Hit::SidebarRow(_) | Hit::Sidebar) => {
                 self.move_selection(1);
             }
-            (MouseEventKind::ScrollUp, Hit::Pane { slot, .. }) => {
+            (MouseEventKind::ScrollUp, Hit::Pane { slot, .. } | Hit::Scrollbar { slot, .. }) => {
                 return Some(Action::ScrollBack(slot));
             }
-            (MouseEventKind::ScrollDown, Hit::Pane { slot, .. }) => {
+            (MouseEventKind::ScrollDown, Hit::Pane { slot, .. } | Hit::Scrollbar { slot, .. }) => {
                 return Some(Action::ScrollForward(slot));
             }
             _ => {}
@@ -3139,7 +3208,7 @@ impl App {
                 self.go_to_tab(index);
                 tab_menu()
             }
-            Hit::Pane { slot, .. } => {
+            Hit::Pane { slot, .. } | Hit::Scrollbar { slot, .. } => {
                 let name = self.pane_session(slot)?.name.clone();
                 self.select(&name);
                 self.session_menu(true)?
@@ -4913,6 +4982,7 @@ impl App {
             return;
         };
         if self.shows_screen(slot) {
+            self.copied_from = None;
             self.focus = Focus::Copy(slot);
         } else if self.selected_is_own() {
             self.notify("crystal can't show the session it runs in".into());
@@ -4936,11 +5006,25 @@ impl App {
         Some(Action::EditHistory { slot, dir, name })
     }
 
-    /// Copy mode is over: the keyboard goes back to the sidebar it came
-    /// from.
+    /// What the mouse selected in the pane at `slot` is kept to be copied
+    /// with copy mode's keys: copy mode has the keyboard there, to give it
+    /// back to the pane it was typing into, if it was, when it's over.
+    pub fn hold_selection(&mut self, slot: Slot) {
+        if !self.shows_screen(slot) || self.focus == Focus::Copy(slot) {
+            return;
+        }
+        self.copied_from = (self.focus == Focus::Pane(slot)).then_some(slot);
+        self.focus = Focus::Copy(slot);
+    }
+
+    /// Copy mode is over: the keyboard goes back to where it came from,
+    /// the sidebar, or the pane the mouse took it from.
     pub fn stop_copying(&mut self) {
         if let Focus::Copy(_) = self.focus {
-            self.focus = Focus::Sidebar;
+            self.focus = match self.copied_from.take() {
+                Some(slot) if self.can_type_into(slot) => Focus::Pane(slot),
+                _ => Focus::Sidebar,
+            };
         }
     }
 
@@ -5217,6 +5301,8 @@ impl App {
         };
         let last_pane = self.last_pane.and_then(moved);
         let dragging = self.dragging.and_then(moved);
+        let holding_thumb = self.holding_thumb.and_then(moved);
+        let copied_from = self.copied_from.and_then(moved);
         let grabbed = self.grabbed.and_then(|grab| {
             let from = moved(grab.from)?;
             let over = grab.over.and_then(moved);
@@ -5225,6 +5311,8 @@ impl App {
         self.focus = focus;
         self.last_pane = last_pane;
         self.dragging = dragging;
+        self.holding_thumb = holding_thumb;
+        self.copied_from = copied_from;
         self.grabbed = grabbed;
     }
 
@@ -7964,6 +8052,90 @@ mod tests {
     }
 
     #[test]
+    fn without_copy_on_select_letting_go_holds_the_selection_in_copy_mode() {
+        let mut app = app_with_splits(&["a", "b"], 1);
+        let config = crate::config::from_text("[mouse]\ncopy_on_select = false").unwrap();
+        app.set_interface(&config);
+        let in_split = Hit::Pane {
+            slot: Slot::Split(0),
+            cell: Some((2, 3)),
+        };
+        app.on_mouse(MouseEventKind::Down(MouseButton::Left), in_split);
+        assert_eq!(app.focus(), Focus::Pane(Slot::Split(0)));
+        assert_eq!(
+            app.on_mouse(MouseEventKind::Up(MouseButton::Left), in_split),
+            Some(Action::HoldSelection(Slot::Split(0)))
+        );
+        // With something selected, copy mode takes the keyboard, and gives
+        // it back to the pane it was typing into when it's over.
+        app.hold_selection(Slot::Split(0));
+        assert_eq!(app.focus(), Focus::Copy(Slot::Split(0)));
+        app.stop_copying();
+        assert_eq!(app.focus(), Focus::Pane(Slot::Split(0)));
+        // From the sidebar, it goes back there.
+        app.focus = Focus::Sidebar;
+        app.hold_selection(Slot::Split(0));
+        app.stop_copying();
+        assert_eq!(app.focus(), Focus::Sidebar);
+    }
+
+    #[test]
+    fn the_wheel_scrolls_the_pane_a_drag_is_selecting_in() {
+        let mut app = app_with_splits(&["a", "b"], 1);
+        let in_split = Hit::Pane {
+            slot: Slot::Split(0),
+            cell: Some((2, 3)),
+        };
+        app.on_mouse(MouseEventKind::Down(MouseButton::Left), in_split);
+        // Wherever the mouse is, the wheel is the drag's pane's.
+        assert_eq!(
+            app.on_mouse(MouseEventKind::ScrollUp, Hit::Sidebar),
+            Some(Action::ScrollBack(Slot::Split(0)))
+        );
+        assert_eq!(
+            app.on_mouse(MouseEventKind::ScrollDown, in_split),
+            Some(Action::ScrollForward(Slot::Split(0)))
+        );
+        assert_eq!(app.dragging(), Some(Slot::Split(0)));
+    }
+
+    #[test]
+    fn a_scrollbars_thumb_follows_the_mouse_until_it_lets_go() {
+        let mut app = app_with_splits(&["a", "b"], 1);
+        let bar = |row| Hit::Scrollbar {
+            slot: Slot::Split(0),
+            row,
+        };
+        let slot = Slot::Split(0);
+        assert_eq!(
+            app.on_mouse(MouseEventKind::Down(MouseButton::Left), bar(4)),
+            Some(Action::GrabThumb { slot, row: 4 })
+        );
+        // The keyboard stays where it was.
+        assert_eq!(app.focus(), Focus::Sidebar);
+        assert_eq!(app.holding_thumb(), Some(slot));
+        let drag = MouseEventKind::Drag(MouseButton::Left);
+        assert_eq!(
+            app.on_mouse(drag, bar(9)),
+            Some(Action::DragThumb { slot, row: 9 })
+        );
+        assert_eq!(app.on_mouse(drag, Hit::Sidebar), None);
+        assert_eq!(
+            app.on_mouse(MouseEventKind::Up(MouseButton::Left), Hit::Sidebar),
+            None
+        );
+        assert_eq!(app.holding_thumb(), None);
+        // The wheel over it scrolls the pane, as over its screen, and a
+        // right click opens the pane's menu.
+        assert_eq!(
+            app.on_mouse(MouseEventKind::ScrollUp, bar(0)),
+            Some(Action::ScrollBack(slot))
+        );
+        app.right_click(bar(0), (79, 2));
+        assert!(app.menu().is_some());
+    }
+
+    #[test]
     fn with_ctrl_held_the_mouse_over_a_pane_marks_where_to_look_for_a_link() {
         let mut app = app_with_splits(&["a", "b"], 1);
         let over = |cell| Hit::Pane {
@@ -9569,7 +9741,7 @@ gate = true
         });
         // `x` would kill the session from the sidebar; here it's nothing.
         assert_eq!(press(&mut app, KeyCode::Char('x')), None);
-        for _ in 0..7 {
+        for _ in 0..11 {
             press(&mut app, KeyCode::Char('j'));
         }
         assert_eq!(

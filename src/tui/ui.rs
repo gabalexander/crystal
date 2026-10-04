@@ -26,6 +26,7 @@ use super::profiles;
 use super::pull_requests;
 use super::reply;
 use super::screen_widget::{Marks, ScreenWidget};
+use super::scrollbar;
 use super::settings_view;
 use super::sidebar::{self, fit};
 use super::split_tree::{Border, Way};
@@ -252,11 +253,36 @@ pub fn view_header<'a>(
 }
 
 /// Where a pane's session's screen goes: all of the pane below its header
-/// line. The session is sized to fit it exactly.
-pub fn screen_area(pane: Rect) -> Rect {
+/// line, but for the column on its right its scrollbar takes, with
+/// `scrollbars` on. The session is sized to fit it exactly.
+pub fn screen_area(pane: Rect, scrollbars: bool) -> Rect {
     let [_header, screen] =
         Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(pane);
-    screen
+    match scrollbar_area(pane, scrollbars) {
+        Some(_) => Rect {
+            width: screen.width - 1,
+            ..screen
+        },
+        None => screen,
+    }
+}
+
+/// The narrowest a pane is to have a scrollbar beside its screen.
+const SCROLLBAR_FROM: u16 = 8;
+
+/// Where a pane's scrollbar goes, with `scrollbars` on: the column on its
+/// right, beside its screen. A pane too narrow to spare one has none.
+pub fn scrollbar_area(pane: Rect, scrollbars: bool) -> Option<Rect> {
+    if !scrollbars || pane.width < SCROLLBAR_FROM || pane.height < 2 {
+        return None;
+    }
+    Some(Rect::new(pane.right() - 1, pane.y + 1, 1, pane.height - 1))
+}
+
+/// The area of the pane at `slot`, as `areas` lays it out.
+fn pane_area(areas: &Areas, app: &App, slot: Slot) -> Option<Rect> {
+    let index = app.slots().iter().position(|at| *at == slot)?;
+    areas.panes.get(index).copied()
 }
 
 /// The cell of the screen of the pane at `slot` nearest `(column, row)`:
@@ -269,14 +295,39 @@ pub fn nearest_cell(
     column: u16,
     row: u16,
 ) -> Option<(u16, u16)> {
-    let index = app.slots().iter().position(|at| *at == slot)?;
-    let screen = screen_area(*areas.panes.get(index)?);
+    let screen = screen_area(pane_area(areas, app, slot)?, app.scrollbars());
     if screen.is_empty() {
         return None;
     }
     let column = column.clamp(screen.x, screen.right() - 1);
     let row = row.clamp(screen.y, screen.bottom() - 1);
     Some((row - screen.y, column - screen.x))
+}
+
+/// How many rows above the screen of the pane at `slot` the mouse is, at
+/// `row`, as less than 0, or below it, or 0 when it's level with it: how
+/// far past the edge a drag selecting there has gone.
+pub fn rows_past(areas: &Areas, app: &App, slot: Slot, row: u16) -> i32 {
+    let Some(pane) = pane_area(areas, app, slot) else {
+        return 0;
+    };
+    let screen = screen_area(pane, app.scrollbars());
+    let row = i32::from(row);
+    let (top, bottom) = (i32::from(screen.y), i32::from(screen.bottom()));
+    if row < top {
+        row - top
+    } else if row >= bottom {
+        row - bottom + 1
+    } else {
+        0
+    }
+}
+
+/// The row of the scrollbar of the pane at `slot` nearest the screen's
+/// `row`: where a drag of its thumb has got to, wherever the mouse is.
+pub fn scrollbar_row(areas: &Areas, app: &App, slot: Slot, row: u16) -> Option<u16> {
+    let track = scrollbar_area(pane_area(areas, app, slot)?, app.scrollbars())?;
+    Some(row.clamp(track.y, track.bottom() - 1) - track.y)
 }
 
 /// What's at `(column, row)` on a screen laid out as `areas`, for `app`.
@@ -324,7 +375,13 @@ pub fn hit(areas: &Areas, app: &App, column: u16, row: u16) -> Hit {
             _ => *area,
         };
         if at(frame) {
-            let screen = screen_area(*area);
+            if let Some(track) = scrollbar_area(*area, app.scrollbars())
+                && at(track)
+            {
+                let row = row - track.y;
+                return Hit::Scrollbar { slot, row };
+            }
+            let screen = screen_area(*area, app.scrollbars());
             let cell = at(screen).then(|| (row - screen.y, column - screen.x));
             // A header line below another pane is the border between
             // them, but for the name on it, which takes the pane to move.
@@ -783,7 +840,7 @@ fn draw_pane(frame: &mut Frame, app: &App, look: &Look, slot: Slot, area: Rect, 
     // yet.
     let pane = pane_in(app, panes, slot);
     let back = pane.map_or(0, Pane::scrolled_back);
-    let screen = screen_area(area);
+    let screen = screen_area(area, app.scrollbars());
     let header = Rect::new(area.x, area.y, area.width, 1);
 
     let Some(session) = session else {
@@ -844,6 +901,14 @@ fn draw_pane(frame: &mut Frame, app: &App, look: &Look, slot: Slot, area: Rect, 
         .with_marks(marks)
         .with_link(link);
     frame.render_widget(widget, screen);
+    if let (Some(track), Some(thumb)) = (scrollbar_area(area, app.scrollbars()), pane.thumb()) {
+        // The thumb stands out while the mouse holds it.
+        let held = app.holding_thumb() == Some(slot);
+        let thumb_color = if held { theme.accent } else { theme.muted };
+        let line = Style::new().fg(theme.rule);
+        let held = Style::new().fg(thumb_color);
+        scrollbar::draw(frame.buffer_mut(), track, thumb, line, held);
+    }
     // In copy mode, the cursor is copy mode's. Back in the history, the
     // program's cursor's place on the live screen means nothing.
     let cursor = if copying {
@@ -2288,7 +2353,7 @@ mod tests {
         app.on_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE));
         let areas = Areas::of(&app, Rect::new(0, 0, 80, 24));
         assert_eq!(areas.panes, [Rect::new(0, 1, 80, 22)]);
-        assert_eq!(screen_area(areas.panes[0]), Rect::new(0, 2, 80, 21));
+        assert_eq!(screen_area(areas.panes[0], false), Rect::new(0, 2, 80, 21));
         assert_eq!(
             hit(&areas, &app, 0, 5),
             Hit::Pane {
@@ -2326,12 +2391,48 @@ mod tests {
     fn a_drag_keeps_to_the_edge_of_the_pane_it_started_in() {
         let app = app_with_sessions(1);
         let areas = Areas::of(&app, Rect::new(0, 0, 80, 24));
-        // The screen is at column 29, row 2, 51 by 21.
+        // The screen is at column 29, row 2, 50 by 21, the scrollbar on
+        // its right.
         let nearest = |column, row| nearest_cell(&areas, &app, Slot::Selected, column, row);
         assert_eq!(nearest(31, 3), Some((1, 2)));
         assert_eq!(nearest(5, 0), Some((0, 0)));
-        assert_eq!(nearest(200, 200), Some((20, 50)));
+        assert_eq!(nearest(200, 200), Some((20, 49)));
         assert_eq!(nearest_cell(&areas, &app, Slot::Split(0), 31, 3), None);
+        // Past its top, on the header line and the top bar, or below its
+        // bottom, on the footer, it says how far.
+        let past = |row| rows_past(&areas, &app, Slot::Selected, row);
+        assert_eq!(
+            [past(0), past(1), past(2), past(22), past(23)],
+            [-2, -1, 0, 0, 1]
+        );
+    }
+
+    #[test]
+    fn a_click_beside_a_panes_screen_is_on_its_scrollbar() {
+        let app = app_with_sessions(1);
+        let areas = Areas::of(&app, Rect::new(0, 0, 80, 24));
+        let selected = Slot::Selected;
+        assert_eq!(
+            hit(&areas, &app, 79, 2),
+            Hit::Scrollbar {
+                slot: selected,
+                row: 0
+            }
+        );
+        assert_eq!(
+            hit(&areas, &app, 78, 22),
+            Hit::Pane {
+                slot: selected,
+                cell: Some((20, 49))
+            }
+        );
+        // Above it is the header line; a drag of the thumb keeps to it.
+        assert!(matches!(
+            hit(&areas, &app, 79, 1),
+            Hit::Pane { cell: None, .. }
+        ));
+        let row = |at| scrollbar_row(&areas, &app, selected, at);
+        assert_eq!([row(0), row(10), row(23)], [Some(0), Some(8), Some(20)]);
     }
 
     #[test]
@@ -2341,7 +2442,17 @@ mod tests {
         assert_eq!(areas.rule, Rect::new(28, 1, 1, 22));
         assert_eq!(areas.tiles, Rect::new(29, 1, 51, 22));
         assert_eq!(areas.panes, [areas.tiles], "one pane takes all the room");
-        assert_eq!(screen_area(areas.panes[0]), Rect::new(29, 2, 51, 21));
+        assert_eq!(screen_area(areas.panes[0], false), Rect::new(29, 2, 51, 21));
+        // A scrollbar takes the column on its right.
+        assert_eq!(screen_area(areas.panes[0], true), Rect::new(29, 2, 50, 21));
+        let track = scrollbar_area(areas.panes[0], true);
+        assert_eq!(track, Some(Rect::new(79, 2, 1, 21)));
+        assert_eq!(scrollbar_area(areas.panes[0], false), None);
+        assert_eq!(
+            scrollbar_area(Rect::new(0, 0, 7, 10), true),
+            None,
+            "too narrow"
+        );
     }
 
     #[test]

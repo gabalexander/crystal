@@ -41,6 +41,7 @@ mod pull_requests;
 mod reply;
 mod review;
 pub(crate) mod screen_widget;
+mod scrollbar;
 mod search;
 mod settings_view;
 pub(crate) mod sidebar;
@@ -358,6 +359,8 @@ pub fn run(socket: &Path) -> Result<()> {
         sessions_asked: Instant::now(),
         searches: Arc::new(AtomicU64::new(0)),
         link_clicked: false,
+        clicks: pane::Clicks::default(),
+        edge: None,
         kept_tabs: tabs::Tabs::default(),
         kept_sidebar: app::Shape::default(),
         quitting: false,
@@ -411,18 +414,18 @@ pub fn run(socket: &Path) -> Result<()> {
 struct TerminalModes;
 
 impl TerminalModes {
-    fn on() -> Result<TerminalModes> {
+    /// With `mouse` off, the terminal keeps the mouse: `[mouse] capture`.
+    fn on(mouse: bool) -> Result<TerminalModes> {
         // A panic on any thread turns them off before the panic is shown.
         let shown_before = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
             modes_off();
             shown_before(info);
         }));
-        // Clicks and the wheel (1000), drags (1002), the mouse just moving
-        // (1003), to underline the link under it while Ctrl is held, all
-        // written the SGR way (1006). A move that changes nothing isn't
-        // drawn. Then bracketed paste (2004): a paste comes whole, its
-        // lines kept, not as typed keys. Then, pushed on the terminal's
+        // The mouse, unless the config leaves it to the terminal: see
+        // `MOUSE_ON`. A move that changes nothing isn't drawn. Then
+        // bracketed paste (2004): a paste comes whole, its lines kept, not
+        // as typed keys. Then, pushed on the terminal's
         // stack, the Kitty keyboard protocol's flags to tell apart keys the
         // old way can't, like Esc or Shift+Enter, and to say which key a
         // shifted one is (1 and 4): a program in a pane that asked for the
@@ -431,9 +434,10 @@ impl TerminalModes {
         // for "while you were away", and so that layout commands from the
         // command line go to the TUI the user is at.
         let mut out = std::io::stdout();
-        out.write_all(
-            b"\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h\x1b[?2004h\x1b[>5u\x1b[?1004h",
-        )?;
+        if mouse {
+            out.write_all(MOUSE_ON)?;
+        }
+        out.write_all(b"\x1b[?2004h\x1b[>5u\x1b[?1004h")?;
         out.flush()?;
         Ok(TerminalModes)
     }
@@ -447,9 +451,33 @@ impl Drop for TerminalModes {
 
 fn modes_off() {
     let mut out = std::io::stdout();
-    let _ =
-        out.write_all(b"\x1b[?1004l\x1b[<u\x1b[?2004l\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l");
+    let _ = out.write_all(b"\x1b[?1004l\x1b[<u\x1b[?2004l");
+    let _ = out.write_all(MOUSE_OFF);
     let _ = out.flush();
+}
+
+/// Clicks and the wheel (1000), drags (1002), the mouse just moving
+/// (1003), to underline the link under it while Ctrl is held, all written
+/// the SGR way (1006).
+const MOUSE_ON: &[u8] = b"\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h";
+const MOUSE_OFF: &[u8] = b"\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l";
+
+/// Has the terminal send the TUI the mouse, or keep it for its own
+/// selection: `[mouse] capture`.
+fn capture_mouse(on: bool) {
+    let mut out = std::io::stdout();
+    let _ = out.write_all(if on { MOUSE_ON } else { MOUSE_OFF });
+    let _ = out.flush();
+}
+
+/// A drag selecting in the pane at `slot`, held `past` rows beyond the top
+/// of its screen (less than 0) or its bottom: its history scrolls again
+/// at `next`.
+#[derive(Debug, Clone, Copy)]
+struct Edge {
+    slot: Slot,
+    past: i32,
+    next: Instant,
 }
 
 struct Tui {
@@ -507,6 +535,11 @@ struct Tui {
     /// A Ctrl+click opened a link: the button coming up is that click's,
     /// not the program's under it.
     link_clicked: bool,
+    /// The clicks on panes' screens, counted for double- and triple-clicks.
+    clicks: pane::Clicks,
+    /// A drag selecting in a pane, held past the top or bottom of its
+    /// screen, which scrolls its history on until it comes back or lets go.
+    edge: Option<Edge>,
     quitting: bool,
     /// The number the timeline follows the event log under, which goes up
     /// each time it starts or stops following: a thread following under an
@@ -527,7 +560,7 @@ impl Tui {
     ) -> Result<()> {
         // The mouse and pastes are the TUI's for as long as `_modes` lives:
         // to the end of this function, however it ends.
-        let _modes = TerminalModes::on()?;
+        let _modes = TerminalModes::on(self.config.mouse.capture)?;
         self.run(terminal, events)
     }
 
@@ -547,6 +580,7 @@ impl Tui {
             while let Ok(event) = events.try_recv() {
                 changed |= self.take(event);
             }
+            changed |= self.scroll_at_edge();
             self.read_topic();
             self.keep_tabs();
         }
@@ -865,12 +899,17 @@ impl Tui {
     }
 
     /// The next event. While an agent works, the wait is cut short in time
-    /// to turn its mark, and there's no event: only a frame to draw.
+    /// to turn its mark, and while a drag is held past the edge of a pane,
+    /// to scroll it again, and there's no event: only a frame to draw.
     fn next_event(&self, events: &Receiver<Event>) -> Result<Option<Event>> {
-        if !self.app.anything_working() {
+        let spin = self.app.anything_working().then_some(SPIN_EVERY);
+        let edge = self
+            .edge
+            .map(|edge| edge.next.saturating_duration_since(Instant::now()));
+        let Some(wait) = spin.into_iter().chain(edge).min() else {
             return Ok(Some(events.recv()?));
-        }
-        match events.recv_timeout(SPIN_EVERY) {
+        };
+        match events.recv_timeout(wait) {
             Ok(event) => Ok(Some(event)),
             Err(RecvTimeoutError::Timeout) => Ok(None),
             Err(RecvTimeoutError::Disconnected) => bail!("the TUI's events stopped"),
@@ -1126,9 +1165,28 @@ impl Tui {
             hit = ui::border_hit(&areas, &self.app, split, mouse.column, mouse.row);
         } else if let Some(slot) = self.app.dragging() {
             // A selection being dragged is crystal's to the end, and keeps
-            // to the edge of its pane when the mouse leaves it.
+            // to the edge of its pane when the mouse leaves it. Past its
+            // top or bottom, the history scrolls under it, on and on while
+            // the mouse stays there.
             let cell = ui::nearest_cell(&areas, &self.app, slot, mouse.column, mouse.row);
             hit = Hit::Pane { slot, cell };
+            let past = ui::rows_past(&areas, &self.app, slot, mouse.row);
+            self.edge = match mouse.kind {
+                MouseEventKind::Drag(_) if past == 0 => None,
+                MouseEventKind::Drag(_) => Some(Edge {
+                    slot,
+                    past,
+                    next: self.edge.map_or_else(Instant::now, |edge| edge.next),
+                }),
+                MouseEventKind::Down(_) | MouseEventKind::Up(_) => None,
+                _ => self.edge,
+            };
+        } else if let Some(slot) = self.app.holding_thumb() {
+            // So is a scrollbar's thumb, which keeps to its track.
+            hit = match ui::scrollbar_row(&areas, &self.app, slot, mouse.row) {
+                Some(row) => Hit::Scrollbar { slot, row },
+                None => Hit::Elsewhere,
+            };
         } else if self.app.grabbed().is_none() && self.pass_to_program(&mouse, hit) {
             return;
         }
@@ -1159,6 +1217,38 @@ impl Tui {
         let hit = ui::hit(&areas, &self.app, mouse.column, mouse.row);
         let ctrl = mouse.modifiers.contains(KeyModifiers::CONTROL);
         self.app.mouse_moved(hit, ctrl)
+    }
+
+    /// Scrolls the history under a drag held past the edge of its pane's
+    /// screen, when it's time to again. Returns whether that moved the
+    /// view: at the end of the history it stays, and so does the timer
+    /// until the mouse moves again.
+    fn scroll_at_edge(&mut self) -> bool {
+        let Some(edge) = self.edge else {
+            return false;
+        };
+        let now = Instant::now();
+        if now < edge.next {
+            return false;
+        }
+        if self.app.dragging() != Some(edge.slot) {
+            self.edge = None;
+            return false;
+        }
+        self.edge = Some(Edge {
+            next: now + pane::EDGE_SCROLL_EVERY,
+            ..edge
+        });
+        let Some(pane) = self.pane_in(edge.slot) else {
+            return false;
+        };
+        let back = pane.scrolled_back();
+        pane.scroll_past_edge(edge.past);
+        let moved = pane.scrolled_back() != back;
+        if !moved {
+            self.edge = None;
+        }
+        moved
     }
 
     /// Ctrl and a click on a link in a pane opens it, whoever has the
@@ -1695,14 +1785,21 @@ impl Tui {
                     pane.page_forward();
                 }
             }
-            Action::ScrollBack(slot) => {
+            Action::ScrollBack(slot) | Action::ScrollForward(slot) => {
+                let back = matches!(action, Action::ScrollBack(_));
+                let lines = usize::from(self.config.mouse.scroll_lines);
+                let selecting = self.app.dragging() == Some(slot);
                 if let Some(pane) = self.pane_in(slot) {
-                    pane.scroll_back();
-                }
-            }
-            Action::ScrollForward(slot) => {
-                if let Some(pane) = self.pane_in(slot) {
-                    pane.scroll_forward();
+                    if back {
+                        pane.scroll_back(lines);
+                    } else {
+                        pane.scroll_forward(lines);
+                    }
+                    // A selection being dragged goes on to what's under the
+                    // mouse now.
+                    if selecting {
+                        pane.follow_drag();
+                    }
                 }
             }
             Action::CopyKey { slot, key } => {
@@ -1731,11 +1828,13 @@ impl Tui {
                 }
             }
             Action::SelectFrom { slot, cell } => {
+                let clicks = self.clicks.click(slot, cell, Instant::now());
                 if let Some(pane) = self.pane_in(slot) {
-                    pane.select_from(cell);
+                    pane.select_from(cell, clicks);
                 }
             }
             Action::SelectTo { slot, cell } => {
+                self.clicks.dragged_to(cell);
                 if let Some(pane) = self.pane_in(slot) {
                     pane.select_to(cell);
                 }
@@ -1746,6 +1845,22 @@ impl Tui {
                     .and_then(|pane| pane.screen.selected_text());
                 if let Some(text) = text {
                     self.copy_to_clipboard(&text)?;
+                }
+            }
+            Action::HoldSelection(slot) => {
+                let held = self.pane_in(slot).is_some_and(Pane::hold_selection);
+                if held {
+                    self.app.hold_selection(slot);
+                }
+            }
+            Action::GrabThumb { slot, row } => {
+                if let Some(pane) = self.pane_in(slot) {
+                    pane.grab_thumb(row);
+                }
+            }
+            Action::DragThumb { slot, row } => {
+                if let Some(pane) = self.pane_in(slot) {
+                    pane.drag_thumb(row);
                 }
             }
             Action::OpenInBrowser { project, topic } => {
@@ -1916,6 +2031,9 @@ impl Tui {
             self.theme = Theme::from_config(config);
         }
         crate::vt::set_history_lines(config.scrollback_lines);
+        if config.mouse.capture != self.config.mouse.capture {
+            capture_mouse(config.mouse.capture);
+        }
         self.config = config.clone();
         self.app.set_launch_settings(config);
         self.app.set_features(config);
@@ -2151,7 +2269,7 @@ impl Tui {
                 continue;
             };
             let name = session.name.clone();
-            let screen = ui::screen_area(*area);
+            let screen = ui::screen_area(*area, self.app.scrollbars());
             let (rows, cols) = (screen.height.max(1), screen.width.max(1));
 
             let kept = before.iter().position(|pane| pane.session_id == session.id);

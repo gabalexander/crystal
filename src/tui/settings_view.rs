@@ -38,6 +38,10 @@ pub enum Setting {
     Sound,
     Theme,
     StopIdle,
+    MouseCapture,
+    CopyOnSelect,
+    ScrollLines,
+    Scrollbars,
     Distill,
     Embeddings,
 }
@@ -52,6 +56,12 @@ pub enum Change {
     Theme(ThemeName),
     /// How long an agent may sit idle, one of [`SessionSettings::CHOICES`].
     StopIdle(&'static str),
+    MouseCapture(bool),
+    CopyOnSelect(bool),
+    /// How many lines a notch of the wheel scrolls, one of
+    /// [`SCROLL_LINES`].
+    ScrollLines(u16),
+    Scrollbars(bool),
     Distill(bool),
     Embeddings(bool),
 }
@@ -66,6 +76,10 @@ impl Change {
             Change::Sound(_) => &["sound", "enabled"],
             Change::Theme(_) => &["theme"],
             Change::StopIdle(_) => &["sessions", "stop_idle_after"],
+            Change::MouseCapture(_) => &["mouse", "capture"],
+            Change::CopyOnSelect(_) => &["mouse", "copy_on_select"],
+            Change::ScrollLines(_) => &["mouse", "scroll_lines"],
+            Change::Scrollbars(_) => &["mouse", "scrollbars"],
             Change::Distill(_) => &["memory", "distill"],
             Change::Embeddings(_) => &["memory", "embeddings"],
         }
@@ -76,8 +90,12 @@ impl Change {
             Change::Notify(on)
             | Change::UnfocusedOnly(on)
             | Change::Sound(on)
+            | Change::MouseCapture(on)
+            | Change::CopyOnSelect(on)
+            | Change::Scrollbars(on)
             | Change::Distill(on)
             | Change::Embeddings(on) => on.into(),
+            Change::ScrollLines(lines) => i64::from(lines).into(),
             Change::NotifyAfter(secs) => i64::try_from(secs).unwrap_or(i64::MAX).into(),
             Change::Theme(theme) => theme.name().into(),
             Change::StopIdle(after) => after.into(),
@@ -98,6 +116,22 @@ fn next_wait(secs: u64, forward: bool) -> u64 {
     } else {
         let before = NOTIFY_AFTER.iter().rev().find(|&&wait| wait < secs);
         *before.unwrap_or(&NOTIFY_AFTER[NOTIFY_AFTER.len() - 1])
+    }
+}
+
+/// The lines `←/→` go through for how far a notch of the wheel scrolls.
+const SCROLL_LINES: [u16; 5] = [1, 2, 3, 5, 10];
+
+/// The lines after `lines` among [`SCROLL_LINES`], or before them, going
+/// round: a number set by hand between two goes to the next, or the one
+/// before.
+fn next_lines(lines: u16, forward: bool) -> u16 {
+    if forward {
+        let next = SCROLL_LINES.iter().find(|&&choice| choice > lines);
+        *next.unwrap_or(&SCROLL_LINES[0])
+    } else {
+        let before = SCROLL_LINES.iter().rev().find(|&&choice| choice < lines);
+        *before.unwrap_or(&SCROLL_LINES[SCROLL_LINES.len() - 1])
     }
 }
 
@@ -122,13 +156,17 @@ pub enum Outcome {
 }
 
 /// The settings the bar can be on, in the order they're listed.
-const SETTINGS: [Setting; 8] = [
+const SETTINGS: [Setting; 12] = [
     Setting::Notify,
     Setting::NotifyAfter,
     Setting::UnfocusedOnly,
     Setting::Sound,
     Setting::Theme,
     Setting::StopIdle,
+    Setting::MouseCapture,
+    Setting::CopyOnSelect,
+    Setting::ScrollLines,
+    Setting::Scrollbars,
     Setting::Distill,
     Setting::Embeddings,
 ];
@@ -233,6 +271,12 @@ impl SettingsView {
                 };
                 Change::StopIdle(choices[next])
             }
+            Setting::MouseCapture => Change::MouseCapture(!config.mouse.capture),
+            Setting::CopyOnSelect => Change::CopyOnSelect(!config.mouse.copy_on_select),
+            Setting::ScrollLines => {
+                Change::ScrollLines(next_lines(config.mouse.scroll_lines, forward))
+            }
+            Setting::Scrollbars => Change::Scrollbars(!config.mouse.scrollbars),
             Setting::Distill => Change::Distill(!config.memory.distill),
             Setting::Embeddings => Change::Embeddings(!config.memory.embeddings),
         };
@@ -364,11 +408,20 @@ fn lines(view: &SettingsView, theme: &Theme) -> Vec<Line<'static>> {
             Setting::Sound => "sounds",
             Setting::Theme => "theme",
             Setting::StopIdle => "stop idle agents",
+            Setting::MouseCapture => "take the mouse",
+            Setting::CopyOnSelect => "copy on select",
+            Setting::ScrollLines => "wheel scrolls",
+            Setting::Scrollbars => "scrollbars",
             Setting::Distill => "distill closed tasks",
             Setting::Embeddings => "search by meaning",
         };
+        let mouse = matches!(
+            setting,
+            Setting::CopyOnSelect | Setting::ScrollLines | Setting::Scrollbars
+        );
         let dim = (matches!(setting, Setting::Distill | Setting::Embeddings) && !memory_on)
-            || (matches!(setting, Setting::NotifyAfter | Setting::UnfocusedOnly) && !config.notify);
+            || (matches!(setting, Setting::NotifyAfter | Setting::UnfocusedOnly) && !config.notify)
+            || (mouse && !config.mouse.capture);
         let (mark, color) = match on {
             Some(true) => ("● ", theme.done),
             Some(false) => ("○ ", theme.muted),
@@ -450,6 +503,39 @@ fn lines(view: &SettingsView, theme: &Theme) -> Vec<Line<'static>> {
             "off".to_string()
         },
         "at their prompt, unwatched: they start again where they were".to_string(),
+    ));
+
+    lines.push(Line::from(""));
+    lines.push(Line::styled("Mouse", bold));
+    let mouse = &config.mouse;
+    lines.push(row(
+        Setting::MouseCapture,
+        Some(mouse.capture),
+        on_off(mouse.capture),
+        "off, your terminal selects as it would without crystal".to_string(),
+    ));
+    lines.push(row(
+        Setting::CopyOnSelect,
+        Some(mouse.copy_on_select),
+        on_off(mouse.copy_on_select),
+        "as you let go; off, it waits in copy mode for y".to_string(),
+    ));
+    let noun = if mouse.scroll_lines == 1 {
+        "line"
+    } else {
+        "lines"
+    };
+    lines.push(row(
+        Setting::ScrollLines,
+        None,
+        format!("{} {noun}", mouse.scroll_lines),
+        "a notch of the wheel, through a pane's history: ←/→".to_string(),
+    ));
+    lines.push(row(
+        Setting::Scrollbars,
+        Some(mouse.scrollbars),
+        on_off(mouse.scrollbars),
+        "beside each pane, a column of its own: drag one to scroll".to_string(),
     ));
 
     lines.push(Line::from(""));
@@ -581,6 +667,30 @@ mod tests {
         press(&mut view, KeyCode::Down);
         assert_eq!(
             press(&mut view, KeyCode::Char(' ')),
+            Outcome::Change(Change::MouseCapture(false))
+        );
+        press(&mut view, KeyCode::Down);
+        assert_eq!(
+            press(&mut view, KeyCode::Char(' ')),
+            Outcome::Change(Change::CopyOnSelect(false))
+        );
+        press(&mut view, KeyCode::Down);
+        assert_eq!(
+            press(&mut view, KeyCode::Right),
+            Outcome::Change(Change::ScrollLines(5))
+        );
+        assert_eq!(
+            press(&mut view, KeyCode::Left),
+            Outcome::Change(Change::ScrollLines(2))
+        );
+        press(&mut view, KeyCode::Down);
+        assert_eq!(
+            press(&mut view, KeyCode::Char(' ')),
+            Outcome::Change(Change::Scrollbars(false))
+        );
+        press(&mut view, KeyCode::Down);
+        assert_eq!(
+            press(&mut view, KeyCode::Char(' ')),
             Outcome::Change(Change::Distill(false))
         );
         // The bar stops at the last.
@@ -603,6 +713,29 @@ mod tests {
         assert_eq!(wait_text(0), "at once");
         assert_eq!(wait_text(120), "2m");
         assert_eq!(wait_text(45), "45s");
+    }
+
+    #[test]
+    fn the_wheels_lines_go_through_their_steps_and_round() {
+        assert_eq!(next_lines(3, true), 5);
+        assert_eq!(next_lines(10, true), 1);
+        assert_eq!(next_lines(1, false), 10);
+        assert_eq!(next_lines(4, false), 3);
+        assert_eq!(next_lines(40, true), 1);
+        assert_eq!(Change::ScrollLines(5).keys(), ["mouse", "scroll_lines"]);
+        assert_eq!(Change::ScrollLines(5).value().as_integer(), Some(5));
+    }
+
+    #[test]
+    fn the_mouse_rows_say_how_it_is_and_dim_without_the_mouse() {
+        let mut config = Config::default();
+        let shown = text(&view_of(config.clone(), None));
+        assert!(shown.contains("take the mouse"), "{shown}");
+        assert!(shown.contains("3 lines"), "{shown}");
+        config.mouse.capture = false;
+        config.mouse.scroll_lines = 1;
+        let shown = text(&view_of(config, None));
+        assert!(shown.contains("1 line "), "{shown}");
     }
 
     #[test]
@@ -649,7 +782,7 @@ mod tests {
         let mut off = Config::default();
         off.memory.embeddings = false;
         let mut view = view_of(off, Some(status()));
-        for _ in 0..7 {
+        for _ in 0..SETTINGS.len() - 1 {
             press(&mut view, KeyCode::Down);
         }
         assert_eq!(press(&mut view, KeyCode::Enter), Outcome::Stay);

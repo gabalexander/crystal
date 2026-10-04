@@ -205,14 +205,29 @@ inline through a scroll region, like Codex. To search that history, or copy from
 [copy mode](#zoom-copy-mode-and-search), and `e` opens it in your editor.
 
 The mouse works too. Click a session in the sidebar to select it, or click a pane to type into it. The wheel
-moves the selection over the sidebar, and scrolls a pane through its history. A right click opens a menu of
-what you can do with what it's on: a session, a worktree or a project in the sidebar, a tab, or a pane. Each
-item is a key from the table above, shown beside it, and does just what that key would there; choose one with
-a click, `Enter`, or its key, and `Esc` or a click elsewhere closes the menu. Drag across a pane to select
-text: it goes to your clipboard as you let go, and stays marked until you click or type. A program that asks
-for the mouse itself, like `vim` with `set mouse=a` or `htop`, gets the clicks, drags and the wheel in its pane
-while that pane has the keyboard; there, your terminal's own selection still works with a key held: `Shift` in
-most terminals, `Option` in iTerm2 and Terminal on macOS.
+moves the selection over the sidebar, and scrolls a pane through its history, three lines a notch. A right click
+opens a menu of what you can do with what it's on: a session, a worktree or a project in the sidebar, a tab, or
+a pane. Each item is a key from the table above, shown beside it, and does just what that key would there;
+choose one with a click, `Enter`, or its key, and `Esc` or a click elsewhere closes the menu. Drag across a pane
+to select text: it goes to your clipboard as you let go, and stays marked until you click or type. A
+double-click selects a word, where a path is one word and a blank, a comma, a quote, a bracket or a colon ends
+one, and a triple-click the whole line, across the rows it wrapped onto; drag on from either and it takes in
+whole words, or lines. Drag past the top or bottom of a pane and its history scrolls under the selection, faster
+the further past, for as long as you hold it there; the wheel scrolls it too. A program that asks for the mouse
+itself, like `vim` with `set mouse=a` or `htop`, gets the clicks, drags and the wheel in its pane while that pane
+has the keyboard; there, your terminal's own selection still works with a key held: `Shift` in most terminals,
+`Option` in iTerm2 and Terminal on macOS.
+
+Beside each pane's screen, in a column of its own, a scrollbar shows where in its history the pane is, once it
+has some: drag its thumb to scroll, or click the track and the thumb jumps there. The wheel over it scrolls the
+pane too.
+
+`[mouse]` in the [settings](#settings) changes all this. `copy_on_select = false` keeps what you select from
+your clipboard as you let go: the pane goes into [copy mode](#zoom-copy-mode-and-search) with it still selected,
+where `y` copies it, the keys change it first, and `Esc` drops it, and the keyboard goes back to where it was
+after. `scroll_lines` is how far a notch of the wheel scrolls, and `scrollbars = false` gives the scrollbar's
+column back to the pane. `capture = false` leaves the mouse to your terminal altogether: its own selection
+works with no key held, but nothing in crystal answers a click, and no program in a pane gets one either.
 
 `Ctrl`+click opens a link in a pane, whoever has the mouse there: a URL written out in the text (`http://`,
 `https://` or `file://`), whole across the rows it wrapped onto, or a hyperlink a program wrote (OSC 8), which
@@ -2169,6 +2184,7 @@ file and change. A setting crystal doesn't know is an error that names it, so a 
 | `[[project]]` | | a project's [run and open commands](#projects), by its main worktree's `path`, in place of its own file's |
 | `[keys]` | | the TUI's keys, by command, its prefix and the key back to the sidebar: [keys and commands](#keys-and-commands) |
 | `[sidebar]` | | the sidebar's `width`, whether it starts `folded`, what folding keeps, and whether what needs you is pinned: [the sidebar](#the-sidebar) |
+| `[mouse]` | | `capture`, whether the TUI takes the mouse from your terminal (`true`); `copy_on_select`, whether a selection is copied as you let go or waits in copy mode for `y` (`true`); `scroll_lines`, how far a notch of the wheel scrolls a pane, up to 100 (`3`); `scrollbars`, a scrollbar beside each pane (`true`): [the mouse](#usage) |
 | `[update]` | | `check`, whether the TUI looks once a day for a [newer crystal](#updating) (`true`) |
 
 `notify_command` is for telling you some other way, like a message to your phone. It runs with
@@ -2189,7 +2205,7 @@ background task's run starts, `[handoff]` each time a note is written, `[session
 each time one starts, `[[project]]` each time a project's commands run,
 `name_from_prompt` each time it names a session, `resume_reported_agents` as it starts sessions again and
 `scrollback_lines` as each session starts, so a change counts straight away (a session already running keeps
-what it had); the TUI reads `new_session`, `theme`, `[colors]`, `scrollback_lines`, `[plugins]`, `[update]`, the profiles and
+what it had); the TUI reads `new_session`, `theme`, `[colors]`, `scrollback_lines`, `[plugins]`, `[update]`, `[mouse]`, the profiles and
 the flows when it starts, again when you save a profile or switch a plugin, and every half a second while the
 settings view is open.
 
@@ -2260,11 +2276,12 @@ all, whatever the theme or `[colors]` say.
 #### The settings view
 
 `,` in the sidebar opens the settings you'd otherwise change in the file: notifications and when they come,
-sounds, the theme, how long an agent may sit [idle](#archiving-and-idle-agents), and how memory learns
-([the distiller](#the-distiller)) and searches ([by meaning](#search-by-meaning)). `space` changes the one the
-bar is on, and `←/→` go through the [themes](#themes), forward and back (the row says which of the twenty it's
-on), the waits before a notification, and the times an agent may sit idle: off, 15 minutes, 30, an hour, two or
-eight. Each change is written to the file at once,
+sounds, the theme, how long an agent may sit [idle](#archiving-and-idle-agents), [the mouse](#usage), and how
+memory learns ([the distiller](#the-distiller)) and searches ([by meaning](#search-by-meaning)). `space` changes
+the one the bar is on, and `←/→` go through the [themes](#themes), forward and back (the row says which of the
+twenty it's on), the waits before a notification, the times an agent may sit idle: off, 15 minutes, 30, an
+hour, two or eight, and how far a notch of the wheel scrolls: 1, 2, 3, 5 or 10 lines. Each change is written to
+the file at once,
 keeping the rest of it as you wrote it, comments and all, and counts straight away: the TUI repaints in a new
 theme, and the daemon reads the rest as it goes.
 
