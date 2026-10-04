@@ -110,6 +110,9 @@ pub struct Config {
     pub appearance: AppearanceSettings,
     /// What the mouse does in the TUI: `[mouse]` in the file.
     pub mouse: MouseSettings,
+    /// What programs in sessions may do with the user's clipboard:
+    /// `[clipboard]` in the file.
+    pub clipboard: ClipboardSettings,
 }
 
 /// The shell a new terminal runs, and where the TUI starts one when
@@ -483,6 +486,26 @@ impl Default for MouseSettings {
     }
 }
 
+/// What programs in sessions may do with the user's clipboard.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ClipboardSettings {
+    /// Whether what a program in a session copies goes to the clipboard,
+    /// as it would in a terminal of its own: the copy it asks its terminal
+    /// for (OSC 52), as Claude Code, vim and tmux do, which the TUI's pane
+    /// or `crystal attach` showing the session passes on. A program never
+    /// reads the clipboard, whatever this says.
+    pub allow_programs: bool,
+}
+
+impl Default for ClipboardSettings {
+    fn default() -> ClipboardSettings {
+        ClipboardSettings {
+            allow_programs: true,
+        }
+    }
+}
+
 /// What a folded sidebar keeps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -802,6 +825,7 @@ impl Default for Config {
             tab_bar: TabBarSettings::default(),
             appearance: AppearanceSettings::default(),
             mouse: MouseSettings::default(),
+            clipboard: ClipboardSettings::default(),
         }
     }
 }
@@ -1558,6 +1582,18 @@ back_to = "build"
     }
 
     #[test]
+    fn programs_copy_to_the_clipboard_unless_the_config_says_not_to() {
+        assert!(Config::default().clipboard.allow_programs);
+        let config = parse("[clipboard]\nallow_programs = false").unwrap();
+        assert!(!config.clipboard.allow_programs);
+        let unknown = parse("[clipboard]\nallow_reading = true").unwrap_err();
+        assert!(
+            format!("{unknown:#}").contains("allow_reading"),
+            "{unknown:#}"
+        );
+    }
+
+    #[test]
     fn the_mouse_settings_are_read_and_checked() {
         let mouse = parse("[mouse]\ncapture = false\nscroll_lines = 1")
             .unwrap()
@@ -1863,6 +1899,9 @@ back_to = "build"
                 copy_on_select: false,
                 scroll_lines: 5,
                 scrollbars: false,
+            },
+            clipboard: ClipboardSettings {
+                allow_programs: false,
             },
         };
         assert_eq!(parse(&config.to_toml()).unwrap(), config);

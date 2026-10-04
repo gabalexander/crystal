@@ -720,6 +720,75 @@ fn the_tui_rings_your_terminal_for_a_bell_in_a_pane_or_out_of_sight() {
     tui.hides("♪");
 }
 
+/// A script that says it's waiting, then copies `text` with OSC 52 once
+/// the file `file` is there, as Claude Code, vim or tmux would, and says
+/// it's done.
+fn copies_when(file: &str, text: &str) -> String {
+    format!(
+        "echo waiting; while [ ! -f {file} ]; do sleep 0.05; done; \
+         printf '\\033]52;c;{}\\007'; echo done copying; sleep 30",
+        base64(text.as_bytes())
+    )
+}
+
+#[test]
+fn what_a_program_in_a_pane_copies_goes_on_the_clipboard_but_not_out_of_sight() {
+    let crystal = Crystal::new();
+    let dir = crystal.dir.path();
+    let shown = copies_when("copy-shown", "from the pane");
+    crystal.ok(&["new", "-n", "shown", "sh", "-c", &shown]);
+    let hidden = copies_when("copy-hidden", "from out of sight");
+    crystal.ok(&["new", "-n", "hidden", "sh", "-c", &hidden]);
+    let tui = tui_over_ssh(&crystal);
+    tui.shows("waiting");
+
+    // The session in the pane copies: it goes on the clipboard, here the
+    // terminal's, asked with OSC 52 since the TUI runs as over ssh.
+    std::fs::write(dir.join("copy-shown"), "").unwrap();
+    tui.copies("from the pane");
+    tui.shows("copied 1 line");
+
+    // One out of sight copies: nobody saw it, so it's dropped, and said.
+    std::fs::write(dir.join("copy-hidden"), "").unwrap();
+    tui.shows("hidden copied out of sight: not put on your clipboard");
+    let events = crystal.ok(&["events", "-k", "session.copy_dropped"]);
+    assert!(
+        events.contains("hidden") && !events.contains("shown"),
+        "{events}"
+    );
+    let written = String::from_utf8_lossy(&tui.written.lock().unwrap()).into_owned();
+    assert!(!written.contains(&base64(b"from out of sight")));
+}
+
+#[test]
+fn attach_puts_what_its_program_copies_on_the_clipboard_unless_told_not_to() {
+    let crystal = Crystal::new();
+    let dir = crystal.dir.path();
+    let script = copies_when("copy-now", "from attach");
+    crystal.ok(&["new", "-n", "copier", "sh", "-c", &script]);
+    let over_ssh = [("SSH_TTY", "/dev/ttys999")];
+    let terminal = crystal.attach_with_env(&["attach", "copier"], &over_ssh);
+    terminal.shows("waiting");
+    std::fs::write(dir.join("copy-now"), "").unwrap();
+    terminal.copies("from attach");
+    drop(terminal);
+
+    // With programs kept off the clipboard, an attach asks for nothing.
+    crystal.configure(
+        "notify = false\nname_from_prompt = false\n\n[plugins]\nmemory = false\n\n\
+         [sound]\nenabled = false\n\n[clipboard]\nallow_programs = false\n",
+    );
+    let script = copies_when("copy-again", "kept off");
+    crystal.ok(&["new", "-n", "kept", "sh", "-c", &script]);
+    let terminal = crystal.attach_with_env(&["attach", "kept"], &over_ssh);
+    terminal.shows("waiting");
+    std::fs::write(dir.join("copy-again"), "").unwrap();
+    terminal.shows("done copying");
+    thread::sleep(Duration::from_millis(300));
+    let written = String::from_utf8_lossy(&terminal.written.lock().unwrap()).into_owned();
+    assert!(!written.contains("\x1b]52;"), "{written:?}");
+}
+
 #[test]
 fn attach_asks_your_terminal_for_what_the_program_asked_and_gives_it_back() {
     let crystal = Crystal::new();
@@ -5385,6 +5454,25 @@ fn the_wheel_over_a_pane_scrolls_it_back_through_its_history() {
 }
 
 #[test]
+fn the_wheel_over_a_pager_sends_it_the_arrow_keys() {
+    let crystal = Crystal::new();
+    // Goes to the alternate screen, as less does, without asking for the
+    // mouse, then writes down the first keys it hears: three arrows, three
+    // bytes each.
+    let script = r"stty raw -echo; printf '\033[?1049hpaging'; echo > listening;
+        dd bs=1 count=9 2>/dev/null > keys; echo >> keys; sleep 30";
+    crystal.ok(&["new", "-n", "pager", "sh", "-c", script]);
+    written(&crystal.dir.path().join("listening"));
+
+    let mut tui = crystal.tui();
+    tui.shows("paging");
+    // Over the pane, the keyboard still in the sidebar.
+    tui.type_keys(&wheel_up(50, 10));
+    let keys = written(&crystal.dir.path().join("keys"));
+    assert_eq!(keys, "\x1b[A\x1b[A\x1b[A\n");
+}
+
+#[test]
 fn a_program_that_asks_for_the_mouse_gets_clicks_where_it_drew() {
     let crystal = Crystal::new();
     // Turns on mouse reporting the SGR way, then writes down the first
@@ -9863,10 +9951,11 @@ fn the_settings_view_changes_the_config_and_follows_it_live() {
     crystal.configure(
         "notify = true\ntheme = \"light\"\n\n[memory]\ndistill = false\nembeddings = false\n",
     );
-    // Memory's rows are ten down from the theme, past the appearance's,
-    // the tab bar's, the spacing of restarts and the mouse's, which the
-    // view scrolls to on a screen too short for all of them.
-    tui.type_keys("jjjjjjjjjj");
+    // Memory's rows are eleven down from the theme, past the appearance's,
+    // the tab bar's, the spacing of restarts, the mouse's and the
+    // clipboard's, which the view scrolls to on a screen too short for all
+    // of them.
+    tui.type_keys("jjjjjjjjjjj");
     tui.shows("○ distill closed tasks");
     tui.shows("not downloaded (2449 MB)");
 

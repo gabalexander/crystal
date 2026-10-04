@@ -6,9 +6,13 @@
 //! (presses and releases, drags too, or every move) and how they're to be
 //! written (the old one-byte-per-number way, its UTF-8 version, or the SGR
 //! way that most programs ask for today).
+//!
+//! A program on the alternate screen that didn't ask, like `less`, gets
+//! the wheel as the arrow keys instead, as xterm's alternate scroll has it.
 
+use crate::keys;
 use crate::vt::{self, mode};
-use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
 
 /// Which mouse events a program asked to hear about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,6 +111,23 @@ pub fn encode(
             Some(text.into_bytes())
         }
     }
+}
+
+/// The keys a notch of the wheel sends the program on `screen` when it's
+/// on the alternate screen and didn't ask for the mouse, like `less`, a git
+/// pager or `man`: there's no history there to scroll, so the notch is
+/// `lines` presses of Up, or of Down, as xterm's alternate scroll mode
+/// (DECSET 1007) has it. `None` on the main screen, whose history the wheel
+/// scrolls; for a program that asked for the mouse, which hears the wheel
+/// itself; and for one that turned alternate scroll off.
+pub fn alternate_scroll(screen: &vt::Screen, up: bool, lines: u16) -> Option<Vec<u8>> {
+    let wanted = screen.alternate_screen() && screen.mode(mode::ALTERNATE_SCROLL);
+    if !wanted || Protocol::of(screen).is_some() {
+        return None;
+    }
+    let arrow = if up { KeyCode::Up } else { KeyCode::Down };
+    let press = keys::encode_for(&KeyEvent::new(arrow, KeyModifiers::NONE), screen)?;
+    Some(press.repeat(usize::from(lines)))
 }
 
 /// What the two older ways of writing say for a release, since they don't
@@ -288,6 +309,29 @@ mod tests {
         assert!(!heard(LEFT_DRAG, Mode::PressRelease));
         assert!(heard(LEFT_DRAG, Mode::ButtonMotion));
         assert!(!heard(MouseEventKind::Moved, Mode::ButtonMotion));
+    }
+
+    #[test]
+    fn the_wheel_is_arrows_on_the_alternate_screen_for_a_program_without_the_mouse() {
+        let arrows = |output: &[u8], up| {
+            let mut screen = vt::Screen::new(2, 10);
+            screen.process(output);
+            alternate_scroll(&screen, up, 3).map(|keys| String::from_utf8(keys).unwrap())
+        };
+        // On the main screen, the wheel scrolls the history.
+        assert_eq!(arrows(b"", true), None);
+        assert_eq!(arrows(b"\x1b[?1049h\x1b[?1049l", true), None);
+        // A pager on the alternate screen is moved with the arrows, the way
+        // it asked them to be written.
+        let pager = b"\x1b[?1049h";
+        assert_eq!(arrows(pager, true).unwrap(), "\x1b[A".repeat(3));
+        assert_eq!(arrows(pager, false).unwrap(), "\x1b[B".repeat(3));
+        let application = b"\x1b[?1049h\x1b[?1h";
+        assert_eq!(arrows(application, true).unwrap(), "\x1bOA".repeat(3));
+        // A program that asked for the mouse hears the wheel itself, and
+        // one that turned alternate scroll off doesn't want the arrows.
+        assert_eq!(arrows(b"\x1b[?1049h\x1b[?1000h", true), None);
+        assert_eq!(arrows(b"\x1b[?1049h\x1b[?1007l", true), None);
     }
 
     #[test]

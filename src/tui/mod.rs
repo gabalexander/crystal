@@ -1172,12 +1172,18 @@ impl Tui {
             }
             Event::Notice(notice) => self.app.notify(notice),
             Event::Output { pane, bytes } => {
-                let rang = self.pane_with_id(pane).is_some_and(|pane| {
-                    pane.screen.process(&bytes);
-                    pane.screen.take_bells() > 0
-                });
+                let Some(pane) = self.pane_with_id(pane) else {
+                    return;
+                };
+                pane.screen.process(&bytes);
+                let rang = pane.screen.take_bells() > 0;
+                let copied = pane.screen.take_copied();
+                let session = pane.session_id.clone();
                 if rang {
                     let _ = self.ringer.ring();
+                }
+                if let Some(text) = copied {
+                    self.copy_for_program(&session, &text);
                 }
             }
             // The next list says whether the session has ended, or runs on
@@ -1995,9 +2001,20 @@ impl Tui {
             }
             Action::ScrollBack(slot) | Action::ScrollForward(slot) => {
                 let back = matches!(action, Action::ScrollBack(_));
-                let lines = usize::from(self.config.mouse.scroll_lines);
+                let lines = self.config.mouse.scroll_lines;
                 let selecting = self.app.dragging() == Some(slot);
+                let typed_into = self.app.can_type_into(slot);
                 if let Some(pane) = self.pane_in(slot) {
+                    // A program on the alternate screen keeps no history to
+                    // scroll: a pager is moved with the arrow keys, unless
+                    // copy mode or a selection has the pane.
+                    let arrows = mouse::alternate_scroll(&pane.screen, back, lines)
+                        .filter(|_| typed_into && !selecting && pane.copy.is_none());
+                    if let Some(arrows) = arrows {
+                        pane.send_keys(&arrows);
+                        return Ok(());
+                    }
+                    let lines = usize::from(lines);
                     if back {
                         pane.scroll_back(lines);
                     } else {
@@ -2138,6 +2155,25 @@ impl Tui {
     }
 
     /// Puts `text` on the user's clipboard, and says how much went.
+    /// Puts on the clipboard what the program in a pane asked its terminal
+    /// to copy (OSC 52), as a terminal of its own would, unless the settings
+    /// say not to. A background task's pane shows what crystal draws of
+    /// Claude's work rather than a program's own output, and copies
+    /// nothing.
+    fn copy_for_program(&mut self, session_id: &str, text: &str) {
+        if !self.config.clipboard.allow_programs {
+            return;
+        }
+        let session = self.app.sessions().iter().find(|s| s.id == session_id);
+        let task = session.and_then(|session| session.task.as_ref());
+        if task.is_some_and(|task| task.background) {
+            return;
+        }
+        if let Err(err) = self.copy_to_clipboard(text) {
+            self.app.notify(format!("{err:#}"));
+        }
+    }
+
     fn copy_to_clipboard(&mut self, text: &str) -> Result<()> {
         clipboard::copy(text).context("couldn't copy")?;
         let lines = text.lines().count().max(1);
