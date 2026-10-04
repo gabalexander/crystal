@@ -1772,6 +1772,14 @@ impl Tui {
                     Event::PullRequests { project, found }
                 });
             }
+            Action::FindPullRequests(projects) => {
+                for project in projects {
+                    self.read_in_background(move || {
+                        let found = list_pull_requests(&project);
+                        Event::PullRequests { project, found }
+                    });
+                }
+            }
             Action::Comment {
                 project,
                 topic,

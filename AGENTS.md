@@ -144,8 +144,10 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   - `command_line.rs`: reads the line typed at `new session:` (the panel's `Ctrl+E`) into the command to run
   - `profiles.rs`: the profiles view (`P`): the list, the form that edits one, its keys and drawing; the
     event loop does the writing
-  - `search.rs`: `/`'s matching, over the sessions of every tab: a session's name, project, branch or
-    command, letters in order
+  - `search.rs`: `/`'s matching, letters in order (a directory or a goal only whole): a session of any
+    tab by its name, project, branch, command, agent, tab or flow run; a worktree with no sessions or a
+    project nothing runs in; an open pull request; the status Tab keeps to; and where what it finds goes
+    under its project in the sidebar's rows
   - `issues.rs`: the issues view (`i`): its state and keys, kept apart from I/O, commenting on an issue and
     changing its title and text, and its drawing
   - `pull_requests.rs`: the pull requests view (`O`): its state and keys, kept apart from I/O, reading one with
