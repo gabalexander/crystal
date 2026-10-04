@@ -8,6 +8,7 @@
 //! session list. The loop takes each event, updates the state, and draws.
 
 mod app;
+pub(crate) mod appearance;
 mod archived_view;
 mod away;
 mod backlog_view;
@@ -39,13 +40,16 @@ mod preview;
 mod profiles;
 mod pull_requests;
 mod reply;
+mod restarted;
 mod review;
 pub(crate) mod screen_widget;
+mod scrollbar;
 mod search;
 mod settings_view;
 pub(crate) mod sidebar;
 pub(crate) mod split_tree;
 mod status;
+pub(crate) mod status_bar;
 mod switcher;
 mod tabs;
 mod text_area;
@@ -54,6 +58,7 @@ pub(crate) mod theme;
 mod timeline;
 mod tree_browser;
 mod ui;
+pub(crate) mod window;
 
 use crate::bell::Ringer;
 use crate::config::{self, Config};
@@ -76,6 +81,7 @@ use crate::{catalog, keys, links, socket, typing, update};
 use crate::{client, clipboard, drive, env, event_log, events, git};
 use anyhow::{Context as _, Result, bail};
 use app::{Action, App, Focus, Hit, Place, PluginKey, PluginPane, Slot};
+use appearance::Appearance;
 use backlog_view::BacklogChange;
 use crossterm::event::{
     Event as TerminalEvent, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
@@ -111,6 +117,15 @@ const SPIN_EVERY: Duration = Duration::from_millis(150);
 /// How often its forge is asked again about a project's pull requests. A
 /// project seen for the first time is asked about straight away.
 const PULL_REQUESTS_EVERY: Duration = Duration::from_secs(60);
+
+/// How often its forge is asked again about a project's issues, for the
+/// tab bar's count: they change less, and the issues view asks for itself.
+const ISSUES_EVERY: Duration = Duration::from_secs(300);
+
+/// The least time between two fetches of a worktree's remotes the branch
+/// switcher starts on its own, so opening and closing it never hammers a
+/// remote. Ctrl+R fetches whenever it's asked.
+const FETCH_EVERY: Duration = Duration::from_secs(60);
 
 /// How long find in files waits after a key before it searches: the time
 /// between keys of someone typing a word, so a search runs once it's typed.
@@ -253,6 +268,12 @@ pub enum Event {
         dir: PathBuf,
         listed: Result<switcher::Listed, String>,
     },
+    /// The remotes of the worktree at `dir` have been fetched, or why they
+    /// couldn't.
+    BranchesFetched {
+        dir: PathBuf,
+        fetched: Result<(), String>,
+    },
     /// What switching the worktree at `dir` to another branch came to.
     BranchSwitched {
         dir: PathBuf,
@@ -303,6 +324,10 @@ pub enum Event {
     },
     /// What the event log gained while the user was away.
     Away(Result<away::Tally, String>),
+    /// The system's appearance, light or dark, has changed.
+    Appearance(Appearance),
+    /// What each thing at the tab bar's right shows now.
+    Status(Vec<String>),
 }
 
 /// Carries out a layout command with no TUI open, on the tabs as the TUIs
@@ -325,8 +350,23 @@ pub fn run(socket: &Path) -> Result<()> {
     // Asking for the list starts the daemon if it isn't running.
     let sessions = list_sessions(socket, true)?;
 
+    // The terminal is asked about its background, where it's asked, before
+    // anything else reads what it sends.
+    let appearance = config
+        .appearance
+        .auto_switch
+        .then(appearance::at_start)
+        .flatten();
     let (sender, events) = mpsc::channel();
     spawn_input_reader(sender.clone());
+    let follow_appearance = Arc::new(AtomicBool::new(config.appearance.auto_switch));
+    appearance::follow(sender.clone(), follow_appearance.clone(), appearance);
+    let status = status_bar::watch(
+        &config.tab_bar.right,
+        std::env::current_dir().unwrap_or_default(),
+        socket,
+        sender.clone(),
+    );
     let layout = layout_link::Link::open(socket, sender.clone());
     let count_backlog = Arc::new(AtomicBool::new(crate::backlog::enabled(&config)));
     let poll_flows = Arc::new(AtomicBool::new(crate::flows::enabled(&config)));
@@ -341,7 +381,7 @@ pub fn run(socket: &Path) -> Result<()> {
         },
     );
     let projects = Arc::new(Mutex::new(Vec::new()));
-    spawn_pull_request_poller(projects.clone(), sender.clone());
+    spawn_forge_poller(projects.clone(), sender.clone());
     let worktree_projects = Arc::new(Mutex::new(Vec::new()));
     let list_worktrees_now = Arc::new(AtomicBool::new(false));
     spawn_worktree_lister(
@@ -369,11 +409,18 @@ pub fn run(socket: &Path) -> Result<()> {
         list_worktrees_now,
         stat_worktrees,
         stats_now,
-        theme: Theme::from_config(&config),
+        theme: Theme::from_config(&config, appearance),
+        appearance,
+        follow_appearance,
+        status,
+        title: None,
+        hostname: window::hostname(),
         started: Instant::now(),
         sessions_asked: Instant::now(),
         searches: Arc::new(AtomicU64::new(0)),
         link_clicked: false,
+        clicks: pane::Clicks::default(),
+        edge: None,
         kept_tabs: tabs::Tabs::default(),
         kept_sidebar: app::Shape::default(),
         kept_folded: BTreeSet::new(),
@@ -387,6 +434,8 @@ pub fn run(socket: &Path) -> Result<()> {
         presence: away::Presence::new(events::now_ms()),
         layout,
         ringer: Ringer::default(),
+        fetched_remotes: HashMap::new(),
+        fetching_remotes: HashSet::new(),
     };
     tui.app.set_agents(catalog::installed());
     let server = socket::server_of(socket).filter(|server| server != socket::DEFAULT);
@@ -394,6 +443,7 @@ pub fn run(socket: &Path) -> Result<()> {
     tui.app.set_launch_settings(&config);
     tui.app.set_features(&config);
     tui.app.set_interface(&config);
+    tui.app.set_start_dir(start_dir(&config));
     tui.app.set_plugin_keys(plugin_keys(&config));
     let sidebar = tui
         .ui(db::SIDEBAR)
@@ -433,29 +483,32 @@ pub fn run(socket: &Path) -> Result<()> {
 struct TerminalModes;
 
 impl TerminalModes {
-    fn on() -> Result<TerminalModes> {
+    /// With `mouse` off, the terminal keeps the mouse: `[mouse] capture`.
+    fn on(mouse: bool) -> Result<TerminalModes> {
         // A panic on any thread turns them off before the panic is shown.
         let shown_before = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
             modes_off();
             shown_before(info);
         }));
-        // Clicks and the wheel (1000), drags (1002), the mouse just moving
-        // (1003), to underline the link under it while Ctrl is held, all
-        // written the SGR way (1006). A move that changes nothing isn't
-        // drawn. Then bracketed paste (2004): a paste comes whole, its
-        // lines kept, not as typed keys. Then, pushed on the terminal's
+        // The mouse, unless the config leaves it to the terminal: see
+        // `MOUSE_ON`. A move that changes nothing isn't drawn. Then
+        // bracketed paste (2004): a paste comes whole, its lines kept, not
+        // as typed keys. Then, pushed on the terminal's
         // stack, the Kitty keyboard protocol's flags to tell apart keys the
         // old way can't, like Esc or Shift+Enter, and to say which key a
         // shifted one is (1 and 4): a program in a pane that asked for the
         // protocol gets them. A terminal without it ignores the request.
-        // Last, focus (1004): the terminal says when it gains and loses it,
+        // Then focus (1004): the terminal says when it gains and loses it,
         // for "while you were away", and so that layout commands from the
-        // command line go to the TUI the user is at.
+        // command line go to the TUI the user is at. Last, the terminal's
+        // title is saved on its stack, for the TUI's own to go over.
         let mut out = std::io::stdout();
-        out.write_all(
-            b"\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h\x1b[?2004h\x1b[>5u\x1b[?1004h",
-        )?;
+        if mouse {
+            out.write_all(MOUSE_ON)?;
+        }
+        out.write_all(b"\x1b[?2004h\x1b[>5u\x1b[?1004h")?;
+        out.write_all(window::SAVE)?;
         out.flush()?;
         Ok(TerminalModes)
     }
@@ -469,9 +522,34 @@ impl Drop for TerminalModes {
 
 fn modes_off() {
     let mut out = std::io::stdout();
-    let _ =
-        out.write_all(b"\x1b[?1004l\x1b[<u\x1b[?2004l\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l");
+    let _ = out.write_all(window::RESTORE);
+    let _ = out.write_all(b"\x1b[?1004l\x1b[<u\x1b[?2004l");
+    let _ = out.write_all(MOUSE_OFF);
     let _ = out.flush();
+}
+
+/// Clicks and the wheel (1000), drags (1002), the mouse just moving
+/// (1003), to underline the link under it while Ctrl is held, all written
+/// the SGR way (1006).
+const MOUSE_ON: &[u8] = b"\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h";
+const MOUSE_OFF: &[u8] = b"\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l";
+
+/// Has the terminal send the TUI the mouse, or keep it for its own
+/// selection: `[mouse] capture`.
+fn capture_mouse(on: bool) {
+    let mut out = std::io::stdout();
+    let _ = out.write_all(if on { MOUSE_ON } else { MOUSE_OFF });
+    let _ = out.flush();
+}
+
+/// A drag selecting in the pane at `slot`, held `past` rows beyond the top
+/// of its screen (less than 0) or its bottom: its history scrolls again
+/// at `next`.
+#[derive(Debug, Clone, Copy)]
+struct Edge {
+    slot: Slot,
+    past: i32,
+    next: Instant,
 }
 
 struct Tui {
@@ -519,6 +597,20 @@ struct Tui {
     /// The worktrees for that thread to count again straight away.
     stats_now: Arc<Mutex<HashSet<PathBuf>>>,
     theme: Theme,
+    /// The system's appearance, light or dark, as it was last told, which
+    /// the theme follows when the settings say: see [`appearance`].
+    appearance: Option<Appearance>,
+    /// Whether the thread that asks the system about its appearance asks:
+    /// `[appearance] auto_switch` is on.
+    follow_appearance: Arc<AtomicBool>,
+    /// The threads working out what the tab bar shows at its right, while
+    /// it shows anything.
+    status: Option<status_bar::Watch>,
+    /// The title last given the terminal, `None` while the TUI has given it
+    /// none.
+    title: Option<String>,
+    /// This machine's name, for the title.
+    hostname: String,
     /// When the TUI started: the working mark turns with the time since.
     started: Instant,
     /// When the daemon was asked for the sessions the TUI shows: a list
@@ -536,6 +628,11 @@ struct Tui {
     /// A Ctrl+click opened a link: the button coming up is that click's,
     /// not the program's under it.
     link_clicked: bool,
+    /// The clicks on panes' screens, counted for double- and triple-clicks.
+    clicks: pane::Clicks,
+    /// A drag selecting in a pane, held past the top or bottom of its
+    /// screen, which scrolls its history on until it comes back or lets go.
+    edge: Option<Edge>,
     quitting: bool,
     /// The number the timeline follows the event log under, which goes up
     /// each time it starts or stops following: a thread following under an
@@ -546,6 +643,10 @@ struct Tui {
     /// Passes on to the user's terminal the bells of the sessions in panes,
     /// and of those out of sight the daemon marked as having rung.
     ringer: Ringer,
+    /// When the branch switcher last fetched each worktree's remotes, and
+    /// the worktrees whose fetch is still going: one at a time in each.
+    fetched_remotes: HashMap<PathBuf, Instant>,
+    fetching_remotes: HashSet<PathBuf>,
 }
 
 impl Tui {
@@ -556,7 +657,7 @@ impl Tui {
     ) -> Result<()> {
         // The mouse and pastes are the TUI's for as long as `_modes` lives:
         // to the end of this function, however it ends.
-        let _modes = TerminalModes::on()?;
+        let _modes = TerminalModes::on(self.config.mouse.capture)?;
         self.run(terminal, events)
     }
 
@@ -576,6 +677,7 @@ impl Tui {
             while let Ok(event) = events.try_recv() {
                 changed |= self.take(event);
             }
+            changed |= self.scroll_at_edge();
             self.read_topic();
             self.keep_tabs();
             self.count_worktrees();
@@ -612,7 +714,61 @@ impl Tui {
         };
         let overlay = self.overlay.as_ref();
         terminal.draw(|frame| ui::draw(frame, &self.app, &self.panes, overlay, &look))?;
+        self.give_title();
         Ok(())
+    }
+
+    /// Gives the terminal the title `crystal title set` gave, or the one
+    /// the settings make, when it doesn't have it already. With neither,
+    /// a title the TUI gave it is taken back.
+    fn give_title(&mut self) {
+        let template = &self.config.window.title;
+        let title = match self.app.title_override() {
+            Some(text) => text.to_string(),
+            None if template.is_empty() => {
+                if self.title.take().is_some() {
+                    // The terminal's own, and saved again for the end.
+                    self.write_out(&[window::RESTORE, window::SAVE].concat());
+                }
+                return;
+            }
+            None => window::fill(template, &self.title_values()),
+        };
+        if self.title.as_ref() != Some(&title) {
+            self.write_out(&window::set(&title));
+            self.title = Some(title);
+        }
+    }
+
+    /// What the title's tokens are filled with.
+    fn title_values(&self) -> window::Values {
+        let selected = self.app.selected();
+        let worktree = selected.and_then(|session| session.worktree.as_ref());
+        let tab = self.app.tabs().current();
+        let number = self.app.tabs().current_index() + 1;
+        let title = selected.and_then(|session| {
+            let pane = self.panes.iter().find(|pane| pane.session_id == session.id);
+            pane.map(|pane| pane.screen.title())
+        });
+        window::Values {
+            hostname: self.hostname.clone(),
+            session: selected.map_or_else(String::new, |session| session.name.clone()),
+            project: worktree.map_or_else(String::new, |worktree| worktree.project.clone()),
+            branch: worktree
+                .and_then(|worktree| worktree.branch.clone())
+                .unwrap_or_default(),
+            tab: match tab.name.is_empty() {
+                true => number.to_string(),
+                false => tab.name.clone(),
+            },
+            title: title.unwrap_or_default(),
+        }
+    }
+
+    /// Writes `bytes` to the terminal, between draws.
+    fn write_out(&self, bytes: &[u8]) {
+        let mut out = std::io::stdout();
+        let _ = out.write_all(bytes).and_then(|()| out.flush());
     }
 
     /// Takes in `event`, and says whether that may have changed what's
@@ -854,8 +1010,8 @@ impl Tui {
         self.list_worktrees_now.store(true, Ordering::Relaxed);
     }
 
-    /// Takes a fresh list of sessions, and tells the pull request poller
-    /// and the worktree lister which projects they're in.
+    /// Takes a fresh list of sessions, and tells the forge poller and the
+    /// worktree lister which projects they're in.
     fn set_sessions(&mut self, sessions: Vec<SessionInfo>) {
         // A session the TUI knew of that has come to be marked as having
         // rung its bell, out of sight, rings the user's terminal.
@@ -918,12 +1074,17 @@ impl Tui {
     }
 
     /// The next event. While an agent works, the wait is cut short in time
-    /// to turn its mark, and there's no event: only a frame to draw.
+    /// to turn its mark, and while a drag is held past the edge of a pane,
+    /// to scroll it again, and there's no event: only a frame to draw.
     fn next_event(&self, events: &Receiver<Event>) -> Result<Option<Event>> {
-        if !self.app.anything_working() {
+        let spin = self.app.anything_working().then_some(SPIN_EVERY);
+        let edge = self
+            .edge
+            .map(|edge| edge.next.saturating_duration_since(Instant::now()));
+        let Some(wait) = spin.into_iter().chain(edge).min() else {
             return Ok(Some(events.recv()?));
-        }
-        match events.recv_timeout(SPIN_EVERY) {
+        };
+        match events.recv_timeout(wait) {
             Ok(event) => Ok(Some(event)),
             Err(RecvTimeoutError::Timeout) => Ok(None),
             Err(RecvTimeoutError::Disconnected) => bail!("the TUI's events stopped"),
@@ -1040,7 +1201,20 @@ impl Tui {
                 }
             }
             Event::PreviewRead { dir, path, read } => self.app.preview_read(&dir, &path, read),
-            Event::BranchesListed { dir, listed } => self.app.branches_listed(&dir, listed),
+            Event::BranchesListed { dir, listed } => {
+                if let Some(action) = self.app.branches_listed(&dir, listed) {
+                    self.carry_out(action);
+                }
+            }
+            Event::BranchesFetched { dir, fetched } => {
+                self.fetching_remotes.remove(&dir);
+                if fetched.is_ok() {
+                    self.fetched_remotes.insert(dir.clone(), Instant::now());
+                }
+                if let Some(action) = self.app.branches_fetched(&dir, fetched) {
+                    self.carry_out(action);
+                }
+            }
             Event::BranchSwitched { dir, outcome } => {
                 if let Some(action) = self.app.branch_switched(&dir, outcome) {
                     self.carry_out(action);
@@ -1085,6 +1259,13 @@ impl Tui {
             Event::Logged { feed, event } if self.following(feed) => self.app.logged(*event),
             // Read for a timeline that has closed since.
             Event::EventsRead { .. } | Event::Logged { .. } => {}
+            Event::Appearance(appearance) => {
+                if Some(appearance) != self.appearance {
+                    self.appearance = Some(appearance);
+                    self.theme = Theme::from_config(&self.config, self.appearance);
+                }
+            }
+            Event::Status(status) => self.app.set_status(status),
             Event::Away(Ok(tally)) => self.app.set_away(&tally),
             Event::Away(Err(reason)) => {
                 self.app
@@ -1180,9 +1361,28 @@ impl Tui {
             hit = ui::border_hit(&areas, &self.app, split, mouse.column, mouse.row);
         } else if let Some(slot) = self.app.dragging() {
             // A selection being dragged is crystal's to the end, and keeps
-            // to the edge of its pane when the mouse leaves it.
+            // to the edge of its pane when the mouse leaves it. Past its
+            // top or bottom, the history scrolls under it, on and on while
+            // the mouse stays there.
             let cell = ui::nearest_cell(&areas, &self.app, slot, mouse.column, mouse.row);
             hit = Hit::Pane { slot, cell };
+            let past = ui::rows_past(&areas, &self.app, slot, mouse.row);
+            self.edge = match mouse.kind {
+                MouseEventKind::Drag(_) if past == 0 => None,
+                MouseEventKind::Drag(_) => Some(Edge {
+                    slot,
+                    past,
+                    next: self.edge.map_or_else(Instant::now, |edge| edge.next),
+                }),
+                MouseEventKind::Down(_) | MouseEventKind::Up(_) => None,
+                _ => self.edge,
+            };
+        } else if let Some(slot) = self.app.holding_thumb() {
+            // So is a scrollbar's thumb, which keeps to its track.
+            hit = match ui::scrollbar_row(&areas, &self.app, slot, mouse.row) {
+                Some(row) => Hit::Scrollbar { slot, row },
+                None => Hit::Elsewhere,
+            };
         } else if self.app.grabbed().is_none() && self.pass_to_program(&mouse, hit) {
             return;
         }
@@ -1213,6 +1413,38 @@ impl Tui {
         let hit = ui::hit(&areas, &self.app, mouse.column, mouse.row);
         let ctrl = mouse.modifiers.contains(KeyModifiers::CONTROL);
         self.app.mouse_moved(hit, ctrl)
+    }
+
+    /// Scrolls the history under a drag held past the edge of its pane's
+    /// screen, when it's time to again. Returns whether that moved the
+    /// view: at the end of the history it stays, and so does the timer
+    /// until the mouse moves again.
+    fn scroll_at_edge(&mut self) -> bool {
+        let Some(edge) = self.edge else {
+            return false;
+        };
+        let now = Instant::now();
+        if now < edge.next {
+            return false;
+        }
+        if self.app.dragging() != Some(edge.slot) {
+            self.edge = None;
+            return false;
+        }
+        self.edge = Some(Edge {
+            next: now + pane::EDGE_SCROLL_EVERY,
+            ..edge
+        });
+        let Some(pane) = self.pane_in(edge.slot) else {
+            return false;
+        };
+        let back = pane.scrolled_back();
+        pane.scroll_past_edge(edge.past);
+        let moved = pane.scrolled_back() != back;
+        if !moved {
+            self.edge = None;
+        }
+        moved
     }
 
     /// Ctrl and a click on a link in a pane opens it, whoever has the
@@ -1483,6 +1715,7 @@ impl Tui {
                     Event::BranchesListed { dir, listed }
                 });
             }
+            Action::FetchBranches { dir, now } => self.fetch_remotes(dir, now),
             Action::SwitchBranch { dir, target, carry } => {
                 // git can take a while, over a commit's hooks say.
                 self.read_in_background(move || {
@@ -1531,8 +1764,19 @@ impl Tui {
             }
             Action::CloseSettings => self.poll_settings.store(false, Ordering::Relaxed),
             Action::ChangeSetting(change) => {
-                let changed = config::set(&config::path(), change.keys(), change.value())
-                    .and_then(|()| Config::load());
+                let path = config::path();
+                let mut changed = config::set(&path, change.keys(), change.value());
+                // A theme picked by hand is the one wanted, whatever the
+                // system's appearance.
+                let stop_following = settings_view::Change::AutoSwitch(false);
+                if let settings_view::Change::Theme(_) = change
+                    && self.config.appearance.auto_switch
+                {
+                    changed = changed.and_then(|()| {
+                        config::set(&path, stop_following.keys(), stop_following.value())
+                    });
+                }
+                let changed = changed.and_then(|()| Config::load());
                 match changed {
                     Ok(config) => {
                         self.config_changed(&config);
@@ -1749,14 +1993,21 @@ impl Tui {
                     pane.page_forward();
                 }
             }
-            Action::ScrollBack(slot) => {
+            Action::ScrollBack(slot) | Action::ScrollForward(slot) => {
+                let back = matches!(action, Action::ScrollBack(_));
+                let lines = usize::from(self.config.mouse.scroll_lines);
+                let selecting = self.app.dragging() == Some(slot);
                 if let Some(pane) = self.pane_in(slot) {
-                    pane.scroll_back();
-                }
-            }
-            Action::ScrollForward(slot) => {
-                if let Some(pane) = self.pane_in(slot) {
-                    pane.scroll_forward();
+                    if back {
+                        pane.scroll_back(lines);
+                    } else {
+                        pane.scroll_forward(lines);
+                    }
+                    // A selection being dragged goes on to what's under the
+                    // mouse now.
+                    if selecting {
+                        pane.follow_drag();
+                    }
                 }
             }
             Action::CopyKey { slot, key } => {
@@ -1785,11 +2036,13 @@ impl Tui {
                 }
             }
             Action::SelectFrom { slot, cell } => {
+                let clicks = self.clicks.click(slot, cell, Instant::now());
                 if let Some(pane) = self.pane_in(slot) {
-                    pane.select_from(cell);
+                    pane.select_from(cell, clicks);
                 }
             }
             Action::SelectTo { slot, cell } => {
+                self.clicks.dragged_to(cell);
                 if let Some(pane) = self.pane_in(slot) {
                     pane.select_to(cell);
                 }
@@ -1800,6 +2053,22 @@ impl Tui {
                     .and_then(|pane| pane.screen.selected_text());
                 if let Some(text) = text {
                     self.copy_to_clipboard(&text)?;
+                }
+            }
+            Action::HoldSelection(slot) => {
+                let held = self.pane_in(slot).is_some_and(Pane::hold_selection);
+                if held {
+                    self.app.hold_selection(slot);
+                }
+            }
+            Action::GrabThumb { slot, row } => {
+                if let Some(pane) = self.pane_in(slot) {
+                    pane.grab_thumb(row);
+                }
+            }
+            Action::DragThumb { slot, row } => {
+                if let Some(pane) = self.pane_in(slot) {
+                    pane.drag_thumb(row);
                 }
             }
             Action::OpenInBrowser { project, topic } => {
@@ -1815,8 +2084,7 @@ impl Tui {
             }
             Action::ListIssues(project) => {
                 self.read_in_background(move || {
-                    let found =
-                        Repo::find(&project).and_then(|repo| Ok((repo.forge, repo.issues()?)));
+                    let found = list_issues(&project);
                     Event::Issues { project, found }
                 });
             }
@@ -1825,6 +2093,14 @@ impl Tui {
                     let found = list_pull_requests(&project);
                     Event::PullRequests { project, found }
                 });
+            }
+            Action::FindPullRequests(projects) => {
+                for project in projects {
+                    self.read_in_background(move || {
+                        let found = list_pull_requests(&project);
+                        Event::PullRequests { project, found }
+                    });
+                }
             }
             Action::Comment {
                 project,
@@ -1958,10 +2234,28 @@ impl Tui {
         if *config == self.config {
             return;
         }
-        if config.theme != self.config.theme || config.colors != self.config.colors {
-            self.theme = Theme::from_config(config);
+        if config.theme != self.config.theme
+            || config.colors != self.config.colors
+            || config.appearance != self.config.appearance
+        {
+            self.theme = Theme::from_config(config, self.appearance);
         }
+        let follow = config.appearance.auto_switch;
+        self.follow_appearance.store(follow, Ordering::Relaxed);
+        if config.tab_bar.right != self.config.tab_bar.right {
+            // The old threads stop as their watch goes.
+            self.status = status_bar::watch(
+                &config.tab_bar.right,
+                std::env::current_dir().unwrap_or_default(),
+                &self.socket,
+                self.events.clone(),
+            );
+        }
+        self.app.set_start_dir(start_dir(config));
         crate::vt::set_history_lines(config.scrollback_lines);
+        if config.mouse.capture != self.config.mouse.capture {
+            capture_mouse(config.mouse.capture);
+        }
         self.config = config.clone();
         self.app.set_launch_settings(config);
         self.app.set_features(config);
@@ -1979,6 +2273,31 @@ impl Tui {
     fn read_settings_now(&self) {
         let socket = self.socket.clone();
         self.read_in_background(move || Event::Settings(Box::new(read_settings(&socket))));
+    }
+
+    /// Fetches the remotes of the worktree at `dir` off the loop, for the
+    /// branch switcher, which hears when it's done: `now`, or unless they
+    /// were fetched less than [`FETCH_EVERY`] ago, when what that brought
+    /// is as good. A fetch still going there answers for this one too.
+    fn fetch_remotes(&mut self, dir: PathBuf, now: bool) {
+        if self.fetching_remotes.contains(&dir) {
+            return;
+        }
+        let lately = self
+            .fetched_remotes
+            .get(&dir)
+            .is_some_and(|at| at.elapsed() < FETCH_EVERY);
+        if lately && !now {
+            if let Some(action) = self.app.branches_fetched(&dir, Ok(())) {
+                self.carry_out(action);
+            }
+            return;
+        }
+        self.fetching_remotes.insert(dir.clone());
+        self.read_in_background(move || {
+            let fetched = git::branches::fetch(&dir);
+            Event::BranchesFetched { dir, fetched }
+        });
     }
 
     /// Asks the daemon to get the model that searches memory by meaning
@@ -2197,7 +2516,7 @@ impl Tui {
                 continue;
             };
             let name = session.name.clone();
-            let screen = ui::screen_area(*area);
+            let screen = ui::screen_area(*area, self.app.scrollbars());
             let (rows, cols) = (screen.height.max(1), screen.width.max(1));
 
             let kept = before.iter().position(|pane| pane.session_id == session.id);
@@ -2367,6 +2686,16 @@ fn placed(context: Context) -> Result<Context> {
         return Ok(context);
     }
     Ok(Context::of_dir(&std::env::current_dir()?))
+}
+
+/// Where `config` has a new tab's shell start, and a session started with
+/// none selected: `None` to follow the selection.
+fn start_dir(config: &Config) -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_default();
+    let current = std::env::current_dir().unwrap_or_default();
+    config.terminal.start_dir(&home, &current)
 }
 
 /// `base`, or `base-2`, `base-3`, …, whichever no session has yet.
@@ -2710,26 +3039,40 @@ fn list_pull_requests(project: &Path) -> Result<(Forge, Vec<PullRequest>), Strin
     Ok((repo.forge, repo.pull_requests()?))
 }
 
-/// Asks their forge about the open pull requests of each project the
-/// sessions are in, on a thread of its own, since its CLI can take seconds
-/// to answer: a project as soon as it's seen, and every one again each
-/// [`PULL_REQUESTS_EVERY`].
-fn spawn_pull_request_poller(projects: Arc<Mutex<Vec<PathBuf>>>, events: Sender<Event>) {
+/// The issues open on the project at `project`, and the forge they're on.
+fn list_issues(project: &Path) -> Result<(Forge, Vec<Issue>), String> {
+    let repo = Repo::find(project)?;
+    Ok((repo.forge, repo.issues()?))
+}
+
+/// Asks their forge about the pull requests and the open issues of each
+/// project the sessions are in, on a thread of its own, since its CLI can
+/// take seconds to answer: a project as soon as it's seen, and every one
+/// again each [`PULL_REQUESTS_EVERY`], and [`ISSUES_EVERY`] for its issues.
+fn spawn_forge_poller(projects: Arc<Mutex<Vec<PathBuf>>>, events: Sender<Event>) {
     thread::spawn(move || {
         let mut asked: HashMap<PathBuf, Instant> = HashMap::new();
+        let mut asked_issues: HashMap<PathBuf, Instant> = HashMap::new();
+        let due = |asked: &HashMap<PathBuf, Instant>, project: &PathBuf, every: Duration| {
+            asked.get(project).is_none_or(|at| at.elapsed() >= every)
+        };
         loop {
             let wanted = projects.lock().unwrap().clone();
             for project in wanted {
-                let due = asked
-                    .get(&project)
-                    .is_none_or(|at| at.elapsed() >= PULL_REQUESTS_EVERY);
-                if !due {
-                    continue;
+                if due(&asked, &project, PULL_REQUESTS_EVERY) {
+                    asked.insert(project.clone(), Instant::now());
+                    let found = list_pull_requests(&project);
+                    let project = project.clone();
+                    if events.send(Event::PullRequests { project, found }).is_err() {
+                        return;
+                    }
                 }
-                asked.insert(project.clone(), Instant::now());
-                let found = list_pull_requests(&project);
-                if events.send(Event::PullRequests { project, found }).is_err() {
-                    return;
+                if due(&asked_issues, &project, ISSUES_EVERY) {
+                    asked_issues.insert(project.clone(), Instant::now());
+                    let found = list_issues(&project);
+                    if events.send(Event::Issues { project, found }).is_err() {
+                        return;
+                    }
                 }
             }
             thread::sleep(Duration::from_millis(500));

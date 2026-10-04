@@ -35,6 +35,7 @@ pub enum Kind {
     SessionDone,
     SessionIdle,
     SessionEnded,
+    SessionStartFailed,
     SessionRemoved,
     SessionArchived,
     SessionClaimed,
@@ -68,10 +69,11 @@ pub enum Kind {
     BacklogClosed,
     PluginPaused,
     DaemonHandedOver,
+    DaemonRestarted,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 40] = [
+    pub const ALL: [Kind; 42] = [
         Kind::SessionStarted,
         Kind::SessionRenamed,
         Kind::SessionWorking,
@@ -79,6 +81,7 @@ impl Kind {
         Kind::SessionDone,
         Kind::SessionIdle,
         Kind::SessionEnded,
+        Kind::SessionStartFailed,
         Kind::SessionRemoved,
         Kind::SessionArchived,
         Kind::SessionClaimed,
@@ -112,6 +115,7 @@ impl Kind {
         Kind::BacklogClosed,
         Kind::PluginPaused,
         Kind::DaemonHandedOver,
+        Kind::DaemonRestarted,
     ];
 
     /// Its name, which is how plugins, filters and the log know it.
@@ -124,6 +128,7 @@ impl Kind {
             Kind::SessionDone => "session.done",
             Kind::SessionIdle => "session.idle",
             Kind::SessionEnded => "session.ended",
+            Kind::SessionStartFailed => "session.start_failed",
             Kind::SessionRemoved => "session.removed",
             Kind::SessionArchived => "session.archived",
             Kind::SessionClaimed => "session.claimed",
@@ -157,6 +162,7 @@ impl Kind {
             Kind::BacklogClosed => "backlog.closed",
             Kind::PluginPaused => "plugin.paused",
             Kind::DaemonHandedOver => "daemon.handed_over",
+            Kind::DaemonRestarted => "daemon.restarted",
         }
     }
 
@@ -351,11 +357,14 @@ pub struct MessageAbout {
 
 /// The daemon, handed over to another crystal: the version it runs now,
 /// and how many sessions carried on through it. The version it ran before
-/// is the event's `from`.
+/// is the event's `from`. Or restarted cold: how many sessions it started
+/// again, and those that couldn't start, by name.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DaemonAbout {
     pub version: String,
     pub sessions: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failed: Vec<String>,
 }
 
 impl Event {
@@ -442,6 +451,16 @@ impl Event {
         let mut event = Event::about_session(Kind::SessionEnded, session);
         if let Some(about) = &mut event.session {
             about.status = status;
+        }
+        event
+    }
+
+    /// `session` couldn't start again after a restart, for the reason its
+    /// state gives, which its status says.
+    pub fn start_failed(session: &SessionInfo) -> Event {
+        let mut event = Event::about_session(Kind::SessionStartFailed, session);
+        if let (Some(about), State::Failed { why }) = (&mut event.session, &session.state) {
+            about.status = format!("couldn't start: {why}");
         }
         event
     }
@@ -695,8 +714,23 @@ impl Event {
             daemon: Some(DaemonAbout {
                 version: version.to_string(),
                 sessions,
+                failed: Vec::new(),
             }),
             ..Event::new(Kind::DaemonHandedOver)
+        }
+    }
+
+    /// The daemon, of crystal `version`, restarted cold and started the
+    /// sessions written down again: `back` of them did, and those called
+    /// `failed` couldn't.
+    pub fn restarted(version: &str, back: usize, failed: Vec<String>) -> Event {
+        Event {
+            daemon: Some(DaemonAbout {
+                version: version.to_string(),
+                sessions: back,
+                failed,
+            }),
+            ..Event::new(Kind::DaemonRestarted)
         }
     }
 
@@ -764,7 +798,7 @@ impl Event {
                 format!("from {from}: {}", message.line)
             }),
             Kind::SessionBell => "rang the bell".to_string(),
-            Kind::SessionEnded => self
+            Kind::SessionEnded | Kind::SessionStartFailed => self
                 .session
                 .as_ref()
                 .map_or(String::new(), |session| session.status.clone()),
@@ -879,6 +913,20 @@ impl Event {
                 };
                 format!(
                     "from crystal {from} to {}, {sessions} carried on",
+                    daemon.version
+                )
+            }),
+            Kind::DaemonRestarted => self.daemon.as_ref().map_or(String::new(), |daemon| {
+                let back = match daemon.sessions {
+                    1 => "1 session".to_string(),
+                    count => format!("{count} sessions"),
+                };
+                let failed = match daemon.failed.as_slice() {
+                    [] => String::new(),
+                    names => format!(", {} couldn't start: {}", names.len(), names.join(", ")),
+                };
+                format!(
+                    "crystal {} started cold: {back} back{failed}",
                     daemon.version
                 )
             }),
@@ -1000,6 +1048,13 @@ pub fn example(kind: Kind, session: Option<&SessionInfo>, dir: &Path) -> Event {
         Kind::SessionDone => Event::activity(&session, Some(Activity::Working), Activity::Done),
         Kind::SessionIdle => Event::activity(&session, Some(Activity::Done), Activity::Idle),
         Kind::SessionEnded => Event::ended(&session, "exited 0".into()),
+        Kind::SessionStartFailed => {
+            let why = format!("its directory, {}, isn't there", dir.display());
+            Event::start_failed(&SessionInfo {
+                state: State::Failed { why },
+                ..session.clone()
+            })
+        }
         Kind::SessionClaimed => {
             let reporter = Reporter {
                 agent: "my-agent".into(),
@@ -1100,6 +1155,7 @@ pub fn example(kind: Kind, session: Option<&SessionInfo>, dir: &Path) -> Event {
         }
         Kind::PluginPaused => Event::plugin_paused("example", "it failed 5 times in a row"),
         Kind::DaemonHandedOver => Event::handed_over("0.3.0", "0.4.0", 3),
+        Kind::DaemonRestarted => Event::restarted("0.4.0", 5, vec!["docs".into()]),
     };
     Event {
         at: now_ms(),

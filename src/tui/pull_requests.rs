@@ -1,10 +1,12 @@
 //! The pull requests view, `O` in the sidebar: the pull requests open on
-//! the selected session's project, merge requests on GitLab, filtered as
-//! you type, each with whether it's a draft and how its checks and review
-//! stand, and the highlighted one read under the list: its description, its
-//! checks one by one, and its conversation. Enter goes on to start a session
-//! in its worktree; Ctrl+D shows its diff, Ctrl+C comments on it, and
-//! Ctrl+O opens it in the browser.
+//! the selected session's project, merge requests on GitLab, then the ones
+//! merged lately, filtered as you type, each with whether it's a draft,
+//! conflicts or has merged, and how its checks and review stand, and the
+//! highlighted one read under the list: its description, its checks one by
+//! one, and its conversation. Drafts are left out while the settings hide
+//! them. Enter goes on to start a session in its worktree; Ctrl+D shows its
+//! diff, Ctrl+C comments on it, Ctrl+O opens it in the browser, and Ctrl+R
+//! asks the forge again.
 //!
 //! The state here is plain data, kept apart from I/O: the list, the bar and
 //! what's been read are a [`Listing`], and what it asks of the forge goes
@@ -55,6 +57,10 @@ pub enum Step {
         number: u64,
         text: String,
     },
+    /// Ask the forge for the list again, and the highlighted one with it.
+    Refresh,
+    /// Tell the user this, at the bottom.
+    Say(String),
 }
 
 pub struct PullRequestsView {
@@ -67,32 +73,56 @@ pub struct PullRequestsView {
     /// The comment being written on the highlighted pull request, while it
     /// is.
     pub comment: Option<CommentBox>,
+    /// Whether drafts are left out of the list, as the settings say.
+    hide_drafts: bool,
+    /// How many drafts the forge listed that are left out.
+    hidden_drafts: usize,
 }
 
 impl PullRequestsView {
     /// The view for the project at `project`, with `known`, the pull
-    /// requests listed last, until the forge lists them again.
+    /// requests listed last, until the forge lists them again; drafts left
+    /// out if `hide_drafts`.
     pub fn new(
         project: PathBuf,
         project_name: String,
         forge: Forge,
         known: Option<Vec<PullRequest>>,
+        hide_drafts: bool,
     ) -> PullRequestsView {
-        PullRequestsView {
+        let mut view = PullRequestsView {
             project,
             project_name,
             forge,
-            list: Listing::new(known),
+            list: Listing::new(None),
             comment: None,
+            hide_drafts,
+            hidden_drafts: 0,
+        };
+        if let Some(known) = known {
+            let known = view.without_hidden(known);
+            view.list = Listing::new(Some(known));
         }
+        view
     }
 
     pub fn set_pull_requests(&mut self, found: Result<(Forge, Vec<PullRequest>), String>) {
         let found = found.map(|(forge, pull_requests)| {
             self.forge = forge;
-            pull_requests
+            self.without_hidden(pull_requests)
         });
         self.list.set_items(found);
+    }
+
+    /// `pull_requests` without the drafts, while they're hidden, counting
+    /// those left out.
+    fn without_hidden(&mut self, mut pull_requests: Vec<PullRequest>) -> Vec<PullRequest> {
+        let listed = pull_requests.len();
+        if self.hide_drafts {
+            pull_requests.retain(|pull_request| !pull_request.draft);
+        }
+        self.hidden_drafts = listed - pull_requests.len();
+        pull_requests
     }
 
     pub fn highlighted(&self) -> Option<&PullRequest> {
@@ -101,8 +131,9 @@ impl PullRequestsView {
 
     /// Keys while the view is open: the comment box's while it's open; else
     /// Esc closes the view, Enter starts a session on the pull request the
-    /// bar is on, Ctrl+D, Ctrl+C and Ctrl+O show its diff, comment on it
-    /// and open it in the browser, and the list takes the rest.
+    /// bar is on, unless it has merged, Ctrl+D, Ctrl+C and Ctrl+O show its
+    /// diff, comment on it and open it in the browser, Ctrl+R asks for the
+    /// list again, and the list takes the rest.
     pub fn on_key(&mut self, key: &KeyEvent) -> Step {
         if let Some(comment) = &mut self.comment {
             return match comment.on_key(key) {
@@ -121,6 +152,14 @@ impl PullRequestsView {
         let highlighted = self.list.highlighted().cloned();
         match (key.code, highlighted) {
             (KeyCode::Esc, _) => Step::Close,
+            (KeyCode::Char('r'), _) if ctrl => {
+                self.list.ask_again();
+                Step::Refresh
+            }
+            (KeyCode::Enter, Some(pull_request)) if pull_request.merged => Step::Say(format!(
+                "{} has merged: there's no work left on it",
+                pull_request.label()
+            )),
             (KeyCode::Enter, Some(pull_request)) => Step::Start(pull_request),
             (KeyCode::Char('d'), Some(pull_request)) if ctrl => Step::Diff(pull_request.number),
             (KeyCode::Char('o'), Some(pull_request)) if ctrl => Step::Open(pull_request.number),
@@ -171,6 +210,7 @@ pub fn hints(view: &PullRequestsView) -> &'static [(&'static str, &'static str)]
         ("ctrl+d", "diff"),
         ("ctrl+c", "comment"),
         ("ctrl+o", "open"),
+        ("ctrl+r", "refresh"),
         ("esc", "close"),
     ]
 }
@@ -181,12 +221,15 @@ pub fn hints(view: &PullRequestsView) -> &'static [(&'static str, &'static str)]
 pub fn draw(frame: &mut Frame, view: &PullRequestsView, theme: &Theme, now: u64, area: Rect) {
     let [heading, filter, rest] = listing::frame_areas(frame, theme, area);
     let forge = view.forge;
-    let open = match view.list.items() {
-        Some(Ok(_)) => Some(view.list.shown().len()),
-        _ => None,
-    };
     let title = forge.pull_requests();
-    listing::draw_heading(frame, theme, title, &view.project_name, open, heading);
+    listing::draw_heading(
+        frame,
+        theme,
+        title,
+        &view.project_name,
+        &said(view),
+        heading,
+    );
     let writing = view.comment.is_some();
     listing::draw_filter(frame, theme, &view.list.filter, !writing, filter);
 
@@ -212,6 +255,25 @@ pub fn draw(frame: &mut Frame, view: &PullRequestsView, theme: &Theme, now: u64,
         let lines = reading_lines(view, pull_request, theme, now);
         listing::draw_reading(frame, lines, view.list.scroll, reading);
     }
+}
+
+/// What the heading says of the list on the right: how many of those shown
+/// are open and how many drafts are hidden, once the forge has listed
+/// them, and that it's being asked again while it is.
+fn said(view: &PullRequestsView) -> Vec<String> {
+    let mut said = Vec::new();
+    if let Some(Ok(_)) = view.list.items() {
+        let shown = view.list.shown();
+        let open = shown.iter().filter(|pull_request| !pull_request.merged);
+        said.push(format!("{} open", open.count()));
+        match view.hidden_drafts {
+            0 => {}
+            1 => said.push("1 draft hidden".to_string()),
+            hidden => said.push(format!("{hidden} drafts hidden")),
+        }
+    }
+    said.extend(view.list.asking_note(view.forge.name()));
+    said
 }
 
 /// One row a pull request: its number, its title and how it stands, and
@@ -249,7 +311,12 @@ fn pull_request_line<'a>(
     highlighted: bool,
     width: usize,
 ) -> Line<'a> {
-    let mut title = Style::new().fg(theme.text);
+    let color = if pull_request.merged {
+        theme.muted
+    } else {
+        theme.text
+    };
+    let mut title = Style::new().fg(color);
     if highlighted {
         title = title.add_modifier(Modifier::BOLD);
     }
@@ -265,15 +332,23 @@ fn pull_request_line<'a>(
     Line::from(spans)
 }
 
-/// Whether it's a draft, how its checks stand, and what its reviewers
+/// Whether it has merged, which says it all; or whether it's a draft,
+/// whether it conflicts, how its checks stand, and what its reviewers
 /// decided, each in its own color, the way the worktree lines mark them.
 fn marks<'a>(pull_request: &PullRequest, theme: &Theme) -> Vec<Span<'a>> {
     let mut marks = Vec::new();
     let mut mark = |text: &str, color: Color| {
         marks.push(Span::styled(format!("  {text}"), Style::new().fg(color)));
     };
+    if pull_request.merged {
+        mark("merged", theme.accent);
+        return marks;
+    }
     if pull_request.draft {
         mark("draft", theme.muted);
+    }
+    if pull_request.conflicts {
+        mark("conflicts", theme.failed);
     }
     match pull_request.checks {
         Checks::Failed => mark("✗ checks", theme.failed),
@@ -290,8 +365,9 @@ fn marks<'a>(pull_request: &PullRequest, theme: &Theme) -> Vec<Span<'a>> {
     marks
 }
 
-/// The highlighted pull request read: where it would merge, its checks
-/// one by one, its description, then its conversation.
+/// The highlighted pull request read: where it would merge, or did, and
+/// whether it can, its checks one by one, its description, then its
+/// conversation.
 fn reading_lines<'a>(
     view: &PullRequestsView,
     pull_request: &PullRequest,
@@ -310,19 +386,36 @@ fn reading_lines<'a>(
     } else {
         format!(" into {}", detail.base)
     };
+    let (said, merged) = if pull_request.merged {
+        ("'s ", " merged")
+    } else {
+        (" wants to merge ", "")
+    };
     let mut lines = vec![Line::from(vec![
         Span::styled(format!(" {}", pull_request.author), text),
-        Span::styled(" wants to merge ", muted),
+        Span::styled(said, muted),
         Span::styled(
             pull_request.local_branch.clone(),
             Style::new().fg(theme.branch),
         ),
+        Span::styled(merged, Style::new().fg(theme.accent)),
         Span::styled(into, muted),
         Span::styled(
             format!(" · {}", ago_from(&pull_request.updated_at, now)),
             muted,
         ),
     ])];
+    if pull_request.conflicts && !pull_request.merged {
+        let base = if detail.base.is_empty() {
+            "its base".to_string()
+        } else {
+            detail.base.clone()
+        };
+        lines.push(Line::styled(
+            format!(" conflicts with {base}: it can't merge as it stands"),
+            Style::new().fg(theme.failed),
+        ));
+    }
     if !detail.checks.is_empty() {
         let mut checks = vec![Span::styled(" checks", muted)];
         for check in &detail.checks {
@@ -367,6 +460,8 @@ mod tests {
             from_fork: false,
             local_branch: branch.into(),
             draft: false,
+            conflicts: false,
+            merged: false,
             checks: Checks::None,
             review: Review::None,
             updated_at: "2026-10-02T09:30:00Z".into(),
@@ -380,6 +475,7 @@ mod tests {
             "app".into(),
             Forge::GitHub,
             None,
+            false,
         );
         view.set_pull_requests(Ok((Forge::GitHub, pull_requests)));
         view
@@ -508,6 +604,7 @@ mod tests {
             "app".into(),
             Forge::GitHub,
             None,
+            false,
         );
         let merge_request = PullRequest {
             forge: Forge::GitLab,
@@ -517,5 +614,89 @@ mod tests {
         let screen = drawn(&view);
         assert!(screen.contains("merge requests · app"), "{screen}");
         assert!(screen.contains("!57"), "{screen}");
+    }
+
+    #[test]
+    fn a_conflict_and_a_merge_are_marked_and_a_merged_one_takes_no_session() {
+        let conflicting = PullRequest {
+            conflicts: true,
+            ..pull_request(57, "Fix the login redirect", "fix-login")
+        };
+        let merged = PullRequest {
+            merged: true,
+            checks: Checks::Failed,
+            ..pull_request(41, "Dark mode", "dark")
+        };
+        let mut view = view_of(vec![conflicting, merged]);
+        view.list.set_detail(
+            57,
+            Ok(PullRequestDetail {
+                base: "main".into(),
+                ..PullRequestDetail::default()
+            }),
+        );
+        let screen = drawn(&view);
+        assert!(screen.contains("1 open"), "{screen}");
+        assert!(
+            screen.contains("Fix the login redirect  conflicts"),
+            "{screen}"
+        );
+        assert!(screen.contains("conflicts with main"), "{screen}");
+        // Merged, its checks are behind it.
+        assert!(screen.contains("Dark mode  merged"), "{screen}");
+        assert!(!screen.contains("✗ checks"), "{screen}");
+
+        press(&mut view, KeyCode::Down);
+        view.list.set_detail(
+            41,
+            Ok(PullRequestDetail {
+                base: "main".into(),
+                ..PullRequestDetail::default()
+            }),
+        );
+        assert!(drawn(&view).contains("ana's dark merged into main"));
+        assert_eq!(
+            press(&mut view, KeyCode::Enter),
+            Step::Say("#41 has merged: there's no work left on it".into())
+        );
+        assert_eq!(ctrl(&mut view, 'd'), Step::Diff(41));
+    }
+
+    #[test]
+    fn drafts_are_left_out_while_the_settings_hide_them() {
+        let draft = PullRequest {
+            draft: true,
+            ..pull_request(58, "Dark mode", "dark")
+        };
+        let ready = pull_request(57, "Fix the login redirect", "fix-login");
+        let known = vec![draft.clone(), ready.clone()];
+        let mut view = PullRequestsView::new(
+            PathBuf::from("/code/app"),
+            "app".into(),
+            Forge::GitHub,
+            Some(known),
+            true,
+        );
+        assert_eq!(view.list.shown().len(), 1);
+        assert_eq!(view.highlighted().map(|pr| pr.number), Some(57));
+        let screen = drawn(&view);
+        assert!(
+            screen.contains("1 open · 1 draft hidden · asking GitHub…"),
+            "{screen}"
+        );
+        view.set_pull_requests(Ok((Forge::GitHub, vec![draft, ready])));
+        let screen = drawn(&view);
+        assert!(screen.contains("1 open · 1 draft hidden"), "{screen}");
+        assert!(!screen.contains("asking"), "{screen}");
+    }
+
+    #[test]
+    fn ctrl_r_asks_again_for_the_list_and_the_highlighted_one() {
+        let mut view = view_of(vec![pull_request(57, "Fix it", "fix-login")]);
+        assert_eq!(view.list.detail_to_fetch(), Some(57));
+        assert_eq!(view.list.detail_to_fetch(), None);
+        assert_eq!(ctrl(&mut view, 'r'), Step::Refresh);
+        assert!(drawn(&view).contains("asking GitHub…"));
+        assert_eq!(view.list.detail_to_fetch(), Some(57));
     }
 }

@@ -16,8 +16,11 @@ pub enum Status {
     Running,
     /// Its program ended well.
     Ended,
-    /// Its program failed, or was killed.
+    /// Its program failed, or was killed, or it couldn't start again after
+    /// a restart.
     Failed,
+    /// It waits its turn to start again after a restart.
+    Starting,
 }
 
 /// The working mark turns through these, a quarter at a time.
@@ -31,6 +34,7 @@ impl Status {
             (State::Running, Some(Activity::Done)) => Status::Done,
             (State::Running, _) => Status::Running,
             (State::Exited { code: 0 }, _) => Status::Ended,
+            (State::Starting, _) => Status::Starting,
             // Stopped by crystal, which isn't the program failing.
             _ if session.stopped_idle => Status::Ended,
             _ => Status::Failed,
@@ -46,6 +50,7 @@ impl Status {
             Status::Done => "✓",
             Status::Running => "▸",
             Status::Ended | Status::Failed => "■",
+            Status::Starting => "◌",
         }
     }
 }
@@ -86,6 +91,15 @@ mod tests {
         assert_eq!(running(None), Status::Running);
         let ended = session(State::Exited { code: 2 }, Some(Activity::Working));
         assert_eq!(Status::of(&ended), Status::Failed);
+    }
+
+    #[test]
+    fn a_session_waiting_to_start_again_is_marked_apart_from_one_that_couldn_t() {
+        let starting = Status::of(&session(State::Starting, None));
+        assert_eq!((starting, starting.mark(0)), (Status::Starting, "◌"));
+        let why = "its directory, ~/code/app, isn't there".to_string();
+        let failed = Status::of(&session(State::Failed { why }, None));
+        assert_eq!(failed, Status::Failed);
     }
 
     #[test]

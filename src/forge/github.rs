@@ -3,8 +3,8 @@
 //! types.
 
 use super::{
-    Check, CheckState, Checks, Comment, Forge, Issue, IssueDetail, LIMIT, PullRequest,
-    PullRequestDetail, Review, Topic, list, parse, run, text,
+    Check, CheckState, Checks, Comment, Forge, Issue, IssueDetail, LIMIT, MERGED_LIMIT,
+    PullRequest, PullRequestDetail, Review, Topic, list, parse, run, text,
 };
 use serde::Deserialize;
 use std::path::Path;
@@ -13,9 +13,22 @@ const FORGE: Forge = Forge::GitHub;
 
 pub(super) fn pull_requests(dir: &Path) -> Result<Vec<PullRequest>, String> {
     let fields = "number,title,author,headRefName,isDraft,isCrossRepository,\
-                  headRepositoryOwner,reviewDecision,statusCheckRollup,updatedAt,url";
+                  headRepositoryOwner,mergeable,reviewDecision,statusCheckRollup,updatedAt,url";
+    let limit = LIMIT.to_string();
     let args = [
-        "pr", "list", "--state", "open", "--limit", LIMIT, "--json", fields,
+        "pr", "list", "--state", "open", "--limit", &limit, "--json", fields,
+    ];
+    parse_pull_requests(&gh(dir, &args)?)
+}
+
+/// The pull requests merged lately, with only what a merged one needs:
+/// its checks and reviews are behind it.
+pub(super) fn merged_pull_requests(dir: &Path) -> Result<Vec<PullRequest>, String> {
+    let fields = "number,title,author,headRefName,isCrossRepository,headRepositoryOwner,\
+                  updatedAt,url";
+    let limit = MERGED_LIMIT.to_string();
+    let args = [
+        "pr", "list", "--state", "merged", "--limit", &limit, "--json", fields,
     ];
     parse_pull_requests(&gh(dir, &args)?)
 }
@@ -34,8 +47,9 @@ pub(super) fn diff(dir: &Path, number: u64) -> Result<String, String> {
 
 pub(super) fn issues(dir: &Path) -> Result<Vec<Issue>, String> {
     let fields = "number,title,labels,updatedAt,author,url";
+    let limit = LIMIT.to_string();
     let args = [
-        "issue", "list", "--state", "open", "--limit", LIMIT, "--json", fields,
+        "issue", "list", "--state", "open", "--limit", &limit, "--json", fields,
     ];
     parse_issues(&gh(dir, &args)?)
 }
@@ -100,6 +114,10 @@ struct ListedPullRequest {
     is_cross_repository: bool,
     #[serde(default)]
     head_repository_owner: Option<User>,
+    /// `MERGEABLE`, `CONFLICTING`, or `UNKNOWN` while GitHub hasn't worked
+    /// it out.
+    #[serde(default, deserialize_with = "text")]
+    mergeable: String,
     #[serde(default, deserialize_with = "text")]
     review_decision: String,
     /// Its checks: GitHub Actions runs, and the older commit statuses.
@@ -133,6 +151,8 @@ fn pull_request_of(listed: ListedPullRequest) -> PullRequest {
         from_fork: listed.is_cross_repository,
         local_branch,
         draft: listed.is_draft,
+        conflicts: listed.mergeable == "CONFLICTING",
+        merged: false,
         checks: Checks::of(listed.status_check_rollup.iter().map(GhCheck::state)),
         review,
         updated_at: listed.updated_at,
@@ -412,6 +432,14 @@ mod tests {
                 {"status": "COMPLETED", "conclusion": "NEUTRAL"}]}"#,
         );
         assert_eq!(skipped.checks, Checks::Passed);
+    }
+
+    #[test]
+    fn a_pull_request_conflicts_only_once_github_says_so() {
+        assert!(listed(r#"{"mergeable": "CONFLICTING"}"#).conflicts);
+        assert!(!listed(r#"{"mergeable": "UNKNOWN"}"#).conflicts);
+        assert!(!listed(r#"{"mergeable": "MERGEABLE"}"#).conflicts);
+        assert!(!listed("{}").conflicts);
     }
 
     #[test]

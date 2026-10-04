@@ -138,6 +138,10 @@ pub struct Session {
     closed: Vec<TaskRecord>,
     /// What has happened to it since the daemon last asked, for it to tell.
     changes: Vec<Change>,
+    /// For a session yet to start again after a restart, or that couldn't:
+    /// what it starts from. It has no program, and is written down as it
+    /// was, to start again with the next restart if it isn't before.
+    start_from: Option<SavedSession>,
     term: Arc<Term>,
 }
 
@@ -205,6 +209,11 @@ pub struct Handed {
     shown: report::Shown,
     #[serde(default)]
     stopped_idle: bool,
+    /// For a session yet to start again after a restart, or that couldn't:
+    /// what it starts from. Its `state` says it has ended, which is how a
+    /// crystal from before these reads it.
+    #[serde(default)]
+    start_from: Option<StartFrom>,
     screen: vt::Saved,
     /// There will be no more output.
     ended: bool,
@@ -212,6 +221,14 @@ pub struct Handed {
     /// it.
     pty: Option<RawFd>,
     task: Option<task::Handed>,
+}
+
+/// What a session yet to start again starts from, as it's handed over,
+/// and why it couldn't, once it has tried.
+#[derive(Serialize, Deserialize)]
+struct StartFrom {
+    saved: SavedSession,
+    failed: Option<String>,
 }
 
 impl Handed {
@@ -235,6 +252,9 @@ impl Handed {
     /// What it takes to start the session again, as after any restart,
     /// when it couldn't be carried on: `None` once its program had ended.
     pub fn saved(&self) -> Option<SavedSession> {
+        if let Some(start_from) = &self.start_from {
+            return Some(start_from.saved.clone());
+        }
         if self.state != State::Running {
             return None;
         }
@@ -366,6 +386,7 @@ impl Session {
             stopped_idle: false,
             closed: Vec::new(),
             changes: Vec::new(),
+            start_from: None,
             term,
         })
     }
@@ -430,8 +451,101 @@ impl Session {
             stopped_idle: false,
             closed: Vec::new(),
             changes: Vec::new(),
+            start_from: None,
             term,
         }
+    }
+
+    /// A session written down before a restart, in the list while it waits
+    /// its turn to start again from `saved`, with no program yet: its screen
+    /// says so to whoever looks. It keeps its `id` once it has started.
+    pub fn to_start(id: String, saved: SavedSession) -> Session {
+        let name = saved.name.clone();
+        let session = Session::unstarted(id, saved);
+        session.term.show(
+            format!("\x1b[2mstarting {name} again after crystal's restart…\x1b[0m").as_bytes(),
+        );
+        session
+    }
+
+    /// A session written down before a restart that couldn't start again
+    /// from `saved`, for the reason `why`: it stays in the list, its screen
+    /// saying why, to start again once that's put right, or to kill.
+    pub fn failed_to_start(id: String, saved: SavedSession, why: &str) -> Session {
+        let mut session = Session::unstarted(id, saved);
+        session.fail_to_start(why);
+        session
+    }
+
+    fn unstarted(id: String, saved: SavedSession) -> Session {
+        let front = match saved.task {
+            Some(_) => Some(Front::Task),
+            None => front::of_command(&saved.command),
+        };
+        Session {
+            name: saved.name.clone(),
+            id,
+            command: saved.command.clone(),
+            checkout: Checkout::find(&saved.cwd),
+            cwd: saved.cwd.clone(),
+            env: BTreeMap::new(),
+            pid: None,
+            state: Arc::new(Mutex::new(State::Starting)),
+            activity: None,
+            changed: Arc::new(Mutex::new(SystemTime::now())),
+            conversation: saved.conversation.clone(),
+            rollouts: None,
+            telling: notify::Telling::default(),
+            bell: false,
+            screen_watch: ScreenWatch::default(),
+            front,
+            front_group: None,
+            front_checked: Instant::now(),
+            task: None,
+            goal: saved.goal.clone(),
+            reminded: false,
+            reporter: None,
+            reporter_job: None,
+            named_after_program: false,
+            typed_agent: None,
+            subagents: 0,
+            model: model::Watch::new(&saved.command),
+            shown: report::Shown::default(),
+            stopped_idle: false,
+            closed: Vec::new(),
+            changes: Vec::new(),
+            start_from: Some(saved),
+            term: Arc::new(Term::without_terminal()),
+        }
+    }
+
+    /// Whether the session waits its turn to start again after a restart.
+    pub fn is_starting(&self) -> bool {
+        *self.state.lock().unwrap() == State::Starting
+    }
+
+    /// Whether the session is yet to start again after a restart, or
+    /// couldn't: see [`State::is_unstarted`].
+    pub fn is_unstarted(&self) -> bool {
+        self.start_from.is_some()
+    }
+
+    /// The session waiting its turn couldn't start, for the reason `why`:
+    /// its screen says so, and the start it waited for is over.
+    pub fn fail_to_start(&mut self, why: &str) {
+        let name = &self.name;
+        let said = format!(
+            "\r\n\x1b[1mcrystal couldn't start {name} again after the restart:\x1b[0m\r\n\r\n  \
+             {why}\r\n\r\nIt's kept as it was: once that's put right, Enter in crystal's \
+             sidebar or `crystal respawn {name}` starts it again, and `crystal kill {name}` \
+             lets it go.\r\n"
+        );
+        self.term.show(said.as_bytes());
+        self.term.close();
+        *self.state.lock().unwrap() = State::Failed {
+            why: why.to_string(),
+        };
+        *self.changed.lock().unwrap() = SystemTime::now();
     }
 
     pub fn is_task(&self) -> bool {
@@ -1050,7 +1164,9 @@ impl Session {
     /// open: nobody is left who could close it.
     fn fail_task_if_ended(&mut self) {
         let open = self.goal.as_ref().is_some_and(TaskInfo::is_open);
-        if !open || self.is_running() || !tasks_on() {
+        // One yet to start again hasn't ended: its task goes on once it
+        // has.
+        if !open || self.is_running() || self.is_unstarted() || !tasks_on() {
             return;
         }
         let why = format!("its session ended: {}", self.state.lock().unwrap());
@@ -1280,9 +1396,10 @@ impl Session {
     }
 
     /// What it takes to start the session again after a restart, while it
-    /// runs. A program that has ended stays ended.
+    /// runs, or while it's yet to start again. A program that has ended
+    /// stays ended.
     pub fn saved(&self) -> Option<SavedSession> {
-        if self.is_running() {
+        if self.is_running() || self.is_unstarted() {
             Some(self.launch())
         } else {
             None
@@ -1294,6 +1411,14 @@ impl Session {
     /// the command that resumes an agent that reports for itself, or one
     /// typed into the session's shell (see [`restart_with`]).
     pub fn launch(&self) -> SavedSession {
+        // One yet to start again starts as it was written down, under the
+        // name it has now.
+        if let Some(saved) = &self.start_from {
+            return SavedSession {
+                name: self.name.clone(),
+                ..saved.clone()
+            };
+        }
         // A task's conversation comes from Claude's own events, which need
         // no transcript file to resume it.
         let conversation = match &self.task {
@@ -1331,6 +1456,13 @@ impl Session {
         let task = self.task.as_ref().map(Task::hand_over).transpose()?;
         let (screen, ended, pty) = self.term.hand_over()?;
         let state = self.state.lock().unwrap();
+        let start_from = self.start_from.as_ref().map(|_| StartFrom {
+            saved: self.launch(),
+            failed: match &*state {
+                State::Failed { why } => Some(why.clone()),
+                _ => None,
+            },
+        });
         let handed = Handed {
             name: self.name.clone(),
             id: self.id.clone(),
@@ -1338,7 +1470,12 @@ impl Session {
             cwd: self.cwd.clone(),
             env: self.env.clone(),
             pid: self.pid,
-            state: state.clone(),
+            // What a crystal from before sessions waited to start again
+            // can read: one that has ended.
+            state: match &*state {
+                State::Starting | State::Failed { .. } => State::Exited { code: 1 },
+                state => state.clone(),
+            },
             activity: self.activity,
             changed: *self.changed.lock().unwrap(),
             looks: self.screen_watch.looks(),
@@ -1356,6 +1493,7 @@ impl Session {
             model: self.model.clone(),
             shown: self.shown.clone(),
             stopped_idle: self.stopped_idle,
+            start_from,
             screen,
             ended,
             pty,
@@ -1368,6 +1506,13 @@ impl Session {
     /// was, its terminal read again, and its program waited for. A task's
     /// runs add to `spending`. Fails when what it was handed isn't open.
     pub fn adopt(handed: Handed, spending: &Arc<Spending>) -> Result<Session> {
+        // One yet to start again waits again, or says again why it couldn't.
+        if let Some(StartFrom { saved, failed }) = handed.start_from {
+            return Ok(match failed {
+                Some(why) => Session::failed_to_start(handed.id, saved, &why),
+                None => Session::to_start(handed.id, saved),
+            });
+        }
         let pty = handed
             .pty
             .map(|fd| handover::inherit(fd).map(|fd| Pty::new(File::from(fd))))
@@ -1431,6 +1576,7 @@ impl Session {
             stopped_idle: handed.stopped_idle,
             closed: Vec::new(),
             changes: Vec::new(),
+            start_from: None,
             term,
         })
     }
@@ -1967,6 +2113,7 @@ mod tests {
             model: model::Watch::new(&["claude".into(), "--model".into(), "opus".into()]),
             shown,
             stopped_idle: false,
+            start_from: None,
             screen: screen.save(),
             ended: true,
             pty: None,
@@ -2007,6 +2154,103 @@ mod tests {
         assert_eq!(session.model.model(), Some("opus"));
     }
 
+    /// A Claude Code session as it was written down before a restart, in
+    /// `dir`, with its task open.
+    fn written_down(dir: &Path) -> SavedSession {
+        SavedSession {
+            name: "fixer".into(),
+            command: vec!["claude".into()],
+            cwd: dir.to_path_buf(),
+            conversation: Some(Conversation {
+                id: "conv-1".into(),
+                transcript: None,
+            }),
+            task: None,
+            goal: Some(TaskInfo {
+                id: Some(7),
+                goal: "fix the login".into(),
+                background: false,
+                backlog: None,
+                waiting: false,
+                created: 1,
+                outcome: None,
+            }),
+            resume: None,
+        }
+    }
+
+    #[test]
+    fn a_session_yet_to_start_again_is_written_down_as_it_was() {
+        let dir = tempfile::tempdir().unwrap();
+        let saved = written_down(dir.path());
+        let mut session = Session::to_start("id-1".into(), saved.clone());
+        let info = session.info();
+        assert_eq!(info.state, State::Starting);
+        assert_eq!((info.name.as_str(), info.id.as_str()), ("fixer", "id-1"));
+        assert_eq!(info.pid, None);
+        assert_eq!(info.task, saved.goal);
+        assert_eq!(info.front.unwrap().word(), "claude");
+        assert!(session.is_starting() && session.is_unstarted());
+        assert!(!session.is_running());
+        assert_eq!(session.saved(), Some(saved.clone()));
+        assert!(session.term().rows(false)[0].contains("starting fixer again"));
+        // Its task waits for it to start, rather than failing.
+        session.check();
+        assert!(session.take_closed().is_empty());
+        assert!(session.goal.as_ref().unwrap().is_open());
+        // Renamed meanwhile, it starts under its new name.
+        session.name = "login".into();
+        assert_eq!(session.launch().name, "login");
+        assert_eq!(session.launch().conversation, saved.conversation);
+    }
+
+    #[test]
+    fn a_session_that_couldn_t_start_again_says_why_and_stays_written_down() {
+        let dir = tempfile::tempdir().unwrap();
+        let saved = written_down(dir.path());
+        let mut session = Session::to_start("id-1".into(), saved.clone());
+        let watching = session.term().watch(false).feed.unwrap();
+        session.fail_to_start("command not found: claude");
+        let why = "command not found: claude".to_string();
+        assert_eq!(session.info().state, State::Failed { why });
+        assert_eq!(session.info().status(), "couldn't start");
+        assert!(!session.is_starting() && session.is_unstarted());
+        assert_eq!(session.saved(), Some(saved));
+        // Whoever was looking sees why, and that nothing more is coming.
+        let said: Vec<u8> = watching.iter().flat_map(|chunk| chunk.to_vec()).collect();
+        let said = String::from_utf8_lossy(&said);
+        assert!(said.contains("command not found: claude"), "{said}");
+        assert!(said.contains("crystal respawn fixer"), "{said}");
+        session.check();
+        assert!(session.take_closed().is_empty(), "its task stays open");
+    }
+
+    #[test]
+    fn a_session_yet_to_start_again_is_handed_over_as_ended_to_an_older_crystal() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::Db::open(&dir.path().join("crystal.sock")).unwrap();
+        let spending = Arc::new(Spending::new(db));
+        let saved = written_down(dir.path());
+        let failed = Session::failed_to_start("id-1".into(), saved.clone(), "gone");
+        let starting = Session::to_start("id-2".into(), saved.clone());
+        for (session, state) in [
+            (failed, State::Failed { why: "gone".into() }),
+            (starting, State::Starting),
+        ] {
+            let (handed, _state) = session.hand_over().unwrap();
+            let json = serde_json::to_value(&handed).unwrap();
+            // A crystal from before reads it as a session that has ended.
+            assert_eq!(json["state"], serde_json::json!({"exited": {"code": 1}}));
+            let handed: Handed = serde_json::from_value(json).unwrap();
+            assert_eq!(handed.saved(), Some(saved.clone()));
+            assert!(handed.processes().is_empty());
+            let adopted = Session::adopt(handed, &spending).unwrap();
+            assert_eq!(adopted.info().state, state);
+            assert_eq!(adopted.id, session.id);
+            assert_eq!(adopted.launch(), saved);
+        }
+    }
+
     /// A shell session's, handed over, that ended with `front` in front,
     /// in Claude Code's conversation `conv-1`, typed into it by hand, with
     /// two subagents running.
@@ -2042,6 +2286,7 @@ mod tests {
             model: model::Watch::default(),
             shown: report::Shown::default(),
             stopped_idle: false,
+            start_from: None,
             screen: vt::Screen::answering(5, 20).save(),
             ended: true,
             pty: None,
@@ -2198,6 +2443,7 @@ mod tests {
             reporter: None,
             reporter_job: None,
             named_after_program: false,
+            start_from: None,
             screen: vt::Screen::answering(5, 20).save(),
             ended: false,
             stopped_idle: false,

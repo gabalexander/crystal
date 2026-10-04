@@ -26,10 +26,14 @@ impl Crystal {
         // a sound (nor one that configures its own: see `QUIET`). Memory is
         // off unless a test turns it on, so Claude's arguments stay as each
         // test expects them, and so is naming a session from its prompt, so
-        // its name does.
+        // its name does. So are panes' scrollbars, so a pane's screen is as
+        // wide as the pane, as the tests that count its columns expect. A
+        // shell isn't a login shell, which on a Mac it would be, so it starts
+        // the same on every machine.
         crystal.configure(
             "notify = false\nname_from_prompt = false\n\n[plugins]\nmemory = false\n\n\
-             [sound]\nenabled = false\n",
+             [sound]\nenabled = false\n\n[mouse]\nscrollbars = false\n\n\
+             [terminal]\nshell_mode = \"non_login\"\n",
         );
         crystal
     }
@@ -276,6 +280,32 @@ impl Terminal {
             );
             thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    /// Waits until crystal has written `bytes` to this terminal `times`
+    /// times, like a sequence vt100 doesn't keep.
+    fn wrote(&self, bytes: &str, times: usize) {
+        let count = || {
+            let written = self.written.lock().unwrap();
+            let windows = written.windows(bytes.len());
+            windows.filter(|window| *window == bytes.as_bytes()).count()
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while count() < times {
+            assert!(
+                Instant::now() < deadline,
+                "{bytes:?} was written {} times, not {times}",
+                count()
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// The rows of the screen, each as wide as the screen.
+    fn rows(&self) -> Vec<String> {
+        let parser = self.screen.lock().unwrap();
+        let (_, width) = parser.screen().size();
+        parser.screen().rows(0, width).collect()
     }
 
     /// How many times crystal rang this terminal's bell: each BEL that
@@ -1599,6 +1629,153 @@ fn a_drag_across_a_pane_copies_what_it_covers() {
     tui.shows("copied 1 line");
 }
 
+/// A crystal whose config is the tests' own but for `[mouse]`, which is
+/// `mouse`.
+fn crystal_with_mouse(mouse: &str) -> Crystal {
+    let crystal = Crystal::new();
+    crystal.configure(&format!(
+        "notify = false\nname_from_prompt = false\n\n[plugins]\nmemory = false\n\n\
+         [sound]\nenabled = false\n\n[mouse]\n{mouse}\n"
+    ));
+    crystal
+}
+
+#[test]
+fn a_double_click_copies_a_word_and_a_triple_click_its_line() {
+    let crystal = Crystal::new();
+    crystal.ok(&[
+        "new",
+        "-n",
+        "words",
+        "sh",
+        "-c",
+        "echo alpha beta gamma; sleep 30",
+    ]);
+
+    let mut tui = tui_over_ssh(&crystal);
+    tui.shows("alpha beta gamma");
+    // "beta" is at columns 36 to 39 of row 3, counting from 1, and
+    // "gamma" at 41 to 45.
+    tui.type_keys(&"\x1b[<0;37;3M\x1b[<0;37;3m".repeat(2));
+    tui.copies("beta");
+    tui.type_keys(&"\x1b[<0;43;3M\x1b[<0;43;3m".repeat(3));
+    tui.copies("alpha beta gamma");
+}
+
+#[test]
+fn a_drag_past_a_panes_top_scrolls_back_through_its_history_selecting() {
+    let crystal = Crystal::new();
+    crystal.ok(&["new", "-n", "printer", "sh", "-c", LONG_OUTPUT]);
+    written(&crystal.dir.path().join("printed"));
+
+    let mut tui = tui_over_ssh(&crystal);
+    tui.shows("line 60");
+    // Down on the first letter of the pane's top row, "line 41", then up
+    // onto the top bar, past the pane's header, and held there: the
+    // history scrolls under it to its start, 41 rows back.
+    tui.type_keys("\x1b[<0;30;3M\x1b[<32;30;1M");
+    tui.shows("↑ 41 lines");
+    tui.type_keys("\x1b[<0;30;1m");
+    let history: Vec<String> = (1..=40).map(|i| format!("line {i}")).collect();
+    tui.copies(&format!("first-line\n{}\nl", history.join("\n")));
+}
+
+#[test]
+fn without_copy_on_select_a_drag_waits_in_copy_mode_for_y() {
+    let crystal = crystal_with_mouse("copy_on_select = false");
+    crystal.ok(&[
+        "new",
+        "-n",
+        "words",
+        "sh",
+        "-c",
+        "echo alpha beta gamma; sleep 30",
+    ]);
+
+    let mut tui = tui_over_ssh(&crystal);
+    tui.shows("alpha beta gamma");
+    tui.type_keys("\x1b[<0;36;3M\x1b[<32;39;3M\x1b[<0;39;3m");
+    tui.shows("words · copy mode");
+    let written = || String::from_utf8_lossy(&tui.written.lock().unwrap()).to_string();
+    assert!(!written().contains("\x1b]52;"), "nothing is copied yet");
+    tui.type_keys("y");
+    tui.copies("beta");
+    // Copy mode is over, and the keyboard is back in the pane it was in:
+    // the terminal echoes what's typed.
+    tui.type_keys("typed");
+    tui.shows("typed");
+}
+
+#[test]
+fn without_mouse_capture_the_terminal_keeps_the_mouse() {
+    let crystal = crystal_with_mouse("capture = false");
+    crystal.ok(&["new", "-n", "stays", "sleep", "30"]);
+
+    let mut tui = crystal.tui();
+    tui.shows("❯ stays");
+    assert!(!tui.sends_the_mouse());
+    assert!(tui.marks_pastes(), "pastes are still the TUI's");
+
+    // Switched on in the settings view, the TUI takes it straight away.
+    tui.type_keys(",");
+    tui.shows("take the mouse");
+    // Ten rows down, past the theme's, the appearance's, the tab bar's and
+    // the sessions'.
+    tui.type_keys("jjjjjjjjjj ");
+    eventually("the TUI takes the mouse", || tui.sends_the_mouse());
+    assert!(
+        std::fs::read_to_string(crystal.config_file())
+            .unwrap()
+            .contains("capture = true")
+    );
+}
+
+#[test]
+fn a_notch_of_the_wheel_scrolls_as_many_lines_as_the_config_says() {
+    let crystal = crystal_with_mouse("scroll_lines = 5");
+    crystal.ok(&["new", "-n", "printer", "sh", "-c", LONG_OUTPUT]);
+    written(&crystal.dir.path().join("printed"));
+
+    let mut tui = crystal.tui();
+    tui.shows("line 60");
+    tui.type_keys(&wheel_up(50, 10));
+    tui.shows("↑ 5 lines");
+}
+
+#[test]
+fn a_panes_scrollbar_shows_where_it_is_and_drags_through_its_history() {
+    let crystal = crystal_with_mouse("scrollbars = true");
+    let script = "trap 'stty size > size' WINCH; \
+                  for i in $(seq 1 60); do echo line $i; done; \
+                  while :; do sleep 0.05; done";
+    crystal.ok(&["new", "-n", "printer", "sh", "-c", script]);
+
+    let mut tui = crystal.tui();
+    tui.shows("line 60");
+    // The scrollbar takes the pane's last column: its session has 50.
+    eventually("the session is a column narrower", || {
+        std::fs::read_to_string(crystal.dir.path().join("size")).is_ok_and(|size| size == "21 50\n")
+    });
+    // 40 rows of history behind 21: a thumb of 7 rows, at the bottom of the
+    // track, rows 3 to 23, while the pane is live.
+    let column = |text: &str| -> String {
+        text.lines()
+            .map(|line| line.chars().nth(79).unwrap_or(' '))
+            .collect()
+    };
+    eventually("the thumb is drawn", || {
+        column(&tui.text()).contains("▐▐▐▐▐▐▐")
+    });
+    // Taken by its middle and dragged up past the top, it shows the
+    // start of the history.
+    tui.type_keys("\x1b[<0;80;20M\x1b[<32;80;1M\x1b[<0;80;1m");
+    tui.shows("↑ 40 lines");
+    tui.shows("line 1 ");
+    // A click near the bottom of the track jumps back there.
+    tui.type_keys(&click(79, 22));
+    tui.hides("↑ 40 lines");
+}
+
 #[test]
 fn the_tui_needs_a_terminal() {
     let crystal = Crystal::new();
@@ -2585,6 +2762,170 @@ fn running_sessions_come_back_after_the_daemon_dies() {
     assert_eq!(row[1], "running");
     assert_ne!(crystal.pid("keeper"), old_pid);
     assert!(crystal.row("finished").is_none());
+}
+
+#[test]
+fn a_session_that_can_t_start_again_after_a_crash_stays_in_its_place_saying_why() {
+    let crystal = Crystal::new();
+    let daemon = crystal.start_daemon();
+    let gone = crystal.dir.path().join("gone");
+    std::fs::create_dir(&gone).unwrap();
+    let out = crystal
+        .command(&["new", "-n", "lost", "sleep", "300"])
+        .current_dir(&gone)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    crystal.ok(&["new", "-n", "keeper", "sleep", "300"]);
+    eventually("both are saved", || {
+        let saved = crystal.saved();
+        saved.contains("lost") && saved.contains("keeper")
+    });
+
+    crash(daemon);
+    std::fs::remove_dir(&gone).unwrap();
+    // Left behind by the crash, it would pass for the next daemon's.
+    std::fs::remove_file(&crystal.socket).unwrap();
+    let daemon = crystal.start_daemon();
+
+    // Not dropped, nor started in another directory: it stays first, and
+    // says why.
+    let listed = crystal.ok(&["ls"]);
+    let names: Vec<&str> = listed.lines().skip(1).map(|line| &line[..6]).collect();
+    assert_eq!(names, ["lost  ", "keeper"]);
+    assert_eq!(status(&crystal, "lost"), "couldn't start");
+    assert_eq!(status(&crystal, "keeper"), "running");
+    let ls = crystal.run(&["ls"]);
+    let why = String::from_utf8(ls.stderr).unwrap();
+    assert!(
+        why.contains("lost couldn't start again: its directory, ")
+            && why.contains("gone, isn't there"),
+        "{why}"
+    );
+    shows_on_screen(
+        &crystal,
+        "lost",
+        "crystal couldn't start lost again after the restart",
+    );
+    eventually("the log says what came back and what didn't", || {
+        let events = crystal.ok(&["events"]);
+        events.contains("session.start_failed  lost  couldn't start: its directory")
+            && events.contains("started cold: 1 session back, 1 couldn't start: lost")
+    });
+    // It's still written down, to start again with the next restart.
+    eventually("it's still saved", || {
+        let saved = crystal.saved();
+        saved.contains("lost") && saved.contains("keeper")
+    });
+
+    // Started again once its directory is back, in its place and under
+    // the same id.
+    let err = crystal.fails(&["respawn", "lost"]);
+    assert!(err.contains("isn't there"), "{err}");
+    let id = |name: &str| {
+        let listed: serde_json::Value =
+            serde_json::from_str(&crystal.ok(&["ls", "--json"])).unwrap();
+        let session = listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["name"] == name);
+        session.unwrap()["id"].as_str().unwrap().to_string()
+    };
+    let before = id("lost");
+    std::fs::create_dir(&gone).unwrap();
+    crystal.ok(&["respawn", "lost"]);
+    assert_eq!(status(&crystal, "lost"), "running");
+    assert_eq!(id("lost"), before);
+    let listed = crystal.ok(&["ls"]);
+    assert!(
+        listed.lines().nth(1).unwrap().starts_with("lost "),
+        "{listed}"
+    );
+    crash(daemon);
+}
+
+#[test]
+fn agents_start_again_a_moment_apart_after_a_crash() {
+    let crystal = Crystal::new();
+    crystal.configure(
+        "notify = false\nname_from_prompt = false\n\n[plugins]\nmemory = false\n\n\
+         [sound]\nenabled = false\n\n[sessions]\nrestart_spacing_ms = 1500\n",
+    );
+    let bin = fake_claude(crystal.dir.path());
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let daemon = crystal.start_daemon();
+    for name in ["first", "second"] {
+        let out = crystal
+            .command(&["new", "-n", name, "claude"])
+            .env("PATH", &path)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+    }
+    crystal.ok(&["new", "-n", "shell", "sleep", "300"]);
+    eventually("all three are saved", || crystal.saved().contains("shell"));
+
+    crash(daemon);
+    let restarted = Instant::now();
+    // The next daemon starts the sessions again from this command's
+    // environment, which finds the fake claude.
+    let out = crystal
+        .command(&["new", "-n", "fresh", "sleep", "300"])
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    // The first agent and the shell are back as soon as the daemon answers;
+    // the second agent waits its turn.
+    assert_eq!(status(&crystal, "first"), "running");
+    assert_eq!(status(&crystal, "shell"), "running");
+    assert_eq!(status(&crystal, "second"), "starting");
+    // Attached meanwhile, its screen says so, then follows it as it starts.
+    let attached = crystal.attach(&["attach", "second"]);
+    attached.shows("starting second again after crystal's restart");
+    eventually("the second agent has started", || {
+        status(&crystal, "second") == "running"
+    });
+    assert!(restarted.elapsed() >= Duration::from_millis(1500));
+    attached.hides("starting second again");
+    eventually("the log says they're all back", || {
+        crystal
+            .ok(&["events"])
+            .contains("started cold: 3 sessions back")
+    });
+}
+
+#[test]
+fn the_tui_says_what_a_restart_couldn_t_start_and_starts_it_again() {
+    let crystal = Crystal::new();
+    let daemon = crystal.start_daemon();
+    let gone = crystal.dir.path().join("gone");
+    std::fs::create_dir(&gone).unwrap();
+    let out = crystal
+        .command(&["new", "-n", "lost", "sleep", "300"])
+        .current_dir(&gone)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    eventually("it's saved", || crystal.saved().contains("lost"));
+    crash(daemon);
+    std::fs::remove_dir(&gone).unwrap();
+    // Left behind by the crash, it would pass for the next daemon's.
+    std::fs::remove_file(&crystal.socket).unwrap();
+    let daemon = crystal.start_daemon();
+
+    let mut tui = crystal.tui();
+    tui.shows("after the restart: 1 couldn't start: lost");
+    tui.shows("couldn't start");
+    tui.shows("isn't there");
+    // Put right, Enter starts it again.
+    std::fs::create_dir(&gone).unwrap();
+    tui.type_keys("\r");
+    tui.shows("start lost again? y/n");
+    tui.type_keys("y");
+    eventually("it has started", || status(&crystal, "lost") == "running");
+    crash(daemon);
 }
 
 #[test]
@@ -3798,6 +4139,156 @@ fn a_daemon_from_before_handovers_is_restarted_cold() {
     );
     older.join().unwrap();
     assert_eq!(crystal.ok(&["ls"]), "");
+}
+
+#[test]
+fn a_session_and_a_shell_split_off_take_the_variables_env_gives() {
+    let crystal = Crystal::new();
+    let script = r#"echo "said $GREETING $EMPTY."; sleep 30"#;
+    let env = ["--env", "GREETING=hello=there", "-e", "EMPTY="];
+    let name = crystal.ok(&[
+        &["new", "-d", "-n", "greeter"][..],
+        &env,
+        &["sh", "-c", script],
+    ]
+    .concat());
+    assert_eq!(name, "greeter\n");
+    shows_on_screen(&crystal, "greeter", "said hello=there .");
+    let said = crystal.fails(&["new", "-d", "--env", "GREETING", "true"]);
+    assert!(said.contains("KEY=VALUE"), "{said}");
+
+    // With no session to show, a split is a new shell's, which says its
+    // name.
+    let split = crystal.ok(&[
+        "pane",
+        "split",
+        "--beside",
+        "greeter",
+        "--env",
+        "PLACE=split",
+    ]);
+    let split = split.trim();
+    let layout = crystal.ok(&["layout"]);
+    assert!(
+        layout.contains(&format!("the selection's: greeter\n      {split}\n")),
+        "{layout}"
+    );
+    crystal.ok(&["send", split, "echo at $PLACE"]);
+    shows_on_screen(&crystal, split, "at split");
+    let said = crystal.fails(&["pane", "split", "greeter", "--env", "A=b"]);
+    assert!(said.contains("cannot be used with"), "{said}");
+}
+
+#[test]
+fn a_new_terminal_runs_the_shell_the_settings_name() {
+    let crystal = Crystal::new();
+    crystal.configure(
+        "notify = false\n\n[plugins]\nmemory = false\n\n\
+         [terminal]\ndefault_shell = \"/bin/sh\"\nshell_mode = \"login\"\n",
+    );
+    crystal.ok(&["new", "-d", "-n", "login"]);
+    let sessions: serde_json::Value = serde_json::from_str(&crystal.ok(&["ls", "--json"])).unwrap();
+    assert_eq!(sessions[0]["command"], serde_json::json!(["/bin/sh", "-l"]));
+}
+
+#[test]
+fn the_tui_titles_its_terminal_after_the_selection_until_told_otherwise() {
+    let crystal = Crystal::new();
+    sessions_saying_here(&crystal, &["alpha"]);
+    let said = crystal.fails(&["title", "set", "nowhere"]);
+    assert!(said.contains("no TUI is running to show it"), "{said}");
+
+    let tui = crystal.tui();
+    // The terminal's own title is kept, for the end.
+    tui.wrote("\x1b[22;0t", 1);
+    tui.wrote("\x1b]2;crystal · alpha\x07", 1);
+    crystal.ok(&["title", "set", "deploying", "now"]);
+    tui.wrote("\x1b]2;deploying now\x07", 1);
+    crystal.ok(&["title", "clear"]);
+    tui.wrote("\x1b]2;crystal · alpha\x07", 2);
+}
+
+#[test]
+fn the_tab_bar_goes_over_the_footer_with_what_the_settings_put_at_its_right() {
+    let crystal = Crystal::new();
+    crystal.configure(
+        "notify = false\n\n[plugins]\nmemory = false\n\n[tab_bar]\nposition = \"bottom\"\n\
+         right = [{ type = \"text\", text = \"prod\" }, \
+         { type = \"command\", command = \"echo; echo $((1 + 1)) up\", every = \"1s\" }]\n",
+    );
+    sessions_saying_here(&crystal, &["alpha"]);
+    let tui = crystal.tui();
+    tui.shows("1 session · prod · 2 up");
+    let rows = tui.rows();
+    assert!(rows[22].starts_with(" crystal   1 "), "{rows:?}");
+    assert!(
+        rows[22].trim_end().ends_with("1 session · prod · 2 up"),
+        "{rows:?}"
+    );
+    assert!(!rows[0].contains("crystal"), "{rows:?}");
+}
+
+#[test]
+fn the_tab_bar_is_left_out_while_there_is_one_tab_when_told() {
+    let crystal = Crystal::new();
+    crystal.configure(
+        "notify = false\n\n[plugins]\nmemory = false\n\n[tab_bar]\nhide_when_single = true\n",
+    );
+    sessions_saying_here(&crystal, &["alpha"]);
+    let mut tui = crystal.tui();
+    sidebar_shows(&tui, "alpha");
+    tui.shows("alpha is here");
+    assert!(!tui.text().contains(" crystal "), "{}", tui.text());
+    tui.type_keys("t");
+    tui.shows(" crystal   1  2 ");
+}
+
+#[test]
+fn the_theme_follows_the_systems_appearance_while_the_tui_runs() {
+    let crystal = Crystal::new();
+    crystal.configure(
+        "notify = false\n\n[plugins]\nmemory = false\n\n[appearance]\nauto_switch = true\n",
+    );
+    // The system, as a Mac's defaults and a Linux desktop's settings say it,
+    // is dark until the file says light.
+    let bin = crystal.dir.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let appearance = crystal.dir.path().join("appearance");
+    std::fs::write(&appearance, "dark").unwrap();
+    let file = appearance.display();
+    script(
+        &bin.join("defaults"),
+        &format!(
+            "if [ \"$(cat {file})\" = dark ]; then echo Dark; \
+             else echo 'The domain/default pair does not exist' >&2; exit 1; fi\n"
+        ),
+    );
+    script(&bin.join("dbus-send"), "exit 1\n");
+    script(
+        &bin.join("gsettings"),
+        &format!(
+            "if [ \"$(cat {file})\" = dark ]; then echo \"'prefer-dark'\"; else echo \"'default'\"; fi\n"
+        ),
+    );
+    let path = path_of(&[&bin]);
+    let env = [
+        ("PATH", path.as_str()),
+        ("SSH_CONNECTION", ""),
+        ("SSH_TTY", ""),
+    ];
+    let tui = crystal.attach_with_env(&[], &env);
+    tui.shows("No sessions yet");
+    // How light the background behind crystal's name is.
+    let brightness = || {
+        let parser = tui.screen.lock().unwrap();
+        match parser.screen().cell(0, 1).map(|cell| cell.bgcolor()) {
+            Some(vt100::Color::Rgb(r, g, b)) => u32::from(r) + u32::from(g) + u32::from(b),
+            other => panic!("the background is {other:?}"),
+        }
+    };
+    assert!(brightness() < 200, "the dark theme");
+    std::fs::write(&appearance, "light").unwrap();
+    eventually("the theme turns light", || brightness() > 600);
 }
 
 #[test]
@@ -7072,15 +7563,17 @@ fn slash_filters_the_sidebar_and_enter_selects_the_match() {
 }
 
 /// A stand-in for GitHub's `gh`: it answers `pr list` and `issue list` with
-/// the JSON given, `pr view`, `pr diff` and `issue view` with a pull
-/// request and an issue of its own, and takes comments and edits. It
-/// writes each call it gets into `gh-calls` beside it, and what it's given
-/// on its standard input into `gh-input`. Returns the directory to put
-/// first on the PATH.
+/// the JSON given, and `pr list --state merged` with what's in
+/// `gh-merged.json` beside it (none, until a test writes some), `pr view`,
+/// `pr diff` and `issue view` with a pull request and an issue of its own,
+/// and takes comments and edits. It writes each call it gets into
+/// `gh-calls` beside it, and what it's given on its standard input into
+/// `gh-input`. Returns the directory to put first on the PATH.
 fn fake_gh(dir: &Path, pull_requests: &str, issues: &str) -> PathBuf {
     let bin = dir.join("gh-bin");
     std::fs::create_dir(&bin).unwrap();
     std::fs::write(dir.join("gh-prs.json"), pull_requests).unwrap();
+    std::fs::write(dir.join("gh-merged.json"), "[]").unwrap();
     std::fs::write(dir.join("gh-issues.json"), issues).unwrap();
     std::fs::write(dir.join("gh-pr.json"), PULL_REQUEST_READ).unwrap();
     std::fs::write(dir.join("gh-issue.json"), ISSUE_READ).unwrap();
@@ -7090,8 +7583,9 @@ fn fake_gh(dir: &Path, pull_requests: &str, issues: &str) -> PathBuf {
         &bin.join("gh"),
         &format!(
             r#"echo "$*" >> "{dir}/gh-calls"
-case "$1 $2 $3" in
-    "pr view --web") ;;
+case "$*" in
+    "pr view --web "*) ;;
+    "pr list --state merged "*) cat "{dir}/gh-merged.json" ;;
     "pr list "*) cat "{dir}/gh-prs.json" ;;
     "pr view "*) cat "{dir}/gh-pr.json" ;;
     "pr diff "*) cat "{dir}/forge.diff" ;;
@@ -7142,14 +7636,16 @@ index 3b18e51..a1b2c3d 100644
 ";
 
 /// A stand-in for GitLab's `glab`, like [`fake_gh`]: it answers `mr list`
-/// and `issue list` with the JSON given, `mr view`, `mr diff` and `issue
-/// view` with a merge request and an issue of its own, and takes notes. It
-/// writes each call it gets into `glab-calls` beside it, and what it's
-/// given on its standard input into `glab-input`.
+/// and `issue list` with the JSON given, `mr list --merged` with what's in
+/// `glab-merged.json`, `mr view`, `mr diff` and `issue view` with a merge
+/// request and an issue of its own, and takes notes. It writes each call it
+/// gets into `glab-calls` beside it, and what it's given on its standard
+/// input into `glab-input`.
 fn fake_glab(dir: &Path, merge_requests: &str, issues: &str) -> PathBuf {
     let bin = dir.join("glab-bin");
     std::fs::create_dir(&bin).unwrap();
     std::fs::write(dir.join("glab-mrs.json"), merge_requests).unwrap();
+    std::fs::write(dir.join("glab-merged.json"), "[]").unwrap();
     std::fs::write(dir.join("glab-issues.json"), issues).unwrap();
     std::fs::write(dir.join("glab-mr.json"), MERGE_REQUEST_READ).unwrap();
     std::fs::write(dir.join("forge.diff"), PULL_REQUEST_DIFF).unwrap();
@@ -7160,14 +7656,15 @@ fn fake_glab(dir: &Path, merge_requests: &str, issues: &str) -> PathBuf {
         &bin.join("glab"),
         &format!(
             r#"echo "$*" >> "{dir}/glab-calls"
-case "$1 $2" in
-    "mr list") cat "{dir}/glab-mrs.json" ;;
-    "mr view") cat "{dir}/glab-mr.json" ;;
-    "mr diff") cat "{dir}/forge.diff" ;;
-    "mr note"|"issue update") cat > "{dir}/glab-input" ;;
-    "issue list") cat "{dir}/glab-issues.json" ;;
-    "issue view") cat "{dir}/glab-issue.json" ;;
-    "issue note") ;;
+case "$*" in
+    "mr list --merged"*) cat "{dir}/glab-merged.json" ;;
+    "mr list"*) cat "{dir}/glab-mrs.json" ;;
+    "mr view"*) cat "{dir}/glab-mr.json" ;;
+    "mr diff"*) cat "{dir}/forge.diff" ;;
+    "mr note"*|"issue update"*) cat > "{dir}/glab-input" ;;
+    "issue list"*) cat "{dir}/glab-issues.json" ;;
+    "issue view"*) cat "{dir}/glab-issue.json" ;;
+    "issue note"*) ;;
     *) echo "unexpected: $*" >&2; exit 1 ;;
 esac
 "#
@@ -7403,6 +7900,87 @@ fn capital_o_reads_a_pull_request_shows_its_diff_and_comments_on_it() {
 }
 
 #[test]
+fn pull_requests_are_marked_merged_or_conflicting_and_counted_in_the_top_bar() {
+    let crystal = Crystal::new();
+    let dir = crystal.dir.path();
+    let repo = github_repo(dir);
+    let open = r#"[
+        {"number": 57, "title": "Fix the login redirect", "author": {"login": "ana"},
+         "headRefName": "fix-login", "isDraft": false, "mergeable": "CONFLICTING",
+         "updatedAt": "2026-10-02T09:30:00Z", "url": "https://github.com/acme/app/pull/57"},
+        {"number": 58, "title": "Dark mode", "author": {"login": "bo"},
+         "headRefName": "dark", "isDraft": true, "mergeable": "MERGEABLE",
+         "updatedAt": "2026-10-01T09:30:00Z", "url": "https://github.com/acme/app/pull/58"}
+    ]"#;
+    let issues = r#"[
+        {"number": 7, "title": "Dark mode", "labels": [], "updatedAt": "2026-09-01T10:00:00Z",
+         "author": {"login": "bo"}, "url": "https://github.com/acme/app/issues/7"},
+        {"number": 42, "title": "Fix login redirect", "labels": [],
+         "updatedAt": "2026-10-01T10:00:00Z", "author": {"login": "ana"},
+         "url": "https://github.com/acme/app/issues/42"}
+    ]"#;
+    let bin = fake_gh(dir, open, issues);
+    let merged = r#"[{"number": 41, "title": "Faster startup", "author": {"login": "cy"},
+        "headRefName": "startup", "updatedAt": "2026-09-30T09:30:00Z",
+        "url": "https://github.com/acme/app/pull/41"}]"#;
+    std::fs::write(dir.join("gh-merged.json"), merged).unwrap();
+    let repo_arg = repo.to_str().unwrap();
+    // The worktree of a pull request that has merged.
+    crystal.ok(&[
+        "new", "-n", "starter", "-c", repo_arg, "-w", "startup", "sleep", "30",
+    ]);
+
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let mut tui = crystal.attach_with_env(&[], &[("PATH", &path)]);
+    tui.shows("#41 merged");
+    tui.shows("1 session · 2 prs · 2 issues");
+
+    tui.type_keys("O");
+    tui.shows("pull requests · app");
+    tui.shows("2 open");
+    tui.shows("Fix the login redirect  conflicts");
+    tui.shows("conflicts with main: it can't merge as it stands");
+    tui.shows("Dark mode  draft");
+    tui.shows("Faster startup  merged");
+
+    // Ctrl+R asks the forge again.
+    let gh_calls = dir.join("gh-calls");
+    let listed = || {
+        calls(&gh_calls)
+            .lines()
+            .filter(|call| call.starts_with("pr list --state open"))
+            .count()
+    };
+    let before = listed();
+    tui.type_keys("\x12");
+    eventually("gh is asked for the list again", || listed() > before);
+    tui.type_keys("\x1b");
+    tui.hides("pull requests · app");
+
+    // Hidden in the settings, drafts leave the list and the count. Theirs
+    // is the last row, which the view scrolls to.
+    tui.type_keys(",");
+    tui.shows("○ notifications");
+    tui.type_keys(&"j".repeat(20));
+    tui.shows("○ hide drafts");
+    tui.type_keys(" ");
+    tui.shows("● hide drafts");
+    let config = || std::fs::read_to_string(crystal.config_file()).unwrap();
+    eventually("hiding drafts is written down", || {
+        config().contains("[forge]\nhide_draft_prs = true")
+    });
+    // The count follows at once, the settings still open; an `O` typed
+    // before the Esc has closed them would be read with it as Alt+O.
+    tui.shows("1 session · 1 pr · 2 issues");
+    tui.type_keys("\x1b");
+    tui.hides("hide drafts");
+    tui.type_keys("O");
+    tui.shows("1 open · 1 draft hidden");
+    tui.shows("Fix the login redirect");
+    tui.hides("Dark mode");
+}
+
+#[test]
 fn enter_on_a_pull_request_starts_a_session_in_its_worktree_forks_too() {
     let crystal = Crystal::new();
     let dir = crystal.dir.path();
@@ -7495,6 +8073,50 @@ fn enter_on_a_pull_request_starts_a_session_in_its_worktree_forks_too() {
 }
 
 #[test]
+fn slash_finds_a_pull_request_a_project_with_nothing_running_and_keeps_to_a_status() {
+    let crystal = Crystal::new();
+    let dir = crystal.dir.path();
+    let repo = github_repo(dir);
+    let bin = fake_gh(dir, OPEN_PULL_REQUEST, NO_ISSUES);
+    let api = git_repo(dir, "api");
+    crystal.ok(&["project", "add", api.to_str().unwrap()]);
+    let repo_arg = repo.to_str().unwrap();
+    crystal.ok(&["new", "-n", "planner", "-c", repo_arg, "sleep", "30"]);
+
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let mut tui = crystal.attach_with_env(&[], &[("PATH", &path)]);
+    tui.shows("▸ planner");
+
+    // A pull request, by a word of its title, opens in the view.
+    tui.type_keys("/redirect");
+    tui.shows("#57 Fix the login");
+    tui.shows("1 match");
+    tui.type_keys("\r");
+    tui.shows("pull requests · app");
+    tui.shows("ana wants to merge fix-login into main");
+    tui.type_keys("\x1b");
+    tui.shows("▸ planner");
+
+    // A project with nothing running: the selection goes onto it.
+    tui.type_keys("/api");
+    tui.shows("1 match");
+    tui.type_keys("\r");
+    tui.shows("No sessions in ⎇ main");
+    tui.shows("api ▸ main");
+
+    // Tab keeps to one status: nothing waits, and the shell is idle.
+    tui.type_keys("/\t");
+    tui.shows("find waiting:");
+    tui.shows("0 matches");
+    tui.type_keys("\x1b[Z\x1b[Z\x1b[Z");
+    tui.shows("find idle:");
+    eventually("the idle shell is found", || {
+        sidebar_of(&tui.text()).contains("planner")
+    });
+    tui.shows("1 match");
+}
+
+#[test]
 fn an_issue_takes_a_comment_and_a_new_title() {
     let crystal = Crystal::new();
     let repo = github_repo(crystal.dir.path());
@@ -7548,6 +8170,11 @@ fn on_gitlab_merge_requests_and_issues_go_through_glab() {
         "updated_at": "2026-10-01T10:00:00Z", "author": {"username": "di"},
         "web_url": "https://gitlab.com/acme/app/-/work_items/8"}]"#;
     let glab = fake_glab(crystal.dir.path(), merge_requests, issues);
+    let merged = r#"[{"iid": 50, "title": "Faster startup", "author": {"username": "cy"},
+        "source_branch": "startup", "source_project_id": 7, "target_project_id": 7,
+        "updated_at": "2026-09-30T09:30:00Z",
+        "web_url": "https://gitlab.com/acme/app/-/merge_requests/50"}]"#;
+    std::fs::write(crystal.dir.path().join("glab-merged.json"), merged).unwrap();
     let repo_arg = repo.to_str().unwrap();
     crystal.ok(&[
         "new",
@@ -7567,6 +8194,7 @@ fn on_gitlab_merge_requests_and_issues_go_through_glab() {
     tui.type_keys("O");
     tui.shows("merge requests · app");
     tui.shows("Fix the login redirect  draft");
+    tui.shows("Faster startup  merged");
     tui.shows("✗ pipeline");
     tui.shows("Why here?");
     tui.shows("cy approved");
@@ -7652,6 +8280,17 @@ fn d_shows_what_changed_in_the_selected_sessions_worktree() {
     tui.shows("notes.md");
     tui.shows("todo.txt");
     tui.shows("+ - ask about fees");
+
+    // `/` filters the files by a few letters of their paths.
+    tui.type_keys("/tdo");
+    tui.shows("1 match");
+    tui.hides("notes.md");
+    tui.shows("+ write the tests");
+    // Enter keeps the filter; Esc then clears it.
+    tui.type_keys("\r");
+    tui.type_keys("\x1b");
+    tui.shows("notes.md");
+    tui.hides("1 match");
 
     // The branch, the way its pull request would read.
     tui.type_keys("b");
@@ -8027,6 +8666,41 @@ fn capital_b_makes_a_branch_and_switches_back_stashing_the_changes() {
         stashed.contains("crystal: spike before switching to main"),
         "{stashed}"
     );
+}
+
+#[test]
+fn capital_b_fetches_the_remotes_so_their_new_branches_are_listed() {
+    let crystal = Crystal::new();
+    let dir = crystal.dir.path();
+    let repo = git_repo(dir, "app");
+    let origin = dir.join("origin.git");
+    let origin_arg = origin.to_str().unwrap();
+    git(dir, &["init", "-q", "--bare", "-b", "main", origin_arg]);
+    git(&repo, &["remote", "add", "origin", origin_arg]);
+    git(&repo, &["push", "-q", "origin", "main"]);
+    // Pushed from somewhere else: the repository hasn't fetched it.
+    git(&origin, &["branch", "from-elsewhere", "main"]);
+    crystal.ok(&[
+        "new",
+        "-n",
+        "agent",
+        "-c",
+        repo.to_str().unwrap(),
+        "sleep",
+        "30",
+    ]);
+
+    let mut tui = crystal.tui();
+    tui.shows("agent");
+    tui.type_keys("B");
+    tui.shows("switch branch");
+    tui.shows("origin/from-elsewhere");
+    tui.hides("fetching…");
+
+    // Ctrl+R fetches again, however lately it did.
+    git(&origin, &["branch", "later", "main"]);
+    tui.type_keys("\x12");
+    tui.shows("origin/later");
 }
 
 #[test]
@@ -9171,7 +9845,6 @@ fn the_settings_view_changes_the_config_and_follows_it_live() {
 
     tui.type_keys(",");
     tui.shows("○ notifications");
-    tui.shows("not downloaded (2449 MB)");
     tui.type_keys(" ");
     tui.shows("● notifications");
     assert!(config().starts_with("notify = true\n"), "{}", config());
@@ -9190,11 +9863,16 @@ fn the_settings_view_changes_the_config_and_follows_it_live() {
     crystal.configure(
         "notify = true\ntheme = \"light\"\n\n[memory]\ndistill = false\nembeddings = false\n",
     );
+    // Memory's rows are ten down from the theme, past the appearance's,
+    // the tab bar's, the spacing of restarts and the mouse's, which the
+    // view scrolls to on a screen too short for all of them.
+    tui.type_keys("jjjjjjjjjj");
     tui.shows("○ distill closed tasks");
+    tui.shows("not downloaded (2449 MB)");
 
     // Turned on, search by meaning has the daemon get the models, and the
     // view follows how that goes: here, a download that fails.
-    tui.type_keys("jjj ");
+    tui.type_keys("j ");
     tui.shows("● search by meaning");
     assert!(
         config().contains("[memory]\ndistill = false\nembeddings = true\n"),

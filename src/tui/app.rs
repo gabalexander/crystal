@@ -31,8 +31,9 @@ use super::preview::Content;
 use super::profiles::{self, ProfilesView};
 use super::pull_requests::{self, PullRequestsView};
 use super::reply::ReplyBox;
+use super::restarted::{Restarted, Restarts};
 use super::review;
-use super::search;
+use super::search::{self, Around, StatusFilter};
 use super::settings_view::{self, SettingsView};
 use super::split_tree::{Direction, Pane, SplitTree, Way};
 use super::status::Status;
@@ -43,7 +44,7 @@ use super::timeline::{self, TimelineView};
 use super::tree_browser::TreeBrowser;
 use crate::catalog::{self, Agent};
 use crate::client::Purpose;
-use crate::config::{Config, Fold, SIDEBAR_WIDTHS};
+use crate::config::{BarPosition, Config, Fold, MouseSettings, SIDEBAR_WIDTHS, TabBarSettings};
 use crate::events::Event;
 use crate::flow_run::{FlowRun, RunState};
 use crate::flows::{self, Flow};
@@ -103,6 +104,9 @@ pub enum Hit {
         slot: Slot,
         cell: Option<(u16, u16)>,
     },
+    /// The scrollbar beside the screen of the pane at `slot`: `row` of it,
+    /// counted from 0 at the screen's top row.
+    Scrollbar { slot: Slot, row: u16 },
     /// The border between the two sides of a split of the tab's panes: the
     /// rule between panes side by side, or, beside the name on it, the
     /// header line of a pane below another. `split` counts the splits in
@@ -462,6 +466,21 @@ pub enum Action {
     /// The mouse let go: put what it selected in the pane at this slot on
     /// the clipboard.
     CopySelection(Slot),
+    /// The mouse let go, and what it selected is copied with copy mode's
+    /// keys: copy mode comes on in the pane at this slot, if anything was
+    /// selected, the selection kept.
+    HoldSelection(Slot),
+    /// The mouse went down on `row` of the scrollbar of the pane at
+    /// `slot`: it takes the thumb there, or the thumb jumps there.
+    GrabThumb {
+        slot: Slot,
+        row: u16,
+    },
+    /// The mouse dragged the thumb it took to `row` of the scrollbar.
+    DragThumb {
+        slot: Slot,
+        row: u16,
+    },
     /// Open `topic`, of the project at `project`, in the browser.
     OpenInBrowser {
         project: PathBuf,
@@ -473,6 +492,10 @@ pub enum Action {
     /// Ask the forge for the open pull requests of the project at this
     /// path, for the pull requests view that's now open.
     ListPullRequests(PathBuf),
+    /// Ask the forges of the projects at these paths for their open pull
+    /// requests, for `/` to find: the projects no session is in, which
+    /// nothing else asks about.
+    FindPullRequests(Vec<PathBuf>),
     /// Post `text` on `topic`, of the project at `project`.
     Comment {
         project: PathBuf,
@@ -510,6 +533,12 @@ pub enum Action {
     /// List the branches of the worktree at this directory, and its
     /// changes, off the event loop.
     ListBranches(PathBuf),
+    /// Fetch the remotes of the worktree at `dir`, off the event loop:
+    /// `now`, or unless they were a moment ago.
+    FetchBranches {
+        dir: PathBuf,
+        now: bool,
+    },
     /// Move the worktree at `dir` onto `target`, its changes going as
     /// `carry` says, off the event loop.
     SwitchBranch {
@@ -651,15 +680,62 @@ pub struct PluginPane {
     pub session: String,
 }
 
-/// The sidebar narrowed to the sessions that match what's typed, while `/`
-/// is open. The selection stays where it was until Enter moves it to the
-/// session the bar is on.
+/// The sidebar narrowed to what matches what's typed, while `/` is open:
+/// the sessions, of every tab, and the projects, worktrees with no
+/// sessions, flow runs and open pull requests: see [`search`]. The
+/// selection stays where it was until Enter picks what the bar is on.
 #[derive(Debug, Default)]
 pub struct Filter {
     pub input: TextInput,
-    /// The session the bar is on, by its id: the sessions are put in order
-    /// again with every fresh list, so an index wouldn't keep to it.
-    highlighted: Option<String>,
+    /// The one status Tab has picked, when it has: only the sessions with
+    /// it are found.
+    pub status: Option<StatusFilter>,
+    /// What the bar is on: the rows are laid out again with every fresh
+    /// list, so a row's place wouldn't keep to it.
+    highlighted: Option<Found>,
+}
+
+/// What `/`'s bar can be on, which Enter or a click picks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Found {
+    /// A session, by its id: picking it selects it.
+    Session(String),
+    /// A worktree with no sessions, a project's main one or a linked one,
+    /// by its directory: picking it puts the selection on it, where Enter
+    /// starts something.
+    Worktree(PathBuf),
+    /// A flow run, by its name: picking it selects the step it's at.
+    Flow(String),
+    /// An open pull request, by its project's main worktree and its
+    /// number: picking it opens the pull requests view on it.
+    PullRequest { project: PathBuf, number: u64 },
+}
+
+/// How many pull requests and issues are open on a project's forge, for
+/// the tab bar: each `None` until its forge has listed them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OpenOnForge {
+    pub forge: Forge,
+    pub pull_requests: Option<Counted>,
+    pub issues: Option<Counted>,
+}
+
+/// How many of something there are to show, and whether the forge listed
+/// as many as it gives at once, so there may be more beyond them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Counted {
+    pub count: usize,
+    pub more: bool,
+}
+
+impl Counted {
+    /// `count` shown, of `listed` the forge listed.
+    fn of(count: usize, listed: usize) -> Counted {
+        Counted {
+            count,
+            more: listed >= forge::LIMIT,
+        }
+    }
 }
 
 pub struct App {
@@ -746,6 +822,12 @@ pub struct App {
     /// The pane a drag of the mouse started in, while the button is down:
     /// the drag is a selection in that pane to the end, wherever it goes.
     dragging: Option<Slot>,
+    /// The pane whose scrollbar's thumb the mouse took, while the button
+    /// is down: the thumb follows it, wherever it goes.
+    holding_thumb: Option<Slot>,
+    /// The pane the keyboard was typing into when the mouse put it in copy
+    /// mode, to go back to when copy mode is over.
+    copied_from: Option<Slot>,
     /// The pane taken by its header line, while the button is down, and
     /// the pane the mouse is over now: letting go there swaps the two.
     grabbed: Option<Grab>,
@@ -766,10 +848,15 @@ pub struct App {
     screen: Rect,
     /// `/`'s filter on the sidebar, while it's open.
     filter: Option<Filter>,
-    /// What its forge said about each project's open pull requests, by the
-    /// project's main worktree: the forge and the pull requests, or why
-    /// there are none to show.
+    /// What its forge said about each project's open pull requests, and
+    /// those merged lately, by the project's main worktree: the forge and
+    /// the pull requests, or why there are none to show.
     pull_requests: HashMap<PathBuf, Result<(Forge, Vec<PullRequest>), String>>,
+    /// What its forge said about each project's open issues, the same way.
+    open_issues: HashMap<PathBuf, Result<(Forge, Vec<Issue>), String>>,
+    /// Whether draft pull requests are left out of the pull requests view,
+    /// the tab bar's count and `/`, as the settings say.
+    hide_draft_prs: bool,
     /// The issues view, while it's open.
     issues: Option<IssuesView>,
     /// The pull requests view, while it's open.
@@ -836,6 +923,11 @@ pub struct App {
     /// Whether the footer says what happened while the user was away: until
     /// the next key.
     away_shown: bool,
+    /// What the TUI has seen of sessions starting again after a restart.
+    restarts: Restarts,
+    /// The footer's line on what a restart brought back and what it
+    /// couldn't, until the next key.
+    restarted: Option<Restarted>,
     /// Which command each sidebar key runs, the prefix and the key that
     /// hands the keyboard back: see [`super::keymap`].
     keymap: Keymap,
@@ -855,6 +947,30 @@ pub struct App {
     pin_needs_you: bool,
     /// Whether the sidebar's edge is being dragged with the mouse.
     dragging_sidebar: bool,
+    /// Where the tab bar goes and what it shows at its right.
+    tab_bar: TabBar,
+    /// What the terminal's title says in place of `[window] title`, as
+    /// `crystal title set` gave it, until `crystal title clear`.
+    title_override: Option<String>,
+    /// Where a new tab's shell starts, and a session started with none
+    /// selected: `None` follows the selection. See
+    /// [`crate::config::NewCwd`].
+    start_dir: Option<PathBuf>,
+    /// What the mouse does, as the config has it.
+    mouse: MouseSettings,
+}
+
+/// The tab bar as the settings have it, and what its right shows.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TabBar {
+    pub position: BarPosition,
+    /// Left out while there's only one tab.
+    pub hide_when_single: bool,
+    /// What goes between two things at its right.
+    pub separator: String,
+    /// What each of `[tab_bar] right` shows, as it was last worked out:
+    /// see [`super::status_bar`].
+    pub status: Vec<String>,
 }
 
 /// How wide the sidebar is and whether it's folded, as the user left it,
@@ -921,6 +1037,8 @@ impl App {
             focus: Focus::Sidebar,
             last_pane: None,
             dragging: None,
+            holding_thumb: None,
+            copied_from: None,
             grabbed: None,
             link_hover: None,
             own_id,
@@ -929,6 +1047,8 @@ impl App {
             screen: Rect::new(0, 0, 80, 24),
             filter: None,
             pull_requests: HashMap::new(),
+            open_issues: HashMap::new(),
+            hide_draft_prs: false,
             issues: None,
             pull_requests_view: None,
             view: None,
@@ -957,6 +1077,8 @@ impl App {
             needs_you: None,
             away: None,
             away_shown: false,
+            restarts: Restarts::default(),
+            restarted: None,
             keymap: Keymap::default(),
             prefixed: false,
             command_list: None,
@@ -965,6 +1087,13 @@ impl App {
             fold: Fold::Marks,
             pin_needs_you: true,
             dragging_sidebar: false,
+            tab_bar: TabBar {
+                separator: TabBarSettings::default().separator,
+                ..TabBar::default()
+            },
+            title_override: None,
+            start_dir: None,
+            mouse: MouseSettings::default(),
         }
     }
 
@@ -980,6 +1109,49 @@ impl App {
         }
         self.fold = settings.fold;
         self.pin_needs_you = settings.needs_you;
+        self.mouse = config.mouse.clone();
+        let bar = &config.tab_bar;
+        self.tab_bar.position = bar.position;
+        self.tab_bar.hide_when_single = bar.hide_when_single;
+        self.tab_bar.separator = bar.separator.clone();
+        // What's shown follows the entries: a line for each, once it's
+        // worked out.
+        if bar.right.len() != self.tab_bar.status.len() {
+            self.tab_bar.status = vec![String::new(); bar.right.len()];
+        }
+    }
+
+    /// The tab bar's settings, and what its right shows.
+    pub fn tab_bar(&self) -> &TabBar {
+        &self.tab_bar
+    }
+
+    /// Whether the tab bar is drawn: unless it's left out while there's
+    /// only one tab, and there is.
+    pub fn tab_bar_shown(&self) -> bool {
+        !(self.tab_bar.hide_when_single && self.tabs.all().len() == 1)
+    }
+
+    /// Takes what each thing at the tab bar's right shows now.
+    pub fn set_status(&mut self, status: Vec<String>) {
+        self.tab_bar.status = status;
+    }
+
+    /// What `crystal title set` gave the terminal's title, until `crystal
+    /// title clear`.
+    pub fn title_override(&self) -> Option<&str> {
+        self.title_override.as_deref()
+    }
+
+    /// Takes where a new tab's shell starts, and a session started with
+    /// none selected: `None` to follow the selection.
+    pub fn set_start_dir(&mut self, dir: Option<PathBuf>) {
+        self.start_dir = dir;
+    }
+
+    /// Whether each pane has a scrollbar beside its screen.
+    pub fn scrollbars(&self) -> bool {
+        self.mouse.scrollbars
     }
 
     /// Takes the sidebar's shape the TUI kept, and whether the config has it
@@ -1077,6 +1249,7 @@ impl App {
         self.memory_on = crate::memory::enabled(config);
         self.profiles_on = profile::enabled(config);
         self.github_on = forge::enabled(config);
+        self.hide_draft_prs = config.forge.hide_draft_prs;
         self.flows_on = flows::enabled(config);
     }
 
@@ -1414,10 +1587,25 @@ impl App {
     }
 
     /// Takes the branches listed for the branch switcher, if it's still
-    /// open on their worktree.
-    pub fn branches_listed(&mut self, dir: &Path, listed: Result<switcher::Listed, String>) {
-        if let Some(View::Branches(switcher)) = &mut self.view {
-            switcher.listed_done(dir, listed);
+    /// open on their worktree, and what that asks for next: listed the
+    /// first time, the remotes fetched.
+    pub fn branches_listed(
+        &mut self,
+        dir: &Path,
+        listed: Result<switcher::Listed, String>,
+    ) -> Option<Action> {
+        match &mut self.view {
+            Some(View::Branches(switcher)) => switcher.listed_done(dir, listed),
+            _ => None,
+        }
+    }
+
+    /// The remotes of the worktree at `dir` have been fetched, or why they
+    /// couldn't, for the switcher, if it's still open on it.
+    pub fn branches_fetched(&mut self, dir: &Path, fetched: Result<(), String>) -> Option<Action> {
+        match &mut self.view {
+            Some(View::Branches(switcher)) => switcher.fetched(dir, fetched),
+            _ => None,
         }
     }
 
@@ -1535,6 +1723,12 @@ impl App {
         Some(&away.line)
     }
 
+    /// The footer's line on what a restart brought back and what it
+    /// couldn't, until the next key.
+    pub fn restarted(&self) -> Option<&Restarted> {
+        self.restarted.as_ref()
+    }
+
     /// Takes what the event log gained while the user was away. When
     /// something worth saying happened, the footer says it, and the
     /// timeline opened next marks what's new since.
@@ -1616,9 +1810,9 @@ impl App {
 
     /// The sidebar's rows: the sessions under their projects and worktrees,
     /// only those that match while `/`'s filter is open. The linked
-    /// worktrees with no sessions come under their projects too, except
-    /// while the filter is open: it finds sessions. A folded project is its
-    /// heading alone.
+    /// worktrees with no sessions come under their projects too, but while
+    /// the filter is open, it adds those it found, with the rest it found:
+    /// see [`App::add_found`]. A folded project is its heading alone.
     pub fn rows(&self) -> Vec<Row> {
         self.rows_folded(true)
     }
@@ -1638,6 +1832,9 @@ impl App {
         let mut rows = groups::rows(&self.sessions, self.shown_flows(), &empty, |index| {
             shown.contains(&index)
         });
+        if let Some(filter) = &self.filter {
+            self.add_found(filter, &mut rows);
+        }
         // The projects with no sessions go after those with some, ahead of
         // the sessions outside any repository.
         if self.filter.is_none() {
@@ -1698,6 +1895,112 @@ impl App {
                 _ => !folding,
             })
             .collect()
+    }
+
+    /// Adds to the `rows` of the sessions `/`'s filter found the rest of
+    /// what it found, each under its project: the projects with no
+    /// sessions, the worktrees with none and the open pull requests that
+    /// match. Only once something's typed, and while no status is picked:
+    /// before that, they would be everything crystal knows, and they have
+    /// no status.
+    fn add_found(&self, filter: &Filter, rows: &mut Vec<Row>) {
+        let query = filter.input.text();
+        if filter.status.is_some() || query.trim().is_empty() {
+            return;
+        }
+        // Each project's rows, in the order their headings would go in.
+        let mut found: Vec<(PathBuf, Vec<Row>)> = Vec::new();
+        let mut under = |project: &Path, more: Vec<Row>| match found
+            .iter_mut()
+            .find(|(path, _)| path == project)
+        {
+            Some((_, rows)) => rows.extend(more),
+            None => found.push((project.to_path_buf(), more)),
+        };
+        for project in self.quiet_projects() {
+            if search::worktree_match(query, project, None) {
+                under(
+                    &project.path,
+                    vec![
+                        Row::Worktree {
+                            project: project.path.clone(),
+                            path: project.path.clone(),
+                            branch: project.branch.clone(),
+                            main: true,
+                            in_progress: project.in_progress,
+                        },
+                        Row::NoSessions(project.path.clone()),
+                    ],
+                );
+            }
+        }
+        let mut empty = self.empty_worktrees();
+        empty.retain(|worktree| {
+            search::worktree_match(query, worktree, self.subject_of(&worktree.path))
+        });
+        let mut projects: Vec<&PathBuf> = empty.iter().map(|w| &w.project_path).collect();
+        projects.extend(self.pull_requests.keys());
+        projects.sort_by_key(|project| self.known_place(project));
+        projects.dedup();
+        for project in projects {
+            under(project, groups::empty_rows(&empty, project));
+            let name = self.project_name(project);
+            under(project, self.found_pull_requests(query, project, &name));
+        }
+        found.retain(|(_, rows)| !rows.is_empty());
+        let found = found
+            .into_iter()
+            .map(|(path, rows)| (self.project_name(&path), path, rows))
+            .collect();
+        search::place_under_projects(rows, found);
+    }
+
+    /// The rows of the open pull requests of the project at `project`,
+    /// called `name`, that match `query`, as its forge listed them, but the
+    /// drafts while the settings hide them: none while the github plugin is
+    /// off, or before its forge has said.
+    fn found_pull_requests(&self, query: &str, project: &Path, name: &str) -> Vec<Row> {
+        if !self.github_on {
+            return Vec::new();
+        }
+        let Some(Ok((_, pull_requests))) = self.pull_requests.get(project) else {
+            return Vec::new();
+        };
+        pull_requests
+            .iter()
+            .filter(|pull_request| !pull_request.merged)
+            .filter(|pull_request| !(self.hide_draft_prs && pull_request.draft))
+            .filter(|pull_request| search::pull_request_match(query, pull_request, name).is_some())
+            .map(|pull_request| Row::PullRequest {
+                project: project.to_path_buf(),
+                number: pull_request.number,
+            })
+            .collect()
+    }
+
+    /// Where the project at `project` comes among the projects crystal
+    /// knows, for the order of the headings `/` adds: the ones it doesn't
+    /// know after them, by their paths.
+    fn known_place(&self, project: &Path) -> (usize, PathBuf) {
+        let place = self.known.iter().position(|known| known.path == project);
+        (place.unwrap_or(usize::MAX), project.to_path_buf())
+    }
+
+    /// The name of the project at `project`, by its main worktree: as its
+    /// sessions or crystal's list of projects say, or else its directory's.
+    fn project_name(&self, project: &Path) -> String {
+        let named = self
+            .sessions
+            .iter()
+            .filter_map(|session| session.worktree.as_ref())
+            .chain(&self.known)
+            .find(|worktree| worktree.project_path == project);
+        match named {
+            Some(worktree) => worktree.project.clone(),
+            None => project
+                .file_name()
+                .map_or_else(String::new, |name| name.to_string_lossy().into_owned()),
+        }
     }
 
     /// The sessions the sidebar pins at its top, from every tab: those
@@ -1970,6 +2273,11 @@ impl App {
     /// worktree was removed, or isn't in the tab in front, it goes back to
     /// the selected session.
     fn keep_selection_on_a_row(&mut self) {
+        // While `/`'s filter is open, the rows are what it found: the
+        // selection is looked at again once it closes.
+        if self.filter.is_some() {
+            return;
+        }
         let Some(path) = self.on_worktree.clone() else {
             return;
         };
@@ -1998,10 +2306,63 @@ impl App {
         let Some(filter) = &self.filter else {
             return self.in_tab();
         };
-        let query = filter.input.text();
         (0..self.sessions.len())
-            .filter(|&index| search::session_match(query, &self.sessions[index]).is_some())
+            .filter(|&index| self.session_found(filter, index).is_some())
             .collect()
+    }
+
+    /// Whether `filter` finds the session at `index`, and if it does, which
+    /// letters of its name it matched: one with the status it keeps to,
+    /// when it keeps to one, that matches what's typed, by itself, the
+    /// name of its tab or the flow run it's a step of.
+    fn session_found(&self, filter: &Filter, index: usize) -> Option<Vec<usize>> {
+        let session = &self.sessions[index];
+        if let Some(status) = filter.status
+            && !status.keeps(Status::of(session))
+        {
+            return None;
+        }
+        let tab = self.tabs.tab_of(&session.name);
+        let tab = tab.map(|tab| self.tabs.all()[tab].name.as_str());
+        let flows = self.shown_flows();
+        let run = groups::flow_step(session, flows).map(|(run, _)| &flows[run]);
+        let around = Around {
+            tab: tab.filter(|name| !name.is_empty()),
+            run,
+        };
+        search::session_match(filter.input.text(), session, around)
+    }
+
+    /// What the bar of `/`'s filter can be on, in the sidebar's order.
+    pub fn found(&self) -> Vec<Found> {
+        self.rows()
+            .iter()
+            .filter_map(|row| self.found_at(row))
+            .collect()
+    }
+
+    /// What picking `row` picks, while `/`'s filter is open: `None` for a
+    /// heading, or a line that goes with the row above it.
+    fn found_at(&self, row: &Row) -> Option<Found> {
+        Some(match row {
+            Row::Session(index) => Found::Session(self.sessions[*index].id.clone()),
+            Row::NoSessions(path) => Found::Worktree(path.clone()),
+            Row::Flow(run) => Found::Flow(self.shown_flows().get(*run)?.name.clone()),
+            Row::PullRequest { project, number } => Found::PullRequest {
+                project: project.clone(),
+                number: *number,
+            },
+            _ => return None,
+        })
+    }
+
+    /// The row `/`'s bar is on, by its place in [`App::rows`], while the
+    /// filter is open and the bar is on something it found.
+    pub fn filter_row(&self) -> Option<usize> {
+        let highlighted = self.filter.as_ref()?.highlighted.as_ref()?;
+        self.rows()
+            .iter()
+            .position(|row| self.found_at(row).as_ref() == Some(highlighted))
     }
 
     /// The name of the tab the session at `index` is in, while `/`'s filter
@@ -2045,18 +2406,36 @@ impl App {
         let Some(filter) = &self.filter else {
             return Vec::new();
         };
-        let session = &self.sessions[index];
-        search::session_match(filter.input.text(), session).unwrap_or_default()
+        self.session_found(filter, index).unwrap_or_default()
+    }
+
+    /// The open pull request numbered `number` of the project at
+    /// `project`, as its forge last listed them, and while `/`'s filter is
+    /// open, which letters of its title to mark.
+    pub fn found_pull_request(
+        &self,
+        project: &Path,
+        number: u64,
+    ) -> Option<(&PullRequest, Vec<usize>)> {
+        let Some(Ok((_, pull_requests))) = self.pull_requests.get(project) else {
+            return None;
+        };
+        let pull_request = pull_requests.iter().find(|pr| pr.number == number)?;
+        let marked = self.filter.as_ref().and_then(|filter| {
+            let name = self.project_name(project);
+            search::pull_request_match(filter.input.text(), pull_request, &name)
+        });
+        Some((pull_request, marked.unwrap_or_default()))
     }
 
     /// The session the sidebar's bar is on: the one the filter's bar is on
     /// while it's open, or else the selected one.
     pub fn sidebar_cursor(&self) -> Option<usize> {
         match &self.filter {
-            Some(filter) => {
-                let id = filter.highlighted.as_ref()?;
-                self.sessions.iter().position(|session| session.id == *id)
-            }
+            Some(filter) => match filter.highlighted.as_ref()? {
+                Found::Session(id) => self.sessions.iter().position(|session| session.id == *id),
+                _ => None,
+            },
             None => self.selected_index(),
         }
     }
@@ -2089,10 +2468,11 @@ impl App {
             view.set_pull_requests(found.clone());
         }
         self.pull_requests.insert(project, found);
+        self.keep_filter_bar_on_a_match();
     }
 
-    /// The open pull request for `branch` in the project at `project`, if
-    /// its forge knows of one.
+    /// The pull request for `branch` in the project at `project`, if its
+    /// forge knows of one: the open one, or else one merged lately.
     pub fn pull_request(&self, project: &Path, branch: &str) -> Option<&PullRequest> {
         if !self.github_on {
             return None;
@@ -2236,11 +2616,47 @@ impl App {
     }
 
     /// Takes the open issues its forge listed for the project at
-    /// `project`.
+    /// `project`, for the tab bar's count and the issues view, if it's
+    /// open on that project.
     pub fn set_issues(&mut self, project: &Path, found: Result<(Forge, Vec<Issue>), String>) {
         if let Some(view) = self.issues.as_mut().filter(|view| view.project == project) {
-            view.set_issues(found);
+            view.set_issues(found.clone());
         }
+        self.open_issues.insert(project.to_path_buf(), found);
+    }
+
+    /// How many pull requests and issues are open on the forge of the
+    /// selected session's project, for the tab bar: the pull requests
+    /// without the drafts while they're hidden, and each once its forge
+    /// has listed them.
+    pub fn open_on_forge(&self) -> Option<OpenOnForge> {
+        if !self.github_on {
+            return None;
+        }
+        let project = &self.selected()?.worktree.as_ref()?.project_path;
+        let mut forge = None;
+        let pull_requests = match self.pull_requests.get(project) {
+            Some(Ok((on, pull_requests))) => {
+                forge = Some(*on);
+                let open = pull_requests.iter().filter(|pr| !pr.merged);
+                let listed = open.clone().count();
+                let shown = open.filter(|pr| !(self.hide_draft_prs && pr.draft));
+                Some(Counted::of(shown.count(), listed))
+            }
+            _ => None,
+        };
+        let issues = match self.open_issues.get(project) {
+            Some(Ok((on, issues))) => {
+                forge = forge.or(Some(*on));
+                Some(Counted::of(issues.len(), issues.len()))
+            }
+            _ => None,
+        };
+        Some(OpenOnForge {
+            forge: forge?,
+            pull_requests,
+            issues,
+        })
     }
 
     /// Takes issue `number` of the project at `project`, read whole.
@@ -2469,6 +2885,11 @@ impl App {
         self.dragging
     }
 
+    /// The pane whose scrollbar's thumb the mouse holds, while it does.
+    pub fn holding_thumb(&self) -> Option<Slot> {
+        self.holding_thumb
+    }
+
     /// The pane being moved by its header line, while the button is down.
     pub fn grabbed(&self) -> Option<Grab> {
         self.grabbed
@@ -2638,6 +3059,9 @@ impl App {
                 self.stats_due.insert(worktree.path.clone());
             }
         }
+        if let Some(restarted) = self.restarts.take(&sessions) {
+            self.restarted = Some(restarted);
+        }
         let before = self.sessions.get(self.selected).cloned();
         let on_a_session = self.on_worktree.is_none();
         self.sessions = groups::order(sessions, self.shown_flows());
@@ -2676,6 +3100,7 @@ impl App {
                 view.refresh(rows);
             }
         }
+        self.keep_filter_bar_on_a_match();
         self.remember_shown();
     }
 
@@ -2786,6 +3211,7 @@ impl App {
     fn take_key(&mut self, key: KeyEvent) -> Option<Action> {
         self.notice = None;
         self.away_shown = false;
+        self.restarted = None;
         // The prefix is for the very next key, wherever it goes.
         let prefixed = std::mem::take(&mut self.prefixed);
         // A plugin's pane is over everything, and has every key but the one
@@ -2892,8 +3318,7 @@ impl App {
             return self.on_pull_requests_key(key);
         }
         if self.filter.is_some() {
-            self.on_filter_key(key);
-            return None;
+            return self.on_filter_key(key);
         }
         if self.resizing {
             self.on_resize_key(key);
@@ -2909,8 +3334,9 @@ impl App {
 
     /// What the mouse does, when no program in a pane has taken it: a click
     /// selects a session or hands a pane the keyboard, a drag moves a
-    /// border between panes, and the wheel moves the selection, or scrolls
-    /// a pane through its history.
+    /// border between panes, selects in a pane or moves its scrollbar's
+    /// thumb, and the wheel moves the selection, or scrolls a pane through
+    /// its history.
     pub fn on_mouse(&mut self, kind: MouseEventKind, hit: Hit) -> Option<Action> {
         let action = self.take_mouse(kind, hit);
         self.remember_shown();
@@ -2942,8 +3368,7 @@ impl App {
             && click
             && let Hit::SidebarRow(row) = hit
         {
-            self.click_row(row);
-            return None;
+            return self.click_found(row);
         }
         if self.waiting_on_keyboard() {
             return None;
@@ -2994,11 +3419,33 @@ impl App {
                 }
                 (MouseEventKind::Up(_), _) => {
                     self.dragging = None;
-                    return Some(Action::CopySelection(slot));
+                    if self.mouse.copy_on_select {
+                        return Some(Action::CopySelection(slot));
+                    }
+                    return Some(Action::HoldSelection(slot));
                 }
+                // The wheel scrolls the pane meanwhile, and the selection
+                // goes on with it.
+                (MouseEventKind::ScrollUp, _) => return Some(Action::ScrollBack(slot)),
+                (MouseEventKind::ScrollDown, _) => return Some(Action::ScrollForward(slot)),
                 // The button came up somewhere nothing heard it: this is a
                 // new click.
                 (MouseEventKind::Down(_), _) => self.dragging = None,
+                _ => return None,
+            }
+        }
+        // A scrollbar's thumb taken by the mouse follows it until the
+        // button comes up.
+        if let Some(slot) = self.holding_thumb {
+            match (kind, hit) {
+                (MouseEventKind::Drag(_), Hit::Scrollbar { slot: at, row }) if at == slot => {
+                    return Some(Action::DragThumb { slot, row });
+                }
+                (MouseEventKind::Up(_), _) => {
+                    self.holding_thumb = None;
+                    return None;
+                }
+                (MouseEventKind::Down(_), _) => self.holding_thumb = None,
                 _ => return None,
             }
         }
@@ -3057,16 +3504,22 @@ impl App {
                     return Some(Action::SelectFrom { slot, cell });
                 }
             }
+            // A scrollbar takes the click as it is, the keyboard staying
+            // where it was.
+            (_, Hit::Scrollbar { slot, row }) if click && self.shows_screen(slot) => {
+                self.holding_thumb = Some(slot);
+                return Some(Action::GrabThumb { slot, row });
+            }
             (MouseEventKind::ScrollUp, Hit::SidebarRow(_) | Hit::Sidebar) => {
                 self.move_selection(-1);
             }
             (MouseEventKind::ScrollDown, Hit::SidebarRow(_) | Hit::Sidebar) => {
                 self.move_selection(1);
             }
-            (MouseEventKind::ScrollUp, Hit::Pane { slot, .. }) => {
+            (MouseEventKind::ScrollUp, Hit::Pane { slot, .. } | Hit::Scrollbar { slot, .. }) => {
                 return Some(Action::ScrollBack(slot));
             }
-            (MouseEventKind::ScrollDown, Hit::Pane { slot, .. }) => {
+            (MouseEventKind::ScrollDown, Hit::Pane { slot, .. } | Hit::Scrollbar { slot, .. }) => {
                 return Some(Action::ScrollForward(slot));
             }
             _ => {}
@@ -3094,7 +3547,7 @@ impl App {
                 self.go_to_tab(index);
                 tab_menu()
             }
-            Hit::Pane { slot, .. } => {
+            Hit::Pane { slot, .. } | Hit::Scrollbar { slot, .. } => {
                 let name = self.pane_session(slot)?.name.clone();
                 self.select(&name);
                 self.session_menu(true)?
@@ -3211,7 +3664,8 @@ impl App {
             | Row::Terminals
             | Row::Flow(_)
             | Row::Step { .. }
-            | Row::NeedsYou(_) => return None,
+            | Row::NeedsYou(_)
+            | Row::PullRequest { .. } => return None,
         }
         self.focus = Focus::Sidebar;
         if self.on_worktree.is_some() {
@@ -3350,6 +3804,18 @@ impl App {
         self.view.is_none() && !self.showing_keys() && !self.waiting_on_keyboard()
     }
 
+    /// A click on a sidebar row while `/`'s filter is open picks what's
+    /// there, as Enter would, wherever it is; a heading, or any other row,
+    /// does nothing.
+    fn click_found(&mut self, row: usize) -> Option<Action> {
+        self.focus = Focus::Sidebar;
+        let found = match self.rows().get(row)? {
+            Row::Task(index) | Row::Line(index) => self.found_at(&Row::Session(*index)),
+            row => self.found_at(row),
+        };
+        self.pick(found?)
+    }
+
     /// A click on a sidebar row gives the sidebar the keyboard, and on a
     /// session, or a worktree with none, selects it. A project's heading
     /// folds or unfolds the project; another heading leaves the selection
@@ -3357,17 +3823,6 @@ impl App {
     fn click_row(&mut self, row: usize) {
         self.focus = Focus::Sidebar;
         let rows = self.rows();
-        // While `/`'s filter is open, a click on a session picks it, as
-        // Enter would, from whichever tab it's in; any other row does
-        // nothing.
-        if self.filter.is_some() {
-            if let Some(Row::Session(index) | Row::Task(index) | Row::Line(index)) = rows.get(row) {
-                let name = self.sessions[*index].name.clone();
-                self.filter = None;
-                self.select(&name);
-            }
-            return;
-        }
         // A pinned session is selected where it is, in whichever tab.
         if let Some(Row::Pinned(index)) = rows.get(row) {
             let name = self.sessions[*index].name.clone();
@@ -3498,7 +3953,7 @@ impl App {
             Command::Memory => return self.open_memory(),
             Command::Profiles => return self.open_profiles(),
             Command::Keys => self.keys_page = Some(0),
-            Command::Search => self.open_filter(),
+            Command::Search => return self.open_filter(),
             Command::Commands => self.open_command_list(),
             Command::PullRequest => return self.open_pull_request(),
             Command::PullRequests => return self.open_pull_requests(),
@@ -3949,37 +4404,53 @@ impl App {
         }
     }
 
-    /// Opens `/`'s filter, its bar on the selected session.
-    fn open_filter(&mut self) {
-        let highlighted = self.selected().map(|session| session.id.clone());
+    /// Opens `/`'s filter, its bar on the selected session, and has the
+    /// forges asked about the open pull requests of the projects no session
+    /// is in, which nothing has asked about yet, for it to find.
+    fn open_filter(&mut self) -> Option<Action> {
+        let highlighted = self
+            .selected()
+            .map(|session| Found::Session(session.id.clone()));
         self.filter = Some(Filter {
             input: TextInput::default(),
+            status: None,
             highlighted,
         });
+        self.keep_filter_bar_on_a_match();
+        if !self.github_on {
+            return None;
+        }
+        let unasked: Vec<PathBuf> = self
+            .quiet_projects()
+            .into_iter()
+            .map(|project| project.path.clone())
+            .filter(|project| !self.pull_requests.contains_key(project))
+            .collect();
+        (!unasked.is_empty()).then_some(Action::FindPullRequests(unasked))
     }
 
-    /// Keys while `/`'s filter is open: Enter selects the session the bar
-    /// is on, Esc leaves the selection where it was, ↑ and ↓ (or Ctrl+P
-    /// and Ctrl+N) move the bar among the matches, and every other key
-    /// edits the filter. Letters type, so j and k don't move the bar here.
-    fn on_filter_key(&mut self, key: KeyEvent) {
+    /// Keys while `/`'s filter is open: Enter picks what the bar is on, Esc
+    /// leaves the selection where it was, ↑ and ↓ (or Ctrl+P and Ctrl+N)
+    /// move the bar among what's found, Tab and Shift+Tab go round the
+    /// statuses it keeps to, and every other key edits the filter. Letters
+    /// type, so j and k don't move the bar here.
+    fn on_filter_key(&mut self, key: KeyEvent) -> Option<Action> {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
-            KeyCode::Esc => self.filter = None,
-            // A session in another tab brings its tab to the front.
+            KeyCode::Esc => self.close_filter(),
             KeyCode::Enter => {
-                let name = self
-                    .sidebar_cursor()
-                    .map(|index| self.sessions[index].name.clone());
-                self.filter = None;
-                if let Some(name) = name {
-                    self.select(&name);
+                let highlighted = self.filter.as_ref()?.highlighted.clone();
+                match highlighted {
+                    Some(found) => return self.pick(found),
+                    None => self.close_filter(),
                 }
             }
             KeyCode::Up => self.move_filter_bar(-1),
             KeyCode::Down => self.move_filter_bar(1),
             KeyCode::Char('p') if ctrl => self.move_filter_bar(-1),
             KeyCode::Char('n') if ctrl => self.move_filter_bar(1),
+            KeyCode::Tab => self.step_filter_status(1),
+            KeyCode::BackTab => self.step_filter_status(-1),
             _ => {
                 if let Some(filter) = &mut self.filter {
                     filter.input.on_key(&key);
@@ -3987,38 +4458,129 @@ impl App {
                 self.keep_filter_bar_on_a_match();
             }
         }
+        None
     }
 
-    /// Moves the filter's bar `by` matches, stopping at the ends.
-    fn move_filter_bar(&mut self, by: isize) {
-        let matches = self.matches();
-        let at = self
-            .sidebar_cursor()
-            .and_then(|cursor| matches.iter().position(|&index| index == cursor));
-        let Some(at) = at else {
+    /// Closes `/`'s filter, the selection where it was.
+    fn close_filter(&mut self) {
+        self.filter = None;
+        self.keep_selection_on_a_row();
+    }
+
+    /// Closes `/`'s filter and does what picking `found` does: a session is
+    /// selected, in whichever tab it's in; a worktree with no sessions has
+    /// the selection put on it, where Enter starts something; a flow run's
+    /// step it's at is selected; and a pull request is opened in the pull
+    /// requests view.
+    fn pick(&mut self, found: Found) -> Option<Action> {
+        self.filter = None;
+        match found {
+            Found::Session(id) => {
+                let session = self.sessions.iter().find(|session| session.id == id);
+                if let Some(name) = session.map(|session| session.name.clone()) {
+                    self.select(&name);
+                }
+            }
+            Found::Worktree(path) => self.select_worktree(path),
+            Found::Flow(name) => self.select_flow(&name),
+            Found::PullRequest { project, number } => {
+                return self.open_pull_requests_of(project, Some(number));
+            }
+        }
+        self.keep_selection_on_a_row();
+        None
+    }
+
+    /// Puts the selection on the worktree with no sessions at `path`. One
+    /// in a project with sessions shows only in their tabs, so when the tab
+    /// in front has none of them, the first tab that has one comes to the
+    /// front; a project with no sessions shows in every tab.
+    fn select_worktree(&mut self, path: PathBuf) {
+        let project = self
+            .worktrees
+            .values()
+            .flatten()
+            .find(|worktree| worktree.path == path)
+            .map(|worktree| worktree.project_path.clone());
+        let in_project = |session: &SessionInfo| {
+            let worktree = session.worktree.as_ref();
+            project.is_some() && worktree.map(|w| &w.project_path) == project.as_ref()
+        };
+        let tabs: Vec<usize> = self
+            .sessions
+            .iter()
+            .filter(|session| in_project(session))
+            .filter_map(|session| self.tabs.tab_of(&session.name))
+            .collect();
+        if let Some(&tab) = tabs.iter().min()
+            && !tabs.contains(&self.tabs.current_index())
+        {
+            self.go_to_tab(tab);
+        }
+        self.on_worktree = Some(path);
+    }
+
+    /// Selects the session of the step the flow run called `name` is at:
+    /// the latest that has a session.
+    fn select_flow(&mut self, name: &str) {
+        let Some(run) = self.flows.iter().find(|run| run.name == name) else {
             return;
         };
-        let to = matches[at.saturating_add_signed(by).min(matches.len() - 1)];
-        let id = self.sessions[to].id.clone();
-        if let Some(filter) = &mut self.filter {
-            filter.highlighted = Some(id);
+        let at = run
+            .steps
+            .iter()
+            .rev()
+            .filter_map(|step| step.session.clone())
+            .find(|session| self.position(session).is_some());
+        match at {
+            Some(session) => self.select(&session),
+            None => self.notify(format!("no step of {name} has a session")),
         }
     }
 
-    /// Puts the filter's bar on the first match when the session it was on
-    /// doesn't match any more.
+    /// Goes round the statuses `/`'s filter keeps to, `by` one forward or
+    /// back.
+    fn step_filter_status(&mut self, by: isize) {
+        if let Some(filter) = &mut self.filter {
+            filter.status = StatusFilter::step(filter.status, by);
+        }
+        self.keep_filter_bar_on_a_match();
+    }
+
+    /// Moves the filter's bar `by` places among what's found, stopping at
+    /// the ends.
+    fn move_filter_bar(&mut self, by: isize) {
+        let found = self.found();
+        let Some(filter) = &mut self.filter else {
+            return;
+        };
+        let at = filter
+            .highlighted
+            .as_ref()
+            .and_then(|highlighted| found.iter().position(|each| each == highlighted));
+        let Some(at) = at else {
+            return;
+        };
+        let to = at.saturating_add_signed(by).min(found.len() - 1);
+        filter.highlighted = Some(found[to].clone());
+    }
+
+    /// Puts the filter's bar on the first thing found when what it was on
+    /// isn't found any more, while the filter is open.
     fn keep_filter_bar_on_a_match(&mut self) {
-        let matches = self.matches();
-        let on_a_match = self
-            .sidebar_cursor()
-            .is_some_and(|cursor| matches.contains(&cursor));
+        if self.filter.is_none() {
+            return;
+        }
+        let found = self.found();
+        let Some(filter) = &mut self.filter else {
+            return;
+        };
+        let on_a_match = filter
+            .highlighted
+            .as_ref()
+            .is_some_and(|highlighted| found.contains(highlighted));
         if !on_a_match {
-            let first = matches
-                .first()
-                .map(|&index| self.sessions[index].id.clone());
-            if let Some(filter) = &mut self.filter {
-                filter.highlighted = first;
-            }
+            filter.highlighted = found.into_iter().next();
         }
     }
 
@@ -4078,24 +4640,41 @@ impl App {
     /// or says why it can't.
     fn open_pull_requests(&mut self) -> Option<Action> {
         let worktree = self.forge_worktree()?;
-        let project = worktree.project_path;
+        self.open_pull_requests_of(worktree.project_path, None)
+    }
+
+    /// Opens the pull requests view for the project at `project`, on the
+    /// ones listed last until its forge lists them again, with the bar on
+    /// pull request `number` when there's one to put it on.
+    fn open_pull_requests_of(&mut self, project: PathBuf, number: Option<u64>) -> Option<Action> {
         let known = match self.pull_requests.get(&project) {
             Some(Ok((_, pull_requests))) => Some(pull_requests.clone()),
             _ => None,
         };
         let forge = self.forge_of(&project);
-        let view = PullRequestsView::new(project.clone(), worktree.project, forge, known);
+        let name = self.project_name(&project);
+        let hide_drafts = self.hide_draft_prs;
+        let mut view = PullRequestsView::new(project.clone(), name, forge, known, hide_drafts);
+        if let Some(number) = number {
+            view.list.highlight(number);
+        }
         self.pull_requests_view = Some(view);
         Some(Action::ListPullRequests(project))
     }
 
-    /// `i`: opens the issues view for the selected session's project, or
-    /// says why it can't.
+    /// `i`: opens the issues view for the selected session's project, on
+    /// the ones listed last until its forge lists them again, or says why
+    /// it can't.
     fn open_issues(&mut self) -> Option<Action> {
         let worktree = self.forge_worktree()?;
         let project = worktree.project_path;
+        let known = match self.open_issues.get(&project) {
+            Some(Ok((_, issues))) => Some(issues.clone()),
+            _ => None,
+        };
         let forge = self.forge_of(&project);
-        self.issues = Some(IssuesView::new(project.clone(), worktree.project, forge));
+        let view = IssuesView::new(project.clone(), worktree.project, forge, known);
+        self.issues = Some(view);
         Some(Action::ListIssues(project))
     }
 
@@ -4263,6 +4842,7 @@ impl App {
                 title,
                 body,
             }),
+            issues::Step::Refresh => Some(Action::ListIssues(project)),
             issues::Step::Say(said) => {
                 self.notify(said);
                 None
@@ -4299,6 +4879,11 @@ impl App {
                 topic: Topic::PullRequest(number),
                 text,
             }),
+            pull_requests::Step::Refresh => Some(Action::ListPullRequests(project)),
+            pull_requests::Step::Say(said) => {
+                self.notify(said);
+                None
+            }
         }
     }
 
@@ -4414,9 +4999,15 @@ impl App {
                 dir: Some(session.cwd.clone()),
                 label: shell::home_relative(&session.cwd),
             },
-            (None, None) => Target::Here {
-                dir: None,
-                label: "this directory".to_string(),
+            (None, None) => match &self.start_dir {
+                Some(dir) => Target::Here {
+                    dir: Some(dir.clone()),
+                    label: shell::home_relative(dir),
+                },
+                None => Target::Here {
+                    dir: None,
+                    label: "this directory".to_string(),
+                },
             },
         };
         let mut targets = vec![
@@ -4558,6 +5149,10 @@ impl App {
         }
         if let Some(View::Branches(switcher)) = &mut self.view {
             switcher.on_paste(&text);
+            return None;
+        }
+        if let Some(View::Diff(diff)) = &mut self.view {
+            diff.on_paste(&text);
             return None;
         }
         if let Some(View::Memory(memory)) = &mut self.view {
@@ -4771,6 +5366,7 @@ impl App {
             return;
         };
         if self.shows_screen(slot) {
+            self.copied_from = None;
             self.focus = Focus::Copy(slot);
         } else if self.selected_is_own() {
             self.notify("crystal can't show the session it runs in".into());
@@ -4794,11 +5390,25 @@ impl App {
         Some(Action::EditHistory { slot, dir, name })
     }
 
-    /// Copy mode is over: the keyboard goes back to the sidebar it came
-    /// from.
+    /// What the mouse selected in the pane at `slot` is kept to be copied
+    /// with copy mode's keys: copy mode has the keyboard there, to give it
+    /// back to the pane it was typing into, if it was, when it's over.
+    pub fn hold_selection(&mut self, slot: Slot) {
+        if !self.shows_screen(slot) || self.focus == Focus::Copy(slot) {
+            return;
+        }
+        self.copied_from = (self.focus == Focus::Pane(slot)).then_some(slot);
+        self.focus = Focus::Copy(slot);
+    }
+
+    /// Copy mode is over: the keyboard goes back to where it came from,
+    /// the sidebar, or the pane the mouse took it from.
     pub fn stop_copying(&mut self) {
         if let Focus::Copy(_) = self.focus {
-            self.focus = Focus::Sidebar;
+            self.focus = match self.copied_from.take() {
+                Some(slot) if self.can_type_into(slot) => Focus::Pane(slot),
+                _ => Focus::Sidebar,
+            };
         }
     }
 
@@ -5075,6 +5685,8 @@ impl App {
         };
         let last_pane = self.last_pane.and_then(moved);
         let dragging = self.dragging.and_then(moved);
+        let holding_thumb = self.holding_thumb.and_then(moved);
+        let copied_from = self.copied_from.and_then(moved);
         let grabbed = self.grabbed.and_then(|grab| {
             let from = moved(grab.from)?;
             let over = grab.over.and_then(moved);
@@ -5083,6 +5695,8 @@ impl App {
         self.focus = focus;
         self.last_pane = last_pane;
         self.dragging = dragging;
+        self.holding_thumb = holding_thumb;
+        self.copied_from = copied_from;
         self.grabbed = grabbed;
     }
 
@@ -5091,7 +5705,8 @@ impl App {
     /// start new work, and a shell is where that starts.
     fn new_tab(&mut self) -> Option<Action> {
         let index = self.tabs.add();
-        let dir = self.selected().map(|session| session.cwd.clone());
+        let followed = self.selected().map(|session| session.cwd.clone());
+        let dir = self.start_dir.clone().or(followed);
         self.go_to_tab(index);
         Some(Action::Start {
             place: Place::Directory(dir),
@@ -5773,6 +6388,39 @@ mod tests {
     }
 
     #[test]
+    fn what_a_restart_brought_back_is_said_until_the_next_key_and_kept_in_its_place() {
+        let starting = |name: &str| SessionInfo {
+            state: State::Starting,
+            ..session(name)
+        };
+        let mut app = App::new(None);
+        app.set_sessions(vec![session("api"), starting("docs"), starting("web")]);
+        app.select("docs");
+        assert_eq!(app.restarted(), None);
+        let failed = SessionInfo {
+            state: State::Failed {
+                why: "its directory, ~/web, isn't there".into(),
+            },
+            ..session("web")
+        };
+        app.set_sessions(vec![session("api"), session("docs"), failed]);
+        let said = app.restarted().unwrap();
+        assert_eq!(
+            said.line,
+            "after the restart: 1 session back · 1 couldn't start: web"
+        );
+        assert!(said.failed);
+        // Each kept its place, and the selection stayed on its session.
+        assert_eq!(selected_name(&app), Some("docs"));
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.restarted(), None);
+        // Enter on the one that couldn't start offers to start it again.
+        assert_eq!(selected_name(&app), Some("web"));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.confirm(), Some(&Confirm::Respawn("web".into())));
+    }
+
+    #[test]
     fn sessions_waiting_on_the_user_come_first() {
         let mut waiting = session("asks");
         waiting.activity = Some(Activity::Waiting);
@@ -6039,6 +6687,29 @@ mod tests {
         assert_eq!(
             press(&mut app, KeyCode::Enter),
             start(Place::Directory(None), &[], "")
+        );
+    }
+
+    #[test]
+    fn with_nothing_selected_the_panel_starts_where_the_settings_say() {
+        let mut app = App::new(None);
+        app.set_start_dir(Some(PathBuf::from("/home/ann/code")));
+        press(&mut app, KeyCode::Char('n'));
+        assert_eq!(
+            press(&mut app, KeyCode::Enter),
+            start(
+                Place::Directory(Some(PathBuf::from("/home/ann/code"))),
+                &[],
+                ""
+            )
+        );
+        // A session selected is still where the panel starts.
+        let mut app = with_agents(&[], vec![in_project("agent", "app")]);
+        app.set_start_dir(Some(PathBuf::from("/home/ann/code")));
+        press(&mut app, KeyCode::Char('n'));
+        assert_eq!(
+            press(&mut app, KeyCode::Enter),
+            start(Place::Directory(Some(PathBuf::from("/code/app"))), &[], "")
         );
     }
 
@@ -7850,6 +8521,90 @@ mod tests {
     }
 
     #[test]
+    fn without_copy_on_select_letting_go_holds_the_selection_in_copy_mode() {
+        let mut app = app_with_splits(&["a", "b"], 1);
+        let config = crate::config::from_text("[mouse]\ncopy_on_select = false").unwrap();
+        app.set_interface(&config);
+        let in_split = Hit::Pane {
+            slot: Slot::Split(0),
+            cell: Some((2, 3)),
+        };
+        app.on_mouse(MouseEventKind::Down(MouseButton::Left), in_split);
+        assert_eq!(app.focus(), Focus::Pane(Slot::Split(0)));
+        assert_eq!(
+            app.on_mouse(MouseEventKind::Up(MouseButton::Left), in_split),
+            Some(Action::HoldSelection(Slot::Split(0)))
+        );
+        // With something selected, copy mode takes the keyboard, and gives
+        // it back to the pane it was typing into when it's over.
+        app.hold_selection(Slot::Split(0));
+        assert_eq!(app.focus(), Focus::Copy(Slot::Split(0)));
+        app.stop_copying();
+        assert_eq!(app.focus(), Focus::Pane(Slot::Split(0)));
+        // From the sidebar, it goes back there.
+        app.focus = Focus::Sidebar;
+        app.hold_selection(Slot::Split(0));
+        app.stop_copying();
+        assert_eq!(app.focus(), Focus::Sidebar);
+    }
+
+    #[test]
+    fn the_wheel_scrolls_the_pane_a_drag_is_selecting_in() {
+        let mut app = app_with_splits(&["a", "b"], 1);
+        let in_split = Hit::Pane {
+            slot: Slot::Split(0),
+            cell: Some((2, 3)),
+        };
+        app.on_mouse(MouseEventKind::Down(MouseButton::Left), in_split);
+        // Wherever the mouse is, the wheel is the drag's pane's.
+        assert_eq!(
+            app.on_mouse(MouseEventKind::ScrollUp, Hit::Sidebar),
+            Some(Action::ScrollBack(Slot::Split(0)))
+        );
+        assert_eq!(
+            app.on_mouse(MouseEventKind::ScrollDown, in_split),
+            Some(Action::ScrollForward(Slot::Split(0)))
+        );
+        assert_eq!(app.dragging(), Some(Slot::Split(0)));
+    }
+
+    #[test]
+    fn a_scrollbars_thumb_follows_the_mouse_until_it_lets_go() {
+        let mut app = app_with_splits(&["a", "b"], 1);
+        let bar = |row| Hit::Scrollbar {
+            slot: Slot::Split(0),
+            row,
+        };
+        let slot = Slot::Split(0);
+        assert_eq!(
+            app.on_mouse(MouseEventKind::Down(MouseButton::Left), bar(4)),
+            Some(Action::GrabThumb { slot, row: 4 })
+        );
+        // The keyboard stays where it was.
+        assert_eq!(app.focus(), Focus::Sidebar);
+        assert_eq!(app.holding_thumb(), Some(slot));
+        let drag = MouseEventKind::Drag(MouseButton::Left);
+        assert_eq!(
+            app.on_mouse(drag, bar(9)),
+            Some(Action::DragThumb { slot, row: 9 })
+        );
+        assert_eq!(app.on_mouse(drag, Hit::Sidebar), None);
+        assert_eq!(
+            app.on_mouse(MouseEventKind::Up(MouseButton::Left), Hit::Sidebar),
+            None
+        );
+        assert_eq!(app.holding_thumb(), None);
+        // The wheel over it scrolls the pane, as over its screen, and a
+        // right click opens the pane's menu.
+        assert_eq!(
+            app.on_mouse(MouseEventKind::ScrollUp, bar(0)),
+            Some(Action::ScrollBack(slot))
+        );
+        app.right_click(bar(0), (79, 2));
+        assert!(app.menu().is_some());
+    }
+
+    #[test]
     fn with_ctrl_held_the_mouse_over_a_pane_marks_where_to_look_for_a_link() {
         let mut app = app_with_splits(&["a", "b"], 1);
         let over = |cell| Hit::Pane {
@@ -7982,6 +8737,32 @@ mod tests {
         assert_eq!(app.tabs().current_index(), 1);
         assert!(in_sidebar(&app).is_empty());
         assert!(app.selected().is_none());
+    }
+
+    #[test]
+    fn t_starts_its_shell_where_the_settings_say_when_they_do() {
+        let mut app = App::new(None);
+        app.set_sessions(vec![SessionInfo {
+            cwd: PathBuf::from("/code/b"),
+            ..session("b")
+        }]);
+        app.select("b");
+        app.set_start_dir(Some(PathBuf::from("/home/ann")));
+        let Some(Action::Start { place, .. }) = press(&mut app, KeyCode::Char('t')) else {
+            panic!("t starts a shell");
+        };
+        assert_eq!(place, Place::Directory(Some(PathBuf::from("/home/ann"))));
+    }
+
+    #[test]
+    fn the_tab_bar_is_left_out_with_one_tab_only_when_told() {
+        let mut app = App::new(None);
+        assert!(app.tab_bar_shown());
+        let config = crate::config::from_text("[tab_bar]\nhide_when_single = true\n").unwrap();
+        app.set_interface(&config);
+        assert!(!app.tab_bar_shown());
+        press(&mut app, KeyCode::Char('t'));
+        assert!(app.tab_bar_shown());
     }
 
     #[test]
@@ -8543,6 +9324,260 @@ mod tests {
         assert_eq!(app.marked_letters(1), vec![0]);
     }
 
+    #[test]
+    fn slash_finds_a_session_by_the_name_of_its_tab() {
+        let mut app = app_with_a_second_tab(&["a", "b"]);
+        app.go_to_tab(0);
+        press(&mut app, KeyCode::Char('T'));
+        answer(&mut app, "review");
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('/'));
+        type_text(&mut app, "review");
+        let shown: Vec<&str> = app
+            .matches()
+            .iter()
+            .map(|&index| app.sessions()[index].name.as_str())
+            .collect();
+        assert_eq!(shown, ["a", "b"]);
+    }
+
+    #[test]
+    fn slash_finds_a_project_with_no_sessions_and_enter_selects_it() {
+        let mut app = app_with_an_empty_worktree();
+        app.set_known_projects(vec![known("app"), known("api")]);
+        press(&mut app, KeyCode::Char('/'));
+        assert!(
+            app.found()
+                .iter()
+                .all(|found| matches!(found, Found::Session(_))),
+            "before a word is typed, only sessions"
+        );
+        type_text(&mut app, "api");
+        let api = PathBuf::from("/code/api");
+        assert_eq!(app.found(), [Found::Worktree(api.clone())]);
+        let rows = app.rows();
+        let heading = Row::Project {
+            name: "api".into(),
+            path: api.clone(),
+        };
+        let at = rows.iter().position(|row| *row == heading).unwrap();
+        assert!(matches!(rows[at + 1], Row::Worktree { main: true, .. }));
+        assert_eq!(rows[at + 2], Row::NoSessions(api.clone()));
+        assert_eq!(app.filter_row(), Some(at + 2));
+
+        press(&mut app, KeyCode::Enter);
+        assert!(app.filter().is_none());
+        assert_eq!(
+            app.selected_empty_worktree().map(|w| w.project.as_str()),
+            Some("api")
+        );
+    }
+
+    #[test]
+    fn slash_finds_a_worktree_with_no_sessions_by_its_branch() {
+        let mut app = app_with_an_empty_worktree();
+        press(&mut app, KeyCode::Char('/'));
+        type_text(&mut app, "old");
+        let old = PathBuf::from("/code/app.worktrees/old");
+        assert_eq!(app.found(), [Found::Worktree(old)]);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(empty_branch(&app), Some("old"));
+    }
+
+    #[test]
+    fn the_selection_on_a_worktree_with_no_sessions_outlasts_the_filter() {
+        let mut app = app_with_an_empty_worktree();
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(empty_branch(&app), Some("old"));
+        press(&mut app, KeyCode::Char('/'));
+        type_text(&mut app, "planner");
+        app.set_sessions(vec![in_worktree("planner", "main", State::Running)]);
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(empty_branch(&app), Some("old"));
+    }
+
+    #[test]
+    fn slash_finds_an_open_pull_request_and_enter_opens_it_in_the_view() {
+        let mut app = with_agents(&["claude"], vec![in_repo("planner", "main")]);
+        let fix = PullRequest {
+            title: "Fix the login redirect".into(),
+            ..pull_request(57, "fix-login")
+        };
+        let dark = PullRequest {
+            title: "Dark mode".into(),
+            ..pull_request(58, "dark")
+        };
+        let app_path = PathBuf::from("/code/app");
+        app.set_pull_requests(app_path.clone(), on_github(vec![fix, dark]));
+        press(&mut app, KeyCode::Char('/'));
+        type_text(&mut app, "dark");
+        let found = Found::PullRequest {
+            project: app_path.clone(),
+            number: 58,
+        };
+        assert_eq!(app.found(), [found]);
+        let (_, marked) = app.found_pull_request(&app_path, 58).unwrap();
+        assert_eq!(marked, vec![0, 1, 2, 3]);
+
+        assert_eq!(
+            press(&mut app, KeyCode::Enter),
+            Some(Action::ListPullRequests(app_path.clone()))
+        );
+        assert!(app.filter().is_none());
+        let view = app.pull_requests_view().unwrap();
+        assert_eq!(view.highlighted().map(|pr| pr.number), Some(58));
+
+        // A click on one picks it too.
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('/'));
+        type_text(&mut app, "#57");
+        let rows = app.rows();
+        let row = rows
+            .iter()
+            .position(|row| matches!(row, Row::PullRequest { number: 57, .. }))
+            .unwrap();
+        assert_eq!(
+            app.on_mouse(CLICK, Hit::SidebarRow(row)),
+            Some(Action::ListPullRequests(app_path))
+        );
+        let view = app.pull_requests_view().unwrap();
+        assert_eq!(view.highlighted().map(|pr| pr.number), Some(57));
+    }
+
+    #[test]
+    fn slash_finds_no_merged_pull_request_and_no_draft_while_they_re_hidden() {
+        let mut app = with_agents(&["claude"], vec![in_repo("planner", "main")]);
+        let merged = PullRequest {
+            title: "Login, the old way".into(),
+            merged: true,
+            ..pull_request(41, "old-login")
+        };
+        let draft = PullRequest {
+            title: "Login, a new way".into(),
+            draft: true,
+            ..pull_request(58, "new-login")
+        };
+        let app_path = PathBuf::from("/code/app");
+        app.set_pull_requests(app_path.clone(), on_github(vec![merged, draft]));
+        press(&mut app, KeyCode::Char('/'));
+        type_text(&mut app, "login");
+        let draft = Found::PullRequest {
+            project: app_path,
+            number: 58,
+        };
+        assert_eq!(app.found(), [draft]);
+        let mut config = Config::default();
+        config.forge.hide_draft_prs = true;
+        app.set_features(&config);
+        assert!(app.found().is_empty());
+    }
+
+    #[test]
+    fn slash_asks_once_for_the_pull_requests_of_projects_no_session_is_in() {
+        let mut app = with_agents(&["claude"], vec![in_repo("planner", "main")]);
+        app.set_known_projects(vec![known("app"), known("api")]);
+        let api = PathBuf::from("/code/api");
+        assert_eq!(
+            press(&mut app, KeyCode::Char('/')),
+            Some(Action::FindPullRequests(vec![api.clone()]))
+        );
+        press(&mut app, KeyCode::Esc);
+        let none = PullRequest {
+            title: "Rate limits".into(),
+            ..pull_request(3, "limits")
+        };
+        app.set_pull_requests(api.clone(), on_github(vec![none]));
+        assert_eq!(press(&mut app, KeyCode::Char('/')), None);
+        type_text(&mut app, "rate");
+        assert_eq!(
+            app.found(),
+            [Found::PullRequest {
+                project: api,
+                number: 3
+            }]
+        );
+
+        let mut config = Config::default();
+        config.plugins.insert("github".into(), false);
+        app.set_features(&config);
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(press(&mut app, KeyCode::Char('/')), None);
+        type_text(&mut app, "rate");
+        assert!(app.found().is_empty(), "nothing from a forge with it off");
+    }
+
+    #[test]
+    fn tab_keeps_the_filter_to_one_status_and_shift_tab_goes_back() {
+        let mut app = App::new(None);
+        app.set_sessions(vec![
+            doing("asker", Activity::Waiting),
+            doing("busy", Activity::Working),
+            session("idler"),
+            ended("gone"),
+        ]);
+        app.set_known_projects(vec![known("api")]);
+        let names = |app: &App| -> Vec<String> {
+            let mut names: Vec<String> = app
+                .matches()
+                .iter()
+                .map(|&index| app.sessions()[index].name.clone())
+                .collect();
+            names.sort();
+            names
+        };
+        press(&mut app, KeyCode::Char('/'));
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(
+            app.filter().and_then(|f| f.status),
+            Some(StatusFilter::Waiting)
+        );
+        assert_eq!(names(&app), ["asker"]);
+        assert_eq!(cursor_name(&app), Some("asker"));
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(names(&app), ["busy"]);
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(names(&app), ["idler"]);
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(names(&app), ["gone"]);
+        press(&mut app, KeyCode::BackTab);
+        assert_eq!(names(&app), ["idler"]);
+
+        // Only sessions have a status: a project that matches isn't found.
+        type_text(&mut app, "i");
+        assert_eq!(names(&app), ["idler"]);
+        assert_eq!(app.found().len(), 1);
+
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.filter().and_then(|f| f.status), None);
+        assert!(
+            app.found()
+                .contains(&Found::Worktree(PathBuf::from("/code/api")))
+        );
+    }
+
+    #[test]
+    fn slash_finds_a_flow_run_by_its_goal_and_enter_selects_the_step_it_is_at() {
+        let mut app = app_with_a_run(crate::flow_run::StepState::Running);
+        press(&mut app, KeyCode::Char('/'));
+        type_text(&mut app, "retries");
+        assert_eq!(
+            app.found(),
+            [
+                Found::Flow("ship-1".into()),
+                Found::Session("ship-1-plan".into()),
+                Found::Session("ship-1-review".into()),
+            ]
+        );
+        assert_eq!(
+            app.filter().and_then(|f| f.highlighted.clone()),
+            Some(Found::Flow("ship-1".into()))
+        );
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(selected_name(&app), Some("ship-1-review"));
+    }
+
     /// A session in the `app` project, on `branch`.
     fn in_repo(name: &str, branch: &str) -> SessionInfo {
         SessionInfo {
@@ -8569,6 +9604,8 @@ mod tests {
             from_fork: false,
             local_branch: branch.into(),
             draft: false,
+            conflicts: false,
+            merged: false,
             checks: forge::Checks::None,
             review: forge::Review::None,
             updated_at: "2026-10-02T09:30:00Z".into(),
@@ -8795,6 +9832,42 @@ mod tests {
         );
         assert_eq!(command[0], "claude");
         assert!(command[2].starts_with("Fix issue #42"));
+    }
+
+    #[test]
+    fn ctrl_r_asks_the_forge_again_and_the_issues_open_on_those_listed_last() {
+        let mut app = App::new(None);
+        app.set_sessions(vec![in_repo("planner", "main")]);
+        let project = PathBuf::from("/code/app");
+        let ctrl_r = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL);
+        let merged = PullRequest {
+            merged: true,
+            ..pull_request(41, "startup")
+        };
+        app.set_pull_requests(project.clone(), on_github(vec![merged]));
+        press(&mut app, KeyCode::Char('O'));
+        assert_eq!(
+            app.on_key(ctrl_r),
+            Some(Action::ListPullRequests(project.clone()))
+        );
+        // A merged one has nothing left to work on.
+        assert_eq!(press(&mut app, KeyCode::Enter), None);
+        assert_eq!(
+            app.notice(),
+            Some("#41 has merged: there's no work left on it")
+        );
+        press(&mut app, KeyCode::Esc);
+
+        // The poller's issues are there as the view opens.
+        let listed = Ok((Forge::GitHub, vec![issue(42, "Fix login redirect")]));
+        app.set_issues(&project, listed);
+        assert_eq!(
+            press(&mut app, KeyCode::Char('i')),
+            Some(Action::ListIssues(project.clone()))
+        );
+        let view = app.issues_view().unwrap();
+        assert_eq!(view.highlighted().map(|issue| issue.number), Some(42));
+        assert_eq!(app.on_key(ctrl_r), Some(Action::ListIssues(project)));
     }
 
     #[test]
@@ -9229,13 +10302,14 @@ gate = true
         });
         // `x` would kill the session from the sidebar; here it's nothing.
         assert_eq!(press(&mut app, KeyCode::Char('x')), None);
-        for _ in 0..7 {
+        // The bar stops at the last.
+        for _ in 0..30 {
             press(&mut app, KeyCode::Char('j'));
         }
         assert_eq!(
             press(&mut app, KeyCode::Char(' ')),
-            Some(Action::ChangeSetting(settings_view::Change::Embeddings(
-                false
+            Some(Action::ChangeSetting(settings_view::Change::HideDrafts(
+                true
             )))
         );
         app.setting_failed("the file is read-only".into());

@@ -1186,8 +1186,29 @@ impl InProgress {
 #[serde(rename_all = "snake_case")]
 pub enum State {
     Running,
-    Exited { code: u32 },
-    Signaled { signal: String },
+    Exited {
+        code: u32,
+    },
+    Signaled {
+        signal: String,
+    },
+    /// Waiting its turn to start again, after the daemon restarted cold:
+    /// agents start a moment apart.
+    Starting,
+    /// Couldn't start again after a restart, for the reason given: its
+    /// directory has gone, say, or its command. It stays in the list, to
+    /// start again once that's put right, or to kill.
+    Failed {
+        why: String,
+    },
+}
+
+impl State {
+    /// Whether the session is yet to start again after a restart, or
+    /// couldn't: it has never run in this daemon.
+    pub fn is_unstarted(&self) -> bool {
+        matches!(self, State::Starting | State::Failed { .. })
+    }
 }
 
 /// An agent's conversation, as its hooks name it: what it takes to pick
@@ -1268,6 +1289,8 @@ impl fmt::Display for State {
             State::Running => write!(f, "running"),
             State::Exited { code } => write!(f, "exited {code}"),
             State::Signaled { signal } => write!(f, "killed ({signal})"),
+            State::Starting => write!(f, "starting"),
+            State::Failed { .. } => write!(f, "couldn't start"),
         }
     }
 }

@@ -161,7 +161,7 @@ and the footer says where you are and offers the keys that matter there, or, whe
 | `u` | select the next session that needs you: waiting on you first, then done |
 | `U` | list everything that [needs you](#timeline), in every tab, and answer a permission or a gate where it stands |
 | `a` | the [timeline](#timeline): what happened, the newest first, as it happens |
-| `/` | find a session, in any tab, by typing a little of its name, project, branch or command; one in another tab says which, and picking it takes you there |
+| `/` | find a session in any tab, a project or worktree with nothing running, a flow run or an open pull request, by typing a little of it; `Tab` keeps to one status; picking a session in another tab takes you there: [finding with `/`](#finding-with-) |
 | `:` | the [command list](#keys-and-commands): every command by its name, with its key, the latest you ran first; `Enter` runs one |
 | `(` / `)` | make the [sidebar](#the-sidebar) narrower or wider; its edge drags with the mouse too |
 | `\` | fold the [sidebar](#the-sidebar) down to a rail of marks, or unfold it |
@@ -206,14 +206,29 @@ inline through a scroll region, like Codex. To search that history, or copy from
 [copy mode](#zoom-copy-mode-and-search), and `e` opens it in your editor.
 
 The mouse works too. Click a session in the sidebar to select it, or click a pane to type into it. The wheel
-moves the selection over the sidebar, and scrolls a pane through its history. A right click opens a menu of
-what you can do with what it's on: a session, a worktree or a project in the sidebar, a tab, or a pane. Each
-item is a key from the table above, shown beside it, and does just what that key would there; choose one with
-a click, `Enter`, or its key, and `Esc` or a click elsewhere closes the menu. Drag across a pane to select
-text: it goes to your clipboard as you let go, and stays marked until you click or type. A program that asks
-for the mouse itself, like `vim` with `set mouse=a` or `htop`, gets the clicks, drags and the wheel in its pane
-while that pane has the keyboard; there, your terminal's own selection still works with a key held: `Shift` in
-most terminals, `Option` in iTerm2 and Terminal on macOS.
+moves the selection over the sidebar, and scrolls a pane through its history, three lines a notch. A right click
+opens a menu of what you can do with what it's on: a session, a worktree or a project in the sidebar, a tab, or
+a pane. Each item is a key from the table above, shown beside it, and does just what that key would there;
+choose one with a click, `Enter`, or its key, and `Esc` or a click elsewhere closes the menu. Drag across a pane
+to select text: it goes to your clipboard as you let go, and stays marked until you click or type. A
+double-click selects a word, where a path is one word and a blank, a comma, a quote, a bracket or a colon ends
+one, and a triple-click the whole line, across the rows it wrapped onto; drag on from either and it takes in
+whole words, or lines. Drag past the top or bottom of a pane and its history scrolls under the selection, faster
+the further past, for as long as you hold it there; the wheel scrolls it too. A program that asks for the mouse
+itself, like `vim` with `set mouse=a` or `htop`, gets the clicks, drags and the wheel in its pane while that pane
+has the keyboard; there, your terminal's own selection still works with a key held: `Shift` in most terminals,
+`Option` in iTerm2 and Terminal on macOS.
+
+Beside each pane's screen, in a column of its own, a scrollbar shows where in its history the pane is, once it
+has some: drag its thumb to scroll, or click the track and the thumb jumps there. The wheel over it scrolls the
+pane too.
+
+`[mouse]` in the [settings](#settings) changes all this. `copy_on_select = false` keeps what you select from
+your clipboard as you let go: the pane goes into [copy mode](#zoom-copy-mode-and-search) with it still selected,
+where `y` copies it, the keys change it first, and `Esc` drops it, and the keyboard goes back to where it was
+after. `scroll_lines` is how far a notch of the wheel scrolls, and `scrollbars = false` gives the scrollbar's
+column back to the pane. `capture = false` leaves the mouse to your terminal altogether: its own selection
+works with no key held, but nothing in crystal answers a click, and no program in a pane gets one either.
 
 `Ctrl`+click opens a link in a pane, whoever has the mouse there: a URL written out in the text (`http://`,
 `https://` or `file://`), whole across the rows it wrapped onto, or a hyperlink a program wrote (OSC 8), which
@@ -298,7 +313,8 @@ waiting on you moves to the top, and that session leads its worktree.
 | `✓` done | the agent finished its turn, and you haven't looked yet |
 | `▸` | running: an agent at its prompt |
 | `❯` | a terminal: muted at a shell's prompt, brighter while a program runs in it |
-| `■` | ended: muted when it exited well, red when it failed; the pane's header says how |
+| `■` | ended: muted when it exited well, red when it failed or [couldn't start again](#usage); the pane's header says how |
+| `◌` starting | waiting its turn to start again after crystal [restarted](#usage) |
 
 Each row also says what's in front in the session's terminal when its name doesn't already say it: `claude`,
 `codex`, `vite`, `zsh`. crystal asks the terminal which program its keys go to, about once a second, so a
@@ -384,16 +400,14 @@ beeps, flashes or marks its tab, the way you set it up to. A session out of sigh
 its time in the sidebar until you look at it, rings your terminal from the TUI too, and the event log gets a
 `session.bell`. A program ringing over and over rings yours at most twice a second.
 
-`/` finds a session by typing a little of it. The sidebar shows only the sessions that match, under their
-project and worktree, with the letters that matched marked in each name. The letters only have to turn up in
-order (`rfx` finds `refund-fix`), and each word you type has to turn up in the name, project, branch or
-command, so `pay fix` finds the fixer in the payments project. Letters type into the filter, so `↑` and `↓`
-(or `Ctrl+P` and `Ctrl+N`) move among the matches; `Enter` selects one and `Esc` leaves the selection where it
-was.
+`/` finds a session by typing a little of it, in any tab, and a project or worktree with nothing running, a
+flow run or an open pull request too; `Tab` keeps it to the sessions with one status: see [finding with
+`/`](#finding-with-).
 
-For a project on GitHub or GitLab, each worktree line shows its branch's open pull request, `#57` (a merge
-request, `!57`, on GitLab), with a mark for what matters most about it; `o` opens it in your browser, `O` lists
-the project's pull requests and `i` its issues: see [pull requests and issues](#pull-requests-and-issues).
+For a project on GitHub or GitLab, each worktree line shows its branch's pull request, `#57` (a merge request,
+`!57`, on GitLab), with a mark for what matters most about it, `merged` once it has; the tab bar counts the
+pull requests and issues open on the selected session's project; `o` opens its pull request in your browser,
+`O` lists the project's pull requests and `i` its issues: see [pull requests and issues](#pull-requests-and-issues).
 
 Everything is also a command, for scripts and for agents:
 
@@ -402,6 +416,7 @@ crystal new claude                          # start Claude Code here and attach 
 crystal new -d -n review -c ~/code/app codex   # start one in the background, named, somewhere else
 crystal new -w fix/login claude             # start one in a new worktree, on a new branch off origin's main
 crystal new -w spike --base HEAD claude     # the same, its branch off the commit you're on
+crystal new -d -e PORT=4000 npm run dev     # with a variable set in its environment, over yours
 crystal task "update the docs"              # run Claude without a terminal, in the background (see below)
 crystal result task                         # a task's answer
 crystal answer task y                       # allow what a task asks for: y, n or always
@@ -433,6 +448,7 @@ crystal profile                             # list your agent profiles
 crystal profile show review                 # what a profile runs, and where it starts
 crystal pane split review                   # show a session in a pane beside yours in the TUI (see below)
 crystal tab new review                      # a new tab in the TUI, in front
+crystal title set "deploying"               # the title of the TUI's terminal, until `crystal title clear`
 crystal layout                              # the TUI's tabs and how each splits its panes
 crystal skill --install                     # teach Claude Code to drive crystal (see below)
 crystal integration install                 # hooks for a claude or codex you start in a shell (see above)
@@ -467,9 +483,16 @@ with it: their directory is gone, so they could never start again.
 To set a new worktree up, say install its dependencies or copy in an `.env`, have a [plugin](#plugins) run a
 command on `worktree.created`, and on `worktree.removed` to tidy up after it.
 
+`crystal new` with no command starts your shell: the one `default_shell` under `[terminal]` in the
+[settings](#terminals-the-window-and-the-tab-bar) names, or else `$SHELL`, as a login shell on a Mac. `--env
+KEY=VALUE` (`-e`), as many times as you like, sets a variable in the session's environment over the one it
+would have from yours: `-e PORT=4000`, `-e DEBUG=` for an empty one. crystal's own, like `TERM` and
+`CRYSTAL_SESSION`, can't be changed.
+
 `crystal rename` changes what a session is called; its program and its saved place after a restart follow the
 new name. `crystal respawn`, or `Enter` on an ended session in the TUI, runs its command again in the same
-directory, under the same name and in the same place in the list, with your environment. Claude Code and Codex
+directory, under the same name and in the same place in the list, with your environment; on one that couldn't
+start again after a restart, it tries again. Claude Code and Codex
 come back in the conversation they were in, without being asked their task again. Every session's program also gets `CRYSTAL_SESSION_ID`, which stays the same
 when the session is renamed, while `CRYSTAL_SESSION` keeps the name the program started under.
 
@@ -478,8 +501,18 @@ The first `crystal new` starts the daemon. Sessions keep running after you detac
 session that has ended, it prints the last screen and how the program exited.
 
 If the daemon dies without being asked to, because it crashed or the machine rebooted, the next `crystal` starts
-the sessions that were running again, in the same directories. Claude Code and Codex come back in the
-conversation they were in. `crystal kill-server` is asked to stop everything, so after it nothing comes back.
+the sessions that were running again, in the same directories and in their places in the list. Claude Code and
+Codex come back in the conversation they were in. Shells and other programs start straight away, and so does
+the first agent, but the agents after it start a quarter of a second apart (`restart_spacing_ms` under
+`[sessions]`, `0` for all at once), so a dozen of them don't all load at once; until its turn, an agent's row
+says `starting`. A session that can't start again, because its directory has gone or its command isn't there
+any more, isn't dropped, and never starts somewhere else instead: it stays in its place, its row says
+`couldn't start`, its screen and `crystal ls` say why, and it stays written down, to try again with the next
+restart. Put it right and `Enter` on it (or `crystal respawn`) starts it, or kill it. Once they've all started
+or failed, the TUI's footer says how it went, like `after the restart: 6 sessions back · 1 couldn't start:
+docs`, and the [event log](#events) has a `session.start_failed` for each that couldn't and a
+`daemon.restarted` for the lot. `crystal kill-server` is asked to stop everything, so after it nothing comes
+back.
 The list is kept in crystal's database, `~/.local/state/crystal/crystal.db`, without the sessions' environment
 variables, since those can hold secrets; a session started again gets the environment of whoever started the
 daemon again.
@@ -566,13 +599,42 @@ fold = "marks"         # what folding keeps: "marks", or "hidden" for nothing
 needs_you = true       # pin what needs you at the top
 ```
 
+### Finding with `/`
+
+`/` finds anything in the sidebar, and more, by typing a little of it. The sidebar shows only what matches,
+from every tab, under its project and worktree, with the letters that matched marked. The letters only have
+to turn up in order (`rfx` finds `refund-fix`), and each word you type has to turn up somewhere in what it
+finds, so `pay fix` finds the fixer in the payments project. Letters type into the filter, so `↑` and `↓` (or
+`Ctrl+P` and `Ctrl+N`) move among the matches; `Enter` picks one, as does a click, and `Esc` leaves the
+selection where it was. What it finds, and what picking it does:
+
+| What | Found by | Picking it |
+|---|---|---|
+| a session, in any tab | its name, project, branch, command, the agent in front, its tab's name, its directory, or the name or goal of the flow run it's a step of | selects it, bringing its tab to the front |
+| a flow run | its name, its flow's or its goal, which find its steps too | selects the step it's at |
+| a project nothing runs in, or a worktree with no sessions | its project, its branch, or its directory | puts the selection on it, where `Enter` starts something |
+| an open pull request (a merge request on GitLab) | its title, number (`57` or `#57`), branch, author or project | opens it in [the pull requests view](#pull-requests-and-issues) |
+
+A directory or a goal only counts where a word turns up in it whole, or nearly anything would find it. Before
+you type, only sessions show; projects, worktrees and pull requests join them as you type. The pull requests are
+those the sidebar already asked the forge for, and `/` asks, in the background, about the projects with nothing
+running the first time it opens, so typing never waits on the forge.
+
+`Tab` keeps to the sessions with one status, the footer saying which, round `waiting`, `working`, `done` (a
+finished turn nobody has looked at), `idle` (at the prompt) and `ended`, then back to all of them; `Shift+Tab`
+goes the other way. Typing narrows them further. Projects and pull requests have no status, so they don't show
+while it keeps to one.
+
 ### Tabs
 
 A tab is a space of its own: it holds its own sessions, and the sidebar lists only the sessions of the tab
 you're in, with that tab's panes beside them. Keep the agents on one feature in one tab, a dev server and its
 logs in another, a review in a third, and switch between them.
 
-The tabs sit in the bar along the top, numbered, the one you're in standing out. `t` makes a new one, starts
+The tabs sit in the bar along the top, numbered, the one you're in standing out; `[tab_bar]` in the
+[settings](#terminals-the-window-and-the-tab-bar) puts the bar over the footer instead, leaves it out while
+there's only one tab, and shows what you like at its right, after the count: the time, this machine's name,
+a command's answer. `t` makes a new one, starts
 your shell in it, in the selected session's directory, and takes you there. `[` and `]` go to the tab before
 and after, `1` to `9` straight to the first nine, and a click on a tab goes there too. `{` and `}` move the
 tab you're in one place to the left or right. Each tab keeps its own selection and panes, split and sized its
@@ -779,6 +841,12 @@ its branch, and for each pull request's diff, where only a file changing takes a
 starts open, a directory that holds only another reads as one row with it, like `src/tui`, and a directory's
 row shows how many lines change under it, and a `✓` once every file under it is reviewed; selected, it lists them.
 
+`/` filters the list as you type, the way the [file finder](#the-file-finder-and-the-tree-browser) matches: a few
+letters of a file's path, in order (`rfnd` keeps `src/billing/refund.rs`), and the header counts how many
+match. In the tree, it keeps the files that match and the directories they're in, all open. `↑` / `↓` still
+move through the files while you type; `Enter` keeps the filter and gives the keys back to the list, and `Esc`
+clears it, there or once you're back in the list, before a second `Esc` closes the diff.
+
 | Key | In the diff |
 |---|---|
 | `j` / `k`, `↓` / `↑` | the next or previous file |
@@ -790,18 +858,21 @@ row shows how many lines change under it, and a `✓` once every file under it i
 | `t` | the files as a tree of directories, or a list again |
 | `←` / `→`, `h` / `l` | in the tree: fold a directory or go up to the one it's in; open one or go into it |
 | `Enter` | in the tree: fold or open the directory |
-| `Esc` / `q` | back to the sidebar |
+| `/` | filter the files by a few letters of their paths: `Enter` keeps the filter, `Esc` clears it |
+| `Esc` / `q` | clear the filter, if there's one; back to the sidebar |
 
 The wheel scrolls the diff, and moves through the files over the list; a click on a directory folds or opens it.
 
 ### Pull requests and issues
 
-For a project whose remote is on GitHub or GitLab, each worktree line shows its branch's open pull request when
-there is one: `#57`, or on GitLab, where it's a merge request, `!57`, and a mark for what matters most about it,
-in this order:
+For a project whose remote is on GitHub or GitLab, each worktree line shows its branch's pull request when
+there is one, open or merged lately: `#57`, or on GitLab, where it's a merge request, `!57`, and a mark for what
+matters most about it, in this order:
 
 | Mark | Meaning |
 |---|---|
+| `merged` | it has merged: the worktree's work is in, and the worktree can go |
+| `conflicts` | its branch conflicts with the one it would merge into, so it can't merge as it stands |
 | `✗` | a check failed |
 | `±` | a reviewer asked for changes |
 | `draft` | it's still a draft |
@@ -809,9 +880,15 @@ in this order:
 | `✓` | approved |
 
 A pull request that's simply ready shows its number alone. `o` opens the selected session's pull request in your
-browser. crystal asks the forge's own command line tool, [`gh`](https://cli.github.com) for GitHub and
-[`glab`](https://gitlab.com/gitlab-org/cli) for GitLab, as soon as it sees a project and then once a minute,
-so your login works as it always does and crystal never sees a token. Which forge a project is on comes from
+browser. On the right of the [tab bar](#terminals-the-window-and-the-tab-bar), after the sessions, are how many
+pull requests and issues are open on the selected session's project, `3 prs · 5 issues` (`mrs` on GitLab):
+none says nothing, a list as long as the forge gives at once counts `100+`, and a narrow terminal leaves them
+out before the tabs, or what you have the bar show at its right, give way.
+
+crystal asks the forge's own command line tool, [`gh`](https://cli.github.com) for GitHub and
+[`glab`](https://gitlab.com/gitlab-org/cli) for GitLab, as soon as it sees a project and then once a minute for
+its pull requests (the open ones, and the last 20 merged) and every five minutes for its issues, so your login
+works as it always does and crystal never sees a token. Which forge a project is on comes from
 its `origin` remote (or its first, without one): `github.com`, or a host `gh` is logged in to, like a GitHub
 Enterprise, is GitHub; `gitlab.com`, or a host in glab's config, like a GitLab of your own, is GitLab.
 Without the tool, or logged out of it, or for a project on neither, nothing is shown; `o`, `O` and `i` say why.
@@ -819,17 +896,25 @@ Without the tool, or logged out of it, or for a project on neither, nothing is s
 #### Pull requests
 
 `O` lists the open pull requests of the selected session's project, with each one's author and branch, whether
-it's a draft, how its checks stand and what its reviewers decided. Under the list is the selected one, read
-whole: who wants to merge which branch into which, each of its checks, its description, and then its
-conversation, comments and reviews in the order they came. Typing filters the list by number, title, author or
-branch; `↑` / `↓` pick another, and `PageUp` / `PageDown` scroll what's under the list.
+it's a draft or conflicts with its base, how its checks stand and what its reviewers decided, then, below them
+and muted, the ones merged lately, marked `merged`. Under the list is the selected one, read whole: who wants to
+merge which branch into which, or merged it, whether it can merge as it stands, each of its checks, its
+description, and then its conversation, comments and reviews in the order they came. Typing filters the list by
+number, title, author or branch; `↑` / `↓` pick another, and `PageUp` / `PageDown` scroll what's under the list.
+The list opens on what the forge said last, and `Ctrl+R` asks again, the heading saying so until it answers.
+
+`hide_draft_prs` under `[forge]` in the [settings](#settings), or `hide drafts` in the [settings
+view](#the-settings-view), leaves drafts out of the list, the tab bar's count and what `/` finds, for what's
+asking to be reviewed; the heading says how many it hides. A worktree's own pull request shows on its line all
+the same.
 
 | Key | In the pull requests |
 |---|---|
-| `Enter` | open the [new-session panel](#starting-a-session) in the pull request's worktree, with the task `Work on pull request #57: <its title> (<its address>)` |
+| `Enter` | open the [new-session panel](#starting-a-session) in the pull request's worktree, with the task `Work on pull request #57: <its title> (<its address>)`; not on one that has merged |
 | `Ctrl+D` | its whole diff, in [the diff](#the-diff); `Esc` comes back to the list |
 | `Ctrl+C` | comment on it: `Enter` posts, `Alt+Enter` breaks a line, `Esc` puts the comment away |
 | `Ctrl+O` | open it in your browser |
+| `Ctrl+R` | ask the forge for the list again, and the selected one with it |
 | `Esc` | close the list |
 
 A pull request's worktree is the project's worktree on its branch, when there's one already; otherwise crystal
@@ -848,7 +933,7 @@ box, with why.
 
 `i` lists the open issues of the selected session's project, the latest to change first, with the selected
 issue under the list: its text, then what's been said on it. Typing filters them by number, title, label or
-author.
+author. It opens on the issues listed last, and `Ctrl+R` asks the forge again.
 
 | Key | In the issues |
 |---|---|
@@ -856,13 +941,15 @@ author.
 | `Ctrl+C` | comment on it: `Enter` posts, `Alt+Enter` breaks a line, `Esc` puts the comment away |
 | `Ctrl+E` | change its title and text: `Tab` goes between them, `Enter` saves both, `Esc` keeps them as they were |
 | `Ctrl+O` | open it in your browser |
+| `Ctrl+R` | ask the forge for the list again, and the selected one with it |
 | `Esc` | close the list |
 
 #### On GitLab
 
 Everything above works on a GitLab project, through `glab`, with merge requests where GitHub has pull requests.
 GitLab's list of merge requests doesn't say how their checks or reviews stand, so their worktree lines and rows
-show only `draft`; reading one shows its pipeline as its check, and an approval in its conversation. GitLab wants
+show only `merged`, `conflicts` and `draft`; reading one shows its pipeline as its check, and an approval in its
+conversation. GitLab wants
 a login to read comments, even on a project anyone can see: logged out, a merge request or an issue reads
 without them.
 
@@ -940,8 +1027,13 @@ long ago that was, then the branches on its remotes that have no branch of yours
 them, the way the file finder does; beside the list is the selected branch's last commit and what `Enter` would
 do with it. `Enter` switches to it; a remote's branch, like `origin/fix-login`, becomes a branch of your own,
 `fix-login`, that follows it. When nothing matches what you typed, `Enter` makes a branch by that name, from the
-commit the worktree is on, and switches to it, your changes coming along. The remotes' branches are as your last
-`git fetch` left them: the switcher doesn't go over the network.
+commit the worktree is on, and switches to it, your changes coming along.
+
+Once it has listed the branches, the switcher fetches every remote in the background, `git fetch --all`, at most
+once a minute for a worktree, and lists them again when that's done, the branch you picked still picked, so a
+branch someone else pushed is there to switch to; the header says `fetching…` meanwhile, or why it couldn't.
+`Ctrl+R` fetches again straight away. A fetch can't ask for a password or a passphrase, which would take the
+TUI's terminal: one that needs to fails instead, and so does one that takes longer than two minutes.
 
 When the worktree has changes not committed, the switcher stops and asks what's to become of them:
 
@@ -1272,6 +1364,7 @@ beside its own, or a script can set up a tab for a review, with the TUI open or 
 crystal new -d -n tests cargo test
 crystal pane split tests                  # beside the pane of the session this runs in; --down below it
 crystal pane split logs --beside server --down --ratio 0.7   # server keeps 70% of the room
+crystal pane split -e PORT=4000           # no session named: a new shell, split off; prints its name
 crystal pane focus tests                  # select it, its tab in front, and type into it; or left, right, up, down
 crystal pane focus tests --raise          # the same, and bring the TUI's terminal to the front, as a notification's click does
 crystal pane resize left 8 -n tests       # move a border of its pane, as R does; 4 columns or 2 rows by default
@@ -1286,6 +1379,8 @@ crystal tab move reviewer review          # move a session to another tab, as > 
 crystal tab reorder review 1              # move a tab to be the first, as { and } do a place at a time
 crystal tab close review --kill           # a tab with sessions closes only with --kill, which kills them
 crystal layout                            # each tab's sessions and how its panes split the room; --json
+crystal title set "deploying"             # the title of the TUI's terminal, in place of the settings' one
+crystal title clear                       # back to the settings' one
 ```
 
 A command about a session works on the tab that holds it, whether it's in front or not, and leaves the tab in
@@ -1293,8 +1388,10 @@ front where it is: an agent in another tab lays out its own without taking you t
 moves you: `tab new`, `tab select` and `pane focus`. Without a session named, a command is about the session
 it runs in, or, run outside crystal, the selected one. `pane split` splits the pane that session has of its
 own, or else the selection's pane, which it selects if that pane shows something else; the session split off
-moves into that tab, out of any pane it had. A command that can't be carried out says why, the way the footer
-would: no room for another pane, a session that isn't on screen.
+moves into that tab, out of any pane it had. With no session named, `pane split` starts a new shell to split
+off, in the directory it's run in or `--cwd`, with any `--env` variables, as `crystal new` does, and prints its
+name. A command that can't be carried out says why, the way the footer would: no room for another pane, a
+session that isn't on screen. `title` needs a TUI open: with none, there's no terminal to give the title.
 
 The command goes through the daemon to the TUI you used last, the one where you last pressed a key, clicked
 or brought its terminal to the front, and waits for it to answer, a few seconds at most. When `restart-server`
@@ -2099,6 +2196,7 @@ matched anywhere in the link unless `^` and `$` pin it. `X` lists each plugin's 
 | `session.done` | a session's agent finishes a turn nobody was watching |
 | `session.idle` | a session's agent is at its prompt, its turn seen |
 | `session.ended` | a session's program ends, or the session is killed |
+| `session.start_failed` | a session can't start again after a [restart](#usage): its directory or its command has gone; its `status` says why |
 | `session.removed` | a session leaves the list: killed, or its worktree removed |
 | `session.archived` | a session is stopped and kept in the archive: `A`, or `crystal archive` |
 | `session.claimed` | an agent takes over saying what a session is doing, with [`crystal report`](#teaching-crystal-about-your-agent) |
@@ -2132,6 +2230,7 @@ matched anywhere in the link unless `^` and `$` pin it. `X` lists each plugin's 
 | `backlog.closed` | an item is marked done |
 | `plugin.paused` | a plugin is paused for failing |
 | `daemon.handed_over` | the daemon is handed over to another crystal, its sessions carrying on (see `restart-server`) |
+| `daemon.restarted` | the daemon, restarted cold, has started the sessions that were running again: its `daemon` says how many came back (`sessions`) and which couldn't (`failed`) |
 
 A hook gets the event as a line of JSON on its standard input, the same as the [event log](#events) keeps it,
 and its name in `CRYSTAL_EVENT`:
@@ -2188,10 +2287,16 @@ file and change. A setting crystal doesn't know is an error that names it, so a 
 | `[events]` | | `keep_days`, how long the [event log](#events) keeps what happened: 30 days, or `0` for ever |
 | `[handoff]` | | `in_git`, the projects, by their main worktree, whose [handoff notes](#the-handoff-file) go in git |
 | `[worktrees]` | | `base`, the branch new worktrees' new branches [start from](#usage): `origin`'s default branch unless set |
-| `[sessions]` | | `stop_idle_after`, how long an agent may sit [idle](#archiving-and-idle-agents) before crystal stops it, like `"30m"`: `"off"` |
+| `[forge]` | | `hide_draft_prs`, leave draft pull requests out of [the pull requests](#pull-requests), the tab bar's count and `/` (`false`) |
+| `[sessions]` | | `stop_idle_after`, how long an agent may sit [idle](#archiving-and-idle-agents) before crystal stops it, like `"30m"`: `"off"`; `restart_spacing_ms`, how far apart the agents a [crash or a reboot](#usage) starts again start (`250`, or `0` for all at once) |
 | `[[project]]` | | a project's [run and open commands](#projects), by its main worktree's `path`, in place of its own file's |
 | `[keys]` | | the TUI's keys, by command, its prefix and the key back to the sidebar: [keys and commands](#keys-and-commands) |
 | `[sidebar]` | | the sidebar's `width`, whether it starts `folded`, what folding keeps, and whether what needs you is pinned: [the sidebar](#the-sidebar) |
+| `[terminal]` | | the shell a new terminal runs, `default_shell`, whether it's a login shell, `shell_mode`, and where `t` starts one, `new_cwd`: [terminals](#terminals-the-window-and-the-tab-bar) |
+| `[window]` | | `title`, what the TUI titles its terminal: [the window](#terminals-the-window-and-the-tab-bar) |
+| `[tab_bar]` | | where the tab bar goes, whether it's left out with one tab, and what it shows at its right: [the tab bar](#terminals-the-window-and-the-tab-bar) |
+| `[appearance]` | | `auto_switch`, the theme following your system's light or dark, and the theme for each: [themes](#themes) |
+| `[mouse]` | | `capture`, whether the TUI takes the mouse from your terminal (`true`); `copy_on_select`, whether a selection is copied as you let go or waits in copy mode for `y` (`true`); `scroll_lines`, how far a notch of the wheel scrolls a pane, up to 100 (`3`); `scrollbars`, a scrollbar beside each pane (`true`): [the mouse](#usage) |
 | `[update]` | | `check`, whether the TUI looks once a day for a [newer crystal](#updating) (`true`) |
 
 `notify_command` is for telling you some other way, like a message to your phone. It runs with
@@ -2208,13 +2313,15 @@ offered as a profile of its own.
 
 The daemon reads the notification and sound settings each time it tells you something, `[plugins]` each time it
 does something a plugin adds, `[memory]` each time a task closes or a search runs, `[tasks]` each time a
-background task's run starts, `[handoff]` each time a note is written, `[sessions]` every 15 seconds, a flow
+background task's run starts, `[handoff]` each time a note is written, `[sessions]` every 15 seconds and as it
+starts sessions again, a flow
 each time one starts, `[[project]]` each time a project's commands run,
 `name_from_prompt` each time it names a session, `resume_reported_agents` as it starts sessions again and
 `scrollback_lines` as each session starts, so a change counts straight away (a session already running keeps
-what it had); the TUI reads `new_session`, `theme`, `[colors]`, `scrollback_lines`, `[plugins]`, `[update]`, the profiles and
-the flows when it starts, again when you save a profile or switch a plugin, and every half a second while the
-settings view is open.
+what it had); `crystal new` and the TUI read `[terminal]` each time they start a shell; the TUI reads
+`new_session`, `theme`, `[colors]`, `[appearance]`, `[window]`, `[tab_bar]`, `scrollback_lines`, `[plugins]`,
+`[update]`, `[mouse]`, `[forge]`, the profiles and the flows when it starts, again when you save a profile or
+switch a plugin, and every half a second while the settings view is open.
 
 #### Themes
 
@@ -2249,6 +2356,30 @@ terminal. The schemes' colors are [herdr](https://github.com/herdrdev/herdr)'s, 
 that crystal gives their roles and blends the tints it needs from, toward the background: behind a diff's
 lines, what a search found, the selection and blocks of code.
 
+`[appearance]` has the theme follow your system's light or dark, switching as the system does, without a
+restart:
+
+```toml
+theme = "catppuccin"
+
+[appearance]
+auto_switch = true
+light_theme = "catppuccin-latte"   # unless given: theme's light side, else crystal's own light
+dark_theme = "catppuccin"          # unless given: theme's dark side, else crystal's own dark
+```
+
+A theme that has two sides (crystal's own, catppuccin, tokyo night, gruvbox, one, solarized, kanagawa and rose
+pine) goes to its other side, so `theme = "gruvbox"` alone is `gruvbox-light` while it's light; one with
+one side goes to crystal's `light` or `dark`; and `terminal` stays, since your terminal's own colors follow
+your terminal. On a Mac the TUI asks the system's appearance every two seconds, and on Linux the desktop's
+settings portal (GNOME's and KDE's), or else GNOME's own setting. Over ssh the system isn't yours, and some
+systems can't say: there the TUI asks your terminal what its background is as it starts, and goes by that,
+which follows a change only the next time it starts. (A terminal can tell a program each time its appearance
+changes, but crystal's keyboard reader would take that for the start of a key it waits to see the end of.)
+Picking a theme in the [settings view](#the-settings-view) stops the following, as that's the theme you want.
+`[appearance.light_colors]` and `[appearance.dark_colors]` take colors of your own, as `[colors]` below does,
+for while it's light or dark, over `[colors]`.
+
 `[colors]` puts colors of your own over the theme's, each named for what it's for:
 
 ```toml
@@ -2280,16 +2411,77 @@ for your terminal's own. What each paints:
 A name or a color crystal doesn't know is an error that names it. With `NO_COLOR` set, crystal uses no color at
 all, whatever the theme or `[colors]` say.
 
+#### Terminals, the window and the tab bar
+
+```toml
+[terminal]
+default_shell = "fish"   # the shell a new terminal runs: a program, not a command line; $SHELL unless given
+shell_mode = "auto"      # a login shell on a Mac, not elsewhere; or "login", "non_login"
+new_cwd = "follow"       # where t starts its shell: "follow", "home", "current" or a directory
+
+[window]
+title = "crystal · {session}"
+
+[tab_bar]
+position = "top"         # or "bottom", over the footer
+hide_when_single = false # leave it out while there's only one tab
+separator = " · "
+right = [
+  { type = "hostname" },
+  { type = "clock", format = "%a %H:%M" },
+  { type = "text", text = "prod" },
+  { type = "command", command = "~/bin/status.sh", every = "10s", timeout = "2s" },
+]
+```
+
+A new terminal, whether `crystal new` with no command, `t`, the new-session panel's shell or `crystal pane
+split` with no session, runs `default_shell`, or else your `$SHELL`, or else `/bin/sh`. `shell_mode = "auto"`
+starts it as a login shell on a Mac, as Terminal and iTerm do, so the profile that puts Homebrew and
+`path_helper`'s directories on the `PATH` runs; elsewhere it doesn't. A login shell is started with `-l`, which
+sh, bash, zsh, fish, ksh, dash, tcsh, nu, xonsh and pwsh take; a shell with no such thing, like elvish, starts
+as it is. A project's [run command](#projects) runs with `$SHELL -c` all the same.
+
+`new_cwd` says where `t` starts its new tab's shell, and where a session starts when none is selected:
+`follow`, the selected session's directory, or where you started `crystal` with none selected; `home`;
+`current`, where you started `crystal`; or a directory of your own, from `/` or `~`. `crystal new` starts where
+it's run, or `--cwd`.
+
+`title` is what the TUI titles the terminal it runs in, which the terminal's tabs, its window and your window
+manager show; a session's own title stops at crystal, which plays its terminal. Its tokens: `{session}`, the
+selected session's name; `{project}` and `{branch}`, where it runs; `{title}`, the title its program gave its
+terminal; `{tab}`, the tab in front's name, or its number; `{hostname}`, this machine's name up to its first
+dot. `{{` and `}}` are braces. A token with nothing to say is empty, and so is what that leaves at either end,
+like the ` · ` of `crystal · {session}` with no session. An empty `title` leaves your terminal's own alone.
+`crystal title set` gives the terminal a title of its own in place of it, say while a script deploys, until
+`crystal title clear`. The terminal's title from before is saved as the TUI starts and put back as it ends, by
+a terminal that keeps a stack of them (xterm's, kitty, WezTerm, iTerm2…).
+
+`right` lists what the tab bar shows after the count (and after the count of [pull requests and
+issues](#pull-requests-and-issues) open on the selected session's project), in order, `separator` between
+them: `hostname`, this
+machine's name; `clock`, the time as `strftime` writes `format` (`%H:%M` unless given); `text`; and
+`command`, the last line a shell command prints, run in the directory you started `crystal` in with
+`CRYSTAL_SOCKET` set, again `every` while (`10s` unless given), stopped once it takes `timeout` (`2s`), its
+colors and other escape sequences taken out, and nothing when it fails. Something with nothing to say is left
+out, and on a bar too narrow for it and the tabs, all of it is, the tabs coming first; the pull requests and
+issues give way before it.
+
 #### The settings view
 
 `,` in the sidebar opens the settings you'd otherwise change in the file: notifications and when they come,
-sounds, the theme, how long an agent may sit [idle](#archiving-and-idle-agents), and how memory learns
-([the distiller](#the-distiller)) and searches ([by meaning](#search-by-meaning)). `space` changes the one the
-bar is on, and `←/→` go through the [themes](#themes), forward and back (the row says which of the twenty it's
-on), the waits before a notification, and the times an agent may sit idle: off, 15 minutes, 30, an hour, two or
-eight. Each change is written to the file at once,
+sounds, the theme and whether it follows your system's [appearance](#themes) (the row says which theme each
+side is), whether the [tab bar](#terminals-the-window-and-the-tab-bar) goes on top or over the footer and is
+left out with one tab, how long an agent may sit [idle](#archiving-and-idle-agents), how far apart agents
+start again after a [crash or a reboot](#usage), [the mouse](#usage), how memory learns ([the
+distiller](#the-distiller)) and searches ([by meaning](#search-by-meaning)), and whether [draft pull
+requests](#pull-requests) are hidden. `space` changes the one the bar is on, and `←/→` go through the
+[themes](#themes), forward and back (the row says which of the twenty it's on), the waits before a
+notification, the times an agent may sit idle: off, 15 minutes, 30, an hour, two or eight, the spacing of
+restarts: all at once, 100 milliseconds, 250, 500, a second or two, and how far a notch of the wheel scrolls:
+1, 2, 3, 5 or 10 lines. Each change is written to the file at once,
 keeping the rest of it as you wrote it, comments and all, and counts straight away: the TUI repaints in a new
-theme, and the daemon reads the rest as it goes.
+theme, and the daemon reads the rest as it goes. On a screen too short for every row, the view scrolls to keep
+the one the bar is on in sight.
 
 While it's open, the view reads the file and asks the daemon again every half a second, so it follows a
 change made by hand in the file too, and shows how the models that search by meaning stand: downloading
@@ -2380,6 +2572,7 @@ over, the daemon is restarted cold from the sessions it wrote down first.
 - [x] Rules for reading each agent's screen in files you can change, and why a session reads as it does
 - [x] Projects and worktrees
 - [x] Resume after a restart
+- [x] Restarts after a crash that start agents a moment apart and keep what can't start, saying why
 - [x] Split panes
 - [x] Tabs
 - [x] Agents that start, message, wait on and read other agents

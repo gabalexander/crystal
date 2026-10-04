@@ -70,6 +70,9 @@ pub enum Row {
     /// A session pinned under [`Row::NeedsYou`], by its index; it has its
     /// own row in its group too, in its tab.
     Pinned(usize),
+    /// An open pull request `/` found, under its project: the project's
+    /// main worktree, and the pull request's number.
+    PullRequest { project: PathBuf, number: u64 },
 }
 
 /// Puts sessions in the sidebar's order. They come in the order they were

@@ -238,15 +238,16 @@ fn offset(app: &App, height: u16) -> usize {
 /// one its bar is on; or the heading of the folded project the selection is
 /// in, out of sight.
 fn selected_row(app: &App) -> Option<usize> {
+    if app.filter().is_some() {
+        return app.filter_row();
+    }
     let rows = app.rows();
     if let Some(project) = app.folded_selection() {
         return rows
             .iter()
             .position(|row| matches!(row, Row::Project { path, .. } if path == project));
     }
-    if app.filter().is_none()
-        && let Some(worktree) = app.selected_empty_worktree()
-    {
+    if let Some(worktree) = app.selected_empty_worktree() {
         let row = Row::NoSessions(worktree.path.clone());
         return rows.iter().position(|shown| *shown == row);
     }
@@ -337,7 +338,62 @@ fn row_line<'a>(app: &'a App, row: &Row, look: &Look, width: u16, selected: bool
                 false,
             )
         }
+        Row::PullRequest { project, number } => {
+            pull_request_line(app, project, *number, look, width, selected)
+        }
     }
+}
+
+/// An open pull request `/` found, under its project, in line with the
+/// worktrees: its number, its title with the letters the filter matched
+/// marked, and on the right the mark for what matters most about it.
+/// Short of room, the title is cut, down to a few letters before the mark
+/// goes.
+fn pull_request_line<'a>(
+    app: &App,
+    project: &Path,
+    number: u64,
+    look: &Look,
+    width: u16,
+    selected: bool,
+) -> Line<'a> {
+    let theme = look.theme;
+    let Some((pull_request, marked)) = app.found_pull_request(project, number) else {
+        return Line::default();
+    };
+    let label = pull_request.label();
+    // The indent, the number and a space before the title; a space at the
+    // end.
+    let room =
+        usize::from(width).saturating_sub(WORKTREE_INDENT.len() + label.chars().count() + 1 + 1);
+    let mark = pull_request_mark(pull_request.state(), theme);
+    let title_width = pull_request.title.chars().count();
+    let mark = mark.filter(|(mark, _)| title_width.min(8) + 1 + mark.chars().count() <= room);
+    let title_room = match mark {
+        Some((mark, _)) => room - 1 - mark.chars().count(),
+        None => room,
+    };
+    let title = fit(&pull_request.title, title_room);
+    let mut title_style = Style::new().fg(theme.text);
+    if selected {
+        title_style = title_style.add_modifier(Modifier::BOLD);
+    }
+    let marked_style = title_style
+        .fg(theme.accent)
+        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+    let mut spans = vec![
+        Span::raw(WORKTREE_INDENT),
+        Span::styled(label, Style::new().fg(theme.muted)),
+        Span::raw(" "),
+    ];
+    let title_width = title.chars().count();
+    spans.extend(marked_spans(&title, &marked, title_style, marked_style));
+    if let Some((mark, color)) = mark {
+        let gap = room.saturating_sub(title_width + mark.chars().count());
+        spans.push(Span::raw(" ".repeat(gap)));
+        spans.push(Span::styled(mark, Style::new().fg(color)));
+    }
+    Line::from(spans)
 }
 
 /// A flow run's heading, in line with the worktrees: a mark in the color
@@ -716,6 +772,8 @@ fn pull_request_spans<'a>(pull_request: &PullRequest, theme: &Theme) -> Vec<Vec<
 /// says how it stands. One that's simply ready has none.
 fn pull_request_mark(state: PullRequestState, theme: &Theme) -> Option<(&'static str, Color)> {
     let mark = match state {
+        PullRequestState::Merged => ("merged", theme.accent),
+        PullRequestState::Conflicts => ("conflicts", theme.failed),
         PullRequestState::ChecksFailing => ("✗", theme.failed),
         PullRequestState::ChangesRequested => ("±", theme.waiting),
         PullRequestState::Draft => ("draft", theme.muted),
@@ -999,8 +1057,12 @@ fn marked_spans<'a>(
 }
 
 /// How long ago the session changed, or nothing from a daemon that
-/// doesn't say.
+/// doesn't say. One yet to start again after a restart, or that couldn't,
+/// says that instead.
 fn changed_ago(session: &SessionInfo, now: u64) -> String {
+    if session.state.is_unstarted() {
+        return session.state.to_string();
+    }
     if session.changed == 0 {
         return String::new();
     }
@@ -1097,6 +1159,20 @@ mod tests {
             line: None,
             bell: false,
         }
+    }
+
+    #[test]
+    fn a_session_yet_to_start_again_says_so_in_place_of_when() {
+        use crate::protocol::State;
+        let mut fixer = session("fixer", claude());
+        fixer.changed = 100;
+        assert_eq!(changed_ago(&fixer, 160), "1m");
+        fixer.state = State::Starting;
+        assert_eq!(changed_ago(&fixer, 160), "starting");
+        fixer.state = State::Failed {
+            why: "command not found: claude".into(),
+        };
+        assert_eq!(changed_ago(&fixer, 160), "couldn't start");
     }
 
     /// What a session's task line says, after its indent.

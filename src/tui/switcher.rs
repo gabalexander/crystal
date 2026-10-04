@@ -9,8 +9,12 @@
 //! A linked worktree isn't switched: it's named after the branch it was
 //! made for, in its directory, and moving it would make the name wrong.
 //!
-//! The state is plain data; the event loop lists the branches and runs the
-//! switch off the loop, with [`crate::git::branches`].
+//! Once the branches are listed, the remotes are fetched, at most once a
+//! minute for a worktree unless Ctrl+R asks again, and the branches listed
+//! again when that's done, so the remotes' branches are as they are now.
+//!
+//! The state is plain data; the event loop lists the branches, fetches
+//! and runs the switch off the loop, with [`crate::git::branches`].
 
 use super::app::{Action, Hit, Loading, Outcome};
 use super::fuzzy::{self, Match};
@@ -113,6 +117,17 @@ impl Choice {
     }
 }
 
+/// How fetching the remotes stands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Fetch {
+    /// Not yet: it starts once the branches are first listed.
+    Waiting,
+    Fetching,
+    Fetched,
+    /// Why it couldn't.
+    Failed(String),
+}
+
 /// Where the switcher is in a switch.
 pub enum Stage {
     /// Choosing the branch.
@@ -162,6 +177,7 @@ pub struct Switcher {
     pub stage: Stage,
     /// Why the last thing asked didn't happen, until the next key.
     pub problem: Option<String>,
+    pub fetch: Fetch,
     /// How many rows the list is drawn in, for paging.
     rows: u16,
 }
@@ -179,6 +195,7 @@ impl Switcher {
             touched: false,
             stage: Stage::Pick,
             problem: None,
+            fetch: Fetch::Waiting,
             rows: 20,
         }
     }
@@ -194,10 +211,11 @@ impl Switcher {
     }
 
     /// Takes the branches listed, if they're this worktree's. Once the user
-    /// has chosen one, the selection stays on it.
-    pub fn listed_done(&mut self, dir: &Path, listed: Result<Listed, String>) {
+    /// has chosen one, the selection stays on it. Listed the first time,
+    /// it asks for the remotes to be fetched.
+    pub fn listed_done(&mut self, dir: &Path, listed: Result<Listed, String>) -> Option<Action> {
         if dir != self.dir {
-            return;
+            return None;
         }
         let kept = self
             .touched
@@ -216,6 +234,36 @@ impl Switcher {
         match at {
             Some(at) => self.selected = at,
             None => self.go_home(),
+        }
+        let first = self.fetch == Fetch::Waiting && matches!(self.listed, Loading::Read(_));
+        first.then(|| self.fetch_remotes(false))
+    }
+
+    /// Starts fetching the remotes: `now`, or unless they were a moment
+    /// ago.
+    fn fetch_remotes(&mut self, now: bool) -> Action {
+        self.fetch = Fetch::Fetching;
+        Action::FetchBranches {
+            dir: self.dir.clone(),
+            now,
+        }
+    }
+
+    /// The remotes of the worktree at `dir` have been fetched, or why they
+    /// couldn't: fetched, the branches are listed again.
+    pub fn fetched(&mut self, dir: &Path, fetched: Result<(), String>) -> Option<Action> {
+        if dir != self.dir {
+            return None;
+        }
+        match fetched {
+            Ok(()) => {
+                self.fetch = Fetch::Fetched;
+                Some(self.read())
+            }
+            Err(why) => {
+                self.fetch = Fetch::Failed(why);
+                None
+            }
         }
     }
 
@@ -298,6 +346,12 @@ impl Switcher {
         match key.code {
             KeyCode::Esc => return Outcome::Close,
             KeyCode::Enter => return self.switch_to_selected(),
+            KeyCode::Char('r') if ctrl => {
+                if self.fetch == Fetch::Fetching {
+                    return Outcome::Stay;
+                }
+                return Outcome::Do(self.fetch_remotes(true));
+            }
             KeyCode::Up => self.select_by(-1),
             KeyCode::Down => self.select_by(1),
             KeyCode::Char('p') if ctrl => self.select_by(-1),
@@ -585,7 +639,12 @@ pub fn list_width(width: u16) -> u16 {
 /// The keys the footer shows while the switcher is open.
 pub fn hints(switcher: &Switcher) -> Vec<(&'static str, &'static str)> {
     match switcher.stage {
-        Stage::Pick => vec![("↑/↓", "select"), ("enter", "switch"), ("esc", "close")],
+        Stage::Pick => vec![
+            ("↑/↓", "select"),
+            ("enter", "switch"),
+            ("ctrl+r", "fetch"),
+            ("esc", "close"),
+        ],
         Stage::Dirty { .. } => vec![
             ("s/b/c/d", "choose"),
             ("↑/↓", "move"),
@@ -697,11 +756,17 @@ fn inside(content: Rect) -> Rect {
     )
 }
 
-/// "⎇ switch branch · 3 uncommitted changes", and where on the right.
+/// "⎇ switch branch · 3 uncommitted changes · fetching…", and where on the
+/// right.
 fn header<'a>(switcher: &Switcher, look: &Look, width: u16) -> Line<'a> {
     let mut notes = Vec::new();
     if let Loading::Read(listed) = &switcher.listed {
         notes.push(changes_note(listed.changes.len()));
+    }
+    match &switcher.fetch {
+        Fetch::Fetching => notes.push("fetching…".to_string()),
+        Fetch::Failed(why) => notes.push(format!("couldn't fetch: {why}")),
+        Fetch::Waiting | Fetch::Fetched => {}
     }
     ui::view_header("⎇", "switch branch", &notes, &switcher.place, look, width)
 }
@@ -1112,6 +1177,39 @@ mod tests {
         };
         switcher.listed_done(Path::new("/code/app"), Ok(listed));
         assert_eq!(switcher.selected_branch().unwrap().name, "origin/theirs");
+    }
+
+    #[test]
+    fn the_remotes_are_fetched_once_listed_and_the_branches_listed_again() {
+        let dir = Path::new("/code/app");
+        let mut switcher = Switcher::new(dir.to_path_buf(), "app ⌂ main".into());
+        let listed = || Listed {
+            branches: three_branches(),
+            changes: Vec::new(),
+        };
+        let fetch = |now: bool| Action::FetchBranches {
+            dir: dir.to_path_buf(),
+            now,
+        };
+        assert_eq!(switcher.listed_done(dir, Ok(listed())), Some(fetch(false)));
+        assert_eq!(switcher.fetch, Fetch::Fetching);
+        // Another worktree's fetch is none of its business.
+        assert_eq!(switcher.fetched(Path::new("/code/other"), Ok(())), None);
+        // Ctrl+R waits for the fetch under way.
+        let ctrl_r = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL);
+        assert_eq!(switcher.on_key(ctrl_r), Outcome::Stay);
+        assert_eq!(
+            switcher.fetched(dir, Ok(())),
+            Some(Action::ListBranches(dir.to_path_buf()))
+        );
+        // Listed again, the remotes aren't fetched again.
+        assert_eq!(switcher.listed_done(dir, Ok(listed())), None);
+        assert_eq!(switcher.on_key(ctrl_r), Outcome::Do(fetch(true)));
+        let why = "could not read from remote repository".to_string();
+        assert_eq!(switcher.fetched(dir, Err(why.clone())), None);
+        assert_eq!(switcher.fetch, Fetch::Failed(why));
+        // The branches listed stay.
+        assert_eq!(switcher.selected_branch().unwrap().name, "feature");
     }
 
     /// A switcher asking what's to become of a change on the way to

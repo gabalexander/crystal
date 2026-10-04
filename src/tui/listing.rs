@@ -1,9 +1,10 @@
 //! What the issues and pull requests views share: the list their forge
 //! gave, filtered as you type, with a bar that keeps to its item, by
 //! number, while the filter changes; each item read whole once, the first
-//! time the bar comes to it; and the reading pane under the list, which
-//! scrolls. Then how both are drawn: a heading, the filter, the list, a
-//! rule, and the reading pane.
+//! time the bar comes to it, or again when the user asks for the list
+//! again; and the reading pane under the list, which scrolls. Then how both
+//! are drawn: a heading, the filter, the list, a rule, and the reading
+//! pane.
 //!
 //! The state is plain data: what the forge answered arrives through
 //! [`Listing::set_items`] and [`Listing::set_detail`], and the event loop
@@ -49,6 +50,9 @@ pub struct Listing<T, D> {
     asked: HashSet<u64>,
     /// How many lines the reading pane is scrolled down.
     pub scroll: u16,
+    /// Whether the forge is being asked for the list, which the heading
+    /// says: as the view opens, and when the user asks again.
+    asking: bool,
 }
 
 impl<T: Item, D> Listing<T, D> {
@@ -62,9 +66,12 @@ impl<T: Item, D> Listing<T, D> {
             details: HashMap::new(),
             asked: HashSet::new(),
             scroll: 0,
+            asking: true,
         };
         if let Some(known) = known {
             listing.set_items(Ok(known));
+            // Shown until the forge's answer comes, which it's asked for.
+            listing.asking = true;
         }
         listing
     }
@@ -72,7 +79,23 @@ impl<T: Item, D> Listing<T, D> {
     /// Takes what the forge listed, or why it couldn't.
     pub fn set_items(&mut self, found: Result<Vec<T>, String>) {
         self.items = Some(found);
+        self.asking = false;
         self.keep_highlight_shown();
+    }
+
+    /// The list is being asked for again, and the highlighted item is to
+    /// be read again with it: what's shown stays until the answers come.
+    pub fn ask_again(&mut self) {
+        self.asking = true;
+        if let Some(number) = self.highlighted {
+            self.read_again(number);
+        }
+    }
+
+    /// What the heading says while the forge, called `forge`, is asked for
+    /// the list again, over one it has listed already: `asking GitHub…`.
+    pub fn asking_note(&self, forge: &str) -> Option<String> {
+        (self.asking && self.items.is_some()).then(|| format!("asking {forge}…"))
     }
 
     /// What the forge listed: `None` while it's being asked.
@@ -169,7 +192,7 @@ impl<T: Item, D> Listing<T, D> {
     }
 
     /// Puts the bar on `number`, the reading pane at the top of it.
-    fn highlight(&mut self, number: u64) {
+    pub fn highlight(&mut self, number: u64) {
         if self.highlighted != Some(number) {
             self.highlighted = Some(number);
             self.scroll = 0;
@@ -229,14 +252,14 @@ pub fn list_areas(rest: Rect, count: usize) -> [Rect; 3] {
     .areas(rest)
 }
 
-/// "pull requests · app", and on the right how many are open, once the
-/// forge has said.
+/// "pull requests · app", and on the right what's said about the list,
+/// like how many are open, once the forge has said.
 pub fn draw_heading(
     frame: &mut Frame,
     theme: &Theme,
     title: &str,
     project: &str,
-    open: Option<usize>,
+    said: &[String],
     area: Rect,
 ) {
     let line = Line::from(vec![
@@ -248,9 +271,12 @@ pub fn draw_heading(
         Span::styled(format!(" · {project}"), Style::new().fg(theme.muted)),
     ]);
     frame.render_widget(line, area);
-    if let Some(open) = open {
-        let open = Line::styled(format!("{open} open "), Style::new().fg(theme.muted));
-        frame.render_widget(open.right_aligned(), area);
+    if !said.is_empty() {
+        let said = Line::styled(
+            format!("{} ", said.join(" · ")),
+            Style::new().fg(theme.muted),
+        );
+        frame.render_widget(said.right_aligned(), area);
     }
 }
 
@@ -391,6 +417,21 @@ mod tests {
         assert_eq!(listing.detail_to_fetch(), Some(7));
         // What it was read as shows until it's read again.
         assert_eq!(listing.detail(7), Some(&Ok("dark".to_string())));
+    }
+
+    #[test]
+    fn asking_again_reads_the_highlighted_item_again_and_waits_for_the_list() {
+        let mut listing = listing();
+        // What was listed before shows while the forge is asked.
+        assert!(listing.asking_note("GitHub").is_some());
+        listing.set_items(Ok(vec![Thing(42, "Login loops"), Thing(7, "Dark mode")]));
+        assert_eq!(listing.asking_note("GitHub"), None);
+        assert_eq!(listing.detail_to_fetch(), Some(42));
+        listing.ask_again();
+        assert!(listing.asking_note("GitHub").is_some());
+        assert_eq!(listing.detail_to_fetch(), Some(42));
+        listing.set_items(Ok(vec![Thing(42, "Login loops")]));
+        assert_eq!(listing.asking_note("GitHub"), None);
     }
 
     #[test]
