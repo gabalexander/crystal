@@ -61,8 +61,15 @@ crystal result tests
   with `--allowedTools` or `--permission-mode`.
 - `crystal interrupt <name>` stops its run; the task stays open, and a follow-up carries on.
 - A task takes follow-ups with `send`, one at a time, never `send-keys`.
-- A task whose run fails ends: `wait` prints `exited N`, and `result` says why. Past the user's daily
-  budget, a new task or follow-up is refused, saying so: tell the user rather than retrying.
+- `--accept "<criterion>"`, once for each, tells it what has to hold before it's done. `--pr <number>` runs it
+  in that pull request's worktree and `--issue <number>` says which issue it's for; with either, the prompt
+  can be left out.
+- How its run ends closes its task: `task --wait` prints `done` or `failed`, and `result` says why. Either
+  way it stays for a follow-up, which carries the conversation on. One whose `claude` crashed has ended:
+  `wait` prints `exited N`. Past the user's daily budget, a new task or follow-up is refused, saying so: tell
+  the user rather than retrying.
+- `crystal tasks terminal <name>` turns it into Claude Code in a terminal, in its conversation: only when the
+  user asks.
 
 ## Or run a flow
 
@@ -109,13 +116,16 @@ crystal done "Wrote the plan" --artifact docs/plan.md
 - An agent you start with a prompt (`crystal new -d claude "…"`, or `-t "…"` for any command) is given a task.
   `crystal ls --json` shows it: `task.id`, `task.goal`, and once closed, `task.outcome` with `failed`,
   `cancelled` and `summary`.
-- A background task (`crystal task`) closes itself when its run ends.
+- A background task (`crystal task`) closes itself when its run ends, done or failed, as Claude's answer
+  says; a follow-up opens it again.
 - Each task has a number, like `t12`. `crystal tasks` lists the project's tasks with theirs and how each
   stands: `pending`, `running`, `waiting` (its turn ended with it open: it's asking the user), `done`,
   `failed` or `cancelled`. `crystal tasks show <task>` shows one, `crystal tasks log <task>` adds its
   transcript, and `crystal tasks cancel <task>` cancels it and stops its session: only when the user asks.
 - `crystal tasks new "<goal>"` makes a task and starts an agent on it, printing its number; `--background`
   runs it as `crystal task` does, and `--no-launch` leaves it pending until `crystal tasks start <task>`.
+  `--accept`, `--pr` and `--issue` work as for `crystal task`.
+- Given acceptance criteria, close your task done only once each holds.
 
 ## Leave notes for the next session
 

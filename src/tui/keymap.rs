@@ -96,6 +96,7 @@ pub enum Command {
     RunProject,
     OpenProject,
     CloseTask,
+    TaskToTerminal,
     FlowGoOn,
     FlowSendBack,
     Timeline,
@@ -263,6 +264,12 @@ pub const COMMANDS: &[Spec] = &[
         "close-task",
         "close the selected session's task",
         &["c"],
+    ),
+    spec(
+        Command::TaskToTerminal,
+        "task-terminal",
+        "open the selected background task in a terminal",
+        &["C"],
     ),
     of_plugin(
         "flows",
@@ -1865,7 +1872,12 @@ pub const HELP: &[HelpRow] = &[
         &[C::RunProject, C::OpenProject],
         "run / open the project",
     ),
-    plugin_row("tasks", "c", &[C::CloseTask], "close its task"),
+    plugin_row(
+        "tasks",
+        "c/C",
+        &[C::CloseTask, C::TaskToTerminal],
+        "close task / in terminal",
+    ),
     HelpRow {
         modes: &[ModeKey::AnswerYes, ModeKey::AnswerNo, ModeKey::AnswerAlways],
         ..plugin_row("tasks", "y/n/Y", &[], "answer what a task asks")

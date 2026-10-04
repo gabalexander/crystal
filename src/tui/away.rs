@@ -251,6 +251,7 @@ mod tests {
             line: None,
             bell: false,
             unseen_copies: 0,
+            context: None,
         }
     }
 
@@ -268,6 +269,7 @@ mod tests {
             created: 1,
             outcome: Some(TaskOutcome::new(state, "", 2)),
             artifacts: Vec::new(),
+            brief: Default::default(),
         };
         Event::task(Kind::TaskClosed, session, task)
     }

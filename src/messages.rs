@@ -170,6 +170,7 @@ mod tests {
             waiting: false,
             created: 0,
             outcome: None,
+            brief: Default::default(),
         }
     }
 

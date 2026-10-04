@@ -1555,9 +1555,10 @@ impl Tui {
                 place,
                 spec,
                 backlog,
+                brief,
             } => {
                 let cwd = self.start_dir(place)?;
-                let name = client::new_task(&self.socket, None, cwd, spec, backlog)?.name;
+                let name = client::new_task(&self.socket, None, cwd, spec, backlog, brief)?.name;
                 // A background task takes no keys: the sidebar keeps them.
                 self.refresh_sessions()?;
                 self.app.select(&name);
@@ -1971,6 +1972,16 @@ impl Tui {
             }
             Action::Respawn(name) => {
                 client::respawn(&self.socket, &name)?;
+                self.refresh_sessions()?;
+                self.app.select(&name);
+                self.app.type_into_selected();
+            }
+            Action::TaskToTerminal(name) => {
+                let request = Request::TaskToTerminal {
+                    task: name.clone(),
+                    env: env::current(),
+                };
+                client::ask(&self.socket, &request, false)?;
                 self.refresh_sessions()?;
                 self.app.select(&name);
                 self.app.type_into_selected();
@@ -2434,6 +2445,7 @@ impl Tui {
             env: environment,
             task: None,
             backlog: None,
+            brief: Default::default(),
         });
         let Some(Response::Created { name, .. }) = client::ask(&self.socket, &request, true)?
         else {
@@ -2533,6 +2545,7 @@ impl Tui {
             env,
             task: None,
             backlog: None,
+            brief: Default::default(),
         });
         let Some(Response::Created { name, .. }) = client::ask(&self.socket, &request, true)?
         else {

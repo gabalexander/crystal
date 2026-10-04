@@ -9,7 +9,7 @@ use crate::handover;
 use crate::layout::{self, Layout, Order};
 use crate::protocol::{
     self, Backlog, NewSession, NewTask, PendingTask, Request, Response, SessionInfo, State,
-    TaskSpec,
+    TaskBrief, TaskSpec,
 };
 use crate::socket;
 use anyhow::{Context, Result, bail};
@@ -105,6 +105,8 @@ pub struct Purpose {
     pub task: Option<String>,
     /// The backlog item it's for.
     pub backlog: Option<u64>,
+    /// What the task carries beside its goal.
+    pub brief: TaskBrief,
 }
 
 /// [`new_session`], for a session started with `purpose`.
@@ -143,19 +145,21 @@ pub fn new_session_with(
         env: environment,
         task: purpose.task,
         backlog: purpose.backlog,
+        brief: purpose.brief,
     });
     started(ask(socket, &request, true)?)
 }
 
 /// Asks the daemon to start a task in `cwd`, with this process's
-/// environment, for backlog item `backlog` if it's for one. Starts the
-/// daemon if it isn't running.
+/// environment, for backlog item `backlog` if it's for one, carrying
+/// `brief`. Starts the daemon if it isn't running.
 pub fn new_task(
     socket: &Path,
     name: Option<String>,
     cwd: PathBuf,
     spec: TaskSpec,
     backlog: Option<u64>,
+    brief: TaskBrief,
 ) -> Result<Started> {
     let request = Request::NewTask(NewTask {
         name,
@@ -163,6 +167,7 @@ pub fn new_task(
         spec,
         env: env::current(),
         backlog,
+        brief,
     });
     started(ask(socket, &request, true)?)
 }

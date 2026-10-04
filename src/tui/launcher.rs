@@ -15,7 +15,7 @@ use crate::catalog::{self, Agent, Choices, FirstPrompt, Setting};
 use crate::flows::Flow;
 use crate::forge::Checkout;
 use crate::profile::{Profile, StartIn};
-use crate::protocol::TaskSpec;
+use crate::protocol::{TaskBrief, TaskSpec};
 use crate::{git, shell};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
@@ -178,7 +178,8 @@ pub enum Outcome {
     /// Start `command` at `place`: in a terminal, or with `background`,
     /// without one, as a background task. `task` is what the agent was
     /// asked, and with `run`, what the panel remembers. `backlog` is the
-    /// backlog item the session is for.
+    /// backlog item the session is for, and `brief` the pull request or
+    /// the issue.
     Start {
         place: Place,
         command: Vec<String>,
@@ -186,6 +187,7 @@ pub enum Outcome {
         run: String,
         background: bool,
         backlog: Option<u64>,
+        brief: TaskBrief,
     },
     /// Start a run of the flow called `flow` at `place`, on `goal`. `run`
     /// is what the panel remembers.
@@ -254,6 +256,9 @@ pub struct Launcher {
     how: usize,
     /// The backlog item the session is for, when it was started from one.
     backlog: Option<u64>,
+    /// The pull request or the issue the session is for, when it was
+    /// started on one.
+    brief: TaskBrief,
     /// Where the panel was opened to start, by its place in `targets`.
     opened_at: usize,
     /// Whether what the panel holds is kept as a draft when it's put away:
@@ -284,6 +289,7 @@ impl Launcher {
             offers_background: setup.background,
             how: 0,
             backlog: None,
+            brief: TaskBrief::default(),
             opened_at: setup.target,
             keeps_draft: false,
             from_draft: false,
@@ -314,6 +320,13 @@ impl Launcher {
     /// ticks.
     pub fn for_backlog_item(mut self, number: u64) -> Launcher {
         self.backlog = Some(number);
+        self
+    }
+
+    /// Starts a session about the pull request or the issue `brief` says,
+    /// which its agent is told of.
+    pub fn about(mut self, brief: TaskBrief) -> Launcher {
+        self.brief = brief;
         self
     }
 
@@ -852,6 +865,7 @@ impl Launcher {
             run: self.run().key(),
             background: self.in_background(),
             backlog: self.backlog,
+            brief: self.brief.clone(),
         }
     }
 

@@ -278,6 +278,7 @@ mod tests {
             line: None,
             bell: false,
             unseen_copies: 0,
+            context: None,
         }
     }
 

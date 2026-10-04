@@ -201,19 +201,46 @@ pub fn wait_for_output(
 /// may not have started yet, and whatever it said about the turn before
 /// would end the wait at once.
 pub fn wait_for_turn(socket: &Path, name: &str, timeout: Option<Duration>) -> Result<()> {
-    let deadline = deadline(timeout);
-    let grace_over = Instant::now() + START_GRACE;
-    let start_deadline = deadline.map_or(grace_over, |deadline| deadline.min(grace_over));
-    let mut watch = Watch::start(socket, name)?;
-    // Seen starting or not, what's left is to wait for the turn to end.
-    let _seen_starting = watch.reach(&[Until::Working, Until::Ended], Some(start_deadline))?;
-    match watch.settle(deadline)? {
+    match turn_settled(socket, name, timeout)? {
         Some(settled) => {
             println!("{settled}");
             Ok(())
         }
         None => timed_out(name, timeout),
     }
+}
+
+/// Waits for the run a background task has just started, as
+/// [`wait_for_turn`] does, and prints how it ended: `done` or `failed`, as
+/// Claude's answer says, or else what the task came to first, like
+/// `waiting` for a permission, or how its `claude` ended.
+pub fn wait_for_run(socket: &Path, name: &str, timeout: Option<Duration>) -> Result<()> {
+    let Some(settled) = turn_settled(socket, name, timeout)? else {
+        return timed_out(name, timeout);
+    };
+    let answered = matches!(settled.as_str(), "done" | "idle");
+    let result = Request::Result {
+        name: name.to_string(),
+    };
+    let said = match ask(socket, &result) {
+        Ok(Response::Result(result)) if answered && result.failed => "failed".to_string(),
+        Ok(Response::Result(_)) if answered => "done".to_string(),
+        _ => settled,
+    };
+    println!("{said}");
+    Ok(())
+}
+
+/// Waits for the turn that a `send` has just started to end, and gives
+/// back what the session settled on, or `None` after `timeout`.
+fn turn_settled(socket: &Path, name: &str, timeout: Option<Duration>) -> Result<Option<String>> {
+    let deadline = deadline(timeout);
+    let grace_over = Instant::now() + START_GRACE;
+    let start_deadline = deadline.map_or(grace_over, |deadline| deadline.min(grace_over));
+    let mut watch = Watch::start(socket, name)?;
+    // Seen starting or not, what's left is to wait for the turn to end.
+    let _seen_starting = watch.reach(&[Until::Working, Until::Ended], Some(start_deadline))?;
+    watch.settle(deadline)
 }
 
 /// Prints what's on the session's screen, after its history with
@@ -434,6 +461,7 @@ mod tests {
             line: None,
             bell: false,
             unseen_copies: 0,
+            context: None,
         }
     }
 

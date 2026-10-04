@@ -15,6 +15,13 @@
 //! goes through [`printable`] first, so the screen only ever draws it,
 //! never takes an order from it: it can't set the session's title, write
 //! the user's clipboard, make a link or switch the screen's modes.
+//!
+//! Each assistant message says how many tokens the model was given for it,
+//! which is how full the conversation's context is, and the result says
+//! how many each model takes: a task's context meter. The transcript Claude
+//! Code keeps of a conversation holds the same messages, and the prompts,
+//! but no results: a task's screen is drawn again from it after a restart
+//! (see [`kept_events`]), made printable the same way.
 
 use crate::markdown::{self, Ink, Mark};
 use crate::printable;
@@ -47,6 +54,13 @@ pub enum Event {
     UsedTool { name: String, gist: String },
     /// A tool answered: the first line of its answer.
     ToolAnswered { first_line: String, failed: bool },
+    /// The model was given this many tokens for its last message, the
+    /// whole of the conversation so far: `model` is the model, as the
+    /// message names it.
+    Context { tokens: u64, model: Option<String> },
+    /// The user asked this, in the transcript Claude Code keeps: a stream
+    /// has the prompts crystal sent it, which crystal draws itself.
+    Asked(String),
     /// The run is over.
     Finished(Outcome),
 }
@@ -66,6 +80,9 @@ pub struct Outcome {
     /// The tools Claude asked for that weren't allowed: nobody is there to
     /// say yes to a task. Each one's name and gist.
     pub refused: Vec<String>,
+    /// How many tokens each model the run used takes, by its name: its
+    /// context window.
+    pub windows: Vec<(String, u64)>,
 }
 
 /// The events in one line of the stream. One assistant message can say
@@ -75,16 +92,63 @@ pub fn events(line: &str) -> Vec<Event> {
     let Ok(event) = serde_json::from_str::<Value>(line) else {
         return Vec::new();
     };
+    events_of(&event)
+}
+
+/// The events in one line of the transcript Claude Code keeps of a
+/// conversation, `<id>.jsonl`: what the user asked, then what [`events`]
+/// finds in a stream's line. A subagent's messages, and what Claude Code
+/// writes about the user's own commands, like `/clear`, are left out.
+pub fn kept_events(line: &str) -> Vec<Event> {
+    let Ok(event) = serde_json::from_str::<Value>(line) else {
+        return Vec::new();
+    };
+    if event["isSidechain"] == true || event["isMeta"] == true {
+        return Vec::new();
+    }
+    let mut events: Vec<Event> = asked(&event).into_iter().map(Event::Asked).collect();
+    events.extend(events_of(&event));
+    events
+}
+
+/// What the user asked in `event`, a line of the transcript Claude Code
+/// keeps: a prompt's text, or its text pieces; none for a tool's answer, or
+/// what Claude Code writes about the user's own commands.
+fn asked(event: &Value) -> Vec<String> {
+    if event["type"] != "user" {
+        return Vec::new();
+    }
+    let said: Vec<&str> = match &event["message"]["content"] {
+        Value::String(text) => vec![text.as_str()],
+        Value::Array(blocks) => blocks
+            .iter()
+            .filter(|block| block["type"] == "text")
+            .filter_map(|block| block["text"].as_str())
+            .collect(),
+        _ => Vec::new(),
+    };
+    said.into_iter()
+        .filter(|text| !text.starts_with("<command-") && !text.starts_with("<local-command-"))
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())
+        .collect()
+}
+
+fn events_of(event: &Value) -> Vec<Event> {
     // A subagent's messages carry the tool use that started it. Only the
     // main conversation is shown, to keep the transcript short.
     if !event["parent_tool_use_id"].is_null() {
         return Vec::new();
     }
     match event["type"].as_str() {
-        Some("system") if event["subtype"] == "init" => started(&event).into_iter().collect(),
-        Some("assistant") => content(&event).iter().filter_map(said_or_used).collect(),
-        Some("user") => content(&event).iter().filter_map(answered).collect(),
-        Some("result") => vec![Event::Finished(outcome(&event))],
+        Some("system") if event["subtype"] == "init" => started(event).into_iter().collect(),
+        Some("assistant") => {
+            let mut events: Vec<Event> = content(event).iter().filter_map(said_or_used).collect();
+            events.extend(context(&event["message"]));
+            events
+        }
+        Some("user") => content(event).iter().filter_map(answered).collect(),
+        Some("result") => vec![Event::Finished(outcome(event))],
         _ => Vec::new(),
     }
 }
@@ -103,7 +167,8 @@ pub fn prompt_lines(prompt: &str) -> String {
 /// The lines that show `event`, on a screen `width` columns wide.
 pub fn lines(event: &Event, width: u16) -> String {
     match event {
-        Event::Started { .. } => String::new(),
+        Event::Started { .. } | Event::Context { .. } => String::new(),
+        Event::Asked(prompt) => prompt_lines(prompt),
         Event::Said(text) => said_lines(text, width),
         Event::UsedTool { name, gist } => {
             let (name, gist) = (printable::line(name), printable::line(gist));
@@ -262,6 +327,21 @@ fn said_or_used(block: &Value) -> Option<Event> {
     }
 }
 
+/// How many tokens the model was given for `message`: what it read, from
+/// its cache or not, and what it wrote, which the next message reads.
+fn context(message: &Value) -> Option<Event> {
+    let usage = &message["usage"];
+    let count = |key: &str| usage[key].as_u64().unwrap_or(0);
+    let tokens = count("input_tokens")
+        + count("cache_creation_input_tokens")
+        + count("cache_read_input_tokens")
+        + count("output_tokens");
+    (tokens > 0).then(|| Event::Context {
+        tokens,
+        model: message["model"].as_str().map(String::from),
+    })
+}
+
 fn answered(block: &Value) -> Option<Event> {
     if block["type"] != "tool_result" {
         return None;
@@ -293,7 +373,19 @@ fn outcome(event: &Value) -> Outcome {
         cost_usd: event["total_cost_usd"].as_f64().unwrap_or(0.0),
         duration_ms: event["duration_ms"].as_u64().unwrap_or(0),
         refused: refused(event),
+        windows: windows(event),
     }
+}
+
+/// How many tokens each model a run used takes, as its result says.
+fn windows(event: &Value) -> Vec<(String, u64)> {
+    let Value::Object(models) = &event["modelUsage"] else {
+        return Vec::new();
+    };
+    models
+        .iter()
+        .filter_map(|(model, usage)| Some((model.clone(), usage["contextWindow"].as_u64()?)))
+        .collect()
 }
 
 /// Claude's answer. A failed run may have none, only the errors it ran
@@ -455,6 +547,58 @@ mod tests {
     }
 
     #[test]
+    fn a_message_says_how_full_the_context_is_and_a_result_how_much_each_model_takes() {
+        let said = r#"{"type":"assistant","parent_tool_use_id":null,"message":{"model":"claude-haiku-4-5",
+            "content":[{"type":"text","text":"ok"}],
+            "usage":{"input_tokens":10,"cache_creation_input_tokens":10479,"cache_read_input_tokens":200,"output_tokens":3}}}"#;
+        assert_eq!(
+            events(said),
+            [
+                Event::Said("ok".into()),
+                Event::Context {
+                    tokens: 10_692,
+                    model: Some("claude-haiku-4-5".into())
+                }
+            ]
+        );
+        let result = r#"{"type":"result","subtype":"success","is_error":false,"result":"ok","session_id":"abc",
+            "modelUsage":{"claude-haiku-4-5":{"inputTokens":10,"contextWindow":200000},"claude-x":{"inputTokens":1}}}"#;
+        assert_eq!(
+            outcome_of(result).windows,
+            [("claude-haiku-4-5".to_string(), 200_000)]
+        );
+    }
+
+    #[test]
+    fn claude_code_s_transcript_has_the_prompts_too_but_not_its_own_notes() {
+        let asked = r#"{"type":"user","message":{"role":"user","content":"fix the tests"},"isSidechain":false}"#;
+        assert_eq!(kept_events(asked), [Event::Asked("fix the tests".into())]);
+        let pieces =
+            r#"{"type":"user","message":{"content":[{"type":"text","text":"and the docs"}]}}"#;
+        assert_eq!(kept_events(pieces), [Event::Asked("and the docs".into())]);
+        let command =
+            r#"{"type":"user","message":{"content":"<command-name>/clear</command-name>"}}"#;
+        assert!(kept_events(command).is_empty());
+        let meta = r#"{"type":"user","isMeta":true,"message":{"content":"Caveat: …"}}"#;
+        assert!(kept_events(meta).is_empty());
+        let subagent = r#"{"type":"assistant","isSidechain":true,"message":{"content":[{"type":"text","text":"inner"}]}}"#;
+        assert!(kept_events(subagent).is_empty());
+        let answered = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}}"#;
+        assert_eq!(
+            kept_events(answered),
+            [Event::ToolAnswered {
+                first_line: "ok".into(),
+                failed: false
+            }]
+        );
+        // Drawn as the prompts crystal sends are.
+        assert_eq!(
+            lines(&Event::Asked("fix it".into()), 80),
+            prompt_lines("fix it")
+        );
+    }
+
+    #[test]
     fn what_isnt_shown_gives_nothing() {
         assert!(events("not json").is_empty());
         assert!(events(r#"{"type":"rate_limit_event"}"#).is_empty());
@@ -498,6 +642,7 @@ mod tests {
             cost_usd: 0.0421,
             duration_ms: 72_000,
             refused: vec!["Bash rm -rf build".into()],
+            windows: Vec::new(),
         };
         let shown = lines(&Event::Finished(outcome), 80);
         assert!(shown.contains("✓ done"));
@@ -539,6 +684,7 @@ mod tests {
             cost_usd: 0.0,
             duration_ms: 0,
             refused: vec![text.into()],
+            windows: Vec::new(),
         };
         let used = Event::UsedTool {
             name: text.into(),
@@ -553,6 +699,8 @@ mod tests {
             lines(&Event::Said(text.into()), 80),
             lines(&used, 80),
             lines(&answered, 80),
+            // A prompt in the transcript Claude Code keeps, drawn again.
+            lines(&Event::Asked(text.into()), 80),
             lines(&Event::Finished(outcome(true)), 80),
             lines(&Event::Finished(outcome(false)), 80),
             note_lines(text),

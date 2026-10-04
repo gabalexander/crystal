@@ -1159,6 +1159,7 @@ mod tests {
             line: None,
             bell: false,
             unseen_copies: 0,
+            context: None,
         }
     }
 
@@ -1196,6 +1197,7 @@ mod tests {
             waiting: false,
             created: 0,
             outcome: None,
+            brief: Default::default(),
         });
         assert_eq!(task_words(&fixer), "fix the tests");
         fixer.task.as_mut().unwrap().waiting = true;

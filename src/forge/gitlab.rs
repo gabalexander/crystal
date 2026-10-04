@@ -33,6 +33,13 @@ pub(super) fn merged_pull_requests(dir: &Path) -> Result<Vec<PullRequest>, Strin
     parse_merge_requests(&glab(dir, &args)?)
 }
 
+/// Merge request `number` as the list has it, read on its own, so that
+/// one past the list's end, merged or closed is found too.
+pub(super) fn listed_pull_request(dir: &Path, number: u64) -> Result<PullRequest, String> {
+    let json = glab(dir, &["mr", "view", &number.to_string(), "-F", "json"])?;
+    Ok(pull_request_of(parse(FORGE, &json)?))
+}
+
 pub(super) fn pull_request(dir: &Path, number: u64) -> Result<PullRequestDetail, String> {
     let json = with_comments(dir, &["mr", "view", &number.to_string(), "-F", "json"])?;
     parse_merge_request(&json)
@@ -48,6 +55,13 @@ pub(super) fn issues(dir: &Path) -> Result<Vec<Issue>, String> {
     let limit = LIMIT.to_string();
     let json = glab(dir, &["issue", "list", "-O", "json", "-P", &limit])?;
     parse_issues(&json)
+}
+
+/// Issue `number` as the list has it, read on its own, so that one past
+/// the list's end, or closed, is found too.
+pub(super) fn listed_issue(dir: &Path, number: u64) -> Result<Issue, String> {
+    let json = glab(dir, &["issue", "view", &number.to_string(), "-F", "json"])?;
+    Ok(issue_of(parse(FORGE, &json)?))
 }
 
 pub(super) fn issue(dir: &Path, number: u64) -> Result<IssueDetail, String> {
@@ -137,6 +151,9 @@ struct ListedMergeRequest {
     updated_at: String,
     #[serde(default, deserialize_with = "text")]
     web_url: String,
+    /// `opened`, `closed`, `locked` or `merged`.
+    #[serde(default, deserialize_with = "text")]
+    state: String,
 }
 
 fn parse_merge_requests(json: &str) -> Result<Vec<PullRequest>, String> {
@@ -165,7 +182,7 @@ fn pull_request_of(listed: ListedMergeRequest) -> PullRequest {
         local_branch,
         draft,
         conflicts: listed.has_conflicts,
-        merged: false,
+        merged: listed.state == "merged",
         checks: Checks::None,
         review: Review::None,
         updated_at: listed.updated_at,
@@ -313,15 +330,18 @@ struct ListedIssue {
 
 fn parse_issues(json: &str) -> Result<Vec<Issue>, String> {
     let listed: Vec<ListedIssue> = parse(FORGE, json)?;
-    let issues = listed.into_iter().map(|issue| Issue {
+    Ok(listed.into_iter().map(issue_of).collect())
+}
+
+fn issue_of(issue: ListedIssue) -> Issue {
+    Issue {
         number: issue.iid,
         title: issue.title,
         labels: issue.labels,
         updated_at: issue.updated_at,
         author: username(issue.author),
         url: issue.web_url,
-    });
-    Ok(issues.collect())
+    }
 }
 
 #[derive(Deserialize)]
@@ -381,6 +401,21 @@ mod tests {
             fork.checkout(Path::new("/code/app")).fetch,
             "refs/merge-requests/58/head"
         );
+    }
+
+    #[test]
+    fn one_merge_request_or_issue_read_on_its_own_is_read_as_the_list_has_it() {
+        let one = r#"{"iid": 59, "title": "Old work", "source_branch": "old",
+            "state": "merged", "web_url": "https://gitlab.com/acme/app/-/merge_requests/59"}"#;
+        let merged = pull_request_of(parse(FORGE, one).unwrap());
+        assert_eq!(merged.number, 59);
+        assert!(merged.merged);
+        assert_eq!(merged.local_branch, "old");
+        let issue = r#"{"iid": 7, "title": "Login loops", "labels": ["bug"],
+            "web_url": "https://gitlab.com/acme/app/-/issues/7"}"#;
+        let issue = issue_of(parse(FORGE, issue).unwrap());
+        assert_eq!((issue.number, issue.title.as_str()), (7, "Login loops"));
+        assert!(!parse_merge_requests(LISTED).unwrap()[0].merged);
     }
 
     #[test]

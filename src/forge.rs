@@ -23,7 +23,7 @@ mod github;
 mod gitlab;
 
 use crate::config::Config;
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -54,7 +54,8 @@ const MERGED_LIMIT: usize = 20;
 const BRANCH_WORDS_MAX: usize = 40;
 
 /// The forges crystal speaks to, each through its own CLI.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Forge {
     GitHub,
     GitLab,
@@ -102,7 +103,7 @@ impl Forge {
     }
 
     /// The command line tool it's asked through.
-    fn cli(self) -> &'static str {
+    pub fn cli(self) -> &'static str {
         match self {
             Forge::GitHub => "gh",
             Forge::GitLab => "glab",
@@ -378,6 +379,15 @@ impl Repo {
         Ok(with_merged(open, merged.unwrap_or_default()))
     }
 
+    /// Pull request `number` as the list has it, whether it's open or
+    /// not, merged as it's marked.
+    pub fn listed_pull_request(&self, number: u64) -> Result<PullRequest, String> {
+        match self.forge {
+            Forge::GitHub => github::listed_pull_request(&self.dir, number),
+            Forge::GitLab => gitlab::listed_pull_request(&self.dir, number),
+        }
+    }
+
     pub fn pull_request(&self, number: u64) -> Result<PullRequestDetail, String> {
         match self.forge {
             Forge::GitHub => github::pull_request(&self.dir, number),
@@ -401,6 +411,14 @@ impl Repo {
         }?;
         issues.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
         Ok(issues)
+    }
+
+    /// Issue `number` as the list has it, whether it's open or not.
+    pub fn listed_issue(&self, number: u64) -> Result<Issue, String> {
+        match self.forge {
+            Forge::GitHub => github::listed_issue(&self.dir, number),
+            Forge::GitLab => gitlab::listed_issue(&self.dir, number),
+        }
     }
 
     pub fn issue(&self, number: u64) -> Result<IssueDetail, String> {
