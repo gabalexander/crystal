@@ -161,7 +161,7 @@ and the footer says where you are and offers the keys that matter there, or, whe
 | `u` | select the next session that needs you: waiting on you first, then done |
 | `U` | list everything that [needs you](#timeline), in every tab, and answer a permission or a gate where it stands |
 | `a` | the [timeline](#timeline): what happened, the newest first, as it happens |
-| `/` | find a session, in any tab, by typing a little of its name, project, branch or command; one in another tab says which, and picking it takes you there |
+| `/` | find a session in any tab, a project or worktree with nothing running, a flow run or an open pull request, by typing a little of it; `Tab` keeps to one status; picking a session in another tab takes you there: [finding with `/`](#finding-with-) |
 | `:` | the [command list](#keys-and-commands): every command by its name, with its key, the latest you ran first; `Enter` runs one |
 | `(` / `)` | make the [sidebar](#the-sidebar) narrower or wider; its edge drags with the mouse too |
 | `\` | fold the [sidebar](#the-sidebar) down to a rail of marks, or unfold it |
@@ -205,14 +205,29 @@ inline through a scroll region, like Codex. To search that history, or copy from
 [copy mode](#zoom-copy-mode-and-search), and `e` opens it in your editor.
 
 The mouse works too. Click a session in the sidebar to select it, or click a pane to type into it. The wheel
-moves the selection over the sidebar, and scrolls a pane through its history. A right click opens a menu of
-what you can do with what it's on: a session, a worktree or a project in the sidebar, a tab, or a pane. Each
-item is a key from the table above, shown beside it, and does just what that key would there; choose one with
-a click, `Enter`, or its key, and `Esc` or a click elsewhere closes the menu. Drag across a pane to select
-text: it goes to your clipboard as you let go, and stays marked until you click or type. A program that asks
-for the mouse itself, like `vim` with `set mouse=a` or `htop`, gets the clicks, drags and the wheel in its pane
-while that pane has the keyboard; there, your terminal's own selection still works with a key held: `Shift` in
-most terminals, `Option` in iTerm2 and Terminal on macOS.
+moves the selection over the sidebar, and scrolls a pane through its history, three lines a notch. A right click
+opens a menu of what you can do with what it's on: a session, a worktree or a project in the sidebar, a tab, or
+a pane. Each item is a key from the table above, shown beside it, and does just what that key would there;
+choose one with a click, `Enter`, or its key, and `Esc` or a click elsewhere closes the menu. Drag across a pane
+to select text: it goes to your clipboard as you let go, and stays marked until you click or type. A
+double-click selects a word, where a path is one word and a blank, a comma, a quote, a bracket or a colon ends
+one, and a triple-click the whole line, across the rows it wrapped onto; drag on from either and it takes in
+whole words, or lines. Drag past the top or bottom of a pane and its history scrolls under the selection, faster
+the further past, for as long as you hold it there; the wheel scrolls it too. A program that asks for the mouse
+itself, like `vim` with `set mouse=a` or `htop`, gets the clicks, drags and the wheel in its pane while that pane
+has the keyboard; there, your terminal's own selection still works with a key held: `Shift` in most terminals,
+`Option` in iTerm2 and Terminal on macOS.
+
+Beside each pane's screen, in a column of its own, a scrollbar shows where in its history the pane is, once it
+has some: drag its thumb to scroll, or click the track and the thumb jumps there. The wheel over it scrolls the
+pane too.
+
+`[mouse]` in the [settings](#settings) changes all this. `copy_on_select = false` keeps what you select from
+your clipboard as you let go: the pane goes into [copy mode](#zoom-copy-mode-and-search) with it still selected,
+where `y` copies it, the keys change it first, and `Esc` drops it, and the keyboard goes back to where it was
+after. `scroll_lines` is how far a notch of the wheel scrolls, and `scrollbars = false` gives the scrollbar's
+column back to the pane. `capture = false` leaves the mouse to your terminal altogether: its own selection
+works with no key held, but nothing in crystal answers a click, and no program in a pane gets one either.
 
 `Ctrl`+click opens a link in a pane, whoever has the mouse there: a URL written out in the text (`http://`,
 `https://` or `file://`), whole across the rows it wrapped onto, or a hyperlink a program wrote (OSC 8), which
@@ -384,12 +399,9 @@ beeps, flashes or marks its tab, the way you set it up to. A session out of sigh
 its time in the sidebar until you look at it, rings your terminal from the TUI too, and the event log gets a
 `session.bell`. A program ringing over and over rings yours at most twice a second.
 
-`/` finds a session by typing a little of it. The sidebar shows only the sessions that match, under their
-project and worktree, with the letters that matched marked in each name. The letters only have to turn up in
-order (`rfx` finds `refund-fix`), and each word you type has to turn up in the name, project, branch or
-command, so `pay fix` finds the fixer in the payments project. Letters type into the filter, so `↑` and `↓`
-(or `Ctrl+P` and `Ctrl+N`) move among the matches; `Enter` selects one and `Esc` leaves the selection where it
-was.
+`/` finds a session by typing a little of it, in any tab, and a project or worktree with nothing running, a
+flow run or an open pull request too; `Tab` keeps it to the sessions with one status: see [finding with
+`/`](#finding-with-).
 
 For a project on GitHub or GitLab, each worktree line shows its branch's open pull request, `#57` (a merge
 request, `!57`, on GitLab), with a mark for what matters most about it; `o` opens it in your browser, `O` lists
@@ -402,6 +414,7 @@ crystal new claude                          # start Claude Code here and attach 
 crystal new -d -n review -c ~/code/app codex   # start one in the background, named, somewhere else
 crystal new -w fix/login claude             # start one in a new worktree, on a new branch off origin's main
 crystal new -w spike --base HEAD claude     # the same, its branch off the commit you're on
+crystal new -d -e PORT=4000 npm run dev     # with a variable set in its environment, over yours
 crystal task "update the docs"              # run Claude without a terminal, in the background (see below)
 crystal result task                         # a task's answer
 crystal answer task y                       # allow what a task asks for: y, n or always
@@ -433,6 +446,7 @@ crystal profile                             # list your agent profiles
 crystal profile show review                 # what a profile runs, and where it starts
 crystal pane split review                   # show a session in a pane beside yours in the TUI (see below)
 crystal tab new review                      # a new tab in the TUI, in front
+crystal title set "deploying"               # the title of the TUI's terminal, until `crystal title clear`
 crystal layout                              # the TUI's tabs and how each splits its panes
 crystal skill --install                     # teach Claude Code to drive crystal (see below)
 crystal integration install                 # hooks for a claude or codex you start in a shell (see above)
@@ -466,6 +480,12 @@ with it: their directory is gone, so they could never start again.
 
 To set a new worktree up, say install its dependencies or copy in an `.env`, have a [plugin](#plugins) run a
 command on `worktree.created`, and on `worktree.removed` to tidy up after it.
+
+`crystal new` with no command starts your shell: the one `default_shell` under `[terminal]` in the
+[settings](#terminals-the-window-and-the-tab-bar) names, or else `$SHELL`, as a login shell on a Mac. `--env
+KEY=VALUE` (`-e`), as many times as you like, sets a variable in the session's environment over the one it
+would have from yours: `-e PORT=4000`, `-e DEBUG=` for an empty one. crystal's own, like `TERM` and
+`CRYSTAL_SESSION`, can't be changed.
 
 `crystal rename` changes what a session is called; its program and its saved place after a restart follow the
 new name. `crystal respawn`, or `Enter` on an ended session in the TUI, runs its command again in the same
@@ -551,13 +571,42 @@ fold = "marks"         # what folding keeps: "marks", or "hidden" for nothing
 needs_you = true       # pin what needs you at the top
 ```
 
+### Finding with `/`
+
+`/` finds anything in the sidebar, and more, by typing a little of it. The sidebar shows only what matches,
+from every tab, under its project and worktree, with the letters that matched marked. The letters only have
+to turn up in order (`rfx` finds `refund-fix`), and each word you type has to turn up somewhere in what it
+finds, so `pay fix` finds the fixer in the payments project. Letters type into the filter, so `↑` and `↓` (or
+`Ctrl+P` and `Ctrl+N`) move among the matches; `Enter` picks one, as does a click, and `Esc` leaves the
+selection where it was. What it finds, and what picking it does:
+
+| What | Found by | Picking it |
+|---|---|---|
+| a session, in any tab | its name, project, branch, command, the agent in front, its tab's name, its directory, or the name or goal of the flow run it's a step of | selects it, bringing its tab to the front |
+| a flow run | its name, its flow's or its goal, which find its steps too | selects the step it's at |
+| a project nothing runs in, or a worktree with no sessions | its project, its branch, or its directory | puts the selection on it, where `Enter` starts something |
+| an open pull request (a merge request on GitLab) | its title, number (`57` or `#57`), branch, author or project | opens it in [the pull requests view](#pull-requests-and-issues) |
+
+A directory or a goal only counts where a word turns up in it whole, or nearly anything would find it. Before
+you type, only sessions show; projects, worktrees and pull requests join them as you type. The pull requests are
+those the sidebar already asked the forge for, and `/` asks, in the background, about the projects with nothing
+running the first time it opens, so typing never waits on the forge.
+
+`Tab` keeps to the sessions with one status, the footer saying which, round `waiting`, `working`, `done` (a
+finished turn nobody has looked at), `idle` (at the prompt) and `ended`, then back to all of them; `Shift+Tab`
+goes the other way. Typing narrows them further. Projects and pull requests have no status, so they don't show
+while it keeps to one.
+
 ### Tabs
 
 A tab is a space of its own: it holds its own sessions, and the sidebar lists only the sessions of the tab
 you're in, with that tab's panes beside them. Keep the agents on one feature in one tab, a dev server and its
 logs in another, a review in a third, and switch between them.
 
-The tabs sit in the bar along the top, numbered, the one you're in standing out. `t` makes a new one, starts
+The tabs sit in the bar along the top, numbered, the one you're in standing out; `[tab_bar]` in the
+[settings](#terminals-the-window-and-the-tab-bar) puts the bar over the footer instead, leaves it out while
+there's only one tab, and shows what you like at its right, after the count: the time, this machine's name,
+a command's answer. `t` makes a new one, starts
 your shell in it, in the selected session's directory, and takes you there. `[` and `]` go to the tab before
 and after, `1` to `9` straight to the first nine, and a click on a tab goes there too. `{` and `}` move the
 tab you're in one place to the left or right. Each tab keeps its own selection and panes, split and sized its
@@ -1238,6 +1287,7 @@ beside its own, or a script can set up a tab for a review, with the TUI open or 
 crystal new -d -n tests cargo test
 crystal pane split tests                  # beside the pane of the session this runs in; --down below it
 crystal pane split logs --beside server --down --ratio 0.7   # server keeps 70% of the room
+crystal pane split -e PORT=4000           # no session named: a new shell, split off; prints its name
 crystal pane focus tests                  # select it, its tab in front, and type into it; or left, right, up, down
 crystal pane focus tests --raise          # the same, and bring the TUI's terminal to the front, as a notification's click does
 crystal pane resize left 8 -n tests       # move a border of its pane, as R does; 4 columns or 2 rows by default
@@ -1252,6 +1302,8 @@ crystal tab move reviewer review          # move a session to another tab, as > 
 crystal tab reorder review 1              # move a tab to be the first, as { and } do a place at a time
 crystal tab close review --kill           # a tab with sessions closes only with --kill, which kills them
 crystal layout                            # each tab's sessions and how its panes split the room; --json
+crystal title set "deploying"             # the title of the TUI's terminal, in place of the settings' one
+crystal title clear                       # back to the settings' one
 ```
 
 A command about a session works on the tab that holds it, whether it's in front or not, and leaves the tab in
@@ -1259,8 +1311,10 @@ front where it is: an agent in another tab lays out its own without taking you t
 moves you: `tab new`, `tab select` and `pane focus`. Without a session named, a command is about the session
 it runs in, or, run outside crystal, the selected one. `pane split` splits the pane that session has of its
 own, or else the selection's pane, which it selects if that pane shows something else; the session split off
-moves into that tab, out of any pane it had. A command that can't be carried out says why, the way the footer
-would: no room for another pane, a session that isn't on screen.
+moves into that tab, out of any pane it had. With no session named, `pane split` starts a new shell to split
+off, in the directory it's run in or `--cwd`, with any `--env` variables, as `crystal new` does, and prints its
+name. A command that can't be carried out says why, the way the footer would: no room for another pane, a
+session that isn't on screen. `title` needs a TUI open: with none, there's no terminal to give the title.
 
 The command goes through the daemon to the TUI you used last, the one where you last pressed a key, clicked
 or brought its terminal to the front, and waits for it to answer, a few seconds at most. When `restart-server`
@@ -2160,6 +2214,11 @@ file and change. A setting crystal doesn't know is an error that names it, so a 
 | `[[project]]` | | a project's [run and open commands](#projects), by its main worktree's `path`, in place of its own file's |
 | `[keys]` | | the TUI's keys, by command, its prefix and the key back to the sidebar: [keys and commands](#keys-and-commands) |
 | `[sidebar]` | | the sidebar's `width`, whether it starts `folded`, what folding keeps, and whether what needs you is pinned: [the sidebar](#the-sidebar) |
+| `[terminal]` | | the shell a new terminal runs, `default_shell`, whether it's a login shell, `shell_mode`, and where `t` starts one, `new_cwd`: [terminals](#terminals-the-window-and-the-tab-bar) |
+| `[window]` | | `title`, what the TUI titles its terminal: [the window](#terminals-the-window-and-the-tab-bar) |
+| `[tab_bar]` | | where the tab bar goes, whether it's left out with one tab, and what it shows at its right: [the tab bar](#terminals-the-window-and-the-tab-bar) |
+| `[appearance]` | | `auto_switch`, the theme following your system's light or dark, and the theme for each: [themes](#themes) |
+| `[mouse]` | | `capture`, whether the TUI takes the mouse from your terminal (`true`); `copy_on_select`, whether a selection is copied as you let go or waits in copy mode for `y` (`true`); `scroll_lines`, how far a notch of the wheel scrolls a pane, up to 100 (`3`); `scrollbars`, a scrollbar beside each pane (`true`): [the mouse](#usage) |
 | `[update]` | | `check`, whether the TUI looks once a day for a [newer crystal](#updating) (`true`) |
 
 `notify_command` is for telling you some other way, like a message to your phone. It runs with
@@ -2181,9 +2240,10 @@ starts sessions again, a flow
 each time one starts, `[[project]]` each time a project's commands run,
 `name_from_prompt` each time it names a session, `resume_reported_agents` as it starts sessions again and
 `scrollback_lines` as each session starts, so a change counts straight away (a session already running keeps
-what it had); the TUI reads `new_session`, `theme`, `[colors]`, `scrollback_lines`, `[plugins]`, `[update]`, the profiles and
-the flows when it starts, again when you save a profile or switch a plugin, and every half a second while the
-settings view is open.
+what it had); `crystal new` and the TUI read `[terminal]` each time they start a shell; the TUI reads
+`new_session`, `theme`, `[colors]`, `[appearance]`, `[window]`, `[tab_bar]`, `scrollback_lines`, `[plugins]`,
+`[update]`, `[mouse]`, the profiles and the flows when it starts, again when you save a profile or switch a
+plugin, and every half a second while the settings view is open.
 
 #### Themes
 
@@ -2218,6 +2278,30 @@ terminal. The schemes' colors are [herdr](https://github.com/herdrdev/herdr)'s, 
 that crystal gives their roles and blends the tints it needs from, toward the background: behind a diff's
 lines, what a search found, the selection and blocks of code.
 
+`[appearance]` has the theme follow your system's light or dark, switching as the system does, without a
+restart:
+
+```toml
+theme = "catppuccin"
+
+[appearance]
+auto_switch = true
+light_theme = "catppuccin-latte"   # unless given: theme's light side, else crystal's own light
+dark_theme = "catppuccin"          # unless given: theme's dark side, else crystal's own dark
+```
+
+A theme that has two sides (crystal's own, catppuccin, tokyo night, gruvbox, one, solarized, kanagawa and rose
+pine) goes to its other side, so `theme = "gruvbox"` alone is `gruvbox-light` while it's light; one with
+one side goes to crystal's `light` or `dark`; and `terminal` stays, since your terminal's own colors follow
+your terminal. On a Mac the TUI asks the system's appearance every two seconds, and on Linux the desktop's
+settings portal (GNOME's and KDE's), or else GNOME's own setting. Over ssh the system isn't yours, and some
+systems can't say: there the TUI asks your terminal what its background is as it starts, and goes by that,
+which follows a change only the next time it starts. (A terminal can tell a program each time its appearance
+changes, but crystal's keyboard reader would take that for the start of a key it waits to see the end of.)
+Picking a theme in the [settings view](#the-settings-view) stops the following, as that's the theme you want.
+`[appearance.light_colors]` and `[appearance.dark_colors]` take colors of your own, as `[colors]` below does,
+for while it's light or dark, over `[colors]`.
+
 `[colors]` puts colors of your own over the theme's, each named for what it's for:
 
 ```toml
@@ -2249,17 +2333,73 @@ for your terminal's own. What each paints:
 A name or a color crystal doesn't know is an error that names it. With `NO_COLOR` set, crystal uses no color at
 all, whatever the theme or `[colors]` say.
 
+#### Terminals, the window and the tab bar
+
+```toml
+[terminal]
+default_shell = "fish"   # the shell a new terminal runs: a program, not a command line; $SHELL unless given
+shell_mode = "auto"      # a login shell on a Mac, not elsewhere; or "login", "non_login"
+new_cwd = "follow"       # where t starts its shell: "follow", "home", "current" or a directory
+
+[window]
+title = "crystal · {session}"
+
+[tab_bar]
+position = "top"         # or "bottom", over the footer
+hide_when_single = false # leave it out while there's only one tab
+separator = " · "
+right = [
+  { type = "hostname" },
+  { type = "clock", format = "%a %H:%M" },
+  { type = "text", text = "prod" },
+  { type = "command", command = "~/bin/status.sh", every = "10s", timeout = "2s" },
+]
+```
+
+A new terminal, whether `crystal new` with no command, `t`, the new-session panel's shell or `crystal pane
+split` with no session, runs `default_shell`, or else your `$SHELL`, or else `/bin/sh`. `shell_mode = "auto"`
+starts it as a login shell on a Mac, as Terminal and iTerm do, so the profile that puts Homebrew and
+`path_helper`'s directories on the `PATH` runs; elsewhere it doesn't. A login shell is started with `-l`, which
+sh, bash, zsh, fish, ksh, dash, tcsh, nu, xonsh and pwsh take; a shell with no such thing, like elvish, starts
+as it is. A project's [run command](#projects) runs with `$SHELL -c` all the same.
+
+`new_cwd` says where `t` starts its new tab's shell, and where a session starts when none is selected:
+`follow`, the selected session's directory, or where you started `crystal` with none selected; `home`;
+`current`, where you started `crystal`; or a directory of your own, from `/` or `~`. `crystal new` starts where
+it's run, or `--cwd`.
+
+`title` is what the TUI titles the terminal it runs in, which the terminal's tabs, its window and your window
+manager show; a session's own title stops at crystal, which plays its terminal. Its tokens: `{session}`, the
+selected session's name; `{project}` and `{branch}`, where it runs; `{title}`, the title its program gave its
+terminal; `{tab}`, the tab in front's name, or its number; `{hostname}`, this machine's name up to its first
+dot. `{{` and `}}` are braces. A token with nothing to say is empty, and so is what that leaves at either end,
+like the ` · ` of `crystal · {session}` with no session. An empty `title` leaves your terminal's own alone.
+`crystal title set` gives the terminal a title of its own in place of it, say while a script deploys, until
+`crystal title clear`. The terminal's title from before is saved as the TUI starts and put back as it ends, by
+a terminal that keeps a stack of them (xterm's, kitty, WezTerm, iTerm2…).
+
+`right` lists what the tab bar shows after the count, in order, `separator` between them: `hostname`, this
+machine's name; `clock`, the time as `strftime` writes `format` (`%H:%M` unless given); `text`; and
+`command`, the last line a shell command prints, run in the directory you started `crystal` in with
+`CRYSTAL_SOCKET` set, again `every` while (`10s` unless given), stopped once it takes `timeout` (`2s`), its
+colors and other escape sequences taken out, and nothing when it fails. Something with nothing to say is left
+out, and on a bar too narrow for it and the tabs, all of it is, the tabs coming first.
+
 #### The settings view
 
 `,` in the sidebar opens the settings you'd otherwise change in the file: notifications and when they come,
-sounds, the theme, how long an agent may sit [idle](#archiving-and-idle-agents), how far apart agents start
-again after a [crash or a reboot](#usage), and how memory learns
-([the distiller](#the-distiller)) and searches ([by meaning](#search-by-meaning)). `space` changes the one the
-bar is on, and `←/→` go through the [themes](#themes), forward and back (the row says which of the twenty it's
+sounds, the theme and whether it follows your system's [appearance](#themes) (the row says which theme each
+side is), whether the [tab bar](#terminals-the-window-and-the-tab-bar) goes on top or over the footer and is
+left out with one tab, how long an agent may sit [idle](#archiving-and-idle-agents), how far apart agents
+start again after a [crash or a reboot](#usage), [the mouse](#usage), and how memory learns ([the
+distiller](#the-distiller)) and searches ([by meaning](#search-by-meaning)). `space` changes the one the bar
+is on, and `←/→` go through the [themes](#themes), forward and back (the row says which of the twenty it's
 on), the waits before a notification, the times an agent may sit idle: off, 15 minutes, 30, an hour, two or
-eight, and the spacing of restarts: all at once, 100 milliseconds, 250, 500, a second or two. Each change is written to the file at once,
+eight, the spacing of restarts: all at once, 100 milliseconds, 250, 500, a second or two, and how far a notch
+of the wheel scrolls: 1, 2, 3, 5 or 10 lines. Each change is written to the file at once,
 keeping the rest of it as you wrote it, comments and all, and counts straight away: the TUI repaints in a new
-theme, and the daemon reads the rest as it goes.
+theme, and the daemon reads the rest as it goes. On a screen too short for every row, the view scrolls to keep
+the one the bar is on in sight.
 
 While it's open, the view reads the file and asks the daemon again every half a second, so it follows a
 change made by hand in the file too, and shows how the models that search by meaning stand: downloading

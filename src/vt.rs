@@ -255,6 +255,9 @@ pub enum Motion {
 pub enum SelectionKind {
     /// Characters, from one to another, wrapping onto the rows between.
     Chars,
+    /// Whole words, as a double-click takes them: up to a blank, a quote,
+    /// a bracket or other punctuation that ends one, as Alacritty has it.
+    Words,
     /// Whole lines.
     Lines,
     /// A rectangle.
@@ -265,6 +268,7 @@ impl SelectionKind {
     fn alacritty(self) -> SelectionType {
         match self {
             SelectionKind::Chars => SelectionType::Simple,
+            SelectionKind::Words => SelectionType::Semantic,
             SelectionKind::Lines => SelectionType::Lines,
             SelectionKind::Block => SelectionType::Block,
         }
@@ -701,6 +705,12 @@ impl Screen {
         self.term.grid().display_offset()
     }
 
+    /// How many rows of history there are behind the screen: none on the
+    /// alternate screen, which keeps none.
+    pub fn history(&self) -> usize {
+        self.term.grid().history_size()
+    }
+
     /// Shows `rows` further back into the history, or toward live when
     /// it's negative. It stops at either end. While it's back, new output
     /// doesn't move it.
@@ -789,6 +799,18 @@ impl Screen {
         if !self.copying() {
             self.term.toggle_vi_mode();
         }
+    }
+
+    /// Turns copy mode on keeping what the mouse selected, its cursor on
+    /// the cell at `(row, col)` of what's showing, where the mouse let go:
+    /// the keys take the selection's end on from there.
+    pub fn start_copying_at(&mut self, cell: (u16, u16)) {
+        let selection = self.term.selection.take();
+        if !self.copying() {
+            self.term.toggle_vi_mode();
+        }
+        self.term.selection = selection;
+        self.put_copy_cursor(cell);
     }
 
     /// Turns copy mode off, forgetting its selection and its search. What's
@@ -888,12 +910,13 @@ impl Screen {
         }
     }
 
-    /// Starts a selection with the mouse, at the cell at `(row, col)` of
-    /// what's showing. It holds nothing until [`Screen::select_to`] takes
-    /// its end somewhere.
-    pub fn select_from(&mut self, cell: (u16, u16)) {
+    /// Starts a selection of `kind` with the mouse, at the cell at
+    /// `(row, col)` of what's showing. Of characters, it holds nothing until
+    /// [`Screen::select_to`] takes its end somewhere; of words or lines, it
+    /// holds the one there at once, and takes in whole ones as its end goes.
+    pub fn select_from(&mut self, cell: (u16, u16), kind: SelectionKind) {
         let point = self.point_showing(cell);
-        self.term.selection = Some(Selection::new(SelectionType::Simple, point, Side::Left));
+        self.term.selection = Some(Selection::new(kind.alacritty(), point, Side::Left));
     }
 
     /// Takes the end of the selection the mouse started to the cell at
@@ -2036,7 +2059,7 @@ mod tests {
     #[test]
     fn the_mouse_selects_from_where_it_went_down_to_where_it_is() {
         let mut screen = screen(3, 20, b"one two\r\nthree four");
-        screen.select_from((0, 4));
+        screen.select_from((0, 4), SelectionKind::Chars);
         assert!(!screen.selecting(), "a click alone selects nothing");
         screen.select_to((1, 4));
         assert_eq!(screen.selected_text().unwrap(), "two\nthree");
@@ -2052,7 +2075,7 @@ mod tests {
         let mut screen = screen(3, 20, b"one two\r\nthree four");
         screen.start_copying();
         // As the pane does it: the selection, then the cursor, each time.
-        screen.select_from((0, 4));
+        screen.select_from((0, 4), SelectionKind::Chars);
         screen.put_copy_cursor((0, 4));
         screen.select_to((1, 4));
         screen.put_copy_cursor((1, 4));
@@ -2060,6 +2083,67 @@ mod tests {
         assert_eq!(screen.copy_cursor(), Some((1, 4)));
         screen.move_copy_cursor(Motion::LineEnd);
         assert_eq!(screen.selected_text().unwrap(), "two\nthree four");
+    }
+
+    #[test]
+    fn a_selection_of_words_takes_the_word_under_the_mouse_and_grows_by_words() {
+        let mut screen = screen(3, 30, b"cargo test --lib\r\nsrc/tui/app.rs:42 here");
+        screen.select_from((0, 2), SelectionKind::Words);
+        assert_eq!(screen.selected_text().unwrap(), "cargo");
+        screen.select_to((0, 8));
+        assert_eq!(screen.selected_text().unwrap(), "cargo test");
+        // A path is one word; a colon ends it.
+        screen.select_from((1, 5), SelectionKind::Words);
+        assert_eq!(screen.selected_text().unwrap(), "src/tui/app.rs");
+    }
+
+    #[test]
+    fn a_selection_of_lines_takes_the_line_under_the_mouse_across_its_wraps() {
+        let mut screen = screen(4, 5, b"abcdefgh\r\nnext");
+        screen.select_from((1, 1), SelectionKind::Lines);
+        assert_eq!(screen.selected_text().unwrap(), "abcdefgh");
+        screen.select_to((2, 0));
+        assert_eq!(screen.selected_text().unwrap(), "abcdefgh\nnext");
+    }
+
+    #[test]
+    fn copy_mode_can_start_on_what_the_mouse_selected() {
+        let mut screen = screen(3, 20, b"one two\r\nthree four");
+        screen.select_from((0, 4), SelectionKind::Chars);
+        screen.select_to((1, 4));
+        screen.start_copying_at((1, 4));
+        assert!(screen.copying());
+        assert_eq!(screen.selected_text().unwrap(), "two\nthree");
+        assert_eq!(screen.copy_cursor(), Some((1, 4)));
+        screen.move_copy_cursor(Motion::LineEnd);
+        assert_eq!(screen.selected_text().unwrap(), "two\nthree four");
+    }
+
+    #[test]
+    fn a_mouse_selection_reaches_into_the_history_as_the_view_scrolls() {
+        let mut screen = copying();
+        screen.stop_copying();
+        assert_eq!(screen.history(), 7);
+        // From line 8 up to line 7, on the top row.
+        screen.select_from((1, 0), SelectionKind::Chars);
+        screen.select_to((0, 0));
+        // Scrolled back two rows, the mouse still on the top row is on
+        // line 5.
+        screen.scroll_back(2);
+        screen.select_to((0, 0));
+        assert_eq!(
+            screen.selected_text().unwrap(),
+            "line 5 of ten\nline 6 of ten\nline 7 of ten\nl"
+        );
+    }
+
+    #[test]
+    fn the_alternate_screen_has_no_history() {
+        let mut screen = copying();
+        screen.process(b"\x1b[?1049h");
+        assert_eq!(screen.history(), 0);
+        screen.process(b"\x1b[?1049l");
+        assert_eq!(screen.history(), 7);
     }
 
     #[test]

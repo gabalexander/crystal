@@ -8,8 +8,9 @@
 //!
 //! The view is state and logic only, apart from [`draw`] at the end.
 
-use super::theme::Theme;
-use crate::config::{Config, SessionSettings, ThemeName};
+use super::appearance::Appearance;
+use super::theme::{self, Theme};
+use crate::config::{BarPosition, Config, SessionSettings, ThemeName};
 use crate::embed::Status;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
@@ -37,8 +38,15 @@ pub enum Setting {
     UnfocusedOnly,
     Sound,
     Theme,
+    AutoSwitch,
+    TabBar,
+    HideSingleTab,
     StopIdle,
     RestartSpacing,
+    MouseCapture,
+    CopyOnSelect,
+    ScrollLines,
+    Scrollbars,
     Distill,
     Embeddings,
 }
@@ -50,12 +58,23 @@ pub enum Change {
     NotifyAfter(u64),
     UnfocusedOnly(bool),
     Sound(bool),
+    /// The theme, which, picked by hand, stops it following the system's
+    /// appearance.
     Theme(ThemeName),
+    AutoSwitch(bool),
+    TabBar(BarPosition),
+    HideSingleTab(bool),
     /// How long an agent may sit idle, one of [`SessionSettings::CHOICES`].
     StopIdle(&'static str),
     /// How far apart agents start again after a restart, in milliseconds,
     /// one of [`SessionSettings::SPACINGS`].
     RestartSpacing(u64),
+    MouseCapture(bool),
+    CopyOnSelect(bool),
+    /// How many lines a notch of the wheel scrolls, one of
+    /// [`SCROLL_LINES`].
+    ScrollLines(u16),
+    Scrollbars(bool),
     Distill(bool),
     Embeddings(bool),
 }
@@ -69,8 +88,15 @@ impl Change {
             Change::UnfocusedOnly(_) => &["notifications", "unfocused_only"],
             Change::Sound(_) => &["sound", "enabled"],
             Change::Theme(_) => &["theme"],
+            Change::AutoSwitch(_) => &["appearance", "auto_switch"],
+            Change::TabBar(_) => &["tab_bar", "position"],
+            Change::HideSingleTab(_) => &["tab_bar", "hide_when_single"],
             Change::StopIdle(_) => &["sessions", "stop_idle_after"],
             Change::RestartSpacing(_) => &["sessions", "restart_spacing_ms"],
+            Change::MouseCapture(_) => &["mouse", "capture"],
+            Change::CopyOnSelect(_) => &["mouse", "copy_on_select"],
+            Change::ScrollLines(_) => &["mouse", "scroll_lines"],
+            Change::Scrollbars(_) => &["mouse", "scrollbars"],
             Change::Distill(_) => &["memory", "distill"],
             Change::Embeddings(_) => &["memory", "embeddings"],
         }
@@ -81,8 +107,16 @@ impl Change {
             Change::Notify(on)
             | Change::UnfocusedOnly(on)
             | Change::Sound(on)
+            | Change::MouseCapture(on)
+            | Change::CopyOnSelect(on)
+            | Change::Scrollbars(on)
             | Change::Distill(on)
-            | Change::Embeddings(on) => on.into(),
+            | Change::Embeddings(on)
+            | Change::AutoSwitch(on)
+            | Change::HideSingleTab(on) => on.into(),
+            Change::TabBar(BarPosition::Top) => "top".into(),
+            Change::TabBar(BarPosition::Bottom) => "bottom".into(),
+            Change::ScrollLines(lines) => i64::from(lines).into(),
             Change::NotifyAfter(secs) | Change::RestartSpacing(secs) => {
                 i64::try_from(secs).unwrap_or(i64::MAX).into()
             }
@@ -122,6 +156,22 @@ fn next_spacing(ms: u64, forward: bool) -> u64 {
     }
 }
 
+/// The lines `←/→` go through for how far a notch of the wheel scrolls.
+const SCROLL_LINES: [u16; 5] = [1, 2, 3, 5, 10];
+
+/// The lines after `lines` among [`SCROLL_LINES`], or before them, going
+/// round: a number set by hand between two goes to the next, or the one
+/// before.
+fn next_lines(lines: u16, forward: bool) -> u16 {
+    if forward {
+        let next = SCROLL_LINES.iter().find(|&&choice| choice > lines);
+        *next.unwrap_or(&SCROLL_LINES[0])
+    } else {
+        let before = SCROLL_LINES.iter().rev().find(|&&choice| choice < lines);
+        *before.unwrap_or(&SCROLL_LINES[SCROLL_LINES.len() - 1])
+    }
+}
+
 /// A wait as the view shows it.
 fn wait_text(secs: u64) -> String {
     match secs {
@@ -143,14 +193,21 @@ pub enum Outcome {
 }
 
 /// The settings the bar can be on, in the order they're listed.
-const SETTINGS: [Setting; 9] = [
+const SETTINGS: [Setting; 16] = [
     Setting::Notify,
     Setting::NotifyAfter,
     Setting::UnfocusedOnly,
     Setting::Sound,
     Setting::Theme,
+    Setting::AutoSwitch,
+    Setting::TabBar,
+    Setting::HideSingleTab,
     Setting::StopIdle,
     Setting::RestartSpacing,
+    Setting::MouseCapture,
+    Setting::CopyOnSelect,
+    Setting::ScrollLines,
+    Setting::Scrollbars,
     Setting::Distill,
     Setting::Embeddings,
 ];
@@ -243,6 +300,12 @@ impl SettingsView {
             Setting::Sound => Change::Sound(!config.sound.enabled),
             Setting::Theme if forward => Change::Theme(config.theme.next()),
             Setting::Theme => Change::Theme(config.theme.previous()),
+            Setting::AutoSwitch => Change::AutoSwitch(!config.appearance.auto_switch),
+            Setting::TabBar => Change::TabBar(match config.tab_bar.position {
+                BarPosition::Top => BarPosition::Bottom,
+                BarPosition::Bottom => BarPosition::Top,
+            }),
+            Setting::HideSingleTab => Change::HideSingleTab(!config.tab_bar.hide_when_single),
             Setting::StopIdle => {
                 let choices = SessionSettings::CHOICES;
                 let now = &config.sessions.stop_idle_after;
@@ -259,6 +322,12 @@ impl SettingsView {
                 let now = config.sessions.restart_spacing_ms;
                 Change::RestartSpacing(next_spacing(now, forward))
             }
+            Setting::MouseCapture => Change::MouseCapture(!config.mouse.capture),
+            Setting::CopyOnSelect => Change::CopyOnSelect(!config.mouse.copy_on_select),
+            Setting::ScrollLines => {
+                Change::ScrollLines(next_lines(config.mouse.scroll_lines, forward))
+            }
+            Setting::Scrollbars => Change::Scrollbars(!config.mouse.scrollbars),
             Setting::Distill => Change::Distill(!config.memory.distill),
             Setting::Embeddings => Change::Embeddings(!config.memory.embeddings),
         };
@@ -334,6 +403,8 @@ pub fn draw(frame: &mut Frame, view: &SettingsView, theme: &Theme, area: Rect) {
         .buffer_mut()
         .set_style(area, Style::new().add_modifier(Modifier::DIM));
     let lines = lines(view, theme);
+    // The row the bar is on is the one drawn as the selection.
+    let selected = lines.iter().position(|line| line.style == theme.selection);
     let width = area.width.saturating_sub(4).clamp(40.min(area.width), 84);
     let height = (lines.len() as u16 + 2).min(area.height);
     let top = if area.height > height { 1 } else { 0 };
@@ -355,7 +426,14 @@ pub fn draw(frame: &mut Frame, view: &SettingsView, theme: &Theme, area: Rect) {
         .inner(panel)
         .inner(Margin::new(if framed { 1 } else { 2 }, 1));
     frame.render_widget(block, panel);
-    frame.render_widget(Paragraph::new(lines), inside);
+    // Taller than the room, the view scrolls to keep the setting the bar is
+    // on in sight, and what's said under it.
+    let room = usize::from(inside.height);
+    let scroll = selected
+        .map_or(0, |at| (at + 3).saturating_sub(room))
+        .min(lines.len().saturating_sub(room));
+    let scroll = u16::try_from(scroll).unwrap_or(u16::MAX);
+    frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), inside);
 }
 
 /// The view's lines: where the file is, then each part's settings, each
@@ -389,13 +467,25 @@ fn lines(view: &SettingsView, theme: &Theme) -> Vec<Line<'static>> {
             Setting::UnfocusedOnly => "  only when away",
             Setting::Sound => "sounds",
             Setting::Theme => "theme",
+            Setting::AutoSwitch => "  follow the system",
+            Setting::TabBar => "tab bar",
+            Setting::HideSingleTab => "  hide with one tab",
             Setting::StopIdle => "stop idle agents",
             Setting::RestartSpacing => "space out restarts",
+            Setting::MouseCapture => "take the mouse",
+            Setting::CopyOnSelect => "copy on select",
+            Setting::ScrollLines => "wheel scrolls",
+            Setting::Scrollbars => "scrollbars",
             Setting::Distill => "distill closed tasks",
             Setting::Embeddings => "search by meaning",
         };
+        let mouse = matches!(
+            setting,
+            Setting::CopyOnSelect | Setting::ScrollLines | Setting::Scrollbars
+        );
         let dim = (matches!(setting, Setting::Distill | Setting::Embeddings) && !memory_on)
-            || (matches!(setting, Setting::NotifyAfter | Setting::UnfocusedOnly) && !config.notify);
+            || (matches!(setting, Setting::NotifyAfter | Setting::UnfocusedOnly) && !config.notify)
+            || (mouse && !config.mouse.capture);
         let (mark, color) = match on {
             Some(true) => ("● ", theme.done),
             Some(false) => ("○ ", theme.muted),
@@ -467,6 +557,35 @@ fn lines(view: &SettingsView, theme: &Theme) -> Vec<Line<'static>> {
         config.theme.name().to_string(),
         format!("{whose}: ←/→ ({at} of {themes})"),
     ));
+    let appearance = &config.appearance;
+    let sides = format!(
+        "{} when it's light, {} when dark",
+        theme::for_appearance(config, Appearance::Light).name(),
+        theme::for_appearance(config, Appearance::Dark).name()
+    );
+    lines.push(row(
+        Setting::AutoSwitch,
+        Some(appearance.auto_switch),
+        on_off(appearance.auto_switch),
+        sides,
+    ));
+    let bar = &config.tab_bar;
+    lines.push(row(
+        Setting::TabBar,
+        None,
+        match bar.position {
+            BarPosition::Top => "top",
+            BarPosition::Bottom => "bottom",
+        }
+        .to_string(),
+        "above the panes, or over the footer: ←/→".to_string(),
+    ));
+    lines.push(row(
+        Setting::HideSingleTab,
+        Some(bar.hide_when_single),
+        on_off(bar.hide_when_single),
+        "while there's only the one tab".to_string(),
+    ));
     let idle = &config.sessions.stop_idle_after;
     lines.push(row(
         Setting::StopIdle,
@@ -487,6 +606,39 @@ fn lines(view: &SettingsView, theme: &Theme) -> Vec<Line<'static>> {
             ms => format!("{ms}ms apart"),
         },
         "the agents a crash or a reboot starts again: ←/→".to_string(),
+    ));
+
+    lines.push(Line::from(""));
+    lines.push(Line::styled("Mouse", bold));
+    let mouse = &config.mouse;
+    lines.push(row(
+        Setting::MouseCapture,
+        Some(mouse.capture),
+        on_off(mouse.capture),
+        "off, your terminal selects as it would without crystal".to_string(),
+    ));
+    lines.push(row(
+        Setting::CopyOnSelect,
+        Some(mouse.copy_on_select),
+        on_off(mouse.copy_on_select),
+        "as you let go; off, it waits in copy mode for y".to_string(),
+    ));
+    let noun = if mouse.scroll_lines == 1 {
+        "line"
+    } else {
+        "lines"
+    };
+    lines.push(row(
+        Setting::ScrollLines,
+        None,
+        format!("{} {noun}", mouse.scroll_lines),
+        "a notch of the wheel, through a pane's history: ←/→".to_string(),
+    ));
+    lines.push(row(
+        Setting::Scrollbars,
+        Some(mouse.scrollbars),
+        on_off(mouse.scrollbars),
+        "beside each pane, a column of its own: drag one to scroll".to_string(),
     ));
 
     lines.push(Line::from(""));
@@ -608,6 +760,21 @@ mod tests {
         );
         press(&mut view, KeyCode::Down);
         assert_eq!(
+            press(&mut view, KeyCode::Char(' ')),
+            Outcome::Change(Change::AutoSwitch(true))
+        );
+        press(&mut view, KeyCode::Down);
+        assert_eq!(
+            press(&mut view, KeyCode::Right),
+            Outcome::Change(Change::TabBar(BarPosition::Bottom))
+        );
+        press(&mut view, KeyCode::Down);
+        assert_eq!(
+            press(&mut view, KeyCode::Char(' ')),
+            Outcome::Change(Change::HideSingleTab(true))
+        );
+        press(&mut view, KeyCode::Down);
+        assert_eq!(
             press(&mut view, KeyCode::Right),
             Outcome::Change(Change::StopIdle("15m"))
         );
@@ -627,6 +794,30 @@ mod tests {
         press(&mut view, KeyCode::Down);
         assert_eq!(
             press(&mut view, KeyCode::Char(' ')),
+            Outcome::Change(Change::MouseCapture(false))
+        );
+        press(&mut view, KeyCode::Down);
+        assert_eq!(
+            press(&mut view, KeyCode::Char(' ')),
+            Outcome::Change(Change::CopyOnSelect(false))
+        );
+        press(&mut view, KeyCode::Down);
+        assert_eq!(
+            press(&mut view, KeyCode::Right),
+            Outcome::Change(Change::ScrollLines(5))
+        );
+        assert_eq!(
+            press(&mut view, KeyCode::Left),
+            Outcome::Change(Change::ScrollLines(2))
+        );
+        press(&mut view, KeyCode::Down);
+        assert_eq!(
+            press(&mut view, KeyCode::Char(' ')),
+            Outcome::Change(Change::Scrollbars(false))
+        );
+        press(&mut view, KeyCode::Down);
+        assert_eq!(
+            press(&mut view, KeyCode::Char(' ')),
             Outcome::Change(Change::Distill(false))
         );
         // The bar stops at the last.
@@ -640,6 +831,32 @@ mod tests {
     }
 
     #[test]
+    fn a_view_taller_than_the_screen_scrolls_to_the_bar() {
+        let theme = Theme::new(ThemeName::DARK, false);
+        let shown = |view: &SettingsView| {
+            let backend = ratatui::backend::TestBackend::new(80, 16);
+            let mut terminal = ratatui::Terminal::new(backend).unwrap();
+            terminal
+                .draw(|frame| draw(frame, view, &theme, frame.area()))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let cells = buffer.content().iter().map(|cell| cell.symbol());
+            cells.collect::<String>()
+        };
+        let mut view = view_of(Config::default(), Some(status()));
+        let top = shown(&view);
+        assert!(top.contains("notifications"), "{top}");
+        assert!(!top.contains("search by meaning"), "{top}");
+        for _ in 0..SETTINGS.len() {
+            press(&mut view, KeyCode::Down);
+        }
+        let bottom = shown(&view);
+        assert!(bottom.contains("search by meaning"), "{bottom}");
+        assert!(bottom.contains("not downloaded"), "{bottom}");
+        assert!(!bottom.contains("notifications"), "{bottom}");
+    }
+
+    #[test]
     fn the_wait_goes_through_its_steps_and_round() {
         assert_eq!(next_wait(0, true), 10);
         assert_eq!(next_wait(300, true), 0);
@@ -649,6 +866,29 @@ mod tests {
         assert_eq!(wait_text(0), "at once");
         assert_eq!(wait_text(120), "2m");
         assert_eq!(wait_text(45), "45s");
+    }
+
+    #[test]
+    fn the_wheels_lines_go_through_their_steps_and_round() {
+        assert_eq!(next_lines(3, true), 5);
+        assert_eq!(next_lines(10, true), 1);
+        assert_eq!(next_lines(1, false), 10);
+        assert_eq!(next_lines(4, false), 3);
+        assert_eq!(next_lines(40, true), 1);
+        assert_eq!(Change::ScrollLines(5).keys(), ["mouse", "scroll_lines"]);
+        assert_eq!(Change::ScrollLines(5).value().as_integer(), Some(5));
+    }
+
+    #[test]
+    fn the_mouse_rows_say_how_it_is_and_dim_without_the_mouse() {
+        let mut config = Config::default();
+        let shown = text(&view_of(config.clone(), None));
+        assert!(shown.contains("take the mouse"), "{shown}");
+        assert!(shown.contains("3 lines"), "{shown}");
+        config.mouse.capture = false;
+        config.mouse.scroll_lines = 1;
+        let shown = text(&view_of(config, None));
+        assert!(shown.contains("1 line "), "{shown}");
     }
 
     #[test]
@@ -687,7 +927,41 @@ mod tests {
     }
 
     #[test]
+    fn following_the_system_says_which_theme_each_side_is() {
+        let config = Config {
+            theme: ThemeName::find("kanagawa").unwrap(),
+            ..Config::default()
+        };
+        let shown = text(&view_of(config.clone(), None));
+        let row = "○   follow the system   off              \
+                   kanagawa-lotus when it's light, kanagawa when dark";
+        assert!(shown.contains(row), "{shown}");
+        assert!(shown.contains("  tab bar               top"), "{shown}");
+        let mut config = config;
+        config.appearance.auto_switch = true;
+        config.appearance.dark_theme = ThemeName::find("dracula");
+        let shown = text(&view_of(config, None));
+        assert!(shown.contains("●   follow the system   on "), "{shown}");
+        assert!(
+            shown.contains("when it's light, dracula when dark"),
+            "{shown}"
+        );
+    }
+
+    #[test]
     fn a_change_says_where_it_goes_in_the_file() {
+        assert_eq!(
+            Change::AutoSwitch(true).keys(),
+            ["appearance", "auto_switch"]
+        );
+        assert_eq!(
+            Change::TabBar(BarPosition::Bottom).value().as_str(),
+            Some("bottom")
+        );
+        assert_eq!(
+            Change::HideSingleTab(true).keys(),
+            ["tab_bar", "hide_when_single"]
+        );
         assert_eq!(Change::Embeddings(true).keys(), ["memory", "embeddings"]);
         assert_eq!(
             Change::NotifyAfter(30).keys(),
@@ -711,7 +985,7 @@ mod tests {
         let mut off = Config::default();
         off.memory.embeddings = false;
         let mut view = view_of(off, Some(status()));
-        for _ in 0..8 {
+        for _ in 0..SETTINGS.len() - 1 {
             press(&mut view, KeyCode::Down);
         }
         assert_eq!(press(&mut view, KeyCode::Enter), Outcome::Stay);

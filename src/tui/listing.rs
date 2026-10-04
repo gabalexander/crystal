@@ -169,7 +169,7 @@ impl<T: Item, D> Listing<T, D> {
     }
 
     /// Puts the bar on `number`, the reading pane at the top of it.
-    fn highlight(&mut self, number: u64) {
+    pub fn highlight(&mut self, number: u64) {
         if self.highlighted != Some(number) {
             self.highlighted = Some(number);
             self.scroll = 0;
