@@ -147,7 +147,8 @@ impl App {
                 let beside = self.subject(beside.as_deref(), caller)?;
                 self.split_beside(&name, &beside, way, ratio)?;
             }
-            Command::Focus { session } => {
+            // Bringing the terminal to the front is the event loop's.
+            Command::Focus { session, raise: _ } => {
                 let name = self.session_named(&session)?;
                 self.focus_on(&name);
             }
@@ -812,6 +813,7 @@ mod tests {
             &mut app,
             Command::Focus {
                 session: "b".into(),
+                raise: false,
             },
         )
         .unwrap();

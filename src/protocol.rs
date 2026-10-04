@@ -66,6 +66,16 @@ pub enum Request {
         name: Option<String>,
         report: AgentReport,
     },
+    /// Tell the user `text` with a notification, the way the daemon tells
+    /// them a session needs them: about the session with `id`, or else
+    /// called `name`, which a click on it takes them to, when there is one.
+    Notify {
+        text: String,
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(default)]
+        name: Option<String>,
+    },
     /// Give a session another name.
     Rename {
         name: String,

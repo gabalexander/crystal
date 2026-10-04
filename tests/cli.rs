@@ -141,6 +141,11 @@ impl Crystal {
         command.cwd(self.dir.path());
         command.env_remove("CRYSTAL_SESSION");
         command.env_remove("CRYSTAL_SESSION_ID");
+        // A notification's click brings the TUI's terminal to the front by
+        // these: never the developer's own.
+        for raises in ["TMUX", "TMUX_PANE", "__CFBundleIdentifier", "WINDOWID"] {
+            command.env_remove(raises);
+        }
         // So that a shell crystal starts is the same everywhere.
         command.env("SHELL", "/bin/sh");
         command.env("XDG_CONFIG_HOME", self.config_home());
@@ -4012,6 +4017,37 @@ fn read_with_history_shows_what_scrolled_off_the_screen() {
 }
 
 #[test]
+fn the_history_keeps_more_than_tmuxs_two_thousand_rows() {
+    let crystal = Crystal::new();
+    let printing = "for i in $(seq 1 3000); do echo line $i; done; echo > printed; sleep 30";
+    crystal.ok(&["new", "-n", "printer", "sh", "-c", printing]);
+    written(&crystal.dir.path().join("printed"));
+
+    let all = crystal.ok(&["read", "printer", "--history"]);
+    let lines: Vec<&str> = all.lines().collect();
+    assert_eq!(lines[0], "line 1");
+    assert_eq!(lines[2999], "line 3000");
+}
+
+#[test]
+fn scrollback_lines_in_the_config_is_how_much_history_a_session_keeps() {
+    let crystal = Crystal::new();
+    crystal.configure(
+        "notify = false\nname_from_prompt = false\nscrollback_lines = 10\n\n[plugins]\nmemory = false\n",
+    );
+    crystal.ok(&["new", "-n", "printer", "sh", "-c", LONG_OUTPUT]);
+    written(&crystal.dir.path().join("printed"));
+
+    // 40 rows on the screen of a session nobody has looked at, the last of
+    // them the empty one under the cursor, and 10 above it.
+    let all = crystal.ok(&["read", "printer", "--history"]);
+    let lines: Vec<&str> = all.lines().collect();
+    assert_eq!(lines.len(), 49, "{all}");
+    assert_eq!(lines[0], "line 12");
+    assert_eq!(lines[48], "line 60");
+}
+
+#[test]
 fn rows_an_inline_agent_scrolls_up_through_a_region_reach_the_history() {
     let crystal = Crystal::new();
     // How an agent like Codex prints above its prompt: a scroll region from
@@ -4143,10 +4179,21 @@ impl Crystal {
     /// Has notices go to a file, one line each, rather than the desktop,
     /// and returns the file.
     fn notices_to_file(&self) -> PathBuf {
-        let notices = self.dir.path().join("notices");
+        self.notices_to_file_with("")
+    }
+
+    /// The same, with `settings` after it in the config.
+    fn notices_to_file_with(&self, settings: &str) -> PathBuf {
         let line = "$CRYSTAL_NOTICE_SESSION $CRYSTAL_NOTICE_ACTIVITY: $CRYSTAL_NOTICE";
+        self.notices_like(line, settings)
+    }
+
+    /// Has notices go to a file as `line` says them, with `settings` after
+    /// it in the config, and returns the file.
+    fn notices_like(&self, line: &str, settings: &str) -> PathBuf {
+        let notices = self.dir.path().join("notices");
         self.configure(&format!(
-            "notify_command = '''echo \"{line}\" >> {}'''\n",
+            "notify_command = '''echo \"{line}\" >> {}'''\n{settings}",
             notices.display()
         ));
         notices
@@ -4198,6 +4245,132 @@ fn nobody_is_told_about_a_session_someone_is_watching() {
     assert!(terminal.exit());
     thread::sleep(Duration::from_millis(800));
     assert!(lines_in(&notices).is_empty());
+}
+
+#[test]
+fn the_user_is_told_only_once_a_session_has_needed_them_for_a_while() {
+    let crystal = Crystal::new();
+    let notices = crystal.notices_to_file_with("\n[notifications]\nafter_secs = 2\n");
+    crystal.new_pretend_agent("agent", ASKING_AGENT);
+
+    std::fs::write(crystal.dir.path().join("ask"), "").unwrap();
+    eventually("the session is waiting", || {
+        crystal.row("agent").unwrap()[1] == "waiting"
+    });
+    let asked = Instant::now();
+    thread::sleep(Duration::from_millis(1000));
+    assert!(lines_in(&notices).is_empty(), "{:?}", lines_in(&notices));
+    eventually("the user is told it's waiting", || {
+        lines_in(&notices) == ["agent waiting: agent is waiting on you"]
+    });
+    assert!(asked.elapsed() >= Duration::from_millis(1500));
+
+    // Done straight after, it's told of only once it has stayed done.
+    std::fs::write(crystal.dir.path().join("rest"), "").unwrap();
+    thread::sleep(Duration::from_millis(1000));
+    assert_eq!(lines_in(&notices).len(), 1);
+    eventually("the user is told it's done", || {
+        lines_in(&notices).len() == 2
+    });
+}
+
+#[test]
+fn a_question_answered_before_its_time_is_never_told_of() {
+    let crystal = Crystal::new();
+    let notices = crystal.notices_to_file_with("\n[notifications]\nafter_secs = 3\n");
+    crystal.new_pretend_agent("agent", ASKING_AGENT);
+
+    std::fs::write(crystal.dir.path().join("ask"), "").unwrap();
+    eventually("the session is waiting", || {
+        crystal.row("agent").unwrap()[1] == "waiting"
+    });
+    std::fs::write(crystal.dir.path().join("rest"), "").unwrap();
+    eventually("the user is told it's done", || {
+        !lines_in(&notices).is_empty()
+    });
+    assert_eq!(lines_in(&notices), ["agent done: agent is done"]);
+}
+
+#[test]
+fn a_session_shown_in_a_terminal_without_the_focus_isn_t_watched() {
+    let crystal = Crystal::new();
+    let notices = crystal.notices_to_file();
+    crystal.new_pretend_agent("agent", ASKING_AGENT);
+    let mut tui = crystal.tui();
+    // Its pane shows it.
+    tui.shows("▸ agent ─");
+
+    // The terminal says it has lost the focus.
+    tui.type_keys("\x1b[O");
+    thread::sleep(Duration::from_millis(500));
+    std::fs::write(crystal.dir.path().join("ask"), "").unwrap();
+    eventually("the user is told it's waiting", || {
+        lines_in(&notices) == ["agent waiting: agent is waiting on you"]
+    });
+}
+
+#[test]
+fn unfocused_only_keeps_quiet_while_crystal_has_the_focus() {
+    let crystal = Crystal::new();
+    let notices = crystal.notices_to_file_with("\n[notifications]\nunfocused_only = true\n");
+    crystal.new_pretend_agent("agent", ASKING_AGENT);
+    crystal.ok(&["new", "-n", "other", "sleep", "30"]);
+    let mut tui = crystal.tui();
+    tui.shows("other");
+    // The one in the pane is watched: the agent mustn't be.
+    crystal.ok(&["pane", "focus", "other"]);
+    tui.shows("❯ other");
+    tui.type_keys("\x1b[I");
+    thread::sleep(Duration::from_millis(500));
+
+    std::fs::write(crystal.dir.path().join("ask"), "").unwrap();
+    eventually("the session is waiting", || {
+        crystal.row("agent").unwrap()[1] == "waiting"
+    });
+    thread::sleep(Duration::from_millis(800));
+    assert!(lines_in(&notices).is_empty(), "{:?}", lines_in(&notices));
+
+    tui.type_keys("\x1b[O");
+    thread::sleep(Duration::from_millis(500));
+    std::fs::write(crystal.dir.path().join("rest"), "").unwrap();
+    eventually("the user is told it's done", || {
+        lines_in(&notices) == ["agent done: agent is done"]
+    });
+}
+
+#[test]
+fn crystal_notify_tells_the_user_and_its_click_goes_to_the_session() {
+    let crystal = Crystal::new();
+    let notices = crystal.notices_like("$CRYSTAL_NOTICE|$CRYSTAL_NOTICE_JUMP", "");
+    crystal.ok(&["new", "-n", "agent", "sleep", "30"]);
+    crystal.ok(&["new", "-n", "other", "sleep", "30"]);
+
+    crystal.ok(&["notify", "the", "build", "is", "green"]);
+    eventually("the user is told", || {
+        lines_in(&notices) == ["the build is green|"]
+    });
+    let err = crystal.fails(&["notify", "-n", "nobody", "hi"]);
+    assert!(err.contains("no session named nobody"), "{err}");
+
+    let tui = crystal.tui();
+    tui.shows("other");
+    crystal.ok(&["pane", "focus", "other"]);
+    tui.shows("❯ other");
+    crystal.ok(&["notify", "-n", "agent", "tests", "pass"]);
+    eventually("the user is told", || lines_in(&notices).len() == 2);
+    let line = lines_in(&notices).pop().unwrap();
+    let (text, jump) = line.split_once('|').unwrap();
+    assert_eq!(text, "agent: tests pass");
+    assert!(jump.ends_with("pane focus --raise -- agent"), "{jump}");
+
+    // A click runs the jump.
+    let clicked = Command::new("sh").arg("-c").arg(jump).output().unwrap();
+    assert!(
+        clicked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&clicked.stderr)
+    );
+    tui.shows("❯ agent");
 }
 
 /// What a terminal sends for a click at `(column, row)` on its screen,
@@ -8368,7 +8541,7 @@ fn the_settings_view_changes_the_config_and_follows_it_live() {
     tui.type_keys(" ");
     tui.shows("● notifications");
     assert!(config().starts_with("notify = true\n"), "{}", config());
-    tui.type_keys("jl");
+    tui.type_keys("jjjl");
     tui.shows("light");
     assert!(config().contains("theme = \"light\""), "{}", config());
 

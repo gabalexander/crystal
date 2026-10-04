@@ -19,12 +19,28 @@ use alacritty_terminal::vte::ansi::{Color, NamedColor, Processor, Timeout};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::fmt::Write as _;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-/// How many rows of history each screen keeps: tmux's default. It's kept
-/// once in the daemon and again in each pane that shows the session.
-pub const HISTORY_LINES: usize = 2_000;
+/// How many rows of history a screen keeps when the config doesn't say:
+/// Alacritty's default. It's kept once in the daemon and again in each pane
+/// that shows the session.
+pub const DEFAULT_HISTORY_LINES: usize = 10_000;
+
+/// The most rows of history the config may ask a screen to keep.
+pub const MAX_HISTORY_LINES: usize = 1_000_000;
+
+/// How many rows of history the screens made from now on keep:
+/// `scrollback_lines` in the config, which each process that makes screens
+/// sets as it reads it.
+static HISTORY_LINES: AtomicUsize = AtomicUsize::new(DEFAULT_HISTORY_LINES);
+
+/// Has the screens made from now on keep `lines` rows of history, at most
+/// [`MAX_HISTORY_LINES`]. A screen made before keeps what it kept.
+pub fn set_history_lines(lines: usize) {
+    HISTORY_LINES.store(lines.min(MAX_HISTORY_LINES), Ordering::Relaxed);
+}
 
 /// The modes a program sets that crystal reads, by their DEC numbers.
 pub mod mode {
@@ -322,9 +338,14 @@ pub struct RgbColor {
 impl Screen {
     /// A screen that only draws: a viewer's.
     pub fn new(rows: u16, cols: u16) -> Screen {
+        Screen::keeping(rows, cols, HISTORY_LINES.load(Ordering::Relaxed))
+    }
+
+    /// A screen that keeps `history` rows of history.
+    fn keeping(rows: u16, cols: u16, history: usize) -> Screen {
         let heard = Arc::new(Mutex::new(Heard::default()));
         let config = Config {
-            scrolling_history: HISTORY_LINES,
+            scrolling_history: history,
             kitty_keyboard: true,
             ..Config::default()
         };
@@ -1404,6 +1425,13 @@ mod tests {
         let screen = screen(2, 10, b"one\r\ntwo\r\nthree\r\nfour");
         assert_eq!(screen.rows(false), ["three", "four"]);
         assert_eq!(screen.rows(true), ["one", "two", "three", "four"]);
+    }
+
+    #[test]
+    fn the_history_keeps_as_many_rows_as_the_screen_was_made_to() {
+        let mut screen = Screen::keeping(2, 10, 1);
+        screen.process(b"one\r\ntwo\r\nthree\r\nfour");
+        assert_eq!(screen.rows(true), ["two", "three", "four"]);
     }
 
     #[test]

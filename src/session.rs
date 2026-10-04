@@ -89,9 +89,9 @@ pub struct Session {
     conversation: Option<Conversation>,
     /// Where to find a Codex session's conversation, until it's found.
     rollouts: Option<Rollouts>,
-    /// What the user was last told about the session, while it still
-    /// holds: it waits on them, or it's done.
-    told: Option<Activity>,
+    /// What the user was last told about the session, and what waits to
+    /// be told.
+    telling: notify::Telling,
     /// `Some` for a task, whose screen shows what Claude does in its runs
     /// rather than a program in a PTY.
     task: Option<Task>,
@@ -324,7 +324,7 @@ impl Session {
             changed,
             conversation: None,
             rollouts: None,
-            told: None,
+            telling: notify::Telling::default(),
             screen_watch: ScreenWatch::default(),
             front: None,
             front_group: None,
@@ -384,7 +384,7 @@ impl Session {
             changed: Arc::new(Mutex::new(SystemTime::now())),
             conversation: None,
             rollouts: None,
-            told: None,
+            telling: notify::Telling::default(),
             screen_watch: ScreenWatch::default(),
             front: Some(Front::Task),
             front_group: None,
@@ -784,7 +784,7 @@ impl Session {
         self.subagents = subagents_after(self.subagents, event);
         let turn_ended = event == AgentEvent::TurnEnded
             || (event == AgentEvent::StillIdle && self.activity == Some(Activity::Working));
-        let mut activity = next_activity(self.activity, event, self.term.is_watched());
+        let mut activity = next_activity(self.activity, event, self.is_watched());
         if let Some(goal) = self.goal.as_mut().filter(|goal| goal.is_open()) {
             if turn_ended && tasks_on() {
                 if !std::mem::replace(&mut goal.waiting, true) {
@@ -961,16 +961,24 @@ impl Session {
         }
     }
 
-    /// Something to tell the user, when the session has just come to need
-    /// them: its agent is asking them something, or is done with a turn
-    /// nobody watched.
-    pub fn notice(&mut self) -> Option<Notice> {
-        let now = self.activity;
-        let watched = self.term.is_watched();
-        let tell = self.is_running() && notify::worth_telling(now, self.told, watched);
-        // Kept even when the user isn't told, say because they were
-        // watching: they've seen it, so it isn't news later either.
-        self.told = if notify::needs_user(now) { now } else { None };
+    /// Whether someone is watching the session: it's shown somewhere, and
+    /// not only in TUIs whose terminals have all lost the focus.
+    fn is_watched(&self) -> bool {
+        notify::watching(self.term.is_watched())
+    }
+
+    /// Something to tell the user, when the session has come to need them,
+    /// and gone on needing them `after` how long: its agent is asking them
+    /// something, or is done with a turn nobody watched.
+    pub fn notice(&mut self, after: impl FnOnce() -> Duration) -> Option<Notice> {
+        let watched = self.is_watched();
+        // A turn that ended while nobody watched has been seen once
+        // someone does, say as the TUI's terminal gets the focus back.
+        if watched {
+            self.seen();
+        }
+        let now = self.activity.filter(|_| self.is_running());
+        let tell = self.telling.update(now, watched, Instant::now(), after);
         match now {
             Some(activity) if tell => Some(Notice::about(&self.info(), activity)),
             _ => None,
@@ -1117,7 +1125,7 @@ impl Session {
             front: self.front.clone(),
             conversation: self.conversation.clone(),
             rollouts: self.rollouts.clone(),
-            told: self.told,
+            told: self.telling.told,
             goal: self.goal.clone(),
             reminded: self.reminded,
             reporter: self.reporter.clone(),
@@ -1185,7 +1193,7 @@ impl Session {
             front_checked: Instant::now(),
             conversation: handed.conversation,
             rollouts: handed.rollouts,
-            told: handed.told,
+            telling: notify::Telling::after(handed.told),
             task,
             goal: handed.goal,
             reminded: handed.reminded,

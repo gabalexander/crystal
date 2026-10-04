@@ -1,9 +1,10 @@
 //! The TUI's end of `crystal tab` and `crystal pane`: a connection to the
 //! daemon that brings in the layout orders the TUI is given, and takes back
 //! its answers and, whenever the user does something in it, that it was
-//! used, so orders go to the TUI used last. A handover or a restart cuts
-//! it, and the TUI offers again at once, saying when it was last used. See
-//! [`crate::layout_relay`].
+//! used, so orders go to the TUI used last, and when its terminal gains and
+//! loses the focus. A handover or a restart cuts it, and the TUI offers
+//! again at once, saying when it was last used, and whether its terminal
+//! has the focus. See [`crate::layout_relay`].
 
 use super::Event;
 use crate::events::now_ms;
@@ -29,6 +30,8 @@ pub struct Link {
     /// When the user last did something here, in milliseconds since the
     /// Unix epoch; opening counts.
     used: Arc<AtomicU64>,
+    /// Whether the terminal has the focus, once it has said.
+    focused: Arc<Mutex<Option<bool>>>,
 }
 
 impl Link {
@@ -39,12 +42,14 @@ impl Link {
         let link = Link {
             reports: Arc::default(),
             used: Arc::new(AtomicU64::new(now_ms())),
+            focused: Arc::default(),
         };
         thread::spawn({
             let socket = socket.to_path_buf();
             let reports = link.reports.clone();
             let used = link.used.clone();
-            move || take_orders(&socket, &reports, &used, &events)
+            let focused = link.focused.clone();
+            move || take_orders(&socket, &reports, &used, &focused, &events)
         });
         link
     }
@@ -53,6 +58,12 @@ impl Link {
     pub fn used(&self) {
         self.used.store(now_ms(), Ordering::Relaxed);
         self.report(&Report::Used);
+    }
+
+    /// Tells the daemon the terminal has gained the focus, or lost it.
+    pub fn focus(&self, focused: bool) {
+        *self.focused.lock().unwrap() = Some(focused);
+        self.report(&Report::Focus { focused });
     }
 
     /// Answers order `id` with the layout it came to, or why it couldn't
@@ -77,6 +88,7 @@ fn take_orders(
     socket: &Path,
     reports: &Mutex<Option<UnixStream>>,
     used: &AtomicU64,
+    focused: &Mutex<Option<bool>>,
     events: &Sender<Event>,
 ) {
     loop {
@@ -84,7 +96,15 @@ fn take_orders(
             thread::sleep(OFFER_AGAIN_AFTER);
             continue;
         };
-        *reports.lock().unwrap() = Some(conn);
+        {
+            // Held while the focus is said, so a change to it can't come
+            // between.
+            let focused = focused.lock().unwrap();
+            if let Some(focused) = *focused {
+                let _ = protocol::send(&conn, &Report::Focus { focused });
+            }
+            *reports.lock().unwrap() = Some(conn);
+        }
         while let Ok(Some(relayed)) = protocol::recv::<Relayed>(&mut orders) {
             if events.send(Event::Layout(relayed)).is_err() {
                 return;

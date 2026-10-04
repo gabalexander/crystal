@@ -288,6 +288,7 @@ pub fn run(socket: &Path) -> Result<()> {
         bail!("crystal needs a terminal; see crystal --help for the commands");
     }
     let config = Config::load()?;
+    crate::vt::set_history_lines(config.scrollback_lines);
     // Asking for the list starts the daemon if it isn't running.
     let sessions = list_sessions(socket, true)?;
 
@@ -901,11 +902,13 @@ impl Tui {
                 self.app.show_settings(current);
             }
             Event::Focus(true) => {
+                self.layout.focus(true);
                 if let Some(went) = self.presence.focus_gained(events::now_ms()) {
                     self.look_back(Since::At(went));
                 }
             }
             Event::Focus(false) => {
+                self.layout.focus(false);
                 self.presence.focus_lost(events::now_ms());
                 self.keep_seen();
             }
@@ -939,8 +942,15 @@ impl Tui {
         // A session it names may have started a moment ago, too lately for
         // the last list.
         self.refresh_sessions().map_err(failed)?;
+        let raise = matches!(
+            order.command,
+            crate::layout::Command::Focus { raise: true, .. }
+        );
         if let Some(action) = self.app.obey(order)? {
             self.perform(action).map_err(failed)?;
+        }
+        if raise {
+            raise_terminal();
         }
         Ok(self.app.layout())
     }
@@ -1655,6 +1665,7 @@ impl Tui {
         if config.theme != self.config.theme {
             self.theme = Theme::from_env(config.theme);
         }
+        crate::vt::set_history_lines(config.scrollback_lines);
         self.config = config.clone();
         self.app.set_launch_settings(config);
         self.app.set_features(config);
@@ -2218,6 +2229,62 @@ fn editor_at(mut editor: Vec<String>, path: String, line: Option<usize>) -> Vec<
     editor
 }
 
+/// Brings the TUI's terminal to the front, as far as this machine lets it,
+/// off the event loop: what a click on a notification asks for.
+fn raise_terminal() {
+    let var = |name: &str| std::env::var(name).ok().filter(|value| !value.is_empty());
+    let commands = raise_commands(
+        var,
+        cfg!(target_os = "macos"),
+        clipboard::remote(),
+        crate::notify::on_path,
+    );
+    thread::spawn(move || {
+        for argv in commands {
+            let _ = std::process::Command::new(&argv[0])
+                .args(&argv[1..])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+    });
+}
+
+/// The commands that bring the terminal to the front, by its environment
+/// (`var`): tmux's window and pane this runs in, then the terminal's app on
+/// macOS, or its window on X11 with `xdotool`. Over ssh, the terminal is
+/// on another machine, out of reach but for tmux.
+fn raise_commands(
+    var: impl Fn(&str) -> Option<String>,
+    macos: bool,
+    remote: bool,
+    installed: impl Fn(&str) -> bool,
+) -> Vec<Vec<String>> {
+    let mut commands = Vec::new();
+    if let Some(pane) = var("TMUX_PANE").filter(|_| var("TMUX").is_some()) {
+        commands.push(vec![
+            "tmux".into(),
+            "select-window".into(),
+            "-t".into(),
+            pane.clone(),
+        ]);
+        commands.push(vec!["tmux".into(), "select-pane".into(), "-t".into(), pane]);
+    }
+    if remote {
+        return commands;
+    }
+    if macos {
+        // The app the terminal is, which macOS gives every program it starts.
+        if let Some(app) = var("__CFBundleIdentifier") {
+            commands.push(vec!["open".into(), "-b".into(), app]);
+        }
+    } else if let Some(window) = var("WINDOWID").filter(|_| installed("xdotool")) {
+        commands.push(vec!["xdotool".into(), "windowactivate".into(), window]);
+    }
+    commands
+}
+
 fn seconds_since_epoch() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2466,6 +2533,39 @@ mod tests {
         assert_eq!(
             at(&["code", "--wait"], Some(12)),
             ["code", "--wait", "--goto", "src/a.rs:12"]
+        );
+    }
+
+    #[test]
+    fn a_terminal_is_brought_to_the_front_the_way_its_machine_allows() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                let found = pairs.iter().find(|(key, _)| *key == name);
+                found.map(|(_, value)| value.to_string())
+            }
+        };
+        let iterm = env(&[("__CFBundleIdentifier", "com.googlecode.iterm2")]);
+        assert_eq!(
+            raise_commands(iterm, true, false, |_| true),
+            [words(&["open", "-b", "com.googlecode.iterm2"])]
+        );
+        let x11 = env(&[("WINDOWID", "4194311")]);
+        assert_eq!(
+            raise_commands(x11, false, false, |_| true),
+            [words(&["xdotool", "windowactivate", "4194311"])]
+        );
+        assert!(raise_commands(x11, false, false, |_| false).is_empty());
+        let tmux_over_ssh = env(&[
+            ("TMUX", "/tmp/tmux-1/default,1,0"),
+            ("TMUX_PANE", "%3"),
+            ("__CFBundleIdentifier", "com.apple.Terminal"),
+        ]);
+        assert_eq!(
+            raise_commands(tmux_over_ssh, true, true, |_| true),
+            [
+                words(&["tmux", "select-window", "-t", "%3"]),
+                words(&["tmux", "select-pane", "-t", "%3"]),
+            ]
         );
     }
 }

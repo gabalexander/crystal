@@ -43,8 +43,13 @@ pub enum Command {
         ratio: f32,
     },
     /// Select a session, bringing its tab to the front, and hand its pane
-    /// the keyboard.
-    Focus { session: String },
+    /// the keyboard; with `raise`, bring the TUI's terminal to the front
+    /// too, as a click on a notification does.
+    Focus {
+        session: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        raise: bool,
+    },
     /// The same for the session in the pane `toward` from the pane of the
     /// session it's about.
     FocusToward { toward: Direction },
@@ -91,6 +96,8 @@ pub struct Relayed {
 pub enum Report {
     /// The user did something in it, so orders go to it from now on.
     Used,
+    /// Its terminal has gained the focus, or lost it.
+    Focus { focused: bool },
     /// What came of the order numbered `id`: the layout it came to, or why
     /// it couldn't be carried out.
     Answer {

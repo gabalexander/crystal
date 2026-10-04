@@ -203,6 +203,16 @@ crystal layout --json             # the TUI's tabs, the sessions in each, and ho
   leave their tabs and focus alone unless they ask: `crystal pane focus <name>` hands a session their
   keyboard, and `crystal tab new <name>` brings a new tab to the front, where sessions started after go.
 
+## Tell the user
+
+```sh
+crystal notify "The migration is ready for you to review"
+```
+
+A desktop notification, as crystal sends when a session needs the user; clicking it takes them to your session
+(`-n <name>` for another). Use it only for what needs them now and they might miss: a question asked, a long
+job finished. Your status says `waiting` or `done` without it.
+
 ## Clean up
 
 ```sh

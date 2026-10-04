@@ -42,6 +42,7 @@ use crate::spending::Spending;
 use crate::state::{self, SavedSession};
 use crate::tasks;
 use crate::typing;
+use crate::vt;
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use regex::Regex;
 use std::collections::{BTreeMap, HashSet};
@@ -89,6 +90,9 @@ pub fn run(socket: &Path, handover: Option<RawFd>) -> Result<()> {
         libc::setsid();
     }
     let handed = handover.map(|fd| handover::read(fd).unwrap_or_else(|err| give_up(socket, err)));
+    // The sessions handed over, or started again, keep the history the
+    // settings say.
+    keep_scrollback();
     // Before listening: a daemon that can't keep its state doesn't start,
     // rather than run with none and write over it.
     let db = match Db::open(socket) {
@@ -439,9 +443,17 @@ impl Daemon {
             // Before telling the user anything: a step the flow goes on
             // from needs nobody, and a gate needs them.
             self.follow_flows(&mut sessions);
+            // Read only when a session has something to tell, at most once
+            // a round.
+            let mut read = None;
+            let mut after = || {
+                *read.get_or_insert_with(|| {
+                    Duration::from_secs(notify::settings().notifications.after_secs)
+                })
+            };
             for session in sessions.iter_mut() {
-                if let Some(notice) = session.notice() {
-                    notify::tell(notice);
+                if let Some(notice) = session.notice(&mut after) {
+                    notify::tell(notice, &self.socket);
                 }
                 self.tell_changes(session);
                 if !session.is_running() && told_ended.insert(session.id.clone()) {
@@ -694,11 +706,14 @@ impl Daemon {
             // A run that has just stopped needs the user as much as a gate
             // does, but its step's session has ended and can't say so.
             if run.state() == RunState::Failed {
-                notify::tell(Notice {
-                    session: run.steps[step].session.clone().unwrap_or_default(),
+                let session = run.steps[step].session.clone();
+                let notice = Notice {
+                    session: session.clone().unwrap_or_default(),
                     activity: Activity::Waiting,
                     text: format!("{} failed at {}", run.name, run.step_name(step)),
-                });
+                    jump: session,
+                };
+                notify::tell(notice, &self.socket);
             }
         }
     }
@@ -1461,6 +1476,27 @@ impl Daemon {
             }
             Request::Emit { event } => {
                 self.events.emit(*event);
+                Ok(Response::Done)
+            }
+            Request::Notify { text, id, name } => {
+                ensure!(!text.trim().is_empty(), "say what to tell the user");
+                let mut sessions = self.sessions.lock().unwrap();
+                let session = match (id, name) {
+                    (Some(id), _) => Some(with_id(&mut sessions, &id)?.name.clone()),
+                    (None, Some(name)) => Some(named(&mut sessions, &name)?.name.clone()),
+                    (None, None) => None,
+                };
+                drop(sessions);
+                let notice = Notice {
+                    text: match &session {
+                        Some(session) => format!("{session}: {text}"),
+                        None => text,
+                    },
+                    session: session.clone().unwrap_or_default(),
+                    activity: Activity::Waiting,
+                    jump: session,
+                };
+                notify::tell(notice, &self.socket);
                 Ok(Response::Done)
             }
             Request::Subscribe { .. }
@@ -2484,6 +2520,7 @@ fn start(
     );
     let argv = agents::with_options(argv, &claude_tools(socket, &cwd, &asked, &crystal, &config));
     let argv = codex::with_instructions(argv, &instructions, codex::home(&env).as_deref());
+    keep_scrollback();
     let mut session = Session::spawn(id, name.clone(), command, &argv, cwd, &env)?;
     if let Some(typed) = typed
         && let Err(err) = session.term().write(&typed)
@@ -2749,6 +2786,7 @@ fn start_task(
     let prompt = spec.prompt.clone();
     let args = task_args(socket, &cwd, &spec);
     let spending = spending.clone();
+    keep_scrollback();
     let mut session = Session::task(
         id,
         name.clone(),
@@ -2789,6 +2827,11 @@ fn new_task_info(goal: String, background: bool, backlog: Option<u64>) -> TaskIn
 /// once. A file that can't be read leaves the defaults.
 fn settings() -> Config {
     Config::load().unwrap_or_default()
+}
+
+/// Has the screens made from now on keep the history the settings say.
+fn keep_scrollback() {
+    vt::set_history_lines(settings().scrollback_lines);
 }
 
 /// Now, in seconds since the Unix epoch.
