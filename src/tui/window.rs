@@ -7,6 +7,8 @@
 //! title from before is saved on the terminal's stack of them as the TUI
 //! starts, and put back as it ends, by a terminal that keeps one.
 
+use crate::printable;
+
 /// The tokens a title can have, and what each is filled with.
 pub const TOKENS: &[(&str, &str)] = &[
     ("hostname", "this machine's name, up to its first dot"),
@@ -89,8 +91,7 @@ pub fn fill(template: &str, values: &Values) -> String {
         }
     }
     title.push_str(rest);
-    let title: String = title.chars().filter(|c| !c.is_control()).collect();
-    title.trim_matches(LEFT_OVER).to_string()
+    printable::line(&title).trim_matches(LEFT_OVER).to_string()
 }
 
 /// Says what's wrong with `template`: a token that isn't one, or a brace
@@ -126,7 +127,7 @@ pub fn check(template: &str) -> Result<(), String> {
 
 /// What sets the terminal's title to `title`.
 pub fn set(title: &str) -> Vec<u8> {
-    let title: String = title.chars().filter(|c| !c.is_control()).collect();
+    let title = printable::line(title);
     format!("\x1b]2;{title}\x07").into_bytes()
 }
 
@@ -200,6 +201,10 @@ mod tests {
         };
         assert_eq!(fill("{title}", &sneaky), "ab]2;c");
         assert_eq!(set("a\x07b"), b"\x1b]2;ab\x07");
+        assert_eq!(
+            set("a\x1b\\b\u{9c}c\u{202e}d"),
+            "\x1b]2;a\\bcd\x07".as_bytes()
+        );
     }
 
     #[test]

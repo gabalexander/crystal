@@ -9,6 +9,7 @@ use crate::env;
 use crate::events::{self, Event};
 use crate::git::Checkout;
 use crate::memory::{self, Added, Entry, Freshness, Kind, Listed, Memory, New, Source, Store};
+use crate::printable;
 use crate::protocol::{Request, Response};
 use crate::tui::sidebar::ago;
 use anyhow::{Result, bail};
@@ -264,13 +265,16 @@ fn print_entries(entries: &[&Listed]) {
         } else {
             format!("  ({})", entry.files.join(", "))
         };
-        println!(
+        let line = format!(
             "{:>4}  {:<8}  {:>4}  {}{files}{mark}",
             entry.id,
             entry.kind.to_string(),
             ago(entry.created, now),
             entry.text.split_whitespace().collect::<Vec<_>>().join(" "),
         );
+        // Its text is kept clean, but not its files, nor what was kept
+        // before that.
+        println!("{}", printable::line(&line));
     }
 }
 
@@ -300,7 +304,7 @@ pub fn in_full(entry: &Entry, freshness: Freshness, now: u64) -> String {
         ago(entry.created, now),
         ago(entry.last_seen, now)
     ));
-    text
+    printable::text(&text).into_owned()
 }
 
 /// Asks `question` at the terminal, and says whether the answer was yes.

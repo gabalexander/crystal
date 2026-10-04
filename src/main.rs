@@ -51,6 +51,7 @@ mod plugin_cli;
 mod plugin_hooks;
 mod plugin_manifest;
 mod plugins;
+mod printable;
 mod profile;
 mod project;
 mod project_cli;
@@ -1413,7 +1414,8 @@ fn main() -> ExitCode {
     match run(Cli::parse()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            eprintln!("crystal: {err:#}");
+            // It may quote what a session, an agent or the forge said.
+            eprintln!("crystal: {}", printable::text(&format!("{err:#}")));
             ExitCode::FAILURE
         }
     }
@@ -1581,7 +1583,7 @@ fn run(cli: Cli) -> Result<()> {
             if json {
                 println!("{}", serde_json::to_string_pretty(&layout)?);
             } else {
-                print!("{}", layout.text());
+                print!("{}", printable::text(&layout.text()));
             }
         }
         Command::Attach { name } => attach::run(&socket, name.as_deref())?,
@@ -2376,16 +2378,22 @@ fn print_archived(archived: &[ArchivedSession]) {
     print_table(header, &rows);
 }
 
-/// Prints `rows` under `header`, each column as wide as its widest cell.
+/// Prints `rows` under `header`, each column as wide as its widest cell,
+/// and each cell on one line, with nothing a terminal would take as an
+/// order: names, branches and commands are anyone's.
 fn print_table<const N: usize>(header: [&str; N], rows: &[[String; N]]) {
     let header = header.map(String::from);
+    let rows: Vec<[String; N]> = rows
+        .iter()
+        .map(|row| row.clone().map(|cell| printable::line(&cell).into_owned()))
+        .collect();
     let mut widths = [0; N];
-    for row in std::iter::once(&header).chain(rows) {
+    for row in std::iter::once(&header).chain(&rows) {
         for (width, cell) in widths.iter_mut().zip(row) {
             *width = (*width).max(cell.chars().count());
         }
     }
-    for row in std::iter::once(&header).chain(rows) {
+    for row in std::iter::once(&header).chain(&rows) {
         let line: Vec<String> = row
             .iter()
             .zip(widths)

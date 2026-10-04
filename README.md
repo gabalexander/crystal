@@ -2615,6 +2615,14 @@ only waits. Attaches and event streams are cut, and come back by themselves: an 
 the last event it had, with none missed, and the log has a `daemon.handed_over`. If the new crystal can't take
 over, the daemon is restarted cold from the sessions it wrote down first.
 
+Text crystal didn't write, like a session's name, what an agent reports, Claude's answers in a background task,
+a pull request's title, a branch, a commit or a file in a preview, reaches your terminal only as text. Control
+characters, the escape sequences they start (a window title, the clipboard, a link, the alternate screen) and
+the bidi controls that turn text around are taken out of every frame the TUI draws, of a background task's
+transcript before its screen draws it, and of what the CLI prints for you to read (`--json` is for scripts). A
+session's name can't hold them. A program draws its own pane: its output goes through the terminal crystal
+emulates for it, as it would through any terminal.
+
 ## Roadmap
 
 - [x] Project skeleton
