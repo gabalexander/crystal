@@ -142,7 +142,7 @@ and the footer says where you are and offers the keys that matter there, or, whe
 | `m` | what the selected session's project has remembered: [memory](#memory) |
 | `P` | list your [profiles](#profiles), and add, change, copy or remove one |
 | `X` | list the [plugins](#plugins): switch them on and off, run their actions and open their panes |
-| `,` | open the [settings](#the-settings-view): notifications, the theme, and how memory learns and searches, each changed as you go |
+| `,` | open the [settings](#the-settings-view): notifications, sounds, the theme, and how memory learns and searches, each changed as you go |
 | `?` | show every key, in the sidebar, in a pane, in a question and with the mouse: a page at a time when they don't all fit, `→` and `←` (or `Space`, `PgDn` and `PgUp`) turning the pages |
 | `q` | quit; the sessions keep running |
 
@@ -308,6 +308,29 @@ unfocused_only = true   # only while no crystal TUI's terminal has the focus
 
 `crystal notify` sends a notification of your own, through the same settings: a script's `crystal notify
 "deploy finished"`, or an agent's, which a click takes you back to its session (`-n <name>` names another).
+
+A sound plays at the same moments: one for an agent asking you something, another for one that's done.
+crystal plays them with `afplay` on macOS, and on Linux with the first of `paplay`, `pw-play`, `ffplay`,
+`mpg123` and `mpv` that's installed; with none, there's no sound. `[sound]` in the
+[settings](#settings) switches them off, for every agent or some, or plays files of your own:
+
+```toml
+[sound]
+enabled = true              # sounds for every agent
+request = "sounds/ask.mp3"  # your own, for an agent that asks you something; from the config's directory
+done = "~/sounds/done.wav"  # and for one that's done
+
+[sound.agents]
+codex = false               # not for Codex, say because it plays its own
+```
+
+`CRYSTAL_NO_SOUND=1` keeps crystal quiet whatever the config says.
+
+A program in a session that rings the terminal's bell (`printf '\a'`, `tput bel`, a build that's done) rings
+yours: `crystal attach` and the TUI's panes pass the bell of the session they show on to your terminal, which
+beeps, flashes or marks its tab, the way you set it up to. A session out of sight that rings gets a `♪` before
+its time in the sidebar until you look at it, rings your terminal from the TUI too, and the event log gets a
+`session.bell`. A program ringing over and over rings yours at most twice a second.
 
 `/` finds a session by typing a little of it. The sidebar shows only the sessions that match, under their
 project and worktree, with the letters that matched marked in each name. The letters only have to turn up in
@@ -1746,7 +1769,7 @@ crystal plugin remove notes
 | `profiles` | [profiles](#profiles): `P`, the profiles in the new-session panel, and `crystal profile` |
 | `github` | [pull requests and issues](#pull-requests-and-issues), on GitHub or GitLab: their marks on worktree lines, `o`, `O` and `i`; switched off, crystal never runs `gh` or `glab` |
 | `flows` | [flows](#flows): `g` and `f`, runs in the sidebar and the new-session panel, and `crystal flow` |
-| `notifications` | telling you when a session needs you |
+| `notifications` | telling you when a session needs you, with a notification and a sound |
 
 crystal's own plugins are on until you switch one off. Then everything it adds is gone: its keys (`?` stops
 listing them), what it shows in the sidebar and the new-session panel, what it tells agents, and the work it
@@ -1761,7 +1784,7 @@ notes = true
 ```
 
 The `notify` setting came before the `notifications` plugin and still works: notifications are on only while
-both are. `memory` used to be a setting of its own; crystal says where it went if it finds one.
+both are. Sounds go with the plugin too, but not with `notify`: `[sound]` has a switch of its own. `memory` used to be a setting of its own; crystal says where it went if it finds one.
 
 #### Writing a plugin
 
@@ -1877,6 +1900,7 @@ matched anywhere in the link unless `^` and `$` pin it. `X` lists each plugin's 
 | `subagent.started` | a session's agent starts a subagent, as its hooks say: its `subagent`, with its `id` and `agent_type` |
 | `subagent.stopped` | that subagent finishes |
 | `session.message` | a session is sent a message: by another session with `crystal send`, which its `message` names, or by you |
+| `session.bell` | a session's program rings the terminal's bell while nobody's watching it |
 | `task.opened` | a task is made: given to a session as it starts, made to start later, or opened again by a follow-up |
 | `task.started` | a task made to start later starts, in a session of its own |
 | `task.waiting` | a task's agent ends a turn with the task still open: it waits on you |
@@ -1945,6 +1969,7 @@ file and change. A setting crystal doesn't know is an error that names it, so a 
 | `notify` | `true` | tell you when a session needs you |
 | `notify_command` | none | a shell command to run instead of the desktop notification |
 | `[notifications]` | | when to tell you: `after_secs`, how long a session must need you first (`0`), and `unfocused_only`, only while crystal's terminal hasn't the focus (`false`): [notifications](#usage) |
+| `[sound]` | | the [sounds](#usage) played at the same moments: `enabled` (`true`), your own `done` and `request` files, and `[sound.agents]` to switch them for an agent by its program |
 | `new_session` | `"claude"` | what the new-session panel runs at first, until you start something from it |
 | `theme` | `"dark"` | the TUI's colors: one of the [themes](#themes) |
 | `[colors]` | | colors of your own over the theme's: [themes](#themes) |
@@ -1974,7 +1999,7 @@ notify_command = 'curl -s -d "$CRYSTAL_NOTICE" ntfy.sh/my-crystal'
 `new_session` names an agent (`claude`, `codex`, …) or `shell`. With options, like `codex --full-auto`, it's
 offered as a profile of its own.
 
-The daemon reads the notification settings each time it tells you something, `[plugins]` each time it
+The daemon reads the notification and sound settings each time it tells you something, `[plugins]` each time it
 does something a plugin adds, `[memory]` each time a task closes or a search runs, `[tasks]` each time a
 background task's run starts, `[handoff]` each time a note is written, `[sessions]` every 15 seconds, a flow
 each time one starts, `[[project]]` each time a project's commands run,
@@ -2051,7 +2076,7 @@ all, whatever the theme or `[colors]` say.
 #### The settings view
 
 `,` in the sidebar opens the settings you'd otherwise change in the file: notifications and when they come,
-the theme, how long an agent may sit [idle](#archiving-and-idle-agents), and how memory learns
+sounds, the theme, how long an agent may sit [idle](#archiving-and-idle-agents), and how memory learns
 ([the distiller](#the-distiller)) and searches ([by meaning](#search-by-meaning)). `space` changes the one the
 bar is on, and `←/→` go through the [themes](#themes), forward and back (the row says which of the twenty it's
 on), the waits before a notification, and the times an agent may sit idle: off, 15 minutes, 30, an hour, two or
@@ -2174,6 +2199,8 @@ If you're an AI agent working on this repository, read [`AGENTS.md`](AGENTS.md) 
 
 crystal builds on ideas from [tmux](https://github.com/tmux/tmux) and [herdr](https://github.com/herdrdev/herdr).
 Its terminal emulator is [Alacritty](https://github.com/alacritty/alacritty)'s, the `alacritty_terminal` crate.
+Its sounds are herdr's, under the [Apache License 2.0](https://www.apache.org/licenses/LICENSE-2.0)
+(`assets/sounds/NOTICE`).
 
 ## License
 

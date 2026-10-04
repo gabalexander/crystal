@@ -36,6 +36,10 @@ const SESSION_INDENT: &str = "     ";
 /// without color.
 const TERMINAL_MARK: &str = "❯";
 
+/// The mark before a session's time while its program has rung the bell
+/// out of sight, until it's looked at.
+const BELL_MARK: &str = "♪";
+
 pub fn draw(frame: &mut Frame, app: &App, look: &Look, area: Rect) {
     if area.width <= RAIL_WIDTH {
         draw_rail(frame, app, look, area);
@@ -602,10 +606,13 @@ fn session_line<'a>(
     }
     // The indent, the mark and a space before the name; a space at the end.
     let room = usize::from(width).saturating_sub(indent.len() + 2 + 1);
-    let when = match tab {
+    let mut when = match tab {
         Some(tab) => format!("⇥ {tab}"),
         None => changed_ago(session, look.now),
     };
+    if session.bell {
+        when = format!("{BELL_MARK} {when}").trim_end().to_string();
+    }
     let label = extras_label(session);
     let (label, when) = fitting_extras(session.name.chars().count(), &label, &when, room);
 
@@ -635,7 +642,14 @@ fn session_line<'a>(
         } else {
             theme.muted
         };
-        spans.push(Span::styled(when.to_string(), Style::new().fg(color)));
+        let time = match when.strip_prefix(BELL_MARK) {
+            Some(time) => {
+                spans.push(Span::styled(BELL_MARK, Style::new().fg(theme.waiting)));
+                time
+            }
+            None => when,
+        };
+        spans.push(Span::styled(time.to_string(), Style::new().fg(color)));
     }
     Line::from(spans)
 }
@@ -826,6 +840,7 @@ mod tests {
             asking: None,
             reporter: None,
             subagents: 0,
+            bell: false,
         }
     }
 
@@ -914,6 +929,25 @@ mod tests {
         let zsh = session("zsh-2", Front::Shell { name: "zsh".into() });
         assert_eq!(name_color(&zsh), Some(theme.muted));
         assert_eq!(name_color(&session("claude", claude())), Some(theme.text));
+    }
+
+    #[test]
+    fn a_session_that_rang_out_of_sight_is_marked_before_its_time() {
+        let theme = Theme::new(crate::config::ThemeName::DARK, false);
+        let look = Look {
+            theme: &theme,
+            now: 720,
+            spin: 0,
+        };
+        let mut rang = session("build", Front::Shell { name: "zsh".into() });
+        rang.changed = 1;
+        let line = session_line(&rang, &[], None, SESSION_INDENT, &look, 28, false);
+        assert_eq!(line.to_string(), "     ❯ build zsh        11m");
+        rang.bell = true;
+        let line = session_line(&rang, &[], None, SESSION_INDENT, &look, 28, false);
+        assert_eq!(line.to_string(), "     ❯ build zsh      ♪ 11m");
+        let mark = line.spans.iter().find(|span| span.content == BELL_MARK);
+        assert_eq!(mark.unwrap().style.fg, Some(theme.waiting));
     }
 
     #[test]

@@ -295,6 +295,7 @@ fn pause(socket: &Path, bus: &Weak<Bus>, plugin: &str) {
         activity: Activity::Waiting,
         text,
         jump: None,
+        agent: None,
     };
     notify::tell(notice, socket);
 }

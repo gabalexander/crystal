@@ -894,6 +894,7 @@ impl Daemon {
                     activity: Activity::Waiting,
                     text: format!("{} failed at {}", run.name, run.step_name(step)),
                     jump: session,
+                    agent: None,
                 };
                 notify::tell(notice, &self.socket);
             }
@@ -1773,6 +1774,7 @@ impl Daemon {
                     session: session.clone().unwrap_or_default(),
                     activity: Activity::Waiting,
                     jump: session,
+                    agent: None,
                 };
                 notify::tell(notice, &self.socket);
                 Ok(Response::Done)
@@ -2330,6 +2332,7 @@ impl Daemon {
                 Change::TaskWaiting => task(Kind::TaskWaiting),
                 Change::Claimed => Some(Event::about_session(Kind::SessionClaimed, &info)),
                 Change::Released { agent } => Some(Event::released(&info, &agent)),
+                Change::Bell => Some(Event::about_session(Kind::SessionBell, &info)),
             };
             if let Some(event) = event {
                 self.events.emit(event);

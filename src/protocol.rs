@@ -620,6 +620,10 @@ pub struct SessionInfo {
     /// How many subagents its agent has running, as its hooks say.
     #[serde(default)]
     pub subagents: u32,
+    /// Its program rang the terminal's bell while nobody was watching, and
+    /// nobody has looked at it since.
+    #[serde(default)]
+    pub bell: bool,
     /// crystal stopped it after its agent sat idle for as long as the
     /// settings allow: it starts again in its conversation.
     #[serde(default)]

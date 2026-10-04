@@ -55,6 +55,7 @@ mod timeline;
 mod tree_browser;
 mod ui;
 
+use crate::bell::Ringer;
 use crate::config::{self, Config};
 use crate::db::{self, Db};
 use crate::events::{Filter, Since};
@@ -269,7 +270,8 @@ pub enum Event {
     BacklogCounts(HashMap<PathBuf, usize>),
     /// What background tasks have spent today.
     Spending(Spending),
-    /// The settings as they are now, for the settings view.
+    /// The settings as they are now, for the settings view: boxed, as the
+    /// config is the biggest thing an event carries.
     Settings(Box<settings_view::Current>),
     /// The terminal has focus again, or has lost it.
     Focus(bool),
@@ -364,6 +366,7 @@ pub fn run(socket: &Path) -> Result<()> {
         feed: Arc::new(AtomicU64::new(0)),
         presence: away::Presence::new(events::now_ms()),
         layout,
+        ringer: Ringer::default(),
     };
     tui.app.set_agents(catalog::installed());
     let server = socket::server_of(socket).filter(|server| server != socket::DEFAULT);
@@ -505,6 +508,9 @@ struct Tui {
     feed: Arc<AtomicU64>,
     /// Whether the user is there, for "while you were away".
     presence: away::Presence,
+    /// Passes on to the user's terminal the bells of the sessions in panes,
+    /// and of those out of sight the daemon marked as having rung.
+    ringer: Ringer,
 }
 
 impl Tui {
@@ -770,6 +776,15 @@ impl Tui {
     /// Takes a fresh list of sessions, and tells the pull request poller
     /// and the worktree lister which projects they're in.
     fn set_sessions(&mut self, sessions: Vec<SessionInfo>) {
+        // A session the TUI knew of that has come to be marked as having
+        // rung its bell, out of sight, rings the user's terminal.
+        let known = self.app.sessions();
+        let rang = sessions.iter().any(|session| {
+            session.bell && known.iter().any(|old| old.id == session.id && !old.bell)
+        });
+        if rang {
+            let _ = self.ringer.ring();
+        }
         self.app.set_sessions(sessions);
         self.list_worktrees_of_projects();
         let projects = self.app.projects();
@@ -907,8 +922,12 @@ impl Tui {
             }
             Event::Notice(notice) => self.app.notify(notice),
             Event::Output { pane, bytes } => {
-                if let Some(pane) = self.pane_with_id(pane) {
+                let rang = self.pane_with_id(pane).is_some_and(|pane| {
                     pane.screen.process(&bytes);
+                    pane.screen.take_bells() > 0
+                });
+                if rang {
+                    let _ = self.ringer.ring();
                 }
             }
             // The next list says whether the session has ended, or runs on

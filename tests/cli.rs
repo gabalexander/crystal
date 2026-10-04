@@ -22,12 +22,15 @@ impl Crystal {
         let socket = dir.path().join("crystal.sock");
         let crystal = Crystal { dir, socket };
         // A config of the test's own: the developer's can't change what
-        // the test sees, and no test pops up a real notification. Memory is
+        // the test sees, and no test pops up a real notification or plays
+        // a sound (nor one that configures its own: see `QUIET`). Memory is
         // off unless a test turns it on, so Claude's arguments stay as each
         // test expects them, and so is naming a session from its prompt, so
         // its name does.
-        crystal
-            .configure("notify = false\nname_from_prompt = false\n\n[plugins]\nmemory = false\n");
+        crystal.configure(
+            "notify = false\nname_from_prompt = false\n\n[plugins]\nmemory = false\n\n\
+             [sound]\nenabled = false\n",
+        );
         crystal
     }
 
@@ -62,7 +65,8 @@ impl Crystal {
             .current_dir(self.dir.path())
             .env("XDG_CONFIG_HOME", self.config_home())
             .env("CLAUDE_CONFIG_DIR", self.claude_config_dir())
-            .envs(PLAIN_GIT);
+            .envs(PLAIN_GIT)
+            .envs(QUIET);
         command
     }
 
@@ -150,7 +154,7 @@ impl Crystal {
         command.env("SHELL", "/bin/sh");
         command.env("XDG_CONFIG_HOME", self.config_home());
         command.env("CLAUDE_CONFIG_DIR", self.claude_config_dir());
-        for (key, value) in PLAIN_GIT.iter().chain(env) {
+        for (key, value) in PLAIN_GIT.iter().chain(&QUIET).chain(env) {
             command.env(key, value);
         }
         let child = pty.slave.spawn_command(command).unwrap();
@@ -266,6 +270,24 @@ impl Terminal {
         }
     }
 
+    /// How many times crystal rang this terminal's bell: each BEL that
+    /// doesn't end an OSC sequence, like a request for the clipboard.
+    fn bells(&self) -> usize {
+        let written = self.written.lock().unwrap().clone();
+        let (mut bells, mut in_osc, mut before) = (0, false, 0);
+        for byte in written {
+            match byte {
+                b']' if before == 0x1b => in_osc = true,
+                b'\\' if before == 0x1b => in_osc = false,
+                0x07 if in_osc => in_osc = false,
+                0x07 => bells += 1,
+                _ => {}
+            }
+            before = byte;
+        }
+        bells
+    }
+
     fn type_keys(&mut self, keys: &str) {
         self.keys.write_all(keys.as_bytes()).unwrap();
         self.keys.flush().unwrap();
@@ -336,6 +358,9 @@ const PLAIN_GIT: [(&str, &str); 2] = [
     ("GIT_CONFIG_GLOBAL", "/dev/null"),
     ("GIT_CONFIG_NOSYSTEM", "1"),
 ];
+
+/// No sound from any daemon a test starts, whatever its config says.
+const QUIET: [(&str, &str); 1] = [("CRYSTAL_NO_SOUND", "1")];
 
 /// Runs git in `dir` the way the tests need it, failing the test if git
 /// fails, and returns what it printed.
@@ -581,6 +606,69 @@ fn attach_shows_the_session_until_ctrl_backslash() {
     terminal.shows("[detached from cat]");
     assert!(terminal.exit());
     assert_eq!(crystal.row("cat").unwrap()[1], "running");
+}
+
+#[test]
+fn attach_passes_the_session_s_bell_on_to_your_terminal() {
+    let crystal = Crystal::new();
+    let script = r"printf ready; read line; printf '\a\a\arang'; sleep 30";
+    crystal.ok(&["new", "-n", "ringer", "sh", "-c", script]);
+
+    let mut terminal = crystal.attach(&["attach", "ringer"]);
+    terminal.shows("ready");
+    assert_eq!(terminal.bells(), 0);
+    terminal.type_keys("\r");
+    terminal.shows("rang");
+    // Three at once ring it once.
+    eventually("the bell is passed on", || terminal.bells() == 1);
+    thread::sleep(Duration::from_millis(600));
+    assert_eq!(terminal.bells(), 1);
+
+    terminal.type_keys("\x1c");
+    terminal.shows("[detached from ringer]");
+}
+
+#[test]
+fn the_tui_rings_your_terminal_for_a_bell_in_a_pane_or_out_of_sight() {
+    let crystal = Crystal::new();
+    let dir = crystal.dir.path();
+    let rings_when = |file: &str| {
+        format!("echo waiting; while [ ! -f {file} ]; do sleep 0.05; done; printf '\\a'; sleep 30")
+    };
+    crystal.ok(&["new", "-n", "shown", "sh", "-c", &rings_when("ring-shown")]);
+    crystal.ok(&[
+        "new",
+        "-n",
+        "builder",
+        "sh",
+        "-c",
+        &rings_when("ring-builder"),
+    ]);
+    let mut tui = crystal.tui();
+    tui.shows("waiting");
+    assert_eq!(tui.bells(), 0);
+
+    // The session in the pane rings: the bell is passed on, and the
+    // session isn't marked, since it was seen.
+    std::fs::write(dir.join("ring-shown"), "").unwrap();
+    eventually("the pane's bell is passed on", || tui.bells() == 1);
+
+    // One out of sight rings: it's marked, and rings the terminal too.
+    thread::sleep(Duration::from_millis(600));
+    std::fs::write(dir.join("ring-builder"), "").unwrap();
+    eventually("builder is marked", || {
+        sidebar_of(&tui.text()).contains("♪")
+    });
+    eventually("its bell is passed on", || tui.bells() == 2);
+    let events = crystal.ok(&["events", "-k", "session.bell"]);
+    assert!(
+        events.contains("builder") && !events.contains("shown"),
+        "{events}"
+    );
+
+    // Looking at it takes the mark off.
+    tui.type_keys("j");
+    tui.hides("♪");
 }
 
 #[test]
@@ -3770,7 +3858,8 @@ impl Servers {
             .env("XDG_STATE_HOME", self.dir().join("state"))
             .env("XDG_CONFIG_HOME", self.crystal.config_home())
             .env("CLAUDE_CONFIG_DIR", self.crystal.claude_config_dir())
-            .envs(PLAIN_GIT);
+            .envs(PLAIN_GIT)
+            .envs(QUIET);
         command
     }
 
@@ -8701,7 +8790,8 @@ fn the_settings_view_changes_the_config_and_follows_it_live() {
     tui.type_keys(" ");
     tui.shows("● notifications");
     assert!(config().starts_with("notify = true\n"), "{}", config());
-    tui.type_keys("jjjl");
+    tui.shows("● sounds");
+    tui.type_keys("jjjjl");
     tui.shows("(2 of 20)");
     assert!(config().contains("theme = \"light\""), "{}", config());
     // Back past the first is the last.

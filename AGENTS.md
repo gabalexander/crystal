@@ -51,7 +51,9 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   nothing is handed over, as each TUI offers again after a handover saying when it was last used, and a
   command just after the daemon starts waits a moment for one to come back
 - `src/attach.rs`: `crystal attach`: draws a session in your terminal and sends it your keys, attaching again
-  after a handover
+  after a handover, and passes its bell on
+- `src/bell.rs`: passing a session's terminal bell on to the user's own terminal, at most one every half a
+  second
 - `src/viewer.rs`: the client's side of an attach, shared by `crystal attach` and the TUI's pane
 - `src/drive.rs`: `crystal send`, `wait`, `read`, `result`, `answer` and `interrupt`, for driving one session from
   another or a script; waits listen to the daemon's events about their session, and `wait --output` has the
@@ -68,8 +70,9 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   changes (a test says so)
 - `src/tui/`: the TUI (`crystal` with no command)
   - `mod.rs`: the event loop: one channel of events, then update and draw (not for a move of the mouse that
-    changes nothing), opening the link a Ctrl+click or copy mode's `o` asks for, and bringing the TUI's
-    terminal to the front for `pane focus --raise`
+    changes nothing), opening the link a Ctrl+click or copy mode's `o` asks for, bringing the TUI's terminal to
+    the front for `pane focus --raise`, and ringing the user's terminal for a pane's bell or a session marked as
+    having rung
   - `app.rs`: the state and how keys and the mouse change it: a sidebar key looked up in the keymap and its
     command run, from the sidebar, the `:` list or after the prefix in a pane; the sidebar's width, folded or
     not, and what needs the user pinned at its top; no I/O, so it's unit-tested
@@ -182,7 +185,7 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   - `away.rs`: "while you were away": when the user is gone (a quit, the terminal's focus lost for a while, or
     no key for a while where focus isn't told), what the event log gained meanwhile counted into the
     footer's line, and the latest event seen, which the event loop keeps in the database
-  - `settings_view.rs`: the settings view (`,`): notifications, the theme, the distiller and search by meaning,
+  - `settings_view.rs`: the settings view (`,`): notifications, sounds, the theme, the distiller and search by meaning,
     each changed with a key, and how the model stands; the event loop writes the file (`config::set`) and,
     while it's open, reads the settings and the daemon's `EmbeddingStatus` again every half a second
 - `src/daemon.rs`: the daemon: listens on the socket and owns the sessions, and emits an event wherever something
@@ -226,13 +229,14 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   agent typed into its shell whose conversation a restart resumes while it's in front, its agent's subagents,
   whether its first prompt can name it, whether its agent is blocked on the user, how long its agent has sat
   idle (nobody watching or typing, its turn seen), and what has changed in it (its agent's activity, a task's
-  runs) for the daemon to tell; handing it over and adopting it, its PTY on a descriptor of crystal's own
+  runs, its bell rung while nobody watched) for the daemon to tell; handing it over and adopting it, its PTY on a descriptor of crystal's own
 - `src/vt.rs`: a terminal's screen, through `alacritty_terminal`: what a program drew and its history, the modes
   it set, its answers to the program's questions (the daemon's screen only), the output that catches a new viewer
   up (its hyperlinks included), the cells to draw, the input modes `crystal attach` asks your terminal for, and,
   for a viewer, copy mode's cursor, selection and search, which are Alacritty's vi mode, and the link on a cell:
-  a hyperlink a program wrote (OSC 8), or a URL in the text across the rows it wrapped onto, as `vt::Link`; and a
-  screen saved for a handover, both its screens and the history, and restored. The only module that uses
+  a hyperlink a program wrote (OSC 8), or a URL in the text across the rows it wrapped onto, as `vt::Link`; the
+  times the program rang the bell; and a screen saved for a handover, both its screens and the history, and
+  restored. The only module that uses
   `alacritty_terminal`
 - `src/links.rs`: opening a link a pane shows: `open` or `xdg-open`, or over ssh (or with neither) the link put
   on the user's clipboard instead
@@ -337,7 +341,10 @@ whenever what's handed over changes in a way the crystal before couldn't read.
 - `src/notify.rs`: telling the user when a session needs them, once it has for `[notifications] after_secs`
   and, with `unfocused_only`, while no TUI's terminal has the focus (where the user is, as the TUIs say, kept
   for the daemon): desktop notifications a click on takes them to the session, or their own command;
-  `crystal notify`'s too
+  `crystal notify`'s too; and the sound at the same moments
+- `src/sound.rs`: the sounds (`assets/sounds/`, herdr's): which plays for an agent asking or done, the user's own
+  files and the agents they're off for (`[sound]`), and playing one with the system's player, off the thread
+  that asked, stopped if it hangs
 - `src/plugins.rs`: plugins: the registry of crystal's own, `enabled`, the gate every one of them goes through
   (each module's `enabled` asks it), finding installed plugins and why one can't run here (it doesn't fit, or
   its build failed) or be switched on, switching one in the config's `[plugins]` with `toml_edit`, the context
@@ -373,8 +380,8 @@ whenever what's handed over changes in a way the crystal before couldn't read.
 - `src/shell.rs`: quoting arguments and writing paths with `~`, the way a shell reads them
 - `tests/cli.rs`: end-to-end tests that drive the real binary against a private daemon (and read its database
   beside its socket to see what it wrote down), with a config of
-  their own that turns notifications, the memory plugin and naming sessions from their prompts off (a test of
-  memory or naming turns it back on), plugins
+  their own that turns notifications, sounds, the memory plugin and naming sessions from their prompts off (a
+  test of memory or naming turns it back on, and `CRYSTAL_NO_SOUND` keeps sounds off even then), plugins
   of their own in its plugins directory, and a Claude Code config directory of their own (`CLAUDE_CONFIG_DIR`),
   since a daemon brings the skill there up to date as it starts; a test that opens the new-session panel pins `PATH` to its fake
   agents, so no real agent is found or run, and a background task's `claude` is a fake that speaks stream-json,

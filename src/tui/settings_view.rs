@@ -35,6 +35,7 @@ pub enum Setting {
     Notify,
     NotifyAfter,
     UnfocusedOnly,
+    Sound,
     Theme,
     StopIdle,
     Distill,
@@ -47,6 +48,7 @@ pub enum Change {
     Notify(bool),
     NotifyAfter(u64),
     UnfocusedOnly(bool),
+    Sound(bool),
     Theme(ThemeName),
     /// How long an agent may sit idle, one of [`SessionSettings::CHOICES`].
     StopIdle(&'static str),
@@ -61,6 +63,7 @@ impl Change {
             Change::Notify(_) => &["notify"],
             Change::NotifyAfter(_) => &["notifications", "after_secs"],
             Change::UnfocusedOnly(_) => &["notifications", "unfocused_only"],
+            Change::Sound(_) => &["sound", "enabled"],
             Change::Theme(_) => &["theme"],
             Change::StopIdle(_) => &["sessions", "stop_idle_after"],
             Change::Distill(_) => &["memory", "distill"],
@@ -72,6 +75,7 @@ impl Change {
         match self {
             Change::Notify(on)
             | Change::UnfocusedOnly(on)
+            | Change::Sound(on)
             | Change::Distill(on)
             | Change::Embeddings(on) => on.into(),
             Change::NotifyAfter(secs) => i64::try_from(secs).unwrap_or(i64::MAX).into(),
@@ -118,10 +122,11 @@ pub enum Outcome {
 }
 
 /// The settings the bar can be on, in the order they're listed.
-const SETTINGS: [Setting; 7] = [
+const SETTINGS: [Setting; 8] = [
     Setting::Notify,
     Setting::NotifyAfter,
     Setting::UnfocusedOnly,
+    Setting::Sound,
     Setting::Theme,
     Setting::StopIdle,
     Setting::Distill,
@@ -213,6 +218,7 @@ impl SettingsView {
                 Change::NotifyAfter(next_wait(config.notifications.after_secs, forward))
             }
             Setting::UnfocusedOnly => Change::UnfocusedOnly(!config.notifications.unfocused_only),
+            Setting::Sound => Change::Sound(!config.sound.enabled),
             Setting::Theme if forward => Change::Theme(config.theme.next()),
             Setting::Theme => Change::Theme(config.theme.previous()),
             Setting::StopIdle => {
@@ -355,6 +361,7 @@ fn lines(view: &SettingsView, theme: &Theme) -> Vec<Line<'static>> {
             Setting::Notify => "notifications",
             Setting::NotifyAfter => "  after",
             Setting::UnfocusedOnly => "  only when away",
+            Setting::Sound => "sounds",
             Setting::Theme => "theme",
             Setting::StopIdle => "stop idle agents",
             Setting::Distill => "distill closed tasks",
@@ -421,6 +428,12 @@ fn lines(view: &SettingsView, theme: &Theme) -> Vec<Line<'static>> {
     };
     let themes = ThemeName::all().count();
     let at = config.theme.position() + 1;
+    lines.push(row(
+        Setting::Sound,
+        Some(config.sound.enabled),
+        on_off(config.sound.enabled),
+        "a chime at the same moments".to_string(),
+    ));
     lines.push(row(
         Setting::Theme,
         None,
@@ -542,6 +555,11 @@ mod tests {
         );
         press(&mut view, KeyCode::Down);
         assert_eq!(
+            press(&mut view, KeyCode::Char(' ')),
+            Outcome::Change(Change::Sound(false))
+        );
+        press(&mut view, KeyCode::Down);
+        assert_eq!(
             press(&mut view, KeyCode::Right),
             Outcome::Change(Change::Theme(ThemeName::LIGHT))
         );
@@ -622,12 +640,13 @@ mod tests {
             Change::StopIdle("30m").keys(),
             ["sessions", "stop_idle_after"]
         );
+        assert_eq!(Change::Sound(true).keys(), ["sound", "enabled"]);
     }
 
     #[test]
     fn enter_gets_the_model_only_once_search_by_meaning_is_on() {
         let mut view = view_of(Config::default(), Some(status()));
-        for _ in 0..6 {
+        for _ in 0..7 {
             press(&mut view, KeyCode::Down);
         }
         assert_eq!(press(&mut view, KeyCode::Enter), Outcome::Stay);

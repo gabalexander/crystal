@@ -5339,6 +5339,7 @@ mod tests {
             asking: None,
             reporter: None,
             subagents: 0,
+            bell: false,
         }
     }
 
@@ -8991,7 +8992,7 @@ gate = true
         });
         // `x` would kill the session from the sidebar; here it's nothing.
         assert_eq!(press(&mut app, KeyCode::Char('x')), None);
-        for _ in 0..6 {
+        for _ in 0..7 {
             press(&mut app, KeyCode::Char('j'));
         }
         assert_eq!(

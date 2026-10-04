@@ -5,7 +5,9 @@
 //! same output, to draw, and to copy from: copy mode's cursor, the
 //! selection and searches are Alacritty's own vi mode, kept in step with
 //! the output as it scrolls. A viewer's screen also finds the links on it,
-//! the hyperlinks a program wrote (OSC 8) and the URLs in its text.
+//! the hyperlinks a program wrote (OSC 8) and the URLs in its text. Every
+//! screen counts the times the program rang the terminal's bell, for the
+//! daemon to mark the session and a viewer to ring the user's terminal.
 
 use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::{Dimensions, Grid, Scroll};
@@ -226,12 +228,15 @@ pub struct Saved {
 }
 
 /// What alacritty_terminal hands back as it reads a program's output: the
-/// title the program gives its terminal, and the answers to its questions.
+/// title the program gives its terminal, the answers to its questions, and
+/// its bell.
 #[derive(Default)]
 struct Heard {
     /// Agents put a spinner here while they work.
     title: String,
     replies: Vec<u8>,
+    /// The times the program rang the bell since they were last taken.
+    bells: u32,
     /// Only the daemon's screen answers: viewers only draw.
     answering: bool,
 }
@@ -246,6 +251,7 @@ impl EventListener for Listener {
             Event::Title(title) => heard.title = title,
             Event::ResetTitle => heard.title.clear(),
             Event::PtyWrite(text) if heard.answering => heard.replies.extend(text.as_bytes()),
+            Event::Bell => heard.bells = heard.bells.saturating_add(1),
             _ => {}
         }
     }
@@ -377,6 +383,12 @@ impl Screen {
     /// back to it.
     pub fn take_replies(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.heard.lock().unwrap().replies)
+    }
+
+    /// How many times the program rang the terminal's bell since the last
+    /// call: a `BEL` on its own, not the one that ends a title.
+    pub fn take_bells(&mut self) -> u32 {
+        std::mem::take(&mut self.heard.lock().unwrap().bells)
     }
 
     /// The size, as `(rows, cols)`.
@@ -1504,6 +1516,17 @@ mod tests {
         assert!(screen.application_cursor());
         assert!(screen.bracketed_paste());
         assert!(!screen.mode(mode::MOUSE_SGR));
+    }
+
+    #[test]
+    fn the_bell_is_counted_and_a_title_s_end_isnt_a_bell() {
+        let mut screen = screen(2, 10, b"a\x07b\x1b]0;title\x07\x07");
+        assert_eq!(screen.take_bells(), 2);
+        assert_eq!(screen.take_bells(), 0);
+        // What catches a new viewer up rings nothing.
+        let mut viewer = Screen::new(2, 10);
+        viewer.process(&screen.state_formatted(true));
+        assert_eq!(viewer.take_bells(), 0);
     }
 
     #[test]

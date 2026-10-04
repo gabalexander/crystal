@@ -56,6 +56,9 @@ pub struct Config {
     pub plugins: BTreeMap<String, bool>,
     /// When to tell: `[notifications]` in the file.
     pub notifications: NotifySettings,
+    /// The sounds played when a session needs the user: `[sound]` in the
+    /// file. See [`crate::sound`].
+    pub sound: SoundSettings,
     /// How the memory plugin learns: `[memory]` in the file.
     pub memory: MemorySettings,
     /// What background tasks may spend: `[tasks]` in the file.
@@ -160,6 +163,38 @@ pub enum Fold {
     Marks,
     /// Nothing: the panes take every column.
     Hidden,
+}
+
+/// The sounds played when a session needs the user, at the same moments
+/// a notification tells them: see [`crate::sound`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SoundSettings {
+    pub enabled: bool,
+    /// A sound file of the user's own for an agent that's done with a
+    /// turn nobody watched, in place of crystal's: a path relative to the
+    /// config file's directory, or `~/` for the home directory.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub done: Option<PathBuf>,
+    /// The same for an agent that comes to ask the user something.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request: Option<PathBuf>,
+    /// Agents switched on or off by their program's name, like `codex =
+    /// false`, for one that plays its own sounds. An agent left out
+    /// follows `enabled`.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub agents: BTreeMap<String, bool>,
+}
+
+impl Default for SoundSettings {
+    fn default() -> SoundSettings {
+        SoundSettings {
+            enabled: true,
+            done: None,
+            request: None,
+            agents: BTreeMap::new(),
+        }
+    }
 }
 
 /// How the memory plugin learns, beyond what it's told.
@@ -376,6 +411,7 @@ impl Default for Config {
             scrollback_lines: vt::DEFAULT_HISTORY_LINES,
             plugins: BTreeMap::new(),
             notifications: NotifySettings::default(),
+            sound: SoundSettings::default(),
             memory: MemorySettings::default(),
             tasks: TaskSettings::default(),
             events: EventSettings::default(),
@@ -1072,6 +1108,21 @@ back_to = "build"
     }
 
     #[test]
+    fn sounds_play_unless_switched_off_for_all_or_an_agent() {
+        let sound = Config::default().sound;
+        assert!(sound.enabled);
+        assert_eq!((sound.done, sound.request), (None, None));
+        let config = parse(
+            "[sound]\nenabled = false\nrequest = \"ask.mp3\"\n\n[sound.agents]\ncodex = false\n",
+        )
+        .unwrap();
+        assert!(!config.sound.enabled);
+        assert_eq!(config.sound.request, Some(PathBuf::from("ask.mp3")));
+        assert_eq!(config.sound.agents.get("codex"), Some(&false));
+        assert!(parse("[sound]\nvolume = 3\n").is_err());
+    }
+
+    #[test]
     fn new_worktrees_start_from_origins_default_unless_told() {
         assert_eq!(Config::default().worktrees.base, None);
         let config = parse("[worktrees]\nbase = \"develop\"\n").unwrap();
@@ -1122,6 +1173,12 @@ back_to = "build"
             notifications: NotifySettings {
                 after_secs: 30,
                 unfocused_only: true,
+            },
+            sound: SoundSettings {
+                enabled: false,
+                done: Some(PathBuf::from("sounds/done.wav")),
+                request: None,
+                agents: BTreeMap::from([("codex".to_string(), false)]),
             },
             memory: MemorySettings {
                 distill: false,
