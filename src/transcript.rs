@@ -9,8 +9,15 @@
 //! on its session's screen, so the lines here carry ANSI colors and end in
 //! `\r\n`, the way any program's output does on a terminal. What Claude
 //! says is markdown, laid out as a page for the screen's width.
+//!
+//! None of what goes into them is crystal's own: Claude's text, a tool's
+//! answer, a command's name, what claude wrote to its standard error. Each
+//! goes through [`printable`] first, so the screen only ever draws it,
+//! never takes an order from it: it can't set the session's title, write
+//! the user's clipboard, make a link or switch the screen's modes.
 
 use crate::markdown::{self, Ink, Mark};
+use crate::printable;
 use crate::syntax::TokenKind;
 use ratatui::style::Modifier;
 use serde_json::Value;
@@ -86,6 +93,7 @@ pub fn events(line: &str) -> Vec<Event> {
 pub fn prompt_lines(prompt: &str) -> String {
     let mut lines = String::new();
     for line in prompt.lines() {
+        let line = printable::line(line);
         lines.push_str(&format!("{BOLD}> {line}{RESET}\r\n"));
     }
     lines.push_str("\r\n");
@@ -97,9 +105,13 @@ pub fn lines(event: &Event, width: u16) -> String {
     match event {
         Event::Started { .. } => String::new(),
         Event::Said(text) => said_lines(text, width),
-        Event::UsedTool { name, gist } => format!("{CYAN}▸ {name}{RESET} {gist}\r\n"),
+        Event::UsedTool { name, gist } => {
+            let (name, gist) = (printable::line(name), printable::line(gist));
+            format!("{CYAN}▸ {name}{RESET} {gist}\r\n")
+        }
         Event::ToolAnswered { first_line, failed } => {
             let color = if *failed { RED } else { DIM };
+            let first_line = printable::line(first_line);
             format!("{color}  └ {first_line}{RESET}\r\n")
         }
         Event::Finished(outcome) => finished_lines(outcome),
@@ -110,13 +122,17 @@ pub fn lines(event: &Event, width: u16) -> String {
 /// the terminal's own colors.
 fn said_lines(text: &str, width: u16) -> String {
     let mut lines = String::new();
-    for line in markdown::render(text, usize::from(width).max(1)) {
+    let text = printable::text(text);
+    for line in markdown::render(&text, usize::from(width).max(1)) {
         for piece in line {
+            // Markdown reads a character reference like `&#x1b;` as the
+            // character, so a piece can hold what the text didn't.
+            let text = printable::line(&piece.text);
             let codes = sgr(piece.mark);
             if codes.is_empty() {
-                lines.push_str(&piece.text);
+                lines.push_str(&text);
             } else {
-                lines.push_str(&format!("\x1b[{codes}m{}{RESET}", piece.text));
+                lines.push_str(&format!("\x1b[{codes}m{text}{RESET}"));
             }
         }
         lines.push_str("\r\n");
@@ -156,11 +172,13 @@ fn sgr(mark: Mark) -> String {
 /// The lines for a note between runs, dimmed so it isn't taken for
 /// Claude's.
 pub fn note_lines(note: &str) -> String {
+    let note = printable::line(note);
     format!("{DIM}{note}{RESET}\r\n\r\n")
 }
 
 /// The line for a permission Claude asks for, which waits on the user.
 pub fn asking_lines(tool: &str, gist: &str) -> String {
+    let (tool, gist) = (printable::line(tool), printable::line(gist));
     format!("{YELLOW}⚠ {tool}{RESET} {gist} {DIM}· waiting on you{RESET}\r\n")
 }
 
@@ -173,6 +191,7 @@ pub fn answered_lines(answer: &str) -> String {
     } else {
         DIM
     };
+    let answer = printable::line(answer);
     format!("{color}  └ {answer}{RESET}\r\n")
 }
 
@@ -180,8 +199,10 @@ pub fn answered_lines(answer: &str) -> String {
 /// was stopped. `why` is how the process ended, and `errors` the last of
 /// what it wrote to its standard error.
 pub fn cut_short_lines(why: &str, errors: &[String]) -> String {
+    let why = printable::line(why);
     let mut lines = format!("\r\n{RED}✗ failed{RESET} · {why}\r\n");
     for error in errors {
+        let error = printable::line(error);
         lines.push_str(&format!("{DIM}  {error}{RESET}\r\n"));
     }
     lines.push_str("\r\n");
@@ -194,6 +215,7 @@ fn finished_lines(outcome: &Outcome) -> String {
     let cost = format!("${:.2}", outcome.cost_usd);
     if outcome.failed {
         let why = gist(&outcome.result);
+        let why = printable::line(&why);
         lines.push_str(&format!(
             "{RED}✗ failed{RESET} · {why} · {took} · {cost}\r\n"
         ));
@@ -201,6 +223,7 @@ fn finished_lines(outcome: &Outcome) -> String {
         lines.push_str(&format!("{GREEN}✓ done{RESET} · {took} · {cost}\r\n"));
     }
     for refused in &outcome.refused {
+        let refused = printable::line(refused);
         lines.push_str(&format!("{YELLOW}  refused: {refused}{RESET}\r\n"));
     }
     lines.push_str("\r\n");
@@ -504,6 +527,73 @@ mod tests {
         );
         let long = Event::Said("one two three four five".into());
         assert_eq!(lines(&long, 10), "one two\r\nthree four\r\nfive\r\n");
+    }
+
+    /// Every kind of line the screen is drawn with, each made with `text`
+    /// wherever crystal puts something it didn't write.
+    fn every_line(text: &str) -> String {
+        let outcome = |failed| Outcome {
+            failed,
+            result: text.into(),
+            conversation: "abc".into(),
+            cost_usd: 0.0,
+            duration_ms: 0,
+            refused: vec![text.into()],
+        };
+        let used = Event::UsedTool {
+            name: text.into(),
+            gist: text.into(),
+        };
+        let answered = Event::ToolAnswered {
+            first_line: text.into(),
+            failed: true,
+        };
+        [
+            prompt_lines(text),
+            lines(&Event::Said(text.into()), 80),
+            lines(&used, 80),
+            lines(&answered, 80),
+            lines(&Event::Finished(outcome(true)), 80),
+            lines(&Event::Finished(outcome(false)), 80),
+            note_lines(text),
+            asking_lines(text, text),
+            answered_lines(text),
+            cut_short_lines(text, &[text.to_string()]),
+        ]
+        .concat()
+    }
+
+    /// Holds `drawn` to crystal's own colors and line ends.
+    fn assert_only_colors_and_text(drawn: &str, from: &str) {
+        for order in printable::orders(drawn) {
+            let color = order.starts_with("\x1b[") && order.ends_with('m');
+            assert!(
+                color || order == "\r" || order == "\n",
+                "{order:?} from {from:?}"
+            );
+        }
+        assert!(!drawn.replace("\r\n", "").contains('\r'), "{from:?}");
+    }
+
+    #[test]
+    fn nothing_claude_or_a_tool_says_is_taken_as_an_order() {
+        for hostile in printable::HOSTILE {
+            let drawn = every_line(hostile);
+            assert_only_colors_and_text(&drawn, hostile);
+            let mut screen = crate::vt::Screen::new(80, 100);
+            screen.process(drawn.as_bytes());
+            assert_eq!(screen.title(), "", "{hostile:?}");
+            assert_eq!(screen.take_copied(), None, "{hostile:?}");
+            assert!(!screen.alternate_screen(), "{hostile:?}");
+        }
+    }
+
+    #[test]
+    fn a_character_reference_in_what_claude_says_stays_text() {
+        let said = "&#x1b;]0;pwned&#7; then &#27;[?1049h and &#x9b;2J";
+        let drawn = lines(&Event::Said(said.into()), 80);
+        assert_only_colors_and_text(&drawn, said);
+        assert!(drawn.contains("]0;pwned then [?1049h and 2J"), "{drawn:?}");
     }
 
     #[test]

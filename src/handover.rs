@@ -590,13 +590,19 @@ mod tests {
                 }
             }
         });
-        let answering = thread::spawn(move || {
-            thread::sleep(Duration::from_millis(100));
-            drop(ticket);
+        // Answered a moment later, well after the gate would otherwise have
+        // closed.
+        let answered = Arc::new(AtomicBool::new(false));
+        let answering = thread::spawn({
+            let answered = answered.clone();
+            move || {
+                thread::sleep(Duration::from_millis(100));
+                answered.store(true, Ordering::SeqCst);
+                drop(ticket);
+            }
         });
-        let started = Instant::now();
         let waiting = gate.close(&socket, Instant::now() + Duration::from_secs(5));
-        assert!(started.elapsed() >= Duration::from_millis(100));
+        assert!(answered.load(Ordering::SeqCst), "it waited for the answer");
         assert_eq!(waiting.len(), 1, "the connection that woke it");
         answering.join().unwrap();
         accepting.join().unwrap();

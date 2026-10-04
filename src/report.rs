@@ -22,6 +22,7 @@
 //! that comes after a later one from the same `--source` is passed over.
 
 use crate::client;
+use crate::printable;
 use crate::protocol::{Activity, AgentEvent, AgentReport, Metadata, Request, Response};
 use crate::shell;
 use crate::typing;
@@ -179,17 +180,10 @@ impl Shown {
     }
 }
 
-/// `text` as a row can show it: on one line, without control characters,
-/// trimmed, and cut to [`LONGEST_SHOWN`] characters.
+/// `text` as a row can show it: on one line, without control characters
+/// (see [`printable`]), trimmed, and cut to [`LONGEST_SHOWN`] characters.
 fn tidy(text: &str) -> String {
-    let one_line: String = text
-        .chars()
-        .filter_map(|c| match c {
-            c if c.is_control() && c.is_whitespace() => Some(' '),
-            c if c.is_control() => None,
-            c => Some(c),
-        })
-        .collect();
+    let one_line = printable::line(text);
     one_line.trim().chars().take(LONGEST_SHOWN).collect()
 }
 

@@ -7,10 +7,14 @@
 //! `--settings`, so the user's settings files are never touched, and its
 //! hooks run alongside any the user has. Other agents take hooks only in
 //! their own settings, where crystal puts them when the user asks it to
-//! (see [`crate::agent_hooks`]); what they report is read here too.
+//! (see [`crate::agent_hooks`]), or plugins, which crystal writes for them
+//! (see [`crate::agent_plugins`]); what they report is read here too, and
+//! here is how each picks its conversation up again.
 
+use crate::agent_rules;
 use crate::catalog;
 use crate::codex;
+use crate::printable;
 use crate::protocol::{AgentEvent, Conversation, Subagent};
 use crate::shell;
 use serde_json::{Value, json};
@@ -116,7 +120,11 @@ pub fn argv(
                 .and_then(|id| codex::resume_argv(command, id))
                 .unwrap_or_else(|| command.to_vec());
         }
-        _ => return in_first_prompt(command, instructions),
+        _ => {
+            return resume
+                .and_then(|id| resumed(command, id, task))
+                .unwrap_or_else(|| in_first_prompt(command, instructions));
+        }
     }
     let mut argv = vec![
         command[0].clone(),
@@ -254,6 +262,30 @@ pub fn hook_conversation(input: &Value) -> Option<Conversation> {
     Some(Conversation {
         id: id.to_string(),
         transcript,
+        prompted: false,
+    })
+}
+
+/// What a Letta Code hook's input means: it hooks only a session
+/// starting. Its `agent_id` is the Letta agent the conversation is with,
+/// not a subagent.
+pub fn letta_event(input: &Value) -> Option<AgentEvent> {
+    (event_name(input)? == "SessionStart").then_some(AgentEvent::Started)
+}
+
+/// The conversation a Letta Code hook's input names: its id, or for the
+/// agent's default conversation, which every agent has one of,
+/// `default:<agent>`, as herdr writes it.
+pub fn letta_conversation(input: &Value) -> Option<Conversation> {
+    let id = text_field(input, &["conversation_id"])?;
+    let id = match id {
+        "default" => format!("default:{}", text_field(input, &["agent_id"])?),
+        id => id.to_string(),
+    };
+    Some(Conversation {
+        id,
+        transcript: None,
+        prompted: false,
     })
 }
 
@@ -305,9 +337,9 @@ fn without_resume_flags(args: &[String]) -> Vec<String> {
 }
 
 /// What a hook's input means, or `None` if it's nothing that changes what
-/// the session is doing: Claude Code's events, which Droid, Qoder and Qwen
-/// Code copied, and Cursor's, spelled its own way. Codex's are
-/// [`codex_event`]'s.
+/// the session is doing: Claude Code's events, which Droid, Qoder, Qwen
+/// Code, Devin, Kimi, MastraCode and Grok copied, adding a few of their
+/// own, and Cursor's, spelled its own way. Codex's are [`codex_event`]'s.
 pub fn hook_event(input: &Value) -> Option<AgentEvent> {
     let name = event_name(input)?;
     if in_subagent(input) && !matches!(name, "PostToolUse" | "PermissionRequest" | "Notification") {
@@ -317,11 +349,19 @@ pub fn hook_event(input: &Value) -> Option<AgentEvent> {
         // A session starts again after its context is compacted, which can
         // happen mid-turn.
         "SessionStart" if input["source"] == "compact" => return None,
-        "SessionStart" | "sessionStart" => AgentEvent::Started,
+        "SessionStart" | "sessionStart" | "session_start" => AgentEvent::Started,
         "UserPromptSubmit" | "beforeSubmitPrompt" => AgentEvent::TurnStarted,
-        "PostToolUse" => AgentEvent::ToolFinished,
+        // An answered permission puts the agent back to work, as a tool
+        // finishing does.
+        "PostToolUse" | "PermissionResult" => AgentEvent::ToolFinished,
         "PermissionRequest" => AgentEvent::Asking,
-        "Stop" | "stop" => AgentEvent::TurnEnded,
+        "Stop" | "stop" | "AgentEnd" => AgentEvent::TurnEnded,
+        // A turn the user cut short.
+        "Interrupt" => AgentEvent::StillIdle,
+        // Antigravity's, as it calls its model, and crystal's own, from
+        // the plugins it gives agents, for a hook that only names the
+        // conversation: their turns are read off their screens.
+        "PreInvocation" | "SessionNamed" => AgentEvent::Named,
         "Notification" => match input["notification_type"].as_str()? {
             "permission_prompt" | "elicitation_dialog" => AgentEvent::Asking,
             "idle_prompt" => AgentEvent::StillIdle,
@@ -408,14 +448,128 @@ pub fn hook_model(input: &Value) -> Option<String> {
 
 /// The command that picks `agent`'s conversation `id` up again, typed into
 /// the shell of a session it was started in by hand: `None` for an agent
-/// crystal can't resume.
+/// crystal can't resume. `agent` is as its hooks name it.
 pub fn resume_typed(agent: &str, id: &str) -> Option<Vec<String>> {
-    let argv = match agent {
-        "claude" => ["claude", "--resume", id],
-        "codex" => ["codex", "resume", id],
+    // Cursor's other program, `agent`, is too common a name to type.
+    let program = match agent {
+        "cursor" => "cursor-agent",
+        agent => agent,
+    };
+    let mut argv = vec![program.to_string()];
+    argv.extend(resume_args(agent, id)?);
+    Some(argv)
+}
+
+/// The longest conversation id crystal puts on a command line, as herdr
+/// takes them.
+const LONGEST_ID: usize = 512;
+
+/// Whether `id`, as an agent's hooks named it, can go on a command line,
+/// and be typed into any shell and read the same: something, not too long,
+/// not taken for an option, with no quote, and nothing a terminal takes as
+/// an order (see [`printable`]).
+fn fits_a_command_line(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= LONGEST_ID
+        && !id.starts_with('-')
+        && !id.contains('\'')
+        && !id.contains(printable::is_unprintable)
+}
+
+/// What chooses `agent`'s conversation `id` on its command line, as each
+/// agent takes it (herdr's list): `None` for an agent crystal can't
+/// resume, or an id that can't go on a command line. Claude Code's and
+/// Codex's own command lines are [`argv`]'s.
+fn resume_args(agent: &str, id: &str) -> Option<Vec<String>> {
+    if !fits_a_command_line(id) {
+        return None;
+    }
+    let option = match agent {
+        "codex" => "resume",
+        "claude" | "cursor" | "droid" | "qodercli" | "qwen" | "devin" | "hermes" | "grok" => {
+            "--resume"
+        }
+        "copilot" => return Some(vec![format!("--resume={id}")]),
+        "kimi" | "pi" | "opencode" | "kilo" => "--session",
+        "mastracode" => "--thread",
+        "agy" => "--conversation",
+        // An agent's default conversation is chosen with the agent.
+        "letta" => match id.strip_prefix("default:") {
+            Some("") => return None,
+            Some(letta_agent) => {
+                let args = ["--conversation", "default", "--agent", letta_agent];
+                return Some(args.map(String::from).to_vec());
+            }
+            None => "--conversation",
+        },
         _ => return None,
     };
-    Some(argv.map(String::from).to_vec())
+    Some(vec![option.to_string(), id.to_string()])
+}
+
+/// The command line that picks `command`'s agent up again in its
+/// conversation `id`, for an agent other than Claude Code and Codex: its
+/// program, what chooses the conversation, then the arguments it was
+/// started with, but for its first prompt, which the conversation has had
+/// (found as for Claude, by `task` when it's last), and options that chose
+/// a conversation, since crystal is choosing it. `None` for an agent
+/// crystal can't resume.
+fn resumed(command: &[String], id: &str, task: Option<&str>) -> Option<Vec<String>> {
+    let program = program_name(command)?;
+    let registry = agent_rules::current();
+    let agent = registry
+        .find(program)
+        .map_or(program, |rules| rules.id.as_str());
+    let chosen = resume_args(agent, id)?;
+    let mut args = catalog::without_first_prompt(command).split_off(1);
+    if task.is_some() && args.last().map(String::as_str) == task {
+        args.pop();
+    }
+    let mut argv = vec![command[0].clone()];
+    argv.extend(without_choosing(&args, &chosen));
+    argv.splice(1..1, chosen);
+    Some(argv)
+}
+
+/// An agent's arguments without those that choose a conversation: the
+/// options in `chosen`, which crystal gives instead, and `--resume` and
+/// `--continue`, which most agents choose one with, each with its value
+/// if it has one. Past `--`, nothing is an option.
+fn without_choosing(args: &[String], chosen: &[String]) -> Vec<String> {
+    // An option in `chosen` followed by something else takes a value.
+    let mut valued: Vec<&str> = Vec::new();
+    for (at, arg) in chosen.iter().enumerate() {
+        let next = chosen.get(at + 1);
+        if arg.starts_with("--") && next.is_some_and(|next| !next.starts_with('-')) {
+            valued.push(arg.split('=').next().unwrap_or(arg));
+        }
+    }
+    let mut kept = Vec::new();
+    let mut args = args.iter().peekable();
+    while let Some(arg) = args.next() {
+        if arg == "--" {
+            kept.push(arg.clone());
+            kept.extend(args.by_ref().cloned());
+            break;
+        }
+        let name = arg.split('=').next().unwrap_or(arg);
+        let chooses = name == "--continue"
+            || name == "--resume"
+            || valued.contains(&name)
+            || chosen
+                .iter()
+                .any(|given| given.split('=').next() == Some(name));
+        if !chooses {
+            kept.push(arg.clone());
+            continue;
+        }
+        // `--resume` may come without an id, for a list to choose from.
+        let takes_value = name != "--continue" && !arg.contains('=');
+        if takes_value && args.peek().is_some_and(|next| !next.starts_with('-')) {
+            args.next();
+        }
+    }
+    kept
 }
 
 /// What a Claude Code Stop hook prints to keep Claude from ending its turn:
@@ -540,15 +694,164 @@ mod tests {
 
     #[test]
     fn an_agent_typed_into_a_shell_resumes_with_its_own_command() {
+        let typed = |agent: &str, id: &str| resume_typed(agent, id).unwrap().join(" ");
+        assert_eq!(typed("claude", "c-1"), "claude --resume c-1");
+        assert_eq!(typed("codex", "t-1"), "codex resume t-1");
+        assert_eq!(typed("cursor", "c-2"), "cursor-agent --resume c-2");
+        assert_eq!(typed("droid", "d"), "droid --resume d");
+        assert_eq!(typed("qodercli", "q"), "qodercli --resume q");
+        assert_eq!(typed("qwen", "q"), "qwen --resume q");
+        assert_eq!(typed("copilot", "p"), "copilot --resume=p");
+        assert_eq!(typed("devin", "d"), "devin --resume d");
+        assert_eq!(typed("kimi", "k"), "kimi --session k");
+        assert_eq!(typed("mastracode", "m"), "mastracode --thread m");
+        assert_eq!(typed("pi", "/s/p.jsonl"), "pi --session /s/p.jsonl");
+        assert_eq!(typed("hermes", "h"), "hermes --resume h");
+        assert_eq!(typed("opencode", "o"), "opencode --session o");
+        assert_eq!(typed("kilo", "k"), "kilo --session k");
+        assert_eq!(typed("agy", "a"), "agy --conversation a");
+        assert_eq!(typed("grok", "g"), "grok --resume g");
+        assert_eq!(typed("letta", "conv-1"), "letta --conversation conv-1");
         assert_eq!(
-            resume_typed("claude", "c-1").unwrap(),
-            ["claude", "--resume", "c-1"]
+            typed("letta", "default:agent-9"),
+            "letta --conversation default --agent agent-9"
         );
-        assert_eq!(
-            resume_typed("codex", "t-1").unwrap(),
-            ["codex", "resume", "t-1"]
-        );
+        assert_eq!(resume_typed("letta", "default:"), None);
         assert_eq!(resume_typed("gemini", "x"), None);
+        // An id a shell or a terminal could take for more than an id isn't
+        // typed in, or run.
+        for hostile in [
+            "",
+            "--yolo",
+            "k'1",
+            "k-1\nrm -rf ~",
+            "k-1\u{1b}]52;c;eA==\u{7}",
+            "\u{202e}1-k",
+        ] {
+            assert_eq!(resume_typed("kimi", hostile), None, "{hostile:?}");
+        }
+        assert_eq!(resume_typed("kimi", &"k".repeat(LONGEST_ID + 1)), None);
+        let typed = resume_typed("pi", "/s/my session.jsonl").unwrap();
+        assert!(crate::report::check_resume(&typed).is_ok());
+        let asked = command(&["kimi"]);
+        let crystal = Path::new("/bin/crystal");
+        assert_eq!(argv(&asked, crystal, Some("--yolo"), None, &[]), asked);
+    }
+
+    #[test]
+    fn an_agent_crystal_started_resumes_without_its_first_prompt() {
+        let crystal = Path::new("/bin/crystal");
+        let resumed = |asked: &[&str], task: Option<&str>| {
+            argv(&command(asked), crystal, Some("s-1"), task, &[]).join(" ")
+        };
+        assert_eq!(
+            resumed(&["/opt/bin/kimi", "--yolo"], None),
+            "/opt/bin/kimi --session s-1 --yolo"
+        );
+        assert_eq!(
+            resumed(
+                &["cursor-agent", "--model", "x", "--", "fix it"],
+                Some("fix it")
+            ),
+            "cursor-agent --resume s-1 --model x"
+        );
+        assert_eq!(
+            resumed(&["opencode", ".", "--prompt", "fix it"], None),
+            "opencode --session s-1 ."
+        );
+        assert_eq!(resumed(&["pi", "fix it"], None), "pi --session s-1");
+        assert_eq!(
+            resumed(&["pi", "--model", "x", "fix it"], Some("fix it")),
+            "pi --session s-1 --model x"
+        );
+        assert_eq!(resumed(&["copilot"], None), "copilot --resume=s-1");
+        // What chose a conversation makes way for crystal's choice.
+        assert_eq!(
+            resumed(
+                &["qwen", "--continue", "--resume", "old", "--model", "x"],
+                None
+            ),
+            "qwen --resume s-1 --model x"
+        );
+        assert_eq!(
+            resumed(&["kimi", "--session=old", "-y"], None),
+            "kimi --session s-1 -y"
+        );
+        let letta = argv(
+            &command(&["letta", "--agent", "old", "--conversation", "c"]),
+            crystal,
+            Some("default:agent-9"),
+            None,
+            &[],
+        );
+        assert_eq!(
+            letta,
+            command(&["letta", "--conversation", "default", "--agent", "agent-9"])
+        );
+        // Picked up again, the notes aren't put in a prompt that's gone.
+        let notes = notes(&["About the task."]);
+        let qwen = argv(
+            &command(&["qwen", "-i", "fix it"]),
+            crystal,
+            Some("s-1"),
+            None,
+            &notes,
+        );
+        assert_eq!(qwen, command(&["qwen", "--resume", "s-1"]));
+        // An agent crystal can't resume starts as it was asked.
+        let gemini = command(&["gemini", "-i", "fix it"]);
+        assert_eq!(argv(&gemini, crystal, Some("s-1"), None, &[]), gemini);
+    }
+
+    #[test]
+    fn the_newer_agents_hooks_mean_what_claude_code_s_do() {
+        let event = |json: Value| hook_event(&json);
+        assert_eq!(
+            event(json!({"hook_event_name": "PermissionResult"})),
+            Some(AgentEvent::ToolFinished)
+        );
+        assert_eq!(
+            event(json!({"hook_event_name": "AgentEnd"})),
+            Some(AgentEvent::TurnEnded)
+        );
+        assert_eq!(
+            event(json!({"hook_event_name": "session_start", "source": "new"})),
+            Some(AgentEvent::Started)
+        );
+        // Antigravity's, as it calls its model, only names its
+        // conversation, as crystal's own plugins' `SessionNamed` does.
+        let invoked = json!({
+            "hook_event_name": "PreInvocation",
+            "conversationId": "a-1",
+            "transcriptPath": "/t/a-1.pb",
+        });
+        assert_eq!(hook_event(&invoked), Some(AgentEvent::Named));
+        let conversation = hook_conversation(&invoked).unwrap();
+        assert_eq!(conversation.id, "a-1");
+        assert_eq!(conversation.transcript, Some(PathBuf::from("/t/a-1.pb")));
+        assert_eq!(
+            event(json!({"hook_event_name": "SessionNamed"})),
+            Some(AgentEvent::Named)
+        );
+    }
+
+    #[test]
+    fn letta_names_its_conversation_with_its_agent() {
+        let started = json!({
+            "hook_event_name": "SessionStart",
+            "conversation_id": "conv-7",
+            "agent_id": "agent-9",
+        });
+        // Its agent is no subagent.
+        assert_eq!(letta_event(&started), Some(AgentEvent::Started));
+        assert_eq!(letta_conversation(&started).unwrap().id, "conv-7");
+        let default = json!({"conversation_id": "default", "agent_id": "agent-9"});
+        assert_eq!(letta_conversation(&default).unwrap().id, "default:agent-9");
+        assert_eq!(
+            letta_conversation(&json!({"conversation_id": "default"})),
+            None
+        );
+        assert_eq!(letta_event(&json!({"hook_event_name": "Stop"})), None);
     }
 
     #[test]
@@ -918,9 +1221,9 @@ mod tests {
 
     #[test]
     fn other_agents_hooks_are_read_the_way_they_spell_them() {
-        // Codex says when a turn is cut short, which its own reading takes.
+        // Codex, Kimi and MastraCode say when a turn is cut short.
         let interrupt = json!({"hook_event_name": "Interrupt", "session_id": "t1"});
-        assert_eq!(hook_event(&interrupt), None);
+        assert_eq!(hook_event(&interrupt), Some(AgentEvent::StillIdle));
         assert_eq!(codex_event(&interrupt), Some(AgentEvent::StillIdle));
         // Cursor's events, and its conversation's id.
         let started = json!({"hook_event_name": "sessionStart", "conversation_id": "c9"});

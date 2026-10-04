@@ -42,6 +42,7 @@ use super::tree_browser;
 use crate::config::BarPosition;
 use crate::flow_run::RunState;
 use crate::model;
+use crate::printable;
 use crate::protocol::{SessionInfo, State, TaskState};
 use crate::shell;
 use ratatui::Frame;
@@ -450,7 +451,22 @@ pub fn border_hit(areas: &Areas, app: &App, split: usize, column: u16, row: u16)
 }
 
 /// Draws the whole TUI. `panes` are the viewers of the sessions on screen.
+/// The frame is scrubbed last, so that whatever a session's name, a pull
+/// request, a file or anything else crystal didn't write holds, the
+/// terminal only draws it: see [`printable`].
 pub fn draw(frame: &mut Frame, app: &App, panes: &[Pane], overlay: Option<&Pane>, look: &Look) {
+    draw_everything(frame, app, panes, overlay, look);
+    printable::scrub(frame.buffer_mut());
+}
+
+/// What [`draw`] draws, before it's scrubbed.
+fn draw_everything(
+    frame: &mut Frame,
+    app: &App,
+    panes: &[Pane],
+    overlay: Option<&Pane>,
+    look: &Look,
+) {
     frame.render_widget(Block::new().style(look.theme.base()), frame.area());
     let areas = Areas::of(app, frame.area());
     draw_top_bar(frame, app, look, areas.top);
@@ -3164,5 +3180,63 @@ mod tests {
         };
         assert_eq!(app.rows()[row], Row::Session(29));
         assert!(screen_text(&app)[10].contains("s29"));
+    }
+
+    /// What crossterm writes to the terminal for `app`, drawn on a `width`
+    /// by `height` screen: the bytes, not the cells.
+    fn written(app: &App, width: u16, height: u16) -> String {
+        use ratatui::backend::CrosstermBackend;
+        use ratatui::{TerminalOptions, Viewport};
+        let theme = theme();
+        let options = TerminalOptions {
+            viewport: Viewport::Fixed(Rect::new(0, 0, width, height)),
+        };
+        let mut out = Vec::new();
+        let mut terminal = Terminal::with_options(CrosstermBackend::new(&mut out), options)
+            .expect("a terminal over a Vec");
+        terminal
+            .draw(|frame| draw(frame, app, &[], None, &look(&theme)))
+            .unwrap();
+        drop(terminal);
+        String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn what_crystal_didnt_write_reaches_the_terminal_as_text_alone() {
+        let sessions = printable::HOSTILE
+            .iter()
+            .enumerate()
+            .map(|(n, hostile)| {
+                let mut session = agent(in_worktree(&format!("{n}{hostile}"), hostile, false));
+                if let Some(worktree) = &mut session.worktree {
+                    worktree.project = hostile.to_string();
+                }
+                session.activity = Some(Activity::Waiting);
+                session.line = Some(hostile.to_string());
+                session.model = Some(hostile.to_string());
+                session.reporter = Some(crate::protocol::Reporter {
+                    agent: hostile.to_string(),
+                    message: Some(hostile.to_string()),
+                    resume: None,
+                });
+                session
+            })
+            .collect();
+        let mut app = App::new(None);
+        app.set_sessions(sessions);
+        let out = written(&app, 160, 48);
+        for order in printable::orders(&out) {
+            // Where to draw, in which colors, and the cursor hidden while
+            // it draws and shown again once the terminal's let go of.
+            let cursor = ["\x1b[?25l", "\x1b[?25h"].contains(&order.as_str());
+            let crosstermss =
+                order.starts_with("\x1b[") && (order.ends_with('H') || order.ends_with('m'));
+            let crosstermss = crosstermss || cursor;
+            assert!(crosstermss, "{order:?} reached the terminal");
+        }
+        // The text around each order is drawn, and what's left of the
+        // order with it, doing nothing.
+        assert!(out.contains("]0;pwned"), "{out:?}");
+        assert!(out.contains("[?1049h"), "{out:?}");
     }
 }
