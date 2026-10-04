@@ -18,6 +18,7 @@ use super::diff_view::{self, Against, DiffView};
 use super::finder::Finder;
 use super::grep::Grep;
 use super::groups::{self, Row};
+use super::handoff_view::{self, HandoffView};
 use super::help;
 use super::issues::{self, IssuesView};
 use super::keymap::{
@@ -33,6 +34,7 @@ use super::plugins_view::{self, PluginsView};
 use super::preview::Content;
 use super::profiles::{self, ProfilesView};
 use super::pull_requests::{self, PullRequestsView};
+use super::ram_view::{self, RamView};
 use super::reply::ReplyBox;
 use super::restarted::{Restarted, Restarts};
 use super::review;
@@ -43,12 +45,12 @@ use super::status::Status;
 use super::switcher::{self, Switcher};
 use super::tabs::Tabs;
 use super::text_input::TextInput;
-use super::timeline::{self, TimelineView};
+use super::timeline::{self, Scoped, TimelineView};
 use super::tree_browser::TreeBrowser;
 use crate::catalog::{self, Agent};
 use crate::client::Purpose;
 use crate::config::{BarPosition, Config, Fold, MouseSettings, SIDEBAR_WIDTHS, TabBarSettings};
-use crate::events::Event;
+use crate::events::{Event, Scope};
 use crate::flow_run::{FlowRun, RunState};
 use crate::flows::{self, Flow};
 use crate::forge::{self, Checkout, Forge, Issue, PullRequest, PullRequestDetail, Topic};
@@ -57,12 +59,14 @@ use crate::profile::{self, Profile};
 use crate::project_commands::Verb;
 use crate::protocol::{
     Activity, Answer, ArchivedSession, Backlog, ForgeLink, Front, SessionInfo, Spending, State,
-    TaskBrief, TaskSpec, Worktree,
+    TaskBrief, TaskSpec, Worktree, task_label,
 };
+use crate::resources::Resources;
 use crate::shell;
-use crate::{backlog, names, plugins, tasks};
+use crate::{backlog, handoff, names, plugins, project, tasks};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
 use ratatui::layout::Rect;
+use std::cell::Cell;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -125,6 +129,9 @@ pub enum Hit {
     /// browser's is dragged: the column the mouse is at, counted from the
     /// view's left edge.
     ViewBorder(u16),
+    /// The footer's readout of the memory crystal takes, which opens the
+    /// RAM view.
+    Readout,
     /// The footer, or anywhere else.
     Elsewhere,
 }
@@ -148,6 +155,7 @@ pub enum View {
     Grep(Grep),
     Branches(Switcher),
     Memory(MemoryView),
+    Handoff(HandoffView),
 }
 
 /// What an open view's key asks for.
@@ -237,6 +245,9 @@ pub enum Question {
     /// Notes on what the flow run called this is to do differently,
     /// sending it back from its gate.
     SendFlowBack(String),
+    /// The directory of a project to put on the list of those crystal
+    /// knows.
+    AddProject,
 }
 
 /// A question on the footer line that `y` answers yes and any other key
@@ -256,6 +267,12 @@ pub enum Confirm {
         branch: String,
         force: bool,
     },
+    /// Remove the linked worktree at `path`, called `name`, which the
+    /// session just killed was the last in.
+    RemoveEmptied {
+        path: PathBuf,
+        name: String,
+    },
     /// Close the tab in front, tab `number`, and kill the sessions in it.
     CloseTab {
         number: usize,
@@ -266,6 +283,14 @@ pub enum Confirm {
     ForgetProject {
         path: PathBuf,
         name: String,
+    },
+    /// Quit the TUI, the sessions carrying on in the daemon.
+    Quit,
+    /// Make the directory `dir` a git repository, and first the directory,
+    /// with `create`, then put it on the list of projects.
+    NewProject {
+        dir: PathBuf,
+        create: bool,
     },
 }
 
@@ -288,6 +313,9 @@ impl Confirm {
                 force: true,
                 ..
             } => format!("{branch} has uncommitted changes: remove it and lose them? y/n"),
+            Confirm::RemoveEmptied { name, .. } => {
+                format!("nothing else is in worktree {name}: remove it too? y/n")
+            }
             Confirm::CloseTab { number, sessions } => {
                 let count = sessions.len();
                 let noun = if count == 1 { "session" } else { "sessions" };
@@ -295,6 +323,16 @@ impl Confirm {
             }
             Confirm::ForgetProject { name, .. } => {
                 format!("take {name} off the list? Nothing on disk changes. y/n")
+            }
+            Confirm::Quit => "quit crystal? The sessions keep running. y/n".to_string(),
+            // The directory last, where a long one cut short loses least.
+            Confirm::NewProject { dir, create: true } => {
+                let dir = shell::home_relative(dir);
+                format!("make a new git repository and add it: {dir}? y/n")
+            }
+            Confirm::NewProject { dir, create: false } => {
+                let dir = shell::home_relative(dir);
+                format!("make it a git repository and add it: {dir}? y/n")
             }
         }
     }
@@ -314,8 +352,15 @@ impl Confirm {
                 branch,
                 force,
             },
+            Confirm::RemoveEmptied { path, name } => Action::RemoveWorktree {
+                path,
+                branch: name,
+                force: false,
+            },
             Confirm::CloseTab { sessions, .. } => Action::KillAll(sessions),
             Confirm::ForgetProject { path, .. } => Action::ForgetProject(path),
+            Confirm::Quit => Action::Quit,
+            Confirm::NewProject { dir, create } => Action::NewProject { dir, create },
         }
     }
 }
@@ -408,6 +453,19 @@ pub enum Action {
     /// Take the project whose main worktree is this off the list of those
     /// crystal knows.
     ForgetProject(PathBuf),
+    /// Put the project in this directory on the list of those crystal
+    /// knows, once it's one: a directory that isn't there, or isn't in a
+    /// git repository, is asked about first.
+    AddProject(PathBuf),
+    /// Make the directory `dir` a git repository, and first the directory,
+    /// with `create`, then put it on the list of projects.
+    NewProject {
+        dir: PathBuf,
+        create: bool,
+    },
+    /// Finish the directory typed so far as the answer to the question
+    /// asked, as Tab does in a shell.
+    CompleteDirectory(String),
     /// Run the project's run command in `worktree`, or stop it, or its open
     /// command there.
     ProjectCommand {
@@ -622,24 +680,32 @@ pub enum Action {
         agent: crate::integration::Agent,
         install: bool,
     },
-    /// Turn the plugin called `name` on, or off, in the config file.
+    /// Turn the plugin called `name` on, or off, in the config file: the
+    /// user's own, or the one the project whose main worktree is `project`
+    /// ships, for that project.
     SwitchPlugin {
         name: String,
+        project: Option<PathBuf>,
         on: bool,
     },
-    /// Run one of an installed plugin's actions, about `context`.
+    /// Run one of a plugin's actions, about `context`: an installed
+    /// plugin's, or a project's.
     RunPlugin {
         plugin: String,
+        project: Option<PathBuf>,
         action: String,
         context: plugins::Context,
     },
-    /// Start one of an installed plugin's panes, and show it over the
-    /// panes.
+    /// Start one of a plugin's panes, and show it where it goes.
     OpenPluginPane {
         plugin: String,
+        project: Option<PathBuf>,
         pane: String,
         context: plugins::Context,
     },
+    /// Show a session started already over the panes, as a plugin's pane:
+    /// one `crystal plugin pane open` started.
+    ShowPluginPane(PluginPane),
     /// Run one of the user's `[[keys.command]]`s, about `context`: in a
     /// popup, in a session in `dir` (the pane or tab it's in made ready
     /// already), or in the background.
@@ -660,14 +726,29 @@ pub enum Action {
     /// Put the tabs back the way this layout has them.
     RestoreLayout(Which),
     RemoveLayout(Which),
-    /// The timeline has opened: read the newest page of the event log for
-    /// it, then follow the log as it grows.
-    FollowEvents,
+    /// The timeline has opened, or been switched to another scope: read
+    /// the newest page of the event log of this scope for it, then follow
+    /// the log as it grows.
+    FollowEvents(Scope),
     /// The timeline has closed: stop following the log.
     StopFollowing,
-    /// Read the page of the event log before the event with this `seq`,
-    /// for the timeline.
-    ReadOlderEvents(u64),
+    /// The RAM view has opened: look at what the sessions take often.
+    OpenRam,
+    /// The RAM view has closed: look only as often as the footer needs.
+    CloseRam,
+    /// Read the page of the event log of `scope` before the event with
+    /// this `seq`, for the timeline.
+    ReadOlderEvents {
+        scope: Scope,
+        before: u64,
+    },
+    /// Look for the worktree's handoff file and read the files task `task`
+    /// kept, for the handoff view on `session`.
+    ReadHandoff {
+        session: String,
+        worktree: Option<PathBuf>,
+        task: Option<u64>,
+    },
 }
 
 impl Action {
@@ -692,17 +773,17 @@ pub struct PluginKey {
     pub title: String,
 }
 
-/// A plugin's pane, open over the panes: a session of its own, which ends
-/// when the pane closes. A `[[keys.command]]` popup is one too, with no
-/// plugin.
+/// A plugin's pane, open over the panes or in a popup: a session of its
+/// own, which ends when the pane closes. A `[[keys.command]]` popup is one
+/// too, with no plugin.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PluginPane {
     pub plugin: String,
     pub title: String,
     /// The session's name.
     pub session: String,
-    /// A popup's width and height: a plugin's pane takes all the room
-    /// beside the sidebar.
+    /// A popup's width and height: a pane over the others takes all the
+    /// room beside the sidebar.
     pub popup: Option<Popup>,
 }
 
@@ -716,11 +797,13 @@ pub struct Popup {
 }
 
 impl PluginPane {
-    /// What its frame says on top.
+    /// What its frame says on top: its plugin, if it has one, and its
+    /// title.
     pub fn heading(&self) -> String {
-        match self.popup {
-            Some(_) => format!(" {} ", self.title),
-            None => format!(" {} · {} ", self.plugin, self.title),
+        if self.plugin.is_empty() {
+            format!(" {} ", self.title)
+        } else {
+            format!(" {} · {} ", self.plugin, self.title)
         }
     }
 }
@@ -807,6 +890,9 @@ pub struct App {
     /// commit each is at, by its directory, as git last said: what the
     /// sidebar names one by.
     subjects: HashMap<PathBuf, String>,
+    /// The labels each project's linked worktrees were given, by their
+    /// directories, as git was last asked: what the sidebar names one by.
+    labels: HashMap<PathBuf, HashMap<PathBuf, String>>,
     /// What git last counted of each worktree the sidebar shows, by its
     /// directory: its changes not committed, and how far its branch is from
     /// its upstream.
@@ -821,10 +907,14 @@ pub struct App {
     /// listed them: those with no sessions stay in the sidebar, and the
     /// new-session panel offers them all.
     known: Vec<Worktree>,
-    /// The worktrees the daemon is removing, by their directories: their
-    /// lines say so, and `W` leaves them be until the daemon says it's
-    /// done.
+    /// The worktrees the daemon is removing for this TUI, by their
+    /// directories: their lines say so, and `W` leaves them be until the
+    /// daemon says it's done.
     removing: HashSet<PathBuf>,
+    /// The worktrees the daemon said it was removing when last asked,
+    /// whoever asked for them, another TUI or `crystal worktree rm`: their
+    /// lines say so too, and `W` leaves them be as well.
+    removals: HashSet<PathBuf>,
     /// The question on the footer line, while one is being answered.
     prompt: Option<Prompt>,
     /// The new-session panel, while it's open.
@@ -928,6 +1018,9 @@ pub struct App {
     /// Whether draft pull requests are left out of the pull requests view,
     /// the tab bar's count and `/`, as the settings say.
     hide_draft_prs: bool,
+    /// Where new worktrees go, when the settings say: `[worktrees]
+    /// directory`.
+    worktree_directory: Option<PathBuf>,
     /// The issues view, while it's open.
     issues: Option<IssuesView>,
     /// The pull requests view, while it's open.
@@ -945,6 +1038,10 @@ pub struct App {
     memory_on: bool,
     /// Whether tasks are on: closing them, and showing how they stand.
     tasks_on: bool,
+    /// Whether `q` asks before it quits: see [`Config::confirm_quit`].
+    confirm_quit: bool,
+    /// Whether the handoff file is on: the notes `M` reads.
+    handoff_on: bool,
     /// Whether the backlog is on: its view, and its counts in the sidebar.
     backlog_on: bool,
     /// Whether the github plugin is on: pull requests on worktree lines,
@@ -988,6 +1085,13 @@ pub struct App {
     timeline: Option<TimelineView>,
     /// The list of everything waiting on the user, while it's open.
     needs_you: Option<NeedsYouView>,
+    /// The RAM view, while it's open.
+    ram: Option<RamView>,
+    /// What the daemon last found crystal's processes take.
+    resources: Option<Resources>,
+    /// Where the footer last drew its readout of that, for a click on it;
+    /// `None` while something else has the footer.
+    readout_at: Cell<Option<Rect>>,
     /// What happened while the user was away, and since when, until the
     /// timeline is opened at that point.
     away: Option<Away>,
@@ -1086,11 +1190,13 @@ impl App {
             on_worktree: None,
             worktrees: HashMap::new(),
             subjects: HashMap::new(),
+            labels: HashMap::new(),
             stats: HashMap::new(),
             stats_due: HashSet::new(),
             folded: BTreeSet::new(),
             known: Vec::new(),
             removing: HashSet::new(),
+            removals: HashSet::new(),
             prompt: None,
             launcher: None,
             launch_draft: None,
@@ -1128,13 +1234,16 @@ impl App {
             issues_asked: HashMap::new(),
             issue_edits: HashMap::new(),
             hide_draft_prs: false,
+            worktree_directory: None,
             issues: None,
             pull_requests_view: None,
             view: None,
             diff_tree: false,
             switching: HashSet::new(),
             memory_on: true,
+            handoff_on: true,
             tasks_on: true,
+            confirm_quit: true,
             backlog_on: true,
             github_on: true,
             plugins_view: None,
@@ -1154,6 +1263,9 @@ impl App {
             server: None,
             timeline: None,
             needs_you: None,
+            ram: None,
+            resources: None,
+            readout_at: Cell::new(None),
             away: None,
             away_shown: false,
             restarts: Restarts::default(),
@@ -1325,12 +1437,15 @@ impl App {
     /// Takes which of crystal's plugins the config has on.
     pub fn set_features(&mut self, config: &Config) {
         self.tasks_on = tasks::enabled(config);
+        self.confirm_quit = config.confirm_quit;
         self.backlog_on = backlog::enabled(config);
         self.memory_on = crate::memory::enabled(config);
+        self.handoff_on = handoff::enabled(config);
         self.profiles_on = profile::enabled(config);
         self.github_on = forge::enabled(config);
         self.hide_draft_prs = config.forge.hide_draft_prs;
         self.flows_on = flows::enabled(config);
+        self.worktree_directory = config.worktrees.directory();
     }
 
     /// Whether the TUI asks the forge about the sessions' projects.
@@ -1345,6 +1460,7 @@ impl App {
             "tasks" => self.tasks_on,
             "backlog" => self.backlog_on,
             "memory" => self.memory_on,
+            "handoff" => self.handoff_on,
             "profiles" => self.profiles_on,
             "github" => self.github_on,
             "flows" => self.flows_on,
@@ -1667,6 +1783,7 @@ impl App {
         match &mut self.view {
             Some(View::Files(finder)) => finder.preview_read(dir, path, read),
             Some(View::Tree(tree)) => tree.preview_read(dir, path, read),
+            Some(View::Handoff(view)) => view.preview_read(dir, path, read),
             _ => {}
         }
     }
@@ -1779,6 +1896,7 @@ impl App {
             Some(View::Grep(grep)) => grep.set_size(list),
             Some(View::Branches(switcher)) => switcher.set_size(list),
             Some(View::Memory(memory)) => memory.set_size(list),
+            Some(View::Handoff(view)) => view.set_size(content),
             None => {}
         }
     }
@@ -1789,6 +1907,34 @@ impl App {
 
     pub fn timeline_view(&self) -> Option<&TimelineView> {
         self.timeline.as_ref()
+    }
+
+    /// The RAM view, while it's open.
+    pub fn ram_view(&self) -> Option<&RamView> {
+        self.ram.as_ref()
+    }
+
+    /// What the daemon last found crystal's processes take, once it has.
+    pub fn resources(&self) -> Option<&Resources> {
+        self.resources.as_ref()
+    }
+
+    /// Takes what the daemon found crystal's processes take now.
+    pub fn set_resources(&mut self, resources: Resources) {
+        if let Some(view) = &mut self.ram {
+            view.refresh(ram_view::rows(&resources, &self.sessions));
+        }
+        self.resources = Some(resources);
+    }
+
+    /// Where the footer drew its readout this time, if it did.
+    pub fn drew_readout(&self, at: Option<Rect>) {
+        self.readout_at.set(at);
+    }
+
+    /// Where the footer last drew its readout, if it did.
+    pub fn readout_at(&self) -> Option<Rect> {
+        self.readout_at.get()
     }
 
     pub fn needs_you_view(&self) -> Option<&NeedsYouView> {
@@ -1838,11 +1984,11 @@ impl App {
             _ => None,
         };
         view.read(page);
-        let older = view.wants_older(false);
+        let older = read_older(view, false);
         if let Some(failed) = failed {
             self.notify(failed);
         }
-        older.map(Action::ReadOlderEvents)
+        older
     }
 
     /// Takes an event that has just happened, for the timeline.
@@ -2021,7 +2167,9 @@ impl App {
         }
         let mut empty = self.empty_worktrees();
         empty.retain(|worktree| {
-            search::worktree_match(query, worktree, self.subject_of(&worktree.path))
+            let path = &worktree.path;
+            let also = self.subject_of(path).or_else(|| self.label_of(path));
+            search::worktree_match(query, worktree, also)
         });
         let mut projects: Vec<&PathBuf> = empty.iter().map(|w| &w.project_path).collect();
         projects.extend(self.pull_requests.keys());
@@ -2205,6 +2353,24 @@ impl App {
         self.subjects.get(path).map(String::as_str)
     }
 
+    /// Takes the labels the linked worktrees of `project` were given, by
+    /// their directories, in place of those known before.
+    pub fn set_labels(&mut self, project: &Path, labels: HashMap<PathBuf, String>) {
+        if labels.is_empty() {
+            self.labels.remove(project);
+        } else {
+            self.labels.insert(project.to_path_buf(), labels);
+        }
+    }
+
+    /// The label the worktree at `path` was given, if it has one.
+    pub fn label_of(&self, path: &Path) -> Option<&str> {
+        self.labels
+            .values()
+            .find_map(|labels| labels.get(path))
+            .map(String::as_str)
+    }
+
     /// Takes what git counted of the worktree at `path`, or forgets it when
     /// git couldn't say.
     pub fn set_stat(&mut self, path: PathBuf, stat: Option<git::Stat>) {
@@ -2323,6 +2489,7 @@ impl App {
     /// rather than when git is next asked.
     pub fn worktree_removed(&mut self, path: &Path) {
         self.removing.remove(path);
+        self.removals.remove(path);
         for linked in self.worktrees.values_mut() {
             linked.retain(|worktree| worktree.path != path);
         }
@@ -2333,12 +2500,24 @@ impl App {
     /// can be asked about again.
     pub fn worktree_not_removed(&mut self, path: &Path, reason: String) {
         self.removing.remove(path);
+        self.removals.remove(path);
         self.notify(reason);
     }
 
-    /// Whether the daemon is removing the worktree at `path`.
+    /// Takes the worktrees the daemon is removing, whoever asked, and says
+    /// whether one it was removing before is done with, gone or not, for
+    /// the event loop to have git list the worktrees again.
+    pub fn set_removals(&mut self, worktrees: Vec<PathBuf>) -> bool {
+        let removals: HashSet<PathBuf> = worktrees.into_iter().collect();
+        let done = self.removals.difference(&removals).next().is_some();
+        self.removals = removals;
+        done
+    }
+
+    /// Whether the daemon is removing the worktree at `path`, for this TUI
+    /// or for anyone else.
     pub fn removing(&self, path: &Path) -> bool {
-        self.removing.contains(path)
+        self.removing.contains(path) || self.removals.contains(path)
     }
 
     /// The linked worktree with no sessions the selection is on, if it's
@@ -3407,8 +3586,15 @@ impl App {
             }
             // The daemon removes a worktree; its line says so until the
             // daemon says it's done.
-            if let Confirm::RemoveWorktree { path, .. } = &confirm {
+            if let Confirm::RemoveWorktree { path, .. } | Confirm::RemoveEmptied { path, .. } =
+                &confirm
+            {
                 self.removing.insert(path.clone());
+            }
+            // Killing the last session in a worktree leaves it with nothing
+            // in it: the next question is whether it goes too.
+            if let Confirm::Kill(name) = &confirm {
+                self.confirm = self.emptied_by_killing(name);
             }
             return Some(confirm.action());
         }
@@ -3462,6 +3648,9 @@ impl App {
         if self.needs_you.is_some() {
             return self.on_needs_you_key(key);
         }
+        if self.ram.is_some() {
+            return self.on_ram_key(key);
+        }
         if self.timeline.is_some() {
             return self.on_timeline_key(key);
         }
@@ -3509,6 +3698,7 @@ impl App {
                 View::Grep(grep) => grep.on_mouse(kind, hit),
                 View::Branches(switcher) => switcher.on_mouse(kind, hit),
                 View::Memory(memory) => memory.on_mouse(kind, hit),
+                View::Handoff(view) => view.on_mouse(kind, hit),
             };
             return self.follow(outcome);
         }
@@ -3636,6 +3826,7 @@ impl App {
         }
         match (kind, hit) {
             (_, Hit::Tab(index)) if click => self.go_to_tab(index),
+            (_, Hit::Readout) if click => return Some(self.open_ram()),
             (_, Hit::SidebarRow(row)) if click => self.click_row(row),
             // Anywhere else in the sidebar, the click only takes the keyboard.
             (_, Hit::Sidebar) if click => self.focus = Focus::Sidebar,
@@ -3860,6 +4051,7 @@ impl App {
             items.push(Item::new("copy mode", Command::Copy));
             items.push(Item::new("edit its history", Command::EditHistory));
         }
+        items.push(Item::new("start one like it", Command::Duplicate));
         items.push(Item::new("rename", Command::Rename));
         items.push(Item::new("move to another tab", Command::MoveToTab));
         if session.worktree.is_some() {
@@ -3881,6 +4073,15 @@ impl App {
         if session.front == Some(Front::Task) {
             items.push(Item::new("open it in a terminal", Command::TaskToTerminal));
         }
+        items.push(Item::new("its timeline", Command::SessionTimeline));
+        let task = session.task.as_ref().and_then(|task| task.id);
+        let task = task.filter(|_| self.tasks_on);
+        if task.is_some() {
+            items.push(Item::new("its task's timeline", Command::TaskTimeline));
+        }
+        if task.is_some() || (self.handoff_on && session.worktree.is_some()) {
+            items.push(Item::new("its handoff notes and files", Command::Handoff));
+        }
         items.push(Item::new("archive it", Command::Archive));
         items.push(Item::danger("kill it", Command::Kill));
         Some(items)
@@ -3897,6 +4098,7 @@ impl App {
             Item::new("what changed", Command::Diff),
             Item::new("find a file", Command::FindFile),
             Item::new("browse its files", Command::FileTree),
+            Item::new("the project's timeline", Command::ProjectTimeline),
         ];
         items.push(if main {
             Item::danger("take the project off the list", Command::RemoveWorktree)
@@ -3924,6 +4126,7 @@ impl App {
         if self.memory_on {
             items.push(Item::new("what it remembers", Command::Memory));
         }
+        items.push(Item::new("its timeline", Command::ProjectTimeline));
         items.push(match self.folded_selection() {
             Some(_) => Item::new("unfold it", Command::UnfoldProject),
             None => Item::new("fold it to its heading", Command::FoldProject),
@@ -3940,6 +4143,7 @@ impl App {
             || self.command_list.is_some()
             || self.timeline.is_some()
             || self.needs_you.is_some()
+            || self.ram.is_some()
             || self.issues.is_some()
             || self.pull_requests_view.is_some()
             || self.backlog.is_some()
@@ -4060,6 +4264,7 @@ impl App {
             let (plugin, action) = (plugin.to_string(), action.to_string());
             return Some(Action::RunPlugin {
                 plugin,
+                project: None,
                 action,
                 context,
             });
@@ -4137,6 +4342,8 @@ impl App {
             Command::PageDown => return Some(Action::PageForward(self.selected_slot()?)),
             Command::NewSession => return self.open_launcher(false),
             Command::NewWorktree => return self.open_launcher(true),
+            Command::Duplicate => return self.duplicate(),
+            Command::AddProject => self.ask_for_project(),
             Command::RemoveWorktree => self.ask_to_remove_worktree(),
             Command::Rename => self.ask_for_name(),
             Command::Kill => self.confirm = Some(Confirm::Kill(self.selected()?.name.clone())),
@@ -4149,6 +4356,25 @@ impl App {
             Command::NextNeedingYou => self.select_next_needing_user(),
             Command::NeedsYou => self.open_needs_you(),
             Command::Timeline => return Some(self.open_timeline()),
+            // On a folded project's heading, it's the project's.
+            Command::SessionTimeline if self.folded_selection().is_some() => {
+                let none = "select a session to see its timeline";
+                return self.open_scoped_timeline(|scope| matches!(scope, Scope::Project(_)), none);
+            }
+            Command::SessionTimeline => {
+                let none = "select a session to see its timeline";
+                return self.open_scoped_timeline(|_| true, none);
+            }
+            Command::TaskTimeline if self.tasks_on => {
+                let none = "the selected session has no task with a number";
+                return self.open_scoped_timeline(|scope| matches!(scope, Scope::Task(_)), none);
+            }
+            Command::TaskTimeline => self.notify(plugins::off("tasks")),
+            Command::ProjectTimeline => {
+                let none = "select a session to see its project's timeline";
+                return self.open_scoped_timeline(|scope| matches!(scope, Scope::Project(_)), none);
+            }
+            Command::Handoff => return self.open_handoff(),
             Command::Diff => return self.open_diff(),
             Command::FindFile => return self.open_finder(),
             Command::FileTree => return self.open_tree_browser(),
@@ -4180,6 +4406,8 @@ impl App {
                 self.settings = Some(SettingsView::new());
                 return Some(Action::OpenSettings);
             }
+            Command::Ram => return Some(self.open_ram()),
+            Command::Quit if self.confirm_quit => self.confirm = Some(Confirm::Quit),
             Command::Quit => return Some(Action::Quit),
         }
         None
@@ -4234,6 +4462,7 @@ impl App {
                     Pick::Command(command) => self.run(command),
                     Pick::Plugin { plugin, action } => Some(Action::RunPlugin {
                         plugin,
+                        project: None,
                         action,
                         context: self.selected_context(),
                     }),
@@ -4316,6 +4545,7 @@ impl App {
     fn run_plugin_action(&self, taken: &PluginKey) -> Option<Action> {
         Some(Action::RunPlugin {
             plugin: taken.plugin.clone(),
+            project: None,
             action: taken.action.clone(),
             context: self.selected_context(),
         })
@@ -4328,7 +4558,7 @@ impl App {
 
     /// What a plugin's action or pane is told about where it was run from:
     /// the selected session. With none, the event loop says where.
-    fn selected_context(&self) -> plugins::Context {
+    pub fn selected_context(&self) -> plugins::Context {
         self.selected()
             .map(plugins::Context::of_session)
             .unwrap_or_default()
@@ -4358,17 +4588,33 @@ impl App {
                 self.plugins_view = None;
                 None
             }
-            plugins_view::Outcome::Switch { name, on } => Some(Action::SwitchPlugin { name, on }),
-            plugins_view::Outcome::Run { plugin, action } => Some(Action::RunPlugin {
+            plugins_view::Outcome::Switch { name, project, on } => {
+                Some(Action::SwitchPlugin { name, project, on })
+            }
+            plugins_view::Outcome::Run {
                 plugin,
+                project,
+                action,
+            } => Some(Action::RunPlugin {
+                plugin,
+                project,
                 action,
                 context: self.selected_context(),
             }),
-            plugins_view::Outcome::Open { plugin, pane } => Some(Action::OpenPluginPane {
+            // Wherever the pane opens, the view makes way for it.
+            plugins_view::Outcome::Open {
                 plugin,
+                project,
                 pane,
-                context: self.selected_context(),
-            }),
+            } => {
+                self.plugins_view = None;
+                Some(Action::OpenPluginPane {
+                    plugin,
+                    project,
+                    pane,
+                    context: self.selected_context(),
+                })
+            }
         }
     }
 
@@ -4461,6 +4707,50 @@ impl App {
         Some(read)
     }
 
+    /// `M`: opens the handoff view on the selected session: its worktree's
+    /// notes, while the handoff file is on, and the files its task kept,
+    /// while tasks are; and has them looked for. Without either, the footer
+    /// says why.
+    fn open_handoff(&mut self) -> Option<Action> {
+        if !self.handoff_on && !self.tasks_on {
+            self.notify(plugins::off("handoff"));
+            return None;
+        }
+        let Some(selected) = self.selected() else {
+            self.notify("select a session to read what it left".into());
+            return None;
+        };
+        let worktree = selected.worktree.as_ref().filter(|_| self.handoff_on);
+        let task = selected.task.as_ref().and_then(|task| task.id);
+        let task = task.filter(|_| self.tasks_on);
+        if worktree.is_none() && task.is_none() {
+            let notice = format!(
+                "{} leaves no notes: it isn't in a git worktree, and has no task",
+                selected.name
+            );
+            self.notify(notice);
+            return None;
+        }
+        let place = match &selected.worktree {
+            Some(worktree) => worktree_label(worktree),
+            None => shell::home_relative(&selected.cwd),
+        };
+        let worktree = worktree.map(|worktree| worktree.path.clone());
+        let view = HandoffView::new(selected.name.clone(), place, worktree, task);
+        let read = view.read();
+        self.view = Some(View::Handoff(view));
+        Some(read)
+    }
+
+    /// Takes what was found for the handoff view on `session`, while it's
+    /// open, and asks for the first file's preview.
+    pub fn handoff_found(&mut self, session: &str, found: handoff_view::Found) -> Option<Action> {
+        match &mut self.view {
+            Some(View::Handoff(view)) => view.found(session, found),
+            _ => None,
+        }
+    }
+
     /// The selected session's worktree, or the worktree with no sessions
     /// the selection is on, and its project and branch the way a view's
     /// header names them: `payments ⎇ fix/login`. When a session isn't in
@@ -4514,6 +4804,7 @@ impl App {
                 View::Diff(diff) => diff.typing(),
                 View::Memory(memory) => memory.typing(),
                 View::Files(_) | View::Tree(_) | View::Grep(_) | View::Branches(_) => true,
+                View::Handoff(_) => false,
             };
             return Some((typing, false));
         }
@@ -4550,6 +4841,9 @@ impl App {
         if self.needs_you.is_some() {
             return Some((false, true));
         }
+        if self.ram.is_some() {
+            return Some((false, false));
+        }
         if self.timeline.is_some() {
             return Some((true, false));
         }
@@ -4571,6 +4865,7 @@ impl App {
             View::Grep(grep) => grep.on_key(key),
             View::Branches(switcher) => switcher.on_key(key),
             View::Memory(memory) => memory.on_key(key),
+            View::Handoff(view) => view.on_key(key),
         };
         self.follow(outcome)
     }
@@ -4598,6 +4893,7 @@ impl App {
                     View::Files(finder) => finder.dir,
                     View::Tree(tree) => tree.dir,
                     View::Grep(grep) => grep.dir,
+                    View::Handoff(view) => view.selected()?.dir.clone(),
                     _ => return None,
                 };
                 let name = self.free_name(&edit_name(&path));
@@ -4714,6 +5010,39 @@ impl App {
             let notice = format!("{} still running in {branch}", running.join(", "));
             self.notify(notice);
         }
+    }
+
+    /// What to ask about the worktree killing the session called `name`
+    /// leaves with nothing in it, if it does: a linked worktree, not one
+    /// Claude Code made for itself, with no other session in it, in any
+    /// tab, running or not, that the daemon isn't removing already.
+    fn emptied_by_killing(&self, name: &str) -> Option<Confirm> {
+        let killed = self.sessions.iter().find(|session| session.name == name)?;
+        let worktree = killed.worktree.as_ref()?;
+        if worktree.main || worktree.claude_codes_own() || self.removing(&worktree.path) {
+            return None;
+        }
+        let others = self.sessions.iter().any(|session| {
+            session.name != name
+                && session
+                    .worktree
+                    .as_ref()
+                    .is_some_and(|w| w.path == worktree.path)
+        });
+        if others {
+            return None;
+        }
+        let name = match self.label_of(&worktree.path) {
+            Some(label) => label.to_string(),
+            None => worktree
+                .branch
+                .clone()
+                .unwrap_or_else(|| "(detached)".to_string()),
+        };
+        Some(Confirm::RemoveEmptied {
+            path: worktree.path.clone(),
+            name,
+        })
     }
 
     /// Asks before removing the worktree at `path`, on `branch`, unless the
@@ -5290,6 +5619,26 @@ impl App {
         self.codex_models_wanted()
     }
 
+    /// `D`: the new-session panel, set to start a session like the selected
+    /// one, where it runs; for a program the panel doesn't start, the
+    /// command line, holding the program's.
+    fn duplicate(&mut self) -> Option<Action> {
+        let Some(session) = self.selected().cloned() else {
+            self.notify("select the session to start one like".into());
+            return None;
+        };
+        let background = session.front == Some(Front::Task);
+        let like = Launcher::new(self.launch_setup(false)).like(&session.command, background);
+        let Some(launcher) = like else {
+            let line: Vec<String> = session.command.iter().map(|a| shell::quote(a)).collect();
+            let place = Place::Directory(Some(session.cwd.clone()));
+            self.ask(Question::Command(place), &line.join(" "));
+            return None;
+        };
+        self.launcher = Some(launcher);
+        self.codex_models_wanted()
+    }
+
     /// What the panel opens with: what can run, with what to pick first,
     /// where it can start, and the tasks given before.
     fn launch_setup(&self, worktree: bool) -> Setup {
@@ -5333,6 +5682,7 @@ impl App {
             codex_models: self.codex_models.clone().unwrap_or_default(),
             background: self.tasks_on,
             branch: names::random(),
+            worktree_directory: self.worktree_directory.clone(),
         }
     }
 
@@ -5551,7 +5901,7 @@ impl App {
             view.on_paste(&text);
         } else if let Some(prompt) = &mut self.prompt {
             prompt.input.insert_str(&text);
-        } else if self.needs_you.is_some() {
+        } else if self.needs_you.is_some() || self.ram.is_some() {
             return None;
         } else if let Some(view) = &mut self.timeline {
             view.on_paste(&text);
@@ -5595,6 +5945,11 @@ impl App {
                 let prompt = self.prompt.take()?;
                 self.answer(prompt)
             }
+            KeyCode::Tab => {
+                let prompt = self.prompt.as_ref()?;
+                (prompt.question == Question::AddProject)
+                    .then(|| Action::CompleteDirectory(prompt.input.text().to_string()))
+            }
             _ => {
                 if let Some(prompt) = &mut self.prompt {
                     prompt.input.on_key(&key);
@@ -5602,6 +5957,52 @@ impl App {
                 None
             }
         }
+    }
+
+    /// `+`: asks for the directory of a project to add, starting in the one
+    /// the selection's project, or else the TUI, is in, for a project
+    /// beside it.
+    fn ask_for_project(&mut self) {
+        let project = self.selection_worktree().map(|w| w.project_path.clone());
+        let beside = project.or_else(|| self.start_dir.clone());
+        let parent = beside.as_deref().and_then(Path::parent);
+        let start = match parent.map(shell::home_relative) {
+            Some(parent) if parent.ends_with('/') => parent,
+            Some(parent) => format!("{parent}/"),
+            None => String::new(),
+        };
+        self.ask(Question::AddProject, &start);
+    }
+
+    /// Takes `completed` as the directory typed so far, as Tab finished it.
+    pub fn complete_answer(&mut self, completed: &str) {
+        if let Some(prompt) = &mut self.prompt
+            && prompt.question == Question::AddProject
+        {
+            prompt.input = TextInput::with_text(completed);
+        }
+    }
+
+    /// Asks before making `dir`, which isn't a git repository, one, and
+    /// with `create`, the directory too, which isn't there.
+    pub fn confirm_new_project(&mut self, dir: PathBuf, create: bool) {
+        self.confirm = Some(Confirm::NewProject { dir, create });
+    }
+
+    /// The project whose main worktree is `path` is on the list now, and
+    /// among the projects known: the selection goes to it, and the footer
+    /// says so.
+    pub fn project_added(&mut self, path: &Path) {
+        let name = crate::project::name_of(path);
+        let has_sessions = self
+            .sessions
+            .iter()
+            .any(|s| s.worktree.as_ref().is_some_and(|w| w.project_path == path));
+        if !has_sessions {
+            self.select_worktree(path.to_path_buf());
+            self.keep_selection_on_a_row();
+        }
+        self.notify(format!("{name} is on the list of projects"));
     }
 
     /// What an answered question leads to: a command line, to a new
@@ -5635,6 +6036,12 @@ impl App {
                 summary: answer,
             }),
             Question::SendFlowBack(run) => Some(Action::SendFlowBack { run, notes: answer }),
+            Question::AddProject if answer.is_empty() => None,
+            Question::AddProject => {
+                let typed = answer.trim_end_matches('/');
+                let typed = if typed.is_empty() { "/" } else { typed };
+                Some(Action::AddProject(shell::expand_home(Path::new(typed))))
+            }
             Question::TabName => {
                 self.tabs.rename(&answer);
                 None
@@ -6404,22 +6811,94 @@ impl App {
         }
     }
 
-    /// `a`: opens the timeline, which marks what's new since the user was
-    /// away when the footer has just said what that was, and has the log
-    /// read for it.
+    /// `#`: opens the RAM view, on what the daemon last found, and has it
+    /// look more often while it's open.
+    fn open_ram(&mut self) -> Action {
+        let rows = self
+            .resources
+            .as_ref()
+            .map(|r| ram_view::rows(r, &self.sessions));
+        self.ram = Some(RamView::new(rows.unwrap_or_default()));
+        Action::OpenRam
+    }
+
+    /// Keys while the RAM view is open: all of them are its.
+    fn on_ram_key(&mut self, key: KeyEvent) -> Option<Action> {
+        match self.ram.as_mut()?.on_key(&key) {
+            ram_view::Step::Stay => None,
+            ram_view::Step::Close => {
+                self.ram = None;
+                Some(Action::CloseRam)
+            }
+            ram_view::Step::Go(name) => {
+                self.ram = None;
+                self.select(&name);
+                Some(Action::CloseRam)
+            }
+        }
+    }
+
+    /// `a`: opens the timeline of everything, which marks what's new
+    /// since the user was away when the footer has just said what that
+    /// was, and has the log read for it. Ctrl+S narrows it to the
+    /// selection's scopes.
     fn open_timeline(&mut self) -> Action {
         let after = self.away.take().map(|away| away.after);
-        self.timeline = Some(TimelineView::new(after));
-        Action::FollowEvents
+        let scopes = self.timeline_scopes();
+        let all = scopes.len() - 1;
+        self.timeline = Some(TimelineView::new(after, scopes, all));
+        Action::FollowEvents(Scope::All)
+    }
+
+    /// `I`, and the menus' timelines: opens the timeline of the first of
+    /// the selection's scopes `wanted` takes, or says `none` when there's
+    /// none.
+    fn open_scoped_timeline(&mut self, wanted: fn(&Scope) -> bool, none: &str) -> Option<Action> {
+        let scopes = self.timeline_scopes();
+        let Some(at) = scopes.iter().position(|scoped| wanted(&scoped.scope)) else {
+            self.notify(none.to_string());
+            return None;
+        };
+        let scope = scopes[at].scope.clone();
+        self.timeline = Some(TimelineView::new(None, scopes, at));
+        Some(Action::FollowEvents(scope))
+    }
+
+    /// The scopes a timeline opened on the selection goes through: the
+    /// selected session, its task, the project it's in, or the project of
+    /// the worktree with no sessions the selection is on; then everything.
+    fn timeline_scopes(&self) -> Vec<Scoped> {
+        let mut scopes = Vec::new();
+        let selected = self.selected();
+        if let Some(session) = selected {
+            let name = format!("session {}", session.name);
+            scopes.push(Scoped::new(Scope::Session(session.id.clone()), name));
+            if let Some(id) = session.task.as_ref().and_then(|task| task.id)
+                && self.tasks_on
+            {
+                let name = format!("task {}", task_label(Some(id)));
+                scopes.push(Scoped::new(Scope::Task(id), name));
+            }
+        }
+        let project = match self.selection_worktree() {
+            Some(worktree) => Some((worktree.project_path.clone(), worktree.project.clone())),
+            None => selected.map(|session| (session.cwd.clone(), project::name_of(&session.cwd))),
+        };
+        if let Some((path, name)) = project {
+            scopes.push(Scoped::new(Scope::Project(path), format!("project {name}")));
+        }
+        scopes.push(Scoped::everything());
+        scopes
     }
 
     /// Keys while the timeline is open: all of them are its.
     fn on_timeline_key(&mut self, key: KeyEvent) -> Option<Action> {
         let view = self.timeline.as_mut()?;
         match view.on_key(&key) {
-            timeline::Step::Stay => view.wants_older(true).map(Action::ReadOlderEvents),
+            timeline::Step::Stay => read_older(view, true),
             timeline::Step::Close => self.close_timeline(),
             timeline::Step::Go(event) => self.go_to_event(&event),
+            timeline::Step::Rescope => Some(Action::FollowEvents(view.scope().scope.clone())),
         }
     }
 
@@ -6555,6 +7034,14 @@ fn worktree_label(worktree: &crate::protocol::Worktree) -> String {
     let mark = if worktree.main { "⌂" } else { "⎇" };
     let branch = worktree.branch.as_deref().unwrap_or("(detached)");
     format!("{} {mark} {branch}", worktree.project)
+}
+
+/// What reading the timeline's log further back takes, when it wants that:
+/// see [`TimelineView::wants_older`].
+fn read_older(view: &mut TimelineView, asked: bool) -> Option<Action> {
+    let before = view.wants_older(asked)?;
+    let scope = view.scope().scope.clone();
+    Some(Action::ReadOlderEvents { scope, before })
 }
 
 /// What a session editing the file at `path` is called: the file's name,
@@ -6843,6 +7330,23 @@ mod tests {
     #[test]
     fn q_asks_to_quit() {
         let mut app = app_with(&["a"]);
+        assert_eq!(press(&mut app, KeyCode::Char('q')), None);
+        assert_eq!(app.confirm(), Some(&Confirm::Quit));
+        // Any key but `y` stays.
+        assert_eq!(press(&mut app, KeyCode::Char('j')), None);
+        assert_eq!(app.confirm(), None);
+        press(&mut app, KeyCode::Char('q'));
+        assert_eq!(press(&mut app, KeyCode::Char('y')), Some(Action::Quit));
+    }
+
+    #[test]
+    fn q_quits_at_once_when_the_settings_say_not_to_ask() {
+        let mut app = app_with(&["a"]);
+        let config = Config {
+            confirm_quit: false,
+            ..Config::default()
+        };
+        app.set_features(&config);
         assert_eq!(press(&mut app, KeyCode::Char('q')), Some(Action::Quit));
     }
 
@@ -6944,6 +7448,44 @@ mod tests {
         assert!(app.launcher().is_none());
         assert_eq!(app.memory().tasks, ["fix the login bug"]);
         assert_eq!(app.memory().last_run.as_deref(), Some("claude"));
+    }
+
+    #[test]
+    fn capital_d_opens_the_panel_like_the_selected_session_where_it_runs() {
+        let agent = SessionInfo {
+            command: vec!["claude".into(), "--model".into(), "opus".into()],
+            ..in_project("agent", "app")
+        };
+        let mut app = with_agents(&["codex", "claude"], vec![agent]);
+        press(&mut app, KeyCode::Char('D'));
+        assert_eq!(run_key(&app), "claude");
+        type_text(&mut app, "now the docs");
+        let place = Place::Directory(Some(PathBuf::from("/code/app")));
+        assert_eq!(
+            press(&mut app, KeyCode::Enter),
+            start(
+                place,
+                &["claude", "--model", "opus", "--", "now the docs"],
+                "now the docs"
+            )
+        );
+    }
+
+    #[test]
+    fn capital_d_on_a_program_the_panel_doesnt_start_asks_for_its_command_line() {
+        let program = SessionInfo {
+            command: vec!["tail".into(), "-f".into(), "my log".into()],
+            ..session("logs")
+        };
+        let mut app = with_agents(&["claude"], vec![program]);
+        press(&mut app, KeyCode::Char('D'));
+        assert!(app.launcher().is_none());
+        let prompt = app.prompt().unwrap();
+        assert_eq!(prompt.input.text(), "tail -f 'my log'");
+        assert_eq!(
+            prompt.question,
+            Question::Command(Place::Directory(Some(PathBuf::from("/"))))
+        );
     }
 
     #[test]
@@ -7540,6 +8082,61 @@ mod tests {
     }
 
     #[test]
+    fn killing_the_last_session_in_a_worktree_asks_whether_it_goes_too() {
+        let mut app = App::new(None);
+        app.set_sessions(vec![
+            in_worktree("planner", "main", State::Running),
+            in_worktree("fixer", "fix", State::Running),
+        ]);
+        app.select("fixer");
+        press(&mut app, KeyCode::Char('x'));
+        assert_eq!(
+            press(&mut app, KeyCode::Char('y')),
+            Some(Action::Kill("fixer".into()))
+        );
+        assert_eq!(
+            app.confirm().map(Confirm::question).as_deref(),
+            Some("nothing else is in worktree fix: remove it too? y/n")
+        );
+        assert_eq!(
+            press(&mut app, KeyCode::Char('y')),
+            Some(removal_of("fix", false))
+        );
+        assert!(app.removing(Path::new("/code/app.worktrees/fix")));
+    }
+
+    #[test]
+    fn the_emptied_worktree_stays_unless_it_s_a_yes() {
+        let mut app = App::new(None);
+        app.set_sessions(vec![in_worktree("fixer", "fix", State::Running)]);
+        app.select("fixer");
+        press(&mut app, KeyCode::Char('x'));
+        press(&mut app, KeyCode::Char('y'));
+        assert_eq!(press(&mut app, KeyCode::Char('n')), None);
+        assert_eq!(app.confirm(), None);
+        assert!(!app.removing(Path::new("/code/app.worktrees/fix")));
+    }
+
+    #[test]
+    fn a_worktree_with_something_left_in_it_or_the_main_one_isn_t_asked_about() {
+        let mut app = App::new(None);
+        app.set_sessions(vec![
+            in_worktree("fixer", "fix", State::Running),
+            in_worktree("tests", "fix", State::Exited { code: 0 }),
+            in_worktree("planner", "main", State::Running),
+        ]);
+        for name in ["fixer", "planner"] {
+            app.select(name);
+            press(&mut app, KeyCode::Char('x'));
+            assert_eq!(
+                press(&mut app, KeyCode::Char('y')),
+                Some(Action::Kill(name.into()))
+            );
+            assert_eq!(app.confirm(), None, "{name}");
+        }
+    }
+
+    #[test]
     fn shift_w_refuses_while_a_session_runs_in_the_worktree() {
         let mut app = App::new(None);
         app.set_sessions(vec![
@@ -7700,6 +8297,40 @@ mod tests {
             })
         );
         assert!(app.removing(old));
+    }
+
+    #[test]
+    fn a_worktree_someone_else_is_removing_says_so_until_the_daemon_is_done() {
+        let mut app = app_with_an_empty_worktree();
+        let old = Path::new("/code/app.worktrees/old");
+        // Asked for by another TUI, or `crystal worktree rm`.
+        assert!(!app.set_removals(vec![old.into()]));
+        assert!(app.removing(old));
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('W'));
+        assert_eq!(app.confirm(), None);
+        assert_eq!(app.notice(), Some("already removing old"));
+
+        assert!(!app.set_removals(vec![old.into()]), "still at it");
+        assert!(app.set_removals(Vec::new()), "done: git lists them again");
+        assert!(!app.removing(old));
+        assert!(!app.set_removals(Vec::new()));
+    }
+
+    #[test]
+    fn a_removal_this_tui_asked_for_says_so_before_the_daemon_lists_it() {
+        let mut app = app_with_an_empty_worktree();
+        let old = Path::new("/code/app.worktrees/old");
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('W'));
+        press(&mut app, KeyCode::Char('y'));
+        // Listed before the daemon was asked: git looks for changes first.
+        app.set_removals(Vec::new());
+        assert!(app.removing(old));
+
+        app.set_removals(vec![old.into()]);
+        app.worktree_removed(old);
+        assert!(!app.removing(old), "done, though the daemon listed it");
     }
 
     #[test]
@@ -11204,6 +11835,111 @@ gate = true
         assert_eq!(app.tabs().current_index(), 0);
     }
 
+    fn resources(sessions: &[(&str, u64)]) -> Resources {
+        use crate::resources::{SessionUsage, Usage};
+        Resources {
+            daemon: Usage {
+                pid: 1,
+                bytes: 20 << 20,
+                processes: 1,
+            },
+            client: None,
+            sessions: sessions
+                .iter()
+                .map(|(name, mb)| SessionUsage {
+                    name: name.to_string(),
+                    usage: Usage {
+                        pid: 2,
+                        bytes: mb << 20,
+                        processes: 3,
+                    },
+                })
+                .collect(),
+            total: 16 << 30,
+        }
+    }
+
+    #[test]
+    fn hash_shows_what_each_session_takes_and_enter_goes_there() {
+        let mut app = app_with(&["small", "big"]);
+        app.set_resources(resources(&[("small", 30), ("big", 600)]));
+        assert_eq!(press(&mut app, KeyCode::Char('#')), Some(Action::OpenRam));
+        let row = app.ram_view().unwrap().highlighted().unwrap();
+        assert_eq!(row.name, "big");
+        // A new look reorders the rows; the bar stays on its session.
+        app.set_resources(resources(&[("small", 900), ("big", 600)]));
+        assert_eq!(app.ram_view().unwrap().highlighted().unwrap().name, "big");
+        // Its keys are the view's: in the sidebar, `x` would ask to kill.
+        press(&mut app, KeyCode::Char('x'));
+        assert!(app.confirm().is_none());
+        press(&mut app, KeyCode::Char('k'));
+        assert_eq!(press(&mut app, KeyCode::Enter), Some(Action::CloseRam));
+        assert!(app.ram_view().is_none());
+        assert_eq!(selected_name(&app), Some("small"));
+    }
+
+    #[test]
+    fn a_click_on_the_footer_s_readout_opens_the_ram_view() {
+        let mut app = app_with(&["a"]);
+        app.set_resources(resources(&[("a", 30)]));
+        let click = MouseEventKind::Down(MouseButton::Left);
+        assert_eq!(app.on_mouse(click, Hit::Readout), Some(Action::OpenRam));
+        assert!(app.ram_view().is_some());
+        assert_eq!(press(&mut app, KeyCode::Esc), Some(Action::CloseRam));
+    }
+
+    #[test]
+    fn plus_asks_for_a_project_beside_this_one_and_tab_finishes_the_directory() {
+        let mut app = with_agents(&["claude"], vec![in_project("agent", "app")]);
+        press(&mut app, KeyCode::Char('+'));
+        let prompt = app.prompt().unwrap();
+        assert_eq!(prompt.question, Question::AddProject);
+        assert_eq!(prompt.input.text(), "/code/");
+        type_text(&mut app, "pay");
+        assert_eq!(
+            press(&mut app, KeyCode::Tab),
+            Some(Action::CompleteDirectory("/code/pay".into()))
+        );
+        app.complete_answer("/code/payments/");
+        assert_eq!(
+            press(&mut app, KeyCode::Enter),
+            Some(Action::AddProject(PathBuf::from("/code/payments")))
+        );
+        // One that isn't a git repository yet is asked about.
+        app.confirm_new_project(PathBuf::from("/code/payments"), false);
+        assert_eq!(
+            app.confirm().unwrap().question(),
+            "make it a git repository and add it: /code/payments? y/n"
+        );
+        assert_eq!(
+            press(&mut app, KeyCode::Char('y')),
+            Some(Action::NewProject {
+                dir: PathBuf::from("/code/payments"),
+                create: false
+            })
+        );
+    }
+
+    #[test]
+    fn a_project_added_with_nothing_running_in_it_is_selected() {
+        let mut app = with_agents(&["claude"], vec![in_project("agent", "app")]);
+        let payments = Worktree {
+            path: PathBuf::from("/code/payments"),
+            project: "payments".into(),
+            project_path: PathBuf::from("/code/payments"),
+            branch: Some("main".into()),
+            main: true,
+            in_progress: None,
+        };
+        app.set_known_projects(vec![payments]);
+        app.project_added(Path::new("/code/payments"));
+        assert_eq!(
+            app.selected_empty_worktree().map(|w| w.path.clone()),
+            Some(PathBuf::from("/code/payments"))
+        );
+        assert_eq!(app.notice(), Some("payments is on the list of projects"));
+    }
+
     #[test]
     fn a_permission_is_answered_from_the_list_which_stays_open() {
         let mut app = App::new(None);
@@ -11242,7 +11978,7 @@ gate = true
         let mut app = app_with(&["a"]);
         assert_eq!(
             press(&mut app, KeyCode::Char('a')),
-            Some(Action::FollowEvents)
+            Some(Action::FollowEvents(Scope::All))
         );
         let worker = SessionInfo {
             id: "s1".into(),
@@ -11269,6 +12005,195 @@ gate = true
 
         press(&mut app, KeyCode::Char('a'));
         assert_eq!(press(&mut app, KeyCode::Esc), Some(Action::StopFollowing));
+    }
+
+    #[test]
+    fn capital_i_opens_the_selected_sessions_timeline_and_ctrl_s_goes_through_its_scopes() {
+        let mut app = App::new(None);
+        app.set_sessions(vec![
+            with_task("fixer", "Fix the login", None),
+            session("shell"),
+        ]);
+        app.select("fixer");
+        assert_eq!(
+            press(&mut app, KeyCode::Char('I')),
+            Some(Action::FollowEvents(Scope::Session("fixer".into())))
+        );
+        let names = |app: &App| app.timeline_view().unwrap().scope().name.clone();
+        assert_eq!(names(&app), "session fixer");
+        // The first page is still being read: nothing further back yet.
+        assert_eq!(app.events_read(Ok(Vec::new())), None);
+        let widened = [
+            (Scope::Task(1), "task t1"),
+            (Scope::Project("/code/shop".into()), "project shop"),
+            (Scope::All, ""),
+            (Scope::Session("fixer".into()), "session fixer"),
+        ];
+        for (scope, name) in widened {
+            assert_eq!(ctrl(&mut app, 's'), Some(Action::FollowEvents(scope)));
+            assert_eq!(names(&app), name);
+        }
+        press(&mut app, KeyCode::Esc);
+
+        // A session outside git with no task: itself, its directory, and
+        // everything; `a` opens on everything.
+        app.select("shell");
+        assert_eq!(
+            press(&mut app, KeyCode::Char('a')),
+            Some(Action::FollowEvents(Scope::All))
+        );
+        assert_eq!(
+            ctrl(&mut app, 's'),
+            Some(Action::FollowEvents(Scope::Session("shell".into())))
+        );
+        assert_eq!(
+            ctrl(&mut app, 's'),
+            Some(Action::FollowEvents(Scope::Project("/".into())))
+        );
+        press(&mut app, KeyCode::Esc);
+
+        // On a folded project's heading, it's the project's.
+        app.select("fixer");
+        press(&mut app, KeyCode::Char('h'));
+        assert_eq!(
+            press(&mut app, KeyCode::Char('I')),
+            Some(Action::FollowEvents(Scope::Project("/code/shop".into())))
+        );
+    }
+
+    #[test]
+    fn a_sessions_menu_opens_its_task_and_project_timelines_and_reading_back_keeps_the_scope() {
+        let mut app = App::new(None);
+        app.set_sessions(vec![with_task("fixer", "Fix the login", None)]);
+        app.right_click(Hit::SidebarRow(row_of(&app, "fixer")), (3, 4));
+        let menu = labels(&app);
+        for label in [
+            "its timeline",
+            "its task's timeline",
+            "its handoff notes and files",
+        ] {
+            assert!(menu.contains(&label), "{label}: {menu:?}");
+        }
+        let task = menu.iter().position(|l| *l == "its task's timeline");
+        let chosen = app.menu_mouse(CLICK, 0, 0);
+        assert_eq!(chosen, None, "a click outside closes it");
+        app.right_click(Hit::SidebarRow(row_of(&app, "fixer")), (3, 4));
+        for _ in 0..task.unwrap() {
+            press(&mut app, KeyCode::Down);
+        }
+        assert_eq!(
+            press(&mut app, KeyCode::Enter),
+            Some(Action::FollowEvents(Scope::Task(1)))
+        );
+        // A full page of the task's lines: reading back asks for more of
+        // the task's.
+        let page: Vec<Event> = (1..=timeline::PAGE as u64)
+            .rev()
+            .map(|seq| {
+                about(
+                    seq + 10,
+                    crate::events::Kind::SessionWorking,
+                    &session("fixer"),
+                )
+            })
+            .collect();
+        assert_eq!(app.events_read(Ok(page)), None);
+        press(&mut app, KeyCode::End);
+        for _ in 0..timeline::PAGE {
+            if let Some(action) = press(&mut app, KeyCode::Down) {
+                assert_eq!(
+                    action,
+                    Action::ReadOlderEvents {
+                        scope: Scope::Task(1),
+                        before: 11,
+                    }
+                );
+                break;
+            }
+        }
+        press(&mut app, KeyCode::Esc);
+
+        // With tasks off, there's no task's timeline.
+        app.tasks_on = false;
+        app.right_click(Hit::SidebarRow(row_of(&app, "fixer")), (3, 4));
+        assert!(!labels(&app).contains(&"its task's timeline"));
+        press(&mut app, KeyCode::Esc);
+        app.view = None;
+
+        // A project's heading opens its timeline.
+        app.right_click(Hit::SidebarRow(0), (1, 1));
+        assert!(matches!(app.rows()[0], Row::Project { .. }));
+        let menu = labels(&app);
+        let at = menu.iter().position(|l| *l == "its timeline").unwrap();
+        for _ in 0..at {
+            press(&mut app, KeyCode::Down);
+        }
+        assert_eq!(
+            press(&mut app, KeyCode::Enter),
+            Some(Action::FollowEvents(Scope::Project("/code/shop".into())))
+        );
+    }
+
+    #[test]
+    fn capital_m_opens_what_the_session_left_and_says_why_when_theres_nothing() {
+        let mut app = App::new(None);
+        app.set_sessions(vec![
+            with_task("fixer", "Fix the login", None),
+            session("shell"),
+        ]);
+        app.select("fixer");
+        assert_eq!(
+            press(&mut app, KeyCode::Char('M')),
+            Some(Action::ReadHandoff {
+                session: "fixer".into(),
+                worktree: Some(PathBuf::from("/code/shop")),
+                task: Some(1),
+            })
+        );
+        let found = handoff_view::Found {
+            notes: Some(PathBuf::from("/code/shop")),
+            kept: Ok(Vec::new()),
+        };
+        assert_eq!(
+            app.handoff_found("fixer", found),
+            Some(Action::ReadPreview {
+                dir: PathBuf::from("/code/shop"),
+                path: ".crystal/handoff.md".into(),
+            })
+        );
+        // `j` moves in it, as in every view that isn't typed into, and
+        // Enter edits the notes in the worktree.
+        assert_eq!(press(&mut app, KeyCode::Char('j')), None);
+        let Some(Action::Edit { dir, path, .. }) = press(&mut app, KeyCode::Enter) else {
+            panic!("enter edits the file");
+        };
+        assert_eq!(
+            (dir, path.as_str()),
+            (PathBuf::from("/code/shop"), ".crystal/handoff.md")
+        );
+        assert!(app.view().is_none());
+
+        app.select("shell");
+        assert_eq!(press(&mut app, KeyCode::Char('M')), None);
+        assert_eq!(
+            app.notice(),
+            Some("shell leaves no notes: it isn't in a git worktree, and has no task")
+        );
+        // With the handoff file off, a task's kept files are still there.
+        app.handoff_on = false;
+        app.select("fixer");
+        assert_eq!(
+            press(&mut app, KeyCode::Char('M')),
+            Some(Action::ReadHandoff {
+                session: "fixer".into(),
+                worktree: None,
+                task: Some(1),
+            })
+        );
+        press(&mut app, KeyCode::Esc);
+        app.tasks_on = false;
+        assert_eq!(press(&mut app, KeyCode::Char('M')), None);
+        assert!(app.notice().unwrap().contains("handoff"));
     }
 
     #[test]

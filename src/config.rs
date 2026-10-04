@@ -39,6 +39,9 @@ pub struct Config {
     /// typed into a shell, whose installed hooks named its conversation,
     /// with the command that resumes it: see [`crate::integration`].
     pub resume_reported_agents: bool,
+    /// Ask before `q` quits the TUI, since a key meant for an agent can
+    /// land on the sidebar. The sessions keep running either way.
+    pub confirm_quit: bool,
     /// The TUI's colors.
     pub theme: ThemeName,
     /// How many rows that scrolled off a session's screen are kept, for
@@ -109,7 +112,8 @@ pub struct Config {
     /// The theme following the system's light or dark: `[appearance]` in
     /// the file. See [`crate::tui::appearance`].
     pub appearance: AppearanceSettings,
-    /// What the mouse does in the TUI: `[mouse]` in the file.
+    /// What the mouse does in the TUI and `crystal attach`: `[mouse]` in
+    /// the file.
     pub mouse: MouseSettings,
     /// What programs in sessions may do with the user's clipboard:
     /// `[clipboard]` in the file.
@@ -407,6 +411,10 @@ pub struct ProjectSettings {
     /// there with its output thrown away.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub open: Option<String>,
+    /// The plugins the project ships in its `.crystal/plugins/` that are
+    /// on for it, by name: see [`crate::plugins`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub plugins: Vec<String>,
 }
 
 /// When the user is told a session needs them: see [`crate::notify`].
@@ -453,7 +461,7 @@ impl Default for SidebarSettings {
     }
 }
 
-/// What the mouse does in the TUI.
+/// What the mouse does in the TUI, and in `crystal attach`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MouseSettings {
@@ -471,6 +479,12 @@ pub struct MouseSettings {
     /// A scrollbar beside each pane's screen, in a column of its own, which
     /// shows where in its history the pane is and drags to scroll it.
     pub scrollbars: bool,
+    /// Whether `crystal attach` takes the mouse: the wheel scrolls the
+    /// session's history on its main screen, and a program that asks gets
+    /// the mouse, through any terminal. Off, the terminal keeps it, for its
+    /// own selection, and only sends a program on the alternate screen the
+    /// wheel as arrow keys.
+    pub attach_capture: bool,
 }
 
 /// How many lines a notch of the wheel may scroll.
@@ -483,6 +497,7 @@ impl Default for MouseSettings {
             copy_on_select: true,
             scroll_lines: 3,
             scrollbars: true,
+            attach_capture: false,
         }
     }
 }
@@ -693,6 +708,34 @@ pub struct WorktreeSettings {
     /// without a branch of that name starts from the default all the same.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base: Option<String>,
+    /// The directory new worktrees go in, each project's in a directory of
+    /// its own named after it, like `~/worktrees/app/fix-login`, in place
+    /// of `<repo>.worktrees` beside the project: from `/`, or `~` for the
+    /// home directory.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub directory: Option<PathBuf>,
+}
+
+impl WorktreeSettings {
+    /// The directory new worktrees go in, `~` made the home directory, when
+    /// the settings say one.
+    pub fn directory(&self) -> Option<PathBuf> {
+        self.directory.as_deref().map(crate::shell::expand_home)
+    }
+
+    fn check(&self) -> Result<()> {
+        if let Some(directory) = &self.directory {
+            let from_root = directory.is_absolute();
+            let from_home = directory == Path::new("~") || directory.starts_with("~/");
+            if !from_root && !from_home {
+                bail!(
+                    "[worktrees] directory is {}: write it from / or ~",
+                    directory.display()
+                );
+            }
+        }
+        Ok(())
+    }
 }
 
 /// What the TUI shows of the pull requests and issues on a project's
@@ -859,6 +902,7 @@ impl Default for Config {
             new_session: "claude".to_string(),
             name_from_prompt: true,
             resume_reported_agents: true,
+            confirm_quit: true,
             theme: ThemeName::DARK,
             colors: BTreeMap::new(),
             scrollback_lines: vt::DEFAULT_HISTORY_LINES,
@@ -1164,6 +1208,7 @@ pub fn from_text(text: &str) -> Result<Config> {
     }
     duration(&config.sessions.stop_idle_after).context("in [sessions], stop_idle_after")?;
     config.tasks.check()?;
+    config.worktrees.check()?;
     Keymap::new(&config.keys).map_err(anyhow::Error::msg)?;
     if !SIDEBAR_WIDTHS.contains(&config.sidebar.width) {
         bail!(
@@ -1646,6 +1691,27 @@ back_to = "build"
     }
 
     #[test]
+    fn new_worktrees_go_beside_the_project_unless_a_directory_is_given() {
+        assert_eq!(Config::default().worktrees.directory(), None);
+        let config = parse("[worktrees]\ndirectory = \"/work/trees\"\n").unwrap();
+        assert_eq!(
+            config.worktrees.directory(),
+            Some(PathBuf::from("/work/trees"))
+        );
+        let config = parse("[worktrees]\ndirectory = \"~/trees\"\n").unwrap();
+        let home = std::env::var_os("HOME").unwrap_or_default();
+        assert_eq!(
+            config.worktrees.directory(),
+            Some(PathBuf::from(home).join("trees"))
+        );
+        let relative = parse("[worktrees]\ndirectory = \"trees\"\n").unwrap_err();
+        assert!(
+            format!("{relative:#}").contains("from / or ~"),
+            "{relative:#}"
+        );
+    }
+
+    #[test]
     fn drafts_show_unless_the_forge_settings_hide_them() {
         assert!(!parse("").unwrap().forge.hide_draft_prs);
         let config = parse("[forge]\nhide_draft_prs = true\n").unwrap();
@@ -1683,6 +1749,9 @@ back_to = "build"
         assert_eq!(mouse.scroll_lines, 1);
         // What's left out has its default.
         assert!(mouse.copy_on_select && mouse.scrollbars);
+        assert!(!mouse.attach_capture);
+        let attach = parse("[mouse]\nattach_capture = true").unwrap().mouse;
+        assert!(attach.attach_capture && attach.capture);
         for lines in [0, 101] {
             let err = parse(&format!("[mouse]\nscroll_lines = {lines}")).unwrap_err();
             assert!(format!("{err:#}").contains("scroll_lines"), "{err:#}");
@@ -1852,6 +1921,7 @@ back_to = "build"
             new_session: "codex --model o3".into(),
             name_from_prompt: false,
             resume_reported_agents: false,
+            confirm_quit: false,
             theme: ThemeName::find("nord").unwrap(),
             scrollback_lines: 50_000,
             colors: BTreeMap::from([
@@ -1890,6 +1960,7 @@ back_to = "build"
             },
             worktrees: WorktreeSettings {
                 base: Some("develop".into()),
+                directory: Some(PathBuf::from("~/worktrees")),
             },
             forge: ForgeSettings {
                 hide_draft_prs: true,
@@ -1918,7 +1989,13 @@ back_to = "build"
                     Step {
                         name: "plan".into(),
                         profile: Some("review".into()),
+                        agent: None,
+                        model: None,
+                        effort: None,
+                        mode: None,
+                        background: None,
                         prompt: "Plan {goal}".into(),
+                        accept: Vec::new(),
                         placement: None,
                         worktree: false,
                         gate: true,
@@ -1928,7 +2005,13 @@ back_to = "build"
                     Step {
                         name: "build".into(),
                         profile: None,
+                        agent: None,
+                        model: None,
+                        effort: None,
+                        mode: None,
+                        background: None,
                         prompt: "Build it:\n{previous}".into(),
+                        accept: Vec::new(),
                         placement: Some(Placement::Fresh),
                         worktree: false,
                         gate: false,
@@ -1941,6 +2024,7 @@ back_to = "build"
                 path: PathBuf::from("~/code/app"),
                 run: Some("npm run dev".into()),
                 open: Some("code .".into()),
+                plugins: vec!["lint".into()],
             }],
             keys: KeySettings {
                 bindings: BTreeMap::from([
@@ -2027,6 +2111,7 @@ back_to = "build"
                 copy_on_select: false,
                 scroll_lines: 5,
                 scrollbars: false,
+                attach_capture: true,
             },
             clipboard: ClipboardSettings {
                 allow_programs: false,

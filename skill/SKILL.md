@@ -18,8 +18,8 @@ crystal new -d -n fixer -w fix/login claude "Fix the login redirect bug"
 - `-d` starts it in the background and prints its name. Always pass it: without it, crystal attaches.
 - `-n` names it. Without it the name comes from its prompt, like `review-diff-branch`, or else is the
   program's, with `-2`, `-3` added if taken. Use the name `-d` prints.
-- `-w <branch>` starts it in a new git worktree, `<repo>.worktrees/<branch>`, making the branch if it
-  doesn't exist. Use it when the agent will edit files, so it doesn't collide with you. A new branch starts
+- `-w <branch>` starts it in a new git worktree, `<repo>.worktrees/<branch>` (or under the user's
+  `[worktrees] directory`), making the branch if it doesn't exist. Use it when the agent will edit files, so it doesn't collide with you. A new branch starts
   from origin's default branch, freshly fetched; add `--base HEAD` when it should have your commits, say to
   review or test your change (commit first: uncommitted work doesn't come along).
 - Several things at once, like a few fixes the user asked for together, are a session each, with `-w`: the
@@ -27,6 +27,23 @@ crystal new -d -n fixer -w fix/login claude "Fix the login redirect bug"
   Agent tool's worktree isolation or `EnterWorktree` for them: those worktrees are yours alone, and nothing
   shows until one is left behind.
 - Words after `claude` are its first prompt. Quote them as one argument.
+
+## Work in a worktree yourself
+
+When the user asks you to do the work in a worktree, have crystal move your session into one rather than
+entering one of your own:
+
+```sh
+crystal worktree move fix/login
+```
+
+It takes the project's worktree on that branch, or makes one (a made-up branch with no name given; `--base
+HEAD` to start from your commits). Run it once, then end your turn at once, saying in a line that you're
+moving: crystal stops you when the turn ends and starts you again in the worktree, in this conversation, with
+a prompt to carry on there. If it fails, say why and carry on where you are. `-n <name>` moves another session.
+
+`crystal worktree list` shows the project's worktrees and the sessions in each; `crystal worktree create
+<branch>` makes one and prints its directory (`--label "what it's for"` names it in the sidebar).
 
 ## Hand it work and wait
 
@@ -92,8 +109,8 @@ crystal result ship-1-review                                   # a step's whole 
   (`crystal flow back <run> "<notes>"`) only when the user tells you to.
 - `crystal flow retry <run>` runs a failed or interrupted step again. `crystal flow --json` lists every run.
 - `crystal flow cancel <run>` cancels a run and its step's open task: only when the user asks.
-- A step on an agent other than Claude runs in a terminal session, `<run>-<step>`, and the flow goes on once
-  its task closes: `crystal read` it rather than `result`.
+- A step on an agent other than Claude, or on Claude with `background = false`, runs in a terminal session,
+  `<run>-<step>`, and the flow goes on once its task closes: `crystal read` it rather than `result`.
 - With flows turned off, these commands say "the flows plugin is off"; run the steps as tasks yourself.
 
 ## Close your task

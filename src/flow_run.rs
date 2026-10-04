@@ -16,7 +16,7 @@
 use crate::flows::{self, Flow, Placement, Value};
 use crate::profile::Profile;
 use crate::protocol::TaskSpec;
-use crate::tasks::MAX_PROMPT_BYTES;
+use crate::tasks::{self, MAX_PROMPT_BYTES};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -418,9 +418,16 @@ impl FlowRun {
     }
 
     /// Whether `step` runs in a terminal: its agent isn't Claude Code, the
-    /// one agent that runs in the background.
+    /// one agent that runs in the background, or the step says not to run
+    /// there.
     pub fn in_terminal(&self, step: usize) -> bool {
-        self.profile_of(step).agent != "claude"
+        !self.flow.steps[step].in_background(&self.profile_of(step).agent)
+    }
+
+    /// What has to hold before `step` is done: its acceptance criteria,
+    /// which its task carries, and which go under what it's asked.
+    pub fn criteria(&self, step: usize) -> Result<Vec<String>> {
+        tasks::criteria(self.flow.steps[step].accept.clone())
     }
 
     /// The `claude -p` arguments and first prompt of the background task
@@ -465,9 +472,9 @@ impl FlowRun {
     /// - `{feedback}`, what the last send back said.
     ///
     /// A step the flow was just sent back to hears the feedback even when
-    /// its prompt doesn't ask for it. A prompt past [`MAX_PROMPT_BYTES`]
-    /// has what steps answered cut, the oldest first; one too long even so
-    /// is an error.
+    /// its prompt doesn't ask for it. Its acceptance criteria go under it.
+    /// A prompt past [`MAX_PROMPT_BYTES`], with them, has what steps
+    /// answered cut, the oldest first; one too long even so is an error.
     pub fn prompt_for(&self, step: usize, sent_back: bool) -> Result<String> {
         let template = &self.flow.steps[step].prompt;
         let answer = |index: usize| self.steps[index].answer.as_deref().unwrap_or("");
@@ -514,26 +521,25 @@ impl FlowRun {
             filled.push("\n\n", None);
             filled.push(feedback, Some(usize::MAX));
         }
-        filled.within(MAX_PROMPT_BYTES).with_context(|| {
+        let accept = self.criteria(step)?;
+        let budget = MAX_PROMPT_BYTES.saturating_sub(tasks::with_criteria("", &accept).len());
+        let prompt = filled.within(budget).with_context(|| {
             format!(
                 "the prompt of step {} is over {} KiB even with what the steps before it \
                  answered cut short",
                 self.step_name(step),
                 MAX_PROMPT_BYTES / 1024
             )
-        })
+        })?;
+        Ok(tasks::with_criteria(&prompt, &accept))
     }
 
     /// The profile `step` runs with: the one it names, or Claude Code as
-    /// it's set up.
+    /// it's set up, with the step's own agent, model, effort and mode over
+    /// it.
     fn profile_of(&self, step: usize) -> Profile {
-        let wanted = self.flow.steps[step].profile.as_ref();
-        let named = self
-            .profiles
-            .iter()
-            .find(|profile| Some(&profile.name) == wanted);
-        named
-            .cloned()
+        let step = &self.flow.steps[step];
+        step.profile_in(&self.profiles)
             .unwrap_or_else(|| Profile::for_agent("claude"))
     }
 
@@ -643,7 +649,13 @@ mod tests {
         Step {
             name: name.into(),
             profile: None,
+            agent: None,
+            model: None,
+            effort: None,
+            mode: None,
+            background: None,
             prompt: prompt.into(),
+            accept: Vec::new(),
             placement: None,
             worktree: false,
             gate: false,
@@ -1014,6 +1026,69 @@ mod tests {
         assert_eq!(command.first().map(String::as_str), Some("codex"));
         assert_eq!(command.last(), Some(&asked));
         assert!(command.contains(&"gpt-5".to_string()), "{command:?}");
+    }
+
+    #[test]
+    fn a_claude_step_can_run_in_a_terminal_with_settings_of_its_own() {
+        let mut run = ship();
+        run.flow.steps[1].background = Some(false);
+        run.flow.steps[1].model = Some("opus".into());
+        run.flow.steps[1].effort = Some("high".into());
+        assert!(!run.in_terminal(0));
+        assert!(run.in_terminal(1));
+        let (command, asked) = run.command(1, "Do add retries");
+        assert_eq!(asked, "Do add retries");
+        assert_eq!(
+            command,
+            [
+                "claude",
+                "--model",
+                "opus",
+                "--effort",
+                "high",
+                "--",
+                "Do add retries"
+            ]
+        );
+        // A step of its own agent, with no profile.
+        run.flow.steps[2].agent = Some("codex".into());
+        assert!(run.in_terminal(2));
+        assert_eq!(run.command(2, "x").0[0], "codex");
+    }
+
+    #[test]
+    fn a_steps_acceptance_criteria_go_under_its_prompt_within_the_most_it_may_be() {
+        let mut run = ship();
+        run.flow.steps[0].accept = vec!["names the files".into(), "  ".into()];
+        assert_eq!(run.criteria(0).unwrap(), ["names the files"]);
+        assert_eq!(
+            run.start(),
+            Next::Run {
+                step: 0,
+                prompt: "Plan add retries\n\nAcceptance criteria:\n- names the files".into()
+            }
+        );
+        // Run again, it's asked the same.
+        run.could_not_start(0, "no claude".into());
+        let Next::Run { prompt, .. } = run.retry().unwrap() else {
+            panic!("it didn't run again");
+        };
+        assert!(prompt.ends_with("- names the files"), "{prompt}");
+
+        run.flow.steps[1].accept = vec!["the tests pass".into()];
+        let long = "p".repeat(MAX_PROMPT_BYTES);
+        let Next::Run { prompt, .. } = run.step_ended(0, done(&long)) else {
+            panic!("the build didn't run");
+        };
+        assert!(prompt.len() <= MAX_PROMPT_BYTES, "{}", prompt.len());
+        assert!(
+            prompt.ends_with(&format!(
+                "{}\n\nAcceptance criteria:\n- the tests pass",
+                flows::CUT
+            )),
+            "{}",
+            &prompt[prompt.len() - 60..]
+        );
     }
 
     #[test]

@@ -171,6 +171,12 @@ pub enum Request {
     },
     /// What background tasks have spent today, and the daily budget.
     Spending,
+    /// The memory each running session's processes take, the daemon's
+    /// own, and the asking client's, whose process is `client`.
+    Resources {
+        #[serde(default)]
+        client: Option<u32>,
+    },
     /// Close a session's task, done or failed. A program in a session says
     /// which by its `id`; from outside, it's the session's `name`.
     Close {
@@ -298,6 +304,18 @@ pub enum Request {
         path: PathBuf,
         force: bool,
     },
+    /// Move the session called `name` into the worktree at `path`, another
+    /// of its project's: its agent is stopped and started again there, in
+    /// its conversation, told where it is now. An agent in the middle of a
+    /// turn, which may be the one asking, moves once the turn ends.
+    /// Answered `Moved`, or `Done` when it's there already.
+    MoveSession {
+        name: String,
+        path: PathBuf,
+    },
+    /// The worktrees the daemon is removing now, whoever asked: a TUI
+    /// opened meanwhile says so on their lines.
+    Removals,
     /// Something that happened outside the daemon, like a worktree a
     /// client made or an entry it added to memory: the daemon numbers it,
     /// writes it in the event log, and passes it on to whoever listens.
@@ -599,6 +617,13 @@ pub enum Response {
         transcript: Option<Vec<String>>,
     },
     Spending(Spending),
+    Resources(crate::resources::Resources),
+    /// What the hook reporting a prompt the user sent tells Claude Code:
+    /// the title to give the conversation, the name the user renamed the
+    /// session to in crystal.
+    Retitle {
+        title: String,
+    },
     /// A project's backlog.
     Backlog(Backlog),
     /// The number a new backlog item got.
@@ -613,6 +638,10 @@ pub enum Response {
     /// now: each one's branch included.
     Projects {
         projects: Vec<Worktree>,
+    },
+    /// The worktrees the daemon is removing, by their directories.
+    Removals {
+        worktrees: Vec<PathBuf>,
     },
     /// The name a new flow run got.
     FlowStarted {
@@ -656,6 +685,11 @@ pub enum Response {
     },
     /// A TUI's tabs and their panes.
     Layout(crate::layout::Layout),
+    /// A session is moving into another worktree: it has started again
+    /// there, or with `later`, does once its agent's turn ends.
+    Moved {
+        later: bool,
+    },
     Done,
     Error {
         message: String,

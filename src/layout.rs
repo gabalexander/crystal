@@ -4,9 +4,12 @@
 //! [`crate::layout_relay`]. With no TUI open, the daemon carries it out
 //! itself, the same way, on the tabs the TUIs keep in the database, where
 //! the next TUI to open finds them. This is what goes between them, and how
-//! `crystal layout` prints a layout.
+//! `crystal layout` prints a layout; a layout as a file, which `crystal
+//! layout export` writes and `crystal layout apply` reads, is
+//! [`crate::layout_file`]'s.
 
 use crate::notify::Presence;
+use crate::tui::keymap::Extent;
 use crate::tui::split_tree::{Direction, Way};
 use serde::{Deserialize, Serialize};
 
@@ -61,6 +64,24 @@ pub enum Command {
         toward: Direction,
         cells: Option<u16>,
     },
+    /// Swap a session's pane with the pane `toward` from it, the splits
+    /// and their ratios left as they are.
+    SwapToward {
+        session: Option<String>,
+        toward: Direction,
+    },
+    /// The same with the pane of `with`, in the same tab.
+    Swap {
+        session: Option<String>,
+        with: String,
+    },
+    /// Give a session's pane's side of the split nearest above it, or the
+    /// nearest `way` when that's given, `share` of the split's room.
+    Ratio {
+        session: Option<String>,
+        way: Option<Way>,
+        share: f32,
+    },
     /// Close a session's pane of its own: its split closes, or its float
     /// is put back.
     Close { session: Option<String> },
@@ -73,9 +94,41 @@ pub enum Command {
     /// Float a session over its tab's panes, or with `on` false, put the
     /// tab's float back among them.
     Float { session: Option<String>, on: bool },
+    /// Show `session`, the pane of the plugin called `plugin`, over the
+    /// panes with the keyboard, under `title`, or in a popup that size,
+    /// until its program ends or the user closes it, which kills it. Only
+    /// a TUI can.
+    Overlay {
+        session: String,
+        plugin: String,
+        title: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        popup: Option<Popup>,
+    },
     /// Give the TUI's terminal the title `text`, in place of the one the
     /// settings make, or with none, go back to that one.
     Title { text: Option<String> },
+    /// Lay tabs out as `tabs` has them, their numbers aside: each in place
+    /// of the tab with its name, or after the others when it has none or
+    /// there's no such tab; or with `replace`, in place of every tab, the
+    /// sessions they don't hold joining the tab in front. The sessions they
+    /// hold move to them, and one `current` comes to the front. The
+    /// sessions are all there by now: `crystal layout apply` starts those
+    /// that weren't (see [`crate::layout_file`]).
+    Apply {
+        tabs: Vec<TabLayout>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        replace: bool,
+    },
+}
+
+/// How big a popup is: so many cells, or a share of the screen, each way.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Popup {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width: Option<Extent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<Extent>,
 }
 
 /// A command as a TUI gets it.

@@ -4,10 +4,11 @@
 use crate::agent_rules;
 use crate::agent_screen::{self, Looks, ScreenWatch};
 use crate::agents;
+use crate::claude_title;
 use crate::codex::Rollouts;
 use crate::config::Config;
 use crate::distill::Material;
-use crate::events::now_ms;
+use crate::events::{ToolUse, now_ms};
 use crate::front;
 use crate::git::Checkout;
 use crate::handover::{self, Got};
@@ -126,6 +127,12 @@ pub struct Session {
     /// Whether crystal named the session after its program, and nothing
     /// has named it since: its first prompt can, then.
     named_after_program: bool,
+    /// Whether the user or a script gave it its name, as it started or with
+    /// a rename: a rename in Claude Code leaves it.
+    name_given: bool,
+    /// The name Claude Code gives its agent's conversation, to keep in step
+    /// with the session's.
+    title: claude_title::Watch,
     /// The agent whose conversation `conversation` is, by its program,
     /// when that isn't the session's own program: one typed into its
     /// shell, whose hooks `crystal integration` installed. A restart types
@@ -167,6 +174,8 @@ pub enum Change {
     RunEnded(TaskResult),
     /// A background task's Claude asks the user for a permission.
     Asking(Asking),
+    /// A background task's Claude used a tool.
+    ToolUsed(ToolUse),
     /// A task its run had closed opened again, with a follow-up.
     Reopened,
     /// Its agent's turn ended with its task still open: the task waits on
@@ -209,6 +218,10 @@ pub struct Handed {
     named_after_program: bool,
     /// Handed over by crystals since these were, and left out by those
     /// before them, which a crystal reads as none.
+    #[serde(default)]
+    name_given: bool,
+    #[serde(default)]
+    title: claude_title::Watch,
     #[serde(default)]
     typed_agent: Option<String>,
     #[serde(default)]
@@ -391,6 +404,8 @@ impl Session {
             reporter: None,
             reporter_job: None,
             named_after_program: false,
+            name_given: false,
+            title: claude_title::Watch::default(),
             typed_agent: None,
             subagents: 0,
             model,
@@ -457,6 +472,8 @@ impl Session {
             reporter: None,
             reporter_job: None,
             named_after_program: false,
+            name_given: false,
+            title: claude_title::Watch::default(),
             typed_agent: None,
             subagents: 0,
             model: model::Watch::default(),
@@ -521,6 +538,8 @@ impl Session {
             reporter: None,
             reporter_job: None,
             named_after_program: false,
+            name_given: false,
+            title: claude_title::Watch::default(),
             typed_agent: None,
             subagents: 0,
             model: model::Watch::new(&saved.command),
@@ -850,6 +869,13 @@ impl Session {
         *self.state.lock().unwrap() == State::Running
     }
 
+    /// The process of its program while it runs: a background task's
+    /// `claude`, while it has one.
+    pub fn running_pid(&self) -> Option<u32> {
+        let pid = self.task.as_ref().map_or(self.pid, Task::pid);
+        pid.filter(|_| self.is_running())
+    }
+
     pub fn info(&self) -> SessionInfo {
         let now = SystemTime::now();
         // The model read is the agent's in front: a shell or another
@@ -1079,6 +1105,49 @@ impl Session {
         self.named_after_program = false;
     }
 
+    /// The user or a script gave it the name it has now as it started: a
+    /// rename in Claude Code leaves it.
+    pub fn keep_given_name(&mut self) {
+        self.keep_name();
+        self.name_given = true;
+    }
+
+    /// The user or a script renamed it: the name is kept through a rename in
+    /// Claude Code, and given to Claude Code with the next prompt.
+    pub fn renamed(&mut self) {
+        self.keep_given_name();
+        self.title.give(&self.name);
+    }
+
+    /// Whether the user or a script gave it its name.
+    pub fn name_given(&self) -> bool {
+        self.name_given
+    }
+
+    /// Looks at the name Claude Code keeps for its agent's conversation,
+    /// while Claude Code runs in front: the name, when Claude Code was
+    /// given a new one since the last look.
+    pub fn check_title(&mut self) -> Option<String> {
+        if !self.is_running() || self.task.is_some() {
+            return None;
+        }
+        let front = self
+            .front
+            .clone()
+            .or_else(|| front::of_command(&self.command));
+        let claude = matches!(front, Some(Front::Agent { program, .. }) if program == "claude");
+        let conversation = self.conversation.as_ref().filter(|_| claude)?;
+        let transcript = conversation.transcript.as_ref()?;
+        self.title.look(transcript, &conversation.id)
+    }
+
+    /// The name to give Claude Code's conversation as the user sends it a
+    /// prompt, once: the one the user renamed the session to, when Claude
+    /// Code hasn't it yet.
+    pub fn title_to_give(&mut self) -> Option<String> {
+        self.title.take_giving()
+    }
+
     /// Works out what the agent is doing from what it just reported. A
     /// turn that ends with the session's task still open is a question for
     /// the user, and the task waits on them until the agent works again.
@@ -1140,12 +1209,24 @@ impl Session {
     /// Keeps up with a task's runs since it last looked.
     fn check_runs(&mut self) {
         let events = self.task.as_mut().map(Task::events).unwrap_or_default();
+        let mut tools = self.task.as_mut().map(Task::tools_used);
         for event in events {
+            // The tools a run used are told after it started and before
+            // it ended.
+            if event == AgentEvent::TurnEnded {
+                self.tell_tools(tools.take());
+            }
             // How a run ended closes its task first: a task that stays
             // open waits on the user.
             self.follow_runs(event);
             self.on_agent_event(event);
         }
+        self.tell_tools(tools);
+    }
+
+    fn tell_tools(&mut self, tools: Option<Vec<ToolUse>>) {
+        let tools = tools.into_iter().flatten();
+        self.changes.extend(tools.map(Change::ToolUsed));
     }
 
     /// Marks the session when its program has rung the bell while nobody
@@ -1560,6 +1641,8 @@ impl Session {
             reporter: self.reporter.clone(),
             reporter_job: self.reporter_job,
             named_after_program: self.named_after_program,
+            name_given: self.name_given,
+            title: self.title.clone(),
             typed_agent: self.typed_agent.clone(),
             subagents: self.subagents,
             model: self.model.clone(),
@@ -1644,6 +1727,8 @@ impl Session {
             reporter: handed.reporter,
             reporter_job: handed.reporter_job,
             named_after_program: handed.named_after_program,
+            name_given: handed.name_given,
+            title: handed.title,
             typed_agent: handed.typed_agent,
             subagents: handed.subagents,
             model: handed.model,
@@ -2286,6 +2371,8 @@ mod tests {
             }),
             reporter_job: Some(4242),
             named_after_program: true,
+            name_given: false,
+            title: claude_title::Watch::default(),
             typed_agent: Some("codex".into()),
             subagents: 2,
             model: model::Watch::new(&["claude".into(), "--model".into(), "opus".into()]),
@@ -2472,6 +2559,8 @@ mod tests {
             reporter: None,
             reporter_job: None,
             named_after_program: false,
+            name_given: false,
+            title: claude_title::Watch::default(),
             typed_agent: Some("claude".into()),
             subagents: 2,
             model: model::Watch::default(),
@@ -2677,6 +2766,8 @@ mod tests {
             reporter: None,
             reporter_job: None,
             named_after_program: false,
+            name_given: false,
+            title: claude_title::Watch::default(),
             start_from: None,
             screen: vt::Screen::answering(5, 20).save(),
             ended: false,

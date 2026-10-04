@@ -151,9 +151,11 @@ and the footer says where you are and offers the keys that matter there, or, whe
 | `S` | your saved [layouts](#layouts): save your tabs as one, or put them back the way one has them |
 | `n` | start a new session from [the new-session panel](#starting-a-session), and type into it |
 | `w` | the same, in a new worktree on a branch with a made-up name, like `brave-otter` |
+| `D` | start a session [like the selected one](#starting-a-session): the new-session panel, set to what it runs and where |
 | `W` | remove the selected worktree, once nothing runs in it and you've said `y` |
+| `+` | add a [project](#projects): a directory, made a git repository first if it isn't one, once you've said `y` |
 | `r` | rename the selected session |
-| `x` | kill the selected session, once you've said `y` |
+| `x` | kill the selected session, once you've said `y`; the last in a linked worktree asks whether the worktree goes too |
 | `A` | [archive](#archiving-and-idle-agents) the selected session, once you've said `y`: it stops and leaves the list, to start again where it was |
 | `Z` | the archive: start an archived session again, in its conversation, or delete it |
 | `!` | run the selected worktree's [project](#projects), with its `run` command, in a terminal of its own; again, stop it |
@@ -161,6 +163,8 @@ and the footer says where you are and offers the keys that matter there, or, whe
 | `u` | select the next session that needs you: waiting on you first, then done |
 | `U` | list everything that [needs you](#timeline), in every tab, and answer a permission or a gate where it stands |
 | `a` | the [timeline](#timeline): what happened, the newest first, as it happens |
+| `I` | the [timeline](#timeline) of the selected session; `Ctrl+S` there goes on to its task's, its project's and everything |
+| `M` | what the selected session leaves for the next: its worktree's [handoff notes](#the-handoff-file) and the files its task [kept](#kept-files), each read beside the list |
 | `/` | find a session in any tab, a project or worktree with nothing running, a flow run or an open pull request, by typing a little of it; `Tab` keeps to one status; picking a session in another tab takes you there: [finding with `/`](#finding-with-) |
 | `:` | the [command list](#keys-and-commands): every command by its name, with its key, the latest you ran first; `Enter` runs one |
 | `(` / `)` | make the [sidebar](#the-sidebar) narrower or wider; its edge drags with the mouse too |
@@ -184,8 +188,9 @@ and the footer says where you are and offers the keys that matter there, or, whe
 | `P` | list your [profiles](#profiles), and add, change, copy or remove one |
 | `X` | list the [plugins](#plugins): switch them on and off, run their actions and open their panes |
 | `,` | open the [settings](#the-settings-view): notifications, sounds, the theme, and how memory learns and searches, each changed as you go |
+| `#` | the memory each session's processes take, and crystal's own: [RAM](#ram) |
 | `?` | show every key, in the sidebar, in a pane, in resize mode, in a view, in a question and with the mouse, your own included: a page at a time when they don't all fit, `→` and `←` (or `Space`, `PgDn` and `PgUp`) turning the pages |
-| `q` | quit; the sessions keep running |
+| `q` | quit, once you've said `y`; the sessions keep running |
 
 While you're typing into a session, every key goes to it, `Tab` included, except `Ctrl+\`, which takes you
 back to the sidebar, `Shift+PageUp` / `Shift+PageDown`, which page through the pane's history, and the prefix,
@@ -226,7 +231,11 @@ as many times as it would scroll lines, the way xterm's alternate scroll does; a
 (`\e[?1007l`) gets nothing. Copy mode and a selection being dragged keep the wheel scrolling the pane.
 `crystal attach` leaves the mouse to your terminal, and has it send the arrow keys for the wheel the same way,
 only while the program is on the alternate screen: a shell at its prompt doesn't page through its history as
-you scroll.
+you scroll, though that leaves the wheel nothing to do there. With `attach_capture = true` under `[mouse]`, the
+attach takes the mouse itself, as the TUI does, which works in a terminal that has no alternate scroll too: a
+program that asks for the mouse gets it, a pager the arrow keys, and anywhere else the wheel scrolls the
+session's history, from before you attached as well, the top right saying how far back (`↑ 120 lines`) until
+you type. Your terminal's own selection then takes a key held, as in the TUI.
 
 Beside each pane's screen, in a column of its own, a scrollbar shows where in its history the pane is, once it
 has some: drag its thumb to scroll, or click the track and the thumb jumps there. The wheel over it scrolls the
@@ -291,8 +300,11 @@ off floats up out of its split, and `s` on the one floating puts it down into a 
 pane was.
 
 The sidebar groups sessions by project, then by worktree: `⌂` marks a repository's main worktree and `⎇` a
-linked one, each named by its branch. Sessions outside any repository come last, under their directory.
-`w` makes its worktree in the selected session's project, or in the repository you started `crystal` in.
+linked one, each named by its branch, or by the label it was given (`crystal worktree create --label`), then
+its branch. Sessions outside any repository come last, under their directory. `w` makes its worktree in the
+selected session's project, or in the repository you started `crystal` in. Killing the last session in a
+linked worktree with `x` asks next whether the worktree goes too: `y` removes it, as `W` would, and any other
+key keeps it.
 
 A linked worktree with no sessions left stays at the end of its project, with a `· no sessions` row under it,
 until it's removed: it's still on disk, maybe with work in it. Select it, and `n` or `Enter` starts something
@@ -439,6 +451,10 @@ crystal new -d -e PORT=4000 npm run dev     # with a variable set in its environ
 crystal task "update the docs"              # run Claude without a terminal, in the background (see below)
 crystal result task                         # a task's answer
 crystal answer task y                       # allow what a task asks for: y, n or always
+crystal worktree list                       # this project's worktrees and the sessions in each
+crystal worktree create spike --label "try sqlite"   # a worktree on its own, its directory printed
+crystal worktree open spike claude          # start a session in a worktree, by its branch or directory
+crystal worktree move fix/login             # move this session into a worktree, its agent carried on there
 crystal worktree rm fix/login               # remove that worktree, once nothing runs in it
 crystal ls                                  # list sessions and how they're doing
 crystal ls --json                           # the same, as JSON, for scripts and agents
@@ -473,6 +489,7 @@ crystal pane split review                   # show a session in a pane beside yo
 crystal tab new review                      # a new tab in the TUI, in front
 crystal title set "deploying"               # the title of the TUI's terminal, until `crystal title clear`
 crystal layout                              # the TUI's tabs and how each splits its panes
+crystal layout apply dev.json               # lay them out as a file says, starting what isn't there
 crystal skill --install                     # teach Claude Code to drive crystal (see below)
 crystal integration install                 # hooks or plugins for the agents installed here (see above)
 crystal mermaid docs/flow.md                # draw a page's mermaid diagrams as text (see below)
@@ -488,7 +505,8 @@ review  exited 0  41388  app      main       ~/code/app                      cod
 ```
 
 `crystal new -w <branch>` makes the worktree beside the repository, in `<repo>.worktrees/<branch>`, with any
-`/` in the branch made a `-`. A branch that does exist is checked out as it is. One that doesn't yet starts
+`/` in the branch made a `-`; with `directory` under `[worktrees]` in the [settings](#settings), in that
+directory instead, each project's in a directory named after it, like `~/worktrees/app/fix-login`. A branch that does exist is checked out as it is. One that doesn't yet starts
 from `origin`'s default branch, fetched first, so it's what everyone else has as `main`, not whatever your
 checkout last pulled; it follows no branch of `origin`'s, so its first `git push` makes a branch of its own.
 `--base <ref>` starts it somewhere else: a branch (`origin`'s copy, fetched, when it has one), a tag, a commit,
@@ -497,16 +515,51 @@ every new worktree you don't give a base, the TUI's included, and a project with
 default. Offline, it's `origin`'s branch as your last fetch left it, and with no `origin`, the commit you're on.
 A [flow](#flows) makes its worktree from the branch as last fetched, without fetching.
 
+`crystal worktree create [<branch>]` makes a worktree on its own, the way `-w` does, and prints its
+directory: with no branch, a new one with a made-up name, like `brave-otter`; `--base` as for `-w`; `--path
+<dir>` to make it there instead; and `--label <text>`, a few words on what it's for, which the sidebar names it
+by. `crystal worktree label <worktree> <text>` changes a label, and `""` takes it off; it's kept in the
+worktree's own git directory, so it goes with the worktree. `crystal worktree open <worktree>` starts a
+session in a worktree you have, given its branch or its directory, as `crystal new` would there: your shell,
+or the command after it. `crystal worktree list` lists the project's worktrees, the main one first, with each
+one's label and how many sessions run in it (`--json` for their names).
+
+`crystal worktree move [<branch>]` moves a session, the one it's run in unless `-n` names another, into a
+worktree of its project: the one on that branch, or else a new one, made as `create` makes it. Its program
+stops and starts again there, under its name, an agent in its conversation (Claude Code and Codex are told
+where they are now, and to carry on). An agent in the middle of a turn moves once the turn ends, so an agent
+can run it about itself: Claude Code is told to, when you ask it to work in a worktree, rather than make one
+of its own, then end its turn. What it changed and didn't commit stays where it was. A background task can't
+move, and a move still to come is carried over `crystal restart-server`, but not a cold restart.
+
 `crystal worktree rm` (or `W` in the TUI) takes the worktree's directory or its branch, refuses while a
 session is still running in it, and leaves the rest to `git worktree remove`, which keeps a worktree with
 changes you haven't committed. `crystal worktree rm --force` removes it anyway, and those changes with it; `W`
 asks a second time, naming them, and a second `y` does the same. Sessions that had ended in it leave the list
 with it: their directory is gone, so they could never start again. The daemon does the removing, and the
 sidebar says `removing…` until it's done, which for a big worktree can take a while: quitting the TUI meanwhile
-doesn't stop it, and neither does `crystal restart-server`.
+doesn't stop it, and neither does `crystal restart-server`. Every TUI's sidebar says so, whoever asked: another
+TUI, `crystal worktree rm`, or this one before you quit and opened it again; and `W` leaves it be meanwhile.
 
 To set a new worktree up, say install its dependencies or copy in an `.env`, have a [plugin](#plugins) run a
-command on `worktree.created`, and on `worktree.removed` to tidy up after it.
+command on `worktree.created`, and on `worktree.removed` to tidy up after it. What a worktree has outside its
+directory, a port, a database, a route, is the repository's business, so a repository can name two programs of
+its own in git config instead, which the daemon runs once crystal has made a worktree, or removed one:
+
+```sh
+git config crystal.worktreeCreateHook ~/bin/worktree-setup
+git config crystal.worktreeDeleteHook ~/bin/worktree-cleanup
+```
+
+`--global` names one for every repository, and a repository's own wins. They're never read from a file in the
+worktree, which would run whatever a clone brought with it. Each is run as it's named, not by a shell, with the
+main worktree and the worktree as its arguments, in the main worktree (a removed one has gone), and with
+`CRYSTAL_HOOK` (`worktree-create` or `worktree-delete`), `CRYSTAL_WORKTREE` and `CRYSTAL_WORKTREE_BRANCH` set.
+They run one at a time, in the order things happened, and only for worktrees crystal made or removed, not for
+those made or removed outside it; making one starts the daemon if it isn't running. What they print goes to `worktree-hooks.log` in crystal's state directory.
+One that fails, or runs past 30 seconds, when it's stopped with everything it started, is a
+`worktree.hook_failed` event in the [timeline](#timeline): the worktree is made, or gone, already. The
+daemon runs them with its own environment, not a login shell's, so a hook that needs your `PATH` sets it.
 
 `crystal new` with no command starts your shell: the one `default_shell` under `[terminal]` in the
 [settings](#terminals-the-window-and-the-tab-bar) names, or else `$SHELL`, as a login shell on a Mac. `--env
@@ -598,8 +651,8 @@ everywhere else. `[keys]` names them the same way:
 | `view-close` | `q` | in a view: close it, or step back out of what's open in it |
 
 A view is any of the lists that take the keyboard: the diff, the file finder, the tree browser, find in files,
-the branch switcher, memory, the backlog, layouts, the archive, the plugins, the settings, what needs you, the
-timeline, the issues, the pull requests, `/` and the command list. A key you give a view's name stands in every
+the branch switcher, memory, the handoff notes, the backlog, layouts, the archive, the plugins, the settings,
+what needs you, RAM, the timeline, the issues, the pull requests, `/` and the command list. A key you give a view's name stands in every
 one of them for the key they all take for it, `↓`, `↑`, `PgDn`, `PgUp`, `Enter` or `Esc`, which go on working
 whatever you give; the defaults you leave it without do nothing. While a view is taking what you type, like
 the file finder's query or a filter, a letter is typed rather than standing for anything, so a key there is
@@ -791,7 +844,9 @@ the sessions that way; an agent given a first prompt starts without it, so it is
 background task, with no terminal of its own, isn't started. Those it can't start, their directory gone, say,
 are left out, and those it doesn't name join the tab in front. The tabs a restore
 replaces are kept, at the top of the list as `↶ before` the layout's name, so `Enter` on that takes you back,
-once. Layouts are kept with your tabs, in crystal's database.
+once. Layouts are kept with your tabs, in crystal's database. To keep one in a file instead, to share or take
+to another machine, `crystal layout export` writes one and `crystal layout apply` puts it back: see [laying out
+the TUI](#laying-out-the-tui).
 
 ### Zoom, copy mode and search
 
@@ -875,6 +930,23 @@ to, stays, and so does one a script has typed into the session by with `crystal 
 `crystal new` and `crystal task` name a session the same way when you don't, and print the name.
 `name_from_prompt = false` in the [settings](#settings) names sessions after their programs.
 
+Claude Code's own name for a conversation, the one `/rename` gives it, and the session's name in crystal are
+kept in step, as far as Claude Code lets them be. `/rename Fix refund rounding` renames the session
+`fix-refund-rounding` within a moment, as crystal reads the name Claude Code keeps beside its transcript,
+unless you named the session yourself: a name you gave it, with `r`, `crystal rename` or `-n`, stays, since
+scripts and other agents may know it by it. The other way, a name you rename a session to in crystal becomes
+Claude Code's for the conversation, shown in its prompt box and `/resume`, but only with the next prompt you
+send it: nothing renames a Claude Code session from outside but its hook's answer to a prompt. The name a
+session started with isn't given to Claude Code, nor one crystal made up: Claude Code has its own. Only Claude Code has such a name to keep in step; a
+background task has none.
+
+`D` starts a session like the selected one: it opens the panel set to what that session runs, the profile its
+command fits or else its agent, each row at the option its command gives, in the background for a background
+task, and in its place, so only the task is left to write. Anything on its command line the panel has no row
+for, like `--dangerously-skip-permissions`, comes along, there to see in the command the panel shows. Its
+conversation doesn't: the new session starts fresh. On a program that's no agent crystal knows, `D` hands its
+command to the bottom line, `new session:`, to run again or change first.
+
 Under the task, `Tab` and `Shift+Tab` go from row to row and `←` / `→` change a row's choice:
 
 - **run**: your [profiles](#profiles), then the agents installed on your `PATH` (Claude Code, Codex, Gemini
@@ -925,6 +997,17 @@ an agent that said how to resume it. A turn that ended while you were away waits
 does one asking you something; terminals, background tasks and sessions with their task open are never
 stopped. It's off until you set it, from the file or the [settings view](#the-settings-view).
 
+### RAM
+
+`#` shows the memory each session takes: its program and every process under it, since an agent runs node
+workers, shells and MCP servers of its own, the biggest first, with how many processes that is and its share of
+the whole. Under them is what crystal takes itself, the daemon and the TUI, and in the heading all of it, and
+its share of the machine's memory. `Enter` goes to the session the bar is on. The daemon looks at the
+processes, `ps` on a Mac and `/proc` on Linux, every second while the view is open, and every five seconds
+otherwise for the footer, which shows all of it beside `? keys` while the sidebar has the keyboard, like
+`1.2 GB`: a click on that opens the view.
+What's counted is each process's resident memory, so what processes share is counted in each.
+
 ### Projects
 
 crystal keeps a list of the projects you work in: every git repository a session has run in, and those you
@@ -933,6 +1016,12 @@ start something there without a terminal of your own in it. `crystal project` li
 sessions each has (`--json` for scripts), `crystal project add [dir]` adds the repository a directory is in, and
 `crystal project rm [dir]` (or `W` on its row in the sidebar) takes one off the list. Its backlog, tasks and
 memory stay, and it's back as soon as a session runs there again.
+
+`+` in the sidebar adds one from the TUI: the bottom line asks for its directory, starting in the one the
+selected project is in, and `Tab` finishes a directory's name as a shell does. A directory in a project already,
+at its top or not, adds that project. One that isn't in a git repository is made one once you've said `y`, and
+one that isn't there yet is made, then made one; crystal's projects are git repositories. The new project is
+selected, ready for `n`.
 
 A project can say how it's run and how it's opened, in `.crystal/project.toml` at the top of a worktree:
 
@@ -1616,6 +1705,8 @@ crystal pane split -e PORT=4000           # no session named: a new shell, split
 crystal pane focus tests                  # select it, its tab in front, and type into it; or left, right, up, down
 crystal pane focus tests --raise          # the same, and bring the TUI's terminal to the front, as a notification's click does
 crystal pane resize left 8 -n tests       # move a border of its pane, as R does; 4 columns or 2 rows by default
+crystal pane swap right -n tests          # swap its pane with the one to its right, as L does; or with another session's
+crystal pane ratio 0.3 tests              # give its side of the split it's in 30% of the room; --right or --down for that way's
 crystal pane close tests                  # close its split, or put its float back
 crystal pane zoom reviewer                # zoom its tab on it; --off puts the panes back
 crystal pane float logs                   # float it over its tab's panes; --off puts it back
@@ -1627,6 +1718,8 @@ crystal tab move reviewer review          # move a session to another tab, as > 
 crystal tab reorder review 1              # move a tab to be the first, as { and } do a place at a time
 crystal tab close review --kill           # a tab with sessions closes only with --kill, which kills them
 crystal layout                            # each tab's sessions and how its panes split the room; --json
+crystal layout export > dev.json          # the tabs as a layout file, with what starts each session; --tab for one
+crystal layout apply dev.json             # lay them out as the file says, starting what isn't there; --replace
 crystal title set "deploying"             # the title of the TUI's terminal, in place of the settings' one
 crystal title clear                       # back to the settings' one
 ```
@@ -1640,6 +1733,10 @@ moves into that tab, out of any pane it had. With no session named, `pane split`
 off, in the directory it's run in or `--cwd`, with any `--env` variables, as `crystal new` does, and prints its
 name. A command that can't be carried out says why, the way the footer would: no room for another pane, a
 session that isn't on screen. `title` needs a TUI open: with none, there's no terminal to give the title.
+`pane swap` trades the places of two panes in a tab, the splits and how big each is staying as they are:
+the session's and the one that way from it, or another session's. `pane ratio` gives the side a session's
+pane is on, of the split nearest above it, a share of that split's room, whichever side it is: or of the
+nearest split side by side with `--right`, or one above the other with `--down`.
 
 The command goes through the daemon to the TUI you used last, the one where you last pressed a key, clicked
 or brought its terminal to the front, and waits for it to answer, a few seconds at most. When `restart-server`
@@ -1655,6 +1752,46 @@ killed. The next TUI to open shows the tabs as the commands left them.
 side and `down` for one above the other, and `ratio` the first side's share. Beside the tabs, `presence` says
 whether you're at crystal, as the TUIs' terminals say of their focus: `here` while one has it, `away` once
 every one has lost it, and `unknown` with no TUI open or one whose terminal doesn't say.
+
+`crystal layout export` writes the tabs as a layout file, a JSON document to keep with a project or take to
+another machine, and `crystal layout apply` lays the tabs out the way one says, from a file or standard input,
+starting the sessions it names that aren't there, as herdr's `layout.export` and `layout.apply` do:
+
+```json
+{"tabs": [{
+  "name": "dev",
+  "current": true,
+  "panes": {"kind": "split", "way": "right", "ratio": 0.6,
+    "first": {"kind": "pane", "session": "editor", "selection": true, "cwd": "~/repo", "command": ["nvim"]},
+    "second": {"kind": "pane", "session": "tests", "cwd": "~/repo", "command": ["sh", "-c", "cargo test"],
+      "env": {"RUST_LOG": "debug"}}},
+  "sessions": [{"session": "notes", "cwd": "~/notes"}],
+  "floating": "logs"
+}]}
+```
+
+A file is in the shape `crystal layout --json` prints, which applies as it is, with more said about a session
+where it's named: a pane's `cwd`, `command` and `env`, and in a tab's `sessions` and its `floating`, a
+session's name or an object with the same, its name as `session`. All but the tabs can be left out, and
+without a pane marked `selection`, the first follows the selection. A session that's there, running or
+ended, is laid out as it is; one that isn't starts under its name when the file says how: its `command`, or
+a shell, in its `cwd`, or the directory `apply` runs in (`~` and relative paths work), with its `env` over
+the environment `apply` runs with. A pane naming no session starts a new one the same way, named as `crystal
+new` names one, but for the pane that follows the selection, which with nothing said shows whatever's
+selected. What can't start, or the file doesn't say how to, is left out, saying so; `apply` prints the name
+of each session it started.
+
+Each tab of the file lays out the tab with its name, or a new one after the others when it has no name or
+there's none, so a tab with a name is laid out in place when the file is applied again. The sessions it
+names move there, out of any pane they had; those in the tab already that it doesn't name stay, off the
+screen. The tab marked `current` comes to the front; with none, the tab in front stays. `--replace` puts the
+file's tabs in place of every tab instead, as restoring a [saved layout](#layouts) does, the sessions it
+doesn't name joining the tab in front: `crystal layout export > tabs.json`, then later `crystal layout apply
+--replace tabs.json`, puts the tabs back the way they were and starts what has gone since. An export writes
+each session's command as it was started, an agent's without its first prompt, and its directory, but not
+its variables, which it doesn't know; a background task, with no terminal, by its name alone. A file that
+can't be applied, with two tabs of one name, say, a session in two places or a ratio that isn't a share,
+changes nothing and says why.
 
 #### A skill for Claude Code
 
@@ -1712,14 +1849,16 @@ shows the same lines as the [timeline](#timeline).
 
 Each line of `--json` is one event, the same JSON the log keeps and plugins get: its `seq` (1, 2, 3…, never
 going back), `at` (milliseconds since the Unix epoch), its name as `event`, the `project` it's about, the
-`session` (its `name`, `id`, `command`, `cwd`, `project`, `worktree`, `branch`, `activity`, `task` and its
-number, `task_id`, `status`, as `ls` words it, and `reporter` while an agent that reports for itself holds it), and what its kind carries:
+`session` (its `name`, `id`, `command`, `cwd`, `project`, `worktree`, `branch`, `activity`, `task`, and its
+number as `task_id`, `status`, as `ls` words it, and `reporter` while an agent that reports for itself holds it), and what its kind carries:
 `from` (a renamed session's old name, what its agent was doing before, or the agent that let go), `task` (with
 its `id`, `pending`, `waiting` and, once closed, its `outcome` and the `artifacts` kept with it), `run`
 (`prompt`; `asking`, with its `tool` and `gist`, and the `decision`; then `failed`, `answer` and `cost_usd`),
 `flow` (`run`, `flow`, `goal`, `step`, `state`, `said`, `cost_usd`), `worktree`, `handoff` (the file's `path`
 and the `note`'s first line), `artifact` (a kept file's `kind`, `name`, `path` and `bytes`), `memory` (the
-entry), `backlog` (the item) or `plugin` (`name` and `why`). New fields and events may appear; none goes away.
+entry), `file` (the file an entry was promoted into), `distill` (`added`, `again`, `rejected`, `cost_usd`, or
+why it `failed`), `backlog` (the item) or `plugin` (`name` and `why`); a `run`'s `tool` has its `name` and
+`gist`. New fields and events may appear; none goes away.
 The events are listed under [plugins](#events-1).
 
 A program can listen on the daemon's socket, as `--follow` does, with one line of JSON:
@@ -1751,6 +1890,15 @@ and the backlog, flows, memory, or the others. `↑` and `↓` move; the line th
 the list, with everything its event carries, and `PgUp` and `PgDn` scroll it. `Enter` goes to the session the
 line is about, whatever it's called now (for a flow run, its latest step's); `Esc` clears the filter, then
 closes. The timeline reads the log a page at a time, and further back as the bar reaches the end.
+
+A timeline can be of one thing, too. `I` opens the selected session's: everything about it, whatever it was
+called then, and the messages it sent. `Ctrl+S` goes on to its task's (what the task did and kept, and its
+session's events while it had the task), then its project's (every session, worktree, flow, memory entry and
+backlog item there), then everything, and round again; the heading says which it shows, and `a` starts at
+everything and goes the same way. A session's right-click menu has **its timeline** and **its task's
+timeline**, and a project's heading **its timeline**; `session-timeline`, `task-timeline` and
+`project-timeline` are in the [command list](#keys-and-commands) to give keys to. On a worktree with no
+sessions, `I` opens its project's.
 
 `U` lists everything that needs you now, in every tab, the most urgent first: background tasks asking for a
 permission, flow runs at a gate, tasks whose agent ended its turn with the task still open, agents asking you
@@ -1871,7 +2019,7 @@ crystal tasks terminal docs                                          # carry on 
 - Every Claude Code session crystal starts, a task or in a terminal, may run the crystal commands it's told
   to without asking, so one driving others doesn't stop at every step:
   - starting and driving sessions: `ls`, `new`, `send`, `wait`, `read`, `result`, `interrupt`, `events`,
-    `rename`, `report`, `notify`, `layout`, `pane split` and `pane close`
+    `rename`, `report`, `notify`, `layout` and `layout export`, `pane split` and `pane close`
   - with tasks on, `done`, `task`, and `tasks` with `show`, `log`, `new` and `start`; with flows on, `flow`
     with `run`, `wait`, `show`, `defs` and `retry`
   - with the backlog on, reading it and `add`, `export`, `done`, `reopen` and `start`; with the handoff file
@@ -2189,6 +2337,7 @@ Ported the codec and its tests
   ```
 
 - Notes are a git worktree's: a session outside git has none. `crystal plugin disable handoff` turns them off.
+- `M` in the TUI reads them, with the selected session's [kept files](#kept-files): see below.
 
 #### Kept files
 
@@ -2206,6 +2355,14 @@ than once.
 - `crystal tasks show t12` lists them, and `crystal tasks --json` gives each task's `artifacts`, with their
   `kind` (`file` or `handoff`), `name`, `path` and `bytes`. Each is a `task.artifact` in the [event
   log](#events).
+
+`M` in the TUI, or **its handoff notes and files** in a session's right-click menu, shows what the selected
+session leaves for the next: its worktree's handoff file as it is now, then the files its task kept, the
+handoff file as it was when the task closed among them. The list is on the left, each file with what it is
+and its size, and the one the bar is on is read on the right, a markdown file as its page (`Ctrl+R` flips it
+to its source). `↑`/`↓` (or `j`/`k`) choose, `PgUp`, `PgDn` and `Space` scroll, `Enter` opens the file in
+your `$EDITOR`, as [the file finder](#the-file-finder-and-the-tree-browser) does, and `Esc` closes. With the
+handoff plugin off it shows only the kept files, and with tasks off only the notes.
 
 ### The backlog
 
@@ -2235,9 +2392,9 @@ after it; that task ticks the item off when it closes done.
 ### Flows
 
 A flow is a chain of [tasks](#tasks) on one goal: plan it, build it in a worktree, review it, open the pull
-request. Each step runs with a [profile](#profiles) of its own and starts once the step before it is done,
-given what that step answered. A step can stop the flow at a gate until you've looked at what it did, then
-you go on, or send it back with notes.
+request. Each step runs with a [profile](#profiles) of its own, or an agent, model and effort it sets itself,
+and starts once the step before it is done, given what that step answered. A step can stop the flow at a gate
+until you've looked at what it did, then you go on, or send it back with notes.
 
 Flows are written in the config file, a `[[flow]]` table each, with a `[[flow.step]]` table for each step.
 `crystal flow example` prints this one, with the profiles it runs with, ready to copy in:
@@ -2256,6 +2413,7 @@ prompt = "Plan how to do this: {goal}. Answer with the files to change and how, 
 name = "implement"
 profile = "builder"
 placement = "fresh"
+accept = ["The tests pass", "The work is committed"]
 prompt = """
 Do this: {goal}
 
@@ -2276,6 +2434,7 @@ prompt = "Review the changes on this branch against what was asked: {goal}"
 [[flow.step]]
 name = "pr"
 profile = "shipper"
+model = "sonnet"
 prompt = "Push this branch and open a pull request for it with `gh pr create --fill`."
 ```
 
@@ -2283,7 +2442,11 @@ prompt = "Push this branch and open a pull request for it with `gh pr create --f
 |---|---|
 | `name` | what the step is called; its session is named after the run and it, like `ship-1-plan` |
 | `profile` | optional: the [profile](#profiles) it runs with: agent, model, mode, arguments, instructions, prompt; left out, Claude Code as it's set up |
+| `agent` | optional: the agent it runs, like `codex`, in place of its profile's; on an agent other than its profile's, it keeps only the profile's prompt and instructions |
+| `model`, `effort`, `mode` | optional: its agent's model, how hard it thinks and how it asks before acting, in place of its profile's, checked as a profile's are |
+| `background` | optional: `false` runs Claude Code in a terminal rather than the background; left out, Claude Code runs in the background and any other agent in a terminal, and only Claude Code can |
 | `prompt` | what it's asked, with the names below filled in |
+| `accept` | optional: its [acceptance criteria](#tasks), a list of what has to hold before it's done: its agent is told them under its prompt, and its task carries them |
 | `placement` | optional: where it runs, below; left out, where the step before it ran, and the first where the run started |
 | `worktree` | optional: `true` is `placement = "fresh"`, as it was first written |
 | `gate` | optional: `true` stops the flow after it until you go on, or send the flow back |
@@ -2328,12 +2491,12 @@ crystal flow cancel ship-1           # cancel its step's task, and go no further
 crystal flow defs                    # the flows a run started here finds, and where each is written
 ```
 
-- A step whose profile is Claude Code's runs as a [background task](#background-tasks), so nobody is there to
-  say yes to a permission: give it a profile that allows what it needs, with `mode` and `args`. A step on any
-  other agent, like Codex, runs in a terminal, a session with the step as its [task](#tasks), and the flow goes
-  on once that task closes: done with its summary as the step's answer, or failed. An agent that can't be given
-  a prompt to start on, like Aider, can't be a step. Each step's task goes into the project's
-  [history](#tasks) as `ship-1 plan: <goal>`.
+- A step on Claude Code runs as a [background task](#background-tasks), so nobody is there to say yes to a
+  permission: give it a profile that allows what it needs, with `mode` and `args`. A step on any other agent,
+  like Codex, or on Claude Code with `background = false`, runs in a terminal, a session with the step as its
+  [task](#tasks), where you can watch it and answer it, and the flow goes on once that task closes: done with
+  its summary as the step's answer, or failed. An agent that can't be given a prompt to start on, like Aider,
+  can't be a step. Each step's task goes into the project's [history](#tasks) as `ship-1 plan: <goal>`.
 - Sending the flow back runs the step it goes back to again, in a new round: a background step as a follow-up
   in its own conversation, a step in a terminal in a new session, with the old one left for you to read. Then
   the steps after it run again. In a gate's last round, `max_rounds`, it can't be sent back: approve it, or
@@ -2366,20 +2529,25 @@ crystal flow defs                    # the flows a run started here finds, and w
 
 Most of what crystal does beyond running sessions is a plugin you can switch off: tasks, handoff notes, the
 backlog, memory, profiles, GitHub and GitLab, flows and notifications. Plugins of your own add actions, panes
-over the TUI, hooks on what happens, commands to run as the daemon starts and links to open their own way, and
-use crystal through its own command line, like any script would.
+over the TUI or among its panes, hooks on what happens, commands to run as the daemon starts and links to open
+their own way, and use crystal through its own command line, like any script would. A project can ship its own
+in its repository, which you turn on for it alone.
 
 ```sh
-crystal plugin                     # every plugin, and whether it's on
+crystal plugin                     # every plugin, the project's too, and whether it's on
 crystal plugin disable github      # or enable; written under [plugins] in the config file
 crystal plugin new notes           # a plugin to start from, in ~/.config/crystal/plugins/notes
 crystal plugin install <git-url>   # or a directory; shows what it runs and asks first, then builds it
 crystal plugin build notes         # run its build commands again
 crystal plugin run notes hello     # run one of its actions
 crystal plugin run notes --event session.waiting   # try its hooks on a made-up event
+crystal events --json | tail -1 | crystal plugin run notes --json -   # or on a real one, or what you write
 crystal plugin run notes --link https://…          # run what its link handlers do with a link
+crystal plugin pane open notes board               # open one of its panes, where it says or --placement does
+crystal plugin events              # every event its hooks can hear, and when
 crystal plugin log notes           # what its commands printed, and how they failed
 crystal plugin remove notes
+crystal plugin enable lint --project               # a plugin the project ships, shown first, for it alone
 ```
 
 | Plugin | What it adds |
@@ -2420,6 +2588,7 @@ version = "0.1.0"
 description = "Notes on sessions"
 min_crystal_version = "0.3.0" # optional: the oldest crystal it works with
 platforms = ["macos", "linux"] # optional: where it runs; anywhere, left out
+timeout_secs = 60             # optional: how long a hook or startup command may run; 30, left out
 
 [[build]]                     # run as it's installed, and by `crystal plugin build notes`
 command = ["npm", "ci"]
@@ -2427,6 +2596,7 @@ platforms = ["linux"]         # optional, here and on a startup command: only th
 
 [[startup]]                   # run by the daemon as it starts
 command = ["sh", "restore.sh"]
+timeout_secs = 120            # optional, here and on a hook: in place of the plugin's
 
 [[actions]]                   # run from X, its key, or `crystal plugin run notes add`
 id = "add"
@@ -2438,10 +2608,13 @@ key = "N"                     # optional: a key crystal and other plugins don't 
 on = "session.waiting"        # or a family of events, like "session.*", or "*" for all
 command = ["./on-wait.sh"]
 
-[[panes]]                     # a program shown over the panes
+[[panes]]                     # a program the TUI shows
 id = "board"
 title = "The notes board"
 command = ["sh", "board.sh"]
+placement = "popup"           # optional: "overlay" (the default), "popup", "split", "zoomed" or "tab"
+width = "80%"                 # a popup's: so many cells, or a share of the screen; 80%, left out
+height = 30
 
 [[link_handlers]]             # links a Ctrl+click opens with one of its actions
 pattern = "^https://github\\.com/[^/]+/[^/]+/issues/[0-9]+$"
@@ -2455,6 +2628,7 @@ found from there too. Every command but a build command finds crystal in its env
   "$CRYSTAL_SESSION" "…"`
 - `CRYSTAL_SOCKET`: that crystal's daemon
 - `CRYSTAL_PLUGIN`, `CRYSTAL_PLUGIN_DIR`: the plugin's name and its directory
+- `CRYSTAL_PLUGIN_PROJECT`: for a [project's own](#a-projects-own-plugins), the project's main worktree
 - `CRYSTAL_PLUGIN_CONFIG_DIR`: a directory for its settings, like a token, which you fill in:
   `~/.config/crystal/plugin-config/notes/`, made as the plugin is installed
 - `CRYSTAL_PLUGIN_STATE_DIR`: a directory for what it keeps as it runs, made before each command:
@@ -2477,12 +2651,59 @@ footer showing the first while it waits for the second and `Esc` letting it go. 
 sidebar has, nor start with one, and two plugins can't share a key or have one's be the first of the other's
 two. A key your `[keys]` gives a command, or one of your own, comes before a plugin's.
 
-A pane is a session of its own, started in the plugin's directory and shown over the panes with the keyboard.
-It's in `crystal ls` while it's open, and ends when its program does or when you press `Ctrl+\`. Its
-`CRYSTAL_SESSION` is its own; `CRYSTAL_PROJECT` and `CRYSTAL_WORKTREE` are the selected session's.
+A pane is a session of its own, started in the plugin's directory. Its `placement` says where it goes:
+
+| `placement` | Where |
+|---|---|
+| `overlay` | over the panes beside the sidebar, with the keyboard; the default |
+| `popup` | in a frame over everything, with the keyboard, `width` by `height`: so many cells, or a share of the screen like `"80%"`, which each is when left out |
+| `split` | split off the selected session's pane, to the right, or below with `split = "down"` |
+| `zoomed` | split off the same way, and zoomed over its tab |
+| `tab` | in a tab of its own, named after its title |
+
+Over the panes or in a popup, it's in `crystal ls` while it's open, and ends when its program does or when you
+press `Ctrl+\`. Split off, zoomed or in a tab, it's a session like the others: it stays once its program has
+ended, until you kill it. Its `CRYSTAL_SESSION` is its own; `CRYSTAL_PROJECT` and `CRYSTAL_WORKTREE` are the
+selected session's.
+
+`crystal plugin pane open <plugin> <pane>` opens one from the command line, or a plugin's own command, about
+the session `--session` names, or the one it's run in, beside whose pane a split goes, and prints the session's
+name. `--placement` puts it elsewhere, with `--width` and `--height` for a popup and `--right` or `--down` for a
+split. Over the panes and in a popup it shows in the TUI used last, and needs one open; split off, zoomed or in
+a tab, it goes in the tabs the daemon keeps for the next TUI when none is.
 
 A plugin that names a `min_crystal_version` newer than yours, or `platforms` without yours, won't install;
 one already there is listed `unsupported`, saying why, and can't be turned on.
+
+#### A project's own plugins
+
+A project can ship plugins in its repository, in `.crystal/plugins/<name>/` of its main worktree, each the same
+as any other. A repository mustn't run code on your machine by being cloned or opened, so one is off until you
+turn it on for that project, and it hears only that project's events:
+
+```sh
+crystal plugin                                   # in the project: its own come after yours
+crystal plugin enable lint --project             # shows what it runs, asks, builds it, and turns it on
+crystal plugin enable lint --project -C ~/code/app --yes
+crystal plugin disable lint --project
+```
+
+`--project` means the plugin of that name the project of the current directory ships, or of `-C`'s, rather
+than yours; `run`, `pane open`, `build` and `log` take it too. Turning one on writes its name in the project's
+`[[project]]` table in the config file, made for it if there's none, and gone again once it says nothing more:
+
+```toml
+[[project]]
+path = "~/code/app"
+plugins = ["lint"]
+```
+
+It runs from the copy in the main worktree, whatever branch that's on. Its hooks hear the events whose
+`project` is its project, and its startup commands run with everyone's; its actions and panes run from `X`,
+where it's listed under the selected session's project, and from the command line. Its actions' keys and its
+link handlers aren't used: the sidebar's keys and the links in panes are every project's. `X` turns one off,
+but not on: the command line shows what it runs first. Its settings and what it keeps are kept apart from
+yours and from another project's of the same name, out of the project's repository.
 
 #### Building
 
@@ -2524,6 +2745,8 @@ matched anywhere in the link unless `^` and `$` pin it. `X` lists each plugin's 
 | `session.start_failed` | a session can't start again after a [restart](#usage): its directory or its command has gone; its `status` says why |
 | `session.removed` | a session leaves the list: killed, or its worktree removed |
 | `session.archived` | a session is stopped and kept in the archive: `A`, or `crystal archive` |
+| `session.unarchived` | a session is started again from the archive: `Z`, or `crystal unarchive` |
+| `session.opened_in_terminal` | a background task is opened in a terminal, picking its conversation up: `C`, or `crystal tasks terminal` |
 | `session.claimed` | an agent takes over saying what a session is doing, with [`crystal report`](#teaching-crystal-about-your-agent) |
 | `session.released` | it lets go: `crystal report --release`, or it left and the shell is back in front |
 | `subagent.started` | a session's agent starts a subagent, as its hooks say: its `subagent`, with its `id` and `agent_type` |
@@ -2534,9 +2757,11 @@ matched anywhere in the link unless `^` and `$` pin it. `X` lists each plugin's 
 | `task.opened` | a task is made: given to a session as it starts, made to start later, or opened again by a follow-up |
 | `task.started` | a task made to start later starts, in a session of its own |
 | `task.waiting` | a task's agent ends a turn with the task still open: it waits on you |
+| `task.reminded` | an agent ending its turn with its task open is reminded to close it, and carries on |
 | `task.closed` | a task closes, done, failed or cancelled |
 | `task.artifact` | a file is kept with a task as it closes: one `crystal done --artifact` named, or its worktree's handoff file |
 | `run.started` | a background task starts a run of Claude: its prompt, or a follow-up |
+| `run.tool_use` | a background task's Claude uses a tool: its `run`'s `tool`, with its `name` and `gist`, one for each call |
 | `run.asking` | a background task's Claude asks you for a permission |
 | `run.answered` | you answer it: allowed, allowed always, or denied |
 | `run.interrupted` | you stop a background task's run halfway |
@@ -2549,9 +2774,14 @@ matched anywhere in the link unless `^` and `$` pin it. `X` lists each plugin's 
 | `flow.ended` | a flow run ends: every step done, one failed, or you cancelled it |
 | `worktree.created` | crystal makes a worktree |
 | `worktree.removed` | crystal removes one |
+| `worktree.hook_failed` | a [worktree hook](#usage) failed, or ran too long |
 | `handoff.added` | a note goes in a worktree's handoff file: `crystal handoff`, or a task closing there |
 | `memory.added` | an entry is added to a project's memory: remembered, or by the distiller |
 | `memory.forgotten` | an entry is forgotten |
+| `memory.stale` | every file an entry is about has changed since it was said, as the daemon finds hourly and as each task closes |
+| `memory.promoted` | an entry is written into the project's CLAUDE.md or AGENTS.md, which its `file` names |
+| `memory.distilled` | the [distiller](#memory) has read what a session did: its `distill` says how many entries it `added`, found `again` and `rejected`, and what it cost |
+| `memory.distill_failed` | the distiller couldn't: its `distill`'s `failed` says why |
 | `backlog.added` | an item goes on a project's backlog |
 | `backlog.closed` | an item is marked done |
 | `plugin.paused` | a plugin is paused for failing |
@@ -2568,18 +2798,38 @@ and its name in `CRYSTAL_EVENT`:
 ```
 
 `task.closed` has a `task`, with its `goal`, `session`, `project`, `branch` and `outcome` (whether it `failed`,
-its `summary`, and when it `closed`). The worktree events have a `worktree`, with its `path`, `branch` and,
-once it's made, `project`. `session.message` has a `message`, with its first `line` and, when another session
-sent it, that session's name (`from`) and id (`from_id`). The rest are under [events](#events).
+its `summary`, and when it `closed`). The worktree events have a `worktree`, with its `path`, `branch` and
+`project`, and for `worktree.hook_failed`, `why`. `session.message` has a `message`, with its first `line` and,
+when another session sent it, that session's name (`from`) and id (`from_id`). The rest are under
+[events](#events).
+
+The same JSON is in `CRYSTAL_EVENT_JSON`, and what happened in a line in `CRYSTAL_EVENT_TEXT`, what it's about
+and what the timeline says of it, for a script that wants no `jq`: `claude-2: working → waiting`, `reviewer:
+done: two risks in the retry loop`, or the event's name where there's nothing more to say. `crystal plugin
+events` lists every event with when it happens.
 
 `crystal plugin run <name> --event <event>` runs the plugin's hooks on that event, here and now, whether the
 plugin is on or not, on a made-up event with everything its kind carries, about the session `--session` names,
-or the one it's run in, or a made-up one. What they print is printed, and it exits as the first that failed.
+or the one it's run in, or a made-up one. `--json` gives the event, or what of it to put over the made-up one,
+as a JSON object, or `-` to read it from standard input, so a line of `crystal events --json` runs them on
+something that happened; its `event` says which, unless `--event` does. What they print is printed, and it
+exits as the first that failed.
 
 A plugin's hooks run one at a time, in the order things happened, and what they print goes to its log, kept in
-crystal's state directory. A hook still running after 30 seconds is stopped. After 5 failures in a row, startup
-commands included, the plugin is paused, with a notification, and `crystal plugin` shows it `paused` until
-`crystal plugin enable <name>` turns it back on.
+crystal's state directory. A hook still running after its `timeout_secs`, or its plugin's, 30 seconds unless
+either says, is stopped. After 5 failures in a row, startup commands included, the plugin is paused, with a
+notification, and `crystal plugin` shows it `paused` until `crystal plugin enable <name>` turns it back on.
+
+#### Examples
+
+[`examples/plugins/`](examples/plugins/) has plugins to copy, or install as they are with `crystal plugin
+install examples/plugins/<name>`. crystal's tests install each and run its hooks.
+
+| Example | Hears | Does |
+|---|---|---|
+| [`event-log`](examples/plugins/event-log/) | `*` | keeps every event as a line of JSON; its `follow` pane, split off below, shows them as they come |
+| [`slack`](examples/plugins/slack/) | `task.closed`, `flow.gate`, `flow.ended`, `plugin.paused` | posts `$CRYSTAL_EVENT_TEXT` to a Slack incoming webhook, its URL in its settings directory, unless a task or a flow run ended done |
+| [`worktree-env`](examples/plugins/worktree-env/) | `worktree.created` | copies the project's `.env` files into each worktree crystal makes: one to ship in a repository's `.crystal/plugins/` |
 
 #### Security
 
@@ -2587,7 +2837,9 @@ A plugin is code that runs as you, with everything you can reach: your files, yo
 build runs as it's installed, and its hooks and startup commands in the background, whenever something happens
 or the daemon starts. Add only plugins you'd run as a script of your own. `crystal plugin install` shows every
 command a plugin would run, its build and startup commands and the actions its link handlers run included, and
-asks before it installs it, and installs it switched off.
+asks before it installs it, and installs it switched off. A project's own plugin never runs until `crystal
+plugin enable --project` has shown you the same and you've said yes; after that, it runs whatever the
+repository's main worktree has, so turn it on only for a repository whose changes you'd run.
 
 ### Settings
 
@@ -2610,23 +2862,24 @@ that makes no sense is said there too, and the settings stay as they were until 
 | `[colors]` | | colors of your own over the theme's: [themes](#themes) |
 | `name_from_prompt` | `true` | name a session you don't name for the [first thing it's asked](#starting-a-session) |
 | `resume_reported_agents` | `true` | after a restart, run the command an agent [said resumes it](#teaching-crystal-about-your-agent), or the one that resumes an agent [typed into a shell](#usage) whose hooks named its conversation |
+| `confirm_quit` | `true` | `q` asks before it quits the TUI, since a key meant for an agent can land on the sidebar; the sessions keep running either way |
 | `scrollback_lines` | `10000` | how many rows that scrolled off a session's screen it keeps, up to 1,000,000, for scrolling back, copy mode, `e` and `crystal read --history` |
 | `[plugins]` | | which plugins are on and off: [plugins](#plugins) |
 | `[memory]` | | how memory's [distiller](#the-distiller) runs, and whether it [searches by meaning](#search-by-meaning) |
 | `[tasks]` | | what [background tasks](#background-tasks) may spend: `max_budget_usd` each (`5`), `daily_budget_usd` all together (none); and what they may do without asking: `permission_mode` (`"default"`), `allowed_tools` (none) and `allow_bypass` (`false`) |
 | `[events]` | | `keep_days`, how long the [event log](#events) keeps what happened: 30 days, or `0` for ever |
 | `[handoff]` | | `in_git`, the projects, by their main worktree, whose [handoff notes](#the-handoff-file) go in git |
-| `[worktrees]` | | `base`, the branch new worktrees' new branches [start from](#usage): `origin`'s default branch unless set |
+| `[worktrees]` | | `base`, the branch new worktrees' new branches [start from](#usage): `origin`'s default branch unless set; `directory`, where new worktrees [go](#usage), each project's in a directory of its own, from `/` or `~`: beside the project, in `<repo>.worktrees`, unless set |
 | `[forge]` | | `hide_draft_prs`, leave draft pull requests out of [the pull requests](#pull-requests), the tab bar's count and `/` (`false`) |
 | `[sessions]` | | `stop_idle_after`, how long an agent may sit [idle](#archiving-and-idle-agents) before crystal stops it, like `"30m"`: `"off"`; `restart_spacing_ms`, how far apart the agents a [crash or a reboot](#usage) starts again start (`250`, or `0` for all at once) |
-| `[[project]]` | | a project's [run and open commands](#projects), by its main worktree's `path`, in place of its own file's |
+| `[[project]]` | | a project's [run and open commands](#projects), by its main worktree's `path`, in place of its own file's, and the [plugins it ships](#a-projects-own-plugins) that are on for it, `plugins` |
 | `[keys]` | | the TUI's keys, by command, its prefixes, the key back to the sidebar, answering's, resize mode's and the views', and `[[keys.command]]`, keys of your own that run commands: [keys and commands](#keys-and-commands) |
 | `[sidebar]` | | the sidebar's `width`, whether it starts `folded`, what folding keeps, and whether what needs you is pinned: [the sidebar](#the-sidebar) |
 | `[terminal]` | | the shell a new terminal runs, `default_shell`, whether it's a login shell, `shell_mode`, and where `t` starts one, `new_cwd`: [terminals](#terminals-the-window-and-the-tab-bar) |
 | `[window]` | | `title`, what the TUI titles its terminal: [the window](#terminals-the-window-and-the-tab-bar) |
 | `[tab_bar]` | | where the tab bar goes, whether it's left out with one tab, and what it shows at its right: [the tab bar](#terminals-the-window-and-the-tab-bar) |
 | `[appearance]` | | `auto_switch`, the theme following your system's light or dark, and the theme for each: [themes](#themes) |
-| `[mouse]` | | `capture`, whether the TUI takes the mouse from your terminal (`true`); `copy_on_select`, whether a selection is copied as you let go or waits in copy mode for `y` (`true`); `scroll_lines`, how far a notch of the wheel scrolls a pane, up to 100, or how many arrow keys it sends a pager (`3`); `scrollbars`, a scrollbar beside each pane (`true`): [the mouse](#usage) |
+| `[mouse]` | | `capture`, whether the TUI takes the mouse from your terminal (`true`); `copy_on_select`, whether a selection is copied as you let go or waits in copy mode for `y` (`true`); `scroll_lines`, how far a notch of the wheel scrolls a pane, up to 100, or how many arrow keys it sends a pager (`3`); `scrollbars`, a scrollbar beside each pane (`true`); `attach_capture`, whether `crystal attach` takes the mouse, for the wheel to scroll a session's history (`false`): [the mouse](#usage) |
 | `[clipboard]` | | `allow_programs`, whether what a program in a session copies goes on your clipboard (`true`): [copying](#zoom-copy-mode-and-search) |
 | `[update]` | | `check`, whether the TUI looks once a day for a [newer crystal](#updating) (`true`) |
 
@@ -2653,8 +2906,8 @@ each time one starts, `[[project]]` each time a project's commands run,
 what it had); `crystal new` and the TUI read `[terminal]` each time they start a shell, and `crystal attach`
 reads `[clipboard]` as it attaches; the TUI reads
 `new_session`, `theme`, `[colors]`, `[appearance]`, `[window]`, `[tab_bar]`, `scrollback_lines`, `[plugins]`,
-`[update]`, `[mouse]`, `[clipboard]`, `[forge]`, the profiles and the flows when it starts, again when you save
-a profile or switch a plugin, and every half a second while the settings view is open.
+`[update]`, `[mouse]`, `[clipboard]`, `[forge]`, `confirm_quit`, the profiles and the flows when it starts,
+again when you save a profile or switch a plugin, and every half a second while the settings view is open.
 
 #### Themes
 
@@ -2805,8 +3058,8 @@ issues give way before it.
 sounds, the theme and whether it follows your system's [appearance](#themes) (the row says which theme each
 side is), whether the [tab bar](#terminals-the-window-and-the-tab-bar) goes on top or over the footer and is
 left out with one tab, how long an agent may sit [idle](#archiving-and-idle-agents), how far apart agents
-start again after a [crash or a reboot](#usage), [the mouse](#usage), whether programs' copies go on [your
-clipboard](#zoom-copy-mode-and-search), how memory learns ([the
+start again after a [crash or a reboot](#usage), whether `q` asks before it quits, [the mouse](#usage),
+whether programs' copies go on [your clipboard](#zoom-copy-mode-and-search), how memory learns ([the
 distiller](#the-distiller)) and searches ([by meaning](#search-by-meaning)), the permission mode [background
 tasks](#background-tasks) start in, and whether [draft pull requests](#pull-requests) are hidden. `space`
 changes the one the bar is on, and `←/→` go through the [themes](#themes), forward and back (the row says which
@@ -2929,6 +3182,8 @@ emulates for it, as it would through any terminal.
 - [x] Tasks that close done or failed, and a backlog per project
 - [x] Plugins: crystal's own switched on and off, and your own actions, panes and hooks
 - [x] Links in panes, opened with `Ctrl`+click or by a plugin; plugins' builds and startup commands
+- [x] Plugins a project ships, on for it alone; plugin panes in popups, splits and tabs, opened from the
+  command line; and example plugins
 - [x] An event log, a stream of events on the socket, and waits on it
 - [x] Any agent saying what it's doing and how to resume it, and sessions named from their first prompt
 - [x] Restart the daemon on a new crystal without stopping its sessions

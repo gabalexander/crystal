@@ -15,8 +15,8 @@ use crate::catalog::{self, Agent, Choices, FirstPrompt, Setting};
 use crate::flows::Flow;
 use crate::forge::Checkout;
 use crate::profile::{Profile, StartIn};
-use crate::protocol::{TaskBrief, TaskSpec};
-use crate::{git, shell};
+use crate::protocol::{Front, TaskBrief, TaskSpec};
+use crate::{front, git, shell};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::{Margin, Rect};
@@ -168,6 +168,9 @@ pub struct Setup {
     pub background: bool,
     /// The made-up name a new worktree's branch starts with.
     pub branch: String,
+    /// Where new worktrees go, when the settings say: `[worktrees]
+    /// directory`.
+    pub worktree_directory: Option<PathBuf>,
 }
 
 /// What a key in the panel leads to.
@@ -267,6 +270,12 @@ pub struct Launcher {
     keeps_draft: bool,
     /// Whether it opened on the draft left last time, which it says.
     from_draft: bool,
+    /// Arguments of the session `D` started it like that neither what runs
+    /// nor its rows give, kept on the command while what runs is the one
+    /// it picked, by its place in `runs`.
+    extra: Option<(usize, Vec<String>)>,
+    /// Where new worktrees go, when the settings say.
+    worktree_directory: Option<PathBuf>,
 }
 
 impl Launcher {
@@ -293,6 +302,8 @@ impl Launcher {
             opened_at: setup.target,
             keeps_draft: false,
             from_draft: false,
+            extra: None,
+            worktree_directory: setup.worktree_directory,
         };
         launcher.choose_run(setup.run);
         // Opened for a new worktree, as by `w`, it stays one whatever the
@@ -371,6 +382,68 @@ impl Launcher {
             self.focus = draft.focus;
         }
         self
+    }
+
+    /// Starts out like the session that runs `command`, for `D`: what runs
+    /// it, the profile whose arguments its command has or else its agent,
+    /// each row at the option its command gives, the rest of its arguments
+    /// kept, and in the background for a background task. Where it starts
+    /// is where the panel opened, the session's place, and the task is left
+    /// to write. `None` when nothing the panel offers runs it, a program
+    /// that's neither an agent crystal knows nor a shell.
+    pub fn like(mut self, command: &[String], background: bool) -> Option<Launcher> {
+        let task = if background {
+            command.get(2).cloned()
+        } else {
+            catalog::first_prompt_in(command)
+        };
+        let command = without_task(command, background);
+        let run = run_like(&self.runs, &command, task.as_deref())?;
+        self.choose_run(run);
+        self.target = self.opened_at;
+        let mut left = command.get(1..).unwrap_or_default().to_vec();
+        // After `--` is the first prompt, for an agent that takes it so.
+        let after_dashes = self.run().agent().map(|agent| agent.first_prompt);
+        if after_dashes == Some(FirstPrompt::Argument)
+            && let Some(at) = left.iter().position(|arg| arg == "--")
+        {
+            left.truncate(at);
+        }
+        if let Run::Profile(profile) = self.run() {
+            let extras = extras(profile);
+            let found = match extras.len() {
+                0 => None,
+                len => left.windows(len).position(|w| w == extras),
+            };
+            if let Some(at) = found {
+                left.drain(at..at + extras.len());
+            }
+        }
+        for (row, setting) in self.run().settings().iter().enumerate() {
+            let given = value_of(&left, setting.option);
+            if let Some(model) = &given
+                && setting.choices == Choices::CodexModels
+                && !self.codex_models.contains(model)
+            {
+                self.codex_models.push(model.clone());
+            }
+            // A value that isn't among the row's choices rides along as it
+            // was, where it was.
+            let at = given.and_then(|value| self.index_of(setting, &value));
+            if at.is_some() {
+                take_option(&mut left, setting.option);
+            }
+            self.chosen[row] = at.unwrap_or(0);
+        }
+        self.touched = true;
+        if !left.is_empty() {
+            self.extra = Some((self.run, left));
+        }
+        self.how = usize::from(background && self.can_run_in_background());
+        if !self.run().takes_task() {
+            self.focus = Field::Run;
+        }
+        Some(self)
     }
 
     /// Whether what the panel holds is kept as a draft when it's put away.
@@ -761,6 +834,11 @@ impl Launcher {
         for (setting, &choice) in self.run().settings().iter().zip(&self.chosen) {
             *profile.choice_mut(setting.kind) = self.value(setting, choice);
         }
+        if let Some((run, extra)) = &self.extra
+            && *run == self.run
+        {
+            profile.args.extend(extra.iter().cloned());
+        }
         profile.command(&self.task_text())
     }
 
@@ -829,7 +907,8 @@ impl Launcher {
             return None;
         };
         let branch = self.branch_name();
-        (!branch.is_empty()).then(|| git::worktree_dir(base, &branch))
+        let directory = self.worktree_directory.as_deref();
+        (!branch.is_empty()).then(|| git::worktree_dir(base, &branch, directory))
     }
 
     /// Enter: starts the session, unless a new worktree has no branch yet.
@@ -886,6 +965,126 @@ impl Launcher {
             _ => line,
         }
     }
+}
+
+/// `command` without what it was asked: a background task's `claude -p
+/// <prompt> <options>` as the `claude <options>` that starts the same agent
+/// in a terminal, and any other command without its agent's first prompt,
+/// where that's plain to see.
+fn without_task(command: &[String], background: bool) -> Vec<String> {
+    match command {
+        [program, flag, _prompt, options @ ..] if background && flag == "-p" => {
+            let mut without = vec![program.clone()];
+            without.extend(options.iter().cloned());
+            without
+        }
+        _ => catalog::without_first_prompt(command),
+    }
+}
+
+/// Which of `runs` runs `command`, a session's without its task, which
+/// was `task`: the user's shell for a shell; for an agent, the profile its
+/// command fits best, or else the agent itself; `None` for any other
+/// program.
+fn run_like(runs: &[Run], command: &[String], task: Option<&str>) -> Option<usize> {
+    let program = match front::of_command(command) {
+        None | Some(Front::Shell { .. }) => {
+            return runs.iter().position(|run| *run == Run::Shell);
+        }
+        Some(Front::Agent { program, .. }) => program,
+        Some(_) => return None,
+    };
+    let mut best: Option<(usize, usize)> = None;
+    for (index, run) in runs.iter().enumerate() {
+        let fit = match run {
+            Run::Agent(agent) if agent.program == program => Some(0),
+            Run::Profile(profile) if profile.agent == program => fit(profile, command, task),
+            _ => None,
+        };
+        if let Some(fit) = fit
+            && best.is_none_or(|(most, _)| fit > most)
+        {
+            best = Some((fit, index));
+        }
+    }
+    best.map(|(_, index)| index)
+}
+
+/// How well `profile` fits a session that ran `command` on `task`: by
+/// the arguments it adds, which the command has to have, its prompt, which
+/// the task starts with, and its rows' choices, when the command gives the
+/// same. `None` when it doesn't fit, or nothing tells it apart from its
+/// agent alone, which is picked then.
+fn fit(profile: &Profile, command: &[String], task: Option<&str>) -> Option<usize> {
+    let extras = extras(profile);
+    let has =
+        |words: &[String]| words.is_empty() || command.windows(words.len()).any(|w| w == words);
+    if !has(&extras) {
+        return None;
+    }
+    let mut fit = extras.len();
+    if let Some(asks) = profile
+        .prompt
+        .as_deref()
+        .filter(|asks| !asks.trim().is_empty())
+    {
+        if !task?.starts_with(asks.trim()) {
+            return None;
+        }
+        fit += 1;
+    }
+    let settings = catalog::find(&profile.agent).map_or(&[][..], |agent| agent.settings);
+    let sets_rows = settings.iter().any(|s| profile.choice(s.kind).is_some());
+    let rows_fit = settings
+        .iter()
+        .all(|s| option_in(command, s.option) == *profile.choice(s.kind));
+    if sets_rows && rows_fit {
+        fit += 1;
+    }
+    (fit > 0).then_some(fit)
+}
+
+/// What `profile` adds to its agent's command line past its rows'
+/// options: its instructions and arguments.
+fn extras(profile: &Profile) -> Vec<String> {
+    let bare = Profile {
+        model: None,
+        effort: None,
+        mode: None,
+        prompt: None,
+        ..profile.clone()
+    };
+    bare.command("").split_off(1)
+}
+
+/// The value `command` gives `option`, as `--model opus` or
+/// `--model=opus`, before any `--`.
+fn option_in(command: &[String], option: &str) -> Option<String> {
+    value_of(command.get(1..).unwrap_or_default(), option)
+}
+
+/// The value `args` give `option`.
+fn value_of(args: &[String], option: &str) -> Option<String> {
+    take_option(&mut args.to_vec(), option)
+}
+
+/// Takes the value `args` give `option`, and the option, out of them.
+fn take_option(args: &mut Vec<String>, option: &str) -> Option<String> {
+    let end = args
+        .iter()
+        .position(|arg| arg == "--")
+        .unwrap_or(args.len());
+    let joined = format!("{option}=");
+    let at = args[..end]
+        .iter()
+        .position(|arg| arg == option || arg.starts_with(&joined))?;
+    let value = match args[at].strip_prefix(&joined) {
+        Some(value) => value.to_string(),
+        None if at + 1 < end => args.remove(at + 1),
+        None => String::new(),
+    };
+    args.remove(at);
+    (!value.is_empty()).then_some(value)
 }
 
 /// A background task's run, from the command that would start the agent
@@ -1287,6 +1486,7 @@ mod tests {
             codex_models: vec!["gpt-6-luna".into(), "gpt-5.5".into()],
             background: false,
             branch: "brave-otter".into(),
+            worktree_directory: None,
         })
     }
 
@@ -1358,6 +1558,7 @@ mod tests {
             codex_models: Vec::new(),
             background: false,
             branch: "calm-heron".into(),
+            worktree_directory: None,
         })
     }
 
@@ -1756,6 +1957,113 @@ mod tests {
         assert_eq!(panel.command()[5..7], ["--permission-mode", "acceptEdits"]);
     }
 
+    fn words(command: &str) -> Vec<String> {
+        command.split(' ').map(String::from).collect()
+    }
+
+    #[test]
+    fn like_a_session_the_panel_runs_its_agent_with_its_options_and_no_task() {
+        let runs = vec![agent("codex"), agent("claude"), Run::Shell];
+        let mut command = words("claude --model opus --effort=high --");
+        command.push("fix the tests".into());
+        let mut panel = launcher(runs).like(&command, false).unwrap();
+        assert_eq!(panel.run().key(), "claude");
+        assert_eq!(panel.focus(), Field::Task);
+        assert!(panel.task().text().is_empty());
+        assert!(!panel.is_new_worktree());
+        type_text(&mut panel, "now the docs");
+        assert_eq!(
+            panel.command(),
+            words("claude --model opus --effort high")
+                .into_iter()
+                .chain(["--".into(), "now the docs".into()])
+                .collect::<Vec<_>>()
+        );
+        // Its rows can still change.
+        press(&mut panel, KeyCode::Tab);
+        press(&mut panel, KeyCode::Tab);
+        press(&mut panel, KeyCode::Right);
+        assert_eq!(panel.command()[1..3], ["--model", "sonnet"]);
+    }
+
+    #[test]
+    fn like_a_session_the_panel_picks_the_profile_its_command_fits() {
+        let reviewer = Profile {
+            name: "reviewer".into(),
+            mode: Some("plan".into()),
+            args: vec!["--add-dir".into(), "../docs".into()],
+            start_in: Some(StartIn::Worktree),
+            ..Profile::for_agent("claude")
+        };
+        let opus = Profile {
+            name: "opus".into(),
+            model: Some("opus".into()),
+            ..Profile::for_agent("claude")
+        };
+        let plain = Profile {
+            name: "plain".into(),
+            ..Profile::for_agent("claude")
+        };
+        let runs = vec![
+            Run::Profile(plain),
+            Run::Profile(opus),
+            Run::Profile(reviewer),
+            agent("claude"),
+        ];
+        let like = |command: &str| launcher(runs.clone()).like(&words(command), false).unwrap();
+        // Its arguments are the reviewer's, in the place it started in: the
+        // session's, not the profile's new worktree.
+        let panel = like("claude --permission-mode plan --add-dir ../docs");
+        assert_eq!(panel.run().key(), "profile:reviewer");
+        assert!(!panel.is_new_worktree());
+        assert_eq!(
+            panel.command(),
+            words("claude --permission-mode plan --add-dir ../docs")
+        );
+        // Its rows are opus's.
+        assert_eq!(like("claude --model opus").run().key(), "profile:opus");
+        // Nothing tells a profile apart: the agent itself, with its rows.
+        let panel = like("claude --model sonnet");
+        assert_eq!(panel.run().key(), "claude");
+        assert_eq!(panel.command(), words("claude --model sonnet"));
+    }
+
+    #[test]
+    fn like_a_session_the_panel_keeps_what_it_has_no_row_for() {
+        let command = words("claude --dangerously-skip-permissions --model claude-x-9");
+        let mut panel = launcher(vec![agent("claude"), agent("codex")])
+            .like(&command, false)
+            .unwrap();
+        type_text(&mut panel, "go");
+        assert_eq!(
+            panel.command(),
+            words("claude --dangerously-skip-permissions --model claude-x-9 -- go")
+        );
+        // Another agent doesn't take them.
+        press(&mut panel, KeyCode::Tab);
+        press(&mut panel, KeyCode::Right);
+        assert_eq!(panel.command(), words("codex -- go"));
+    }
+
+    #[test]
+    fn like_a_background_task_the_panel_starts_one_in_the_background() {
+        let command = words("claude -p fix-it --model haiku");
+        let panel = launcher_with_background(vec![agent("claude")])
+            .like(&command, true)
+            .unwrap();
+        assert!(panel.in_background());
+        assert_eq!(panel.command(), words("claude --model haiku"));
+    }
+
+    #[test]
+    fn like_a_shell_the_panel_starts_a_shell_and_like_another_program_nothing() {
+        let runs = vec![agent("claude"), Run::Shell];
+        let shell = launcher(runs.clone()).like(&words("/bin/zsh -l"), false);
+        assert_eq!(shell.unwrap().run(), &Run::Shell);
+        assert!(launcher(runs.clone()).like(&[], false).is_some());
+        assert!(launcher(runs).like(&words("htop"), false).is_none());
+    }
+
     #[test]
     fn a_codex_profile_s_model_is_there_before_codex_lists_its_models() {
         let fast = Profile {
@@ -1786,6 +2094,7 @@ mod tests {
             codex_models: Vec::new(),
             background: false,
             branch: "brave-otter".into(),
+            worktree_directory: None,
         });
         assert!(panel.is_new_worktree());
     }

@@ -1,0 +1,9 @@
+name = "worktree-env"
+version = "0.1.0"
+description = "Copies the project's .env files into each worktree crystal makes"
+
+# Ship it in a repository's .crystal/plugins/ for its own worktrees, and
+# turn it on there with `crystal plugin enable worktree-env --project`.
+[[events]]
+on = "worktree.created"
+command = ["sh", "copy.sh"]

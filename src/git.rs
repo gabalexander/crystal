@@ -7,6 +7,7 @@
 
 pub mod branches;
 
+use crate::printable;
 use crate::protocol::{InProgress, Worktree};
 use anyhow::{Context, Result, bail};
 use std::collections::HashMap;
@@ -158,18 +159,41 @@ pub struct Base {
     pub fetch: bool,
 }
 
+/// Where a new worktree's directory goes.
+#[derive(Debug, Clone, Default)]
+pub struct Location {
+    /// The directory asked for this time, like `--path`'s, in place of
+    /// the one its branch gives it.
+    pub path: Option<PathBuf>,
+    /// The directory the settings keep worktrees in, each project's in a
+    /// directory named after it, in place of one beside the project.
+    pub directory: Option<PathBuf>,
+}
+
+impl Location {
+    /// Where the worktree for `branch` of the project at `project_path`
+    /// goes.
+    pub fn of(&self, project_path: &Path, branch: &str) -> PathBuf {
+        match &self.path {
+            Some(path) => path.clone(),
+            None => worktree_dir(project_path, branch, self.directory.as_deref()),
+        }
+    }
+}
+
 /// How long a call that talks to `origin` may take before a new worktree
 /// is made from what the clone has instead: a connection that has
 /// stalled mustn't hold up a new session for good.
 const REMOTE_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// Makes a worktree for `branch` in the repository `dir` is in, and returns
-/// its directory. A branch that exists already is checked out as it is; a
-/// new one starts where [`start_point`] says for `base`.
-pub fn add_worktree(dir: &Path, branch: &str, base: &Base) -> Result<PathBuf> {
+/// Makes a worktree for `branch` in the repository `dir` is in, where
+/// `location` says, and returns its directory. A branch that exists
+/// already is checked out as it is; a new one starts where
+/// [`start_point`] says for `base`.
+pub fn add_worktree(dir: &Path, branch: &str, base: &Base, location: &Location) -> Result<PathBuf> {
     let checkout = Checkout::find(dir)
         .with_context(|| format!("{} isn't in a git repository", dir.display()))?;
-    let target = worktree_dir(&checkout.project_path, branch);
+    let target = location.of(&checkout.project_path, branch);
     let target_arg = target.to_string_lossy();
     if branch_exists(dir, branch) {
         git(dir, &["worktree", "add", &target_arg, branch])?;
@@ -312,9 +336,14 @@ fn fetch_branch(dir: &Path, branch: &str) -> Result<()> {
 
 /// Makes a worktree in the repository `dir` is in on a new branch: `branch`,
 /// or else `branch-2`, `branch-3`… whichever is neither a branch yet nor
-/// has a worktree's directory in the way, starting where `base` says.
-/// Returns its directory, and the branch it's on.
-pub fn add_new_worktree(dir: &Path, branch: &str, base: &Base) -> Result<(PathBuf, String)> {
+/// has a worktree's directory in the way, starting where `base` says, and
+/// where `location` says. Returns its directory, and the branch it's on.
+pub fn add_new_worktree(
+    dir: &Path,
+    branch: &str,
+    base: &Base,
+    location: &Location,
+) -> Result<(PathBuf, String)> {
     let checkout = Checkout::find(dir)
         .with_context(|| format!("{} isn't in a git repository", dir.display()))?;
     let free = (1..)
@@ -323,10 +352,10 @@ pub fn add_new_worktree(dir: &Path, branch: &str, base: &Base) -> Result<(PathBu
             n => format!("{branch}-{n}"),
         })
         .find(|name| {
-            !branch_exists(dir, name) && !worktree_dir(&checkout.project_path, name).exists()
+            !branch_exists(dir, name) && !location.of(&checkout.project_path, name).exists()
         })
         .expect("some number is free");
-    let path = add_worktree(dir, &free, base)?;
+    let path = add_worktree(dir, &free, base, location)?;
     Ok((path, free))
 }
 
@@ -345,8 +374,13 @@ pub fn worktree_on(project: &Path, branch: &str) -> Result<Option<PathBuf>> {
 /// It's fetched first. A new branch starts there and follows `fetch` on
 /// `origin`, so that `git pull` brings what's pushed to it later; a branch
 /// that's there already is brought up to it, unless it has commits of its
-/// own. Returns the worktree's directory.
-pub fn add_fetched_worktree(project: &Path, branch: &str, fetch: &str) -> Result<PathBuf> {
+/// own. It goes where `location` says. Returns the worktree's directory.
+pub fn add_fetched_worktree(
+    project: &Path,
+    branch: &str,
+    fetch: &str,
+    location: &Location,
+) -> Result<PathBuf> {
     // Both come from the forge, and go to git as arguments.
     for name in [branch, fetch] {
         if name.is_empty() || name.starts_with('-') || name.contains(char::is_whitespace) {
@@ -360,7 +394,7 @@ pub fn add_fetched_worktree(project: &Path, branch: &str, fetch: &str) -> Result
     // By its commit: another fetch in the repository could move FETCH_HEAD.
     let tip = git(project, &["rev-parse", "--verify", "FETCH_HEAD^{commit}"])?;
     let tip = tip.trim();
-    let target = worktree_dir(&checkout.project_path, branch);
+    let target = location.of(&checkout.project_path, branch);
     let target_arg = target.to_string_lossy();
     if branch_exists(project, branch) {
         git(project, &["worktree", "add", &target_arg, branch])?;
@@ -414,6 +448,9 @@ pub struct Linked {
     /// commit each is at, by its path: it says what one holds, where its
     /// branch's name, a hash, says nothing.
     pub subjects: HashMap<PathBuf, String>,
+    /// The labels the worktrees were given, by their paths: see
+    /// [`set_label`].
+    pub labels: HashMap<PathBuf, String>,
 }
 
 /// The worktrees linked to the repository whose main worktree is
@@ -436,10 +473,14 @@ pub fn linked_worktrees(project_path: &Path) -> Result<Linked> {
         let Ok(path) = std::fs::canonicalize(&listed.path) else {
             continue;
         };
-        let (branch, in_progress) = match git_dir_of(&path) {
-            Some(git_dir) => standing(&git_dir),
+        let git_dir = git_dir_of(&path);
+        let (branch, in_progress) = match &git_dir {
+            Some(git_dir) => standing(git_dir),
             None => (listed.branch, None),
         };
+        if let Some(label) = git_dir.as_deref().and_then(label_in) {
+            linked.labels.insert(path.clone(), label);
+        }
         let worktree = Worktree {
             project: checkout.project.clone(),
             project_path: checkout.project_path.clone(),
@@ -521,6 +562,13 @@ pub fn still_has_worktree(project_path: &Path, path: &Path) -> Result<bool> {
         git(project_path, &["worktree", "prune"])?;
     }
     Ok(there)
+}
+
+/// Makes the directory `dir` a git repository of its own, for a project
+/// that isn't one yet.
+pub fn init(dir: &Path) -> Result<()> {
+    git(dir, &["init", "--quiet"])?;
+    Ok(())
 }
 
 /// Whether the worktree at `dir` has changes that `git worktree remove`
@@ -921,14 +969,68 @@ fn lines(output: &str) -> Vec<String> {
 }
 
 /// Where a new worktree for `branch` goes: beside the project, in a
-/// directory named `<project>.worktrees` with one directory per branch.
-/// A `/` in the branch becomes a `-`, so each worktree is one level down.
-pub fn worktree_dir(project_path: &Path, branch: &str) -> PathBuf {
-    let project = project_path.file_name().unwrap_or_default();
-    let parent = project_path.parent().unwrap_or(project_path);
-    parent
-        .join(format!("{}.worktrees", project.to_string_lossy()))
-        .join(branch.replace('/', "-"))
+/// directory named `<project>.worktrees` with one directory per branch, or
+/// with `directory`, the settings', in `<directory>/<project>`. A `/` in
+/// the branch becomes a `-`, so each worktree is one level down.
+pub fn worktree_dir(project_path: &Path, branch: &str, directory: Option<&Path>) -> PathBuf {
+    let project = project_path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy();
+    let parent = match directory {
+        Some(directory) => directory.join(&*project),
+        None => {
+            let beside = project_path.parent().unwrap_or(project_path);
+            beside.join(format!("{project}.worktrees"))
+        }
+    };
+    parent.join(branch.replace('/', "-"))
+}
+
+/// The path git config sets `key` to for the repository `dir` is in, read
+/// the way git reads its own settings, the repository's over the user's,
+/// with `~` made the home directory; `None` when it isn't set.
+pub fn config_path(dir: &Path, key: &str) -> Option<PathBuf> {
+    let value = git(dir, &["config", "--type=path", "--get", key]).ok()?;
+    let value = value.trim();
+    (!value.is_empty()).then(|| PathBuf::from(value))
+}
+
+/// The file in a linked worktree's own git directory where crystal keeps
+/// its label: git ignores it there, and removes it with the worktree.
+const LABEL_FILE: &str = "crystal-label";
+
+/// The label kept in the git directory `git_dir`, if there's one.
+fn label_in(git_dir: &Path) -> Option<String> {
+    let kept = std::fs::read_to_string(git_dir.join(LABEL_FILE)).ok()?;
+    let label = printable::line(kept.trim()).trim().to_string();
+    (!label.is_empty()).then_some(label)
+}
+
+/// Gives the linked worktree at `path` the label `label`, a few words on
+/// what it's for, or with an empty one takes its label off. It's kept in
+/// the worktree's own git directory, so that it goes with the worktree.
+/// The main worktree is the project's, and takes none.
+pub fn set_label(path: &Path, label: &str) -> Result<()> {
+    let checkout = Checkout::find(path)
+        .with_context(|| format!("{} isn't in a git repository", path.display()))?;
+    if checkout.main {
+        bail!(
+            "{} is the project's main worktree, which takes no label",
+            path.display()
+        );
+    }
+    let file = checkout.git_dir.join(LABEL_FILE);
+    let label = printable::line(label).trim().to_string();
+    if label.is_empty() {
+        match std::fs::remove_file(&file) {
+            Err(err) if err.kind() != std::io::ErrorKind::NotFound => Err(err.into()),
+            _ => Ok(()),
+        }
+    } else {
+        std::fs::write(&file, format!("{label}\n"))
+            .with_context(|| format!("couldn't write {}", file.display()))
+    }
 }
 
 /// The project a repository's shared git dir belongs to: the main worktree,
@@ -1068,7 +1170,7 @@ fn read_all(pipe: Option<impl Read + Send + 'static>) -> std::thread::JoinHandle
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -1206,8 +1308,8 @@ mod tests {
             configured: None,
             fetch: false,
         };
-        let removed = add_worktree(&project, "removed", &base).unwrap();
-        let gone = add_worktree(&project, "gone", &base).unwrap();
+        let removed = add_worktree(&project, "removed", &base, &Location::default()).unwrap();
+        let gone = add_worktree(&project, "gone", &base, &Location::default()).unwrap();
         let (removed, gone) = (
             std::fs::canonicalize(removed).unwrap(),
             std::fs::canonicalize(gone).unwrap(),
@@ -1363,7 +1465,7 @@ mod tests {
         // The clone's own main is ahead of origin's in a way of its own.
         run(&app, &["commit", "-q", "--allow-empty", "-m", "mine"]);
 
-        let path = add_worktree(&app, "fix", &fetched()).unwrap();
+        let path = add_worktree(&app, "fix", &fetched(), &Location::default()).unwrap();
         assert_eq!(run(&path, &["rev-parse", "HEAD"]), cloned.newer);
         // New work, which follows no branch of origin's.
         let upstream = Command::new("git")
@@ -1450,13 +1552,37 @@ mod tests {
     fn worktrees_go_beside_the_project_one_per_branch() {
         let project = Path::new("/code/app");
         assert_eq!(
-            worktree_dir(project, "fix-typo"),
+            worktree_dir(project, "fix-typo", None),
             Path::new("/code/app.worktrees/fix-typo")
         );
         assert_eq!(
-            worktree_dir(project, "feat/login"),
+            worktree_dir(project, "feat/login", None),
             Path::new("/code/app.worktrees/feat-login")
         );
+    }
+
+    #[test]
+    fn a_directory_in_the_settings_keeps_each_project_s_worktrees_apart() {
+        let project = Path::new("/code/app");
+        let directory = Path::new("/work/trees");
+        assert_eq!(
+            worktree_dir(project, "feat/login", Some(directory)),
+            Path::new("/work/trees/app/feat-login")
+        );
+        let location = Location {
+            path: None,
+            directory: Some(directory.to_path_buf()),
+        };
+        assert_eq!(
+            location.of(project, "fix"),
+            Path::new("/work/trees/app/fix")
+        );
+        // A path asked for goes over both.
+        let location = Location {
+            path: Some("/elsewhere/spike".into()),
+            ..location
+        };
+        assert_eq!(location.of(project, "fix"), Path::new("/elsewhere/spike"));
     }
 
     /// Runs git in `dir` for a test, and says whether it succeeded.
@@ -1521,6 +1647,26 @@ mod tests {
         assert_eq!(seen.branch.as_deref(), Some("fix"));
         assert_eq!(seen.in_progress, None);
         assert_eq!(in_progress(&worktree), None);
+    }
+
+    #[test]
+    fn a_linked_worktree_keeps_its_label_where_git_keeps_its_own_files() {
+        let (dir, worktree) = repo_with_a_conflict();
+        let label = |path: &Path| label_in(&git_dir_of(path).unwrap());
+        assert_eq!(label(&worktree), None);
+        set_label(&worktree, "  the login fix\n").unwrap();
+        assert_eq!(label(&worktree).as_deref(), Some("the login fix"));
+        let linked = linked_worktrees(dir.path()).unwrap();
+        let labelled = linked.labels.get(&worktree).map(String::as_str);
+        assert_eq!(labelled, Some("the login fix"));
+        // Nothing in the worktree itself changed.
+        assert!(!has_changes(&worktree).unwrap());
+
+        set_label(&worktree, "").unwrap();
+        assert_eq!(label(&worktree), None);
+        assert!(linked_worktrees(dir.path()).unwrap().labels.is_empty());
+        let main = set_label(dir.path(), "main").unwrap_err();
+        assert!(main.to_string().contains("main worktree"), "{main:#}");
     }
 
     #[test]

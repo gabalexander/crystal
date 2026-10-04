@@ -1,0 +1,22 @@
+name = "slack"
+version = "0.1.0"
+description = "Posts to a Slack channel when work fails or waits on you"
+
+# A post never takes long: past 15 seconds, it's stopped.
+timeout_secs = 15
+
+[[events]]
+on = "task.closed"
+command = ["sh", "post.sh"]
+
+[[events]]
+on = "flow.gate"
+command = ["sh", "post.sh"]
+
+[[events]]
+on = "flow.ended"
+command = ["sh", "post.sh"]
+
+[[events]]
+on = "plugin.paused"
+command = ["sh", "post.sh"]
