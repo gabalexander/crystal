@@ -368,6 +368,9 @@ in the TUI takes you to it, and `U` [lists everything](#timeline) that needs you
 
 On macOS, crystal uses [`terminal-notifier`](https://github.com/julienXX/terminal-notifier) when it's
 installed (`brew install terminal-notifier`), and macOS's own notifications otherwise; on Linux, `notify-send`.
+A notification server that reads markup in a notification's text (it says `body-markup` when crystal asks it,
+once, with `gdbus` or `dbus-send`) gets the text with its `&`, `<` and `>` escaped, so a branch or an agent's
+message holding `<b>` or `<a href>` shows as it's written.
 Clicking a notification from `terminal-notifier`, or from a `notify-send` that takes actions (libnotify 0.7.10
 on), takes you to the session: the TUI you used last selects it, hands it the keyboard and brings its terminal
 to the front (on macOS the terminal's app, on X11 its window with `xdotool`, and inside tmux its window and
@@ -1830,8 +1833,8 @@ crystal tasks terminal docs                                          # carry on 
 ### Memory
 
 A project keeps a short list of what its sessions have learned, so the next session doesn't learn it again: a
-decision and why it was made, a gotcha, a command that works, a note, or how a task turned out. You or an
-agent in a session add to it:
+decision and why it was made, a gotcha, a command that works, or a note. You or an agent in a session add to
+it:
 
 ```sh
 crystal remember "Fees are kept in cents; never store a float"
@@ -1847,9 +1850,12 @@ crystal memory distill fixer         # have a model read what a session did, now
 crystal memory embed                 # download the model that searches by meaning
 ```
 
-- `-k` is `decision`, `gotcha`, `command`, `note` (the default) or `outcome`. Inside a session, an entry goes
-  to the session's project and says which session added it; elsewhere it goes to the project of the current
+- `-k` is `decision`, `gotcha`, `command` or `note` (the default). Inside a session, an entry goes to the
+  session's project and says which session added it; elsewhere it goes to the project of the current
   directory, or of `-C <dir>`.
+- How a task turned out isn't kept here: its project's [tasks](#tasks) keep that (`crystal tasks`). The
+  `outcome` entries an earlier crystal added as each task closed are still listed and found by a search, but
+  agents starting aren't shown them; `crystal memory rm` those you don't want.
 - A project is its main worktree, so every worktree of it shares one list. Every project's list is kept in one
   SQLite database in crystal's state directory (`~/.local/state/crystal/memory/memory.db`), not in the
   repository. A project's list from before, a JSON file there, is brought in the first time it's read.
@@ -1876,8 +1882,8 @@ crystal memory embed                 # download the model that searches by meani
 When an agent starts, crystal shows it the entries that have most to do with its launch: first those about files
 its worktree has changed since its branch left the default one (`origin`'s, or `main` or `master`), committed
 or not, then those that have most to do with its first prompt, or the newest when neither finds any. That's a
-few at most, in 800 bytes, the least relevant left out first; none that's stale, and drifting ones marked where
-they rank. Each comes with its id, and a line on how to read the rest and add more:
+few at most, in 800 bytes, the least relevant left out first; none that's stale or a task's outcome, and
+drifting ones marked where they rank. Each comes with its id, and a line on how to read the rest and add more:
 
 - Claude Code gets them in its system prompt, and reads the rest with crystal's MCP tools (below).
 - Codex gets them as its `developer_instructions` (`-c`), after the ones it has already, from a
@@ -2452,7 +2458,7 @@ matched anywhere in the link unless `^` and `$` pin it. `X` lists each plugin's 
 | `worktree.created` | crystal makes a worktree |
 | `worktree.removed` | crystal removes one |
 | `handoff.added` | a note goes in a worktree's handoff file: `crystal handoff`, or a task closing there |
-| `memory.added` | an entry is added to a project's memory: remembered, a task's outcome, or by the distiller |
+| `memory.added` | an entry is added to a project's memory: remembered, or by the distiller |
 | `memory.forgotten` | an entry is forgotten |
 | `backlog.added` | an item goes on a project's backlog |
 | `backlog.closed` | an item is marked done |
