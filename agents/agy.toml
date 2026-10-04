@@ -1,0 +1,29 @@
+# Adapted from herdr's detection rules (Apache-2.0).
+id = "agy"
+name = "Antigravity"
+aliases = ["antigravity", "antigravity-cli"]
+
+[[rules]]
+id = "permission_prompt"
+looks = "waiting"
+priority = 300
+region = "screen"
+contains = ["requesting permission for:"]
+any = [
+  { contains = ["do you want to proceed?"] },
+  { contains = ["tab amend", "edit command"] },
+]
+
+[[rules]]
+id = "spinner_working"
+looks = "working"
+priority = 100
+region = "screen"
+line_regex = ['^\s*[\u2800-\u28FF]+\s+\p{Alphabetic}+\w*ing\b']
+
+[[rules]]
+id = "background_tasks_working"
+looks = "working"
+priority = 90
+region = "last_rows(5)"
+line_regex = ['(?i)·\s*[1-9][0-9]*\s+task']

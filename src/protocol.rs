@@ -45,9 +45,11 @@ pub enum Request {
         /// names a session crystal named after its program.
         #[serde(default)]
         prompt: Option<String>,
-        /// The agent whose hooks sent it, by its program: `claude` or
+        /// The agent whose hooks sent it, by its program, like `claude` or
         /// `codex`. `None` from a crystal that didn't say, which meant
-        /// Claude Code.
+        /// Claude Code. A hook set up in an agent's own settings runs for
+        /// every run of it, one an agent in the session started too: what
+        /// that one does isn't what's in front.
         #[serde(default)]
         agent: Option<String>,
         /// The directory the agent runs in, as its hooks say.
@@ -333,6 +335,13 @@ pub enum Request {
     TakeLayoutOrders {
         used: u64,
     },
+    /// Why crystal reads a session's agent the way it does, with `agent`'s
+    /// rules when it's given, or else with those of the agent in front.
+    ExplainAgent {
+        name: String,
+        #[serde(default)]
+        agent: Option<String>,
+    },
     /// What's on a session's screen, as text.
     Read {
         name: String,
@@ -503,6 +512,7 @@ pub enum Response {
     Screen {
         rows: Vec<String>,
     },
+    Explained(Box<ScreenExplained>),
     /// A task's answer, and what it has come to.
     Result(TaskResult),
     /// Tasks, as `Request::Tasks` asks for them.
@@ -620,6 +630,10 @@ pub struct SessionInfo {
     /// How many subagents its agent has running, as its hooks say.
     #[serde(default)]
     pub subagents: u32,
+    /// Its program rang the terminal's bell while nobody was watching, and
+    /// nobody has looked at it since.
+    #[serde(default)]
+    pub bell: bool,
     /// crystal stopped it after its agent sat idle for as long as the
     /// settings allow: it starts again in its conversation.
     #[serde(default)]
@@ -737,6 +751,26 @@ impl SessionInfo {
             (state, _) => state.to_string(),
         }
     }
+}
+
+/// Why crystal reads a session's agent the way it does, for `crystal agent
+/// explain`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScreenExplained {
+    pub session: String,
+    /// What's in front in its terminal, once that's been looked at.
+    pub front: Option<Front>,
+    /// Why its screen isn't read, when it isn't.
+    pub not_read: Option<String>,
+    /// How the screen has been seen to look.
+    pub watch: crate::agent_rules::Meaning,
+    /// A different look seen once, which counts if it's seen again.
+    pub candidate: Option<crate::agent_rules::Meaning>,
+    /// What the session's agent is doing, by everything crystal has heard.
+    pub activity: Option<Activity>,
+    /// The rules tried on its screen now; `None` with no agent to try them
+    /// for.
+    pub rules: Option<crate::agent_rules::Explained>,
 }
 
 /// What's in front in a session's terminal: the program its keys go to.

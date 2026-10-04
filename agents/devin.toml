@@ -1,0 +1,78 @@
+# Adapted from herdr's detection rules (Apache-2.0).
+id = "devin"
+name = "Devin"
+aliases = ["devin-cli"]
+
+[[rules]]
+id = "workspace_trust_prompt"
+looks = "waiting"
+priority = 300
+region = "last_rows(8)"
+contains = [
+  "do you trust the authors of this directory?",
+  "with untrusted content.",
+  "yes, trust ",
+]
+
+[[rules]]
+id = "permission_prompt"
+looks = "waiting"
+priority = 290
+region = "last_rows(8)"
+contains = ["approve once", "select", "confirm", "esc cancel"]
+
+[[rules]]
+id = "running_tools_footer"
+looks = "working"
+priority = 200
+region = "last_rows(8)"
+contains = ["running tools", "esc to interrupt"]
+not = [
+  { contains = ["approve once", "esc cancel"] },
+]
+
+[[rules]]
+id = "guide_while_working"
+looks = "working"
+priority = 190
+region = "last_rows(6)"
+contains = ["guide devin while it works"]
+not = [
+  { contains = ["approve once", "esc cancel"] },
+]
+
+[[rules]]
+id = "tool_reading_timeout"
+looks = "working"
+priority = 180
+region = "last_rows(8)"
+contains = ["reading shell ", "timeout:"]
+not = [
+  { contains = ["approve once", "esc cancel"] },
+]
+
+[[rules]]
+id = "welcome_prompt_footer"
+looks = "settled"
+priority = 120
+region = "last_rows(8)"
+contains = ["ask devin to build", "features, fix bugs", "your code"]
+line_regex = ['^\s*❭ Ask Devin to build']
+not = [
+  { contains = ["approve once", "esc cancel"] },
+  { contains = ["running tools", "esc to interrupt"] },
+  { contains = ["guide devin while it works"] },
+]
+
+[[rules]]
+id = "live_prompt_footer"
+looks = "settled"
+priority = 100
+region = "last_rows(6)"
+contains = ["context:"]
+line_regex = ['^\s*❭']
+not = [
+  { contains = ["approve once", "esc cancel"] },
+  { contains = ["running tools", "esc to interrupt"] },
+  { contains = ["guide devin while it works"] },
+]

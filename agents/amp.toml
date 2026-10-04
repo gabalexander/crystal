@@ -1,0 +1,59 @@
+# Adapted from herdr's detection rules (Apache-2.0).
+id = "amp"
+name = "Amp"
+aliases = ["amp-local"]
+packages = ["@sourcegraph/amp", "@ampcode/cli"]
+
+[[rules]]
+id = "osc_title_plugin_confirmation_blocked"
+looks = "waiting"
+priority = 1100
+region = "title"
+contains = ["Plugin confirmation needed"]
+
+[[rules]]
+id = "osc_title_working"
+looks = "working"
+priority = 1050
+region = "title"
+regex = ['^[\x{2800}-\x{28FF}] ']
+
+[[rules]]
+id = "approval_footer"
+looks = "waiting"
+priority = 300
+region = "screen"
+any = [
+  { contains = ["waiting for approval"] },
+  { contains = ["invoke tool"] },
+  { contains = ["run this command?"] },
+  { contains = ["allow editing file:"] },
+  { contains = ["allow creating file:"] },
+  { contains = ["confirm tool call"] },
+  { contains = ["approve"], any = [{ contains = ["allow all for this session"] }, { contains = ["allow all for every session"] }, { contains = ["allow file for every session"] }, { contains = ["deny with feedback"] }] },
+]
+
+[[rules]]
+id = "status_footer_working"
+looks = "working"
+priority = 200
+region = "last_rows(5)"
+line_regex = ['(?i)^\s*╰\s+\S+\s+(thinking|streaming|running tools|waiting)\s+─']
+
+[[rules]]
+id = "esc_cancel_working"
+looks = "working"
+priority = 100
+region = "screen"
+contains = ["esc to cancel"]
+
+[[rules]]
+id = "osc_title_idle"
+looks = "settled"
+priority = 50
+region = "title"
+contains = [" - amp - "]
+not = [
+  { regex = ['^[\x{2800}-\x{28FF}] '] },
+  { contains = ["Plugin confirmation needed"] },
+]

@@ -1,0 +1,125 @@
+# Adapted from herdr's detection rules (Apache-2.0).
+id = "codex"
+name = "Codex"
+packages = ["@openai/codex"]
+
+[[rules]]
+id = "osc_title_blocked"
+looks = "waiting"
+priority = 1100
+region = "title"
+contains = ["Action Required"]
+
+[[rules]]
+id = "osc_title_working"
+looks = "working"
+priority = 1050
+region = "title"
+regex = ['(?:^| )[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏](?: |$)']
+
+[[rules]]
+id = "transcript_viewer"
+looks = "skip"
+priority = 1000
+region = "after_last_prompt"
+contains = ["↑/↓ to scroll", "pgup/pgdn to", "home/end to jump", "q to quit"]
+any = [
+  { contains = ["esc to edit prev"] },
+  { contains = ["esc/← to edit prev"] },
+]
+
+[[rules]]
+id = "trust_directory"
+looks = "waiting"
+priority = 950
+region = "first_rows(20)"
+all = [
+  { any = [
+    { regex = ['\A> You are in [^\r\n]+(?:\r?\n|$)'] },
+    { contains = ["Folder access"] },
+  ] },
+  { any = [
+    { regex = ['(?s)Do\s+you\s+trust\s+the\s+contents\s+of\s+this\s+directory\?'] },
+    { all = [
+      { contains = ["Trust this folder?", "Codex can read, edit, and run files here"] },
+      { any = [
+        { contains = ["Trust and continue"] },
+        { contains = ["enter continue"] },
+      ] },
+    ] },
+  ] },
+]
+
+[[rules]]
+id = "startup_update"
+looks = "waiting"
+priority = 950
+region = "last_rows(20)"
+contains = ["Update available!", "Update now"]
+regex = ['Skip\s+until\s+next\s+version', 'Press enter to continue\s*\z']
+
+[[rules]]
+id = "live_strong_blocker"
+looks = "waiting"
+priority = 900
+region = "after_last_prompt"
+any = [
+  { contains = ["press enter to confirm or esc to cancel"] },
+  { contains = ["enter to submit answer"] },
+  { contains = ["enter to submit all"] },
+  { contains = ["allow command?"] },
+  { contains = ["All Results", "Filesystem Only", "Plugins"] },
+]
+
+[[rules]]
+id = "weak_blocker"
+looks = "waiting"
+priority = 600
+region = "without_current_prompt"
+# Sparkles can replace the space after ›. A later response marker makes that prompt stale.
+not = [{ regex = ['(?m)^›[⠁⠂⠄⠈⠐⠠⡀⢀][^\n]*(?:\n(?:[^•■✗✓\n][^\n]*)?)*\z'] }]
+any = [
+  { contains = ["[y/n]"] },
+  { contains = ["yes (y)"] },
+  { contains = ["do you want to"], any = [{ contains = ["yes"] }, { contains = ["❯"] }] },
+  { contains = ["would you like to"], any = [{ contains = ["yes"] }, { contains = ["❯"] }] },
+]
+
+[[rules]]
+id = "screen_working_fallback"
+looks = "working"
+priority = 500
+region = "before_current_prompt"
+# Support animated and reduced-motion status, including dynamic activity labels.
+# The interrupt hint can be remapped, unbound, or hidden, and queued inputs can
+# sit below the status. Require the live timer suffix with no later response.
+any = [{ contains = [" to interrupt)"] }, { contains = ["s)"] }]
+regex = ['(?m)^(?:[•◦][ \t]+)?[^\s›•◦■✗✓─][^\r\n]* \((?:[0-9]+[hm] )*[0-9]+s(?: • [^\r\n]+? to interrupt)?\)(?: · [^\r\n]*)?(?:\r?\n(?:[^•◦›■✗✓─\r\n][^\r\n]*|•[ \t]+(?:Queued\s+follow-up\s+inputs|Messages\s+to\s+be\s+submitted\s+after\s+next\s+tool\s+call(?:\s+\(press\s+[^\r\n]+?\s+to\s+interrupt\s+and\s+send\s+immediately\))?|Messages\s+to\s+be\s+submitted\s+at\s+end\s+of\s+turn)|›[⠁⠂⠄⠈⠐⠠⡀⢀][^\r\n]*)?)*\s*\z']
+# A failed reconnect keeps its final elapsed timer but is no longer working.
+not = [{ line_regex = ['^(?:[•◦][ \t]+)?Reconnect failed — check the endpoint, then relaunch \([0-9hms ]+\)$'] }]
+
+[[rules]]
+id = "osc_title_idle"
+looks = "settled"
+priority = 100
+region = "title"
+regex = ['\S']
+not = [
+  { regex = ['(?:^| )[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏](?: |$)'] },
+  { contains = ["Action Required"] },
+]
+
+# crystal's own: each of Codex's approvals asks "would you like to …?",
+# and its other questions, like reviewing new hooks as it starts, end with
+# their keys in a short form.
+[[rules]]
+id = "approval_question"
+looks = "waiting"
+priority = 890
+region = "last_rows(15)"
+any = [
+  { contains = ["would you like to run the following command?"] },
+  { contains = ["would you like to make the following edits?"] },
+  { contains = ["would you like to grant these permissions?"] },
+  { contains = ["enter confirm · esc"] },
+]

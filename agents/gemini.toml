@@ -1,0 +1,23 @@
+# Adapted from herdr's detection rules (Apache-2.0).
+id = "gemini"
+name = "Gemini CLI"
+packages = ["@google/gemini-cli"]
+
+[[rules]]
+id = "apply_or_allow_change"
+looks = "waiting"
+priority = 300
+region = "screen"
+any = [
+  { contains = ["│ Apply this change"] },
+  { contains = ["│ Allow execution"] },
+  { all = [{ contains = ["yes"] }, { any = [{ contains = ["waiting for user confirmation"] }, { contains = ["│ Do you want to proceed"] }, { contains = ["do you want to proceed?"] }] }] },
+  { line_regex = ['(?i)^\s*❯.*(yes|allow)'] },
+]
+
+[[rules]]
+id = "esc_cancel_working"
+looks = "working"
+priority = 100
+region = "screen"
+contains = ["esc to cancel"]

@@ -17,8 +17,14 @@
 //! Codex in `hooks.json` in its home, in the same shape. Codex runs them
 //! once its config has `[features] hooks = true`, which installing makes
 //! sure of, and once the user has reviewed them in Codex's `/hooks`.
+//!
+//! Cursor, Droid, Qoder, Qwen Code and GitHub Copilot take hooks from their
+//! own settings too, each in a shape of its own: [`crate::agent_hooks`]
+//! puts crystal's there and takes them out.
 
+use crate::agent_hooks::{self, Target};
 use crate::agents;
+use crate::shell;
 use crate::skill;
 use anyhow::{Context, Result, bail};
 use serde_json::{Map, Value, json};
@@ -31,6 +37,12 @@ use std::path::{Path, PathBuf};
 pub enum Agent {
     Claude,
     Codex,
+    Cursor,
+    Droid,
+    #[value(name = "qodercli", alias = "qoder")]
+    Qoder,
+    Qwen,
+    Copilot,
 }
 
 /// How long a hook may take, in seconds, as crystal's own Claude Code hooks
@@ -49,7 +61,7 @@ pub enum Standing {
 }
 
 impl Standing {
-    fn word(self) -> &'static str {
+    pub fn word(self) -> &'static str {
         match self {
             Standing::Installed => "installed",
             Standing::OutOfDate => "out of date",
@@ -59,38 +71,76 @@ impl Standing {
 }
 
 impl Agent {
-    pub const ALL: [Agent; 2] = [Agent::Claude, Agent::Codex];
+    pub const ALL: [Agent; 7] = [
+        Agent::Claude,
+        Agent::Codex,
+        Agent::Cursor,
+        Agent::Droid,
+        Agent::Qoder,
+        Agent::Qwen,
+        Agent::Copilot,
+    ];
 
     /// Its program, which is how `crystal hook` knows it.
     pub fn program(self) -> &'static str {
         match self {
             Agent::Claude => "claude",
             Agent::Codex => "codex",
+            Agent::Cursor => "cursor",
+            Agent::Droid => "droid",
+            Agent::Qoder => "qodercli",
+            Agent::Qwen => "qwen",
+            Agent::Copilot => "copilot",
         }
+    }
+
+    /// The agent whose program, or other name in its rules, is `program`.
+    pub fn of_program(program: &str) -> Option<Agent> {
+        let id = crate::agent_rules::bundled_registry()
+            .find(program)
+            .map_or(program, |rules| rules.id.as_str());
+        Agent::ALL.into_iter().find(|agent| agent.program() == id)
     }
 
     fn name(self) -> &'static str {
         match self {
             Agent::Claude => "Claude Code",
             Agent::Codex => "Codex",
+            Agent::Cursor => "Cursor",
+            Agent::Droid => "Droid",
+            Agent::Qoder => "Qoder",
+            Agent::Qwen => "Qwen Code",
+            Agent::Copilot => "GitHub Copilot",
         }
     }
 
-    /// The hook events crystal listens to.
+    /// How [`crate::agent_hooks`] puts hooks in its settings: for every
+    /// agent but Claude Code and Codex, which this module does itself.
+    fn other(self) -> Option<&'static Target> {
+        match self {
+            Agent::Claude | Agent::Codex => None,
+            agent => agent_hooks::target(agent.program()),
+        }
+    }
+
+    /// The hook events crystal listens to, for Claude Code and Codex.
     fn events(self) -> &'static [&'static str] {
         match self {
-            Agent::Claude => agents::CLAUDE_HOOK_EVENTS,
             Agent::Codex => agents::CODEX_HOOK_EVENTS,
+            _ => agents::CLAUDE_HOOK_EVENTS,
         }
     }
 
     /// Where the agent keeps its settings, as the environment says:
     /// `$CLAUDE_CONFIG_DIR` or `~/.claude`, `$CODEX_HOME` or `~/.codex`.
     fn dir(self) -> Result<PathBuf> {
+        if let Some(target) = self.other() {
+            return Ok(target.dir());
+        }
         let home = std::env::var_os("HOME");
         let dir = match self {
-            Agent::Claude => skill::claude_config_dir(std::env::var_os("CLAUDE_CONFIG_DIR"), home),
             Agent::Codex => codex_home(std::env::var_os("CODEX_HOME"), home),
+            _ => skill::claude_config_dir(std::env::var_os("CLAUDE_CONFIG_DIR"), home),
         };
         dir.with_context(|| {
             format!(
@@ -102,9 +152,10 @@ impl Agent {
 
     /// The file it keeps its hooks in, in `dir`.
     fn hooks_file(self, dir: &Path) -> PathBuf {
-        match self {
-            Agent::Claude => dir.join("settings.json"),
-            Agent::Codex => dir.join("hooks.json"),
+        match (self, self.other()) {
+            (_, Some(target)) => target.file(dir),
+            (Agent::Codex, None) => dir.join("hooks.json"),
+            _ => dir.join("settings.json"),
         }
     }
 
@@ -136,7 +187,7 @@ pub fn chosen(agent: Option<Agent>) -> Result<Vec<Agent>> {
         }
     }
     if found.is_empty() {
-        bail!("neither Claude Code nor Codex is installed here: install one first");
+        bail!("none of the agents crystal can hook is installed here: install one first");
     }
     Ok(found)
 }
@@ -145,6 +196,23 @@ pub fn chosen(agent: Option<Agent>) -> Result<Vec<Agent>> {
 /// program, and says what it did.
 pub fn install(agent: Agent, crystal: &Path) -> Result<Vec<String>> {
     let dir = agent.dir()?;
+    if let Some(target) = agent.other() {
+        let changed = target.install(&dir, crystal)?;
+        if changed.is_empty() {
+            return Ok(vec![format!(
+                "{}: crystal's hooks are in {} already",
+                agent.program(),
+                agent.hooks_file(&dir).display()
+            )]);
+        }
+        return Ok(changed
+            .iter()
+            .map(|path| {
+                let path = shell::home_relative(path);
+                format!("{}: added crystal's hooks to {path}", agent.program())
+            })
+            .collect());
+    }
     if !dir.is_dir() {
         bail!(
             "{}'s directory isn't at {}; install {} first",
@@ -191,7 +259,15 @@ pub fn install(agent: Agent, crystal: &Path) -> Result<Vec<String>> {
 /// Takes crystal's hooks out of `agent`'s settings, and says what it did.
 /// Codex's hooks stay on in its config: other hooks may need them.
 pub fn uninstall(agent: Agent) -> Result<String> {
-    let file = agent.hooks_file(&agent.dir()?);
+    let dir = agent.dir()?;
+    let file = agent.hooks_file(&dir);
+    if let Some(target) = agent.other() {
+        let said = match target.uninstall(&dir)?.is_empty() {
+            true => "there are no crystal hooks in",
+            false => "took crystal's hooks out of",
+        };
+        return Ok(format!("{}: {said} {}", agent.program(), file.display()));
+    }
     if !file.is_file() {
         return Ok(format!(
             "{}: {} isn't there",
@@ -219,14 +295,28 @@ pub fn uninstall(agent: Agent) -> Result<String> {
 /// file.
 pub fn status(agent: Agent, crystal: &Path) -> Result<String> {
     let file = agent.hooks_file(&agent.dir()?);
-    let command = agents::hook_command(crystal, agent.program(), true);
-    let standing = standing(&read_json(&file)?, agent, &command);
+    let standing = standing_of(agent, crystal)?;
     Ok(format!(
         "{}  {}  {}",
         agent.program(),
         standing.word(),
         file.display()
     ))
+}
+
+/// How `agent`'s hooks stand, for `crystal` at its path.
+pub fn standing_of(agent: Agent, crystal: &Path) -> Result<Standing> {
+    let dir = agent.dir()?;
+    if let Some(target) = agent.other() {
+        return Ok(if target.installed(&dir) {
+            Standing::Installed
+        } else {
+            Standing::NotInstalled
+        });
+    }
+    let file = agent.hooks_file(&dir);
+    let command = agents::hook_command(crystal, agent.program(), true);
+    Ok(standing(&read_json(&file)?, agent, &command))
 }
 
 /// `settings` with crystal's hook, `command`, on each of `agent`'s events:

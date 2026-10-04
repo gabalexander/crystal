@@ -22,12 +22,15 @@ impl Crystal {
         let socket = dir.path().join("crystal.sock");
         let crystal = Crystal { dir, socket };
         // A config of the test's own: the developer's can't change what
-        // the test sees, and no test pops up a real notification. Memory is
+        // the test sees, and no test pops up a real notification or plays
+        // a sound (nor one that configures its own: see `QUIET`). Memory is
         // off unless a test turns it on, so Claude's arguments stay as each
         // test expects them, and so is naming a session from its prompt, so
         // its name does.
-        crystal
-            .configure("notify = false\nname_from_prompt = false\n\n[plugins]\nmemory = false\n");
+        crystal.configure(
+            "notify = false\nname_from_prompt = false\n\n[plugins]\nmemory = false\n\n\
+             [sound]\nenabled = false\n",
+        );
         crystal
     }
 
@@ -54,7 +57,12 @@ impl Crystal {
     }
 
     fn command(&self, args: &[&str]) -> Command {
-        let mut command = Command::new(CRYSTAL);
+        self.command_of(Path::new(CRYSTAL), args)
+    }
+
+    /// Like [`Crystal::command`], run by the crystal at `program`.
+    fn command_of(&self, program: &Path, args: &[&str]) -> Command {
+        let mut command = Command::new(program);
         command
             .arg("--socket")
             .arg(&self.socket)
@@ -62,7 +70,8 @@ impl Crystal {
             .current_dir(self.dir.path())
             .env("XDG_CONFIG_HOME", self.config_home())
             .env("CLAUDE_CONFIG_DIR", self.claude_config_dir())
-            .envs(PLAIN_GIT);
+            .envs(PLAIN_GIT)
+            .envs(QUIET);
         command
     }
 
@@ -150,7 +159,10 @@ impl Crystal {
         command.env("SHELL", "/bin/sh");
         command.env("XDG_CONFIG_HOME", self.config_home());
         command.env("CLAUDE_CONFIG_DIR", self.claude_config_dir());
-        for (key, value) in PLAIN_GIT.iter().chain(env) {
+        // No TUI asks GitHub whether a newer crystal is out: the releases
+        // are nowhere, unless a test says where.
+        command.env("CRYSTAL_RELEASES", NO_RELEASES);
+        for (key, value) in PLAIN_GIT.iter().chain(&QUIET).chain(env) {
             command.env(key, value);
         }
         let child = pty.slave.spawn_command(command).unwrap();
@@ -266,6 +278,24 @@ impl Terminal {
         }
     }
 
+    /// How many times crystal rang this terminal's bell: each BEL that
+    /// doesn't end an OSC sequence, like a request for the clipboard.
+    fn bells(&self) -> usize {
+        let written = self.written.lock().unwrap().clone();
+        let (mut bells, mut in_osc, mut before) = (0, false, 0);
+        for byte in written {
+            match byte {
+                b']' if before == 0x1b => in_osc = true,
+                b'\\' if before == 0x1b => in_osc = false,
+                0x07 if in_osc => in_osc = false,
+                0x07 => bells += 1,
+                _ => {}
+            }
+            before = byte;
+        }
+        bells
+    }
+
     fn type_keys(&mut self, keys: &str) {
         self.keys.write_all(keys.as_bytes()).unwrap();
         self.keys.flush().unwrap();
@@ -330,12 +360,19 @@ fn size(rows: u16, cols: u16) -> PtySize {
     }
 }
 
+/// Where a TUI looks for crystal's releases unless a test says: a port
+/// nothing listens on, so it learns nothing, at once.
+const NO_RELEASES: &str = "http://127.0.0.1:9/releases";
+
 /// Keeps the machine's own git config, like signed commits or hooks, out of
 /// the git that tests and crystal run.
 const PLAIN_GIT: [(&str, &str); 2] = [
     ("GIT_CONFIG_GLOBAL", "/dev/null"),
     ("GIT_CONFIG_NOSYSTEM", "1"),
 ];
+
+/// No sound from any daemon a test starts, whatever its config says.
+const QUIET: [(&str, &str); 1] = [("CRYSTAL_NO_SOUND", "1")];
 
 /// Runs git in `dir` the way the tests need it, failing the test if git
 /// fails, and returns what it printed.
@@ -581,6 +618,69 @@ fn attach_shows_the_session_until_ctrl_backslash() {
     terminal.shows("[detached from cat]");
     assert!(terminal.exit());
     assert_eq!(crystal.row("cat").unwrap()[1], "running");
+}
+
+#[test]
+fn attach_passes_the_session_s_bell_on_to_your_terminal() {
+    let crystal = Crystal::new();
+    let script = r"printf ready; read line; printf '\a\a\arang'; sleep 30";
+    crystal.ok(&["new", "-n", "ringer", "sh", "-c", script]);
+
+    let mut terminal = crystal.attach(&["attach", "ringer"]);
+    terminal.shows("ready");
+    assert_eq!(terminal.bells(), 0);
+    terminal.type_keys("\r");
+    terminal.shows("rang");
+    // Three at once ring it once.
+    eventually("the bell is passed on", || terminal.bells() == 1);
+    thread::sleep(Duration::from_millis(600));
+    assert_eq!(terminal.bells(), 1);
+
+    terminal.type_keys("\x1c");
+    terminal.shows("[detached from ringer]");
+}
+
+#[test]
+fn the_tui_rings_your_terminal_for_a_bell_in_a_pane_or_out_of_sight() {
+    let crystal = Crystal::new();
+    let dir = crystal.dir.path();
+    let rings_when = |file: &str| {
+        format!("echo waiting; while [ ! -f {file} ]; do sleep 0.05; done; printf '\\a'; sleep 30")
+    };
+    crystal.ok(&["new", "-n", "shown", "sh", "-c", &rings_when("ring-shown")]);
+    crystal.ok(&[
+        "new",
+        "-n",
+        "builder",
+        "sh",
+        "-c",
+        &rings_when("ring-builder"),
+    ]);
+    let mut tui = crystal.tui();
+    tui.shows("waiting");
+    assert_eq!(tui.bells(), 0);
+
+    // The session in the pane rings: the bell is passed on, and the
+    // session isn't marked, since it was seen.
+    std::fs::write(dir.join("ring-shown"), "").unwrap();
+    eventually("the pane's bell is passed on", || tui.bells() == 1);
+
+    // One out of sight rings: it's marked, and rings the terminal too.
+    thread::sleep(Duration::from_millis(600));
+    std::fs::write(dir.join("ring-builder"), "").unwrap();
+    eventually("builder is marked", || {
+        sidebar_of(&tui.text()).contains("♪")
+    });
+    eventually("its bell is passed on", || tui.bells() == 2);
+    let events = crystal.ok(&["events", "-k", "session.bell"]);
+    assert!(
+        events.contains("builder") && !events.contains("shown"),
+        "{events}"
+    );
+
+    // Looking at it takes the mark off.
+    tui.type_keys("j");
+    tui.hides("♪");
 }
 
 #[test]
@@ -1907,6 +2007,191 @@ fn the_screen_says_what_an_agent_without_hooks_is_doing() {
         std::fs::write(crystal.dir.path().join(stage), "").unwrap();
         eventually(&format!("the agent is {expected}"), || status() == expected);
     }
+}
+
+#[test]
+fn agent_explain_shows_the_rule_that_read_a_session_s_screen() {
+    let crystal = Crystal::new();
+    crystal.new_pretend_agent("agent", "printf '\\033]0;⠋ Thinking\\007> '; sleep 30");
+    eventually("the agent is working", || {
+        crystal.row("agent").unwrap()[1] == "working"
+    });
+    let out = crystal.ok(&["agent", "explain", "agent"]);
+    assert!(
+        out.starts_with("agent: Aider (aider) is in front\n"),
+        "{out}"
+    );
+    assert!(
+        out.contains("\ncrystal has its screen as working\n"),
+        "{out}"
+    );
+    assert!(
+        out.contains("\nAny other agent (default) rules read the screen now as working, by rule title_spinner\nrules: crystal's own\n"),
+        "{out}"
+    );
+    let decided = out.lines().find(|line| line.starts_with('→')).unwrap();
+    assert!(decided.contains("title_spinner"), "{decided}");
+
+    let json = crystal.ok(&["agent", "explain", "agent", "--json"]);
+    let json: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(json["rules"]["decided_by"], "title_spinner");
+    assert_eq!(json["watch"], "working");
+    // Another agent's rules, on the same screen.
+    let codex = crystal.ok(&["agent", "explain", "agent", "--agent", "codex"]);
+    assert!(
+        codex.contains("\nCodex (codex) rules read the screen now as "),
+        "{codex}"
+    );
+    let err = crystal.fails(&["agent", "explain", "nobody"]);
+    assert!(err.contains("nobody"), "{err}");
+}
+
+#[test]
+fn agent_explain_tries_an_agent_s_rules_on_a_saved_screen() {
+    let crystal = Crystal::new();
+    let screen = crystal.dir.path().join("screen.txt");
+    std::fs::write(
+        &screen,
+        "  Would you like to run the following command?\n\n› 1. Yes, proceed (y)\n",
+    )
+    .unwrap();
+    let file = screen.to_str().unwrap();
+    let out = crystal.ok(&["agent", "explain", "--file", file, "--agent", "codex"]);
+    assert!(
+        out.starts_with(
+            "Codex (codex) rules read the screen now as waiting, by rule approval_question\n"
+        ),
+        "{out}"
+    );
+    let titled = crystal.ok(&[
+        "agent",
+        "explain",
+        "--file",
+        file,
+        "--agent",
+        "codex",
+        "--title",
+        "Action Required",
+    ]);
+    assert!(titled.contains("by rule osc_title_blocked"), "{titled}");
+    let err = crystal.fails(&["agent", "explain", "--file", file, "--agent", "nobody"]);
+    assert!(err.contains("crystal has no rules for nobody"), "{err}");
+    // The file it read is the one `rules` prints, under any of its names.
+    let rules = crystal.ok(&["agent", "rules", "cursor-agent"]);
+    assert!(rules.contains("\nid = \"cursor\"\n"), "{rules}");
+    assert!(
+        crystal
+            .fails(&["agent", "rules", "nobody"])
+            .contains("no rules for nobody")
+    );
+}
+
+#[test]
+fn a_rules_file_of_the_user_s_changes_how_an_agent_is_read() {
+    let crystal = Crystal::new();
+    let agents = crystal.config_home().join("crystal/agents");
+    std::fs::create_dir_all(&agents).unwrap();
+    // Aider has no rules of its own: these say its hum is work.
+    let hum = "id = \"aider\"\nname = \"Aider\"\n\n[[rules]]\nid = \"hum\"\nlooks = \"working\"\ncontains = [\"hmm\"]\n";
+    std::fs::write(agents.join("aider.toml"), hum).unwrap();
+    crystal.new_pretend_agent("agent", "printf 'hmm'; sleep 30");
+    eventually("the agent is working", || {
+        crystal.row("agent").unwrap()[1] == "working"
+    });
+    let list = crystal.ok(&["agent", "list"]);
+    assert!(list.starts_with("AGENT "), "{list}");
+    let aider = list
+        .lines()
+        .find(|line| line.starts_with("aider "))
+        .unwrap();
+    assert!(aider.contains("agents/aider.toml"), "{aider}");
+    let claude = list
+        .lines()
+        .find(|line| line.starts_with("claude "))
+        .unwrap();
+    assert!(claude.ends_with("built in"), "{claude}");
+
+    // A broken file says so, and crystal's own rules stand in for it.
+    std::fs::write(agents.join("codex.toml"), "id = \"codex\"\n[[rules]\n").unwrap();
+    let list = crystal.ok(&["agent", "list"]);
+    let codex = list
+        .lines()
+        .find(|line| line.starts_with("codex "))
+        .unwrap();
+    assert!(codex.contains(" bundled "), "{codex}");
+    assert!(list.contains("\n! couldn't use "), "{list}");
+    let json = crystal.ok(&["agent", "list", "--json"]);
+    let json: serde_json::Value = serde_json::from_str(&json).unwrap();
+    let codex = json["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|agent| agent["id"] == "codex")
+        .unwrap();
+    assert!(codex["problem"].as_str().unwrap().contains("codex.toml"));
+}
+
+#[test]
+fn integration_puts_hooks_in_other_agents_settings_and_takes_them_out() {
+    let crystal = Crystal::new();
+    let cursor = crystal.dir.path().join("cursor-config");
+    std::fs::create_dir_all(&cursor).unwrap();
+    let run = |args: &[&str]| {
+        let out = crystal
+            .command(args)
+            .env("CURSOR_CONFIG_DIR", &cursor)
+            .output()
+            .unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "crystal {args:?}: {err}");
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let hooks_line = |list: &str| {
+        list.lines()
+            .find(|line| line.starts_with("cursor "))
+            .unwrap()
+            .to_string()
+    };
+    let out = run(&["integration", "install", "cursor"]);
+    assert!(out.contains("cursor: added crystal's hooks to"), "{out}");
+    let hooks: serde_json::Value =
+        serde_json::from_str(&written(&cursor.join("hooks.json"))).unwrap();
+    let command = hooks["hooks"]["stop"][0]["command"].as_str().unwrap();
+    assert!(command.contains(CRYSTAL), "{command}");
+    assert!(command.ends_with(" hook cursor || true"), "{command}");
+    let listed = hooks_line(&run(&["agent", "list"]));
+    assert!(
+        listed.ends_with(" installed") && !listed.contains("not installed"),
+        "{listed}"
+    );
+    let status = run(&["integration", "status", "cursor"]);
+    assert!(status.starts_with("cursor  installed"), "{status}");
+
+    let out = run(&["integration", "uninstall", "cursor"]);
+    assert!(out.contains("took crystal's hooks out"), "{out}");
+    let listed = hooks_line(&run(&["agent", "list"]));
+    assert!(listed.ends_with("not installed"), "{listed}");
+
+    let gemini = crystal.fails(&["integration", "install", "gemini"]);
+    assert!(gemini.contains("gemini"), "{gemini}");
+}
+
+#[test]
+fn a_hook_from_another_agent_than_the_one_in_front_is_left_out() {
+    let crystal = Crystal::new();
+    crystal.new_pretend_agent("agent", "printf '> '; sleep 30");
+    eventually("the agent is in front", || {
+        crystal
+            .ok(&["agent", "explain", "agent"])
+            .starts_with("agent: Aider (aider) is in front")
+    });
+    let prompt = r#"{"hook_event_name":"UserPromptSubmit","session_id":"s1"}"#;
+    // A Codex the agent started, with hooks in its own settings.
+    run_hook(&crystal, "agent", &format!("{CRYSTAL} hook codex"), prompt);
+    assert_eq!(crystal.row("agent").unwrap()[1], "running");
+    // The agent's own hooks count.
+    run_hook(&crystal, "agent", &format!("{CRYSTAL} hook aider"), prompt);
+    assert_eq!(crystal.row("agent").unwrap()[1], "working");
 }
 
 /// The line number of the first line of `text` that holds `needle`.
@@ -3777,7 +4062,12 @@ impl Servers {
     }
 
     fn command(&self, args: &[&str]) -> Command {
-        let mut command = Command::new(CRYSTAL);
+        self.command_of(Path::new(CRYSTAL), args)
+    }
+
+    /// Like [`Servers::command`], run by the crystal at `program`.
+    fn command_of(&self, program: &Path, args: &[&str]) -> Command {
+        let mut command = Command::new(program);
         command
             .args(args)
             .current_dir(self.dir())
@@ -3787,7 +4077,8 @@ impl Servers {
             .env("XDG_STATE_HOME", self.dir().join("state"))
             .env("XDG_CONFIG_HOME", self.crystal.config_home())
             .env("CLAUDE_CONFIG_DIR", self.crystal.claude_config_dir())
-            .envs(PLAIN_GIT);
+            .envs(PLAIN_GIT)
+            .envs(QUIET);
         command
     }
 
@@ -4155,7 +4446,11 @@ fn the_history_keeps_more_than_tmuxs_two_thousand_rows() {
     crystal.ok(&["new", "-n", "printer", "sh", "-c", printing]);
     written(&crystal.dir.path().join("printed"));
 
-    let all = crystal.ok(&["read", "printer", "--history"]);
+    // The file is written as the last line goes out, before the daemon has
+    // read it all off the terminal.
+    let read = || crystal.ok(&["read", "printer", "--history"]);
+    eventually("the last line is in", || read().contains("line 3000\n"));
+    let all = read();
     let lines: Vec<&str> = all.lines().collect();
     assert_eq!(lines[0], "line 1");
     assert_eq!(lines[2999], "line 3000");
@@ -8845,9 +9140,16 @@ fn the_settings_view_changes_the_config_and_follows_it_live() {
     tui.type_keys(" ");
     tui.shows("● notifications");
     assert!(config().starts_with("notify = true\n"), "{}", config());
-    tui.type_keys("jjjl");
-    tui.shows("light");
+    tui.shows("● sounds");
+    tui.type_keys("jjjjl");
+    tui.shows("(2 of 20)");
     assert!(config().contains("theme = \"light\""), "{}", config());
+    // Back past the first is the last.
+    tui.type_keys("h");
+    tui.shows("(1 of 20)");
+    tui.type_keys("h");
+    tui.shows("vesper");
+    assert!(config().contains("theme = \"vesper\""), "{}", config());
 
     // Changed by hand, the file is shown as it is now.
     crystal.configure("notify = true\ntheme = \"light\"\n\n[memory]\ndistill = false\n");
@@ -10594,7 +10896,9 @@ command = ["sh", "hook.sh"]
     crystal.ok(&["plugin", "enable", "listener"]);
     crystal.ok(&["backlog", "add", "Retry", "the", "webhook"]);
     let heard = dir.join("heard");
-    eventually("the plugin hears of it", || heard.exists());
+    // The hook writes the event's name before its JSON: wait for the whole.
+    let whole = || std::fs::read_to_string(&heard).is_ok_and(|text| text.trim_end().ends_with('}'));
+    eventually("the plugin hears of it", whole);
     let heard = std::fs::read_to_string(&heard).unwrap();
     let json = heard
         .strip_prefix("backlog.added ")
@@ -11217,4 +11521,412 @@ fn an_agent_left_idle_is_stopped_and_starts_again_where_it_was() {
         .unwrap();
     assert!(out.status.success());
     assert_eq!(written(&args), "--resume\ns 1\n");
+}
+#[test]
+fn keys_the_config_gives_run_their_commands_and_colon_lists_every_one() {
+    let crystal = Crystal::new();
+    crystal.configure("[keys]\nkill = \"X\"\nquit = \"none\"\nprefix = \"ctrl+a\"\n");
+    let keys = crystal.ok(&["keys"]);
+    let line = |id: &str| {
+        keys.lines()
+            .find(|line| line.split_whitespace().next() == Some(id))
+            .unwrap_or_else(|| panic!("no {id} in {keys}"))
+            .to_string()
+    };
+    assert!(line("kill").contains(" X "), "{keys}");
+    assert!(line("quit").contains(" - "), "{keys}");
+    assert!(line("prefix").contains("ctrl+a"), "{keys}");
+
+    let mut tui = crystal.tui();
+    crystal.ok(&["new", "-n", "agent", "sleep", "30"]);
+    tui.shows("agent");
+    // `q` quits no more, and `X` kills.
+    tui.type_keys("q");
+    tui.type_keys("X");
+    tui.shows("kill agent? y/n");
+    tui.type_keys("n");
+    tui.hides("kill agent?");
+
+    // From inside the pane, the prefix and `:` open the list of commands.
+    tui.type_keys("\r");
+    tui.shows("typing into");
+    tui.type_keys("\x01");
+    tui.shows("ctrl+a …");
+    tui.type_keys(":");
+    tui.shows("select the session below");
+    tui.type_keys("quit");
+    tui.shows("quit the TUI");
+    tui.type_keys("\r");
+    assert!(tui.exit());
+}
+
+#[test]
+fn a_key_the_config_cant_make_sense_of_is_an_error_that_names_it() {
+    let crystal = Crystal::new();
+    crystal.configure("[keys]\nnew-sesion = \"n\"\n");
+    let err = crystal.fails(&["keys"]);
+    assert!(
+        err.contains("new-sesion") && err.contains("config.toml"),
+        "{err}"
+    );
+}
+
+/// This crystal's version.
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// What this machine's release is called, as `crystal update` picks it.
+fn release_target() -> String {
+    let os = if cfg!(target_os = "macos") {
+        "apple-darwin"
+    } else {
+        "unknown-linux-musl"
+    };
+    format!("{}-{os}", std::env::consts::ARCH)
+}
+
+/// crystal's releases, on a web server of the test's own that serves them
+/// the way GitHub does: `latest` redirects to the latest release's page,
+/// and each release's files are under `download/v<version>/`.
+struct Releases {
+    dir: TempDir,
+    url: String,
+    /// How many times it has been asked which release is the latest.
+    asked: Arc<Mutex<usize>>,
+}
+
+impl Releases {
+    /// Releases whose latest is `latest`.
+    fn new(latest: &str) -> Releases {
+        let dir = tempfile::tempdir().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/releases", listener.local_addr().unwrap());
+        let asked = Arc::new(Mutex::new(0));
+        let (root, base, latest) = (dir.path().to_path_buf(), url.clone(), latest.to_string());
+        let counted = asked.clone();
+        thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                serve_release(stream, &root, &base, &latest, &counted);
+            }
+        });
+        Releases { dir, url, asked }
+    }
+
+    fn asked(&self) -> usize {
+        *self.asked.lock().unwrap()
+    }
+
+    /// Publishes the release `version`, its crystal the script `crystal`,
+    /// with its checksum, or `sum` in its place.
+    fn publish(&self, version: &str, crystal: &str, sum: Option<&str>) {
+        use std::os::unix::fs::PermissionsExt;
+        let name = format!("crystal-{version}-{}", release_target());
+        let build = self.dir.path().join("build");
+        std::fs::create_dir_all(build.join(&name)).unwrap();
+        let binary = build.join(&name).join("crystal");
+        std::fs::write(&binary, crystal).unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let download = self.dir.path().join(format!("download/v{version}"));
+        std::fs::create_dir_all(&download).unwrap();
+        let archive = download.join(format!("{name}.tar.gz"));
+        let tar = Command::new("tar")
+            .arg("-czf")
+            .arg(&archive)
+            .arg("-C")
+            .arg(&build)
+            .arg(&name)
+            .status()
+            .unwrap();
+        assert!(tar.success());
+        let sum = sum.map_or_else(
+            || sha256_hex(&std::fs::read(&archive).unwrap()),
+            String::from,
+        );
+        let line = format!("{sum}  {name}.tar.gz\n");
+        std::fs::write(download.join(format!("{name}.tar.gz.sha256")), line).unwrap();
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// Answers one request to the releases' web server.
+fn serve_release(
+    mut stream: std::net::TcpStream,
+    root: &Path,
+    base: &str,
+    latest: &str,
+    asked: &Mutex<usize>,
+) {
+    use std::io::BufRead;
+    let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+    let mut request = String::new();
+    let _ = reader.read_line(&mut request);
+    let mut header = String::new();
+    while reader.read_line(&mut header).is_ok_and(|read| read > 2) {
+        header.clear();
+    }
+    let mut words = request.split_whitespace();
+    let (method, path) = (words.next().unwrap_or(""), words.next().unwrap_or(""));
+    let file = path
+        .strip_prefix("/releases/download/")
+        .and_then(|file| std::fs::read(root.join("download").join(file)).ok());
+    let (head, body) = if path == "/releases/latest" {
+        *asked.lock().unwrap() += 1;
+        let location = format!("{base}/tag/v{latest}");
+        (format!("302 Found\r\nLocation: {location}"), Vec::new())
+    } else if let Some(body) = file {
+        ("200 OK".to_string(), body)
+    } else {
+        ("404 Not Found".to_string(), Vec::new())
+    };
+    let head = format!(
+        "HTTP/1.1 {head}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    let _ = stream.write_all(head.as_bytes());
+    if method != "HEAD" {
+        let _ = stream.write_all(&body);
+    }
+}
+
+/// A crystal for a release that only says what it was asked to do, in
+/// `log`, and its version, 9.9.9.
+fn logging_crystal(log: &Path) -> String {
+    format!(
+        "#!/bin/sh\necho \"$*\" >> '{}'\nif [ \"$1\" = --version ]; then echo 'crystal 9.9.9'; fi\n",
+        log.display()
+    )
+}
+
+/// A copy of the crystal under test in `dir`'s `bin`, for an update to
+/// replace.
+fn installed_copy(dir: &Path) -> PathBuf {
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let installed = bin.join("crystal");
+    std::fs::copy(CRYSTAL, &installed).unwrap();
+    installed
+}
+
+#[test]
+fn update_puts_the_latest_release_in_place_and_restarts_every_daemon_on_it() {
+    let servers = Servers::new();
+    servers.ok(&["new", "-d", "-n", "keeper", "sleep", "300"]);
+    servers.ok(&[
+        "--server", "work", "new", "-d", "-n", "other", "sleep", "300",
+    ]);
+    let releases = Releases::new("9.9.9");
+    let log = servers.dir().join("new-crystal.log");
+    releases.publish("9.9.9", &logging_crystal(&log), None);
+    let installed = installed_copy(servers.dir());
+    // Claude Code is on this machine: its config directory is there.
+    std::fs::create_dir_all(servers.crystal.claude_config_dir()).unwrap();
+
+    let out = servers
+        .command_of(&installed, &["update"])
+        .env("CRYSTAL_RELEASES", &releases.url)
+        .output()
+        .unwrap();
+    let said = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{said}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        said.contains(&format!("updated crystal {VERSION} to 9.9.9")),
+        "{said}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&installed).unwrap(),
+        logging_crystal(&log)
+    );
+    // Nothing is left beside it.
+    let beside = std::fs::read_dir(installed.parent().unwrap()).unwrap();
+    assert_eq!(beside.count(), 1);
+
+    // The new crystal was tried, then restarted each daemon and installed
+    // its skill.
+    let ran = std::fs::read_to_string(&log).unwrap();
+    let ran: Vec<&str> = ran.lines().collect();
+    assert_eq!(ran[0], "--version", "{ran:?}");
+    for server in ["default", "work"] {
+        let socket = servers.run_dir().join(format!("crystal/{server}.sock"));
+        let restart = format!("--socket {} restart-server", socket.display());
+        assert!(ran.contains(&restart.as_str()), "{ran:?}");
+    }
+    assert_eq!(ran.last(), Some(&"skill --install"), "{ran:?}");
+}
+
+#[test]
+fn an_update_that_doesnt_match_its_checksum_changes_nothing() {
+    let crystal = Crystal::new();
+    let releases = Releases::new("9.9.9");
+    let log = crystal.dir.path().join("new-crystal.log");
+    releases.publish("9.9.9", &logging_crystal(&log), Some(&"0".repeat(64)));
+    let installed = installed_copy(crystal.dir.path());
+
+    let out = crystal
+        .command_of(&installed, &["update"])
+        .env("CRYSTAL_RELEASES", &releases.url)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("doesn't match its checksum"), "{err}");
+    // The crystal there is the one that was, and the new one never ran.
+    let version = Command::new(&installed).arg("--version").output().unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&version.stdout),
+        format!("crystal {VERSION}\n")
+    );
+    assert!(!log.exists());
+    let beside = std::fs::read_dir(installed.parent().unwrap()).unwrap();
+    assert_eq!(beside.count(), 1);
+}
+
+#[test]
+fn update_check_says_whether_a_newer_crystal_is_out() {
+    let crystal = Crystal::new();
+    let said = |releases: &Releases, args: &[&str]| {
+        let out = crystal
+            .command(args)
+            .env("CRYSTAL_RELEASES", &releases.url)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let newer = Releases::new("9.9.9");
+    assert_eq!(
+        said(&newer, &["update", "--check"]),
+        format!("crystal 9.9.9 is out, and this is {VERSION}: `crystal update` installs it\n")
+    );
+    let same = Releases::new(VERSION);
+    let latest = format!("crystal {VERSION} is the latest\n");
+    assert_eq!(said(&same, &["update", "--check"]), latest);
+    // With nothing newer, an update has nothing to do.
+    assert_eq!(said(&same, &["update"]), latest);
+}
+
+#[test]
+fn the_tui_says_once_a_day_that_a_newer_crystal_is_out() {
+    let crystal = Crystal::new();
+    let releases = Releases::new("9.9.9");
+    let env = [("CRYSTAL_RELEASES", releases.url.as_str())];
+    let mut tui = crystal.attach_with_env(&[], &env);
+    tui.shows("crystal 9.9.9 is out: `crystal update` installs it");
+    assert_eq!(releases.asked(), 1);
+    // Any key and it's gone.
+    tui.type_keys("j");
+    tui.hides("is out");
+    tui.type_keys("q");
+    assert!(tui.exit());
+
+    // Opened again the same day, it doesn't ask again.
+    let tui = crystal.attach_with_env(&[], &env);
+    tui.shows("crystal");
+    thread::sleep(Duration::from_millis(500));
+    assert_eq!(releases.asked(), 1);
+    assert!(!tui.text().contains("is out"));
+}
+
+#[test]
+fn bash_completes_the_names_of_running_sessions() {
+    let crystal = Crystal::new();
+    let dir = crystal.dir.path();
+    std::fs::write(
+        dir.join("crystal.bash"),
+        crystal.ok(&["completions", "bash"]),
+    )
+    .unwrap();
+    let driver = r#"
+source ./crystal.bash
+crystal() { printf 'review\nreviewer\nbuild\n'; }
+at() {
+    COMP_WORDS=("$@")
+    COMP_CWORD=$((${#COMP_WORDS[@]} - 1))
+    COMPREPLY=()
+    _crystal_with_sessions crystal "${COMP_WORDS[COMP_CWORD]}" "${COMP_WORDS[COMP_CWORD-1]}"
+    echo "${COMPREPLY[*]}"
+}
+at crystal attach rev
+at crystal a b
+at crystal -L work kill ''
+at crystal pane split --beside r
+at crystal done -n b
+at crystal send review ''
+at crystal new -n ''
+"#;
+    let out = Command::new("bash")
+        .arg("-c")
+        .arg(driver)
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let said = String::from_utf8(out.stdout).unwrap();
+    let lines: Vec<&str> = said.lines().collect();
+    assert_eq!(
+        lines[..5],
+        [
+            "review reviewer",
+            "build",
+            "review reviewer build",
+            "review reviewer",
+            "build"
+        ]
+    );
+    // A message to send, and a new session's name, aren't sessions.
+    assert!(!lines[5].contains("review"), "{said}");
+    assert!(!lines[6].contains("review"), "{said}");
+}
+
+#[test]
+fn zsh_and_fish_completions_offer_the_sessions() {
+    let crystal = Crystal::new();
+    let zsh = crystal.ok(&["completions", "zsh"]);
+    assert!(zsh.contains("_crystal_sessions"));
+    if Path::new("/bin/zsh").exists() {
+        let file = crystal.dir.path().join("_crystal");
+        std::fs::write(&file, &zsh).unwrap();
+        let checked = Command::new("/bin/zsh")
+            .arg("-n")
+            .arg(&file)
+            .output()
+            .unwrap();
+        assert!(
+            checked.status.success(),
+            "{}",
+            String::from_utf8_lossy(&checked.stderr)
+        );
+    }
+    let fish = crystal.ok(&["completions", "fish"]);
+    assert!(fish.contains("-a \"(crystal complete-sessions)\""));
+}
+
+#[test]
+fn complete_sessions_lists_running_sessions_and_never_starts_the_daemon() {
+    let crystal = Crystal::new();
+    assert_eq!(crystal.ok(&["complete-sessions"]), "");
+    assert!(!crystal.socket.exists());
+    crystal.ok(&["new", "-d", "-n", "review", "sleep", "30"]);
+    crystal.ok(&["new", "-d", "-n", "build", "sleep", "30"]);
+    let listed = crystal.ok(&["complete-sessions"]);
+    let mut names: Vec<&str> = listed.lines().collect();
+    names.sort_unstable();
+    assert_eq!(names, ["build", "review"]);
 }

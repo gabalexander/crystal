@@ -1,0 +1,108 @@
+# Adapted from herdr's detection rules (Apache-2.0).
+# Qwen Code keeps its composer visible while responding, so the prompt box is
+# not idle evidence by itself. Its status-prefixed terminal titles are the
+# primary locale-independent signals when ui.showStatusInTitle is enabled.
+# Exact screen fallbacks cover built-in locales and narrow terminals. OSC 9;4
+# is supplemental because Qwen emits it only while a tool is executing and
+# only in terminals that advertise progress support.
+id = "qwen"
+name = "Qwen Code"
+aliases = ["qwen-code"]
+packages = ["@qwen-code/qwen-code"]
+
+[[rules]]
+id = "osc_title_blocked"
+looks = "waiting"
+priority = 1200
+region = "title"
+regex = ['^\x{2733}\x{FE0E}? ']
+
+[[rules]]
+id = "osc_title_working"
+looks = "working"
+priority = 1100
+region = "title"
+regex = ['^\x{25D0}\x{FE0E}? ']
+
+[[rules]]
+id = "waiting_for_confirmation"
+looks = "waiting"
+priority = 1000
+region = "last_rows(20)"
+line_regex = ['^\s*⠏\s+.*\.\.\.\s*$']
+any = [
+  { contains = ["Waiting for user confirmation..."] },
+  { contains = ["等待用户确认..."] },
+  { contains = ["等待用戶確認..."] },
+  { contains = ["Warten auf Benutzerbestätigung..."] },
+  { contains = ["En attente de la confirmation de l'utilisateur..."] },
+  { contains = ["ユーザーの確認を待っています..."] },
+  { contains = ["Aguardando confirmação do usuário..."] },
+  { contains = ["Ожидание подтверждения от пользователя..."] },
+  { contains = ["Esperant la confirmació de l'usuari..."] },
+]
+
+[[rules]]
+id = "tool_confirmation"
+looks = "waiting"
+priority = 990
+region = "last_rows(20)"
+contains = ["yes, allow once"]
+any = [
+  { contains = ["apply this change?"] },
+  { contains = ["allow execution of:"] },
+  { contains = ["allow execution of mcp tool"] },
+  { contains = ["do you want to proceed?"] },
+  { contains = ["shell command execution"] },
+]
+
+[[rules]]
+id = "question_dialog"
+looks = "waiting"
+priority = 980
+region = "last_rows(20)"
+line_regex = [
+  '^\s*[❯›]\s*(?:\[(?: |✓)\]\s*)?\d+\.\s+',
+  '^\s*↑/↓\s*:.*(?:Enter|Return)\s*:',
+]
+
+[[rules]]
+id = "folder_trust_dialog"
+looks = "waiting"
+priority = 970
+region = "last_rows(20)"
+contains = ["do you trust this folder?", "trust folder (", "don't trust (esc)"]
+
+[[rules]]
+id = "cancel_hint_working"
+looks = "working"
+priority = 900
+region = "last_rows(8)"
+line_regex = ['^\s*(?:[⠁-⣿]|\.{1,2})\s+.*\(\d+(?:m(?:\s+\d+s)?|s).*\s·\sesc to cancel\)\s*$']
+
+[[rules]]
+id = "narrow_cancel_hint_working"
+looks = "working"
+priority = 890
+region = "last_rows(8)"
+line_regex = ['^\s*\(\d+(?:m(?:\s+\d+s)?|s)\s·\sesc to cancel\)\s*$']
+
+[[rules]]
+id = "osc_tool_progress_working"
+looks = "working"
+priority = 850
+region = "progress"
+regex = ['^4;3(?:;|$)']
+
+[[rules]]
+id = "composer_idle"
+looks = "settled"
+priority = 100
+region = "last_rows(30)"
+line_regex = ['^\s*>\s*(?:type\s*)?.*$']
+any = [
+  { contains = ["type your message"] },
+  { contains = ["your message or @path/to/file"] },
+  { contains = ["@path/to/file"] },
+  { contains = ["type", "mes", "sage", "@pat", "h/to", "/fil"] },
+]

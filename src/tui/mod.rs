@@ -12,6 +12,7 @@ mod archived_view;
 mod away;
 mod backlog_view;
 mod command_line;
+mod command_list;
 mod compose;
 mod copy_mode;
 mod diff;
@@ -23,6 +24,7 @@ mod grep;
 mod groups;
 mod help;
 mod issues;
+pub(crate) mod keymap;
 pub(crate) mod launcher;
 mod layout_link;
 mod layouts;
@@ -48,11 +50,12 @@ mod switcher;
 mod tabs;
 mod text_area;
 mod text_input;
-mod theme;
+pub(crate) mod theme;
 mod timeline;
 mod tree_browser;
 mod ui;
 
+use crate::bell::Ringer;
 use crate::config::{self, Config};
 use crate::db::{self, Db};
 use crate::events::{Filter, Since};
@@ -69,7 +72,7 @@ use crate::project_commands::{self, Commands, Verb};
 use crate::protocol::{
     Backlog, NewSession, Request, Response, SessionInfo, Spending, State, Worktree,
 };
-use crate::{catalog, keys, links, socket, typing};
+use crate::{catalog, keys, links, socket, typing, update};
 use crate::{client, clipboard, drive, env, event_log, events, git};
 use anyhow::{Context as _, Result, bail};
 use app::{Action, App, Focus, Hit, Place, PluginKey, PluginPane, Slot};
@@ -270,7 +273,8 @@ pub enum Event {
     BacklogCounts(HashMap<PathBuf, usize>),
     /// What background tasks have spent today.
     Spending(Spending),
-    /// The settings as they are now, for the settings view.
+    /// The settings as they are now, for the settings view: boxed, as the
+    /// config is the biggest thing an event carries.
     Settings(Box<settings_view::Current>),
     /// The terminal has focus again, or has lost it.
     Focus(bool),
@@ -349,12 +353,13 @@ pub fn run(socket: &Path) -> Result<()> {
         projects,
         worktree_projects,
         list_worktrees_now,
-        theme: Theme::from_env(config.theme),
+        theme: Theme::from_config(&config),
         started: Instant::now(),
         sessions_asked: Instant::now(),
         searches: Arc::new(AtomicU64::new(0)),
         link_clicked: false,
         kept_tabs: tabs::Tabs::default(),
+        kept_sidebar: app::Shape::default(),
         quitting: false,
         overlay: None,
         count_backlog,
@@ -364,13 +369,20 @@ pub fn run(socket: &Path) -> Result<()> {
         feed: Arc::new(AtomicU64::new(0)),
         presence: away::Presence::new(events::now_ms()),
         layout,
+        ringer: Ringer::default(),
     };
     tui.app.set_agents(catalog::installed());
     let server = socket::server_of(socket).filter(|server| server != socket::DEFAULT);
     tui.app.set_server(server);
     tui.app.set_launch_settings(&config);
     tui.app.set_features(&config);
+    tui.app.set_interface(&config);
     tui.app.set_plugin_keys(plugin_keys(&config));
+    let sidebar = tui
+        .ui(db::SIDEBAR)
+        .and_then(|json| serde_json::from_str(&json).ok());
+    tui.app.set_sidebar(sidebar, config.sidebar.folded);
+    tui.kept_sidebar = tui.app.sidebar_shape();
     tui.app
         .set_memory(launcher::read_memory(tui.ui(db::LAUNCHER).as_deref()));
     tui.app.set_diff_tree(tui.review().tree);
@@ -381,6 +393,9 @@ pub fn run(socket: &Path) -> Result<()> {
     tui.app.set_tabs(tabs::read(tui.ui(db::TABS).as_deref()));
     tui.kept_tabs = tui.app.tabs_to_keep();
     tui.look_back_from_last_seen();
+    if config.update.check {
+        tui.look_for_update();
+    }
 
     let mut terminal = ratatui::try_init()?;
     let result = tui.run_with_modes(&mut terminal, events);
@@ -484,6 +499,8 @@ struct Tui {
     sessions_asked: Instant,
     /// The tabs as they were last kept.
     kept_tabs: tabs::Tabs,
+    /// The sidebar's shape as it was last written down.
+    kept_sidebar: app::Shape,
     /// How many searches find in files has asked for: a search that isn't
     /// the last one asked for stops.
     searches: Arc<AtomicU64>,
@@ -497,6 +514,9 @@ struct Tui {
     feed: Arc<AtomicU64>,
     /// Whether the user is there, for "while you were away".
     presence: away::Presence,
+    /// Passes on to the user's terminal the bells of the sessions in panes,
+    /// and of those out of sight the daemon marked as having rung.
+    ringer: Ringer,
 }
 
 impl Tui {
@@ -599,6 +619,28 @@ impl Tui {
         });
     }
 
+    /// Once a day, has whether a newer crystal is out looked up off the
+    /// loop, and said when it is. The look is kept as it starts, so one that
+    /// can't ask, offline say, waits a day too.
+    fn look_for_update(&self) {
+        let Ok(db) = &self.db else {
+            return;
+        };
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |since| since.as_secs());
+        if !update::due(self.ui(db::UPDATE).as_deref(), now) {
+            return;
+        }
+        let _ = db.keep_ui(db::UPDATE, &update::Looked { at: now });
+        let events = self.events.clone();
+        thread::spawn(move || {
+            if let Some(notice) = update::newer_notice() {
+                let _ = events.send(Event::Notice(notice));
+            }
+        });
+    }
+
     /// Keeps the latest event in the log as the last the user has seen,
     /// where "while you were away" counts from the next time the TUI opens.
     fn keep_seen(&self) {
@@ -693,6 +735,15 @@ impl Tui {
             }
             self.kept_tabs = tabs;
         }
+        // The sidebar's width goes with them; whether it's folded is the
+        // config's to say at the start.
+        let sidebar = self.app.sidebar_shape();
+        let resized = sidebar.width != self.kept_sidebar.width
+            || sidebar.from_config != self.kept_sidebar.from_config;
+        if resized && let Ok(db) = &self.db {
+            let _ = db.keep_ui(db::SIDEBAR, &sidebar);
+        }
+        self.kept_sidebar = sidebar;
     }
 
     /// The document called `name` the TUI keeps, when there's one to read.
@@ -753,6 +804,15 @@ impl Tui {
     /// Takes a fresh list of sessions, and tells the pull request poller
     /// and the worktree lister which projects they're in.
     fn set_sessions(&mut self, sessions: Vec<SessionInfo>) {
+        // A session the TUI knew of that has come to be marked as having
+        // rung its bell, out of sight, rings the user's terminal.
+        let known = self.app.sessions();
+        let rang = sessions.iter().any(|session| {
+            session.bell && known.iter().any(|old| old.id == session.id && !old.bell)
+        });
+        if rang {
+            let _ = self.ringer.ring();
+        }
         self.app.set_sessions(sessions);
         self.list_worktrees_of_projects();
         let projects = self.app.projects();
@@ -897,8 +957,12 @@ impl Tui {
             }
             Event::Notice(notice) => self.app.notify(notice),
             Event::Output { pane, bytes } => {
-                if let Some(pane) = self.pane_with_id(pane) {
+                let rang = self.pane_with_id(pane).is_some_and(|pane| {
                     pane.screen.process(&bytes);
+                    pane.screen.take_bells() > 0
+                });
+                if rang {
+                    let _ = self.ringer.ring();
                 }
             }
             // The next list says whether the session has ended, or runs on
@@ -1054,7 +1118,10 @@ impl Tui {
         if self.click_on_link(&mouse, hit) {
             return;
         }
-        if let Some(split) = self.app.moving_border() {
+        if self.app.dragging_sidebar() {
+            // So is the sidebar's edge, wherever the mouse goes.
+            hit = Hit::SidebarEdge(mouse.column);
+        } else if let Some(split) = self.app.moving_border() {
             // A border taken by the mouse is crystal's until it's let go.
             hit = ui::border_hit(&areas, &self.app, split, mouse.column, mouse.row);
         } else if let Some(slot) = self.app.dragging() {
@@ -1837,13 +1904,14 @@ impl Tui {
         if *config == self.config {
             return;
         }
-        if config.theme != self.config.theme {
-            self.theme = Theme::from_env(config.theme);
+        if config.theme != self.config.theme || config.colors != self.config.colors {
+            self.theme = Theme::from_config(config);
         }
         crate::vt::set_history_lines(config.scrollback_lines);
         self.config = config.clone();
         self.app.set_launch_settings(config);
         self.app.set_features(config);
+        self.app.set_interface(config);
         self.app.set_plugin_keys(plugin_keys(config));
         let backlog = crate::backlog::enabled(config);
         self.count_backlog.store(backlog, Ordering::Relaxed);
@@ -2185,10 +2253,10 @@ fn listed_plugins(config: &Config, socket: &Path) -> Vec<plugins_view::Listed> {
     own.chain(installed).collect()
 }
 
-/// The sidebar keys taken by the actions of the installed plugins that are
-/// on and can run here. Installing or switching on a plugin refuses a key
-/// another has, so where two plugins' files were changed to share one, the
-/// first by name keeps it.
+/// The actions of the installed plugins that are on and can run here, each
+/// with the sidebar key it took, if it took one. Installing or switching on
+/// a plugin refuses a key another has, so where two plugins' files were
+/// changed to share one, the first by name keeps it.
 fn plugin_keys(config: &Config) -> Vec<PluginKey> {
     let mut keys: Vec<PluginKey> = Vec::new();
     let on = plugins::installed()
@@ -2199,17 +2267,14 @@ fn plugin_keys(config: &Config) -> Vec<PluginKey> {
             continue;
         };
         for action in manifest.actions {
-            let Some(key) = action.key.as_ref().and_then(|key| key.chars().next()) else {
-                continue;
-            };
-            if keys.iter().all(|taken| taken.key != key) {
-                keys.push(PluginKey {
-                    key,
-                    plugin: plugin.name.clone(),
-                    action: action.id,
-                    title: action.title,
-                });
-            }
+            let key = action.key.as_ref().and_then(|key| key.chars().next());
+            let free = key.is_some_and(|key| keys.iter().all(|taken| taken.key != Some(key)));
+            keys.push(PluginKey {
+                key: key.filter(|_| free),
+                plugin: plugin.name.clone(),
+                action: action.id,
+                title: action.title,
+            });
         }
     }
     keys

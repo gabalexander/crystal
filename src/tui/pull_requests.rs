@@ -394,7 +394,7 @@ mod tests {
     }
 
     fn drawn(view: &PullRequestsView) -> String {
-        let theme = Theme::new(ThemeName::Dark, false);
+        let theme = Theme::new(ThemeName::DARK, false);
         let mut terminal = Terminal::new(TestBackend::new(80, 16)).unwrap();
         terminal
             .draw(|frame| draw(frame, view, &theme, 1_790_940_000, frame.area()))

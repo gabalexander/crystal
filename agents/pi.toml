@@ -1,0 +1,24 @@
+# Adapted from herdr's detection rules (Apache-2.0).
+id = "pi"
+name = "Pi"
+packages = ["@mariozechner/pi-coding-agent", "@earendil-works/pi-coding-agent"]
+
+[[rules]]
+id = "working_literal"
+looks = "working"
+priority = 100
+region = "screen"
+any = [
+  { contains = ["Working..."] },
+  { line_regex = ['^[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] Working$'] },
+]
+
+[[rules]]
+id = "working_border"
+looks = "working"
+priority = 100
+region = "last_rows(12)"
+any = [
+  { line_regex = ['^── [⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] Working ─+$'] },
+  { line_regex = ['^[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] Working$'] },
+]

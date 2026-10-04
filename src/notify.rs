@@ -21,9 +21,15 @@
 //! - `CRYSTAL_NOTICE_ACTIVITY`: `waiting` or `done`
 //! - `CRYSTAL_NOTICE_JUMP`: a shell command that takes the user to the
 //!   session in the TUI and brings its terminal to the front, for a click
+//!
+//! A sound plays at the same moments, unless `[sound]` says not to: see
+//! [`crate::sound`]. It goes with the notifications plugin, but not with
+//! `notify`, so the one can be on without the other.
 
+use crate::agents;
 use crate::config::Config;
-use crate::protocol::{Activity, SessionInfo};
+use crate::protocol::{Activity, Front, SessionInfo};
+use crate::sound::{self, Sound};
 use anyhow::{Result, bail};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -50,6 +56,9 @@ pub struct Notice {
     pub text: String,
     /// The session a click on it takes the user to, if any.
     pub jump: Option<String>,
+    /// The program of the session's agent, like `claude`, for the sounds
+    /// switched off for some agents.
+    pub agent: Option<String>,
 }
 
 impl Notice {
@@ -75,6 +84,7 @@ impl Notice {
             activity,
             text,
             jump: Some(session.name.clone()),
+            agent: agent_of(session),
         }
     }
 }
@@ -171,6 +181,16 @@ impl Telling {
     }
 }
 
+/// The program of the agent in `session`: the one in front, or that
+/// reports for itself, or else the program it was started with.
+fn agent_of(session: &SessionInfo) -> Option<String> {
+    match &session.front {
+        Some(Front::Agent { program, .. }) => Some(program.clone()),
+        Some(Front::Task) => Some("claude".to_string()),
+        _ => agents::program_name(&session.command).map(String::from),
+    }
+}
+
 /// Whether an agent doing `activity` needs the user: it's asking them
 /// something, or it has finished a turn they haven't seen.
 pub fn needs_user(activity: Option<Activity>) -> bool {
@@ -214,8 +234,13 @@ pub fn may_tell(config: &Config, presence: Presence) -> bool {
     enabled(config) && !(config.notifications.unfocused_only && presence == Presence::Here)
 }
 
+/// Tells the user of `notice`: a sound, unless `[sound]` says not to, and
+/// a notification, by the notification settings.
 fn tell_now(notice: &Notice, socket: &Path) -> Result<()> {
     let config = settings();
+    if sound::wanted(&config, notice.agent.as_deref()) {
+        sound::play(Sound::of(notice.activity), &config.sound);
+    }
     if !may_tell(&config, presence()) {
         return Ok(());
     }
@@ -429,6 +454,7 @@ mod tests {
             asking: None,
             reporter: None,
             subagents: 0,
+            bell: false,
         }
     }
 
@@ -565,6 +591,24 @@ mod tests {
 
         let notice = Notice::about(&session(None), Done);
         assert_eq!(notice.text, "claude-2 is done");
+    }
+
+    #[test]
+    fn a_notice_says_which_agent_it_s_about() {
+        assert_eq!(
+            Notice::about(&session(None), Done).agent.as_deref(),
+            Some("claude")
+        );
+        let mut codex = session(None);
+        codex.command = vec!["sh".into()];
+        codex.front = Some(Front::Agent {
+            program: "codex".into(),
+            name: "Codex".into(),
+        });
+        assert_eq!(
+            Notice::about(&codex, Waiting).agent.as_deref(),
+            Some("codex")
+        );
     }
 
     #[test]

@@ -75,6 +75,45 @@ daemon from before handovers is restarted: running sessions come back, Claude Co
 programs from the start. A crystal that finds a daemon of another version says so, rather than misunderstanding
 it; a TUI left open on an older crystal asks you to start it again.
 
+### Updating
+
+```sh
+crystal update            # install the latest release, if it's newer
+crystal update --check    # only say whether a newer one is out
+crystal update 0.2.0      # install that release instead, even an older one
+```
+
+`crystal update` does what the install script does, in place: it downloads the release for this machine,
+checks it against its checksum, runs it once to see that it runs here, and only then puts it in place of the
+crystal you ran. Then the new crystal restarts every daemon that's running, each server's, handed over as
+`crystal restart-server` does, so your sessions carry on, and brings the skill up to date where Claude Code is
+(`CRYSTAL_NO_SKILL=1` leaves it). A crystal installed by Homebrew, mise, Nix or cargo, or one built from
+source, is left alone, and the command says what updates it instead. `CRYSTAL_RELEASES` names another place to
+download releases from, as it does for the install script.
+
+Once a day, as it opens, the TUI looks for a newer release and says so on its bottom line when there is one.
+`check = false` under `[update]` in the [settings](#settings) turns that off.
+
+### Shell completions
+
+`crystal completions <shell>` prints the script that completes crystal's commands and options in bash, zsh,
+fish, elvish or PowerShell. In bash, zsh and fish, a command that takes a session's name, like `attach`, `send`
+or `kill`, completes the names of the sessions running now; with no daemon running there are none, and none is
+started.
+
+```sh
+# bash: in ~/.bashrc
+eval "$(crystal completions bash)"
+# zsh: in a directory on your $fpath, then start a new shell (compinit must run in ~/.zshrc)
+crystal completions zsh > ~/.zfunc/_crystal
+# fish
+crystal completions fish > ~/.config/fish/completions/crystal.fish
+# elvish: in ~/.config/elvish/rc.elv
+eval (crystal completions elvish | slurp)
+# PowerShell: in your $PROFILE
+crystal completions powershell | Out-String | Invoke-Expression
+```
+
 ## Usage
 
 Run `crystal` on its own to open the TUI: every session in a sidebar on the left, and the selected one live in
@@ -122,7 +161,10 @@ and the footer says where you are and offers the keys that matter there, or, whe
 | `u` | select the next session that needs you: waiting on you first, then done |
 | `U` | list everything that [needs you](#timeline), in every tab, and answer a permission or a gate where it stands |
 | `a` | the [timeline](#timeline): what happened, the newest first, as it happens |
-| `/` | find a session by typing a little of its name, project, branch or command |
+| `/` | find a session, in any tab, by typing a little of its name, project, branch or command; one in another tab says which, and picking it takes you there |
+| `:` | the [command list](#keys-and-commands): every command by its name, with its key, the latest you ran first; `Enter` runs one |
+| `(` / `)` | make the [sidebar](#the-sidebar) narrower or wider; its edge drags with the mouse too |
+| `\` | fold the [sidebar](#the-sidebar) down to a rail of marks, or unfold it |
 | `o` | open the pull request of the selected session's branch in your browser |
 | `O` | list the open [pull requests](#pull-requests-and-issues) of the selected session's project: read one, see its diff, comment, or start an agent in its worktree |
 | `i` | list the open [issues](#pull-requests-and-issues) of the selected session's project: read one, comment, edit it, or start an agent on it |
@@ -139,13 +181,16 @@ and the footer says where you are and offers the keys that matter there, or, whe
 | `m` | what the selected session's project has remembered: [memory](#memory) |
 | `P` | list your [profiles](#profiles), and add, change, copy or remove one |
 | `X` | list the [plugins](#plugins): switch them on and off, run their actions and open their panes |
-| `,` | open the [settings](#the-settings-view): notifications, the theme, and how memory learns and searches, each changed as you go |
+| `,` | open the [settings](#the-settings-view): notifications, sounds, the theme, and how memory learns and searches, each changed as you go |
 | `?` | show every key, in the sidebar, in a pane, in a question and with the mouse: a page at a time when they don't all fit, `→` and `←` (or `Space`, `PgDn` and `PgUp`) turning the pages |
 | `q` | quit; the sessions keep running |
 
 While you're typing into a session, every key goes to it, `Tab` included, except `Ctrl+\`, which takes you
-back to the sidebar, and `Shift+PageUp` / `Shift+PageDown`, which page through the pane's history. Some
-terminals keep `Shift+PageUp` for their own scrolling; `Ctrl+\` and then `PageUp` does the same.
+back to the sidebar, `Shift+PageUp` / `Shift+PageDown`, which page through the pane's history, and the prefix,
+`Ctrl+B`: press it, then any key in the table above, and that key's command runs without the keyboard leaving
+the pane, as in tmux. `Ctrl+B` twice sends `Ctrl+B` to the program, and `Esc` after it does nothing. Some
+terminals keep `Shift+PageUp` for their own scrolling; `Ctrl+B` and then `PageUp` does the same. Every key in
+the table, the prefix and `Ctrl+\` included, can be changed: see [keys and commands](#keys-and-commands).
 
 A program that asks for the [Kitty keyboard protocol](https://sw.kovidgoyal.net/kitty/keyboard-protocol/), as
 Codex does, gets its keys that way, in a pane, through `crystal attach` and from `crystal send-keys`: keys the
@@ -262,20 +307,23 @@ version, or an agent npm runs with `node`.
 
 crystal knows what an agent is doing in two ways. When it starts Claude Code itself, it adds hooks with
 `--settings`, so your settings files are left alone and your own hooks still run. And for every session it
-reads the screen: the spinner an agent puts in its title, "esc to interrupt" while it works, the question
-it asks before a command. The screen covers agents without hooks, like Codex or a Claude you started from a
-shell, and what hooks never say: a turn you cut short with Esc, or work carrying on once you've said yes.
-The screen only counts while an agent is in front: a shell or a build printing an agent's words never shows
-as waiting, and when an agent exits back to its shell, what it was doing goes with it. While Claude Code's
-agent has subagents running, its row says how many after what's in front: `claude +2`.
+reads the screen, by [rules for each agent](#how-crystal-reads-an-agent): the spinner an agent puts in its
+title, "esc to interrupt" while it works, the question it asks before a command. The screen covers agents
+without hooks, like Codex or a Claude you started from a shell, and what hooks never say: a turn you cut short
+with Esc, or work carrying on once you've said yes. The screen only counts while an agent is in front: a shell
+or a build printing an agent's words never shows as waiting, and when an agent exits back to its shell, what
+it was doing goes with it. `crystal agent explain <session>` shows why crystal reads a session the way it
+does. While Claude Code's agent has subagents running, its row says how many after
+what's in front: `claude +2`.
 
 A Claude Code or Codex you start yourself, typed into a session's shell, has no hooks of crystal's: crystal
 doesn't start it. `crystal integration install` puts crystal's hooks in their own settings, beside yours:
 
 ```sh
-crystal integration install          # Claude Code and Codex, each that's installed here
+crystal integration install          # each agent crystal can hook that's installed here
 crystal integration install claude   # into $CLAUDE_CONFIG_DIR/settings.json, or ~/.claude/settings.json
 crystal integration install codex    # into $CODEX_HOME/hooks.json, or ~/.codex/hooks.json
+crystal integration install cursor   # and droid, qodercli, qwen, copilot: see below
 crystal integration status           # whether they're there, for this crystal
 crystal integration uninstall        # take them out again, and only them
 ```
@@ -311,6 +359,29 @@ unfocused_only = true   # only while no crystal TUI's terminal has the focus
 
 `crystal notify` sends a notification of your own, through the same settings: a script's `crystal notify
 "deploy finished"`, or an agent's, which a click takes you back to its session (`-n <name>` names another).
+
+A sound plays at the same moments: one for an agent asking you something, another for one that's done.
+crystal plays them with `afplay` on macOS, and on Linux with the first of `paplay`, `pw-play`, `ffplay`,
+`mpg123` and `mpv` that's installed; with none, there's no sound. `[sound]` in the
+[settings](#settings) switches them off, for every agent or some, or plays files of your own:
+
+```toml
+[sound]
+enabled = true              # sounds for every agent
+request = "sounds/ask.mp3"  # your own, for an agent that asks you something; from the config's directory
+done = "~/sounds/done.wav"  # and for one that's done
+
+[sound.agents]
+codex = false               # not for Codex, say because it plays its own
+```
+
+`CRYSTAL_NO_SOUND=1` keeps crystal quiet whatever the config says.
+
+A program in a session that rings the terminal's bell (`printf '\a'`, `tput bel`, a build that's done) rings
+yours: `crystal attach` and the TUI's panes pass the bell of the session they show on to your terminal, which
+beeps, flashes or marks its tab, the way you set it up to. A session out of sight that rings gets a `♪` before
+its time in the sidebar until you look at it, rings your terminal from the TUI too, and the event log gets a
+`session.bell`. A program ringing over and over rings yours at most twice a second.
 
 `/` finds a session by typing a little of it. The sidebar shows only the sessions that match, under their
 project and worktree, with the letters that matched marked in each name. The letters only have to turn up in
@@ -353,6 +424,8 @@ crystal project run                         # run this worktree's project in a s
 crystal kill-server                         # stop every session, and the daemon
 crystal restart-server                      # restart the daemon on this crystal, say after an upgrade
 crystal restart-server --cold               # stop it and start it again: sessions start again too
+crystal update                              # install the latest release, the daemons restarted on it
+crystal completions zsh                     # complete crystal's commands in your shell (see above)
 crystal server                              # list the servers, daemons of their own (see below)
 crystal config                              # where the config file is, and the settings in effect
 crystal profile                             # list your agent profiles
@@ -418,6 +491,54 @@ can't be read stops the daemon rather than being started over. What an older cry
 brought in the first time, and each file is kept beside it, renamed `.imported` (or `.broken`, when it couldn't
 be read).
 
+### Keys and commands
+
+Every key in the sidebar's table runs a command with a name: `n` is `new-session`, `|` is `split-right`, `q` is
+`quit`. `crystal keys` lists them all, with the keys your config gives them. `[keys]` in the
+[config file](#settings) changes them, a command's name to one key, a list of them, or `"none"`:
+
+```toml
+[keys]
+prefix = "ctrl+a"          # the prefix, from inside a pane; "none" for no prefix
+hand-back = "ctrl+g"       # from a pane back to the sidebar
+new-session = ["n", "ctrl+n"]
+kill = "X"                 # x is free now
+split-right = "v"          # v was copy mode's: copy mode has no key now
+quit = "none"              # the command list still runs it
+```
+
+A key you give one command is taken from the command that had it, which is left with its other keys, or none.
+Two commands given the same key, a command or a key crystal doesn't know, are errors that name them, so a
+typo never goes unnoticed. Keys are written as `n`, `N` (or `shift+n`), `ctrl+b`, `alt+enter`, `shift+left`,
+`pageup`, `space`, `f5`, or the character itself, like `|`, `(` or `:`. The `?` overlay, the footer and the
+command list all say the keys you chose. The keys inside the views (the diff, the file finder and the rest),
+copy mode's and the questions' on the footer line stay as they are.
+
+`:` opens the command list: every command by its name, with what it does and its key, and your plugins'
+actions after them. Type a little of a name, or of what it does, and `Enter` runs the one the bar is on, as
+its key would. Before you type, the five you ran from it last come first, so it's also a quick way back to
+what you just did. A command with no key, or whose key you don't remember, is always there.
+
+### The sidebar
+
+The sidebar is 28 columns wide unless `[sidebar]` in the config says otherwise. `(` and `)` take four columns
+from it or give it four, or drag the line between it and the panes with the mouse; the TUI keeps the width
+you leave it at, until the config gives another. `\` folds it to a rail three columns wide, a session's mark
+a row, so a session waiting on you still shows while the panes take the room; `\` again, `)`, or dragging its
+edge, unfolds it. While it's folded, or the tab is zoomed, `/` brings it out over the panes to look through.
+
+Whatever needs you, in every tab, is pinned at the top under **needs you**: the agents waiting on you, then
+those that finished a turn you haven't looked at. One in another tab says which tab, and a click on it takes
+you there. `u` goes to each in turn, and `U` lists them with what each waits for.
+
+```toml
+[sidebar]
+width = 32             # 16 to 80 columns
+folded = false         # start folded
+fold = "marks"         # what folding keeps: "marks", or "hidden" for nothing
+needs_you = true       # pin what needs you at the top
+```
+
 ### Tabs
 
 A tab is a space of its own: it holds its own sessions, and the sidebar lists only the sessions of the tab
@@ -433,7 +554,8 @@ bar shows only the numbers, and with more still, as many as fit around the tab y
 
 A tab with something going on in it shows that on its label, the way the sidebar marks a session: `▲` when an
 agent in it is waiting on you, `✓` when one has finished a turn you haven't looked at, the turning `◐` while
-one works. `u` looks through every tab for the next session that needs you, and takes you to its tab.
+one works. `u` looks through every tab for the next session that needs you, and takes you to its tab; the
+sidebar [pins](#the-sidebar) whatever needs you, from every tab, at its top; and `/` finds a session in any tab.
 
 Every session is in exactly one tab. A session you start from the TUI goes in the tab you're in, and so does
 one started any other way, from the command line or another TUI, unless it's a step of a [flow](#flows), which
@@ -527,7 +649,9 @@ to, stays, and so does one a script has typed into the session by with `crystal 
 Under the task, `Tab` and `Shift+Tab` go from row to row and `←` / `→` change a row's choice:
 
 - **run**: your [profiles](#profiles), then the agents installed on your `PATH` (Claude Code, Codex, Gemini
-  CLI, OpenCode, Cursor, Aider), then your shell. What you started last is chosen the next time. A profile's
+  CLI, OpenCode, Cursor, Qwen Code, Pi, GitHub Copilot, Amp, Droid, Kimi Code, Kiro, Cline, Kilo Code,
+  Devin, Grok, Qoder CLI, Letta Code, Hermes Agent, Antigravity, Aider), then your shell. What you started
+  last is chosen the next time. A profile's
   description shows under the row, and choosing it sets the rows below from it; you can still change them.
 - **how**, for Claude Code: **in a terminal**, or **in the background**, as a [background
   task](#background-tasks) that needs no terminal. Only Claude Code offers it: crystal reads `claude -p`'s
@@ -546,8 +670,9 @@ it.
 
 The panel ends with the command it runs and, for a new worktree, where. `Ctrl+E` hands that command to the
 bottom line, `new session:`, to change it or run anything else: `npm run dev` or `sh -c 'make && make test'`
-work there, and an empty line starts your shell. Aider can't be given a task when it starts, so for it the
-task box gives way to a note.
+work there, and an empty line starts your shell. Claude Code, Codex, Gemini CLI, OpenCode, Cursor, Qwen Code
+and Pi are given the task as they start, each the way it takes one. For the others crystal knows of no way to,
+checked against their own code or documentation, so for them the task box gives way to a note.
 
 ### Archiving and idle agents
 
@@ -838,11 +963,88 @@ started with, but not its first prompt again. The limits:
 - A Codex you start yourself in a shell session gets its status from the screen, and is resumed only with
   crystal's hooks installed.
 
+### How crystal reads an agent
+
+crystal reads each agent's screen by a file of rules for that agent. It comes with one for each of Claude
+Code, Codex, Gemini CLI, OpenCode, Cursor, Qwen Code, Pi, GitHub Copilot, Amp, Droid, Kimi Code, Kiro, Cline,
+Kilo Code, Devin, Grok, Qoder CLI, Letta Code, Hermes Agent, Antigravity, Maki and Muse, adapted from
+[herdr](https://github.com/herdrdev/herdr)'s, and a common one for any other agent in front, like Aider. An
+agent changes what it draws from one version to the next, so when crystal reads one wrong you can mend its
+rules yourself without waiting for a release:
+
+```sh
+crystal agent list                        # the agents, where their rules come from, installed, hooks
+crystal agent explain fix-login           # why crystal reads that session the way it does
+crystal agent explain fix-login --agent codex -v   # Codex's rules on its screen, with what each looked at
+crystal agent explain --file screen.txt --agent codex --title "⠋ codex"   # rules on a saved screen
+crystal agent rules codex > ~/.config/crystal/agents/codex.toml           # start from crystal's own
+```
+
+A file in `~/.config/crystal/agents/` takes the place of crystal's rules for the agent its `id` (or one of its
+`aliases`) names, and a file for an agent crystal has none for adds it: it's then taken for an agent when it's
+in front, and read by its rules. The daemon reads the files again within a couple of seconds of a change. A
+file that can't be used is said in `crystal agent list`, `explain` and the daemon's log, and crystal's own
+rules stand in for it, so a typo never stops the reading.
+
+```toml
+# A file's fields, and every test a rule can make.
+id = "codex"                     # the agent, by its program's name
+name = "Codex"                   # how crystal shows it
+aliases = ["codex-cli"]          # other names its program goes by
+packages = ["@openai/codex"]     # npm packages it runs from, as `node …/node_modules/<package>/…`
+
+[[rules]]
+id = "approval_question"         # what explain calls it
+looks = "waiting"                # working, waiting, settled, or skip
+priority = 890                   # of the rules that match, the highest wins; the first in the file on a tie
+region = "last_rows(15)"         # where it looks
+contains = ["would you like to"] # all of these, in any case
+regex = ['\(y\)']                # all of these patterns match
+line_regex = ['^› ']             # each of these matches a line
+any = [{ contains = ["yes"] }, { contains = ["❯"] }]   # one of these passes
+all = [{ contains = ["proceed"] }]                     # every one of these passes
+not = [{ contains = ["esc to interrupt"] }]            # none of these passes
+```
+
+`skip` is for a screen that says nothing either way, like a menu or a transcript viewer over the prompt: the
+status stays as it was. When no rule matches, the agent is settled. A rule looks in one region:
+
+| Region | What it is |
+|---|---|
+| `screen` | the whole screen (the default) |
+| `title` | the title the agent gave its terminal |
+| `progress` | the progress it reports (OSC 9;4), as `4;1;-1`: a state, then a percentage |
+| `last_rows(N)`, `first_rows(N)` | the last or first N rows with something on them |
+| `after_last_rule` | the rows after the last horizontal rule (`───`) |
+| `prompt_box`, `above_prompt_box`, `last_row_above_prompt_box` | inside the box between the last two rules, what's above it, and its last row |
+| `after_last_prompt`, `before_current_prompt`, `without_current_prompt` | around Codex's prompt line, `›`: the rows after the last one, the rows before the one the user is at, or the whole screen unless the user is at one |
+
+A new look counts once two checks in a row see it, so a screen caught halfway through a redraw doesn't.
+
+#### Hooks in other agents' own settings
+
+Beyond Claude Code and Codex, some agents take hooks only in their own settings files, never on the command
+line. crystal leaves those files alone unless you ask, with the same [`crystal
+integration`](#usage) command, as for those two:
+
+```sh
+crystal integration install cursor     # ~/.cursor/hooks.json, or $CURSOR_CONFIG_DIR's
+crystal integration uninstall cursor   # takes crystal's out, and leaves yours
+```
+
+It can for Cursor, Droid (`~/.factory/settings.json`), Qoder CLI (`qodercli`), Qwen Code and GitHub Copilot,
+with the events each has that say what it's doing or which conversation it's in. The hook runs `crystal hook
+<agent>` inside a crystal session only, so the agent anywhere else runs as before, and it never fails the
+agent. What a hook says counts only while that agent is in front: an agent that Claude Code runs in the
+session doesn't speak for the session. `crystal agent list` says whose hooks are in. The settings file is
+written again as formatted JSON, its keys in order.
+
 ### Teaching crystal about your agent
 
-crystal knows Claude Code by its hooks, and reads Codex and the other agents it knows off their screens. Any
-other agent, or a script wrapped around one, can tell crystal what it's doing itself, and how to pick its
-session up again, with `crystal report`: no change to crystal, and no waiting for a release of it. Once your
+crystal knows Claude Code by its hooks, and reads Codex and the other agents it has
+[rules](#how-crystal-reads-an-agent) for off their screens. Any other agent, or a script wrapped around one,
+can tell crystal what it's doing itself, and how to pick its session up again, with `crystal report`: no
+change to crystal, and no waiting for a release of it. Once your
 agent reports, its status shows in the sidebar and in `crystal ls`, the user is told when it's done with a turn
 or waits on them, `crystal wait` and the [events](#events) follow it, and, once it says how, its session comes
 back in the same conversation after crystal restarts.
@@ -1337,9 +1539,9 @@ after the rest. Each comes with its id, and a line on how to read the rest and a
 - Claude Code gets them in its system prompt, and reads the rest with crystal's MCP tools (below).
 - Codex gets them as its `developer_instructions` (`-c`), after the ones it has already, from a
   [profile](#profiles) or its own `config.toml`, and reads the rest with `crystal memory search` and `show`.
-- Gemini CLI, OpenCode and Cursor get them at the top of their first prompt, when they're given one. A prompt
-  that would pass 16 KiB with them loses what the memory has first. Aider, which takes no first prompt, isn't
-  told.
+- Gemini CLI, OpenCode, Cursor, Qwen Code and Pi get them at the top of their first prompt, when they're given
+  one. A prompt that would pass 16 KiB with them loses what the memory has first. An agent that takes no first
+  prompt, like Aider, isn't told.
 
 `crystal plugin disable memory` turns it all off: see [plugins](#plugins).
 
@@ -1490,10 +1692,10 @@ Ported the codec and its tests
   closed. A cancelled one adds nothing.
 - Every agent crystal starts in a worktree whose file has notes is told to read it first and how to add to it,
   with the file's last 2 KiB, by the same road as its task: Claude Code on top of its system prompt, a
-  background task too, Codex in its developer instructions, and Gemini CLI, OpenCode and Cursor at the top of
-  their first prompt. When the file's end would make what it's asked and told more than 16 KiB, it's told
-  where the file is without it; a first prompt too long even so loses what the memory has first, then the
-  notes.
+  background task too, Codex in its developer instructions, and Gemini CLI, OpenCode, Cursor, Qwen Code and
+  Pi at the top of their first prompt. When the file's end would make what it's asked and told more than 16
+  KiB, it's told where the file is without it; a first prompt too long even so loses what the memory has
+  first, then the notes.
 - crystal is the file's only writer. It keeps it to 256 KiB, letting the oldest notes go, with `[earlier
   notes trimmed]` on top.
 - The notes stay out of git: the first note writes a `.gitignore` beside them that ignores everything in
@@ -1709,7 +1911,7 @@ crystal plugin remove notes
 | `profiles` | [profiles](#profiles): `P`, the profiles in the new-session panel, and `crystal profile` |
 | `github` | [pull requests and issues](#pull-requests-and-issues), on GitHub or GitLab: their marks on worktree lines, `o`, `O` and `i`; switched off, crystal never runs `gh` or `glab` |
 | `flows` | [flows](#flows): `g` and `f`, runs in the sidebar and the new-session panel, and `crystal flow` |
-| `notifications` | telling you when a session needs you |
+| `notifications` | telling you when a session needs you, with a notification and a sound |
 
 crystal's own plugins are on until you switch one off. Then everything it adds is gone: its keys (`?` stops
 listing them), what it shows in the sidebar and the new-session panel, what it tells agents, and the work it
@@ -1724,7 +1926,7 @@ notes = true
 ```
 
 The `notify` setting came before the `notifications` plugin and still works: notifications are on only while
-both are. `memory` used to be a setting of its own; crystal says where it went if it finds one.
+both are. Sounds go with the plugin too, but not with `notify`: `[sound]` has a switch of its own. `memory` used to be a setting of its own; crystal says where it went if it finds one.
 
 #### Writing a plugin
 
@@ -1840,6 +2042,7 @@ matched anywhere in the link unless `^` and `$` pin it. `X` lists each plugin's 
 | `subagent.started` | a session's agent starts a subagent, as its hooks say: its `subagent`, with its `id` and `agent_type` |
 | `subagent.stopped` | that subagent finishes |
 | `session.message` | a session is sent a message: by another session with `crystal send`, which its `message` names, or by you |
+| `session.bell` | a session's program rings the terminal's bell while nobody's watching it |
 | `task.opened` | a task is made: given to a session as it starts, made to start later, or opened again by a follow-up |
 | `task.started` | a task made to start later starts, in a session of its own |
 | `task.waiting` | a task's agent ends a turn with the task still open: it waits on you |
@@ -1908,8 +2111,10 @@ file and change. A setting crystal doesn't know is an error that names it, so a 
 | `notify` | `true` | tell you when a session needs you |
 | `notify_command` | none | a shell command to run instead of the desktop notification |
 | `[notifications]` | | when to tell you: `after_secs`, how long a session must need you first (`0`), and `unfocused_only`, only while crystal's terminal hasn't the focus (`false`): [notifications](#usage) |
+| `[sound]` | | the [sounds](#usage) played at the same moments: `enabled` (`true`), your own `done` and `request` files, and `[sound.agents]` to switch them for an agent by its program |
 | `new_session` | `"claude"` | what the new-session panel runs at first, until you start something from it |
-| `theme` | `"dark"` | the TUI's colors: `"dark"`, `"light"`, or `"terminal"` |
+| `theme` | `"dark"` | the TUI's colors: one of the [themes](#themes) |
+| `[colors]` | | colors of your own over the theme's: [themes](#themes) |
 | `name_from_prompt` | `true` | name a session you don't name for the [first thing it's asked](#starting-a-session) |
 | `resume_reported_agents` | `true` | after a restart, run the command an agent [said resumes it](#teaching-crystal-about-your-agent), or the one that resumes a Claude Code or Codex [typed into a shell](#usage) |
 | `scrollback_lines` | `10000` | how many rows that scrolled off a session's screen it keeps, up to 1,000,000, for scrolling back, copy mode, `e` and `crystal read --history` |
@@ -1921,9 +2126,9 @@ file and change. A setting crystal doesn't know is an error that names it, so a 
 | `[worktrees]` | | `base`, the branch new worktrees' new branches [start from](#usage): `origin`'s default branch unless set |
 | `[sessions]` | | `stop_idle_after`, how long an agent may sit [idle](#archiving-and-idle-agents) before crystal stops it, like `"30m"`: `"off"` |
 | `[[project]]` | | a project's [run and open commands](#projects), by its main worktree's `path`, in place of its own file's |
-
-`dark` and `light` paint their own background, so crystal looks the same in any terminal; `terminal` paints
-nothing and uses your terminal's own colors. With `NO_COLOR` set, crystal uses no color at all.
+| `[keys]` | | the TUI's keys, by command, its prefix and the key back to the sidebar: [keys and commands](#keys-and-commands) |
+| `[sidebar]` | | the sidebar's `width`, whether it starts `folded`, what folding keeps, and whether what needs you is pinned: [the sidebar](#the-sidebar) |
+| `[update]` | | `check`, whether the TUI looks once a day for a [newer crystal](#updating) (`true`) |
 
 `notify_command` is for telling you some other way, like a message to your phone. It runs with
 `CRYSTAL_NOTICE` (the line a notification would show), `CRYSTAL_NOTICE_SESSION` (the session's name),
@@ -1937,23 +2142,88 @@ notify_command = 'curl -s -d "$CRYSTAL_NOTICE" ntfy.sh/my-crystal'
 `new_session` names an agent (`claude`, `codex`, …) or `shell`. With options, like `codex --full-auto`, it's
 offered as a profile of its own.
 
-The daemon reads the notification settings each time it tells you something, `[plugins]` each time it
+The daemon reads the notification and sound settings each time it tells you something, `[plugins]` each time it
 does something a plugin adds, `[memory]` each time a task closes or a search runs, `[tasks]` each time a
 background task's run starts, `[handoff]` each time a note is written, `[sessions]` every 15 seconds, a flow
 each time one starts, `[[project]]` each time a project's commands run,
 `name_from_prompt` each time it names a session, `resume_reported_agents` as it starts sessions again and
 `scrollback_lines` as each session starts, so a change counts straight away (a session already running keeps
-what it had); the TUI reads `new_session`, `theme`, `scrollback_lines`, `[plugins]`, the profiles and
+what it had); the TUI reads `new_session`, `theme`, `[colors]`, `scrollback_lines`, `[plugins]`, `[update]`, the profiles and
 the flows when it starts, again when you save a profile or switch a plugin, and every half a second while the
 settings view is open.
+
+#### Themes
+
+`theme` picks one of twenty:
+
+| Theme | Also called | |
+|---|---|---|
+| `dark` | | crystal's own: deep ink, with a violet accent |
+| `light` | | crystal's own: warm paper |
+| `terminal` | | paints nothing, and uses your terminal's own sixteen colors |
+| `catppuccin` | `catppuccin-mocha`, `mocha` | |
+| `catppuccin-latte` | `latte` | light |
+| `tokyo-night` | `tokyonight` | |
+| `tokyo-night-day` | `tokyo-day`, `tokyonight-day` | light |
+| `dracula` | | |
+| `nord` | | |
+| `gruvbox` | `gruvbox-dark` | |
+| `gruvbox-light` | | light |
+| `one-dark` | `onedark` | |
+| `one-light` | `onelight` | light |
+| `solarized` | `solarized-dark` | |
+| `solarized-light` | | light |
+| `kanagawa` | | |
+| `kanagawa-lotus` | `lotus` | light |
+| `rose-pine` | `rosepine` | |
+| `rose-pine-dawn` | `rosepine-dawn`, `dawn` | light |
+| `vesper` | | |
+
+A name can be written in any case, with spaces or underscores for its dashes: `"Tokyo Night"` is
+`tokyo-night`. Every theme but `terminal` paints its own background, so crystal looks the same in any
+terminal. The schemes' colors are [herdr](https://github.com/herdrdev/herdr)'s, each a palette of ten
+that crystal gives their roles and blends the tints it needs from, toward the background: behind a diff's
+lines, what a search found, the selection and blocks of code.
+
+`[colors]` puts colors of your own over the theme's, each named for what it's for:
+
+```toml
+theme = "catppuccin"
+
+[colors]
+accent = "#f5c2e7"      # what has the keyboard, and crystal's name
+waiting = "bright-red"  # an agent waiting on you
+selection = "#313244"   # behind the selected row
+background = "reset"    # your terminal's own background
+```
+
+A color is `"#rrggbb"`, `"#rgb"`, one of your terminal's sixteen (`black`, `red`, `green`, `yellow`, `blue`,
+`magenta`, `cyan`, `white`, and each with `bright-` in front), a number from its 256 (`"238"`), or `"reset"`
+for your terminal's own. What each paints:
+
+| Name | What it paints |
+|---|---|
+| `background`, `text`, `muted`, `accent` | behind everything; text; hints and times; what has the keyboard |
+| `rule`, `panel`, `branch` | the lines between the parts; behind what's drawn over the rest; branch names |
+| `waiting`, `working`, `done` | an agent waiting on you, at work, done with a turn you haven't seen |
+| `running`, `ended`, `failed` | a program running, one that ended well, one that failed, and errors |
+| `selection`, `copy_selection` | behind the selected row; behind text selected to copy |
+| `found`, `found_current` | behind what a search found; behind the match copy mode's cursor is on |
+| `added`, `removed` | a diff's counts and the letters of files it adds or deletes |
+| `added_line`, `removed_line`, `added_words`, `removed_words` | behind a diff's lines, and the words that changed in them |
+| `keyword`, `string`, `number`, `code_block` | highlighted code; behind a block of code |
+
+A name or a color crystal doesn't know is an error that names it. With `NO_COLOR` set, crystal uses no color at
+all, whatever the theme or `[colors]` say.
 
 #### The settings view
 
 `,` in the sidebar opens the settings you'd otherwise change in the file: notifications and when they come,
-the theme, how long an agent may sit [idle](#archiving-and-idle-agents), and how memory learns
+sounds, the theme, how long an agent may sit [idle](#archiving-and-idle-agents), and how memory learns
 ([the distiller](#the-distiller)) and searches ([by meaning](#search-by-meaning)). `space` changes the one the
-bar is on, and `←/→` go through the themes, the waits before a notification, and the times an agent may sit
-idle: off, 15 minutes, 30, an hour, two or eight. Each change is written to the file at once,
+bar is on, and `←/→` go through the [themes](#themes), forward and back (the row says which of the twenty it's
+on), the waits before a notification, and the times an agent may sit idle: off, 15 minutes, 30, an hour, two or
+eight. Each change is written to the file at once,
 keeping the rest of it as you wrote it, comments and all, and counts straight away: the TUI repaints in a new
 theme, and the daemon reads the rest as it goes.
 
@@ -1973,7 +2243,7 @@ where. The new-session panel offers your profiles first.
 [[profile]]
 name = "review"                            # how the panel shows it
 description = "Reads the branch's diff"    # optional: shown under it in the panel
-agent = "claude"                           # claude, codex, gemini, opencode, cursor-agent or aider
+agent = "claude"                           # an agent the new-session panel knows: claude, codex, qwen, …
 model = "opus"                             # optional: Claude Code's or Codex's model
 effort = "high"                            # optional: Claude Code's effort: low, medium, high, xhigh or max
 mode = "plan"                              # optional: Claude Code's permission mode, or Codex's approvals
@@ -2043,6 +2313,7 @@ over, the daemon is restarted cold from the sessions it wrote down first.
 - [x] Session list in a sidebar
 - [x] Session status from Claude Code's hooks
 - [x] Session status from the screen, for agents without hooks
+- [x] Rules for reading each agent's screen in files you can change, and why a session reads as it does
 - [x] Projects and worktrees
 - [x] Resume after a restart
 - [x] Split panes
@@ -2072,6 +2343,8 @@ If you're an AI agent working on this repository, read [`AGENTS.md`](AGENTS.md) 
 
 crystal builds on ideas from [tmux](https://github.com/tmux/tmux) and [herdr](https://github.com/herdrdev/herdr).
 Its terminal emulator is [Alacritty](https://github.com/alacritty/alacritty)'s, the `alacritty_terminal` crate.
+Its sounds are herdr's, under the [Apache License 2.0](https://www.apache.org/licenses/LICENSE-2.0)
+(`assets/sounds/NOTICE`).
 
 ## License
 

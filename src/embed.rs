@@ -358,7 +358,7 @@ pub fn download(progress: bool) -> Result<PathBuf> {
 }
 
 /// The SHA-256 of the file at `path`, in hex.
-fn sha256_of(path: &Path) -> Result<String> {
+pub fn sha256_of(path: &Path) -> Result<String> {
     let mut file = File::open(path).with_context(|| format!("couldn't read {}", path.display()))?;
     let mut hasher = Sha256::new();
     let mut buffer = vec![0; 1 << 16];

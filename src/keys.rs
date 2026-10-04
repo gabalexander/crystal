@@ -7,14 +7,6 @@ use crate::vt;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::fmt::Write as _;
 
-/// Whether `key` is Ctrl+\, which hands the keyboard back from the pane to
-/// the sidebar, as it detaches `crystal attach`. Terminals send it as the
-/// byte 0x1c, which crossterm reports as Ctrl+4.
-pub fn is_hand_back(key: &KeyEvent) -> bool {
-    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-    ctrl && matches!(key.code, KeyCode::Char('\\') | KeyCode::Char('4'))
-}
-
 /// The bytes a terminal sends for `key`, or `None` for a key it sends
 /// nothing for. `application_cursor` is the mode a program can ask for, in
 /// which the arrows and Home/End send `ESC O` instead of `ESC [`.
@@ -604,18 +596,5 @@ mod tests {
         assert_eq!(encoded(key(KeyCode::F(1))), b"\x1bOP");
         assert_eq!(encoded(key(KeyCode::F(12))), b"\x1b[24~");
         assert_eq!(encode(&key(KeyCode::F(13)), false), None);
-    }
-
-    #[test]
-    fn ctrl_backslash_hands_the_keyboard_back_however_it_is_reported() {
-        assert!(is_hand_back(&with(
-            KeyCode::Char('\\'),
-            KeyModifiers::CONTROL
-        )));
-        assert!(is_hand_back(&with(
-            KeyCode::Char('4'),
-            KeyModifiers::CONTROL
-        )));
-        assert!(!is_hand_back(&key(KeyCode::Char('\\'))));
     }
 }

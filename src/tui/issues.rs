@@ -460,7 +460,7 @@ mod tests {
     /// Draws `view` over a screen full of `¤`, the way it opens over the
     /// sidebar and the panes, and returns what's on the screen.
     fn drawn_over_the_screen(view: &IssuesView) -> String {
-        let theme = Theme::new(ThemeName::Dark, false);
+        let theme = Theme::new(ThemeName::DARK, false);
         let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
         terminal
             .draw(|frame| {

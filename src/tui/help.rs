@@ -1,10 +1,12 @@
 //! The overlay `?` opens: every key the TUI takes, grouped by where it
-//! works. It's drawn from [`KEYS`], one table, so that what it says and
-//! what the README says can be checked against each other. A key that
-//! belongs to one of crystal's plugins is only listed while that plugin is
-//! on, and the keys installed plugins' actions took are listed after the
-//! sidebar's own.
+//! works. The sidebar's keys come from the keymap's table,
+//! [`keymap::HELP`], written as the user's `[keys]` has them; the others
+//! from [`KEYS`]. The README's table of sidebar keys is checked against
+//! the defaults. A key that belongs to one of crystal's plugins is only
+//! listed while that plugin is on, and the keys installed plugins' actions
+//! took are listed after the sidebar's own.
 
+use super::keymap::{self, Keymap};
 use super::theme::Theme;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Margin, Rect};
@@ -44,56 +46,12 @@ pub struct Key {
     pub label: &'static str,
     pub does: &'static str,
     pub section: Section,
-    /// The plugin the key is part of, which has to be on for it to work.
-    pub plugin: Option<&'static str>,
 }
 
-/// Every key the TUI takes, in the order the overlay lists them.
+/// Every key the TUI takes but the sidebar's commands, the prefix and the
+/// key that hands the keyboard back, which the keymap has, in the order
+/// the overlay lists them.
 pub const KEYS: &[Key] = &[
-    sidebar("j/k ↓/↑", "select a session"),
-    sidebar("/", "find a session"),
-    sidebar("Enter", "type into it, or rerun"),
-    sidebar("Space", "reply, from right here"),
-    sidebar("Tab/Shift+Tab", "next / previous pane"),
-    sidebar("Shift+arrows", "the pane that way"),
-    sidebar("s", "split it off, or close it"),
-    sidebar("|/-", "split side by side / below"),
-    sidebar("z", "zoom its pane"),
-    sidebar("F", "float it over the panes"),
-    sidebar("H/J/K/L", "swap its pane that way"),
-    sidebar("R", "resize the panes"),
-    sidebar("v", "copy mode"),
-    sidebar("PgUp/PgDn", "page through its history"),
-    sidebar("e", "edit its history"),
-    sidebar("t/T/&", "tab: new / name / close"),
-    sidebar("[/] 1-9", "switch tabs"),
-    sidebar("{/}", "move the tab left / right"),
-    sidebar(">", "move it to another tab"),
-    sidebar("S", "saved layouts"),
-    sidebar("n/w", "new, or in a worktree"),
-    sidebar("W", "remove the worktree"),
-    sidebar("r/x", "rename / kill it"),
-    sidebar("A/Z", "archive it / the archive"),
-    sidebar("!/.", "run / open the project"),
-    of_plugin("tasks", "c", "close its task"),
-    of_plugin("tasks", "y/n/Y", "answer what a task asks"),
-    of_plugin("flows", "g/f", "flow: go on / send back"),
-    sidebar("u", "next needing you"),
-    sidebar("U", "all needing you"),
-    sidebar("a", "the timeline"),
-    of_plugin("github", "o/O", "its PR / all PRs"),
-    of_plugin("github", "i", "the project's issues"),
-    sidebar("d", "what changed: the diff"),
-    sidebar("p", "find a file"),
-    sidebar("E", "the files as a tree"),
-    sidebar("G", "find in files"),
-    sidebar("B", "switch branches"),
-    of_plugin("backlog", "b", "the project's backlog"),
-    of_plugin("memory", "m", "what it has remembered"),
-    of_plugin("profiles", "P", "your agent profiles"),
-    sidebar("X/,", "plugins / settings"),
-    sidebar("?/q", "keys / quit"),
-    in_pane("Ctrl+\\", "back to the sidebar"),
     in_pane("Shift+PgUp", "page back"),
     in_pane("Shift+PgDn", "page forward"),
     in_pane("other keys", "go to the program"),
@@ -117,19 +75,6 @@ const fn key(section: Section, label: &'static str, does: &'static str) -> Key {
         label,
         does,
         section,
-        plugin: None,
-    }
-}
-
-const fn sidebar(label: &'static str, does: &'static str) -> Key {
-    key(Section::Sidebar, label, does)
-}
-
-/// A sidebar key that's part of the plugin called `plugin`.
-const fn of_plugin(plugin: &'static str, label: &'static str, does: &'static str) -> Key {
-    Key {
-        plugin: Some(plugin),
-        ..sidebar(label, does)
     }
 }
 
@@ -150,11 +95,13 @@ const fn mouse(label: &'static str, does: &'static str) -> Key {
 }
 
 /// What the overlay lists beyond crystal's keys that are always there:
-/// which of crystal's plugins are on, and the keys installed plugins'
-/// actions took, each with what it does.
+/// which of crystal's plugins are on, the keys installed plugins' actions
+/// took, each with what it does, and the keys as the user's `[keys]` has
+/// them.
 pub struct Shown<'a> {
     pub plugin_on: &'a dyn Fn(&str) -> bool,
     pub plugin_keys: &'a [(String, String)],
+    pub keymap: &'a Keymap,
 }
 
 /// A row of the overlay: a key, or a few, and what it does.
@@ -302,23 +249,48 @@ fn flow(rows: &[Row], room: usize) -> Vec<Vec<Entry<'_>>> {
     columns
 }
 
-/// Every row the overlay shows: crystal's keys, but those of plugins that
-/// are off, then the keys installed plugins took.
+/// Every row the overlay shows: the sidebar's commands, but those of
+/// plugins that are off and those the user left with no key, then the keys
+/// installed plugins took, then the prefix and the hand-back key, then the
+/// rest.
 fn rows(shown: &Shown) -> Vec<Row> {
-    let own = KEYS
+    let keymap = shown.keymap;
+    let sidebar = keymap::HELP
         .iter()
-        .filter(|key| key.plugin.is_none_or(|plugin| (shown.plugin_on)(plugin)))
-        .map(|key| Row {
-            section: key.section,
-            label: key.label.to_string(),
-            does: key.does.to_string(),
+        .filter(|row| row.plugin.is_none_or(|plugin| (shown.plugin_on)(plugin)))
+        .filter_map(|row| {
+            Some(Row {
+                section: Section::Sidebar,
+                label: keymap.row_label(row)?,
+                does: row.does.to_string(),
+            })
         });
     let plugins = shown.plugin_keys.iter().map(|(label, does)| Row {
         section: Section::Plugins,
         label: label.clone(),
         does: does.clone(),
     });
-    own.chain(plugins).collect()
+    let hand_back = Row {
+        section: Section::Pane,
+        label: keymap.hand_back().label(),
+        does: "back to the sidebar".to_string(),
+    };
+    let prefix = keymap.prefix().map(|prefix| Row {
+        section: Section::Pane,
+        label: format!("{}, a key", prefix.label()),
+        does: "that key's command".to_string(),
+    });
+    let own = KEYS.iter().map(|key| Row {
+        section: key.section,
+        label: key.label.to_string(),
+        does: key.does.to_string(),
+    });
+    sidebar
+        .chain(plugins)
+        .chain([hand_back])
+        .chain(prefix)
+        .chain(own)
+        .collect()
 }
 
 /// The widest key label in `column`, which the others are padded out to.
@@ -416,7 +388,7 @@ mod tests {
     use crate::config::ThemeName;
 
     fn theme() -> Theme {
-        Theme::new(ThemeName::Dark, false)
+        Theme::new(ThemeName::DARK, false)
     }
 
     /// The keys a label stands for: `j/k ↓/↑` is j, k, ↓ and ↑. A `/` on
@@ -463,10 +435,9 @@ mod tests {
         // The overlay puts keys that go together on one row to fit a small
         // terminal, and the README gives most a row each, so the keys are
         // compared, not the rows.
-        let mut overlay: Vec<String> = KEYS
+        let mut overlay: Vec<String> = keymap::HELP
             .iter()
-            .filter(|key| key.section == Section::Sidebar)
-            .flat_map(|key| keys_in(key.label))
+            .flat_map(|row| keys_in(row.label))
             .collect();
         let mut readme: Vec<String> = readme_sidebar_keys().into_iter().flatten().collect();
         overlay.sort();
@@ -479,6 +450,7 @@ mod tests {
         rows(&Shown {
             plugin_on: &|_| true,
             plugin_keys: &[],
+            keymap: &Keymap::default(),
         })
     }
 
@@ -504,6 +476,7 @@ mod tests {
         let rows = rows(&Shown {
             plugin_on: &on_but_memory,
             plugin_keys: &keys,
+            keymap: &Keymap::default(),
         });
         let labels: Vec<&str> = rows.iter().map(|row| row.label.as_str()).collect();
         assert!(!labels.contains(&"m"), "{labels:?}");
@@ -523,8 +496,8 @@ mod tests {
 
     #[test]
     fn every_key_the_sidebar_takes_is_kept_from_plugins() {
-        for key in KEYS.iter().filter(|key| key.section == Section::Sidebar) {
-            let letters = keys_in(key.label).into_iter();
+        for row in keymap::HELP {
+            let letters = keys_in(row.label).into_iter();
             for part in letters.filter(|part| part.len() == 1) {
                 assert!(
                     crate::plugins::RESERVED_KEYS.contains(part.as_str()),
@@ -543,6 +516,7 @@ mod tests {
         rows(&Shown {
             plugin_on: &|_| true,
             plugin_keys: &keys,
+            keymap: &Keymap::default(),
         })
     }
 
@@ -619,6 +593,29 @@ mod tests {
         for key in KEYS {
             assert!(ORDER.contains(&key.section), "{} isn't shown", key.label);
         }
+    }
+
+    #[test]
+    fn the_overlay_writes_the_keys_the_user_gave() {
+        let settings = [
+            ("split-right".to_string(), keymap::Binding::One("V".into())),
+            ("prefix".to_string(), keymap::Binding::One("ctrl+a".into())),
+            (
+                "hand-back".to_string(),
+                keymap::Binding::One("ctrl+g".into()),
+            ),
+        ];
+        let keymap = Keymap::new(&settings.into_iter().collect()).unwrap();
+        let rows = rows(&Shown {
+            plugin_on: &|_| true,
+            plugin_keys: &[],
+            keymap: &keymap,
+        });
+        let labels: Vec<&str> = rows.iter().map(|row| row.label.as_str()).collect();
+        assert!(labels.contains(&"V/-"), "{labels:?}");
+        assert!(labels.contains(&"Ctrl+G"), "{labels:?}");
+        assert!(labels.contains(&"Ctrl+A, a key"), "{labels:?}");
+        assert!(!labels.contains(&"|/-"), "{labels:?}");
     }
 
     #[test]

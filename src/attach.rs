@@ -3,8 +3,10 @@
 //!
 //! What the session writes is drawn through a screen of our own rather than
 //! passed straight through, so whatever the program does to its terminal,
-//! like switching screens, stays inside the attach.
+//! like switching screens, stays inside the attach. Its bell is passed on
+//! to your terminal, as often as [`crate::bell`] lets it.
 
+use crate::bell::Ringer;
 use crate::client;
 use crate::config::Config;
 use crate::env;
@@ -158,11 +160,15 @@ impl Drawing {
             let drawn = drawn.clone();
             let done = done.clone();
             move || {
+                let mut ringer = Ringer::default();
                 for chunk in output {
                     let mut drawn = drawn.lock().unwrap();
                     drawn.screen.process(&chunk);
                     if drawn.draw().is_err() {
                         break;
+                    }
+                    if drawn.screen.take_bells() > 0 {
+                        let _ = ringer.ring();
                     }
                 }
                 done.store(true, Ordering::SeqCst);

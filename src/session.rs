@@ -1,6 +1,7 @@
 //! A program running in a PTY of its own, or a task: Claude Code run
 //! without a terminal.
 
+use crate::agent_rules;
 use crate::agent_screen::{self, Looks, ScreenWatch};
 use crate::agents;
 use crate::codex::Rollouts;
@@ -13,8 +14,8 @@ use crate::keys;
 use crate::notify::{self, Notice};
 use crate::protocol::{
     Activity, AgentEvent, AgentReport, Answer, Asking, Conversation, Front, InProgress, Reporter,
-    SessionInfo, State, TaskInfo, TaskOutcome, TaskRecord, TaskResult, TaskSpec, TaskState,
-    TaskView,
+    ScreenExplained, SessionInfo, State, TaskInfo, TaskOutcome, TaskRecord, TaskResult, TaskSpec,
+    TaskState, TaskView,
 };
 use crate::report;
 use crate::spending::Spending;
@@ -93,6 +94,10 @@ pub struct Session {
     /// What the user was last told about the session, and what waits to
     /// be told.
     telling: notify::Telling,
+    /// The program rang the terminal's bell while nobody was watching, and
+    /// nobody has looked since. Not handed over: a new crystal starts the
+    /// marks afresh.
+    bell: bool,
     /// `Some` for a task, whose screen shows what Claude does in its runs
     /// rather than a program in a PTY.
     task: Option<Task>,
@@ -154,6 +159,8 @@ pub enum Change {
     Claimed,
     /// The agent called this let go of it.
     Released { agent: String },
+    /// Its program rang the terminal's bell while nobody was watching.
+    Bell,
 }
 
 /// A session as one daemon hands it to the next, in a handover: all it
@@ -330,6 +337,7 @@ impl Session {
             conversation: None,
             rollouts: None,
             telling: notify::Telling::default(),
+            bell: false,
             screen_watch: ScreenWatch::default(),
             front: None,
             front_group: None,
@@ -391,6 +399,7 @@ impl Session {
             conversation: None,
             rollouts: None,
             telling: notify::Telling::default(),
+            bell: false,
             screen_watch: ScreenWatch::default(),
             front: Some(Front::Task),
             front_group: None,
@@ -716,6 +725,7 @@ impl Session {
                 _ => self.subagents,
             },
             stopped_idle: self.stopped_idle,
+            bell: self.bell,
         }
     }
 
@@ -913,7 +923,19 @@ impl Session {
             }
             None => self.check_screen(),
         }
+        self.check_bell();
         self.fail_task_if_ended();
+    }
+
+    /// Marks the session when its program has rung the bell while nobody
+    /// was watching, until someone looks at it: a viewer passes on the
+    /// bells of a session it shows itself.
+    fn check_bell(&mut self) {
+        let rang = self.term.take_bells() > 0;
+        if rang && !self.bell && !self.term.is_watched() {
+            self.bell = true;
+            self.changes.push(Change::Bell);
+        }
     }
 
     /// Keeps up with a task's runs, noting each that starts and ends, and a
@@ -1026,23 +1048,75 @@ impl Session {
         self.front = Some(front);
     }
 
-    /// Whether an agent is in front in the terminal, the only time its
-    /// screen says anything about what an agent is doing.
-    fn agent_in_front(&self) -> bool {
-        self.front.as_ref().is_some_and(Front::is_agent)
-    }
-
     /// Reads what the agent is doing off the screen, and takes it as an
     /// event when that has changed. Only while an agent is in front: a
     /// shell or any other program can print an agent's words. An agent
     /// that reports for itself knows better than its screen.
     fn check_screen(&mut self) {
-        if !self.is_running() || !self.agent_in_front() || self.is_claimed() {
+        if !self.is_running() || self.is_claimed() {
             return;
         }
-        let looks = self.term.looks();
+        let Some(Front::Agent { program, .. }) = &self.front else {
+            return;
+        };
+        // A screen that says nothing either way leaves the look as it was.
+        let Some(looks) = self.term.looks(program) else {
+            return;
+        };
         if let Some(event) = self.screen_watch.update(looks) {
             self.on_agent_event(event);
+        }
+    }
+
+    /// Whether what `agent`'s hooks report is about this session: it is,
+    /// unless another agent is in front, which `agent` was started by.
+    pub fn reports_for(&self, agent: &str) -> bool {
+        match &self.front {
+            Some(Front::Agent { program, .. }) => agent_rules::current().same_agent(agent, program),
+            _ => true,
+        }
+    }
+
+    /// Why crystal reads the session's agent the way it does: what's in
+    /// front, whether its screen is read, and the rules tried on it, those
+    /// of `agent` when it's given, or else of the agent in front.
+    pub fn explain_screen(&self, agent: Option<&str>) -> ScreenExplained {
+        let in_front = match &self.front {
+            Some(Front::Agent { program, .. }) => Some(program.as_str()),
+            _ => None,
+        };
+        let not_read = if self.task.is_some() {
+            Some("it's a background task, which says what it's doing itself".to_string())
+        } else if !self.is_running() {
+            Some("it has ended".to_string())
+        } else if self.is_claimed() {
+            Some("its agent says what it's doing itself, with `crystal report`".to_string())
+        } else if in_front.is_none() {
+            let what = self.front.as_ref().map_or("nothing yet", Front::word);
+            Some(format!("no agent is in front, but {what}"))
+        } else {
+            None
+        };
+        let rules = agent
+            .or(in_front)
+            .filter(|_| self.task.is_none())
+            .map(|agent| {
+                let (rows, title, progress) = self.term.screen_for_rules();
+                let screen = agent_rules::Input {
+                    rows: &rows,
+                    title: &title,
+                    progress: &progress,
+                };
+                agent_rules::current().for_program(agent).explain(&screen)
+            });
+        ScreenExplained {
+            session: self.name.clone(),
+            front: self.front.clone(),
+            not_read,
+            watch: self.screen_watch.looks().into(),
+            candidate: self.screen_watch.candidate().map(Into::into),
+            activity: self.activity,
+            rules,
         }
     }
 
@@ -1280,6 +1354,7 @@ impl Session {
             conversation: handed.conversation,
             rollouts: handed.rollouts,
             telling: notify::Telling::after(handed.told),
+            bell: false,
             task,
             goal: handed.goal,
             reminded: handed.reminded,
@@ -1300,6 +1375,7 @@ impl Session {
         if self.activity == Some(Activity::Done) {
             self.set_activity(Some(Activity::Idle));
         }
+        self.bell = false;
     }
 
     pub fn term(&self) -> Arc<Term> {
@@ -1523,10 +1599,19 @@ impl Term {
         self.screen.lock().unwrap().vt.recent_rows(history)
     }
 
-    /// What the screen says the agent is doing.
-    pub fn looks(&self) -> Looks {
+    /// What the screen says `agent`, the program in front, is doing: `None`
+    /// when it says nothing either way.
+    pub fn looks(&self, agent: &str) -> Option<Looks> {
+        let (rows, title, progress) = self.screen_for_rules();
+        agent_screen::read(agent, &rows, &title, &progress)
+    }
+
+    /// The screen as the rules that read agents take it: its rows, its
+    /// title and the progress its program reports.
+    pub fn screen_for_rules(&self) -> (Vec<String>, String, String) {
         let screen = self.screen.lock().unwrap();
-        agent_screen::read(&screen.vt.rows(false), &screen.vt.title())
+        let progress = screen.vt.progress().to_string();
+        (screen.vt.rows(false), screen.vt.title(), progress)
     }
 
     /// What pressing `key`, a key's name or some text, sends the program:
@@ -1560,6 +1645,11 @@ impl Term {
 
     pub fn is_watched(&self) -> bool {
         !self.screen.lock().unwrap().viewers.is_empty()
+    }
+
+    /// How many times the program rang the bell since the last call.
+    pub fn take_bells(&self) -> u32 {
+        self.screen.lock().unwrap().vt.take_bells()
     }
 
     pub fn unwatch(&self, id: u64) {
@@ -1998,6 +2088,73 @@ mod tests {
             Some(Waiting)
         );
         assert_eq!(after(None, AgentEvent::SubagentStarted), None);
+    }
+
+    /// A shell's session, running, as a daemon would hand it over, without
+    /// a terminal: what it shows is drawn with `show`.
+    fn shell_session(dir: &std::path::Path) -> Session {
+        let db = crate::db::Db::open(&dir.join("crystal.sock")).unwrap();
+        let spending = Arc::new(Spending::new(db));
+        let handed = Handed {
+            name: "build".into(),
+            id: "id-2".into(),
+            command: vec!["zsh".into()],
+            cwd: dir.to_path_buf(),
+            env: BTreeMap::new(),
+            pid: None,
+            state: State::Running,
+            activity: None,
+            changed: UNIX_EPOCH,
+            looks: Looks::Settled,
+            front: Some(Front::Shell { name: "zsh".into() }),
+            conversation: None,
+            rollouts: None,
+            told: None,
+            goal: None,
+            reminded: false,
+            reporter: None,
+            reporter_job: None,
+            named_after_program: false,
+            screen: vt::Screen::answering(5, 20).save(),
+            ended: false,
+            stopped_idle: false,
+            typed_agent: None,
+            subagents: 0,
+            pty: None,
+            task: None,
+        };
+        Session::adopt(handed, &spending).unwrap()
+    }
+
+    #[test]
+    fn a_bell_nobody_watched_marks_the_session_until_it_s_seen() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = shell_session(dir.path());
+        session.term().show(b"done\x07\x07");
+        session.check();
+        assert!(session.info().bell);
+        assert_eq!(session.take_changes(), [Change::Bell]);
+        // Ringing again while marked is no news.
+        session.term().show(b"\x07");
+        session.check();
+        assert!(session.take_changes().is_empty());
+        session.seen();
+        assert!(!session.info().bell);
+    }
+
+    #[test]
+    fn a_bell_someone_watches_doesn_t_mark_the_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = shell_session(dir.path());
+        let watch = session.term().watch(false);
+        session.term().show(b"\x07");
+        session.check();
+        assert!(!session.info().bell);
+        assert!(session.take_changes().is_empty());
+        // Nor does one heard while watched, once the viewer has gone.
+        session.term().unwatch(watch.id);
+        session.check();
+        assert!(!session.info().bell);
     }
 
     fn after(before: Option<Activity>, event: AgentEvent) -> Option<Activity> {

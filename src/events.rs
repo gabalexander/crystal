@@ -42,6 +42,7 @@ pub enum Kind {
     SubagentStarted,
     SubagentStopped,
     SessionMessage,
+    SessionBell,
     TaskOpened,
     TaskStarted,
     TaskWaiting,
@@ -70,7 +71,7 @@ pub enum Kind {
 }
 
 impl Kind {
-    pub const ALL: [Kind; 39] = [
+    pub const ALL: [Kind; 40] = [
         Kind::SessionStarted,
         Kind::SessionRenamed,
         Kind::SessionWorking,
@@ -85,6 +86,7 @@ impl Kind {
         Kind::SubagentStarted,
         Kind::SubagentStopped,
         Kind::SessionMessage,
+        Kind::SessionBell,
         Kind::TaskOpened,
         Kind::TaskStarted,
         Kind::TaskWaiting,
@@ -129,6 +131,7 @@ impl Kind {
             Kind::SubagentStarted => "subagent.started",
             Kind::SubagentStopped => "subagent.stopped",
             Kind::SessionMessage => "session.message",
+            Kind::SessionBell => "session.bell",
             Kind::TaskOpened => "task.opened",
             Kind::TaskStarted => "task.started",
             Kind::TaskWaiting => "task.waiting",
@@ -760,6 +763,7 @@ impl Event {
                 let from = message.from.as_deref().unwrap_or("you");
                 format!("from {from}: {}", message.line)
             }),
+            Kind::SessionBell => "rang the bell".to_string(),
             Kind::SessionEnded => self
                 .session
                 .as_ref()
@@ -923,6 +927,7 @@ pub fn example(kind: Kind, session: Option<&SessionInfo>, dir: &Path) -> Event {
             asking: None,
             reporter: None,
             subagents: 0,
+            bell: false,
         },
     };
     let now = now_ms() / 1000;
@@ -982,7 +987,7 @@ pub fn example(kind: Kind, session: Option<&SessionInfo>, dir: &Path) -> Event {
         closed: (kind == Kind::BacklogClosed).then_some(now),
     };
     let event = match kind {
-        Kind::SessionStarted | Kind::SessionRemoved | Kind::SessionArchived => {
+        Kind::SessionStarted | Kind::SessionRemoved | Kind::SessionArchived | Kind::SessionBell => {
             Event::about_session(kind, &session)
         }
         Kind::SessionRenamed => Event::renamed(&session, "old-name"),
@@ -1222,6 +1227,7 @@ mod tests {
             asking: None,
             reporter: None,
             subagents: 0,
+            bell: false,
         }
     }
 

@@ -2,6 +2,7 @@
 //! terminal it was started from, so sessions keep running when the
 //! client goes away.
 
+use crate::agent_rules;
 use crate::agents;
 use crate::artifacts;
 use crate::backlog;
@@ -120,6 +121,9 @@ pub fn run(socket: &Path, handover: Option<RawFd>) -> Result<()> {
     };
     let events = Arc::new(Bus::new(socket));
     let hooks = plugin_hooks::follow(&events, socket);
+    // A rules file of the user's that can't be used is said in the log,
+    // each time it's read.
+    agent_rules::log_problems();
     thread::spawn({
         let events = events.clone();
         move || {
@@ -894,6 +898,7 @@ impl Daemon {
                     activity: Activity::Waiting,
                     text: format!("{} failed at {}", run.name, run.step_name(step)),
                     jump: session,
+                    agent: None,
                 };
                 notify::tell(notice, &self.socket);
             }
@@ -1688,6 +1693,14 @@ impl Daemon {
                 if with_id(&mut sessions, &id)?.is_task() {
                     return Ok(Response::Done);
                 }
+                // Hooks in an agent's own settings run for an agent that
+                // the one in front started too, which isn't the session's.
+                if !with_id(&mut sessions, &id)?.reports_for(&agent) {
+                    return Ok(Response::Done);
+                }
+                // Only Claude Code's and Codex's Stop hooks take the answer
+                // that keeps the agent from ending its turn.
+                let can_remind = matches!(agent.as_str(), "claude" | "codex");
                 if let Some(prompt) = prompt {
                     self.name_from_prompt(&mut sessions, &id, &prompt);
                 }
@@ -1698,6 +1711,7 @@ impl Daemon {
                 // Reminded that its task is open, the agent carries on: its
                 // turn hasn't ended, and it isn't done.
                 if event == AgentEvent::TurnEnded
+                    && can_remind
                     && tasks::enabled(&settings())
                     && session.remind_of_task()
                 {
@@ -1773,6 +1787,7 @@ impl Daemon {
                     session: session.clone().unwrap_or_default(),
                     activity: Activity::Waiting,
                     jump: session,
+                    agent: None,
                 };
                 notify::tell(notice, &self.socket);
                 Ok(Response::Done)
@@ -1841,6 +1856,12 @@ impl Daemon {
                 let mut sessions = self.sessions.lock().unwrap();
                 let result = named(&mut sessions, &name)?.result()?;
                 Ok(Response::Result(result))
+            }
+            Request::ExplainAgent { name, agent } => {
+                let mut sessions = self.sessions.lock().unwrap();
+                let session = named(&mut sessions, &name)?;
+                let explained = session.explain_screen(agent.as_deref());
+                Ok(Response::Explained(Box::new(explained)))
             }
             Request::Read { name, history } => {
                 let mut sessions = self.sessions.lock().unwrap();
@@ -2340,6 +2361,7 @@ impl Daemon {
                 Change::TaskWaiting => task(Kind::TaskWaiting),
                 Change::Claimed => Some(Event::about_session(Kind::SessionClaimed, &info)),
                 Change::Released { agent } => Some(Event::released(&info, &agent)),
+                Change::Bell => Some(Event::about_session(Kind::SessionBell, &info)),
             };
             if let Some(event) = event {
                 self.events.emit(event);
