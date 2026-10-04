@@ -107,7 +107,10 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   - `command_list.rs`: the command list (`:`): every command and plugin action by name, with its keys,
     filtered as you type, the latest run first; its state and keys, kept apart from I/O, and its drawing
   - `status.rs`: a session's status as the TUI shows it, and its mark
-  - `theme.rs`: every color, named for what it's for: `dark`, `light`, `terminal`, and none for `NO_COLOR`
+  - `theme.rs`: every color, named for what it's for, and `THEMES`, the one table of every theme by its names:
+    crystal's own `dark`, `light` and `terminal`, and the well-known schemes (catppuccin, nord, …), each a
+    palette of ten colors given their roles, its tints blended toward the background; the user's `[colors]`
+    over it, and none for `NO_COLOR`
   - `mouse.rs`: writes mouse events the way a program in a pane asked for them
   - `help.rs`: the overlay `?` opens, a key a row: the sidebar's from the keymap, written as the user's
     `[keys]` has them, the rest from one table; its sections flowed into columns as tall as the terminal, two
@@ -299,7 +302,8 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   markdown export, and `enabled`, the one gate everything the backlog adds goes through
 - `src/work.rs`: `crystal done` (with `--artifact`), `handoff`, `tasks` and its commands (`new`, `start`, `show`,
   `cancel`, `log`), and `backlog`
-- `src/config.rs`: the settings in `~/.config/crystal/config.toml`, read and checked
+- `src/config.rs`: the settings in `~/.config/crystal/config.toml`, read and checked: a theme by any of its
+  names, and the colors `[colors]` takes
 - `src/memory.rs`: what a project's sessions learned: the SQLite store in the state directory with its FTS5
   index (bm25, prefix and porter-stemmed words), each entry's vector and search by meaning merged with it by
   reciprocal rank fusion, its migrations, the same said again seen again, forgotten entries the

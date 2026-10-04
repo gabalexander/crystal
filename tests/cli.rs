@@ -8702,8 +8702,14 @@ fn the_settings_view_changes_the_config_and_follows_it_live() {
     tui.shows("● notifications");
     assert!(config().starts_with("notify = true\n"), "{}", config());
     tui.type_keys("jjjl");
-    tui.shows("light");
+    tui.shows("(2 of 20)");
     assert!(config().contains("theme = \"light\""), "{}", config());
+    // Back past the first is the last.
+    tui.type_keys("h");
+    tui.shows("(1 of 20)");
+    tui.type_keys("h");
+    tui.shows("vesper");
+    assert!(config().contains("theme = \"vesper\""), "{}", config());
 
     // Changed by hand, the file is shown as it is now.
     crystal.configure("notify = true\ntheme = \"light\"\n\n[memory]\ndistill = false\n");

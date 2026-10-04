@@ -831,7 +831,7 @@ mod tests {
 
     /// What a session's task line says, after its indent.
     fn task_words(session: &SessionInfo) -> String {
-        let theme = Theme::new(crate::config::ThemeName::Dark, false);
+        let theme = Theme::new(crate::config::ThemeName::DARK, false);
         let line = task_line(session, &theme, 60);
         let words: String = line.spans[1..].iter().map(|s| s.content.as_ref()).collect();
         words.trim_end().to_string()
@@ -873,7 +873,7 @@ mod tests {
 
     #[test]
     fn a_running_terminal_has_the_chevron_and_an_agent_its_status() {
-        let theme = Theme::new(crate::config::ThemeName::Dark, false);
+        let theme = Theme::new(crate::config::ThemeName::DARK, false);
         let look = Look {
             theme: &theme,
             now: 0,
@@ -900,7 +900,7 @@ mod tests {
 
     #[test]
     fn a_terminal_s_name_is_muted_and_an_agent_s_is_not() {
-        let theme = Theme::new(crate::config::ThemeName::Dark, false);
+        let theme = Theme::new(crate::config::ThemeName::DARK, false);
         let look = Look {
             theme: &theme,
             now: 0,
@@ -919,7 +919,7 @@ mod tests {
     #[test]
     fn a_worktree_git_is_removing_says_so_on_its_line() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-        let theme = Theme::new(crate::config::ThemeName::Dark, false);
+        let theme = Theme::new(crate::config::ThemeName::DARK, false);
         let project = Path::new("/code/app");
         let path = Path::new("/code/app.worktrees/old");
         // An agent that has ended in the worktree, which `W` removes.
@@ -950,7 +950,7 @@ mod tests {
 
     #[test]
     fn the_line_before_the_terminals_fills_the_row() {
-        let theme = Theme::new(crate::config::ThemeName::Dark, false);
+        let theme = Theme::new(crate::config::ThemeName::DARK, false);
         let line = terminals_line(&theme, 28);
         assert_eq!(line.width(), 27);
         assert!(line.to_string().starts_with("     terminals ┄┄"));

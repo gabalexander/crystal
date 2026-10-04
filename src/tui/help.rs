@@ -388,7 +388,7 @@ mod tests {
     use crate::config::ThemeName;
 
     fn theme() -> Theme {
-        Theme::new(ThemeName::Dark, false)
+        Theme::new(ThemeName::DARK, false)
     }
 
     /// The keys a label stands for: `j/k ↓/↑` is j, k, ↓ and ↑. A `/` on

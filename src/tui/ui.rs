@@ -1656,7 +1656,7 @@ mod tests {
     use std::path::PathBuf;
 
     fn theme() -> Theme {
-        Theme::new(ThemeName::Dark, false)
+        Theme::new(ThemeName::DARK, false)
     }
 
     fn look(theme: &Theme) -> Look<'_> {

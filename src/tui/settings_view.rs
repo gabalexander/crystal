@@ -214,7 +214,7 @@ impl SettingsView {
             }
             Setting::UnfocusedOnly => Change::UnfocusedOnly(!config.notifications.unfocused_only),
             Setting::Theme if forward => Change::Theme(config.theme.next()),
-            Setting::Theme => Change::Theme(config.theme.next().next()),
+            Setting::Theme => Change::Theme(config.theme.previous()),
             Setting::StopIdle => {
                 let choices = SessionSettings::CHOICES;
                 let now = &config.sessions.stop_idle_after;
@@ -371,7 +371,8 @@ fn lines(view: &SettingsView, theme: &Theme) -> Vec<Line<'static>> {
         let line = Line::from(vec![
             Span::styled(mark, Style::new().fg(color)),
             Span::styled(format!("{name:<22}"), Style::new().fg(text)),
-            Span::styled(format!("{value:<10}"), Style::new().fg(theme.accent)),
+            // As wide as the longest theme's name, and a space.
+            Span::styled(format!("{value:<17}"), Style::new().fg(theme.accent)),
             Span::styled(about, muted),
         ]);
         if selected {
@@ -413,11 +414,18 @@ fn lines(view: &SettingsView, theme: &Theme) -> Vec<Line<'static>> {
         on_off(notifications.unfocused_only),
         "only while crystal's terminal hasn't the focus".to_string(),
     ));
+    let whose = if config.colors.is_empty() {
+        "the TUI's colors"
+    } else {
+        "under your [colors]"
+    };
+    let themes = ThemeName::all().count();
+    let at = config.theme.position() + 1;
     lines.push(row(
         Setting::Theme,
         None,
         config.theme.name().to_string(),
-        "the TUI's colors: ←/→ to change".to_string(),
+        format!("{whose}: ←/→ ({at} of {themes})"),
     ));
     let idle = &config.sessions.stop_idle_after;
     lines.push(row(
@@ -505,7 +513,7 @@ mod tests {
     }
 
     fn text(view: &SettingsView) -> String {
-        let theme = Theme::new(ThemeName::Dark, true);
+        let theme = Theme::new(ThemeName::DARK, true);
         let lines = lines(view, &theme);
         let lines: Vec<String> = lines.iter().map(|line| line.to_string()).collect();
         lines.join("\n")
@@ -535,11 +543,12 @@ mod tests {
         press(&mut view, KeyCode::Down);
         assert_eq!(
             press(&mut view, KeyCode::Right),
-            Outcome::Change(Change::Theme(ThemeName::Light))
+            Outcome::Change(Change::Theme(ThemeName::LIGHT))
         );
+        // Back from the first is the last.
         assert_eq!(
             press(&mut view, KeyCode::Left),
-            Outcome::Change(Change::Theme(ThemeName::Terminal))
+            Outcome::Change(Change::Theme(ThemeName::all().last().unwrap()))
         );
         press(&mut view, KeyCode::Down);
         assert_eq!(
@@ -578,6 +587,25 @@ mod tests {
     }
 
     #[test]
+    fn the_theme_row_says_which_of_the_themes_it_is() {
+        let mut config = Config {
+            theme: ThemeName::find("catppuccin-latte").unwrap(),
+            ..Config::default()
+        };
+        let shown = text(&view_of(config.clone(), None));
+        let at = config.theme.position() + 1;
+        let row = format!("catppuccin-latte the TUI's colors: ←/→ ({at} of 20)");
+        assert!(shown.contains(&row), "{shown}");
+
+        config.colors.insert(
+            crate::config::ColorToken::Accent,
+            crate::config::ColorValue(Color::Red),
+        );
+        let shown = text(&view_of(config, None));
+        assert!(shown.contains("under your [colors]: ←/→"), "{shown}");
+    }
+
+    #[test]
     fn a_change_says_where_it_goes_in_the_file() {
         assert_eq!(Change::Embeddings(true).keys(), ["memory", "embeddings"]);
         assert_eq!(
@@ -586,7 +614,7 @@ mod tests {
         );
         assert_eq!(Change::NotifyAfter(30).value().as_integer(), Some(30));
         assert_eq!(
-            Change::Theme(ThemeName::Light).value().as_str(),
+            Change::Theme(ThemeName::LIGHT).value().as_str(),
             Some("light")
         );
         assert_eq!(Change::Notify(false).value().as_bool(), Some(false));

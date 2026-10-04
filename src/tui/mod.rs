@@ -50,7 +50,7 @@ mod switcher;
 mod tabs;
 mod text_area;
 mod text_input;
-mod theme;
+pub(crate) mod theme;
 mod timeline;
 mod tree_browser;
 mod ui;
@@ -348,7 +348,7 @@ pub fn run(socket: &Path) -> Result<()> {
         projects,
         worktree_projects,
         list_worktrees_now,
-        theme: Theme::from_env(config.theme),
+        theme: Theme::from_config(&config),
         started: Instant::now(),
         sessions_asked: Instant::now(),
         searches: Arc::new(AtomicU64::new(0)),
@@ -1850,8 +1850,8 @@ impl Tui {
         if *config == self.config {
             return;
         }
-        if config.theme != self.config.theme {
-            self.theme = Theme::from_env(config.theme);
+        if config.theme != self.config.theme || config.colors != self.config.colors {
+            self.theme = Theme::from_config(config);
         }
         crate::vt::set_history_lines(config.scrollback_lines);
         self.config = config.clone();

@@ -1946,7 +1946,8 @@ file and change. A setting crystal doesn't know is an error that names it, so a 
 | `notify_command` | none | a shell command to run instead of the desktop notification |
 | `[notifications]` | | when to tell you: `after_secs`, how long a session must need you first (`0`), and `unfocused_only`, only while crystal's terminal hasn't the focus (`false`): [notifications](#usage) |
 | `new_session` | `"claude"` | what the new-session panel runs at first, until you start something from it |
-| `theme` | `"dark"` | the TUI's colors: `"dark"`, `"light"`, or `"terminal"` |
+| `theme` | `"dark"` | the TUI's colors: one of the [themes](#themes) |
+| `[colors]` | | colors of your own over the theme's: [themes](#themes) |
 | `name_from_prompt` | `true` | name a session you don't name for the [first thing it's asked](#starting-a-session) |
 | `resume_reported_agents` | `true` | after a restart, run the command an agent [said resumes it](#teaching-crystal-about-your-agent), or the one that resumes a Claude Code or Codex [typed into a shell](#usage) |
 | `scrollback_lines` | `10000` | how many rows that scrolled off a session's screen it keeps, up to 1,000,000, for scrolling back, copy mode, `e` and `crystal read --history` |
@@ -1960,9 +1961,6 @@ file and change. A setting crystal doesn't know is an error that names it, so a 
 | `[[project]]` | | a project's [run and open commands](#projects), by its main worktree's `path`, in place of its own file's |
 | `[keys]` | | the TUI's keys, by command, its prefix and the key back to the sidebar: [keys and commands](#keys-and-commands) |
 | `[sidebar]` | | the sidebar's `width`, whether it starts `folded`, what folding keeps, and whether what needs you is pinned: [the sidebar](#the-sidebar) |
-
-`dark` and `light` paint their own background, so crystal looks the same in any terminal; `terminal` paints
-nothing and uses your terminal's own colors. With `NO_COLOR` set, crystal uses no color at all.
 
 `notify_command` is for telling you some other way, like a message to your phone. It runs with
 `CRYSTAL_NOTICE` (the line a notification would show), `CRYSTAL_NOTICE_SESSION` (the session's name),
@@ -1982,17 +1980,82 @@ background task's run starts, `[handoff]` each time a note is written, `[session
 each time one starts, `[[project]]` each time a project's commands run,
 `name_from_prompt` each time it names a session, `resume_reported_agents` as it starts sessions again and
 `scrollback_lines` as each session starts, so a change counts straight away (a session already running keeps
-what it had); the TUI reads `new_session`, `theme`, `scrollback_lines`, `[plugins]`, the profiles and
+what it had); the TUI reads `new_session`, `theme`, `[colors]`, `scrollback_lines`, `[plugins]`, the profiles and
 the flows when it starts, again when you save a profile or switch a plugin, and every half a second while the
 settings view is open.
+
+#### Themes
+
+`theme` picks one of twenty:
+
+| Theme | Also called | |
+|---|---|---|
+| `dark` | | crystal's own: deep ink, with a violet accent |
+| `light` | | crystal's own: warm paper |
+| `terminal` | | paints nothing, and uses your terminal's own sixteen colors |
+| `catppuccin` | `catppuccin-mocha`, `mocha` | |
+| `catppuccin-latte` | `latte` | light |
+| `tokyo-night` | `tokyonight` | |
+| `tokyo-night-day` | `tokyo-day`, `tokyonight-day` | light |
+| `dracula` | | |
+| `nord` | | |
+| `gruvbox` | `gruvbox-dark` | |
+| `gruvbox-light` | | light |
+| `one-dark` | `onedark` | |
+| `one-light` | `onelight` | light |
+| `solarized` | `solarized-dark` | |
+| `solarized-light` | | light |
+| `kanagawa` | | |
+| `kanagawa-lotus` | `lotus` | light |
+| `rose-pine` | `rosepine` | |
+| `rose-pine-dawn` | `rosepine-dawn`, `dawn` | light |
+| `vesper` | | |
+
+A name can be written in any case, with spaces or underscores for its dashes: `"Tokyo Night"` is
+`tokyo-night`. Every theme but `terminal` paints its own background, so crystal looks the same in any
+terminal. The schemes' colors are [herdr](https://github.com/herdrdev/herdr)'s, each a palette of ten
+that crystal gives their roles and blends the tints it needs from, toward the background: behind a diff's
+lines, what a search found, the selection and blocks of code.
+
+`[colors]` puts colors of your own over the theme's, each named for what it's for:
+
+```toml
+theme = "catppuccin"
+
+[colors]
+accent = "#f5c2e7"      # what has the keyboard, and crystal's name
+waiting = "bright-red"  # an agent waiting on you
+selection = "#313244"   # behind the selected row
+background = "reset"    # your terminal's own background
+```
+
+A color is `"#rrggbb"`, `"#rgb"`, one of your terminal's sixteen (`black`, `red`, `green`, `yellow`, `blue`,
+`magenta`, `cyan`, `white`, and each with `bright-` in front), a number from its 256 (`"238"`), or `"reset"`
+for your terminal's own. What each paints:
+
+| Name | What it paints |
+|---|---|
+| `background`, `text`, `muted`, `accent` | behind everything; text; hints and times; what has the keyboard |
+| `rule`, `panel`, `branch` | the lines between the parts; behind what's drawn over the rest; branch names |
+| `waiting`, `working`, `done` | an agent waiting on you, at work, done with a turn you haven't seen |
+| `running`, `ended`, `failed` | a program running, one that ended well, one that failed, and errors |
+| `selection`, `copy_selection` | behind the selected row; behind text selected to copy |
+| `found`, `found_current` | behind what a search found; behind the match copy mode's cursor is on |
+| `added`, `removed` | a diff's counts and the letters of files it adds or deletes |
+| `added_line`, `removed_line`, `added_words`, `removed_words` | behind a diff's lines, and the words that changed in them |
+| `keyword`, `string`, `number`, `code_block` | highlighted code; behind a block of code |
+
+A name or a color crystal doesn't know is an error that names it. With `NO_COLOR` set, crystal uses no color at
+all, whatever the theme or `[colors]` say.
 
 #### The settings view
 
 `,` in the sidebar opens the settings you'd otherwise change in the file: notifications and when they come,
 the theme, how long an agent may sit [idle](#archiving-and-idle-agents), and how memory learns
 ([the distiller](#the-distiller)) and searches ([by meaning](#search-by-meaning)). `space` changes the one the
-bar is on, and `←/→` go through the themes, the waits before a notification, and the times an agent may sit
-idle: off, 15 minutes, 30, an hour, two or eight. Each change is written to the file at once,
+bar is on, and `←/→` go through the [themes](#themes), forward and back (the row says which of the twenty it's
+on), the waits before a notification, and the times an agent may sit idle: off, 15 minutes, 30, an hour, two or
+eight. Each change is written to the file at once,
 keeping the rest of it as you wrote it, comments and all, and counts straight away: the TUI repaints in a new
 theme, and the daemon reads the rest as it goes.
 
