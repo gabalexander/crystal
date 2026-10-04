@@ -171,6 +171,7 @@ and the footer says where you are and offers the keys that matter there, or, whe
 | `i` | list the open [issues](#pull-requests-and-issues) of the selected session's project: read one, comment, edit it, or start an agent on it |
 | `b` | open the selected session's project's [backlog](#the-backlog) |
 | `c` | close the selected session's [task](#tasks): done or failed, with a line on how it went |
+| `C` | open the selected [background task](#background-tasks) in a terminal: Claude Code picks its conversation up there |
 | `y` / `n` / `Y` | on a [background task](#background-tasks) asking for a permission: allow it, deny it, or allow it always; elsewhere `n` is a new session |
 | `g` | on a step of a [flow](#flows): go on past its gate, or run a step that failed or was cut short again |
 | `f` | on a step of a flow waiting at its gate: send it back, with notes on what to do differently |
@@ -951,7 +952,7 @@ the same.
 
 | Key | In the pull requests |
 |---|---|
-| `Enter` | open the [new-session panel](#starting-a-session) in the pull request's worktree, with the task `Work on pull request #57: <its title> (<its address>)`; not on one that has merged |
+| `Enter` | open the [new-session panel](#starting-a-session) in the pull request's worktree, with the task `Work on pull request #57: <its title> (<its address>)`, its agent told to read it first and keep to it, as [`--pr`](#tasks) tells it; not on one that has merged |
 | `Ctrl+D` | its whole diff, in [the diff](#the-diff); `Esc` comes back to the list |
 | `Ctrl+C` | comment on it: `Enter` posts, `Alt+Enter` breaks a line, `Esc` puts the comment away |
 | `Ctrl+O` | open it in your browser |
@@ -978,7 +979,7 @@ author. It opens on the issues listed last, and `Ctrl+R` asks the forge again.
 
 | Key | In the issues |
 |---|---|
-| `Enter` | open the [new-session panel](#starting-a-session) on a new worktree with a branch named after the issue, like `42-fix-login-redirect`, and the task `Fix issue #42: <its title> (<its address>)`, so the agent knows which issue and can read it with `gh issue view 42` or `glab issue view 42` |
+| `Enter` | open the [new-session panel](#starting-a-session) on a new worktree with a branch named after the issue, like `42-fix-login-redirect`, and the task `Fix issue #42: <its title> (<its address>)`, its agent told to read it with `gh issue view 42` or `glab issue view 42` first, as [`--issue`](#tasks) tells it |
 | `Ctrl+C` | comment on it: `Enter` posts, `Alt+Enter` breaks a line, `Esc` puts the comment away |
 | `Ctrl+E` | change its title and text: `Tab` goes between them, `Enter` saves both, `Esc` keeps them as they were |
 | `Ctrl+O` | open it in your browser |
@@ -1389,9 +1390,11 @@ session, plus `status`, the word the STATE column shows:
 `front` is what's in front in the terminal: `{"kind": "agent", …}`, `{"kind": "shell", "name": "zsh"}`,
 `{"kind": "program", "name": "vite"}` or `{"kind": "task"}`, and `null` until it's been looked at.
 `task` is `null` for a session started with nothing to do, and otherwise holds its [task](#tasks): `id`,
-`goal`, `waiting` while it waits on you, and once it's closed, `outcome` with `failed`, `cancelled` and
-`summary`. `asking` holds the permission a [background task](#background-tasks) waits on you for, `tool` and
-`gist`, and is `null` otherwise. `reporter` holds an agent that [says what it's doing
+`goal`, `waiting` while it waits on you, once it's closed, `outcome` with `failed`, `cancelled` and
+`summary`, and when it has them, its `accept`ance criteria, its `pull_request` and its `issue`. `asking` holds
+the permission a [background task](#background-tasks) waits on you for, `tool` and `gist`, and is `null`
+otherwise; `context`, how full a background task's conversation is, `tokens` of its model's `window`, once
+Claude has said. `reporter` holds an agent that [says what it's doing
 itself](#teaching-crystal-about-your-agent): its `agent` name, its last `message` and its `resume` command;
 while it's there, `front` is that agent. New fields may appear; none goes away. With no daemon running, it
 prints `[]`.
@@ -1625,14 +1628,21 @@ it took and what it cost.
 ```sh
 crystal task -n docs "Update the README for the new flags"           # prints the task's name
 crystal task --wait -n tests "Run the tests and fix what fails" -- --permission-mode acceptEdits
+crystal task --accept "cargo test passes" "Fix the flaky test"       # with what has to hold before it's done
+crystal task --pr 57                                                 # work on pull request 57, in its worktree
 crystal result tests                                                 # Claude's answer at the end of the run
 crystal send docs "Now the changelog too" --wait                     # a follow-up, in the same conversation
 crystal answer docs y                                                # allow what it asks for: y, n or always
 crystal interrupt docs                                               # stop the run it's in the middle of
+crystal tasks terminal docs                                          # carry on with it yourself, in a terminal
 ```
 
 - One `claude` takes the task's prompt and each follow-up after it, a run each, over its standard input
   (`--input-format stream-json`). Arguments after `--` go to every `claude -p` the task starts.
+- `--wait` waits for the run to end and prints how it went: `done` or `failed`, as Claude's answer says, or
+  `waiting` when it stops to ask for a permission first.
+- `--accept`, `--pr` and `--issue` give a task acceptance criteria, and a pull request or an issue to work on:
+  see [tasks](#tasks).
 - When Claude asks for a tool its permission mode and rules don't allow, the run waits on you: the session
   shows as `waiting`, its transcript and its pane's header say what it asks (`⚠ Bash cargo test`), and `ls
   --json` has it as `asking`. `y` in the TUI, on the task in the sidebar, in its pane or in the list `U` opens, or
@@ -1641,7 +1651,13 @@ crystal interrupt docs                                               # stop the 
   command its first word, or its first two for `git`, `cargo`, `npm`, `go` and the like (`Bash(cargo
   test:*)`), and for any other tool the tool. Claude adds the rule to the checkout's
   `.claude/settings.local.json`, so later sessions there have it too. To be asked less to begin with, allow
-  what it needs with `--allowedTools` or `--permission-mode` after `--`.
+  what it needs with `--allowedTools` or `--permission-mode` after `--`, or for every task, under `[tasks]` in
+  the [settings](#settings): `permission_mode`, the mode each `claude -p` starts in (`acceptEdits`, `auto`,
+  `dontAsk` or `plan`; `default` passes none, and Claude asks for what isn't allowed), and `allowed_tools`,
+  rules like `"Bash(cargo test:*)"` allowed beside crystal's own. A task's own arguments win. They're read as
+  each `claude` starts, so a change counts from its next. `bypassPermissions`, which turns every check off for a
+  task nobody watches, is refused unless `allow_bypass = true` says so too. The [settings
+  view](#the-settings-view) goes through the modes.
 - Every Claude Code session crystal starts, a task or in a terminal, may run the crystal commands it's told
   to without asking, so one driving others doesn't stop at every step:
   - starting and driving sessions: `ls`, `new`, `send`, `wait`, `read`, `result`, `interrupt`, `events`,
@@ -1668,12 +1684,31 @@ crystal interrupt docs                                               # stop the 
   is added up by the day, and the TUI's footer shows it: `$4.12 today`. With `daily_budget_usd` set, past it
   the footer turns red (`$6.40 today · over $5.00`) and no new run starts until the next day, whether a new
   task, a follow-up or a flow's step: each is refused, saying why. Runs already going carry on.
-- A run that fails, or crashes before saying anything, ends the task, which shows how it exited and why.
-  `crystal respawn` runs its prompt again, in its conversation if it got that far.
-- After a restart, a task comes back at rest rather than running its prompt again, and what it showed before
-  is gone; `crystal send` carries its conversation on. `restart-server` hands it over as it is instead: its
-  `claude` goes on with the run it's in, a permission it's asking for is still there to answer, and its
-  screen keeps what it showed.
+- How a run ends closes its [task](#tasks), as Claude's own result says: done with the first line of its
+  answer, or failed with what went wrong, like `error max turns` or a budget reached. The task stays at rest
+  either way, for a follow-up: `crystal send` opens its task again and carries the conversation on, after a
+  failure on a new `claude`, with a budget of its own. A `claude` that crashes before saying how its run
+  ended ends the task's session, which shows how it exited and why; `crystal respawn` runs its prompt again,
+  in its conversation if it got that far.
+- A task's pane's header says how full its conversation is, `ctx 12%`: the tokens Claude was given for its
+  last message, of the most its model takes, which each run's result says (200,000 until one has, or a
+  million for a model run with `[1m]`). `crystal tasks show` says it in tokens, `24k of 200k tokens, 12%`,
+  and `ls --json` has it as `context`.
+- `C` in the TUI, on the task in the sidebar or in its menu, or `crystal tasks terminal <task>`, opens it in a
+  terminal: Claude Code picks its conversation up there (`claude --resume <id>`), in the task's directory,
+  under its name and in its place in the list, with the task's own arguments but those only `claude -p` takes
+  (`--max-budget-usd`, `--max-turns`, `--output-format` and the like). Its task goes with it as it stood,
+  under its number: one still open is closed with `crystal done` from then on, as an agent's in a terminal
+  is. There's no way back to the background. It's refused while a run is going on: `crystal wait` for it, or
+  `crystal interrupt` it, first.
+- After a restart, a task comes back at rest rather than running its prompt again: its pane is drawn again
+  from the transcript Claude Code keeps of its conversation (`~/.claude/projects/…/<id>.jsonl`, in
+  `CLAUDE_CONFIG_DIR` when that's set), the last 512 KiB of it: the prompts, what Claude said, each tool it
+  used with the first line of what came back, and how full the conversation is. What only crystal drew, the
+  permissions asked for and how they were answered, and how each run ended with its cost, isn't in that file
+  and doesn't come back. `crystal send` carries its conversation on. `restart-server` hands it over as it is
+  instead: its `claude` goes on with the run it's in, a permission it's asking for is still there to answer,
+  and its screen keeps what it showed.
 
 `<task>` is the task's session, or its [task](#tasks) number, like `t12`.
 
@@ -1834,8 +1869,8 @@ made, `t1`, `t2`…, and stays open until it's closed, done or failed, with a li
   closes it anyway.
 - You close it from the TUI: `c` on the session asks `d` done or `f` failed, then for a line on how it went,
   which can stay empty.
-- A background task closes itself when its run ends: done with the first line of Claude's answer, or failed.
-  A follow-up opens it again.
+- A background task closes itself when its run ends, as Claude's result says: done with the first line of
+  its answer, or failed. Its session stays either way, and a follow-up opens the task again.
 
 | State | Meaning |
 |---|---|
@@ -1859,17 +1894,39 @@ does the pane's header. `crystal ls` has a TASK column, and `ls --json` a `task`
 crystal tasks                                       # the project's tasks: open, waiting to start, then closed
 crystal tasks new "Fix the flaky test"              # the new-session panel's first agent on it; prints t12
 crystal tasks new --background "Bump the deps" -- --model opus   # or Claude in the background
+crystal tasks new --accept "cargo test passes" "Fix the flaky test"   # with what has to hold
+crystal tasks new --pr 57 --background              # on pull request 57, in its worktree
+crystal tasks new --issue 7                         # to fix issue 7
 crystal tasks new --no-launch "Tidy the README"     # made now, started later: prints t13
 crystal tasks start t13                             # start it; prints its session's name
 crystal tasks show t12                              # how it stands, its session, what it asks for and costs
 crystal tasks cancel t12                            # cancel it, and stop its session
 crystal tasks log t12                               # how it stands, then its session's transcript
+crystal tasks terminal t12                          # a background task, opened in a terminal
 ```
 
 `tasks new` works from a shell or from inside a session, in the current directory (`-c <dir>`, or `-w
 <branch>` for a new worktree, made at once), and `-n` names its session. A task is named by its number, with
 or without the `t`, or by its session's name. `crystal task <prompt>` still starts a background task;
-`crystal tasks` is about the tasks there are.
+`crystal tasks` is about the tasks there are. `tasks terminal` opens a [background task](#background-tasks) in a
+terminal, the tasks plugin on or off.
+
+A task can carry acceptance criteria, what has to hold before it's done: `--accept "<criterion>"`, once for
+each, or `--accept-file <file>`, a line each (a list's `-` or `[ ]` taken off, and `#` headings left out), on
+`crystal task` or `crystal tasks new`. Its agent is given them in its first prompt, under its goal
+(`Acceptance criteria:`), so they're on its screen, a background task's transcript too. `crystal tasks show`
+lists them, and `ls --json` has them as `task.accept`. A task made to wait keeps them until it starts.
+
+A task can be about a pull request or an issue of its project's [forge](#pull-requests-and-issues), by its
+number. `--pr 57` runs it in that pull request's worktree: the one the project has on its branch, or else a
+new one, its commits fetched, a fork's under its owner, as `O` makes it. `--issue 7` says which issue it's for,
+wherever it runs. Its agent is told of them by the road its task takes, Claude Code on top of its system
+prompt: to read the pull request or the issue and its conversation first (`gh pr view 57 --comments`, or
+`glab`'s), to keep to what it needs, and to close the issue from the pull request that fixes it (`Closes
+#7`). Given no goal, a task on a pull request is to work on it, and one on an issue to fix it, in the words
+`O` and `i` use. `crystal tasks show` names them, and `ls --json` has them as `task.pull_request` and
+`task.issue`. Both ask the forge, so they need the github plugin and `gh` or `glab`; a number it doesn't know
+starts nothing.
 
 Closed tasks are kept in the project's history in crystal's database: what each was asked, when and how it
 closed, and the session and branch it ran in. `crystal tasks` lists the project's tasks, open ones first, then
@@ -2333,7 +2390,7 @@ file and change. A setting crystal doesn't know is an error that names it, so a 
 | `scrollback_lines` | `10000` | how many rows that scrolled off a session's screen it keeps, up to 1,000,000, for scrolling back, copy mode, `e` and `crystal read --history` |
 | `[plugins]` | | which plugins are on and off: [plugins](#plugins) |
 | `[memory]` | | how memory's [distiller](#the-distiller) runs, and whether it [searches by meaning](#search-by-meaning) |
-| `[tasks]` | | what [background tasks](#background-tasks) may spend: `max_budget_usd` each (`5`), `daily_budget_usd` all together (none) |
+| `[tasks]` | | what [background tasks](#background-tasks) may spend: `max_budget_usd` each (`5`), `daily_budget_usd` all together (none); and what they may do without asking: `permission_mode` (`"default"`), `allowed_tools` (none) and `allow_bypass` (`false`) |
 | `[events]` | | `keep_days`, how long the [event log](#events) keeps what happened: 30 days, or `0` for ever |
 | `[handoff]` | | `in_git`, the projects, by their main worktree, whose [handoff notes](#the-handoff-file) go in git |
 | `[worktrees]` | | `base`, the branch new worktrees' new branches [start from](#usage): `origin`'s default branch unless set |
@@ -2527,12 +2584,13 @@ side is), whether the [tab bar](#terminals-the-window-and-the-tab-bar) goes on t
 left out with one tab, how long an agent may sit [idle](#archiving-and-idle-agents), how far apart agents
 start again after a [crash or a reboot](#usage), [the mouse](#usage), whether programs' copies go on [your
 clipboard](#zoom-copy-mode-and-search), how memory learns ([the
-distiller](#the-distiller)) and searches ([by meaning](#search-by-meaning)), and whether [draft pull
-requests](#pull-requests) are hidden. `space` changes the one the bar is on, and `←/→` go through the
-[themes](#themes), forward and back (the row says which of the twenty it's on), the waits before a
-notification, the times an agent may sit idle: off, 15 minutes, 30, an hour, two or eight, the spacing of
-restarts: all at once, 100 milliseconds, 250, 500, a second or two, and how far a notch of the wheel scrolls:
-1, 2, 3, 5 or 10 lines. Each change is written to the file at once,
+distiller](#the-distiller)) and searches ([by meaning](#search-by-meaning)), the permission mode [background
+tasks](#background-tasks) start in, and whether [draft pull requests](#pull-requests) are hidden. `space`
+changes the one the bar is on, and `←/→` go through the [themes](#themes), forward and back (the row says which
+of the twenty it's on), the waits before a notification, the times an agent may sit idle: off, 15 minutes, 30,
+an hour, two or eight, the spacing of restarts: all at once, 100 milliseconds, 250, 500, a second or two, how
+far a notch of the wheel scrolls: 1, 2, 3, 5 or 10 lines, and the permission modes: `default`, `acceptEdits`,
+`auto`, `dontAsk` and `plan`. Each change is written to the file at once,
 keeping the rest of it as you wrote it, comments and all, and counts straight away: the TUI repaints in a new
 theme, and the daemon reads the rest as it goes. On a screen too short for every row, the view scrolls to keep
 the one the bar is on in sight.

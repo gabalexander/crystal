@@ -34,7 +34,8 @@ use crate::project;
 use crate::protocol::{
     self, Activity, AgentEvent, ArchivedSession, Artifact, ArtifactKind, Backlog, Conversation,
     Frame, Front, NewSession, NewTask, PendingTask, Request, Response, SessionInfo, State,
-    TaskInfo, TaskOutcome, TaskRecord, TaskSpec, TaskStart, TaskState, TaskView, Worktree,
+    TaskBrief, TaskInfo, TaskOutcome, TaskRecord, TaskSpec, TaskStart, TaskState, TaskView,
+    Worktree,
 };
 use crate::report;
 use crate::session::{Change, STOP_GRACE, Session, Term, signal_group};
@@ -42,6 +43,7 @@ use crate::skill;
 use crate::socket;
 use crate::spending::Spending;
 use crate::state::{self, SavedSession};
+use crate::task;
 use crate::tasks;
 use crate::typing;
 use crate::vt;
@@ -521,6 +523,10 @@ impl Daemon {
         let id = id.unwrap_or_else(new_id);
         let goal = saved.goal.clone();
         let backlog = goal.as_ref().and_then(|goal| goal.backlog);
+        let brief = goal
+            .as_ref()
+            .map(|goal| goal.brief.clone())
+            .unwrap_or_default();
         let name = match saved.task {
             // A task comes back at rest: a run it was in the middle of
             // can't be picked up halfway, so it isn't run again either.
@@ -531,6 +537,7 @@ impl Daemon {
                     spec,
                     env,
                     backlog,
+                    brief,
                 };
                 let conversation = saved.conversation.map(|conversation| conversation.id);
                 start_task_as(
@@ -551,6 +558,7 @@ impl Daemon {
                     env,
                     task: goal.as_ref().map(|goal| goal.goal.clone()),
                     backlog,
+                    brief,
                 };
                 start_as(
                     id,
@@ -1117,6 +1125,7 @@ impl Daemon {
                 env: run.env.clone(),
                 task: Some(asked),
                 backlog: None,
+                brief: TaskBrief::default(),
             };
             start(sessions, &self.socket, new, None, None)?
         } else {
@@ -1126,6 +1135,7 @@ impl Daemon {
                 spec: run.task_spec(step, prompt),
                 env: run.env.clone(),
                 backlog: None,
+                brief: TaskBrief::default(),
             };
             start_task(
                 sessions,
@@ -1141,7 +1151,7 @@ impl Daemon {
         let session = sessions.last_mut().expect("it was just started");
         if session.task_record().is_some() {
             let goal = format!("{} {}: {}", run.name, run.step_name(step), run.goal);
-            session.give_task(new_task_info(goal, !terminal, None));
+            session.give_task(new_task_info(goal, !terminal, None, TaskBrief::default()));
             self.number_tasks(std::slice::from_mut(session));
         }
         let task = session.task_id();
@@ -2163,6 +2173,7 @@ impl Daemon {
                     .emit(Event::about_session(Kind::RunInterrupted, &session.info()));
                 Ok(Response::Done)
             }
+            Request::TaskToTerminal { task, env } => self.task_to_terminal(&task, env),
             Request::Spending => Ok(Response::Spending(protocol::Spending {
                 today_usd: self.spending.today(),
                 daily_budget_usd: settings().tasks.daily_budget_usd,
@@ -2432,6 +2443,7 @@ impl Daemon {
             name,
             start: how,
             backlog,
+            brief,
             ..
         } = task;
         let started = match how {
@@ -2443,6 +2455,7 @@ impl Daemon {
                     env,
                     task: Some(goal),
                     backlog,
+                    brief,
                 };
                 start(&mut sessions, &self.socket, new, None, None)
             }
@@ -2453,6 +2466,7 @@ impl Daemon {
                     spec: TaskSpec { prompt: goal, args },
                     env,
                     backlog,
+                    brief,
                 };
                 start_task(&mut sessions, &self.socket, &self.spending, new, None, true)
             }
@@ -2466,6 +2480,96 @@ impl Daemon {
             eprintln!("crystal daemon: couldn't forget that t{id} waits to start: {err:#}");
         }
         Ok(self.started(&mut sessions, name, Kind::TaskStarted))
+    }
+
+    /// Turns the background task `handle` names, by its number or its
+    /// session's name, into a session in a terminal, from the client's
+    /// environment `env`: Claude Code, with the task's own arguments but
+    /// those only `claude -p` takes, picking its conversation up, in its
+    /// directory, under its name and in its place in the list. Its task
+    /// goes on in it as it stands, open or closed, under its number: an
+    /// open one is closed with `crystal done` from then on. Its `claude`,
+    /// at rest, is let go. Refused while a run is going on, and for a task
+    /// with no conversation yet.
+    fn task_to_terminal(&self, handle: &str, env: BTreeMap<String, String>) -> Result<Response> {
+        let mut sessions = self.sessions.lock().unwrap();
+        let name = task_session(&mut sessions, handle)?.name.clone();
+        let index = sessions
+            .iter()
+            .position(|session| session.name == name)
+            .expect("it was just found");
+        let session = &sessions[index];
+        ensure!(
+            session.is_task(),
+            "{name} isn't a background task: it's in a terminal already"
+        );
+        ensure!(
+            !session.in_a_run(),
+            "{name} is in the middle of a run: `crystal wait {name}` for it, or `crystal \
+             interrupt {name}`, first"
+        );
+        let launch = session.launch();
+        let id = launch
+            .conversation
+            .as_ref()
+            .map(|conversation| conversation.id.clone())
+            .with_context(|| format!("{name} has no conversation to pick up yet"))?;
+        // Claude Code in a terminal picks up a conversation it has the
+        // transcript of.
+        let transcript = crate::distill::transcript_of(&id, session.env()).with_context(|| {
+            format!("Claude Code has no transcript of {name}'s conversation, {id}, to pick up")
+        })?;
+        let conversation = Conversation {
+            id,
+            transcript: Some(transcript),
+        };
+        let spec = launch.task.clone().expect("a background task has its spec");
+        let mut command = vec!["claude".to_string()];
+        command.extend(task::terminal_args(&spec.args));
+        let goal = launch.goal.clone();
+        let backlog = goal.as_ref().and_then(|goal| goal.backlog);
+        let brief = goal
+            .as_ref()
+            .map(|goal| goal.brief.clone())
+            .unwrap_or_default();
+        // An open task is said as Claude's task, so that it's told how to
+        // close it; one closed already is only carried over.
+        let open = goal.as_ref().filter(|goal| goal.is_open());
+        let new = NewSession {
+            name: Some(name.clone()),
+            cwd: launch.cwd.clone(),
+            command,
+            env,
+            task: open.map(|goal| goal.goal.clone()),
+            backlog,
+            brief,
+        };
+        // The task makes way, and comes back if Claude doesn't start.
+        let background = sessions.remove(index);
+        if let Err(err) = start(&mut sessions, &self.socket, new, Some(conversation), None) {
+            sessions.insert(index, background);
+            return Err(err);
+        }
+        background.stop();
+        // `start` adds the session at the end; it goes where the task was,
+        // with the task as it stood.
+        let mut started = sessions.pop().expect("start added a session");
+        if let Some(goal) = goal {
+            started.give_task(TaskInfo {
+                background: false,
+                waiting: false,
+                ..goal
+            });
+        }
+        let task_id = started.task_id();
+        sessions.insert(index, started);
+        let info = sessions[index].info();
+        self.events
+            .emit(Event::about_session(Kind::SessionStarted, &info));
+        Ok(Response::Created {
+            name,
+            task: task_id,
+        })
     }
 
     fn new_session(&self, new: NewSession) -> Result<Response> {
@@ -2653,6 +2757,11 @@ impl Daemon {
         let launch = ended.launch();
         // Run again, its task is open again: the work goes on.
         let backlog = launch.goal.as_ref().and_then(|goal| goal.backlog);
+        let brief = launch
+            .goal
+            .as_ref()
+            .map(|goal| goal.brief.clone())
+            .unwrap_or_default();
         let started = match launch.task {
             // A task runs its prompt again, in its conversation if it had
             // got as far as one.
@@ -2663,6 +2772,7 @@ impl Daemon {
                     spec,
                     env,
                     backlog,
+                    brief,
                 };
                 let conversation = launch.conversation.map(|conversation| conversation.id);
                 start_task(
@@ -2682,6 +2792,7 @@ impl Daemon {
                     env,
                     task: launch.goal.as_ref().map(|goal| goal.goal.clone()),
                     backlog,
+                    brief,
                 };
                 start(
                     &mut sessions,
@@ -2971,6 +3082,7 @@ fn start_as(
         env,
         task,
         backlog,
+        brief,
     } = new;
     let Some(program) = command.first() else {
         bail!("no command to run");
@@ -3026,12 +3138,24 @@ fn start_as(
     // What it was started to do: a conversation picked up again has been
     // asked that already, whether tasks are on or off.
     let given_task = task.clone();
+    // Its acceptance criteria go under its goal, in its first prompt, when
+    // it starts afresh.
+    let asked = match &given_task {
+        Some(goal) if resume.is_none() && !resumed => {
+            tasks::with_criteria_in(asked, goal, &brief.accept)
+        }
+        _ => asked,
+    };
     // With tasks off, a session started with something to do is just a
     // session.
     let task = task.filter(|_| tasks::enabled(&config));
-    let about_task = task
-        .as_ref()
-        .map(|_| tasks::instructions(backlog::enabled(&config)));
+    // The pull request and the issue it's about, which it's told of beside
+    // its task, whether tasks are on or off.
+    let about_task = paragraphs([
+        task.as_ref()
+            .map(|_| tasks::instructions(backlog::enabled(&config))),
+        tasks::forge_notes(&brief, &cwd),
+    ]);
     let parallel = (agents::program_name(&command) == Some("claude"))
         .then(|| agents::PARALLEL_WORK.to_string());
     let remembered = remembered(socket, &cwd, &command);
@@ -3069,7 +3193,7 @@ fn start_as(
         session.mark_named_after_program();
     }
     if let Some(goal) = task {
-        session.give_task(new_task_info(goal, false, backlog));
+        session.give_task(new_task_info(goal, false, backlog, brief));
     }
     match conversation {
         Some(conversation) => session.set_conversation(conversation),
@@ -3101,6 +3225,13 @@ fn resumable(
         eprintln!("crystal daemon: couldn't resume {name}'s agent: command not found: {program}");
     }
     found
+}
+
+/// The paragraphs there are, one after the other, or `None` when there
+/// are none.
+fn paragraphs<const N: usize>(paragraphs: [Option<String>; N]) -> Option<String> {
+    let said: Vec<String> = paragraphs.into_iter().flatten().collect();
+    (!said.is_empty()).then(|| said.join("\n\n"))
 }
 
 /// What crystal tells an agent on top of what it was asked, a paragraph
@@ -3285,18 +3416,27 @@ fn crystal_commands(config: &Config) -> Vec<&'static str> {
 }
 
 /// The arguments each of a task's runs gives Claude: the task's own; in its
-/// system prompt, the notes its worktree's sessions left and, with memory
-/// on, what its project remembers that has to do with its prompt; with
-/// memory on, crystal's MCP server, to search the rest; and the crystal
-/// commands it's told to run and that server's tools allowed.
-fn task_args(socket: &Path, cwd: &Path, spec: &protocol::TaskSpec) -> Vec<String> {
+/// system prompt, what it's told of the pull request and the issue it's
+/// about, the notes its worktree's sessions left and, with memory on, what
+/// its project remembers that has to do with its prompt; with memory on,
+/// crystal's MCP server, to search the rest; and the crystal commands it's
+/// told to run and that server's tools allowed.
+fn task_args(
+    socket: &Path,
+    cwd: &Path,
+    spec: &protocol::TaskSpec,
+    brief: &TaskBrief,
+) -> Vec<String> {
     let config = settings();
     let memory_on = memory::enabled(&config);
     let remembered = memory_on
         .then(|| launch_memory(socket, cwd, &spec.prompt, memory::Reader::Task))
         .flatten();
-    let handoff = handoff_note(cwd, &[remembered.as_deref()]);
-    let mut args = agents::with_instructions(&spec.args, &notes(None, None, handoff, remembered));
+    // Its runs close it, so it's told nothing of closing it: only of the
+    // pull request and the issue it's about.
+    let about = tasks::forge_notes(brief, cwd);
+    let handoff = handoff_note(cwd, &[about.as_deref(), remembered.as_deref()]);
+    let mut args = agents::with_instructions(&spec.args, &notes(about, None, handoff, remembered));
     let mut tools = crystal_commands(&config);
     if memory_on && let Ok(crystal) = std::env::current_exe() {
         let server = mcp::config(&crystal, socket, cwd);
@@ -3352,6 +3492,7 @@ fn start_task_as(
         spec,
         env,
         backlog,
+        brief,
     } = task;
     check_dir(&cwd)?;
     ensure!(
@@ -3378,7 +3519,9 @@ fn start_task_as(
     // installed stay quiet.
     env.insert(agents::HOOKED.into(), "claude".into());
     let prompt = spec.prompt.clone();
-    let args = task_args(socket, &cwd, &spec);
+    let args = task_args(socket, &cwd, &spec, &brief);
+    // Its acceptance criteria go under its prompt.
+    let first_prompt = tasks::with_criteria(&prompt, &brief.accept);
     let spending = spending.clone();
     keep_scrollback();
     let mut session = Session::task(
@@ -3393,10 +3536,10 @@ fn start_task_as(
     );
     // It closes itself when its run ends, from Claude's answer.
     if tasks::enabled(&settings()) {
-        session.give_task(new_task_info(prompt.clone(), true, backlog));
+        session.give_task(new_task_info(prompt, true, backlog, brief));
     }
     if run_prompt {
-        session.prompt(&prompt)?;
+        session.prompt(&first_prompt)?;
     } else {
         session.came_back();
     }
@@ -3405,7 +3548,12 @@ fn start_task_as(
 }
 
 /// A task just made, open, and numbered by [`Daemon::number_tasks`].
-fn new_task_info(goal: String, background: bool, backlog: Option<u64>) -> TaskInfo {
+fn new_task_info(
+    goal: String,
+    background: bool,
+    backlog: Option<u64>,
+    brief: TaskBrief,
+) -> TaskInfo {
     TaskInfo {
         id: None,
         goal,
@@ -3414,6 +3562,7 @@ fn new_task_info(goal: String, background: bool, backlog: Option<u64>) -> TaskIn
         waiting: false,
         created: now_seconds(),
         outcome: None,
+        brief,
     }
 }
 

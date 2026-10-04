@@ -259,44 +259,18 @@ fn cut_to(mut line: String, max: usize) -> String {
 /// Claude said, the tools it used and what they answered. A subagent's own
 /// work is left out, as a task's screen leaves it out.
 fn claude_lines(line: &str) -> Vec<String> {
-    let Ok(event) = serde_json::from_str::<Value>(line) else {
-        return Vec::new();
-    };
-    if event["isSidechain"] == true || event["isMeta"] == true {
-        return Vec::new();
-    }
-    let mut lines = Vec::new();
-    if event["type"] == "user" {
-        let content = &event["message"]["content"];
-        let said: Vec<&str> = match content {
-            Value::String(text) => vec![text.as_str()],
-            Value::Array(blocks) => blocks
-                .iter()
-                .filter(|block| block["type"] == "text")
-                .filter_map(|block| block["text"].as_str())
-                .collect(),
-            _ => Vec::new(),
-        };
-        for text in said {
-            // What Claude Code writes about the user's own commands, like
-            // `/clear`, says nothing about the work.
-            if !text.starts_with("<command-") && !text.starts_with("<local-command-") {
-                lines.push(format!("USER: {}", text.trim()));
-            }
+    let said = transcript::kept_events(line).into_iter();
+    said.filter_map(|event| match event {
+        Event::Asked(text) => Some(format!("USER: {text}")),
+        Event::Said(text) => Some(format!("ASSISTANT: {}", text.trim())),
+        Event::UsedTool { name, gist } => Some(format!("TOOL {name}: {gist}")),
+        Event::ToolAnswered { first_line, failed } => {
+            let what = if failed { "ERROR" } else { "RESULT" };
+            Some(format!("{what}: {first_line}"))
         }
-    }
-    for event in transcript::events(line) {
-        match event {
-            Event::Said(text) => lines.push(format!("ASSISTANT: {}", text.trim())),
-            Event::UsedTool { name, gist } => lines.push(format!("TOOL {name}: {gist}")),
-            Event::ToolAnswered { first_line, failed } => {
-                let what = if failed { "ERROR" } else { "RESULT" };
-                lines.push(format!("{what}: {first_line}"));
-            }
-            Event::Started { .. } | Event::Finished(_) => {}
-        }
-    }
-    lines
+        Event::Started { .. } | Event::Context { .. } | Event::Finished(_) => None,
+    })
+    .collect()
 }
 
 /// What a pass reads.
@@ -337,7 +311,7 @@ impl Material {
 
 /// The transcript Claude Code keeps of `conversation`, in the directory
 /// of the project it was in, under its config directory's `projects`.
-fn transcript_of(conversation: &str, env: &BTreeMap<String, String>) -> Option<PathBuf> {
+pub fn transcript_of(conversation: &str, env: &BTreeMap<String, String>) -> Option<PathBuf> {
     if conversation.is_empty() || conversation.contains(['/', '.']) {
         return None;
     }
@@ -776,6 +750,7 @@ mod tests {
             created: 0,
             outcome: Some(TaskOutcome::new(TaskState::Done, "redis has to be up", 0)),
             artifacts: Vec::new(),
+            brief: Default::default(),
         };
         let header = header(&task);
         assert_eq!(

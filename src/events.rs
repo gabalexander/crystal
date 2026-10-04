@@ -985,6 +985,7 @@ pub fn example(kind: Kind, session: Option<&SessionInfo>, dir: &Path) -> Event {
             line: None,
             bell: false,
             unseen_copies: 0,
+            context: None,
         },
     };
     let now = now_ms() / 1000;
@@ -1005,6 +1006,7 @@ pub fn example(kind: Kind, session: Option<&SessionInfo>, dir: &Path) -> Event {
         outcome: None,
         id: Some(12),
         artifacts: Vec::new(),
+        brief: Default::default(),
     };
     let asking = Asking {
         tool: "Bash".into(),
@@ -1298,6 +1300,7 @@ mod tests {
             line: None,
             bell: false,
             unseen_copies: 0,
+            context: None,
         }
     }
 

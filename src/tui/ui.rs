@@ -1099,6 +1099,10 @@ fn header_notes(app: &App, slot: Slot, session: &SessionInfo, back: usize) -> Ve
         let gist = fit(&asking.gist, TASK_NOTE_LENGTH);
         notes.push(format!("⚠ {} {gist} · y/n/Y", asking.tool));
     }
+    // How full a background task's conversation is.
+    if let Some(context) = session.context {
+        notes.push(format!("ctx {}%", context.percent()));
+    }
     let index = app.sessions().iter().position(|s| s.name == session.name);
     let flow_step = index.and_then(|index| app.flow_step_of(index));
     if let Some((run, step)) = flow_step {
@@ -1978,6 +1982,7 @@ mod tests {
             line: None,
             bell: false,
             unseen_copies: 0,
+            context: None,
         }
     }
 
@@ -2667,6 +2672,22 @@ mod tests {
         let notes = vec!["exited 3".to_string()];
         let header = text_of(&pane_header(&ended, &notes, false, &look(&theme), 60));
         assert!(header.starts_with(" ■ done · exited 3 ─"), "{header}");
+    }
+
+    #[test]
+    fn a_background_task_s_pane_says_how_full_its_conversation_is() {
+        let mut app = App::new(None);
+        let task = SessionInfo {
+            front: Some(Front::Task),
+            context: Some(crate::protocol::ContextUse {
+                tokens: 24_000,
+                window: 200_000,
+            }),
+            ..session("fixer", State::Running)
+        };
+        app.set_sessions(vec![task]);
+        let text = screen_text_at(&app, 100, 24).join("\n");
+        assert!(text.contains("fixer · ctx 12%"), "{text}");
     }
 
     #[test]

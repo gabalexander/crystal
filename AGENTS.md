@@ -60,7 +60,7 @@ whenever what's handed over changes in a way the crystal before couldn't read.
 - `src/viewer.rs`: the client's side of an attach, shared by `crystal attach` and the TUI's pane
 - `src/drive.rs`: `crystal send`, `wait`, `read`, `result`, `answer` and `interrupt`, for driving one session from
   another or a script; waits listen to the daemon's events about their session, and `wait --output` has the
-  daemon look at its screen, asking again when a handover cuts it
+  daemon look at its screen, asking again when a handover cuts it; `task --wait`'s run, done or failed
 - `src/messages.rs`: what `crystal send` carries from one session to another: the text tidied and cut to 8 KiB,
   the line ahead of it saying which session sent it, the guard that holds a session to 20 sends a minute, and
   the `agent_blocked:` refusal for an agent asking the user something; adapted from docket's
@@ -233,15 +233,17 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   - `restarted.rs`: the footer's line on what a cold restart brought back and what couldn't start, worked out
     from the sessions the TUI sees waiting their turn, and those that failed, said once; pure
   - `settings_view.rs`: the settings view (`,`): notifications, sounds, the theme, the mouse, programs' copies,
-    idle agents, the spacing of restarts, the distiller, search by meaning and hiding draft pull requests, each
-    changed with a key, and how the models stand; the event loop writes the file (`config::set`) and, while it's open, reads
-    the settings and the daemon's `EmbeddingStatus` again every half a second
+    idle agents, the spacing of restarts, background tasks' permission mode, the distiller, search by meaning
+    and hiding draft pull requests, each changed with a key, and how the models stand; the event loop writes
+    the file (`config::set`) and, while it's open, reads the settings and the daemon's `EmbeddingStatus` again
+    every half a second
 - `src/daemon.rs`: the daemon: listens on the socket and owns the sessions, and emits an event wherever something
   happens to them, their tasks, flows, worktrees, memory or backlog; archives sessions and starts them again,
   stops agents left idle past `[sessions] stop_idle_after`, and keeps the list of projects sessions ran in;
   after a cold restart, puts the sessions written down back in their places and starts them again, agents
   `[sessions] restart_spacing_ms` apart on a thread of their own, those that can't start kept, failed, saying
-  why; hands itself over to a new crystal, and takes over from the daemon that handed over
+  why; opens a background task in a terminal, in its place, its task carried on; hands itself over to a new
+  crystal, and takes over from the daemon that handed over
 - `src/handover.rs`: handing the daemon over to a newly installed crystal by exec in its own process, the
   sessions carrying on: what's handed over and its `FORMAT`, the file it's written to and read from, keeping
   descriptors open across the exec, the readers it stops, the gate connections come in through, the helpers
@@ -320,12 +322,16 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   machine, or OSC 52 to their terminal over ssh or when none of those works
 - `src/task.rs`: tasks: Claude Code run without a terminal (`claude -p`): one process taking the prompt and each
   follow-up over its standard input, the permissions it asks for and their answers, interrupts, each run's cost
-  and budget, letting an idle one go, and handing its `claude` over, pipes and all
+  and budget, the permission mode and rules `[tasks]` gives each `claude`, letting an idle one go or one whose
+  run failed, how full its conversation is (its context meter), its screen drawn again from Claude Code's
+  transcript after a cold restart, the arguments it keeps opened in a terminal, and handing its `claude` over,
+  pipes and all
 - `src/claude_stream.rs`: Claude Code's stream-json protocol, as crystal speaks it with a background task's
   `claude -p`: prompts in, the control messages that carry a permission prompt out and its answer back, an
   interrupt, and the rule "always" keeps; adapted from docket's `docket-claude`
 - `src/transcript.rs`: reading `claude -p`'s stream-json events, and drawing them as a task's transcript,
-  Claude's answers as markdown pages
+  Claude's answers as markdown pages; how many tokens each message took and each model takes; and the
+  transcript Claude Code keeps of a conversation, its prompts too, read the same way
 - `src/markdown.rs`: markdown laid out as a page for one width (pulldown-cmark), each piece marked with what
   it is for the TUI's theme or a transcript's colors to draw, mermaid fences drawn as diagrams; adapted from
   docket's
@@ -355,7 +361,8 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   stopping one, and deleting a stopped one's state
 - `src/db.rs`: the SQLite database the daemon and the TUI keep their state in (WAL, `synchronous=NORMAL`,
   migrations by `user_version`, as docket does): the sessions to start again, the archived sessions, flow runs,
-  the projects on crystal's list, each project's backlog and closed tasks, the files tasks kept, the tasks waiting to start and the last task number, what background
+  the projects on crystal's list, each project's backlog and closed tasks, the files tasks kept, the tasks waiting to start and the last task number, what each
+  task carried beside its goal (its acceptance criteria, pull request and issue), what background
   tasks spent each day, the event log, read from a point on or a page at a time back from its end, and the TUI's
   tabs, layouts, the new-session panel's memory, the diff view's reviewed marks, the projects folded in the
   sidebar and the latest event the user had seen, each a JSON document; and bringing in the JSON files from before, a project's the first time it's
@@ -367,10 +374,11 @@ whenever what's handed over changes in a way the crystal before couldn't read.
 - `src/project_cli.rs`: `crystal project`: the projects crystal knows, adding and taking one off the list, and
   running or opening the project in a worktree
 - `src/tasks.rs`: tasks, sessions started with something to do: the paragraph an agent is told about
-  `crystal done`, the reminder for one that ends a turn with its task open, reading a project's closed tasks
-  from the file they were kept in before the database, numbering tasks (`t12`) and showing a task waiting to
-  start, the most a prompt crystal puts together may be, and `enabled`, the one gate everything tasks add goes
-  through
+  `crystal done`, the reminder for one that ends a turn with its task open, a task's acceptance criteria and
+  where they go in its first prompt, the goal of a task on a pull request or an issue and what its agent is
+  told of them, reading a project's closed tasks from the file they were kept in before the database,
+  numbering tasks (`t12`) and showing a task waiting to start, the most a prompt crystal puts together may be,
+  and `enabled`, the one gate everything tasks add goes through
 - `src/handoff.rs`: the handoff file, `.crystal/handoff.md` at the top of a git worktree: a note's heading and
   tidying, adding a section and letting the oldest go past the cap, the `.gitignore` beside it unless the config
   keeps a project's notes in git, the end of the file read for an agent starting there and the rule it's told,
@@ -381,10 +389,11 @@ whenever what's handed over changes in a way the crystal before couldn't read.
 - `src/backlog.rs`: a project's backlog, numbered items kept in the database by the daemon alone, its
   markdown export, and `enabled`, the one gate everything the backlog adds goes through
 - `src/work.rs`: `crystal done` (with `--artifact`), `handoff`, `tasks` and its commands (`new`, `start`, `show`,
-  `cancel`, `log`), and `backlog`
+  `cancel`, `log`, `terminal`), reading what a new task carries (`--accept`, and `--pr` and `--issue` from the
+  forge, a pull request's worktree found or made), and `backlog`
 - `src/config.rs`: the settings in `~/.config/crystal/config.toml`, read and checked: a theme by any of its
   names, the colors `[colors]` takes, what the mouse does (`[mouse]`) and whether programs' copies go on the
-  clipboard (`[clipboard]`); the shell a new terminal runs
+  clipboard (`[clipboard]`); what background tasks may spend and do unasked (`[tasks]`); the shell a new terminal runs
   (`[terminal]`, `-l` for a login shell) and where the TUI starts one, the window's title, the tab bar and
   the appearance
 - `src/memory.rs`: what a project's sessions learned: the SQLite store in the state directory with its FTS5
@@ -465,7 +474,7 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   first prompt, like `fix-login-redirect`
 - `src/forge.rs`: pull requests (open, and merged lately) and issues from the forge a project's remote is on,
   GitHub or GitLab, told apart by its host and the hosts `gh` and `glab` know: the types both read into,
-  `Repo`'s calls, and running the CLI with a timeout; tests use a fake `gh` and `glab`, never the real ones.
+  `Repo`'s calls, one pull request or issue among them read on its own, and running the CLI with a timeout; tests use a fake `gh` and `glab`, never the real ones.
   Was `github.rs`
   - `forge/github.rs`: each call as a `gh` command, and reading its `--json`
   - `forge/gitlab.rs`: each call as a `glab` command, and reading its JSON, a merge request as a pull request

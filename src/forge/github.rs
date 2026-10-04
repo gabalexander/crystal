@@ -33,6 +33,17 @@ pub(super) fn merged_pull_requests(dir: &Path) -> Result<Vec<PullRequest>, Strin
     parse_pull_requests(&gh(dir, &args)?)
 }
 
+/// Pull request `number` as the list has it, read on its own, so that one
+/// past the list's end, merged or closed is found too.
+pub(super) fn listed_pull_request(dir: &Path, number: u64) -> Result<PullRequest, String> {
+    let fields = "number,title,author,headRefName,isDraft,isCrossRepository,\
+                  headRepositoryOwner,mergeable,reviewDecision,statusCheckRollup,updatedAt,url,\
+                  state";
+    let number = number.to_string();
+    let json = gh(dir, &["pr", "view", &number, "--json", fields])?;
+    Ok(pull_request_of(parse(FORGE, &json)?))
+}
+
 pub(super) fn pull_request(dir: &Path, number: u64) -> Result<PullRequestDetail, String> {
     let number = number.to_string();
     let fields = "baseRefName,body,statusCheckRollup,comments,reviews";
@@ -52,6 +63,15 @@ pub(super) fn issues(dir: &Path) -> Result<Vec<Issue>, String> {
         "issue", "list", "--state", "open", "--limit", &limit, "--json", fields,
     ];
     parse_issues(&gh(dir, &args)?)
+}
+
+/// Issue `number` as the list has it, read on its own, so that one past
+/// the list's end, or closed, is found too.
+pub(super) fn listed_issue(dir: &Path, number: u64) -> Result<Issue, String> {
+    let number = number.to_string();
+    let fields = "number,title,labels,updatedAt,author,url";
+    let json = gh(dir, &["issue", "view", &number, "--json", fields])?;
+    Ok(issue_of(parse(FORGE, &json)?))
 }
 
 pub(super) fn issue(dir: &Path, number: u64) -> Result<IssueDetail, String> {
@@ -127,6 +147,9 @@ struct ListedPullRequest {
     updated_at: String,
     #[serde(default, deserialize_with = "text")]
     url: String,
+    /// `OPEN`, `CLOSED` or `MERGED`, when it's asked for.
+    #[serde(default, deserialize_with = "text")]
+    state: String,
 }
 
 fn parse_pull_requests(json: &str) -> Result<Vec<PullRequest>, String> {
@@ -152,7 +175,7 @@ fn pull_request_of(listed: ListedPullRequest) -> PullRequest {
         local_branch,
         draft: listed.is_draft,
         conflicts: listed.mergeable == "CONFLICTING",
-        merged: false,
+        merged: listed.state == "MERGED",
         checks: Checks::of(listed.status_check_rollup.iter().map(GhCheck::state)),
         review,
         updated_at: listed.updated_at,
@@ -340,15 +363,18 @@ struct Label {
 
 fn parse_issues(json: &str) -> Result<Vec<Issue>, String> {
     let listed: Vec<ListedIssue> = parse(FORGE, json)?;
-    let issues = listed.into_iter().map(|issue| Issue {
+    Ok(listed.into_iter().map(issue_of).collect())
+}
+
+fn issue_of(issue: ListedIssue) -> Issue {
+    Issue {
         number: issue.number,
         title: issue.title,
         labels: issue.labels.into_iter().map(|label| label.name).collect(),
         updated_at: issue.updated_at,
         author: login(issue.author),
         url: issue.url,
-    });
-    Ok(issues.collect())
+    }
 }
 
 #[derive(Deserialize)]
@@ -409,6 +435,19 @@ mod tests {
         assert_eq!(pr.review, Review::Required);
         assert_eq!(pr.checks, Checks::None);
         assert_eq!(pr.label(), "#57");
+    }
+
+    #[test]
+    fn a_pull_request_read_on_its_own_says_whether_it_merged() {
+        assert!(listed(r#"{"state": "MERGED"}"#).merged);
+        assert!(!listed(r#"{"state": "OPEN"}"#).merged);
+        assert!(!listed("{}").merged);
+        let one = r#"{"number": 7, "title": "Login loops", "labels": [], "url": "https://github.com/acme/app/issues/7"}"#;
+        let issue = issue_of(parse(FORGE, one).unwrap());
+        assert_eq!(
+            (issue.number, issue.url.as_str()),
+            (7, "https://github.com/acme/app/issues/7")
+        );
     }
 
     #[test]

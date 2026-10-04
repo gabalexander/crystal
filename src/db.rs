@@ -21,7 +21,8 @@ use crate::backlog;
 use crate::events::{Event, Since};
 use crate::flow_run::FlowRun;
 use crate::protocol::{
-    ArchivedSession, Artifact, ArtifactKind, BacklogItem, PendingTask, TaskOutcome, TaskRecord,
+    ArchivedSession, Artifact, ArtifactKind, BacklogItem, PendingTask, TaskBrief, TaskOutcome,
+    TaskRecord,
 };
 use crate::state::{self, SavedSession};
 use crate::tasks;
@@ -217,6 +218,14 @@ CREATE TABLE archived (
 CREATE INDEX archived_name ON archived(name, archived);
 ";
 
+/// What a task carries beside its goal, as JSON (see
+/// [`crate::protocol::TaskBrief`]): its acceptance criteria, and the pull
+/// request and issue it's about. `NULL` for a task with none.
+const BRIEFS: &str = "
+ALTER TABLE tasks ADD COLUMN brief TEXT;
+ALTER TABLE pending_tasks ADD COLUMN brief TEXT;
+";
+
 /// What makes the database as it is now, a step for each version: a
 /// database at version `v`, kept in its `user_version`, takes the steps
 /// after the first `v`.
@@ -228,6 +237,7 @@ const MIGRATIONS: &[&str] = &[
     RESUME,
     PROJECTS,
     ARCHIVED,
+    BRIEFS,
 ];
 
 /// The file each project kept its backlog in before the database.
@@ -237,8 +247,8 @@ const SESSION_COLUMNS: &str = "name, command, cwd, conversation, task, goal, res
 const RUN_COLUMNS: &str =
     "name, flow, profiles, goal, cwd, worktree, round, feedback, steps, started";
 const TASK_COLUMNS: &str = "project_name, goal, session, branch, background, backlog, failed, \
-                            summary, closed, number, created, cancelled";
-const PENDING_COLUMNS: &str = "number, goal, cwd, name, start, backlog, created";
+                            summary, closed, number, created, cancelled, brief";
+const PENDING_COLUMNS: &str = "number, goal, cwd, name, start, backlog, created, brief";
 const ITEM_COLUMNS: &str = "number, text, tags, done, created, closed";
 const ARTIFACT_COLUMNS: &str = "kind, name, path, bytes";
 
@@ -431,7 +441,7 @@ impl Db {
         let number = next_task_number(&tx)?;
         tx.execute(
             &format!(
-                "INSERT INTO pending_tasks ({PENDING_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
+                "INSERT INTO pending_tasks ({PENDING_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
             ),
             params![
                 number,
@@ -441,6 +451,7 @@ impl Db {
                 json(&task.start)?,
                 task.backlog,
                 task.created,
+                brief_json(&task.brief)?,
             ],
         )?;
         tx.commit()?;
@@ -952,7 +963,7 @@ fn insert_task(conn: &Connection, project: &str, task: &TaskRecord) -> Result<()
     conn.execute(
         &format!(
             "INSERT INTO tasks (project, {TASK_COLUMNS}) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)"
         ),
         params![
             project,
@@ -968,9 +979,16 @@ fn insert_task(conn: &Connection, project: &str, task: &TaskRecord) -> Result<()
             task.id,
             task.created,
             outcome.is_some_and(|outcome| outcome.cancelled),
+            brief_json(&task.brief)?,
         ],
     )?;
     Ok(())
+}
+
+/// What a task carries beside its goal, as its row keeps it: `NULL` for
+/// nothing.
+fn brief_json(brief: &TaskBrief) -> Result<Option<String>> {
+    (!brief.is_empty()).then(|| json(brief)).transpose()
 }
 
 /// A task from a project's history. It closed, or it's from a file before
@@ -999,6 +1017,7 @@ fn task_of(row: &Row) -> Result<TaskRecord> {
         created: row.get(10)?,
         outcome,
         artifacts: Vec::new(),
+        brief: from_json_or_null(row.get(12)?)?.unwrap_or_default(),
     })
 }
 
@@ -1027,6 +1046,7 @@ fn pending_of(row: &Row) -> Result<PendingTask> {
         start: from_json(&row.get::<_, String>(4)?)?,
         backlog: row.get(5)?,
         created: row.get(6)?,
+        brief: from_json_or_null(row.get(7)?)?.unwrap_or_default(),
     })
 }
 
@@ -1161,6 +1181,7 @@ mod tests {
             created: 1,
             outcome: Some(TaskOutcome::new(TaskState::Done, "did it", at)),
             artifacts: Vec::new(),
+            brief: Default::default(),
         }
     }
 
@@ -1175,6 +1196,7 @@ mod tests {
             },
             backlog: Some(4),
             created: 9,
+            brief: Default::default(),
         }
     }
 
@@ -1196,6 +1218,7 @@ mod tests {
             waiting: true,
             created: 3,
             outcome: None,
+            brief: Default::default(),
         });
         let mut reported = saved("c");
         reported.resume = Some(vec!["pi".into(), "--session".into(), "s1".into()]);
@@ -1335,6 +1358,52 @@ mod tests {
         let back = db.closed_tasks(Some(app)).unwrap();
         assert_eq!(back, [cancelled]);
         assert_eq!(back[0].state(), TaskState::Cancelled);
+    }
+
+    #[test]
+    fn a_task_keeps_its_criteria_and_what_it_was_about_closed_or_waiting() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Db::open(&socket_in(&dir)).unwrap();
+        let brief = crate::protocol::TaskBrief {
+            accept: vec!["the tests pass".into()],
+            issue: Some(Box::new(crate::protocol::ForgeLink {
+                forge: crate::forge::Forge::GitHub,
+                number: 7,
+                title: "Login loops".into(),
+                url: "https://github.com/o/r/issues/7".into(),
+                branch: None,
+            })),
+            ..Default::default()
+        };
+        let app = Path::new("/code/app");
+        let task = TaskRecord {
+            brief: brief.clone(),
+            ..closed("fix it", 4)
+        };
+        db.record_task(app, &task).unwrap();
+        db.record_task(app, &closed("plain", 5)).unwrap();
+        assert_eq!(
+            db.closed_tasks(Some(app)).unwrap(),
+            [task, closed("plain", 5)]
+        );
+        // One with none keeps nothing.
+        let kept: Option<String> = db
+            .conn
+            .query_row("SELECT brief FROM tasks WHERE goal = 'plain'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(kept, None);
+
+        let waiting = PendingTask {
+            brief,
+            ..pending("later")
+        };
+        let id = db.add_pending_task(&waiting).unwrap();
+        assert_eq!(
+            db.pending_task(id).unwrap().unwrap(),
+            PendingTask { id, ..waiting }
+        );
     }
 
     #[test]

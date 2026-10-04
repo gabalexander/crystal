@@ -53,8 +53,8 @@ use crate::git;
 use crate::profile::{self, Profile};
 use crate::project_commands::Verb;
 use crate::protocol::{
-    Activity, Answer, ArchivedSession, Backlog, Front, SessionInfo, Spending, State, TaskSpec,
-    Worktree,
+    Activity, Answer, ArchivedSession, Backlog, ForgeLink, Front, SessionInfo, Spending, State,
+    TaskBrief, TaskSpec, Worktree,
 };
 use crate::shell;
 use crate::{backlog, names, plugins, tasks};
@@ -339,11 +339,13 @@ pub enum Action {
         purpose: Purpose,
     },
     /// Start a background task at `place`: Claude Code runs `spec` without
-    /// a terminal, for backlog item `backlog` if it's for one.
+    /// a terminal, for backlog item `backlog` if it's for one, about the
+    /// pull request or the issue `brief` says, if it's about one.
     StartInBackground {
         place: Place,
         spec: TaskSpec,
         backlog: Option<u64>,
+        brief: TaskBrief,
     },
     /// Start a run of the flow called `flow` at `place`, on `goal`.
     StartFlow {
@@ -414,6 +416,8 @@ pub enum Action {
     },
     /// Start this ended session's command again.
     Respawn(String),
+    /// Open the background task called this in a terminal.
+    TaskToTerminal(String),
     /// Remove the linked worktree at `path`, which is on `branch`: with
     /// `force`, though it has changes not committed.
     RemoveWorktree {
@@ -3744,6 +3748,9 @@ impl App {
         if self.tasks_on && session.task.as_ref().is_some_and(|task| task.is_open()) {
             items.push(Item::new("close its task", Command::CloseTask));
         }
+        if session.front == Some(Front::Task) {
+            items.push(Item::new("open it in a terminal", Command::TaskToTerminal));
+        }
         items.push(Item::new("archive it", Command::Archive));
         items.push(Item::danger("kill it", Command::Kill));
         Some(items)
@@ -3983,6 +3990,7 @@ impl App {
             Command::Issues => return self.open_issues(),
             Command::CloseTask if self.tasks_on => self.ask_how_the_task_went(),
             Command::CloseTask => self.notify(plugins::off("tasks")),
+            Command::TaskToTerminal => return self.task_to_terminal(),
             Command::Backlog if self.backlog_on => return self.open_backlog(),
             Command::Backlog => self.notify(plugins::off("backlog")),
             Command::FlowGoOn if self.flows_on => return self.go_on_with_flow(),
@@ -4930,7 +4938,17 @@ impl App {
             choice: format!("{} {}", forge.pull_request(), pull_request.label()),
         }];
         setup.target = 0;
-        self.launcher = Some(Launcher::new(setup).with_task(&task));
+        let brief = TaskBrief {
+            pull_request: Some(Box::new(ForgeLink {
+                forge,
+                number: pull_request.number,
+                title: pull_request.title.clone(),
+                url: pull_request.url.clone(),
+                branch: Some(pull_request.local_branch.clone()),
+            })),
+            ..TaskBrief::default()
+        };
+        self.launcher = Some(Launcher::new(setup).with_task(&task).about(brief));
         self.codex_models_wanted()
     }
 
@@ -4948,7 +4966,20 @@ impl App {
         if let Some(Target::NewWorktree { base, .. }) = setup.targets.get_mut(1) {
             *base = Some(view.project.clone());
         }
-        let launcher = Launcher::new(setup).with_task(&task).with_branch(&branch);
+        let brief = TaskBrief {
+            issue: Some(Box::new(ForgeLink {
+                forge: view.forge,
+                number: issue.number,
+                title: issue.title.clone(),
+                url: issue.url.clone(),
+                branch: None,
+            })),
+            ..TaskBrief::default()
+        };
+        let launcher = Launcher::new(setup)
+            .with_task(&task)
+            .with_branch(&branch)
+            .about(brief);
         self.launcher = Some(launcher);
         self.codex_models_wanted()
     }
@@ -5114,6 +5145,7 @@ impl App {
                 run,
                 background,
                 backlog,
+                brief,
             } => {
                 self.close_launcher(true);
                 self.memory.remember(&task, &run);
@@ -5123,12 +5155,14 @@ impl App {
                         place,
                         spec,
                         backlog,
+                        brief,
                     });
                 }
                 // Given something to do, the session is a task.
                 let purpose = Purpose {
                     task: (!task.is_empty()).then_some(task),
                     backlog,
+                    brief,
                 };
                 Some(Action::Start {
                     place,
@@ -5286,7 +5320,7 @@ impl App {
                     // given a task.
                     let purpose = Purpose {
                         task: catalog::first_prompt_in(&command).filter(|_| self.tasks_on),
-                        backlog: None,
+                        ..Purpose::default()
                     };
                     Some(Action::Start {
                         place,
@@ -5362,6 +5396,18 @@ impl App {
             _ if self.pane_shows_task(slot) => self.on_task_pane_key(slot, key),
             _ => Some(Action::Type { to: slot, key }),
         }
+    }
+
+    /// Opens the selected background task in a terminal: Claude Code picks
+    /// its conversation up there, and its task goes on in it.
+    fn task_to_terminal(&mut self) -> Option<Action> {
+        let session = self.selected()?;
+        if session.front != Some(Front::Task) {
+            let name = session.name.clone();
+            self.notify(format!("{name} isn't a background task"));
+            return None;
+        }
+        Some(Action::TaskToTerminal(session.name.clone()))
     }
 
     /// Whether the pane at `slot` shows a background task, which takes no
@@ -6241,6 +6287,7 @@ mod tests {
             line: None,
             bell: false,
             unseen_copies: 0,
+            context: None,
         }
     }
 
@@ -6548,7 +6595,7 @@ mod tests {
         let command = command.iter().map(|word| word.to_string()).collect();
         let purpose = Purpose {
             task: (!task.is_empty()).then(|| task.to_string()),
-            backlog: None,
+            ..Purpose::default()
         };
         Some(Action::Start {
             place,
@@ -9827,7 +9874,7 @@ mod tests {
             panel.task().text(),
             "Work on pull request #57: a change (https://github.com/acme/app/pull/57)"
         );
-        let Some(Action::Start { place, .. }) = press(&mut app, KeyCode::Enter) else {
+        let Some(Action::Start { place, purpose, .. }) = press(&mut app, KeyCode::Enter) else {
             panic!("Enter should start the session");
         };
         assert_eq!(
@@ -9837,6 +9884,12 @@ mod tests {
                 branch: "fix-login".into(),
                 fetch: "fix-login".into(),
             })
+        );
+        // Its agent is told of the pull request, as `crystal task --pr` is.
+        let about = purpose.brief.pull_request.unwrap();
+        assert_eq!(
+            (about.number, about.branch.as_deref()),
+            (57, Some("fix-login"))
         );
     }
 
@@ -9953,7 +10006,12 @@ mod tests {
             panel.task().text(),
             "Fix issue #42: Fix login redirect (https://github.com/acme/app/issues/42)"
         );
-        let Some(Action::Start { place, command, .. }) = press(&mut app, KeyCode::Enter) else {
+        let Some(Action::Start {
+            place,
+            command,
+            purpose,
+        }) = press(&mut app, KeyCode::Enter)
+        else {
             panic!("Enter should start the session");
         };
         assert_eq!(
@@ -9966,6 +10024,7 @@ mod tests {
         );
         assert_eq!(command[0], "claude");
         assert!(command[2].starts_with("Fix issue #42"));
+        assert_eq!(purpose.brief.issue.unwrap().number, 42);
     }
 
     #[test]
@@ -10071,6 +10130,7 @@ mod tests {
                 waiting: false,
                 created: 0,
                 outcome: outcome.map(closed),
+                brief: Default::default(),
             }),
             ..in_project(name, "shop")
         }
@@ -10203,6 +10263,7 @@ mod tests {
                     args: Vec::new(),
                 },
                 backlog: None,
+                brief: TaskBrief::default(),
             })
         );
     }
@@ -10700,6 +10761,28 @@ gate = true
         assert_eq!(press(&mut app, KeyCode::Char('x')), None);
         assert!(app.menu().is_none());
         assert_eq!(app.confirm(), Some(&Confirm::Kill("b".into())));
+    }
+
+    #[test]
+    fn a_background_task_opens_in_a_terminal_from_its_menu_or_with_shift_c() {
+        let mut app = App::new(None);
+        let task = SessionInfo {
+            front: Some(Front::Task),
+            ..doing("fixer", Activity::Done)
+        };
+        app.set_sessions(vec![task, session("shell")]);
+        app.right_click(Hit::SidebarRow(row_of(&app, "fixer")), (3, 4));
+        assert!(labels(&app).contains(&"open it in a terminal"));
+        assert_eq!(
+            press(&mut app, KeyCode::Char('C')),
+            Some(Action::TaskToTerminal("fixer".into()))
+        );
+        // A session in a terminal is in one already.
+        app.right_click(Hit::SidebarRow(row_of(&app, "shell")), (3, 4));
+        assert!(!labels(&app).contains(&"open it in a terminal"));
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(press(&mut app, KeyCode::Char('C')), None);
+        assert_eq!(app.notice(), Some("shell isn't a background task"));
     }
 
     #[test]

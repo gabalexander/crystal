@@ -11,18 +11,21 @@
 //! asks for waits for the user's answer, and a turn can be stopped halfway.
 //! A `claude` left idle for [`IDLE_KEEP`] is let go; the next follow-up
 //! starts another, which carries the conversation on with `--resume`, as
-//! one does after a restart. A turn that fails ends the task.
+//! one does after a restart. So is one whose turn failed, by Claude's own
+//! answer: the task's session stays, for a follow-up. A `claude` that dies
+//! in the middle of a turn, saying nothing of how it ended, ends it.
 //!
 //! A handover (see [`crate::handover`]) hands the `claude` over too, its
 //! pipes and all, so a turn halfway through carries on in the next daemon:
 //! a `claude` is a child like a terminal's program, and its pipes are
 //! descriptors like a terminal.
 
+use crate::agents;
 use crate::claude_stream::{self, Decision, Line, PermissionRequest, Rule};
-use crate::config::Config;
+use crate::config::{Config, TaskSettings};
 use crate::distill::Record;
 use crate::handover::{self, Got};
-use crate::protocol::{AgentEvent, Answer, Asking, State, TaskResult, TaskSpec};
+use crate::protocol::{AgentEvent, Answer, Asking, ContextUse, State, TaskResult, TaskSpec};
 use crate::session::{STOP_GRACE, Term, signal_group};
 use crate::spending::Spending;
 use crate::transcript::{self, Event, Outcome};
@@ -48,6 +51,16 @@ const ERROR_LINES: usize = 5;
 /// it's let go: each one holds on to a fair amount of memory.
 const IDLE_KEEP: Duration = Duration::from_secs(5 * 60);
 
+/// How much of the end of the transcript Claude Code keeps of a task's
+/// conversation is drawn again after a restart.
+const KEPT_BYTES: u64 = 512 * 1024;
+
+/// How many tokens a model takes, until a run's result has said: Claude's
+/// models take this many, unless they're run with a million, which their
+/// names say.
+const CONTEXT_WINDOW: u64 = 200_000;
+const MILLION_WINDOW: u64 = 1_000_000;
+
 pub struct Task {
     spec: TaskSpec,
     /// What each `claude` is given: the spec's own arguments, with what
@@ -57,7 +70,8 @@ pub struct Task {
     env: BTreeMap<String, String>,
     /// The session's screen, which each turn is drawn on.
     term: Arc<Term>,
-    /// The session's state: a turn that fails ends the task.
+    /// The session's state: a `claude` that dies in the middle of a turn
+    /// ends the task's session.
     state: Arc<Mutex<State>>,
     /// What every background task has spent today, which each turn adds
     /// to and a daily budget is held against.
@@ -98,6 +112,14 @@ struct Runs {
     /// The model Claude said it runs on, as its last run started.
     #[serde(default)]
     model: Option<String>,
+    /// How many tokens the model was given for the conversation's last
+    /// message, and which model that was, as the message names it.
+    #[serde(default)]
+    context: Option<(u64, Option<String>)>,
+    /// How many tokens each model the task's runs used takes, as their
+    /// results said.
+    #[serde(default)]
+    windows: BTreeMap<String, u64>,
     /// What the last turn was asked.
     prompt: String,
     /// What the last turn came to: Claude's answer, or what went wrong.
@@ -113,6 +135,28 @@ struct Runs {
 impl Runs {
     fn working(&self) -> bool {
         self.started > self.ended
+    }
+
+    /// How full the conversation is, once a message has said: of what its
+    /// model takes as a result said, or else of what its name says.
+    fn context(&self) -> Option<ContextUse> {
+        let (tokens, model) = self.context.as_ref()?;
+        let said = model.as_ref().and_then(|model| self.windows.get(model));
+        let window = match said {
+            Some(&window) => window,
+            None if self
+                .model
+                .as_ref()
+                .is_some_and(|model| model.ends_with("[1m]")) =>
+            {
+                MILLION_WINDOW
+            }
+            None => CONTEXT_WINDOW,
+        };
+        Some(ContextUse {
+            tokens: *tokens,
+            window,
+        })
     }
 
     /// Lets the `claude` go once it has sat idle for [`IDLE_KEEP`]. Its
@@ -233,7 +277,7 @@ impl Task {
             .as_mut()
             .is_some_and(|claude| claude.send(&message).is_ok());
         if !taken {
-            self.start_claude(&mut runs, config.tasks.max_budget_usd)?;
+            self.start_claude(&mut runs, &config.tasks)?;
             let claude = runs.claude.as_mut().expect("just started");
             claude
                 .send(&message)
@@ -251,9 +295,9 @@ impl Task {
 
     /// Starts a `claude` for the task's turns, in its conversation if it
     /// has one, and a thread that reads what it says.
-    fn start_claude(&self, runs: &mut Runs, budget: f64) -> Result<()> {
+    fn start_claude(&self, runs: &mut Runs, settings: &TaskSettings) -> Result<()> {
         let mut child = self
-            .command(runs.conversation.as_deref(), budget)
+            .command(runs.conversation.as_deref(), settings)
             .spawn()
             .context("couldn't start claude")?;
         let pipe = |pipe: Option<OwnedFd>| pipe.map(File::from).context("claude has no pipes");
@@ -436,6 +480,11 @@ impl Task {
         self.runs.lock().unwrap().cost_usd
     }
 
+    /// How full its conversation is, once Claude has said.
+    pub fn context(&self) -> Option<ContextUse> {
+        self.runs.lock().unwrap().context()
+    }
+
     /// The permission Claude is waiting on the user for, the oldest when
     /// there are several.
     pub fn asking(&self) -> Option<Asking> {
@@ -518,6 +567,46 @@ impl Task {
         self.term.show(transcript::note_lines(note).as_bytes());
     }
 
+    /// Draws what the task did before a cold restart, which took what its
+    /// screen showed, again: from the transcript Claude Code keeps of its
+    /// conversation, its last [`KEPT_BYTES`]. What was asked, what Claude
+    /// said and the tools it used come back, and how full the conversation
+    /// is; what only crystal drew, the permissions asked for and how each
+    /// run ended, doesn't. With no transcript to read, it says what's gone.
+    pub fn draw_kept(&self) {
+        let conversation = self.conversation();
+        let kept = conversation
+            .as_deref()
+            .and_then(|conversation| crate::distill::transcript_of(conversation, &self.env))
+            .and_then(|path| kept_lines(&path).ok())
+            .filter(|lines| !lines.is_empty());
+        let Some(lines) = kept else {
+            self.note(
+                "crystal restarted, and what this task showed before is gone. \
+                 `crystal send` carries its conversation on.",
+            );
+            return;
+        };
+        self.note("What this task did before, from Claude Code's transcript of its conversation:");
+        {
+            let mut runs = self.runs.lock().unwrap();
+            for line in lines {
+                for event in transcript::kept_events(&line) {
+                    match event {
+                        Event::Context { tokens, model } => runs.context = Some((tokens, model)),
+                        Event::Started { .. } | Event::Finished(_) => {}
+                        event => {
+                            let lines = transcript::lines(&event, self.term.columns());
+                            self.term.show(lines.as_bytes());
+                        }
+                    }
+                }
+            }
+        }
+        self.term.show(b"\r\n");
+        self.note("`crystal send` carries its conversation on.");
+    }
+
     /// Stops the task. Its `claude` is asked to stop, the way process
     /// supervisors ask, then killed if it hasn't after [`STOP_GRACE`]. A
     /// turn cut short ends the task with how the process ended; a task at
@@ -543,24 +632,36 @@ impl Task {
     }
 
     /// `claude -p`, taking prompts on its input and writing its events as
-    /// JSON, in the task's directory and environment.
-    fn command(&self, conversation: Option<&str>, budget: f64) -> Command {
+    /// JSON, in the task's directory and environment: with the budget, the
+    /// permission mode and the rules the settings give every task, as they
+    /// are now.
+    fn command(&self, conversation: Option<&str>, settings: &TaskSettings) -> Command {
         let mut command = Command::new("claude");
         command.args(claude_stream::ARGS);
-        // A budget given with the task's own arguments wins.
-        if budget > 0.0
-            && !self
-                .args
-                .iter()
-                .any(|arg| arg.starts_with("--max-budget-usd"))
-        {
+        // A budget given with the task's own arguments wins, and so does a
+        // permission mode.
+        let budget = settings.max_budget_usd;
+        if budget > 0.0 && !given(&self.args, "--max-budget-usd") {
             command.args(["--max-budget-usd", &budget.to_string()]);
+        }
+        if let Some(mode) = settings.permission_mode()
+            && !given(&self.args, "--permission-mode")
+        {
+            command.args(["--permission-mode", mode]);
         }
         if let Some(id) = conversation {
             command.args(["--resume", id]);
         }
+        let args = match settings.allowed_tools.as_slice() {
+            [] => self.args.clone(),
+            rules => agents::with_value(
+                &self.args,
+                &["--allowedTools", "--allowed-tools"],
+                &rules.join(","),
+            ),
+        };
         command
-            .args(&self.args)
+            .args(&args)
             .current_dir(&self.cwd)
             .env_clear()
             .envs(&self.env)
@@ -572,6 +673,55 @@ impl Task {
             .process_group(0);
         command
     }
+}
+
+/// The options of a task's own arguments that only `claude -p` takes, each
+/// with whether it takes a value: a task opened in a terminal leaves them
+/// out, and crystal chooses the conversation itself.
+const PRINT_ONLY: &[(&str, bool)] = &[
+    ("-p", false),
+    ("--print", false),
+    ("--max-budget-usd", true),
+    ("--max-turns", true),
+    ("--output-format", true),
+    ("--input-format", true),
+    ("--include-partial-messages", false),
+    ("--replay-user-messages", false),
+    ("--permission-prompt-tool", true),
+    ("--fallback-model", true),
+    ("--resume", true),
+    ("-r", true),
+    ("--continue", false),
+    ("-c", false),
+];
+
+/// A task's own arguments, `args`, as Claude Code in a terminal takes them:
+/// without those only `claude -p` takes.
+pub fn terminal_args(args: &[String]) -> Vec<String> {
+    let mut kept = Vec::new();
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        let option = arg
+            .split_once('=')
+            .map_or(arg.as_str(), |(option, _)| option);
+        match PRINT_ONLY.iter().find(|(name, _)| *name == option) {
+            Some((_, true)) if !arg.contains('=') => {
+                args.next();
+            }
+            Some(_) => {}
+            None => kept.push(arg.clone()),
+        }
+    }
+    kept
+}
+
+/// Whether `args` give the option `option`, on its own or as
+/// `option=value`.
+fn given(args: &[String], option: &str) -> bool {
+    args.iter().any(|arg| {
+        arg.strip_prefix(option)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('='))
+    })
 }
 
 /// The events for what changed between two looks at a task's runs. A run
@@ -738,6 +888,7 @@ impl Reading {
                         runs.model = model;
                     }
                 }
+                Event::Context { tokens, model } => runs.context = Some((tokens, model)),
                 Event::Finished(outcome) => self.finish(runs, outcome),
                 event => {
                     let lines = transcript::lines(&event, self.term.columns());
@@ -747,8 +898,9 @@ impl Reading {
         }
     }
 
-    /// Notes how a turn ended, and what it cost. One that failed ends the
-    /// task, unless the user stopped it.
+    /// Notes how a turn ended, and what it cost. One that failed lets its
+    /// `claude` go, unless the user stopped it: a follow-up starts another,
+    /// with a budget of its own, in the same conversation.
     fn finish(&self, runs: &mut Runs, outcome: Outcome) {
         let Some(claude) = runs.claude.as_mut() else {
             return;
@@ -762,6 +914,7 @@ impl Reading {
         }
         runs.result = Some(outcome.result.clone());
         runs.failed = outcome.failed;
+        runs.windows.extend(outcome.windows.iter().cloned());
         runs.interrupted = std::mem::take(&mut runs.interrupting);
         runs.asking.clear();
         runs.ended = (runs.ended + 1).min(runs.started);
@@ -775,8 +928,6 @@ impl Reading {
         if runs.failed && !runs.interrupted {
             // Let go: its input closes, and it ends.
             runs.claude = None;
-            *self.state.lock().unwrap() = State::Exited { code: 1 };
-            self.term.close();
         }
     }
 
@@ -833,6 +984,30 @@ fn signal_name(signal: i32) -> String {
         libc::SIGTERM => "Terminated".to_string(),
         other => format!("signal {other}"),
     }
+}
+
+/// The lines at the end of the transcript at `path`, its last
+/// [`KEPT_BYTES`], from the first whole line in them.
+fn kept_lines(path: &std::path::Path) -> io::Result<Vec<String>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = File::open(path)?;
+    let length = file.metadata()?.len();
+    let start = length.saturating_sub(KEPT_BYTES);
+    file.seek(SeekFrom::Start(start))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    // Begun partway through a line, the end of it isn't one.
+    if start > 0 {
+        let first = bytes
+            .iter()
+            .position(|&byte| byte == b'\n')
+            .map_or(bytes.len(), |at| at + 1);
+        bytes.drain(..first);
+    }
+    Ok(String::from_utf8_lossy(&bytes)
+        .lines()
+        .map(String::from)
+        .collect())
 }
 
 /// A line read off a pipe, as text, without its line ending.
@@ -1104,6 +1279,188 @@ mod tests {
         assert_eq!(task.spec().prompt, "fix the tests");
         // What the session had seen of its runs isn't news again.
         assert!(task.events().is_empty());
+    }
+
+    /// A task at rest in `dir`, in conversation `conversation`, with
+    /// `env` and its own arguments `args`.
+    fn task_in(
+        dir: &std::path::Path,
+        env: BTreeMap<String, String>,
+        args: &[&str],
+        conversation: Option<&str>,
+    ) -> Task {
+        let db = crate::db::Db::open(&dir.join("crystal.sock")).unwrap();
+        let args: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
+        Task::new(
+            TaskSpec {
+                prompt: "fix the tests".into(),
+                args: args.clone(),
+            },
+            args,
+            dir.to_path_buf(),
+            env,
+            Arc::new(Term::without_terminal()),
+            Arc::new(Mutex::new(State::Running)),
+            Arc::new(Spending::new(db)),
+            conversation.map(String::from),
+        )
+    }
+
+    fn args_of(command: &Command) -> Vec<String> {
+        command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn each_claude_starts_as_the_settings_say_unless_the_task_says_otherwise() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = TaskSettings {
+            permission_mode: "acceptEdits".into(),
+            allowed_tools: vec!["Bash(make:*)".into(), "Edit".into()],
+            ..TaskSettings::default()
+        };
+        let task = task_in(
+            dir.path(),
+            BTreeMap::new(),
+            &["--allowedTools", "Bash(crystal ls:*)"],
+            None,
+        );
+        let args = args_of(&task.command(Some("conv-1"), &settings));
+        let after_print = &args[claude_stream::ARGS.len()..];
+        assert_eq!(
+            after_print,
+            [
+                "--max-budget-usd",
+                "5",
+                "--permission-mode",
+                "acceptEdits",
+                "--resume",
+                "conv-1",
+                "--allowedTools",
+                "Bash(make:*),Edit",
+                "Bash(crystal ls:*)",
+            ]
+        );
+        // What the task's own arguments say wins.
+        let own = task_in(
+            dir.path(),
+            BTreeMap::new(),
+            &["--permission-mode=plan", "--max-budget-usd", "1"],
+            None,
+        );
+        let args = args_of(&own.command(None, &TaskSettings::default()));
+        assert!(!args[..claude_stream::ARGS.len() + 2].contains(&"--permission-mode".into()));
+        assert_eq!(
+            &args[claude_stream::ARGS.len()..],
+            ["--permission-mode=plan", "--max-budget-usd", "1"]
+        );
+        assert!(given(&["--max-turns=3".into()], "--max-turns"));
+        assert!(!given(&["--max-turnsx".into()], "--max-turns"));
+    }
+
+    #[test]
+    fn a_task_in_a_terminal_leaves_out_what_only_claude_p_takes() {
+        let args: Vec<String> = [
+            "--model",
+            "opus",
+            "--max-budget-usd",
+            "2",
+            "--max-turns=9",
+            "-p",
+            "--resume",
+            "old",
+            "--allowedTools",
+            "Edit",
+            "--verbose",
+        ]
+        .iter()
+        .map(|arg| arg.to_string())
+        .collect();
+        assert_eq!(
+            terminal_args(&args),
+            ["--model", "opus", "--allowedTools", "Edit", "--verbose"]
+        );
+    }
+
+    #[test]
+    fn the_context_is_of_what_the_model_takes_as_the_result_said() {
+        let mut runs = Runs::default();
+        assert_eq!(runs.context(), None);
+        runs.context = Some((50_000, Some("claude-sonnet-5-5".into())));
+        // Before a result says, Claude's models take 200k.
+        assert_eq!(runs.context().unwrap().window, CONTEXT_WINDOW);
+        assert_eq!(runs.context().unwrap().percent(), 25);
+        runs.model = Some("claude-sonnet-5-5[1m]".into());
+        assert_eq!(runs.context().unwrap().window, MILLION_WINDOW);
+        runs.windows.insert("claude-sonnet-5-5".into(), 400_000);
+        assert_eq!(
+            runs.context(),
+            Some(ContextUse {
+                tokens: 50_000,
+                window: 400_000
+            })
+        );
+    }
+
+    #[test]
+    fn after_a_restart_a_task_is_drawn_again_from_claude_s_transcript() {
+        let dir = tempfile::tempdir().unwrap();
+        let kept = dir.path().join("claude/projects/-work-app");
+        std::fs::create_dir_all(&kept).unwrap();
+        let lines = [
+            r#"{"type":"user","message":{"role":"user","content":"fix the tests"},"isSidechain":false}"#,
+            r#"{"type":"assistant","message":{"model":"m","content":[{"type":"text","text":"Running them."},{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"cargo test"}}],"usage":{"input_tokens":10,"cache_read_input_tokens":20000,"output_tokens":30}},"isSidechain":false}"#,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"test result: ok"}]}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"A subagent's."}]},"isSidechain":true}"#,
+        ];
+        std::fs::write(kept.join("conv-1.jsonl"), lines.join("\n")).unwrap();
+        let env = BTreeMap::from([(
+            "CLAUDE_CONFIG_DIR".to_string(),
+            dir.path().join("claude").display().to_string(),
+        )]);
+        let task = task_in(dir.path(), env.clone(), &[], Some("conv-1"));
+        task.draw_kept();
+        let screen = task.term.rows(true).join("\n");
+        assert!(screen.contains("Claude Code's transcript"), "{screen}");
+        assert!(screen.contains("> fix the tests"), "{screen}");
+        assert!(screen.contains("Running them."), "{screen}");
+        assert!(screen.contains("▸ Bash cargo test"), "{screen}");
+        assert!(screen.contains("└ test result: ok"), "{screen}");
+        assert!(!screen.contains("A subagent's."), "{screen}");
+        assert!(screen.contains("`crystal send` carries"), "{screen}");
+        assert_eq!(task.context().unwrap().tokens, 20_040);
+
+        // With no transcript, it says what's gone.
+        let gone = task_in(dir.path(), env, &[], Some("conv-2"));
+        gone.draw_kept();
+        let screen = gone.term.rows(true).join("\n");
+        assert!(
+            screen.contains("what this task showed before is gone"),
+            "{screen}"
+        );
+    }
+
+    #[test]
+    fn only_the_end_of_a_long_transcript_is_read_from_a_whole_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("long.jsonl");
+        let line = "x".repeat(1000);
+        let text: String = (0..KEPT_BYTES / 1000 + 10)
+            .map(|n| format!("{n} {line}\n"))
+            .collect();
+        std::fs::write(&path, &text).unwrap();
+        let lines = kept_lines(&path).unwrap();
+        assert!(lines.iter().all(|kept| kept.ends_with(&line)));
+        assert!(
+            lines
+                .last()
+                .unwrap()
+                .starts_with(&format!("{} ", KEPT_BYTES / 1000 + 9))
+        );
+        let bytes: usize = lines.iter().map(|kept| kept.len() + 1).sum();
+        assert!(bytes as u64 <= KEPT_BYTES);
     }
 
     #[test]

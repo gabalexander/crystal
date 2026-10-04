@@ -7095,7 +7095,8 @@ const ALLOWED: &str = concat!(
 /// `runs`, a line each (`<args> -- <prompt>`), then writes what a short turn
 /// of Claude writes: some text, a tool and its answer, waiting for the test
 /// to make `finish-<run>` before its answer and result. The cost it gives
-/// is what its process has cost so far, $0.0421 a turn. A prompt with `ASK`
+/// is what its process has cost so far, $0.0421 a turn; its answer takes
+/// 24,040 tokens of the 200,000 its model takes, 12%. A prompt with `ASK`
 /// in it asks for a permission instead, writes the answer it gets to
 /// `answers` and goes on; one with `SLOW` works until it's interrupted.
 /// With `FAKE_FAIL` set its result says it failed; with `FAKE_CRASH` it
@@ -7111,8 +7112,8 @@ fn print_claude(dir: &Path) -> PathBuf {
 while IFS= read -r line; do
     case "$line" in *'"type":"user"'*) ;; *) continue ;; esac
     prompt=$(printf '%s\n' "$line" | sed 's/.*"content":"\([^"]*\)".*/\1/')
-    echo "$* -- $prompt" >> runs
-    run=$(wc -l < runs | tr -d ' ')
+    printf '%s -- %s\n' "$*" "$prompt" >> runs
+    run=$(grep -c -- ' -- ' runs)
     turns=$((turns + 1))
     if [ -n "$FAKE_CRASH" ]; then
         echo 'Error: Invalid API key' >&2
@@ -7147,13 +7148,13 @@ while IFS= read -r line; do
         while [ ! -e "finish-$run" ]; do sleep 0.05; done
         ;;
     esac
-    echo '{"type":"assistant","parent_tool_use_id":null,"message":{"content":[{"type":"text","text":"All green on run '"$run"'."}]}}'
+    echo '{"type":"assistant","parent_tool_use_id":null,"message":{"model":"m","content":[{"type":"text","text":"All green on run '"$run"'."}],"usage":{"input_tokens":10,"cache_read_input_tokens":24000,"output_tokens":30}}}'
     if [ -n "$FAKE_FAIL" ]; then
         echo '{"type":"result","subtype":"error_max_turns","is_error":true,"session_id":"conv-1","total_cost_usd":0.01,"duration_ms":900}'
         continue
     fi
     cost=$(awk "BEGIN { print $turns * 0.0421 }")
-    echo '{"type":"result","subtype":"success","is_error":false,"result":"All green on run '"$run"'.","session_id":"conv-1","total_cost_usd":'"$cost"',"duration_ms":3200,"permission_denials":[{"tool_name":"Bash","tool_use_id":"t9","tool_input":{"command":"rm -rf build"}}]}'
+    echo '{"type":"result","subtype":"success","is_error":false,"result":"All green on run '"$run"'.","session_id":"conv-1","total_cost_usd":'"$cost"',"duration_ms":3200,"permission_denials":[{"tool_name":"Bash","tool_use_id":"t9","tool_input":{"command":"rm -rf build"}}],"modelUsage":{"m":{"contextWindow":200000}}}'
     if [ -n "$FAKE_ONE_TURN" ]; then exit 0; fi
 done
 "#,
@@ -7233,6 +7234,16 @@ fn a_task_runs_claude_without_a_terminal_and_shows_what_it_did() {
     assert_eq!(result["conversation"], "conv-1");
     assert_eq!(result["cost_usd"], 0.0421);
     assert_eq!(result["runs"], 1);
+
+    // How full its conversation is, as Claude said.
+    let context = &listed(&crystal, "fixer")["context"];
+    assert_eq!(context["tokens"], 24_040);
+    assert_eq!(context["window"], 200_000);
+    let card = crystal.ok(&["tasks", "show", "fixer"]);
+    assert!(
+        card.contains("  context   24k of 200k tokens, 12%\n"),
+        "{card}"
+    );
 }
 
 #[test]
@@ -7303,10 +7314,35 @@ fn task_wait_waits_for_the_run_and_says_how_it_ended() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout), "quick\ndone\n");
+
+    // One whose run failed says so.
+    let dir = crystal.dir.path().join("failing");
+    std::fs::create_dir(&dir).unwrap();
+    finish_run(&dir, 1);
+    let out = crystal
+        .command(&[
+            "task",
+            "--wait",
+            "-n",
+            "broken",
+            "-c",
+            dir.to_str().unwrap(),
+            "fix the tests",
+        ])
+        .env("PATH", &path)
+        .env("FAKE_FAIL", "1")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "broken\nfailed\n");
 }
 
 #[test]
-fn a_task_whose_run_fails_ends_and_says_why() {
+fn a_task_whose_run_fails_closes_failed_and_a_follow_up_carries_on() {
     let crystal = Crystal::new();
     let path = path_with(&print_claude(crystal.dir.path()));
     let start = |name: &str, fault: &str| {
@@ -7333,18 +7369,38 @@ fn a_task_whose_run_fails_ends_and_says_why() {
         dir
     };
 
-    // Claude says the run failed.
+    // Claude says the run failed: its task closes failed, and the task
+    // stays, at rest, for a follow-up.
     let failing = start("failing", "FAKE_FAIL");
     finish_run(&failing, 1);
-    eventually("the task has ended", || {
-        status(&crystal, "failing") == "exited 1"
+    eventually("its task has closed", || {
+        crystal.row("failing").unwrap()[8] == "✗ error max turns"
     });
+    assert_eq!(status(&crystal, "failing"), "done");
     shows_on_screen(&crystal, "failing", "✗ failed · error max turns");
     let result: serde_json::Value =
         serde_json::from_str(&crystal.ok(&["result", "failing", "--json"])).unwrap();
     assert_eq!(result["failed"], true);
+    let tasks = crystal.ok(&["tasks", "--all"]);
+    assert!(tasks.contains("failed     failing"), "{tasks}");
+    // Its claude was let go: a follow-up starts another, in the same
+    // conversation, and opens the task again.
+    eventually("its claude has gone", || {
+        listed(&crystal, "failing")["pid"].is_null()
+    });
+    crystal.ok(&["send", "failing", "try again"]);
+    assert_eq!(
+        runs(&failing, 2)[1],
+        format!("{PRINT_ARGS} --resume conv-1 --allowedTools {ALLOWED} -- try again")
+    );
+    eventually("its task is open again", || {
+        crystal
+            .ok(&["tasks", "--all"])
+            .contains("running    failing")
+    });
 
-    // Claude crashes before it says anything.
+    // Claude crashes before it says anything: there's no claude to carry
+    // on, and the task ends.
     start("crashing", "FAKE_CRASH");
     eventually("the task has ended", || {
         status(&crystal, "crashing") == "exited 1"
@@ -7378,6 +7434,7 @@ fn a_task_comes_back_at_rest_after_a_restart_and_carries_its_conversation_on() {
     eventually("its conversation is saved", || {
         crystal.saved().contains("conv-1")
     });
+    keep_claude_transcript(&crystal);
 
     crash(daemon);
     // The next command starts a daemon, which brings the task back at rest
@@ -7391,7 +7448,12 @@ fn a_task_comes_back_at_rest_after_a_restart_and_carries_its_conversation_on() {
     eventually("the task is back", || {
         crystal.row("fixer").is_some_and(|row| row[1] == "idle")
     });
-    shows_on_screen(&crystal, "fixer", "crystal restarted");
+    // What it did before is drawn again from Claude Code's transcript, and
+    // how full its conversation is read from it.
+    shows_on_screen(&crystal, "fixer", "What this task did before");
+    shows_on_screen(&crystal, "fixer", "> fix the tests");
+    shows_on_screen(&crystal, "fixer", "All green on run 1.");
+    assert_eq!(listed(&crystal, "fixer")["context"]["tokens"], 24_040);
     assert_eq!(runs(dir, 1).len(), 1);
 
     crystal.ok(&["send", "fixer", "carry on"]);
@@ -9239,6 +9301,354 @@ fn a_task_made_to_wait_is_pending_until_it_starts() {
 }
 
 #[test]
+fn a_task_carries_acceptance_criteria_under_its_prompt_and_on_its_card() {
+    let crystal = Crystal::new();
+    let dir = crystal.dir.path();
+    let path = path_with(&print_claude(dir));
+    std::fs::write(dir.join("done-when.md"), "# Done when\n- [ ] no warnings\n").unwrap();
+    let out = crystal
+        .command(&[
+            "task",
+            "-n",
+            "fixer",
+            "--accept",
+            "the tests pass",
+            "--accept-file",
+            "done-when.md",
+            "fix the tests",
+        ])
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // Its first prompt has them under its goal, as Claude reads it.
+    let prompt = r"fix the tests\n\nAcceptance criteria:\n- the tests pass\n- no warnings";
+    assert_eq!(
+        runs(dir, 1),
+        [format!("{PRINT_ARGS} --allowedTools {ALLOWED} -- {prompt}")]
+    );
+    shows_on_screen(&crystal, "fixer", "> - no warnings");
+    let card = crystal.ok(&["tasks", "show", "fixer"]);
+    assert!(
+        card.contains("  accept    the tests pass\n            no warnings\n"),
+        "{card}"
+    );
+    let task = &listed(&crystal, "fixer")["task"];
+    assert_eq!(task["goal"], "fix the tests");
+    assert_eq!(
+        task["accept"],
+        serde_json::json!(["the tests pass", "no warnings"])
+    );
+
+    // An agent in a terminal has them in its first prompt too, and a task
+    // made to wait keeps them until it starts.
+    let claude = fake_claude(dir);
+    let terminal = path_with(&claude);
+    let made = crystal
+        .command(&[
+            "tasks",
+            "new",
+            "--no-launch",
+            "-n",
+            "later",
+            "--accept",
+            "the docs say so",
+            "write the docs",
+        ])
+        .env("PATH", &terminal)
+        .output()
+        .unwrap();
+    assert!(made.status.success());
+    let card = crystal.ok(&["tasks", "show", "t2"]);
+    assert!(card.contains("  accept    the docs say so\n"), "{card}");
+    let started = crystal
+        .command(&["tasks", "start", "t2"])
+        .env("PATH", &terminal)
+        .output()
+        .unwrap();
+    assert!(
+        started.status.success(),
+        "{}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    let args = written(&dir.join("args"));
+    assert!(
+        args.ends_with("write the docs\n\nAcceptance criteria:\n- the docs say so\n"),
+        "{args}"
+    );
+}
+
+#[test]
+fn the_settings_give_background_tasks_a_permission_mode_and_rules() {
+    let crystal = Crystal::new();
+    crystal.configure(
+        "notify = false\nname_from_prompt = false\n\n[plugins]\nmemory = false\n\n\
+         [sound]\nenabled = false\n\n[mouse]\nscrollbars = false\n\n\
+         [terminal]\nshell_mode = \"non_login\"\n\n\
+         [tasks]\npermission_mode = \"acceptEdits\"\nallowed_tools = [\"Bash(make:*)\"]\n",
+    );
+    let dir = crystal.dir.path();
+    let path = path_with(&print_claude(dir));
+    start_task(&crystal, &path, "fixer", "fix the tests");
+    assert_eq!(
+        runs(dir, 1),
+        [format!(
+            "{PRINT_ARGS} --permission-mode acceptEdits --allowedTools Bash(make:*) {ALLOWED} \
+             -- fix the tests"
+        )]
+    );
+    // The task's own arguments win.
+    let other = dir.join("other");
+    std::fs::create_dir(&other).unwrap();
+    let out = crystal
+        .command(&[
+            "task",
+            "-n",
+            "planner",
+            "-c",
+            other.to_str().unwrap(),
+            "plan it",
+            "--",
+            "--permission-mode",
+            "plan",
+        ])
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let run = &runs(&other, 1)[0];
+    assert!(
+        run.contains("--permission-mode plan") && !run.contains("acceptEdits"),
+        "{run}"
+    );
+}
+
+/// A stand-in for `gh` that knows pull request 57 and issue 7 of
+/// acme/app, as `crystal task --pr` and `--issue` ask for them, and writes
+/// each call into `gh-calls` beside it.
+fn task_gh(dir: &Path) -> PathBuf {
+    let bin = dir.join("task-gh-bin");
+    std::fs::create_dir(&bin).unwrap();
+    let calls = dir.join("gh-calls");
+    script(
+        &bin.join("gh"),
+        &format!(
+            r#"echo "$*" >> "{}"
+case "$*" in
+    "pr view 57 --json "*) echo '{{"number": 57, "title": "Fix the login redirect", "headRefName": "fix-login", "isCrossRepository": false, "state": "OPEN", "url": "https://github.com/acme/app/pull/57"}}' ;;
+    "issue view 7 --json "*) echo '{{"number": 7, "title": "Login loops", "url": "https://github.com/acme/app/issues/7"}}' ;;
+    *) echo "no such thing: $*" >&2; exit 1 ;;
+esac
+"#,
+            calls.display()
+        ),
+    );
+    bin
+}
+
+#[test]
+fn a_task_on_a_pull_request_runs_in_its_worktree_and_is_told_to_read_it_first() {
+    let crystal = Crystal::new();
+    let dir = crystal.dir.path();
+    let repo = github_repo(dir);
+    git(&repo, &["checkout", "-q", "-b", "fix-login"]);
+    git(
+        &repo,
+        &["commit", "-q", "--allow-empty", "-m", "send them home"],
+    );
+    git(&repo, &["push", "-q", "origin", "fix-login"]);
+    let fix = git(&repo, &["rev-parse", "HEAD"]);
+    git(&repo, &["checkout", "-q", "main"]);
+    git(&repo, &["branch", "-q", "-D", "fix-login"]);
+    let gh = task_gh(dir);
+    let path = format!("{}:{}", gh.display(), path_with(&print_claude(dir)));
+    let repo_arg = repo.to_str().unwrap();
+
+    let out = crystal
+        .command(&[
+            "task", "-n", "fixer", "-c", repo_arg, "--pr", "57", "--issue", "7",
+        ])
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "fixer\n");
+    // In the pull request's worktree, made for it, its commits fetched.
+    let worktree = dir.join("app.worktrees/fix-login");
+    assert_eq!(git(&worktree, &["rev-parse", "HEAD"]), fix);
+    let ran = worktree.join("runs");
+    eventually("claude has run", || {
+        std::fs::read_to_string(&ran).is_ok_and(|runs| runs.contains("-- Work on"))
+    });
+    let runs = std::fs::read_to_string(&ran).unwrap();
+    assert!(
+        runs.ends_with(
+            "-- Work on pull request #57: Fix the login redirect \
+             (https://github.com/acme/app/pull/57)\n"
+        ),
+        "{runs}"
+    );
+    assert!(
+        runs.contains("Your task is about GitHub pull request #57")
+            && runs.contains("`gh pr view 57 --comments`")
+            && runs.contains("Your task is for GitHub issue #7, \"Login loops\""),
+        "{runs}"
+    );
+    let card = crystal.ok(&["tasks", "show", "fixer"]);
+    assert!(
+        card.contains(
+            "  pr        #57 Fix the login redirect · https://github.com/acme/app/pull/57\n"
+        ) && card.contains("  issue     #7 Login loops · https://github.com/acme/app/issues/7\n"),
+        "{card}"
+    );
+    assert!(card.contains("  where     app fix-login\n"), "{card}");
+
+    // On an issue alone, it runs where it's started, to fix it.
+    let out = crystal
+        .command(&[
+            "tasks",
+            "new",
+            "--background",
+            "-n",
+            "issue",
+            "-c",
+            repo_arg,
+            "--issue",
+            "7",
+        ])
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let ran = repo.join("runs");
+    eventually("claude has run on the issue", || {
+        std::fs::read_to_string(&ran)
+            .is_ok_and(|runs| runs.contains("-- Fix issue #7: Login loops"))
+    });
+    let calls = std::fs::read_to_string(dir.join("gh-calls")).unwrap();
+    assert!(calls.starts_with("pr view 57 --json "), "{calls}");
+
+    // One the forge doesn't know starts nothing.
+    let missing = crystal
+        .command(&["task", "-c", repo_arg, "--pr", "99"])
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert!(!missing.status.success());
+    assert!(
+        String::from_utf8_lossy(&missing.stderr).contains("no such thing: pr view 99"),
+        "{}",
+        String::from_utf8_lossy(&missing.stderr)
+    );
+}
+
+/// Writes the transcript Claude Code keeps of conversation `conv-1` into
+/// the test's Claude Code config directory: the prompt, and Claude's
+/// answer, with how many tokens it took.
+fn keep_claude_transcript(crystal: &Crystal) {
+    let kept = crystal.claude_config_dir().join("projects/-work-app");
+    std::fs::create_dir_all(&kept).unwrap();
+    let lines = [
+        r#"{"type":"user","message":{"role":"user","content":"fix the tests"},"isSidechain":false,"sessionId":"conv-1"}"#,
+        r#"{"type":"assistant","message":{"model":"m","content":[{"type":"text","text":"All green on run 1."}],"usage":{"input_tokens":10,"cache_read_input_tokens":24000,"output_tokens":30}},"isSidechain":false,"sessionId":"conv-1"}"#,
+    ];
+    std::fs::write(kept.join("conv-1.jsonl"), lines.join("\n") + "\n").unwrap();
+}
+
+#[test]
+fn a_background_task_opens_in_a_terminal_in_its_conversation() {
+    let crystal = Crystal::new();
+    let dir = crystal.dir.path();
+    let path = path_with(&print_claude(dir));
+    let out = crystal
+        .command(&[
+            "task",
+            "-n",
+            "fixer",
+            "fix the tests",
+            "--",
+            "--model",
+            "opus",
+            "--max-turns",
+            "3",
+        ])
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    finish_run(dir, 1);
+    eventually("the task is done", || status(&crystal, "fixer") == "done");
+    keep_claude_transcript(&crystal);
+
+    let terminal = path_with(&fake_claude(dir));
+    let out = crystal
+        .command(&["tasks", "terminal", "t1"])
+        .env("PATH", &terminal)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "fixer\n");
+    // Claude Code in a terminal, in the task's conversation, with what of
+    // its arguments a terminal takes.
+    let args = written(&dir.join("args"));
+    let args: Vec<&str> = args.lines().collect();
+    let resume = args.iter().position(|arg| *arg == "--resume").unwrap();
+    assert_eq!(args[resume + 1], "conv-1");
+    assert!(
+        args.windows(2).any(|pair| pair == ["--model", "opus"]),
+        "{args:?}"
+    );
+    assert!(
+        !args.contains(&"--max-turns") && !args.contains(&"-p"),
+        "{args:?}"
+    );
+    let session = listed(&crystal, "fixer");
+    assert_eq!(
+        session["command"],
+        serde_json::json!(["claude", "--model", "opus"])
+    );
+    assert_ne!(session["front"]["kind"], "task");
+    // Its task went with it, as it stood.
+    assert_eq!(session["task"]["id"], 1);
+    assert_eq!(session["task"]["background"], false);
+    let card = crystal.ok(&["tasks", "show", "t1"]);
+    assert!(card.starts_with("t1  done  fix the tests\n"), "{card}");
+    assert!(card.contains("in a terminal"), "{card}");
+
+    // A session in a terminal is in one already, and a task in the middle
+    // of a run is let finish first.
+    let refused = crystal.fails(&["tasks", "terminal", "fixer"]);
+    assert!(refused.contains("isn't a background task"), "{refused}");
+    let slow = dir.join("slow");
+    std::fs::create_dir(&slow).unwrap();
+    let out = crystal
+        .command(&["task", "-n", "slow", "-c", slow.to_str().unwrap(), "SLOW"])
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    eventually("it's working", || status(&crystal, "slow") == "working");
+    let refused = crystal.fails(&["tasks", "terminal", "slow"]);
+    assert!(refused.contains("in the middle of a run"), "{refused}");
+}
+
+#[test]
 fn cancelling_a_task_stops_its_session_and_killing_a_session_cancels_its_task() {
     let crystal = Crystal::new();
     // One waiting to start goes straight to the history.
@@ -10042,11 +10452,11 @@ fn the_settings_view_changes_the_config_and_follows_it_live() {
     crystal.configure(
         "notify = true\ntheme = \"light\"\n\n[memory]\ndistill = false\nembeddings = false\n",
     );
-    // Memory's rows are eleven down from the theme, past the appearance's,
-    // the tab bar's, the spacing of restarts, the mouse's and the
-    // clipboard's, which the view scrolls to on a screen too short for all
-    // of them.
-    tui.type_keys("jjjjjjjjjjj");
+    // Memory's rows are twelve down from the theme, past the appearance's,
+    // the tab bar's, the spacing of restarts, the mouse's, the clipboard's
+    // and background tasks', which the view scrolls to on a screen too
+    // short for all of them.
+    tui.type_keys("jjjjjjjjjjjj");
     tui.shows("○ distill closed tasks");
     tui.shows("not downloaded (2449 MB)");
 

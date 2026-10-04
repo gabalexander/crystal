@@ -44,6 +44,7 @@ const SESSION_ARGS: &[(&[&str], &str)] = &[
     (&["report"], "name"),
     (&["answer"], "task"),
     (&["interrupt"], "task"),
+    (&["tasks", "terminal"], "task"),
     (&["result"], "name"),
     (&["attach"], "name"),
     (&["send-keys"], "name"),

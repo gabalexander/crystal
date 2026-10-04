@@ -364,8 +364,12 @@ enum Command {
         #[arg(long, value_name = "SECONDS", requires = "wait")]
         timeout: Option<f64>,
 
-        /// The prompt. Several words are joined with spaces.
-        #[arg(required = true)]
+        #[command(flatten)]
+        brief: BriefArgs,
+
+        /// The prompt. Several words are joined with spaces. With --pr or
+        /// --issue, it can be left out: the task is to work on it.
+        #[arg(required_unless_present_any = ["pr", "issue"])]
         prompt: Vec<String>,
 
         /// Arguments for each `claude -p` the task runs, after `--`: for
@@ -876,8 +880,12 @@ enum TasksCommand {
         #[arg(long)]
         no_launch: bool,
 
-        /// What it's to do. Several words are joined with spaces.
-        #[arg(required = true)]
+        #[command(flatten)]
+        brief: Box<BriefArgs>,
+
+        /// What it's to do. Several words are joined with spaces. With --pr
+        /// or --issue, it can be left out: the task is to work on it.
+        #[arg(required_unless_present_any = ["pr", "issue"])]
         goal: Vec<String>,
 
         /// With --background, arguments for its `claude -p`, after `--`.
@@ -910,6 +918,66 @@ enum TasksCommand {
         /// The task, by its number, like t12, or its session's name.
         task: String,
     },
+    /// Open a background task in a terminal: Claude Code picks its
+    /// conversation up there, in its place and under its name, and its
+    /// task goes on in it. Prints the session's name.
+    Terminal {
+        /// The task, by its number, like t12, or its session's name.
+        task: String,
+    },
+}
+
+/// What a task carries beside its goal, for `crystal task` and `tasks
+/// new`.
+#[derive(clap::Args)]
+struct BriefArgs {
+    /// Something that has to hold before the task is done. Its agent is
+    /// told each one under its goal. Give it once for each.
+    #[arg(long, value_name = "CRITERION")]
+    accept: Vec<String>,
+
+    /// Acceptance criteria from a file, a line each: a list's `-` or `[ ]`
+    /// is taken off.
+    #[arg(long, value_name = "FILE")]
+    accept_file: Option<PathBuf>,
+
+    /// Work on this pull request (a merge request, on GitLab), by its
+    /// number: in its worktree, made if the project hasn't one. Its agent
+    /// is told to read it first.
+    #[arg(long, value_name = "NUMBER", conflicts_with = "worktree")]
+    pr: Option<u64>,
+
+    /// The issue it's for, by its number. Its agent is told to read it
+    /// first.
+    #[arg(long, value_name = "NUMBER")]
+    issue: Option<u64>,
+}
+
+impl From<BriefArgs> for work::Brief {
+    fn from(args: BriefArgs) -> work::Brief {
+        work::Brief {
+            accept: args.accept,
+            accept_file: args.accept_file,
+            pull_request: args.pr,
+            issue: args.issue,
+        }
+    }
+}
+
+/// Where a task runs and what it carries: in its pull request's worktree
+/// when it's on one, or else in `cwd` or a new worktree, as for a session.
+fn place_task(
+    socket: &Path,
+    cwd: Option<PathBuf>,
+    worktree: Option<NewWorktree>,
+    brief: BriefArgs,
+) -> Result<(PathBuf, protocol::TaskBrief)> {
+    let (brief, in_pull_request) = work::read_brief(socket, &here(cwd.clone())?, brief.into())?;
+    let dir = match in_pull_request {
+        Some(dir) => dir,
+        None => start_dir(socket, cwd, worktree)?,
+    };
+    Ok((dir, brief))
 }
 
 /// What an agent says it's doing with `crystal report`.
@@ -1547,18 +1615,20 @@ fn run(cli: Cli) -> Result<()> {
             base,
             wait,
             timeout,
+            brief,
             prompt,
             claude_args,
         } => {
+            let worktree = NewWorktree::from_args(worktree, base);
+            let (cwd, brief) = place_task(&socket, cwd, worktree, brief)?;
             let spec = TaskSpec {
-                prompt: prompt.join(" "),
+                prompt: work::goal(&prompt, &brief)?,
                 args: claude_args,
             };
-            let cwd = start_dir(&socket, cwd, NewWorktree::from_args(worktree, base))?;
-            let name = client::new_task(&socket, name, cwd, spec, None)?.name;
+            let name = client::new_task(&socket, name, cwd, spec, None, brief)?.name;
             println!("{name}");
             if wait {
-                drive::wait_for_turn(&socket, &name, seconds(timeout))?;
+                drive::wait_for_run(&socket, &name, seconds(timeout))?;
             }
         }
         Command::Flow { json, command } => flow(&socket, json, command)?,
@@ -1952,7 +2022,7 @@ fn new_session(socket: &Path, new: NewArgs) -> Result<()> {
     };
     let purpose = client::Purpose {
         task,
-        backlog: None,
+        ..client::Purpose::default()
     };
     let name = client::new_session_with(socket, name, cwd, command, purpose, &env)?.name;
     attach_or_print(socket, &name, detached)
@@ -2040,16 +2110,20 @@ fn tasks(
             base,
             background,
             no_launch,
+            brief,
             goal,
             claude_args,
         }) => {
+            let worktree = NewWorktree::from_args(worktree, base);
+            let (cwd, brief) = place_task(socket, cwd, worktree, *brief)?;
             let task = work::NewTask {
-                goal: goal.join(" "),
-                cwd: start_dir(socket, cwd, NewWorktree::from_args(worktree, base))?,
+                goal: work::goal(&goal, &brief)?,
+                cwd,
                 name,
                 background,
                 claude_args,
                 launch: !no_launch,
+                brief,
             };
             work::new_task(socket, task)
         }
@@ -2057,6 +2131,7 @@ fn tasks(
         Some(TasksCommand::Show { task, json }) => work::show_task(socket, &task, json),
         Some(TasksCommand::Cancel { task }) => work::cancel_task(socket, &task),
         Some(TasksCommand::Log { task }) => work::task_log(socket, &task),
+        Some(TasksCommand::Terminal { task }) => work::task_to_terminal(socket, &task),
     }
 }
 

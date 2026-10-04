@@ -580,8 +580,9 @@ impl Default for MemorySettings {
     }
 }
 
-/// What background tasks may spend, in US dollars, by Claude's own count.
-/// 0 is no limit.
+/// What background tasks may spend, in US dollars, by Claude's own count,
+/// 0 being no limit; and what they may do without asking, unless a task's
+/// own arguments say otherwise.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct TaskSettings {
@@ -591,6 +592,59 @@ pub struct TaskSettings {
     /// The most every background task together may spend in a day: past
     /// it, no new run starts until tomorrow.
     pub daily_budget_usd: f64,
+    /// The permission mode each `claude -p` starts in, as
+    /// `--permission-mode`: one of [`TaskSettings::PERMISSION_MODES`].
+    /// `default` passes none, and Claude asks for what isn't allowed.
+    pub permission_mode: String,
+    /// Claude's permission rules every task has allowed, like `Bash(cargo
+    /// test:*)` or `Edit`, as `--allowedTools`, beside crystal's own.
+    pub allowed_tools: Vec<String>,
+    /// Whether `permission_mode` may be `bypassPermissions`, which turns
+    /// every check off for a task nobody is watching.
+    pub allow_bypass: bool,
+}
+
+impl TaskSettings {
+    /// The permission modes `permission_mode` takes: Claude Code's own,
+    /// but for `bypassPermissions`, which takes `allow_bypass` too.
+    pub const PERMISSION_MODES: [&'static str; 5] =
+        ["default", "acceptEdits", "auto", "dontAsk", "plan"];
+
+    /// The mode that turns every check off.
+    pub const BYPASS: &'static str = "bypassPermissions";
+
+    /// The permission mode to give `claude -p`: none for `default`.
+    pub fn permission_mode(&self) -> Option<&str> {
+        Some(self.permission_mode.as_str()).filter(|mode| *mode != "default")
+    }
+
+    /// Refuses a permission mode Claude doesn't know, rather than guess at
+    /// it, and bypassing the checks without `allow_bypass`.
+    fn check(&self) -> Result<()> {
+        let mode = self.permission_mode.as_str();
+        if mode == Self::BYPASS {
+            if !self.allow_bypass {
+                bail!(
+                    "[tasks] permission_mode = \"{mode}\" turns every check off for tasks \
+                     nobody watches: say `allow_bypass = true` too, if that's what you want"
+                );
+            }
+        } else if !Self::PERMISSION_MODES.contains(&mode) {
+            bail!(
+                "[tasks] permission_mode is \"{mode}\": it's one of {}, or {}",
+                Self::PERMISSION_MODES.join(", "),
+                Self::BYPASS
+            );
+        }
+        if let Some(blank) = self
+            .allowed_tools
+            .iter()
+            .find(|rule| rule.trim().is_empty())
+        {
+            bail!("[tasks] allowed_tools has an empty rule: {blank:?}");
+        }
+        Ok(())
+    }
 }
 
 impl Default for TaskSettings {
@@ -598,6 +652,9 @@ impl Default for TaskSettings {
         TaskSettings {
             max_budget_usd: 5.0,
             daily_budget_usd: 0.0,
+            permission_mode: "default".to_string(),
+            allowed_tools: Vec::new(),
+            allow_bypass: false,
         }
     }
 }
@@ -1105,6 +1162,7 @@ pub fn from_text(text: &str) -> Result<Config> {
         );
     }
     duration(&config.sessions.stop_idle_after).context("in [sessions], stop_idle_after")?;
+    config.tasks.check()?;
     Keymap::new(&config.keys).map_err(anyhow::Error::msg)?;
     if !SIDEBAR_WIDTHS.contains(&config.sidebar.width) {
         bail!(
@@ -1514,6 +1572,27 @@ back_to = "build"
     }
 
     #[test]
+    fn background_tasks_ask_for_what_isnt_allowed_unless_told() {
+        let config = Config::default();
+        assert_eq!(config.tasks.permission_mode(), None);
+        assert!(config.tasks.allowed_tools.is_empty());
+        let config =
+            parse("[tasks]\npermission_mode = \"acceptEdits\"\nallowed_tools = [\"Edit\"]\n")
+                .unwrap();
+        assert_eq!(config.tasks.permission_mode(), Some("acceptEdits"));
+        assert_eq!(config.tasks.allowed_tools, ["Edit"]);
+        let err = parse("[tasks]\npermission_mode = \"yolo\"\n").unwrap_err();
+        assert!(format!("{err:#}").contains("acceptEdits"), "{err:#}");
+        // Turning every check off takes saying so twice.
+        let bypass = "[tasks]\npermission_mode = \"bypassPermissions\"\n";
+        let err = parse(bypass).unwrap_err();
+        assert!(format!("{err:#}").contains("allow_bypass"), "{err:#}");
+        let config = parse(&format!("{bypass}allow_bypass = true\n")).unwrap();
+        assert_eq!(config.tasks.permission_mode(), Some("bypassPermissions"));
+        assert!(parse("[tasks]\nallowed_tools = [\" \"]\n").is_err());
+    }
+
+    #[test]
     fn notifications_come_at_once_whatever_has_the_focus_unless_told() {
         let config = Config::default();
         assert_eq!(config.notifications, NotifySettings::default());
@@ -1785,6 +1864,9 @@ back_to = "build"
             tasks: TaskSettings {
                 max_budget_usd: 2.5,
                 daily_budget_usd: 20.0,
+                permission_mode: "acceptEdits".into(),
+                allowed_tools: vec!["Bash(cargo test:*)".into(), "Edit".into()],
+                allow_bypass: false,
             },
             events: EventSettings { keep_days: 7 },
             handoff: HandoffSettings {

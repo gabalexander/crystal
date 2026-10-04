@@ -442,6 +442,7 @@ mod tests {
             line: None,
             bell: false,
             unseen_copies: 0,
+            context: None,
         }
     }
 
@@ -465,6 +466,7 @@ mod tests {
                 waiting: true,
                 created: 1,
                 outcome: None,
+                brief: Default::default(),
             }),
             ..session(name, Some(Activity::Waiting), changed)
         }

@@ -629,6 +629,11 @@ impl Session {
         task.result()
     }
 
+    /// Whether the session is a background task in the middle of a run.
+    pub fn in_a_run(&self) -> bool {
+        self.task.as_ref().is_some_and(Task::is_working)
+    }
+
     /// The background task this session runs, or why there's none.
     fn background(&self) -> Result<&Task> {
         let name = &self.name;
@@ -656,14 +661,12 @@ impl Session {
             .with_context(|| format!("{} can't be interrupted", self.name))
     }
 
-    /// A task started again after a restart: it says so, and waits at rest
-    /// for a follow-up, which carries its conversation on.
+    /// A task started again after a restart: its screen shows what it did
+    /// before, from Claude Code's transcript of its conversation, and it
+    /// waits at rest for a follow-up, which carries its conversation on.
     pub fn came_back(&mut self) {
         if let Some(task) = &self.task {
-            task.note(
-                "crystal restarted, and what this task showed before is gone. \
-                 `crystal send` carries its conversation on.",
-            );
+            task.draw_kept();
             self.on_agent_event(AgentEvent::Started);
         }
     }
@@ -710,6 +713,7 @@ impl Session {
             session_state: Some(self.state.lock().unwrap().clone()),
             asking: self.task.as_ref().and_then(Task::asking),
             cost_usd: self.task.as_ref().map(Task::cost_usd),
+            context: self.task.as_ref().and_then(Task::context),
         })
     }
 
@@ -779,6 +783,7 @@ impl Session {
             created: goal.created,
             outcome: goal.outcome.clone(),
             artifacts: Vec::new(),
+            brief: goal.brief.clone(),
         })
     }
 
@@ -878,6 +883,7 @@ impl Session {
             stopped_idle: self.stopped_idle,
             bell: self.bell,
             unseen_copies: self.unseen_copies,
+            context: self.task.as_ref().and_then(Task::context),
         }
     }
 
@@ -2119,6 +2125,7 @@ mod tests {
             waiting: true,
             created: 1,
             outcome: None,
+            brief: Default::default(),
         };
         // What its agent put on its row, for a while yet.
         let mut shown = report::Shown::default();
@@ -2222,6 +2229,7 @@ mod tests {
                 waiting: false,
                 created: 1,
                 outcome: None,
+                brief: Default::default(),
             }),
             resume: None,
         }

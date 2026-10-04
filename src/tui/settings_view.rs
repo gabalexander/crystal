@@ -10,7 +10,7 @@
 
 use super::appearance::Appearance;
 use super::theme::{self, Theme};
-use crate::config::{BarPosition, Config, SessionSettings, ThemeName};
+use crate::config::{BarPosition, Config, SessionSettings, TaskSettings, ThemeName};
 use crate::embed::Status;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
@@ -48,6 +48,7 @@ pub enum Setting {
     ScrollLines,
     Scrollbars,
     ProgramsCopy,
+    TaskPermissions,
     Distill,
     Embeddings,
     HideDrafts,
@@ -78,6 +79,9 @@ pub enum Change {
     ScrollLines(u16),
     Scrollbars(bool),
     ProgramsCopy(bool),
+    /// The permission mode background tasks start in, one of
+    /// [`TaskSettings::PERMISSION_MODES`].
+    TaskPermissions(&'static str),
     Distill(bool),
     Embeddings(bool),
     HideDrafts(bool),
@@ -102,6 +106,7 @@ impl Change {
             Change::ScrollLines(_) => &["mouse", "scroll_lines"],
             Change::Scrollbars(_) => &["mouse", "scrollbars"],
             Change::ProgramsCopy(_) => &["clipboard", "allow_programs"],
+            Change::TaskPermissions(_) => &["tasks", "permission_mode"],
             Change::Distill(_) => &["memory", "distill"],
             Change::Embeddings(_) => &["memory", "embeddings"],
             Change::HideDrafts(_) => &["forge", "hide_draft_prs"],
@@ -129,7 +134,7 @@ impl Change {
                 i64::try_from(secs).unwrap_or(i64::MAX).into()
             }
             Change::Theme(theme) => theme.name().into(),
-            Change::StopIdle(after) => after.into(),
+            Change::StopIdle(after) | Change::TaskPermissions(after) => after.into(),
         }
     }
 }
@@ -201,7 +206,7 @@ pub enum Outcome {
 }
 
 /// The settings the bar can be on, in the order they're listed.
-const SETTINGS: [Setting; 18] = [
+const SETTINGS: [Setting; 19] = [
     Setting::Notify,
     Setting::NotifyAfter,
     Setting::UnfocusedOnly,
@@ -217,6 +222,7 @@ const SETTINGS: [Setting; 18] = [
     Setting::ScrollLines,
     Setting::Scrollbars,
     Setting::ProgramsCopy,
+    Setting::TaskPermissions,
     Setting::Distill,
     Setting::Embeddings,
     Setting::HideDrafts,
@@ -339,6 +345,19 @@ impl SettingsView {
             }
             Setting::Scrollbars => Change::Scrollbars(!config.mouse.scrollbars),
             Setting::ProgramsCopy => Change::ProgramsCopy(!config.clipboard.allow_programs),
+            Setting::TaskPermissions => {
+                let modes = TaskSettings::PERMISSION_MODES;
+                let now = &config.tasks.permission_mode;
+                // One the list doesn't have, like bypassing the checks,
+                // goes on to the first.
+                let at = modes.iter().position(|mode| mode == now);
+                let next = match (at, forward) {
+                    (Some(at), true) => (at + 1) % modes.len(),
+                    (Some(at), false) => (at + modes.len() - 1) % modes.len(),
+                    (None, _) => 0,
+                };
+                Change::TaskPermissions(modes[next])
+            }
             Setting::Distill => Change::Distill(!config.memory.distill),
             Setting::Embeddings => Change::Embeddings(!config.memory.embeddings),
             Setting::HideDrafts => Change::HideDrafts(!config.forge.hide_draft_prs),
@@ -490,6 +509,7 @@ fn lines(view: &SettingsView, theme: &Theme) -> Vec<Line<'static>> {
             Setting::ScrollLines => "wheel scrolls",
             Setting::Scrollbars => "scrollbars",
             Setting::ProgramsCopy => "programs copy",
+            Setting::TaskPermissions => "permission mode",
             Setting::Distill => "distill closed tasks",
             Setting::Embeddings => "search by meaning",
             Setting::HideDrafts => "hide drafts",
@@ -665,6 +685,21 @@ fn lines(view: &SettingsView, theme: &Theme) -> Vec<Line<'static>> {
         Some(programs),
         on_off(programs),
         "what Claude Code, vim or tmux copy (OSC 52)".to_string(),
+    ));
+
+    lines.push(Line::from(""));
+    lines.push(Line::styled("Background tasks", bold));
+    let tasks = &config.tasks;
+    let rules = match tasks.allowed_tools.len() {
+        0 => "what they may do without asking: ←/→".to_string(),
+        1 => "and the rule in [tasks] allowed_tools: ←/→".to_string(),
+        rules => format!("and the {rules} rules in [tasks] allowed_tools: ←/→"),
+    };
+    lines.push(row(
+        Setting::TaskPermissions,
+        None,
+        tasks.permission_mode.clone(),
+        rules,
     ));
 
     lines.push(Line::from(""));
@@ -864,6 +899,15 @@ mod tests {
         );
         press(&mut view, KeyCode::Down);
         assert_eq!(
+            press(&mut view, KeyCode::Right),
+            Outcome::Change(Change::TaskPermissions("acceptEdits"))
+        );
+        assert_eq!(
+            press(&mut view, KeyCode::Left),
+            Outcome::Change(Change::TaskPermissions("plan"))
+        );
+        press(&mut view, KeyCode::Down);
+        assert_eq!(
             press(&mut view, KeyCode::Char(' ')),
             Outcome::Change(Change::Distill(false))
         );
@@ -1034,6 +1078,14 @@ mod tests {
         assert_eq!(
             Change::ProgramsCopy(false).keys(),
             ["clipboard", "allow_programs"]
+        );
+        assert_eq!(
+            Change::TaskPermissions("plan").keys(),
+            ["tasks", "permission_mode"]
+        );
+        assert_eq!(
+            Change::TaskPermissions("plan").value().as_str(),
+            Some("plan")
         );
     }
 

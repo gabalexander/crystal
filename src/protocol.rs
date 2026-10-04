@@ -162,6 +162,13 @@ pub enum Request {
     Interrupt {
         task: String,
     },
+    /// Turn a background task, by its number or its session's name, into a
+    /// session in a terminal: Claude Code, picking its conversation up, its
+    /// task carried on, from the client's environment.
+    TaskToTerminal {
+        task: String,
+        env: BTreeMap<String, String>,
+    },
     /// What background tasks have spent today, and the daily budget.
     Spending,
     /// Close a session's task, done or failed. A program in a session says
@@ -413,6 +420,11 @@ pub struct NewSession {
     /// The backlog item the task is for, which closing it done ticks.
     #[serde(default)]
     pub backlog: Option<u64>,
+    /// What the task carries beside its goal: its acceptance criteria,
+    /// which the daemon adds to the agent's first prompt, and the pull
+    /// request and issue it's about.
+    #[serde(flatten)]
+    pub brief: TaskBrief,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -427,6 +439,9 @@ pub struct NewTask {
     /// The backlog item the task is for, which closing it done ticks.
     #[serde(default)]
     pub backlog: Option<u64>,
+    /// What the task carries beside its prompt, as for a session.
+    #[serde(flatten)]
+    pub brief: TaskBrief,
 }
 
 /// A task made to start later: what it's to do, where, and how it starts.
@@ -447,6 +462,8 @@ pub struct PendingTask {
     /// When it was made, in seconds since the Unix epoch.
     #[serde(default)]
     pub created: u64,
+    #[serde(flatten)]
+    pub brief: TaskBrief,
 }
 
 /// How a task starts.
@@ -665,6 +682,48 @@ pub struct SessionInfo {
     /// settings allow: it starts again in its conversation.
     #[serde(default)]
     pub stopped_idle: bool,
+    /// How full a background task's conversation is, once Claude has said.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<ContextUse>,
+}
+
+/// How full a conversation's context is: the tokens the model was given for
+/// its last message, of the most its model takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextUse {
+    pub tokens: u64,
+    pub window: u64,
+}
+
+impl ContextUse {
+    /// How full it is, in percent, rounded to the nearest.
+    pub fn percent(self) -> u64 {
+        if self.window == 0 {
+            return 0;
+        }
+        (self.tokens * 100 + self.window / 2) / self.window
+    }
+
+    /// As a person reads it: `24k of 200k tokens, 12%`.
+    pub fn words(self) -> String {
+        format!(
+            "{} of {} tokens, {}%",
+            thousands(self.tokens),
+            thousands(self.window),
+            self.percent()
+        )
+    }
+}
+
+/// A count of tokens, in thousands once it's past a thousand, or millions
+/// past a million: `850`, `24k`, `1M`.
+fn thousands(count: u64) -> String {
+    match count {
+        0..1_000 => count.to_string(),
+        1_000..1_000_000 => format!("{}k", (count + 500) / 1_000),
+        _ if count.is_multiple_of(1_000_000) => format!("{}M", count / 1_000_000),
+        _ => format!("{:.1}M", count as f64 / 1_000_000.0),
+    }
 }
 
 /// A subagent an agent started, as its hooks name it: its id, and its
@@ -885,6 +944,8 @@ pub struct TaskInfo {
     /// `None` while the task is open.
     #[serde(default)]
     pub outcome: Option<TaskOutcome>,
+    #[serde(flatten)]
+    pub brief: TaskBrief,
 }
 
 impl TaskInfo {
@@ -899,6 +960,41 @@ impl TaskInfo {
     pub fn is_open(&self) -> bool {
         self.outcome.is_none()
     }
+}
+
+/// What a task carries beside its goal: what has to hold before it's done,
+/// and the pull request and the issue it's about, on its project's forge.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskBrief {
+    /// Its acceptance criteria, each one a line, which its agent is told
+    /// under its goal.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accept: Vec<String>,
+    /// The pull request it works on, in whose worktree it runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pull_request: Option<Box<ForgeLink>>,
+    /// The issue it's for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issue: Option<Box<ForgeLink>>,
+}
+
+impl TaskBrief {
+    pub fn is_empty(&self) -> bool {
+        self.accept.is_empty() && self.pull_request.is_none() && self.issue.is_none()
+    }
+}
+
+/// A pull request or an issue a task is about: which forge it's on, its
+/// number, title and address, and for a pull request, the branch its
+/// worktree is on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForgeLink {
+    pub forge: crate::forge::Forge,
+    pub number: u64,
+    pub title: String,
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
 }
 
 /// How a task went, once it's closed.
@@ -997,6 +1093,8 @@ pub struct TaskRecord {
     /// The files kept with it as it closed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub artifacts: Vec<Artifact>,
+    #[serde(flatten)]
+    pub brief: TaskBrief,
 }
 
 impl TaskRecord {
@@ -1026,6 +1124,9 @@ pub struct TaskView {
     /// What a background task has cost so far, in US dollars.
     #[serde(default)]
     pub cost_usd: Option<f64>,
+    /// How full a background task's conversation is, once Claude has said.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<ContextUse>,
 }
 
 impl TaskView {
@@ -1037,6 +1138,7 @@ impl TaskView {
             session_state: None,
             asking: None,
             cost_usd: None,
+            context: None,
         }
     }
 }
@@ -1435,6 +1537,27 @@ pub fn recv_frame(mut input: impl Read) -> io::Result<Option<Frame>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_context_meter_reads_in_thousands_and_percent() {
+        let used = ContextUse {
+            tokens: 24_400,
+            window: 200_000,
+        };
+        assert_eq!(used.percent(), 12);
+        assert_eq!(used.words(), "24k of 200k tokens, 12%");
+        let big = ContextUse {
+            tokens: 850,
+            window: 1_000_000,
+        };
+        assert_eq!(big.words(), "850 of 1M tokens, 0%");
+        assert_eq!(thousands(1_500_000), "1.5M");
+        let none = ContextUse {
+            tokens: 1,
+            window: 0,
+        };
+        assert_eq!(none.percent(), 0);
+    }
 
     #[test]
     fn a_conversation_resumes_only_once_its_transcript_exists() {

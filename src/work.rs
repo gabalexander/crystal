@@ -14,8 +14,8 @@ use crate::env;
 use crate::forge;
 use crate::handoff;
 use crate::protocol::{
-    BacklogItem, PendingTask, Request, Response, State, TaskSpec, TaskStart, TaskState, TaskView,
-    task_label,
+    BacklogItem, ForgeLink, PendingTask, Request, Response, State, TaskBrief, TaskSpec, TaskStart,
+    TaskState, TaskView, task_label,
 };
 use crate::shell;
 use crate::tasks;
@@ -92,6 +92,91 @@ pub fn list_tasks(socket: &Path, dir: PathBuf, all: bool, json: bool) -> Result<
     Ok(())
 }
 
+/// What a task is to carry beside its goal, as the command line says it:
+/// its acceptance criteria, given one by one or in a file, and the pull
+/// request and the issue it's about, by their numbers.
+#[derive(Debug, Default)]
+pub struct Brief {
+    pub accept: Vec<String>,
+    pub accept_file: Option<PathBuf>,
+    pub pull_request: Option<u64>,
+    pub issue: Option<u64>,
+}
+
+/// Reads `brief` for a task in the project `dir` is in: its criteria, and
+/// what the forge says of its pull request and issue. A task on a pull
+/// request runs in that pull request's worktree, the project's own on its
+/// branch or else one made for it, its commits fetched, which comes back
+/// with it.
+pub fn read_brief(socket: &Path, dir: &Path, brief: Brief) -> Result<(TaskBrief, Option<PathBuf>)> {
+    let Brief {
+        mut accept,
+        accept_file,
+        pull_request,
+        issue,
+    } = brief;
+    if let Some(file) = &accept_file {
+        let text = std::fs::read_to_string(file)
+            .with_context(|| format!("couldn't read {}", file.display()))?;
+        accept.extend(tasks::criteria_in(&text));
+    }
+    let mut read = TaskBrief {
+        accept: tasks::criteria(accept)?,
+        ..TaskBrief::default()
+    };
+    // Neither asks the forge anything.
+    if pull_request.is_none() && issue.is_none() {
+        return Ok((read, None));
+    }
+    let config = settings();
+    if !forge::enabled(&config) {
+        bail!(
+            "--pr and --issue ask the forge, which is the github plugin: {}",
+            crate::plugins::off("github")
+        );
+    }
+    let project = crate::project::of(dir).path;
+    let repo = forge::Repo::find(&project).map_err(anyhow::Error::msg)?;
+    let mut worktree = None;
+    if let Some(number) = pull_request {
+        let found = repo
+            .listed_pull_request(number)
+            .map_err(anyhow::Error::msg)?;
+        worktree = Some(client::pull_request_worktree(
+            socket,
+            &found.checkout(&project),
+        )?);
+        read.pull_request = Some(Box::new(ForgeLink {
+            forge: repo.forge,
+            number,
+            title: found.title,
+            url: found.url,
+            branch: Some(found.local_branch),
+        }));
+    }
+    if let Some(number) = issue {
+        let found = repo.listed_issue(number).map_err(anyhow::Error::msg)?;
+        read.issue = Some(Box::new(ForgeLink {
+            forge: repo.forge,
+            number,
+            title: found.title,
+            url: found.url,
+            branch: None,
+        }));
+    }
+    Ok((read, worktree))
+}
+
+/// A task's goal: the words given, or for a task on a pull request or an
+/// issue given none, to work on it.
+pub fn goal(words: &[String], brief: &TaskBrief) -> Result<String> {
+    let said = words.join(" ");
+    if !said.trim().is_empty() {
+        return Ok(said);
+    }
+    tasks::goal_for(brief).context("say what it's to do")
+}
+
 /// A task to make with `crystal tasks new`.
 pub struct NewTask {
     pub goal: String,
@@ -105,6 +190,7 @@ pub struct NewTask {
     pub claude_args: Vec<String>,
     /// Start it now, rather than leave it waiting to start.
     pub launch: bool,
+    pub brief: TaskBrief,
 }
 
 /// Makes a task, and starts it, unless it's to wait. Prints its number.
@@ -118,6 +204,7 @@ pub fn new_task(socket: &Path, task: NewTask) -> Result<()> {
         background,
         claude_args,
         launch,
+        brief,
     } = task;
     let start = if background {
         TaskStart::Background { args: claude_args }
@@ -135,6 +222,7 @@ pub fn new_task(socket: &Path, task: NewTask) -> Result<()> {
             start,
             backlog: None,
             created: 0,
+            brief,
         };
         let id = client::add_task(socket, pending)?;
         println!("{}", task_label(Some(id)));
@@ -145,12 +233,13 @@ pub fn new_task(socket: &Path, task: NewTask) -> Result<()> {
             let purpose = Purpose {
                 task: Some(goal),
                 backlog: None,
+                brief,
             };
             client::new_session_for(socket, name, cwd, command, purpose)?
         }
         TaskStart::Background { args } => {
             let spec = TaskSpec { prompt: goal, args };
-            client::new_task(socket, name, cwd, spec, None)?
+            client::new_task(socket, name, cwd, spec, None, brief)?
         }
     };
     println!("{}", task_label(started.task));
@@ -193,6 +282,21 @@ pub fn cancel_task(socket: &Path, task: &str) -> Result<()> {
         task: task.to_string(),
     };
     expect_done(client::ask(socket, &request, false)?, socket)
+}
+
+/// Opens a background task, by its number or its session's name, in a
+/// terminal, and prints its session's name. A background task runs with
+/// the tasks plugin off too, so this does.
+pub fn task_to_terminal(socket: &Path, task: &str) -> Result<()> {
+    let request = Request::TaskToTerminal {
+        task: task.to_string(),
+        env: env::current(),
+    };
+    let Response::Created { name, .. } = ask_running(socket, &request)? else {
+        bail!("the daemon didn't open it in a terminal");
+    };
+    println!("{name}");
+    Ok(())
 }
 
 /// Prints what happened to a task: how it stands, then its session's
@@ -276,6 +380,9 @@ fn task_card(task: &TaskView, now: u64) -> String {
         (false, _) => "in a terminal".to_string(),
     };
     line("runs", how);
+    if let Some(context) = task.context {
+        line("context", context.words());
+    }
     if let Some(asking) = &task.asking {
         let handle = if record.id.is_some() {
             &label
@@ -292,6 +399,25 @@ fn task_card(task: &TaskView, now: u64) -> String {
     }
     if let Some(number) = record.backlog {
         line("backlog", format!("#{number}"));
+    }
+    let brief = &record.brief;
+    if let Some(pull_request) = &brief.pull_request {
+        let forge = pull_request.forge;
+        let label = match forge {
+            forge::Forge::GitHub => "pr",
+            forge::Forge::GitLab => "mr",
+        };
+        line(
+            label,
+            forge_line(&forge.label(pull_request.number), pull_request),
+        );
+    }
+    if let Some(issue) = &brief.issue {
+        line("issue", forge_line(&format!("#{}", issue.number), issue));
+    }
+    for (index, criterion) in brief.accept.iter().enumerate() {
+        let label = if index == 0 { "accept" } else { "" };
+        line(label, criterion.clone());
     }
     if record.created > 0 {
         line("made", when(record.created, now));
@@ -326,6 +452,12 @@ fn task_card(task: &TaskView, now: u64) -> String {
         }
     }
     card
+}
+
+/// A pull request or an issue on a task's card: its number as `label`,
+/// its title and where it is.
+fn forge_line(label: &str, link: &ForgeLink) -> String {
+    format!("{label} {} · {}", link.title, link.url)
 }
 
 /// How long ago `then` was, at `now`: `just now`, `5m ago`.
@@ -438,6 +570,7 @@ pub fn start_from_backlog(
     let purpose = Purpose {
         task: Some(item.text.clone()),
         backlog: Some(number),
+        ..Purpose::default()
     };
     Ok(client::new_session_for(socket, name, cwd, command, purpose)?.name)
 }
@@ -511,6 +644,7 @@ mod tests {
             created: 100,
             outcome: outcome.map(|(state, summary)| TaskOutcome::new(state, summary, 1000)),
             artifacts: Vec::new(),
+            brief: Default::default(),
         })
     }
 
@@ -574,6 +708,47 @@ mod tests {
         let card = task_card(&cancelled, 1000);
         assert!(card.contains("  session   claude, gone\n"), "{card}");
         assert!(card.contains("closed    just now, cancelled: cancelled by the user"));
+    }
+
+    #[test]
+    fn a_card_says_what_a_task_is_about_what_it_must_meet_and_how_full_it_is() {
+        let mut about = task(9, "fix the login", None);
+        about.record.background = true;
+        about.context = Some(crate::protocol::ContextUse {
+            tokens: 24_000,
+            window: 200_000,
+        });
+        let link = |number, kind: &str| {
+            Box::new(ForgeLink {
+                forge: forge::Forge::GitHub,
+                number,
+                title: "Login loops".into(),
+                url: format!("https://github.com/acme/app/{kind}/{number}"),
+                branch: None,
+            })
+        };
+        about.record.brief = TaskBrief {
+            accept: vec!["the tests pass".into(), "no redirect loop".into()],
+            pull_request: Some(link(57, "pull")),
+            issue: Some(link(7, "issues")),
+        };
+        let card = task_card(&about, 160);
+        assert!(
+            card.contains("  context   24k of 200k tokens, 12%\n"),
+            "{card}"
+        );
+        assert!(
+            card.contains("  pr        #57 Login loops · https://github.com/acme/app/pull/57\n"),
+            "{card}"
+        );
+        assert!(
+            card.contains("  issue     #7 Login loops · https://github.com/acme/app/issues/7\n"),
+            "{card}"
+        );
+        assert!(
+            card.contains("  accept    the tests pass\n            no redirect loop\n"),
+            "{card}"
+        );
     }
 
     #[test]
