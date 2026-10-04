@@ -933,7 +933,7 @@ impl Event {
                         "{} ({}) {}",
                         entry.id,
                         entry.kind,
-                        memory::one_line(&entry.text)
+                        memory::title(&entry.text)
                     )
                 })
             }
@@ -1077,6 +1077,7 @@ pub fn example(kind: Kind, session: Option<&SessionInfo>, dir: &Path) -> Event {
     let item = BacklogItem {
         number: 1,
         text: "Retry the webhook on a timeout".into(),
+        body: String::new(),
         tags: Vec::new(),
         done: kind == Kind::BacklogClosed,
         created: now,

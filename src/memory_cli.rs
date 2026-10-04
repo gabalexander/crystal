@@ -8,7 +8,9 @@ use crate::embed::{self, Models};
 use crate::env;
 use crate::events::{self, Event};
 use crate::git::Checkout;
-use crate::memory::{self, Added, Entry, Freshness, Kind, Listed, Memory, New, Source, Store};
+use crate::memory::{
+    self, Added, Entry, Forgotten, Freshness, Kind, Listed, Memory, New, Source, Store, Wanted,
+};
 use crate::printable;
 use crate::protocol::{Request, Response};
 use crate::tui::sidebar::ago;
@@ -18,25 +20,31 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 /// Remembers `text` for the project `dir` is in (the current directory
-/// without one), about `files`, and says which entry it is.
+/// without one), about `files`, under `title` if it's given, and says which
+/// entry it is.
 pub fn remember(
     socket: &Path,
     dir: Option<PathBuf>,
     kind: Kind,
     files: Vec<String>,
+    title: Option<String>,
     text: &str,
 ) -> Result<()> {
     check_on()?;
+    let text = match title {
+        Some(title) => memory::titled(&title, text)?,
+        None => text.to_string(),
+    };
     let dir = dir_or_current(dir)?;
     let project = memory::project_of(&dir);
-    let top = Checkout::find(&dir).map_or_else(|| dir.clone(), |c| c.worktree().path);
+    let top = top_of(&dir);
     let files = files
         .iter()
         .map(|file| from_top(file, &dir, &top))
         .collect();
     let new = New {
         kind,
-        text: text.to_string(),
+        text,
         files,
         source: source(socket),
         checkout: Some(top),
@@ -55,10 +63,34 @@ pub fn remember(
     Ok(())
 }
 
-/// Prints the project's memory, newest first.
-pub fn list(socket: &Path, dir: Option<PathBuf>) -> Result<()> {
+/// Prints the project's memory, newest first: of `kind` alone if it's
+/// given, or with `forgotten`, what was forgotten instead, the latest
+/// forgotten first.
+pub fn list(
+    socket: &Path,
+    dir: Option<PathBuf>,
+    kind: Option<Kind>,
+    forgotten: bool,
+) -> Result<()> {
+    if forgotten {
+        check_on()?;
+        let project = memory::project_of(&dir_or_current(dir)?);
+        let forgotten = Store::open(socket)?.forgotten(&project)?;
+        let forgotten = forgotten
+            .iter()
+            .filter(|entry| kind.is_none_or(|kind| entry.kind == kind));
+        for entry in forgotten {
+            println!("{}", printable::line(&forgotten_line(entry, now())));
+        }
+        return Ok(());
+    }
     let memory = read(socket, dir)?;
-    print_entries(&memory.listed().iter().collect::<Vec<_>>());
+    let listed = memory.listed();
+    let listed: Vec<&Listed> = listed
+        .iter()
+        .filter(|item| kind.is_none_or(|kind| item.entry.kind == kind))
+        .collect();
+    print_entries(&listed);
     Ok(())
 }
 
@@ -84,8 +116,25 @@ pub fn export(socket: &Path, dir: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-/// Prints the entries that have to do with `words`, the best first.
-pub fn search(socket: &Path, dir: Option<PathBuf>, words: &[String]) -> Result<()> {
+/// What `crystal memory search` keeps to besides its words.
+#[derive(Debug, Default)]
+pub struct SearchArgs {
+    pub kind: Option<Kind>,
+    /// Files or directories, as given from the current directory.
+    pub files: Vec<String>,
+    /// Stale entries too.
+    pub all: bool,
+    pub limit: Option<usize>,
+}
+
+/// Prints the entries that have to do with `words`, the best first, as
+/// `args` says: those that are stale left out, unless it says all.
+pub fn search(
+    socket: &Path,
+    dir: Option<PathBuf>,
+    words: &[String],
+    args: SearchArgs,
+) -> Result<()> {
     check_on()?;
     let dir = dir_or_current(dir)?;
     let settings = Config::load()?.memory;
@@ -96,27 +145,31 @@ pub fn search(socket: &Path, dir: Option<PathBuf>, words: &[String]) -> Result<(
              alone: the daemon gets them as it starts, or `crystal memory embed` does now"
         );
     }
-    let found = found(socket, &dir, &words.join(" "), None, memory::SEARCH_LIMIT)?;
+    let top = top_of(&dir);
+    let wanted = Wanted {
+        kind: args.kind,
+        files: args
+            .files
+            .iter()
+            .map(|file| from_top(file, &dir, &top))
+            .collect(),
+        fresh: !args.all,
+        limit: args.limit.unwrap_or(memory::SEARCH_LIMIT).max(1),
+    };
+    let found = found(socket, &dir, &words.join(" "), &wanted)?;
     print_entries(&found.iter().collect::<Vec<_>>());
     Ok(())
 }
 
 /// The entries of the memory of the project `dir` is in that have to do
-/// with `query`, of `kind` if it's given, the best first: searched by the
-/// daemon, which keeps the model that searches by meaning loaded, or here,
-/// when there's no daemon to ask.
-pub fn found(
-    socket: &Path,
-    dir: &Path,
-    query: &str,
-    kind: Option<Kind>,
-    limit: usize,
-) -> Result<Vec<Listed>> {
+/// with `query`, as `wanted` says, the best first: searched by the daemon,
+/// which keeps the model that searches by meaning loaded, or here, when
+/// there's no daemon to ask.
+pub fn found(socket: &Path, dir: &Path, query: &str, wanted: &Wanted) -> Result<Vec<Listed>> {
     let request = Request::SearchMemory {
         dir: dir.to_path_buf(),
         query: query.to_string(),
-        kind,
-        limit,
+        wanted: wanted.clone(),
     };
     if let Ok(Some(Response::Memory { entries })) = client::ask(socket, &request, false) {
         return Ok(entries);
@@ -124,8 +177,7 @@ pub fn found(
     let project = memory::project_of(dir);
     let embedder = embed::shared_now();
     let mut store = Store::open(socket)?;
-    let found = store.search(&project, query, kind, limit, embed::as_embed(&embedder))?;
-    Ok(memory::marked(found, &project))
+    store.find(&project, query, wanted, embed::as_embed(&embedder))
 }
 
 pub fn remove(socket: &Path, dir: Option<PathBuf>, id: u64) -> Result<()> {
@@ -240,6 +292,11 @@ fn source(socket: &Path) -> Source {
     }
 }
 
+/// The top of the worktree `dir` is in, or `dir` itself outside git.
+fn top_of(dir: &Path) -> PathBuf {
+    Checkout::find(dir).map_or_else(|| dir.to_path_buf(), |c| c.worktree().path)
+}
+
 /// `file`, given from `dir`, from `top`, the top of its worktree: the same
 /// in every worktree of the project. A file outside the worktree stays as
 /// it was given.
@@ -270,12 +327,29 @@ fn print_entries(entries: &[&Listed]) {
             entry.id,
             entry.kind.to_string(),
             ago(entry.created, now),
-            entry.text.split_whitespace().collect::<Vec<_>>().join(" "),
+            memory::title(&entry.text),
         );
         // Its text is kept clean, but not its files, nor what was kept
         // before that.
         println!("{}", printable::line(&line));
     }
+}
+
+/// A forgotten entry on one line: the id it had, its kind, how long ago it
+/// was forgotten, its title and its files.
+fn forgotten_line(entry: &Forgotten, now: u64) -> String {
+    let files = if entry.files.is_empty() {
+        String::new()
+    } else {
+        format!("  ({})", entry.files.join(", "))
+    };
+    format!(
+        "{:>4}  {:<8}  {:>4}  {}{files}",
+        entry.id,
+        entry.kind.to_string(),
+        ago(entry.forgotten, now),
+        memory::title(&entry.text),
+    )
 }
 
 /// An entry in full, as `crystal memory show` and the `memory_show` tool

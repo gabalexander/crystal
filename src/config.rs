@@ -562,8 +562,9 @@ impl Default for SoundSettings {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MemorySettings {
-    /// Once a task has closed, have a model read what it did and keep what
-    /// a later session would need to know: see [`crate::distill`].
+    /// Once a task has closed, or a session is archived, have a model read
+    /// what it did and keep what a later session would need to know: see
+    /// [`crate::distill`].
     pub distill: bool,
     /// The model that does it, as `claude --model` takes it.
     pub distill_model: String,

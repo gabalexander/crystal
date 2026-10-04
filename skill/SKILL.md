@@ -166,12 +166,16 @@ your task, put it there rather than into your change:
 
 ```sh
 crystal backlog add "Retry the webhook on a timeout" -t payments   # prints its number, like #4
-crystal backlog                   # what's to do
+crystal backlog add "Retry the webhook" -b "On a timeout only, not a 4xx."   # more than a line: a body
+crystal backlog                   # what's to do; -t payments for one tag's
+crystal backlog show 4            # one item: its body, and the tasks started for it and how they went
+crystal backlog edit 4 -b "Twice, then give up"   # its line, -b its body, -t its tags
 crystal backlog done 4            # tick it off; reopen 4 or rm 4 undo it
 crystal backlog start 4 -w -d     # an agent on #4 in a new worktree; closing its task done ticks #4
 ```
 
-Every command works on the current directory's project; `-C <dir>` names another.
+Every command works on the current directory's project; `-C <dir>` names another. `backlog start` takes `-p
+<profile>`, `--pr <number>` to work in a pull request's worktree, and `--background` for `claude -p`.
 
 ## Statuses
 
@@ -264,7 +268,9 @@ their prompt. Add to it when you find something the next session would otherwise
 
 ```sh
 crystal remember -k gotcha -f tests/ledger.rs "The ledger tests need the database up: make db"
+crystal remember -k decision --title "Fees are kept in cents" "A float loses a cent in a refund."
 crystal memory search ledger
+crystal memory search ledger -k gotcha -f tests   # of a kind, about the files in tests/
 ```
 
 - `-k` is `decision`, `gotcha`, `command` or `note` (the default). Keep each entry to a sentence or two.
@@ -272,11 +278,13 @@ crystal memory search ledger
   once all of them have, stale.
 - Don't remember what the code, the git log or CLAUDE.md already says, or anything that only matters now.
 - `crystal memory search` matches any of its words, or a word they start or stem from, best first; with
-  search by meaning on, entries that mean the same count too, so a few plain words do.
+  search by meaning on, entries that mean the same count too, so a few plain words do. It leaves out stale
+  entries; `--all` brings them back.
+- An entry's first line is what lists show of it; `--title` gives it one of its own, over the rest.
 - In a Claude Code session crystal started, the `memory_search` and `memory_show` tools search the memory and
   read an entry by its id without a shell command; use them when you have them.
 - `crystal memory` lists every entry; `crystal memory show <id>` reads one in full; `crystal memory rm <id>`
-  forgets one that's wrong.
+  forgets one that's wrong, and `crystal memory list --forgotten` lists what was.
 - Once your task closes, a model reads what you did and keeps what it finds worth keeping, so remember what
   only you know, like why you chose something; it never repeats what's there already.
 - With memory turned off, these commands say "the memory plugin is off"; carry on without them.

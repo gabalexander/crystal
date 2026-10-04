@@ -66,6 +66,9 @@ const MAX_ANCHORED_BYTES: u64 = 8 * 1024 * 1024;
 /// The most entries a search gives back.
 pub const SEARCH_LIMIT: usize = 50;
 
+/// The longest a title of an entry's own may be, in characters: a line.
+const MAX_TITLE: usize = 120;
+
 /// The most words of a query that reach the index: a session's first
 /// prompt can be pages long, and its first few dozen words say what it's
 /// about.
@@ -187,6 +190,19 @@ ALTER TABLE entries ADD COLUMN anchors TEXT NOT NULL DEFAULT '{}';
 ALTER TABLE entries ADD COLUMN checkout TEXT;
 ";
 
+/// What each forgotten entry said, beside the hash of its words, for
+/// `crystal memory list --forgotten` to show: its id, kind, text and files,
+/// where it came from, and when it was forgotten. Those forgotten before
+/// have only their hash.
+const FORGOTTEN_ENTRIES: &str = "
+ALTER TABLE forgotten ADD COLUMN id INTEGER;
+ALTER TABLE forgotten ADD COLUMN kind TEXT;
+ALTER TABLE forgotten ADD COLUMN text TEXT;
+ALTER TABLE forgotten ADD COLUMN files TEXT NOT NULL DEFAULT '[]';
+ALTER TABLE forgotten ADD COLUMN source TEXT;
+ALTER TABLE forgotten ADD COLUMN forgot INTEGER;
+";
+
 /// What makes the database as it is now, a step for each version: a
 /// database at version `v`, kept in its `user_version`, takes the steps
 /// after the first `v`.
@@ -194,6 +210,7 @@ const MIGRATIONS: &[fn(&Connection) -> Result<()>] = &[
     |conn| Ok(conn.execute_batch(TABLES)?),
     |conn| Ok(conn.execute_batch(VECTORS)?),
     add_anchors,
+    |conn| Ok(conn.execute_batch(FORGOTTEN_ENTRIES)?),
 ];
 
 /// The columns [`entry_of`] reads, in its order.
@@ -268,16 +285,37 @@ enum Kinds {
     Lasting,
 }
 
-impl Kinds {
-    /// The kind it keeps to and the kind it leaves out, as the SQL's
-    /// parameters, `NULL` for none.
-    fn params(self) -> (Option<String>, Option<String>) {
-        match self {
+/// The entries a search looks among: those of `kinds`, and with `files`,
+/// only those about one of them or about a file under one of them.
+#[derive(Debug, Clone, Copy)]
+struct Among<'a> {
+    kinds: Kinds,
+    files: &'a [String],
+}
+
+impl Among<'_> {
+    /// The kind it keeps to, the kind it leaves out and the files it keeps
+    /// to, as JSON, as the SQL's parameters, `NULL` for none.
+    fn params(self) -> (Option<String>, Option<String>, Option<String>) {
+        let (only, but) = match self.kinds {
             Kinds::All => (None, None),
             Kinds::Only(kind) => (Some(kind.to_string()), None),
             Kinds::Lasting => (None, Some(Kind::Outcome.to_string())),
-        }
+        };
+        let files = (!self.files.is_empty())
+            .then(|| serde_json::to_string(self.files).expect("a list of strings is JSON"));
+        (only, but, files)
     }
+}
+
+/// The SQL that keeps a search to the entries about the files, as JSON, in
+/// parameter `at`, or a file under one of them: all of them while it's
+/// `NULL`.
+fn about_files_sql(at: usize) -> String {
+    format!(
+        "(?{at} IS NULL OR EXISTS (SELECT 1 FROM json_each(e.files) f, json_each(?{at}) w \
+         WHERE f.value = w.value OR substr(f.value, 1, length(w.value) + 1) = w.value || '/'))"
+    )
 }
 
 /// Who an entry came from.
@@ -377,6 +415,44 @@ impl Added {
             Added::Refused => None,
         }
     }
+}
+
+/// What a search keeps to besides its words, and the most it gives.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Wanted {
+    /// Only entries of this kind.
+    pub kind: Option<Kind>,
+    /// Only entries about one of these files, or a file under one of them,
+    /// each from the top of the project.
+    pub files: Vec<String>,
+    /// Leave the stale out.
+    pub fresh: bool,
+    pub limit: usize,
+}
+
+impl Wanted {
+    /// The `limit` best of every kind, about any file, stale or not.
+    pub fn best(limit: usize) -> Wanted {
+        Wanted {
+            kind: None,
+            files: Vec::new(),
+            fresh: false,
+            limit,
+        }
+    }
+}
+
+/// An entry that was forgotten, as it was.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Forgotten {
+    /// The id it had.
+    pub id: u64,
+    pub kind: Kind,
+    pub text: String,
+    pub files: Vec<String>,
+    pub source: Source,
+    /// When it was forgotten, in seconds since the Unix epoch.
+    pub forgotten: u64,
 }
 
 /// The database every project's memory is kept in, open.
@@ -494,8 +570,8 @@ impl Store {
     }
 
     /// Takes entry `id` out of `project`'s memory, and gives it back. What
-    /// it said is kept only as a hash, for the distiller to know not to add
-    /// it again.
+    /// it said is kept apart, with a hash of its words for the distiller to
+    /// know not to add it again, and for [`Store::forgotten`] to list.
     pub fn remove(&mut self, project: &Path, id: u64) -> Result<Entry> {
         let name = self.ready(project)?;
         let tx = self
@@ -509,12 +585,49 @@ impl Store {
         let key = key_of(&entry.text);
         if !key.is_empty() {
             tx.execute(
-                "INSERT OR IGNORE INTO forgotten (project, key) VALUES (?1, ?2)",
-                params![name, hash(&key)],
+                "INSERT OR REPLACE INTO forgotten (project, key, id, kind, text, files, source, \
+                 forgot) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    name,
+                    hash(&key),
+                    entry.id,
+                    entry.kind.to_string(),
+                    entry.text,
+                    serde_json::to_string(&entry.files)?,
+                    serde_json::to_string(&entry.source)?,
+                    seconds_since_epoch(SystemTime::now()),
+                ],
             )?;
         }
         tx.commit()?;
         Ok(entry)
+    }
+
+    /// The entries forgotten in `project`, the latest forgotten first: each
+    /// as it was, until it's remembered again. Those forgotten before
+    /// crystal kept what they said aren't listed.
+    pub fn forgotten(&mut self, project: &Path) -> Result<Vec<Forgotten>> {
+        let name = self.ready(project)?;
+        let mut query = self.conn.prepare(
+            "SELECT id, kind, text, files, source, forgot FROM forgotten \
+             WHERE project = ?1 AND text IS NOT NULL ORDER BY forgot DESC, id DESC",
+        )?;
+        let rows = query.query_map(params![name], |row| {
+            let kind: String = row.get(1)?;
+            let files: String = row.get(3)?;
+            let source: Option<String> = row.get(4)?;
+            Ok(Forgotten {
+                id: row.get(0)?,
+                kind: Kind::parse(&kind).unwrap_or(Kind::Note),
+                text: row.get(2)?,
+                files: serde_json::from_str(&files).unwrap_or_default(),
+                source: source
+                    .and_then(|source| serde_json::from_str(&source).ok())
+                    .unwrap_or(Source::User),
+                forgotten: row.get::<_, Option<u64>>(5)?.unwrap_or(0),
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     /// Every entry of `project`, newest first.
@@ -566,32 +679,79 @@ impl Store {
         limit: usize,
         embedder: Option<&dyn Embed>,
     ) -> Result<Vec<Entry>> {
-        let kinds = kind.map_or(Kinds::All, Kinds::Only);
-        self.search_among(project, text, kinds, limit, embedder)
+        self.search_about(project, text, kind, &[], limit, embedder)
     }
 
-    /// [`Store::search`], among the entries of `kinds` alone, so that those
-    /// left out take no place in either ranking, nor among those the
+    /// The entries of `project` that have to do with `text`, as `wanted`
+    /// says, the best first, each with whether it still holds: as
+    /// [`Store::search_about`] finds them, the drifting and the stale marked
+    /// where they rank, or with `fresh`, the stale left out.
+    pub fn find(
+        &mut self,
+        project: &Path,
+        text: &str,
+        wanted: &Wanted,
+        embedder: Option<&dyn Embed>,
+    ) -> Result<Vec<Listed>> {
+        // The stale left out leave room for as many after them.
+        let limit = if wanted.fresh {
+            wanted.limit.max(SEARCH_LIMIT)
+        } else {
+            wanted.limit
+        };
+        let files: Vec<String> = wanted
+            .files
+            .iter()
+            .map(|file| file.trim_end_matches('/').to_string())
+            .filter(|file| !file.is_empty() && file != ".")
+            .collect();
+        let found = self.search_about(project, text, wanted.kind, &files, limit, embedder)?;
+        let mut found = marked(found, project);
+        if wanted.fresh {
+            found.retain(|item| item.freshness != Freshness::Stale);
+        }
+        found.truncate(wanted.limit);
+        Ok(found)
+    }
+
+    /// [`Store::search`], with `files`, among the entries about one of them
+    /// alone, or about a file under one of them: each a path from the top
+    /// of the project, a file's or a directory's.
+    pub fn search_about(
+        &mut self,
+        project: &Path,
+        text: &str,
+        kind: Option<Kind>,
+        files: &[String],
+        limit: usize,
+        embedder: Option<&dyn Embed>,
+    ) -> Result<Vec<Entry>> {
+        let kinds = kind.map_or(Kinds::All, Kinds::Only);
+        self.search_among(project, text, Among { kinds, files }, limit, embedder)
+    }
+
+    /// [`Store::search`], among the entries `among` keeps to alone, so that
+    /// those left out take no place in either ranking, nor among those the
     /// reranker reads.
     fn search_among(
         &mut self,
         project: &Path,
         text: &str,
-        kinds: Kinds,
+        among: Among,
         limit: usize,
         embedder: Option<&dyn Embed>,
     ) -> Result<Vec<Entry>> {
         let name = self.ready(project)?;
         let Some(query) = fts_query(text) else {
-            return self.newest(&name, kinds, limit);
+            return self.newest(&name, among, limit);
         };
         let pool = limit.max(POOL);
-        let mut by_words = self.by_words(&name, &query, kinds, pool)?;
+        let mut by_words = self.by_words(&name, &query, among, pool)?;
         let Some(embedder) = embedder else {
             by_words.truncate(limit);
             return Ok(by_words);
         };
-        match self.by_meaning(&name, text, kinds, pool, embedder) {
+        match self.by_meaning(&name, text, among, pool, embedder) {
             Ok(by_meaning) => Ok(reranked(
                 fused(&[by_words, by_meaning], pool),
                 text,
@@ -613,16 +773,17 @@ impl Store {
         &self,
         project: &str,
         query: &str,
-        kinds: Kinds,
+        among: Among,
         limit: usize,
     ) -> Result<Vec<Entry>> {
-        let (only, but) = kinds.params();
+        let (only, but, files) = among.params();
         let mut found = self.conn.prepare(&format!(
             "SELECT {COLUMNS} FROM entries_fts JOIN entries e ON e.n = entries_fts.rowid \
              WHERE entries_fts MATCH ?2 AND e.project = ?1 AND (?3 IS NULL OR e.kind = ?3) \
-             AND e.kind IS NOT ?5 ORDER BY {RANK}, e.last_seen DESC, e.id DESC LIMIT ?4"
+             AND e.kind IS NOT ?5 AND {} ORDER BY {RANK}, e.last_seen DESC, e.id DESC LIMIT ?4",
+            about_files_sql(6)
         ))?;
-        let found = found.query_map(params![project, query, only, limit, but], entry_of)?;
+        let found = found.query_map(params![project, query, only, limit, but, files], entry_of)?;
         Ok(found.collect::<rusqlite::Result<_>>()?)
     }
 
@@ -633,20 +794,22 @@ impl Store {
         &mut self,
         project: &str,
         text: &str,
-        kinds: Kinds,
+        among: Among,
         limit: usize,
         embedder: &dyn Embed,
     ) -> Result<Vec<Entry>> {
         self.embed_missing_in(Some(project), embedder)?;
         let asked = embedder.embed_query(text)?;
         let asked = &asked;
-        let (only, but) = kinds.params();
+        let (only, but, files) = among.params();
         let mut rows = self.conn.prepare(&format!(
             "SELECT {COLUMNS}, v.vector FROM entries e JOIN vectors v ON v.n = e.n \
              WHERE e.project = ?1 AND v.model = ?2 AND (?3 IS NULL OR e.kind = ?3) \
-             AND e.kind IS NOT ?4"
+             AND e.kind IS NOT ?4 AND {}",
+            about_files_sql(5)
         ))?;
-        let rows = rows.query_map(params![project, embedder.model(), only, but], |row| {
+        let model = embedder.model();
+        let rows = rows.query_map(params![project, model, only, but, files], |row| {
             Ok((entry_of(row)?, row.get::<_, Vec<u8>>("vector")?))
         })?;
         let mut alike = Vec::new();
@@ -668,16 +831,17 @@ impl Store {
             .collect())
     }
 
-    /// The entries of the project called `project`, of `kinds`, said most
-    /// recently first.
-    fn newest(&self, project: &str, kinds: Kinds, limit: usize) -> Result<Vec<Entry>> {
-        let (only, but) = kinds.params();
+    /// The entries of the project called `project` that `among` keeps to,
+    /// said most recently first.
+    fn newest(&self, project: &str, among: Among, limit: usize) -> Result<Vec<Entry>> {
+        let (only, but, files) = among.params();
         let mut newest = self.conn.prepare(&format!(
             "SELECT {COLUMNS} FROM entries e WHERE e.project = ?1 \
-             AND (?2 IS NULL OR e.kind = ?2) AND e.kind IS NOT ?4 \
-             ORDER BY e.last_seen DESC, e.id DESC LIMIT ?3"
+             AND (?2 IS NULL OR e.kind = ?2) AND e.kind IS NOT ?4 AND {} \
+             ORDER BY e.last_seen DESC, e.id DESC LIMIT ?3",
+            about_files_sql(5)
         ))?;
-        let newest = newest.query_map(params![project, only, limit, but], entry_of)?;
+        let newest = newest.query_map(params![project, only, limit, but, files], entry_of)?;
         Ok(newest.collect::<rusqlite::Result<_>>()?)
     }
 
@@ -1184,7 +1348,11 @@ pub fn for_launch(
     let mut store = Store::open(socket)?;
     let mut hashes = Hashes::default();
     let about_changes = store.about_files(project, changed)?;
-    let found = store.search_among(project, asked, Kinds::Lasting, SEARCH_LIMIT, embedder)?;
+    let lasting = Among {
+        kinds: Kinds::Lasting,
+        files: &[],
+    };
+    let found = store.search_among(project, asked, lasting, SEARCH_LIMIT, embedder)?;
     let mut shown = launch_order(vec![about_changes, found], project, &mut hashes);
     if shown.is_empty() {
         shown = launch_order(vec![store.entries(project)?], project, &mut hashes);
@@ -1352,11 +1520,11 @@ pub fn markdown(name: &str, listed: &[Listed]) -> String {
     text
 }
 
-/// One entry as a session is shown it: its kind, its text on one line and
-/// not too long, the files it's about, and whether some have changed.
+/// One entry as a session is shown it: its kind, its title, not too long,
+/// the files it's about, and whether some have changed.
 fn launch_line(item: &Listed) -> String {
     let entry = &item.entry;
-    let mut text = one_line(&entry.text);
+    let mut text = title(&entry.text);
     if text.chars().count() > LAUNCH_TEXT_LENGTH {
         text = text.chars().take(LAUNCH_TEXT_LENGTH).collect();
         text.push('…');
@@ -1373,6 +1541,31 @@ fn launch_line(item: &Listed) -> String {
 
 pub fn one_line(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// An entry's title: the first line of its text, which is the whole of an
+/// entry said in one line. A list and an agent starting are shown it, and
+/// `crystal memory show` the rest.
+pub fn title(text: &str) -> String {
+    one_line(text.trim().lines().next().unwrap_or_default())
+}
+
+/// The text of an entry with a title of its own (`--title`): the title, on
+/// one line, then `text` under it. A title is the claim itself, so one too
+/// long is refused rather than cut.
+pub fn titled(title: &str, text: &str) -> Result<String> {
+    let title = one_line(&printable::line(title));
+    if title.is_empty() {
+        bail!("a title has to say something");
+    }
+    let length = title.chars().count();
+    if length > MAX_TITLE {
+        bail!("a title is {MAX_TITLE} characters at most; this one is {length}");
+    }
+    Ok(match text.trim() {
+        "" => title,
+        text => format!("{title}\n\n{text}"),
+    })
 }
 
 /// Whether `entry` still holds, by its files as they are now.
@@ -1648,6 +1841,156 @@ mod tests {
             add(&socket, project, distilled).unwrap(),
             Added::Again(_)
         ));
+    }
+
+    #[test]
+    fn what_was_forgotten_is_listed_as_it_was_until_it_s_remembered_again() {
+        let (_dir, socket) = socket();
+        let project = Path::new(APP);
+        let mut store = Store::open(&socket).unwrap();
+        let about = New {
+            kind: Kind::Gotcha,
+            files: vec!["ledger.rs".into()],
+            ..note("the ledger needs redis")
+        };
+        store.add(project, about).unwrap();
+        store.add(project, note("fees are kept in cents")).unwrap();
+        store.remove(project, 1).unwrap();
+        store.remove(project, 2).unwrap();
+        let forgotten = store.forgotten(project).unwrap();
+        let said: Vec<(u64, Kind, &str)> = forgotten
+            .iter()
+            .map(|entry| (entry.id, entry.kind, &entry.text[..]))
+            .collect();
+        assert_eq!(
+            said,
+            [
+                (2, Kind::Note, "fees are kept in cents"),
+                (1, Kind::Gotcha, "the ledger needs redis"),
+            ]
+        );
+        assert_eq!(forgotten[1].files, ["ledger.rs"]);
+        assert!(forgotten[0].forgotten > 0);
+        assert!(
+            store
+                .forgotten(Path::new("/code/other"))
+                .unwrap()
+                .is_empty()
+        );
+
+        store.add(project, note("The ledger needs Redis!")).unwrap();
+        let forgotten = store.forgotten(project).unwrap();
+        assert_eq!(forgotten.len(), 1, "{forgotten:?}");
+    }
+
+    #[test]
+    fn a_title_is_an_entry_s_first_line_and_one_of_its_own_goes_over_it() {
+        assert_eq!(
+            title("  Fees are in cents\nnever floats "),
+            "Fees are in cents"
+        );
+        assert_eq!(title("one line,  spaced"), "one line, spaced");
+        assert_eq!(
+            titled("Fees are in cents", "Never store a float.").unwrap(),
+            "Fees are in cents\n\nNever store a float."
+        );
+        assert_eq!(titled(" two\nlines ", "").unwrap(), "two lines");
+        assert!(titled("  ", "x").is_err());
+        let long = "word ".repeat(30);
+        let refused = titled(&long, "").unwrap_err().to_string();
+        assert!(refused.contains("120 characters at most"), "{refused}");
+    }
+
+    #[test]
+    fn a_search_keeps_to_the_files_it_names_and_the_directories_they_re_in() {
+        let (_dir, socket) = socket();
+        let project = Path::new(APP);
+        let mut store = Store::open(&socket).unwrap();
+        for files in [
+            &["src/ledger.rs"][..],
+            &["src/ledger/mod.rs"],
+            &["src/ledgers.rs"],
+            &[],
+        ] {
+            let new = New {
+                files: files.iter().map(|file| file.to_string()).collect(),
+                ..note(&format!("ledger note about {files:?}"))
+            };
+            store.add(project, new).unwrap();
+        }
+        let mut about = |files: &[&str]| {
+            let files: Vec<String> = files.iter().map(|file| file.to_string()).collect();
+            let found = store
+                .search_about(project, "ledger", None, &files, 10, None)
+                .unwrap();
+            let mut found = ids(&found);
+            found.sort();
+            found
+        };
+        assert_eq!(about(&["src/ledger.rs"]), [1]);
+        assert_eq!(
+            about(&["src/ledger"]),
+            [2],
+            "a directory, not a name it starts"
+        );
+        assert_eq!(about(&["src"]), [1, 2, 3]);
+        assert_eq!(about(&["src/ledger.rs", "src/ledgers.rs"]), [1, 3]);
+        assert_eq!(about(&[]), [1, 2, 3, 4]);
+        let newest = store
+            .search_about(project, "", None, &["src/ledger".into()], 10, None)
+            .unwrap();
+        assert_eq!(ids(&newest), [2]);
+    }
+
+    #[test]
+    fn a_fresh_search_leaves_the_stale_out_and_fills_its_room_after_them() {
+        let (_dir, socket) = socket();
+        let project = project_with(&["a.rs", "b.rs"]);
+        let mut store = Store::open(&socket).unwrap();
+        store
+            .add(project.path(), about(&["a.rs"], project.path()))
+            .unwrap();
+        store
+            .add(project.path(), note("refund waits for the ledger, always"))
+            .unwrap();
+        store
+            .add(project.path(), note("the refund ledger is slow"))
+            .unwrap();
+        fs::write(project.path().join("a.rs"), "changed").unwrap();
+
+        let wanted = |fresh, limit| Wanted {
+            fresh,
+            ..Wanted::best(limit)
+        };
+        let mut found = |wanted: Wanted| {
+            let found = store
+                .find(project.path(), "refund ledger", &wanted, None)
+                .unwrap();
+            let mut said: Vec<(u64, Freshness)> = found
+                .iter()
+                .map(|item| (item.entry.id, item.freshness))
+                .collect();
+            said.sort();
+            said
+        };
+        assert_eq!(
+            found(wanted(false, 10)),
+            [
+                (1, Freshness::Stale),
+                (2, Freshness::Fresh),
+                (3, Freshness::Fresh)
+            ]
+        );
+        assert_eq!(
+            found(wanted(true, 10)),
+            [(2, Freshness::Fresh), (3, Freshness::Fresh)]
+        );
+        assert_eq!(found(wanted(true, 1)).len(), 1);
+        let gotchas = Wanted {
+            kind: Some(Kind::Gotcha),
+            ..wanted(false, 10)
+        };
+        assert!(found(gotchas).is_empty());
     }
 
     #[test]

@@ -212,8 +212,8 @@ pub enum Request {
     SearchMemory {
         dir: PathBuf,
         query: String,
-        kind: Option<crate::memory::Kind>,
-        limit: usize,
+        #[serde(flatten)]
+        wanted: crate::memory::Wanted,
     },
     /// The tasks of the project `dir` is in, or of every project with
     /// `all`: those still open, then those waiting to start, then those
@@ -256,8 +256,29 @@ pub enum Request {
     BacklogAdd {
         dir: PathBuf,
         text: String,
+        /// More than its line says, when there's more to say.
+        #[serde(default)]
+        body: String,
         #[serde(default)]
         tags: Vec<String>,
+    },
+    /// Change a backlog item: each of its line, its body and its tags that's
+    /// given, in place of what it was.
+    BacklogEdit {
+        dir: PathBuf,
+        number: u64,
+        #[serde(default)]
+        text: Option<String>,
+        #[serde(default)]
+        body: Option<String>,
+        #[serde(default)]
+        tags: Option<Vec<String>>,
+    },
+    /// Put these items on the backlog of the project `dir` is in, all or
+    /// none, but for those whose line it has already.
+    BacklogImport {
+        dir: PathBuf,
+        items: Vec<NewItem>,
     },
     /// Mark a backlog item done, or open again.
     BacklogMark {
@@ -590,6 +611,12 @@ pub enum Response {
     /// The number a new backlog item got.
     Added {
         number: u64,
+    },
+    /// What an import put on the backlog: the numbers its new items got,
+    /// and how many it passed over as there already.
+    Imported {
+        added: Vec<u64>,
+        skipped: usize,
     },
     /// How many items are open on each project's backlog.
     BacklogCounts {
@@ -1229,13 +1256,30 @@ pub fn task_label(id: Option<u64>) -> String {
 }
 
 /// One project's backlog: things to do later.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Backlog {
     /// The project's name, as the sidebar shows it.
     pub project: String,
     /// The project's main worktree, or the directory itself outside git.
     pub path: PathBuf,
     pub items: Vec<BacklogItem>,
+    /// The project's tasks started for an item, open, waiting or closed,
+    /// with tasks on: each item's history.
+    #[serde(default)]
+    pub tasks: Vec<TaskView>,
+}
+
+impl Backlog {
+    /// The tasks started for item `number`, the oldest first.
+    pub fn tasks_for(&self, number: u64) -> Vec<&TaskView> {
+        let mut tasks: Vec<&TaskView> = self
+            .tasks
+            .iter()
+            .filter(|task| task.record.backlog == Some(number))
+            .collect();
+        tasks.sort_by_key(|task| (task.record.created, task.record.id));
+        tasks
+    }
 }
 
 /// A thing to do later.
@@ -1243,7 +1287,11 @@ pub struct Backlog {
 pub struct BacklogItem {
     /// Its number in the project's backlog, which never changes: #1, #2…
     pub number: u64,
+    /// One line on what's to do.
     pub text: String,
+    /// More on it, when one line isn't enough: empty, or a few lines.
+    #[serde(default)]
+    pub body: String,
     #[serde(default)]
     pub tags: Vec<String>,
     pub done: bool,
@@ -1252,6 +1300,19 @@ pub struct BacklogItem {
     /// When it was done, while it is.
     #[serde(default)]
     pub closed: Option<u64>,
+}
+
+/// An item to put on the backlog, as `crystal backlog import` read it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NewItem {
+    pub text: String,
+    #[serde(default)]
+    pub body: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// Whether it's done already: ticked off as it's put there.
+    #[serde(default)]
+    pub done: bool,
 }
 
 /// The git worktree a session runs in, and the project it belongs to.
