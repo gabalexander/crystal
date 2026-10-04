@@ -12,8 +12,9 @@
 //! A desktop notification does the telling: on macOS `terminal-notifier`
 //! when it's installed, which a click on takes the user to the session, or
 //! else macOS's own; on Linux `notify-send`, clicked the same way where it
-//! takes actions. A command in the config runs instead, when it names one,
-//! and finds the notice in its environment:
+//! takes actions, its text escaped where the notification server would
+//! read markup in it. A command in the config runs instead, when it names
+//! one, and finds the notice in its environment:
 //!
 //! - `CRYSTAL_NOTICE`: the line a notification would show, like
 //!   "claude-2 is waiting on you · app fix/login"
@@ -31,6 +32,7 @@ use crate::config::Config;
 use crate::printable;
 use crate::protocol::{Activity, Front, SessionInfo};
 use crate::sound::{self, Sound};
+use crate::tui::status_bar;
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use std::io::Read;
@@ -47,6 +49,9 @@ const TELL_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a notification that can be clicked is listened to for a
 /// click, once it's shown.
 const CLICK_WITHIN: Duration = Duration::from_secs(60 * 60);
+
+/// How long asking the notification server what it can do may take.
+const CAPABILITIES_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Something to tell the user about one session.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -349,7 +354,14 @@ fn desktop_command(notice: &Notice, jump: Option<&[String]>) -> Option<Desktop> 
         if clickable {
             notify_send.args(["--action", "default=Open", "--wait"]);
         }
-        notify_send.arg("crystal").arg(&notice.text);
+        // A report's message or a branch holding `<b>` or `<a href>` would
+        // be drawn as markup by a server that takes it.
+        let body = if body_markup() {
+            escape_markup(&notice.text)
+        } else {
+            notice.text.clone()
+        };
+        notify_send.arg("crystal").arg(body);
         Some(if clickable {
             Desktop::Clickable(notify_send)
         } else {
@@ -372,6 +384,64 @@ fn notify_send_takes_actions() -> bool {
             .output();
         help.is_ok_and(|help| String::from_utf8_lossy(&help.stdout).contains("--action"))
     })
+}
+
+/// Whether the desktop's notification server takes a notification's body
+/// as markup: asked once.
+fn body_markup() -> bool {
+    static MARKUP: OnceLock<bool> = OnceLock::new();
+    *MARKUP.get_or_init(|| says_body_markup(Path::new("gdbus"), Path::new("dbus-send")))
+}
+
+/// Whether the notification server says `body-markup` is among its
+/// capabilities, as the freedesktop spec has one say that takes `<b>`,
+/// `<a href>` and the like in a notification's body: asked with `gdbus`, or
+/// `dbus-send` where that can't. A server neither can ask in
+/// [`CAPABILITIES_TIMEOUT`] is taken not to, since escaping the body for
+/// one that doesn't would show `&lt;` as it is.
+fn says_body_markup(gdbus: &Path, dbus_send: &Path) -> bool {
+    let mut with_gdbus = Command::new(gdbus);
+    with_gdbus.args([
+        "call",
+        "--session",
+        "--dest",
+        "org.freedesktop.Notifications",
+        "--object-path",
+        "/org/freedesktop/Notifications",
+        "--method",
+        "org.freedesktop.Notifications.GetCapabilities",
+    ]);
+    let mut with_dbus_send = Command::new(dbus_send);
+    with_dbus_send.args([
+        "--session",
+        "--print-reply",
+        "--dest=org.freedesktop.Notifications",
+        "/org/freedesktop/Notifications",
+        "org.freedesktop.Notifications.GetCapabilities",
+    ]);
+    let said = [with_gdbus, with_dbus_send].iter_mut().find_map(|ask| {
+        let output = status_bar::run_within(ask, CAPABILITIES_TIMEOUT)?;
+        let said = String::from_utf8_lossy(&output.stdout);
+        output.status.success().then(|| said.into_owned())
+    });
+    // `gdbus` prints `(['body', 'body-markup'],)`, and `dbus-send` a
+    // `string "body-markup"` line for each.
+    said.is_some_and(|said| said.contains("'body-markup'") || said.contains("\"body-markup\""))
+}
+
+/// `text` with what markup would read in it written as itself: `&`, `<`
+/// and `>`.
+fn escape_markup(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            c => escaped.push(c),
+        }
+    }
+    escaped
 }
 
 /// Runs a notification that waits to be clicked, for [`CLICK_WITHIN`] at
@@ -636,6 +706,80 @@ mod tests {
             "claude-2 is waiting on you: approve the deploy"
         );
         assert_eq!(Notice::about(&waiting, Done).text, "claude-2 is done");
+    }
+
+    /// What `gdbus` is asked for the notification server's capabilities.
+    const GDBUS_ASKED: &str = "call --session --dest org.freedesktop.Notifications \
+                               --object-path /org/freedesktop/Notifications \
+                               --method org.freedesktop.Notifications.GetCapabilities";
+
+    /// What `dbus-send` is asked for them.
+    const DBUS_SEND_ASKED: &str = "--session --print-reply --dest=org.freedesktop.Notifications \
+                                   /org/freedesktop/Notifications \
+                                   org.freedesktop.Notifications.GetCapabilities";
+
+    /// A stand-in for `gdbus` or `dbus-send`, `name` in `dir`, that prints
+    /// `said` when it's asked `asked`, and fails when it's asked anything
+    /// else, as a real one does with no notification server to ask.
+    fn fake(dir: &Path, name: &str, asked: &str, said: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let program = dir.join(name);
+        let script =
+            format!("#!/bin/sh\n[ \"$*\" = '{asked}' ] || exit 1\ncat <<'EOF'\n{said}\nEOF\n");
+        std::fs::write(&program, script).unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        program
+    }
+
+    #[test]
+    fn markup_in_a_notice_is_written_as_itself() {
+        assert_eq!(
+            escape_markup("ok <b>now</b> & <a href=\"https://x\">here</a>"),
+            "ok &lt;b&gt;now&lt;/b&gt; &amp; &lt;a href=\"https://x\"&gt;here&lt;/a&gt;"
+        );
+        assert_eq!(
+            escape_markup("claude-2 is done · app fix/login"),
+            "claude-2 is done · app fix/login"
+        );
+    }
+
+    #[test]
+    fn the_notification_server_says_whether_it_takes_markup() {
+        let dir = tempfile::tempdir().unwrap();
+        let nowhere = dir.path().join("nowhere");
+        let takes = fake(
+            dir.path(),
+            "gdbus",
+            GDBUS_ASKED,
+            "(['actions', 'body', 'body-hyperlinks', 'body-markup', 'persistence'],)",
+        );
+        assert!(says_body_markup(&takes, &nowhere));
+        let plain = fake(
+            dir.path(),
+            "gdbus-plain",
+            GDBUS_ASKED,
+            "(['actions', 'body', 'body-hyperlinks', 'persistence'],)",
+        );
+        assert!(!says_body_markup(&plain, &nowhere));
+    }
+
+    #[test]
+    fn dbus_send_asks_where_gdbus_can_t() {
+        let dir = tempfile::tempdir().unwrap();
+        let nowhere = dir.path().join("nowhere");
+        let dbus_send = fake(
+            dir.path(),
+            "dbus-send",
+            DBUS_SEND_ASKED,
+            "method return time=1759500000.1 sender=:1.25 -> destination=:1.150 serial=7 \
+             reply_serial=2\n   array [\n      string \"body\"\n      string \"body-markup\"\n   ]",
+        );
+        assert!(says_body_markup(&nowhere, &dbus_send));
+        // One with no server to ask fails, and the next is asked.
+        let failing = fake(dir.path(), "gdbus", "never this", "");
+        assert!(says_body_markup(&failing, &dbus_send));
+        // Neither there: no markup, so nothing is escaped to show as it is.
+        assert!(!says_body_markup(&nowhere, &nowhere));
     }
 
     #[test]
