@@ -55,6 +55,9 @@ whenever what's handed over changes in a way the crystal before couldn't read.
 - `src/drive.rs`: `crystal send`, `wait`, `read`, `result`, `answer` and `interrupt`, for driving one session from
   another or a script; waits listen to the daemon's events about their session, and `wait --output` has the
   daemon look at its screen, asking again when a handover cuts it
+- `src/messages.rs`: what `crystal send` carries from one session to another: the text tidied and cut to 8 KiB,
+  the line ahead of it saying which session sent it, the guard that holds a session to 20 sends a minute, and
+  the `agent_blocked:` refusal for an agent asking the user something; adapted from docket's
 - `src/keys.rs`: turning keys into the bytes a terminal sends: the TUI's keys, and the names `send-keys` takes;
   the old way, or in the Kitty keyboard protocol once a program has asked for it
 - `src/remote.rs`: `crystal ssh`: finds (or installs) crystal on another machine, then runs it there over ssh
@@ -187,8 +190,8 @@ whenever what's handed over changes in a way the crystal before couldn't read.
 - `src/typing.rs`: typing into a session the way a person would: pastes marked, Enter on its own
 - `src/session.rs`: one program in a PTY, or a task: spawn, exit status, stop, its screen, viewers and listeners,
   the agent that says what it's doing itself while it holds the session, whether its first prompt can name
-  it, and what has changed in it (its agent's activity, a task's runs) for the daemon to tell; handing it over
-  and adopting it, its PTY on a descriptor of crystal's own
+  it, whether its agent is blocked on the user, and what has changed in it (its agent's activity, a task's
+  runs) for the daemon to tell; handing it over and adopting it, its PTY on a descriptor of crystal's own
 - `src/vt.rs`: a terminal's screen, through `alacritty_terminal`: what a program drew and its history, the modes
   it set, its answers to the program's questions (the daemon's screen only), the output that catches a new viewer
   up (its hyperlinks included), the cells to draw, the input modes `crystal attach` asks your terminal for, and,

@@ -363,6 +363,37 @@ impl Session {
         task.run(text)
     }
 
+    /// What its agent is asking the user, while it's stopped until they
+    /// answer: a background task's permission, or an agent in a terminal
+    /// asking something, as its hooks, its screen or its own report say.
+    /// Anything typed into it then would land in the question. An agent
+    /// waiting only because its turn ended with its task open is at its
+    /// prompt, and takes a message as ever.
+    pub fn blocked(&self) -> Option<String> {
+        if let Some(task) = &self.task {
+            let asking = task.asking()?;
+            return Some(match asking.gist.as_str() {
+                "" => format!("asking to use {}", asking.tool),
+                gist => format!("asking to use {}: {gist}", asking.tool),
+            });
+        }
+        if self.activity != Some(Activity::Waiting) {
+            return None;
+        }
+        let at_its_prompt = self
+            .goal
+            .as_ref()
+            .is_some_and(|goal| goal.is_open() && goal.waiting);
+        if at_its_prompt {
+            return None;
+        }
+        let said = self.reporter.as_ref().and_then(|reporter| {
+            let message = reporter.message.as_deref()?.trim();
+            (!message.is_empty()).then(|| format!("waiting on the user ({message})"))
+        });
+        Some(said.unwrap_or_else(|| "asking the user something".to_string()))
+    }
+
     /// A task's last answer, and what it has come to.
     pub fn result(&self) -> Result<TaskResult> {
         let name = &self.name;

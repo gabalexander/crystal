@@ -243,4 +243,10 @@ crystal memory search ledger
   input starts, use `send --wait` or `send-keys --wait`, not `send` then `wait`.
 - A program that doesn't report what it's doing (a shell, a build) counts as busy until it exits: `wait`
   blocks until then. Pass `--timeout <seconds>`; it fails when the time runs out.
+- `send` refuses an agent that's asking the user something, with an error starting `agent_blocked:`: the
+  text would land in its question. Answer it with `send-keys` (`crystal answer` for a background task) if
+  that's yours to answer, or leave it to the user; `--force` types it anyway.
+- What you `send` another session starts with a line saying it's from yours, and what you work on. Send 20 a
+  minute at most: past that it's refused, as two agents answering each other are probably in a loop; stop
+  sending and carry on with your own work. Never send only to say you got a message.
 - Don't `kill` or `send` to your own session. `$CRYSTAL_SESSION` is its name when it started.

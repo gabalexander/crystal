@@ -803,6 +803,19 @@ text starts, not one that ended before it. `wait` returns once the agent isn't w
 it asks something, `idle`, or how its program exited. It takes a `--timeout` in seconds, and fails when that
 runs out. A program that doesn't say what it's doing counts as busy until it ends.
 
+An agent asking you something takes nothing `send` types, since the text would land in its question: `send`
+refuses with an error that starts `agent_blocked:`, saying what it asks and how to answer it, with `crystal
+answer` for a background task or in its pane or with `send-keys` for one in a terminal. `--force` types it
+anyway. An agent waiting only because it ended a turn with its [task](#tasks) open is at its prompt, and takes
+it. `send-keys` is never refused, since that's how a question is answered.
+
+Sent from another session, a message says so on a line ahead of it, `[crystal] Message from session "scout",
+working on task "Port the codec":`, so the agent knows who asks, and that `crystal send` answers. Such a
+message loses its control characters but for line breaks, and is cut at 8 KiB. A session may send 20
+messages a minute, the most crystal allows: the next is refused, since two agents answering each other are
+most likely in a loop. A session can't send to itself. From you or a script, the text goes as it is, with no
+line ahead of it and no limit. Each message is a `session.message` [event](#events).
+
 `wait` can wait for something else instead:
 
 ```sh
@@ -1669,6 +1682,7 @@ matched anywhere in the link unless `^` and `$` pin it. `X` lists each plugin's 
 | `session.removed` | a session leaves the list: killed, or its worktree removed |
 | `session.claimed` | an agent takes over saying what a session is doing, with [`crystal report`](#teaching-crystal-about-your-agent) |
 | `session.released` | it lets go: `crystal report --release`, or it left and the shell is back in front |
+| `session.message` | a session is sent a message: by another session with `crystal send`, which its `message` names, or by you |
 | `task.opened` | a task is made: given to a session as it starts, made to start later, or opened again by a follow-up |
 | `task.started` | a task made to start later starts, in a session of its own |
 | `task.waiting` | a task's agent ends a turn with the task still open: it waits on you |
@@ -1706,7 +1720,8 @@ and its name in `CRYSTAL_EVENT`:
 
 `task.closed` has a `task`, with its `goal`, `session`, `project`, `branch` and `outcome` (whether it `failed`,
 its `summary`, and when it `closed`). The worktree events have a `worktree`, with its `path`, `branch` and,
-once it's made, `project`. The rest are under [events](#events).
+once it's made, `project`. `session.message` has a `message`, with its first `line` and, when another session
+sent it, that session's name (`from`) and id (`from_id`). The rest are under [events](#events).
 
 `crystal plugin run <name> --event <event>` runs the plugin's hooks on that event, here and now, whether the
 plugin is on or not, on a made-up event with everything its kind carries, about the session `--session` names,

@@ -2320,6 +2320,121 @@ fn send_wait_and_read_say_when_a_session_is_missing_or_ended() {
     );
 }
 
+/// Starts a session called `name` that runs the shell script `script`,
+/// then sleeps, with `$C` the crystal these tests run: a session's own
+/// crystal commands go to its daemon, and say they come from it.
+fn in_session(crystal: &Crystal, name: &str, script: &str) {
+    let script = format!("C='{CRYSTAL}'; {script}; sleep 30");
+    crystal.ok(&["new", "-n", name, "sh", "-c", &script]);
+}
+
+/// What's in `file` once it has `lines` lines.
+fn once_lines(file: &Path, lines: usize) -> String {
+    eventually(&format!("{} has {lines} lines", file.display()), || {
+        std::fs::read_to_string(file).is_ok_and(|text| text.lines().count() == lines)
+    });
+    std::fs::read_to_string(file).unwrap()
+}
+
+#[test]
+fn a_message_from_another_session_says_which_sent_it() {
+    let crystal = Crystal::new();
+    let dir = crystal.dir.path();
+    crystal.ok(&["new", "-n", "inbox", "sh", "-c", "cat > got"]);
+
+    in_session(
+        &crystal,
+        "scout",
+        r#""$C" send inbox 'the codec moved' 2> err; echo $? > sent"#,
+    );
+    assert_eq!(written(&dir.join("sent")), "0\n");
+    assert_eq!(
+        once_lines(&dir.join("got"), 2),
+        "[crystal] Message from session \"scout\":\nthe codec moved\n"
+    );
+    let logged = events(&crystal, &["-k", "session.message"]);
+    assert_eq!(logged[0]["session"]["name"], "inbox");
+    assert_eq!(logged[0]["message"]["from"], "scout");
+    assert_eq!(logged[0]["message"]["line"], "the codec moved");
+
+    // From a shell, it goes as typed, from nobody.
+    crystal.ok(&["send", "inbox", "plain"]);
+    assert!(once_lines(&dir.join("got"), 3).ends_with("moved\nplain\n"));
+    let logged = events(&crystal, &["-k", "session.message"]);
+    assert!(logged[1]["message"].get("from").is_none(), "{}", logged[1]);
+    assert_eq!(logged[1]["message"]["line"], "plain");
+
+    // A session can't send to itself.
+    in_session(
+        &crystal,
+        "loner",
+        r#""$C" send loner hi 2> loner-err; echo $? > loner-sent"#,
+    );
+    assert_eq!(written(&dir.join("loner-sent")), "1\n");
+    let err = std::fs::read_to_string(dir.join("loner-err")).unwrap();
+    assert!(err.contains("loner is this session"), "{err}");
+}
+
+#[test]
+fn a_session_sends_twenty_messages_a_minute_at_most() {
+    let crystal = Crystal::new();
+    let dir = crystal.dir.path();
+    crystal.ok(&["new", "-n", "inbox", "sh", "-c", "cat > /dev/null"]);
+
+    in_session(
+        &crystal,
+        "chatty",
+        r#"for i in $(seq 21); do "$C" send --no-enter inbox "m$i" 2>> errors || echo "$i" >> refused; done; echo > finished"#,
+    );
+    written(&dir.join("finished"));
+    assert_eq!(
+        std::fs::read_to_string(dir.join("refused")).unwrap(),
+        "21\n"
+    );
+    let errors = std::fs::read_to_string(dir.join("errors")).unwrap();
+    assert!(
+        errors.contains("this session has sent 20 messages in the last minute"),
+        "{errors}"
+    );
+    // You aren't held to it.
+    crystal.ok(&["send", "--no-enter", "inbox", "from you"]);
+}
+
+#[test]
+fn send_refuses_an_agent_asking_something_unless_forced() {
+    let crystal = Crystal::new();
+    let dir = crystal.dir.path();
+    crystal.ok(&["new", "-n", "agent", "sh", "-c", "cat > got"]);
+    crystal.ok(&[
+        "report",
+        "-n",
+        "agent",
+        "--agent",
+        "pi",
+        "waiting",
+        "-m",
+        "Allow cargo test?",
+    ]);
+
+    let refused = crystal.fails(&["send", "agent", "carry on"]);
+    assert!(
+        refused.contains(
+            "agent_blocked: agent is waiting on the user (Allow cargo test?). Answer it first, \
+             in its pane, or with `crystal send-keys agent …`, or send again with --force"
+        ),
+        "{refused}"
+    );
+    // Keys are how a question is answered: they're never refused.
+    crystal.ok(&["send-keys", "agent", "y", "Enter"]);
+    crystal.ok(&["send", "--force", "agent", "carry on"]);
+    assert_eq!(once_lines(&dir.join("got"), 2), "y\ncarry on\n");
+
+    // At its prompt again, it takes what it's sent.
+    crystal.ok(&["report", "-n", "agent", "idle"]);
+    crystal.ok(&["send", "agent", "next"]);
+    assert_eq!(once_lines(&dir.join("got"), 3), "y\ncarry on\nnext\n");
+}
+
 #[test]
 fn s_splits_a_session_off_and_it_stays_while_the_selection_moves() {
     let crystal = Crystal::new();
@@ -5788,6 +5903,15 @@ fn a_permission_a_task_asks_for_waits_on_the_user_until_they_answer() {
     assert!(
         show.contains("asking    Bash cargo test: crystal answer t1 y|n|always"),
         "{show}"
+    );
+    // Asking, it takes no follow-up: that's for after it's answered.
+    let refused = crystal.fails(&["send", "fixer", "hurry up"]);
+    assert!(
+        refused.contains(
+            "agent_blocked: fixer is asking to use Bash: cargo test. Answer it first, \
+             with `crystal answer fixer y|n|always`"
+        ),
+        "{refused}"
     );
 
     // Always lets it run, and keeps a rule for calls like it.
@@ -9452,7 +9576,12 @@ fn the_event_log_keeps_what_happened_to_a_session_through_its_renames() {
     let about_memo = events(&crystal, &["-n", "memo"]);
     assert_eq!(
         names(&about_memo),
-        ["session.started", "session.renamed", "session.ended"]
+        [
+            "session.started",
+            "session.renamed",
+            "session.message",
+            "session.ended"
+        ]
     );
     let seqs: Vec<u64> = about_memo
         .iter()
@@ -9460,7 +9589,8 @@ fn the_event_log_keeps_what_happened_to_a_session_through_its_renames() {
         .collect();
     assert!(seqs.windows(2).all(|pair| pair[0] < pair[1]), "{seqs:?}");
     assert_eq!(about_memo[1]["from"], "brief");
-    assert_eq!(about_memo[2]["session"]["status"], "exited 4");
+    assert_eq!(about_memo[2]["message"]["line"], "go");
+    assert_eq!(about_memo[3]["session"]["status"], "exited 4");
 
     crystal.ok(&["kill", "memo"]);
     // Gone, it's known by the names it had.
