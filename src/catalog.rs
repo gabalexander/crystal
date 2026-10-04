@@ -293,6 +293,25 @@ pub fn first_prompt_at(command: &[String]) -> Option<usize> {
     }
 }
 
+/// `command` without its agent's first prompt, for starting the agent again
+/// with nothing to do yet: the prompt goes, with the option or the `--` it
+/// came after. Any other command stays as it is.
+pub fn without_first_prompt(command: &[String]) -> Vec<String> {
+    let mut without = command.to_vec();
+    let Some(at) = first_prompt_at(command) else {
+        return without;
+    };
+    let after_option = matches!(
+        agent_of(command).map(|agent| agent.first_prompt),
+        Some(FirstPrompt::Option(_))
+    );
+    without.remove(at);
+    if at > 1 && (after_option || without[at - 1] == "--") {
+        without.remove(at - 1);
+    }
+    without
+}
+
 /// Where the first prompt of an agent that takes it as an argument is, when
 /// that's plain to see: its only argument, or the last, after `--`.
 fn argument_prompt_at(command: &[String]) -> Option<usize> {
@@ -362,6 +381,20 @@ mod tests {
 
     fn words(args: &[&str]) -> Vec<String> {
         args.iter().map(|arg| arg.to_string()).collect()
+    }
+
+    #[test]
+    fn an_agent_starts_again_without_its_first_prompt() {
+        let claude = words(&["claude", "--model", "opus", "--", "fix it"]);
+        assert_eq!(without_first_prompt(&claude), ["claude", "--model", "opus"]);
+        assert_eq!(
+            without_first_prompt(&words(&["claude", "fix it"])),
+            ["claude"]
+        );
+        let gemini = words(&["gemini", "-m", "pro", "-i", "fix it"]);
+        assert_eq!(without_first_prompt(&gemini), ["gemini", "-m", "pro"]);
+        let other = words(&["cargo", "test", "--", "fix"]);
+        assert_eq!(without_first_prompt(&other), other);
     }
 
     #[test]

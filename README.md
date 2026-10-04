@@ -106,6 +106,7 @@ and the footer says where you are and offers the keys that matter there, or, whe
 | `T` | name the tab you're in |
 | `&` | close the tab you're in, and kill its sessions once you've said `y` |
 | `[` / `]`, `1-9` | go to the tab before or after this one, or to the tab with that number |
+| `{` / `}` | move the tab you're in one place to the left or right |
 | `>` | move the selected session to another tab: then a tab's number, or `t` for a new one |
 | `S` | your saved [layouts](#layouts): save your tabs as one, or put them back the way one has them |
 | `n` | start a new session from [the new-session panel](#starting-a-session), and type into it |
@@ -177,7 +178,8 @@ the next session you select, beside it when both halves can be at least 80 colum
 own already, they split that pane: the selection's pane comes beside it, and what it showed stays where it was,
 split off. Split any pane again, as often as there's room, to lay the panes out any way you like. `s` on a
 session split off closes its split, and the pane beside it takes the room. Each pane's session is sized to its
-pane.
+pane. A session nobody has looked at yet is 120 columns by 40 rows, so an agent started in the background lays
+its output out for a real screen; once seen, it keeps the size of the last pane it was in.
 
 While the selection is on a session with a pane of its own, the selection's pane goes on showing the last
 session it showed, so no session is drawn twice and going from pane to pane changes none of them. Shift and an
@@ -359,9 +361,10 @@ logs in another, a review in a third, and switch between them.
 
 The tabs sit in the bar along the top, numbered, the one you're in standing out. `t` makes a new one, starts
 your shell in it, in the selected session's directory, and takes you there. `[` and `]` go to the tab before
-and after, `1` to `9` straight to that one, and a click on a tab goes there too. Each tab keeps its own
-selection and panes, split and sized its own way. `T` names the tab you're in, and the bar shows the name after its number; with too many
-to fit, the bar shows only the numbers.
+and after, `1` to `9` straight to the first nine, and a click on a tab goes there too. `{` and `}` move the
+tab you're in one place to the left or right. Each tab keeps its own selection and panes, split and sized its
+own way. `T` names the tab you're in, and the bar shows the name after its number; with too many to fit, the
+bar shows only the numbers, and with more still, as many as fit around the tab you're in.
 
 A tab with something going on in it shows that on its label, the way the sidebar marks a session: `▲` when an
 agent in it is waiting on you, `✓` when one has finished a turn you haven't looked at, the turning `◐` while
@@ -372,8 +375,8 @@ one started any other way, from the command line or another TUI, unless it's a s
 goes in the tab with the rest of its run. `>` moves the selected session to another tab: press the tab's
 number next, or `t` to make a new tab for it. `&` closes the tab you're in and kills the sessions in it, once
 you've said `y`; an empty tab closes at once. The command line makes, names and closes tabs too: see
-[laying out the TUI](#laying-out-the-tui). There's always one tab, and nine at most. They're kept in crystal's
-database, so they're there when you open the TUI again.
+[laying out the TUI](#laying-out-the-tui). There's always one tab, and as many more as you like. They're kept
+in crystal's database, so they're there when you open the TUI again.
 
 ### Layouts
 
@@ -384,8 +387,11 @@ tabs as they are now under a name you type, in place of the layout of that name 
 `Enter` puts your tabs back the way the layout has them; `x` removes it, once you've said `y`; `Esc` closes the
 list.
 
-A layout names sessions; it doesn't start them. Restoring one arranges the sessions running now: those it
-names that have gone since are left out, and those it doesn't name join the tab in front. The tabs a restore
+A layout keeps what starts each of its sessions again: the command it was started with and its directory.
+Restoring one starts again the sessions it names that have gone since, each under its name, then arranges
+the sessions that way; an agent given a first prompt starts without it, so it isn't asked that again, and a
+background task, with no terminal of its own, isn't started. Those it can't start, their directory gone, say,
+are left out, and those it doesn't name join the tab in front. The tabs a restore
 replaces are kept, at the top of the list as `↶ before` the layout's name, so `Enter` on that takes you back,
 once. Layouts are kept with your tabs, in crystal's database.
 
@@ -863,8 +869,8 @@ prints `[]`.
 
 #### Laying out the TUI
 
-The tabs and panes are the TUI's, and the command line lays them out too, so an agent can put the session it
-started on screen beside its own, or a script can set up a tab for a review:
+The command line lays out the tabs and panes too, so an agent can put the session it started on screen
+beside its own, or a script can set up a tab for a review, with the TUI open or not:
 
 ```sh
 crystal new -d -n tests cargo test
@@ -880,6 +886,7 @@ crystal tab new review                    # a tab after the others, in front: se
 crystal tab select 1                      # a tab by its number or its name
 crystal tab rename 2 checks               # an empty name takes it back to its number
 crystal tab move reviewer review          # move a session to another tab, as > does
+crystal tab reorder review 1              # move a tab to be the first, as { and } do a place at a time
 crystal tab close review --kill           # a tab with sessions closes only with --kill, which kills them
 crystal layout                            # each tab's sessions and how its panes split the room; --json
 ```
@@ -893,9 +900,12 @@ moves into that tab, out of any pane it had. A command that can't be carried out
 would: no room for another pane, a session that isn't on screen.
 
 The command goes through the daemon to the TUI you used last, the one where you last pressed a key, clicked
-or brought its terminal to the front, and waits for it to answer, a few seconds at most. With no TUI open,
-it fails, saying so. When `restart-server` hands the daemon over, each TUI offers itself to the new one at
-once, saying when you last used it, so commands carry on going to the same one. What it changes is kept like any change you make, so it's there when the TUI opens again.
+or brought its terminal to the front, and waits for it to answer, a few seconds at most. When `restart-server`
+hands the daemon over, each TUI offers itself to the new one at once, saying when you last used it, so
+commands carry on going to the same one. What it changes is kept like any change you make, so it's there when
+the TUI opens again. With no TUI open, the daemon carries the command out itself, the way the TUI would, on
+the tabs as the TUI last kept them, starting if it isn't running; a tab closed with `--kill` has its sessions
+killed. The next TUI to open shows the tabs as the commands left them.
 `crystal layout --json` prints the tabs in their order, each with its `number`, `name`, whether it's
 `current` and `zoomed`, its `sessions`, the one `selected`, the one `floating`, and its `panes`: either
 `{"kind": "pane", "session": "tests"}`, with `"selection": true` for the pane that follows the selection, or

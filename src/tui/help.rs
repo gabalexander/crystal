@@ -66,6 +66,7 @@ pub const KEYS: &[Key] = &[
     sidebar("e", "edit its history"),
     sidebar("t/T/&", "tab: new / name / close"),
     sidebar("[/] 1-9", "switch tabs"),
+    sidebar("{/}", "move the tab left / right"),
     sidebar(">", "move it to another tab"),
     sidebar("S", "saved layouts"),
     sidebar("n/w", "new, or in a worktree"),

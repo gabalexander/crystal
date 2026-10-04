@@ -42,6 +42,13 @@ pub const STOP_GRACE: Duration = Duration::from_secs(2);
 /// Chunks of output a viewer may fall behind by before it's dropped.
 const VIEWER_BACKLOG: usize = 256;
 
+/// The size a session's screen has, rows by columns, until a viewer gives
+/// it another, as herdr does: roomy enough that an agent nobody is looking
+/// at yet lays its output out as it would on a real screen, not cramped
+/// into a terminal's old 80 by 24. Once seen, a session keeps the size its
+/// last viewer gave it.
+pub const UNSEEN_SIZE: (u16, u16) = (40, 120);
+
 /// How often what's in front in a terminal is looked at again even when
 /// its job hasn't changed: a program can replace itself with another, the
 /// way `exec` does, and keep its place in front.
@@ -230,9 +237,10 @@ impl Session {
         cwd: PathBuf,
         env: &BTreeMap<String, String>,
     ) -> Result<Session> {
+        let (rows, cols) = UNSEEN_SIZE;
         let pty = native_pty_system().openpty(portable_pty::PtySize {
-            rows: 24,
-            cols: 80,
+            rows,
+            cols,
             pixel_width: 0,
             pixel_height: 0,
         })?;
@@ -1227,10 +1235,10 @@ pub struct Watch {
 }
 
 impl Term {
-    /// A screen of 24 rows by 80 columns, until a viewer gives it another
-    /// size.
+    /// A screen of [`UNSEEN_SIZE`], until a viewer gives it another size.
     fn new(pty: Option<Pty>) -> Term {
-        Term::with_screen(pty, vt::Screen::answering(24, 80))
+        let (rows, cols) = UNSEEN_SIZE;
+        Term::with_screen(pty, vt::Screen::answering(rows, cols))
     }
 
     fn with_screen(pty: Option<Pty>, vt: vt::Screen) -> Term {

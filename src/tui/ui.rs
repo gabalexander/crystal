@@ -542,8 +542,8 @@ fn draw_tabs(frame: &mut Frame, app: &App, look: &Look, area: Rect) {
     let theme = look.theme;
     let in_front = app.tabs().current_index();
     let statuses = tab_statuses(app);
-    let labels = tab_labels(app.tabs().all(), &statuses, tabs_width(app, area));
-    for (index, (column, label)) in labels.into_iter().enumerate() {
+    let labels = tab_labels(app.tabs().all(), &statuses, tabs_width(app, area), in_front);
+    for (index, column, label) in labels {
         let style = if index == in_front {
             theme
                 .selection
@@ -572,12 +572,19 @@ fn tab_statuses(app: &App) -> Vec<Option<Status>> {
     (0..count).map(|index| app.tab_status(index)).collect()
 }
 
-/// The tabs' labels in a top bar `width` columns wide, each with the column
-/// it starts at: ` 1 `, or ` 2 review ` once the tab has a name, and
-/// ` 2 review ▲ ` with its status's mark when `statuses` gives it one.
-/// While they all fit they show their names; when they don't, only their
-/// numbers, and any that still don't fit are left off.
-pub fn tab_labels(tabs: &[Tab], statuses: &[Option<Status>], width: u16) -> Vec<(u16, String)> {
+/// The tabs' labels in a top bar `width` columns wide, each with the tab's
+/// index and the column it starts at: ` 1 `, or ` 2 review ` once the tab
+/// has a name, and ` 2 review ▲ ` with its status's mark when `statuses`
+/// gives it one. While they all fit they show their names; when they
+/// don't, only their numbers, and those that still don't fit are left off,
+/// from the end, or from the start as far as it takes to show the tab at
+/// `in_front`.
+pub fn tab_labels(
+    tabs: &[Tab],
+    statuses: &[Option<Status>],
+    width: u16,
+    in_front: usize,
+) -> Vec<(usize, u16, String)> {
     let room = width.saturating_sub(TABS_START + SUMMARY_ROOM);
     let labels = |named: bool| -> Vec<String> {
         let numbered = tabs.iter().zip(statuses).enumerate();
@@ -590,14 +597,22 @@ pub fn tab_labels(tabs: &[Tab], statuses: &[Option<Status>], width: u16) -> Vec<
     if all_named > room {
         shown = labels(false);
     }
+    let widths: Vec<u16> = shown.iter().map(|label| width_of(label)).collect();
+    // The first tab shown: the first of all, unless the one in front then
+    // wouldn't fit.
+    let mut first = 0;
+    let through_front = |first: usize| -> u16 { widths[first..=in_front].iter().sum() };
+    while in_front < widths.len() && first < in_front && through_front(first) > room {
+        first += 1;
+    }
     let mut placed = Vec::new();
     let mut used = 0;
-    for label in shown {
-        let width = width_of(&label);
+    for (index, label) in shown.into_iter().enumerate().skip(first) {
+        let width = widths[index];
         if used + width > room {
             break;
         }
-        placed.push((TABS_START + used, label));
+        placed.push((index, TABS_START + used, label));
         used += width;
     }
     placed
@@ -632,12 +647,17 @@ fn server_label(server: &str) -> String {
 /// there.
 fn tab_hit(app: &App, area: Rect, column: u16) -> Hit {
     let column = column - area.x;
-    let labels = tab_labels(app.tabs().all(), &tab_statuses(app), tabs_width(app, area));
-    let under = labels.iter().position(|(start, label)| {
+    let labels = tab_labels(
+        app.tabs().all(),
+        &tab_statuses(app),
+        tabs_width(app, area),
+        app.tabs().current_index(),
+    );
+    let under = labels.iter().find(|(_, start, label)| {
         let end = start + width_of(label);
         (*start..end).contains(&column)
     });
-    under.map_or(Hit::Elsewhere, Hit::Tab)
+    under.map_or(Hit::Elsewhere, |(index, _, _)| Hit::Tab(*index))
 }
 
 /// How many columns `text` takes on screen.
@@ -1747,12 +1767,34 @@ mod tests {
         };
         let tabs = [named("agents"), named("a-long-name-for-a-tab"), named("")];
         let labels = |width| -> Vec<String> {
-            let labels: Vec<(u16, String)> = tab_labels(&tabs, &[None; 3], width);
-            labels.into_iter().map(|(_, label)| label).collect()
+            let labels = tab_labels(&tabs, &[None; 3], width, 0);
+            labels.into_iter().map(|(_, _, label)| label).collect()
         };
         assert_eq!(labels(120), [" 1 agents ", " 2 a-long-name-for… ", " 3 "]);
         assert_eq!(labels(60), [" 1 ", " 2 ", " 3 "]);
         assert_eq!(labels(42), [" 1 ", " 2 "], "the last doesn't fit");
+    }
+
+    #[test]
+    fn tabs_that_dont_fit_are_left_off_from_the_start_to_show_the_one_in_front() {
+        let tabs = vec![Tab::default(); 20];
+        let statuses = [None; 20];
+        let labels = |in_front| -> Vec<(usize, String)> {
+            let labels = tab_labels(&tabs, &statuses, 60, in_front);
+            labels
+                .into_iter()
+                .map(|(index, _, label)| (index, label))
+                .collect()
+        };
+        let first = labels(0);
+        assert_eq!(first.first().unwrap().0, 0);
+        assert!(first.len() < 20, "{first:?}");
+        let last = labels(19);
+        assert_eq!(last.last().unwrap(), &(19, " 20 ".to_string()));
+        assert!(last.first().unwrap().0 > 0);
+        // The labels start where the first always does.
+        let start = tab_labels(&tabs, &statuses, 60, 19)[0].1;
+        assert_eq!(start, tab_labels(&tabs, &statuses, 60, 0)[0].1);
     }
 
     #[test]

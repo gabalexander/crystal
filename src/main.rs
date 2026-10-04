@@ -845,6 +845,15 @@ enum TabCommand {
     },
     /// Move a session to another tab.
     Move { session: String, tab: String },
+    /// Move a tab to another place among the tabs, the others making room.
+    Reorder {
+        /// The tab: its number, from 1, or its name.
+        tab: String,
+
+        /// The number it takes, from 1.
+        #[arg(value_parser = clap::value_parser!(u64).range(1..))]
+        position: u64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1619,6 +1628,10 @@ fn tab(socket: &Path, command: TabCommand) -> Result<()> {
         TabCommand::Rename { tab, name } => layout::Command::RenameTab { tab, name },
         TabCommand::Close { tab, kill } => layout::Command::CloseTab { tab, kill },
         TabCommand::Move { session, tab } => layout::Command::MoveToTab { session, tab },
+        TabCommand::Reorder { tab, position } => layout::Command::ReorderTab {
+            tab,
+            position: position as usize,
+        },
     };
     let layout = client::lay_out(socket, command)?;
     if new && let Some(tab) = layout.current() {

@@ -6,6 +6,8 @@
 
 mod commands;
 
+pub use commands::Alone;
+
 use super::away::{Away, Tally};
 use super::backlog_view::{BacklogChange, BacklogView, Step};
 use super::command_line;
@@ -16,7 +18,7 @@ use super::groups::{self, Row};
 use super::help;
 use super::issues::{self, IssuesView};
 use super::launcher::{self, Launcher, Memory, Run, Setup, Target};
-use super::layouts::{self, Layouts, LayoutsView, Which};
+use super::layouts::{self, Layouts, LayoutsView, Program, Programs, Which};
 use super::memory_view::MemoryView;
 use super::needs_you::{self, NeedsYouView};
 use super::plugins_view::{self, PluginsView};
@@ -29,7 +31,7 @@ use super::settings_view::{self, SettingsView};
 use super::split_tree::{Direction, Pane, SplitTree, Way};
 use super::status::Status;
 use super::switcher::{self, Switcher};
-use super::tabs::{self, Tabs};
+use super::tabs::Tabs;
 use super::text_input::TextInput;
 use super::timeline::{self, TimelineView};
 use super::tree_browser::TreeBrowser;
@@ -1567,19 +1569,43 @@ impl App {
     /// Puts the tabs back the way the layout called `name` had them, and
     /// closes the layouts view: see [`Self::set_tabs`]. Says how many of
     /// the layout's sessions have gone since, which it leaves out.
-    pub fn restore_layout(&mut self, tabs: Tabs, name: &str) {
+    pub fn restore_layout(&mut self, tabs: Tabs, name: &str, started: usize) {
         let gone = tabs
             .sessions()
             .filter(|name| self.position(name).is_none())
             .count();
         self.layouts = None;
         self.set_tabs(tabs);
-        let notice = match gone {
-            0 => format!("restored {name}"),
-            1 => format!("restored {name}: one of its sessions has gone"),
-            gone => format!("restored {name}: {gone} of its sessions have gone"),
+        let started = match started {
+            0 => None,
+            1 => Some("one of its sessions started again".to_string()),
+            started => Some(format!("{started} of its sessions started again")),
+        };
+        let gone = match gone {
+            0 => None,
+            1 => Some("one of its sessions has gone".to_string()),
+            gone => Some(format!("{gone} of its sessions have gone")),
+        };
+        let said: Vec<String> = started.into_iter().chain(gone).collect();
+        let notice = match said.is_empty() {
+            true => format!("restored {name}"),
+            false => format!("restored {name}: {}", said.join(", ")),
         };
         self.notify(notice);
+    }
+
+    /// What starts each session again, by name, but the one this TUI runs
+    /// in: those a layout saved now names, should they go.
+    pub fn programs(&self) -> Programs {
+        (self.sessions.iter())
+            .filter(|session| !self.is_own(session))
+            .filter_map(|session| Some((session.name.clone(), Program::of(session)?)))
+            .collect()
+    }
+
+    /// Whether there's a session called `name`.
+    pub fn has_session(&self, name: &str) -> bool {
+        self.position(name).is_some()
     }
 
     /// The backlog view, while it's open.
@@ -2503,6 +2529,8 @@ impl App {
             KeyCode::Char('>') => self.ask_where_to_move(),
             KeyCode::Char('[') => self.go_to_tab(self.tabs.previous()),
             KeyCode::Char(']') => self.go_to_tab(self.tabs.next()),
+            KeyCode::Char('{') => self.shift_tab(-1),
+            KeyCode::Char('}') => self.shift_tab(1),
             KeyCode::Char(digit @ '1'..='9') => self.go_to_tab_numbered(digit),
             KeyCode::PageUp => return Some(Action::PageBack(self.selected_slot()?)),
             KeyCode::PageDown => return Some(Action::PageForward(self.selected_slot()?)),
@@ -3978,10 +4006,7 @@ impl App {
     /// it, in the selected session's directory: a new tab is somewhere to
     /// start new work, and a shell is where that starts.
     fn new_tab(&mut self) -> Option<Action> {
-        let Some(index) = self.tabs.add() else {
-            self.notify_tabs_at_most();
-            return None;
-        };
+        let index = self.tabs.add();
         let dir = self.selected().map(|session| session.cwd.clone());
         self.go_to_tab(index);
         Some(Action::Start {
@@ -3989,11 +4014,6 @@ impl App {
             command: Vec::new(),
             purpose: Purpose::default(),
         })
-    }
-
-    fn notify_tabs_at_most(&mut self) {
-        let most = tabs::MAX_TABS;
-        self.notify(format!("{most} tabs at most: & closes the one in front"));
     }
 
     /// `>`: asks, on the footer, which tab to move the selected session to.
@@ -4009,10 +4029,7 @@ impl App {
     fn move_to_tab(&mut self, name: &str, key: KeyCode) {
         let to = match key {
             KeyCode::Char(digit @ '1'..='9') => digit as usize - '1' as usize,
-            KeyCode::Char('t') => match self.tabs.add() {
-                Some(index) => index,
-                None => return self.notify_tabs_at_most(),
-            },
+            KeyCode::Char('t') => self.tabs.add(),
             _ => return,
         };
         let number = to + 1;
@@ -4071,6 +4088,18 @@ impl App {
     fn go_to_tab_numbered(&mut self, digit: char) {
         if let Some(number) = digit.to_digit(10) {
             self.go_to_tab(number as usize - 1);
+        }
+    }
+
+    /// `{` and `}`: moves the tab in front one place to the left, `by` -1,
+    /// or to the right, `by` 1, past its neighbor. It stays in front.
+    fn shift_tab(&mut self, by: isize) {
+        let from = self.tabs.current_index();
+        let Some(to) = from.checked_add_signed(by) else {
+            return self.notify("this tab is the first already".into());
+        };
+        if !self.tabs.move_tab(from, to) {
+            self.notify("this tab is the last already".into());
         }
     }
 
@@ -6046,7 +6075,7 @@ mod tests {
     fn enter_in_the_layouts_asks_for_the_one_the_bar_is_on() {
         let mut app = app_with(&["a"]);
         let mut layouts = Layouts::default();
-        layouts.save("work", app.tabs_to_keep(), 10);
+        layouts.save("work", app.tabs_to_keep(), app.programs(), 10);
         app.show_layouts(Ok(layouts), None);
         assert_eq!(
             press(&mut app, KeyCode::Enter),
@@ -6076,7 +6105,7 @@ mod tests {
         // a has gone since the layout was saved; d is new.
         app.set_sessions(vec![session("b"), session("c"), session("d")]);
         app.show_layouts(Ok(Layouts::default()), None);
-        app.restore_layout(saved, "work");
+        app.restore_layout(saved.clone(), "work", 0);
         assert!(app.layouts_view().is_none());
         assert_eq!(app.tabs().all().len(), 1);
         assert_eq!(app.tabs().current().name, "work");
@@ -6089,6 +6118,20 @@ mod tests {
             app.notice(),
             Some("restored work: one of its sessions has gone")
         );
+        app.restore_layout(saved, "work", 2);
+        assert_eq!(
+            app.notice(),
+            Some("restored work: 2 of its sessions started again, one of its sessions has gone")
+        );
+    }
+
+    #[test]
+    fn a_layout_saves_what_starts_each_session_but_the_tui_s_own() {
+        let mut app = App::new(Some("me".into()));
+        app.set_sessions(vec![session("a"), session("me")]);
+        let programs = app.programs();
+        assert_eq!(programs.keys().collect::<Vec<_>>(), ["a"]);
+        assert_eq!(programs["a"].command, ["sh"]);
     }
 
     #[test]
@@ -6680,13 +6723,43 @@ mod tests {
     }
 
     #[test]
-    fn nine_tabs_at_most_and_a_tenth_says_so() {
+    fn there_can_be_a_tenth_tab_and_more() {
         let mut app = app_with(&["a"]);
-        for _ in 0..9 {
+        for _ in 0..11 {
             press(&mut app, KeyCode::Char('t'));
         }
-        assert_eq!(app.tabs().all().len(), 9);
-        assert!(app.notice().unwrap().contains("9 tabs at most"));
+        assert_eq!(app.tabs().all().len(), 12);
+        assert_eq!(app.tabs().current_index(), 11);
+        press(&mut app, KeyCode::Char('9'));
+        assert_eq!(app.tabs().current_index(), 8);
+    }
+
+    #[test]
+    fn braces_move_the_tab_in_front_and_it_stays_in_front() {
+        let mut app = app_with(&["a"]);
+        press(&mut app, KeyCode::Char('T'));
+        answer(&mut app, "one");
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('t'));
+        let names = |app: &App| -> Vec<String> {
+            app.tabs()
+                .all()
+                .iter()
+                .map(|tab| tab.name.clone())
+                .collect()
+        };
+        press(&mut app, KeyCode::Char('{'));
+        assert_eq!(names(&app), ["", "one"]);
+        assert_eq!(app.tabs().current_index(), 0);
+        press(&mut app, KeyCode::Char('{'));
+        assert_eq!(app.notice(), Some("this tab is the first already"));
+        press(&mut app, KeyCode::Char('}'));
+        assert_eq!(names(&app), ["one", ""]);
+        assert_eq!(app.tabs().current_index(), 1);
+        press(&mut app, KeyCode::Char('}'));
+        assert_eq!(app.notice(), Some("this tab is the last already"));
+        // The session stays in its tab, which moved with it.
+        assert_eq!(app.tabs().all()[0].sessions, ["a"]);
     }
 
     #[test]

@@ -6,11 +6,55 @@
 //! a session.
 
 use super::{Action, App, Slot, resize_step};
+use crate::flow_run::FlowRun;
 use crate::layout::{Command, Layout, Order, TabLayout, Tile};
+use crate::protocol::SessionInfo;
+use crate::session::UNSEEN_SIZE;
 use crate::tui::split_tree::{Direction, Pane, SplitTree, Way};
-use crate::tui::tabs::MAX_TABS;
+use crate::tui::tabs::Tabs;
+use crate::tui::ui::Areas;
+use ratatui::layout::Rect;
+
+/// What came of a layout command carried out with no TUI open.
+pub struct Alone {
+    /// The layout it came to, as a TUI would answer with.
+    pub layout: Layout,
+    /// The tabs as they are now, to keep for the next TUI to open with.
+    pub tabs: Tabs,
+    /// The sessions a tab closed with them leaves to be killed.
+    pub kill: Vec<String>,
+}
 
 impl App {
+    /// Carries out a layout command with no TUI open, the way the TUI used
+    /// last would have: on `tabs`, as the TUIs last kept them, with
+    /// `sessions` and `flows` as they are now, on a screen the size a
+    /// session has when nobody is looking at it.
+    pub fn obey_alone(
+        sessions: Vec<SessionInfo>,
+        flows: Vec<FlowRun>,
+        tabs: Tabs,
+        order: Order,
+    ) -> Result<Alone, String> {
+        let mut app = App::new(None);
+        let (rows, cols) = UNSEEN_SIZE;
+        let screen = Rect::new(0, 0, cols, rows);
+        app.set_screen(screen);
+        app.flows = flows;
+        app.set_sessions(sessions);
+        app.set_tabs(tabs);
+        app.set_tiles(Areas::of(&app, screen).tiles);
+        let kill = match app.obey(order)? {
+            Some(Action::KillAll(names)) => names,
+            _ => Vec::new(),
+        };
+        Ok(Alone {
+            layout: app.layout(),
+            tabs: app.tabs_to_keep(),
+            kill,
+        })
+    }
+
     /// Carries out a layout command from the command line, or says why it
     /// can't. Closing a tab with its sessions leaves killing them to the
     /// event loop.
@@ -67,7 +111,7 @@ impl App {
     ) -> Result<Option<Action>, String> {
         match command {
             Command::Show => {}
-            Command::NewTab { name } => self.add_tab(name.as_deref())?,
+            Command::NewTab { name } => self.add_tab(name.as_deref()),
             Command::SelectTab { tab } => {
                 let index = self.tab_named(&tab)?;
                 self.go_to_tab(index);
@@ -81,6 +125,17 @@ impl App {
                 let name = self.session_named(&session)?;
                 let to = self.tab_named(&tab)?;
                 self.move_session(&name, to);
+            }
+            Command::ReorderTab { tab, position } => {
+                let from = self.tab_named(&tab)?;
+                let to = position.checked_sub(1).ok_or("tabs are numbered from 1")?;
+                if !self.tabs.move_tab(from, to) {
+                    let count = match self.tabs.all().len() {
+                        1 => "only one tab".to_string(),
+                        count => format!("{count} tabs"),
+                    };
+                    return Err(format!("there's no place {position} among {count}"));
+                }
             }
             Command::Split {
                 session,
@@ -296,16 +351,12 @@ impl App {
     /// Makes a tab after the others, named `name` if there's one, and brings
     /// it to the front, where sessions started from then on go. Unlike `t`,
     /// it starts nothing in it.
-    fn add_tab(&mut self, name: Option<&str>) -> Result<(), String> {
-        let index = self
-            .tabs
-            .add()
-            .ok_or_else(|| format!("{MAX_TABS} tabs at most"))?;
+    fn add_tab(&mut self, name: Option<&str>) {
+        let index = self.tabs.add();
         self.go_to_tab(index);
         if let Some(name) = name {
             self.tabs.tab_mut(index).rename(name);
         }
-        Ok(())
     }
 
     /// Closes the tab `tab` names, or the one in front. One with sessions
@@ -650,11 +701,35 @@ mod tests {
         let current = layout.current().unwrap();
         assert_eq!((current.number, current.name.as_str()), (2, "review"));
         assert!(current.sessions.is_empty());
-        for _ in 2..MAX_TABS {
+        for _ in 2..12 {
             obey(&mut app, Command::NewTab { name: None }).unwrap();
         }
-        let said = obey(&mut app, Command::NewTab { name: None }).unwrap_err();
-        assert_eq!(said, "9 tabs at most");
+        assert_eq!(app.layout().current().unwrap().number, 12);
+    }
+
+    #[test]
+    fn a_tab_reordered_takes_its_place_and_the_one_in_front_stays() {
+        let mut app = two_tabs();
+        let reorder = |tab: &str, position| Command::ReorderTab {
+            tab: tab.into(),
+            position,
+        };
+        let in_front = app.layout().current().unwrap().sessions.clone();
+        obey(&mut app, reorder("1", 2)).unwrap();
+        let layout = app.layout();
+        assert_eq!(layout.current().unwrap().sessions, in_front);
+        assert_eq!(
+            layout.tabs[1].sessions,
+            two_tabs().layout().tabs[0].sessions
+        );
+        assert_eq!(
+            obey(&mut app, reorder("1", 3)).unwrap_err(),
+            "there's no place 3 among 2 tabs"
+        );
+        assert_eq!(
+            obey(&mut app, reorder("1", 0)).unwrap_err(),
+            "tabs are numbered from 1"
+        );
     }
 
     #[test]

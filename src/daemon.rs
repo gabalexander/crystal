@@ -8,6 +8,7 @@ use crate::backlog;
 use crate::catalog;
 use crate::codex;
 use crate::config::{Config, MemorySettings};
+use crate::db;
 use crate::db::Db;
 use crate::distill::{self, Job};
 use crate::embed;
@@ -20,7 +21,8 @@ use crate::front;
 use crate::git;
 use crate::handoff;
 use crate::handover::{self, Gate, Ticket};
-use crate::layout_relay::Relay;
+use crate::layout::{Layout, Order};
+use crate::layout_relay::{NoTui, Relay};
 use crate::mcp;
 use crate::memory::{self, Added};
 use crate::names;
@@ -40,7 +42,7 @@ use crate::spending::Spending;
 use crate::state::{self, SavedSession};
 use crate::tasks;
 use crate::typing;
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use regex::Regex;
 use std::collections::{BTreeMap, HashSet};
 use std::convert::Infallible;
@@ -1427,25 +1429,7 @@ impl Daemon {
                 Ok(Response::Done)
             }
             Request::Kill { name } => {
-                let mut sessions = self.sessions.lock().unwrap();
-                let index = sessions
-                    .iter()
-                    .position(|session| session.name == name)
-                    .with_context(|| format!("no session named {name}"))?;
-                let mut session = sessions.remove(index);
-                let cancelled = tasks::enabled(&settings())
-                    .then(|| session.cancel_task("its session was killed"))
-                    .flatten();
-                if let Some(cancelled) = cancelled {
-                    self.write_down_closed(&session, &cancelled);
-                }
-                let info = session.info();
-                session.stop();
-                if info.state == State::Running {
-                    self.events.emit(Event::ended(&info, "killed".into()));
-                }
-                self.events
-                    .emit(Event::about_session(Kind::SessionRemoved, &info));
+                self.kill(&name)?;
                 Ok(Response::Done)
             }
             Request::Emit { event } => {
@@ -1458,7 +1442,10 @@ impl Daemon {
             | Request::TakeLayoutOrders { .. } => {
                 bail!("this takes the connection over")
             }
-            Request::Layout(order) => Ok(Response::Layout(self.layout.pass(order)?)),
+            Request::Layout(order) => match self.layout.pass(order.clone()) {
+                Err(err) if err.is::<NoTui>() => Ok(Response::Layout(self.lay_out_alone(order)?)),
+                passed => Ok(Response::Layout(passed?)),
+            },
             Request::Rename { name, new_name } => {
                 let mut sessions = self.sessions.lock().unwrap();
                 if new_name != name {
@@ -2056,6 +2043,52 @@ impl Daemon {
         }
         let _ = conn.shutdown(Shutdown::Both);
         Ok(())
+    }
+
+    /// Kills the session called `name` and lets go of it, cancelling its
+    /// task if it has one open.
+    fn kill(&self, name: &str) -> Result<()> {
+        let mut sessions = self.sessions.lock().unwrap();
+        let index = sessions
+            .iter()
+            .position(|session| session.name == name)
+            .with_context(|| format!("no session named {name}"))?;
+        let mut session = sessions.remove(index);
+        let cancelled = tasks::enabled(&settings())
+            .then(|| session.cancel_task("its session was killed"))
+            .flatten();
+        if let Some(cancelled) = cancelled {
+            self.write_down_closed(&session, &cancelled);
+        }
+        let info = session.info();
+        session.stop();
+        if info.state == State::Running {
+            self.events.emit(Event::ended(&info, "killed".into()));
+        }
+        self.events
+            .emit(Event::about_session(Kind::SessionRemoved, &info));
+        Ok(())
+    }
+
+    /// Carries out a layout command with no TUI open to: on the tabs as the
+    /// TUIs last kept them, the way the TUI would have, and keeps them in
+    /// their place, for the next TUI to open with. A tab closed with its
+    /// sessions has them killed.
+    fn lay_out_alone(&self, order: Order) -> Result<Layout> {
+        let sessions = self.sessions.lock().unwrap();
+        let infos = sessions.iter().map(Session::info).collect();
+        drop(sessions);
+        let flows = self.flows.lock().unwrap().clone();
+        let db = self.db.lock().unwrap();
+        let kept = db.ui(db::TABS)?;
+        let alone = crate::tui::obey_alone(infos, flows, kept.as_deref(), order)
+            .map_err(|why| anyhow!(why))?;
+        db.keep_ui(db::TABS, &alone.tabs)?;
+        drop(db);
+        for name in &alone.kill {
+            self.kill(name)?;
+        }
+        Ok(alone.layout)
     }
 
     /// Runs an ended session's command again, in its directory and under

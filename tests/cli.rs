@@ -689,7 +689,11 @@ fn a_resize_reaches_the_program() {
     let terminal = crystal.attach(&["attach", "sizer"]);
     terminal.shows("watching");
     terminal.resize(30, 100);
-    assert_eq!(written(&crystal.dir.path().join("size")), "30 100\n");
+    // Attaching sized it first: it was 120 by 40 until then.
+    let file = crystal.dir.path().join("size");
+    eventually("the program hears its new size", || {
+        std::fs::read_to_string(&file).is_ok_and(|size| size == "30 100\n")
+    });
 }
 
 #[test]
@@ -2462,11 +2466,14 @@ fn a_layout_saved_puts_the_tabs_back_the_way_they_were() {
     tui.hides("beta is here");
     tui.type_keys("T\x15\r");
     tui.hides("review");
+    // beta goes, and the layout starts it again.
+    crystal.ok(&["kill", "beta"]);
+    sidebar_hides(&tui, "beta");
 
     tui.type_keys("S");
     tui.shows("side by side");
     tui.type_keys("\r");
-    tui.shows("restored side by side");
+    tui.shows("restored side by side: one of its sessions started again");
     tui.shows("1 review");
     tui.shows("alpha is here");
     tui.shows("beta is here");
@@ -2476,6 +2483,23 @@ fn a_layout_saved_puts_the_tabs_back_the_way_they_were() {
     tui.shows("↶ before side by side");
     let layouts = crystal.query("SELECT json FROM ui WHERE name = 'layouts'");
     assert!(layouts.unwrap().contains("side by side"));
+}
+
+#[test]
+fn a_session_nobody_has_looked_at_is_120_columns_by_40_rows() {
+    let crystal = Crystal::new();
+    crystal.ok(&[
+        "new",
+        "-n",
+        "unseen",
+        "sh",
+        "-c",
+        "stty size > size; sleep 30",
+    ]);
+    let file = crystal.dir.path().join("size");
+    eventually("the session says its size", || {
+        std::fs::read_to_string(&file).is_ok_and(|size| size == "40 120\n")
+    });
 }
 
 #[test]
@@ -3116,13 +3140,53 @@ fn a_daemon_from_before_handovers_is_restarted_cold() {
 }
 
 #[test]
-fn layout_commands_need_a_tui() {
+fn layout_commands_with_no_tui_open_lay_out_the_tabs_it_opens_with() {
     let crystal = Crystal::new();
-    let said = crystal.fails(&["layout"]);
-    assert!(said.contains("no TUI is running"), "{said}");
-    crystal.ok(&["new", "-d", "-n", "alpha", "sleep", "30"]);
-    let said = crystal.fails(&["pane", "split", "alpha"]);
-    assert!(said.contains("no TUI is running"), "{said}");
+    // With no daemon running even, one starts, and there's the one tab.
+    assert_eq!(
+        crystal.ok(&["layout"]),
+        "1 (in front)\n  sessions  none\n  panes\n    the selection's: nothing yet\n"
+    );
+    sessions_saying_here(&crystal, &["alpha", "beta"]);
+
+    // A tab closed with --kill has its sessions killed.
+    assert_eq!(crystal.ok(&["tab", "new", "scratch"]), "2\n");
+    sessions_saying_here(&crystal, &["delta"]);
+    crystal.ok(&["tab", "close", "scratch", "--kill"]);
+    assert!(crystal.row("delta").is_none());
+
+    sessions_saying_here(&crystal, &["gamma"]);
+    crystal.ok(&["pane", "split", "beta", "--beside", "alpha"]);
+    assert_eq!(crystal.ok(&["tab", "new", "review"]), "2\n");
+    crystal.ok(&["tab", "move", "gamma", "review"]);
+    crystal.ok(&["tab", "reorder", "review", "1"]);
+    let layout = crystal.ok(&["layout"]);
+    assert!(
+        layout.starts_with("1 review (in front)\n  sessions  gamma\n"),
+        "{layout}"
+    );
+    assert!(
+        layout.contains("\n2\n  sessions  alpha, beta\n"),
+        "{layout}"
+    );
+    assert!(
+        layout.contains("side by side, 50% first\n      the selection's: alpha\n      beta\n"),
+        "{layout}"
+    );
+    let said = crystal.fails(&["tab", "close", "1"]);
+    assert!(said.contains("--kill closes it"), "{said}");
+    let said = crystal.fails(&["tab", "reorder", "review", "3"]);
+    assert!(said.contains("there's no place 3"), "{said}");
+
+    // The TUI opens on the tabs as the commands left them, and takes the
+    // commands from then on.
+    let tui = crystal.tui();
+    tui.shows(" 1 review ");
+    sidebar_shows(&tui, "gamma");
+    tui.shows("gamma is here");
+    crystal.ok(&["tab", "select", "2"]);
+    sidebar_shows(&tui, "alpha");
+    tui.shows("beta is here");
 }
 
 #[test]

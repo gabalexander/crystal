@@ -272,6 +272,17 @@ pub enum Event {
     Away(Result<away::Tally, String>),
 }
 
+/// Carries out a layout command with no TUI open, on the tabs as the TUIs
+/// last kept them, `kept`: see [`App::obey_alone`].
+pub(crate) fn obey_alone(
+    sessions: Vec<SessionInfo>,
+    flows: Vec<FlowRun>,
+    kept: Option<&str>,
+    order: Order,
+) -> Result<app::Alone, String> {
+    App::obey_alone(sessions, flows, tabs::read(kept), order)
+}
+
 pub fn run(socket: &Path) -> Result<()> {
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         bail!("crystal needs a terminal; see crystal --help for the commands");
@@ -635,6 +646,22 @@ impl Tui {
     /// Whether the timeline still follows the log under the number `feed`.
     fn following(&self, feed: u64) -> bool {
         self.feed.load(Ordering::Relaxed) == feed
+    }
+
+    /// Starts again the sessions a layout being restored names that have
+    /// gone, those it has `programs` for, each under its name, and says how
+    /// many started. One that can't, its directory gone, say, stays gone.
+    fn start_again(&self, programs: &layouts::Programs) -> usize {
+        let gone = programs
+            .iter()
+            .filter(|(name, _)| !self.app.has_session(name));
+        let started = gone.filter(|(name, program)| {
+            let name = Some(name.to_string());
+            let (cwd, command) = (program.cwd.clone(), program.command.clone());
+            let purpose = client::Purpose::default();
+            client::new_session_for(&self.socket, name, cwd, command, purpose).is_ok()
+        });
+        started.count()
     }
 
     /// Writes the tabs down when they've changed, so that they're there the
@@ -1344,7 +1371,8 @@ impl Tui {
             Action::SaveLayout(name) => {
                 let mut kept = self.layouts().map_err(anyhow::Error::msg)?;
                 let tabs = self.app.tabs_to_keep();
-                let replaced = kept.save(&name, tabs, seconds_since_epoch());
+                let programs = self.app.programs();
+                let replaced = kept.save(&name, tabs, programs, seconds_since_epoch());
                 self.keep_layouts(&kept)?;
                 self.app
                     .show_layouts(Ok(kept), Some(&Which::Saved(name.clone())));
@@ -1358,11 +1386,17 @@ impl Tui {
                     Which::Saved(name) => name.clone(),
                     Which::Before => "the tabs from before".to_string(),
                 };
-                let Some(tabs) = kept.restore(&which, current, seconds_since_epoch()) else {
+                let programs = self.app.programs();
+                let now = seconds_since_epoch();
+                let Some(restored) = kept.restore(&which, current, programs, now) else {
                     bail!("{name} can't be restored: it's from another crystal");
                 };
                 self.keep_layouts(&kept)?;
-                self.app.restore_layout(tabs, &name);
+                let started = self.start_again(&restored.programs);
+                if started > 0 {
+                    self.refresh_sessions()?;
+                }
+                self.app.restore_layout(restored.tabs, &name, started);
             }
             Action::FollowEvents => self.follow_events(),
             Action::StopFollowing => {

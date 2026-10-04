@@ -1,16 +1,16 @@
 //! Laying out the TUI from the command line: `crystal tab`, `crystal pane`
-//! and `crystal layout`. The tabs and their panes are the TUI's, not the
-//! daemon's, so a command goes through the daemon to the TUI used last,
-//! which carries it out and answers with the layout it came to: see
-//! [`crate::layout_relay`]. This is what goes between them, and how
+//! and `crystal layout`. A command goes through the daemon to the TUI used
+//! last, which carries it out and answers with the layout it came to: see
+//! [`crate::layout_relay`]. With no TUI open, the daemon carries it out
+//! itself, the same way, on the tabs the TUIs keep in the database, where
+//! the next TUI to open finds them. This is what goes between them, and how
 //! `crystal layout` prints a layout.
 
 use crate::tui::split_tree::{Direction, Way};
 use serde::{Deserialize, Serialize};
 
-/// What a command is told with no TUI to carry it out.
-pub const NO_TUI: &str =
-    "no TUI is running: the tabs and panes are the TUI's; open it with `crystal`";
+/// Why an order can't be passed on to a TUI: none is open.
+pub const NO_TUI: &str = "no TUI is running";
 
 /// What a TUI is asked to do with its tabs and panes. A session named is
 /// one of the TUI's; one that isn't named is the session the command was
@@ -32,6 +32,8 @@ pub enum Command {
     CloseTab { tab: Option<String>, kill: bool },
     /// Move a session to another tab.
     MoveToTab { session: String, tab: String },
+    /// Move a tab to `position`, from 1, the others making room.
+    ReorderTab { tab: String, position: usize },
     /// Show `session` in a pane of its own, split off `way` from the pane
     /// of `beside`, which keeps `ratio` of the room.
     Split {

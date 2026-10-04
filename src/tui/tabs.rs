@@ -14,9 +14,6 @@
 use super::split_tree::{Pane, SplitTree, Way};
 use serde::{Deserialize, Serialize};
 
-/// How many tabs there can be: one for each of the keys 1 to 9.
-pub const MAX_TABS: usize = 9;
-
 /// Which shape the tabs are kept in. Tabs kept in the shape before, when a
 /// tab's panes were a list, are read too, the list made a tree; those of
 /// any other shape, like the one tabs were kept in before they held their
@@ -154,14 +151,30 @@ impl Tabs {
         &mut self.tabs[index]
     }
 
-    /// Adds an empty tab after the others, and says where it went: `None`
-    /// when there's no room for another. The tab in front stays in front.
-    pub fn add(&mut self) -> Option<usize> {
-        if self.tabs.len() >= MAX_TABS {
-            return None;
-        }
+    /// Adds an empty tab after the others, and says where it went. The tab
+    /// in front stays in front.
+    pub fn add(&mut self) -> usize {
         self.tabs.push(Tab::default());
-        Some(self.tabs.len() - 1)
+        self.tabs.len() - 1
+    }
+
+    /// Moves the tab at `from` to `to`, the others making room, and says
+    /// whether both are tabs. The tab in front stays in front, wherever it
+    /// went.
+    pub fn move_tab(&mut self, from: usize, to: usize) -> bool {
+        if from >= self.tabs.len() || to >= self.tabs.len() {
+            return false;
+        }
+        let in_front = self.current;
+        let tab = self.tabs.remove(from);
+        self.tabs.insert(to, tab);
+        self.current = match in_front {
+            moved if moved == from => to,
+            before if from < before && before <= to => before - 1,
+            after if to <= after && after < from => after + 1,
+            unmoved => unmoved,
+        };
+        true
     }
 
     /// Brings the tab at `index` to the front, if there is one there. Says
@@ -279,12 +292,10 @@ impl Tabs {
     }
 
     /// Tabs as read back, put right where they couldn't have been kept that
-    /// way: one tab at least and [`MAX_TABS`] at most, each
-    /// with panes of its own sessions only, each in one pane, a float of its
+    /// way: one tab at least, each with panes of its own sessions only, each in one pane, a float of its
     /// own that isn't split off too, and one pane following the selection;
     /// no session in two tabs, and the one in front among them.
     fn checked(mut self) -> Tabs {
-        self.tabs.truncate(MAX_TABS);
         if self.tabs.is_empty() {
             return Tabs::default();
         }
@@ -405,7 +416,7 @@ mod tests {
         let mut tabs = Tabs::default();
         tabs.rename("a");
         for name in ["b", "c"] {
-            let added = tabs.add().unwrap();
+            let added = tabs.add();
             tabs.go_to(added);
             tabs.rename(name);
         }
@@ -443,20 +454,44 @@ mod tests {
     fn a_new_tab_goes_after_the_others_empty_and_the_one_in_front_stays() {
         let mut tabs = Tabs::default();
         tabs.put("agent", 0);
-        assert_eq!(tabs.add(), Some(1));
+        assert_eq!(tabs.add(), 1);
         assert_eq!(tabs.current_index(), 0);
         assert!(tabs.all()[1].sessions.is_empty());
         assert_eq!(in_front(&tabs), ["agent"]);
     }
 
     #[test]
-    fn nine_tabs_at_most() {
+    fn there_can_be_more_tabs_than_the_digit_keys() {
         let mut tabs = Tabs::default();
-        for _ in 1..MAX_TABS {
-            assert!(tabs.add().is_some());
+        for added in 1..12 {
+            assert_eq!(tabs.add(), added);
         }
-        assert_eq!(tabs.add(), None);
-        assert_eq!(tabs.all().len(), MAX_TABS);
+        assert_eq!(tabs.all().len(), 12);
+    }
+
+    #[test]
+    fn a_tab_moves_and_the_one_in_front_stays_in_front() {
+        let mut tabs = three_tabs();
+        // c, in front, goes first.
+        assert!(tabs.move_tab(2, 0));
+        assert_eq!(names(&tabs), ["c", "a", "b"]);
+        assert_eq!(tabs.current_index(), 0);
+        // a goes last, past c, in front, which stays where it is.
+        assert!(tabs.move_tab(1, 2));
+        assert_eq!(names(&tabs), ["c", "b", "a"]);
+        assert_eq!(tabs.current_index(), 0);
+        tabs.go_to(1);
+        // c goes past b, in front, which takes its place.
+        assert!(tabs.move_tab(0, 2));
+        assert_eq!(names(&tabs), ["b", "a", "c"]);
+        assert_eq!(tabs.current().name, "b");
+        // a goes ahead of b, in front, which makes room.
+        assert!(tabs.move_tab(1, 0));
+        assert_eq!(names(&tabs), ["a", "b", "c"]);
+        assert_eq!(tabs.current().name, "b");
+        assert!(!tabs.move_tab(3, 0));
+        assert!(!tabs.move_tab(0, 3));
+        assert_eq!(names(&tabs), ["a", "b", "c"]);
     }
 
     #[test]
@@ -734,8 +769,8 @@ mod tests {
         let many = [tab; 12].join(",");
         let text = format!(r#"{{"version": 3, "tabs": [{many}], "current": 20}}"#);
         let tabs = read(Some(&text));
-        assert_eq!(tabs.all().len(), MAX_TABS);
-        assert_eq!(tabs.current_index(), MAX_TABS - 1);
+        assert_eq!(tabs.all().len(), 12);
+        assert_eq!(tabs.current_index(), 11);
         assert_eq!(tabs.all()[0].sessions, ["a", "b", "c"]);
         // d isn't the tab's, a is in one pane only, and the selection's
         // pane, missing, is put beside them.
