@@ -29,8 +29,11 @@ const RESET: &str = "\x1b[0m";
 /// Something in Claude's stream worth showing, or remembering.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Event {
-    /// The run has started, in this conversation.
-    Started { conversation: String },
+    /// The run has started, in this conversation, on this model.
+    Started {
+        conversation: String,
+        model: Option<String>,
+    },
     /// Claude said something.
     Said(String),
     /// Claude used a tool: its name, and the gist of what it asked of it.
@@ -206,7 +209,11 @@ fn finished_lines(outcome: &Outcome) -> String {
 
 fn started(event: &Value) -> Option<Event> {
     let conversation = event["session_id"].as_str()?.to_string();
-    Some(Event::Started { conversation })
+    let model = event["model"].as_str().map(String::from);
+    Some(Event::Started {
+        conversation,
+        model,
+    })
 }
 
 /// A message's content blocks: text, tool uses, tool results.
@@ -344,11 +351,12 @@ mod tests {
 
     #[test]
     fn the_first_event_names_the_conversation() {
-        let line = r#"{"type":"system","subtype":"init","session_id":"abc","cwd":"/x"}"#;
+        let line = r#"{"type":"system","subtype":"init","session_id":"abc","cwd":"/x","model":"claude-opus-5-5"}"#;
         assert_eq!(
             events(line),
             [Event::Started {
-                conversation: "abc".into()
+                conversation: "abc".into(),
+                model: Some("claude-opus-5-5".into()),
             }]
         );
     }

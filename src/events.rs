@@ -927,6 +927,8 @@ pub fn example(kind: Kind, session: Option<&SessionInfo>, dir: &Path) -> Event {
             asking: None,
             reporter: None,
             subagents: 0,
+            model: None,
+            line: None,
             bell: false,
         },
     };
@@ -1227,6 +1229,8 @@ mod tests {
             asking: None,
             reporter: None,
             subagents: 0,
+            model: None,
+            line: None,
             bell: false,
         }
     }

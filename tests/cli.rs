@@ -5211,6 +5211,34 @@ fn a_worktree_whose_last_session_is_killed_stays_until_shift_w_removes_it() {
 }
 
 #[test]
+fn a_worktree_s_line_counts_its_changes_and_a_folded_project_stays_folded() {
+    let crystal = Crystal::new();
+    let repo = git_repo(crystal.dir.path(), "app");
+    // A new file of two lines, not committed.
+    std::fs::write(repo.join("notes.txt"), "one\ntwo\n").unwrap();
+    let repo_arg = repo.to_str().unwrap();
+    crystal.ok(&["new", "-n", "planner", "-c", repo_arg, "sleep", "30"]);
+    let mut tui = crystal.tui();
+    tui.shows("⌂ main");
+    tui.shows("+1 ±2");
+
+    // `h` folds the project down to its heading, which says what's in it.
+    tui.type_keys("h");
+    tui.shows("app (1)");
+    tui.hides("+1 ±2");
+    tui.type_keys("q");
+    assert!(tui.exit());
+
+    // Folded it stays, the next time; `l` unfolds it.
+    let mut tui = crystal.tui();
+    tui.shows("app (1)");
+    tui.hides("+1 ±2");
+    tui.type_keys("l");
+    tui.shows("+1 ±2");
+    tui.hides("app (1)");
+}
+
+#[test]
 fn a_worktree_in_the_middle_of_a_rebase_keeps_its_branch_and_says_so() {
     let crystal = Crystal::new();
     let repo = git_repo(crystal.dir.path(), "app");
@@ -11041,6 +11069,99 @@ fn a_report_that_cant_be_taken_says_why() {
     assert!(!out.status.success());
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("isn't running in a crystal session"), "{err}");
+}
+
+#[test]
+fn a_line_and_a_model_reported_for_a_session_show_on_its_row() {
+    let crystal = Crystal::new();
+    crystal.ok(&["new", "-d", "-n", "indexer", "sleep", "30"]);
+    crystal.ok(&[
+        "report",
+        "-n",
+        "indexer",
+        "--line",
+        "indexing 40%",
+        "--model",
+        "pi-large",
+    ]);
+    let listed = crystal.listed("indexer");
+    assert_eq!(listed["line"], "indexing 40%", "{listed}");
+    assert_eq!(listed["model"], "pi-large", "{listed}");
+    // For the sidebar alone: the status is still crystal's to read.
+    assert_eq!(listed["status"], "running", "{listed}");
+    assert!(listed["reporter"].is_null(), "{listed}");
+    let tui = crystal.tui();
+    tui.shows("indexing 40%");
+    tui.shows("indexer pi-large");
+
+    // A report numbered lower than the last from its source came late.
+    let numbered = |seq: &str, line: &str| {
+        crystal.ok(&[
+            "report", "-n", "indexer", "--source", "ci", "--seq", seq, "--line", line,
+        ]);
+    };
+    numbered("2", "the second report");
+    numbered("1", "the first report");
+    assert_eq!(crystal.listed("indexer")["line"], "the second report");
+    tui.shows("the second report");
+
+    // A line given a while goes once it's up; an empty one takes it off.
+    crystal.ok(&["report", "-n", "indexer", "--line", "brief", "--ttl", "1s"]);
+    assert_eq!(crystal.listed("indexer")["line"], "brief");
+    eventually("the line's time is up", || {
+        crystal.listed("indexer")["line"].is_null()
+    });
+    tui.hides("brief");
+    crystal.ok(&["report", "-n", "indexer", "--model", ""]);
+    assert!(crystal.listed("indexer")["model"].is_null());
+
+    let err = crystal.fails(&["report", "-n", "indexer", "--line", "x", "--ttl", "25h"]);
+    assert!(err.contains("from a second to a day"), "{err}");
+    let err = crystal.fails(&["report", "-n", "indexer", "--line", "x", "--source", "a b"]);
+    assert!(err.contains("letters, digits"), "{err}");
+    crystal.fails(&["report", "-n", "indexer", "--ttl", "5s"]);
+}
+
+#[test]
+fn an_agent_s_model_follows_its_hooks_and_a_switch_in_its_transcript() {
+    let crystal = Crystal::new();
+    let bin = fake_claude(crystal.dir.path());
+    let out = crystal
+        .command(&["new", "-n", "agent", "claude", "--model", "opus"])
+        .env("PATH", path_of(&[&bin]))
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    // Until anything else says, the model its command gave it.
+    eventually("the command's model shows", || {
+        crystal.listed("agent")["model"] == "opus"
+    });
+    let args = written(&crystal.dir.path().join("args"));
+    let settings = claude_settings(&args);
+    let hook = settings["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+        .as_str()
+        .unwrap();
+
+    // Its hooks say the model it started on, and where its conversation is.
+    let transcript = crystal.dir.path().join("conv-1.jsonl");
+    let started = serde_json::json!({
+        "hook_event_name": "SessionStart",
+        "source": "startup",
+        "session_id": "conv-1",
+        "transcript_path": transcript,
+        "model": "claude-opus-5-5",
+    });
+    run_hook(&crystal, "agent", hook, &started.to_string());
+    assert_eq!(crystal.listed("agent")["model"], "claude-opus-5-5");
+
+    // `/model` fires no hook: the switch is read from the conversation.
+    let switched = r#"{"type":"user","message":{"content":"<local-command-stdout>Set model to `Sonnet 5` and saved as your default</local-command-stdout>"}}"#;
+    std::fs::write(&transcript, format!("{switched}\n")).unwrap();
+    eventually("the switch shows", || {
+        crystal.listed("agent")["model"] == "Sonnet 5"
+    });
+    let tui = crystal.tui();
+    tui.shows("agent sonnet 5");
 }
 
 #[test]

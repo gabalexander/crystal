@@ -390,6 +390,22 @@ pub fn hook_cwd(input: &Value) -> Option<PathBuf> {
     input["cwd"].as_str().map(PathBuf::from)
 }
 
+/// The model a hook's input says the agent runs on, as Claude Code's and
+/// Codex's say as a session starts: its id, or an object with one. Not a
+/// subagent's hook's, which may name the subagent's own.
+pub fn hook_model(input: &Value) -> Option<String> {
+    if input["agent_id"].is_string() {
+        return None;
+    }
+    let model = &input["model"];
+    let id = model
+        .as_str()
+        .or_else(|| model["id"].as_str())
+        .or_else(|| model["display_name"].as_str())?;
+    let id = id.trim();
+    (!id.is_empty()).then(|| id.to_string())
+}
+
 /// The command that picks `agent`'s conversation `id` up again, typed into
 /// the shell of a session it was started in by hand: `None` for an agent
 /// crystal can't resume.
@@ -806,6 +822,19 @@ mod tests {
         assert_eq!(conversation.id, "abc");
         assert_eq!(conversation.transcript, Some(PathBuf::from("/t/abc.jsonl")));
         assert_eq!(hook_conversation(&json!({})), None);
+    }
+
+    #[test]
+    fn a_hook_can_name_its_model() {
+        let started = json!({"hook_event_name": "SessionStart", "model": "claude-opus-5-5"});
+        assert_eq!(hook_model(&started), Some("claude-opus-5-5".into()));
+        let object = json!({"model": {"id": "gpt-5-codex", "display_name": "GPT-5 Codex"}});
+        assert_eq!(hook_model(&object), Some("gpt-5-codex".into()));
+        assert_eq!(hook_model(&json!({"model": " "})), None);
+        let subagent =
+            json!({"hook_event_name": "SubagentStart", "agent_id": "a1", "model": "haiku"});
+        assert_eq!(hook_model(&subagent), None);
+        assert_eq!(hook_model(&json!({})), None);
     }
 
     #[test]

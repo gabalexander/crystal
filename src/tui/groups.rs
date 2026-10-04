@@ -56,6 +56,9 @@ pub enum Row {
     /// The task of the session at this index, under its row: what it was
     /// asked to do, or how that went.
     Task(usize),
+    /// The line an agent or a script put on the row of the session at this
+    /// index, with `crystal report --line`, under its row and its task's.
+    Line(usize),
     /// The flow run at this index, heading its steps.
     Flow(usize),
     /// A step of a flow run with no session to show: one still to come, or
@@ -116,7 +119,8 @@ pub fn order(sessions: Vec<SessionInfo>, runs: &[FlowRun]) -> Vec<SessionInfo> {
 /// The sidebar's rows for sessions already in [`order`] with `runs`, those
 /// that `keep` keeps by their index: a heading wherever the project or the
 /// worktree changes, then each session, and under one with a task, its
-/// task. Where a worktree's terminals follow its agents, a line goes
+/// task, and under one with a line reported for it, that line. Where a
+/// worktree's terminals follow its agents, a line goes
 /// between them. A flow run is a heading of its own, then a row for each
 /// step: its session's, or one for the step alone when it has none. Only a
 /// kept session brings its headings, and a run's.
@@ -175,6 +179,9 @@ pub fn rows(
                 rows.push(Row::Session(index));
                 if session.task.is_some() {
                     rows.push(Row::Task(index));
+                }
+                if session.line.is_some() {
+                    rows.push(Row::Line(index));
                 }
             }
         }
@@ -373,6 +380,8 @@ mod tests {
             asking: None,
             reporter: None,
             subagents: 0,
+            model: None,
+            line: None,
             bell: false,
         }
     }

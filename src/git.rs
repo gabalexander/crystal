@@ -1,7 +1,7 @@
 //! What crystal needs from git: which project and worktree a directory is
 //! in, which branch that worktree is on, making and removing worktrees,
-//! what changed in one, for the diff and the file finder, and searching
-//! its files. [`branches`] lists a worktree's branches and moves it onto
+//! what changed in one, for the diff, the file finder and the sidebar's
+//! counts, and searching its files. [`branches`] lists a worktree's branches and moves it onto
 //! another. It runs the `git` command rather than using a library, so it
 //! behaves exactly like the git the user runs.
 
@@ -507,6 +507,167 @@ pub fn has_changes(dir: &Path) -> Result<bool> {
     Ok(!status.trim().is_empty())
 }
 
+/// What a worktree's line in the sidebar counts: its changes not
+/// committed, and how far its branch has gone from its upstream.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Stat {
+    /// Files changed, staged or not, and new ones git doesn't track yet.
+    pub files: usize,
+    /// Lines added and removed in them, a new file's all added.
+    pub added: u64,
+    pub removed: u64,
+    /// Commits on the branch that its upstream hasn't got, and the other
+    /// way round: none without an upstream.
+    pub ahead: u32,
+    pub behind: u32,
+}
+
+/// The biggest new file whose lines are counted: a bigger one, a build's
+/// output or a dump, counts none rather than hold the count up.
+const NEW_FILE_COUNTED: u64 = 512 * 1024;
+
+/// The most of new files one count reads, so that a worktree full of them
+/// costs no more than this; files past it count none.
+const NEW_FILES_COUNTED: u64 = 4 * 1024 * 1024;
+
+/// Counts what the worktree at `dir` has changed and not committed, and
+/// how far its branch is ahead of its upstream and behind it: one `git
+/// status`, one `git diff` when tracked files changed, and new files' lines
+/// read from disk, within limits. It never takes the index's lock, which
+/// an agent's own git may need at the same moment.
+pub fn stat(dir: &Path) -> Result<Stat> {
+    let status = git(
+        dir,
+        &[
+            "--no-optional-locks",
+            "-c",
+            "core.quotePath=false",
+            "status",
+            "--porcelain=v2",
+            "--branch",
+            "-z",
+            "--untracked-files=all",
+        ],
+    )?;
+    let read = parse_status_v2(&status);
+    let mut stat = Stat {
+        files: read.tracked + read.untracked.len(),
+        ahead: read.ahead,
+        behind: read.behind,
+        ..Stat::default()
+    };
+    if read.tracked > 0 {
+        let numstat = [
+            "--no-optional-locks",
+            "diff",
+            "HEAD",
+            "--numstat",
+            "-z",
+            "--no-color",
+            "--no-ext-diff",
+            "--",
+        ];
+        // Before the first commit there's no HEAD to count from: the
+        // lines go uncounted, the files still are.
+        if let Ok(numstat) = git(dir, &numstat) {
+            (stat.added, stat.removed) = parse_numstat(&numstat);
+        }
+    }
+    stat.added += new_lines(dir, &read.untracked);
+    Ok(stat)
+}
+
+/// What `git status --porcelain=v2 --branch -z` says, counted.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct StatusRead {
+    /// Tracked files changed, staged or not, or in conflict.
+    tracked: usize,
+    /// New files git doesn't track yet, by their paths from the top.
+    untracked: Vec<String>,
+    ahead: u32,
+    behind: u32,
+}
+
+/// Reads `git status --porcelain=v2 --branch -z`: a header line for how
+/// far the branch is from its upstream (`# branch.ab +2 -1`), a line for
+/// each changed file (`1`, `2` for one renamed, with the name it had as
+/// the next field, `u` in conflict), and `?` for a new one.
+fn parse_status_v2(status: &str) -> StatusRead {
+    let mut read = StatusRead::default();
+    let mut fields = status.split('\0');
+    while let Some(field) = fields.next() {
+        if let Some(ab) = field.strip_prefix("# branch.ab ") {
+            let mut counts = ab.split(' ');
+            let mut count = |sign: char| {
+                let count = counts.next().and_then(|count| count.strip_prefix(sign));
+                count.and_then(|count| count.parse().ok()).unwrap_or(0)
+            };
+            read.ahead = count('+');
+            read.behind = count('-');
+        } else if let Some(path) = field.strip_prefix("? ") {
+            read.untracked.push(path.to_string());
+        } else if field.starts_with("1 ") || field.starts_with("u ") {
+            read.tracked += 1;
+        } else if field.starts_with("2 ") {
+            read.tracked += 1;
+            // The name it had before.
+            fields.next();
+        }
+    }
+    read
+}
+
+/// The lines `git diff --numstat -z` counts, added and removed, summed: a
+/// file's `added\tremoved\tpath`, or for one renamed, `added\tremoved\t`
+/// and its two paths as the next two fields. A binary file's `-` counts
+/// none.
+fn parse_numstat(numstat: &str) -> (u64, u64) {
+    let (mut added, mut removed) = (0, 0);
+    let mut fields = numstat.split('\0');
+    while let Some(field) = fields.next() {
+        let mut parts = field.splitn(3, '\t');
+        let (Some(plus), Some(minus), Some(path)) = (parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+        added += plus.parse::<u64>().unwrap_or(0);
+        removed += minus.parse::<u64>().unwrap_or(0);
+        if path.is_empty() {
+            fields.next();
+            fields.next();
+        }
+    }
+    (added, removed)
+}
+
+/// The lines of the new files at `paths` in `dir`, read from disk within
+/// [`NEW_FILE_COUNTED`] and [`NEW_FILES_COUNTED`]: none for a directory, a
+/// link or a binary file, which git counts none for either.
+fn new_lines(dir: &Path, paths: &[String]) -> u64 {
+    let mut left = NEW_FILES_COUNTED;
+    let mut lines = 0;
+    for path in paths {
+        let path = dir.join(path);
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !meta.is_file() || meta.len() > NEW_FILE_COUNTED || meta.len() > left {
+            continue;
+        }
+        left -= meta.len();
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        // Binary, by git's own test: a NUL in its first 8000 bytes.
+        if bytes.iter().take(8000).any(|&b| b == 0) {
+            continue;
+        }
+        let newlines = bytes.iter().filter(|&&b| b == b'\n').count() as u64;
+        lines += newlines + u64::from(bytes.last().is_some_and(|&b| b != b'\n'));
+    }
+    lines
+}
+
 /// What `git diff` is asked for every patch crystal reads: no colors, no
 /// diff program of the user's, renames found, and the usual `a/` and `b/`
 /// in front of paths whatever the user's config says, so that the patch
@@ -929,6 +1090,62 @@ mod tests {
         run(&["add", "."]);
         run(&["commit", "-q", "-m", "first"]);
         dir
+    }
+
+    #[test]
+    fn a_worktree_s_changes_and_its_distance_from_upstream_are_counted() {
+        let dir = repo();
+        let run = |args: &[&str]| {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(dir.path())
+                .args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{out:?}");
+        };
+        assert_eq!(stat(dir.path()).unwrap(), Stat::default());
+
+        // One line changed, one added; a new file of three lines; a binary.
+        std::fs::write(dir.path().join("tracked.txt"), "a needle\nmore\n").unwrap();
+        std::fs::write(dir.path().join("new.txt"), "one\ntwo\nthree").unwrap();
+        std::fs::write(dir.path().join("blob.bin"), b"\0\x01\x02").unwrap();
+        let changed = stat(dir.path()).unwrap();
+        assert_eq!(
+            (changed.files, changed.added, changed.removed),
+            (3, 2 + 3, 1)
+        );
+
+        // A branch that follows `main`, a commit ahead of it, then `main` a
+        // commit ahead of the branch.
+        run(&["checkout", "-q", "-b", "feature", "--track", "main"]);
+        run(&["add", "."]);
+        run(&["commit", "-q", "-m", "second"]);
+        run(&["checkout", "-q", "main"]);
+        std::fs::write(dir.path().join("main.txt"), "on main\n").unwrap();
+        run(&["add", "main.txt"]);
+        run(&["commit", "-q", "-m", "third"]);
+        run(&["checkout", "-q", "feature"]);
+        let apart = stat(dir.path()).unwrap();
+        assert_eq!((apart.files, apart.ahead, apart.behind), (0, 1, 1));
+    }
+
+    #[test]
+    fn status_and_numstat_read_renames_and_conflicts() {
+        let status = "# branch.oid abc\0# branch.head fix\0# branch.upstream origin/main\0# branch.ab +3 -0\0\
+            1 .M N... 100644 100644 100644 a b src/a.rs\0\
+            2 R. N... 100644 100644 100644 a b R100 src/new.rs\0src/old.rs\0\
+            u UU N... 100644 100644 100644 100644 a b c src/both.rs\0\
+            ? notes/new file.md\0";
+        let read = parse_status_v2(status);
+        assert_eq!(read.tracked, 3);
+        assert_eq!(read.untracked, ["notes/new file.md"]);
+        assert_eq!((read.ahead, read.behind), (3, 0));
+        let numstat = "4\t1\tsrc/a.rs\0-\t-\timage.png\0\
+            2\t0\t\0src/old.rs\0src/new.rs\0";
+        assert_eq!(parse_numstat(numstat), (6, 1));
     }
 
     #[test]
