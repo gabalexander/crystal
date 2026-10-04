@@ -626,6 +626,9 @@ enum Command {
         #[arg(long)]
         ascii: bool,
     },
+    /// List the TUI's commands, the ids `[keys]` in the config file takes,
+    /// and the keys that run them, as your config has them.
+    Keys,
     /// Print the Claude Code skill that teaches an agent to drive crystal.
     Skill {
         /// Install it into Claude Code's skills, in $CLAUDE_CONFIG_DIR or
@@ -1569,6 +1572,11 @@ fn run(cli: Cli) -> Result<()> {
             Some(PluginCommand::Log { name }) => plugin_cli::log(&socket, &name)?,
         },
         Command::Mermaid { file, width, ascii } => mermaid_cli::run(file.as_deref(), width, ascii)?,
+        Command::Keys => {
+            let config = config::Config::load()?;
+            let keymap = tui::keymap::Keymap::new(&config.keys).map_err(anyhow::Error::msg)?;
+            print!("{}", tui::keymap::listing(&keymap));
+        }
         Command::Skill { install, force } => {
             if install {
                 skill::install(force)?;

@@ -11074,3 +11074,51 @@ fn an_agent_left_idle_is_stopped_and_starts_again_where_it_was() {
     assert!(out.status.success());
     assert_eq!(written(&args), "--resume\ns 1\n");
 }
+#[test]
+fn keys_the_config_gives_run_their_commands_and_colon_lists_every_one() {
+    let crystal = Crystal::new();
+    crystal.configure("[keys]\nkill = \"X\"\nquit = \"none\"\nprefix = \"ctrl+a\"\n");
+    let keys = crystal.ok(&["keys"]);
+    let line = |id: &str| {
+        keys.lines()
+            .find(|line| line.split_whitespace().next() == Some(id))
+            .unwrap_or_else(|| panic!("no {id} in {keys}"))
+            .to_string()
+    };
+    assert!(line("kill").contains(" X "), "{keys}");
+    assert!(line("quit").contains(" - "), "{keys}");
+    assert!(line("prefix").contains("ctrl+a"), "{keys}");
+
+    let mut tui = crystal.tui();
+    crystal.ok(&["new", "-n", "agent", "sleep", "30"]);
+    tui.shows("agent");
+    // `q` quits no more, and `X` kills.
+    tui.type_keys("q");
+    tui.type_keys("X");
+    tui.shows("kill agent? y/n");
+    tui.type_keys("n");
+    tui.hides("kill agent?");
+
+    // From inside the pane, the prefix and `:` open the list of commands.
+    tui.type_keys("\r");
+    tui.shows("typing into");
+    tui.type_keys("\x01");
+    tui.shows("ctrl+a …");
+    tui.type_keys(":");
+    tui.shows("select the session below");
+    tui.type_keys("quit");
+    tui.shows("quit the TUI");
+    tui.type_keys("\r");
+    assert!(tui.exit());
+}
+
+#[test]
+fn a_key_the_config_cant_make_sense_of_is_an_error_that_names_it() {
+    let crystal = Crystal::new();
+    crystal.configure("[keys]\nnew-sesion = \"n\"\n");
+    let err = crystal.fails(&["keys"]);
+    assert!(
+        err.contains("new-sesion") && err.contains("config.toml"),
+        "{err}"
+    );
+}

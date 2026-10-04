@@ -7,6 +7,7 @@
 use crate::flows::Flow;
 use crate::plugins;
 use crate::profile::Profile;
+use crate::tui::keymap::{Binding, Keymap};
 use crate::vt;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -77,6 +78,12 @@ pub struct Config {
     /// `[[project]]` tables in the file. See [`crate::project_commands`].
     #[serde(rename = "project", skip_serializing_if = "Vec::is_empty")]
     pub projects: Vec<ProjectSettings>,
+    /// The TUI's keys, by command, and its prefix: `[keys]` in the file.
+    /// See [`crate::tui::keymap`].
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub keys: BTreeMap<String, Binding>,
+    /// How the TUI's sidebar is laid out: `[sidebar]` in the file.
+    pub sidebar: SidebarSettings,
 }
 
 /// One project's commands, which take the place of those in its own
@@ -107,6 +114,48 @@ pub struct NotifySettings {
     /// Tell only while no crystal TUI's terminal has the focus: the user
     /// looking at crystal sees what needs them in its sidebar.
     pub unfocused_only: bool,
+}
+
+/// How the TUI's sidebar is laid out.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SidebarSettings {
+    /// How many columns wide it is until it's resized, with the mouse on
+    /// its edge or with `{` and `}`; the TUI keeps a width it was resized
+    /// to.
+    pub width: u16,
+    /// Whether it starts folded, until `\` unfolds it.
+    pub folded: bool,
+    /// What it keeps while it's folded.
+    pub fold: Fold,
+    /// The sessions that need the user, from every tab, in a group of their
+    /// own at its top.
+    pub needs_you: bool,
+}
+
+/// The narrowest and widest the sidebar can be, unfolded.
+pub const SIDEBAR_WIDTHS: std::ops::RangeInclusive<u16> = 16..=80;
+
+impl Default for SidebarSettings {
+    fn default() -> SidebarSettings {
+        SidebarSettings {
+            width: 28,
+            folded: false,
+            fold: Fold::Marks,
+            needs_you: true,
+        }
+    }
+}
+
+/// What a folded sidebar keeps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Fold {
+    /// A narrow rail: each session's mark, so what needs the user still
+    /// shows.
+    Marks,
+    /// Nothing: the panes take every column.
+    Hidden,
 }
 
 /// How the memory plugin learns, beyond what it's told.
@@ -273,6 +322,8 @@ impl Default for Config {
             profiles: Vec::new(),
             flows: Vec::new(),
             projects: Vec::new(),
+            keys: BTreeMap::new(),
+            sidebar: SidebarSettings::default(),
         }
     }
 }
@@ -424,6 +475,15 @@ pub fn from_text(text: &str) -> Result<Config> {
         );
     }
     duration(&config.sessions.stop_idle_after).context("in [sessions], stop_idle_after")?;
+    Keymap::new(&config.keys).map_err(anyhow::Error::msg)?;
+    if !SIDEBAR_WIDTHS.contains(&config.sidebar.width) {
+        bail!(
+            "[sidebar] width is {}: it's from {} to {} columns",
+            config.sidebar.width,
+            SIDEBAR_WIDTHS.start(),
+            SIDEBAR_WIDTHS.end()
+        );
+    }
     for profile in &config.profiles {
         profile.check()?;
     }
@@ -760,6 +820,21 @@ back_to = "build"
     }
 
     #[test]
+    fn keys_and_the_sidebar_are_checked() {
+        let keys = parse("[keys]\nkill = \"n\"\nnew-session = \"N\"").unwrap();
+        assert_eq!(keys.keys.len(), 2);
+        let unknown = parse("[keys]\nkil = \"n\"").unwrap_err();
+        assert!(format!("{unknown:#}").contains("kil"), "{unknown:#}");
+        let twice = parse("[keys]\nkill = \"q\"\nquit = \"q\"").unwrap_err();
+        assert!(format!("{twice:#}").contains("both"), "{twice:#}");
+        let narrow = parse("[sidebar]\nwidth = 4").unwrap_err();
+        assert!(format!("{narrow:#}").contains("width"), "{narrow:#}");
+        let folded = parse("[sidebar]\nfolded = true\nfold = \"hidden\"").unwrap();
+        assert!(folded.sidebar.folded);
+        assert_eq!(folded.sidebar.fold, Fold::Hidden);
+    }
+
+    #[test]
     fn the_settings_written_out_read_back_the_same() {
         let config = Config {
             notify: false,
@@ -837,6 +912,19 @@ back_to = "build"
                 run: Some("npm run dev".into()),
                 open: Some("code .".into()),
             }],
+            keys: BTreeMap::from([
+                ("prefix".to_string(), Binding::One("ctrl+a".into())),
+                (
+                    "new-session".to_string(),
+                    Binding::Many(vec!["n".into(), "ctrl+n".into()]),
+                ),
+            ]),
+            sidebar: SidebarSettings {
+                width: 36,
+                folded: true,
+                fold: Fold::Hidden,
+                needs_you: false,
+            },
         };
         assert_eq!(parse(&config.to_toml()).unwrap(), config);
         assert_eq!(

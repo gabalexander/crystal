@@ -1,13 +1,15 @@
 //! The menu a right click opens: on a session, a worktree or a project in
-//! the sidebar, on a tab, or on a pane. Each item is a key the sidebar
-//! takes, said in words, so choosing one does just what pressing its key
-//! would, on what was clicked; the key is shown beside it, to learn.
+//! the sidebar, on a tab, or on a pane. Each item is a sidebar command,
+//! said in words, so choosing one does just what pressing its key would, on
+//! what was clicked; its key, as the user's `[keys]` has it, is shown
+//! beside it, to learn.
 //!
 //! In the menu, `j`/`k` or the arrows move the bar, Enter chooses, an
 //! item's own key chooses it straight away, and Esc closes it; the mouse
 //! chooses with a click, and a click anywhere else closes it. Its state and
 //! keys are here, and its drawing; the App says what's in it.
 
+use super::keymap::{Chord, Command, Keymap};
 use super::theme::Theme;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
@@ -16,47 +18,39 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Clear};
 
-/// One thing the menu offers: what it does, and the sidebar key that does
-/// it.
+/// One thing the menu offers: what it does, the command that does it, and
+/// that command's key.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Item {
     pub label: &'static str,
-    pub key: KeyCode,
+    pub command: Command,
+    /// The command's first key, once the menu has the keymap; none when the
+    /// user left it with none.
+    pub key: Option<Chord>,
     /// It can't be taken back, like a kill: drawn in the failed color.
     pub danger: bool,
 }
 
 impl Item {
-    pub fn new(label: &'static str, key: char) -> Item {
+    pub fn new(label: &'static str, command: Command) -> Item {
         Item {
             label,
-            key: KeyCode::Char(key),
+            command,
+            key: None,
             danger: false,
         }
     }
 
-    pub fn enter(label: &'static str) -> Item {
-        Item {
-            label,
-            key: KeyCode::Enter,
-            danger: false,
-        }
-    }
-
-    pub fn danger(label: &'static str, key: char) -> Item {
+    pub fn danger(label: &'static str, command: Command) -> Item {
         Item {
             danger: true,
-            ..Item::new(label, key)
+            ..Item::new(label, command)
         }
     }
 
     /// How its key is written beside it.
     fn key_label(&self) -> String {
-        match self.key {
-            KeyCode::Enter => "enter".to_string(),
-            KeyCode::Char(c) => c.to_string(),
-            _ => String::new(),
-        }
+        self.key.map(|key| key.hint()).unwrap_or_default()
     }
 }
 
@@ -65,8 +59,8 @@ impl Item {
 pub enum Step {
     Stay,
     Close,
-    /// Close, and press this key in the sidebar.
-    Press(KeyCode),
+    /// Close, and run this command, as its key in the sidebar would.
+    Run(Command),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,7 +73,11 @@ pub struct Menu {
 }
 
 impl Menu {
-    pub fn new(at: (u16, u16), items: Vec<Item>) -> Menu {
+    /// A menu of `items` at `at`, each with its command's key in `keymap`.
+    pub fn new(at: (u16, u16), mut items: Vec<Item>, keymap: &Keymap) -> Menu {
+        for item in &mut items {
+            item.key = keymap.keys(item.command).first().copied();
+        }
         Menu {
             at,
             items,
@@ -108,10 +106,13 @@ impl Menu {
                 Step::Stay
             }
             KeyCode::Enter => self.choose(self.highlighted),
-            code => match self.items.iter().position(|item| item.key == code) {
-                Some(index) => self.choose(index),
-                None => Step::Stay,
-            },
+            _ => {
+                let pressed = Some(Chord::of(key));
+                match self.items.iter().position(|item| item.key == pressed) {
+                    Some(index) => self.choose(index),
+                    None => Step::Stay,
+                }
+            }
         }
     }
 
@@ -124,7 +125,7 @@ impl Menu {
 
     pub fn choose(&self, index: usize) -> Step {
         match self.items.get(index) {
-            Some(item) => Step::Press(item.key),
+            Some(item) => Step::Run(item.command),
             None => Step::Close,
         }
     }
@@ -230,38 +231,49 @@ mod tests {
         menu.on_key(&KeyEvent::new(code, KeyModifiers::NONE))
     }
 
+    fn items() -> Vec<Item> {
+        vec![
+            Item::new("type into it", Command::Open),
+            Item::new("zoom", Command::Zoom),
+            Item::danger("kill", Command::Kill),
+        ]
+    }
+
     fn menu() -> Menu {
-        Menu::new(
-            (10, 5),
-            vec![
-                Item::enter("type into it"),
-                Item::new("zoom", 'z'),
-                Item::danger("kill", 'x'),
-            ],
-        )
+        Menu::new((10, 5), items(), &Keymap::default())
     }
 
     #[test]
     fn enter_chooses_the_item_the_bar_is_on_and_a_key_its_own_item() {
         let mut menu = menu();
-        assert_eq!(
-            press(&mut menu, KeyCode::Enter),
-            Step::Press(KeyCode::Enter)
-        );
+        assert_eq!(press(&mut menu, KeyCode::Enter), Step::Run(Command::Open));
         press(&mut menu, KeyCode::Down);
         press(&mut menu, KeyCode::Down);
         press(&mut menu, KeyCode::Down);
         assert_eq!(menu.highlighted, 2, "the bar stops at the last");
-        assert_eq!(
-            press(&mut menu, KeyCode::Enter),
-            Step::Press(KeyCode::Char('x'))
-        );
+        assert_eq!(press(&mut menu, KeyCode::Enter), Step::Run(Command::Kill));
         assert_eq!(
             press(&mut menu, KeyCode::Char('z')),
-            Step::Press(KeyCode::Char('z'))
+            Step::Run(Command::Zoom)
         );
         assert_eq!(press(&mut menu, KeyCode::Char('w')), Step::Stay);
         assert_eq!(press(&mut menu, KeyCode::Esc), Step::Close);
+    }
+
+    #[test]
+    fn an_item_shows_and_takes_the_key_the_user_gave_its_command() {
+        let settings = [(
+            "kill".to_string(),
+            crate::tui::keymap::Binding::One("X".into()),
+        )];
+        let keymap = Keymap::new(&settings.into_iter().collect()).unwrap();
+        let mut menu = Menu::new((10, 5), items(), &keymap);
+        assert_eq!(menu.items[2].key_label(), "X");
+        assert_eq!(press(&mut menu, KeyCode::Char('x')), Step::Stay);
+        assert_eq!(
+            press(&mut menu, KeyCode::Char('X')),
+            Step::Run(Command::Kill)
+        );
     }
 
     #[test]
@@ -278,7 +290,7 @@ mod tests {
         assert!(menu.covers(screen, 12, 5));
         assert!(!menu.covers(screen, 9, 6));
 
-        let corner = Menu::new((79, 23), menu.items.clone());
+        let corner = Menu::new((79, 23), menu.items.clone(), &Keymap::default());
         let area = corner.area(screen);
         assert_eq!(area.right(), 80);
         assert_eq!(area.bottom(), 24);

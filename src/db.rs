@@ -46,6 +46,8 @@ pub const DIFF: &str = "diff";
 /// The latest event the user had seen when the TUI last knew they were
 /// looking: where "while you were away" counts from.
 pub const SEEN: &str = "seen";
+/// How wide the sidebar was left.
+pub const SIDEBAR: &str = "sidebar";
 
 /// How long a write waits for another to finish: the daemon and every TUI
 /// share the one database.

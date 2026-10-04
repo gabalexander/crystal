@@ -12,6 +12,7 @@ mod archived_view;
 mod away;
 mod backlog_view;
 mod command_line;
+mod command_list;
 mod compose;
 mod copy_mode;
 mod diff;
@@ -23,6 +24,7 @@ mod grep;
 mod groups;
 mod help;
 mod issues;
+pub(crate) mod keymap;
 pub(crate) mod launcher;
 mod layout_link;
 mod layouts;
@@ -352,6 +354,7 @@ pub fn run(socket: &Path) -> Result<()> {
         searches: Arc::new(AtomicU64::new(0)),
         link_clicked: false,
         kept_tabs: tabs::Tabs::default(),
+        kept_sidebar: app::Shape::default(),
         quitting: false,
         overlay: None,
         count_backlog,
@@ -367,7 +370,13 @@ pub fn run(socket: &Path) -> Result<()> {
     tui.app.set_server(server);
     tui.app.set_launch_settings(&config);
     tui.app.set_features(&config);
+    tui.app.set_interface(&config);
     tui.app.set_plugin_keys(plugin_keys(&config));
+    let sidebar = tui
+        .ui(db::SIDEBAR)
+        .and_then(|json| serde_json::from_str(&json).ok());
+    tui.app.set_sidebar(sidebar, config.sidebar.folded);
+    tui.kept_sidebar = tui.app.sidebar_shape();
     tui.app
         .set_memory(launcher::read_memory(tui.ui(db::LAUNCHER).as_deref()));
     tui.app.set_diff_tree(tui.review().tree);
@@ -481,6 +490,8 @@ struct Tui {
     sessions_asked: Instant,
     /// The tabs as they were last kept.
     kept_tabs: tabs::Tabs,
+    /// The sidebar's shape as it was last written down.
+    kept_sidebar: app::Shape,
     /// How many searches find in files has asked for: a search that isn't
     /// the last one asked for stops.
     searches: Arc<AtomicU64>,
@@ -690,6 +701,15 @@ impl Tui {
             }
             self.kept_tabs = tabs;
         }
+        // The sidebar's width goes with them; whether it's folded is the
+        // config's to say at the start.
+        let sidebar = self.app.sidebar_shape();
+        let resized = sidebar.width != self.kept_sidebar.width
+            || sidebar.from_config != self.kept_sidebar.from_config;
+        if resized && let Ok(db) = &self.db {
+            let _ = db.keep_ui(db::SIDEBAR, &sidebar);
+        }
+        self.kept_sidebar = sidebar;
     }
 
     /// The document called `name` the TUI keeps, when there's one to read.
@@ -1044,7 +1064,10 @@ impl Tui {
         if self.click_on_link(&mouse, hit) {
             return;
         }
-        if let Some(split) = self.app.moving_border() {
+        if self.app.dragging_sidebar() {
+            // So is the sidebar's edge, wherever the mouse goes.
+            hit = Hit::SidebarEdge(mouse.column);
+        } else if let Some(split) = self.app.moving_border() {
             // A border taken by the mouse is crystal's until it's let go.
             hit = ui::border_hit(&areas, &self.app, split, mouse.column, mouse.row);
         } else if let Some(slot) = self.app.dragging() {
@@ -1834,6 +1857,7 @@ impl Tui {
         self.config = config.clone();
         self.app.set_launch_settings(config);
         self.app.set_features(config);
+        self.app.set_interface(config);
         self.app.set_plugin_keys(plugin_keys(config));
         let backlog = crate::backlog::enabled(config);
         self.count_backlog.store(backlog, Ordering::Relaxed);
@@ -2175,10 +2199,10 @@ fn listed_plugins(config: &Config, socket: &Path) -> Vec<plugins_view::Listed> {
     own.chain(installed).collect()
 }
 
-/// The sidebar keys taken by the actions of the installed plugins that are
-/// on and can run here. Installing or switching on a plugin refuses a key
-/// another has, so where two plugins' files were changed to share one, the
-/// first by name keeps it.
+/// The actions of the installed plugins that are on and can run here, each
+/// with the sidebar key it took, if it took one. Installing or switching on
+/// a plugin refuses a key another has, so where two plugins' files were
+/// changed to share one, the first by name keeps it.
 fn plugin_keys(config: &Config) -> Vec<PluginKey> {
     let mut keys: Vec<PluginKey> = Vec::new();
     let on = plugins::installed()
@@ -2189,17 +2213,14 @@ fn plugin_keys(config: &Config) -> Vec<PluginKey> {
             continue;
         };
         for action in manifest.actions {
-            let Some(key) = action.key.as_ref().and_then(|key| key.chars().next()) else {
-                continue;
-            };
-            if keys.iter().all(|taken| taken.key != key) {
-                keys.push(PluginKey {
-                    key,
-                    plugin: plugin.name.clone(),
-                    action: action.id,
-                    title: action.title,
-                });
-            }
+            let key = action.key.as_ref().and_then(|key| key.chars().next());
+            let free = key.is_some_and(|key| keys.iter().all(|taken| taken.key != Some(key)));
+            keys.push(PluginKey {
+                key: key.filter(|_| free),
+                plugin: plugin.name.clone(),
+                action: action.id,
+                title: action.title,
+            });
         }
     }
     keys

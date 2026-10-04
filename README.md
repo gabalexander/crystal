@@ -122,7 +122,10 @@ and the footer says where you are and offers the keys that matter there, or, whe
 | `u` | select the next session that needs you: waiting on you first, then done |
 | `U` | list everything that [needs you](#timeline), in every tab, and answer a permission or a gate where it stands |
 | `a` | the [timeline](#timeline): what happened, the newest first, as it happens |
-| `/` | find a session by typing a little of its name, project, branch or command |
+| `/` | find a session, in any tab, by typing a little of its name, project, branch or command; one in another tab says which, and picking it takes you there |
+| `:` | the [command list](#keys-and-commands): every command by its name, with its key, the latest you ran first; `Enter` runs one |
+| `(` / `)` | make the [sidebar](#the-sidebar) narrower or wider; its edge drags with the mouse too |
+| `\` | fold the [sidebar](#the-sidebar) down to a rail of marks, or unfold it |
 | `o` | open the pull request of the selected session's branch in your browser |
 | `O` | list the open [pull requests](#pull-requests-and-issues) of the selected session's project: read one, see its diff, comment, or start an agent in its worktree |
 | `i` | list the open [issues](#pull-requests-and-issues) of the selected session's project: read one, comment, edit it, or start an agent on it |
@@ -144,8 +147,11 @@ and the footer says where you are and offers the keys that matter there, or, whe
 | `q` | quit; the sessions keep running |
 
 While you're typing into a session, every key goes to it, `Tab` included, except `Ctrl+\`, which takes you
-back to the sidebar, and `Shift+PageUp` / `Shift+PageDown`, which page through the pane's history. Some
-terminals keep `Shift+PageUp` for their own scrolling; `Ctrl+\` and then `PageUp` does the same.
+back to the sidebar, `Shift+PageUp` / `Shift+PageDown`, which page through the pane's history, and the prefix,
+`Ctrl+B`: press it, then any key in the table above, and that key's command runs without the keyboard leaving
+the pane, as in tmux. `Ctrl+B` twice sends `Ctrl+B` to the program, and `Esc` after it does nothing. Some
+terminals keep `Shift+PageUp` for their own scrolling; `Ctrl+B` and then `PageUp` does the same. Every key in
+the table, the prefix and `Ctrl+\` included, can be changed: see [keys and commands](#keys-and-commands).
 
 A program that asks for the [Kitty keyboard protocol](https://sw.kovidgoyal.net/kitty/keyboard-protocol/), as
 Codex does, gets its keys that way, in a pane, through `crystal attach` and from `crystal send-keys`: keys the
@@ -409,6 +415,54 @@ can't be read stops the daemon rather than being started over. What an older cry
 brought in the first time, and each file is kept beside it, renamed `.imported` (or `.broken`, when it couldn't
 be read).
 
+### Keys and commands
+
+Every key in the sidebar's table runs a command with a name: `n` is `new-session`, `|` is `split-right`, `q` is
+`quit`. `crystal keys` lists them all, with the keys your config gives them. `[keys]` in the
+[config file](#settings) changes them, a command's name to one key, a list of them, or `"none"`:
+
+```toml
+[keys]
+prefix = "ctrl+a"          # the prefix, from inside a pane; "none" for no prefix
+hand-back = "ctrl+g"       # from a pane back to the sidebar
+new-session = ["n", "ctrl+n"]
+kill = "X"                 # x is free now
+split-right = "v"          # v was copy mode's: copy mode has no key now
+quit = "none"              # the command list still runs it
+```
+
+A key you give one command is taken from the command that had it, which is left with its other keys, or none.
+Two commands given the same key, a command or a key crystal doesn't know, are errors that name them, so a
+typo never goes unnoticed. Keys are written as `n`, `N` (or `shift+n`), `ctrl+b`, `alt+enter`, `shift+left`,
+`pageup`, `space`, `f5`, or the character itself, like `|`, `(` or `:`. The `?` overlay, the footer and the
+command list all say the keys you chose. The keys inside the views (the diff, the file finder and the rest),
+copy mode's and the questions' on the footer line stay as they are.
+
+`:` opens the command list: every command by its name, with what it does and its key, and your plugins'
+actions after them. Type a little of a name, or of what it does, and `Enter` runs the one the bar is on, as
+its key would. Before you type, the five you ran from it last come first, so it's also a quick way back to
+what you just did. A command with no key, or whose key you don't remember, is always there.
+
+### The sidebar
+
+The sidebar is 28 columns wide unless `[sidebar]` in the config says otherwise. `(` and `)` take four columns
+from it or give it four, or drag the line between it and the panes with the mouse; the TUI keeps the width
+you leave it at, until the config gives another. `\` folds it to a rail three columns wide, a session's mark
+a row, so a session waiting on you still shows while the panes take the room; `\` again, `)`, or dragging its
+edge, unfolds it. While it's folded, or the tab is zoomed, `/` brings it out over the panes to look through.
+
+Whatever needs you, in every tab, is pinned at the top under **needs you**: the agents waiting on you, then
+those that finished a turn you haven't looked at. One in another tab says which tab, and a click on it takes
+you there. `u` goes to each in turn, and `U` lists them with what each waits for.
+
+```toml
+[sidebar]
+width = 32             # 16 to 80 columns
+folded = false         # start folded
+fold = "marks"         # what folding keeps: "marks", or "hidden" for nothing
+needs_you = true       # pin what needs you at the top
+```
+
 ### Tabs
 
 A tab is a space of its own: it holds its own sessions, and the sidebar lists only the sessions of the tab
@@ -424,7 +478,8 @@ bar shows only the numbers, and with more still, as many as fit around the tab y
 
 A tab with something going on in it shows that on its label, the way the sidebar marks a session: `▲` when an
 agent in it is waiting on you, `✓` when one has finished a turn you haven't looked at, the turning `◐` while
-one works. `u` looks through every tab for the next session that needs you, and takes you to its tab.
+one works. `u` looks through every tab for the next session that needs you, and takes you to its tab; the
+sidebar [pins](#the-sidebar) whatever needs you, from every tab, at its top; and `/` finds a session in any tab.
 
 Every session is in exactly one tab. A session you start from the TUI goes in the tab you're in, and so does
 one started any other way, from the command line or another TUI, unless it's a step of a [flow](#flows), which
@@ -1903,6 +1958,8 @@ file and change. A setting crystal doesn't know is an error that names it, so a 
 | `[worktrees]` | | `base`, the branch new worktrees' new branches [start from](#usage): `origin`'s default branch unless set |
 | `[sessions]` | | `stop_idle_after`, how long an agent may sit [idle](#archiving-and-idle-agents) before crystal stops it, like `"30m"`: `"off"` |
 | `[[project]]` | | a project's [run and open commands](#projects), by its main worktree's `path`, in place of its own file's |
+| `[keys]` | | the TUI's keys, by command, its prefix and the key back to the sidebar: [keys and commands](#keys-and-commands) |
+| `[sidebar]` | | the sidebar's `width`, whether it starts `folded`, what folding keeps, and whether what needs you is pinned: [the sidebar](#the-sidebar) |
 
 `dark` and `light` paint their own background, so crystal looks the same in any terminal; `terminal` paints
 nothing and uses your terminal's own colors. With `NO_COLOR` set, crystal uses no color at all.

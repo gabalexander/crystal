@@ -70,7 +70,9 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   - `mod.rs`: the event loop: one channel of events, then update and draw (not for a move of the mouse that
     changes nothing), opening the link a Ctrl+click or copy mode's `o` asks for, and bringing the TUI's
     terminal to the front for `pane focus --raise`
-  - `app.rs`: the state and how keys and the mouse change it; no I/O, so it's unit-tested
+  - `app.rs`: the state and how keys and the mouse change it: a sidebar key looked up in the keymap and its
+    command run, from the sidebar, the `:` list or after the prefix in a pane; the sidebar's width, folded or
+    not, and what needs the user pinned at its top; no I/O, so it's unit-tested
     - `app/commands.rs`: the layout commands carried out on the state, each on the tab holding the session it's
       about, in front or not, and the layout the TUI answers with; and carried out with no TUI open, on a state
       made for it from the tabs kept, the sessions and the flow runs, on a screen of an unseen session's size
@@ -96,13 +98,21 @@ whenever what's handed over changes in a way the crystal before couldn't read.
     terminals' programs again, and put back, and the tabs a restore replaced; its state and keys, kept apart
     from I/O (the event loop keeps them in the database and starts the sessions gone), and its drawing
   - `sidebar.rs`: the sidebar's rows: headings, worktree lines, sessions with their mark and how long ago,
-    terminals drawn apart from agents
+    terminals drawn apart from agents, the sessions that need the user pinned on top with the tab each is
+    in, and the rail of marks a folded sidebar keeps
+  - `keymap.rs`: the sidebar's commands, each with the id `[keys]` names it by, what it does and its default
+    keys; keys as the config writes them and as terminals send them, folded into one form; the config's
+    keys laid over the defaults, a key given to one command taken from the one that had it; the prefix and
+    the key that hands the keyboard back; the `?` overlay's rows of sidebar keys; and `crystal keys`'s list
+  - `command_list.rs`: the command list (`:`): every command and plugin action by name, with its keys,
+    filtered as you type, the latest run first; its state and keys, kept apart from I/O, and its drawing
   - `status.rs`: a session's status as the TUI shows it, and its mark
   - `theme.rs`: every color, named for what it's for: `dark`, `light`, `terminal`, and none for `NO_COLOR`
   - `mouse.rs`: writes mouse events the way a program in a pane asked for them
-  - `help.rs`: the overlay `?` opens, drawn from one table of every key, a key a row: its sections flowed
-    into columns as tall as the terminal, two to a page, the pages turned with the arrows; a test keeps the
-    README's table of sidebar keys in step with it
+  - `help.rs`: the overlay `?` opens, a key a row: the sidebar's from the keymap, written as the user's
+    `[keys]` has them, the rest from one table; its sections flowed into columns as tall as the terminal, two
+    to a page, the pages turned with the arrows; a test keeps the README's table of sidebar keys in step with
+    the defaults
   - `groups.rs`: the sidebar's order and headings: sessions by project, then worktree, agents before
     terminals, each flow run's steps under it, and linked worktrees with no sessions left at the end of
     their project
@@ -116,7 +126,8 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   - `command_line.rs`: reads the line typed at `new session:` (the panel's `Ctrl+E`) into the command to run
   - `profiles.rs`: the profiles view (`P`): the list, the form that edits one, its keys and drawing; the
     event loop does the writing
-  - `search.rs`: `/`'s matching: a session's name, project, branch or command, letters in order
+  - `search.rs`: `/`'s matching, over the sessions of every tab: a session's name, project, branch or
+    command, letters in order
   - `issues.rs`: the issues view (`i`): its state and keys, kept apart from I/O, commenting on an issue and
     changing its title and text, and its drawing
   - `pull_requests.rs`: the pull requests view (`O`): its state and keys, kept apart from I/O, reading one with

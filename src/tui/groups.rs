@@ -59,6 +59,12 @@ pub enum Row {
     /// A step of a flow run with no session to show: one still to come, or
     /// whose session has gone. A step with a session is that session's row.
     Step { run: usize, step: usize },
+    /// The heading of the sessions that need the user, pinned at the top
+    /// of the sidebar from every tab: how many there are.
+    NeedsYou(usize),
+    /// A session pinned under [`Row::NeedsYou`], by its index; it has its
+    /// own row in its group too, in its tab.
+    Pinned(usize),
 }
 
 /// Puts sessions in the sidebar's order. They come in the order they were
