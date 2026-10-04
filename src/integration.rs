@@ -148,7 +148,8 @@ impl Agent {
         Agent::ALL.into_iter().find(|agent| agent.program() == id)
     }
 
-    fn name(self) -> &'static str {
+    /// Its name, as people know it.
+    pub fn name(self) -> &'static str {
         match self {
             Agent::Claude => "Claude Code",
             Agent::Codex => "Codex",
@@ -238,6 +239,17 @@ fn codex_home(from_env: Option<OsString>, home: Option<OsString>) -> Option<Path
         Some(dir) if !dir.is_empty() => Some(PathBuf::from(dir)),
         _ => home.map(|home| PathBuf::from(home).join(".codex")),
     }
+}
+
+/// Each agent installed here, by whether its directory is there, with how
+/// its hooks stand for `crystal` at its path: what the settings view lists.
+/// One whose files can't be read is left out.
+pub fn here(crystal: &Path) -> Vec<(Agent, Standing)> {
+    Agent::ALL
+        .into_iter()
+        .filter(|agent| agent.dir().is_ok_and(|dir| dir.is_dir()))
+        .filter_map(|agent| Some((agent, standing_of(agent, crystal).ok()?)))
+        .collect()
 }
 
 /// The agents to work on: `agent`, or every one installed here, by whether
@@ -404,8 +416,7 @@ pub fn status(agent: Agent, crystal: &Path) -> Result<String> {
 pub fn standing_of(agent: Agent, crystal: &Path) -> Result<Standing> {
     let dir = agent.dir()?;
     match agent.way() {
-        Way::Hooks(target) if target.installed(&dir) => return Ok(Standing::Installed),
-        Way::Hooks(_) => return Ok(Standing::NotInstalled),
+        Way::Hooks(target) => return Ok(target.standing(&dir, crystal)),
         Way::Plugin(plugin) => return Ok(plugin.standing(&dir, crystal)),
         Way::Own => {}
     }

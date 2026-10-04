@@ -147,6 +147,17 @@ impl Preview {
         Some(self.read_again())
     }
 
+    /// Shows the file at `path` in the directory at `dir`, which may be
+    /// another than the one it showed files in: the handoff view's are in a
+    /// worktree and in the state directory.
+    pub fn show_in(&mut self, dir: &Path, path: &str) -> Option<Action> {
+        if self.dir != dir {
+            self.dir = dir.to_path_buf();
+            self.path = None;
+        }
+        self.show(path)
+    }
+
     /// What reading the file shown again takes, to show what's changed in
     /// it. What's on screen stays until it's read.
     pub fn read_again(&self) -> Action {

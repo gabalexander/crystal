@@ -4,12 +4,14 @@ mod agent_plugins;
 mod agent_rules;
 mod agent_screen;
 mod agents;
+mod api;
 mod artifacts;
 mod attach;
 mod backlog;
 mod bell;
 mod catalog;
 mod claude_stream;
+mod claude_title;
 mod client;
 mod clipboard;
 mod codex;
@@ -49,6 +51,7 @@ mod messages;
 mod model;
 mod names;
 mod notify;
+mod output_ring;
 mod plugin_cli;
 mod plugin_hooks;
 mod plugin_manifest;
@@ -63,6 +66,7 @@ mod qwen3;
 mod remote;
 mod report;
 mod rerank;
+mod resources;
 mod secrets;
 mod server_cli;
 mod session;
@@ -72,6 +76,7 @@ mod socket;
 mod sound;
 mod spending;
 mod state;
+mod stream;
 mod syntax;
 mod task;
 mod tasks;
@@ -499,7 +504,8 @@ enum Command {
         name: String,
 
         /// The text to type. Several words are joined with spaces; put
-        /// `--` before text that starts with a `-`.
+        /// `--` before text that starts with a `-`. `-` alone reads it from
+        /// standard input.
         #[arg(required = true)]
         text: Vec<String>,
 
@@ -511,6 +517,11 @@ enum Command {
         /// is refused otherwise: the text would land in the question.
         #[arg(long)]
         force: bool,
+
+        /// Stop the run a background task is in the middle of first, and
+        /// carry on from there with the text.
+        #[arg(long)]
+        interrupt: bool,
 
         /// Then wait for the turn it starts to end, and print how it ended.
         #[arg(long)]
@@ -542,9 +553,13 @@ enum Command {
         #[arg(long, value_name = "REGEX")]
         output: Option<String>,
 
-        /// Give up after this many seconds, and fail.
+        /// Give up after this many seconds, exiting 2.
         #[arg(long, value_name = "SECONDS")]
         timeout: Option<f64>,
+
+        /// Print nothing once it's there.
+        #[arg(short, long)]
+        quiet: bool,
     },
     /// Print what happened, from the event log, one line each, the oldest
     /// first: sessions starting, working, waiting and ending, tasks, runs,
@@ -554,6 +569,11 @@ enum Command {
         /// time, like 14:00, 2026-10-01 or 2026-10-01T09:30.
         #[arg(long, value_name = "WHEN")]
         since: Option<String>,
+
+        /// Only those after the event with this `seq`, like the one `api
+        /// snapshot` gives.
+        #[arg(long, value_name = "SEQ", conflicts_with = "since")]
+        after: Option<u64>,
 
         /// Only events of this kind, or family, like session.waiting or
         /// task.*; give it more than once for more.
@@ -567,6 +587,16 @@ enum Command {
         /// Only those about the project this directory is in.
         #[arg(short = 'C', long = "dir", value_name = "DIR")]
         dir: Option<PathBuf>,
+
+        /// Only those about a task, by its number, like t12: the task, and
+        /// its session while it works on it.
+        #[arg(short, long, value_name = "TASK")]
+        task: Option<String>,
+
+        /// Only the newest this many; with --follow, of those before the
+        /// new ones.
+        #[arg(short, long, value_name = "N")]
+        limit: Option<usize>,
 
         /// Print them as JSON, one object a line, as the log keeps them.
         #[arg(long)]
@@ -588,6 +618,59 @@ enum Command {
         /// The rows that have scrolled up off the screen too, ahead of it.
         #[arg(long)]
         history: bool,
+
+        /// Only what its program wrote since then, history and all: a while
+        /// back, like 30s, 10m or 2h, or a time, like 14:00 or
+        /// 2026-10-01T09:30.
+        #[arg(long, value_name = "WHEN")]
+        since: Option<String>,
+
+        /// Each line its program wrote as one, however many rows it wrapped
+        /// onto.
+        #[arg(long)]
+        unwrap: bool,
+
+        /// Keep its colors, bold, italic and underlines, as escape codes.
+        #[arg(long)]
+        ansi: bool,
+    },
+    /// Print what runs in a session's terminal: the processes in front,
+    /// the job its keys go to, its leader first, each with its command and
+    /// the directory it works in.
+    #[command(visible_alias = "ps")]
+    ProcessInfo {
+        name: String,
+
+        /// Print it as JSON, with the session's own program and the
+        /// foreground process group.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Stream a session's terminal as JSON lines, for a program to watch:
+    /// a `start` line with its size, then each `output` the program
+    /// writes, base64, the first drawing the screen as it is, then
+    /// `closed`. Doesn't resize the session, or count as you watching it.
+    Observe { name: String },
+    /// Stream a session's terminal as `observe` does, and drive it with
+    /// JSON lines on standard input: `input` (`text`, or `data` in base64),
+    /// `keys` by name as send-keys takes them, `resize` and `release`. The
+    /// end of the input lets go too.
+    Control {
+        name: String,
+
+        /// Resize the session to this many rows first.
+        #[arg(long, requires = "cols")]
+        rows: Option<u16>,
+
+        /// And this many columns.
+        #[arg(long, requires = "rows")]
+        cols: Option<u16>,
+    },
+    /// Read everything crystal knows as JSON, for a client of your own to
+    /// start from: `api snapshot`.
+    Api {
+        #[command(subcommand)]
+        command: ApiCommand,
     },
     /// Give a session another name.
     Rename { name: String, new_name: String },
@@ -678,9 +761,15 @@ enum Command {
         #[command(subcommand)]
         command: Option<ProfileCommand>,
     },
-    /// List plugins, crystal's own and yours, with whether they're on; or
-    /// switch, run, install, build, make or remove one.
+    /// List plugins, crystal's own, yours and the project's, with whether
+    /// they're on; or the events they hear; or switch, run, install, build,
+    /// make or remove one, or open one of its panes.
     Plugin {
+        /// The directory of the project whose plugins `--project` means,
+        /// and which the list shows [default: the current one]
+        #[arg(short = 'C', long = "dir", value_name = "DIR", global = true)]
+        dir: Option<PathBuf>,
+
         #[command(subcommand)]
         command: Option<PluginCommand>,
     },
@@ -789,6 +878,15 @@ enum Command {
 }
 
 #[derive(Subcommand)]
+enum ApiCommand {
+    /// Print everything at once as JSON: the sessions, the TUI's tabs and
+    /// panes, the projects, the tasks not closed, the flow runs, the
+    /// archive, and the latest event's `seq`, to follow on from with
+    /// `crystal events --follow --after <seq>`.
+    Snapshot,
+}
+
+#[derive(Subcommand)]
 enum IntegrationCommand {
     /// Add crystal's hooks, beside your own, to every event crystal
     /// listens to. Codex runs them once you've reviewed them in its
@@ -802,10 +900,16 @@ enum IntegrationCommand {
         /// The agent [default: each one installed here]
         agent: Option<integration::Agent>,
     },
-    /// Whether crystal's hooks are installed, for this crystal.
+    /// Whether crystal's hooks are installed, for this crystal: installed,
+    /// out of date (another crystal's, or an earlier one's, which
+    /// `install` brings up to date), or not installed.
     Status {
         /// The agent [default: every one]
         agent: Option<integration::Agent>,
+
+        /// Only those out of date.
+        #[arg(long)]
+        outdated_only: bool,
     },
 }
 
@@ -1613,16 +1717,36 @@ enum ProfileCommand {
 
 #[derive(Subcommand)]
 enum PluginCommand {
-    /// Turn a plugin on.
-    Enable { name: String },
+    /// Turn a plugin on. A project's shows what it runs and asks first,
+    /// then builds it.
+    Enable {
+        name: String,
+
+        /// The plugin the project ships in its .crystal/plugins, on for it
+        /// alone.
+        #[arg(long)]
+        project: bool,
+
+        /// Don't ask first.
+        #[arg(long, requires = "project")]
+        yes: bool,
+    },
     /// Turn a plugin off.
-    Disable { name: String },
+    Disable {
+        name: String,
+
+        /// The plugin the project ships.
+        #[arg(long)]
+        project: bool,
+    },
+    /// List the events a plugin's hooks can hear, and when each happens.
+    Events,
     /// Run one of a plugin's actions, or try its hooks out on an event.
     Run {
         plugin: String,
 
         /// The action, by its id.
-        #[arg(required_unless_present_any = ["event", "link"])]
+        #[arg(required_unless_present_any = ["event", "json", "link"])]
         action: Option<String>,
 
         /// Run the plugin's hooks on a made-up event of this kind, like
@@ -1631,15 +1755,30 @@ enum PluginCommand {
         #[arg(long, value_name = "KIND", conflicts_with = "action")]
         event: Option<String>,
 
+        /// Run its hooks on the event this JSON says, or - to read it from
+        /// standard input, like a line of `crystal events --json`: what it
+        /// gives over a made-up one of its kind, or of --event's.
+        #[arg(long, value_name = "JSON", conflicts_with = "action")]
+        json: Option<String>,
+
         /// Run the action the plugin's link handlers give this link, with
         /// it in CRYSTAL_LINK, as a Ctrl+click on it in a pane would.
-        #[arg(long, value_name = "URL", conflicts_with_all = ["action", "event"])]
+        #[arg(long, value_name = "URL", conflicts_with_all = ["action", "event", "json"])]
         link: Option<String>,
 
         /// The session to run it for [default: the one this runs in, if
         /// any]
         #[arg(short, long)]
         session: Option<String>,
+
+        /// The plugin the project ships.
+        #[arg(long)]
+        project: bool,
+    },
+    /// Open one of a plugin's panes.
+    Pane {
+        #[command(subcommand)]
+        command: PluginPaneCommand,
     },
     /// Install a plugin from a git repository or a directory, once you've
     /// seen what it runs and said yes, and build it. It starts off.
@@ -1657,14 +1796,70 @@ enum PluginCommand {
     },
     /// Run a plugin's build commands again. One that fails turns it off
     /// until a build works.
-    Build { name: String },
+    Build {
+        name: String,
+
+        /// The plugin the project ships.
+        #[arg(long)]
+        project: bool,
+    },
     /// Remove a plugin you installed.
     #[command(visible_alias = "rm")]
     Remove { name: String },
     /// Make a plugin to start from, in your plugins directory.
     New { name: String },
     /// Print what a plugin's commands printed, and how they failed.
-    Log { name: String },
+    Log {
+        name: String,
+
+        /// The plugin the project ships.
+        #[arg(long)]
+        project: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum PluginPaneCommand {
+    /// Start one of a plugin's panes in a session of its own and show it
+    /// where its manifest says, or --placement does: over the TUI's panes
+    /// or in a popup, which take a TUI, or split off a session's pane,
+    /// zoomed, or in a tab of its own. Prints the session's name.
+    Open {
+        plugin: String,
+
+        /// The pane, by its id.
+        pane: String,
+
+        /// Where it goes, in place of where its manifest says.
+        #[arg(long, value_enum)]
+        placement: Option<plugin_manifest::Placement>,
+
+        /// A popup's width: so many cells, or a share of the screen, like
+        /// 80%.
+        #[arg(long, value_name = "SIZE")]
+        width: Option<String>,
+
+        /// A popup's height.
+        #[arg(long, value_name = "SIZE")]
+        height: Option<String>,
+
+        /// A split's new pane to the right of the session's.
+        #[arg(long, conflicts_with = "down")]
+        right: bool,
+
+        /// A split's new pane below the session's.
+        #[arg(long)]
+        down: bool,
+
+        /// The session it's about, and a split goes beside [default: the
+        /// one this runs in, or else the one selected]
+        #[arg(short, long)]
+        session: Option<String>,
+
+        /// The plugin the project ships.
+        #[arg(long)]
+        project: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1788,13 +1983,32 @@ enum BacklogCommand {
     },
 }
 
+/// What `crystal` exits with when a wait gives up: 2, and only then, so a
+/// script can tell "not yet" from anything else going wrong.
+const TIMED_OUT: u8 = 2;
+
 fn main() -> ExitCode {
-    match run(Cli::parse()) {
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(err) => {
+            let _ = err.print();
+            // A mistyped flag fails as anything else does, with 1: clap's
+            // own 2 is a wait's that gave up.
+            return match err.use_stderr() {
+                true => ExitCode::FAILURE,
+                false => ExitCode::SUCCESS,
+            };
+        }
+    };
+    match run(cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             // It may quote what a session, an agent or the forge said.
             eprintln!("crystal: {}", printable::text(&format!("{err:#}")));
-            ExitCode::FAILURE
+            match err.is::<drive::TimedOut>() {
+                true => ExitCode::from(TIMED_OUT),
+                false => ExitCode::FAILURE,
+            }
         }
     }
 }
@@ -2008,12 +2222,17 @@ fn run(cli: Cli) -> Result<()> {
             text,
             no_enter,
             force,
+            interrupt,
             wait,
             timeout,
         } => {
-            drive::send(&socket, &name, &text.join(" "), !no_enter, force)?;
+            let text = match &text[..] {
+                [dash] if dash == drive::FROM_STDIN => drive::read_stdin()?,
+                words => words.join(" "),
+            };
+            drive::send(&socket, &name, &text, !no_enter, force, interrupt)?;
             if wait {
-                drive::wait_for_turn(&socket, &name, seconds(timeout))?;
+                drive::wait_for_turn(&socket, &name, seconds(timeout), false)?;
             }
         }
         Command::SendKeys {
@@ -2024,7 +2243,7 @@ fn run(cli: Cli) -> Result<()> {
         } => {
             drive::send_keys(&socket, &name, keys)?;
             if wait {
-                drive::wait_for_turn(&socket, &name, seconds(timeout))?;
+                drive::wait_for_turn(&socket, &name, seconds(timeout), false)?;
             }
         }
         Command::Wait {
@@ -2032,27 +2251,40 @@ fn run(cli: Cli) -> Result<()> {
             until,
             output,
             timeout,
+            quiet,
         } => {
             let timeout = seconds(timeout);
             match output {
-                Some(pattern) => drive::wait_for_output(&socket, &name, &pattern, timeout)?,
-                None if until.is_empty() => drive::wait(&socket, &name, timeout)?,
-                None => drive::wait_until(&socket, &name, &until, timeout)?,
+                Some(pattern) => drive::wait_for_output(&socket, &name, &pattern, timeout, quiet)?,
+                None if until.is_empty() => drive::wait(&socket, &name, timeout, quiet)?,
+                None => drive::wait_until(&socket, &name, &until, timeout, quiet)?,
             }
         }
         Command::Events {
             since,
+            after,
             kinds,
             name,
             dir,
+            task,
+            limit,
             json,
             follow,
         } => {
+            let task = task
+                .map(|task| {
+                    tasks::parse_id(&task)
+                        .ok_or_else(|| anyhow::anyhow!("`{task}` isn't a task's number, like t12"))
+                })
+                .transpose()?;
             let options = events_cli::Options {
                 since,
+                after,
                 kinds,
                 session: name,
                 dir: dir.map(|dir| here(Some(dir))).transpose()?,
+                task,
+                limit,
                 json,
                 follow,
             };
@@ -2062,7 +2294,31 @@ fn run(cli: Cli) -> Result<()> {
             name,
             lines,
             history,
-        } => drive::read(&socket, &name, lines, history)?,
+            since,
+            unwrap,
+            ansi,
+        } => {
+            let reading = drive::Reading {
+                lines,
+                history,
+                unwrap,
+                ansi,
+                since,
+            };
+            drive::read(&socket, &name, reading)?
+        }
+        Command::ProcessInfo { name, json } => drive::process_info(&socket, &name, json)?,
+        Command::Observe { name } => stream::observe(&socket, &name)?,
+        Command::Api {
+            command: ApiCommand::Snapshot,
+        } => println!(
+            "{}",
+            serde_json::to_string_pretty(&api::snapshot(&socket)?)?
+        ),
+        Command::Control { name, rows, cols } => {
+            let size = rows.zip(cols).filter(|&(rows, cols)| rows > 0 && cols > 0);
+            stream::control(&socket, &name, size)?
+        }
         Command::Rename { name, new_name } => client::rename(&socket, &name, &new_name)?,
         Command::Respawn { name } => client::respawn(&socket, &name)?,
         Command::Archive { names } => {
@@ -2151,42 +2407,86 @@ fn run(cli: Cli) -> Result<()> {
                 Some(ProfileCommand::Show { name }) => print_profile(&settings.profiles, &name)?,
             }
         }
-        Command::Plugin { command } => match command {
-            None => plugin_cli::list(&socket)?,
-            Some(PluginCommand::Enable { name }) => plugin_cli::switch(&socket, &name, true)?,
-            Some(PluginCommand::Disable { name }) => plugin_cli::switch(&socket, &name, false)?,
-            Some(PluginCommand::Run {
-                plugin,
-                action,
-                event,
-                link,
-                session,
-            }) => {
-                let code = match (action, event, link) {
-                    (_, Some(event), _) => {
-                        plugin_cli::run_event(&socket, &plugin, &event, session)?
-                    }
-                    (_, None, Some(link)) => {
-                        plugin_cli::run_link(&socket, &plugin, &link, session)?
-                    }
-                    (action, None, None) => {
-                        let action = action.unwrap_or_default();
-                        plugin_cli::run(&socket, &plugin, &action, session, None)?
-                    }
-                };
-                // The action's or the hook's own exit code is crystal's.
-                std::process::exit(code);
+        Command::Plugin { dir, command } => {
+            let id = |name: &str, project: bool| plugin_cli::id(name, project, dir.clone());
+            match command {
+                None => plugin_cli::list(&socket, dir)?,
+                Some(PluginCommand::Enable { name, project, yes }) => {
+                    plugin_cli::switch(&socket, &id(&name, project)?, true, yes)?
+                }
+                Some(PluginCommand::Disable { name, project }) => {
+                    plugin_cli::switch(&socket, &id(&name, project)?, false, false)?
+                }
+                Some(PluginCommand::Events) => plugin_cli::events(),
+                Some(PluginCommand::Run {
+                    plugin,
+                    action,
+                    event,
+                    json,
+                    link,
+                    session,
+                    project,
+                }) => {
+                    let plugin = id(&plugin, project)?;
+                    let code = match (action, event, json, link) {
+                        (_, event, json, _) if event.is_some() || json.is_some() => {
+                            let (event, json) = (event.as_deref(), json.as_deref());
+                            plugin_cli::run_event(&socket, &plugin, event, json, session)?
+                        }
+                        (_, _, _, Some(link)) => {
+                            plugin_cli::run_link(&socket, &plugin, &link, session)?
+                        }
+                        (action, ..) => {
+                            let action = action.unwrap_or_default();
+                            plugin_cli::run(&socket, &plugin, &action, session, None)?
+                        }
+                    };
+                    // The action's or the hook's own exit code is crystal's.
+                    std::process::exit(code);
+                }
+                Some(PluginCommand::Pane {
+                    command:
+                        PluginPaneCommand::Open {
+                            plugin,
+                            pane,
+                            placement,
+                            width,
+                            height,
+                            right,
+                            down,
+                            session,
+                            project,
+                        },
+                }) => {
+                    let split = match (right, down) {
+                        (true, _) => Some(tui::keymap::SplitWay::Right),
+                        (_, true) => Some(tui::keymap::SplitWay::Down),
+                        _ => None,
+                    };
+                    let placing = plugin_cli::Placing {
+                        placement,
+                        width,
+                        height,
+                        split,
+                    };
+                    let plugin = id(&plugin, project)?;
+                    plugin_cli::open_pane(&socket, &plugin, &pane, placing, session)?
+                }
+                Some(PluginCommand::Install {
+                    source,
+                    yes,
+                    enable,
+                }) => plugin_cli::install(&socket, &source, yes, enable)?,
+                Some(PluginCommand::Build { name, project }) => {
+                    plugin_cli::build(&socket, &id(&name, project)?)?
+                }
+                Some(PluginCommand::Remove { name }) => plugin_cli::remove(&name)?,
+                Some(PluginCommand::New { name }) => plugin_cli::new(&name)?,
+                Some(PluginCommand::Log { name, project }) => {
+                    plugin_cli::log(&socket, &id(&name, project)?)?
+                }
             }
-            Some(PluginCommand::Install {
-                source,
-                yes,
-                enable,
-            }) => plugin_cli::install(&socket, &source, yes, enable)?,
-            Some(PluginCommand::Build { name }) => plugin_cli::build(&socket, &name)?,
-            Some(PluginCommand::Remove { name }) => plugin_cli::remove(&name)?,
-            Some(PluginCommand::New { name }) => plugin_cli::new(&name)?,
-            Some(PluginCommand::Log { name }) => plugin_cli::log(&socket, &name)?,
-        },
+        }
         Command::Mermaid { file, width, ascii } => mermaid_cli::run(file.as_deref(), width, ascii)?,
         Command::Keys => {
             let config = config::Config::load()?;
@@ -2565,10 +2865,17 @@ fn run_integration(command: IntegrationCommand) -> Result<()> {
                 println!("{}", integration::uninstall(agent)?);
             }
         }
-        IntegrationCommand::Status { agent } => {
+        IntegrationCommand::Status {
+            agent,
+            outdated_only,
+        } => {
             let agents = agent.map_or(integration::Agent::ALL.to_vec(), |agent| vec![agent]);
             for agent in agents {
-                println!("{}", integration::status(agent, &crystal)?);
+                let outdated =
+                    integration::standing_of(agent, &crystal)? == integration::Standing::OutOfDate;
+                if outdated || !outdated_only {
+                    println!("{}", integration::status(agent, &crystal)?);
+                }
             }
         }
     }

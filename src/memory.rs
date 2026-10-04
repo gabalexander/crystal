@@ -190,6 +190,12 @@ ALTER TABLE entries ADD COLUMN anchors TEXT NOT NULL DEFAULT '{}';
 ALTER TABLE entries ADD COLUMN checkout TEXT;
 ";
 
+/// Whether the daemon has told of each entry going stale, which it does
+/// once, until the entry holds again: see [`newly_stale`].
+const TOLD_STALE: &str = "
+ALTER TABLE entries ADD COLUMN told_stale INTEGER NOT NULL DEFAULT 0;
+";
+
 /// What each forgotten entry said, beside the hash of its words, for
 /// `crystal memory list --forgotten` to show: its id, kind, text and files,
 /// where it came from, and when it was forgotten. Those forgotten before
@@ -210,6 +216,7 @@ const MIGRATIONS: &[fn(&Connection) -> Result<()>] = &[
     |conn| Ok(conn.execute_batch(TABLES)?),
     |conn| Ok(conn.execute_batch(VECTORS)?),
     add_anchors,
+    |conn| Ok(conn.execute_batch(TOLD_STALE)?),
     |conn| Ok(conn.execute_batch(FORGOTTEN_ENTRIES)?),
 ];
 
@@ -514,7 +521,7 @@ impl Store {
             let anchors = anchors_in(checkout, &files);
             tx.execute(
                 "UPDATE entries SET seen = seen + 1, last_seen = ?3, files = ?4, anchors = ?5, \
-                 checkout = ?6 WHERE project = ?1 AND id = ?2",
+                 checkout = ?6, told_stale = 0 WHERE project = ?1 AND id = ?2",
                 params![
                     name,
                     said.id,
@@ -643,6 +650,31 @@ impl Store {
     pub fn get(&mut self, project: &Path, id: u64) -> Result<Option<Entry>> {
         let name = self.ready(project)?;
         get(&self.conn, &name, id)
+    }
+
+    /// Every project's entries that are anchored to files, each with its
+    /// project's main worktree and whether the daemon has told of it going
+    /// stale: those that can go stale.
+    fn anchored(&mut self) -> Result<Vec<(PathBuf, Entry, bool)>> {
+        let mut query = self.conn.prepare(&format!(
+            "SELECT {COLUMNS}, e.project, e.told_stale FROM entries e \
+             WHERE e.anchors != '{{}}' ORDER BY e.project, e.id"
+        ))?;
+        let anchored = query.query_map([], |row| {
+            let project: String = row.get(10)?;
+            Ok((PathBuf::from(project), entry_of(row)?, row.get(11)?))
+        })?;
+        Ok(anchored.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Notes whether the daemon has told of entry `id` of `project` going
+    /// stale.
+    fn set_told_stale(&mut self, project: &Path, id: u64, told: bool) -> Result<()> {
+        self.conn.execute(
+            "UPDATE entries SET told_stale = ?3 WHERE project = ?1 AND id = ?2",
+            params![project.to_string_lossy(), id, told],
+        )?;
+        Ok(())
     }
 
     /// The entries of `project` about any of `files`, said most recently
@@ -1573,6 +1605,26 @@ pub fn freshness(entry: &Entry, project: &Path) -> Freshness {
     Hashes::default().freshness(entry, project)
 }
 
+/// The entries of the memory kept for the daemon at `socket`, with their
+/// projects, that have gone stale, every file each is about changed or
+/// gone, and that the daemon hasn't told of yet: each is told of once,
+/// until it holds again, its files changed back or it said again.
+pub fn newly_stale(socket: &Path) -> Result<Vec<(PathBuf, Entry)>> {
+    let mut store = Store::open(socket)?;
+    let mut hashes = Hashes::default();
+    let mut gone_stale = Vec::new();
+    for (project, entry, told) in store.anchored()? {
+        let stale = hashes.freshness(&entry, &project) == Freshness::Stale;
+        if stale != told {
+            store.set_told_stale(&project, entry.id, stale)?;
+        }
+        if stale && !told {
+            gone_stale.push((project, entry));
+        }
+    }
+    Ok(gone_stale)
+}
+
 /// The hash of each file looked at, read once however many entries are
 /// about it.
 #[derive(Default)]
@@ -2086,6 +2138,43 @@ mod tests {
         assert_eq!(holds(), Freshness::Drifting);
         fs::write(at.join("a.rs"), "changed").unwrap();
         assert_eq!(holds(), Freshness::Fresh);
+    }
+
+    #[test]
+    fn an_entry_is_told_of_once_as_it_goes_stale_until_it_holds_again() {
+        let (_dir, socket) = socket();
+        let project = project_with(&["a.rs", "b.rs"]);
+        let at = project.path();
+        add(&socket, at, about(&["a.rs"], at)).unwrap();
+        add(&socket, at, note("about no file")).unwrap();
+        let other = New {
+            text: "the ledger runs nightly".into(),
+            ..about(&["b.rs"], at)
+        };
+        add(&socket, at, other).unwrap();
+        let swept = || -> Vec<u64> {
+            let stale = newly_stale(&socket).unwrap();
+            assert!(stale.iter().all(|(project, _)| project == at));
+            stale.into_iter().map(|(_, entry)| entry.id).collect()
+        };
+        assert_eq!(swept(), Vec::<u64>::new());
+        fs::write(at.join("a.rs"), "changed").unwrap();
+        assert_eq!(swept(), [1]);
+        assert_eq!(swept(), Vec::<u64>::new(), "once is enough");
+
+        // Fresh again, its file changed back, it can go stale again.
+        fs::write(at.join("b.rs"), "changed").unwrap();
+        assert_eq!(swept(), [3]);
+        fs::write(at.join("b.rs"), "b.rs").unwrap();
+        assert_eq!(swept(), Vec::<u64>::new());
+        fs::remove_file(at.join("b.rs")).unwrap();
+        assert_eq!(swept(), [3]);
+
+        // Said again, it holds for its files as they are now.
+        fs::write(at.join("a.rs"), "a.rs").unwrap();
+        add(&socket, at, about(&["a.rs"], at)).unwrap();
+        fs::write(at.join("a.rs"), "changed again").unwrap();
+        assert_eq!(swept(), [1]);
     }
 
     #[test]

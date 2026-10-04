@@ -260,6 +260,8 @@ pub fn promote(socket: &Path, dir: Option<PathBuf>, id: u64, yes: bool) -> Resul
     }
     let file = memory::promote(&memory.project, entry)?;
     println!("added entry {id} to {}", file.display());
+    let promoted = Event::promoted(memory.project.clone(), entry.clone(), file);
+    tell(socket, promoted);
     Ok(())
 }
 

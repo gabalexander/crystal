@@ -24,6 +24,7 @@ mod finder;
 mod fuzzy;
 mod grep;
 mod groups;
+mod handoff_view;
 mod help;
 mod issues;
 pub(crate) mod keymap;
@@ -40,6 +41,7 @@ mod plugins_view;
 mod preview;
 mod profiles;
 mod pull_requests;
+mod ram_view;
 mod reply;
 mod restarted;
 mod review;
@@ -64,23 +66,24 @@ pub(crate) mod window;
 use crate::bell::Ringer;
 use crate::config::{self, Config};
 use crate::db::{self, Db};
-use crate::events::{Filter, Since};
+use crate::events::{Filter, Scope, Since};
 use crate::flow_run::FlowRun;
 use crate::forge::{
     Checkout, Forge, Issue, IssueDetail, PullRequest, PullRequestDetail, Repo, Topic,
 };
-use crate::layout::{Layout, Order, Relayed};
+use crate::layout::{self, Layout, Order, Relayed};
 use crate::memory::{self, Listed, Memory};
-use crate::plugins::{self, Context};
+use crate::plugin_manifest::Placement;
+use crate::plugins::{self, Context, Id};
 use crate::profile;
 use crate::project_cli;
 use crate::project_commands::{self, Commands, Verb};
 use crate::protocol::{
     Backlog, NewSession, Request, Response, SessionInfo, Spending, State, Worktree,
 };
-use crate::{catalog, keys, links, names, socket, typing, update};
-use crate::{client, clipboard, drive, env, event_log, events, git};
-use anyhow::{Context as _, Result, bail};
+use crate::{catalog, keys, links, names, project, shell, socket, typing, update};
+use crate::{client, clipboard, drive, env, event_log, events, git, handoff};
+use anyhow::{Context as _, Result, bail, ensure};
 use app::{Action, App, Focus, Hit, Place, PluginKey, PluginPane, Popup, Slot};
 use appearance::Appearance;
 use backlog_view::BacklogChange;
@@ -89,7 +92,7 @@ use crossterm::event::{
     MouseEventKind,
 };
 use diff_view::Against;
-use keymap::{CommandKind, KeyCommand, Sequence};
+use keymap::{CommandKind, KeyCommand, Sequence, SplitWay};
 use layouts::{Layouts, Which};
 use pane::Pane;
 use ratatui::DefaultTerminal;
@@ -143,6 +146,11 @@ const WORKTREES_EVERY: Duration = Duration::from_secs(5);
 /// when nothing says it has: a worktree is counted again straight away
 /// once a session in it changes.
 const STATS_EVERY: Duration = Duration::from_secs(10);
+
+/// How often the daemon is asked what crystal's processes take, for the
+/// footer's readout; and how often while the RAM view is open.
+const RESOURCES_EVERY: Duration = Duration::from_secs(5);
+const RESOURCES_OPEN_EVERY: Duration = Duration::from_secs(1);
 
 /// How often the thread following the event log for the timeline looks up
 /// from waiting, to see whether the timeline is still open.
@@ -260,6 +268,8 @@ pub enum Event {
     /// A pull request's worktree is there now: the start that waited on it
     /// can go on, in it.
     Fetched(Box<Action>),
+    /// What the daemon found crystal's processes take.
+    Resources(crate::resources::Resources),
     /// Something to tell the user, from work done off the loop.
     Notice(String),
     /// A worktree's diff, read for the diff view.
@@ -324,6 +334,9 @@ pub enum Event {
     /// The settings as they are now, for the settings view: boxed, as the
     /// config is the biggest thing an event carries.
     Settings(Box<settings_view::Current>),
+    /// The config file has changed: what it says now, or why it can't be
+    /// read.
+    ConfigFile(Box<Result<Config, String>>),
     /// The terminal has focus again, or has lost it.
     Focus(bool),
     /// A page of the event log, the newest first, read for the timeline
@@ -340,6 +353,11 @@ pub enum Event {
     },
     /// What the event log gained while the user was away.
     Away(Result<away::Tally, String>),
+    /// What the handoff view on `session` shows.
+    HandoffFound {
+        session: String,
+        found: handoff_view::Found,
+    },
     /// The system's appearance, light or dark, has changed.
     Appearance(Appearance),
     /// What each thing at the tab bar's right shows now.
@@ -384,6 +402,7 @@ pub fn run(socket: &Path) -> Result<()> {
         sender.clone(),
     );
     let layout = layout_link::Link::open(socket, sender.clone());
+    watch_config(sender.clone());
     let count_backlog = Arc::new(AtomicBool::new(crate::backlog::enabled(&config)));
     let poll_flows = Arc::new(AtomicBool::new(crate::flows::enabled(&config)));
     let poll_settings = Arc::new(AtomicBool::new(false));
@@ -408,6 +427,8 @@ pub fn run(socket: &Path) -> Result<()> {
     let stat_worktrees = Arc::new(Mutex::new(Vec::new()));
     let stats_now = Arc::new(Mutex::new(HashSet::new()));
     spawn_stat_counter(stat_worktrees.clone(), stats_now.clone(), sender.clone());
+    let ram_open = Arc::new(AtomicBool::new(false));
+    spawn_resource_poller(socket.to_path_buf(), sender.clone(), ram_open.clone());
 
     // Losing the tabs is no reason not to start: without the database, the
     // TUI starts with one tab, and says why when asked for a layout.
@@ -445,6 +466,7 @@ pub fn run(socket: &Path) -> Result<()> {
         count_backlog,
         poll_flows,
         poll_settings,
+        ram_open,
         config: config.clone(),
         feed: Arc::new(AtomicU64::new(0)),
         presence: away::Presence::new(events::now_ms()),
@@ -593,6 +615,9 @@ struct Tui {
     /// Whether the session poller reads the settings too: the settings
     /// view is open.
     poll_settings: Arc<AtomicBool>,
+    /// Whether the RAM view is open, which has the daemon asked what the
+    /// sessions take more often.
+    ram_open: Arc<AtomicBool>,
     /// The config as the TUI last took it in.
     config: Config,
     /// Where layout commands from the command line come from, and their
@@ -863,22 +888,25 @@ impl Tui {
         }
     }
 
-    /// Reads the newest page of the event log for the timeline, then
-    /// follows the log from there, on a thread of its own, until the
-    /// timeline closes. Subscribing from the page's newest event leaves no
-    /// gap between the two, and the subscription picks up again after the
-    /// last event it gave when a handover cuts it.
-    fn follow_events(&self) {
+    /// Reads the newest page of the event log of `scope` for the timeline,
+    /// then follows the log from there, on a thread of its own, until the
+    /// timeline closes or is switched to another scope. Subscribing from
+    /// the latest event the log had as the page was read leaves no gap
+    /// between the two (an event in both is taken once), and the
+    /// subscription picks up again after the last event it gave when a
+    /// handover cuts it.
+    fn follow_events(&self, scope: Scope) {
         let feed = self.feed.fetch_add(1, Ordering::Relaxed) + 1;
         let current = self.feed.clone();
         let socket = self.socket.clone();
         let events = self.events.clone();
         thread::spawn(move || {
-            let read = read_events(&socket, None);
+            let read = read_events(&socket, &scope, None);
             let since = match &read {
-                Ok(page) => Some(Since::Seq(page.first().map_or(0, |event| event.seq))),
+                Ok((latest, _)) => Some(Since::Seq(*latest)),
                 Err(_) => None,
             };
+            let read = read.map(|(_, page)| page);
             if events.send(Event::EventsRead { feed, read }).is_err() {
                 return;
             }
@@ -1211,6 +1239,7 @@ impl Tui {
                 self.carry_out(*start);
             }
             Event::Notice(notice) => self.app.notify(notice),
+            Event::Resources(taken) => self.app.set_resources(taken),
             Event::Output { pane, bytes } => {
                 let Some(pane) = self.pane_with_id(pane) else {
                     return;
@@ -1286,6 +1315,18 @@ impl Tui {
                 }
                 self.app.show_settings(*current);
             }
+            Event::ConfigFile(read) => match *read {
+                // A change the settings view made is the config already.
+                Ok(config) if config != self.config => {
+                    self.config_changed(&config);
+                    self.app
+                        .notify("the config file changed: the settings follow it".into());
+                }
+                Ok(_) => {}
+                Err(why) => self.app.notify(format!(
+                    "the config file can't be read, so the settings stay as they were: {why}"
+                )),
+            },
             Event::Focus(true) => {
                 self.layout.focus(true);
                 if let Some(went) = self.presence.focus_gained(events::now_ms()) {
@@ -1313,6 +1354,11 @@ impl Tui {
             }
             Event::Status(status) => self.app.set_status(status),
             Event::Away(Ok(tally)) => self.app.set_away(&tally),
+            Event::HandoffFound { session, found } => {
+                if let Some(action) = self.app.handoff_found(&session, found) {
+                    self.carry_out(action);
+                }
+            }
             Event::Away(Err(reason)) => {
                 self.app
                     .notify(format!("couldn't read the event log: {reason}"));
@@ -1536,7 +1582,7 @@ impl Tui {
                 link: Some(url),
                 ..context
             };
-            return self.run_plugin(&plugin, &action, context);
+            return self.run_plugin(&Id::own(&plugin), &action, context);
         }
         let said = links::open(&url)?;
         self.app.notify(said);
@@ -1573,6 +1619,37 @@ impl Tui {
             pane.send_keys(&bytes);
         }
         true
+    }
+
+    /// Puts the project in `dir` on the list, once it's one: a directory
+    /// that isn't there, or isn't in a git repository, is asked about
+    /// first. One in a project already, its root or not, puts that project
+    /// on the list, if it isn't on it yet.
+    fn add_project(&mut self, dir: PathBuf) -> Result<()> {
+        let dir = std::path::absolute(&dir).unwrap_or(dir);
+        if !dir.exists() {
+            self.app.confirm_new_project(dir, true);
+            return Ok(());
+        }
+        ensure!(
+            dir.is_dir(),
+            "{} isn't a directory",
+            shell::home_relative(&dir)
+        );
+        if git::Checkout::find(&dir).is_none() {
+            self.app.confirm_new_project(dir, false);
+            return Ok(());
+        }
+        client::ask(
+            &self.socket,
+            &Request::AddProject { dir: dir.clone() },
+            false,
+        )?;
+        if let Some(projects) = list_projects(&self.socket) {
+            self.set_known_projects(projects);
+        }
+        self.app.project_added(&project::of(&dir).path);
+        Ok(())
     }
 
     fn perform(&mut self, action: Action) -> Result<()> {
@@ -1852,14 +1929,33 @@ impl Tui {
                 self.prepare_embeddings();
                 self.read_settings_now();
             }
+            Action::Integrate { agent, install } => {
+                let integrated = std::env::current_exe()
+                    .map_err(anyhow::Error::from)
+                    .and_then(|crystal| match install {
+                        true => crate::integration::install(agent, &crystal),
+                        false => crate::integration::uninstall(agent).map(|said| vec![said]),
+                    });
+                match integrated {
+                    // The last line says what's left to do, like Codex's
+                    // review of its hooks.
+                    Ok(said) => self
+                        .app
+                        .setting_noted(said.last().cloned().unwrap_or_default()),
+                    Err(err) => self.app.setting_failed(format!("{err:#}")),
+                }
+                self.read_settings_now();
+            }
             Action::ListPlugins => {
                 let config = Config::load()?;
-                self.app.show_plugins(listed_plugins(&config, &self.socket));
+                let listed = listed_plugins(&config, &self.socket, self.selected_project());
+                self.app.show_plugins(listed);
             }
-            Action::SwitchPlugin { name, on } => {
+            Action::SwitchPlugin { name, project, on } => {
                 let path = config::path();
-                let switched = can_switch(&name, on)
-                    .and_then(|()| plugins::set_enabled(&path, &self.socket, &name, on))
+                let id = Id { name, project };
+                let switched = can_switch(&id, on)
+                    .and_then(|()| plugins::switch(&path, &self.socket, &id, on))
                     .and_then(|()| Config::load());
                 match switched {
                     Ok(config) => self.plugins_changed(&config),
@@ -1868,14 +1964,29 @@ impl Tui {
             }
             Action::RunPlugin {
                 plugin,
+                project,
                 action,
                 context,
-            } => self.run_plugin(&plugin, &action, context)?,
+            } => {
+                let id = Id {
+                    name: plugin,
+                    project,
+                };
+                self.run_plugin(&id, &action, context)?
+            }
             Action::OpenPluginPane {
                 plugin,
+                project,
                 pane,
                 context,
-            } => self.open_plugin_pane(&plugin, &pane, context)?,
+            } => {
+                let id = Id {
+                    name: plugin,
+                    project,
+                };
+                self.open_plugin_pane(&id, &pane, context)?
+            }
+            Action::ShowPluginPane(pane) => self.show_over(pane)?,
             Action::TypeInPluginPane(key) => {
                 if let Some(pane) = &mut self.overlay
                     && let Some(bytes) = keys::encode_for(&key, &pane.screen)
@@ -1928,16 +2039,29 @@ impl Tui {
                 }
                 self.app.restore_layout(restored.tabs, &name, started);
             }
-            Action::FollowEvents => self.follow_events(),
+            Action::FollowEvents(scope) => self.follow_events(scope),
             Action::StopFollowing => {
                 self.feed.fetch_add(1, Ordering::Relaxed);
             }
-            Action::ReadOlderEvents(before) => {
+            Action::OpenRam => self.ram_open.store(true, Ordering::Relaxed),
+            Action::CloseRam => self.ram_open.store(false, Ordering::Relaxed),
+            Action::ReadOlderEvents { scope, before } => {
                 let feed = self.feed.load(Ordering::Relaxed);
                 let socket = self.socket.clone();
                 self.read_in_background(move || Event::EventsRead {
                     feed,
-                    read: read_events(&socket, Some(before)),
+                    read: read_events(&socket, &scope, Some(before)).map(|(_, page)| page),
+                });
+            }
+            Action::ReadHandoff {
+                session,
+                worktree,
+                task,
+            } => {
+                let socket = self.socket.clone();
+                self.read_in_background(move || Event::HandoffFound {
+                    found: find_handoff(&socket, worktree, task),
+                    session,
                 });
             }
             Action::RemoveLayout(which) => {
@@ -1958,6 +2082,19 @@ impl Tui {
                 if let Some(projects) = list_projects(&self.socket) {
                     self.set_known_projects(projects);
                 }
+            }
+            Action::AddProject(dir) => self.add_project(dir)?,
+            Action::NewProject { dir, create } => {
+                if create {
+                    std::fs::create_dir_all(&dir)
+                        .with_context(|| format!("couldn't make {}", shell::home_relative(&dir)))?;
+                }
+                git::init(&dir)?;
+                self.add_project(dir)?;
+            }
+            Action::CompleteDirectory(typed) => {
+                let completed = shell::complete_dir(&typed, shell::subdirectories);
+                self.app.complete_answer(&completed);
             }
             Action::Archive(name) => {
                 client::ask(
@@ -2346,7 +2483,14 @@ impl Tui {
     /// the plugins add follows what the config file now says.
     fn plugins_changed(&mut self, config: &Config) {
         self.config_changed(config);
-        self.app.show_plugins(listed_plugins(config, &self.socket));
+        let listed = listed_plugins(config, &self.socket, self.selected_project());
+        self.app.show_plugins(listed);
+    }
+
+    /// The main worktree of the selected session's project, whose plugins
+    /// the plugins view lists.
+    fn selected_project(&self) -> Option<PathBuf> {
+        self.app.selected_context().project
     }
 
     /// Takes in `config`, when it's not the one the TUI has: the theme, the
@@ -2432,13 +2576,13 @@ impl Tui {
 
     /// Runs one of a plugin's actions, off the loop, with what it prints in
     /// the plugin's log, and says how it went at the bottom.
-    fn run_plugin(&mut self, plugin: &str, action: &str, context: Context) -> Result<()> {
-        plugins::ensure_enabled(&Config::load()?, plugin)?;
+    fn run_plugin(&mut self, plugin: &Id, action: &str, context: Context) -> Result<()> {
         let (dir, manifest) = installed_plugin(plugin)?;
+        let label = plugin.label();
         let action = manifest
             .action(action)
             .cloned()
-            .with_context(|| format!("{plugin} has no action {action}"))?;
+            .with_context(|| format!("{label} has no action {action}"))?;
         let context = placed(context)?;
         plugins::log(
             &self.socket,
@@ -2452,13 +2596,13 @@ impl Tui {
             .stderr(log)
             .spawn()
             .with_context(|| format!("couldn't run {}", action.command.join(" ")))?;
-        let what = format!("{plugin}: {}", action.title);
-        let plugin = plugin.to_string();
+        let what = format!("{label}: {}", action.title);
+        let log = format!("crystal plugin log {}{}", plugin.name, plugin.flag());
         let events = self.events.clone();
         thread::spawn(move || {
             let notice = match child.wait() {
                 Ok(status) if status.success() => format!("ran {what}"),
-                Ok(status) => format!("{what} failed ({status}): `crystal plugin log {plugin}`"),
+                Ok(status) => format!("{what} failed ({status}): `{log}`"),
                 Err(err) => format!("{what}: {err}"),
             };
             let _ = events.send(Event::Notice(notice));
@@ -2520,19 +2664,27 @@ impl Tui {
             width: command.width.clone(),
             height: command.height.clone(),
         };
-        let areas = ui::Areas::of(&self.app, self.screen);
-        let screen = ui::plugin_pane_screen(&areas, Some(&popup));
-        self.last_pane_id += 1;
-        let (id, events) = (self.last_pane_id, self.events.clone());
-        let (rows, cols) = (screen.height.max(1), screen.width.max(1));
-        self.overlay = Some(Pane::open(&self.socket, &name, rows, cols, id, events)?);
-        self.app.plugin_pane_opened(PluginPane {
+        self.show_over(PluginPane {
             plugin: String::new(),
             title: command.label().to_string(),
             session: name,
             popup: Some(popup),
-        });
+        })?;
         self.refresh_sessions()
+    }
+
+    /// Shows `pane`'s session over the panes, or in its popup, with the
+    /// keyboard.
+    fn show_over(&mut self, pane: PluginPane) -> Result<()> {
+        let areas = ui::Areas::of(&self.app, self.screen);
+        let screen = ui::plugin_pane_screen(&areas, pane.popup.as_ref());
+        self.last_pane_id += 1;
+        let (id, events) = (self.last_pane_id, self.events.clone());
+        let (rows, cols) = (screen.height.max(1), screen.width.max(1));
+        let shown = Pane::open(&self.socket, &pane.session, rows, cols, id, events)?;
+        self.overlay = Some(shown);
+        self.app.plugin_pane_opened(pane);
+        Ok(())
     }
 
     /// Runs `argv`, a `[[keys.command]]`'s, in `dir` with `vars` over the
@@ -2580,26 +2732,29 @@ impl Tui {
     }
 
     /// Starts one of a plugin's panes in a session of its own, and shows it
-    /// over the panes, with the keyboard.
-    fn open_plugin_pane(&mut self, plugin: &str, pane: &str, context: Context) -> Result<()> {
-        plugins::ensure_enabled(&Config::load()?, plugin)?;
+    /// where its manifest says: over the panes or in a popup, with the
+    /// keyboard, or among them, split off the selected session's pane,
+    /// zoomed, or in a tab of its own, the way the layout commands of
+    /// `crystal plugin pane open` place it.
+    fn open_plugin_pane(&mut self, plugin: &Id, pane: &str, context: Context) -> Result<()> {
         let (dir, manifest) = installed_plugin(plugin)?;
+        let label = plugin.label();
         let spec = manifest
             .panes
             .into_iter()
             .find(|candidate| candidate.id == pane)
-            .with_context(|| format!("{plugin} has no pane {pane}"))?;
+            .with_context(|| format!("{label} has no pane {pane}"))?;
         let context = placed(context)?;
         plugins::make_state_dir(&self.socket, plugin);
         let mut env = env::current();
-        for (key, said) in plugins::env(&self.socket, plugin, &context) {
+        for (key, said) in plugins::env(&self.socket, plugin, &dir, &context) {
             match said {
                 Some(value) => env.insert(key.to_string(), value),
                 None => env.remove(key),
             };
         }
         let taken = list_sessions(&self.socket, false)?;
-        let name = free_name(&format!("{plugin}-{pane}"), &taken);
+        let name = free_name(&format!("{}-{pane}", plugin.name), &taken);
         let request = Request::New(NewSession {
             name: Some(name),
             cwd: dir.clone(),
@@ -2611,22 +2766,64 @@ impl Tui {
         });
         let Some(Response::Created { name, .. }) = client::ask(&self.socket, &request, true)?
         else {
-            bail!("the daemon didn't start {plugin}'s pane");
+            bail!("the daemon didn't start {label}'s pane");
         };
-        let areas = ui::Areas::of(&self.app, self.screen);
-        let screen = ui::plugin_pane_screen(&areas, None);
-        self.last_pane_id += 1;
-        let (id, events) = (self.last_pane_id, self.events.clone());
-        let rows = screen.height.max(1);
-        let cols = screen.width.max(1);
-        self.overlay = Some(Pane::open(&self.socket, &name, rows, cols, id, events)?);
-        self.app.plugin_pane_opened(PluginPane {
-            plugin: plugin.to_string(),
-            title: spec.title,
-            session: name,
-            popup: None,
-        });
-        self.refresh_sessions()
+        if spec.placement.is_over() {
+            let popup = (spec.placement == Placement::Popup).then(|| Popup {
+                width: spec.width.clone(),
+                height: spec.height.clone(),
+            });
+            self.show_over(PluginPane {
+                plugin: plugin.name.clone(),
+                title: spec.title,
+                session: name,
+                popup,
+            })?;
+            return self.refresh_sessions();
+        }
+        self.refresh_sessions()?;
+        let order = |command| Order {
+            command,
+            caller: None,
+        };
+        let placed = (|| -> Result<(), String> {
+            if spec.placement == Placement::Tab {
+                let title = Some(spec.title.clone());
+                self.app
+                    .obey(order(layout::Command::NewTab { name: title }))?;
+                let tab = self.app.layout().current().map(|tab| tab.number);
+                let tab = tab.unwrap_or(1).to_string();
+                let session = name.clone();
+                self.app
+                    .obey(order(layout::Command::MoveToTab { session, tab }))?;
+                return Ok(());
+            }
+            let way = match spec.split {
+                Some(SplitWay::Down) => split_tree::Way::Down,
+                Some(SplitWay::Right) | None => split_tree::Way::Right,
+            };
+            let split = layout::Command::Split {
+                session: name.clone(),
+                beside: None,
+                way,
+                ratio: 0.5,
+            };
+            self.app.obey(order(split))?;
+            if spec.placement == Placement::Zoomed {
+                let session = Some(name.clone());
+                self.app
+                    .obey(order(layout::Command::Zoom { session, on: true }))?;
+            }
+            Ok(())
+        })();
+        if let Err(why) = placed {
+            // It was only ever the pane's.
+            let _ = client::ask(&self.socket, &Request::Kill { name }, false);
+            bail!("{why}");
+        }
+        self.app.select(&name);
+        self.app.type_into_selected();
+        Ok(())
     }
 
     /// Attaches again to the sessions whose panes' output ended while they
@@ -2804,37 +3001,51 @@ impl Tui {
 }
 
 /// The plugins as the plugins view lists them: crystal's own, then the
-/// installed ones, each with whether it's on and what keeps it from
-/// running.
-fn listed_plugins(config: &Config, socket: &Path) -> Vec<plugins_view::Listed> {
+/// installed ones, then those the project whose main worktree is `project`
+/// ships, each with whether it's on and what keeps it from running.
+fn listed_plugins(
+    config: &Config,
+    socket: &Path,
+    project: Option<PathBuf>,
+) -> Vec<plugins_view::Listed> {
     let own = plugins::BUILT_IN.iter().map(|plugin| plugins_view::Listed {
         name: plugin.name.to_string(),
         description: plugin.description.to_string(),
         built_in: true,
+        project: None,
         on: plugins::enabled(config, plugin.name),
         trouble: None,
         actions: Vec::new(),
         panes: Vec::new(),
         links: Vec::new(),
     });
-    let installed = plugins::installed().into_iter().map(|plugin| {
-        let on = plugins::enabled(config, &plugin.name);
-        let paused = plugins::paused(socket, &plugin.name).filter(|_| on);
+    let shipped = project.as_deref().map(plugins::of_project);
+    let installed = plugins::installed()
+        .into_iter()
+        .chain(shipped.into_iter().flatten());
+    let installed = installed.map(|plugin| {
+        let id = plugin.id();
+        let on = plugins::is_on(config, &id);
+        let paused = plugins::paused(socket, &id).filter(|_| on);
         let paused = paused.map(|_| "paused after failing: space off and on again".to_string());
         let trouble = plugin.blocked().or(paused);
-        let item = |id: &str, title: &str, key: Option<&String>| plugins_view::Item {
+        let item = |id: &str, title: &str, key: Option<String>| plugins_view::Item {
             id: id.to_string(),
             title: title.to_string(),
-            key: key.cloned(),
+            key,
         };
+        // A project's plugin takes no keys.
+        let keyed = plugin.project.is_none();
+        let key = |key: Option<&String>| key.filter(|_| keyed).cloned();
         match plugin.manifest {
             Ok(manifest) => plugins_view::Listed {
                 name: plugin.name,
                 built_in: false,
+                project: plugin.project,
                 on,
                 trouble,
                 actions: (manifest.actions.iter())
-                    .map(|action| item(&action.id, &action.title, action.key.as_ref()))
+                    .map(|action| item(&action.id, &action.title, key(action.key.as_ref())))
                     .collect(),
                 panes: (manifest.panes.iter())
                     .map(|pane| item(&pane.id, &pane.title, None))
@@ -2853,6 +3064,7 @@ fn listed_plugins(config: &Config, socket: &Path) -> Vec<plugins_view::Listed> {
                 name: plugin.name,
                 description: String::new(),
                 built_in: false,
+                project: plugin.project,
                 on,
                 trouble: Some(why),
                 actions: Vec::new(),
@@ -2899,27 +3111,43 @@ fn plugin_keys(config: &Config) -> Vec<PluginKey> {
 
 /// The installed plugin called `name`, when it can run here: its
 /// directory and manifest.
-fn installed_plugin(name: &str) -> Result<(PathBuf, crate::plugin_manifest::Manifest)> {
-    let plugin = plugins::find(name).with_context(|| format!("there's no plugin called {name}"))?;
+fn installed_plugin(id: &Id) -> Result<(PathBuf, crate::plugin_manifest::Manifest)> {
+    let label = id.label();
+    if id.project.is_none() {
+        plugins::ensure_enabled(&Config::load()?, &id.name)?;
+    } else if !plugins::is_on(&Config::load()?, id) {
+        bail!(
+            "{label} is off: `crystal plugin enable {} --project` turns it on",
+            id.name
+        );
+    }
+    let plugin = plugins::find_id(id).with_context(|| format!("there's no plugin {label}"))?;
     if let Some(why) = plugin.blocked() {
-        bail!("{name} can't run: {why}");
+        bail!("{label} can't run: {why}");
     }
     let manifest = plugin
         .manifest
-        .map_err(|why| anyhow::anyhow!("{name}'s plugin.toml: {why}"))?;
+        .map_err(|why| anyhow::anyhow!("{label}'s plugin.toml: {why}"))?;
     Ok((plugin.dir, manifest))
 }
 
-/// Refuses to switch on the plugin called `name`, saying why, when it
-/// can't run here or wants another's key. Any can be switched off.
-fn can_switch(name: &str, on: bool) -> Result<()> {
-    if !on || plugins::is_built_in(name) {
+/// Refuses to switch on the plugin `id`, saying why, when it can't run
+/// here or wants another's key, or is a project's, which the command line
+/// turns on once it has shown what it runs. Any can be switched off.
+fn can_switch(id: &Id, on: bool) -> Result<()> {
+    if !on || plugins::is_built_in(&id.name) {
         return Ok(());
     }
+    if id.project.is_some() {
+        bail!(
+            "`crystal plugin enable {} --project` shows what it runs, then turns it on",
+            id.name
+        );
+    }
     let installed = plugins::installed();
-    match installed.iter().find(|plugin| plugin.name == name) {
+    match installed.iter().find(|plugin| plugin.name == id.name) {
         Some(plugin) => plugins::check_can_enable(plugin, &installed),
-        None => bail!("there's no plugin called {name}"),
+        None => bail!("there's no plugin called {}", id.name),
     }
 }
 
@@ -3025,14 +3253,18 @@ fn read_memory(socket: &Path, dir: &Path) -> Result<Vec<Listed>, String> {
 }
 
 /// Writes entry `id` of the memory of the project `dir` is in into its
-/// CLAUDE.md or AGENTS.md, and returns which.
+/// CLAUDE.md or AGENTS.md, tells the daemon, and returns which.
 fn promote_memory(socket: &Path, dir: &Path, id: u64) -> Result<PathBuf> {
     let project = memory::project_of(dir);
     let memory = Memory::read(socket, &project)?;
     let Some(entry) = memory.get(id) else {
         bail!("there's no entry {id}");
     };
-    memory::promote(&project, entry)
+    let file = memory::promote(&project, entry)?;
+    // The file has it either way.
+    let promoted = events::Event::promoted(project, entry.clone(), file.clone());
+    let _ = client::tell(socket, promoted);
+    Ok(file)
 }
 
 /// The models Codex lets the user choose, as `codex debug models` lists
@@ -3180,11 +3412,40 @@ fn list_sessions(socket: &Path, start: bool) -> Result<Vec<SessionInfo>> {
     }
 }
 
-/// A page of the event log of the daemon at `socket`, the newest first:
-/// its end, or from before the event numbered `before`.
-fn read_events(socket: &Path, before: Option<u64>) -> Result<Vec<events::Event>, String> {
-    let page = Db::open(socket).and_then(|db| db.events_before(before, timeline::PAGE));
-    page.map_err(|err| format!("{err:#}"))
+/// A page of the event log of the daemon at `socket` that `scope` takes,
+/// the newest first: its end, or from before the event numbered `before`;
+/// and the latest event the log had before it was read.
+fn read_events(
+    socket: &Path,
+    scope: &Scope,
+    before: Option<u64>,
+) -> Result<(u64, Vec<events::Event>), String> {
+    let read = || -> Result<_> {
+        let db = Db::open(socket)?;
+        let latest = db.latest_event()?;
+        Ok((latest, db.events_before(scope, before, timeline::PAGE)?))
+    };
+    read().map_err(|err| format!("{err:#}"))
+}
+
+/// What the handoff view shows: whether the worktree at `worktree` has
+/// notes, and the files the daemon at `socket` kept with task `task`.
+fn find_handoff(
+    socket: &Path,
+    worktree: Option<PathBuf>,
+    task: Option<u64>,
+) -> handoff_view::Found {
+    let notes = worktree.filter(|worktree| {
+        let path = handoff::path(worktree);
+        std::fs::metadata(path).is_ok_and(|meta| meta.is_file() && meta.len() > 0)
+    });
+    let kept = match task {
+        Some(task) => Db::open(socket)
+            .and_then(|db| db.artifacts(task))
+            .map_err(|err| format!("couldn't read what its task kept: {err:#}")),
+        None => Ok(Vec::new()),
+    };
+    handoff_view::Found { notes, kept }
 }
 
 /// Every flow run, or none when the daemon can't say.
@@ -3291,6 +3552,37 @@ fn spawn_stat_counter(
     });
 }
 
+/// Asks the daemon what crystal's processes take, on a thread of its own:
+/// every [`RESOURCES_EVERY`], and every [`RESOURCES_OPEN_EVERY`] while
+/// `open` says the RAM view is, straight away as it opens.
+fn spawn_resource_poller(socket: PathBuf, events: Sender<Event>, open: Arc<AtomicBool>) {
+    thread::spawn(move || {
+        let request = Request::Resources {
+            client: Some(std::process::id()),
+        };
+        let mut asked: Option<Instant> = None;
+        let mut was_open = false;
+        loop {
+            let is_open = open.load(Ordering::Relaxed);
+            let every = match is_open {
+                true => RESOURCES_OPEN_EVERY,
+                false => RESOURCES_EVERY,
+            };
+            let due = asked.is_none_or(|at| at.elapsed() >= every) || (is_open && !was_open);
+            was_open = is_open;
+            if due {
+                asked = Some(Instant::now());
+                if let Ok(Some(Response::Resources(taken))) = client::ask(&socket, &request, false)
+                    && events.send(Event::Resources(taken)).is_err()
+                {
+                    return;
+                }
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+    });
+}
+
 /// The pull requests open on the project at `project`, and the forge
 /// they're on.
 fn list_pull_requests(project: &Path) -> Result<(Forge, Vec<PullRequest>), String> {
@@ -3361,6 +3653,37 @@ struct Polled {
     backlog_counts: Arc<AtomicBool>,
     flows: Arc<AtomicBool>,
     settings: Arc<AtomicBool>,
+}
+
+/// How often the config file is looked at for a change.
+const CONFIG_EVERY: Duration = Duration::from_secs(1);
+
+/// Watches the config file, on a thread of its own, and reads it again
+/// whenever it changes, so that a change made by hand, or by another
+/// crystal, counts at once without starting the TUI again. Stops once the
+/// event loop has gone.
+fn watch_config(events: Sender<Event>) {
+    thread::spawn(move || {
+        let path = config::path();
+        // What tells a change: when it was written, and how long it is.
+        let stamp = || {
+            let meta = std::fs::metadata(&path).ok()?;
+            Some((meta.modified().ok()?, meta.len()))
+        };
+        let mut last = stamp();
+        loop {
+            thread::sleep(CONFIG_EVERY);
+            let now = stamp();
+            if now == last {
+                continue;
+            }
+            last = now;
+            let read = Config::load().map_err(|err| format!("{err:#}"));
+            if events.send(Event::ConfigFile(Box::new(read))).is_err() {
+                return;
+            }
+        }
+    });
 }
 
 fn spawn_session_poller(socket: PathBuf, events: Sender<Event>, polled: Polled) {
@@ -3463,10 +3786,14 @@ fn read_settings(socket: &Path) -> settings_view::Current {
         Ok(Some(Response::EmbeddingStatus(status))) => Some(status),
         _ => None,
     };
+    let integrations = std::env::current_exe()
+        .map(|crystal| crate::integration::here(&crystal))
+        .unwrap_or_default();
     settings_view::Current {
         path: config::path(),
         config: Config::load().map_err(|err| format!("{err:#}")),
         model,
+        integrations,
     }
 }
 

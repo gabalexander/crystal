@@ -15,10 +15,11 @@ use crate::config::{Config, MemorySettings};
 use crate::db;
 use crate::db::Db;
 use crate::distill::{self, Job};
+use crate::drive;
 use crate::embed;
 use crate::env;
 use crate::event_log::{self, Bus, Subscription};
-use crate::events::{Event, Filter, Kind, Since};
+use crate::events::{DistillAbout, Event, Filter, Kind, Since};
 use crate::flow_run::{self, Ended, FlowRun, Next, Place, RunState, StepState};
 use crate::flows;
 use crate::front;
@@ -42,6 +43,7 @@ use crate::protocol::{
     Worktree,
 };
 use crate::report;
+use crate::resources;
 use crate::session::{Change, STOP_GRACE, Session, Term, signal_group};
 use crate::skill;
 use crate::socket;
@@ -64,7 +66,7 @@ use std::os::fd::{AsFd, AsRawFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::RecvTimeoutError;
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{fs, process, thread};
@@ -98,6 +100,10 @@ const LOOK_AT_MOST_EVERY: Duration = Duration::from_millis(50);
 /// How long a handover waits for the requests the daemon is answering, and
 /// for plugins' hooks and the distiller, before it stops them.
 const HANDOVER_GRACE: Duration = Duration::from_secs(3);
+
+/// How often the daemon looks for entries of memory gone stale, besides
+/// each time a task closes.
+const STALE_SWEEP_EVERY: Duration = Duration::from_secs(60 * 60);
 
 /// Runs the daemon on `socket`, or with `handover`, the descriptor of what
 /// the last daemon handed over as it ran this crystal in its place (see
@@ -143,6 +149,12 @@ pub fn run(socket: &Path, handover: Option<RawFd>) -> Result<()> {
             }
         }
     });
+    let (sweep, sweeps) = mpsc::sync_channel(1);
+    thread::spawn({
+        let events = events.clone();
+        let socket = socket.to_path_buf();
+        move || tell_stale(&socket, &events, &sweeps)
+    });
     let daemon = Arc::new(Daemon {
         socket: socket.to_path_buf(),
         listener: listener.as_raw_fd(),
@@ -161,6 +173,7 @@ pub fn run(socket: &Path, handover: Option<RawFd>) -> Result<()> {
         projects: Mutex::default(),
         removals: Mutex::default(),
         moves: Mutex::default(),
+        sweep,
     });
     // A daemon starts again after every upgrade, or is handed over to the
     // new crystal, so this is where the skill an earlier crystal installed
@@ -314,6 +327,8 @@ struct Daemon {
     /// The sessions on their way into other worktrees. Taken after
     /// `sessions`, never before it.
     moves: Mutex<Vec<Move>>,
+    /// Asks for a look for entries of memory gone stale: see [`tell_stale`].
+    sweep: SyncSender<()>,
 }
 
 /// The projects the sessions run in that are on the list already, as
@@ -369,10 +384,11 @@ impl Daemon {
                 rows,
                 cols,
                 history,
+                program,
             } => {
                 drop(ticket);
-                return match self.find(name.as_deref()) {
-                    Ok(found) => attach(&conn, input, found, (rows, cols), history),
+                return match self.find(name.as_deref(), !program) {
+                    Ok(found) => attach(&conn, input, found, (rows, cols), history, program),
                     Err(err) => Ok(protocol::send(&conn, &Response::from(err))?),
                 };
             }
@@ -658,7 +674,14 @@ impl Daemon {
             }
         };
         drop(db);
-        Ok(self.started(&mut sessions, started, Kind::TaskOpened))
+        let response = self.started(&mut sessions, started.clone(), Kind::TaskOpened);
+        if let Some(session) = sessions.iter().find(|session| session.name == started) {
+            self.events.emit(Event::about_session(
+                Kind::SessionUnarchived,
+                &session.info(),
+            ));
+        }
+        Ok(response)
     }
 
     /// Again and again: reads every session's screen for what its agent is
@@ -693,15 +716,22 @@ impl Daemon {
                 .filter_map(Session::looking_for_conversation)
                 .map(|rollouts| (rollouts.cwd().to_path_buf(), rollouts.started()))
                 .collect();
+            let mut retitled = Vec::new();
             for session in sessions.iter_mut() {
                 session.find_conversation(&claimed, &looking);
                 session.check_front();
                 session.check();
                 session.check_model();
+                if let Some(title) = session.check_title() {
+                    retitled.push((session.id.clone(), title));
+                }
                 self.tell_changes(session);
                 for closed in session.take_closed() {
                     self.write_down_closed(session, &closed);
                 }
+            }
+            for (id, title) in retitled {
+                self.follow_claude_title(&mut sessions, &id, &title);
             }
             // Before an ended session is told of: one moving into another
             // worktree starts again there instead.
@@ -1348,6 +1378,9 @@ impl Daemon {
     fn write_down_closed(&self, session: &Session, task: &TaskRecord) {
         self.write_down(session.cwd(), Some(&session.info()), task);
         self.distill_later(session, task);
+        // What the task changed may leave entries of memory stale. One
+        // look asked for already will do.
+        let _ = self.sweep.try_send(());
     }
 
     /// Writes a task that has just closed, which ran in `cwd`, in `session`
@@ -1537,9 +1570,11 @@ impl Daemon {
             return;
         };
         let events = self.events.clone();
+        let info = session.info();
         thread::spawn(move || {
             let name = &job.session;
-            match distill::run(&job) {
+            let report = distill::run(&job);
+            match &report {
                 Ok(report) => {
                     eprintln!("crystal daemon: distilled {name}: {}", report.line());
                     for why in &report.rejected {
@@ -1549,6 +1584,7 @@ impl Daemon {
                 }
                 Err(err) => eprintln!("crystal daemon: couldn't distill {name}: {err:#}"),
             }
+            events.emit(Event::distilled(&info, distill_about(&report)));
             drop(reading);
         });
     }
@@ -1662,7 +1698,7 @@ impl Daemon {
     fn distill_now(&self, name: &str) -> Result<Response> {
         let config = settings();
         crate::plugins::ensure_enabled(&config, "memory")?;
-        let (job, reading) = {
+        let (job, reading, info) = {
             let mut sessions = self.sessions.lock().unwrap();
             let session = named(&mut sessions, name)?;
             let task = session.task_record();
@@ -1676,25 +1712,31 @@ impl Daemon {
                 })?;
             let reading = Reading::start(&self.distilling, &session.id)
                 .with_context(|| format!("the distiller is reading what {name} did already"))?;
-            (job, reading)
+            (job, reading, session.info())
         };
         let report = distill::run(&job);
         drop(reading);
-        let report = report?;
-        tell_distilled(&self.events, &job, &report.added);
-        Ok(Response::Distilled(report))
+        if let Ok(report) = &report {
+            tell_distilled(&self.events, &job, &report.added);
+        }
+        self.events
+            .emit(Event::distilled(&info, distill_about(&report)));
+        Ok(Response::Distilled(report?))
     }
 
     /// The session called `name`, or the newest one, for a client about to
-    /// show it. That counts as having seen it.
-    fn find(&self, name: Option<&str>) -> Result<Found> {
+    /// show it. That counts as having seen it, when it's the user who `sees`
+    /// it.
+    fn find(&self, name: Option<&str>, sees: bool) -> Result<Found> {
         let mut sessions = self.sessions.lock().unwrap();
         let session = match name {
             Some(name) => named(&mut sessions, name)?,
             None => sessions.last_mut().context("there are no sessions")?,
         };
-        session.seen();
-        self.tell_changes(session);
+        if sees {
+            session.seen();
+            self.tell_changes(session);
+        }
         Ok(Found {
             name: session.name.clone(),
             id: session.id.clone(),
@@ -1733,7 +1775,11 @@ impl Daemon {
                 Some(Sender::new(&info.id, &info.name, info.task.as_ref()))
             });
             let text = match &sender {
-                Some(_) => messages::tidy(text)?,
+                Some(_) => {
+                    let tidied = messages::tidy(text)?;
+                    messages::check_says_something(&tidied)?;
+                    tidied
+                }
                 None => text.to_string(),
             };
             let session = named(&mut sessions, name)?;
@@ -1827,6 +1873,35 @@ impl Daemon {
         self.tell_renamed(session, &old_name);
     }
 
+    /// Names the session with id `id` after `title`, the name Claude Code
+    /// was just given for its conversation, as `/rename` gives one, unless
+    /// the user or a script named the session.
+    fn follow_claude_title(&self, sessions: &mut [Session], id: &str, title: &str) {
+        let Some(index) = sessions.iter().position(|session| session.id == id) else {
+            return;
+        };
+        let Some(base) = names::from_title(title) else {
+            return;
+        };
+        if sessions[index].name_given() || sessions[index].name == base {
+            return;
+        }
+        let taken = |name: &str| {
+            let others = sessions.iter().enumerate().filter(|(at, _)| *at != index);
+            others
+                .map(|(_, session)| session)
+                .any(|session| session.name == name)
+        };
+        let new_name = unique_name(&base, taken);
+        let session = &mut sessions[index];
+        if session.name == new_name {
+            return;
+        }
+        let old_name = std::mem::replace(&mut session.name, new_name);
+        session.keep_name();
+        self.tell_renamed(session, &old_name);
+    }
+
     /// Tells that `session` was called `from` until now, and keeps a flow's
     /// step to it under its new name.
     fn tell_renamed(&self, session: &Session, from: &str) {
@@ -1901,6 +1976,9 @@ impl Daemon {
                 // Only Claude Code's and Codex's Stop hooks take the answer
                 // that keeps the agent from ending its turn.
                 let can_remind = matches!(agent.as_str(), "claude" | "codex");
+                // Only Claude Code's prompt hook takes a name for its
+                // conversation.
+                let can_retitle = agent == "claude" && prompt.is_some();
                 if let Some(prompt) = prompt {
                     self.name_from_prompt(&mut sessions, &id, &prompt);
                 }
@@ -1913,8 +1991,13 @@ impl Daemon {
                     session.heard_model(&model);
                 }
                 // A conversation just named is looked at now: what's
-                // written to it from here on is news.
+                // written to it from here on is news, its model and its
+                // name.
                 session.check_model();
+                if let Some(title) = session.check_title() {
+                    self.follow_claude_title(&mut sessions, &id, &title);
+                }
+                let session = with_id(&mut sessions, &id)?;
                 // Reminded that its task is open, the agent carries on: its
                 // turn hasn't ended, and it isn't done. One moving into
                 // another worktree carries on there.
@@ -1924,10 +2007,16 @@ impl Daemon {
                     && !moving
                     && session.remind_of_task()
                 {
+                    if let Some(task) = session.task_record() {
+                        let info = session.info();
+                        self.events
+                            .emit(Event::task(Kind::TaskReminded, &info, task));
+                    }
                     return Ok(Response::Remind {
                         text: tasks::REMINDER.to_string(),
                     });
                 }
+                let retitle = can_retitle.then(|| session.title_to_give()).flatten();
                 // An agent that reports for itself holds the session's
                 // status: what hooks say counts again once it lets go.
                 if !session.is_claimed() {
@@ -1943,7 +2032,10 @@ impl Daemon {
                     }
                 }
                 self.tell_changes(session);
-                Ok(Response::Done)
+                match retitle {
+                    Some(title) => Ok(Response::Retitle { title }),
+                    None => Ok(Response::Done),
+                }
             }
             Request::ReportAgent { id, name, report } => {
                 let mut sessions = self.sessions.lock().unwrap();
@@ -2046,7 +2138,7 @@ impl Daemon {
                 }
                 let session = named(&mut sessions, &name)?;
                 session.name = new_name.clone();
-                session.keep_name();
+                session.renamed();
                 if new_name != name {
                     self.tell_renamed(session, &name);
                 }
@@ -2093,9 +2185,37 @@ impl Daemon {
                 let explained = session.explain_screen(agent.as_deref());
                 Ok(Response::Explained(Box::new(explained)))
             }
-            Request::Read { name, history } => {
-                let mut sessions = self.sessions.lock().unwrap();
-                let rows = named(&mut sessions, &name)?.term().rows(history);
+            Request::ProcessInfo { name } => {
+                let (pid, term) = {
+                    let mut sessions = self.sessions.lock().unwrap();
+                    let session = named(&mut sessions, &name)?;
+                    ensure!(
+                        !session.is_task(),
+                        "{name} is a background task, which runs in no terminal"
+                    );
+                    ensure!(session.is_running(), "{name} has ended");
+                    (session.info().pid, session.term())
+                };
+                let group = term.foreground_group();
+                let foreground = group.map(front::foreground).unwrap_or_default();
+                Ok(Response::Processes(protocol::Processes {
+                    pid,
+                    group,
+                    foreground,
+                }))
+            }
+            Request::Read {
+                name,
+                history,
+                unwrap,
+                ansi,
+                since_ms,
+            } => {
+                let term = {
+                    let mut sessions = self.sessions.lock().unwrap();
+                    named(&mut sessions, &name)?.term()
+                };
+                let rows = term.read(history, unwrap, ansi, since_ms);
                 Ok(Response::Screen { rows })
             }
             Request::Close {
@@ -2223,6 +2343,18 @@ impl Daemon {
                 Ok(Response::Done)
             }
             Request::TaskToTerminal { task, env } => self.task_to_terminal(&task, env),
+            Request::Resources { client } => {
+                // `ps` takes a moment: the sessions aren't held meanwhile.
+                let running: Vec<(String, u32)> = {
+                    let sessions = self.sessions.lock().unwrap();
+                    let running = sessions
+                        .iter()
+                        .filter_map(|session| Some((session.name.clone(), session.running_pid()?)));
+                    running.collect()
+                };
+                let taken = resources::measure(std::process::id(), client, &running);
+                Ok(Response::Resources(taken))
+            }
             Request::Spending => Ok(Response::Spending(protocol::Spending {
                 today_usd: self.spending.today(),
                 daily_budget_usd: settings().tasks.daily_budget_usd,
@@ -2658,6 +2790,8 @@ impl Daemon {
         let info = sessions[index].info();
         self.events
             .emit(Event::about_session(Kind::SessionStarted, &info));
+        self.events
+            .emit(Event::about_session(Kind::SessionOpenedInTerminal, &info));
         Ok(Response::Created {
             name,
             task: task_id,
@@ -2666,7 +2800,11 @@ impl Daemon {
 
     fn new_session(&self, new: NewSession) -> Result<Response> {
         let mut sessions = self.sessions.lock().unwrap();
+        let given = new.name.is_some();
         let name = start(&mut sessions, &self.socket, new, None, None)?;
+        if given {
+            named(&mut sessions, &name)?.keep_given_name();
+        }
         Ok(self.started(&mut sessions, name, Kind::TaskOpened))
     }
 
@@ -2716,6 +2854,7 @@ impl Daemon {
                 Change::RunStarted { prompt } => Some(Event::run_started(&info, &prompt)),
                 Change::RunEnded(result) => Some(Event::run_ended(&info, &result)),
                 Change::Asking(asking) => Some(Event::asking(&info, asking)),
+                Change::ToolUsed(tool) => Some(Event::tool_use(&info, tool)),
                 Change::Reopened => task(Kind::TaskOpened),
                 Change::TaskWaiting => task(Kind::TaskWaiting),
                 Change::Claimed => Some(Event::about_session(Kind::SessionClaimed, &info)),
@@ -2770,7 +2909,12 @@ impl Daemon {
         let response = match watched {
             Ok(None) => None,
             Ok(Some(line)) => Some(Response::Matched { line }),
-            Err(err) => Some(Response::from(err)),
+            Err(err) => match err.downcast::<drive::TimedOut>() {
+                Ok(timed_out) => Some(Response::TimedOut {
+                    message: timed_out.0,
+                }),
+                Err(err) => Some(Response::from(err)),
+            },
         };
         if let Some(response) = response {
             protocol::send(conn, &response)?;
@@ -3061,7 +3205,8 @@ fn matching_row(
         let left = deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
         if left == Some(Duration::ZERO) {
             let seconds = timeout.unwrap_or_default().as_secs_f64();
-            bail!("nothing on {name}'s screen matched `{pattern}` after {seconds}s");
+            let said = format!("nothing on {name}'s screen matched `{pattern}` after {seconds}s");
+            return Err(drive::TimedOut(said).into());
         }
         let wait = left.map_or(LOOK_FOR_HANG_UP, |left| left.min(LOOK_FOR_HANG_UP));
         match output.recv_timeout(wait) {
@@ -3095,6 +3240,44 @@ fn watch_for_hang_up(conn: &UnixStream) -> Result<Arc<AtomicBool>> {
 /// done or failed. A cancelled task did nothing anyone wanted kept.
 fn read_as_it_closed(task: &TaskRecord) -> bool {
     matches!(task.state(), TaskState::Done | TaskState::Failed)
+}
+
+/// Tells of each entry of memory that goes stale, every file it's about
+/// changed since it was said: looks as the daemon starts, then each time
+/// `sweeps` asks and every [`STALE_SWEEP_EVERY`], while memory is on.
+fn tell_stale(socket: &Path, events: &Bus, sweeps: &Receiver<()>) {
+    loop {
+        if memory::enabled_now() {
+            match memory::newly_stale(socket) {
+                Ok(stale) => {
+                    for (project, entry) in stale {
+                        events.emit(Event::memory(Kind::MemoryStale, project, entry));
+                    }
+                }
+                Err(err) => eprintln!("crystal daemon: couldn't look at memory: {err:#}"),
+            }
+        }
+        if let Err(RecvTimeoutError::Disconnected) = sweeps.recv_timeout(STALE_SWEEP_EVERY) {
+            return;
+        }
+    }
+}
+
+/// What came of a pass of the distiller, for its event.
+fn distill_about(report: &Result<distill::Report>) -> DistillAbout {
+    match report {
+        Ok(report) => DistillAbout {
+            added: report.added.len(),
+            again: report.again.len(),
+            rejected: report.rejected.len(),
+            cost_usd: report.cost_usd,
+            failed: None,
+        },
+        Err(err) => DistillAbout {
+            failed: Some(format!("{err:#}")),
+            ..DistillAbout::default()
+        },
+    }
 }
 
 /// Tells of the entries the distiller added to the memory of `job`'s
@@ -3890,12 +4073,24 @@ fn attach(
     found: Found,
     (rows, cols): (u16, u16),
     with_history: bool,
+    program: bool,
 ) -> Result<()> {
     let Found { name, id, term } = found;
-    term.resize(rows, cols)?;
-    let watch = term.watch(with_history);
+    // No size keeps the one it has: a program watching it may not want to
+    // change what the user sees.
+    if rows > 0 && cols > 0 {
+        term.resize(rows, cols)?;
+    }
+    let watch = term.watch(with_history, program);
     let running = watch.feed.is_some();
-    protocol::send(conn, &Response::Attached { name, id, running })?;
+    let size = term.size();
+    let attached = Response::Attached {
+        name,
+        id,
+        running,
+        size,
+    };
+    protocol::send(conn, &attached)?;
     let mut output = conn.try_clone()?;
     output.write_all(&watch.screen)?;
     match watch.feed {

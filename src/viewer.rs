@@ -18,6 +18,8 @@ pub struct Viewer {
     /// False when the session had already ended: the daemon sends its last
     /// screen and hangs up.
     pub running: bool,
+    /// The session's size, rows by columns, as the output starts.
+    pub size: (u16, u16),
     conn: UnixStream,
 }
 
@@ -35,8 +37,29 @@ impl Viewer {
     pub fn connect(
         socket: &Path,
         name: Option<&str>,
+        size: (u16, u16),
+        with_history: bool,
+    ) -> Result<(Viewer, Output)> {
+        Viewer::open(socket, name, size, with_history, false)
+    }
+
+    /// Attaches as a program watching rather than the user, as
+    /// `crystal observe` and `control` do: the session isn't seen or
+    /// watched for it, and a size of 0 by 0 leaves it the size it is.
+    pub fn connect_program(
+        socket: &Path,
+        name: &str,
+        size: (u16, u16),
+    ) -> Result<(Viewer, Output)> {
+        Viewer::open(socket, Some(name), size, false, true)
+    }
+
+    fn open(
+        socket: &Path,
+        name: Option<&str>,
         (rows, cols): (u16, u16),
         with_history: bool,
+        program: bool,
     ) -> Result<(Viewer, Output)> {
         let conn = UnixStream::connect(socket)
             .with_context(|| format!("no daemon is running on {}", socket.display()))?;
@@ -45,14 +68,20 @@ impl Viewer {
             rows,
             cols,
             history: with_history,
+            program,
         };
         protocol::send_request(&conn, &request)?;
 
         // The same reader goes on to read the output: it may already hold
         // the first of it.
         let mut reader = BufReader::new(conn.try_clone()?);
-        let (name, id, running) = match protocol::recv(&mut reader)? {
-            Some(Response::Attached { name, id, running }) => (name, id, running),
+        let (name, id, running, size) = match protocol::recv(&mut reader)? {
+            Some(Response::Attached {
+                name,
+                id,
+                running,
+                size,
+            }) => (name, id, running, size),
             Some(Response::Error { message }) => bail!(message),
             _ => bail!("the daemon hung up without answering"),
         };
@@ -60,6 +89,7 @@ impl Viewer {
             name,
             id,
             running,
+            size,
             conn,
         };
         Ok((viewer, Output { reader }))
@@ -74,10 +104,16 @@ impl Viewer {
     }
 }
 
-impl Drop for Viewer {
+impl Viewer {
     /// Hangs up, which also ends the [`Output`] on whatever thread reads it.
-    fn drop(&mut self) {
+    pub fn hang_up(&self) {
         let _ = self.conn.shutdown(Shutdown::Both);
+    }
+}
+
+impl Drop for Viewer {
+    fn drop(&mut self) {
+        self.hang_up();
     }
 }
 
