@@ -1214,6 +1214,7 @@ mod tests {
                 path: "/code/app".into(),
                 main: true,
                 branch: Some("main".into()),
+                in_progress: None,
             }),
             changed: 0,
             front: None,

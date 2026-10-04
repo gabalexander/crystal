@@ -7,8 +7,9 @@
 
 pub mod branches;
 
-use crate::protocol::Worktree;
+use crate::protocol::{InProgress, Worktree};
 use anyhow::{Context, Result, bail};
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
@@ -24,8 +25,11 @@ pub struct Checkout {
     project_path: PathBuf,
     worktree: PathBuf,
     main: bool,
-    /// The worktree's HEAD file, which says which branch it's on.
-    head: PathBuf,
+    /// The worktree's own git directory, where its HEAD file says which
+    /// branch it's on, and git leaves its marks of a merge or a rebase
+    /// under way: the repository's for the main worktree, one inside it
+    /// for a linked worktree.
+    git_dir: PathBuf,
 }
 
 impl Checkout {
@@ -51,7 +55,7 @@ impl Checkout {
             // A linked worktree has a git dir of its own, inside the shared
             // one; the main worktree uses the shared one.
             main: git_dir == common_dir,
-            head: git_dir.join("HEAD"),
+            git_dir,
         })
     }
 
@@ -60,18 +64,83 @@ impl Checkout {
         &self.project_path
     }
 
-    /// The worktree as it is now: reading one small file tells which
-    /// branch it's on, much cheaper than running git.
+    /// The worktree as it is now: reading a few small files tells which
+    /// branch it's on and what git is in the middle of, much cheaper than
+    /// running git.
     pub fn worktree(&self) -> Worktree {
-        let head = std::fs::read_to_string(&self.head).unwrap_or_default();
+        let (branch, in_progress) = standing(&self.git_dir);
         Worktree {
             project: self.project.clone(),
             project_path: self.project_path.clone(),
             path: self.worktree.clone(),
             main: self.main,
-            branch: branch_from_head(&head),
+            branch,
+            in_progress,
         }
     }
+}
+
+/// How the worktree whose git directory is `git_dir` stands: the branch
+/// it's on, and what git is in the middle of there. A rebase detaches HEAD
+/// until it's through, but writes down which branch it rebases, so the
+/// worktree keeps its name meanwhile.
+fn standing(git_dir: &Path) -> (Option<String>, Option<InProgress>) {
+    let head = std::fs::read_to_string(git_dir.join("HEAD")).unwrap_or_default();
+    let in_progress = in_progress_in(git_dir);
+    let branch = branch_from_head(&head).or_else(|| {
+        (in_progress == Some(InProgress::Rebase))
+            .then(|| rebased_branch(git_dir))
+            .flatten()
+    });
+    (branch, in_progress)
+}
+
+/// What git is in the middle of in the worktree whose git directory is
+/// `git_dir`, by the marks it leaves there: `MERGE_HEAD` during a merge,
+/// a `rebase-merge` or `rebase-apply` directory during a rebase, and so
+/// on. The first found counts, in the order git itself tells them apart.
+fn in_progress_in(git_dir: &Path) -> Option<InProgress> {
+    const MARKS: [(&str, InProgress); 5] = [
+        ("rebase-merge", InProgress::Rebase),
+        ("rebase-apply", InProgress::Rebase),
+        ("MERGE_HEAD", InProgress::Merge),
+        ("CHERRY_PICK_HEAD", InProgress::CherryPick),
+        ("REVERT_HEAD", InProgress::Revert),
+    ];
+    MARKS
+        .into_iter()
+        .find(|(mark, _)| git_dir.join(mark).exists())
+        .map(|(_, what)| what)
+}
+
+/// The branch a rebase under way in the worktree whose git directory is
+/// `git_dir` is rebasing, which git writes down as `head-name` in the
+/// rebase's directory: `None` when it rebases a detached HEAD.
+fn rebased_branch(git_dir: &Path) -> Option<String> {
+    ["rebase-merge", "rebase-apply"]
+        .into_iter()
+        .find_map(|dir| std::fs::read_to_string(git_dir.join(dir).join("head-name")).ok())
+        .and_then(|name| branch_from_head(&format!("ref: {}", name.trim())))
+}
+
+/// What git is in the middle of in the worktree at `dir`, if anything:
+/// no switch of branch is safe then, and a task's work isn't done.
+pub fn in_progress(dir: &Path) -> Option<InProgress> {
+    in_progress_in(&git_dir_of(dir)?)
+}
+
+/// The git directory of the worktree at `dir`, found without running git:
+/// `.git` there when it's a directory, the main worktree's; or the
+/// directory the `.git` file names, a linked worktree's, inside the
+/// repository's.
+fn git_dir_of(dir: &Path) -> Option<PathBuf> {
+    let dot_git = dir.join(".git");
+    if dot_git.is_dir() {
+        return Some(dot_git);
+    }
+    let text = std::fs::read_to_string(&dot_git).ok()?;
+    let named = text.trim().strip_prefix("gitdir:")?.trim();
+    Some(dir.join(named))
 }
 
 /// Where a new worktree's branch starts, when the branch is a new one.
@@ -337,32 +406,82 @@ pub fn find_worktree(dir: &Path, target: &str) -> Result<PathBuf> {
     }
 }
 
+/// What git lists as a project's linked worktrees.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Linked {
+    pub worktrees: Vec<Worktree>,
+    /// For the worktrees Claude Code made for itself, the subject of the
+    /// commit each is at, by its path: it says what one holds, where its
+    /// branch's name, a hash, says nothing.
+    pub subjects: HashMap<PathBuf, String>,
+}
+
 /// The worktrees linked to the repository whose main worktree is
 /// `project_path`: every one git lists but the main worktree, which it
 /// lists first. One whose directory has gone is left out: git only keeps
-/// it until it's pruned.
-pub fn linked_worktrees(project_path: &Path) -> Result<Vec<Worktree>> {
+/// it until it's pruned. A worktree in the middle of a rebase is on the
+/// branch it rebases, though git lists it as detached.
+pub fn linked_worktrees(project_path: &Path) -> Result<Linked> {
     let checkout = Checkout::find(project_path)
         .with_context(|| format!("{} isn't in a git repository", project_path.display()))?;
     let list = git(project_path, &["worktree", "list", "--porcelain"])?;
-    let linked = parse_worktree_list(&list)
-        .into_iter()
-        .skip(1)
-        .filter(|listed| !listed.prunable)
-        .filter_map(|listed| {
-            // Resolved the way a session's worktree is, so that the two
-            // can be compared; a directory that has gone can't be.
-            let path = std::fs::canonicalize(&listed.path).ok()?;
-            Some(Worktree {
-                project: checkout.project.clone(),
-                project_path: checkout.project_path.clone(),
-                path,
-                main: false,
-                branch: listed.branch,
-            })
-        })
-        .collect();
+    let mut linked = Linked::default();
+    let mut claude_codes: Vec<(PathBuf, String)> = Vec::new();
+    for listed in parse_worktree_list(&list).into_iter().skip(1) {
+        if listed.prunable {
+            continue;
+        }
+        // Resolved the way a session's worktree is, so that the two
+        // can be compared; a directory that has gone can't be.
+        let Ok(path) = std::fs::canonicalize(&listed.path) else {
+            continue;
+        };
+        let (branch, in_progress) = match git_dir_of(&path) {
+            Some(git_dir) => standing(&git_dir),
+            None => (listed.branch, None),
+        };
+        let worktree = Worktree {
+            project: checkout.project.clone(),
+            project_path: checkout.project_path.clone(),
+            path,
+            main: false,
+            branch,
+            in_progress,
+        };
+        if worktree.claude_codes_own()
+            && let Some(head) = listed.head
+        {
+            claude_codes.push((worktree.path.clone(), head));
+        }
+        linked.worktrees.push(worktree);
+    }
+    if !claude_codes.is_empty() {
+        let commits = claude_codes.iter().map(|(_, head)| head.as_str());
+        let subjects = subjects(project_path, commits);
+        for (path, head) in claude_codes {
+            if let Some(subject) = subjects.get(&head) {
+                linked.subjects.insert(path, subject.clone());
+            }
+        }
+    }
     Ok(linked)
+}
+
+/// The subject of each of `commits`, by its id, in one call of git: a
+/// commit git doesn't know is left out.
+fn subjects<'a>(
+    project_path: &Path,
+    commits: impl Iterator<Item = &'a str>,
+) -> HashMap<String, String> {
+    let mut args = vec!["log", "--no-walk=unsorted", "--format=%H%x09%s"];
+    args.extend(commits);
+    let Ok(log) = git(project_path, &args) else {
+        return HashMap::new();
+    };
+    log.lines()
+        .filter_map(|line| line.split_once('\t'))
+        .map(|(id, subject)| (id.to_string(), subject.to_string()))
+        .collect()
 }
 
 /// Removes the worktree at `path` the way `git worktree remove` does, which
@@ -653,6 +772,8 @@ fn branch_from_head(head: &str) -> Option<String> {
 #[derive(Debug, PartialEq, Eq)]
 struct Listed {
     path: PathBuf,
+    /// The commit it's at, which a bare repository's worktree hasn't.
+    head: Option<String>,
     /// The branch it has checked out, or `None` when HEAD is detached.
     branch: Option<String>,
     /// Whether git would prune it: its directory has gone.
@@ -660,14 +781,15 @@ struct Listed {
 }
 
 /// The worktrees in `git worktree list --porcelain`, in its order. Each
-/// worktree is a block of lines like `worktree /path`, `branch
-/// refs/heads/main`, and `prunable …` once its directory has gone.
+/// worktree is a block of lines like `worktree /path`, `HEAD <commit>`,
+/// `branch refs/heads/main`, and `prunable …` once its directory has gone.
 fn parse_worktree_list(list: &str) -> Vec<Listed> {
     let mut worktrees: Vec<Listed> = Vec::new();
     for line in list.lines() {
         if let Some(path) = line.strip_prefix("worktree ") {
             worktrees.push(Listed {
                 path: PathBuf::from(path),
+                head: None,
                 branch: None,
                 prunable: false,
             });
@@ -676,7 +798,9 @@ fn parse_worktree_list(list: &str) -> Vec<Listed> {
         let Some(last) = worktrees.last_mut() else {
             continue;
         };
-        if let Some(branch) = line.strip_prefix("branch refs/heads/") {
+        if let Some(head) = line.strip_prefix("HEAD ") {
+            last.head = Some(head.to_string());
+        } else if let Some(branch) = line.strip_prefix("branch refs/heads/") {
             last.branch = Some(branch.to_string());
         } else if line == "prunable" || line.starts_with("prunable ") {
             last.prunable = true;
@@ -1057,6 +1181,133 @@ mod tests {
         );
     }
 
+    /// Runs git in `dir` for a test, and says whether it succeeded.
+    fn try_run(dir: &Path, args: &[&str]) -> bool {
+        Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["-c", "user.name=crystal", "-c", "user.email=c@example.com"])
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap()
+            .status
+            .success()
+    }
+
+    /// A repository whose `fix` branch and `main` each change the same
+    /// line, so that one can't be rebased or merged onto the other without
+    /// a conflict, with `fix` checked out in a linked worktree, returned
+    /// with the repository.
+    fn repo_with_a_conflict() -> (tempfile::TempDir, PathBuf) {
+        let dir = repo();
+        let app = dir.path();
+        run(app, &["checkout", "-q", "-b", "fix"]);
+        std::fs::write(app.join("tracked.txt"), "the fix\n").unwrap();
+        run(app, &["commit", "-q", "-am", "the fix"]);
+        run(app, &["checkout", "-q", "main"]);
+        std::fs::write(app.join("tracked.txt"), "on main\n").unwrap();
+        run(app, &["commit", "-q", "-am", "on main"]);
+        let worktree = app.join("fix");
+        run(
+            app,
+            &["worktree", "add", "-q", worktree.to_str().unwrap(), "fix"],
+        );
+        let worktree = std::fs::canonicalize(worktree).unwrap();
+        (dir, worktree)
+    }
+
+    #[test]
+    fn a_worktree_in_the_middle_of_a_rebase_keeps_its_branch_and_says_so() {
+        let (dir, worktree) = repo_with_a_conflict();
+        assert!(!try_run(&worktree, &["rebase", "main"]), "it should stop");
+        // git itself calls it detached meanwhile.
+        let list = run(dir.path(), &["worktree", "list", "--porcelain"]);
+        assert!(list.contains("detached"), "{list}");
+
+        let seen = Checkout::find(&worktree).unwrap().worktree();
+        assert_eq!(seen.branch.as_deref(), Some("fix"));
+        assert_eq!(seen.in_progress, Some(InProgress::Rebase));
+        assert_eq!(in_progress(&worktree), Some(InProgress::Rebase));
+        let linked = linked_worktrees(dir.path()).unwrap();
+        assert_eq!(linked.worktrees.len(), 1);
+        assert_eq!(linked.worktrees[0].path, worktree);
+        assert_eq!(linked.worktrees[0].branch.as_deref(), Some("fix"));
+        assert_eq!(linked.worktrees[0].in_progress, Some(InProgress::Rebase));
+        assert!(linked.subjects.is_empty());
+
+        // Aborted, it's on its branch and in the middle of nothing.
+        run(&worktree, &["rebase", "--abort"]);
+        let seen = Checkout::find(&worktree).unwrap().worktree();
+        assert_eq!(seen.branch.as_deref(), Some("fix"));
+        assert_eq!(seen.in_progress, None);
+        assert_eq!(in_progress(&worktree), None);
+    }
+
+    #[test]
+    fn a_worktree_in_the_middle_of_a_merge_says_so_on_its_branch() {
+        let (dir, worktree) = repo_with_a_conflict();
+        assert!(!try_run(&worktree, &["merge", "main"]), "it should stop");
+        let seen = Checkout::find(&worktree).unwrap().worktree();
+        assert_eq!(seen.branch.as_deref(), Some("fix"));
+        assert_eq!(seen.in_progress, Some(InProgress::Merge));
+        // The main worktree is in the middle of nothing.
+        let main = Checkout::find(dir.path()).unwrap().worktree();
+        assert_eq!(main.branch.as_deref(), Some("main"));
+        assert_eq!(main.in_progress, None);
+    }
+
+    #[test]
+    fn claude_code_s_own_worktrees_come_with_the_subject_of_their_commit() {
+        let dir = repo();
+        let app = dir.path();
+        std::fs::create_dir_all(app.join(".claude/worktrees")).unwrap();
+        let own = app.join(".claude/worktrees/agent-a2d61d64");
+        let own_arg = own.to_str().unwrap();
+        run(
+            app,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "worktree-agent-a2d61d64",
+                own_arg,
+            ],
+        );
+        std::fs::write(own.join("new.txt"), "x\n").unwrap();
+        run(&own, &["add", "."]);
+        run(&own, &["commit", "-q", "-m", "feat: add the thing"]);
+        let other = app.join("other");
+        run(
+            app,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "other",
+                other.to_str().unwrap(),
+            ],
+        );
+
+        let linked = linked_worktrees(app).unwrap();
+        let own = std::fs::canonicalize(&own).unwrap();
+        let other = std::fs::canonicalize(&other).unwrap();
+        let by_path = |path: &Path| linked.worktrees.iter().find(|w| w.path == path).unwrap();
+        assert!(by_path(&own).claude_codes_own());
+        assert_eq!(
+            by_path(&own).branch.as_deref(),
+            Some("worktree-agent-a2d61d64")
+        );
+        assert!(!by_path(&other).claude_codes_own());
+        assert_eq!(
+            linked.subjects,
+            HashMap::from([(own, "feat: add the thing".to_string())])
+        );
+    }
+
     #[test]
     fn the_worktree_list_gives_each_worktree_its_branch_and_says_which_have_gone() {
         let list = "worktree /code/app\n\
@@ -1075,18 +1326,26 @@ mod tests {
                     HEAD 0e7b51f1e2a4cdb0b27c2ac83c20f0c6ce3a1c51\n\
                     branch refs/heads/gone\n\
                     prunable gitdir file points to non-existent location\n";
-        let listed = |path: &str, branch: Option<&str>, prunable| Listed {
+        let listed = |path: &str, head: &str, branch: Option<&str>, prunable| Listed {
             path: PathBuf::from(path),
+            head: Some(head.to_string()),
             branch: branch.map(String::from),
             prunable,
         };
+        let first = "9fceb02d0ae598e95dc970b74767f19372d61af8";
+        let second = "0e7b51f1e2a4cdb0b27c2ac83c20f0c6ce3a1c51";
         assert_eq!(
             parse_worktree_list(list),
             [
-                listed("/code/app", Some("main"), false),
-                listed("/code/app.worktrees/feat-login", Some("feat/login"), false),
-                listed("/code/app.worktrees/spike", None, false),
-                listed("/code/app.worktrees/gone", Some("gone"), true),
+                listed("/code/app", first, Some("main"), false),
+                listed(
+                    "/code/app.worktrees/feat-login",
+                    second,
+                    Some("feat/login"),
+                    false
+                ),
+                listed("/code/app.worktrees/spike", second, None, false),
+                listed("/code/app.worktrees/gone", second, Some("gone"), true),
             ]
         );
     }

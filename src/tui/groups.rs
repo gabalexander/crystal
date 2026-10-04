@@ -18,7 +18,7 @@
 
 use crate::flow_run::FlowRun;
 use crate::front;
-use crate::protocol::{Activity, Front, SessionInfo, Worktree};
+use crate::protocol::{Activity, Front, InProgress, SessionInfo, Worktree};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -39,6 +39,8 @@ pub enum Row {
         path: PathBuf,
         branch: Option<String>,
         main: bool,
+        /// What git is in the middle of there, if anything.
+        in_progress: Option<InProgress>,
     },
     /// A directory outside any repository, heading its sessions.
     Directory(PathBuf),
@@ -178,15 +180,20 @@ pub fn rows(
 }
 
 /// The rows of the worktrees in `empty` that are `project`'s, in the order
-/// they come: each one's heading, and the row saying it has no sessions.
+/// they come, but for those Claude Code made for itself, which come last:
+/// each one's heading, and the row saying it has no sessions.
 pub fn empty_rows(empty: &[Worktree], project: &Path) -> Vec<Row> {
     let mut rows = Vec::new();
-    for worktree in empty.iter().filter(|w| w.project_path == project) {
+    let of_project = empty.iter().filter(|w| w.project_path == project);
+    let (claude_codes, others): (Vec<&Worktree>, Vec<&Worktree>) =
+        of_project.partition(|w| w.claude_codes_own());
+    for worktree in others.into_iter().chain(claude_codes) {
         rows.push(Row::Worktree {
             project: worktree.project_path.clone(),
             path: worktree.path.clone(),
             branch: worktree.branch.clone(),
             main: false,
+            in_progress: worktree.in_progress,
         });
         rows.push(Row::NoSessions(worktree.path.clone()));
     }
@@ -306,6 +313,7 @@ fn worktree_heading(session: &SessionInfo) -> Row {
             path: worktree.path.clone(),
             branch: worktree.branch.clone(),
             main: worktree.main,
+            in_progress: worktree.in_progress,
         },
         None => Row::Directory(session.cwd.clone()),
     }
@@ -341,6 +349,7 @@ mod tests {
             path: PathBuf::from(format!("/code/{project}/{branch}")),
             main: branch == "main",
             branch: Some(branch.into()),
+            in_progress: None,
         });
         SessionInfo {
             stopped_idle: false,
@@ -403,6 +412,7 @@ mod tests {
             path: PathBuf::from(format!("/code/{project}/{branch}")),
             main: false,
             branch: Some(branch.into()),
+            in_progress: None,
         }
     }
 
@@ -596,7 +606,8 @@ mod tests {
                     project: PathBuf::from("/code/app"),
                     path: PathBuf::from("/code/app/main"),
                     branch: Some("main".into()),
-                    main: true
+                    main: true,
+                    in_progress: None,
                 },
                 Row::Session(0),
                 Row::Session(1),
@@ -604,7 +615,8 @@ mod tests {
                     project: PathBuf::from("/code/app"),
                     path: PathBuf::from("/code/app/feat"),
                     branch: Some("feat".into()),
-                    main: false
+                    main: false,
+                    in_progress: None,
                 },
                 Row::Session(2),
                 Row::OutsideGit,
@@ -627,6 +639,7 @@ mod tests {
             path: PathBuf::from("/code/app/old"),
             branch: Some("old".into()),
             main: false,
+            in_progress: None,
         };
         assert_eq!(
             rows[2..5],
@@ -641,6 +654,20 @@ mod tests {
             rows.last(),
             Some(&Row::NoSessions(PathBuf::from("/code/web/spike")))
         );
+    }
+
+    #[test]
+    fn claude_code_s_own_worktrees_come_after_the_others() {
+        let mut own = linked("app", "worktree-agent-1");
+        own.path = PathBuf::from("/code/app/.claude/worktrees/agent-1");
+        let empty = [own.clone(), linked("app", "old")];
+        let rows = empty_rows(&empty, Path::new("/code/app"));
+        assert_eq!(rows.len(), 4);
+        assert!(
+            matches!(&rows[0], Row::Worktree { path, .. } if path == Path::new("/code/app/old"))
+        );
+        assert!(matches!(&rows[2], Row::Worktree { path, .. } if *path == own.path));
+        assert_eq!(rows[3], Row::NoSessions(own.path));
     }
 
     #[test]

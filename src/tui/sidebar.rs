@@ -12,7 +12,7 @@ use super::theme::Theme;
 use super::ui::Look;
 use crate::flow_run::{FlowRun, RunState, StepState};
 use crate::forge::{PullRequest, PullRequestState};
-use crate::protocol::{Front, SessionInfo, TaskState};
+use crate::protocol::{self, Front, InProgress, SessionInfo, TaskState};
 use crate::shell;
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -143,7 +143,20 @@ fn row_line<'a>(app: &'a App, row: &Row, look: &Look, width: u16, selected: bool
             path,
             branch,
             main,
-        } => worktree_line(app, project, path, branch.as_deref(), *main, theme, width),
+            in_progress,
+        } => {
+            let branch = branch.as_deref();
+            worktree_line(
+                app,
+                project,
+                path,
+                branch,
+                *main,
+                *in_progress,
+                theme,
+                width,
+            )
+        }
         Row::Directory(dir) => {
             let dir = shell::home_relative(dir);
             let room = usize::from(width).saturating_sub(WORKTREE_INDENT.len());
@@ -347,23 +360,46 @@ fn task_line<'a>(session: &SessionInfo, theme: &Theme, width: u16) -> Line<'a> {
     ])
 }
 
-/// A worktree's line: its mark and branch, and on the right its pull
-/// request when its forge knows of one, `#57` (`!57` on GitLab) and a mark
-/// for what matters most about it, or `removing…` while git removes it. Short of room, the mark
-/// goes first, then the number, before the branch is cut.
+/// A worktree's line: its mark and branch, then what git is in the middle
+/// of there, `· rebasing`, and on the right its pull request when its forge
+/// knows of one, `#57` (`!57` on GitLab) and a mark for what matters most
+/// about it, or `removing…` while git removes it. Short of room, the mark
+/// goes first, then the number, then what's said after the branch is cut,
+/// before the branch itself is. One Claude Code made for itself is named
+/// `claude`, then the subject of the commit it's at, which says what it
+/// holds where its branch's name doesn't, or its directory's name until
+/// git has said.
+#[allow(clippy::too_many_arguments)]
 fn worktree_line<'a>(
     app: &App,
     project: &Path,
     path: &Path,
     branch: Option<&str>,
     main: bool,
+    in_progress: Option<InProgress>,
     theme: &Theme,
     width: u16,
 ) -> Line<'a> {
     let mark = if main { "⌂ " } else { "⎇ " };
-    let name = branch.unwrap_or("(detached)");
+    let (name, about) = if protocol::claude_codes_own(project, path) {
+        let subject = app.subject_of(path).map(str::to_string);
+        let directory = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned());
+        ("claude", subject.or(directory))
+    } else {
+        let doing = in_progress.map(|what| what.doing().to_string());
+        (branch.unwrap_or("(detached)"), doing)
+    };
     // The indent and the mark before the branch; a space at the end.
     let room = usize::from(width).saturating_sub(WORKTREE_INDENT.len() + 2 + 1);
+    let name_width = name.chars().count();
+    // What's said after the name takes the room the name leaves, past
+    // the ` · ` between them.
+    let about = about
+        .filter(|_| name_width + 3 < room)
+        .map(|about| fit(&about, room - name_width - 3));
+    let label_width = name_width + about.as_ref().map_or(0, |about| 3 + about.chars().count());
     let forms = if app.removing(path) {
         vec![vec![Span::styled(
             "removing…",
@@ -377,21 +413,29 @@ fn worktree_line<'a>(
     };
     let right = forms
         .into_iter()
-        .find(|spans| name.chars().count() + 1 + width_of(spans) <= room)
+        .find(|spans| label_width + 1 + width_of(spans) <= room)
         .unwrap_or_default();
 
     let mut line = vec![
         Span::raw(WORKTREE_INDENT),
         Span::styled(mark, Style::new().fg(theme.muted)),
     ];
-    if right.is_empty() {
+    if right.is_empty() && about.is_none() {
         line.push(Span::styled(fit(name, room), Style::new().fg(theme.branch)));
-    } else {
-        let gap = room - name.chars().count() - width_of(&right);
+        return Line::from(line);
+    }
+    line.push(Span::styled(
+        name.to_string(),
+        Style::new().fg(theme.branch),
+    ));
+    if let Some(about) = about {
         line.push(Span::styled(
-            name.to_string(),
-            Style::new().fg(theme.branch),
+            format!(" · {about}"),
+            Style::new().fg(theme.muted),
         ));
+    }
+    if !right.is_empty() {
+        let gap = room - label_width - width_of(&right);
         line.push(Span::raw(" ".repeat(gap)));
         line.extend(right);
     }
@@ -638,6 +682,7 @@ pub fn fit(text: &str, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     #[test]
     fn a_change_in_the_last_ten_seconds_is_now() {
@@ -778,6 +823,59 @@ mod tests {
     }
 
     #[test]
+    fn a_worktree_in_the_middle_of_a_rebase_says_so_after_its_branch() {
+        let theme = Theme::new(crate::config::ThemeName::Dark, false);
+        let app = App::new(None);
+        let project = Path::new("/code/app");
+        let path = Path::new("/code/app.worktrees/fix");
+        let rebasing = Some(InProgress::Rebase);
+        let line = |width| {
+            worktree_line(
+                &app,
+                project,
+                path,
+                Some("fix"),
+                false,
+                rebasing,
+                &theme,
+                width,
+            )
+        };
+        assert_eq!(line(28).to_string().trim_end(), "   ⎇ fix · rebasing");
+        // Short of room, what's said is cut before the branch is.
+        assert_eq!(line(16).to_string().trim_end(), "   ⎇ fix · reb…");
+        // On its branch again, nothing is said.
+        let line = worktree_line(&app, project, path, Some("fix"), false, None, &theme, 28);
+        assert_eq!(line.to_string().trim_end(), "   ⎇ fix");
+    }
+
+    #[test]
+    fn a_worktree_claude_code_made_for_itself_is_named_by_its_commit() {
+        let theme = Theme::new(crate::config::ThemeName::Dark, false);
+        let mut app = App::new(None);
+        let project = Path::new("/code/app");
+        let path = Path::new("/code/app/.claude/worktrees/agent-a2d6");
+        let branch = Some("worktree-agent-a2d6");
+        let line = |app: &App| worktree_line(app, project, path, branch, false, None, &theme, 40);
+        // Until git has said what it's at, its directory's name.
+        assert_eq!(
+            line(&app).to_string().trim_end(),
+            "   ⎇ claude · agent-a2d6"
+        );
+        let subjects = HashMap::from([(path.to_path_buf(), "feat: add the thing".to_string())]);
+        app.set_subjects(project, subjects);
+        assert_eq!(
+            line(&app).to_string().trim_end(),
+            "   ⎇ claude · feat: add the thing"
+        );
+        // Another project's are left alone when this one's are set again.
+        app.set_subjects(Path::new("/code/web"), HashMap::new());
+        assert_eq!(app.subject_of(path), Some("feat: add the thing"));
+        app.set_subjects(project, HashMap::new());
+        assert_eq!(app.subject_of(path), None);
+    }
+
+    #[test]
     fn a_worktree_git_is_removing_says_so_on_its_line() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         let theme = Theme::new(crate::config::ThemeName::Dark, false);
@@ -792,12 +890,14 @@ mod tests {
                 path: path.into(),
                 main: false,
                 branch: Some("old".into()),
+                in_progress: None,
             }),
             ..session("fixer", claude())
         };
         let mut app = App::new(None);
         app.set_sessions(vec![ended]);
-        let line = |app: &App| worktree_line(app, project, path, Some("old"), false, &theme, 28);
+        let line =
+            |app: &App| worktree_line(app, project, path, Some("old"), false, None, &theme, 28);
         assert_eq!(line(&app).to_string().trim_end(), "   ⎇ old");
 
         for key in ['W', 'y'] {

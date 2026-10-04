@@ -22,6 +22,10 @@ crystal new -d -n fixer -w fix/login claude "Fix the login redirect bug"
   doesn't exist. Use it when the agent will edit files, so it doesn't collide with you. A new branch starts
   from origin's default branch, freshly fetched; add `--base HEAD` when it should have your commits, say to
   review or test your change (commit first: uncommitted work doesn't come along).
+- Several things at once, like a few fixes the user asked for together, are a session each, with `-w`: the
+  user sees each in the sidebar, with its status, its diff and its screen, and can step in. Don't use the
+  Agent tool's worktree isolation or `EnterWorktree` for them: those worktrees are yours alone, and nothing
+  shows until one is left behind.
 - Words after `claude` are its first prompt. Quote them as one argument.
 
 ## Hand it work and wait
@@ -98,6 +102,8 @@ crystal done "Wrote the plan" --artifact docs/plan.md
 - `--artifact <path>`, once for each file, keeps a copy of a file in your worktree with the task, for whoever
   reads it once the worktree is gone: a plan, a report. A file can be 1 MiB at most. One that can't be kept
   refuses the close and says why; the task stays open, so fix the call and run it again.
+- `crystal done` refuses while your worktree is in the middle of a rebase or a merge, stopped on conflicts
+  say: the work isn't done then. Finish it or abort it, then close the task; `--failed` closes it anyway.
 - End a turn with your task still open and crystal reminds you, once. Close it then if you're through;
   if you're waiting on the user, leave it open and end your turn.
 - An agent you start with a prompt (`crystal new -d claude "…"`, or `-t "…"` for any command) is given a task.

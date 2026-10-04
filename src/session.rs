@@ -12,8 +12,9 @@ use crate::handover::{self, Got};
 use crate::keys;
 use crate::notify::{self, Notice};
 use crate::protocol::{
-    Activity, AgentEvent, AgentReport, Answer, Asking, Conversation, Front, Reporter, SessionInfo,
-    State, TaskInfo, TaskOutcome, TaskRecord, TaskResult, TaskSpec, TaskState, TaskView,
+    Activity, AgentEvent, AgentReport, Answer, Asking, Conversation, Front, InProgress, Reporter,
+    SessionInfo, State, TaskInfo, TaskOutcome, TaskRecord, TaskResult, TaskSpec, TaskState,
+    TaskView,
 };
 use crate::report;
 use crate::spending::Spending;
@@ -636,6 +637,12 @@ impl Session {
     /// Where the session runs: the directory its project is found from.
     pub fn cwd(&self) -> &std::path::Path {
         &self.cwd
+    }
+
+    /// What git is in the middle of in the worktree the session runs in,
+    /// if anything: a task there isn't done while it lasts.
+    pub fn worktree_in_progress(&self) -> Option<InProgress> {
+        self.checkout.as_ref()?.worktree().in_progress
     }
 
     /// The top of the worktree the session runs in, or outside git, where
