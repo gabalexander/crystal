@@ -10426,7 +10426,7 @@ fn the_panel_starts_claude_in_the_background_as_a_task() {
 }
 
 #[test]
-fn a_closed_task_is_remembered_in_its_project_s_memory() {
+fn a_closed_task_is_kept_in_its_project_s_history_not_its_memory() {
     let crystal = Crystal::new();
     crystal.configure("notify = false\n");
     let dir = crystal.dir.path();
@@ -10448,11 +10448,13 @@ fn a_closed_task_is_remembered_in_its_project_s_memory() {
     eventually("the task is closed", || {
         crystal.row("fixer").unwrap()[8] == "✓ did what was asked"
     });
-    eventually("the outcome is remembered", || {
+    eventually("the task is in the project's history", || {
         crystal
-            .ok(&["memory"])
-            .contains("fix the tests: did what was asked")
+            .ok(&["tasks"])
+            .contains("fix the tests — did what was asked")
     });
+    let remembered = crystal.ok(&["memory"]);
+    assert!(!remembered.contains("did what was asked"), "{remembered}");
 }
 
 /// A stand-in for Claude that plays both its parts in a task: as the task,
@@ -10590,11 +10592,13 @@ fn a_task_is_shown_what_was_learned_and_given_crystal_s_mcp_server() {
     assert!(prompt.contains("memory_search tool"), "{prompt}");
     assert_eq!(written(&repo.join("task-prompt")), "fix the ledger\n");
 
-    eventually("the task is done and its outcome kept", || {
+    eventually("the task is done", || {
         crystal
-            .ok(&["memory", "-C", repo_dir])
-            .contains("fix the ledger: Fixed: start redis first.")
+            .ok(&["tasks", "-C", repo_dir])
+            .contains("fix the ledger — Fixed: start redis first.")
     });
+    let remembered = crystal.ok(&["memory", "-C", repo_dir]);
+    assert!(!remembered.contains("start redis first"), "{remembered}");
     // With the distiller off, nothing more is read.
     thread::sleep(Duration::from_millis(300));
     assert!(!repo.join("distill-args").exists());
@@ -10644,7 +10648,7 @@ fn the_distiller_keeps_what_a_closed_task_learned() {
          rejected entry 2: \"outcome\" isn't a kind it may give\n"
     );
     let found = crystal.ok(&["memory", "-C", repo_dir, "search", "redis"]);
-    assert_eq!(found.lines().count(), 2, "{found}");
+    assert_eq!(found.lines().count(), 1, "{found}");
 
     // Forgotten, it stays forgotten.
     let id = found
