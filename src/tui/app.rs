@@ -9023,7 +9023,7 @@ gate = true
         assert_eq!(
             press(&mut app, KeyCode::Char(' ')),
             Some(Action::ChangeSetting(settings_view::Change::Embeddings(
-                true
+                false
             )))
         );
         app.setting_failed("the file is read-only".into());

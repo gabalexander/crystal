@@ -20,7 +20,8 @@
 //! An entry can name the files it's about, and keeps a hash of each as it
 //! was when the entry was said: its anchors. Once some of them change, the
 //! entry is drifting, and may hold only in part; once all of them have, it's
-//! stale, and agents aren't shown it.
+//! stale, and agents aren't shown it as they start. A search marks both
+//! where they rank.
 //!
 //! The user can turn all of it off: [`enabled`] is the one place that
 //! decides, and everything memory adds asks it first.
@@ -86,6 +87,11 @@ const BUSY_WAIT: Duration = Duration::from_secs(5);
 /// How many of the best entries each ranking, by words and by meaning,
 /// gives before the two are merged.
 const POOL: usize = 50;
+
+/// How many of the best entries, by words and meaning merged, the reranker
+/// reads again: 20 ranked crystal's notes best. Those past it it never
+/// reads, so they aren't found.
+const RERANK_POOL: usize = 20;
 
 /// Reciprocal rank fusion's constant: an entry gets `1 / (K + its place)`
 /// from each ranking it's in. 60, as in the paper that brought it in, keeps
@@ -518,7 +524,9 @@ impl Store {
     /// word counts, and so does a word it starts or stems from: "test" finds
     /// "tests" and "testing". With an `embedder`, entries that mean much the
     /// same count too, whatever their words, and the two rankings are
-    /// merged. A text with no words gives the entries said most recently.
+    /// merged; then, with its reranker, the best are read again with `text`,
+    /// those that don't answer it are left out, and its ranking is merged
+    /// in too. A text with no words gives the entries said most recently.
     pub fn search(
         &mut self,
         project: &Path,
@@ -539,7 +547,12 @@ impl Store {
             return Ok(by_words);
         };
         match self.by_meaning(&name, text, kind.as_deref(), pool, embedder) {
-            Ok(by_meaning) => Ok(fused(&[by_words, by_meaning], limit)),
+            Ok(by_meaning) => Ok(reranked(
+                fused(&[by_words, by_meaning], pool),
+                text,
+                embedder,
+                limit,
+            )),
             // The model failing leaves the search to the words.
             Err(err) => {
                 eprintln!("crystal: couldn't search by meaning: {err:#}");
@@ -579,8 +592,8 @@ impl Store {
         embedder: &dyn Embed,
     ) -> Result<Vec<Entry>> {
         self.embed_missing_in(Some(project), embedder)?;
-        let asked = embedder.embed(&[text])?;
-        let asked = asked.first().context("the model gave no vector")?;
+        let asked = embedder.embed_query(text)?;
+        let asked = &asked;
         let mut rows = self.conn.prepare(&format!(
             "SELECT {COLUMNS}, v.vector FROM entries e JOIN vectors v ON v.n = e.n \
              WHERE e.project = ?1 AND v.model = ?2 AND (?3 IS NULL OR e.kind = ?3)"
@@ -632,6 +645,15 @@ impl Store {
         Ok((entries, embedded))
     }
 
+    /// Lets go of the vectors of every model but `model`: crystal searches
+    /// with one, and another's can't be compared with it.
+    pub fn forget_vectors_but(&mut self, model: &str) -> Result<usize> {
+        let gone = self
+            .conn
+            .execute("DELETE FROM vectors WHERE model != ?1", params![model])?;
+        Ok(gone)
+    }
+
     /// Gives every entry, in every project, that has no vector from
     /// `embedder` one, and says how many that was.
     pub fn embed_missing(&mut self, embedder: &dyn Embed) -> Result<usize> {
@@ -654,7 +676,7 @@ impl Store {
         };
         for batch in missing.chunks(EMBED_BATCH) {
             let texts: Vec<&str> = batch.iter().map(|(_, text)| text.as_str()).collect();
-            let vectors = embedder.embed(&texts)?;
+            let vectors = embedder.embed_passages(&texts)?;
             let tx = self
                 .conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -853,6 +875,52 @@ fn fused(rankings: &[Vec<Entry>], limit: usize) -> Vec<Entry> {
         .collect()
 }
 
+/// `found`, the best ranked first, read again with `text` by the
+/// embedder's reranker: nothing, when not even the best of the first
+/// [`RERANK_POOL`] answers `text`; otherwise those of them it doesn't rule
+/// out, in the order of the two rankings merged. Without a reranker, or
+/// with it failing, `found` as it is.
+fn reranked(mut found: Vec<Entry>, text: &str, embedder: &dyn Embed, limit: usize) -> Vec<Entry> {
+    found.truncate(RERANK_POOL.max(limit));
+    let read = &found[..found.len().min(RERANK_POOL)];
+    let passages: Vec<&str> = read.iter().map(|entry| entry.text.as_str()).collect();
+    let scores = match embedder.rerank(text, &passages) {
+        Ok(Some(scores)) if scores.len() == read.len() => scores,
+        Ok(Some(_)) => {
+            eprintln!("crystal: the reranker didn't score every entry");
+            found.truncate(limit);
+            return found;
+        }
+        Ok(None) => {
+            found.truncate(limit);
+            return found;
+        }
+        Err(err) => {
+            eprintln!("crystal: couldn't rerank: {err:#}");
+            found.truncate(limit);
+            return found;
+        }
+    };
+    if scores.iter().all(|score| *score < embedder.answers_from()) {
+        return Vec::new();
+    }
+    let mut answering: Vec<(f32, &Entry)> = scores
+        .into_iter()
+        .zip(read)
+        .filter(|(score, _)| *score >= embedder.kept_from())
+        .collect();
+    let first: Vec<Entry> = answering
+        .iter()
+        .map(|(_, entry)| (*entry).clone())
+        .collect();
+    answering.sort_by(|a, b| b.0.total_cmp(&a.0));
+    let second: Vec<Entry> = answering
+        .into_iter()
+        .map(|(_, entry)| entry.clone())
+        .collect();
+    fused(&[first, second], limit)
+}
+
 fn dot(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(x, y)| x * y).sum()
 }
@@ -1049,16 +1117,15 @@ pub fn remove(socket: &Path, project: &Path, id: u64) -> Result<Entry> {
     Store::open(socket)?.remove(project, id)
 }
 
-/// `entries` with whether each still holds: the fresh first, then the
-/// drifting, then the stale, each part in the order it was.
-pub fn freshest_first(entries: Vec<Entry>, project: &Path) -> Vec<Listed> {
+/// `entries` with whether each still holds, in the order they came: a
+/// search's ranking stays as it is, the drifting and the stale marked where
+/// they rank rather than moved below the rest.
+pub fn marked(entries: Vec<Entry>, project: &Path) -> Vec<Listed> {
     let mut hashes = Hashes::default();
-    let mut listed: Vec<Listed> = entries
+    entries
         .into_iter()
         .map(|entry| hashes.listed(entry, project))
-        .collect();
-    listed.sort_by_key(|item| item.freshness);
-    listed
+        .collect()
 }
 
 /// Who [`for_launch`] tells, which says how it reads the rest of the
@@ -1078,7 +1145,7 @@ pub enum Reader {
 /// entries about files its worktree has changed since its base, `changed`,
 /// then those with most to do with what it was asked, `asked`, or else the
 /// newest, and how to search and add to it. Stale entries are left out,
-/// and in each part the drifting come after the rest. A task in the
+/// and the drifting are marked where they rank. A task in the
 /// background isn't told how to add, so it has nothing to be told when
 /// nothing is remembered. With an `embedder`, what has to do with what it
 /// was asked goes by meaning as well as by words.
@@ -1102,18 +1169,17 @@ pub fn for_launch(
 }
 
 /// The entries a session may be shown as it starts, from `parts`, the most
-/// relevant part first: each once, none that's stale, and in each part the
-/// fresh ahead of the drifting.
+/// relevant part first: each once, none that's stale, and in each part in
+/// the order it ranked, the drifting marked where they rank.
 fn launch_order(parts: Vec<Vec<Entry>>, project: &Path, hashes: &mut Hashes) -> Vec<Listed> {
     let mut shown: Vec<Listed> = Vec::new();
     for part in parts {
-        let mut part: Vec<Listed> = part
+        let part: Vec<Listed> = part
             .into_iter()
             .filter(|entry| !shown.iter().any(|item| item.entry.id == entry.id))
             .map(|entry| hashes.listed(entry, project))
             .filter(|item| item.freshness != Freshness::Stale)
             .collect();
-        part.sort_by_key(|item| item.freshness);
         shown.extend(part);
     }
     shown
@@ -1821,13 +1887,9 @@ mod tests {
         &["money", "fees", "cents"],
     ];
 
-    impl Embed for Meanings {
-        fn model(&self) -> &str {
-            self.model
-        }
-
-        fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
-            Ok(texts
+    impl Meanings {
+        fn vectors(&self, texts: &[&str]) -> Vec<Vec<f32>> {
+            texts
                 .iter()
                 .map(|text| {
                     let mut vector = vec![0.0_f32; 16];
@@ -1845,7 +1907,21 @@ mod tests {
                     let length = dot(&vector, &vector).sqrt().max(f32::EPSILON);
                     vector.iter().map(|x| x / length).collect()
                 })
-                .collect())
+                .collect()
+        }
+    }
+
+    impl Embed for Meanings {
+        fn model(&self) -> &str {
+            self.model
+        }
+
+        fn embed_passages(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+            Ok(self.vectors(texts))
+        }
+
+        fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
+            Ok(self.vectors(&[text]).remove(0))
         }
 
         fn min_similarity(&self) -> f32 {
@@ -1867,7 +1943,11 @@ mod tests {
             "broken"
         }
 
-        fn embed(&self, _: &[&str]) -> Result<Vec<Vec<f32>>> {
+        fn embed_passages(&self, _: &[&str]) -> Result<Vec<Vec<f32>>> {
+            bail!("out of memory")
+        }
+
+        fn embed_query(&self, _: &str) -> Result<Vec<f32>> {
             bail!("out of memory")
         }
 
@@ -1934,8 +2014,11 @@ mod tests {
             fn model(&self) -> &str {
                 self.0.model()
             }
-            fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
-                self.0.embed(texts)
+            fn embed_passages(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+                self.0.embed_passages(texts)
+            }
+            fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
+                self.0.embed_query(text)
             }
             fn min_similarity(&self) -> f32 {
                 0.3
@@ -1948,6 +2031,101 @@ mod tests {
             .search(Path::new(APP), "money", None, 10, Some(&Picky(picky)))
             .unwrap();
         assert_eq!(ids(&found), [1]);
+    }
+
+    /// A stand-in with a reranker: an entry answers a query by how much of
+    /// what it means the query asks about, and a reranker that fails, or
+    /// leaves an entry unscored, when `broken` says so.
+    struct Reading {
+        broken: Option<&'static str>,
+    }
+
+    impl Embed for Reading {
+        fn model(&self) -> &str {
+            "meanings"
+        }
+
+        fn embed_passages(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+            MEANINGS.embed_passages(texts)
+        }
+
+        fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
+            MEANINGS.embed_query(text)
+        }
+
+        fn min_similarity(&self) -> f32 {
+            0.1
+        }
+
+        fn near_best(&self) -> f32 {
+            1.0
+        }
+
+        fn rerank(&self, query: &str, passages: &[&str]) -> Result<Option<Vec<f32>>> {
+            match self.broken {
+                Some("fails") => bail!("the GPU went away"),
+                Some("short") => return Ok(Some(vec![1.0])),
+                _ => {}
+            }
+            let asked = MEANINGS.embed_query(query)?;
+            Ok(Some(
+                MEANINGS
+                    .embed_passages(passages)?
+                    .iter()
+                    .map(|passage| dot(&asked, passage))
+                    .collect(),
+            ))
+        }
+
+        fn answers_from(&self) -> f32 {
+            0.9
+        }
+
+        fn kept_from(&self) -> f32 {
+            0.85
+        }
+    }
+
+    #[test]
+    fn the_reranker_puts_what_answers_first_and_leaves_out_what_doesn_t() {
+        let (_dir, _socket, mut store) = remembering(&[
+            (
+                Kind::Note,
+                "fees in the ledger, cents, floats, rounding and the money tests",
+            ),
+            (Kind::Note, "fees are kept in cents"),
+            (Kind::Note, "cents, fees and money"),
+        ]);
+        let project = Path::new(APP);
+        let reading = Reading { broken: None };
+        let found = store
+            .search(project, "fees cents", None, 10, Some(&reading))
+            .unwrap();
+        // All three have the words, and the third answers; the first, about
+        // much else, scores too little to keep.
+        assert_eq!(ids(&found), [3, 2]);
+        let found = store
+            .search(project, "ledger floats", None, 10, Some(&reading))
+            .unwrap();
+        assert!(found.is_empty(), "nothing answers it: {found:?}");
+    }
+
+    #[test]
+    fn a_reranker_that_fails_leaves_the_search_as_it_was() {
+        let (_dir, _socket, mut store) = remembering(&[
+            (Kind::Note, "fees are kept in cents"),
+            (Kind::Note, "the deploy checklist"),
+        ]);
+        let project = Path::new(APP);
+        for broken in ["fails", "short"] {
+            let reading = Reading {
+                broken: Some(broken),
+            };
+            let found = store
+                .search(project, "fees", None, 10, Some(&reading))
+                .unwrap();
+            assert_eq!(ids(&found), [1], "{broken}");
+        }
     }
 
     #[test]
@@ -1987,6 +2165,9 @@ mod tests {
         assert_eq!(store.counts("meanings").unwrap(), (3, 3));
         store.remove(project, 1).unwrap();
         assert_eq!(vectors(&store), 2);
+        assert_eq!(store.forget_vectors_but("meanings").unwrap(), 0);
+        assert_eq!(store.forget_vectors_but("another").unwrap(), 2);
+        assert_eq!(vectors(&store), 0);
 
         // Another model's vectors can't be compared: it makes its own.
         let other = Meanings { model: "other" };
@@ -2025,7 +2206,7 @@ mod tests {
     }
 
     #[test]
-    fn the_drifting_and_then_the_stale_sink_in_the_search() {
+    fn the_drifting_and_the_stale_are_marked_where_they_rank() {
         let project = project_with(&["a.rs", "b.rs"]);
         let anchored = |id, anchors: &[(&str, &str)]| Entry {
             anchors: anchors
@@ -2038,13 +2219,13 @@ mod tests {
         let stale = anchored(1, &[("a.rs", "")]);
         let drifting = anchored(2, &[("a.rs", &a), ("b.rs", "")]);
         let fresh = anchored(3, &[("a.rs", &a)]);
-        let listed = freshest_first(vec![stale, drifting, fresh], project.path());
+        let listed = marked(vec![stale, drifting, fresh], project.path());
         let ids: Vec<u64> = listed.iter().map(|item| item.entry.id).collect();
-        assert_eq!(ids, [3, 2, 1]);
+        assert_eq!(ids, [1, 2, 3]);
         let freshness: Vec<Freshness> = listed.iter().map(|item| item.freshness).collect();
         assert_eq!(
             freshness,
-            [Freshness::Fresh, Freshness::Drifting, Freshness::Stale]
+            [Freshness::Stale, Freshness::Drifting, Freshness::Fresh]
         );
     }
 
@@ -2147,7 +2328,7 @@ mod tests {
     }
 
     #[test]
-    fn a_drifting_entry_is_shown_marked_after_the_fresh() {
+    fn a_drifting_entry_is_shown_marked_where_it_ranks() {
         let (_dir, socket) = socket();
         let project = project_with(&["a.rs", "b.rs"]);
         let at = project.path();
@@ -2158,12 +2339,13 @@ mod tests {
             .unwrap()
             .unwrap();
         let lines: Vec<&str> = paragraph.lines().collect();
+        // It has both words, so it comes first, marked.
         assert_eq!(
             lines[1..3],
             [
-                "- 2 (note) the ledger is slow to start",
                 "- 1 (note) refund waits for the ledger [a.rs, b.rs] \
                  [drifting: some of its files changed since]",
+                "- 2 (note) the ledger is slow to start",
             ]
         );
     }

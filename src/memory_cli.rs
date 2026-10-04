@@ -4,7 +4,7 @@
 
 use crate::client;
 use crate::config::Config;
-use crate::embed::{self, Embedder};
+use crate::embed::{self, Models};
 use crate::env;
 use crate::events::{self, Event};
 use crate::git::Checkout;
@@ -88,11 +88,11 @@ pub fn search(socket: &Path, dir: Option<PathBuf>, words: &[String]) -> Result<(
     check_on()?;
     let dir = dir_or_current(dir)?;
     let settings = Config::load()?.memory;
-    let downloaded = embed::model_dir().is_some_and(|dir| embed::is_downloaded(&dir));
+    let downloaded = embed::models_dir().is_some_and(|dir| embed::is_downloaded(&dir));
     if settings.embeddings && !downloaded {
         eprintln!(
-            "{} isn't downloaded, so this goes by words alone: `crystal memory embed` gets it",
-            embed::MODEL
+            "the models that search by meaning aren't downloaded yet, so this goes by words \
+             alone: the daemon gets them as it starts, or `crystal memory embed` does now"
         );
     }
     let found = found(socket, &dir, &words.join(" "), None, memory::SEARCH_LIMIT)?;
@@ -124,7 +124,7 @@ pub fn found(
     let embedder = embed::shared_now();
     let mut store = Store::open(socket)?;
     let found = store.search(&project, query, kind, limit, embed::as_embed(&embedder))?;
-    Ok(memory::freshest_first(found, &project))
+    Ok(memory::marked(found, &project))
 }
 
 pub fn remove(socket: &Path, dir: Option<PathBuf>, id: u64) -> Result<()> {
@@ -148,19 +148,21 @@ fn tell(socket: &Path, event: Event) {
     }
 }
 
-/// Downloads the embedding model if it isn't here yet, then gives every
-/// entry of every project its vector, and says how many that was.
+/// Downloads the models that search by meaning if they aren't here yet,
+/// then gives every entry of every project its vector, and says how many
+/// that was.
 pub fn embed(socket: &Path) -> Result<()> {
     check_on()?;
-    let dir = match embed::model_dir().filter(|dir| embed::is_downloaded(dir)) {
-        Some(dir) => dir,
+    let root = match embed::models_dir().filter(|root| embed::is_downloaded(root)) {
+        Some(root) => root,
         None => {
-            eprintln!("downloading {} ({} MB)", embed::MODEL, embed::size_mb());
+            eprintln!("downloading {} ({} MB)", embed::names(), embed::size_mb());
             embed::download(std::io::stderr().is_terminal())?
         }
     };
-    let embedder = Embedder::load(&dir)?;
-    let count = Store::open(socket)?.embed_missing(&embedder)?;
+    // Embedding needs only the one model.
+    let models = Models::load(&root, false)?;
+    let count = Store::open(socket)?.embed_missing(&models)?;
     println!("embedded {count} entries with {}", embed::MODEL);
     if !Config::load()?.memory.embeddings {
         println!(

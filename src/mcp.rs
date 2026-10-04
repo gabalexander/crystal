@@ -189,11 +189,12 @@ fn tools() -> Value {
             "name": "memory_search",
             "description": "Search this project's memory: what earlier sessions working here \
                             learned, like decisions and why, gotchas, commands that work, notes \
-                            and how tasks turned out. Give a few words: any of them matches, \
-                            and so does a word they start or stem from. Gives the best matches \
-                            first, a line each: id, kind, age, text, the files it's about, \
-                            [drifting] when some of those have changed since, and [stale] when \
-                            all of them have.",
+                            and how tasks turned out. Give a few words or a question: any of \
+                            the words matches, and so does a word they start or stem from; with \
+                            search by meaning on, so does what means the same, and a search \
+                            nothing answers finds nothing. Gives the best matches first, a line \
+                            each: id, kind, age, text, the files it's about, [drifting] when some \
+                            of those have changed since, and [stale] when all of them have.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -262,7 +263,7 @@ mod tests {
             on: || true,
             search: |socket, project, query, kind, limit| {
                 let found = Store::open(socket)?.search(project, query, kind, limit, None)?;
-                Ok(memory::freshest_first(found, project))
+                Ok(memory::marked(found, project))
             },
         };
         std::fs::create_dir(&server.project).unwrap();
