@@ -406,8 +406,8 @@ impl FlowRun {
         }
     }
 
-    /// The goal as `{slug}` and the branch of the run's worktree: its
-    /// words, or the run's name when it has none that fit a branch.
+    /// The goal as `{slug}`: its words as a branch would have them, or the
+    /// run's name when it has none that fit.
     pub fn slug(&self) -> String {
         let slug = flows::slug(&self.goal);
         if slug.is_empty() {
@@ -881,13 +881,13 @@ mod tests {
         let mut run = ship();
         assert_eq!(run.place(0), Place::In("/code/app".into()));
         assert_eq!(run.place(1), Place::NewWorktree);
-        assert_eq!(run.slug(), "add-retries");
         run.start();
         run.steps[0].cwd = Some("/code/app".into());
         run.step_ended(0, done("the plan"));
-        run.worktree = Some("/code/app.worktrees/add-retries".into());
+        // On a branch with a made-up name, which the daemon picks.
+        run.worktree = Some("/code/app.worktrees/brave-otter".into());
         run.steps[1].cwd = run.worktree.clone();
-        let tree = Place::In("/code/app.worktrees/add-retries".into());
+        let tree = Place::In("/code/app.worktrees/brave-otter".into());
         assert_eq!(run.place(1), tree);
         assert_eq!(run.place(2), tree);
         assert_eq!(run.place(3), tree);

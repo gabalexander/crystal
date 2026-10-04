@@ -491,7 +491,9 @@ A [flow](#flows) makes its worktree from the branch as last fetched, without fet
 session is still running in it, and leaves the rest to `git worktree remove`, which keeps a worktree with
 changes you haven't committed. `crystal worktree rm --force` removes it anyway, and those changes with it; `W`
 asks a second time, naming them, and a second `y` does the same. Sessions that had ended in it leave the list
-with it: their directory is gone, so they could never start again.
+with it: their directory is gone, so they could never start again. The daemon does the removing, and the
+sidebar says `removing…` until it's done, which for a big worktree can take a while: quitting the TUI meanwhile
+doesn't stop it, and neither does `crystal restart-server`.
 
 To set a new worktree up, say install its dependencies or copy in an `.env`, have a [plugin](#plugins) run a
 command on `worktree.created`, and on `worktree.removed` to tidy up after it.
@@ -2210,7 +2212,7 @@ prompt = "Push this branch and open a pull request for it with `gh pr create --f
 | Placement | The step runs |
 |---|---|
 | `root` | where the run was started |
-| `fresh` | in a worktree the run makes for itself, the first time a step asks for it, on a branch named after the goal (`add-retries`, or `add-retries-2` when that's taken); every `fresh` step of the run after that runs there too |
+| `fresh` | in a worktree the run makes for itself, the first time a step asks for it, on a new branch with a made-up name like `brave-otter`, as the new-session panel gives a new worktree (`brave-otter-2` when that's taken); every `fresh` step of the run after that runs there too |
 | `same` | where the step before it ran |
 
 A step in a worktree is told about the [handoff file](#the-handoff-file) there like any agent, so it hears what
@@ -2807,7 +2809,9 @@ so every program is still the daemon's child, and how it ends is still known; th
 pipes to its `claude` and the listening socket stay open across the exec, so a client that connects meanwhile
 only waits. Attaches and event streams are cut, and come back by themselves: an event stream picks up after
 the last event it had, with none missed, and the log has a `daemon.handed_over`. If the new crystal can't take
-over, the daemon is restarted cold from the sessions it wrote down first.
+over, the daemon is restarted cold from the sessions it wrote down first. A worktree still being removed is left
+to git: the new daemon waits for it to finish, has git try again if the worktree is still there, then answers
+whoever asked.
 
 Text crystal didn't write, like a session's name, what an agent reports, Claude's answers in a background task,
 a pull request's title, a branch, a commit or a file in a preview, reaches your terminal only as text. Control

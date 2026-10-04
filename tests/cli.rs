@@ -6135,6 +6135,184 @@ fn worktree_rm_takes_the_sessions_that_ended_there_with_it() {
     assert!(crystal.row("fixer").is_none());
 }
 
+/// Puts a `git` in `bin` that writes each command it's given down in
+/// `git.log` in `dir`, and holds `worktree remove` until there's a file
+/// called `go` there, then runs the real one. Gives back the log's path.
+fn held_worktree_remove(bin: &Path, dir: &Path) -> PathBuf {
+    let found = outside_crystal("sh")
+        .args(["-c", "command -v git"])
+        .output()
+        .unwrap();
+    let git = String::from_utf8(found.stdout).unwrap();
+    let (log, go) = (dir.join("git.log"), dir.join("go"));
+    script(
+        &bin.join("git"),
+        &format!(
+            "echo \"$*\" >> '{}'\n\
+             case \"$*\" in *\"worktree remove\"*)\n\
+             while [ ! -e '{}' ]; do sleep 0.05; done ;;\n\
+             esac\n\
+             exec {} \"$@\"\n",
+            log.display(),
+            go.display(),
+            git.trim()
+        ),
+    );
+    log
+}
+
+/// What `child` printed, once it has ended, which it must do in a while.
+fn answered(mut child: std::process::Child) -> Output {
+    eventually("the command has been answered", || {
+        child.try_wait().unwrap().is_some()
+    });
+    child.wait_with_output().unwrap()
+}
+
+/// How many of the commands `held_worktree_remove`'s git wrote down in
+/// `log` have `words` in them.
+fn git_ran(log: &Path, words: &str) -> usize {
+    let log = std::fs::read_to_string(log).unwrap_or_default();
+    log.lines().filter(|line| line.contains(words)).count()
+}
+
+#[test]
+fn quitting_the_tui_doesn_t_stop_the_worktree_it_asked_to_remove() {
+    let crystal = Crystal::new();
+    let dir = crystal.dir.path();
+    let repo = git_repo(dir, "app");
+    let repo_arg = repo.to_str().unwrap();
+    let bin = dir.join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let log = held_worktree_remove(&bin, dir);
+    // The daemon removes it, with the git that holds.
+    let daemon = crystal.start_daemon_with(&[("PATH", &path_with(&bin))]);
+    crystal.ok(&[
+        "new", "-n", "fixer", "-c", repo_arg, "-w", "fix", "sh", "-c", "exit 0",
+    ]);
+    eventually("fixer has ended", || {
+        crystal.row("fixer").unwrap()[1] == "exited 0"
+    });
+    let worktree = dir.join("app.worktrees/fix");
+
+    let mut tui = crystal.tui();
+    tui.shows("■ fixer");
+    tui.type_keys("W");
+    tui.shows("remove worktree fix? y/n");
+    tui.type_keys("y");
+    tui.shows("removing…");
+    eventually("git is removing it", || {
+        git_ran(&log, "worktree remove") == 1
+    });
+    tui.type_keys("q");
+    assert!(tui.exit());
+
+    std::fs::write(dir.join("go"), "").unwrap();
+    eventually("the worktree is gone", || !worktree.exists());
+    eventually("its ended session went with it", || {
+        crystal.row("fixer").is_none()
+    });
+    let removed = crystal.ok(&["events", "-k", "worktree.removed"]);
+    assert_eq!(removed.lines().count(), 1, "{removed}");
+    assert!(removed.contains("app.worktrees/fix on fix"), "{removed}");
+    crash(daemon);
+}
+
+#[test]
+fn a_worktree_being_removed_as_the_daemon_hands_over_is_finished_by_the_next() {
+    let crystal = Crystal::new();
+    let dir = crystal.dir.path();
+    let repo = git_repo(dir, "app");
+    let repo_arg = repo.to_str().unwrap();
+    let bin = dir.join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let log = held_worktree_remove(&bin, dir);
+    let daemon = crystal.start_daemon_with(&[("PATH", &path_with(&bin))]);
+    crystal.ok(&[
+        "new", "-n", "fixer", "-c", repo_arg, "-w", "fix", "sh", "-c", "exit 0",
+    ]);
+    eventually("fixer has ended", || {
+        crystal.row("fixer").unwrap()[1] == "exited 0"
+    });
+    let worktree = dir.join("app.worktrees/fix");
+    let remove = || {
+        crystal
+            .command(&["worktree", "rm", "app.worktrees/fix"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap()
+    };
+
+    let first = remove();
+    eventually("git is removing it", || {
+        git_ran(&log, "worktree remove") == 1
+    });
+    // Asked again meanwhile, it's the same removal: the daemon looks for
+    // the worktree's repository, then waits with the first.
+    let looked = git_ran(&log, "app.worktrees/fix rev-parse");
+    let second = remove();
+    eventually("the second has been read", || {
+        git_ran(&log, "app.worktrees/fix rev-parse") > looked
+    });
+    assert_eq!(
+        crystal.ok(&["restart-server"]),
+        "restarted the daemon, and its sessions carried on\n"
+    );
+    assert!(worktree.is_dir(), "git is still holding");
+
+    std::fs::write(dir.join("go"), "").unwrap();
+    for removal in [first, second] {
+        let out = answered(removal);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{err}");
+    }
+    assert!(!worktree.exists());
+    assert!(crystal.row("fixer").is_none());
+    // git removed it once, the new daemon finding it gone.
+    assert_eq!(git_ran(&log, "worktree remove"), 1);
+    let removed = crystal.ok(&["events", "-k", "worktree.removed"]);
+    assert_eq!(removed.lines().count(), 1, "{removed}");
+    crash(daemon);
+}
+
+#[test]
+fn a_removal_git_refuses_after_a_handover_is_tried_again_and_says_why() {
+    let crystal = Crystal::new();
+    let dir = crystal.dir.path();
+    let repo = git_repo(dir, "app");
+    let repo_arg = repo.to_str().unwrap();
+    let bin = dir.join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let log = held_worktree_remove(&bin, dir);
+    let daemon = crystal.start_daemon_with(&[("PATH", &path_with(&bin))]);
+    crystal.ok(&["new", "-n", "x", "-c", repo_arg, "-w", "fix", "true"]);
+    eventually("x has ended", || crystal.row("x").unwrap()[1] == "exited 0");
+    let worktree = dir.join("app.worktrees/fix");
+    std::fs::write(worktree.join("notes.txt"), "half done\n").unwrap();
+
+    let removal = crystal
+        .command(&["worktree", "rm", "app.worktrees/fix"])
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    eventually("git is removing it", || {
+        git_ran(&log, "worktree remove") == 1
+    });
+    crystal.ok(&["restart-server"]);
+    std::fs::write(dir.join("go"), "").unwrap();
+
+    // Still there after the first git, the next daemon has git try again,
+    // which says why it won't.
+    let out = answered(removal);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("untracked"), "{err}");
+    assert_eq!(git_ran(&log, "worktree remove"), 2);
+    assert!(worktree.join("notes.txt").exists());
+    crash(daemon);
+}
+
 #[test]
 fn shift_w_removes_a_worktree_once_nothing_runs_in_it() {
     let crystal = Crystal::new();
@@ -11877,10 +12055,22 @@ fn a_step_that_wants_a_worktree_runs_in_one_the_flow_makes_as_do_those_after() {
     // Columns: BRANCH, then DIRECTORY.
     let plan = crystal.row("tree-1-plan").unwrap();
     assert_eq!(plan[4], "main");
+    // On a new branch with a made-up name, an adjective and an animal, as
+    // the new-session panel gives a new worktree, whatever the goal says.
+    let build = crystal.row("tree-1-build").unwrap();
+    let branch = build[4].clone();
+    let (adjective, animal) = branch.split_once('-').unwrap();
+    assert!(
+        [adjective, animal]
+            .iter()
+            .all(|word| !word.is_empty() && word.chars().all(|c| c.is_ascii_lowercase())),
+        "{branch}"
+    );
     for step in ["tree-1-build", "tree-1-check"] {
         let row = crystal.row(step).unwrap();
-        assert_eq!(row[4], "add-retries");
-        assert!(row[5].ends_with("app.worktrees/add-retries"), "{}", row[5]);
+        assert_eq!(row[4], branch);
+        let dir = format!("app.worktrees/{branch}");
+        assert!(row[5].ends_with(&dir), "{}", row[5]);
     }
 
     // A second run of the same goal makes a worktree of its own.
@@ -11890,7 +12080,8 @@ fn a_step_that_wants_a_worktree_runs_in_one_the_flow_makes_as_do_those_after() {
         &["tree", "add retries", "-c", &repo_arg, "--wait"],
     );
     assert_eq!(out, "tree-2\ndone\n");
-    assert_eq!(crystal.row("tree-2-build").unwrap()[4], "add-retries-2");
+    let second = crystal.row("tree-2-build").unwrap();
+    assert_ne!(second[5], build[5]);
 }
 
 #[test]

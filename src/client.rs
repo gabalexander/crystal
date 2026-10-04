@@ -8,8 +8,7 @@ use crate::git;
 use crate::handover;
 use crate::layout::{self, Layout, Order};
 use crate::protocol::{
-    self, Backlog, NewSession, NewTask, PendingTask, Request, Response, SessionInfo, State,
-    TaskBrief, TaskSpec,
+    self, Backlog, NewSession, NewTask, PendingTask, Request, Response, TaskBrief, TaskSpec,
 };
 use crate::socket;
 use anyhow::{Context, Result, bail};
@@ -251,37 +250,22 @@ pub fn respawn(socket: &Path, name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Removes the worktree at `path`, unless sessions are still running in
-/// it: removing a directory out from under a program would leave it
-/// working on files that are gone. With `force`, changes not committed go
-/// with it. Sessions that had ended there leave the list with it, since
-/// their directory is gone and they could never start again.
+/// Has the daemon remove the worktree at `path`, unless sessions are still
+/// running in it: removing a directory out from under a program would
+/// leave it working on files that are gone. With `force`, changes not
+/// committed go with it. Sessions that had ended there leave the list with
+/// it, since their directory is gone and they could never start again.
+/// Comes back once it's gone, or with why not: the daemon carries on with
+/// it if this process goes first. Starts the daemon if it isn't running.
 pub fn remove_worktree(socket: &Path, path: &Path, force: bool) -> Result<()> {
-    let sessions = match ask(socket, &Request::List, false)? {
-        Some(Response::Sessions { sessions }) => sessions,
-        _ => Vec::new(),
+    let request = Request::RemoveWorktree {
+        path: path.to_path_buf(),
+        force,
     };
-    let (running, ended): (Vec<&SessionInfo>, Vec<&SessionInfo>) = sessions
-        .iter()
-        .filter(|session| runs_in(session, path))
-        .partition(|session| session.state == State::Running);
-    if !running.is_empty() {
-        let names: Vec<&str> = running
-            .iter()
-            .map(|session| session.name.as_str())
-            .collect();
-        bail!("{} still running in {}", names.join(", "), path.display());
+    match ask(socket, &request, true)? {
+        Some(Response::Done) => Ok(()),
+        _ => bail!("the daemon didn't say the worktree was removed"),
     }
-    let branch = git::Checkout::find(path).and_then(|checkout| checkout.worktree().branch);
-    git::remove_worktree(path, force)?;
-    tell_worktree(socket, path, branch, false);
-    for session in ended {
-        let kill = Request::Kill {
-            name: session.name.clone(),
-        };
-        ask(socket, &kill, false)?;
-    }
-    Ok(())
 }
 
 /// Makes a worktree for `branch` in the repository `dir` is in, as
@@ -507,14 +491,6 @@ impl Iterator for Subscription {
     fn next(&mut self) -> Option<Result<Event>> {
         self.next_before(None).transpose()
     }
-}
-
-/// Whether `session` runs in the worktree at `path`.
-fn runs_in(session: &SessionInfo, path: &Path) -> bool {
-    session
-        .worktree
-        .as_ref()
-        .is_some_and(|worktree| worktree.path == path)
 }
 
 /// Has the TUI used last carry out a layout command, or with none open the
