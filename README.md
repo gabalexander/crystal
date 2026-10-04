@@ -403,9 +403,10 @@ its time in the sidebar until you look at it, rings your terminal from the TUI t
 flow run or an open pull request too; `Tab` keeps it to the sessions with one status: see [finding with
 `/`](#finding-with-).
 
-For a project on GitHub or GitLab, each worktree line shows its branch's open pull request, `#57` (a merge
-request, `!57`, on GitLab), with a mark for what matters most about it; `o` opens it in your browser, `O` lists
-the project's pull requests and `i` its issues: see [pull requests and issues](#pull-requests-and-issues).
+For a project on GitHub or GitLab, each worktree line shows its branch's pull request, `#57` (a merge request,
+`!57`, on GitLab), with a mark for what matters most about it, `merged` once it has; the tab bar counts the
+pull requests and issues open on the selected session's project; `o` opens its pull request in your browser,
+`O` lists the project's pull requests and `i` its issues: see [pull requests and issues](#pull-requests-and-issues).
 
 Everything is also a command, for scripts and for agents:
 
@@ -813,6 +814,12 @@ its branch, and for each pull request's diff, where only a file changing takes a
 starts open, a directory that holds only another reads as one row with it, like `src/tui`, and a directory's
 row shows how many lines change under it, and a `✓` once every file under it is reviewed; selected, it lists them.
 
+`/` filters the list as you type, the way the [file finder](#the-file-finder-and-the-tree-browser) matches: a few
+letters of a file's path, in order (`rfnd` keeps `src/billing/refund.rs`), and the header counts how many
+match. In the tree, it keeps the files that match and the directories they're in, all open. `↑` / `↓` still
+move through the files while you type; `Enter` keeps the filter and gives the keys back to the list, and `Esc`
+clears it, there or once you're back in the list, before a second `Esc` closes the diff.
+
 | Key | In the diff |
 |---|---|
 | `j` / `k`, `↓` / `↑` | the next or previous file |
@@ -824,18 +831,21 @@ row shows how many lines change under it, and a `✓` once every file under it i
 | `t` | the files as a tree of directories, or a list again |
 | `←` / `→`, `h` / `l` | in the tree: fold a directory or go up to the one it's in; open one or go into it |
 | `Enter` | in the tree: fold or open the directory |
-| `Esc` / `q` | back to the sidebar |
+| `/` | filter the files by a few letters of their paths: `Enter` keeps the filter, `Esc` clears it |
+| `Esc` / `q` | clear the filter, if there's one; back to the sidebar |
 
 The wheel scrolls the diff, and moves through the files over the list; a click on a directory folds or opens it.
 
 ### Pull requests and issues
 
-For a project whose remote is on GitHub or GitLab, each worktree line shows its branch's open pull request when
-there is one: `#57`, or on GitLab, where it's a merge request, `!57`, and a mark for what matters most about it,
-in this order:
+For a project whose remote is on GitHub or GitLab, each worktree line shows its branch's pull request when
+there is one, open or merged lately: `#57`, or on GitLab, where it's a merge request, `!57`, and a mark for what
+matters most about it, in this order:
 
 | Mark | Meaning |
 |---|---|
+| `merged` | it has merged: the worktree's work is in, and the worktree can go |
+| `conflicts` | its branch conflicts with the one it would merge into, so it can't merge as it stands |
 | `✗` | a check failed |
 | `±` | a reviewer asked for changes |
 | `draft` | it's still a draft |
@@ -843,9 +853,15 @@ in this order:
 | `✓` | approved |
 
 A pull request that's simply ready shows its number alone. `o` opens the selected session's pull request in your
-browser. crystal asks the forge's own command line tool, [`gh`](https://cli.github.com) for GitHub and
-[`glab`](https://gitlab.com/gitlab-org/cli) for GitLab, as soon as it sees a project and then once a minute,
-so your login works as it always does and crystal never sees a token. Which forge a project is on comes from
+browser. On the right of the [tab bar](#terminals-the-window-and-the-tab-bar), after the sessions, are how many
+pull requests and issues are open on the selected session's project, `3 prs · 5 issues` (`mrs` on GitLab):
+none says nothing, a list as long as the forge gives at once counts `100+`, and a narrow terminal leaves them
+out before the tabs, or what you have the bar show at its right, give way.
+
+crystal asks the forge's own command line tool, [`gh`](https://cli.github.com) for GitHub and
+[`glab`](https://gitlab.com/gitlab-org/cli) for GitLab, as soon as it sees a project and then once a minute for
+its pull requests (the open ones, and the last 20 merged) and every five minutes for its issues, so your login
+works as it always does and crystal never sees a token. Which forge a project is on comes from
 its `origin` remote (or its first, without one): `github.com`, or a host `gh` is logged in to, like a GitHub
 Enterprise, is GitHub; `gitlab.com`, or a host in glab's config, like a GitLab of your own, is GitLab.
 Without the tool, or logged out of it, or for a project on neither, nothing is shown; `o`, `O` and `i` say why.
@@ -853,17 +869,25 @@ Without the tool, or logged out of it, or for a project on neither, nothing is s
 #### Pull requests
 
 `O` lists the open pull requests of the selected session's project, with each one's author and branch, whether
-it's a draft, how its checks stand and what its reviewers decided. Under the list is the selected one, read
-whole: who wants to merge which branch into which, each of its checks, its description, and then its
-conversation, comments and reviews in the order they came. Typing filters the list by number, title, author or
-branch; `↑` / `↓` pick another, and `PageUp` / `PageDown` scroll what's under the list.
+it's a draft or conflicts with its base, how its checks stand and what its reviewers decided, then, below them
+and muted, the ones merged lately, marked `merged`. Under the list is the selected one, read whole: who wants to
+merge which branch into which, or merged it, whether it can merge as it stands, each of its checks, its
+description, and then its conversation, comments and reviews in the order they came. Typing filters the list by
+number, title, author or branch; `↑` / `↓` pick another, and `PageUp` / `PageDown` scroll what's under the list.
+The list opens on what the forge said last, and `Ctrl+R` asks again, the heading saying so until it answers.
+
+`hide_draft_prs` under `[forge]` in the [settings](#settings), or `hide drafts` in the [settings
+view](#the-settings-view), leaves drafts out of the list, the tab bar's count and what `/` finds, for what's
+asking to be reviewed; the heading says how many it hides. A worktree's own pull request shows on its line all
+the same.
 
 | Key | In the pull requests |
 |---|---|
-| `Enter` | open the [new-session panel](#starting-a-session) in the pull request's worktree, with the task `Work on pull request #57: <its title> (<its address>)` |
+| `Enter` | open the [new-session panel](#starting-a-session) in the pull request's worktree, with the task `Work on pull request #57: <its title> (<its address>)`; not on one that has merged |
 | `Ctrl+D` | its whole diff, in [the diff](#the-diff); `Esc` comes back to the list |
 | `Ctrl+C` | comment on it: `Enter` posts, `Alt+Enter` breaks a line, `Esc` puts the comment away |
 | `Ctrl+O` | open it in your browser |
+| `Ctrl+R` | ask the forge for the list again, and the selected one with it |
 | `Esc` | close the list |
 
 A pull request's worktree is the project's worktree on its branch, when there's one already; otherwise crystal
@@ -882,7 +906,7 @@ box, with why.
 
 `i` lists the open issues of the selected session's project, the latest to change first, with the selected
 issue under the list: its text, then what's been said on it. Typing filters them by number, title, label or
-author.
+author. It opens on the issues listed last, and `Ctrl+R` asks the forge again.
 
 | Key | In the issues |
 |---|---|
@@ -890,13 +914,15 @@ author.
 | `Ctrl+C` | comment on it: `Enter` posts, `Alt+Enter` breaks a line, `Esc` puts the comment away |
 | `Ctrl+E` | change its title and text: `Tab` goes between them, `Enter` saves both, `Esc` keeps them as they were |
 | `Ctrl+O` | open it in your browser |
+| `Ctrl+R` | ask the forge for the list again, and the selected one with it |
 | `Esc` | close the list |
 
 #### On GitLab
 
 Everything above works on a GitLab project, through `glab`, with merge requests where GitHub has pull requests.
 GitLab's list of merge requests doesn't say how their checks or reviews stand, so their worktree lines and rows
-show only `draft`; reading one shows its pipeline as its check, and an approval in its conversation. GitLab wants
+show only `merged`, `conflicts` and `draft`; reading one shows its pipeline as its check, and an approval in its
+conversation. GitLab wants
 a login to read comments, even on a project anyone can see: logged out, a merge request or an issue reads
 without them.
 
@@ -974,8 +1000,13 @@ long ago that was, then the branches on its remotes that have no branch of yours
 them, the way the file finder does; beside the list is the selected branch's last commit and what `Enter` would
 do with it. `Enter` switches to it; a remote's branch, like `origin/fix-login`, becomes a branch of your own,
 `fix-login`, that follows it. When nothing matches what you typed, `Enter` makes a branch by that name, from the
-commit the worktree is on, and switches to it, your changes coming along. The remotes' branches are as your last
-`git fetch` left them: the switcher doesn't go over the network.
+commit the worktree is on, and switches to it, your changes coming along.
+
+Once it has listed the branches, the switcher fetches every remote in the background, `git fetch --all`, at most
+once a minute for a worktree, and lists them again when that's done, the branch you picked still picked, so a
+branch someone else pushed is there to switch to; the header says `fetching…` meanwhile, or why it couldn't.
+`Ctrl+R` fetches again straight away. A fetch can't ask for a password or a passphrase, which would take the
+TUI's terminal: one that needs to fails instead, and so does one that takes longer than two minutes.
 
 When the worktree has changes not committed, the switcher stops and asks what's to become of them:
 
@@ -2210,6 +2241,7 @@ file and change. A setting crystal doesn't know is an error that names it, so a 
 | `[events]` | | `keep_days`, how long the [event log](#events) keeps what happened: 30 days, or `0` for ever |
 | `[handoff]` | | `in_git`, the projects, by their main worktree, whose [handoff notes](#the-handoff-file) go in git |
 | `[worktrees]` | | `base`, the branch new worktrees' new branches [start from](#usage): `origin`'s default branch unless set |
+| `[forge]` | | `hide_draft_prs`, leave draft pull requests out of [the pull requests](#pull-requests), the tab bar's count and `/` (`false`) |
 | `[sessions]` | | `stop_idle_after`, how long an agent may sit [idle](#archiving-and-idle-agents) before crystal stops it, like `"30m"`: `"off"`; `restart_spacing_ms`, how far apart the agents a [crash or a reboot](#usage) starts again start (`250`, or `0` for all at once) |
 | `[[project]]` | | a project's [run and open commands](#projects), by its main worktree's `path`, in place of its own file's |
 | `[keys]` | | the TUI's keys, by command, its prefix and the key back to the sidebar: [keys and commands](#keys-and-commands) |
@@ -2242,8 +2274,8 @@ each time one starts, `[[project]]` each time a project's commands run,
 `scrollback_lines` as each session starts, so a change counts straight away (a session already running keeps
 what it had); `crystal new` and the TUI read `[terminal]` each time they start a shell; the TUI reads
 `new_session`, `theme`, `[colors]`, `[appearance]`, `[window]`, `[tab_bar]`, `scrollback_lines`, `[plugins]`,
-`[update]`, `[mouse]`, the profiles and the flows when it starts, again when you save a profile or switch a
-plugin, and every half a second while the settings view is open.
+`[update]`, `[mouse]`, `[forge]`, the profiles and the flows when it starts, again when you save a profile or
+switch a plugin, and every half a second while the settings view is open.
 
 #### Themes
 
@@ -2378,12 +2410,15 @@ like the ` · ` of `crystal · {session}` with no session. An empty `title` leav
 `crystal title clear`. The terminal's title from before is saved as the TUI starts and put back as it ends, by
 a terminal that keeps a stack of them (xterm's, kitty, WezTerm, iTerm2…).
 
-`right` lists what the tab bar shows after the count, in order, `separator` between them: `hostname`, this
+`right` lists what the tab bar shows after the count (and after the count of [pull requests and
+issues](#pull-requests-and-issues) open on the selected session's project), in order, `separator` between
+them: `hostname`, this
 machine's name; `clock`, the time as `strftime` writes `format` (`%H:%M` unless given); `text`; and
 `command`, the last line a shell command prints, run in the directory you started `crystal` in with
 `CRYSTAL_SOCKET` set, again `every` while (`10s` unless given), stopped once it takes `timeout` (`2s`), its
 colors and other escape sequences taken out, and nothing when it fails. Something with nothing to say is left
-out, and on a bar too narrow for it and the tabs, all of it is, the tabs coming first.
+out, and on a bar too narrow for it and the tabs, all of it is, the tabs coming first; the pull requests and
+issues give way before it.
 
 #### The settings view
 
@@ -2391,12 +2426,13 @@ out, and on a bar too narrow for it and the tabs, all of it is, the tabs coming 
 sounds, the theme and whether it follows your system's [appearance](#themes) (the row says which theme each
 side is), whether the [tab bar](#terminals-the-window-and-the-tab-bar) goes on top or over the footer and is
 left out with one tab, how long an agent may sit [idle](#archiving-and-idle-agents), how far apart agents
-start again after a [crash or a reboot](#usage), [the mouse](#usage), and how memory learns ([the
-distiller](#the-distiller)) and searches ([by meaning](#search-by-meaning)). `space` changes the one the bar
-is on, and `←/→` go through the [themes](#themes), forward and back (the row says which of the twenty it's
-on), the waits before a notification, the times an agent may sit idle: off, 15 minutes, 30, an hour, two or
-eight, the spacing of restarts: all at once, 100 milliseconds, 250, 500, a second or two, and how far a notch
-of the wheel scrolls: 1, 2, 3, 5 or 10 lines. Each change is written to the file at once,
+start again after a [crash or a reboot](#usage), [the mouse](#usage), how memory learns ([the
+distiller](#the-distiller)) and searches ([by meaning](#search-by-meaning)), and whether [draft pull
+requests](#pull-requests) are hidden. `space` changes the one the bar is on, and `←/→` go through the
+[themes](#themes), forward and back (the row says which of the twenty it's on), the waits before a
+notification, the times an agent may sit idle: off, 15 minutes, 30, an hour, two or eight, the spacing of
+restarts: all at once, 100 milliseconds, 250, 500, a second or two, and how far a notch of the wheel scrolls:
+1, 2, 3, 5 or 10 lines. Each change is written to the file at once,
 keeping the rest of it as you wrote it, comments and all, and counts straight away: the TUI repaints in a new
 theme, and the daemon reads the rest as it goes. On a screen too short for every row, the view scrolls to keep
 the one the bar is on in sight.

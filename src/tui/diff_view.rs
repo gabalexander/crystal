@@ -11,13 +11,17 @@
 //!
 //! A file read can be marked reviewed, `r`: it sinks to the bottom of the
 //! list with a ✓, until it changes again (see [`review`]). `t` folds the
-//! list into a tree of directories ([`Tree`]), and back.
+//! list into a tree of directories ([`Tree`]), and back. `/` filters the
+//! list as you type, by a few letters of a file's path, the way the file
+//! finder matches ([`fuzzy`]).
 
 use super::app::{Action, Hit, Loading, Outcome};
 use super::diff::{self, Body, DiffLine, FileDiff, FileStatus, Layout, LineKind, Row};
 use super::diff_tree::{Kind, Tree};
+use super::fuzzy;
 use super::review::{Marks, Scope};
 use super::sidebar::fit;
+use super::text_input::TextInput;
 use super::theme::Theme;
 use super::ui::{self, Look, ViewAreas};
 use crate::forge::{Forge, Repo};
@@ -40,6 +44,10 @@ const WHEEL_ROWS: usize = 3;
 
 /// How wide a tab is drawn.
 const TAB: &str = "    ";
+
+/// The rows the filter takes at the top of the list while it's shown: the
+/// filter, and a rule under it.
+const FILTER_ROWS: u16 = 2;
 
 /// What the diff compares the worktree with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -161,6 +169,11 @@ pub struct DiffView {
     /// is once they're read.
     as_tree: bool,
     tree: Option<Tree>,
+    /// What the list is filtered by: a few letters of a file's path.
+    filter: TextInput,
+    /// Whether the filter has the keyboard. What it holds keeps filtering
+    /// once Enter hands the keyboard back to the list.
+    filtering: bool,
     /// The selected row of the list.
     pub selected: usize,
     /// How many rows down the selected file's diff is scrolled.
@@ -190,6 +203,8 @@ impl DiffView {
             reviewed: Marks::new(),
             as_tree,
             tree: None,
+            filter: TextInput::default(),
+            filtering: false,
             selected: 0,
             scroll: 0,
             size: (24, 80),
@@ -239,7 +254,7 @@ impl DiffView {
             }
             Err(err) => Loading::Failed(err),
         };
-        self.tree = self.as_tree.then(|| Tree::new(&self.paths()));
+        self.tree = self.as_tree.then(|| self.tree_of_shown());
         self.selected = self.first_unreviewed();
         self.scroll = 0;
     }
@@ -271,12 +286,47 @@ impl DiffView {
         }
     }
 
-    fn paths(&self) -> Vec<&str> {
-        self.files().iter().map(|file| file.path.as_str()).collect()
+    /// The files the filter keeps, by their places in the diff: all of
+    /// them, with nothing typed.
+    fn shown_files(&self) -> Vec<usize> {
+        let query = self.filter.text();
+        let files = self.files().iter().enumerate();
+        files
+            .filter(|(_, file)| {
+                query.trim().is_empty() || fuzzy::score(&file.path, query).is_some()
+            })
+            .map(|(at, _)| at)
+            .collect()
     }
 
-    /// The rows of the list, top to bottom: the files, those reviewed
-    /// last, or, as a tree, its rows.
+    /// The files the filter keeps as a tree, every directory open.
+    fn tree_of_shown(&self) -> Tree {
+        let files = self.files();
+        let shown: Vec<(usize, &str)> = self
+            .shown_files()
+            .into_iter()
+            .map(|at| (at, files[at].path.as_str()))
+            .collect();
+        Tree::of(&shown)
+    }
+
+    /// Whether something's typed in the filter.
+    pub fn filtered(&self) -> bool {
+        !self.filter.text().trim().is_empty()
+    }
+
+    /// The rows the filter takes at the top of the list: none until
+    /// something's typed or it has the keyboard.
+    fn filter_rows(&self) -> u16 {
+        if self.filtering || !self.filter.text().is_empty() {
+            FILTER_ROWS
+        } else {
+            0
+        }
+    }
+
+    /// The rows of the list, top to bottom: the files the filter keeps,
+    /// those reviewed last, or, as a tree, its rows.
     pub fn entries(&self) -> Vec<Entry> {
         if let Some(tree) = &self.tree {
             return tree
@@ -288,7 +338,7 @@ impl DiffView {
                 })
                 .collect();
         }
-        let mut files: Vec<usize> = (0..self.files().len()).collect();
+        let mut files = self.shown_files();
         files.sort_by_key(|file| self.is_reviewed(*file));
         files.into_iter().map(Entry::File).collect()
     }
@@ -334,10 +384,20 @@ impl DiffView {
     }
 
     pub fn on_key(&mut self, key: KeyEvent) -> Outcome {
+        if self.filtering {
+            self.on_filter_key(key);
+            return Outcome::Stay;
+        }
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         let page = self.page();
         match key.code {
+            // Esc clears a filter before it closes the view.
+            KeyCode::Esc if self.filtered() => {
+                self.filter = TextInput::default();
+                self.filter_again();
+            }
             KeyCode::Esc | KeyCode::Char('q') => return Outcome::Close,
+            KeyCode::Char('/') => self.filtering = true,
             KeyCode::Char('j') | KeyCode::Down => self.select(self.selected + 1),
             KeyCode::Char('k') | KeyCode::Up => self.select(self.selected.saturating_sub(1)),
             KeyCode::Char(' ') if shift => self.scroll_up(page),
@@ -357,6 +417,63 @@ impl DiffView {
             _ => {}
         }
         Outcome::Stay
+    }
+
+    /// Keys while the filter has the keyboard: Enter keeps what's typed and
+    /// gives the keys back to the list, Esc empties it, the arrows still
+    /// move through the files, and the rest edit it.
+    fn on_filter_key(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Enter => self.filtering = false,
+            KeyCode::Esc => {
+                self.filtering = false;
+                self.filter = TextInput::default();
+                self.filter_again();
+            }
+            KeyCode::Down => self.select(self.selected + 1),
+            KeyCode::Up => self.select(self.selected.saturating_sub(1)),
+            KeyCode::Char('n') if ctrl => self.select(self.selected + 1),
+            KeyCode::Char('p') if ctrl => self.select(self.selected.saturating_sub(1)),
+            _ => {
+                let before = self.filter.text().to_string();
+                self.filter.on_key(&key);
+                if self.filter.text() != before {
+                    self.filter_again();
+                }
+            }
+        }
+    }
+
+    /// Pasted text goes into the filter, which opens for it.
+    pub fn on_paste(&mut self, text: &str) {
+        self.filtering = true;
+        self.filter.insert_str(text);
+        self.filter_again();
+    }
+
+    /// Lists the files the filter keeps now, the selection staying on its
+    /// file while it's kept, or else on the first not reviewed yet. In the
+    /// tree, every directory opens again.
+    fn filter_again(&mut self) {
+        let file = match self.selected_entry() {
+            Some(Entry::File(file)) => Some(file),
+            _ => None,
+        };
+        if self.tree.is_some() {
+            self.tree = Some(self.tree_of_shown());
+        }
+        let kept = file.and_then(|file| {
+            let entries = self.entries();
+            entries.iter().position(|entry| *entry == Entry::File(file))
+        });
+        match kept {
+            Some(row) => self.selected = row,
+            None => {
+                self.selected = self.first_unreviewed();
+                self.scroll = 0;
+            }
+        }
     }
 
     /// The wheel scrolls the diff, or, over the list, moves through the
@@ -481,7 +598,7 @@ impl DiffView {
         };
         self.as_tree = !self.as_tree;
         self.tree = match &self.diff {
-            Loading::Read(_) if self.as_tree => Some(Tree::new(&self.paths())),
+            Loading::Read(_) if self.as_tree => Some(self.tree_of_shown()),
             _ => None,
         };
         let row = match (&mut self.tree, file) {
@@ -610,6 +727,13 @@ pub fn list_width(width: u16) -> u16 {
 
 /// The keys the footer shows while the diff is open.
 pub fn hints(view: &DiffView) -> Vec<(&'static str, &'static str)> {
+    if view.filtering {
+        return vec![
+            ("enter", "keep the filter"),
+            ("esc", "clear it"),
+            ("↑/↓", "file"),
+        ];
+    }
     let layout = match view.wanted {
         Layout::Unified => "side by side",
         Layout::SideBySide => "unified",
@@ -632,13 +756,22 @@ pub fn hints(view: &DiffView) -> Vec<(&'static str, &'static str)> {
     } else {
         hints.push(("t", "tree"));
     }
-    hints.push(("esc", "close"));
+    hints.push(("/", "filter"));
+    if view.filtered() {
+        hints.push(("esc", "clear the filter"));
+    } else {
+        hints.push(("esc", "close"));
+    }
     hints
 }
 
 /// Which row of the list is on screen `row`, in a list drawn in `area`.
 pub fn list_hit(view: &DiffView, area: Rect, row: u16) -> Hit {
-    let index = list_offset(view.selected, area.height) + usize::from(row - area.y);
+    let Some(row) = (row - area.y).checked_sub(view.filter_rows()) else {
+        return Hit::Elsewhere;
+    };
+    let height = area.height.saturating_sub(view.filter_rows());
+    let index = list_offset(view.selected, height) + usize::from(row);
     if index < view.entries().len() {
         Hit::ViewList(index)
     } else {
@@ -678,7 +811,21 @@ pub fn draw(frame: &mut Frame, view: &DiffView, look: &Look, areas: &ViewAreas) 
         ui::draw_message(frame, look, message, areas.content);
         return;
     }
-    draw_list(frame, view, look, areas.list);
+    let filter_rows = view.filter_rows();
+    if filter_rows > 0 {
+        draw_filter(frame, view, look, areas.list);
+    }
+    let list = Rect::new(
+        areas.list.x,
+        areas.list.y + filter_rows,
+        areas.list.width,
+        areas.list.height.saturating_sub(filter_rows),
+    );
+    if view.entries().is_empty() {
+        ui::draw_message(frame, look, "no file matches", list);
+        return;
+    }
+    draw_list(frame, view, look, list);
     match view.selected_entry() {
         Some(Entry::File(file)) => draw_file(frame, view, &files[file], look, areas.content),
         Some(Entry::Dir(node)) => draw_dir(frame, view, node, look, areas.content),
@@ -686,8 +833,8 @@ pub fn draw(frame: &mut Frame, view: &DiffView, look: &Look, areas: &ViewAreas) 
     }
 }
 
-/// "± uncommitted changes · 3 files +41 −9 · 1 reviewed", and where on the
-/// right.
+/// "± uncommitted changes · 3 files +41 −9 · 1 reviewed · 2 match", and
+/// where on the right.
 fn header<'a>(view: &DiffView, look: &Look, width: u16) -> Line<'a> {
     let title = match (&view.against, &view.diff) {
         (Against::Uncommitted, _) => "uncommitted changes".to_string(),
@@ -713,7 +860,35 @@ fn header<'a>(view: &DiffView, look: &Look, width: u16) -> Line<'a> {
     if reviewed > 0 {
         notes.push(format!("{reviewed} reviewed"));
     }
+    if view.filtered() {
+        notes.push(format!("{} match", view.shown_files().len()));
+    }
     ui::view_header("±", &title, &notes, &view.place, look, width)
+}
+
+/// The filter, with the cursor in it while it has the keyboard, and a rule
+/// under it.
+fn draw_filter(frame: &mut Frame, view: &DiffView, look: &Look, list: Rect) {
+    let theme = look.theme;
+    let prompt = " / ";
+    let line = Line::from(vec![
+        Span::styled(
+            prompt,
+            Style::new().fg(theme.accent).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(view.filter.text().to_string(), Style::new().fg(theme.text)),
+    ]);
+    frame.render_widget(line, Rect::new(list.x, list.y, list.width, 1));
+    let rule = "─".repeat(usize::from(list.width));
+    frame.render_widget(
+        Line::styled(rule, Style::new().fg(theme.rule)),
+        Rect::new(list.x, list.y + 1, list.width, 1),
+    );
+    if view.filtering {
+        // The prompt is three columns wide.
+        let column = list.x + 3 + view.filter.cursor() as u16;
+        frame.set_cursor_position((column.min(list.right().saturating_sub(1)), list.y));
+    }
 }
 
 /// "3 files +41 −9".
@@ -1434,5 +1609,93 @@ mod tests {
             [("let total = ", false), ("1", true), (";", false)]
         );
         assert_eq!(pieces("same", &[]), [("same", false)]);
+    }
+
+    fn type_text(view: &mut DiffView, text: &str) {
+        for letter in text.chars() {
+            view.on_key(key(KeyCode::Char(letter)));
+        }
+    }
+
+    #[test]
+    fn slash_filters_the_files_and_esc_clears_the_filter_before_closing() {
+        let files = vec![
+            file("src/billing/refund.rs", 1),
+            file("src/billing/invoice.rs", 1),
+            file("README.md", 1),
+        ];
+        let mut view = view_with(files);
+        view.on_key(key(KeyCode::Down));
+        assert_eq!(
+            selected_path(&view).as_deref(),
+            Some("src/billing/invoice.rs")
+        );
+        // Letters are the list's keys until `/`.
+        assert_eq!(view.on_key(key(KeyCode::Char('/'))), Outcome::Stay);
+        type_text(&mut view, "rfnd");
+        assert_eq!(listed(&view), ["src/billing/refund.rs"]);
+        assert_eq!(
+            selected_path(&view).as_deref(),
+            Some("src/billing/refund.rs")
+        );
+        // Enter keeps the filter and gives the keys back to the list.
+        view.on_key(key(KeyCode::Enter));
+        assert_eq!(hints(&view).last(), Some(&("esc", "clear the filter")));
+        view.on_key(key(KeyCode::Char('j')));
+        assert_eq!(listed(&view), ["src/billing/refund.rs"]);
+        assert_eq!(view.on_key(key(KeyCode::Esc)), Outcome::Stay);
+        assert_eq!(listed(&view).len(), 3);
+        assert_eq!(
+            selected_path(&view).as_deref(),
+            Some("src/billing/refund.rs")
+        );
+        assert_eq!(view.on_key(key(KeyCode::Esc)), Outcome::Close);
+    }
+
+    #[test]
+    fn the_filter_keeps_the_selection_on_its_file_while_it_matches() {
+        let mut view = view_with(vec![file("a/one.rs", 1), file("b/two.rs", 1)]);
+        view.on_key(key(KeyCode::Down));
+        view.on_paste("o");
+        // Both match; the selection stays on `b/two.rs`.
+        assert_eq!(listed(&view).len(), 2);
+        assert_eq!(selected_path(&view).as_deref(), Some("b/two.rs"));
+        type_text(&mut view, "zzz");
+        assert!(view.entries().is_empty());
+        assert_eq!(view.file(), None);
+        // Escape empties it, and every file is back.
+        view.on_key(key(KeyCode::Esc));
+        assert_eq!(listed(&view).len(), 2);
+    }
+
+    #[test]
+    fn in_the_tree_the_filter_keeps_the_files_that_match_and_their_directories() {
+        let files = vec![
+            file("src/billing/refund.rs", 1),
+            file("src/billing/invoice.rs", 1),
+            file("docs/refunds.md", 1),
+        ];
+        let mut view = view_reviewed(files, &[], true);
+        view.on_key(key(KeyCode::Char('/')));
+        type_text(&mut view, "inv");
+        assert_eq!(listed(&view), ["src/billing/", "src/billing/invoice.rs"]);
+        assert_eq!(
+            selected_path(&view).as_deref(),
+            Some("src/billing/invoice.rs")
+        );
+        // Back to the list, flat, the filter still holds.
+        view.on_key(key(KeyCode::Enter));
+        view.on_key(key(KeyCode::Char('t')));
+        assert_eq!(listed(&view), ["src/billing/invoice.rs"]);
+    }
+
+    #[test]
+    fn a_click_on_the_list_counts_the_filters_rows() {
+        let mut view = view_with(vec![file("a.rs", 1), file("b.rs", 1)]);
+        let area = Rect::new(0, 2, 30, 10);
+        assert_eq!(list_hit(&view, area, 3), Hit::ViewList(1));
+        view.on_key(key(KeyCode::Char('/')));
+        assert_eq!(list_hit(&view, area, 3), Hit::Elsewhere);
+        assert_eq!(list_hit(&view, area, 4), Hit::ViewList(0));
     }
 }

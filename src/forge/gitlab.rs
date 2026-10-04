@@ -4,15 +4,16 @@
 //!
 //! Where GitLab's answers differ: a number is a merge request's `iid`, a
 //! link its `web_url`, a person their `username`, and a description its
-//! `description`. The list carries no checks or reviews; reading one merge
+//! `description`. The list carries no checks or reviews, though it does
+//! say whether one has conflicts; reading one merge
 //! request gives its head pipeline, as its one check, and its notes, where
 //! an approval is a note GitLab writes itself, `approved this merge
 //! request`. A fork's owner isn't named, so its worktree's branch is
 //! `mr-57/<branch>`.
 
 use super::{
-    Check, CheckState, Checks, Comment, Forge, Issue, IssueDetail, LIMIT, PullRequest,
-    PullRequestDetail, Review, Topic, list, parse, run, text,
+    Check, CheckState, Checks, Comment, Forge, Issue, IssueDetail, LIMIT, MERGED_LIMIT,
+    PullRequest, PullRequestDetail, Review, Topic, list, parse, run, text,
 };
 use serde::Deserialize;
 use std::path::Path;
@@ -20,8 +21,16 @@ use std::path::Path;
 const FORGE: Forge = Forge::GitLab;
 
 pub(super) fn pull_requests(dir: &Path) -> Result<Vec<PullRequest>, String> {
-    let json = glab(dir, &["mr", "list", "-F", "json", "-P", LIMIT])?;
+    let limit = LIMIT.to_string();
+    let json = glab(dir, &["mr", "list", "-F", "json", "-P", &limit])?;
     parse_merge_requests(&json)
+}
+
+/// The merge requests merged lately.
+pub(super) fn merged_pull_requests(dir: &Path) -> Result<Vec<PullRequest>, String> {
+    let limit = MERGED_LIMIT.to_string();
+    let args = ["mr", "list", "--merged", "-F", "json", "-P", &limit];
+    parse_merge_requests(&glab(dir, &args)?)
 }
 
 pub(super) fn pull_request(dir: &Path, number: u64) -> Result<PullRequestDetail, String> {
@@ -36,7 +45,8 @@ pub(super) fn diff(dir: &Path, number: u64) -> Result<String, String> {
 
 pub(super) fn issues(dir: &Path) -> Result<Vec<Issue>, String> {
     // `issue list` takes its JSON switch as `-O`: its `-F` is another.
-    let json = glab(dir, &["issue", "list", "-O", "json", "-P", LIMIT])?;
+    let limit = LIMIT.to_string();
+    let json = glab(dir, &["issue", "list", "-O", "json", "-P", &limit])?;
     parse_issues(&json)
 }
 
@@ -118,6 +128,8 @@ struct ListedMergeRequest {
     #[serde(default)]
     work_in_progress: bool,
     #[serde(default)]
+    has_conflicts: bool,
+    #[serde(default)]
     source_project_id: Option<u64>,
     #[serde(default)]
     target_project_id: Option<u64>,
@@ -152,6 +164,8 @@ fn pull_request_of(listed: ListedMergeRequest) -> PullRequest {
         from_fork,
         local_branch,
         draft,
+        conflicts: listed.has_conflicts,
+        merged: false,
         checks: Checks::None,
         review: Review::None,
         updated_at: listed.updated_at,
@@ -343,7 +357,8 @@ mod tests {
         "author": {"username": "bo"}, "source_branch": "main",
         "source_project_id": 9, "target_project_id": 7,
         "updated_at": "2026-10-01T09:30:00Z",
-        "web_url": "https://gitlab.com/acme/app/-/merge_requests/58"
+        "web_url": "https://gitlab.com/acme/app/-/merge_requests/58",
+        "has_conflicts": true
     }]"#;
 
     #[test]
@@ -357,8 +372,10 @@ mod tests {
         assert_eq!(draft.author, "ana");
         assert_eq!(draft.local_branch, "fix-login");
         assert_eq!(draft.checks, Checks::None);
+        assert!(!draft.conflicts);
         let fork = &listed[1];
         assert!(fork.from_fork);
+        assert!(fork.conflicts);
         assert_eq!(fork.local_branch, "mr-58/main");
         assert_eq!(
             fork.checkout(Path::new("/code/app")).fetch,

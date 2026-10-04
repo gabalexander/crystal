@@ -2,8 +2,8 @@
 //! session's project on its forge, the latest to change first, filtered as
 //! you type, with the highlighted issue read under the list: its text, then
 //! what's been said on it. Enter goes on to start a session for it; Ctrl+C
-//! comments on it, Ctrl+E changes its title and text, and Ctrl+O opens it
-//! in the browser.
+//! comments on it, Ctrl+E changes its title and text, Ctrl+O opens it in
+//! the browser, and Ctrl+R asks the forge again.
 //!
 //! The state here is plain data, kept apart from I/O: the list, the bar and
 //! what's been read are a [`Listing`], and what's being written goes to the
@@ -56,6 +56,8 @@ pub enum Step {
         title: String,
         body: String,
     },
+    /// Ask the forge for the list again, and the highlighted one with it.
+    Refresh,
     /// Tell the user this, at the bottom.
     Say(String),
 }
@@ -76,13 +78,19 @@ pub struct IssuesView {
 }
 
 impl IssuesView {
-    /// The view for the project at `project`, waiting for its issues.
-    pub fn new(project: PathBuf, project_name: String, forge: Forge) -> IssuesView {
+    /// The view for the project at `project`, with `known`, the issues
+    /// listed last, until the forge lists them again.
+    pub fn new(
+        project: PathBuf,
+        project_name: String,
+        forge: Forge,
+        known: Option<Vec<Issue>>,
+    ) -> IssuesView {
         IssuesView {
             project,
             project_name,
             forge,
-            list: Listing::new(None),
+            list: Listing::new(known),
             comment: None,
             form: None,
         }
@@ -103,7 +111,8 @@ impl IssuesView {
     /// Keys while the view is open: the comment box's or the form's while
     /// one is open; else Esc closes it, Enter starts a session for the
     /// issue the bar is on, Ctrl+C, Ctrl+E and Ctrl+O comment on it, change
-    /// it and open it in the browser, and the list takes the rest.
+    /// it and open it in the browser, Ctrl+R asks for the list again, and
+    /// the list takes the rest.
     pub fn on_key(&mut self, key: &KeyEvent) -> Step {
         if let Some(comment) = &mut self.comment {
             return match comment.on_key(key) {
@@ -136,6 +145,10 @@ impl IssuesView {
         let highlighted = self.list.highlighted().cloned();
         match (key.code, highlighted) {
             (KeyCode::Esc, _) => Step::Close,
+            (KeyCode::Char('r'), _) if ctrl => {
+                self.list.ask_again();
+                Step::Refresh
+            }
             (KeyCode::Enter, Some(issue)) => Step::Start(issue),
             (KeyCode::Char('o'), Some(issue)) if ctrl => Step::Open(issue.number),
             (KeyCode::Char('c'), Some(issue)) if ctrl => {
@@ -221,6 +234,7 @@ pub fn hints(view: &IssuesView) -> &'static [(&'static str, &'static str)] {
             ("ctrl+c", "comment"),
             ("ctrl+e", "edit"),
             ("ctrl+o", "open"),
+            ("ctrl+r", "refresh"),
             ("esc", "close"),
         ]
     }
@@ -282,11 +296,12 @@ pub fn ago_from(time: &str, now: u64) -> String {
 /// `now` is seconds since the Unix epoch.
 pub fn draw(frame: &mut Frame, view: &IssuesView, theme: &Theme, now: u64, area: Rect) {
     let [heading, filter, rest] = listing::frame_areas(frame, theme, area);
-    let open = match view.list.items() {
-        Some(Ok(_)) => Some(view.list.shown().len()),
-        _ => None,
-    };
-    listing::draw_heading(frame, theme, "issues", &view.project_name, open, heading);
+    let mut said = Vec::new();
+    if let Some(Ok(_)) = view.list.items() {
+        said.push(format!("{} open", view.list.shown().len()));
+    }
+    said.extend(view.list.asking_note(view.forge.name()));
+    listing::draw_heading(frame, theme, "issues", &view.project_name, &said, heading);
     let writing = view.comment.is_some() || view.form.is_some();
     listing::draw_filter(frame, theme, &view.list.filter, !writing, filter);
 
@@ -438,7 +453,12 @@ mod tests {
     }
 
     fn view_of(issues: Vec<Issue>) -> IssuesView {
-        let mut view = IssuesView::new(PathBuf::from("/code/app"), "app".into(), Forge::GitHub);
+        let mut view = IssuesView::new(
+            PathBuf::from("/code/app"),
+            "app".into(),
+            Forge::GitHub,
+            None,
+        );
         view.set_issues(Ok((Forge::GitHub, issues)));
         view
     }
@@ -493,6 +513,18 @@ mod tests {
         let mut view = view_of(vec![issue(42, "Login loops", "bug")]);
         type_text(&mut view, "ana");
         assert_eq!(view.list.shown().len(), 1);
+    }
+
+    #[test]
+    fn ctrl_r_asks_again_for_the_issues_and_reads_the_highlighted_one_again() {
+        let mut view = view_of(vec![issue(42, "Login loops", "bug")]);
+        assert_eq!(view.list.detail_to_fetch(), Some(42));
+        assert_eq!(ctrl(&mut view, 'r'), Step::Refresh);
+        assert_eq!(
+            view.list.asking_note("GitHub").as_deref(),
+            Some("asking GitHub…")
+        );
+        assert_eq!(view.list.detail_to_fetch(), Some(42));
     }
 
     #[test]

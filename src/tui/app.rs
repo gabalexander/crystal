@@ -532,6 +532,12 @@ pub enum Action {
     /// List the branches of the worktree at this directory, and its
     /// changes, off the event loop.
     ListBranches(PathBuf),
+    /// Fetch the remotes of the worktree at `dir`, off the event loop:
+    /// `now`, or unless they were a moment ago.
+    FetchBranches {
+        dir: PathBuf,
+        now: bool,
+    },
     /// Move the worktree at `dir` onto `target`, its changes going as
     /// `carry` says, off the event loop.
     SwitchBranch {
@@ -704,6 +710,33 @@ pub enum Found {
     PullRequest { project: PathBuf, number: u64 },
 }
 
+/// How many pull requests and issues are open on a project's forge, for
+/// the tab bar: each `None` until its forge has listed them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OpenOnForge {
+    pub forge: Forge,
+    pub pull_requests: Option<Counted>,
+    pub issues: Option<Counted>,
+}
+
+/// How many of something there are to show, and whether the forge listed
+/// as many as it gives at once, so there may be more beyond them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Counted {
+    pub count: usize,
+    pub more: bool,
+}
+
+impl Counted {
+    /// `count` shown, of `listed` the forge listed.
+    fn of(count: usize, listed: usize) -> Counted {
+        Counted {
+            count,
+            more: listed >= forge::LIMIT,
+        }
+    }
+}
+
 pub struct App {
     /// In the sidebar's order: see [`groups`].
     sessions: Vec<SessionInfo>,
@@ -804,10 +837,15 @@ pub struct App {
     screen: Rect,
     /// `/`'s filter on the sidebar, while it's open.
     filter: Option<Filter>,
-    /// What its forge said about each project's open pull requests, by the
-    /// project's main worktree: the forge and the pull requests, or why
-    /// there are none to show.
+    /// What its forge said about each project's open pull requests, and
+    /// those merged lately, by the project's main worktree: the forge and
+    /// the pull requests, or why there are none to show.
     pull_requests: HashMap<PathBuf, Result<(Forge, Vec<PullRequest>), String>>,
+    /// What its forge said about each project's open issues, the same way.
+    open_issues: HashMap<PathBuf, Result<(Forge, Vec<Issue>), String>>,
+    /// Whether draft pull requests are left out of the pull requests view,
+    /// the tab bar's count and `/`, as the settings say.
+    hide_draft_prs: bool,
     /// The issues view, while it's open.
     issues: Option<IssuesView>,
     /// The pull requests view, while it's open.
@@ -995,6 +1033,8 @@ impl App {
             screen: Rect::new(0, 0, 80, 24),
             filter: None,
             pull_requests: HashMap::new(),
+            open_issues: HashMap::new(),
+            hide_draft_prs: false,
             issues: None,
             pull_requests_view: None,
             view: None,
@@ -1195,6 +1235,7 @@ impl App {
         self.memory_on = crate::memory::enabled(config);
         self.profiles_on = profile::enabled(config);
         self.github_on = forge::enabled(config);
+        self.hide_draft_prs = config.forge.hide_draft_prs;
         self.flows_on = flows::enabled(config);
     }
 
@@ -1532,10 +1573,25 @@ impl App {
     }
 
     /// Takes the branches listed for the branch switcher, if it's still
-    /// open on their worktree.
-    pub fn branches_listed(&mut self, dir: &Path, listed: Result<switcher::Listed, String>) {
-        if let Some(View::Branches(switcher)) = &mut self.view {
-            switcher.listed_done(dir, listed);
+    /// open on their worktree, and what that asks for next: listed the
+    /// first time, the remotes fetched.
+    pub fn branches_listed(
+        &mut self,
+        dir: &Path,
+        listed: Result<switcher::Listed, String>,
+    ) -> Option<Action> {
+        match &mut self.view {
+            Some(View::Branches(switcher)) => switcher.listed_done(dir, listed),
+            _ => None,
+        }
+    }
+
+    /// The remotes of the worktree at `dir` have been fetched, or why they
+    /// couldn't, for the switcher, if it's still open on it.
+    pub fn branches_fetched(&mut self, dir: &Path, fetched: Result<(), String>) -> Option<Action> {
+        match &mut self.view {
+            Some(View::Branches(switcher)) => switcher.fetched(dir, fetched),
+            _ => None,
         }
     }
 
@@ -1852,8 +1908,9 @@ impl App {
     }
 
     /// The rows of the open pull requests of the project at `project`,
-    /// called `name`, that match `query`, as its forge listed them: none
-    /// while the github plugin is off, or before its forge has said.
+    /// called `name`, that match `query`, as its forge listed them, but the
+    /// drafts while the settings hide them: none while the github plugin is
+    /// off, or before its forge has said.
     fn found_pull_requests(&self, query: &str, project: &Path, name: &str) -> Vec<Row> {
         if !self.github_on {
             return Vec::new();
@@ -1863,6 +1920,8 @@ impl App {
         };
         pull_requests
             .iter()
+            .filter(|pull_request| !pull_request.merged)
+            .filter(|pull_request| !(self.hide_draft_prs && pull_request.draft))
             .filter(|pull_request| search::pull_request_match(query, pull_request, name).is_some())
             .map(|pull_request| Row::PullRequest {
                 project: project.to_path_buf(),
@@ -2262,8 +2321,8 @@ impl App {
         self.keep_filter_bar_on_a_match();
     }
 
-    /// The open pull request for `branch` in the project at `project`, if
-    /// its forge knows of one.
+    /// The pull request for `branch` in the project at `project`, if its
+    /// forge knows of one: the open one, or else one merged lately.
     pub fn pull_request(&self, project: &Path, branch: &str) -> Option<&PullRequest> {
         if !self.github_on {
             return None;
@@ -2407,11 +2466,47 @@ impl App {
     }
 
     /// Takes the open issues its forge listed for the project at
-    /// `project`.
+    /// `project`, for the tab bar's count and the issues view, if it's
+    /// open on that project.
     pub fn set_issues(&mut self, project: &Path, found: Result<(Forge, Vec<Issue>), String>) {
         if let Some(view) = self.issues.as_mut().filter(|view| view.project == project) {
-            view.set_issues(found);
+            view.set_issues(found.clone());
         }
+        self.open_issues.insert(project.to_path_buf(), found);
+    }
+
+    /// How many pull requests and issues are open on the forge of the
+    /// selected session's project, for the tab bar: the pull requests
+    /// without the drafts while they're hidden, and each once its forge
+    /// has listed them.
+    pub fn open_on_forge(&self) -> Option<OpenOnForge> {
+        if !self.github_on {
+            return None;
+        }
+        let project = &self.selected()?.worktree.as_ref()?.project_path;
+        let mut forge = None;
+        let pull_requests = match self.pull_requests.get(project) {
+            Some(Ok((on, pull_requests))) => {
+                forge = Some(*on);
+                let open = pull_requests.iter().filter(|pr| !pr.merged);
+                let listed = open.clone().count();
+                let shown = open.filter(|pr| !(self.hide_draft_prs && pr.draft));
+                Some(Counted::of(shown.count(), listed))
+            }
+            _ => None,
+        };
+        let issues = match self.open_issues.get(project) {
+            Some(Ok((on, issues))) => {
+                forge = forge.or(Some(*on));
+                Some(Counted::of(issues.len(), issues.len()))
+            }
+            _ => None,
+        };
+        Some(OpenOnForge {
+            forge: forge?,
+            pull_requests,
+            issues,
+        })
     }
 
     /// Takes issue `number` of the project at `project`, read whole.
@@ -4375,7 +4470,8 @@ impl App {
         };
         let forge = self.forge_of(&project);
         let name = self.project_name(&project);
-        let mut view = PullRequestsView::new(project.clone(), name, forge, known);
+        let hide_drafts = self.hide_draft_prs;
+        let mut view = PullRequestsView::new(project.clone(), name, forge, known, hide_drafts);
         if let Some(number) = number {
             view.list.highlight(number);
         }
@@ -4383,13 +4479,19 @@ impl App {
         Some(Action::ListPullRequests(project))
     }
 
-    /// `i`: opens the issues view for the selected session's project, or
-    /// says why it can't.
+    /// `i`: opens the issues view for the selected session's project, on
+    /// the ones listed last until its forge lists them again, or says why
+    /// it can't.
     fn open_issues(&mut self) -> Option<Action> {
         let worktree = self.forge_worktree()?;
         let project = worktree.project_path;
+        let known = match self.open_issues.get(&project) {
+            Some(Ok((_, issues))) => Some(issues.clone()),
+            _ => None,
+        };
         let forge = self.forge_of(&project);
-        self.issues = Some(IssuesView::new(project.clone(), worktree.project, forge));
+        let view = IssuesView::new(project.clone(), worktree.project, forge, known);
+        self.issues = Some(view);
         Some(Action::ListIssues(project))
     }
 
@@ -4557,6 +4659,7 @@ impl App {
                 title,
                 body,
             }),
+            issues::Step::Refresh => Some(Action::ListIssues(project)),
             issues::Step::Say(said) => {
                 self.notify(said);
                 None
@@ -4593,6 +4696,11 @@ impl App {
                 topic: Topic::PullRequest(number),
                 text,
             }),
+            pull_requests::Step::Refresh => Some(Action::ListPullRequests(project)),
+            pull_requests::Step::Say(said) => {
+                self.notify(said);
+                None
+            }
         }
     }
 
@@ -4858,6 +4966,10 @@ impl App {
         }
         if let Some(View::Branches(switcher)) = &mut self.view {
             switcher.on_paste(&text);
+            return None;
+        }
+        if let Some(View::Diff(diff)) = &mut self.view {
+            diff.on_paste(&text);
             return None;
         }
         if let Some(View::Memory(memory)) = &mut self.view {
@@ -9122,6 +9234,34 @@ mod tests {
     }
 
     #[test]
+    fn slash_finds_no_merged_pull_request_and_no_draft_while_they_re_hidden() {
+        let mut app = with_agents(&["claude"], vec![in_repo("planner", "main")]);
+        let merged = PullRequest {
+            title: "Login, the old way".into(),
+            merged: true,
+            ..pull_request(41, "old-login")
+        };
+        let draft = PullRequest {
+            title: "Login, a new way".into(),
+            draft: true,
+            ..pull_request(58, "new-login")
+        };
+        let app_path = PathBuf::from("/code/app");
+        app.set_pull_requests(app_path.clone(), on_github(vec![merged, draft]));
+        press(&mut app, KeyCode::Char('/'));
+        type_text(&mut app, "login");
+        let draft = Found::PullRequest {
+            project: app_path,
+            number: 58,
+        };
+        assert_eq!(app.found(), [draft]);
+        let mut config = Config::default();
+        config.forge.hide_draft_prs = true;
+        app.set_features(&config);
+        assert!(app.found().is_empty());
+    }
+
+    #[test]
     fn slash_asks_once_for_the_pull_requests_of_projects_no_session_is_in() {
         let mut app = with_agents(&["claude"], vec![in_repo("planner", "main")]);
         app.set_known_projects(vec![known("app"), known("api")]);
@@ -9253,6 +9393,8 @@ mod tests {
             from_fork: false,
             local_branch: branch.into(),
             draft: false,
+            conflicts: false,
+            merged: false,
             checks: forge::Checks::None,
             review: forge::Review::None,
             updated_at: "2026-10-02T09:30:00Z".into(),
@@ -9479,6 +9621,42 @@ mod tests {
         );
         assert_eq!(command[0], "claude");
         assert!(command[2].starts_with("Fix issue #42"));
+    }
+
+    #[test]
+    fn ctrl_r_asks_the_forge_again_and_the_issues_open_on_those_listed_last() {
+        let mut app = App::new(None);
+        app.set_sessions(vec![in_repo("planner", "main")]);
+        let project = PathBuf::from("/code/app");
+        let ctrl_r = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL);
+        let merged = PullRequest {
+            merged: true,
+            ..pull_request(41, "startup")
+        };
+        app.set_pull_requests(project.clone(), on_github(vec![merged]));
+        press(&mut app, KeyCode::Char('O'));
+        assert_eq!(
+            app.on_key(ctrl_r),
+            Some(Action::ListPullRequests(project.clone()))
+        );
+        // A merged one has nothing left to work on.
+        assert_eq!(press(&mut app, KeyCode::Enter), None);
+        assert_eq!(
+            app.notice(),
+            Some("#41 has merged: there's no work left on it")
+        );
+        press(&mut app, KeyCode::Esc);
+
+        // The poller's issues are there as the view opens.
+        let listed = Ok((Forge::GitHub, vec![issue(42, "Fix login redirect")]));
+        app.set_issues(&project, listed);
+        assert_eq!(
+            press(&mut app, KeyCode::Char('i')),
+            Some(Action::ListIssues(project.clone()))
+        );
+        let view = app.issues_view().unwrap();
+        assert_eq!(view.highlighted().map(|issue| issue.number), Some(42));
+        assert_eq!(app.on_key(ctrl_r), Some(Action::ListIssues(project)));
     }
 
     #[test]
@@ -9919,8 +10097,8 @@ gate = true
         }
         assert_eq!(
             press(&mut app, KeyCode::Char(' ')),
-            Some(Action::ChangeSetting(settings_view::Change::Embeddings(
-                false
+            Some(Action::ChangeSetting(settings_view::Change::HideDrafts(
+                true
             )))
         );
         app.setting_failed("the file is read-only".into());

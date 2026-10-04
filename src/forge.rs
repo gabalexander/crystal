@@ -1,9 +1,10 @@
 //! What crystal asks the forge a project is on, GitHub or GitLab: the pull
-//! requests open on it (merge requests, GitLab calls them), its open
-//! issues, one of either read with its conversation, a pull request's diff,
-//! and the comments and issue edits written back. Everything goes through
-//! the forge's own command line tool, `gh` or `glab`, so the user's login
-//! works as it always does and crystal never sees a token.
+//! requests open on it (merge requests, GitLab calls them) and the ones
+//! merged lately, its open issues, one of either read with its
+//! conversation, a pull request's diff, and the comments and issue edits
+//! written back. Everything goes through the forge's own command line tool,
+//! `gh` or `glab`, so the user's login works as it always does and crystal
+//! never sees a token.
 //!
 //! Which forge a project is on is read off its remote's host: github.com,
 //! or a host `gh` is logged in to, like a GitHub Enterprise, is GitHub;
@@ -42,8 +43,12 @@ pub fn enabled(config: &Config) -> bool {
 const TIMEOUT: Duration = Duration::from_secs(20);
 
 /// How many pull requests or issues to ask for at once: GitLab gives no
-/// more than this a page.
-const LIMIT: &str = "100";
+/// more than this a page. A list this long may have more beyond it.
+pub const LIMIT: usize = 100;
+
+/// How many of the pull requests merged lately to ask for, beside the open
+/// ones: enough to mark the worktrees whose work has gone in.
+const MERGED_LIMIT: usize = 20;
 
 /// The longest a branch named after an issue's title gets, past its number.
 const BRANCH_WORDS_MAX: usize = 40;
@@ -121,7 +126,7 @@ pub enum Topic {
     PullRequest(u64),
 }
 
-/// An open pull request, as its forge lists it.
+/// A pull request open or merged lately, as its forge lists it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PullRequest {
     pub forge: Forge,
@@ -140,6 +145,12 @@ pub struct PullRequest {
     /// the project's.
     pub local_branch: String,
     pub draft: bool,
+    /// Whether its branch conflicts with the one it would merge into, so
+    /// it can't merge as it stands. GitHub works it out lazily, so one it
+    /// hasn't yet doesn't.
+    pub conflicts: bool,
+    /// Whether it has merged: no longer open, its work gone in.
+    pub merged: bool,
     pub checks: Checks,
     pub review: Review,
     /// When it last changed, as the forge writes it: `2026-10-02T09:30:00Z`.
@@ -184,10 +195,14 @@ pub enum Review {
     ChangesRequested,
 }
 
-/// What matters most about a pull request, in the order it matters: a
-/// failing check before anything else, since it's what has to be fixed.
+/// What matters most about a pull request, in the order it matters: one
+/// that has merged is past the rest; then a conflict, since nothing merges
+/// until it's settled, and a failing check, since it's what has to be
+/// fixed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PullRequestState {
+    Merged,
+    Conflicts,
     ChecksFailing,
     ChangesRequested,
     Draft,
@@ -198,7 +213,11 @@ pub enum PullRequestState {
 
 impl PullRequest {
     pub fn state(&self) -> PullRequestState {
-        if self.checks == Checks::Failed {
+        if self.merged {
+            PullRequestState::Merged
+        } else if self.conflicts {
+            PullRequestState::Conflicts
+        } else if self.checks == Checks::Failed {
             PullRequestState::ChecksFailing
         } else if self.review == Review::ChangesRequested {
             PullRequestState::ChangesRequested
@@ -342,12 +361,21 @@ impl Repo {
         }
     }
 
-    /// The pull requests open on it.
+    /// The pull requests open on it, then the ones merged lately, the
+    /// latest first. Those merged are only worth having: when the forge
+    /// won't list them, the open ones are all there is.
     pub fn pull_requests(&self) -> Result<Vec<PullRequest>, String> {
-        match self.forge {
-            Forge::GitHub => github::pull_requests(&self.dir),
-            Forge::GitLab => gitlab::pull_requests(&self.dir),
-        }
+        let (open, merged) = match self.forge {
+            Forge::GitHub => (
+                github::pull_requests(&self.dir)?,
+                github::merged_pull_requests(&self.dir),
+            ),
+            Forge::GitLab => (
+                gitlab::pull_requests(&self.dir)?,
+                gitlab::merged_pull_requests(&self.dir),
+            ),
+        };
+        Ok(with_merged(open, merged.unwrap_or_default()))
     }
 
     pub fn pull_request(&self, number: u64) -> Result<PullRequestDetail, String> {
@@ -414,6 +442,18 @@ impl Repo {
         )?;
         Ok(())
     }
+}
+
+/// The `open` pull requests, then those `merged`, marked so, the latest to
+/// change first: one listed as both, merged as it was asked, is open.
+fn with_merged(open: Vec<PullRequest>, mut merged: Vec<PullRequest>) -> Vec<PullRequest> {
+    merged.retain(|merged| !open.iter().any(|open| open.number == merged.number));
+    merged.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    let merged = merged.into_iter().map(|pull_request| PullRequest {
+        merged: true,
+        ..pull_request
+    });
+    open.into_iter().chain(merged).collect()
 }
 
 /// A branch named for issue `number`: its number, then the words of its
@@ -721,6 +761,8 @@ mod tests {
             from_fork: false,
             local_branch: "fix-login".into(),
             draft: false,
+            conflicts: false,
+            merged: false,
             checks: Checks::None,
             review: Review::None,
             updated_at: "2026-10-02T09:30:00Z".into(),
@@ -731,6 +773,43 @@ mod tests {
     #[test]
     fn a_pull_request_with_nothing_to_say_is_ready() {
         assert_eq!(pull_request().state(), Ready);
+    }
+
+    #[test]
+    fn merged_is_past_everything_and_a_conflict_comes_before_a_failing_check() {
+        let conflicting = PullRequest {
+            conflicts: true,
+            checks: Checks::Failed,
+            draft: true,
+            ..pull_request()
+        };
+        assert_eq!(conflicting.state(), Conflicts);
+        let merged = PullRequest {
+            merged: true,
+            ..conflicting
+        };
+        assert_eq!(merged.state(), Merged);
+    }
+
+    #[test]
+    fn the_merged_ones_come_after_the_open_ones_the_latest_first() {
+        let numbered = |number: u64, updated_at: &str| PullRequest {
+            number,
+            updated_at: updated_at.into(),
+            ..pull_request()
+        };
+        let open = vec![numbered(57, "2026-10-02T09:30:00Z")];
+        let merged = vec![
+            numbered(40, "2026-09-01T09:30:00Z"),
+            numbered(41, "2026-09-03T09:30:00Z"),
+            // Merged between one list and the other: still open here.
+            numbered(57, "2026-10-02T09:40:00Z"),
+        ];
+        let listed: Vec<(u64, bool)> = with_merged(open, merged)
+            .iter()
+            .map(|pr| (pr.number, pr.merged))
+            .collect();
+        assert_eq!(listed, [(57, false), (41, true), (40, true)]);
     }
 
     #[test]

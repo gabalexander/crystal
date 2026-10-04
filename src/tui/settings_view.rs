@@ -49,6 +49,7 @@ pub enum Setting {
     Scrollbars,
     Distill,
     Embeddings,
+    HideDrafts,
 }
 
 /// A change to one setting, to write to the config file.
@@ -77,6 +78,7 @@ pub enum Change {
     Scrollbars(bool),
     Distill(bool),
     Embeddings(bool),
+    HideDrafts(bool),
 }
 
 impl Change {
@@ -99,6 +101,7 @@ impl Change {
             Change::Scrollbars(_) => &["mouse", "scrollbars"],
             Change::Distill(_) => &["memory", "distill"],
             Change::Embeddings(_) => &["memory", "embeddings"],
+            Change::HideDrafts(_) => &["forge", "hide_draft_prs"],
         }
     }
 
@@ -113,7 +116,8 @@ impl Change {
             | Change::Distill(on)
             | Change::Embeddings(on)
             | Change::AutoSwitch(on)
-            | Change::HideSingleTab(on) => on.into(),
+            | Change::HideSingleTab(on)
+            | Change::HideDrafts(on) => on.into(),
             Change::TabBar(BarPosition::Top) => "top".into(),
             Change::TabBar(BarPosition::Bottom) => "bottom".into(),
             Change::ScrollLines(lines) => i64::from(lines).into(),
@@ -193,7 +197,7 @@ pub enum Outcome {
 }
 
 /// The settings the bar can be on, in the order they're listed.
-const SETTINGS: [Setting; 16] = [
+const SETTINGS: [Setting; 17] = [
     Setting::Notify,
     Setting::NotifyAfter,
     Setting::UnfocusedOnly,
@@ -210,6 +214,7 @@ const SETTINGS: [Setting; 16] = [
     Setting::Scrollbars,
     Setting::Distill,
     Setting::Embeddings,
+    Setting::HideDrafts,
 ];
 
 pub struct SettingsView {
@@ -330,6 +335,7 @@ impl SettingsView {
             Setting::Scrollbars => Change::Scrollbars(!config.mouse.scrollbars),
             Setting::Distill => Change::Distill(!config.memory.distill),
             Setting::Embeddings => Change::Embeddings(!config.memory.embeddings),
+            Setting::HideDrafts => Change::HideDrafts(!config.forge.hide_draft_prs),
         };
         Outcome::Change(change)
     }
@@ -459,6 +465,7 @@ fn lines(view: &SettingsView, theme: &Theme) -> Vec<Line<'static>> {
         }
     };
     let memory_on = crate::memory::enabled(config);
+    let forge_on = crate::forge::enabled(config);
     let row = |setting: Setting, on: Option<bool>, value: String, about: String| {
         let selected = SETTINGS[view.selected] == setting;
         let name = match setting {
@@ -478,6 +485,7 @@ fn lines(view: &SettingsView, theme: &Theme) -> Vec<Line<'static>> {
             Setting::Scrollbars => "scrollbars",
             Setting::Distill => "distill closed tasks",
             Setting::Embeddings => "search by meaning",
+            Setting::HideDrafts => "hide drafts",
         };
         let mouse = matches!(
             setting,
@@ -485,7 +493,8 @@ fn lines(view: &SettingsView, theme: &Theme) -> Vec<Line<'static>> {
         );
         let dim = (matches!(setting, Setting::Distill | Setting::Embeddings) && !memory_on)
             || (matches!(setting, Setting::NotifyAfter | Setting::UnfocusedOnly) && !config.notify)
-            || (mouse && !config.mouse.capture);
+            || (mouse && !config.mouse.capture)
+            || (setting == Setting::HideDrafts && !forge_on);
         let (mark, color) = match on {
             Some(true) => ("● ", theme.done),
             Some(false) => ("○ ", theme.muted),
@@ -682,6 +691,22 @@ fn lines(view: &SettingsView, theme: &Theme) -> Vec<Line<'static>> {
             muted,
         ));
     }
+
+    lines.push(Line::from(""));
+    lines.push(Line::styled("Pull requests", bold));
+    let hidden = config.forge.hide_draft_prs;
+    lines.push(row(
+        Setting::HideDrafts,
+        Some(hidden),
+        on_off(hidden),
+        "leave drafts out of O, / and the tab bar's count".to_string(),
+    ));
+    if !forge_on {
+        lines.push(Line::styled(
+            "the github plugin is off, so this does nothing: X switches it on",
+            muted,
+        ));
+    }
     if let Some(problem) = &view.problem {
         lines.push(Line::from(""));
         lines.push(Line::styled(problem.clone(), Style::new().fg(theme.failed)));
@@ -820,12 +845,17 @@ mod tests {
             press(&mut view, KeyCode::Char(' ')),
             Outcome::Change(Change::Distill(false))
         );
+        press(&mut view, KeyCode::Down);
+        assert_eq!(
+            press(&mut view, KeyCode::Char(' ')),
+            Outcome::Change(Change::Embeddings(false))
+        );
         // The bar stops at the last.
         press(&mut view, KeyCode::Down);
         press(&mut view, KeyCode::Down);
         assert_eq!(
             press(&mut view, KeyCode::Char(' ')),
-            Outcome::Change(Change::Embeddings(false))
+            Outcome::Change(Change::HideDrafts(true))
         );
         assert_eq!(press(&mut view, KeyCode::Char(',')), Outcome::Close);
     }
@@ -978,6 +1008,7 @@ mod tests {
             ["sessions", "stop_idle_after"]
         );
         assert_eq!(Change::Sound(true).keys(), ["sound", "enabled"]);
+        assert_eq!(Change::HideDrafts(true).keys(), ["forge", "hide_draft_prs"]);
     }
 
     #[test]
@@ -985,7 +1016,10 @@ mod tests {
         let mut off = Config::default();
         off.memory.embeddings = false;
         let mut view = view_of(off, Some(status()));
-        for _ in 0..SETTINGS.len() - 1 {
+        let embeddings = SETTINGS
+            .iter()
+            .position(|setting| *setting == Setting::Embeddings);
+        for _ in 0..embeddings.unwrap() {
             press(&mut view, KeyCode::Down);
         }
         assert_eq!(press(&mut view, KeyCode::Enter), Outcome::Stay);

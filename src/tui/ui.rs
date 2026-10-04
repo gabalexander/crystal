@@ -4,7 +4,9 @@
 //! the theme's colors tell the parts apart. Drawing only reads the state;
 //! it never changes it.
 
-use super::app::{App, Filter, Focus, Hit, PluginPane, Prompt, Question, Slot, View};
+use super::app::{
+    App, Counted, Filter, Focus, Hit, OpenOnForge, PluginPane, Prompt, Question, Slot, View,
+};
 use super::archived_view;
 use super::backlog_view::{self, BacklogView};
 use super::command_list;
@@ -610,7 +612,8 @@ fn draw_plugin_pane(
 
 /// crystal's name and the tabs on the left, and on the right the server,
 /// when it isn't the default, then how many sessions there are and how
-/// many wait on the user.
+/// many wait on the user, then, when there's room, how many pull requests
+/// and issues are open on the selected session's project's forge.
 fn draw_top_bar(frame: &mut Frame, app: &App, look: &Look, area: Rect) {
     // Left out, it has no row to draw on.
     if area.height == 0 {
@@ -627,18 +630,29 @@ fn draw_top_bar(frame: &mut Frame, app: &App, look: &Look, area: Rect) {
     frame.render_widget(name, area);
     draw_tabs(frame, app, look, area);
     let mut right = summary(app.sessions(), app.server(), theme);
-    if let Some(status) = status_shown(app, area.width) {
+    let counts = counts_width(app, area.width) > 0;
+    let status = status_shown(app, area.width);
+    if counts || status.is_some() {
         // After the count, before the space the summary ends with.
         let end = right.spans.pop();
         let separator = Span::styled(
             app.tab_bar().separator.clone(),
             Style::new().fg(theme.muted),
         );
-        for text in status {
+        let mut shown = Vec::new();
+        if counts {
+            shown.extend(forge_counts(app.open_on_forge(), theme));
+        }
+        let text = Style::new().fg(theme.text);
+        shown.extend(
+            status
+                .into_iter()
+                .flatten()
+                .map(|said| Span::styled(said, text)),
+        );
+        for said in shown {
             right.spans.push(separator.clone());
-            right
-                .spans
-                .push(Span::styled(text, Style::new().fg(theme.text)));
+            right.spans.push(said);
         }
         right.spans.extend(end);
     }
@@ -671,6 +685,69 @@ fn status_width(app: &App, width: u16) -> u16 {
     status_shown(app, width).map_or(0, |shown| {
         shown.iter().map(|text| separator + width_of(text)).sum()
     })
+}
+
+/// What the tab bar counts on the forge of the selected session's
+/// project, after the sessions: `3 prs` in the accent and `5 issues` in
+/// green.
+fn forge_counts<'a>(open: Option<OpenOnForge>, theme: &Theme) -> Vec<Span<'a>> {
+    count_words(open)
+        .into_iter()
+        .map(|(said, pull_requests)| {
+            let color = if pull_requests {
+                theme.accent
+            } else {
+                theme.done
+            };
+            Span::styled(said, Style::new().fg(color))
+        })
+        .collect()
+}
+
+/// The counts [`forge_counts`] draws, each with whether it counts pull
+/// requests: `3 prs`, `mrs` on GitLab, and `5 issues`. A count of none says
+/// nothing, and a list the forge cut short counts `100+`.
+fn count_words(open: Option<OpenOnForge>) -> Vec<(String, bool)> {
+    let Some(open) = open else {
+        return Vec::new();
+    };
+    let (pr, prs) = match open.forge {
+        crate::forge::Forge::GitHub => ("pr", "prs"),
+        crate::forge::Forge::GitLab => ("mr", "mrs"),
+    };
+    let said = |counted: Option<Counted>, one: &str, many: &str| {
+        let counted = counted.filter(|counted| counted.count > 0)?;
+        let plus = if counted.more { "+" } else { "" };
+        let noun = if counted.count == 1 && !counted.more {
+            one
+        } else {
+            many
+        };
+        Some(format!("{}{plus} {noun}", counted.count))
+    };
+    let pull_requests = said(open.pull_requests, pr, prs).map(|said| (said, true));
+    let issues = said(open.issues, "issue", "issues").map(|said| (said, false));
+    pull_requests.into_iter().chain(issues).collect()
+}
+
+/// How many columns the forge's counts take in a tab bar `width` columns
+/// wide: none when there are none, or they'd leave the tabs fewer than
+/// [`TABS_KEEP`] columns beside what the bar shows at its right, which
+/// they give way to.
+fn counts_width(app: &App, width: u16) -> u16 {
+    let separator = width_of(&app.tab_bar().separator);
+    let words = count_words(app.open_on_forge());
+    let counts: u16 = words
+        .iter()
+        .map(|(said, _)| separator + width_of(said))
+        .sum();
+    let beside = server_width(app) + status_width(app, width);
+    let room = TABS_START + SUMMARY_ROOM + beside + counts + TABS_KEEP;
+    if counts > 0 && width >= room {
+        counts
+    } else {
+        0
+    }
 }
 
 /// The tabs, after crystal's name in the top bar in `area`: the one in
@@ -770,13 +847,19 @@ fn tab_label(number: usize, tab: &Tab, status: Option<Status>, named: bool) -> S
 
 /// How much of the top bar in `area` the tabs share with the summary: all
 /// of it, but for the server's name the summary starts with, if it does,
-/// and what the bar shows at its right.
+/// what the bar shows at its right, and the forge's counts before that,
+/// if they're shown.
 fn tabs_width(app: &App, area: Rect) -> u16 {
-    let server = app
-        .server()
-        .map_or(0, |server| width_of(&server_label(server)));
     let status = status_width(app, area.width);
-    area.width.saturating_sub(server + status)
+    let counts = counts_width(app, area.width);
+    area.width
+        .saturating_sub(server_width(app) + status + counts)
+}
+
+/// How many columns the server's name takes at the start of the summary.
+fn server_width(app: &App) -> u16 {
+    app.server()
+        .map_or(0, |server| width_of(&server_label(server)))
 }
 
 /// What the summary says of the server, before the sessions.
@@ -1968,6 +2051,8 @@ mod tests {
             from_fork: false,
             local_branch: "fix-login".into(),
             draft: false,
+            conflicts: false,
+            merged: false,
             checks: Checks::Failed,
             review: Review::None,
             updated_at: "2026-10-02T09:30:00Z".into(),
@@ -2251,6 +2336,122 @@ mod tests {
         assert_eq!(text_of(&line), "2 sessions · 1 waiting ");
         let count = line.spans.iter().find(|span| span.content == "1 waiting");
         assert_eq!(count.unwrap().style.fg, Some(theme.waiting));
+    }
+
+    #[test]
+    fn the_forge_counts_say_nothing_of_none_and_a_plus_for_a_list_cut_short() {
+        let theme = theme();
+        let counted = |count: usize, more: bool| Some(Counted { count, more });
+        let open = OpenOnForge {
+            forge: crate::forge::Forge::GitHub,
+            pull_requests: counted(3, false),
+            issues: counted(1, false),
+        };
+        let said = Line::from(forge_counts(Some(open), &theme));
+        assert_eq!(text_of(&said), "3 prs1 issue");
+        let prs = said.spans.iter().find(|span| span.content == "3 prs");
+        assert_eq!(prs.unwrap().style.fg, Some(theme.accent));
+
+        let gitlab = OpenOnForge {
+            forge: crate::forge::Forge::GitLab,
+            pull_requests: counted(100, true),
+            issues: counted(0, false),
+        };
+        let said = Line::from(forge_counts(Some(gitlab), &theme));
+        assert_eq!(text_of(&said), "100+ mrs");
+        let unlisted = OpenOnForge {
+            issues: None,
+            pull_requests: None,
+            ..gitlab
+        };
+        assert!(forge_counts(Some(unlisted), &theme).is_empty());
+        assert!(forge_counts(None, &theme).is_empty());
+    }
+
+    #[test]
+    fn the_top_bar_counts_what_is_open_on_the_selected_projects_forge() {
+        use crate::forge::{Checks, Forge, PullRequest, Review};
+        let mut app = App::new(None);
+        let mut planner = session("planner", State::Running);
+        planner.worktree = Some(crate::protocol::Worktree {
+            project: "app".into(),
+            project_path: PathBuf::from("/code/app"),
+            path: PathBuf::from("/code/app"),
+            main: true,
+            branch: Some("main".into()),
+            in_progress: None,
+        });
+        app.set_sessions(vec![planner]);
+        let pull_request = |number: u64, draft: bool, merged: bool| PullRequest {
+            forge: Forge::GitHub,
+            number,
+            title: "a change".into(),
+            author: "ana".into(),
+            branch: format!("b{number}"),
+            from_fork: false,
+            local_branch: format!("b{number}"),
+            draft,
+            conflicts: false,
+            merged,
+            checks: Checks::None,
+            review: Review::None,
+            updated_at: String::new(),
+            url: String::new(),
+        };
+        let listed = vec![
+            pull_request(1, false, false),
+            pull_request(2, true, false),
+            pull_request(3, false, true),
+        ];
+        app.set_pull_requests(PathBuf::from("/code/app"), Ok((Forge::GitHub, listed)));
+        let top = |app: &App, width: u16| {
+            let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+            let theme = theme();
+            let look = Look {
+                theme: &theme,
+                now: 0,
+                spin: 0,
+            };
+            terminal
+                .draw(|frame| draw_top_bar(frame, app, &look, frame.area()))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            (0..width)
+                .map(|x| buffer[(x, 0)].symbol())
+                .collect::<String>()
+        };
+        // The merged one isn't open; the draft is, until drafts are hidden.
+        assert!(
+            top(&app, 100).ends_with("1 session · 2 prs "),
+            "{}",
+            top(&app, 100)
+        );
+        let config = crate::config::Config {
+            forge: crate::config::ForgeSettings {
+                hide_draft_prs: true,
+            },
+            ..crate::config::Config::default()
+        };
+        app.set_features(&config);
+        assert!(
+            top(&app, 100).ends_with("1 session · 1 pr "),
+            "{}",
+            top(&app, 100)
+        );
+        // What the user has the bar show at its right comes after them,
+        // and the counts give way to it first when room runs short.
+        app.set_status(vec!["devbox".into()]);
+        assert!(
+            top(&app, 100).ends_with("1 session · 1 pr · devbox "),
+            "{}",
+            top(&app, 100)
+        );
+        assert!(
+            top(&app, 60).ends_with("1 session · devbox "),
+            "{}",
+            top(&app, 60)
+        );
+        assert!(top(&app, 50).ends_with("1 session "), "{}", top(&app, 50));
     }
 
     #[test]

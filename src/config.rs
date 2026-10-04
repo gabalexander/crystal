@@ -69,6 +69,8 @@ pub struct Config {
     pub handoff: HandoffSettings,
     /// How new worktrees are made: `[worktrees]` in the file.
     pub worktrees: WorktreeSettings,
+    /// What the TUI shows of a project's forge: `[forge]` in the file.
+    pub forge: ForgeSettings,
     /// What crystal does with sessions left alone: `[sessions]` in the
     /// file.
     pub sessions: SessionSettings,
@@ -612,6 +614,17 @@ pub struct WorktreeSettings {
     pub base: Option<String>,
 }
 
+/// What the TUI shows of the pull requests and issues on a project's
+/// forge: see [`crate::forge`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ForgeSettings {
+    /// Leave draft pull requests out of the pull requests view, the tab
+    /// bar's count and what `/` finds, for what's asking to be reviewed. A
+    /// worktree's own pull request is shown on its line all the same.
+    pub hide_draft_prs: bool,
+}
+
 /// Whether the TUI says when a newer crystal is out: see [`crate::update`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -776,6 +789,7 @@ impl Default for Config {
             events: EventSettings::default(),
             handoff: HandoffSettings::default(),
             worktrees: WorktreeSettings::default(),
+            forge: ForgeSettings::default(),
             sessions: SessionSettings::default(),
             update: UpdateSettings::default(),
             profiles: Vec::new(),
@@ -1527,6 +1541,14 @@ back_to = "build"
     }
 
     #[test]
+    fn drafts_show_unless_the_forge_settings_hide_them() {
+        assert!(!parse("").unwrap().forge.hide_draft_prs);
+        let config = parse("[forge]\nhide_draft_prs = true\n").unwrap();
+        assert!(config.forge.hide_draft_prs);
+        assert!(parse("[forge]\nhide_drafts = true\n").is_err());
+    }
+
+    #[test]
     fn a_leftover_preset_says_its_now_a_profile() {
         let err = parse("[[preset]]\nname = \"x\"\nagent = \"claude\"\n").unwrap_err();
         assert!(
@@ -1734,6 +1756,9 @@ back_to = "build"
             },
             worktrees: WorktreeSettings {
                 base: Some("develop".into()),
+            },
+            forge: ForgeSettings {
+                hide_draft_prs: true,
             },
             sessions: SessionSettings {
                 stop_idle_after: "45m".into(),
