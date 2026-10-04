@@ -12932,7 +12932,7 @@ description = "break"
     tui.type_keys("\x1b\x07");
     tui.shows("the popup says hi");
     tui.shows(" the board ");
-    assert!(crystal.row("board").is_some());
+    eventually("its session starts", || crystal.row("board").is_some());
     tui.type_keys("hello\r");
     assert_eq!(written(&dir.join("got")), "got hello\n");
     tui.hides("the popup says hi");
