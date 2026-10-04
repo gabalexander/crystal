@@ -7,6 +7,7 @@
 use crate::flows::Flow;
 use crate::plugins;
 use crate::profile::Profile;
+use crate::vt;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -35,6 +36,11 @@ pub struct Config {
     pub resume_reported_agents: bool,
     /// The TUI's colors.
     pub theme: ThemeName,
+    /// How many rows that scrolled off a session's screen are kept, for
+    /// copy mode, `crystal read --history` and the editor `e` opens: in the
+    /// daemon, and again in each pane showing the session. A session keeps
+    /// what the settings said as it started; a pane, as it opened.
+    pub scrollback_lines: usize,
     /// Which plugins are on and off, by name: crystal's own, which are on
     /// unless switched off here, and ones the user installed, which are off
     /// until switched on. See [`crate::plugins`].
@@ -151,6 +157,7 @@ impl Default for Config {
             name_from_prompt: true,
             resume_reported_agents: true,
             theme: ThemeName::Dark,
+            scrollback_lines: vt::DEFAULT_HISTORY_LINES,
             plugins: BTreeMap::new(),
             memory: MemorySettings::default(),
             tasks: TaskSettings::default(),
@@ -301,6 +308,13 @@ pub fn from_text(text: &str) -> Result<Config> {
         bail!("`memory` is now a plugin: put `memory = …` under a `[plugins]` line instead");
     }
     let config: Config = table.try_into()?;
+    if config.scrollback_lines > vt::MAX_HISTORY_LINES {
+        bail!(
+            "scrollback_lines is at most {}, not {}",
+            vt::MAX_HISTORY_LINES,
+            config.scrollback_lines
+        );
+    }
     for profile in &config.profiles {
         profile.check()?;
     }
@@ -353,6 +367,18 @@ mod tests {
     #[test]
     fn a_setting_of_the_wrong_kind_is_an_error() {
         assert!(parse("notify = \"yes\"\n").is_err());
+    }
+
+    #[test]
+    fn scrollback_has_a_limit() {
+        assert_eq!(
+            parse("scrollback_lines = 50000\n")
+                .unwrap()
+                .scrollback_lines,
+            50_000
+        );
+        let err = parse("scrollback_lines = 5000000\n").unwrap_err();
+        assert!(format!("{err:#}").contains("at most"), "{err:#}");
     }
 
     #[test]
@@ -593,6 +619,7 @@ back_to = "build"
             name_from_prompt: false,
             resume_reported_agents: false,
             theme: ThemeName::Terminal,
+            scrollback_lines: 50_000,
             plugins: BTreeMap::from([("memory".to_string(), false)]),
             memory: MemorySettings {
                 distill: false,

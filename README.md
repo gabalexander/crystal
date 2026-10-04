@@ -147,8 +147,8 @@ old way can't tell apart, like `Esc`, `Shift+Enter` or `Ctrl+I` and `Tab`, reach
 keyboard that takes a terminal that speaks the protocol too, like Ghostty, kitty, foot or Alacritty; in any
 other, keys arrive the old way.
 
-Each session keeps the last 2,000 rows that scrolled off its screen, so a pane can page back through what an
-agent wrote before you opened it. The title says how far back you are (`↑ 120 lines`), new output doesn't pull
+Each session keeps the last 10,000 rows that scrolled off its screen (`scrollback_lines` in the
+[settings](#settings)), so a pane can page back through what an agent wrote before you opened it. The title says how far back you are (`↑ 120 lines`), new output doesn't pull
 you away while you read, and typing into the session brings you back to live. That includes agents that print
 inline through a scroll region, like Codex. To search that history, or copy from it, there's
 [copy mode](#zoom-copy-mode-and-search), and `e` opens it in your editor.
@@ -1723,6 +1723,7 @@ file and change. A setting crystal doesn't know is an error that names it, so a 
 | `theme` | `"dark"` | the TUI's colors: `"dark"`, `"light"`, or `"terminal"` |
 | `name_from_prompt` | `true` | name a session you don't name for the [first thing it's asked](#starting-a-session) |
 | `resume_reported_agents` | `true` | after a restart, run the command an agent [said resumes it](#teaching-crystal-about-your-agent) |
+| `scrollback_lines` | `10000` | how many rows that scrolled off a session's screen it keeps, up to 1,000,000, for scrolling back, copy mode, `e` and `crystal read --history` |
 | `[plugins]` | | which plugins are on and off: [plugins](#plugins) |
 | `[memory]` | | how memory's [distiller](#the-distiller) runs, and whether it [searches by meaning](#search-by-meaning) |
 | `[tasks]` | | what [background tasks](#background-tasks) may spend: `max_budget_usd` each (`5`), `daily_budget_usd` all together (none) |
@@ -1746,8 +1747,9 @@ offered as a profile of its own.
 The daemon reads the notification settings each time it tells you something, `[plugins]` each time it
 does something a plugin adds, `[memory]` each time a task closes or a search runs, `[tasks]` each time a
 background task's run starts, `[handoff]` each time a note is written, a flow each time one starts,
-`name_from_prompt` each time it names a session and `resume_reported_agents` as it starts sessions again, so a
-change counts straight away; the TUI reads `new_session`, `theme`, `[plugins]`, the profiles and
+`name_from_prompt` each time it names a session, `resume_reported_agents` as it starts sessions again and
+`scrollback_lines` as each session starts, so a change counts straight away (a session already running keeps
+what it had); the TUI reads `new_session`, `theme`, `scrollback_lines`, `[plugins]`, the profiles and
 the flows when it starts, again when you save a profile or switch a plugin, and every half a second while the
 settings view is open.
 
