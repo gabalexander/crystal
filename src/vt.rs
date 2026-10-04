@@ -554,10 +554,17 @@ impl Screen {
             .fold(0, |flags, (_, bit)| flags | bit)
     }
 
-    /// What the program has asked of the keyboard and the mouse.
+    /// What the program has asked of the keyboard and the mouse. The wheel
+    /// sends it the arrow keys (alternate scroll) only while it's on the
+    /// alternate screen, as it would in a terminal of its own: a terminal
+    /// it's drawn on may be on its alternate screen all along, and a shell
+    /// on the main one would take the arrows for its history.
     pub fn input_modes(&self) -> InputModes {
         InputModes {
-            modes: INPUT_MODES.map(|mode| self.mode(mode)),
+            modes: INPUT_MODES.map(|mode| match mode {
+                mode::ALTERNATE_SCROLL => self.alternate_screen() && self.mode(mode),
+                _ => self.mode(mode),
+            }),
             kitty_keyboard: self.kitty_keyboard(),
         }
     }
@@ -1491,7 +1498,7 @@ fn sgr_color(color: Color, introducer: u8) -> Option<String> {
 
 /// The modes that change what a terminal sends the program in it, rather
 /// than what it shows.
-const INPUT_MODES: [u16; 9] = [
+const INPUT_MODES: [u16; 10] = [
     mode::APPLICATION_CURSOR,
     mode::APPLICATION_KEYPAD,
     mode::MOUSE_NORMAL,
@@ -1500,6 +1507,7 @@ const INPUT_MODES: [u16; 9] = [
     mode::FOCUS_EVENTS,
     mode::MOUSE_UTF8,
     mode::MOUSE_SGR,
+    mode::ALTERNATE_SCROLL,
     mode::BRACKETED_PASTE,
 ];
 
@@ -1933,6 +1941,29 @@ mod tests {
             String::from_utf8(none.changes_from(&set)).unwrap(),
             "\x1b[?1l\x1b>\x1b[?1000l\x1b[?1006l\x1b[?2004l\x1b[=0;1u"
         );
+    }
+
+    #[test]
+    fn the_wheel_sends_arrows_only_on_the_alternate_screen() {
+        // On until a program turns it off, but on the main screen a shell
+        // would take the arrows for its history.
+        let mut screen = Screen::new(2, 10);
+        let main = screen.input_modes();
+        assert!(screen.mode(mode::ALTERNATE_SCROLL));
+        assert_eq!(main, InputModes::default());
+
+        screen.process(b"\x1b[?1049h");
+        let alternate = screen.input_modes();
+        let changes = alternate.changes_from(&main);
+        assert_eq!(String::from_utf8(changes).unwrap(), "\x1b[?1007h");
+
+        screen.process(b"\x1b[?1007l");
+        let turned_off = screen.input_modes();
+        let changes = turned_off.changes_from(&alternate);
+        assert_eq!(String::from_utf8(changes).unwrap(), "\x1b[?1007l");
+
+        screen.process(b"\x1b[?1007h\x1b[?1049l");
+        assert_eq!(screen.input_modes(), main);
     }
 
     #[test]

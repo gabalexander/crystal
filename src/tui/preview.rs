@@ -301,15 +301,18 @@ impl Preview {
     /// Scrolls for `key` the way the diff view does: `Space`, `PageDown`
     /// and `PageUp` page, `Home` and `End` go to the ends, and
     /// `Shift+↓`/`Shift+↑` go a line. Returns whether it was one of those.
+    /// `Ctrl+Home` and `Ctrl+End` aren't: they're a text box's, to the ends
+    /// of what's typed beside the preview.
     pub fn scroll_key(&mut self, key: &KeyEvent) -> bool {
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let page = self.page_size();
         match key.code {
             KeyCode::Char(' ') if shift => self.scroll_up(page),
             KeyCode::Char(' ') | KeyCode::PageDown => self.scroll_down(page),
             KeyCode::PageUp => self.scroll_up(page),
-            KeyCode::Home => self.scroll = 0,
-            KeyCode::End => self.scroll = self.last_scroll(),
+            KeyCode::Home if !ctrl => self.scroll = 0,
+            KeyCode::End if !ctrl => self.scroll = self.last_scroll(),
             KeyCode::Down if shift => self.scroll_down(1),
             KeyCode::Up if shift => self.scroll_up(1),
             _ => return false,

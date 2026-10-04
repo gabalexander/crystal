@@ -2,9 +2,9 @@
 //! gave, filtered as you type, with a bar that keeps to its item, by
 //! number, while the filter changes; each item read whole once, the first
 //! time the bar comes to it, or again when the user asks for the list
-//! again; and the reading pane under the list, which scrolls. Then how both
-//! are drawn: a heading, the filter, the list, a rule, and the reading
-//! pane.
+//! again, a read asked before the one kept dropped; and the reading pane
+//! under the list, which scrolls. Then how both are drawn: a heading, the
+//! filter, the list, a rule, and the reading pane.
 //!
 //! The state is plain data: what the forge answered arrives through
 //! [`Listing::set_items`] and [`Listing::set_detail`], and the event loop
@@ -20,6 +20,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 use std::collections::{HashMap, HashSet};
+use std::time::Instant;
 
 /// The most of the room below the filter the list takes, in thirds: the
 /// rest is the reading pane.
@@ -46,6 +47,10 @@ pub struct Listing<T, D> {
     highlighted: Option<u64>,
     /// Items read whole, by number, as the forge gave them.
     details: HashMap<u64, Result<D, String>>,
+    /// When each of those was asked of the forge: a read asked before
+    /// lands after it only when the forge took longer over it, without
+    /// what was said on the item since, and it's dropped.
+    read_asked: HashMap<u64, Instant>,
     /// The items that have been asked for whole, answered or not.
     asked: HashSet<u64>,
     /// How many lines the reading pane is scrolled down.
@@ -64,6 +69,7 @@ impl<T: Item, D> Listing<T, D> {
             filter: TextInput::default(),
             highlighted: None,
             details: HashMap::new(),
+            read_asked: HashMap::new(),
             asked: HashSet::new(),
             scroll: 0,
             asking: true,
@@ -110,7 +116,14 @@ impl<T: Item, D> Listing<T, D> {
         items.iter_mut().find(|item| item.number() == number)
     }
 
-    pub fn set_detail(&mut self, number: u64, detail: Result<D, String>) {
+    /// Takes item `number` read whole, as asked of the forge at `asked`,
+    /// unless what's kept of it was asked later.
+    pub fn set_detail(&mut self, number: u64, detail: Result<D, String>, asked: Instant) {
+        let kept = self.read_asked.get(&number);
+        if kept.is_some_and(|kept| asked < *kept) {
+            return;
+        }
+        self.read_asked.insert(number, asked);
         self.details.insert(number, detail);
     }
 
@@ -349,6 +362,7 @@ pub fn text_lines<'a>(text: &str, style: Style) -> Vec<Line<'a>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     struct Thing(u64, &'static str);
 
@@ -412,10 +426,27 @@ mod tests {
         assert_eq!(listing.detail_to_fetch(), None);
         press(&mut listing, KeyCode::Down);
         assert_eq!(listing.detail_to_fetch(), Some(7));
-        listing.set_detail(7, Ok("dark".to_string()));
+        listing.set_detail(7, Ok("dark".to_string()), Instant::now());
         listing.read_again(7);
         assert_eq!(listing.detail_to_fetch(), Some(7));
         // What it was read as shows until it's read again.
+        assert_eq!(listing.detail(7), Some(&Ok("dark".to_string())));
+    }
+
+    #[test]
+    fn a_read_asked_before_the_one_kept_is_dropped() {
+        let mut listing = listing();
+        let first = Instant::now();
+        let later = first + Duration::from_secs(1);
+        // Read again after a comment, the new read comes back first.
+        listing.set_detail(42, Ok("with the comment".to_string()), later);
+        listing.set_detail(42, Ok("without it".to_string()), first);
+        let kept = Ok("with the comment".to_string());
+        assert_eq!(listing.detail(42), Some(&kept));
+        listing.set_detail(42, Ok("read again".to_string()), later);
+        assert_eq!(listing.detail(42), Some(&Ok("read again".to_string())));
+        // Each item by itself.
+        listing.set_detail(7, Ok("dark".to_string()), first);
         assert_eq!(listing.detail(7), Some(&Ok("dark".to_string())));
     }
 

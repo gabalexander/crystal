@@ -53,8 +53,10 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   waiting, a few seconds at most, or `NoTui`, for the daemon to carry it out itself on the tabs the TUIs keep;
   nothing is handed over, as each TUI offers again after a handover saying when it was last used, and a
   command just after the daemon starts waits a moment for one to come back
-- `src/attach.rs`: `crystal attach`: draws a session in your terminal and sends it your keys, attaching again
-  after a handover, and passes its bell and what its program copies on
+- `src/attach.rs`: `crystal attach`: draws a session in your terminal and sends it your keys, your terminal
+  asked for what its program asked of them (the wheel's arrows only while it's on the alternate screen, your
+  terminal's own put back after), attaching again after a handover, and passes its bell and what its program
+  copies on
 - `src/bell.rs`: passing a session's terminal bell on to the user's own terminal, at most one every half a
   second
 - `src/viewer.rs`: the client's side of an attach, shared by `crystal attach` and the TUI's pane
@@ -94,7 +96,9 @@ whenever what's handed over changes in a way the crystal before couldn't read.
     written `direct+`; a plugin's first key waiting for its second; a key in a view taken as the key the user
     gave it stands for; the user's own keys' commands made ready (a split, a tab); the sidebar's width, folded or
     not, what needs the user pinned at its top, and the projects folded down to their headings, the selection
-    resting on one out of sight; no I/O, so it's unit-tested
+    resting on one out of sight; the forge's lists, one asked before the one kept dropped, and the issues
+    edited in the issues view laid over what was asked before the forge saved them; no I/O, so it's
+    unit-tested
     - `app/commands.rs`: the layout commands carried out on the state, each on the tab holding the session it's
       about, in front or not, and the layout the TUI answers with; and carried out with no TUI open, on a state
       made for it from the tabs kept, the sessions and the flow runs, on a screen of an unseen session's size
@@ -190,8 +194,8 @@ whenever what's handed over changes in a way the crystal before couldn't read.
     while the settings hide them, reading one with its checks and conversation, its diff, commenting, asking
     the forge again (`Ctrl+R`), starting a session in its worktree, and its drawing
   - `listing.rs`: what the issues and pull requests views and the timeline share: a list filtered as you
-    type, the bar kept on its item, each item read whole once, the list asked for again and the heading
-    saying so, the reading pane, and drawing them
+    type, the bar kept on its item, each item read whole once, a read asked before the one kept dropped, the
+    list asked for again and the heading saying so, the reading pane, and drawing them
   - `compose.rs`: writing back to the forge from those views: the comment box and the form that edits an
     issue, which keep what's typed until the forge takes it
   - `backlog_view.rs`: the backlog view `b` opens: its state and keys, kept apart from I/O, and its
@@ -221,8 +225,9 @@ whenever what's handed over changes in a way the crystal before couldn't read.
     they're listed (or on `Ctrl+R`) and the branches listed again, the question about the worktree's
     uncommitted changes and the commit message, kept apart from I/O, and its drawing
   - `tree_browser.rs`: the tree browser (`E`): a worktree's files as a tree, folded and opened, the filter
-    that narrows it to the files that match and their directories, the border dragged, its keys and drawing;
-    kept apart from I/O, so it's unit-tested
+    that narrows it to the files that match and their directories, edited as a text box is but for the keys
+    the tree and the preview take, the border dragged, its keys and drawing; kept apart from I/O, so it's
+    unit-tested
   - `preview.rs`: the file finder's and the tree browser's preview: a file read and highlighted off the
     event loop, a markdown file's page laid out for its width or its source, scrolling, and drawing them
   - `memory_view.rs`: the memory view (`m`): a project's entries, the filter, forgetting and
