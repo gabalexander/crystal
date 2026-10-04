@@ -1255,6 +1255,12 @@ pub enum Extent {
 const POPUP_SHARE: u16 = 80;
 
 impl Extent {
+    /// What's wrong with it, if anything: no cells, or a share that isn't
+    /// one.
+    pub fn check(&self) -> Result<(), String> {
+        self.read().map(drop)
+    }
+
     /// The share it is, from 1 to 100, or so many cells.
     fn read(&self) -> Result<Result<u16, u16>, String> {
         match self {

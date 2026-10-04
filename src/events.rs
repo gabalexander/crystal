@@ -38,6 +38,8 @@ pub enum Kind {
     SessionStartFailed,
     SessionRemoved,
     SessionArchived,
+    SessionUnarchived,
+    SessionOpenedInTerminal,
     SessionClaimed,
     SessionReleased,
     SubagentStarted,
@@ -48,9 +50,11 @@ pub enum Kind {
     TaskOpened,
     TaskStarted,
     TaskWaiting,
+    TaskReminded,
     TaskClosed,
     TaskArtifact,
     RunStarted,
+    RunToolUse,
     RunAsking,
     RunAnswered,
     RunInterrupted,
@@ -67,6 +71,10 @@ pub enum Kind {
     HandoffAdded,
     MemoryAdded,
     MemoryForgotten,
+    MemoryStale,
+    MemoryPromoted,
+    MemoryDistilled,
+    MemoryDistillFailed,
     BacklogAdded,
     BacklogClosed,
     PluginPaused,
@@ -75,7 +83,7 @@ pub enum Kind {
 }
 
 impl Kind {
-    pub const ALL: [Kind; 44] = [
+    pub const ALL: [Kind; 52] = [
         Kind::SessionStarted,
         Kind::SessionRenamed,
         Kind::SessionWorking,
@@ -86,6 +94,8 @@ impl Kind {
         Kind::SessionStartFailed,
         Kind::SessionRemoved,
         Kind::SessionArchived,
+        Kind::SessionUnarchived,
+        Kind::SessionOpenedInTerminal,
         Kind::SessionClaimed,
         Kind::SessionReleased,
         Kind::SubagentStarted,
@@ -96,9 +106,11 @@ impl Kind {
         Kind::TaskOpened,
         Kind::TaskStarted,
         Kind::TaskWaiting,
+        Kind::TaskReminded,
         Kind::TaskClosed,
         Kind::TaskArtifact,
         Kind::RunStarted,
+        Kind::RunToolUse,
         Kind::RunAsking,
         Kind::RunAnswered,
         Kind::RunInterrupted,
@@ -115,6 +127,10 @@ impl Kind {
         Kind::HandoffAdded,
         Kind::MemoryAdded,
         Kind::MemoryForgotten,
+        Kind::MemoryStale,
+        Kind::MemoryPromoted,
+        Kind::MemoryDistilled,
+        Kind::MemoryDistillFailed,
         Kind::BacklogAdded,
         Kind::BacklogClosed,
         Kind::PluginPaused,
@@ -135,6 +151,8 @@ impl Kind {
             Kind::SessionStartFailed => "session.start_failed",
             Kind::SessionRemoved => "session.removed",
             Kind::SessionArchived => "session.archived",
+            Kind::SessionUnarchived => "session.unarchived",
+            Kind::SessionOpenedInTerminal => "session.opened_in_terminal",
             Kind::SessionClaimed => "session.claimed",
             Kind::SessionReleased => "session.released",
             Kind::SubagentStarted => "subagent.started",
@@ -145,9 +163,11 @@ impl Kind {
             Kind::TaskOpened => "task.opened",
             Kind::TaskStarted => "task.started",
             Kind::TaskWaiting => "task.waiting",
+            Kind::TaskReminded => "task.reminded",
             Kind::TaskClosed => "task.closed",
             Kind::TaskArtifact => "task.artifact",
             Kind::RunStarted => "run.started",
+            Kind::RunToolUse => "run.tool_use",
             Kind::RunAsking => "run.asking",
             Kind::RunAnswered => "run.answered",
             Kind::RunInterrupted => "run.interrupted",
@@ -164,6 +184,10 @@ impl Kind {
             Kind::HandoffAdded => "handoff.added",
             Kind::MemoryAdded => "memory.added",
             Kind::MemoryForgotten => "memory.forgotten",
+            Kind::MemoryStale => "memory.stale",
+            Kind::MemoryPromoted => "memory.promoted",
+            Kind::MemoryDistilled => "memory.distilled",
+            Kind::MemoryDistillFailed => "memory.distill_failed",
             Kind::BacklogAdded => "backlog.added",
             Kind::BacklogClosed => "backlog.closed",
             Kind::PluginPaused => "plugin.paused",
@@ -174,6 +198,64 @@ impl Kind {
 
     pub fn named(name: &str) -> Option<Kind> {
         Kind::ALL.into_iter().find(|kind| kind.name() == name)
+    }
+
+    /// When it happens, in a line: what `crystal plugin events` says of it.
+    pub fn about(self) -> &'static str {
+        match self {
+            Kind::SessionStarted => "a session starts, or starts again",
+            Kind::SessionRenamed => "a session gets another name",
+            Kind::SessionWorking => "a session's agent starts working on a turn",
+            Kind::SessionWaiting => "a session's agent comes to wait on you",
+            Kind::SessionDone => "a session's agent finishes a turn nobody was watching",
+            Kind::SessionIdle => "a session's agent is at its prompt, its turn seen",
+            Kind::SessionEnded => "a session's program ends, or the session is killed",
+            Kind::SessionStartFailed => "a session can't start again after a restart",
+            Kind::SessionRemoved => "a session leaves the list: killed, or its worktree removed",
+            Kind::SessionArchived => "a session is stopped and kept in the archive",
+            Kind::SessionUnarchived => "a session is started again from the archive",
+            Kind::SessionOpenedInTerminal => "a background task is opened in a terminal",
+            Kind::SessionClaimed => "an agent takes over saying what a session is doing",
+            Kind::SessionReleased => "that agent lets go of the session",
+            Kind::SubagentStarted => "a session's agent starts a subagent",
+            Kind::SubagentStopped => "that subagent finishes",
+            Kind::SessionMessage => "a session is sent a message: by another session, or by you",
+            Kind::SessionBell => "a session's program rings the bell while nobody's watching",
+            Kind::SessionCopyDropped => "a session's program copies while nobody's watching",
+            Kind::TaskOpened => "a task is made, or opened again by a follow-up",
+            Kind::TaskStarted => "a task made to start later starts",
+            Kind::TaskWaiting => "a task's agent ends a turn with the task still open",
+            Kind::TaskReminded => "an agent ending its turn is reminded to close its task",
+            Kind::TaskClosed => "a task closes, done, failed or cancelled",
+            Kind::TaskArtifact => "a file is kept with a task as it closes",
+            Kind::RunStarted => "a background task starts a run of Claude",
+            Kind::RunToolUse => "a background task's Claude uses a tool",
+            Kind::RunAsking => "a background task's Claude asks you for a permission",
+            Kind::RunAnswered => "you answer it",
+            Kind::RunInterrupted => "you stop a background task's run halfway",
+            Kind::RunEnded => "that run ends",
+            Kind::FlowStarted => "a flow run starts",
+            Kind::FlowStepStarted => "a flow run starts a step",
+            Kind::FlowStepEnded => "a step's run ends: done, at its gate, or failed",
+            Kind::FlowGate => "a flow run waits at a gate for you",
+            Kind::FlowGateAnswered => "you approve a gate, or send the run back",
+            Kind::FlowEnded => "a flow run ends",
+            Kind::WorktreeCreated => "crystal makes a worktree",
+            Kind::WorktreeRemoved => "crystal removes one",
+            Kind::WorktreeHookFailed => "a worktree's create or delete hook fails",
+            Kind::HandoffAdded => "a note goes in a worktree's handoff file",
+            Kind::MemoryAdded => "an entry is added to a project's memory",
+            Kind::MemoryForgotten => "an entry is forgotten",
+            Kind::MemoryStale => "every file an entry is about has changed since it was said",
+            Kind::MemoryPromoted => "an entry is written into the project's CLAUDE.md or AGENTS.md",
+            Kind::MemoryDistilled => "the distiller has read what a session did",
+            Kind::MemoryDistillFailed => "the distiller couldn't read what a session did",
+            Kind::BacklogAdded => "an item goes on a project's backlog",
+            Kind::BacklogClosed => "an item is marked done",
+            Kind::PluginPaused => "a plugin is paused for failing",
+            Kind::DaemonHandedOver => "the daemon is handed over to another crystal",
+            Kind::DaemonRestarted => "the daemon, restarted cold, has started its sessions again",
+        }
     }
 
     /// The event for a session's agent coming to do `activity`.
@@ -249,6 +331,13 @@ pub struct Event {
     pub subagent: Option<Subagent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<MessageAbout>,
+    /// What the distiller made of what a session did, or why it couldn't.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub distill: Option<DistillAbout>,
+    /// The file it's about: the instructions file an entry of memory was
+    /// written into.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<PathBuf>,
 }
 
 /// The session an event is about, as it was then.
@@ -290,6 +379,9 @@ pub struct RunAbout {
     /// The permission Claude asks for, or that was answered.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub asking: Option<Asking>,
+    /// The tool Claude used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<ToolUse>,
     /// How the user answered it: `allow`, `deny` or `always`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decision: Option<Answer>,
@@ -380,6 +472,45 @@ pub struct DaemonAbout {
     pub failed: Vec<String>,
 }
 
+/// A tool a background task's Claude used: its name, and the gist of what
+/// it was given, like the command it ran.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolUse {
+    pub name: String,
+    pub gist: String,
+}
+
+/// A pass of the distiller over what a session did: how many entries it
+/// added to the project's memory, found there already and turned down,
+/// and what it cost; or why it failed.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct DistillAbout {
+    pub added: usize,
+    pub again: usize,
+    pub rejected: usize,
+    pub cost_usd: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed: Option<String>,
+}
+
+impl DistillAbout {
+    /// What came of it, in a line: `2 added, 1 seen again ($0.0012)`, or
+    /// why it failed.
+    pub fn line(&self) -> String {
+        if let Some(why) = &self.failed {
+            return why.clone();
+        }
+        let mut line = format!("{} added", self.added);
+        if self.again > 0 {
+            line.push_str(&format!(", {} seen again", self.again));
+        }
+        if self.rejected > 0 {
+            line.push_str(&format!(", {} rejected", self.rejected));
+        }
+        format!("{line}{}", cost(Some(self.cost_usd)))
+    }
+}
+
 impl Event {
     /// An event of `kind` about nothing yet, for the constructors to fill
     /// in. The daemon gives it its `seq` and `at`.
@@ -403,6 +534,8 @@ impl Event {
             daemon: None,
             subagent: None,
             message: None,
+            distill: None,
+            file: None,
         }
     }
 
@@ -540,6 +673,18 @@ impl Event {
         Event {
             run: Some(run),
             ..Event::about_session(Kind::RunEnded, session)
+        }
+    }
+
+    /// The background task `session`'s Claude used `tool`.
+    pub fn tool_use(session: &SessionInfo, tool: ToolUse) -> Event {
+        let run = RunAbout {
+            tool: Some(tool),
+            ..RunAbout::default()
+        };
+        Event {
+            run: Some(run),
+            ..Event::about_session(Kind::RunToolUse, session)
         }
     }
 
@@ -698,6 +843,29 @@ impl Event {
         }
     }
 
+    /// `entry` of `project`'s memory was written into `file`, the
+    /// project's CLAUDE.md or AGENTS.md.
+    pub fn promoted(project: PathBuf, entry: Entry, file: PathBuf) -> Event {
+        Event {
+            file: Some(file),
+            ..Event::memory(Kind::MemoryPromoted, project, entry)
+        }
+    }
+
+    /// The distiller read what `session` did: `distill` says what came of
+    /// it, and with its `failed`, why it couldn't.
+    pub fn distilled(session: &SessionInfo, distill: DistillAbout) -> Event {
+        let kind = if distill.failed.is_some() {
+            Kind::MemoryDistillFailed
+        } else {
+            Kind::MemoryDistilled
+        };
+        Event {
+            distill: Some(distill),
+            ..Event::about_session(kind, session)
+        }
+    }
+
     /// `item` went on `project`'s backlog, or was marked done.
     pub fn backlog(kind: Kind, project: PathBuf, item: BacklogItem) -> Event {
         Event {
@@ -793,15 +961,32 @@ impl Event {
         }
     }
 
+    /// What happened, in a line of its own: its subject and what it says,
+    /// or its name when it says nothing more: `claude-2: working → waiting`,
+    /// `claude-2: session.archived`. A plugin's hooks find it in
+    /// `CRYSTAL_EVENT_TEXT`.
+    pub fn line(&self) -> String {
+        let text = self.text();
+        let text = if text.is_empty() {
+            self.kind.name()
+        } else {
+            &text
+        };
+        format!("{}: {text}", self.subject())
+    }
+
     /// What happened, in words, to follow its subject.
     pub fn text(&self) -> String {
         let said = |text: Option<&str>| text.map(|text| format!(": {text}")).unwrap_or_default();
         match self.kind {
-            Kind::SessionStarted => self.session.as_ref().map_or(String::new(), |session| {
-                let command: Vec<String> =
-                    session.command.iter().map(|a| shell::quote(a)).collect();
-                command.join(" ")
-            }),
+            Kind::SessionStarted | Kind::SessionOpenedInTerminal => {
+                self.session.as_ref().map_or(String::new(), |session| {
+                    let command: Vec<String> =
+                        session.command.iter().map(|a| shell::quote(a)).collect();
+                    command.join(" ")
+                })
+            }
+            Kind::SessionUnarchived => "back from the archive".to_string(),
             Kind::SessionRenamed => format!("was {}", self.from.as_deref().unwrap_or("?")),
             Kind::SessionWorking | Kind::SessionWaiting | Kind::SessionDone | Kind::SessionIdle => {
                 let now = self.session.as_ref().map_or("", |session| &session.status);
@@ -854,27 +1039,32 @@ impl Event {
                 .handoff
                 .as_ref()
                 .map_or(String::new(), |handoff| handoff.note.clone()),
-            Kind::TaskOpened | Kind::TaskStarted | Kind::TaskWaiting | Kind::TaskClosed => {
-                self.task.as_ref().map_or(String::new(), |task| {
-                    let goal = first_line(&task.goal);
-                    match &task.outcome {
-                        None if task.pending => format!("{goal}, to start later"),
-                        None => goal,
-                        Some(outcome) => {
-                            let summary =
-                                (!outcome.summary.is_empty()).then_some(&*outcome.summary);
-                            format!("{}{}", outcome.state().word(), said(summary))
-                        }
+            Kind::TaskOpened
+            | Kind::TaskStarted
+            | Kind::TaskWaiting
+            | Kind::TaskReminded
+            | Kind::TaskClosed => self.task.as_ref().map_or(String::new(), |task| {
+                let goal = first_line(&task.goal);
+                match &task.outcome {
+                    None if task.pending => format!("{goal}, to start later"),
+                    None => goal,
+                    Some(outcome) => {
+                        let summary = (!outcome.summary.is_empty()).then_some(&*outcome.summary);
+                        format!("{}{}", outcome.state().word(), said(summary))
                     }
-                })
-            }
+                }
+            }),
             Kind::RunStarted
+            | Kind::RunToolUse
             | Kind::RunAsking
             | Kind::RunAnswered
             | Kind::RunInterrupted
             | Kind::RunEnded => self.run.as_ref().map_or(String::new(), |run| {
                 if let Some(prompt) = &run.prompt {
                     return prompt.clone();
+                }
+                if let Some(tool) = &run.tool {
+                    return format!("{} {}", tool.name, tool.gist);
                 }
                 let asked = run
                     .asking
@@ -931,16 +1121,26 @@ impl Event {
                 let why = worktree.why.as_deref().unwrap_or("it failed");
                 format!("{path}: {why}")
             }),
-            Kind::MemoryAdded | Kind::MemoryForgotten => {
-                self.memory.as_ref().map_or(String::new(), |entry| {
-                    format!(
-                        "{} ({}) {}",
-                        entry.id,
-                        entry.kind,
-                        memory::one_line(&entry.text)
-                    )
-                })
-            }
+            Kind::MemoryAdded
+            | Kind::MemoryForgotten
+            | Kind::MemoryStale
+            | Kind::MemoryPromoted => self.memory.as_ref().map_or(String::new(), |entry| {
+                let into = self
+                    .file
+                    .as_ref()
+                    .map(|file| format!(" → {}", shell::home_relative(file)))
+                    .unwrap_or_default();
+                format!(
+                    "{} ({}) {}{into}",
+                    entry.id,
+                    entry.kind,
+                    memory::one_line(&entry.text)
+                )
+            }),
+            Kind::MemoryDistilled | Kind::MemoryDistillFailed => self
+                .distill
+                .as_ref()
+                .map_or(String::new(), DistillAbout::line),
             Kind::BacklogAdded | Kind::BacklogClosed => {
                 self.backlog.as_ref().map_or(String::new(), |item| {
                     format!("#{} {}", item.number, first_line(&item.text))
@@ -1071,7 +1271,7 @@ pub fn example(kind: Kind, session: Option<&SessionInfo>, dir: &Path) -> Event {
         id: 1,
         kind: memory::Kind::Gotcha,
         text: "The ledger tests need the database up: make db".into(),
-        files: Vec::new(),
+        files: vec!["Makefile".into()],
         source: memory::Source::User,
         created: now,
         seen: 1,
@@ -1091,6 +1291,8 @@ pub fn example(kind: Kind, session: Option<&SessionInfo>, dir: &Path) -> Event {
         Kind::SessionStarted
         | Kind::SessionRemoved
         | Kind::SessionArchived
+        | Kind::SessionUnarchived
+        | Kind::SessionOpenedInTerminal
         | Kind::SessionBell
         | Kind::SessionCopyDropped => Event::about_session(kind, &session),
         Kind::SessionRenamed => Event::renamed(&session, "old-name"),
@@ -1141,7 +1343,7 @@ pub fn example(kind: Kind, session: Option<&SessionInfo>, dir: &Path) -> Event {
             let text = messages::compose(&from, "The codec moved to crates/codec");
             Event::message(&session, Some(&from), &text)
         }
-        Kind::TaskOpened | Kind::TaskStarted | Kind::TaskWaiting => {
+        Kind::TaskOpened | Kind::TaskStarted | Kind::TaskWaiting | Kind::TaskReminded => {
             Event::task(kind, &session, task)
         }
         Kind::TaskClosed => {
@@ -1170,6 +1372,13 @@ pub fn example(kind: Kind, session: Option<&SessionInfo>, dir: &Path) -> Event {
             )
         }
         Kind::RunStarted => Event::run_started(&session, goal),
+        Kind::RunToolUse => {
+            let tool = ToolUse {
+                name: "Bash".into(),
+                gist: "cargo test".into(),
+            };
+            Event::tool_use(&session, tool)
+        }
         Kind::RunAsking => Event::asking(&session, asking),
         Kind::RunAnswered => Event::answered(&session, Some(asking), Answer::Allow),
         Kind::RunInterrupted => Event::about_session(kind, &session),
@@ -1210,8 +1419,24 @@ pub fn example(kind: Kind, session: Option<&SessionInfo>, dir: &Path) -> Event {
             let why = "the worktree create hook exited with exit status: 1";
             Event::worktree_hook_failed(&worktree, why)
         }
-        Kind::MemoryAdded | Kind::MemoryForgotten => {
+        Kind::MemoryAdded | Kind::MemoryForgotten | Kind::MemoryStale => {
             Event::memory(kind, project::of(dir).path, entry)
+        }
+        Kind::MemoryPromoted => {
+            let project = project::of(dir).path;
+            Event::promoted(project.clone(), entry, project.join("CLAUDE.md"))
+        }
+        Kind::MemoryDistilled | Kind::MemoryDistillFailed => {
+            let failed = (kind == Kind::MemoryDistillFailed)
+                .then(|| "claude -p ended with exit status: 1".to_string());
+            let distill = DistillAbout {
+                added: 2,
+                again: 1,
+                rejected: 0,
+                cost_usd: 0.0012,
+                failed,
+            };
+            Event::distilled(&session, distill)
         }
         Kind::BacklogAdded | Kind::BacklogClosed => {
             Event::backlog(kind, project::of(dir).path, item)
@@ -1520,6 +1745,42 @@ mod tests {
         assert_eq!(released.text(), "by pi");
         let json = serde_json::to_value(&released).unwrap();
         assert!(json["session"].get("reporter").is_none());
+    }
+
+    #[test]
+    fn the_events_added_later_carry_what_they_say_where_plugins_read_it() {
+        let dir = Path::new("/code/app");
+        let json = |kind| serde_json::to_value(example(kind, Some(&session()), dir)).unwrap();
+        let tool = json(Kind::RunToolUse);
+        assert_eq!(tool["run"]["tool"]["name"], "Bash");
+        assert_eq!(tool["run"]["tool"]["gist"], "cargo test");
+        let distilled = json(Kind::MemoryDistilled);
+        assert_eq!(distilled["session"]["name"], "claude");
+        assert_eq!(distilled["distill"]["added"], 2);
+        assert!(distilled["distill"].get("failed").is_none());
+        let failed = json(Kind::MemoryDistillFailed);
+        assert_eq!(
+            failed["distill"]["failed"],
+            "claude -p ended with exit status: 1"
+        );
+        assert_eq!(json(Kind::MemoryPromoted)["file"], "/code/app/CLAUDE.md");
+        assert_eq!(
+            json(Kind::TaskReminded)["task"]["goal"],
+            "Fix the login redirect"
+        );
+        let promoted = example(Kind::MemoryPromoted, None, dir);
+        assert!(
+            promoted.text().ends_with(" → /code/app/CLAUDE.md"),
+            "{}",
+            promoted.text()
+        );
+        let distilled = example(Kind::MemoryDistilled, Some(&session()), dir);
+        assert_eq!(distilled.line(), "claude: 2 added, 1 seen again ($0.0012)");
+        let archived = Event::about_session(Kind::SessionArchived, &session());
+        assert_eq!(archived.line(), "claude: session.archived");
+        for kind in Kind::ALL {
+            assert!(!kind.about().is_empty(), "{kind:?}");
+        }
     }
 
     #[test]

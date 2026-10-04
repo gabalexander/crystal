@@ -632,24 +632,32 @@ pub enum Action {
     ChangeSetting(settings_view::Change),
     /// Have the daemon get the model that searches memory by meaning ready.
     PrepareEmbeddings,
-    /// Turn the plugin called `name` on, or off, in the config file.
+    /// Turn the plugin called `name` on, or off, in the config file: the
+    /// user's own, or the one the project whose main worktree is `project`
+    /// ships, for that project.
     SwitchPlugin {
         name: String,
+        project: Option<PathBuf>,
         on: bool,
     },
-    /// Run one of an installed plugin's actions, about `context`.
+    /// Run one of a plugin's actions, about `context`: an installed
+    /// plugin's, or a project's.
     RunPlugin {
         plugin: String,
+        project: Option<PathBuf>,
         action: String,
         context: plugins::Context,
     },
-    /// Start one of an installed plugin's panes, and show it over the
-    /// panes.
+    /// Start one of a plugin's panes, and show it where it goes.
     OpenPluginPane {
         plugin: String,
+        project: Option<PathBuf>,
         pane: String,
         context: plugins::Context,
     },
+    /// Show a session started already over the panes, as a plugin's pane:
+    /// one `crystal plugin pane open` started.
+    ShowPluginPane(PluginPane),
     /// Run one of the user's `[[keys.command]]`s, about `context`: in a
     /// popup, in a session in `dir` (the pane or tab it's in made ready
     /// already), or in the background.
@@ -713,17 +721,17 @@ pub struct PluginKey {
     pub title: String,
 }
 
-/// A plugin's pane, open over the panes: a session of its own, which ends
-/// when the pane closes. A `[[keys.command]]` popup is one too, with no
-/// plugin.
+/// A plugin's pane, open over the panes or in a popup: a session of its
+/// own, which ends when the pane closes. A `[[keys.command]]` popup is one
+/// too, with no plugin.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PluginPane {
     pub plugin: String,
     pub title: String,
     /// The session's name.
     pub session: String,
-    /// A popup's width and height: a plugin's pane takes all the room
-    /// beside the sidebar.
+    /// A popup's width and height: a pane over the others takes all the
+    /// room beside the sidebar.
     pub popup: Option<Popup>,
 }
 
@@ -737,11 +745,13 @@ pub struct Popup {
 }
 
 impl PluginPane {
-    /// What its frame says on top.
+    /// What its frame says on top: its plugin, if it has one, and its
+    /// title.
     pub fn heading(&self) -> String {
-        match self.popup {
-            Some(_) => format!(" {} ", self.title),
-            None => format!(" {} · {} ", self.plugin, self.title),
+        if self.plugin.is_empty() {
+            format!(" {} ", self.title)
+        } else {
+            format!(" {} · {} ", self.plugin, self.title)
         }
     }
 }
@@ -4146,6 +4156,7 @@ impl App {
             let (plugin, action) = (plugin.to_string(), action.to_string());
             return Some(Action::RunPlugin {
                 plugin,
+                project: None,
                 action,
                 context,
             });
@@ -4339,6 +4350,7 @@ impl App {
                     Pick::Command(command) => self.run(command),
                     Pick::Plugin { plugin, action } => Some(Action::RunPlugin {
                         plugin,
+                        project: None,
                         action,
                         context: self.selected_context(),
                     }),
@@ -4421,6 +4433,7 @@ impl App {
     fn run_plugin_action(&self, taken: &PluginKey) -> Option<Action> {
         Some(Action::RunPlugin {
             plugin: taken.plugin.clone(),
+            project: None,
             action: taken.action.clone(),
             context: self.selected_context(),
         })
@@ -4433,7 +4446,7 @@ impl App {
 
     /// What a plugin's action or pane is told about where it was run from:
     /// the selected session. With none, the event loop says where.
-    fn selected_context(&self) -> plugins::Context {
+    pub fn selected_context(&self) -> plugins::Context {
         self.selected()
             .map(plugins::Context::of_session)
             .unwrap_or_default()
@@ -4460,17 +4473,33 @@ impl App {
                 self.plugins_view = None;
                 None
             }
-            plugins_view::Outcome::Switch { name, on } => Some(Action::SwitchPlugin { name, on }),
-            plugins_view::Outcome::Run { plugin, action } => Some(Action::RunPlugin {
+            plugins_view::Outcome::Switch { name, project, on } => {
+                Some(Action::SwitchPlugin { name, project, on })
+            }
+            plugins_view::Outcome::Run {
                 plugin,
+                project,
+                action,
+            } => Some(Action::RunPlugin {
+                plugin,
+                project,
                 action,
                 context: self.selected_context(),
             }),
-            plugins_view::Outcome::Open { plugin, pane } => Some(Action::OpenPluginPane {
+            // Wherever the pane opens, the view makes way for it.
+            plugins_view::Outcome::Open {
                 plugin,
+                project,
                 pane,
-                context: self.selected_context(),
-            }),
+            } => {
+                self.plugins_view = None;
+                Some(Action::OpenPluginPane {
+                    plugin,
+                    project,
+                    pane,
+                    context: self.selected_context(),
+                })
+            }
         }
     }
 

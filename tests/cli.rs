@@ -7649,11 +7649,49 @@ fn memory_promote_adds_the_entry_to_claude_md_under_notes() {
     // Away from a terminal, it can't ask, so it needs to be told.
     let refused = crystal.fails(&["memory", "-C", repo_dir, "promote", "1"]);
     assert!(refused.contains("--yes"), "{refused}");
+    // A daemon to tell, as there is wherever sessions run.
+    crystal.ok(&["new", "-d", "-n", "here", "sleep", "30"]);
     crystal.ok(&["memory", "-C", repo_dir, "promote", "1", "--yes"]);
     assert_eq!(
         std::fs::read_to_string(repo.join("CLAUDE.md")).unwrap(),
         "# app\n\nRun make test.\n\n## Notes\n\n- Fees are kept in cents\n"
     );
+    let events = crystal.ok(&["events", "-k", "memory.promoted"]);
+    assert!(
+        events.contains("1 (note) Fees are kept in cents → ") && events.contains("CLAUDE.md"),
+        "{events}"
+    );
+}
+
+#[test]
+fn an_entry_whose_files_have_all_changed_is_told_of_as_a_task_closes() {
+    let (crystal, repo) = crystal_remembering();
+    let repo_dir = repo.to_str().unwrap();
+    std::fs::write(repo.join("Makefile"), "test:\n\tcargo test\n").unwrap();
+    crystal.ok(&[
+        "remember",
+        "-C",
+        repo_dir,
+        "-f",
+        "Makefile",
+        "make test runs the tests",
+    ]);
+    crystal.ok(&[
+        "new", "-d", "-n", "fixer", "-c", repo_dir, "-t", "fix it", "sleep", "30",
+    ]);
+    std::fs::write(repo.join("Makefile"), "test:\n\tcargo nextest run\n").unwrap();
+    crystal.ok(&["done", "-n", "fixer", "moved to nextest"]);
+    let stale = || crystal.ok(&["events", "-k", "memory.stale"]);
+    eventually("the entry is told of as stale", || {
+        stale().contains("make test runs the tests")
+    });
+    // Once.
+    crystal.ok(&[
+        "new", "-d", "-n", "again", "-c", repo_dir, "-t", "more", "sleep", "30",
+    ]);
+    crystal.ok(&["done", "-n", "again", "nothing"]);
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(stale().lines().count(), 1, "{}", stale());
 }
 
 #[test]
@@ -10304,6 +10342,11 @@ fn an_agent_that_ends_its_turn_with_its_task_open_is_reminded_once() {
     let reason = said["reason"].as_str().unwrap();
     assert!(reason.contains("crystal done"), "{reason}");
     assert_eq!(crystal.row("agent").unwrap()[1], "working");
+    let events = crystal.ok(&["events", "-k", "task.reminded"]);
+    assert!(
+        events.contains("agent") && events.contains("fix the tests"),
+        "{events}"
+    );
 
     // …and once is enough: it may have its reasons to leave the task open,
     // like a question for the user, so it waits on them.
@@ -10784,6 +10827,11 @@ fn a_background_task_opens_in_a_terminal_in_its_conversation() {
     let card = crystal.ok(&["tasks", "show", "t1"]);
     assert!(card.starts_with("t1  done  fix the tests\n"), "{card}");
     assert!(card.contains("in a terminal"), "{card}");
+    let events = crystal.ok(&["events", "-k", "session.opened_in_terminal"]);
+    assert!(events.contains("fixer"), "{events}");
+    // What Claude did in the background was told of, a tool at a time.
+    let events = crystal.ok(&["events", "-k", "run.tool_use"]);
+    assert!(events.contains("Bash cargo test"), "{events}");
 
     // A session in a terminal is in one already, and a task in the middle
     // of a run is let finish first.
@@ -11454,6 +11502,11 @@ fn the_distiller_keeps_what_a_closed_task_learned() {
         said,
         "distilled fixer: 0 entries added, 1 seen again, 1 rejected ($0.0100)\n  \
          rejected entry 2: \"outcome\" isn't a kind it may give\n"
+    );
+    let events = crystal.ok(&["events", "-k", "memory.distilled"]);
+    assert!(
+        events.contains("0 added, 1 seen again, 1 rejected ($0.0100)"),
+        "{events}"
     );
     let found = crystal.ok(&["memory", "-C", repo_dir, "search", "redis"]);
     assert_eq!(found.lines().count(), 1, "{found}");
@@ -12266,6 +12319,452 @@ fn a_plugin_for_a_newer_crystal_is_listed_but_can_t_be_turned_on() {
         refused.contains(&format!("future can't be installed: it {why}")),
         "{refused}"
     );
+}
+
+#[test]
+fn plugin_events_lists_every_event_a_hook_can_hear() {
+    let crystal = Crystal::new();
+    let listed = crystal.ok(&["plugin", "events"]);
+    assert!(listed.starts_with("EVENT"), "{listed}");
+    for (event, when) in [
+        ("session.waiting", "a session's agent comes to wait on you"),
+        (
+            "session.unarchived",
+            "a session is started again from the archive",
+        ),
+        ("run.tool_use", "a background task's Claude uses a tool"),
+        (
+            "memory.distill_failed",
+            "the distiller couldn't read what a session did",
+        ),
+    ] {
+        let line = listed
+            .lines()
+            .find(|line| line.starts_with(&format!("{event} ")))
+            .unwrap_or_else(|| panic!("{event}: {listed}"));
+        assert!(line.ends_with(when), "{line}");
+    }
+}
+
+#[test]
+fn plugin_run_json_hands_a_hook_the_event_it_gives() {
+    let crystal = Crystal::new();
+    let manifest = r#"
+name = "listener"
+version = "1"
+
+[[events]]
+on = "*"
+command = ["sh", "hook.sh"]
+"#;
+    let hook = r#"{ printf '%s|%s|%s|' "$CRYSTAL_EVENT" "$CRYSTAL_EVENT_TEXT" "$CRYSTAL_SESSION"; cat; } > heard"#;
+    let dir = plugin(&crystal, "listener", manifest, &[("hook.sh", hook)]);
+    let heard = || std::fs::read_to_string(dir.join("heard")).unwrap();
+
+    let closed = r#"{"event":"task.closed","task":{"goal":"Ship it","outcome":{"failed":true,"summary":"tests red","closed":1}}}"#;
+    crystal.ok(&["plugin", "run", "listener", "--json", closed]);
+    let said = heard();
+    assert!(
+        said.starts_with("task.closed|example: failed: tests red|example|{"),
+        "{said}"
+    );
+    let json: serde_json::Value =
+        serde_json::from_str(said.splitn(4, '|').nth(3).unwrap()).unwrap();
+    assert_eq!(json["task"]["goal"], "Ship it");
+    // What it didn't give, the made-up event has.
+    assert_eq!(json["task"]["id"], 12);
+
+    // --event names it, and the JSON comes on standard input, like a line
+    // of `crystal events --json`.
+    let mut run = crystal.command(&[
+        "plugin",
+        "run",
+        "listener",
+        "--event",
+        "session.waiting",
+        "--json",
+        "-",
+    ]);
+    let mut child = run.stdin(Stdio::piped()).spawn().unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(br#"{"event":"session.done","session":{"name":"docs"}}"#)
+        .unwrap();
+    assert!(child.wait().unwrap().success());
+    assert!(
+        heard().starts_with("session.waiting|docs: working → waiting|docs|"),
+        "{}",
+        heard()
+    );
+
+    let refused = crystal.fails(&["plugin", "run", "listener", "--json", "[1]"]);
+    assert!(refused.contains("--json is an object"), "{refused}");
+    let refused = crystal.fails(&["plugin", "run", "listener", "--json", "{}"]);
+    assert!(refused.contains("say which event"), "{refused}");
+    let refused = crystal.fails(&[
+        "plugin",
+        "run",
+        "listener",
+        "--json",
+        r#"{"event":"task.*"}"#,
+    ]);
+    assert!(refused.contains("say one event"), "{refused}");
+}
+
+#[test]
+fn a_hook_runs_as_long_as_its_plugin_says() {
+    let crystal = Crystal::new();
+    let manifest = r#"
+name = "slow"
+version = "1"
+timeout_secs = 1
+
+[[events]]
+on = "session.started"
+command = ["sh", "-c", "sleep 5"]
+"#;
+    plugin(&crystal, "slow", manifest, &[]);
+    crystal.ok(&["plugin", "enable", "slow"]);
+    crystal.ok(&["new", "-d", "-n", "agent", "sleep", "30"]);
+    eventually("the hook is stopped", || {
+        crystal
+            .ok(&["plugin", "log", "slow"])
+            .contains("still running after 1s, so it was stopped")
+    });
+}
+
+/// `example`, one of the example plugins, put in `dir`.
+fn example_plugin(example: &str, dir: &Path) -> PathBuf {
+    let from = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("examples/plugins")
+        .join(example);
+    let to = dir.join(example);
+    std::fs::create_dir_all(&to).unwrap();
+    for entry in std::fs::read_dir(&from).unwrap() {
+        let entry = entry.unwrap();
+        std::fs::copy(entry.path(), to.join(entry.file_name())).unwrap();
+    }
+    to
+}
+
+#[test]
+fn a_projects_plugin_runs_once_it_s_on_for_it_and_hears_only_its_project() {
+    let crystal = Crystal::new();
+    let app = git_repo(crystal.dir.path(), "app");
+    let other = git_repo(crystal.dir.path(), "other");
+    let (app_arg, other_arg) = (app.to_str().unwrap(), other.to_str().unwrap());
+    example_plugin("worktree-env", &app.join(".crystal/plugins"));
+    for repo in [&app, &other] {
+        std::fs::write(repo.join(".env"), "SECRET=1\n").unwrap();
+    }
+
+    let plugins = crystal.ok(&["plugin", "-C", app_arg]);
+    assert!(plugins.contains("app's own, in "), "{plugins}");
+    assert!(plugins.contains("worktree-env  off"), "{plugins}");
+    assert!(
+        !crystal
+            .ok(&["plugin", "-C", other_arg])
+            .contains("worktree-env")
+    );
+    // Not the user's own, nor on until it's turned on for the project.
+    let refused = crystal.fails(&["plugin", "enable", "worktree-env"]);
+    assert!(
+        refused.contains("there's no plugin called worktree-env"),
+        "{refused}"
+    );
+    let refused = crystal.fails(&[
+        "plugin",
+        "enable",
+        "worktree-env",
+        "--project",
+        "-C",
+        app_arg,
+    ]);
+    assert!(refused.contains("--yes"), "{refused}");
+
+    let said = crystal.ok(&[
+        "plugin",
+        "enable",
+        "worktree-env",
+        "--project",
+        "-C",
+        app_arg,
+        "--yes",
+    ]);
+    assert!(said.contains("on worktree.created  sh copy.sh"), "{said}");
+    assert!(
+        said.ends_with("the worktree-env plugin is on, for app alone\n"),
+        "{said}"
+    );
+    let config = std::fs::read_to_string(crystal.config_file()).unwrap();
+    assert!(config.contains("[[project]]\npath = "), "{config}");
+    assert!(config.contains("plugins = [\"worktree-env\"]"), "{config}");
+    assert!(
+        crystal
+            .ok(&["plugin", "-C", app_arg])
+            .contains("worktree-env  on")
+    );
+
+    // The other project's worktree comes first: by the time app's has its
+    // .env, the plugin would have heard of the other's.
+    crystal.ok(&[
+        "new",
+        "-d",
+        "-n",
+        "elsewhere",
+        "-c",
+        other_arg,
+        "-w",
+        "elsewhere",
+        "sleep",
+        "30",
+    ]);
+    crystal.ok(&[
+        "new", "-d", "-n", "feature", "-c", app_arg, "-w", "feature", "sleep", "30",
+    ]);
+    let worktree =
+        |name: &str| PathBuf::from(listed(&crystal, name)["cwd"].as_str().unwrap().to_string());
+    let copied = worktree("feature").join(".env");
+    eventually("the .env is copied", || copied.is_file());
+    assert_eq!(std::fs::read_to_string(&copied).unwrap(), "SECRET=1\n");
+    assert!(!worktree("elsewhere").join(".env").exists());
+    let log = crystal.ok(&["plugin", "log", "worktree-env", "--project", "-C", app_arg]);
+    assert!(log.contains("copied .env into"), "{log}");
+
+    crystal.ok(&[
+        "plugin",
+        "disable",
+        "worktree-env",
+        "--project",
+        "-C",
+        app_arg,
+    ]);
+    let config = std::fs::read_to_string(crystal.config_file()).unwrap();
+    assert!(!config.contains("[[project]]"), "{config}");
+}
+
+#[test]
+fn the_example_plugins_do_what_they_say() {
+    let crystal = Crystal::new();
+    let plugins = crystal.config_home().join("crystal/plugins");
+    for example in ["event-log", "slack"] {
+        let source = example_plugin(example, &crystal.dir.path().join("examples"));
+        crystal.ok(&[
+            "plugin",
+            "install",
+            source.to_str().unwrap(),
+            "--yes",
+            "--enable",
+        ]);
+    }
+    assert!(plugins.join("slack/post.sh").is_file());
+
+    // event-log keeps each event, and its action empties the log.
+    crystal.ok(&["new", "-d", "-n", "agent", "sleep", "30"]);
+    let state = crystal
+        .dir
+        .path()
+        .join("crystal.plugins/event-log/events.jsonl");
+    eventually("the event is logged", || {
+        std::fs::read_to_string(&state)
+            .is_ok_and(|log| log.contains(r#""event":"session.started""#))
+    });
+    crystal.ok(&["plugin", "run", "event-log", "clear"]);
+    assert_eq!(std::fs::read_to_string(&state).unwrap(), "");
+
+    // slack posts what failed, with the URL it's given, and nothing else.
+    let bin = crystal.dir.path().join("curl-bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    script(&bin.join("curl"), "printf '%s\\n' \"$@\" > \"$CURL_LOG\"\n");
+    let curl_log = crystal.dir.path().join("curl.log");
+    let post = |json: &str| {
+        let out = crystal
+            .command(&["plugin", "run", "slack", "--json", json])
+            .env("PATH", path_with(&bin))
+            .env("CURL_LOG", &curl_log)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let failed = r#"{"event":"task.closed","task":{"outcome":{"failed":true,"summary":"tests \"red\"","closed":1}}}"#;
+    assert!(post(failed).contains("no webhook yet"));
+    assert!(!curl_log.exists());
+    let config = crystal.config_home().join("crystal/plugin-config/slack");
+    std::fs::write(config.join("webhook-url"), "https://hooks.example/T1\n").unwrap();
+    post(failed);
+    let sent = std::fs::read_to_string(&curl_log).unwrap();
+    assert!(
+        sent.contains(r#"{"text":"[task.closed] example: failed: tests \"red\""}"#),
+        "{sent}"
+    );
+    assert!(sent.ends_with("https://hooks.example/T1\n"), "{sent}");
+    std::fs::remove_file(&curl_log).unwrap();
+    post(
+        r#"{"event":"task.closed","task":{"outcome":{"failed":false,"summary":"fixed","closed":1}}}"#,
+    );
+    assert!(!curl_log.exists(), "a task done isn't posted");
+}
+
+#[test]
+fn a_plugin_pane_opens_where_it_says_from_the_command_line() {
+    let crystal = Crystal::new();
+    let manifest = r#"
+name = "board"
+version = "0.1.0"
+
+[[panes]]
+id = "show"
+title = "The board"
+command = ["sh", "show.sh"]
+"#;
+    let script = "echo \"the board for $CRYSTAL_PLUGIN\"\nexec sleep 30\n";
+    plugin(&crystal, "board", manifest, &[("show.sh", script)]);
+    crystal.ok(&["new", "-d", "-n", "agent", "sleep", "30"]);
+    let refused = crystal.fails(&["plugin", "pane", "open", "board", "show"]);
+    assert!(
+        refused.contains("turn it on with `crystal plugin enable board`"),
+        "{refused}"
+    );
+    crystal.ok(&["plugin", "enable", "board"]);
+
+    // Over the panes takes a TUI; its session goes with the try.
+    let refused = crystal.fails(&["plugin", "pane", "open", "board", "show"]);
+    assert!(refused.contains("no TUI is running"), "{refused}");
+    assert!(
+        refused.contains("split, zoomed or tab do without one"),
+        "{refused}"
+    );
+    assert!(crystal.row("board-show").is_none());
+    let refused = crystal.fails(&[
+        "plugin",
+        "pane",
+        "open",
+        "board",
+        "show",
+        "--placement",
+        "split",
+        "--width",
+        "40",
+    ]);
+    assert!(refused.contains("only a popup has a width"), "{refused}");
+    let refused = crystal.fails(&["plugin", "pane", "open", "board", "nope"]);
+    assert!(
+        refused.contains("board has no pane nope; its panes: show"),
+        "{refused}"
+    );
+
+    // Split off beside a session, or in a tab of its own, it's a session
+    // among the others, TUI or not.
+    let said = crystal.ok(&[
+        "plugin",
+        "pane",
+        "open",
+        "board",
+        "show",
+        "--placement",
+        "split",
+        "--session",
+        "agent",
+        "--down",
+    ]);
+    assert_eq!(said, "board-show\n");
+    let layout = crystal.ok(&["layout"]);
+    assert!(
+        layout.contains(
+            "one above the other, 50% first\n      the selection's: agent\n      board-show\n"
+        ),
+        "{layout}"
+    );
+    crystal.ok(&[
+        "plugin",
+        "pane",
+        "open",
+        "board",
+        "show",
+        "--placement",
+        "tab",
+    ]);
+    let layout = crystal.ok(&["layout"]);
+    assert!(
+        layout.contains("2 The board (in front)\n  sessions  board-show-2\n"),
+        "{layout}"
+    );
+
+    // With a TUI, a popup comes up over everything, with the keyboard.
+    crystal.ok(&["kill", "board-show"]);
+    crystal.ok(&["kill", "board-show-2"]);
+    crystal.ok(&["tab", "close", "2"]);
+    let mut tui = crystal.tui();
+    tui.shows("agent");
+    let said = crystal.ok(&[
+        "plugin",
+        "pane",
+        "open",
+        "board",
+        "show",
+        "--placement",
+        "popup",
+        "--height",
+        "10",
+        "--session",
+        "agent",
+    ]);
+    assert_eq!(said, "board-show\n");
+    tui.shows("board · The board");
+    tui.shows("the board for board");
+    let refused = crystal.fails(&["plugin", "pane", "open", "board", "show"]);
+    assert!(
+        refused.contains("The board is open over the panes already"),
+        "{refused}"
+    );
+    tui.type_keys("\x1c");
+    tui.hides("board · The board");
+    eventually("its session ends with it", || {
+        crystal.row("board-show").is_none()
+    });
+}
+
+#[test]
+fn a_plugin_pane_placed_in_a_split_opens_beside_the_selected_session_in_the_tui() {
+    let crystal = Crystal::new();
+    let manifest = r#"
+name = "board"
+version = "0.1.0"
+
+[[panes]]
+id = "show"
+title = "The board"
+placement = "split"
+command = ["sh", "show.sh"]
+"#;
+    plugin(
+        &crystal,
+        "board",
+        manifest,
+        &[("show.sh", "echo 'the board says hi'\nexec sleep 30\n")],
+    );
+    crystal.ok(&["plugin", "enable", "board"]);
+    crystal.ok(&["new", "-d", "-n", "agent", "sleep", "30"]);
+    let mut tui = crystal.tui();
+    tui.shows("agent");
+    // Down past crystal's own eight, to the pane under board.
+    tui.type_keys("X");
+    tui.shows("installed");
+    tui.type_keys("jjjjjjjjj\r");
+    tui.shows("the board says hi");
+    tui.hides("crystal's own");
+    let layout = crystal.ok(&["layout"]);
+    assert!(layout.contains("side by side, 50% first\n"), "{layout}");
+    assert!(layout.contains("board-show"), "{layout}");
+    // A session among the others, it stays once its program has ended.
+    assert!(crystal.row("board-show").is_some());
 }
 
 /// Flows for the tests below, with the settings every test has.
@@ -13299,15 +13798,18 @@ fn a_background_task_s_runs_and_its_task_are_in_the_log() {
             "task.opened",
             "run.started",
             "session.working",
+            "run.tool_use",
             "run.ended",
             "session.done",
             "task.closed"
         ]
     );
     assert_eq!(logged[2]["run"]["prompt"], "fix the tests");
-    assert_eq!(logged[4]["run"]["cost_usd"], 0.0421);
-    assert_eq!(logged[4]["run"]["answer"], "All green on run 1.");
-    assert_eq!(logged[6]["task"]["outcome"]["failed"], false);
+    assert_eq!(logged[4]["run"]["tool"]["name"], "Bash");
+    assert_eq!(logged[4]["run"]["tool"]["gist"], "cargo test");
+    assert_eq!(logged[5]["run"]["cost_usd"], 0.0421);
+    assert_eq!(logged[5]["run"]["answer"], "All green on run 1.");
+    assert_eq!(logged[7]["task"]["outcome"]["failed"], false);
 }
 
 #[test]
@@ -14178,6 +14680,8 @@ fn an_archived_agent_leaves_the_list_and_comes_back_where_it_was() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "agent\n");
     assert_eq!(written(&args), "--resume\ns 1\n");
     assert_eq!(crystal.ok(&["ls", "--archived"]), "");
+    let events = crystal.ok(&["events", "-k", "session.unarchived"]);
+    assert!(events.contains("back from the archive"), "{events}");
 
     // Killing an archived session takes it out of the archive.
     crystal.ok(&["archive", "agent"]);

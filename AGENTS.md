@@ -45,9 +45,10 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   `subscribe` a stream of its events, for the CLI and a TUI to read, which picks up again after a handover,
   and `lay_out` a layout command for the TUI; restarting the daemon, handed over or cold
 - `src/layout.rs`: laying out the TUI from the command line: the commands `crystal tab`, `crystal pane`,
-  `crystal title` and `crystal layout apply` send, the order a TUI gets with the id of the session it was run
-  in, what the TUI reports back, the layout it answers with, where the daemon says the user is, and how
-  `crystal layout` prints it
+  `crystal title`, `crystal layout apply` and `crystal plugin pane open` send (a session shown over the panes
+  or in a popup only by a TUI), the order a TUI gets with the id of the session it was run in, what the TUI
+  reports back, the layout it answers with, where the daemon says the user is, and how `crystal layout` prints
+  it
 - `src/layout_file.rs`: layout files, as herdr's `layout.export` and `layout.apply` take them: `crystal layout
   export` writing the tabs with what starts each session again, and `crystal layout apply` reading one (the
   shape `crystal layout --json` prints, with a session's `cwd`, `command` and `env` where it's named),
@@ -112,7 +113,7 @@ whenever what's handed over changes in a way the crystal before couldn't read.
       about, in front or not, a layout applied (each of its tabs in place of the tab of its name or after the
       others, or in place of every tab), and the layout the TUI answers with; and carried out with no TUI
       open, on a state made for it from the tabs kept, the sessions and the flow runs, on a screen of an unseen
-      session's size
+      session's size; a plugin's pane over the panes left to the event loop to show
   - `layout_link.rs`: the TUI's end of the layout commands: offering the daemon to take them, again at once
     after a handover or a restart, each one an event for the loop, and its answers, that it was used (a
     key, the mouse, a paste, focus gained) and when its terminal gains and loses the focus  sent back
@@ -246,8 +247,10 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   - `memory_view.rs`: the memory view (`m`): a project's entries, the filter, forgetting and
     promoting after a `y`, and its drawing
   - `plugins_view.rs`: the plugins view (`X`): every plugin, on or off, with installed ones' actions, panes and
-    link handlers, its keys and drawing; the event loop does the switching, runs actions and opens plugins'
-    panes over the others
+    link handlers, and those the selected session's project ships under its name, which the view turns off
+    but leaves the command line to turn on; its keys and drawing; the event loop does the switching, runs
+    actions and opens plugins' panes where their manifests place them, through the layout commands for those
+    among the panes
   - `timeline.rs`: the timeline (`a`, and `I` for the selected session's): the event log of everything or
     of one scope, a session, its task or its project, read back a page at a time, the newest first, and
     followed while it's open, `Ctrl+S` going through the selection's scopes, filtered as you type and by
@@ -270,7 +273,8 @@ whenever what's handed over changes in a way the crystal before couldn't read.
     the file (`config::set`) and, while it's open, reads the settings and the daemon's `EmbeddingStatus` again
     every half a second
 - `src/daemon.rs`: the daemon: listens on the socket and owns the sessions, and emits an event wherever something
-  happens to them, their tasks, flows, worktrees, memory or backlog; archives sessions and starts them again,
+  happens to them, their tasks, flows, worktrees, memory or backlog, and for the entries of memory gone stale,
+  looked for hourly and as each task closes; archives sessions and starts them again,
   stops agents left idle past `[sessions] stop_idle_after`, and keeps the list of projects sessions ran in;
   after a cold restart, puts the sessions written down back in their places and starts them again, agents
   `[sessions] restart_spacing_ms` apart on a thread of their own, those that can't start kept, failed, saying
@@ -294,9 +298,9 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   descriptors open across the exec, the readers it stops, the gate connections come in through, the helpers
   (hooks, the distiller) it waits for, and waiting for a child by its pid
 - `src/events.rs`: what happens, as events: the one `Event` type, its kinds (a public contract plugins listen
-  for), what each carries, how one reads in a line, the filter a reader gives, the scope a timeline shows (a
-  session, a task or a project), and the made-up event `plugin run --event` tries hooks on; pure, so it's
-  unit-tested
+  for: add one, never rename one) and when each happens, what each carries, how one reads in a line, the filter
+  a reader gives, the scope a timeline shows (a session, a task or a project), and the made-up event `plugin
+  run --event` tries hooks on; pure, so it's unit-tested
 - `src/event_log.rs`: the event log, the `events` table in the database, read and pruned by age and count; and
   the daemon's `Bus`, which numbers each event (a `seq` that never goes back), writes it down and sends it to
   every subscriber: clients streaming over the socket, and the plugins' hooks
@@ -459,7 +463,8 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   index (bm25, prefix and porter-stemmed words), each entry's vector and search by meaning merged with it by
   reciprocal rank fusion, then the reranker's read of the best (nothing when none answers), its migrations,
   the same said again seen again, forgotten entries the distiller can't add back, bringing in a project's JSON file from before, anchors (each file's SHA-256 when
-  an entry was said) and whether an entry holds, fresh, drifting or stale, search, the paragraph every agent is
+  an entry was said) and whether an entry holds, fresh, drifting or stale, the entries gone stale the daemon
+  hasn't told of, search, the paragraph every agent is
   shown at launch (entries about what its worktree changed first, in docket's 800 bytes, tasks' outcomes kept
   by an earlier crystal left out of it), promoting into
   CLAUDE.md, the markdown export, and `enabled`, the one gate everything memory adds goes through
@@ -505,21 +510,29 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   files and the agents they're off for (`[sound]`), and playing one with the system's player, off the thread
   that asked, stopped if it hangs
 - `src/plugins.rs`: plugins: the registry of crystal's own, `enabled`, the gate every one of them goes through
-  (each module's `enabled` asks it), finding installed plugins and why one can't run here (it doesn't fit, or
-  its build failed) or be switched on, switching one in the config's `[plugins]` with `toml_edit`, the context
-  and environment their commands run with, each plugin's settings directory (shared, beside the config) and
-  state directory (each server's), their logs, pausing one that fails, and the plugin a link goes to
-- `src/plugin_manifest.rs`: an installed plugin's `plugin.toml` (build and startup commands, actions, events,
-  panes, link handlers, `min_crystal_version` and `platforms`), read and checked, whether it fits this crystal
-  and this system, and how event patterns match
+  (each module's `enabled` asks it), finding installed plugins and those a project ships in its
+  `.crystal/plugins/` (each known by its `Id`, its name and the project's), why one can't run here (it doesn't
+  fit, or its build failed) or be switched on, switching one in the config's `[plugins]`, or a project's in
+  its `[[project]]` table, with `toml_edit`, the plugins running, the context and environment their commands
+  run with, each plugin's settings directory (shared, beside the config) and state directory (each server's),
+  a project's kept apart under the project's name and hash, their logs, pausing one that fails, and the plugin
+  a link goes to
+- `src/plugin_manifest.rs`: a plugin's `plugin.toml` (build and startup commands, actions, events, panes and where
+  each is placed, link handlers, `min_crystal_version`, `platforms` and `timeout_secs`), read and checked,
+  whether it fits this crystal and this system, and how event patterns match
 - `src/plugin_hooks.rs`: the daemon's side of plugins' `[[events]]` and `[[startup]]`: a subscriber of the bus,
-  each plugin's hooks run one at a time on a thread of its own, with a timeout, a log, and a pause (and a
-  `plugin.paused` event) after failures in a row; startup commands queued the same way by `Hooks::start_up`,
-  which the daemon calls once its sessions are back (and a daemon taking over must call too); and running a hook
-  here, for `plugin run --event`
-- `src/plugin_cli.rs`: `crystal plugin`: listing, switching, running an action or trying hooks on a made-up event,
-  installing and building (`[[build]]`, its output in the plugin's log, a failure noted to keep it off), making
-  and removing
+  each plugin's hooks run one at a time on a thread of its own, with its timeout, a log, and a pause (and a
+  `plugin.paused` event) after failures in a row, a project's hearing only its project's events, each given the
+  event on its standard input, in `CRYSTAL_EVENT_JSON` and in words in `CRYSTAL_EVENT_TEXT`; startup commands
+  queued the same way by `Hooks::start_up`, which the daemon calls once its sessions are back (and a daemon
+  taking over must call too); and running a hook here, for `plugin run --event`
+- `src/plugin_cli.rs`: `crystal plugin`: listing, the project's own too, and the events hooks hear, switching
+  (a project's shown, asked about and built first), running an action, or trying hooks on an event made up,
+  given as JSON or both, opening a pane where it's placed (a session started, then shown over the TUI's panes,
+  or laid out with the layout commands), installing and building (`[[build]]`, its output in the plugin's log,
+  a failure noted to keep it off), making and removing
+- `examples/plugins/`: example plugins, each a `plugin.toml` and its scripts, which a unit test reads and
+  `tests/cli.rs` installs and runs
 - `src/env.rs`: the environment a session's program starts with
 - `src/git.rs`: a directory's project, worktree and branch, a project's linked worktrees, and making and
   removing worktrees, a new branch from `origin`'s default (fetched, with a timeout), the settings' base or
