@@ -701,6 +701,34 @@ pub struct WorktreeSettings {
     /// without a branch of that name starts from the default all the same.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base: Option<String>,
+    /// The directory new worktrees go in, each project's in a directory of
+    /// its own named after it, like `~/worktrees/app/fix-login`, in place
+    /// of `<repo>.worktrees` beside the project: from `/`, or `~` for the
+    /// home directory.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub directory: Option<PathBuf>,
+}
+
+impl WorktreeSettings {
+    /// The directory new worktrees go in, `~` made the home directory, when
+    /// the settings say one.
+    pub fn directory(&self) -> Option<PathBuf> {
+        self.directory.as_deref().map(crate::shell::expand_home)
+    }
+
+    fn check(&self) -> Result<()> {
+        if let Some(directory) = &self.directory {
+            let from_root = directory.is_absolute();
+            let from_home = directory == Path::new("~") || directory.starts_with("~/");
+            if !from_root && !from_home {
+                bail!(
+                    "[worktrees] directory is {}: write it from / or ~",
+                    directory.display()
+                );
+            }
+        }
+        Ok(())
+    }
 }
 
 /// What the TUI shows of the pull requests and issues on a project's
@@ -1172,6 +1200,7 @@ pub fn from_text(text: &str) -> Result<Config> {
     }
     duration(&config.sessions.stop_idle_after).context("in [sessions], stop_idle_after")?;
     config.tasks.check()?;
+    config.worktrees.check()?;
     Keymap::new(&config.keys).map_err(anyhow::Error::msg)?;
     if !SIDEBAR_WIDTHS.contains(&config.sidebar.width) {
         bail!(
@@ -1654,6 +1683,27 @@ back_to = "build"
     }
 
     #[test]
+    fn new_worktrees_go_beside_the_project_unless_a_directory_is_given() {
+        assert_eq!(Config::default().worktrees.directory(), None);
+        let config = parse("[worktrees]\ndirectory = \"/work/trees\"\n").unwrap();
+        assert_eq!(
+            config.worktrees.directory(),
+            Some(PathBuf::from("/work/trees"))
+        );
+        let config = parse("[worktrees]\ndirectory = \"~/trees\"\n").unwrap();
+        let home = std::env::var_os("HOME").unwrap_or_default();
+        assert_eq!(
+            config.worktrees.directory(),
+            Some(PathBuf::from(home).join("trees"))
+        );
+        let relative = parse("[worktrees]\ndirectory = \"trees\"\n").unwrap_err();
+        assert!(
+            format!("{relative:#}").contains("from / or ~"),
+            "{relative:#}"
+        );
+    }
+
+    #[test]
     fn drafts_show_unless_the_forge_settings_hide_them() {
         assert!(!parse("").unwrap().forge.hide_draft_prs);
         let config = parse("[forge]\nhide_draft_prs = true\n").unwrap();
@@ -1901,6 +1951,7 @@ back_to = "build"
             },
             worktrees: WorktreeSettings {
                 base: Some("develop".into()),
+                directory: Some(PathBuf::from("~/worktrees")),
             },
             forge: ForgeSettings {
                 hide_draft_prs: true,

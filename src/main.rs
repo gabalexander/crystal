@@ -82,6 +82,8 @@ mod update;
 mod viewer;
 mod vt;
 mod work;
+mod worktree_cli;
+mod worktree_hooks;
 
 use anyhow::{Result, bail};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
@@ -134,8 +136,9 @@ enum Command {
         detached: bool,
 
         /// Start in a new git worktree on this branch, beside the
-        /// repository in <repo>.worktrees/. The branch is made if it
-        /// doesn't exist, from origin's default branch, fetched first.
+        /// repository in <repo>.worktrees/, or in `[worktrees] directory`.
+        /// The branch is made if it doesn't exist, from origin's default
+        /// branch, fetched first.
         #[arg(short, long, value_name = "BRANCH")]
         worktree: Option<String>,
 
@@ -1391,6 +1394,110 @@ enum ServerCommand {
 
 #[derive(Subcommand)]
 enum WorktreeCommand {
+    /// List the project's worktrees, the main one first, with each one's
+    /// label and how many sessions run in it.
+    #[command(visible_alias = "ls")]
+    List {
+        /// A directory in the project [default: the current one]
+        #[arg(short = 'C', long = "dir", value_name = "DIR")]
+        dir: Option<PathBuf>,
+
+        /// Print them as JSON, each with the names of its sessions.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Make a worktree, and print its directory. A branch that exists is
+    /// checked out as it is; a new one starts from origin's default
+    /// branch, fetched first. It goes beside the repository in
+    /// <repo>.worktrees/, or in `[worktrees] directory`.
+    Create {
+        /// Its branch [default: a new one with a made-up name, like
+        /// brave-otter]
+        branch: Option<String>,
+
+        /// Where a new branch starts, as `new --base` says.
+        #[arg(long, value_name = "REF")]
+        base: Option<String>,
+
+        /// Make it in this directory instead.
+        #[arg(long, value_name = "PATH")]
+        path: Option<PathBuf>,
+
+        /// A few words on what it's for, which the sidebar shows in place
+        /// of its branch.
+        #[arg(long, value_name = "TEXT")]
+        label: Option<String>,
+
+        /// A directory in the project [default: the current one]
+        #[arg(short = 'C', long = "dir", value_name = "DIR")]
+        dir: Option<PathBuf>,
+    },
+    /// Start a session in a worktree, given its directory or its branch,
+    /// and attach to it when run in a terminal: your shell, or the command
+    /// given.
+    Open {
+        /// The worktree's directory, or the branch it has checked out.
+        worktree: String,
+
+        /// Give the worktree this label, as `create --label` does.
+        #[arg(long, value_name = "TEXT")]
+        label: Option<String>,
+
+        /// The session's name [default: from its first prompt, or else the
+        /// program's name]
+        #[arg(short, long)]
+        name: Option<String>,
+
+        /// Don't attach; print the session's name instead.
+        #[arg(short, long)]
+        detached: bool,
+
+        /// Set a variable in the session's environment, as `new -e` does.
+        #[arg(short, long = "env", value_name = "KEY=VALUE", value_parser = variable)]
+        env: Vec<(String, String)>,
+
+        /// A directory in the project [default: the current one]
+        #[arg(short = 'C', long = "dir", value_name = "DIR")]
+        dir: Option<PathBuf>,
+
+        /// The command and its arguments [default: the shell `[terminal]`
+        /// says, or yours]
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
+    },
+    /// Give a worktree a label, a few words on what it's for, which the
+    /// sidebar shows in place of its branch; "" takes it off.
+    Label {
+        /// The worktree's directory, or the branch it has checked out.
+        worktree: String,
+
+        label: String,
+
+        /// A directory in the project [default: the current one]
+        #[arg(short = 'C', long = "dir", value_name = "DIR")]
+        dir: Option<PathBuf>,
+    },
+    /// Move a session into a worktree of its project: its program stops
+    /// and starts again there, an agent in its conversation, told where it
+    /// is now. One in the middle of a turn moves once the turn ends, so an
+    /// agent asked to work in a worktree runs this and ends its turn.
+    Move {
+        /// The worktree on this branch, made if there's none [default: a
+        /// new one, on a branch with a made-up name]
+        branch: Option<String>,
+
+        /// The session to move [default: the one this runs in]
+        #[arg(short, long)]
+        name: Option<String>,
+
+        /// Where a new branch starts, as `new --base` says.
+        #[arg(long, value_name = "REF")]
+        base: Option<String>,
+
+        /// Make a new worktree in this directory.
+        #[arg(long, value_name = "PATH")]
+        path: Option<PathBuf>,
+    },
     /// Remove a worktree, given its directory or its branch. Refuses while
     /// a session runs in it, and when it has changes not committed.
     #[command(visible_alias = "remove")]
@@ -1704,9 +1811,7 @@ fn run(cli: Cli) -> Result<()> {
         }
         Command::Flow { json, command } => flow(&socket, json, command)?,
         Command::Result { name, json } => drive::result(&socket, &name, json)?,
-        Command::Worktree {
-            command: WorktreeCommand::Rm { worktree, force },
-        } => remove_worktree(&socket, &worktree, force)?,
+        Command::Worktree { command } => worktree(&socket, command)?,
         Command::Project { json, command } => project(&socket, json, command)?,
         Command::Tab { command } => tab(&socket, command)?,
         Command::Pane { command } => pane(&socket, command)?,
@@ -2418,9 +2523,72 @@ fn start_dir(
     };
     match worktree {
         Some(NewWorktree { branch, base }) => {
-            client::add_worktree(socket, &cwd, &branch, base.as_deref())
+            client::add_worktree(socket, &cwd, &branch, base.as_deref(), None)
         }
         None => Ok(cwd),
+    }
+}
+
+/// `crystal worktree` and its commands.
+fn worktree(socket: &Path, command: WorktreeCommand) -> Result<()> {
+    match command {
+        WorktreeCommand::List { dir, json } => worktree_cli::list(socket, &here(dir)?, json),
+        WorktreeCommand::Create {
+            branch,
+            base,
+            path,
+            label,
+            dir,
+        } => {
+            let new = worktree_cli::NewWorktree {
+                branch,
+                base,
+                path,
+                label,
+            };
+            worktree_cli::create(socket, &here(dir)?, new)
+        }
+        WorktreeCommand::Open {
+            worktree,
+            label,
+            name,
+            detached,
+            env,
+            dir,
+            command,
+        } => {
+            let path = worktree_cli::find(&here(dir)?, &worktree, label.as_deref())?;
+            let new = NewArgs {
+                name,
+                cwd: Some(path),
+                worktree: None,
+                detached,
+                command,
+                task: None,
+                env,
+            };
+            new_session(socket, new)
+        }
+        WorktreeCommand::Label {
+            worktree,
+            label,
+            dir,
+        } => worktree_cli::label(&here(dir)?, &worktree, &label),
+        WorktreeCommand::Move {
+            branch,
+            name,
+            base,
+            path,
+        } => {
+            let to = worktree_cli::MoveTo {
+                session: name,
+                branch,
+                base,
+                path,
+            };
+            worktree_cli::move_session(socket, to)
+        }
+        WorktreeCommand::Rm { worktree, force } => remove_worktree(socket, &worktree, force),
     }
 }
 

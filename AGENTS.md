@@ -106,7 +106,8 @@ whenever what's handed over changes in a way the crystal before couldn't read.
     not, what needs the user pinned at its top, and the projects folded down to their headings, the selection
     resting on one out of sight; the forge's lists, one asked before the one kept dropped, and the issues
     edited in the issues view laid over what was asked before the forge saved them; the worktrees being
-    removed, for this TUI and for anyone else, as the daemon lists them; no I/O, so it's unit-tested
+    removed, for this TUI and for anyone else, as the daemon lists them; killing the last session in a linked
+    worktree asking whether the worktree goes too; no I/O, so it's unit-tested
     - `app/commands.rs`: the layout commands carried out on the state, each on the tab holding the session it's
       about, in front or not, a layout applied (each of its tabs in place of the tab of its name or after the
       others, or in place of every tab), and the layout the TUI answers with; and carried out with no TUI
@@ -140,10 +141,10 @@ whenever what's handed over changes in a way the crystal before couldn't read.
     from I/O (the event loop keeps them in the database and starts the sessions gone), and its drawing
   - `sidebar.rs`: the sidebar's rows: headings, a folded project's with what's in it, worktree lines with
     what git is in the middle of there, their changes not committed and how far they are from their upstream,
-    and Claude Code's own named by their commits, sessions with their mark, their agent's model and how long
-    ago, the line reported for one under it, terminals drawn apart from agents, the sessions that need the user
-    pinned on top with the tab each is in, and the rail of marks a folded sidebar keeps; what doesn't fit left
-    out
+    Claude Code's own named by their commits and a labelled one by its label, sessions with their mark, their
+    agent's model and how long ago, the line reported for one under it, terminals drawn apart from agents, the
+    sessions that need the user pinned on top with the tab each is in, and the rail of marks a folded sidebar
+    keeps; what doesn't fit left out
   - `keymap.rs`: the sidebar's commands, each with the id `[keys]` names it by, what it does and its default
     keys; keys as the config writes them and as terminals send them, folded into one form; the config's
     keys laid over the defaults, a key given to one command taken from the one that had it, and those written
@@ -275,6 +276,14 @@ whenever what's handed over changes in a way the crystal before couldn't read.
     `worktree.removed`, and everyone who asked answered, a second ask waiting with the first; the worktrees
     being removed listed for anyone who asks, as each TUI does; one in flight handed over with its git still
     running, which the next daemon waits for, then has git try again if the worktree is still there
+  - `daemon/moving.rs`: moving a session into another worktree of its project, for `crystal worktree move`:
+    its program stopped once its agent's turn is over (never reminded of its task meanwhile), then started
+    again there in its place, under its name and id, an agent in its conversation and told where it is now,
+    or failed, saying why; the moves still to come handed over
+- `src/worktree_hooks.rs`: the worktree hooks, `crystal.worktreeCreateHook` and `crystal.worktreeDeleteHook`
+  in git config (adapted from docket's): run on `worktree.created` and `worktree.removed` from the daemon's
+  bus, one at a time, as they're named with the main worktree and the worktree, their output in a log, stopped
+  whole past a timeout, and a failure a `worktree.hook_failed` event
 - `src/handover.rs`: handing the daemon over to a newly installed crystal by exec in its own process, the
   sessions carrying on: what's handed over and its `FORMAT`, the file it's written to and read from, keeping
   descriptors open across the exec, the readers it stops, the gate connections come in through, the helpers
@@ -429,6 +438,8 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   their own, and keeping the worktree's handoff file there too
 - `src/backlog.rs`: a project's backlog, numbered items kept in the database by the daemon alone, its
   markdown export, and `enabled`, the one gate everything the backlog adds goes through
+- `src/worktree_cli.rs`: `crystal worktree list`, `create`, `open` (finding the worktree; `main.rs` starts the
+  session), `label` and `move`, which makes the worktree a session moves into when there's none
 - `src/work.rs`: `crystal done` (with `--artifact`), `handoff`, `tasks` and its commands (`new`, `start`, `show`,
   `cancel`, `log`, `terminal`), reading what a new task carries (`--accept`, and `--pr` and `--issue` from the
   forge, a pull request's worktree found or made), and `backlog`
@@ -436,7 +447,7 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   names, the colors `[colors]` takes, what the mouse does (`[mouse]`) and whether programs' copies go on the
   clipboard (`[clipboard]`); what background tasks may spend and do unasked (`[tasks]`); the shell a new terminal runs
   (`[terminal]`, `-l` for a login shell) and where the TUI starts one, the window's title, the tab bar and
-  the appearance
+  the appearance; where new worktrees start and go (`[worktrees]`)
 - `src/memory.rs`: what a project's sessions learned: the SQLite store in the state directory with its FTS5
   index (bm25, prefix and porter-stemmed words), each entry's vector and search by meaning merged with it by
   reciprocal rank fusion, then the reranker's read of the best (nothing when none answers), its migrations,
@@ -505,7 +516,9 @@ whenever what's handed over changes in a way the crystal before couldn't read.
 - `src/env.rs`: the environment a session's program starts with
 - `src/git.rs`: a directory's project, worktree and branch, a project's linked worktrees, and making and
   removing worktrees, a new branch from `origin`'s default (fetched, with a timeout), the settings' base or
-  `--base`, a pull request's with its commits fetched from `origin`, the patches the diff reads,
+  `--base`, beside the project in `<repo>.worktrees`, in the settings' directory or at `--path`, a pull
+  request's with its commits fetched from `origin`, a linked worktree's label, kept in its own git directory,
+  a path git config names, the patches the diff reads,
   the files a worktree changed since its branch left the default one, what git is in the middle of in a
   worktree (a merge, a rebase, a cherry-pick or a revert) and the branch a rebase keeps though HEAD is
   detached, the subject of the commit each of Claude Code's own worktrees (`.claude/worktrees`) is at, what a

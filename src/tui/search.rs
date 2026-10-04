@@ -54,12 +54,13 @@ pub fn session_match(query: &str, session: &SessionInfo, around: Around) -> Opti
 }
 
 /// Whether `worktree`, one with no sessions, matches `query`: by its
-/// project, its branch or, for one Claude Code made for itself, `subject`,
-/// the subject of the commit it's at; or by its directory, whole.
-pub fn worktree_match(query: &str, worktree: &Worktree, subject: Option<&str>) -> bool {
+/// project, its branch or `name`, what the sidebar names it by in place of
+/// its branch (the subject of the commit it's at, for one Claude Code made
+/// for itself, or the label it was given); or by its directory, whole.
+pub fn worktree_match(query: &str, worktree: &Worktree, name: Option<&str>) -> bool {
     let mut also = vec![worktree.project.clone()];
     also.extend(worktree.branch.clone());
-    also.extend(subject.map(str::to_string));
+    also.extend(name.map(str::to_string));
     let whole = [shell::home_relative(&worktree.path)];
     found(query, "", &also, &whole).is_some()
 }

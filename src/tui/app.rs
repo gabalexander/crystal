@@ -256,6 +256,12 @@ pub enum Confirm {
         branch: String,
         force: bool,
     },
+    /// Remove the linked worktree at `path`, called `name`, which the
+    /// session just killed was the last in.
+    RemoveEmptied {
+        path: PathBuf,
+        name: String,
+    },
     /// Close the tab in front, tab `number`, and kill the sessions in it.
     CloseTab {
         number: usize,
@@ -288,6 +294,9 @@ impl Confirm {
                 force: true,
                 ..
             } => format!("{branch} has uncommitted changes: remove it and lose them? y/n"),
+            Confirm::RemoveEmptied { name, .. } => {
+                format!("nothing else is in worktree {name}: remove it too? y/n")
+            }
             Confirm::CloseTab { number, sessions } => {
                 let count = sessions.len();
                 let noun = if count == 1 { "session" } else { "sessions" };
@@ -313,6 +322,11 @@ impl Confirm {
                 path,
                 branch,
                 force,
+            },
+            Confirm::RemoveEmptied { path, name } => Action::RemoveWorktree {
+                path,
+                branch: name,
+                force: false,
             },
             Confirm::CloseTab { sessions, .. } => Action::KillAll(sessions),
             Confirm::ForgetProject { path, .. } => Action::ForgetProject(path),
@@ -801,6 +815,9 @@ pub struct App {
     /// commit each is at, by its directory, as git last said: what the
     /// sidebar names one by.
     subjects: HashMap<PathBuf, String>,
+    /// The labels each project's linked worktrees were given, by their
+    /// directories, as git was last asked: what the sidebar names one by.
+    labels: HashMap<PathBuf, HashMap<PathBuf, String>>,
     /// What git last counted of each worktree the sidebar shows, by its
     /// directory: its changes not committed, and how far its branch is from
     /// its upstream.
@@ -926,6 +943,9 @@ pub struct App {
     /// Whether draft pull requests are left out of the pull requests view,
     /// the tab bar's count and `/`, as the settings say.
     hide_draft_prs: bool,
+    /// Where new worktrees go, when the settings say: `[worktrees]
+    /// directory`.
+    worktree_directory: Option<PathBuf>,
     /// The issues view, while it's open.
     issues: Option<IssuesView>,
     /// The pull requests view, while it's open.
@@ -1084,6 +1104,7 @@ impl App {
             on_worktree: None,
             worktrees: HashMap::new(),
             subjects: HashMap::new(),
+            labels: HashMap::new(),
             stats: HashMap::new(),
             stats_due: HashSet::new(),
             folded: BTreeSet::new(),
@@ -1127,6 +1148,7 @@ impl App {
             issues_asked: HashMap::new(),
             issue_edits: HashMap::new(),
             hide_draft_prs: false,
+            worktree_directory: None,
             issues: None,
             pull_requests_view: None,
             view: None,
@@ -1330,6 +1352,7 @@ impl App {
         self.github_on = forge::enabled(config);
         self.hide_draft_prs = config.forge.hide_draft_prs;
         self.flows_on = flows::enabled(config);
+        self.worktree_directory = config.worktrees.directory();
     }
 
     /// Whether the TUI asks the forge about the sessions' projects.
@@ -2012,7 +2035,9 @@ impl App {
         }
         let mut empty = self.empty_worktrees();
         empty.retain(|worktree| {
-            search::worktree_match(query, worktree, self.subject_of(&worktree.path))
+            let path = &worktree.path;
+            let also = self.subject_of(path).or_else(|| self.label_of(path));
+            search::worktree_match(query, worktree, also)
         });
         let mut projects: Vec<&PathBuf> = empty.iter().map(|w| &w.project_path).collect();
         projects.extend(self.pull_requests.keys());
@@ -2194,6 +2219,24 @@ impl App {
     /// one Claude Code made for itself and git has said.
     pub fn subject_of(&self, path: &Path) -> Option<&str> {
         self.subjects.get(path).map(String::as_str)
+    }
+
+    /// Takes the labels the linked worktrees of `project` were given, by
+    /// their directories, in place of those known before.
+    pub fn set_labels(&mut self, project: &Path, labels: HashMap<PathBuf, String>) {
+        if labels.is_empty() {
+            self.labels.remove(project);
+        } else {
+            self.labels.insert(project.to_path_buf(), labels);
+        }
+    }
+
+    /// The label the worktree at `path` was given, if it has one.
+    pub fn label_of(&self, path: &Path) -> Option<&str> {
+        self.labels
+            .values()
+            .find_map(|labels| labels.get(path))
+            .map(String::as_str)
     }
 
     /// Takes what git counted of the worktree at `path`, or forgets it when
@@ -3411,8 +3454,15 @@ impl App {
             }
             // The daemon removes a worktree; its line says so until the
             // daemon says it's done.
-            if let Confirm::RemoveWorktree { path, .. } = &confirm {
+            if let Confirm::RemoveWorktree { path, .. } | Confirm::RemoveEmptied { path, .. } =
+                &confirm
+            {
                 self.removing.insert(path.clone());
+            }
+            // Killing the last session in a worktree leaves it with nothing
+            // in it: the next question is whether it goes too.
+            if let Confirm::Kill(name) = &confirm {
+                self.confirm = self.emptied_by_killing(name);
             }
             return Some(confirm.action());
         }
@@ -4717,6 +4767,39 @@ impl App {
         }
     }
 
+    /// What to ask about the worktree killing the session called `name`
+    /// leaves with nothing in it, if it does: a linked worktree, not one
+    /// Claude Code made for itself, with no other session in it, in any
+    /// tab, running or not, that the daemon isn't removing already.
+    fn emptied_by_killing(&self, name: &str) -> Option<Confirm> {
+        let killed = self.sessions.iter().find(|session| session.name == name)?;
+        let worktree = killed.worktree.as_ref()?;
+        if worktree.main || worktree.claude_codes_own() || self.removing(&worktree.path) {
+            return None;
+        }
+        let others = self.sessions.iter().any(|session| {
+            session.name != name
+                && session
+                    .worktree
+                    .as_ref()
+                    .is_some_and(|w| w.path == worktree.path)
+        });
+        if others {
+            return None;
+        }
+        let name = match self.label_of(&worktree.path) {
+            Some(label) => label.to_string(),
+            None => worktree
+                .branch
+                .clone()
+                .unwrap_or_else(|| "(detached)".to_string()),
+        };
+        Some(Confirm::RemoveEmptied {
+            path: worktree.path.clone(),
+            name,
+        })
+    }
+
     /// Asks before removing the worktree at `path`, on `branch`, unless the
     /// daemon is removing it already.
     fn confirm_removal(&mut self, path: PathBuf, branch: String) {
@@ -5334,6 +5417,7 @@ impl App {
             codex_models: self.codex_models.clone().unwrap_or_default(),
             background: self.tasks_on,
             branch: names::random(),
+            worktree_directory: self.worktree_directory.clone(),
         }
     }
 
@@ -7538,6 +7622,61 @@ mod tests {
         app.ask_to_force_removal("/code/app.worktrees/fix".into(), "fix".into());
         assert_eq!(press(&mut app, KeyCode::Char('n')), None);
         assert_eq!(app.confirm(), None);
+    }
+
+    #[test]
+    fn killing_the_last_session_in_a_worktree_asks_whether_it_goes_too() {
+        let mut app = App::new(None);
+        app.set_sessions(vec![
+            in_worktree("planner", "main", State::Running),
+            in_worktree("fixer", "fix", State::Running),
+        ]);
+        app.select("fixer");
+        press(&mut app, KeyCode::Char('x'));
+        assert_eq!(
+            press(&mut app, KeyCode::Char('y')),
+            Some(Action::Kill("fixer".into()))
+        );
+        assert_eq!(
+            app.confirm().map(Confirm::question).as_deref(),
+            Some("nothing else is in worktree fix: remove it too? y/n")
+        );
+        assert_eq!(
+            press(&mut app, KeyCode::Char('y')),
+            Some(removal_of("fix", false))
+        );
+        assert!(app.removing(Path::new("/code/app.worktrees/fix")));
+    }
+
+    #[test]
+    fn the_emptied_worktree_stays_unless_it_s_a_yes() {
+        let mut app = App::new(None);
+        app.set_sessions(vec![in_worktree("fixer", "fix", State::Running)]);
+        app.select("fixer");
+        press(&mut app, KeyCode::Char('x'));
+        press(&mut app, KeyCode::Char('y'));
+        assert_eq!(press(&mut app, KeyCode::Char('n')), None);
+        assert_eq!(app.confirm(), None);
+        assert!(!app.removing(Path::new("/code/app.worktrees/fix")));
+    }
+
+    #[test]
+    fn a_worktree_with_something_left_in_it_or_the_main_one_isn_t_asked_about() {
+        let mut app = App::new(None);
+        app.set_sessions(vec![
+            in_worktree("fixer", "fix", State::Running),
+            in_worktree("tests", "fix", State::Exited { code: 0 }),
+            in_worktree("planner", "main", State::Running),
+        ]);
+        for name in ["fixer", "planner"] {
+            app.select(name);
+            press(&mut app, KeyCode::Char('x'));
+            assert_eq!(
+                press(&mut app, KeyCode::Char('y')),
+                Some(Action::Kill(name.into()))
+            );
+            assert_eq!(app.confirm(), None, "{name}");
+        }
     }
 
     #[test]

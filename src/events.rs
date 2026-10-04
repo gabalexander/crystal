@@ -63,6 +63,7 @@ pub enum Kind {
     FlowEnded,
     WorktreeCreated,
     WorktreeRemoved,
+    WorktreeHookFailed,
     HandoffAdded,
     MemoryAdded,
     MemoryForgotten,
@@ -74,7 +75,7 @@ pub enum Kind {
 }
 
 impl Kind {
-    pub const ALL: [Kind; 43] = [
+    pub const ALL: [Kind; 44] = [
         Kind::SessionStarted,
         Kind::SessionRenamed,
         Kind::SessionWorking,
@@ -110,6 +111,7 @@ impl Kind {
         Kind::FlowEnded,
         Kind::WorktreeCreated,
         Kind::WorktreeRemoved,
+        Kind::WorktreeHookFailed,
         Kind::HandoffAdded,
         Kind::MemoryAdded,
         Kind::MemoryForgotten,
@@ -158,6 +160,7 @@ impl Kind {
             Kind::FlowEnded => "flow.ended",
             Kind::WorktreeCreated => "worktree.created",
             Kind::WorktreeRemoved => "worktree.removed",
+            Kind::WorktreeHookFailed => "worktree.hook_failed",
             Kind::HandoffAdded => "handoff.added",
             Kind::MemoryAdded => "memory.added",
             Kind::MemoryForgotten => "memory.forgotten",
@@ -325,8 +328,11 @@ pub struct WorktreeAbout {
     pub path: PathBuf,
     pub branch: Option<String>,
     /// Its project's main worktree. A removed worktree's directory is gone,
-    /// so git can't say which project it was in.
+    /// so git can't say which project it was in, unless crystal removed it.
     pub project: Option<PathBuf>,
+    /// Why the hook run on it failed, for `worktree.hook_failed`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub why: Option<String>,
 }
 
 /// A note added to a worktree's handoff file.
@@ -647,11 +653,36 @@ impl Event {
             path: path.to_path_buf(),
             branch: branch.map(String::from),
             project: project.clone(),
+            why: None,
         };
         Event {
             project,
             worktree: Some(worktree),
             ..Event::new(kind)
+        }
+    }
+
+    /// The daemon removed the worktree at `path`, of the project whose main
+    /// worktree is `project`.
+    pub fn worktree_removed(path: &Path, branch: Option<&str>, project: &Path) -> Event {
+        let mut event = Event::worktree(false, path, branch);
+        event.project = Some(project.to_path_buf());
+        if let Some(worktree) = &mut event.worktree {
+            worktree.project = Some(project.to_path_buf());
+        }
+        event
+    }
+
+    /// The hook run on `worktree`, made or removed, failed, for `why`: see
+    /// [`crate::worktree_hooks`].
+    pub fn worktree_hook_failed(worktree: &WorktreeAbout, why: &str) -> Event {
+        Event {
+            project: worktree.project.clone(),
+            worktree: Some(WorktreeAbout {
+                why: Some(why.to_string()),
+                ..worktree.clone()
+            }),
+            ..Event::new(Kind::WorktreeHookFailed)
         }
     }
 
@@ -891,6 +922,11 @@ impl Event {
                     }
                 })
             }
+            Kind::WorktreeHookFailed => self.worktree.as_ref().map_or(String::new(), |worktree| {
+                let path = shell::home_relative(&worktree.path);
+                let why = worktree.why.as_deref().unwrap_or("it failed");
+                format!("{path}: {why}")
+            }),
             Kind::MemoryAdded | Kind::MemoryForgotten => {
                 self.memory.as_ref().map_or(String::new(), |entry| {
                     format!(
@@ -1158,6 +1194,16 @@ pub fn example(kind: Kind, session: Option<&SessionInfo>, dir: &Path) -> Event {
                 .as_ref()
                 .map_or(dir, |worktree| &worktree.path);
             Event::worktree(kind == Kind::WorktreeCreated, path, Some("fix-login"))
+        }
+        Kind::WorktreeHookFailed => {
+            let path = session
+                .worktree
+                .as_ref()
+                .map_or(dir, |worktree| &worktree.path);
+            let made = Event::worktree(true, path, Some("fix-login"));
+            let worktree = made.worktree.expect("a worktree event has its worktree");
+            let why = "the worktree create hook exited with exit status: 1";
+            Event::worktree_hook_failed(&worktree, why)
         }
         Kind::MemoryAdded | Kind::MemoryForgotten => {
             Event::memory(kind, project::of(dir).path, entry)
