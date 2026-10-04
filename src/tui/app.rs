@@ -32,7 +32,7 @@ use super::profiles::{self, ProfilesView};
 use super::pull_requests::{self, PullRequestsView};
 use super::reply::ReplyBox;
 use super::review;
-use super::search;
+use super::search::{self, Around, StatusFilter};
 use super::settings_view::{self, SettingsView};
 use super::split_tree::{Direction, Pane, SplitTree, Way};
 use super::status::Status;
@@ -490,6 +490,10 @@ pub enum Action {
     /// Ask the forge for the open pull requests of the project at this
     /// path, for the pull requests view that's now open.
     ListPullRequests(PathBuf),
+    /// Ask the forges of the projects at these paths for their open pull
+    /// requests, for `/` to find: the projects no session is in, which
+    /// nothing else asks about.
+    FindPullRequests(Vec<PathBuf>),
     /// Post `text` on `topic`, of the project at `project`.
     Comment {
         project: PathBuf,
@@ -668,15 +672,35 @@ pub struct PluginPane {
     pub session: String,
 }
 
-/// The sidebar narrowed to the sessions that match what's typed, while `/`
-/// is open. The selection stays where it was until Enter moves it to the
-/// session the bar is on.
+/// The sidebar narrowed to what matches what's typed, while `/` is open:
+/// the sessions, of every tab, and the projects, worktrees with no
+/// sessions, flow runs and open pull requests: see [`search`]. The
+/// selection stays where it was until Enter picks what the bar is on.
 #[derive(Debug, Default)]
 pub struct Filter {
     pub input: TextInput,
-    /// The session the bar is on, by its id: the sessions are put in order
-    /// again with every fresh list, so an index wouldn't keep to it.
-    highlighted: Option<String>,
+    /// The one status Tab has picked, when it has: only the sessions with
+    /// it are found.
+    pub status: Option<StatusFilter>,
+    /// What the bar is on: the rows are laid out again with every fresh
+    /// list, so a row's place wouldn't keep to it.
+    highlighted: Option<Found>,
+}
+
+/// What `/`'s bar can be on, which Enter or a click picks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Found {
+    /// A session, by its id: picking it selects it.
+    Session(String),
+    /// A worktree with no sessions, a project's main one or a linked one,
+    /// by its directory: picking it puts the selection on it, where Enter
+    /// starts something.
+    Worktree(PathBuf),
+    /// A flow run, by its name: picking it selects the step it's at.
+    Flow(String),
+    /// An open pull request, by its project's main worktree and its
+    /// number: picking it opens the pull requests view on it.
+    PullRequest { project: PathBuf, number: u64 },
 }
 
 pub struct App {
@@ -1637,8 +1661,9 @@ impl App {
 
     /// The sidebar's rows: the sessions under their projects and worktrees,
     /// only those that match while `/`'s filter is open. The linked
-    /// worktrees with no sessions come under their projects too, except
-    /// while the filter is open: it finds sessions.
+    /// worktrees with no sessions come under their projects too, but while
+    /// the filter is open, it adds those it found, with the rest it found:
+    /// see [`App::add_found`].
     pub fn rows(&self) -> Vec<Row> {
         let shown = self.matches();
         let empty = match self.filter {
@@ -1648,6 +1673,9 @@ impl App {
         let mut rows = groups::rows(&self.sessions, self.shown_flows(), &empty, |index| {
             shown.contains(&index)
         });
+        if let Some(filter) = &self.filter {
+            self.add_found(filter, &mut rows);
+        }
         // The projects with no sessions go after those with some, ahead of
         // the sessions outside any repository.
         if self.filter.is_none() {
@@ -1684,6 +1712,109 @@ impl App {
         with_pinned.extend(pinned.into_iter().map(Row::Pinned));
         with_pinned.extend(rows);
         with_pinned
+    }
+
+    /// Adds to the `rows` of the sessions `/`'s filter found the rest of
+    /// what it found, each under its project: the projects with no
+    /// sessions, the worktrees with none and the open pull requests that
+    /// match. Only once something's typed, and while no status is picked:
+    /// before that, they would be everything crystal knows, and they have
+    /// no status.
+    fn add_found(&self, filter: &Filter, rows: &mut Vec<Row>) {
+        let query = filter.input.text();
+        if filter.status.is_some() || query.trim().is_empty() {
+            return;
+        }
+        // Each project's rows, in the order their headings would go in.
+        let mut found: Vec<(PathBuf, Vec<Row>)> = Vec::new();
+        let mut under = |project: &Path, more: Vec<Row>| match found
+            .iter_mut()
+            .find(|(path, _)| path == project)
+        {
+            Some((_, rows)) => rows.extend(more),
+            None => found.push((project.to_path_buf(), more)),
+        };
+        for project in self.quiet_projects() {
+            if search::worktree_match(query, project, None) {
+                under(
+                    &project.path,
+                    vec![
+                        Row::Worktree {
+                            project: project.path.clone(),
+                            path: project.path.clone(),
+                            branch: project.branch.clone(),
+                            main: true,
+                            in_progress: project.in_progress,
+                        },
+                        Row::NoSessions(project.path.clone()),
+                    ],
+                );
+            }
+        }
+        let mut empty = self.empty_worktrees();
+        empty.retain(|worktree| {
+            search::worktree_match(query, worktree, self.subject_of(&worktree.path))
+        });
+        let mut projects: Vec<&PathBuf> = empty.iter().map(|w| &w.project_path).collect();
+        projects.extend(self.pull_requests.keys());
+        projects.sort_by_key(|project| self.known_place(project));
+        projects.dedup();
+        for project in projects {
+            under(project, groups::empty_rows(&empty, project));
+            let name = self.project_name(project);
+            under(project, self.found_pull_requests(query, project, &name));
+        }
+        found.retain(|(_, rows)| !rows.is_empty());
+        let found = found
+            .into_iter()
+            .map(|(path, rows)| (self.project_name(&path), path, rows))
+            .collect();
+        search::place_under_projects(rows, found);
+    }
+
+    /// The rows of the open pull requests of the project at `project`,
+    /// called `name`, that match `query`, as its forge listed them: none
+    /// while the github plugin is off, or before its forge has said.
+    fn found_pull_requests(&self, query: &str, project: &Path, name: &str) -> Vec<Row> {
+        if !self.github_on {
+            return Vec::new();
+        }
+        let Some(Ok((_, pull_requests))) = self.pull_requests.get(project) else {
+            return Vec::new();
+        };
+        pull_requests
+            .iter()
+            .filter(|pull_request| search::pull_request_match(query, pull_request, name).is_some())
+            .map(|pull_request| Row::PullRequest {
+                project: project.to_path_buf(),
+                number: pull_request.number,
+            })
+            .collect()
+    }
+
+    /// Where the project at `project` comes among the projects crystal
+    /// knows, for the order of the headings `/` adds: the ones it doesn't
+    /// know after them, by their paths.
+    fn known_place(&self, project: &Path) -> (usize, PathBuf) {
+        let place = self.known.iter().position(|known| known.path == project);
+        (place.unwrap_or(usize::MAX), project.to_path_buf())
+    }
+
+    /// The name of the project at `project`, by its main worktree: as its
+    /// sessions or crystal's list of projects say, or else its directory's.
+    fn project_name(&self, project: &Path) -> String {
+        let named = self
+            .sessions
+            .iter()
+            .filter_map(|session| session.worktree.as_ref())
+            .chain(&self.known)
+            .find(|worktree| worktree.project_path == project);
+        match named {
+            Some(worktree) => worktree.project.clone(),
+            None => project
+                .file_name()
+                .map_or_else(String::new, |name| name.to_string_lossy().into_owned()),
+        }
     }
 
     /// The sessions the sidebar pins at its top, from every tab: those
@@ -1854,6 +1985,11 @@ impl App {
     /// worktree was removed, or isn't in the tab in front, it goes back to
     /// the selected session.
     fn keep_selection_on_a_row(&mut self) {
+        // While `/`'s filter is open, the rows are what it found: the
+        // selection is looked at again once it closes.
+        if self.filter.is_some() {
+            return;
+        }
         let Some(path) = self.on_worktree.clone() else {
             return;
         };
@@ -1882,10 +2018,63 @@ impl App {
         let Some(filter) = &self.filter else {
             return self.in_tab();
         };
-        let query = filter.input.text();
         (0..self.sessions.len())
-            .filter(|&index| search::session_match(query, &self.sessions[index]).is_some())
+            .filter(|&index| self.session_found(filter, index).is_some())
             .collect()
+    }
+
+    /// Whether `filter` finds the session at `index`, and if it does, which
+    /// letters of its name it matched: one with the status it keeps to,
+    /// when it keeps to one, that matches what's typed, by itself, the
+    /// name of its tab or the flow run it's a step of.
+    fn session_found(&self, filter: &Filter, index: usize) -> Option<Vec<usize>> {
+        let session = &self.sessions[index];
+        if let Some(status) = filter.status
+            && !status.keeps(Status::of(session))
+        {
+            return None;
+        }
+        let tab = self.tabs.tab_of(&session.name);
+        let tab = tab.map(|tab| self.tabs.all()[tab].name.as_str());
+        let flows = self.shown_flows();
+        let run = groups::flow_step(session, flows).map(|(run, _)| &flows[run]);
+        let around = Around {
+            tab: tab.filter(|name| !name.is_empty()),
+            run,
+        };
+        search::session_match(filter.input.text(), session, around)
+    }
+
+    /// What the bar of `/`'s filter can be on, in the sidebar's order.
+    pub fn found(&self) -> Vec<Found> {
+        self.rows()
+            .iter()
+            .filter_map(|row| self.found_at(row))
+            .collect()
+    }
+
+    /// What picking `row` picks, while `/`'s filter is open: `None` for a
+    /// heading, or a line that goes with the row above it.
+    fn found_at(&self, row: &Row) -> Option<Found> {
+        Some(match row {
+            Row::Session(index) => Found::Session(self.sessions[*index].id.clone()),
+            Row::NoSessions(path) => Found::Worktree(path.clone()),
+            Row::Flow(run) => Found::Flow(self.shown_flows().get(*run)?.name.clone()),
+            Row::PullRequest { project, number } => Found::PullRequest {
+                project: project.clone(),
+                number: *number,
+            },
+            _ => return None,
+        })
+    }
+
+    /// The row `/`'s bar is on, by its place in [`App::rows`], while the
+    /// filter is open and the bar is on something it found.
+    pub fn filter_row(&self) -> Option<usize> {
+        let highlighted = self.filter.as_ref()?.highlighted.as_ref()?;
+        self.rows()
+            .iter()
+            .position(|row| self.found_at(row).as_ref() == Some(highlighted))
     }
 
     /// The name of the tab the session at `index` is in, while `/`'s filter
@@ -1929,18 +2118,36 @@ impl App {
         let Some(filter) = &self.filter else {
             return Vec::new();
         };
-        let session = &self.sessions[index];
-        search::session_match(filter.input.text(), session).unwrap_or_default()
+        self.session_found(filter, index).unwrap_or_default()
+    }
+
+    /// The open pull request numbered `number` of the project at
+    /// `project`, as its forge last listed them, and while `/`'s filter is
+    /// open, which letters of its title to mark.
+    pub fn found_pull_request(
+        &self,
+        project: &Path,
+        number: u64,
+    ) -> Option<(&PullRequest, Vec<usize>)> {
+        let Some(Ok((_, pull_requests))) = self.pull_requests.get(project) else {
+            return None;
+        };
+        let pull_request = pull_requests.iter().find(|pr| pr.number == number)?;
+        let marked = self.filter.as_ref().and_then(|filter| {
+            let name = self.project_name(project);
+            search::pull_request_match(filter.input.text(), pull_request, &name)
+        });
+        Some((pull_request, marked.unwrap_or_default()))
     }
 
     /// The session the sidebar's bar is on: the one the filter's bar is on
     /// while it's open, or else the selected one.
     pub fn sidebar_cursor(&self) -> Option<usize> {
         match &self.filter {
-            Some(filter) => {
-                let id = filter.highlighted.as_ref()?;
-                self.sessions.iter().position(|session| session.id == *id)
-            }
+            Some(filter) => match filter.highlighted.as_ref()? {
+                Found::Session(id) => self.sessions.iter().position(|session| session.id == *id),
+                _ => None,
+            },
             None => self.selected_index(),
         }
     }
@@ -1973,6 +2180,7 @@ impl App {
             view.set_pull_requests(found.clone());
         }
         self.pull_requests.insert(project, found);
+        self.keep_filter_bar_on_a_match();
     }
 
     /// The open pull request for `branch` in the project at `project`, if
@@ -2558,6 +2766,7 @@ impl App {
                 view.refresh(rows);
             }
         }
+        self.keep_filter_bar_on_a_match();
         self.remember_shown();
     }
 
@@ -2770,8 +2979,7 @@ impl App {
             return self.on_pull_requests_key(key);
         }
         if self.filter.is_some() {
-            self.on_filter_key(key);
-            return None;
+            return self.on_filter_key(key);
         }
         if self.resizing {
             self.on_resize_key(key);
@@ -2821,8 +3029,7 @@ impl App {
             && click
             && let Hit::SidebarRow(row) = hit
         {
-            self.click_row(row);
-            return None;
+            return self.click_found(row);
         }
         if self.waiting_on_keyboard() {
             return None;
@@ -3112,7 +3319,8 @@ impl App {
             | Row::Terminals
             | Row::Flow(_)
             | Row::Step { .. }
-            | Row::NeedsYou(_) => return None,
+            | Row::NeedsYou(_)
+            | Row::PullRequest { .. } => return None,
         }
         self.focus = Focus::Sidebar;
         if self.on_worktree.is_some() {
@@ -3247,23 +3455,24 @@ impl App {
         self.view.is_none() && !self.showing_keys() && !self.waiting_on_keyboard()
     }
 
+    /// A click on a sidebar row while `/`'s filter is open picks what's
+    /// there, as Enter would, wherever it is; a heading, or any other row,
+    /// does nothing.
+    fn click_found(&mut self, row: usize) -> Option<Action> {
+        self.focus = Focus::Sidebar;
+        let found = match self.rows().get(row)? {
+            Row::Task(index) => self.found_at(&Row::Session(*index)),
+            row => self.found_at(row),
+        };
+        self.pick(found?)
+    }
+
     /// A click on a sidebar row gives the sidebar the keyboard, and on a
     /// session, or a worktree with none, selects it. A heading leaves the
     /// selection where it was.
     fn click_row(&mut self, row: usize) {
         self.focus = Focus::Sidebar;
         let rows = self.rows();
-        // While `/`'s filter is open, a click on a session picks it, as
-        // Enter would, from whichever tab it's in; any other row does
-        // nothing.
-        if self.filter.is_some() {
-            if let Some(Row::Session(index) | Row::Task(index)) = rows.get(row) {
-                let name = self.sessions[*index].name.clone();
-                self.filter = None;
-                self.select(&name);
-            }
-            return;
-        }
         // A pinned session is selected where it is, in whichever tab.
         if let Some(Row::Pinned(index)) = rows.get(row) {
             let name = self.sessions[*index].name.clone();
@@ -3385,7 +3594,7 @@ impl App {
             Command::Memory => return self.open_memory(),
             Command::Profiles => return self.open_profiles(),
             Command::Keys => self.keys_page = Some(0),
-            Command::Search => self.open_filter(),
+            Command::Search => return self.open_filter(),
             Command::Commands => self.open_command_list(),
             Command::PullRequest => return self.open_pull_request(),
             Command::PullRequests => return self.open_pull_requests(),
@@ -3834,37 +4043,53 @@ impl App {
         }
     }
 
-    /// Opens `/`'s filter, its bar on the selected session.
-    fn open_filter(&mut self) {
-        let highlighted = self.selected().map(|session| session.id.clone());
+    /// Opens `/`'s filter, its bar on the selected session, and has the
+    /// forges asked about the open pull requests of the projects no session
+    /// is in, which nothing has asked about yet, for it to find.
+    fn open_filter(&mut self) -> Option<Action> {
+        let highlighted = self
+            .selected()
+            .map(|session| Found::Session(session.id.clone()));
         self.filter = Some(Filter {
             input: TextInput::default(),
+            status: None,
             highlighted,
         });
+        self.keep_filter_bar_on_a_match();
+        if !self.github_on {
+            return None;
+        }
+        let unasked: Vec<PathBuf> = self
+            .quiet_projects()
+            .into_iter()
+            .map(|project| project.path.clone())
+            .filter(|project| !self.pull_requests.contains_key(project))
+            .collect();
+        (!unasked.is_empty()).then_some(Action::FindPullRequests(unasked))
     }
 
-    /// Keys while `/`'s filter is open: Enter selects the session the bar
-    /// is on, Esc leaves the selection where it was, ↑ and ↓ (or Ctrl+P
-    /// and Ctrl+N) move the bar among the matches, and every other key
-    /// edits the filter. Letters type, so j and k don't move the bar here.
-    fn on_filter_key(&mut self, key: KeyEvent) {
+    /// Keys while `/`'s filter is open: Enter picks what the bar is on, Esc
+    /// leaves the selection where it was, ↑ and ↓ (or Ctrl+P and Ctrl+N)
+    /// move the bar among what's found, Tab and Shift+Tab go round the
+    /// statuses it keeps to, and every other key edits the filter. Letters
+    /// type, so j and k don't move the bar here.
+    fn on_filter_key(&mut self, key: KeyEvent) -> Option<Action> {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
-            KeyCode::Esc => self.filter = None,
-            // A session in another tab brings its tab to the front.
+            KeyCode::Esc => self.close_filter(),
             KeyCode::Enter => {
-                let name = self
-                    .sidebar_cursor()
-                    .map(|index| self.sessions[index].name.clone());
-                self.filter = None;
-                if let Some(name) = name {
-                    self.select(&name);
+                let highlighted = self.filter.as_ref()?.highlighted.clone();
+                match highlighted {
+                    Some(found) => return self.pick(found),
+                    None => self.close_filter(),
                 }
             }
             KeyCode::Up => self.move_filter_bar(-1),
             KeyCode::Down => self.move_filter_bar(1),
             KeyCode::Char('p') if ctrl => self.move_filter_bar(-1),
             KeyCode::Char('n') if ctrl => self.move_filter_bar(1),
+            KeyCode::Tab => self.step_filter_status(1),
+            KeyCode::BackTab => self.step_filter_status(-1),
             _ => {
                 if let Some(filter) = &mut self.filter {
                     filter.input.on_key(&key);
@@ -3872,38 +4097,129 @@ impl App {
                 self.keep_filter_bar_on_a_match();
             }
         }
+        None
     }
 
-    /// Moves the filter's bar `by` matches, stopping at the ends.
-    fn move_filter_bar(&mut self, by: isize) {
-        let matches = self.matches();
-        let at = self
-            .sidebar_cursor()
-            .and_then(|cursor| matches.iter().position(|&index| index == cursor));
-        let Some(at) = at else {
+    /// Closes `/`'s filter, the selection where it was.
+    fn close_filter(&mut self) {
+        self.filter = None;
+        self.keep_selection_on_a_row();
+    }
+
+    /// Closes `/`'s filter and does what picking `found` does: a session is
+    /// selected, in whichever tab it's in; a worktree with no sessions has
+    /// the selection put on it, where Enter starts something; a flow run's
+    /// step it's at is selected; and a pull request is opened in the pull
+    /// requests view.
+    fn pick(&mut self, found: Found) -> Option<Action> {
+        self.filter = None;
+        match found {
+            Found::Session(id) => {
+                let session = self.sessions.iter().find(|session| session.id == id);
+                if let Some(name) = session.map(|session| session.name.clone()) {
+                    self.select(&name);
+                }
+            }
+            Found::Worktree(path) => self.select_worktree(path),
+            Found::Flow(name) => self.select_flow(&name),
+            Found::PullRequest { project, number } => {
+                return self.open_pull_requests_of(project, Some(number));
+            }
+        }
+        self.keep_selection_on_a_row();
+        None
+    }
+
+    /// Puts the selection on the worktree with no sessions at `path`. One
+    /// in a project with sessions shows only in their tabs, so when the tab
+    /// in front has none of them, the first tab that has one comes to the
+    /// front; a project with no sessions shows in every tab.
+    fn select_worktree(&mut self, path: PathBuf) {
+        let project = self
+            .worktrees
+            .values()
+            .flatten()
+            .find(|worktree| worktree.path == path)
+            .map(|worktree| worktree.project_path.clone());
+        let in_project = |session: &SessionInfo| {
+            let worktree = session.worktree.as_ref();
+            project.is_some() && worktree.map(|w| &w.project_path) == project.as_ref()
+        };
+        let tabs: Vec<usize> = self
+            .sessions
+            .iter()
+            .filter(|session| in_project(session))
+            .filter_map(|session| self.tabs.tab_of(&session.name))
+            .collect();
+        if let Some(&tab) = tabs.iter().min()
+            && !tabs.contains(&self.tabs.current_index())
+        {
+            self.go_to_tab(tab);
+        }
+        self.on_worktree = Some(path);
+    }
+
+    /// Selects the session of the step the flow run called `name` is at:
+    /// the latest that has a session.
+    fn select_flow(&mut self, name: &str) {
+        let Some(run) = self.flows.iter().find(|run| run.name == name) else {
             return;
         };
-        let to = matches[at.saturating_add_signed(by).min(matches.len() - 1)];
-        let id = self.sessions[to].id.clone();
-        if let Some(filter) = &mut self.filter {
-            filter.highlighted = Some(id);
+        let at = run
+            .steps
+            .iter()
+            .rev()
+            .filter_map(|step| step.session.clone())
+            .find(|session| self.position(session).is_some());
+        match at {
+            Some(session) => self.select(&session),
+            None => self.notify(format!("no step of {name} has a session")),
         }
     }
 
-    /// Puts the filter's bar on the first match when the session it was on
-    /// doesn't match any more.
+    /// Goes round the statuses `/`'s filter keeps to, `by` one forward or
+    /// back.
+    fn step_filter_status(&mut self, by: isize) {
+        if let Some(filter) = &mut self.filter {
+            filter.status = StatusFilter::step(filter.status, by);
+        }
+        self.keep_filter_bar_on_a_match();
+    }
+
+    /// Moves the filter's bar `by` places among what's found, stopping at
+    /// the ends.
+    fn move_filter_bar(&mut self, by: isize) {
+        let found = self.found();
+        let Some(filter) = &mut self.filter else {
+            return;
+        };
+        let at = filter
+            .highlighted
+            .as_ref()
+            .and_then(|highlighted| found.iter().position(|each| each == highlighted));
+        let Some(at) = at else {
+            return;
+        };
+        let to = at.saturating_add_signed(by).min(found.len() - 1);
+        filter.highlighted = Some(found[to].clone());
+    }
+
+    /// Puts the filter's bar on the first thing found when what it was on
+    /// isn't found any more, while the filter is open.
     fn keep_filter_bar_on_a_match(&mut self) {
-        let matches = self.matches();
-        let on_a_match = self
-            .sidebar_cursor()
-            .is_some_and(|cursor| matches.contains(&cursor));
+        if self.filter.is_none() {
+            return;
+        }
+        let found = self.found();
+        let Some(filter) = &mut self.filter else {
+            return;
+        };
+        let on_a_match = filter
+            .highlighted
+            .as_ref()
+            .is_some_and(|highlighted| found.contains(highlighted));
         if !on_a_match {
-            let first = matches
-                .first()
-                .map(|&index| self.sessions[index].id.clone());
-            if let Some(filter) = &mut self.filter {
-                filter.highlighted = first;
-            }
+            filter.highlighted = found.into_iter().next();
         }
     }
 
@@ -3963,13 +4279,23 @@ impl App {
     /// or says why it can't.
     fn open_pull_requests(&mut self) -> Option<Action> {
         let worktree = self.forge_worktree()?;
-        let project = worktree.project_path;
+        self.open_pull_requests_of(worktree.project_path, None)
+    }
+
+    /// Opens the pull requests view for the project at `project`, on the
+    /// ones listed last until its forge lists them again, with the bar on
+    /// pull request `number` when there's one to put it on.
+    fn open_pull_requests_of(&mut self, project: PathBuf, number: Option<u64>) -> Option<Action> {
         let known = match self.pull_requests.get(&project) {
             Some(Ok((_, pull_requests))) => Some(pull_requests.clone()),
             _ => None,
         };
         let forge = self.forge_of(&project);
-        let view = PullRequestsView::new(project.clone(), worktree.project, forge, known);
+        let name = self.project_name(&project);
+        let mut view = PullRequestsView::new(project.clone(), name, forge, known);
+        if let Some(number) = number {
+            view.list.highlight(number);
+        }
         self.pull_requests_view = Some(view);
         Some(Action::ListPullRequests(project))
     }
@@ -8501,6 +8827,232 @@ mod tests {
             "the bar stops at the last"
         );
         assert_eq!(app.marked_letters(1), vec![0]);
+    }
+
+    #[test]
+    fn slash_finds_a_session_by_the_name_of_its_tab() {
+        let mut app = app_with_a_second_tab(&["a", "b"]);
+        app.go_to_tab(0);
+        press(&mut app, KeyCode::Char('T'));
+        answer(&mut app, "review");
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('/'));
+        type_text(&mut app, "review");
+        let shown: Vec<&str> = app
+            .matches()
+            .iter()
+            .map(|&index| app.sessions()[index].name.as_str())
+            .collect();
+        assert_eq!(shown, ["a", "b"]);
+    }
+
+    #[test]
+    fn slash_finds_a_project_with_no_sessions_and_enter_selects_it() {
+        let mut app = app_with_an_empty_worktree();
+        app.set_known_projects(vec![known("app"), known("api")]);
+        press(&mut app, KeyCode::Char('/'));
+        assert!(
+            app.found()
+                .iter()
+                .all(|found| matches!(found, Found::Session(_))),
+            "before a word is typed, only sessions"
+        );
+        type_text(&mut app, "api");
+        let api = PathBuf::from("/code/api");
+        assert_eq!(app.found(), [Found::Worktree(api.clone())]);
+        let rows = app.rows();
+        let heading = Row::Project {
+            name: "api".into(),
+            path: api.clone(),
+        };
+        let at = rows.iter().position(|row| *row == heading).unwrap();
+        assert!(matches!(rows[at + 1], Row::Worktree { main: true, .. }));
+        assert_eq!(rows[at + 2], Row::NoSessions(api.clone()));
+        assert_eq!(app.filter_row(), Some(at + 2));
+
+        press(&mut app, KeyCode::Enter);
+        assert!(app.filter().is_none());
+        assert_eq!(
+            app.selected_empty_worktree().map(|w| w.project.as_str()),
+            Some("api")
+        );
+    }
+
+    #[test]
+    fn slash_finds_a_worktree_with_no_sessions_by_its_branch() {
+        let mut app = app_with_an_empty_worktree();
+        press(&mut app, KeyCode::Char('/'));
+        type_text(&mut app, "old");
+        let old = PathBuf::from("/code/app.worktrees/old");
+        assert_eq!(app.found(), [Found::Worktree(old)]);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(empty_branch(&app), Some("old"));
+    }
+
+    #[test]
+    fn the_selection_on_a_worktree_with_no_sessions_outlasts_the_filter() {
+        let mut app = app_with_an_empty_worktree();
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(empty_branch(&app), Some("old"));
+        press(&mut app, KeyCode::Char('/'));
+        type_text(&mut app, "planner");
+        app.set_sessions(vec![in_worktree("planner", "main", State::Running)]);
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(empty_branch(&app), Some("old"));
+    }
+
+    #[test]
+    fn slash_finds_an_open_pull_request_and_enter_opens_it_in_the_view() {
+        let mut app = with_agents(&["claude"], vec![in_repo("planner", "main")]);
+        let fix = PullRequest {
+            title: "Fix the login redirect".into(),
+            ..pull_request(57, "fix-login")
+        };
+        let dark = PullRequest {
+            title: "Dark mode".into(),
+            ..pull_request(58, "dark")
+        };
+        let app_path = PathBuf::from("/code/app");
+        app.set_pull_requests(app_path.clone(), on_github(vec![fix, dark]));
+        press(&mut app, KeyCode::Char('/'));
+        type_text(&mut app, "dark");
+        let found = Found::PullRequest {
+            project: app_path.clone(),
+            number: 58,
+        };
+        assert_eq!(app.found(), [found]);
+        let (_, marked) = app.found_pull_request(&app_path, 58).unwrap();
+        assert_eq!(marked, vec![0, 1, 2, 3]);
+
+        assert_eq!(
+            press(&mut app, KeyCode::Enter),
+            Some(Action::ListPullRequests(app_path.clone()))
+        );
+        assert!(app.filter().is_none());
+        let view = app.pull_requests_view().unwrap();
+        assert_eq!(view.highlighted().map(|pr| pr.number), Some(58));
+
+        // A click on one picks it too.
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('/'));
+        type_text(&mut app, "#57");
+        let rows = app.rows();
+        let row = rows
+            .iter()
+            .position(|row| matches!(row, Row::PullRequest { number: 57, .. }))
+            .unwrap();
+        assert_eq!(
+            app.on_mouse(CLICK, Hit::SidebarRow(row)),
+            Some(Action::ListPullRequests(app_path))
+        );
+        let view = app.pull_requests_view().unwrap();
+        assert_eq!(view.highlighted().map(|pr| pr.number), Some(57));
+    }
+
+    #[test]
+    fn slash_asks_once_for_the_pull_requests_of_projects_no_session_is_in() {
+        let mut app = with_agents(&["claude"], vec![in_repo("planner", "main")]);
+        app.set_known_projects(vec![known("app"), known("api")]);
+        let api = PathBuf::from("/code/api");
+        assert_eq!(
+            press(&mut app, KeyCode::Char('/')),
+            Some(Action::FindPullRequests(vec![api.clone()]))
+        );
+        press(&mut app, KeyCode::Esc);
+        let none = PullRequest {
+            title: "Rate limits".into(),
+            ..pull_request(3, "limits")
+        };
+        app.set_pull_requests(api.clone(), on_github(vec![none]));
+        assert_eq!(press(&mut app, KeyCode::Char('/')), None);
+        type_text(&mut app, "rate");
+        assert_eq!(
+            app.found(),
+            [Found::PullRequest {
+                project: api,
+                number: 3
+            }]
+        );
+
+        let mut config = Config::default();
+        config.plugins.insert("github".into(), false);
+        app.set_features(&config);
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(press(&mut app, KeyCode::Char('/')), None);
+        type_text(&mut app, "rate");
+        assert!(app.found().is_empty(), "nothing from a forge with it off");
+    }
+
+    #[test]
+    fn tab_keeps_the_filter_to_one_status_and_shift_tab_goes_back() {
+        let mut app = App::new(None);
+        app.set_sessions(vec![
+            doing("asker", Activity::Waiting),
+            doing("busy", Activity::Working),
+            session("idler"),
+            ended("gone"),
+        ]);
+        app.set_known_projects(vec![known("api")]);
+        let names = |app: &App| -> Vec<String> {
+            let mut names: Vec<String> = app
+                .matches()
+                .iter()
+                .map(|&index| app.sessions()[index].name.clone())
+                .collect();
+            names.sort();
+            names
+        };
+        press(&mut app, KeyCode::Char('/'));
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(
+            app.filter().and_then(|f| f.status),
+            Some(StatusFilter::Waiting)
+        );
+        assert_eq!(names(&app), ["asker"]);
+        assert_eq!(cursor_name(&app), Some("asker"));
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(names(&app), ["busy"]);
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(names(&app), ["idler"]);
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(names(&app), ["gone"]);
+        press(&mut app, KeyCode::BackTab);
+        assert_eq!(names(&app), ["idler"]);
+
+        // Only sessions have a status: a project that matches isn't found.
+        type_text(&mut app, "i");
+        assert_eq!(names(&app), ["idler"]);
+        assert_eq!(app.found().len(), 1);
+
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.filter().and_then(|f| f.status), None);
+        assert!(
+            app.found()
+                .contains(&Found::Worktree(PathBuf::from("/code/api")))
+        );
+    }
+
+    #[test]
+    fn slash_finds_a_flow_run_by_its_goal_and_enter_selects_the_step_it_is_at() {
+        let mut app = app_with_a_run(crate::flow_run::StepState::Running);
+        press(&mut app, KeyCode::Char('/'));
+        type_text(&mut app, "retries");
+        assert_eq!(
+            app.found(),
+            [
+                Found::Flow("ship-1".into()),
+                Found::Session("ship-1-plan".into()),
+                Found::Session("ship-1-review".into()),
+            ]
+        );
+        assert_eq!(
+            app.filter().and_then(|f| f.highlighted.clone()),
+            Some(Found::Flow("ship-1".into()))
+        );
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(selected_name(&app), Some("ship-1-review"));
     }
 
     /// A session in the `app` project, on `branch`.

@@ -173,7 +173,7 @@ pub const COMMANDS: &[Spec] = &[
     spec(
         Command::Search,
         "search",
-        "find a session, in any tab",
+        "find a session, project, flow run or pull request",
         &["/"],
     ),
     spec(
@@ -979,7 +979,7 @@ use Command as C;
 /// fit a small terminal.
 pub const HELP: &[HelpRow] = &[
     row("j/k ↓/↑", &[C::Down, C::Up], "select a session"),
-    row("/", &[C::Search], "find one, in any tab"),
+    row("/", &[C::Search], "find anything; Tab: status"),
     row(":", &[C::Commands], "every command by name"),
     row("Enter", &[C::Open], "type into it, or rerun"),
     row("Space", &[C::Reply], "reply, from right here"),

@@ -7613,6 +7613,50 @@ fn enter_on_a_pull_request_starts_a_session_in_its_worktree_forks_too() {
 }
 
 #[test]
+fn slash_finds_a_pull_request_a_project_with_nothing_running_and_keeps_to_a_status() {
+    let crystal = Crystal::new();
+    let dir = crystal.dir.path();
+    let repo = github_repo(dir);
+    let bin = fake_gh(dir, OPEN_PULL_REQUEST, NO_ISSUES);
+    let api = git_repo(dir, "api");
+    crystal.ok(&["project", "add", api.to_str().unwrap()]);
+    let repo_arg = repo.to_str().unwrap();
+    crystal.ok(&["new", "-n", "planner", "-c", repo_arg, "sleep", "30"]);
+
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let mut tui = crystal.attach_with_env(&[], &[("PATH", &path)]);
+    tui.shows("▸ planner");
+
+    // A pull request, by a word of its title, opens in the view.
+    tui.type_keys("/redirect");
+    tui.shows("#57 Fix the login");
+    tui.shows("1 match");
+    tui.type_keys("\r");
+    tui.shows("pull requests · app");
+    tui.shows("ana wants to merge fix-login into main");
+    tui.type_keys("\x1b");
+    tui.shows("▸ planner");
+
+    // A project with nothing running: the selection goes onto it.
+    tui.type_keys("/api");
+    tui.shows("1 match");
+    tui.type_keys("\r");
+    tui.shows("No sessions in ⎇ main");
+    tui.shows("api ▸ main");
+
+    // Tab keeps to one status: nothing waits, and the shell is idle.
+    tui.type_keys("/\t");
+    tui.shows("find waiting:");
+    tui.shows("0 matches");
+    tui.type_keys("\x1b[Z\x1b[Z\x1b[Z");
+    tui.shows("find idle:");
+    eventually("the idle shell is found", || {
+        sidebar_of(&tui.text()).contains("planner")
+    });
+    tui.shows("1 match");
+}
+
+#[test]
 fn an_issue_takes_a_comment_and_a_new_title() {
     let crystal = Crystal::new();
     let repo = github_repo(crystal.dir.path());
