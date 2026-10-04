@@ -269,24 +269,35 @@ pub fn remove_worktree(socket: &Path, path: &Path, force: bool) -> Result<()> {
 }
 
 /// Makes a worktree for `branch` in the repository `dir` is in, as
-/// [`git::add_worktree`] does, and tells the daemon, for the plugins that
-/// listen for new worktrees. A new branch starts from `base`, when it's
-/// given, or else where the settings say, fetched first.
+/// [`git::add_worktree`] does, and tells the daemon, for the plugins and
+/// the hooks that listen for new worktrees. A new branch starts from
+/// `base`, when it's given, or else where the settings say, fetched first.
+/// The worktree goes in `path`, when it's given, or else where the
+/// settings say.
 pub fn add_worktree(
     socket: &Path,
     dir: &Path,
     branch: &str,
     base: Option<&str>,
+    path: Option<PathBuf>,
 ) -> Result<PathBuf> {
-    let path = git::add_worktree(dir, branch, &worktree_base(base))?;
+    let path = git::add_worktree(dir, branch, &worktree_base(base), &worktree_location(path))?;
     tell_worktree(socket, &path, Some(branch.to_string()), true);
     Ok(path)
 }
 
 /// Makes a worktree on a new branch, `branch` or the first like it that's
-/// free, as [`git::add_new_worktree`] does, and tells the daemon.
-pub fn add_new_worktree(socket: &Path, dir: &Path, branch: &str) -> Result<PathBuf> {
-    let (path, branch) = git::add_new_worktree(dir, branch, &worktree_base(None))?;
+/// free, as [`git::add_new_worktree`] does, and tells the daemon. It goes
+/// in `path`, when it's given, or else where the settings say.
+pub fn add_new_worktree(
+    socket: &Path,
+    dir: &Path,
+    branch: &str,
+    base: Option<&str>,
+    path: Option<PathBuf>,
+) -> Result<PathBuf> {
+    let base = worktree_base(base);
+    let (path, branch) = git::add_new_worktree(dir, branch, &base, &worktree_location(path))?;
     tell_worktree(socket, &path, Some(branch), true);
     Ok(path)
 }
@@ -301,6 +312,41 @@ fn worktree_base(named: Option<&str>) -> git::Base {
     }
 }
 
+/// Where a new worktree goes: `path`, or the settings' directory.
+fn worktree_location(path: Option<PathBuf>) -> git::Location {
+    git::Location {
+        path,
+        directory: Config::load().unwrap_or_default().worktrees.directory(),
+    }
+}
+
+/// Has the daemon move the session called `name` into the worktree at
+/// `path`, of its project, its agent picked up there in its conversation:
+/// now, when its agent isn't in the middle of a turn, or else once its
+/// turn ends. Says which. Starts the daemon if it isn't running.
+pub fn move_session(socket: &Path, name: &str, path: &Path) -> Result<Moved> {
+    let request = Request::MoveSession {
+        name: name.to_string(),
+        path: path.to_path_buf(),
+    };
+    match ask(socket, &request, true)? {
+        Some(Response::Moved { later }) => Ok(if later { Moved::Later } else { Moved::Now }),
+        Some(Response::Done) => Ok(Moved::AlreadyThere),
+        _ => bail!("the daemon didn't say it moved {name}"),
+    }
+}
+
+/// What [`move_session`] came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Moved {
+    /// The session started again in the worktree.
+    Now,
+    /// It moves once its agent's turn ends.
+    Later,
+    /// It was there already.
+    AlreadyThere,
+}
+
 /// The worktree for a pull request: the one its project has on its branch
 /// already, or else a new one, its commits fetched first, as
 /// [`git::add_fetched_worktree`] makes it, which the daemon is told of.
@@ -313,16 +359,17 @@ pub fn pull_request_worktree(socket: &Path, checkout: &Checkout) -> Result<PathB
     if let Some(path) = git::worktree_on(project, branch)? {
         return Ok(path);
     }
-    let path = git::add_fetched_worktree(project, branch, fetch)?;
+    let path = git::add_fetched_worktree(project, branch, fetch, &worktree_location(None))?;
     tell_worktree(socket, &path, Some(branch.clone()), true);
     Ok(path)
 }
 
-/// Tells the daemon a worktree was made or removed. The worktree is made or
-/// gone either way, so a daemon that can't be told is no reason to fail.
+/// Tells the daemon a worktree was made or removed, starting it if it isn't
+/// running: it runs the worktree hooks. The worktree is made or gone either
+/// way, so a daemon that can't be told is no reason to fail.
 fn tell_worktree(socket: &Path, path: &Path, branch: Option<String>, created: bool) {
-    let event = Event::worktree(created, path, branch.as_deref());
-    if let Err(err) = tell(socket, event) {
+    let event = Box::new(Event::worktree(created, path, branch.as_deref()));
+    if let Err(err) = ask(socket, &Request::Emit { event }, true) {
         eprintln!(
             "crystal: couldn't tell the daemon about {}: {err:#}",
             path.display()

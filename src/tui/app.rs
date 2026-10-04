@@ -18,6 +18,7 @@ use super::diff_view::{self, Against, DiffView};
 use super::finder::Finder;
 use super::grep::Grep;
 use super::groups::{self, Row};
+use super::handoff_view::{self, HandoffView};
 use super::help;
 use super::issues::{self, IssuesView};
 use super::keymap::{
@@ -44,12 +45,12 @@ use super::status::Status;
 use super::switcher::{self, Switcher};
 use super::tabs::Tabs;
 use super::text_input::TextInput;
-use super::timeline::{self, TimelineView};
+use super::timeline::{self, Scoped, TimelineView};
 use super::tree_browser::TreeBrowser;
 use crate::catalog::{self, Agent};
 use crate::client::Purpose;
 use crate::config::{BarPosition, Config, Fold, MouseSettings, SIDEBAR_WIDTHS, TabBarSettings};
-use crate::events::Event;
+use crate::events::{Event, Scope};
 use crate::flow_run::{FlowRun, RunState};
 use crate::flows::{self, Flow};
 use crate::forge::{self, Checkout, Forge, Issue, PullRequest, PullRequestDetail, Topic};
@@ -58,11 +59,11 @@ use crate::profile::{self, Profile};
 use crate::project_commands::Verb;
 use crate::protocol::{
     Activity, Answer, ArchivedSession, Backlog, ForgeLink, Front, SessionInfo, Spending, State,
-    TaskBrief, TaskSpec, Worktree,
+    TaskBrief, TaskSpec, Worktree, task_label,
 };
 use crate::resources::Resources;
 use crate::shell;
-use crate::{backlog, names, plugins, tasks};
+use crate::{backlog, handoff, names, plugins, project, tasks};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
 use ratatui::layout::Rect;
 use std::cell::Cell;
@@ -154,6 +155,7 @@ pub enum View {
     Grep(Grep),
     Branches(Switcher),
     Memory(MemoryView),
+    Handoff(HandoffView),
 }
 
 /// What an open view's key asks for.
@@ -265,6 +267,12 @@ pub enum Confirm {
         branch: String,
         force: bool,
     },
+    /// Remove the linked worktree at `path`, called `name`, which the
+    /// session just killed was the last in.
+    RemoveEmptied {
+        path: PathBuf,
+        name: String,
+    },
     /// Close the tab in front, tab `number`, and kill the sessions in it.
     CloseTab {
         number: usize,
@@ -305,6 +313,9 @@ impl Confirm {
                 force: true,
                 ..
             } => format!("{branch} has uncommitted changes: remove it and lose them? y/n"),
+            Confirm::RemoveEmptied { name, .. } => {
+                format!("nothing else is in worktree {name}: remove it too? y/n")
+            }
             Confirm::CloseTab { number, sessions } => {
                 let count = sessions.len();
                 let noun = if count == 1 { "session" } else { "sessions" };
@@ -340,6 +351,11 @@ impl Confirm {
                 path,
                 branch,
                 force,
+            },
+            Confirm::RemoveEmptied { path, name } => Action::RemoveWorktree {
+                path,
+                branch: name,
+                force: false,
             },
             Confirm::CloseTab { sessions, .. } => Action::KillAll(sessions),
             Confirm::ForgetProject { path, .. } => Action::ForgetProject(path),
@@ -658,24 +674,32 @@ pub enum Action {
     ChangeSetting(settings_view::Change),
     /// Have the daemon get the model that searches memory by meaning ready.
     PrepareEmbeddings,
-    /// Turn the plugin called `name` on, or off, in the config file.
+    /// Turn the plugin called `name` on, or off, in the config file: the
+    /// user's own, or the one the project whose main worktree is `project`
+    /// ships, for that project.
     SwitchPlugin {
         name: String,
+        project: Option<PathBuf>,
         on: bool,
     },
-    /// Run one of an installed plugin's actions, about `context`.
+    /// Run one of a plugin's actions, about `context`: an installed
+    /// plugin's, or a project's.
     RunPlugin {
         plugin: String,
+        project: Option<PathBuf>,
         action: String,
         context: plugins::Context,
     },
-    /// Start one of an installed plugin's panes, and show it over the
-    /// panes.
+    /// Start one of a plugin's panes, and show it where it goes.
     OpenPluginPane {
         plugin: String,
+        project: Option<PathBuf>,
         pane: String,
         context: plugins::Context,
     },
+    /// Show a session started already over the panes, as a plugin's pane:
+    /// one `crystal plugin pane open` started.
+    ShowPluginPane(PluginPane),
     /// Run one of the user's `[[keys.command]]`s, about `context`: in a
     /// popup, in a session in `dir` (the pane or tab it's in made ready
     /// already), or in the background.
@@ -696,18 +720,29 @@ pub enum Action {
     /// Put the tabs back the way this layout has them.
     RestoreLayout(Which),
     RemoveLayout(Which),
-    /// The timeline has opened: read the newest page of the event log for
-    /// it, then follow the log as it grows.
-    FollowEvents,
+    /// The timeline has opened, or been switched to another scope: read
+    /// the newest page of the event log of this scope for it, then follow
+    /// the log as it grows.
+    FollowEvents(Scope),
     /// The timeline has closed: stop following the log.
     StopFollowing,
     /// The RAM view has opened: look at what the sessions take often.
     OpenRam,
     /// The RAM view has closed: look only as often as the footer needs.
     CloseRam,
-    /// Read the page of the event log before the event with this `seq`,
-    /// for the timeline.
-    ReadOlderEvents(u64),
+    /// Read the page of the event log of `scope` before the event with
+    /// this `seq`, for the timeline.
+    ReadOlderEvents {
+        scope: Scope,
+        before: u64,
+    },
+    /// Look for the worktree's handoff file and read the files task `task`
+    /// kept, for the handoff view on `session`.
+    ReadHandoff {
+        session: String,
+        worktree: Option<PathBuf>,
+        task: Option<u64>,
+    },
 }
 
 impl Action {
@@ -732,17 +767,17 @@ pub struct PluginKey {
     pub title: String,
 }
 
-/// A plugin's pane, open over the panes: a session of its own, which ends
-/// when the pane closes. A `[[keys.command]]` popup is one too, with no
-/// plugin.
+/// A plugin's pane, open over the panes or in a popup: a session of its
+/// own, which ends when the pane closes. A `[[keys.command]]` popup is one
+/// too, with no plugin.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PluginPane {
     pub plugin: String,
     pub title: String,
     /// The session's name.
     pub session: String,
-    /// A popup's width and height: a plugin's pane takes all the room
-    /// beside the sidebar.
+    /// A popup's width and height: a pane over the others takes all the
+    /// room beside the sidebar.
     pub popup: Option<Popup>,
 }
 
@@ -756,11 +791,13 @@ pub struct Popup {
 }
 
 impl PluginPane {
-    /// What its frame says on top.
+    /// What its frame says on top: its plugin, if it has one, and its
+    /// title.
     pub fn heading(&self) -> String {
-        match self.popup {
-            Some(_) => format!(" {} ", self.title),
-            None => format!(" {} · {} ", self.plugin, self.title),
+        if self.plugin.is_empty() {
+            format!(" {} ", self.title)
+        } else {
+            format!(" {} · {} ", self.plugin, self.title)
         }
     }
 }
@@ -847,6 +884,9 @@ pub struct App {
     /// commit each is at, by its directory, as git last said: what the
     /// sidebar names one by.
     subjects: HashMap<PathBuf, String>,
+    /// The labels each project's linked worktrees were given, by their
+    /// directories, as git was last asked: what the sidebar names one by.
+    labels: HashMap<PathBuf, HashMap<PathBuf, String>>,
     /// What git last counted of each worktree the sidebar shows, by its
     /// directory: its changes not committed, and how far its branch is from
     /// its upstream.
@@ -861,10 +901,14 @@ pub struct App {
     /// listed them: those with no sessions stay in the sidebar, and the
     /// new-session panel offers them all.
     known: Vec<Worktree>,
-    /// The worktrees the daemon is removing, by their directories: their
-    /// lines say so, and `W` leaves them be until the daemon says it's
-    /// done.
+    /// The worktrees the daemon is removing for this TUI, by their
+    /// directories: their lines say so, and `W` leaves them be until the
+    /// daemon says it's done.
     removing: HashSet<PathBuf>,
+    /// The worktrees the daemon said it was removing when last asked,
+    /// whoever asked for them, another TUI or `crystal worktree rm`: their
+    /// lines say so too, and `W` leaves them be as well.
+    removals: HashSet<PathBuf>,
     /// The question on the footer line, while one is being answered.
     prompt: Option<Prompt>,
     /// The new-session panel, while it's open.
@@ -968,6 +1012,9 @@ pub struct App {
     /// Whether draft pull requests are left out of the pull requests view,
     /// the tab bar's count and `/`, as the settings say.
     hide_draft_prs: bool,
+    /// Where new worktrees go, when the settings say: `[worktrees]
+    /// directory`.
+    worktree_directory: Option<PathBuf>,
     /// The issues view, while it's open.
     issues: Option<IssuesView>,
     /// The pull requests view, while it's open.
@@ -987,6 +1034,8 @@ pub struct App {
     tasks_on: bool,
     /// Whether `q` asks before it quits: see [`Config::confirm_quit`].
     confirm_quit: bool,
+    /// Whether the handoff file is on: the notes `M` reads.
+    handoff_on: bool,
     /// Whether the backlog is on: its view, and its counts in the sidebar.
     backlog_on: bool,
     /// Whether the github plugin is on: pull requests on worktree lines,
@@ -1135,11 +1184,13 @@ impl App {
             on_worktree: None,
             worktrees: HashMap::new(),
             subjects: HashMap::new(),
+            labels: HashMap::new(),
             stats: HashMap::new(),
             stats_due: HashSet::new(),
             folded: BTreeSet::new(),
             known: Vec::new(),
             removing: HashSet::new(),
+            removals: HashSet::new(),
             prompt: None,
             launcher: None,
             launch_draft: None,
@@ -1177,12 +1228,14 @@ impl App {
             issues_asked: HashMap::new(),
             issue_edits: HashMap::new(),
             hide_draft_prs: false,
+            worktree_directory: None,
             issues: None,
             pull_requests_view: None,
             view: None,
             diff_tree: false,
             switching: HashSet::new(),
             memory_on: true,
+            handoff_on: true,
             tasks_on: true,
             confirm_quit: true,
             backlog_on: true,
@@ -1381,10 +1434,12 @@ impl App {
         self.confirm_quit = config.confirm_quit;
         self.backlog_on = backlog::enabled(config);
         self.memory_on = crate::memory::enabled(config);
+        self.handoff_on = handoff::enabled(config);
         self.profiles_on = profile::enabled(config);
         self.github_on = forge::enabled(config);
         self.hide_draft_prs = config.forge.hide_draft_prs;
         self.flows_on = flows::enabled(config);
+        self.worktree_directory = config.worktrees.directory();
     }
 
     /// Whether the TUI asks the forge about the sessions' projects.
@@ -1399,6 +1454,7 @@ impl App {
             "tasks" => self.tasks_on,
             "backlog" => self.backlog_on,
             "memory" => self.memory_on,
+            "handoff" => self.handoff_on,
             "profiles" => self.profiles_on,
             "github" => self.github_on,
             "flows" => self.flows_on,
@@ -1713,6 +1769,7 @@ impl App {
         match &mut self.view {
             Some(View::Files(finder)) => finder.preview_read(dir, path, read),
             Some(View::Tree(tree)) => tree.preview_read(dir, path, read),
+            Some(View::Handoff(view)) => view.preview_read(dir, path, read),
             _ => {}
         }
     }
@@ -1825,6 +1882,7 @@ impl App {
             Some(View::Grep(grep)) => grep.set_size(list),
             Some(View::Branches(switcher)) => switcher.set_size(list),
             Some(View::Memory(memory)) => memory.set_size(list),
+            Some(View::Handoff(view)) => view.set_size(content),
             None => {}
         }
     }
@@ -1912,11 +1970,11 @@ impl App {
             _ => None,
         };
         view.read(page);
-        let older = view.wants_older(false);
+        let older = read_older(view, false);
         if let Some(failed) = failed {
             self.notify(failed);
         }
-        older.map(Action::ReadOlderEvents)
+        older
     }
 
     /// Takes an event that has just happened, for the timeline.
@@ -2095,7 +2153,9 @@ impl App {
         }
         let mut empty = self.empty_worktrees();
         empty.retain(|worktree| {
-            search::worktree_match(query, worktree, self.subject_of(&worktree.path))
+            let path = &worktree.path;
+            let also = self.subject_of(path).or_else(|| self.label_of(path));
+            search::worktree_match(query, worktree, also)
         });
         let mut projects: Vec<&PathBuf> = empty.iter().map(|w| &w.project_path).collect();
         projects.extend(self.pull_requests.keys());
@@ -2279,6 +2339,24 @@ impl App {
         self.subjects.get(path).map(String::as_str)
     }
 
+    /// Takes the labels the linked worktrees of `project` were given, by
+    /// their directories, in place of those known before.
+    pub fn set_labels(&mut self, project: &Path, labels: HashMap<PathBuf, String>) {
+        if labels.is_empty() {
+            self.labels.remove(project);
+        } else {
+            self.labels.insert(project.to_path_buf(), labels);
+        }
+    }
+
+    /// The label the worktree at `path` was given, if it has one.
+    pub fn label_of(&self, path: &Path) -> Option<&str> {
+        self.labels
+            .values()
+            .find_map(|labels| labels.get(path))
+            .map(String::as_str)
+    }
+
     /// Takes what git counted of the worktree at `path`, or forgets it when
     /// git couldn't say.
     pub fn set_stat(&mut self, path: PathBuf, stat: Option<git::Stat>) {
@@ -2397,6 +2475,7 @@ impl App {
     /// rather than when git is next asked.
     pub fn worktree_removed(&mut self, path: &Path) {
         self.removing.remove(path);
+        self.removals.remove(path);
         for linked in self.worktrees.values_mut() {
             linked.retain(|worktree| worktree.path != path);
         }
@@ -2407,12 +2486,24 @@ impl App {
     /// can be asked about again.
     pub fn worktree_not_removed(&mut self, path: &Path, reason: String) {
         self.removing.remove(path);
+        self.removals.remove(path);
         self.notify(reason);
     }
 
-    /// Whether the daemon is removing the worktree at `path`.
+    /// Takes the worktrees the daemon is removing, whoever asked, and says
+    /// whether one it was removing before is done with, gone or not, for
+    /// the event loop to have git list the worktrees again.
+    pub fn set_removals(&mut self, worktrees: Vec<PathBuf>) -> bool {
+        let removals: HashSet<PathBuf> = worktrees.into_iter().collect();
+        let done = self.removals.difference(&removals).next().is_some();
+        self.removals = removals;
+        done
+    }
+
+    /// Whether the daemon is removing the worktree at `path`, for this TUI
+    /// or for anyone else.
     pub fn removing(&self, path: &Path) -> bool {
-        self.removing.contains(path)
+        self.removing.contains(path) || self.removals.contains(path)
     }
 
     /// The linked worktree with no sessions the selection is on, if it's
@@ -3481,8 +3572,15 @@ impl App {
             }
             // The daemon removes a worktree; its line says so until the
             // daemon says it's done.
-            if let Confirm::RemoveWorktree { path, .. } = &confirm {
+            if let Confirm::RemoveWorktree { path, .. } | Confirm::RemoveEmptied { path, .. } =
+                &confirm
+            {
                 self.removing.insert(path.clone());
+            }
+            // Killing the last session in a worktree leaves it with nothing
+            // in it: the next question is whether it goes too.
+            if let Confirm::Kill(name) = &confirm {
+                self.confirm = self.emptied_by_killing(name);
             }
             return Some(confirm.action());
         }
@@ -3586,6 +3684,7 @@ impl App {
                 View::Grep(grep) => grep.on_mouse(kind, hit),
                 View::Branches(switcher) => switcher.on_mouse(kind, hit),
                 View::Memory(memory) => memory.on_mouse(kind, hit),
+                View::Handoff(view) => view.on_mouse(kind, hit),
             };
             return self.follow(outcome);
         }
@@ -3960,6 +4059,15 @@ impl App {
         if session.front == Some(Front::Task) {
             items.push(Item::new("open it in a terminal", Command::TaskToTerminal));
         }
+        items.push(Item::new("its timeline", Command::SessionTimeline));
+        let task = session.task.as_ref().and_then(|task| task.id);
+        let task = task.filter(|_| self.tasks_on);
+        if task.is_some() {
+            items.push(Item::new("its task's timeline", Command::TaskTimeline));
+        }
+        if task.is_some() || (self.handoff_on && session.worktree.is_some()) {
+            items.push(Item::new("its handoff notes and files", Command::Handoff));
+        }
         items.push(Item::new("archive it", Command::Archive));
         items.push(Item::danger("kill it", Command::Kill));
         Some(items)
@@ -3976,6 +4084,7 @@ impl App {
             Item::new("what changed", Command::Diff),
             Item::new("find a file", Command::FindFile),
             Item::new("browse its files", Command::FileTree),
+            Item::new("the project's timeline", Command::ProjectTimeline),
         ];
         items.push(if main {
             Item::danger("take the project off the list", Command::RemoveWorktree)
@@ -4003,6 +4112,7 @@ impl App {
         if self.memory_on {
             items.push(Item::new("what it remembers", Command::Memory));
         }
+        items.push(Item::new("its timeline", Command::ProjectTimeline));
         items.push(match self.folded_selection() {
             Some(_) => Item::new("unfold it", Command::UnfoldProject),
             None => Item::new("fold it to its heading", Command::FoldProject),
@@ -4140,6 +4250,7 @@ impl App {
             let (plugin, action) = (plugin.to_string(), action.to_string());
             return Some(Action::RunPlugin {
                 plugin,
+                project: None,
                 action,
                 context,
             });
@@ -4231,6 +4342,25 @@ impl App {
             Command::NextNeedingYou => self.select_next_needing_user(),
             Command::NeedsYou => self.open_needs_you(),
             Command::Timeline => return Some(self.open_timeline()),
+            // On a folded project's heading, it's the project's.
+            Command::SessionTimeline if self.folded_selection().is_some() => {
+                let none = "select a session to see its timeline";
+                return self.open_scoped_timeline(|scope| matches!(scope, Scope::Project(_)), none);
+            }
+            Command::SessionTimeline => {
+                let none = "select a session to see its timeline";
+                return self.open_scoped_timeline(|_| true, none);
+            }
+            Command::TaskTimeline if self.tasks_on => {
+                let none = "the selected session has no task with a number";
+                return self.open_scoped_timeline(|scope| matches!(scope, Scope::Task(_)), none);
+            }
+            Command::TaskTimeline => self.notify(plugins::off("tasks")),
+            Command::ProjectTimeline => {
+                let none = "select a session to see its project's timeline";
+                return self.open_scoped_timeline(|scope| matches!(scope, Scope::Project(_)), none);
+            }
+            Command::Handoff => return self.open_handoff(),
             Command::Diff => return self.open_diff(),
             Command::FindFile => return self.open_finder(),
             Command::FileTree => return self.open_tree_browser(),
@@ -4318,6 +4448,7 @@ impl App {
                     Pick::Command(command) => self.run(command),
                     Pick::Plugin { plugin, action } => Some(Action::RunPlugin {
                         plugin,
+                        project: None,
                         action,
                         context: self.selected_context(),
                     }),
@@ -4400,6 +4531,7 @@ impl App {
     fn run_plugin_action(&self, taken: &PluginKey) -> Option<Action> {
         Some(Action::RunPlugin {
             plugin: taken.plugin.clone(),
+            project: None,
             action: taken.action.clone(),
             context: self.selected_context(),
         })
@@ -4412,7 +4544,7 @@ impl App {
 
     /// What a plugin's action or pane is told about where it was run from:
     /// the selected session. With none, the event loop says where.
-    fn selected_context(&self) -> plugins::Context {
+    pub fn selected_context(&self) -> plugins::Context {
         self.selected()
             .map(plugins::Context::of_session)
             .unwrap_or_default()
@@ -4439,17 +4571,33 @@ impl App {
                 self.plugins_view = None;
                 None
             }
-            plugins_view::Outcome::Switch { name, on } => Some(Action::SwitchPlugin { name, on }),
-            plugins_view::Outcome::Run { plugin, action } => Some(Action::RunPlugin {
+            plugins_view::Outcome::Switch { name, project, on } => {
+                Some(Action::SwitchPlugin { name, project, on })
+            }
+            plugins_view::Outcome::Run {
                 plugin,
+                project,
+                action,
+            } => Some(Action::RunPlugin {
+                plugin,
+                project,
                 action,
                 context: self.selected_context(),
             }),
-            plugins_view::Outcome::Open { plugin, pane } => Some(Action::OpenPluginPane {
+            // Wherever the pane opens, the view makes way for it.
+            plugins_view::Outcome::Open {
                 plugin,
+                project,
                 pane,
-                context: self.selected_context(),
-            }),
+            } => {
+                self.plugins_view = None;
+                Some(Action::OpenPluginPane {
+                    plugin,
+                    project,
+                    pane,
+                    context: self.selected_context(),
+                })
+            }
         }
     }
 
@@ -4542,6 +4690,50 @@ impl App {
         Some(read)
     }
 
+    /// `M`: opens the handoff view on the selected session: its worktree's
+    /// notes, while the handoff file is on, and the files its task kept,
+    /// while tasks are; and has them looked for. Without either, the footer
+    /// says why.
+    fn open_handoff(&mut self) -> Option<Action> {
+        if !self.handoff_on && !self.tasks_on {
+            self.notify(plugins::off("handoff"));
+            return None;
+        }
+        let Some(selected) = self.selected() else {
+            self.notify("select a session to read what it left".into());
+            return None;
+        };
+        let worktree = selected.worktree.as_ref().filter(|_| self.handoff_on);
+        let task = selected.task.as_ref().and_then(|task| task.id);
+        let task = task.filter(|_| self.tasks_on);
+        if worktree.is_none() && task.is_none() {
+            let notice = format!(
+                "{} leaves no notes: it isn't in a git worktree, and has no task",
+                selected.name
+            );
+            self.notify(notice);
+            return None;
+        }
+        let place = match &selected.worktree {
+            Some(worktree) => worktree_label(worktree),
+            None => shell::home_relative(&selected.cwd),
+        };
+        let worktree = worktree.map(|worktree| worktree.path.clone());
+        let view = HandoffView::new(selected.name.clone(), place, worktree, task);
+        let read = view.read();
+        self.view = Some(View::Handoff(view));
+        Some(read)
+    }
+
+    /// Takes what was found for the handoff view on `session`, while it's
+    /// open, and asks for the first file's preview.
+    pub fn handoff_found(&mut self, session: &str, found: handoff_view::Found) -> Option<Action> {
+        match &mut self.view {
+            Some(View::Handoff(view)) => view.found(session, found),
+            _ => None,
+        }
+    }
+
     /// The selected session's worktree, or the worktree with no sessions
     /// the selection is on, and its project and branch the way a view's
     /// header names them: `payments ⎇ fix/login`. When a session isn't in
@@ -4595,6 +4787,7 @@ impl App {
                 View::Diff(diff) => diff.typing(),
                 View::Memory(memory) => memory.typing(),
                 View::Files(_) | View::Tree(_) | View::Grep(_) | View::Branches(_) => true,
+                View::Handoff(_) => false,
             };
             return Some((typing, false));
         }
@@ -4655,6 +4848,7 @@ impl App {
             View::Grep(grep) => grep.on_key(key),
             View::Branches(switcher) => switcher.on_key(key),
             View::Memory(memory) => memory.on_key(key),
+            View::Handoff(view) => view.on_key(key),
         };
         self.follow(outcome)
     }
@@ -4682,6 +4876,7 @@ impl App {
                     View::Files(finder) => finder.dir,
                     View::Tree(tree) => tree.dir,
                     View::Grep(grep) => grep.dir,
+                    View::Handoff(view) => view.selected()?.dir.clone(),
                     _ => return None,
                 };
                 let name = self.free_name(&edit_name(&path));
@@ -4798,6 +4993,39 @@ impl App {
             let notice = format!("{} still running in {branch}", running.join(", "));
             self.notify(notice);
         }
+    }
+
+    /// What to ask about the worktree killing the session called `name`
+    /// leaves with nothing in it, if it does: a linked worktree, not one
+    /// Claude Code made for itself, with no other session in it, in any
+    /// tab, running or not, that the daemon isn't removing already.
+    fn emptied_by_killing(&self, name: &str) -> Option<Confirm> {
+        let killed = self.sessions.iter().find(|session| session.name == name)?;
+        let worktree = killed.worktree.as_ref()?;
+        if worktree.main || worktree.claude_codes_own() || self.removing(&worktree.path) {
+            return None;
+        }
+        let others = self.sessions.iter().any(|session| {
+            session.name != name
+                && session
+                    .worktree
+                    .as_ref()
+                    .is_some_and(|w| w.path == worktree.path)
+        });
+        if others {
+            return None;
+        }
+        let name = match self.label_of(&worktree.path) {
+            Some(label) => label.to_string(),
+            None => worktree
+                .branch
+                .clone()
+                .unwrap_or_else(|| "(detached)".to_string()),
+        };
+        Some(Confirm::RemoveEmptied {
+            path: worktree.path.clone(),
+            name,
+        })
     }
 
     /// Asks before removing the worktree at `path`, on `branch`, unless the
@@ -5437,6 +5665,7 @@ impl App {
             codex_models: self.codex_models.clone().unwrap_or_default(),
             background: self.tasks_on,
             branch: names::random(),
+            worktree_directory: self.worktree_directory.clone(),
         }
     }
 
@@ -6592,22 +6821,67 @@ impl App {
         }
     }
 
-    /// `a`: opens the timeline, which marks what's new since the user was
-    /// away when the footer has just said what that was, and has the log
-    /// read for it.
+    /// `a`: opens the timeline of everything, which marks what's new
+    /// since the user was away when the footer has just said what that
+    /// was, and has the log read for it. Ctrl+S narrows it to the
+    /// selection's scopes.
     fn open_timeline(&mut self) -> Action {
         let after = self.away.take().map(|away| away.after);
-        self.timeline = Some(TimelineView::new(after));
-        Action::FollowEvents
+        let scopes = self.timeline_scopes();
+        let all = scopes.len() - 1;
+        self.timeline = Some(TimelineView::new(after, scopes, all));
+        Action::FollowEvents(Scope::All)
+    }
+
+    /// `I`, and the menus' timelines: opens the timeline of the first of
+    /// the selection's scopes `wanted` takes, or says `none` when there's
+    /// none.
+    fn open_scoped_timeline(&mut self, wanted: fn(&Scope) -> bool, none: &str) -> Option<Action> {
+        let scopes = self.timeline_scopes();
+        let Some(at) = scopes.iter().position(|scoped| wanted(&scoped.scope)) else {
+            self.notify(none.to_string());
+            return None;
+        };
+        let scope = scopes[at].scope.clone();
+        self.timeline = Some(TimelineView::new(None, scopes, at));
+        Some(Action::FollowEvents(scope))
+    }
+
+    /// The scopes a timeline opened on the selection goes through: the
+    /// selected session, its task, the project it's in, or the project of
+    /// the worktree with no sessions the selection is on; then everything.
+    fn timeline_scopes(&self) -> Vec<Scoped> {
+        let mut scopes = Vec::new();
+        let selected = self.selected();
+        if let Some(session) = selected {
+            let name = format!("session {}", session.name);
+            scopes.push(Scoped::new(Scope::Session(session.id.clone()), name));
+            if let Some(id) = session.task.as_ref().and_then(|task| task.id)
+                && self.tasks_on
+            {
+                let name = format!("task {}", task_label(Some(id)));
+                scopes.push(Scoped::new(Scope::Task(id), name));
+            }
+        }
+        let project = match self.selection_worktree() {
+            Some(worktree) => Some((worktree.project_path.clone(), worktree.project.clone())),
+            None => selected.map(|session| (session.cwd.clone(), project::name_of(&session.cwd))),
+        };
+        if let Some((path, name)) = project {
+            scopes.push(Scoped::new(Scope::Project(path), format!("project {name}")));
+        }
+        scopes.push(Scoped::everything());
+        scopes
     }
 
     /// Keys while the timeline is open: all of them are its.
     fn on_timeline_key(&mut self, key: KeyEvent) -> Option<Action> {
         let view = self.timeline.as_mut()?;
         match view.on_key(&key) {
-            timeline::Step::Stay => view.wants_older(true).map(Action::ReadOlderEvents),
+            timeline::Step::Stay => read_older(view, true),
             timeline::Step::Close => self.close_timeline(),
             timeline::Step::Go(event) => self.go_to_event(&event),
+            timeline::Step::Rescope => Some(Action::FollowEvents(view.scope().scope.clone())),
         }
     }
 
@@ -6743,6 +7017,14 @@ fn worktree_label(worktree: &crate::protocol::Worktree) -> String {
     let mark = if worktree.main { "⌂" } else { "⎇" };
     let branch = worktree.branch.as_deref().unwrap_or("(detached)");
     format!("{} {mark} {branch}", worktree.project)
+}
+
+/// What reading the timeline's log further back takes, when it wants that:
+/// see [`TimelineView::wants_older`].
+fn read_older(view: &mut TimelineView, asked: bool) -> Option<Action> {
+    let before = view.wants_older(asked)?;
+    let scope = view.scope().scope.clone();
+    Some(Action::ReadOlderEvents { scope, before })
 }
 
 /// What a session editing the file at `path` is called: the file's name,
@@ -7783,6 +8065,61 @@ mod tests {
     }
 
     #[test]
+    fn killing_the_last_session_in_a_worktree_asks_whether_it_goes_too() {
+        let mut app = App::new(None);
+        app.set_sessions(vec![
+            in_worktree("planner", "main", State::Running),
+            in_worktree("fixer", "fix", State::Running),
+        ]);
+        app.select("fixer");
+        press(&mut app, KeyCode::Char('x'));
+        assert_eq!(
+            press(&mut app, KeyCode::Char('y')),
+            Some(Action::Kill("fixer".into()))
+        );
+        assert_eq!(
+            app.confirm().map(Confirm::question).as_deref(),
+            Some("nothing else is in worktree fix: remove it too? y/n")
+        );
+        assert_eq!(
+            press(&mut app, KeyCode::Char('y')),
+            Some(removal_of("fix", false))
+        );
+        assert!(app.removing(Path::new("/code/app.worktrees/fix")));
+    }
+
+    #[test]
+    fn the_emptied_worktree_stays_unless_it_s_a_yes() {
+        let mut app = App::new(None);
+        app.set_sessions(vec![in_worktree("fixer", "fix", State::Running)]);
+        app.select("fixer");
+        press(&mut app, KeyCode::Char('x'));
+        press(&mut app, KeyCode::Char('y'));
+        assert_eq!(press(&mut app, KeyCode::Char('n')), None);
+        assert_eq!(app.confirm(), None);
+        assert!(!app.removing(Path::new("/code/app.worktrees/fix")));
+    }
+
+    #[test]
+    fn a_worktree_with_something_left_in_it_or_the_main_one_isn_t_asked_about() {
+        let mut app = App::new(None);
+        app.set_sessions(vec![
+            in_worktree("fixer", "fix", State::Running),
+            in_worktree("tests", "fix", State::Exited { code: 0 }),
+            in_worktree("planner", "main", State::Running),
+        ]);
+        for name in ["fixer", "planner"] {
+            app.select(name);
+            press(&mut app, KeyCode::Char('x'));
+            assert_eq!(
+                press(&mut app, KeyCode::Char('y')),
+                Some(Action::Kill(name.into()))
+            );
+            assert_eq!(app.confirm(), None, "{name}");
+        }
+    }
+
+    #[test]
     fn shift_w_refuses_while_a_session_runs_in_the_worktree() {
         let mut app = App::new(None);
         app.set_sessions(vec![
@@ -7943,6 +8280,40 @@ mod tests {
             })
         );
         assert!(app.removing(old));
+    }
+
+    #[test]
+    fn a_worktree_someone_else_is_removing_says_so_until_the_daemon_is_done() {
+        let mut app = app_with_an_empty_worktree();
+        let old = Path::new("/code/app.worktrees/old");
+        // Asked for by another TUI, or `crystal worktree rm`.
+        assert!(!app.set_removals(vec![old.into()]));
+        assert!(app.removing(old));
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('W'));
+        assert_eq!(app.confirm(), None);
+        assert_eq!(app.notice(), Some("already removing old"));
+
+        assert!(!app.set_removals(vec![old.into()]), "still at it");
+        assert!(app.set_removals(Vec::new()), "done: git lists them again");
+        assert!(!app.removing(old));
+        assert!(!app.set_removals(Vec::new()));
+    }
+
+    #[test]
+    fn a_removal_this_tui_asked_for_says_so_before_the_daemon_lists_it() {
+        let mut app = app_with_an_empty_worktree();
+        let old = Path::new("/code/app.worktrees/old");
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('W'));
+        press(&mut app, KeyCode::Char('y'));
+        // Listed before the daemon was asked: git looks for changes first.
+        app.set_removals(Vec::new());
+        assert!(app.removing(old));
+
+        app.set_removals(vec![old.into()]);
+        app.worktree_removed(old);
+        assert!(!app.removing(old), "done, though the daemon listed it");
     }
 
     #[test]
@@ -11589,7 +11960,7 @@ gate = true
         let mut app = app_with(&["a"]);
         assert_eq!(
             press(&mut app, KeyCode::Char('a')),
-            Some(Action::FollowEvents)
+            Some(Action::FollowEvents(Scope::All))
         );
         let worker = SessionInfo {
             id: "s1".into(),
@@ -11616,6 +11987,195 @@ gate = true
 
         press(&mut app, KeyCode::Char('a'));
         assert_eq!(press(&mut app, KeyCode::Esc), Some(Action::StopFollowing));
+    }
+
+    #[test]
+    fn capital_i_opens_the_selected_sessions_timeline_and_ctrl_s_goes_through_its_scopes() {
+        let mut app = App::new(None);
+        app.set_sessions(vec![
+            with_task("fixer", "Fix the login", None),
+            session("shell"),
+        ]);
+        app.select("fixer");
+        assert_eq!(
+            press(&mut app, KeyCode::Char('I')),
+            Some(Action::FollowEvents(Scope::Session("fixer".into())))
+        );
+        let names = |app: &App| app.timeline_view().unwrap().scope().name.clone();
+        assert_eq!(names(&app), "session fixer");
+        // The first page is still being read: nothing further back yet.
+        assert_eq!(app.events_read(Ok(Vec::new())), None);
+        let widened = [
+            (Scope::Task(1), "task t1"),
+            (Scope::Project("/code/shop".into()), "project shop"),
+            (Scope::All, ""),
+            (Scope::Session("fixer".into()), "session fixer"),
+        ];
+        for (scope, name) in widened {
+            assert_eq!(ctrl(&mut app, 's'), Some(Action::FollowEvents(scope)));
+            assert_eq!(names(&app), name);
+        }
+        press(&mut app, KeyCode::Esc);
+
+        // A session outside git with no task: itself, its directory, and
+        // everything; `a` opens on everything.
+        app.select("shell");
+        assert_eq!(
+            press(&mut app, KeyCode::Char('a')),
+            Some(Action::FollowEvents(Scope::All))
+        );
+        assert_eq!(
+            ctrl(&mut app, 's'),
+            Some(Action::FollowEvents(Scope::Session("shell".into())))
+        );
+        assert_eq!(
+            ctrl(&mut app, 's'),
+            Some(Action::FollowEvents(Scope::Project("/".into())))
+        );
+        press(&mut app, KeyCode::Esc);
+
+        // On a folded project's heading, it's the project's.
+        app.select("fixer");
+        press(&mut app, KeyCode::Char('h'));
+        assert_eq!(
+            press(&mut app, KeyCode::Char('I')),
+            Some(Action::FollowEvents(Scope::Project("/code/shop".into())))
+        );
+    }
+
+    #[test]
+    fn a_sessions_menu_opens_its_task_and_project_timelines_and_reading_back_keeps_the_scope() {
+        let mut app = App::new(None);
+        app.set_sessions(vec![with_task("fixer", "Fix the login", None)]);
+        app.right_click(Hit::SidebarRow(row_of(&app, "fixer")), (3, 4));
+        let menu = labels(&app);
+        for label in [
+            "its timeline",
+            "its task's timeline",
+            "its handoff notes and files",
+        ] {
+            assert!(menu.contains(&label), "{label}: {menu:?}");
+        }
+        let task = menu.iter().position(|l| *l == "its task's timeline");
+        let chosen = app.menu_mouse(CLICK, 0, 0);
+        assert_eq!(chosen, None, "a click outside closes it");
+        app.right_click(Hit::SidebarRow(row_of(&app, "fixer")), (3, 4));
+        for _ in 0..task.unwrap() {
+            press(&mut app, KeyCode::Down);
+        }
+        assert_eq!(
+            press(&mut app, KeyCode::Enter),
+            Some(Action::FollowEvents(Scope::Task(1)))
+        );
+        // A full page of the task's lines: reading back asks for more of
+        // the task's.
+        let page: Vec<Event> = (1..=timeline::PAGE as u64)
+            .rev()
+            .map(|seq| {
+                about(
+                    seq + 10,
+                    crate::events::Kind::SessionWorking,
+                    &session("fixer"),
+                )
+            })
+            .collect();
+        assert_eq!(app.events_read(Ok(page)), None);
+        press(&mut app, KeyCode::End);
+        for _ in 0..timeline::PAGE {
+            if let Some(action) = press(&mut app, KeyCode::Down) {
+                assert_eq!(
+                    action,
+                    Action::ReadOlderEvents {
+                        scope: Scope::Task(1),
+                        before: 11,
+                    }
+                );
+                break;
+            }
+        }
+        press(&mut app, KeyCode::Esc);
+
+        // With tasks off, there's no task's timeline.
+        app.tasks_on = false;
+        app.right_click(Hit::SidebarRow(row_of(&app, "fixer")), (3, 4));
+        assert!(!labels(&app).contains(&"its task's timeline"));
+        press(&mut app, KeyCode::Esc);
+        app.view = None;
+
+        // A project's heading opens its timeline.
+        app.right_click(Hit::SidebarRow(0), (1, 1));
+        assert!(matches!(app.rows()[0], Row::Project { .. }));
+        let menu = labels(&app);
+        let at = menu.iter().position(|l| *l == "its timeline").unwrap();
+        for _ in 0..at {
+            press(&mut app, KeyCode::Down);
+        }
+        assert_eq!(
+            press(&mut app, KeyCode::Enter),
+            Some(Action::FollowEvents(Scope::Project("/code/shop".into())))
+        );
+    }
+
+    #[test]
+    fn capital_m_opens_what_the_session_left_and_says_why_when_theres_nothing() {
+        let mut app = App::new(None);
+        app.set_sessions(vec![
+            with_task("fixer", "Fix the login", None),
+            session("shell"),
+        ]);
+        app.select("fixer");
+        assert_eq!(
+            press(&mut app, KeyCode::Char('M')),
+            Some(Action::ReadHandoff {
+                session: "fixer".into(),
+                worktree: Some(PathBuf::from("/code/shop")),
+                task: Some(1),
+            })
+        );
+        let found = handoff_view::Found {
+            notes: Some(PathBuf::from("/code/shop")),
+            kept: Ok(Vec::new()),
+        };
+        assert_eq!(
+            app.handoff_found("fixer", found),
+            Some(Action::ReadPreview {
+                dir: PathBuf::from("/code/shop"),
+                path: ".crystal/handoff.md".into(),
+            })
+        );
+        // `j` moves in it, as in every view that isn't typed into, and
+        // Enter edits the notes in the worktree.
+        assert_eq!(press(&mut app, KeyCode::Char('j')), None);
+        let Some(Action::Edit { dir, path, .. }) = press(&mut app, KeyCode::Enter) else {
+            panic!("enter edits the file");
+        };
+        assert_eq!(
+            (dir, path.as_str()),
+            (PathBuf::from("/code/shop"), ".crystal/handoff.md")
+        );
+        assert!(app.view().is_none());
+
+        app.select("shell");
+        assert_eq!(press(&mut app, KeyCode::Char('M')), None);
+        assert_eq!(
+            app.notice(),
+            Some("shell leaves no notes: it isn't in a git worktree, and has no task")
+        );
+        // With the handoff file off, a task's kept files are still there.
+        app.handoff_on = false;
+        app.select("fixer");
+        assert_eq!(
+            press(&mut app, KeyCode::Char('M')),
+            Some(Action::ReadHandoff {
+                session: "fixer".into(),
+                worktree: None,
+                task: Some(1),
+            })
+        );
+        press(&mut app, KeyCode::Esc);
+        app.tasks_on = false;
+        assert_eq!(press(&mut app, KeyCode::Char('M')), None);
+        assert!(app.notice().unwrap().contains("handoff"));
     }
 
     #[test]

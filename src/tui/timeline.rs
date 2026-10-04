@@ -6,23 +6,29 @@
 //! read whole under the list. Events that came while the user was away are
 //! marked, when it's opened after "while you were away" said so.
 //!
+//! It shows everything, or one [`Scope`]: a session, its task or its
+//! project, as `I` opens it from the session's row. Ctrl+S goes through the
+//! scopes the selection had as it opened, everything among them, and reads
+//! the log again for each.
+//!
 //! The state is plain data, kept apart from I/O: the event loop reads the
-//! log a page at a time and follows it as it grows, handing the events in
-//! through [`TimelineView::read`] and [`TimelineView::logged`], and asks
-//! [`TimelineView::wants_older`] when to read further back. The list, its
-//! filter and its bar are a [`Listing`]. Events of kinds it has never heard
-//! of are listed like the rest, by their name and what they say.
+//! log a page at a time for the scope and follows it as it grows, handing
+//! the events in through [`TimelineView::read`] and
+//! [`TimelineView::logged`], and asks [`TimelineView::wants_older`] when to
+//! read further back. The list, its filter and its bar are a [`Listing`].
+//! Events of kinds it has never heard of are listed like the rest, by their
+//! name and what they say.
 
 use super::listing::{self, Item, Listing};
 use super::sidebar::fit;
 use super::text_input::TextInput;
 use super::theme::Theme;
-use crate::events::{Event, Kind};
+use crate::events::{Event, Kind, Scope};
 use crate::events_cli;
 use crate::project;
 use crate::protocol::TaskState;
 use crate::shell;
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -133,10 +139,35 @@ pub enum Step {
     Close,
     /// Go to what this event is about.
     Go(Rc<Event>),
+    /// Read the log again, for the scope it has been switched to.
+    Rescope,
+}
+
+/// A scope the timeline can show, and what its heading calls it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Scoped {
+    pub scope: Scope,
+    /// What it's about, in words: `session fixer`, `task t12`, `project
+    /// app`; nothing for everything.
+    pub name: String,
+}
+
+impl Scoped {
+    pub fn new(scope: Scope, name: String) -> Scoped {
+        Scoped { scope, name }
+    }
+
+    pub fn everything() -> Scoped {
+        Scoped::new(Scope::All, String::new())
+    }
 }
 
 pub struct TimelineView {
-    /// Every event read so far, the newest first.
+    /// The scopes it can show, which Ctrl+S goes through: never none.
+    scopes: Vec<Scoped>,
+    /// The one it shows, by its place in `scopes`.
+    at: usize,
+    /// Every event of the scope read so far, the newest first.
     events: Vec<Rc<Event>>,
     /// The lines shown: the events of `kinds`, filtered as typed. No items
     /// while the first page is being read.
@@ -153,9 +184,15 @@ pub struct TimelineView {
 
 impl TimelineView {
     /// The timeline before anything is read, marking what came after
-    /// `away_after` as new.
-    pub fn new(away_after: Option<u64>) -> TimelineView {
+    /// `away_after` as new, of the scope at `at` in `scopes`, everything
+    /// when there are none.
+    pub fn new(away_after: Option<u64>, mut scopes: Vec<Scoped>, at: usize) -> TimelineView {
+        if scopes.is_empty() {
+            scopes.push(Scoped::everything());
+        }
         TimelineView {
+            at: at.min(scopes.len() - 1),
+            scopes,
             events: Vec::new(),
             list: Listing::new(None),
             kinds: Kinds::All,
@@ -163,6 +200,11 @@ impl TimelineView {
             complete: false,
             reading: true,
         }
+    }
+
+    /// The scope it shows.
+    pub fn scope(&self) -> &Scoped {
+        &self.scopes[self.at]
     }
 
     /// Takes a page of the log, the newest first: its end, or what came
@@ -189,13 +231,14 @@ impl TimelineView {
         self.show();
     }
 
-    /// Takes an event that has just happened, at the top; the bar stays on
-    /// the line it was on.
+    /// Takes an event that has just happened, at the top, if it's of the
+    /// scope; the bar stays on the line it was on.
     pub fn logged(&mut self, event: Event) {
-        if self
-            .events
-            .first()
-            .is_some_and(|newest| newest.seq >= event.seq)
+        if !self.scope().scope.matches(&event)
+            || self
+                .events
+                .first()
+                .is_some_and(|newest| newest.seq >= event.seq)
         {
             return;
         }
@@ -243,10 +286,16 @@ impl TimelineView {
 
     /// Esc clears the filter, and closes the view once it's clear; Enter
     /// goes to what the line is about; Tab and Shift+Tab go through the
-    /// kinds; the list takes the rest: the arrows move, PgUp and PgDn
-    /// scroll the line read whole, and the other keys type into the filter.
+    /// kinds, and Ctrl+S through the scopes; the list takes the rest: the
+    /// arrows move, PgUp and PgDn scroll the line read whole, and the other
+    /// keys type into the filter.
     pub fn on_key(&mut self, key: &KeyEvent) -> Step {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
+            KeyCode::Char('s') if ctrl && self.scopes.len() > 1 => {
+                self.rescope((self.at + 1) % self.scopes.len());
+                return Step::Rescope;
+            }
             KeyCode::Esc if !self.list.filter.text().is_empty() => {
                 self.list.filter = TextInput::default();
                 self.show();
@@ -271,6 +320,18 @@ impl TimelineView {
     fn choose(&mut self, kinds: Kinds) {
         self.kinds = kinds;
         self.show();
+    }
+
+    /// Shows the scope at `at`, from nothing read, keeping the kind and
+    /// the filter.
+    fn rescope(&mut self, at: usize) {
+        self.at = at;
+        self.events.clear();
+        let filter = std::mem::take(&mut self.list.filter);
+        self.list = Listing::new(None);
+        self.list.filter = filter;
+        self.complete = false;
+        self.reading = true;
     }
 }
 
@@ -319,7 +380,7 @@ fn tone(event: &Event, theme: &Theme) -> Color {
             Some("exited 0") => theme.muted,
             _ => theme.failed,
         },
-        Kind::PluginPaused | Kind::SessionStartFailed => theme.failed,
+        Kind::PluginPaused | Kind::SessionStartFailed | Kind::WorktreeHookFailed => theme.failed,
         Kind::DaemonRestarted => match event.daemon.as_ref() {
             Some(daemon) if !daemon.failed.is_empty() => theme.failed,
             _ => theme.muted,
@@ -328,14 +389,28 @@ fn tone(event: &Event, theme: &Theme) -> Color {
     }
 }
 
-/// The keys the footer offers.
-pub const HINTS: &[(&str, &str)] = &[
-    ("enter", "go to it"),
-    ("tab", "kinds"),
-    ("↑/↓", "move"),
-    ("pgup/pgdn", "scroll"),
-    ("esc", "clear, close"),
-];
+/// The keys the footer offers: Ctrl+S too, when there are scopes to go
+/// through.
+pub fn hints(view: &TimelineView) -> &'static [(&'static str, &'static str)] {
+    if view.scopes.len() > 1 {
+        &[
+            ("enter", "go to it"),
+            ("tab", "kinds"),
+            ("ctrl+s", "scope"),
+            ("↑/↓", "move"),
+            ("pgup/pgdn", "scroll"),
+            ("esc", "clear, close"),
+        ]
+    } else {
+        &[
+            ("enter", "go to it"),
+            ("tab", "kinds"),
+            ("↑/↓", "move"),
+            ("pgup/pgdn", "scroll"),
+            ("esc", "clear, close"),
+        ]
+    }
+}
 
 /// Draws the view in `area`: a heading with the kinds, the filter, the
 /// lines, and the one the bar is on read whole. `now` is milliseconds since
@@ -351,7 +426,11 @@ pub fn draw(frame: &mut Frame, view: &TimelineView, theme: &Theme, now: u64, are
     };
     if events.is_empty() {
         let nothing = if view.list.filter.text().is_empty() && view.kinds == Kinds::All {
-            "nothing has happened yet"
+            if view.scope().scope == Scope::All {
+                "nothing has happened yet"
+            } else {
+                "nothing has happened to it yet, or not lately"
+            }
         } else {
             "nothing matches"
         };
@@ -384,13 +463,22 @@ pub fn draw(frame: &mut Frame, view: &TimelineView, theme: &Theme, now: u64, are
     }
 }
 
-/// "timeline", the kinds with the one chosen standing out, and on the
-/// right how many came while the user was away, which are marked.
+/// "timeline", of what when it's one scope, the kinds with the one chosen
+/// standing out, and on the right how many came while the user was away,
+/// which are marked.
 fn draw_heading(frame: &mut Frame, view: &TimelineView, theme: &Theme, area: Rect) {
     let mut spans = vec![Span::styled(
         " timeline ",
         Style::new().fg(theme.text).add_modifier(Modifier::BOLD),
     )];
+    let name = &view.scope().name;
+    if !name.is_empty() {
+        spans.push(Span::styled("of ", Style::new().fg(theme.muted)));
+        spans.push(Span::styled(
+            format!("{} ", fit(name, PLACE)),
+            Style::new().fg(theme.accent).add_modifier(Modifier::BOLD),
+        ));
+    }
     for kinds in Kinds::ALL {
         let style = if kinds == view.kinds {
             Style::new().fg(theme.accent).add_modifier(Modifier::BOLD)
@@ -562,7 +650,7 @@ mod tests {
     }
 
     fn read(kinds: &[(u64, Kind)]) -> TimelineView {
-        let mut view = TimelineView::new(None);
+        let mut view = TimelineView::new(None, Vec::new(), 0);
         let page = kinds.iter().map(|(seq, kind)| event(*seq, *kind)).collect();
         view.read(Ok(page));
         view
@@ -622,7 +710,7 @@ mod tests {
 
     #[test]
     fn it_reads_further_back_to_fill_itself_then_as_the_bar_reaches_the_end() {
-        let mut view = TimelineView::new(None);
+        let mut view = TimelineView::new(None, Vec::new(), 0);
         // Nothing more is read while the first page is.
         assert_eq!(view.wants_older(true), None);
         let full: Vec<Event> = (1..=PAGE as u64)
@@ -645,7 +733,7 @@ mod tests {
 
     #[test]
     fn a_page_that_cant_be_read_says_why_when_theres_nothing_else() {
-        let mut view = TimelineView::new(None);
+        let mut view = TimelineView::new(None, Vec::new(), 0);
         view.read(Err("no database".into()));
         assert_eq!(view.list.items(), Some(&Err("no database".to_string())));
         // The log followed from there still fills it.
@@ -656,7 +744,7 @@ mod tests {
 
     #[test]
     fn what_came_while_the_user_was_away_is_new() {
-        let mut view = TimelineView::new(Some(5));
+        let mut view = TimelineView::new(Some(5), Vec::new(), 0);
         view.read(Ok(vec![
             event(7, Kind::MemoryAdded),
             event(5, Kind::MemoryAdded),
@@ -665,6 +753,58 @@ mod tests {
         assert_eq!(view.new_count(), 2);
         assert!(view.is_new(&event(6, Kind::MemoryAdded)));
         assert!(!view.is_new(&event(5, Kind::MemoryAdded)));
+    }
+
+    #[test]
+    fn a_scoped_timeline_takes_only_its_scope_and_ctrl_s_reads_the_next_from_nothing() {
+        let session = |id: &str| SessionAbout {
+            name: id.into(),
+            id: id.into(),
+            command: Vec::new(),
+            cwd: "/code/app".into(),
+            project: None,
+            worktree: None,
+            branch: None,
+            activity: None,
+            task: None,
+            task_id: None,
+            status: String::new(),
+            reporter: None,
+        };
+        let about = |seq, id: &str| Event {
+            session: Some(session(id)),
+            ..event(seq, Kind::SessionWorking)
+        };
+        let scopes = vec![
+            Scoped::new(Scope::Session("s1".into()), "session fixer".into()),
+            Scoped::everything(),
+        ];
+        let mut view = TimelineView::new(None, scopes, 0);
+        assert_eq!(view.scope().name, "session fixer");
+        view.read(Ok(vec![about(1, "s1")]));
+        view.logged(about(2, "s2"));
+        view.logged(about(3, "s1"));
+        assert_eq!(seqs(&view), [3, 1], "another session's is left out");
+
+        type_text(&mut view, "work");
+        let ctrl_s = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
+        assert_eq!(view.on_key(&ctrl_s), Step::Rescope);
+        assert_eq!(view.scope().scope, Scope::All);
+        assert_eq!(view.list.items(), None, "read again");
+        assert_eq!(view.list.filter.text(), "work", "the filter stays");
+        assert_eq!(view.wants_older(true), None, "while the first page is read");
+        view.read(Ok(vec![about(3, "s1"), about(2, "s2"), about(1, "s1")]));
+        assert_eq!(seqs(&view), [3, 2, 1]);
+        assert_eq!(hints(&view)[2], ("ctrl+s", "scope"));
+        // Round to the first again.
+        view.on_key(&ctrl_s);
+        assert_eq!(view.scope().name, "session fixer");
+
+        // With only one scope, there's nothing to go through.
+        let mut all = TimelineView::new(None, Vec::new(), 3);
+        assert_eq!(all.scope().scope, Scope::All);
+        assert_eq!(all.on_key(&ctrl_s), Step::Stay);
+        assert!(!hints(&all).iter().any(|(key, _)| *key == "ctrl+s"));
     }
 
     #[test]
@@ -691,6 +831,7 @@ mod tests {
                 branch: Some("main".into()),
                 activity: None,
                 task: None,
+                task_id: None,
                 status: "running".into(),
                 reporter: None,
             }),

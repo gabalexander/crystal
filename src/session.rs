@@ -8,6 +8,7 @@ use crate::claude_title;
 use crate::codex::Rollouts;
 use crate::config::Config;
 use crate::distill::Material;
+use crate::events::ToolUse;
 use crate::front;
 use crate::git::Checkout;
 use crate::handover::{self, Got};
@@ -172,6 +173,8 @@ pub enum Change {
     RunEnded(TaskResult),
     /// A background task's Claude asks the user for a permission.
     Asking(Asking),
+    /// A background task's Claude used a tool.
+    ToolUsed(ToolUse),
     /// A task its run had closed opened again, with a follow-up.
     Reopened,
     /// Its agent's turn ended with its task still open: the task waits on
@@ -1205,12 +1208,24 @@ impl Session {
     /// Keeps up with a task's runs since it last looked.
     fn check_runs(&mut self) {
         let events = self.task.as_mut().map(Task::events).unwrap_or_default();
+        let mut tools = self.task.as_mut().map(Task::tools_used);
         for event in events {
+            // The tools a run used are told after it started and before
+            // it ended.
+            if event == AgentEvent::TurnEnded {
+                self.tell_tools(tools.take());
+            }
             // How a run ended closes its task first: a task that stays
             // open waits on the user.
             self.follow_runs(event);
             self.on_agent_event(event);
         }
+        self.tell_tools(tools);
+    }
+
+    fn tell_tools(&mut self, tools: Option<Vec<ToolUse>>) {
+        let tools = tools.into_iter().flatten();
+        self.changes.extend(tools.map(Change::ToolUsed));
     }
 
     /// Marks the session when its program has rung the bell while nobody

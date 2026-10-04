@@ -102,6 +102,10 @@ pub enum Command {
     FlowGoOn,
     FlowSendBack,
     Timeline,
+    SessionTimeline,
+    TaskTimeline,
+    ProjectTimeline,
+    Handoff,
     Diff,
     FindFile,
     FileTree,
@@ -448,6 +452,31 @@ pub const COMMANDS: &[Spec] = &[
         "timeline",
         "the timeline of what happened",
         &["a"],
+    ),
+    spec(
+        Command::SessionTimeline,
+        "session-timeline",
+        "the timeline of the selected session, or of its project",
+        &["I"],
+    ),
+    of_plugin(
+        "tasks",
+        Command::TaskTimeline,
+        "task-timeline",
+        "the timeline of the selected session's task",
+        &[],
+    ),
+    spec(
+        Command::ProjectTimeline,
+        "project-timeline",
+        "the timeline of the selected session's project",
+        &[],
+    ),
+    spec(
+        Command::Handoff,
+        "handoff",
+        "the selected session's handoff notes, and the files its task kept",
+        &["M"],
     ),
     spec(
         Command::Diff,
@@ -1247,6 +1276,12 @@ pub enum Extent {
 const POPUP_SHARE: u16 = 80;
 
 impl Extent {
+    /// What's wrong with it, if anything: no cells, or a share that isn't
+    /// one.
+    pub fn check(&self) -> Result<(), String> {
+        self.read().map(drop)
+    }
+
     /// The share it is, from 1 to 100, or so many cells.
     fn read(&self) -> Result<Result<u16, u16>, String> {
         match self {
@@ -1911,7 +1946,17 @@ pub const HELP: &[HelpRow] = &[
     ),
     row("u", &[C::NextNeedingYou], "next needing you"),
     row("U", &[C::NeedsYou], "all needing you"),
-    row("a", &[C::Timeline], "the timeline"),
+    row(
+        "a/I",
+        &[
+            C::Timeline,
+            C::SessionTimeline,
+            C::TaskTimeline,
+            C::ProjectTimeline,
+        ],
+        "timeline: all / its own",
+    ),
+    row("M", &[C::Handoff], "its notes, kept files"),
     plugin_row(
         "github",
         "o/O",

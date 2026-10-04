@@ -24,6 +24,7 @@ use crate::agents;
 use crate::claude_stream::{self, Decision, Line, PermissionRequest, Rule};
 use crate::config::{Config, TaskSettings};
 use crate::distill::Record;
+use crate::events::ToolUse;
 use crate::handover::{self, Got};
 use crate::protocol::{AgentEvent, Answer, Asking, ContextUse, State, TaskResult, TaskSpec};
 use crate::session::{STOP_GRACE, Term, signal_group};
@@ -104,6 +105,10 @@ struct Runs {
     idle_since: Option<Instant>,
     /// The permissions Claude waits on the user for, the oldest first.
     asking: VecDeque<PermissionRequest>,
+    /// The tools Claude has used since the session last asked, in order:
+    /// each one's name and gist.
+    #[serde(skip)]
+    tools_used: Vec<ToolUse>,
     /// The user has stopped the turn going on now.
     interrupting: bool,
     /// The last turn to end had been stopped by the user.
@@ -456,6 +461,11 @@ impl Task {
         let events = turn_events(self.seen, now);
         self.seen = now;
         events
+    }
+
+    /// The tools Claude has used since this was last asked, in order.
+    pub fn tools_used(&mut self) -> Vec<ToolUse> {
+        std::mem::take(&mut self.runs.lock().unwrap().tools_used)
     }
 
     /// What the last run to start was asked.
@@ -898,6 +908,13 @@ impl Reading {
                 Event::Context { tokens, model } => runs.context = Some((tokens, model)),
                 Event::Finished(outcome) => self.finish(runs, outcome),
                 event => {
+                    if let Event::UsedTool { name, gist } = &event {
+                        let used = ToolUse {
+                            name: name.clone(),
+                            gist: gist.clone(),
+                        };
+                        runs.tools_used.push(used);
+                    }
                     let lines = transcript::lines(&event, self.term.columns());
                     self.term.show(lines.as_bytes());
                 }
@@ -1286,6 +1303,27 @@ mod tests {
         assert_eq!(task.spec().prompt, "fix the tests");
         // What the session had seen of its runs isn't news again.
         assert!(task.events().is_empty());
+    }
+
+    #[test]
+    fn the_tools_claude_uses_wait_for_the_session_to_take_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut task = task_in(dir.path(), BTreeMap::new(), &[], None);
+        let reading = Reading {
+            number: 0,
+            term: task.term.clone(),
+            runs: task.runs.clone(),
+            state: task.state.clone(),
+            spending: task.spending.clone(),
+        };
+        let line = r#"{"type":"assistant","parent_tool_use_id":null,"message":{"content":[{"type":"text","text":"Testing."},{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"cargo test"}}]}}"#;
+        reading.converse(&mut task.runs.lock().unwrap(), line);
+        let used = ToolUse {
+            name: "Bash".into(),
+            gist: "cargo test".into(),
+        };
+        assert_eq!(task.tools_used(), [used]);
+        assert!(task.tools_used().is_empty());
     }
 
     /// A task at rest in `dir`, in conversation `conversation`, with

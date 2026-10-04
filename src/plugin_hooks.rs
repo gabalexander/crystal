@@ -1,16 +1,19 @@
 //! The daemon's side of plugins' `[[events]]` and `[[startup]]`: when
 //! something happens in crystal, the hooks of the plugins that asked for it
-//! run, each with the event as JSON on its standard input and its name in
-//! `CRYSTAL_EVENT`. They hear it from the daemon's [`Bus`], like any other
-//! subscriber. As the daemon starts, once it has brought back its sessions,
-//! each plugin's startup commands run, with `CRYSTAL_EVENT` set to
-//! `startup`.
+//! run, each with the event as JSON on its standard input and in
+//! `CRYSTAL_EVENT_JSON`, its name in `CRYSTAL_EVENT`, and what happened in
+//! a line in `CRYSTAL_EVENT_TEXT`. They hear it from the daemon's [`Bus`],
+//! like any other subscriber; a project's plugin hears only what happens
+//! in its project. As the daemon starts, once it has brought back its
+//! sessions, each plugin's startup commands run, with `CRYSTAL_EVENT` set
+//! to `startup`.
 //!
 //! A plugin's commands run one at a time, in the order things happened, on
 //! a thread of the plugin's own, so a slow plugin holds up neither the
 //! daemon nor the others. What a command prints goes to the plugin's log.
-//! One that runs past [`TIMEOUT`] is stopped, and a plugin whose commands
-//! fail [`FAILURES_TO_PAUSE`] times in a row is paused, with a notice and a
+//! One that runs past its timeout, [`plugin_manifest::TIMEOUT`] unless the
+//! plugin says, is stopped, and a plugin whose commands fail
+//! [`FAILURES_TO_PAUSE`] times in a row is paused, with a notice and a
 //! `plugin.paused` event, until the user turns it on again. A handover to a
 //! new crystal gives the commands running a few seconds to finish, and drops
 //! those still waiting to run.
@@ -21,8 +24,9 @@ use crate::events::{Event, Filter};
 use crate::handover::{self, HELPERS};
 use crate::notify::{self, Notice};
 use crate::plugin_manifest::{self, Manifest};
-use crate::plugins::{self, Context};
+use crate::plugins::{self, Context, Id};
 use crate::protocol::Activity;
+use crate::shell;
 use anyhow::{Context as _, Result, bail};
 use std::collections::HashMap;
 use std::io::Write;
@@ -33,9 +37,6 @@ use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex, Weak};
 use std::thread;
 use std::time::{Duration, Instant};
-
-/// How long a hook may run before it's stopped.
-const TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How many times in a row a plugin's hooks may fail before it's paused.
 const FAILURES_TO_PAUSE: u32 = 5;
@@ -73,9 +74,9 @@ pub struct Hooks {
     socket: PathBuf,
     /// Where a plugin paused for failing says so.
     bus: Weak<Bus>,
-    /// Each plugin's queue of hooks to run, by its name, made the first
-    /// time it has one.
-    queues: Mutex<HashMap<String, Sender<Job>>>,
+    /// Each plugin's queue of hooks to run, made the first time it has
+    /// one.
+    queues: Mutex<HashMap<Id, Sender<Job>>>,
 }
 
 /// One of a plugin's commands to run: a hook for one event, or a startup
@@ -85,6 +86,8 @@ struct Job {
     command: Vec<String>,
     /// The event it's run on, or `None` as the daemon starts.
     event: Option<Arc<Event>>,
+    /// How long it may run before it's stopped.
+    timeout: Duration,
 }
 
 impl Job {
@@ -107,17 +110,22 @@ impl Hooks {
     }
 
     /// Hands `event` to the hooks of every plugin that's on and listens
-    /// for it, to run in turn after the plugin's others.
+    /// for it, to run in turn after the plugin's others: a project's
+    /// plugin, only when it's about that project.
     fn tell(&self, event: &Arc<Event>) {
         let config = Config::load().unwrap_or_default();
-        for (dir, manifest) in plugins::running(&config, &self.socket) {
-            for hook in hooks_on(&manifest, event) {
+        for plugin in plugins::running(&config, &self.socket) {
+            if !hears(&plugin.id, event) {
+                continue;
+            }
+            for hook in hooks_on(&plugin.manifest, event) {
                 let job = Job {
-                    dir: dir.clone(),
+                    dir: plugin.dir.clone(),
                     command: hook.command.clone(),
                     event: Some(event.clone()),
+                    timeout: plugin.manifest.timeout(hook.timeout_secs),
                 };
-                self.queue(&manifest.name).send(job).ok();
+                self.queue(&plugin.id).send(job).ok();
             }
         }
     }
@@ -128,25 +136,27 @@ impl Hooks {
     /// takes over from another.
     pub fn start_up(&self) {
         let config = Config::load().unwrap_or_default();
-        for (dir, manifest) in plugins::running(&config, &self.socket) {
+        for plugin in plugins::running(&config, &self.socket) {
+            let manifest = &plugin.manifest;
             for once in manifest.startup.iter().filter(|once| once.runs_here()) {
                 let job = Job {
-                    dir: dir.clone(),
+                    dir: plugin.dir.clone(),
                     command: once.command.clone(),
                     event: None,
+                    timeout: manifest.timeout(once.timeout_secs),
                 };
-                self.queue(&manifest.name).send(job).ok();
+                self.queue(&plugin.id).send(job).ok();
             }
         }
     }
 
-    fn queue(&self, plugin: &str) -> Sender<Job> {
+    fn queue(&self, plugin: &Id) -> Sender<Job> {
         let mut queues = self.queues.lock().unwrap();
-        let queue = queues.entry(plugin.to_string()).or_insert_with(|| {
+        let queue = queues.entry(plugin.clone()).or_insert_with(|| {
             let (queue, jobs) = mpsc::channel::<Job>();
             let socket = self.socket.clone();
             let bus = self.bus.clone();
-            let plugin = plugin.to_string();
+            let plugin = plugin.clone();
             thread::spawn(move || {
                 let mut failures = 0;
                 for job in jobs {
@@ -160,7 +170,7 @@ impl Hooks {
                         plugins::log(&socket, &plugin, &format!("{name}: dropped in a handover"));
                         continue;
                     }
-                    match run(&socket, &plugin, &job, TIMEOUT) {
+                    match run(&socket, &plugin, &job) {
                         Ok(()) => failures = 0,
                         Err(err) => {
                             failures += 1;
@@ -179,6 +189,16 @@ impl Hooks {
     }
 }
 
+/// Whether the plugin `plugin` hears `event`: the user's own hear every
+/// one, and a project's those about its project.
+fn hears(plugin: &Id, event: &Event) -> bool {
+    match (&plugin.project, &event.project) {
+        (None, _) => true,
+        (Some(project), Some(about)) => plugins::same_dir(project, about),
+        (Some(_), None) => false,
+    }
+}
+
 /// The hooks of `manifest` that listen for `event`.
 pub fn hooks_on<'a>(
     manifest: &'a Manifest,
@@ -191,19 +211,28 @@ pub fn hooks_on<'a>(
         .filter(move |hook| plugin_manifest::matches(&hook.on, name))
 }
 
-/// The plugin called `plugin`'s `job`, from its directory, with what it's
-/// run on in `CRYSTAL_EVENT` and what the event is about in the variables
-/// every plugin command finds. An event goes on its standard input.
-fn command(plugin: &str, job: &Job, socket: &Path) -> Command {
+/// The plugin `plugin`'s `job`, from its directory, with what it's run on
+/// in `CRYSTAL_EVENT` and what the event is about in the variables every
+/// plugin command finds. An event goes on its standard input, and in
+/// `CRYSTAL_EVENT_JSON`; what happened, in words, in `CRYSTAL_EVENT_TEXT`.
+fn command(plugin: &Id, job: &Job, socket: &Path) -> Command {
     let context = job.event.as_deref().map(Context::of_event);
     let context = context.unwrap_or_default();
     let mut command = plugins::command(plugin, &job.dir, &job.command, socket, &context);
-    let stdin = if job.event.is_some() {
-        Stdio::piped()
-    } else {
-        Stdio::null()
+    command.env("CRYSTAL_EVENT", job.on());
+    match &job.event {
+        Some(event) => {
+            let json = serde_json::to_string(event).unwrap_or_default();
+            command
+                .env("CRYSTAL_EVENT_JSON", json)
+                .env("CRYSTAL_EVENT_TEXT", event.line())
+                .stdin(Stdio::piped())
+        }
+        None => command
+            .env_remove("CRYSTAL_EVENT_JSON")
+            .env_remove("CRYSTAL_EVENT_TEXT")
+            .stdin(Stdio::null()),
     };
-    command.env("CRYSTAL_EVENT", job.on()).stdin(stdin);
     command
 }
 
@@ -217,12 +246,12 @@ fn hand_over(child: &mut std::process::Child, job: &Job) {
     }
 }
 
-/// Runs a hook of the plugin called `plugin` here, in the foreground, its
-/// output going where this process's does: how `crystal plugin run
-/// --event` tries a plugin's hooks out. It's neither logged nor counted
-/// towards a pause.
+/// Runs a hook of the plugin `plugin` here, in the foreground, its output
+/// going where this process's does: how `crystal plugin run --event` tries
+/// a plugin's hooks out. It's neither logged nor counted towards a pause,
+/// and runs as long as it takes.
 pub fn run_here(
-    plugin: &str,
+    plugin: &Id,
     dir: &Path,
     words: &[String],
     socket: &Path,
@@ -232,6 +261,7 @@ pub fn run_here(
         dir: dir.to_path_buf(),
         command: words.to_vec(),
         event: Some(Arc::new(event.clone())),
+        timeout: plugin_manifest::TIMEOUT,
     };
     let mut child = command(plugin, &job, socket)
         .spawn()
@@ -242,8 +272,9 @@ pub fn run_here(
 
 /// Runs one of the plugin's commands, with its event on its standard input
 /// and what it prints in the plugin's log, and stops it if it runs past
-/// `timeout`.
-fn run(socket: &Path, plugin: &str, job: &Job, timeout: Duration) -> Result<()> {
+/// its timeout.
+fn run(socket: &Path, plugin: &Id, job: &Job) -> Result<()> {
+    let timeout = job.timeout;
     let name = job.on();
     plugins::log(
         socket,
@@ -282,22 +313,34 @@ fn run(socket: &Path, plugin: &str, job: &Job, timeout: Duration) -> Result<()> 
 
 /// Pauses a plugin that keeps failing, and tells the user so, and how to
 /// turn it back on.
-fn pause(socket: &Path, bus: &Weak<Bus>, plugin: &str) {
+fn pause(socket: &Path, bus: &Weak<Bus>, plugin: &Id) {
+    let (label, name) = (plugin.label(), &plugin.name);
+    let flags = match &plugin.project {
+        Some(project) => format!(
+            " --project -C {}",
+            shell::quote(&shell::home_relative(project))
+        ),
+        None => String::new(),
+    };
     let text = format!(
-        "the {plugin} plugin failed {FAILURES_TO_PAUSE} times in a row and was paused: \
-         see `crystal plugin log {plugin}`, then turn it back on with \
-         `crystal plugin enable {plugin}`"
+        "the {label} plugin failed {FAILURES_TO_PAUSE} times in a row and was paused: \
+         see `crystal plugin log {name}{flags}`, then turn it back on with \
+         `crystal plugin enable {name}{flags}`"
     );
     plugins::log(socket, plugin, &text);
     if let Err(err) = plugins::pause(socket, plugin, &text) {
-        eprintln!("crystal daemon: couldn't pause the {plugin} plugin: {err:#}");
+        eprintln!("crystal daemon: couldn't pause the {label} plugin: {err:#}");
     }
     eprintln!("crystal daemon: {text}");
     if let Some(bus) = bus.upgrade() {
-        bus.emit(Event::plugin_paused(plugin, &text));
+        let paused = Event {
+            project: plugin.project.clone(),
+            ..Event::plugin_paused(name, &text)
+        };
+        bus.emit(paused);
     }
     let notice = Notice {
-        session: plugin.to_string(),
+        session: label,
         // It's waiting on the user to look at it.
         activity: Activity::Waiting,
         text,
@@ -319,18 +362,26 @@ mod tests {
             dir: dir.to_path_buf(),
             command: vec!["sh".into(), "hook.sh".into()],
             event: Some(Arc::new(Event::new(Kind::SessionDone))),
+            timeout: plugin_manifest::TIMEOUT,
         }
+    }
+
+    fn notes() -> Id {
+        Id::own("notes")
     }
 
     #[test]
     fn a_hook_reads_the_event_and_its_output_goes_to_the_log() {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("crystal.sock");
-        let job = job(dir.path(), "echo \"got $CRYSTAL_EVENT\"; cat\n");
-        run(&socket, "notes", &job, TIMEOUT).unwrap();
-        let log = fs::read_to_string(plugins::log_path(&socket, "notes")).unwrap();
-        assert!(log.contains("got session.done"), "{log}");
-        assert!(log.contains(r#""event":"session.done""#), "{log}");
+        let job = job(
+            dir.path(),
+            "echo \"got $CRYSTAL_EVENT: $CRYSTAL_EVENT_TEXT\"; echo \"$CRYSTAL_EVENT_JSON\"; cat\n",
+        );
+        run(&socket, &notes(), &job).unwrap();
+        let log = fs::read_to_string(plugins::log_path(&socket, &notes())).unwrap();
+        assert!(log.contains("got session.done: -: session.done"), "{log}");
+        assert_eq!(log.matches(r#""event":"session.done""#).count(), 2, "{log}");
     }
 
     #[test]
@@ -342,10 +393,10 @@ mod tests {
             "echo \"started: $CRYSTAL_EVENT in $CRYSTAL_PLUGIN_STATE_DIR\"; cat\n",
         );
         job.event = None;
-        run(&socket, "notes", &job, TIMEOUT).unwrap();
-        let log = fs::read_to_string(plugins::log_path(&socket, "notes")).unwrap();
+        run(&socket, &notes(), &job).unwrap();
+        let log = fs::read_to_string(plugins::log_path(&socket, &notes())).unwrap();
         assert!(log.contains("startup: sh hook.sh"), "{log}");
-        let state = plugins::own_state_dir(&socket, "notes");
+        let state = plugins::own_state_dir(&socket, &notes());
         assert!(
             log.contains(&format!("started: startup in {}", state.display())),
             "{log}"
@@ -357,10 +408,27 @@ mod tests {
     fn a_hook_that_fails_or_runs_too_long_is_an_error() {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("crystal.sock");
-        let err = run(&socket, "notes", &job(dir.path(), "exit 3\n"), TIMEOUT).unwrap_err();
+        let err = run(&socket, &notes(), &job(dir.path(), "exit 3\n")).unwrap_err();
         assert!(err.to_string().contains("exit status: 3"), "{err:#}");
-        let slow = job(dir.path(), "exec sleep 5\n");
-        let err = run(&socket, "notes", &slow, Duration::from_millis(100)).unwrap_err();
+        let slow = Job {
+            timeout: Duration::from_millis(100),
+            ..job(dir.path(), "exec sleep 5\n")
+        };
+        let err = run(&socket, &notes(), &slow).unwrap_err();
         assert!(err.to_string().contains("stopped"), "{err:#}");
+    }
+
+    #[test]
+    fn a_projects_plugin_hears_only_what_happens_in_its_project() {
+        let about = |project: Option<&str>| Event {
+            project: project.map(PathBuf::from),
+            ..Event::new(Kind::SessionDone)
+        };
+        let lint = Id::of_project("lint", Path::new("/code/app"));
+        assert!(hears(&lint, &about(Some("/code/app"))));
+        assert!(!hears(&lint, &about(Some("/code/other"))));
+        assert!(!hears(&lint, &about(None)));
+        assert!(hears(&notes(), &about(None)));
+        assert!(hears(&notes(), &about(Some("/code/other"))));
     }
 }

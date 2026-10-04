@@ -1,12 +1,13 @@
 //! Flows: a named chain of steps, run one after another on one goal. Each
-//! step is a task with a profile of its own: Claude Code in the background
-//! (`claude -p`), or any other agent in a terminal, which ends as its task
-//! closes. A step is asked what its prompt says, which can bring in the
-//! goal, what earlier steps answered and the files they kept, and notes
-//! from the last time the flow was sent back. A step runs where the run
-//! started, in a worktree the run makes for itself, or where the step
-//! before it ran. It can stop the flow at a gate until the user says to go
-//! on, or sends it back, a few rounds at most.
+//! step is a task with a profile of its own, or its own agent, model,
+//! effort and mode over it: Claude Code in the background (`claude -p`), or
+//! any agent in a terminal, which ends as its task closes. It can carry
+//! acceptance criteria, as a task does. A step is asked what its prompt
+//! says, which can bring in the goal, what earlier steps answered and the
+//! files they kept, and notes from the last time the flow was sent back. A
+//! step runs where the run started, in a worktree the run makes for
+//! itself, or where the step before it ran. It can stop the flow at a gate
+//! until the user says to go on, or sends it back, a few rounds at most.
 //!
 //! Flows are written in the config file as `[[flow]]` tables, each step a
 //! `[[flow.step]]` under it, and a project can keep its own in
@@ -16,12 +17,13 @@
 //! Everything flows add to crystal goes through [`enabled`], so they can be
 //! switched off as one.
 
-use crate::catalog::{self, FirstPrompt};
+use crate::catalog::{self, FirstPrompt, Kind};
 use crate::config::{self, Config};
 use crate::plugins;
 use crate::profile::Profile;
 use crate::project;
 use crate::shell;
+use crate::tasks;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -76,14 +78,37 @@ pub struct Step {
     /// What the step is called, in its flow and in its session's name.
     pub name: String,
     /// The `[[profile]]` it runs with, for its agent, model, mode,
-    /// arguments, instructions and prompt. Claude Code's run in the
-    /// background; any other agent runs in a terminal. Left out, Claude
-    /// Code as it's set up.
+    /// arguments, instructions and prompt. Left out, Claude Code as it's
+    /// set up.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
+    /// The agent it runs, one crystal knows (`claude`, `codex`, …), in
+    /// place of its profile's: see [`Step::profile_in`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    /// The model, in place of its profile's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// How hard it thinks, Claude Code's `--effort`, in place of its
+    /// profile's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    /// How it asks before acting, in place of its profile's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    /// Whether it runs in the background, as `claude -p`. Left out, a
+    /// step on Claude Code does, and one on any other agent runs in a
+    /// terminal; `false` runs Claude Code in a terminal too. Only Claude
+    /// Code runs in the background.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background: Option<bool>,
     /// What it's asked, with `{goal}` and the rest filled in: see
     /// [`crate::flow_run::FlowRun::prompt_for`].
     pub prompt: String,
+    /// What has to hold before it's done: its task's acceptance criteria,
+    /// which its agent is told under its prompt.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accept: Vec<String>,
     /// Where it runs. Left out, where the step before it ran, or for the
     /// first step, where the run started.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -128,12 +153,58 @@ impl Step {
     pub fn rounds(&self) -> u32 {
         self.max_rounds.unwrap_or(MAX_ROUNDS)
     }
+
+    /// The profile it runs with: the one it names among `profiles`, or
+    /// Claude Code as it's set up, with its own agent, model, effort and
+    /// mode in place of the profile's. On an agent other than its
+    /// profile's, it keeps only the profile's prompt and instructions, the
+    /// rest being for the profile's agent. `None` when the profile it
+    /// names isn't there.
+    pub fn profile_in(&self, profiles: &[Profile]) -> Option<Profile> {
+        let claude = Profile::for_agent("claude");
+        let named = match &self.profile {
+            Some(wanted) => profiles.iter().find(|profile| profile.name == *wanted)?,
+            None => &claude,
+        };
+        let mut profile = match &self.agent {
+            Some(agent) if *agent != named.agent => Profile {
+                name: named.name.clone(),
+                prompt: named.prompt.clone(),
+                instructions: named.instructions.clone(),
+                ..Profile::for_agent(agent)
+            },
+            _ => named.clone(),
+        };
+        for kind in [Kind::Model, Kind::Effort, Kind::Mode] {
+            if let Some(chosen) = self.choice(kind) {
+                *profile.choice_mut(kind) = Some(chosen.clone());
+            }
+        }
+        Some(profile)
+    }
+
+    /// Whether it runs in the background on `agent`, the agent its profile
+    /// comes to: as it says, or when it doesn't, on Claude Code.
+    pub fn in_background(&self, agent: &str) -> bool {
+        self.background.unwrap_or(agent == "claude")
+    }
+
+    /// What it sets the agent's row of `kind` to itself, if anything.
+    fn choice(&self, kind: Kind) -> Option<&String> {
+        match kind {
+            Kind::Model => self.model.as_ref(),
+            Kind::Effort => self.effort.as_ref(),
+            Kind::Mode => self.mode.as_ref(),
+        }
+    }
 }
 
 impl Flow {
     /// A flow that can't run as written is an error that says why: no
     /// steps or too many, a name with spaces, two steps with one name, a
-    /// profile that isn't there or whose agent can't be given a prompt, a
+    /// profile that isn't there, an agent, model, effort or mode a profile
+    /// couldn't have, an agent that can't be given a prompt, or one other
+    /// than Claude Code in the background, acceptance criteria too long, a
     /// placement or a `back_to` that goes nowhere, rounds out of reach, or
     /// a step that asks for a step that doesn't come before it.
     pub fn check(&self, profiles: &[Profile]) -> Result<()> {
@@ -158,21 +229,27 @@ impl Flow {
             if step.prompt.trim().is_empty() {
                 bail!("step {name} of flow {flow} has no prompt");
             }
-            if let Some(wanted) = &step.profile {
-                let Some(profile) = profiles.iter().find(|profile| profile.name == *wanted) else {
-                    bail!(
-                        "step {name} of flow {flow} runs with profile {wanted}, which isn't there"
-                    );
-                };
-                let agent = catalog::find(&profile.agent);
-                if agent.is_none_or(|agent| agent.first_prompt == FirstPrompt::None) {
-                    bail!(
-                        "step {name} of flow {flow} runs with profile {wanted}, for {}, which \
-                         can't be given a prompt to start on",
-                        profile.agent
-                    );
-                }
+            let Some(profile) = step.profile_in(profiles) else {
+                let wanted = step.profile.as_deref().unwrap_or_default();
+                bail!("step {name} of flow {flow} runs with profile {wanted}, which isn't there");
+            };
+            profile.check_settings(&format!("step {name} of flow {flow}"))?;
+            let agent = catalog::find(&profile.agent);
+            let called = agent.map_or(profile.agent.as_str(), |agent| agent.name);
+            if agent.is_none_or(|agent| agent.first_prompt == FirstPrompt::None) {
+                bail!(
+                    "step {name} of flow {flow} runs {called}, which can't be given a prompt to \
+                     start on"
+                );
             }
+            if step.background == Some(true) && profile.agent != "claude" {
+                bail!(
+                    "step {name} of flow {flow} runs {called}, which can't run in the \
+                     background: only Claude Code does, so leave out `background`"
+                );
+            }
+            tasks::criteria(step.accept.clone())
+                .with_context(|| format!("step {name} of flow {flow}"))?;
             if step.worktree && step.placement.is_some() {
                 bail!(
                     "step {name} of flow {flow} has both `worktree` and `placement`: \
@@ -590,20 +667,20 @@ and how, in the order to change them."""
 # {plan.summary} is what the plan step answered; {previous} is what the
 # step just before answered. placement = "fresh" runs this step in a
 # worktree the run makes for itself, on a new branch with a made-up name
-# like brave-otter.
+# like brave-otter. accept is what has to hold before it's done: the step
+# is told under its prompt, and its task carries it.
 [[flow.step]]
 name = "implement"
 profile = "builder"
 placement = "fresh"
+accept = ["The tests pass", "The work is committed"]
 prompt = """
 Do this: {goal}
 
 Follow this plan:
 {plan.summary}
 
-{feedback}
-
-Run the tests, and commit your work when they pass."""
+{feedback}"""
 
 # placement = "same" runs it where the step before it ran, as a step that
 # says no placement does. gate = true stops the flow here until you go on,
@@ -627,9 +704,14 @@ What the builder said it did, in round {round}:
 
 {feedback}"""
 
+# A step can set its own agent, model, effort and mode, over its profile's
+# or with none. background = false runs Claude Code in a terminal rather
+# than the background: a session you can watch and answer, and the flow
+# goes on once it closes its task.
 [[flow.step]]
 name = "pr"
 profile = "shipper"
+model = "sonnet"
 prompt = """
 Push this branch and open a pull request for it with `gh pr create --fill`.
 It does this: {goal}
@@ -644,7 +726,13 @@ mod tests {
         Step {
             name: name.into(),
             profile: None,
+            agent: None,
+            model: None,
+            effort: None,
+            mode: None,
+            background: None,
             prompt: "do {goal}".into(),
+            accept: Vec::new(),
             placement: None,
             worktree: false,
             gate: false,
@@ -713,6 +801,120 @@ mod tests {
         let aider = [profile("planner", "aider")];
         assert!(problem(&flow, &aider).contains("can't be given a prompt to start on"));
         flow.check(&[profile("planner", "gemini")]).unwrap();
+    }
+
+    #[test]
+    fn a_steps_own_agent_model_effort_and_mode_go_over_its_profiles() {
+        let builder = Profile {
+            name: "builder".into(),
+            mode: Some("acceptEdits".into()),
+            args: vec!["--allowedTools".into(), "Bash".into()],
+            prompt: Some("Be careful.".into()),
+            instructions: Some("Keep changes small.".into()),
+            ..Profile::for_agent("claude")
+        };
+        let profiles = [builder.clone()];
+
+        // With no profile, Claude Code with what the step sets.
+        let mut alone = step("plan");
+        alone.model = Some("opus".into());
+        alone.effort = Some("high".into());
+        let profile = alone.profile_in(&profiles).unwrap();
+        assert_eq!(profile.agent, "claude");
+        assert_eq!(profile.model.as_deref(), Some("opus"));
+        assert_eq!(profile.effort.as_deref(), Some("high"));
+
+        // Over a profile, the rest of the profile stays.
+        let mut over = step("build");
+        over.profile = Some("builder".into());
+        over.model = Some("sonnet".into());
+        over.agent = Some("claude".into());
+        let profile = over.profile_in(&profiles).unwrap();
+        assert_eq!(
+            profile,
+            Profile {
+                model: Some("sonnet".into()),
+                ..builder.clone()
+            }
+        );
+
+        // On another agent, only its prompt and instructions.
+        over.agent = Some("codex".into());
+        over.model = Some("gpt-5".into());
+        let profile = over.profile_in(&profiles).unwrap();
+        assert_eq!(profile.agent, "codex");
+        assert_eq!(profile.model.as_deref(), Some("gpt-5"));
+        assert_eq!(profile.mode, None);
+        assert!(profile.args.is_empty());
+        assert_eq!(profile.prompt, builder.prompt);
+        assert_eq!(profile.instructions, builder.instructions);
+        flow(vec![alone, over.clone()]).check(&profiles).unwrap();
+
+        over.profile = Some("nobody".into());
+        assert_eq!(over.profile_in(&profiles), None);
+    }
+
+    #[test]
+    fn a_steps_own_settings_are_checked_as_a_profiles_are() {
+        let on = |agent: &str| Step {
+            agent: Some(agent.into()),
+            ..step("plan")
+        };
+        let cases = [
+            (
+                on("vim"),
+                "step plan of flow ship: crystal doesn't know the agent vim",
+            ),
+            (
+                on("aider"),
+                "step plan of flow ship runs Aider, which can't be given a prompt to start on",
+            ),
+            (
+                Step {
+                    effort: Some("turbo".into()),
+                    ..step("plan")
+                },
+                "step plan of flow ship: turbo isn't an effort level of Claude Code",
+            ),
+            (
+                Step {
+                    effort: Some("high".into()),
+                    ..on("codex")
+                },
+                "step plan of flow ship: Codex doesn't take an effort level",
+            ),
+            (
+                Step {
+                    accept: vec!["x".repeat(crate::tasks::MAX_CRITERIA_BYTES + 1)],
+                    ..step("plan")
+                },
+                "step plan of flow ship: the acceptance criteria come to",
+            ),
+        ];
+        for (wrong, expected) in cases {
+            let problem = problem(&flow(vec![wrong]), &[]);
+            assert!(problem.contains(expected), "{problem}");
+        }
+    }
+
+    #[test]
+    fn only_claude_code_runs_in_the_background_and_it_can_run_in_a_terminal() {
+        let mut claude = step("plan");
+        assert!(claude.in_background("claude"));
+        assert!(!claude.in_background("codex"));
+        claude.background = Some(false);
+        assert!(!claude.in_background("claude"));
+        claude.background = Some(true);
+        flow(vec![claude.clone()]).check(&[]).unwrap();
+
+        claude.agent = Some("codex".into());
+        let problem = problem(&flow(vec![claude.clone()]), &[]);
+        assert!(
+            problem.contains("runs Codex, which can't run in the background"),
+            "{problem}"
+        );
+        claude.background = Some(false);
+        flow(vec![claude]).check(&[]).unwrap();
     }
 
     #[test]
@@ -888,5 +1090,11 @@ mod tests {
         assert_eq!(ship.placement(1), Placement::Fresh);
         assert_eq!(ship.placement(3), Placement::Same);
         assert_eq!(ship.steps[2].back_to.as_deref(), Some("implement"));
+        assert_eq!(ship.steps[1].accept.len(), 2);
+        let pr = ship.steps[3].profile_in(&config.profiles).unwrap();
+        assert_eq!(
+            (pr.name.as_str(), pr.model.as_deref()),
+            ("shipper", Some("sonnet"))
+        );
     }
 }

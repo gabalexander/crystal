@@ -2,10 +2,12 @@
 //! the daemon for: refused while a session runs there; git removes it;
 //! everyone's told it's gone, and the sessions that had ended in it leave
 //! the list with it, since their directory is gone; then whoever asked is
-//! answered. The client going doesn't stop it. A handover doesn't either:
-//! git is left running, still this process's child, and the next daemon
-//! waits for it to end, has git remove the worktree again if it's still
-//! there, and answers the clients that asked.
+//! answered. Meanwhile any client can ask which worktrees are being
+//! removed, as a TUI does to say so on their lines, whoever asked for them.
+//! The client going doesn't stop it. A handover doesn't either: git is
+//! left running, still this process's child, and the next daemon waits for
+//! it to end, has git remove the worktree again if it's still there, and
+//! answers the clients that asked.
 
 use super::Daemon;
 use crate::events::Event;
@@ -142,6 +144,15 @@ impl Daemon {
         self.removed(path, removed);
     }
 
+    /// The worktrees being removed, by their directories, whoever asked.
+    pub(super) fn removing(&self) -> Vec<PathBuf> {
+        let removals = self.removals.lock().unwrap();
+        removals
+            .iter()
+            .map(|removal| removal.path.clone())
+            .collect()
+    }
+
     /// Refuses while a session runs in the worktree at `path`: removing it
     /// would pull the directory out from under the program.
     fn check_nothing_runs_in(&self, path: &Path) -> Result<()> {
@@ -207,7 +218,8 @@ impl Daemon {
         };
         if removed.is_ok() {
             let branch = removal.branch.as_deref();
-            self.events.emit(Event::worktree(false, path, branch));
+            self.events
+                .emit(Event::worktree_removed(path, branch, &removal.project));
             while let Some(index) = sessions
                 .iter()
                 .position(|session| !session.is_running() && in_worktree(session, path))

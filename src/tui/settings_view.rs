@@ -48,6 +48,7 @@ pub enum Setting {
     CopyOnSelect,
     ScrollLines,
     Scrollbars,
+    AttachCapture,
     ProgramsCopy,
     TaskPermissions,
     Distill,
@@ -80,6 +81,7 @@ pub enum Change {
     /// [`SCROLL_LINES`].
     ScrollLines(u16),
     Scrollbars(bool),
+    AttachCapture(bool),
     ProgramsCopy(bool),
     /// The permission mode background tasks start in, one of
     /// [`TaskSettings::PERMISSION_MODES`].
@@ -108,6 +110,7 @@ impl Change {
             Change::CopyOnSelect(_) => &["mouse", "copy_on_select"],
             Change::ScrollLines(_) => &["mouse", "scroll_lines"],
             Change::Scrollbars(_) => &["mouse", "scrollbars"],
+            Change::AttachCapture(_) => &["mouse", "attach_capture"],
             Change::ProgramsCopy(_) => &["clipboard", "allow_programs"],
             Change::TaskPermissions(_) => &["tasks", "permission_mode"],
             Change::Distill(_) => &["memory", "distill"],
@@ -124,6 +127,7 @@ impl Change {
             | Change::MouseCapture(on)
             | Change::CopyOnSelect(on)
             | Change::Scrollbars(on)
+            | Change::AttachCapture(on)
             | Change::ProgramsCopy(on)
             | Change::Distill(on)
             | Change::Embeddings(on)
@@ -210,7 +214,7 @@ pub enum Outcome {
 }
 
 /// The settings the bar can be on, in the order they're listed.
-const SETTINGS: [Setting; 20] = [
+const SETTINGS: [Setting; 21] = [
     Setting::Notify,
     Setting::NotifyAfter,
     Setting::UnfocusedOnly,
@@ -226,6 +230,7 @@ const SETTINGS: [Setting; 20] = [
     Setting::CopyOnSelect,
     Setting::ScrollLines,
     Setting::Scrollbars,
+    Setting::AttachCapture,
     Setting::ProgramsCopy,
     Setting::TaskPermissions,
     Setting::Distill,
@@ -350,6 +355,7 @@ impl SettingsView {
                 Change::ScrollLines(next_lines(config.mouse.scroll_lines, forward))
             }
             Setting::Scrollbars => Change::Scrollbars(!config.mouse.scrollbars),
+            Setting::AttachCapture => Change::AttachCapture(!config.mouse.attach_capture),
             Setting::ProgramsCopy => Change::ProgramsCopy(!config.clipboard.allow_programs),
             Setting::TaskPermissions => {
                 let modes = TaskSettings::PERMISSION_MODES;
@@ -515,19 +521,23 @@ fn lines(view: &SettingsView, theme: &Theme) -> Vec<Line<'static>> {
             Setting::CopyOnSelect => "copy on select",
             Setting::ScrollLines => "wheel scrolls",
             Setting::Scrollbars => "scrollbars",
+            Setting::AttachCapture => "take it in attach",
             Setting::ProgramsCopy => "programs copy",
             Setting::TaskPermissions => "permission mode",
             Setting::Distill => "distill closed tasks",
             Setting::Embeddings => "search by meaning",
             Setting::HideDrafts => "hide drafts",
         };
-        let mouse = matches!(
-            setting,
-            Setting::CopyOnSelect | Setting::ScrollLines | Setting::Scrollbars
-        );
+        // The wheel scrolls the attach's history too, while it takes the
+        // mouse.
+        let mouse = match setting {
+            Setting::CopyOnSelect | Setting::Scrollbars => !config.mouse.capture,
+            Setting::ScrollLines => !config.mouse.capture && !config.mouse.attach_capture,
+            _ => false,
+        };
         let dim = (matches!(setting, Setting::Distill | Setting::Embeddings) && !memory_on)
             || (matches!(setting, Setting::NotifyAfter | Setting::UnfocusedOnly) && !config.notify)
-            || (mouse && !config.mouse.capture)
+            || mouse
             || (setting == Setting::HideDrafts && !forge_on);
         let (mark, color) = match on {
             Some(true) => ("● ", theme.done),
@@ -688,6 +698,12 @@ fn lines(view: &SettingsView, theme: &Theme) -> Vec<Line<'static>> {
         Some(mouse.scrollbars),
         on_off(mouse.scrollbars),
         "beside each pane, a column of its own: drag one to scroll".to_string(),
+    ));
+    lines.push(row(
+        Setting::AttachCapture,
+        Some(mouse.attach_capture),
+        on_off(mouse.attach_capture),
+        "crystal attach's wheel scrolls its history".to_string(),
     ));
 
     lines.push(Line::from(""));
@@ -913,6 +929,11 @@ mod tests {
         press(&mut view, KeyCode::Down);
         assert_eq!(
             press(&mut view, KeyCode::Char(' ')),
+            Outcome::Change(Change::AttachCapture(true))
+        );
+        press(&mut view, KeyCode::Down);
+        assert_eq!(
+            press(&mut view, KeyCode::Char(' ')),
             Outcome::Change(Change::ProgramsCopy(false))
         );
         press(&mut view, KeyCode::Down);
@@ -1003,6 +1024,11 @@ mod tests {
         config.mouse.scroll_lines = 1;
         let shown = text(&view_of(config, None));
         assert!(shown.contains("1 line "), "{shown}");
+        assert!(shown.contains("take it in attach     off"), "{shown}");
+        assert_eq!(
+            Change::AttachCapture(true).keys(),
+            ["mouse", "attach_capture"]
+        );
     }
 
     #[test]

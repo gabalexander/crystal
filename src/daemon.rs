@@ -2,6 +2,7 @@
 //! terminal it was started from, so sessions keep running when the
 //! client goes away.
 
+mod moving;
 mod removal;
 
 use crate::agent_rules;
@@ -17,7 +18,7 @@ use crate::distill::{self, Job};
 use crate::embed;
 use crate::env;
 use crate::event_log::{self, Bus, Subscription};
-use crate::events::{Event, Filter, Kind, Since};
+use crate::events::{DistillAbout, Event, Filter, Kind, Since};
 use crate::flow_run::{self, Ended, FlowRun, Next, Place, RunState, StepState};
 use crate::flows;
 use crate::front;
@@ -51,7 +52,9 @@ use crate::task;
 use crate::tasks;
 use crate::typing;
 use crate::vt;
+use crate::worktree_hooks;
 use anyhow::{Context, Result, anyhow, bail, ensure};
+use moving::Move;
 use regex::Regex;
 use removal::Removal;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -62,7 +65,7 @@ use std::os::fd::{AsFd, AsRawFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::RecvTimeoutError;
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{fs, process, thread};
@@ -97,6 +100,10 @@ const LOOK_AT_MOST_EVERY: Duration = Duration::from_millis(50);
 /// for plugins' hooks and the distiller, before it stops them.
 const HANDOVER_GRACE: Duration = Duration::from_secs(3);
 
+/// How often the daemon looks for entries of memory gone stale, besides
+/// each time a task closes.
+const STALE_SWEEP_EVERY: Duration = Duration::from_secs(60 * 60);
+
 /// Runs the daemon on `socket`, or with `handover`, the descriptor of what
 /// the last daemon handed over as it ran this crystal in its place (see
 /// [`crate::handover`]), carries on from there.
@@ -128,6 +135,7 @@ pub fn run(socket: &Path, handover: Option<RawFd>) -> Result<()> {
     };
     let events = Arc::new(Bus::new(socket));
     let hooks = plugin_hooks::follow(&events, socket);
+    worktree_hooks::follow(&events, socket);
     // A rules file of the user's that can't be used is said in the log,
     // each time it's read.
     agent_rules::log_problems();
@@ -139,6 +147,12 @@ pub fn run(socket: &Path, handover: Option<RawFd>) -> Result<()> {
                 thread::sleep(event_log::PRUNE_EVERY);
             }
         }
+    });
+    let (sweep, sweeps) = mpsc::sync_channel(1);
+    thread::spawn({
+        let events = events.clone();
+        let socket = socket.to_path_buf();
+        move || tell_stale(&socket, &events, &sweeps)
     });
     let daemon = Arc::new(Daemon {
         socket: socket.to_path_buf(),
@@ -157,6 +171,8 @@ pub fn run(socket: &Path, handover: Option<RawFd>) -> Result<()> {
         sends: messages::Guard::default(),
         projects: Mutex::default(),
         removals: Mutex::default(),
+        moves: Mutex::default(),
+        sweep,
     });
     // A daemon starts again after every upgrade, or is handed over to the
     // new crystal, so this is where the skill an earlier crystal installed
@@ -307,6 +323,11 @@ struct Daemon {
     /// The worktrees being removed, with who's waiting to hear each is
     /// done. Taken after `sessions` and `flows`, never before them.
     removals: Mutex<Vec<Removal>>,
+    /// The sessions on their way into other worktrees. Taken after
+    /// `sessions`, never before it.
+    moves: Mutex<Vec<Move>>,
+    /// Asks for a look for entries of memory gone stale: see [`tell_stale`].
+    sweep: SyncSender<()>,
 }
 
 /// The projects the sessions run in that are on the list already, as
@@ -579,6 +600,7 @@ impl Daemon {
                     new,
                     saved.conversation,
                     saved.resume,
+                    None,
                 )?
             }
         };
@@ -648,7 +670,14 @@ impl Daemon {
             }
         };
         drop(db);
-        Ok(self.started(&mut sessions, started, Kind::TaskOpened))
+        let response = self.started(&mut sessions, started.clone(), Kind::TaskOpened);
+        if let Some(session) = sessions.iter().find(|session| session.name == started) {
+            self.events.emit(Event::about_session(
+                Kind::SessionUnarchived,
+                &session.info(),
+            ));
+        }
+        Ok(response)
     }
 
     /// Again and again: reads every session's screen for what its agent is
@@ -700,6 +729,9 @@ impl Daemon {
             for (id, title) in retitled {
                 self.follow_claude_title(&mut sessions, &id, &title);
             }
+            // Before an ended session is told of: one moving into another
+            // worktree starts again there instead.
+            self.carry_out_moves(&mut sessions);
             // Before telling the user anything: a step the flow goes on
             // from needs nobody, and a gate needs them.
             self.follow_flows(&mut sessions);
@@ -729,7 +761,11 @@ impl Daemon {
                     self.events.emit(Event::ended(&info, status));
                 }
             }
-            told_ended.retain(|id| sessions.iter().any(|session| &session.id == id));
+            // One running again under its id, moved into another worktree,
+            // is told of again when it ends.
+            told_ended.retain(|id| {
+                (sessions.iter()).any(|session| &session.id == id && !session.is_running())
+            });
             self.list_projects_of(&sessions);
             // Written while the list is still locked, so that an older list
             // can never be written after a shutdown has emptied it.
@@ -901,6 +937,7 @@ impl Daemon {
         // Held until the exec, so each removal's git is handed over either
         // running, for the next crystal to wait for, or reaped.
         let removals = self.removals.lock().unwrap();
+        let moves = self.moves.lock().unwrap();
         // What has happened so far is told, and a task that closed written
         // down, before the sessions go.
         for session in sessions.iter_mut() {
@@ -947,6 +984,7 @@ impl Daemon {
                 .iter()
                 .map(Removal::hand_over)
                 .collect::<std::io::Result<_>>()?,
+            moves: moves.iter().map(Move::hand_over).collect(),
         };
         let dir = self.socket.parent().unwrap_or(Path::new("/"));
         let file = handover::write(dir, &state)?;
@@ -972,6 +1010,7 @@ impl Daemon {
             sessions: handed_sessions,
             flows,
             removals,
+            moves,
             ..
         } = handed;
         let mut sessions = self.sessions.lock().unwrap();
@@ -1019,6 +1058,7 @@ impl Daemon {
         *self.flows.lock().unwrap() = flows;
         drop(sessions);
         self.carry_on_removals(removals);
+        self.carry_on_moves(moves);
         eprintln!("crystal daemon: took over from crystal {from}: {carried} sessions carried on");
         self.events
             .emit(Event::handed_over(&from, &protocol::version(), carried));
@@ -1116,6 +1156,7 @@ impl Daemon {
         prompt: &str,
     ) -> Result<()> {
         let terminal = run.in_terminal(step);
+        let accept = run.criteria(step)?;
         // A step in a terminal goes on once its task closes.
         ensure!(
             !terminal || tasks::enabled(&settings()),
@@ -1175,11 +1216,16 @@ impl Daemon {
             )?
         };
         // As a task, it's the step, in the project's history and memory,
-        // rather than the whole of its prompt.
+        // rather than the whole of its prompt, with the step's acceptance
+        // criteria, which its prompt has under it already.
         let session = sessions.last_mut().expect("it was just started");
         if session.task_record().is_some() {
             let goal = format!("{} {}: {}", run.name, run.step_name(step), run.goal);
-            session.give_task(new_task_info(goal, !terminal, None, TaskBrief::default()));
+            let brief = TaskBrief {
+                accept,
+                ..TaskBrief::default()
+            };
+            session.give_task(new_task_info(goal, !terminal, None, brief));
             self.number_tasks(std::slice::from_mut(session));
         }
         let task = session.task_id();
@@ -1206,8 +1252,13 @@ impl Daemon {
                     configured: settings().worktrees.base,
                     fetch: false,
                 };
+                let location = git::Location {
+                    path: None,
+                    directory: settings().worktrees.directory(),
+                };
                 let branch = names::random();
-                let (worktree, branch) = git::add_new_worktree(&run.cwd, &branch, &base)?;
+                let (worktree, branch) =
+                    git::add_new_worktree(&run.cwd, &branch, &base, &location)?;
                 self.events
                     .emit(Event::worktree(true, &worktree, Some(&branch)));
                 run.worktree = Some(worktree.clone());
@@ -1323,6 +1374,9 @@ impl Daemon {
     fn write_down_closed(&self, session: &Session, task: &TaskRecord) {
         self.write_down(session.cwd(), Some(&session.info()), task);
         self.distill_later(session, task);
+        // What the task changed may leave entries of memory stale. One
+        // look asked for already will do.
+        let _ = self.sweep.try_send(());
     }
 
     /// Writes a task that has just closed, which ran in `cwd`, in `session`
@@ -1494,9 +1548,11 @@ impl Daemon {
             return;
         };
         let events = self.events.clone();
+        let info = session.info();
         thread::spawn(move || {
             let name = &job.session;
-            match distill::run(&job) {
+            let report = distill::run(&job);
+            match &report {
                 Ok(report) => {
                     eprintln!("crystal daemon: distilled {name}: {}", report.line());
                     for why in &report.rejected {
@@ -1506,6 +1562,7 @@ impl Daemon {
                 }
                 Err(err) => eprintln!("crystal daemon: couldn't distill {name}: {err:#}"),
             }
+            events.emit(Event::distilled(&info, distill_about(&report)));
             drop(reading);
         });
     }
@@ -1619,7 +1676,7 @@ impl Daemon {
     fn distill_now(&self, name: &str) -> Result<Response> {
         let config = settings();
         crate::plugins::ensure_enabled(&config, "memory")?;
-        let (job, reading) = {
+        let (job, reading, info) = {
             let mut sessions = self.sessions.lock().unwrap();
             let session = named(&mut sessions, name)?;
             let task = session.task_record();
@@ -1633,13 +1690,16 @@ impl Daemon {
                 })?;
             let reading = Reading::start(&self.distilling, &session.id)
                 .with_context(|| format!("the distiller is reading what {name} did already"))?;
-            (job, reading)
+            (job, reading, session.info())
         };
         let report = distill::run(&job);
         drop(reading);
-        let report = report?;
-        tell_distilled(&self.events, &job, &report.added);
-        Ok(Response::Distilled(report))
+        if let Ok(report) = &report {
+            tell_distilled(&self.events, &job, &report.added);
+        }
+        self.events
+            .emit(Event::distilled(&info, distill_about(&report)));
+        Ok(Response::Distilled(report?))
     }
 
     /// The session called `name`, or the newest one, for a client about to
@@ -1893,6 +1953,7 @@ impl Daemon {
                 if let Some(prompt) = prompt {
                     self.name_from_prompt(&mut sessions, &id, &prompt);
                 }
+                let moving = self.is_moving(&id);
                 let session = with_id(&mut sessions, &id)?;
                 if let Some(conversation) = conversation {
                     session.set_hooked_conversation(&agent, conversation);
@@ -1909,12 +1970,19 @@ impl Daemon {
                 }
                 let session = with_id(&mut sessions, &id)?;
                 // Reminded that its task is open, the agent carries on: its
-                // turn hasn't ended, and it isn't done.
+                // turn hasn't ended, and it isn't done. One moving into
+                // another worktree carries on there.
                 if event == AgentEvent::TurnEnded
                     && can_remind
                     && tasks::enabled(&settings())
+                    && !moving
                     && session.remind_of_task()
                 {
+                    if let Some(task) = session.task_record() {
+                        let info = session.info();
+                        self.events
+                            .emit(Event::task(Kind::TaskReminded, &info, task));
+                    }
                     return Ok(Response::Remind {
                         text: tasks::REMINDER.to_string(),
                     });
@@ -2010,8 +2078,12 @@ impl Daemon {
             Request::Projects => Ok(Response::Projects {
                 projects: self.known_projects()?,
             }),
+            Request::MoveSession { name, path } => self.move_session(&name, &path),
             Request::AddProject { dir } => self.list_project(&dir, true),
             Request::RemoveProject { dir } => self.list_project(&dir, false),
+            Request::Removals => Ok(Response::Removals {
+                worktrees: self.removing(),
+            }),
             Request::Subscribe { .. }
             | Request::WaitOutput { .. }
             | Request::Handover { .. }
@@ -2627,6 +2699,8 @@ impl Daemon {
         let info = sessions[index].info();
         self.events
             .emit(Event::about_session(Kind::SessionStarted, &info));
+        self.events
+            .emit(Event::about_session(Kind::SessionOpenedInTerminal, &info));
         Ok(Response::Created {
             name,
             task: task_id,
@@ -2689,6 +2763,7 @@ impl Daemon {
                 Change::RunStarted { prompt } => Some(Event::run_started(&info, &prompt)),
                 Change::RunEnded(result) => Some(Event::run_ended(&info, &result)),
                 Change::Asking(asking) => Some(Event::asking(&info, asking)),
+                Change::ToolUsed(tool) => Some(Event::tool_use(&info, tool)),
                 Change::Reopened => task(Kind::TaskOpened),
                 Change::TaskWaiting => task(Kind::TaskWaiting),
                 Change::Claimed => Some(Event::about_session(Kind::SessionClaimed, &info)),
@@ -3064,6 +3139,44 @@ fn watch_for_hang_up(conn: &UnixStream) -> Result<Arc<AtomicBool>> {
     Ok(hung_up)
 }
 
+/// Tells of each entry of memory that goes stale, every file it's about
+/// changed since it was said: looks as the daemon starts, then each time
+/// `sweeps` asks and every [`STALE_SWEEP_EVERY`], while memory is on.
+fn tell_stale(socket: &Path, events: &Bus, sweeps: &Receiver<()>) {
+    loop {
+        if memory::enabled_now() {
+            match memory::newly_stale(socket) {
+                Ok(stale) => {
+                    for (project, entry) in stale {
+                        events.emit(Event::memory(Kind::MemoryStale, project, entry));
+                    }
+                }
+                Err(err) => eprintln!("crystal daemon: couldn't look at memory: {err:#}"),
+            }
+        }
+        if let Err(RecvTimeoutError::Disconnected) = sweeps.recv_timeout(STALE_SWEEP_EVERY) {
+            return;
+        }
+    }
+}
+
+/// What came of a pass of the distiller, for its event.
+fn distill_about(report: &Result<distill::Report>) -> DistillAbout {
+    match report {
+        Ok(report) => DistillAbout {
+            added: report.added.len(),
+            again: report.again.len(),
+            rejected: report.rejected.len(),
+            cost_usd: report.cost_usd,
+            failed: None,
+        },
+        Err(err) => DistillAbout {
+            failed: Some(format!("{err:#}")),
+            ..DistillAbout::default()
+        },
+    }
+}
+
 /// Tells of the entries the distiller added to the memory of `job`'s
 /// project, by their ids.
 fn tell_distilled(events: &Bus, job: &Job, added: &[u64]) {
@@ -3131,13 +3244,16 @@ fn start(
         new,
         conversation,
         resume_command,
+        None,
     )
 }
 
 /// Starts a session under the id `id` and adds it to `sessions`. Given a
 /// `conversation`, an agent that can pick one up starts back in it; given a
 /// `resume_command`, the command an agent said resumes it, it's resumed
-/// with that instead. Never anywhere but its directory.
+/// with that instead. Never anywhere but its directory. An agent picked up
+/// in its conversation after a move into another worktree is given
+/// `moved`, which tells it so, as its next prompt: see [`moving`].
 fn start_as(
     id: String,
     sessions: &mut Vec<Session>,
@@ -3145,6 +3261,7 @@ fn start_as(
     new: NewSession,
     conversation: Option<Conversation>,
     resume_command: Option<Vec<String>>,
+    moved: Option<&str>,
 ) -> Result<String> {
     let NewSession {
         name,
@@ -3253,6 +3370,10 @@ fn start_as(
     );
     let argv = agents::with_options(argv, &claude_tools(socket, &cwd, &asked, &crystal, &config));
     let argv = codex::with_instructions(argv, &instructions, codex::home(&env).as_deref());
+    let argv = match moved.filter(|_| resume.is_some()) {
+        Some(notice) => agents::moved(argv, notice, &cwd),
+        None => argv,
+    };
     keep_scrollback();
     let mut session = Session::spawn(id, name.clone(), command, &argv, cwd, &env)?;
     if let Some(typed) = typed
@@ -3434,7 +3555,9 @@ fn crystal_commands(config: &Config) -> Vec<&'static str> {
         "Bash(crystal rename:*)",
         "Bash(crystal report:*)",
         "Bash(crystal notify:*)",
-        "Bash(crystal layout:*)",
+        "Bash(crystal layout)",
+        "Bash(crystal layout --json)",
+        "Bash(crystal layout export:*)",
         "Bash(crystal pane split:*)",
         "Bash(crystal pane close:*)",
     ];

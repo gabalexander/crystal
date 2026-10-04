@@ -1,0 +1,24 @@
+name = "event-log"
+version = "0.1.0"
+description = "Every event as a line of JSON, followed in a split"
+
+# Every event, `*`, as it happens: a line of JSON on the hook's standard
+# input, added to events.jsonl in the plugin's state directory.
+[[events]]
+on = "*"
+command = ["sh", "log.sh"]
+
+# `crystal plugin run event-log clear`, or Enter on it in X.
+[[actions]]
+id = "clear"
+title = "Clear the log"
+command = ["sh", "clear.sh"]
+
+# A session of its own, split off below the selected one's pane:
+# `crystal plugin pane open event-log follow`, or Enter on it in X.
+[[panes]]
+id = "follow"
+title = "Events as they happen"
+placement = "split"
+split = "down"
+command = ["sh", "follow.sh"]

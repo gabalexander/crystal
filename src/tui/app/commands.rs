@@ -2,10 +2,10 @@
 //! [`crate::layout`]), carried out on its state, and the layout it answers
 //! with. A command about a session works on the tab that holds it, in
 //! front or not, and leaves the tab in front where it is, but for those
-//! whose point is to go somewhere: making a tab, going to one, and focusing
-//! a session.
+//! whose point is to go somewhere: making a tab, going to one, focusing a
+//! session, and a layout applied that says which tab is in front.
 
-use super::{Action, App, Slot, resize_step};
+use super::{Action, App, PluginPane, Popup, Slot, resize_step};
 use crate::flow_run::FlowRun;
 use crate::layout::{Command, Layout, NO_TUI, Order, TabLayout, Tile};
 use crate::notify::Presence;
@@ -37,8 +37,9 @@ impl App {
         tabs: Tabs,
         order: Order,
     ) -> Result<Alone, String> {
-        // The title is the TUI's terminal's, and there's none.
-        if let Command::Title { .. } = order.command {
+        // The title is the TUI's terminal's, and there's none; nor is
+        // there anything to show a pane over.
+        if let Command::Title { .. } | Command::Overlay { .. } = order.command {
             return Err(format!("{NO_TUI} to show it"));
         }
         let mut app = App::new(None);
@@ -172,6 +173,23 @@ impl App {
                 let cells = cells.unwrap_or_else(|| resize_step(toward));
                 self.resize_pane_of(&name, toward, cells)?;
             }
+            Command::SwapToward { session, toward } => {
+                let name = self.subject(session.as_deref(), caller)?;
+                self.swap_toward(&name, toward)?;
+            }
+            Command::Swap { session, with } => {
+                let name = self.subject(session.as_deref(), caller)?;
+                let with = self.session_named(&with)?;
+                self.swap_with(&name, &with)?;
+            }
+            Command::Ratio {
+                session,
+                way,
+                share,
+            } => {
+                let name = self.subject(session.as_deref(), caller)?;
+                self.set_share_of(&name, way, share)?;
+            }
             Command::Close { session } => {
                 let name = self.subject(session.as_deref(), caller)?;
                 self.close_pane_of(&name)?;
@@ -197,6 +215,28 @@ impl App {
                 self.put_float_back_in(index);
             }
             Command::Title { text } => self.title_override = text,
+            Command::Apply { tabs, replace } => self.apply(&tabs, replace)?,
+            Command::Overlay {
+                session,
+                plugin,
+                title,
+                popup,
+            } => {
+                let name = self.session_named(&session)?;
+                if let Some(open) = &self.plugin_pane {
+                    return Err(format!("{} is open over the panes already", open.title));
+                }
+                let popup = popup.map(|popup| Popup {
+                    width: popup.width,
+                    height: popup.height,
+                });
+                return Ok(Some(Action::ShowPluginPane(PluginPane {
+                    plugin,
+                    title,
+                    session: name,
+                    popup,
+                })));
+            }
         }
         Ok(None)
     }
@@ -493,6 +533,120 @@ impl App {
         Ok(())
     }
 
+    /// Swaps the pane that shows the session called `name` with the pane
+    /// `toward` from it, as `H`, `J`, `K` and `L` do.
+    fn swap_toward(&mut self, name: &str, toward: Direction) -> Result<(), String> {
+        let index = self.tab_holding(name);
+        let pane = self.pane_of_session(index, name)?;
+        let panes = &self.tabs.all()[index].panes;
+        let other = (panes.neighbour(&pane, toward, self.tiles).cloned())
+            .ok_or_else(|| format!("there's no pane {} of {name}'s", toward.word()))?;
+        self.change_panes_in(index, |panes| {
+            panes.swap(&pane, &other);
+        });
+        Ok(())
+    }
+
+    /// Swaps the panes that show the sessions called `name` and `with`,
+    /// which have to be on screen in the same tab.
+    fn swap_with(&mut self, name: &str, with: &str) -> Result<(), String> {
+        if name == with {
+            return Err(format!("{name} can't swap with itself"));
+        }
+        let index = self.tab_holding(name);
+        let theirs = self.tab_holding(with);
+        if theirs != index {
+            let number = theirs + 1;
+            return Err(format!(
+                "{with} is in tab {number}: panes swap within a tab, `crystal tab move` moves a session"
+            ));
+        }
+        let pane = self.pane_of_session(index, name)?;
+        let other = self.pane_of_session(index, with)?;
+        self.change_panes_in(index, |panes| {
+            panes.swap(&pane, &other);
+        });
+        Ok(())
+    }
+
+    /// Gives the side of the pane that shows the session called `name`
+    /// `share` of the room of the split nearest above it, or the nearest
+    /// `way`.
+    fn set_share_of(&mut self, name: &str, way: Option<Way>, share: f32) -> Result<(), String> {
+        if !(0.1..=0.9).contains(&share) {
+            return Err("a share of the room is from 0.1 to 0.9".into());
+        }
+        let index = self.tab_holding(name);
+        let pane = self.pane_of_session(index, name)?;
+        let panes = &mut self.tabs.tab_mut(index).panes;
+        if !panes.set_share(&pane, way, share) {
+            let split = match way {
+                None => "split",
+                Some(Way::Right) => "split side by side",
+                Some(Way::Down) => "split one above the other",
+            };
+            return Err(format!("{name}'s pane isn't in a {split}"));
+        }
+        Ok(())
+    }
+
+    /// Lays tabs out as `laid` has them: see [`Command::Apply`]. Nothing
+    /// changes when a session they name isn't there, or is the one this
+    /// TUI runs in on a pane of its own.
+    fn apply(&mut self, laid: &[TabLayout], replace: bool) -> Result<(), String> {
+        if laid.is_empty() {
+            return Err("the layout has no tabs".into());
+        }
+        for tab in laid {
+            for name in held(tab) {
+                self.session_named(name)?;
+            }
+            let own = own_panes(&tab.panes);
+            for name in own.iter().copied().chain(tab.floating.as_deref()) {
+                self.can_show(name)?;
+            }
+            if let Some(name) = tab.floating.as_deref().filter(|name| own.contains(name)) {
+                return Err(format!("{name} can't float and have a pane too"));
+            }
+        }
+        let mut tabs = if replace {
+            Tabs::default()
+        } else {
+            self.tabs_to_keep()
+        };
+        let mut front = None;
+        for (at, tab) in laid.iter().enumerate() {
+            let named = (!replace && !tab.name.is_empty())
+                .then(|| tabs.all().iter().position(|held| held.name == tab.name))
+                .flatten();
+            let index = match named {
+                Some(index) => index,
+                None if replace && at == 0 => 0,
+                None => tabs.add(),
+            };
+            for name in held(tab) {
+                tabs.put(name, index);
+            }
+            let shows = selection_pane(&tab.panes).cloned().flatten();
+            let kept = tabs.tab_mut(index);
+            kept.rename(&tab.name);
+            kept.panes = tree_of(&tab.panes);
+            kept.panes.retain(|_| true);
+            kept.floating = tab.floating.clone();
+            kept.zoomed = tab.zoomed;
+            kept.selected = tab.selected.clone().or_else(|| shows.clone());
+            kept.shown = shows;
+            if tab.current {
+                front = Some(index);
+            }
+        }
+        if let Some(index) = front {
+            tabs.go_to(index);
+        }
+        self.set_tabs(tabs);
+        Ok(())
+    }
+
     /// Closes the pane of its own the session called `name` has: its split
     /// closes, and the pane beside it takes the room, or its float is put
     /// back.
@@ -530,6 +684,76 @@ impl App {
         self.put_float_back_in(index);
         self.tabs.tab_mut(index).floating = Some(name.to_string());
         Ok(())
+    }
+}
+
+/// Every session a tab laid out holds: those it lists, those in its panes
+/// and the one floating, each once.
+fn held(tab: &TabLayout) -> Vec<&str> {
+    fn gather<'a>(tile: &'a Tile, names: &mut Vec<&'a str>) {
+        match tile {
+            Tile::Pane { session, .. } => names.extend(session.as_deref()),
+            Tile::Split { first, second, .. } => {
+                gather(first, names);
+                gather(second, names);
+            }
+        }
+    }
+    let mut names: Vec<&str> = tab.sessions.iter().map(String::as_str).collect();
+    gather(&tab.panes, &mut names);
+    names.extend(tab.floating.as_deref());
+    let mut seen = Vec::new();
+    names.retain(|name| {
+        let new = !seen.contains(name);
+        seen.push(*name);
+        new
+    });
+    names
+}
+
+/// The sessions split off into panes of their own in `tile`.
+fn own_panes(tile: &Tile) -> Vec<&str> {
+    match tile {
+        Tile::Pane {
+            session: Some(name),
+            selection: false,
+        } => vec![name.as_str()],
+        Tile::Pane { .. } => Vec::new(),
+        Tile::Split { first, second, .. } => [own_panes(first), own_panes(second)].concat(),
+    }
+}
+
+/// The first pane in `tile` that follows the selection, by the session it
+/// shows, if any.
+fn selection_pane(tile: &Tile) -> Option<&Option<String>> {
+    match tile {
+        Tile::Pane {
+            session,
+            selection: true,
+        } => Some(session),
+        Tile::Pane { .. } => None,
+        Tile::Split { first, second, .. } => {
+            selection_pane(first).or_else(|| selection_pane(second))
+        }
+    }
+}
+
+/// `tile` as a tab's panes: a pane naming no session, or marked as the
+/// selection's, is the selection's. It may have none of those, or several,
+/// until [`SplitTree::retain`] puts it right.
+fn tree_of(tile: &Tile) -> SplitTree {
+    match tile {
+        Tile::Pane {
+            session: Some(name),
+            selection: false,
+        } => SplitTree::of(Pane::Session(name.clone())),
+        Tile::Pane { .. } => SplitTree::of(Pane::Selection),
+        Tile::Split {
+            way,
+            ratio,
+            first,
+            second,
+        } => SplitTree::joined(*way, *ratio, tree_of(first), tree_of(second)),
     }
 }
 
@@ -616,6 +840,51 @@ mod tests {
 
     fn selected(app: &App) -> Option<String> {
         app.selected().map(|session| session.name.clone())
+    }
+
+    #[test]
+    fn a_session_is_shown_over_the_panes_once_and_only_by_a_tui() {
+        let mut app = app_with(&["claude", "notes-board"]);
+        let over = || Command::Overlay {
+            session: "notes-board".into(),
+            plugin: "notes".into(),
+            title: "Board".into(),
+            popup: Some(crate::layout::Popup {
+                width: None,
+                height: Some(crate::tui::keymap::Extent::Cells(20)),
+            }),
+        };
+        let Ok(Some(Action::ShowPluginPane(pane))) = obey(&mut app, over()) else {
+            panic!("it isn't shown");
+        };
+        assert_eq!(pane.heading(), " notes · Board ");
+        assert_eq!(
+            pane.popup.unwrap().height,
+            Some(crate::tui::keymap::Extent::Cells(20))
+        );
+        let missing = Command::Overlay {
+            session: "nope".into(),
+            plugin: "notes".into(),
+            title: "Board".into(),
+            popup: None,
+        };
+        assert!(obey(&mut app, missing).is_err());
+        app.plugin_pane_opened(PluginPane {
+            plugin: "notes".into(),
+            title: "Board".into(),
+            session: "notes-board".into(),
+            popup: None,
+        });
+        let said = obey(&mut app, over()).unwrap_err();
+        assert_eq!(said, "Board is open over the panes already");
+
+        let order = Order {
+            command: over(),
+            caller: None,
+        };
+        let tabs = Tabs::default();
+        let alone = App::obey_alone(vec![session("notes-board")], Vec::new(), tabs, order);
+        assert_eq!(alone.err().unwrap(), format!("{NO_TUI} to show it"));
     }
 
     #[test]
@@ -909,6 +1178,258 @@ mod tests {
             said,
             "c isn't on screen: `crystal pane split c` gives it a pane"
         );
+    }
+
+    #[test]
+    fn a_swap_trades_two_panes_places_that_way_or_by_name() {
+        let mut app = app_with(&["a", "b", "c", "d"]);
+        app.select("a");
+        obey(&mut app, split("b", None, Way::Right)).unwrap();
+        obey(&mut app, split("c", Some("b"), Way::Down)).unwrap();
+        let toward = |toward| Command::SwapToward {
+            session: Some("a".into()),
+            toward,
+        };
+        obey(&mut app, toward(Direction::Right)).unwrap();
+        assert_eq!(panes(&app, 1), ["b", "*a", "c"]);
+        let said = obey(&mut app, toward(Direction::Right)).unwrap_err();
+        assert_eq!(said, "there's no pane right of a's");
+
+        let with = |session: &str, with: &str| Command::Swap {
+            session: Some(session.into()),
+            with: with.into(),
+        };
+        obey(&mut app, with("c", "b")).unwrap();
+        assert_eq!(panes(&app, 1), ["c", "*a", "b"]);
+        // Run in a session, it's that session's pane that moves.
+        obey_from(
+            &mut app,
+            "b",
+            Command::SwapToward {
+                session: None,
+                toward: Direction::Up,
+            },
+        )
+        .unwrap();
+        assert_eq!(panes(&app, 1), ["c", "b", "*a"]);
+        // The ratios stay where they were.
+        let Tile::Split { ratio, .. } = app.layout().tabs[0].panes else {
+            panic!("the panes are split");
+        };
+        assert_eq!(ratio, 0.5);
+
+        let said = |app: &mut App, command| obey(app, command).unwrap_err();
+        assert_eq!(said(&mut app, with("a", "a")), "a can't swap with itself");
+        assert_eq!(
+            said(&mut app, with("a", "d")),
+            "d isn't on screen: `crystal pane split d` gives it a pane"
+        );
+        obey(&mut app, Command::NewTab { name: None }).unwrap();
+        app.set_sessions(["a", "b", "c", "d", "e"].map(session).to_vec());
+        assert_eq!(
+            said(&mut app, with("a", "e")),
+            "e is in tab 2: panes swap within a tab, `crystal tab move` moves a session"
+        );
+    }
+
+    #[test]
+    fn a_ratio_gives_a_panes_side_of_its_split_a_share_of_the_room() {
+        let mut app = app_with(&["a", "b", "c"]);
+        app.select("a");
+        obey(&mut app, split("b", None, Way::Right)).unwrap();
+        obey(&mut app, split("c", Some("b"), Way::Down)).unwrap();
+        let ratio = |session: &str, way, share| Command::Ratio {
+            session: Some(session.into()),
+            way,
+            share,
+        };
+        let ratios = |app: &App| match &app.layout().tabs[0].panes {
+            Tile::Split { ratio, second, .. } => match **second {
+                Tile::Split { ratio: inner, .. } => (*ratio, inner),
+                Tile::Pane { .. } => (*ratio, 1.0),
+            },
+            Tile::Pane { .. } => (1.0, 1.0),
+        };
+        // c is the second side of the split it's in.
+        obey(&mut app, ratio("c", None, 0.3)).unwrap();
+        assert_eq!(ratios(&app), (0.5, 0.7));
+        // Side by side, its side is the second of the outer split.
+        obey(&mut app, ratio("c", Some(Way::Right), 0.75)).unwrap();
+        assert_eq!(ratios(&app), (0.25, 0.7));
+        obey(&mut app, ratio("a", None, 0.6)).unwrap();
+        assert_eq!(ratios(&app), (0.6, 0.7));
+
+        let said = |app: &mut App, command| obey(app, command).unwrap_err();
+        assert_eq!(
+            said(&mut app, ratio("a", Some(Way::Down), 0.5)),
+            "a's pane isn't in a split one above the other"
+        );
+        assert_eq!(
+            said(&mut app, ratio("a", None, 0.95)),
+            "a share of the room is from 0.1 to 0.9"
+        );
+        let mut alone = app_with(&["a"]);
+        assert_eq!(
+            said(&mut alone, ratio("a", None, 0.5)),
+            "a's pane isn't in a split"
+        );
+    }
+
+    fn laid(name: &str, current: bool, panes: Tile, sessions: &[&str]) -> TabLayout {
+        TabLayout {
+            number: 0,
+            name: name.into(),
+            current,
+            zoomed: false,
+            sessions: sessions.iter().map(|name| name.to_string()).collect(),
+            selected: None,
+            floating: None,
+            panes,
+        }
+    }
+
+    fn tile(session: &str, selection: bool) -> Tile {
+        Tile::Pane {
+            session: Some(session.into()),
+            selection,
+        }
+    }
+
+    fn side_by_side(first: Tile, second: Tile) -> Tile {
+        Tile::Split {
+            way: Way::Right,
+            ratio: 0.6,
+            first: Box::new(first),
+            second: Box::new(second),
+        }
+    }
+
+    #[test]
+    fn a_layout_applied_lays_out_the_tab_of_its_name_or_a_new_one() {
+        let mut app = two_tabs();
+        obey(
+            &mut app,
+            Command::RenameTab {
+                tab: "1".into(),
+                name: "dev".into(),
+            },
+        )
+        .unwrap();
+        let dev = laid(
+            "dev",
+            false,
+            side_by_side(tile("c", true), tile("a", false)),
+            &[],
+        );
+        let logs = laid("logs", false, tile("b", true), &[]);
+        let apply = |tabs| Command::Apply {
+            tabs,
+            replace: false,
+        };
+        obey(&mut app, apply(vec![dev.clone(), logs])).unwrap();
+        let layout = app.layout();
+        assert_eq!(layout.tabs.len(), 3);
+        assert_eq!(layout.tabs[0].name, "dev");
+        assert_eq!(layout.tabs[0].sessions, ["a", "c"]);
+        assert_eq!(layout.tabs[0].selected.as_deref(), Some("c"));
+        assert_eq!(panes(&app, 1), ["*c", "a"]);
+        assert_eq!(
+            (layout.tabs[2].name.as_str(), &layout.tabs[2].sessions[..]),
+            ("logs", &["b".to_string()][..])
+        );
+        // The tab in front stays in front, empty now.
+        assert_eq!(app.tabs().current_index(), 1);
+        assert!(layout.tabs[1].sessions.is_empty());
+
+        // Applied again, it changes nothing; marked current, its tab comes
+        // to the front.
+        let mut dev = dev;
+        dev.current = true;
+        obey(&mut app, apply(vec![dev])).unwrap();
+        assert_eq!(app.layout().tabs.len(), 3);
+        assert_eq!(app.tabs().current_index(), 0);
+        assert_eq!(selected(&app).as_deref(), Some("c"));
+        assert_eq!(panes(&app, 1), ["*c", "a"]);
+    }
+
+    #[test]
+    fn a_layout_applied_in_place_of_every_tab_keeps_the_sessions_it_leaves_out() {
+        let mut app = two_tabs();
+        let mut logs = laid("logs", false, tile("b", true), &[]);
+        logs.floating = Some("c".into());
+        logs.zoomed = true;
+        let work = laid(
+            "",
+            true,
+            side_by_side(
+                tile("a", false),
+                Tile::Pane {
+                    session: None,
+                    selection: true,
+                },
+            ),
+            &[],
+        );
+        obey(
+            &mut app,
+            Command::Apply {
+                tabs: vec![logs, work],
+                replace: true,
+            },
+        )
+        .unwrap();
+        let layout = app.layout();
+        assert_eq!(layout.tabs.len(), 2);
+        assert_eq!(layout.tabs[0].sessions, ["b", "c"]);
+        assert_eq!(layout.tabs[0].floating.as_deref(), Some("c"));
+        assert!(layout.tabs[0].zoomed);
+        assert_eq!(app.tabs().current_index(), 1);
+        assert_eq!(layout.tabs[1].name, "");
+        assert_eq!(panes(&app, 2), ["a", "*"]);
+    }
+
+    #[test]
+    fn a_layout_is_applied_whole_or_not_at_all() {
+        let mut app = App::new(Some("id-me".into()));
+        app.set_sessions(["a", "b", "me"].map(session).to_vec());
+        let before = app.layout();
+        let apply = |tab: TabLayout| Command::Apply {
+            tabs: vec![tab],
+            replace: false,
+        };
+        let said = |app: &mut App, command| obey(app, command).unwrap_err();
+        let gone = laid("x", false, tile("a", true), &["gone"]);
+        assert_eq!(
+            said(&mut app, apply(gone)),
+            "there's no session called gone"
+        );
+        let mine = laid(
+            "x",
+            false,
+            side_by_side(tile("a", true), tile("me", false)),
+            &[],
+        );
+        assert_eq!(
+            said(&mut app, apply(mine)),
+            "crystal can't show the session it runs in"
+        );
+        let mut twice = laid(
+            "x",
+            false,
+            side_by_side(tile("a", true), tile("b", false)),
+            &[],
+        );
+        twice.floating = Some("b".into());
+        assert_eq!(
+            said(&mut app, apply(twice)),
+            "b can't float and have a pane too"
+        );
+        let none = Command::Apply {
+            tabs: Vec::new(),
+            replace: true,
+        };
+        assert_eq!(said(&mut app, none), "the layout has no tabs");
+        assert_eq!(app.layout(), before);
     }
 
     #[test]
