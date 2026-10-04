@@ -109,7 +109,8 @@ pub struct Config {
     /// The theme following the system's light or dark: `[appearance]` in
     /// the file. See [`crate::tui::appearance`].
     pub appearance: AppearanceSettings,
-    /// What the mouse does in the TUI: `[mouse]` in the file.
+    /// What the mouse does in the TUI and `crystal attach`: `[mouse]` in
+    /// the file.
     pub mouse: MouseSettings,
     /// What programs in sessions may do with the user's clipboard:
     /// `[clipboard]` in the file.
@@ -453,7 +454,7 @@ impl Default for SidebarSettings {
     }
 }
 
-/// What the mouse does in the TUI.
+/// What the mouse does in the TUI, and in `crystal attach`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MouseSettings {
@@ -471,6 +472,12 @@ pub struct MouseSettings {
     /// A scrollbar beside each pane's screen, in a column of its own, which
     /// shows where in its history the pane is and drags to scroll it.
     pub scrollbars: bool,
+    /// Whether `crystal attach` takes the mouse: the wheel scrolls the
+    /// session's history on its main screen, and a program that asks gets
+    /// the mouse, through any terminal. Off, the terminal keeps it, for its
+    /// own selection, and only sends a program on the alternate screen the
+    /// wheel as arrow keys.
+    pub attach_capture: bool,
 }
 
 /// How many lines a notch of the wheel may scroll.
@@ -483,6 +490,7 @@ impl Default for MouseSettings {
             copy_on_select: true,
             scroll_lines: 3,
             scrollbars: true,
+            attach_capture: false,
         }
     }
 }
@@ -1733,6 +1741,9 @@ back_to = "build"
         assert_eq!(mouse.scroll_lines, 1);
         // What's left out has its default.
         assert!(mouse.copy_on_select && mouse.scrollbars);
+        assert!(!mouse.attach_capture);
+        let attach = parse("[mouse]\nattach_capture = true").unwrap().mouse;
+        assert!(attach.attach_capture && attach.capture);
         for lines in [0, 101] {
             let err = parse(&format!("[mouse]\nscroll_lines = {lines}")).unwrap_err();
             assert!(format!("{err:#}").contains("scroll_lines"), "{err:#}");
@@ -2078,6 +2089,7 @@ back_to = "build"
                 copy_on_select: false,
                 scroll_lines: 5,
                 scrollbars: false,
+                attach_capture: true,
             },
             clipboard: ClipboardSettings {
                 allow_programs: false,

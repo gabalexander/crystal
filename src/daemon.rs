@@ -1992,6 +1992,9 @@ impl Daemon {
             Request::MoveSession { name, path } => self.move_session(&name, &path),
             Request::AddProject { dir } => self.list_project(&dir, true),
             Request::RemoveProject { dir } => self.list_project(&dir, false),
+            Request::Removals => Ok(Response::Removals {
+                worktrees: self.removing(),
+            }),
             Request::Subscribe { .. }
             | Request::WaitOutput { .. }
             | Request::Handover { .. }
@@ -3406,7 +3409,9 @@ fn crystal_commands(config: &Config) -> Vec<&'static str> {
         "Bash(crystal rename:*)",
         "Bash(crystal report:*)",
         "Bash(crystal notify:*)",
-        "Bash(crystal layout:*)",
+        "Bash(crystal layout)",
+        "Bash(crystal layout --json)",
+        "Bash(crystal layout export:*)",
         "Bash(crystal pane split:*)",
         "Bash(crystal pane close:*)",
     ];

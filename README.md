@@ -226,7 +226,11 @@ as many times as it would scroll lines, the way xterm's alternate scroll does; a
 (`\e[?1007l`) gets nothing. Copy mode and a selection being dragged keep the wheel scrolling the pane.
 `crystal attach` leaves the mouse to your terminal, and has it send the arrow keys for the wheel the same way,
 only while the program is on the alternate screen: a shell at its prompt doesn't page through its history as
-you scroll.
+you scroll, though that leaves the wheel nothing to do there. With `attach_capture = true` under `[mouse]`, the
+attach takes the mouse itself, as the TUI does, which works in a terminal that has no alternate scroll too: a
+program that asks for the mouse gets it, a pager the arrow keys, and anywhere else the wheel scrolls the
+session's history, from before you attached as well, the top right saying how far back (`↑ 120 lines`) until
+you type. Your terminal's own selection then takes a key held, as in the TUI.
 
 Beside each pane's screen, in a column of its own, a scrollbar shows where in its history the pane is, once it
 has some: drag its thumb to scroll, or click the track and the thumb jumps there. The wheel over it scrolls the
@@ -470,6 +474,7 @@ crystal pane split review                   # show a session in a pane beside yo
 crystal tab new review                      # a new tab in the TUI, in front
 crystal title set "deploying"               # the title of the TUI's terminal, until `crystal title clear`
 crystal layout                              # the TUI's tabs and how each splits its panes
+crystal layout apply dev.json               # lay them out as a file says, starting what isn't there
 crystal skill --install                     # teach Claude Code to drive crystal (see below)
 crystal integration install                 # hooks or plugins for the agents installed here (see above)
 crystal mermaid docs/flow.md                # draw a page's mermaid diagrams as text (see below)
@@ -518,7 +523,8 @@ changes you haven't committed. `crystal worktree rm --force` removes it anyway, 
 asks a second time, naming them, and a second `y` does the same. Sessions that had ended in it leave the list
 with it: their directory is gone, so they could never start again. The daemon does the removing, and the
 sidebar says `removing…` until it's done, which for a big worktree can take a while: quitting the TUI meanwhile
-doesn't stop it, and neither does `crystal restart-server`.
+doesn't stop it, and neither does `crystal restart-server`. Every TUI's sidebar says so, whoever asked: another
+TUI, `crystal worktree rm`, or this one before you quit and opened it again; and `W` leaves it be meanwhile.
 
 To set a new worktree up, say install its dependencies or copy in an `.env`, have a [plugin](#plugins) run a
 command on `worktree.created`, and on `worktree.removed` to tidy up after it. What a worktree has outside its
@@ -823,7 +829,9 @@ the sessions that way; an agent given a first prompt starts without it, so it is
 background task, with no terminal of its own, isn't started. Those it can't start, their directory gone, say,
 are left out, and those it doesn't name join the tab in front. The tabs a restore
 replaces are kept, at the top of the list as `↶ before` the layout's name, so `Enter` on that takes you back,
-once. Layouts are kept with your tabs, in crystal's database.
+once. Layouts are kept with your tabs, in crystal's database. To keep one in a file instead, to share or take
+to another machine, `crystal layout export` writes one and `crystal layout apply` puts it back: see [laying out
+the TUI](#laying-out-the-tui).
 
 ### Zoom, copy mode and search
 
@@ -1584,6 +1592,8 @@ crystal pane split -e PORT=4000           # no session named: a new shell, split
 crystal pane focus tests                  # select it, its tab in front, and type into it; or left, right, up, down
 crystal pane focus tests --raise          # the same, and bring the TUI's terminal to the front, as a notification's click does
 crystal pane resize left 8 -n tests       # move a border of its pane, as R does; 4 columns or 2 rows by default
+crystal pane swap right -n tests          # swap its pane with the one to its right, as L does; or with another session's
+crystal pane ratio 0.3 tests              # give its side of the split it's in 30% of the room; --right or --down for that way's
 crystal pane close tests                  # close its split, or put its float back
 crystal pane zoom reviewer                # zoom its tab on it; --off puts the panes back
 crystal pane float logs                   # float it over its tab's panes; --off puts it back
@@ -1595,6 +1605,8 @@ crystal tab move reviewer review          # move a session to another tab, as > 
 crystal tab reorder review 1              # move a tab to be the first, as { and } do a place at a time
 crystal tab close review --kill           # a tab with sessions closes only with --kill, which kills them
 crystal layout                            # each tab's sessions and how its panes split the room; --json
+crystal layout export > dev.json          # the tabs as a layout file, with what starts each session; --tab for one
+crystal layout apply dev.json             # lay them out as the file says, starting what isn't there; --replace
 crystal title set "deploying"             # the title of the TUI's terminal, in place of the settings' one
 crystal title clear                       # back to the settings' one
 ```
@@ -1608,6 +1620,10 @@ moves into that tab, out of any pane it had. With no session named, `pane split`
 off, in the directory it's run in or `--cwd`, with any `--env` variables, as `crystal new` does, and prints its
 name. A command that can't be carried out says why, the way the footer would: no room for another pane, a
 session that isn't on screen. `title` needs a TUI open: with none, there's no terminal to give the title.
+`pane swap` trades the places of two panes in a tab, the splits and how big each is staying as they are:
+the session's and the one that way from it, or another session's. `pane ratio` gives the side a session's
+pane is on, of the split nearest above it, a share of that split's room, whichever side it is: or of the
+nearest split side by side with `--right`, or one above the other with `--down`.
 
 The command goes through the daemon to the TUI you used last, the one where you last pressed a key, clicked
 or brought its terminal to the front, and waits for it to answer, a few seconds at most. When `restart-server`
@@ -1623,6 +1639,46 @@ killed. The next TUI to open shows the tabs as the commands left them.
 side and `down` for one above the other, and `ratio` the first side's share. Beside the tabs, `presence` says
 whether you're at crystal, as the TUIs' terminals say of their focus: `here` while one has it, `away` once
 every one has lost it, and `unknown` with no TUI open or one whose terminal doesn't say.
+
+`crystal layout export` writes the tabs as a layout file, a JSON document to keep with a project or take to
+another machine, and `crystal layout apply` lays the tabs out the way one says, from a file or standard input,
+starting the sessions it names that aren't there, as herdr's `layout.export` and `layout.apply` do:
+
+```json
+{"tabs": [{
+  "name": "dev",
+  "current": true,
+  "panes": {"kind": "split", "way": "right", "ratio": 0.6,
+    "first": {"kind": "pane", "session": "editor", "selection": true, "cwd": "~/repo", "command": ["nvim"]},
+    "second": {"kind": "pane", "session": "tests", "cwd": "~/repo", "command": ["sh", "-c", "cargo test"],
+      "env": {"RUST_LOG": "debug"}}},
+  "sessions": [{"session": "notes", "cwd": "~/notes"}],
+  "floating": "logs"
+}]}
+```
+
+A file is in the shape `crystal layout --json` prints, which applies as it is, with more said about a session
+where it's named: a pane's `cwd`, `command` and `env`, and in a tab's `sessions` and its `floating`, a
+session's name or an object with the same, its name as `session`. All but the tabs can be left out, and
+without a pane marked `selection`, the first follows the selection. A session that's there, running or
+ended, is laid out as it is; one that isn't starts under its name when the file says how: its `command`, or
+a shell, in its `cwd`, or the directory `apply` runs in (`~` and relative paths work), with its `env` over
+the environment `apply` runs with. A pane naming no session starts a new one the same way, named as `crystal
+new` names one, but for the pane that follows the selection, which with nothing said shows whatever's
+selected. What can't start, or the file doesn't say how to, is left out, saying so; `apply` prints the name
+of each session it started.
+
+Each tab of the file lays out the tab with its name, or a new one after the others when it has no name or
+there's none, so a tab with a name is laid out in place when the file is applied again. The sessions it
+names move there, out of any pane they had; those in the tab already that it doesn't name stay, off the
+screen. The tab marked `current` comes to the front; with none, the tab in front stays. `--replace` puts the
+file's tabs in place of every tab instead, as restoring a [saved layout](#layouts) does, the sessions it
+doesn't name joining the tab in front: `crystal layout export > tabs.json`, then later `crystal layout apply
+--replace tabs.json`, puts the tabs back the way they were and starts what has gone since. An export writes
+each session's command as it was started, an agent's without its first prompt, and its directory, but not
+its variables, which it doesn't know; a background task, with no terminal, by its name alone. A file that
+can't be applied, with two tabs of one name, say, a session in two places or a ratio that isn't a share,
+changes nothing and says why.
 
 #### A skill for Claude Code
 
@@ -1835,7 +1891,7 @@ crystal tasks terminal docs                                          # carry on 
 - Every Claude Code session crystal starts, a task or in a terminal, may run the crystal commands it's told
   to without asking, so one driving others doesn't stop at every step:
   - starting and driving sessions: `ls`, `new`, `send`, `wait`, `read`, `result`, `interrupt`, `events`,
-    `rename`, `report`, `notify`, `layout`, `pane split` and `pane close`
+    `rename`, `report`, `notify`, `layout` and `layout export`, `pane split` and `pane close`
   - with tasks on, `done`, `task`, and `tasks` with `show`, `log`, `new` and `start`; with flows on, `flow`
     with `run`, `wait`, `show`, `defs` and `retry`
   - with the backlog on, reading it and `add`, `export`, `done`, `reopen` and `start`; with the handoff file
@@ -2588,7 +2644,7 @@ file and change. A setting crystal doesn't know is an error that names it, so a 
 | `[window]` | | `title`, what the TUI titles its terminal: [the window](#terminals-the-window-and-the-tab-bar) |
 | `[tab_bar]` | | where the tab bar goes, whether it's left out with one tab, and what it shows at its right: [the tab bar](#terminals-the-window-and-the-tab-bar) |
 | `[appearance]` | | `auto_switch`, the theme following your system's light or dark, and the theme for each: [themes](#themes) |
-| `[mouse]` | | `capture`, whether the TUI takes the mouse from your terminal (`true`); `copy_on_select`, whether a selection is copied as you let go or waits in copy mode for `y` (`true`); `scroll_lines`, how far a notch of the wheel scrolls a pane, up to 100, or how many arrow keys it sends a pager (`3`); `scrollbars`, a scrollbar beside each pane (`true`): [the mouse](#usage) |
+| `[mouse]` | | `capture`, whether the TUI takes the mouse from your terminal (`true`); `copy_on_select`, whether a selection is copied as you let go or waits in copy mode for `y` (`true`); `scroll_lines`, how far a notch of the wheel scrolls a pane, up to 100, or how many arrow keys it sends a pager (`3`); `scrollbars`, a scrollbar beside each pane (`true`); `attach_capture`, whether `crystal attach` takes the mouse, for the wheel to scroll a session's history (`false`): [the mouse](#usage) |
 | `[clipboard]` | | `allow_programs`, whether what a program in a session copies goes on your clipboard (`true`): [copying](#zoom-copy-mode-and-search) |
 | `[update]` | | `check`, whether the TUI looks once a day for a [newer crystal](#updating) (`true`) |
 

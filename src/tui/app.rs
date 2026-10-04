@@ -832,10 +832,14 @@ pub struct App {
     /// listed them: those with no sessions stay in the sidebar, and the
     /// new-session panel offers them all.
     known: Vec<Worktree>,
-    /// The worktrees the daemon is removing, by their directories: their
-    /// lines say so, and `W` leaves them be until the daemon says it's
-    /// done.
+    /// The worktrees the daemon is removing for this TUI, by their
+    /// directories: their lines say so, and `W` leaves them be until the
+    /// daemon says it's done.
     removing: HashSet<PathBuf>,
+    /// The worktrees the daemon said it was removing when last asked,
+    /// whoever asked for them, another TUI or `crystal worktree rm`: their
+    /// lines say so too, and `W` leaves them be as well.
+    removals: HashSet<PathBuf>,
     /// The question on the footer line, while one is being answered.
     prompt: Option<Prompt>,
     /// The new-session panel, while it's open.
@@ -1106,6 +1110,7 @@ impl App {
             folded: BTreeSet::new(),
             known: Vec::new(),
             removing: HashSet::new(),
+            removals: HashSet::new(),
             prompt: None,
             launcher: None,
             launch_draft: None,
@@ -2352,6 +2357,7 @@ impl App {
     /// rather than when git is next asked.
     pub fn worktree_removed(&mut self, path: &Path) {
         self.removing.remove(path);
+        self.removals.remove(path);
         for linked in self.worktrees.values_mut() {
             linked.retain(|worktree| worktree.path != path);
         }
@@ -2362,12 +2368,24 @@ impl App {
     /// can be asked about again.
     pub fn worktree_not_removed(&mut self, path: &Path, reason: String) {
         self.removing.remove(path);
+        self.removals.remove(path);
         self.notify(reason);
     }
 
-    /// Whether the daemon is removing the worktree at `path`.
+    /// Takes the worktrees the daemon is removing, whoever asked, and says
+    /// whether one it was removing before is done with, gone or not, for
+    /// the event loop to have git list the worktrees again.
+    pub fn set_removals(&mut self, worktrees: Vec<PathBuf>) -> bool {
+        let removals: HashSet<PathBuf> = worktrees.into_iter().collect();
+        let done = self.removals.difference(&removals).next().is_some();
+        self.removals = removals;
+        done
+    }
+
+    /// Whether the daemon is removing the worktree at `path`, for this TUI
+    /// or for anyone else.
     pub fn removing(&self, path: &Path) -> bool {
-        self.removing.contains(path)
+        self.removing.contains(path) || self.removals.contains(path)
     }
 
     /// The linked worktree with no sessions the selection is on, if it's
@@ -7822,6 +7840,40 @@ mod tests {
             })
         );
         assert!(app.removing(old));
+    }
+
+    #[test]
+    fn a_worktree_someone_else_is_removing_says_so_until_the_daemon_is_done() {
+        let mut app = app_with_an_empty_worktree();
+        let old = Path::new("/code/app.worktrees/old");
+        // Asked for by another TUI, or `crystal worktree rm`.
+        assert!(!app.set_removals(vec![old.into()]));
+        assert!(app.removing(old));
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('W'));
+        assert_eq!(app.confirm(), None);
+        assert_eq!(app.notice(), Some("already removing old"));
+
+        assert!(!app.set_removals(vec![old.into()]), "still at it");
+        assert!(app.set_removals(Vec::new()), "done: git lists them again");
+        assert!(!app.removing(old));
+        assert!(!app.set_removals(Vec::new()));
+    }
+
+    #[test]
+    fn a_removal_this_tui_asked_for_says_so_before_the_daemon_lists_it() {
+        let mut app = app_with_an_empty_worktree();
+        let old = Path::new("/code/app.worktrees/old");
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('W'));
+        press(&mut app, KeyCode::Char('y'));
+        // Listed before the daemon was asked: git looks for changes first.
+        app.set_removals(Vec::new());
+        assert!(app.removing(old));
+
+        app.set_removals(vec![old.into()]);
+        app.worktree_removed(old);
+        assert!(!app.removing(old), "done, though the daemon listed it");
     }
 
     #[test]

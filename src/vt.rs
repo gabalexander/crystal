@@ -1521,6 +1521,21 @@ pub struct InputModes {
 }
 
 impl InputModes {
+    /// These, with the mouse taken for whoever draws the program: presses
+    /// and releases at least, as the program asked for more, written the
+    /// SGR way whichever way it asked for them, to be read and written
+    /// again its way. The wheel never sends the arrow keys itself.
+    pub fn taking_the_mouse(mut self) -> InputModes {
+        for (&mode, on) in INPUT_MODES.iter().zip(&mut self.modes) {
+            match mode {
+                mode::MOUSE_NORMAL | mode::MOUSE_SGR => *on = true,
+                mode::MOUSE_UTF8 | mode::ALTERNATE_SCROLL => *on = false,
+                _ => {}
+            }
+        }
+        self
+    }
+
     /// Output that asks a terminal that was set as `before` to be set as
     /// these are. The Kitty keyboard flags are set in the terminal's
     /// current entry of its stack, which is the caller's to push and pop.
@@ -1964,6 +1979,25 @@ mod tests {
 
         screen.process(b"\x1b[?1007h\x1b[?1049l");
         assert_eq!(screen.input_modes(), main);
+    }
+
+    #[test]
+    fn taking_the_mouse_asks_for_it_the_sgr_way_on_any_screen() {
+        let mut screen = Screen::new(2, 10);
+        let none = InputModes::default();
+        let taken = screen.input_modes().taking_the_mouse();
+        let changes = taken.changes_from(&none);
+        assert_eq!(
+            String::from_utf8(changes).unwrap(),
+            "\x1b[?1000h\x1b[?1006h"
+        );
+
+        // Drags as the program asks for them, but never its UTF-8, nor the
+        // wheel's arrows.
+        screen.process(b"\x1b[?1049h\x1b[?1002h\x1b[?1005h");
+        let program = screen.input_modes().taking_the_mouse();
+        let changes = program.changes_from(&taken);
+        assert_eq!(String::from_utf8(changes).unwrap(), "\x1b[?1002h");
     }
 
     #[test]

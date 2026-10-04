@@ -29,11 +29,11 @@ mod issues;
 pub(crate) mod keymap;
 pub(crate) mod launcher;
 mod layout_link;
-mod layouts;
+pub(crate) mod layouts;
 mod listing;
 mod memory_view;
 mod menu;
-mod mouse;
+pub(crate) mod mouse;
 mod needs_you;
 mod pane;
 mod plugins_view;
@@ -200,6 +200,9 @@ pub enum Event {
         subjects: HashMap<PathBuf, String>,
         labels: HashMap<PathBuf, String>,
     },
+    /// The worktrees the daemon is removing, whoever asked, as it listed
+    /// them.
+    Removals(Vec<PathBuf>),
     /// The daemon is done removing the worktree at `path`: it's gone, or
     /// why not.
     WorktreeRemoved {
@@ -1158,6 +1161,13 @@ impl Tui {
                 self.app.set_worktrees(project, worktrees);
             }
             Event::Stat { path, stat } => self.app.set_stat(path, stat),
+            // One someone else asked for that's done with has git list the
+            // worktrees again, for it to leave the sidebar if it's gone.
+            Event::Removals(worktrees) => {
+                if self.app.set_removals(worktrees) {
+                    self.list_worktrees_again();
+                }
+            }
             Event::WorktreeRemoved { path, removed } => self.worktree_removed(&path, removed),
             Event::WorktreeHasChanges { path, branch } => {
                 self.app.ask_to_force_removal(path, branch);
@@ -3399,6 +3409,11 @@ fn spawn_session_poller(socket: PathBuf, events: Sender<Event>, polled: Polled) 
             if events.send(Event::Sessions { sessions, asked }).is_err() {
                 return;
             }
+            if let Some(worktrees) = list_removals(&socket)
+                && events.send(Event::Removals(worktrees)).is_err()
+            {
+                return;
+            }
             if let Ok(Some(Response::Spending(spending))) =
                 client::ask(&socket, &Request::Spending, false)
                 && events.send(Event::Spending(spending)).is_err()
@@ -3413,6 +3428,15 @@ fn spawn_session_poller(socket: PathBuf, events: Sender<Event>, polled: Polled) 
             }
         }
     });
+}
+
+/// The worktrees the daemon is removing, whoever asked, or `None` when it
+/// can't say.
+fn list_removals(socket: &Path) -> Option<Vec<PathBuf>> {
+    match client::ask(socket, &Request::Removals, false) {
+        Ok(Some(Response::Removals { worktrees })) => Some(worktrees),
+        _ => None,
+    }
 }
 
 /// The projects crystal knows, by their main worktrees, or `None` when the

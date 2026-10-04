@@ -307,6 +307,9 @@ pub enum Request {
         name: String,
         path: PathBuf,
     },
+    /// The worktrees the daemon is removing now, whoever asked: a TUI
+    /// opened meanwhile says so on their lines.
+    Removals,
     /// Something that happened outside the daemon, like a worktree a
     /// client made or an entry it added to memory: the daemon numbers it,
     /// writes it in the event log, and passes it on to whoever listens.
@@ -596,6 +599,10 @@ pub enum Response {
     /// now: each one's branch included.
     Projects {
         projects: Vec<Worktree>,
+    },
+    /// The worktrees the daemon is removing, by their directories.
+    Removals {
+        worktrees: Vec<PathBuf>,
     },
     /// The name a new flow run got.
     FlowStarted {

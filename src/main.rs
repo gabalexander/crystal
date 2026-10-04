@@ -36,6 +36,7 @@ mod hook;
 mod integration;
 mod keys;
 mod layout;
+mod layout_file;
 mod layout_relay;
 mod links;
 mod markdown;
@@ -452,11 +453,16 @@ enum Command {
         command: TitleCommand,
     },
     /// Print the TUI's tabs: each one's sessions, and how its panes split
-    /// the room.
+    /// the room. Or write them to a layout file, or lay them out the way
+    /// one says, starting what isn't there.
+    #[command(args_conflicts_with_subcommands = true)]
     Layout {
         /// Print them as JSON.
         #[arg(long)]
         json: bool,
+
+        #[command(subcommand)]
+        command: Option<LayoutCommand>,
     },
     /// Show a session in this terminal; Ctrl+\ detaches.
     #[command(visible_alias = "a")]
@@ -1164,6 +1170,30 @@ enum TabCommand {
 }
 
 #[derive(Subcommand)]
+enum LayoutCommand {
+    /// Print the tabs as a layout file, for `layout apply`: as `layout
+    /// --json` prints them, with the command and directory that start each
+    /// session again.
+    Export {
+        /// Only this tab: its number, from 1, or its name.
+        #[arg(long)]
+        tab: Option<String>,
+    },
+    /// Lay the tabs out the way a layout file says: each in place of the
+    /// tab with its name, or else after the others. Sessions it names that
+    /// aren't there start, when it says how; it prints the name of each.
+    Apply {
+        /// The file [default: standard input, as - is]
+        file: Option<PathBuf>,
+
+        /// Take the place of every tab, as restoring a saved layout does:
+        /// the sessions the file doesn't name join the tab in front.
+        #[arg(long)]
+        replace: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum TitleCommand {
     /// Set the title.
     Set {
@@ -1245,6 +1275,38 @@ enum PaneCommand {
         /// one]
         #[arg(short, long)]
         name: Option<String>,
+    },
+    /// Swap a session's pane with another, the splits and how big each is
+    /// left as they are: the pane that way from it, given left, right, up
+    /// or down, or the pane of another session in its tab.
+    Swap {
+        /// left, right, up or down, or a session's name.
+        target: String,
+
+        /// The session whose pane to swap [default: the one this runs in,
+        /// or else the selected one]
+        #[arg(short, long)]
+        name: Option<String>,
+    },
+    /// Give a session's pane a share of the room of the split it's in: the
+    /// nearest split above it, or with --right or --down, the nearest that
+    /// splits that way.
+    Ratio {
+        /// Its share of the room, from 0.1 to 0.9.
+        #[arg(value_parser = share)]
+        share: f32,
+
+        /// The session [default: the one this runs in, or else the selected
+        /// one]
+        session: Option<String>,
+
+        /// The nearest split side by side.
+        #[arg(long, conflicts_with = "down")]
+        right: bool,
+
+        /// The nearest split one above the other.
+        #[arg(long)]
+        down: bool,
     },
     /// Close a session's pane of its own: its split, the pane beside it
     /// taking the room, or its float.
@@ -1760,7 +1822,18 @@ fn run(cli: Cli) -> Result<()> {
             };
             client::lay_out(&socket, layout::Command::Title { text })?;
         }
-        Command::Layout { json } => {
+        Command::Layout {
+            command: Some(LayoutCommand::Export { tab }),
+            ..
+        } => layout_file::export(&socket, tab.as_deref())?,
+        Command::Layout {
+            command: Some(LayoutCommand::Apply { file, replace }),
+            ..
+        } => layout_file::apply(&socket, file.as_deref(), replace)?,
+        Command::Layout {
+            json,
+            command: None,
+        } => {
             let layout = client::lay_out(&socket, layout::Command::Show)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&layout)?);
@@ -2378,6 +2451,30 @@ fn pane(socket: &Path, command: PaneCommand) -> Result<()> {
             session: name,
             toward: direction.into(),
             cells,
+        },
+        PaneCommand::Swap { target, name } => match Toward::from_str(&target, false) {
+            Ok(toward) => layout::Command::SwapToward {
+                session: name,
+                toward: toward.into(),
+            },
+            Err(_) => layout::Command::Swap {
+                session: name,
+                with: target,
+            },
+        },
+        PaneCommand::Ratio {
+            share,
+            session,
+            right,
+            down,
+        } => layout::Command::Ratio {
+            session,
+            way: match (right, down) {
+                (true, _) => Some(Way::Right),
+                (_, true) => Some(Way::Down),
+                _ => None,
+            },
+            share,
         },
         PaneCommand::Close { session } => layout::Command::Close { session },
         PaneCommand::Zoom { session, off } => layout::Command::Zoom { session, on: !off },
