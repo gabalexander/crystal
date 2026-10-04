@@ -484,19 +484,43 @@ fn subjects<'a>(
         .collect()
 }
 
-/// Removes the worktree at `path` the way `git worktree remove` does, which
+/// Starts removing the worktree at `path`, of the repository whose main
+/// worktree is `project_path`, the way `git worktree remove` does, which
 /// refuses the main worktree, and, unless `force`, one with changes not yet
-/// committed.
-pub fn remove_worktree(path: &Path, force: bool) -> Result<()> {
-    let checkout = Checkout::find(path)
-        .with_context(|| format!("{} isn't in a git repository", path.display()))?;
-    let path = path.to_string_lossy();
-    let mut args = vec!["worktree", "remove", &path];
+/// committed. Gives back git's process, which says why on its standard
+/// error when it fails: whoever started it waits for it, and a handover
+/// can leave it running for the next daemon to wait for.
+pub fn start_removing_worktree(project_path: &Path, path: &Path, force: bool) -> Result<Child> {
+    let mut command = Command::new("git");
+    command
+        .arg("-C")
+        .arg(project_path)
+        .args(["worktree", "remove"])
+        .arg(path);
     if force {
-        args.push("--force");
+        command.arg("--force");
     }
-    git(&checkout.project_path, &args)?;
-    Ok(())
+    command
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("couldn't run git")
+}
+
+/// Whether the repository whose main worktree is `project_path` still has
+/// the worktree at `path`, its directory there. One whose directory has
+/// gone is pruned, as git only kept it until then.
+pub fn still_has_worktree(project_path: &Path, path: &Path) -> Result<bool> {
+    let list = git(project_path, &["worktree", "list", "--porcelain"])?;
+    let there = parse_worktree_list(&list).into_iter().any(|listed| {
+        !listed.prunable && std::fs::canonicalize(&listed.path).is_ok_and(|listed| listed == path)
+    });
+    if !there {
+        git(project_path, &["worktree", "prune"])?;
+    }
+    Ok(there)
 }
 
 /// Whether the worktree at `dir` has changes that `git worktree remove`
@@ -1171,6 +1195,43 @@ mod tests {
                 more: false
             }
         );
+    }
+
+    #[test]
+    fn a_worktree_is_there_until_git_removes_it_and_pruned_once_its_directory_goes() {
+        let dir = repo();
+        let project = std::fs::canonicalize(dir.path()).unwrap();
+        let base = Base {
+            named: None,
+            configured: None,
+            fetch: false,
+        };
+        let removed = add_worktree(&project, "removed", &base).unwrap();
+        let gone = add_worktree(&project, "gone", &base).unwrap();
+        let (removed, gone) = (
+            std::fs::canonicalize(removed).unwrap(),
+            std::fs::canonicalize(gone).unwrap(),
+        );
+        assert!(still_has_worktree(&project, &removed).unwrap());
+
+        let removing = start_removing_worktree(&project, &removed, false).unwrap();
+        let out = removing.wait_with_output().unwrap();
+        assert!(out.status.success(), "{out:?}");
+        assert!(!removed.exists());
+        assert!(!still_has_worktree(&project, &removed).unwrap());
+        // Asked again, git says why, in its own words.
+        let again = start_removing_worktree(&project, &removed, false).unwrap();
+        let out = again.wait_with_output().unwrap();
+        assert!(!out.status.success());
+        assert!(String::from_utf8_lossy(&out.stderr).contains("is not a working tree"));
+
+        // A directory gone without git is pruned.
+        std::fs::remove_dir_all(&gone).unwrap();
+        assert!(!still_has_worktree(&project, &gone).unwrap());
+        let list = git(&project, &["worktree", "list", "--porcelain"]).unwrap();
+        assert_eq!(parse_worktree_list(&list).len(), 1, "{list}");
+        // Beside the repository, so outside the directory the test cleans.
+        std::fs::remove_dir(gone.parent().unwrap()).unwrap();
     }
 
     #[test]

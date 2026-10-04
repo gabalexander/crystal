@@ -254,6 +254,11 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   `[sessions] restart_spacing_ms` apart on a thread of their own, those that can't start kept, failed, saying
   why; opens a background task in a terminal, in its place, its task carried on; hands itself over to a new
   crystal, and takes over from the daemon that handed over
+  - `daemon/removal.rs`: removing a worktree, for `W` and `crystal worktree rm`: refused while a session runs
+    there, git started and reaped while the removals are held, the sessions that had ended there killed,
+    `worktree.removed`, and everyone who asked answered, a second ask waiting with the first; one in flight
+    handed over with its git still running, which the next daemon waits for, then has git try again if the
+    worktree is still there
 - `src/handover.rs`: handing the daemon over to a newly installed crystal by exec in its own process, the
   sessions carrying on: what's handed over and its `FORMAT`, the file it's written to and read from, keeping
   descriptors open across the exec, the readers it stops, the gate connections come in through, the helpers

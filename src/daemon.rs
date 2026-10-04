@@ -2,6 +2,8 @@
 //! terminal it was started from, so sessions keep running when the
 //! client goes away.
 
+mod removal;
+
 use crate::agent_rules;
 use crate::agents;
 use crate::artifacts;
@@ -50,6 +52,7 @@ use crate::typing;
 use crate::vt;
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use regex::Regex;
+use removal::Removal;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::convert::Infallible;
 use std::io::{BufReader, ErrorKind, Read, Write};
@@ -152,6 +155,7 @@ pub fn run(socket: &Path, handover: Option<RawFd>) -> Result<()> {
         layout: Relay::new(),
         sends: messages::Guard::default(),
         projects: Mutex::default(),
+        removals: Mutex::default(),
     });
     // A daemon starts again after every upgrade, or is handed over to the
     // new crystal, so this is where the skill an earlier crystal installed
@@ -299,6 +303,9 @@ struct Daemon {
     /// What the daemon knows of the projects crystal keeps a list of.
     /// Taken after `sessions` and before `db`.
     projects: Mutex<KnownProjects>,
+    /// The worktrees being removed, with who's waiting to hear each is
+    /// done. Taken after `sessions` and `flows`, never before them.
+    removals: Mutex<Vec<Removal>>,
 }
 
 /// The projects the sessions run in that are on the list already, as
@@ -380,6 +387,9 @@ impl Daemon {
             }
             Request::Handover { exe, format } => {
                 return self.hand_over(&conn, ticket, &exe, format);
+            }
+            Request::RemoveWorktree { path, force } => {
+                return self.remove_worktree(&conn, ticket, path, force);
             }
             _ => {}
         }
@@ -880,6 +890,9 @@ impl Daemon {
     ) -> Result<Infallible> {
         let mut sessions = self.sessions.lock().unwrap();
         let flows = self.flows.lock().unwrap();
+        // Held until the exec, so each removal's git is handed over either
+        // running, for the next crystal to wait for, or reaped.
+        let removals = self.removals.lock().unwrap();
         // What has happened so far is told, and a task that closed written
         // down, before the sessions go.
         for session in sessions.iter_mut() {
@@ -922,6 +935,10 @@ impl Daemon {
             waiting: keep(waiting)?,
             sessions: handed,
             flows: flows.iter().map(handover::HandedFlow::of).collect(),
+            removals: removals
+                .iter()
+                .map(Removal::hand_over)
+                .collect::<std::io::Result<_>>()?,
         };
         let dir = self.socket.parent().unwrap_or(Path::new("/"));
         let file = handover::write(dir, &state)?;
@@ -946,6 +963,7 @@ impl Daemon {
             waiting,
             sessions: handed_sessions,
             flows,
+            removals,
             ..
         } = handed;
         let mut sessions = self.sessions.lock().unwrap();
@@ -992,6 +1010,7 @@ impl Daemon {
         }
         *self.flows.lock().unwrap() = flows;
         drop(sessions);
+        self.carry_on_removals(removals);
         eprintln!("crystal daemon: took over from crystal {from}: {carried} sessions carried on");
         self.events
             .emit(Event::handed_over(&from, &protocol::version(), carried));
@@ -1166,7 +1185,8 @@ impl Daemon {
 
     /// Where `step` of `run` runs, as [`FlowRun::place`] says: the
     /// worktree the run makes for itself is made the first time a step
-    /// asks for it.
+    /// asks for it, on a new branch with a made-up name, as the new-session
+    /// panel's are.
     fn step_dir(&self, run: &mut FlowRun, step: usize) -> Result<PathBuf> {
         match run.place(step) {
             Place::In(dir) => Ok(dir),
@@ -1178,7 +1198,8 @@ impl Daemon {
                     configured: settings().worktrees.base,
                     fetch: false,
                 };
-                let (worktree, branch) = git::add_new_worktree(&run.cwd, &run.slug(), &base)?;
+                let branch = names::random();
+                let (worktree, branch) = git::add_new_worktree(&run.cwd, &branch, &base)?;
                 self.events
                     .emit(Event::worktree(true, &worktree, Some(&branch)));
                 run.worktree = Some(worktree.clone());
@@ -1974,7 +1995,8 @@ impl Daemon {
             Request::Subscribe { .. }
             | Request::WaitOutput { .. }
             | Request::Handover { .. }
-            | Request::TakeLayoutOrders { .. } => {
+            | Request::TakeLayoutOrders { .. }
+            | Request::RemoveWorktree { .. } => {
                 bail!("this takes the connection over")
             }
             Request::Layout(order) => match self.layout.pass(order.clone()) {
@@ -2697,6 +2719,13 @@ impl Daemon {
             .iter()
             .position(|session| session.name == name)
             .with_context(|| format!("no session named {name}"))?;
+        self.kill_at(&mut sessions, index);
+        Ok(())
+    }
+
+    /// Kills the session at `index` in `sessions`, and takes it off the
+    /// list.
+    fn kill_at(&self, sessions: &mut Vec<Session>, index: usize) {
         let mut session = sessions.remove(index);
         let cancelled = tasks::enabled(&settings())
             .then(|| session.cancel_task("its session was killed"))
@@ -2711,7 +2740,6 @@ impl Daemon {
         }
         self.events
             .emit(Event::about_session(Kind::SessionRemoved, &info));
-        Ok(())
     }
 
     /// Carries out a layout command with no TUI open to: on the tabs as the

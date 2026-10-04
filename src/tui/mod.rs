@@ -197,7 +197,8 @@ pub enum Event {
         worktrees: Vec<Worktree>,
         subjects: HashMap<PathBuf, String>,
     },
-    /// git is done removing the worktree at `path`: it's gone, or why not.
+    /// The daemon is done removing the worktree at `path`: it's gone, or
+    /// why not.
     WorktreeRemoved {
         path: PathBuf,
         removed: Result<(), String>,
@@ -1991,8 +1992,9 @@ impl Tui {
                 branch,
                 force,
             } => {
-                // git looks for changes and deletes every file in it, which
-                // can take a while: off the loop.
+                // git looks for changes, then the daemon has it delete
+                // every file in it, which can take a while: off the loop.
+                // The daemon carries on if the TUI quits meanwhile.
                 let socket = self.socket.clone();
                 self.read_in_background(move || {
                     // git won't remove a worktree with changes not
@@ -2651,8 +2653,9 @@ impl Tui {
         });
     }
 
-    /// git is done removing the worktree at `path`. Once it's gone, it and
-    /// the sessions that had ended in it leave the sidebar straight away.
+    /// The daemon is done removing the worktree at `path`. Once it's gone,
+    /// it and the sessions that had ended in it leave the sidebar straight
+    /// away.
     fn worktree_removed(&mut self, path: &Path, removed: Result<(), String>) {
         if let Err(reason) = removed {
             self.app.worktree_not_removed(path, reason);

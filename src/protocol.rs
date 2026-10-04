@@ -287,6 +287,17 @@ pub enum Request {
     RemoveProject {
         dir: PathBuf,
     },
+    /// Remove the linked worktree at `path`, unless a session still runs
+    /// in it; with `force`, though it has changes not committed, which go
+    /// with it. Answered once git is done, however long that takes, and
+    /// the sessions that had ended there have left the list with it. One
+    /// asked for while the daemon is removing it already is answered with
+    /// that one. The client going doesn't stop it, and a handover doesn't
+    /// either: the next daemon finishes it and answers.
+    RemoveWorktree {
+        path: PathBuf,
+        force: bool,
+    },
     /// Something that happened outside the daemon, like a worktree a
     /// client made or an entry it added to memory: the daemon numbers it,
     /// writes it in the event log, and passes it on to whoever listens.
