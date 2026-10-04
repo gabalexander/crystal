@@ -3372,7 +3372,9 @@ fn crystal_commands(config: &Config) -> Vec<&'static str> {
         "Bash(crystal rename:*)",
         "Bash(crystal report:*)",
         "Bash(crystal notify:*)",
-        "Bash(crystal layout:*)",
+        "Bash(crystal layout)",
+        "Bash(crystal layout --json)",
+        "Bash(crystal layout export:*)",
         "Bash(crystal pane split:*)",
         "Bash(crystal pane close:*)",
     ];

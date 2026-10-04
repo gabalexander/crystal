@@ -4897,6 +4897,108 @@ fn layout_commands_with_no_tui_open_lay_out_the_tabs_it_opens_with() {
 }
 
 #[test]
+fn a_layout_file_starts_what_isnt_there_and_lays_the_tabs_out() {
+    let crystal = Crystal::new();
+    sessions_saying_here(&crystal, &["alpha"]);
+    let here =
+        |name: &str| serde_json::json!(["sh", "-c", format!("echo {name} is here; sleep 30")]);
+    let file = serde_json::json!({"tabs": [
+        {
+            "name": "dev",
+            "current": true,
+            "panes": {"kind": "split", "way": "right", "ratio": 0.6,
+                "first": {"kind": "pane", "session": "alpha"},
+                "second": {"kind": "pane", "session": "beta", "env": {"WHO": "beta"},
+                    "command": ["sh", "-c", "echo $WHO is here; sleep 30"]}},
+            "sessions": [{"session": "gamma", "command": here("gamma")}]
+        },
+        {"name": "logs", "panes": {"kind": "pane", "session": "delta", "command": here("delta")},
+            "sessions": ["gone"]}
+    ]});
+    std::fs::write(crystal.dir.path().join("dev.json"), file.to_string()).unwrap();
+
+    // With no TUI open, the daemon lays the tabs out, once what isn't
+    // there has started.
+    let out = crystal.run(&["layout", "apply", "dev.json"]);
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{said}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "beta\ngamma\ndelta\n");
+    assert!(said.contains("left out gone: it isn't there"), "{said}");
+    shows_on_screen(&crystal, "beta", "beta is here");
+    shows_on_screen(&crystal, "delta", "delta is here");
+    let layout = crystal.ok(&["layout"]);
+    assert!(layout.starts_with("1\n  sessions  none\n"), "{layout}");
+    assert!(layout.contains("\n2 dev (in front)\n"), "{layout}");
+    assert!(
+        layout.contains("side by side, 60% first\n      the selection's: alpha\n      beta\n"),
+        "{layout}"
+    );
+    assert!(layout.contains("\n3 logs\n  sessions  delta\n"), "{layout}");
+
+    // A pane swaps with the one beside it, and takes a share of the room.
+    crystal.ok(&["pane", "swap", "right", "-n", "alpha"]);
+    crystal.ok(&["pane", "ratio", "0.25", "alpha"]);
+    let layout = crystal.ok(&["layout"]);
+    assert!(
+        layout.contains("side by side, 75% first\n      beta\n      the selection's: alpha\n"),
+        "{layout}"
+    );
+    let said = crystal.fails(&["pane", "swap", "gamma", "-n", "beta"]);
+    assert!(said.contains("gamma isn't on screen"), "{said}");
+    let said = crystal.fails(&["pane", "ratio", "0.5", "delta"]);
+    assert!(said.contains("delta's pane isn't in a split"), "{said}");
+
+    // An export says what starts each session again, and applied in place
+    // of every tab, starts nothing that's there.
+    let export = crystal.ok(&["layout", "export", "--tab", "dev"]);
+    let json: serde_json::Value = serde_json::from_str(&export).unwrap();
+    let dev = &json["tabs"][0];
+    assert_eq!(dev["name"], "dev");
+    assert_eq!(dev["panes"]["first"]["session"], "beta");
+    assert_eq!(
+        dev["panes"]["first"]["command"],
+        serde_json::json!(["sh", "-c", "echo $WHO is here; sleep 30"])
+    );
+    assert_eq!(dev["sessions"][0]["command"], here("gamma"));
+    let mut apply = crystal
+        .command(&["layout", "apply", "--replace"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    apply
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(export.as_bytes())
+        .unwrap();
+    let out = apply.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "");
+    let layout = crystal.ok(&["layout"]);
+    assert!(layout.starts_with("1 dev (in front)\n"), "{layout}");
+    assert!(!layout.contains("\n2"), "{layout}");
+    assert!(layout.contains("delta"), "{layout}");
+
+    // With the TUI open, it's the TUI that lays them out.
+    let tui = crystal.tui();
+    tui.shows("beta is here");
+    let file = serde_json::json!({"tabs": [{"name": "more", "current": true,
+        "panes": {"kind": "pane", "session": "epsilon", "command": here("epsilon")}}]});
+    std::fs::write(crystal.dir.path().join("more.json"), file.to_string()).unwrap();
+    assert_eq!(crystal.ok(&["layout", "apply", "more.json"]), "epsilon\n");
+    tui.shows(" 2 more ");
+    tui.shows("epsilon is here");
+    let said = crystal.fails(&["layout", "apply", "missing.json"]);
+    assert!(said.contains("couldn't read missing.json"), "{said}");
+}
+
+#[test]
 fn a_split_and_a_tab_from_the_command_line_reach_the_tui() {
     let crystal = Crystal::new();
     sessions_saying_here(&crystal, &["alpha", "beta"]);
@@ -7744,8 +7846,8 @@ macro_rules! session_rules {
         "Bash(crystal ls:*),Bash(crystal new:*),Bash(crystal send:*),Bash(crystal wait:*),\
          Bash(crystal read:*),Bash(crystal result:*),Bash(crystal interrupt:*),\
          Bash(crystal events:*),Bash(crystal rename:*),Bash(crystal report:*),\
-         Bash(crystal notify:*),Bash(crystal layout:*),Bash(crystal pane split:*),\
-         Bash(crystal pane close:*)"
+         Bash(crystal notify:*),Bash(crystal layout),Bash(crystal layout --json),\
+         Bash(crystal layout export:*),Bash(crystal pane split:*),Bash(crystal pane close:*)"
     };
 }
 

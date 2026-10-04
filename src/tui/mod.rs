@@ -29,7 +29,7 @@ mod issues;
 pub(crate) mod keymap;
 pub(crate) mod launcher;
 mod layout_link;
-mod layouts;
+pub(crate) mod layouts;
 mod listing;
 mod memory_view;
 mod menu;
