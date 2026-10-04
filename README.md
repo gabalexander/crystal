@@ -165,6 +165,7 @@ and the footer says where you are and offers the keys that matter there, or, whe
 | `:` | the [command list](#keys-and-commands): every command by its name, with its key, the latest you ran first; `Enter` runs one |
 | `(` / `)` | make the [sidebar](#the-sidebar) narrower or wider; its edge drags with the mouse too |
 | `\` | fold the [sidebar](#the-sidebar) down to a rail of marks, or unfold it |
+| `h` / `l` | fold the selected session's project down to its heading in the [sidebar](#the-sidebar), or unfold it; a click on a project's heading does the same |
 | `o` | open the pull request of the selected session's branch in your browser |
 | `O` | list the open [pull requests](#pull-requests-and-issues) of the selected session's project: read one, see its diff, comment, or start an agent in its worktree |
 | `i` | list the open [issues](#pull-requests-and-issues) of the selected session's project: read one, comment, edit it, or start an agent on it |
@@ -563,6 +564,32 @@ edge, unfolds it. While it's folded, or the tab is zoomed, `/` brings it out ove
 Whatever needs you, in every tab, is pinned at the top under **needs you**: the agents waiting on you, then
 those that finished a turn you haven't looked at. One in another tab says which tab, and a click on it takes
 you there. `u` goes to each in turn, and `U` lists them with what each waits for.
+
+A row says what fits of what there is to say, and leaves the rest out as the sidebar narrows:
+
+```
+ app (2) ▲1 ───────────────
+ web ────────────── 3 to do
+   ⎇ fix-login    +3 ±42 ↑2
+     ◐ fixer opus 5.5    4m
+       indexing 40%
+```
+
+- **An agent's model**, after its name: the `--model` it was started with, then what its hooks say as it starts,
+  then each switch it makes. Claude Code's `/model` fires no hook, so crystal reads the switch from its
+  conversation's transcript as it's written, only what was added since it last looked; Codex's model is in each
+  turn's context in its rollout. Claude's names are shortened, `claude-opus-5-5` to `opus 5.5`. The pane's header
+  says it too, on the right.
+- **A worktree's changes**, on its line: `+3` files changed and not committed, new ones included, `±42` lines
+  changed in them, and `↑2 ↓1` commits ahead of its upstream and behind it. git counts them off to the side,
+  without taking the index's lock from under an agent's own git, for the worktrees on screen: as one appears,
+  as soon as a session in it starts or stops doing something, and every ten seconds meanwhile.
+- **A line an agent or a script reported** with [`crystal report --line`](#a-line-on-its-row), under its row.
+- **A folded project**: `h` folds the selected session's project down to its heading, `l` (or `Enter` on the
+  heading) unfolds it, and a click on a project's heading does either. The heading says how many of the tab's
+  sessions it holds, and a count of those waiting on you, working, done and failed, by their marks. The
+  selection can rest on it, and `j` / `k` step over it as one row; a session picked by name, with `/`, `u` or a
+  click on its pinned row, unfolds its project. Folds are kept across restarts, as the width is.
 
 ```toml
 [sidebar]
@@ -1209,12 +1236,31 @@ one instead. An agent that leaves without letting go is let go of once the shell
 later: a safety net, not a way to leave. That's also why a report typed at the shell's own prompt doesn't
 hold: report from your agent's process.
 
+#### A line on its row
+
+```sh
+crystal report --line "indexing 40%"                    # a line under the session's row in the sidebar
+crystal report --line "deploying" --ttl 5m              # gone in five minutes unless it's reported again
+crystal report --model my-model-large                   # the model it runs on, beside its name
+crystal report --source indexer --seq 12 --line "60%"   # one numbered lower than the last from indexer is dropped
+crystal report --line ""                                # take it off
+```
+
+`--line` and `--model` are for the sidebar alone: on their own, they don't take the session over, so an agent
+crystal already knows, or a script running beside it, can say what it's on without changing how its status is
+read. With a state, `crystal report working --line "reading the docs"`, they go along with it. Each stays until
+it's said again or taken off with `""`, or for as long as `--ttl` gives it (`30s`, `5m` or `2h`, a day at most);
+`--model ""` gives back the model crystal reads. Text is put on one line, without control characters, and cut to
+80 characters. `--seq` numbers a source's reports, `--source` naming it with letters, digits and `:._-`: a
+report that arrives after a later one from the same source is passed over, so reports sent at once from
+several processes can't leave an older line showing. A session takes numbered reports from up to 32 sources.
+
 #### Keep it out of the way
 
 - Don't let crystal hold your agent up: report with a short timeout, one report at a time, and ignore
   failures.
 - `crystal ls --json` shows what crystal has: `reporter`, with the agent's name, its last `message` and the
-  `resume` command, and `front`, the agent by its name.
+  `resume` command, `front`, the agent by its name, and the `line` and `model` its row shows.
 - `crystal events -n <session>` shows each report that changed something, and `session.claimed` and
   `session.released` as your agent takes the session over and lets go.
 

@@ -11,11 +11,12 @@ use crate::front;
 use crate::git::Checkout;
 use crate::handover::{self, Got};
 use crate::keys;
+use crate::model;
 use crate::notify::{self, Notice};
 use crate::protocol::{
-    Activity, AgentEvent, AgentReport, Answer, Asking, Conversation, Front, InProgress, Reporter,
-    ScreenExplained, SessionInfo, State, TaskInfo, TaskOutcome, TaskRecord, TaskResult, TaskSpec,
-    TaskState, TaskView,
+    Activity, AgentEvent, AgentReport, Answer, Asking, Conversation, Front, InProgress, Metadata,
+    Reporter, ScreenExplained, SessionInfo, State, TaskInfo, TaskOutcome, TaskRecord, TaskResult,
+    TaskSpec, TaskState, TaskView,
 };
 use crate::report;
 use crate::spending::Spending;
@@ -125,6 +126,11 @@ pub struct Session {
     typed_agent: Option<String>,
     /// How many subagents its agent has running, as its hooks say.
     subagents: u32,
+    /// The model its agent runs on, as its command, its hooks and its
+    /// transcript say.
+    model: model::Watch,
+    /// What `crystal report --line` and `--model` put on its row.
+    shown: report::Shown,
     /// crystal stopped it after its agent sat idle: see [`Session::idle_for`].
     stopped_idle: bool,
     /// Tasks that closed of themselves, like a background task whose run
@@ -197,6 +203,10 @@ pub struct Handed {
     typed_agent: Option<String>,
     #[serde(default)]
     subagents: u32,
+    #[serde(default)]
+    model: model::Watch,
+    #[serde(default)]
+    shown: report::Shown,
     #[serde(default)]
     stopped_idle: bool,
     /// For a session yet to start again after a restart, or that couldn't:
@@ -343,6 +353,7 @@ impl Session {
         let changed = Arc::new(Mutex::new(SystemTime::now()));
         watch_for_end(pid, state.clone(), changed.clone());
 
+        let model = model::Watch::new(&command);
         Ok(Session {
             name,
             id,
@@ -370,6 +381,8 @@ impl Session {
             named_after_program: false,
             typed_agent: None,
             subagents: 0,
+            model,
+            shown: report::Shown::default(),
             stopped_idle: false,
             closed: Vec::new(),
             changes: Vec::new(),
@@ -433,6 +446,8 @@ impl Session {
             named_after_program: false,
             typed_agent: None,
             subagents: 0,
+            model: model::Watch::default(),
+            shown: report::Shown::default(),
             stopped_idle: false,
             closed: Vec::new(),
             changes: Vec::new(),
@@ -494,6 +509,8 @@ impl Session {
             named_after_program: false,
             typed_agent: None,
             subagents: 0,
+            model: model::Watch::new(&saved.command),
+            shown: report::Shown::default(),
             stopped_idle: false,
             closed: Vec::new(),
             changes: Vec::new(),
@@ -807,6 +824,16 @@ impl Session {
     }
 
     pub fn info(&self) -> SessionInfo {
+        let now = SystemTime::now();
+        // The model read is the agent's in front: a shell or another
+        // program has none. One the agent reported knows better.
+        let read_model = match &self.front {
+            Some(Front::Shell { .. } | Front::Program { .. }) => None,
+            _ => {
+                let read = self.model.model().map(String::from);
+                read.or_else(|| self.task.as_ref().and_then(Task::model))
+            }
+        };
         // An agent that reports for itself is in front by the name it gave,
         // whatever its process is called.
         let front = match &self.reporter {
@@ -836,6 +863,8 @@ impl Session {
                 Some(front) if !front.is_agent() => 0,
                 _ => self.subagents,
             },
+            model: self.shown.model(now).map(String::from).or(read_model),
+            line: self.shown.line(now).map(String::from),
             stopped_idle: self.stopped_idle,
             bell: self.bell,
         }
@@ -928,6 +957,39 @@ impl Session {
             AgentReport::Release => self.release(),
         }
         Ok(())
+    }
+
+    /// Takes what `crystal report --line` or `--model` puts on the
+    /// session's row. False when it came late, after a later report from
+    /// the same source, and was passed over.
+    pub fn take_metadata(&mut self, metadata: &Metadata) -> Result<bool> {
+        self.shown.take(metadata, SystemTime::now())
+    }
+
+    /// Takes the model the agent's hooks say it runs on.
+    pub fn heard_model(&mut self, model: &str) {
+        self.model.heard(model);
+    }
+
+    /// Reads what the agent's conversation has gained since the last look,
+    /// for a switch of its model, while it runs in front.
+    pub fn check_model(&mut self) {
+        if !self.is_running() || self.task.is_some() {
+            return;
+        }
+        if matches!(
+            self.front,
+            Some(Front::Shell { .. } | Front::Program { .. })
+        ) {
+            return;
+        }
+        let transcript = self
+            .conversation
+            .as_ref()
+            .and_then(|c| c.transcript.clone());
+        if let Some(transcript) = transcript {
+            self.model.look(&transcript);
+        }
     }
 
     /// The name of an agent that reports without giving one: the one it
@@ -1154,6 +1216,7 @@ impl Session {
         }
         if agent_left {
             self.subagents = 0;
+            self.model.forget();
             if self.typed_agent.take().is_some() {
                 self.conversation = None;
             }
@@ -1427,6 +1490,8 @@ impl Session {
             named_after_program: self.named_after_program,
             typed_agent: self.typed_agent.clone(),
             subagents: self.subagents,
+            model: self.model.clone(),
+            shown: self.shown.clone(),
             stopped_idle: self.stopped_idle,
             start_from,
             screen,
@@ -1506,6 +1571,8 @@ impl Session {
             named_after_program: handed.named_after_program,
             typed_agent: handed.typed_agent,
             subagents: handed.subagents,
+            model: handed.model,
+            shown: handed.shown,
             stopped_idle: handed.stopped_idle,
             closed: Vec::new(),
             changes: Vec::new(),
@@ -2005,6 +2072,15 @@ mod tests {
             created: 1,
             outcome: None,
         };
+        // What its agent put on its row, for a while yet.
+        let mut shown = report::Shown::default();
+        let metadata = Metadata {
+            line: Some("deploying".into()),
+            model: Some("pi-large".into()),
+            ttl_secs: Some(600),
+            ..Metadata::default()
+        };
+        shown.take(&metadata, SystemTime::now()).unwrap();
         let handed = Handed {
             name: "agent".into(),
             id: "id-1".into(),
@@ -2034,6 +2110,8 @@ mod tests {
             named_after_program: true,
             typed_agent: Some("codex".into()),
             subagents: 2,
+            model: model::Watch::new(&["claude".into(), "--model".into(), "opus".into()]),
+            shown,
             stopped_idle: false,
             start_from: None,
             screen: screen.save(),
@@ -2069,6 +2147,11 @@ mod tests {
         assert_eq!(session.subagents, 2);
         // With the shell in front, there are none to show.
         assert_eq!(info.subagents, 0);
+        // What its agent put on its row stays, the model it reported over
+        // the one its command gave.
+        assert_eq!(info.line.as_deref(), Some("deploying"));
+        assert_eq!(info.model.as_deref(), Some("pi-large"));
+        assert_eq!(session.model.model(), Some("opus"));
     }
 
     /// A Claude Code session as it was written down before a restart, in
@@ -2200,6 +2283,8 @@ mod tests {
             named_after_program: false,
             typed_agent: Some("claude".into()),
             subagents: 2,
+            model: model::Watch::default(),
+            shown: report::Shown::default(),
             stopped_idle: false,
             start_from: None,
             screen: vt::Screen::answering(5, 20).save(),
@@ -2364,6 +2449,8 @@ mod tests {
             stopped_idle: false,
             typed_agent: None,
             subagents: 0,
+            model: model::Watch::default(),
+            shown: report::Shown::default(),
             pty: None,
             task: None,
         };

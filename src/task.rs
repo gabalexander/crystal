@@ -95,6 +95,9 @@ struct Runs {
     /// The last turn to end had been stopped by the user.
     interrupted: bool,
     conversation: Option<String>,
+    /// The model Claude said it runs on, as its last run started.
+    #[serde(default)]
+    model: Option<String>,
     /// What the last turn was asked.
     prompt: String,
     /// What the last turn came to: Claude's answer, or what went wrong.
@@ -192,6 +195,11 @@ impl Task {
 
     pub fn conversation(&self) -> Option<String> {
         self.runs.lock().unwrap().conversation.clone()
+    }
+
+    /// The model Claude runs the task on, once a run has said.
+    pub fn model(&self) -> Option<String> {
+        self.runs.lock().unwrap().model.clone()
     }
 
     /// The process of the `claude` taking the task's turns, while there is
@@ -721,7 +729,15 @@ impl Reading {
         runs.record.push_claude(line);
         for event in transcript::events(line) {
             match event {
-                Event::Started { conversation } => runs.conversation = Some(conversation),
+                Event::Started {
+                    conversation,
+                    model,
+                } => {
+                    runs.conversation = Some(conversation);
+                    if model.is_some() {
+                        runs.model = model;
+                    }
+                }
                 Event::Finished(outcome) => self.finish(runs, outcome),
                 event => {
                     let lines = transcript::lines(&event, self.term.columns());

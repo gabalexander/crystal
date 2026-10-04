@@ -44,6 +44,7 @@ mod memory_cli;
 mod mermaid;
 mod mermaid_cli;
 mod messages;
+mod model;
 mod names;
 mod notify;
 mod plugin_cli;
@@ -210,16 +211,45 @@ enum Command {
     /// Say what the agent in this session is doing, for an agent crystal
     /// doesn't know or a script wrapped around one, and how to resume it
     /// after a restart: the command after `--`. Its reports are the
-    /// session's status until `--release`.
+    /// session's status until `--release`. Or, with `--line` and
+    /// `--model` alone, only put a line on its row in the sidebar, or its
+    /// model.
     Report {
         /// What it's doing: working, waiting (on you, which `blocked` says
         /// too), idle (at its prompt) or done (with a turn).
         #[arg(
             value_enum,
-            required_unless_present_any = ["session_only", "release"],
+            required_unless_present_any = ["session_only", "release", "line", "model"],
             conflicts_with_all = ["session_only", "release"]
         )]
         state: Option<ReportedState>,
+
+        /// A short line under the session's row in the sidebar, like
+        /// "indexing 40%"; "" takes it off. It doesn't take the status
+        /// over.
+        #[arg(long)]
+        line: Option<String>,
+
+        /// The model the agent runs on, shown on its row in place of what
+        /// crystal reads; "" gives that back.
+        #[arg(long)]
+        model: Option<String>,
+
+        /// How long the --line and --model go on showing unless they're
+        /// reported again, like 30s, 5m or 2h, a day at most [default:
+        /// until they're replaced]
+        #[arg(long, value_name = "WHILE")]
+        ttl: Option<String>,
+
+        /// Who reports the --line and --model, for --seq: letters, digits
+        /// and `:._-`.
+        #[arg(long, value_name = "ID")]
+        source: Option<String>,
+
+        /// The report's number from its --source: one numbered no higher
+        /// than the last came late, and is passed over.
+        #[arg(long, value_name = "N")]
+        seq: Option<u64>,
 
         /// The agent's name, as the sidebar and `ls` show it [default: the
         /// one it gave before, or what's in front in the session]
@@ -227,7 +257,7 @@ enum Command {
         agent: Option<String>,
 
         /// A line on what it's doing, like what it's waiting on you for.
-        #[arg(short, long, conflicts_with_all = ["session_only", "release"])]
+        #[arg(short, long, requires = "state", conflicts_with_all = ["session_only", "release"])]
         message: Option<String>,
 
         /// The session [default: the one this runs in]
@@ -1443,6 +1473,11 @@ fn run(cli: Cli) -> Result<()> {
         }
         Command::Report {
             state,
+            line,
+            model,
+            ttl,
+            source,
+            seq,
             agent,
             message,
             name,
@@ -1450,19 +1485,35 @@ fn run(cli: Cli) -> Result<()> {
             release,
             resume,
         } => {
+            let shows = line.is_some() || model.is_some();
+            if !shows && (ttl.is_some() || source.is_some() || seq.is_some()) {
+                bail!("--ttl, --source and --seq go with --line or --model");
+            }
+            let metadata = if shows {
+                Some(protocol::Metadata {
+                    line,
+                    model,
+                    ttl_secs: ttl.as_deref().map(report_ttl).transpose()?,
+                    source,
+                    seq,
+                })
+            } else {
+                None
+            };
             let resume = (!resume.is_empty()).then_some(resume);
             let report = match (state, resume) {
-                _ if release => protocol::AgentReport::Release,
-                (Some(state), resume) => protocol::AgentReport::State {
+                _ if release => Some(protocol::AgentReport::Release),
+                (Some(state), resume) => Some(protocol::AgentReport::State {
                     agent,
                     state: state.activity(),
                     message,
                     resume,
-                },
-                (None, Some(argv)) => protocol::AgentReport::Resume { agent, argv },
+                }),
+                (None, Some(argv)) => Some(protocol::AgentReport::Resume { agent, argv }),
+                (None, None) if shows => None,
                 (None, None) => bail!("say what the agent is doing"),
             };
-            report::run(&socket, name, report)?;
+            report::run(&socket, name, metadata, report)?;
         }
         Command::Tasks {
             all,
@@ -2198,6 +2249,15 @@ fn remove_worktree(socket: &Path, target: &str, force: bool) -> Result<()> {
 /// A number of seconds from the command line, as a `Duration`.
 fn seconds(seconds: Option<f64>) -> Option<Duration> {
     seconds.map(Duration::from_secs_f64)
+}
+
+/// `crystal report --ttl`, in seconds: a while written the way the
+/// settings write one, a day at most.
+fn report_ttl(ttl: &str) -> Result<u64> {
+    let ttl = config::duration(ttl)?
+        .filter(|ttl| *ttl <= report::LONGEST_TTL)
+        .ok_or_else(|| anyhow::anyhow!("a --ttl is from a second to a day, like 30s, 5m or 2h"))?;
+    Ok(ttl.as_secs())
 }
 
 fn no_daemon(socket: &Path) -> Result<()> {

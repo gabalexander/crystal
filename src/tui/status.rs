@@ -77,6 +77,8 @@ mod tests {
             asking: None,
             reporter: None,
             subagents: 0,
+            model: None,
+            line: None,
             bell: false,
         }
     }

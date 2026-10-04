@@ -49,6 +49,7 @@ use crate::events::Event;
 use crate::flow_run::{FlowRun, RunState};
 use crate::flows::{self, Flow};
 use crate::forge::{self, Checkout, Forge, Issue, PullRequest, PullRequestDetail, Topic};
+use crate::git;
 use crate::profile::{self, Profile};
 use crate::project_commands::Verb;
 use crate::protocol::{
@@ -59,7 +60,7 @@ use crate::shell;
 use crate::{backlog, names, plugins, tasks};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
 use ratatui::layout::Rect;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// Where a pane sits beside the sidebar: the one that follows the
@@ -752,6 +753,16 @@ pub struct App {
     /// commit each is at, by its directory, as git last said: what the
     /// sidebar names one by.
     subjects: HashMap<PathBuf, String>,
+    /// What git last counted of each worktree the sidebar shows, by its
+    /// directory: its changes not committed, and how far its branch is from
+    /// its upstream.
+    stats: HashMap<PathBuf, git::Stat>,
+    /// The worktrees whose sessions have changed since the event loop last
+    /// asked: they're counted again straight away.
+    stats_due: HashSet<PathBuf>,
+    /// The projects folded down to their headings in the sidebar, by their
+    /// main worktrees, which the event loop keeps in the database.
+    folded: BTreeSet<PathBuf>,
     /// The main worktrees of the projects crystal knows, as the daemon last
     /// listed them: those with no sessions stay in the sidebar, and the
     /// new-session panel offers them all.
@@ -1001,6 +1012,9 @@ impl App {
             on_worktree: None,
             worktrees: HashMap::new(),
             subjects: HashMap::new(),
+            stats: HashMap::new(),
+            stats_due: HashSet::new(),
+            folded: BTreeSet::new(),
             known: Vec::new(),
             removing: HashSet::new(),
             prompt: None,
@@ -1798,8 +1812,18 @@ impl App {
     /// only those that match while `/`'s filter is open. The linked
     /// worktrees with no sessions come under their projects too, but while
     /// the filter is open, it adds those it found, with the rest it found:
-    /// see [`App::add_found`].
+    /// see [`App::add_found`]. A folded project is its heading alone.
     pub fn rows(&self) -> Vec<Row> {
+        self.rows_folded(true)
+    }
+
+    /// The sidebar's rows with every project unfolded: where the selection
+    /// can be, seen or not.
+    fn all_rows(&self) -> Vec<Row> {
+        self.rows_folded(false)
+    }
+
+    fn rows_folded(&self, fold: bool) -> Vec<Row> {
         let shown = self.matches();
         let empty = match self.filter {
             Some(_) => Vec::new(),
@@ -1839,6 +1863,9 @@ impl App {
         if !self.tasks_on {
             rows.retain(|row| !matches!(row, Row::Task(_)));
         }
+        if fold {
+            rows = self.fold(rows);
+        }
         let pinned = self.pinned();
         if pinned.is_empty() {
             return rows;
@@ -1847,6 +1874,27 @@ impl App {
         with_pinned.extend(pinned.into_iter().map(Row::Pinned));
         with_pinned.extend(rows);
         with_pinned
+    }
+
+    /// `rows` with each folded project down to its heading.
+    fn fold(&self, rows: Vec<Row>) -> Vec<Row> {
+        if self.folded.is_empty() || self.filter.is_some() {
+            return rows;
+        }
+        let mut folding = false;
+        rows.into_iter()
+            .filter(|row| match row {
+                Row::Project { path, .. } => {
+                    folding = self.folded.contains(path);
+                    true
+                }
+                Row::OutsideGit => {
+                    folding = false;
+                    true
+                }
+                _ => !folding,
+            })
+            .collect()
     }
 
     /// Adds to the `rows` of the sessions `/`'s filter found the rest of
@@ -2072,6 +2120,108 @@ impl App {
         self.subjects.get(path).map(String::as_str)
     }
 
+    /// Takes what git counted of the worktree at `path`, or forgets it when
+    /// git couldn't say.
+    pub fn set_stat(&mut self, path: PathBuf, stat: Option<git::Stat>) {
+        match stat {
+            Some(stat) => self.stats.insert(path, stat),
+            None => self.stats.remove(&path),
+        };
+    }
+
+    /// What git last counted of the worktree at `path`.
+    pub fn stat_of(&self, path: &Path) -> Option<&git::Stat> {
+        self.stats.get(path)
+    }
+
+    /// The worktrees whose lines the sidebar shows, by their directories:
+    /// those to count. None while it's folded.
+    pub fn shown_worktrees(&self) -> Vec<PathBuf> {
+        if self.sidebar.folded {
+            return Vec::new();
+        }
+        self.rows()
+            .into_iter()
+            .filter_map(|row| match row {
+                Row::Worktree { path, .. } => Some(path),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The worktrees to count again now, since a session in one changed.
+    pub fn take_stats_due(&mut self) -> HashSet<PathBuf> {
+        std::mem::take(&mut self.stats_due)
+    }
+
+    /// The projects folded down to their headings, to keep.
+    pub fn folded_projects(&self) -> &BTreeSet<PathBuf> {
+        &self.folded
+    }
+
+    /// Takes the projects the TUI kept folded.
+    pub fn set_folded_projects(&mut self, folded: BTreeSet<PathBuf>) {
+        self.folded = folded;
+    }
+
+    /// Whether the project with its main worktree at `path` is folded down
+    /// to its heading: never while `/`'s filter is open, which finds
+    /// sessions wherever they are.
+    pub fn is_folded(&self, path: &Path) -> bool {
+        self.filter.is_none() && self.folded.contains(path)
+    }
+
+    /// The folded project the selection is in, out of sight, by its main
+    /// worktree: its heading has the bar.
+    pub fn folded_selection(&self) -> Option<&Path> {
+        let project = &self.selection_worktree()?.project_path;
+        self.is_folded(project).then_some(project.as_path())
+    }
+
+    /// `h`: folds the project the selection is in down to its heading. The
+    /// selection stays where it was, out of sight, the heading taking the
+    /// bar.
+    fn fold_project(&mut self) {
+        if self.filter.is_some() {
+            return;
+        }
+        match self.selection_worktree() {
+            Some(worktree) => {
+                let project = worktree.project_path.clone();
+                self.folded.insert(project);
+            }
+            None => self.notify("only a project folds".to_string()),
+        }
+    }
+
+    /// `l`, or `Enter` on a folded project's heading: unfolds the project
+    /// the selection is in.
+    fn unfold_project(&mut self) {
+        if let Some(worktree) = self.selection_worktree() {
+            let project = worktree.project_path.clone();
+            self.folded.remove(&project);
+        }
+    }
+
+    /// A click on a project's heading folds the project, or unfolds it.
+    fn toggle_fold(&mut self, project: &Path) {
+        if !self.folded.remove(project) {
+            self.folded.insert(project.to_path_buf());
+        }
+    }
+
+    /// The sessions of the tab in front a folded project's heading stands
+    /// for, by index.
+    pub fn folded_sessions(&self, project: &Path) -> Vec<usize> {
+        self.in_tab()
+            .into_iter()
+            .filter(|&index| {
+                let worktree = self.sessions[index].worktree.as_ref();
+                worktree.is_some_and(|worktree| worktree.project_path == project)
+            })
+            .collect()
+    }
+
     /// Asks again before removing the worktree at `path`, on `branch`,
     /// which git found changes not committed in: a yes forces it, and they
     /// go with it. Until then, git isn't removing it.
@@ -2131,7 +2281,7 @@ impl App {
         let Some(path) = self.on_worktree.clone() else {
             return;
         };
-        if self.rows().contains(&Row::NoSessions(path.clone())) {
+        if self.all_rows().contains(&Row::NoSessions(path.clone())) {
             return;
         }
         self.on_worktree = None;
@@ -2901,6 +3051,13 @@ impl App {
             if let Some(was) = was.filter(|was| was.name != now.name) {
                 self.tabs.renamed(&was.name, &now.name);
             }
+            // A session that started, or whose agent stopped or started
+            // doing something, may have changed files: its worktree is
+            // counted again.
+            let changed = was.is_none_or(|was| was.changed != now.changed);
+            if changed && let Some(worktree) = &now.worktree {
+                self.stats_due.insert(worktree.path.clone());
+            }
         }
         if let Some(restarted) = self.restarts.take(&sessions) {
             self.restarted = Some(restarted);
@@ -2922,7 +3079,7 @@ impl App {
             && still_there.is_none()
             && let Some(worktree) = before.and_then(|session| session.worktree)
             && self
-                .rows()
+                .all_rows()
                 .contains(&Row::NoSessions(worktree.path.clone()))
         {
             self.on_worktree = Some(worktree.path);
@@ -3006,6 +3163,10 @@ impl App {
         }
         self.selected = index;
         self.on_worktree = None;
+        // Picked by name, it's shown: a folded project it's in unfolds.
+        if let Some(worktree) = &self.sessions[index].worktree {
+            self.folded.remove(&worktree.project_path);
+        }
         self.remember_shown();
     }
 
@@ -3471,7 +3632,13 @@ impl App {
                 .cloned()
         };
         match &clicked {
-            Row::Session(_) | Row::Task(_) | Row::NoSessions(_) => self.select_row(&clicked),
+            Row::Session(_) | Row::Task(_) | Row::Line(_) | Row::NoSessions(_) => {
+                self.select_row(&clicked)
+            }
+            Row::Project { path, .. } if self.is_folded(path) => {
+                self.select_row(&clicked);
+                return Some(self.project_menu());
+            }
             Row::Project { .. } => {
                 self.select_row(&first_under(|row| {
                     matches!(row, Row::Project { .. } | Row::OutsideGit)
@@ -3597,6 +3764,10 @@ impl App {
         if self.memory_on {
             items.push(Item::new("what it remembers", Command::Memory));
         }
+        items.push(match self.folded_selection() {
+            Some(_) => Item::new("unfold it", Command::UnfoldProject),
+            None => Item::new("fold it to its heading", Command::FoldProject),
+        });
         items
     }
 
@@ -3639,15 +3810,16 @@ impl App {
     fn click_found(&mut self, row: usize) -> Option<Action> {
         self.focus = Focus::Sidebar;
         let found = match self.rows().get(row)? {
-            Row::Task(index) => self.found_at(&Row::Session(*index)),
+            Row::Task(index) | Row::Line(index) => self.found_at(&Row::Session(*index)),
             row => self.found_at(row),
         };
         self.pick(found?)
     }
 
     /// A click on a sidebar row gives the sidebar the keyboard, and on a
-    /// session, or a worktree with none, selects it. A heading leaves the
-    /// selection where it was.
+    /// session, or a worktree with none, selects it. A project's heading
+    /// folds or unfolds the project; another heading leaves the selection
+    /// where it was.
     fn click_row(&mut self, row: usize) {
         self.focus = Focus::Sidebar;
         let rows = self.rows();
@@ -3657,8 +3829,16 @@ impl App {
             self.select(&name);
             return;
         }
+        // A project's heading folds the project, or unfolds it.
+        if let Some(Row::Project { path, .. }) = rows.get(row) {
+            self.toggle_fold(path);
+            return;
+        }
         if let Some(row) = rows.get(row)
-            && matches!(row, Row::Session(_) | Row::Task(_) | Row::NoSessions(_))
+            && matches!(
+                row,
+                Row::Session(_) | Row::Task(_) | Row::Line(_) | Row::NoSessions(_)
+            )
         {
             self.select_row(row);
         }
@@ -3713,6 +3893,7 @@ impl App {
             Command::Up => self.move_selection(-1),
             // On a worktree with no sessions, there's nothing to type into:
             // Enter starts something there, as `n` does.
+            Command::Open if self.folded_selection().is_some() => self.unfold_project(),
             Command::Open if self.on_worktree.is_some() => return self.open_launcher(false),
             Command::Open => self.enter(),
             Command::Reply if self.on_worktree.is_some() => {}
@@ -3787,6 +3968,8 @@ impl App {
             Command::NarrowerSidebar => self.resize_sidebar(-SIDEBAR_STEP),
             Command::WiderSidebar => self.resize_sidebar(SIDEBAR_STEP),
             Command::FoldSidebar => self.fold_sidebar(),
+            Command::FoldProject => self.fold_project(),
+            Command::UnfoldProject => self.unfold_project(),
             Command::Plugins => return Some(Action::ListPlugins),
             Command::Settings => {
                 self.settings = Some(SettingsView::new());
@@ -5701,13 +5884,17 @@ impl App {
     }
 
     /// Moves the selection `by` rows up or down the sidebar, over the rows
-    /// it can be on: the sessions, and the worktrees with none. It stops
-    /// at the ends.
+    /// it can be on: the sessions, the worktrees with none, and the
+    /// headings of folded projects. It stops at the ends.
     fn move_selection(&mut self, by: isize) {
         let stops: Vec<Row> = self
             .rows()
             .into_iter()
-            .filter(|row| matches!(row, Row::Session(_) | Row::NoSessions(_)))
+            .filter(|row| match row {
+                Row::Session(_) | Row::NoSessions(_) => true,
+                Row::Project { path, .. } => self.is_folded(path),
+                _ => false,
+            })
             .collect();
         if stops.is_empty() {
             return;
@@ -5722,26 +5909,48 @@ impl App {
         self.select_row(&stops[to]);
     }
 
-    /// Whether the selection is on `row`: a session's, or a worktree's
-    /// with no sessions.
+    /// Whether the selection is on `row`: a session's, a worktree's with no
+    /// sessions, or the heading of the folded project it's in.
     fn is_selected(&self, row: &Row) -> bool {
         match row {
             Row::Session(index) => self.selected_index() == Some(*index),
             Row::NoSessions(path) => self.on_worktree.as_ref() == Some(path),
+            Row::Project { path, .. } => self.folded_selection() == Some(path.as_path()),
             _ => false,
         }
     }
 
-    /// Puts the selection on `row`, if it's one it can be on.
+    /// Puts the selection on `row`, if it's one it can be on. On a folded
+    /// project's heading, it goes to the first row the heading stands for,
+    /// out of sight.
     fn select_row(&mut self, row: &Row) {
         match row {
-            Row::Session(index) | Row::Task(index) => {
+            Row::Session(index) | Row::Task(index) | Row::Line(index) => {
                 self.selected = *index;
                 self.on_worktree = None;
             }
             Row::NoSessions(path) => self.on_worktree = Some(path.clone()),
+            Row::Project { path, .. } if self.is_folded(path) => {
+                if let Some(first) = self.first_under(path) {
+                    self.select_row(&first);
+                }
+            }
             _ => {}
         }
+    }
+
+    /// The first row under the heading of the project at `project`, folded
+    /// or not, that the selection can be on.
+    fn first_under(&self, project: &Path) -> Option<Row> {
+        let rows = self.all_rows();
+        let heading = rows
+            .iter()
+            .position(|row| matches!(row, Row::Project { path, .. } if path == project))?;
+        rows[heading + 1..]
+            .iter()
+            .take_while(|row| !matches!(row, Row::Project { .. } | Row::OutsideGit))
+            .find(|row| matches!(row, Row::Session(_) | Row::NoSessions(_)))
+            .cloned()
     }
 
     /// Selects the next session that needs the user, bringing its tab to
@@ -5975,6 +6184,8 @@ mod tests {
             asking: None,
             reporter: None,
             subagents: 0,
+            model: None,
+            line: None,
             bell: false,
         }
     }
@@ -10472,5 +10683,113 @@ gate = true
         let mut outside = app_with(&["a"]);
         assert_eq!(press(&mut outside, KeyCode::Char('!')), None);
         assert!(outside.notice().unwrap().contains("git worktree"));
+    }
+
+    /// The row of the heading of the project at `project`.
+    fn heading_of(app: &App, project: &str) -> usize {
+        let project = Path::new(project);
+        app.rows()
+            .iter()
+            .position(|row| matches!(row, Row::Project { path, .. } if path == project))
+            .unwrap()
+    }
+
+    #[test]
+    fn h_folds_the_selected_project_to_its_heading_and_l_unfolds_it() {
+        let app_path = Path::new("/code/app");
+        let mut app = App::new(None);
+        app.set_sessions(vec![
+            in_project("planner", "app"),
+            in_project("fixer", "app"),
+            in_project("docs", "web"),
+        ]);
+        let unfolded = app.rows();
+        press(&mut app, KeyCode::Char('h'));
+        assert!(app.is_folded(app_path));
+        // The project is its heading alone, the next project's right under
+        // it; the selection stays, out of sight, its heading with the bar.
+        let rows = app.rows();
+        assert!(matches!(&rows[1], Row::Project { name, .. } if name == "web"));
+        assert_eq!(rows.len(), unfolded.len() - 3);
+        assert_eq!(selected_name(&app), Some("planner"));
+        assert_eq!(app.folded_selection(), Some(app_path));
+        // The folded project is one row to move over, and back onto.
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(selected_name(&app), Some("docs"));
+        assert_eq!(app.folded_selection(), None);
+        press(&mut app, KeyCode::Char('k'));
+        assert_eq!(app.folded_selection(), Some(app_path));
+        // Enter on its heading unfolds it, as `l` does.
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.rows(), unfolded);
+        press(&mut app, KeyCode::Char('h'));
+        press(&mut app, KeyCode::Char('l'));
+        assert_eq!(app.rows(), unfolded);
+        assert_eq!(app.focus(), Focus::Sidebar);
+    }
+
+    #[test]
+    fn a_click_on_a_project_s_heading_folds_it_and_a_session_picked_unfolds_it() {
+        let web = Path::new("/code/web");
+        let mut app = App::new(None);
+        app.set_sessions(vec![
+            in_project("planner", "app"),
+            in_project("docs", "web"),
+        ]);
+        app.on_mouse(CLICK, Hit::SidebarRow(heading_of(&app, "/code/web")));
+        assert!(app.is_folded(web));
+        assert_eq!(selected_name(&app), Some("planner"));
+        assert_eq!(app.folded_projects().len(), 1);
+        // `/` finds sessions wherever they are, folded or not.
+        press(&mut app, KeyCode::Char('/'));
+        type_text(&mut app, "docs");
+        let docs = app
+            .sessions()
+            .iter()
+            .position(|s| s.name == "docs")
+            .unwrap();
+        assert!(app.rows().contains(&Row::Session(docs)));
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.rows().contains(&Row::Session(docs)));
+        // A session picked by name is shown: its project unfolds.
+        app.select("docs");
+        assert!(!app.is_folded(web));
+        // Clicked again, a folded heading unfolds.
+        let mut app = App::new(None);
+        app.set_sessions(vec![in_project("planner", "app")]);
+        app.set_folded_projects(BTreeSet::from([PathBuf::from("/code/app")]));
+        app.on_mouse(CLICK, Hit::SidebarRow(heading_of(&app, "/code/app")));
+        assert!(app.folded_projects().is_empty());
+    }
+
+    #[test]
+    fn folding_keeps_the_selection_on_an_empty_worktree_out_of_sight() {
+        let mut app = app_with_an_empty_worktree();
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(empty_branch(&app), Some("old"));
+        press(&mut app, KeyCode::Char('h'));
+        assert!(!shows_empty_worktree(&app));
+        // git listing the worktrees again leaves the selection where it is.
+        app.set_worktrees(PathBuf::from("/code/app"), vec![linked("old")]);
+        assert_eq!(empty_branch(&app), Some("old"));
+        assert_eq!(app.folded_selection(), Some(Path::new("/code/app")));
+    }
+
+    #[test]
+    fn a_worktree_is_counted_again_once_a_session_in_it_changes() {
+        let fix = PathBuf::from("/code/app.worktrees/fix");
+        let mut fixer = in_worktree("fixer", "fix", State::Running);
+        let mut app = App::new(None);
+        app.set_sessions(vec![fixer.clone()]);
+        assert_eq!(app.take_stats_due(), HashSet::from([fix.clone()]));
+        app.set_sessions(vec![fixer.clone()]);
+        assert!(app.take_stats_due().is_empty());
+        fixer.changed = 5;
+        app.set_sessions(vec![fixer]);
+        assert_eq!(app.take_stats_due(), HashSet::from([fix.clone()]));
+        // Shown, it's counted; folded away with its project, it isn't.
+        assert_eq!(app.shown_worktrees(), [fix]);
+        press(&mut app, KeyCode::Char('h'));
+        assert!(app.shown_worktrees().is_empty());
     }
 }

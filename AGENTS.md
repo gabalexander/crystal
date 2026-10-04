@@ -82,13 +82,14 @@ whenever what's handed over changes in a way the crystal before couldn't read.
 - `src/tui/`: the TUI (`crystal` with no command)
   - `mod.rs`: the event loop: one channel of events, then update and draw (not for a move of the mouse that
     changes nothing), opening the link a Ctrl+click or copy mode's `o` asks for, bringing the TUI's terminal to
-    the front for `pane focus --raise`, and ringing the user's terminal for a pane's bell or a session marked as
+    the front for `pane focus --raise`, ringing the user's terminal for a pane's bell or a session marked as
     having rung; taking the mouse from the terminal or leaving it there (`[mouse] capture`), counting clicks
     for double- and triple-clicks, and scrolling a pane's history on a timer while a drag selecting in it is
-    held past its edge
+    held past its edge; and having git count the changes of the worktrees the sidebar shows, off the loop
   - `app.rs`: the state and how keys and the mouse change it: a sidebar key looked up in the keymap and its
     command run, from the sidebar, the `:` list or after the prefix in a pane; the sidebar's width, folded or
-    not, and what needs the user pinned at its top; no I/O, so it's unit-tested
+    not, what needs the user pinned at its top, and the projects folded down to their headings, the selection
+    resting on one out of sight; no I/O, so it's unit-tested
     - `app/commands.rs`: the layout commands carried out on the state, each on the tab holding the session it's
       about, in front or not, and the layout the TUI answers with; and carried out with no TUI open, on a state
       made for it from the tabs kept, the sessions and the flow runs, on a screen of an unseen session's size
@@ -117,10 +118,12 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   - `layouts.rs`: the layouts view (`S`): the tabs saved under a name, with what starts each of their
     terminals' programs again, and put back, and the tabs a restore replaced; its state and keys, kept apart
     from I/O (the event loop keeps them in the database and starts the sessions gone), and its drawing
-  - `sidebar.rs`: the sidebar's rows: headings, worktree lines with what git is in the middle of there and
-    Claude Code's own named by their commits, sessions with their mark and how long ago, terminals drawn
-    apart from agents, the sessions that need the user pinned on top with the tab each is in, and the rail
-    of marks a folded sidebar keeps
+  - `sidebar.rs`: the sidebar's rows: headings, a folded project's with what's in it, worktree lines with
+    what git is in the middle of there, their changes not committed and how far they are from their upstream,
+    and Claude Code's own named by their commits, sessions with their mark, their agent's model and how long
+    ago, the line reported for one under it, terminals drawn apart from agents, the sessions that need the user
+    pinned on top with the tab each is in, and the rail of marks a folded sidebar keeps; what doesn't fit left
+    out
   - `keymap.rs`: the sidebar's commands, each with the id `[keys]` names it by, what it does and its default
     keys; keys as the config writes them and as terminals send them, folded into one form; the config's
     keys laid over the defaults, a key given to one command taken from the one that had it; the prefix and
@@ -146,8 +149,8 @@ whenever what's handed over changes in a way the crystal before couldn't read.
     to a page, the pages turned with the arrows; a test keeps the README's table of sidebar keys in step with
     the defaults
   - `groups.rs`: the sidebar's order and headings: sessions by project, then worktree, agents before
-    terminals, each flow run's steps under it, and linked worktrees with no sessions left at the end of
-    their project, Claude Code's own last
+    terminals, a session's task and the line reported for it under it, each flow run's steps under it, and
+    linked worktrees with no sessions left at the end of their project, Claude Code's own last
   - `text_input.rs`: a one-line text box, for the questions asked on the bottom line
   - `text_area.rs`: a text box of several lines that wrap: the new-session panel's task, and the reply box
   - `reply.rs`: the reply box (`Space`): the next prompt for a session, or a background task's follow-up,
@@ -246,8 +249,8 @@ whenever what's handed over changes in a way the crystal before couldn't read.
 - `src/agents.rs`: what crystal knows about particular agents: the hooks it adds to Claude Code, the events it
   listens to and what they mean (Claude Code's, which others copied, Cursor's spelled its own way, and
   Codex's), subagents' among them, the variable that quiets the installed hooks for an agent crystal hooked
-  itself, the command that resumes one typed into a shell, and where an agent hears crystal's notes: Claude
-  Code's system prompt, or the top of another's first prompt
+  itself, the command that resumes one typed into a shell, the model a hook names, and where an agent hears
+  crystal's notes: Claude Code's system prompt, or the top of another's first prompt
 - `src/agent_rules.rs`: the rules agents' screens are read by: a file for each agent in `agents/` (adapted from
   herdr's), bundled, each rule a look, a priority, a region and tests; a file of the user's in the config's
   `agents/` directory in place of one, or adding an agent, read again when it changes, and a broken one said
@@ -271,7 +274,12 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   go through symbolic links; pure edits on the JSON, so they're unit-tested; and the other agents' through
   `agent_hooks.rs`
 - `src/report.rs`: `crystal report`: any agent, or a script wrapped around one, saying what it's doing and the
-  command that resumes it; checking that command, and what's typed into a shell to run it after a restart
+  command that resumes it; checking that command, and what's typed into a shell to run it after a restart; and
+  what `--line` and `--model` put on a session's row, for the sidebar alone: tidied, each with when it goes
+  (`--ttl`), and a source's late reports (`--seq`) passed over
+- `src/model.rs`: the model a session's agent runs on: its command's `--model`, what its hooks say, then the
+  newest switch in its conversation's transcript, Claude Code's `/model` or Codex's turn context, read a little
+  at a time as it's written; and a model's name shortened for a row (adapted from docket's)
 - `src/agent_screen.rs`: reading what an agent is doing off its screen, title and progress, by its rules, and
   the watch that counts a new look once it holds for two checks
 - `src/front.rs`: what's in front in a session's terminal (agent, shell or program), from its foreground process:
@@ -281,11 +289,11 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   sizes it), viewers and listeners, the agent that says what it's doing itself while it holds the session, an
   agent typed into its shell whose conversation a restart resumes while it's in front, its agent's subagents,
   whether its first prompt can name it, whether its agent is blocked on the user, how long its agent has sat
-  idle (nobody watching or typing, its turn seen), why its screen reads the way it does (`crystal agent
-  explain`), and what has changed in it (its agent's activity, a task's runs, its bell rung while nobody
-  watched) for the daemon to tell; one written down before a restart, with no program, while it waits its turn
-  to start again or once it couldn't, saying why on its screen; handing it over and adopting it, its PTY on a
-  descriptor of crystal's own
+  idle (nobody watching or typing, its turn seen), the model its agent runs on and what was reported for its
+  row, why its screen reads the way it does (`crystal agent explain`), and what has changed in it (its agent's
+  activity, a task's runs, its bell rung while nobody watched) for the daemon to tell; one written down before
+  a restart, with no program, while it waits its turn to start again or once it couldn't, saying why on its
+  screen; handing it over and adopting it, its PTY on a descriptor of crystal's own
 - `src/vt.rs`: a terminal's screen, through `alacritty_terminal`: what a program drew and its history, the modes
   it set, its answers to the program's questions (the daemon's screen only), the output that catches a new viewer
   up (its hyperlinks included), the cells to draw, the input modes `crystal attach` asks your terminal for, and,
@@ -339,8 +347,8 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   migrations by `user_version`, as docket does): the sessions to start again, the archived sessions, flow runs,
   the projects on crystal's list, each project's backlog and closed tasks, the files tasks kept, the tasks waiting to start and the last task number, what background
   tasks spent each day, the event log, read from a point on or a page at a time back from its end, and the TUI's
-  tabs, layouts, the new-session panel's memory, the diff view's reviewed marks and the latest event the user
-  had seen, each a JSON document; and bringing in the JSON files from before, a project's the first time it's
+  tabs, layouts, the new-session panel's memory, the diff view's reviewed marks, the projects folded in the
+  sidebar and the latest event the user had seen, each a JSON document; and bringing in the JSON files from before, a project's the first time it's
   asked for. Settings stay in the config file and memory in `memory.db`
 - `src/project.rs`: the project a directory is in: its git main worktree, or the directory itself outside git
 - `src/project_commands.rs`: a project's `run` and `open` commands, from the config's `[[project]]`, or else the
@@ -435,8 +443,10 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   `--base`, a pull request's with its commits fetched from `origin`, the patches the diff reads,
   the files a worktree changed since its branch left the default one, what git is in the middle of in a
   worktree (a merge, a rebase, a cherry-pick or a revert) and the branch a rebase keeps though HEAD is
-  detached, the subject of the commit each of Claude Code's own worktrees (`.claude/worktrees`) is at, and
-  `git grep` stopped once it's no longer wanted (runs `git`)
+  detached, the subject of the commit each of Claude Code's own worktrees (`.claude/worktrees`) is at, what a
+  worktree's line in the sidebar counts (its changes not committed, files and lines, and how far its branch is
+  ahead of its upstream and behind it, read without taking the index's lock), and `git grep` stopped once it's
+  no longer wanted (runs `git`)
   - `git/branches.rs`: a worktree's branches, local and remote, fetching its remotes in a session of their own
     with a timeout, its uncommitted changes, and switching it to another branch or a new one, the changes
     stashed, brought along, committed or thrown away, and put back when git won't switch

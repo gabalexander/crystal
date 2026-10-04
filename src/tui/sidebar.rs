@@ -4,6 +4,11 @@
 //! worktree's agents come first; its terminals, the shells and other
 //! programs, come after a line of their own and are drawn quieter, with a
 //! prompt's chevron for a mark, so the two never look alike.
+//!
+//! What fits is said and the rest left out, at the default 28 columns and
+//! wider: an agent's model beside its name, a line its agent reported
+//! under it, a worktree's changes not committed and how far it is from its
+//! upstream on its line, and on a folded project's heading, what's in it.
 
 use super::app::{App, Hit, RAIL_WIDTH};
 use super::groups::{self, Row};
@@ -13,6 +18,8 @@ use super::theme::Theme;
 use super::ui::Look;
 use crate::flow_run::{FlowRun, RunState, StepState};
 use crate::forge::{PullRequest, PullRequestState};
+use crate::git::Stat;
+use crate::model;
 use crate::protocol::{self, Front, InProgress, SessionInfo, TaskState};
 use crate::shell;
 use ratatui::Frame;
@@ -66,9 +73,12 @@ pub fn draw(frame: &mut Frame, app: &App, look: &Look, area: Rect) {
     for (index, row) in shown {
         let y = area.y + (index - first) as u16;
         let line_area = Rect::new(area.x, y, area.width, 1);
-        // A session's task line goes with it, selected or not.
+        // A session's task line, and the line reported for it, go with
+        // it, selected or not.
         let is_selected = match row {
-            Row::Task(_) => index > 0 && selected == Some(index - 1),
+            Row::Task(owner) | Row::Line(owner) => {
+                selected.is_some_and(|at| rows[at] == Row::Session(*owner))
+            }
             _ => selected == Some(index),
         };
         if is_selected {
@@ -113,8 +123,9 @@ fn draw_empty_tab(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
 }
 
 /// The folded sidebar: a rail of the tab's sessions' marks, a row each,
-/// the selected one's standing out, and above them, over a short rule, a
-/// mark for each pinned session that needs the user, from every tab.
+/// and a folded project's, the selected one's standing out, and above them,
+/// over a short rule, a mark for each pinned session that needs the user,
+/// from every tab.
 fn draw_rail(frame: &mut Frame, app: &App, look: &Look, area: Rect) {
     let rows = app.rows();
     let on_rail = rail_rows(app);
@@ -136,6 +147,7 @@ fn draw_rail(frame: &mut Frame, app: &App, look: &Look, area: Rect) {
         }
         let (mark, color) = match &rows[at] {
             Row::Session(index) | Row::Pinned(index) => session_mark(&app.sessions()[*index], look),
+            Row::Project { path, .. } => folded_mark(app, path, look),
             _ => (" ", look.theme.muted),
         };
         let line = Line::from(vec![
@@ -147,7 +159,8 @@ fn draw_rail(frame: &mut Frame, app: &App, look: &Look, area: Rect) {
 }
 
 /// The rows the rail shows, by their places in [`App::rows`]: the pinned
-/// sessions, then `None` for the rule under them, then the tab's.
+/// sessions, then `None` for the rule under them, then the tab's, and the
+/// headings of folded projects among them.
 fn rail_rows(app: &App) -> Vec<Option<usize>> {
     let mut rail = Vec::new();
     let mut after_pinned = false;
@@ -157,7 +170,8 @@ fn rail_rows(app: &App) -> Vec<Option<usize>> {
                 after_pinned = true;
                 rail.push(Some(at));
             }
-            Row::Session(_) => {
+            Row::Project { path, .. } if !app.is_folded(path) => {}
+            Row::Session(_) | Row::Project { .. } => {
                 if std::mem::take(&mut after_pinned) {
                     rail.push(None);
                 }
@@ -203,10 +217,15 @@ pub fn hit(area: Rect, app: &App, row: u16) -> Hit {
 /// clicking both go by this, so a click lands on the row drawn there.
 fn offset(app: &App, height: u16) -> usize {
     let height = usize::from(height.max(1));
-    // The selected session's task line is kept in sight with it.
-    let last = selected_row(app).map(|row| match app.rows().get(row + 1) {
-        Some(Row::Task(_)) => row + 1,
-        _ => row,
+    // The selected session's task line, and the line reported for it, are
+    // kept in sight with it.
+    let rows = app.rows();
+    let last = selected_row(app).map(|row| {
+        let under = rows[row + 1..]
+            .iter()
+            .take_while(|under| matches!(under, Row::Task(_) | Row::Line(_)))
+            .count();
+        row + under
     });
     match last {
         Some(last) if last >= height => last + 1 - height,
@@ -216,12 +235,18 @@ fn offset(app: &App, height: u16) -> usize {
 
 /// The row the bar is on: the selected session's, or the worktree's with
 /// no sessions the selection is on, or, while `/`'s filter is open, the
-/// one its bar is on.
+/// one its bar is on; or the heading of the folded project the selection is
+/// in, out of sight.
 fn selected_row(app: &App) -> Option<usize> {
     if app.filter().is_some() {
         return app.filter_row();
     }
     let rows = app.rows();
+    if let Some(project) = app.folded_selection() {
+        return rows
+            .iter()
+            .position(|row| matches!(row, Row::Project { path, .. } if path == project));
+    }
     if let Some(worktree) = app.selected_empty_worktree() {
         let row = Row::NoSessions(worktree.path.clone());
         return rows.iter().position(|shown| *shown == row);
@@ -235,7 +260,11 @@ fn row_line<'a>(app: &'a App, row: &Row, look: &Look, width: u16, selected: bool
     let theme = look.theme;
     match row {
         Row::Project { name, path } => {
-            let mut line = heading(name, Style::new().fg(theme.text), look, width);
+            let mut line = if app.is_folded(path) {
+                folded_heading(app, name, path, look, width)
+            } else {
+                heading(name, Style::new().fg(theme.text), look, width)
+            };
             if let Some(open) = app.backlog_open(path) {
                 to_do_on_heading(&mut line, open, theme);
             }
@@ -289,6 +318,7 @@ fn row_line<'a>(app: &'a App, row: &Row, look: &Look, width: u16, selected: bool
         Row::Terminals => terminals_line(theme, width),
         Row::NoSessions(_) => no_sessions_line(theme, width, selected),
         Row::Task(index) => task_line(&app.sessions()[*index], theme, width),
+        Row::Line(index) => reported_line(&app.sessions()[*index], theme, width),
         Row::Flow(run) => flow_heading(&app.flows()[*run], look, width),
         Row::Step { run, step } => step_line(&app.flows()[*run], *step, None, look, width, false),
         Row::NeedsYou(count) => {
@@ -443,7 +473,7 @@ fn step_line<'a>(
     let room = usize::from(width).saturating_sub(SESSION_INDENT.len() + 2 + 1);
     let name = run.step_name(step);
     let when = session.map_or(String::new(), |session| changed_ago(session, look.now));
-    let (_, when) = fitting_extras(name.chars().count(), "", &when, room);
+    let (_, when) = fitting_extras(name.chars().count(), &[], &when, room);
     let name = fit(name, room);
     let gap = room.saturating_sub(name.chars().count() + when.chars().count());
     Line::from(vec![
@@ -545,12 +575,32 @@ fn task_line<'a>(session: &SessionInfo, theme: &Theme, width: u16) -> Line<'a> {
     ])
 }
 
+/// The line an agent or a script reported for a session, under its row
+/// and its task's: quieter than the task's, in italics.
+fn reported_line<'a>(session: &SessionInfo, theme: &Theme, width: u16) -> Line<'a> {
+    let Some(said) = &session.line else {
+        return Line::default();
+    };
+    // Under the session's name: its indent and mark.
+    let indent = format!("{SESSION_INDENT}  ");
+    let room = usize::from(width).saturating_sub(indent.len() + 1);
+    let style = Style::new().fg(theme.muted).add_modifier(Modifier::ITALIC);
+    Line::from(vec![
+        Span::raw(indent),
+        Span::styled(fit(said, room), style),
+    ])
+}
+
 /// A worktree's line: its mark and branch, then what git is in the middle
-/// of there, `· rebasing`, and on the right its pull request when its forge
-/// knows of one, `#57` (`!57` on GitLab) and a mark for what matters most
-/// about it, or `removing…` while git removes it. Short of room, the mark
-/// goes first, then the number, then what's said after the branch is cut,
-/// before the branch itself is. One Claude Code made for itself is named
+/// of there, `· rebasing`, and on the right what git counts there, `+3 ±42
+/// ↑2 ↓1` (files changed and not committed, the lines changed in them,
+/// commits ahead of its upstream and behind it), then its pull request when
+/// its forge knows of one, `#57` (`!57` on GitLab) and a mark for what
+/// matters most about it; or `removing…` while git removes it. Short of
+/// room, the lines go first, then the counts but the files, then the rest
+/// of the counts, then the pull request's mark, then its number, then
+/// what's said after the branch is cut, before the branch itself is. One
+/// Claude Code made for itself is named
 /// `claude`, then the subject of the commit it's at, which says what it
 /// holds where its branch's name doesn't, or its directory's name until
 /// git has said.
@@ -592,9 +642,14 @@ fn worktree_line<'a>(
         )]]
     } else {
         let pull_request = branch.and_then(|branch| app.pull_request(project, branch));
-        pull_request
+        let pull_request = pull_request
             .map(|pull_request| pull_request_spans(pull_request, theme))
-            .unwrap_or_default()
+            .unwrap_or_default();
+        let stat = app
+            .stat_of(path)
+            .map(|stat| stat_spans(stat, theme))
+            .unwrap_or_default();
+        right_forms(&stat, &pull_request)
     };
     let right = forms
         .into_iter()
@@ -625,6 +680,76 @@ fn worktree_line<'a>(
         line.extend(right);
     }
     Line::from(line)
+}
+
+/// What a worktree's line can say on the right, the most first: each form
+/// of the counts beside each of the pull request's, then the pull
+/// request's alone, then the counts' alone.
+fn right_forms<'a>(stat: &[Vec<Span<'a>>], pull_request: &[Vec<Span<'a>>]) -> Vec<Vec<Span<'a>>> {
+    let mut forms = Vec::new();
+    for pull_request in pull_request {
+        for stat in stat {
+            let mut both = stat.clone();
+            both.push(Span::raw(" "));
+            both.extend(pull_request.iter().cloned());
+            forms.push(both);
+        }
+        forms.push(pull_request.clone());
+    }
+    forms.extend(stat.iter().cloned());
+    forms
+}
+
+/// What a worktree's line can say of what git counted there, the most
+/// first: `+3 ±42 ↑2 ↓1`, then without the lines, then the files alone.
+/// Nothing for a worktree with nothing to say.
+fn stat_spans<'a>(stat: &Stat, theme: &Theme) -> Vec<Vec<Span<'a>>> {
+    let files = (stat.files > 0).then(|| {
+        let files = Span::styled(format!("+{}", stat.files), Style::new().fg(theme.waiting));
+        let changed = stat.added + stat.removed;
+        let lines = (changed > 0)
+            .then(|| Span::styled(format!("±{changed}"), Style::new().fg(theme.muted)));
+        (files, lines)
+    });
+    let mut apart = Vec::new();
+    if stat.ahead > 0 {
+        apart.push(Span::styled(
+            format!("↑{}", stat.ahead),
+            Style::new().fg(theme.added),
+        ));
+    }
+    if stat.behind > 0 {
+        apart.push(Span::styled(
+            format!("↓{}", stat.behind),
+            Style::new().fg(theme.removed),
+        ));
+    }
+    let spaced = |spans: Vec<Span<'a>>| {
+        let mut spaced = Vec::new();
+        for span in spans {
+            if !spaced.is_empty() {
+                spaced.push(Span::raw(" "));
+            }
+            spaced.push(span);
+        }
+        spaced
+    };
+    let mut forms: Vec<Vec<Span<'a>>> = Vec::new();
+    let mut add = |spans: Vec<Span<'a>>| {
+        let form = spaced(spans);
+        if !form.is_empty() && !forms.contains(&form) {
+            forms.push(form);
+        }
+    };
+    let (files, lines) = match files {
+        Some((files, lines)) => (Some(files), lines),
+        None => (None, None),
+    };
+    let all: Vec<Span> = files.iter().chain(&lines).chain(&apart).cloned().collect();
+    add(all);
+    add(files.iter().chain(&apart).cloned().collect());
+    add(files.into_iter().collect());
+    forms
 }
 
 /// What a worktree line can say on the right about its pull request, the
@@ -663,6 +788,74 @@ fn width_of(spans: &[Span]) -> usize {
     spans.iter().map(Span::width).sum()
 }
 
+/// A folded project's heading: its name, how many of the tab's sessions
+/// are in it, `(4)`, and for those that need a look, a mark and a count of
+/// each, `▲1 ◐2`: waiting, working, done, failed. Then the rule. What
+/// doesn't fit after the name is left out.
+fn folded_heading<'a>(app: &App, name: &str, project: &Path, look: &Look, width: u16) -> Line<'a> {
+    let theme = look.theme;
+    let width = usize::from(width).saturating_sub(MARGIN.len());
+    let name = fit(name, width);
+    let sessions = app.folded_sessions(project);
+    let mut extras = vec![(format!("({})", sessions.len()), theme.muted)];
+    for (status, count) in folded_counts(app, project) {
+        let mark = format!("{}{count}", status.mark(look.spin));
+        extras.push((mark, theme.status(status)));
+    }
+    let mut spans = vec![
+        Span::raw(MARGIN),
+        Span::styled(
+            name.clone(),
+            Style::new().fg(theme.text).add_modifier(Modifier::BOLD),
+        ),
+    ];
+    // A space before each, and before the rule, and one kept clear after.
+    let mut used = name.chars().count();
+    for (extra, color) in extras {
+        let extra_width = extra.chars().count();
+        if used + 1 + extra_width + 2 > width {
+            break;
+        }
+        used += 1 + extra_width;
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(extra, Style::new().fg(color)));
+    }
+    let rule = width.saturating_sub(used + 2);
+    spans.push(Span::raw(" "));
+    spans.push(Span::styled("─".repeat(rule), Style::new().fg(theme.rule)));
+    Line::from(spans)
+}
+
+/// How many of the tab's sessions in the folded project at `project` need a
+/// look, by their status, the most urgent first: waiting, working, done and
+/// failed, those there are.
+fn folded_counts(app: &App, project: &Path) -> Vec<(Status, usize)> {
+    let sessions = app.folded_sessions(project);
+    let statuses: Vec<Status> = sessions
+        .iter()
+        .map(|&index| Status::of(&app.sessions()[index]))
+        .collect();
+    [
+        Status::Waiting,
+        Status::Working,
+        Status::Done,
+        Status::Failed,
+    ]
+    .into_iter()
+    .map(|wanted| (wanted, statuses.iter().filter(|&&s| s == wanted).count()))
+    .filter(|&(_, count)| count > 0)
+    .collect()
+}
+
+/// A folded project's mark on the rail: that of the most urgent of its
+/// sessions that need a look, or a muted `+` for what's folded away.
+fn folded_mark(app: &App, project: &Path, look: &Look) -> (&'static str, Color) {
+    match folded_counts(app, project).first() {
+        Some(&(status, _)) => (status.mark(look.spin), look.theme.status(status)),
+        None => ("+", look.theme.muted),
+    }
+}
+
 /// A heading: the name in bold, then a thin rule nearly to the edge.
 fn heading<'a>(name: &str, style: Style, look: &Look, width: u16) -> Line<'a> {
     let width = usize::from(width).saturating_sub(MARGIN.len());
@@ -678,9 +871,9 @@ fn heading<'a>(name: &str, style: Style, look: &Look, width: u16) -> Line<'a> {
 }
 
 /// A session's row: its mark, its name, what's in front in it when the
-/// name doesn't say, and on the right how long ago it changed. Short of
-/// room, what's in front goes first, then the time, before the name is
-/// cut. The letters at `marked` in the name are those `/`'s filter matched.
+/// name doesn't say and the model its agent runs on, and on the right how
+/// long ago it changed. Short of room, what's in front goes first, then
+/// the model, then the time, before the name is cut. The letters at `marked` in the name are those `/`'s filter matched.
 /// `tab` is the tab it's in when it's shown from one other than the tab in
 /// front, by `/`'s filter or pinned as needing the user: its name takes
 /// the place of how long ago the session changed, so the user knows that
@@ -715,8 +908,8 @@ fn session_line<'a>(
     if session.bell {
         when = format!("{BELL_MARK} {when}").trim_end().to_string();
     }
-    let label = extras_label(session);
-    let (label, when) = fitting_extras(session.name.chars().count(), &label, &when, room);
+    let labels = extras_labels(session);
+    let (label, when) = fitting_extras(session.name.chars().count(), &labels, &when, room);
 
     let mut spans = vec![
         Span::raw(indent),
@@ -784,24 +977,38 @@ fn front_label(session: &SessionInfo) -> Option<&str> {
     if named { None } else { Some(word) }
 }
 
-/// What a row says of the session beside its name: what's in front, as
-/// [`front_label`] has it, and `+2` after it while its agent has two
-/// subagents running.
-fn extras_label(session: &SessionInfo) -> String {
-    let front = front_label(session).unwrap_or_default();
-    match session.subagents {
-        0 => front.to_string(),
-        count if front.is_empty() => format!("+{count}"),
-        count => format!("{front} +{count}"),
+/// What a row can say of the session beside its name, the most first:
+/// what's in front, as [`front_label`] has it, then the model its agent
+/// runs on, `claude opus 5.5`; the model alone; what's in front alone. Each
+/// with `+2` after it while its agent has two subagents running.
+fn extras_labels(session: &SessionInfo) -> Vec<String> {
+    let front = front_label(session);
+    let model = session.model.as_deref().map(model::short);
+    let subagents = (session.subagents > 0).then(|| format!("+{}", session.subagents));
+    let said = |parts: &[Option<&str>]| {
+        let parts: Vec<&str> = parts.iter().flatten().copied().collect();
+        parts.join(" ")
+    };
+    let (model, subagents) = (model.as_deref(), subagents.as_deref());
+    let mut labels: Vec<String> = Vec::new();
+    for label in [
+        said(&[front, model, subagents]),
+        said(&[model, subagents]),
+        said(&[front, subagents]),
+    ] {
+        if !label.is_empty() && !labels.contains(&label) {
+            labels.push(label);
+        }
     }
+    labels
 }
 
 /// Which of a row's extras fit beside a name `name_width` wide in `room`
-/// columns, a space before each: what's in front and the time, the time
-/// alone, or neither.
+/// columns, a space before each: the first of `labels` that fits with the
+/// time, the time alone, or neither.
 fn fitting_extras<'b>(
     name_width: usize,
-    label: &'b str,
+    labels: &'b [String],
     when: &'b str,
     room: usize,
 ) -> (&'b str, &'b str) {
@@ -812,12 +1019,13 @@ fn fitting_extras<'b>(
             1 + text.chars().count()
         }
     };
-    if name_width + width(label) + width(when) <= room {
-        (label, when)
-    } else if name_width + width(when) <= room {
-        ("", when)
-    } else {
-        ("", "")
+    let label = labels
+        .iter()
+        .find(|label| name_width + width(label) + width(when) <= room);
+    match label {
+        Some(label) => (label, when),
+        None if name_width + width(when) <= room => ("", when),
+        None => ("", ""),
     }
 }
 
@@ -947,6 +1155,8 @@ mod tests {
             asking: None,
             reporter: None,
             subagents: 0,
+            model: None,
+            line: None,
             bell: false,
         }
     }
@@ -1179,9 +1389,132 @@ mod tests {
     #[test]
     fn short_of_room_what_s_in_front_goes_before_the_time() {
         // "refund-fix" is 10 wide; " claude" 7 and " 12m" 4 more.
-        assert_eq!(fitting_extras(10, "claude", "12m", 21), ("claude", "12m"));
-        assert_eq!(fitting_extras(10, "claude", "12m", 20), ("", "12m"));
-        assert_eq!(fitting_extras(10, "claude", "12m", 13), ("", ""));
+        let claude = ["claude".to_string()];
+        assert_eq!(fitting_extras(10, &claude, "12m", 21), ("claude", "12m"));
+        assert_eq!(fitting_extras(10, &claude, "12m", 20), ("", "12m"));
+        assert_eq!(fitting_extras(10, &claude, "12m", 13), ("", ""));
+    }
+
+    #[test]
+    fn an_agent_s_model_shows_beside_its_name_as_room_allows() {
+        let theme = Theme::new(crate::config::ThemeName::DARK, false);
+        let look = Look {
+            theme: &theme,
+            now: 720,
+            spin: 0,
+        };
+        let mut fixer = session("fixer", claude());
+        fixer.changed = 1;
+        fixer.model = Some("claude-opus-5-5".into());
+        fixer.subagents = 2;
+        let row = |session: &SessionInfo, width| {
+            let line = session_line(session, &[], None, SESSION_INDENT, &look, width, false);
+            line.to_string()
+        };
+        assert_eq!(row(&fixer, 40), "     ▸ fixer claude opus 5.5 +2     11m");
+        // Short of room, what's in front goes, then the model.
+        assert_eq!(row(&fixer, 30), "     ▸ fixer opus 5.5 +2  11m");
+        assert_eq!(row(&fixer, 27), "     ▸ fixer claude +2 11m");
+        assert_eq!(row(&fixer, 20), "     ▸ fixer    11m");
+        // Named after its agent, the row needn't say it twice.
+        fixer.name = "claude-2".into();
+        fixer.subagents = 0;
+        assert_eq!(row(&fixer, 29), "     ▸ claude-2 opus 5.5 11m");
+    }
+
+    #[test]
+    fn a_folded_project_s_heading_counts_what_s_in_it() {
+        use crate::protocol::{Activity, Worktree};
+        let theme = Theme::new(crate::config::ThemeName::DARK, false);
+        let look = Look {
+            theme: &theme,
+            now: 0,
+            spin: 0,
+        };
+        let project = Path::new("/code/app");
+        let in_app = |name: &str, activity| SessionInfo {
+            activity,
+            worktree: Some(Worktree {
+                project: "app".into(),
+                project_path: project.into(),
+                path: project.into(),
+                main: true,
+                branch: Some("main".into()),
+                in_progress: None,
+            }),
+            ..session(name, claude())
+        };
+        let mut app = App::new(None);
+        app.set_sessions(vec![
+            in_app("asker", Some(Activity::Waiting)),
+            in_app("idler", Some(Activity::Idle)),
+        ]);
+        app.set_folded_projects([project.to_path_buf()].into());
+        // Under the one pinned as needing you, the project is its heading
+        // alone, with the bar: the selection is in it.
+        let rows = app.rows();
+        assert!(matches!(
+            rows[..],
+            [Row::NeedsYou(1), Row::Pinned(_), Row::Project { .. }]
+        ));
+        assert_eq!(selected_row(&app), Some(2));
+        let line = folded_heading(&app, "app", project, &look, 28);
+        assert_eq!(line.width(), 27);
+        assert!(line.to_string().starts_with(" app (2) ▲1 ───"), "{line}");
+        // Short of room, the counts go before the name is cut.
+        let line = folded_heading(&app, "app", project, &look, 10);
+        assert_eq!(line.to_string().trim_end(), " app (2)");
+        // On the rail, it has the mark of the most urgent of them.
+        assert_eq!(rail_rows(&app), [Some(1), None, Some(2)]);
+        assert_eq!(folded_mark(&app, project, &look), ("▲", theme.waiting));
+    }
+
+    #[test]
+    fn a_line_reported_for_a_session_goes_under_it_cut_to_fit() {
+        let theme = Theme::new(crate::config::ThemeName::DARK, false);
+        let mut indexer = session("indexer", claude());
+        indexer.line = Some("indexing the repository, 40% done".into());
+        let line = reported_line(&indexer, &theme, 28);
+        assert_eq!(line.to_string(), "       indexing the reposi…");
+        assert!(line.spans[1].style.add_modifier.contains(Modifier::ITALIC));
+    }
+
+    #[test]
+    fn a_worktree_s_counts_go_on_its_line_as_room_allows() {
+        let theme = Theme::new(crate::config::ThemeName::DARK, false);
+        let mut app = App::new(None);
+        let project = Path::new("/code/app");
+        let path = Path::new("/code/app.worktrees/fix");
+        let stat = Stat {
+            files: 3,
+            added: 30,
+            removed: 12,
+            ahead: 2,
+            behind: 1,
+        };
+        app.set_stat(path.to_path_buf(), Some(stat));
+        let line = |app: &App, width| {
+            let line = worktree_line(app, project, path, Some("fix"), false, None, &theme, width);
+            line.to_string().trim_end().to_string()
+        };
+        assert_eq!(line(&app, 28), "   ⎇ fix       +3 ±42 ↑2 ↓1");
+        // Short of room, the lines go, then the distance from upstream.
+        assert_eq!(line(&app, 21), "   ⎇ fix    +3 ↑2 ↓1");
+        assert_eq!(line(&app, 16), "   ⎇ fix     +3");
+        assert_eq!(line(&app, 10), "   ⎇ fix");
+        // Clean and level with its upstream, it says nothing.
+        app.set_stat(path.to_path_buf(), Some(Stat::default()));
+        assert_eq!(line(&app, 28), "   ⎇ fix");
+        let ahead = Stat {
+            ahead: 4,
+            ..Stat::default()
+        };
+        app.set_stat(path.to_path_buf(), Some(ahead));
+        assert_eq!(line(&app, 28), "   ⎇ fix                 ↑4");
+        let added = |spans: &[Span]| spans.iter().any(|span| span.style.fg == Some(theme.added));
+        assert!(added(
+            &worktree_line(&app, project, path, Some("fix"), false, None, &theme, 28).spans
+        ));
     }
 
     #[test]

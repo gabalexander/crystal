@@ -58,6 +58,9 @@ pub enum Request {
         /// The subagent a subagent's event is about.
         #[serde(default)]
         subagent: Option<Subagent>,
+        /// The model the agent runs on, when its hooks say.
+        #[serde(default)]
+        model: Option<String>,
     },
     /// What an agent says about itself with `crystal report`. A program in
     /// a session says which by its `id`; from outside, it's the session's
@@ -68,6 +71,16 @@ pub enum Request {
         #[serde(default)]
         name: Option<String>,
         report: AgentReport,
+    },
+    /// What an agent or a script puts on its session's row with `crystal
+    /// report --line` or `--model`, for the sidebar alone: it doesn't take
+    /// the session's status over. Said the way [`Request::ReportAgent`] is.
+    ReportMetadata {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(default)]
+        name: Option<String>,
+        metadata: Metadata,
     },
     /// Tell the user `text` with a notification, the way the daemon tells
     /// them a session needs them: about the session with `id`, or else
@@ -630,6 +643,15 @@ pub struct SessionInfo {
     /// How many subagents its agent has running, as its hooks say.
     #[serde(default)]
     pub subagents: u32,
+    /// The model its agent runs on, as it said with `crystal report
+    /// --model`, or else as its command, its hooks or its transcript have
+    /// it, following a switch like Claude Code's `/model`.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// The line an agent or a script put on its row with `crystal report
+    /// --line`, until it's taken off or its time is up.
+    #[serde(default)]
+    pub line: Option<String>,
     /// Its program rang the terminal's bell while nobody was watching, and
     /// nobody has looked at it since.
     #[serde(default)]
@@ -716,6 +738,29 @@ pub enum AgentReport {
     /// It lets go of the session: crystal reads what the session does for
     /// itself again, and forgets the agent's name and command.
     Release,
+}
+
+/// What `crystal report --line` and `--model` put on a session's row.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Metadata {
+    /// A short line under its row; empty takes it off.
+    #[serde(default)]
+    pub line: Option<String>,
+    /// The model its agent runs on, in place of what crystal reads;
+    /// empty gives that back.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// How long what this says stays, in seconds, unless it's said again:
+    /// until it's replaced, with none.
+    #[serde(default)]
+    pub ttl_secs: Option<u64>,
+    /// Who says it, for `seq`.
+    #[serde(default)]
+    pub source: Option<String>,
+    /// The report's number from `source`: one numbered no higher than the
+    /// last that source sent came late, and is passed over.
+    #[serde(default)]
+    pub seq: Option<u64>,
 }
 
 /// A permission a background task's Claude asks for: the tool, and what

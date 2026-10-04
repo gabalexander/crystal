@@ -71,6 +71,7 @@ fn report(socket: &Path, agent: &str, installed: bool) -> Result<()> {
         agent: Some(agent.to_string()),
         cwd: agents::hook_cwd(&input),
         subagent: agents::subagent(&input).filter(|_| about_subagent),
+        model: agents::hook_model(&input),
     };
     // Codex's Stop hook takes the same answer as Claude Code's.
     if let Some(Response::Remind { text }) = client::ask(socket, &report, false)? {

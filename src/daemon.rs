@@ -667,6 +667,7 @@ impl Daemon {
                 session.find_conversation(&claimed, &looking);
                 session.check_front();
                 session.check();
+                session.check_model();
                 self.tell_changes(session);
                 for closed in session.take_closed() {
                     self.write_down_closed(session, &closed);
@@ -1816,6 +1817,7 @@ impl Daemon {
                 agent,
                 cwd,
                 subagent,
+                model,
             } => {
                 let agent = agent.unwrap_or_else(|| "claude".to_string());
                 let mut sessions = self.sessions.lock().unwrap();
@@ -1852,6 +1854,12 @@ impl Daemon {
                 if let Some(conversation) = conversation {
                     session.set_hooked_conversation(&agent, conversation);
                 }
+                if let Some(model) = model {
+                    session.heard_model(&model);
+                }
+                // A conversation just named is looked at now: what's
+                // written to it from here on is news.
+                session.check_model();
                 // Reminded that its task is open, the agent carries on: its
                 // turn hasn't ended, and it isn't done.
                 if event == AgentEvent::TurnEnded
@@ -1895,6 +1903,17 @@ impl Daemon {
                 ensure!(session.is_running(), "{} has ended", session.name);
                 session.take_report(report)?;
                 self.tell_changes(session);
+                Ok(Response::Done)
+            }
+            Request::ReportMetadata { id, name, metadata } => {
+                let mut sessions = self.sessions.lock().unwrap();
+                let session = match (id, name) {
+                    (Some(id), _) => with_id(&mut sessions, &id)?,
+                    (None, Some(name)) => named(&mut sessions, &name)?,
+                    (None, None) => bail!("say which session the report is about"),
+                };
+                ensure!(session.is_running(), "{} has ended", session.name);
+                session.take_metadata(&metadata)?;
                 Ok(Response::Done)
             }
             Request::Kill { name } => {

@@ -48,6 +48,8 @@ pub const DIFF: &str = "diff";
 pub const SEEN: &str = "seen";
 /// How wide the sidebar was left.
 pub const SIDEBAR: &str = "sidebar";
+/// The projects folded in the sidebar, by their main worktrees.
+pub const FOLDED: &str = "folded";
 /// When the TUI last looked for a newer crystal.
 pub const UPDATE: &str = "update";
 

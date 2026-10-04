@@ -41,6 +41,7 @@ use super::timeline;
 use super::tree_browser;
 use crate::config::BarPosition;
 use crate::flow_run::RunState;
+use crate::model;
 use crate::protocol::{SessionInfo, State, TaskState};
 use crate::shell;
 use ratatui::Frame;
@@ -1203,7 +1204,8 @@ pub fn pane_header<'a>(
 }
 
 /// What can go on the right of a pane's header, longest first: where the
-/// session runs and its command, then only where it runs.
+/// session runs, the model its agent runs on and its command; then without
+/// the command; then without the model; then only where it runs.
 fn right_sides(session: &SessionInfo) -> Vec<String> {
     let command: Vec<String> = session
         .command
@@ -1220,7 +1222,15 @@ fn right_sides(session: &SessionInfo) -> Vec<String> {
         }
         None => shell::home_relative(&session.cwd),
     };
-    vec![format!("{place} · {command}"), place]
+    match session.model.as_deref().map(model::short) {
+        Some(model) => vec![
+            format!("{place} · {model} · {command}"),
+            format!("{place} · {model}"),
+            format!("{place} · {command}"),
+            place,
+        ],
+        None => vec![format!("{place} · {command}"), place],
+    }
 }
 
 /// One line of text across the middle of `area`.
@@ -1964,6 +1974,8 @@ mod tests {
             asking: None,
             reporter: None,
             subagents: 0,
+            model: None,
+            line: None,
             bell: false,
         }
     }
@@ -2632,6 +2644,19 @@ mod tests {
         let narrow = header(18);
         assert!(narrow.starts_with(" ▸ planner ─"), "{narrow}");
         assert!(!narrow.contains("app"), "{narrow}");
+    }
+
+    #[test]
+    fn a_pane_header_names_its_agent_s_model_before_its_command() {
+        let theme = theme();
+        let look = look(&theme);
+        let mut session = agent(in_worktree("planner", "main", true));
+        session.model = Some("claude-opus-5-5".into());
+        let header = |width| text_of(&pane_header(&session, &[], false, &look, width));
+        let wide = header(60);
+        assert!(wide.contains("app ⌂ main · opus 5.5 · sh"), "{wide}");
+        let middling = header(40);
+        assert!(middling.contains("app ⌂ main · opus 5.5 "), "{middling}");
     }
 
     #[test]

@@ -92,7 +92,7 @@ use layouts::{Layouts, Which};
 use pane::Pane;
 use ratatui::DefaultTerminal;
 use ratatui::layout::Rect;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -137,6 +137,11 @@ const GREP_PAUSE: Duration = Duration::from_millis(150);
 /// made or removed a worktree.
 const WORKTREES_EVERY: Duration = Duration::from_secs(5);
 
+/// How often git counts what each worktree the sidebar shows has changed,
+/// when nothing says it has: a worktree is counted again straight away
+/// once a session in it changes.
+const STATS_EVERY: Duration = Duration::from_secs(10);
+
 /// How often the thread following the event log for the timeline looks up
 /// from waiting, to see whether the timeline is still open.
 const FOLLOW_CHECK: Duration = Duration::from_millis(250);
@@ -175,6 +180,12 @@ pub enum Event {
     PullRequests {
         project: PathBuf,
         found: Result<(Forge, Vec<PullRequest>), String>,
+    },
+    /// What git counted of the worktree at `path`, or `None` when it
+    /// couldn't say.
+    Stat {
+        path: PathBuf,
+        stat: Option<git::Stat>,
     },
     /// The linked worktrees of a project, as git listed them, and for
     /// those Claude Code made for itself, the subject of the commit each
@@ -378,6 +389,9 @@ pub fn run(socket: &Path) -> Result<()> {
         list_worktrees_now.clone(),
         sender.clone(),
     );
+    let stat_worktrees = Arc::new(Mutex::new(Vec::new()));
+    let stats_now = Arc::new(Mutex::new(HashSet::new()));
+    spawn_stat_counter(stat_worktrees.clone(), stats_now.clone(), sender.clone());
 
     // Losing the tabs is no reason not to start: without the database, the
     // TUI starts with one tab, and says why when asked for a layout.
@@ -393,6 +407,8 @@ pub fn run(socket: &Path) -> Result<()> {
         projects,
         worktree_projects,
         list_worktrees_now,
+        stat_worktrees,
+        stats_now,
         theme: Theme::from_config(&config, appearance),
         appearance,
         follow_appearance,
@@ -407,6 +423,7 @@ pub fn run(socket: &Path) -> Result<()> {
         edge: None,
         kept_tabs: tabs::Tabs::default(),
         kept_sidebar: app::Shape::default(),
+        kept_folded: BTreeSet::new(),
         quitting: false,
         overlay: None,
         count_backlog,
@@ -433,6 +450,11 @@ pub fn run(socket: &Path) -> Result<()> {
         .and_then(|json| serde_json::from_str(&json).ok());
     tui.app.set_sidebar(sidebar, config.sidebar.folded);
     tui.kept_sidebar = tui.app.sidebar_shape();
+    let folded = tui
+        .ui(db::FOLDED)
+        .and_then(|json| serde_json::from_str(&json).ok());
+    tui.app.set_folded_projects(folded.unwrap_or_default());
+    tui.kept_folded = tui.app.folded_projects().clone();
     tui.app
         .set_memory(launcher::read_memory(tui.ui(db::LAUNCHER).as_deref()));
     tui.app.set_diff_tree(tui.review().tree);
@@ -569,6 +591,11 @@ struct Tui {
     /// Set when crystal has just made or removed a worktree, for that
     /// thread to ask git again straight away.
     list_worktrees_now: Arc<AtomicBool>,
+    /// The worktrees the sidebar shows, for the thread that counts what
+    /// each has changed.
+    stat_worktrees: Arc<Mutex<Vec<PathBuf>>>,
+    /// The worktrees for that thread to count again straight away.
+    stats_now: Arc<Mutex<HashSet<PathBuf>>>,
     theme: Theme,
     /// The system's appearance, light or dark, as it was last told, which
     /// the theme follows when the settings say: see [`appearance`].
@@ -593,6 +620,8 @@ struct Tui {
     kept_tabs: tabs::Tabs,
     /// The sidebar's shape as it was last written down.
     kept_sidebar: app::Shape,
+    /// The projects folded in the sidebar, as they were last written down.
+    kept_folded: BTreeSet<PathBuf>,
     /// How many searches find in files has asked for: a search that isn't
     /// the last one asked for stops.
     searches: Arc<AtomicU64>,
@@ -651,6 +680,7 @@ impl Tui {
             changed |= self.scroll_at_edge();
             self.read_topic();
             self.keep_tabs();
+            self.count_worktrees();
         }
         self.keep_seen();
         Ok(())
@@ -900,6 +930,29 @@ impl Tui {
             let _ = db.keep_ui(db::SIDEBAR, &sidebar);
         }
         self.kept_sidebar = sidebar;
+        // And the projects folded in it.
+        let folded = self.app.folded_projects();
+        if *folded != self.kept_folded {
+            if let Ok(db) = &self.db {
+                let _ = db.keep_ui(db::FOLDED, folded);
+            }
+            self.kept_folded = folded.clone();
+        }
+    }
+
+    /// Tells the thread that counts what worktrees have changed which the
+    /// sidebar shows now, and which to count again straight away.
+    fn count_worktrees(&mut self) {
+        let shown = self.app.shown_worktrees();
+        let mut wanted = self.stat_worktrees.lock().unwrap();
+        if *wanted != shown {
+            *wanted = shown;
+        }
+        drop(wanted);
+        let due = self.app.take_stats_due();
+        if !due.is_empty() {
+            self.stats_now.lock().unwrap().extend(due);
+        }
     }
 
     /// The document called `name` the TUI keeps, when there's one to read.
@@ -1081,6 +1134,7 @@ impl Tui {
                 self.app.set_subjects(&project, subjects);
                 self.app.set_worktrees(project, worktrees);
             }
+            Event::Stat { path, stat } => self.app.set_stat(path, stat),
             Event::WorktreeRemoved { path, removed } => self.worktree_removed(&path, removed),
             Event::WorktreeHasChanges { path, branch } => {
                 self.app.ask_to_force_removal(path, branch);
@@ -2941,6 +2995,39 @@ fn spawn_worktree_lister(
                 }
             }
             thread::sleep(Duration::from_millis(100));
+        }
+    });
+}
+
+/// Counts what git says of each worktree the sidebar shows, on a thread of
+/// its own: one as soon as it's shown, again straight away once it's asked
+/// for in `now`, and every [`STATS_EVERY`] meanwhile.
+fn spawn_stat_counter(
+    worktrees: Arc<Mutex<Vec<PathBuf>>>,
+    now: Arc<Mutex<HashSet<PathBuf>>>,
+    events: Sender<Event>,
+) {
+    thread::spawn(move || {
+        let mut counted: HashMap<PathBuf, Instant> = HashMap::new();
+        loop {
+            let wanted = worktrees.lock().unwrap().clone();
+            let due_now = std::mem::take(&mut *now.lock().unwrap());
+            counted.retain(|path, _| wanted.contains(path));
+            for path in wanted {
+                let due = due_now.contains(&path)
+                    || counted
+                        .get(&path)
+                        .is_none_or(|at| at.elapsed() >= STATS_EVERY);
+                if !due {
+                    continue;
+                }
+                counted.insert(path.clone(), Instant::now());
+                let stat = git::stat(&path).ok();
+                if events.send(Event::Stat { path, stat }).is_err() {
+                    return;
+                }
+            }
+            thread::sleep(Duration::from_millis(200));
         }
     });
 }
