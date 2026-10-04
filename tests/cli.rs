@@ -10748,7 +10748,9 @@ command = ["sh", "hook.sh"]
     crystal.ok(&["plugin", "enable", "listener"]);
     crystal.ok(&["backlog", "add", "Retry", "the", "webhook"]);
     let heard = dir.join("heard");
-    eventually("the plugin hears of it", || heard.exists());
+    // The hook writes the event's name before its JSON: wait for the whole.
+    let whole = || std::fs::read_to_string(&heard).is_ok_and(|text| text.trim_end().ends_with('}'));
+    eventually("the plugin hears of it", whole);
     let heard = std::fs::read_to_string(&heard).unwrap();
     let json = heard
         .strip_prefix("backlog.added ")
