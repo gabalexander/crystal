@@ -1,0 +1,41 @@
+# The rules for an agent that has no file of its own: what most agents
+# draw while they wait on the user or work on a turn, in the last rows they
+# drew, and a spinner at the start of the title.
+id = "default"
+name = "Any other agent"
+
+[[rules]]
+id = "question"
+looks = "waiting"
+priority = 300
+region = "last_rows(15)"
+any = [
+  { contains = ["do you want to proceed?"] },
+  { contains = ["waiting for permission"] },
+  { contains = ["would you like to run the following command?"] },
+  { contains = ["would you like to make the following edits?"] },
+  { contains = ["press enter to confirm or esc to cancel"] },
+  { contains = ["allow command?"] },
+]
+
+[[rules]]
+id = "title_asks"
+looks = "waiting"
+priority = 300
+region = "title"
+contains = ["Action Required"]
+
+[[rules]]
+id = "interrupt_hint"
+looks = "working"
+priority = 200
+region = "last_rows(15)"
+contains = ["esc to interrupt"]
+
+[[rules]]
+id = "title_spinner"
+looks = "working"
+priority = 200
+region = "title"
+# A braille pattern, or a circle a quarter of which is filled in.
+regex = ['^[\x{2800}-\x{28FF}\x{25D0}-\x{25D3}]']

@@ -7,8 +7,10 @@
 use crate::flows::Flow;
 use crate::plugins;
 use crate::profile::Profile;
+use crate::tui::keymap::{Binding, Keymap};
 use crate::vt;
 use anyhow::{Context, Result, bail};
+use ratatui::style::Color;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -44,6 +46,9 @@ pub struct Config {
     /// daemon, and again in each pane showing the session. A session keeps
     /// what the settings said as it started; a pane, as it opened.
     pub scrollback_lines: usize,
+    /// Colors of the user's own, over the theme's: `[colors]` in the file.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub colors: BTreeMap<ColorToken, ColorValue>,
     /// Which plugins are on and off, by name: crystal's own, which are on
     /// unless switched off here, and ones the user installed, which are off
     /// until switched on. See [`crate::plugins`].
@@ -51,6 +56,9 @@ pub struct Config {
     pub plugins: BTreeMap<String, bool>,
     /// When to tell: `[notifications]` in the file.
     pub notifications: NotifySettings,
+    /// The sounds played when a session needs the user: `[sound]` in the
+    /// file. See [`crate::sound`].
+    pub sound: SoundSettings,
     /// How the memory plugin learns: `[memory]` in the file.
     pub memory: MemorySettings,
     /// What background tasks may spend: `[tasks]` in the file.
@@ -64,6 +72,9 @@ pub struct Config {
     /// What crystal does with sessions left alone: `[sessions]` in the
     /// file.
     pub sessions: SessionSettings,
+    /// Whether the TUI says when a newer crystal is out: `[update]` in the
+    /// file.
+    pub update: UpdateSettings,
     /// Saved ways to start an agent, offered first in the new-session
     /// panel: `[[profile]]` tables in the file. See [`crate::profile`].
     #[serde(rename = "profile", skip_serializing_if = "Vec::is_empty")]
@@ -77,6 +88,12 @@ pub struct Config {
     /// `[[project]]` tables in the file. See [`crate::project_commands`].
     #[serde(rename = "project", skip_serializing_if = "Vec::is_empty")]
     pub projects: Vec<ProjectSettings>,
+    /// The TUI's keys, by command, and its prefix: `[keys]` in the file.
+    /// See [`crate::tui::keymap`].
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub keys: BTreeMap<String, Binding>,
+    /// How the TUI's sidebar is laid out: `[sidebar]` in the file.
+    pub sidebar: SidebarSettings,
 }
 
 /// One project's commands, which take the place of those in its own
@@ -107,6 +124,80 @@ pub struct NotifySettings {
     /// Tell only while no crystal TUI's terminal has the focus: the user
     /// looking at crystal sees what needs them in its sidebar.
     pub unfocused_only: bool,
+}
+
+/// How the TUI's sidebar is laid out.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SidebarSettings {
+    /// How many columns wide it is until it's resized, with the mouse on
+    /// its edge or with `{` and `}`; the TUI keeps a width it was resized
+    /// to.
+    pub width: u16,
+    /// Whether it starts folded, until `\` unfolds it.
+    pub folded: bool,
+    /// What it keeps while it's folded.
+    pub fold: Fold,
+    /// The sessions that need the user, from every tab, in a group of their
+    /// own at its top.
+    pub needs_you: bool,
+}
+
+/// The narrowest and widest the sidebar can be, unfolded.
+pub const SIDEBAR_WIDTHS: std::ops::RangeInclusive<u16> = 16..=80;
+
+impl Default for SidebarSettings {
+    fn default() -> SidebarSettings {
+        SidebarSettings {
+            width: 28,
+            folded: false,
+            fold: Fold::Marks,
+            needs_you: true,
+        }
+    }
+}
+
+/// What a folded sidebar keeps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Fold {
+    /// A narrow rail: each session's mark, so what needs the user still
+    /// shows.
+    Marks,
+    /// Nothing: the panes take every column.
+    Hidden,
+}
+
+/// The sounds played when a session needs the user, at the same moments
+/// a notification tells them: see [`crate::sound`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SoundSettings {
+    pub enabled: bool,
+    /// A sound file of the user's own for an agent that's done with a
+    /// turn nobody watched, in place of crystal's: a path relative to the
+    /// config file's directory, or `~/` for the home directory.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub done: Option<PathBuf>,
+    /// The same for an agent that comes to ask the user something.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request: Option<PathBuf>,
+    /// Agents switched on or off by their program's name, like `codex =
+    /// false`, for one that plays its own sounds. An agent left out
+    /// follows `enabled`.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub agents: BTreeMap<String, bool>,
+}
+
+impl Default for SoundSettings {
+    fn default() -> SoundSettings {
+        SoundSettings {
+            enabled: true,
+            done: None,
+            request: None,
+            agents: BTreeMap::new(),
+        }
+    }
 }
 
 /// How the memory plugin learns, beyond what it's told.
@@ -193,6 +284,20 @@ pub struct WorktreeSettings {
     pub base: Option<String>,
 }
 
+/// Whether the TUI says when a newer crystal is out: see [`crate::update`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct UpdateSettings {
+    /// Once a day, as the TUI opens, look for a newer release.
+    pub check: bool,
+}
+
+impl Default for UpdateSettings {
+    fn default() -> UpdateSettings {
+        UpdateSettings { check: true }
+    }
+}
+
 /// What crystal does with sessions left alone.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -241,16 +346,74 @@ pub fn duration(text: &str) -> Result<Option<Duration>> {
     Ok((seconds > 0).then(|| Duration::from_secs(seconds)))
 }
 
-/// The TUI's colors to choose from. `dark` and `light` paint their own
-/// background, so they look the same in any terminal; `terminal` paints
-/// nothing and keeps to the terminal's own colors.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ThemeName {
-    Dark,
-    Light,
-    Terminal,
+/// One of the TUI's themes, by the name the config file gives it: crystal's
+/// own `dark`, `light` and `terminal`, or a well-known scheme like
+/// `catppuccin`. The themes, and the other names each is known by, are
+/// [`crate::tui::theme::THEMES`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(into = "String")]
+pub struct ThemeName(&'static str);
+
+/// What a color in `[colors]` paints: one of the theme's own names for
+/// what its colors are for. See [`crate::tui::theme::Theme`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ColorToken {
+    Background,
+    Text,
+    Muted,
+    Accent,
+    Rule,
+    Branch,
+    Selection,
+    Panel,
+    Waiting,
+    Working,
+    Done,
+    Running,
+    Ended,
+    Failed,
+    Added,
+    Removed,
+    AddedLine,
+    RemovedLine,
+    AddedWords,
+    RemovedWords,
+    CopySelection,
+    Found,
+    FoundCurrent,
+    Keyword,
+    String,
+    Number,
+    CodeBlock,
 }
+
+/// A color as the config file says it: `"#rrggbb"`, `"#rgb"`, one of the
+/// terminal's sixteen by name (`"red"`, `"bright-blue"`), a number from
+/// its 256, or `"reset"` for the terminal's own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct ColorValue(pub Color);
+
+/// The terminal's sixteen colors, by the names `[colors]` takes.
+const NAMED_COLORS: [(&str, Color); 16] = [
+    ("black", Color::Black),
+    ("red", Color::Red),
+    ("green", Color::Green),
+    ("yellow", Color::Yellow),
+    ("blue", Color::Blue),
+    ("magenta", Color::Magenta),
+    ("cyan", Color::Cyan),
+    ("white", Color::Gray),
+    ("bright-black", Color::DarkGray),
+    ("bright-red", Color::LightRed),
+    ("bright-green", Color::LightGreen),
+    ("bright-yellow", Color::LightYellow),
+    ("bright-blue", Color::LightBlue),
+    ("bright-magenta", Color::LightMagenta),
+    ("bright-cyan", Color::LightCyan),
+    ("bright-white", Color::White),
+];
 
 impl Default for Config {
     fn default() -> Config {
@@ -260,19 +423,24 @@ impl Default for Config {
             new_session: "claude".to_string(),
             name_from_prompt: true,
             resume_reported_agents: true,
-            theme: ThemeName::Dark,
+            theme: ThemeName::DARK,
+            colors: BTreeMap::new(),
             scrollback_lines: vt::DEFAULT_HISTORY_LINES,
             plugins: BTreeMap::new(),
             notifications: NotifySettings::default(),
+            sound: SoundSettings::default(),
             memory: MemorySettings::default(),
             tasks: TaskSettings::default(),
             events: EventSettings::default(),
             handoff: HandoffSettings::default(),
             worktrees: WorktreeSettings::default(),
             sessions: SessionSettings::default(),
+            update: UpdateSettings::default(),
             profiles: Vec::new(),
             flows: Vec::new(),
             projects: Vec::new(),
+            keys: BTreeMap::new(),
+            sidebar: SidebarSettings::default(),
         }
     }
 }
@@ -351,21 +519,149 @@ pub fn set(path: &Path, keys: &[&str], value: toml_edit::Value) -> Result<()> {
 }
 
 impl ThemeName {
-    pub const ALL: [ThemeName; 3] = [ThemeName::Dark, ThemeName::Light, ThemeName::Terminal];
+    pub const DARK: ThemeName = ThemeName("dark");
+    pub const LIGHT: ThemeName = ThemeName("light");
+    pub const TERMINAL: ThemeName = ThemeName("terminal");
+
+    /// The theme `text` names, by its name or another it's known by, in
+    /// any case and with spaces or underscores for dashes:
+    /// `"Tokyo Night"` is `tokyo-night`.
+    pub fn find(text: &str) -> Option<ThemeName> {
+        let text = text.trim().to_lowercase().replace([' ', '_'], "-");
+        crate::tui::theme::THEMES
+            .iter()
+            .find(|theme| theme.name == text || theme.aliases.contains(&text.as_str()))
+            .map(|theme| ThemeName(theme.name))
+    }
+
+    /// Every theme, in the order the settings view goes through them.
+    pub fn all() -> impl Iterator<Item = ThemeName> {
+        crate::tui::theme::THEMES
+            .iter()
+            .map(|theme| ThemeName(theme.name))
+    }
 
     /// Its name, as the config file has it.
     pub fn name(self) -> &'static str {
-        match self {
-            ThemeName::Dark => "dark",
-            ThemeName::Light => "light",
-            ThemeName::Terminal => "terminal",
-        }
+        self.0
+    }
+
+    /// Where it is among [`ThemeName::all`], counted from 0.
+    pub fn position(self) -> usize {
+        ThemeName::all()
+            .position(|theme| theme == self)
+            .unwrap_or(0)
     }
 
     /// The one after it, back to the first after the last.
     pub fn next(self) -> ThemeName {
-        let at = ThemeName::ALL.iter().position(|theme| *theme == self);
-        ThemeName::ALL[(at.unwrap_or(0) + 1) % ThemeName::ALL.len()]
+        self.step(1)
+    }
+
+    /// The one before it, back to the last before the first.
+    pub fn previous(self) -> ThemeName {
+        self.step(-1)
+    }
+
+    fn step(self, by: isize) -> ThemeName {
+        let themes: Vec<ThemeName> = ThemeName::all().collect();
+        let at = self.position() as isize + by;
+        themes[at.rem_euclid(themes.len() as isize) as usize]
+    }
+}
+
+impl TryFrom<String> for ThemeName {
+    type Error = String;
+
+    fn try_from(text: String) -> Result<ThemeName, String> {
+        ThemeName::find(&text).ok_or_else(|| {
+            let names: Vec<&str> = ThemeName::all().map(ThemeName::name).collect();
+            format!("`{text}` isn't a theme: say one of {}", names.join(", "))
+        })
+    }
+}
+
+impl From<ThemeName> for String {
+    fn from(theme: ThemeName) -> String {
+        theme.name().to_string()
+    }
+}
+
+// By hand, since serde's derive would take the `&'static str` for one
+// borrowed from the file.
+impl<'de> Deserialize<'de> for ThemeName {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<ThemeName, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        ThemeName::try_from(text).map_err(serde::de::Error::custom)
+    }
+}
+
+impl ColorValue {
+    /// The color `text` says, or `None` when it says none crystal knows.
+    pub fn parse(text: &str) -> Option<Color> {
+        let text = text.trim().to_lowercase().replace([' ', '_'], "-");
+        if let Some(hex) = text.strip_prefix('#') {
+            return hex_color(hex);
+        }
+        if let Ok(index) = text.parse::<u8>() {
+            return Some(Color::Indexed(index));
+        }
+        if matches!(text.as_str(), "reset" | "none") {
+            return Some(Color::Reset);
+        }
+        NAMED_COLORS
+            .iter()
+            .find(|(name, _)| *name == text)
+            .map(|(_, color)| *color)
+    }
+}
+
+/// `rrggbb` or `rgb` as a color, each digit of `rgb` doubled, as CSS reads
+/// it.
+fn hex_color(hex: &str) -> Option<Color> {
+    // `from_str_radix` would take a `+` too.
+    if !hex.chars().all(|digit| digit.is_ascii_hexdigit()) {
+        return None;
+    }
+    let channel = |digits: &str| u8::from_str_radix(digits, 16).ok();
+    match hex.len() {
+        6 => Some(Color::Rgb(
+            channel(&hex[0..2])?,
+            channel(&hex[2..4])?,
+            channel(&hex[4..6])?,
+        )),
+        3 => {
+            let doubled = |at: usize| channel(&hex[at..=at]).map(|digit| digit * 17);
+            Some(Color::Rgb(doubled(0)?, doubled(1)?, doubled(2)?))
+        }
+        _ => None,
+    }
+}
+
+impl TryFrom<String> for ColorValue {
+    type Error = String;
+
+    fn try_from(text: String) -> Result<ColorValue, String> {
+        ColorValue::parse(&text).map(ColorValue).ok_or_else(|| {
+            let names = NAMED_COLORS.map(|(name, _)| name).join(", ");
+            format!(
+                "`{text}` isn't a color: say \"#rrggbb\", \"#rgb\", a number up to 255, \
+                 \"reset\", or one of {names}"
+            )
+        })
+    }
+}
+
+impl From<ColorValue> for String {
+    fn from(ColorValue(color): ColorValue) -> String {
+        if let Some((name, _)) = NAMED_COLORS.iter().find(|(_, named)| *named == color) {
+            return (*name).to_string();
+        }
+        match color {
+            Color::Rgb(r, g, b) => format!("#{r:02x}{g:02x}{b:02x}"),
+            Color::Indexed(index) => index.to_string(),
+            _ => "reset".to_string(),
+        }
     }
 }
 
@@ -424,6 +720,15 @@ pub fn from_text(text: &str) -> Result<Config> {
         );
     }
     duration(&config.sessions.stop_idle_after).context("in [sessions], stop_idle_after")?;
+    Keymap::new(&config.keys).map_err(anyhow::Error::msg)?;
+    if !SIDEBAR_WIDTHS.contains(&config.sidebar.width) {
+        bail!(
+            "[sidebar] width is {}: it's from {} to {} columns",
+            config.sidebar.width,
+            SIDEBAR_WIDTHS.start(),
+            SIDEBAR_WIDTHS.end()
+        );
+    }
     for profile in &config.profiles {
         profile.check()?;
     }
@@ -514,15 +819,79 @@ mod tests {
     fn a_theme_is_chosen_by_name() {
         assert_eq!(
             parse("theme = \"light\"\n").unwrap().theme,
-            ThemeName::Light
+            ThemeName::LIGHT
         );
-        assert_eq!(Config::default().theme, ThemeName::Dark);
+        assert_eq!(Config::default().theme, ThemeName::DARK);
+        let config = parse("theme = \"rose-pine-dawn\"\n").unwrap();
+        assert_eq!(config.theme.name(), "rose-pine-dawn");
     }
 
     #[test]
-    fn a_theme_crystal_doesnt_have_is_an_error_that_names_it() {
-        let err = parse("theme = \"neon\"\n").unwrap_err();
-        assert!(format!("{err:#}").contains("neon"), "{err:#}");
+    fn a_theme_answers_to_its_other_names_in_any_case() {
+        let named = |text: &str| ThemeName::find(text).map(ThemeName::name);
+        assert_eq!(named("Tokyo Night"), Some("tokyo-night"));
+        assert_eq!(named("tokyonight"), Some("tokyo-night"));
+        assert_eq!(named("catppuccin_mocha"), Some("catppuccin"));
+        assert_eq!(named("latte"), Some("catppuccin-latte"));
+        assert_eq!(named("dawn"), Some("rose-pine-dawn"));
+        assert_eq!(named(" GRUVBOX-DARK "), Some("gruvbox"));
+        // crystal's own light theme keeps its name: herdr's `light` alias
+        // for catppuccin-latte isn't taken.
+        assert_eq!(named("light"), Some("light"));
+        assert_eq!(named("neon"), None);
+        // Written back, a theme has its own name.
+        let config = parse("theme = \"Solarized Dark\"\n").unwrap();
+        assert!(config.to_toml().contains("theme = \"solarized\""));
+    }
+
+    #[test]
+    fn a_theme_crystal_doesnt_have_is_an_error_that_names_it_and_the_themes() {
+        let err = format!("{:#}", parse("theme = \"neon\"\n").unwrap_err());
+        assert!(err.contains("neon"), "{err}");
+        assert!(err.contains("dark, light, terminal, catppuccin"), "{err}");
+    }
+
+    #[test]
+    fn colors_of_ones_own_are_read_by_what_they_paint() {
+        let config = parse(
+            "[colors]\naccent = \"#F5C2E7\"\nbackground = \"reset\"\nwaiting = \"bright-red\"\n\
+             rule = \"#abc\"\nselection = \"238\"\ncode_block = \"none\"\n",
+        )
+        .unwrap();
+        let color = |token| config.colors.get(&token).map(|value| value.0);
+        assert_eq!(color(ColorToken::Accent), Some(Color::Rgb(245, 194, 231)));
+        assert_eq!(color(ColorToken::Background), Some(Color::Reset));
+        assert_eq!(color(ColorToken::Waiting), Some(Color::LightRed));
+        assert_eq!(color(ColorToken::Rule), Some(Color::Rgb(170, 187, 204)));
+        assert_eq!(color(ColorToken::Selection), Some(Color::Indexed(238)));
+        assert_eq!(color(ColorToken::CodeBlock), Some(Color::Reset));
+        assert_eq!(color(ColorToken::Text), None);
+    }
+
+    #[test]
+    fn a_color_that_isnt_one_or_paints_nothing_is_an_error_that_names_it() {
+        let cases = [
+            ("accent = \"#ggg\"", "`#ggg` isn't a color"),
+            ("accent = \"#+f+f+f\"", "`#+f+f+f` isn't a color"),
+            ("accent = \"#12345\"", "`#12345` isn't a color"),
+            ("accent = \"256\"", "`256` isn't a color"),
+            ("accent = \"pink\"", "bright-blue"),
+            ("acent = \"red\"", "acent"),
+            ("accent = 3", "accent"),
+        ];
+        for (line, expected) in cases {
+            let err = parse(&format!("[colors]\n{line}\n")).unwrap_err();
+            assert!(format!("{err:#}").contains(expected), "{line}: {err:#}");
+        }
+    }
+
+    #[test]
+    fn colors_written_out_read_back_the_same() {
+        for text in ["#0a0b0c", "red", "bright-white", "white", "17", "reset"] {
+            let value = ColorValue::try_from(text.to_string()).unwrap();
+            assert_eq!(String::from(value), text);
+        }
+        assert_eq!(ColorValue::parse("Bright Blue"), Some(Color::LightBlue));
     }
 
     #[test]
@@ -684,7 +1053,7 @@ back_to = "build"
         assert!(text.contains("[memory]\nembeddings = true\n"), "{text}");
         let config = from_text(&text).unwrap();
         assert!(!config.notify && config.memory.embeddings);
-        assert_eq!(config.theme, ThemeName::Light);
+        assert_eq!(config.theme, ThemeName::LIGHT);
 
         // What crystal wouldn't take is never written.
         assert!(set(&path, &["theme"], "pink".into()).is_err());
@@ -692,10 +1061,24 @@ back_to = "build"
     }
 
     #[test]
-    fn the_themes_go_round() {
-        assert_eq!(ThemeName::Dark.next(), ThemeName::Light);
-        assert_eq!(ThemeName::Terminal.next(), ThemeName::Dark);
-        assert_eq!(ThemeName::Light.name(), "light");
+    fn the_themes_go_round_both_ways() {
+        assert_eq!(ThemeName::DARK.next(), ThemeName::LIGHT);
+        assert_eq!(ThemeName::LIGHT.previous(), ThemeName::DARK);
+        assert_eq!(ThemeName::LIGHT.name(), "light");
+        let last = ThemeName::all().last().unwrap();
+        assert_eq!(last.next(), ThemeName::DARK);
+        assert_eq!(ThemeName::DARK.previous(), last);
+        let mut theme = ThemeName::DARK;
+        let mut seen = Vec::new();
+        loop {
+            seen.push(theme.name());
+            theme = theme.next();
+            if theme == ThemeName::DARK {
+                break;
+            }
+        }
+        assert_eq!(seen.len(), ThemeName::all().count());
+        assert_eq!(seen.len(), 20);
     }
 
     #[test]
@@ -743,6 +1126,29 @@ back_to = "build"
     }
 
     #[test]
+    fn sounds_play_unless_switched_off_for_all_or_an_agent() {
+        let sound = Config::default().sound;
+        assert!(sound.enabled);
+        assert_eq!((sound.done, sound.request), (None, None));
+        let config = parse(
+            "[sound]\nenabled = false\nrequest = \"ask.mp3\"\n\n[sound.agents]\ncodex = false\n",
+        )
+        .unwrap();
+        assert!(!config.sound.enabled);
+        assert_eq!(config.sound.request, Some(PathBuf::from("ask.mp3")));
+        assert_eq!(config.sound.agents.get("codex"), Some(&false));
+        assert!(parse("[sound]\nvolume = 3\n").is_err());
+    }
+
+    #[test]
+    fn the_tui_looks_for_a_newer_crystal_unless_told_not_to() {
+        assert!(Config::default().update.check);
+        let config = parse("[update]\ncheck = false\n").unwrap();
+        assert!(!config.update.check);
+        assert!(parse("[update]\nauto = true\n").is_err());
+    }
+
+    #[test]
     fn new_worktrees_start_from_origins_default_unless_told() {
         assert_eq!(Config::default().worktrees.base, None);
         let config = parse("[worktrees]\nbase = \"develop\"\n").unwrap();
@@ -760,6 +1166,21 @@ back_to = "build"
     }
 
     #[test]
+    fn keys_and_the_sidebar_are_checked() {
+        let keys = parse("[keys]\nkill = \"n\"\nnew-session = \"N\"").unwrap();
+        assert_eq!(keys.keys.len(), 2);
+        let unknown = parse("[keys]\nkil = \"n\"").unwrap_err();
+        assert!(format!("{unknown:#}").contains("kil"), "{unknown:#}");
+        let twice = parse("[keys]\nkill = \"q\"\nquit = \"q\"").unwrap_err();
+        assert!(format!("{twice:#}").contains("both"), "{twice:#}");
+        let narrow = parse("[sidebar]\nwidth = 4").unwrap_err();
+        assert!(format!("{narrow:#}").contains("width"), "{narrow:#}");
+        let folded = parse("[sidebar]\nfolded = true\nfold = \"hidden\"").unwrap();
+        assert!(folded.sidebar.folded);
+        assert_eq!(folded.sidebar.fold, Fold::Hidden);
+    }
+
+    #[test]
     fn the_settings_written_out_read_back_the_same() {
         let config = Config {
             notify: false,
@@ -767,12 +1188,23 @@ back_to = "build"
             new_session: "codex --model o3".into(),
             name_from_prompt: false,
             resume_reported_agents: false,
-            theme: ThemeName::Terminal,
+            theme: ThemeName::find("nord").unwrap(),
             scrollback_lines: 50_000,
+            colors: BTreeMap::from([
+                (ColorToken::Accent, ColorValue(Color::Rgb(245, 194, 231))),
+                (ColorToken::FoundCurrent, ColorValue(Color::LightRed)),
+                (ColorToken::Background, ColorValue(Color::Reset)),
+            ]),
             plugins: BTreeMap::from([("memory".to_string(), false)]),
             notifications: NotifySettings {
                 after_secs: 30,
                 unfocused_only: true,
+            },
+            sound: SoundSettings {
+                enabled: false,
+                done: Some(PathBuf::from("sounds/done.wav")),
+                request: None,
+                agents: BTreeMap::from([("codex".to_string(), false)]),
             },
             memory: MemorySettings {
                 distill: false,
@@ -794,6 +1226,7 @@ back_to = "build"
             sessions: SessionSettings {
                 stop_idle_after: "45m".into(),
             },
+            update: UpdateSettings { check: false },
             profiles: vec![Profile {
                 name: "review".into(),
                 description: Some("A second pair of eyes".into()),
@@ -837,6 +1270,19 @@ back_to = "build"
                 run: Some("npm run dev".into()),
                 open: Some("code .".into()),
             }],
+            keys: BTreeMap::from([
+                ("prefix".to_string(), Binding::One("ctrl+a".into())),
+                (
+                    "new-session".to_string(),
+                    Binding::Many(vec!["n".into(), "ctrl+n".into()]),
+                ),
+            ]),
+            sidebar: SidebarSettings {
+                width: 36,
+                folded: true,
+                fold: Fold::Hidden,
+                needs_you: false,
+            },
         };
         assert_eq!(parse(&config.to_toml()).unwrap(), config);
         assert_eq!(

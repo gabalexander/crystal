@@ -9,7 +9,8 @@
 //!
 //! The hooks crystal adds as it starts Claude Code run `crystal hook
 //! claude`; those `crystal integration` puts in an agent's own settings run
-//! it with `--installed`, for an agent typed into a session's shell.
+//! it with `--installed`, for an agent typed into a session's shell, or one
+//! like Codex that takes hooks from nowhere else.
 
 use crate::agents;
 use crate::client;
@@ -44,18 +45,15 @@ fn report(socket: &Path, agent: &str, installed: bool) -> Result<()> {
     // id finds the session even after a rename. Only programs started
     // before sessions had ids go without one.
     let id = std::env::var("CRYSTAL_SESSION_ID").ok();
-    let (event, conversation, prompt) = match agent {
-        "claude" => (
-            agents::claude_event(&input),
-            agents::claude_conversation(&input),
-            agents::claude_prompt(&input),
-        ),
+    let (event, conversation) = match agent {
         "codex" => (
             agents::codex_event(&input),
             agents::codex_conversation(&input),
-            agents::claude_prompt(&input),
         ),
-        _ => (None, None, None),
+        _ => (
+            agents::hook_event(&input),
+            agents::hook_conversation(&input),
+        ),
     };
     let Some(event) = event else {
         return Ok(());
@@ -69,7 +67,7 @@ fn report(socket: &Path, agent: &str, installed: bool) -> Result<()> {
         id,
         event,
         conversation,
-        prompt,
+        prompt: agents::hook_prompt(&input),
         agent: Some(agent.to_string()),
         cwd: agents::hook_cwd(&input),
         subagent: agents::subagent(&input).filter(|_| about_subagent),

@@ -2,16 +2,355 @@
 //! "muted" or "waiting", never for a color, so a theme can change every one
 //! of them in one place.
 //!
-//! `dark` and `light` paint their own background, so they look the same in
-//! any terminal. `terminal` paints nothing and uses the terminal's own
-//! sixteen colors. With `NO_COLOR` set there's no color at all, as that
-//! convention asks: only bold and reversed text tell things apart.
+//! crystal's own `dark` and `light` paint their own background, so they look
+//! the same in any terminal. `terminal` paints nothing and uses the
+//! terminal's own sixteen colors. The rest are well-known schemes, each a
+//! palette of a few colors that [`Theme::from_palette`] gives their roles,
+//! blending the tints it needs toward the background. The user's `[colors]`
+//! go over whichever it is. With `NO_COLOR` set there's no color at all, as
+//! that convention asks: only bold and reversed text tell things apart.
 
 use super::status::Status;
-use crate::config::ThemeName;
+use crate::config::{ColorToken, ColorValue, Config, ThemeName};
 use crate::markdown::{Ink, Mark};
 use crate::syntax::TokenKind;
 use ratatui::style::{Color, Modifier, Style};
+use std::collections::BTreeMap;
+
+/// A theme crystal has: the name the config file gives it, the other names
+/// it answers to, and its colors.
+pub struct Named {
+    pub name: &'static str,
+    pub aliases: &'static [&'static str],
+    colors: Colors,
+}
+
+enum Colors {
+    /// One of crystal's own, every color picked by hand.
+    Own(fn() -> Theme),
+    /// A scheme's palette, given its roles by [`Theme::from_palette`].
+    Palette(Palette),
+}
+
+/// A color as red, green and blue.
+type Rgb = (u8, u8, u8);
+
+/// A scheme's few colors: its background and text, a dimmer text, its
+/// accent, and the hues the statuses, the diff and code are drawn in.
+struct Palette {
+    background: Rgb,
+    text: Rgb,
+    muted: Rgb,
+    accent: Rgb,
+    red: Rgb,
+    green: Rgb,
+    yellow: Rgb,
+    blue: Rgb,
+    cyan: Rgb,
+    orange: Rgb,
+}
+
+const fn own(name: &'static str, theme: fn() -> Theme) -> Named {
+    Named {
+        name,
+        aliases: &[],
+        colors: Colors::Own(theme),
+    }
+}
+
+const fn scheme(name: &'static str, aliases: &'static [&'static str], palette: Palette) -> Named {
+    Named {
+        name,
+        aliases,
+        colors: Colors::Palette(palette),
+    }
+}
+
+/// Every theme, in the order the settings view goes through them: crystal's
+/// own, then each scheme's dark side before its light one. The schemes'
+/// colors are herdr's (Apache-2.0), with a few changes: the dimmer text is
+/// light (or dark) enough to read on the background, where herdr's often
+/// isn't (nord's was 1.7:1); solarized-light's text is a shade darker for
+/// the same reason; kanagawa's red and green are its wave red and spring
+/// green; rose pine's blue is its foam, so a session at work doesn't look
+/// done; and vesper's background is its own `#101010`.
+pub const THEMES: &[Named] = &[
+    own("dark", Theme::dark),
+    own("light", Theme::light),
+    own("terminal", Theme::terminal),
+    scheme(
+        "catppuccin",
+        &["catppuccin-mocha", "mocha"],
+        Palette {
+            background: (30, 30, 46),
+            text: (205, 214, 244),
+            muted: (127, 132, 156),
+            accent: (137, 180, 250),
+            red: (243, 139, 168),
+            green: (166, 227, 161),
+            yellow: (249, 226, 175),
+            blue: (137, 180, 250),
+            cyan: (148, 226, 213),
+            orange: (250, 179, 135),
+        },
+    ),
+    scheme(
+        "catppuccin-latte",
+        &["latte"],
+        Palette {
+            background: (239, 241, 245),
+            text: (76, 79, 105),
+            muted: (124, 127, 147),
+            accent: (30, 102, 245),
+            red: (210, 15, 57),
+            green: (64, 160, 43),
+            yellow: (223, 142, 29),
+            blue: (30, 102, 245),
+            cyan: (23, 146, 153),
+            orange: (254, 100, 11),
+        },
+    ),
+    scheme(
+        "tokyo-night",
+        &["tokyonight"],
+        Palette {
+            background: (26, 27, 38),
+            text: (192, 202, 245),
+            muted: (105, 113, 150),
+            accent: (122, 162, 247),
+            red: (247, 118, 142),
+            green: (158, 206, 106),
+            yellow: (224, 175, 104),
+            blue: (122, 162, 247),
+            cyan: (125, 207, 255),
+            orange: (255, 158, 100),
+        },
+    ),
+    scheme(
+        "tokyo-night-day",
+        &["tokyo-day", "tokyonight-day"],
+        Palette {
+            background: (225, 226, 231),
+            text: (55, 96, 191),
+            muted: (104, 112, 154),
+            accent: (46, 125, 233),
+            red: (245, 42, 101),
+            green: (88, 117, 57),
+            yellow: (140, 108, 62),
+            blue: (46, 125, 233),
+            cyan: (17, 140, 116),
+            orange: (177, 92, 0),
+        },
+    ),
+    scheme(
+        "dracula",
+        &[],
+        Palette {
+            background: (40, 42, 54),
+            text: (248, 248, 242),
+            muted: (130, 140, 180),
+            accent: (189, 147, 249),
+            red: (255, 85, 85),
+            green: (80, 250, 123),
+            yellow: (241, 250, 140),
+            blue: (139, 233, 253),
+            cyan: (139, 233, 253),
+            orange: (255, 184, 108),
+        },
+    ),
+    scheme(
+        "nord",
+        &[],
+        Palette {
+            background: (46, 52, 64),
+            text: (236, 239, 244),
+            muted: (126, 136, 156),
+            accent: (136, 192, 208),
+            red: (191, 97, 106),
+            green: (163, 190, 140),
+            yellow: (235, 203, 139),
+            blue: (129, 161, 193),
+            cyan: (143, 188, 187),
+            orange: (208, 135, 112),
+        },
+    ),
+    scheme(
+        "gruvbox",
+        &["gruvbox-dark"],
+        Palette {
+            background: (40, 40, 40),
+            text: (235, 219, 178),
+            muted: (146, 131, 116),
+            accent: (215, 153, 33),
+            red: (251, 73, 52),
+            green: (184, 187, 38),
+            yellow: (250, 189, 47),
+            blue: (131, 165, 152),
+            cyan: (142, 192, 124),
+            orange: (254, 128, 25),
+        },
+    ),
+    scheme(
+        "gruvbox-light",
+        &[],
+        Palette {
+            background: (251, 241, 199),
+            text: (60, 56, 54),
+            muted: (124, 111, 100),
+            accent: (7, 102, 120),
+            red: (157, 0, 6),
+            green: (121, 116, 14),
+            yellow: (181, 118, 20),
+            blue: (7, 102, 120),
+            cyan: (66, 123, 88),
+            orange: (175, 58, 3),
+        },
+    ),
+    scheme(
+        "one-dark",
+        &["onedark"],
+        Palette {
+            background: (40, 44, 52),
+            text: (171, 178, 191),
+            muted: (115, 122, 135),
+            accent: (97, 175, 239),
+            red: (224, 108, 117),
+            green: (152, 195, 121),
+            yellow: (229, 192, 123),
+            blue: (97, 175, 239),
+            cyan: (86, 182, 194),
+            orange: (209, 154, 102),
+        },
+    ),
+    scheme(
+        "one-light",
+        &["onelight"],
+        Palette {
+            background: (250, 250, 250),
+            text: (56, 58, 66),
+            muted: (128, 130, 140),
+            accent: (64, 120, 242),
+            red: (228, 86, 73),
+            green: (80, 161, 79),
+            yellow: (193, 132, 1),
+            blue: (64, 120, 242),
+            cyan: (1, 132, 188),
+            orange: (152, 104, 1),
+        },
+    ),
+    scheme(
+        "solarized",
+        &["solarized-dark"],
+        Palette {
+            background: (0, 43, 54),
+            text: (147, 161, 161),
+            muted: (101, 123, 131),
+            accent: (38, 139, 210),
+            red: (220, 50, 47),
+            green: (133, 153, 0),
+            yellow: (181, 137, 0),
+            blue: (38, 139, 210),
+            cyan: (42, 161, 152),
+            orange: (203, 75, 22),
+        },
+    ),
+    scheme(
+        "solarized-light",
+        &[],
+        Palette {
+            background: (253, 246, 227),
+            text: (88, 110, 117),
+            muted: (131, 148, 150),
+            accent: (38, 139, 210),
+            red: (220, 50, 47),
+            green: (133, 153, 0),
+            yellow: (181, 137, 0),
+            blue: (38, 139, 210),
+            cyan: (42, 161, 152),
+            orange: (203, 75, 22),
+        },
+    ),
+    scheme(
+        "kanagawa",
+        &[],
+        Palette {
+            background: (31, 31, 40),
+            text: (220, 215, 186),
+            muted: (135, 134, 125),
+            accent: (126, 156, 216),
+            red: (228, 104, 118),
+            green: (152, 187, 108),
+            yellow: (192, 163, 110),
+            blue: (126, 156, 216),
+            cyan: (127, 180, 202),
+            orange: (255, 160, 102),
+        },
+    ),
+    scheme(
+        "kanagawa-lotus",
+        &["lotus"],
+        Palette {
+            background: (242, 236, 188),
+            text: (84, 84, 100),
+            muted: (128, 127, 118),
+            accent: (77, 105, 155),
+            red: (200, 64, 83),
+            green: (111, 137, 78),
+            yellow: (119, 113, 63),
+            blue: (77, 105, 155),
+            cyan: (78, 140, 162),
+            orange: (204, 109, 0),
+        },
+    ),
+    scheme(
+        "rose-pine",
+        &["rosepine"],
+        Palette {
+            background: (25, 23, 36),
+            text: (224, 222, 244),
+            muted: (144, 140, 170),
+            accent: (196, 167, 231),
+            red: (235, 111, 146),
+            green: (49, 116, 143),
+            yellow: (246, 193, 119),
+            blue: (156, 207, 216),
+            cyan: (156, 207, 216),
+            orange: (234, 154, 151),
+        },
+    ),
+    scheme(
+        "rose-pine-dawn",
+        &["rosepine-dawn", "dawn"],
+        Palette {
+            background: (250, 244, 237),
+            text: (70, 66, 97),
+            muted: (121, 117, 147),
+            accent: (144, 122, 169),
+            red: (180, 99, 122),
+            green: (40, 105, 131),
+            yellow: (234, 157, 52),
+            blue: (86, 148, 159),
+            cyan: (86, 148, 159),
+            orange: (215, 130, 126),
+        },
+    ),
+    scheme(
+        "vesper",
+        &[],
+        Palette {
+            background: (16, 16, 16),
+            text: (255, 255, 255),
+            muted: (139, 139, 139),
+            accent: (255, 199, 153),
+            red: (255, 128, 128),
+            green: (153, 255, 228),
+            yellow: (255, 199, 153),
+            blue: (176, 176, 176),
+            cyan: (102, 221, 204),
+            orange: (255, 199, 153),
+        },
+    ),
+];
 
 pub struct Theme {
     /// Painted behind everything. `Color::Reset` leaves the terminal's own.
@@ -72,18 +411,116 @@ impl Theme {
         if no_color {
             return Theme::plain();
         }
-        match name {
-            ThemeName::Dark => Theme::dark(),
-            ThemeName::Light => Theme::light(),
-            ThemeName::Terminal => Theme::terminal(),
+        // A `ThemeName` is only ever made from a name in `THEMES`.
+        let named = THEMES.iter().find(|theme| theme.name == name.name());
+        match named.map(|theme| &theme.colors) {
+            Some(Colors::Own(theme)) => theme(),
+            Some(Colors::Palette(palette)) => Theme::from_palette(palette),
+            None => Theme::dark(),
         }
     }
 
-    /// The theme the user asked for in their config, unless the
-    /// environment asks for no color.
-    pub fn from_env(name: ThemeName) -> Theme {
+    /// The theme the user asked for in their config, with their colors
+    /// over it, unless the environment asks for no color.
+    pub fn from_config(config: &Config) -> Theme {
         let no_color = std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty());
-        Theme::new(name, no_color)
+        Theme::configured(config, no_color)
+    }
+
+    /// The config's theme and colors, or none at all when `no_color` is
+    /// set: no color the user picked outweighs the environment's asking for
+    /// none.
+    fn configured(config: &Config, no_color: bool) -> Theme {
+        if no_color {
+            return Theme::plain();
+        }
+        Theme::new(config.theme, false).with_colors(&config.colors)
+    }
+
+    /// The theme with `colors`, the user's `[colors]`, over its own. A
+    /// color for what's drawn with a background is that background, and
+    /// takes the place of text reversed where a theme can't paint one.
+    pub fn with_colors(mut self, colors: &BTreeMap<ColorToken, ColorValue>) -> Theme {
+        let behind =
+            |style: Style, color: Color| style.remove_modifier(Modifier::REVERSED).bg(color);
+        for (&token, &ColorValue(color)) in colors {
+            match token {
+                ColorToken::Background => self.background = color,
+                ColorToken::Text => self.text = color,
+                ColorToken::Muted => self.muted = color,
+                ColorToken::Accent => self.accent = color,
+                ColorToken::Rule => self.rule = color,
+                ColorToken::Branch => self.branch = color,
+                ColorToken::Selection => self.selection = behind(self.selection, color),
+                ColorToken::Panel => self.panel = color,
+                ColorToken::Waiting => self.waiting = color,
+                ColorToken::Working => self.working = color,
+                ColorToken::Done => self.done = color,
+                ColorToken::Running => self.running = color,
+                ColorToken::Ended => self.ended = color,
+                ColorToken::Failed => self.failed = color,
+                ColorToken::Added => self.added = color,
+                ColorToken::Removed => self.removed = color,
+                ColorToken::AddedLine => self.added_line = behind(self.added_line, color),
+                ColorToken::RemovedLine => self.removed_line = behind(self.removed_line, color),
+                ColorToken::AddedWords => self.added_words = behind(self.added_words, color),
+                ColorToken::RemovedWords => {
+                    self.removed_words = behind(self.removed_words, color);
+                }
+                ColorToken::CopySelection => {
+                    self.copy_selection = behind(self.copy_selection, color);
+                }
+                ColorToken::Found => self.found = behind(self.found, color),
+                ColorToken::FoundCurrent => self.found_current = behind(self.found_current, color),
+                ColorToken::Keyword => self.keyword = self.keyword.fg(color),
+                ColorToken::String => self.string = self.string.fg(color),
+                ColorToken::Number => self.number = self.number.fg(color),
+                ColorToken::CodeBlock => self.code_block = behind(self.code_block, color),
+            }
+        }
+        self
+    }
+
+    /// A scheme's palette with its colors given their roles. The tints
+    /// behind a diff's lines, a search's finds, the selection and code are
+    /// each a hue blended toward the background, so they suit a light
+    /// background as well as a dark one.
+    fn from_palette(palette: &Palette) -> Theme {
+        let color = |(r, g, b): Rgb| Color::Rgb(r, g, b);
+        let tint = |toward: Rgb, amount: f32| blend(palette.background, toward, amount);
+        Theme {
+            background: color(palette.background),
+            text: color(palette.text),
+            muted: color(palette.muted),
+            accent: color(palette.accent),
+            rule: tint(palette.muted, 0.35),
+            branch: color(palette.cyan),
+            selection: Style::new().bg(tint(palette.accent, 0.15)),
+            panel: tint(palette.text, 0.06),
+            waiting: color(palette.orange),
+            working: color(palette.blue),
+            done: color(palette.green),
+            // A program at work is calmer than an agent done: the green,
+            // toward the dimmer text.
+            running: blend(palette.green, palette.muted, 0.4),
+            ended: color(palette.muted),
+            failed: color(palette.red),
+            added: color(palette.green),
+            removed: color(palette.red),
+            added_line: Style::new().bg(tint(palette.green, 0.15)),
+            removed_line: Style::new().bg(tint(palette.red, 0.15)),
+            added_words: Style::new().bg(tint(palette.green, 0.35)),
+            removed_words: Style::new().bg(tint(palette.red, 0.35)),
+            copy_selection: Style::new().bg(tint(palette.accent, 0.35)),
+            found: Style::new().bg(tint(palette.yellow, 0.3)),
+            found_current: Style::new()
+                .fg(color(palette.background))
+                .bg(color(palette.orange)),
+            keyword: Style::new().fg(color(palette.blue)),
+            string: Style::new().fg(color(palette.green)),
+            number: Style::new().fg(color(palette.orange)),
+            code_block: Style::new().bg(tint(palette.text, 0.05)),
+        }
     }
 
     /// Deep ink, with a violet accent.
@@ -283,13 +720,163 @@ impl Theme {
     }
 }
 
+/// `from` moved `amount` of the way to `to`, 0 to 1.
+fn blend(from: Rgb, to: Rgb, amount: f32) -> Color {
+    let channel = |from: u8, to: u8| {
+        let (from, to) = (f32::from(from), f32::from(to));
+        // Between two channels, so within 0 to 255.
+        (from + (to - from) * amount).round() as u8
+    };
+    Color::Rgb(
+        channel(from.0, to.0),
+        channel(from.1, to.1),
+        channel(from.2, to.2),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Every theme, by its name.
+    fn every_theme() -> Vec<(&'static str, Theme)> {
+        ThemeName::all()
+            .map(|name| (name.name(), Theme::new(name, false)))
+            .collect()
+    }
+
+    /// How far apart two colors are in lightness, as WCAG measures
+    /// contrast: 1 for none, 21 for black on white.
+    fn contrast(a: Color, b: Color) -> f64 {
+        let luminance = |color: Color| {
+            let Color::Rgb(r, g, b) = color else {
+                panic!("{color:?} isn't painted");
+            };
+            let linear = |channel: u8| {
+                let channel = f64::from(channel) / 255.0;
+                if channel <= 0.04045 {
+                    channel / 12.92
+                } else {
+                    ((channel + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            0.2126 * linear(r) + 0.7152 * linear(g) + 0.0722 * linear(b)
+        };
+        let (a, b) = (luminance(a), luminance(b));
+        (a.max(b) + 0.05) / (a.min(b) + 0.05)
+    }
+
+    #[test]
+    fn every_theme_has_a_name_of_its_own_and_none_answers_to_anothers() {
+        let mut names: Vec<&str> = THEMES
+            .iter()
+            .flat_map(|theme| std::iter::once(theme.name).chain(theme.aliases.iter().copied()))
+            .collect();
+        let count = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), count, "a name is taken twice");
+        for name in names {
+            // Each is written as `ThemeName::find` looks for it.
+            assert_eq!(name, name.to_lowercase().replace([' ', '_'], "-"));
+        }
+    }
+
+    #[test]
+    fn every_painted_theme_can_be_read_on_its_background() {
+        for (name, theme) in every_theme() {
+            if theme.background == Color::Reset {
+                continue;
+            }
+            let text = contrast(theme.text, theme.background);
+            assert!(text >= 4.5, "{name}: text is {text:.2} to its background");
+            let muted = contrast(theme.muted, theme.background);
+            assert!(
+                muted >= 2.8,
+                "{name}: muted is {muted:.2} to its background"
+            );
+            for status in [
+                Status::Waiting,
+                Status::Working,
+                Status::Done,
+                Status::Failed,
+            ] {
+                let color = contrast(theme.status(status), theme.background);
+                assert!(color >= 1.8, "{name}: {status:?} is {color:.2}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_palette_is_given_its_roles() {
+        let theme = Theme::new(ThemeName::find("catppuccin").unwrap(), false);
+        assert_eq!(theme.background, Color::Rgb(30, 30, 46));
+        assert_eq!(theme.working, Color::Rgb(137, 180, 250));
+        assert_eq!(theme.waiting, Color::Rgb(250, 179, 135));
+        // A tint is between the background and its hue.
+        let Some(Color::Rgb(r, g, b)) = theme.added_line.bg else {
+            panic!("an added line is painted");
+        };
+        assert!(r > 30 && r < 166 && g > 30 && g < 227 && b > 46 && b < 161);
+        // And on a light background, darker than it.
+        let latte = Theme::new(ThemeName::find("latte").unwrap(), false);
+        let Some(Color::Rgb(r, g, b)) = latte.selection.bg else {
+            panic!("the selection is painted");
+        };
+        assert!(r < 239 && g < 241 && b <= 245);
+    }
+
+    #[test]
+    fn blending_goes_from_one_color_to_the_other() {
+        assert_eq!(blend((0, 0, 0), (200, 100, 50), 0.0), Color::Rgb(0, 0, 0));
+        assert_eq!(
+            blend((0, 0, 0), (200, 100, 50), 0.5),
+            Color::Rgb(100, 50, 25)
+        );
+        assert_eq!(blend((250, 250, 250), (0, 0, 0), 1.0), Color::Rgb(0, 0, 0));
+    }
+
+    #[test]
+    fn colors_of_ones_own_go_over_the_theme() {
+        let config = crate::config::from_text(
+            "theme = \"nord\"\n[colors]\naccent = \"#ff0000\"\nselection = \"blue\"\n\
+             keyword = \"bright-green\"\nfound_current = \"#00ff00\"\n",
+        )
+        .unwrap();
+        let theme = Theme::configured(&config, false);
+        let nord = Theme::new(config.theme, false);
+        assert_eq!(theme.accent, Color::Rgb(255, 0, 0));
+        assert_eq!(theme.selection.bg, Some(Color::Blue));
+        assert_eq!(theme.keyword.fg, Some(Color::LightGreen));
+        assert_eq!(theme.found_current.bg, Some(Color::Rgb(0, 255, 0)));
+        // What isn't given keeps the theme's: the text over the match too.
+        assert_eq!(theme.found_current.fg, nord.found_current.fg);
+        assert_eq!(theme.text, nord.text);
+        assert_eq!(theme.background, nord.background);
+
+        // Where the terminal theme reverses the selection, a color of
+        // one's own is painted behind it instead.
+        let mut config = config;
+        config.theme = ThemeName::TERMINAL;
+        let theme = Theme::configured(&config, false);
+        assert_eq!(theme.selection.bg, Some(Color::Blue));
+        assert!(theme.selection.sub_modifier.contains(Modifier::REVERSED));
+    }
+
+    #[test]
+    fn no_color_outweighs_colors_of_ones_own() {
+        let config = crate::config::from_text(
+            "theme = \"dracula\"\n[colors]\naccent = \"#ff0000\"\nbackground = \"#000000\"\n",
+        )
+        .unwrap();
+        let theme = Theme::configured(&config, true);
+        assert_eq!(theme.accent, Color::Reset);
+        assert_eq!(theme.background, Color::Reset);
+    }
+
     #[test]
     fn no_color_means_no_color_whatever_the_theme() {
-        let theme = Theme::new(ThemeName::Dark, true);
+        let theme = Theme::new(ThemeName::DARK, true);
         let colors = [
             theme.background,
             theme.text,
@@ -308,18 +895,15 @@ mod tests {
     }
 
     #[test]
-    fn the_painted_themes_paint_and_the_terminal_one_doesnt() {
-        assert_ne!(Theme::new(ThemeName::Dark, false).background, Color::Reset);
-        assert_ne!(Theme::new(ThemeName::Light, false).background, Color::Reset);
-        assert_eq!(
-            Theme::new(ThemeName::Terminal, false).background,
-            Color::Reset
-        );
+    fn every_theme_but_the_terminal_one_paints() {
+        for (name, theme) in every_theme() {
+            let painted = theme.background != Color::Reset;
+            assert_eq!(painted, name != "terminal", "{name}");
+        }
     }
 
     #[test]
-    fn each_status_has_a_color_of_its_own() {
-        let theme = Theme::new(ThemeName::Dark, false);
+    fn in_every_theme_each_status_has_a_color_of_its_own() {
         let statuses = [
             Status::Waiting,
             Status::Working,
@@ -327,10 +911,12 @@ mod tests {
             Status::Running,
             Status::Failed,
         ];
-        let colors: std::collections::HashSet<String> = statuses
-            .iter()
-            .map(|status| format!("{:?}", theme.status(*status)))
-            .collect();
-        assert_eq!(colors.len(), statuses.len());
+        for (name, theme) in every_theme() {
+            let colors: std::collections::HashSet<String> = statuses
+                .iter()
+                .map(|status| format!("{:?}", theme.status(*status)))
+                .collect();
+            assert_eq!(colors.len(), statuses.len(), "{name}");
+        }
     }
 }

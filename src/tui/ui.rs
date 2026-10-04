@@ -7,12 +7,14 @@
 use super::app::{App, Filter, Focus, Hit, PluginPane, Prompt, Question, Slot, View};
 use super::archived_view;
 use super::backlog_view::{self, BacklogView};
+use super::command_list;
 use super::copy_mode::{self, SearchPrompt};
 use super::diff_view;
 use super::finder;
 use super::grep;
 use super::help;
 use super::issues;
+use super::keymap::Command;
 use super::launcher;
 use super::layouts::{self, LayoutsView};
 use super::memory_view;
@@ -41,8 +43,6 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph};
-
-const SIDEBAR_WIDTH: u16 = 28;
 
 /// Where the tabs start in the top bar: after crystal's name and a gap.
 const TABS_START: u16 = 10;
@@ -90,9 +90,11 @@ impl Areas {
     /// bar and the footer, the sidebar and its rule with no room.
     pub fn of(app: &App, screen: Rect) -> Areas {
         let [top, main, footer] = rows(screen);
+        // A sidebar folded away has no rule either.
+        let sidebar_width = app.sidebar_columns(screen.width);
         let [sidebar, rule, tiles] = Layout::horizontal([
-            Constraint::Length(SIDEBAR_WIDTH),
-            Constraint::Length(1),
+            Constraint::Length(sidebar_width),
+            Constraint::Length(u16::from(sidebar_width > 0)),
             Constraint::Min(0),
         ])
         .areas(main);
@@ -309,6 +311,10 @@ pub fn hit(areas: &Areas, app: &App, column: u16, row: u16) -> Hit {
     if at(areas.sidebar) {
         return sidebar::hit(areas.sidebar, app, row);
     }
+    // The rule beside the sidebar is its edge, which the mouse drags.
+    if at(areas.rule) && !app.zoomed() {
+        return Hit::SidebarEdge(column);
+    }
     // The float is over the others, its frame and all: the last pane
     // first.
     let panes = app.slots().into_iter().zip(&areas.panes).rev();
@@ -404,12 +410,12 @@ pub fn draw(frame: &mut Frame, app: &App, panes: &[Pane], overlay: Option<&Pane>
         draw_float_frame(frame, app, look, around);
         draw_pane(frame, app, look, Slot::Float, *area, panes);
     }
-    // Zoomed, the sidebar comes out over the pane while `/` looks through
-    // it, rather than squeezing the pane, which its program would redraw
-    // for.
-    if app.zoomed() && app.filter().is_some() {
+    // Zoomed or folded, the sidebar comes out over the panes while `/`
+    // looks through it, rather than squeezing them, which their programs
+    // would redraw for.
+    if (app.zoomed() || app.sidebar_folded()) && app.filter().is_some() {
         let main = areas.main;
-        let width = SIDEBAR_WIDTH.min(main.width.saturating_sub(1));
+        let width = app.sidebar_shape().width.min(main.width.saturating_sub(1));
         let drawer = Rect::new(main.x, main.y, width, main.height);
         let rule = Rect::new(drawer.right(), main.y, 1, main.height);
         frame.render_widget(Clear, drawer.union(rule));
@@ -467,7 +473,11 @@ pub fn draw(frame: &mut Frame, app: &App, panes: &[Pane], overlay: Option<&Pane>
         settings_view::draw(frame, view, look.theme, middle);
     }
     if let (Some(open), Some(pane)) = (app.plugin_pane(), overlay) {
-        draw_plugin_pane(frame, open, pane, look, &areas);
+        let hand_back = app.keymap().hand_back().hint();
+        draw_plugin_pane(frame, open, pane, look, &areas, &hand_back);
+    }
+    if let Some(list) = app.command_list() {
+        command_list::draw(frame, list, look.theme, middle);
     }
     draw_footer(frame, app, panes, look, areas.footer);
     if let Some(open) = app.menu() {
@@ -479,6 +489,7 @@ pub fn draw(frame: &mut Frame, app: &App, panes: &[Pane], overlay: Option<&Pane>
         let shown = help::Shown {
             plugin_on: &plugin_on,
             plugin_keys: &plugin_keys,
+            keymap: app.keymap(),
         };
         help::draw(frame, look.theme, frame.area(), &shown, app.keys_page());
     }
@@ -499,7 +510,14 @@ pub fn plugin_pane_screen(areas: &Areas) -> Rect {
 
 /// A plugin's pane: its program's screen in a frame, its title on top and
 /// the key that closes it below.
-fn draw_plugin_pane(frame: &mut Frame, open: &PluginPane, pane: &Pane, look: &Look, areas: &Areas) {
+fn draw_plugin_pane(
+    frame: &mut Frame,
+    open: &PluginPane,
+    pane: &Pane,
+    look: &Look,
+    areas: &Areas,
+    look_hand_back: &str,
+) {
     let theme = look.theme;
     let area = plugin_pane_area(areas);
     frame.render_widget(Clear, area);
@@ -512,7 +530,7 @@ fn draw_plugin_pane(frame: &mut Frame, open: &PluginPane, pane: &Pane, look: &Lo
             title,
         ))
         .title_bottom(Line::styled(
-            " ctrl+\\ closes ",
+            format!(" {} closes ", look_hand_back),
             Style::new().fg(theme.muted),
         ));
     let screen = block.inner(area);
@@ -1027,9 +1045,13 @@ fn draw_footer(frame: &mut Frame, app: &App, panes: &[Pane], look: &Look, area: 
     };
     let searching = copying.and_then(|pane| pane.copy.as_ref()?.prompt.as_ref());
     if app.plugin_pane().is_some() {
-        frame.render_widget(hint_spans(&[("ctrl+\\", "close")], theme), area);
+        let hand_back = app.keymap().hand_back().hint();
+        frame.render_widget(hint_spans(&[(&hand_back, "close")], theme), area);
     } else if app.reply().is_some() {
         frame.render_widget(hint_spans(REPLY_HINTS, theme), area);
+    } else if app.command_list().is_some() {
+        let hints = [("enter", "run it"), ("↑/↓", "choose"), ("esc", "close")];
+        frame.render_widget(hint_spans(&hints, theme), area);
     } else if app.launcher().is_some() {
         frame.render_widget(hint_spans(LAUNCHER_HINTS, theme), area);
     } else if let Some(view) = app.profiles_view() {
@@ -1174,83 +1196,111 @@ fn question_line<'a>(question: &str, theme: &Theme) -> Line<'a> {
     ])
 }
 
-/// The keys the footer offers in the sidebar, most needed first; the rest
-/// are behind `?`.
-const SIDEBAR_HINTS: &[(&str, &str)] = &[
-    ("enter", "type"),
-    ("space", "reply"),
-    ("n", "new"),
-    ("s", "split"),
-    ("x", "kill"),
-    ("q", "quit"),
-    ("z", "zoom"),
-    ("v", "copy"),
-    ("w", "worktree"),
-    ("u", "next"),
-    ("/", "find"),
-    ("d", "diff"),
-    ("p", "files"),
-    ("t", "tab"),
-    ("R", "resize"),
+/// A key the footer names: a command's, written as the user's `[keys]`
+/// has it, and left out when it has none; one of the sidebar's own; the
+/// key that hands the keyboard back; or the prefix.
+#[derive(Debug, Clone, Copy)]
+enum Hint {
+    Run(Command, &'static str),
+    Key(&'static str, &'static str),
+    HandBack(&'static str),
+    Prefix(&'static str),
+}
+
+/// The keys `hints` name, as the keymap writes them.
+fn written(app: &App, hints: &[Hint]) -> Vec<(String, String)> {
+    let keymap = app.keymap();
+    hints
+        .iter()
+        .filter_map(|hint| {
+            let (key, does) = match *hint {
+                Hint::Run(command, does) => (keymap.hint(command)?, does),
+                Hint::Key(key, does) => (key.to_string(), does),
+                Hint::HandBack(does) => (keymap.hand_back().hint(), does),
+                Hint::Prefix(does) => (keymap.prefix()?.hint(), does),
+            };
+            Some((key, does.to_string()))
+        })
+        .collect()
+}
+
+/// The sidebar's keys, the most used first: as many as fit are shown.
+const SIDEBAR_HINTS: &[Hint] = &[
+    Hint::Run(Command::Open, "type"),
+    Hint::Run(Command::Reply, "reply"),
+    Hint::Run(Command::NewSession, "new"),
+    Hint::Run(Command::ToggleSplit, "split"),
+    Hint::Run(Command::Kill, "kill"),
+    Hint::Run(Command::Quit, "quit"),
+    Hint::Run(Command::Zoom, "zoom"),
+    Hint::Run(Command::Copy, "copy"),
+    Hint::Run(Command::NewWorktree, "worktree"),
+    Hint::Run(Command::NextNeedingYou, "next"),
+    Hint::Run(Command::Search, "find"),
+    Hint::Run(Command::Commands, "commands"),
+    Hint::Run(Command::Diff, "diff"),
+    Hint::Run(Command::FindFile, "files"),
+    Hint::Run(Command::NewTab, "tab"),
+    Hint::Run(Command::Resize, "resize"),
 ];
 
 /// The sidebar's keys while the tab is zoomed: `j` and `k` choose the
 /// session the one pane shows.
-const ZOOMED_HINTS: &[(&str, &str)] = &[
-    ("z", "unzoom"),
-    ("enter", "type"),
-    ("j/k", "switch"),
-    ("v", "copy"),
-    ("n", "new"),
-    ("q", "quit"),
+const ZOOMED_HINTS: &[Hint] = &[
+    Hint::Run(Command::Zoom, "unzoom"),
+    Hint::Run(Command::Open, "type"),
+    Hint::Run(Command::Down, "switch"),
+    Hint::Run(Command::Copy, "copy"),
+    Hint::Run(Command::NewSession, "new"),
+    Hint::Run(Command::Quit, "quit"),
 ];
 
 /// The sidebar's keys while the selected step's flow run waits at a gate.
-const GATE_HINTS: &[(&str, &str)] = &[
-    ("g", "go on"),
-    ("f", "send back"),
-    ("n", "new"),
-    ("x", "kill"),
-    ("q", "quit"),
-    ("u", "next"),
-    ("/", "find"),
-    ("d", "diff"),
+const GATE_HINTS: &[Hint] = &[
+    Hint::Run(Command::FlowGoOn, "go on"),
+    Hint::Run(Command::FlowSendBack, "send back"),
+    Hint::Run(Command::NewSession, "new"),
+    Hint::Run(Command::Kill, "kill"),
+    Hint::Run(Command::Quit, "quit"),
+    Hint::Run(Command::NextNeedingYou, "next"),
+    Hint::Run(Command::Search, "find"),
+    Hint::Run(Command::Diff, "diff"),
 ];
 
 /// The sidebar's keys while the selected background task asks for a
 /// permission.
-const ASKING_HINTS: &[(&str, &str)] = &[
-    ("y", "allow"),
-    ("n", "deny"),
-    ("Y", "always"),
-    ("enter", "watch"),
-    ("x", "kill"),
-    ("q", "quit"),
-    ("u", "next"),
+const ASKING_HINTS: &[Hint] = &[
+    Hint::Key("y", "allow"),
+    Hint::Key("n", "deny"),
+    Hint::Key("Y", "always"),
+    Hint::Run(Command::Open, "watch"),
+    Hint::Run(Command::Kill, "kill"),
+    Hint::Run(Command::Quit, "quit"),
+    Hint::Run(Command::NextNeedingYou, "next"),
 ];
 
 /// The sidebar's keys while the selection is on a worktree with no
 /// sessions.
-const EMPTY_WORKTREE_HINTS: &[(&str, &str)] = &[
-    ("n", "start one here"),
-    ("W", "remove it"),
-    ("d", "diff"),
-    ("p", "files"),
-    ("q", "quit"),
-    ("u", "next"),
-    ("/", "find"),
+const EMPTY_WORKTREE_HINTS: &[Hint] = &[
+    Hint::Run(Command::NewSession, "start one here"),
+    Hint::Run(Command::RemoveWorktree, "remove it"),
+    Hint::Run(Command::Diff, "diff"),
+    Hint::Run(Command::FindFile, "files"),
+    Hint::Run(Command::Quit, "quit"),
+    Hint::Run(Command::NextNeedingYou, "next"),
+    Hint::Run(Command::Search, "find"),
 ];
 
 /// The sidebar's keys while the selected step's flow run has stopped, at a
 /// step that failed or was cut short.
-const STOPPED_HINTS: &[(&str, &str)] = &[
-    ("g", "run again"),
-    ("n", "new"),
-    ("x", "kill"),
-    ("q", "quit"),
-    ("u", "next"),
-    ("/", "find"),
-    ("d", "diff"),
+const STOPPED_HINTS: &[Hint] = &[
+    Hint::Run(Command::FlowGoOn, "run again"),
+    Hint::Run(Command::NewSession, "new"),
+    Hint::Run(Command::Kill, "kill"),
+    Hint::Run(Command::Quit, "quit"),
+    Hint::Run(Command::NextNeedingYou, "next"),
+    Hint::Run(Command::Search, "find"),
+    Hint::Run(Command::Diff, "diff"),
 ];
 
 /// The keys while the new-session panel is open.
@@ -1387,23 +1437,36 @@ fn draw_filter(frame: &mut Frame, theme: &Theme, filter: &Filter, matches: usize
 }
 
 /// The keys that don't go to the program, while a pane has the keyboard.
-const PANE_HINTS: &[(&str, &str)] = &[("ctrl+\\", "sidebar"), ("shift+pgup", "history")];
+const PANE_HINTS: &[Hint] = &[
+    Hint::HandBack("sidebar"),
+    Hint::Prefix("then a command's key"),
+    Hint::Key("shift+pgup", "history"),
+];
 
 /// The keys a background task's pane takes, while it has the keyboard.
-const TASK_PANE_HINTS: &[(&str, &str)] = &[
-    ("ctrl+\\", "sidebar"),
-    ("y/n/Y", "answer"),
-    ("ctrl+c", "stop the run"),
-    ("space", "follow-up"),
-    ("shift+pgup", "history"),
+const TASK_PANE_HINTS: &[Hint] = &[
+    Hint::HandBack("sidebar"),
+    Hint::Key("y/n/Y", "answer"),
+    Hint::Key("ctrl+c", "stop the run"),
+    Hint::Key("space", "follow-up"),
+    Hint::Prefix("then a command's key"),
+    Hint::Key("shift+pgup", "history"),
+];
+
+/// The keys after the prefix, in a pane.
+const PREFIXED_HINTS: &[Hint] = &[
+    Hint::Key("a command's key", "runs it"),
+    Hint::Run(Command::Commands, "every command"),
+    Hint::Prefix("again: to the program"),
+    Hint::Key("esc", "never mind"),
 ];
 
 /// The keys in resize mode.
-const RESIZE_HINTS: &[(&str, &str)] = &[
-    ("h/j/k/l", "move a border"),
-    ("=", "even out"),
-    ("esc", "done"),
-    ("shift+arrows", "another pane"),
+const RESIZE_HINTS: &[Hint] = &[
+    Hint::Key("h/j/k/l", "move a border"),
+    Hint::Key("=", "even out"),
+    Hint::Key("esc", "done"),
+    Hint::Key("shift+arrows", "another pane"),
 ];
 
 /// Where the keyboard is, then the keys that matter most there, as many as
@@ -1423,14 +1486,36 @@ fn hints_line<'a>(
         ]
     };
     let (mut spans, hints) = match app.focus() {
-        Focus::Sidebar if app.resizing() => (doing("resizing", app.selected()), RESIZE_HINTS),
-        Focus::Sidebar => (whereabouts(app, theme, width), sidebar_hints(app)),
-        Focus::Pane(slot) if app.pane_shows_task(slot) => {
-            (doing("in", app.pane_session(slot)), TASK_PANE_HINTS)
+        Focus::Sidebar if app.resizing() => (
+            doing("resizing", app.selected()),
+            written(app, RESIZE_HINTS),
+        ),
+        Focus::Sidebar => (
+            whereabouts(app, theme, width),
+            written(app, sidebar_hints(app)),
+        ),
+        Focus::Pane(_) if app.prefixed() => {
+            let prefix = app.keymap().prefix().map(|p| p.hint()).unwrap_or_default();
+            let lead = vec![Span::styled(
+                format!(" {prefix} …"),
+                Style::new().fg(theme.accent).add_modifier(Modifier::BOLD),
+            )];
+            (lead, written(app, PREFIXED_HINTS))
         }
-        Focus::Pane(slot) => (doing("typing into", app.pane_session(slot)), PANE_HINTS),
+        Focus::Pane(slot) if app.pane_shows_task(slot) => (
+            doing("in", app.pane_session(slot)),
+            written(app, TASK_PANE_HINTS),
+        ),
+        Focus::Pane(slot) => (
+            doing("typing into", app.pane_session(slot)),
+            written(app, PANE_HINTS),
+        ),
         Focus::Copy(slot) => {
             let hints = copying.map_or(&[][..], |pane| copy_mode::hints(&pane.screen));
+            let hints = hints
+                .iter()
+                .map(|(key, does)| (key.to_string(), does.to_string()))
+                .collect();
             (doing("copying from", app.pane_session(slot)), hints)
         }
     };
@@ -1453,7 +1538,7 @@ fn hints_line<'a>(
 /// The sidebar's keys, led by what the selected step's flow run takes
 /// while it waits on the user, or by what can be done with a worktree
 /// with no sessions.
-fn sidebar_hints(app: &App) -> &'static [(&'static str, &'static str)] {
+fn sidebar_hints(app: &App) -> &'static [Hint] {
     if app.selected_empty_worktree().is_some() {
         return EMPTY_WORKTREE_HINTS;
     }
@@ -1571,7 +1656,7 @@ mod tests {
     use std::path::PathBuf;
 
     fn theme() -> Theme {
-        Theme::new(ThemeName::Dark, false)
+        Theme::new(ThemeName::DARK, false)
     }
 
     fn look(theme: &Theme) -> Look<'_> {
@@ -1605,12 +1690,15 @@ mod tests {
         screen_text_at(app, 80, 12)
     }
 
+    /// How wide the sidebar is unless the config says.
+    const SIDEBAR: u16 = 28;
+
     /// The sidebar's rows on an 80 by 12 screen, up to the rule: what's
     /// beside them, like the pane's header, left out.
     fn sidebar_text(app: &App) -> Vec<String> {
         screen_text(app)
             .iter()
-            .map(|line| line.chars().take(usize::from(SIDEBAR_WIDTH) + 1).collect())
+            .map(|line| line.chars().take(usize::from(SIDEBAR) + 1).collect())
             .collect()
     }
 
@@ -1631,6 +1719,7 @@ mod tests {
             asking: None,
             reporter: None,
             subagents: 0,
+            bell: false,
         }
     }
 
@@ -1847,16 +1936,20 @@ mod tests {
         let top: String = (0..30).map(|x| buffer[(x, 0)].symbol()).collect();
         assert!(top.starts_with(" crystal   1 ▲  2 "), "{top}");
         assert_eq!(buffer[(13, 0)].fg, theme.waiting);
-        // The one waiting is in the first tab, out of this one's sidebar.
+        // The one waiting is in the first tab: pinned at the top of this
+        // one's sidebar, saying which tab it's in, and nowhere else.
         let sidebar = sidebar_text(&app);
+        assert!(sidebar[1].contains("needs you · 1"), "{sidebar:?}");
+        assert!(
+            sidebar[2].contains("▲ a") && sidebar[2].contains("⇥ 1"),
+            "{sidebar:?}"
+        );
         assert!(
             sidebar.iter().any(|line| line.contains("❯ b")),
             "{sidebar:?}"
         );
-        assert!(
-            !sidebar.iter().any(|line| line.contains("▲ a")),
-            "{sidebar:?}"
-        );
+        let waiting = sidebar.iter().filter(|line| line.contains("▲ a")).count();
+        assert_eq!(waiting, 1, "{sidebar:?}");
     }
 
     #[test]
@@ -2278,6 +2371,30 @@ mod tests {
     }
 
     #[test]
+    fn a_folded_sidebar_is_a_rail_of_marks_with_the_pinned_over_a_rule() {
+        let mut waiting = session("a", State::Running);
+        waiting.activity = Some(Activity::Waiting);
+        let mut app = App::new(None);
+        app.set_sessions(vec![waiting, session("b", State::Running)]);
+        app.on_key(KeyEvent::new(KeyCode::Char('\\'), KeyModifiers::NONE));
+        let rail: Vec<String> = screen_text(&app)
+            .iter()
+            .skip(1)
+            .take(4)
+            .map(|line| line.chars().take(4).collect())
+            .collect();
+        assert!(rail[0].starts_with(" ▲ │"), "{rail:?}");
+        assert!(rail[1].starts_with("── │"), "{rail:?}");
+        assert!(rail[2].starts_with(" ▲ │"), "{rail:?}");
+        assert!(!rail[3].starts_with("   "), "{rail:?}");
+        // A click on the rail selects the session drawn there.
+        let areas = Areas::of(&app, Rect::new(0, 0, 80, 12));
+        assert_eq!(areas.sidebar.width, 3);
+        assert_eq!(hit(&areas, &app, 1, 2), Hit::Sidebar, "the rule");
+        assert!(matches!(hit(&areas, &app, 1, 4), Hit::SidebarRow(_)));
+    }
+
+    #[test]
     fn a_click_finds_the_cell_on_the_panes_screen() {
         let app = app_with_sessions(1);
         let areas = Areas::of(&app, Rect::new(0, 0, 80, 24));
@@ -2298,7 +2415,7 @@ mod tests {
                 cell: None
             }
         );
-        assert_eq!(hit(&areas, &app, 28, 5), Hit::Elsewhere, "the rule");
+        assert_eq!(hit(&areas, &app, 28, 5), Hit::SidebarEdge(28), "the rule");
         assert_eq!(hit(&areas, &app, 40, 23), Hit::Elsewhere, "the footer");
     }
 

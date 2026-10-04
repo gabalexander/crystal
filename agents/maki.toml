@@ -1,0 +1,61 @@
+# Adapted from herdr's detection rules (Apache-2.0).
+# Maki renders a persistent one-line status bar on the bottom row. It starts
+# with the mode label "[BUILD]", "[PLAN]", or "[BASH]" when idle and gets a
+# leading braille spinner cell while the agent is streaming. Permission
+# requests and the plan-complete form replace the input box above the status
+# bar. Maki does not set OSC title or OSC 9;4 progress.
+id = "maki"
+name = "Maki"
+
+[[rules]]
+id = "permission_prompt"
+looks = "waiting"
+priority = 980
+region = "screen"
+contains = ["permission required"]
+any = [
+  { contains = ["y allow", "n deny"] },
+  { contains = ["confirm allow"] },
+  { contains = ["confirm deny"] },
+  { contains = ["enter deny", "esc cancel"] },
+]
+
+[[rules]]
+id = "plan_complete_form"
+looks = "waiting"
+priority = 970
+region = "screen"
+contains = ["plan complete", "enter confirm"]
+any = [
+  { contains = ["space toggle parallel"] },
+  { contains = ["edit plan"] },
+]
+
+[[rules]]
+id = "status_bar_spinner_working"
+looks = "working"
+priority = 900
+region = "last_rows(1)"
+line_regex = ['^( [\x{2800}-\x{28FF}]){1,2} \[(BUILD|PLAN|BASH)\]']
+
+[[rules]]
+id = "status_bar_idle"
+looks = "settled"
+priority = 850
+region = "last_rows(1)"
+line_regex = ['^ \[(BUILD|PLAN|BASH)\]']
+
+# On narrow panes the right side of the status bar overwrites the mode label,
+# so fall back to the prompt chevron above the input box border. The not-gates
+# keep this from matching the streaming placeholder or a status bar that still
+# shows the spinner.
+[[rules]]
+id = "prompt_box_idle"
+looks = "settled"
+priority = 840
+region = "last_rows(3)"
+line_regex = ['^❯ ']
+not = [
+  { contains = ["queue another prompt"] },
+  { line_regex = ['^( [\x{2800}-\x{28FF}]){1,2} '] },
+]

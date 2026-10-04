@@ -64,7 +64,7 @@ pub fn list(json: bool) -> Result<()> {
 
 /// Every server's name: the default's, then those with a directory of
 /// state or a socket.
-fn names() -> Vec<String> {
+pub fn names() -> Vec<String> {
     let name = |path: PathBuf, suffix: &str| -> Option<String> {
         let file = path.file_name()?.to_str()?;
         Some(file.strip_suffix(suffix)?.to_string())

@@ -5,8 +5,9 @@
 //! programs, come after a line of their own and are drawn quieter, with a
 //! prompt's chevron for a mark, so the two never look alike.
 
-use super::app::{App, Hit};
+use super::app::{App, Hit, RAIL_WIDTH};
 use super::groups::{self, Row};
+use super::keymap::Command;
 use super::status::Status;
 use super::theme::Theme;
 use super::ui::Look;
@@ -35,10 +36,28 @@ const SESSION_INDENT: &str = "     ";
 /// without color.
 const TERMINAL_MARK: &str = "❯";
 
+/// The mark before a session's time while its program has rung the bell
+/// out of sight, until it's looked at.
+const BELL_MARK: &str = "♪";
+
 pub fn draw(frame: &mut Frame, app: &App, look: &Look, area: Rect) {
+    if area.width <= RAIL_WIDTH {
+        draw_rail(frame, app, look, area);
+        return;
+    }
     let rows = app.rows();
-    if rows.is_empty() && app.filter().is_none() && !app.sessions().is_empty() {
-        draw_empty_tab(frame, look.theme, area);
+    // A tab with nothing of its own, while other tabs have sessions: the
+    // pinned group, if anything needs the user, then how to start
+    // something here.
+    let pinned = rows.iter().filter(|row| is_pinned(row)).count();
+    if pinned == rows.len() && app.filter().is_none() && !app.sessions().is_empty() {
+        for (offset, row) in rows.iter().enumerate().take(area.height.into()) {
+            let line_area = Rect::new(area.x, area.y + offset as u16, area.width, 1);
+            frame.render_widget(row_line(app, row, look, area.width, false), line_area);
+        }
+        let below = (pinned as u16 + u16::from(pinned > 0)).min(area.height);
+        let rest = Rect::new(area.x, area.y + below, area.width, area.height - below);
+        draw_empty_tab(frame, app, look.theme, rest);
         return;
     }
     let first = offset(app, area.height);
@@ -62,22 +81,30 @@ pub fn draw(frame: &mut Frame, app: &App, look: &Look, area: Rect) {
     }
 }
 
+/// Whether `row` is the pinned group's.
+fn is_pinned(row: &Row) -> bool {
+    matches!(row, Row::NeedsYou(_) | Row::Pinned(_))
+}
+
 /// The sidebar of a tab with no sessions in it, while other tabs have
-/// some: how to start something there, or close it.
-fn draw_empty_tab(frame: &mut Frame, theme: &Theme, area: Rect) {
+/// some: how to start something there, or close it, with the keys the
+/// user's `[keys]` gives.
+fn draw_empty_tab(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     let muted = Style::new().fg(theme.muted);
     let key = Style::new().fg(theme.text);
-    let lines = vec![
-        Line::styled(" nothing in this tab yet", muted),
-        Line::from(vec![
-            Span::styled(" n", key),
-            Span::styled(" starts a session here", muted),
-        ]),
-        Line::from(vec![
-            Span::styled(" &", key),
-            Span::styled(" closes the tab", muted),
-        ]),
+    let mut lines = vec![Line::styled(" nothing in this tab yet", muted)];
+    let keys = [
+        (Command::NewSession, " starts a session here"),
+        (Command::CloseTab, " closes the tab"),
     ];
+    for (command, does) in keys {
+        if let Some(hint) = app.keymap().hint(command) {
+            lines.push(Line::from(vec![
+                Span::styled(format!(" {hint}"), key),
+                Span::styled(does, muted),
+            ]));
+        }
+    }
     let shown = lines.into_iter().take(area.height.into());
     for (offset, line) in shown.enumerate() {
         let line_area = Rect::new(area.x, area.y + offset as u16, area.width, 1);
@@ -85,8 +112,84 @@ fn draw_empty_tab(frame: &mut Frame, theme: &Theme, area: Rect) {
     }
 }
 
+/// The folded sidebar: a rail of the tab's sessions' marks, a row each,
+/// the selected one's standing out, and above them, over a short rule, a
+/// mark for each pinned session that needs the user, from every tab.
+fn draw_rail(frame: &mut Frame, app: &App, look: &Look, area: Rect) {
+    let rows = app.rows();
+    let on_rail = rail_rows(app);
+    let first = rail_offset(app, &on_rail, area.height);
+    let selected = selected_row(app);
+    let shown = on_rail.iter().skip(first).take(area.height.into());
+    for (offset, &at) in shown.enumerate() {
+        let line_area = Rect::new(area.x, area.y + offset as u16, area.width, 1);
+        let Some(at) = at else {
+            let rule = "─".repeat(usize::from(area.width.saturating_sub(1)));
+            let line = Line::styled(rule, Style::new().fg(look.theme.rule));
+            frame.render_widget(line, line_area);
+            continue;
+        };
+        if selected == Some(at) {
+            frame
+                .buffer_mut()
+                .set_style(line_area, look.theme.selection);
+        }
+        let (mark, color) = match &rows[at] {
+            Row::Session(index) | Row::Pinned(index) => session_mark(&app.sessions()[*index], look),
+            _ => (" ", look.theme.muted),
+        };
+        let line = Line::from(vec![
+            Span::raw(MARGIN),
+            Span::styled(mark, Style::new().fg(color)),
+        ]);
+        frame.render_widget(line, line_area);
+    }
+}
+
+/// The rows the rail shows, by their places in [`App::rows`]: the pinned
+/// sessions, then `None` for the rule under them, then the tab's.
+fn rail_rows(app: &App) -> Vec<Option<usize>> {
+    let mut rail = Vec::new();
+    let mut after_pinned = false;
+    for (at, row) in app.rows().iter().enumerate() {
+        match row {
+            Row::Pinned(_) => {
+                after_pinned = true;
+                rail.push(Some(at));
+            }
+            Row::Session(_) => {
+                if std::mem::take(&mut after_pinned) {
+                    rail.push(None);
+                }
+                rail.push(Some(at));
+            }
+            _ => {}
+        }
+    }
+    rail
+}
+
+/// The first of the rail's rows on screen: far enough down to keep the
+/// selection in sight.
+fn rail_offset(app: &App, on_rail: &[Option<usize>], height: u16) -> usize {
+    let height = usize::from(height.max(1));
+    let selected = selected_row(app).and_then(|row| on_rail.iter().position(|&at| at == Some(row)));
+    match selected {
+        Some(last) if last >= height => last + 1 - height,
+        _ => 0,
+    }
+}
+
 /// Which sidebar row is on screen `row`, in a sidebar drawn in `area`.
 pub fn hit(area: Rect, app: &App, row: u16) -> Hit {
+    if area.width <= RAIL_WIDTH {
+        let on_rail = rail_rows(app);
+        let index = rail_offset(app, &on_rail, area.height) + usize::from(row - area.y);
+        return match on_rail.get(index) {
+            Some(Some(at)) => Hit::SidebarRow(*at),
+            _ => Hit::Sidebar,
+        };
+    }
     let index = offset(app, area.height) + usize::from(row - area.y);
     if index < app.rows().len() {
         Hit::SidebarRow(index)
@@ -158,13 +261,39 @@ fn row_line<'a>(app: &'a App, row: &Row, look: &Look, width: u16, selected: bool
                 return step_line(run, step, Some(session), look, width, selected);
             }
             let marked = app.marked_letters(*index);
-            session_line(session, &marked, look, width, selected)
+            let tab = app.elsewhere(*index);
+            session_line(
+                session,
+                &marked,
+                tab.as_deref(),
+                SESSION_INDENT,
+                look,
+                width,
+                selected,
+            )
         }
         Row::Terminals => terminals_line(theme, width),
         Row::NoSessions(_) => no_sessions_line(theme, width, selected),
         Row::Task(index) => task_line(&app.sessions()[*index], theme, width),
         Row::Flow(run) => flow_heading(&app.flows()[*run], look, width),
         Row::Step { run, step } => step_line(&app.flows()[*run], *step, None, look, width, false),
+        Row::NeedsYou(count) => {
+            let style = Style::new().fg(look.theme.waiting);
+            heading(&format!("needs you · {count}"), style, look, width)
+        }
+        Row::Pinned(index) => {
+            let session = &app.sessions()[*index];
+            let tab = app.tab_elsewhere(*index);
+            session_line(
+                session,
+                &[],
+                tab.as_deref(),
+                WORKTREE_INDENT,
+                look,
+                width,
+                false,
+            )
+        }
     }
 }
 
@@ -450,9 +579,15 @@ fn heading<'a>(name: &str, style: Style, look: &Look, width: u16) -> Line<'a> {
 /// name doesn't say, and on the right how long ago it changed. Short of
 /// room, what's in front goes first, then the time, before the name is
 /// cut. The letters at `marked` in the name are those `/`'s filter matched.
+/// `tab` is the tab it's in when it's shown from one other than the tab in
+/// front, by `/`'s filter or pinned as needing the user: its name takes
+/// the place of how long ago the session changed, so the user knows that
+/// picking it changes tabs. `indent` is how far in it starts.
 fn session_line<'a>(
     session: &SessionInfo,
     marked: &[usize],
+    tab: Option<&str>,
+    indent: &'static str,
     look: &Look,
     width: u16,
     selected: bool,
@@ -470,13 +605,19 @@ fn session_line<'a>(
         name_style = name_style.add_modifier(Modifier::BOLD);
     }
     // The indent, the mark and a space before the name; a space at the end.
-    let room = usize::from(width).saturating_sub(SESSION_INDENT.len() + 2 + 1);
-    let when = changed_ago(session, look.now);
+    let room = usize::from(width).saturating_sub(indent.len() + 2 + 1);
+    let mut when = match tab {
+        Some(tab) => format!("⇥ {tab}"),
+        None => changed_ago(session, look.now),
+    };
+    if session.bell {
+        when = format!("{BELL_MARK} {when}").trim_end().to_string();
+    }
     let label = extras_label(session);
     let (label, when) = fitting_extras(session.name.chars().count(), &label, &when, room);
 
     let mut spans = vec![
-        Span::raw(SESSION_INDENT),
+        Span::raw(indent),
         Span::styled(mark, Style::new().fg(mark_color)),
         Span::raw(" "),
     ];
@@ -496,7 +637,19 @@ fn session_line<'a>(
         let used: usize = spans.iter().skip(3).map(Span::width).sum();
         let gap = room.saturating_sub(used + when.chars().count());
         spans.push(Span::raw(" ".repeat(gap)));
-        spans.push(Span::styled(when.to_string(), Style::new().fg(theme.muted)));
+        let color = if tab.is_some() {
+            theme.accent
+        } else {
+            theme.muted
+        };
+        let time = match when.strip_prefix(BELL_MARK) {
+            Some(time) => {
+                spans.push(Span::styled(BELL_MARK, Style::new().fg(theme.waiting)));
+                time
+            }
+            None => when,
+        };
+        spans.push(Span::styled(time.to_string(), Style::new().fg(color)));
     }
     Line::from(spans)
 }
@@ -687,12 +840,13 @@ mod tests {
             asking: None,
             reporter: None,
             subagents: 0,
+            bell: false,
         }
     }
 
     /// What a session's task line says, after its indent.
     fn task_words(session: &SessionInfo) -> String {
-        let theme = Theme::new(crate::config::ThemeName::Dark, false);
+        let theme = Theme::new(crate::config::ThemeName::DARK, false);
         let line = task_line(session, &theme, 60);
         let words: String = line.spans[1..].iter().map(|s| s.content.as_ref()).collect();
         words.trim_end().to_string()
@@ -734,7 +888,7 @@ mod tests {
 
     #[test]
     fn a_running_terminal_has_the_chevron_and_an_agent_its_status() {
-        let theme = Theme::new(crate::config::ThemeName::Dark, false);
+        let theme = Theme::new(crate::config::ThemeName::DARK, false);
         let look = Look {
             theme: &theme,
             now: 0,
@@ -761,14 +915,14 @@ mod tests {
 
     #[test]
     fn a_terminal_s_name_is_muted_and_an_agent_s_is_not() {
-        let theme = Theme::new(crate::config::ThemeName::Dark, false);
+        let theme = Theme::new(crate::config::ThemeName::DARK, false);
         let look = Look {
             theme: &theme,
             now: 0,
             spin: 0,
         };
         let name_color = |session: &SessionInfo| {
-            let line = session_line(session, &[], &look, 28, false);
+            let line = session_line(session, &[], None, SESSION_INDENT, &look, 28, false);
             // The indent, the mark and a space, then the name.
             line.spans[3].style.fg
         };
@@ -778,9 +932,28 @@ mod tests {
     }
 
     #[test]
+    fn a_session_that_rang_out_of_sight_is_marked_before_its_time() {
+        let theme = Theme::new(crate::config::ThemeName::DARK, false);
+        let look = Look {
+            theme: &theme,
+            now: 720,
+            spin: 0,
+        };
+        let mut rang = session("build", Front::Shell { name: "zsh".into() });
+        rang.changed = 1;
+        let line = session_line(&rang, &[], None, SESSION_INDENT, &look, 28, false);
+        assert_eq!(line.to_string(), "     ❯ build zsh        11m");
+        rang.bell = true;
+        let line = session_line(&rang, &[], None, SESSION_INDENT, &look, 28, false);
+        assert_eq!(line.to_string(), "     ❯ build zsh      ♪ 11m");
+        let mark = line.spans.iter().find(|span| span.content == BELL_MARK);
+        assert_eq!(mark.unwrap().style.fg, Some(theme.waiting));
+    }
+
+    #[test]
     fn a_worktree_git_is_removing_says_so_on_its_line() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-        let theme = Theme::new(crate::config::ThemeName::Dark, false);
+        let theme = Theme::new(crate::config::ThemeName::DARK, false);
         let project = Path::new("/code/app");
         let path = Path::new("/code/app.worktrees/old");
         // An agent that has ended in the worktree, which `W` removes.
@@ -811,7 +984,7 @@ mod tests {
 
     #[test]
     fn the_line_before_the_terminals_fills_the_row() {
-        let theme = Theme::new(crate::config::ThemeName::Dark, false);
+        let theme = Theme::new(crate::config::ThemeName::DARK, false);
         let line = terminals_line(&theme, 28);
         assert_eq!(line.width(), 27);
         assert!(line.to_string().starts_with("     terminals ┄┄"));

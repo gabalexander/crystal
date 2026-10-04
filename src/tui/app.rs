@@ -12,6 +12,7 @@ use super::archived_view::{self, ArchivedView};
 use super::away::{Away, Tally};
 use super::backlog_view::{BacklogChange, BacklogView, Step};
 use super::command_line;
+use super::command_list::{self, CommandList, Pick, PluginAction};
 use super::compose::Typed;
 use super::diff_view::{self, Against, DiffView};
 use super::finder::Finder;
@@ -19,6 +20,7 @@ use super::grep::Grep;
 use super::groups::{self, Row};
 use super::help;
 use super::issues::{self, IssuesView};
+use super::keymap::{Command, Keymap};
 use super::launcher::{self, Launcher, Memory, Run, Setup, Target};
 use super::layouts::{self, Layouts, LayoutsView, Program, Programs, Which};
 use super::memory_view::MemoryView;
@@ -41,12 +43,11 @@ use super::timeline::{self, TimelineView};
 use super::tree_browser::TreeBrowser;
 use crate::catalog::{self, Agent};
 use crate::client::Purpose;
-use crate::config::Config;
+use crate::config::{Config, Fold, SIDEBAR_WIDTHS};
 use crate::events::Event;
 use crate::flow_run::{FlowRun, RunState};
 use crate::flows::{self, Flow};
 use crate::forge::{self, Checkout, Forge, Issue, PullRequest, PullRequestDetail, Topic};
-use crate::keys;
 use crate::profile::{self, Profile};
 use crate::project_commands::Verb;
 use crate::protocol::{
@@ -90,8 +91,11 @@ pub enum Hit {
     Tab(usize),
     /// A row of the sidebar, by its place in [`App::rows`].
     SidebarRow(usize),
-    /// The sidebar, but none of its rows: its border, or below the last.
+    /// The sidebar, but none of its rows: below the last.
     Sidebar,
+    /// The rule between the sidebar and the panes, which the mouse drags
+    /// to resize the sidebar: the column the mouse is at.
+    SidebarEdge(u16),
     /// The pane at `slot`. `cell` is the `(row, column)` on its session's
     /// screen, counted from 0, when the mouse is inside the pane's border.
     Pane {
@@ -310,11 +314,11 @@ impl Confirm {
 /// The menu for a tab, once it's in front.
 fn tab_menu() -> Vec<Item> {
     vec![
-        Item::new("new tab", 't'),
-        Item::new("name it", 'T'),
-        Item::new("saved layouts", 'S'),
-        Item::new("the archive", 'Z'),
-        Item::danger("close it", '&'),
+        Item::new("new tab", Command::NewTab),
+        Item::new("name it", Command::RenameTab),
+        Item::new("saved layouts", Command::Layouts),
+        Item::new("the archive", Command::Archived),
+        Item::danger("close it", Command::CloseTab),
     ]
 }
 
@@ -626,10 +630,11 @@ impl Action {
     }
 }
 
-/// A sidebar key one of the installed plugins' actions took.
+/// An action of one of the installed plugins, and the sidebar key it
+/// took, if it took one: the `:` list offers every one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PluginKey {
-    pub key: char,
+    pub key: Option<char>,
     pub plugin: String,
     pub action: String,
     pub title: String,
@@ -816,7 +821,55 @@ pub struct App {
     /// Whether the footer says what happened while the user was away: until
     /// the next key.
     away_shown: bool,
+    /// Which command each sidebar key runs, the prefix and the key that
+    /// hands the keyboard back: see [`super::keymap`].
+    keymap: Keymap,
+    /// Whether the prefix was pressed in a pane: the next key is a
+    /// command's.
+    prefixed: bool,
+    /// The `:` list, while it's open.
+    command_list: Option<CommandList>,
+    /// What was run from the `:` list lately, the latest first.
+    recent_commands: Vec<Pick>,
+    /// How wide the sidebar is and whether it's folded.
+    sidebar: Shape,
+    /// What a folded sidebar keeps.
+    fold: Fold,
+    /// Whether the sessions that need the user lead the sidebar, from every
+    /// tab.
+    pin_needs_you: bool,
+    /// Whether the sidebar's edge is being dragged with the mouse.
+    dragging_sidebar: bool,
 }
+
+/// How wide the sidebar is and whether it's folded, as the user left it,
+/// which the event loop keeps in the database. A width from the config
+/// holds until the user resizes the sidebar, and again once the config
+/// gives another: `from_config` is the config's width it was resized from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Shape {
+    pub width: u16,
+    pub from_config: u16,
+    #[serde(skip)]
+    pub folded: bool,
+}
+
+impl Default for Shape {
+    fn default() -> Shape {
+        let width = crate::config::SidebarSettings::default().width;
+        Shape {
+            width,
+            from_config: width,
+            folded: false,
+        }
+    }
+}
+
+/// How many columns `(` and `)` take from the sidebar or give it.
+const SIDEBAR_STEP: i32 = 4;
+
+/// How wide a folded sidebar's rail of marks is.
+pub const RAIL_WIDTH: u16 = 3;
 
 impl App {
     /// A TUI with no sessions yet. `own_id` is the id of the session it
@@ -885,7 +938,117 @@ impl App {
             needs_you: None,
             away: None,
             away_shown: false,
+            keymap: Keymap::default(),
+            prefixed: false,
+            command_list: None,
+            recent_commands: Vec::new(),
+            sidebar: Shape::default(),
+            fold: Fold::Marks,
+            pin_needs_you: true,
+            dragging_sidebar: false,
         }
+    }
+
+    /// Takes the keys and the sidebar's settings from the config. A config
+    /// whose keys don't make sense never loads, so this keeps the defaults
+    /// for it only in a config made up in a test.
+    pub fn set_interface(&mut self, config: &Config) {
+        self.keymap = Keymap::new(&config.keys).unwrap_or_default();
+        let settings = &config.sidebar;
+        if settings.width != self.sidebar.from_config {
+            self.sidebar.width = settings.width;
+            self.sidebar.from_config = settings.width;
+        }
+        self.fold = settings.fold;
+        self.pin_needs_you = settings.needs_you;
+    }
+
+    /// Takes the sidebar's shape the TUI kept, and whether the config has it
+    /// start folded. A kept width holds only while the config's width is
+    /// the one it was resized from.
+    pub fn set_sidebar(&mut self, kept: Option<Shape>, folded: bool) {
+        if let Some(kept) = kept
+            && kept.from_config == self.sidebar.from_config
+            && SIDEBAR_WIDTHS.contains(&kept.width)
+        {
+            self.sidebar.width = kept.width;
+        }
+        self.sidebar.folded = folded;
+    }
+
+    /// The sidebar's shape, to keep.
+    pub fn sidebar_shape(&self) -> Shape {
+        self.sidebar
+    }
+
+    /// How many columns the sidebar takes: its width, or folded, a rail of
+    /// marks or nothing; never so many that the panes have less than a
+    /// third of `screen_width`.
+    pub fn sidebar_columns(&self, screen_width: u16) -> u16 {
+        if self.sidebar.folded {
+            return match self.fold {
+                Fold::Marks => RAIL_WIDTH.min(screen_width),
+                Fold::Hidden => 0,
+            };
+        }
+        let most = (screen_width * 2 / 3).max(*SIDEBAR_WIDTHS.start());
+        self.sidebar.width.min(most).min(screen_width)
+    }
+
+    /// Whether the sidebar is folded.
+    pub fn sidebar_folded(&self) -> bool {
+        self.sidebar.folded
+    }
+
+    /// Whether the sidebar's edge is being dragged.
+    pub fn dragging_sidebar(&self) -> bool {
+        self.dragging_sidebar
+    }
+
+    /// `(` and `)`: the sidebar `by` columns wider, or narrower. Folded,
+    /// wider unfolds it.
+    fn resize_sidebar(&mut self, by: i32) {
+        if self.sidebar.folded {
+            if by > 0 {
+                self.sidebar.folded = false;
+            }
+            return;
+        }
+        let width = (i32::from(self.sidebar.width) + by).clamp(
+            i32::from(*SIDEBAR_WIDTHS.start()),
+            i32::from(*SIDEBAR_WIDTHS.end()),
+        );
+        self.sidebar.width = width as u16;
+    }
+
+    /// Where the sidebar's edge has been dragged to: the sidebar takes the
+    /// columns left of it, unfolding if it was folded.
+    fn drag_sidebar_to(&mut self, column: u16) {
+        let most = (self.screen.width * 2 / 3).max(*SIDEBAR_WIDTHS.start());
+        let width = column.clamp(*SIDEBAR_WIDTHS.start(), *SIDEBAR_WIDTHS.end());
+        self.sidebar.width = width.min(most);
+        self.sidebar.folded = false;
+    }
+
+    /// `\`: folds the sidebar, or unfolds it.
+    fn fold_sidebar(&mut self) {
+        self.sidebar.folded = !self.sidebar.folded;
+    }
+
+    /// The keymap the TUI goes by.
+    pub fn keymap(&self) -> &Keymap {
+        &self.keymap
+    }
+
+    /// Whether the prefix was pressed, in a pane, and the next key is a
+    /// command's.
+    pub fn prefixed(&self) -> bool {
+        self.prefixed
+    }
+
+    /// The `:` list, while it's open.
+    pub fn command_list(&self) -> Option<&CommandList> {
+        self.command_list.as_ref()
     }
 
     /// Takes which of crystal's plugins the config has on.
@@ -927,11 +1090,12 @@ impl App {
     pub fn plugin_key_rows(&self) -> Vec<(String, String)> {
         self.plugin_keys
             .iter()
-            .map(|key| {
-                (
-                    key.key.to_string(),
-                    format!("{}: {}", key.plugin, key.title),
-                )
+            .filter_map(|taken| {
+                let key = taken.key?;
+                Some((
+                    key.to_string(),
+                    format!("{}: {}", taken.plugin, taken.title),
+                ))
             })
             .collect()
     }
@@ -1181,6 +1345,7 @@ impl App {
         let shown = help::Shown {
             plugin_on: &plugin_on,
             plugin_keys: &plugin_keys,
+            keymap: &self.keymap,
         };
         help::page_count(&shown, self.screen)
     }
@@ -1470,7 +1635,56 @@ impl App {
         if !self.tasks_on {
             rows.retain(|row| !matches!(row, Row::Task(_)));
         }
-        rows
+        let pinned = self.pinned();
+        if pinned.is_empty() {
+            return rows;
+        }
+        let mut with_pinned = vec![Row::NeedsYou(pinned.len())];
+        with_pinned.extend(pinned.into_iter().map(Row::Pinned));
+        with_pinned.extend(rows);
+        with_pinned
+    }
+
+    /// The sessions the sidebar pins at its top, from every tab: those
+    /// waiting on the user, then those that finished a turn nobody has
+    /// looked at, each tab's in its order, the tab in front's first. None
+    /// while `/`'s filter is open, which finds sessions in every tab itself.
+    fn pinned(&self) -> Vec<usize> {
+        if !self.pin_needs_you || self.filter.is_some() {
+            return Vec::new();
+        }
+        let count = self.tabs.all().len();
+        let first = self.tabs.current_index();
+        let in_order: Vec<usize> = (0..count)
+            .flat_map(|step| self.sessions_in((first + step) % count))
+            .collect();
+        [Status::Waiting, Status::Done]
+            .into_iter()
+            .flat_map(|wanted| {
+                in_order
+                    .iter()
+                    .copied()
+                    .filter(move |&index| Status::of(&self.sessions[index]) == wanted)
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// The tab the session at `index` is in, when it isn't the tab in
+    /// front: its name, or its number when it has none, as the top bar
+    /// shows it.
+    pub fn tab_elsewhere(&self, index: usize) -> Option<String> {
+        let name = &self.sessions.get(index)?.name;
+        let tab = self.tabs.tab_of(name)?;
+        if tab == self.tabs.current_index() {
+            return None;
+        }
+        let named = &self.tabs.all()[tab].name;
+        Some(if named.is_empty() {
+            (tab + 1).to_string()
+        } else {
+            named.clone()
+        })
     }
 
     /// The projects crystal knows that no session is in, in any tab, by
@@ -1606,17 +1820,24 @@ impl App {
         self.filter.as_ref()
     }
 
-    /// The sessions shown in the sidebar, by index: those of the tab in
-    /// front that match the filter while it's open, or else all of them.
+    /// The sessions shown in the sidebar, by index: while `/`'s filter is
+    /// open, those that match it in every tab, or else all of the tab in
+    /// front's.
     pub fn matches(&self) -> Vec<usize> {
-        let query = self
-            .filter
-            .as_ref()
-            .map_or("", |filter| filter.input.text());
-        self.in_tab()
-            .into_iter()
+        let Some(filter) = &self.filter else {
+            return self.in_tab();
+        };
+        let query = filter.input.text();
+        (0..self.sessions.len())
             .filter(|&index| search::session_match(query, &self.sessions[index]).is_some())
             .collect()
+    }
+
+    /// The name of the tab the session at `index` is in, while `/`'s filter
+    /// shows it from a tab other than the one in front.
+    pub fn elsewhere(&self, index: usize) -> Option<String> {
+        self.filter.as_ref()?;
+        self.tab_elsewhere(index)
     }
 
     /// The sessions in the tab in front, by index, in the sidebar's order.
@@ -2383,10 +2604,12 @@ impl App {
     fn take_key(&mut self, key: KeyEvent) -> Option<Action> {
         self.notice = None;
         self.away_shown = false;
+        // The prefix is for the very next key, wherever it goes.
+        let prefixed = std::mem::take(&mut self.prefixed);
         // A plugin's pane is over everything, and has every key but the one
         // that closes it.
         if self.plugin_pane.is_some() {
-            if keys::is_hand_back(&key) {
+            if self.keymap.is_hand_back(&key) {
                 return Some(Action::ClosePluginPane);
             }
             return Some(Action::TypeInPluginPane(key));
@@ -2447,6 +2670,9 @@ impl App {
         if self.reply.is_some() {
             return self.on_reply_key(key);
         }
+        if self.command_list.is_some() {
+            return self.on_command_list_key(key);
+        }
         if self.backlog.is_some() {
             return self.on_backlog_key(key);
         }
@@ -2493,6 +2719,7 @@ impl App {
         }
         match self.focus {
             Focus::Sidebar => self.on_sidebar_key(key),
+            Focus::Pane(slot) if prefixed => self.after_prefix(slot, key),
             Focus::Pane(slot) => self.on_pane_key(slot, key),
             Focus::Copy(slot) => self.on_copy_key(slot, key),
         }
@@ -2527,13 +2754,36 @@ impl App {
             }
             return None;
         }
+        let click = kind == MouseEventKind::Down(MouseButton::Left);
+        // `/`'s filter waits on the keyboard, but a click on a match picks it.
+        if self.filter.is_some()
+            && click
+            && let Hit::SidebarRow(row) = hit
+        {
+            self.click_row(row);
+            return None;
+        }
         if self.waiting_on_keyboard() {
             return None;
         }
-        let click = kind == MouseEventKind::Down(MouseButton::Left);
         if click {
             self.notice = None;
             self.resizing = false;
+        }
+        // The sidebar's edge follows the mouse until the button comes up.
+        if self.dragging_sidebar {
+            match (kind, hit) {
+                (MouseEventKind::Drag(_), Hit::SidebarEdge(column)) => {
+                    self.drag_sidebar_to(column);
+                    return None;
+                }
+                (MouseEventKind::Down(_), _) => self.dragging_sidebar = false,
+                (MouseEventKind::Up(_), _) => {
+                    self.dragging_sidebar = false;
+                    return None;
+                }
+                _ => return None,
+            }
         }
         // A border taken by the mouse follows it until the button comes up.
         if let Some(split) = self.border {
@@ -2603,6 +2853,7 @@ impl App {
             (_, Hit::SidebarRow(row)) if click => self.click_row(row),
             // Anywhere else in the sidebar, the click only takes the keyboard.
             (_, Hit::Sidebar) if click => self.focus = Focus::Sidebar,
+            (_, Hit::SidebarEdge(_)) if click => self.dragging_sidebar = true,
             (_, Hit::Border { split, .. }) if click && !self.zoomed() => self.border = Some(split),
             (_, Hit::Pane { slot, cell }) if click => {
                 // A click hands a pane the keyboard, but copy mode keeps it.
@@ -2674,7 +2925,7 @@ impl App {
             self.stop_copying();
         }
         self.focus = Focus::Sidebar;
-        self.menu = Some(Menu::new(at, items));
+        self.menu = Some(Menu::new(at, items, &self.keymap));
         self.remember_shown();
         None
     }
@@ -2721,9 +2972,9 @@ impl App {
                 self.menu = None;
                 None
             }
-            menu::Step::Press(code) => {
+            menu::Step::Run(command) => {
                 self.menu = None;
-                let action = self.on_sidebar_key(KeyEvent::new(code, KeyModifiers::NONE));
+                let action = self.run(command);
                 self.remember_shown();
                 action
             }
@@ -2763,7 +3014,16 @@ impl App {
                         | Row::Flow(_)
                 )
             })?),
-            Row::OutsideGit | Row::Terminals | Row::Flow(_) | Row::Step { .. } => return None,
+            // A pinned session is selected where it is, in whichever tab.
+            Row::Pinned(index) => {
+                let name = self.sessions[*index].name.clone();
+                self.select(&name);
+            }
+            Row::OutsideGit
+            | Row::Terminals
+            | Row::Flow(_)
+            | Row::Step { .. }
+            | Row::NeedsYou(_) => return None,
         }
         self.focus = Focus::Sidebar;
         if self.on_worktree.is_some() {
@@ -2778,46 +3038,49 @@ impl App {
         let session = self.selected()?;
         let running = session.state == State::Running;
         let mut items = vec![if running {
-            Item::enter("type into it")
+            Item::new("type into it", Command::Open)
         } else {
-            Item::enter("start it again")
+            Item::new("start it again", Command::Open)
         }];
         items.push(if self.is_split(&session.name) {
-            Item::new("close its split", 's')
+            Item::new("close its split", Command::ToggleSplit)
         } else {
-            Item::new("split it off", 's')
+            Item::new("split it off", Command::ToggleSplit)
         });
         if on_pane {
-            items.push(Item::new("split side by side", '|'));
-            items.push(Item::new("split below", '-'));
+            items.push(Item::new("split side by side", Command::SplitRight));
+            items.push(Item::new("split below", Command::SplitDown));
         }
         items.push(if self.is_floating(&session.name) {
-            Item::new("put it back", 'F')
+            Item::new("put it back", Command::Float)
         } else {
-            Item::new("float it", 'F')
+            Item::new("float it", Command::Float)
         });
-        items.push(Item::new("zoom", 'z'));
+        items.push(Item::new("zoom", Command::Zoom));
         if on_pane {
-            items.push(Item::new("copy mode", 'v'));
-            items.push(Item::new("edit its history", 'e'));
+            items.push(Item::new("copy mode", Command::Copy));
+            items.push(Item::new("edit its history", Command::EditHistory));
         }
-        items.push(Item::new("rename", 'r'));
-        items.push(Item::new("move to another tab", '>'));
+        items.push(Item::new("rename", Command::Rename));
+        items.push(Item::new("move to another tab", Command::MoveToTab));
         if session.worktree.is_some() {
-            items.push(Item::new("what changed", 'd'));
-            items.push(Item::new("find a file", 'p'));
-            items.push(Item::new("browse its files", 'E'));
-            items.push(Item::new("run the project, or stop it", '!'));
-            items.push(Item::new("open the project", '.'));
+            items.push(Item::new("what changed", Command::Diff));
+            items.push(Item::new("find a file", Command::FindFile));
+            items.push(Item::new("browse its files", Command::FileTree));
+            items.push(Item::new(
+                "run the project, or stop it",
+                Command::RunProject,
+            ));
+            items.push(Item::new("open the project", Command::OpenProject));
             if self.github_on() {
-                items.push(Item::new("its pull request", 'o'));
+                items.push(Item::new("its pull request", Command::PullRequest));
             }
         }
         if self.tasks_on && session.task.as_ref().is_some_and(|task| task.is_open()) {
-            items.push(Item::new("close its task", 'c'));
+            items.push(Item::new("close its task", Command::CloseTask));
         }
-        items.push(Item::new("archive it", 'A'));
-        items.push(Item::danger("kill it", 'x'));
+        items.push(Item::new("archive it", Command::Archive));
+        items.push(Item::danger("kill it", Command::Kill));
         Some(items)
     }
 
@@ -2825,18 +3088,18 @@ impl App {
     fn empty_worktree_menu(&self) -> Vec<Item> {
         let main = self.selected_empty_worktree().is_some_and(|w| w.main);
         let mut items = vec![
-            Item::new("start a session here", 'n'),
-            Item::new("new worktree", 'w'),
-            Item::new("run the project", '!'),
-            Item::new("open the project", '.'),
-            Item::new("what changed", 'd'),
-            Item::new("find a file", 'p'),
-            Item::new("browse its files", 'E'),
+            Item::new("start a session here", Command::NewSession),
+            Item::new("new worktree", Command::NewWorktree),
+            Item::new("run the project", Command::RunProject),
+            Item::new("open the project", Command::OpenProject),
+            Item::new("what changed", Command::Diff),
+            Item::new("find a file", Command::FindFile),
+            Item::new("browse its files", Command::FileTree),
         ];
         items.push(if main {
-            Item::danger("take the project off the list", 'W')
+            Item::danger("take the project off the list", Command::RemoveWorktree)
         } else {
-            Item::danger("remove the worktree", 'W')
+            Item::danger("remove the worktree", Command::RemoveWorktree)
         });
         items
     }
@@ -2844,20 +3107,20 @@ impl App {
     /// The menu for a project's heading.
     fn project_menu(&self) -> Vec<Item> {
         let mut items = vec![
-            Item::new("new session", 'n'),
-            Item::new("new worktree", 'w'),
-            Item::new("run the project, or stop it", '!'),
-            Item::new("open the project", '.'),
+            Item::new("new session", Command::NewSession),
+            Item::new("new worktree", Command::NewWorktree),
+            Item::new("run the project, or stop it", Command::RunProject),
+            Item::new("open the project", Command::OpenProject),
         ];
         if self.github_on() {
-            items.push(Item::new("pull requests", 'O'));
-            items.push(Item::new("issues", 'i'));
+            items.push(Item::new("pull requests", Command::PullRequests));
+            items.push(Item::new("issues", Command::Issues));
         }
         if self.backlog_on {
-            items.push(Item::new("the backlog", 'b'));
+            items.push(Item::new("the backlog", Command::Backlog));
         }
         if self.memory_on {
-            items.push(Item::new("what it remembers", 'm'));
+            items.push(Item::new("what it remembers", Command::Memory));
         }
         items
     }
@@ -2868,6 +3131,7 @@ impl App {
     /// panel, the profiles view and the others over the panes.
     fn waiting_on_keyboard(&self) -> bool {
         let typing = self.filter.is_some()
+            || self.command_list.is_some()
             || self.timeline.is_some()
             || self.needs_you.is_some()
             || self.issues.is_some()
@@ -2900,6 +3164,23 @@ impl App {
     fn click_row(&mut self, row: usize) {
         self.focus = Focus::Sidebar;
         let rows = self.rows();
+        // While `/`'s filter is open, a click on a session picks it, as
+        // Enter would, from whichever tab it's in; any other row does
+        // nothing.
+        if self.filter.is_some() {
+            if let Some(Row::Session(index) | Row::Task(index)) = rows.get(row) {
+                let name = self.sessions[*index].name.clone();
+                self.filter = None;
+                self.select(&name);
+            }
+            return;
+        }
+        // A pinned session is selected where it is, in whichever tab.
+        if let Some(Row::Pinned(index)) = rows.get(row) {
+            let name = self.sessions[*index].name.clone();
+            self.select(&name);
+            return;
+        }
         if let Some(row) = rows.get(row)
             && matches!(row, Row::Session(_) | Row::Task(_) | Row::NoSessions(_))
         {
@@ -2908,116 +3189,134 @@ impl App {
     }
 
     fn on_sidebar_key(&mut self, key: KeyEvent) -> Option<Action> {
-        // Ctrl or Alt with a letter isn't that letter. Ctrl+J is a line feed,
-        // which a terminal sends as it closes, and it mustn't move the
-        // selection: showing a session counts as having seen it.
-        if key
-            .modifiers
-            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
-        {
+        // The prefix does nothing here, where every key is a command's
+        // already: the key after it does what it always does.
+        if self.keymap.is_prefix(&key) {
             return None;
         }
+        let ctrl_or_alt = key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
         // On a background task asking for a permission, `y`, `n` and `Y`
         // answer it; `n` is a new session again once it's answered.
-        if let Some(answer) = answer_key(key.code)
+        if !ctrl_or_alt
+            && let Some(answer) = answer_key(key.code)
             && let Some(name) = self.selected().filter(|s| s.asking.is_some())
         {
             let name = name.name.clone();
             return Some(Action::Answer { name, answer });
         }
-        // Shift and an arrow go from pane to pane, where the arrow points.
-        if key.modifiers.contains(KeyModifiers::SHIFT)
-            && let Some(toward) = arrow(key.code)
-        {
-            self.focus_toward(toward);
+        if let Some(command) = self.keymap.command(&key) {
+            return self.run(command);
+        }
+        // Ctrl or Alt with a letter isn't that letter. Ctrl+J is a line feed,
+        // which a terminal sends as it closes, and it mustn't move the
+        // selection: showing a session counts as having seen it.
+        if ctrl_or_alt {
             return None;
         }
         match key.code {
-            KeyCode::Char('j') | KeyCode::Down => self.move_selection(1),
-            KeyCode::Char('k') | KeyCode::Up => self.move_selection(-1),
             KeyCode::Char('y' | 'Y') => {
                 let not_asking = |s: &SessionInfo| format!("{} isn't asking for anything", s.name);
                 let notice = self
                     .selected()
                     .map_or_else(|| "there's no session selected".into(), not_asking);
                 self.notify(notice);
+                None
             }
+            KeyCode::Char(c) => self.run_plugin_key(c),
+            _ => None,
+        }
+    }
+
+    /// Runs `command`, as its key does in the sidebar: from the sidebar,
+    /// from the `:` list, or after the prefix in a pane.
+    fn run(&mut self, command: Command) -> Option<Action> {
+        match command {
+            Command::Down => self.move_selection(1),
+            Command::Up => self.move_selection(-1),
             // On a worktree with no sessions, there's nothing to type into:
             // Enter starts something there, as `n` does.
-            KeyCode::Enter if self.on_worktree.is_some() => return self.open_launcher(false),
-            KeyCode::Enter => self.enter(),
-            KeyCode::Char(' ') if self.on_worktree.is_some() => {}
-            KeyCode::Char(' ') => match self.selected_name() {
+            Command::Open if self.on_worktree.is_some() => return self.open_launcher(false),
+            Command::Open => self.enter(),
+            Command::Reply if self.on_worktree.is_some() => {}
+            Command::Reply => match self.selected_name() {
                 Some(name) => self.open_reply(&name),
                 None => self.notify("there's no session selected".into()),
             },
-            KeyCode::Tab => self.move_to_pane(Round::Forward),
-            KeyCode::BackTab => self.move_to_pane(Round::Back),
-            KeyCode::Char('s') => self.toggle_split(),
-            KeyCode::Char('|') => self.split_pane(Way::Right, HALF),
-            KeyCode::Char('-') => self.split_pane(Way::Down, HALF),
-            KeyCode::Char('z') => self.toggle_zoom(),
-            KeyCode::Char('v') => self.start_copying(),
-            KeyCode::Char('e') => return self.edit_history(),
-            KeyCode::Char('F') => self.toggle_float(),
-            KeyCode::Char('S') => return Some(Action::ListLayouts),
-            KeyCode::Char('H') => self.move_pane(Direction::Left),
-            KeyCode::Char('J') => self.move_pane(Direction::Down),
-            KeyCode::Char('K') => self.move_pane(Direction::Up),
-            KeyCode::Char('L') => self.move_pane(Direction::Right),
-            KeyCode::Char('R') => self.start_resizing(),
-            KeyCode::Char('t') => return self.new_tab(),
-            KeyCode::Char('T') => self.ask_for_tab_name(),
-            KeyCode::Char('&') => self.close_tab(),
-            KeyCode::Char('>') => self.ask_where_to_move(),
-            KeyCode::Char('[') => self.go_to_tab(self.tabs.previous()),
-            KeyCode::Char(']') => self.go_to_tab(self.tabs.next()),
-            KeyCode::Char('{') => self.shift_tab(-1),
-            KeyCode::Char('}') => self.shift_tab(1),
-            KeyCode::Char(digit @ '1'..='9') => self.go_to_tab_numbered(digit),
-            KeyCode::PageUp => return Some(Action::PageBack(self.selected_slot()?)),
-            KeyCode::PageDown => return Some(Action::PageForward(self.selected_slot()?)),
-            KeyCode::Char('!') => return self.project_command(Verb::Run),
-            KeyCode::Char('.') => return self.project_command(Verb::Open),
-            KeyCode::Char('n') => return self.open_launcher(false),
-            KeyCode::Char('w') => return self.open_launcher(true),
-            KeyCode::Char('W') => self.ask_to_remove_worktree(),
-            KeyCode::Char('r') => self.ask_for_name(),
-            KeyCode::Char('x') => self.confirm = Some(Confirm::Kill(self.selected()?.name.clone())),
-            KeyCode::Char('A') => {
+            Command::NextPane => self.move_to_pane(Round::Forward),
+            Command::PreviousPane => self.move_to_pane(Round::Back),
+            Command::PaneLeft => self.focus_toward(Direction::Left),
+            Command::PaneDown => self.focus_toward(Direction::Down),
+            Command::PaneUp => self.focus_toward(Direction::Up),
+            Command::PaneRight => self.focus_toward(Direction::Right),
+            Command::ToggleSplit => self.toggle_split(),
+            Command::SplitRight => self.split_pane(Way::Right, HALF),
+            Command::SplitDown => self.split_pane(Way::Down, HALF),
+            Command::Zoom => self.toggle_zoom(),
+            Command::Copy => self.start_copying(),
+            Command::EditHistory => return self.edit_history(),
+            Command::Float => self.toggle_float(),
+            Command::Layouts => return Some(Action::ListLayouts),
+            Command::SwapLeft => self.move_pane(Direction::Left),
+            Command::SwapDown => self.move_pane(Direction::Down),
+            Command::SwapUp => self.move_pane(Direction::Up),
+            Command::SwapRight => self.move_pane(Direction::Right),
+            Command::Resize => self.start_resizing(),
+            Command::NewTab => return self.new_tab(),
+            Command::RenameTab => self.ask_for_tab_name(),
+            Command::CloseTab => self.close_tab(),
+            Command::MoveToTab => self.ask_where_to_move(),
+            Command::PreviousTab => self.go_to_tab(self.tabs.previous()),
+            Command::NextTab => self.go_to_tab(self.tabs.next()),
+            Command::MoveTabLeft => self.shift_tab(-1),
+            Command::MoveTabRight => self.shift_tab(1),
+            Command::Tab(number) => self.go_to_tab(usize::from(number.max(1)) - 1),
+            Command::PageUp => return Some(Action::PageBack(self.selected_slot()?)),
+            Command::PageDown => return Some(Action::PageForward(self.selected_slot()?)),
+            Command::NewSession => return self.open_launcher(false),
+            Command::NewWorktree => return self.open_launcher(true),
+            Command::RemoveWorktree => self.ask_to_remove_worktree(),
+            Command::Rename => self.ask_for_name(),
+            Command::Kill => self.confirm = Some(Confirm::Kill(self.selected()?.name.clone())),
+            Command::Archive => {
                 self.confirm = Some(Confirm::Archive(self.selected()?.name.clone()));
             }
-            KeyCode::Char('Z') => return Some(Action::ListArchived),
-            KeyCode::Char('u') => self.select_next_needing_user(),
-            KeyCode::Char('U') => self.open_needs_you(),
-            KeyCode::Char('a') => return Some(self.open_timeline()),
-            KeyCode::Char('d') => return self.open_diff(),
-            KeyCode::Char('p') => return self.open_finder(),
-            KeyCode::Char('E') => return self.open_tree_browser(),
-            KeyCode::Char('G') => self.open_grep(),
-            KeyCode::Char('B') => return self.open_switcher(),
-            KeyCode::Char('m') => return self.open_memory(),
-            KeyCode::Char('P') => return self.open_profiles(),
-            KeyCode::Char('?') => self.keys_page = Some(0),
-            KeyCode::Char('/') => self.open_filter(),
-            KeyCode::Char('o') => return self.open_pull_request(),
-            KeyCode::Char('O') => return self.open_pull_requests(),
-            KeyCode::Char('i') => return self.open_issues(),
-            KeyCode::Char('c') if self.tasks_on => self.ask_how_the_task_went(),
-            KeyCode::Char('b') if self.backlog_on => return self.open_backlog(),
-            KeyCode::Char('g') if self.flows_on => return self.go_on_with_flow(),
-            KeyCode::Char('f') if self.flows_on => self.ask_to_send_flow_back(),
-            KeyCode::Char('c') => self.notify(plugins::off("tasks")),
-            KeyCode::Char('b') => self.notify(plugins::off("backlog")),
-            KeyCode::Char('g' | 'f') => self.notify(plugins::off("flows")),
-            KeyCode::Char('X') => return Some(Action::ListPlugins),
-            KeyCode::Char(',') => {
+            Command::Archived => return Some(Action::ListArchived),
+            Command::RunProject => return self.project_command(Verb::Run),
+            Command::OpenProject => return self.project_command(Verb::Open),
+            Command::NextNeedingYou => self.select_next_needing_user(),
+            Command::NeedsYou => self.open_needs_you(),
+            Command::Timeline => return Some(self.open_timeline()),
+            Command::Diff => return self.open_diff(),
+            Command::FindFile => return self.open_finder(),
+            Command::FileTree => return self.open_tree_browser(),
+            Command::Grep => self.open_grep(),
+            Command::Branches => return self.open_switcher(),
+            Command::Memory => return self.open_memory(),
+            Command::Profiles => return self.open_profiles(),
+            Command::Keys => self.keys_page = Some(0),
+            Command::Search => self.open_filter(),
+            Command::Commands => self.open_command_list(),
+            Command::PullRequest => return self.open_pull_request(),
+            Command::PullRequests => return self.open_pull_requests(),
+            Command::Issues => return self.open_issues(),
+            Command::CloseTask if self.tasks_on => self.ask_how_the_task_went(),
+            Command::CloseTask => self.notify(plugins::off("tasks")),
+            Command::Backlog if self.backlog_on => return self.open_backlog(),
+            Command::Backlog => self.notify(plugins::off("backlog")),
+            Command::FlowGoOn if self.flows_on => return self.go_on_with_flow(),
+            Command::FlowSendBack if self.flows_on => self.ask_to_send_flow_back(),
+            Command::FlowGoOn | Command::FlowSendBack => self.notify(plugins::off("flows")),
+            Command::NarrowerSidebar => self.resize_sidebar(-SIDEBAR_STEP),
+            Command::WiderSidebar => self.resize_sidebar(SIDEBAR_STEP),
+            Command::FoldSidebar => self.fold_sidebar(),
+            Command::Plugins => return Some(Action::ListPlugins),
+            Command::Settings => {
                 self.settings = Some(SettingsView::new());
                 return Some(Action::OpenSettings);
             }
-            KeyCode::Char('q') => return Some(Action::Quit),
-            KeyCode::Char(c) => return self.run_plugin_key(c),
-            _ => {}
+            Command::Quit => return Some(Action::Quit),
         }
         None
     }
@@ -3037,10 +3336,87 @@ impl App {
         self.confirm = Some(Confirm::Kill(name));
     }
 
+    /// `:`: opens the list of every command.
+    fn open_command_list(&mut self) {
+        let plugin_on = |plugin: &str| self.plugin_on(plugin);
+        let actions: Vec<PluginAction> = self
+            .plugin_keys
+            .iter()
+            .map(|taken| PluginAction {
+                plugin: &taken.plugin,
+                action: &taken.action,
+                title: &taken.title,
+                key: taken.key,
+            })
+            .collect();
+        let rows = command_list::rows(&self.keymap, &plugin_on, &actions);
+        self.command_list = Some(CommandList::new(rows, &self.recent_commands));
+    }
+
+    /// A key while the `:` list is open: Enter runs the command the bar is
+    /// on, as its key would where the keyboard is.
+    fn on_command_list_key(&mut self, key: KeyEvent) -> Option<Action> {
+        let list = self.command_list.as_mut()?;
+        match list.on_key(&key) {
+            command_list::Outcome::Stay => None,
+            command_list::Outcome::Close => {
+                self.command_list = None;
+                None
+            }
+            command_list::Outcome::Run(pick) => {
+                self.command_list = None;
+                command_list::remember(&mut self.recent_commands, pick.clone());
+                match pick {
+                    Pick::Command(command) => self.run(command),
+                    Pick::Plugin { plugin, action } => Some(Action::RunPlugin {
+                        plugin,
+                        action,
+                        context: self.selected_context(),
+                    }),
+                }
+            }
+        }
+    }
+
+    /// The key after the prefix, in a pane: the prefix again goes to the
+    /// program, Esc lets it be, the hand-back key hands the keyboard back,
+    /// and any other is the sidebar's command, run with the keyboard
+    /// staying in the pane, unless the command moves it.
+    fn after_prefix(&mut self, slot: Slot, key: KeyEvent) -> Option<Action> {
+        if self.keymap.is_prefix(&key) {
+            if self.pane_shows_task(slot) {
+                return None;
+            }
+            return Some(Action::Type { to: slot, key });
+        }
+        if key.code == KeyCode::Esc {
+            return None;
+        }
+        if self.keymap.is_hand_back(&key) {
+            self.focus = Focus::Sidebar;
+            return None;
+        }
+        match self.keymap.command(&key) {
+            Some(command) => self.run(command),
+            None => {
+                let prefix = self.keymap.prefix().map(|p| p.hint()).unwrap_or_default();
+                let commands = self.keymap.hint(Command::Commands);
+                let list =
+                    commands.map_or(String::new(), |key| format!(": {prefix} {key} lists them"));
+                let written = super::keymap::Chord::of(&key).hint();
+                self.notify(format!("{written} runs no command{list}"));
+                None
+            }
+        }
+    }
+
     /// Runs the plugin action that took `key`, about the selected session,
     /// if one did.
     fn run_plugin_key(&mut self, key: char) -> Option<Action> {
-        let taken = self.plugin_keys.iter().find(|taken| taken.key == key)?;
+        let taken = self
+            .plugin_keys
+            .iter()
+            .find(|taken| taken.key == Some(key))?;
         let (plugin, action) = (taken.plugin.clone(), taken.action.clone());
         Some(Action::RunPlugin {
             plugin,
@@ -3386,12 +3762,15 @@ impl App {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
             KeyCode::Esc => self.filter = None,
+            // A session in another tab brings its tab to the front.
             KeyCode::Enter => {
-                if let Some(index) = self.sidebar_cursor() {
-                    self.selected = index;
-                    self.on_worktree = None;
-                }
+                let name = self
+                    .sidebar_cursor()
+                    .map(|index| self.sessions[index].name.clone());
                 self.filter = None;
+                if let Some(name) = name {
+                    self.select(&name);
+                }
             }
             KeyCode::Up => self.move_filter_bar(-1),
             KeyCode::Down => self.move_filter_bar(1),
@@ -3986,6 +4365,8 @@ impl App {
         }
         if let Some(reply) = &mut self.reply {
             reply.on_paste(&text);
+        } else if let Some(list) = &mut self.command_list {
+            list.on_paste(&text);
         } else if let Some(launcher) = &mut self.launcher {
             launcher.on_paste(&text);
         } else if let Some(view) = &mut self.profiles_view {
@@ -4116,8 +4497,12 @@ impl App {
     fn on_pane_key(&mut self, slot: Slot, key: KeyEvent) -> Option<Action> {
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         match key.code {
-            _ if keys::is_hand_back(&key) => {
+            _ if self.keymap.is_hand_back(&key) => {
                 self.focus = Focus::Sidebar;
+                None
+            }
+            _ if self.keymap.is_prefix(&key) => {
+                self.prefixed = true;
                 None
             }
             KeyCode::PageUp if shift => Some(Action::PageBack(slot)),
@@ -4167,7 +4552,7 @@ impl App {
     /// Every key goes to copy mode, but Ctrl+\, which leaves it for the
     /// sidebar.
     fn on_copy_key(&mut self, slot: Slot, key: KeyEvent) -> Option<Action> {
-        if keys::is_hand_back(&key) {
+        if self.keymap.is_hand_back(&key) {
             self.focus = Focus::Sidebar;
             return None;
         }
@@ -4579,13 +4964,6 @@ impl App {
         }
     }
 
-    /// Brings the tab a digit key names to the front: 1 is the first.
-    fn go_to_tab_numbered(&mut self, digit: char) {
-        if let Some(number) = digit.to_digit(10) {
-            self.go_to_tab(number as usize - 1);
-        }
-    }
-
     /// `{` and `}`: moves the tab in front one place to the left, `by` -1,
     /// or to the right, `by` 1, past its neighbor. It stays in front.
     fn shift_tab(&mut self, by: isize) {
@@ -4961,6 +5339,7 @@ mod tests {
             asking: None,
             reporter: None,
             subagents: 0,
+            bell: false,
         }
     }
 
@@ -6780,6 +7159,222 @@ mod tests {
         }
     }
 
+    /// `app` with the config's `[keys]` set to `toml`'s.
+    fn with_keys(mut app: App, toml: &str) -> App {
+        let config = crate::config::from_text(&format!("[keys]\n{toml}")).unwrap();
+        app.set_interface(&config);
+        app
+    }
+
+    fn ctrl(app: &mut App, c: char) -> Option<Action> {
+        app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL))
+    }
+
+    #[test]
+    fn a_key_the_config_gives_a_command_runs_it_and_its_old_key_doesnt() {
+        let mut app = with_keys(
+            app_with(&["a", "b"]),
+            "kill = \"X\"\nnew-session = \"ctrl+n\"",
+        );
+        press(&mut app, KeyCode::Char('x'));
+        assert!(app.confirm().is_none(), "x is free now");
+        app.on_key(KeyEvent::new(KeyCode::Char('X'), KeyModifiers::SHIFT));
+        assert!(matches!(app.confirm(), Some(Confirm::Kill(name)) if name == "a"));
+        press(&mut app, KeyCode::Char('n'));
+        assert!(app.launcher().is_none());
+        ctrl(&mut app, 'n');
+        assert!(app.launcher().is_some());
+    }
+
+    #[test]
+    fn the_prefix_in_a_pane_runs_the_next_keys_command_and_keeps_the_keyboard_there() {
+        let mut app = app_with(&["a", "b"]);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.focus(), Focus::Pane(Slot::Selected));
+        assert_eq!(ctrl(&mut app, 'b'), None);
+        assert!(app.prefixed());
+        // `j` selects the next session; the pane that follows the selection
+        // keeps the keyboard, now on it.
+        assert_eq!(press(&mut app, KeyCode::Char('j')), None);
+        assert!(!app.prefixed());
+        assert_eq!(selected_name(&app), Some("b"));
+        assert_eq!(app.focus(), Focus::Pane(Slot::Selected));
+        // Without the prefix, `j` is the program's.
+        let typed = press(&mut app, KeyCode::Char('j'));
+        assert!(matches!(typed, Some(Action::Type { .. })), "{typed:?}");
+    }
+
+    #[test]
+    fn the_prefix_twice_sends_it_and_esc_after_it_does_nothing() {
+        let mut app = app_with(&["a"]);
+        press(&mut app, KeyCode::Enter);
+        ctrl(&mut app, 'b');
+        let sent = ctrl(&mut app, 'b');
+        assert!(
+            matches!(sent, Some(Action::Type { key, .. }) if key.code == KeyCode::Char('b')),
+            "{sent:?}"
+        );
+        ctrl(&mut app, 'b');
+        assert_eq!(press(&mut app, KeyCode::Esc), None);
+        assert_eq!(app.focus(), Focus::Pane(Slot::Selected));
+        ctrl(&mut app, 'b');
+        assert_eq!(press(&mut app, KeyCode::Char('%')), None);
+        assert!(
+            app.notice()
+                .is_some_and(|notice| notice.contains("runs no command"))
+        );
+    }
+
+    #[test]
+    fn the_prefix_can_be_another_key_or_none() {
+        let mut app = with_keys(app_with(&["a", "b"]), "prefix = \"none\"");
+        press(&mut app, KeyCode::Enter);
+        assert!(matches!(ctrl(&mut app, 'b'), Some(Action::Type { .. })));
+        let mut app = with_keys(
+            app_with(&["a", "b"]),
+            "prefix = \"ctrl+a\"\nhand-back = \"ctrl+g\"",
+        );
+        press(&mut app, KeyCode::Enter);
+        ctrl(&mut app, 'a');
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(selected_name(&app), Some("b"));
+        ctrl(&mut app, '\\');
+        assert_ne!(app.focus(), Focus::Sidebar, "ctrl+\\ is the program's now");
+        ctrl(&mut app, 'g');
+        assert_eq!(app.focus(), Focus::Sidebar);
+    }
+
+    #[test]
+    fn colon_lists_the_commands_and_enter_runs_one() {
+        let mut app = app_with(&["a"]);
+        press(&mut app, KeyCode::Char(':'));
+        assert!(app.command_list().is_some());
+        type_text(&mut app, "zoom");
+        press(&mut app, KeyCode::Enter);
+        assert!(app.command_list().is_none());
+        assert!(app.zoomed());
+        // It leads the list the next time.
+        press(&mut app, KeyCode::Char(':'));
+        let first = app.command_list().unwrap().shown().next().unwrap().0;
+        assert_eq!(first.name, "zoom");
+        press(&mut app, KeyCode::Esc);
+        assert!(app.command_list().is_none());
+        assert!(app.zoomed(), "esc runs nothing");
+    }
+
+    #[test]
+    fn a_plugin_action_with_no_key_runs_from_the_command_list() {
+        let mut app = app_with(&["a"]);
+        app.set_plugin_keys(vec![PluginKey {
+            key: None,
+            plugin: "notes".into(),
+            action: "add".into(),
+            title: "add a note".into(),
+        }]);
+        assert!(app.plugin_key_rows().is_empty(), "no key to list");
+        press(&mut app, KeyCode::Char(':'));
+        type_text(&mut app, "notes:add");
+        let ran = press(&mut app, KeyCode::Enter);
+        assert!(
+            matches!(&ran, Some(Action::RunPlugin { plugin, action, .. }) if plugin == "notes" && action == "add"),
+            "{ran:?}"
+        );
+    }
+
+    #[test]
+    fn the_sidebar_resizes_within_its_bounds_and_folds() {
+        let mut app = app_with(&["a"]);
+        assert_eq!(app.sidebar_columns(120), 28);
+        press(&mut app, KeyCode::Char(')'));
+        assert_eq!(app.sidebar_columns(120), 32);
+        for _ in 0..10 {
+            press(&mut app, KeyCode::Char('('));
+        }
+        assert_eq!(app.sidebar_columns(120), 16, "no narrower");
+        assert_eq!(app.sidebar_columns(30), 16, "never past most of the screen");
+        press(&mut app, KeyCode::Char('\\'));
+        assert!(app.sidebar_folded());
+        assert_eq!(app.sidebar_columns(120), RAIL_WIDTH);
+        press(&mut app, KeyCode::Char(')'));
+        assert!(!app.sidebar_folded(), "wider unfolds it");
+        assert_eq!(app.sidebar_columns(120), 16);
+    }
+
+    #[test]
+    fn a_folded_sidebar_can_take_no_columns() {
+        let mut app = app_with(&["a"]);
+        let config = crate::config::from_text("[sidebar]\nfold = \"hidden\"\nwidth = 40").unwrap();
+        app.set_interface(&config);
+        app.set_sidebar(None, true);
+        assert_eq!(app.sidebar_columns(120), 0);
+        press(&mut app, KeyCode::Char('\\'));
+        assert_eq!(app.sidebar_columns(120), 40);
+    }
+
+    #[test]
+    fn a_width_kept_holds_until_the_config_gives_another() {
+        let mut app = app_with(&["a"]);
+        let kept = Shape {
+            width: 44,
+            from_config: 28,
+            folded: false,
+        };
+        app.set_sidebar(Some(kept), false);
+        assert_eq!(app.sidebar_columns(200), 44);
+        let config = crate::config::from_text("[sidebar]\nwidth = 30").unwrap();
+        app.set_interface(&config);
+        assert_eq!(app.sidebar_columns(200), 30);
+        app.set_sidebar(Some(kept), false);
+        assert_eq!(app.sidebar_columns(200), 30, "kept from another width");
+    }
+
+    #[test]
+    fn the_sidebars_edge_drags_with_the_mouse() {
+        let mut app = app_with(&["a"]);
+        app.set_screen(Rect::new(0, 0, 120, 40));
+        app.on_mouse(CLICK, Hit::SidebarEdge(28));
+        assert!(app.dragging_sidebar());
+        app.on_mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            Hit::SidebarEdge(41),
+        );
+        assert_eq!(app.sidebar_columns(120), 41);
+        app.on_mouse(MouseEventKind::Drag(MouseButton::Left), Hit::SidebarEdge(2));
+        assert_eq!(app.sidebar_columns(120), 16);
+        app.on_mouse(MouseEventKind::Up(MouseButton::Left), Hit::Elsewhere);
+        assert!(!app.dragging_sidebar());
+    }
+
+    #[test]
+    fn what_needs_you_is_pinned_at_the_top_from_every_tab() {
+        let mut app = app_with_a_second_tab(&["a", "b"]);
+        let waiting = doing("b", Activity::Waiting);
+        let done = doing("a", Activity::Done);
+        app.set_sessions(vec![done, waiting, session("shell")]);
+        let rows = app.rows();
+        let b = app.sessions().iter().position(|s| s.name == "b").unwrap();
+        let a = app.sessions().iter().position(|s| s.name == "a").unwrap();
+        assert_eq!(
+            rows[..3],
+            [Row::NeedsYou(2), Row::Pinned(b), Row::Pinned(a)]
+        );
+        assert_eq!(app.tab_elsewhere(b).as_deref(), Some("1"));
+        // j and k pass the pinned rows by; a click on one goes to it.
+        app.on_mouse(CLICK, Hit::SidebarRow(1));
+        assert_eq!(app.tabs().current_index(), 0);
+        assert_eq!(selected_name(&app), Some("b"));
+    }
+
+    #[test]
+    fn the_config_can_leave_nothing_pinned() {
+        let mut app = app_with(&["a"]);
+        app.set_sessions(vec![doing("a", Activity::Waiting)]);
+        assert!(matches!(app.rows()[0], Row::NeedsYou(1)));
+        let config = crate::config::from_text("[sidebar]\nneeds_you = false").unwrap();
+        app.set_interface(&config);
+        assert!(!app.rows().iter().any(|row| matches!(row, Row::NeedsYou(_))));
+    }
+
     #[test]
     fn tab_inside_a_pane_goes_to_its_session() {
         let mut app = app_with(&["a"]);
@@ -7661,6 +8256,40 @@ mod tests {
     }
 
     #[test]
+    fn slash_finds_sessions_in_every_tab_and_enter_brings_one_to_the_front() {
+        // "a" and "b" in the first tab, the new tab's shell in front.
+        let mut app = app_with_a_second_tab(&["a", "b"]);
+        assert_eq!(app.tabs().current_index(), 1);
+        press(&mut app, KeyCode::Char('/'));
+        type_text(&mut app, "b");
+        let shown: Vec<&str> = app
+            .matches()
+            .iter()
+            .map(|&index| app.sessions()[index].name.as_str())
+            .collect();
+        assert_eq!(shown, ["b"]);
+        let b = app.sidebar_cursor().unwrap();
+        assert_eq!(app.elsewhere(b).as_deref(), Some("1"));
+
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.tabs().current_index(), 0);
+        assert_eq!(selected_name(&app), Some("b"));
+        assert_eq!(app.elsewhere(b), None, "only while the filter is open");
+    }
+
+    #[test]
+    fn a_click_on_a_match_in_another_tab_picks_it() {
+        let mut app = app_with_a_second_tab(&["a", "b"]);
+        press(&mut app, KeyCode::Char('/'));
+        type_text(&mut app, "a");
+        let row = row_of(&app, "a");
+        app.on_mouse(CLICK, Hit::SidebarRow(row));
+        assert!(app.filter().is_none());
+        assert_eq!(app.tabs().current_index(), 0);
+        assert_eq!(selected_name(&app), Some("a"));
+    }
+
+    #[test]
     fn letters_type_into_the_filter_and_the_arrows_move_its_bar() {
         let mut app = app_with(&["job-one", "job-two", "other"]);
         press(&mut app, KeyCode::Char('/'));
@@ -8363,7 +8992,7 @@ gate = true
         });
         // `x` would kill the session from the sidebar; here it's nothing.
         assert_eq!(press(&mut app, KeyCode::Char('x')), None);
-        for _ in 0..6 {
+        for _ in 0..7 {
             press(&mut app, KeyCode::Char('j'));
         }
         assert_eq!(

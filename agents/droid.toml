@@ -1,0 +1,43 @@
+# Adapted from herdr's detection rules (Apache-2.0).
+id = "droid"
+name = "Droid"
+
+[[rules]]
+id = "execute_selection_blocker"
+looks = "waiting"
+priority = 300
+region = "screen"
+contains = ["enter to select", "esc to cancel"]
+any = [
+  { contains = ["↑↓ to navigate"] },
+  { contains = ["use ↑↓ to navigate"] },
+]
+all = [
+  { any = [{ contains = ["> yes, allow"] }, { contains = ["> no, cancel"] }] },
+]
+
+[[rules]]
+id = "selection_menu_blocker"
+looks = "waiting"
+priority = 290
+region = "last_rows(8)"
+contains = ["enter select", "esc cancel"]
+any = [
+  { contains = ["↑/↓ navigate"] },
+  { contains = ["↑↓ navigate"] },
+]
+
+[[rules]]
+id = "spinner_stop_working"
+looks = "working"
+priority = 110
+region = "screen"
+contains = ["esc to stop"]
+line_regex = ['^\s*[\u2800-\u28FF]']
+
+[[rules]]
+id = "stop_hint_working"
+looks = "working"
+priority = 100
+region = "screen"
+contains = ["esc to stop"]

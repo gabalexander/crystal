@@ -1,13 +1,18 @@
+mod agent_cli;
+mod agent_hooks;
+mod agent_rules;
 mod agent_screen;
 mod agents;
 mod artifacts;
 mod attach;
 mod backlog;
+mod bell;
 mod catalog;
 mod claude_stream;
 mod client;
 mod clipboard;
 mod codex;
+mod completions;
 mod config;
 mod daemon;
 mod db;
@@ -58,6 +63,7 @@ mod session;
 mod shell;
 mod skill;
 mod socket;
+mod sound;
 mod spending;
 mod state;
 mod syntax;
@@ -66,12 +72,13 @@ mod tasks;
 mod transcript;
 mod tui;
 mod typing;
+mod update;
 mod viewer;
 mod vt;
 mod work;
 
 use anyhow::{Result, bail};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use client::Restart;
 use profile::{Profile, StartIn};
 use protocol::{ArchivedSession, Request, Response, SessionInfo, TaskSpec, TaskState};
@@ -554,6 +561,18 @@ enum Command {
         #[arg(long)]
         cold: bool,
     },
+    /// Update crystal to its latest release, or to the one given: download
+    /// it, check it against its checksum, put it in place of this one, and
+    /// restart every running daemon on it, their sessions carrying on.
+    Update {
+        /// The release to install, like 0.4.0, rather than the latest.
+        #[arg(conflicts_with = "check")]
+        version: Option<String>,
+
+        /// Only say whether a newer crystal is out.
+        #[arg(long)]
+        check: bool,
+    },
     /// List the servers, each a daemon with its own sessions and state: the
     /// default one and those named with --server, with whether each is
     /// running and how many sessions it has. Or stop one, or delete one.
@@ -610,6 +629,13 @@ enum Command {
         #[command(subcommand)]
         command: Option<PluginCommand>,
     },
+    /// List the agents crystal reads the screens of, where their rules
+    /// come from and their hooks; or show why it reads a session the way
+    /// it does, print an agent's rules, or add hooks to an agent.
+    Agent {
+        #[command(subcommand)]
+        command: Option<AgentCommand>,
+    },
     /// Draw a mermaid diagram as text, the way crystal's previews draw it:
     /// a diagram, or each ```mermaid fence of a markdown file. One that
     /// can't be drawn is printed as it is, and the command fails saying
@@ -626,6 +652,9 @@ enum Command {
         #[arg(long)]
         ascii: bool,
     },
+    /// List the TUI's commands, the ids `[keys]` in the config file takes,
+    /// and the keys that run them, as your config has them.
+    Keys,
     /// Print the Claude Code skill that teaches an agent to drive crystal.
     Skill {
         /// Install it into Claude Code's skills, in $CLAUDE_CONFIG_DIR or
@@ -644,6 +673,12 @@ enum Command {
     Integration {
         #[command(subcommand)]
         command: IntegrationCommand,
+    },
+    /// Print the script that completes crystal's commands in your shell:
+    /// see the README for where each shell wants it.
+    Completions {
+        #[arg(value_enum)]
+        shell: completions::Target,
     },
     /// Run crystal on another machine, over your own ssh: its TUI, or a
     /// crystal command there, like `crystal ssh box ls`.
@@ -677,6 +712,11 @@ enum Command {
         #[arg(long)]
         installed: bool,
     },
+    /// Print the running sessions' names, a line each, for a shell
+    /// completing one: never starts the daemon, and says nothing when it
+    /// can't ask.
+    #[command(hide = true)]
+    CompleteSessions,
     /// Serve a project's memory to Claude over MCP, on standard input and
     /// output: what a task in the background searches it with.
     #[command(hide = true)]
@@ -706,6 +746,56 @@ enum IntegrationCommand {
         /// The agent [default: both]
         agent: Option<integration::Agent>,
     },
+}
+
+#[derive(Subcommand)]
+enum AgentCommand {
+    /// List the agents crystal has rules for: where the rules come from,
+    /// whether the agent is installed, and its hooks.
+    List {
+        /// Print JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show why crystal reads a session's agent the way it does: what's in
+    /// front, the rules tried on its screen, and the one that decided.
+    Explain {
+        /// The session [required without --file]
+        #[arg(required_unless_present = "file")]
+        session: Option<String>,
+
+        /// Try the rules on a screen saved in a file instead, a row a line.
+        #[arg(
+            long,
+            value_name = "PATH",
+            conflicts_with = "session",
+            requires = "agent"
+        )]
+        file: Option<PathBuf>,
+
+        /// The agent whose rules to try [default: the one in front]
+        #[arg(long, value_name = "AGENT")]
+        agent: Option<String>,
+
+        /// With --file, the title the agent gave its terminal.
+        #[arg(long, requires = "file", default_value = "")]
+        title: String,
+
+        /// With --file, the progress it reported (OSC 9;4), like `4;3`.
+        #[arg(long, requires = "file", default_value = "")]
+        progress: String,
+
+        /// Show the text each rule looked at.
+        #[arg(short, long)]
+        verbose: bool,
+
+        /// Print JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print the rules crystal comes with for an agent, to start a file of
+    /// your own from.
+    Rules { agent: String },
 }
 
 #[derive(Subcommand)]
@@ -1500,6 +1590,7 @@ fn run(cli: Cli) -> Result<()> {
                 println!("restarted the daemon; its sessions started again, since {why}");
             }
         },
+        Command::Update { version, check } => update::run(&socket, version, check)?,
         Command::Server { json, command } => match command {
             None => server_cli::list(json)?,
             Some(ServerCommand::Stop { name }) => server_cli::stop(&name)?,
@@ -1569,6 +1660,11 @@ fn run(cli: Cli) -> Result<()> {
             Some(PluginCommand::Log { name }) => plugin_cli::log(&socket, &name)?,
         },
         Command::Mermaid { file, width, ascii } => mermaid_cli::run(file.as_deref(), width, ascii)?,
+        Command::Keys => {
+            let config = config::Config::load()?;
+            let keymap = tui::keymap::Keymap::new(&config.keys).map_err(anyhow::Error::msg)?;
+            print!("{}", tui::keymap::listing(&keymap));
+        }
         Command::Skill { install, force } => {
             if install {
                 skill::install(force)?;
@@ -1577,6 +1673,7 @@ fn run(cli: Cli) -> Result<()> {
             }
         }
         Command::Integration { command } => run_integration(command)?,
+        Command::Completions { shell } => print!("{}", completions::script(shell, Cli::command())),
         Command::Ssh {
             install,
             destination,
@@ -1590,8 +1687,40 @@ fn run(cli: Cli) -> Result<()> {
             // The remote command's own exit code is crystal's.
             std::process::exit(code);
         }
+        Command::Agent { command } => match command {
+            None | Some(AgentCommand::List { json: false }) => agent_cli::list(false)?,
+            Some(AgentCommand::List { json: true }) => agent_cli::list(true)?,
+            Some(AgentCommand::Explain {
+                session,
+                file,
+                agent,
+                title,
+                progress,
+                verbose,
+                json,
+            }) => match (file, session) {
+                (Some(file), _) => {
+                    let agent = agent.as_deref().unwrap_or(agent_rules::DEFAULT);
+                    agent_cli::explain_file(&file, agent, &title, &progress, verbose, json)?;
+                }
+                (None, Some(session)) => {
+                    agent_cli::explain(&socket, &session, agent.as_deref(), verbose, json)?;
+                }
+                (None, None) => unreachable!("clap asks for a session or a file"),
+            },
+            Some(AgentCommand::Rules { agent }) => agent_cli::rules(&agent)?,
+        },
         Command::Daemon { handover } => daemon::run(&socket, handover)?,
         Command::Hook { agent, installed } => hook::run(&socket, &agent, installed),
+        Command::CompleteSessions => {
+            if let Ok(Some(Response::Sessions { sessions })) =
+                client::ask(&socket, &Request::List, false)
+            {
+                for session in sessions {
+                    println!("{}", session.name);
+                }
+            }
+        }
         Command::Mcp { dir } => mcp::run(&socket, &here(dir)?)?,
     }
     Ok(())

@@ -1,0 +1,42 @@
+# Adapted from herdr's detection rules (Apache-2.0).
+id = "copilot"
+name = "GitHub Copilot"
+aliases = ["github-copilot", "ghcs"]
+packages = ["@github/copilot"]
+
+[[rules]]
+id = "selection_blocker"
+looks = "waiting"
+priority = 300
+region = "screen"
+all = [
+  { any = [
+    { contains = ["esc to cancel"] },
+    { contains = ["esc cancel"] },
+  ] },
+  { any = [
+    { contains = ["enter to select"] },
+    { contains = ["enter to confirm"] },
+    { contains = ["enter to submit"] },
+    { contains = ["enter accept"] },
+  ] },
+]
+
+[[rules]]
+id = "background_agents_working"
+looks = "working"
+priority = 110
+region = "last_rows(6)"
+line_regex = ['^\s*◎\s+Waiting for background agents(?:\s|·|$)']
+
+[[rules]]
+id = "working_cancel_hint"
+looks = "working"
+priority = 100
+region = "screen"
+any = [
+  { contains = ["esc to cancel"] },
+  { contains = ["esc cancel"] },
+  { contains = ["esc again to cancel"] },
+  { contains = ["esc interrupt"] }
+]

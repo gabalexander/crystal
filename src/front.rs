@@ -10,6 +10,7 @@
 //! and an agent installed with npm runs as `node` with the agent's package
 //! as its script. So [`classify`] looks at all of them.
 
+use crate::agent_rules;
 use crate::catalog;
 use crate::protocol::Front;
 use std::path::Path;
@@ -23,15 +24,6 @@ const SHELLS: &[&str] = &[
 /// what runs: the script says what's in front.
 const INTERPRETERS: &[&str] = &[
     "node", "nodejs", "bun", "deno", "python", "python3", "ruby", "perl",
-];
-
-/// npm packages of agents, which run as `node <package>/…`: the package,
-/// and the program it stands for in the catalog.
-const AGENT_PACKAGES: &[(&str, &str)] = &[
-    ("@anthropic-ai/claude-code", "claude"),
-    ("@openai/codex", "codex"),
-    ("@google/gemini-cli", "gemini"),
-    ("opencode-ai", "opencode"),
 ];
 
 /// What's in front in the terminal whose foreground process group is led
@@ -96,13 +88,12 @@ fn script(args: &[String]) -> Option<&str> {
     None
 }
 
-/// What runs as `script`: an agent named for it, or an agent's npm
-/// package, or else a program named after the script.
+/// What runs as `script`: an agent named for it, or one of the npm
+/// packages an agent's rules name, or else a program named after the
+/// script.
 fn of_script(script: &str) -> Front {
-    for (package, program) in AGENT_PACKAGES {
-        if script.contains(&format!("node_modules/{package}/")) {
-            return agent(program);
-        }
+    if let Some(rules) = agent_rules::current().by_script(script) {
+        return agent(&rules.id);
     }
     let name = program_name(script);
     if let Some(front) = agent_named(&name) {
@@ -127,11 +118,30 @@ fn package_of(script: &str) -> Option<String> {
     Some(package.to_string())
 }
 
-/// The agent run as `name`, if crystal knows one by that name.
+/// The agent run as `name`, if crystal knows one by that name: one the
+/// new-session panel offers, or one there are rules to read the screen of.
 fn agent_named(name: &str) -> Option<Front> {
-    catalog::find(name).map(|known| Front::Agent {
-        program: known.program.to_string(),
-        name: known.name.to_string(),
+    if let Some(known) = catalog::find(name) {
+        return Some(Front::Agent {
+            program: known.program.to_string(),
+            name: known.name.to_string(),
+        });
+    }
+    let registry = agent_rules::current();
+    let rules = registry.find(name)?;
+    // An agent run by another of its names is in the catalog by that one.
+    let known = std::iter::once(&rules.id)
+        .chain(&rules.aliases)
+        .find_map(|name| catalog::find(name));
+    Some(match known {
+        Some(known) => Front::Agent {
+            program: known.program.to_string(),
+            name: known.name.to_string(),
+        },
+        None => Front::Agent {
+            program: name.to_string(),
+            name: rules.name.clone(),
+        },
     })
 }
 
@@ -320,6 +330,22 @@ mod tests {
         assert_eq!(
             front("/usr/bin/node", &["node", "--no-warnings", script]),
             agent("claude", "Claude Code")
+        );
+    }
+
+    #[test]
+    fn an_agent_crystal_only_has_rules_for_is_an_agent_too() {
+        // Maki isn't in the new-session panel, but its screen can be read.
+        assert_eq!(front("/usr/bin/maki", &["maki"]), agent("maki", "Maki"));
+        // Another name of an agent in the panel is that agent.
+        assert_eq!(
+            front("/usr/bin/cursor", &["cursor"]),
+            agent("cursor-agent", "Cursor")
+        );
+        let qwen = "/usr/lib/node_modules/@qwen-code/qwen-code/dist/index.js";
+        assert_eq!(
+            front("/usr/bin/node", &["node", qwen]),
+            agent("qwen", "Qwen Code")
         );
     }
 

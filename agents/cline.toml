@@ -1,0 +1,57 @@
+# Adapted from herdr's detection rules (Apache-2.0).
+id = "cline"
+name = "Cline"
+packages = ["cline"]
+
+[[rules]]
+id = "tool_permission"
+looks = "waiting"
+priority = 300
+region = "screen"
+any = [
+  { contains = ["let cline use this tool"] },
+  { contains = ["[act mode]", "execute command?", "yes"] },
+  { contains = ["[act mode]", "use this tool?", "yes"] },
+  { contains = ["[plan mode]", "execute command?", "yes"] },
+  { contains = ["[plan mode]", "use this tool?", "yes"] },
+]
+
+[[rules]]
+id = "inline_tool_permission"
+looks = "waiting"
+priority = 300
+region = "last_rows(16)"
+contains = ["Cline needs permission", "Approve tool call?", "[y] Approve", "[n] Deny"]
+
+[[rules]]
+id = "inline_question"
+looks = "waiting"
+priority = 300
+region = "last_rows(24)"
+line_regex = ['^\s*Cline is asking a question\s*$', '^\s*>\s+\S']
+contains = ["(Tab)", "Shift+Tab"]
+
+[[rules]]
+id = "active_turn"
+looks = "working"
+priority = 200
+region = "last_rows(20)"
+any = [
+  { line_regex = ['^\s*[\x{2801}-\x{28FF}]\s+\S'] },
+  { contains = ["Thinking... (esc to cancel)"] },
+]
+
+[[rules]]
+id = "composer_idle"
+looks = "settled"
+priority = 100
+region = "last_rows(12)"
+line_regex = ['^\s*❯(?:\s.*)?$']
+contains = ["─", "(Tab)", "Shift+Tab"]
+
+[[rules]]
+id = "default_cline_working"
+looks = "working"
+priority = -10
+region = "screen"
+regex = ['(?s).+']

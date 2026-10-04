@@ -226,7 +226,7 @@ mod tests {
 
     #[test]
     fn the_box_says_who_it_s_for_what_sending_does_and_why_it_was_refused() {
-        let theme = Theme::new(ThemeName::Dark, false);
+        let theme = Theme::new(ThemeName::DARK, false);
         let mut reply = ReplyBox::new("fixer", "a follow-up: its next run");
         type_into(&mut reply, "carry on");
         reply.on_key(&key(KeyCode::Enter));

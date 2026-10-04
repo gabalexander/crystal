@@ -1,0 +1,34 @@
+# Adapted from herdr's detection rules (Apache-2.0).
+id = "opencode"
+name = "OpenCode"
+aliases = ["open-code"]
+packages = ["opencode-ai"]
+
+[[rules]]
+id = "permission_required"
+looks = "waiting"
+priority = 300
+region = "screen"
+any = [
+  { contains = ["△ Permission required"] },
+  { contains = ["esc dismiss"], any = [{ contains = ["enter confirm"] }, { contains = ["enter submit"] }, { contains = ["enter toggle"] }], all = [{ any = [{ contains = ["↑↓ select"] }, { contains = ["⇆ tab"] }] }] },
+]
+
+[[rules]]
+id = "interrupt_hint_working"
+looks = "working"
+priority = 110
+region = "screen"
+any = [
+  { contains = ["esc to interrupt"] },
+  { contains = ["ctrl+c to interrupt"] },
+  { contains = ["press esc to interrupt"] },
+  { line_regex = ['(?i).*opencode.*esc (again to )?interrupt'] },
+]
+
+[[rules]]
+id = "progress_bar_working"
+looks = "working"
+priority = 100
+region = "screen"
+regex = ['(■|⬝){4,}']

@@ -30,6 +30,9 @@ pub enum FirstPrompt {
     Argument,
     /// After this option: `gemini -i "fix the tests"`.
     Option(&'static str),
+    /// As its last argument, with no `--` before it, for an agent that
+    /// takes `--` for an option of its own: `pi "fix the tests"`.
+    Last,
     /// It can't be: the task is typed once the agent is open.
     None,
 }
@@ -49,6 +52,7 @@ impl FirstPrompt {
                 command.push(option.to_string());
                 command.push(task.to_string());
             }
+            FirstPrompt::Last => command.push(task.to_string()),
             FirstPrompt::None => {}
         }
     }
@@ -217,6 +221,118 @@ pub const AGENTS: &[Agent] = &[
         settings: &[],
     },
     Agent {
+        program: "qwen",
+        name: "Qwen Code",
+        // Its `--prompt-interactive`: "execute the provided prompt and
+        // continue in interactive mode".
+        first_prompt: FirstPrompt::Option("-i"),
+        instructions: Instructions::None,
+        settings: &[],
+    },
+    Agent {
+        program: "pi",
+        name: "Pi",
+        // `pi [options] [@files...] [messages...]`; it takes `--` for an
+        // option, which would take the prompt for its value.
+        first_prompt: FirstPrompt::Last,
+        instructions: Instructions::None,
+        settings: &[],
+    },
+    // The agents below take no first prompt that's been checked against
+    // their own code or documentation, so the panel asks them no task.
+    Agent {
+        program: "copilot",
+        name: "GitHub Copilot",
+        first_prompt: FirstPrompt::None,
+        instructions: Instructions::None,
+        settings: &[],
+    },
+    Agent {
+        program: "amp",
+        name: "Amp",
+        first_prompt: FirstPrompt::None,
+        instructions: Instructions::None,
+        settings: &[],
+    },
+    Agent {
+        program: "droid",
+        name: "Droid",
+        first_prompt: FirstPrompt::None,
+        instructions: Instructions::None,
+        settings: &[],
+    },
+    Agent {
+        program: "kimi",
+        name: "Kimi Code",
+        first_prompt: FirstPrompt::None,
+        instructions: Instructions::None,
+        settings: &[],
+    },
+    Agent {
+        program: "kiro-cli",
+        name: "Kiro",
+        first_prompt: FirstPrompt::None,
+        instructions: Instructions::None,
+        settings: &[],
+    },
+    Agent {
+        program: "cline",
+        name: "Cline",
+        // Given a prompt, it runs one turn and exits.
+        first_prompt: FirstPrompt::None,
+        instructions: Instructions::None,
+        settings: &[],
+    },
+    Agent {
+        program: "kilo",
+        name: "Kilo Code",
+        first_prompt: FirstPrompt::None,
+        instructions: Instructions::None,
+        settings: &[],
+    },
+    Agent {
+        program: "devin",
+        name: "Devin",
+        first_prompt: FirstPrompt::None,
+        instructions: Instructions::None,
+        settings: &[],
+    },
+    Agent {
+        program: "grok",
+        name: "Grok",
+        first_prompt: FirstPrompt::None,
+        instructions: Instructions::None,
+        settings: &[],
+    },
+    Agent {
+        program: "qodercli",
+        name: "Qoder CLI",
+        first_prompt: FirstPrompt::None,
+        instructions: Instructions::None,
+        settings: &[],
+    },
+    Agent {
+        program: "letta",
+        name: "Letta Code",
+        first_prompt: FirstPrompt::None,
+        instructions: Instructions::None,
+        settings: &[],
+    },
+    Agent {
+        program: "hermes",
+        name: "Hermes Agent",
+        first_prompt: FirstPrompt::None,
+        instructions: Instructions::None,
+        settings: &[],
+    },
+    Agent {
+        program: "agy",
+        name: "Antigravity",
+        first_prompt: FirstPrompt::None,
+        instructions: Instructions::None,
+        settings: &[],
+    },
+    Agent {
         program: "aider",
         name: "Aider",
         // `--message` runs one message and exits, which isn't a session.
@@ -272,11 +388,12 @@ pub fn add_first_prompt(command: &mut Vec<String>, task: &str) {
 /// no telling an option's value from a prompt, so it's left to the caller
 /// to say.
 pub fn first_prompt_in(command: &[String]) -> Option<String> {
-    let agent = agent_of(command)?;
-    if agent.first_prompt != FirstPrompt::Argument {
-        return None;
-    }
-    argument_prompt_at(command).map(|at| command[at].clone())
+    let at = match agent_of(command)?.first_prompt {
+        FirstPrompt::Argument => argument_prompt_at(command),
+        FirstPrompt::Last => only_argument_at(command),
+        FirstPrompt::Option(_) | FirstPrompt::None => None,
+    };
+    at.map(|at| command[at].clone())
 }
 
 /// Where in `command` its agent's first prompt is, for an agent crystal
@@ -289,6 +406,8 @@ pub fn first_prompt_at(command: &[String]) -> Option<usize> {
             let at = command.iter().rposition(|arg| arg == option)? + 1;
             (at < command.len()).then_some(at)
         }
+        // Past options, a last word may as well be an option's value.
+        FirstPrompt::Last => only_argument_at(command),
         FirstPrompt::None => None,
     }
 }
@@ -310,6 +429,14 @@ pub fn without_first_prompt(command: &[String]) -> Vec<String> {
         without.remove(at - 1);
     }
     without
+}
+
+/// Where the only argument is, when there's one and it's no option.
+fn only_argument_at(command: &[String]) -> Option<usize> {
+    match &command[1..] {
+        [prompt] if !prompt.starts_with('-') => Some(1),
+        _ => None,
+    }
 }
 
 /// Where the first prompt of an agent that takes it as an argument is, when
@@ -411,6 +538,15 @@ mod tests {
         add_first_prompt(&mut aider, "fix it");
         assert_eq!(aider, ["aider"], "aider takes no first prompt");
 
+        let mut qwen = words(&["qwen"]);
+        add_first_prompt(&mut qwen, "fix it");
+        assert_eq!(qwen, ["qwen", "-i", "fix it"]);
+
+        // Pi takes `--` for an option, which would take the prompt.
+        let mut pi = words(&["pi", "--model", "x"]);
+        add_first_prompt(&mut pi, "fix it");
+        assert_eq!(pi, ["pi", "--model", "x", "fix it"]);
+
         let mut unknown = words(&["sleep", "30"]);
         add_first_prompt(&mut unknown, "fix it");
         assert_eq!(unknown, ["sleep", "30"], "a program crystal doesn't know");
@@ -439,6 +575,10 @@ mod tests {
         assert_eq!(prompt(&["claude", "--model", "opus", "fix it"]), None);
         assert_eq!(prompt(&["vim", "notes.md"]), None);
         assert_eq!(prompt(&["gemini", "-i", "fix it"]), None);
+        // A last word after options may as well be an option's value.
+        assert_eq!(prompt(&["pi", "fix it"]), Some("fix it".into()));
+        assert_eq!(prompt(&["pi", "--model", "x"]), None);
+        assert_eq!(first_prompt_at(&words(&["pi", "fix it"])), Some(1));
     }
 
     #[test]
