@@ -8,12 +8,17 @@
 //! and, whenever the user does something in it, that it was used. A
 //! command (`Request::Layout`) waits for the answer, a while at most.
 //!
+//! A TUI also says when its terminal gains and loses the focus, so the
+//! daemon knows whether the user is at crystal at all: see
+//! [`notify::Presence`].
+//!
 //! Nothing here is handed over: a handover, or any restart, cuts every
 //! TUI's connection, and each offers again at once, saying when it was last
 //! used, so the next daemon knows which was used last as they come back.
 
 use crate::events::now_ms;
 use crate::layout::{Layout, NO_TUI, Order, Relayed, Report};
+use crate::notify::{self, Presence};
 use crate::protocol::{self, Response};
 use anyhow::{Context, Result, anyhow, bail};
 use std::collections::HashMap;
@@ -62,6 +67,8 @@ struct Tui {
     used: u64,
     /// The orders it was given that wait on its answer, by number.
     waiting: HashMap<u64, Sender<Answer>>,
+    /// Whether its terminal has the focus, once it has said.
+    focused: Option<bool>,
 }
 
 impl Relay {
@@ -89,9 +96,15 @@ impl Relay {
             match report {
                 Report::Used => state.used(tui, now_ms()),
                 Report::Answer { id, answer } => state.answer(tui, id, answer),
+                Report::Focus { focused } => {
+                    state.focus(tui, focused);
+                    notify::set_presence(state.presence());
+                }
             }
         }
-        self.state.lock().unwrap().remove(tui);
+        let mut state = self.state.lock().unwrap();
+        state.remove(tui);
+        notify::set_presence(state.presence());
         Ok(())
     }
 
@@ -131,6 +144,7 @@ impl State {
             conn,
             used,
             waiting: HashMap::new(),
+            focused: None,
         });
         Ok(self.came)
     }
@@ -145,6 +159,27 @@ impl State {
     fn used(&mut self, tui: u64, at: u64) {
         if let Some(held) = self.find(tui) {
             held.used = held.used.max(at);
+        }
+    }
+
+    /// The terminal of the TUI `tui` has gained the focus, or lost it.
+    fn focus(&mut self, tui: u64, focused: bool) {
+        if let Some(held) = self.find(tui) {
+            held.focused = Some(focused);
+        }
+    }
+
+    /// Whether the user is at crystal: a TUI's terminal has the focus, or
+    /// every one's has lost it; or, with no TUI or one whose terminal
+    /// hasn't said, nobody knows.
+    fn presence(&self) -> Presence {
+        let focus: Vec<Option<bool>> = self.tuis.iter().map(|tui| tui.focused).collect();
+        if focus.contains(&Some(true)) {
+            Presence::Here
+        } else if !focus.is_empty() && focus.iter().all(|focused| *focused == Some(false)) {
+            Presence::Away
+        } else {
+            Presence::Unknown
         }
     }
 
@@ -274,6 +309,29 @@ mod tests {
 
         state.answer(tui, number, Err("there's no tab 4".into()));
         assert_eq!(answered.recv().unwrap(), Err("there's no tab 4".into()));
+    }
+
+    #[test]
+    fn the_user_is_away_only_once_every_tui_has_lost_the_focus() {
+        let mut state = State::default();
+        assert_eq!(state.presence(), Presence::Unknown);
+        let (first, _first_end) = tui(&mut state, 1);
+        let (second, _second_end) = tui(&mut state, 1);
+        assert_eq!(state.presence(), Presence::Unknown);
+        state.focus(first, false);
+        assert_eq!(
+            state.presence(),
+            Presence::Unknown,
+            "the second hasn't said"
+        );
+        state.focus(second, true);
+        assert_eq!(state.presence(), Presence::Here);
+        state.focus(second, false);
+        assert_eq!(state.presence(), Presence::Away);
+        state.remove(second);
+        assert_eq!(state.presence(), Presence::Away);
+        state.remove(first);
+        assert_eq!(state.presence(), Presence::Unknown);
     }
 
     #[test]

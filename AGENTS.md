@@ -45,7 +45,8 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   the order a TUI gets with the id of the session it was run in, what the TUI reports back, the layout it
   answers with, and how `crystal layout` prints it
 - `src/layout_relay.rs`: the daemon's side of those commands: the TUIs that take orders and which was used last
-  (a key, a click, its terminal brought to the front), an order written to that one and its answer handed back
+  (a key, a click, its terminal brought to the front), whether each one's terminal has the focus, which says
+  where the user is for notifications, an order written to that one and its answer handed back
   to the command waiting, a few seconds at most; nothing is handed over, as each TUI offers again after a
   handover saying when it was last used, and a command just after the daemon starts waits a moment for
   one to come back
@@ -64,13 +65,14 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   changes (a test says so)
 - `src/tui/`: the TUI (`crystal` with no command)
   - `mod.rs`: the event loop: one channel of events, then update and draw (not for a move of the mouse that
-    changes nothing), and opening the link a Ctrl+click or copy mode's `o` asks for
+    changes nothing), opening the link a Ctrl+click or copy mode's `o` asks for, and bringing the TUI's
+    terminal to the front for `pane focus --raise`
   - `app.rs`: the state and how keys and the mouse change it; no I/O, so it's unit-tested
     - `app/commands.rs`: the layout commands carried out on the state, each on the tab holding the session it's
       about, in front or not, and the layout the TUI answers with
   - `layout_link.rs`: the TUI's end of the layout commands: offering the daemon to take them, again at once
-    after a handover or a restart, each one an event for the loop, and its answers and that it was used (a
-    key, the mouse, a paste, focus gained) sent back
+    after a handover or a restart, each one an event for the loop, and its answers, that it was used (a
+    key, the mouse, a paste, focus gained) and when its terminal gains and loses the focus  sent back
   - `ui.rs`: the layout and drawing (top bar and its tabs, pane headers, footer), and what's under the mouse
   - `tabs.rs`: tabs, each holding its own sessions (each session in exactly one) with its own selection,
     its tree of panes, the session the selection's pane last showed and the session floating over them, and
@@ -290,7 +292,10 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   an agent other than Claude Code, in a terminal; kept apart from I/O, so it's unit-tested; the daemon starts
   the steps and writes the runs down in the database
 - `src/flow_cli.rs`: `crystal flow` and its commands, `cancel` and `defs` among them
-- `src/notify.rs`: telling the user when a session needs them: desktop notifications, or their own command
+- `src/notify.rs`: telling the user when a session needs them, once it has for `[notifications] after_secs`
+  and, with `unfocused_only`, while no TUI's terminal has the focus (where the user is, as the TUIs say, kept
+  for the daemon): desktop notifications a click on takes them to the session, or their own command;
+  `crystal notify`'s too
 - `src/plugins.rs`: plugins: the registry of crystal's own, `enabled`, the gate every one of them goes through
   (each module's `enabled` asks it), finding installed plugins and why one can't run here (it doesn't fit, or
   its build failed) or be switched on, switching one in the config's `[plugins]` with `toml_edit`, the context
