@@ -161,7 +161,7 @@ and the footer says where you are and offers the keys that matter there, or, whe
 | `u` | select the next session that needs you: waiting on you first, then done |
 | `U` | list everything that [needs you](#timeline), in every tab, and answer a permission or a gate where it stands |
 | `a` | the [timeline](#timeline): what happened, the newest first, as it happens |
-| `/` | find a session, in any tab, by typing a little of its name, project, branch or command; one in another tab says which, and picking it takes you there |
+| `/` | find a session in any tab, a project or worktree with nothing running, a flow run or an open pull request, by typing a little of it; `Tab` keeps to one status; picking a session in another tab takes you there: [finding with `/`](#finding-with-) |
 | `:` | the [command list](#keys-and-commands): every command by its name, with its key, the latest you ran first; `Enter` runs one |
 | `(` / `)` | make the [sidebar](#the-sidebar) narrower or wider; its edge drags with the mouse too |
 | `\` | fold the [sidebar](#the-sidebar) down to a rail of marks, or unfold it |
@@ -205,14 +205,29 @@ inline through a scroll region, like Codex. To search that history, or copy from
 [copy mode](#zoom-copy-mode-and-search), and `e` opens it in your editor.
 
 The mouse works too. Click a session in the sidebar to select it, or click a pane to type into it. The wheel
-moves the selection over the sidebar, and scrolls a pane through its history. A right click opens a menu of
-what you can do with what it's on: a session, a worktree or a project in the sidebar, a tab, or a pane. Each
-item is a key from the table above, shown beside it, and does just what that key would there; choose one with
-a click, `Enter`, or its key, and `Esc` or a click elsewhere closes the menu. Drag across a pane to select
-text: it goes to your clipboard as you let go, and stays marked until you click or type. A program that asks
-for the mouse itself, like `vim` with `set mouse=a` or `htop`, gets the clicks, drags and the wheel in its pane
-while that pane has the keyboard; there, your terminal's own selection still works with a key held: `Shift` in
-most terminals, `Option` in iTerm2 and Terminal on macOS.
+moves the selection over the sidebar, and scrolls a pane through its history, three lines a notch. A right click
+opens a menu of what you can do with what it's on: a session, a worktree or a project in the sidebar, a tab, or
+a pane. Each item is a key from the table above, shown beside it, and does just what that key would there;
+choose one with a click, `Enter`, or its key, and `Esc` or a click elsewhere closes the menu. Drag across a pane
+to select text: it goes to your clipboard as you let go, and stays marked until you click or type. A
+double-click selects a word, where a path is one word and a blank, a comma, a quote, a bracket or a colon ends
+one, and a triple-click the whole line, across the rows it wrapped onto; drag on from either and it takes in
+whole words, or lines. Drag past the top or bottom of a pane and its history scrolls under the selection, faster
+the further past, for as long as you hold it there; the wheel scrolls it too. A program that asks for the mouse
+itself, like `vim` with `set mouse=a` or `htop`, gets the clicks, drags and the wheel in its pane while that pane
+has the keyboard; there, your terminal's own selection still works with a key held: `Shift` in most terminals,
+`Option` in iTerm2 and Terminal on macOS.
+
+Beside each pane's screen, in a column of its own, a scrollbar shows where in its history the pane is, once it
+has some: drag its thumb to scroll, or click the track and the thumb jumps there. The wheel over it scrolls the
+pane too.
+
+`[mouse]` in the [settings](#settings) changes all this. `copy_on_select = false` keeps what you select from
+your clipboard as you let go: the pane goes into [copy mode](#zoom-copy-mode-and-search) with it still selected,
+where `y` copies it, the keys change it first, and `Esc` drops it, and the keyboard goes back to where it was
+after. `scroll_lines` is how far a notch of the wheel scrolls, and `scrollbars = false` gives the scrollbar's
+column back to the pane. `capture = false` leaves the mouse to your terminal altogether: its own selection
+works with no key held, but nothing in crystal answers a click, and no program in a pane gets one either.
 
 `Ctrl`+click opens a link in a pane, whoever has the mouse there: a URL written out in the text (`http://`,
 `https://` or `file://`), whole across the rows it wrapped onto, or a hyperlink a program wrote (OSC 8), which
@@ -383,12 +398,9 @@ beeps, flashes or marks its tab, the way you set it up to. A session out of sigh
 its time in the sidebar until you look at it, rings your terminal from the TUI too, and the event log gets a
 `session.bell`. A program ringing over and over rings yours at most twice a second.
 
-`/` finds a session by typing a little of it. The sidebar shows only the sessions that match, under their
-project and worktree, with the letters that matched marked in each name. The letters only have to turn up in
-order (`rfx` finds `refund-fix`), and each word you type has to turn up in the name, project, branch or
-command, so `pay fix` finds the fixer in the payments project. Letters type into the filter, so `↑` and `↓`
-(or `Ctrl+P` and `Ctrl+N`) move among the matches; `Enter` selects one and `Esc` leaves the selection where it
-was.
+`/` finds a session by typing a little of it, in any tab, and a project or worktree with nothing running, a
+flow run or an open pull request too; `Tab` keeps it to the sessions with one status: see [finding with
+`/`](#finding-with-).
 
 For a project on GitHub or GitLab, each worktree line shows its branch's open pull request, `#57` (a merge
 request, `!57`, on GitLab), with a mark for what matters most about it; `o` opens it in your browser, `O` lists
@@ -546,6 +558,32 @@ folded = false         # start folded
 fold = "marks"         # what folding keeps: "marks", or "hidden" for nothing
 needs_you = true       # pin what needs you at the top
 ```
+
+### Finding with `/`
+
+`/` finds anything in the sidebar, and more, by typing a little of it. The sidebar shows only what matches,
+from every tab, under its project and worktree, with the letters that matched marked. The letters only have
+to turn up in order (`rfx` finds `refund-fix`), and each word you type has to turn up somewhere in what it
+finds, so `pay fix` finds the fixer in the payments project. Letters type into the filter, so `↑` and `↓` (or
+`Ctrl+P` and `Ctrl+N`) move among the matches; `Enter` picks one, as does a click, and `Esc` leaves the
+selection where it was. What it finds, and what picking it does:
+
+| What | Found by | Picking it |
+|---|---|---|
+| a session, in any tab | its name, project, branch, command, the agent in front, its tab's name, its directory, or the name or goal of the flow run it's a step of | selects it, bringing its tab to the front |
+| a flow run | its name, its flow's or its goal, which find its steps too | selects the step it's at |
+| a project nothing runs in, or a worktree with no sessions | its project, its branch, or its directory | puts the selection on it, where `Enter` starts something |
+| an open pull request (a merge request on GitLab) | its title, number (`57` or `#57`), branch, author or project | opens it in [the pull requests view](#pull-requests-and-issues) |
+
+A directory or a goal only counts where a word turns up in it whole, or nearly anything would find it. Before
+you type, only sessions show; projects, worktrees and pull requests join them as you type. The pull requests are
+those the sidebar already asked the forge for, and `/` asks, in the background, about the projects with nothing
+running the first time it opens, so typing never waits on the forge.
+
+`Tab` keeps to the sessions with one status, the footer saying which, round `waiting`, `working`, `done` (a
+finished turn nobody has looked at), `idle` (at the prompt) and `ended`, then back to all of them; `Shift+Tab`
+goes the other way. Typing narrows them further. Projects and pull requests have no status, so they don't show
+while it keeps to one.
 
 ### Tabs
 
@@ -2166,6 +2204,7 @@ file and change. A setting crystal doesn't know is an error that names it, so a 
 | `[window]` | | `title`, what the TUI titles its terminal: [the window](#terminals-the-window-and-the-tab-bar) |
 | `[tab_bar]` | | where the tab bar goes, whether it's left out with one tab, and what it shows at its right: [the tab bar](#terminals-the-window-and-the-tab-bar) |
 | `[appearance]` | | `auto_switch`, the theme following your system's light or dark, and the theme for each: [themes](#themes) |
+| `[mouse]` | | `capture`, whether the TUI takes the mouse from your terminal (`true`); `copy_on_select`, whether a selection is copied as you let go or waits in copy mode for `y` (`true`); `scroll_lines`, how far a notch of the wheel scrolls a pane, up to 100 (`3`); `scrollbars`, a scrollbar beside each pane (`true`): [the mouse](#usage) |
 | `[update]` | | `check`, whether the TUI looks once a day for a [newer crystal](#updating) (`true`) |
 
 `notify_command` is for telling you some other way, like a message to your phone. It runs with
@@ -2188,8 +2227,8 @@ each time one starts, `[[project]]` each time a project's commands run,
 `scrollback_lines` as each session starts, so a change counts straight away (a session already running keeps
 what it had); `crystal new` and the TUI read `[terminal]` each time they start a shell; the TUI reads
 `new_session`, `theme`, `[colors]`, `[appearance]`, `[window]`, `[tab_bar]`, `scrollback_lines`, `[plugins]`,
-`[update]`, the profiles and the flows when it starts, again when you save a profile or switch a plugin, and
-every half a second while the settings view is open.
+`[update]`, `[mouse]`, the profiles and the flows when it starts, again when you save a profile or switch a
+plugin, and every half a second while the settings view is open.
 
 #### Themes
 
@@ -2336,13 +2375,15 @@ out, and on a bar too narrow for it and the tabs, all of it is, the tabs coming 
 `,` in the sidebar opens the settings you'd otherwise change in the file: notifications and when they come,
 sounds, the theme and whether it follows your system's [appearance](#themes) (the row says which theme each
 side is), whether the [tab bar](#terminals-the-window-and-the-tab-bar) goes on top or over the footer and is
-left out with one tab, how long an agent may sit [idle](#archiving-and-idle-agents), and how memory learns
-([the distiller](#the-distiller)) and searches ([by meaning](#search-by-meaning)). `space` changes the one the
-bar is on, and `←/→` go through the [themes](#themes), forward and back (the row says which of the twenty it's
-on), the waits before a notification, and the times an agent may sit idle: off, 15 minutes, 30, an hour, two or
-eight. Each change is written to the file at once,
+left out with one tab, how long an agent may sit [idle](#archiving-and-idle-agents), [the mouse](#usage), and
+how memory learns ([the distiller](#the-distiller)) and searches ([by meaning](#search-by-meaning)). `space`
+changes the one the bar is on, and `←/→` go through the [themes](#themes), forward and back (the row says
+which of the twenty it's on), the waits before a notification, the times an agent may sit idle: off, 15
+minutes, 30, an hour, two or eight, and how far a notch of the wheel scrolls: 1, 2, 3, 5 or 10 lines. Each
+change is written to the file at once,
 keeping the rest of it as you wrote it, comments and all, and counts straight away: the TUI repaints in a new
-theme, and the daemon reads the rest as it goes.
+theme, and the daemon reads the rest as it goes. On a screen too short for every row, the view scrolls to keep
+the one the bar is on in sight.
 
 While it's open, the view reads the file and asks the daemon again every half a second, so it follows a
 change made by hand in the file too, and shows how the models that search by meaning stand: downloading

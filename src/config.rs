@@ -106,6 +106,8 @@ pub struct Config {
     /// The theme following the system's light or dark: `[appearance]` in
     /// the file. See [`crate::tui::appearance`].
     pub appearance: AppearanceSettings,
+    /// What the mouse does in the TUI: `[mouse]` in the file.
+    pub mouse: MouseSettings,
 }
 
 /// The shell a new terminal runs, and where the TUI starts one when
@@ -445,6 +447,40 @@ impl Default for SidebarSettings {
     }
 }
 
+/// What the mouse does in the TUI.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MouseSettings {
+    /// Whether the TUI takes the mouse: its clicks, drags, wheel and right
+    /// clicks, and those it hands the programs in panes that ask. Off, the
+    /// terminal it runs in keeps them, for its own selection.
+    pub capture: bool,
+    /// Whether what the mouse selects in a pane goes to the clipboard as
+    /// the button comes up. Off, it stays selected in copy mode, for `y` to
+    /// copy.
+    pub copy_on_select: bool,
+    /// How many lines a notch of the wheel scrolls a pane through its
+    /// history.
+    pub scroll_lines: u16,
+    /// A scrollbar beside each pane's screen, in a column of its own, which
+    /// shows where in its history the pane is and drags to scroll it.
+    pub scrollbars: bool,
+}
+
+/// How many lines a notch of the wheel may scroll.
+pub const SCROLL_LINES: std::ops::RangeInclusive<u16> = 1..=100;
+
+impl Default for MouseSettings {
+    fn default() -> MouseSettings {
+        MouseSettings {
+            capture: true,
+            copy_on_select: true,
+            scroll_lines: 3,
+            scrollbars: true,
+        }
+    }
+}
+
 /// What a folded sidebar keeps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -737,6 +773,7 @@ impl Default for Config {
             window: WindowSettings::default(),
             tab_bar: TabBarSettings::default(),
             appearance: AppearanceSettings::default(),
+            mouse: MouseSettings::default(),
         }
     }
 }
@@ -1030,6 +1067,14 @@ pub fn from_text(text: &str) -> Result<Config> {
     }
     crate::tui::window::check(&config.window.title)
         .map_err(|err| anyhow::anyhow!("in [window] title, {err}"))?;
+    if !SCROLL_LINES.contains(&config.mouse.scroll_lines) {
+        bail!(
+            "[mouse] scroll_lines is {}: it's from {} to {} lines",
+            config.mouse.scroll_lines,
+            SCROLL_LINES.start(),
+            SCROLL_LINES.end()
+        );
+    }
     for profile in &config.profiles {
         profile.check()?;
     }
@@ -1467,6 +1512,26 @@ back_to = "build"
     }
 
     #[test]
+    fn the_mouse_settings_are_read_and_checked() {
+        let mouse = parse("[mouse]\ncapture = false\nscroll_lines = 1")
+            .unwrap()
+            .mouse;
+        assert!(!mouse.capture);
+        assert_eq!(mouse.scroll_lines, 1);
+        // What's left out has its default.
+        assert!(mouse.copy_on_select && mouse.scrollbars);
+        for lines in [0, 101] {
+            let err = parse(&format!("[mouse]\nscroll_lines = {lines}")).unwrap_err();
+            assert!(format!("{err:#}").contains("scroll_lines"), "{err:#}");
+        }
+        let unknown = parse("[mouse]\ncopy_on_selection = false").unwrap_err();
+        assert!(
+            format!("{unknown:#}").contains("copy_on_selection"),
+            "{unknown:#}"
+        );
+    }
+
+    #[test]
     fn keys_and_the_sidebar_are_checked() {
         let keys = parse("[keys]\nkill = \"n\"\nnew-session = \"N\"").unwrap();
         assert_eq!(keys.keys.len(), 2);
@@ -1742,6 +1807,12 @@ back_to = "build"
                     ColorValue(Color::Rgb(239, 241, 245)),
                 )]),
                 dark_colors: BTreeMap::new(),
+            },
+            mouse: MouseSettings {
+                capture: false,
+                copy_on_select: false,
+                scroll_lines: 5,
+                scrollbars: false,
             },
         };
         assert_eq!(parse(&config.to_toml()).unwrap(), config);
