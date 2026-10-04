@@ -44,6 +44,7 @@ pub enum Kind {
     SubagentStopped,
     SessionMessage,
     SessionBell,
+    SessionCopyDropped,
     TaskOpened,
     TaskStarted,
     TaskWaiting,
@@ -73,7 +74,7 @@ pub enum Kind {
 }
 
 impl Kind {
-    pub const ALL: [Kind; 42] = [
+    pub const ALL: [Kind; 43] = [
         Kind::SessionStarted,
         Kind::SessionRenamed,
         Kind::SessionWorking,
@@ -90,6 +91,7 @@ impl Kind {
         Kind::SubagentStopped,
         Kind::SessionMessage,
         Kind::SessionBell,
+        Kind::SessionCopyDropped,
         Kind::TaskOpened,
         Kind::TaskStarted,
         Kind::TaskWaiting,
@@ -137,6 +139,7 @@ impl Kind {
             Kind::SubagentStopped => "subagent.stopped",
             Kind::SessionMessage => "session.message",
             Kind::SessionBell => "session.bell",
+            Kind::SessionCopyDropped => "session.copy_dropped",
             Kind::TaskOpened => "task.opened",
             Kind::TaskStarted => "task.started",
             Kind::TaskWaiting => "task.waiting",
@@ -798,6 +801,9 @@ impl Event {
                 format!("from {from}: {}", message.line)
             }),
             Kind::SessionBell => "rang the bell".to_string(),
+            Kind::SessionCopyDropped => {
+                "copied while nobody watched: not put on the clipboard".to_string()
+            }
             Kind::SessionEnded | Kind::SessionStartFailed => self
                 .session
                 .as_ref()
@@ -978,6 +984,7 @@ pub fn example(kind: Kind, session: Option<&SessionInfo>, dir: &Path) -> Event {
             model: None,
             line: None,
             bell: false,
+            unseen_copies: 0,
         },
     };
     let now = now_ms() / 1000;
@@ -1037,9 +1044,11 @@ pub fn example(kind: Kind, session: Option<&SessionInfo>, dir: &Path) -> Event {
         closed: (kind == Kind::BacklogClosed).then_some(now),
     };
     let event = match kind {
-        Kind::SessionStarted | Kind::SessionRemoved | Kind::SessionArchived | Kind::SessionBell => {
-            Event::about_session(kind, &session)
-        }
+        Kind::SessionStarted
+        | Kind::SessionRemoved
+        | Kind::SessionArchived
+        | Kind::SessionBell
+        | Kind::SessionCopyDropped => Event::about_session(kind, &session),
         Kind::SessionRenamed => Event::renamed(&session, "old-name"),
         Kind::SessionWorking => Event::activity(&session, Some(Activity::Idle), Activity::Working),
         Kind::SessionWaiting => {
@@ -1288,6 +1297,7 @@ mod tests {
             model: None,
             line: None,
             bell: false,
+            unseen_copies: 0,
         }
     }
 

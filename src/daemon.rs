@@ -2525,6 +2525,7 @@ impl Daemon {
                 Change::Claimed => Some(Event::about_session(Kind::SessionClaimed, &info)),
                 Change::Released { agent } => Some(Event::released(&info, &agent)),
                 Change::Bell => Some(Event::about_session(Kind::SessionBell, &info)),
+                Change::UnseenCopy => Some(Event::about_session(Kind::SessionCopyDropped, &info)),
             };
             if let Some(event) = event {
                 self.events.emit(event);

@@ -217,7 +217,10 @@ whole words, or lines. Drag past the top or bottom of a pane and its history scr
 the further past, for as long as you hold it there; the wheel scrolls it too. A program that asks for the mouse
 itself, like `vim` with `set mouse=a` or `htop`, gets the clicks, drags and the wheel in its pane while that pane
 has the keyboard; there, your terminal's own selection still works with a key held: `Shift` in most terminals,
-`Option` in iTerm2 and Terminal on macOS.
+`Option` in iTerm2 and Terminal on macOS. A program on the alternate screen that doesn't ask, like `less`, a git
+pager or `man`, keeps no history for the wheel to scroll, so a notch sends it the arrow keys instead, Up or Down
+as many times as it would scroll lines, the way xterm's alternate scroll does; a program that turns that off
+(`\e[?1007l`) gets nothing. Copy mode and a selection being dragged keep the wheel scrolling the pane.
 
 Beside each pane's screen, in a column of its own, a scrollbar shows where in its history the pane is, once it
 has some: drag its thumb to scroll, or click the track and the thumb jumps there. The wheel over it scrolls the
@@ -731,6 +734,15 @@ What you copy goes to your clipboard. On your own machine crystal hands it to `p
 `wl-copy`, `xclip` or `xsel` on Linux. Over ssh, or with none of those, it asks the terminal you're in to take
 it, with OSC 52, which puts it on the clipboard of the machine your terminal runs on: Ghostty, kitty, WezTerm,
 Alacritty, foot and Windows Terminal do; iTerm2 once you allow it in its settings; macOS's Terminal doesn't.
+
+What a program in a session copies goes there too, as it would in a terminal of its own: Claude Code, vim with
+an OSC 52 clipboard and tmux with `set-clipboard on` ask their terminal to copy with OSC 52, and the pane or the
+`crystal attach` showing the session puts it on your clipboard the same way, on the machine you're at, over
+[`crystal ssh`](#other-machines) too. A program can never read your clipboard. One out of sight, its session in
+no pane and no attach, has its copy dropped: nobody saw what it was, and it would take the place of what you
+copied meanwhile. The TUI's footer says so (`builder copied out of sight: not put on your clipboard`), and the
+event log gets a `session.copy_dropped`; look at the session and copy again. `[clipboard] allow_programs = false`
+in the [settings](#settings) keeps programs off your clipboard.
 
 `e` opens the selected session's history in your `$EDITOR` (or `vi`): everything its pane can page back through,
 then what's on its screen, as plain text, with a line that wrapped onto several rows made whole again. It opens
@@ -2242,6 +2254,7 @@ matched anywhere in the link unless `^` and `$` pin it. `X` lists each plugin's 
 | `subagent.stopped` | that subagent finishes |
 | `session.message` | a session is sent a message: by another session with `crystal send`, which its `message` names, or by you |
 | `session.bell` | a session's program rings the terminal's bell while nobody's watching it |
+| `session.copy_dropped` | a session's program copies while nobody's watching it, which crystal doesn't put on your [clipboard](#zoom-copy-mode-and-search) |
 | `task.opened` | a task is made: given to a session as it starts, made to start later, or opened again by a follow-up |
 | `task.started` | a task made to start later starts, in a session of its own |
 | `task.waiting` | a task's agent ends a turn with the task still open: it waits on you |
@@ -2333,7 +2346,8 @@ file and change. A setting crystal doesn't know is an error that names it, so a 
 | `[window]` | | `title`, what the TUI titles its terminal: [the window](#terminals-the-window-and-the-tab-bar) |
 | `[tab_bar]` | | where the tab bar goes, whether it's left out with one tab, and what it shows at its right: [the tab bar](#terminals-the-window-and-the-tab-bar) |
 | `[appearance]` | | `auto_switch`, the theme following your system's light or dark, and the theme for each: [themes](#themes) |
-| `[mouse]` | | `capture`, whether the TUI takes the mouse from your terminal (`true`); `copy_on_select`, whether a selection is copied as you let go or waits in copy mode for `y` (`true`); `scroll_lines`, how far a notch of the wheel scrolls a pane, up to 100 (`3`); `scrollbars`, a scrollbar beside each pane (`true`): [the mouse](#usage) |
+| `[mouse]` | | `capture`, whether the TUI takes the mouse from your terminal (`true`); `copy_on_select`, whether a selection is copied as you let go or waits in copy mode for `y` (`true`); `scroll_lines`, how far a notch of the wheel scrolls a pane, up to 100, or how many arrow keys it sends a pager (`3`); `scrollbars`, a scrollbar beside each pane (`true`): [the mouse](#usage) |
+| `[clipboard]` | | `allow_programs`, whether what a program in a session copies goes on your clipboard (`true`): [copying](#zoom-copy-mode-and-search) |
 | `[update]` | | `check`, whether the TUI looks once a day for a [newer crystal](#updating) (`true`) |
 
 `notify_command` is for telling you some other way, like a message to your phone. It runs with
@@ -2353,12 +2367,14 @@ does something a plugin adds, `[memory]` each time a task closes or a search run
 background task's run starts, `[handoff]` each time a note is written, `[sessions]` every 15 seconds and as it
 starts sessions again, a flow
 each time one starts, `[[project]]` each time a project's commands run,
-`name_from_prompt` each time it names a session, `resume_reported_agents` as it starts sessions again and
+`name_from_prompt` each time it names a session, `resume_reported_agents` as it starts sessions again,
+`[clipboard]` each time a program copies out of sight and
 `scrollback_lines` as each session starts, so a change counts straight away (a session already running keeps
-what it had); `crystal new` and the TUI read `[terminal]` each time they start a shell; the TUI reads
+what it had); `crystal new` and the TUI read `[terminal]` each time they start a shell, and `crystal attach`
+reads `[clipboard]` as it attaches; the TUI reads
 `new_session`, `theme`, `[colors]`, `[appearance]`, `[window]`, `[tab_bar]`, `scrollback_lines`, `[plugins]`,
-`[update]`, `[mouse]`, `[forge]`, the profiles and the flows when it starts, again when you save a profile or
-switch a plugin, and every half a second while the settings view is open.
+`[update]`, `[mouse]`, `[clipboard]`, `[forge]`, the profiles and the flows when it starts, again when you save
+a profile or switch a plugin, and every half a second while the settings view is open.
 
 #### Themes
 
@@ -2509,7 +2525,8 @@ issues give way before it.
 sounds, the theme and whether it follows your system's [appearance](#themes) (the row says which theme each
 side is), whether the [tab bar](#terminals-the-window-and-the-tab-bar) goes on top or over the footer and is
 left out with one tab, how long an agent may sit [idle](#archiving-and-idle-agents), how far apart agents
-start again after a [crash or a reboot](#usage), [the mouse](#usage), how memory learns ([the
+start again after a [crash or a reboot](#usage), [the mouse](#usage), whether programs' copies go on [your
+clipboard](#zoom-copy-mode-and-search), how memory learns ([the
 distiller](#the-distiller)) and searches ([by meaning](#search-by-meaning)), and whether [draft pull
 requests](#pull-requests) are hidden. `space` changes the one the bar is on, and `←/→` go through the
 [themes](#themes), forward and back (the row says which of the twenty it's on), the waits before a

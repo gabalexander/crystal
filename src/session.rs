@@ -99,6 +99,10 @@ pub struct Session {
     /// nobody has looked since. Not handed over: a new crystal starts the
     /// marks afresh.
     bell: bool,
+    /// How many times the program asked its terminal to copy something
+    /// while nobody was watching, which nobody put on the clipboard. Not
+    /// handed over either.
+    unseen_copies: u32,
     /// `Some` for a task, whose screen shows what Claude does in its runs
     /// rather than a program in a PTY.
     task: Option<Task>,
@@ -171,6 +175,9 @@ pub enum Change {
     Released { agent: String },
     /// Its program rang the terminal's bell while nobody was watching.
     Bell,
+    /// Its program asked its terminal to copy something while nobody was
+    /// watching, which nobody put on the clipboard.
+    UnseenCopy,
 }
 
 /// A session as one daemon hands it to the next, in a handover: all it
@@ -369,6 +376,7 @@ impl Session {
             rollouts: None,
             telling: notify::Telling::default(),
             bell: false,
+            unseen_copies: 0,
             screen_watch: ScreenWatch::default(),
             front: None,
             front_group: None,
@@ -434,6 +442,7 @@ impl Session {
             rollouts: None,
             telling: notify::Telling::default(),
             bell: false,
+            unseen_copies: 0,
             screen_watch: ScreenWatch::default(),
             front: Some(Front::Task),
             front_group: None,
@@ -497,6 +506,7 @@ impl Session {
             rollouts: None,
             telling: notify::Telling::default(),
             bell: false,
+            unseen_copies: 0,
             screen_watch: ScreenWatch::default(),
             front,
             front_group: None,
@@ -867,6 +877,7 @@ impl Session {
             line: self.shown.line(now).map(String::from),
             stopped_idle: self.stopped_idle,
             bell: self.bell,
+            unseen_copies: self.unseen_copies,
         }
     }
 
@@ -1098,6 +1109,7 @@ impl Session {
             None => self.check_screen(),
         }
         self.check_bell();
+        self.check_copies();
         self.fail_task_if_ended();
     }
 
@@ -1109,6 +1121,20 @@ impl Session {
         if rang && !self.bell && !self.term.is_watched() {
             self.bell = true;
             self.changes.push(Change::Bell);
+        }
+    }
+
+    /// Counts the copies its program asked its terminal for while nobody was
+    /// watching. Nobody put them on the clipboard: there was nobody to see
+    /// what they were, and putting one there later would take the place of
+    /// whatever the user copied meanwhile. A viewer puts what a session it
+    /// shows copies there itself. A task's screen shows what crystal draws
+    /// of Claude's work, not a program's own output, and copies nothing.
+    fn check_copies(&mut self) {
+        let unseen = self.term.take_unseen_copies();
+        if unseen > 0 && self.task.is_none() && programs_copy() {
+            self.unseen_copies = self.unseen_copies.saturating_add(unseen);
+            self.changes.push(Change::UnseenCopy);
         }
     }
 
@@ -1563,6 +1589,7 @@ impl Session {
             rollouts: handed.rollouts,
             telling: notify::Telling::after(handed.told),
             bell: false,
+            unseen_copies: 0,
             task,
             goal: handed.goal,
             reminded: handed.reminded,
@@ -1702,6 +1729,9 @@ struct Screen {
     /// it, or started or stopped watching it. Its program's own output
     /// doesn't count: an agent at its prompt can redraw as it likes.
     touched: Instant,
+    /// The copies the program asked its terminal for while nobody was
+    /// watching, since they were last taken.
+    unseen_copies: u32,
 }
 
 struct Viewer {
@@ -1734,6 +1764,7 @@ impl Term {
                 listeners: Vec::new(),
                 ended: false,
                 touched: Instant::now(),
+                unseen_copies: 0,
             }),
             pump: Mutex::default(),
         }
@@ -1863,6 +1894,12 @@ impl Term {
         self.screen.lock().unwrap().vt.take_bells()
     }
 
+    /// How many times the program asked its terminal to copy something
+    /// while nobody was watching, since the last call.
+    pub fn take_unseen_copies(&self) -> u32 {
+        std::mem::take(&mut self.screen.lock().unwrap().unseen_copies)
+    }
+
     pub fn unwatch(&self, id: u64) {
         let mut screen = self.screen.lock().unwrap();
         screen.viewers.retain(|viewer| viewer.id != id);
@@ -1947,6 +1984,11 @@ impl Term {
         screen
             .viewers
             .retain(|viewer| viewer.feed.try_send(chunk.clone()).is_ok());
+        // What the program copies, a viewer's own screen sees, and puts on
+        // the clipboard; with none, nobody does.
+        if screen.vt.take_copied().is_some() && screen.viewers.is_empty() {
+            screen.unseen_copies = screen.unseen_copies.saturating_add(1);
+        }
         // One signal waiting is enough: the listener looks at the screen as
         // it is then.
         screen.listeners.retain(|listener| {
@@ -1960,6 +2002,12 @@ impl Term {
 /// open task is left as it is.
 fn tasks_on() -> bool {
     tasks::enabled(&Config::load().unwrap_or_default())
+}
+
+/// Whether what programs copy goes to the clipboard, by the config as it is
+/// now: with it off, a copy nobody saw is nothing to tell.
+fn programs_copy() -> bool {
+    Config::load().unwrap_or_default().clipboard.allow_programs
 }
 
 /// `time` as seconds since the Unix epoch, which is how it travels.
@@ -2471,6 +2519,33 @@ mod tests {
         assert!(session.take_changes().is_empty());
         session.seen();
         assert!(!session.info().bell);
+    }
+
+    #[test]
+    fn a_copy_nobody_watched_is_counted_and_told_and_one_watched_isn_t() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = shell_session(dir.path());
+        // Two in one go are one: only the last would be on the clipboard.
+        session.term().show(b"\x1b]52;c;aGk=\x07\x1b]52;c;aGk=\x07");
+        session.check();
+        assert_eq!(session.info().unseen_copies, 1);
+        assert_eq!(session.take_changes(), [Change::UnseenCopy]);
+        session.term().show(b"\x1b]52;c;aGk=\x07");
+        session.check();
+        assert_eq!(session.info().unseen_copies, 2);
+        assert_eq!(session.take_changes(), [Change::UnseenCopy]);
+        // Looking at the session doesn't take the count back: it only
+        // grows, for a TUI to see it go up.
+        session.seen();
+        assert_eq!(session.info().unseen_copies, 2);
+
+        // A viewer puts what it sees copied on the clipboard itself.
+        let watch = session.term().watch(false);
+        session.term().show(b"\x1b]52;c;aGk=\x07");
+        session.term().unwatch(watch.id);
+        session.check();
+        assert_eq!(session.info().unseen_copies, 2);
+        assert!(session.take_changes().is_empty());
     }
 
     #[test]

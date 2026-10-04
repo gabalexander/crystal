@@ -107,6 +107,7 @@ mod tests {
             model: None,
             line: None,
             bell: false,
+            unseen_copies: 0,
         }
     }
 

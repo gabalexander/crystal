@@ -7,7 +7,11 @@
 //! the output as it scrolls. A viewer's screen also finds the links on it,
 //! the hyperlinks a program wrote (OSC 8) and the URLs in its text. Every
 //! screen counts the times the program rang the terminal's bell, for the
-//! daemon to mark the session and a viewer to ring the user's terminal.
+//! daemon to mark the session and a viewer to ring the user's terminal, and
+//! keeps the text the program last asked its terminal to copy (OSC 52), for
+//! a viewer to put on the user's clipboard and the daemon to say when
+//! nobody was there to; a program asking to read the clipboard is never
+//! answered.
 
 use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::{Dimensions, Grid, Scroll};
@@ -15,7 +19,7 @@ use alacritty_terminal::index::{Boundary, Column, Direction, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionRange, SelectionType};
 use alacritty_terminal::term::cell::{Cell as GridCell, Flags, Hyperlink};
 use alacritty_terminal::term::search::{Match, RegexIter, RegexSearch};
-use alacritty_terminal::term::{Config, Term, TermMode};
+use alacritty_terminal::term::{Config, Osc52, Term, TermMode};
 use alacritty_terminal::vi_mode::ViMotion;
 use alacritty_terminal::vte::ansi::{Color, NamedColor, Processor, Timeout};
 use serde::{Deserialize, Serialize};
@@ -62,6 +66,10 @@ pub mod mode {
     pub const MOUSE_UTF8: u16 = 1005;
     /// Mouse events written the SGR way.
     pub const MOUSE_SGR: u16 = 1006;
+    /// The wheel on the alternate screen sends the arrow keys, for a
+    /// program that didn't ask for the mouse: on until a program turns it
+    /// off.
+    pub const ALTERNATE_SCROLL: u16 = 1007;
     /// Pastes marked as pastes.
     pub const BRACKETED_PASTE: u16 = 2004;
 }
@@ -77,6 +85,7 @@ fn term_mode(mode: u16) -> TermMode {
         mode::FOCUS_EVENTS => TermMode::FOCUS_IN_OUT,
         mode::MOUSE_UTF8 => TermMode::UTF8_MOUSE,
         mode::MOUSE_SGR => TermMode::SGR_MOUSE,
+        mode::ALTERNATE_SCROLL => TermMode::ALTERNATE_SCROLL,
         mode::BRACKETED_PASTE => TermMode::BRACKETED_PASTE,
         _ => TermMode::empty(),
     }
@@ -310,8 +319,8 @@ pub struct Saved {
 }
 
 /// What alacritty_terminal hands back as it reads a program's output: the
-/// title the program gives its terminal, the answers to its questions, and
-/// its bell.
+/// title the program gives its terminal, the answers to its questions, its
+/// bell, and what it copies.
 #[derive(Default)]
 struct Heard {
     /// Agents put a spinner here while they work.
@@ -319,6 +328,10 @@ struct Heard {
     replies: Vec<u8>,
     /// The times the program rang the bell since they were last taken.
     bells: u32,
+    /// The text the program last asked its terminal to put on the
+    /// clipboard, or the selection, which goes there too, until it's
+    /// taken.
+    copied: Option<String>,
     /// Only the daemon's screen answers: viewers only draw.
     answering: bool,
 }
@@ -334,6 +347,7 @@ impl EventListener for Listener {
             Event::ResetTitle => heard.title.clear(),
             Event::PtyWrite(text) if heard.answering => heard.replies.extend(text.as_bytes()),
             Event::Bell => heard.bells = heard.bells.saturating_add(1),
+            Event::ClipboardStore(_, text) => heard.copied = Some(text),
             _ => {}
         }
     }
@@ -435,6 +449,9 @@ impl Screen {
         let config = Config {
             scrolling_history: history,
             kitty_keyboard: true,
+            // A program may put text on the user's clipboard, as in a
+            // terminal of its own, but never read what's there.
+            osc52: Osc52::OnlyCopy,
             ..Config::default()
         };
         let term = Term::new(config, &size(rows, cols), Listener(heard.clone()));
@@ -479,6 +496,13 @@ impl Screen {
     /// call: a `BEL` on its own, not the one that ends a title.
     pub fn take_bells(&mut self) -> u32 {
         std::mem::take(&mut self.heard.lock().unwrap().bells)
+    }
+
+    /// The text the program last asked its terminal to put on the
+    /// clipboard (OSC 52) since the last call, when it asked: only the last
+    /// counts, as only the last would be on the clipboard.
+    pub fn take_copied(&mut self) -> Option<String> {
+        self.heard.lock().unwrap().copied.take()
     }
 
     /// The size, as `(rows, cols)`.
@@ -1516,6 +1540,7 @@ impl InputModes {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clipboard;
 
     fn screen(rows: u16, cols: u16, output: &[u8]) -> Screen {
         let mut screen = Screen::new(rows, cols);
@@ -1652,6 +1677,39 @@ mod tests {
         let mut viewer = Screen::new(2, 10);
         viewer.process(&screen.state_formatted(true));
         assert_eq!(viewer.take_bells(), 0);
+    }
+
+    #[test]
+    fn what_a_program_copies_is_kept_until_taken_the_last_of_it() {
+        // "hi", then "中文" to the selection, ended with ST.
+        let mut screen = screen(2, 10, b"a\x1b]52;c;aGk=\x07b\x1b]52;s;5Lit5paH\x1b\\c");
+        assert_eq!(screen.take_copied().as_deref(), Some("中文"));
+        assert_eq!(screen.take_copied(), None);
+        assert_eq!(screen.rows(false)[0], "abc");
+        // Nothing to copy, however it's written, is nothing copied.
+        screen.process(b"\x1b]52;c;!!!\x07\x1b]52;x;aGk=\x07");
+        assert_eq!(screen.take_copied(), None);
+        // A copy split across reads is still one, and a long one is whole.
+        let long = "word ".repeat(20_000);
+        let sequence = format!("\x1b]52;c;{}\x07", clipboard::base64(long.as_bytes()));
+        let (first, second) = sequence.as_bytes().split_at(sequence.len() / 2);
+        screen.process(first);
+        assert_eq!(screen.take_copied(), None);
+        screen.process(second);
+        assert_eq!(screen.take_copied(), Some(long));
+        // What catches a new viewer up copies nothing.
+        screen.process(b"\x1b]52;c;aGk=\x07");
+        let mut viewer = Screen::new(2, 10);
+        viewer.process(&screen.state_formatted(true));
+        assert_eq!(viewer.take_copied(), None);
+    }
+
+    #[test]
+    fn a_program_asking_to_read_the_clipboard_is_never_answered() {
+        let mut screen = Screen::answering(2, 10);
+        screen.process(b"\x1b]52;c;?\x07\x1b]52;s;?\x1b\\");
+        assert!(screen.take_replies().is_empty());
+        assert_eq!(screen.take_copied(), None);
     }
 
     #[test]

@@ -4,10 +4,12 @@
 //! What the session writes is drawn through a screen of our own rather than
 //! passed straight through, so whatever the program does to its terminal,
 //! like switching screens, stays inside the attach. Its bell is passed on
-//! to your terminal, as often as [`crate::bell`] lets it.
+//! to your terminal, as often as [`crate::bell`] lets it, and what it copies
+//! goes on your clipboard, as [`crate::clipboard`] puts it there.
 
 use crate::bell::Ringer;
 use crate::client;
+use crate::clipboard;
 use crate::config::Config;
 use crate::env;
 use crate::protocol::{Request, Response, State};
@@ -48,9 +50,8 @@ pub fn run(socket: &Path, name: Option<&str>) -> Result<()> {
         bail!("attach needs a terminal");
     }
     // A config that can't be read is for the TUI to say; attaching goes on.
-    if let Ok(config) = Config::load() {
-        vt::set_history_lines(config.scrollback_lines);
-    }
+    let config = Config::load().unwrap_or_default();
+    vt::set_history_lines(config.scrollback_lines);
     let (cols, rows) = terminal::size()?;
     // Your own terminal keeps what scrolls by while you're attached; the
     // history from before is for the TUI's panes and `crystal read`.
@@ -72,9 +73,10 @@ pub fn run(socket: &Path, name: Option<&str>) -> Result<()> {
         return Ok(());
     }
 
+    let copies = config.clipboard.allow_programs && !in_background(socket, &viewer.id);
     let detached = {
         let _raw = RawTerminal::enter()?;
-        relay(socket, viewer, output, rows, cols)?
+        relay(socket, viewer, output, (rows, cols), copies)?
     };
     if detached {
         println!("[detached from {name}]");
@@ -84,12 +86,32 @@ pub fn run(socket: &Path, name: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+/// Whether the session with the id `id` is a background task, whose screen
+/// shows what crystal draws of Claude's work rather than a program's own
+/// output.
+fn in_background(socket: &Path, id: &str) -> bool {
+    let Ok(Some(Response::Sessions { sessions })) = client::ask(socket, &Request::List, false)
+    else {
+        return false;
+    };
+    let session = sessions.iter().find(|session| session.id == id);
+    let task = session.and_then(|session| session.task.as_ref());
+    task.is_some_and(|task| task.background)
+}
+
 /// Draws the session and sends it the keyboard until the user detaches
-/// (`true`) or the session goes (`false`).
-fn relay(socket: &Path, viewer: Viewer, output: Output, rows: u16, cols: u16) -> Result<bool> {
+/// (`true`) or the session goes (`false`). With `copies`, what its program
+/// copies goes on the clipboard.
+fn relay(
+    socket: &Path,
+    viewer: Viewer,
+    output: Output,
+    (rows, cols): (u16, u16),
+    copies: bool,
+) -> Result<bool> {
     let drawn = Arc::new(Mutex::new(Drawn::new(rows, cols)?));
     let mut viewer = viewer;
-    let mut drawing = Drawing::start(&drawn, output);
+    let mut drawing = Drawing::start(&drawn, output, copies);
 
     // Our own handle on the keyboard, unbuffered, so that waiting on it
     // and reading from it agree.
@@ -107,7 +129,7 @@ fn relay(socket: &Path, viewer: Viewer, output: Output, rows: u16, cols: u16) ->
             };
             viewer = again;
             drawn.lock().unwrap().screen = vt::Screen::new(size.0, size.1);
-            drawing = Drawing::start(&drawn, output);
+            drawing = Drawing::start(&drawn, output, copies);
         }
         if readable(&keyboard, TICK)? {
             let n = (&keyboard).read(&mut buf)?;
@@ -147,14 +169,15 @@ fn attach_again(
     (again.running && again.id == viewer.id).then_some((again, output))
 }
 
-/// The thread that draws a session's output as it comes, until it ends.
+/// The thread that draws a session's output as it comes, until it ends,
+/// and passes on its bell and, with `copies`, what it copies.
 struct Drawing {
     drawer: Option<thread::JoinHandle<()>>,
     done: Arc<AtomicBool>,
 }
 
 impl Drawing {
-    fn start(drawn: &Arc<Mutex<Drawn>>, output: Output) -> Drawing {
+    fn start(drawn: &Arc<Mutex<Drawn>>, output: Output, copies: bool) -> Drawing {
         let done = Arc::new(AtomicBool::new(false));
         let drawer = thread::spawn({
             let drawn = drawn.clone();
@@ -169,6 +192,11 @@ impl Drawing {
                     }
                     if drawn.screen.take_bells() > 0 {
                         let _ = ringer.ring();
+                    }
+                    if let Some(text) = drawn.screen.take_copied()
+                        && copies
+                    {
+                        let _ = clipboard::copy(&text);
                     }
                 }
                 done.store(true, Ordering::SeqCst);

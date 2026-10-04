@@ -47,6 +47,7 @@ pub enum Setting {
     CopyOnSelect,
     ScrollLines,
     Scrollbars,
+    ProgramsCopy,
     Distill,
     Embeddings,
     HideDrafts,
@@ -76,6 +77,7 @@ pub enum Change {
     /// [`SCROLL_LINES`].
     ScrollLines(u16),
     Scrollbars(bool),
+    ProgramsCopy(bool),
     Distill(bool),
     Embeddings(bool),
     HideDrafts(bool),
@@ -99,6 +101,7 @@ impl Change {
             Change::CopyOnSelect(_) => &["mouse", "copy_on_select"],
             Change::ScrollLines(_) => &["mouse", "scroll_lines"],
             Change::Scrollbars(_) => &["mouse", "scrollbars"],
+            Change::ProgramsCopy(_) => &["clipboard", "allow_programs"],
             Change::Distill(_) => &["memory", "distill"],
             Change::Embeddings(_) => &["memory", "embeddings"],
             Change::HideDrafts(_) => &["forge", "hide_draft_prs"],
@@ -113,6 +116,7 @@ impl Change {
             | Change::MouseCapture(on)
             | Change::CopyOnSelect(on)
             | Change::Scrollbars(on)
+            | Change::ProgramsCopy(on)
             | Change::Distill(on)
             | Change::Embeddings(on)
             | Change::AutoSwitch(on)
@@ -197,7 +201,7 @@ pub enum Outcome {
 }
 
 /// The settings the bar can be on, in the order they're listed.
-const SETTINGS: [Setting; 17] = [
+const SETTINGS: [Setting; 18] = [
     Setting::Notify,
     Setting::NotifyAfter,
     Setting::UnfocusedOnly,
@@ -212,6 +216,7 @@ const SETTINGS: [Setting; 17] = [
     Setting::CopyOnSelect,
     Setting::ScrollLines,
     Setting::Scrollbars,
+    Setting::ProgramsCopy,
     Setting::Distill,
     Setting::Embeddings,
     Setting::HideDrafts,
@@ -333,6 +338,7 @@ impl SettingsView {
                 Change::ScrollLines(next_lines(config.mouse.scroll_lines, forward))
             }
             Setting::Scrollbars => Change::Scrollbars(!config.mouse.scrollbars),
+            Setting::ProgramsCopy => Change::ProgramsCopy(!config.clipboard.allow_programs),
             Setting::Distill => Change::Distill(!config.memory.distill),
             Setting::Embeddings => Change::Embeddings(!config.memory.embeddings),
             Setting::HideDrafts => Change::HideDrafts(!config.forge.hide_draft_prs),
@@ -483,6 +489,7 @@ fn lines(view: &SettingsView, theme: &Theme) -> Vec<Line<'static>> {
             Setting::CopyOnSelect => "copy on select",
             Setting::ScrollLines => "wheel scrolls",
             Setting::Scrollbars => "scrollbars",
+            Setting::ProgramsCopy => "programs copy",
             Setting::Distill => "distill closed tasks",
             Setting::Embeddings => "search by meaning",
             Setting::HideDrafts => "hide drafts",
@@ -648,6 +655,16 @@ fn lines(view: &SettingsView, theme: &Theme) -> Vec<Line<'static>> {
         Some(mouse.scrollbars),
         on_off(mouse.scrollbars),
         "beside each pane, a column of its own: drag one to scroll".to_string(),
+    ));
+
+    lines.push(Line::from(""));
+    lines.push(Line::styled("Clipboard", bold));
+    let programs = config.clipboard.allow_programs;
+    lines.push(row(
+        Setting::ProgramsCopy,
+        Some(programs),
+        on_off(programs),
+        "what Claude Code, vim or tmux copy (OSC 52)".to_string(),
     ));
 
     lines.push(Line::from(""));
@@ -843,6 +860,11 @@ mod tests {
         press(&mut view, KeyCode::Down);
         assert_eq!(
             press(&mut view, KeyCode::Char(' ')),
+            Outcome::Change(Change::ProgramsCopy(false))
+        );
+        press(&mut view, KeyCode::Down);
+        assert_eq!(
+            press(&mut view, KeyCode::Char(' ')),
             Outcome::Change(Change::Distill(false))
         );
         press(&mut view, KeyCode::Down);
@@ -1009,6 +1031,10 @@ mod tests {
         );
         assert_eq!(Change::Sound(true).keys(), ["sound", "enabled"]);
         assert_eq!(Change::HideDrafts(true).keys(), ["forge", "hide_draft_prs"]);
+        assert_eq!(
+            Change::ProgramsCopy(false).keys(),
+            ["clipboard", "allow_programs"]
+        );
     }
 
     #[test]

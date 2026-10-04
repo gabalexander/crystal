@@ -656,6 +656,11 @@ pub struct SessionInfo {
     /// nobody has looked at it since.
     #[serde(default)]
     pub bell: bool,
+    /// How many times its program asked its terminal to copy something
+    /// while nobody was watching, since the daemon started: crystal put
+    /// none of them on the clipboard. A TUI says so as the count goes up.
+    #[serde(default)]
+    pub unseen_copies: u32,
     /// crystal stopped it after its agent sat idle for as long as the
     /// settings allow: it starts again in its conversation.
     #[serde(default)]

@@ -3053,6 +3053,7 @@ impl App {
     /// worktree, the selection goes to the row that worktree is left with;
     /// otherwise to the next session in the tab, or the last.
     pub fn set_sessions(&mut self, sessions: Vec<SessionInfo>) {
+        let mut copied_unseen = None;
         // A session renamed from elsewhere, by `crystal rename` or from its
         // first prompt, keeps its tab, its pane and the selection.
         for now in &sessions {
@@ -3067,6 +3068,19 @@ impl App {
             if changed && let Some(worktree) = &now.worktree {
                 self.stats_due.insert(worktree.path.clone());
             }
+            // Its program copied something while nobody watched, which
+            // nobody put on the clipboard: the user is told, to copy it
+            // again where they can see it. A daemon handed over counts from
+            // nothing again.
+            let copied = was.is_some_and(|was| was.unseen_copies != now.unseen_copies);
+            if copied && now.unseen_copies > 0 {
+                copied_unseen = Some(now.name.clone());
+            }
+        }
+        if let Some(name) = copied_unseen {
+            self.notify(format!(
+                "{name} copied out of sight: not put on your clipboard"
+            ));
         }
         if let Some(restarted) = self.restarts.take(&sessions) {
             self.restarted = Some(restarted);
@@ -6129,7 +6143,7 @@ impl App {
     }
 
     /// Only a pane that shows a running session takes keys.
-    fn can_type_into(&self, slot: Slot) -> bool {
+    pub fn can_type_into(&self, slot: Slot) -> bool {
         let running = self
             .pane_session(slot)
             .is_some_and(|session| session.state == State::Running);
@@ -6226,6 +6240,7 @@ mod tests {
             model: None,
             line: None,
             bell: false,
+            unseen_copies: 0,
         }
     }
 
@@ -8920,6 +8935,30 @@ mod tests {
         assert_eq!(in_sidebar(&app), ["shell"]);
         press(&mut app, KeyCode::Char('1'));
         assert_eq!(in_sidebar(&app), ["z"]);
+    }
+
+    #[test]
+    fn a_copy_nobody_saw_is_said_once_as_it_comes() {
+        let mut app = app_with(&["shown", "hidden"]);
+        let copied = |count| SessionInfo {
+            unseen_copies: count,
+            ..session("hidden")
+        };
+        app.set_sessions(vec![session("shown"), copied(1)]);
+        assert_eq!(
+            app.notice(),
+            Some("hidden copied out of sight: not put on your clipboard")
+        );
+        // The same count again says nothing new.
+        app.notify("something else".into());
+        app.set_sessions(vec![session("shown"), copied(1)]);
+        assert_eq!(app.notice(), Some("something else"));
+        // Nor does a daemon handed over, counting from nothing, until it
+        // counts one.
+        app.set_sessions(vec![session("shown"), copied(0)]);
+        assert_eq!(app.notice(), Some("something else"));
+        app.set_sessions(vec![session("shown"), copied(1)]);
+        assert!(app.notice().unwrap().starts_with("hidden copied"));
     }
 
     #[test]
