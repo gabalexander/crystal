@@ -529,7 +529,8 @@ enum Command {
     /// Give a session another name.
     Rename { name: String, new_name: String },
     /// Run an ended session's command again, in the same directory and
-    /// under the same name. Claude Code comes back in its conversation.
+    /// under the same name. Claude Code comes back in its conversation. One
+    /// that couldn't start again after a restart tries again.
     Respawn { name: String },
     /// Stop a session and remove it from the list. An archived one is
     /// taken out of the archive.
@@ -2170,6 +2171,13 @@ fn print_sessions(sessions: &[SessionInfo]) {
         "TASK",
     ];
     print_table(header, &rows);
+    // Why a session couldn't start again is too long for its row, and on
+    // standard error it's out of the way of a script reading the rows.
+    for session in sessions {
+        if let protocol::State::Failed { why } = &session.state {
+            eprintln!("{} couldn't start again: {why}", session.name);
+        }
+    }
 }
 
 /// Prints the archived sessions, the latest archived first, with how long

@@ -716,6 +716,7 @@ impl Theme {
             Status::Running => self.running,
             Status::Ended => self.ended,
             Status::Failed => self.failed,
+            Status::Starting => self.muted,
         }
     }
 }

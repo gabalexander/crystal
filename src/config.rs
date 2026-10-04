@@ -310,12 +310,18 @@ pub struct SessionSettings {
     /// or typing, before crystal stops it, to start again in its
     /// conversation when it's wanted: like `30m`, `2h` or `90s`, or `off`.
     pub stop_idle_after: String,
+    /// After the daemon restarts cold, from a crash or a reboot, how many
+    /// milliseconds apart it starts the agents it starts again, so they
+    /// don't all start at once: the first straight away, and `0` all of
+    /// them. Other programs start straight away.
+    pub restart_spacing_ms: u64,
 }
 
 impl Default for SessionSettings {
     fn default() -> SessionSettings {
         SessionSettings {
             stop_idle_after: "off".to_string(),
+            restart_spacing_ms: 250,
         }
     }
 }
@@ -324,9 +330,17 @@ impl SessionSettings {
     /// The choices the settings view goes round.
     pub const CHOICES: [&str; 6] = ["off", "15m", "30m", "1h", "2h", "8h"];
 
+    /// The spacings the settings view goes round, in milliseconds.
+    pub const SPACINGS: [u64; 6] = [0, 100, 250, 500, 1000, 2000];
+
     /// How long an agent may sit idle, or `None` when it may for good.
     pub fn idle_limit(&self) -> Option<Duration> {
         duration(&self.stop_idle_after).ok().flatten()
+    }
+
+    /// How far apart agents start again after a cold restart.
+    pub fn restart_spacing(&self) -> Duration {
+        Duration::from_millis(self.restart_spacing_ms)
     }
 }
 
@@ -784,6 +798,16 @@ mod tests {
     }
 
     #[test]
+    fn agents_start_again_a_moment_apart_unless_told_otherwise() {
+        let spacing = Config::default().sessions.restart_spacing();
+        assert_eq!(spacing, Duration::from_millis(250));
+        let config = parse("[sessions]\nrestart_spacing_ms = 0\n").unwrap();
+        assert_eq!(config.sessions.restart_spacing(), Duration::ZERO);
+        assert!(SessionSettings::SPACINGS.contains(&250));
+        assert!(parse("[sessions]\nrestart_spacing_ms = -1\n").is_err());
+    }
+
+    #[test]
     fn an_empty_file_is_all_defaults() {
         assert_eq!(parse("").unwrap(), Config::default());
     }
@@ -1230,6 +1254,7 @@ back_to = "build"
             },
             sessions: SessionSettings {
                 stop_idle_after: "45m".into(),
+                restart_spacing_ms: 1000,
             },
             update: UpdateSettings { check: false },
             profiles: vec![Profile {

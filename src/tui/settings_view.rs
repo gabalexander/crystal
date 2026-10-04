@@ -38,6 +38,7 @@ pub enum Setting {
     Sound,
     Theme,
     StopIdle,
+    RestartSpacing,
     Distill,
     Embeddings,
 }
@@ -52,6 +53,9 @@ pub enum Change {
     Theme(ThemeName),
     /// How long an agent may sit idle, one of [`SessionSettings::CHOICES`].
     StopIdle(&'static str),
+    /// How far apart agents start again after a restart, in milliseconds,
+    /// one of [`SessionSettings::SPACINGS`].
+    RestartSpacing(u64),
     Distill(bool),
     Embeddings(bool),
 }
@@ -66,6 +70,7 @@ impl Change {
             Change::Sound(_) => &["sound", "enabled"],
             Change::Theme(_) => &["theme"],
             Change::StopIdle(_) => &["sessions", "stop_idle_after"],
+            Change::RestartSpacing(_) => &["sessions", "restart_spacing_ms"],
             Change::Distill(_) => &["memory", "distill"],
             Change::Embeddings(_) => &["memory", "embeddings"],
         }
@@ -78,7 +83,9 @@ impl Change {
             | Change::Sound(on)
             | Change::Distill(on)
             | Change::Embeddings(on) => on.into(),
-            Change::NotifyAfter(secs) => i64::try_from(secs).unwrap_or(i64::MAX).into(),
+            Change::NotifyAfter(secs) | Change::RestartSpacing(secs) => {
+                i64::try_from(secs).unwrap_or(i64::MAX).into()
+            }
             Change::Theme(theme) => theme.name().into(),
             Change::StopIdle(after) => after.into(),
         }
@@ -98,6 +105,20 @@ fn next_wait(secs: u64, forward: bool) -> u64 {
     } else {
         let before = NOTIFY_AFTER.iter().rev().find(|&&wait| wait < secs);
         *before.unwrap_or(&NOTIFY_AFTER[NOTIFY_AFTER.len() - 1])
+    }
+}
+
+/// The spacing after `ms` among [`SessionSettings::SPACINGS`], or before
+/// it, round from the last to the first: one set by hand between two goes
+/// to the next, or the one before.
+fn next_spacing(ms: u64, forward: bool) -> u64 {
+    let spacings = SessionSettings::SPACINGS;
+    if forward {
+        let next = spacings.iter().find(|&&spacing| spacing > ms);
+        *next.unwrap_or(&spacings[0])
+    } else {
+        let before = spacings.iter().rev().find(|&&spacing| spacing < ms);
+        *before.unwrap_or(&spacings[spacings.len() - 1])
     }
 }
 
@@ -122,13 +143,14 @@ pub enum Outcome {
 }
 
 /// The settings the bar can be on, in the order they're listed.
-const SETTINGS: [Setting; 8] = [
+const SETTINGS: [Setting; 9] = [
     Setting::Notify,
     Setting::NotifyAfter,
     Setting::UnfocusedOnly,
     Setting::Sound,
     Setting::Theme,
     Setting::StopIdle,
+    Setting::RestartSpacing,
     Setting::Distill,
     Setting::Embeddings,
 ];
@@ -232,6 +254,10 @@ impl SettingsView {
                     (None, _) => 0,
                 };
                 Change::StopIdle(choices[next])
+            }
+            Setting::RestartSpacing => {
+                let now = config.sessions.restart_spacing_ms;
+                Change::RestartSpacing(next_spacing(now, forward))
             }
             Setting::Distill => Change::Distill(!config.memory.distill),
             Setting::Embeddings => Change::Embeddings(!config.memory.embeddings),
@@ -364,6 +390,7 @@ fn lines(view: &SettingsView, theme: &Theme) -> Vec<Line<'static>> {
             Setting::Sound => "sounds",
             Setting::Theme => "theme",
             Setting::StopIdle => "stop idle agents",
+            Setting::RestartSpacing => "space out restarts",
             Setting::Distill => "distill closed tasks",
             Setting::Embeddings => "search by meaning",
         };
@@ -450,6 +477,16 @@ fn lines(view: &SettingsView, theme: &Theme) -> Vec<Line<'static>> {
             "off".to_string()
         },
         "at their prompt, unwatched: they start again where they were".to_string(),
+    ));
+    let spacing = config.sessions.restart_spacing_ms;
+    lines.push(row(
+        Setting::RestartSpacing,
+        Some(spacing > 0),
+        match spacing {
+            0 => "all at once".to_string(),
+            ms => format!("{ms}ms apart"),
+        },
+        "the agents a crash or a reboot starts again: ←/→".to_string(),
     ));
 
     lines.push(Line::from(""));
@@ -580,6 +617,15 @@ mod tests {
         );
         press(&mut view, KeyCode::Down);
         assert_eq!(
+            press(&mut view, KeyCode::Right),
+            Outcome::Change(Change::RestartSpacing(500))
+        );
+        assert_eq!(
+            press(&mut view, KeyCode::Left),
+            Outcome::Change(Change::RestartSpacing(100))
+        );
+        press(&mut view, KeyCode::Down);
+        assert_eq!(
             press(&mut view, KeyCode::Char(' ')),
             Outcome::Change(Change::Distill(false))
         );
@@ -603,6 +649,22 @@ mod tests {
         assert_eq!(wait_text(0), "at once");
         assert_eq!(wait_text(120), "2m");
         assert_eq!(wait_text(45), "45s");
+    }
+
+    #[test]
+    fn the_restart_spacing_goes_through_its_steps_and_round() {
+        assert_eq!(next_spacing(250, true), 500);
+        assert_eq!(next_spacing(2000, true), 0);
+        assert_eq!(next_spacing(0, false), 2000);
+        assert_eq!(next_spacing(300, false), 250);
+        assert_eq!(
+            Change::RestartSpacing(100).keys(),
+            ["sessions", "restart_spacing_ms"]
+        );
+        assert_eq!(Change::RestartSpacing(100).value().as_integer(), Some(100));
+        let shown = text(&view_of(Config::default(), None));
+        assert!(shown.contains("space out restarts"), "{shown}");
+        assert!(shown.contains("250ms apart"), "{shown}");
     }
 
     #[test]
@@ -649,7 +711,7 @@ mod tests {
         let mut off = Config::default();
         off.memory.embeddings = false;
         let mut view = view_of(off, Some(status()));
-        for _ in 0..7 {
+        for _ in 0..8 {
             press(&mut view, KeyCode::Down);
         }
         assert_eq!(press(&mut view, KeyCode::Enter), Outcome::Stay);

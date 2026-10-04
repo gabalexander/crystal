@@ -197,13 +197,18 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   - `away.rs`: "while you were away": when the user is gone (a quit, the terminal's focus lost for a while, or
     no key for a while where focus isn't told), what the event log gained meanwhile counted into the
     footer's line, and the latest event seen, which the event loop keeps in the database
-  - `settings_view.rs`: the settings view (`,`): notifications, sounds, the theme, the distiller and search by meaning,
-    each changed with a key, and how the models stand; the event loop writes the file (`config::set`) and,
-    while it's open, reads the settings and the daemon's `EmbeddingStatus` again every half a second
+  - `restarted.rs`: the footer's line on what a cold restart brought back and what couldn't start, worked out
+    from the sessions the TUI sees waiting their turn, and those that failed, said once; pure
+  - `settings_view.rs`: the settings view (`,`): notifications, sounds, the theme, idle agents, the spacing of
+    restarts, the distiller and search by meaning, each changed with a key, and how the models stand; the event
+    loop writes the file (`config::set`) and, while it's open, reads the settings and the daemon's
+    `EmbeddingStatus` again every half a second
 - `src/daemon.rs`: the daemon: listens on the socket and owns the sessions, and emits an event wherever something
   happens to them, their tasks, flows, worktrees, memory or backlog; archives sessions and starts them again,
   stops agents left idle past `[sessions] stop_idle_after`, and keeps the list of projects sessions ran in;
-  hands itself over to a new crystal, and takes over from the daemon that handed over
+  after a cold restart, puts the sessions written down back in their places and starts them again, agents
+  `[sessions] restart_spacing_ms` apart on a thread of their own, those that can't start kept, failed, saying
+  why; hands itself over to a new crystal, and takes over from the daemon that handed over
 - `src/handover.rs`: handing the daemon over to a newly installed crystal by exec in its own process, the
   sessions carrying on: what's handed over and its `FORMAT`, the file it's written to and read from, keeping
   descriptors open across the exec, the readers it stops, the gate connections come in through, the helpers
@@ -256,7 +261,9 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   whether its first prompt can name it, whether its agent is blocked on the user, how long its agent has sat
   idle (nobody watching or typing, its turn seen), why its screen reads the way it does (`crystal agent
   explain`), and what has changed in it (its agent's activity, a task's runs, its bell rung while nobody
-  watched) for the daemon to tell; handing it over and adopting it, its PTY on a descriptor of crystal's own
+  watched) for the daemon to tell; one written down before a restart, with no program, while it waits its turn
+  to start again or once it couldn't, saying why on its screen; handing it over and adopting it, its PTY on a
+  descriptor of crystal's own
 - `src/vt.rs`: a terminal's screen, through `alacritty_terminal`: what a program drew and its history, the modes
   it set, its answers to the program's questions (the daemon's screen only), the output that catches a new viewer
   up (its hyperlinks included), the cells to draw, the input modes `crystal attach` asks your terminal for, and,

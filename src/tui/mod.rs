@@ -39,6 +39,7 @@ mod preview;
 mod profiles;
 mod pull_requests;
 mod reply;
+mod restarted;
 mod review;
 pub(crate) mod screen_widget;
 mod search;

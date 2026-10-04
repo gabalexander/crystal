@@ -31,6 +31,7 @@ use super::preview::Content;
 use super::profiles::{self, ProfilesView};
 use super::pull_requests::{self, PullRequestsView};
 use super::reply::ReplyBox;
+use super::restarted::{Restarted, Restarts};
 use super::review;
 use super::search;
 use super::settings_view::{self, SettingsView};
@@ -825,6 +826,11 @@ pub struct App {
     /// Whether the footer says what happened while the user was away: until
     /// the next key.
     away_shown: bool,
+    /// What the TUI has seen of sessions starting again after a restart.
+    restarts: Restarts,
+    /// The footer's line on what a restart brought back and what it
+    /// couldn't, until the next key.
+    restarted: Option<Restarted>,
     /// Which command each sidebar key runs, the prefix and the key that
     /// hands the keyboard back: see [`super::keymap`].
     keymap: Keymap,
@@ -943,6 +949,8 @@ impl App {
             needs_you: None,
             away: None,
             away_shown: false,
+            restarts: Restarts::default(),
+            restarted: None,
             keymap: Keymap::default(),
             prefixed: false,
             command_list: None,
@@ -1519,6 +1527,12 @@ impl App {
     pub fn away_line(&self) -> Option<&str> {
         let away = self.away.as_ref().filter(|_| self.away_shown)?;
         Some(&away.line)
+    }
+
+    /// The footer's line on what a restart brought back and what it
+    /// couldn't, until the next key.
+    pub fn restarted(&self) -> Option<&Restarted> {
+        self.restarted.as_ref()
     }
 
     /// Takes what the event log gained while the user was away. When
@@ -2480,6 +2494,9 @@ impl App {
                 self.tabs.renamed(&was.name, &now.name);
             }
         }
+        if let Some(restarted) = self.restarts.take(&sessions) {
+            self.restarted = Some(restarted);
+        }
         let before = self.sessions.get(self.selected).cloned();
         let on_a_session = self.on_worktree.is_none();
         self.sessions = groups::order(sessions, self.shown_flows());
@@ -2624,6 +2641,7 @@ impl App {
     fn take_key(&mut self, key: KeyEvent) -> Option<Action> {
         self.notice = None;
         self.away_shown = false;
+        self.restarted = None;
         // The prefix is for the very next key, wherever it goes.
         let prefixed = std::mem::take(&mut self.prefixed);
         // A plugin's pane is over everything, and has every key but the one
@@ -5558,6 +5576,39 @@ mod tests {
         assert_eq!(app.notice(), Some("no session named b"));
         press(&mut app, KeyCode::Char('j'));
         assert_eq!(app.notice(), None);
+    }
+
+    #[test]
+    fn what_a_restart_brought_back_is_said_until_the_next_key_and_kept_in_its_place() {
+        let starting = |name: &str| SessionInfo {
+            state: State::Starting,
+            ..session(name)
+        };
+        let mut app = App::new(None);
+        app.set_sessions(vec![session("api"), starting("docs"), starting("web")]);
+        app.select("docs");
+        assert_eq!(app.restarted(), None);
+        let failed = SessionInfo {
+            state: State::Failed {
+                why: "its directory, ~/web, isn't there".into(),
+            },
+            ..session("web")
+        };
+        app.set_sessions(vec![session("api"), session("docs"), failed]);
+        let said = app.restarted().unwrap();
+        assert_eq!(
+            said.line,
+            "after the restart: 1 session back · 1 couldn't start: web"
+        );
+        assert!(said.failed);
+        // Each kept its place, and the selection stayed on its session.
+        assert_eq!(selected_name(&app), Some("docs"));
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.restarted(), None);
+        // Enter on the one that couldn't start offers to start it again.
+        assert_eq!(selected_name(&app), Some("web"));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.confirm(), Some(&Confirm::Respawn("web".into())));
     }
 
     #[test]
@@ -9017,7 +9068,7 @@ gate = true
         });
         // `x` would kill the session from the sidebar; here it's nothing.
         assert_eq!(press(&mut app, KeyCode::Char('x')), None);
-        for _ in 0..7 {
+        for _ in 0..8 {
             press(&mut app, KeyCode::Char('j'));
         }
         assert_eq!(
