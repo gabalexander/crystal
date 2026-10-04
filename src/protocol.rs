@@ -298,6 +298,15 @@ pub enum Request {
         path: PathBuf,
         force: bool,
     },
+    /// Move the session called `name` into the worktree at `path`, another
+    /// of its project's: its agent is stopped and started again there, in
+    /// its conversation, told where it is now. An agent in the middle of a
+    /// turn, which may be the one asking, moves once the turn ends.
+    /// Answered `Moved`, or `Done` when it's there already.
+    MoveSession {
+        name: String,
+        path: PathBuf,
+    },
     /// Something that happened outside the daemon, like a worktree a
     /// client made or an entry it added to memory: the daemon numbers it,
     /// writes it in the event log, and passes it on to whoever listens.
@@ -625,6 +634,11 @@ pub enum Response {
     },
     /// A TUI's tabs and their panes.
     Layout(crate::layout::Layout),
+    /// A session is moving into another worktree: it has started again
+    /// there, or with `later`, does once its agent's turn ends.
+    Moved {
+        later: bool,
+    },
     Done,
     Error {
         message: String,

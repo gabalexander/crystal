@@ -6395,6 +6395,10 @@ fn a_worktree_whose_last_session_is_killed_stays_until_shift_w_removes_it() {
     tui.shows("kill fixer? y/n");
     tui.type_keys("y");
     tui.hides("❯ fixer");
+    // Asked whether the worktree goes too, a no keeps it.
+    tui.shows("nothing else is in worktree fix: remove it too? y/n");
+    tui.type_keys("n");
+    tui.hides("remove it too?");
     // The worktree stays, and the selection is on it.
     tui.shows("· no sessions");
     tui.shows("No sessions in ⎇ fix");
@@ -6406,6 +6410,344 @@ fn a_worktree_whose_last_session_is_killed_stays_until_shift_w_removes_it() {
     eventually("the worktree is gone", || !worktree.exists());
     tui.hides("no sessions");
     tui.hides("⎇ fix");
+}
+
+#[test]
+fn killing_the_last_session_in_a_worktree_can_take_the_worktree_with_it() {
+    let crystal = Crystal::new();
+    let repo = git_repo(crystal.dir.path(), "app");
+    let repo_arg = repo.to_str().unwrap();
+    crystal.ok(&["new", "-n", "planner", "-c", repo_arg, "sleep", "30"]);
+    crystal.ok(&[
+        "new", "-n", "fixer", "-c", repo_arg, "-w", "fix", "sleep", "30",
+    ]);
+    let worktree = crystal.dir.path().join("app.worktrees/fix");
+
+    let mut tui = crystal.tui();
+    tui.shows("❯ fixer");
+    tui.type_keys("jx");
+    tui.shows("kill fixer? y/n");
+    tui.type_keys("y");
+    tui.shows("nothing else is in worktree fix: remove it too? y/n");
+    tui.type_keys("y");
+    eventually("the worktree is gone", || !worktree.exists());
+    tui.hides("⎇ fix");
+    assert!(crystal.row("planner").is_some());
+}
+
+/// The config of a test whose new worktrees go in `directory`.
+fn worktrees_in(directory: &Path) -> String {
+    format!(
+        "notify = false\nname_from_prompt = false\n\n[plugins]\nmemory = false\n\n\
+         [worktrees]\ndirectory = \"{}\"\n",
+        directory.display()
+    )
+}
+
+#[test]
+fn worktree_create_makes_one_where_the_settings_say_and_labels_it() {
+    let crystal = Crystal::new();
+    let dir = crystal.dir.path();
+    let trees = dir.join("trees");
+    crystal.configure(&worktrees_in(&trees));
+    let repo = git_repo(dir, "app");
+    let repo_arg = repo.to_str().unwrap();
+
+    let made = crystal.ok(&[
+        "worktree",
+        "create",
+        "spike",
+        "--label",
+        "try sqlite",
+        "-C",
+        repo_arg,
+    ]);
+    let spike = trees.join("app/spike").canonicalize().unwrap();
+    assert_eq!(Path::new(made.trim()), spike);
+    assert!(git(&repo, &["branch", "--list", "spike"]).contains("spike"));
+
+    // With no branch, one with a made-up name, and wherever --path says.
+    let elsewhere = dir.join("elsewhere");
+    let made = crystal.ok(&[
+        "worktree",
+        "create",
+        "--path",
+        elsewhere.to_str().unwrap(),
+        "-C",
+        repo_arg,
+    ]);
+    assert_eq!(Path::new(made.trim()), elsewhere.canonicalize().unwrap());
+
+    // `new -w` makes its worktree in the settings' directory too.
+    crystal.ok(&[
+        "new", "-d", "-n", "fixer", "-c", repo_arg, "-w", "fix", "sleep", "30",
+    ]);
+    assert!(trees.join("app/fix").is_dir());
+
+    let listed: serde_json::Value =
+        serde_json::from_str(&crystal.ok(&["worktree", "list", "--json", "-C", repo_arg])).unwrap();
+    let listed = listed.as_array().unwrap();
+    assert_eq!(listed.len(), 4, "{listed:?}");
+    assert_eq!(listed[0]["main"], true);
+    assert_eq!(listed[0]["branch"], "main");
+    let by_branch = |branch: &str| {
+        listed
+            .iter()
+            .find(|worktree| worktree["branch"] == branch)
+            .unwrap_or_else(|| panic!("no {branch} in {listed:?}"))
+    };
+    assert_eq!(by_branch("spike")["label"], "try sqlite");
+    assert_eq!(by_branch("fix")["sessions"], serde_json::json!(["fixer"]));
+    let table = crystal.ok(&["worktree", "list", "-C", repo_arg]);
+    assert!(table.contains("⎇ spike"), "{table}");
+    assert!(table.contains("try sqlite"), "{table}");
+
+    crystal.ok(&["worktree", "label", "spike", "", "-C", repo_arg]);
+    let listed: serde_json::Value =
+        serde_json::from_str(&crystal.ok(&["worktree", "list", "--json", "-C", repo_arg])).unwrap();
+    let spike = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|worktree| worktree["branch"] == "spike")
+        .unwrap()
+        .clone();
+    assert_eq!(spike["label"], serde_json::Value::Null);
+}
+
+#[test]
+fn worktree_open_starts_a_session_in_a_worktree_found_by_its_branch() {
+    let crystal = Crystal::new();
+    let repo = git_repo(crystal.dir.path(), "app");
+    let repo_arg = repo.to_str().unwrap();
+    crystal.ok(&["worktree", "create", "spike", "-C", repo_arg]);
+    let spike = crystal.dir.path().join("app.worktrees/spike");
+
+    let name = crystal.ok(&[
+        "worktree",
+        "open",
+        "spike",
+        "-d",
+        "-n",
+        "opened",
+        "--label",
+        "the spike",
+        "-C",
+        repo_arg,
+        "sh",
+        "-c",
+        "pwd > where; sleep 30",
+    ]);
+    assert_eq!(name.trim(), "opened");
+    let started_in = written(&spike.join("where"));
+    assert_eq!(
+        Path::new(started_in.trim()).canonicalize().unwrap(),
+        spike.canonicalize().unwrap()
+    );
+    assert_eq!(crystal.row("opened").unwrap()[4], "spike");
+    let err = crystal.fails(&["worktree", "open", "nowhere", "-d", "-C", repo_arg]);
+    assert!(err.contains("no worktree at nowhere"), "{err}");
+}
+
+/// A hook that writes down what it was run with, a line each time, in
+/// `log`.
+fn recording_hook(dir: &Path, log: &Path) -> PathBuf {
+    let hook = dir.join("hook.sh");
+    std::fs::write(
+        &hook,
+        format!(
+            "#!/bin/sh\necho \"$CRYSTAL_HOOK $CRYSTAL_WORKTREE_BRANCH $(pwd) $1 $2\" >> {}\n",
+            log.display()
+        ),
+    )
+    .unwrap();
+    let mut permissions = std::fs::metadata(&hook).unwrap().permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+    std::fs::set_permissions(&hook, permissions).unwrap();
+    hook
+}
+
+#[test]
+fn worktree_hooks_in_git_config_run_once_crystal_makes_or_removes_a_worktree() {
+    let crystal = Crystal::new();
+    let dir = crystal.dir.path();
+    let repo = git_repo(dir, "app");
+    let repo_arg = repo.to_str().unwrap();
+    let log = dir.join("hooks.log");
+    let hook = recording_hook(dir, &log);
+    let hook_arg = hook.to_str().unwrap();
+    git(&repo, &["config", "crystal.worktreeCreateHook", hook_arg]);
+    git(&repo, &["config", "crystal.worktreeDeleteHook", hook_arg]);
+
+    crystal.ok(&["worktree", "create", "fix", "-C", repo_arg]);
+    let project = repo.canonicalize().unwrap();
+    let fix = dir.join("app.worktrees/fix").canonicalize().unwrap();
+    let created = format!(
+        "worktree-create fix {} {} {}",
+        project.display(),
+        project.display(),
+        fix.display()
+    );
+    eventually("the create hook has run", || {
+        std::fs::read_to_string(&log).is_ok_and(|log| log.contains(&created))
+    });
+
+    let out = crystal
+        .command(&["worktree", "rm", "fix"])
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let deleted = format!(
+        "worktree-delete fix {} {} {}",
+        project.display(),
+        project.display(),
+        fix.display()
+    );
+    eventually("the delete hook has run", || {
+        std::fs::read_to_string(&log).is_ok_and(|log| log.contains(&deleted))
+    });
+
+    // One that fails says so, in an event, and the worktree stays made.
+    let failing = dir.join("failing.sh");
+    std::fs::write(&failing, "#!/bin/sh\necho 'no port for it' >&2\nexit 4\n").unwrap();
+    let mut permissions = std::fs::metadata(&failing).unwrap().permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+    std::fs::set_permissions(&failing, permissions).unwrap();
+    git(
+        &repo,
+        &[
+            "config",
+            "crystal.worktreeCreateHook",
+            failing.to_str().unwrap(),
+        ],
+    );
+    crystal.ok(&["worktree", "create", "spike", "-C", repo_arg]);
+    eventually("the failure is an event", || {
+        let events = crystal.ok(&["events", "--json"]);
+        events.lines().any(|line| {
+            line.contains("worktree.hook_failed") && line.contains("exit status: 4: no port for it")
+        })
+    });
+    assert!(dir.join("app.worktrees/spike").is_dir());
+}
+
+#[test]
+fn worktree_move_starts_a_session_again_in_the_worktree() {
+    let crystal = Crystal::new();
+    let repo = git_repo(crystal.dir.path(), "app");
+    let repo_arg = repo.to_str().unwrap();
+    crystal.ok(&[
+        "new",
+        "-d",
+        "-n",
+        "here",
+        "-c",
+        repo_arg,
+        "sh",
+        "-c",
+        "pwd > where; exec sleep 30",
+    ]);
+    written(&repo.join("where"));
+
+    let said = crystal.ok(&["worktree", "move", "fix", "-n", "here"]);
+    assert!(said.contains("here moves into"), "{said}");
+    assert!(said.contains("now"), "{said}");
+    let fix = crystal.dir.path().join("app.worktrees/fix");
+    let started_in = written(&fix.join("where"));
+    assert_eq!(
+        Path::new(started_in.trim()).canonicalize().unwrap(),
+        fix.canonicalize().unwrap()
+    );
+    eventually("it runs on the worktree's branch", || {
+        crystal.row("here").is_some_and(|row| row[4] == "fix")
+    });
+
+    // Moved again to where it is, nothing happens.
+    let said = crystal.ok(&["worktree", "move", "fix", "-n", "here"]);
+    assert!(said.contains("is in"), "{said}");
+    let err = crystal.fails(&["worktree", "move", "fix"]);
+    assert!(err.contains("-n <session>"), "{err}");
+}
+
+#[test]
+fn an_agent_moved_mid_turn_moves_once_the_turn_ends_and_carries_on_there() {
+    let crystal = Crystal::new();
+    let repo = git_repo(crystal.dir.path(), "app");
+    let repo_arg = repo.to_str().unwrap();
+    let bin = fake_claude(crystal.dir.path());
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let out = crystal
+        .command(&["new", "-n", "agent", "-c", repo_arg, "claude"])
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+
+    // In a conversation, in the middle of a turn.
+    let args = written(&repo.join("args"));
+    let settings: serde_json::Value = claude_settings(&args);
+    let hook = settings["hooks"]["Stop"][0]["hooks"][0]["command"]
+        .as_str()
+        .unwrap();
+    let transcript = crystal.dir.path().join("abc-123.jsonl");
+    std::fs::write(&transcript, "{}\n").unwrap();
+    let prompted = serde_json::json!({
+        "hook_event_name": "UserPromptSubmit",
+        "session_id": "abc-123",
+        "transcript_path": transcript,
+    });
+    run_hook(&crystal, "agent", hook, &prompted.to_string());
+    eventually("the agent is working", || {
+        crystal.row("agent").is_some_and(|row| row[1] == "working")
+    });
+    let pid = crystal.pid("agent");
+
+    // The agent asks for itself, from inside its session.
+    let listed: serde_json::Value = serde_json::from_str(&crystal.ok(&["ls", "--json"])).unwrap();
+    let id = listed[0]["id"].as_str().unwrap().to_string();
+    let out = crystal
+        .command(&["worktree", "move", "fix"])
+        .env("CRYSTAL_SESSION_ID", &id)
+        .env("CRYSTAL_SOCKET", &crystal.socket)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let said = String::from_utf8(out.stdout).unwrap();
+    assert!(said.contains("End your turn now"), "{said}");
+    let fix = crystal.dir.path().join("app.worktrees/fix");
+    assert!(fix.is_dir());
+    thread::sleep(Duration::from_millis(600));
+    assert_eq!(crystal.pid("agent"), pid, "it waits for its turn to end");
+
+    let ended = serde_json::json!({
+        "hook_event_name": "Stop",
+        "session_id": "abc-123",
+        "transcript_path": transcript,
+    });
+    run_hook(&crystal, "agent", hook, &ended.to_string());
+    let args = written(&fix.join("args"));
+    let args: Vec<&str> = args.lines().collect();
+    let resume = args.iter().position(|arg| *arg == "--resume").unwrap();
+    assert_eq!(args[resume + 1], "abc-123");
+    let told = args.last().unwrap();
+    assert_eq!(args[args.len() - 2], "--");
+    assert!(
+        told.starts_with("[crystal] This session has moved"),
+        "{told}"
+    );
+    assert!(told.contains("`fix`"), "{told}");
+    let row = crystal.row("agent").unwrap();
+    assert_eq!(row[4], "fix");
+    assert_ne!(crystal.pid("agent"), pid);
 }
 
 #[test]

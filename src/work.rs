@@ -565,6 +565,7 @@ pub fn start_from_backlog(
             &dir,
             &forge::branch_for_issue(number, &item.text),
             None,
+            None,
         )?
     } else {
         dir

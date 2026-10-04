@@ -207,7 +207,8 @@ impl Daemon {
         };
         if removed.is_ok() {
             let branch = removal.branch.as_deref();
-            self.events.emit(Event::worktree(false, path, branch));
+            self.events
+                .emit(Event::worktree_removed(path, branch, &removal.project));
             while let Some(index) = sessions
                 .iter()
                 .position(|session| !session.is_running() && in_worktree(session, path))
