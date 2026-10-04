@@ -22,14 +22,15 @@ use super::handoff_view::{self, HandoffView};
 use super::help;
 use super::issues::{self, IssuesView};
 use super::keymap::{
-    Bound, Chord, Command, CommandKind, KeyCommand, Keymap, Mode, ModeKey, Rebinding, Sequence,
-    SplitWay, Translated,
+    self, Bound, Chord, Command, CommandKind, KeyCommand, Keymap, Mode, ModeKey, Rebinding,
+    Sequence, SplitWay, Translated,
 };
 use super::launcher::{self, Launcher, Memory, Run, Setup, Target};
 use super::layouts::{self, Layouts, LayoutsView, Program, Programs, Which};
 use super::memory_view::MemoryView;
 use super::menu::{self, Item, Menu};
 use super::needs_you::{self, NeedsYouView};
+use super::page::Page;
 use super::plugins_view::{self, PluginsView};
 use super::preview::Content;
 use super::profiles::{self, ProfilesView};
@@ -49,7 +50,9 @@ use super::timeline::{self, Scoped, TimelineView};
 use super::tree_browser::TreeBrowser;
 use crate::catalog::{self, Agent};
 use crate::client::Purpose;
-use crate::config::{BarPosition, Config, Fold, MouseSettings, SIDEBAR_WIDTHS, TabBarSettings};
+use crate::config::{
+    BarPosition, Config, Fold, MouseSettings, SIDEBAR_WIDTHS, SidebarSettings, TabBarSettings,
+};
 use crate::events::{Event, Scope};
 use crate::flow_run::{FlowRun, RunState};
 use crate::flows::{self, Flow};
@@ -69,7 +72,7 @@ use ratatui::layout::Rect;
 use std::cell::Cell;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Where a pane sits beside the sidebar: the one that follows the
 /// selection, or one of the splits, counted in the order they're drawn
@@ -80,6 +83,27 @@ pub enum Slot {
     Split(usize),
     /// The pane floating over the others: see [`App::floating`].
     Float,
+}
+
+/// How long a key pressed shows at the footer's right while keys are shown.
+const SHOW_KEY_FOR: Duration = Duration::from_secs(3);
+
+/// A key pressed, as the footer shows it while keys are shown: how it's
+/// written, after the prefix when it was pressed after it, and what it did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShownKey {
+    pub keys: String,
+    pub did: String,
+    pressed: Instant,
+}
+
+/// What the overlay `?` opens shows: its tabs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Help {
+    /// Every key, at this page of them.
+    Keys(usize),
+    /// The guide, as far down as it's read.
+    Guide(Page),
 }
 
 /// Where the keyboard goes.
@@ -995,9 +1019,21 @@ pub struct App {
     /// Something to tell the user, like why a key didn't work. It stays
     /// until the next key.
     notice: Option<String>,
-    /// The page the overlay listing every key is open at, while it's
-    /// open.
-    keys_page: Option<usize>,
+    /// The overlay `?` opens, while it's open: every key, at a page of
+    /// them, or the guide.
+    help: Option<Help>,
+    /// Whether each key that runs a command shows at the footer's right,
+    /// with the command, as the settings say: for whoever watches a screen
+    /// shared or recorded.
+    show_keys: bool,
+    /// The key pressed last, while keys are shown.
+    shown_key: Option<ShownKey>,
+    /// How narrow a terminal shows one column, as the settings say: see
+    /// [`App::one_column`].
+    phone_width: u16,
+    /// A page over everything, while it's open: what's new in crystal, once,
+    /// after an update.
+    page: Option<Page>,
     /// The whole terminal, as the event loop last drew it: what the list of
     /// keys has to fit.
     screen: Rect,
@@ -1228,7 +1264,11 @@ impl App {
             link_hover: None,
             own_id,
             notice: None,
-            keys_page: None,
+            help: None,
+            show_keys: false,
+            shown_key: None,
+            phone_width: SidebarSettings::default().phone_width,
+            page: None,
             screen: Rect::new(0, 0, 80, 24),
             filter: None,
             pull_requests: HashMap::new(),
@@ -1449,6 +1489,74 @@ impl App {
         self.hide_draft_prs = config.forge.hide_draft_prs;
         self.flows_on = flows::enabled(config);
         self.worktree_directory = config.worktrees.directory();
+        self.show_keys = config.show_keys;
+        self.phone_width = config.sidebar.phone_width;
+    }
+
+    /// Whether a terminal `width` columns wide shows one column, as a phone's
+    /// does: the sidebar across all of it while it has the keyboard, and
+    /// otherwise the pane being typed into, as though it were zoomed.
+    pub fn one_column_at(&self, width: u16) -> bool {
+        self.phone_width > 0 && width <= self.phone_width
+    }
+
+    /// Whether the terminal, as the event loop last drew it, shows one
+    /// column: see [`App::one_column_at`].
+    pub fn one_column(&self) -> bool {
+        self.one_column_at(self.screen.width)
+    }
+
+    /// Whether the sidebar is over the pane, in one column: while it has
+    /// the keyboard.
+    pub fn sidebar_over_panes(&self) -> bool {
+        self.one_column() && self.focus == Focus::Sidebar
+    }
+
+    /// The key the footer shows, while keys are shown, for as long as it
+    /// shows.
+    pub fn shown_key(&self) -> Option<&ShownKey> {
+        let key = self.shown_key.as_ref()?;
+        (key.pressed.elapsed() < SHOW_KEY_FOR).then_some(key)
+    }
+
+    /// When the key the footer shows goes, for the event loop to draw it
+    /// gone.
+    pub fn shown_key_goes(&self) -> Option<Instant> {
+        self.shown_key().map(|key| key.pressed + SHOW_KEY_FOR)
+    }
+
+    /// Notes `key`, pressed after the prefix when `prefixed` says so, as the
+    /// key that did `did`, for the footer to show, while keys are shown.
+    fn show_key(&mut self, key: &KeyEvent, prefixed: bool, did: &str) {
+        if !self.show_keys {
+            return;
+        }
+        let mut keys = Chord::of(key).hint();
+        if prefixed && let Some(prefix) = self.keymap.prefix() {
+            keys = format!("{} {keys}", prefix.hint());
+        }
+        self.shown_key = Some(ShownKey {
+            keys,
+            did: did.to_string(),
+            pressed: Instant::now(),
+        });
+    }
+
+    /// What a key bound to `bound` does, as the footer shows it: the
+    /// command's name, or what the user's own command is called.
+    fn bound_name(&self, bound: Bound) -> String {
+        match bound {
+            Bound::Command(command) => keymap::spec_of(command).id.to_string(),
+            Bound::Custom(index) => self
+                .keymap
+                .custom()
+                .get(index)
+                .map_or_else(String::new, |c| {
+                    c.0.description
+                        .clone()
+                        .unwrap_or_else(|| c.0.command.clone())
+                }),
+        }
     }
 
     /// Whether the TUI asks the forge about the sessions' projects.
@@ -1719,14 +1827,34 @@ impl App {
         self.notice.as_deref()
     }
 
-    /// Whether the overlay listing every key is open.
+    /// Whether the overlay `?` opens is open, on either of its tabs, or a
+    /// page is over everything: either takes every key.
     pub fn showing_keys(&self) -> bool {
-        self.keys_page.is_some()
+        self.help.is_some() || self.page.is_some()
     }
 
     /// The page of the list of keys that's open.
+    #[cfg(test)]
     pub fn keys_page(&self) -> usize {
-        self.keys_page.unwrap_or(0)
+        match self.help {
+            Some(Help::Keys(page)) => page,
+            _ => 0,
+        }
+    }
+
+    /// What the overlay `?` opens shows, while it's open.
+    pub fn help(&self) -> Option<&Help> {
+        self.help.as_ref()
+    }
+
+    /// The page over everything, while one is open.
+    pub fn page(&self) -> Option<&Page> {
+        self.page.as_ref()
+    }
+
+    /// Opens `page` over everything, like what's new in crystal.
+    pub fn show_page(&mut self, page: Page) {
+        self.page = Some(page);
     }
 
     /// Takes the whole terminal's size, as the event loop lays it out.
@@ -3119,7 +3247,7 @@ impl App {
     /// the selected session. Then, last, over the others, the float, if
     /// there is one.
     pub fn slots(&self) -> Vec<Slot> {
-        let mut slots = if self.zoomed() {
+        let mut slots = if self.zoomed() || self.one_column() {
             let zoomed = self.selected_slot().filter(|slot| *slot != Slot::Float);
             vec![zoomed.unwrap_or(Slot::Selected)]
         } else {
@@ -3566,14 +3694,34 @@ impl App {
             let step = menu.on_key(&key);
             return self.follow_menu(step);
         }
-        // The arrows turn the list of keys' pages. Any other key closes it,
-        // and does nothing else: the key that closes it may be one the user
-        // was only reading about.
-        if let Some(page) = self.keys_page {
-            let pages = self.keys_pages();
-            self.keys_page = match page_turn(key.code) {
-                Some(by) if pages > 1 => Some((page + pages).wrapping_add_signed(by) % pages),
-                _ => None,
+        // A page over everything scrolls; any other key closes it.
+        if let Some(page) = &mut self.page {
+            if !page.on_key(&key, self.screen) {
+                self.page = None;
+            }
+            return None;
+        }
+        // Tab goes from the list of keys to the guide and back. The arrows
+        // turn the list's pages, and scroll the guide. Any other key closes
+        // it, and does nothing else: the key that closes it may be one the
+        // user was only reading about.
+        if let Some(help) = self.help.take() {
+            let tab = matches!(key.code, KeyCode::Tab | KeyCode::BackTab);
+            self.help = match help {
+                Help::Keys(_) if tab => Some(Help::Guide(Page::guide())),
+                Help::Guide(_) if tab => Some(Help::Keys(0)),
+                Help::Keys(page) => {
+                    let pages = self.keys_pages();
+                    match page_turn(key.code) {
+                        Some(by) if pages > 1 => {
+                            Some(Help::Keys((page + pages).wrapping_add_signed(by) % pages))
+                        }
+                        _ => None,
+                    }
+                }
+                Help::Guide(mut guide) => guide
+                    .on_key(&key, self.screen)
+                    .then_some(Help::Guide(guide)),
             };
             return None;
         }
@@ -3705,10 +3853,26 @@ impl App {
             };
             return self.follow(outcome);
         }
-        // A click closes the list of keys, like a key does.
+        // A click closes the list of keys, or a page, like a key does; the
+        // wheel scrolls a page.
         if self.showing_keys() {
-            if kind == MouseEventKind::Down(MouseButton::Left) {
-                self.keys_page = None;
+            let code = match kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    self.help = None;
+                    self.page = None;
+                    return None;
+                }
+                MouseEventKind::ScrollDown => KeyCode::Down,
+                MouseEventKind::ScrollUp => KeyCode::Up,
+                _ => return None,
+            };
+            let screen = self.screen;
+            let page = match (&mut self.page, &mut self.help) {
+                (Some(page), _) | (None, Some(Help::Guide(page))) => page,
+                _ => return None,
+            };
+            for _ in 0..3 {
+                page.on_key(&KeyEvent::new(code, KeyModifiers::NONE), screen);
             }
             return None;
         }
@@ -4225,9 +4389,16 @@ impl App {
             && let Some(name) = self.selected().filter(|s| s.asking.is_some())
         {
             let name = name.name.clone();
+            let did = match answer {
+                Answer::Allow => "yes",
+                Answer::Deny => "no",
+                Answer::Always => "always",
+            };
+            self.show_key(&key, false, did);
             return Some(Action::Answer { name, answer });
         }
         if let Some(bound) = self.keymap.bound(&key) {
+            self.show_key(&key, false, &self.bound_name(bound));
             return self.run_bound(bound);
         }
         if let Some(ran) = self.plugin_key(&key) {
@@ -4385,7 +4556,7 @@ impl App {
             Command::Branches => return self.open_switcher(),
             Command::Memory => return self.open_memory(),
             Command::Profiles => return self.open_profiles(),
-            Command::Keys => self.keys_page = Some(0),
+            Command::Keys => self.help = Some(Help::Keys(0)),
             Command::Search => return self.open_filter(),
             Command::Commands => self.open_command_list(),
             Command::PullRequest => return self.open_pull_request(),
@@ -4494,6 +4665,7 @@ impl App {
             return None;
         }
         if let Some(bound) = self.keymap.bound(&key) {
+            self.show_key(&key, true, &self.bound_name(bound));
             return self.run_bound(bound);
         }
         if let Some(ran) = self.plugin_key(&key) {
@@ -4813,7 +4985,7 @@ impl App {
             return Some((typing, false));
         }
         let asking = self.menu.is_some()
-            || self.keys_page.is_some()
+            || self.showing_keys()
             || self.confirm.is_some()
             || self.moving.is_some()
             || self.closing.is_some()
@@ -5797,6 +5969,7 @@ impl App {
                 place,
                 command,
                 task,
+                goal,
                 run,
                 background,
                 backlog,
@@ -5813,9 +5986,10 @@ impl App {
                         brief,
                     });
                 }
-                // Given something to do, the session is a task.
+                // Given something to do, the session is a task, unless its
+                // profile starts it as a plain session.
                 let purpose = Purpose {
-                    task: (!task.is_empty()).then_some(task),
+                    task: goal,
                     backlog,
                     brief,
                 };
@@ -6097,6 +6271,7 @@ impl App {
     fn on_pane_key(&mut self, slot: Slot, key: KeyEvent) -> Option<Action> {
         // A key the user wrote `direct+` is theirs, not the program's.
         if let Some(bound) = self.keymap.direct(&key) {
+            self.show_key(&key, false, &self.bound_name(bound));
             return self.run_bound(bound);
         }
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
@@ -7371,6 +7546,74 @@ mod tests {
         // q is read about, not obeyed: the TUI doesn't quit.
         assert_eq!(press(&mut app, KeyCode::Char('q')), None);
         assert!(!app.showing_keys());
+    }
+
+    #[test]
+    fn tab_goes_from_the_keys_to_the_guide_which_scrolls_and_back() {
+        let mut app = app_with(&["a"]);
+        press(&mut app, KeyCode::Char('?'));
+        press(&mut app, KeyCode::Tab);
+        let Some(Help::Guide(guide)) = app.help() else {
+            panic!("not on the guide: {:?}", app.help());
+        };
+        assert_eq!(guide.scroll(), 0);
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Down);
+        let Some(Help::Guide(guide)) = app.help() else {
+            panic!("the guide closed");
+        };
+        assert_eq!(guide.scroll(), 2);
+        press(&mut app, KeyCode::BackTab);
+        assert_eq!(app.help(), Some(&Help::Keys(0)));
+        press(&mut app, KeyCode::Tab);
+        // Any key that doesn't scroll closes it, and does nothing else.
+        assert_eq!(press(&mut app, KeyCode::Char('q')), None);
+        assert!(!app.showing_keys());
+    }
+
+    #[test]
+    fn a_page_over_everything_scrolls_and_any_other_key_or_a_click_puts_it_away() {
+        let mut app = app_with(&["a", "b"]);
+        let text: String = (1..=60).map(|n| format!("line {n}\n\n")).collect();
+        app.show_page(Page::new("what's new in crystal 9.9.9", &text));
+        assert!(app.showing_keys());
+        assert_eq!(press(&mut app, KeyCode::Char('j')), None);
+        app.on_mouse(MouseEventKind::ScrollDown, Hit::Sidebar);
+        assert_eq!(app.page().unwrap().scroll(), 4);
+        assert_eq!(press(&mut app, KeyCode::Char('x')), None);
+        assert!(app.page().is_none());
+        app.show_page(Page::new("what's new", "short"));
+        app.on_mouse(CLICK, Hit::SidebarRow(row_of(&app, "b")));
+        assert!(app.page().is_none());
+        assert_eq!(selected_name(&app), Some("a"), "the click only closed it");
+    }
+
+    #[test]
+    fn keys_that_run_commands_show_with_them_while_the_settings_say_so() {
+        let mut app = app_with(&["a", "b"]);
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.shown_key(), None, "not unless the settings say so");
+        let config = Config {
+            show_keys: true,
+            ..Config::default()
+        };
+        app.set_features(&config);
+        press(&mut app, KeyCode::Char('k'));
+        let shown = app.shown_key().unwrap();
+        assert_eq!((shown.keys.as_str(), shown.did.as_str()), ("k", "up"));
+        assert!(app.shown_key_goes().unwrap() > Instant::now());
+        // After the prefix in a pane, the prefix shows with the key.
+        press(&mut app, KeyCode::Enter);
+        app.on_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+        press(&mut app, KeyCode::Char('z'));
+        let shown = app.shown_key().unwrap();
+        assert_eq!(
+            (shown.keys.as_str(), shown.did.as_str()),
+            ("ctrl+b z", "zoom")
+        );
+        // What's typed into a session never shows.
+        press(&mut app, KeyCode::Char('x'));
+        assert_eq!(app.shown_key().unwrap().keys, "ctrl+b z");
     }
 
     #[test]

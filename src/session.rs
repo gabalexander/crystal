@@ -19,8 +19,8 @@ use crate::output_ring::OutputRing;
 use crate::printable;
 use crate::protocol::{
     Activity, AgentEvent, AgentReport, Answer, Asking, Conversation, Front, InProgress, Metadata,
-    Reporter, ScreenExplained, SessionInfo, State, TaskInfo, TaskOutcome, TaskRecord, TaskResult,
-    TaskSpec, TaskState, TaskView,
+    Reporter, ScreenExplained, SessionInfo, State, TaskBrief, TaskInfo, TaskOutcome, TaskRecord,
+    TaskResult, TaskSpec, TaskState, TaskView,
 };
 use crate::report;
 use crate::spending::Spending;
@@ -113,6 +113,10 @@ pub struct Session {
     /// What the agent was asked to do, for a session started with
     /// something to do: a task, in a terminal or in the background.
     goal: Option<TaskInfo>,
+    /// The pull request and the issue the session is about, apart from any
+    /// task it has: its agent is told of them each time it starts, and they
+    /// go with it through restarts and handovers.
+    about: TaskBrief,
     /// Whether its agent has been reminded that its task is still open,
     /// which it is once.
     reminded: bool,
@@ -212,6 +216,9 @@ pub struct Handed {
     rollouts: Option<Rollouts>,
     told: Option<Activity>,
     goal: Option<TaskInfo>,
+    /// Handed over by crystals since this was.
+    #[serde(default)]
+    about: TaskBrief,
     reminded: bool,
     reporter: Option<Reporter>,
     reporter_job: Option<i32>,
@@ -303,6 +310,7 @@ impl Handed {
             task: self.task.as_ref().map(|task| task.spec().clone()),
             goal: self.goal.clone(),
             resume,
+            about: self.about.clone(),
         })
     }
 }
@@ -400,6 +408,7 @@ impl Session {
             front_checked: Instant::now(),
             task: None,
             goal: None,
+            about: TaskBrief::default(),
             reminded: false,
             reporter: None,
             reporter_job: None,
@@ -468,6 +477,7 @@ impl Session {
             front_checked: Instant::now(),
             task: Some(task),
             goal: None,
+            about: TaskBrief::default(),
             reminded: false,
             reporter: None,
             reporter_job: None,
@@ -534,6 +544,7 @@ impl Session {
             front_checked: Instant::now(),
             task: None,
             goal: saved.goal.clone(),
+            about: saved.about.clone(),
             reminded: false,
             reporter: None,
             reporter_job: None,
@@ -703,6 +714,15 @@ impl Session {
     /// stays open until the task is closed done or failed.
     pub fn give_task(&mut self, goal: TaskInfo) {
         self.goal = Some(goal);
+    }
+
+    /// Has the session be about the pull request and the issue `brief`
+    /// names, task or not; its acceptance criteria are its task's alone.
+    pub fn set_about(&mut self, brief: &TaskBrief) {
+        self.about = TaskBrief {
+            accept: Vec::new(),
+            ..brief.clone()
+        };
     }
 
     /// Closes the session's task, saying how it went: `state` is done,
@@ -961,10 +981,21 @@ impl Session {
     }
 
     /// Takes what the session's agent says about itself with `crystal
-    /// report`. Its first report of what it's doing takes the session's
-    /// status over; a resume command alone needs it to hold the session
-    /// already, so that a command never outlives the agent it's for.
-    pub fn take_report(&mut self, report: AgentReport) -> Result<()> {
+    /// report`, sent by `source` and numbered `seq` when it says so. Its
+    /// first report of what it's doing takes the session's status over; a
+    /// resume command alone needs it to hold the session already, so that a
+    /// command never outlives the agent it's for. False when the report was
+    /// passed over: it came after a later one from its source, or it lets
+    /// go of a session another source holds.
+    pub fn take_report(
+        &mut self,
+        report: AgentReport,
+        source: Option<String>,
+        seq: Option<u64>,
+    ) -> Result<bool> {
+        if !self.shown.status_in_order(source.as_deref(), seq)? {
+            return Ok(false);
+        }
         match report {
             AgentReport::State {
                 agent,
@@ -987,8 +1018,12 @@ impl Session {
                     agent: agent.clone(),
                     message: None,
                     resume: None,
+                    source: None,
                 });
                 reporter.agent = agent;
+                if source.is_some() {
+                    reporter.source = source;
+                }
                 // Shown on the user's screen, and in their notifications.
                 reporter.message = message
                     .map(|message| printable::line(&message).trim().to_string())
@@ -1013,9 +1048,17 @@ impl Session {
                 }
                 reporter.resume = Some(argv);
             }
-            AgentReport::Release => self.release(),
+            AgentReport::Release => {
+                let holder = self.reporter.as_ref().and_then(|r| r.source.as_deref());
+                if let (Some(holder), Some(source)) = (holder, source.as_deref())
+                    && holder != source
+                {
+                    return Ok(false);
+                }
+                self.release();
+            }
         }
-        Ok(())
+        Ok(true)
     }
 
     /// Takes what `crystal report --line` or `--model` puts on the
@@ -1595,6 +1638,7 @@ impl Session {
             task: self.task.as_ref().map(|task| task.spec().clone()),
             goal: self.goal.clone(),
             resume,
+            about: self.about.clone(),
         }
     }
 
@@ -1637,6 +1681,7 @@ impl Session {
             rollouts: self.rollouts.clone(),
             told: self.telling.told,
             goal: self.goal.clone(),
+            about: self.about.clone(),
             reminded: self.reminded,
             reporter: self.reporter.clone(),
             reporter_job: self.reporter_job,
@@ -1723,6 +1768,7 @@ impl Session {
             unseen_copies: 0,
             task,
             goal: handed.goal,
+            about: handed.about,
             reminded: handed.reminded,
             reporter: handed.reporter,
             reporter_job: handed.reporter_job,
@@ -2363,11 +2409,13 @@ mod tests {
             rollouts: None,
             told: Some(Waiting),
             goal: Some(goal.clone()),
+            about: TaskBrief::default(),
             reminded: true,
             reporter: Some(Reporter {
                 agent: "pi".into(),
                 message: Some("approve the deploy".into()),
                 resume: Some(vec!["pi".into(), "--resume".into(), "s 1".into()]),
+                source: None,
             }),
             reporter_job: Some(4242),
             named_after_program: true,
@@ -2446,6 +2494,7 @@ mod tests {
                 brief: Default::default(),
             }),
             resume: None,
+            about: Default::default(),
         }
     }
 
@@ -2555,6 +2604,7 @@ mod tests {
             rollouts: None,
             told: None,
             goal: None,
+            about: TaskBrief::default(),
             reminded: false,
             reporter: None,
             reporter_job: None,
@@ -2699,6 +2749,7 @@ mod tests {
             agent: "pi".into(),
             message: None,
             resume: Some(vec!["pi".into(), "--resume".into()]),
+            source: None,
         };
         let (_, resume) = restart(Some(claude()), Some(&reporter));
         assert_eq!(resume.unwrap(), ["pi", "--resume"]);
@@ -2762,6 +2813,7 @@ mod tests {
             rollouts: None,
             told: None,
             goal: None,
+            about: TaskBrief::default(),
             reminded: false,
             reporter: None,
             reporter_job: None,

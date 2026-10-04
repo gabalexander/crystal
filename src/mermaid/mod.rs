@@ -37,6 +37,28 @@ mod width;
 pub use canvas::Glyphs;
 pub use width::display_width;
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Whether diagrams drawn into pages are drawn with ASCII: the
+/// `mermaid_ascii` setting, as this process last read it.
+static ASCII: AtomicBool = AtomicBool::new(false);
+
+/// Has the diagrams drawn into pages from now on drawn with ASCII, or with
+/// box drawing: what the TUI and the daemon do as they read the settings.
+pub fn set_ascii(ascii: bool) {
+    ASCII.store(ascii, Ordering::Relaxed);
+}
+
+/// The glyphs the diagrams in pages are drawn with, as the settings last
+/// said: see [`set_ascii`].
+pub fn glyphs() -> Glyphs {
+    if ASCII.load(Ordering::Relaxed) {
+        Glyphs::ASCII
+    } else {
+        Glyphs::BOX_DRAWING
+    }
+}
+
 /// Which kind of diagram was drawn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {

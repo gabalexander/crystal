@@ -241,6 +241,7 @@ mod tests {
                 task: None,
                 goal: None,
                 resume: None,
+                about: Default::default(),
             },
             worktree: None,
             archived: 10,

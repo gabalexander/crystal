@@ -64,13 +64,18 @@ pub enum Request {
     },
     /// What an agent says about itself with `crystal report`. A program in
     /// a session says which by its `id`; from outside, it's the session's
-    /// `name`.
+    /// `name`. A report numbered `seq` no higher than the last `source`
+    /// sent came late, and is passed over.
     ReportAgent {
         #[serde(default)]
         id: Option<String>,
         #[serde(default)]
         name: Option<String>,
         report: AgentReport,
+        #[serde(default)]
+        source: Option<String>,
+        #[serde(default)]
+        seq: Option<u64>,
     },
     /// What an agent or a script puts on its session's row with `crystal
     /// report --line` or `--model`, for the sidebar alone: it doesn't take
@@ -909,6 +914,10 @@ pub struct Reporter {
     /// The command that picks its session up again after a restart.
     #[serde(default)]
     pub resume: Option<Vec<String>>,
+    /// The `--source` its reports came from, when it said one: only that
+    /// source lets go of the session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 /// What an agent says about itself with `crystal report`.
@@ -960,6 +969,13 @@ pub struct Metadata {
     /// last that source sent came late, and is passed over.
     #[serde(default)]
     pub seq: Option<u64>,
+}
+
+impl Metadata {
+    /// Whether it puts anything on the row: a line or a model.
+    pub fn shows(&self) -> bool {
+        self.line.is_some() || self.model.is_some()
+    }
 }
 
 /// A permission a background task's Claude asks for: the tool, and what

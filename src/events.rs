@@ -1316,6 +1316,7 @@ pub fn example(kind: Kind, session: Option<&SessionInfo>, dir: &Path) -> Event {
                 agent: "my-agent".into(),
                 message: None,
                 resume: Some(vec!["my-agent".into(), "--resume".into(), "s1".into()]),
+                source: None,
             };
             let session = SessionInfo {
                 reporter: Some(reporter),
@@ -1787,6 +1788,7 @@ mod tests {
                 agent: "pi".into(),
                 message: Some("approve the deploy".into()),
                 resume: None,
+                source: None,
             }),
             activity: Some(Activity::Waiting),
             ..session()

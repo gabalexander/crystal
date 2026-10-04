@@ -275,6 +275,8 @@ impl Task {
     /// the daily budget.
     pub fn run(&self, prompt: &str) -> Result<()> {
         let config = Config::load().unwrap_or_default();
+        // What Claude draws in its answers follows the settings at once.
+        crate::mermaid::set_ascii(config.mermaid_ascii);
         let mut runs = self.runs.lock().unwrap();
         ensure!(
             !runs.working(),

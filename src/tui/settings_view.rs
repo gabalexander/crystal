@@ -69,6 +69,9 @@ pub enum Setting {
     SidebarFolded,
     Fold,
     PinNeedsYou,
+    PhoneWidth,
+    ShowKeys,
+    MermaidAscii,
     NewSession,
     NameFromPrompt,
     StopIdle,
@@ -121,6 +124,9 @@ impl Setting {
             Setting::SidebarFolded => &["sidebar", "folded"],
             Setting::Fold => &["sidebar", "fold"],
             Setting::PinNeedsYou => &["sidebar", "needs_you"],
+            Setting::PhoneWidth => &["sidebar", "phone_width"],
+            Setting::ShowKeys => &["show_keys"],
+            Setting::MermaidAscii => &["mermaid_ascii"],
             Setting::NewSession => &["new_session"],
             Setting::NameFromPrompt => &["name_from_prompt"],
             Setting::StopIdle => &["sessions", "stop_idle_after"],
@@ -173,6 +179,9 @@ impl Setting {
             Setting::SidebarFolded => "  starts folded",
             Setting::Fold => "  folded, keeps",
             Setting::PinNeedsYou => "  pin what needs you",
+            Setting::PhoneWidth => "  one column at",
+            Setting::ShowKeys => "show keys pressed",
+            Setting::MermaidAscii => "diagrams in ASCII",
             Setting::NewSession => "new session runs",
             Setting::NameFromPrompt => "name from the prompt",
             Setting::StopIdle => "stop idle agents",
@@ -327,6 +336,9 @@ const KEEP_DAYS: [u32; 5] = [0, 7, 30, 90, 365];
 /// The sidebar's widths, in columns.
 const WIDTHS: [u16; 8] = [20, 24, 28, 32, 36, 40, 48, 60];
 
+/// How narrow a terminal shows one column, in columns, `0` never.
+const PHONE_WIDTHS: [u16; 6] = [0, 48, 56, 64, 72, 80];
+
 /// How many rows that scrolled off a session's screen it keeps.
 const SCROLLBACK: [usize; 5] = [1_000, 5_000, 10_000, 50_000, 100_000];
 
@@ -445,8 +457,15 @@ const TABS: [Tab; 8] = [
             ),
             (
                 "Sidebar",
-                &[S::SidebarWidth, S::SidebarFolded, S::Fold, S::PinNeedsYou],
+                &[
+                    S::SidebarWidth,
+                    S::SidebarFolded,
+                    S::Fold,
+                    S::PinNeedsYou,
+                    S::PhoneWidth,
+                ],
             ),
+            ("Keys and diagrams", &[S::ShowKeys, S::MermaidAscii]),
         ],
     },
     Tab {
@@ -904,6 +923,11 @@ impl SettingsView {
                 },
             ),
             S::PinNeedsYou => on(!config.sidebar.needs_you),
+            S::PhoneWidth => {
+                number(next_of(&PHONE_WIDTHS, config.sidebar.phone_width, forward).into())
+            }
+            S::ShowKeys => on(!config.show_keys),
+            S::MermaidAscii => on(!config.mermaid_ascii),
             S::NameFromPrompt => on(!config.name_from_prompt),
             S::StopIdle => {
                 let now = &config.sessions.stop_idle_after;
@@ -1398,6 +1422,21 @@ fn shown(setting: Setting, config: &Config) -> Shown {
         S::PinNeedsYou => switch(
             config.sidebar.needs_you,
             "what needs you, from every tab, at its top",
+        ),
+        S::PhoneWidth => choice(
+            match config.sidebar.phone_width {
+                0 => "never".to_string(),
+                columns => format!("{columns} columns"),
+            },
+            "or narrower, as on a phone: the sidebar or the pane: ←/→",
+        ),
+        S::ShowKeys => switch(
+            config.show_keys,
+            "each key's command at the footer's right, for a screen share",
+        ),
+        S::MermaidAscii => switch(
+            config.mermaid_ascii,
+            "+ - | > v rather than box drawing, for fonts without it",
         ),
         S::NewSession => choice(
             config.new_session.clone(),
@@ -1955,6 +1994,8 @@ mod tests {
             (S::AutoSwitch, true),
             (S::SidebarFolded, true),
             (S::PinNeedsYou, false),
+            (S::ShowKeys, true),
+            (S::MermaidAscii, true),
             (S::NameFromPrompt, false),
             (S::ResumeReported, false),
             (S::MouseCapture, false),
@@ -2003,6 +2044,12 @@ mod tests {
             S::SidebarWidth,
             number(S::SidebarWidth, 32),
             number(S::SidebarWidth, 24),
+        );
+        both(
+            &mut view,
+            S::PhoneWidth,
+            number(S::PhoneWidth, 72),
+            number(S::PhoneWidth, 56),
         );
         both(
             &mut view,
@@ -2134,7 +2181,7 @@ mod tests {
             }
         }
         let settings: usize = (0..KEYS_TAB).map(|tab| rows(tab, &[]).len()).sum();
-        assert_eq!(settings, 46);
+        assert_eq!(settings, 49);
     }
 
     /// Writes `change` to a config file made of `text`, and reads it back.
