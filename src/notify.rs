@@ -28,6 +28,7 @@
 
 use crate::agents;
 use crate::config::Config;
+use crate::printable;
 use crate::protocol::{Activity, Front, SessionInfo};
 use crate::sound::{self, Sound};
 use anyhow::{Result, bail};
@@ -82,7 +83,9 @@ impl Notice {
         Notice {
             session: session.name.clone(),
             activity,
-            text,
+            // A notification shows it, and the user's own command may
+            // print it to a terminal.
+            text: printable::line(&text).into_owned(),
             jump: Some(session.name.clone()),
             agent: agent_of(session),
         }
@@ -628,5 +631,26 @@ mod tests {
             "claude-2 is waiting on you: approve the deploy"
         );
         assert_eq!(Notice::about(&waiting, Done).text, "claude-2 is done");
+    }
+
+    #[test]
+    fn a_notice_holds_nothing_a_terminal_would_take_as_an_order() {
+        let mut waiting = session(Some(Worktree {
+            project: "app\u{202e}".into(),
+            project_path: PathBuf::from("/code/app"),
+            path: PathBuf::from("/code/app"),
+            main: true,
+            branch: Some("main\u{9b}2J".into()),
+            in_progress: None,
+        }));
+        waiting.reporter = Some(crate::protocol::Reporter {
+            agent: "pi".into(),
+            message: Some("ok\x1b]0;pwned\x07\nnext".into()),
+            resume: None,
+        });
+        assert_eq!(
+            Notice::about(&waiting, Waiting).text,
+            "claude-2 is waiting on you: ok]0;pwned next · app main2J"
+        );
     }
 }

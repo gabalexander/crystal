@@ -4,6 +4,7 @@
 use crate::client;
 use crate::event_log;
 use crate::events::{self, Event, Filter, Since, now_ms};
+use crate::printable;
 use crate::project;
 use crate::protocol::{Request, Response};
 use anyhow::{Result, bail};
@@ -85,7 +86,8 @@ fn session_key(socket: &Path, name: String) -> String {
 }
 
 /// An event as `crystal events` prints it: when, what, about what, and
-/// how it went.
+/// how it went, on one line with nothing a terminal would take as an
+/// order, since what it says comes from sessions, agents and plugins.
 fn line(event: &Event, now: u64) -> String {
     let line = format!(
         "{:<11}  {:<18}  {}  {}",
@@ -94,7 +96,7 @@ fn line(event: &Event, now: u64) -> String {
         event.subject(),
         event.text()
     );
-    line.trim_end().to_string()
+    printable::line(line.trim_end()).into_owned()
 }
 
 /// When something happened, in milliseconds since the Unix epoch, as
@@ -220,6 +222,16 @@ fn from_local(year: i32, month: i32, day: i32, hour: i32, minute: i32, second: i
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_line_holds_nothing_a_terminal_would_take_as_an_order() {
+        let event = Event {
+            from: Some("old\x1b]0;pwned\x07\nname\u{202e}".into()),
+            ..Event::new(events::Kind::SessionRenamed)
+        };
+        let line = line(&event, 0);
+        assert!(line.ends_with("was old]0;pwned name"), "{line:?}");
+    }
 
     #[test]
     fn a_while_back_is_counted_from_now() {

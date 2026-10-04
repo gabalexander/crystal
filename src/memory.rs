@@ -29,6 +29,7 @@
 use crate::config::Config;
 use crate::embed::Embed;
 use crate::git::Checkout;
+use crate::printable;
 use crate::secrets;
 use crate::state;
 use anyhow::{Context, Result, bail};
@@ -991,12 +992,9 @@ fn hash(key: &str) -> String {
 }
 
 /// `text` without control characters, which would drive the terminal of
-/// whoever reads it, but for line breaks and tabs.
+/// whoever reads it, but for line breaks and tabs: see [`printable`].
 fn clean(text: &str) -> String {
-    text.replace("\r\n", "\n")
-        .chars()
-        .filter(|c| !c.is_control() || matches!(c, '\n' | '\t'))
-        .collect()
+    printable::text(text).into_owned()
 }
 
 /// `a`, then whatever of `b` isn't in it.
