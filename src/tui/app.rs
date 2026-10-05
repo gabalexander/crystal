@@ -175,8 +175,8 @@ pub enum Hit {
     /// browser's is dragged: the column the mouse is at, counted from the
     /// view's left edge.
     ViewBorder(u16),
-    /// The footer's readout of the memory crystal takes, which opens the
-    /// RAM view.
+    /// The footer's readout of the memory and CPU crystal takes, which
+    /// opens the resources view.
     Readout,
     /// The tab bar's count of the pull requests open on the forge of the
     /// selected session's project, which opens the pull requests view.
@@ -804,9 +804,9 @@ pub enum Action {
     FollowEvents(Scope),
     /// The timeline has closed: stop following the log.
     StopFollowing,
-    /// The RAM view has opened: look at what the sessions take often.
+    /// The resources view has opened: look at what the sessions take often.
     OpenRam,
-    /// The RAM view has closed: look only as often as the footer needs.
+    /// The resources view has closed: look only as often as the footer needs.
     CloseRam,
     /// Read the page of the event log of `scope` before the event with
     /// this `seq`, for the timeline.
@@ -1212,7 +1212,7 @@ pub struct App {
     timeline: Option<TimelineView>,
     /// The list of everything waiting on the user, while it's open.
     needs_you: Option<NeedsYouView>,
-    /// The RAM view, while it's open.
+    /// The resources view, while it's open.
     ram: Option<RamView>,
     /// What the daemon last found crystal's processes take.
     resources: Option<Resources>,
@@ -2166,7 +2166,7 @@ impl App {
         self.timeline.as_ref()
     }
 
-    /// The RAM view, while it's open.
+    /// The resources view, while it's open.
     pub fn ram_view(&self) -> Option<&RamView> {
         self.ram.as_ref()
     }
@@ -7620,8 +7620,8 @@ impl App {
         }
     }
 
-    /// `#`: opens the RAM view, on what the daemon last found, and has it
-    /// look more often while it's open.
+    /// `#`: opens the resources view, on what the daemon last found, and has
+    /// it look more often while it's open.
     fn open_ram(&mut self) -> Action {
         let rows = self
             .resources
@@ -7631,7 +7631,7 @@ impl App {
         Action::OpenRam
     }
 
-    /// Keys while the RAM view is open: all of them are its.
+    /// Keys while the resources view is open: all of them are its.
     fn on_ram_key(&mut self, key: KeyEvent) -> Option<Action> {
         match self.ram.as_mut()?.on_key(&key) {
             ram_view::Step::Stay => None,
@@ -13333,9 +13333,9 @@ gate = true
             daemon: Usage {
                 pid: 1,
                 bytes: 20 << 20,
+                cpu: 0.5,
                 processes: 1,
             },
-            client: None,
             sessions: sessions
                 .iter()
                 .map(|(name, mb)| SessionUsage {
@@ -13343,12 +13343,13 @@ gate = true
                     usage: Usage {
                         pid: 2,
                         bytes: mb << 20,
+                        cpu: 3.0,
                         processes: 3,
                     },
                 })
                 .collect(),
-            warm: None,
-            total: 16 << 30,
+            cpu_over_ms: 1000,
+            ..Resources::default()
         }
     }
 

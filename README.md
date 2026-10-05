@@ -220,7 +220,7 @@ and the footer says where you are and offers the keys that matter there, or, whe
 | `P` | list your [profiles](#profiles), and add, change, copy or remove one |
 | `X` | list the [plugins](#plugins): switch them on and off, run their actions and open their panes |
 | `,` | open the [settings](#the-settings-view): notifications, sounds, the theme, and how memory learns and searches, each changed as you go |
-| `#` | the memory each session's processes take, and crystal's own: [RAM](#ram) |
+| `#` | the memory and CPU each session's processes take, and crystal's own: [resources](#resources) |
 | `?` | show every key, in the sidebar, in a pane, in resize mode, in a view, in a question and with the mouse, your own included: a page at a time when they don't all fit, `→` and `←` (or `Space`, `PgDn` and `PgUp`) turning the pages; `Tab` goes to the [guide](docs/guide.md), a page on what to start, the keys that matter most and what agents call, and back |
 | `q` | quit, once you've said `y`; the sessions keep running |
 
@@ -394,6 +394,7 @@ waiting on you moves to the top, and that session leads its worktree.
 | `▲` waiting | the agent is asking you something, like a permission |
 | `◐` working | the agent is working on a turn; the mark turns while it does |
 | `✓` done | the agent finished its turn, and you haven't looked yet |
+| `◇` open | its task is still open, but the agent asks nothing of you: it said it waits on something else, like CI |
 | `▸` | running: an agent at its prompt |
 | `❯` | a terminal: muted at a shell's prompt, brighter while a program runs in it |
 | `■` | ended: muted when it exited well, red when it failed or [couldn't start again](#usage); the pane's header says how |
@@ -424,6 +425,15 @@ one has stopped, a turn of the agent's own, its prompt or its spinner, is the wo
 end of it; with none within a minute, the turn is over. Subagents that show no sign of life for 15 minutes,
 none starting or stopping, no tool finishing, no permission asked for, are taken for gone, and the turn is over
 too.
+
+So with the rest of the work Claude Code wakes the agent for, as its Stop hook lists it (`background_tasks` and
+`session_crons`): a command it runs in the background, like a test suite, a Monitor watching CI, a wakeup it
+scheduled (`ScheduleWakeup`, `CronCreate`, `/loop`), or another task Claude Code keeps for it. A turn that ends
+with any of it to come reads as working, its row says on what (`in the background: cargo test`, `watching: CI
+checks`), and it tells you nothing, until a turn of the agent's own starts as that work wakes it; that turn's
+end is held again if some is still to come. If the agent never wakes, the turn is over once the longest the work
+can take has passed, and a minute more: two hours for a command, an hour for a Monitor or a wakeup. A turn whose
+last message asks you something is never held: you're told at once, whatever runs.
 
 A Claude Code or Codex you start yourself, typed into a session's shell, has no hooks of crystal's: crystal
 doesn't start it. `crystal integration install` puts crystal's hooks in their own settings, beside yours:
@@ -557,6 +567,8 @@ crystal kill review                         # stop one session; asks if its empt
 crystal archive review                      # stop it and keep it in the archive, out of the list
 crystal unarchive review                    # start it again where it was, in its conversation
 crystal ls --archived                       # the archived sessions
+crystal usage                               # the memory and CPU each session takes, and crystal's own
+crystal usage --json                        # the same, as JSON, with the totals
 crystal project                             # the projects crystal knows, running or not
 crystal project run                         # run this worktree's project in a session of its own
 crystal kill-server                         # stop every session, and the daemon
@@ -768,7 +780,7 @@ everywhere else. `[keys]` names them the same way:
 
 A view is any of the lists that take the keyboard: the diff, the file finder, the tree browser, find in files,
 the branch switcher, memory, the handoff notes, the files `crystal open` shows, the backlog, layouts, the
-archive, the plugins, the settings, what needs you, RAM, the timeline, the issues, the pull requests, `/` and the command list. A key you give a view's name stands in every
+archive, the plugins, the settings, what needs you, resources, the timeline, the issues, the pull requests, `/` and the command list. A key you give a view's name stands in every
 one of them for the key they all take for it, `↓`, `↑`, `PgDn`, `PgUp`, `Enter` or `Esc`, which go on working
 whatever you give; the defaults you leave it without do nothing. While a view is taking what you type, like
 the file finder's query or a filter, a letter is typed rather than standing for anything, so a key there is
@@ -952,7 +964,7 @@ lines past its first take the place of its task's line and its reported line, un
 | `agent` | what's in front in it, in a word, or the agent reported with `--display-agent` |
 | `model` | the model its agent runs on |
 | `subagents` | how many subagents its agent has running, `+2` |
-| `state` | its status in a word (`waiting`, `working`, `done`, `idle`, `running`, `ended`, `failed`, `starting`), or the label reported for it with `--state-label` |
+| `state` | its status in a word (`waiting`, `working`, `done`, `open`, `idle`, `running`, `ended`, `failed`, `starting`), or the label reported for it with `--state-label` |
 | `when` | how long ago it changed, or the tab it's in when it's shown from another |
 | `bell` | `♪` while its bell rang out of sight |
 | `task` | its task: what it was asked to do, or how that went |
@@ -1274,7 +1286,7 @@ You can have crystal keep a Claude Code started and waiting, so that a new sessi
 `warm_agent = true` under `[sessions]`, the TUI has the daemon keep one where its selection rests, started as
 the new-session panel would start it there, crystal's notes and all, and a new session started the same way, in
 that directory with that command, takes it over, its task typed in as its first prompt. It takes what an idle
-Claude Code does, a few hundred MB, for as long as a TUI is open, the RAM view showing it beside crystal's own,
+Claude Code does, a few hundred MB, for as long as a TUI is open, the resources view showing it beside crystal's own,
 and it's started again every ten minutes while it waits, so that what it was told as it started, the worktree's
 handoff notes and the project's memory, stays fresh. It's let go once no TUI has asked for it in a quarter of
 an hour, once the setting goes off, and before a handover. What the project's memory tells it goes by its
@@ -1282,17 +1294,30 @@ command alone, not by its task's words, which a session started cold has searche
 request or an issue, with acceptance criteria, in the background or with another agent starts as ever. It's
 off unless you turn it on.
 
-### RAM
+### Resources
 
-`#` shows the memory each session takes: its program and every process under it, since an agent runs node
-workers, shells and MCP servers of its own, the biggest first, with how many processes that is and its share of
-the whole. Under them is what crystal takes itself, the daemon and the TUI, then the agent [kept
-warm](#archiving-and-idle-agents) while there's one, and in the heading all of it, and
-its share of the machine's memory. `Enter` goes to the session the bar is on. The daemon looks at the
-processes, `ps` on a Mac and `/proc` on Linux, every second while the view is open, and every five seconds
-otherwise for the footer, which shows all of it beside `? keys` while the sidebar has the keyboard, like
-`1.2 GB`: a click on that opens the view.
-What's counted is each process's resident memory, so what processes share is counted in each.
+`#` shows the memory and CPU each session takes: its program and every process under it, since an agent runs node
+workers, shells and MCP servers of its own, the biggest first, with how many processes that is and a bar of its
+share of the whole; `s` puts the busiest first instead, and back. Under them is what crystal takes itself: the
+daemon, where memory's models run; each program it runs that isn't a session's, those of one name together,
+like the distiller's `claude -p`, git or a plugin's hook; and the TUI, with what it runs. Then comes the agent
+[kept warm](#archiving-and-idle-agents) while there's one. The heading says all of it, with its share of the
+machine's memory, and its CPU, with its share of the machine's cores. `Enter` goes to the session the bar is on.
+The footer shows all of it beside `? keys` while the sidebar has the keyboard, like `2.1G 35%`, in the room its
+keys leave, never in a key's place: its CPU goes first where there's less, then all of it. A click on that opens
+the view. `crystal usage` prints the same table for a script, and `--json` the daemon's look with its
+totals.
+
+A process's memory is what it has in RAM now. On a Mac that's its physical footprint, what Activity Monitor's
+Memory column shows, which counts what it has on the GPU, as the daemon has memory's models on Metal; on Linux
+it's its resident set, so what processes share is counted in each. Its CPU is a rate, in percent of one core,
+`100%` being one core busy and a machine of ten cores busy through and through `1000%`: the CPU time it had,
+user and system, since the daemon looked before, over the time between. That's not `ps`'s `%cpu`, which is an
+average over the process's whole life on Linux and a decaying one on a Mac. The daemon looks, with `/proc` on
+Linux and libproc on a Mac, where seven hundred processes take a millisecond, every second while the view is
+open and every five seconds otherwise; a look less than half a second after another counts from the one before
+that, and the first in ten seconds waits half a second to have something to count from. A process that started
+since the look counted from counts all its CPU time.
 
 ### Projects
 
@@ -2838,8 +2863,9 @@ made, `t1`, `t2`…, and stays open until it's closed, done or failed, with a li
   "<why>"`. crystal tells Claude Code how, on top of its system prompt, Codex in its developer instructions,
   and other agents at the top of their first prompt, opening with a line on where that comes from, so the
   agent doesn't take it for a stranger's instructions. Agents don't always remember to, Haiku least of all, so
-  the first time Claude Code ends a turn with its task still open, its Stop hook reminds it and it carries on:
-  to close the task, or, if it isn't through, to leave it open and end its turn. `-n <session>` closes another
+  the first time Claude Code ends a turn with its task still open, saying nothing that makes clear why, its Stop
+  hook reminds it and it carries on: to close the task if it's done, to ask you its question plainly if it needs
+  you, or to say what work of its own it waits on, which wakes it, and end its turn. `-n <session>` closes another
   session's task. A task isn't done while its worktree is in the middle of a rebase or a merge, stopped on
   conflicts say: `crystal done` refuses then and says so, until the agent finishes or aborts it; `--failed`
   closes it anyway.
@@ -2851,15 +2877,33 @@ made, `t1`, `t2`…, and stays open until it's closed, done or failed, with a li
 | State | Meaning |
 |---|---|
 | `pending` | made with `--no-launch`: nothing works on it yet |
-| `running` | its session is working on it |
-| `waiting` | its agent's turn ended with the task still open: it's asking you something |
+| `running` | its session is working on it, or its agent left it open waiting on something other than you |
+| `waiting` | its agent's turn ended with the task still open, asking you something |
 | `done` | closed done |
 | `failed` | closed failed, or its session ended while it was open, leaving nobody who could close it |
 | `cancelled` | you cancelled it, or killed its session while it was open |
 
-A turn that ends with the task still open, once the agent has been reminded, is a question for you: the session
-waits on you (`▲`, and `u` finds it) until its agent works again, and its task line says so. So does a
-background task you interrupted. A program that exits with its task open fails it, saying how it ended; `crystal
+Whether a turn that ends with the task still open needs you goes by what the agent said last, which Claude
+Code's Stop hook gives, read with no model:
+
+- A question, or a request: a choice, a decision, an approval, a file, access, or a command for you to run. The
+  session waits on you (`▲`, pinned, `u` finds it, and you're told) until its agent works again, and its task
+  line says so. It isn't reminded first: it asked.
+- A plain statement that it waits on something else: "waiting on CI, not on you", "I'll pick up when the tests
+  finish". The task stays open and the session sits idle, marked `◇`: not pinned, not told of, not found by
+  `u` or `U`. With work of its own still running that wakes it, the turn is held as working instead (see
+  [usage](#usage)).
+- Anything else, like a summary that doesn't close the task, is unclear: it's reminded once, and if its next turn
+  ends as unclear, it waits on you. So does a turn whose end its hooks didn't give, from another agent or an
+  older Claude Code.
+
+Of the 27 turns crystal's own log had marked as waiting on the user, none asked anything: 25 waited on their
+tests, CI, a helper or a subagent, and two were one finished report the agent didn't close. The rule reads 24 of
+them as waiting on something else, and 25 had work of their own running that holds them; together they leave
+out 25, and the finished report still tells you. Over the 472 turn ends a person answered next, it took none
+that asked for one that didn't.
+
+A background task you interrupted waits on you too. A program that exits with its task open fails it, saying how it ended; `crystal
 respawn` opens it again, under the same number.
 
 The sidebar shows a task under its session: what it was asked to do while it's open, `▲` when it waits on you,

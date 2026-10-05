@@ -190,6 +190,7 @@ pub fn run(socket: &Path, handover: Option<RawFd>) -> Result<()> {
         moves: Mutex::default(),
         spare: Mutex::default(),
         sweep,
+        earlier: Mutex::default(),
     });
     // A daemon starts again after every upgrade, or is handed over to the
     // new crystal, so this is where the skill an earlier crystal installed
@@ -349,6 +350,9 @@ struct Daemon {
     spare: Mutex<Option<Spare>>,
     /// Asks for a look for entries of memory gone stale: see [`tell_stale`].
     sweep: SyncSender<()>,
+    /// The CPU time each process had at the looks at what crystal takes,
+    /// for the next look to count from.
+    earlier: Mutex<resources::Earlier>,
 }
 
 /// The projects the sessions run in that are on the list already, as
@@ -2218,6 +2222,8 @@ impl Daemon {
                 subagent,
                 model,
                 wakeup,
+                said,
+                pending,
             } => {
                 let agent = agent.unwrap_or_else(|| "claude".to_string());
                 // The agent kept warm is in no list till it's taken over.
@@ -2261,6 +2267,12 @@ impl Daemon {
                 }
                 let moving = self.is_moving(&id);
                 let session = with_id(&mut sessions, &id)?;
+                // Before it's reminded of its task: whether it asks the user
+                // anything, and what of its own is still to come, say whether
+                // its turn is over.
+                if event == AgentEvent::TurnEnded {
+                    session.turn_ended_with(said.as_deref(), pending);
+                }
                 if let Some(prompt) = &prompt {
                     session.recalled().asked(prompt);
                 }
@@ -2719,7 +2731,8 @@ impl Daemon {
             }
             Request::TaskToTerminal { task, env } => self.task_to_terminal(&task, env),
             Request::Resources { client } => {
-                // `ps` takes a moment: the sessions aren't held meanwhile.
+                // A look takes a moment, and the first waits half a second
+                // for CPU to count: the sessions aren't held meanwhile.
                 let running: Vec<(String, u32)> = {
                     let sessions = self.sessions.lock().unwrap();
                     let running = sessions
@@ -2727,9 +2740,16 @@ impl Daemon {
                         .filter_map(|session| Some((session.name.clone(), session.running_pid()?)));
                     running.collect()
                 };
-                let warm = self.spare_pid();
-                let taken = resources::measure(std::process::id(), client, &running, warm);
-                Ok(Response::Resources(taken))
+                let whose = resources::Whose {
+                    daemon: std::process::id(),
+                    client,
+                    sessions: &running,
+                    warm: self.spare_pid(),
+                };
+                Ok(Response::Resources(resources::measure(
+                    &self.earlier,
+                    &whose,
+                )))
             }
             Request::Spending => Ok(Response::Spending(protocol::Spending {
                 today_usd: self.spending.today(),

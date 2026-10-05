@@ -1647,6 +1647,23 @@
       ],
       "description": "A note added to a worktree's handoff file."
     },
+    "HelperUsage": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Its program's name, as the system keeps it: cut to 15 bytes."
+        },
+        "usage": {
+          "$ref": "#/$defs/ProcessUsage"
+        }
+      },
+      "required": [
+        "name",
+        "usage"
+      ],
+      "description": "What a process the daemon runs that isn't a session's takes, with every process under it: the distiller's `claude -p`, git, a plugin's hook."
+    },
     "InProgress": {
       "type": "string",
       "enum": [
@@ -2458,7 +2475,7 @@
             "string",
             "null"
           ],
-          "description": "The line an agent or a script put on its row with `crystal report --line`, until it's taken off or its time is up.",
+          "description": "The line an agent or a script put on its row with `crystal report --line`, until it's taken off or its time is up; or, held working while work of its own runs, what that is.",
           "default": null
         },
         "row": {
@@ -2511,6 +2528,28 @@
         "status"
       ],
       "description": "A session as `ls --json` lists it: what the daemon knows, and the word its STATE column shows."
+    },
+    "Machine": {
+      "type": "object",
+      "properties": {
+        "bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "description": "Its memory, in bytes: 0 when it can't say."
+        },
+        "cores": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0,
+          "description": "Its cores, those online: 0 when it can't say."
+        }
+      },
+      "required": [
+        "bytes",
+        "cores"
+      ],
+      "description": "What the machine has."
     },
     "MemoryEntry": {
       "type": "object",
@@ -3133,6 +3172,60 @@
       ],
       "description": "A way to go from a pane on screen: to the pane there, or to move a border."
     },
+    "Pending": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/PendingKind"
+        },
+        "what": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "What it is, in a few words: a command, a watch's or a subagent's description."
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "description": "Work of an agent's own still to come as its turn ended, which wakes it once it's done or due, as Claude Code's Stop hook lists it: a task in the background, or a wakeup it scheduled."
+    },
+    "PendingKind": {
+      "oneOf": [
+        {
+          "type": "string",
+          "const": "shell",
+          "description": "A command run in the background."
+        },
+        {
+          "type": "string",
+          "const": "monitor",
+          "description": "A Monitor watch."
+        },
+        {
+          "type": "string",
+          "const": "subagent",
+          "description": "A subagent in the background."
+        },
+        {
+          "type": "string",
+          "const": "wakeup",
+          "description": "A wakeup scheduled once."
+        },
+        {
+          "type": "string",
+          "const": "cron",
+          "description": "A wakeup that comes again and again."
+        },
+        {
+          "type": "string",
+          "const": "other",
+          "description": "Any other task, like a workflow or a teammate."
+        }
+      ],
+      "description": "What sort of work is still to come."
+    },
     "PendingTask": {
       "type": "object",
       "properties": {
@@ -3339,7 +3432,12 @@
           "type": "integer",
           "format": "uint64",
           "minimum": 0,
-          "description": "Resident memory, in bytes."
+          "description": "Memory, in bytes: the physical footprint on a Mac, the resident set on Linux."
+        },
+        "cpu": {
+          "type": "number",
+          "format": "double",
+          "description": "CPU since the look counted from, in percent of one core, to a tenth: 100 is one core busy all that while."
         },
         "processes": {
           "type": "integer",
@@ -3351,6 +3449,7 @@
       "required": [
         "pid",
         "bytes",
+        "cpu",
         "processes"
       ],
       "description": "What a process, and with a session's, every process under it, takes."
@@ -3694,6 +3793,23 @@
                 }
               ],
               "description": "Work the agent scheduled to wake it later, when its hooks say it just did: it isn't idle meanwhile."
+            },
+            "said": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "description": "What the agent said last as its turn ended, when its hooks say: whether it asks the user anything goes by it."
+            },
+            "pending": {
+              "type": [
+                "array",
+                "null"
+              ],
+              "items": {
+                "$ref": "#/$defs/Pending"
+              },
+              "description": "The work of its own still to come as its turn ended, which wakes it, when its hooks say: none when they say there's none."
             },
             "type": {
               "type": "string",
@@ -4207,7 +4323,7 @@
           "required": [
             "type"
           ],
-          "description": "The memory each running session's processes take, the daemon's own, and the asking client's, whose process is `client`."
+          "description": "The memory and CPU each running session's processes take, the daemon's own and its helpers', and the asking client's, whose process is `client`."
         },
         {
           "type": "object",
@@ -5279,7 +5395,15 @@
       "properties": {
         "daemon": {
           "$ref": "#/$defs/ProcessUsage",
-          "description": "The daemon's own process, without its sessions'."
+          "description": "The daemon's own process, without its sessions' or its helpers'."
+        },
+        "helpers": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/HelperUsage"
+          },
+          "description": "The processes the daemon runs that aren't sessions' programs or the agent kept warm, each with every process under it.",
+          "default": []
         },
         "client": {
           "anyOf": [
@@ -5290,7 +5414,7 @@
               "type": "null"
             }
           ],
-          "description": "The client that asked, when it said which process it is."
+          "description": "The client that asked, with every process under it, when it said which process it is."
         },
         "sessions": {
           "type": "array",
@@ -5310,17 +5434,21 @@
           ],
           "description": "The agent kept warm for a new session to take over, while there's one: `[sessions] warm_agent`."
         },
-        "total": {
+        "machine": {
+          "$ref": "#/$defs/Machine"
+        },
+        "cpu_over_ms": {
           "type": "integer",
           "format": "uint64",
           "minimum": 0,
-          "description": "The memory the machine has, in bytes: 0 when it can't say."
+          "description": "How long CPU was counted over, in milliseconds: 0 when it couldn't be, every process's CPU then 0."
         }
       },
       "required": [
         "daemon",
         "sessions",
-        "total"
+        "machine",
+        "cpu_over_ms"
       ],
       "description": "One look at what crystal takes."
     },
@@ -6667,7 +6795,7 @@
             "string",
             "null"
           ],
-          "description": "The line an agent or a script put on its row with `crystal report --line`, until it's taken off or its time is up.",
+          "description": "The line an agent or a script put on its row with `crystal report --line`, until it's taken off or its time is up; or, held working while work of its own runs, what that is.",
           "default": null
         },
         "row": {

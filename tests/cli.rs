@@ -1910,7 +1910,7 @@ fn q_asks_before_it_quits_unless_the_settings_say_not_to() {
 }
 
 #[test]
-fn hash_shows_the_memory_each_session_takes() {
+fn hash_shows_the_memory_and_cpu_each_session_takes() {
     let crystal = Crystal::new();
     crystal.ok(&["new", "-n", "stays", "sleep", "30"]);
     crystal.ok(&["new", "-n", "other", "sleep", "30"]);
@@ -1918,11 +1918,19 @@ fn hash_shows_the_memory_each_session_takes() {
     let mut tui = crystal.tui();
     tui.shows("❯ stays");
     tui.type_keys("#");
-    tui.shows(" RAM · ");
+    tui.shows(" Resources · RAM ");
+    tui.shows(" of a core");
+    tui.shows("RAM↓");
     tui.shows("1 process");
     tui.shows("crystal itself");
     tui.shows("the daemon");
     tui.shows("this TUI");
+    // `s` puts the busiest first, and back.
+    tui.type_keys("s");
+    tui.shows("CPU↓");
+    tui.shows("s by RAM");
+    tui.type_keys("s");
+    tui.shows("RAM↓");
     // Enter goes to the session the bar is on.
     tui.type_keys("j\r");
     tui.hides("crystal itself");
@@ -8703,6 +8711,54 @@ fn ls_json_lists_every_session_with_its_status() {
 }
 
 #[test]
+fn usage_counts_each_session_s_memory_and_cpu_and_crystal_s_own() {
+    let crystal = Crystal::new();
+    let said = crystal.fails(&["usage"]);
+    assert!(said.contains("no daemon is running"), "{said}");
+
+    crystal.ok(&["new", "-n", "busy", "sh", "-c", "while :; do :; done"]);
+    crystal.ok(&["new", "-n", "idle", "sleep", "30"]);
+    // The daemon hasn't looked before: it looks twice, half a second apart.
+    let json = crystal.ok(&["usage", "--json"]);
+    let usage: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert!(usage["cpu_over_ms"].as_u64().unwrap() >= 500, "{json}");
+    let session = |name: &str| {
+        let sessions = usage["sessions"].as_array().unwrap();
+        let found = sessions.iter().find(|session| session["name"] == name);
+        found.unwrap()["usage"].clone()
+    };
+    let (busy, idle) = (session("busy"), session("idle"));
+    assert_eq!(busy["pid"], crystal.pid("busy"));
+    assert_eq!(idle["pid"], crystal.pid("idle"));
+    assert!(busy["bytes"].as_u64().unwrap() > 0, "{json}");
+    assert!(busy["processes"].as_u64().unwrap() >= 1, "{json}");
+    // A shell spinning keeps a core busy, as much of it as the machine
+    // gives it; `sleep` keeps none.
+    assert!(busy["cpu"].as_f64().unwrap() > 10.0, "{json}");
+    assert!(idle["cpu"].as_f64().unwrap() < busy["cpu"].as_f64().unwrap());
+    assert!(usage["daemon"]["bytes"].as_u64().unwrap() > 0, "{json}");
+    assert!(usage["machine"]["cores"].as_u64().unwrap() > 0, "{json}");
+    assert!(usage["machine"]["bytes"].as_u64().unwrap() > 0, "{json}");
+    let (own, all) = (&usage["crystal"], &usage["all"]);
+    assert!(all["bytes"].as_u64() > own["bytes"].as_u64(), "{json}");
+    assert!(all["processes"].as_u64().unwrap() >= 3, "{json}");
+
+    // The table, the busiest first.
+    let table = crystal.ok(&["usage", "--sort", "cpu"]);
+    let lines: Vec<Vec<&str>> = table
+        .lines()
+        .map(|line| line.split_whitespace().collect())
+        .collect();
+    assert_eq!(lines[0], ["NAME", "KIND", "PID", "PROCESSES", "RAM", "CPU"]);
+    assert_eq!(lines[1][..2], ["busy", "session"], "{table}");
+    assert!(
+        lines.iter().any(|line| line[..2] == ["crystal", "daemon"]),
+        "{table}"
+    );
+    assert_eq!(lines.last().unwrap()[..2], ["all", "total"], "{table}");
+}
+
+#[test]
 fn skill_install_writes_the_skill_and_keeps_a_changed_one() {
     let crystal = Crystal::new();
     let install = |args: &[&str]| crystal.run(args);
@@ -12629,6 +12685,80 @@ fn an_agent_that_ends_its_turn_with_its_task_open_is_reminded_once() {
     );
     assert_eq!(crystal.row("agent").unwrap()[1], "working");
     assert!(crystal.ok(&["tasks"]).starts_with("t1    running    agent"));
+}
+
+#[test]
+fn an_agent_waiting_on_its_own_work_works_on_and_only_a_question_waits_on_the_user() {
+    let crystal = Crystal::new();
+    let bin = fake_claude(crystal.dir.path());
+    let out = crystal
+        .command(&["new", "-d", "-n", "agent", "claude", "fix the tests"])
+        .env("PATH", path_of(&[&bin]))
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let hook = format!("{CRYSTAL} hook claude");
+    let session = [("CRYSTAL_SESSION", "agent")];
+    let says = |event: &serde_json::Value| hook_says(&crystal, &session, &hook, &event.to_string());
+    let status = || crystal.row("agent").unwrap()[1].clone();
+    let prompt = serde_json::json!({"hook_event_name": "UserPromptSubmit"});
+    let stop = |said: &str, tasks: serde_json::Value| {
+        serde_json::json!({
+            "hook_event_name": "Stop",
+            "last_assistant_message": said,
+            "background_tasks": tasks,
+            "session_crons": [],
+        })
+    };
+    let waits_on_user = || {
+        let events = crystal.ok(&["events", "-k", "task.waiting"]);
+        !events.trim().is_empty()
+    };
+    assert_eq!(says(&prompt), "");
+
+    // Its turn ends with its tests running in the background: it's still at
+    // work on them, not reminded of its task, which doesn't wait on the
+    // user, and its row says what runs.
+    let tests = serde_json::json!([{"id": "b1", "type": "shell", "status": "running",
+                                    "description": "Run the full test suite",
+                                    "command": "cargo test"}]);
+    let waiting = "The tests run in the background; I'll pick up when they finish.";
+    assert_eq!(says(&stop(waiting, tests)), "", "not reminded");
+    assert_eq!(status(), "working");
+    let row = listed(&crystal, "agent");
+    assert_eq!(row["task"]["waiting"], false);
+    assert_eq!(row["line"], "in the background: Run the full test suite");
+    let idle = serde_json::json!({"hook_event_name": "Notification",
+                                  "notification_type": "idle_prompt"});
+    assert_eq!(says(&idle), "");
+    assert_eq!(status(), "working", "its prompt back says nothing");
+
+    // Woken as they end, it opens the PR and ends saying it waits on CI,
+    // nothing of its own running: its task stays open, the session idle,
+    // needing nobody.
+    assert_eq!(says(&prompt), "");
+    let ci = "PR #7 is open. I'm waiting on CI, not on you.";
+    assert_eq!(says(&stop(ci, serde_json::json!([]))), "", "not reminded");
+    assert_eq!(status(), "idle");
+    let row = listed(&crystal, "agent");
+    assert_eq!(
+        (&row["task"]["waiting"], &row["line"]),
+        (&false.into(), &serde_json::Value::Null)
+    );
+    assert!(crystal.ok(&["tasks"]).starts_with("t1    running    agent"));
+    assert!(!waits_on_user());
+
+    // Then it asks something: it waits on the user, and isn't reminded first.
+    assert_eq!(says(&prompt), "");
+    let question = "CI is green. Should I merge it?";
+    assert_eq!(
+        says(&stop(question, serde_json::json!([]))),
+        "",
+        "not reminded"
+    );
+    assert_eq!(status(), "waiting");
+    assert_eq!(listed(&crystal, "agent")["task"]["waiting"], true);
+    assert!(waits_on_user());
 }
 
 #[test]

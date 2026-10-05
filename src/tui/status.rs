@@ -1,7 +1,8 @@
 //! What a session is doing, as the TUI shows it: one mark, in a color the
 //! theme picks. The marks are shapes that tell apart at a glance even
 //! without color: a warning triangle for a session waiting on you, a turning
-//! circle while it works, a tick when it's done.
+//! circle while it works, a tick when it's done, a diamond for a task left
+//! open that asks nothing of you.
 
 use crate::protocol::{Activity, SessionInfo, State};
 
@@ -12,6 +13,10 @@ pub enum Status {
     Working,
     /// Its agent finished a turn, and nobody has looked since.
     Done,
+    /// Its agent ended its turn with its task still open, waiting on
+    /// something other than the user, like its tests or CI: it needs
+    /// nobody, so it isn't pinned, told of or gone to with `u`.
+    Open,
     /// An agent at its prompt, or any program that doesn't say.
     Running,
     /// Its program ended well.
@@ -56,6 +61,11 @@ impl Status {
             (State::Running, Some(Activity::Waiting)) => Status::Waiting,
             (State::Running, Some(Activity::Working)) => Status::Working,
             (State::Running, Some(Activity::Done)) => Status::Done,
+            (State::Running, Some(Activity::Idle))
+                if session.task.as_ref().is_some_and(|task| task.is_open()) =>
+            {
+                Status::Open
+            }
             (State::Running, _) => Status::Running,
             (State::Exited { code: 0 }, _) => Status::Ended,
             (State::Starting, _) => Status::Starting,
@@ -72,6 +82,7 @@ impl Status {
             Status::Waiting => "▲",
             Status::Working => SPINNER[spin % SPINNER.len()],
             Status::Done => "✓",
+            Status::Open => "◇",
             Status::Running => "▸",
             Status::Ended | Status::Failed => "■",
             Status::Starting => "◌",
@@ -82,6 +93,7 @@ impl Status {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::TaskInfo;
     use std::path::PathBuf;
 
     fn session(state: State, activity: Option<Activity>) -> SessionInfo {
@@ -144,6 +156,36 @@ mod tests {
         assert_eq!(Need::of(&session(State::Exited { code: 1 }, None)), None);
         assert_eq!(Need::of(&session(State::Starting, None)), None);
         assert_eq!(Need::of(&session(State::Running, None)), None);
+    }
+
+    #[test]
+    fn a_task_left_open_asking_nothing_is_marked_and_needs_nobody() {
+        let goal = |waiting| TaskInfo {
+            id: Some(1),
+            goal: "fix it".into(),
+            background: false,
+            backlog: None,
+            waiting,
+            created: 0,
+            outcome: None,
+            brief: Default::default(),
+        };
+        let open = SessionInfo {
+            task: Some(goal(false)),
+            ..session(State::Running, Some(Activity::Idle))
+        };
+        assert_eq!(Status::of(&open), Status::Open);
+        assert_eq!(Status::Open.mark(0), "◇");
+        assert_eq!(Need::of(&open), None);
+        // One asking the user something waits on them.
+        let asking = SessionInfo {
+            task: Some(goal(true)),
+            ..session(State::Running, Some(Activity::Waiting))
+        };
+        assert_eq!(Need::of(&asking), Some(Need::Answer));
+        // An agent at rest with no task is just that.
+        let idle = session(State::Running, Some(Activity::Idle));
+        assert_eq!(Status::of(&idle), Status::Running);
     }
 
     #[test]
