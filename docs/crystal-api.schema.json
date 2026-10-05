@@ -2492,6 +2492,16 @@
           },
           "description": "What its text names that was in the code when it was last said: the identifiers, paths, commands and flags in it, to tell whether they're still there.",
           "default": []
+        },
+        "used": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0,
+          "description": "When an agent last read it in full, in seconds since the Unix epoch.",
+          "default": null
         }
       },
       "required": [
@@ -4140,6 +4150,11 @@
             "fresh": {
               "type": "boolean",
               "description": "Leave the stale out, rather than give them after the rest."
+            },
+            "expired": {
+              "type": "boolean",
+              "description": "The expired too, which are left out otherwise.",
+              "default": false
             },
             "limit": {
               "type": "integer",

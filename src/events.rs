@@ -1459,6 +1459,7 @@ pub fn example(kind: Kind, session: Option<&SessionInfo>, dir: &Path) -> Event {
         anchors: Default::default(),
         checkout: None,
         names: Vec::new(),
+        used: None,
     };
     let item = BacklogItem {
         number: 1,

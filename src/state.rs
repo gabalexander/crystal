@@ -109,6 +109,13 @@ pub fn task_dir(socket: &Path, task: u64) -> PathBuf {
     kept(socket, "tasks", "tasks").join(format!("t{task}"))
 }
 
+/// Where the TUIs of the daemon at `socket` keep a copy of each file
+/// dropped on a task or a reply that would go away before its agent reads
+/// it: see `tui::dropped_files`.
+pub fn attachments_dir(socket: &Path) -> PathBuf {
+    kept(socket, "attachments", "attachments")
+}
+
 /// Where the daemon at `socket` keeps the logs of the plugins it runs.
 pub fn plugins_dir(socket: &Path) -> PathBuf {
     kept(socket, "plugins", "plugins")
@@ -228,6 +235,10 @@ mod tests {
         let work = socket::of_server("work").unwrap();
         assert_eq!(db_path(&work), servers_dir().join("work/crystal.db"));
         assert_eq!(plugins_dir(&work), servers_dir().join("work/plugins"));
+        assert_eq!(
+            attachments_dir(&work),
+            servers_dir().join("work/attachments")
+        );
         assert_eq!(server_dir("work"), servers_dir().join("work"));
         assert_eq!(server_dir(socket::DEFAULT), state_dir());
         assert_eq!(

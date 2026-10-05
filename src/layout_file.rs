@@ -22,7 +22,7 @@
 
 use crate::client::{self, Purpose};
 use crate::layout::{self, Command, Layout, TabLayout};
-use crate::output::outln;
+use crate::output::{errln, outln};
 use crate::printable;
 use crate::protocol::{Request, Response, SessionInfo};
 use crate::shell;
@@ -661,7 +661,7 @@ pub fn apply(socket: &Path, path: Option<&Path>, replace: bool) -> Result<()> {
             .map_err(|err| format!("{err:#}"))
     });
     for why in &planned.left_out {
-        eprintln!("{}", printable::line(why));
+        errln!("{}", printable::line(why));
     }
     for name in &planned.started {
         outln!("{name}")?;

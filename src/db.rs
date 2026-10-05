@@ -21,6 +21,7 @@
 use crate::backlog;
 use crate::events::{Event, Scope, Since};
 use crate::flow_run::FlowRun;
+use crate::output::errln;
 use crate::protocol::{
     ArchivedSession, Artifact, ArtifactKind, BacklogItem, PendingTask, TaskBrief, TaskOutcome,
     TaskRecord,
@@ -891,7 +892,7 @@ impl Db {
             return;
         }
         if let Err(err) = self.try_bring_in(file, put) {
-            eprintln!("crystal: couldn't bring in {}: {err:#}", file.display());
+            errln!("crystal: couldn't bring in {}: {err:#}", file.display());
         }
     }
 
@@ -1226,7 +1227,7 @@ fn readable<T>(
     for row in rows {
         match row? {
             Ok(value) => found.push(value),
-            Err(err) => eprintln!("crystal: couldn't read {what}: {err:#}"),
+            Err(err) => errln!("crystal: couldn't read {what}: {err:#}"),
         }
     }
     Ok(found)
@@ -1237,7 +1238,7 @@ fn readable<T>(
 fn set_aside(file: &Path, suffix: &str, why: &anyhow::Error) {
     let aside = with_suffix(file, suffix);
     if fs::rename(file, &aside).is_ok() {
-        eprintln!(
+        errln!(
             "crystal: couldn't read {}, kept as {}: {why:#}",
             file.display(),
             aside.display()

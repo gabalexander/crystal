@@ -1,12 +1,13 @@
 //! Copy mode: vi's keys move a cursor over a pane's screen and back
 //! through its history, select from it, and search it as the search is
 //! typed, and what's selected goes to the clipboard; `o` opens the link
-//! under the cursor. The program in the pane goes on running, and its
+//! under the cursor, a URL or a file's path. The program in the pane goes on running, and its
 //! output on showing. The TUI's panes and `crystal attach` both have it.
 //! Kept apart from I/O: the keys work on the screen, and say what's to be
 //! copied.
 
 use super::text_input::TextInput;
+use crate::links::Target;
 use crate::vt::{self, Motion, SelectionKind};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -83,7 +84,7 @@ pub enum Outcome {
     /// Put this on the clipboard; copy mode is over.
     Copy(String),
     /// Open this link; copy mode is over.
-    Open(String),
+    Open(Target),
     /// Tell the user this.
     Say(String),
 }
@@ -130,7 +131,7 @@ impl CopyMode {
             KeyCode::Char('o') => {
                 let link = screen.copy_cursor().and_then(|cell| screen.link_at(cell));
                 return match link {
-                    Some(link) => Outcome::Open(link.url),
+                    Some(link) => Outcome::Open(link.target),
                     None => Outcome::Say("there's no link under the cursor".into()),
                 };
             }
@@ -493,7 +494,21 @@ mod tests {
             Outcome::Say("there's no link under the cursor".into())
         );
         let outcome = press(&mut copy, &mut screen, "kWWo");
-        assert_eq!(outcome, Outcome::Open("https://example.com/docs".into()));
+        let url = Target::Url("https://example.com/docs".into());
+        assert_eq!(outcome, Outcome::Open(url));
+    }
+
+    #[test]
+    fn o_opens_the_path_under_the_cursor_with_its_line() {
+        let mut screen = vt::Screen::new(3, 40);
+        screen.process(b"see src/app.rs:42 now\r\n");
+        screen.start_copying();
+        let mut copy = CopyMode::default();
+        let file = Target::File {
+            path: "src/app.rs".into(),
+            line: Some(42),
+        };
+        assert_eq!(press(&mut copy, &mut screen, "kWo"), Outcome::Open(file));
     }
 
     #[test]

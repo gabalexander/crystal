@@ -40,6 +40,7 @@ use super::preview::Content;
 use super::profiles::{self, ProfilesView};
 use super::pull_requests::{self, PullRequestsView};
 use super::ram_view::{self, RamView};
+use super::recent::Recent;
 use super::reply::ReplyBox;
 use super::restarted::{Restarted, Restarts};
 use super::review;
@@ -549,6 +550,11 @@ pub enum Action {
         to: Slot,
         text: String,
     },
+    /// Pasted text for a box whose text goes to an agent, the reply box or
+    /// the new-session panel's task: any file dropped in it that would go
+    /// away is copied first (`dropped_files`), then it's handed back with
+    /// [`App::paste_staged`].
+    PasteForAgent(String),
     /// Ask Codex, off the event loop, which models it lets the user choose.
     ReadCodexModels,
     /// Show a page further back into the history of the pane at this slot.
@@ -1098,6 +1104,8 @@ pub struct App {
     /// The session the selection rests on, for one crystal stopped idle to
     /// start again: see [`App::wake_landed`].
     landed: Option<Landed>,
+    /// The sessions the user has been on, for `;` to go back to.
+    recent: Recent,
     /// How narrow a terminal shows one column, as the settings say: see
     /// [`App::one_column`].
     phone_width: u16,
@@ -1360,6 +1368,7 @@ impl App {
             show_keys: false,
             shown_key: None,
             landed: None,
+            recent: Recent::default(),
             phone_width: SidebarSettings::default().phone_width,
             page: None,
             screen: Rect::new(0, 0, 80, 24),
@@ -3701,6 +3710,27 @@ impl App {
             .unwrap_or_default()
     }
 
+    /// Where a file's path the pane at `slot` shows is looked for: where
+    /// its session runs, then the top of its worktree.
+    pub fn link_dirs(&self, slot: Slot) -> Vec<PathBuf> {
+        self.pane_session(slot)
+            .map(crate::links::dirs_of)
+            .unwrap_or_default()
+    }
+
+    /// What opens the file at `path` in `dir` in the user's editor, at
+    /// `line`: a session of its own named after the file, as the file
+    /// finder's Enter starts.
+    pub fn edit(&self, dir: PathBuf, path: String, line: Option<usize>) -> Action {
+        let name = self.free_name(&edit_name(&path));
+        Action::Edit {
+            dir,
+            path,
+            line,
+            name,
+        }
+    }
+
     /// The session the pane at `slot` is about: the one split off there,
     /// the one floating, or, in the pane that follows the selection, the
     /// selected one. While the selected session has a pane of its own,
@@ -3997,9 +4027,34 @@ impl App {
     }
 
     /// The session called `from` is called `to` now: a split of it stays
-    /// open under its new name, and a tab that was on it stays on it.
+    /// open under its new name, a tab that was on it stays on it, and `;`
+    /// goes back to it by its new name.
     pub fn renamed(&mut self, from: &str, to: &str) {
         self.tabs.renamed(from, to);
+        self.recent.renamed(from, to);
+    }
+
+    /// Notes where the selection is at `now`, for `;` to go back to the
+    /// session the user was on before. The event loop calls this as it
+    /// goes round.
+    pub fn note_selection(&mut self, now: Instant) {
+        let selected = self.selected_name();
+        self.recent.note(selected.as_deref(), now);
+    }
+
+    /// `;`: back to the session the user was on before, in whichever tab
+    /// it is; the keyboard goes into its pane if it was in a pane.
+    fn go_back(&mut self) {
+        let sessions = &self.sessions;
+        let there = |name: &str| sessions.iter().any(|session| session.name == name);
+        let Some(name) = self.recent.go_back(there) else {
+            return self.notify("there's no session to go back to".into());
+        };
+        let typing = matches!(self.focus, Focus::Pane(_));
+        self.select(&name);
+        if typing {
+            self.type_into_selected();
+        }
     }
 
     /// Hands the keyboard to the selected session, in whichever pane shows
@@ -4859,6 +4914,7 @@ impl App {
         match command {
             Command::Down => self.move_selection(1),
             Command::Up => self.move_selection(-1),
+            Command::LastSession => self.go_back(),
             // On a worktree with no sessions, there's nothing to type into:
             // Enter starts something there, as `n` does.
             Command::Open if self.folded_selection().is_some() => self.unfold_project(),
@@ -6569,7 +6625,9 @@ impl App {
 
     /// Pasted text: into whichever text box has the keyboard, or else to
     /// the session in the pane that has it. Anywhere else, like the
-    /// sidebar, where letters are commands, a paste does nothing.
+    /// sidebar, where letters are commands, a paste does nothing. A paste
+    /// for the reply box or the new-session panel's task goes by the event
+    /// loop first, which copies a file dropped there that would go away.
     pub fn on_paste(&mut self, text: String) -> Option<Action> {
         if self.plugin_pane.is_some() {
             return Some(Action::PasteInPluginPane(text));
@@ -6601,11 +6659,14 @@ impl App {
         if self.view.is_some() || self.showing_keys() || self.confirm.is_some() {
             return None;
         }
-        if let Some(reply) = &mut self.reply {
-            reply.on_paste(&text);
+        if let Some(reply) = &self.reply {
+            return (!reply.sending).then_some(Action::PasteForAgent(text));
         } else if let Some(list) = &mut self.command_list {
             list.on_paste(&text);
         } else if let Some(launcher) = &mut self.launcher {
+            if launcher.focus() == launcher::Field::Task {
+                return Some(Action::PasteForAgent(text));
+            }
             launcher.on_paste(&text);
         } else if let Some(view) = &mut self.profiles_view {
             view.on_paste(&text);
@@ -6634,6 +6695,16 @@ impl App {
             return Some(Action::CopyPaste { slot, text });
         }
         None
+    }
+
+    /// A paste [`Action::PasteForAgent`] asked to have staged, staged: into
+    /// the reply box, or the new-session panel's task.
+    pub fn paste_staged(&mut self, text: &str) {
+        if let Some(reply) = &mut self.reply {
+            reply.on_paste(text);
+        } else if let Some(launcher) = &mut self.launcher {
+            launcher.on_paste(text);
+        }
     }
 
     fn ask(&mut self, question: Question, answer: &str) {
@@ -8652,7 +8723,14 @@ mod tests {
     fn a_paste_goes_to_the_panel_or_else_to_the_pane_typed_into() {
         let mut app = with_agents(&["claude"], vec![session("a")]);
         press(&mut app, KeyCode::Char('n'));
-        assert_eq!(app.on_paste("one\ntwo".into()), None);
+        // The task goes to an agent: the event loop copies a file dropped
+        // in it that would go away, and hands it back.
+        assert_eq!(
+            app.on_paste("one\ntwo".into()),
+            Some(Action::PasteForAgent("one\ntwo".into()))
+        );
+        assert_eq!(app.launcher().unwrap().task().text(), "");
+        app.paste_staged("one\ntwo");
         assert_eq!(app.launcher().unwrap().task().text(), "one\ntwo");
         press(&mut app, KeyCode::Esc);
 
@@ -11536,6 +11614,63 @@ mod tests {
     }
 
     #[test]
+    fn semicolon_goes_back_to_the_session_before_in_its_tab_and_again_comes_back() {
+        let start = Instant::now();
+        let after = |seconds| start + Duration::from_secs(seconds);
+        let mut app = app_with_a_second_tab(&["a", "b", "c"]);
+        press(&mut app, KeyCode::Char(';'));
+        assert_eq!(app.notice(), Some("there's no session to go back to"));
+        press(&mut app, KeyCode::Char('1'));
+        app.select("a");
+        app.note_selection(after(0));
+        // b is only passed over on the way to c.
+        press(&mut app, KeyCode::Char('j'));
+        app.note_selection(after(5));
+        press(&mut app, KeyCode::Char('j'));
+        app.note_selection(after(5));
+        assert_eq!(selected_name(&app), Some("c"));
+        press(&mut app, KeyCode::Char('2'));
+        app.note_selection(after(9));
+
+        press(&mut app, KeyCode::Char(';'));
+        assert_eq!(app.tabs().current_index(), 0);
+        assert_eq!(selected_name(&app), Some("c"));
+        app.note_selection(after(9));
+        press(&mut app, KeyCode::Char(';'));
+        assert_eq!(app.tabs().current_index(), 1);
+        assert_eq!(selected_name(&app), Some("shell"));
+        app.note_selection(after(9));
+        // c has gone: a is the one before it.
+        let left = vec![session("a"), session("b"), session("shell")];
+        app.set_sessions(left);
+        press(&mut app, KeyCode::Char(';'));
+        assert_eq!(selected_name(&app), Some("a"));
+    }
+
+    #[test]
+    fn semicolon_from_a_pane_types_into_the_session_gone_back_to() {
+        let start = Instant::now();
+        let mut app = app_with(&["a", "b"]);
+        app.select("a");
+        app.note_selection(start);
+        app.select("b");
+        app.note_selection(start + Duration::from_secs(2));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.focus(), Focus::Pane(Slot::Selected));
+        ctrl(&mut app, 'b');
+        press(&mut app, KeyCode::Char(';'));
+        assert_eq!(selected_name(&app), Some("a"));
+        assert_eq!(app.focus(), Focus::Pane(Slot::Selected));
+        // From the sidebar, the sidebar keeps the keyboard.
+        app.note_selection(start + Duration::from_secs(2));
+        ctrl(&mut app, '\\');
+        assert_eq!(app.focus(), Focus::Sidebar);
+        press(&mut app, KeyCode::Char(';'));
+        assert_eq!(selected_name(&app), Some("b"));
+        assert_eq!(app.focus(), Focus::Sidebar);
+    }
+
+    #[test]
     fn a_tab_shows_what_most_needs_the_user_in_it() {
         let mut app = app_with_a_second_tab(&["a", "b"]);
         assert_eq!(app.tab_status(0), None);
@@ -12708,6 +12843,7 @@ mod tests {
             anchors: Default::default(),
             checkout: None,
             names: Vec::new(),
+            used: None,
         };
         let listed = crate::memory::Listed {
             entry,
@@ -13684,8 +13820,31 @@ gate = true
                 .label
                 .starts_with("its agent's next prompt")
         );
-        assert_eq!(app.on_paste("line one\nline two".into()), None);
+        assert_eq!(
+            app.on_paste("line one\nline two".into()),
+            Some(Action::PasteForAgent("line one\nline two".into()))
+        );
+        app.paste_staged("line one\nline two");
         assert_eq!(app.reply().unwrap().text.text(), "line one\nline two");
+
+        // On its way to the session, the box takes nothing more.
+        press(&mut app, KeyCode::Enter);
+        assert!(app.reply().unwrap().sending);
+        assert_eq!(app.on_paste("more".into()), None);
+    }
+
+    #[test]
+    fn a_paste_into_the_branch_goes_straight_in_as_it_reaches_no_agent() {
+        let mut app = with_agents(&["claude"], vec![session("a")]);
+        press(&mut app, KeyCode::Char('w'));
+        // Back round from the task to the branch, the panel's last field.
+        press(&mut app, KeyCode::BackTab);
+        assert_eq!(app.launcher().unwrap().focus(), launcher::Field::Branch);
+        let before = app.launcher().unwrap().branch_name();
+
+        assert_eq!(app.on_paste("-x".into()), None);
+
+        assert_eq!(app.launcher().unwrap().branch_name(), format!("{before}-x"));
     }
 
     fn labels(app: &App) -> Vec<&'static str> {

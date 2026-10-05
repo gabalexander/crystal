@@ -11,7 +11,7 @@ use crate::env;
 use crate::git::{self, Checkout};
 use crate::memory_cli::confirm;
 use crate::names;
-use crate::output::outln;
+use crate::output::{errln, outln};
 use crate::protocol::{ArchivedSession, Front, Request, Response, SessionInfo};
 use crate::shell;
 use anyhow::{Context, Result, bail};
@@ -279,7 +279,7 @@ pub fn kill(socket: &Path, name: &str, remove: Option<bool>) -> Result<()> {
     if !at_a_terminal() {
         for worktree in &plan.ask {
             let path = shell::quote(&worktree.path.to_string_lossy());
-            eprintln!(
+            errln!(
                 "nothing else is in worktree {}: `crystal worktree rm {path}` removes it",
                 worktree.name
             );
@@ -313,7 +313,7 @@ fn remove_emptied(socket: &Path, worktree: &Emptied, asked: bool) -> Result<()> 
             if asked && !at_a_terminal() {
                 bail!(stays);
             }
-            eprintln!("{stays}");
+            errln!("{stays}");
             return Ok(());
         }
     }

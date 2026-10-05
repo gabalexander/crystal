@@ -19,6 +19,7 @@ pub(crate) mod copy_mode;
 mod diff;
 mod diff_tree;
 mod diff_view;
+mod dropped_files;
 mod editing;
 mod finder;
 mod fuzzy;
@@ -45,6 +46,7 @@ pub(crate) mod preview;
 mod profiles;
 mod pull_requests;
 mod ram_view;
+mod recent;
 mod reply;
 mod restarted;
 mod review;
@@ -514,7 +516,11 @@ pub fn run(socket: &Path) -> Result<()> {
         fetched_remotes: HashMap::new(),
         fetching_remotes: HashSet::new(),
         warming: warm::Warming::default(),
+        drops: dropped_files::Drops::new(crate::state::attachments_dir(socket)),
     };
+    // The copies a week old go even if nothing is dropped again.
+    let drops = tui.drops.clone();
+    std::thread::spawn(move || drops.prune());
     tui.app.set_agents(catalog::installed());
     let server = socket::server_of(socket).filter(|server| server != socket::DEFAULT);
     tui.app.set_server(server);
@@ -787,6 +793,9 @@ struct Tui {
     /// Asking the daemon to keep an agent warm where the selection is,
     /// while `[sessions] warm_agent` is on.
     warming: warm::Warming,
+    /// Where a file dropped on a task or a reply that would go away is
+    /// copied before its agent reads it.
+    drops: dropped_files::Drops,
 }
 
 impl Tui {
@@ -807,6 +816,7 @@ impl Tui {
         self.layout_told = self.app.look();
         self.layout_seen = self.layout_told.clone();
         self.wake_landed();
+        self.app.note_selection(Instant::now());
         while !self.quitting {
             if changed {
                 self.draw(terminal)?;
@@ -828,6 +838,7 @@ impl Tui {
             self.count_worktrees();
             self.ask_modes_when_due();
             changed |= self.wake_landed();
+            self.app.note_selection(Instant::now());
             self.keep_warm();
         }
         self.keep_seen();
@@ -1828,15 +1839,16 @@ impl Tui {
                 let Some((slot, cell)) = self.app.link_cell(hit) else {
                     return false;
                 };
+                let dirs = self.app.link_dirs(slot);
                 let link = self
                     .pane_in(slot)
-                    .and_then(|pane| pane.screen.link_at(cell));
+                    .and_then(|pane| pane.screen.link_at(cell))
+                    .filter(|link| links::can_open(&link.target, &dirs));
                 let Some(link) = link else {
                     return false;
                 };
                 self.link_clicked = true;
-                let context = self.app.link_context(slot);
-                if let Err(err) = self.open_link(link.url, context) {
+                if let Err(err) = self.open_target(slot, link.target) {
                     self.app.notify(format!("{err:#}"));
                 }
                 true
@@ -1844,6 +1856,33 @@ impl Tui {
             MouseEventKind::Up(MouseButton::Left) => std::mem::take(&mut self.link_clicked),
             _ => false,
         }
+    }
+
+    /// Opens `target`, a link the pane at `slot` shows: a URL as
+    /// [`Self::open_link`] does, and a file's path in the user's editor, at
+    /// its line, as the file finder's Enter does.
+    fn open_target(&mut self, slot: Slot, target: links::Target) -> Result<()> {
+        let (path, line) = match target {
+            links::Target::Url(url) => {
+                let context = self.app.link_context(slot);
+                return self.open_link(url, context);
+            }
+            links::Target::File { path, line } => (path, line),
+        };
+        let dirs = self.app.link_dirs(slot);
+        let Some(found) = links::find_file(&path, &dirs) else {
+            let place = dirs.first().map(|dir| shell::home_relative(dir));
+            bail!("there's no file {path} in {}", place.unwrap_or_default());
+        };
+        // The editor runs where the session does, the path as it's found
+        // from there.
+        let dir = (dirs.first().cloned())
+            .or_else(|| found.parent().map(Path::to_path_buf))
+            .unwrap_or_default();
+        let path = found.strip_prefix(&dir).unwrap_or(&found);
+        let path = path.display().to_string();
+        let action = self.app.edit(dir, path, line);
+        self.perform(action)
     }
 
     /// Opens `url`, a link a pane shows, about `context`: with the action
@@ -2053,6 +2092,19 @@ impl Tui {
                 if let Some(pane) = self.pane_in(to) {
                     pane.send_keys(&pasted(&text, pane.wants_paste_marked()));
                 }
+            }
+            Action::PasteForAgent(text) => {
+                let text = match self.drops.stage(&text) {
+                    Some(staged) => {
+                        if let Some((name, why)) = staged.failed.first() {
+                            self.app
+                                .notify(format!("couldn't keep a copy of {name}: {why}"));
+                        }
+                        staged.text
+                    }
+                    None => text,
+                };
+                self.app.paste_staged(&text);
             }
             Action::ReadCodexModels => {
                 self.read_in_background(|| Event::CodexModels(read_codex_models()));
@@ -2543,10 +2595,9 @@ impl Tui {
                         self.app.stop_copying();
                         self.copy_to_clipboard(&text)?;
                     }
-                    copy_mode::Outcome::Open(url) => {
+                    copy_mode::Outcome::Open(target) => {
                         self.app.stop_copying();
-                        let context = self.app.link_context(slot);
-                        self.open_link(url, context)?;
+                        self.open_target(slot, target)?;
                     }
                 }
             }

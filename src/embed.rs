@@ -19,6 +19,7 @@
 //! Both models are licensed CC BY-NC 4.0: for use that isn't commercial.
 
 use crate::config::{Config, MemorySettings};
+use crate::output::errln;
 use crate::qwen3::{self, Qwen3};
 use crate::rerank::Reranker;
 use anyhow::{Context, Result, anyhow, bail};
@@ -208,7 +209,7 @@ fn device() -> (Device, DType) {
     if std::env::var_os("CRYSTAL_MODELS_ON_CPU").is_none() {
         match Device::new_metal(0) {
             Ok(device) => return (device, DType::BF16),
-            Err(err) => eprintln!("crystal: no GPU for memory's models, so the CPU: {err}"),
+            Err(err) => errln!("crystal: no GPU for memory's models, so the CPU: {err}"),
         }
     }
     (Device::Cpu, DType::F32)
@@ -425,7 +426,7 @@ pub fn shared(settings: &MemorySettings) -> Option<Arc<Models>> {
             Some(models)
         }
         Err(err) => {
-            eprintln!("crystal: couldn't load memory's models: {err:#}");
+            errln!("crystal: couldn't load memory's models: {err:#}");
             None
         }
     }
@@ -778,7 +779,7 @@ mod tests {
             };
             assert_eq!(best(&scores), want, "{query}: {scores:?}");
             let reranked = models.rerank(query, &passages).unwrap().unwrap();
-            eprintln!("{query}: {scores:?} {reranked:?}");
+            errln!("{query}: {scores:?} {reranked:?}");
             if answers {
                 assert_eq!(best(&reranked), want, "{query}: {reranked:?}");
                 assert!(reranked[want] >= ANSWERS_FROM, "{query}: {reranked:?}");

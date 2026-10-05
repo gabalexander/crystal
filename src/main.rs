@@ -98,7 +98,7 @@ mod worktree_hooks;
 use anyhow::{Result, bail};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use client::Restart;
-use output::{out, outln};
+use output::{errln, out, outln};
 use profile::{Launch, Profile, StartIn};
 use protocol::{ArchivedSession, NotifySound, Request, Response, SessionInfo, TaskSpec, TaskState};
 use std::collections::BTreeMap;
@@ -1287,8 +1287,8 @@ enum MemoryCommand {
         #[command(flatten)]
         entry: EntryArgs,
     },
-    /// Every entry, newest first, drifting and stale ones marked: what
-    /// `crystal memory` with no command does.
+    /// Every entry, newest first, drifting, stale and expired ones marked:
+    /// what `crystal memory` with no command does.
     #[command(visible_alias = "ls")]
     List {
         /// Only the entries of this kind.
@@ -1297,11 +1297,25 @@ enum MemoryCommand {
 
         /// The entries forgotten instead, the latest first: the distiller
         /// never adds one back, but remembering it again does.
-        #[arg(long, visible_alias = "wrong")]
+        #[arg(long, visible_alias = "wrong", conflicts_with_all = ["status", "expired"])]
         forgotten: bool,
+
+        /// Only the entries that read as progress or status rather than
+        /// lessons (merged, pushed, installed, CI passed, a commit's hash, a
+        /// backlog item tracking it), to look through before `rm --status`
+        /// forgets them. Tasks' outcomes are left out: `-k outcome` lists
+        /// those.
+        #[arg(long)]
+        status: bool,
+
+        /// Only the expired: notes and outcomes nobody found again, which
+        /// searches and agents starting leave out.
+        #[arg(long)]
+        expired: bool,
     },
     /// The entries that have to do with these words, the best first, those
-    /// that still hold before the stale, which are marked.
+    /// that still hold before the stale, which are marked, and those expired
+    /// left out.
     Search {
         #[arg(required = true)]
         words: Vec<String>,
@@ -1320,9 +1334,9 @@ enum MemoryCommand {
         #[arg(long)]
         fresh: bool,
 
-        /// What a search gives already, the stale too: kept so that what
-        /// passed it before still runs.
-        #[arg(short, long, hide = true)]
+        /// The expired too, marked: notes and outcomes nobody has found
+        /// again in a while.
+        #[arg(short, long)]
         all: bool,
 
         /// The most entries to print [default: 50]
@@ -1334,9 +1348,28 @@ enum MemoryCommand {
     Show { id: u64 },
     /// Print every entry as markdown, newest first.
     Export,
-    /// Forget an entry, by its id.
+    /// Forget entries, by their ids; or with --status, every entry `list
+    /// --status` lists, once --yes says so.
     #[command(visible_alias = "remove")]
-    Rm { id: u64 },
+    Rm {
+        /// The entries, by their ids.
+        #[arg(required_unless_present = "status", conflicts_with = "status")]
+        ids: Vec<u64>,
+
+        /// Every entry that reads as progress or status, as `list --status`
+        /// lists them: only listed, as what would be forgotten, without
+        /// --yes.
+        #[arg(long)]
+        status: bool,
+
+        /// With --status, only the entries of this kind.
+        #[arg(short, long, value_enum, requires = "status")]
+        kind: Option<memory::Kind>,
+
+        /// With --status, forget them.
+        #[arg(long, requires = "status")]
+        yes: bool,
+    },
     /// Write an entry into the project's CLAUDE.md, or its AGENTS.md, under
     /// a "Notes" heading, for every session to read.
     Promote {
@@ -2638,30 +2671,55 @@ fn run(cli: Cli) -> Result<()> {
         },
         Command::Remember { entry, dir } => remember(&socket, dir, entry)?,
         Command::Memory { dir, command } => match command {
-            None => memory_cli::list(&socket, dir, None, false)?,
+            None => memory_cli::list(&socket, dir, memory_cli::Listing::default())?,
             Some(MemoryCommand::Add { entry }) => remember(&socket, dir, entry)?,
-            Some(MemoryCommand::List { kind, forgotten }) => {
-                memory_cli::list(&socket, dir, kind, forgotten)?;
+            Some(MemoryCommand::List {
+                kind,
+                forgotten,
+                status,
+                expired,
+            }) => {
+                let listing = memory_cli::Listing {
+                    kind,
+                    forgotten,
+                    status,
+                    expired,
+                };
+                memory_cli::list(&socket, dir, listing)?;
             }
             Some(MemoryCommand::Search {
                 words,
                 kind,
                 files,
                 fresh,
-                all: _,
+                all,
                 limit,
             }) => {
                 let args = memory_cli::SearchArgs {
                     kind,
                     files,
                     fresh,
+                    all,
                     limit,
                 };
                 memory_cli::search(&socket, dir, &words, args)?;
             }
             Some(MemoryCommand::Show { id }) => memory_cli::show(&socket, dir, id)?,
             Some(MemoryCommand::Export) => memory_cli::export(&socket, dir)?,
-            Some(MemoryCommand::Rm { id }) => memory_cli::remove(&socket, dir, id)?,
+            Some(MemoryCommand::Rm {
+                ids,
+                status,
+                kind,
+                yes,
+            }) => {
+                let forgetting = memory_cli::Forgetting {
+                    ids,
+                    status,
+                    kind,
+                    yes,
+                };
+                memory_cli::remove(&socket, dir, forgetting)?;
+            }
             Some(MemoryCommand::Distill { name }) => memory_cli::distill(&socket, &name)?,
             Some(MemoryCommand::Embed) => memory_cli::embed(&socket)?,
             Some(MemoryCommand::Promote { id, yes }) => {
@@ -3558,7 +3616,7 @@ fn print_sessions(sessions: &[SessionInfo]) -> Result<()> {
     // standard error it's out of the way of a script reading the rows.
     for session in sessions {
         if let protocol::State::Failed { why } = &session.state {
-            eprintln!("{} couldn't start again: {why}", session.name);
+            errln!("{} couldn't start again: {why}", session.name);
         }
     }
     Ok(())

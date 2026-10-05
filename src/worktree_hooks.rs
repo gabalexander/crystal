@@ -31,6 +31,7 @@ use crate::event_log::Bus;
 use crate::events::{Event, Filter, Kind, WorktreeAbout};
 use crate::git;
 use crate::handover::{self, HELPERS};
+use crate::output::errln;
 use crate::session;
 use crate::state;
 use anyhow::{Context, Result, bail};
@@ -88,13 +89,13 @@ pub fn follow(bus: &Arc<Bus>, socket: &Path) {
                 if let Err(err) = hook.run(&socket, TIMEOUT) {
                     let why = format!("{err:#}");
                     log(&socket, &why);
-                    eprintln!("crystal daemon: {why}");
+                    errln!("crystal daemon: {why}");
                     if let Some(bus) = bus.upgrade() {
                         bus.emit(Event::worktree_hook_failed(&hook.worktree, &why));
                     }
                 }
             }
-            eprintln!("crystal daemon: the worktree hooks fell behind, and missed worktrees");
+            errln!("crystal daemon: the worktree hooks fell behind, and missed worktrees");
         }
     });
 }

@@ -20,7 +20,14 @@
 //! history (`crystal tasks`). The outcome entries an earlier crystal kept
 //! for each one are still found by a search, but not shown at launch: true
 //! only when they were written, and one for each `crystal done`, they
-//! crowded out what still holds.
+//! crowded out what still holds. Each keeps its task's goal in a sentence
+//! and what `crystal done` said, not the whole brief the task was given.
+//!
+//! Lessons (decisions, gotchas and commands) rank above notes and
+//! outcomes, in a search and at launch, unless what's asked is about what
+//! was done. A note or an outcome nobody finds again, by saying it again
+//! or by an agent reading it in full, expires after a while: searches and
+//! agents starting leave it out, and the list marks it.
 //!
 //! Whether an entry still holds goes by what it names: the identifiers,
 //! paths, commands and flags in its text (`local_origin`,
@@ -41,10 +48,12 @@
 use crate::config::Config;
 use crate::embed::Embed;
 use crate::git::Checkout;
+use crate::output::errln;
 use crate::printable;
 use crate::secrets;
 use crate::state;
 use anyhow::{Context, Result, bail};
+use regex::RegexSet;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -52,6 +61,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// How many entries a session is shown when it starts. A few that matter
@@ -189,6 +199,36 @@ const FUSION_K: f32 = 60.0;
 /// have no vector yet.
 const EMBED_BATCH: usize = 32;
 
+/// How many places lower a note or a task's outcome ranks than what it
+/// says would put it, below the lessons near it: what was learned before
+/// what was done, but a note that answers well still ahead of a lesson
+/// that hardly does. Asked 97 questions about crystal's own memory, 3 put
+/// the lessons that answer as high as more places did, and left the notes
+/// that answer the most room.
+const NOTES_BEHIND: usize = 3;
+
+/// Words that ask about what was done rather than what was learned: a
+/// search with one of them ranks notes and outcomes where they fall.
+const WHAT_WAS_DONE: &[&str] = &[
+    "already",
+    "did",
+    "done",
+    "finished",
+    "happened",
+    "history",
+    "merged",
+    "outcome",
+    "outcomes",
+    "previously",
+    "progress",
+    "shipped",
+    "status",
+];
+
+/// The longest a task's goal stays in its outcome entry, in characters: a
+/// title's line.
+const OUTCOME_GOAL: usize = MAX_TITLE;
+
 /// The database's tables as they were first. `n` is the entry's
 /// rowid, which the full-text index is kept by; `id` is the number people
 /// see, counting up in each project from its `next_id`, and never used
@@ -293,6 +333,12 @@ ALTER TABLE forgotten ADD COLUMN source TEXT;
 ALTER TABLE forgotten ADD COLUMN forgot INTEGER;
 ";
 
+/// When an agent last read each entry in full, which finds it again, so
+/// it doesn't expire: see [`Store::used`].
+const USED: &str = "
+ALTER TABLE entries ADD COLUMN used INTEGER;
+";
+
 /// What makes the database as it is now, a step for each version: a
 /// database at version `v`, kept in its `user_version`, takes the steps
 /// after the first `v`.
@@ -302,12 +348,14 @@ const MIGRATIONS: &[fn(&Connection) -> Result<()>] = &[
     add_anchors,
     |conn| Ok(conn.execute_batch(TOLD_STALE)?),
     |conn| Ok(conn.execute_batch(FORGOTTEN_ENTRIES)?),
+    shorten_outcomes,
+    |conn| Ok(conn.execute_batch(USED)?),
     add_names,
 ];
 
 /// The columns [`entry_of`] reads, in its order.
 const COLUMNS: &str = "e.id, e.kind, e.text, e.files, e.source, e.created, e.seen, e.last_seen, \
-                       e.anchors, e.checkout, e.names";
+                       e.anchors, e.checkout, e.used, e.names";
 
 /// Whether memory is on, the `memory` plugin: the one gate for everything
 /// it adds, from the launch paragraph to the TUI's view and the commands.
@@ -354,6 +402,25 @@ impl Kind {
     pub fn parse(name: &str) -> Option<Kind> {
         Kind::ALL.into_iter().find(|kind| kind.to_string() == name)
     }
+
+    /// Whether it's a lesson, something learned that holds: a decision, a
+    /// gotcha or a command. They rank above notes and outcomes, and never
+    /// expire.
+    pub fn is_lesson(self) -> bool {
+        matches!(self, Kind::Decision | Kind::Gotcha | Kind::Command)
+    }
+
+    /// How long an entry of this kind lasts once nobody finds it again: a
+    /// month for a note, two weeks for a task's outcome, and a lesson for
+    /// good.
+    pub fn expires_after(self) -> Option<Duration> {
+        const DAY: u64 = 24 * 60 * 60;
+        match self {
+            Kind::Note => Some(Duration::from_secs(30 * DAY)),
+            Kind::Outcome => Some(Duration::from_secs(14 * DAY)),
+            Kind::Decision | Kind::Gotcha | Kind::Command => None,
+        }
+    }
 }
 
 impl fmt::Display for Kind {
@@ -380,17 +447,20 @@ enum Kinds {
 }
 
 /// The entries a search looks among: those of `kinds`, and with `files`,
-/// only those about one of them or about a file under one of them.
+/// only those about one of them or about a file under one of them; the
+/// expired too only with `expired`.
 #[derive(Debug, Clone, Copy)]
 struct Among<'a> {
     kinds: Kinds,
     files: &'a [String],
+    expired: bool,
 }
 
 impl Among<'_> {
-    /// The kind it keeps to, the kind it leaves out and the files it keeps
-    /// to, as JSON, as the SQL's parameters, `NULL` for none.
-    fn params(self) -> (Option<String>, Option<String>, Option<String>) {
+    /// The kind it keeps to, the kind it leaves out, the files it keeps
+    /// to, as JSON, and the time the expired are told by, as the SQL's
+    /// parameters, `NULL` for none.
+    fn params(self) -> (Option<String>, Option<String>, Option<String>, Option<u64>) {
         let (only, but) = match self.kinds {
             Kinds::All => (None, None),
             Kinds::Only(kind) => (Some(kind.to_string()), None),
@@ -398,7 +468,8 @@ impl Among<'_> {
         };
         let files = (!self.files.is_empty())
             .then(|| serde_json::to_string(self.files).expect("a list of strings is JSON"));
-        (only, but, files)
+        let now = (!self.expired).then(|| seconds_since_epoch(SystemTime::now()));
+        (only, but, files, now)
     }
 }
 
@@ -409,6 +480,22 @@ fn about_files_sql(at: usize) -> String {
     format!(
         "(?{at} IS NULL OR EXISTS (SELECT 1 FROM json_each(e.files) f, json_each(?{at}) w \
          WHERE f.value = w.value OR substr(f.value, 1, length(w.value) + 1) = w.value || '/'))"
+    )
+}
+
+/// The SQL that leaves out the entries expired at the time in parameter
+/// `at`, as [`Entry::expired`] tells them: none while it's `NULL`.
+fn unexpired_sql(at: usize) -> String {
+    let ages: String = Kind::ALL
+        .iter()
+        .filter_map(|kind| {
+            let age = kind.expires_after()?.as_secs();
+            Some(format!(" WHEN '{kind}' THEN {age}"))
+        })
+        .collect();
+    format!(
+        "(?{at} IS NULL OR e.seen > 1 OR e.used IS NOT NULL \
+         OR coalesce(max(e.created, e.last_seen) + CASE e.kind{ages} END > ?{at}, 1))"
     )
 }
 
@@ -480,6 +567,23 @@ pub struct Entry {
     /// they're still there.
     #[serde(default)]
     pub names: Vec<String>,
+    /// When an agent last read it in full, in seconds since the Unix epoch.
+    #[serde(default)]
+    pub used: Option<u64>,
+}
+
+impl Entry {
+    /// Whether it's expired at `now`: a note or a task's outcome that
+    /// nobody has found again, said again or read in full by an agent,
+    /// since it was said, longer ago than its kind lasts. Searches and
+    /// agents starting leave it out; it's kept, and the list marks it.
+    pub fn expired(&self, now: u64) -> bool {
+        let Some(age) = self.kind.expires_after() else {
+            return false;
+        };
+        let said = self.created.max(self.last_seen);
+        self.seen <= 1 && self.used.is_none() && now >= said.saturating_add(age.as_secs())
+    }
 }
 
 fn once() -> u32 {
@@ -531,16 +635,21 @@ pub struct Wanted {
     pub files: Vec<String>,
     /// Leave the stale out, rather than give them after the rest.
     pub fresh: bool,
+    /// The expired too, which are left out otherwise.
+    #[serde(default)]
+    pub expired: bool,
     pub limit: usize,
 }
 
 impl Wanted {
-    /// The `limit` best of every kind, about any file, stale or not.
+    /// The `limit` best of every kind, about any file, stale or not, but
+    /// none expired.
     pub fn best(limit: usize) -> Wanted {
         Wanted {
             kind: None,
             files: Vec::new(),
             fresh: false,
+            expired: false,
             limit,
         }
     }
@@ -674,6 +783,7 @@ impl Store {
             seen: 1,
             last_seen: now,
             checkout: new.checkout,
+            used: None,
         };
         insert(&tx, &name, &entry)?;
         tx.commit()?;
@@ -838,6 +948,17 @@ impl Store {
         get(&self.conn, &name, id)
     }
 
+    /// Entry `id` of `project`, read in full by an agent, which notes that
+    /// it was: found again, it doesn't expire.
+    pub fn used(&mut self, project: &Path, id: u64) -> Result<Option<Entry>> {
+        let name = self.ready(project)?;
+        self.conn.execute(
+            "UPDATE entries SET used = ?3 WHERE project = ?1 AND id = ?2",
+            params![name, id, seconds_since_epoch(SystemTime::now())],
+        )?;
+        get(&self.conn, &name, id)
+    }
+
     /// Every project's entries that are anchored to names or files, each
     /// with its project's main worktree and whether the daemon has told of
     /// it going stale: those that can go stale.
@@ -847,8 +968,12 @@ impl Store {
              WHERE e.anchors != '{{}}' OR e.names != '[]' ORDER BY e.project, e.id"
         ))?;
         let anchored = query.query_map([], |row| {
-            let project: String = row.get(11)?;
-            Ok((PathBuf::from(project), entry_of(row)?, row.get(12)?))
+            let project: String = row.get("project")?;
+            Ok((
+                PathBuf::from(project),
+                entry_of(row)?,
+                row.get("told_stale")?,
+            ))
         })?;
         Ok(anchored.collect::<rusqlite::Result<_>>()?)
     }
@@ -911,6 +1036,8 @@ impl Store {
     /// merged; then, with its reranker, the best are read again with `text`,
     /// those that don't answer it are left out, and its ranking is merged
     /// in too. A text with no words gives the entries said most recently.
+    /// Either way, lessons come before notes and outcomes near them, unless
+    /// `text` asks about what was done, and the expired are left out.
     pub fn search(
         &mut self,
         project: &Path,
@@ -924,7 +1051,8 @@ impl Store {
 
     /// The entries of `project` that have to do with `text`, as `wanted`
     /// says, each with whether it still holds: the best that
-    /// [`Store::search_about`] finds, those that hold first, as they rank,
+    /// [`Store::search_about`] finds, the expired too if it says so, those
+    /// that hold first, as they rank, lessons before the notes near them and
     /// the drifting marked, then the stale, marked; or with `fresh`, the
     /// stale left out.
     pub fn find(
@@ -934,24 +1062,31 @@ impl Store {
         wanted: &Wanted,
         embedder: Option<&dyn Embed>,
     ) -> Result<Vec<Listed>> {
-        // The stale left out leave room for as many after them.
+        // The stale left out leave room for as many after them, and the
+        // notes put after lessons for the lessons below the limit.
         let limit = if wanted.fresh {
             wanted.limit.max(SEARCH_LIMIT)
         } else {
             wanted.limit
-        };
+        } + NOTES_BEHIND;
         let files: Vec<String> = wanted
             .files
             .iter()
             .map(|file| file.trim_end_matches('/').to_string())
             .filter(|file| !file.is_empty() && file != ".")
             .collect();
-        let found = self.search_about(project, text, wanted.kind, &files, limit, embedder)?;
-        let (mut found, stale): (Vec<Listed>, Vec<Listed>) = marked(found, project)
+        let among = Among {
+            kinds: wanted.kind.map_or(Kinds::All, Kinds::Only),
+            files: &files,
+            expired: wanted.expired,
+        };
+        let found = self.search_among(project, text, among, limit, embedder)?;
+        let (found, stale): (Vec<Listed>, Vec<Listed>) = marked(found, project)
             .into_iter()
             .partition(|item| item.freshness != Freshness::Stale);
+        let mut found = lessons_first(found, text, |item| item.entry.kind);
         if !wanted.fresh {
-            found.extend(stale);
+            found.extend(lessons_first(stale, text, |item| item.entry.kind));
         }
         found.truncate(wanted.limit);
         Ok(found)
@@ -969,13 +1104,24 @@ impl Store {
         limit: usize,
         embedder: Option<&dyn Embed>,
     ) -> Result<Vec<Entry>> {
-        let kinds = kind.map_or(Kinds::All, Kinds::Only);
-        self.search_among(project, text, Among { kinds, files }, limit, embedder)
+        let among = Among {
+            kinds: kind.map_or(Kinds::All, Kinds::Only),
+            files,
+            expired: false,
+        };
+        // Deeper than the limit, so that lessons below it can come up past
+        // the notes ahead of them.
+        let deeper = limit + NOTES_BEHIND;
+        let found = self.search_among(project, text, among, deeper, embedder)?;
+        let mut found = lessons_first(found, text, |entry| entry.kind);
+        found.truncate(limit);
+        Ok(found)
     }
 
     /// [`Store::search`], among the entries `among` keeps to alone, so that
     /// those left out take no place in either ranking, nor among those the
-    /// reranker reads.
+    /// reranker reads; ranked as they are found, before lessons are put
+    /// first.
     fn search_among(
         &mut self,
         project: &Path,
@@ -1003,7 +1149,7 @@ impl Store {
             )),
             // The model failing leaves the search to the words.
             Err(err) => {
-                eprintln!("crystal: couldn't search by meaning: {err:#}");
+                errln!("crystal: couldn't search by meaning: {err:#}");
                 by_words.truncate(limit);
                 Ok(by_words)
             }
@@ -1019,14 +1165,19 @@ impl Store {
         among: Among,
         limit: usize,
     ) -> Result<Vec<Entry>> {
-        let (only, but, files) = among.params();
+        let (only, but, files, now) = among.params();
         let mut found = self.conn.prepare(&format!(
             "SELECT {COLUMNS} FROM entries_fts JOIN entries e ON e.n = entries_fts.rowid \
              WHERE entries_fts MATCH ?2 AND e.project = ?1 AND (?3 IS NULL OR e.kind = ?3) \
-             AND e.kind IS NOT ?5 AND {} ORDER BY {RANK}, e.last_seen DESC, e.id DESC LIMIT ?4",
-            about_files_sql(6)
+             AND e.kind IS NOT ?5 AND {} AND {} \
+             ORDER BY {RANK}, e.last_seen DESC, e.id DESC LIMIT ?4",
+            about_files_sql(6),
+            unexpired_sql(7)
         ))?;
-        let found = found.query_map(params![project, query, only, limit, but, files], entry_of)?;
+        let found = found.query_map(
+            params![project, query, only, limit, but, files, now],
+            entry_of,
+        )?;
         Ok(found.collect::<rusqlite::Result<_>>()?)
     }
 
@@ -1044,15 +1195,16 @@ impl Store {
         self.embed_missing_in(Some(project), embedder)?;
         let asked = embedder.embed_query(text)?;
         let asked = &asked;
-        let (only, but, files) = among.params();
+        let (only, but, files, now) = among.params();
         let mut rows = self.conn.prepare(&format!(
             "SELECT {COLUMNS}, v.vector FROM entries e JOIN vectors v ON v.n = e.n \
              WHERE e.project = ?1 AND v.model = ?2 AND (?3 IS NULL OR e.kind = ?3) \
-             AND e.kind IS NOT ?4 AND {}",
-            about_files_sql(5)
+             AND e.kind IS NOT ?4 AND {} AND {}",
+            about_files_sql(5),
+            unexpired_sql(6)
         ))?;
         let model = embedder.model();
-        let rows = rows.query_map(params![project, model, only, but, files], |row| {
+        let rows = rows.query_map(params![project, model, only, but, files, now], |row| {
             Ok((entry_of(row)?, row.get::<_, Vec<u8>>("vector")?))
         })?;
         let mut alike = Vec::new();
@@ -1077,14 +1229,15 @@ impl Store {
     /// The entries of the project called `project` that `among` keeps to,
     /// said most recently first.
     fn newest(&self, project: &str, among: Among, limit: usize) -> Result<Vec<Entry>> {
-        let (only, but, files) = among.params();
+        let (only, but, files, now) = among.params();
         let mut newest = self.conn.prepare(&format!(
             "SELECT {COLUMNS} FROM entries e WHERE e.project = ?1 \
-             AND (?2 IS NULL OR e.kind = ?2) AND e.kind IS NOT ?4 AND {} \
+             AND (?2 IS NULL OR e.kind = ?2) AND e.kind IS NOT ?4 AND {} AND {} \
              ORDER BY e.last_seen DESC, e.id DESC LIMIT ?3",
-            about_files_sql(5)
+            about_files_sql(5),
+            unexpired_sql(6)
         ))?;
-        let newest = newest.query_map(params![project, only, limit, but, files], entry_of)?;
+        let newest = newest.query_map(params![project, only, limit, but, files, now], entry_of)?;
         Ok(newest.collect::<rusqlite::Result<_>>()?)
     }
 
@@ -1283,6 +1436,122 @@ fn add_names(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Shortens each task's outcome entry an earlier crystal kept to its goal
+/// in a sentence and what `crystal done` said, as [`short_outcome`] does:
+/// each kept the whole brief its task was given, pages of it at times. The
+/// brief is still in the task's record, in its project's history.
+fn shorten_outcomes(conn: &Connection) -> Result<()> {
+    let outcomes: Vec<(i64, String)> = {
+        let mut outcomes = conn.prepare("SELECT n, text FROM entries WHERE kind = ?1")?;
+        let outcomes = outcomes.query_map(params![Kind::Outcome.to_string()], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?;
+        outcomes.collect::<rusqlite::Result<_>>()?
+    };
+    for (n, text) in outcomes {
+        if let Some(short) = short_outcome(&text) {
+            conn.execute(
+                "UPDATE entries SET text = ?2, key = ?3 WHERE n = ?1",
+                params![n, short, key_of(&short)],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// An outcome entry as an earlier crystal kept it, `<goal>: <summary>` or
+/// `<goal> (failed): <summary>`, with its goal cut to its first sentence:
+/// `None` when that leaves it no shorter. What `crystal done` said is its
+/// last line, and the goal everything before it.
+fn short_outcome(text: &str) -> Option<String> {
+    const FAILED: &str = " (failed): ";
+    let text = text.trim_end();
+    let last = text.rfind('\n').map_or(0, |at| at + 1);
+    let line = &text[last..];
+    let (goal_ends, how, said) = match line.find(FAILED) {
+        Some(at) => (at, " (failed)", &line[at + FAILED.len()..]),
+        None => {
+            let at = goal_end(line)?;
+            (at, "", &line[at + 2..])
+        }
+    };
+    let goal = goal_sentence(&text[..last + goal_ends]);
+    if goal.is_empty() || said.trim().is_empty() {
+        return None;
+    }
+    let short = format!("{goal}{how}: {}", said.trim());
+    (short.len() < text.len()).then_some(short)
+}
+
+/// Where, in the last line of an outcome entry, its goal ends and what
+/// `crystal done` said begins: at the first `: ` that follows the end of a
+/// sentence and comes before what could start one, or else at the first,
+/// which may keep some of the goal but never loses any of what was said.
+fn goal_end(line: &str) -> Option<usize> {
+    let colons: Vec<usize> = line.match_indices(": ").map(|(at, _)| at).collect();
+    let after_a_sentence = colons.iter().copied().find(|&at| {
+        let before = line[..at].chars().next_back();
+        let after = line[at + 2..].chars().next();
+        before.is_some_and(|c| ".?!)`\"'".contains(c)) && after.is_some_and(|c| !c.is_lowercase())
+    });
+    after_a_sentence.or(colons.first().copied())
+}
+
+/// A task's goal as its outcome keeps it: its first line that says
+/// something, without a heading's or a list item's marks, to the end of
+/// its first sentence, its last full stop left off, and at most
+/// [`OUTCOME_GOAL`] characters, cut after a word.
+fn goal_sentence(goal: &str) -> String {
+    let line = goal
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default();
+    let line = line.trim_start_matches('#').trim_start();
+    let line = ["- ", "* "]
+        .iter()
+        .find_map(|mark| line.strip_prefix(mark))
+        .unwrap_or(line);
+    let sentence = &line[..sentence_end(line).unwrap_or(line.len())];
+    let sentence = one_line(sentence.strip_suffix('.').unwrap_or(sentence));
+    if sentence.chars().count() <= OUTCOME_GOAL {
+        return sentence;
+    }
+    let mut cut: String = sentence.chars().take(OUTCOME_GOAL).collect();
+    if let Some(space) = cut.rfind(' ') {
+        cut.truncate(space);
+    }
+    cut.push('…');
+    cut
+}
+
+/// Where the first sentence of `line` ends, just after its `.`, `?` or `!`
+/// with a space or nothing after it: not a number's full stop (`1. `), nor
+/// that of a letter alone (`e.g. `).
+fn sentence_end(line: &str) -> Option<usize> {
+    let chars: Vec<(usize, char)> = line.char_indices().collect();
+    chars.iter().enumerate().find_map(|(i, &(at, c))| {
+        if !matches!(c, '.' | '?' | '!') {
+            return None;
+        }
+        if chars
+            .get(i + 1)
+            .is_some_and(|(_, next)| !next.is_whitespace())
+        {
+            return None;
+        }
+        if c == '.' {
+            let before = &chars[..i];
+            let letters = before.iter().rev().take_while(|(_, c)| c.is_alphabetic());
+            let closing = before.last().is_some_and(|(_, c)| ")`\"'".contains(*c));
+            if letters.count() < 2 && !closing {
+                return None;
+            }
+        }
+        Some(at + c.len_utf8())
+    })
+}
+
 fn get(conn: &Connection, project: &str, id: u64) -> Result<Option<Entry>> {
     Ok(conn
         .query_row(
@@ -1332,7 +1601,7 @@ fn entry_of(row: &rusqlite::Row) -> rusqlite::Result<Entry> {
     let source: String = row.get(4)?;
     let anchors: String = row.get(8)?;
     let checkout: Option<String> = row.get(9)?;
-    let names: String = row.get(10)?;
+    let names: String = row.get(11)?;
     Ok(Entry {
         id: row.get(0)?,
         kind: Kind::parse(&kind).unwrap_or(Kind::Note),
@@ -1344,6 +1613,7 @@ fn entry_of(row: &rusqlite::Row) -> rusqlite::Result<Entry> {
         last_seen: row.get(7)?,
         anchors: serde_json::from_str(&anchors).unwrap_or_default(),
         checkout: checkout.map(PathBuf::from),
+        used: row.get(10)?,
         names: serde_json::from_str(&names).unwrap_or_default(),
     })
 }
@@ -1387,7 +1657,7 @@ fn reranked(mut found: Vec<Entry>, text: &str, embedder: &dyn Embed, limit: usiz
     let scores = match embedder.rerank(text, &passages) {
         Ok(Some(scores)) if scores.len() == read.len() => scores,
         Ok(Some(_)) => {
-            eprintln!("crystal: the reranker didn't score every entry");
+            errln!("crystal: the reranker didn't score every entry");
             found.truncate(limit);
             return found;
         }
@@ -1396,7 +1666,7 @@ fn reranked(mut found: Vec<Entry>, text: &str, embedder: &dyn Embed, limit: usiz
             return found;
         }
         Err(err) => {
-            eprintln!("crystal: couldn't rerank: {err:#}");
+            errln!("crystal: couldn't rerank: {err:#}");
             found.truncate(limit);
             return found;
         }
@@ -1419,6 +1689,36 @@ fn reranked(mut found: Vec<Entry>, text: &str, embedder: &dyn Embed, limit: usiz
         .map(|(_, entry)| entry.clone())
         .collect();
     fused(&[first, second], limit)
+}
+
+/// `found`, the best first, with each note and task's outcome, by its
+/// `kind`, ranked [`NOTES_BEHIND`] places lower than it was, a lesson
+/// coming first where they meet: unless `asked` is about what was done, as
+/// it is. Put after what leaves entries out, so that it counts the places
+/// of those shown.
+fn lessons_first<T>(found: Vec<T>, asked: &str, kind: impl Fn(&T) -> Kind) -> Vec<T> {
+    if about_what_was_done(asked) {
+        return found;
+    }
+    let mut ranked: Vec<(usize, bool, T)> = found
+        .into_iter()
+        .enumerate()
+        .map(|(at, item)| {
+            let lesson = kind(&item).is_lesson();
+            let at = if lesson { at } else { at + NOTES_BEHIND };
+            (at, !lesson, item)
+        })
+        .collect();
+    ranked.sort_by_key(|(at, not_a_lesson, _)| (*at, *not_a_lesson));
+    ranked.into_iter().map(|(_, _, item)| item).collect()
+}
+
+/// Whether `asked` is about what was done, by one of its words: see
+/// [`WHAT_WAS_DONE`].
+fn about_what_was_done(asked: &str) -> bool {
+    asked
+        .split(|c: char| !c.is_alphanumeric())
+        .any(|word| WHAT_WAS_DONE.contains(&word.to_lowercase().as_str()))
 }
 
 fn dot(a: &[f32], b: &[f32]) -> f32 {
@@ -1642,11 +1942,13 @@ pub enum Reader {
 /// What a session is told of its project's memory as it starts: the
 /// entries about files its worktree has changed since its base, `changed`,
 /// then those with most to do with what it was asked, `asked`, or else the
-/// newest, and how to search and add to it. Stale entries and tasks'
-/// outcomes are left out, and the drifting are marked where they rank. A
-/// task in the background isn't told how to add, so it has nothing to be
-/// told when nothing is remembered. With an `embedder`, what has to do with
-/// what it was asked goes by meaning as well as by words.
+/// newest, and how to search and add to it. In each, lessons come before
+/// the notes near them, unless it was asked about what was done. Stale and
+/// expired entries and tasks' outcomes are left out, and the drifting are
+/// marked where they rank. A task in the background isn't told how to add,
+/// so it has nothing to be told when nothing is remembered. With an
+/// `embedder`, what has to do with what it was asked goes by meaning as
+/// well as by words.
 pub fn for_launch(
     socket: &Path,
     project: &Path,
@@ -1661,30 +1963,38 @@ pub fn for_launch(
     let lasting = Among {
         kinds: Kinds::Lasting,
         files: &[],
+        expired: false,
     };
     let found = store.search_among(project, asked, lasting, SEARCH_LIMIT, embedder)?;
-    let mut shown = launch_order(vec![about_changes, found], project, &mut code);
+    let mut shown = launch_order(vec![about_changes, found], asked, project, &mut code);
     if shown.is_empty() {
-        shown = launch_order(vec![store.entries(project)?], project, &mut code);
+        shown = launch_order(vec![store.entries(project)?], asked, project, &mut code);
     }
     Ok(launch_paragraph(&shown, reader))
 }
 
 /// The entries a session may be shown as it starts, from `parts`, the most
-/// relevant part first: each once, none that's stale or a task's outcome,
-/// and in each part in the order it ranked, the drifting marked where they
-/// rank.
-fn launch_order(parts: Vec<Vec<Entry>>, project: &Path, code: &mut Code) -> Vec<Listed> {
+/// relevant part first: each once, none that's stale, expired or a task's
+/// outcome, and in each part in the order it ranked, lessons put before the
+/// notes near them unless it was `asked` about what was done, the drifting
+/// marked where they rank.
+fn launch_order(
+    parts: Vec<Vec<Entry>>,
+    asked: &str,
+    project: &Path,
+    code: &mut Code,
+) -> Vec<Listed> {
+    let now = seconds_since_epoch(SystemTime::now());
     let mut shown: Vec<Listed> = Vec::new();
     for part in parts {
         let part: Vec<Listed> = part
             .into_iter()
-            .filter(|entry| entry.kind != Kind::Outcome)
+            .filter(|entry| entry.kind != Kind::Outcome && !entry.expired(now))
             .filter(|entry| !shown.iter().any(|item| item.entry.id == entry.id))
             .map(|entry| code.listed(entry, project))
             .filter(|item| item.freshness != Freshness::Stale)
             .collect();
-        shown.extend(part);
+        shown.extend(lessons_first(part, asked, |item| item.entry.kind));
     }
     shown
 }
@@ -1879,6 +2189,53 @@ pub fn titled(title: &str, text: &str) -> Result<String> {
     Ok(match text.trim() {
         "" => title,
         text => format!("{title}\n\n{text}"),
+    })
+}
+
+/// What says an entry is about progress or status rather than a lesson, by
+/// the distiller's rules ([`crate::distill::SYSTEM_PROMPT`]): what was
+/// merged, pushed, committed or installed, CI passing, a pull request
+/// opened, the backlog item that tracks something, or what holds only in
+/// this pull request or session. A commit's hash says so too, which
+/// [`has_commit_hash`] finds.
+const STATUS: &[&str] = &[
+    r"(?i)\bsquash-merged (?:into|as)\b",
+    r"(?i)\bmerged (?:in|into|to) (?:master|main)\b",
+    r"(?i)\bmerged (?:as|at) [0-9a-f]{7}",
+    r"(?i)\bmerged with CI\b",
+    r"(?i)\ball merged\b",
+    r"(?i)(?:#\d+|\bPRs?) (?:\S+ )?merged\b",
+    r"(?i)\bnot (?:yet )?(?:pushed|committed|installed|merged)\b",
+    r"(?i)\(uncommitted|\buncommitted\)",
+    r"(?i)\bcommitted (?:as )?[0-9a-f]{7}",
+    r"(?i)\brun `?make install`? to\b",
+    r"(?i)\bCI (?:is )?(?:green|passed)\b|\bgreen CI\b",
+    r"(?i)\bopened (?:a |the )?(?:stacked )?(?:draft )?PRs? #?\d",
+    r"(?i)\bbacklog #\d+(?:/#?\d+)? (?:tracks|waits)\b",
+    r"(?i)\b(?:tracked|saved|archived|deferred|left|noted|backlogged) (?:in|as|to|on) (?:the )?backlog\b",
+    r"(?i)\bbacklogged as #\d+",
+    r"(?i)\bin this (?:PR|session)\b",
+];
+
+/// Whether `text` reads as progress or status rather than a lesson, by
+/// [`STATUS`]: for `crystal memory list --status` to list, for the user to
+/// look through and forget. Never acted on by itself.
+pub fn reads_as_status(text: &str) -> bool {
+    static RULES: OnceLock<RegexSet> = OnceLock::new();
+    let rules = RULES.get_or_init(|| RegexSet::new(STATUS).expect("the status rules are regexes"));
+    rules.is_match(text) || has_commit_hash(text)
+}
+
+/// Whether `text` names a commit by its hash: a word of 7 to 12 hex
+/// digits, numbers and letters both, and not a piece of a path, a color or
+/// a longer name, which stay whole as words here.
+fn has_commit_hash(text: &str) -> bool {
+    let words = text.split(|c: char| !(c.is_alphanumeric() || "_/.#-".contains(c)));
+    words.map(|word| word.trim_end_matches('.')).any(|word| {
+        (7..=12).contains(&word.len())
+            && word.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f'))
+            && word.contains(|c: char| c.is_ascii_digit())
+            && word.contains(|c: char| c.is_ascii_alphabetic())
     })
 }
 
@@ -2469,6 +2826,7 @@ mod tests {
             last_seen: 1_000,
             anchors: BTreeMap::new(),
             checkout: None,
+            used: None,
             names: Vec::new(),
         }
     }
@@ -2734,7 +3092,10 @@ mod tests {
         let all = found(wanted(false, 10));
         assert_eq!(all.len(), 3);
         assert_eq!(all[2], (1, Freshness::Stale), "{all:?}");
-        assert_eq!(found(wanted(false, 1)), [(1, Freshness::Stale)], "the best");
+        // Among the few best, those that hold come first.
+        let best = found(wanted(false, 1));
+        assert_eq!(best.len(), 1);
+        assert_eq!(best[0].1, Freshness::Fresh, "{best:?}");
         let mut fresh = found(wanted(true, 10));
         fresh.sort();
         assert_eq!(fresh, [(2, Freshness::Fresh), (3, Freshness::Fresh)]);
@@ -4117,5 +4478,268 @@ mod tests {
             key_of("Fix the  flaky refund-test!"),
             "fix the flaky refund test"
         );
+    }
+
+    #[test]
+    fn an_outcome_keeps_its_goal_in_a_sentence_and_what_crystal_done_said() {
+        let short = |text: &str| short_outcome(text);
+        // A question, and an answer with a colon of its own.
+        assert_eq!(
+            short(
+                "do we have memory like docket? - Memory. Crystal has none.: Checked memory \
+                 against docket: no distiller yet"
+            )
+            .as_deref(),
+            Some("do we have memory like docket?: Checked memory against docket: no distiller yet")
+        );
+        // A brief of a page, under a heading.
+        let brief = "# Backlog #41: `/` search beyond sessions\n\nYou are one of six workers.\n\
+                     Keep to your item.: / finds projects too: https://example.com/pull/62";
+        assert_eq!(
+            short(brief).as_deref(),
+            Some(
+                "Backlog #41: `/` search beyond sessions: / finds projects too: \
+                 https://example.com/pull/62"
+            )
+        );
+        assert_eq!(
+            short("merge them. Both, in order. (failed): auto mode blocked the merge").as_deref(),
+            Some("merge them (failed): auto mode blocked the merge")
+        );
+        // Neither a list's number nor an abbreviation ends a sentence.
+        assert_eq!(
+            short(
+                "we need to handle this: 1. Claude asks first, e.g. for crystal done. Then \
+                 more.\n2. And this.: Allowed crystal's own commands"
+            )
+            .as_deref(),
+            Some(
+                "we need to handle this: 1. Claude asks first, e.g. for crystal done: Allowed \
+                 crystal's own commands"
+            )
+        );
+        // A long sentence is cut after a word.
+        let long = format!("{}: done it", "word ".repeat(40).trim());
+        let cut = short(&long).unwrap();
+        assert!(cut.ends_with("word…: done it"), "{cut}");
+        assert!(cut.chars().count() <= OUTCOME_GOAL + ": done it".len() + 1);
+        // No shorter, or nothing to tell the goal from: as it was.
+        assert_eq!(
+            short("Fix issue #17: Remind it (https://x/17): Stop hook reminds it"),
+            None
+        );
+        assert_eq!(short("fixed it"), None);
+    }
+
+    #[test]
+    fn a_database_from_before_shortens_its_outcomes_once() {
+        let (_dir, socket) = socket();
+        fs::create_dir_all(dir(&socket)).unwrap();
+        let conn = Connection::open(dir(&socket).join("memory.db")).unwrap();
+        for step in &MIGRATIONS[..5] {
+            step(&conn).unwrap();
+        }
+        conn.execute_batch("PRAGMA user_version = 5").unwrap();
+        conn.execute(
+            "INSERT INTO projects (path, next_id) VALUES (?1, 3)",
+            params![APP],
+        )
+        .unwrap();
+        let now = seconds_since_epoch(SystemTime::now());
+        let brief = "# Fix the ledger\n\nThe ledger drops a cent on refunds. Find out why.\n\
+                     Keep to it.: Fees are kept in cents now";
+        let note = "the ledger needs redis: start it first. Always.";
+        for (id, kind, text) in [(1, "outcome", brief), (2, "note", note)] {
+            conn.execute(
+                "INSERT INTO entries (project, id, kind, text, key, source, created, last_seen) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, '\"user\"', ?6, ?6)",
+                params![APP, id, kind, text, key_of(text), now],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        let mut store = Store::open(&socket).unwrap();
+        let project = Path::new(APP);
+        let text = |store: &mut Store, id| store.get(project, id).unwrap().unwrap().text;
+        assert_eq!(
+            text(&mut store, 1),
+            "Fix the ledger: Fees are kept in cents now"
+        );
+        assert_eq!(text(&mut store, 2), note, "only outcomes");
+        // The index follows: the brief's words are gone.
+        assert!(
+            store
+                .search(project, "refunds", None, 10, None)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            ids(&store.search(project, "cents", None, 10, None).unwrap()),
+            [1]
+        );
+        assert_eq!(store.used(project, 2).unwrap().unwrap().id, 2);
+    }
+
+    #[test]
+    fn lessons_rank_above_the_notes_near_them_unless_asked_what_was_done() {
+        let kinds = [
+            Kind::Note,
+            Kind::Outcome,
+            Kind::Gotcha,
+            Kind::Note,
+            Kind::Decision,
+            Kind::Command,
+            Kind::Command,
+            Kind::Command,
+            Kind::Gotcha,
+        ];
+        let found: Vec<Entry> = kinds
+            .iter()
+            .enumerate()
+            .map(|(at, kind)| entry(at as u64 + 1, *kind, "x"))
+            .collect();
+        // Each note three places lower, a lesson first where they meet.
+        assert_eq!(
+            ids(&lessons_first(found.clone(), "the ledger", |entry| entry.kind)),
+            [3, 1, 5, 2, 6, 7, 4, 8, 9]
+        );
+        assert_eq!(
+            ids(&lessons_first(
+                found,
+                "what did we do about the ledger?",
+                |entry| entry.kind
+            )),
+            [1, 2, 3, 4, 5, 6, 7, 8, 9]
+        );
+        assert!(about_what_was_done("Was the ledger fix MERGED?"));
+        assert!(!about_what_was_done("fix the flaky ledger test"));
+    }
+
+    #[test]
+    fn a_search_finds_lessons_before_the_notes_that_match_as_well() {
+        let (_dir, socket, mut store) = remembering(&[
+            (Kind::Note, "the ledger flakes on refunds"),
+            (Kind::Gotcha, "the ledger needs redis"),
+        ]);
+        let project = Path::new(APP);
+        let found =
+            |store: &mut Store, asked| ids(&store.search(project, asked, None, 10, None).unwrap());
+        assert_eq!(found(&mut store, "ledger flakes refunds"), [2, 1]);
+        assert_eq!(
+            found(&mut store, "what happened to the ledger refunds"),
+            [1, 2]
+        );
+        let paragraph = launch(&socket, project, "ledger refunds flakes", Reader::Claude)
+            .unwrap()
+            .unwrap();
+        let lines: Vec<&str> = paragraph.lines().collect();
+        assert_eq!(
+            lines[1..3],
+            [
+                "- 2 (gotcha) the ledger needs redis",
+                "- 1 (note) the ledger flakes on refunds"
+            ]
+        );
+    }
+
+    const DAY: u64 = 24 * 60 * 60;
+
+    #[test]
+    fn a_note_or_an_outcome_nobody_finds_again_expires_and_a_lesson_never_does() {
+        let now = 100 * DAY;
+        let said = |kind, days: u64| Entry {
+            created: now - days * DAY,
+            last_seen: now - days * DAY,
+            ..entry(1, kind, "x")
+        };
+        assert!(!said(Kind::Note, 29).expired(now));
+        assert!(said(Kind::Note, 30).expired(now));
+        assert!(!said(Kind::Outcome, 13).expired(now));
+        assert!(said(Kind::Outcome, 14).expired(now));
+        for kind in [Kind::Decision, Kind::Gotcha, Kind::Command] {
+            assert!(!said(kind, 99).expired(now), "{kind}");
+        }
+        // Found again: said again, or read in full by an agent.
+        let again = Entry {
+            seen: 2,
+            ..said(Kind::Note, 99)
+        };
+        assert!(!again.expired(now));
+        let used = Entry {
+            used: Some(now - 60 * DAY),
+            ..said(Kind::Note, 99)
+        };
+        assert!(!used.expired(now));
+    }
+
+    #[test]
+    fn the_expired_are_left_out_of_searches_and_launch_until_found_again() {
+        let (_dir, socket, mut store) = remembering(&[
+            (Kind::Note, "the ledger needs redis"),
+            (Kind::Gotcha, "the ledger tests are slow"),
+        ]);
+        let project = Path::new(APP);
+        store
+            .conn
+            .execute(
+                "UPDATE entries SET created = created - ?1, last_seen = last_seen - ?1",
+                params![40 * DAY],
+            )
+            .unwrap();
+        let found =
+            |store: &mut Store, asked| ids(&store.search(project, asked, None, 10, None).unwrap());
+        assert_eq!(found(&mut store, "ledger redis"), [2]);
+        assert_eq!(found(&mut store, ""), [2], "nor among the newest");
+        let all = Wanted {
+            expired: true,
+            ..Wanted::best(10)
+        };
+        let listed = store.find(project, "ledger redis", &all, None).unwrap();
+        let listed: Vec<u64> = listed.iter().map(|item| item.entry.id).collect();
+        assert_eq!(listed, [2, 1], "found when asked for");
+        let shown = |asked| {
+            launch(&socket, project, asked, Reader::Claude)
+                .unwrap()
+                .unwrap()
+        };
+        assert!(!shown("ledger redis").contains("redis"));
+        assert!(!shown("").contains("redis"));
+
+        // An agent reading it in full finds it again.
+        store.used(project, 1).unwrap();
+        assert_eq!(found(&mut store, "ledger redis"), [2, 1]);
+        assert!(shown("ledger redis").contains("1 (note) the ledger needs redis"));
+    }
+
+    #[test]
+    fn what_reads_as_status_is_told_by_its_words() {
+        for status in [
+            "Notifications PR #56 squash-merged into master as 8012b6c on 2026-10-04",
+            "PRs #99–#104 all merged at da801ed but crystal binary not yet installed; run `make \
+             install` to pick up all 13 items",
+            "Backlog #81 tracks showing removal progress when another client requests it",
+            "Flaky plugin test archived to backlog #135 during batch merge",
+            "Only Claude Code naming implemented in this PR; other agents need their own",
+            "The rebase onto master (dd40e97) had many overlapping conflicts",
+            "Added an effort row; tests and README updated (uncommitted)",
+            "All 14 items (PRs #81–#91) merged with CI green",
+            "Fixed between 1234567 and abc1234def",
+        ] {
+            assert!(reads_as_status(status), "{status}");
+        }
+        for lesson in [
+            "Merging a stack of squash-merged PRs here: after each squash, merge master into the \
+             next PR's branch",
+            "So no prefix, a 0.5 floor, and only matches near the best, merged with bm25 by RRF",
+            "Merging conflicting PRs: have each merge master locally, wait for CI to pass, then \
+             merge to master in sequence (used for #62-#67)",
+            "Run the e2e tests with env -u CRYSTAL_AGENT_HOOKS (backlog #73)",
+            "The skill's SHA-256 goes in SHIPPED: \
+             3f2a9c0d1e4b5a6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c",
+            "Its files are in src/tui/a1b2c3d/ and target/0123abc.d, its color #1e66f5a",
+        ] {
+            assert!(!reads_as_status(lesson), "{lesson}");
+        }
     }
 }

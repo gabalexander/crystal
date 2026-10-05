@@ -28,6 +28,7 @@
 //! simple.
 
 use crate::flow_run::FlowRun;
+use crate::output::errln;
 use crate::report;
 use crate::session;
 use anyhow::{Context, Result, ensure};
@@ -450,7 +451,7 @@ impl Helpers {
             .wait_timeout_while(running, left, |running| !running.is_empty())
             .unwrap();
         for &pid in running.iter() {
-            eprintln!("crystal daemon: stopped {pid}, which was still running, to hand over");
+            errln!("crystal daemon: stopped {pid}, which was still running, to hand over");
             session::signal_group(pid, libc::SIGKILL);
         }
         let _ = self

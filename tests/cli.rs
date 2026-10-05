@@ -112,6 +112,25 @@ impl Crystal {
         self.command(args).stdout(writer).output().unwrap()
     }
 
+    /// Runs a command whose standard error is a pipe nobody reads any
+    /// more: every warning it says there fails.
+    fn saying_to_a_closed_pipe(&self, args: &[&str]) -> Output {
+        let (reader, writer) = std::io::pipe().unwrap();
+        drop(reader);
+        self.command(args).stderr(writer).output().unwrap()
+    }
+
+    /// Runs a command whose standard output and standard error are one pipe
+    /// nobody reads any more, as `2>&1 | head -1` leaves them once `head`
+    /// has what it wants.
+    fn both_to_a_closed_pipe(&self, args: &[&str]) -> Output {
+        let (reader, writer) = std::io::pipe().unwrap();
+        drop(reader);
+        let command = &mut self.command(args);
+        command.stdout(writer.try_clone().unwrap()).stderr(writer);
+        command.output().unwrap()
+    }
+
     /// Runs a command piped into `head -1`, as a shell does, and returns how
     /// the command ended and the line `head` printed.
     fn piped_to_head(&self, args: &[&str]) -> (Output, String) {
@@ -1405,6 +1424,48 @@ fn a_task_pasted_whole_keeps_its_lines() {
         args.ends_with("\nfix the refund\nthen run the tests\n"),
         "{args:?}"
     );
+}
+
+#[test]
+fn a_screenshot_dropped_on_the_task_reaches_the_agent_as_a_copy_that_stays() {
+    let crystal = Crystal::new();
+    let bin = fake_claude(crystal.dir.path());
+    let path = path_of(&[&bin]);
+    // A macOS screenshot behind its floating thumbnail, which macOS deletes
+    // soon after the drop, a U+202F before `PM` in its name.
+    let thumbnails = crystal
+        .dir
+        .path()
+        .join("T/TemporaryItems/NSIRD_screencaptureui_LySI4r");
+    std::fs::create_dir_all(&thumbnails).unwrap();
+    let shot = thumbnails.join("Screenshot 2026-09-21 at 11.13.58\u{202f}PM.png");
+    std::fs::write(&shot, b"\x89PNG pixels").unwrap();
+    // Kept beside the daemon's state, a socket given by its path's beside it.
+    let copy = crystal
+        .dir
+        .path()
+        .join("crystal.attachments/Screenshot-2026-09-21-at-11.13.58-PM.png");
+    let mut tui = crystal.attach_with_env(&[], &[("PATH", &path)]);
+    eventually("the TUI asks for pastes marked", || tui.marks_pastes());
+
+    tui.type_keys("n");
+    tui.shows("What should it do?");
+    tui.type_keys("look at ");
+    // Dropped the way Ghostty pastes it: the path escaped for a shell.
+    let dropped = shot.to_string_lossy().replace(' ', "\\ ");
+    tui.type_keys(&format!("\x1b[200~{dropped}\x1b[201~"));
+    eventually("the screenshot is copied as it's dropped", || {
+        copy.is_file()
+    });
+    std::fs::remove_file(&shot).unwrap();
+    tui.type_keys("\r");
+    tui.shows("▸ claude");
+
+    let args = written(&crystal.dir.path().join("args"));
+    let task = args.lines().last().unwrap();
+    assert!(task.starts_with("look at "), "{args:?}");
+    assert!(task.contains(&*copy.to_string_lossy()), "{args:?}");
+    assert_eq!(std::fs::read(&copy).unwrap(), b"\x89PNG pixels");
 }
 
 #[test]
@@ -9238,6 +9299,102 @@ fn memory_lists_by_kind_by_title_and_what_was_forgotten() {
 }
 
 #[test]
+fn memory_puts_lessons_first_lets_status_go_in_bulk_and_expires_notes_nobody_finds() {
+    let (crystal, repo) = crystal_remembering();
+    let repo_dir = repo.to_str().unwrap();
+    let memory = |args: &[&str]| crystal.ok(&[&["memory", "-C", repo_dir], args].concat());
+    crystal.ok(&["remember", "-C", repo_dir, "The ledger flakes on refunds"]);
+    crystal.ok(&[
+        "remember",
+        "-C",
+        repo_dir,
+        "-k",
+        "gotcha",
+        "The ledger needs redis",
+    ]);
+    crystal.ok(&[
+        "remember",
+        "-C",
+        repo_dir,
+        "PR #12 squash-merged into master as 8012b6c",
+    ]);
+    crystal.ok(&[
+        "remember",
+        "-C",
+        repo_dir,
+        "-k",
+        "decision",
+        "Fees in cents",
+    ]);
+    let ids = |listed: String| -> Vec<String> {
+        let ids = listed.lines().map(|line| line.split_whitespace().next());
+        ids.map(|id| id.unwrap().to_string()).collect()
+    };
+
+    // The note says more of what's asked, but the lesson comes first,
+    // unless what's asked is what was done.
+    assert_eq!(
+        ids(memory(&["search", "ledger", "flakes", "refunds"])),
+        ["2", "1"]
+    );
+    let done = memory(&["search", "what", "happened", "to", "ledger", "refunds"]);
+    assert_eq!(ids(done), ["1", "2"]);
+
+    // What reads as status is listed, and goes only once --yes says so.
+    let status = memory(&["list", "--status"]);
+    assert_eq!(ids(status.clone()), ["3"]);
+    let dry = memory(&["rm", "--status"]);
+    assert_eq!(
+        dry,
+        format!("{status}would forget these 1: add --yes to forget them\n")
+    );
+    assert!(memory(&["list"]).contains("squash-merged"));
+    let forgot = memory(&["rm", "--status", "--yes"]);
+    assert!(forgot.starts_with("forgot 3: PR #12"), "{forgot}");
+    assert_eq!(memory(&["list", "--status"]), "");
+    assert_eq!(memory(&["rm", "--status"]), "nothing reads as status\n");
+
+    // A note nobody found again expires, kept and marked; a lesson doesn't.
+    let db = crystal.socket.with_file_name("memory").join("memory.db");
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.busy_timeout(Duration::from_secs(5)).unwrap();
+    conn.execute(
+        "UPDATE entries SET created = created - 3456000, last_seen = last_seen - 3456000",
+        [],
+    )
+    .unwrap();
+    assert_eq!(ids(memory(&["search", "ledger", "refunds"])), ["2"]);
+    let all = memory(&["search", "ledger", "refunds", "--all"]);
+    assert!(
+        all.contains("The ledger flakes on refunds  [expired]"),
+        "{all}"
+    );
+    assert_eq!(ids(memory(&["list", "--expired"])), ["1"]);
+    let listed = memory(&["list"]);
+    assert!(listed.contains("Fees in cents\n"), "{listed}");
+    // Read in full by an agent, it's found again.
+    let show = serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                                  "params": {"name": "memory_show", "arguments": {"id": 1}}});
+    let replies = mcp(&crystal, &repo, &[show]);
+    let shown = replies[0]["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        shown.ends_with("an agent read it in full just now"),
+        "{shown}"
+    );
+    assert_eq!(ids(memory(&["search", "ledger", "refunds"])), ["2", "1"]);
+    assert_eq!(memory(&["list", "--expired"]), "");
+
+    // Several go at once, once every one is there.
+    let missing = crystal.fails(&["memory", "-C", repo_dir, "rm", "2", "9"]);
+    assert!(missing.contains("there's no entry 9"), "{missing}");
+    let forgot = memory(&["rm", "2", "4"]);
+    assert_eq!(
+        forgot,
+        "forgot 2: The ledger needs redis\nforgot 4: Fees in cents\n"
+    );
+}
+
+#[test]
 fn search_by_meaning_without_its_model_goes_by_words_and_says_how_to_get_it() {
     let (crystal, repo) = crystal_remembering();
     crystal.configure("notify = false\n\n[memory]\nembeddings = true\ndistill = false\n");
@@ -14533,6 +14690,69 @@ fn ctrl_click_opens_a_link_in_a_pane_and_over_ssh_copies_it() {
 }
 
 #[test]
+fn ctrl_click_opens_a_files_path_in_the_editor_and_semicolon_goes_back() {
+    let crystal = Crystal::new();
+    let project = crystal.dir.path().join("app");
+    std::fs::create_dir_all(project.join("src")).unwrap();
+    std::fs::write(project.join("src/main.rs"), "fn main() {}\n").unwrap();
+    let printing = "echo 'error at src/main.rs:2:5 and src/gone.rs:3'; sleep 30";
+    let project_arg = project.to_str().unwrap();
+    crystal.ok(&[
+        "new",
+        "-n",
+        "agent",
+        "-c",
+        project_arg,
+        "sh",
+        "-c",
+        printing,
+    ]);
+    // An editor that says where it ran and what it was asked to open.
+    let editor = crystal.dir.path().join("editor");
+    let edited = crystal.dir.path().join("edited");
+    script(
+        &editor,
+        "echo \"$PWD $*\" > \"$EDITED.new\" && mv \"$EDITED.new\" \"$EDITED\"\nsleep 30\n",
+    );
+
+    let mut tui = crystal.attach_with_env(
+        &[],
+        &[
+            ("EDITOR", editor.to_str().unwrap()),
+            ("EDITED", edited.to_str().unwrap()),
+        ],
+    );
+    tui.shows("src/gone.rs:3");
+    let (column, row) = (PANE_SCREEN_COLUMN, PANE_SCREEN_ROW);
+    // Held with Ctrl over the path of a file, the mouse underlines it and
+    // its line; over the path of none, nothing.
+    tui.type_keys(&mouse_move(column + 12, row, true));
+    eventually("the path is underlined", || {
+        tui.underlined(column as u16 + 9, row as u16)
+            && tui.underlined(column as u16 + 23, row as u16)
+    });
+    assert!(!tui.underlined(column as u16 + 24, row as u16));
+    tui.type_keys(&mouse_move(column + 32, row, true));
+    eventually("the underline goes", || {
+        !tui.underlined(column as u16 + 9, row as u16)
+    });
+    assert!(!tui.underlined(column as u16 + 32, row as u16));
+    // Long enough on the agent for it to be a session the user was on.
+    thread::sleep(Duration::from_millis(1100));
+
+    tui.type_keys(&ctrl_click(column + 12, row));
+    tui.shows("typing into main.rs");
+    let opened = written(&edited);
+    assert!(opened.ends_with("/app +2 src/main.rs\n"), "{opened}");
+
+    // The prefix and `;` go back to the agent, and again to the editor.
+    tui.type_keys("\x02;");
+    tui.shows("typing into agent");
+    tui.type_keys("\x02;");
+    tui.shows("typing into main.rs");
+}
+
+#[test]
 fn a_plugin_s_link_handler_opens_the_links_it_takes() {
     let crystal = Crystal::new();
     let manifest = r#"
@@ -14965,12 +15185,15 @@ fn a_projects_plugin_runs_once_it_s_on_for_it_and_hears_only_its_project() {
     ]);
     let worktree =
         |name: &str| PathBuf::from(listed(&crystal, name)["cwd"].as_str().unwrap().to_string());
-    let copied = worktree("feature").join(".env");
-    eventually("the .env is copied", || copied.is_file());
-    assert_eq!(std::fs::read_to_string(&copied).unwrap(), "SECRET=1\n");
+    // `cp` makes the file before it writes it: wait for the whole.
+    assert_eq!(written(&worktree("feature").join(".env")), "SECRET=1\n");
     assert!(!worktree("elsewhere").join(".env").exists());
-    let log = crystal.ok(&["plugin", "log", "worktree-env", "--project", "-C", app_arg]);
-    assert!(log.contains("copied .env into"), "{log}");
+    // The hook says so once it has copied it, straight into the log.
+    eventually("the plugin logs the copy", || {
+        crystal
+            .ok(&["plugin", "log", "worktree-env", "--project", "-C", app_arg])
+            .contains("copied .env into")
+    });
 
     crystal.ok(&[
         "plugin",
@@ -18248,6 +18471,34 @@ fn printing_what_the_daemon_has_into_a_closed_pipe_stops_quietly() {
     }
     // The daemon carries on for whoever asks next.
     assert!(crystal.row("counter").is_some());
+}
+
+#[test]
+fn a_warning_said_into_a_closed_pipe_lets_the_command_carry_on() {
+    let crystal = Crystal::new();
+    let repo = git_repo(crystal.dir.path(), "app");
+    std::fs::create_dir(repo.join(".crystal")).unwrap();
+    std::fs::write(repo.join(".crystal/flows.toml"), "[[flow]\n").unwrap();
+    let args = &["flow", "defs", "-C", repo.to_str().unwrap()][..];
+    let listed = |out: &Output| String::from_utf8_lossy(&out.stdout).starts_with("no flows yet");
+
+    // It warns of the file it couldn't read, then lists the flows it could.
+    let out = crystal.run(args);
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{said}");
+    assert!(said.contains("couldn't read the project's flows"), "{said}");
+    assert!(listed(&out), "{out:?}");
+
+    // Nobody reads the warning, and it lists them all the same.
+    let out = crystal.saying_to_a_closed_pipe(args);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert!(listed(&out), "{out:?}");
+    // Nor anything at all: the warning lost, then the list.
+    assert_eq!(crystal.both_to_a_closed_pipe(args).status.code(), Some(0));
+    // A command that fails says why to nobody, and fails all the same.
+    let failed = crystal.saying_to_a_closed_pipe(&["mermaid", "no-such-file.md"]);
+    assert_eq!(failed.status.code(), Some(1), "{failed:?}");
+    assert!(!crystal.socket.exists());
 }
 
 #[test]

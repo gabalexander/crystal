@@ -158,6 +158,7 @@ and the footer says where you are and offers the keys that matter there, or, whe
 | Key | In the sidebar |
 |---|---|
 | `j` / `k`, `↓` / `↑` | select a session, or a worktree with no sessions |
+| `;` | go back to the session you were on before, in whichever [tab](#tabs) it is, as tmux's `last-pane` does, and `;` again comes back; one only passed over with `j` or `k` doesn't count. After the prefix in a pane, you type into it |
 | `Enter` | type into the selected session, or start an ended one again, once you've said `y`; on a worktree with no sessions, start one there |
 | `Space` | reply to the selected session without going into its pane: a box takes what to say, and `Enter` sends it, typed in with `Enter` after it, or as a [background task](#background-tasks)'s follow-up (`Alt+Enter` or `Ctrl+J` for a new line, `Esc` to cancel) |
 | `s` | split the selected session off into a pane of its own, beside its pane or below it, or close its split |
@@ -296,9 +297,20 @@ underlined. It opens in your browser, with `open` on macOS or `xdg-open` on Linu
 [plugin takes links like it](#link-handlers). Over ssh a browser opened on the other machine would be no use to
 you, so the link goes on your clipboard instead, as copying does. Your terminal has to hand the click to
 crystal: macOS's Terminal keeps `Ctrl`+click for its own menu, and iTerm2 does unless you turn that off in its
-settings. Copy mode's `o` opens the link under its cursor, from the keyboard. In `crystal attach`, a click on a
-link is your terminal's to open, as it finds them in the text, and copy mode's `o` opens the one under its
-cursor as the TUI does.
+settings. Copy mode's `o` opens the link under its cursor, from the keyboard.
+
+A file's path in a pane's text is a link too, like the `src/app.rs:42` an agent prints: `Ctrl`+click opens it
+in your `$EDITOR` (or `vi`) at that line, as a session of its own beside the one that printed it, the way
+[the file finder](#the-file-finder-and-the-tree-browser) opens one, and `;` takes you back. The line can follow
+the path as compilers and agents write it, `src/app.rs:42` or `src/app.rs:42:7`, as MSVC and TypeScript do,
+`src/app.ts(42,7)`, or as GitHub does, `src/app.rs#L42`; a diff's `a/` or `b/` before it, and a bracket, a quote
+or a full stop around it, are left out. A path is looked for where its session runs, then at the top of its
+worktree, or where it says when it's absolute or starts with `~/`, and only one that's a file there is
+underlined and opens.
+
+In `crystal attach`, a click on a link is your terminal's to open, as it finds them in the text, and copy
+mode's `o` opens the URL under its cursor as the TUI does; on a file's path, with no editor beside the session
+to open it in, it puts the file's whole path and its line on your clipboard.
 
 A split keeps a session on screen while the selection moves on. `s` splits the selected session off into a
 pane of its own: it stays where it is, and the pane that follows the selection takes the other half, to show
@@ -1091,7 +1103,7 @@ works on a session that has ended too, on the last it showed. `Ctrl+\` leaves co
 | `Y` | copy the line the cursor is on, and leave copy mode |
 | `/` / `?` | search down, or up, as you type: each key goes to the nearest match; `Enter` keeps it, `Esc` goes back |
 | `n` / `N` | the next match the same way, or the other way |
-| `o` | open the link under the cursor, as `Ctrl`+click does, and leave copy mode |
+| `o` | open the link under the cursor, a URL or a file's path, as `Ctrl`+click does, and leave copy mode |
 | `Esc` | drop the selection, then the search, then leave copy mode |
 | `q`, `Ctrl+C` | leave copy mode |
 
@@ -1140,6 +1152,16 @@ argument. `Alt+Enter` starts a new line, and a paste keeps its lines. An empty t
 prompt. `↑` on the first line and `↓` on the last bring back earlier tasks: the panel keeps the last 100, in
 crystal's database. The task box edits [as a shell's line does](#keys-and-commands), `Ctrl+W` and `Alt+B` among
 its keys, all but `Ctrl+E`, which is the panel's.
+
+Drag a file onto the task, or onto the reply box, and your terminal pastes its path. A screenshot dragged from
+macOS's floating thumbnail is a file macOS deletes soon after the drop, long before the agent gets to read it,
+and its name has a narrow no-break space before `PM` that an agent types back as a plain space. So crystal
+copies a dropped file from a folder that goes away (`TemporaryItems`, or on a Mac the temporary directory macOS
+clears), and an image whose path has anything a shell would want escaped, into its state directory
+(`~/.local/state/crystal/attachments/`) under a plain name, like `Screenshot-2026-09-21-at-11.13.58-PM.png`,
+and puts the copy's path in the box in place of the one dropped. Any other file, like a source file in the
+worktree, is left as pasted, for the agent to work on the file itself. A copy is kept for a week from when it
+was last dropped: older ones are deleted as another is copied, and as the TUI starts.
 
 `Esc` puts the panel away without losing what's in it: the next `n` or `w` opens on it, `draft left last time`
 under it. Opened where it was before, it comes back whole, the task, what runs it, its rows' choices, where it
@@ -2497,8 +2519,11 @@ crystal memory search ledger tests   # the entries that have most to do with tho
 crystal memory search db -k command -f src/ledger --fresh -n 5   # of a kind, about those files, none stale
 crystal memory show 3                # one in full: its files, where it came from, how often it was said
 crystal memory export > MEMORY.md    # the whole list as markdown
-crystal memory rm 3                  # forget one
+crystal memory rm 3                  # forget one, or `rm 3 5 8` several
 crystal memory list --forgotten      # what was forgotten, the latest first
+crystal memory list --expired        # the notes and outcomes nobody found again
+crystal memory list --status         # the entries that read as status rather than lessons
+crystal memory rm --status           # what that would forget; `--yes` forgets them
 crystal memory promote 2             # copy one into the project's CLAUDE.md, under "Notes"
 crystal memory distill fixer         # have a model read what a session did, now
 crystal memory embed                 # download the model that searches by meaning
@@ -2512,18 +2537,34 @@ crystal memory embed                 # download the model that searches by meani
   says.
 - How a task turned out isn't kept here: its project's [tasks](#tasks) keep that (`crystal tasks`). The
   `outcome` entries an earlier crystal added as each task closed are still listed and found by a search, but
-  agents starting aren't shown them; `crystal memory rm` those you don't want.
+  agents starting aren't shown them; `crystal memory rm` those you don't want. Each keeps its task's goal in
+  a sentence and what `crystal done` said: they held the whole brief the task was given, pages of it at times,
+  which the task's record keeps.
+- Lessons, `decision`, `gotcha` and `command`, rank above notes and outcomes: in a search and at launch, a
+  note or an outcome ranks three places lower than what it says would put it, below the lessons near it but
+  still ahead of one that hardly answers. A search about what was done, with a word like `did`, `done`,
+  `merged`, `already` or `history` in it, ranks them where they fall.
+- A note or an outcome nobody finds again expires: a note 30 days after it was said, an outcome after 14. Found
+  again is said again (`remembered 3 already`), or read in full by an agent, with the `memory_show` tool or
+  `crystal memory show` in a session. A search and agents starting leave the expired out; they're kept, marked
+  `[expired]` in the list, `list --expired` lists them alone and `search --all` brings them back. Lessons never
+  expire.
+- `list --status` lists the entries that read as progress or status rather than lessons, by the words that
+  say so: merged, pushed, committed or installed, CI passing, a pull request opened, a commit's hash, a backlog
+  item that tracks it, or what holds only in this pull request. It's for you to look through: `rm --status`
+  lists what it would forget, and forgets them only with `--yes`; `-k` keeps either to a kind. Tasks' outcomes
+  aren't counted: `-k outcome` lists those, and they expire.
 - A project is its main worktree, so every worktree of it shares one list. Every project's list is kept in one
   SQLite database in crystal's state directory (`~/.local/state/crystal/memory/memory.db`), not in the
   repository. A project's list from before, a JSON file there, is brought in the first time it's read.
 - `search` uses SQLite's full-text index (FTS5), ranked by bm25: any of the words matches, and so does a word
   they start or stem from (`deploying` finds "Deploys go out on Tuesdays"); the entries with more of the words,
   and rarer ones, come first, drifting ones marked where they rank, and of those it finds, the stale come
-  after the rest, marked. `--fresh` leaves the stale out (`--all`, which brought them back when a search left
-  them out, is still taken, and changes nothing). `-k` keeps to a kind, `-f` to the entries about a file, or
-  about any file in a directory, named from where you are (give it more than once for more), and `-n` says
-  how many at most (50 unless it's told). With [search by meaning](#search-by-meaning), on unless you turn it off, entries that mean
-  the same count too, whatever their words, and what doesn't answer the search is left out.
+  after the rest, marked. `--fresh` leaves the stale out. `-k` keeps to a kind, `-f` to the entries about a
+  file, or about any file in a directory, named from where you are (give it more than once for more), and `-n`
+  says how many at most (50 unless it's told). With [search by meaning](#search-by-meaning), on unless you turn
+  it off, entries that mean the same count too, whatever their words, and what doesn't answer the search is
+  left out. Expired entries are left out too, and `--all` (`-a`) brings them back, marked.
 - The same thing remembered again (the same words, whatever the case or punctuation) is the one entry, seen
   again: `remembered 3 already`. Credentials in an entry, like `API_KEY=…` or a token, are taken out as it's
   kept.
@@ -2545,16 +2586,17 @@ crystal memory embed                 # download the model that searches by meani
   only one the project has.
 - `rm` forgets an entry: it leaves the list, and the distiller never adds it back. `memory list --forgotten`
   (or `--wrong`) lists what was forgotten, as it was; remembering it again brings it back.
-- `m` in the sidebar opens the selected session's project's list, drifting and stale entries marked: the entry
-  the bar is on is shown in full beside it, with what's gone, `/` filters, `Enter` opens its file in your `$EDITOR` (in the
-  worktree it was remembered in while that's there, as a session of its own), and `x` forgets an entry and `p`
-  promotes it, each after a `y`.
+- `m` in the sidebar opens the selected session's project's list, drifting, stale and expired entries marked:
+  the entry the bar is on is shown in full beside it, with what's gone, `/` filters, `Enter` opens its file in
+  your `$EDITOR` (in the worktree it was remembered in while that's there, as a session of its own), and `x`
+  forgets an entry and `p` promotes it, each after a `y`.
 
 When an agent starts, crystal shows it the entries that have most to do with its launch: first those about files
 its worktree has changed since its branch left the default one (`origin`'s, or `main` or `master`), committed
-or not, then those that have most to do with its first prompt, or the newest when neither finds any. That's a
-few at most, in 800 bytes, the least relevant left out first; none that's stale or a task's outcome, and
-drifting ones marked where they rank. Each comes with its id, and a line on how to read the rest and add more:
+or not, then those that have most to do with its first prompt, or the newest when neither finds any, lessons
+before the notes near them. That's a few at most, in 800 bytes, the least relevant left out first; none that's
+stale, expired or a task's outcome, and drifting ones marked where they rank. Each comes with its id, and a
+line on how to read the rest and add more:
 
 - Claude Code gets them in its system prompt, and reads the rest with crystal's MCP tools (below).
 - Codex gets them as its `developer_instructions` (`-c`), after the ones it has already, from a
@@ -2567,7 +2609,8 @@ drifting ones marked where they rank. Each comes with its id, and a line on how 
 
 Every Claude Code session crystal starts, in a terminal or as a task in the background (`claude -p`), gets
 crystal's own MCP server, `crystal mcp`, with its two tools allowed: `memory_search`, which searches the
-project's memory the way `crystal memory search` does, and `memory_show`, which reads one entry in full. These
+project's memory the way `crystal memory search` does, and `memory_show`, which reads one entry in full, and
+finds it again, so it doesn't expire. These
 are how it reads the rest of what was learned without a shell command, which a task has nobody to say yes to
 and a session in a terminal would stop to ask about.
 
@@ -2623,6 +2666,11 @@ task closed done or failed and it was read then. It's one `claude -p` run on Hai
   what crystal read of its runs), or for Claude Code in a terminal, the transcript its hooks named. Codex leaves
   nothing it can read. Credentials are taken out before the model sees any of it.
 - It's shown what the project's memory has already on the same subject, and told never to give that again.
+- It's told to keep lessons alone, what a later session couldn't get from the code, the git log, the backlog or
+  CLAUDE.md, and never progress or status (merged, pushed, installed, CI passed), a commit's hash or a pull
+  request's or backlog item's number as the point of an entry, or what's only true today, with entries of each
+  from crystal's own memory; never to say what you decided unless the transcript shows you saying it; to
+  quote names exactly, with no line numbers; and to make an entry a note only when it's no lesson.
 - It has no tools, no MCP servers, none of the project's settings and none of your hooks, a budget (25 cents
   by default) and two turns. Its answer is checked before anything is kept: at most 8 entries, of the kinds
   `decision`, `gotcha`, `command` and `note`, each 400 characters at most, naming only files that are in the
@@ -3195,8 +3243,9 @@ A `Ctrl`+click on a link in a pane, or copy mode's `o`, goes to the first plugin
 link handler whose `pattern` matches the link, the plugin's handlers tried in their order. The handler's
 `action` runs in place of your browser, about the session in that pane, with the link in `CRYSTAL_LINK`: open
 an issue in a pane of the plugin's own, say, or have an agent look at it. The pattern is a regular expression,
-matched anywhere in the link unless `^` and `$` pin it. `X` lists each plugin's handlers under it, and
-`crystal plugin run <name> --link <url>` runs the action its handlers give a link, to try them.
+matched anywhere in the link unless `^` and `$` pin it. A file's path in the text isn't one of their links: it
+opens in your editor. `X` lists each plugin's handlers under it, and `crystal plugin run <name> --link <url>`
+runs the action its handlers give a link, to try them.
 
 #### Events
 
@@ -3743,6 +3792,7 @@ emulates for it, as it would through any terminal.
 - [x] A sidebar in a stable order, or one of your own, and its rows laid out your way, with what agents report
 - [x] Idle sessions stopped by default, sparing work they left running, and back as you go to them; an agent
   kept warm for the next session
+- [x] Files' paths in panes opened in your editor at their line, and a key back to the session you were on
 
 ## Development
 

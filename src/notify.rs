@@ -33,6 +33,7 @@
 
 use crate::agents;
 use crate::config::Config;
+use crate::output::errln;
 use crate::printable;
 use crate::protocol::{Activity, Front, NotifySound, SessionInfo};
 use crate::sound::{self, Sound};
@@ -282,7 +283,7 @@ pub fn tell(notice: Notice, socket: &Path) {
     let socket = socket.to_path_buf();
     thread::spawn(move || {
         if let Err(err) = tell_now(&notice, &socket) {
-            eprintln!(
+            errln!(
                 "crystal daemon: couldn't tell the user that {}: {err:#}",
                 notice.text
             );
@@ -301,7 +302,7 @@ pub fn enabled(config: &Config) -> bool {
 /// straight away.
 pub fn settings() -> Config {
     Config::load().unwrap_or_else(|err| {
-        eprintln!("crystal daemon: {err:#}; using the default settings");
+        errln!("crystal daemon: {err:#}; using the default settings");
         Config::default()
     })
 }

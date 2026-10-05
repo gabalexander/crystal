@@ -25,7 +25,10 @@ api_schema` writes it again.
 What a command prints on standard output goes through `out!` and `outln!` (`src/output.rs`) with a `?`, never
 `print!` and `println!`, which `clippy.toml` refuses: a reader gone, like `head -1`'s, stops the command and
 crystal exits 0, where `println!` panics. A line said along the way of work that must finish, like `crystal
-update`'s, is printed with `let _ =`, the work going on unread.
+update`'s, is printed with `let _ =`, the work going on unread. What crystal says on standard error, a warning, a
+question or the daemon's log, goes through `err!` and `errln!`, never `eprint!` and `eprintln!`, which
+`clippy.toml` refuses too: they carry on once standard error's reader has gone, as `2>&1 | head -1` leaves it,
+what they said lost.
 
 ## Releasing
 
@@ -90,8 +93,9 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   attach_capture`, the mouse taken: SGR reports picked out of the keys (one cut off held a moment for its end),
   handed to a program that asked, a drag selecting (a word on a double-click, a line on a triple-click, the
   history scrolling under one held on the top or bottom row), copied as it lets go or held in copy mode, the
-  wheel as arrows for a pager or scrolling the session's history, and back to live as you type; what it does
-  with the keys and the mouse kept apart from I/O, so it's unit-tested
+  wheel as arrows for a pager or scrolling the session's history, and back to live as you type; copy mode's
+  `o` on a file's path putting the file's whole path and its line on the clipboard, with no editor to open it
+  in; what it does with the keys and the mouse kept apart from I/O, so it's unit-tested
 - `src/bell.rs`: passing a session's terminal bell on to the user's own terminal, at most one every half a
   second
 - `src/viewer.rs`: the client's side of an attach, shared by `crystal attach`, the TUI's pane and the streams,
@@ -146,7 +150,8 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   from source with Nix
 - `src/tui/`: the TUI (`crystal` with no command)
   - `mod.rs`: the event loop: one channel of events, then update and draw (not for a move of the mouse that
-    changes nothing), opening the link a Ctrl+click or copy mode's `o` asks for, bringing the TUI's terminal to
+    changes nothing), opening the link a Ctrl+click or copy mode's `o` asks for, a file's path in the editor
+    as a session of its own, bringing the TUI's terminal to
     the front for `pane focus --raise`, ringing the user's terminal for a pane's bell or a session marked as
     having rung, putting on the clipboard what a pane's program copies (not a background task's); taking the
     mouse from the terminal or leaving it there (`[mouse] capture`), counting clicks for double- and
@@ -158,7 +163,9 @@ whenever what's handed over changes in a way the crystal before couldn't read.
     pane or a tab, or a command in the background that says only when it fails; this crystal's release notes,
     off the loop, for `release-notes`; handing the settings view the mouse while it's open; starting again a
     session crystal stopped idle once the selection rests on it; asking the daemon, off the loop, to keep an
-    agent warm where the selection is (`[sessions] warm_agent`); and watching the config file, taking a change
+    agent warm where the selection is (`[sessions] warm_agent`); copying a file dropped on the reply box or
+    the new-session panel's task that would go away, before the paste goes in (`dropped_files.rs`), and
+    deleting the copies a week old as it starts, off the loop; and watching the config file, taking a change
     made by hand in at once, the panes' history following `scrollback_lines`, or saying why it can't be read;
     asking the terminal again every two seconds for the mouse, bracketed paste, focus and the Kitty keyboard
     flags, which a terminal reset forgets, though not while a mouse button is down, and on a resize for the
@@ -178,7 +185,8 @@ whenever what's handed over changes in a way the crystal before couldn't read.
     new-session panel like the selected session; `+`'s question, its `Tab` handed to the event loop to finish
     the directory; what crystal's processes take, and where the footer drew its readout of it, for a click;
     the session the selection rests on, for one crystal stopped idle to start again once it has rested there
-    a moment; no I/O, so it's unit-tested
+    a moment; `;` going back to the session the user was on before (see `recent.rs`), the keyboard into its
+    pane from a pane; no I/O, so it's unit-tested
     - `app/by_hand.rs`: moving the sidebar's sessions and projects by hand, with `move-up` and the rest, a drag
       of a session's row or a project's heading (a click on one folding it as the button comes up), and
       `crystal sidebar move`: a session among those beside it in its worktree, agents among agents, a project
@@ -210,6 +218,9 @@ whenever what's handed over changes in a way the crystal before couldn't read.
     dragged thumb takes it, and drawing it; pure, so it's unit-tested
   - `warm.rs`: asking the daemon to keep an agent warm where the selection is: once what it would be has held
     a moment, again every few minutes, and again once a session has taken it over; pure, so it's unit-tested
+  - `recent.rs`: the sessions the user has been on, the latest first, by name, for `;` to go back to the one
+    before in whichever tab it is: one the selection stayed on a second, not one passed over on the way, and
+    the one `;` leaves; the event loop notes the selection as it goes round; pure, so it's unit-tested
   - `tabs.rs`: tabs, as many as the user likes, each holding its own sessions (each session in exactly one)
     with its own selection, its tree of panes, the session the selection's pane last showed and the session
     floating over them, their order and which is in front; the sidebar shows only that tab's sessions; each
@@ -295,6 +306,13 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   - `reply.rs`: the reply box (`Space`): the next prompt for a session, or a background task's follow-up,
     sent without going into its pane; its state and keys, kept apart from I/O, what's typed kept until the
     daemon takes it, and its drawing
+  - `dropped_files.rs`: files dropped on the reply box or the new-session panel's task, which a terminal
+    pastes as their paths, escaped, quoted or as `file://` URLs: a paste of nothing but files, one of them in
+    a folder that goes away (`TemporaryItems`, a screenshot's floating thumbnail's, or on a Mac the temporary
+    directory) or an image whose path an agent won't type back right, has those copied into the server's
+    `attachments` under a plain name, only the user able to read them, and their copies' paths in place of
+    theirs; a copy is kept a week from when it was last dropped; adapted from docket's, unit-tested on
+    files of its own
   - `launcher.rs`: the new-session panel (`n`, `w`): its state and keys, kept apart from I/O, the command
     it builds, a profile's `launch` setting its "how" row as it's chosen and whether what it starts is a
     task, what it remembers between runs, the draft it leaves when it's put away with a task in it and
@@ -328,7 +346,8 @@ whenever what's handed over changes in a way the crystal before couldn't read.
     scrollbar's thumb dragged
   - `copy_mode.rs`: copy mode (`v`, and `crystal attach`'s): vi's keys over a screen and its history,
     selecting, searching as the search is typed (each key from where it began, `Esc` going back there), the
-    text to copy, and `o` for the link under the cursor; works on the screen, kept apart from I/O
+    text to copy, and `o` for the link under the cursor, a URL or a file's path; works on the screen, kept
+    apart from I/O
   - `screen_widget.rs`: draws a session's screen into ratatui, for the panes and `crystal attach`, with the
     link under the mouse underlined
   - `diff.rs`: reads `git diff`'s patch into files, hunks and lines, marks the words that changed,
@@ -354,9 +373,10 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   - `preview.rs`: the file finder's, the tree browser's, the handoff view's and the opened view's preview: a
     file read and highlighted off the event loop, a binary one refused by git's test, which `crystal open`
     makes too, a markdown file's page laid out for its width or its source, scrolling, and drawing them
-  - `memory_view.rs`: the memory view (`m`): a project's entries by their titles, the drifting and the stale
-    marked, the entry the bar is on with what's gone, the filter, the entry's file opened in the editor (Enter), in the worktree it was said in while that's there, forgetting and
-    promoting after a `y`, and its drawing
+  - `memory_view.rs`: the memory view (`m`): a project's entries by their titles, the drifting, stale and
+    expired marked, the entry the bar is on with what's gone, the filter, the entry's file opened in the
+    editor (Enter), in the worktree it was said in while that's there, forgetting and promoting after a `y`,
+    and its drawing
   - `plugins_view.rs`: the plugins view (`X`): every plugin, on or off, with installed ones' actions, panes and
     link handlers, and those the selected session's project ships under its name, which the view turns off
     but leaves the command line to turn on; its keys and drawing; the event loop does the switching, runs
@@ -533,8 +553,8 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   for the daemon to give its screen and every viewer's alike, the cells to draw, the input modes `crystal attach` asks your terminal for, and,
   for a viewer, copy mode's cursor, selection (of characters, words, lines or a block) and search, which are
   Alacritty's vi mode, where a search being typed began (`vt::Spot`, counted from the top of the history, so
-  output meanwhile doesn't move it), to search from at each key and go back to, and the link on a cell: a hyperlink a program wrote (OSC 8), or a URL in the text across
-  the rows it wrapped onto, as `vt::Link`; the
+  output meanwhile doesn't move it), to search from at each key and go back to, and the link on a cell: a hyperlink a program wrote (OSC 8), or a URL or a file's path in
+  the text across the rows it wrapped onto, as `vt::Link`; the
   times the program rang the bell; the text it last asked to copy (OSC 52), a read of the clipboard never
   answered; the progress a program reports (OSC 9;4), picked out of its output, which
   alacritty_terminal passes over; how much history a screen keeps, changed on a running one; a screen saved
@@ -542,8 +562,11 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   show again, without what its program set, above the program a cold restart starts in its place. The only
   module that uses
   `alacritty_terminal`
-- `src/links.rs`: opening a link a pane shows: `open` or `xdg-open`, or over ssh (or with neither) the link put
-  on the user's clipboard instead
+- `src/links.rs`: links a pane shows and opening them: a URL with `open` or `xdg-open`, or over ssh (or with
+  neither) put on the user's clipboard instead; a file's path in the text with the line after it (`:12`,
+  `:12:5`, `(12,5)`, `#L12`) read out of a line of it, and found where its session runs or at the top of its
+  worktree (adapted from docket's `visible_file_links`), for the TUI to open in the editor; the reading pure,
+  so it's unit-tested
 - `src/clipboard.rs`: putting text on the user's clipboard: `pbcopy`, `wl-copy`, `xclip` or `xsel` on their own
   machine, or OSC 52 to their terminal over ssh or when none of those works
 - `src/task.rs`: tasks: Claude Code run without a terminal (`claude -p`): one process taking the prompt and each
@@ -585,7 +608,7 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   the same state
 - `src/state.rs`: where the daemon's state is: a server's directory in the state dir (the default server's is
   the state dir itself), or beside a socket given by its path; the database, the directory of the files each
-  task kept, and the files kept before the database (the sessions, the flow runs, each project's directory); a
+  task kept, the directory of the files dropped on a task or a reply, and the files kept before the database (the sessions, the flow runs, each project's directory); a
   running session as it's written down to start it again, the worktree it was on its way into, and whether
   crystal had stopped it idle, to stay stopped
 - `src/server_cli.rs`: `crystal server`: every server with whether it's running and how many sessions it has,
@@ -654,16 +677,21 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   holds, fresh, drifting or stale, by what it names, looked up among the words of a worktree's files
   (`Words`), or naming nothing, by its files, the entries gone stale the daemon hasn't told of, and those about
   some files for the distiller to ask about again, anchored again or reworded, search (of a kind, about some
-  files or directories, the stale after the rest or left out), an entry's
-  title, its first line, or one of its own, the paragraph every agent is
-  shown at launch (entries about what its worktree changed first, in docket's 800 bytes, tasks' outcomes kept
-  by an earlier crystal left out of it), promoting into
-  CLAUDE.md, the markdown export, and `enabled`, the one gate everything memory adds goes through
+  files or directories, the stale after the rest or left out), lessons
+  (decisions, gotchas, commands) ranked above the notes and outcomes near them unless what's asked is about
+  what was done, notes and outcomes nobody found again (said again, or read in full by an agent: `used`)
+  expired and left out of searches and launch, the words that say an entry reads as status rather than a
+  lesson (`reads_as_status`, for `list --status`), tasks' outcomes from an earlier crystal shortened to their
+  goal's first sentence and what `crystal done` said, an entry's title, its first line, or one of its own, the
+  paragraph every agent is shown at launch (entries about what its worktree changed first, in docket's 800
+  bytes, tasks' outcomes kept by an earlier crystal left out of it), promoting into CLAUDE.md, the markdown
+  export, and `enabled`, the one gate everything memory adds goes through
 - `src/distill.rs`: the distiller: after a task closes, or a session is archived that wasn't read as its task
   closed, one tool-less `claude -p` (Haiku by default, `[memory]`
-  in the config) over the end of its transcript, told what the memory has already, and asked about the
-  entries gone stale that are about the files the work touched, to keep, reword or forget; its answer checked
-  against the checkout before it's kept
+  in the config) over the end of its transcript, told what the memory has already, to keep lessons alone and
+  never progress, status or what's only true today, with entries of each, and asked about the entries gone
+  stale that are about the files the work touched, to keep, reword or forget; its answer checked against the
+  checkout before it's kept
 - `src/mcp.rs`: `crystal mcp`: an MCP server over stdio with `memory_search` and `memory_show`, which every
   Claude Code session crystal starts, in a terminal or a task in the background, is given with `--mcp-config`
   and its tools allowed
@@ -684,9 +712,11 @@ whenever what's handed over changes in a way the crystal before couldn't read.
 - `src/rerank.rs`: the reranker: every passage and the query in one prompt, each marked at its end, the
   projector over the model's state at the marks, and each passage's cosine with the query
 - `src/secrets.rs`: taking credentials out of text before memory keeps it or the distiller reads it
-- `src/memory_cli.rs`: `crystal remember` and `crystal memory`, `add`, `list` (by kind, or what was
-  forgotten), `search` (by kind, files, the stale left out or not, and how many), `show`, `export` and
-  `distill` included, and an entry in full as `show` and the `memory_show` tool print it, with what's gone
+- `src/memory_cli.rs`: `crystal remember` and `crystal memory`, `add`, `list` (by kind, what was forgotten,
+  what reads as status or what expired), `search` (by kind, files, the stale left out or not, the expired too,
+  and how many), `show` (an agent's in a session finding it again), `rm` (several ids, or what reads as
+  status, listed until `--yes`), `export` and `distill` included, and an entry in full as `show` and the
+  `memory_show` tool print it, with what's gone
 - `src/profile.rs`: agent profiles: what one runs, its prompt and postfix around the task or alone with no
   task (`skip_task`), how it's meant to start (`launch`: a session, a task or a background task), checking it,
   and saving or removing one in the config file with `toml_edit`, so the user's comments and layout stay;
@@ -766,7 +796,8 @@ whenever what's handed over changes in a way the crystal before couldn't read.
 - `src/output.rs`: what a command prints on standard output: `out!` and `outln!`, in place of `print!` and
   `println!`, and `Closed`, its reader gone, which stops the command and has `main` exit 0; SIGPIPE is left
   ignored, as the daemon, the TUI, `crystal attach`, `crystal mcp` and the hooks need it, and as a command's own
-  writes to the daemon's socket and its programs' pipes do
+  writes to the daemon's socket and its programs' pipes do; and what crystal says on standard error, `err!` and
+  `errln!` in place of `eprint!` and `eprintln!`, a write there that fails passed over
 - `src/printable.rs`: text crystal didn't write made fit for the user's terminal: control characters, the escape
   sequences they start and the explicit bidi controls taken out, on one line or keeping its lines; and the TUI's
   frame scrubbed of them last, since ratatui hands a zero-width one on to the terminal. A background task's
