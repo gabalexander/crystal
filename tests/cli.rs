@@ -17383,8 +17383,8 @@ fn a_terminal_is_never_stopped_idle_unless_asked() {
 
 /// A stand-in for Claude Code that tells crystal it has started through
 /// the hooks crystal gives it, then takes what's typed into it: each start
-/// adds its pid to `starts`, and writes its arguments and what it's typed
-/// to files named for its pid.
+/// adds its pid to `starts`, and writes its arguments, `ready` once crystal
+/// has heard its hook, and what it's typed to files named for its pid.
 fn fake_waiting_claude(dir: &Path) -> PathBuf {
     let bin = dir.join("warm-bin");
     std::fs::create_dir(&bin).unwrap();
@@ -17394,6 +17394,7 @@ printf '%s\n' "$@" > args-$$
 printf '%s\n' $$ >> starts
 printf '{{"hook_event_name":"SessionStart","source":"startup","session_id":"c-'$$'"}}' \
     | '{CRYSTAL}' hook claude
+: > ready-$$
 stty raw -echo
 exec cat > typed-$$
 "#
@@ -17414,27 +17415,34 @@ fn a_warm_agent_waits_where_the_selection_is_and_a_new_session_takes_it_over() {
     let mut tui = crystal.attach_with_env(&[], &[("PATH", &path)]);
     let starts = crystal.dir.path().join("starts");
     eventually("an agent is kept warm", || starts.exists());
+    let started = Instant::now();
     let warm = written(&starts).trim().to_string();
     // Started as a task would be, but with no first prompt.
     let args = written(&crystal.dir.path().join(format!("args-{warm}")));
     assert!(args.contains("crystal done"), "{args}");
     assert!(!args.lines().any(|arg| arg == "--"), "{args}");
     assert_eq!(crystal.row("claude"), None, "it's in no list");
-    // It takes a moment to take keys.
-    thread::sleep(Duration::from_millis(3500));
+    // Taken over only once it has said it's up.
+    let ready = crystal.dir.path().join(format!("ready-{warm}"));
+    eventually("crystal has heard it's up", || ready.exists());
 
     tui.type_keys("n");
     tui.shows("What should it do?");
     tui.type_keys("fix the login bug");
     tui.type_keys("\r");
-    tui.shows("▸ claude");
+    eventually("the session has started", || {
+        crystal.row("claude").is_some()
+    });
     assert_eq!(
         crystal.pid("claude").to_string(),
         warm,
         "it took the agent over"
     );
     let typed = crystal.dir.path().join(format!("typed-{warm}"));
-    // Typed in, then Enter on its own: in raw mode, a return.
+    // Typed in once it has been up long enough to take keys, then Enter on
+    // its own: in raw mode, a return.
+    let up = Duration::from_secs(3);
+    thread::sleep(up.saturating_sub(started.elapsed()));
     eventually("its first prompt is typed in", || {
         std::fs::read_to_string(&typed)
             .is_ok_and(|text| text.contains("fix the login bug") && text.ends_with('\r'))
