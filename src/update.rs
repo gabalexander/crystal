@@ -19,7 +19,7 @@
 //! directory, and the TUI shows them, once, the first time it opens on the
 //! new crystal; updated some other way, the TUI asks for them itself.
 
-use crate::output::{out, outln};
+use crate::output::{errln, out, outln};
 use crate::{embed, printable, server_cli, shell, skill, socket, state};
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
@@ -537,12 +537,12 @@ fn restart_daemons(exe: &Path, socket: &Path) {
             (Ok(out), Some(server)) if out.status.success() => {
                 let _ = out!("{server}: {}", String::from_utf8_lossy(&out.stdout));
             }
-            (_, None) => eprintln!(
+            (_, None) => errln!(
                 "crystal: couldn't restart the daemon at {}: run `crystal -S {} restart-server`",
                 daemon.display(),
                 shell::quote(&daemon.to_string_lossy())
             ),
-            (_, Some(server)) => eprintln!(
+            (_, Some(server)) => errln!(
                 "crystal: couldn't restart the server {server}: run `crystal -L {server} \
                  restart-server`"
             ),

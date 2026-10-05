@@ -4,6 +4,7 @@
 //! day, so a restart doesn't forget it.
 
 use crate::db::Db;
+use crate::output::errln;
 use anyhow::{Result, ensure};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -27,7 +28,7 @@ impl Spending {
             .unwrap()
             .spent_on(&today())
             .unwrap_or_else(|err| {
-                eprintln!("crystal daemon: couldn't read today's spending: {err:#}");
+                errln!("crystal daemon: couldn't read today's spending: {err:#}");
                 0.0
             })
     }
@@ -38,7 +39,7 @@ impl Spending {
             return;
         }
         if let Err(err) = self.db.lock().unwrap().add_spending(&today(), usd) {
-            eprintln!("crystal daemon: couldn't write down today's spending: {err:#}");
+            errln!("crystal daemon: couldn't write down today's spending: {err:#}");
         }
     }
 

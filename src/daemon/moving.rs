@@ -15,6 +15,7 @@ use super::Daemon;
 use crate::events::{Event, Kind};
 use crate::git::Checkout;
 use crate::handover::HandedMove;
+use crate::output::errln;
 use crate::protocol::{Activity, Response};
 use crate::session::Session;
 use crate::state::{MovedTo, SavedSession};
@@ -160,7 +161,7 @@ impl Daemon {
             }
             Err(err) => {
                 let why = format!("{err:#}");
-                eprintln!(
+                errln!(
                     "crystal daemon: couldn't start {} again in {}: {why}",
                     saved.name,
                     moving.to.path.display()

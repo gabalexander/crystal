@@ -34,6 +34,7 @@
 use crate::config::Config;
 use crate::embed::Embed;
 use crate::git::Checkout;
+use crate::output::errln;
 use crate::printable;
 use crate::secrets;
 use crate::state;
@@ -799,7 +800,7 @@ impl Store {
             )),
             // The model failing leaves the search to the words.
             Err(err) => {
-                eprintln!("crystal: couldn't search by meaning: {err:#}");
+                errln!("crystal: couldn't search by meaning: {err:#}");
                 by_words.truncate(limit);
                 Ok(by_words)
             }
@@ -1140,7 +1141,7 @@ fn reranked(mut found: Vec<Entry>, text: &str, embedder: &dyn Embed, limit: usiz
     let scores = match embedder.rerank(text, &passages) {
         Ok(Some(scores)) if scores.len() == read.len() => scores,
         Ok(Some(_)) => {
-            eprintln!("crystal: the reranker didn't score every entry");
+            errln!("crystal: the reranker didn't score every entry");
             found.truncate(limit);
             return found;
         }
@@ -1149,7 +1150,7 @@ fn reranked(mut found: Vec<Entry>, text: &str, embedder: &dyn Embed, limit: usiz
             return found;
         }
         Err(err) => {
-            eprintln!("crystal: couldn't rerank: {err:#}");
+            errln!("crystal: couldn't rerank: {err:#}");
             found.truncate(limit);
             return found;
         }

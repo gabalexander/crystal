@@ -7,6 +7,7 @@ use crate::forge::Checkout;
 use crate::git;
 use crate::handover;
 use crate::layout::{self, Layout, Order};
+use crate::output::errln;
 use crate::protocol::{
     self, Backlog, NewSession, NewTask, PendingTask, Request, Response, TaskBrief, TaskSpec,
 };
@@ -386,7 +387,7 @@ pub fn pull_request_worktree(socket: &Path, checkout: &Checkout) -> Result<PathB
 fn tell_worktree(socket: &Path, path: &Path, branch: Option<String>, created: bool) {
     let event = Box::new(Event::worktree(created, path, branch.as_deref()));
     if let Err(err) = ask(socket, &Request::Emit { event }, true) {
-        eprintln!(
+        errln!(
             "crystal: couldn't tell the daemon about {}: {err:#}",
             path.display()
         );

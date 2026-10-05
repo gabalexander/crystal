@@ -23,6 +23,7 @@ use crate::event_log::Bus;
 use crate::events::{Event, Filter};
 use crate::handover::{self, HELPERS};
 use crate::notify::{self, Notice};
+use crate::output::errln;
 use crate::plugin_manifest::{self, Manifest};
 use crate::plugins::{self, Context, Id};
 use crate::shell;
@@ -62,7 +63,7 @@ pub fn follow(bus: &Arc<Bus>, socket: &Path) -> Arc<Hooks> {
             }
             // Dropped for falling behind: what was missed is lost, and the
             // hooks hear what happens from now on.
-            eprintln!("crystal daemon: the plugins fell behind, and missed events");
+            errln!("crystal daemon: the plugins fell behind, and missed events");
         }
     });
     hooks
@@ -328,9 +329,9 @@ fn pause(socket: &Path, bus: &Weak<Bus>, plugin: &Id) {
     );
     plugins::log(socket, plugin, &text);
     if let Err(err) = plugins::pause(socket, plugin, &text) {
-        eprintln!("crystal daemon: couldn't pause the {label} plugin: {err:#}");
+        errln!("crystal daemon: couldn't pause the {label} plugin: {err:#}");
     }
-    eprintln!("crystal daemon: {text}");
+    errln!("crystal daemon: {text}");
     if let Some(bus) = bus.upgrade() {
         let paused = Event {
             project: plugin.project.clone(),

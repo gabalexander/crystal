@@ -25,7 +25,10 @@ api_schema` writes it again.
 What a command prints on standard output goes through `out!` and `outln!` (`src/output.rs`) with a `?`, never
 `print!` and `println!`, which `clippy.toml` refuses: a reader gone, like `head -1`'s, stops the command and
 crystal exits 0, where `println!` panics. A line said along the way of work that must finish, like `crystal
-update`'s, is printed with `let _ =`, the work going on unread.
+update`'s, is printed with `let _ =`, the work going on unread. What crystal says on standard error, a warning, a
+question or the daemon's log, goes through `err!` and `errln!`, never `eprint!` and `eprintln!`, which
+`clippy.toml` refuses too: they carry on once standard error's reader has gone, as `2>&1 | head -1` leaves it,
+what they said lost.
 
 ## Releasing
 
@@ -762,7 +765,8 @@ whenever what's handed over changes in a way the crystal before couldn't read.
 - `src/output.rs`: what a command prints on standard output: `out!` and `outln!`, in place of `print!` and
   `println!`, and `Closed`, its reader gone, which stops the command and has `main` exit 0; SIGPIPE is left
   ignored, as the daemon, the TUI, `crystal attach`, `crystal mcp` and the hooks need it, and as a command's own
-  writes to the daemon's socket and its programs' pipes do
+  writes to the daemon's socket and its programs' pipes do; and what crystal says on standard error, `err!` and
+  `errln!` in place of `eprint!` and `eprintln!`, a write there that fails passed over
 - `src/printable.rs`: text crystal didn't write made fit for the user's terminal: control characters, the escape
   sequences they start and the explicit bidi controls taken out, on one line or keeping its lines; and the TUI's
   frame scrubbed of them last, since ratatui hands a zero-width one on to the terminal. A background task's
