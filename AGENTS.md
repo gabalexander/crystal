@@ -446,8 +446,9 @@ whenever what's handed over changes in a way the crystal before couldn't read.
 - `src/hook.rs`: `crystal hook <agent>`: what those hooks run, any agent's, to tell the daemon, the prompt sent,
   the conversation, the agent and a subagent included (the daemon passes over an agent's that isn't the one in
   front), and to pass on its reminder to an agent ending a turn with its task open, and to Claude Code, as the
-  user sends a prompt, the name the session was renamed to in crystal; with `--installed`, the hooks `crystal
-  integration` installed, and with `--event`, the event a hook or plugin names itself
+  user sends a prompt, the name the session was renamed to in crystal or the words asking it to name the
+  session; with `--installed`, the hooks `crystal integration` installed, and with `--event`, the event a hook or
+  plugin names itself
 - `src/claude_title.rs`: keeping a session's name and Claude Code's name for its conversation (`/rename`) in
   step: the file Claude Code keeps it in beside the transcript, looked at with each check, a rename since the
   first look followed unless the user named the session; and a rename in crystal, given once as the prompt
@@ -468,6 +469,10 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   at a time as it's written; and a model's name shortened for a row (adapted from docket's)
 - `src/agent_screen.rs`: reading what an agent is doing off its screen, title and progress, by its rules, and
   the watch that counts a new look once it holds for two checks
+- `src/subagents.rs`: an agent's subagents, counted as its hooks tell of them, and the turn it ends while they
+  still run, held open, the agent still at work, until they've stopped and it hasn't taken their work up within
+  a minute, a turn of its own ending the hold, or they've shown no sign of life for 15 minutes; handed over;
+  pure, with the time given, so it's unit-tested
 - `src/front.rs`: what's in front in a session's terminal (agent, shell or program), from its foreground process:
   an agent by its program's name, the catalog's or one its rules give, or by the npm package its rules name,
   or by `CRYSTAL_AGENT` in its environment for a wrapper that hides it; and the processes in the foreground
@@ -479,10 +484,10 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   its screen and history but the cursor's line, its own and every viewer's, the program sent nothing, the agent that says what it's doing
   itself while it holds the session, the pull request and the issue it's about apart from any task, the
   conversation its agent's hooks named, which counts once the agent has worked on a turn in it, an agent typed
-  into its shell whose conversation a restart resumes while it's in front, its agent's subagents,
-  whether its first prompt can name it, whether the user or a script gave its name, the name Claude Code gives
-  its conversation, whether its agent is blocked on the user, how long its agent has sat
-  idle (nobody watching or typing, its turn seen), the model its agent runs on and what was reported for its
+  into its shell whose conversation a restart resumes while it's in front, its agent's subagents and the turn
+  held for them, whether its first prompt can name it, whether the user or a script gave its name, whether its
+  agent is to name it or has been asked to, the name Claude Code gives its conversation, whether its agent is
+  blocked on the user, how long its agent has sat idle (nobody watching or typing, its turn seen), the model its agent runs on and what was reported for its
   row, why its screen reads the way it does (`crystal agent explain`), and what has changed in it (its agent's
   activity, a task's runs, its bell rung or a copy its program made while nobody watched) for the daemon to
   tell; one written down before
@@ -705,7 +710,9 @@ whenever what's handed over changes in a way the crystal before couldn't read.
     with a timeout, its uncommitted changes, and switching it to another branch or a new one, the changes
     stashed, brought along, committed or thrown away, and put back when git won't switch
 - `src/names.rs`: made-up names for new worktrees' branches, like `brave-otter`, and a session's name from its
-  first prompt, like `fix-login-redirect`, or from the name Claude Code gave its conversation
+  first prompt, like `fix-login-redirect`, from the name Claude Code gave its conversation, or from the few
+  words Claude Code picks when crystal asks it to with its first prompt (`ASK_AGENT`), which it gives with the
+  hidden `crystal name`, for a session nobody holds the name of (docket's AUTO-TITLE)
 - `src/forge.rs`: pull requests (open, and merged lately) and issues from the forge a project's remote is on,
   GitHub or GitLab, told apart by its host and the hosts `gh` and `glab` know: the types both read into,
   `Repo`'s calls, one pull request or issue among them read on its own, and running the CLI with a timeout; tests use a fake `gh` and `glab`, never the real ones.

@@ -236,6 +236,7 @@ pub fn new_task(socket: &Path, task: NewTask) -> Result<()> {
                 task: Some(goal),
                 backlog: None,
                 brief,
+                ..Purpose::default()
             };
             client::new_session_for(socket, name, cwd, command, purpose)?
         }
@@ -744,6 +745,7 @@ pub fn start_from_backlog(socket: &Path, dir: PathBuf, start: BacklogStart) -> R
         task: Some(goal),
         backlog: Some(number),
         brief,
+        ..Purpose::default()
     };
     Ok(client::new_session_for(socket, name, cwd, command, purpose)?.name)
 }

@@ -620,6 +620,19 @@ pub fn claude_keep_going(reason: &str) -> String {
     json!({ "decision": "block", "reason": reason }).to_string()
 }
 
+/// What a Claude Code hook prints for the prompt the user just sent to
+/// come with `context`, which Claude reads before it: the
+/// `UserPromptSubmit` hook's `additionalContext`.
+pub fn claude_context(context: &str) -> String {
+    json!({
+        "hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": context,
+        }
+    })
+    .to_string()
+}
+
 /// Settings for Claude Code that add a hook, `crystal hook claude`, to
 /// each event in [`CLAUDE_HOOK_EVENTS`].
 fn claude_settings(crystal: &Path) -> String {
@@ -1241,6 +1254,15 @@ mod tests {
         assert_eq!(
             output,
             json!({"decision": "block", "reason": "Close \"it\"."})
+        );
+    }
+
+    #[test]
+    fn a_prompt_hook_adds_to_what_claude_reads_with_the_prompt() {
+        let output: Value = serde_json::from_str(&claude_context("Name it.")).unwrap();
+        assert_eq!(
+            output["hookSpecificOutput"],
+            json!({"hookEventName": "UserPromptSubmit", "additionalContext": "Name it."})
         );
     }
 
