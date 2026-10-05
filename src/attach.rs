@@ -26,10 +26,10 @@ use crate::clipboard;
 use crate::config::Config;
 use crate::env;
 use crate::keys::{self, Typed};
-use crate::links;
+use crate::links::{self, Target};
 use crate::output::outln;
 use crate::plugins::{self, Context, Id};
-use crate::protocol::{Request, Response, State};
+use crate::protocol::{Request, Response, SessionInfo, State};
 use crate::tui::copy_mode::{CopyMode, Outcome, SearchPrompt};
 use crate::tui::keymap::{Bound, Chord, Command, Keymap};
 use crate::tui::mouse;
@@ -303,7 +303,7 @@ enum Took {
     /// Copy mode copies this, and is over.
     Copy(String),
     /// Copy mode opens this link, and is over.
-    Open(String),
+    Open(Target),
     /// Ctrl+\: the attach is over.
     Detach,
 }
@@ -358,8 +358,12 @@ impl Controls {
                                 shown.said = Some(copy_to_clipboard(&text));
                                 changed = true;
                             }
-                            Took::Open(url) => {
+                            Took::Open(Target::Url(url)) => {
                                 shown.said = Some(open_link(socket, &viewer.id, url));
+                                changed = true;
+                            }
+                            Took::Open(Target::File { path, line }) => {
+                                shown.said = Some(copy_path(socket, &viewer.id, &path, line));
                                 changed = true;
                             }
                             Took::Detach => {
@@ -643,7 +647,7 @@ fn copy_key(key: KeyEvent, shown: &mut Shown) -> Took {
         }
         Outcome::Leave => Took::Taken,
         Outcome::Copy(text) => Took::Copy(text),
-        Outcome::Open(url) => Took::Open(url),
+        Outcome::Open(target) => Took::Open(target),
     };
     shown.stop_copying();
     took
@@ -697,15 +701,45 @@ fn open_link(socket: &Path, id: &str, url: String) -> String {
     }
 }
 
+/// What `o` does with a file's path on the screen of the session with the
+/// id `id`, which `crystal attach` has no editor beside it to open in: puts
+/// the file's own path on your clipboard, with the line after it, for your
+/// editor. Says so, or why it couldn't.
+fn copy_path(socket: &Path, id: &str, path: &str, line: Option<usize>) -> String {
+    let dirs = match session(socket, id) {
+        Some(session) => links::dirs_of(&session),
+        None => vec![std::env::current_dir().unwrap_or_default()],
+    };
+    let Some(found) = links::find_file(path, &dirs) else {
+        return format!("there's no file {path} where the session runs");
+    };
+    let found = Target::File {
+        path: found.display().to_string(),
+        line,
+    };
+    let text = found.written();
+    match clipboard::copy(&text) {
+        Ok(()) => format!("copied {text}: crystal attach has no editor to open it in"),
+        Err(err) => format!("couldn't copy: {err:#}"),
+    }
+}
+
 /// What a plugin is told about the session with the id `id`: where it
 /// runs, or the directory the attach runs in, if it's gone.
 fn session_context(socket: &Path, id: &str) -> Context {
-    if let Ok(Some(Response::Sessions { sessions })) = client::ask(socket, &Request::List, false)
-        && let Some(session) = sessions.iter().find(|session| session.id == id)
-    {
-        return Context::of_session(session);
+    match session(socket, id) {
+        Some(session) => Context::of_session(&session),
+        None => Context::of_dir(&std::env::current_dir().unwrap_or_default()),
     }
-    Context::of_dir(&std::env::current_dir().unwrap_or_default())
+}
+
+/// The session with the id `id`, as the daemon has it, if it's there.
+fn session(socket: &Path, id: &str) -> Option<SessionInfo> {
+    let Ok(Some(Response::Sessions { sessions })) = client::ask(socket, &Request::List, false)
+    else {
+        return None;
+    };
+    sessions.into_iter().find(|session| session.id == id)
 }
 
 /// What a mouse event does on the screen of the attach.

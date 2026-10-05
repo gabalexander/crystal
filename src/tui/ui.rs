@@ -1150,11 +1150,13 @@ fn draw_pane(frame: &mut Frame, app: &App, look: &Look, slot: Slot, area: Rect, 
         current: theme.found_current,
         ..Marks::default()
     };
-    // The link under the mouse, with Ctrl held, is underlined.
+    // The link under the mouse, with Ctrl held, is underlined: a file's
+    // path only once there's a file there to open.
     let link = app
         .link_hover()
         .filter(|(over, _)| *over == slot)
-        .and_then(|(_, cell)| pane.screen.link_at(cell));
+        .and_then(|(_, cell)| pane.screen.link_at(cell))
+        .filter(|link| crate::links::can_open(&link.target, &app.link_dirs(slot)));
     let widget = ScreenWidget::new(&pane.screen)
         .with_defaults(theme.text, theme.background)
         .with_marks(marks)

@@ -158,6 +158,7 @@ and the footer says where you are and offers the keys that matter there, or, whe
 | Key | In the sidebar |
 |---|---|
 | `j` / `k`, `↓` / `↑` | select a session, or a worktree with no sessions |
+| `;` | go back to the session you were on before, in whichever [tab](#tabs) it is, as tmux's `last-pane` does, and `;` again comes back; one only passed over with `j` or `k` doesn't count. After the prefix in a pane, you type into it |
 | `Enter` | type into the selected session, or start an ended one again, once you've said `y`; on a worktree with no sessions, start one there |
 | `Space` | reply to the selected session without going into its pane: a box takes what to say, and `Enter` sends it, typed in with `Enter` after it, or as a [background task](#background-tasks)'s follow-up (`Alt+Enter` or `Ctrl+J` for a new line, `Esc` to cancel) |
 | `s` | split the selected session off into a pane of its own, beside its pane or below it, or close its split |
@@ -296,9 +297,20 @@ underlined. It opens in your browser, with `open` on macOS or `xdg-open` on Linu
 [plugin takes links like it](#link-handlers). Over ssh a browser opened on the other machine would be no use to
 you, so the link goes on your clipboard instead, as copying does. Your terminal has to hand the click to
 crystal: macOS's Terminal keeps `Ctrl`+click for its own menu, and iTerm2 does unless you turn that off in its
-settings. Copy mode's `o` opens the link under its cursor, from the keyboard. In `crystal attach`, a click on a
-link is your terminal's to open, as it finds them in the text, and copy mode's `o` opens the one under its
-cursor as the TUI does.
+settings. Copy mode's `o` opens the link under its cursor, from the keyboard.
+
+A file's path in a pane's text is a link too, like the `src/app.rs:42` an agent prints: `Ctrl`+click opens it
+in your `$EDITOR` (or `vi`) at that line, as a session of its own beside the one that printed it, the way
+[the file finder](#the-file-finder-and-the-tree-browser) opens one, and `;` takes you back. The line can follow
+the path as compilers and agents write it, `src/app.rs:42` or `src/app.rs:42:7`, as MSVC and TypeScript do,
+`src/app.ts(42,7)`, or as GitHub does, `src/app.rs#L42`; a diff's `a/` or `b/` before it, and a bracket, a quote
+or a full stop around it, are left out. A path is looked for where its session runs, then at the top of its
+worktree, or where it says when it's absolute or starts with `~/`, and only one that's a file there is
+underlined and opens.
+
+In `crystal attach`, a click on a link is your terminal's to open, as it finds them in the text, and copy
+mode's `o` opens the URL under its cursor as the TUI does; on a file's path, with no editor beside the session
+to open it in, it puts the file's whole path and its line on your clipboard.
 
 A split keeps a session on screen while the selection moves on. `s` splits the selected session off into a
 pane of its own: it stays where it is, and the pane that follows the selection takes the other half, to show
@@ -1091,7 +1103,7 @@ works on a session that has ended too, on the last it showed. `Ctrl+\` leaves co
 | `Y` | copy the line the cursor is on, and leave copy mode |
 | `/` / `?` | search down, or up, as you type: each key goes to the nearest match; `Enter` keeps it, `Esc` goes back |
 | `n` / `N` | the next match the same way, or the other way |
-| `o` | open the link under the cursor, as `Ctrl`+click does, and leave copy mode |
+| `o` | open the link under the cursor, a URL or a file's path, as `Ctrl`+click does, and leave copy mode |
 | `Esc` | drop the selection, then the search, then leave copy mode |
 | `q`, `Ctrl+C` | leave copy mode |
 
@@ -3181,8 +3193,9 @@ A `Ctrl`+click on a link in a pane, or copy mode's `o`, goes to the first plugin
 link handler whose `pattern` matches the link, the plugin's handlers tried in their order. The handler's
 `action` runs in place of your browser, about the session in that pane, with the link in `CRYSTAL_LINK`: open
 an issue in a pane of the plugin's own, say, or have an agent look at it. The pattern is a regular expression,
-matched anywhere in the link unless `^` and `$` pin it. `X` lists each plugin's handlers under it, and
-`crystal plugin run <name> --link <url>` runs the action its handlers give a link, to try them.
+matched anywhere in the link unless `^` and `$` pin it. A file's path in the text isn't one of their links: it
+opens in your editor. `X` lists each plugin's handlers under it, and `crystal plugin run <name> --link <url>`
+runs the action its handlers give a link, to try them.
 
 #### Events
 
@@ -3729,6 +3742,7 @@ emulates for it, as it would through any terminal.
 - [x] A sidebar in a stable order, or one of your own, and its rows laid out your way, with what agents report
 - [x] Idle sessions stopped by default, sparing work they left running, and back as you go to them; an agent
   kept warm for the next session
+- [x] Files' paths in panes opened in your editor at their line, and a key back to the session you were on
 
 ## Development
 

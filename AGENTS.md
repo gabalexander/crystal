@@ -90,8 +90,9 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   attach_capture`, the mouse taken: SGR reports picked out of the keys (one cut off held a moment for its end),
   handed to a program that asked, a drag selecting (a word on a double-click, a line on a triple-click, the
   history scrolling under one held on the top or bottom row), copied as it lets go or held in copy mode, the
-  wheel as arrows for a pager or scrolling the session's history, and back to live as you type; what it does
-  with the keys and the mouse kept apart from I/O, so it's unit-tested
+  wheel as arrows for a pager or scrolling the session's history, and back to live as you type; copy mode's
+  `o` on a file's path putting the file's whole path and its line on the clipboard, with no editor to open it
+  in; what it does with the keys and the mouse kept apart from I/O, so it's unit-tested
 - `src/bell.rs`: passing a session's terminal bell on to the user's own terminal, at most one every half a
   second
 - `src/viewer.rs`: the client's side of an attach, shared by `crystal attach`, the TUI's pane and the streams,
@@ -146,7 +147,8 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   from source with Nix
 - `src/tui/`: the TUI (`crystal` with no command)
   - `mod.rs`: the event loop: one channel of events, then update and draw (not for a move of the mouse that
-    changes nothing), opening the link a Ctrl+click or copy mode's `o` asks for, bringing the TUI's terminal to
+    changes nothing), opening the link a Ctrl+click or copy mode's `o` asks for, a file's path in the editor
+    as a session of its own, bringing the TUI's terminal to
     the front for `pane focus --raise`, ringing the user's terminal for a pane's bell or a session marked as
     having rung, putting on the clipboard what a pane's program copies (not a background task's); taking the
     mouse from the terminal or leaving it there (`[mouse] capture`), counting clicks for double- and
@@ -178,7 +180,8 @@ whenever what's handed over changes in a way the crystal before couldn't read.
     new-session panel like the selected session; `+`'s question, its `Tab` handed to the event loop to finish
     the directory; what crystal's processes take, and where the footer drew its readout of it, for a click;
     the session the selection rests on, for one crystal stopped idle to start again once it has rested there
-    a moment; no I/O, so it's unit-tested
+    a moment; `;` going back to the session the user was on before (see `recent.rs`), the keyboard into its
+    pane from a pane; no I/O, so it's unit-tested
     - `app/by_hand.rs`: moving the sidebar's sessions and projects by hand, with `move-up` and the rest, a drag
       of a session's row or a project's heading (a click on one folding it as the button comes up), and
       `crystal sidebar move`: a session among those beside it in its worktree, agents among agents, a project
@@ -210,6 +213,9 @@ whenever what's handed over changes in a way the crystal before couldn't read.
     dragged thumb takes it, and drawing it; pure, so it's unit-tested
   - `warm.rs`: asking the daemon to keep an agent warm where the selection is: once what it would be has held
     a moment, again every few minutes, and again once a session has taken it over; pure, so it's unit-tested
+  - `recent.rs`: the sessions the user has been on, the latest first, by name, for `;` to go back to the one
+    before in whichever tab it is: one the selection stayed on a second, not one passed over on the way, and
+    the one `;` leaves; the event loop notes the selection as it goes round; pure, so it's unit-tested
   - `tabs.rs`: tabs, as many as the user likes, each holding its own sessions (each session in exactly one)
     with its own selection, its tree of panes, the session the selection's pane last showed and the session
     floating over them, their order and which is in front; the sidebar shows only that tab's sessions; each
@@ -328,7 +334,8 @@ whenever what's handed over changes in a way the crystal before couldn't read.
     scrollbar's thumb dragged
   - `copy_mode.rs`: copy mode (`v`, and `crystal attach`'s): vi's keys over a screen and its history,
     selecting, searching as the search is typed (each key from where it began, `Esc` going back there), the
-    text to copy, and `o` for the link under the cursor; works on the screen, kept apart from I/O
+    text to copy, and `o` for the link under the cursor, a URL or a file's path; works on the screen, kept
+    apart from I/O
   - `screen_widget.rs`: draws a session's screen into ratatui, for the panes and `crystal attach`, with the
     link under the mouse underlined
   - `diff.rs`: reads `git diff`'s patch into files, hunks and lines, marks the words that changed,
@@ -533,8 +540,8 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   for the daemon to give its screen and every viewer's alike, the cells to draw, the input modes `crystal attach` asks your terminal for, and,
   for a viewer, copy mode's cursor, selection (of characters, words, lines or a block) and search, which are
   Alacritty's vi mode, where a search being typed began (`vt::Spot`, counted from the top of the history, so
-  output meanwhile doesn't move it), to search from at each key and go back to, and the link on a cell: a hyperlink a program wrote (OSC 8), or a URL in the text across
-  the rows it wrapped onto, as `vt::Link`; the
+  output meanwhile doesn't move it), to search from at each key and go back to, and the link on a cell: a hyperlink a program wrote (OSC 8), or a URL or a file's path in
+  the text across the rows it wrapped onto, as `vt::Link`; the
   times the program rang the bell; the text it last asked to copy (OSC 52), a read of the clipboard never
   answered; the progress a program reports (OSC 9;4), picked out of its output, which
   alacritty_terminal passes over; how much history a screen keeps, changed on a running one; a screen saved
@@ -542,8 +549,11 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   show again, without what its program set, above the program a cold restart starts in its place. The only
   module that uses
   `alacritty_terminal`
-- `src/links.rs`: opening a link a pane shows: `open` or `xdg-open`, or over ssh (or with neither) the link put
-  on the user's clipboard instead
+- `src/links.rs`: links a pane shows and opening them: a URL with `open` or `xdg-open`, or over ssh (or with
+  neither) put on the user's clipboard instead; a file's path in the text with the line after it (`:12`,
+  `:12:5`, `(12,5)`, `#L12`) read out of a line of it, and found where its session runs or at the top of its
+  worktree (adapted from docket's `visible_file_links`), for the TUI to open in the editor; the reading pure,
+  so it's unit-tested
 - `src/clipboard.rs`: putting text on the user's clipboard: `pbcopy`, `wl-copy`, `xclip` or `xsel` on their own
   machine, or OSC 52 to their terminal over ssh or when none of those works
 - `src/task.rs`: tasks: Claude Code run without a terminal (`claude -p`): one process taking the prompt and each

@@ -14466,6 +14466,69 @@ fn ctrl_click_opens_a_link_in_a_pane_and_over_ssh_copies_it() {
 }
 
 #[test]
+fn ctrl_click_opens_a_files_path_in_the_editor_and_semicolon_goes_back() {
+    let crystal = Crystal::new();
+    let project = crystal.dir.path().join("app");
+    std::fs::create_dir_all(project.join("src")).unwrap();
+    std::fs::write(project.join("src/main.rs"), "fn main() {}\n").unwrap();
+    let printing = "echo 'error at src/main.rs:2:5 and src/gone.rs:3'; sleep 30";
+    let project_arg = project.to_str().unwrap();
+    crystal.ok(&[
+        "new",
+        "-n",
+        "agent",
+        "-c",
+        project_arg,
+        "sh",
+        "-c",
+        printing,
+    ]);
+    // An editor that says where it ran and what it was asked to open.
+    let editor = crystal.dir.path().join("editor");
+    let edited = crystal.dir.path().join("edited");
+    script(
+        &editor,
+        "echo \"$PWD $*\" > \"$EDITED.new\" && mv \"$EDITED.new\" \"$EDITED\"\nsleep 30\n",
+    );
+
+    let mut tui = crystal.attach_with_env(
+        &[],
+        &[
+            ("EDITOR", editor.to_str().unwrap()),
+            ("EDITED", edited.to_str().unwrap()),
+        ],
+    );
+    tui.shows("src/gone.rs:3");
+    let (column, row) = (PANE_SCREEN_COLUMN, PANE_SCREEN_ROW);
+    // Held with Ctrl over the path of a file, the mouse underlines it and
+    // its line; over the path of none, nothing.
+    tui.type_keys(&mouse_move(column + 12, row, true));
+    eventually("the path is underlined", || {
+        tui.underlined(column as u16 + 9, row as u16)
+            && tui.underlined(column as u16 + 23, row as u16)
+    });
+    assert!(!tui.underlined(column as u16 + 24, row as u16));
+    tui.type_keys(&mouse_move(column + 32, row, true));
+    eventually("the underline goes", || {
+        !tui.underlined(column as u16 + 9, row as u16)
+    });
+    assert!(!tui.underlined(column as u16 + 32, row as u16));
+    // Long enough on the agent for it to be a session the user was on.
+    thread::sleep(Duration::from_millis(1100));
+
+    tui.type_keys(&ctrl_click(column + 12, row));
+    tui.shows("typing into main.rs");
+    let opened = written(&edited);
+    assert!(opened.ends_with("/app +2 src/main.rs\n"), "{opened}");
+
+    // The prefix and `;` go back to the agent, and again to the editor.
+    tui.type_keys("\x02;");
+    tui.shows("typing into agent");
+    tui.type_keys("\x02;");
+    tui.shows("typing into main.rs");
+}
+
+#[test]
 fn a_plugin_s_link_handler_opens_the_links_it_takes() {
     let crystal = Crystal::new();
     let manifest = r#"

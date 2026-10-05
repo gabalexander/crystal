@@ -48,6 +48,7 @@ use std::fmt;
 pub enum Command {
     Down,
     Up,
+    LastSession,
     Open,
     Reply,
     NextPane,
@@ -222,6 +223,12 @@ pub const COMMANDS: &[Spec] = &[
         "needs-you",
         "everything waiting on you, in every tab",
         &["U"],
+    ),
+    spec(
+        Command::LastSession,
+        "last-session",
+        "back to the session you were on before, in whichever tab it is",
+        &[";"],
     ),
     spec(
         Command::NewSession,
@@ -2144,6 +2151,7 @@ use Command as C;
 /// fit a small terminal.
 pub const HELP: &[HelpRow] = &[
     row("j/k ↓/↑", &[C::Down, C::Up], "select a session"),
+    row(";", &[C::LastSession], "back to the last session"),
     row("/", &[C::Search], "find anything; Tab: status"),
     row(":", &[C::Commands], "every command by name"),
     row("Enter", &[C::Open], "type into it, or rerun"),
