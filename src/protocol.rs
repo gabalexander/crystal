@@ -71,6 +71,14 @@ pub enum Request {
         /// just did: it isn't idle meanwhile.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         wakeup: Option<Wakeup>,
+        /// What the agent said last as its turn ended, when its hooks say:
+        /// whether it asks the user anything goes by it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        said: Option<String>,
+        /// The work of its own still to come as its turn ended, which wakes
+        /// it, when its hooks say: none when they say there's none.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pending: Option<Vec<Pending>>,
     },
     /// What an agent says about itself with `crystal report`. A program in
     /// a session says which by its `id`; from outside, it's the session's
@@ -900,7 +908,8 @@ pub struct SessionInfo {
     #[serde(default)]
     pub model: Option<String>,
     /// The line an agent or a script put on its row with `crystal report
-    /// --line`, until it's taken off or its time is up.
+    /// --line`, until it's taken off or its time is up; or, held working
+    /// while work of its own runs, what that is.
     #[serde(default)]
     pub line: Option<String>,
     /// The rest of what `crystal report` put on its row: a title, the
@@ -1778,6 +1787,38 @@ pub enum Wakeup {
     After { secs: u64 },
     /// Again and again, for as long as it runs.
     Recurring,
+}
+
+/// Work of an agent's own still to come as its turn ended, which wakes it
+/// once it's done or due, as Claude Code's Stop hook lists it: a task in
+/// the background, or a wakeup it scheduled.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+pub struct Pending {
+    pub kind: PendingKind,
+    /// What it is, in a few words: a command, a watch's or a subagent's
+    /// description.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub what: Option<String>,
+}
+
+/// What sort of work is still to come.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum PendingKind {
+    /// A command run in the background.
+    Shell,
+    /// A Monitor watch.
+    Monitor,
+    /// A subagent in the background.
+    Subagent,
+    /// A wakeup scheduled once.
+    Wakeup,
+    /// A wakeup that comes again and again.
+    Cron,
+    /// Any other task, like a workflow or a teammate.
+    Other,
 }
 
 /// What the agent in a session is doing.

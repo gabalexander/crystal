@@ -34,7 +34,9 @@ reads it; agents write it with `crystal remember`.
 ## When something needs you
 
 A session waiting on you wears `▲` and is pinned at the top of the sidebar, in whichever tab it's in. So is
-one a crash or a reboot couldn't start again, saying why: put that right and `Enter` starts it.
+one a crash or a reboot couldn't start again, saying why: put that right and `Enter` starts it. An agent that
+ends its turn with its task open asking you nothing, waiting on its tests or CI, wears `◇` and isn't pinned;
+one with work of its own still running, a command in the background or a Monitor, shows as working on it.
 
 - `u` goes to the next one that needs you, and `U` lists everything that does, the most urgent first.
 - `y`, `n` and `Y` answer a background task asking for a permission: yes, no, always.

@@ -97,6 +97,8 @@ fn report(socket: &Path, agent: &str, installed: bool, event: Option<&str>) -> R
         subagent: agents::subagent(&input).filter(|_| about_subagent),
         model: agents::hook_model(&input),
         wakeup: agents::hook_wakeup(&input),
+        said: agents::hook_said(&input),
+        pending: agents::hook_pending(&input),
     };
     match client::ask(socket, &report, false)? {
         // Codex's Stop hook takes the same answer as Claude Code's.
