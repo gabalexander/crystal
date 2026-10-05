@@ -130,6 +130,23 @@ const ANSWERS_FROM: f32 = 0.03;
 /// one while leaving out two in three of the rest.
 const KEPT_FROM: f32 = -0.05;
 
+/// How alike two entries' vectors have to be, by this model, for the second
+/// to be the first said again in other words, whatever the reranker makes of
+/// it: on crystal's notes, every pair this alike said the same thing.
+const SAME_FROM: f32 = 0.92;
+
+/// How alike two entries' vectors have to be for the reranker to be asked
+/// whether the second says what the first does. Below it, on crystal's notes,
+/// different lessons about the same thing scored as high with the reranker as
+/// the same lesson said again.
+const ALIKE_FROM: f32 = 0.87;
+
+/// The score the reranker, reading an entry as the query, gives one said
+/// before at least [`ALIKE_FROM`] alike for the two to say the same thing: on
+/// crystal's notes, different lessons that alike scored 0.36 at most, the same
+/// said again mostly 0.4 to 0.75.
+const SAME_RERANKED_FROM: f32 = 0.40;
+
 /// A model's files at a revision.
 pub struct Spec {
     pub repo: &'static str,
@@ -198,6 +215,24 @@ pub trait Embed {
     /// once one answers the query.
     fn kept_from(&self) -> f32 {
         KEPT_FROM
+    }
+
+    /// How alike two entries' vectors have to be for the second to say what
+    /// the first does, the reranker or not.
+    fn same_from(&self) -> f32 {
+        SAME_FROM
+    }
+
+    /// How alike two entries' vectors have to be for the reranker to be
+    /// asked whether the second says what the first does.
+    fn alike_from(&self) -> f32 {
+        ALIKE_FROM
+    }
+
+    /// The score from [`Embed::rerank`], an entry read as the query, one at
+    /// least [`Embed::alike_from`] alike has to reach to say the same thing.
+    fn same_reranked_from(&self) -> f32 {
+        SAME_RERANKED_FROM
     }
 }
 

@@ -2576,6 +2576,32 @@ impl Daemon {
                 let entries = store.find(&project, &query, &wanted, embed::as_embed(&embedder))?;
                 Ok(Response::Memory { entries })
             }
+            Request::Remember { project, entry } => {
+                crate::plugins::ensure_enabled(&settings(), "memory")?;
+                let embedder = embed::shared_now();
+                let mut store = memory::Store::open(&self.socket)?;
+                let added = store.add_with(&project, entry, embed::as_embed(&embedder))?;
+                if let memory::Added::New(entry) = &added {
+                    let added = Event::memory(Kind::MemoryAdded, project, entry.clone());
+                    self.events.emit(added);
+                }
+                Ok(Response::Remembered(added))
+            }
+            Request::DedupeMemory { dir, apply } => {
+                crate::plugins::ensure_enabled(&settings(), "memory")?;
+                let project = memory::project_of(&dir);
+                let embedder = embed::shared_now();
+                let merges =
+                    memory::dedupe(&self.socket, &project, embed::as_embed(&embedder), apply)?;
+                if apply {
+                    for merge in &merges {
+                        let ids: Vec<u64> = merge.merged.iter().map(|twin| twin.entry.id).collect();
+                        let merged = Event::merged(project.clone(), merge.kept.clone(), &ids);
+                        self.events.emit(merged);
+                    }
+                }
+                Ok(Response::Deduped { merges })
+            }
             Request::Tasks { dir, all } => {
                 tasks::ensure_enabled(&settings())?;
                 Ok(Response::Tasks {

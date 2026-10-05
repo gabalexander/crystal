@@ -323,6 +323,8 @@ crystal memory search ledger -k gotcha -f tests   # of a kind, about the files i
   after the rest, marked; check one in the code before you rely on it. `--fresh` leaves them out. It leaves out
   expired entries; `--all` brings them back.
 - An entry's first line is what lists show of it; `--title` gives it one of its own, over the rest.
+- What the memory has already, in the same words or with search by meaning on in others, is that entry seen
+  again, not a new one: `remembered 12 already, in other words: <what 12 says>`. Nothing more to do.
 - In a Claude Code session crystal started, the `memory_search` and `memory_show` tools search the memory and
   read an entry by its id without a shell command; use them when you have them.
 - `crystal memory` lists every entry; `crystal memory show <id>` reads one in full; `crystal memory rm <id>`

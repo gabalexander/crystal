@@ -671,7 +671,11 @@ whenever what's handed over changes in a way the crystal before couldn't read.
 - `src/memory.rs`: what a project's sessions learned: the SQLite store in the state directory with its FTS5
   index (bm25, prefix and porter-stemmed words), each entry's vector and search by meaning merged with it by
   reciprocal rank fusion, then the reranker's read of the best (nothing when none answers), its migrations,
-  the same said again seen again, forgotten entries the distiller can't add back, kept as they were to list,
+  the same said again seen again, in its words or, with the models, in others (as alike as `same_from`, or as
+  `alike_from` with the reranker agreeing), forgotten entries the distiller can't add back, kept as they were
+  to list, the entries kept twice grouped about the one each group keeps (`crystal memory dedupe`) and merged
+  into it, holding as its freshest did, kept apart so their words said again count as it said again, the
+  entries nearest in meaning to what a session said, for the distiller,
   bringing in a project's JSON file from before, anchors (what an entry's text names that looks like code and
   was in its worktree's code when it was said, `names_in`, and each file's SHA-256 then) and whether an entry
   holds, fresh, drifting or stale, by what it names, looked up among the words of a worktree's files
@@ -689,10 +693,12 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   export, and `enabled`, the one gate everything memory adds goes through
 - `src/distill.rs`: the distiller: after a task closes, or a session is archived that wasn't read as its task
   closed, one tool-less `claude -p` (Haiku by default, `[memory]`
-  in the config) over the end of its transcript, told what the memory has already, to keep lessons alone and
+  in the config) over the end of its transcript, told what the memory has already (the entries nearest in
+  meaning to the last things the session said, merged with those about its task), to keep lessons alone and
   never progress, status or what's only true today, with entries of each, and asked about the entries gone
   stale that are about the files the work touched, to keep, reword or forget, and which of the notes it's shown
-  are lessons, to make them so; its answer checked against the checkout before it's kept; and a pass over a
+  are lessons, to make them so; its answer checked against the checkout before it's kept, and what's there already in other
+  words seen again; and a pass over a
   project's notes alone for the lessons among them (`lessons_among`), for `crystal memory kind --notes`
 - `src/mcp.rs`: `crystal mcp`: an MCP server over stdio with `memory_search` and `memory_show`, which every
   Claude Code session crystal starts, in a terminal or a task in the background, is given with `--mcp-config`
@@ -700,7 +706,8 @@ whenever what's handed over changes in a way the crystal before couldn't read.
 - `src/embed.rs`: search by meaning: jina-embeddings-v5-text-small (its retrieval LoRA adapter folded into
   its weights as it loads) and jina-reranker-v3, both run through Candle on a Mac's GPU (Metal, bfloat16) or
   the CPU, one call at a time (Candle on Metal answers wrong to threads running models at once); `Embed` (the
-  models, or a stand-in in tests), with the scores from which the reranker counts an entry; downloading both at pinned revisions with their SHA-256s checked, by the daemon as it starts unless
+  models, or a stand-in in tests), with the scores from which the reranker counts an entry and from which two
+  entries say the same thing, measured on crystal's own memory; downloading both at pinned revisions with their SHA-256s checked, by the daemon as it starts unless
   `CRYSTAL_NO_MODEL_DOWNLOAD` is set; and the one copy each process loads when `[memory] embeddings` is on;
   memory.rs keeps the vectors and merges the rankings
 - `src/qwen3.rs`: Qwen3, the transformer both models are, adapted from candle-transformers' to read texts whole:
@@ -716,10 +723,12 @@ whenever what's handed over changes in a way the crystal before couldn't read.
 - `src/secrets.rs`: taking credentials out of text before memory keeps it or the distiller reads it
 - `src/memory_cli.rs`: `crystal remember` and `crystal memory`, `add`, `list` (by kind, what was forgotten,
   what reads as status or what expired), `search` (by kind, files, the stale left out or not, the expired too,
-  and how many), `show` (an agent's in a session finding it again), `rm` (several ids, or what reads as
-  status, listed until `--yes`), `kind` (entries' kinds by their ids, or the notes the distiller's model reads
-  as lessons, listed until `--yes`), `export` and `distill` included, and an entry in full as `show` and the
-  `memory_show` tool print it, with what's gone
+  and how many), `show` (an agent's in a session finding it again, or where an entry merged went), `rm`
+  (several ids, or what reads as status, listed until `--yes`), `kind` (entries' kinds by their ids, or the
+  notes the distiller's model reads as lessons, listed until `--yes`), `export`, `distill` and `dedupe` (each
+  group under the one kept, merged with `--apply`) included, adding and deduping through the daemon, which
+  keeps the models loaded, or here without one, and an entry in full as `show` and the `memory_show` tool
+  print it, with what's gone
 - `src/profile.rs`: agent profiles: what one runs, its prompt and postfix around the task or alone with no
   task (`skip_task`), how it's meant to start (`launch`: a session, a task or a background task), checking it,
   and saving or removing one in the config file with `toml_edit`, so the user's comments and layout stay;

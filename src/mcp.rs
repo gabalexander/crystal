@@ -172,7 +172,7 @@ impl Server {
         // Read in full, it's used, which keeps it from expiring.
         let entry = Store::open(&self.socket)?
             .used(&self.project, id)?
-            .with_context(|| format!("there's no entry {id}"))?;
+            .with_context(|| memory_cli::no_entry(&self.socket, &self.project, id))?;
         let item = memory::checked(entry, &self.project);
         Ok(memory_cli::in_full(&item, now()))
     }

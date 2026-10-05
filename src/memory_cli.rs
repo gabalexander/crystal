@@ -10,7 +10,7 @@ use crate::env;
 use crate::events::{self, Event};
 use crate::git::Checkout;
 use crate::memory::{
-    self, Added, Entry, Forgotten, Kind, Listed, Memory, New, Source, Store, Wanted,
+    self, Added, Entry, Forgotten, Kind, Listed, Memory, Merge, New, Source, Store, Wanted,
 };
 use crate::output::{err, errln, out, outln};
 use crate::printable;
@@ -51,18 +51,106 @@ pub fn remember(
         source: source(socket),
         checkout: Some(top),
     };
-    match memory::add(socket, &project, new)? {
-        Added::New(entry) => {
-            outln!("remembered {}", entry.id)?;
-            tell(
-                socket,
-                Event::memory(events::Kind::MemoryAdded, project, entry),
-            );
-        }
+    match added(socket, &project, new)? {
+        Added::New(entry) => outln!("remembered {}", entry.id)?,
         Added::Again(entry) => outln!("remembered {} already", entry.id)?,
+        Added::Alike(entry) => outln!(
+            "remembered {} already, in other words: {}",
+            entry.id,
+            printable::line(&memory::title(&entry.text))
+        )?,
         Added::Refused => unreachable!("only crystal is refused what was forgotten"),
     }
     Ok(())
+}
+
+/// Adds `new` to `project`'s memory: by the daemon, which keeps the models
+/// that find it said already in other words loaded, and tells of a new
+/// entry; or here, when there's no daemon to ask.
+fn added(socket: &Path, project: &Path, new: New) -> Result<Added> {
+    let request = Request::Remember {
+        project: project.to_path_buf(),
+        entry: new.clone(),
+    };
+    if let Ok(Some(Response::Remembered(added))) = client::ask(socket, &request, false) {
+        return Ok(added);
+    }
+    let embedder = embed::shared_now();
+    let added = Store::open(socket)?.add_with(project, new, embed::as_embed(&embedder))?;
+    if let Added::New(entry) = &added {
+        let event = Event::memory(
+            events::Kind::MemoryAdded,
+            project.to_path_buf(),
+            entry.clone(),
+        );
+        tell(socket, event);
+    }
+    Ok(added)
+}
+
+/// Lists the entries of the project's memory that say what another does,
+/// each group under the one it keeps, as `crystal memory dedupe` finds
+/// them, and with `apply`, merges them; found and merged by the daemon,
+/// which keeps the models loaded, or here, when there's no daemon to ask.
+pub fn dedupe(socket: &Path, dir: Option<PathBuf>, apply: bool) -> Result<()> {
+    check_on()?;
+    let dir = dir_or_current(dir)?;
+    let request = Request::DedupeMemory {
+        dir: dir.clone(),
+        apply,
+    };
+    let merges = match client::ask(socket, &request, false) {
+        Ok(Some(Response::Deduped { merges })) => merges,
+        Ok(_) => {
+            let project = memory::project_of(&dir);
+            let embedder = embed::shared_now();
+            let merges = memory::dedupe(socket, &project, embed::as_embed(&embedder), apply)?;
+            if apply {
+                for merge in &merges {
+                    let ids: Vec<u64> = merge.merged.iter().map(|twin| twin.entry.id).collect();
+                    tell(
+                        socket,
+                        Event::merged(project.clone(), merge.kept.clone(), &ids),
+                    );
+                }
+            }
+            merges
+        }
+        Err(err) => return Err(err),
+    };
+    out!("{}", merges_text(&merges, apply))?;
+    Ok(())
+}
+
+/// What `crystal memory dedupe` prints of `merges`: each one kept, by its
+/// id, kind and title, and under it each that goes into it, with how alike
+/// they are; then how many went, or would go with `--apply`.
+fn merges_text(merges: &[Merge], applied: bool) -> String {
+    let line = |entry: &Entry| {
+        printable::line(&format!(
+            "{:>4}  {:<8}  {}",
+            entry.id,
+            entry.kind.to_string(),
+            memory::title(&entry.text)
+        ))
+        .into_owned()
+    };
+    let mut text = String::new();
+    for merge in merges {
+        text.push_str(&format!("{}\n", line(&merge.kept)));
+        for twin in &merge.merged {
+            text.push_str(&format!("  ← {:.2}  {}\n", twin.alike, line(&twin.entry)));
+        }
+    }
+    let merged: usize = merges.iter().map(|merge| merge.merged.len()).sum();
+    let entries = if merged == 1 { "entry" } else { "entries" };
+    let into = merges.len();
+    text.push_str(&match (merged, applied) {
+        (0, _) => "no two entries say the same thing\n".to_string(),
+        (_, true) => format!("merged {merged} {entries} into {into}\n"),
+        (_, false) => format!("{merged} {entries} would go into {into}: --apply merges them\n"),
+    });
+    text
 }
 
 /// Which of a project's entries `crystal memory list` lists.
@@ -123,11 +211,21 @@ pub fn show(socket: &Path, dir: Option<PathBuf>, id: u64) -> Result<()> {
         None => store.get(&project, id)?,
     };
     let Some(entry) = entry else {
-        bail!("there's no entry {id}");
+        bail!("{}", no_entry(socket, &project, id));
     };
     let item = memory::checked(entry, &project);
     outln!("{}", in_full(&item, now()))?;
     Ok(())
+}
+
+/// Why there's no entry `id` in `project`'s memory to show: none was ever
+/// that, or it was merged into another, which says the same thing.
+pub fn no_entry(socket: &Path, project: &Path, id: u64) -> String {
+    let merged = Store::open(socket).and_then(|mut store| store.merged_into(project, id));
+    match merged {
+        Ok(Some(kept)) => format!("entry {id} was merged into {kept}, which says the same thing"),
+        _ => format!("there's no entry {id}"),
+    }
 }
 
 /// Prints the project's memory as markdown, newest first.
@@ -573,4 +671,59 @@ pub fn confirm(question: &str) -> Result<bool> {
 
 fn now() -> u64 {
     memory::seconds_since_epoch(SystemTime::now())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::memory::Twin;
+
+    fn entry(id: u64, kind: Kind, text: &str) -> Entry {
+        Entry {
+            id,
+            kind,
+            text: text.into(),
+            files: Vec::new(),
+            source: Source::User,
+            created: 0,
+            seen: 1,
+            last_seen: 0,
+            anchors: Default::default(),
+            checkout: None,
+            used: None,
+            names: Vec::new(),
+            counted_from: None,
+        }
+    }
+
+    #[test]
+    fn dedupe_lists_each_one_kept_with_what_goes_into_it() {
+        let merges = [Merge {
+            kept: entry(3, Kind::Gotcha, "The ledger needs redis\n\nStart it first."),
+            merged: vec![
+                Twin {
+                    entry: entry(7, Kind::Note, "redis has to run for the ledger"),
+                    alike: 0.934,
+                    reranked: Some(0.5),
+                },
+                Twin {
+                    entry: entry(9, Kind::Command, "make redis \x1b[31mfirst"),
+                    alike: 0.95,
+                    reranked: None,
+                },
+            ],
+        }];
+        assert_eq!(
+            merges_text(&merges, false),
+            "   3  gotcha    The ledger needs redis\n\
+             \x20 ← 0.93     7  note      redis has to run for the ledger\n\
+             \x20 ← 0.95     9  command   make redis [31mfirst\n\
+             2 entries would go into 1: --apply merges them\n"
+        );
+        assert!(merges_text(&merges, true).ends_with("\nmerged 2 entries into 1\n"));
+        assert_eq!(
+            merges_text(&[], false),
+            "no two entries say the same thing\n"
+        );
+    }
 }
