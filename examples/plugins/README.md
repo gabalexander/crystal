@@ -1,7 +1,7 @@
 # Example plugins
 
 Plugins to copy, or to install as they are: `crystal plugin install examples/plugins/<name>`, then
-`crystal plugin enable <name>`. See [Plugins](../../README.md#plugins) for what a plugin can do.
+`crystal plugin enable <name>`. See [Plugins](../../docs/plugins.md) for what a plugin can do.
 
 | Plugin | Hears | Does |
 |---|---|---|

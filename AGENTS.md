@@ -1,7 +1,8 @@
 # crystal
 
 A terminal workspace for running many coding agents at once: a background daemon that owns each agent's PTY,
-a status for every agent, and one list of projects, worktrees and sessions. README.md has the plan and the
+a status for every agent, and one list of projects, worktrees and sessions. README.md says what it is, how to
+install it and start, and where to read more; `docs/` has a page for each part of it, and `docs/roadmap.md` the
 roadmap.
 
 ## Commands
@@ -15,6 +16,12 @@ roadmap.
   `CRYSTAL_NO_SKILL=1`)
 
 Run lint, format and tests before every commit.
+
+The README stays short: what crystal is, installing it, a quick start, and a line for each page under `docs/`.
+A feature, a key, a setting or a command is written up on its page there: keys in `docs/keys.md`, whose table
+of sidebar keys a test keeps in step with the keymap; settings in `docs/configuration.md`; events in
+`docs/plugins.md`, whose table a test keeps in step with `events.rs`; and so on. A new topic is a page of its
+own, with a short intro and its contents, and a row in the README's table of documentation.
 
 Every type a request, a response or an event reaches derives `schemars::JsonSchema` in test builds alone
 (`#[cfg_attr(test, derive(schemars::JsonSchema))]`, schemars being a dev-dependency), a new one too, and one
@@ -145,6 +152,11 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   commands by key, nothing written unless the result makes sense; pure but for the files, so it's unit-tested
 - `docs/guide.md`: the guide, one page on what to start, the keys that matter most, what agents call and
   where things live, which the `?` overlay's second tab shows and `crystal guide` prints
+- `docs/`: the rest of the documentation, which the README lists, a page a topic: installing (`install.md`),
+  the TUI (`tui.md`), its keys (`keys.md`), sessions, the command line (`cli.md`), projects and worktrees,
+  diffs, files and pull requests (`code.md`), agents, agents driving agents (`driving.md`), tasks and the
+  backlog, flows, memory, events, plugins, settings (`configuration.md`), other machines and servers
+  (`servers.md`), how it works and the roadmap
 - `packaging/homebrew/`: the Homebrew formula for a tap, `crystal.rb`, installing a release's archive for the
   machine, and `formula.sh`, which fills in a release's version and checksums; `flake.nix` builds crystal
   from source with Nix
@@ -283,8 +295,8 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   - `help.rs`: the overlay `?` opens, a key a row: the sidebar's, the user's own, those that work in a pane
     without the prefix, resize mode's and the views' from the keymap, written as the user's `[keys]` has
     them, the rest from one table; its sections flowed into columns as tall as the terminal, two to a page,
-    the pages turned with the arrows, `Tab` going to the guide; a test keeps the README's table of sidebar
-    keys in step with the defaults
+    the pages turned with the arrows, `Tab` going to the guide; a test keeps the table of sidebar keys in
+    `docs/keys.md` in step with the defaults
   - `page.rs`: a markdown page over everything, scrolled with the arrows and any other key closing it: the
     guide (`docs/guide.md`), the `?` overlay's second tab, and what's new in crystal after an update; its
     state and keys, and its drawing
@@ -456,7 +468,8 @@ whenever what's handed over changes in a way the crystal before couldn't read.
 - `src/events.rs`: what happens, as events: the one `Event` type, its kinds (a public contract plugins listen
   for: add one, never rename one) and when each happens, what each carries, how one reads in a line, the filter
   a reader gives, the scope a timeline shows (a session, a task or a project), and the made-up event `plugin
-  run --event` tries hooks on; pure, so it's unit-tested
+  run --event` tries hooks on; pure, so it's unit-tested, and a test keeps the table of events in
+  `docs/plugins.md` in step with its kinds
 - `src/event_log.rs`: the event log, the `events` table in the database, read and pruned by age and count; and
   the daemon's `Bus`, which numbers each event (a `seq` that never goes back), writes it down and sends it to
   every subscriber: clients streaming over the socket, and the plugins' hooks

@@ -1758,7 +1758,7 @@ instructions = "Keep changes small."
             vec!["quick", "codex", "-"],
         ]
     );
-    // The README's example, word for word.
+    // docs/configuration.md's example, word for word.
     assert_eq!(
         crystal.ok(&["profile", "show", "quick"]),
         "quick\n\
