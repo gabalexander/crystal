@@ -281,7 +281,10 @@ impl Kind {
             Kind::HandoffAdded => "a note goes in a worktree's handoff file",
             Kind::MemoryAdded => "an entry is added to a project's memory",
             Kind::MemoryForgotten => "an entry is forgotten",
-            Kind::MemoryStale => "every file an entry is about has changed since it was said",
+            Kind::MemoryStale => {
+                "all an entry names is gone from the code, or naming nothing to look for, every \
+                 file it's about"
+            }
             Kind::MemoryPromoted => "an entry is written into the project's CLAUDE.md or AGENTS.md",
             Kind::MemoryDistilled => "the distiller has read what a session did",
             Kind::MemoryDistillFailed => "the distiller couldn't read what a session did",
@@ -565,14 +568,17 @@ pub struct ToolUse {
 }
 
 /// A pass of the distiller over what a session did: how many entries it
-/// added to the project's memory, found there already and turned down,
-/// and what it cost; or why it failed.
+/// added to the project's memory, found there already and turned down, how
+/// many of those gone stale it kept, reworded or forgot, and what it cost;
+/// or why it failed.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct DistillAbout {
     pub added: usize,
     pub again: usize,
     pub rejected: usize,
+    #[serde(default)]
+    pub rechecked: usize,
     pub cost_usd: f64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failed: Option<String>,
@@ -588,6 +594,9 @@ impl DistillAbout {
         let mut line = format!("{} added", self.added);
         if self.again > 0 {
             line.push_str(&format!(", {} seen again", self.again));
+        }
+        if self.rechecked > 0 {
+            line.push_str(&format!(", {} stale rechecked", self.rechecked));
         }
         if self.rejected > 0 {
             line.push_str(&format!(", {} rejected", self.rejected));
@@ -1449,6 +1458,7 @@ pub fn example(kind: Kind, session: Option<&SessionInfo>, dir: &Path) -> Event {
         last_seen: now,
         anchors: Default::default(),
         checkout: None,
+        names: Vec::new(),
         used: None,
     };
     let item = BacklogItem {
@@ -1607,6 +1617,7 @@ pub fn example(kind: Kind, session: Option<&SessionInfo>, dir: &Path) -> Event {
                 added: 2,
                 again: 1,
                 rejected: 0,
+                rechecked: 1,
                 cost_usd: 0.0012,
                 failed,
             };
@@ -2053,7 +2064,10 @@ mod tests {
             promoted.text()
         );
         let distilled = example(Kind::MemoryDistilled, Some(&session()), dir);
-        assert_eq!(distilled.line(), "claude: 2 added, 1 seen again ($0.0012)");
+        assert_eq!(
+            distilled.line(),
+            "claude: 2 added, 1 seen again, 1 stale rechecked ($0.0012)"
+        );
         let archived = Event::about_session(Kind::SessionArchived, &session());
         assert_eq!(archived.line(), "claude: session.archived");
         for kind in Kind::ALL {

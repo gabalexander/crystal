@@ -8854,15 +8854,16 @@ fn claude_starts_with_what_its_project_remembered_in_its_system_prompt() {
         "gotcha",
         "The ledger tests need the database up",
     ]);
-    // About a file that has changed since, so stale: Claude isn't shown it.
-    std::fs::write(repo.join("ledger.rs"), "fn round() {}").unwrap();
+    // Naming what's gone from the code since, so stale: Claude isn't shown
+    // it.
+    std::fs::write(repo.join("ledger.rs"), "fn round_cents() {}").unwrap();
     crystal.ok(&[
         "remember",
         "-C",
         repo_dir,
         "-f",
         "ledger.rs",
-        "Ledger rounding lives in ledger.rs",
+        "Ledger rounding lives in round_cents",
     ]);
     std::fs::write(repo.join("ledger.rs"), "fn round_down() {}").unwrap();
     let bin = fake_claude(crystal.dir.path());
@@ -9134,10 +9135,20 @@ fn memory_marks_an_entry_drifting_and_shows_and_exports_it_in_full() {
          About `a.rs`, `b.rs`. From you.\n"
     );
 
-    // Once all its files have changed, it's stale.
+    // Naming nothing to look for, it's stale once every file it's about
+    // is gone.
     std::fs::write(repo.join("b.rs"), "changed").unwrap();
     let listed = crystal.ok(&["memory", "-C", repo_dir]);
+    assert!(listed.contains("(a.rs, b.rs)  [drifting]"), "{listed}");
+    std::fs::remove_file(repo.join("a.rs")).unwrap();
+    std::fs::remove_file(repo.join("b.rs")).unwrap();
+    let listed = crystal.ok(&["memory", "-C", repo_dir]);
     assert!(listed.contains("(a.rs, b.rs)  [stale]"), "{listed}");
+    let shown = crystal.ok(&["memory", "-C", repo_dir, "show", "1"]);
+    assert!(
+        shown.starts_with("1 · gotcha · stale: every file it's about is gone\n"),
+        "{shown}"
+    );
     let refused = crystal.fails(&["memory", "-C", repo_dir, "show", "7"]);
     assert!(refused.contains("there's no entry 7"), "{refused}");
 }
@@ -9165,11 +9176,11 @@ fn memory_search_lists_the_entries_that_share_its_words() {
 }
 
 #[test]
-fn memory_search_keeps_to_a_kind_and_files_and_leaves_the_stale_out() {
+fn memory_search_keeps_to_a_kind_and_files_and_gives_the_stale_last() {
     let (crystal, repo) = crystal_remembering();
     let repo_dir = repo.to_str().unwrap();
     std::fs::create_dir(repo.join("src")).unwrap();
-    std::fs::write(repo.join("src/ledger.rs"), "ledger").unwrap();
+    std::fs::write(repo.join("src/ledger.rs"), "fn ledger_redis() {}").unwrap();
     std::fs::write(repo.join("src/fees.rs"), "fees").unwrap();
     let remember = |args: &[&str]| {
         let mut all = vec!["remember", "-C", repo_dir];
@@ -9181,7 +9192,7 @@ fn memory_search_keeps_to_a_kind_and_files_and_leaves_the_stale_out() {
         "gotcha",
         "-f",
         "src/ledger.rs",
-        "The ledger tests need redis",
+        "The ledger tests need redis: ledger_redis",
     ]);
     remember(&[
         "-k",
@@ -9214,12 +9225,18 @@ fn memory_search_keeps_to_a_kind_and_files_and_leaves_the_stale_out() {
     );
     assert_eq!(search(repo_dir, &["ledger", "-n", "1"]).len(), 1);
 
-    // Stale, it's left out, unless --all says otherwise.
+    // Stale, it comes after the rest, marked, unless --fresh leaves it out.
     std::fs::write(repo.join("src/ledger.rs"), "changed").unwrap();
-    assert_eq!(search(repo_dir, &["ledger"]), [2, 3]);
+    let found = crystal.ok(&["memory", "-C", repo_dir, "search", "ledger", "redis"]);
+    let last = found.lines().last().unwrap();
+    assert!(
+        last.contains("need redis: ledger_redis  (src/ledger.rs)  [stale]"),
+        "{found}"
+    );
+    assert_eq!(search(repo_dir, &["ledger", "--fresh"]), [2, 3]);
+    // What asked for the stale before still runs.
     assert_eq!(search(repo_dir, &["ledger", "--all"]), [1, 2, 3]);
-    let found = crystal.ok(&["memory", "-C", repo_dir, "search", "redis", "-a"]);
-    assert!(found.contains("[stale]"), "{found}");
+    assert_eq!(search(repo_dir, &["redis", "-a"]), [1]);
 }
 
 #[test]
@@ -9436,17 +9453,17 @@ fn memory_promote_adds_the_entry_to_claude_md_under_notes() {
 }
 
 #[test]
-fn an_entry_whose_files_have_all_changed_is_told_of_as_a_task_closes() {
+fn an_entry_whose_names_are_gone_is_told_of_as_a_task_closes() {
     let (crystal, repo) = crystal_remembering();
     let repo_dir = repo.to_str().unwrap();
-    std::fs::write(repo.join("Makefile"), "test:\n\tcargo test\n").unwrap();
+    std::fs::write(repo.join("Makefile"), "test:\n\tcargo test --workspace\n").unwrap();
     crystal.ok(&[
         "remember",
         "-C",
         repo_dir,
         "-f",
         "Makefile",
-        "make test runs the tests",
+        "make test runs the tests with --workspace",
     ]);
     crystal.ok(&[
         "new", "-d", "-n", "fixer", "-c", repo_dir, "-t", "fix it", "sleep", "30",
@@ -13694,7 +13711,8 @@ fn a_closed_task_is_kept_in_its_project_s_history_not_its_memory() {
 /// distiller, run with `--json-schema`, it
 /// writes its arguments to `distill-args` and its message to
 /// `distill-message`, and answers with two entries, one of a kind it may
-/// not give. Returns the directory to put on the PATH.
+/// not give, and that the first stale entry it's asked about no longer
+/// holds. Returns the directory to put on the PATH.
 fn distilling_claude(dir: &Path) -> PathBuf {
     let bin = dir.join("distilling-bin");
     std::fs::create_dir(&bin).unwrap();
@@ -13704,7 +13722,10 @@ fn distilling_claude(dir: &Path) -> PathBuf {
 *" --json-schema "*)
     cat > distill-message
     printf '%s\n' "$@" > distill-args.new && mv distill-args.new distill-args
-    echo '{"type":"result","subtype":"success","is_error":false,"result":"","structured_output":{"entries":[{"kind":"gotcha","text":"The ledger tests need redis up","files":["ledger.rs"]},{"kind":"outcome","text":"fixed it","files":[]}]},"total_cost_usd":0.01}'
+    stale=$(sed -n 's/^- id \([0-9]*\): .*/\1/p' distill-message | head -n 1)
+    rechecked=""
+    [ -n "$stale" ] && rechecked='{"id":'"$stale"',"verdict":"forget","text":""}'
+    echo '{"type":"result","subtype":"success","is_error":false,"result":"","structured_output":{"entries":[{"kind":"gotcha","text":"The ledger tests need redis up","files":["ledger.rs"]},{"kind":"outcome","text":"fixed it","files":[]}],"rechecked":['"$rechecked"']},"total_cost_usd":0.01}'
     ;;
 *)
     printf '%s\n' "$@" > task-args.new && mv task-args.new task-args
@@ -13900,6 +13921,52 @@ fn the_distiller_keeps_what_a_closed_task_learned() {
     assert!(said.contains("1 forgotten before"), "{said}");
     let listed = crystal.ok(&["memory", "-C", repo_dir]);
     assert!(!listed.contains("ledger tests"), "{listed}");
+}
+
+#[test]
+fn the_distiller_is_asked_whether_a_stale_entry_the_task_touched_still_holds() {
+    let (crystal, repo) = crystal_remembering();
+    let repo_dir = repo.to_str().unwrap();
+    std::fs::write(repo.join("ledger.rs"), "fn old_ledger() {}").unwrap();
+    git(&repo, &["add", "ledger.rs"]);
+    git(&repo, &["commit", "-q", "-m", "ledger"]);
+    crystal.ok(&[
+        "remember",
+        "-C",
+        repo_dir,
+        "-k",
+        "gotcha",
+        "-f",
+        "ledger.rs",
+        "Call `old_ledger()` before a refund",
+    ]);
+    // The task changes the file, and what the entry names is gone.
+    std::fs::write(repo.join("ledger.rs"), "fn new_ledger() {}").unwrap();
+    let listed = crystal.ok(&["memory", "-C", repo_dir]);
+    assert!(
+        listed.contains("before a refund  (ledger.rs)  [stale]"),
+        "{listed}"
+    );
+    let bin = distilling_claude(crystal.dir.path());
+    start_fixer(&crystal, &repo, &bin);
+
+    eventually("the stale entry is forgotten", || {
+        crystal
+            .ok(&["memory", "-C", repo_dir, "list", "--forgotten"])
+            .contains("Call `old_ledger()` before a refund")
+    });
+    let message = std::fs::read_to_string(repo.join("distill-message")).unwrap();
+    assert!(
+        message.contains(
+            "- id 1: (gotcha) Call `old_ledger()` before a refund [gone from the code: \
+             old_ledger]\n"
+        ),
+        "{message}"
+    );
+    let forgot = crystal.ok(&["events", "-k", "memory.forgotten"]);
+    assert!(forgot.contains("old_ledger"), "{forgot}");
+    let distilled = crystal.ok(&["events", "-k", "memory.distilled"]);
+    assert!(distilled.contains("1 stale rechecked"), "{distilled}");
 }
 
 #[test]

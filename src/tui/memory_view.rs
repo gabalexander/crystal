@@ -478,16 +478,10 @@ fn draw_entry(frame: &mut Frame, view: &MemoryView, look: &Look, area: Rect) {
             Style::new().fg(theme.branch),
         ));
     }
-    let holds = match item.freshness {
-        Freshness::Fresh => None,
-        Freshness::Drifting => Some(
-            " drifting: some of the files it's about have changed since, so it may hold only in \
-             part",
-        ),
-        Freshness::Stale => {
-            Some(" stale: the files it's about have changed since, so it may no longer hold")
-        }
-    };
+    let holds = item.how_it_holds().map(|holds| match item.freshness {
+        Freshness::Stale => format!(" {holds}, so it may no longer hold"),
+        _ => format!(" {holds}, so it may hold only in part"),
+    });
     if let Some(holds) = holds {
         lines.push(Line::styled(holds, Style::new().fg(theme.waiting)));
     }
@@ -525,9 +519,11 @@ mod tests {
                 last_seen: 1_000,
                 anchors: Default::default(),
                 checkout: None,
+                names: Vec::new(),
                 used: None,
             },
             freshness: Freshness::Fresh,
+            gone: Vec::new(),
         }
     }
 

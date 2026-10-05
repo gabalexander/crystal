@@ -29,11 +29,18 @@
 //! or by an agent reading it in full, expires after a while: searches and
 //! agents starting leave it out, and the list marks it.
 //!
-//! An entry can name the files it's about, and keeps a hash of each as it
-//! was when the entry was said: its anchors. Once some of them change, the
-//! entry is drifting, and may hold only in part; once all of them have, it's
-//! stale, and agents aren't shown it as they start. A search marks both
-//! where they rank.
+//! Whether an entry still holds goes by what it names: the identifiers,
+//! paths, commands and flags in its text (`local_origin`,
+//! `Request::Shutdown`, `src/agent_rules.rs`, `--test-threads`) that were
+//! in its worktree's code when it was said. While they're all still there,
+//! it holds, however much its files have changed; once some are gone, it's
+//! drifting, and may hold only in part; once all of them are, it's stale.
+//! An entry that names nothing to look for goes by the files it's about
+//! instead, a hash of each kept as it was when it was said: drifting once
+//! some have changed, and stale once every one is gone. Those, and the
+//! names, are its anchors. Agents starting aren't shown the stale; a search
+//! gives them after the rest, marked, and the distiller is asked whether
+//! those about the files a task touched still hold.
 //!
 //! The user can turn all of it off: [`enabled`] is the one place that
 //! decides, and everything memory adds asks it first.
@@ -50,7 +57,7 @@ use regex::RegexSet;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -69,9 +76,80 @@ const LAUNCH_TEXT_LENGTH: usize = 300;
 /// relevant are left out first.
 const LAUNCH_BYTES: usize = 800;
 
-/// The biggest file an anchor hashes. A file an entry is about is source,
-/// far smaller; one bigger is data, not worth reading through each time.
+/// The biggest file an anchor hashes, or whose words are looked through
+/// for an entry's names. A file an entry is about is source, far smaller;
+/// one bigger is data, not worth reading through each time.
 const MAX_ANCHORED_BYTES: u64 = 8 * 1024 * 1024;
+
+/// The most of a worktree read for the names entries give, in bytes, its
+/// files in the order git lists them: crystal's own is under 8 MiB.
+const MAX_WORDS_READ: u64 = 64 * 1024 * 1024;
+
+/// The most files of a directory outside git read for the names entries
+/// give.
+const MAX_WALKED: usize = 5_000;
+
+/// The directories of what's built or fetched, never read for names
+/// outside git, where nothing says to ignore them.
+const NOT_WALKED: &[&str] = &["node_modules", "target"];
+
+/// The most names an entry is checked by: the first it gives.
+const MAX_NAMES: usize = 16;
+
+/// The extensions that make a word a file's name, like `memory.db`.
+const EXTENSIONS: &[&str] = &[
+    "c", "cpp", "css", "db", "go", "h", "html", "java", "js", "json", "jsonl", "jsx", "kt", "lock",
+    "log", "lua", "md", "nix", "py", "rb", "rs", "sh", "sock", "sql", "swift", "toml", "ts", "tsx",
+    "txt", "yaml", "yml",
+];
+
+/// Words shaped like code that name nothing an entry could lose: Rust's
+/// keywords and commonest types, and products' names.
+const NOT_NAMES: &[&str] = &[
+    "Err",
+    "GitHub",
+    "GitLab",
+    "JavaScript",
+    "LaTeX",
+    "MySQL",
+    "NeoVim",
+    "None",
+    "Ok",
+    "OpenAI",
+    "Option",
+    "PostgreSQL",
+    "PowerShell",
+    "Result",
+    "SQLite",
+    "Self",
+    "Some",
+    "String",
+    "TypeScript",
+    "VSCode",
+    "Vec",
+    "WezTerm",
+    "YouTube",
+    "async",
+    "await",
+    "bool",
+    "crate",
+    "false",
+    "iOS",
+    "iTerm",
+    "iTerm2",
+    "impl",
+    "let",
+    "macOS",
+    "mod",
+    "mut",
+    "pub",
+    "self",
+    "str",
+    "super",
+    "true",
+    "use",
+    "usize",
+];
 
 /// The most entries a search gives back.
 pub const SEARCH_LIMIT: usize = 50;
@@ -236,6 +314,12 @@ const TOLD_STALE: &str = "
 ALTER TABLE entries ADD COLUMN told_stale INTEGER NOT NULL DEFAULT 0;
 ";
 
+/// The names each entry's text gives that were in its worktree's code when
+/// it was last said, which it's checked by: see [`add_names`].
+const NAMES: &str = "
+ALTER TABLE entries ADD COLUMN names TEXT NOT NULL DEFAULT '[]';
+";
+
 /// What each forgotten entry said, beside the hash of its words, for
 /// `crystal memory list --forgotten` to show: its id, kind, text and files,
 /// where it came from, and when it was forgotten. Those forgotten before
@@ -266,11 +350,12 @@ const MIGRATIONS: &[fn(&Connection) -> Result<()>] = &[
     |conn| Ok(conn.execute_batch(FORGOTTEN_ENTRIES)?),
     shorten_outcomes,
     |conn| Ok(conn.execute_batch(USED)?),
+    add_names,
 ];
 
 /// The columns [`entry_of`] reads, in its order.
 const COLUMNS: &str = "e.id, e.kind, e.text, e.files, e.source, e.created, e.seen, e.last_seen, \
-                       e.anchors, e.checkout, e.used";
+                       e.anchors, e.checkout, e.used, e.names";
 
 /// Whether memory is on, the `memory` plugin: the one gate for everything
 /// it adds, from the launch paragraph to the TUI's view and the commands.
@@ -477,6 +562,11 @@ pub struct Entry {
     /// when it's `None`.
     #[serde(default)]
     pub checkout: Option<PathBuf>,
+    /// What its text names that was in the code when it was last said: the
+    /// identifiers, paths, commands and flags in it, to tell whether
+    /// they're still there.
+    #[serde(default)]
+    pub names: Vec<String>,
     /// When an agent last read it in full, in seconds since the Unix epoch.
     #[serde(default)]
     pub used: Option<u64>,
@@ -543,7 +633,7 @@ pub struct Wanted {
     /// Only entries about one of these files, or a file under one of them,
     /// each from the top of the project.
     pub files: Vec<String>,
-    /// Leave the stale out.
+    /// Leave the stale out, rather than give them after the rest.
     pub fresh: bool,
     /// The expired too, which are left out otherwise.
     #[serde(default)]
@@ -605,7 +695,8 @@ impl Store {
     /// Adds `new` to `project`'s memory: a new entry, or one it has already
     /// seen again. Credentials in its text are taken out first, and so are
     /// control characters, which would drive the terminal of whoever reads
-    /// it. Either way, it's anchored to its files as they are now.
+    /// it. Either way, it's anchored to its files and what it names as they
+    /// are now.
     pub fn add(&mut self, project: &Path, new: New) -> Result<Added> {
         let text = clean(&secrets::redact(new.text.trim()));
         if text.trim().is_empty() {
@@ -615,6 +706,10 @@ impl Store {
         let name = self.ready(project)?;
         let now = seconds_since_epoch(SystemTime::now());
         let checkout = new.checkout.as_deref().unwrap_or(project);
+        // Read before the database is held: the worktree's words are kept
+        // for the same said again in other words, below.
+        let mut code = Code::default();
+        let names = code.names_in(checkout, &text, &new.files);
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -637,7 +732,7 @@ impl Store {
             let anchors = anchors_in(checkout, &files);
             tx.execute(
                 "UPDATE entries SET seen = seen + 1, last_seen = ?3, files = ?4, anchors = ?5, \
-                 checkout = ?6, told_stale = 0 WHERE project = ?1 AND id = ?2",
+                 checkout = ?6, names = ?7, told_stale = 0 WHERE project = ?1 AND id = ?2",
                 params![
                     name,
                     said.id,
@@ -645,6 +740,7 @@ impl Store {
                     serde_json::to_string(&files)?,
                     serde_json::to_string(&anchors)?,
                     path_text(&new.checkout),
+                    serde_json::to_string(&code.names_in(checkout, &said.text, &files))?,
                 ],
             )?;
             let entry = get(&tx, &name, said.id)?.context("the entry just seen is gone")?;
@@ -678,8 +774,9 @@ impl Store {
         let entry = Entry {
             id,
             kind: new.kind,
-            text,
             anchors: anchors_in(checkout, &new.files),
+            names,
+            text,
             files: new.files,
             source: new.source,
             created: now,
@@ -691,6 +788,88 @@ impl Store {
         insert(&tx, &name, &entry)?;
         tx.commit()?;
         Ok(Added::New(entry))
+    }
+
+    /// Anchors entry `id` of `project` again to its files and what it names
+    /// as they are in `checkout` now: it holds as it is, someone who knows
+    /// says, so it's fresh, and can be told of going stale again. Gives the
+    /// entry back.
+    pub fn reanchor(&mut self, project: &Path, id: u64, checkout: &Path) -> Result<Entry> {
+        let name = self.ready(project)?;
+        let entry =
+            get(&self.conn, &name, id)?.with_context(|| format!("there's no entry {id}"))?;
+        let mut code = Code::default();
+        self.conn.execute(
+            "UPDATE entries SET anchors = ?3, names = ?4, checkout = ?5, told_stale = 0 \
+             WHERE project = ?1 AND id = ?2",
+            params![
+                name,
+                id,
+                serde_json::to_string(&anchors_in(checkout, &entry.files))?,
+                serde_json::to_string(&code.names_in(checkout, &entry.text, &entry.files))?,
+                checkout.to_string_lossy(),
+            ],
+        )?;
+        get(&self.conn, &name, id)?.context("the entry just anchored is gone")
+    }
+
+    /// Puts `text` in place of what entry `id` of `project` says, anchored
+    /// to its files and what `text` names as they are in `checkout` now,
+    /// under the same id. Cleaned as [`Store::add`] cleans what it keeps;
+    /// refused when it says what another entry says, or what was forgotten.
+    /// Gives the entry back.
+    pub fn reword(
+        &mut self,
+        project: &Path,
+        id: u64,
+        text: &str,
+        checkout: &Path,
+    ) -> Result<Entry> {
+        let text = clean(&secrets::redact(text.trim()));
+        let key = key_of(&text);
+        if key.is_empty() {
+            bail!("it says nothing");
+        }
+        let name = self.ready(project)?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let entry = get(&tx, &name, id)?.with_context(|| format!("there's no entry {id}"))?;
+        let other: Option<u64> = tx
+            .query_row(
+                "SELECT id FROM entries WHERE project = ?1 AND key = ?2 AND id != ?3",
+                params![name, key, id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(other) = other {
+            bail!("it says what entry {other} says");
+        }
+        let forgotten: bool = tx.query_row(
+            "SELECT EXISTS (SELECT 1 FROM forgotten WHERE project = ?1 AND key = ?2)",
+            params![name, hash(&key)],
+            |row| row.get(0),
+        )?;
+        if forgotten {
+            bail!("it says what was forgotten");
+        }
+        let mut code = Code::default();
+        tx.execute(
+            "UPDATE entries SET text = ?3, key = ?4, anchors = ?5, names = ?6, checkout = ?7, \
+             told_stale = 0 WHERE project = ?1 AND id = ?2",
+            params![
+                name,
+                id,
+                text,
+                key,
+                serde_json::to_string(&anchors_in(checkout, &entry.files))?,
+                serde_json::to_string(&code.names_in(checkout, &text, &entry.files))?,
+                checkout.to_string_lossy(),
+            ],
+        )?;
+        let entry = get(&tx, &name, id)?.context("the entry just reworded is gone")?;
+        tx.commit()?;
+        Ok(entry)
     }
 
     /// Takes entry `id` out of `project`'s memory, and gives it back. What
@@ -780,13 +959,13 @@ impl Store {
         get(&self.conn, &name, id)
     }
 
-    /// Every project's entries that are anchored to files, each with its
-    /// project's main worktree and whether the daemon has told of it going
-    /// stale: those that can go stale.
+    /// Every project's entries that are anchored to names or files, each
+    /// with its project's main worktree and whether the daemon has told of
+    /// it going stale: those that can go stale.
     fn anchored(&mut self) -> Result<Vec<(PathBuf, Entry, bool)>> {
         let mut query = self.conn.prepare(&format!(
             "SELECT {COLUMNS}, e.project, e.told_stale FROM entries e \
-             WHERE e.anchors != '{{}}' ORDER BY e.project, e.id"
+             WHERE e.anchors != '{{}}' OR e.names != '[]' ORDER BY e.project, e.id"
         ))?;
         let anchored = query.query_map([], |row| {
             let project: String = row.get("project")?;
@@ -797,6 +976,23 @@ impl Store {
             ))
         })?;
         Ok(anchored.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// The entries of `project` about any of `files` that have gone stale,
+    /// said most recently first, `limit` at most, each with what's gone:
+    /// those to ask about again.
+    pub fn stale_about(
+        &mut self,
+        project: &Path,
+        files: &[String],
+        limit: usize,
+    ) -> Result<Vec<Listed>> {
+        // Every one about them: a file nearly every task changes has many.
+        let about = self.about_files(project, files, i64::MAX as usize)?;
+        let mut stale = marked(about, project);
+        stale.retain(|item| item.freshness == Freshness::Stale);
+        stale.truncate(limit);
+        Ok(stale)
     }
 
     /// Notes whether the daemon has told of entry `id` of `project` going
@@ -810,8 +1006,13 @@ impl Store {
     }
 
     /// The entries of `project` about any of `files`, said most recently
-    /// first.
-    fn about_files(&mut self, project: &Path, files: &[String]) -> Result<Vec<Entry>> {
+    /// first, `limit` at most.
+    fn about_files(
+        &mut self,
+        project: &Path,
+        files: &[String],
+        limit: usize,
+    ) -> Result<Vec<Entry>> {
         if files.is_empty() {
             return Ok(Vec::new());
         }
@@ -822,7 +1023,7 @@ impl Store {
              ORDER BY e.last_seen DESC, e.id DESC LIMIT ?3"
         ))?;
         let files = serde_json::to_string(files)?;
-        let about = about.query_map(params![name, files, SEARCH_LIMIT], entry_of)?;
+        let about = about.query_map(params![name, files, limit], entry_of)?;
         Ok(about.collect::<rusqlite::Result<_>>()?)
     }
 
@@ -849,10 +1050,11 @@ impl Store {
     }
 
     /// The entries of `project` that have to do with `text`, as `wanted`
-    /// says, the best first, each with whether it still holds: as
-    /// [`Store::search_about`] finds them, the expired too if it says so,
-    /// the drifting and the stale marked where they rank, or with `fresh`,
-    /// the stale left out.
+    /// says, each with whether it still holds: the best that
+    /// [`Store::search_about`] finds, the expired too if it says so, those
+    /// that hold first, as they rank, lessons before the notes near them and
+    /// the drifting marked, then the stale, marked; or with `fresh`, the
+    /// stale left out.
     pub fn find(
         &mut self,
         project: &Path,
@@ -879,11 +1081,13 @@ impl Store {
             expired: wanted.expired,
         };
         let found = self.search_among(project, text, among, limit, embedder)?;
-        let mut found = marked(found, project);
-        if wanted.fresh {
-            found.retain(|item| item.freshness != Freshness::Stale);
-        }
+        let (found, stale): (Vec<Listed>, Vec<Listed>) = marked(found, project)
+            .into_iter()
+            .partition(|item| item.freshness != Freshness::Stale);
         let mut found = lessons_first(found, text, |item| item.entry.kind);
+        if !wanted.fresh {
+            found.extend(lessons_first(stale, text, |item| item.entry.kind));
+        }
         found.truncate(wanted.limit);
         Ok(found)
     }
@@ -1129,6 +1333,7 @@ impl Store {
                 "INSERT INTO projects (path, next_id) VALUES (?1, ?2)",
                 params![name, next_id],
             )?;
+            let mut code = Code::default();
             for entry in entries {
                 let mut entry = entry.clone();
                 entry.seen = entry.seen.max(1);
@@ -1137,6 +1342,7 @@ impl Store {
                 }
                 let said = entry.last_seen.max(entry.created);
                 entry.anchors = anchors_from_before(&entry.files, said, project);
+                entry.names = code.names_in(project, &entry.text, &entry.files);
                 insert(&tx, &name, &entry)?;
             }
         }
@@ -1189,6 +1395,43 @@ fn add_anchors(conn: &Connection) -> Result<()> {
             "UPDATE entries SET anchors = ?2 WHERE n = ?1",
             params![n, serde_json::to_string(&anchors)?],
         )?;
+    }
+    Ok(())
+}
+
+/// Adds [`NAMES`], and anchors each entry already there to what it names
+/// that's in its worktree's code now, while that's there, or else its
+/// project's: what it names that's gone already says nothing either way,
+/// as a file that isn't there isn't anchored.
+fn add_names(conn: &Connection) -> Result<()> {
+    conn.execute_batch(NAMES)?;
+    let old: Vec<(i64, String, String, String, Option<String>)> = {
+        let mut old = conn.prepare("SELECT n, project, text, files, checkout FROM entries")?;
+        let old = old.query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        })?;
+        old.collect::<rusqlite::Result<_>>()?
+    };
+    let mut code = Code::default();
+    for (n, project, text, files, checkout) in old {
+        let checkout = checkout
+            .map(PathBuf::from)
+            .filter(|checkout| checkout.is_dir())
+            .unwrap_or_else(|| PathBuf::from(project));
+        let files: Vec<String> = serde_json::from_str(&files).unwrap_or_default();
+        let names = code.names_in(&checkout, &text, &files);
+        if !names.is_empty() {
+            conn.execute(
+                "UPDATE entries SET names = ?2 WHERE n = ?1",
+                params![n, serde_json::to_string(&names)?],
+            )?;
+        }
     }
     Ok(())
 }
@@ -1322,7 +1565,8 @@ fn get(conn: &Connection, project: &str, id: u64) -> Result<Option<Entry>> {
 fn insert(conn: &Connection, project: &str, entry: &Entry) -> Result<()> {
     conn.execute(
         "INSERT INTO entries (project, id, kind, text, key, files, source, created, seen, \
-         last_seen, anchors, checkout) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+         last_seen, anchors, checkout, names) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         params![
             project,
             entry.id,
@@ -1336,6 +1580,7 @@ fn insert(conn: &Connection, project: &str, entry: &Entry) -> Result<()> {
             entry.last_seen,
             serde_json::to_string(&entry.anchors)?,
             path_text(&entry.checkout),
+            serde_json::to_string(&entry.names)?,
         ],
     )?;
     Ok(())
@@ -1356,6 +1601,7 @@ fn entry_of(row: &rusqlite::Row) -> rusqlite::Result<Entry> {
     let source: String = row.get(4)?;
     let anchors: String = row.get(8)?;
     let checkout: Option<String> = row.get(9)?;
+    let names: String = row.get(11)?;
     Ok(Entry {
         id: row.get(0)?,
         kind: Kind::parse(&kind).unwrap_or(Kind::Note),
@@ -1368,6 +1614,7 @@ fn entry_of(row: &rusqlite::Row) -> rusqlite::Result<Entry> {
         anchors: serde_json::from_str(&anchors).unwrap_or_default(),
         checkout: checkout.map(PathBuf::from),
         used: row.get(10)?,
+        names: serde_json::from_str(&names).unwrap_or_default(),
     })
 }
 
@@ -1568,18 +1815,22 @@ pub struct Memory {
     entries: Vec<Entry>,
 }
 
-/// Whether an entry still holds, by the files it's about. The fresher
-/// sorts first.
+/// Whether an entry still holds, by what it names, or with nothing to look
+/// for, the files it's about. The fresher sorts first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum Freshness {
-    /// None of its files has changed since it was said, or it names none.
+    /// Everything it names is in the code still; or naming nothing to look
+    /// for, none of its files has changed since it was said, or it has none.
     Fresh,
-    /// Some of its files have changed since: it may hold only in part.
+    /// Some of what it names is gone from the code; or naming nothing to
+    /// look for, some of its files have changed since: it may hold only in
+    /// part.
     Drifting,
-    /// Every one of its files has changed since, or gone: it may no
-    /// longer hold at all.
+    /// Everything it names is gone from the code; or naming nothing to
+    /// look for, every one of its files is gone: it may no longer hold at
+    /// all.
     Stale,
 }
 
@@ -1601,6 +1852,29 @@ impl Freshness {
 pub struct Listed {
     pub entry: Entry,
     pub freshness: Freshness,
+    /// What it names that's gone from the code since it was said; or,
+    /// naming nothing to look for, the files it's about that are gone.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gone: Vec<String>,
+}
+
+impl Listed {
+    /// How it holds, in words, when it may not: drifting or stale, and
+    /// why. `None` for one that's fresh.
+    pub fn how_it_holds(&self) -> Option<String> {
+        let mark = self.freshness.mark()?;
+        let gone = || {
+            let gone: Vec<&str> = self.gone.iter().map(String::as_str).collect();
+            gone.join(", ")
+        };
+        let why = match (self.entry.names.is_empty(), self.freshness) {
+            (false, Freshness::Stale) => format!("what it names is gone from the code: {}", gone()),
+            (false, _) => format!("some of what it names is gone from the code: {}", gone()),
+            (true, Freshness::Stale) => "every file it's about is gone".to_string(),
+            (true, _) => "some of its files have changed since".to_string(),
+        };
+        Some(format!("{mark}: {why}"))
+    }
 }
 
 impl Memory {
@@ -1616,11 +1890,7 @@ impl Memory {
 
     /// Every entry, newest first, with whether it still holds.
     pub fn listed(&self) -> Vec<Listed> {
-        let mut hashes = Hashes::default();
-        self.entries
-            .iter()
-            .map(|entry| hashes.listed(entry.clone(), &self.project))
-            .collect()
+        marked(self.entries.clone(), &self.project)
     }
 
     pub fn get(&self, id: u64) -> Option<&Entry> {
@@ -1647,14 +1917,12 @@ pub fn remove(socket: &Path, project: &Path, id: u64) -> Result<Entry> {
     Store::open(socket)?.remove(project, id)
 }
 
-/// `entries` with whether each still holds, in the order they came: a
-/// search's ranking stays as it is, the drifting and the stale marked where
-/// they rank rather than moved below the rest.
+/// `entries` with whether each still holds, in the order they came.
 pub fn marked(entries: Vec<Entry>, project: &Path) -> Vec<Listed> {
-    let mut hashes = Hashes::default();
+    let mut code = Code::default();
     entries
         .into_iter()
-        .map(|entry| hashes.listed(entry, project))
+        .map(|entry| code.listed(entry, project))
         .collect()
 }
 
@@ -1690,17 +1958,17 @@ pub fn for_launch(
     embedder: Option<&dyn Embed>,
 ) -> Result<Option<String>> {
     let mut store = Store::open(socket)?;
-    let mut hashes = Hashes::default();
-    let about_changes = store.about_files(project, changed)?;
+    let mut code = Code::default();
+    let about_changes = store.about_files(project, changed, SEARCH_LIMIT)?;
     let lasting = Among {
         kinds: Kinds::Lasting,
         files: &[],
         expired: false,
     };
     let found = store.search_among(project, asked, lasting, SEARCH_LIMIT, embedder)?;
-    let mut shown = launch_order(vec![about_changes, found], asked, project, &mut hashes);
+    let mut shown = launch_order(vec![about_changes, found], asked, project, &mut code);
     if shown.is_empty() {
-        shown = launch_order(vec![store.entries(project)?], asked, project, &mut hashes);
+        shown = launch_order(vec![store.entries(project)?], asked, project, &mut code);
     }
     Ok(launch_paragraph(&shown, reader))
 }
@@ -1714,7 +1982,7 @@ fn launch_order(
     parts: Vec<Vec<Entry>>,
     asked: &str,
     project: &Path,
-    hashes: &mut Hashes,
+    code: &mut Code,
 ) -> Vec<Listed> {
     let now = seconds_since_epoch(SystemTime::now());
     let mut shown: Vec<Listed> = Vec::new();
@@ -1723,7 +1991,7 @@ fn launch_order(
             .into_iter()
             .filter(|entry| entry.kind != Kind::Outcome && !entry.expired(now))
             .filter(|entry| !shown.iter().any(|item| item.entry.id == entry.id))
-            .map(|entry| hashes.listed(entry, project))
+            .map(|entry| code.listed(entry, project))
             .filter(|item| item.freshness != Freshness::Stale)
             .collect();
         shown.extend(lessons_first(part, asked, |item| item.entry.kind));
@@ -1873,7 +2141,7 @@ pub fn markdown(name: &str, listed: &[Listed]) -> String {
 }
 
 /// One entry as a session is shown it: its kind, its title, not too long,
-/// the files it's about, and whether some have changed.
+/// the files it's about, and whether it's drifting.
 fn launch_line(item: &Listed) -> String {
     let entry = &item.entry;
     let mut text = title(&entry.text);
@@ -1886,7 +2154,11 @@ fn launch_line(item: &Listed) -> String {
         line.push_str(&format!(" [{}]", entry.files.join(", ")));
     }
     if item.freshness == Freshness::Drifting {
-        line.push_str(" [drifting: some of its files changed since]");
+        line.push_str(if entry.names.is_empty() {
+            " [drifting: some of its files changed since]"
+        } else {
+            " [drifting: some of what it names is gone]"
+        });
     }
     line
 }
@@ -1967,21 +2239,29 @@ fn has_commit_hash(text: &str) -> bool {
     })
 }
 
-/// Whether `entry` still holds, by its files as they are now.
-pub fn freshness(entry: &Entry, project: &Path) -> Freshness {
-    Hashes::default().freshness(entry, project)
+/// What of `text` [`names_in`] finds that's in the code of the worktree at
+/// `top` now, but for the paths of `files`.
+pub fn found_in(top: &Path, text: &str, files: &[String]) -> Vec<String> {
+    Code::default().names_in(top, text, files)
+}
+
+/// `entry`, with whether it still holds, by what it names and its files as
+/// they are now.
+pub fn checked(entry: Entry, project: &Path) -> Listed {
+    Code::default().listed(entry, project)
 }
 
 /// The entries of the memory kept for the daemon at `socket`, with their
-/// projects, that have gone stale, every file each is about changed or
-/// gone, and that the daemon hasn't told of yet: each is told of once,
-/// until it holds again, its files changed back or it said again.
+/// projects, that have gone stale, all they name gone from the code, or
+/// naming nothing to look for, every file they're about, and that the
+/// daemon hasn't told of yet: each is told of once, until it holds again,
+/// what it names back or it said again.
 pub fn newly_stale(socket: &Path) -> Result<Vec<(PathBuf, Entry)>> {
     let mut store = Store::open(socket)?;
-    let mut hashes = Hashes::default();
+    let mut code = Code::default();
     let mut gone_stale = Vec::new();
     for (project, entry, told) in store.anchored()? {
-        let stale = hashes.freshness(&entry, &project) == Freshness::Stale;
+        let stale = code.holds(&entry, &project).0 == Freshness::Stale;
         if stale != told {
             store.set_told_stale(&project, entry.id, stale)?;
         }
@@ -1992,46 +2272,458 @@ pub fn newly_stale(socket: &Path) -> Result<Vec<(PathBuf, Entry)>> {
     Ok(gone_stale)
 }
 
-/// The hash of each file looked at, read once however many entries are
-/// about it.
+/// The code entries are checked against: the hash of each file, and the
+/// words of each worktree, each read once however many entries look at
+/// it.
 #[derive(Default)]
-struct Hashes(HashMap<PathBuf, Option<String>>);
+struct Code {
+    hashes: HashMap<PathBuf, Option<String>>,
+    words: HashMap<PathBuf, Words>,
+}
 
-impl Hashes {
-    fn of(&mut self, path: PathBuf) -> Option<&String> {
-        self.0
+impl Code {
+    fn hash(&mut self, path: PathBuf) -> Option<&String> {
+        self.hashes
             .entry(path)
             .or_insert_with_key(|path| hash_of(path))
             .as_ref()
     }
 
-    /// Whether `entry` still holds: its anchored files looked at in the
-    /// worktree they were hashed in, while it's there, or else in
-    /// `project`, and each that's changed or gone counted.
-    fn freshness(&mut self, entry: &Entry, project: &Path) -> Freshness {
+    /// What of `text` [`names_in`] finds that's in the code of the
+    /// worktree at `top` now, but for the paths of `files`: what an entry
+    /// saying it about them is anchored to. Its own files say only where it
+    /// is, and they're anchored by their hashes.
+    fn names_in(&mut self, top: &Path, text: &str, files: &[String]) -> Vec<String> {
+        let names = names_beside(text, files);
+        if names.is_empty() {
+            return names;
+        }
+        let words = self.words_of(top);
+        names.into_iter().filter(|name| words.has(name)).collect()
+    }
+
+    fn words_of(&mut self, top: &Path) -> &Words {
+        self.words
+            .entry(top.to_path_buf())
+            .or_insert_with_key(|top| Words::read(top))
+    }
+
+    /// Whether `entry` still holds, and what's gone: looked at in the
+    /// worktree it was said in, while it's there, or else in `project`.
+    /// What it names, while it names anything that was there, each looked
+    /// for in the code; or else its anchored files, each changed or gone
+    /// counted, a change making it drifting, and every one gone, stale.
+    fn holds(&mut self, entry: &Entry, project: &Path) -> (Freshness, Vec<String>) {
         let checkout = entry
             .checkout
             .as_deref()
             .filter(|checkout| checkout.is_dir())
             .unwrap_or(project);
-        let changed = entry
-            .anchors
-            .iter()
-            .filter(|(file, hash)| self.of(checkout.join(file)) != Some(*hash))
-            .count();
-        match changed {
-            0 => Freshness::Fresh,
-            all if all == entry.anchors.len() => Freshness::Stale,
-            _ => Freshness::Drifting,
+        if !entry.names.is_empty() {
+            let words = self.words_of(checkout);
+            let gone: Vec<String> = (entry.names.iter())
+                .filter(|name| !words.has(name))
+                .cloned()
+                .collect();
+            let freshness = match gone.len() {
+                0 => Freshness::Fresh,
+                all if all == entry.names.len() => Freshness::Stale,
+                _ => Freshness::Drifting,
+            };
+            return (freshness, gone);
         }
+        let mut changed = 0;
+        let mut gone = Vec::new();
+        for (file, hash) in &entry.anchors {
+            let path = checkout.join(file);
+            if !path.exists() {
+                gone.push(file.clone());
+                changed += 1;
+            } else if self.hash(path) != Some(hash) {
+                changed += 1;
+            }
+        }
+        let freshness = if changed == 0 {
+            Freshness::Fresh
+        } else if gone.len() == entry.anchors.len() {
+            Freshness::Stale
+        } else {
+            Freshness::Drifting
+        };
+        (freshness, gone)
     }
 
     fn listed(&mut self, entry: Entry, project: &Path) -> Listed {
+        let (freshness, gone) = self.holds(&entry, project);
         Listed {
-            freshness: self.freshness(&entry, project),
             entry,
+            freshness,
+            gone,
         }
     }
+}
+
+/// The words of a worktree's code, to look the names entries give up in:
+/// those of every file git lists there, those it tracks and the new ones it
+/// doesn't ignore, or outside git, every file under it but the hidden; the
+/// files themselves by their paths; and the worktree, for what's in it by
+/// a path.
+struct Words {
+    top: PathBuf,
+    words: HashSet<String>,
+}
+
+impl Words {
+    /// The words of the worktree at `top`, as much of it as
+    /// [`MAX_WORDS_READ`] reads: none when it isn't there.
+    fn read(top: &Path) -> Words {
+        let mut words = HashSet::new();
+        let files = crate::git::files(top).unwrap_or_else(|_| walked(top));
+        let mut room = MAX_WORDS_READ;
+        for file in files {
+            add_path(&mut words, file.as_bytes());
+            let path = top.join(&file);
+            let Ok(meta) = fs::metadata(&path) else {
+                continue;
+            };
+            if !meta.is_file() || meta.len() > MAX_ANCHORED_BYTES || meta.len() > room {
+                continue;
+            }
+            let Ok(bytes) = fs::read(&path) else {
+                continue;
+            };
+            room -= meta.len();
+            // A NUL near the start is git's own test for a binary file.
+            if !bytes[..bytes.len().min(8000)].contains(&0) {
+                add_words(&mut words, &bytes);
+            }
+        }
+        Words {
+            top: top.to_path_buf(),
+            words,
+        }
+    }
+
+    /// Whether `name`, as [`names_in`] gives it, is in the code: a long
+    /// flag by its name with dashes or underscores, as a parser derives it
+    /// from a field; a path, or a file's name, as a file or a directory
+    /// there, or a path its files' words end with; anything else as one of
+    /// their words.
+    fn has(&self, name: &str) -> bool {
+        if let Some(flag) = name.strip_prefix("--") {
+            return self.words.contains(flag) || self.words.contains(&flag.replace('-', "_"));
+        }
+        if name.contains(['/', '.']) {
+            let path = name.trim_end_matches('/');
+            return self.words.contains(path) || self.top.join(path).exists();
+        }
+        self.words.contains(name)
+    }
+}
+
+/// What `text` names, as [`names_in`] finds it, but for the paths of
+/// `files`, the files an entry saying it is about.
+pub fn names_beside(text: &str, files: &[String]) -> Vec<String> {
+    let mut names = names_in(text);
+    names.retain(|name| !is_one_of(name, files));
+    names
+}
+
+/// Whether the path `name` is one of `files`, or the end of one's path, as
+/// `cli.rs` is of `tests/cli.rs`.
+fn is_one_of(name: &str, files: &[String]) -> bool {
+    let name = name.trim_end_matches('/');
+    files.iter().any(|file| {
+        let file = file.trim_end_matches('/');
+        file == name
+            || file
+                .strip_suffix(name)
+                .is_some_and(|dir| dir.ends_with('/'))
+    })
+}
+
+/// Every file under `dir`, by its path from it, but those under a hidden
+/// directory or one of [`NOT_WALKED`], [`MAX_WALKED`] at most: the files of
+/// a project outside git.
+fn walked(dir: &Path) -> Vec<String> {
+    let mut files = Vec::new();
+    let mut dirs = vec![PathBuf::new()];
+    while let Some(at) = dirs.pop() {
+        let Ok(entries) = fs::read_dir(dir.join(&at)) else {
+            continue;
+        };
+        let mut entries: Vec<_> = entries.flatten().collect();
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let name = entry.file_name();
+            let name_text = name.to_string_lossy();
+            if name_text.starts_with('.') {
+                continue;
+            }
+            let path = at.join(&name);
+            match entry.file_type() {
+                Ok(kind) if kind.is_dir() && !NOT_WALKED.contains(&&*name_text) => dirs.push(path),
+                Ok(kind) if kind.is_file() => files.push(path.to_string_lossy().into_owned()),
+                _ => {}
+            }
+            if files.len() >= MAX_WALKED {
+                return files;
+            }
+        }
+    }
+    files
+}
+
+/// Adds the words of `bytes` to `words`: each identifier, each word joined
+/// by dashes (`kill-server`, `--test-threads` as `test-threads`), and each
+/// path (`src/memory.rs`, `memory.db`, `memory.stale`) with every path it
+/// ends with.
+fn add_words(words: &mut HashSet<String>, bytes: &[u8]) {
+    let in_path = |byte: &u8| byte.is_ascii_alphanumeric() || b"_-./~".contains(byte);
+    for run in bytes.split(|byte| !in_path(byte)) {
+        if run.is_empty() {
+            continue;
+        }
+        for identifier in run.split(|byte| !(byte.is_ascii_alphanumeric() || *byte == b'_')) {
+            add_word(words, identifier);
+        }
+        for dashed in run.split(|byte| b"./~".contains(byte)) {
+            let dashed = dashed.trim_ascii_start().trim_ascii_end();
+            let dashed = trim_bytes(dashed, b'-');
+            if dashed.contains(&b'-') {
+                add_word(words, dashed);
+            }
+        }
+        add_path(words, run);
+    }
+}
+
+/// Adds the path `path` to `words`, without the dots and slashes it ends
+/// with, with every path it ends with after a slash, and every directory
+/// it's in.
+fn add_path(words: &mut HashSet<String>, path: &[u8]) {
+    let mut path = path;
+    while let [rest @ .., b'.' | b'/'] = path {
+        path = rest;
+    }
+    if !path.contains(&b'/') && !path.contains(&b'.') {
+        return;
+    }
+    add_word(words, path);
+    for (at, byte) in path.iter().enumerate() {
+        if *byte == b'/' {
+            add_word(words, &path[at + 1..]);
+            add_word(words, &path[..at]);
+        }
+    }
+}
+
+fn add_word(words: &mut HashSet<String>, word: &[u8]) {
+    if word.is_empty() {
+        return;
+    }
+    // What `in_path` keeps is ASCII.
+    if let Ok(word) = std::str::from_utf8(word)
+        && !words.contains(word)
+    {
+        words.insert(word.to_string());
+    }
+}
+
+/// `bytes` without `byte` at either end.
+fn trim_bytes(mut bytes: &[u8], byte: u8) -> &[u8] {
+    while let [first, rest @ ..] = bytes
+        && *first == byte
+    {
+        bytes = rest;
+    }
+    while let [rest @ .., last] = bytes
+        && *last == byte
+    {
+        bytes = rest;
+    }
+    bytes
+}
+
+/// What `text` names that looks like code, which can be looked for in it:
+/// what's in backticks, and outside them, identifiers with an underscore or
+/// a hump (`local_origin`, `TaskRecord`), the last part of a path in code
+/// (`Crystal::listening` as `listening`), what's called (`listening()`),
+/// long flags (`--test-threads`), files and directories (`src/memory.rs`,
+/// `memory.db`, `agents/`) and words joined by dots (`memory.stale`). A
+/// command in backticks gives those of its words, and those joined by
+/// dashes (`kill-server`). Words split by a slash are each looked at alone,
+/// unless they're a path. Each once, in the order they come,
+/// [`MAX_NAMES`] at most. Nothing outside the project, like `~/.config` or
+/// `/tmp`, and nothing that names no particular thing, like `true` or
+/// `macOS`.
+pub fn names_in(text: &str) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    let pieces: Vec<&str> = text.split('`').collect();
+    for (at, piece) in pieces.iter().enumerate() {
+        // Between two backticks on one line, it's quoted.
+        let quoted = at % 2 == 1 && at + 1 < pieces.len() && !piece.contains('\n');
+        let one_word = !piece.trim().contains(char::is_whitespace);
+        for word in piece.split_whitespace() {
+            for part in parts_of(word) {
+                let name = if quoted && one_word {
+                    name_of(part, true)
+                } else if quoted {
+                    name_of(part, false).or_else(|| name_of(part, part.contains('-')))
+                } else {
+                    name_of(part, false)
+                };
+                if let Some(name) = name
+                    && !names.contains(&name)
+                {
+                    names.push(name);
+                }
+            }
+        }
+    }
+    names.truncate(MAX_NAMES);
+    names
+}
+
+/// The parts of `word` that may each be a name: the word without the
+/// punctuation around it, whole when it's a path, or else split at each
+/// slash, each part without what a call takes (`listening()` as
+/// `listening`).
+fn parts_of(word: &str) -> Vec<&str> {
+    let word = bare(word);
+    // Outside the project: from the root, a home, or another machine.
+    if word.starts_with(['/', '~']) || word.contains("://") {
+        return Vec::new();
+    }
+    if is_path(word) {
+        return vec![word];
+    }
+    word.split('/')
+        .map(|part| {
+            let part = bare(part);
+            let called = part.find('(').filter(|&at| {
+                at > 0
+                    && part[..at]
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || "_:.".contains(c))
+            });
+            bare(called.map_or(part, |at| &part[..at]))
+        })
+        .filter(|part| !part.is_empty())
+        .collect()
+}
+
+/// `word` without the punctuation around it.
+fn bare(word: &str) -> &str {
+    word.trim_start_matches(|c| "([{\"'<*$".contains(c))
+        .trim_end_matches(|c| ")]}\"'>,.;:!?*".contains(c))
+}
+
+/// The name `word` gives, if it looks like code: always so in a backtick of
+/// its own, `quoted`, any word of three letters or more, or words joined by
+/// dashes.
+fn name_of(word: &str, quoted: bool) -> Option<String> {
+    if !word.bytes().any(|byte| byte.is_ascii_alphabetic()) {
+        return None;
+    }
+    if let Some(flag) = word.strip_prefix("--") {
+        let flag = flag.split('=').next().unwrap_or_default();
+        let shaped = flag.len() > 1
+            && !flag.starts_with('-')
+            && !flag.ends_with('-')
+            && flag
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-');
+        return shaped.then(|| format!("--{flag}"));
+    }
+    if word.starts_with(['/', '~', '-']) {
+        return None;
+    }
+    if is_path(word) || is_file_name(word) {
+        return Some(word.to_string());
+    }
+    if let Some((_, last)) = word.rsplit_once("::") {
+        // A type, a variant or a constant by its own name; a function or a
+        // field only when its name looks like code.
+        let typed = last.starts_with(|c: char| c.is_ascii_uppercase());
+        return (last.len() > 1 && is_identifier(last))
+            .then(|| name_of(last, quoted || typed))
+            .flatten();
+    }
+    if is_identifier(word) {
+        let underscored = word.trim_matches('_').contains('_');
+        let humped = word
+            .as_bytes()
+            .windows(2)
+            .any(|pair| pair[0].is_ascii_lowercase() && pair[1].is_ascii_uppercase());
+        let named = underscored || humped || (quoted && word.len() >= 3);
+        return (named && !NOT_NAMES.contains(&word)).then(|| word.to_string());
+    }
+    let dashed = word.split('-').count() > 1
+        && word.split('-').all(|part| {
+            !part.is_empty()
+                && part
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        });
+    if quoted && dashed {
+        return Some(word.to_string());
+    }
+    let dotted = word.split('.').count() > 1
+        && word.split('.').all(|part| {
+            part.len() > 1
+                && is_identifier(part)
+                && part.bytes().any(|byte| byte.is_ascii_lowercase())
+        });
+    dotted.then(|| word.to_string())
+}
+
+fn is_identifier(word: &str) -> bool {
+    let mut chars = word.chars();
+    chars
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Whether `word` is a path in the project: parts joined by slashes, a
+/// directory's ending with one (`agents/`), a file's with its name
+/// (`src/memory.rs`); not words a slash sets side by side, like `add/list`
+/// or `CLAUDE.md/AGENTS.md`.
+fn is_path(word: &str) -> bool {
+    let shaped = word.contains('/')
+        && !word.contains("://")
+        && word.bytes().any(|byte| byte.is_ascii_alphabetic())
+        && word
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_-./~".contains(&byte));
+    if !shaped {
+        return false;
+    }
+    let mut parts: Vec<&str> = word.trim_end_matches('/').split('/').collect();
+    let last = if word.ends_with('/') {
+        None
+    } else {
+        parts.pop()
+    };
+    let directories = parts
+        .iter()
+        .all(|part| !part.is_empty() && *part != "." && *part != ".." && !part[1..].contains('.'));
+    directories && last.is_none_or(is_file_name) && word.len() > 1
+}
+
+/// Whether `word` is a file's name: a name, then an extension a file of
+/// code or data has, like `memory.db` or `.gitignore.md`.
+fn is_file_name(word: &str) -> bool {
+    let Some((stem, extension)) = word.rsplit_once('.') else {
+        return false;
+    };
+    let stem = stem.strip_prefix('.').unwrap_or(stem);
+    EXTENSIONS.contains(&extension)
+        && stem.bytes().any(|byte| byte.is_ascii_alphabetic())
+        && stem
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_-.".contains(&byte))
 }
 
 /// An anchor for each of `files` that's a file in `checkout` now: its
@@ -2135,6 +2827,7 @@ mod tests {
             anchors: BTreeMap::new(),
             checkout: None,
             used: None,
+            names: Vec::new(),
         }
     }
 
@@ -2363,13 +3056,16 @@ mod tests {
     }
 
     #[test]
-    fn a_fresh_search_leaves_the_stale_out_and_fills_its_room_after_them() {
+    fn a_search_gives_the_stale_after_the_rest_or_leaves_them_out() {
         let (_dir, socket) = socket();
         let project = project_with(&["a.rs", "b.rs"]);
+        fs::write(project.path().join("a.rs"), "fn refund_ledger() {}").unwrap();
         let mut store = Store::open(&socket).unwrap();
-        store
-            .add(project.path(), about(&["a.rs"], project.path()))
-            .unwrap();
+        let named = New {
+            text: "the refund ledger is in `refund_ledger`".into(),
+            ..about(&["a.rs"], project.path())
+        };
+        store.add(project.path(), named).unwrap();
         store
             .add(project.path(), note("refund waits for the ledger, always"))
             .unwrap();
@@ -2386,25 +3082,23 @@ mod tests {
             let found = store
                 .find(project.path(), "refund ledger", &wanted, None)
                 .unwrap();
-            let mut said: Vec<(u64, Freshness)> = found
+            let said: Vec<(u64, Freshness)> = found
                 .iter()
                 .map(|item| (item.entry.id, item.freshness))
                 .collect();
-            said.sort();
             said
         };
-        assert_eq!(
-            found(wanted(false, 10)),
-            [
-                (1, Freshness::Stale),
-                (2, Freshness::Fresh),
-                (3, Freshness::Fresh)
-            ]
-        );
-        assert_eq!(
-            found(wanted(true, 10)),
-            [(2, Freshness::Fresh), (3, Freshness::Fresh)]
-        );
+        // First by its words, it comes after those that hold.
+        let all = found(wanted(false, 10));
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[2], (1, Freshness::Stale), "{all:?}");
+        // Among the few best, those that hold come first.
+        let best = found(wanted(false, 1));
+        assert_eq!(best.len(), 1);
+        assert_eq!(best[0].1, Freshness::Fresh, "{best:?}");
+        let mut fresh = found(wanted(true, 10));
+        fresh.sort();
+        assert_eq!(fresh, [(2, Freshness::Fresh), (3, Freshness::Fresh)]);
         assert_eq!(found(wanted(true, 1)).len(), 1);
         let gotchas = Wanted {
             kind: Some(Kind::Gotcha),
@@ -2483,29 +3177,124 @@ mod tests {
         }
     }
 
+    /// How entry `id` of the memory of `at` holds now.
+    fn holds(socket: &Path, at: &Path, id: u64) -> Freshness {
+        let entry = Memory::read(socket, at).unwrap().get(id).unwrap().clone();
+        checked(entry, at).freshness
+    }
+
     #[test]
-    fn an_entry_drifts_as_some_of_its_files_change_and_goes_stale_once_all_have() {
+    fn an_entry_holds_while_what_it_names_is_there_however_its_files_change() {
+        let (_dir, socket) = socket();
+        let project = project_with(&["a.rs", "b.rs"]);
+        let at = project.path();
+        fs::write(
+            at.join("a.rs"),
+            "fn local_origin() {}\nconst LEDGER_DB: &str = \"\";",
+        )
+        .unwrap();
+        let named = New {
+            text: "Tests use `local_origin()`, never github.com; LEDGER_DB is set".into(),
+            ..about(&["a.rs", "b.rs"], at)
+        };
+        let added = add(&socket, at, named).unwrap();
+        assert_eq!(added.entry().unwrap().names, ["local_origin", "LEDGER_DB"]);
+        assert_eq!(holds(&socket, at, 1), Freshness::Fresh);
+
+        fs::write(at.join("b.rs"), "changed").unwrap();
+        fs::write(
+            at.join("a.rs"),
+            "// moved\nfn local_origin() {} const LEDGER_DB: u8 = 1;",
+        )
+        .unwrap();
+        assert_eq!(holds(&socket, at, 1), Freshness::Fresh, "its files changed");
+        // Moved to another file, it's there still.
+        fs::write(at.join("a.rs"), "const LEDGER_DB: u8 = 1;").unwrap();
+        fs::write(at.join("c.rs"), "pub fn local_origin() {}").unwrap();
+        assert_eq!(holds(&socket, at, 1), Freshness::Fresh);
+
+        fs::remove_file(at.join("c.rs")).unwrap();
+        let entry = Memory::read(&socket, at).unwrap().get(1).unwrap().clone();
+        let item = checked(entry, at);
+        assert_eq!(item.freshness, Freshness::Drifting);
+        assert_eq!(item.gone, ["local_origin"]);
+        assert_eq!(
+            item.how_it_holds().unwrap(),
+            "drifting: some of what it names is gone from the code: local_origin"
+        );
+        fs::write(at.join("a.rs"), "const LEDGER: u8 = 1;").unwrap();
+        assert_eq!(holds(&socket, at, 1), Freshness::Stale);
+        // Back, it holds again.
+        fs::write(
+            at.join("a.rs"),
+            "fn local_origin() {}\nconst LEDGER_DB: u8 = 1;",
+        )
+        .unwrap();
+        assert_eq!(holds(&socket, at, 1), Freshness::Fresh);
+    }
+
+    #[test]
+    fn what_wasn_t_in_the_code_as_it_was_said_isn_t_looked_for() {
+        let (_dir, socket) = socket();
+        let project = project_with(&["a.rs"]);
+        let at = project.path();
+        fs::write(at.join("a.rs"), "fn uncapped_tabs() {}").unwrap();
+        let removed = New {
+            text: "Tabs are uncapped now: there's no MAX_TABS; see uncapped_tabs".into(),
+            ..about(&["a.rs"], at)
+        };
+        let added = add(&socket, at, removed).unwrap();
+        assert_eq!(added.entry().unwrap().names, ["uncapped_tabs"]);
+        // Naming nothing that was there, it goes by its files.
+        let nothing = New {
+            text: "There's no MAX_TABS any more".into(),
+            ..about(&["a.rs"], at)
+        };
+        assert!(
+            add(&socket, at, nothing)
+                .unwrap()
+                .entry()
+                .unwrap()
+                .names
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn an_entry_naming_nothing_drifts_as_its_files_change_and_goes_stale_once_all_are_gone() {
         let (_dir, socket) = socket();
         let project = project_with(&["a.rs", "b.rs"]);
         let at = project.path();
         add(&socket, at, about(&["a.rs", "b.rs"], at)).unwrap();
-        let holds = || freshness(Memory::read(&socket, at).unwrap().get(1).unwrap(), at);
-        assert_eq!(holds(), Freshness::Fresh);
+        assert_eq!(holds(&socket, at, 1), Freshness::Fresh);
 
         fs::write(at.join("a.rs"), "changed").unwrap();
-        assert_eq!(holds(), Freshness::Drifting);
+        assert_eq!(holds(&socket, at, 1), Freshness::Drifting);
+        fs::write(at.join("b.rs"), "changed").unwrap();
+        assert_eq!(
+            holds(&socket, at, 1),
+            Freshness::Drifting,
+            "changed, not gone"
+        );
         fs::remove_file(at.join("b.rs")).unwrap();
-        assert_eq!(holds(), Freshness::Stale, "gone counts as changed");
+        assert_eq!(holds(&socket, at, 1), Freshness::Drifting);
+        fs::remove_file(at.join("a.rs")).unwrap();
+        assert_eq!(holds(&socket, at, 1), Freshness::Stale, "every one gone");
+        let entry = Memory::read(&socket, at).unwrap().get(1).unwrap().clone();
+        assert_eq!(
+            checked(entry, at).how_it_holds().unwrap(),
+            "stale: every file it's about is gone"
+        );
 
         // Said again, it holds for its files as they are now.
-        fs::write(at.join("b.rs"), "back").unwrap();
+        fs::write(at.join("a.rs"), "back").unwrap();
         add(&socket, at, about(&["a.rs"], at)).unwrap();
-        assert_eq!(holds(), Freshness::Fresh);
+        assert_eq!(holds(&socket, at, 1), Freshness::Fresh);
         // A file changed back is the file it was.
         fs::write(at.join("a.rs"), "changed again").unwrap();
-        assert_eq!(holds(), Freshness::Drifting);
-        fs::write(at.join("a.rs"), "changed").unwrap();
-        assert_eq!(holds(), Freshness::Fresh);
+        assert_eq!(holds(&socket, at, 1), Freshness::Drifting);
+        fs::write(at.join("a.rs"), "back").unwrap();
+        assert_eq!(holds(&socket, at, 1), Freshness::Fresh);
     }
 
     #[test]
@@ -2513,35 +3302,42 @@ mod tests {
         let (_dir, socket) = socket();
         let project = project_with(&["a.rs", "b.rs"]);
         let at = project.path();
-        add(&socket, at, about(&["a.rs"], at)).unwrap();
-        add(&socket, at, note("about no file")).unwrap();
-        let other = New {
-            text: "the ledger runs nightly".into(),
-            ..about(&["b.rs"], at)
+        fs::write(at.join("a.rs"), "fn nightly_ledger() {}").unwrap();
+        let named = New {
+            text: "the ledger runs nightly: `nightly_ledger`".into(),
+            ..about(&["a.rs"], at)
         };
-        add(&socket, at, other).unwrap();
+        add(&socket, at, named).unwrap();
+        add(&socket, at, note("about no file")).unwrap();
+        add(&socket, at, about(&["b.rs"], at)).unwrap();
         let swept = || -> Vec<u64> {
             let stale = newly_stale(&socket).unwrap();
             assert!(stale.iter().all(|(project, _)| project == at));
             stale.into_iter().map(|(_, entry)| entry.id).collect()
         };
         assert_eq!(swept(), Vec::<u64>::new());
-        fs::write(at.join("a.rs"), "changed").unwrap();
+        fs::write(at.join("b.rs"), "changed").unwrap();
+        assert_eq!(swept(), Vec::<u64>::new(), "a change only drifts");
+        fs::write(at.join("a.rs"), "fn daily_ledger() {}").unwrap();
         assert_eq!(swept(), [1]);
         assert_eq!(swept(), Vec::<u64>::new(), "once is enough");
 
-        // Fresh again, its file changed back, it can go stale again.
-        fs::write(at.join("b.rs"), "changed").unwrap();
-        assert_eq!(swept(), [3]);
-        fs::write(at.join("b.rs"), "b.rs").unwrap();
+        // Holding again, what it names back, it can go stale again.
+        fs::write(at.join("a.rs"), "fn nightly_ledger() {}").unwrap();
         assert_eq!(swept(), Vec::<u64>::new());
+        fs::remove_file(at.join("a.rs")).unwrap();
+        assert_eq!(swept(), [1]);
         fs::remove_file(at.join("b.rs")).unwrap();
         assert_eq!(swept(), [3]);
 
-        // Said again, it holds for its files as they are now.
-        fs::write(at.join("a.rs"), "a.rs").unwrap();
-        add(&socket, at, about(&["a.rs"], at)).unwrap();
-        fs::write(at.join("a.rs"), "changed again").unwrap();
+        // Said again, it holds for what it names as it is now.
+        fs::write(at.join("b.rs"), "pub fn nightly_ledger() {}").unwrap();
+        let again = New {
+            text: "the ledger runs nightly: `nightly_ledger`".into(),
+            ..about(&["b.rs"], at)
+        };
+        add(&socket, at, again).unwrap();
+        fs::write(at.join("b.rs"), "changed again").unwrap();
         assert_eq!(swept(), [1]);
     }
 
@@ -2553,7 +3349,7 @@ mod tests {
         let added = add(&socket, at, about(&["a.rs", "gone.rs"], at)).unwrap();
         let entry = added.entry().unwrap();
         assert_eq!(entry.anchors.keys().collect::<Vec<_>>(), ["a.rs"]);
-        assert_eq!(freshness(entry, at), Freshness::Fresh);
+        assert_eq!(checked(entry.clone(), at).freshness, Freshness::Fresh);
 
         let nothing = add(
             &socket,
@@ -2564,24 +3360,37 @@ mod tests {
             },
         );
         assert_eq!(
-            freshness(nothing.unwrap().entry().unwrap(), at),
+            checked(nothing.unwrap().entry().unwrap().clone(), at).freshness,
             Freshness::Fresh
         );
     }
 
     #[test]
-    fn files_are_looked_at_in_the_worktree_they_were_said_in_while_it_s_there() {
+    fn code_is_looked_at_in_the_worktree_it_was_said_in_while_it_s_there() {
         let (_dir, socket) = socket();
         let project = project_with(&["a.rs"]);
         let worktree = tempfile::tempdir().unwrap();
-        fs::write(worktree.path().join("a.rs"), "the worktree's own").unwrap();
-        let added = add(&socket, project.path(), about(&["a.rs"], worktree.path())).unwrap();
+        fs::write(worktree.path().join("a.rs"), "fn worktree_only() {}").unwrap();
+        let named = New {
+            text: "worktree_only is the worktree's own".into(),
+            ..about(&["a.rs"], worktree.path())
+        };
+        let added = add(&socket, project.path(), named).unwrap();
         let entry = added.entry().unwrap().clone();
-        assert_eq!(freshness(&entry, project.path()), Freshness::Fresh);
+        assert_eq!(entry.names, ["worktree_only"]);
+        let holds = |entry: &Entry| checked(entry.clone(), project.path()).freshness;
+        assert_eq!(holds(&entry), Freshness::Fresh);
+        let files = added.entry().unwrap().clone();
+        let files = Entry {
+            names: Vec::new(),
+            ..files
+        };
+        assert_eq!(holds(&files), Freshness::Fresh);
 
-        // Once the worktree is gone, the project's file is the one.
+        // Once the worktree is gone, the project's code is the one.
         drop(worktree);
-        assert_eq!(freshness(&entry, project.path()), Freshness::Stale);
+        assert_eq!(holds(&entry), Freshness::Stale);
+        assert_eq!(holds(&files), Freshness::Drifting);
     }
 
     fn remembering(texts: &[(Kind, &str)]) -> (tempfile::TempDir, PathBuf, Store) {
@@ -3007,17 +3816,14 @@ mod tests {
     #[test]
     fn the_drifting_and_the_stale_are_marked_where_they_rank() {
         let project = project_with(&["a.rs", "b.rs"]);
-        let anchored = |id, anchors: &[(&str, &str)]| Entry {
-            anchors: anchors
-                .iter()
-                .map(|(file, hash)| (file.to_string(), hash.to_string()))
-                .collect(),
+        fs::write(project.path().join("a.rs"), "fn ledger_timeout() {}").unwrap();
+        let naming = |id, names: &[&str]| Entry {
+            names: names.iter().map(|name| name.to_string()).collect(),
             ..entry(id, Kind::Note, "ledger timeout")
         };
-        let a = hash_of(&project.path().join("a.rs")).unwrap();
-        let stale = anchored(1, &[("a.rs", "")]);
-        let drifting = anchored(2, &[("a.rs", &a), ("b.rs", "")]);
-        let fresh = anchored(3, &[("a.rs", &a)]);
+        let stale = naming(1, &["ledger_retries"]);
+        let drifting = naming(2, &["ledger_timeout", "ledger_retries"]);
+        let fresh = naming(3, &["ledger_timeout", "a.rs"]);
         let listed = marked(vec![stale, drifting, fresh], project.path());
         let ids: Vec<u64> = listed.iter().map(|item| item.entry.id).collect();
         assert_eq!(ids, [1, 2, 3]);
@@ -3220,13 +4026,13 @@ mod tests {
     fn a_stale_entry_is_never_shown_at_launch() {
         let (_dir, socket) = socket();
         let project = project_with(&["refund.rs"]);
-        add(
-            &socket,
-            project.path(),
-            about(&["refund.rs"], project.path()),
-        )
-        .unwrap();
-        fs::write(project.path().join("refund.rs"), "changed").unwrap();
+        fs::write(project.path().join("refund.rs"), "fn refund_waits() {}").unwrap();
+        let named = New {
+            text: "refund waits for the ledger: refund_waits".into(),
+            ..about(&["refund.rs"], project.path())
+        };
+        add(&socket, project.path(), named).unwrap();
+        fs::write(project.path().join("refund.rs"), "fn refund_now() {}").unwrap();
         let paragraph = launch(&socket, project.path(), "refund", Reader::Claude)
             .unwrap()
             .unwrap();
@@ -3300,10 +4106,12 @@ mod tests {
         let long = |id| Listed {
             entry: entry(id, Kind::Note, &"ledger ".repeat(40)),
             freshness: Freshness::Fresh,
+            gone: Vec::new(),
         };
         let short = |id| Listed {
             entry: entry(id, Kind::Note, "ledger"),
             freshness: Freshness::Fresh,
+            gone: Vec::new(),
         };
         let shown = [long(1), long(2), long(3), short(4)];
         let lines = fitted(&shown);
@@ -3371,17 +4179,229 @@ mod tests {
         let freshness: Vec<Freshness> = memory.listed().iter().map(|item| item.freshness).collect();
         assert_eq!(
             freshness,
-            [Freshness::Fresh, Freshness::Stale, Freshness::Fresh],
+            [Freshness::Fresh, Freshness::Drifting, Freshness::Fresh],
             "newest first"
         );
         // Anchored to what the file holds, it goes on from there.
         fs::write(project.path().join("a.rs"), "changed").unwrap();
-        let holds = freshness_of(&memory, 1);
-        assert_eq!(holds, Freshness::Stale);
+        let holds = checked(memory.get(1).unwrap().clone(), &memory.project);
+        assert_eq!(holds.freshness, Freshness::Drifting);
     }
 
-    fn freshness_of(memory: &Memory, id: u64) -> Freshness {
-        freshness(memory.get(id).unwrap(), &memory.project)
+    #[test]
+    fn an_entry_names_what_looks_like_code_in_it() {
+        let names = |text| names_in(text);
+        assert_eq!(
+            names(
+                "In tests/cli.rs, wait with Crystal::listening()/start_daemon_with, never \
+                 socket.exists(); every test goes through `outside_crystal()`."
+            ),
+            [
+                "tests/cli.rs",
+                "start_daemon_with",
+                "socket.exists",
+                "outside_crystal"
+            ]
+        );
+        // Of a path in code, a type, a variant or a constant by its name,
+        // and anything else when it looks like code or is in backticks.
+        assert_eq!(
+            names("Request::Shutdown, Profile::check, Store::open_db and `Crystal::listening()`"),
+            ["Shutdown", "open_db", "listening"]
+        );
+        assert_eq!(
+            names("Set CRYSTAL_AGENT_HOOKS, then TaskRecord and insteadOf; memory.stale fires."),
+            [
+                "CRYSTAL_AGENT_HOOKS",
+                "TaskRecord",
+                "insteadOf",
+                "memory.stale"
+            ]
+        );
+        assert_eq!(
+            names("Run `crystal kill-server --socket /tmp/x` and `cargo test -- --test-threads=4`"),
+            ["kill-server", "--socket", "--test-threads"]
+        );
+        assert_eq!(
+            names("`wait` and `agents/` and src/agent_rules.rs, `memory.db`; Cargo.toml too"),
+            [
+                "wait",
+                "agents/",
+                "src/agent_rules.rs",
+                "memory.db",
+                "Cargo.toml"
+            ]
+        );
+        // Words a slash sets side by side are each looked at alone.
+        assert_eq!(
+            names("add/list/export, CLAUDE.md/AGENTS.md and run_hook/run_task"),
+            ["CLAUDE.md", "AGENTS.md", "run_hook", "run_task"]
+        );
+        // Prose, what's outside the project and what names nothing.
+        assert!(names("Agent rule files compile lazily on first use, e.g. now.").is_empty());
+        assert!(names("On macOS `true` is None; ~/.config/x, /tmp/y.rs, a/b, -k, #62").is_empty());
+        assert!(names("see https://example.com/a.md and v0.2.0").is_empty());
+        // The paths of the files an entry is about say only where it is.
+        let files = ["tests/cli.rs".to_string(), "agents/".to_string()];
+        assert_eq!(
+            names_beside(
+                "cli.rs, tests/cli.rs, `agents/` and src/x.rs: run_hook",
+                &files
+            ),
+            ["src/x.rs", "run_hook"]
+        );
+        let many: String = (0..20).map(|n| format!("name_{n} ")).collect();
+        assert_eq!(names(&many).len(), MAX_NAMES);
+        assert_eq!(names("`same_one` and same_one")[..], ["same_one"]);
+    }
+
+    #[test]
+    fn a_name_is_looked_for_among_the_words_and_paths_of_the_code() {
+        let project = project_with(&[]);
+        let at = project.path();
+        fs::create_dir_all(at.join("src/tui")).unwrap();
+        fs::create_dir(at.join(".hidden")).unwrap();
+        fs::write(
+            at.join("src/tui/app.rs"),
+            "#[arg(long)]\nremove_worktree: bool,\n// crystal kill-server; see docs/guide.md.\n",
+        )
+        .unwrap();
+        fs::write(
+            at.join("README.md"),
+            "Run `make e2e` with --test-threads=4.",
+        )
+        .unwrap();
+        fs::write(at.join(".hidden/secret.rs"), "fn hidden_away() {}").unwrap();
+        fs::write(at.join("data.bin"), b"fn in_binary() {}\0\0").unwrap();
+        let words = Words::read(at);
+        for there in [
+            "remove_worktree",
+            "--remove-worktree",
+            "--test-threads",
+            "kill-server",
+            "docs/guide.md",
+            "guide.md",
+            "src/tui/app.rs",
+            "tui/app.rs",
+            "app.rs",
+            "src/tui/",
+            "src/",
+            "README.md",
+            "e2e",
+        ] {
+            assert!(words.has(there), "{there}");
+        }
+        for gone in [
+            "remove_work",
+            "--kill-all",
+            "server-kill",
+            "src/app.rs",
+            "hidden_away",
+            "in_binary",
+            "docs/manual.md",
+        ] {
+            assert!(!words.has(gone), "{gone}");
+        }
+        assert!(!Words::read(&at.join("nowhere")).has("app.rs"));
+    }
+
+    #[test]
+    fn a_database_from_before_names_anchors_its_entries_to_those_in_the_code() {
+        let (_dir, socket) = socket();
+        let project = project_with(&["a.rs"]);
+        fs::write(project.path().join("a.rs"), "fn ledger_retry() {}").unwrap();
+        fs::create_dir_all(dir(&socket)).unwrap();
+        let conn = Connection::open(dir(&socket).join("memory.db")).unwrap();
+        for step in &MIGRATIONS[..MIGRATIONS.len() - 1] {
+            step(&conn).unwrap();
+        }
+        conn.execute_batch(&format!("PRAGMA user_version = {}", MIGRATIONS.len() - 1))
+            .unwrap();
+        let name = project.path().to_string_lossy();
+        conn.execute(
+            "INSERT INTO projects (path, next_id) VALUES (?1, 4)",
+            params![name],
+        )
+        .unwrap();
+        // Said in a worktree that's gone; in none; about something gone.
+        for (id, text, checkout) in [
+            (
+                1,
+                "use `ledger_retry` and LEDGER_GONE",
+                Some("/gone/worktree"),
+            ),
+            (2, "nothing like code", None),
+            (3, "MAX_TABS is gone", None),
+        ] {
+            conn.execute(
+                "INSERT INTO entries (project, id, kind, text, key, files, source, created, \
+                 last_seen, checkout) VALUES (?1, ?2, 'note', ?3, ?3, '[]', '\"user\"', 1, 1, ?4)",
+                params![name, id, text, checkout],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        let memory = Memory::read(&socket, project.path()).unwrap();
+        let names: Vec<Vec<String>> = (1..=3)
+            .map(|id| memory.get(id).unwrap().names.clone())
+            .collect();
+        assert_eq!(names, [vec!["ledger_retry".to_string()], vec![], vec![]]);
+        let freshness: Vec<Freshness> = memory.listed().iter().map(|item| item.freshness).collect();
+        assert_eq!(freshness, [Freshness::Fresh; 3]);
+        fs::write(project.path().join("a.rs"), "fn ledger_retries() {}").unwrap();
+        assert_eq!(memory.listed()[2].freshness, Freshness::Stale);
+    }
+
+    #[test]
+    fn a_stale_entry_anchored_again_or_reworded_holds_again() {
+        let (_dir, socket) = socket();
+        let project = project_with(&["a.rs", "b.rs"]);
+        let at = project.path();
+        fs::write(at.join("a.rs"), "fn ledger_retry() {}").unwrap();
+        let mut store = Store::open(&socket).unwrap();
+        let named = |text: &str| New {
+            text: text.into(),
+            ..about(&["a.rs"], at)
+        };
+        store
+            .add(at, named("Flaky calls go through `ledger_retry`"))
+            .unwrap();
+        store
+            .add(at, named("`ledger_retry` waits a second"))
+            .unwrap();
+        store.add(at, named("Fees are kept in cents")).unwrap();
+        store.add(at, about(&["b.rs"], at)).unwrap();
+        fs::write(at.join("a.rs"), "fn ledger_retry_twice() {}").unwrap();
+        fs::remove_file(at.join("b.rs")).unwrap();
+        let stale = |store: &mut Store| -> Vec<u64> {
+            let files = ["a.rs".to_string(), "b.rs".to_string()];
+            let stale = store.stale_about(at, &files, 10).unwrap();
+            stale.iter().map(|item| item.entry.id).collect()
+        };
+        assert_eq!(stale(&mut store), [4, 2, 1], "said most recently first");
+        let a_rs = ["a.rs".to_string()];
+        assert_eq!(store.stale_about(at, &a_rs, 1).unwrap().len(), 1);
+
+        let reworded = store
+            .reword(at, 1, "Flaky calls go through `ledger_retry_twice`", at)
+            .unwrap();
+        assert_eq!(reworded.id, 1);
+        assert_eq!(reworded.names, ["ledger_retry_twice"]);
+        assert_eq!(reworded.kind, Kind::Note);
+        let kept = store.reanchor(at, 4, at).unwrap();
+        assert!(kept.anchors.is_empty(), "{kept:?}");
+        assert_eq!(stale(&mut store), [2]);
+        let found = store.search(at, "twice", None, 10, None).unwrap();
+        assert_eq!(ids(&found), [1], "the index has the new words");
+
+        let said = store.reword(at, 2, "Fees are kept in CENTS", at);
+        assert!(said.unwrap_err().to_string().contains("entry 3 says"));
+        store.remove(at, 3).unwrap();
+        let forgotten = store.reword(at, 2, "fees are kept in cents", at);
+        assert!(forgotten.unwrap_err().to_string().contains("forgotten"));
+        assert!(store.reword(at, 2, " ", at).is_err());
+        assert!(store.reanchor(at, 9, at).is_err());
     }
 
     #[test]
@@ -3394,10 +4414,12 @@ mod tests {
             Listed {
                 entry: gotcha,
                 freshness: Freshness::Drifting,
+                gone: Vec::new(),
             },
             Listed {
                 entry: entry(1, Kind::Note, "Fees are in cents."),
                 freshness: Freshness::Fresh,
+                gone: Vec::new(),
             },
         ];
         assert_eq!(

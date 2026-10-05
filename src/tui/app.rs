@@ -12842,11 +12842,13 @@ mod tests {
             last_seen: 0,
             anchors: Default::default(),
             checkout: None,
+            names: Vec::new(),
             used: None,
         };
         let listed = crate::memory::Listed {
             entry,
             freshness: crate::memory::Freshness::Fresh,
+            gone: Vec::new(),
         };
         app.memory_read(Path::new("/code/app"), Ok(vec![listed]));
         assert_eq!(

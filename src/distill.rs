@@ -3,6 +3,11 @@
 //! and keeps, in the project's memory, what a later session there would
 //! need to know and couldn't find by reading the code.
 //!
+//! It's also shown a few of the entries gone stale that are about the files
+//! the work touched, and says of each that the record settles whether it
+//! still holds as it is, holds reworded, or no longer holds: the entry is
+//! anchored again, reworded or forgotten.
+//!
 //! It reads the end of what the task's session did: for a task in the
 //! background, Claude's runs as crystal read them; for Claude Code in a
 //! terminal, the transcript its hooks named. Codex leaves nothing it can
@@ -13,7 +18,9 @@
 //! a turn cap, a system prompt that says what to keep and what never to, and
 //! `--json-schema` for the shape of its answer. The answer is checked
 //! before anything is kept: kinds it may use, texts short enough, files
-//! that are in the checkout, at most [`MAX_DISTILLED`] entries. What passes
+//! that are in the checkout, at most [`MAX_DISTILLED`] entries, and only
+//! the stale entries it was shown, one kept or reworded naming something
+//! that's in the checkout when it names anything. What passes
 //! goes into the memory the way everything does, so what's known already is
 //! seen again rather than added twice, and what the user forgot stays
 //! forgotten.
@@ -24,7 +31,7 @@
 use crate::config::MemorySettings;
 use crate::embed;
 use crate::handover::HELPERS;
-use crate::memory::{self, Added, Kind, New, Source, Store};
+use crate::memory::{self, Added, Entry, Kind, Listed, New, Source, Store};
 use crate::protocol::TaskRecord;
 use crate::secrets;
 use crate::session::signal_group;
@@ -71,6 +78,10 @@ const MAX_LINE: usize = 2_000;
 /// ones with most to do with the task, so it doesn't give them again in
 /// other words.
 const KNOWN_SHOWN: usize = 20;
+
+/// How many of the stale entries about the files the work touched the
+/// model is asked about, the ones said most recently.
+pub const RECHECKED: usize = 4;
 
 /// The kinds the distiller may give an entry: how a task turned out is the
 /// task's own to say.
@@ -138,8 +149,14 @@ statement of at most 300 characters that states the claim itself, with why when 
 and the files it is about, as paths relative to the repository root exactly as the record \
 names them (only files the record names; an empty list is fine).\n\nReturn at most 8 entries, \
 the most useful first. Return an empty list when nothing qualifies: an empty list is better \
-than a weak entry. You have no tools; do not try to read files or run commands: everything you \
-may use is in the message. Answer only through the structured output.";
+than a weak entry.\n\nThe message may also list entries the memory has already that may no \
+longer hold, each by its id, with what it names that is gone from the code. For each one the \
+record settles, give a verdict in rechecked: keep when it still holds as it says, with an empty \
+text; reword when it holds once corrected, with the corrected statement as its text, under the \
+same rules as an entry's; forget when it no longer holds, with an empty text. Leave out every \
+one the record does not settle: never guess.\n\nYou have no tools; do not try to read files or \
+run commands: everything you may use is in the message. Answer only through the structured \
+output.";
 
 /// The shape of the answer, for `--json-schema`: an object holding the
 /// entries, since structured output wants an object at the top.
@@ -165,9 +182,23 @@ pub fn schema() -> Value {
                     "required": ["kind", "text", "files"],
                     "additionalProperties": false
                 }
+            },
+            "rechecked": {
+                "type": "array",
+                "maxItems": RECHECKED,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "integer" },
+                        "verdict": { "type": "string", "enum": ["keep", "reword", "forget"] },
+                        "text": { "type": "string", "maxLength": MAX_TEXT }
+                    },
+                    "required": ["id", "verdict", "text"],
+                    "additionalProperties": false
+                }
             }
         },
-        "required": ["entries"],
+        "required": ["entries", "rechecked"],
         "additionalProperties": false
     })
 }
@@ -247,6 +278,18 @@ impl Record {
 
     pub fn is_empty(&self) -> bool {
         self.lines.is_empty()
+    }
+
+    /// The files it says were edited or written, as the tools named them.
+    pub fn edited(&self) -> Vec<&str> {
+        let edits = ["Edit", "MultiEdit", "NotebookEdit", "Write"];
+        self.lines
+            .iter()
+            .filter_map(|line| {
+                let (tool, file) = line.strip_prefix("TOOL ")?.split_once(": ")?;
+                edits.contains(&tool).then_some(file)
+            })
+            .collect()
     }
 
     pub fn text(&self) -> String {
@@ -403,6 +446,19 @@ pub struct Report {
     pub again: Vec<u64>,
     /// How many it found that the user had forgotten.
     pub forgotten: usize,
+    /// The ids of the stale entries it said still hold, anchored again.
+    #[serde(default)]
+    pub kept: Vec<u64>,
+    /// The ids of the stale entries it reworded.
+    #[serde(default)]
+    pub reworded: Vec<u64>,
+    /// The ids of the stale entries it said no longer hold, forgotten.
+    #[serde(default)]
+    pub forgot: Vec<u64>,
+    /// Those entries as they were, for the daemon to tell of.
+    #[serde(skip)]
+    #[cfg_attr(test, schemars(skip))]
+    pub forgot_entries: Vec<Entry>,
     /// The entries the model gave that didn't pass, each with why.
     pub rejected: Vec<String>,
     /// What the pass cost, in US dollars, as Claude counts it.
@@ -422,6 +478,18 @@ impl Report {
         if self.forgotten > 0 {
             line.push_str(&format!(", {} forgotten before", self.forgotten));
         }
+        let rechecked = [
+            (self.kept.len(), "kept"),
+            (self.reworded.len(), "reworded"),
+            (self.forgot.len(), "forgotten"),
+        ];
+        let rechecked: Vec<String> = (rechecked.iter())
+            .filter(|(count, _)| *count > 0)
+            .map(|(count, what)| format!("{count} {what}"))
+            .collect();
+        if !rechecked.is_empty() {
+            line.push_str(&format!(", of the stale {}", rechecked.join(", ")));
+        }
         if !self.rejected.is_empty() {
             line.push_str(&format!(", {} rejected", self.rejected.len()));
         }
@@ -431,7 +499,8 @@ impl Report {
 }
 
 /// Runs a pass, start to end: reads what was done, asks Claude, checks its
-/// answer and keeps what passes.
+/// answer and keeps what passes, and does as it says with the stale
+/// entries it was shown.
 pub fn run(job: &Job) -> Result<Report> {
     let record = job.material.read(&job.env)?;
     if record.is_empty() {
@@ -445,8 +514,11 @@ pub fn run(job: &Job) -> Result<Report> {
         .iter()
         .map(|entry| format!("({}) {}", entry.kind, memory::one_line(&entry.text)))
         .collect();
-    let (answer, cost_usd) = ask_claude(job, &message(&job.header, &known, &record.text()))?;
-    let checked = check(&answer, &job.checkout)?;
+    let touched = touched(&job.checkout, &record);
+    let stale = store.stale_about(&job.project, &touched, RECHECKED)?;
+    let message = message(&job.header, &known, &stale, &record.text());
+    let (answer, cost_usd) = ask_claude(job, &message)?;
+    let checked = check(&answer, &job.checkout, &stale)?;
     let mut report = Report {
         rejected: checked.rejected,
         cost_usd,
@@ -463,14 +535,46 @@ pub fn run(job: &Job) -> Result<Report> {
             Added::Refused => report.forgotten += 1,
         }
     }
+    for Recheck { id, verdict } in checked.rechecks {
+        let done = match verdict {
+            Verdict::Keep => {
+                (store.reanchor(&job.project, id, &job.checkout)).map(|_| report.kept.push(id))
+            }
+            Verdict::Reword(text) => (store.reword(&job.project, id, &text, &job.checkout))
+                .map(|_| report.reworded.push(id)),
+            Verdict::Forget => store.remove(&job.project, id).map(|entry| {
+                report.forgot.push(id);
+                report.forgot_entries.push(entry);
+            }),
+        };
+        if let Err(err) = done {
+            report.rejected.push(format!("entry {id}: {err:#}"));
+        }
+    }
     Ok(report)
 }
 
+/// The files the work touched, from the top of `checkout`: those its
+/// branch has changed since it left the default one, committed or not, and
+/// those `record` says were edited or written that are there.
+fn touched(checkout: &Path, record: &Record) -> Vec<String> {
+    let mut touched = crate::git::branch_changes(checkout).unwrap_or_default();
+    for file in record.edited() {
+        if let Some(file) = file_in(checkout, file)
+            && !touched.contains(&file)
+        {
+            touched.push(file);
+        }
+    }
+    touched
+}
+
 /// The message a pass sends: what the work was and how it ended, what the
-/// project's memory has already that has to do with it, `known`, then what
-/// was done. Credentials are taken out of all of it, so the model never
-/// sees a key a session printed, to copy it into an entry.
-pub fn message(header: &str, known: &[String], record: &str) -> String {
+/// project's memory has already that has to do with it, `known`, the
+/// entries gone stale it's asked about, `stale`, then what was done.
+/// Credentials are taken out of all of it, so the model never sees a key a
+/// session printed, to copy it into an entry.
+pub fn message(header: &str, known: &[String], stale: &[Listed], record: &str) -> String {
     let mut message = secrets::redact(header);
     message.push_str("\n\nWhat the project's memory has already");
     if known.is_empty() {
@@ -479,6 +583,26 @@ pub fn message(header: &str, known: &[String], record: &str) -> String {
         message.push_str(" (never give any of it again, even in other words):\n");
         for entry in known {
             message.push_str(&format!("- {}\n", secrets::redact(entry)));
+        }
+    }
+    if !stale.is_empty() {
+        message.push_str(
+            "\n\nEntries about the files this work touched that may no longer hold (give a \
+             verdict in rechecked on each the record settles, by its id):\n",
+        );
+        for item in stale {
+            let entry = &item.entry;
+            let gone = if entry.names.is_empty() {
+                "every file it's about".to_string()
+            } else {
+                item.gone.join(", ")
+            };
+            message.push_str(&format!(
+                "- id {}: ({}) {} [gone from the code: {gone}]\n",
+                entry.id,
+                entry.kind,
+                secrets::redact(&memory::one_line(&entry.text)),
+            ));
         }
     }
     message.push_str(&format!(
@@ -579,19 +703,40 @@ fn answer_of(out: &str) -> Result<(Value, f64)> {
     Ok((answer, cost))
 }
 
-/// The model's entries that passed, and why each that didn't, didn't.
+/// The model's entries that passed, what it said of the stale entries
+/// that passed, and why each that didn't, didn't.
 #[derive(Debug, Default, PartialEq)]
 pub struct Checked {
     pub entries: Vec<New>,
+    pub rechecks: Vec<Recheck>,
     pub rejected: Vec<String>,
+}
+
+/// What the model said of a stale entry it was shown.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Recheck {
+    pub id: u64,
+    pub verdict: Verdict,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Verdict {
+    /// It still holds as it says: anchored again.
+    Keep,
+    /// It holds said this way instead.
+    Reword(String),
+    /// It no longer holds.
+    Forget,
 }
 
 /// Checks the model's answer against the checkout: an array of entries,
 /// bare or as `entries`, at most [`MAX_DISTILLED`]; each of a kind the
 /// distiller may give, with a text that isn't empty or too long, naming
 /// files that are in `checkout`. An entry that fails any of it is dropped
-/// whole, with why.
-pub fn check(answer: &Value, checkout: &Path) -> Result<Checked> {
+/// whole, with why. Then its verdicts on the stale entries, `rechecked`:
+/// each on one of `stale`, once, and one kept or reworded naming something
+/// that's in `checkout`, when it names anything.
+pub fn check(answer: &Value, checkout: &Path, stale: &[Listed]) -> Result<Checked> {
     let items = match answer {
         Value::Array(items) => items,
         Value::Object(object) => match object.get("entries") {
@@ -614,7 +759,67 @@ pub fn check(answer: &Value, checkout: &Path) -> Result<Checked> {
             Err(why) => checked.rejected.push(format!("entry {number}: {why}")),
         }
     }
+    let rechecked = match &answer["rechecked"] {
+        Value::Array(rechecked) => &rechecked[..],
+        _ => &[],
+    };
+    for item in rechecked {
+        let id = item["id"].as_u64();
+        let said = || match id {
+            Some(id) => format!("entry {id}"),
+            None => "a verdict".to_string(),
+        };
+        match recheck(item, checkout, stale) {
+            Ok(recheck) if checked.rechecks.iter().any(|done| done.id == recheck.id) => {
+                checked
+                    .rejected
+                    .push(format!("{}: a second verdict", said()));
+            }
+            Ok(recheck) => checked.rechecks.push(recheck),
+            Err(why) => checked.rejected.push(format!("{}: {why}", said())),
+        }
+    }
     Ok(checked)
+}
+
+/// A verdict on one of the `stale` entries, checked.
+fn recheck(item: &Value, checkout: &Path, stale: &[Listed]) -> Result<Recheck, String> {
+    let id = item["id"].as_u64().ok_or("it says of no entry")?;
+    let asked = (stale.iter())
+        .find(|item| item.entry.id == id)
+        .ok_or("it wasn't one of those asked about")?;
+    let text = item["text"].as_str().unwrap_or_default().trim();
+    let verdict = match item["verdict"].as_str().unwrap_or_default() {
+        "keep" => Verdict::Keep,
+        "reword" => {
+            text_of(text)?;
+            Verdict::Reword(text.to_string())
+        }
+        "forget" => Verdict::Forget,
+        verdict => return Err(format!("{verdict:?} isn't a verdict")),
+    };
+    let said = match &verdict {
+        Verdict::Keep => &asked.entry.text,
+        Verdict::Reword(text) => text,
+        Verdict::Forget => return Ok(Recheck { id, verdict }),
+    };
+    let files = &asked.entry.files;
+    let named = !memory::names_beside(said, files).is_empty();
+    if named && memory::found_in(checkout, said, files).is_empty() {
+        return Err("nothing it names is in the checkout".to_string());
+    }
+    Ok(Recheck { id, verdict })
+}
+
+/// Whether `text` is fit for an entry: something, and not too long.
+fn text_of(text: &str) -> Result<(), String> {
+    if text.is_empty() {
+        return Err("it says nothing".to_string());
+    }
+    if text.chars().count() > MAX_TEXT {
+        return Err(format!("it's longer than {MAX_TEXT} characters"));
+    }
+    Ok(())
 }
 
 fn entry(item: &Value, checkout: &Path) -> Result<New, String> {
@@ -623,12 +828,7 @@ fn entry(item: &Value, checkout: &Path) -> Result<New, String> {
         .filter(|kind| KINDS.contains(kind))
         .ok_or_else(|| format!("{kind:?} isn't a kind it may give"))?;
     let text = item["text"].as_str().unwrap_or_default().trim();
-    if text.is_empty() {
-        return Err("it says nothing".to_string());
-    }
-    if text.chars().count() > MAX_TEXT {
-        return Err(format!("it's longer than {MAX_TEXT} characters"));
-    }
+    text_of(text)?;
     let mut files = Vec::new();
     let named = item["files"]
         .as_array()
@@ -709,6 +909,8 @@ mod tests {
         assert_eq!(after("--max-budget-usd"), "0.25");
         let schema: Value = serde_json::from_str(&after("--json-schema")).unwrap();
         assert_eq!(schema["properties"]["entries"]["maxItems"], 8);
+        assert_eq!(schema["properties"]["rechecked"]["maxItems"], RECHECKED);
+        assert!(SYSTEM_PROMPT.contains("never guess"));
     }
 
     #[test]
@@ -808,7 +1010,7 @@ mod tests {
         );
         let known = ["(gotcha) redis has to be up".to_string()];
         let record = "TOOL Bash: REDIS_PASSWORD=hunter22x make\n";
-        let message = message(&header, &known, record);
+        let message = message(&header, &known, &[], record);
         assert!(
             message.contains(
                 "What the project's memory has already (never give any of it again, even in \
@@ -818,11 +1020,157 @@ mod tests {
         );
         assert!(message.contains("REDIS_PASSWORD=[redacted]"), "{message}");
         assert!(!message.contains("hunter22x"));
-        let message = super::message(&header, &[], record);
+        let message = super::message(&header, &[], &[], record);
         assert!(
             message.contains("has already: nothing on this yet."),
             "{message}"
         );
+        assert!(!message.contains("may no longer hold"), "{message}");
+    }
+
+    /// Entry `id`, gone stale, with what of it is gone.
+    fn stale(id: u64, text: &str, gone: &[&str]) -> Listed {
+        let names = gone.iter().map(|name| name.to_string()).collect();
+        Listed {
+            entry: Entry {
+                id,
+                kind: Kind::Gotcha,
+                text: text.into(),
+                files: vec!["src/ledger.rs".into()],
+                source: Source::User,
+                created: 0,
+                seen: 1,
+                last_seen: 0,
+                anchors: Default::default(),
+                checkout: None,
+                used: None,
+                names,
+            },
+            freshness: memory::Freshness::Stale,
+            gone: gone.iter().map(|name| name.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn the_message_asks_about_the_stale_entries_by_their_ids() {
+        let stale = [
+            stale(7, "Use `ledger_retry` for\nflaky calls", &["ledger_retry"]),
+            Listed {
+                gone: vec!["src/fees.rs".into()],
+                ..stale(9, "Fees are rounded down", &[])
+            },
+        ];
+        let message = message("The task: fix the ledger", &[], &stale, "USER: fix it\n");
+        assert!(
+            message.contains(
+                "may no longer hold (give a verdict in rechecked on each the record settles, by \
+                 its id):\n\
+                 - id 7: (gotcha) Use `ledger_retry` for flaky calls [gone from the code: \
+                 ledger_retry]\n\
+                 - id 9: (gotcha) Fees are rounded down [gone from the code: every file it's \
+                 about]\n"
+            ),
+            "{message}"
+        );
+        assert!(message.find("may no longer hold") < message.find("The record"));
+    }
+
+    #[test]
+    fn verdicts_on_the_stale_entries_are_checked_against_the_checkout() {
+        let dir = checkout();
+        std::fs::write(
+            dir.path().join("src/ledger.rs"),
+            "fn ledger_retry_twice() {}",
+        )
+        .unwrap();
+        let asked = [
+            stale(7, "Use `ledger_retry` for flaky calls", &["ledger_retry"]),
+            stale(8, "Call `ledger_sync` first", &["ledger_sync"]),
+            stale(9, "Ledger calls are slow", &[]),
+        ];
+        let answer = json!({"entries": [], "rechecked": [
+            {"id": 7, "verdict": "reword", "text": "Use `ledger_retry_twice` for flaky calls"},
+            {"id": 8, "verdict": "keep", "text": ""},
+            {"id": 9, "verdict": "keep", "text": ""},
+            {"id": 7, "verdict": "forget", "text": ""},
+            {"id": 3, "verdict": "forget", "text": ""},
+            {"id": 8, "verdict": "doubt", "text": ""},
+            {"verdict": "forget", "text": ""},
+        ]});
+        let checked = check(&answer, dir.path(), &asked).unwrap();
+        assert_eq!(
+            checked.rechecks,
+            [
+                Recheck {
+                    id: 7,
+                    verdict: Verdict::Reword("Use `ledger_retry_twice` for flaky calls".into()),
+                },
+                Recheck {
+                    id: 9,
+                    verdict: Verdict::Keep,
+                },
+            ]
+        );
+        assert_eq!(
+            checked.rejected,
+            [
+                "entry 8: nothing it names is in the checkout",
+                "entry 7: a second verdict",
+                "entry 3: it wasn't one of those asked about",
+                "entry 8: \"doubt\" isn't a verdict",
+                "a verdict: it says of no entry",
+            ]
+        );
+        let reworded = json!({"entries": [], "rechecked": [
+            {"id": 7, "verdict": "reword", "text": "Use `ledger_retries` instead"},
+            {"id": 8, "verdict": "reword", "text": " "},
+            {"id": 9, "verdict": "forget", "text": ""},
+        ]});
+        let checked = check(&reworded, dir.path(), &asked).unwrap();
+        assert_eq!(
+            checked.rechecks,
+            [Recheck {
+                id: 9,
+                verdict: Verdict::Forget,
+            }]
+        );
+        assert_eq!(
+            checked.rejected,
+            [
+                "entry 7: nothing it names is in the checkout",
+                "entry 8: it says nothing",
+            ]
+        );
+        // An answer from before has none.
+        let before = json!({"entries": []});
+        assert!(
+            check(&before, dir.path(), &asked)
+                .unwrap()
+                .rechecks
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn the_files_the_work_touched_include_those_it_edited() {
+        let dir = checkout();
+        let mut record = Record::default();
+        let ledger = dir.path().join("src/ledger.rs");
+        for line in [
+            format!("TOOL Edit: {}", ledger.display()),
+            "TOOL Write: src/ledger.rs".to_string(),
+            "TOOL Read: src/other.rs".to_string(),
+            "TOOL Edit: src/gone.rs".to_string(),
+            "RESULT: TOOL Edit: src/x.rs".to_string(),
+        ] {
+            record.push(line);
+        }
+        assert_eq!(
+            record.edited(),
+            [ledger.to_str().unwrap(), "src/ledger.rs", "src/gone.rs"]
+        );
+        // Outside git, only what it edited that's there.
+        assert_eq!(touched(dir.path(), &record), ["src/ledger.rs"]);
     }
 
     #[test]
@@ -856,7 +1204,7 @@ mod tests {
             {"kind": "command", "text": "make ci runs it all",
              "files": [dir.path().join("src/ledger.rs").to_str().unwrap()]},
         ]});
-        let checked = check(&answer, dir.path()).unwrap();
+        let checked = check(&answer, dir.path(), &[]).unwrap();
         let texts: Vec<&str> = checked.entries.iter().map(|e| e.text.as_str()).collect();
         assert_eq!(
             texts,
@@ -876,10 +1224,10 @@ mod tests {
         let entries: Vec<Value> = (0..10)
             .map(|at| json!({"kind": "note", "text": format!("note {at}"), "files": []}))
             .collect();
-        let checked = check(&Value::Array(entries), dir.path()).unwrap();
+        let checked = check(&Value::Array(entries), dir.path(), &[]).unwrap();
         assert_eq!(checked.entries.len(), MAX_DISTILLED);
         assert_eq!(checked.rejected.len(), 2);
-        assert!(check(&json!("nothing"), dir.path()).is_err());
+        assert!(check(&json!("nothing"), dir.path(), &[]).is_err());
     }
 
     #[test]
@@ -924,10 +1272,20 @@ mod tests {
             forgotten: 1,
             rejected: vec!["entry 3: it says nothing".into()],
             cost_usd: 0.0123,
+            ..Report::default()
         };
         assert_eq!(
             report.line(),
             "2 entries added, 1 seen again, 1 forgotten before, 1 rejected ($0.0123)"
+        );
+        let rechecked = Report {
+            kept: vec![2],
+            forgot: vec![3, 6],
+            ..Report::default()
+        };
+        assert_eq!(
+            rechecked.line(),
+            "0 entries added, of the stale 1 kept, 2 forgotten ($0.0000)"
         );
     }
 }

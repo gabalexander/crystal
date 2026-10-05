@@ -1262,9 +1262,10 @@ struct EntryArgs {
     #[arg(short, long, value_enum, default_value_t = memory::Kind::Note)]
     kind: memory::Kind,
 
-    /// A file it's about; once some of its files change, the entry is
-    /// marked drifting, and once all of them have, stale. Give it once a
-    /// file.
+    /// A file it's about. Give it once a file. Whether the entry holds
+    /// goes by what its text names, like `local_origin` or `--force`; one
+    /// that names nothing to look for goes by its files: drifting once some
+    /// have changed, and stale once every one is gone.
     #[arg(short = 'f', long = "file", value_name = "FILE")]
     files: Vec<String>,
 
@@ -1312,8 +1313,9 @@ enum MemoryCommand {
         #[arg(long)]
         expired: bool,
     },
-    /// The entries that have to do with these words, the best first,
-    /// those that are stale or expired left out.
+    /// The entries that have to do with these words, the best first, those
+    /// that still hold before the stale, which are marked, and those expired
+    /// left out.
     Search {
         #[arg(required = true)]
         words: Vec<String>,
@@ -1327,7 +1329,13 @@ enum MemoryCommand {
         #[arg(short = 'f', long = "file", value_name = "PATH")]
         files: Vec<String>,
 
-        /// Stale and expired entries too, marked.
+        /// Leave the stale out: those whose every name is gone from the
+        /// code.
+        #[arg(long)]
+        fresh: bool,
+
+        /// The expired too, marked: notes and outcomes nobody has found
+        /// again in a while.
         #[arg(short, long)]
         all: bool,
 
@@ -2683,12 +2691,14 @@ fn run(cli: Cli) -> Result<()> {
                 words,
                 kind,
                 files,
+                fresh,
                 all,
                 limit,
             }) => {
                 let args = memory_cli::SearchArgs {
                     kind,
                     files,
+                    fresh,
                     all,
                     limit,
                 };

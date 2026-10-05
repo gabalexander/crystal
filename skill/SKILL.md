@@ -312,13 +312,16 @@ crystal memory search ledger -k gotcha -f tests   # of a kind, about the files i
 
 - `-k` is `decision`, `gotcha`, `command` or `note` (the default). Keep each entry to a sentence or two. Give a
   lesson its kind: lessons rank above notes, and a note nobody finds again expires after 30 days.
-- `-f <file>` names a file the entry is about. Once some of its files change, the entry is marked drifting, and
-  once all of them have, stale.
+- `-f <file>` names a file the entry is about. Whether an entry still holds goes by what it names that looks
+  like code (`local_origin`, `TaskRecord`, `src/ledger.rs`, `--force`): drifting once some of that is gone from
+  the code, stale once all of it is. So name what the claim is about, in backticks; an entry that names nothing
+  goes by its files, drifting once they change and stale once they're all gone.
 - Don't remember what the code, the git log, the backlog or CLAUDE.md already says, or anything that only
   matters now: what was merged, pushed or installed, a commit's hash, which backlog item tracks what.
 - `crystal memory search` matches any of its words, or a word they start or stem from, best first; with
-  search by meaning on, entries that mean the same count too, so a few plain words do. It leaves out stale
-  and expired entries; `--all` brings them back.
+  search by meaning on, entries that mean the same count too, so a few plain words do. Stale entries come
+  after the rest, marked; check one in the code before you rely on it. `--fresh` leaves them out. It leaves out
+  expired entries; `--all` brings them back.
 - An entry's first line is what lists show of it; `--title` gives it one of its own, over the rest.
 - In a Claude Code session crystal started, the `memory_search` and `memory_show` tools search the memory and
   read an entry by its id without a shell command; use them when you have them.
