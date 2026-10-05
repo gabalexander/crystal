@@ -679,7 +679,8 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   bringing in a project's JSON file from before, anchors (what an entry's text names that looks like code and
   was in its worktree's code when it was said, `names_in`, and each file's SHA-256 then) and whether an entry
   holds, fresh, drifting or stale, by what it names, looked up among the words of a worktree's files
-  (`Words`), or naming nothing, by its files, the entries gone stale the daemon hasn't told of, and those about
+  (`Words`, kept in each process from one look to the next and read again only where a file's time or size
+  changed, `Kept`), or naming nothing, by its files, the entries gone stale the daemon hasn't told of, and those about
   some files for the distiller to ask about again, anchored again or reworded, search (of a kind, about some
   files or directories, the stale after the rest or left out), lessons
   (decisions, gotchas, commands) ranked above the notes and outcomes near them unless what's asked is about
@@ -727,8 +728,8 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   (several ids, or what reads as status, listed until `--yes`), `kind` (entries' kinds by their ids, or the
   notes the distiller's model reads as lessons, listed until `--yes`), `export`, `distill` and `dedupe` (each
   group under the one kept, merged with `--apply`) included, adding and deduping through the daemon, which
-  keeps the models loaded, or here without one, and an entry in full as `show` and the `memory_show` tool
-  print it, with what's gone
+  keeps the models loaded, and listing and exporting through it, which keeps each worktree's words, or here
+  without one, and an entry in full as `show` and the `memory_show` tool print it, with what's gone
 - `src/profile.rs`: agent profiles: what one runs, its prompt and postfix around the task or alone with no
   task (`skip_task`), how it's meant to start (`launch`: a session, a task or a background task), checking it,
   and saving or removing one in the config file with `toml_edit`, so the user's comments and layout stay;

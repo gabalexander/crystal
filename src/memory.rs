@@ -63,9 +63,10 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::fs;
+use std::hash::{DefaultHasher, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// How many entries a session is shown when it starts. A few that matter
 /// help; a long list is skimmed past.
@@ -95,6 +96,16 @@ const MAX_WALKED: usize = 5_000;
 /// The directories of what's built or fetched, never read for names
 /// outside git, where nothing says to ignore them.
 const NOT_WALKED: &[&str] = &["node_modules", "target"];
+
+/// How long after a file last changed its stamp, when that was and its
+/// size, tells a change from none: changed twice within one tick of a
+/// coarse clock, to the same size, it would look unchanged, so one read
+/// sooner after it changed is read again the next time, as git does with
+/// what its index keeps.
+const SETTLED: Duration = Duration::from_secs(2);
+
+/// How long the words of a worktree nobody looks at are kept.
+const WORDS_KEPT: Duration = Duration::from_secs(30 * 60);
 
 /// The most names an entry is checked by: the first it gives.
 const MAX_NAMES: usize = 16;
@@ -2892,7 +2903,7 @@ impl Code {
     fn words_of(&mut self, top: &Path) -> &Words {
         self.words
             .entry(top.to_path_buf())
-            .or_insert_with_key(|top| Words::read(top))
+            .or_insert_with_key(|top| Words::of(top))
     }
 
     /// Whether `entry` still holds, and what's gone: looked at in the
@@ -2954,40 +2965,26 @@ impl Code {
 /// those of every file git lists there, those it tracks and the new ones it
 /// doesn't ignore, or outside git, every file under it but the hidden; the
 /// files themselves by their paths; and the worktree, for what's in it by
-/// a path.
+/// a path. Each word is kept by a hash of it, and with how many files have
+/// it.
 struct Words {
     top: PathBuf,
-    words: HashSet<String>,
+    words: Arc<HashMap<u64, u32>>,
 }
 
 impl Words {
-    /// The words of the worktree at `top`, as much of it as
-    /// [`MAX_WORDS_READ`] reads: none when it isn't there.
-    fn read(top: &Path) -> Words {
-        let mut words = HashSet::new();
+    /// The words of the worktree at `top` as it is now, as much of it as
+    /// [`MAX_WORDS_READ`] reads: none when it isn't there. What this
+    /// process kept of it from its last look is brought up to date, only
+    /// what changed since read again: see [`Kept`].
+    fn of(top: &Path) -> Words {
         let files = crate::git::files(top).unwrap_or_else(|_| walked(top));
-        let mut room = MAX_WORDS_READ;
-        for file in files {
-            add_path(&mut words, file.as_bytes());
-            let path = top.join(&file);
-            let Ok(meta) = fs::metadata(&path) else {
-                continue;
-            };
-            if !meta.is_file() || meta.len() > MAX_ANCHORED_BYTES || meta.len() > room {
-                continue;
-            }
-            let Ok(bytes) = fs::read(&path) else {
-                continue;
-            };
-            room -= meta.len();
-            // A NUL near the start is git's own test for a binary file.
-            if !bytes[..bytes.len().min(8000)].contains(&0) {
-                add_words(&mut words, &bytes);
-            }
-        }
+        let kept = Kept::of(top);
+        let mut kept = kept.lock().unwrap_or_else(PoisonError::into_inner);
+        kept.update(top, &files);
         Words {
             top: top.to_path_buf(),
-            words,
+            words: kept.counts.clone(),
         }
     }
 
@@ -2998,14 +2995,168 @@ impl Words {
     /// their words.
     fn has(&self, name: &str) -> bool {
         if let Some(flag) = name.strip_prefix("--") {
-            return self.words.contains(flag) || self.words.contains(&flag.replace('-', "_"));
+            return self.contains(flag) || self.contains(&flag.replace('-', "_"));
         }
         if name.contains(['/', '.']) {
             let path = name.trim_end_matches('/');
-            return self.words.contains(path) || self.top.join(path).exists();
+            return self.contains(path) || self.top.join(path).exists();
         }
-        self.words.contains(name)
+        self.contains(name)
     }
+
+    fn contains(&self, word: &str) -> bool {
+        self.words.contains_key(&word_key(word.as_bytes()))
+    }
+}
+
+/// What a process keeps of a worktree's words from one look to the next:
+/// each file's, as it was read, by its stamp then, and how many of its
+/// files have each word. A look reads again only the files whose stamps
+/// changed, those that hadn't settled as they were read, and those new
+/// since; and lets go of those gone. The daemon, which searches, starts
+/// agents and looks for what's gone stale, reads a worktree whole once.
+#[derive(Default)]
+struct Kept {
+    files: HashMap<String, KeptFile>,
+    counts: Arc<HashMap<u64, u32>>,
+}
+
+/// A file's words as a look read them.
+struct KeptFile {
+    /// Its stamp as it was looked at, or `None` when it couldn't be.
+    stamp: Option<Stamp>,
+    /// Whether its stamp had [`SETTLED`] as it was read.
+    settled: bool,
+    /// Whether what it holds was read, rather than only its path counted:
+    /// not when it's too big, or past what a look reads.
+    read: bool,
+    /// The hash of each of its words, each once.
+    words: Box<[u64]>,
+}
+
+/// When a file last changed and its size: unchanged, the file is taken to
+/// be as it was read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Stamp {
+    changed: SystemTime,
+    len: u64,
+}
+
+impl Stamp {
+    fn of(meta: &fs::Metadata) -> Option<Stamp> {
+        Some(Stamp {
+            changed: meta.modified().ok()?,
+            len: meta.len(),
+        })
+    }
+
+    /// Whether, read at `now`, it had settled: it changed at least
+    /// [`SETTLED`] before.
+    fn settled(self, now: SystemTime) -> bool {
+        now.duration_since(self.changed)
+            .is_ok_and(|since| since >= SETTLED)
+    }
+}
+
+impl Kept {
+    /// What this process keeps of the worktree at `top`, empty the first
+    /// time. Those of worktrees gone, or nobody has looked at for
+    /// [`WORDS_KEPT`], are let go.
+    fn of(top: &Path) -> Arc<Mutex<Kept>> {
+        type Worktrees = HashMap<PathBuf, (Instant, Arc<Mutex<Kept>>)>;
+        static KEPT: OnceLock<Mutex<Worktrees>> = OnceLock::new();
+        let mut kept = KEPT
+            .get_or_init(Mutex::default)
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        kept.retain(|dir, (looked, _)| looked.elapsed() < WORDS_KEPT && dir.is_dir());
+        let (looked, words) =
+            (kept.entry(top.to_path_buf())).or_insert_with(|| (Instant::now(), Arc::default()));
+        *looked = Instant::now();
+        words.clone()
+    }
+
+    /// Brings what's kept up to date with `files`, the worktree's files as
+    /// they're listed now, in the order they're read.
+    fn update(&mut self, top: &Path, files: &[String]) {
+        let counts = Arc::make_mut(&mut self.counts);
+        let now = SystemTime::now();
+        let mut room = MAX_WORDS_READ;
+        let mut listed = HashSet::with_capacity(files.len());
+        for file in files {
+            listed.insert(file.as_str());
+            let path = top.join(file);
+            let meta = fs::metadata(&path).ok();
+            let stamp = meta.as_ref().and_then(Stamp::of);
+            let size = meta
+                .as_ref()
+                .filter(|meta| meta.is_file())
+                .map(fs::Metadata::len);
+            let read = size.is_some_and(|size| size <= MAX_ANCHORED_BYTES && size <= room);
+            if read {
+                room -= size.unwrap_or_default();
+            }
+            let unchanged = (self.files.get(file))
+                .is_some_and(|kept| kept.settled && kept.stamp == stamp && kept.read == read);
+            if unchanged {
+                continue;
+            }
+            let kept = KeptFile {
+                stamp,
+                settled: stamp.is_some_and(|stamp| stamp.settled(now)),
+                read,
+                words: file_words(file, read.then_some(&path)),
+            };
+            count(counts, &kept.words, true);
+            if let Some(was) = self.files.insert(file.clone(), kept) {
+                count(counts, &was.words, false);
+            }
+        }
+        self.files.retain(|file, kept| {
+            let there = listed.contains(file.as_str());
+            if !there {
+                count(counts, &kept.words, false);
+            }
+            there
+        });
+    }
+}
+
+/// The words of the file at `file`, from the top of its worktree: those of
+/// its path, and with `path`, those of what it holds, unless it's binary.
+fn file_words(file: &str, path: Option<&PathBuf>) -> Box<[u64]> {
+    let mut words = HashSet::new();
+    add_path(&mut words, file.as_bytes());
+    if let Some(bytes) = path.and_then(|path| fs::read(path).ok())
+        // A NUL near the start is git's own test for a binary file.
+        && !bytes[..bytes.len().min(8000)].contains(&0)
+    {
+        add_words(&mut words, &bytes);
+    }
+    words.into_iter().collect()
+}
+
+/// Counts `words` in `counts` as a file that has them comes, `added`, or
+/// goes.
+fn count(counts: &mut HashMap<u64, u32>, words: &[u64], added: bool) {
+    for word in words {
+        if added {
+            *counts.entry(*word).or_default() += 1;
+        } else if let Some(files) = counts.get_mut(word) {
+            *files -= 1;
+            if *files == 0 {
+                counts.remove(word);
+            }
+        }
+    }
+}
+
+/// A word as [`Words`] keeps it: the same hash for the same bytes in every
+/// look of one process.
+fn word_key(word: &[u8]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    hasher.write(word);
+    hasher.finish()
 }
 
 /// What `text` names, as [`names_in`] finds it, but for the paths of
@@ -3065,7 +3216,7 @@ fn walked(dir: &Path) -> Vec<String> {
 /// by dashes (`kill-server`, `--test-threads` as `test-threads`), and each
 /// path (`src/memory.rs`, `memory.db`, `memory.stale`) with every path it
 /// ends with.
-fn add_words(words: &mut HashSet<String>, bytes: &[u8]) {
+fn add_words(words: &mut HashSet<u64>, bytes: &[u8]) {
     let in_path = |byte: &u8| byte.is_ascii_alphanumeric() || b"_-./~".contains(byte);
     for run in bytes.split(|byte| !in_path(byte)) {
         if run.is_empty() {
@@ -3088,7 +3239,7 @@ fn add_words(words: &mut HashSet<String>, bytes: &[u8]) {
 /// Adds the path `path` to `words`, without the dots and slashes it ends
 /// with, with every path it ends with after a slash, and every directory
 /// it's in.
-fn add_path(words: &mut HashSet<String>, path: &[u8]) {
+fn add_path(words: &mut HashSet<u64>, path: &[u8]) {
     let mut path = path;
     while let [rest @ .., b'.' | b'/'] = path {
         path = rest;
@@ -3105,15 +3256,9 @@ fn add_path(words: &mut HashSet<String>, path: &[u8]) {
     }
 }
 
-fn add_word(words: &mut HashSet<String>, word: &[u8]) {
-    if word.is_empty() {
-        return;
-    }
-    // What `in_path` keeps is ASCII.
-    if let Ok(word) = std::str::from_utf8(word)
-        && !words.contains(word)
-    {
-        words.insert(word.to_string());
+fn add_word(words: &mut HashSet<u64>, word: &[u8]) {
+    if !word.is_empty() {
+        words.insert(word_key(word));
     }
 }
 
@@ -5184,7 +5329,7 @@ mod tests {
         .unwrap();
         fs::write(at.join(".hidden/secret.rs"), "fn hidden_away() {}").unwrap();
         fs::write(at.join("data.bin"), b"fn in_binary() {}\0\0").unwrap();
-        let words = Words::read(at);
+        let words = Words::of(at);
         for there in [
             "remove_worktree",
             "--remove-worktree",
@@ -5213,7 +5358,53 @@ mod tests {
         ] {
             assert!(!words.has(gone), "{gone}");
         }
-        assert!(!Words::read(&at.join("nowhere")).has("app.rs"));
+        assert!(!Words::of(&at.join("nowhere")).has("app.rs"));
+    }
+
+    /// Writes `text` into `file`, changed when the clock read `changed`.
+    fn write_changed(file: &Path, text: &str, changed: SystemTime) {
+        fs::write(file, text).unwrap();
+        let file = fs::File::options().write(true).open(file).unwrap();
+        file.set_modified(changed).unwrap();
+    }
+
+    #[test]
+    fn a_worktree_s_words_are_read_again_only_where_it_changed() {
+        let project = project_with(&[]);
+        let at = project.path();
+        let long_ago = SystemTime::now() - Duration::from_secs(60);
+        write_changed(&at.join("a.rs"), "fn ledger_retry() {}", long_ago);
+        write_changed(&at.join("b.rs"), "fn fees_in_cents() {}", long_ago);
+        let words = Words::of(at);
+        assert!(words.has("ledger_retry") && words.has("fees_in_cents"));
+
+        // Its stamp the same, a file is taken to be as it was read: what
+        // shows the kept words are used.
+        write_changed(&at.join("a.rs"), "fn ledger_redo_() {}", long_ago);
+        assert!(Words::of(at).has("ledger_retry"));
+        // Its size or its time changed, it's read again.
+        write_changed(&at.join("a.rs"), "fn ledger_redone() {}", long_ago);
+        let words = Words::of(at);
+        assert!(words.has("ledger_redone") && !words.has("ledger_retry"));
+        write_changed(&at.join("a.rs"), "fn ledger_again() {}", SystemTime::now());
+        assert!(Words::of(at).has("ledger_again"));
+        // Read so soon after it changed, it's read again next time, though
+        // its stamp is the same.
+        let now = fs::metadata(at.join("a.rs")).unwrap().modified().unwrap();
+        write_changed(&at.join("a.rs"), "fn ledger_later() {}", now);
+        assert!(Words::of(at).has("ledger_later"));
+
+        // A file gone takes its words with it, but not those another has.
+        fs::write(at.join("c.rs"), "fn fees_in_cents() {} fn only_in_c() {}").unwrap();
+        assert!(Words::of(at).has("only_in_c"));
+        fs::remove_file(at.join("c.rs")).unwrap();
+        let words = Words::of(at);
+        assert!(!words.has("only_in_c") && !words.has("c.rs"));
+        assert!(words.has("fees_in_cents"));
+        // What a look took is its own, whatever comes after.
+        fs::remove_file(at.join("b.rs")).unwrap();
+        assert!(words.has("fees_in_cents"));
+        assert!(!Words::of(at).has("fees_in_cents"));
     }
 
     #[test]

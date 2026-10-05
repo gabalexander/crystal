@@ -9154,6 +9154,39 @@ fn memory_marks_an_entry_drifting_and_shows_and_exports_it_in_full() {
 }
 
 #[test]
+fn the_daemon_lists_memory_with_its_worktrees_words_kept_up_to_date() {
+    let (crystal, repo) = crystal_remembering();
+    let repo_dir = repo.to_str().unwrap();
+    std::fs::write(repo.join("ledger.rs"), "fn ledger_retry() {}").unwrap();
+    crystal.ok(&[
+        "remember",
+        "-C",
+        repo_dir,
+        "-k",
+        "gotcha",
+        "Flaky calls go through `ledger_retry`",
+    ]);
+    // A daemon to ask, which keeps the worktree's words between looks.
+    crystal.ok(&["new", "-d", "-n", "here", "sleep", "30"]);
+    let listed = || crystal.ok(&["memory", "-C", repo_dir]);
+    assert!(
+        listed().ends_with("go through `ledger_retry`\n"),
+        "{}",
+        listed()
+    );
+    std::fs::write(repo.join("ledger.rs"), "fn ledger_retries() {}").unwrap();
+    assert!(listed().contains("`ledger_retry`  [stale]"), "{}", listed());
+    let exported = crystal.ok(&["memory", "-C", repo_dir, "export"]);
+    assert!(exported.contains("## 1 · gotcha (stale)"), "{exported}");
+    std::fs::write(repo.join("other.rs"), "// ledger_retry, back").unwrap();
+    assert!(
+        listed().ends_with("go through `ledger_retry`\n"),
+        "{}",
+        listed()
+    );
+}
+
+#[test]
 fn memory_search_lists_the_entries_that_share_its_words() {
     let (crystal, repo) = crystal_remembering();
     let repo_dir = repo.to_str().unwrap();

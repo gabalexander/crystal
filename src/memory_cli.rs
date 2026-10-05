@@ -181,8 +181,8 @@ pub fn list(socket: &Path, dir: Option<PathBuf>, listing: Listing) -> Result<()>
         }
         return Ok(());
     }
-    let memory = read(socket, dir)?;
-    let listed = memory.listed();
+    check_on()?;
+    let listed = listed(socket, &dir_or_current(dir)?)?;
     let now = now();
     let listed: Vec<&Listed> = listed
         .iter()
@@ -230,13 +230,27 @@ pub fn no_entry(socket: &Path, project: &Path, id: u64) -> String {
 
 /// Prints the project's memory as markdown, newest first.
 pub fn export(socket: &Path, dir: Option<PathBuf>) -> Result<()> {
-    let memory = read(socket, dir)?;
-    let name = memory.project.file_name().unwrap_or_default();
-    out!(
-        "{}",
-        memory::markdown(&name.to_string_lossy(), &memory.listed())
-    )?;
+    check_on()?;
+    let dir = dir_or_current(dir)?;
+    let project = memory::project_of(&dir);
+    let name = project.file_name().unwrap_or_default();
+    let listed = listed(socket, &dir)?;
+    out!("{}", memory::markdown(&name.to_string_lossy(), &listed))?;
     Ok(())
+}
+
+/// Every entry of the memory of the project `dir` is in, newest first,
+/// each with whether it still holds: from the daemon, which keeps each
+/// worktree's words from one look to the next, or read here, when there's
+/// no daemon to ask.
+fn listed(socket: &Path, dir: &Path) -> Result<Vec<Listed>> {
+    let request = Request::ListMemory {
+        dir: dir.to_path_buf(),
+    };
+    if let Ok(Some(Response::Memory { entries })) = client::ask(socket, &request, false) {
+        return Ok(entries);
+    }
+    Ok(Memory::read(socket, &memory::project_of(dir))?.listed())
 }
 
 /// What `crystal memory search` keeps to besides its words.

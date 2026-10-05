@@ -2597,6 +2597,9 @@ crystal memory dedupe                # entries that say what another does, by me
   holds, however much its files change. Once some are gone, it's marked drifting: it may hold only in part.
   Once all of them are, it's stale: agents starting aren't shown it, and a search gives it after the rest.
   What it names that isn't in the code as it's remembered, like something just removed, isn't looked for.
+  The daemon keeps each worktree's words from one look to the next, and reads again only the files that
+  changed since (by their time and size), so a search, an agent starting and `crystal memory` itself, which
+  asks the daemon when one is running, don't read the whole worktree each time.
 - `-f` names a file an entry is about, and can be given more than once. crystal keeps a hash of each file as it
   is then (a file that isn't there isn't counted). An entry that names nothing to look for goes by its files
   instead: drifting once some have changed, and stale once every one of them is gone. `crystal memory show`
