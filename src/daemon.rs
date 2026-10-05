@@ -3620,6 +3620,7 @@ fn distill_about(report: &Result<distill::Report>) -> DistillAbout {
         Ok(report) => DistillAbout {
             added: report.added.len(),
             again: report.again.len(),
+            made_lessons: report.made_lessons.len(),
             rejected: report.rejected.len(),
             rechecked: report.kept.len() + report.reworded.len() + report.forgot.len(),
             cost_usd: report.cost_usd,
@@ -3633,7 +3634,8 @@ fn distill_about(report: &Result<distill::Report>) -> DistillAbout {
 }
 
 /// Tells of the entries the distiller added to the memory of `job`'s
-/// project, by their ids, and of the stale ones it forgot.
+/// project, and the notes it made lessons, by their ids, and of the stale
+/// ones it forgot.
 fn tell_distilled(events: &Bus, job: &Job, report: &distill::Report) {
     for entry in &report.forgot_entries {
         let forgot = Event::memory(Kind::MemoryForgotten, job.project.clone(), entry.clone());
@@ -3642,9 +3644,15 @@ fn tell_distilled(events: &Bus, job: &Job, report: &distill::Report) {
     let Ok(mut store) = memory::Store::open(&job.socket) else {
         return;
     };
-    for &id in &report.added {
-        if let Ok(Some(entry)) = store.get(&job.project, id) {
-            events.emit(Event::memory(Kind::MemoryAdded, job.project.clone(), entry));
+    let told = [
+        (Kind::MemoryAdded, &report.added),
+        (Kind::MemoryChanged, &report.made_lessons),
+    ];
+    for (kind, ids) in told {
+        for &id in ids {
+            if let Ok(Some(entry)) = store.get(&job.project, id) {
+                events.emit(Event::memory(kind, job.project.clone(), entry));
+            }
         }
     }
 }

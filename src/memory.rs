@@ -339,6 +339,12 @@ const USED: &str = "
 ALTER TABLE entries ADD COLUMN used INTEGER;
 ";
 
+/// When each entry's time to expire counts from, when that's later than
+/// when it was last said: see [`count_from_now`].
+const COUNTED_FROM: &str = "
+ALTER TABLE entries ADD COLUMN counted_from INTEGER;
+";
+
 /// What makes the database as it is now, a step for each version: a
 /// database at version `v`, kept in its `user_version`, takes the steps
 /// after the first `v`.
@@ -351,11 +357,12 @@ const MIGRATIONS: &[fn(&Connection) -> Result<()>] = &[
     shorten_outcomes,
     |conn| Ok(conn.execute_batch(USED)?),
     add_names,
+    count_from_now,
 ];
 
 /// The columns [`entry_of`] reads, in its order.
 const COLUMNS: &str = "e.id, e.kind, e.text, e.files, e.source, e.created, e.seen, e.last_seen, \
-                       e.anchors, e.checkout, e.used, e.names";
+                       e.anchors, e.checkout, e.used, e.names, e.counted_from";
 
 /// Whether memory is on, the `memory` plugin: the one gate for everything
 /// it adds, from the launch paragraph to the TUI's view and the commands.
@@ -495,7 +502,8 @@ fn unexpired_sql(at: usize) -> String {
         .collect();
     format!(
         "(?{at} IS NULL OR e.seen > 1 OR e.used IS NOT NULL \
-         OR coalesce(max(e.created, e.last_seen) + CASE e.kind{ages} END > ?{at}, 1))"
+         OR coalesce(max(e.created, e.last_seen, coalesce(e.counted_from, 0)) \
+         + CASE e.kind{ages} END > ?{at}, 1))"
     )
 }
 
@@ -570,18 +578,25 @@ pub struct Entry {
     /// When an agent last read it in full, in seconds since the Unix epoch.
     #[serde(default)]
     pub used: Option<u64>,
+    /// When its time to expire counts from, when that's later than when it
+    /// was last said: when crystal started telling whether an entry is
+    /// found again, for one from before then, or when it was made a note.
+    #[serde(default)]
+    pub counted_from: Option<u64>,
 }
 
 impl Entry {
     /// Whether it's expired at `now`: a note or a task's outcome that
     /// nobody has found again, said again or read in full by an agent,
-    /// since it was said, longer ago than its kind lasts. Searches and
-    /// agents starting leave it out; it's kept, and the list marks it.
+    /// since it was said, or since its time began to count, longer ago than
+    /// its kind lasts. Searches and agents starting leave it out; it's
+    /// kept, and the list marks it.
     pub fn expired(&self, now: u64) -> bool {
         let Some(age) = self.kind.expires_after() else {
             return false;
         };
         let said = self.created.max(self.last_seen);
+        let said = said.max(self.counted_from.unwrap_or(0));
         self.seen <= 1 && self.used.is_none() && now >= said.saturating_add(age.as_secs())
     }
 }
@@ -784,6 +799,7 @@ impl Store {
             last_seen: now,
             checkout: new.checkout,
             used: None,
+            counted_from: None,
         };
         insert(&tx, &name, &entry)?;
         tx.commit()?;
@@ -957,6 +973,24 @@ impl Store {
             params![name, id, seconds_since_epoch(SystemTime::now())],
         )?;
         get(&self.conn, &name, id)
+    }
+
+    /// Makes entry `id` of `project` one of `kind`, and gives it back: what
+    /// it says stays as it is, and so do its vector and its place in the
+    /// index. Made a note, its time to expire counts from now.
+    pub fn set_kind(&mut self, project: &Path, id: u64, kind: Kind) -> Result<Entry> {
+        let name = self.ready(project)?;
+        let now = seconds_since_epoch(SystemTime::now());
+        let from = kind.expires_after().map(|_| now);
+        let changed = self.conn.execute(
+            "UPDATE entries SET kind = ?3, counted_from = coalesce(?4, counted_from) \
+             WHERE project = ?1 AND id = ?2",
+            params![name, id, kind.to_string(), from],
+        )?;
+        if changed == 0 {
+            bail!("there's no entry {id}");
+        }
+        get(&self.conn, &name, id)?.context("the entry just changed is gone")
     }
 
     /// Every project's entries that are anchored to names or files, each
@@ -1343,6 +1377,8 @@ impl Store {
                 let said = entry.last_seen.max(entry.created);
                 entry.anchors = anchors_from_before(&entry.files, said, project);
                 entry.names = code.names_in(project, &entry.text, &entry.files);
+                // Brought in now, it has as long as any other to be found.
+                entry.counted_from = Some(seconds_since_epoch(SystemTime::now()));
                 insert(&tx, &name, &entry)?;
             }
         }
@@ -1552,6 +1588,19 @@ fn sentence_end(line: &str) -> Option<usize> {
     })
 }
 
+/// Adds [`COUNTED_FROM`], and starts the time of every entry there to
+/// expire now: before, crystal didn't tell whether an entry was found
+/// again, so one said a month ago would expire the day it upgraded,
+/// however much it was read.
+fn count_from_now(conn: &Connection) -> Result<()> {
+    conn.execute_batch(COUNTED_FROM)?;
+    conn.execute(
+        "UPDATE entries SET counted_from = ?1",
+        params![seconds_since_epoch(SystemTime::now())],
+    )?;
+    Ok(())
+}
+
 fn get(conn: &Connection, project: &str, id: u64) -> Result<Option<Entry>> {
     Ok(conn
         .query_row(
@@ -1565,8 +1614,8 @@ fn get(conn: &Connection, project: &str, id: u64) -> Result<Option<Entry>> {
 fn insert(conn: &Connection, project: &str, entry: &Entry) -> Result<()> {
     conn.execute(
         "INSERT INTO entries (project, id, kind, text, key, files, source, created, seen, \
-         last_seen, anchors, checkout, names) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+         last_seen, anchors, checkout, names, counted_from) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         params![
             project,
             entry.id,
@@ -1581,6 +1630,7 @@ fn insert(conn: &Connection, project: &str, entry: &Entry) -> Result<()> {
             serde_json::to_string(&entry.anchors)?,
             path_text(&entry.checkout),
             serde_json::to_string(&entry.names)?,
+            entry.counted_from,
         ],
     )?;
     Ok(())
@@ -1615,6 +1665,7 @@ fn entry_of(row: &rusqlite::Row) -> rusqlite::Result<Entry> {
         checkout: checkout.map(PathBuf::from),
         used: row.get(10)?,
         names: serde_json::from_str(&names).unwrap_or_default(),
+        counted_from: row.get(12)?,
     })
 }
 
@@ -2828,6 +2879,7 @@ mod tests {
             checkout: None,
             used: None,
             names: Vec::new(),
+            counted_from: None,
         }
     }
 
@@ -4312,10 +4364,12 @@ mod tests {
         fs::write(project.path().join("a.rs"), "fn ledger_retry() {}").unwrap();
         fs::create_dir_all(dir(&socket)).unwrap();
         let conn = Connection::open(dir(&socket).join("memory.db")).unwrap();
-        for step in &MIGRATIONS[..MIGRATIONS.len() - 1] {
+        // The database as it was before names, the eighth step.
+        let before_names = 7;
+        for step in &MIGRATIONS[..before_names] {
             step(&conn).unwrap();
         }
-        conn.execute_batch(&format!("PRAGMA user_version = {}", MIGRATIONS.len() - 1))
+        conn.execute_batch(&format!("PRAGMA user_version = {before_names}"))
             .unwrap();
         let name = project.path().to_string_lossy();
         conn.execute(
@@ -4710,6 +4764,76 @@ mod tests {
         store.used(project, 1).unwrap();
         assert_eq!(found(&mut store, "ledger redis"), [2, 1]);
         assert!(shown("ledger redis").contains("1 (note) the ledger needs redis"));
+    }
+
+    #[test]
+    fn a_database_from_before_counts_its_entries_time_from_the_upgrade() {
+        let (_dir, socket) = socket();
+        fs::create_dir_all(dir(&socket)).unwrap();
+        let conn = Connection::open(dir(&socket).join("memory.db")).unwrap();
+        // The database as it was before its time was counted, the ninth step.
+        let before = 8;
+        for step in &MIGRATIONS[..before] {
+            step(&conn).unwrap();
+        }
+        conn.execute_batch(&format!("PRAGMA user_version = {before}"))
+            .unwrap();
+        conn.execute(
+            "INSERT INTO projects (path, next_id) VALUES (?1, 2)",
+            params![APP],
+        )
+        .unwrap();
+        let long_ago = seconds_since_epoch(SystemTime::now()) - 100 * DAY;
+        conn.execute(
+            "INSERT INTO entries (project, id, kind, text, key, source, created, last_seen) \
+             VALUES (?1, 1, 'note', 'the ledger needs redis', 'the ledger needs redis', \
+             '\"user\"', ?2, ?2)",
+            params![APP, long_ago],
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut store = Store::open(&socket).unwrap();
+        let project = Path::new(APP);
+        let entry = store.get(project, 1).unwrap().unwrap();
+        let now = seconds_since_epoch(SystemTime::now());
+        assert!(entry.counted_from.is_some_and(|from| from + 60 >= now));
+        assert!(!entry.expired(now), "it has its month from the upgrade");
+        assert!(entry.expired(now + 30 * DAY), "and no more");
+        let found = store.search(project, "ledger redis", None, 10, None);
+        assert_eq!(ids(&found.unwrap()), [1]);
+    }
+
+    #[test]
+    fn an_entry_s_kind_changes_in_place_and_a_note_made_counts_from_then() {
+        let (_dir, _socket, mut store) =
+            remembering(&[(Kind::Note, "the ledger tests need redis")]);
+        let project = Path::new(APP);
+        assert_eq!(store.embed_missing(&MEANINGS).unwrap(), 1);
+        // Said long ago and never found again, it's expired as a note.
+        store
+            .conn
+            .execute(
+                "UPDATE entries SET created = created - ?1, last_seen = last_seen - ?1",
+                params![40 * DAY],
+            )
+            .unwrap();
+        let found =
+            |store: &mut Store| ids(&store.search(project, "redis", None, 10, None).unwrap());
+        assert!(found(&mut store).is_empty());
+
+        let made = store.set_kind(project, 1, Kind::Gotcha).unwrap();
+        assert_eq!(made.kind, Kind::Gotcha);
+        assert_eq!(made.text, "the ledger tests need redis");
+        // Its vector and its words stay: nothing is embedded again.
+        assert_eq!(store.embed_missing(&MEANINGS).unwrap(), 0);
+        assert_eq!(found(&mut store), [1], "a lesson never expires");
+        // Made a note again, its month starts now.
+        let note = store.set_kind(project, 1, Kind::Note).unwrap();
+        assert!(!note.expired(seconds_since_epoch(SystemTime::now())));
+        assert_eq!(found(&mut store), [1]);
+        let missing = store.set_kind(project, 9, Kind::Gotcha).unwrap_err();
+        assert_eq!(missing.to_string(), "there's no entry 9");
     }
 
     #[test]

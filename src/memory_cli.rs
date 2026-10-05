@@ -4,6 +4,7 @@
 
 use crate::client;
 use crate::config::Config;
+use crate::distill;
 use crate::embed::{self, Models};
 use crate::env;
 use crate::events::{self, Event};
@@ -261,6 +262,95 @@ pub fn remove(socket: &Path, dir: Option<PathBuf>, forgetting: Forgetting) -> Re
         outln!("forgot {}: {}", entry.id, entry.text)?;
         let forgotten = Event::memory(events::Kind::MemoryForgotten, project.clone(), entry);
         tell(socket, forgotten);
+    }
+    Ok(())
+}
+
+/// What `crystal memory kind` changes.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Kinding {
+    /// The kind to give `ids`.
+    pub kind: Option<Kind>,
+    pub ids: Vec<u64>,
+    /// Have the distiller's model read the notes for the lessons among
+    /// them instead.
+    pub notes: bool,
+    /// With `notes`, give each the kind it says: without it, they're only
+    /// listed, as what would change.
+    pub yes: bool,
+}
+
+/// Changes the kind of the entries `kinding` says, and says which: each of
+/// its ids, once every one is there, given its kind; or with `notes`, the
+/// notes the distiller's model reads as lessons, listed with the kind it
+/// gives each, and given it only once it says yes. What an entry says, its
+/// vector and its place in the index stay as they are.
+pub fn kind(socket: &Path, dir: Option<PathBuf>, kinding: Kinding) -> Result<()> {
+    check_on()?;
+    let dir = dir_or_current(dir)?;
+    let project = memory::project_of(&dir);
+    let mut store = Store::open(socket)?;
+    let changes: Vec<(u64, Kind)> = if kinding.notes {
+        // Those that read as status are no lessons: `list --status` has them.
+        let (status, notes): (Vec<Entry>, Vec<Entry>) = store
+            .entries(&project)?
+            .into_iter()
+            .filter(|entry| entry.kind == Kind::Note)
+            .partition(|entry| memory::reads_as_status(&entry.text));
+        if notes.is_empty() {
+            outln!("there are no notes but those that read as status")?;
+            return Ok(());
+        }
+        let settings = Config::load()?.memory;
+        let count = notes.len();
+        let model = &settings.distill_model;
+        errln!(
+            "asking {model} which of the {count} notes are lessons ({} that read as status left \
+             out: `list --status` lists them)…",
+            status.len()
+        );
+        let env = std::env::vars().collect();
+        let read = distill::lessons_among(&notes, &settings, &top_of(&dir), &env)?;
+        for why in &read.rejected {
+            errln!("  rejected {why}");
+        }
+        errln!("(${:.4})", read.cost_usd);
+        if !kinding.yes {
+            for &(id, kind) in &read.lessons {
+                let note = notes.iter().find(|note| note.id == id);
+                let title = note
+                    .map(|note| memory::title(&note.text))
+                    .unwrap_or_default();
+                let line = format!("{id:>4}  note → {:<8}  {title}", kind.to_string());
+                outln!("{}", printable::line(&line))?;
+            }
+            match read.lessons.len() {
+                0 => outln!("none of the notes reads as a lesson")?,
+                1 => outln!("would make this note a lesson: add --yes to make it one")?,
+                n => outln!("would make these {n} notes lessons: add --yes to make them")?,
+            }
+            return Ok(());
+        }
+        read.lessons
+    } else {
+        let kind = kinding.kind.expect("clap asks for a kind with ids");
+        let mut missing = Vec::new();
+        for &id in &kinding.ids {
+            if store.get(&project, id)?.is_none() {
+                missing.push(id.to_string());
+            }
+        }
+        if !missing.is_empty() {
+            bail!("there's no entry {}", missing.join(", "));
+        }
+        kinding.ids.iter().map(|&id| (id, kind)).collect()
+    };
+    for (id, kind) in changes {
+        let entry = store.set_kind(&project, id, kind)?;
+        let line = format!("{id} is a {kind} now: {}", memory::title(&entry.text));
+        outln!("{}", printable::line(&line))?;
+        let changed = Event::memory(events::Kind::MemoryChanged, project.clone(), entry);
+        tell(socket, changed);
     }
     Ok(())
 }

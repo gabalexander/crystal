@@ -2170,6 +2170,27 @@ impl Tui {
                     }
                 });
             }
+            Action::SetMemoryKind { dir, id, kind } => {
+                let socket = self.socket.clone();
+                self.read_in_background(move || {
+                    let project = memory::project_of(&dir);
+                    let set = memory::Store::open(&socket)
+                        .and_then(|mut store| store.set_kind(&project, id, kind));
+                    match set {
+                        Ok(entry) => {
+                            let changed =
+                                events::Event::memory(events::Kind::MemoryChanged, project, entry);
+                            // The entry has changed either way.
+                            let _ = client::tell(&socket, changed);
+                            Event::MemoryRead {
+                                read: read_memory(&socket, &dir),
+                                dir,
+                            }
+                        }
+                        Err(err) => Event::Notice(format!("{err:#}")),
+                    }
+                });
+            }
             Action::PromoteMemory { dir, id } => {
                 let socket = self.socket.clone();
                 self.read_in_background(move || match promote_memory(&socket, &dir, id) {

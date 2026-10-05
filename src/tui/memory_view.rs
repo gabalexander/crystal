@@ -3,7 +3,7 @@
 //! full beside the list. `/` filters the list as you type; Enter opens the
 //! entry's file in the user's editor; `x` forgets the entry and `p` writes
 //! it into the project's CLAUDE.md or AGENTS.md, each once the user says
-//! `y`.
+//! `y`; and `c` changes its kind to the one the next key picks.
 //!
 //! The state here is plain data: the entries arrive through
 //! [`MemoryView::read_done`], and what the user asks for goes out as an
@@ -13,7 +13,7 @@ use super::app::{Action, Hit, Loading, Outcome};
 use super::sidebar::{ago, fit};
 use super::text_input::TextInput;
 use super::ui::{self, Look, ViewAreas};
-use crate::memory::{self, Freshness, Listed};
+use crate::memory::{self, Freshness, Kind, Listed};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -54,7 +54,17 @@ pub struct MemoryView {
 enum Ask {
     Forget(u64),
     Promote(u64),
+    /// Which kind to give it, by the key of its first letter.
+    Kind(u64),
 }
+
+/// The kinds `c` offers, each by the key that picks it.
+const KINDS: [(char, Kind); 4] = [
+    ('d', Kind::Decision),
+    ('g', Kind::Gotcha),
+    ('c', Kind::Command),
+    ('n', Kind::Note),
+];
 
 impl MemoryView {
     /// The view for the memory of `dir`, waiting for its entries.
@@ -131,6 +141,7 @@ impl MemoryView {
         match self.asking? {
             Ask::Forget(id) => Some(format!("forget entry {id}?")),
             Ask::Promote(id) => Some(format!("add entry {id} to the project's CLAUDE.md?")),
+            Ask::Kind(id) => Some(format!("entry {id}'s kind:")),
         }
     }
 
@@ -142,7 +153,21 @@ impl MemoryView {
 
     pub fn on_key(&mut self, key: KeyEvent) -> Outcome {
         // Only `y` says yes; any other key says no, and does nothing else.
+        // Asked for a kind, its key picks it.
         if let Some(ask) = self.asking.take() {
+            if let Ask::Kind(id) = ask {
+                let picked = KINDS
+                    .iter()
+                    .find(|(key_of, _)| key.code == KeyCode::Char(*key_of));
+                return match picked {
+                    Some(&(_, kind)) => Outcome::Do(Action::SetMemoryKind {
+                        dir: self.dir.clone(),
+                        id,
+                        kind,
+                    }),
+                    None => Outcome::Stay,
+                };
+            }
             if key.code == KeyCode::Char('y') {
                 return Outcome::Do(self.action_for(ask));
             }
@@ -161,6 +186,7 @@ impl MemoryView {
             KeyCode::PageUp => self.move_by(-page),
             KeyCode::Char('x') => self.asking = self.selected.map(Ask::Forget),
             KeyCode::Char('p') => self.asking = self.selected.map(Ask::Promote),
+            KeyCode::Char('c') => self.asking = self.selected.map(Ask::Kind),
             KeyCode::Enter => {
                 if let Some((_, path)) = self.file_to_open() {
                     return Outcome::Edit { path, line: None };
@@ -239,6 +265,7 @@ impl MemoryView {
         match ask {
             Ask::Forget(id) => Action::ForgetMemory { dir, id },
             Ask::Promote(id) => Action::PromoteMemory { dir, id },
+            Ask::Kind(_) => unreachable!("a kind is picked by its key, not y"),
         }
     }
 
@@ -285,7 +312,16 @@ pub fn list_width(width: u16) -> u16 {
 /// The keys the footer shows, or the question being asked.
 pub fn hints(view: &MemoryView) -> Vec<(String, String)> {
     if let Some(question) = view.question() {
-        return vec![(question, String::new()), ("y".into(), "yes".into())];
+        let mut hints = vec![(question, String::new())];
+        if matches!(view.asking, Some(Ask::Kind(_))) {
+            let kinds = KINDS
+                .iter()
+                .map(|(key, kind)| (key.to_string(), kind.to_string()));
+            hints.extend(kinds);
+        } else {
+            hints.push(("y".into(), "yes".into()));
+        }
+        return hints;
     }
     if view.filtering {
         return vec![
@@ -297,7 +333,12 @@ pub fn hints(view: &MemoryView) -> Vec<(String, String)> {
     if view.file_to_open().is_some() {
         hints.push(("enter", "edit its file"));
     }
-    hints.extend([("x", "forget"), ("p", "add to CLAUDE.md"), ("esc", "close")]);
+    hints.extend([
+        ("x", "forget"),
+        ("c", "kind"),
+        ("p", "add to CLAUDE.md"),
+        ("esc", "close"),
+    ]);
     hints
         .into_iter()
         .map(|(key, does)| (key.to_string(), does.to_string()))
@@ -521,6 +562,7 @@ mod tests {
                 checkout: None,
                 names: Vec::new(),
                 used: None,
+                counted_from: None,
             },
             freshness: Freshness::Fresh,
             gone: Vec::new(),
@@ -590,6 +632,32 @@ mod tests {
 
         press(&mut view, KeyCode::Char('x'));
         assert_eq!(press(&mut view, KeyCode::Char('n')), Outcome::Stay);
+        assert_eq!(view.question(), None);
+    }
+
+    #[test]
+    fn c_gives_the_entry_the_kind_the_next_key_picks() {
+        let mut view = view_of(vec![item(5, Kind::Note, "the ledger needs redis")]);
+        press(&mut view, KeyCode::Char('c'));
+        assert_eq!(view.question().as_deref(), Some("entry 5's kind:"));
+        let keys: Vec<String> = hints(&view)
+            .into_iter()
+            .skip(1)
+            .map(|(key, _)| key)
+            .collect();
+        assert_eq!(keys, ["d", "g", "c", "n"]);
+        assert!(view.typing(), "the next key is the kind's, not a move");
+        assert_eq!(
+            press(&mut view, KeyCode::Char('g')),
+            Outcome::Do(Action::SetMemoryKind {
+                dir: PathBuf::from("/code/app"),
+                id: 5,
+                kind: Kind::Gotcha,
+            })
+        );
+        // Any other key leaves it as it was.
+        press(&mut view, KeyCode::Char('c'));
+        assert_eq!(press(&mut view, KeyCode::Char('y')), Outcome::Stay);
         assert_eq!(view.question(), None);
     }
 

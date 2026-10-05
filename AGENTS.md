@@ -376,7 +376,7 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   - `memory_view.rs`: the memory view (`m`): a project's entries by their titles, the drifting, stale and
     expired marked, the entry the bar is on with what's gone, the filter, the entry's file opened in the
     editor (Enter), in the worktree it was said in while that's there, forgetting and promoting after a `y`,
-    and its drawing
+    its kind changed with `c` and the key of the kind, and its drawing
   - `plugins_view.rs`: the plugins view (`X`): every plugin, on or off, with installed ones' actions, panes and
     link handlers, and those the selected session's project ships under its name, which the view turns off
     but leaves the command line to turn on; its keys and drawing; the event loop does the switching, runs
@@ -680,7 +680,8 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   files or directories, the stale after the rest or left out), lessons
   (decisions, gotchas, commands) ranked above the notes and outcomes near them unless what's asked is about
   what was done, notes and outcomes nobody found again (said again, or read in full by an agent: `used`)
-  expired and left out of searches and launch, the words that say an entry reads as status rather than a
+  expired and left out of searches and launch, their days counted from the upgrade for those from before it
+  or from being made a note (`counted_from`), an entry's kind changed in place (`set_kind`), the words that say an entry reads as status rather than a
   lesson (`reads_as_status`, for `list --status`), tasks' outcomes from an earlier crystal shortened to their
   goal's first sentence and what `crystal done` said, an entry's title, its first line, or one of its own, the
   paragraph every agent is shown at launch (entries about what its worktree changed first, in docket's 800
@@ -690,8 +691,9 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   closed, one tool-less `claude -p` (Haiku by default, `[memory]`
   in the config) over the end of its transcript, told what the memory has already, to keep lessons alone and
   never progress, status or what's only true today, with entries of each, and asked about the entries gone
-  stale that are about the files the work touched, to keep, reword or forget; its answer checked against the
-  checkout before it's kept
+  stale that are about the files the work touched, to keep, reword or forget, and which of the notes it's shown
+  are lessons, to make them so; its answer checked against the checkout before it's kept; and a pass over a
+  project's notes alone for the lessons among them (`lessons_among`), for `crystal memory kind --notes`
 - `src/mcp.rs`: `crystal mcp`: an MCP server over stdio with `memory_search` and `memory_show`, which every
   Claude Code session crystal starts, in a terminal or a task in the background, is given with `--mcp-config`
   and its tools allowed
@@ -715,7 +717,8 @@ whenever what's handed over changes in a way the crystal before couldn't read.
 - `src/memory_cli.rs`: `crystal remember` and `crystal memory`, `add`, `list` (by kind, what was forgotten,
   what reads as status or what expired), `search` (by kind, files, the stale left out or not, the expired too,
   and how many), `show` (an agent's in a session finding it again), `rm` (several ids, or what reads as
-  status, listed until `--yes`), `export` and `distill` included, and an entry in full as `show` and the
+  status, listed until `--yes`), `kind` (entries' kinds by their ids, or the notes the distiller's model reads
+  as lessons, listed until `--yes`), `export` and `distill` included, and an entry in full as `show` and the
   `memory_show` tool print it, with what's gone
 - `src/profile.rs`: agent profiles: what one runs, its prompt and postfix around the task or alone with no
   task (`skip_task`), how it's meant to start (`launch`: a session, a task or a background task), checking it,
