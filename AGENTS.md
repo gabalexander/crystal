@@ -212,10 +212,10 @@ whenever what's handed over changes in a way the crystal before couldn't read.
     its tabs and panes, as events, sent back
   - `ui.rs`: the layout and drawing (the tab bar, on top or over the footer or left out, its tabs and what
     it shows at its right, the counts of what's open on the selected session's forge first, which a click
-    lists, pane headers, footer and its readout of the memory and CPU crystal takes, the column each pane's
-    scrollbar takes, the key pressed last while `show_keys` is on), one column on a terminal as narrow as a
-    phone's (`[sidebar] phone_width`), the sidebar over the pane while it has the keyboard, and what's under
-    the mouse
+    lists, pane headers, footer and its readout of the memory and CPU crystal takes, in the room its keys
+    leave, the column each pane's scrollbar takes, the key pressed last while `show_keys` is on), one column
+    on a terminal as narrow as a phone's (`[sidebar] phone_width`), the sidebar over the pane while it has
+    the keyboard, and what's under the mouse
   - `scrollbar.rs`: a pane's scrollbar: where its thumb is for how far back the pane is, how far back a
     dragged thumb takes it, and drawing it; pure, so it's unit-tested
   - `warm.rs`: asking the daemon to keep an agent warm where the selection is: once what it would be has held

@@ -183,17 +183,16 @@ pub fn hints(view: &RamView) -> &'static [(&'static str, &'static str)] {
     }
 }
 
-/// What the footer shows of it at its right once the daemon has said: all
-/// crystal takes, its memory short and its CPU, like `2.1G 35%`.
-pub fn readout(resources: &Resources) -> String {
+/// What the footer can show of it at its right once the daemon has said,
+/// the most first: all crystal takes, its memory short and its CPU, like
+/// `2.1G 35%`, then its memory alone, for a footer whose keys need the
+/// room.
+pub fn readouts(resources: &Resources) -> Vec<String> {
     let all = resources.all();
+    let memory = resources::short_size(all.bytes);
     match resources.cpu_over_ms {
-        0 => resources::short_size(all.bytes),
-        _ => format!(
-            "{} {}",
-            resources::short_size(all.bytes),
-            resources::cpu(all.cpu)
-        ),
+        0 => vec![memory],
+        _ => vec![format!("{memory} {}", resources::cpu(all.cpu)), memory],
     }
 }
 
@@ -620,11 +619,11 @@ mod tests {
     }
 
     #[test]
-    fn the_footer_reads_memory_short_and_cpu() {
+    fn the_footer_reads_memory_short_and_cpu_or_memory_alone() {
         let mut resources = taken(&[("a", 2000, 33.0)]);
-        assert_eq!(readout(&resources), "2.0G 34%");
+        assert_eq!(readouts(&resources), ["2.0G 34%", "2.0G"]);
         resources.cpu_over_ms = 0;
-        assert_eq!(readout(&resources), "2.0G");
+        assert_eq!(readouts(&resources), ["2.0G"]);
     }
 
     #[test]

@@ -1293,8 +1293,9 @@ daemon, where memory's models run; each program it runs that isn't a session's, 
 like the distiller's `claude -p`, git or a plugin's hook; and the TUI, with what it runs. Then comes the agent
 [kept warm](#archiving-and-idle-agents) while there's one. The heading says all of it, with its share of the
 machine's memory, and its CPU, with its share of the machine's cores. `Enter` goes to the session the bar is on.
-The footer shows all of it beside `? keys` while the sidebar has the keyboard, like `2.1G 35%`: a click on that
-opens the view. `crystal usage` prints the same table for a script, and `--json` the daemon's look with its
+The footer shows all of it beside `? keys` while the sidebar has the keyboard, like `2.1G 35%`, in the room its
+keys leave, never in a key's place: its CPU goes first where there's less, then all of it. A click on that opens
+the view. `crystal usage` prints the same table for a script, and `--json` the daemon's look with its
 totals.
 
 A process's memory is what it has in RAM now. On a Mac that's its physical footprint, what Activity Monitor's

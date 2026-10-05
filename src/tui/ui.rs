@@ -1447,9 +1447,18 @@ fn draw_footer(frame: &mut Frame, app: &App, panes: &[Pane], look: &Look, area: 
         frame.render_widget(away_line(away, theme), area);
     } else {
         // Beside `? keys`, in the sidebar, where it leaves a pane's keys the
-        // room.
+        // room; and only in the room the keys leave, never in a key's place,
+        // its CPU going first, then its memory.
         let sidebar = app.focus() == Focus::Sidebar && !app.resizing();
-        let readout = app.resources().filter(|_| sidebar).map(ram_view::readout);
+        let bare = footer_right(app, None, theme).width();
+        let room = usize::from(area.width).saturating_sub(bare + 1);
+        let keys = hints_line(app, copying, theme, area.width, room).width();
+        let fits = |readout: &String| {
+            let right = footer_right(app, Some(readout), theme).width();
+            keys + 2 + right <= usize::from(area.width)
+        };
+        let readouts = app.resources().filter(|_| sidebar).map(ram_view::readouts);
+        let readout = readouts.into_iter().flatten().find(fits);
         let right = footer_right(app, readout.as_deref(), theme);
         let room = usize::from(area.width).saturating_sub(right.width() + 1);
         frame.render_widget(hints_line(app, copying, theme, area.width, room), area);
@@ -3113,6 +3122,53 @@ mod tests {
         app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
         let text = screen_text(&app);
         assert!(text[11].contains("kill doomed? y/n"));
+    }
+
+    #[test]
+    fn the_footer_s_readout_takes_only_the_room_its_keys_leave() {
+        let with_readout = |readout: bool| {
+            let mut app = App::new(None);
+            app.set_sessions(vec![session("printer", State::Running)]);
+            if readout {
+                app.set_resources(crate::resources::Resources {
+                    daemon: crate::resources::Usage {
+                        pid: 1,
+                        bytes: 1288 << 20,
+                        cpu: 104.0,
+                        processes: 1,
+                    },
+                    cpu_over_ms: 1000,
+                    ..Default::default()
+                });
+            }
+            app
+        };
+        let (shown, bare) = (with_readout(true), with_readout(false));
+        let mut seen = std::collections::HashSet::new();
+        // As wide as every key fits.
+        for width in 60..=220 {
+            let footer = &screen_text_at(&shown, width, 12)[11];
+            let keys = &screen_text_at(&bare, width, 12)[11];
+            // The keys are those the footer shows with no readout, and the
+            // readout says as much as the room after them holds, two spaces
+            // apart.
+            let hints = keys.trim_end().trim_end_matches("? keys").trim_end();
+            assert!(footer.starts_with(hints), "{width}: {footer}");
+            let room = usize::from(width) - hints.chars().count() - "? keys ".len();
+            let readout = ["1.3G 104%", "1.3G"]
+                .into_iter()
+                .find(|readout| 2 + readout.len() + 2 <= room)
+                .unwrap_or("none");
+            match readout {
+                "none" => assert_eq!(footer, keys, "{width}"),
+                readout => {
+                    let right = format!(" {readout}  ? keys ");
+                    assert!(footer.ends_with(&right), "{width}: {footer}");
+                }
+            }
+            seen.insert(readout);
+        }
+        assert_eq!(seen.len(), 3, "each of them at some width: {seen:?}");
     }
 
     #[test]
