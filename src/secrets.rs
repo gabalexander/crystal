@@ -119,11 +119,12 @@ fn names_a_secret(lower: &str) -> bool {
 }
 
 /// A word shaped like a credential whatever is around it: a known
-/// provider's key format, a JWT, or a long run of letters and digits in
-/// both cases (not a path, not a hex hash).
+/// provider's key format, a JWT, or one with a long run of letters and
+/// digits in both cases between its dots (not a path, not a hex hash, not
+/// a domain, a version or `self.foo_bar`, whose parts are short or in one
+/// case).
 fn looks_like_a_key(word: &str) -> bool {
     let len = word.len();
-    let has = |f: fn(char) -> bool| word.chars().any(f);
     let starts = |prefixes: &[&str]| prefixes.iter().any(|prefix| word.starts_with(prefix));
     let rest_upper_alnum = |from: usize| {
         word[from..]
@@ -144,16 +145,28 @@ fn looks_like_a_key(word: &str) -> bool {
         || (starts(&["xoxb-", "xoxp-", "xoxa-", "xoxr-", "xoxs-"]) && len >= 15)
         || (starts(&["AKIA", "ASIA"]) && len == 20 && rest_upper_alnum(4))
         || (word.starts_with("AIza") && len >= 35)
+        || (word.starts_with("AQ.") && len >= 40 && is_base64url(&word[3..]))
         || (word.starts_with("ya29.") && len >= 20)
         || (word.starts_with("npm_") && len >= 36)
         || (word.starts_with("hf_") && len >= 30)
         || (word.starts_with("eyJ") && len >= 30 && word.matches('.').count() == 2)
-        || (len >= 32
-            && !word.contains('/')
-            && !word.contains('.')
-            && has(|c| c.is_ascii_uppercase())
-            && has(|c| c.is_ascii_lowercase())
-            && has(|c| c.is_ascii_digit()))
+        || (!word.contains('/') && word.split('.').any(looks_generated))
+}
+
+/// A run of letters and digits in both cases too long to be a word or a
+/// name someone typed.
+fn looks_generated(part: &str) -> bool {
+    let has = |f: fn(char) -> bool| part.chars().any(f);
+    part.len() >= 32
+        && has(|c| c.is_ascii_uppercase())
+        && has(|c| c.is_ascii_lowercase())
+        && has(|c| c.is_ascii_digit())
+}
+
+/// Letters, digits, `_` and `-` alone, as base64url writes bytes.
+fn is_base64url(text: &str) -> bool {
+    text.chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
 }
 
 /// A value after `name:` that's a credential rather than prose: long, or
@@ -256,6 +269,14 @@ mod tests {
                 "jwt [redacted]",
             ),
             (
+                "gemini AQ.FakeTestKey0123456789-abcdefghijklmnop_QRSTUVWXYZab works.",
+                "gemini [redacted] works.",
+            ),
+            (
+                "sendgrid SG.FakeSendGrid0123456789.FakeSecretPart0123456789abcdefghijKLMNOPQ",
+                "sendgrid [redacted]",
+            ),
+            (
                 "a\n-----BEGIN RSA PRIVATE KEY-----\nMIIE\nabcd\n-----END RSA PRIVATE KEY-----\nb",
                 "a\n[redacted]\nb",
             ),
@@ -273,6 +294,9 @@ mod tests {
             "src/memory.rs and d0ba4e321a7e481237e0360dbd3a3f9518131c94",
             "see https://github.com/o/r/pull/12",
             "-----BEGIN CERTIFICATE----- is public",
+            "self.foo_bar = generativelanguage.googleapis.com v0.2.0-rc.1",
+            "AQ.short, Qwen3-Embedding-0.6B and SettingsViewController.handleKeyWithModifiers",
+            "jina-embeddings-v5-text-small.safetensors in ~/.cache/crystal.models",
         ] {
             assert_eq!(redact(prose), prose);
         }
