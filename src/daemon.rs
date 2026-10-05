@@ -2122,6 +2122,38 @@ impl Daemon {
         self.tell_renamed(session, &old_name);
     }
 
+    /// What the session `id`, or else called `name`, is told of its
+    /// project's memory as its agent reads or edits `file`, the first time
+    /// it does: the entries about it it hasn't been shown, as
+    /// [`Response::Context`]. Nothing for a file it was told of already, or
+    /// that's outside its project, or with memory or `recall_on_read` off.
+    /// The sessions aren't held while the memory is looked through.
+    fn recall(&self, name: &str, id: Option<&str>, file: &Path) -> Result<Response> {
+        let config = settings();
+        if !memory::enabled(&config) || !config.memory.recall_on_read {
+            return Ok(Response::Done);
+        }
+        let (id, lookup) = {
+            let mut sessions = self.sessions.lock().unwrap();
+            let session = id_or_name(&mut sessions, id.map(String::from), Some(name.to_string()))?;
+            let Some(lookup) = session.recall_lookup(file) else {
+                return Ok(Response::Done);
+            };
+            (session.id.clone(), lookup)
+        };
+        let (lookup, asked) = lookup;
+        let mut store = memory::Store::open(&self.socket)?;
+        let found = store.about_file(&lookup.project, &lookup.top, &lookup.file, &asked)?;
+        let mut sessions = self.sessions.lock().unwrap();
+        let Some(session) = sessions.iter_mut().find(|session| session.id == id) else {
+            return Ok(Response::Done);
+        };
+        Ok(match session.recalled().tell(&lookup.file, &found) {
+            Some(text) => Response::Context { text },
+            None => Response::Done,
+        })
+    }
+
     /// Tells that `session` was called `from` until now, and keeps a flow's
     /// step to it under its new name.
     fn tell_renamed(&self, session: &Session, from: &str) {
@@ -2212,6 +2244,9 @@ impl Daemon {
                 }
                 let moving = self.is_moving(&id);
                 let session = with_id(&mut sessions, &id)?;
+                if let Some(prompt) = &prompt {
+                    session.recalled().asked(prompt);
+                }
                 if let Some(conversation) = conversation {
                     session.set_hooked_conversation(&agent, conversation);
                 }
@@ -2278,6 +2313,7 @@ impl Daemon {
                     None => Ok(Response::Done),
                 }
             }
+            Request::Recall { name, id, file } => self.recall(&name, id.as_deref(), &file),
             Request::ReportAgent {
                 id,
                 name,
@@ -3348,9 +3384,12 @@ impl Daemon {
 
         // The ended session makes way for the new one, and comes back if
         // that doesn't start.
-        let ended = sessions.remove(index);
+        let mut ended = sessions.remove(index);
         let launch = ended.launch();
         let name_given = launch.name_given;
+        // An agent picked up in its conversation has what it was shown of
+        // its project's memory there still.
+        let goes_on = launch.conversation.is_some() || launch.resume.is_some();
         // Run again, its task is open again: the work goes on.
         let backlog = launch.goal.as_ref().and_then(|goal| goal.backlog);
         let brief = brief_of(&launch);
@@ -3411,6 +3450,11 @@ impl Daemon {
         let mut started = sessions.pop().expect("start added a session");
         if name_given {
             started.keep_given_name();
+        }
+        if goes_on {
+            started
+                .recalled()
+                .carry_on(std::mem::take(ended.recalled()));
         }
         // It's the same task, open again, under the same number.
         if let (Some(goal), true) = (launch.goal, started.task_record().is_some()) {
@@ -3883,8 +3927,8 @@ fn start_as(
     let task = task.filter(|_| tasks::enabled(&config));
     // Picked up again with its own command, its conversation has heard
     // crystal's notes already.
-    let instructions = if resumed {
-        Vec::new()
+    let (instructions, remembered) = if resumed {
+        (Vec::new(), Vec::new())
     } else {
         launch_notes(socket, &cwd, &command, task.as_deref(), &brief, &config)
     };
@@ -3915,6 +3959,7 @@ fn start_as(
     if agent_names {
         session.let_agent_name();
     }
+    session.recalled().launched(&remembered);
     session.set_about(&brief);
     if let Some(goal) = task {
         session.give_task(new_task_info(goal, false, backlog, brief));
@@ -3969,7 +4014,8 @@ fn names_itself(name: Option<&str>, command: &[String], config: &Config) -> bool
 /// tasks on, and of the pull request and the issue `brief` names, whether
 /// it's a task or not; how to work on several things at once here and show
 /// the user files, for Claude Code; the notes its worktree's sessions left; and what its
-/// project remembers that has to do with the words of `command`.
+/// project remembers that has to do with the words of `command`. And the
+/// entries of its project's memory that shows it, by id.
 fn launch_notes(
     socket: &Path,
     cwd: &Path,
@@ -3977,14 +4023,17 @@ fn launch_notes(
     task: Option<&str>,
     brief: &TaskBrief,
     config: &Config,
-) -> Vec<String> {
+) -> (Vec<String>, Vec<u64>) {
     let about_task = paragraphs([
         task.map(|_| tasks::instructions(backlog::enabled(config))),
         tasks::forge_notes(brief, cwd, task.is_some()),
     ]);
     let parallel = (agents::program_name(command) == Some("claude"))
         .then(|| format!("{} {}", agents::PARALLEL_WORK, agents::SHOWING_FILES));
-    let remembered = remembered(socket, cwd, command);
+    let memory::Launch {
+        text: remembered,
+        shown,
+    } = remembered(socket, cwd, command);
     let said = [
         task,
         about_task.as_deref(),
@@ -3992,7 +4041,7 @@ fn launch_notes(
         remembered.as_deref(),
     ];
     let handoff = handoff_note(cwd, &said);
-    notes(about_task, parallel, handoff, remembered)
+    (notes(about_task, parallel, handoff, remembered), shown)
 }
 
 /// Whether the session called `name` can be resumed with `argv`, the
@@ -4065,15 +4114,15 @@ fn handoff_note(cwd: &Path, said: &[Option<&str>]) -> Option<String> {
 /// with the words of its command as what it was asked, unless the config
 /// turns memory off: Claude Code, Codex, or another agent crystal knows
 /// that's given a first prompt to say it in.
-fn remembered(socket: &Path, cwd: &Path, command: &[String]) -> Option<String> {
-    let reader = match agents::program_name(command)? {
-        "claude" => memory::Reader::Claude,
-        "codex" => memory::Reader::Agent,
-        _ if catalog::first_prompt_at(command).is_some() => memory::Reader::Agent,
-        _ => return None,
+fn remembered(socket: &Path, cwd: &Path, command: &[String]) -> memory::Launch {
+    let reader = match agents::program_name(command) {
+        Some("claude") => memory::Reader::Claude,
+        Some("codex") => memory::Reader::Agent,
+        Some(_) if catalog::first_prompt_at(command).is_some() => memory::Reader::Agent,
+        _ => return memory::Launch::default(),
     };
     if !memory::enabled_now() {
-        return None;
+        return memory::Launch::default();
     }
     let asked = command[1..].join(" ");
     launch_memory(socket, cwd, &asked, reader)
@@ -4082,14 +4131,12 @@ fn remembered(socket: &Path, cwd: &Path, command: &[String]) -> Option<String> {
 /// What the memory of the project `cwd` is in tells `reader` as it starts
 /// there, asked `asked`: what has to do with the files its worktree has
 /// changed comes first.
-fn launch_memory(socket: &Path, cwd: &Path, asked: &str, reader: memory::Reader) -> Option<String> {
+fn launch_memory(socket: &Path, cwd: &Path, asked: &str, reader: memory::Reader) -> memory::Launch {
     let project = memory::project_of(cwd);
     let changed = git::branch_changes(cwd).unwrap_or_default();
     let embedder = embed::shared_now();
     let embedder = embed::as_embed(&embedder);
-    memory::for_launch(socket, &project, asked, &changed, reader, embedder)
-        .ok()
-        .flatten()
+    memory::for_launch(socket, &project, asked, &changed, reader, embedder).unwrap_or_default()
 }
 
 /// What gives a Claude Code session in `cwd` the tools crystal tells it
@@ -4233,7 +4280,7 @@ fn task_args(
     let config = settings();
     let memory_on = memory::enabled(&config);
     let remembered = memory_on
-        .then(|| launch_memory(socket, cwd, &spec.prompt, memory::Reader::Task))
+        .then(|| launch_memory(socket, cwd, &spec.prompt, memory::Reader::Task).text)
         .flatten();
     // Its runs close it, so it's told nothing of closing it: only of the
     // pull request and the issue it's about.
