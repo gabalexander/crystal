@@ -98,6 +98,20 @@ pub const PARALLEL_WORK: &str = "To work on several things at once, start a crys
                                  into it and picks your conversation up there. The crystal \
                                  skill says more.";
 
+/// What Claude Code is told about showing the user a file: to put it in
+/// front of them with `crystal open` when they ask to see it, rather than
+/// paste it into its answer, and never unasked, since it takes their
+/// screen; text files only, as that's all a TUI draws. Said beside
+/// [`PARALLEL_WORK`], in its system prompt. Adapted from docket's.
+pub const SHOWING_FILES: &str = "When the user asks you to show them a file, or to open one in \
+                                 crystal, run `crystal open <file>...` once for the files: \
+                                 crystal shows them in its TUI, a markdown file as a page \
+                                 with its mermaid diagrams drawn, so say in a line what you \
+                                 opened rather than paste them into your answer. Never open \
+                                 a file unasked: name its path and let the user ask. It \
+                                 shows text files only; name an image's or a PDF's path \
+                                 instead, and if the command fails, name the paths.";
+
 /// The command line to run for `command`. For an agent crystal knows, it
 /// carries the flags that make the agent report to `crystal hook`, run
 /// from `crystal`, the path of this program, and with `resume`, the id of
@@ -604,6 +618,19 @@ fn without_choosing(args: &[String], chosen: &[String]) -> Vec<String> {
 /// it carries on, with `reason` as what it's told next.
 pub fn claude_keep_going(reason: &str) -> String {
     json!({ "decision": "block", "reason": reason }).to_string()
+}
+
+/// What a Claude Code hook prints for the prompt the user just sent to
+/// come with `context`, which Claude reads before it: the
+/// `UserPromptSubmit` hook's `additionalContext`.
+pub fn claude_context(context: &str) -> String {
+    json!({
+        "hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": context,
+        }
+    })
+    .to_string()
 }
 
 /// Settings for Claude Code that add a hook, `crystal hook claude`, to
@@ -1227,6 +1254,15 @@ mod tests {
         assert_eq!(
             output,
             json!({"decision": "block", "reason": "Close \"it\"."})
+        );
+    }
+
+    #[test]
+    fn a_prompt_hook_adds_to_what_claude_reads_with_the_prompt() {
+        let output: Value = serde_json::from_str(&claude_context("Name it.")).unwrap();
+        assert_eq!(
+            output["hookSpecificOutput"],
+            json!({"hookEventName": "UserPromptSubmit", "additionalContext": "Name it."})
         );
     }
 

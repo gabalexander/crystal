@@ -1,6 +1,6 @@
 ---
 name: crystal
-description: Run other coding agents in parallel with crystal, hand them work, wait for them, read their answers and answer their questions. Use when a task splits into parts other agents can do at the same time, when you want a second agent to review or test your change, or when work should happen in its own git worktree. Requires the `crystal` command.
+description: Run other coding agents in parallel with crystal, hand them work, wait for them, read their answers and answer their questions; and show the user a file in crystal. Use when a task splits into parts other agents can do at the same time, when you want a second agent to review or test your change, when work should happen in its own git worktree, or when the user asks to see a file in crystal. Requires the `crystal` command.
 ---
 
 # crystal
@@ -52,7 +52,10 @@ a background task too, once its run ends.
 crystal send reviewer "Now check the tests too" --wait
 ```
 
-`--wait` waits for the turn that text starts, then prints how it ended. Then read the answer:
+`--wait` waits for the turn that text starts, then prints how it ended. An agent neither seen starting on it
+nor changing its screen within five seconds has stalled: `send` fails with an error starting
+`agent_prompt_stalled:` and exits 3. It may have taken the text all the same, so `read` it before sending it
+again. Then read the answer:
 
 ```sh
 crystal read reviewer --lines 40
@@ -145,6 +148,8 @@ crystal done "Wrote the plan" --artifact docs/plan.md
 - `crystal tasks new "<goal>"` makes a task and starts an agent on it, printing its number; `--background`
   runs it as `crystal task` does, and `--no-launch` leaves it pending until `crystal tasks start <task>`.
   `--accept`, `--pr` and `--issue` work as for `crystal task`.
+- `crystal wait <task>` waits until a task closes, like one you started, and prints how it went: `done`,
+  `failed` or `cancelled`.
 - Given acceptance criteria, close your task done only once each holds.
 
 ## Leave notes for the next session
@@ -192,14 +197,19 @@ Every command works on the current directory's project; `-C <dir>` names another
 | `exited N`, `killed (…)` | the program ended | `read` its last screen; `crystal respawn <name>` runs it again |
 | `couldn't start` | it couldn't start again after crystal restarted: its directory or its command has gone | `crystal ls` says why; once that's put right, `crystal respawn <name>` starts it |
 
-To wait for one status in particular, or for a program to print something:
+To wait for one status in particular, for a program to print something, or for a task to close:
 
 ```sh
-crystal wait reviewer --until waiting --timeout 600   # or working, done, idle, ended; several with commas
+crystal wait reviewer --until waiting --timeout 600   # or working, done, idle, ended, closed; several with commas
 crystal wait server --output 'listening on' --timeout 60   # a regular expression; prints the line
+crystal wait t12 --timeout 3600                       # until task t12 closes: prints done, failed or cancelled
+crystal wait reviewer --until waiting,closed          # until it asks something, or its task closes
 ```
 
-- A wait that runs out of time exits 2; anything else that goes wrong exits 1. `--quiet` prints nothing.
+- A wait that runs out of time exits 2; `send --wait` whose agent never started on the text exits 3
+  (`agent_prompt_stalled:`); anything else that goes wrong exits 1. `--quiet` prints nothing.
+- `closed` is a task closing, done, failed or cancelled, which it prints; a session that ends or is killed
+  with its task open closes it, failed or cancelled.
 - `--until` fails when the program ends first, unless `ended` is one it waits for.
 - A turn that ends while the user watches it is `idle` at once, never `done`: wait for `done,idle`.
 - `--output` counts what's on the screen already, and the rows just above it.
@@ -244,6 +254,26 @@ crystal layout --json             # the TUI's tabs, the sessions in each, and ho
 - They change what the user sees. Split off what helps them follow your work, close it when it's done, and
   leave their tabs and focus alone unless they ask: `crystal pane focus <name>` hands a session their
   keyboard, and `crystal tab new <name>` brings a new tab to the front, where sessions started after go.
+
+## Show the user a file
+
+When the user asks to see a file, or a page you wrote for them, put it in front of them rather than in your
+answer:
+
+```sh
+crystal open docs/explain-hooks.md
+crystal open src/billing/refund.rs src/billing/ledger.rs
+```
+
+- It goes to the TUI the user used last, in a view of its own: the files listed, the one selected read beside
+  them, a markdown file as its page with its mermaid diagrams drawn, `Enter` opening it in their editor. Say
+  in a line what you opened; don't paste it into your answer as well.
+- Only when asked: it takes over their screen. A file you wrote or changed is no reason to open it; name its
+  path and let them ask.
+- Text files only: an image, a PDF or another binary is refused, so name its path instead. With no TUI open
+  it fails, saying so; name the paths then too.
+- An explanation reads best as a page: write it to a markdown file, a ```` ```mermaid ```` fence for each flow
+  or structure, and open that.
 
 ## Tell the user
 

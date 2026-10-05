@@ -96,7 +96,7 @@ fn started(response: Option<Response>) -> Result<Started> {
 }
 
 /// What a session is started to do, when it's started with something to
-/// do: that makes it a task.
+/// do: that makes it a task. And whether its agent may name it.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Purpose {
     /// The task, which is in the command already as the agent's first
@@ -106,6 +106,9 @@ pub struct Purpose {
     pub backlog: Option<u64>,
     /// What the task carries beside its goal.
     pub brief: TaskBrief,
+    /// Its agent may name it, in place of the name crystal gives it: whoever
+    /// starts it doesn't hold on to that name.
+    pub agent_names: bool,
 }
 
 /// [`new_session`], for a session started with `purpose`.
@@ -145,6 +148,7 @@ pub fn new_session_with(
         task: purpose.task,
         backlog: purpose.backlog,
         brief: purpose.brief,
+        agent_names: purpose.agent_names,
     });
     started(ask(socket, &request, true)?)
 }
@@ -204,6 +208,18 @@ pub fn start_flow(socket: &Path, flow: &str, goal: &str, cwd: PathBuf) -> Result
         Some(Response::FlowStarted { run }) => Ok(run),
         _ => bail!("the daemon didn't start the flow"),
     }
+}
+
+/// Names the session this runs in, in `title`'s words, as crystal asked
+/// its agent to.
+pub fn name_by_agent(socket: &Path, title: &str) -> Result<()> {
+    let id = env::own_session_id(socket).context("this isn't running in a crystal session")?;
+    let request = Request::NameByAgent {
+        id,
+        title: title.to_string(),
+    };
+    ask_running(socket, &request)?;
+    Ok(())
 }
 
 /// Gives the session called `name` another name.

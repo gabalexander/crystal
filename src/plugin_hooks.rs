@@ -25,7 +25,6 @@ use crate::handover::{self, HELPERS};
 use crate::notify::{self, Notice};
 use crate::plugin_manifest::{self, Manifest};
 use crate::plugins::{self, Context, Id};
-use crate::protocol::Activity;
 use crate::shell;
 use anyhow::{Context as _, Result, bail};
 use std::collections::HashMap;
@@ -339,13 +338,10 @@ fn pause(socket: &Path, bus: &Weak<Bus>, plugin: &Id) {
         };
         bus.emit(paused);
     }
+    // It's waiting on the user to look at it.
     let notice = Notice {
         session: label,
-        // It's waiting on the user to look at it.
-        activity: Activity::Waiting,
-        text,
-        jump: None,
-        agent: None,
+        ..Notice::of_crystal(text, None)
     };
     notify::tell(notice, socket);
 }

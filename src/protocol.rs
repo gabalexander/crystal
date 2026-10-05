@@ -101,17 +101,30 @@ pub enum Request {
     /// Tell the user `text` with a notification, the way the daemon tells
     /// them a session needs them: about the session with `id`, or else
     /// called `name`, which a click on it takes them to, when there is one.
+    /// It's under `title`, or crystal's name; with no text, the title is
+    /// what it says. `sound` plays with it.
     Notify {
         text: String,
         #[serde(default)]
         id: Option<String>,
         #[serde(default)]
         name: Option<String>,
+        #[serde(default)]
+        title: Option<String>,
+        #[serde(default)]
+        sound: NotifySound,
     },
     /// Give a session another name.
     Rename {
         name: String,
         new_name: String,
+    },
+    /// The agent in the session with `id` names it, in `title`'s words, as
+    /// crystal asked it to: only while crystal names it itself, and nobody
+    /// holds on to that name.
+    NameByAgent {
+        id: String,
+        title: String,
     },
     /// Stop a session and keep it in the archive, out of the list, to
     /// start again in its conversation when it's wanted.
@@ -451,6 +464,16 @@ pub enum Request {
         #[serde(default)]
         since_ms: Option<u64>,
     },
+    /// Clear a session's screen and history but for the line its cursor
+    /// is on, which goes to the top, its own and every viewer's, sending
+    /// its program nothing: not on the alternate screen. The session with
+    /// `id`, or else called `name`.
+    Clear {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(default)]
+        name: Option<String>,
+    },
     /// With no name, the newest session. A size of 0 by 0 leaves the
     /// session's as it is.
     Attach {
@@ -513,6 +536,12 @@ pub struct NewSession {
     /// request and issue it's about.
     #[serde(flatten)]
     pub brief: TaskBrief,
+    /// Whether the session's agent may name it, in place of the name
+    /// crystal gives it, when the settings say so: for a client that
+    /// doesn't hold on to that name, like the TUI, which follows a rename.
+    /// A script that was told the name may use it later.
+    #[serde(default)]
+    pub agent_names: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -566,6 +595,20 @@ pub enum TaskStart {
     Agent { command: Vec<String> },
     /// In the background, `claude -p` with these arguments.
     Background { args: Vec<String> },
+}
+
+/// The sound a notification of `crystal notify` plays: none, or one of
+/// crystal's two, which `[sound]` can make the user's own.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum NotifySound {
+    None,
+    /// The one for an agent that's done.
+    Done,
+    /// The one for an agent asking the user something.
+    #[default]
+    Request,
 }
 
 /// An answer to the permission a background task asks for.
@@ -668,6 +711,11 @@ pub enum Response {
     /// session to in crystal.
     Retitle {
         title: String,
+    },
+    /// What the hook reporting a prompt the user sent adds to it for
+    /// Claude Code to read: crystal asking it to name its session.
+    Context {
+        text: String,
     },
     /// A project's backlog.
     Backlog(Backlog),

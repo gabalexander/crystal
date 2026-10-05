@@ -77,6 +77,7 @@ pub enum Command {
     PageUp,
     PageDown,
     EditHistory,
+    ClearPane,
     NewTab,
     RenameTab,
     CloseTab,
@@ -414,6 +415,14 @@ pub const COMMANDS: &[Spec] = &[
         "edit-history",
         "open its history in your editor",
         &["e"],
+    ),
+    // Its history can't be had back, so it waits for the user to give it a
+    // key, as herdr's does.
+    spec(
+        Command::ClearPane,
+        "clear-pane",
+        "clear its screen and history but the line it's on",
+        &[],
     ),
     spec(Command::NewTab, "new-tab", "a new tab", &["t"]),
     spec(Command::RenameTab, "rename-tab", "name the tab", &["T"]),
@@ -1789,7 +1798,8 @@ impl Keymap {
         write: fn(&Chord) -> String,
     ) -> Option<String> {
         if self.is_default_for(commands) && self.modes_default_for(modes) {
-            return Some(label.to_string());
+            // A row of commands with no key until the user gives one.
+            return (!label.is_empty()).then(|| label.to_string());
         }
         let commands = commands.iter().map(|&command| self.keys(command));
         let modes = modes.iter().map(|&key| self.mode_keys(key));
@@ -2169,6 +2179,8 @@ pub const HELP: &[HelpRow] = &[
         "page through its history",
     ),
     row("e", &[C::EditHistory], "edit its history"),
+    // Shown once it's given a key.
+    row("", &[C::ClearPane], "clear all but its line"),
     row(
         "t/T/&",
         &[C::NewTab, C::RenameTab, C::CloseTab],
@@ -2505,6 +2517,14 @@ mod tests {
         assert_eq!(moved.row_label(split).as_deref(), Some("V/-"));
         let gone = keymap("split-right = \"none\"\nsplit-down = \"none\"").unwrap();
         assert_eq!(gone.row_label(split), None);
+        // A command with no key is shown once it's given one.
+        let clear = HELP
+            .iter()
+            .find(|row| row.commands == [Command::ClearPane])
+            .unwrap();
+        assert_eq!(defaults.row_label(clear), None);
+        let given = keymap("clear-pane = \"ctrl+l\"").unwrap();
+        assert_eq!(given.row_label(clear).as_deref(), Some("Ctrl+L"));
     }
 
     #[test]

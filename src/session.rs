@@ -14,6 +14,7 @@ use crate::git::Checkout;
 use crate::handover::{self, Got};
 use crate::keys;
 use crate::model;
+use crate::names;
 use crate::notify::{self, Notice};
 use crate::output_ring::OutputRing;
 use crate::printable;
@@ -25,10 +26,11 @@ use crate::protocol::{
 use crate::report;
 use crate::spending::Spending;
 use crate::state::SavedSession;
+use crate::subagents::{self, Subagents};
 use crate::task::{self, Task};
 use crate::tasks;
 use crate::vt;
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use portable_pty::{CommandBuilder, ExitStatus, MasterPty, native_pty_system};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -134,6 +136,9 @@ pub struct Session {
     /// Whether the user or a script gave it its name, as it started or with
     /// a rename: a rename in Claude Code leaves it.
     name_given: bool,
+    /// Where it stands on its agent naming it, in place of the name crystal
+    /// gave it.
+    agent_naming: AgentNaming,
     /// The name Claude Code gives its agent's conversation, to keep in step
     /// with the session's.
     title: claude_title::Watch,
@@ -142,8 +147,8 @@ pub struct Session {
     /// shell, whose hooks `crystal integration` installed. A restart types
     /// the command that resumes it into the shell again.
     typed_agent: Option<String>,
-    /// How many subagents its agent has running, as its hooks say.
-    subagents: u32,
+    /// Its agent's subagents, as its hooks say, and the turn held for them.
+    subagents: Subagents,
     /// The model its agent runs on, as its command, its hooks and its
     /// transcript say.
     model: model::Watch,
@@ -199,6 +204,24 @@ pub enum Change {
     UnseenCopy,
 }
 
+/// Where a session stands on its agent naming it, in place of the name
+/// crystal gave it, after its program or its first prompt: Claude Code is
+/// asked to with the first prompt the user sends it that says what it's
+/// about, and does with `crystal name`. Only for a session whose name
+/// nobody holds on to, like one started from the TUI, which follows a
+/// rename: a script that was told the name may use it later.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentNaming {
+    /// Its name stays as it is, but for a rename.
+    #[default]
+    Off,
+    /// Its agent is to be asked with the next prompt.
+    Due,
+    /// Its agent has been asked.
+    Asked,
+}
+
 /// A session as one daemon hands it to the next, in a handover: all it
 /// takes to carry it on, and its terminal by the number of the descriptor
 /// the next daemon inherits.
@@ -231,11 +254,15 @@ pub struct Handed {
     #[serde(default)]
     name_given: bool,
     #[serde(default)]
+    agent_naming: AgentNaming,
+    #[serde(default)]
     title: claude_title::Watch,
     #[serde(default)]
     typed_agent: Option<String>,
     #[serde(default)]
     subagents: u32,
+    #[serde(default)]
+    held_for_subagents: Option<subagents::Held>,
     #[serde(default)]
     model: model::Watch,
     #[serde(default)]
@@ -431,9 +458,10 @@ impl Session {
             reporter_job: None,
             named_after_program: false,
             name_given: false,
+            agent_naming: AgentNaming::Off,
             title: claude_title::Watch::default(),
             typed_agent: None,
-            subagents: 0,
+            subagents: Subagents::default(),
             model,
             shown: report::Shown::default(),
             stopped_idle: false,
@@ -501,9 +529,10 @@ impl Session {
             reporter_job: None,
             named_after_program: false,
             name_given: false,
+            agent_naming: AgentNaming::Off,
             title: claude_title::Watch::default(),
             typed_agent: None,
-            subagents: 0,
+            subagents: Subagents::default(),
             model: model::Watch::default(),
             shown: report::Shown::default(),
             stopped_idle: false,
@@ -569,9 +598,10 @@ impl Session {
             reporter_job: None,
             named_after_program: false,
             name_given: saved.name_given,
+            agent_naming: AgentNaming::Off,
             title: claude_title::Watch::default(),
             typed_agent: None,
-            subagents: 0,
+            subagents: Subagents::default(),
             model: model::Watch::new(&saved.command),
             shown: report::Shown::default(),
             stopped_idle: false,
@@ -814,7 +844,9 @@ impl Session {
             .goal
             .as_ref()
             .is_some_and(|goal| goal.outcome.is_none() && !goal.background);
-        if !open || self.reminded {
+        // An agent whose subagents still run works on: it's reminded as a
+        // turn after them ends.
+        if !open || self.reminded || self.subagents.running() > 0 {
             return false;
         }
         self.reminded = true;
@@ -954,7 +986,7 @@ impl Session {
             // its subagents with it.
             subagents: match &self.front {
                 Some(front) if !front.is_agent() => 0,
-                _ => self.subagents,
+                _ => self.subagents.running(),
             },
             model: self.shown.model(now).map(String::from).or(read_model),
             line: self.shown.line(now).map(String::from),
@@ -1170,10 +1202,40 @@ impl Session {
         self.named_after_program
     }
 
-    /// Its name was given now, by the user or a script, or comes from its
-    /// prompt: nothing names it after this but a rename.
+    /// Its name was given now, by the user, a script or its agent, or it
+    /// was typed into by it: nothing names it after this but a rename.
     pub fn keep_name(&mut self) {
         self.named_after_program = false;
+        self.agent_naming = AgentNaming::Off;
+    }
+
+    /// Its first prompt named it: nothing names it after this but a rename,
+    /// or its agent, when it's to.
+    pub fn named_from_prompt(&mut self) {
+        self.named_after_program = false;
+    }
+
+    /// Its agent may name it, in place of the name crystal gave it, once
+    /// it's asked to with a prompt.
+    pub fn let_agent_name(&mut self) {
+        self.agent_naming = AgentNaming::Due;
+    }
+
+    /// Whether its agent is to be asked to name it with `prompt`, the one
+    /// the user just sent: once, with the first that says what it's
+    /// about, which a slash command doesn't.
+    pub fn ask_agent_to_name(&mut self, prompt: &str) -> bool {
+        if self.agent_naming != AgentNaming::Due || names::from_prompt(prompt).is_none() {
+            return false;
+        }
+        self.agent_naming = AgentNaming::Asked;
+        true
+    }
+
+    /// Whether its agent may name it now: crystal still names it itself,
+    /// and nobody holds on to that name.
+    pub fn awaits_agent_name(&self) -> bool {
+        self.agent_naming != AgentNaming::Off
     }
 
     /// The user or a script gave it the name it has now as it started: a
@@ -1223,9 +1285,19 @@ impl Session {
     /// turn that ends with the session's task still open is a question for
     /// the user, and the task waits on them until the agent works again.
     pub fn on_agent_event(&mut self, event: AgentEvent) {
-        self.subagents = subagents_after(self.subagents, event);
+        let now = SystemTime::now();
+        self.subagents.heard(event, now);
         let turn_ended = event == AgentEvent::TurnEnded
             || (event == AgentEvent::StillIdle && self.activity == Some(Activity::Working));
+        // A turn that ends with subagents still running isn't the agent
+        // done: it works on until they've finished.
+        if turn_ended && self.subagents.hold(now) {
+            if self.activity != Some(Activity::Working) {
+                self.set_activity(Some(Activity::Working));
+                *self.changed.lock().unwrap() = SystemTime::now();
+            }
+            return;
+        }
         let mut activity = next_activity(self.activity, event, self.is_watched());
         if let Some(goal) = self.goal.as_mut().filter(|goal| goal.is_open()) {
             if turn_ended && tasks_on() {
@@ -1271,10 +1343,21 @@ impl Session {
             self.check_runs();
         } else {
             self.check_screen();
+            self.check_held_turn();
         }
         self.check_bell();
         self.check_copies();
         self.fail_task_if_ended();
+    }
+
+    /// Ends the turn its agent ended while subagents ran, once that's over:
+    /// they've all stopped and it hasn't taken their work up, or they've
+    /// gone quiet. An agent that reports for itself says when it's done.
+    fn check_held_turn(&mut self) {
+        let at_work = self.activity == Some(Activity::Working) && !self.is_claimed();
+        if at_work && self.subagents.let_go(SystemTime::now()) {
+            self.on_agent_event(AgentEvent::TurnEnded);
+        }
     }
 
     /// Keeps up with a task's runs since it last looked.
@@ -1429,7 +1512,7 @@ impl Session {
             *self.changed.lock().unwrap() = SystemTime::now();
         }
         if agent_left {
-            self.subagents = 0;
+            self.subagents.forget();
             self.model.forget();
             if self.typed_agent.take().is_some() {
                 self.conversation = None;
@@ -1719,9 +1802,11 @@ impl Session {
             reporter_job: self.reporter_job,
             named_after_program: self.named_after_program,
             name_given: self.name_given,
+            agent_naming: self.agent_naming,
             title: self.title.clone(),
             typed_agent: self.typed_agent.clone(),
-            subagents: self.subagents,
+            subagents: self.subagents.running(),
+            held_for_subagents: self.subagents.held(),
             model: self.model.clone(),
             shown: self.shown.clone(),
             stopped_idle: self.stopped_idle,
@@ -1806,9 +1891,10 @@ impl Session {
             reporter_job: handed.reporter_job,
             named_after_program: handed.named_after_program,
             name_given: handed.name_given,
+            agent_naming: handed.agent_naming,
             title: handed.title,
             typed_agent: handed.typed_agent,
-            subagents: handed.subagents,
+            subagents: Subagents::handed(handed.subagents, handed.held_for_subagents),
             model: handed.model,
             shown: handed.shown,
             stopped_idle: handed.stopped_idle,
@@ -2293,33 +2379,54 @@ impl Term {
     /// Keeps the screen up to date with `output` and passes it on to every
     /// viewer. Returns what the program asked its terminal, to answer.
     fn take_output(&self, output: &[u8]) -> Vec<u8> {
+        self.screen.lock().unwrap().take(output)
+    }
+
+    /// Clears the screen and its history but for the line the cursor is
+    /// on, the daemon's and every viewer's: see [`vt::Screen::clearing`].
+    /// The program is sent nothing. Not once it has ended, nor on the
+    /// alternate screen, whose program draws all of it.
+    pub fn clear(&self) -> Result<()> {
         let mut screen = self.screen.lock().unwrap();
-        let alternate = screen.vt.alternate_screen();
-        screen.vt.process(output);
-        screen.ring.push(output, now_ms());
-        if !alternate || !screen.vt.alternate_screen() {
-            screen.main_written = WRITES.fetch_add(1, Ordering::Relaxed) + 1;
+        ensure!(!screen.ended, "its program has ended");
+        let Some(clearing) = screen.vt.clearing() else {
+            bail!("its program draws on the alternate screen, which keeps no history");
+        };
+        // Under the one lock, so no output comes between the screen read
+        // and the clearing written.
+        screen.take(&clearing);
+        Ok(())
+    }
+}
+
+impl Screen {
+    /// [`Term::take_output`], under the screen's lock.
+    fn take(&mut self, output: &[u8]) -> Vec<u8> {
+        let alternate = self.vt.alternate_screen();
+        self.vt.process(output);
+        self.ring.push(output, now_ms());
+        if !alternate || !self.vt.alternate_screen() {
+            self.main_written = WRITES.fetch_add(1, Ordering::Relaxed) + 1;
         }
         // Viewers get the same output, so that their own screens keep the
         // same history.
         let chunk: Arc<[u8]> = output.into();
         // A viewer that's gone, or too far behind to catch up, is dropped
         // rather than holding up the program.
-        screen
-            .viewers
+        self.viewers
             .retain(|viewer| viewer.feed.try_send(chunk.clone()).is_ok());
         // What the program copies, a viewer's own screen sees, and puts on
         // the clipboard; with none, nobody does.
-        let watched = screen.viewers.iter().any(Viewer::is_user);
-        if screen.vt.take_copied().is_some() && !watched {
-            screen.unseen_copies = screen.unseen_copies.saturating_add(1);
+        let watched = self.viewers.iter().any(Viewer::is_user);
+        if self.vt.take_copied().is_some() && !watched {
+            self.unseen_copies = self.unseen_copies.saturating_add(1);
         }
         // One signal waiting is enough: the listener looks at the screen as
         // it is then.
-        screen.listeners.retain(|listener| {
+        self.listeners.retain(|listener| {
             !matches!(listener.try_send(()), Err(TrySendError::Disconnected(_)))
         });
-        screen.vt.take_replies()
+        self.vt.take_replies()
     }
 }
 
@@ -2363,18 +2470,6 @@ fn next_activity(before: Option<Activity>, event: AgentEvent, watched: bool) -> 
         Some(Activity::Idle)
     } else {
         Some(after)
-    }
-}
-
-/// How many subagents an agent that had `count` running has after `event`:
-/// one more as one starts, one fewer as one stops, never below none, and
-/// none when it starts afresh.
-fn subagents_after(count: u32, event: AgentEvent) -> u32 {
-    match event {
-        AgentEvent::SubagentStarted => count + 1,
-        AgentEvent::SubagentStopped => count.saturating_sub(1),
-        AgentEvent::Started => 0,
-        _ => count,
     }
 }
 
@@ -2487,9 +2582,11 @@ mod tests {
             reporter_job: Some(4242),
             named_after_program: true,
             name_given: false,
+            agent_naming: AgentNaming::Asked,
             title: claude_title::Watch::default(),
             typed_agent: Some("codex".into()),
             subagents: 2,
+            held_for_subagents: Some(subagents::Held::at(UNIX_EPOCH, None)),
             model: model::Watch::new(&["claude".into(), "--model".into(), "opus".into()]),
             shown,
             stopped_idle: false,
@@ -2527,7 +2624,10 @@ mod tests {
         let resume = session.launch().resume.unwrap();
         assert_eq!(resume, ["pi", "--resume", "s 1"]);
         assert!(session.is_named_after_program());
-        assert_eq!(session.subagents, 2);
+        assert!(session.awaits_agent_name());
+        // Its subagents, and the turn held for them.
+        let held = Subagents::handed(2, Some(subagents::Held::at(UNIX_EPOCH, None)));
+        assert_eq!(session.subagents, held);
         // With the shell in front, there are none to show.
         assert_eq!(info.subagents, 0);
         // What its agent put on its row stays, the model it reported over
@@ -2713,9 +2813,11 @@ mod tests {
             reporter_job: None,
             named_after_program: false,
             name_given: false,
+            agent_naming: AgentNaming::Off,
             title: claude_title::Watch::default(),
             typed_agent: Some("claude".into()),
             subagents: 2,
+            held_for_subagents: None,
             model: model::Watch::default(),
             shown: report::Shown::default(),
             stopped_idle: false,
@@ -2871,15 +2973,78 @@ mod tests {
         assert_eq!(codex.1.unwrap(), ["codex", "resume", "conv-1"]);
     }
 
+    /// Claude Code's session, running, as a daemon would hand it over, at
+    /// work.
+    fn claude_at_work(dir: &std::path::Path) -> Session {
+        let mut session = shell_session(dir);
+        session.command = vec!["claude".into()];
+        session.front = Some(claude());
+        session.activity = Some(Working);
+        session
+    }
+
     #[test]
-    fn subagents_are_counted_as_they_start_and_stop() {
-        use AgentEvent::*;
-        assert_eq!(subagents_after(0, SubagentStarted), 1);
-        assert_eq!(subagents_after(1, SubagentStarted), 2);
-        assert_eq!(subagents_after(2, SubagentStopped), 1);
-        assert_eq!(subagents_after(0, SubagentStopped), 0, "never below none");
-        assert_eq!(subagents_after(2, TurnEnded), 2, "they can outlive a turn");
-        assert_eq!(subagents_after(2, Started), 0);
+    fn a_turn_ended_with_subagents_running_is_held_until_they_are_done() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = claude_at_work(dir.path());
+        session.on_agent_event(AgentEvent::SubagentStarted);
+        session.on_agent_event(AgentEvent::SubagentStarted);
+        session.on_agent_event(AgentEvent::TurnEnded);
+        assert_eq!(session.activity, Some(Working));
+        // Its prompt back for a while says nothing more.
+        session.on_agent_event(AgentEvent::StillIdle);
+        assert_eq!(session.activity, Some(Working));
+        session.on_agent_event(AgentEvent::SubagentStopped);
+        session.on_agent_event(AgentEvent::SubagentStopped);
+        session.check();
+        assert_eq!(session.activity, Some(Working), "it may take their work up");
+        assert!(session.take_changes().is_empty());
+
+        // It hasn't, a while after the last stopped: the turn is over.
+        let then = SystemTime::now() - subagents::DRAINED_FOR;
+        session.subagents = Subagents::handed(0, Some(subagents::Held::at(then, Some(then))));
+        session.check();
+        assert_eq!(session.activity, Some(Done));
+        let ended = Change::Activity {
+            from: Some(Working),
+            to: Some(Done),
+        };
+        assert_eq!(session.take_changes(), [ended]);
+    }
+
+    #[test]
+    fn a_task_isn_t_waiting_while_its_agent_s_subagents_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = claude_at_work(dir.path());
+        session.give_task(TaskInfo {
+            id: Some(3),
+            goal: "port the tests".into(),
+            background: false,
+            backlog: None,
+            waiting: false,
+            created: 1,
+            outcome: None,
+            brief: Default::default(),
+        });
+        session.on_agent_event(AgentEvent::SubagentStarted);
+        session.on_agent_event(AgentEvent::TurnEnded);
+        assert!(!session.goal.as_ref().unwrap().waiting);
+        assert!(!session.remind_of_task(), "it works on");
+        // The turn it takes their work up in ends as any does.
+        session.on_agent_event(AgentEvent::SubagentStopped);
+        session.on_agent_event(AgentEvent::TurnStarted);
+        assert!(session.remind_of_task(), "reminded once they're done");
+    }
+
+    #[test]
+    fn a_turn_held_for_subagents_gone_quiet_ends() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = claude_at_work(dir.path());
+        let then = SystemTime::now() - subagents::QUIET_FOR;
+        session.subagents = Subagents::handed(1, Some(subagents::Held::at(then, None)));
+        session.check();
+        assert_eq!(session.activity, Some(Done));
+        assert_eq!(session.info().subagents, 0, "taken for gone");
     }
 
     #[test]
@@ -2922,6 +3087,7 @@ mod tests {
             reporter_job: None,
             named_after_program: false,
             name_given: false,
+            agent_naming: AgentNaming::Off,
             title: claude_title::Watch::default(),
             start_from: None,
             screen: vt::Screen::answering(5, 20).save(),
@@ -2929,6 +3095,7 @@ mod tests {
             stopped_idle: false,
             typed_agent: None,
             subagents: 0,
+            held_for_subagents: None,
             model: model::Watch::default(),
             shown: report::Shown::default(),
             pty: None,

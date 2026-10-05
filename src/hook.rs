@@ -2,11 +2,12 @@
 //! reads the event the agent passes on stdin and tells the daemon.
 //!
 //! A hook must never get in its agent's way. This one prints nothing, since
-//! an agent may take a hook's output as input, but for the two things meant
-//! as input: the reminder the daemon sends back when an agent ends a turn
-//! with its task still open, and the name a session was renamed to in
-//! crystal, for Claude Code's conversation, as the user sends a prompt. And it always
-//! succeeds: a failing hook can hold the agent up.
+//! an agent may take a hook's output as input, but for the things meant as
+//! input: the reminder the daemon sends back when an agent ends a turn with
+//! its task still open, and as the user sends Claude Code a prompt, the
+//! name a session was renamed to in crystal, for its conversation, or the
+//! words that ask it to name the session. And it always succeeds: a failing
+//! hook can hold the agent up.
 //!
 //! The hooks crystal adds as it starts Claude Code run `crystal hook
 //! claude`; those `crystal integration` puts in an agent's own settings run
@@ -100,6 +101,7 @@ fn report(socket: &Path, agent: &str, installed: bool, event: Option<&str>) -> R
         // Codex's Stop hook takes the same answer as Claude Code's.
         Some(Response::Remind { text }) => outln!("{}", agents::claude_keep_going(&text))?,
         Some(Response::Retitle { title }) => outln!("{}", claude_title::hook_answer(&title))?,
+        Some(Response::Context { text }) => outln!("{}", agents::claude_context(&text))?,
         _ => {}
     }
     Ok(())
