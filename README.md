@@ -2553,7 +2553,8 @@ crystal memory kind gotcha 12 15     # make entries gotchas: what they say stays
 crystal memory kind --notes          # the notes a model reads as lessons, and their kinds; `--yes` makes them so
 crystal memory promote 2             # copy one into the project's CLAUDE.md, under "Notes"
 crystal memory distill fixer         # have a model read what a session did, now
-crystal memory embed                 # download the model that searches by meaning
+crystal memory embed                 # give every entry its vector, downloading the models first if needed
+crystal memory status                # how search by meaning stands: what makes the vectors, Gemini's key
 crystal memory dedupe                # entries that say what another does, by meaning; --apply merges them
 crystal remember --replaces 3 --why "it flipped" "Idle stop is on by default"   # in place of 3, which no longer holds
 crystal memory retire 3 --by 12      # 3 no longer holds: 12, there already, holds in its place
@@ -2733,7 +2734,8 @@ and a session in a terminal would stop to ask about.
 
 Words only find words: "db" never finds "Postgres has to be running". So crystal also searches by what entries
 mean, with two models run on your machine through [Candle](https://github.com/huggingface/candle): no API, no
-key, and nothing leaves the machine.
+key, and nothing leaves the machine, unless you have [Gemini](#gemini-instead-of-the-model-here) make the
+vectors.
 
 - [jinaai/jina-embeddings-v5-text-small](https://huggingface.co/jinaai/jina-embeddings-v5-text-small) turns
   each entry, and each query, into a vector, so an entry that means what a query asks is found whatever its
@@ -2779,6 +2781,56 @@ crystal memory embed   # downloads both models now (2.4 GB), and gives every ent
 - Both models are licensed [CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/): yours to use,
   but not commercially. `embeddings = false` under `[memory]` turns search by meaning off, and `rerank =
   false` leaves the reranker out: faster on a CPU, but a search then always brings back what's nearest.
+- `crystal memory status` says how it stands: what makes the vectors, how many entries have theirs, whether
+  the models are downloaded and loaded, and with Gemini, where its key is and how its last request went.
+
+#### Gemini instead of the model here
+
+`embedder = "gemini"` under `[memory]` has Google's [Gemini API](https://ai.google.dev/gemini-api/docs/embeddings)
+turn entries and searches into vectors, with `gemini-embedding-2`, in place of jina's model. The reranker here
+still reads the best of each search: the Gemini API has none.
+
+- **What goes to Google:** every entry's text (with credentials taken out, as memory keeps it), each search,
+  the first prompt of each agent that starts (what it's shown of the memory is found by it), and the last
+  things a session said that the distiller holds against the memory, credentials taken out again on the way. Turn it on only where you're fine sending your memory to Google; the settings view's row
+  says so too.
+- **The key:** put it in `~/.config/crystal/gemini.key`, one line, readable by you alone (`chmod 600`), or
+  name another file with `gemini_key_file`; with no file, `GEMINI_API_KEY` or `GOOGLE_API_KEY` in the
+  daemon's environment. Never in `config.toml`, which `crystal config export` bundles: crystal refuses a key
+  there. It's read as each request goes, so a new one counts at once, and handed to `curl` on its standard
+  input, never on its command line, where `ps` shows it; it's never logged, said in an error or passed to
+  sessions.
+- Entries go a hundred to a request, four requests at once. Crystal's own 512 entries took 31,691 tokens,
+  about $0.006 at $0.20 a million tokens, in 7 to 14 seconds. Each entry keeps a vector from each model, so
+  switching to Gemini and back embeds only what's missing; changing `gemini_dimensions` embeds every entry
+  again. A search's vector is kept an hour, since agents ask the same again.
+- **When Gemini fails** (offline, out of quota, a key it refuses), it's said once in the daemon's log, and
+  searches go by the model here while it's downloaded, else by words, until Gemini is asked again: 30
+  seconds after the network failed, as long as a 429 asks, five minutes after a refusal, or at once with a
+  new key. Nothing fails for it: a search finds what it can, and a remember keeps its entry. `crystal memory
+  status` and the settings view say why.
+- **Thresholds are its own.** Gemini's cosines sit higher and closer together than jina's (two entries are
+  0.63 alike in the middle, against jina's 0.31), so each threshold tied to them was measured again on
+  crystal's own memory, per size. By meaning, only entries within 0.08 of the best match count (0.03 to
+  0.11 tried), and a search is sent as a question to answer (`task: question answering`), which ranked a
+  little better than as a search for results. Two different lessons on one subject reached 0.913 alike,
+  higher than with jina, and the reranker scores pairs like that as high as the same said again, so an
+  entry is the same as another from 0.92 alike (0.925 at 768), and the reranker is asked only from 0.915
+  (0.918): on crystal's memory, `dedupe` finds 22 entries said again in 15 groups, every one rightly,
+  where jina finds 33. Entries are near one another, for `reconcile` and the hint as you remember, from
+  0.82 (0.825), below every pair where one corrected the other.
+- **Measured** on crystal's own 512 entries, 97 questions (a right entry among the first five, of 93 that
+  have one; the mean reciprocal rank of the first right one among ten):
+
+  | | with the reranker | without it |
+  | --- | --- | --- |
+  | jina, here | 90 of 93, 0.816 | 84, 0.746 |
+  | Gemini, 3072 | 89, 0.813 | 84, 0.804 |
+  | Gemini, 768 | 89, 0.801 | 83, 0.794 |
+
+  By meaning alone, Gemini ranks well ahead (0.83 against 0.74), but with the reranker, which the
+  default keeps, it doesn't beat the model here. And a search waits on Google: about 0.55 seconds for its
+  vector at 768, 0.77 at 3072, unless it was asked in the last hour.
 
 #### The distiller
 
@@ -2831,6 +2883,10 @@ distill_budget_usd = 0.25           # the most one task's pass may spend
 embeddings = true                   # false to search by words alone: see above
 rerank = true                       # false to leave the reranker out
 recall_on_read = true               # false to stop showing Claude Code what's known about each file it reads
+embedder = "local"                  # "gemini" for Google's Gemini API, which entries' text goes to: see above
+gemini_model = "gemini-embedding-2" # Gemini's model
+gemini_dimensions = 768             # 3072, 1536 or 768 numbers to a vector
+# gemini_key_file = "~/.config/crystal/gemini.key"  # where its key is; never the key itself
 ```
 
 ### Tasks
@@ -3557,7 +3613,7 @@ that makes no sense is said there too, and the settings stay as they were until 
 | `mermaid_ascii` | `false` | draw [mermaid diagrams](#the-file-finder-and-the-tree-browser) with ASCII rather than box drawing |
 | `scrollback_lines` | `10000` | how many rows that scrolled off a session's screen it keeps, up to 1,000,000, for scrolling back, copy mode, `e` and `crystal read --history`; a change counts for the sessions running too, which let their oldest rows go when it's fewer |
 | `[plugins]` | | which plugins are on and off: [plugins](#plugins) |
-| `[memory]` | | how memory's [distiller](#the-distiller) runs, whether it [searches by meaning](#search-by-meaning), and whether Claude Code is shown the entries about each file it reads |
+| `[memory]` | | how memory's [distiller](#the-distiller) runs, whether it [searches by meaning](#search-by-meaning), and with what: the model here or [Gemini](#gemini-instead-of-the-model-here); and whether Claude Code is shown the entries about each file it reads |
 | `[tasks]` | | what [background tasks](#background-tasks) may spend: `max_budget_usd` each (`5`), `daily_budget_usd` all together (none); and what they may do without asking: `permission_mode` (`"default"`), `allowed_tools` (none) and `allow_bypass` (`false`) |
 | `[events]` | | `keep_days`, how long the [event log](#events) keeps what happened: 30 days, or `0` for ever |
 | `[handoff]` | | `in_git`, the projects, by their main worktree, whose [handoff notes](#the-handoff-file) go in git |
@@ -3784,7 +3840,7 @@ bar.
 | Sessions | what the [new-session panel](#starting-a-session) offers first, naming sessions for their prompt, how long an agent may sit [idle](#archiving-and-idle-agents) and whether a terminal is stopped too, whether an agent is kept warm for the next session, how far apart agents start again after a [crash or a reboot](#usage) and whether one resumes as it said; a new terminal's shell, whether it's a login shell and where it starts; how much each session's history keeps, the running ones' too, and whether a terminal shows it again after a crash or a reboot; and the branch new worktrees start from, where they go and whether one its last session is killed from is removed |
 | Mouse | [the mouse](#usage), and whether programs' copies go on [your clipboard](#zoom-copy-mode-and-search) |
 | Tasks | the permission mode [background tasks](#background-tasks) start in, and what a run and a day may spend |
-| Memory | how memory learns ([the distiller](#the-distiller), its model and what it may spend), whether it searches [by meaning](#search-by-meaning) and reranks, and whether Claude Code is shown what's known about a file as it reads it |
+| Memory | how memory learns ([the distiller](#the-distiller), its model and what it may spend), whether it searches [by meaning](#search-by-meaning), with the model here or [Gemini](#gemini-instead-of-the-model-here) and at how many dimensions, and reranks, and whether Claude Code is shown what's known about a file as it reads it |
 | Integrations | the agents installed here that crystal can [hook](#hooks-in-other-agents-own-settings): below |
 | Keys | every key `[keys]` gives, each given by pressing it: below |
 
@@ -3818,7 +3874,8 @@ the filter and gives the rows their keys back, and `esc` takes it away, the bar 
 
 While it's open, the view reads the file and asks the daemon again every half a second, so it follows a
 change made by hand in the file too, and shows how the models that search by meaning stand: downloading
-(`42 of 2449 MB`), loaded in the daemon or not, and how many entries have their vector. Turning search by
+(`42 of 2449 MB`), loaded in the daemon or not, and how many entries have their vector; with Gemini, where
+its key is and how many tokens it was sent, or why its last request failed and what searches go by meanwhile. Turning search by
 meaning on has the daemon get the models ready: it downloads them if they aren't here, loads them and gives
 every entry its vector, and `enter` on that row does it again. Turned off, the daemon lets the models go, and
 the memory they took with them.

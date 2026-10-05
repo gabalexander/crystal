@@ -70,7 +70,7 @@ use crate::output::errln;
 use crate::printable;
 use crate::secrets;
 use crate::state;
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use regex::RegexSet;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
@@ -254,10 +254,6 @@ const RERANK_POOL: usize = 20;
 /// a first place in one ranking from outweighing good places in both.
 const FUSION_K: f32 = 60.0;
 
-/// How many entries go through the model at once, embedding those that
-/// have no vector yet.
-const EMBED_BATCH: usize = 32;
-
 /// How many places lower a note or a task's outcome ranks than what it
 /// says would put it, below the lessons near it: what was learned before
 /// what was done, but a note that answers well still ahead of a lesson
@@ -340,7 +336,8 @@ END;
 /// Each entry's vector, from the model [`crate::embed`] runs, kept under
 /// the model's name: a vector from another model can't be compared. An
 /// entry whose text changes, or that goes, loses its vector; so does a new
-/// entry given the rowid of one gone, which SQLite can do.
+/// entry given the rowid of one gone, which SQLite can do. Since
+/// [`VECTORS_BY_MODEL`], one from each model.
 const VECTORS: &str = "
 CREATE TABLE vectors (
   n      INTEGER PRIMARY KEY,
@@ -483,6 +480,45 @@ CREATE INDEX superseded_id ON superseded (project, id);
 CREATE INDEX superseded_key ON superseded (project, key);
 ";
 
+/// Each entry's vector from each model, rather than from one, and each
+/// entry's kept apart: Gemini's beside the model's here, so a search falls
+/// back on the one, or goes back to the other, without embedding every
+/// entry again.
+const VECTORS_BY_MODEL: &str = "
+DROP TRIGGER vectors_entry_added;
+DROP TRIGGER vectors_entry_gone;
+DROP TRIGGER vectors_text_changed;
+ALTER TABLE vectors RENAME TO vectors_before;
+CREATE TABLE vectors (
+  n      INTEGER NOT NULL,
+  model  TEXT NOT NULL,
+  vector BLOB NOT NULL,
+  PRIMARY KEY (n, model)
+);
+INSERT INTO vectors (n, model, vector) SELECT n, model, vector FROM vectors_before;
+DROP TABLE vectors_before;
+CREATE TRIGGER vectors_entry_added AFTER INSERT ON entries BEGIN
+  DELETE FROM vectors WHERE n = new.n;
+END;
+CREATE TRIGGER vectors_entry_gone AFTER DELETE ON entries BEGIN
+  DELETE FROM vectors WHERE n = old.n;
+END;
+CREATE TRIGGER vectors_text_changed AFTER UPDATE OF text ON entries BEGIN
+  DELETE FROM vectors WHERE n = old.n;
+END;
+ALTER TABLE apart_vectors RENAME TO apart_vectors_before;
+CREATE TABLE apart_vectors (
+  project TEXT NOT NULL,
+  key     TEXT NOT NULL,
+  model   TEXT NOT NULL,
+  vector  BLOB NOT NULL,
+  PRIMARY KEY (project, key, model)
+);
+INSERT INTO apart_vectors (project, key, model, vector)
+  SELECT project, key, model, vector FROM apart_vectors_before;
+DROP TABLE apart_vectors_before;
+";
+
 /// What makes the database as it is now, a step for each version: a
 /// database at version `v`, kept in its `user_version`, takes the steps
 /// after the first `v`.
@@ -499,6 +535,7 @@ const MIGRATIONS: &[fn(&Connection) -> Result<()>] = &[
     |conn| Ok(conn.execute_batch(MERGED)?),
     |conn| Ok(conn.execute_batch(APART)?),
     |conn| Ok(conn.execute_batch(SUPERSEDED)?),
+    |conn| Ok(conn.execute_batch(VECTORS_BY_MODEL)?),
 ];
 
 /// The columns [`entry_of`] reads, in its order.
@@ -1024,10 +1061,12 @@ impl Store {
         // By meaning before the write, which holds up every other while
         // the models take their time.
         let meant = embedder.and_then(|embedder| {
-            self.meaning(&name, &text, embedder, new.source.is_crystal(), replaced)
-                .map(|meant| (meant, embedder.model()))
-                .inspect_err(|err| errln!("crystal: couldn't compare it by meaning: {err:#}"))
-                .ok()
+            falling_back(embedder, |embedder| {
+                self.meaning(&name, &text, embedder, new.source.is_crystal(), replaced)
+            })
+            .map(|(meant, embedder)| (meant, embedder.model().to_string()))
+            .inspect_err(|err| errln!("crystal: couldn't compare it by meaning: {err:#}"))
+            .ok()
         });
         let now = seconds_since_epoch(SystemTime::now());
         let checkout = new.checkout.as_deref().unwrap_or(project);
@@ -1602,7 +1641,8 @@ impl Store {
         except: &[u64],
     ) -> Result<Vec<Vec<Entry>>> {
         let name = self.ready(project)?;
-        let mut entries = self.with_vectors(&name, embedder)?;
+        let (mut entries, embedder) =
+            falling_back(embedder, |embedder| self.with_vectors(&name, embedder))?;
         entries.retain(|(entry, _)| !except.contains(&entry.id));
         let at: HashMap<u64, usize> = (entries.iter().enumerate())
             .map(|(n, (entry, _))| (entry.id, n))
@@ -1662,8 +1702,12 @@ impl Store {
             return Ok(Vec::new());
         }
         let name = self.ready(project)?;
-        let entries = self.with_vectors(&name, embedder)?;
-        let asked = embedder.embed_passages(texts)?;
+        let ((entries, asked), _) = falling_back(embedder, |embedder| {
+            Ok((
+                self.with_vectors(&name, embedder)?,
+                embedder.embed_passages(texts)?,
+            ))
+        })?;
         let mut near: Vec<(f32, Entry)> = entries
             .into_iter()
             .filter_map(|(entry, vector)| {
@@ -1686,7 +1730,8 @@ impl Store {
     /// them, the one kept earliest first.
     pub fn twins(&mut self, project: &Path, embedder: &dyn Embed) -> Result<Vec<Merge>> {
         let name = self.ready(project)?;
-        let entries = self.with_vectors(&name, embedder)?;
+        let (entries, embedder) =
+            falling_back(embedder, |embedder| self.with_vectors(&name, embedder))?;
         let same: Vec<Vec<Twin>> = entries
             .iter()
             .map(|(entry, vector)| {
@@ -2211,14 +2256,17 @@ impl Store {
             by_words.truncate(limit);
             return Ok(by_words);
         };
-        match self.by_meaning(&name, text, among, pool, embedder) {
-            Ok(by_meaning) => {
+        let by_meaning = falling_back(embedder, |embedder| {
+            self.by_meaning(&name, text, among, pool, embedder)
+        });
+        match by_meaning {
+            Ok((by_meaning, embedder)) => {
                 let found = fused(&[by_words, by_meaning], pool);
                 let read: Vec<u64> = found.iter().take(RERANK_POOL).map(|e| e.id).collect();
                 let merged_words = self.merged_words(&name, &read)?;
                 Ok(reranked(found, text, embedder, limit, &merged_words))
             }
-            // The model failing leaves the search to the words.
+            // The models failing leave the search to the words.
             Err(err) => {
                 errln!("crystal: couldn't search by meaning: {err:#}");
                 by_words.truncate(limit);
@@ -2353,17 +2401,21 @@ impl Store {
         Ok((entries, embedded))
     }
 
-    /// Lets go of the vectors of every model but `model`: crystal searches
-    /// with one, and another's can't be compared with it.
-    pub fn forget_vectors_but(&mut self, model: &str) -> Result<usize> {
-        let gone = self
-            .conn
-            .execute("DELETE FROM vectors WHERE model != ?1", params![model])?;
-        let apart = self.conn.execute(
-            "DELETE FROM apart_vectors WHERE model != ?1",
-            params![model],
-        )?;
-        Ok(gone + apart)
+    /// Lets go of the vectors of every model but `models`, of entries and
+    /// of what was kept apart: those crystal searches with, or falls back
+    /// on, or would search with again were it switched back.
+    pub fn forget_vectors_but(&mut self, models: &[&str]) -> Result<usize> {
+        let models = serde_json::to_string(models)?;
+        let mut gone = 0;
+        for table in ["vectors", "apart_vectors"] {
+            gone += self.conn.execute(
+                &format!(
+                    "DELETE FROM {table} WHERE model NOT IN (SELECT value FROM json_each(?1))"
+                ),
+                params![models],
+            )?;
+        }
+        Ok(gone)
     }
 
     /// Gives every entry, in every project, that has no vector from
@@ -2381,7 +2433,7 @@ impl Store {
     /// Lets go of every vector kept that isn't numbers, and says how many.
     fn forget_broken_vectors(&mut self) -> Result<usize> {
         let mut broken = 0;
-        for (table, key) in [("vectors", "n"), ("apart_vectors", "rowid")] {
+        for (table, key) in [("vectors", "rowid"), ("apart_vectors", "rowid")] {
             let ids: Vec<i64> = {
                 let mut rows = self
                     .conn
@@ -2425,7 +2477,7 @@ impl Store {
             })?;
             missing.collect::<rusqlite::Result<_>>()?
         };
-        for batch in missing.chunks(EMBED_BATCH) {
+        for batch in missing.chunks(embedder.batch().max(1)) {
             let texts: Vec<&str> = batch.iter().map(|(_, text)| text.as_str()).collect();
             let vectors = embedder.embed_passages(&texts)?;
             let tx = self
@@ -2460,7 +2512,7 @@ impl Store {
             })?;
             apart.collect::<rusqlite::Result<_>>()?
         };
-        for batch in apart.chunks(EMBED_BATCH) {
+        for batch in apart.chunks(embedder.batch().max(1)) {
             let texts: Vec<&str> = batch.iter().map(|(_, _, text)| text.as_str()).collect();
             let vectors = embedder.embed_passages(&texts)?;
             let tx = self
@@ -3336,6 +3388,25 @@ fn about_what_was_done(asked: &str) -> bool {
     asked
         .split(|c: char| !c.is_alphanumeric())
         .any(|word| WHAT_WAS_DONE.contains(&word.to_lowercase().as_str()))
+}
+
+/// What `with` makes of `embedder`, or, when that fails, of the model it
+/// falls back on, if it has one; with the one it was made with, whose
+/// vectors and thresholds go together.
+fn falling_back<'a, T>(
+    embedder: &'a dyn Embed,
+    mut with: impl FnMut(&'a dyn Embed) -> Result<T>,
+) -> Result<(T, &'a dyn Embed)> {
+    match with(embedder) {
+        Ok(made) => Ok((made, embedder)),
+        Err(err) => match embedder.fallback() {
+            Some(fallback) => match with(fallback) {
+                Ok(made) => Ok((made, fallback)),
+                Err(second) => Err(anyhow!("{err:#}; then, falling back, {second:#}")),
+            },
+            None => Err(err),
+        },
+    }
 }
 
 fn dot(a: &[f32], b: &[f32]) -> f32 {
@@ -5695,7 +5766,7 @@ mod tests {
     }
 
     #[test]
-    fn each_entry_gets_one_vector_a_model_which_goes_with_it() {
+    fn each_entry_gets_a_vector_from_each_model_which_goes_with_it() {
         let (_dir, _socket, mut store) = remembering(&[
             (Kind::Note, "fees are kept in cents"),
             (Kind::Note, "deploys"),
@@ -5716,14 +5787,129 @@ mod tests {
         // The one forgotten keeps its vector apart.
         store.remove(project, 1).unwrap();
         assert_eq!(vectors(&store), 2);
-        assert_eq!(store.forget_vectors_but("meanings").unwrap(), 0);
-        assert_eq!(store.forget_vectors_but("another").unwrap(), 3);
+        assert_eq!(store.forget_vectors_but(&["meanings"]).unwrap(), 0);
+        assert_eq!(store.forget_vectors_but(&["another"]).unwrap(), 3);
         assert_eq!(vectors(&store), 0);
 
-        // Another model's vectors can't be compared: it makes its own.
+        // Another model's vectors can't be compared: it makes its own, of
+        // what was kept apart too, and each keeps its own, beside the
+        // other's.
         let other = Meanings { model: "other" };
         assert_eq!(store.embed_missing(&other).unwrap(), 3);
         assert_eq!(store.embed_missing(&MEANINGS).unwrap(), 3);
+        assert_eq!(store.embed_missing(&other).unwrap(), 0);
+        assert_eq!(vectors(&store), 4);
+        assert_eq!(store.forget_vectors_but(&["other", "meanings"]).unwrap(), 0);
+        store.remove(project, 2).unwrap();
+        assert_eq!(vectors(&store), 2, "an entry gone takes both");
+    }
+
+    /// A model that fails, as Gemini does offline, with one to fall back
+    /// on, as Gemini has the model here.
+    struct Falling;
+
+    impl Embed for Falling {
+        fn model(&self) -> &str {
+            "falling"
+        }
+
+        fn embed_passages(&self, _: &[&str]) -> Result<Vec<Vec<f32>>> {
+            bail!("offline")
+        }
+
+        fn embed_query(&self, _: &str) -> Result<Vec<f32>> {
+            bail!("offline")
+        }
+
+        fn min_similarity(&self) -> f32 {
+            0.0
+        }
+
+        fn near_best(&self) -> f32 {
+            1.0
+        }
+
+        fn fallback(&self) -> Option<&dyn Embed> {
+            Some(&MEANINGS)
+        }
+    }
+
+    #[test]
+    fn a_model_that_fails_falls_back_on_its_other_for_searching_and_adding() {
+        let (_dir, _socket, mut store) =
+            remembering(&[(Kind::Gotcha, "Postgres has to be up for the ledger tests")]);
+        let project = Path::new(APP);
+        let found = store
+            .search(project, "db", None, 10, Some(&Falling))
+            .unwrap();
+        assert_eq!(ids(&found), [1], "by meaning, through the other");
+        assert_eq!(store.counts("meanings").unwrap(), (1, 1));
+        assert_eq!(store.counts("falling").unwrap(), (1, 0));
+        // A new entry is compared by the other, and keeps the vector it was
+        // compared by.
+        let added = store
+            .add_with(project, note("deploys go out on tuesdays"), Some(&Falling))
+            .unwrap();
+        assert!(matches!(added, Added::New(_)));
+        assert_eq!(store.counts("meanings").unwrap(), (2, 2));
+        let near = store
+            .nearest(project, &["the database"], 1, &Falling)
+            .unwrap();
+        assert_eq!(ids(&near), [1]);
+        // With nothing to fall back on, a search goes by its words.
+        let found = store
+            .search(project, "postgres", None, 10, Some(&Broken))
+            .unwrap();
+        assert_eq!(ids(&found), [1]);
+    }
+
+    #[test]
+    fn a_database_from_before_keeps_its_vectors_and_takes_another_model_s_beside() {
+        let (_dir, socket) = socket();
+        fs::create_dir_all(dir(&socket)).unwrap();
+        let conn = Connection::open(dir(&socket).join("memory.db")).unwrap();
+        // The database as it was with one vector an entry, before the
+        // eleventh step.
+        let before = 10;
+        for step in &MIGRATIONS[..before] {
+            step(&conn).unwrap();
+        }
+        conn.execute_batch(&format!("PRAGMA user_version = {before}"))
+            .unwrap();
+        conn.execute(
+            "INSERT INTO projects (path, next_id) VALUES (?1, 2)",
+            params![APP],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO entries (project, id, kind, text, key, source, created, last_seen) \
+             VALUES (?1, 1, 'gotcha', 'postgres has to be up', 'postgres has to be up', \
+             '\"user\"', 1, 1)",
+            params![APP],
+        )
+        .unwrap();
+        let vector = MEANINGS.vectors(&["postgres has to be up"]).remove(0);
+        conn.execute(
+            "INSERT INTO vectors (n, model, vector) SELECT n, 'meanings', ?1 FROM entries",
+            params![bytes_of(&vector)],
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut store = Store::open(&socket).unwrap();
+        assert_eq!(store.counts("meanings").unwrap(), (1, 1));
+        let other = Meanings { model: "other" };
+        assert_eq!(store.embed_missing(&other).unwrap(), 1);
+        assert_eq!(store.embed_missing(&MEANINGS).unwrap(), 0, "kept");
+        let found = store
+            .search(Path::new(APP), "db", None, 10, Some(&MEANINGS))
+            .unwrap();
+        assert_eq!(ids(&found), [1]);
+        // The triggers came back with the table.
+        store
+            .reword(Path::new(APP), 1, "postgres must be up", Path::new(APP))
+            .unwrap();
+        assert_eq!(vectors(&store), 0);
     }
 
     #[test]
