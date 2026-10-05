@@ -169,8 +169,9 @@ impl Server {
                     .ok()
             })
             .context("say which entry, by its id")?;
+        // Read in full, it's used, which keeps it from expiring.
         let entry = Store::open(&self.socket)?
-            .get(&self.project, id)?
+            .used(&self.project, id)?
             .with_context(|| format!("there's no entry {id}"))?;
         let freshness = memory::freshness(&entry, &self.project);
         Ok(memory_cli::in_full(&entry, freshness, now()))
@@ -200,9 +201,11 @@ fn tools() -> Value {
                             notes. Give a few words or a question: any of the words matches, \
                             and so does a word they start or stem from; with search by meaning \
                             on, so does what means the same, and a search nothing answers finds \
-                            nothing. Gives the best matches first, a line each: id, kind, age, \
-                            text, the files it's about, [drifting] when some of those have \
-                            changed since, and [stale] when all of them have.",
+                            nothing. Gives the best matches first, lessons (decisions, gotchas, \
+                            commands) ahead of notes and task outcomes unless it asks what was \
+                            done, a line each: id, kind, age, text, the files it's about, \
+                            [drifting] when some of those have changed since, and [stale] when \
+                            all of them have.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -384,6 +387,13 @@ mod tests {
         );
         assert!(shown.contains("from: session fixer"));
         assert!(shown.contains("said once"));
+        // Read in full, it's used, and doesn't expire.
+        assert!(
+            shown.ends_with("; an agent read it in full just now"),
+            "{shown}"
+        );
+        let entry = Store::open(&server.socket).unwrap().get(&server.project, 2);
+        assert!(entry.unwrap().unwrap().used.is_some());
 
         let result = call(&server, "memory_show", json!({"id": 9}));
         assert_eq!(result["isError"], true);

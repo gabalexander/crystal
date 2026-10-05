@@ -1286,8 +1286,8 @@ enum MemoryCommand {
         #[command(flatten)]
         entry: EntryArgs,
     },
-    /// Every entry, newest first, drifting and stale ones marked: what
-    /// `crystal memory` with no command does.
+    /// Every entry, newest first, drifting, stale and expired ones marked:
+    /// what `crystal memory` with no command does.
     #[command(visible_alias = "ls")]
     List {
         /// Only the entries of this kind.
@@ -1296,11 +1296,24 @@ enum MemoryCommand {
 
         /// The entries forgotten instead, the latest first: the distiller
         /// never adds one back, but remembering it again does.
-        #[arg(long, visible_alias = "wrong")]
+        #[arg(long, visible_alias = "wrong", conflicts_with_all = ["status", "expired"])]
         forgotten: bool,
+
+        /// Only the entries that read as progress or status rather than
+        /// lessons (merged, pushed, installed, CI passed, a commit's hash, a
+        /// backlog item tracking it), to look through before `rm --status`
+        /// forgets them. Tasks' outcomes are left out: `-k outcome` lists
+        /// those.
+        #[arg(long)]
+        status: bool,
+
+        /// Only the expired: notes and outcomes nobody found again, which
+        /// searches and agents starting leave out.
+        #[arg(long)]
+        expired: bool,
     },
     /// The entries that have to do with these words, the best first,
-    /// those that are stale left out.
+    /// those that are stale or expired left out.
     Search {
         #[arg(required = true)]
         words: Vec<String>,
@@ -1314,7 +1327,7 @@ enum MemoryCommand {
         #[arg(short = 'f', long = "file", value_name = "PATH")]
         files: Vec<String>,
 
-        /// Stale entries too, marked.
+        /// Stale and expired entries too, marked.
         #[arg(short, long)]
         all: bool,
 
@@ -1327,9 +1340,28 @@ enum MemoryCommand {
     Show { id: u64 },
     /// Print every entry as markdown, newest first.
     Export,
-    /// Forget an entry, by its id.
+    /// Forget entries, by their ids; or with --status, every entry `list
+    /// --status` lists, once --yes says so.
     #[command(visible_alias = "remove")]
-    Rm { id: u64 },
+    Rm {
+        /// The entries, by their ids.
+        #[arg(required_unless_present = "status", conflicts_with = "status")]
+        ids: Vec<u64>,
+
+        /// Every entry that reads as progress or status, as `list --status`
+        /// lists them: only listed, as what would be forgotten, without
+        /// --yes.
+        #[arg(long)]
+        status: bool,
+
+        /// With --status, only the entries of this kind.
+        #[arg(short, long, value_enum, requires = "status")]
+        kind: Option<memory::Kind>,
+
+        /// With --status, forget them.
+        #[arg(long, requires = "status")]
+        yes: bool,
+    },
     /// Write an entry into the project's CLAUDE.md, or its AGENTS.md, under
     /// a "Notes" heading, for every session to read.
     Promote {
@@ -2631,10 +2663,21 @@ fn run(cli: Cli) -> Result<()> {
         },
         Command::Remember { entry, dir } => remember(&socket, dir, entry)?,
         Command::Memory { dir, command } => match command {
-            None => memory_cli::list(&socket, dir, None, false)?,
+            None => memory_cli::list(&socket, dir, memory_cli::Listing::default())?,
             Some(MemoryCommand::Add { entry }) => remember(&socket, dir, entry)?,
-            Some(MemoryCommand::List { kind, forgotten }) => {
-                memory_cli::list(&socket, dir, kind, forgotten)?;
+            Some(MemoryCommand::List {
+                kind,
+                forgotten,
+                status,
+                expired,
+            }) => {
+                let listing = memory_cli::Listing {
+                    kind,
+                    forgotten,
+                    status,
+                    expired,
+                };
+                memory_cli::list(&socket, dir, listing)?;
             }
             Some(MemoryCommand::Search {
                 words,
@@ -2653,7 +2696,20 @@ fn run(cli: Cli) -> Result<()> {
             }
             Some(MemoryCommand::Show { id }) => memory_cli::show(&socket, dir, id)?,
             Some(MemoryCommand::Export) => memory_cli::export(&socket, dir)?,
-            Some(MemoryCommand::Rm { id }) => memory_cli::remove(&socket, dir, id)?,
+            Some(MemoryCommand::Rm {
+                ids,
+                status,
+                kind,
+                yes,
+            }) => {
+                let forgetting = memory_cli::Forgetting {
+                    ids,
+                    status,
+                    kind,
+                    yes,
+                };
+                memory_cli::remove(&socket, dir, forgetting)?;
+            }
             Some(MemoryCommand::Distill { name }) => memory_cli::distill(&socket, &name)?,
             Some(MemoryCommand::Embed) => memory_cli::embed(&socket)?,
             Some(MemoryCommand::Promote { id, yes }) => {

@@ -2448,6 +2448,16 @@
           ],
           "description": "The worktree its files were hashed in; the project's main worktree when it's `None`.",
           "default": null
+        },
+        "used": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0,
+          "description": "When an agent last read it in full, in seconds since the Unix epoch.",
+          "default": null
         }
       },
       "required": [
@@ -4089,6 +4099,11 @@
             "fresh": {
               "type": "boolean",
               "description": "Leave the stale out."
+            },
+            "expired": {
+              "type": "boolean",
+              "description": "The expired too, which are left out otherwise.",
+              "default": false
             },
             "limit": {
               "type": "integer",

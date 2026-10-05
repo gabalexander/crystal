@@ -12842,6 +12842,7 @@ mod tests {
             last_seen: 0,
             anchors: Default::default(),
             checkout: None,
+            used: None,
         };
         let listed = crate::memory::Listed {
             entry,
