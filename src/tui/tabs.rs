@@ -13,6 +13,7 @@
 
 use super::split_tree::{Pane, SplitTree, Way};
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Which shape the tabs are kept in. Tabs kept in the shape before, when a
 /// tab's panes were a list, are read too, the list made a tree; those of
@@ -24,8 +25,14 @@ const VERSION: u32 = 3;
 /// panes were drawn.
 const LISTED: u32 = 2;
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Tab {
+    /// Which tab it is, for as long as this crystal runs: the same through
+    /// a move or a rename, and never another's, so a tab moved is told
+    /// from one closed and another made. Never written down: tabs read
+    /// back are given ids of their own.
+    #[serde(skip)]
+    pub id: u64,
     /// What the user called the tab. Empty until they do: the tab bar
     /// shows only its number then.
     pub name: String,
@@ -50,6 +57,48 @@ pub struct Tab {
     /// The session floating over the panes, in a pane of its own, if one
     /// is. One of the tab's own sessions, and never one split off too.
     pub floating: Option<String>,
+}
+
+/// The id the next tab made is given.
+static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
+impl Default for Tab {
+    fn default() -> Tab {
+        Tab {
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+            name: String::new(),
+            sessions: Vec::new(),
+            selected: None,
+            panes: SplitTree::default(),
+            shown: None,
+            zoomed: false,
+            floating: None,
+        }
+    }
+}
+
+/// Two tabs are alike when they're laid out alike, whichever tabs they
+/// are: what the event loop keeps when the tabs change.
+impl PartialEq for Tab {
+    fn eq(&self, other: &Tab) -> bool {
+        let Tab {
+            id: _,
+            name,
+            sessions,
+            selected,
+            panes,
+            shown,
+            zoomed,
+            floating,
+        } = self;
+        name == &other.name
+            && sessions == &other.sessions
+            && selected == &other.selected
+            && panes == &other.panes
+            && shown == &other.shown
+            && zoomed == &other.zoomed
+            && floating == &other.floating
+    }
 }
 
 impl Tab {
@@ -375,6 +424,7 @@ impl From<KeptTab> for Tab {
             shown: kept.shown,
             zoomed: kept.zoomed,
             floating: kept.floating,
+            ..Tab::default()
         }
     }
 }

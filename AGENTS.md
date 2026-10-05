@@ -72,6 +72,7 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   (a key, a click, its terminal brought to the front), whether each one's terminal has the focus, which says
   where the user is for notifications, an order written to that one and its answer handed back to the command
   waiting, a few seconds at most, or `NoTui`, for the daemon to carry it out itself on the tabs the TUIs keep;
+  what changed in a TUI's tabs and panes, as it reports them, handed to the daemon to tell as events;
   nothing is handed over, as each TUI offers again after a handover saying when it was last used, and a
   command just after the daemon starts waits a moment for one to come back
 - `src/attach.rs`: `crystal attach`: draws a session in your terminal and sends it your keys, your terminal
@@ -91,10 +92,11 @@ whenever what's handed over changes in a way the crystal before couldn't read.
 - `src/viewer.rs`: the client's side of an attach, shared by `crystal attach`, the TUI's pane and the streams,
   which attach as a program rather than the user
 - `src/drive.rs`: `crystal send` (its text from standard input with `-`, a task's run stopped first with
-  `--interrupt`), `wait`, `read` (`--ansi`, `--unwrap`, `--since`), `process-info`, `result`, `answer` and
-  `interrupt`, for driving one session from another or a script; waits listen to the daemon's events about their
-  session, and `wait --output` has the daemon look at its screen, asking again when a handover cuts it; `task
-  --wait`'s run, done or failed; a wait that gives up is a `TimedOut`, which `crystal` exits 2 for
+  `--interrupt`), `wait`, `read` (`--ansi`, `--unwrap`, `--since`), `clear`, `process-info`, `result`,
+  `answer` and `interrupt`, for driving one session from another or a script; waits listen to the daemon's
+  events about their session, and `wait --output` has the daemon look at its screen, asking again when a
+  handover cuts it; `task --wait`'s run, done or failed; a wait that gives up is a `TimedOut`, which `crystal`
+  exits 2 for
 - `src/stream.rs`: `crystal observe` and `control`: a session's terminal as JSON lines, its output base64,
   attached again after a handover, and `control`'s commands on standard input (input, keys, resize, release)
 - `src/api.rs`: `crystal api snapshot`: the sessions, layout, projects, open tasks, flow runs and archive in one
@@ -148,7 +150,10 @@ whenever what's handed over changes in a way the crystal before couldn't read.
     pane or a tab, or a command in the background that says only when it fails; this crystal's release notes,
     off the loop, for `release-notes`; handing the settings view the mouse while it's open; and watching the
     config file, taking a change made by hand in at once, the panes' history following `scrollback_lines`, or
-    saying why it can't be read
+    saying why it can't be read; asking the terminal again every two seconds for the mouse, bracketed paste,
+    focus and the Kitty keyboard flags, which a terminal reset forgets, though not while a mouse button is
+    down, and on a resize for the alternate screen too; and telling the daemon what changed in the tabs and
+    panes once they've held still (see `layout_events.rs`)
   - `app.rs`: the state and how keys and the mouse change it: a sidebar key looked up in the keymap and its
     command run, from the sidebar, the `:` list, after the prefix in a pane or in a pane without it for a key
     written `direct+`; a plugin's first key waiting for its second; a key in a view taken as the key the user
@@ -167,10 +172,17 @@ whenever what's handed over changes in a way the crystal before couldn't read.
       about, in front or not, a layout applied (each of its tabs in place of the tab of its name or after the
       others, or in place of every tab), and the layout the TUI answers with; and carried out with no TUI
       open, on a state made for it from the tabs kept, the sessions and the flow runs, on a screen of an unseen
-      session's size; a plugin's pane over the panes left to the event loop to show
+      session's size, with the events for what it changed; a plugin's pane over the panes left to the event
+      loop to show; and the look the TUI's layout events are told from
+  - `layout_events.rs`: what changed in a TUI's tabs and panes, as events for plugins (`tab.*`, `pane.focused`,
+    `pane.moved`, `layout.updated`, `project.focused`), found from a look at the layout before and after, by
+    each tab's id; the event loop looks once the layout has held still for a moment, so a key held down or a
+    border dragged is one event, and the user stays on their session while the selection rests on no session;
+    pure, so it's unit-tested
   - `layout_link.rs`: the TUI's end of the layout commands: offering the daemon to take them, again at once
     after a handover or a restart, each one an event for the loop, and its answers, that it was used (a
-    key, the mouse, a paste, focus gained) and when its terminal gains and loses the focus  sent back
+    key, the mouse, a paste, focus gained), when its terminal gains and loses the focus, and what changed in
+    its tabs and panes, as events, sent back
   - `ui.rs`: the layout and drawing (the tab bar, on top or over the footer or left out, its tabs and what
     it shows at its right, the counts of what's open on the selected session's forge first, which a click
     lists, pane headers, footer and its readout of the memory crystal takes, the column each pane's
@@ -181,8 +193,10 @@ whenever what's handed over changes in a way the crystal before couldn't read.
     dragged thumb takes it, and drawing it; pure, so it's unit-tested
   - `tabs.rs`: tabs, as many as the user likes, each holding its own sessions (each session in exactly one)
     with its own selection, its tree of panes, the session the selection's pane last showed and the session
-    floating over them, their order and which is in front; the sidebar shows only that tab's sessions. Kept apart from I/O; the event loop keeps
-    them in the database, and tabs kept from when a tab's panes were a list are read as a tree
+    floating over them, their order and which is in front; the sidebar shows only that tab's sessions; each
+    tab's id while crystal runs, never kept, which tells a tab moved from one closed and another made. Kept
+    apart from I/O; the event loop keeps them in the database, and tabs kept from when a tab's panes were a
+    list are read as a tree
   - `split_tree.rs`: a tab's panes as a tree of splits, right or down at a ratio, at any depth, one pane
     following the selection: laying them out, borders, the pane beside another on screen, splitting, closing,
     swapping, resizing within each pane's least size, dragging a border, giving a pane's side of a split a share
@@ -323,7 +337,7 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   - `timeline.rs`: the timeline (`a`, and `I` for the selected session's): the event log of everything or
     of one scope, a session, its task or its project, read back a page at a time, the newest first, and
     followed while it's open, `Ctrl+S` going through the selection's scopes, filtered as you type and by
-    kind, what's new since the user was away marked, the line the bar is on read whole, and its drawing;
+    kind (the layout's among them), what's new since the user was away marked, the line the bar is on read whole, and its drawing;
     kept apart from I/O, and events of kinds it doesn't know are listed by their name and what they say
   - `handoff_view.rs`: the handoff view (`M`): the selected session's worktree's handoff notes and the files
     its task kept, listed, the one the bar is on previewed, and opened in the editor; its state and keys,
@@ -354,7 +368,8 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   looked for hourly and as each task closes; archives sessions, the distiller reading what one did, and starts
   them again,
   stops agents left idle past `[sessions] stop_idle_after`, has the sessions running keep the history
-  `scrollback_lines` says, and keeps the list of projects sessions ran in;
+  `scrollback_lines` says, and keeps the list of projects sessions ran in, telling each one that goes on it or
+  off it;
   after a cold restart, puts the sessions written down back in their places and starts them again, agents
   `[sessions] restart_spacing_ms` apart on a thread of their own, those that can't start kept, failed, saying
   why, a name the user gave still theirs, and with `[sessions] restore_screens` a terminal below what it
@@ -448,7 +463,8 @@ whenever what's handed over changes in a way the crystal before couldn't read.
 - `src/typing.rs`: typing into a session the way a person would: pastes marked, Enter on its own
 - `src/session.rs`: one program in a PTY, or a task: spawn, exit status, stop, its screen (120 by 40 until a viewer
   sizes it), viewers (the user, or a program, which doesn't count as watching) and listeners, the output lately
-  in an `OutputRing` and reading the screen as `crystal read` asks, the waits for output looking at it, the agent that says what it's doing
+  in an `OutputRing` and reading the screen as `crystal read` asks, the waits for output looking at it, clearing
+  its screen and history but the cursor's line, its own and every viewer's, the program sent nothing, the agent that says what it's doing
   itself while it holds the session, the pull request and the issue it's about apart from any task, the
   conversation its agent's hooks named, which counts once the agent has worked on a turn in it, an agent typed
   into its shell whose conversation a restart resumes while it's in front, its agent's subagents,
@@ -464,7 +480,8 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   what came since a time, or that it can't say, for `crystal read --since`; adapted from docket's
 - `src/vt.rs`: a terminal's screen, through `alacritty_terminal`: what a program drew and its history, read as
   text a row or a line at a time, with its colors as SGR codes or not, the modes it set, its answers to the program's questions (the daemon's screen only), the output that catches a new viewer
-  up (its hyperlinks included), the cells to draw, the input modes `crystal attach` asks your terminal for, and,
+  up (its hyperlinks included), the output that clears the screen and its history but for the cursor's line,
+  for the daemon to give its screen and every viewer's alike, the cells to draw, the input modes `crystal attach` asks your terminal for, and,
   for a viewer, copy mode's cursor, selection (of characters, words, lines or a block) and search, which are
   Alacritty's vi mode, where a search being typed began (`vt::Spot`, counted from the top of the history, so
   output meanwhile doesn't move it), to search from at each key and go back to, and the link on a cell: a hyperlink a program wrote (OSC 8), or a URL in the text across
@@ -630,7 +647,8 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   and, with `unfocused_only`, while no TUI's terminal has the focus (where the user is, as the TUIs say, kept
   for the daemon): desktop notifications a click on takes them to the session, `notify-send`'s text escaped
   for a server that says it reads markup (asked once, with `gdbus` or `dbus-send`), or their own command;
-  `crystal notify`'s too; and the sound at the same moments
+  `crystal notify`'s too, under a title of its own and with the sound it names or none; and the sound at the
+  same moments
 - `src/sound.rs`: the sounds (`assets/sounds/`, herdr's): which plays for an agent asking or done, the user's own
   files and the agents they're off for (`[sound]`), and playing one with the system's player, off the thread
   that asked, stopped if it hangs

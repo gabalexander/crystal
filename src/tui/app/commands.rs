@@ -6,11 +6,13 @@
 //! session, and a layout applied that says which tab is in front.
 
 use super::{Action, App, PluginPane, Popup, Slot, resize_step};
+use crate::events::Event;
 use crate::flow_run::FlowRun;
 use crate::layout::{Command, Layout, NO_TUI, Order, TabLayout, Tile};
 use crate::notify::Presence;
 use crate::protocol::SessionInfo;
 use crate::session::UNSEEN_SIZE;
+use crate::tui::layout_events::{self, Focus, Look};
 use crate::tui::split_tree::{Direction, Pane, SplitTree, Way};
 use crate::tui::tabs::Tabs;
 use crate::tui::ui::Areas;
@@ -24,6 +26,8 @@ pub struct Alone {
     pub tabs: Tabs,
     /// The sessions a tab closed with them leaves to be killed.
     pub kill: Vec<String>,
+    /// What it changed, as events: see [`layout_events`].
+    pub events: Vec<Event>,
 }
 
 impl App {
@@ -50,6 +54,12 @@ impl App {
         app.set_sessions(sessions);
         app.set_tabs(tabs);
         app.set_tiles(Areas::of(&app, screen).tiles);
+        // Nobody is at a TUI to be on a session: what changed is the tabs.
+        let look = |app: &App| Look {
+            focused: None,
+            ..app.look()
+        };
+        let before = look(&app);
         let kill = match app.obey(order)? {
             Some(Action::KillAll(names)) => names,
             _ => Vec::new(),
@@ -58,7 +68,18 @@ impl App {
             layout: app.layout(),
             tabs: app.tabs_to_keep(),
             kill,
+            events: layout_events::changes(&before, &look(&app), &app.sessions),
         })
+    }
+
+    /// The tabs, with their ids, and the session the user is on, to tell
+    /// what changed in them: see [`layout_events`].
+    pub fn look(&self) -> Look {
+        let ids = self.tabs.all().iter().map(|tab| tab.id);
+        Look {
+            tabs: ids.zip(self.layout().tabs).collect(),
+            focused: self.selected().map(Focus::of),
+        }
     }
 
     /// Carries out a layout command from the command line, or says why it

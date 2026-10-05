@@ -280,6 +280,12 @@ after. `scroll_lines` is how far a notch of the wheel scrolls, and `scrollbars =
 column back to the pane. `capture = false` leaves the mouse to your terminal altogether: its own selection
 works with no key held, but nothing in crystal answers a click, and no program in a pane gets one either.
 
+A terminal can forget it was asked for the mouse: iTerm2's Session ▸ Reset does, and so does a stray reset
+written to it, after which every click goes to the terminal and the wheel scrolls its own scrollback. The TUI
+asks for the mouse again every two seconds, with bracketed paste, focus reports and the keys it tells apart,
+though never in the middle of a drag, so the mouse comes back on its own; resizing the window goes back to the
+TUI's screen too, should the terminal have left it, and draws all of it again.
+
 `Ctrl`+click opens a link in a pane, whoever has the mouse there: a URL written out in the text (`http://`,
 `https://` or `file://`), whole across the rows it wrapped onto, or a hyperlink a program wrote (OSC 8), which
 goes where it points rather than to the text it shows. Hold `Ctrl` and move the mouse over one to see it
@@ -447,6 +453,15 @@ unfocused_only = true   # only while no crystal TUI's terminal has the focus
 
 `crystal notify` sends a notification of your own, through the same settings: a script's `crystal notify
 "deploy finished"`, or an agent's, which a click takes you back to its session (`-n <name>` names another).
+`--title` gives it a title of its own in place of crystal's, or alone, with no message, is what it says, and
+`--sound` plays the `request` sound (the default), the `done` one, or `none`:
+
+```sh
+crystal notify --title "Deploy" --sound done "api is out, 0 errors"
+crystal notify -t "build failed" -s none
+```
+
+A `notify_command` of your own finds the title in `CRYSTAL_NOTICE_TITLE`, beside `CRYSTAL_NOTICE`.
 
 A sound plays at the same moments: one for an agent asking you something, another for one that's done.
 crystal plays them with `afplay` on macOS, and on Linux with the first of `paplay`, `pw-play`, `ffplay`,
@@ -506,6 +521,7 @@ crystal wait review                         # block until its agent stops workin
 crystal read review --lines 20              # print the last 20 rows of its screen
 crystal read review --history               # and what scrolled off it before
 crystal read review --since 10m             # only what it wrote in the last ten minutes
+crystal clear -n review                     # clear its screen and history but its prompt line
 crystal ps review                           # what runs in its terminal, and where (process-info)
 crystal observe review                      # its terminal as JSON lines, for a program; `control` drives it
 crystal api snapshot                        # everything at once, as JSON, for a client of your own
@@ -998,6 +1014,14 @@ as a session of its own, in the session's directory, called after it (`claude-hi
 so you can search, copy or save from it with the editor you know. It works on a session that has ended too. The
 text is a copy, written beside the daemon's state in `~/.local/state/crystal/history/`: the session goes on as
 before, and editing the file changes nothing in it.
+
+`clear-pane` clears the selected session's screen and its history, but for the line its cursor is on, which goes
+to the top: a shell's prompt and what's typed on it, the rows it wrapped onto too. Its program is sent nothing,
+not even a `Ctrl+L`, so a command half typed stays as it was; every pane and `crystal attach` showing it is
+cleared with it, and a program on the alternate screen, like an editor or `less`, is left alone, as it draws all
+of it. What's cleared can't be had back, so it has no key until you give it one (`clear-pane = "ctrl+l"` under
+`[keys]`); the [command list](#keys-and-commands) and a pane's right-click menu have it, and `crystal clear`
+does the same from a shell, for the session it runs in or the one `-n` names.
 
 ### Starting a session
 
@@ -1737,6 +1761,10 @@ before, so a line or two from up to a second before may come in. When that MiB d
 the program wrote before a `restart-server` handed it over, `--since` prints the history and the screen whole.
 `--ansi` keeps the style of the text as SGR codes, and nothing that moves the cursor or makes a link.
 
+`crystal clear` clears a session's screen and history but for the line its cursor is on, sending its program
+nothing: the one it's run in, or the one `-n` names. It's the TUI's
+[`clear-pane`](#zoom-copy-mode-and-search), and like it, leaves a program on the alternate screen alone.
+
 `crystal process-info <session>` (or `ps`) lists what runs in its terminal: the processes in front, the job
 its keys go to, a line each, with its pid, its name, the directory it works in and its command; `--json` adds
 the session's own program's pid and the foreground process group.
@@ -1947,7 +1975,8 @@ changed since; it never installs the skill where it isn't, or writes over one yo
 
 The daemon writes down everything that happens in an event log, kept in crystal's database
 (`~/.local/state/crystal/crystal.db`): sessions starting, working, waiting and ending, tasks opening and
-closing, background runs, what they asked and what they cost, flows, worktrees, memory and the backlog.
+closing, background runs, what they asked and what they cost, flows, worktrees, memory and the backlog, and
+the TUI's tabs and panes and the session you're on.
 `crystal events` prints it, one line each, the oldest first:
 
 ```sh
@@ -1978,7 +2007,9 @@ Each line of `--json` is one event, the same JSON the log keeps and plugins get:
 going back), `at` (milliseconds since the Unix epoch), its name as `event`, the `project` it's about, the
 `session` (its `name`, `id`, `command`, `cwd`, `project`, `worktree`, `branch`, `activity`, `task`, and its
 number as `task_id`, `status`, as `ls` words it, and `reporter` while an agent that reports for itself holds it), and what its kind carries:
-`from` (a renamed session's old name, what its agent was doing before, or the agent that let go), `task` (with
+`from` (a renamed session's old name, what its agent was doing before, or the agent that let go; a renamed
+tab's old name, a moved tab's number before, the number of the tab a session moved from, or the session or
+project you were on before), `tab` (the tab, as [`crystal layout --json`](#tabs) has it), `task` (with
 its `id`, `pending`, `waiting` and, once closed, its `outcome` and the `artifacts` kept with it), `run`
 (`prompt`; `asking`, with its `tool` and `gist`, and the `decision`; then `failed`, `answer` and `cost_usd`),
 `flow` (`run`, `flow`, `goal`, `step`, `state`, `said`, `cost_usd`), `worktree`, `handoff` (the file's `path`
@@ -2013,7 +2044,7 @@ so one done with no daemon running isn't written down.
 about, and what it says. It's live: while it's open, new events come in on top, and the bar stays on the line
 it was on. Type to filter the lines by anything in them (`fixer`, `task.closed`, `failed`, a branch), and
 `Tab` and `Shift+Tab` narrow them to one kind: sessions and worktrees, tasks with their runs, handoff notes
-and the backlog, flows, memory, or the others. `↑` and `↓` move; the line the bar is on is read whole under
+and the backlog, flows, memory, the tabs, panes and focus of the layout, or the others. `↑` and `↓` move; the line the bar is on is read whole under
 the list, with everything its event carries, and `PgUp` and `PgDn` scroll it. `Enter` goes to the session the
 line is about, whatever it's called now (for a flow run, its latest step's); `Esc` clears the filter, then
 closes. The timeline reads the log a page at a time, and further back as the bar reaches the end.
@@ -2961,6 +2992,17 @@ matched anywhere in the link unless `^` and `$` pin it. `X` lists each plugin's 
 | `plugin.paused` | a plugin is paused for failing |
 | `daemon.handed_over` | the daemon is handed over to another crystal, its sessions carrying on (see `restart-server`) |
 | `daemon.restarted` | the daemon, restarted cold, has started the sessions that were running again: its `daemon` says how many came back (`sessions`) and which couldn't (`failed`) |
+| `tab.created` | a TUI makes a tab: `t`, `crystal tab new`, a layout put back |
+| `tab.closed` | a TUI closes one; its `tab` is as it was |
+| `tab.renamed` | a tab is named, or its name taken back: its `from` is the name it had, empty for none |
+| `tab.moved` | a tab moves to another place among the tabs: its `from` is the number it had |
+| `tab.focused` | another tab comes to the front: its `from` is the number of the one in front before |
+| `pane.focused` | the selection settles on another session, the one you're on, in the sidebar or a pane: its `session`, the `tab` it's in, and the session you were on as `from` |
+| `pane.moved` | a session moves to another tab: its `from` is the number of the tab it left |
+| `layout.updated` | a tab's panes change: split, closed, resized, swapped, zoomed, floated or evened out; its `tab` has them |
+| `project.added` | a project goes on crystal's list: `crystal project add`, or a session starting in it |
+| `project.removed` | a project is taken off it |
+| `project.focused` | the selection settles on a session in another project: its `from` is the project you were in |
 
 A hook gets the event as a line of JSON on its standard input, the same as the [event log](#events) keeps it,
 and its name in `CRYSTAL_EVENT`:
@@ -2972,7 +3014,11 @@ and its name in `CRYSTAL_EVENT`:
 ```
 
 `task.closed` has a `task`, with its `goal`, `session`, `project`, `branch` and `outcome` (whether it `failed`,
-its `summary`, and when it `closed`). The worktree events have a `worktree`, with its `path`, `branch` and
+its `summary`, and when it `closed`). The tab and pane events have a `tab`, the tab as `crystal layout --json`
+has it: its `number`, `name`, the `sessions` in it, the one `selected`, and its `panes`. A TUI tells what
+changed in its tabs and panes once they've held still for a moment, so `j` held down through the sidebar, or a
+border dragged across the screen, is one event, about where it ended; with no TUI open, the daemon tells what
+a [layout command](#tabs) changed, but for the session you're on, as you aren't on one. The worktree events have a `worktree`, with its `path`, `branch` and
 `project`, and for `worktree.hook_failed`, `why`. `session.message` has a `message`, with its first `line` and,
 when another session sent it, that session's name (`from`) and id (`from_id`). The rest are under
 [events](#events).

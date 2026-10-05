@@ -3975,6 +3975,40 @@ fn read_prints_the_screen_and_lines_keeps_the_last_rows() {
 }
 
 #[test]
+fn clear_keeps_only_the_prompt_line_in_the_session_and_every_viewer() {
+    let crystal = Crystal::new();
+    let script = r"for i in $(seq 1 60); do echo line $i; done; printf 'ready> '; read x; sleep 30";
+    crystal.ok(&["new", "-n", "shell", "sh", "-c", script]);
+    shows_on_screen(&crystal, "shell", "ready>");
+    let terminal = crystal.terminal(&["attach", "shell"]);
+    terminal.shows("ready>");
+    assert!(
+        crystal
+            .ok(&["read", "shell", "--history"])
+            .contains("line 1\n")
+    );
+
+    crystal.ok(&["clear", "-n", "shell"]);
+    assert_eq!(crystal.ok(&["read", "shell", "--history"]), "ready>\n");
+    // The viewer is cleared with it, its prompt at the top.
+    terminal.hides("line 60");
+    assert!(terminal.text().starts_with("ready>"), "{}", terminal.text());
+    // The program was sent nothing: it still waits on its line.
+    crystal.ok(&["send", "shell", "go"]);
+    shows_on_screen(&crystal, "shell", "ready> go");
+
+    // A program on the alternate screen draws all of it.
+    let alternate = r"printf '\033[?1049hfull screen'; sleep 30";
+    crystal.ok(&["new", "-n", "editor", "sh", "-c", alternate]);
+    shows_on_screen(&crystal, "editor", "full screen");
+    let said = crystal.fails(&["clear", "-n", "editor"]);
+    assert!(said.contains("alternate screen"), "{said}");
+    // Outside a session, it has to be told which.
+    let said = crystal.fails(&["clear"]);
+    assert!(said.contains("-n <session>"), "{said}");
+}
+
+#[test]
 fn wait_returns_how_a_program_ended() {
     let crystal = Crystal::new();
     crystal.ok(&["new", "-n", "brief", "sh", "-c", "read go; exit 4"]);
@@ -5761,6 +5795,57 @@ fn the_theme_follows_the_systems_appearance_while_the_tui_runs() {
 }
 
 #[test]
+fn what_changes_in_the_layout_is_an_event_with_a_tui_open_or_none() {
+    let crystal = Crystal::new();
+    sessions_saying_here(&crystal, &["alpha", "beta"]);
+    let layout = || {
+        let kinds = ["-k", "tab.*", "-k", "pane.*", "-k", "layout.*"];
+        events(&crystal, &kinds)
+    };
+
+    // With no TUI open, the daemon tells what a command changed.
+    crystal.ok(&["tab", "new", "scratch"]);
+    crystal.ok(&["tab", "move", "beta", "scratch"]);
+    let told = layout();
+    assert_eq!(names(&told), ["tab.created", "tab.focused", "pane.moved"]);
+    assert_eq!(told[0]["tab"]["name"], "scratch");
+    assert_eq!(told[1]["from"], "1");
+    assert_eq!(told[2]["session"]["name"], "beta");
+    assert_eq!(told[2]["from"], "1");
+    assert_eq!(told[2]["tab"]["sessions"][0], "beta");
+
+    // A TUI tells what changed once it has held still: the user on
+    // another session, a tab brought to the front and named.
+    let tui = crystal.tui();
+    sidebar_shows(&tui, "beta");
+    crystal.ok(&["pane", "focus", "alpha"]);
+    crystal.ok(&["tab", "rename", "1", "main"]);
+    eventually("the TUI tells it", || layout().len() == 6);
+    let told = layout();
+    assert_eq!(
+        names(&told[3..]),
+        ["tab.renamed", "tab.focused", "pane.focused"]
+    );
+    assert_eq!(told[3]["tab"]["name"], "main");
+    assert_eq!(told[3]["from"], "");
+    assert_eq!(told[4]["tab"]["number"], 1);
+    assert_eq!(told[5]["session"]["name"], "alpha");
+    assert_eq!(told[5]["from"], "beta");
+    crystal.ok(&["pane", "split", "beta", "--beside", "alpha"]);
+    eventually("the TUI tells it", || layout().len() >= 7);
+    let told = layout();
+    assert_eq!(names(&told[6..]), ["pane.moved", "layout.updated"]);
+    assert_eq!(told[7]["tab"]["panes"]["kind"], "split");
+
+    // Crystal's list of projects is told too.
+    let app = git_repo(crystal.dir.path(), "app");
+    crystal.ok(&["project", "add", app.to_str().unwrap()]);
+    crystal.ok(&["project", "rm", app.to_str().unwrap()]);
+    let listed = names(&events(&crystal, &["-k", "project.*"]));
+    assert_eq!(listed, ["project.added", "project.removed"]);
+}
+
+#[test]
 fn layout_commands_with_no_tui_open_lay_out_the_tabs_it_opens_with() {
     let crystal = Crystal::new();
     // With no daemon running even, one starts, and there's the one tab.
@@ -6964,6 +7049,28 @@ fn crystal_notify_tells_the_user_and_its_click_goes_to_the_session() {
         String::from_utf8_lossy(&clicked.stderr)
     );
     tui.shows("❯ agent");
+}
+
+#[test]
+fn crystal_notify_gives_the_notification_a_title_of_its_own() {
+    let crystal = Crystal::new();
+    let notices = crystal.notices_like("$CRYSTAL_NOTICE_TITLE|$CRYSTAL_NOTICE", "");
+    crystal.ok(&["new", "-n", "agent", "sleep", "30"]);
+
+    crystal.ok(&[
+        "notify", "--title", "Deploy", "--sound", "none", "it's", "out",
+    ]);
+    eventually("the user is told", || {
+        lines_in(&notices) == ["Deploy|it's out"]
+    });
+    // A title alone is what it says.
+    crystal.ok(&["notify", "-t", "build failed", "-s", "done", "-n", "agent"]);
+    eventually("the user is told", || lines_in(&notices).len() == 2);
+    assert_eq!(lines_in(&notices)[1], "crystal|agent: build failed");
+    let err = crystal.fails(&["notify"]);
+    assert!(err.contains("<MESSAGE>"), "{err}");
+    let err = crystal.fails(&["notify", "-t", " "]);
+    assert!(err.contains("say what to tell the user"), "{err}");
 }
 
 /// What a terminal sends for a click at `(column, row)` on its screen,

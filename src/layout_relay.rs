@@ -13,13 +13,14 @@
 //!
 //! A TUI also says when its terminal gains and loses the focus, so the
 //! daemon knows whether the user is at crystal at all: see
-//! [`notify::Presence`].
+//! [`notify::Presence`]; and what changed in its tabs and panes, which the
+//! daemon tells as events.
 //!
 //! Nothing here is handed over: a handover, or any restart, cuts every
 //! TUI's connection, and each offers again at once, saying when it was last
 //! used, so the next daemon knows which was used last as they come back.
 
-use crate::events::now_ms;
+use crate::events::{Event, now_ms};
 use crate::layout::{Layout, NO_TUI, Order, Relayed, Report};
 use crate::notify::{self, Presence};
 use crate::protocol::{self, Response};
@@ -96,9 +97,16 @@ impl Relay {
     }
 
     /// Takes the connection of a TUI that offers to take orders, last used
-    /// at `used`, and reads what it reports until it hangs up. The orders
-    /// waiting on its answer then fail.
-    pub fn serve(&self, conn: &UnixStream, mut input: impl BufRead, used: u64) -> Result<()> {
+    /// at `used`, and reads what it reports until it hangs up, handing
+    /// what changed in its layout to `tell`. The orders waiting on its
+    /// answer then fail.
+    pub fn serve(
+        &self,
+        conn: &UnixStream,
+        mut input: impl BufRead,
+        used: u64,
+        tell: impl Fn(Event),
+    ) -> Result<()> {
         let tui = {
             let mut state = self.state.lock().unwrap();
             // Under the lock, so no order is written ahead of this.
@@ -107,8 +115,13 @@ impl Relay {
         };
         self.came.notify_all();
         while let Ok(Some(report)) = protocol::recv::<Report>(&mut input) {
+            if let Report::Events { events } = report {
+                events.into_iter().for_each(&tell);
+                continue;
+            }
             let mut state = self.state.lock().unwrap();
             match report {
+                Report::Events { .. } => {}
                 Report::Used => state.used(tui, now_ms()),
                 Report::Answer { id, answer } => state.answer(tui, id, answer),
                 Report::Focus { focused } => {
@@ -289,7 +302,7 @@ mod tests {
     }
 
     #[test]
-    fn a_command_just_after_the_daemon_starts_waits_for_a_tui_to_come_back() {
+    fn a_command_just_after_the_daemon_starts_waits_for_a_tui_to_come_back_and_hears_it() {
         let relay = std::sync::Arc::new(Relay::new());
         let passed = std::thread::spawn({
             let relay = relay.clone();
@@ -297,9 +310,13 @@ mod tests {
         });
         std::thread::sleep(Duration::from_millis(100));
         let (daemon, tui) = UnixStream::pair().unwrap();
+        let (told, heard) = mpsc::channel();
         std::thread::spawn({
             let relay = relay.clone();
-            move || relay.serve(&daemon, BufReader::new(daemon.try_clone().unwrap()), 1)
+            move || {
+                let input = BufReader::new(daemon.try_clone().unwrap());
+                relay.serve(&daemon, input, 1, |event| told.send(event).unwrap())
+            }
         });
         let mut tui = BufReader::new(tui);
         let done: Response = protocol::recv(&mut tui).unwrap().unwrap();
@@ -315,6 +332,13 @@ mod tests {
         };
         protocol::send(tui.get_ref(), &answer).unwrap();
         assert_eq!(passed.join().unwrap().unwrap(), layout);
+        // What changed in its layout is told.
+        let focused = crate::events::Event::new(crate::events::Kind::TabFocused);
+        let events = Report::Events {
+            events: vec![focused.clone()],
+        };
+        protocol::send(tui.get_ref(), &events).unwrap();
+        assert_eq!(heard.recv_timeout(Duration::from_secs(5)).unwrap(), focused);
     }
 
     #[test]
