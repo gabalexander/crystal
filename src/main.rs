@@ -99,6 +99,7 @@ use client::Restart;
 use output::{out, outln};
 use profile::{Launch, Profile, StartIn};
 use protocol::{ArchivedSession, Request, Response, SessionInfo, TaskSpec, TaskState};
+use std::collections::BTreeMap;
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -226,15 +227,18 @@ enum Command {
     /// Say what the agent in this session is doing, for an agent crystal
     /// doesn't know or a script wrapped around one, and how to resume it
     /// after a restart: the command after `--`. Its reports are the
-    /// session's status until `--release`. Or, with `--line` and
-    /// `--model` alone, only put a line on its row in the sidebar, or its
-    /// model.
+    /// session's status until `--release`. Or, with `--line`, `--model`,
+    /// `--title`, `--display-agent`, `--state-label` and `--token` alone,
+    /// only put something on its row in the sidebar.
     Report {
         /// What it's doing: working, waiting (on you, which `blocked` says
         /// too), idle (at its prompt) or done (with a turn).
         #[arg(
             value_enum,
-            required_unless_present_any = ["session_only", "release", "line", "model"],
+            required_unless_present_any = [
+                "session_only", "release", "line", "model", "title", "display_agent",
+                "state_label", "token",
+            ],
             conflicts_with_all = ["session_only", "release"]
         )]
         state: Option<ReportedState>,
@@ -250,9 +254,31 @@ enum Command {
         #[arg(long)]
         model: Option<String>,
 
-        /// How long the --line and --model go on showing unless they're
+        /// What a row laid out with `title` says in place of the session's
+        /// name; "" takes it off.
+        #[arg(long)]
+        title: Option<String>,
+
+        /// The agent the row says is in front, in place of what crystal
+        /// reads; "" gives that back.
+        #[arg(long, value_name = "TEXT")]
+        display_agent: Option<String>,
+
+        /// What a row laid out with `state` says for a status: waiting,
+        /// working, done, idle, running, ended, failed or starting, like
+        /// `waiting=needs a key`; an empty label takes it off. Again for
+        /// another.
+        #[arg(long, value_name = "STATUS=TEXT")]
+        state_label: Vec<String>,
+
+        /// A value for a row laid out with `$name` to show, like
+        /// `load=90`; an empty value takes it off. Again for another.
+        #[arg(long, value_name = "NAME=VALUE")]
+        token: Vec<String>,
+
+        /// How long what this puts on the row goes on showing unless it's
         /// reported again, like 30s, 5m or 2h, a day at most [default:
-        /// until they're replaced]
+        /// until it's replaced]
         #[arg(long, value_name = "WHILE")]
         ttl: Option<String>,
 
@@ -467,6 +493,12 @@ enum Command {
     Title {
         #[command(subcommand)]
         command: TitleCommand,
+    },
+    /// Put the sidebar's sessions and projects in an order of your own,
+    /// which lasts across restarts. The TUI used last does it.
+    Sidebar {
+        #[command(subcommand)]
+        command: SidebarCommand,
     },
     /// Print the TUI's tabs: each one's sessions, and how its panes split
     /// the room. Or write them to a layout file, or lay them out the way
@@ -1381,6 +1413,41 @@ enum TabCommand {
 }
 
 #[derive(Subcommand)]
+enum SidebarCommand {
+    /// Move a session up or down among those beside it in its worktree
+    /// (agents among agents, terminals among terminals), or next to one of
+    /// them; or, with --project, a project among the projects.
+    Move {
+        /// The session [default: the one this runs in, or else the one
+        /// selected]
+        #[arg(conflicts_with = "project")]
+        session: Option<String>,
+
+        /// Move a project instead: the one this directory is in [default:
+        /// the current one].
+        #[arg(long, value_name = "DIR", num_args = 0..=1)]
+        project: Option<Option<PathBuf>>,
+
+        /// A place up.
+        #[arg(long, group = "to")]
+        up: bool,
+
+        /// A place down.
+        #[arg(long, group = "to")]
+        down: bool,
+
+        /// Just before this session, or with --project, the project this
+        /// directory is in.
+        #[arg(long, group = "to", value_name = "NAME|DIR")]
+        before: Option<String>,
+
+        /// Just after it.
+        #[arg(long, group = "to", value_name = "NAME|DIR")]
+        after: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
 enum LayoutCommand {
     /// Print the tabs as a layout file, for `layout apply`: as `layout
     /// --json` prints them, with the command and directory that start each
@@ -1775,6 +1842,34 @@ enum ProjectCommand {
         #[arg(short = 'C', long = "dir", value_name = "DIR")]
         dir: Option<PathBuf>,
     },
+    /// Put tokens on the project's rows in the sidebar, for a heading or a
+    /// worktree's row laid out with `$name` to show, as `crystal report
+    /// --token` does for a session's.
+    Report {
+        /// A value to show, like `deploy=green`; an empty value takes it
+        /// off. Again for another.
+        #[arg(long, value_name = "NAME=VALUE", required = true)]
+        token: Vec<String>,
+
+        /// How long they go on showing unless they're reported again,
+        /// like 30s, 5m or 2h, a day at most [default: until they're
+        /// replaced]
+        #[arg(long, value_name = "WHILE")]
+        ttl: Option<String>,
+
+        /// Who sends the report, for --seq: letters, digits and `:._-`.
+        #[arg(long, value_name = "ID")]
+        source: Option<String>,
+
+        /// The report's number from its --source: one numbered no higher
+        /// than the last came late, and is passed over.
+        #[arg(long, value_name = "N")]
+        seq: Option<u64>,
+
+        /// A directory in the project [default: the current one]
+        #[arg(short = 'C', long = "dir", value_name = "DIR")]
+        dir: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2142,6 +2237,10 @@ fn run(cli: Cli) -> Result<()> {
             state,
             line,
             model,
+            title,
+            display_agent,
+            state_label,
+            token,
             ttl,
             source,
             seq,
@@ -2152,19 +2251,23 @@ fn run(cli: Cli) -> Result<()> {
             release,
             resume,
         } => {
-            let shows = line.is_some() || model.is_some();
-            if !shows && ttl.is_some() {
-                bail!("--ttl goes with --line or --model");
-            }
             // Who sent the report, and its number, go with what's on the row
             // and with what the agent is doing alike.
             let metadata = protocol::Metadata {
                 line,
                 model,
+                title,
+                display_agent,
+                state_labels: pairs(&state_label, "--state-label", "STATUS=TEXT")?,
+                tokens: pairs(&token, "--token", "NAME=VALUE")?,
                 ttl_secs: ttl.as_deref().map(report_ttl).transpose()?,
                 source,
                 seq,
             };
+            let shows = metadata.shows();
+            if !shows && ttl.is_some() {
+                bail!("--ttl goes with what's put on the row: --line, --token and the rest");
+            }
             let resume = (!resume.is_empty()).then_some(resume);
             let report = match (state, resume) {
                 _ if release => Some(protocol::AgentReport::Release),
@@ -2234,6 +2337,7 @@ fn run(cli: Cli) -> Result<()> {
         Command::Worktree { command } => worktree(&socket, command)?,
         Command::Project { json, command } => project(&socket, json, command)?,
         Command::Tab { command } => tab(&socket, command)?,
+        Command::Sidebar { command } => sidebar(&socket, command)?,
         Command::Pane { command } => pane(&socket, command)?,
         Command::Title { command } => {
             let text = match command {
@@ -2813,6 +2917,22 @@ fn project(socket: &Path, json: bool, command: Option<ProjectCommand>) -> Result
             None => Ok(()),
         },
         Some(ProjectCommand::Open { dir }) => project_cli::open(&here(dir)?),
+        Some(ProjectCommand::Report {
+            token,
+            ttl,
+            source,
+            seq,
+            dir,
+        }) => {
+            let metadata = protocol::Metadata {
+                tokens: pairs(&token, "--token", "NAME=VALUE")?,
+                ttl_secs: ttl.as_deref().map(report_ttl).transpose()?,
+                source,
+                seq,
+                ..protocol::Metadata::default()
+            };
+            project_cli::report(socket, &here(dir)?, metadata)
+        }
     }
 }
 
@@ -3021,6 +3141,47 @@ fn tab(socket: &Path, command: TabCommand) -> Result<()> {
     Ok(())
 }
 
+/// `crystal sidebar` and its commands.
+fn sidebar(socket: &Path, command: SidebarCommand) -> Result<()> {
+    let SidebarCommand::Move {
+        session,
+        project,
+        up,
+        down,
+        before,
+        after,
+    } = command;
+    // A project goes by its main worktree, whatever directory in it is
+    // given.
+    let main_worktree =
+        |dir: Option<PathBuf>| -> Result<PathBuf> { Ok(project::of(&here(dir)?).path) };
+    let named = |other: String| -> Result<String> {
+        match project {
+            Some(_) => Ok(main_worktree(Some(PathBuf::from(other)))?
+                .to_string_lossy()
+                .into_owned()),
+            None => Ok(other),
+        }
+    };
+    let to = match (up, down, before, after) {
+        (true, ..) => layout::SidebarPlace::Up,
+        (_, true, ..) => layout::SidebarPlace::Down,
+        (_, _, Some(other), _) => layout::SidebarPlace::Before(named(other)?),
+        (_, _, _, Some(other)) => layout::SidebarPlace::After(named(other)?),
+        _ => bail!("say where it goes: --up, --down, --before or --after"),
+    };
+    let project = project.map(main_worktree).transpose()?;
+    client::lay_out(
+        socket,
+        layout::Command::SidebarMove {
+            session,
+            project,
+            to,
+        },
+    )?;
+    Ok(())
+}
+
 /// `crystal pane` and its commands.
 fn pane(socket: &Path, command: PaneCommand) -> Result<()> {
     let command = match command {
@@ -3226,6 +3387,20 @@ fn seconds(seconds: Option<f64>) -> Option<Duration> {
 
 /// `crystal report --ttl`, in seconds: a while written the way the
 /// settings write one, a day at most.
+/// The `NAME=VALUE`s given with `flag`, by their names, the value cut at
+/// the first `=`; one given again replaces the one before.
+fn pairs(given: &[String], flag: &str, shape: &str) -> Result<BTreeMap<String, String>> {
+    given
+        .iter()
+        .map(|pair| match pair.split_once('=') {
+            Some((name, value)) if !name.trim().is_empty() => {
+                Ok((name.trim().to_string(), value.to_string()))
+            }
+            _ => bail!("{flag} is {shape}, like {flag} load=90: not `{pair}`"),
+        })
+        .collect()
+}
+
 fn report_ttl(ttl: &str) -> Result<u64> {
     let ttl = config::duration(ttl)?
         .filter(|ttl| *ttl <= report::LONGEST_TTL)

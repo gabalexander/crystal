@@ -1,5 +1,5 @@
-//! Laying out the TUI from the command line: `crystal tab`, `crystal pane`
-//! and `crystal layout`. A command goes through the daemon to the TUI used
+//! Laying out the TUI from the command line: `crystal tab`, `crystal pane`,
+//! `crystal sidebar` and `crystal layout`. A command goes through the daemon to the TUI used
 //! last, which carries it out and answers with the layout it came to: see
 //! [`crate::layout_relay`]. With no TUI open, the daemon carries it out
 //! itself, the same way, on the tabs the TUIs keep in the database, where
@@ -12,6 +12,7 @@ use crate::notify::Presence;
 use crate::tui::keymap::Extent;
 use crate::tui::split_tree::{Direction, Way};
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 /// Why an order can't be passed on to a TUI: none is open.
 pub const NO_TUI: &str = "no TUI is running";
@@ -110,6 +111,16 @@ pub enum Command {
     /// Give the TUI's terminal the title `text`, in place of the one the
     /// settings make, or with none, go back to that one.
     Title { text: Option<String> },
+    /// Move a session in the sidebar's order by hand, among those beside it
+    /// in its worktree; or, with `project`, the project with its main
+    /// worktree there, among the projects. The order lasts across restarts.
+    SidebarMove {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project: Option<PathBuf>,
+        to: SidebarPlace,
+    },
     /// Lay tabs out as `tabs` has them, their numbers aside: each in place
     /// of the tab with its name, or after the others when it has none or
     /// there's no such tab; or with `replace`, in place of every tab, the
@@ -122,6 +133,18 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         replace: bool,
     },
+}
+
+/// Where `SidebarMove` takes a session or a project: a place up or down,
+/// or next to another, by its name, or a project's main worktree.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum SidebarPlace {
+    Up,
+    Down,
+    Before(String),
+    After(String),
 }
 
 /// How big a popup is: so many cells, or a share of the screen, each way.

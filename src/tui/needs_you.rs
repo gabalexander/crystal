@@ -471,6 +471,7 @@ mod tests {
             unseen_copies: 0,
             context: None,
             output_waits: 0,
+            row: Default::default(),
         }
     }
 

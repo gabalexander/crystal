@@ -17,8 +17,13 @@
 //! With `--line` and `--model`, an agent or a script puts a short line
 //! under its session's row in the sidebar, or the model it runs on, as
 //! herdr's `report-metadata` does: for the sidebar alone, which doesn't
-//! take the status over. Each stays until it's said again or taken off, or
-//! for as long as `--ttl` gives it.
+//! take the status over. With `--display-agent`, the agent the row says is
+//! in front; and with `--title`, `--state-label` and `--token`, what a row
+//! laid out with `title`, `state` and `$name` shows (see
+//! [`crate::tui::rows`]). `crystal project report --token` puts tokens on
+//! a project the same way, for its heading's and its worktrees' rows. Each
+//! stays until it's said again or taken off, or for as long as `--ttl`
+//! gives it.
 //!
 //! Any report can say who sent it, with `--source`, and number it, with
 //! `--seq`: one numbered no higher than the last from the same source came
@@ -29,7 +34,7 @@
 
 use crate::client;
 use crate::printable;
-use crate::protocol::{Activity, AgentEvent, AgentReport, Metadata, Request, Response};
+use crate::protocol::{Activity, AgentEvent, AgentReport, Metadata, Request, Response, RowReport};
 use crate::shell;
 use crate::typing;
 use crate::work;
@@ -60,6 +65,19 @@ pub const LONGEST_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 /// The most sources a session takes numbered reports from, in all its
 /// life.
 const MOST_SOURCES: usize = 32;
+
+/// The most tokens a session or a project shows at once.
+pub const MOST_TOKENS: usize = 32;
+
+/// The longest a token's name may be.
+const LONGEST_TOKEN: usize = 32;
+
+/// The words of the statuses a row's `state` says, which `--state-label`
+/// gives labels by: an agent's, then a program's, then how a session
+/// ended or waits to start.
+pub const STATE_WORDS: [&str; 8] = [
+    "waiting", "working", "done", "idle", "running", "ended", "failed", "starting",
+];
 
 /// Tells the daemon what the agent in the session called `name`, or the
 /// one this runs in, says about itself: what it puts on its row, if
@@ -113,15 +131,24 @@ fn check_source(source: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-/// What's on a session's row by `crystal report --line` and `--model`, in
-/// the daemon: each with when it goes, and the last number each source
-/// gave its reports, of what's on the row and of what its agent is doing.
+/// What's on a session's row by `crystal report --line`, `--model` and the
+/// rest, or on a project's by `crystal project report`, in the daemon: each
+/// with when it goes, and the last number each source gave its reports, of
+/// what's on the row and of what its agent is doing.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Shown {
     #[serde(default)]
     line: Option<Kept>,
     #[serde(default)]
     model: Option<Kept>,
+    #[serde(default)]
+    title: Option<Kept>,
+    #[serde(default)]
+    display_agent: Option<Kept>,
+    #[serde(default)]
+    state_labels: BTreeMap<String, Kept>,
+    #[serde(default)]
+    tokens: BTreeMap<String, Kept>,
     #[serde(default)]
     seqs: BTreeMap<String, u64>,
     /// Handed over by crystals since these were.
@@ -148,9 +175,17 @@ impl Shown {
     /// later report from the same source, and was passed over.
     pub fn take(&mut self, metadata: &Metadata, now: SystemTime) -> Result<bool> {
         ensure!(
-            metadata.line.is_some() || metadata.model.is_some(),
-            "say what to put on the row: --line, --model or both"
+            metadata.shows(),
+            "say what to put on the row: --line, --model, --title, --display-agent, \
+             --state-label or --token"
         );
+        let mut labels = BTreeMap::new();
+        for (word, label) in &metadata.state_labels {
+            labels.insert(state_word(word)?, label);
+        }
+        for name in metadata.tokens.keys() {
+            check_token(name)?;
+        }
         let until = match metadata.ttl_secs {
             Some(secs) => {
                 let ttl = Duration::from_secs(secs);
@@ -162,20 +197,71 @@ impl Shown {
             }
             None => None,
         };
-        if !in_order(&mut self.seqs, metadata.source.as_deref(), metadata.seq)? {
-            return Ok(false);
-        }
         let kept = |text: &str| {
             let text = tidy(text);
             (!text.is_empty()).then_some(Kept { text, until })
         };
+        let put = |map: &mut BTreeMap<String, Kept>, key: &str, text: &str| match kept(text) {
+            Some(kept) => map.insert(key.to_string(), kept),
+            None => map.remove(key),
+        };
+        // The tokens it comes to, those gone by now making room for new
+        // ones, are checked before anything is taken.
+        let mut tokens = self.tokens.clone();
+        tokens.retain(|_, kept| kept.at(now).is_some());
+        for (name, value) in &metadata.tokens {
+            put(&mut tokens, name, value);
+        }
+        ensure!(
+            tokens.len() <= MOST_TOKENS,
+            "a row shows {MOST_TOKENS} tokens at most"
+        );
+        if !in_order(&mut self.seqs, metadata.source.as_deref(), metadata.seq)? {
+            return Ok(false);
+        }
         if let Some(line) = &metadata.line {
             self.line = kept(line);
         }
         if let Some(model) = &metadata.model {
             self.model = kept(model);
         }
+        if let Some(title) = &metadata.title {
+            self.title = kept(title);
+        }
+        if let Some(agent) = &metadata.display_agent {
+            self.display_agent = kept(agent);
+        }
+        for (word, label) in labels {
+            put(&mut self.state_labels, word, label);
+        }
+        self.tokens = tokens;
         Ok(true)
+    }
+
+    /// The rest of what's on the row at `now`, while each lasts.
+    pub fn row(&self, now: SystemTime) -> RowReport {
+        let live = |map: &BTreeMap<String, Kept>| {
+            map.iter()
+                .filter_map(|(key, kept)| Some((key.clone(), kept.at(now)?.to_string())))
+                .collect()
+        };
+        RowReport {
+            title: self
+                .title
+                .as_ref()
+                .and_then(|kept| kept.at(now))
+                .map(String::from),
+            display_agent: (self.display_agent.as_ref())
+                .and_then(|kept| kept.at(now))
+                .map(String::from),
+            state_labels: live(&self.state_labels),
+            tokens: live(&self.tokens),
+        }
+    }
+
+    /// The tokens on a project's rows at `now`, while each lasts.
+    pub fn tokens(&self, now: SystemTime) -> BTreeMap<String, String> {
+        self.row(now).tokens
     }
 
     /// Whether a report of what the agent is doing, numbered `seq` by
@@ -219,6 +305,35 @@ fn in_order(
     }
     seqs.insert(source.to_string(), seq);
     Ok(true)
+}
+
+/// Refuses a token's name that isn't a short word of letters, digits, `_`
+/// and `-`, starting with a letter: what a layout writes after its `$`.
+pub fn check_token(name: &str) -> Result<()> {
+    let fits = |c: char| c.is_ascii_alphanumeric() || "_-".contains(c);
+    ensure!(
+        name.starts_with(|c: char| c.is_ascii_alphabetic())
+            && name.len() <= LONGEST_TOKEN
+            && name.chars().all(fits),
+        "a token's name is up to {LONGEST_TOKEN} letters, digits, `_` and `-`, starting with a \
+         letter, like `load` or `ci_status`: not `{name}`"
+    );
+    Ok(())
+}
+
+/// The status a `--state-label` is for, by its word: one of
+/// [`STATE_WORDS`], or `blocked`, which `crystal report` takes for
+/// `waiting` too.
+pub fn state_word(word: &str) -> Result<&'static str> {
+    let word = word.trim().to_lowercase();
+    let word = if word == "blocked" { "waiting" } else { &word };
+    match STATE_WORDS.iter().find(|known| **known == word) {
+        Some(known) => Ok(known),
+        None => bail!(
+            "a state label is for one of {}: not `{word}`",
+            STATE_WORDS.join(", ")
+        ),
+    }
 }
 
 /// `text` as a row can show it: on one line, without control characters
@@ -436,6 +551,67 @@ mod tests {
         assert!(shown.status_in_order(Some("hook"), None).unwrap());
         assert!(shown.status_in_order(None, Some(1)).unwrap());
         assert!(shown.status_in_order(Some("a b"), Some(1)).is_err());
+    }
+
+    #[test]
+    fn tokens_are_put_on_and_taken_off_one_at_a_time() {
+        let now = SystemTime::now();
+        let mut shown = Shown::default();
+        let tokens = |pairs: &[(&str, &str)]| Metadata {
+            tokens: pairs
+                .iter()
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .collect(),
+            ..Metadata::default()
+        };
+        shown
+            .take(&tokens(&[("load", " 90 "), ("ci", "green")]), now)
+            .unwrap();
+        shown.take(&tokens(&[("ci", "")]), now).unwrap();
+        let row = shown.row(now);
+        assert_eq!(row.tokens.len(), 1);
+        assert_eq!(row.tokens["load"], "90");
+        assert!(shown.take(&tokens(&[("$load", "1")]), now).is_err());
+        assert!(shown.take(&tokens(&[("9lives", "1")]), now).is_err());
+        let many: Vec<(String, String)> = (0..MOST_TOKENS)
+            .map(|n| (format!("t{n}"), "x".to_string()))
+            .collect();
+        let many: Vec<(&str, &str)> = many.iter().map(|(n, v)| (n.as_str(), v.as_str())).collect();
+        assert!(shown.take(&tokens(&many), now).is_err());
+        // What was there stays when a report is refused.
+        assert_eq!(shown.row(now).tokens.len(), 1);
+    }
+
+    #[test]
+    fn a_title_an_agent_and_state_labels_go_on_the_row() {
+        let now = SystemTime::now();
+        let mut shown = Shown::default();
+        let said = Metadata {
+            title: Some("refund fix".into()),
+            display_agent: Some("pi".into()),
+            state_labels: [("blocked".to_string(), "needs a key".to_string())].into(),
+            ..Metadata::default()
+        };
+        shown.take(&said, now).unwrap();
+        let row = shown.row(now);
+        assert_eq!(row.title.as_deref(), Some("refund fix"));
+        assert_eq!(row.display_agent.as_deref(), Some("pi"));
+        assert_eq!(row.state_labels["waiting"], "needs a key");
+        let unknown = Metadata {
+            state_labels: [("asleep".to_string(), "zz".to_string())].into(),
+            ..Metadata::default()
+        };
+        assert!(shown.take(&unknown, now).is_err());
+        let off = Metadata {
+            title: Some(String::new()),
+            state_labels: [("waiting".to_string(), String::new())].into(),
+            ..Metadata::default()
+        };
+        shown.take(&off, now).unwrap();
+        let row = shown.row(now);
+        assert_eq!(row.title, None);
+        assert!(row.state_labels.is_empty());
+        assert_eq!(row.display_agent.as_deref(), Some("pi"));
     }
 
     #[test]

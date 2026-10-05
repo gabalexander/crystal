@@ -1977,6 +1977,35 @@
         {
           "type": "object",
           "properties": {
+            "session": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "project": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "to": {
+              "$ref": "#/$defs/SidebarPlace"
+            },
+            "do": {
+              "type": "string",
+              "const": "sidebar_move"
+            }
+          },
+          "required": [
+            "do",
+            "to"
+          ],
+          "description": "Move a session in the sidebar's order by hand, among those beside it in its worktree; or, with `project`, the project with its main worktree there, among the projects. The order lasts across restarts."
+        },
+        {
+          "type": "object",
+          "properties": {
             "tabs": {
               "type": "array",
               "items": {
@@ -2207,6 +2236,10 @@
           ],
           "description": "The line an agent or a script put on its row with `crystal report --line`, until it's taken off or its time is up.",
           "default": null
+        },
+        "row": {
+          "$ref": "#/$defs/RowReport",
+          "description": "The rest of what `crystal report` put on its row: a title, the agent it says is in front, labels for its statuses and tokens."
         },
         "bell": {
           "type": "boolean",
@@ -2469,6 +2502,34 @@
           "description": "The model its agent runs on, in place of what crystal reads; empty gives that back.",
           "default": null
         },
+        "title": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "What a row laid out with `title` says in place of the session's name; empty takes it off."
+        },
+        "display_agent": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "What the row says is in front, in place of the agent crystal reads; empty gives that back."
+        },
+        "state_labels": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "What a row laid out with `state` says for a status, by the status's word (`waiting`, `working`, `done`, `idle`, …); an empty one takes that status's off."
+        },
+        "tokens": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "The values of tokens a row laid out with `$name` shows, by their names; an empty one takes that token off. Those not named stay as they were."
+        },
         "ttl_secs": {
           "type": [
             "integer",
@@ -2498,7 +2559,7 @@
           "default": null
         }
       },
-      "description": "What `crystal report --line` and `--model` put on a session's row."
+      "description": "What `crystal report --line`, `--model`, `--title`, `--display-agent`, `--state-label` and `--token` put on a session's row, or `crystal project report --token` on a project's."
     },
     "MovedTo": {
       "type": "object",
@@ -3334,7 +3395,41 @@
             "type",
             "metadata"
           ],
-          "description": "What an agent or a script puts on its session's row with `crystal report --line` or `--model`, for the sidebar alone: it doesn't take the session's status over. Said the way `Request::ReportAgent` is."
+          "description": "What an agent or a script puts on its session's row with `crystal report --line`, `--model`, `--token` and the rest, for the sidebar alone: it doesn't take the session's status over. Said the way `Request::ReportAgent` is."
+        },
+        {
+          "type": "object",
+          "properties": {
+            "project": {
+              "type": "string"
+            },
+            "metadata": {
+              "$ref": "#/$defs/Metadata"
+            },
+            "type": {
+              "type": "string",
+              "const": "report_project"
+            }
+          },
+          "required": [
+            "type",
+            "project",
+            "metadata"
+          ],
+          "description": "The tokens a script puts on the project with its main worktree at `project`, with `crystal project report`, for the sidebar's project and worktree rows to show: `metadata`'s tokens, and nothing else."
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "project_tokens"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "description": "The tokens reported for each project, as they are now."
         },
         {
           "type": "object",
@@ -5103,6 +5198,29 @@
         {
           "type": "object",
           "properties": {
+            "projects": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "object",
+                "additionalProperties": {
+                  "type": "string"
+                }
+              }
+            },
+            "type": {
+              "type": "string",
+              "const": "project_tokens"
+            }
+          },
+          "required": [
+            "type",
+            "projects"
+          ],
+          "description": "The tokens reported for each project that has any, by its main worktree, then by their names."
+        },
+        {
+          "type": "object",
+          "properties": {
             "run": {
               "type": "string"
             },
@@ -5360,6 +5478,40 @@
           ]
         }
       ]
+    },
+    "RowReport": {
+      "type": "object",
+      "properties": {
+        "title": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "What a row laid out with `title` says in place of its name."
+        },
+        "display_agent": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "What the row says is in front, in place of the agent crystal reads."
+        },
+        "state_labels": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "What a row laid out with `state` says for a status, by its word."
+        },
+        "tokens": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "The values of the row's `$name` tokens, by their names."
+        }
+      },
+      "description": "What `crystal report` put on a session's row besides its line and its model, while it lasts: for the sidebar alone."
     },
     "RulesExplained": {
       "type": "object",
@@ -5870,6 +6022,10 @@
           "description": "The line an agent or a script put on its row with `crystal report --line`, until it's taken off or its time is up.",
           "default": null
         },
+        "row": {
+          "$ref": "#/$defs/RowReport",
+          "description": "The rest of what `crystal report` put on its row: a title, the agent it says is in front, labels for its statuses and tokens."
+        },
         "bell": {
           "type": "boolean",
           "description": "Its program rang the terminal's bell while nobody was watching, and nobody has looked at it since.",
@@ -5927,6 +6083,42 @@
         "usage"
       ],
       "description": "What a session's processes take."
+    },
+    "SidebarPlace": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "up",
+            "down"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "before": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "before"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "after": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "after"
+          ],
+          "additionalProperties": false
+        }
+      ],
+      "description": "Where `SidebarMove` takes a session or a project: a place up or down, or next to another, by its name, or a project's main worktree."
     },
     "Since": {
       "oneOf": [

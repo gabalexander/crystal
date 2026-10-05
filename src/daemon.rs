@@ -26,7 +26,7 @@ use crate::front;
 use crate::git::{self, Checkout};
 use crate::handoff;
 use crate::handover::{self, Gate, Ticket};
-use crate::layout::{Layout, Order};
+use crate::layout::{self, Layout, Order};
 use crate::layout_relay::{NoTui, Relay};
 use crate::mcp;
 use crate::memory;
@@ -38,8 +38,8 @@ use crate::printable;
 use crate::project;
 use crate::protocol::{
     self, Activity, AgentEvent, ArchivedSession, Artifact, ArtifactKind, Backlog, Conversation,
-    Frame, Front, NewSession, NewTask, PendingTask, Request, Response, SessionInfo, State,
-    TaskBrief, TaskInfo, TaskOutcome, TaskRecord, TaskSpec, TaskStart, TaskState, TaskView,
+    Frame, Front, Metadata, NewSession, NewTask, PendingTask, Request, Response, SessionInfo,
+    State, TaskBrief, TaskInfo, TaskOutcome, TaskRecord, TaskSpec, TaskStart, TaskState, TaskView,
     Worktree,
 };
 use crate::report;
@@ -347,6 +347,9 @@ struct Daemon {
 struct KnownProjects {
     listed: HashSet<PathBuf>,
     checkouts: HashMap<PathBuf, Option<Checkout>>,
+    /// The tokens `crystal project report` put on each project's rows,
+    /// listed or not.
+    shown: HashMap<PathBuf, report::Shown>,
 }
 
 /// What [`Daemon::prepare_embeddings`] is doing, or why it failed.
@@ -1112,6 +1115,7 @@ impl Daemon {
                 .map(Removal::hand_over)
                 .collect::<std::io::Result<_>>()?,
             moves: moves.iter().map(Move::hand_over).collect(),
+            project_tokens: self.projects.lock().unwrap().shown.clone(),
         };
         let dir = self.socket.parent().unwrap_or(Path::new("/"));
         let file = handover::write(dir, &state)?;
@@ -1138,8 +1142,10 @@ impl Daemon {
             flows,
             removals,
             moves,
+            project_tokens,
             ..
         } = handed;
+        self.projects.lock().unwrap().shown = project_tokens;
         let mut sessions = self.sessions.lock().unwrap();
         let mut again = Vec::new();
         for handed in handed_sessions {
@@ -2196,6 +2202,34 @@ impl Daemon {
                 session.take_metadata(&metadata)?;
                 Ok(Response::Done)
             }
+            Request::ReportProject { project, metadata } => {
+                let only_tokens = Metadata {
+                    tokens: metadata.tokens.clone(),
+                    ttl_secs: metadata.ttl_secs,
+                    source: metadata.source.clone(),
+                    seq: metadata.seq,
+                    ..Metadata::default()
+                };
+                ensure!(
+                    metadata == only_tokens,
+                    "a project's report puts --token on its rows, and nothing else"
+                );
+                let mut projects = self.projects.lock().unwrap();
+                let shown = projects.shown.entry(project).or_default();
+                shown.take(&metadata, SystemTime::now())?;
+                Ok(Response::Done)
+            }
+            Request::ProjectTokens => {
+                let now = SystemTime::now();
+                let projects = self.projects.lock().unwrap();
+                let tokens = projects.shown.iter().map(|(project, shown)| {
+                    let tokens = shown.tokens(now);
+                    (project.clone(), tokens)
+                });
+                Ok(Response::ProjectTokens {
+                    projects: tokens.filter(|(_, tokens)| !tokens.is_empty()).collect(),
+                })
+            }
             Request::Kill { name } => {
                 // An archived session is killed by taking it out of the
                 // archive.
@@ -3091,11 +3125,23 @@ impl Daemon {
         let infos = sessions.iter().map(Session::info).collect();
         drop(sessions);
         let flows = self.flows.lock().unwrap().clone();
+        // Only a move in the sidebar's order changes it, and needs the
+        // projects with no sessions, which move too.
+        let moves = matches!(order.command, layout::Command::SidebarMove { .. });
+        let projects = if moves {
+            self.known_projects()?
+        } else {
+            Vec::new()
+        };
         let db = self.db.lock().unwrap();
-        let kept = db.ui(db::TABS)?;
-        let alone = crate::tui::obey_alone(infos, flows, kept.as_deref(), order)
+        let (tabs, by_hand) = (db.ui(db::TABS)?, db.ui(db::ORDER)?);
+        let kept = (tabs.as_deref(), by_hand.as_deref());
+        let alone = crate::tui::obey_alone(infos, flows, projects, kept, order)
             .map_err(|why| anyhow!(why))?;
         db.keep_ui(db::TABS, &alone.tabs)?;
+        if moves {
+            db.keep_ui(db::ORDER, &alone.by_hand)?;
+        }
         drop(db);
         for name in &alone.kill {
             self.kill(name)?;

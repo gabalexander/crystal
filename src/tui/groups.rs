@@ -3,22 +3,26 @@
 //! directory. The steps of a flow run go together, under the run, after
 //! their project's worktrees, whichever worktree each step ran in.
 //!
-//! Sessions waiting on the user come first without leaving their group: a
-//! project with a waiting session moves to the top, and within its worktree
-//! the waiting session leads. What needs the user is at the top, still next
-//! to the work it belongs to. Within a worktree, its agents come before
-//! its terminals, the shells and other programs beside them, with a line
-//! between the two, so an agent never passes for a shell at a glance.
-//! Everything else stays in the order it was made in, so the list doesn't
-//! shuffle as agents work.
+//! Projects and sessions come in the order they were made in, or the order
+//! the user put them in by hand ([`ByHand`]), which the TUI keeps across
+//! restarts. Ordered by attention, as they are unless `[sidebar] order`
+//! says `stable`, sessions waiting on the user come first without leaving
+//! their group: a project with a waiting session moves to the top, and
+//! within its worktree the waiting session leads. What needs the user is at
+//! the top, still next to the work it belongs to. Within a worktree, its
+//! agents come before its terminals, the shells and other programs beside
+//! them, with a line between the two, so an agent never passes for a shell
+//! at a glance. Nothing else moves as agents work.
 //!
 //! A linked worktree with no sessions left stays at the end of its
 //! project, with a row saying so, until it's removed: it's still on disk,
 //! maybe with work in it, and the sidebar is where it's removed from.
 
+use crate::config::SidebarOrder;
 use crate::flow_run::FlowRun;
 use crate::front;
 use crate::protocol::{Activity, Front, InProgress, SessionInfo, Worktree};
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -59,6 +63,10 @@ pub enum Row {
     /// The line an agent or a script put on the row of the session at this
     /// index, with `crystal report --line`, under its row and its task's.
     Line(usize),
+    /// A line of the session at this index past its first, as `[sidebar]
+    /// rows` lays its lines out: the one at `line`, from 1. Laid out so, a
+    /// session has these in place of its task's and its reported line.
+    More { session: usize, line: usize },
     /// The flow run at this index, heading its steps.
     Flow(usize),
     /// A step of a flow run with no session to show: one still to come, or
@@ -82,10 +90,105 @@ pub enum Row {
     BacklogItem { project: PathBuf, number: u64 },
 }
 
-/// Puts sessions in the sidebar's order. They come in the order they were
-/// made in, which settles every tie. The sessions of `runs`' steps go after
-/// their project's worktrees, a run at a time, each run's in step order.
-pub fn order(sessions: Vec<SessionInfo>, runs: &[FlowRun]) -> Vec<SessionInfo> {
+/// How the sidebar orders its projects and sessions: by attention or not,
+/// and the order the user put them in by hand.
+#[derive(Debug, Clone, Copy)]
+pub struct Sorting<'a> {
+    pub order: SidebarOrder,
+    pub by_hand: &'a ByHand,
+}
+
+/// The order the user put the sidebar's projects in by hand, by their main
+/// worktrees, and its sessions, by their names, which a cold restart keeps
+/// where it doesn't keep their ids: a session renamed takes its place with
+/// it (see [`ByHand::renamed`]). Those it lists go first, in its order;
+/// those it doesn't, after them, in the order they were made. A session's
+/// place counts only among the sessions it's beside, in its worktree.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ByHand {
+    #[serde(default)]
+    pub projects: Vec<PathBuf>,
+    #[serde(default)]
+    pub sessions: Vec<String>,
+}
+
+impl ByHand {
+    /// Where the project at `path` goes among those placed by hand.
+    pub fn project_place(&self, path: &Path) -> usize {
+        place_in(&self.projects, |placed| placed == path)
+    }
+
+    /// Where the session called `name` goes among those placed by hand.
+    pub fn session_place(&self, name: &str) -> usize {
+        place_in(&self.sessions, |placed| placed == name)
+    }
+
+    /// Moves the project at `moved` next to the one at `beside`: after it,
+    /// or before. `projects` are every project there is, in the order they
+    /// stand now, which the list becomes first. Whether that changed it.
+    pub fn place_project(
+        &mut self,
+        projects: Vec<PathBuf>,
+        moved: &Path,
+        beside: &Path,
+        after: bool,
+    ) -> bool {
+        place(&mut self.projects, projects, moved, beside, after)
+    }
+
+    /// The same for the sessions, by their names.
+    pub fn place_session(
+        &mut self,
+        sessions: Vec<String>,
+        moved: &str,
+        beside: &str,
+        after: bool,
+    ) -> bool {
+        place(&mut self.sessions, sessions, moved, beside, after)
+    }
+
+    /// The session called `was` is called `now`: its place goes with it.
+    pub fn renamed(&mut self, was: &str, now: &str) {
+        for name in &mut self.sessions {
+            if name == was {
+                *name = now.to_string();
+            }
+        }
+    }
+}
+
+/// Where the first of `placed` that `is` holds for is, or past them all.
+fn place_in<T>(placed: &[T], is: impl Fn(&T) -> bool) -> usize {
+    placed.iter().position(is).unwrap_or(usize::MAX)
+}
+
+/// `list` as `all` has them, `moved` taken out and put back next to
+/// `beside`, after it or before: whether that changed `list`.
+fn place<T, U>(list: &mut Vec<T>, all: Vec<T>, moved: &U, beside: &U, after: bool) -> bool
+where
+    T: PartialEq<U> + PartialEq,
+    U: ?Sized,
+{
+    let mut placed = all;
+    let Some(from) = placed.iter().position(|item| item == moved) else {
+        return false;
+    };
+    let item = placed.remove(from);
+    let Some(to) = placed.iter().position(|item| item == beside) else {
+        return false;
+    };
+    placed.insert(to + usize::from(after), item);
+    let changed = *list != placed;
+    *list = placed;
+    changed
+}
+
+/// Puts sessions in the sidebar's order, as `sorting` says. They come in
+/// the order they were made in, which settles every tie. The sessions of
+/// `runs`' steps go after their project's worktrees, a run at a time, each
+/// run's in step order.
+pub fn order(sessions: Vec<SessionInfo>, runs: &[FlowRun], sorting: Sorting) -> Vec<SessionInfo> {
+    let attention = sorting.order == SidebarOrder::Attention;
     // Where each project's and each worktree's first session is, and which
     // projects have a session waiting.
     let mut project_first: HashMap<Option<&Path>, usize> = HashMap::new();
@@ -95,7 +198,7 @@ pub fn order(sessions: Vec<SessionInfo>, runs: &[FlowRun]) -> Vec<SessionInfo> {
         let (project, worktree) = group(session);
         project_first.entry(project).or_insert(index);
         worktree_first.entry(worktree).or_insert(index);
-        if is_waiting(session) {
+        if attention && is_waiting(session) {
             waiting_projects.insert(project);
         }
     }
@@ -109,13 +212,15 @@ pub fn order(sessions: Vec<SessionInfo>, runs: &[FlowRun]) -> Vec<SessionInfo> {
             SortKey {
                 outside_git: project.is_none(),
                 project_not_waiting: !waiting_projects.contains(&project),
+                project_by_hand: project.map_or(usize::MAX, |p| sorting.by_hand.project_place(p)),
                 project_first: project_first[&project],
                 in_a_flow: flow_step.is_some(),
                 flow_step: flow_step.unwrap_or_default(),
                 linked: session.worktree.as_ref().is_some_and(|w| !w.main),
                 worktree_first: worktree_first[worktree],
                 terminal: is_terminal(session),
-                not_waiting: !is_waiting(session),
+                not_waiting: !(attention && is_waiting(session)),
+                by_hand: sorting.by_hand.session_place(&session.name),
                 made,
             }
         })
@@ -288,8 +393,11 @@ pub fn flow_step(session: &SessionInfo, runs: &[FlowRun]) -> Option<(usize, usiz
 struct SortKey {
     /// Sessions outside any repository go last.
     outside_git: bool,
-    /// Projects with a session waiting on the user go first…
+    /// Projects with a session waiting on the user go first, by
+    /// attention…
     project_not_waiting: bool,
+    /// …then those placed by hand, in their order…
+    project_by_hand: usize,
     /// …then projects in the order their first sessions were made.
     project_first: usize,
     /// Within a project, the steps of flow runs go after the worktrees…
@@ -304,8 +412,11 @@ struct SortKey {
     /// Within a worktree, agents go before terminals. Only an agent can be
     /// waiting on the user, so a waiting session still leads its worktree…
     terminal: bool,
-    /// …and among the agents, those waiting on the user go first…
+    /// …and among the agents, by attention, those waiting on the user go
+    /// first…
     not_waiting: bool,
+    /// …then those placed by hand, in their order…
+    by_hand: usize,
     /// …then sessions in the order they were made.
     made: usize,
 }
@@ -354,8 +465,15 @@ pub fn is_terminal(session: &SessionInfo) -> bool {
     !matches!(front, Some(Front::Agent { .. } | Front::Task))
 }
 
-fn is_waiting(session: &SessionInfo) -> bool {
+/// Whether the session's agent is waiting on the user.
+pub fn is_waiting(session: &SessionInfo) -> bool {
     session.activity == Some(Activity::Waiting)
+}
+
+/// The project a session is in, by its main worktree, and the worktree, or
+/// its directory outside any repository: where it goes in the sidebar.
+pub fn place_of(session: &SessionInfo) -> (Option<&Path>, &Path) {
+    group(session)
 }
 
 #[cfg(test)]
@@ -396,6 +514,7 @@ mod tests {
             unseen_copies: 0,
             context: None,
             output_waits: 0,
+            row: Default::default(),
         }
     }
 
@@ -423,9 +542,21 @@ mod tests {
         sessions.iter().map(|s| s.name.as_str()).collect()
     }
 
-    /// Most tests have no flow runs.
+    /// Most tests have no flow runs, and order by attention, with nothing
+    /// placed by hand.
     fn order(sessions: Vec<SessionInfo>) -> Vec<SessionInfo> {
-        super::order(sessions, &[])
+        super::order(sessions, &[], attention())
+    }
+
+    fn attention() -> Sorting<'static> {
+        static NONE: ByHand = ByHand {
+            projects: Vec::new(),
+            sessions: Vec::new(),
+        };
+        Sorting {
+            order: SidebarOrder::Attention,
+            by_hand: &NONE,
+        }
     }
 
     /// Most tests have no worktrees without sessions either.
@@ -495,6 +626,7 @@ mod tests {
                 session("a2", "app", "feat"),
             ],
             &runs,
+            attention(),
         );
         assert_eq!(names(&sessions), ["a1", "a2", "plan", "build"]);
         let rows = super::rows(&sessions, &runs, &[], |_| true);
@@ -518,6 +650,7 @@ mod tests {
                 session("build", "app", "main"),
             ],
             &runs,
+            attention(),
         );
         let rows = super::rows(&sessions, &runs, &[], |index| {
             sessions[index].name == "build"
@@ -608,6 +741,82 @@ mod tests {
             waiting(session("w2", "web", "main")),
         ]);
         assert_eq!(names(&sessions), ["w2", "w1", "a1"]);
+    }
+
+    #[test]
+    fn a_stable_order_moves_nothing_as_a_session_comes_to_wait() {
+        let by_hand = ByHand::default();
+        let stable = Sorting {
+            order: SidebarOrder::Stable,
+            by_hand: &by_hand,
+        };
+        let sessions = super::order(
+            vec![
+                agent(session("a1", "app", "main")),
+                agent(session("w1", "web", "main")),
+                waiting(agent(session("w2", "web", "main"))),
+            ],
+            &[],
+            stable,
+        );
+        assert_eq!(names(&sessions), ["a1", "w1", "w2"]);
+    }
+
+    #[test]
+    fn what_s_placed_by_hand_goes_first_in_its_order() {
+        let by_hand = ByHand {
+            projects: vec![PathBuf::from("/code/web")],
+            sessions: vec!["a3".into(), "a1".into()],
+        };
+        let sorting = Sorting {
+            order: SidebarOrder::Attention,
+            by_hand: &by_hand,
+        };
+        let sessions = super::order(
+            vec![
+                agent(session("a1", "app", "main")),
+                agent(session("a2", "app", "main")),
+                agent(session("w1", "web", "main")),
+                agent(session("a3", "app", "main")),
+            ],
+            &[],
+            sorting,
+        );
+        // web was placed first; in app, a3 then a1, then a2, not placed.
+        assert_eq!(names(&sessions), ["w1", "a3", "a1", "a2"]);
+        // By attention, a waiting project still goes to the top, and its
+        // waiting session leads its worktree.
+        let sessions = super::order(
+            vec![
+                agent(session("a1", "app", "main")),
+                waiting(agent(session("a2", "app", "main"))),
+                agent(session("w1", "web", "main")),
+                agent(session("a3", "app", "main")),
+            ],
+            &[],
+            sorting,
+        );
+        assert_eq!(names(&sessions), ["a2", "a3", "a1", "w1"]);
+    }
+
+    #[test]
+    fn a_move_writes_every_place_out_then_moves_one() {
+        let mut by_hand = ByHand::default();
+        let all = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+        assert!(by_hand.place_session(all(&["a", "b", "c"]), "c", "a", false));
+        assert_eq!(by_hand.sessions, ["c", "a", "b"]);
+        assert!(by_hand.place_session(all(&["c", "a", "b"]), "c", "a", true));
+        assert_eq!(by_hand.sessions, ["a", "c", "b"]);
+        // Nothing moves where it is already, or beside what isn't there.
+        assert!(!by_hand.place_session(all(&["a", "c", "b"]), "c", "a", true));
+        assert!(!by_hand.place_session(all(&["a", "c", "b"]), "c", "z", true));
+        by_hand.renamed("c", "fixer");
+        assert_eq!(by_hand.sessions, ["a", "fixer", "b"]);
+        let path = PathBuf::from;
+        let projects = vec![path("/a"), path("/b")];
+        assert!(by_hand.place_project(projects, Path::new("/b"), Path::new("/a"), false));
+        assert_eq!(by_hand.project_place(Path::new("/b")), 0);
+        assert_eq!(by_hand.project_place(Path::new("/c")), usize::MAX);
     }
 
     #[test]

@@ -2,11 +2,14 @@
 //! Nothing here talks to the daemon or draws: when a key needs the outside
 //! world, it comes back as an [`Action`] for the event loop to carry out.
 //! That keeps every state change testable on its own. [`commands`] carries
-//! out the layout commands `crystal tab` and `crystal pane` send.
+//! out the layout commands `crystal tab` and `crystal pane` send, and
+//! [`by_hand`] moves the sidebar's projects and sessions by hand.
 
+mod by_hand;
 mod commands;
 
-pub use commands::Alone;
+pub use by_hand::SidebarGrab;
+pub use commands::{Alone, Kept};
 
 use super::archived_view::{self, ArchivedView};
 use super::away::{Away, Tally};
@@ -17,7 +20,7 @@ use super::compose::Typed;
 use super::diff_view::{self, Against, DiffView};
 use super::finder::Finder;
 use super::grep::Grep;
-use super::groups::{self, Row};
+use super::groups::{self, ByHand, Row};
 use super::handoff_view::{self, HandoffView};
 use super::help;
 use super::issues::{self, IssuesView};
@@ -39,8 +42,10 @@ use super::ram_view::{self, RamView};
 use super::reply::ReplyBox;
 use super::restarted::{Restarted, Restarts};
 use super::review;
+use super::rows::{self, RowLayouts};
 use super::search::{self, Around, StatusFilter};
 use super::settings_view::{self, SettingsView};
+use super::sidebar;
 use super::split_tree::{Direction, Pane, SplitTree, Way};
 use super::status::{Need, Status};
 use super::switcher::{self, Switcher};
@@ -51,8 +56,8 @@ use super::tree_browser::TreeBrowser;
 use crate::catalog::{self, Agent};
 use crate::client::Purpose;
 use crate::config::{
-    BarPosition, Config, EmptiedWorktree, Fold, MouseSettings, SIDEBAR_WIDTHS, SidebarSettings,
-    TabBarSettings,
+    BarPosition, Config, EmptiedWorktree, Fold, MouseSettings, SIDEBAR_WIDTHS, SidebarOrder,
+    SidebarSettings, TabBarSettings,
 };
 use crate::emptied::{self, Emptied};
 use crate::events::{Event, Scope};
@@ -72,7 +77,7 @@ use crate::{backlog, handoff, names, plugins, project, tasks};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
 use ratatui::layout::Rect;
 use std::cell::Cell;
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -1209,6 +1214,21 @@ pub struct App {
     /// Whether the sessions that need the user lead the sidebar, from every
     /// tab.
     pin_needs_you: bool,
+    /// Whether what waits on the user comes first in the sidebar.
+    order: SidebarOrder,
+    /// The order the user put the sidebar's projects and sessions in by
+    /// hand, which the event loop keeps in the database.
+    by_hand: ByHand,
+    /// The sessions' names in the order the daemon listed them, which is
+    /// the order they were made in.
+    made: Vec<String>,
+    /// A sidebar row taken by the mouse, to move it.
+    sidebar_grab: Option<SidebarGrab>,
+    /// How `[sidebar]` lays rows out: crystal's own where it says nothing.
+    row_layouts: RowLayouts,
+    /// The tokens reported for each project, by its main worktree, as the
+    /// daemon last said.
+    project_tokens: BTreeMap<PathBuf, BTreeMap<String, String>>,
     /// Whether the sidebar's edge is being dragged with the mouse.
     dragging_sidebar: bool,
     /// Where the tab bar goes and what it shows at its right.
@@ -1372,6 +1392,12 @@ impl App {
             sidebar: Shape::default(),
             fold: Fold::Marks,
             pin_needs_you: true,
+            order: SidebarOrder::default(),
+            by_hand: ByHand::default(),
+            made: Vec::new(),
+            sidebar_grab: None,
+            row_layouts: RowLayouts::default(),
+            project_tokens: BTreeMap::new(),
             dragging_sidebar: false,
             tab_bar: TabBar {
                 separator: TabBarSettings::default().separator,
@@ -1395,6 +1421,11 @@ impl App {
         }
         self.fold = settings.fold;
         self.pin_needs_you = settings.needs_you;
+        self.row_layouts = RowLayouts::of(settings);
+        if settings.order != self.order {
+            self.order = settings.order;
+            self.sort_again();
+        }
         self.mouse = config.mouse.clone();
         let bar = &config.tab_bar;
         self.tab_bar.position = bar.position;
@@ -2192,7 +2223,24 @@ impl App {
     /// sessions in order again around them.
     pub fn set_flows(&mut self, runs: Vec<FlowRun>) {
         self.flows = runs;
-        self.set_sessions(self.sessions.clone());
+        self.sort_again();
+    }
+
+    /// Puts the sessions in the sidebar's order again, from the order they
+    /// were made in, after something they're ordered by changed.
+    pub(super) fn sort_again(&mut self) {
+        let made = |session: &SessionInfo| self.made.iter().position(|name| *name == session.name);
+        let mut sessions = self.sessions.clone();
+        sessions.sort_by_key(|session| made(session).unwrap_or(usize::MAX));
+        self.set_sessions(sessions);
+    }
+
+    /// How the sidebar orders its projects and sessions.
+    fn sorting(&self) -> groups::Sorting<'_> {
+        groups::Sorting {
+            order: self.order,
+            by_hand: &self.by_hand,
+        }
     }
 
     pub fn flows(&self) -> &[FlowRun] {
@@ -2253,33 +2301,35 @@ impl App {
             self.add_found(filter, &mut rows);
         }
         // The projects with no sessions go after those with some, ahead of
-        // the sessions outside any repository.
+        // the sessions outside any repository, but for those placed by
+        // hand, which go where they were put.
         if self.filter.is_none() {
-            let mut quiet = Vec::new();
-            for project in self.quiet_projects() {
-                quiet.push(Row::Project {
-                    name: project.project.clone(),
-                    path: project.path.clone(),
-                });
-                quiet.push(Row::Worktree {
-                    project: project.path.clone(),
-                    path: project.path.clone(),
-                    branch: project.branch.clone(),
-                    main: true,
-                    in_progress: project.in_progress,
-                });
-                quiet.push(Row::NoSessions(project.path.clone()));
-                quiet.extend(groups::empty_rows(&empty, &project.path));
+            let mut quiet: Vec<&Worktree> = self.quiet_projects();
+            quiet.sort_by_key(|project| self.by_hand.project_place(&project.path));
+            for project in quiet {
+                let mut heading = vec![
+                    Row::Project {
+                        name: project.project.clone(),
+                        path: project.path.clone(),
+                    },
+                    Row::Worktree {
+                        project: project.path.clone(),
+                        path: project.path.clone(),
+                        branch: project.branch.clone(),
+                        main: true,
+                        in_progress: project.in_progress,
+                    },
+                    Row::NoSessions(project.path.clone()),
+                ];
+                heading.extend(groups::empty_rows(&empty, &project.path));
+                let at = self.quiet_place(&rows, &project.path);
+                rows.splice(at..at, heading);
             }
-            let at = rows
-                .iter()
-                .position(|row| *row == Row::OutsideGit)
-                .unwrap_or(rows.len());
-            rows.splice(at..at, quiet);
         }
         if !self.tasks_on {
             rows.retain(|row| !matches!(row, Row::Task(_)));
         }
+        rows = self.lay_out_lines(rows);
         if fold {
             rows = self.fold(rows);
         }
@@ -2291,6 +2341,62 @@ impl App {
         with_pinned.extend(pinned.into_iter().map(Row::Pinned));
         with_pinned.extend(rows);
         with_pinned
+    }
+
+    /// Where the heading of the project at `project`, which has no
+    /// sessions, goes among `rows`: before the first heading of a project
+    /// placed after it by hand, or not placed, that isn't first for
+    /// waiting on the user; or else at the end, ahead of the sessions
+    /// outside any repository.
+    fn quiet_place(&self, rows: &[Row], project: &Path) -> usize {
+        let place = self.by_hand.project_place(project);
+        let lifted = |path: &Path| {
+            self.order == SidebarOrder::Attention
+                && self.sessions.iter().any(|session| {
+                    groups::is_waiting(session)
+                        && session.worktree.as_ref().map(|w| w.project_path.as_path()) == Some(path)
+                })
+        };
+        let before = rows.iter().position(|row| match row {
+            Row::Project { path, .. } => {
+                place != usize::MAX && !lifted(path) && self.by_hand.project_place(path) > place
+            }
+            Row::OutsideGit => true,
+            _ => false,
+        });
+        before.unwrap_or(rows.len())
+    }
+
+    /// `rows` with each session that `[sidebar] rows` lays out having its
+    /// lines past the first that show anything, in place of its task's and
+    /// its reported line.
+    fn lay_out_lines(&self, rows: Vec<Row>) -> Vec<Row> {
+        if self.row_layouts == RowLayouts::default() {
+            return rows;
+        }
+        let mut laid = Vec::with_capacity(rows.len());
+        for row in rows {
+            match row {
+                Row::Task(index) | Row::Line(index) if self.session_lines(index).is_some() => {}
+                Row::Session(index) => {
+                    laid.push(row);
+                    let Some(lines) = self.session_lines(index) else {
+                        continue;
+                    };
+                    for (line, pieces) in lines.iter().enumerate().skip(1) {
+                        let text = |token: &str| sidebar::session_text(self, index, token, 0);
+                        if rows::shows(pieces, text) {
+                            laid.push(Row::More {
+                                session: index,
+                                line,
+                            });
+                        }
+                    }
+                }
+                row => laid.push(row),
+            }
+        }
+        laid
     }
 
     /// `rows` with each folded project down to its heading.
@@ -2449,6 +2555,44 @@ impl App {
         (place.unwrap_or(usize::MAX), project.to_path_buf())
     }
 
+    /// How `[sidebar]` lays the sidebar's rows out.
+    pub fn row_layouts(&self) -> &RowLayouts {
+        &self.row_layouts
+    }
+
+    /// The lines `[sidebar] rows` lays the session at `index` out in, by
+    /// its agent: `None` for crystal's own, and for a flow's step, which
+    /// keeps its own.
+    pub fn session_lines(&self, index: usize) -> Option<&[Vec<rows::Piece>]> {
+        let session = self.sessions.get(index)?;
+        if groups::flow_step(session, self.shown_flows()).is_some() {
+            return None;
+        }
+        let agent = sidebar::agent_program(session);
+        self.row_layouts.session(agent.as_deref())
+    }
+
+    /// Whether tasks are on, for a session's task to show.
+    pub fn tasks_on(&self) -> bool {
+        self.tasks_on
+    }
+
+    /// Takes the tokens reported for each project, as the daemon said.
+    pub fn set_project_tokens(&mut self, tokens: BTreeMap<PathBuf, BTreeMap<String, String>>) {
+        self.project_tokens = tokens;
+    }
+
+    /// The tokens reported for the project at `project`, by its main
+    /// worktree.
+    pub fn project_tokens(&self, project: &Path) -> Option<&BTreeMap<String, String>> {
+        self.project_tokens.get(project)
+    }
+
+    /// The name of the project at `project`, by its main worktree.
+    pub fn project_name_of(&self, project: &Path) -> String {
+        self.project_name(project)
+    }
+
     /// The name of the project at `project`, by its main worktree: as its
     /// sessions or crystal's list of projects say, or else its directory's.
     fn project_name(&self, project: &Path) -> String {
@@ -2484,6 +2628,19 @@ impl App {
         // Stable: each need's in the order they came.
         pinned.sort_by_key(|(need, _)| *need);
         pinned.into_iter().map(|(_, index)| index).collect()
+    }
+
+    /// The tab the session at `index` is in: its name, or its number when
+    /// it has none, as the top bar shows it.
+    pub fn tab_label(&self, index: usize) -> Option<String> {
+        let name = &self.sessions.get(index)?.name;
+        let tab = self.tabs.tab_of(name)?;
+        let named = &self.tabs.all()[tab].name;
+        Some(if named.is_empty() {
+            (tab + 1).to_string()
+        } else {
+            named.clone()
+        })
     }
 
     /// The tab the session at `index` is in, when it isn't the tab in
@@ -3639,6 +3796,7 @@ impl App {
             let was = self.sessions.iter().find(|was| was.id == now.id);
             if let Some(was) = was.filter(|was| was.name != now.name) {
                 self.tabs.renamed(&was.name, &now.name);
+                self.by_hand.renamed(&was.name, &now.name);
             }
             // A session that started, or whose agent stopped or started
             // doing something, may have changed files: its worktree is
@@ -3666,7 +3824,11 @@ impl App {
         }
         let before = self.sessions.get(self.selected).cloned();
         let on_a_session = self.on_worktree.is_none();
-        self.sessions = groups::order(sessions, self.shown_flows());
+        self.made = sessions
+            .iter()
+            .map(|session| session.name.clone())
+            .collect();
+        self.sessions = groups::order(sessions, self.shown_flows(), self.sorting());
         let still_there = before
             .as_ref()
             .and_then(|s| self.sessions.iter().position(|now| now.id == s.id));
@@ -3968,6 +4130,9 @@ impl App {
     }
 
     fn take_mouse(&mut self, kind: MouseEventKind, hit: Hit) -> Option<Action> {
+        if self.view.is_some() {
+            self.sidebar_grab = None;
+        }
         if let Some(view) = &mut self.view {
             let outcome = match view {
                 View::Diff(diff) => diff.on_mouse(kind, hit),
@@ -4090,6 +4255,22 @@ impl App {
                 _ => return None,
             }
         }
+        // A sidebar row taken by the mouse goes where the button comes up,
+        // among those beside it.
+        if let Some(grab) = &mut self.sidebar_grab {
+            match (kind, hit) {
+                (MouseEventKind::Drag(_), Hit::SidebarRow(row)) => {
+                    grab.over = row;
+                    return None;
+                }
+                (MouseEventKind::Up(_), _) => {
+                    self.let_go();
+                    return None;
+                }
+                (MouseEventKind::Down(_), _) => self.sidebar_grab = None,
+                _ => return None,
+            }
+        }
         // A pane taken by its header goes where the button comes up, over
         // another pane, and swaps places with it.
         if let Some(grab) = self.grabbed {
@@ -4123,7 +4304,10 @@ impl App {
             (_, Hit::Readout) if click => return Some(self.open_ram()),
             (_, Hit::PullRequestCount) if click => return self.open_pull_requests(),
             (_, Hit::IssueCount) if click => return self.open_issues(),
-            (_, Hit::SidebarRow(row)) if click => self.click_row(row),
+            (_, Hit::SidebarRow(row)) if click => {
+                self.click_row(row);
+                self.grab_row(row);
+            }
             // Anywhere else in the sidebar, the click only takes the keyboard.
             (_, Hit::Sidebar) if click => self.focus = Focus::Sidebar,
             (_, Hit::SidebarEdge(_)) if click => self.dragging_sidebar = true,
@@ -4276,9 +4460,11 @@ impl App {
                 .cloned()
         };
         match &clicked {
-            Row::Session(_) | Row::Task(_) | Row::Line(_) | Row::NoSessions(_) => {
-                self.select_row(&clicked)
-            }
+            Row::Session(_)
+            | Row::Task(_)
+            | Row::Line(_)
+            | Row::More { .. }
+            | Row::NoSessions(_) => self.select_row(&clicked),
             Row::Project { path, .. } if self.is_folded(path) => {
                 self.select_row(&clicked);
                 return Some(self.project_menu());
@@ -4472,7 +4658,9 @@ impl App {
     fn click_found(&mut self, row: usize) -> Option<Action> {
         self.focus = Focus::Sidebar;
         let found = match self.rows().get(row)? {
-            Row::Task(index) | Row::Line(index) => self.found_at(&Row::Session(*index)),
+            Row::Task(index) | Row::Line(index) | Row::More { session: index, .. } => {
+                self.found_at(&Row::Session(*index))
+            }
             row => self.found_at(row),
         };
         self.pick(found?)
@@ -4480,7 +4668,8 @@ impl App {
 
     /// A click on a sidebar row gives the sidebar the keyboard, and on a
     /// session, or a worktree with none, selects it. A project's heading
-    /// folds or unfolds the project; another heading leaves the selection
+    /// folds or unfolds the project as the button comes up where it went
+    /// down (see [`App::let_go`]); another heading leaves the selection
     /// where it was.
     fn click_row(&mut self, row: usize) {
         self.focus = Focus::Sidebar;
@@ -4491,15 +4680,14 @@ impl App {
             self.select(&name);
             return;
         }
-        // A project's heading folds the project, or unfolds it.
-        if let Some(Row::Project { path, .. }) = rows.get(row) {
-            self.toggle_fold(path);
-            return;
-        }
         if let Some(row) = rows.get(row)
             && matches!(
                 row,
-                Row::Session(_) | Row::Task(_) | Row::Line(_) | Row::NoSessions(_)
+                Row::Session(_)
+                    | Row::Task(_)
+                    | Row::Line(_)
+                    | Row::More { .. }
+                    | Row::NoSessions(_)
             )
         {
             self.select_row(row);
@@ -4708,6 +4896,10 @@ impl App {
             Command::FoldSidebar => self.fold_sidebar(),
             Command::FoldProject => self.fold_project(),
             Command::UnfoldProject => self.unfold_project(),
+            Command::MoveUp => self.move_selected(false),
+            Command::MoveDown => self.move_selected(true),
+            Command::MoveProjectUp => self.move_selected_project(false),
+            Command::MoveProjectDown => self.move_selected_project(true),
             Command::Plugins => return Some(Action::ListPlugins),
             Command::Settings => {
                 let mut view = SettingsView::new();
@@ -7179,7 +7371,10 @@ impl App {
     /// out of sight.
     fn select_row(&mut self, row: &Row) {
         match row {
-            Row::Session(index) | Row::Task(index) | Row::Line(index) => {
+            Row::Session(index)
+            | Row::Task(index)
+            | Row::Line(index)
+            | Row::More { session: index, .. } => {
                 self.selected = *index;
                 self.on_worktree = None;
             }
@@ -7522,6 +7717,7 @@ mod tests {
             unseen_copies: 0,
             context: None,
             output_waits: 0,
+            row: Default::default(),
         }
     }
 
@@ -11264,6 +11460,8 @@ mod tests {
     }
 
     const CLICK: MouseEventKind = MouseEventKind::Down(MouseButton::Left);
+    const DRAG: MouseEventKind = MouseEventKind::Drag(MouseButton::Left);
+    const LET_GO: MouseEventKind = MouseEventKind::Up(MouseButton::Left);
 
     /// The sidebar row `name` is drawn on.
     fn row_of(app: &App, name: &str) -> usize {
@@ -13559,7 +13757,12 @@ gate = true
             in_project("planner", "app"),
             in_project("docs", "web"),
         ]);
-        app.on_mouse(CLICK, Hit::SidebarRow(heading_of(&app, "/code/web")));
+        let heading = Hit::SidebarRow(heading_of(&app, "/code/web"));
+        app.on_mouse(CLICK, heading);
+        // It folds as the button comes up, where it went down: held and
+        // dragged, it moves the project instead.
+        assert!(!app.is_folded(web));
+        app.on_mouse(LET_GO, heading);
         assert!(app.is_folded(web));
         assert_eq!(selected_name(&app), Some("planner"));
         assert_eq!(app.folded_projects().len(), 1);
@@ -13581,7 +13784,9 @@ gate = true
         let mut app = App::new(None);
         app.set_sessions(vec![in_project("planner", "app")]);
         app.set_folded_projects(BTreeSet::from([PathBuf::from("/code/app")]));
-        app.on_mouse(CLICK, Hit::SidebarRow(heading_of(&app, "/code/app")));
+        let heading = Hit::SidebarRow(heading_of(&app, "/code/app"));
+        app.on_mouse(CLICK, heading);
+        app.on_mouse(LET_GO, heading);
         assert!(app.folded_projects().is_empty());
     }
 
@@ -13614,5 +13819,234 @@ gate = true
         assert_eq!(app.shown_worktrees(), [fix]);
         press(&mut app, KeyCode::Char('h'));
         assert!(app.shown_worktrees().is_empty());
+    }
+
+    fn alt(app: &mut App, c: char) -> Option<Action> {
+        app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::ALT))
+    }
+
+    /// An agent called `name` in the main worktree of `project`.
+    fn agent_in(name: &str, project: &str) -> SessionInfo {
+        SessionInfo {
+            front: Some(Front::Agent {
+                program: "claude".into(),
+                name: "Claude Code".into(),
+            }),
+            ..in_project(name, project)
+        }
+    }
+
+    fn names_in_order(app: &App) -> Vec<&str> {
+        app.sessions().iter().map(|s| s.name.as_str()).collect()
+    }
+
+    fn with_sidebar(mut app: App, toml: &str) -> App {
+        let config = crate::config::from_text(&format!("[sidebar]\n{toml}")).unwrap();
+        app.set_interface(&config);
+        app
+    }
+
+    #[test]
+    fn alt_j_and_alt_k_move_a_session_among_those_beside_it_and_the_order_lasts() {
+        let made = || ["a", "b", "c"].map(|name| agent_in(name, "app")).to_vec();
+        let mut app = App::new(None);
+        app.set_sessions(made());
+        app.select("a");
+        alt(&mut app, 'j');
+        assert_eq!(names_in_order(&app), ["b", "a", "c"]);
+        assert_eq!(selected_name(&app), Some("a"));
+        // The daemon lists them as they were made: the order stays.
+        app.set_sessions(made());
+        assert_eq!(names_in_order(&app), ["b", "a", "c"]);
+        alt(&mut app, 'k');
+        alt(&mut app, 'k');
+        assert_eq!(names_in_order(&app), ["a", "b", "c"]);
+        assert_eq!(app.notice(), Some("a is first already"));
+        app.select("c");
+        app.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT));
+        assert_eq!(names_in_order(&app), ["a", "c", "b"]);
+        // A TUI opened again, on what this one kept, has them the same.
+        let kept = app.by_hand().clone();
+        let mut again = App::new(None);
+        again.set_by_hand(kept);
+        again.set_sessions(made());
+        assert_eq!(names_in_order(&again), ["a", "c", "b"]);
+        // Renamed, a session keeps its place.
+        let mut renamed = made();
+        renamed[2].name = "fixer".into();
+        again.set_sessions(renamed);
+        assert_eq!(names_in_order(&again), ["a", "fixer", "b"]);
+    }
+
+    #[test]
+    fn a_session_moves_only_among_those_beside_it() {
+        let mut app = App::new(None);
+        app.set_sessions(vec![
+            agent_in("claude", "app"),
+            in_project("zsh", "app"),
+            agent_in("other", "web"),
+        ]);
+        app.select("zsh");
+        alt(&mut app, 'k');
+        // A terminal stays after the agents, below their line.
+        assert_eq!(app.notice(), Some("zsh is first already"));
+        let toward = by_hand::Toward::Before(by_hand::Movable::Session("other".into()));
+        let said = app
+            .move_by_hand(&by_hand::Movable::Session("claude".into()), toward)
+            .unwrap_err();
+        assert!(
+            said.contains("among the sessions in its worktree"),
+            "{said}"
+        );
+    }
+
+    #[test]
+    fn alt_shift_j_moves_the_selected_session_s_project() {
+        let made = || vec![agent_in("planner", "app"), agent_in("docs", "web")];
+        let mut app = App::new(None);
+        app.set_sessions(made());
+        app.select("planner");
+        alt(&mut app, 'J');
+        assert_eq!(names_in_order(&app), ["docs", "planner"]);
+        assert_eq!(app.by_hand().projects[0], PathBuf::from("/code/web"));
+        app.set_sessions(made());
+        assert_eq!(names_in_order(&app), ["docs", "planner"]);
+        // A folded project's heading moves with the session keys too.
+        app.set_folded_projects(BTreeSet::from([PathBuf::from("/code/app")]));
+        alt(&mut app, 'k');
+        assert_eq!(names_in_order(&app), ["planner", "docs"]);
+    }
+
+    #[test]
+    fn by_attention_what_waits_stays_first_and_a_move_says_why() {
+        let made = || {
+            let mut asking = agent_in("asking", "app");
+            asking.activity = Some(Activity::Waiting);
+            vec![asking, agent_in("quiet", "app")]
+        };
+        let mut app = App::new(None);
+        app.set_sessions(made());
+        app.select("quiet");
+        alt(&mut app, 'k');
+        assert_eq!(names_in_order(&app), ["asking", "quiet"]);
+        assert!(app.notice().unwrap().contains("ordered by attention"));
+        // A stable order has it where it was put.
+        let mut app = with_sidebar(app, "order = \"stable\"");
+        assert_eq!(names_in_order(&app), ["quiet", "asking"]);
+        app.set_sessions(made());
+        assert_eq!(names_in_order(&app), ["quiet", "asking"]);
+    }
+
+    #[test]
+    fn a_stable_order_doesn_t_lift_a_waiting_project() {
+        let mut asking = agent_in("asking", "web");
+        asking.activity = Some(Activity::Waiting);
+        let app = with_sidebar(App::new(None), "order = \"stable\"");
+        let mut app = app;
+        app.set_sessions(vec![agent_in("planner", "app"), asking]);
+        assert_eq!(names_in_order(&app), ["planner", "asking"]);
+        let rows = app.rows();
+        let first = rows.iter().find(|row| matches!(row, Row::Project { .. }));
+        assert!(matches!(first, Some(Row::Project { name, .. }) if name == "app"));
+    }
+
+    #[test]
+    fn dragging_a_row_moves_it_and_a_heading_moves_its_project() {
+        let mut app = App::new(None);
+        app.set_sessions(vec![
+            agent_in("a", "app"),
+            agent_in("b", "app"),
+            agent_in("c", "app"),
+            agent_in("docs", "web"),
+        ]);
+        let from = Hit::SidebarRow(row_of(&app, "c"));
+        app.on_mouse(CLICK, from);
+        assert_eq!(selected_name(&app), Some("c"));
+        app.on_mouse(DRAG, Hit::SidebarRow(row_of(&app, "a")));
+        assert!(app.sidebar_grab().is_some());
+        app.on_mouse(LET_GO, Hit::SidebarRow(row_of(&app, "a")));
+        assert_eq!(names_in_order(&app), ["c", "a", "b", "docs"]);
+        // Dragged down past another, it goes after it.
+        app.on_mouse(CLICK, Hit::SidebarRow(row_of(&app, "c")));
+        app.on_mouse(DRAG, Hit::SidebarRow(row_of(&app, "b")));
+        app.on_mouse(LET_GO, Hit::SidebarRow(row_of(&app, "b")));
+        assert_eq!(names_in_order(&app), ["a", "b", "c", "docs"]);
+        // A session let go of in another worktree stays where it was.
+        app.on_mouse(CLICK, Hit::SidebarRow(row_of(&app, "a")));
+        app.on_mouse(DRAG, Hit::SidebarRow(row_of(&app, "docs")));
+        app.on_mouse(LET_GO, Hit::SidebarRow(row_of(&app, "docs")));
+        assert_eq!(names_in_order(&app), ["a", "b", "c", "docs"]);
+        // A project's heading goes where any row of another project is,
+        // and doesn't fold on the way.
+        let web = Hit::SidebarRow(heading_of(&app, "/code/web"));
+        app.on_mouse(CLICK, web);
+        app.on_mouse(DRAG, Hit::SidebarRow(row_of(&app, "b")));
+        app.on_mouse(LET_GO, Hit::SidebarRow(row_of(&app, "b")));
+        assert_eq!(names_in_order(&app), ["docs", "a", "b", "c"]);
+        assert!(app.folded_projects().is_empty());
+    }
+
+    #[test]
+    fn a_project_with_no_sessions_keeps_the_place_it_was_moved_to() {
+        let mut app = App::new(None);
+        app.set_sessions(vec![agent_in("planner", "app")]);
+        let quiet = Worktree {
+            project: "docs".into(),
+            project_path: PathBuf::from("/code/docs"),
+            path: PathBuf::from("/code/docs"),
+            main: true,
+            branch: Some("main".into()),
+            in_progress: None,
+        };
+        app.set_known_projects(vec![quiet]);
+        let headings = |app: &App| -> Vec<String> {
+            (app.rows().iter())
+                .filter_map(|row| match row {
+                    Row::Project { name, .. } => Some(name.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(headings(&app), ["app", "docs"]);
+        let docs = by_hand::Movable::Project(PathBuf::from("/code/docs"));
+        app.move_by_hand(&docs, by_hand::Toward::Up).unwrap();
+        assert_eq!(headings(&app), ["docs", "app"]);
+        assert_eq!(heading_of(&app, "/code/docs"), 0);
+    }
+
+    #[test]
+    fn a_session_laid_out_in_lines_has_those_with_something_on_them() {
+        let mut fixer = agent_in("fixer", "app");
+        fixer.line = Some("indexing".into());
+        let app = with_sidebar(
+            App::new(None),
+            "rows = [[\"mark\", \"name\"], [\"$load\"], [\"line\"]]",
+        );
+        let mut app = app;
+        app.set_sessions(vec![fixer.clone()]);
+        // The line reported is the third line, laid out; there's no load.
+        assert_eq!(
+            app.rows()[2..],
+            [
+                Row::Session(0),
+                Row::More {
+                    session: 0,
+                    line: 2
+                }
+            ]
+        );
+        fixer.row.tokens.insert("load".into(), "90".into());
+        app.set_sessions(vec![fixer]);
+        assert_eq!(app.rows().len(), 5);
+        assert_eq!(
+            app.rows()[3],
+            Row::More {
+                session: 0,
+                line: 1
+            }
+        );
+        // A click on one of its lines selects it.
+        app.on_mouse(CLICK, Hit::SidebarRow(4));
+        assert_eq!(selected_name(&app), Some("fixer"));
     }
 }

@@ -1,14 +1,16 @@
 //! `crystal project`: the projects crystal knows, which the TUI lists with
-//! no session running in them, adding one and taking one off the list; and
+//! no session running in them, adding one and taking one off the list;
 //! running a worktree's project, or opening it, with the commands
-//! [`crate::project_commands`] finds.
+//! [`crate::project_commands`] finds; and the tokens `report` puts on a
+//! project's rows in the sidebar.
 
 use crate::client;
 use crate::config::Config;
 use crate::git::Checkout;
 use crate::output::outln;
+use crate::project;
 use crate::project_commands::{self, Commands, Verb};
-use crate::protocol::{Request, Response, SessionInfo, State, Worktree};
+use crate::protocol::{Metadata, Request, Response, SessionInfo, State, Worktree};
 use crate::shell;
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
@@ -65,6 +67,17 @@ pub fn list(socket: &Path, json: bool) -> Result<()> {
         })
         .collect();
     crate::print_table(["NAME", "BRANCH", "SESSIONS", "DIRECTORY"], &rows)
+}
+
+/// Puts `metadata`'s tokens on the rows of the project `dir` is in.
+pub fn report(socket: &Path, dir: &Path, metadata: Metadata) -> Result<()> {
+    let project = project::of(dir).path;
+    let request = Request::ReportProject { project, metadata };
+    match client::ask(socket, &request, false)? {
+        Some(Response::Done) => Ok(()),
+        Some(_) => bail!("the daemon answered something else"),
+        None => bail!("no daemon is running on {}", socket.display()),
+    }
 }
 
 /// Puts the project `dir` is in on the list, or takes it off.

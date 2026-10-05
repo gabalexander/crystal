@@ -5,16 +5,19 @@
 //! whose point is to go somewhere: making a tab, going to one, focusing a
 //! session, and a layout applied that says which tab is in front.
 
+use super::by_hand::{Movable, Toward};
 use super::{Action, App, PluginPane, Popup, Slot, resize_step};
 use crate::flow_run::FlowRun;
-use crate::layout::{Command, Layout, NO_TUI, Order, TabLayout, Tile};
+use crate::layout::{Command, Layout, NO_TUI, Order, SidebarPlace, TabLayout, Tile};
 use crate::notify::Presence;
-use crate::protocol::SessionInfo;
+use crate::protocol::{SessionInfo, Worktree};
 use crate::session::UNSEEN_SIZE;
+use crate::tui::groups::ByHand;
 use crate::tui::split_tree::{Direction, Pane, SplitTree, Way};
 use crate::tui::tabs::Tabs;
 use crate::tui::ui::Areas;
 use ratatui::layout::Rect;
+use std::path::PathBuf;
 
 /// What came of a layout command carried out with no TUI open.
 pub struct Alone {
@@ -22,21 +25,35 @@ pub struct Alone {
     pub layout: Layout,
     /// The tabs as they are now, to keep for the next TUI to open with.
     pub tabs: Tabs,
+    /// The sidebar's order by hand as it is now, to keep the same way.
+    pub by_hand: ByHand,
     /// The sessions a tab closed with them leaves to be killed.
     pub kill: Vec<String>,
 }
 
+/// What a TUI keeps that a layout command carried out with no TUI open
+/// works on: as the TUIs last kept them, with what the daemon knows now.
+pub struct Kept {
+    pub sessions: Vec<SessionInfo>,
+    pub flows: Vec<FlowRun>,
+    /// The projects crystal knows, by their main worktrees.
+    pub projects: Vec<Worktree>,
+    pub tabs: Tabs,
+    pub by_hand: ByHand,
+}
+
 impl App {
     /// Carries out a layout command with no TUI open, the way the TUI used
-    /// last would have: on `tabs`, as the TUIs last kept them, with
-    /// `sessions` and `flows` as they are now, on a screen the size a
-    /// session has when nobody is looking at it.
-    pub fn obey_alone(
-        sessions: Vec<SessionInfo>,
-        flows: Vec<FlowRun>,
-        tabs: Tabs,
-        order: Order,
-    ) -> Result<Alone, String> {
+    /// last would have: on what `kept` has, on a screen the size a session
+    /// has when nobody is looking at it.
+    pub fn obey_alone(kept: Kept, order: Order) -> Result<Alone, String> {
+        let Kept {
+            sessions,
+            flows,
+            projects,
+            tabs,
+            by_hand,
+        } = kept;
         // The title is the TUI's terminal's, and there's none; nor is
         // there anything to show a pane over.
         if let Command::Title { .. } | Command::Overlay { .. } = order.command {
@@ -48,6 +65,8 @@ impl App {
         app.set_screen(screen);
         app.flows = flows;
         app.set_sessions(sessions);
+        app.set_known_projects(projects);
+        app.set_by_hand(by_hand);
         app.set_tabs(tabs);
         app.set_tiles(Areas::of(&app, screen).tiles);
         let kill = match app.obey(order)? {
@@ -57,6 +76,7 @@ impl App {
         Ok(Alone {
             layout: app.layout(),
             tabs: app.tabs_to_keep(),
+            by_hand: app.by_hand().clone(),
             kill,
         })
     }
@@ -129,6 +149,27 @@ impl App {
                 self.tabs.tab_mut(index).rename(&name);
             }
             Command::CloseTab { tab, kill } => return self.close_tab_named(tab.as_deref(), kill),
+            Command::SidebarMove {
+                session,
+                project,
+                to,
+            } => {
+                let what = match project {
+                    Some(path) => Movable::Project(path),
+                    None => Movable::Session(self.subject(session.as_deref(), caller)?),
+                };
+                let like = |other: String| match &what {
+                    Movable::Session(_) => Movable::Session(other),
+                    Movable::Project(_) => Movable::Project(PathBuf::from(other)),
+                };
+                let toward = match to {
+                    SidebarPlace::Up => Toward::Up,
+                    SidebarPlace::Down => Toward::Down,
+                    SidebarPlace::Before(other) => Toward::Before(like(other)),
+                    SidebarPlace::After(other) => Toward::After(like(other)),
+                };
+                self.move_by_hand(&what, toward)?;
+            }
             Command::MoveToTab { session, tab } => {
                 let name = self.session_named(&session)?;
                 let to = self.tab_named(&tab)?;
@@ -788,6 +829,7 @@ mod tests {
             unseen_copies: 0,
             context: None,
             output_waits: 0,
+            row: Default::default(),
         }
     }
 
@@ -882,8 +924,7 @@ mod tests {
             command: over(),
             caller: None,
         };
-        let tabs = Tabs::default();
-        let alone = App::obey_alone(vec![session("notes-board")], Vec::new(), tabs, order);
+        let alone = App::obey_alone(kept(vec![session("notes-board")]), order);
         assert_eq!(alone.err().unwrap(), format!("{NO_TUI} to show it"));
     }
 
@@ -902,11 +943,69 @@ mod tests {
             command: title(Some("deploying")),
             caller: None,
         };
-        let alone = App::obey_alone(vec![session("a")], Vec::new(), Tabs::default(), order);
+        let alone = App::obey_alone(kept(vec![session("a")]), order);
         let Err(said) = alone else {
             panic!("a title was given with no TUI to show it");
         };
         assert!(said.contains(NO_TUI), "{said}");
+    }
+
+    #[test]
+    fn sidebar_move_puts_a_session_or_a_project_where_it_says() {
+        // Outside git, the sessions are all beside one another.
+        let mut app = app_with(&["a", "b", "c"]);
+        let to = |to: SidebarPlace| Command::SidebarMove {
+            session: Some("c".into()),
+            project: None,
+            to,
+        };
+        obey(&mut app, to(SidebarPlace::Before("a".into()))).unwrap();
+        let names = |app: &App| app.layout().tabs[0].sessions.clone();
+        assert_eq!(names(&app), ["c", "a", "b"]);
+        obey(&mut app, to(SidebarPlace::Down)).unwrap();
+        assert_eq!(names(&app), ["a", "c", "b"]);
+        // Run in a session, it moves that one.
+        let up = Command::SidebarMove {
+            session: None,
+            project: None,
+            to: SidebarPlace::Up,
+        };
+        obey_from(&mut app, "b", up).unwrap();
+        assert_eq!(names(&app), ["a", "b", "c"]);
+        let nowhere = to(SidebarPlace::After("nope".into()));
+        assert!(obey(&mut app, nowhere).unwrap_err().contains("isn't one"));
+        let project = Command::SidebarMove {
+            session: None,
+            project: Some(PathBuf::from("/code/nope")),
+            to: SidebarPlace::Up,
+        };
+        assert!(obey(&mut app, project).is_err());
+    }
+
+    #[test]
+    fn with_no_tui_open_a_move_is_kept_for_the_next() {
+        let order = Order {
+            command: Command::SidebarMove {
+                session: Some("b".into()),
+                project: None,
+                to: SidebarPlace::Up,
+            },
+            caller: None,
+        };
+        let alone = App::obey_alone(kept(vec![session("a"), session("b")]), order).unwrap();
+        assert_eq!(alone.by_hand.sessions, ["b", "a"]);
+        assert_eq!(alone.layout.tabs[0].sessions, ["b", "a"]);
+    }
+
+    /// What a TUI keeps, with no TUI open: `sessions`, and nothing else.
+    fn kept(sessions: Vec<SessionInfo>) -> Kept {
+        Kept {
+            sessions,
+            flows: Vec::new(),
+            projects: Vec::new(),
+            tabs: Tabs::default(),
+            by_hand: ByHand::default(),
+        }
     }
 
     /// Two tabs: a and b in the first, c in the second, which is in front.

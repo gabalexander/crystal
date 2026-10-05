@@ -9,10 +9,17 @@
 //! wider: an agent's model beside its name, a line its agent reported
 //! under it, a worktree's changes not committed and how far it is from its
 //! upstream on its line, and on a folded project's heading, what's in it.
+//!
+//! Where `[sidebar]` lays a session's lines, a worktree's line or a
+//! project's heading out itself (see [`super::rows`]), they're drawn from
+//! the values their tokens have here, in place of crystal's own. The
+//! pinned rows, the rail, a folded project's heading and a flow's steps
+//! keep crystal's own.
 
 use super::app::{App, Hit, RAIL_WIDTH};
 use super::groups::{self, Row};
 use super::keymap::Command;
+use super::rows::{self, Laid, Piece, Value};
 use super::status::Status;
 use super::theme::Theme;
 use super::ui::Look;
@@ -37,6 +44,10 @@ const WORKTREE_INDENT: &str = "   ";
 
 /// How far a session row is indented: under its worktree's line.
 const SESSION_INDENT: &str = "     ";
+
+/// How far a session's lines under its row are indented, laid out by
+/// `[sidebar] rows`: under its name, past its mark.
+const UNDER_NAME: &str = "       ";
 
 /// A terminal's mark while it runs: a prompt's chevron. No agent's status
 /// uses it, so a terminal never passes for an agent at its prompt, even
@@ -69,19 +80,24 @@ pub fn draw(frame: &mut Frame, app: &App, look: &Look, area: Rect) {
     }
     let first = offset(app, area.height);
     let selected = selected_row(app);
+    let drop_at = app
+        .sidebar_grab()
+        .filter(|grab| app.drop_target(grab).is_some())
+        .map(|grab| grab.over);
     let shown = rows.iter().enumerate().skip(first).take(area.height.into());
     for (index, row) in shown {
         let y = area.y + (index - first) as u16;
         let line_area = Rect::new(area.x, y, area.width, 1);
-        // A session's task line, and the line reported for it, go with
-        // it, selected or not.
+        // A session's task line, the line reported for it, and its other
+        // lines go with it, selected or not.
         let is_selected = match row {
-            Row::Task(owner) | Row::Line(owner) => {
+            Row::Task(owner) | Row::Line(owner) | Row::More { session: owner, .. } => {
                 selected.is_some_and(|at| rows[at] == Row::Session(*owner))
             }
             _ => selected == Some(index),
         };
-        if is_selected {
+        // Where a row the mouse holds would go, were it let go of.
+        if is_selected || drop_at == Some(index) {
             frame
                 .buffer_mut()
                 .set_style(line_area, look.theme.selection);
@@ -223,7 +239,7 @@ fn offset(app: &App, height: u16) -> usize {
     let last = selected_row(app).map(|row| {
         let under = rows[row + 1..]
             .iter()
-            .take_while(|under| matches!(under, Row::Task(_) | Row::Line(_)))
+            .take_while(|under| matches!(under, Row::Task(_) | Row::Line(_) | Row::More { .. }))
             .count();
         row + under
     });
@@ -260,6 +276,11 @@ fn row_line<'a>(app: &'a App, row: &Row, look: &Look, width: u16, selected: bool
     let theme = look.theme;
     match row {
         Row::Project { name, path } => {
+            if !app.is_folded(path)
+                && let Some(pieces) = app.row_layouts().project()
+            {
+                return laid_heading(app, pieces, name, path, look, width);
+            }
             let mut line = if app.is_folded(path) {
                 folded_heading(app, name, path, look, width)
             } else {
@@ -279,6 +300,16 @@ fn row_line<'a>(app: &'a App, row: &Row, look: &Look, width: u16, selected: bool
             in_progress,
         } => {
             let branch = branch.as_deref();
+            let worktree = WorktreeAt {
+                project,
+                path,
+                branch,
+                main: *main,
+                in_progress: *in_progress,
+            };
+            if let Some(pieces) = app.row_layouts().worktree() {
+                return laid_worktree(app, pieces, &worktree, theme, width);
+            }
             worktree_line(
                 app,
                 project,
@@ -305,6 +336,15 @@ fn row_line<'a>(app: &'a App, row: &Row, look: &Look, width: u16, selected: bool
             }
             let marked = app.marked_letters(*index);
             let tab = app.elsewhere(*index);
+            if let Some(lines) = app.session_lines(*index) {
+                let at = SessionAt {
+                    index: *index,
+                    marked: &marked,
+                    tab: tab.as_deref(),
+                    selected,
+                };
+                return laid_session(app, &lines[0], &at, SESSION_INDENT, look, width);
+            }
             session_line(
                 session,
                 &marked,
@@ -317,6 +357,22 @@ fn row_line<'a>(app: &'a App, row: &Row, look: &Look, width: u16, selected: bool
         }
         Row::Terminals => terminals_line(theme, width),
         Row::NoSessions(_) => no_sessions_line(theme, width, selected),
+        Row::More {
+            session: index,
+            line,
+        } => {
+            let Some(pieces) = app.session_lines(*index).and_then(|lines| lines.get(*line)) else {
+                return Line::default();
+            };
+            let tab = app.elsewhere(*index);
+            let at = SessionAt {
+                index: *index,
+                marked: &[],
+                tab: tab.as_deref(),
+                selected,
+            };
+            laid_session(app, pieces, &at, UNDER_NAME, look, width)
+        }
         Row::Task(index) => task_line(&app.sessions()[*index], theme, width),
         Row::Line(index) => reported_line(&app.sessions()[*index], theme, width),
         Row::Flow(run) => flow_heading(&app.flows()[*run], look, width),
@@ -568,6 +624,22 @@ fn task_line<'a>(session: &SessionInfo, theme: &Theme, width: u16) -> Line<'a> {
     // Under the session's name: its indent and mark.
     let indent = format!("{SESSION_INDENT}  ");
     let room = usize::from(width).saturating_sub(indent.len() + 1);
+    let ((mark, status), said) = task_words(session, task);
+    let room = room.saturating_sub(mark.chars().count());
+    let color = status.map_or(theme.muted, |status| theme.status(status));
+    Line::from(vec![
+        Span::raw(indent),
+        Span::styled(mark, Style::new().fg(color)),
+        Span::styled(fit(&said, room), Style::new().fg(theme.muted)),
+    ])
+}
+
+/// What a session's task line says: its mark, and the status whose color
+/// it's in (muted for none), then its words.
+fn task_words(
+    session: &SessionInfo,
+    task: &protocol::TaskInfo,
+) -> ((&'static str, Option<Status>), String) {
     let goal = task.goal.lines().next().unwrap_or("");
     let summary = task
         .outcome
@@ -575,24 +647,18 @@ fn task_line<'a>(session: &SessionInfo, theme: &Theme, width: u16) -> Line<'a> {
         .map(|outcome| outcome.summary.as_str())
         .filter(|summary| !summary.is_empty())
         .unwrap_or(goal);
-    let asked;
     let (mark, color, said) = match (&session.asking, task.state()) {
         (Some(asking), _) => {
-            asked = format!("{} {}", asking.tool, asking.gist);
-            ("⚠ ", theme.waiting, asked.as_str())
+            let asked = format!("{} {}", asking.tool, asking.gist);
+            return (("⚠ ", Some(Status::Waiting)), asked);
         }
-        (None, TaskState::Waiting) => ("▲ ", theme.waiting, goal),
-        (None, TaskState::Done) => ("✓ ", theme.done, summary),
-        (None, TaskState::Failed) => ("✗ ", theme.failed, summary),
-        (None, TaskState::Cancelled) => ("– ", theme.muted, summary),
-        (None, TaskState::Running | TaskState::Pending) => ("", theme.muted, goal),
+        (None, TaskState::Waiting) => ("▲ ", Some(Status::Waiting), goal),
+        (None, TaskState::Done) => ("✓ ", Some(Status::Done), summary),
+        (None, TaskState::Failed) => ("✗ ", Some(Status::Failed), summary),
+        (None, TaskState::Cancelled) => ("– ", None, summary),
+        (None, TaskState::Running | TaskState::Pending) => ("", None, goal),
     };
-    let room = room.saturating_sub(mark.chars().count());
-    Line::from(vec![
-        Span::raw(indent),
-        Span::styled(mark, Style::new().fg(color)),
-        Span::styled(fit(said, room), Style::new().fg(theme.muted)),
-    ])
+    ((mark, color), said.to_string())
 }
 
 /// The line an agent or a script reported for a session, under its row
@@ -636,23 +702,8 @@ fn worktree_line<'a>(
     width: u16,
 ) -> Line<'a> {
     let mark = if main { "⌂ " } else { "⎇ " };
-    let doing = in_progress.map(|what| what.doing().to_string());
-    let branch_name = branch.unwrap_or("(detached)");
-    let (name, about) = if protocol::claude_codes_own(project, path) {
-        let subject = app.subject_of(path).map(str::to_string);
-        let directory = path
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned());
-        ("claude", subject.or(directory))
-    } else if let Some(label) = app.label_of(path) {
-        let about = match doing {
-            Some(doing) => format!("{branch_name} · {doing}"),
-            None => branch_name.to_string(),
-        };
-        (label, Some(about))
-    } else {
-        (branch_name, doing)
-    };
+    let (name, about) = worktree_names(app, project, path, branch, in_progress);
+    let name = name.as_str();
     // The indent and the mark before the branch; a space at the end.
     let room = usize::from(width).saturating_sub(WORKTREE_INDENT.len() + 2 + 1);
     let name_width = name.chars().count();
@@ -707,6 +758,409 @@ fn worktree_line<'a>(
         line.extend(right);
     }
     Line::from(line)
+}
+
+/// What a worktree's line calls it, and what it says after that: one
+/// Claude Code made for itself is `claude`, then the subject of the commit
+/// it's at, or its directory's name until git has said; one given a label,
+/// its label, then its branch and what git is in the middle of there; any
+/// other, its branch, then what git is in the middle of.
+fn worktree_names(
+    app: &App,
+    project: &Path,
+    path: &Path,
+    branch: Option<&str>,
+    in_progress: Option<InProgress>,
+) -> (String, Option<String>) {
+    let doing = in_progress.map(|what| what.doing().to_string());
+    let branch_name = branch.unwrap_or("(detached)");
+    if protocol::claude_codes_own(project, path) {
+        let subject = app.subject_of(path).map(str::to_string);
+        let directory = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned());
+        ("claude".to_string(), subject.or(directory))
+    } else if let Some(label) = app.label_of(path) {
+        let about = match doing {
+            Some(doing) => format!("{branch_name} · {doing}"),
+            None => branch_name.to_string(),
+        };
+        (label.to_string(), Some(about))
+    } else {
+        (branch_name.to_string(), doing)
+    }
+}
+
+/// A session's row being laid out as `[sidebar] rows` says: the session at
+/// `index`, the letters of its name `/`'s filter matched, the tab it's in
+/// when shown from another, and whether the selection's on it.
+struct SessionAt<'a> {
+    index: usize,
+    marked: &'a [usize],
+    tab: Option<&'a str>,
+    selected: bool,
+}
+
+/// A worktree's line being laid out as `[sidebar] worktree_row` says.
+struct WorktreeAt<'a> {
+    project: &'a Path,
+    path: &'a Path,
+    branch: Option<&'a str>,
+    main: bool,
+    in_progress: Option<InProgress>,
+}
+
+/// One of a session's lines, laid out from `pieces` after `indent`, a
+/// space kept clear at the end.
+fn laid_session<'a>(
+    app: &App,
+    pieces: &[Piece],
+    at: &SessionAt,
+    indent: &'static str,
+    look: &Look,
+    width: u16,
+) -> Line<'a> {
+    let room = usize::from(width).saturating_sub(indent.len() + 1);
+    let laid = rows::lay_out(pieces, look.theme, room, |token| {
+        session_value(app, at, token, look)
+    });
+    let Some(laid) = laid else {
+        return Line::raw(indent);
+    };
+    spread(indent, laid, room)
+}
+
+/// `laid` after `indent`, what follows its gap at the right of `room`.
+fn spread<'a>(indent: &'static str, laid: Laid<'a>, room: usize) -> Line<'a> {
+    let gap = room.saturating_sub(laid.left_width() + laid.right_width());
+    let mut spans = vec![Span::raw(indent)];
+    spans.extend(laid.left);
+    if !laid.right.is_empty() {
+        spans.push(Span::raw(" ".repeat(gap)));
+        spans.extend(laid.right);
+    }
+    Line::from(spans)
+}
+
+/// A worktree's line laid out from `pieces`, as `[sidebar] worktree_row`
+/// says: what follows its gap gives way to `removing…` while the daemon
+/// removes it.
+fn laid_worktree<'a>(
+    app: &App,
+    pieces: &[Piece],
+    worktree: &WorktreeAt,
+    theme: &Theme,
+    width: u16,
+) -> Line<'a> {
+    let room = usize::from(width).saturating_sub(WORKTREE_INDENT.len() + 1);
+    let removing = app.removing(worktree.path);
+    let mut pieces = pieces.to_vec();
+    if removing {
+        let gap = pieces.iter().position(|piece| piece.token() == rows::GAP);
+        pieces.truncate(gap.unwrap_or(pieces.len()));
+        pieces.push(Piece::Token(rows::GAP.into()));
+        pieces.push(Piece::Token("removing".into()));
+    }
+    let laid = rows::lay_out(&pieces, theme, room, |token| match token {
+        "removing" => Some(Value::styled("removing…", Style::new().fg(theme.muted))),
+        token => worktree_value(app, worktree, token, theme),
+    });
+    let Some(laid) = laid else {
+        return Line::raw(WORKTREE_INDENT);
+    };
+    spread(WORKTREE_INDENT, laid, room)
+}
+
+/// A project's heading laid out from `pieces`, as `[sidebar] project_row`
+/// says: what's before its gap, then the rule, then what follows it, a
+/// space kept clear at the end.
+fn laid_heading<'a>(
+    app: &App,
+    pieces: &[Piece],
+    name: &str,
+    project: &Path,
+    look: &Look,
+    width: u16,
+) -> Line<'a> {
+    let theme = look.theme;
+    let room = usize::from(width).saturating_sub(MARGIN.len() + 1);
+    // At least three columns of rule, a space either side.
+    let laid = rows::lay_out(pieces, theme, room.saturating_sub(5), |token| {
+        project_value(app, name, project, token, theme)
+    })
+    .unwrap_or_default();
+    let mut spans = vec![Span::raw(MARGIN)];
+    let (used, right) = (laid.left_width(), laid.right_width());
+    spans.extend(laid.left);
+    if used > 0 {
+        spans.push(Span::raw(" "));
+    }
+    let rule = room.saturating_sub(used + usize::from(used > 0) + right + usize::from(right > 0));
+    spans.push(Span::styled("─".repeat(rule), Style::new().fg(theme.rule)));
+    if right > 0 {
+        spans.push(Span::raw(" "));
+        spans.extend(laid.right);
+    }
+    Line::from(spans)
+}
+
+/// What a session's `token` says, for `[sidebar] rows`: its text, or
+/// `None` when it has nothing to say. `now` is for how long ago it
+/// changed.
+pub fn session_text(app: &App, index: usize, token: &str, now: u64) -> Option<String> {
+    let session = app.sessions().get(index)?;
+    let some = |text: String| (!text.is_empty()).then_some(text);
+    match token {
+        "mark" => Some(Status::of(session).mark(0).to_string()),
+        "name" => Some(session.name.clone()),
+        "title" => Some(
+            session
+                .row
+                .title
+                .clone()
+                .unwrap_or_else(|| session.name.clone()),
+        ),
+        "agent" => some(agent_word(session)?),
+        "model" => session.model.as_deref().map(model::short),
+        "subagents" => (session.subagents > 0).then(|| format!("+{}", session.subagents)),
+        "state" => {
+            let word = state_word(session);
+            let label = session.row.state_labels.get(word);
+            Some(label.cloned().unwrap_or_else(|| word.to_string()))
+        }
+        "when" => some(changed_ago(session, now)),
+        "bell" => session.bell.then(|| BELL_MARK.to_string()),
+        "task" => {
+            let task = session.task.as_ref().filter(|_| app.tasks_on())?;
+            some(task_words(session, task).1)
+        }
+        "line" => session.line.clone(),
+        "branch" => session.worktree.as_ref()?.branch.clone(),
+        "project" => Some(session.worktree.as_ref()?.project.clone()),
+        "tab" => app.tab_label(index),
+        "context" => session
+            .context
+            .map(|context| format!("{}%", context.percent())),
+        token => {
+            let name = token.strip_prefix('$')?;
+            session.row.tokens.get(name).cloned()
+        }
+    }
+}
+
+/// What's in front in a session, in a word, or the agent reported for its
+/// row: `rows_by_agent` goes by it.
+pub fn agent_word(session: &SessionInfo) -> Option<String> {
+    if let Some(agent) = &session.row.display_agent {
+        return Some(agent.clone());
+    }
+    let front = (session.front.clone()).or_else(|| crate::front::of_command(&session.command))?;
+    Some(front.word().to_string())
+}
+
+/// The program `[sidebar] rows_by_agent` lays a session out by: its agent's,
+/// Claude Code's for a background task, none for a terminal.
+pub fn agent_program(session: &SessionInfo) -> Option<String> {
+    let front = (session.front.clone()).or_else(|| crate::front::of_command(&session.command))?;
+    match front {
+        Front::Agent { program, .. } => Some(program),
+        Front::Task => Some("claude".to_string()),
+        Front::Shell { .. } | Front::Program { .. } => None,
+    }
+}
+
+/// A session's status in a word, as `state` says it and `--state-label`
+/// names it: a program at rest is `running`, an agent `idle`.
+fn state_word(session: &SessionInfo) -> &'static str {
+    match Status::of(session) {
+        Status::Waiting => "waiting",
+        Status::Working => "working",
+        Status::Done => "done",
+        Status::Running if groups::is_terminal(session) => "running",
+        Status::Running => "idle",
+        Status::Ended => "ended",
+        Status::Failed => "failed",
+        Status::Starting => "starting",
+    }
+}
+
+/// A session's `token` as a line laid out with it draws it.
+fn session_value<'a>(app: &App, at: &SessionAt, token: &str, look: &Look) -> Option<Value<'a>> {
+    let theme = look.theme;
+    let session = &app.sessions()[at.index];
+    let muted = Style::new().fg(theme.muted);
+    let value = match token {
+        "mark" => {
+            let (mark, color) = session_mark(session, look);
+            Value::styled(mark, Style::new().fg(color))
+        }
+        "name" | "title" => {
+            let text = session_text(app, at.index, token, look.now)?;
+            let color = if groups::is_terminal(session) {
+                theme.muted
+            } else {
+                theme.text
+            };
+            let mut style = Style::new().fg(color);
+            if at.selected {
+                style = style.add_modifier(Modifier::BOLD);
+            }
+            let marked_style = style
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+            let marked = if token == "name" { at.marked } else { &[] };
+            let spans = marked_spans(&text, marked, style, marked_style);
+            Value { text, spans }
+        }
+        "state" => {
+            let text = session_text(app, at.index, token, look.now)?;
+            Value::styled(text, Style::new().fg(theme.status(Status::of(session))))
+        }
+        "when" => match at.tab {
+            Some(tab) => Value::styled(format!("⇥ {tab}"), Style::new().fg(theme.accent)),
+            None => Value::styled(session_text(app, at.index, token, look.now)?, muted),
+        },
+        "bell" => Value::styled(
+            session_text(app, at.index, token, look.now)?,
+            Style::new().fg(theme.waiting),
+        ),
+        "task" => {
+            let task = session.task.as_ref().filter(|_| app.tasks_on())?;
+            let ((mark, status), said) = task_words(session, task);
+            if said.is_empty() {
+                return None;
+            }
+            let mut spans = Vec::new();
+            if !mark.is_empty() {
+                let color = status.map_or(theme.muted, |status| theme.status(status));
+                spans.push(Span::styled(mark, Style::new().fg(color)));
+            }
+            spans.push(Span::styled(said.clone(), muted));
+            Value { text: said, spans }
+        }
+        "line" => Value::styled(
+            session_text(app, at.index, token, look.now)?,
+            muted.add_modifier(Modifier::ITALIC),
+        ),
+        "branch" => Value::styled(
+            session_text(app, at.index, token, look.now)?,
+            Style::new().fg(theme.branch),
+        ),
+        token => Value::styled(session_text(app, at.index, token, look.now)?, muted),
+    };
+    Some(value)
+}
+
+/// A worktree's `token` as `[sidebar] worktree_row` draws it.
+fn worktree_value<'a>(
+    app: &App,
+    worktree: &WorktreeAt,
+    token: &str,
+    theme: &Theme,
+) -> Option<Value<'a>> {
+    let muted = Style::new().fg(theme.muted);
+    let branch = Style::new().fg(theme.branch);
+    let (name, about) = worktree_names(
+        app,
+        worktree.project,
+        worktree.path,
+        worktree.branch,
+        worktree.in_progress,
+    );
+    let spans = |spans: Vec<Span<'a>>| {
+        let text: String = spans.iter().map(|span| span.content.as_ref()).collect();
+        (!spans.is_empty()).then_some(Value { text, spans })
+    };
+    let stat = app.stat_of(worktree.path);
+    match token {
+        "mark" => Some(Value::styled(if worktree.main { "⌂" } else { "⎇" }, muted)),
+        "name" => Some(Value::styled(name, branch)),
+        "about" => Some(Value::styled(about?, muted)),
+        "branch" => Some(Value::styled(worktree.branch?.to_string(), branch)),
+        "label" => Some(Value::styled(
+            app.label_of(worktree.path)?.to_string(),
+            branch,
+        )),
+        "doing" => Some(Value::styled(
+            worktree.in_progress?.doing().to_string(),
+            muted,
+        )),
+        "changes" => {
+            let stat = stat.filter(|stat| stat.files > 0)?;
+            let mut changes = vec![Span::styled(
+                format!("+{}", stat.files),
+                Style::new().fg(theme.waiting),
+            )];
+            let lines = stat.added + stat.removed;
+            if lines > 0 {
+                changes.push(Span::raw(" "));
+                changes.push(Span::styled(format!("±{lines}"), muted));
+            }
+            spans(changes)
+        }
+        "upstream" => {
+            let stat = stat?;
+            let mut upstream = Vec::new();
+            if stat.ahead > 0 {
+                upstream.push(Span::styled(
+                    format!("↑{}", stat.ahead),
+                    Style::new().fg(theme.added),
+                ));
+            }
+            if stat.behind > 0 {
+                if !upstream.is_empty() {
+                    upstream.push(Span::raw(" "));
+                }
+                upstream.push(Span::styled(
+                    format!("↓{}", stat.behind),
+                    Style::new().fg(theme.removed),
+                ));
+            }
+            spans(upstream)
+        }
+        "pull_request" => {
+            let pull_request = app.pull_request(worktree.project, worktree.branch?)?;
+            let mut forms = pull_request_spans(pull_request, theme);
+            spans(forms.remove(0))
+        }
+        "path" => Some(Value::styled(shell::home_relative(worktree.path), muted)),
+        "project" => {
+            let name = app.project_name_of(worktree.project);
+            Some(Value::styled(name, muted))
+        }
+        token => {
+            let name = token.strip_prefix('$')?;
+            let value = app.project_tokens(worktree.project)?.get(name)?;
+            Some(Value::styled(value.clone(), muted))
+        }
+    }
+}
+
+/// A project's `token` as `[sidebar] project_row` draws it on its heading.
+fn project_value<'a>(
+    app: &App,
+    name: &str,
+    project: &Path,
+    token: &str,
+    theme: &Theme,
+) -> Option<Value<'a>> {
+    let muted = Style::new().fg(theme.muted);
+    match token {
+        "name" => Some(Value::styled(
+            name.to_string(),
+            Style::new().fg(theme.text).add_modifier(Modifier::BOLD),
+        )),
+        "to_do" => {
+            let open = app.backlog_open(project)?;
+            Some(Value::styled(format!("{open} to do"), muted))
+        }
+        "path" => Some(Value::styled(shell::home_relative(project), muted)),
+        token => {
+            let token = token.strip_prefix('$')?;
+            let value = app.project_tokens(project)?.get(token)?;
+            Some(Value::styled(value.clone(), muted))
+        }
+    }
 }
 
 /// What a worktree's line can say on the right, the most first: each form
@@ -995,11 +1449,15 @@ pub fn session_mark(session: &SessionInfo, look: &Look) -> (&'static str, Color)
     (status.mark(look.spin), theme.status(status))
 }
 
-/// What's in front in the session, in a word, when its name doesn't say
-/// already: a session called `refund-fix` with Claude Code in front shows
-/// `claude`, and one called `claude-2` shows nothing more.
+/// What's in front in the session, in a word, or the agent reported for
+/// its row, when its name doesn't say already: a session called
+/// `refund-fix` with Claude Code in front shows `claude`, and one called
+/// `claude-2` shows nothing more.
 fn front_label(session: &SessionInfo) -> Option<&str> {
-    let word = session.front.as_ref()?.word();
+    let word = match &session.row.display_agent {
+        Some(agent) => agent.as_str(),
+        None => session.front.as_ref()?.word(),
+    };
     let named = session.name.to_lowercase().contains(&word.to_lowercase());
     if named { None } else { Some(word) }
 }
@@ -1133,6 +1591,7 @@ pub fn fit(text: &str, width: usize) -> String {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use std::path::PathBuf;
 
     #[test]
     fn a_change_in_the_last_ten_seconds_is_now() {
@@ -1188,6 +1647,7 @@ mod tests {
             unseen_copies: 0,
             context: None,
             output_waits: 0,
+            row: Default::default(),
         }
     }
 
@@ -1571,6 +2031,128 @@ mod tests {
         assert!(added(
             &worktree_line(&app, project, path, Some("fix"), false, None, &theme, 28).spans
         ));
+    }
+
+    #[test]
+    fn the_agent_reported_for_a_row_shows_in_place_of_what_s_in_front() {
+        let mut session = session("refund-fix", claude());
+        session.row.display_agent = Some("pi".into());
+        assert_eq!(front_label(&session), Some("pi"));
+        session.front = None;
+        assert_eq!(front_label(&session), Some("pi"));
+    }
+
+    /// `app` with `[sidebar]` set as `toml` says.
+    fn laid_out(mut app: App, toml: &str) -> App {
+        let config = crate::config::from_text(&format!("[sidebar]\n{toml}")).unwrap();
+        app.set_interface(&config);
+        app
+    }
+
+    /// The line at `row` of the sidebar, drawn `width` wide.
+    fn drawn(app: &App, look: &Look, row: usize, width: u16) -> String {
+        let rows = app.rows();
+        row_line(app, &rows[row], look, width, false)
+            .to_string()
+            .trim_end()
+            .to_string()
+    }
+
+    fn in_app(name: &str) -> SessionInfo {
+        SessionInfo {
+            worktree: Some(crate::protocol::Worktree {
+                project: "app".into(),
+                project_path: "/code/app".into(),
+                path: "/code/app".into(),
+                main: true,
+                branch: Some("main".into()),
+                in_progress: None,
+            }),
+            ..session(name, claude())
+        }
+    }
+
+    #[test]
+    fn a_session_laid_out_shows_its_tokens_in_their_places() {
+        let theme = Theme::new(crate::config::ThemeName::DARK, false);
+        let look = Look {
+            theme: &theme,
+            now: 720,
+            spin: 0,
+        };
+        let mut fixer = in_app("fixer");
+        fixer.changed = 1;
+        fixer.model = Some("claude-opus-5-5".into());
+        fixer.activity = Some(crate::protocol::Activity::Waiting);
+        fixer.row.title = Some("refund fix".into());
+        fixer.row.display_agent = Some("pi".into());
+        fixer.row.state_labels = [("waiting".to_string(), "needs a key".to_string())].into();
+        fixer.row.tokens = [("load".to_string(), "90".to_string())].into();
+        let app = laid_out(
+            App::new(None),
+            r#"needs_you = false
+rows = [
+    ["mark", "title", "agent", "gap", "when"],
+    ["state", { token = "$load", rules = [{ gt = 80, hide = true }] }, "model"],
+]"#,
+        );
+        let mut app = app;
+        app.set_sessions(vec![fixer]);
+        // Under the project's heading and the worktree's line.
+        assert_eq!(
+            drawn(&app, &look, 2, 40),
+            "     ▲ refund fix · pi              11m"
+        );
+        assert_eq!(drawn(&app, &look, 3, 40), "       needs a key · opus 5.5");
+        // Short of room, what's left of the gap is cut first.
+        assert_eq!(drawn(&app, &look, 2, 22), "     ▲ refund fi… 11m");
+    }
+
+    #[test]
+    fn rows_by_agent_lay_one_agent_s_sessions_out_their_own_way() {
+        let theme = Theme::new(crate::config::ThemeName::DARK, false);
+        let look = Look {
+            theme: &theme,
+            now: 0,
+            spin: 0,
+        };
+        let shell = SessionInfo {
+            front: Some(Front::Shell { name: "zsh".into() }),
+            ..in_app("zsh")
+        };
+        let app = laid_out(
+            App::new(None),
+            "[sidebar.rows_by_agent]\nclaude = [[\"name\", \"agent\"]]",
+        );
+        let mut app = app;
+        app.set_sessions(vec![in_app("fixer"), shell]);
+        assert_eq!(drawn(&app, &look, 2, 40), "     fixer · claude");
+        // A terminal has crystal's own.
+        assert!(drawn(&app, &look, 4, 40).starts_with("     ❯ zsh"));
+    }
+
+    #[test]
+    fn a_worktree_and_a_heading_laid_out_show_the_project_s_tokens() {
+        let theme = Theme::new(crate::config::ThemeName::DARK, false);
+        let look = Look {
+            theme: &theme,
+            now: 0,
+            spin: 0,
+        };
+        let app = laid_out(
+            App::new(None),
+            r#"worktree_row = ["mark", "name", "gap", "$deploy"]
+project_row = ["name", "gap", "$deploy"]"#,
+        );
+        let mut app = app;
+        app.set_sessions(vec![in_app("fixer")]);
+        let deploy = [("deploy".to_string(), "green".to_string())].into();
+        app.set_project_tokens([(PathBuf::from("/code/app"), deploy)].into());
+        assert_eq!(drawn(&app, &look, 0, 28), " app ──────────────── green");
+        assert_eq!(drawn(&app, &look, 1, 28), "   ⌂ main             green");
+        app.set_project_tokens(Default::default());
+        assert_eq!(drawn(&app, &look, 0, 28), " app ──────────────────────");
+        assert_eq!(drawn(&app, &look, 1, 28), "   ⌂ main");
     }
 
     #[test]

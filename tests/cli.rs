@@ -1888,8 +1888,9 @@ fn a_question_mark_shows_every_key_and_the_next_key_only_closes_it() {
     // 80 by 24 takes three pages; space turns to the next.
     tui.shows("1/3");
     tui.type_keys(" ");
-    tui.shows("In resize mode");
+    tui.shows("In a pane");
     tui.type_keys(" ");
+    tui.shows("In resize mode");
     tui.shows("With the mouse");
 
     // q puts the keys away; it doesn't quit.
@@ -16099,6 +16100,78 @@ fn a_line_and_a_model_reported_for_a_session_show_on_its_row() {
     let err = crystal.fails(&["report", "-n", "indexer", "--line", "x", "--source", "a b"]);
     assert!(err.contains("letters, digits"), "{err}");
     crystal.fails(&["report", "-n", "indexer", "--ttl", "5s"]);
+}
+
+#[test]
+fn the_sidebar_lays_rows_out_as_the_config_says_and_keeps_an_order_put_by_hand() {
+    let crystal = Crystal::new();
+    crystal.configure(
+        "notify = false\nname_from_prompt = false\nconfirm_quit = false\n\n\
+         [plugins]\nmemory = false\n\n[sound]\nenabled = false\n\n\
+         [mouse]\nscrollbars = false\n\n[terminal]\nshell_mode = \"non_login\"\n\n\
+         [sidebar]\nrows = [[\"mark\", \"name\", \"gap\", \"$load\"], [\"state\"]]\n\
+         project_row = [\"name\", \"$deploy\"]\n",
+    );
+    let app = git_repo(crystal.dir.path(), "app");
+    let app_arg = app.to_str().unwrap();
+    for name in ["first", "second"] {
+        crystal.ok(&["new", "-n", name, "-c", app_arg, "sleep", "30"]);
+    }
+    crystal.ok(&[
+        "report",
+        "-n",
+        "second",
+        "--token",
+        "load=93",
+        "--state-label",
+        "running=busy",
+    ]);
+    crystal.ok(&[
+        "project",
+        "report",
+        "-C",
+        app_arg,
+        "--token",
+        "deploy=green",
+    ]);
+    let listed = crystal.listed("second");
+    assert_eq!(listed["row"]["tokens"]["load"], "93", "{listed}");
+    assert_eq!(listed["row"]["state_labels"]["running"], "busy", "{listed}");
+    let err = crystal.fails(&["report", "-n", "second", "--token", "load"]);
+    assert!(err.contains("NAME=VALUE"), "{err}");
+
+    // With no TUI open, the daemon keeps a move for the next to open.
+    crystal.ok(&["sidebar", "move", "second", "--up"]);
+    let order = |crystal: &Crystal| {
+        let layout: serde_json::Value =
+            serde_json::from_str(&crystal.ok(&["layout", "--json"])).unwrap();
+        layout["tabs"][0]["sessions"].clone()
+    };
+    assert_eq!(order(&crystal), serde_json::json!(["second", "first"]));
+    let err = crystal.fails(&["sidebar", "move", "second", "--up"]);
+    assert!(err.contains("second is first already"), "{err}");
+
+    let mut tui = crystal.tui();
+    tui.shows("app · green");
+    tui.shows("busy");
+    let sidebar = sidebar_of(&tui.text());
+    let second = line_with(&sidebar, "❯ second");
+    assert!(second < line_with(&sidebar, "❯ first"), "{sidebar}");
+    // The load goes at the right edge, past the gap.
+    let row = sidebar.lines().nth(second).unwrap();
+    assert!(row.trim_end_matches('│').ends_with("93 "), "{sidebar}");
+    // Alt+k moves the selected session, first, back up.
+    tui.shows("main ▸ first");
+    tui.type_keys("\x1bk");
+    eventually("first moves up", || {
+        let sidebar = sidebar_of(&tui.text());
+        sidebar.contains("❯ second")
+            && line_with(&sidebar, "❯ first") < line_with(&sidebar, "❯ second")
+    });
+    tui.type_keys("q");
+    assert!(tui.exit());
+    // The next TUI opens on the order this one left.
+    assert_eq!(order(&crystal), serde_json::json!(["first", "second"]));
 }
 
 #[test]

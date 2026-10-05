@@ -8,6 +8,7 @@ use crate::flows::Flow;
 use crate::plugins;
 use crate::profile::Profile;
 use crate::tui::keymap::{KeySettings, Keymap};
+use crate::tui::rows;
 use crate::vt;
 use anyhow::{Context, Result, bail};
 use ratatui::style::Color;
@@ -439,7 +440,7 @@ pub struct NotifySettings {
 }
 
 /// How the TUI's sidebar is laid out.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SidebarSettings {
     /// How many columns wide it is until it's resized, with the mouse on
@@ -457,6 +458,60 @@ pub struct SidebarSettings {
     /// ssh, shows one column: the sidebar across all of it, or the pane
     /// being typed into. 0 never does.
     pub phone_width: u16,
+    /// Whether what waits on the user comes first, or everything stays
+    /// where it is.
+    pub order: SidebarOrder,
+    /// A session's lines, each the tokens on it: see [`crate::tui::rows`].
+    /// None, crystal's own.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub rows: Vec<Vec<rows::Piece>>,
+    /// The same for the sessions of one agent, by its program's name, like
+    /// `claude`, in place of `rows`.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub rows_by_agent: BTreeMap<String, Vec<Vec<rows::Piece>>>,
+    /// The tokens on a worktree's line. None, crystal's own.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub worktree_row: Vec<rows::Piece>,
+    /// The tokens on a project's heading, the rule filling the room left.
+    /// None, crystal's own.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub project_row: Vec<rows::Piece>,
+}
+
+/// The order of the sidebar's projects and sessions. Either way, they're
+/// in the order they were made, or the order the user put them in by hand.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SidebarOrder {
+    /// A project with a session waiting on the user goes to the top, and
+    /// that session leads its worktree, for as long as it waits.
+    #[default]
+    Attention,
+    /// Nothing moves as statuses change: what waits on the user shows in
+    /// the pinned rows at the top.
+    Stable,
+}
+
+impl SidebarSettings {
+    /// Whether a project's or a worktree's row shows tokens reported for
+    /// its project, which the TUI asks the daemon for.
+    pub fn shows_project_tokens(&self) -> bool {
+        let reported = |piece: &rows::Piece| piece.token().starts_with('$');
+        self.worktree_row
+            .iter()
+            .chain(&self.project_row)
+            .any(reported)
+    }
+
+    fn check(&self) -> Result<()> {
+        rows::check_lines(&self.rows).context("in [sidebar] rows")?;
+        rows::check_agents(&self.rows_by_agent).context("in [sidebar] rows_by_agent")?;
+        rows::check_line(&self.worktree_row, rows::Kind::Worktree)
+            .context("in [sidebar] worktree_row")?;
+        rows::check_line(&self.project_row, rows::Kind::Project)
+            .context("in [sidebar] project_row")?;
+        Ok(())
+    }
 }
 
 /// The narrowest and widest the sidebar can be, unfolded.
@@ -470,6 +525,11 @@ impl Default for SidebarSettings {
             fold: Fold::Marks,
             needs_you: true,
             phone_width: 64,
+            order: SidebarOrder::default(),
+            rows: Vec::new(),
+            rows_by_agent: BTreeMap::new(),
+            worktree_row: Vec::new(),
+            project_row: Vec::new(),
         }
     }
 }
@@ -1318,6 +1378,7 @@ pub fn from_text(text: &str) -> Result<Config> {
             SIDEBAR_WIDTHS.end()
         );
     }
+    config.sidebar.check()?;
     for entry in &config.tab_bar.right {
         entry.check().context("in [tab_bar] right")?;
     }
@@ -2240,6 +2301,36 @@ back_to = "build"
                 fold: Fold::Hidden,
                 needs_you: false,
                 phone_width: 50,
+                order: SidebarOrder::Stable,
+                rows: vec![
+                    vec![
+                        rows::Piece::Token("mark".into()),
+                        rows::Piece::Token("name".into()),
+                        rows::Piece::Token("gap".into()),
+                        rows::Piece::Token("when".into()),
+                    ],
+                    vec![rows::Piece::Styled(rows::Styled {
+                        token: "$load".into(),
+                        fg: Some(rows::Paint::try_from("muted".to_string()).unwrap()),
+                        bold: None,
+                        dim: Some(true),
+                        italic: None,
+                        rules: vec![rows::Rule {
+                            gt: Some(80.0),
+                            fg: Some(rows::Paint::try_from("#ff5555".to_string()).unwrap()),
+                            ..rows::Rule::default()
+                        }],
+                    })],
+                ],
+                rows_by_agent: BTreeMap::from([(
+                    "codex".to_string(),
+                    vec![vec![rows::Piece::Token("name".into())]],
+                )]),
+                worktree_row: vec![rows::Piece::Token("name".into())],
+                project_row: vec![
+                    rows::Piece::Token("name".into()),
+                    rows::Piece::Token("$deploy".into()),
+                ],
             },
             terminal: TerminalSettings {
                 default_shell: "fish".into(),

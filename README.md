@@ -28,7 +28,8 @@ worktrees. The agents keep working after you close it, and you can always see wh
   or idle. crystal reads that from the agent's hooks when it has them and from its screen when it doesn't, and
   waiting sessions float to the top.
 - **Every project in one list** — projects, their git worktrees and the sessions in each, in one sidebar you
-  drive from the keyboard, with the selected session live next to it.
+  drive from the keyboard, with the selected session live next to it, in an order of your own if you like,
+  each row laid out your way.
 - **One worktree per agent** — give an agent its own branch and `git worktree` in one key, so agents working in
   parallel never edit the same checkout.
 - **Conversations survive restarts** — when crystal comes back up, each agent reopens its previous
@@ -198,6 +199,8 @@ and the footer says where you are and offers the keys that matter there, or, whe
 | `(` / `)` | make the [sidebar](#the-sidebar) narrower or wider; its edge drags with the mouse too |
 | `\` | fold the [sidebar](#the-sidebar) down to a rail of marks, or unfold it |
 | `h` / `l` | fold the selected session's project down to its heading in the [sidebar](#the-sidebar), or unfold it; a click on a project's heading does the same |
+| `Alt+k` / `Alt+j` | move the selected session up or down among those beside it in its worktree, or a folded project among the projects; dragging its row does the same: [the order](#the-order) |
+| `Alt+K` / `Alt+J` | move the selected session's project up or down among the projects; dragging its heading does the same |
 | `o` | open the pull request of the selected session's branch in your browser |
 | `O` | list the open [pull requests](#pull-requests-and-issues) of the selected session's project: read one, see its diff, comment, or start an agent in its worktree |
 | `i` | list the open [issues](#pull-requests-and-issues) of the selected session's project: read one, comment, edit it, or start an agent on it |
@@ -533,6 +536,7 @@ crystal profile show review                 # what a profile runs, and where it 
 crystal pane split review                   # show a session in a pane beside yours in the TUI (see below)
 crystal tab new review                      # a new tab in the TUI, in front
 crystal title set "deploying"               # the title of the TUI's terminal, until `crystal title clear`
+crystal sidebar move review --up            # put a session a place up in the sidebar, for good (see below)
 crystal layout                              # the TUI's tabs and how each splits its panes
 crystal layout apply dev.json               # lay them out as a file says, starting what isn't there
 crystal skill --install                     # teach Claude Code to drive crystal (see below)
@@ -847,8 +851,102 @@ width = 32             # 16 to 80 columns
 folded = false         # start folded
 fold = "marks"         # what folding keeps: "marks", or "hidden" for nothing
 needs_you = true       # pin what needs you at the top
+order = "attention"    # what waits on you goes first; "stable" moves nothing as statuses change
 phone_width = 64       # one column at this width or narrower; 0 never
 ```
+
+#### The order
+
+Projects come in the order their first sessions were made, and within a worktree, sessions in the order they
+were made, its agents before its terminals. Ordered by attention, as they are unless `order = "stable"` under
+`[sidebar]` says otherwise, a project with an agent waiting on you goes to the top for as long as it waits,
+and that agent leads its worktree: what needs you is at the top, still beside the work it belongs to. Stable,
+nothing moves as statuses change, and what waits on you shows in the pinned **needs you** rows instead. The
+settings view's Look tab switches it.
+
+Either way, the order is yours to change. `Alt+k` and `Alt+j` (or `Alt+↑` and `Alt+↓`) move the selected session
+a place up or down among the sessions beside it in its worktree, agents among agents and terminals among
+terminals; on a folded project's heading, they move the project. `Alt+K` and `Alt+J` (or `Alt+Shift+↑` and
+`Alt+Shift+↓`) move the selected session's project among the projects. With the mouse, drag a session's row
+onto another's in its worktree, or a project's heading onto any row of another project: it goes before the one
+it's let go of, or after it when that's further down. A click on a heading still folds it; it folds as the
+button comes up, where it went down. `crystal sidebar move` does the same from the command line. A project
+with no sessions keeps the place it was put in, and a session renamed keeps its place; what you haven't placed
+comes after what you have, in the order it was made. Ordered by attention, what waits on you still goes first,
+and a move it holds back says so. The order is kept in crystal's database across restarts, cold ones too, and
+a step of a [flow](#flows) keeps its place in its run. On a Mac, `Alt` is `Option` once your terminal sends it
+as `Meta` (Terminal's and iTerm2's profiles each have a setting for it).
+
+#### Laying out its rows
+
+A session's row, a worktree's line and a project's heading can be laid out your own way, as herdr's sidebar
+rows are: each line a list of tokens, written in the order they go. `rows` lays out a session's lines,
+`rows_by_agent` a particular agent's sessions in place of `rows`, by the agent's program (`claude`, `codex`,
+…), `worktree_row` a worktree's line and `project_row` a project's heading. Left out, crystal draws its own.
+
+```toml
+[sidebar]
+rows = [
+  ["mark", "name", "agent", "gap", "when"],
+  [{ token = "$load", rules = [{ gt = 80, fg = "failed", bold = true }, { gt = 50, fg = "waiting" }] }, "state"],
+  ["task"],
+]
+worktree_row = ["mark", "name", "about", "gap", "changes", "upstream", "pull_request", "$deploy"]
+project_row = ["name", "$deploy", "gap", "to_do"]
+
+[sidebar.rows_by_agent]
+codex = [["mark", "title", "model", "gap", "when"], ["line"]]
+```
+
+Tokens on one line are separated by ` · `, but for a single space after `mark`, and what follows `gap` goes at
+the line's right edge (on a heading, the rule fills the room between them). A token with nothing to say is left
+out with the separator before it, and a line with nothing on it goes, but a session's first, which the
+selection rests on. Short of room, what's before the gap is cut first, then what's after it goes. A session's
+lines past its first take the place of its task's line and its reported line, under its name: `task` and
+`line` put them where you like.
+
+| Session token | What it says |
+|---|---|
+| `mark` | its status's mark, in its color |
+| `name` | its name |
+| `title` | the title reported for it with `--title`, or else its name |
+| `agent` | what's in front in it, in a word, or the agent reported with `--display-agent` |
+| `model` | the model its agent runs on |
+| `subagents` | how many subagents its agent has running, `+2` |
+| `state` | its status in a word (`waiting`, `working`, `done`, `idle`, `running`, `ended`, `failed`, `starting`), or the label reported for it with `--state-label` |
+| `when` | how long ago it changed, or the tab it's in when it's shown from another |
+| `bell` | `♪` while its bell rang out of sight |
+| `task` | its task: what it was asked to do, or how that went |
+| `line` | the line reported for it with `--line` |
+| `branch`, `project`, `tab` | its worktree's branch, its project's name, the tab it's in |
+| `context` | how full a background task's conversation is, `42%` |
+| `$name` | the value reported for it with `crystal report --token name=…` |
+
+| Worktree token | What it says |
+|---|---|
+| `mark` | `⌂` for the main worktree, `⎇` for a linked one |
+| `name` | its label, its branch, or `claude` for one Claude Code made |
+| `about` | what's said after its name: its branch, what git is in the middle of |
+| `branch`, `label`, `doing` | its branch, the label it was given, what git is in the middle of there |
+| `changes`, `upstream` | its changes not committed, `+3 ±42`, and how far it is from its upstream, `↑2 ↓1` |
+| `pull_request` | its pull request and how it stands, `#57 ✓` |
+| `path`, `project` | its directory, its project's name |
+| `$name` | the value reported for its project with `crystal project report --token name=…` |
+
+A project's heading takes `name`, `to_do` (how many backlog items are left, `3 to do`), `path` and `$name`, its
+project's tokens. While crystal removes a worktree, what follows its line's gap says `removing…`.
+
+A token can be a table that styles it: `fg`, a color as `[colors]` takes one or one of the theme's by what it's
+for (`text`, `muted`, `accent`, `branch`, `waiting`, `working`, `done`, `running`, `ended`, `failed`, `added`,
+`removed`), which follows the theme, and `bold`, `dim` and `italic`, `true` or `false`; what's left unsaid
+keeps the token's own look. Its `rules`, up to 16, each have one condition, `equals`, `contains` and
+`starts_with` (case and all, unless `ignore_case = true`) or `gt` and `lt`, for a value that reads whole as a
+number: the first that holds styles the token as it says, or with `hide = true`, leaves it out. `mark`, `bell`,
+`changes`, `upstream` and `pull_request` take a style but no rules. A token crystal doesn't know, a rule with
+no condition or two, more than 16 lines or 16 tokens on one, is an error that says which.
+
+The pinned **needs you** rows, the folded sidebar's rail, a folded project's heading and a flow's steps keep
+crystal's own look.
 
 #### On a phone
 
@@ -1633,6 +1731,24 @@ it's said again or taken off with `""`, or for as long as `--ttl` gives it (`30s
 `--model ""` gives back the model crystal reads. Text is put on one line, without control characters, and cut to
 80 characters.
 
+#### Tokens, a title and labels for a layout
+
+```sh
+crystal report --token load=93 --token ci=green         # values for a layout's $load and $ci
+crystal report --token ci=                              # take one off; the others stay
+crystal report --title "refund fix"                    # what `title` says in place of the session's name
+crystal report --display-agent pi                       # the agent its row says is in front, as `agent` does too
+crystal report --state-label waiting="needs a key"      # what `state` says while it waits; again for another
+crystal project report --token deploy=green --ttl 10m   # a value for the project's heading and worktrees, $deploy
+```
+
+These are values for rows [laid out your own way](#laying-out-its-rows), and like `--line`, for the sidebar
+alone: they don't take the session over, go with `--ttl`, `--source` and `--seq` the same way, and are cut to 80
+characters. A token's name is letters, digits, `_` and `-`, starting with a letter, and a session or a project
+shows 32 at most. `--display-agent` shows on crystal's own row too, where it says what's in front.
+`crystal project report` puts its tokens on the project the directory it's run in (or `-C`) is in, for its
+heading's and its worktrees' `$name`.
+
 #### Numbered reports
 
 ```sh
@@ -1849,6 +1965,10 @@ crystal layout export > dev.json          # the tabs as a layout file, with what
 crystal layout apply dev.json             # lay them out as the file says, starting what isn't there; --replace
 crystal title set "deploying"             # the title of the TUI's terminal, in place of the settings' one
 crystal title clear                       # back to the settings' one
+crystal sidebar move tests --up           # a place up among the sessions in its worktree, as Alt+k does; --down
+crystal sidebar move tests --before lint  # just before another of them; --after
+crystal sidebar move --project --down     # the project this directory is in, among the projects, as Alt+J does
+crystal sidebar move --project ~/web --before ~/app   # a project just before another, each by a directory in it
 ```
 
 A command about a session works on the tab that holds it, whether it's in front or not, and leaves the tab in
@@ -1860,6 +1980,8 @@ moves into that tab, out of any pane it had. With no session named, `pane split`
 off, in the directory it's run in or `--cwd`, with any `--env` variables, as `crystal new` does, and prints its
 name. A command that can't be carried out says why, the way the footer would: no room for another pane, a
 session that isn't on screen. `title` needs a TUI open: with none, there's no terminal to give the title.
+`sidebar move` puts a session in [the order](#the-order) of your own, among the sessions beside it in its
+worktree, or with `--project`, a project among the projects.
 `pane swap` trades the places of two panes in a tab, the splits and how big each is staying as they are:
 the session's and the one that way from it, or another session's. `pane ratio` gives the side a session's
 pane is on, of the split nearest above it, a share of that split's room, whichever side it is: or of the
@@ -3050,7 +3172,7 @@ that makes no sense is said there too, and the settings stay as they were until 
 | `[sessions]` | | `stop_idle_after`, how long an agent may sit [idle](#archiving-and-idle-agents) before crystal stops it, like `"30m"`: `"off"`; `restart_spacing_ms`, how far apart the agents a [crash or a reboot](#usage) starts again start (`250`, or `0` for all at once); `restore_screens`, whether a terminal a crash or a reboot starts again shows what it showed before, kept in crystal's database (`false`: a screen can hold secrets) |
 | `[[project]]` | | a project's [run and open commands](#projects), by its main worktree's `path`, in place of its own file's, and the [plugins it ships](#a-projects-own-plugins) that are on for it, `plugins` |
 | `[keys]` | | the TUI's keys, by command, its prefixes, the key back to the sidebar, answering's, resize mode's and the views', and `[[keys.command]]`, keys of your own that run commands: [keys and commands](#keys-and-commands) |
-| `[sidebar]` | | the sidebar's `width`, whether it starts `folded`, what folding keeps, whether what needs you is pinned, and how narrow a terminal shows [one column](#on-a-phone): [the sidebar](#the-sidebar) |
+| `[sidebar]` | | the sidebar's `width`, whether it starts `folded`, what folding keeps, whether what needs you is pinned, its [`order`](#the-order), how narrow a terminal shows [one column](#on-a-phone), and its rows [laid out your own way](#laying-out-its-rows): [the sidebar](#the-sidebar) |
 | `[terminal]` | | the shell a new terminal runs, `default_shell`, whether it's a login shell, `shell_mode`, and where `t` starts one, `new_cwd`: [terminals](#terminals-the-window-and-the-tab-bar) |
 | `[window]` | | `title`, what the TUI titles its terminal: [the window](#terminals-the-window-and-the-tab-bar) |
 | `[tab_bar]` | | where the tab bar goes, whether it's left out with one tab, and what it shows at its right: [the tab bar](#terminals-the-window-and-the-tab-bar) |
@@ -3263,7 +3385,7 @@ bar.
 | Tab | What's in it |
 |---|---|
 | General | [notifications](#usage): whether, after how long, only while you're away, and a command of your own in place of them; sounds; whether `q` asks before it quits; looking for a [newer crystal](#updating); how long the [event log](#events) keeps what happened; and whether [draft pull requests](#pull-requests) are hidden |
-| Look | the [theme](#themes), whether it follows your system's appearance (the row says which theme each side is) and the theme for each side; the [tab bar](#terminals-the-window-and-the-tab-bar)'s place, whether it's left out with one tab, and its separator; the window's title; the [sidebar](#the-sidebar)'s width, whether it starts folded, what folding keeps, whether what needs you is pinned, and how narrow a terminal shows [one column](#on-a-phone); whether keys pressed show at the footer (`show_keys`), and whether [mermaid diagrams](#the-file-finder-and-the-tree-browser) are drawn in ASCII |
+| Look | the [theme](#themes), whether it follows your system's appearance (the row says which theme each side is) and the theme for each side; the [tab bar](#terminals-the-window-and-the-tab-bar)'s place, whether it's left out with one tab, and its separator; the window's title; the [sidebar](#the-sidebar)'s width, whether it starts folded, what folding keeps, whether what needs you is pinned, whether what waits goes first ([the order](#the-order)), and how narrow a terminal shows [one column](#on-a-phone); whether keys pressed show at the footer (`show_keys`), and whether [mermaid diagrams](#the-file-finder-and-the-tree-browser) are drawn in ASCII |
 | Sessions | what the [new-session panel](#starting-a-session) offers first, naming sessions for their prompt, how long an agent may sit [idle](#archiving-and-idle-agents), how far apart agents start again after a [crash or a reboot](#usage) and whether one resumes as it said; a new terminal's shell, whether it's a login shell and where it starts; how much each session's history keeps, the running ones' too, and whether a terminal shows it again after a crash or a reboot; and the branch new worktrees start from, where they go and whether one its last session is killed from is removed |
 | Mouse | [the mouse](#usage), and whether programs' copies go on [your clipboard](#zoom-copy-mode-and-search) |
 | Tasks | the permission mode [background tasks](#background-tasks) start in, and what a run and a day may spend |
@@ -3430,6 +3552,7 @@ emulates for it, as it would through any terminal.
 - [x] Hooks for a Claude Code or Codex typed into a shell, resumed after a restart, and subagents counted
 - [x] Hooks or plugins for 15 more agents, each resumed in its conversation after a restart
 - [x] Archived sessions, idle agents stopped, right-click menus, and projects kept with their run and open commands
+- [x] A sidebar in a stable order, or one of your own, and its rows laid out your way, with what agents report
 
 ## Development
 
