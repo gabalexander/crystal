@@ -4099,6 +4099,9 @@ fn send_wait_fails_when_the_agent_never_starts_on_what_it_was_sent() {
         .stdout(Stdio::piped())
         .spawn()
         .unwrap();
+    // It types only once it has seen the agent working: the turn ends after
+    // that, or the send would find it done, and stall.
+    shows_on_screen(&crystal, "agent", "queued");
     run_hook(&crystal, "agent", &hook, r#"{"hook_event_name":"Stop"}"#);
     let out = waiting.wait_with_output().unwrap();
     assert!(out.status.success());
