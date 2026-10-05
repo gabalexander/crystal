@@ -1583,6 +1583,23 @@
       ],
       "description": "A note added to a worktree's handoff file."
     },
+    "HelperUsage": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Its program's name, as the system keeps it: cut to 15 bytes."
+        },
+        "usage": {
+          "$ref": "#/$defs/ProcessUsage"
+        }
+      },
+      "required": [
+        "name",
+        "usage"
+      ],
+      "description": "What a process the daemon runs that isn't a session's takes, with every process under it: the distiller's `claude -p`, git, a plugin's hook."
+    },
     "InProgress": {
       "type": "string",
       "enum": [
@@ -2447,6 +2464,28 @@
         "status"
       ],
       "description": "A session as `ls --json` lists it: what the daemon knows, and the word its STATE column shows."
+    },
+    "Machine": {
+      "type": "object",
+      "properties": {
+        "bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "description": "Its memory, in bytes: 0 when it can't say."
+        },
+        "cores": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0,
+          "description": "Its cores, those online: 0 when it can't say."
+        }
+      },
+      "required": [
+        "bytes",
+        "cores"
+      ],
+      "description": "What the machine has."
     },
     "MemoryEntry": {
       "type": "object",
@@ -3329,7 +3368,12 @@
           "type": "integer",
           "format": "uint64",
           "minimum": 0,
-          "description": "Resident memory, in bytes."
+          "description": "Memory, in bytes: the physical footprint on a Mac, the resident set on Linux."
+        },
+        "cpu": {
+          "type": "number",
+          "format": "double",
+          "description": "CPU since the look counted from, in percent of one core, to a tenth: 100 is one core busy all that while."
         },
         "processes": {
           "type": "integer",
@@ -3341,6 +3385,7 @@
       "required": [
         "pid",
         "bytes",
+        "cpu",
         "processes"
       ],
       "description": "What a process, and with a session's, every process under it, takes."
@@ -4214,7 +4259,7 @@
           "required": [
             "type"
           ],
-          "description": "The memory each running session's processes take, the daemon's own, and the asking client's, whose process is `client`."
+          "description": "The memory and CPU each running session's processes take, the daemon's own and its helpers', and the asking client's, whose process is `client`."
         },
         {
           "type": "object",
@@ -5286,7 +5331,15 @@
       "properties": {
         "daemon": {
           "$ref": "#/$defs/ProcessUsage",
-          "description": "The daemon's own process, without its sessions'."
+          "description": "The daemon's own process, without its sessions' or its helpers'."
+        },
+        "helpers": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/HelperUsage"
+          },
+          "description": "The processes the daemon runs that aren't sessions' programs or the agent kept warm, each with every process under it.",
+          "default": []
         },
         "client": {
           "anyOf": [
@@ -5297,7 +5350,7 @@
               "type": "null"
             }
           ],
-          "description": "The client that asked, when it said which process it is."
+          "description": "The client that asked, with every process under it, when it said which process it is."
         },
         "sessions": {
           "type": "array",
@@ -5317,17 +5370,21 @@
           ],
           "description": "The agent kept warm for a new session to take over, while there's one: `[sessions] warm_agent`."
         },
-        "total": {
+        "machine": {
+          "$ref": "#/$defs/Machine"
+        },
+        "cpu_over_ms": {
           "type": "integer",
           "format": "uint64",
           "minimum": 0,
-          "description": "The memory the machine has, in bytes: 0 when it can't say."
+          "description": "How long CPU was counted over, in milliseconds: 0 when it couldn't be, every process's CPU then 0."
         }
       },
       "required": [
         "daemon",
         "sessions",
-        "total"
+        "machine",
+        "cpu_over_ms"
       ],
       "description": "One look at what crystal takes."
     },

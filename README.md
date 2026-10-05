@@ -220,7 +220,7 @@ and the footer says where you are and offers the keys that matter there, or, whe
 | `P` | list your [profiles](#profiles), and add, change, copy or remove one |
 | `X` | list the [plugins](#plugins): switch them on and off, run their actions and open their panes |
 | `,` | open the [settings](#the-settings-view): notifications, sounds, the theme, and how memory learns and searches, each changed as you go |
-| `#` | the memory each session's processes take, and crystal's own: [RAM](#ram) |
+| `#` | the memory and CPU each session's processes take, and crystal's own: [resources](#resources) |
 | `?` | show every key, in the sidebar, in a pane, in resize mode, in a view, in a question and with the mouse, your own included: a page at a time when they don't all fit, `→` and `←` (or `Space`, `PgDn` and `PgUp`) turning the pages; `Tab` goes to the [guide](docs/guide.md), a page on what to start, the keys that matter most and what agents call, and back |
 | `q` | quit, once you've said `y`; the sessions keep running |
 
@@ -567,6 +567,8 @@ crystal kill review                         # stop one session; asks if its empt
 crystal archive review                      # stop it and keep it in the archive, out of the list
 crystal unarchive review                    # start it again where it was, in its conversation
 crystal ls --archived                       # the archived sessions
+crystal usage                               # the memory and CPU each session takes, and crystal's own
+crystal usage --json                        # the same, as JSON, with the totals
 crystal project                             # the projects crystal knows, running or not
 crystal project run                         # run this worktree's project in a session of its own
 crystal kill-server                         # stop every session, and the daemon
@@ -778,7 +780,7 @@ everywhere else. `[keys]` names them the same way:
 
 A view is any of the lists that take the keyboard: the diff, the file finder, the tree browser, find in files,
 the branch switcher, memory, the handoff notes, the files `crystal open` shows, the backlog, layouts, the
-archive, the plugins, the settings, what needs you, RAM, the timeline, the issues, the pull requests, `/` and the command list. A key you give a view's name stands in every
+archive, the plugins, the settings, what needs you, resources, the timeline, the issues, the pull requests, `/` and the command list. A key you give a view's name stands in every
 one of them for the key they all take for it, `↓`, `↑`, `PgDn`, `PgUp`, `Enter` or `Esc`, which go on working
 whatever you give; the defaults you leave it without do nothing. While a view is taking what you type, like
 the file finder's query or a filter, a letter is typed rather than standing for anything, so a key there is
@@ -1284,7 +1286,7 @@ You can have crystal keep a Claude Code started and waiting, so that a new sessi
 `warm_agent = true` under `[sessions]`, the TUI has the daemon keep one where its selection rests, started as
 the new-session panel would start it there, crystal's notes and all, and a new session started the same way, in
 that directory with that command, takes it over, its task typed in as its first prompt. It takes what an idle
-Claude Code does, a few hundred MB, for as long as a TUI is open, the RAM view showing it beside crystal's own,
+Claude Code does, a few hundred MB, for as long as a TUI is open, the resources view showing it beside crystal's own,
 and it's started again every ten minutes while it waits, so that what it was told as it started, the worktree's
 handoff notes and the project's memory, stays fresh. It's let go once no TUI has asked for it in a quarter of
 an hour, once the setting goes off, and before a handover. What the project's memory tells it goes by its
@@ -1292,17 +1294,30 @@ command alone, not by its task's words, which a session started cold has searche
 request or an issue, with acceptance criteria, in the background or with another agent starts as ever. It's
 off unless you turn it on.
 
-### RAM
+### Resources
 
-`#` shows the memory each session takes: its program and every process under it, since an agent runs node
-workers, shells and MCP servers of its own, the biggest first, with how many processes that is and its share of
-the whole. Under them is what crystal takes itself, the daemon and the TUI, then the agent [kept
-warm](#archiving-and-idle-agents) while there's one, and in the heading all of it, and
-its share of the machine's memory. `Enter` goes to the session the bar is on. The daemon looks at the
-processes, `ps` on a Mac and `/proc` on Linux, every second while the view is open, and every five seconds
-otherwise for the footer, which shows all of it beside `? keys` while the sidebar has the keyboard, like
-`1.2 GB`: a click on that opens the view.
-What's counted is each process's resident memory, so what processes share is counted in each.
+`#` shows the memory and CPU each session takes: its program and every process under it, since an agent runs node
+workers, shells and MCP servers of its own, the biggest first, with how many processes that is and a bar of its
+share of the whole; `s` puts the busiest first instead, and back. Under them is what crystal takes itself: the
+daemon, where memory's models run; each program it runs that isn't a session's, those of one name together,
+like the distiller's `claude -p`, git or a plugin's hook; and the TUI, with what it runs. Then comes the agent
+[kept warm](#archiving-and-idle-agents) while there's one. The heading says all of it, with its share of the
+machine's memory, and its CPU, with its share of the machine's cores. `Enter` goes to the session the bar is on.
+The footer shows all of it beside `? keys` while the sidebar has the keyboard, like `2.1G 35%`, in the room its
+keys leave, never in a key's place: its CPU goes first where there's less, then all of it. A click on that opens
+the view. `crystal usage` prints the same table for a script, and `--json` the daemon's look with its
+totals.
+
+A process's memory is what it has in RAM now. On a Mac that's its physical footprint, what Activity Monitor's
+Memory column shows, which counts what it has on the GPU, as the daemon has memory's models on Metal; on Linux
+it's its resident set, so what processes share is counted in each. Its CPU is a rate, in percent of one core,
+`100%` being one core busy and a machine of ten cores busy through and through `1000%`: the CPU time it had,
+user and system, since the daemon looked before, over the time between. That's not `ps`'s `%cpu`, which is an
+average over the process's whole life on Linux and a decaying one on a Mac. The daemon looks, with `/proc` on
+Linux and libproc on a Mac, where seven hundred processes take a millisecond, every second while the view is
+open and every five seconds otherwise; a look less than half a second after another counts from the one before
+that, and the first in ten seconds waits half a second to have something to count from. A process that started
+since the look counted from counts all its CPU time.
 
 ### Projects
 

@@ -621,7 +621,7 @@ pub const COMMANDS: &[Spec] = &[
     spec(
         Command::Ram,
         "ram",
-        "the memory each session's processes take, and crystal's own",
+        "the memory and CPU each session's processes take, and crystal's own",
         &["#"],
     ),
     spec(Command::Keys, "keys", "every key", &["?"]),
@@ -2298,7 +2298,7 @@ pub const HELP: &[HelpRow] = &[
     row(
         "X/,/#",
         &[C::Plugins, C::Settings, C::Ram],
-        "plugins / settings / RAM",
+        "plugins / settings / resources",
     ),
     row(
         "?/q",

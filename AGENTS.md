@@ -124,6 +124,8 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   the old way, or in the Kitty keyboard protocol once a program has asked for it; and back, what a terminal
   sends read into keys, either way, pastes and the rest, each with its bytes, for `crystal attach`
 - `src/remote.rs`: `crystal ssh`: finds (or installs) crystal on another machine, then runs it there over ssh
+- `src/usage_cli.rs`: `crystal usage`: what crystal's processes take, memory and CPU, the resources view's
+  table on standard output, the sessions by either, or the daemon's look as JSON with its totals
 - `src/update.rs`: `crystal update`: the latest release (where GitHub's `releases/latest` redirects, or
   `CRYSTAL_RELEASES`), downloaded with `curl`, checked against its SHA-256, unpacked, tried, and renamed over
   this crystal, unless a package manager, cargo or a build from source put it there; then the new crystal
@@ -158,7 +160,7 @@ whenever what's handed over changes in a way the crystal before couldn't read.
     triple-clicks, scrolling a pane's history on a timer while a drag selecting in it is held past its edge,
     and sending a pager the wheel as arrow keys; having git count the changes of the worktrees the sidebar
     shows, off the loop; asking the daemon what crystal's processes take, every few seconds and every second
-    while the RAM view is open, off the loop; adding a project `+` asked for, made a git repository first
+    while the resources view is open, off the loop; adding a project `+` asked for, made a git repository first
     once the user said so; running the user's own keys' commands: a popup over everything, a session in a
     pane or a tab, or a command in the background that says only when it fails; this crystal's release notes,
     off the loop, for `release-notes`; handing the settings view the mouse while it's open; starting again a
@@ -210,10 +212,10 @@ whenever what's handed over changes in a way the crystal before couldn't read.
     its tabs and panes, as events, sent back
   - `ui.rs`: the layout and drawing (the tab bar, on top or over the footer or left out, its tabs and what
     it shows at its right, the counts of what's open on the selected session's forge first, which a click
-    lists, pane headers, footer and its readout of the memory crystal takes, the column each pane's
-    scrollbar takes, the key pressed last while `show_keys` is on), one column on a terminal as narrow as a
-    phone's (`[sidebar] phone_width`), the sidebar over the pane while it has the keyboard, and what's under
-    the mouse
+    lists, pane headers, footer and its readout of the memory and CPU crystal takes, in the room its keys
+    leave, the column each pane's scrollbar takes, the key pressed last while `show_keys` is on), one column
+    on a terminal as narrow as a phone's (`[sidebar] phone_width`), the sidebar over the pane while it has
+    the keyboard, and what's under the mouse
   - `scrollbar.rs`: a pane's scrollbar: where its thumb is for how far back the pane is, how far back a
     dragged thumb takes it, and drawing it; pure, so it's unit-tested
   - `warm.rs`: asking the daemon to keep an agent warm where the selection is: once what it would be has held
@@ -398,10 +400,11 @@ whenever what's handed over changes in a way the crystal before couldn't read.
     first, from the sessions and flow runs the TUI has, those that couldn't start again after a restart among
     them; answering a permission or a gate in place, or starting one of those again, the bar kept on its row
     as rows come and go, and its drawing
-  - `ram_view.rs`: the RAM view (`#`): the memory each session's processes take, the biggest first, its
-    share of all of it, crystal's own and the agent kept warm; Enter goes to the session, the bar kept on its
-    session as a new
-    look reorders the rows; its state, keys and drawing, and the footer's readout
+  - `ram_view.rs`: the resources view (`#`, still `ram` in `[keys]`): the memory and CPU each session's
+    processes take, the biggest first by either (`s`), with its share of all of it; crystal's own, the daemon,
+    its helpers a row each program and the TUI, and the agent kept warm; all of it in the heading, with its
+    share of the machine's memory and cores; Enter goes to the session, the bar kept on its session as a new
+    look reorders the rows; its state, keys and drawing, and the footer's readout (`2.1G 35%`)
   - `away.rs`: "while you were away": when the user is gone (a quit, the terminal's focus lost for a while, or
     no key for a while where focus isn't told), what the event log gained meanwhile counted into the
     footer's line, and the latest event seen, which the event loop keeps in the database
@@ -738,11 +741,14 @@ whenever what's handed over changes in a way the crystal before couldn't read.
 - `src/qwen3.rs`: Qwen3, the transformer both models are, adapted from candle-transformers' to read texts whole:
   no cache, a batch padded at its end, causal attention through Candle's fused kernel on Metal (past 8 tokens,
   below which Candle's kernel isn't causal)
-- `src/resources.rs`: the memory crystal's processes take, for the RAM view: every process on the machine read
-  once (`/proc` on Linux, `ps` elsewhere), each session's program summed with every process under it, the
-  daemon's own, the asking client's and the agent kept warm, and the machine's memory; and what runs under a
-  session's program, a job cut loose from its terminal among it, for whether an idle one may be stopped; the
-  counting pure, so it's unit-tested
+- `src/resources.rs`: the memory and CPU crystal's processes take, for the resources view and `crystal usage`:
+  every process on the machine read once (`/proc` on Linux, its resident set; libproc on a Mac, its physical
+  footprint, what it has on the GPU included), each session's program summed with every process under it, the
+  daemon's own, each process it runs that isn't a session's (its helpers) with those under it, the asking
+  client's and the agent kept warm, and the machine's memory and cores; CPU as the time each process had since
+  an earlier look, kept by the daemon (`Earlier`) by pid and start, over the time between, in percent of a core;
+  and what runs under a session's program (`ps` on a Mac), a job cut loose from its terminal among it, for
+  whether an idle one may be stopped; the counting pure, so it's unit-tested
 - `src/rerank.rs`: the reranker: every passage and the query in one prompt, each marked at its end, the
   projector over the model's state at the marks, and each passage's cosine with the query
 - `src/secrets.rs`: taking credentials out of text before memory keeps it or the distiller reads it
