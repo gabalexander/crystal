@@ -104,7 +104,8 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   restarts every running daemon and installs its skill, since only it reads its own handover; the TUI's
   look for a newer release, once a day, kept in the database; and a release's notes (its body from GitHub's
   API, or `release-notes.md` beside a mirror's files), kept in the state directory by the update for the new
-  crystal's TUI to show once, which crystal it last opened as kept in the database, and `--notes`
+  crystal's TUI to show once, or again when `release-notes` asks, which crystal it last opened as kept in the
+  database, and `--notes`
 - `src/completions.rs`: `crystal completions`: clap's script for each shell, without the hidden commands, and
   in bash, zsh and fish the running sessions' names (`crystal complete-sessions`, which never starts a daemon)
   where a command takes one, the arguments in `SESSION_ARGS`; keep that list in step with the commands
@@ -132,8 +133,10 @@ whenever what's handed over changes in a way the crystal before couldn't read.
     shows, off the loop; asking the daemon what crystal's processes take, every few seconds and every second
     while the RAM view is open, off the loop; adding a project `+` asked for, made a git repository first
     once the user said so; running the user's own keys' commands: a popup over everything, a session in a
-    pane or a tab, or a command in the background that says only when it fails; and watching the config
-    file, taking a change made by hand in at once, or saying why it can't be read
+    pane or a tab, or a command in the background that says only when it fails; this crystal's release notes,
+    off the loop, for `release-notes`; handing the settings view the mouse while it's open; and watching the
+    config file, taking a change made by hand in at once, the panes' history following `scrollback_lines`, or
+    saying why it can't be read
   - `app.rs`: the state and how keys and the mouse change it: a sidebar key looked up in the keymap and its
     command run, from the sidebar, the `:` list, after the prefix in a pane or in a pane without it for a key
     written `direct+`; a plugin's first key waiting for its second; a key in a view taken as the key the user
@@ -327,15 +330,18 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   - `settings_view.rs`: the settings view (`,`): the settings in tabs (general, look, sessions, mouse, tasks,
     memory), each under its heading, changed with a key, gone through with the arrows or typed in, or taken out
     of the file for its default, and how the models stand; crystal's hooks in each agent installed here, put
-    in, brought up to date or taken out with a key; and the keys' tab, every key `[keys]` gives, the key
-    pressed next given one, one another has taken from it once the user says so; kept apart from I/O, so it's
-    unit-tested; the event loop writes the file (`config::apply`) or the agent's hooks (`integration`) and,
-    while it's open, reads the settings, the hooks and the daemon's `EmbeddingStatus` again every half a second
+    in, brought up to date or taken out with a key; and the keys' tab, every key `[keys]` gives or those `/`'s
+    filter finds, the key pressed next given one, one another has taken from it, or an installed plugin's
+    action takes, once the user says so; a click on a tab or a row, and the wheel, where `hit` says the mouse
+    is as `draw` lays the view out; kept apart from I/O, so it's unit-tested; the event loop writes the file
+    (`config::apply`) or the agent's hooks (`integration`) and, while it's open, reads the settings, the hooks
+    and the daemon's `EmbeddingStatus` again every half a second
 - `src/daemon.rs`: the daemon: listens on the socket and owns the sessions, and emits an event wherever something
   happens to them, their tasks, flows, worktrees, memory or backlog, and for the entries of memory gone stale,
   looked for hourly and as each task closes; archives sessions, the distiller reading what one did, and starts
   them again,
-  stops agents left idle past `[sessions] stop_idle_after`, and keeps the list of projects sessions ran in;
+  stops agents left idle past `[sessions] stop_idle_after`, has the sessions running keep the history
+  `scrollback_lines` says, and keeps the list of projects sessions ran in;
   after a cold restart, puts the sessions written down back in their places and starts them again, agents
   `[sessions] restart_spacing_ms` apart on a thread of their own, those that can't start kept, failed, saying
   why, a name the user gave still theirs, and with `[sessions] restore_screens` a terminal below what it
@@ -451,9 +457,10 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   the rows it wrapped onto, as `vt::Link`; the
   times the program rang the bell; the text it last asked to copy (OSC 52), a read of the clipboard never
   answered; the progress a program reports (OSC 9;4), picked out of its output, which
-  alacritty_terminal passes over; a screen saved for a handover, both its screens and the history, and
-  restored; and the main screen and its history kept to show again, without what its program set, above
-  the program a cold restart starts in its place. The only module that uses
+  alacritty_terminal passes over; how much history a screen keeps, changed on a running one; a screen saved
+  for a handover, both its screens and the history, and restored; and the main screen and its history kept to
+  show again, without what its program set, above the program a cold restart starts in its place. The only
+  module that uses
   `alacritty_terminal`
 - `src/links.rs`: opening a link a pane shows: `open` or `xdg-open`, or over ssh (or with neither) the link put
   on the user's clipboard instead

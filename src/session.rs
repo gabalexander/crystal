@@ -2151,6 +2151,12 @@ impl Term {
         self.screen.lock().unwrap().vt.rows(with_history)
     }
 
+    /// Has the screen keep `lines` rows of history from now on: see
+    /// [`vt::Screen::keep_history`].
+    pub fn keep_history(&self, lines: usize) {
+        self.screen.lock().unwrap().vt.keep_history(lines);
+    }
+
     /// What's on the screen as `crystal read` asks for it, as
     /// [`vt::Screen::lines`] reads it. With `since`, in milliseconds since
     /// the Unix epoch, only what the program wrote from then on, laid out

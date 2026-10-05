@@ -2,7 +2,8 @@
 
 crystal runs your coding agents in a daemon that outlives the window, and lists every session in one
 sidebar. You don't have to remember a key: `?` shows every one, `:` lists every command by its name, and a
-right click on anything offers what it does. This page is `?` and then `Tab`, or `crystal guide` in a shell.
+right click on anything offers what it does. This page is `?` and then `Tab`, `guide` in the command list, or
+`crystal guide` in a shell.
 
 ## What to start
 

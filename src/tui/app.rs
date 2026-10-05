@@ -695,6 +695,9 @@ pub enum Action {
     DeleteProfile(String),
     /// Read which plugins there are, and open the plugins view on them.
     ListPlugins,
+    /// Show this crystal's release notes: kept by the update that installed
+    /// it, or else asked of where the releases are.
+    ReleaseNotes,
     /// The settings view has opened: read the settings, and again and
     /// again while it's open.
     OpenSettings,
@@ -1630,6 +1633,9 @@ impl App {
 
     /// Takes the sidebar keys the installed plugins that are on took.
     pub fn set_plugin_keys(&mut self, keys: Vec<PluginKey>) {
+        if let Some(view) = &mut self.settings {
+            view.set_plugin_keys(keys.clone());
+        }
         self.plugin_keys = keys;
     }
 
@@ -4682,6 +4688,8 @@ impl App {
             Command::Memory => return self.open_memory(),
             Command::Profiles => return self.open_profiles(),
             Command::Keys => self.help = Some(Help::Keys(0)),
+            Command::Guide => self.help = Some(Help::Guide(Page::guide())),
+            Command::ReleaseNotes => return Some(Action::ReleaseNotes),
             Command::Search => return self.open_filter(),
             Command::Commands => self.open_command_list(),
             Command::PullRequest => return self.open_pull_request(),
@@ -4702,7 +4710,9 @@ impl App {
             Command::UnfoldProject => self.unfold_project(),
             Command::Plugins => return Some(Action::ListPlugins),
             Command::Settings => {
-                self.settings = Some(SettingsView::new());
+                let mut view = SettingsView::new();
+                view.set_plugin_keys(self.plugin_keys.clone());
+                self.settings = Some(view);
                 return Some(Action::OpenSettings);
             }
             Command::Ram => return Some(self.open_ram()),
@@ -4866,7 +4876,24 @@ impl App {
 
     /// Keys while the settings view is open: all of them are its.
     fn on_settings_key(&mut self, key: KeyEvent) -> Option<Action> {
-        match self.settings.as_mut()?.on_key(key) {
+        let outcome = self.settings.as_mut()?.on_key(key);
+        self.follow_settings(outcome)
+    }
+
+    /// The mouse while the settings view is open, on `spot` of it: all of
+    /// it is the view's.
+    pub fn settings_mouse(
+        &mut self,
+        kind: MouseEventKind,
+        spot: settings_view::Spot,
+    ) -> Option<Action> {
+        let outcome = self.settings.as_mut()?.on_mouse(kind, spot);
+        self.follow_settings(outcome)
+    }
+
+    /// What the settings view's `outcome` asks of the event loop.
+    fn follow_settings(&mut self, outcome: settings_view::Outcome) -> Option<Action> {
+        match outcome {
             settings_view::Outcome::Stay => None,
             settings_view::Outcome::Close => {
                 self.settings = None;
@@ -9925,6 +9952,64 @@ mod tests {
         press(&mut app, KeyCode::Esc);
         assert!(app.command_list().is_none());
         assert!(app.zoomed(), "esc runs nothing");
+    }
+
+    #[test]
+    fn the_guide_and_the_release_notes_have_commands_with_no_key() {
+        let mut app = app_with(&["a"]);
+        press(&mut app, KeyCode::Char(':'));
+        type_text(&mut app, "guide");
+        press(&mut app, KeyCode::Enter);
+        assert!(
+            matches!(app.help(), Some(Help::Guide(_))),
+            "{:?}",
+            app.help()
+        );
+        // Tab goes on to the keys, as from `?`.
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.help(), Some(&Help::Keys(0)));
+        press(&mut app, KeyCode::Char('x'));
+        press(&mut app, KeyCode::Char(':'));
+        type_text(&mut app, "release-notes");
+        assert_eq!(press(&mut app, KeyCode::Enter), Some(Action::ReleaseNotes));
+    }
+
+    #[test]
+    fn the_settings_view_hears_of_the_keys_plugins_took_and_takes_the_mouse() {
+        let mut app = app_with(&["agent"]);
+        press(&mut app, KeyCode::Char(','));
+        app.show_settings(settings_view::Current {
+            path: PathBuf::from("/c"),
+            config: Ok(Config::default()),
+            model: None,
+            integrations: Vec::new(),
+        });
+        app.set_plugin_keys(vec![PluginKey {
+            key: Some(Sequence::parse("N").unwrap()),
+            plugin: "notes".into(),
+            action: "add".into(),
+            title: "add a note".into(),
+        }]);
+        // The first row is the bar's: a click on it is Enter there.
+        let first = settings_view::Spot::Row(0);
+        assert_eq!(
+            app.settings_mouse(MouseEventKind::Down(MouseButton::Left), first),
+            Some(Action::ChangeSetting(settings_view::Change::set(
+                settings_view::Setting::Notify,
+                false
+            )))
+        );
+        let keys = settings_view::Spot::Tab(7);
+        app.settings_mouse(MouseEventKind::Down(MouseButton::Left), keys);
+        press(&mut app, KeyCode::Char('/'));
+        type_text(&mut app, "new-session");
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(press(&mut app, KeyCode::Char('N')), None, "it asks first");
+        assert!(matches!(
+            press(&mut app, KeyCode::Enter),
+            Some(Action::ChangeKeys(_))
+        ));
     }
 
     #[test]

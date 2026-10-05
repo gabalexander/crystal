@@ -281,6 +281,13 @@ pub fn view_header<'a>(
     Line::from(spans)
 }
 
+/// Where the views over everything but the tab bar and the footer go, on
+/// `screen` laid out as `areas`: the settings, the command list and the
+/// rest.
+pub fn middle(areas: &Areas, screen: Rect) -> Rect {
+    Rect::new(0, areas.main.y, screen.width, areas.main.height)
+}
+
 /// Where a pane's session's screen goes: all of the pane below its header
 /// line, but for the column on its right its scrollbar takes, with
 /// `scrollbars` on. The session is sized to fit it exactly.
@@ -537,8 +544,7 @@ fn draw_everything(
         sidebar::draw(frame, app, look, drawer);
         draw_rule(frame, look, rule);
     }
-    // Over everything but the tab bar and the footer.
-    let middle = Rect::new(0, areas.main.y, frame.area().width, areas.main.height);
+    let middle = middle(&areas, frame.area());
     if let Some(view) = app.issues_view() {
         issues::draw(frame, view, look.theme, look.now, middle);
     }
