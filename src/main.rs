@@ -69,6 +69,7 @@ mod project_cli;
 mod project_commands;
 mod protocol;
 mod qwen3;
+mod recall;
 mod remote;
 mod report;
 mod rerank;

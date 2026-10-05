@@ -28,8 +28,9 @@ with notes. Start one from the panel (`flow: <name>`) or with `crystal flow run 
 **The backlog** is the project's list of things to come back to: `b` opens it, and `Enter` on an item hands it
 to an agent as a task that ticks it when it's done. Agents add to it with `crystal backlog add`.
 
-**Memory** is what sessions learned about the project, shown to every agent started there when it matters. `m`
-reads it; agents write it with `crystal remember`.
+**Memory** is what sessions learned about the project, shown to every agent started there when it matters,
+and to Claude Code as it first reads or edits a file, the few lines about that file it hasn't seen (`[memory]
+recall_on_read` turns that off). `m` reads it; agents write it with `crystal remember`.
 
 ## When something needs you
 

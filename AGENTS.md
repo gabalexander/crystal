@@ -419,7 +419,8 @@ whenever what's handed over changes in a way the crystal before couldn't read.
 - `src/daemon.rs`: the daemon: listens on the socket and owns the sessions, and emits an event wherever something
   happens to them, their tasks, flows, worktrees, memory or backlog, and for the entries of memory gone stale,
   looked for hourly and as each task closes; archives sessions, the distiller reading what one did, and starts
-  them again,
+  them again; answers Claude Code's hook as it reads or edits a file with what the memory has about it (see
+  `recall.rs`), the sessions not held while it looks,
   stops sessions left idle past `[sessions] stop_idle_after`, agents and with `stop_idle_terminals` terminals,
   unless what runs under them holds them, and starts one again for `crystal send` to reach, has the sessions
   running keep the history `scrollback_lines` says, and keeps the list of projects sessions ran in, telling
@@ -468,8 +469,9 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   way, Letta's, and Codex's), subagents' among them, the variable that quiets the installed hooks for an agent
   crystal hooked itself, each agent's command that resumes a conversation, typed into a shell or run in place
   of the one it was started with, without its first prompt, the model a hook names, the wakeups Claude Code
-  schedules (`ScheduleWakeup`, `CronCreate`), and where an agent hears
-  crystal's notes: Claude Code's system prompt, or the top of another's first prompt
+  schedules (`ScheduleWakeup`, `CronCreate`), the file Claude Code is about to read or edit (its `PreToolUse`
+  hook, matched to `CLAUDE_FILE_TOOLS`), what a hook prints for Claude to read (`additionalContext`), and where
+  an agent hears crystal's notes: Claude Code's system prompt, or the top of another's first prompt
 - `src/agent_rules.rs`: the rules agents' screens are read by: a file for each agent in `agents/` (adapted from
   herdr's), bundled, each rule a look, a priority, a region and tests; a file of the user's in the config's
   `agents/` directory in place of one, or adding an agent, read again when it changes, and a broken one said
@@ -494,8 +496,9 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   the conversation, the agent and a subagent included (the daemon passes over an agent's that isn't the one in
   front), what a turn ended saying and with still to come, and to pass on its reminder to an agent ending a turn with its task open, and to Claude Code, as the
   user sends a prompt, the name the session was renamed to in crystal or the words asking it to name the
-  session; with `--installed`, the hooks `crystal integration` installed, and with `--event`, the event a hook or
-  plugin names itself
+  session, and as it's about to read or edit a file, what its project's memory has about it, asked of the
+  daemon within `recall::WAIT`; with `--installed`, the hooks `crystal integration` installed, and with
+  `--event`, the event a hook or plugin names itself
 - `src/claude_title.rs`: keeping a session's name and Claude Code's name for its conversation (`/rename`) in
   step: the file Claude Code keeps it in beside the transcript, looked at with each check, a rename since the
   first look followed unless the user named the session; and a rename in crystal, given once as the prompt
@@ -699,8 +702,16 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   lesson (`reads_as_status`, for `list --status`), tasks' outcomes from an earlier crystal shortened to their
   goal's first sentence and what `crystal done` said, an entry's title, its first line, or one of its own, the
   paragraph every agent is shown at launch (entries about what its worktree changed first, in docket's 800
-  bytes, tasks' outcomes kept by an earlier crystal left out of it), promoting into CLAUDE.md, the markdown
-  export, and `enabled`, the one gate everything memory adds goes through
+  bytes, tasks' outcomes kept by an earlier crystal left out of it) and the ids it shows, the entries about
+  one file for Claude Code reading it (`about_file`: about it, naming its path or something in it few files
+  have, or about its directory; ranked with no model, the worktree's words as a look in the last minute left
+  them), promoting into CLAUDE.md, the markdown export, and `enabled`, the one gate everything memory adds
+  goes through
+- `src/recall.rs`: what Claude Code is shown of its project's memory as it reads or edits a file: what each
+  session was shown, at launch and since, the files it was told about and the prompt it was last sent
+  (`Recalled`, handed over with the session and carried on through a move or a restart in its conversation),
+  where in its worktree a file the hook names is, links followed, and the few lines it's told, at most three,
+  in 600 bytes; why being shown doesn't count as found again; unit-tested
 - `src/distill.rs`: the distiller: after a task closes, or a session is archived that wasn't read as its task
   closed, one tool-less `claude -p` (Haiku by default, `[memory]`
   in the config) over the end of its transcript, told what the memory has already (the entries nearest in

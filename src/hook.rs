@@ -4,10 +4,12 @@
 //! A hook must never get in its agent's way. This one prints nothing, since
 //! an agent may take a hook's output as input, but for the things meant as
 //! input: the reminder the daemon sends back when an agent ends a turn with
-//! its task still open, and as the user sends Claude Code a prompt, the
-//! name a session was renamed to in crystal, for its conversation, or the
-//! words that ask it to name the session. And it always succeeds: a failing
-//! hook can hold the agent up.
+//! its task still open; as the user sends Claude Code a prompt, the name a
+//! session was renamed to in crystal, for its conversation, or the words
+//! that ask it to name the session; and as Claude Code is about to read or
+//! edit a file, what its project's memory has about it (see
+//! [`crate::recall`]), which it waits only so long for. And it always
+//! succeeds: a failing hook can hold the agent up.
 //!
 //! The hooks crystal adds as it starts Claude Code run `crystal hook
 //! claude`; those `crystal integration` puts in an agent's own settings run
@@ -22,6 +24,7 @@ use crate::claude_title;
 use crate::client;
 use crate::output::outln;
 use crate::protocol::{AgentEvent, Request, Response};
+use crate::recall;
 use anyhow::Result;
 use serde_json::{Value, json};
 use std::io::Read;
@@ -65,6 +68,16 @@ fn report(socket: &Path, agent: &str, installed: bool, event: Option<&str>) -> R
     // id finds the session even after a rename. Only programs started
     // before sessions had ids go without one.
     let id = std::env::var("CRYSTAL_SESSION_ID").ok();
+    if agent == "claude"
+        && let Some(file) = agents::claude_file(&input)
+    {
+        let asked = Request::Recall { name, id, file };
+        if let Some(Response::Context { text }) = client::ask_within(socket, &asked, recall::WAIT)?
+        {
+            outln!("{}", agents::claude_context("PreToolUse", &text))?;
+        }
+        return Ok(());
+    }
     let (event, conversation) = match agent {
         "codex" => (
             agents::codex_event(&input),
@@ -104,7 +117,9 @@ fn report(socket: &Path, agent: &str, installed: bool, event: Option<&str>) -> R
         // Codex's Stop hook takes the same answer as Claude Code's.
         Some(Response::Remind { text }) => outln!("{}", agents::claude_keep_going(&text))?,
         Some(Response::Retitle { title }) => outln!("{}", claude_title::hook_answer(&title))?,
-        Some(Response::Context { text }) => outln!("{}", agents::claude_context(&text))?,
+        Some(Response::Context { text }) => {
+            outln!("{}", agents::claude_context("UserPromptSubmit", &text))?
+        }
         _ => {}
     }
     Ok(())
