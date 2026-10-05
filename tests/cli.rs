@@ -5678,6 +5678,78 @@ fn the_tui_titles_its_terminal_after_the_selection_until_told_otherwise() {
 }
 
 #[test]
+fn crystal_open_shows_files_in_the_tui_and_enter_edits_one() {
+    let crystal = Crystal::new();
+    sessions_saying_here(&crystal, &["explainer"]);
+    let dir = crystal.dir.path();
+    std::fs::create_dir_all(dir.join("docs")).unwrap();
+    let page = "# How a hook lands\n\nThe CLI posts it.\n\n\
+                ```mermaid\nsequenceDiagram\n  CLI->>daemon: hook\n```\n";
+    std::fs::write(dir.join("docs/explain.md"), page).unwrap();
+    std::fs::write(dir.join("notes.txt"), "plain notes\n").unwrap();
+    std::fs::write(dir.join("logo.png"), b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR").unwrap();
+
+    // With no TUI open, there's nowhere to show them.
+    let said = crystal.fails(&["open", "docs/explain.md"]);
+    assert!(
+        said.contains("nothing was opened: no TUI is running"),
+        "{said}"
+    );
+    // An image isn't text: nothing is sent.
+    let said = crystal.fails(&["open", "notes.txt", "logo.png"]);
+    assert!(said.contains("text files only"), "{said}");
+
+    // An editor that notes what it was asked to open.
+    let editor = dir.join("editor");
+    let edited = dir.join("edited");
+    script(&editor, "printf '%s\\n' \"$@\" > \"$EDITED\"\nsleep 30\n");
+    let mut tui = crystal.attach_with_env(
+        &[],
+        &[
+            ("EDITOR", editor.to_str().unwrap()),
+            ("EDITED", edited.to_str().unwrap()),
+        ],
+    );
+    sidebar_shows(&tui, "explainer");
+
+    // The session asks, and the view says it did.
+    let sessions: serde_json::Value = serde_json::from_str(&crystal.ok(&["ls", "--json"])).unwrap();
+    let id = sessions[0]["id"].as_str().unwrap();
+    let out = crystal
+        .command(&["open", "docs/explain.md", "notes.txt"])
+        .env("CRYSTAL_SESSION_ID", id)
+        .env("CRYSTAL_SOCKET", &crystal.socket)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout)
+            .starts_with("showing 2 files in crystal's TUI, where the user reads them"),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    tui.shows("opened · explainer · 2 files");
+    // A markdown file is its page, its diagram drawn.
+    tui.shows("How a hook lands");
+    tui.shows("The CLI posts it.");
+    tui.shows("│ CLI │");
+    tui.shows("mermaid · sequence");
+    assert!(!tui.text().contains("# How"), "{}", tui.text());
+    tui.type_keys("\x12");
+    tui.shows("# How a hook lands");
+
+    tui.type_keys("\t");
+    tui.shows("plain notes");
+    tui.type_keys("\r");
+    assert_eq!(written(&edited), "notes.txt\n");
+    tui.shows("typing into notes.txt");
+}
+
+#[test]
 fn the_tab_bar_goes_over_the_footer_with_what_the_settings_put_at_its_right() {
     let crystal = Crystal::new();
     crystal.configure(
@@ -9578,7 +9650,8 @@ macro_rules! session_rules {
          Bash(crystal read:*),Bash(crystal result:*),Bash(crystal interrupt:*),\
          Bash(crystal events:*),Bash(crystal rename:*),Bash(crystal report:*),\
          Bash(crystal notify:*),Bash(crystal layout),Bash(crystal layout --json),\
-         Bash(crystal layout export:*),Bash(crystal pane split:*),Bash(crystal pane close:*)"
+         Bash(crystal layout export:*),Bash(crystal pane split:*),Bash(crystal pane close:*),\
+         Bash(crystal open:*)"
     };
 }
 

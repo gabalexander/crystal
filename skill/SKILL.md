@@ -1,6 +1,6 @@
 ---
 name: crystal
-description: Run other coding agents in parallel with crystal, hand them work, wait for them, read their answers and answer their questions. Use when a task splits into parts other agents can do at the same time, when you want a second agent to review or test your change, or when work should happen in its own git worktree. Requires the `crystal` command.
+description: Run other coding agents in parallel with crystal, hand them work, wait for them, read their answers and answer their questions; and show the user a file in crystal. Use when a task splits into parts other agents can do at the same time, when you want a second agent to review or test your change, when work should happen in its own git worktree, or when the user asks to see a file in crystal. Requires the `crystal` command.
 ---
 
 # crystal
@@ -244,6 +244,26 @@ crystal layout --json             # the TUI's tabs, the sessions in each, and ho
 - They change what the user sees. Split off what helps them follow your work, close it when it's done, and
   leave their tabs and focus alone unless they ask: `crystal pane focus <name>` hands a session their
   keyboard, and `crystal tab new <name>` brings a new tab to the front, where sessions started after go.
+
+## Show the user a file
+
+When the user asks to see a file, or a page you wrote for them, put it in front of them rather than in your
+answer:
+
+```sh
+crystal open docs/explain-hooks.md
+crystal open src/billing/refund.rs src/billing/ledger.rs
+```
+
+- It goes to the TUI the user used last, in a view of its own: the files listed, the one selected read beside
+  them, a markdown file as its page with its mermaid diagrams drawn, `Enter` opening it in their editor. Say
+  in a line what you opened; don't paste it into your answer as well.
+- Only when asked: it takes over their screen. A file you wrote or changed is no reason to open it; name its
+  path and let them ask.
+- Text files only: an image, a PDF or another binary is refused, so name its path instead. With no TUI open
+  it fails, saying so; name the paths then too.
+- An explanation reads best as a page: write it to a markdown file, a ```` ```mermaid ```` fence for each flow
+  or structure, and open that.
 
 ## Tell the user
 
