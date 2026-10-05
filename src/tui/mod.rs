@@ -46,6 +46,7 @@ pub(crate) mod preview;
 mod profiles;
 mod pull_requests;
 mod ram_view;
+mod recent;
 mod reply;
 mod restarted;
 mod review;
@@ -815,6 +816,7 @@ impl Tui {
         self.layout_told = self.app.look();
         self.layout_seen = self.layout_told.clone();
         self.wake_landed();
+        self.app.note_selection(Instant::now());
         while !self.quitting {
             if changed {
                 self.draw(terminal)?;
@@ -836,6 +838,7 @@ impl Tui {
             self.count_worktrees();
             self.ask_modes_when_due();
             changed |= self.wake_landed();
+            self.app.note_selection(Instant::now());
             self.keep_warm();
         }
         self.keep_seen();
@@ -1836,15 +1839,16 @@ impl Tui {
                 let Some((slot, cell)) = self.app.link_cell(hit) else {
                     return false;
                 };
+                let dirs = self.app.link_dirs(slot);
                 let link = self
                     .pane_in(slot)
-                    .and_then(|pane| pane.screen.link_at(cell));
+                    .and_then(|pane| pane.screen.link_at(cell))
+                    .filter(|link| links::can_open(&link.target, &dirs));
                 let Some(link) = link else {
                     return false;
                 };
                 self.link_clicked = true;
-                let context = self.app.link_context(slot);
-                if let Err(err) = self.open_link(link.url, context) {
+                if let Err(err) = self.open_target(slot, link.target) {
                     self.app.notify(format!("{err:#}"));
                 }
                 true
@@ -1852,6 +1856,33 @@ impl Tui {
             MouseEventKind::Up(MouseButton::Left) => std::mem::take(&mut self.link_clicked),
             _ => false,
         }
+    }
+
+    /// Opens `target`, a link the pane at `slot` shows: a URL as
+    /// [`Self::open_link`] does, and a file's path in the user's editor, at
+    /// its line, as the file finder's Enter does.
+    fn open_target(&mut self, slot: Slot, target: links::Target) -> Result<()> {
+        let (path, line) = match target {
+            links::Target::Url(url) => {
+                let context = self.app.link_context(slot);
+                return self.open_link(url, context);
+            }
+            links::Target::File { path, line } => (path, line),
+        };
+        let dirs = self.app.link_dirs(slot);
+        let Some(found) = links::find_file(&path, &dirs) else {
+            let place = dirs.first().map(|dir| shell::home_relative(dir));
+            bail!("there's no file {path} in {}", place.unwrap_or_default());
+        };
+        // The editor runs where the session does, the path as it's found
+        // from there.
+        let dir = (dirs.first().cloned())
+            .or_else(|| found.parent().map(Path::to_path_buf))
+            .unwrap_or_default();
+        let path = found.strip_prefix(&dir).unwrap_or(&found);
+        let path = path.display().to_string();
+        let action = self.app.edit(dir, path, line);
+        self.perform(action)
     }
 
     /// Opens `url`, a link a pane shows, about `context`: with the action
@@ -2564,10 +2595,9 @@ impl Tui {
                         self.app.stop_copying();
                         self.copy_to_clipboard(&text)?;
                     }
-                    copy_mode::Outcome::Open(url) => {
+                    copy_mode::Outcome::Open(target) => {
                         self.app.stop_copying();
-                        let context = self.app.link_context(slot);
-                        self.open_link(url, context)?;
+                        self.open_target(slot, target)?;
                     }
                 }
             }

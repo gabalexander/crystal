@@ -5,7 +5,9 @@
 //! same output, to draw, and to copy from: copy mode's cursor, the
 //! selection and searches are Alacritty's own vi mode, kept in step with
 //! the output as it scrolls. A viewer's screen also finds the links on it,
-//! the hyperlinks a program wrote (OSC 8) and the URLs in its text. Every
+//! the hyperlinks a program wrote (OSC 8), the URLs in its text and the
+//! files' paths, like `src/app.rs:42`, read as [`links::path_at`] reads
+//! them. Every
 //! screen counts the times the program rang the terminal's bell, for the
 //! daemon to mark the session and a viewer to ring the user's terminal, and
 //! keeps the text the program last asked its terminal to copy (OSC 52), for
@@ -13,6 +15,7 @@
 //! nobody was there to; a program asking to read the clipboard is never
 //! answered.
 
+use crate::links::{self, Target};
 use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::{Dimensions, Grid, Scroll};
 use alacritty_terminal::index::{Boundary, Column, Direction, Line, Point, Side};
@@ -204,11 +207,11 @@ impl Progress {
 /// can't be in one. Punctuation that ends a sentence is taken off after.
 const URL: &str = r#"(https?|file)://[^\x00-\x1f\x7f-\x9f\s<>"{}|\\^`⟨⟩]+"#;
 
-/// A link on a screen: a hyperlink the program wrote (OSC 8), or a URL in
-/// its text.
+/// A link on a screen: a hyperlink the program wrote (OSC 8), a URL in its
+/// text, or a file's path in its text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Link {
-    pub url: String,
+    pub target: Target,
     /// Its first and last cells on what's showing, as `(row, col)`; every
     /// cell between them, in reading order, is the link's. One that goes
     /// on out of sight is cut at the edge.
@@ -1301,11 +1304,14 @@ impl Screen {
     }
 
     /// The link on the cell at `(row, col)` of what's showing, if there's
-    /// one: a hyperlink the program wrote, or else a URL in the text, whole
-    /// across the rows it wrapped onto.
+    /// one: a hyperlink the program wrote, or else a URL in the text, or
+    /// else a file's path in it, whole across the rows it wrapped onto.
+    /// Whether there's a file at that path isn't said here.
     pub fn link_at(&self, cell: (u16, u16)) -> Option<Link> {
         let point = self.point_showing(cell);
-        self.hyperlink_at(point).or_else(|| self.url_at(point))
+        self.hyperlink_at(point)
+            .or_else(|| self.url_at(point))
+            .or_else(|| self.path_at(point))
     }
 
     /// The hyperlink on the cell at `point`: the cells around it with the
@@ -1323,7 +1329,8 @@ impl Screen {
         let end = std::iter::successors(Some(point), after)
             .take_while(same)
             .last()?;
-        Some(self.link_showing(link.uri().to_string(), start, end))
+        let target = Target::Url(link.uri().to_string());
+        Some(self.link_showing(target, start, end))
     }
 
     /// The URL in the text on the cell at `point`, if it's in one.
@@ -1344,7 +1351,38 @@ impl Screen {
         for _ in url.chars().count()..text.chars().count() {
             last = self.cell_before(last)?;
         }
-        (point <= last).then(|| self.link_showing(url.to_string(), *found.start(), last))
+        let target = Target::Url(url.to_string());
+        (point <= last).then(|| self.link_showing(target, *found.start(), last))
+    }
+
+    /// The file's path in the text on the cell at `point`, if it's in one.
+    fn path_at(&self, point: Point) -> Option<Link> {
+        let grid = self.term.grid();
+        let end = self.term.line_search_right(point);
+        // The line's characters, a wide one's spacer left out, and the
+        // cell each is on.
+        let mut text = Vec::new();
+        let mut cells = Vec::new();
+        let mut at = None;
+        let mut next = Some(self.term.line_search_left(point));
+        while let Some(cell) = next.filter(|cell| *cell <= end) {
+            let flags = grid[cell].flags;
+            if !flags.contains(Flags::WIDE_CHAR_SPACER) {
+                let blank = flags.contains(Flags::LEADING_WIDE_CHAR_SPACER) || grid[cell].c == '\0';
+                text.push(if blank { ' ' } else { grid[cell].c });
+                cells.push(cell);
+            }
+            if cell == point {
+                at = cells.len().checked_sub(1);
+            }
+            next = self.cell_after(cell);
+        }
+        let found = links::path_at(&text, at?)?;
+        let target = Target::File {
+            path: found.path,
+            line: found.line,
+        };
+        Some(self.link_showing(target, cells[found.first], cells[found.last]))
     }
 
     /// The first and last lines showing.
@@ -1378,9 +1416,9 @@ impl Screen {
         }
     }
 
-    /// A link to `url` from `start` to `end` in the grid, placed on what's
-    /// showing, and cut at its edges.
-    fn link_showing(&self, url: String, start: Point, end: Point) -> Link {
+    /// A link to `target` from `start` to `end` in the grid, placed on
+    /// what's showing, and cut at its edges.
+    fn link_showing(&self, target: Target, start: Point, end: Point) -> Link {
         let (top, bottom) = self.lines_showing();
         let last_column = self.term.last_column();
         let place = |point: Point| {
@@ -1394,7 +1432,7 @@ impl Screen {
             ((point.line - top).0 as u16, point.column.0 as u16)
         };
         Link {
-            url,
+            target,
             start: place(start),
             end: place(end),
         }
@@ -2376,7 +2414,7 @@ mod tests {
         let mut restored = Screen::restored(&original.save());
         // The alternate screen starts where the cursor was: the second row.
         let link = restored.link_at((1, 7)).unwrap();
-        assert_eq!(link.url, "https://example.com/alt");
+        assert_eq!(link.target, Target::Url("https://example.com/alt".into()));
         assert_eq!(restored.link_at((1, 7)), original.link_at((1, 7)));
         assert_eq!(restored.link_at((1, 2)), None);
         assert_eq!(
@@ -2388,7 +2426,7 @@ mod tests {
         original.process(b"\x1b[?1049l");
         restored.process(b"\x1b[?1049l");
         let link = restored.link_at((0, 2)).unwrap();
-        assert_eq!(link.url, "file:///tmp/main");
+        assert_eq!(link.target, Target::Url("file:///tmp/main".into()));
         assert_eq!((link.start, link.end), ((0, 0), (0, 8)));
         assert_eq!(restored.link_at((0, 2)), original.link_at((0, 2)));
     }
@@ -2858,7 +2896,7 @@ mod tests {
             b"see \x1b]8;;https://example.com/a\x1b\\the docs\x1b]8;;\x1b\\ now",
         );
         let link = screen.link_at((0, 6)).unwrap();
-        assert_eq!(link.url, "https://example.com/a");
+        assert_eq!(link.target, Target::Url("https://example.com/a".into()));
         assert_eq!((link.start, link.end), ((0, 4), (0, 11)));
         assert!(link.covers((0, 11)) && !link.covers((0, 12)));
         assert_eq!(screen.link_at((0, 1)), None);
@@ -2873,12 +2911,12 @@ mod tests {
             b"read https://example.com/x?q=1. then\r\n(at http://h/a_(b)) ok",
         );
         let link = screen.link_at((0, 10)).unwrap();
-        assert_eq!(link.url, "https://example.com/x?q=1");
+        assert_eq!(link.target, Target::Url("https://example.com/x?q=1".into()));
         assert_eq!((link.start, link.end), ((0, 5), (0, 29)));
         // The full stop after it isn't the link.
         assert_eq!(screen.link_at((0, 30)), None);
         let link = screen.link_at((1, 5)).unwrap();
-        assert_eq!(link.url, "http://h/a_(b)");
+        assert_eq!(link.target, Target::Url("http://h/a_(b)".into()));
         assert_eq!(screen.link_at((0, 2)), None);
     }
 
@@ -2888,8 +2926,47 @@ mod tests {
         let from_top = screen.link_at((0, 5)).unwrap();
         let from_below = screen.link_at((1, 3)).unwrap();
         assert_eq!(from_top, from_below);
-        assert_eq!(from_top.url, "https://example.com/abc");
+        assert_eq!(
+            from_top.target,
+            Target::Url("https://example.com/abc".into())
+        );
         assert_eq!((from_top.start, from_top.end), ((0, 3), (2, 1)));
+    }
+
+    #[test]
+    fn a_path_in_the_text_is_a_link_with_its_line() {
+        let screen = screen(3, 40, b"error at src/main.rs:12:5 here\r\nplain words");
+        let link = screen.link_at((0, 12)).unwrap();
+        let target = Target::File {
+            path: "src/main.rs".into(),
+            line: Some(12),
+        };
+        assert_eq!(link.target, target);
+        assert_eq!((link.start, link.end), ((0, 9), (0, 24)));
+        assert_eq!(screen.link_at((0, 25)), None);
+        assert_eq!(screen.link_at((1, 2)), None);
+    }
+
+    #[test]
+    fn a_path_that_wraps_is_one_link_and_wide_characters_keep_their_cells() {
+        let screen = screen(3, 12, "→ 文 crates/app/a.rs:3 ok".as_bytes());
+        let link = screen.link_at((1, 2)).unwrap();
+        assert_eq!(link, screen.link_at((0, 7)).unwrap());
+        let target = Target::File {
+            path: "crates/app/a.rs".into(),
+            line: Some(3),
+        };
+        assert_eq!(link.target, target);
+        // The wide character takes two cells, so the path starts at 5.
+        assert_eq!((link.start, link.end), ((0, 5), (1, 9)));
+    }
+
+    #[test]
+    fn a_path_in_a_url_is_the_urls() {
+        let screen = screen(2, 50, b"see https://example.com/src/a.rs:12 now");
+        let link = screen.link_at((0, 30)).unwrap();
+        let url = "https://example.com/src/a.rs:12";
+        assert_eq!(link.target, Target::Url(url.into()));
     }
 
     #[test]
@@ -2901,7 +2978,7 @@ mod tests {
         );
         let copy = screen(3, 20, &original.state_formatted(true));
         let link = copy.link_at((0, 2)).unwrap();
-        assert_eq!(link.url, "file:///tmp/x");
+        assert_eq!(link.target, Target::Url("file:///tmp/x".into()));
         assert_eq!((link.start, link.end), ((0, 0), (0, 5)));
         assert_eq!(copy.link_at((0, 8)), None);
     }
