@@ -672,10 +672,13 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   index (bm25, prefix and porter-stemmed words), each entry's vector and search by meaning merged with it by
   reciprocal rank fusion, then the reranker's read of the best (nothing when none answers), its migrations,
   the same said again seen again, in its words or, with the models, in others (as alike as `same_from`, or as
-  `alike_from` with the reranker agreeing), forgotten entries the distiller can't add back, kept as they were
-  to list, the entries kept twice grouped about the one each group keeps (`crystal memory dedupe`) and merged
-  into it, holding as its freshest did, kept apart so their words said again count as it said again, the
-  entries nearest in meaning to what a session said, for the distiller,
+  `alike_from` with the reranker agreeing), forgotten entries the distiller can't add back, in their words or
+  others, kept as they were to list, the entries kept twice grouped about the one each group keeps (`crystal
+  memory dedupe`) and merged into it, holding as its freshest did, kept apart so their words said again count
+  as it said again, their words in a column of the index of their own (`merged_words`), and their vectors and
+  the forgotten's (`apart_vectors`), so what was merged finds the one kept by its words and meaning and the
+  reranker reads it with them, vectors that aren't numbers never kept and made again, the entries nearest in
+  meaning to what a session said, for the distiller,
   bringing in a project's JSON file from before, anchors (what an entry's text names that looks like code and
   was in its worktree's code when it was said, `names_in`, and each file's SHA-256 then) and whether an entry
   holds, fresh, drifting or stale, by what it names, looked up among the words of a worktree's files
@@ -708,7 +711,8 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   its weights as it loads) and jina-reranker-v3, both run through Candle on a Mac's GPU (Metal, bfloat16) or
   the CPU, one call at a time (Candle on Metal answers wrong to threads running models at once); `Embed` (the
   models, or a stand-in in tests), with the scores from which the reranker counts an entry and from which two
-  entries say the same thing, measured on crystal's own memory; downloading both at pinned revisions with their SHA-256s checked, by the daemon as it starts unless
+  entries say the same thing, measured on crystal's own memory, and a vector that isn't numbers made again
+  once; downloading both at pinned revisions with their SHA-256s checked, by the daemon as it starts unless
   `CRYSTAL_NO_MODEL_DOWNLOAD` is set; and the one copy each process loads when `[memory] embeddings` is on;
   memory.rs keeps the vectors and merges the rankings
 - `src/qwen3.rs`: Qwen3, the transformer both models are, adapted from candle-transformers' to read texts whole:
