@@ -16,6 +16,14 @@
 //! event, nothing crystal was asked went wrong, and a script under `set -o
 //! pipefail` shouldn't fail for it. `crystal observe` and `control` end
 //! their streams the same way, on their own.
+//!
+//! What crystal says on standard error, a warning along the way or a
+//! question, goes through `err!` and `errln!` in place of `eprint!` and
+//! `eprintln!` (clippy refuses those too), which panic just the same once
+//! standard error's reader has gone, as it goes in `crystal … 2>&1 | head
+//! -1`. Nothing stops over it: what's said there is said beside the work,
+//! not the work, and is lost. The daemon's standard error is its log file,
+//! and a disk too full to write a line there doesn't stop it either.
 
 use anyhow::Result;
 use std::fmt;
@@ -53,11 +61,36 @@ macro_rules! outln {
     };
 }
 
-pub(crate) use {out, outln};
+/// `eprint!`, without the panic when standard error fails: what it says
+/// is lost, and the command carries on.
+macro_rules! err {
+    ($($arg:tt)*) => {
+        $crate::output::say(format_args!($($arg)*))
+    };
+}
+
+/// `eprintln!`, without the panic when standard error fails: what it says
+/// is lost, and the command carries on.
+macro_rules! errln {
+    () => {
+        $crate::output::say(format_args!("\n"))
+    };
+    ($($arg:tt)*) => {
+        $crate::output::say(format_args!("{}\n", format_args!($($arg)*)))
+    };
+}
+
+pub(crate) use {err, errln, out, outln};
 
 /// Writes `args` on standard output, for `out!` and `outln!`.
 pub fn print(args: fmt::Arguments<'_>) -> Result<()> {
     io::stdout().write_fmt(args).map_err(failed)
+}
+
+/// Writes `args` on standard error, for `err!` and `errln!`, and passes
+/// over its failing.
+pub fn say(args: fmt::Arguments<'_>) {
+    let _ = io::stderr().write_fmt(args);
 }
 
 /// What a write to standard output failing comes to: `Closed` when its

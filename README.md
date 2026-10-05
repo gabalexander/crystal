@@ -1153,6 +1153,16 @@ prompt. `↑` on the first line and `↓` on the last bring back earlier tasks: 
 crystal's database. The task box edits [as a shell's line does](#keys-and-commands), `Ctrl+W` and `Alt+B` among
 its keys, all but `Ctrl+E`, which is the panel's.
 
+Drag a file onto the task, or onto the reply box, and your terminal pastes its path. A screenshot dragged from
+macOS's floating thumbnail is a file macOS deletes soon after the drop, long before the agent gets to read it,
+and its name has a narrow no-break space before `PM` that an agent types back as a plain space. So crystal
+copies a dropped file from a folder that goes away (`TemporaryItems`, or on a Mac the temporary directory macOS
+clears), and an image whose path has anything a shell would want escaped, into its state directory
+(`~/.local/state/crystal/attachments/`) under a plain name, like `Screenshot-2026-09-21-at-11.13.58-PM.png`,
+and puts the copy's path in the box in place of the one dropped. Any other file, like a source file in the
+worktree, is left as pasted, for the agent to work on the file itself. A copy is kept for a week from when it
+was last dropped: older ones are deleted as another is copied, and as the TUI starts.
+
 `Esc` puts the panel away without losing what's in it: the next `n` or `w` opens on it, `draft left last time`
 under it. Opened where it was before, it comes back whole, the task, what runs it, its rows' choices, where it
 starts and the branch; opened somewhere else, `n` on another session or `w` after `n`, the task and the rows'

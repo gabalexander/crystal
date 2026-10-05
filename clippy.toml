@@ -1,7 +1,11 @@
 # A closed standard output, as `crystal ls | head -1` leaves, panics
 # `print!` and `println!`; `out!` and `outln!` (src/output.rs) stop the
-# command quietly instead.
+# command quietly instead. A closed standard error, as `crystal … 2>&1 |
+# head -1` leaves, panics `eprint!` and `eprintln!`; `err!` and `errln!`
+# carry on, what they said lost.
 disallowed-macros = [
     { path = "std::print", reason = "use `out!`, which stops quietly once standard output's reader has gone" },
     { path = "std::println", reason = "use `outln!`, which stops quietly once standard output's reader has gone" },
+    { path = "std::eprint", reason = "use `err!`, which carries on once standard error's reader has gone" },
+    { path = "std::eprintln", reason = "use `errln!`, which carries on once standard error's reader has gone" },
 ]

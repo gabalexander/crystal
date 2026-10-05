@@ -25,7 +25,10 @@ api_schema` writes it again.
 What a command prints on standard output goes through `out!` and `outln!` (`src/output.rs`) with a `?`, never
 `print!` and `println!`, which `clippy.toml` refuses: a reader gone, like `head -1`'s, stops the command and
 crystal exits 0, where `println!` panics. A line said along the way of work that must finish, like `crystal
-update`'s, is printed with `let _ =`, the work going on unread.
+update`'s, is printed with `let _ =`, the work going on unread. What crystal says on standard error, a warning, a
+question or the daemon's log, goes through `err!` and `errln!`, never `eprint!` and `eprintln!`, which
+`clippy.toml` refuses too: they carry on once standard error's reader has gone, as `2>&1 | head -1` leaves it,
+what they said lost.
 
 ## Releasing
 
@@ -160,7 +163,9 @@ whenever what's handed over changes in a way the crystal before couldn't read.
     pane or a tab, or a command in the background that says only when it fails; this crystal's release notes,
     off the loop, for `release-notes`; handing the settings view the mouse while it's open; starting again a
     session crystal stopped idle once the selection rests on it; asking the daemon, off the loop, to keep an
-    agent warm where the selection is (`[sessions] warm_agent`); and watching the config file, taking a change
+    agent warm where the selection is (`[sessions] warm_agent`); copying a file dropped on the reply box or
+    the new-session panel's task that would go away, before the paste goes in (`dropped_files.rs`), and
+    deleting the copies a week old as it starts, off the loop; and watching the config file, taking a change
     made by hand in at once, the panes' history following `scrollback_lines`, or saying why it can't be read;
     asking the terminal again every two seconds for the mouse, bracketed paste, focus and the Kitty keyboard
     flags, which a terminal reset forgets, though not while a mouse button is down, and on a resize for the
@@ -301,6 +306,13 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   - `reply.rs`: the reply box (`Space`): the next prompt for a session, or a background task's follow-up,
     sent without going into its pane; its state and keys, kept apart from I/O, what's typed kept until the
     daemon takes it, and its drawing
+  - `dropped_files.rs`: files dropped on the reply box or the new-session panel's task, which a terminal
+    pastes as their paths, escaped, quoted or as `file://` URLs: a paste of nothing but files, one of them in
+    a folder that goes away (`TemporaryItems`, a screenshot's floating thumbnail's, or on a Mac the temporary
+    directory) or an image whose path an agent won't type back right, has those copied into the server's
+    `attachments` under a plain name, only the user able to read them, and their copies' paths in place of
+    theirs; a copy is kept a week from when it was last dropped; adapted from docket's, unit-tested on
+    files of its own
   - `launcher.rs`: the new-session panel (`n`, `w`): its state and keys, kept apart from I/O, the command
     it builds, a profile's `launch` setting its "how" row as it's chosen and whether what it starts is a
     task, what it remembers between runs, the draft it leaves when it's put away with a task in it and
@@ -595,7 +607,7 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   the same state
 - `src/state.rs`: where the daemon's state is: a server's directory in the state dir (the default server's is
   the state dir itself), or beside a socket given by its path; the database, the directory of the files each
-  task kept, and the files kept before the database (the sessions, the flow runs, each project's directory); a
+  task kept, the directory of the files dropped on a task or a reply, and the files kept before the database (the sessions, the flow runs, each project's directory); a
   running session as it's written down to start it again, the worktree it was on its way into, and whether
   crystal had stopped it idle, to stay stopped
 - `src/server_cli.rs`: `crystal server`: every server with whether it's running and how many sessions it has,
@@ -772,7 +784,8 @@ whenever what's handed over changes in a way the crystal before couldn't read.
 - `src/output.rs`: what a command prints on standard output: `out!` and `outln!`, in place of `print!` and
   `println!`, and `Closed`, its reader gone, which stops the command and has `main` exit 0; SIGPIPE is left
   ignored, as the daemon, the TUI, `crystal attach`, `crystal mcp` and the hooks need it, and as a command's own
-  writes to the daemon's socket and its programs' pipes do
+  writes to the daemon's socket and its programs' pipes do; and what crystal says on standard error, `err!` and
+  `errln!` in place of `eprint!` and `eprintln!`, a write there that fails passed over
 - `src/printable.rs`: text crystal didn't write made fit for the user's terminal: control characters, the escape
   sequences they start and the explicit bidi controls taken out, on one line or keeping its lines; and the TUI's
   frame scrubbed of them last, since ratatui hands a zero-width one on to the terminal. A background task's

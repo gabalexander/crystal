@@ -7,6 +7,7 @@
 //! The crystal over there has its own daemon and its own sessions; nothing
 //! here talks to them except through that second connection.
 
+use crate::output::{err, errln};
 use crate::shell;
 use anyhow::{Context, Result, bail};
 use std::ffi::OsString;
@@ -74,7 +75,7 @@ pub fn run(destination: &str, args: &[String], install: bool) -> Result<i32> {
     // works; it's only worth knowing, and upgrading if the user wants.
     let ours = env!("CARGO_PKG_VERSION");
     if crystal.version != ours {
-        eprintln!(
+        errln!(
             "crystal: crystal on {destination} is {}, and this one is {ours}",
             crystal.version
         );
@@ -111,7 +112,7 @@ fn find(destination: &str) -> Result<Found> {
 
 /// Runs the install script on `destination`, then finds what it installed.
 fn install_on(destination: &str) -> Result<RemoteCrystal> {
-    eprintln!("crystal: installing crystal on {destination}");
+    errln!("crystal: installing crystal on {destination}");
     let status = Command::new(ssh_program())
         .args(ssh_args(destination, &in_sh(INSTALL), false))
         .status()
@@ -190,7 +191,7 @@ fn ask(question: &str) -> Result<bool> {
     if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
         return Ok(false);
     }
-    eprint!("{question} [y/N] ");
+    err!("{question} [y/N] ");
     std::io::stderr().flush()?;
     let mut answer = String::new();
     std::io::stdin().lock().read_line(&mut answer)?;

@@ -112,6 +112,25 @@ impl Crystal {
         self.command(args).stdout(writer).output().unwrap()
     }
 
+    /// Runs a command whose standard error is a pipe nobody reads any
+    /// more: every warning it says there fails.
+    fn saying_to_a_closed_pipe(&self, args: &[&str]) -> Output {
+        let (reader, writer) = std::io::pipe().unwrap();
+        drop(reader);
+        self.command(args).stderr(writer).output().unwrap()
+    }
+
+    /// Runs a command whose standard output and standard error are one pipe
+    /// nobody reads any more, as `2>&1 | head -1` leaves them once `head`
+    /// has what it wants.
+    fn both_to_a_closed_pipe(&self, args: &[&str]) -> Output {
+        let (reader, writer) = std::io::pipe().unwrap();
+        drop(reader);
+        let command = &mut self.command(args);
+        command.stdout(writer.try_clone().unwrap()).stderr(writer);
+        command.output().unwrap()
+    }
+
     /// Runs a command piped into `head -1`, as a shell does, and returns how
     /// the command ended and the line `head` printed.
     fn piped_to_head(&self, args: &[&str]) -> (Output, String) {
@@ -1405,6 +1424,48 @@ fn a_task_pasted_whole_keeps_its_lines() {
         args.ends_with("\nfix the refund\nthen run the tests\n"),
         "{args:?}"
     );
+}
+
+#[test]
+fn a_screenshot_dropped_on_the_task_reaches_the_agent_as_a_copy_that_stays() {
+    let crystal = Crystal::new();
+    let bin = fake_claude(crystal.dir.path());
+    let path = path_of(&[&bin]);
+    // A macOS screenshot behind its floating thumbnail, which macOS deletes
+    // soon after the drop, a U+202F before `PM` in its name.
+    let thumbnails = crystal
+        .dir
+        .path()
+        .join("T/TemporaryItems/NSIRD_screencaptureui_LySI4r");
+    std::fs::create_dir_all(&thumbnails).unwrap();
+    let shot = thumbnails.join("Screenshot 2026-09-21 at 11.13.58\u{202f}PM.png");
+    std::fs::write(&shot, b"\x89PNG pixels").unwrap();
+    // Kept beside the daemon's state, a socket given by its path's beside it.
+    let copy = crystal
+        .dir
+        .path()
+        .join("crystal.attachments/Screenshot-2026-09-21-at-11.13.58-PM.png");
+    let mut tui = crystal.attach_with_env(&[], &[("PATH", &path)]);
+    eventually("the TUI asks for pastes marked", || tui.marks_pastes());
+
+    tui.type_keys("n");
+    tui.shows("What should it do?");
+    tui.type_keys("look at ");
+    // Dropped the way Ghostty pastes it: the path escaped for a shell.
+    let dropped = shot.to_string_lossy().replace(' ', "\\ ");
+    tui.type_keys(&format!("\x1b[200~{dropped}\x1b[201~"));
+    eventually("the screenshot is copied as it's dropped", || {
+        copy.is_file()
+    });
+    std::fs::remove_file(&shot).unwrap();
+    tui.type_keys("\r");
+    tui.shows("▸ claude");
+
+    let args = written(&crystal.dir.path().join("args"));
+    let task = args.lines().last().unwrap();
+    assert!(task.starts_with("look at "), "{args:?}");
+    assert!(task.contains(&*copy.to_string_lossy()), "{args:?}");
+    assert_eq!(std::fs::read(&copy).unwrap(), b"\x89PNG pixels");
 }
 
 #[test]
@@ -14961,12 +15022,15 @@ fn a_projects_plugin_runs_once_it_s_on_for_it_and_hears_only_its_project() {
     ]);
     let worktree =
         |name: &str| PathBuf::from(listed(&crystal, name)["cwd"].as_str().unwrap().to_string());
-    let copied = worktree("feature").join(".env");
-    eventually("the .env is copied", || copied.is_file());
-    assert_eq!(std::fs::read_to_string(&copied).unwrap(), "SECRET=1\n");
+    // `cp` makes the file before it writes it: wait for the whole.
+    assert_eq!(written(&worktree("feature").join(".env")), "SECRET=1\n");
     assert!(!worktree("elsewhere").join(".env").exists());
-    let log = crystal.ok(&["plugin", "log", "worktree-env", "--project", "-C", app_arg]);
-    assert!(log.contains("copied .env into"), "{log}");
+    // The hook says so once it has copied it, straight into the log.
+    eventually("the plugin logs the copy", || {
+        crystal
+            .ok(&["plugin", "log", "worktree-env", "--project", "-C", app_arg])
+            .contains("copied .env into")
+    });
 
     crystal.ok(&[
         "plugin",
@@ -18244,6 +18308,34 @@ fn printing_what_the_daemon_has_into_a_closed_pipe_stops_quietly() {
     }
     // The daemon carries on for whoever asks next.
     assert!(crystal.row("counter").is_some());
+}
+
+#[test]
+fn a_warning_said_into_a_closed_pipe_lets_the_command_carry_on() {
+    let crystal = Crystal::new();
+    let repo = git_repo(crystal.dir.path(), "app");
+    std::fs::create_dir(repo.join(".crystal")).unwrap();
+    std::fs::write(repo.join(".crystal/flows.toml"), "[[flow]\n").unwrap();
+    let args = &["flow", "defs", "-C", repo.to_str().unwrap()][..];
+    let listed = |out: &Output| String::from_utf8_lossy(&out.stdout).starts_with("no flows yet");
+
+    // It warns of the file it couldn't read, then lists the flows it could.
+    let out = crystal.run(args);
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{said}");
+    assert!(said.contains("couldn't read the project's flows"), "{said}");
+    assert!(listed(&out), "{out:?}");
+
+    // Nobody reads the warning, and it lists them all the same.
+    let out = crystal.saying_to_a_closed_pipe(args);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert!(listed(&out), "{out:?}");
+    // Nor anything at all: the warning lost, then the list.
+    assert_eq!(crystal.both_to_a_closed_pipe(args).status.code(), Some(0));
+    // A command that fails says why to nobody, and fails all the same.
+    let failed = crystal.saying_to_a_closed_pipe(&["mermaid", "no-such-file.md"]);
+    assert_eq!(failed.status.code(), Some(1), "{failed:?}");
+    assert!(!crystal.socket.exists());
 }
 
 #[test]

@@ -98,7 +98,7 @@ mod worktree_hooks;
 use anyhow::{Result, bail};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use client::Restart;
-use output::{out, outln};
+use output::{errln, out, outln};
 use profile::{Launch, Profile, StartIn};
 use protocol::{ArchivedSession, NotifySound, Request, Response, SessionInfo, TaskSpec, TaskState};
 use std::collections::BTreeMap;
@@ -3550,7 +3550,7 @@ fn print_sessions(sessions: &[SessionInfo]) -> Result<()> {
     // standard error it's out of the way of a script reading the rows.
     for session in sessions {
         if let protocol::State::Failed { why } = &session.state {
-            eprintln!("{} couldn't start again: {why}", session.name);
+            errln!("{} couldn't start again: {why}", session.name);
         }
     }
     Ok(())
