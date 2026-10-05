@@ -103,6 +103,13 @@ pub enum Request {
         name: String,
         new_name: String,
     },
+    /// The agent in the session with `id` names it, in `title`'s words, as
+    /// crystal asked it to: only while crystal names it itself, and nobody
+    /// holds on to that name.
+    NameByAgent {
+        id: String,
+        title: String,
+    },
     /// Stop a session and keep it in the archive, out of the list, to
     /// start again in its conversation when it's wanted.
     Archive {
@@ -503,6 +510,12 @@ pub struct NewSession {
     /// request and issue it's about.
     #[serde(flatten)]
     pub brief: TaskBrief,
+    /// Whether the session's agent may name it, in place of the name
+    /// crystal gives it, when the settings say so: for a client that
+    /// doesn't hold on to that name, like the TUI, which follows a rename.
+    /// A script that was told the name may use it later.
+    #[serde(default)]
+    pub agent_names: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -658,6 +671,11 @@ pub enum Response {
     /// session to in crystal.
     Retitle {
         title: String,
+    },
+    /// What the hook reporting a prompt the user sent adds to it for
+    /// Claude Code to read: crystal asking it to name its session.
+    Context {
+        text: String,
     },
     /// A project's backlog.
     Backlog(Backlog),

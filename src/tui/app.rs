@@ -6245,6 +6245,7 @@ impl App {
                     task: goal,
                     backlog,
                     brief,
+                    ..Purpose::default()
                 };
                 Some(Action::Start {
                     place,

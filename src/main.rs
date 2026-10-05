@@ -80,6 +80,7 @@ mod sound;
 mod spending;
 mod state;
 mod stream;
+mod subagents;
 mod syntax;
 mod task;
 mod tasks;
@@ -682,6 +683,15 @@ enum Command {
     },
     /// Give a session another name.
     Rename { name: String, new_name: String },
+    /// Name the session this runs in, in a few words, as crystal asks
+    /// Claude Code to with its first prompt: only while crystal still names
+    /// the session itself.
+    #[command(hide = true)]
+    Name {
+        /// The words, joined with dashes for the name.
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        title: Vec<String>,
+    },
     /// Run an ended session's command again, in the same directory and
     /// under the same name. Claude Code comes back in its conversation. One
     /// that couldn't start again after a restart tries again.
@@ -2401,6 +2411,7 @@ fn run(cli: Cli) -> Result<()> {
             stream::control(&socket, &name, size)?
         }
         Command::Rename { name, new_name } => client::rename(&socket, &name, &new_name)?,
+        Command::Name { title } => client::name_by_agent(&socket, &title.join(" "))?,
         Command::Respawn { name } => client::respawn(&socket, &name)?,
         Command::Archive { names } => {
             for name in names {
@@ -2778,19 +2789,28 @@ fn new_session(socket: &Path, new: NewArgs) -> Result<()> {
         }
         None => catalog::first_prompt_in(&command),
     };
+    // Its name printed, a script may use it later: only one attached to
+    // may be named by its agent.
     let purpose = client::Purpose {
         task,
+        agent_names: attaches(detached),
         ..client::Purpose::default()
     };
     let name = client::new_session_with(socket, name, cwd, command, purpose, &env)?.name;
     attach_or_print(socket, &name, detached)
 }
 
+/// Whether a command that starts a session attaches to it, run in a
+/// terminal, unless `detached`, rather than printing its name.
+fn attaches(detached: bool) -> bool {
+    let in_a_terminal = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    in_a_terminal && !detached
+}
+
 /// Attaches to the new session `name` when run in a terminal, unless
 /// `detached`; prints its name otherwise.
 fn attach_or_print(socket: &Path, name: &str, detached: bool) -> Result<()> {
-    let in_a_terminal = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
-    if in_a_terminal && !detached {
+    if attaches(detached) {
         attach::run(socket, Some(name))
     } else {
         outln!("{name}")?;

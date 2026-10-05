@@ -1716,6 +1716,11 @@ impl Tui {
                 purpose,
             } => {
                 let cwd = self.start_dir(place)?;
+                // The TUI follows a session's renames: its agent may name it.
+                let purpose = client::Purpose {
+                    agent_names: true,
+                    ..purpose
+                };
                 let name = client::new_session_for(&self.socket, None, cwd, command, purpose)?.name;
                 self.show_new_session(&name)?;
                 self.keep_memory();
@@ -2740,6 +2745,7 @@ impl Tui {
             task: None,
             backlog: None,
             brief: Default::default(),
+            agent_names: false,
         });
         let Some(Response::Created { name, .. }) = client::ask(&self.socket, &request, true)?
         else {
@@ -2851,6 +2857,7 @@ impl Tui {
             task: None,
             backlog: None,
             brief: Default::default(),
+            agent_names: false,
         });
         let Some(Response::Created { name, .. }) = client::ask(&self.socket, &request, true)?
         else {
