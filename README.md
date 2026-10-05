@@ -192,7 +192,7 @@ and the footer says where you are and offers the keys that matter there, or, whe
 | `a` | the [timeline](#timeline): what happened, the newest first, as it happens |
 | `I` | the [timeline](#timeline) of the selected session; `Ctrl+S` there goes on to its task's, its project's and everything |
 | `M` | what the selected session leaves for the next: its worktree's [handoff notes](#the-handoff-file) and the files its task [kept](#kept-files), each read beside the list |
-| `/` | find a session in any tab, a project or worktree with nothing running, a flow run or an open pull request, by typing a little of it; `Tab` keeps to one status; picking a session in another tab takes you there: [finding with `/`](#finding-with-) |
+| `/` | find a session in any tab, a project or worktree with nothing running, a flow run, an open pull request or issue, or an item on a backlog, by typing a little of it; `Tab` keeps to one status; picking a session in another tab takes you there: [finding with `/`](#finding-with-) |
 | `:` | the [command list](#keys-and-commands): every command by its name, with its key, the latest you ran first; `Enter` runs one |
 | `(` / `)` | make the [sidebar](#the-sidebar) narrower or wider; its edge drags with the mouse too |
 | `\` | fold the [sidebar](#the-sidebar) down to a rail of marks, or unfold it |
@@ -459,13 +459,14 @@ its time in the sidebar until you look at it, rings your terminal from the TUI t
 `session.bell`. A program ringing over and over rings yours at most twice a second.
 
 `/` finds a session by typing a little of it, in any tab, and a project or worktree with nothing running, a
-flow run or an open pull request too; `Tab` keeps it to the sessions with one status: see [finding with
-`/`](#finding-with-).
+flow run, an open pull request or issue, or an item on a backlog too; `Tab` keeps it to the sessions with one
+status: see [finding with `/`](#finding-with-).
 
 For a project on GitHub or GitLab, each worktree line shows its branch's pull request, `#57` (a merge request,
 `!57`, on GitLab), with a mark for what matters most about it, `merged` once it has; the tab bar counts the
-pull requests and issues open on the selected session's project; `o` opens its pull request in your browser,
-`O` lists the project's pull requests and `i` its issues: see [pull requests and issues](#pull-requests-and-issues).
+pull requests and issues open on the selected session's project, and a click on either count lists them; `o`
+opens its pull request in your browser, `O` lists the project's pull requests and `i` its issues: see [pull
+requests and issues](#pull-requests-and-issues).
 
 Everything is also a command, for scripts and for agents:
 
@@ -495,6 +496,7 @@ crystal read review --since 10m             # only what it wrote in the last ten
 crystal ps review                           # what runs in its terminal, and where (process-info)
 crystal observe review                      # its terminal as JSON lines, for a program; `control` drives it
 crystal api snapshot                        # everything at once, as JSON, for a client of your own
+crystal api schema --json                   # the JSON Schema of what crystal says over its socket
 crystal rename review reviewer              # give a session another name
 crystal respawn reviewer                    # run an ended session again; an agent in its conversation
 crystal kill review                         # stop one session
@@ -844,16 +846,20 @@ selection where it was. What it finds, and what picking it does:
 | a flow run | its name, its flow's or its goal, which find its steps too | selects the step it's at |
 | a project nothing runs in, or a worktree with no sessions | its project, its branch, or its directory | puts the selection on it, where `Enter` starts something |
 | an open pull request (a merge request on GitLab) | its title, number (`57` or `#57`), branch, author or project | opens it in [the pull requests view](#pull-requests-and-issues) |
+| an open issue, marked `issue` | its title, number (`12` or `#12`), author, labels or project | opens it in [the issues view](#pull-requests-and-issues) |
+| an item to do on a project's [backlog](#the-backlog), marked `to do` | its line, number (`3` or `#3`), tags or project, or a word of its body | opens the backlog view on it |
 
-A directory or a goal only counts where a word turns up in it whole, or nearly anything would find it. Before
-you type, only sessions show; projects, worktrees and pull requests join them as you type. The pull requests are
-those the sidebar already asked the forge for, and `/` asks, in the background, about the projects with nothing
-running the first time it opens, so typing never waits on the forge.
+A directory, a goal or a backlog item's body only counts where a word turns up in it whole, or nearly anything
+would find it. Before you type, only sessions show; the rest join them as you type, each under its project, a
+project's pull requests, then its issues, then its backlog items. The pull requests and issues are those the
+sidebar already asked the forge for, and `/` asks, in the background, about the projects with nothing running
+the first time it opens, so typing never waits on the forge; it asks the daemon for every project's backlog
+each time it opens.
 
 `Tab` keeps to the sessions with one status, the footer saying which, round `waiting`, `working`, `done` (a
 finished turn nobody has looked at), `idle` (at the prompt) and `ended`, then back to all of them; `Shift+Tab`
-goes the other way. Typing narrows them further. Projects and pull requests have no status, so they don't show
-while it keeps to one.
+goes the other way. Typing narrows them further. Projects, pull requests, issues and backlog items have no
+status, so they don't show while it keeps to one.
 
 ### Tabs
 
@@ -1168,7 +1174,8 @@ A pull request that's simply ready shows its number alone. `o` opens the selecte
 browser. On the right of the [tab bar](#terminals-the-window-and-the-tab-bar), after the sessions, are how many
 pull requests and issues are open on the selected session's project, `3 prs · 5 issues` (`mrs` on GitLab):
 none says nothing, a list as long as the forge gives at once counts `100+`, and a narrow terminal leaves them
-out before the tabs, or what you have the bar show at its right, give way.
+out before the tabs, or what you have the bar show at its right, give way. A click on `3 prs` lists them, as
+`O` does, and on `5 issues`, as `i` does.
 
 crystal asks the forge's own command line tool, [`gh`](https://cli.github.com) for GitHub and
 [`glab`](https://gitlab.com/gitlab-org/cli) for GitLab, as soon as it sees a project and then once a minute for
@@ -1725,6 +1732,16 @@ lists them, `layout` as `crystal layout --json` prints it, `projects`, the `task
 in `flows`, and the `archived` sessions. `crystal events --follow --after <seq>` then carries on from it with
 nothing missed: an event says what changed, and the client asks again for what it shows. It never starts the
 daemon.
+
+`crystal api schema` says what the schema of crystal's socket protocol covers, the one bundled with that crystal:
+`--json` prints the whole JSON Schema (draft 2020-12), and `--output PATH` writes it to a file. It's
+[`docs/crystal-api.schema.json`](docs/crystal-api.schema.json) too. Its `schemas` name each message: the
+`request` a client sends, a JSON object a line with its kind in `type` and the `version` of the crystal sending
+it, which must be the daemon's; the `response` the daemon answers with; each `event` a `subscribe` streams,
+`crystal events --json` prints and plugins' hooks are given, its kind in `event` with when it happens; the
+`layout_order` and `layout_report` lines a TUI taking layout orders and the daemon trade; and the `snapshot`
+`crystal api snapshot` prints. `$defs` holds every type they're made of, described as crystal reads it: a field
+it can do without is optional, though crystal may always write it.
 
 `crystal ls --json` prints the sessions as a JSON array. Each object holds what the daemon knows about the
 session, plus `status`, the word the STATE column shows:
@@ -2503,7 +2520,8 @@ notice along the way on the backlog with `crystal backlog add`, rather than into
 command works on the current directory's project; `-C <dir>` names another.
 
 In the TUI, `b` opens the selected session's project's backlog, and the sidebar counts what each project has
-to do beside its name: `payments ──── 3 to do`. In the view, what's to do comes first and what's done after,
+to do beside its name: `payments ──── 3 to do`. [`/`](#finding-with-) finds an item to do on any project's
+backlog, and picking it opens the backlog on it. In the view, what's to do comes first and what's done after,
 and under the list, the item the bar is on: its tags, the tasks started for it and its body. `a` adds an item
 and `e` changes its line, `Space` ticks one off or opens it again, `x` removes one once you've said `y`, `/`
 filters the list as you type, and `t` keeps it to each tag in turn. `Enter` opens the new-session panel with
@@ -3105,7 +3123,9 @@ your terminal. On a Mac the TUI asks the system's appearance every two seconds, 
 settings portal (GNOME's and KDE's), or else GNOME's own setting. Over ssh the system isn't yours, and some
 systems can't say: there the TUI asks your terminal what its background is as it starts, and goes by that,
 which follows a change only the next time it starts. (A terminal can tell a program each time its appearance
-changes, but crystal's keyboard reader would take that for the start of a key it waits to see the end of.)
+changes, mode 2031, but crystal's keyboard reader, crossterm's, would take that report for the start of a key
+it waits to see the end of, and swallow the keys after it, until crossterm reads it: see crossterm's
+[#1104](https://github.com/crossterm-rs/crossterm/issues/1104).)
 Picking a theme in the [settings view](#the-settings-view) stops the following, as that's the theme you want.
 `[appearance.light_colors]` and `[appearance.dark_colors]` take colors of your own, as `[colors]` below does,
 for while it's light or dark, over `[colors]`.
@@ -3373,7 +3393,11 @@ make build      # cargo build
 make test       # cargo test
 make lint       # cargo fmt --check, and clippy with warnings as errors
 make install    # a release build into ~/.local/bin, and the daemon handed over to it
+CRYSTAL_UPDATE_API_SCHEMA=1 cargo test api_schema  # write docs/crystal-api.schema.json again
 ```
+
+A test keeps [`docs/crystal-api.schema.json`](docs/crystal-api.schema.json) what the protocol's types make, and
+fails once one of them changes until the schema is written again.
 
 If you're an AI agent working on this repository, read [`AGENTS.md`](AGENTS.md) before making changes.
 

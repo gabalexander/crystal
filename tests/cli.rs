@@ -4456,6 +4456,35 @@ fn api_snapshot_holds_everything_and_the_seq_to_follow_on_from() {
 }
 
 #[test]
+fn api_schema_says_what_it_covers_prints_it_and_writes_it_to_a_file() {
+    let crystal = Crystal::new();
+    let summary = crystal.ok(&["api", "schema"]);
+    assert!(summary.contains(env!("CARGO_PKG_VERSION")), "{summary}");
+    for message in ["request", "response", "event", "snapshot"] {
+        assert!(summary.contains(message), "{summary}");
+    }
+
+    let printed = crystal.ok(&["api", "schema", "--json"]);
+    let bundled = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/crystal-api.schema.json"),
+    )
+    .unwrap();
+    assert_eq!(printed, bundled);
+    let schema: serde_json::Value = serde_json::from_str(&printed).unwrap();
+    assert_eq!(schema["schemas"]["request"]["$ref"], "#/$defs/Request");
+    assert!(schema["$defs"]["Event"].is_object(), "{schema}");
+
+    let path = crystal.dir.path().join("crystal-api.schema.json");
+    let wrote = crystal.ok(&["api", "schema", "--output", path.to_str().unwrap()]);
+    assert!(wrote.starts_with("wrote the API schema to "), "{wrote}");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), printed);
+    let err = crystal.fails(&["api", "schema", "--json", "--output", "x.json"]);
+    assert!(err.contains("cannot be used with"), "{err}");
+    // None of it needs the daemon, so none was started.
+    assert!(!crystal.socket.exists());
+}
+
+#[test]
 fn integration_status_lists_only_those_out_of_date_when_asked() {
     let crystal = Crystal::new();
     std::fs::create_dir_all(crystal.claude_config_dir()).unwrap();
@@ -10564,6 +10593,56 @@ fn slash_finds_a_pull_request_a_project_with_nothing_running_and_keeps_to_a_stat
         sidebar_of(&tui.text()).contains("planner")
     });
     tui.shows("1 match");
+}
+
+#[test]
+fn slash_finds_an_issue_and_a_backlog_item_and_a_click_on_a_count_lists_them() {
+    let crystal = Crystal::new();
+    let dir = crystal.dir.path();
+    let repo = github_repo(dir);
+    let issues = r#"[{"number": 42, "title": "Fix login redirect", "labels": [{"name": "bug"}],
+        "updatedAt": "2026-10-01T10:00:00Z", "author": {"login": "ana"},
+        "url": "https://github.com/acme/app/issues/42"}]"#;
+    let bin = fake_gh(dir, OPEN_PULL_REQUEST, issues);
+    let repo_arg = repo.to_str().unwrap();
+    crystal.ok(&["backlog", "add", "Retry failed charges", "-C", repo_arg]);
+    crystal.ok(&["new", "-n", "planner", "-c", repo_arg, "sleep", "30"]);
+
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let mut tui = crystal.attach_with_env(&[], &[("PATH", &path)]);
+    tui.shows("▸ planner");
+    tui.shows("1 pr · 1 issue");
+
+    // An issue, by its label, opens in the issues view on it.
+    tui.type_keys("/bug");
+    tui.shows("#42 Fix login");
+    tui.shows("1 match");
+    tui.type_keys("\r");
+    tui.shows("issues · app");
+    tui.type_keys("\x1b");
+    tui.shows("▸ planner");
+
+    // An item on the backlog, by a word of its line, opens the backlog on
+    // it.
+    tui.type_keys("/charges");
+    tui.shows("#1 Retry failed");
+    tui.type_keys("\r");
+    tui.shows("backlog · app");
+    tui.type_keys("\x1b");
+    tui.shows("▸ planner");
+
+    // A click on a count on the tab bar lists what it counts.
+    let click = |tui: &mut Terminal, text: &str| {
+        let top = tui.text().lines().next().unwrap().to_string();
+        let column = top[..top.find(text).unwrap()].chars().count() + 1;
+        tui.type_keys(&format!("\x1b[<0;{column};1M\x1b[<0;{column};1m"));
+    };
+    click(&mut tui, "1 pr");
+    tui.shows("pull requests · app");
+    tui.type_keys("\x1b");
+    tui.shows("▸ planner");
+    click(&mut tui, "1 issue");
+    tui.shows("issues · app");
 }
 
 #[test]

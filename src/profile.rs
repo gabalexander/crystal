@@ -27,6 +27,7 @@ pub fn enabled(config: &config::Config) -> bool {
 
 /// A saved way to start an agent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct Profile {
     /// What the panel calls it.
@@ -81,6 +82,7 @@ fn is_false(value: &bool) -> bool {
 
 /// How a profile's agent is meant to start.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum Launch {
     /// As the new-session panel is set.
@@ -122,6 +124,7 @@ impl Launch {
 
 /// Where a profile starts its agent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum StartIn {
     /// Where the selected session runs.

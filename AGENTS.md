@@ -16,6 +16,12 @@ roadmap.
 
 Run lint, format and tests before every commit.
 
+Every type a request, a response or an event reaches derives `schemars::JsonSchema` in test builds alone
+(`#[cfg_attr(test, derive(schemars::JsonSchema))]`, schemars being a dev-dependency), a new one too, and one
+whose name another has, or says little alone, takes `#[cfg_attr(test, schemars(rename = "..."))]`. A test
+keeps `docs/crystal-api.schema.json` what they make: after changing one, `CRYSTAL_UPDATE_API_SCHEMA=1 cargo test
+api_schema` writes it again.
+
 ## Releasing
 
 Releases are built by `.github/workflows/release.yml`, for macOS (Apple silicon and Intel) and Linux (x86_64
@@ -82,6 +88,9 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   attached again after a handover, and `control`'s commands on standard input (input, keys, resize, release)
 - `src/api.rs`: `crystal api snapshot`: the sessions, layout, projects, open tasks, flow runs and archive in one
   JSON document, with the latest event's seq to follow on from
+  - `api/schema.rs`: `crystal api schema`: the JSON Schema of the socket protocol, `docs/crystal-api.schema.json`
+    bundled as it is, a line on each message it names, or the whole of it printed or written to a file; and the
+    tests that make it from the types, keep the file in step and check messages crystal writes against it
 - `src/messages.rs`: what `crystal send` carries from one session to another: the text tidied and cut to 8 KiB,
   the line ahead of it saying which session sent it, the guard that holds a session to 20 sends a minute, the
   refusal of a message that only acknowledges (`ok`, `thanks`, `👍`), and the `agent_blocked:` refusal for an
@@ -146,10 +155,11 @@ whenever what's handed over changes in a way the crystal before couldn't read.
     after a handover or a restart, each one an event for the loop, and its answers, that it was used (a
     key, the mouse, a paste, focus gained) and when its terminal gains and loses the focus  sent back
   - `ui.rs`: the layout and drawing (the tab bar, on top or over the footer or left out, its tabs and what
-    it shows at its right, the counts of what's open on the selected session's forge first, pane headers,
-    footer and its readout of the memory crystal takes, the column each pane's scrollbar takes, the key
-    pressed last while `show_keys` is on), one column on a terminal as narrow as a phone's (`[sidebar]
-    phone_width`), the sidebar over the pane while it has the keyboard, and what's under the mouse
+    it shows at its right, the counts of what's open on the selected session's forge first, which a click
+    lists, pane headers, footer and its readout of the memory crystal takes, the column each pane's
+    scrollbar takes, the key pressed last while `show_keys` is on), one column on a terminal as narrow as a
+    phone's (`[sidebar] phone_width`), the sidebar over the pane while it has the keyboard, and what's under
+    the mouse
   - `scrollbar.rs`: a pane's scrollbar: where its thumb is for how far back the pane is, how far back a
     dragged thumb takes it, and drawing it; pure, so it's unit-tested
   - `tabs.rs`: tabs, as many as the user likes, each holding its own sessions (each session in exactly one)
@@ -174,8 +184,8 @@ whenever what's handed over changes in a way the crystal before couldn't read.
     what git is in the middle of there, their changes not committed and how far they are from their upstream,
     Claude Code's own named by their commits and a labelled one by its label, sessions with their mark, their
     agent's model and how long ago, the line reported for one under it, terminals drawn apart from agents, the
-    sessions that need the user pinned on top with the tab each is in, and the rail of marks a folded sidebar
-    keeps; what doesn't fit left out
+    sessions that need the user pinned on top with the tab each is in, the pull requests, issues and backlog
+    items `/` found, and the rail of marks a folded sidebar keeps; what doesn't fit left out
   - `keymap.rs`: the sidebar's commands, each with the id `[keys]` names it by, what it does and its default
     keys; keys as the config writes them and as terminals send them, folded into one form; the config's
     keys laid over the defaults, a key given to one command taken from the one that had it, and those written
@@ -197,7 +207,9 @@ whenever what's handed over changes in a way the crystal before couldn't read.
     or dark appearance, a scheme's other side; the user's `[colors]` over it, and none for `NO_COLOR`
   - `appearance.rs`: light or dark, which the theme follows with `[appearance] auto_switch`: the system's (a
     Mac's defaults, the desktop portal, GNOME's), asked every two seconds off the event loop, or over ssh the
-    terminal's background, asked once as the TUI starts, before the input reader reads anything
+    terminal's background, asked once as the TUI starts, before the input reader reads anything; not the
+    terminal's mode 2031 reports, which crossterm 0.29 takes for an unfinished key and swallows the keys
+    after
   - `window.rs`: the title the TUI gives its terminal: `[window] title`'s tokens filled in and checked, what
     an empty token leaves at either end taken off, and the title stack it's saved on and put back from
   - `status_bar.rs`: what the tab bar shows at its right (`[tab_bar] right`): the hostname, a clock through
@@ -235,8 +247,8 @@ whenever what's handed over changes in a way the crystal before couldn't read.
     event loop does the writing
   - `search.rs`: `/`'s matching, letters in order (a directory or a goal only whole): a session of any
     tab by its name, project, branch, command, agent, tab or flow run; a worktree with no sessions or a
-    project nothing runs in; an open pull request; the status Tab keeps to; and where what it finds goes
-    under its project in the sidebar's rows
+    project nothing runs in; an open pull request or issue; an item to do on a backlog, its body only
+    whole; the status Tab keeps to; and where what it finds goes under its project in the sidebar's rows
   - `issues.rs`: the issues view (`i`): its state and keys, kept apart from I/O, commenting on an issue and
     changing its title and text, and its drawing
   - `pull_requests.rs`: the pull requests view (`O`): its state and keys, kept apart from I/O, the open ones
@@ -474,7 +486,8 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   for mermaid to draw in the browser
 - `src/spending.rs`: what background tasks have spent today, kept in the database by the day: the TUI footer's
   `$X today`, and what `daily_budget_usd` is held against
-- `src/protocol.rs`: requests and responses, one JSON line each, and the frames an attached client sends
+- `src/protocol.rs`: requests and responses, one JSON line each, and the frames an attached client sends; their
+  JSON Schema is `docs/crystal-api.schema.json` (see `api/schema.rs`)
 - `src/socket.rs`: where the socket lives: a server's, named after it in crystal's socket directory, or one
   given by its path; which a command is for (`-S`, `--server`, `CRYSTAL_SOCKET`, then `CRYSTAL_SERVER`); and
   which server a socket is, however it's spelled and whoever starts its daemon, so the same socket always gets

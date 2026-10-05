@@ -58,6 +58,7 @@ pub fn ensure_enabled(config: &Config) -> Result<()> {
 
 /// A named chain of steps.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct Flow {
     /// What it's run by: `crystal flow run <name>`. Its runs and their
@@ -73,6 +74,8 @@ pub struct Flow {
 
 /// One step of a flow: a task.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+#[cfg_attr(test, schemars(rename = "FlowStep"))]
 #[serde(deny_unknown_fields)]
 pub struct Step {
     /// What the step is called, in its flow and in its session's name.
@@ -132,6 +135,7 @@ pub struct Step {
 
 /// Where a step runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum Placement {
     /// Where the run was started.

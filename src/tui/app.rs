@@ -61,8 +61,8 @@ use crate::git;
 use crate::profile::{self, Profile};
 use crate::project_commands::Verb;
 use crate::protocol::{
-    Activity, Answer, ArchivedSession, Backlog, ForgeLink, Front, SessionInfo, Spending, State,
-    TaskBrief, TaskSpec, Worktree, task_label,
+    Activity, Answer, ArchivedSession, Backlog, BacklogItem, ForgeLink, Front, SessionInfo,
+    Spending, State, TaskBrief, TaskSpec, Worktree, task_label,
 };
 use crate::resources::Resources;
 use crate::shell;
@@ -156,6 +156,12 @@ pub enum Hit {
     /// The footer's readout of the memory crystal takes, which opens the
     /// RAM view.
     Readout,
+    /// The tab bar's count of the pull requests open on the forge of the
+    /// selected session's project, which opens the pull requests view.
+    PullRequestCount,
+    /// The tab bar's count of the issues open there, which opens the
+    /// issues view.
+    IssueCount,
     /// The footer, or anywhere else.
     Elsewhere,
 }
@@ -582,10 +588,9 @@ pub enum Action {
     /// Ask the forge for the open pull requests of the project at this
     /// path, for the pull requests view that's now open.
     ListPullRequests(PathBuf),
-    /// Ask the forges of the projects at these paths for their open pull
-    /// requests, for `/` to find: the projects no session is in, which
-    /// nothing else asks about.
-    FindPullRequests(Vec<PathBuf>),
+    /// Ask for what `/` finds that nothing else keeps up to date: see
+    /// [`ToFind`].
+    Find(ToFind),
     /// Post `text` on `topic`, of the project at `project`.
     Comment {
         project: PathBuf,
@@ -850,6 +855,23 @@ pub struct Filter {
     highlighted: Option<Found>,
 }
 
+/// What `/` asks for as it opens, for it to find, each by the projects'
+/// main worktrees: the open pull requests and issues of the projects no
+/// session is in, which nothing else asks their forges about, and the
+/// backlogs of every project crystal knows, which the daemon keeps.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ToFind {
+    pub pull_requests: Vec<PathBuf>,
+    pub issues: Vec<PathBuf>,
+    pub backlogs: Vec<PathBuf>,
+}
+
+impl ToFind {
+    fn is_empty(&self) -> bool {
+        self.pull_requests.is_empty() && self.issues.is_empty() && self.backlogs.is_empty()
+    }
+}
+
 /// What `/`'s bar can be on, which Enter or a click picks.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Found {
@@ -864,6 +886,12 @@ pub enum Found {
     /// An open pull request, by its project's main worktree and its
     /// number: picking it opens the pull requests view on it.
     PullRequest { project: PathBuf, number: u64 },
+    /// An open issue, by its project's main worktree and its number:
+    /// picking it opens the issues view on it.
+    Issue { project: PathBuf, number: u64 },
+    /// An item to do on a project's backlog, by the project and its
+    /// number: picking it opens the backlog view on it.
+    Backlog { project: PathBuf, number: u64 },
 }
 
 /// How many pull requests and issues are open on a project's forge, for
@@ -1045,6 +1073,10 @@ pub struct App {
     pull_requests: HashMap<PathBuf, Result<(Forge, Vec<PullRequest>), String>>,
     /// What its forge said about each project's open issues, the same way.
     open_issues: HashMap<PathBuf, Result<(Forge, Vec<Issue>), String>>,
+    /// The items to do on each project's backlog, by the project's main
+    /// worktree, or its directory outside git, as the daemon last listed
+    /// them: for `/` to find.
+    backlogs: HashMap<PathBuf, Vec<BacklogItem>>,
     /// When each of those lists was asked of the forge, by project: a list
     /// asked before lands after it only when the forge took longer over it,
     /// and it's dropped.
@@ -1273,6 +1305,7 @@ impl App {
             filter: None,
             pull_requests: HashMap::new(),
             open_issues: HashMap::new(),
+            backlogs: HashMap::new(),
             pull_requests_asked: HashMap::new(),
             issues_asked: HashMap::new(),
             issue_edits: HashMap::new(),
@@ -2261,10 +2294,10 @@ impl App {
 
     /// Adds to the `rows` of the sessions `/`'s filter found the rest of
     /// what it found, each under its project: the projects with no
-    /// sessions, the worktrees with none and the open pull requests that
-    /// match. Only once something's typed, and while no status is picked:
-    /// before that, they would be everything crystal knows, and they have
-    /// no status.
+    /// sessions, the worktrees with none, the open pull requests and
+    /// issues, and the backlog's items to do that match. Only once
+    /// something's typed, and while no status is picked: before that, they
+    /// would be everything crystal knows, and they have no status.
     fn add_found(&self, filter: &Filter, rows: &mut Vec<Row>) {
         let query = filter.input.text();
         if filter.status.is_some() || query.trim().is_empty() {
@@ -2304,12 +2337,16 @@ impl App {
         });
         let mut projects: Vec<&PathBuf> = empty.iter().map(|w| &w.project_path).collect();
         projects.extend(self.pull_requests.keys());
+        projects.extend(self.open_issues.keys());
+        projects.extend(self.backlogs.keys());
         projects.sort_by_key(|project| self.known_place(project));
         projects.dedup();
         for project in projects {
             under(project, groups::empty_rows(&empty, project));
             let name = self.project_name(project);
             under(project, self.found_pull_requests(query, project, &name));
+            under(project, self.found_issues(query, project, &name));
+            under(project, self.found_backlog_items(query, project, &name));
         }
         found.retain(|(_, rows)| !rows.is_empty());
         let found = found
@@ -2338,6 +2375,46 @@ impl App {
             .map(|pull_request| Row::PullRequest {
                 project: project.to_path_buf(),
                 number: pull_request.number,
+            })
+            .collect()
+    }
+
+    /// The rows of the open issues of the project at `project`, called
+    /// `name`, that match `query`, as its forge listed them: none while the
+    /// github plugin is off, or before its forge has said.
+    fn found_issues(&self, query: &str, project: &Path, name: &str) -> Vec<Row> {
+        if !self.github_on {
+            return Vec::new();
+        }
+        let Some(Ok((_, issues))) = self.open_issues.get(project) else {
+            return Vec::new();
+        };
+        issues
+            .iter()
+            .filter(|issue| search::issue_match(query, issue, name).is_some())
+            .map(|issue| Row::Issue {
+                project: project.to_path_buf(),
+                number: issue.number,
+            })
+            .collect()
+    }
+
+    /// The rows of the items to do on the backlog of the project at
+    /// `project`, called `name`, that match `query`: none while the backlog
+    /// is off, or before the daemon has listed them.
+    fn found_backlog_items(&self, query: &str, project: &Path, name: &str) -> Vec<Row> {
+        if !self.backlog_on {
+            return Vec::new();
+        }
+        let Some(items) = self.backlogs.get(project) else {
+            return Vec::new();
+        };
+        items
+            .iter()
+            .filter(|item| search::backlog_match(query, item, name).is_some())
+            .map(|item| Row::BacklogItem {
+                project: project.to_path_buf(),
+                number: item.number,
             })
             .collect()
     }
@@ -2742,6 +2819,14 @@ impl App {
                 project: project.clone(),
                 number: *number,
             },
+            Row::Issue { project, number } => Found::Issue {
+                project: project.clone(),
+                number: *number,
+            },
+            Row::BacklogItem { project, number } => Found::Backlog {
+                project: project.clone(),
+                number: *number,
+            },
             _ => return None,
         })
     }
@@ -2816,6 +2901,38 @@ impl App {
             search::pull_request_match(filter.input.text(), pull_request, &name)
         });
         Some((pull_request, marked.unwrap_or_default()))
+    }
+
+    /// The open issue numbered `number` of the project at `project`, as
+    /// its forge last listed them, and while `/`'s filter is open, which
+    /// letters of its title to mark.
+    pub fn found_issue(&self, project: &Path, number: u64) -> Option<(&Issue, Vec<usize>)> {
+        let Some(Ok((_, issues))) = self.open_issues.get(project) else {
+            return None;
+        };
+        let issue = issues.iter().find(|issue| issue.number == number)?;
+        let marked = self.filter.as_ref().and_then(|filter| {
+            let name = self.project_name(project);
+            search::issue_match(filter.input.text(), issue, &name)
+        });
+        Some((issue, marked.unwrap_or_default()))
+    }
+
+    /// Item `number` on the backlog of the project at `project`, as the
+    /// daemon last listed it, and while `/`'s filter is open, which letters
+    /// of its line to mark.
+    pub fn found_backlog_item(
+        &self,
+        project: &Path,
+        number: u64,
+    ) -> Option<(&BacklogItem, Vec<usize>)> {
+        let items = self.backlogs.get(project)?;
+        let item = items.iter().find(|item| item.number == number)?;
+        let marked = self.filter.as_ref().and_then(|filter| {
+            let name = self.project_name(project);
+            search::backlog_match(filter.input.text(), item, &name)
+        });
+        Some((item, marked.unwrap_or_default()))
     }
 
     /// The session the sidebar's bar is on: the one the filter's bar is on
@@ -2985,8 +3102,15 @@ impl App {
         self.backlog.as_ref()
     }
 
-    /// Takes the backlog the daemon sent for the project `dir` is in.
+    /// Takes the backlog the daemon sent for the project `dir` is in: its
+    /// items to do for `/` to find, and the whole of it for the backlog
+    /// view, if it's open on that project.
     pub fn set_backlog(&mut self, dir: &Path, found: Result<Backlog, String>) {
+        if let Ok(backlog) = &found {
+            let to_do = backlog.items.iter().filter(|item| !item.done);
+            self.backlogs
+                .insert(backlog.path.clone(), to_do.cloned().collect());
+        }
         if let Some(view) = self.backlog.as_mut().filter(|view| view.dir == dir) {
             view.set_backlog(found);
         }
@@ -3989,6 +4113,8 @@ impl App {
         match (kind, hit) {
             (_, Hit::Tab(index)) if click => self.go_to_tab(index),
             (_, Hit::Readout) if click => return Some(self.open_ram()),
+            (_, Hit::PullRequestCount) if click => return self.open_pull_requests(),
+            (_, Hit::IssueCount) if click => return self.open_issues(),
             (_, Hit::SidebarRow(row)) if click => self.click_row(row),
             // Anywhere else in the sidebar, the click only takes the keyboard.
             (_, Hit::Sidebar) if click => self.focus = Focus::Sidebar,
@@ -4175,7 +4301,9 @@ impl App {
             | Row::Flow(_)
             | Row::Step { .. }
             | Row::NeedsYou(_)
-            | Row::PullRequest { .. } => return None,
+            | Row::PullRequest { .. }
+            | Row::Issue { .. }
+            | Row::BacklogItem { .. } => return None,
         }
         self.focus = Focus::Sidebar;
         if self.on_worktree.is_some() {
@@ -5237,8 +5365,9 @@ impl App {
     }
 
     /// Opens `/`'s filter, its bar on the selected session, and has the
-    /// forges asked about the open pull requests of the projects no session
-    /// is in, which nothing has asked about yet, for it to find.
+    /// forges asked about the open pull requests and issues of the projects
+    /// no session is in, which nothing has asked about yet, and the daemon
+    /// about every project's backlog, for it to find.
     fn open_filter(&mut self) -> Option<Action> {
         let highlighted = self
             .selected()
@@ -5249,16 +5378,27 @@ impl App {
             highlighted,
         });
         self.keep_filter_bar_on_a_match();
-        if !self.github_on {
-            return None;
+        let mut to_find = ToFind::default();
+        if self.github_on {
+            let quiet: Vec<PathBuf> = (self.quiet_projects().into_iter())
+                .map(|project| project.path.clone())
+                .collect();
+            to_find.pull_requests = (quiet.iter())
+                .filter(|project| !self.pull_requests.contains_key(*project))
+                .cloned()
+                .collect();
+            to_find.issues = (quiet.into_iter())
+                .filter(|project| !self.open_issues.contains_key(project))
+                .collect();
         }
-        let unasked: Vec<PathBuf> = self
-            .quiet_projects()
-            .into_iter()
-            .map(|project| project.path.clone())
-            .filter(|project| !self.pull_requests.contains_key(project))
-            .collect();
-        (!unasked.is_empty()).then_some(Action::FindPullRequests(unasked))
+        if self.backlog_on {
+            let mut backlogs = self.projects();
+            backlogs.extend(self.known.iter().map(|project| project.path.clone()));
+            backlogs.sort();
+            backlogs.dedup();
+            to_find.backlogs = backlogs;
+        }
+        (!to_find.is_empty()).then_some(Action::Find(to_find))
     }
 
     /// Keys while `/`'s filter is open: Enter picks what the bar is on, Esc
@@ -5302,8 +5442,8 @@ impl App {
     /// Closes `/`'s filter and does what picking `found` does: a session is
     /// selected, in whichever tab it's in; a worktree with no sessions has
     /// the selection put on it, where Enter starts something; a flow run's
-    /// step it's at is selected; and a pull request is opened in the pull
-    /// requests view.
+    /// step it's at is selected; and a pull request, an issue or a backlog
+    /// item is opened in its view, the bar on it.
     fn pick(&mut self, found: Found) -> Option<Action> {
         self.filter = None;
         match found {
@@ -5317,6 +5457,13 @@ impl App {
             Found::Flow(name) => self.select_flow(&name),
             Found::PullRequest { project, number } => {
                 return self.open_pull_requests_of(project, Some(number));
+            }
+            Found::Issue { project, number } => {
+                return self.open_issues_of(project, Some(number));
+            }
+            Found::Backlog { project, number } => {
+                let name = self.project_name(&project);
+                return self.open_backlog_of(project, name, Some(number));
             }
         }
         self.keep_selection_on_a_row();
@@ -5499,13 +5646,23 @@ impl App {
     /// it can't.
     fn open_issues(&mut self) -> Option<Action> {
         let worktree = self.forge_worktree()?;
-        let project = worktree.project_path;
+        self.open_issues_of(worktree.project_path, None)
+    }
+
+    /// Opens the issues view for the project at `project`, on the ones
+    /// listed last until its forge lists them again, with the bar on issue
+    /// `number` when there's one to put it on.
+    fn open_issues_of(&mut self, project: PathBuf, number: Option<u64>) -> Option<Action> {
         let known = match self.open_issues.get(&project) {
             Some(Ok((_, issues))) => Some(issues.clone()),
             _ => None,
         };
         let forge = self.forge_of(&project);
-        let view = IssuesView::new(project.clone(), worktree.project, forge, known);
+        let name = self.project_name(&project);
+        let mut view = IssuesView::new(project.clone(), name, forge, known);
+        if let Some(number) = number {
+            view.list.highlight(number);
+        }
         self.issues = Some(view);
         Some(Action::ListIssues(project))
     }
@@ -5584,7 +5741,22 @@ impl App {
             Some(worktree) => (worktree.project_path.clone(), worktree.project.clone()),
             None => (selected.cwd.clone(), shell::home_relative(&selected.cwd)),
         };
-        self.backlog = Some(BacklogView::new(dir.clone(), name));
+        self.open_backlog_of(dir, name, None)
+    }
+
+    /// Opens the backlog view of the project `dir` is in, called `name`,
+    /// with the bar on item `number` when there's one to put it on.
+    fn open_backlog_of(
+        &mut self,
+        dir: PathBuf,
+        name: String,
+        number: Option<u64>,
+    ) -> Option<Action> {
+        let mut view = BacklogView::new(dir.clone(), name);
+        if let Some(number) = number {
+            view.highlight(number);
+        }
+        self.backlog = Some(view);
         Some(Action::ListBacklog(dir))
     }
 
@@ -11170,13 +11342,35 @@ mod tests {
     }
 
     #[test]
-    fn slash_asks_once_for_the_pull_requests_of_projects_no_session_is_in() {
+    fn a_click_on_the_tab_bars_forge_counts_opens_their_views() {
+        let mut app = with_agents(&["claude"], vec![in_repo("planner", "main")]);
+        let app_path = PathBuf::from("/code/app");
+        assert_eq!(
+            app.on_mouse(CLICK, Hit::PullRequestCount),
+            Some(Action::ListPullRequests(app_path.clone()))
+        );
+        assert!(app.pull_requests_view().is_some());
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(
+            app.on_mouse(CLICK, Hit::IssueCount),
+            Some(Action::ListIssues(app_path))
+        );
+        assert!(app.issues_view().is_some());
+    }
+
+    #[test]
+    fn slash_asks_once_for_the_forge_of_projects_no_session_is_in_and_every_backlog() {
         let mut app = with_agents(&["claude"], vec![in_repo("planner", "main")]);
         app.set_known_projects(vec![known("app"), known("api")]);
         let api = PathBuf::from("/code/api");
+        let backlogs = vec![api.clone(), PathBuf::from("/code/app")];
         assert_eq!(
             press(&mut app, KeyCode::Char('/')),
-            Some(Action::FindPullRequests(vec![api.clone()]))
+            Some(Action::Find(ToFind {
+                pull_requests: vec![api.clone()],
+                issues: vec![api.clone()],
+                backlogs: backlogs.clone(),
+            }))
         );
         press(&mut app, KeyCode::Esc);
         let none = PullRequest {
@@ -11184,7 +11378,17 @@ mod tests {
             ..pull_request(3, "limits")
         };
         app.set_pull_requests(api.clone(), on_github(vec![none]), Instant::now());
-        assert_eq!(press(&mut app, KeyCode::Char('/')), None);
+        app.set_issues(&api, Ok((Forge::GitHub, Vec::new())), Instant::now());
+        // The daemon's backlogs are asked for every time: they're cheap,
+        // and nothing else keeps them.
+        let only_backlogs = ToFind {
+            backlogs: backlogs.clone(),
+            ..ToFind::default()
+        };
+        assert_eq!(
+            press(&mut app, KeyCode::Char('/')),
+            Some(Action::Find(only_backlogs.clone()))
+        );
         type_text(&mut app, "rate");
         assert_eq!(
             app.found(),
@@ -11198,9 +11402,154 @@ mod tests {
         config.plugins.insert("github".into(), false);
         app.set_features(&config);
         press(&mut app, KeyCode::Esc);
-        assert_eq!(press(&mut app, KeyCode::Char('/')), None);
+        assert_eq!(
+            press(&mut app, KeyCode::Char('/')),
+            Some(Action::Find(only_backlogs))
+        );
         type_text(&mut app, "rate");
         assert!(app.found().is_empty(), "nothing from a forge with it off");
+
+        config.plugins.insert("backlog".into(), false);
+        app.set_features(&config);
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(press(&mut app, KeyCode::Char('/')), None);
+    }
+
+    #[test]
+    fn slash_finds_an_open_issue_and_enter_opens_it_in_the_view() {
+        let mut app = with_agents(&["claude"], vec![in_repo("planner", "main")]);
+        let app_path = PathBuf::from("/code/app");
+        let issues = vec![
+            issue(12, "Login fails on Safari"),
+            issue(13, "Dark mode flickers"),
+        ];
+        app.set_issues(&app_path, Ok((Forge::GitHub, issues)), Instant::now());
+        press(&mut app, KeyCode::Char('/'));
+        type_text(&mut app, "safari");
+        let found = Found::Issue {
+            project: app_path.clone(),
+            number: 12,
+        };
+        assert_eq!(app.found(), [found]);
+        let (_, marked) = app.found_issue(&app_path, 12).unwrap();
+        assert_eq!(marked, vec![15, 16, 17, 18, 19, 20]);
+
+        assert_eq!(
+            press(&mut app, KeyCode::Enter),
+            Some(Action::ListIssues(app_path.clone()))
+        );
+        assert!(app.filter().is_none());
+        let view = app.issues_view().unwrap();
+        assert_eq!(view.highlighted().map(|issue| issue.number), Some(12));
+
+        // A click on one picks it too.
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('/'));
+        type_text(&mut app, "#13");
+        let rows = app.rows();
+        let row = rows
+            .iter()
+            .position(|row| matches!(row, Row::Issue { number: 13, .. }))
+            .unwrap();
+        assert_eq!(
+            app.on_mouse(CLICK, Hit::SidebarRow(row)),
+            Some(Action::ListIssues(app_path))
+        );
+        let view = app.issues_view().unwrap();
+        assert_eq!(view.highlighted().map(|issue| issue.number), Some(13));
+
+        let mut config = Config::default();
+        config.plugins.insert("github".into(), false);
+        app.set_features(&config);
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('/'));
+        type_text(&mut app, "safari");
+        assert!(app.found().is_empty(), "nothing from a forge with it off");
+    }
+
+    #[test]
+    fn slash_finds_a_backlog_item_to_do_and_enter_opens_the_backlog_on_it() {
+        let mut app = with_agents(&["claude"], vec![in_project("fixer", "shop")]);
+        let shop = PathBuf::from("/code/shop");
+        let mut backlog = backlog_of(&[
+            (3, "Retry failed charges"),
+            (4, "Retry the old way"),
+            (5, "Tidy the README"),
+        ]);
+        backlog.items[1].done = true;
+        app.set_backlog(&shop, Ok(backlog.clone()));
+        press(&mut app, KeyCode::Char('/'));
+        type_text(&mut app, "retry");
+        let found = Found::Backlog {
+            project: shop.clone(),
+            number: 3,
+        };
+        assert_eq!(app.found(), [found], "an item done is left out");
+        let (_, marked) = app.found_backlog_item(&shop, 3).unwrap();
+        assert_eq!(marked, vec![0, 1, 2, 3, 4]);
+
+        assert_eq!(
+            press(&mut app, KeyCode::Enter),
+            Some(Action::ListBacklog(shop.clone()))
+        );
+        assert!(app.filter().is_none());
+        app.set_backlog(&shop, Ok(backlog));
+        let view = app.backlog_view().unwrap();
+        assert_eq!(view.highlighted().map(|item| item.number), Some(3));
+
+        let mut config = Config::default();
+        config.plugins.insert("backlog".into(), false);
+        app.set_features(&config);
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('/'));
+        type_text(&mut app, "retry");
+        assert!(
+            app.found().is_empty(),
+            "nothing from the backlog with it off"
+        );
+    }
+
+    #[test]
+    fn what_slash_finds_on_a_forge_and_a_backlog_goes_under_its_project() {
+        let mut app = with_agents(&["claude"], vec![in_repo("planner", "main")]);
+        let app_path = PathBuf::from("/code/app");
+        let fix = PullRequest {
+            title: "Fix the login redirect".into(),
+            ..pull_request(57, "fix-login")
+        };
+        app.set_pull_requests(app_path.clone(), on_github(vec![fix]), Instant::now());
+        let issues = vec![issue(12, "Login fails on Safari")];
+        app.set_issues(&app_path, Ok((Forge::GitHub, issues)), Instant::now());
+        let backlog = Backlog {
+            project: "app".into(),
+            path: app_path.clone(),
+            ..backlog_of(&[(3, "Log the login attempts")])
+        };
+        app.set_backlog(&app_path, Ok(backlog));
+        press(&mut app, KeyCode::Char('/'));
+        type_text(&mut app, "login");
+        let rows = app.rows();
+        let heading = rows
+            .iter()
+            .position(|row| matches!(row, Row::Project { path, .. } if *path == app_path))
+            .unwrap();
+        let project = app_path.clone();
+        assert_eq!(
+            rows[rows.len() - 3..],
+            [
+                Row::PullRequest {
+                    project: project.clone(),
+                    number: 57
+                },
+                Row::Issue {
+                    project: project.clone(),
+                    number: 12
+                },
+                Row::BacklogItem { project, number: 3 },
+            ]
+        );
+        assert!(heading < rows.len() - 3);
+        assert_eq!(app.found().len(), 3);
     }
 
     #[test]

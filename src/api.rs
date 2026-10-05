@@ -9,6 +9,8 @@
 //! It's asked for piece by piece, not all at once, so a change can land
 //! between two pieces; the events after `seq` cover it.
 
+pub mod schema;
+
 use crate::client;
 use crate::db::Db;
 use crate::env;
@@ -22,6 +24,7 @@ use std::path::Path;
 
 /// What `crystal api snapshot` prints.
 #[derive(Debug, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct Snapshot {
     /// The crystal that took it, which is the daemon's: the two must match.
     pub version: String,
@@ -49,6 +52,8 @@ pub struct Snapshot {
 /// A session as `ls --json` lists it: what the daemon knows, and the word
 /// its STATE column shows.
 #[derive(Debug, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+#[cfg_attr(test, schemars(rename = "ListedSession"))]
 pub struct Listed {
     #[serde(flatten)]
     pub session: SessionInfo,

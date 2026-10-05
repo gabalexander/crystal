@@ -2365,8 +2365,8 @@ impl Tui {
                     }
                 });
             }
-            Action::FindPullRequests(projects) => {
-                for project in projects {
+            Action::Find(to_find) => {
+                for project in to_find.pull_requests {
                     self.read_in_background(move || {
                         let asked = Instant::now();
                         let found = list_pull_requests(&project);
@@ -2377,6 +2377,18 @@ impl Tui {
                         }
                     });
                 }
+                for project in to_find.issues {
+                    self.read_in_background(move || {
+                        let asked = Instant::now();
+                        let found = list_issues(&project);
+                        Event::Issues {
+                            project,
+                            found,
+                            asked,
+                        }
+                    });
+                }
+                self.find_backlogs(to_find.backlogs);
             }
             Action::Comment {
                 project,
@@ -2936,6 +2948,26 @@ impl Tui {
             let found =
                 client::backlog(&socket, dir.clone(), true).map_err(|err| format!("{err:#}"));
             Event::Backlog { dir, found }
+        });
+    }
+
+    /// Asks the daemon, off the loop, for the backlogs of the projects
+    /// `dirs` are in, one after the other, done items too, as the backlog
+    /// view does: for `/` to find their items to do.
+    fn find_backlogs(&self, dirs: Vec<PathBuf>) {
+        if dirs.is_empty() {
+            return;
+        }
+        let socket = self.socket.clone();
+        let events = self.events.clone();
+        thread::spawn(move || {
+            for dir in dirs {
+                let found =
+                    client::backlog(&socket, dir.clone(), true).map_err(|err| format!("{err:#}"));
+                if events.send(Event::Backlog { dir, found }).is_err() {
+                    return;
+                }
+            }
         });
     }
 

@@ -51,7 +51,7 @@ one a crash or a reboot couldn't start again, saying why: put that right and `En
 | `n` `w` | A new session, or one in a new worktree |
 | `Space` | Reply to the selected session |
 | `u` | The next session that needs you |
-| `/` | Find a session, a worktree, a flow run or a pull request |
+| `/` | Find a session, a worktree, a flow run, a pull request, an issue or a backlog item |
 | `:` | Every command, by its name |
 | `\|` `-` | Split the pane, side by side or one above the other |
 | `z` | Zoom the pane to the whole screen, and back |
