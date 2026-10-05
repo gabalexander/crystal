@@ -9,6 +9,7 @@
 //! layout export` writes and `crystal layout apply` reads, is
 //! [`crate::layout_file`]'s.
 
+use crate::events::Event;
 use crate::notify::Presence;
 use crate::tui::keymap::Extent;
 use crate::tui::split_tree::{Direction, Way};
@@ -177,6 +178,9 @@ pub enum Report {
         id: u64,
         answer: Result<Layout, String>,
     },
+    /// What changed in its tabs and panes, for the daemon to tell whoever
+    /// listens: see [`crate::tui::layout_events`].
+    Events { events: Vec<Event> },
 }
 
 /// A TUI's tabs and their panes.
@@ -227,6 +231,26 @@ pub enum Tile {
         first: Box<Tile>,
         second: Box<Tile>,
     },
+}
+
+impl TabLayout {
+    /// What it's called: its name, or with none, its number, as `tab 2`.
+    pub fn label(&self) -> String {
+        match self.name.is_empty() {
+            true => format!("tab {}", self.number),
+            false => self.name.clone(),
+        }
+    }
+}
+
+impl Tile {
+    /// How many panes it is.
+    pub fn count(&self) -> usize {
+        match self {
+            Tile::Pane { .. } => 1,
+            Tile::Split { first, second, .. } => first.count() + second.count(),
+        }
+    }
 }
 
 impl Layout {

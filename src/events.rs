@@ -11,6 +11,7 @@
 
 use crate::artifacts;
 use crate::flow_run::{FlowRun, StepState};
+use crate::layout::{TabLayout, Tile};
 use crate::memory::{self, Entry};
 use crate::messages::{self, Sender};
 use crate::plugin_manifest;
@@ -20,6 +21,7 @@ use crate::protocol::{
     Subagent, TaskOutcome, TaskRecord, TaskResult, TaskState,
 };
 use crate::shell;
+use crate::tui::split_tree::Way;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -80,10 +82,21 @@ pub enum Kind {
     PluginPaused,
     DaemonHandedOver,
     DaemonRestarted,
+    TabCreated,
+    TabClosed,
+    TabRenamed,
+    TabMoved,
+    TabFocused,
+    PaneFocused,
+    PaneMoved,
+    LayoutUpdated,
+    ProjectAdded,
+    ProjectRemoved,
+    ProjectFocused,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 52] = [
+    pub const ALL: [Kind; 63] = [
         Kind::SessionStarted,
         Kind::SessionRenamed,
         Kind::SessionWorking,
@@ -136,6 +149,17 @@ impl Kind {
         Kind::PluginPaused,
         Kind::DaemonHandedOver,
         Kind::DaemonRestarted,
+        Kind::TabCreated,
+        Kind::TabClosed,
+        Kind::TabRenamed,
+        Kind::TabMoved,
+        Kind::TabFocused,
+        Kind::PaneFocused,
+        Kind::PaneMoved,
+        Kind::LayoutUpdated,
+        Kind::ProjectAdded,
+        Kind::ProjectRemoved,
+        Kind::ProjectFocused,
     ];
 
     /// Its name, which is how plugins, filters and the log know it.
@@ -193,6 +217,17 @@ impl Kind {
             Kind::PluginPaused => "plugin.paused",
             Kind::DaemonHandedOver => "daemon.handed_over",
             Kind::DaemonRestarted => "daemon.restarted",
+            Kind::TabCreated => "tab.created",
+            Kind::TabClosed => "tab.closed",
+            Kind::TabRenamed => "tab.renamed",
+            Kind::TabMoved => "tab.moved",
+            Kind::TabFocused => "tab.focused",
+            Kind::PaneFocused => "pane.focused",
+            Kind::PaneMoved => "pane.moved",
+            Kind::LayoutUpdated => "layout.updated",
+            Kind::ProjectAdded => "project.added",
+            Kind::ProjectRemoved => "project.removed",
+            Kind::ProjectFocused => "project.focused",
         }
     }
 
@@ -255,6 +290,17 @@ impl Kind {
             Kind::PluginPaused => "a plugin is paused for failing",
             Kind::DaemonHandedOver => "the daemon is handed over to another crystal",
             Kind::DaemonRestarted => "the daemon, restarted cold, has started its sessions again",
+            Kind::TabCreated => "a TUI makes a tab",
+            Kind::TabClosed => "a TUI closes a tab",
+            Kind::TabRenamed => "a tab is named, or its name taken back",
+            Kind::TabMoved => "a tab moves to another place among the tabs",
+            Kind::TabFocused => "another tab comes to the front",
+            Kind::PaneFocused => "the selection settles on another session: the one the user is on",
+            Kind::PaneMoved => "a session moves to another tab",
+            Kind::LayoutUpdated => "a tab's panes change: split, closed, resized, swapped, zoomed",
+            Kind::ProjectAdded => "a project goes on crystal's list",
+            Kind::ProjectRemoved => "a project is taken off it",
+            Kind::ProjectFocused => "the selection settles on a session in another project",
         }
     }
 
@@ -323,7 +369,10 @@ pub struct Event {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<SessionAbout>,
     /// What it was before: a renamed session's old name, what its agent
-    /// was doing before it changed, or the agent that let go of it.
+    /// was doing before it changed, or the agent that let go of it; a
+    /// renamed tab's old name, the number a tab had before it moved or of
+    /// the tab in front before, the number of the tab a session moved
+    /// from, or the session or project the user was on before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -359,6 +408,11 @@ pub struct Event {
     /// written into.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file: Option<PathBuf>,
+    /// The tab it's about, as `crystal layout --json` has it: as it is now,
+    /// or as it was, closed; for a session focused or moved, the tab it's
+    /// in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tab: Option<TabLayout>,
 }
 
 /// The session an event is about, as it was then.
@@ -567,6 +621,7 @@ impl Event {
             message: None,
             distill: None,
             file: None,
+            tab: None,
         }
     }
 
@@ -971,8 +1026,49 @@ impl Event {
         }
     }
 
+    /// `tab` was made, closed, named, moved or brought to the front, or its
+    /// panes changed, as `kind` says; `from` is what it was before.
+    pub fn tab(kind: Kind, tab: TabLayout, from: Option<String>) -> Event {
+        Event {
+            tab: Some(tab),
+            from,
+            ..Event::new(kind)
+        }
+    }
+
+    /// The user's selection settled on `session`, from the session called
+    /// `from`; or it moved to another tab, from the tab numbered `from`.
+    /// `tab` is the tab it's in.
+    pub fn pane(kind: Kind, session: &SessionInfo, tab: TabLayout, from: Option<String>) -> Event {
+        Event {
+            tab: Some(tab),
+            from,
+            ..Event::about_session(kind, session)
+        }
+    }
+
+    /// The project whose main worktree is `project` went on crystal's list
+    /// of projects, or off it.
+    pub fn project_listed(listed: bool, project: PathBuf) -> Event {
+        let kind = if listed {
+            Kind::ProjectAdded
+        } else {
+            Kind::ProjectRemoved
+        };
+        Event::about_project(kind, project)
+    }
+
+    /// The user's selection settled on a session in `project`, from one in
+    /// the project `from`.
+    pub fn project_focused(project: PathBuf, from: Option<&Path>) -> Event {
+        Event {
+            from: from.map(|from| from.display().to_string()),
+            ..Event::about_project(Kind::ProjectFocused, project)
+        }
+    }
+
     /// What it's about, in a word: the session's name, the flow run's, the
-    /// plugin's, the daemon, or else the project's.
+    /// plugin's, the daemon, the tab's, or else the project's.
     pub fn subject(&self) -> String {
         if let Some(session) = &self.session {
             return session.name.clone();
@@ -985,6 +1081,9 @@ impl Event {
         }
         if self.daemon.is_some() {
             return "daemon".to_string();
+        }
+        if let Some(tab) = &self.tab {
+            return tab.label();
         }
         match &self.project {
             Some(project) => project::name_of(project),
@@ -1193,6 +1292,46 @@ impl Event {
                     daemon.version
                 )
             }),
+            Kind::TabCreated => "made".to_string(),
+            Kind::TabClosed => "closed".to_string(),
+            Kind::TabRenamed => match self.from.as_deref() {
+                Some("") | None => "named".to_string(),
+                Some(from) => format!("was {from}"),
+            },
+            Kind::TabMoved => {
+                let to = self.tab.as_ref().map_or(0, |tab| tab.number);
+                format!("from {} to {to}", self.from.as_deref().unwrap_or("?"))
+            }
+            Kind::TabFocused => "in front".to_string(),
+            Kind::PaneFocused | Kind::ProjectFocused => match self.from.as_deref() {
+                Some(from) if self.kind == Kind::ProjectFocused => {
+                    format!("focused, from {}", project::name_of(Path::new(from)))
+                }
+                Some(from) => format!("focused, from {from}"),
+                None => "focused".to_string(),
+            },
+            Kind::PaneMoved => {
+                let to = self.tab.as_ref().map_or_else(String::new, TabLayout::label);
+                format!("tab {} → {to}", self.from.as_deref().unwrap_or("?"))
+            }
+            Kind::LayoutUpdated => self.tab.as_ref().map_or(String::new(), |tab| {
+                let panes = match tab.panes.count() {
+                    1 => "1 pane".to_string(),
+                    count => format!("{count} panes"),
+                };
+                let mut about = vec![panes];
+                if tab.zoomed {
+                    about.push("zoomed".to_string());
+                }
+                if let Some(floating) = &tab.floating {
+                    about.push(format!("{floating} floating"));
+                }
+                about.join(", ")
+            }),
+            Kind::ProjectAdded | Kind::ProjectRemoved => self
+                .project
+                .as_deref()
+                .map_or(String::new(), shell::home_relative),
             Kind::DaemonRestarted => self.daemon.as_ref().map_or(String::new(), |daemon| {
                 let back = match daemon.sessions {
                     1 => "1 session".to_string(),
@@ -1477,10 +1616,55 @@ pub fn example(kind: Kind, session: Option<&SessionInfo>, dir: &Path) -> Event {
         Kind::PluginPaused => Event::plugin_paused("example", "it failed 5 times in a row"),
         Kind::DaemonHandedOver => Event::handed_over("0.3.0", "0.4.0", 3),
         Kind::DaemonRestarted => Event::restarted("0.4.0", 5, vec!["docs".into()]),
+        Kind::TabCreated | Kind::TabClosed | Kind::TabFocused | Kind::LayoutUpdated => {
+            Event::tab(kind, example_tab(&session.name), None)
+        }
+        Kind::TabRenamed => Event::tab(kind, example_tab(&session.name), Some("scratch".into())),
+        Kind::TabMoved => Event::tab(kind, example_tab(&session.name), Some("1".into())),
+        Kind::PaneFocused => Event::pane(
+            kind,
+            &session,
+            example_tab(&session.name),
+            Some("reviewer".into()),
+        ),
+        Kind::PaneMoved => {
+            Event::pane(kind, &session, example_tab(&session.name), Some("1".into()))
+        }
+        Kind::ProjectAdded | Kind::ProjectRemoved => {
+            Event::project_listed(kind == Kind::ProjectAdded, project::of(dir).path)
+        }
+        Kind::ProjectFocused => {
+            let other = dir.with_file_name("docs");
+            Event::project_focused(project::of(dir).path, Some(&other))
+        }
     };
     Event {
         at: now_ms(),
         ..event
+    }
+}
+
+/// A made-up tab, the second, called `work`, with `session` in it beside
+/// the pane that follows the selection.
+fn example_tab(session: &str) -> TabLayout {
+    let pane = |session: &str, selection| Tile::Pane {
+        session: Some(session.to_string()),
+        selection,
+    };
+    TabLayout {
+        number: 2,
+        name: "work".into(),
+        current: true,
+        zoomed: false,
+        sessions: vec![session.to_string(), "server".into()],
+        selected: Some(session.to_string()),
+        floating: None,
+        panes: Tile::Split {
+            way: Way::Right,
+            ratio: 0.5,
+            first: Box::new(pane(session, true)),
+            second: Box::new(pane("server", false)),
+        },
     }
 }
 

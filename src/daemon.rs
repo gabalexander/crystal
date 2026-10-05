@@ -37,10 +37,9 @@ use crate::plugin_hooks;
 use crate::printable;
 use crate::project;
 use crate::protocol::{
-    self, Activity, AgentEvent, ArchivedSession, Artifact, ArtifactKind, Backlog, Conversation,
-    Frame, Front, NewSession, NewTask, PendingTask, Request, Response, SessionInfo, State,
-    TaskBrief, TaskInfo, TaskOutcome, TaskRecord, TaskSpec, TaskStart, TaskState, TaskView,
-    Worktree,
+    self, AgentEvent, ArchivedSession, Artifact, ArtifactKind, Backlog, Conversation, Frame, Front,
+    NewSession, NewTask, PendingTask, Request, Response, SessionInfo, State, TaskBrief, TaskInfo,
+    TaskOutcome, TaskRecord, TaskSpec, TaskStart, TaskState, TaskView, Worktree,
 };
 use crate::report;
 use crate::resources;
@@ -407,7 +406,9 @@ impl Daemon {
             }
             Request::TakeLayoutOrders { used } => {
                 drop(ticket);
-                return self.layout.serve(&conn, input, used);
+                return self
+                    .layout
+                    .serve(&conn, input, used, |event| self.events.emit(event));
             }
             Request::WaitOutput {
                 name,
@@ -922,9 +923,14 @@ impl Daemon {
             if known.listed.contains(project) {
                 continue;
             }
-            match self.db.lock().unwrap().list_project(project, true) {
-                Ok(()) => {
+            let listed = self.db.lock().unwrap().list_project(project, true);
+            match listed {
+                Ok(added) => {
                     known.listed.insert(project.to_path_buf());
+                    if added {
+                        let event = Event::project_listed(true, project.to_path_buf());
+                        self.events.emit(event);
+                    }
                 }
                 Err(err) => eprintln!(
                     "crystal daemon: couldn't keep {} in the list of projects: {err:#}",
@@ -979,12 +985,15 @@ impl Daemon {
             );
         }
         let mut known = self.projects.lock().unwrap();
-        self.db.lock().unwrap().list_project(&project, listed)?;
+        let changed = self.db.lock().unwrap().list_project(&project, listed)?;
         if listed {
             known.checkouts.insert(project.clone(), Some(checkout));
         } else {
             known.listed.remove(&project);
             known.checkouts.remove(&project);
+        }
+        if changed {
+            self.events.emit(Event::project_listed(listed, project));
         }
         Ok(Response::Done)
     }
@@ -1232,13 +1241,8 @@ impl Daemon {
             // does, but its step's session has ended and can't say so.
             if run.state() == RunState::Failed {
                 let session = run.steps[step].session.clone();
-                let notice = Notice {
-                    session: session.clone().unwrap_or_default(),
-                    activity: Activity::Waiting,
-                    text: format!("{} failed at {}", run.name, run.step_name(step)),
-                    jump: session,
-                    agent: None,
-                };
+                let text = format!("{} failed at {}", run.name, run.step_name(step));
+                let notice = Notice::of_crystal(text, session);
                 notify::tell(notice, &self.socket);
             }
         }
@@ -2256,8 +2260,13 @@ impl Daemon {
                 self.events.emit(*event);
                 Ok(Response::Done)
             }
-            Request::Notify { text, id, name } => {
-                ensure!(!text.trim().is_empty(), "say what to tell the user");
+            Request::Notify {
+                text,
+                id,
+                name,
+                title,
+                sound,
+            } => {
                 let mut sessions = self.sessions.lock().unwrap();
                 let session = match (id, name) {
                     (Some(id), _) => Some(with_id(&mut sessions, &id)?.name.clone()),
@@ -2265,16 +2274,8 @@ impl Daemon {
                     (None, None) => None,
                 };
                 drop(sessions);
-                let notice = Notice {
-                    text: match &session {
-                        Some(session) => format!("{session}: {text}"),
-                        None => text,
-                    },
-                    session: session.clone().unwrap_or_default(),
-                    activity: Activity::Waiting,
-                    jump: session,
-                    agent: None,
-                };
+                let notice = Notice::told(title.as_deref(), &text, session, sound)
+                    .context("say what to tell the user")?;
                 notify::tell(notice, &self.socket);
                 Ok(Response::Done)
             }
@@ -2395,6 +2396,18 @@ impl Daemon {
                 };
                 let rows = term.read(history, unwrap, ansi, since_ms);
                 Ok(Response::Screen { rows })
+            }
+            Request::Clear { id, name } => {
+                let (name, term) = {
+                    let mut sessions = self.sessions.lock().unwrap();
+                    let session = id_or_name(&mut sessions, id, name)?;
+                    let name = session.name.clone();
+                    ensure!(session.is_running(), "{name} isn't running");
+                    (name, session.term())
+                };
+                term.clear()
+                    .with_context(|| format!("{name} wasn't cleared"))?;
+                Ok(Response::Done)
             }
             Request::Close {
                 id,
@@ -3153,6 +3166,9 @@ impl Daemon {
             .map_err(|why| anyhow!(why))?;
         db.keep_ui(db::TABS, &alone.tabs)?;
         drop(db);
+        for event in alone.events {
+            self.events.emit(event);
+        }
         for name in &alone.kill {
             self.kill(name)?;
         }

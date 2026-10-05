@@ -649,7 +649,7 @@
             "string",
             "null"
           ],
-          "description": "What it was before: a renamed session's old name, what its agent was doing before it changed, or the agent that let go of it."
+          "description": "What it was before: a renamed session's old name, what its agent was doing before it changed, or the agent that let go of it; a renamed tab's old name, the number a tab had before it moved or of the tab in front before, the number of the tab a session moved from, or the session or project the user was on before."
         },
         "task": {
           "anyOf": [
@@ -790,6 +790,17 @@
             "null"
           ],
           "description": "The file it's about: the instructions file an entry of memory was written into."
+        },
+        "tab": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TabLayout"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The tab it's about, as `crystal layout --json` has it: as it is now, or as it was, closed; for a session focused or moved, the tab it's in."
         }
       },
       "required": [
@@ -1008,6 +1019,50 @@
         {
           "const": "daemon.restarted",
           "description": "the daemon, restarted cold, has started its sessions again"
+        },
+        {
+          "const": "tab.created",
+          "description": "a TUI makes a tab"
+        },
+        {
+          "const": "tab.closed",
+          "description": "a TUI closes a tab"
+        },
+        {
+          "const": "tab.renamed",
+          "description": "a tab is named, or its name taken back"
+        },
+        {
+          "const": "tab.moved",
+          "description": "a tab moves to another place among the tabs"
+        },
+        {
+          "const": "tab.focused",
+          "description": "another tab comes to the front"
+        },
+        {
+          "const": "pane.focused",
+          "description": "the selection settles on another session: the one the user is on"
+        },
+        {
+          "const": "pane.moved",
+          "description": "a session moves to another tab"
+        },
+        {
+          "const": "layout.updated",
+          "description": "a tab's panes change: split, closed, resized, swapped, zoomed"
+        },
+        {
+          "const": "project.added",
+          "description": "a project goes on crystal's list"
+        },
+        {
+          "const": "project.removed",
+          "description": "a project is taken off it"
+        },
+        {
+          "const": "project.focused",
+          "description": "the selection settles on a session in another project"
         }
       ]
     },
@@ -2097,6 +2152,26 @@
             "answer"
           ],
           "description": "What came of the order numbered `id`: the layout it came to, or why it couldn't be carried out."
+        },
+        {
+          "type": "object",
+          "properties": {
+            "events": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/Event"
+              }
+            },
+            "type": {
+              "type": "string",
+              "const": "events"
+            }
+          },
+          "required": [
+            "type",
+            "events"
+          ],
+          "description": "What changed in its tabs and panes, for the daemon to tell whoever listens: see `crate::tui::layout_events`."
         }
       ],
       "description": "What a TUI tells the daemon, a line at a time, once it takes orders."
@@ -2727,6 +2802,27 @@
         "env"
       ],
       "description": "What a task carries beside its goal: what has to hold before it's done, and the pull request and the issue it's about, on its project's forge."
+    },
+    "NotifySound": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "none"
+          ]
+        },
+        {
+          "type": "string",
+          "const": "done",
+          "description": "The one for an agent that's done."
+        },
+        {
+          "type": "string",
+          "const": "request",
+          "description": "The one for an agent asking the user something."
+        }
+      ],
+      "description": "The sound a notification of `crystal notify` plays: none, or one of crystal's two, which `[sound]` can make the user's own."
     },
     "PaneDirection": {
       "type": "string",
@@ -3385,6 +3481,17 @@
               ],
               "default": null
             },
+            "title": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "default": null
+            },
+            "sound": {
+              "$ref": "#/$defs/NotifySound",
+              "default": "request"
+            },
             "type": {
               "type": "string",
               "const": "notify"
@@ -3394,7 +3501,7 @@
             "type",
             "text"
           ],
-          "description": "Tell the user `text` with a notification, the way the daemon tells them a session needs them: about the session with `id`, or else called `name`, which a click on it takes them to, when there is one."
+          "description": "Tell the user `text` with a notification, the way the daemon tells them a session needs them: about the session with `id`, or else called `name`, which a click on it takes them to, when there is one. It's under `title`, or crystal's name; with no text, the title is what it says. `sound` plays with it."
         },
         {
           "type": "object",
@@ -4603,6 +4710,33 @@
             "name"
           ],
           "description": "What's on a session's screen, as text."
+        },
+        {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "default": null
+            },
+            "name": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "default": null
+            },
+            "type": {
+              "type": "string",
+              "const": "clear"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "description": "Clear a session's screen and history but for the line its cursor is on, which goes to the top, its own and every viewer's, sending its program nothing: not on the alternate screen. The session with `id`, or else called `name`."
         },
         {
           "type": "object",

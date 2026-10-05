@@ -668,6 +668,9 @@ pub enum Action {
         line: Option<usize>,
         name: String,
     },
+    /// Clear the screen and history of the session called this but for
+    /// the line its cursor is on: the daemon's and every viewer's.
+    ClearPane(String),
     /// Open the history and screen of the pane at `slot` in the user's
     /// editor, as a new session called `name` in `dir`.
     EditHistory {
@@ -4354,6 +4357,9 @@ impl App {
         if on_pane {
             items.push(Item::new("copy mode", Command::Copy));
             items.push(Item::new("edit its history", Command::EditHistory));
+            if running {
+                items.push(Item::danger("clear all but its line", Command::ClearPane));
+            }
         }
         items.push(Item::new("start one like it", Command::Duplicate));
         items.push(Item::new("rename", Command::Rename));
@@ -4633,6 +4639,7 @@ impl App {
             Command::Zoom => self.toggle_zoom(),
             Command::Copy => self.start_copying(),
             Command::EditHistory => return self.edit_history(),
+            Command::ClearPane => return self.clear_pane(),
             Command::Float => self.toggle_float(),
             Command::Layouts => return Some(Action::ListLayouts),
             Command::SwapLeft => self.move_pane(Direction::Left),
@@ -6642,6 +6649,21 @@ impl App {
         let dir = session.cwd.clone();
         let name = self.free_name(&format!("{}-history", session.name));
         Some(Action::EditHistory { slot, dir, name })
+    }
+
+    /// Clears the selected session's screen and history but for the line
+    /// its cursor is on, in every pane and attach that shows it, as its
+    /// own screen is in the daemon. It has to be running.
+    fn clear_pane(&mut self) -> Option<Action> {
+        let session = self.selected()?;
+        if session.state != State::Running {
+            self.notify(format!(
+                "{} has ended: there's nothing to clear",
+                session.name
+            ));
+            return None;
+        }
+        Some(Action::ClearPane(session.name.clone()))
     }
 
     /// What the mouse selected in the pane at `slot` is kept to be copied
@@ -10618,6 +10640,20 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn clearing_a_pane_waits_for_a_key_and_asks_for_a_running_session() {
+        let mut app = app_with(&["a", "b"]);
+        app.select("b");
+        assert!(app.keymap().keys(Command::ClearPane).is_empty());
+        let mut app = with_keys(app, "clear-pane = \"ctrl+l\"");
+        assert_eq!(ctrl(&mut app, 'l'), Some(Action::ClearPane("b".into())));
+        // An ended session's last screen is left as it is.
+        let mut app = with_keys(App::new(None), "clear-pane = \"ctrl+l\"");
+        app.set_sessions(vec![ended("done")]);
+        assert_eq!(ctrl(&mut app, 'l'), None);
+        assert!(app.notice().unwrap().contains("has ended"));
     }
 
     #[test]

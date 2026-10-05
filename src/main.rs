@@ -100,7 +100,7 @@ use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use client::Restart;
 use output::{out, outln};
 use profile::{Launch, Profile, StartIn};
-use protocol::{ArchivedSession, Request, Response, SessionInfo, TaskSpec, TaskState};
+use protocol::{ArchivedSession, NotifySound, Request, Response, SessionInfo, TaskSpec, TaskState};
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -214,15 +214,26 @@ enum Command {
     },
     /// Tell the user something with a notification, the way crystal tells
     /// them a session needs them; a click on it takes them to the session.
-    /// The notification settings count, `unfocused_only` among them.
+    /// The notification settings count, `unfocused_only` among them, and
+    /// `[sound]`'s.
     Notify {
         /// The session it's about, which a click takes the user to
         /// [default: the one this runs in, if any]
         #[arg(short, long)]
         name: Option<String>,
 
+        /// Its title [default: crystal]. Alone, with no message, it's what
+        /// the notification says.
+        #[arg(short, long)]
+        title: Option<String>,
+
+        /// The sound that plays with it: crystal's for an agent asking you
+        /// something, or for one that's done, or none.
+        #[arg(short, long, value_enum, default_value = "request")]
+        sound: NotifySound,
+
         /// What to tell them. Several words are joined with spaces.
-        #[arg(required = true)]
+        #[arg(required_unless_present = "title")]
         message: Vec<String>,
     },
     /// Say what the agent in this session is doing, for an agent crystal
@@ -655,6 +666,15 @@ enum Command {
         /// Keep its colors, bold, italic and underlines, as escape codes.
         #[arg(long)]
         ansi: bool,
+    },
+    /// Clear a session's screen and history, but for the line its cursor
+    /// is on, which goes to the top: a shell's prompt and what's typed on
+    /// it. Its program is sent nothing. A program drawing on the alternate
+    /// screen, like an editor, is left as it is.
+    Clear {
+        /// The session [default: the one this runs in]
+        #[arg(short, long)]
+        name: Option<String>,
     },
     /// Print what runs in a session's terminal: the processes in front,
     /// the job its keys go to, its leader first, each with its command and
@@ -2155,7 +2175,12 @@ fn run(cli: Cli) -> Result<()> {
             summary,
         } => work::done(&socket, name, failed, &summary.join(" "), artifacts)?,
         Command::Handoff { name, note } => work::handoff(&socket, name, &note.join(" "))?,
-        Command::Notify { name, message } => {
+        Command::Notify {
+            name,
+            title,
+            sound,
+            message,
+        } => {
             let id = name
                 .is_none()
                 .then(|| env::own_session_id(&socket))
@@ -2164,6 +2189,8 @@ fn run(cli: Cli) -> Result<()> {
                 text: message.join(" "),
                 id,
                 name,
+                title,
+                sound,
             };
             match client::ask(&socket, &request, true)? {
                 Some(Response::Done) => {}
@@ -2231,6 +2258,7 @@ fn run(cli: Cli) -> Result<()> {
             drive::answer(&socket, &task, answer, message)?;
         }
         Command::Interrupt { task } => drive::interrupt(&socket, &task)?,
+        Command::Clear { name } => drive::clear(&socket, name)?,
         Command::Backlog {
             dir,
             all,

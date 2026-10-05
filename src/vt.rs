@@ -672,6 +672,73 @@ impl Screen {
         out
     }
 
+    /// The output that clears the screen and its history but for the line
+    /// the cursor is on, which goes to the top: the row it's on and those
+    /// on the screen it wrapped from or onto, with what's typed on a
+    /// prompt. It's output, for the daemon to give its own screen and every
+    /// viewer's alike, so they stay in step, and the program is sent
+    /// nothing. The pen, a link still open and a write waiting to wrap
+    /// carry on as they were. `None` on the alternate screen, which has no
+    /// history, and whose program draws all of it.
+    pub fn clearing(&self) -> Option<Vec<u8>> {
+        if self.alternate_screen() {
+            return None;
+        }
+        let grid = self.term.grid();
+        let cursor = &grid.cursor;
+        let wraps = |line: i32| {
+            grid[Line(line)][grid.last_column()]
+                .flags
+                .contains(Flags::WRAPLINE)
+        };
+        let at = cursor.point.line.0;
+        let top = (0..at)
+            .rev()
+            .take_while(|&line| wraps(line))
+            .last()
+            .unwrap_or(at);
+        let last = grid.screen_lines() as i32 - 1;
+        let bottom = (at..last)
+            .take_while(|&line| wraps(line))
+            .last()
+            .map_or(at, |line| line + 1);
+        // The pen off first, or the rows cleared would take its colors.
+        let mut out = String::from("\x1b[m\x1b[2J\x1b[3J\x1b[H");
+        write_rows(&mut out, grid, top, bottom);
+        out.push_str("\x1b[m");
+        let row = at - top + 1;
+        let column = cursor.point.column;
+        if cursor.input_needs_wrap {
+            // The program wrote to the row's last column, and its next
+            // character goes on the row below: writing that column again
+            // leaves the cursor that way.
+            let cells = &grid[cursor.point.line];
+            let column = match cells[column].flags.contains(Flags::WIDE_CHAR_SPACER) {
+                true => Column(column.0.saturating_sub(1)),
+                false => column,
+            };
+            let cell = &cells[column];
+            let _ = write!(
+                out,
+                "\x1b[{row};{}H{}",
+                column.0 + 1,
+                Style::of(cell).sequence()
+            );
+            cell_text(cell, &mut out);
+            out.push_str("\x1b[m");
+        } else {
+            let _ = write!(out, "\x1b[{row};{}H", column.0 + 1);
+        }
+        let pen = Style::of(&cursor.template);
+        if pen != Style::default() {
+            out.push_str(&pen.sequence());
+        }
+        if let Some(link) = cursor.template.hyperlink() {
+            write_hyperlink(&mut out, Some(&link));
+        }
+        Some(out.into_bytes())
+    }
+
     /// The screen as it's handed to the next daemon. On the alternate
     /// screen, the main one and its history go first, then the alternate
     /// one, which the program goes back from to find the main one as it
@@ -2061,6 +2128,83 @@ mod tests {
         assert_eq!(copy.cursor(), original.cursor());
         assert_eq!(copy.cursor(), Some((1, 3)));
         assert!(copy.bracketed_paste());
+    }
+
+    /// What clearing `screen` writes, written to it, as the daemon writes
+    /// it to its screen and every viewer's.
+    fn clear(screen: &mut Screen) {
+        let clearing = screen.clearing().expect("the main screen clears");
+        screen.process(&clearing);
+    }
+
+    #[test]
+    fn clearing_keeps_the_line_the_cursor_is_on_at_the_top_and_no_history() {
+        let output = b"one\r\ntwo\r\nthree\r\nfour\r\nfive\r\n\x1b[32m$\x1b[m ls";
+        let mut screen = screen(4, 20, output);
+        assert!(screen.history() > 0);
+        clear(&mut screen);
+        assert_eq!(screen.history(), 0);
+        assert_eq!(screen.rows(true), ["$ ls", "", "", ""]);
+        assert_eq!(screen.cursor(), Some((0, 4)));
+        // As it was drawn, colors and all, and typing carries on there.
+        screen.process(b" -la");
+        assert_eq!(
+            cells(&screen),
+            cells(&self::screen(4, 20, b"\x1b[32m$\x1b[m ls -la"))
+        );
+    }
+
+    #[test]
+    fn clearing_keeps_the_rows_the_cursor_s_line_wraps_onto() {
+        // Typing that wrapped, the cursor gone back up into it.
+        let output = b"old\r\nold\r\nold\r\nold\r\nold\r\n$ abcdefghijklmnop\x1b[1A\x1b[4G";
+        let mut screen = screen(5, 10, output);
+        clear(&mut screen);
+        assert_eq!(screen.rows(true), ["$ abcdefgh", "ijklmnop", "", "", ""]);
+        assert_eq!(screen.lines(true, true, false)[0], "$ abcdefghijklmnop");
+        assert_eq!(screen.cursor(), Some((0, 3)));
+        // From the middle of a line wrapped onto, it goes back to its start.
+        let mut screen = self::screen(4, 10, b"old\r\n$ abcdefghijklmnop");
+        clear(&mut screen);
+        assert_eq!(screen.rows(false), ["$ abcdefgh", "ijklmnop", "", ""]);
+        assert_eq!(screen.cursor(), Some((1, 8)));
+    }
+
+    #[test]
+    fn clearing_leaves_a_write_waiting_to_wrap_and_the_pen_as_they_were() {
+        let mut screen = screen(3, 10, b"x\r\n$ abcdefgh");
+        clear(&mut screen);
+        screen.process(b"ij");
+        assert_eq!(screen.rows(false), ["$ abcdefgh", "ij", ""]);
+        let mut screen = self::screen(3, 10, b"old\r\n$ \x1b[1;31m");
+        clear(&mut screen);
+        screen.process(b"red");
+        assert_eq!(
+            cells(&screen),
+            cells(&self::screen(3, 10, b"$ \x1b[1;31mred"))
+        );
+    }
+
+    #[test]
+    fn the_alternate_screen_isnt_cleared() {
+        let screen = screen(3, 10, b"one\r\ntwo\r\n\x1b[?1049hless");
+        assert_eq!(screen.clearing(), None);
+    }
+
+    #[test]
+    fn a_viewer_given_the_clearing_comes_to_the_daemon_s_screen() {
+        let output = b"one\r\ntwo\r\nthree\r\nfour\r\n\x1b]8;;https://x.dev\x1b\\$ cargo";
+        let mut daemon = Screen::answering(3, 12);
+        let mut viewer = Screen::new(3, 12);
+        daemon.process(output);
+        viewer.process(output);
+        viewer.scroll_back(2);
+        let clearing = daemon.clearing().unwrap();
+        daemon.process(&clearing);
+        viewer.process(&clearing);
+        assert_eq!(viewer.scrolled_back(), 0);
+        assert_eq!(viewer.state_formatted(true), daemon.state_formatted(true));
+        assert_eq!(daemon.rows(true), ["$ cargo", "", ""]);
     }
 
     #[test]
