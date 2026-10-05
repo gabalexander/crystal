@@ -24,6 +24,11 @@ use std::path::{Path, PathBuf};
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Request {
     New(NewSession),
+    /// Keep an agent started and waiting as `warm` says, while `[sessions]
+    /// warm_agent` is on, for a new session started the same way to take
+    /// over: asked again, to keep it. The daemon keeps one, for the client
+    /// that asked last.
+    Warm(WarmAgent),
     /// Start a task: Claude Code run without a terminal.
     NewTask(NewTask),
     List,
@@ -62,6 +67,10 @@ pub enum Request {
         /// The model the agent runs on, when its hooks say.
         #[serde(default)]
         model: Option<String>,
+        /// Work the agent scheduled to wake it later, when its hooks say it
+        /// just did: it isn't idle meanwhile.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        wakeup: Option<Wakeup>,
     },
     /// What an agent says about itself with `crystal report`. A program in
     /// a session says which by its `id`; from outside, it's the session's
@@ -503,6 +512,21 @@ pub struct NewSession {
     /// request and issue it's about.
     #[serde(flatten)]
     pub brief: TaskBrief,
+}
+
+/// What a warm agent is started as: what a new session that takes it over
+/// is started as, but for its first prompt, which is typed into it then.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+pub struct WarmAgent {
+    pub cwd: PathBuf,
+    /// Its command, with no first prompt: Claude Code's.
+    pub command: Vec<String>,
+    /// The client's environment, which the program starts from.
+    pub env: BTreeMap<String, String>,
+    /// Whether the session that takes it over is a task, with tasks on:
+    /// the agent is told of closing it as it starts.
+    pub task: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1595,6 +1619,19 @@ pub enum AgentEvent {
     /// what it's doing: a hook that runs at no point of a turn crystal can
     /// tell, or one whose agent says too little to read its turns by.
     Named,
+}
+
+/// Work an agent scheduled to wake it later, as its hooks say: Claude
+/// Code's `ScheduleWakeup`, which a `/loop` paces itself with, and
+/// `CronCreate`. An agent stopped meanwhile would never wake.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum Wakeup {
+    /// Once, this many seconds on.
+    After { secs: u64 },
+    /// Again and again, for as long as it runs.
+    Recurring,
 }
 
 /// What the agent in a session is doing.

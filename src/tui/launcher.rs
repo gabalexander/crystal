@@ -909,6 +909,23 @@ impl Launcher {
         quoted.join(" ")
     }
 
+    /// What the agent kept warm for the panel as it's set is started as
+    /// (`[sessions] warm_agent`): where, its command with no first prompt,
+    /// and whether, given a task, the session is one. `None` unless it
+    /// starts Claude Code in a terminal, in a directory that's there
+    /// already.
+    pub fn warm(&self) -> Option<(Place, Vec<String>, bool)> {
+        if self.in_background() || self.run().agent()?.program != "claude" {
+            return None;
+        }
+        let place = self.place();
+        if !matches!(place, Place::Directory(_)) {
+            return None;
+        }
+        let command = catalog::without_first_prompt(&self.command());
+        Some((place, command, self.run().launch() != Launch::Session))
+    }
+
     pub fn place(&self) -> Place {
         match self.target() {
             Target::Here { dir, .. } => Place::Directory(dir.clone()),

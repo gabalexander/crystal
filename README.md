@@ -1082,20 +1082,47 @@ top, and the archive says which. An archived session's open task is cancelled, a
 back. From the command line, `crystal archive <name>`, `crystal unarchive <name>` and `crystal ls --archived`
 do the same, and `crystal kill` on an archived name deletes it.
 
-An agent you've left alone can be stopped for you, to free what it holds. With `stop_idle_after` under
-`[sessions]` in the [settings](#settings), say `"30m"`, crystal stops an agent that has sat at its prompt that
-long, its turn seen, with nobody watching it or typing into it. It stays in the list, its row saying
-`stopped idle`, and `Enter` (or `crystal respawn`) starts it again in its conversation. Only an agent that can
-come back where it was is stopped: Claude Code, Codex or another agent once crystal knows its conversation, or
-an agent that said how to resume it. A turn that ended while you were away waits for you (`✓`) however long it takes, and so
-does one asking you something; terminals, background tasks and sessions with their task open are never
-stopped. It's off until you set it, from the file or the [settings view](#the-settings-view).
+An agent you've left alone is stopped for you, to free what it holds: an idle Claude Code takes a few hundred
+MB with its MCP servers. Once an agent has sat at its prompt for half an hour (`stop_idle_after` under
+`[sessions]` in the [settings](#settings), like `"2h"`, or `"off"`), its turn seen, with nobody watching it or
+typing into it, crystal stops it. It stays in the list, its row saying `stopped idle`, and comes back in its
+conversation as soon as you go to it: once the sidebar's selection rests on it a moment, or `crystal attach`
+reaches it, as well as on `Enter` or `crystal respawn`. A message `crystal send` gives it, another agent's or
+the reply box's, starts it again too, and reaches it once it's back at its prompt. A crash or a reboot leaves
+it stopped, to come back the same way. Only an agent that can come back where it was is stopped: Claude Code,
+Codex or another agent once crystal knows its conversation, or an agent that said how to resume it. A turn that
+ended while you were away waits for you (`✓`) however long it takes, and so does one asking you something;
+background tasks and sessions with their task open are never stopped. Nor is an agent with work going on
+without it: subagents running, a job it cut loose from its terminal still running, like Claude Code's Bash
+calls and Monitor watches in the background or a Codex shell command, whose end starts its half hour again, or
+a wakeup it scheduled, Claude Code's `ScheduleWakeup`, which `/loop` paces itself with, until it's due, or a
+`CronCreate`, for as long as it runs. What's lost is what the agent held only in memory: a prompt half typed,
+or a mode switched to in it.
+
+A terminal is stopped the same way only if you ask, with `stop_idle_terminals = true`: a shell at its prompt
+with nothing at all running under it, not even a job in the background or a prompt's helper like
+powerlevel10k's `gitstatusd`. It comes back in the directory it was in, showing what it showed, but what was
+set in the shell, its variables, functions and aliases, is gone, and a shell takes little, so it's off unless you
+turn it on.
+
+You can have crystal keep a Claude Code started and waiting, so that a new session starts at once: with
+`warm_agent = true` under `[sessions]`, the TUI has the daemon keep one where its selection rests, started as
+the new-session panel would start it there, crystal's notes and all, and a new session started the same way, in
+that directory with that command, takes it over, its task typed in as its first prompt. It takes what an idle
+Claude Code does, a few hundred MB, for as long as a TUI is open, the RAM view showing it beside crystal's own,
+and it's started again every ten minutes while it waits, so that what it was told as it started, the worktree's
+handoff notes and the project's memory, stays fresh. It's let go once no TUI has asked for it in a quarter of
+an hour, once the setting goes off, and before a handover. What the project's memory tells it goes by its
+command alone, not by its task's words, which a session started cold has searched for too; a session on a pull
+request or an issue, with acceptance criteria, in the background or with another agent starts as ever. It's
+off unless you turn it on.
 
 ### RAM
 
 `#` shows the memory each session takes: its program and every process under it, since an agent runs node
 workers, shells and MCP servers of its own, the biggest first, with how many processes that is and its share of
-the whole. Under them is what crystal takes itself, the daemon and the TUI, and in the heading all of it, and
+the whole. Under them is what crystal takes itself, the daemon and the TUI, then the agent [kept
+warm](#archiving-and-idle-agents) while there's one, and in the heading all of it, and
 its share of the machine's memory. `Enter` goes to the session the bar is on. The daemon looks at the
 processes, `ps` on a Mac and `/proc` on Linux, every second while the view is open, and every five seconds
 otherwise for the footer, which shows all of it beside `? keys` while the sidebar has the keyboard, like
@@ -3047,7 +3074,7 @@ that makes no sense is said there too, and the settings stay as they were until 
 | `[handoff]` | | `in_git`, the projects, by their main worktree, whose [handoff notes](#the-handoff-file) go in git |
 | `[worktrees]` | | `base`, the branch new worktrees' new branches [start from](#usage): `origin`'s default branch unless set; `directory`, where new worktrees [go](#usage), each project's in a directory of its own, from `/` or `~`: beside the project, in `<repo>.worktrees`, unless set; `remove_emptied`, what's done with a linked worktree once [its last session is killed](#usage): `"ask"` (the default), `"always"` removes it without asking, unless archived sessions ran there, and `"never"` keeps it |
 | `[forge]` | | `hide_draft_prs`, leave draft pull requests out of [the pull requests](#pull-requests), the tab bar's count and `/` (`false`) |
-| `[sessions]` | | `stop_idle_after`, how long an agent may sit [idle](#archiving-and-idle-agents) before crystal stops it, like `"30m"`: `"off"`; `restart_spacing_ms`, how far apart the agents a [crash or a reboot](#usage) starts again start (`250`, or `0` for all at once); `restore_screens`, whether a terminal a crash or a reboot starts again shows what it showed before, kept in crystal's database (`false`: a screen can hold secrets) |
+| `[sessions]` | | `stop_idle_after`, how long an agent may sit [idle](#archiving-and-idle-agents) before crystal stops it, like `"2h"`, or `"off"`: `"30m"`; `stop_idle_terminals`, whether a terminal whose shell sits idle is stopped too (`false`); `warm_agent`, whether a Claude Code is kept [started and waiting](#archiving-and-idle-agents) where the TUI's selection is, for a new session to take over (`false`); `restart_spacing_ms`, how far apart the agents a [crash or a reboot](#usage) starts again start (`250`, or `0` for all at once); `restore_screens`, whether a terminal a crash or a reboot starts again shows what it showed before, kept in crystal's database (`false`: a screen can hold secrets) |
 | `[[project]]` | | a project's [run and open commands](#projects), by its main worktree's `path`, in place of its own file's, and the [plugins it ships](#a-projects-own-plugins) that are on for it, `plugins` |
 | `[keys]` | | the TUI's keys, by command, its prefixes, the key back to the sidebar, answering's, resize mode's and the views', and `[[keys.command]]`, keys of your own that run commands: [keys and commands](#keys-and-commands) |
 | `[sidebar]` | | the sidebar's `width`, whether it starts `folded`, what folding keeps, whether what needs you is pinned, and how narrow a terminal shows [one column](#on-a-phone): [the sidebar](#the-sidebar) |
@@ -3264,7 +3291,7 @@ bar.
 |---|---|
 | General | [notifications](#usage): whether, after how long, only while you're away, and a command of your own in place of them; sounds; whether `q` asks before it quits; looking for a [newer crystal](#updating); how long the [event log](#events) keeps what happened; and whether [draft pull requests](#pull-requests) are hidden |
 | Look | the [theme](#themes), whether it follows your system's appearance (the row says which theme each side is) and the theme for each side; the [tab bar](#terminals-the-window-and-the-tab-bar)'s place, whether it's left out with one tab, and its separator; the window's title; the [sidebar](#the-sidebar)'s width, whether it starts folded, what folding keeps, whether what needs you is pinned, and how narrow a terminal shows [one column](#on-a-phone); whether keys pressed show at the footer (`show_keys`), and whether [mermaid diagrams](#the-file-finder-and-the-tree-browser) are drawn in ASCII |
-| Sessions | what the [new-session panel](#starting-a-session) offers first, naming sessions for their prompt, how long an agent may sit [idle](#archiving-and-idle-agents), how far apart agents start again after a [crash or a reboot](#usage) and whether one resumes as it said; a new terminal's shell, whether it's a login shell and where it starts; how much each session's history keeps, the running ones' too, and whether a terminal shows it again after a crash or a reboot; and the branch new worktrees start from, where they go and whether one its last session is killed from is removed |
+| Sessions | what the [new-session panel](#starting-a-session) offers first, naming sessions for their prompt, how long an agent may sit [idle](#archiving-and-idle-agents) and whether a terminal is stopped too, whether an agent is kept warm for the next session, how far apart agents start again after a [crash or a reboot](#usage) and whether one resumes as it said; a new terminal's shell, whether it's a login shell and where it starts; how much each session's history keeps, the running ones' too, and whether a terminal shows it again after a crash or a reboot; and the branch new worktrees start from, where they go and whether one its last session is killed from is removed |
 | Mouse | [the mouse](#usage), and whether programs' copies go on [your clipboard](#zoom-copy-mode-and-search) |
 | Tasks | the permission mode [background tasks](#background-tasks) start in, and what a run and a day may spend |
 | Memory | how memory learns ([the distiller](#the-distiller), its model and what it may spend) and whether it searches [by meaning](#search-by-meaning) and reranks |
@@ -3430,6 +3457,8 @@ emulates for it, as it would through any terminal.
 - [x] Hooks for a Claude Code or Codex typed into a shell, resumed after a restart, and subagents counted
 - [x] Hooks or plugins for 15 more agents, each resumed in its conversation after a restart
 - [x] Archived sessions, idle agents stopped, right-click menus, and projects kept with their run and open commands
+- [x] Idle sessions stopped by default, sparing work they left running, and back as you go to them; an agent
+  kept warm for the next session
 
 ## Development
 

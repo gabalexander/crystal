@@ -47,6 +47,10 @@ pub struct SavedSession {
     /// starts there.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub moved: Option<MovedTo>,
+    /// Whether crystal had stopped it after it sat idle: it stays stopped
+    /// after a restart, to start again once it's wanted.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stopped_idle: bool,
 }
 
 /// The worktree a session moves into: see `crystal worktree move`.

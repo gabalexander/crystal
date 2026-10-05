@@ -815,7 +815,24 @@ pub struct SessionSettings {
     /// How long an agent may sit idle at its prompt, with nobody watching
     /// or typing, before crystal stops it, to start again in its
     /// conversation when it's wanted: like `30m`, `2h` or `90s`, or `off`.
+    /// Half an hour unless set: long enough that going from one session to
+    /// another never stops one, short enough to free what an agent left
+    /// for lunch holds.
     pub stop_idle_after: String,
+    /// Whether a terminal whose shell sits at its prompt, with nothing
+    /// running under it, is stopped after the same while too, to start
+    /// again in the directory it was in, showing what it showed. Off unless
+    /// asked for: a shell started again has lost what was set in it, its
+    /// variables, functions and aliases, and a shell takes little.
+    pub stop_idle_terminals: bool,
+    /// Whether one agent is kept started and waiting where the TUI's
+    /// selection is, so that a new session there starts at once: Claude
+    /// Code, as the new-session panel would start it, which a new session
+    /// started the same way takes over, its first prompt typed in. Off
+    /// unless asked for: the agent waiting takes what an idle Claude Code
+    /// does, a few hundred MB, the whole time, and starts again every ten
+    /// minutes.
+    pub warm_agent: bool,
     /// After the daemon restarts cold, from a crash or a reboot, how many
     /// milliseconds apart it starts the agents it starts again, so they
     /// don't all start at once: the first straight away, and `0` all of
@@ -832,7 +849,9 @@ pub struct SessionSettings {
 impl Default for SessionSettings {
     fn default() -> SessionSettings {
         SessionSettings {
-            stop_idle_after: "off".to_string(),
+            stop_idle_after: "30m".to_string(),
+            stop_idle_terminals: false,
+            warm_agent: false,
             restart_spacing_ms: 250,
             restore_screens: false,
         }
@@ -1364,11 +1383,19 @@ mod tests {
 
     #[test]
     fn how_long_an_agent_may_sit_idle_is_read_as_a_while() {
-        assert_eq!(Config::default().sessions.idle_limit(), None);
-        let config = parse("[sessions]\nstop_idle_after = \"30m\"\n").unwrap();
+        let default = Config::default().sessions;
+        assert_eq!(default.idle_limit(), Some(Duration::from_secs(1800)));
+        assert!(
+            !default.stop_idle_terminals,
+            "a shell is stopped only if asked"
+        );
+        assert!(!default.warm_agent, "an agent waits only if asked");
+        let config = parse("[sessions]\nstop_idle_after = \"off\"\n").unwrap();
+        assert_eq!(config.sessions.idle_limit(), None);
+        let config = parse("[sessions]\nstop_idle_after = \"2h\"\n").unwrap();
         assert_eq!(
             config.sessions.idle_limit(),
-            Some(Duration::from_secs(1800))
+            Some(Duration::from_secs(7200))
         );
         assert_eq!(duration("2h").unwrap(), Some(Duration::from_secs(7200)));
         assert_eq!(duration("90s").unwrap(), Some(Duration::from_secs(90)));
@@ -2134,6 +2161,8 @@ back_to = "build"
             },
             sessions: SessionSettings {
                 stop_idle_after: "45m".into(),
+                stop_idle_terminals: true,
+                warm_agent: true,
                 restart_spacing_ms: 1000,
                 restore_screens: true,
             },

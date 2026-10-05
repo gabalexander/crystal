@@ -20,9 +20,10 @@ use crate::printable;
 use crate::protocol::{
     Activity, AgentEvent, AgentReport, Answer, Asking, Conversation, Front, InProgress, Metadata,
     Reporter, ScreenExplained, SessionInfo, State, TaskBrief, TaskInfo, TaskOutcome, TaskRecord,
-    TaskResult, TaskSpec, TaskState, TaskView,
+    TaskResult, TaskSpec, TaskState, TaskView, Wakeup,
 };
 use crate::report;
+use crate::resources::Under;
 use crate::spending::Spending;
 use crate::state::SavedSession;
 use crate::task::{self, Task};
@@ -149,8 +150,15 @@ pub struct Session {
     model: model::Watch,
     /// What `crystal report --line` and `--model` put on its row.
     shown: report::Shown,
-    /// crystal stopped it after its agent sat idle: see [`Session::idle_for`].
+    /// crystal stopped it after it sat idle: see [`Session::idle_for`].
     stopped_idle: bool,
+    /// The directory its shell was in when crystal stopped it idle, a
+    /// terminal, to start again there: within its worktree, so it stays
+    /// where it is in the sidebar.
+    stopped_in: Option<PathBuf>,
+    /// What its agent left running that will wake it, which keeps it from
+    /// counting as idle though its turn is over.
+    wakes: Wakes,
     /// crystal stopped it to start it again in another worktree: see
     /// [`Session::stop_to_move`].
     stopped_to_move: bool,
@@ -199,6 +207,49 @@ pub enum Change {
     UnseenCopy,
 }
 
+/// What a session's agent left running that will wake it, which keeps it
+/// from counting as idle though its turn is over: see
+/// [`Session::idle_for`]. A clock, not an [`Instant`], so it's handed over.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct Wakes {
+    /// When a job it cut loose from its terminal, like a Bash call it runs
+    /// in the background, was last seen running under it: its end is when
+    /// the agent wakes to read what came of it.
+    job_seen: Option<SystemTime>,
+    /// When the wakeup it scheduled last is due.
+    wakeup: Option<SystemTime>,
+    /// It scheduled itself work that comes again and again, a cron: for as
+    /// long as it runs, it isn't idle.
+    recurring: bool,
+}
+
+impl Wakes {
+    /// How long it's been since what it left running last held it, as of
+    /// `now`: `None` while something still does, and for as long as it
+    /// likes when nothing ever did.
+    fn quiet_for(&self, now: SystemTime) -> Option<Duration> {
+        if self.recurring {
+            return None;
+        }
+        let since = |at: Option<SystemTime>| match at {
+            Some(at) => now.duration_since(at).ok(),
+            None => Some(Duration::MAX),
+        };
+        Some(since(self.job_seen)?.min(since(self.wakeup)?))
+    }
+
+    /// Takes a wakeup its agent's hooks say it scheduled, heard at `now`.
+    fn scheduled(&mut self, wakeup: Wakeup, now: SystemTime) {
+        match wakeup {
+            Wakeup::After { secs } => {
+                let due = now + Duration::from_secs(secs);
+                self.wakeup = Some(self.wakeup.map_or(due, |was| was.max(due)));
+            }
+            Wakeup::Recurring => self.recurring = true,
+        }
+    }
+}
+
 /// A session as one daemon hands it to the next, in a handover: all it
 /// takes to carry it on, and its terminal by the number of the descriptor
 /// the next daemon inherits.
@@ -242,6 +293,10 @@ pub struct Handed {
     shown: report::Shown,
     #[serde(default)]
     stopped_idle: bool,
+    #[serde(default)]
+    stopped_in: Option<PathBuf>,
+    #[serde(default)]
+    wakes: Wakes,
     /// For a session yet to start again after a restart, or that couldn't:
     /// what it starts from. Its `state` says it has ended, which is how a
     /// crystal from before these reads it.
@@ -288,7 +343,7 @@ impl Handed {
         if let Some(start_from) = &self.start_from {
             return Some(start_from.saved.clone());
         }
-        if self.state != State::Running {
+        if self.state != State::Running && !self.stopped_idle {
             return None;
         }
         let conversation = match &self.task {
@@ -308,7 +363,7 @@ impl Handed {
         Some(SavedSession {
             name: self.name.clone(),
             command: self.command.clone(),
-            cwd: self.cwd.clone(),
+            cwd: self.stopped_in.clone().unwrap_or_else(|| self.cwd.clone()),
             conversation,
             task: self.task.as_ref().map(|task| task.spec().clone()),
             goal: self.goal.clone(),
@@ -316,6 +371,7 @@ impl Handed {
             about: self.about.clone(),
             name_given: self.name_given,
             moved: None,
+            stopped_idle: self.stopped_idle,
         })
     }
 }
@@ -437,6 +493,8 @@ impl Session {
             model,
             shown: report::Shown::default(),
             stopped_idle: false,
+            stopped_in: None,
+            wakes: Wakes::default(),
             stopped_to_move: false,
             closed: Vec::new(),
             changes: Vec::new(),
@@ -507,12 +565,40 @@ impl Session {
             model: model::Watch::default(),
             shown: report::Shown::default(),
             stopped_idle: false,
+            stopped_in: None,
+            wakes: Wakes::default(),
             stopped_to_move: false,
             closed: Vec::new(),
             changes: Vec::new(),
             start_from: None,
             term,
         }
+    }
+
+    /// A session written down before a restart, back in the list under the
+    /// id `id`: waiting its turn to start again, or, one crystal had stopped
+    /// after it sat idle, stopped still, to start again once it's wanted.
+    pub fn put_back(id: String, saved: SavedSession) -> Session {
+        if !saved.stopped_idle {
+            return Session::to_start(id, saved);
+        }
+        let name = printable::line(&saved.name).into_owned();
+        let session = Session {
+            stopped_idle: true,
+            ..Session::unstarted(id, saved)
+        };
+        session.term.show(
+            format!(
+                "\x1b[2mcrystal stopped {name} after it sat idle: it starts again where it \
+                 was as you go to it\x1b[0m"
+            )
+            .as_bytes(),
+        );
+        session.term.close();
+        *session.state.lock().unwrap() = State::Signaled {
+            signal: "Hangup".to_string(),
+        };
+        session
     }
 
     /// A session written down before a restart, in the list while it waits
@@ -575,6 +661,8 @@ impl Session {
             model: model::Watch::new(&saved.command),
             shown: report::Shown::default(),
             stopped_idle: false,
+            stopped_in: None,
+            wakes: Wakes::default(),
             stopped_to_move: false,
             closed: Vec::new(),
             changes: Vec::new(),
@@ -966,38 +1054,140 @@ impl Session {
         }
     }
 
-    /// How long the session's agent has sat idle at its prompt: its turn
-    /// seen, nobody watching it or typing into it, and nothing changed. Only
-    /// an agent that can come back where it was, in its conversation or with
-    /// the command it gave, counts; never a task, nor one with its task
-    /// open, which waits on the user. `None` when it isn't idle that way.
-    pub fn idle_for(&self) -> Option<Duration> {
-        if !self.is_running() || self.task.is_some() || self.activity != Some(Activity::Idle) {
+    /// How long the session has sat idle: its agent at its prompt, its turn
+    /// seen, or with `terminals`, a terminal's shell at its prompt; nobody
+    /// watching it or typing into it, and nothing changed. Only an agent
+    /// that can come back where it was, in its conversation or with the
+    /// command it gave, counts; never a task, nor one with its task open,
+    /// which waits on the user, nor one with subagents at work, or a wakeup
+    /// it scheduled still to come, whose clock starts once it's due. `None`
+    /// when it isn't idle that way. What runs under its program, which the
+    /// daemon looks at only once it has sat idle long enough, may hold it
+    /// still: see [`Session::held_by`].
+    pub fn idle_for(&self, terminals: bool) -> Option<Duration> {
+        if !self.is_running() || self.task.is_some() {
             return None;
+        }
+        if !self.idle_agent() && !(terminals && self.idle_shell()) {
+            return None;
+        }
+        let untouched = self.term.untouched_for()?;
+        let now = SystemTime::now();
+        let unchanged = now
+            .duration_since(*self.changed.lock().unwrap())
+            .unwrap_or_default();
+        let quiet = self.wakes.quiet_for(now)?;
+        Some(untouched.min(unchanged).min(quiet))
+    }
+
+    /// Whether its agent sits at its prompt, its turn seen, with nothing
+    /// to do until the user gives it something, and could come back where
+    /// it was.
+    fn idle_agent(&self) -> bool {
+        if self.activity != Some(Activity::Idle) || self.subagents > 0 {
+            return false;
         }
         if self.goal.as_ref().is_some_and(TaskInfo::is_open) {
-            return None;
+            return false;
         }
-        let agent = match &self.reporter {
+        match &self.reporter {
             Some(reporter) => reporter.resume.is_some(),
             None => {
                 let in_front = self.front.as_ref().is_some_and(Front::is_agent);
                 in_front && self.conversation.is_some()
             }
-        };
-        if !agent {
-            return None;
         }
-        let untouched = self.term.untouched_for()?;
-        let unchanged = self.changed.lock().unwrap().elapsed().unwrap_or_default();
-        Some(untouched.min(unchanged))
     }
 
-    /// Stops the session's agent, which has sat idle: it stays in the list,
-    /// to start again in its conversation.
+    /// Whether it's a terminal whose shell is at its prompt: the shell it
+    /// started with in front, no agent in it.
+    fn idle_shell(&self) -> bool {
+        let shell = |front: Option<&Front>| matches!(front, Some(Front::Shell { .. }));
+        self.reporter.is_none()
+            && self.activity.is_none()
+            && shell(self.front.as_ref())
+            && shell(front::of_command(&self.command).as_ref())
+    }
+
+    /// Whether what runs under its program, `under`, holds the session,
+    /// idle as it is: a job its agent cut loose from the terminal, which
+    /// runs on after the turn that started it, and whose end starts its
+    /// clock again; or anything at all under a shell, a job in the
+    /// background or a prompt's helper, which a shell started again
+    /// wouldn't have.
+    pub fn held_by(&mut self, under: Under) -> bool {
+        if self.idle_shell() {
+            return under.anything;
+        }
+        if under.detached_job {
+            self.wakes.job_seen = Some(SystemTime::now());
+        }
+        under.detached_job
+    }
+
+    /// Takes a wakeup its agent's hooks say it scheduled.
+    pub fn scheduled(&mut self, wakeup: Wakeup) {
+        self.wakes.scheduled(wakeup, SystemTime::now());
+    }
+
+    /// Stops the session, which has sat idle: it stays in the list, to start
+    /// again where it was, an agent in its conversation, a terminal in the
+    /// directory its shell was in.
     pub fn stop_idle(&mut self) {
+        if self.idle_shell() {
+            self.stopped_in = self
+                .pid
+                .and_then(|pid| front::working_dir(pid as i32))
+                .and_then(|dir| self.within(&dir));
+        }
         self.stopped_idle = true;
         self.stop();
+    }
+
+    /// `dir`, when it's in the session's worktree, or under its directory
+    /// outside git, as the session spells that: a shell says where it is
+    /// with every link followed, like macOS's `/private/var` for `/var`.
+    fn within(&self, dir: &Path) -> Option<PathBuf> {
+        let top = match &self.checkout {
+            Some(checkout) => checkout.worktree().path,
+            None => self.cwd.clone(),
+        };
+        let real = |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let under = real(dir).strip_prefix(real(&top)).ok()?.to_path_buf();
+        Some(top.join(under))
+    }
+
+    /// Whether crystal stopped it after it sat idle.
+    pub fn stopped_idle(&self) -> bool {
+        self.stopped_idle
+    }
+
+    /// Whether its agent sits at its prompt, as its hooks or its screen
+    /// say.
+    pub fn at_prompt(&self) -> bool {
+        matches!(self.activity, Some(Activity::Idle | Activity::Done))
+    }
+
+    /// Takes a warm agent over as the session `name`, as `command` asked
+    /// for it, its first prompt typed in after: what it did while it
+    /// waited is no news.
+    pub fn take_over(&mut self, name: String, command: Vec<String>) {
+        self.name = name;
+        self.command = command;
+        self.changes.clear();
+    }
+
+    /// Kills its program outright, with whatever it started, and waits a
+    /// moment for it to end: for one nothing of is kept.
+    pub fn kill_now(&self) {
+        let Some(pid) = self.running_pid() else {
+            return;
+        };
+        signal_group(pid, libc::SIGKILL);
+        let deadline = Instant::now() + STOP_GRACE;
+        while self.is_running() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 
     /// Stops the session to start it again in another worktree, under its
@@ -1624,6 +1814,13 @@ impl Session {
     pub fn saved(&self) -> Option<SavedSession> {
         if self.is_running() || self.is_unstarted() {
             Some(self.launch())
+        } else if self.stopped_idle {
+            // Stopped only to free what it held, it comes back once it's
+            // wanted, after a restart as before.
+            Some(SavedSession {
+                stopped_idle: true,
+                ..self.launch()
+            })
         } else {
             None
         }
@@ -1662,7 +1859,8 @@ impl Session {
         SavedSession {
             name: self.name.clone(),
             command: self.command.clone(),
-            cwd: self.cwd.clone(),
+            // A terminal stopped idle starts again where its shell was.
+            cwd: self.stopped_in.clone().unwrap_or_else(|| self.cwd.clone()),
             conversation,
             task: self.task.as_ref().map(|task| task.spec().clone()),
             goal: self.goal.clone(),
@@ -1670,6 +1868,7 @@ impl Session {
             about: self.about.clone(),
             name_given: self.name_given,
             moved: None,
+            stopped_idle: false,
         }
     }
 
@@ -1724,6 +1923,8 @@ impl Session {
             model: self.model.clone(),
             shown: self.shown.clone(),
             stopped_idle: self.stopped_idle,
+            stopped_in: self.stopped_in.clone(),
+            wakes: self.wakes.clone(),
             start_from,
             screen,
             ended,
@@ -1741,7 +1942,7 @@ impl Session {
         if let Some(StartFrom { saved, failed }) = handed.start_from {
             return Ok(match failed {
                 Some(why) => Session::failed_to_start(handed.id, saved, &why),
-                None => Session::to_start(handed.id, saved),
+                None => Session::put_back(handed.id, saved),
             });
         }
         let pty = handed
@@ -1811,6 +2012,8 @@ impl Session {
             model: handed.model,
             shown: handed.shown,
             stopped_idle: handed.stopped_idle,
+            stopped_in: handed.stopped_in,
+            wakes: handed.wakes,
             stopped_to_move: false,
             closed: Vec::new(),
             changes: Vec::new(),
@@ -2492,6 +2695,8 @@ mod tests {
             model: model::Watch::new(&["claude".into(), "--model".into(), "opus".into()]),
             shown,
             stopped_idle: false,
+            stopped_in: None,
+            wakes: Wakes::default(),
             start_from: None,
             screen: screen.save(),
             ended: true,
@@ -2563,6 +2768,7 @@ mod tests {
             about: Default::default(),
             name_given: false,
             moved: None,
+            stopped_idle: false,
         }
     }
 
@@ -2630,6 +2836,51 @@ mod tests {
         let session = Session::to_start("id-2".into(), given.clone());
         assert!(session.name_given());
         assert_eq!(session.saved(), Some(given));
+    }
+
+    #[test]
+    fn a_session_crystal_stopped_idle_stays_stopped_after_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let saved = SavedSession {
+            stopped_idle: true,
+            ..written_down(dir.path())
+        };
+        let session = Session::put_back("id-1".into(), saved.clone());
+        let info = session.info();
+        assert!(info.stopped_idle);
+        assert_eq!(info.status(), "stopped idle");
+        assert!(!session.is_starting() && session.is_unstarted());
+        assert!(!session.is_running());
+        assert!(session.term().rows(false)[0].contains("stopped fixer"));
+        // Written down again as it was, to stay stopped after the next.
+        assert_eq!(session.saved(), Some(saved.clone()));
+        // Anything else written down waits its turn to start.
+        let waiting = Session::put_back("id-2".into(), written_down(dir.path()));
+        assert!(waiting.is_starting());
+    }
+
+    #[test]
+    fn what_an_agent_left_to_wake_it_holds_it_until_it_does() {
+        let now = SystemTime::now();
+        let minute = Duration::from_secs(60);
+        assert_eq!(Wakes::default().quiet_for(now), Some(Duration::MAX));
+        // A wakeup scheduled holds it until it's due, then its clock runs
+        // from then; a later one moves it on, an earlier one doesn't.
+        let mut wakes = Wakes::default();
+        wakes.scheduled(Wakeup::After { secs: 600 }, now - 2 * minute);
+        assert_eq!(wakes.quiet_for(now), None);
+        assert_eq!(wakes.quiet_for(now + 9 * minute), Some(minute));
+        wakes.scheduled(Wakeup::After { secs: 60 }, now);
+        assert_eq!(wakes.quiet_for(now + 9 * minute), Some(minute));
+        // A job seen running holds it as of when it was last seen.
+        let mut wakes = Wakes {
+            job_seen: Some(now - 3 * minute),
+            ..Wakes::default()
+        };
+        assert_eq!(wakes.quiet_for(now), Some(3 * minute));
+        // Work that comes again and again holds it for good.
+        wakes.scheduled(Wakeup::Recurring, now);
+        assert_eq!(wakes.quiet_for(now + 600 * minute), None);
     }
 
     #[test]
@@ -2718,6 +2969,8 @@ mod tests {
             model: model::Watch::default(),
             shown: report::Shown::default(),
             stopped_idle: false,
+            stopped_in: None,
+            wakes: Wakes::default(),
             start_from: None,
             screen: vt::Screen::answering(5, 20).save(),
             ended: true,
@@ -2926,6 +3179,8 @@ mod tests {
             screen: vt::Screen::answering(5, 20).save(),
             ended: false,
             stopped_idle: false,
+            stopped_in: None,
+            wakes: Wakes::default(),
             typed_agent: None,
             subagents: 0,
             model: model::Watch::default(),

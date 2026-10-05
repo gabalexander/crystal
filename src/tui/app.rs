@@ -90,6 +90,19 @@ pub enum Slot {
 /// How long a key pressed shows at the footer's right while keys are shown.
 const SHOW_KEY_FOR: Duration = Duration::from_secs(3);
 
+/// How long the selection rests on a session crystal stopped idle before
+/// it starts again: going past it on the way to another doesn't start it.
+const LANDING: Duration = Duration::from_millis(400);
+
+/// The session the selection is on, as far as starting one crystal stopped
+/// idle goes: by its id, since when, and whether it was started again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Landed {
+    id: String,
+    since: Instant,
+    woken: bool,
+}
+
 /// A key pressed, as the footer shows it while keys are shown: how it's
 /// written, after the prefix when it was pressed after it, and what it did.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1071,6 +1084,9 @@ pub struct App {
     show_keys: bool,
     /// The key pressed last, while keys are shown.
     shown_key: Option<ShownKey>,
+    /// The session the selection rests on, for one crystal stopped idle to
+    /// start again: see [`App::wake_landed`].
+    landed: Option<Landed>,
     /// How narrow a terminal shows one column, as the settings say: see
     /// [`App::one_column`].
     phone_width: u16,
@@ -1317,6 +1333,7 @@ impl App {
             help: None,
             show_keys: false,
             shown_key: None,
+            landed: None,
             phone_width: SidebarSettings::default().phone_width,
             page: None,
             screen: Rect::new(0, 0, 80, 24),
@@ -3612,6 +3629,43 @@ impl App {
 
     fn selected_name(&self) -> Option<String> {
         self.selected().map(|session| session.name.clone())
+    }
+
+    /// The session crystal stopped idle that the selection has rested on
+    /// long enough, at `now`, to start again, once: going to it is wanting
+    /// it. The event loop calls this as it goes round, and starts it.
+    pub fn wake_landed(&mut self, now: Instant) -> Option<String> {
+        let Some(selected) = self.selected() else {
+            self.landed = None;
+            return None;
+        };
+        let (id, name, stopped) = (
+            selected.id.clone(),
+            selected.name.clone(),
+            selected.stopped_idle,
+        );
+        let landed = match &mut self.landed {
+            Some(landed) if landed.id == id => landed,
+            _ => self.landed.insert(Landed {
+                id,
+                since: now,
+                woken: false,
+            }),
+        };
+        if !stopped || landed.woken || now < landed.since + LANDING {
+            return None;
+        }
+        landed.woken = true;
+        Some(name)
+    }
+
+    /// When the session crystal stopped idle that the selection is on is
+    /// due to start again, for the event loop to wake then.
+    pub fn wake_due(&self) -> Option<Instant> {
+        let landed = self.landed.as_ref()?;
+        let selected = self.selected()?;
+        let due = selected.stopped_idle && !landed.woken && selected.id == landed.id;
+        due.then(|| landed.since + LANDING)
     }
 
     /// Whether the selected session is the one this TUI runs in.
@@ -6074,6 +6128,17 @@ impl App {
         self.codex_models_wanted()
     }
 
+    /// What the agent kept warm where the selection is would be started as
+    /// (`[sessions] warm_agent`): what the new-session panel starts, as
+    /// it's set while it's open, or else as it opens. See
+    /// [`Launcher::warm`].
+    pub fn warm_agent(&self) -> Option<(Place, Vec<String>, bool)> {
+        match &self.launcher {
+            Some(launcher) => launcher.warm(),
+            None => Launcher::new(self.launch_setup(false)).warm(),
+        }
+    }
+
     /// What the panel opens with: what can run, with what to pick first,
     /// where it can start, and the tasks given before.
     fn launch_setup(&self, worktree: bool) -> Setup {
@@ -7788,6 +7853,38 @@ mod tests {
     }
 
     #[test]
+    fn a_session_crystal_stopped_idle_starts_again_once_the_selection_rests_on_it() {
+        let stopped = |name: &str| SessionInfo {
+            stopped_idle: true,
+            state: State::Signaled {
+                signal: "Hangup".into(),
+            },
+            ..session(name)
+        };
+        let mut app = App::new(None);
+        app.set_sessions(vec![session("api"), stopped("docs"), ended("web")]);
+        app.select("api");
+        let start = Instant::now();
+        assert_eq!(app.wake_landed(start), None);
+        assert_eq!(app.wake_due(), None, "api runs");
+        // Going past it on the way elsewhere doesn't start it.
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(selected_name(&app), Some("docs"));
+        assert_eq!(app.wake_landed(start), None);
+        assert_eq!(app.wake_due(), Some(start + LANDING));
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.wake_landed(start + LANDING), None);
+        assert_eq!(app.wake_due(), None, "web ended of itself");
+        // Resting on it does, once.
+        press(&mut app, KeyCode::Char('k'));
+        let back = start + LANDING;
+        assert_eq!(app.wake_landed(back), None);
+        assert_eq!(app.wake_landed(back + LANDING), Some("docs".into()));
+        assert_eq!(app.wake_landed(back + LANDING * 2), None);
+        assert_eq!(app.wake_due(), None);
+    }
+
+    #[test]
     fn sessions_waiting_on_the_user_come_first() {
         let mut waiting = session("asks");
         waiting.activity = Some(Activity::Waiting);
@@ -8651,6 +8748,7 @@ mod tests {
                 about: TaskBrief::default(),
                 name_given: false,
                 moved: None,
+                stopped_idle: false,
             },
             worktree: in_worktree(name, branch, State::Running).worktree,
             archived: 1,
@@ -12861,6 +12959,7 @@ gate = true
                     },
                 })
                 .collect(),
+            warm: None,
             total: 16 << 30,
         }
     }

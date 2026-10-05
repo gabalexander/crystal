@@ -190,6 +190,7 @@ Every command works on the current directory's project; `-C <dir>` names another
 | `idle` | at its prompt, already seen | `read`, or `send` more work |
 | `waiting` | asking something: a permission, a choice, or a question it ended its turn on with its task open | `read` it, then answer: a permission or a choice with `send-keys` (a background task's permission with `crystal answer`), a question with `send` |
 | `exited N`, `killed (…)` | the program ended | `read` its last screen; `crystal respawn <name>` runs it again |
+| `stopped idle` | crystal stopped it after it sat at its prompt, unwatched, to free what it held | `send` starts it again in its conversation and gives it the message once it's back; `crystal respawn <name>` only starts it |
 | `couldn't start` | it couldn't start again after crystal restarted: its directory or its command has gone | `crystal ls` says why; once that's put right, `crystal respawn <name>` starts it |
 
 To wait for one status in particular, or for a program to print something:

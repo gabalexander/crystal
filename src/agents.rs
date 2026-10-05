@@ -15,7 +15,7 @@ use crate::agent_rules;
 use crate::catalog;
 use crate::codex;
 use crate::printable;
-use crate::protocol::{AgentEvent, Conversation, Subagent};
+use crate::protocol::{AgentEvent, Conversation, Subagent, Wakeup};
 use crate::shell;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -472,6 +472,26 @@ pub fn hook_model(input: &Value) -> Option<String> {
         .or_else(|| model["display_name"].as_str())?;
     let id = id.trim();
     (!id.is_empty()).then(|| id.to_string())
+}
+
+/// Work a hook's input says the agent just scheduled to wake it later:
+/// Claude Code's `ScheduleWakeup`, with how long it waits, at most the hour
+/// it takes, or `CronCreate`, which may come again and again. A wakeup told
+/// to stop schedules nothing.
+pub fn hook_wakeup(input: &Value) -> Option<Wakeup> {
+    if event_name(input)? != "PostToolUse" {
+        return None;
+    }
+    match input["tool_name"].as_str()? {
+        "ScheduleWakeup" => {
+            let secs = input["tool_input"]["delaySeconds"].as_f64()?;
+            Some(Wakeup::After {
+                secs: secs.clamp(0.0, 3600.0) as u64,
+            })
+        }
+        "CronCreate" => Some(Wakeup::Recurring),
+        _ => None,
+    }
 }
 
 /// The command that picks `agent`'s conversation `id` up again, typed into
@@ -1204,6 +1224,37 @@ mod tests {
             json!({"hook_event_name": "SubagentStart", "agent_id": "a1", "model": "haiku"});
         assert_eq!(hook_model(&subagent), None);
         assert_eq!(hook_model(&json!({})), None);
+    }
+
+    #[test]
+    fn a_wakeup_the_agent_scheduled_is_read_from_its_tool_call() {
+        let used = |tool: &str, input: Value| {
+            hook_wakeup(&json!({
+                "hook_event_name": "PostToolUse",
+                "tool_name": tool,
+                "tool_input": input,
+            }))
+        };
+        assert_eq!(
+            used(
+                "ScheduleWakeup",
+                json!({"delaySeconds": 1200, "prompt": "/loop"})
+            ),
+            Some(Wakeup::After { secs: 1200 })
+        );
+        assert_eq!(
+            used("ScheduleWakeup", json!({"delaySeconds": 90000})),
+            Some(Wakeup::After { secs: 3600 })
+        );
+        // Told to stop, it schedules nothing.
+        assert_eq!(used("ScheduleWakeup", json!({"stop": true})), None);
+        assert_eq!(
+            used("CronCreate", json!({"cron": "*/5 * * * *"})),
+            Some(Wakeup::Recurring)
+        );
+        assert_eq!(used("Bash", json!({"command": "ls"})), None);
+        let asked = json!({"hook_event_name": "PreToolUse", "tool_name": "CronCreate"});
+        assert_eq!(hook_wakeup(&asked), None);
     }
 
     #[test]

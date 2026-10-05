@@ -1,7 +1,8 @@
 //! The RAM view, `#` in the sidebar: the memory each session takes, its
 //! program and every process under it, the biggest first, how many
 //! processes that is and what share of the machine's; then what crystal
-//! takes itself, the daemon and this TUI, and all of it together. The
+//! takes itself, the daemon and this TUI, and the agent kept warm while
+//! there's one (`[sessions] warm_agent`), and all of it together. The
 //! daemon looks at the processes (see [`crate::resources`]), asked off the
 //! event loop every second while the view is open, and every few seconds
 //! while it's closed, for the footer's readout. Enter goes to the session
@@ -229,7 +230,16 @@ fn own_line<'a>(resources: &Resources, theme: &Theme) -> Line<'a> {
     if let Some(client) = resources.client {
         said.push_str(&format!(", this TUI {}", resources::size(client.bytes)));
     }
-    Line::styled(said, Style::new().fg(theme.muted))
+    Line::styled(said + &warm_said(resources), Style::new().fg(theme.muted))
+}
+
+/// What the agent kept warm takes, after what crystal takes itself, while
+/// there's one.
+fn warm_said(resources: &Resources) -> String {
+    match resources.warm {
+        Some(warm) => format!(" · the agent kept warm {}", resources::size(warm.bytes)),
+        None => String::new(),
+    }
 }
 
 /// `part` of `whole`, in percent, as a person reads it: `4%`, or `<1%`.
@@ -265,6 +275,7 @@ mod tests {
                     },
                 })
                 .collect(),
+            warm: None,
             total: 0,
         }
     }
@@ -293,6 +304,20 @@ mod tests {
         assert_eq!(view.highlighted().unwrap().name, "b");
         view.refresh(rows(&taken(&[("a", 100)]), &[]));
         assert_eq!(view.highlighted().unwrap().name, "a");
+    }
+
+    #[test]
+    fn the_agent_kept_warm_is_counted_beside_crystal_itself() {
+        let mut resources = taken(&[("a", 100)]);
+        assert_eq!(warm_said(&resources), "");
+        let before = resources.all();
+        resources.warm = Some(Usage {
+            pid: 99,
+            bytes: 250 << 20,
+            processes: 4,
+        });
+        assert_eq!(warm_said(&resources), " · the agent kept warm 250 MB");
+        assert_eq!(resources.all(), before + (250 << 20));
     }
 
     #[test]

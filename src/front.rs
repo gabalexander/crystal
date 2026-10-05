@@ -285,17 +285,17 @@ fn group_members(group: i32) -> Vec<i32> {
 
 /// The directory process `pid` works in, when the system says.
 #[cfg(target_os = "linux")]
-fn working_dir(pid: i32) -> Option<PathBuf> {
+pub fn working_dir(pid: i32) -> Option<PathBuf> {
     std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
 }
 
 #[cfg(target_os = "macos")]
-fn working_dir(pid: i32) -> Option<PathBuf> {
+pub fn working_dir(pid: i32) -> Option<PathBuf> {
     macos::working_dir(pid)
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn working_dir(_pid: i32) -> Option<PathBuf> {
+pub fn working_dir(_pid: i32) -> Option<PathBuf> {
     None
 }
 
