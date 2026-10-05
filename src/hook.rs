@@ -19,6 +19,7 @@
 use crate::agents;
 use crate::claude_title;
 use crate::client;
+use crate::output::outln;
 use crate::protocol::{AgentEvent, Request, Response};
 use anyhow::Result;
 use serde_json::{Value, json};
@@ -97,8 +98,8 @@ fn report(socket: &Path, agent: &str, installed: bool, event: Option<&str>) -> R
     };
     match client::ask(socket, &report, false)? {
         // Codex's Stop hook takes the same answer as Claude Code's.
-        Some(Response::Remind { text }) => println!("{}", agents::claude_keep_going(&text)),
-        Some(Response::Retitle { title }) => println!("{}", claude_title::hook_answer(&title)),
+        Some(Response::Remind { text }) => outln!("{}", agents::claude_keep_going(&text))?,
+        Some(Response::Retitle { title }) => outln!("{}", claude_title::hook_answer(&title))?,
         _ => {}
     }
     Ok(())

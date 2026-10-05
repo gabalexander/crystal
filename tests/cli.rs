@@ -102,6 +102,33 @@ impl Crystal {
         String::from_utf8(out.stderr).unwrap()
     }
 
+    /// Runs a command whose standard output is a pipe nobody reads any
+    /// more, as `head` leaves it once it has what it wants: every write the
+    /// command makes there fails.
+    fn printing_to_a_closed_pipe(&self, args: &[&str]) -> Output {
+        let (reader, writer) = std::io::pipe().unwrap();
+        drop(reader);
+        self.command(args).stdout(writer).output().unwrap()
+    }
+
+    /// Runs a command piped into `head -1`, as a shell does, and returns how
+    /// the command ended and the line `head` printed.
+    fn piped_to_head(&self, args: &[&str]) -> (Output, String) {
+        let mut child = self
+            .command(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let head = Command::new("head")
+            .arg("-1")
+            .stdin(child.stdout.take().unwrap())
+            .output()
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        (out, String::from_utf8(head.stdout).unwrap())
+    }
+
     /// The `ls` row for `name`, split into its columns.
     fn row(&self, name: &str) -> Option<Vec<String>> {
         self.ok(&["ls"])
@@ -17260,4 +17287,99 @@ fn complete_sessions_lists_running_sessions_and_never_starts_the_daemon() {
     let mut names: Vec<&str> = listed.lines().collect();
     names.sort_unstable();
     assert_eq!(names, ["build", "review"]);
+}
+
+/// Checks that `crystal args` ended as it should once its reader had gone:
+/// with 0, and nothing said, let alone a panic.
+fn stopped_quietly(args: &[&str], out: &Output) {
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "crystal {args:?}: {said}");
+    assert!(said.is_empty(), "crystal {args:?}: {said}");
+}
+
+#[test]
+fn a_command_printing_into_a_pipe_closed_early_stops_quietly() {
+    let crystal = Crystal::new();
+    // Each too long for the pipe, so most of it is still to write once
+    // `head` has gone.
+    for args in [
+        &["completions", "zsh"][..],
+        &["completions", "bash"],
+        &["completions", "fish"],
+        &["api", "schema", "--json"],
+    ] {
+        let (out, first) = crystal.piped_to_head(args);
+        stopped_quietly(args, &out);
+        assert!(first.ends_with('\n'), "crystal {args:?}: {first:?}");
+    }
+    for args in [
+        &["completions", "zsh"][..],
+        &["api", "schema", "--json"],
+        &["api", "schema"],
+        &["guide"],
+        &["skill"],
+        &["keys"],
+        &["config"],
+        &["agent", "list"],
+        &["agent", "list", "--json"],
+        &["agent", "rules", "claude"],
+        &["plugin", "events"],
+        &["flow", "example"],
+    ] {
+        stopped_quietly(args, &crystal.printing_to_a_closed_pipe(args));
+    }
+    // None of them needs the daemon, so none was started.
+    assert!(!crystal.socket.exists());
+}
+
+#[test]
+fn printing_what_the_daemon_has_into_a_closed_pipe_stops_quietly() {
+    let crystal = Crystal::new();
+    crystal.ok(&[
+        "new",
+        "-n",
+        "counter",
+        "sh",
+        "-c",
+        "seq 1 100; exec sleep 30",
+    ]);
+    crystal.ok(&["new", "-n", "idle", "sleep", "30"]);
+    eventually("counter has counted", || {
+        crystal.ok(&["read", "counter"]).contains("100")
+    });
+    for args in [
+        &["ls"][..],
+        &["ls", "--json"],
+        &["events"],
+        &["events", "--json"],
+        // It stops at the first it prints rather than following on.
+        &["events", "--follow", "--limit", "1"],
+        &["read", "counter"],
+        &["layout", "--json"],
+        &["api", "snapshot"],
+        &["complete-sessions"],
+    ] {
+        stopped_quietly(args, &crystal.printing_to_a_closed_pipe(args));
+    }
+    // The daemon carries on for whoever asks next.
+    assert!(crystal.row("counter").is_some());
+}
+
+#[test]
+fn crystal_mcp_ends_quietly_once_claude_stops_reading() {
+    let crystal = Crystal::new();
+    let (reader, writer) = std::io::pipe().unwrap();
+    drop(reader);
+    let mut child = crystal
+        .command(&["mcp"])
+        .stdin(Stdio::piped())
+        .stdout(writer)
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let ping = serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "ping"});
+    let mut input = child.stdin.take().unwrap();
+    writeln!(input, "{ping}").unwrap();
+    drop(input);
+    stopped_quietly(&["mcp"], &child.wait_with_output().unwrap());
 }

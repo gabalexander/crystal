@@ -4,6 +4,7 @@
 
 use crate::client;
 use crate::db;
+use crate::output::outln;
 use crate::protocol::{Request, Response};
 use crate::socket::{self, DEFAULT};
 use crate::state;
@@ -40,7 +41,7 @@ pub fn list(json: bool) -> Result<()> {
         .map(|name| look_at(name))
         .collect::<Result<Vec<Server>>>()?;
     if json {
-        println!("{}", serde_json::to_string_pretty(&servers)?);
+        outln!("{}", serde_json::to_string_pretty(&servers)?)?;
         return Ok(());
     }
     let rows: Vec<[String; 3]> = servers
@@ -53,7 +54,7 @@ pub fn list(json: bool) -> Result<()> {
             [server.name.clone(), state.to_string(), sessions]
         })
         .collect();
-    crate::print_table(["NAME", "STATE", "SESSIONS"], &rows);
+    crate::print_table(["NAME", "STATE", "SESSIONS"], &rows)?;
     for server in &servers {
         if let Some(error) = &server.error {
             eprintln!("crystal: {}: {error}", server.name);

@@ -6,6 +6,7 @@
 use crate::client;
 use crate::config::Config;
 use crate::git::Checkout;
+use crate::output::outln;
 use crate::project_commands::{self, Commands, Verb};
 use crate::protocol::{Request, Response, SessionInfo, State, Worktree};
 use crate::shell;
@@ -45,11 +46,11 @@ pub fn list(socket: &Path, json: bool) -> Result<()> {
                 sessions: count(project),
             })
             .collect();
-        println!("{}", serde_json::to_string_pretty(&listed)?);
+        outln!("{}", serde_json::to_string_pretty(&listed)?)?;
         return Ok(());
     }
     if projects.is_empty() {
-        println!("no projects yet: start a session in one, or add one with crystal project add");
+        outln!("no projects yet: start a session in one, or add one with crystal project add")?;
         return Ok(());
     }
     let rows: Vec<[String; 4]> = projects
@@ -63,8 +64,7 @@ pub fn list(socket: &Path, json: bool) -> Result<()> {
             ]
         })
         .collect();
-    crate::print_table(["NAME", "BRANCH", "SESSIONS", "DIRECTORY"], &rows);
-    Ok(())
+    crate::print_table(["NAME", "BRANCH", "SESSIONS", "DIRECTORY"], &rows)
 }
 
 /// Puts the project `dir` is in on the list, or takes it off.

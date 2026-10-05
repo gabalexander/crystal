@@ -550,6 +550,11 @@ fixer   working   41377  app      fix/login  ~/code/app.worktrees/fix-login  cla
 review  exited 0  41388  app      main       ~/code/app                      codex    codex
 ```
 
+A command whose output is cut short by what reads it, like `head -1` in `crystal ls | head -1` or `grep -m1
+task.closed` reading `crystal events --follow`, stops there and exits 0, saying nothing, so a script under `set
+-o pipefail` goes on; `crystal update`, `crystal integration install` and a plugin's build finish what they
+started first.
+
 `crystal new -w <branch>` makes the worktree beside the repository, in `<repo>.worktrees/<branch>`, with any
 `/` in the branch made a `-`; with `directory` under `[worktrees]` in the [settings](#settings), in that
 directory instead, each project's in a directory named after it, like `~/worktrees/app/fix-login`. A branch that does exist is checked out as it is. One that doesn't yet starts

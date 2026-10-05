@@ -13,6 +13,7 @@ use crate::config::Config;
 use crate::env;
 use crate::forge;
 use crate::handoff;
+use crate::output::{out, outln};
 use crate::printable;
 use crate::protocol::{
     Backlog, BacklogItem, ForgeLink, PendingTask, Request, Response, State, TaskBrief, TaskSpec,
@@ -86,9 +87,9 @@ pub fn list_tasks(socket: &Path, dir: PathBuf, all: bool, json: bool) -> Result<
         _ => bail!("the daemon didn't list the tasks"),
     };
     if json {
-        println!("{}", serde_json::to_string_pretty(&tasks)?);
+        outln!("{}", serde_json::to_string_pretty(&tasks)?)?;
     } else {
-        print!("{}", printable::text(&task_lines(&tasks, all)));
+        out!("{}", printable::text(&task_lines(&tasks, all)))?;
     }
     Ok(())
 }
@@ -226,7 +227,7 @@ pub fn new_task(socket: &Path, task: NewTask) -> Result<()> {
             brief,
         };
         let id = client::add_task(socket, pending)?;
-        println!("{}", task_label(Some(id)));
+        outln!("{}", task_label(Some(id)))?;
         return Ok(());
     }
     let started = match start {
@@ -243,7 +244,7 @@ pub fn new_task(socket: &Path, task: NewTask) -> Result<()> {
             client::new_task(socket, name, cwd, spec, None, brief)?
         }
     };
-    println!("{}", task_label(started.task));
+    outln!("{}", task_label(started.task))?;
     Ok(())
 }
 
@@ -253,7 +254,7 @@ pub fn start_task(socket: &Path, id: &str) -> Result<()> {
     let id =
         tasks::parse_id(id).with_context(|| format!("{id} isn't a task's number, like t12"))?;
     let started = client::start_task(socket, id)?;
-    println!("{}", started.name);
+    outln!("{}", started.name)?;
     Ok(())
 }
 
@@ -268,9 +269,9 @@ pub fn show_task(socket: &Path, task: &str, json: bool) -> Result<()> {
         bail!("the daemon didn't send the task");
     };
     if json {
-        println!("{}", serde_json::to_string_pretty(&task)?);
+        outln!("{}", serde_json::to_string_pretty(&task)?)?;
     } else {
-        print!("{}", printable::text(&task_card(&task, now())));
+        out!("{}", printable::text(&task_card(&task, now())))?;
     }
     Ok(())
 }
@@ -296,7 +297,7 @@ pub fn task_to_terminal(socket: &Path, task: &str) -> Result<()> {
     let Response::Created { name, .. } = ask_running(socket, &request)? else {
         bail!("the daemon didn't open it in a terminal");
     };
-    println!("{name}");
+    outln!("{name}")?;
     Ok(())
 }
 
@@ -310,15 +311,15 @@ pub fn task_log(socket: &Path, task: &str) -> Result<()> {
     let Response::TaskLog { task, transcript } = ask_running(socket, &request)? else {
         bail!("the daemon didn't send the task's log");
     };
-    print!("{}", printable::text(&task_card(&task, now())));
-    println!();
+    out!("{}", printable::text(&task_card(&task, now())))?;
+    outln!()?;
     match transcript {
-        Some(rows) => print!("{}", transcript_text(&rows)),
-        None if task.state == TaskState::Pending => println!("Nothing has worked on it yet."),
-        None => println!(
+        Some(rows) => out!("{}", transcript_text(&rows))?,
+        None if task.state == TaskState::Pending => outln!("Nothing has worked on it yet.")?,
+        None => outln!(
             "Its session, {}, has gone, and its transcript with it.",
             task.record.session
-        ),
+        )?,
     }
     Ok(())
 }
@@ -539,9 +540,9 @@ pub fn change_backlog(socket: &Path, dir: PathBuf, action: BacklogAction) -> Res
                 .filter(|item| backlog::has_tags(item, &tags))
                 .collect();
             if json {
-                println!("{}", serde_json::to_string_pretty(&items)?);
+                outln!("{}", serde_json::to_string_pretty(&items)?)?;
             } else {
-                print!("{}", printable::text(&backlog_lines(&items)));
+                out!("{}", printable::text(&backlog_lines(&items)))?;
             }
         }
         BacklogAction::Add { text, body, tags } => {
@@ -552,7 +553,7 @@ pub fn change_backlog(socket: &Path, dir: PathBuf, action: BacklogAction) -> Res
                 tags,
             };
             match client::ask(socket, &add, true)? {
-                Some(Response::Added { number }) => println!("#{number}"),
+                Some(Response::Added { number }) => outln!("#{number}")?,
                 _ => bail!("the daemon didn't add it"),
             }
         }
@@ -562,9 +563,9 @@ pub fn change_backlog(socket: &Path, dir: PathBuf, action: BacklogAction) -> Res
             let tasks = backlog.tasks_for(number);
             if json {
                 let shown = ShownItem { item, tasks };
-                println!("{}", serde_json::to_string_pretty(&shown)?);
+                outln!("{}", serde_json::to_string_pretty(&shown)?)?;
             } else {
-                print!("{}", printable::text(&item_card(item, &tasks, now())));
+                out!("{}", printable::text(&item_card(item, &tasks, now())))?;
             }
         }
         BacklogAction::Edit {
@@ -596,7 +597,7 @@ pub fn change_backlog(socket: &Path, dir: PathBuf, action: BacklogAction) -> Res
         BacklogAction::Export => {
             let backlog = client::backlog(socket, dir, true)?;
             let markdown = backlog::markdown(&backlog.project, &backlog.items);
-            print!("{}", printable::text(&markdown));
+            out!("{}", printable::text(&markdown))?;
         }
         BacklogAction::Import { file } => {
             let text = if file == Path::new("-") {
@@ -614,7 +615,7 @@ pub fn change_backlog(socket: &Path, dir: PathBuf, action: BacklogAction) -> Res
             else {
                 bail!("the daemon didn't import them");
             };
-            print!("{}", imported_lines(&added, skipped));
+            out!("{}", imported_lines(&added, skipped))?;
         }
     }
     Ok(())

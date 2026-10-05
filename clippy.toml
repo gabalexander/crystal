@@ -1,0 +1,7 @@
+# A closed standard output, as `crystal ls | head -1` leaves, panics
+# `print!` and `println!`; `out!` and `outln!` (src/output.rs) stop the
+# command quietly instead.
+disallowed-macros = [
+    { path = "std::print", reason = "use `out!`, which stops quietly once standard output's reader has gone" },
+    { path = "std::println", reason = "use `outln!`, which stops quietly once standard output's reader has gone" },
+]

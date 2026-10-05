@@ -6,6 +6,7 @@ use crate::client;
 use crate::config::Config;
 use crate::flow_run::{FlowRun, RunState};
 use crate::flows;
+use crate::output::{out, outln};
 use crate::printable;
 use crate::protocol::{Request, Response};
 use crate::shell;
@@ -23,7 +24,7 @@ const POLL_EVERY: Duration = Duration::from_millis(250);
 pub fn run(socket: &Path, flow: &str, goal: &str, cwd: PathBuf, wait: bool) -> Result<()> {
     ensure_on()?;
     let run = client::start_flow(socket, flow, goal, cwd)?;
-    println!("{run}");
+    outln!("{run}")?;
     if wait {
         self::wait(socket, &run, None)?;
     }
@@ -36,12 +37,11 @@ pub fn list(socket: &Path, json: bool) -> Result<()> {
     let runs = runs(socket)?;
     if json {
         let listed: Vec<Listed> = runs.iter().map(Listed::from).collect();
-        println!("{}", serde_json::to_string_pretty(&listed)?);
+        outln!("{}", serde_json::to_string_pretty(&listed)?)?;
         return Ok(());
     }
     if runs.is_empty() {
-        print_flows();
-        return Ok(());
+        return print_flows();
     }
     let rows: Vec<[String; 7]> = runs
         .iter()
@@ -59,8 +59,7 @@ pub fn list(socket: &Path, json: bool) -> Result<()> {
         })
         .collect();
     let header = ["RUN", "FLOW", "STATE", "STEP", "ROUND", "COST", "GOAL"];
-    crate::print_table(header, &rows);
-    Ok(())
+    crate::print_table(header, &rows)
 }
 
 /// Prints one run: what it's for, where it runs, and each step, with the
@@ -68,24 +67,24 @@ pub fn list(socket: &Path, json: bool) -> Result<()> {
 pub fn show(socket: &Path, name: &str, json: bool) -> Result<()> {
     let run = find(socket, name)?;
     if json {
-        println!("{}", serde_json::to_string_pretty(&Listed::from(&run))?);
+        outln!("{}", serde_json::to_string_pretty(&Listed::from(&run))?)?;
         return Ok(());
     }
-    println!(
+    outln!(
         "{} · {} · {} · round {} · {}",
         run.name,
         run.flow.name,
         describe(&run),
         run.round,
         dollars(run.cost_usd())
-    );
-    println!("goal  {}", printable::text(&run.goal));
+    )?;
+    outln!("goal  {}", printable::text(&run.goal))?;
     let mut place = shell::home_relative(&run.cwd);
     if let Some(worktree) = &run.worktree {
         place.push_str(&format!(", then {}", shell::home_relative(worktree)));
     }
-    println!("in    {place}");
-    println!();
+    outln!("in    {place}")?;
+    outln!()?;
     let rows: Vec<[String; 6]> = run
         .steps
         .iter()
@@ -102,8 +101,7 @@ pub fn show(socket: &Path, name: &str, json: bool) -> Result<()> {
         })
         .collect();
     let header = ["STEP", "STATE", "SESSION", "RUNS", "COST", "ANSWER"];
-    crate::print_table(header, &rows);
-    Ok(())
+    crate::print_table(header, &rows)
 }
 
 /// Goes on past the gate the run called `name` waits at.
@@ -139,7 +137,7 @@ pub fn defs(dir: &Path) -> Result<()> {
         eprintln!("crystal: couldn't read the project's flows: {problem}");
     }
     if found.is_empty() {
-        println!("no flows yet: `crystal flow example` prints one to copy into your config file");
+        outln!("no flows yet: `crystal flow example` prints one to copy into your config file")?;
         return Ok(());
     }
     let rows: Vec<[String; 3]> = found
@@ -156,8 +154,7 @@ pub fn defs(dir: &Path) -> Result<()> {
             ]
         })
         .collect();
-    crate::print_table(["FLOW", "STEPS", "FROM"], &rows);
-    Ok(())
+    crate::print_table(["FLOW", "STEPS", "FROM"], &rows)
 }
 
 /// Waits until the run called `name` stops running: it waits at a gate, is
@@ -171,7 +168,7 @@ pub fn wait(socket: &Path, name: &str, timeout: Option<Duration>) -> Result<()> 
         match run.state() {
             RunState::Running => {}
             RunState::AtGate | RunState::Done => {
-                println!("{}", describe(&run));
+                outln!("{}", describe(&run))?;
                 return Ok(());
             }
             RunState::Failed | RunState::Interrupted | RunState::Cancelled => {
@@ -189,23 +186,24 @@ pub fn wait(socket: &Path, name: &str, timeout: Option<Duration>) -> Result<()> 
 
 /// Says there are no runs yet, and which flows a run started in the
 /// current directory would find: their names and steps, or how to write one.
-fn print_flows() {
+fn print_flows() -> Result<()> {
     let config = Config::load().unwrap_or_default();
     let here = std::env::current_dir().unwrap_or_default();
     let (found, _) = flows::definitions(&config, &here);
     if found.is_empty() {
-        println!("no flows yet: `crystal flow example` prints one to copy into your config file");
-        return;
+        outln!("no flows yet: `crystal flow example` prints one to copy into your config file")?;
+        return Ok(());
     }
-    println!("no flow runs yet; `crystal flow run <flow> \"<goal>\"` starts one of these:");
+    outln!("no flow runs yet; `crystal flow run <flow> \"<goal>\"` starts one of these:")?;
     for found in &found {
-        println!("  {}  {}", found.flow.name, found.flow.chain());
+        outln!("  {}  {}", found.flow.name, found.flow.chain())?;
     }
+    Ok(())
 }
 
 /// Prints the example flow, to copy into the config file.
-pub fn example() {
-    print!("{}", flows::EXAMPLE);
+pub fn example() -> Result<()> {
+    out!("{}", flows::EXAMPLE)
 }
 
 /// How a run stands, in a few words, with the step that matters.

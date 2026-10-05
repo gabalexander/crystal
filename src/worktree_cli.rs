@@ -11,6 +11,7 @@ use crate::env;
 use crate::git::{self, Checkout};
 use crate::memory_cli::confirm;
 use crate::names;
+use crate::output::outln;
 use crate::protocol::{ArchivedSession, Front, Request, Response, SessionInfo};
 use crate::shell;
 use anyhow::{Context, Result, bail};
@@ -60,7 +61,7 @@ pub fn list(socket: &Path, dir: &Path, json: bool) -> Result<()> {
         })
         .collect();
     if json {
-        println!("{}", serde_json::to_string_pretty(&listed)?);
+        outln!("{}", serde_json::to_string_pretty(&listed)?)?;
         return Ok(());
     }
     let rows: Vec<[String; 4]> = listed
@@ -77,8 +78,7 @@ pub fn list(socket: &Path, dir: &Path, json: bool) -> Result<()> {
             ]
         })
         .collect();
-    crate::print_table(["BRANCH", "LABEL", "SESSIONS", "DIRECTORY"], &rows);
-    Ok(())
+    crate::print_table(["BRANCH", "LABEL", "SESSIONS", "DIRECTORY"], &rows)
 }
 
 /// What `crystal worktree create` was asked for.
@@ -97,7 +97,7 @@ pub struct NewWorktree {
 /// its directory.
 pub fn create(socket: &Path, dir: &Path, new: NewWorktree) -> Result<()> {
     let path = make(socket, dir, new)?;
-    println!("{}", path.display());
+    outln!("{}", path.display())?;
     Ok(())
 }
 
@@ -211,13 +211,13 @@ pub fn move_session(socket: &Path, to: MoveTo) -> Result<()> {
         _ => "its agent's turn",
     };
     match client::move_session(socket, &session.name, &target)? {
-        Moved::AlreadyThere => println!("{} is in {at} already", session.name),
-        Moved::Later if itself => println!(
+        Moved::AlreadyThere => outln!("{} is in {at} already", session.name)?,
+        Moved::Later if itself => outln!(
             "End your turn now, saying in a line that this session is moving: crystal moves it \
              into {at} once your turn ends, and picks your conversation up there."
-        ),
-        Moved::Later => println!("{} moves into {at} once {turn} ends", session.name),
-        Moved::Now => println!("{} moves into {at} now", session.name),
+        )?,
+        Moved::Later => outln!("{} moves into {at} once {turn} ends", session.name)?,
+        Moved::Now => outln!("{} moves into {at} now", session.name)?,
     }
     Ok(())
 }
@@ -318,7 +318,7 @@ fn remove_emptied(socket: &Path, worktree: &Emptied, asked: bool) -> Result<()> 
         }
     }
     client::remove_worktree(socket, &worktree.path, changes)?;
-    println!("removed worktree {name}");
+    outln!("removed worktree {name}")?;
     Ok(())
 }
 

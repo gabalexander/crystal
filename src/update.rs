@@ -19,6 +19,7 @@
 //! directory, and the TUI shows them, once, the first time it opens on the
 //! new crystal; updated some other way, the TUI asks for them itself.
 
+use crate::output::{out, outln};
 use crate::{embed, printable, server_cli, shell, skill, socket, state};
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
@@ -65,7 +66,7 @@ pub fn run(socket: &Path, version: Option<String>, check: bool, notes: bool) -> 
         let body = kept_notes(version)
             .or_else(|| fetch_notes(version))
             .with_context(|| no_notes_of(version))?;
-        println!("{}", printable::text(&body).trim_end());
+        outln!("{}", printable::text(&body).trim_end())?;
         return Ok(());
     }
     let wanted = match &version {
@@ -74,22 +75,20 @@ pub fn run(socket: &Path, version: Option<String>, check: bool, notes: bool) -> 
     };
     if check {
         if is_newer(&wanted, VERSION) {
-            println!(
-                "crystal {wanted} is out, and this is {VERSION}: `crystal update` installs it"
-            );
+            outln!("crystal {wanted} is out, and this is {VERSION}: `crystal update` installs it")?;
         } else {
-            println!("crystal {VERSION} is the latest");
+            outln!("crystal {VERSION} is the latest")?;
         }
         return Ok(());
     }
     // A build from past the latest release isn't taken back to it unless
     // asked for by its version.
     if version.is_none() && !is_newer(&wanted, VERSION) {
-        println!("crystal {VERSION} is the latest");
+        outln!("crystal {VERSION} is the latest")?;
         return Ok(());
     }
     if wanted == VERSION {
-        println!("crystal {VERSION} is installed already");
+        outln!("crystal {VERSION} is installed already")?;
         return Ok(());
     }
 
@@ -99,14 +98,17 @@ pub fn run(socket: &Path, version: Option<String>, check: bool, notes: bool) -> 
     let archive = download(&wanted, &target, scratch.path())?;
     let binary = unpack(&archive, &wanted, &target, scratch.path())?;
     replace(&exe, &binary)?;
-    println!(
+    // From here on, what's said is said along the way: nothing reading it
+    // any more stops the update half done, its daemons left on the old
+    // crystal.
+    let _ = outln!(
         "updated crystal {VERSION} to {wanted} in {}",
         shell::home_relative(&exe)
     );
     // What's new, for the TUI to show as it next opens; none is no matter.
     if let Some(body) = fetch_notes(&wanted) {
         keep_notes(&wanted, &body);
-        println!(
+        let _ = outln!(
             "crystal's TUI shows what's new as it next opens: `crystal update --notes` prints it"
         );
     }
@@ -420,7 +422,8 @@ fn download(version: &str, target: &str, dir: &Path) -> Result<PathBuf> {
     let url = format!("{}/download/v{version}/{name}", releases());
     let archive = dir.join(&name);
     let sum = dir.join(format!("{name}.sha256"));
-    println!("downloading crystal {version} for {target}");
+    // Said along the way: the update goes on whether anything reads it.
+    let _ = outln!("downloading crystal {version} for {target}");
     fetch(&url, &archive, std::io::stderr().is_terminal())?;
     fetch(&format!("{url}.sha256"), &sum, false)?;
     let expected = fs::read_to_string(&sum)?
@@ -527,11 +530,12 @@ fn restart_daemons(exe: &Path, socket: &Path) {
             .stderr(Stdio::inherit())
             .output();
         match (restarted, &server) {
+            // Said along the way, as the update's other lines are.
             (Ok(out), None) if out.status.success() => {
-                print!("{}", String::from_utf8_lossy(&out.stdout));
+                let _ = out!("{}", String::from_utf8_lossy(&out.stdout));
             }
             (Ok(out), Some(server)) if out.status.success() => {
-                print!("{server}: {}", String::from_utf8_lossy(&out.stdout));
+                let _ = out!("{server}: {}", String::from_utf8_lossy(&out.stdout));
             }
             (_, None) => eprintln!(
                 "crystal: couldn't restart the daemon at {}: run `crystal -S {} restart-server`",

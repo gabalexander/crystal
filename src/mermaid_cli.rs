@@ -15,6 +15,7 @@
 //! from the jsDelivr CDN.
 
 use crate::mermaid::{self, Glyphs, Rendered};
+use crate::output::{self, outln};
 use crate::{links, markdown, printable, state};
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
@@ -31,7 +32,7 @@ pub fn run(input: Option<&str>, width: Option<usize>, ascii: bool, open: bool) -
     let text = read(input)?;
     if open {
         let page = write_page(&text, &state::diagrams_dir())?;
-        println!("{}", page.display());
+        outln!("{}", page.display())?;
         eprintln!("{}", links::open(&file_url(&page))?);
         return Ok(());
     }
@@ -41,7 +42,8 @@ pub fn run(input: Option<&str>, width: Option<usize>, ascii: bool, open: bool) -
     } else {
         Glyphs::BOX_DRAWING
     };
-    let not_drawn = draw(&text, width, glyphs, &mut std::io::stdout().lock())?;
+    let not_drawn =
+        draw(&text, width, glyphs, &mut std::io::stdout().lock()).map_err(output::failed)?;
     if !not_drawn.is_empty() {
         bail!("{}", not_drawn.join("; "));
     }
@@ -93,7 +95,12 @@ fn diagrams(text: &str) -> Vec<String> {
 
 /// Draws every diagram in `text` to `out`, and the source of each that
 /// can't be drawn. Returns why each of those wasn't.
-fn draw(text: &str, width: usize, glyphs: Glyphs, out: &mut impl Write) -> Result<Vec<String>> {
+fn draw(
+    text: &str,
+    width: usize,
+    glyphs: Glyphs,
+    out: &mut impl Write,
+) -> std::io::Result<Vec<String>> {
     let diagrams = diagrams(text);
     let several = diagrams.len() > 1;
     let mut not_drawn = Vec::new();

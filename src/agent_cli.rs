@@ -6,6 +6,7 @@
 use crate::agent_rules::{self, Explained, Input, Meaning};
 use crate::client;
 use crate::integration::{self, Agent};
+use crate::output::{out, outln};
 use crate::protocol::{Front, Request, Response, ScreenExplained};
 use crate::shell;
 use anyhow::{Context, Result, bail};
@@ -36,7 +37,7 @@ pub fn list(json: bool) -> Result<()> {
             .collect();
         let problems = &registry.problems;
         let out = json!({ "agents": rows, "problems": problems });
-        println!("{}", serde_json::to_string_pretty(&out)?);
+        outln!("{}", serde_json::to_string_pretty(&out)?)?;
         return Ok(());
     }
     let table: Vec<[String; 5]> = rows
@@ -55,22 +56,22 @@ pub fn list(json: bool) -> Result<()> {
             ]
         })
         .collect();
-    print_table(["AGENT", "NAME", "RULES", "INSTALLED", "HOOKS"], &table);
+    print_table(["AGENT", "NAME", "RULES", "INSTALLED", "HOOKS"], &table)?;
     let dir = shell::home_relative(&agent_rules::dir());
-    println!();
-    println!(
+    outln!()?;
+    outln!(
         "A file of your own in {dir}/ takes the place of crystal's rules for its agent, or adds an agent:"
-    );
-    println!("`crystal agent rules <agent>` prints crystal's to start from.");
+    )?;
+    outln!("`crystal agent rules <agent>` prints crystal's to start from.")?;
     let problems: Vec<String> = rows
         .iter()
         .filter_map(|row| row.problem.clone())
         .chain(registry.problems.iter().cloned())
         .collect();
     if !problems.is_empty() {
-        println!();
+        outln!()?;
         for problem in problems {
-            println!("! {problem}");
+            outln!("! {problem}")?;
         }
     }
     Ok(())
@@ -128,7 +129,7 @@ fn on_path(program: &str) -> bool {
     })
 }
 
-fn print_table<const N: usize>(header: [&str; N], rows: &[[String; N]]) {
+fn print_table<const N: usize>(header: [&str; N], rows: &[[String; N]]) -> Result<()> {
     let mut widths = header.map(|title| title.chars().count());
     for row in rows {
         for (width, cell) in widths.iter_mut().zip(row) {
@@ -144,12 +145,13 @@ fn print_table<const N: usize>(header: [&str; N], rows: &[[String; N]]) {
                 line.push_str(&format!("{cell:width$}  "));
             }
         }
-        println!("{}", line.trim_end());
+        outln!("{}", line.trim_end())
     };
-    line(header.to_vec());
+    line(header.to_vec())?;
     for row in rows {
-        line(row.iter().map(String::as_str).collect());
+        line(row.iter().map(String::as_str).collect())?;
     }
+    Ok(())
 }
 
 /// Shows why crystal reads `session`'s agent the way it does, by the rules
@@ -172,9 +174,9 @@ pub fn explain(
         bail!("the daemon didn't explain {session}");
     };
     if json {
-        println!("{}", serde_json::to_string_pretty(&explained)?);
+        outln!("{}", serde_json::to_string_pretty(&explained)?)?;
     } else {
-        print!("{}", session_text(&explained, verbose));
+        out!("{}", session_text(&explained, verbose))?;
     }
     Ok(())
 }
@@ -208,9 +210,9 @@ pub fn explain_file(
     };
     let explained = rules.explain(&screen);
     if json {
-        println!("{}", serde_json::to_string_pretty(&explained)?);
+        outln!("{}", serde_json::to_string_pretty(&explained)?)?;
     } else {
-        print!("{}", rules_text(&explained, verbose));
+        out!("{}", rules_text(&explained, verbose))?;
     }
     Ok(())
 }
@@ -222,7 +224,7 @@ pub fn rules(agent: &str) -> Result<()> {
             "crystal comes with no rules for {agent}: `crystal agent list` shows the agents it has them for"
         );
     };
-    print!("{text}");
+    out!("{text}")?;
     Ok(())
 }
 

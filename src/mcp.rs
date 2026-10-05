@@ -13,6 +13,7 @@
 
 use crate::memory::{self, Kind, Listed, Store, Wanted};
 use crate::memory_cli;
+use crate::output;
 use crate::tui::sidebar::ago;
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
@@ -49,8 +50,10 @@ pub fn run(socket: &Path, dir: &Path) -> Result<()> {
             continue;
         }
         if let Some(reply) = server.answer(&line) {
-            writeln!(out, "{reply}")?;
-            out.flush()?;
+            // With Claude Code gone, the server ends quietly.
+            writeln!(out, "{reply}")
+                .and_then(|()| out.flush())
+                .map_err(output::failed)?;
         }
     }
     Ok(())

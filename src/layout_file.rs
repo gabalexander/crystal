@@ -22,6 +22,7 @@
 
 use crate::client::{self, Purpose};
 use crate::layout::{self, Command, Layout, TabLayout};
+use crate::output::outln;
 use crate::printable;
 use crate::protocol::{Request, Response, SessionInfo};
 use crate::shell;
@@ -620,7 +621,7 @@ pub fn export(socket: &Path, tab: Option<&str>) -> Result<()> {
     let layout = client::lay_out(socket, Command::Show)?;
     let sessions = sessions(socket, false)?;
     let file = File::export(&layout, &sessions, tab).map_err(anyhow::Error::msg)?;
-    println!("{}", serde_json::to_string_pretty(&file)?);
+    outln!("{}", serde_json::to_string_pretty(&file)?)?;
     Ok(())
 }
 
@@ -663,7 +664,7 @@ pub fn apply(socket: &Path, path: Option<&Path>, replace: bool) -> Result<()> {
         eprintln!("{}", printable::line(why));
     }
     for name in &planned.started {
-        println!("{name}");
+        outln!("{name}")?;
     }
     client::lay_out(
         socket,

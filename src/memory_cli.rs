@@ -11,6 +11,7 @@ use crate::git::Checkout;
 use crate::memory::{
     self, Added, Entry, Forgotten, Freshness, Kind, Listed, Memory, New, Source, Store, Wanted,
 };
+use crate::output::{out, outln};
 use crate::printable;
 use crate::protocol::{Request, Response};
 use crate::tui::sidebar::ago;
@@ -51,13 +52,13 @@ pub fn remember(
     };
     match memory::add(socket, &project, new)? {
         Added::New(entry) => {
-            println!("remembered {}", entry.id);
+            outln!("remembered {}", entry.id)?;
             tell(
                 socket,
                 Event::memory(events::Kind::MemoryAdded, project, entry),
             );
         }
-        Added::Again(entry) => println!("remembered {} already", entry.id),
+        Added::Again(entry) => outln!("remembered {} already", entry.id)?,
         Added::Refused => unreachable!("only crystal is refused what was forgotten"),
     }
     Ok(())
@@ -80,7 +81,7 @@ pub fn list(
             .iter()
             .filter(|entry| kind.is_none_or(|kind| entry.kind == kind));
         for entry in forgotten {
-            println!("{}", printable::line(&forgotten_line(entry, now())));
+            outln!("{}", printable::line(&forgotten_line(entry, now())))?;
         }
         return Ok(());
     }
@@ -90,8 +91,7 @@ pub fn list(
         .iter()
         .filter(|item| kind.is_none_or(|kind| item.entry.kind == kind))
         .collect();
-    print_entries(&listed);
-    Ok(())
+    print_entries(&listed)
 }
 
 /// Prints entry `id` in full.
@@ -101,7 +101,7 @@ pub fn show(socket: &Path, dir: Option<PathBuf>, id: u64) -> Result<()> {
         bail!("there's no entry {id}");
     };
     let freshness = memory::freshness(entry, &memory.project);
-    println!("{}", in_full(entry, freshness, now()));
+    outln!("{}", in_full(entry, freshness, now()))?;
     Ok(())
 }
 
@@ -109,10 +109,10 @@ pub fn show(socket: &Path, dir: Option<PathBuf>, id: u64) -> Result<()> {
 pub fn export(socket: &Path, dir: Option<PathBuf>) -> Result<()> {
     let memory = read(socket, dir)?;
     let name = memory.project.file_name().unwrap_or_default();
-    print!(
+    out!(
         "{}",
         memory::markdown(&name.to_string_lossy(), &memory.listed())
-    );
+    )?;
     Ok(())
 }
 
@@ -157,8 +157,7 @@ pub fn search(
         limit: args.limit.unwrap_or(memory::SEARCH_LIMIT).max(1),
     };
     let found = found(socket, &dir, &words.join(" "), &wanted)?;
-    print_entries(&found.iter().collect::<Vec<_>>());
-    Ok(())
+    print_entries(&found.iter().collect::<Vec<_>>())
 }
 
 /// The entries of the memory of the project `dir` is in that have to do
@@ -184,7 +183,7 @@ pub fn remove(socket: &Path, dir: Option<PathBuf>, id: u64) -> Result<()> {
     check_on()?;
     let project = memory::project_of(&dir_or_current(dir)?);
     let entry = memory::remove(socket, &project, id)?;
-    println!("forgot {}: {}", entry.id, entry.text);
+    outln!("forgot {}: {}", entry.id, entry.text)?;
     tell(
         socket,
         Event::memory(events::Kind::MemoryForgotten, project, entry),
@@ -216,12 +215,12 @@ pub fn embed(socket: &Path) -> Result<()> {
     // Embedding needs only the one model.
     let models = Models::load(&root, false)?;
     let count = Store::open(socket)?.embed_missing(&models)?;
-    println!("embedded {count} entries with {}", embed::MODEL);
+    outln!("embedded {count} entries with {}", embed::MODEL)?;
     if !Config::load()?.memory.embeddings {
-        println!(
+        outln!(
             "searches use it once `embeddings = true` is under `[memory]` in {}",
             crate::config::path().display()
-        );
+        )?;
     }
     Ok(())
 }
@@ -236,9 +235,9 @@ pub fn distill(socket: &Path, name: &str) -> Result<()> {
     let Some(Response::Distilled(report)) = client::ask(socket, &request, false)? else {
         bail!("there's no session called {name}: no daemon is running");
     };
-    println!("distilled {name}: {}", report.line());
+    outln!("distilled {name}: {}", report.line())?;
     for why in &report.rejected {
-        println!("  rejected {why}");
+        outln!("  rejected {why}")?;
     }
     Ok(())
 }
@@ -255,11 +254,11 @@ pub fn promote(socket: &Path, dir: Option<PathBuf>, id: u64, yes: bool) -> Resul
             "Add entry {id} to the project's instructions file?"
         ))?
     {
-        println!("left as it was");
+        outln!("left as it was")?;
         return Ok(());
     }
     let file = memory::promote(&memory.project, entry)?;
-    println!("added entry {id} to {}", file.display());
+    outln!("added entry {id} to {}", file.display())?;
     let promoted = Event::promoted(memory.project.clone(), entry.clone(), file);
     tell(socket, promoted);
     Ok(())
@@ -313,7 +312,7 @@ fn from_top(file: &str, dir: &Path, top: &Path) -> String {
 
 /// One line an entry: its id, kind and age, then its text, marked when
 /// it's drifting or stale.
-fn print_entries(entries: &[&Listed]) {
+fn print_entries(entries: &[&Listed]) -> Result<()> {
     let now = now();
     for item in entries {
         let entry = &item.entry;
@@ -333,8 +332,9 @@ fn print_entries(entries: &[&Listed]) {
         );
         // Its text is kept clean, but not its files, nor what was kept
         // before that.
-        println!("{}", printable::line(&line));
+        outln!("{}", printable::line(&line))?;
     }
+    Ok(())
 }
 
 /// A forgotten entry on one line: the id it had, its kind, how long ago it
