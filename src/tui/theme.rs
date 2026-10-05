@@ -699,7 +699,7 @@ impl Theme {
     }
 
     /// No color at all: every color is the terminal's default.
-    fn plain() -> Theme {
+    pub fn plain() -> Theme {
         Theme {
             background: Color::Reset,
             text: Color::Reset,

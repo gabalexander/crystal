@@ -8,8 +8,13 @@
 //!
 //! A terminal can also tell a program its appearance each time it changes
 //! (mode 2031), but crystal's input reader, crossterm's, takes that report
-//! for the start of a sequence it waits to see the end of, and would
-//! swallow the keys after it.
+//! (`CSI ? 997 ; 1 n`) for the start of a sequence it waits to see the end
+//! of, and would swallow the keys after it, up to the next that ends in a
+//! `u` or a `c`. Nothing outside crossterm can get at the report first: it
+//! reads the terminal itself, from a buffer of its own, and has no event
+//! for it. crossterm 0.29, its latest, has neither the fix (crossterm#1106)
+//! nor color scheme events (crossterm#1052); until it does, crystal doesn't
+//! ask for the reports.
 
 use super::Event;
 use std::io::Write;

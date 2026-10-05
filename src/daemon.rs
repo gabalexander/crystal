@@ -76,6 +76,14 @@ use std::{fs, process, thread};
 /// down the sessions that are running.
 const KEEP_UP_EVERY: Duration = Duration::from_millis(250);
 
+/// How often the keep-up loop looks at what terminals show, to keep it
+/// while `[sessions] restore_screens` is on: the settings are read each
+/// time. See [`Daemon::keep_screens`].
+const SCREENS_CHECK_EVERY: Duration = Duration::from_secs(1);
+
+/// How often what a terminal shows is kept again while it goes on changing.
+const KEEP_SCREEN_EVERY: Duration = Duration::from_secs(15);
+
 /// How often the keep-up loop looks for agents that have sat idle for too
 /// long: the settings are read each time. `CRYSTAL_IDLE_CHECK_MS` sets it
 /// otherwise, for tests.
@@ -501,10 +509,11 @@ impl Daemon {
         saved: SavedSession,
         env: BTreeMap<String, String>,
     ) -> Result<String> {
+        let before = self.screen_before(&saved);
         // It makes way, so that its name is free for the session started.
         let mut waiting = sessions.remove(index);
         let id = waiting.id.clone();
-        match self.start_saved(sessions, saved.clone(), env, Some(id)) {
+        match self.start_saved(sessions, saved.clone(), env, Some(id), before) {
             Ok(name) => {
                 // Whoever was looking at the one waiting is let go, to look
                 // again at the session started under its id.
@@ -543,11 +552,29 @@ impl Daemon {
         }
     }
 
+    /// What the terminal of the session written down as `saved` showed
+    /// before the restart, to show again above its program, while `[sessions]
+    /// restore_screens` is on: see [`Daemon::keep_screens`].
+    fn screen_before(&self, saved: &SavedSession) -> Option<vt::Saved> {
+        if !shows_again(saved) || !settings().sessions.restore_screens {
+            return None;
+        }
+        let screen = self.db.lock().unwrap().screen(&saved.name);
+        screen.unwrap_or_else(|err| {
+            eprintln!(
+                "crystal daemon: couldn't read what {} showed: {err:#}",
+                saved.name
+            );
+            None
+        })
+    }
+
     /// Starts a session again from what was written down of it, from the
     /// environment `env`, at the end of `sessions`, under the id `id` or a
     /// new one, and gives back its name: an agent in its conversation, a
-    /// task at rest, any other program from the start. It comes back with
-    /// its task as it was, closed or not. One written down on its way into
+    /// task at rest, any other program from the start, below `before`, what
+    /// its terminal showed before (see [`start_as`]). It comes back with its
+    /// task as it was, closed or not. One written down on its way into
     /// another worktree, which it starts in, is told it has moved: an agent
     /// as it starts, a task with a follow-up, which carries it on there.
     fn start_saved(
@@ -556,12 +583,14 @@ impl Daemon {
         saved: SavedSession,
         env: BTreeMap<String, String>,
         id: Option<String>,
+        before: Option<vt::Saved>,
     ) -> Result<String> {
         let id = id.unwrap_or_else(new_id);
         let moved = saved.moved.as_ref().map(moving::notice);
         let goal = saved.goal.clone();
         let backlog = goal.as_ref().and_then(|goal| goal.backlog);
         let brief = brief_of(&saved);
+        let name_given = saved.name_given;
         let name = match saved.task {
             // A task comes back at rest: a run it was in the middle of
             // can't be picked up halfway, so it isn't run again either.
@@ -603,12 +632,17 @@ impl Daemon {
                     saved.conversation,
                     saved.resume,
                     moved.as_deref(),
+                    before,
                 )?
             }
         };
         let session = sessions.last_mut().expect("start added a session");
         if let Some(goal) = goal {
             session.give_task(goal);
+        }
+        // A name the user or a script gave stays theirs.
+        if name_given {
+            session.keep_given_name();
         }
         if let Some(notice) = moved.filter(|_| session.is_task())
             && let Err(err) = session.prompt(&notice)
@@ -672,7 +706,8 @@ impl Daemon {
                 .expect("some number is free");
             archived.session.name = free;
         }
-        let started = match self.start_saved(&mut sessions, archived.session.clone(), env, None) {
+        let session = archived.session.clone();
+        let started = match self.start_saved(&mut sessions, session, env, None, None) {
             Ok(started) => started,
             Err(err) => {
                 db.archive(&archived)?;
@@ -692,9 +727,11 @@ impl Daemon {
 
     /// Again and again: reads every session's screen for what its agent is
     /// doing, tells what has changed, and writes down the running sessions
-    /// when they've changed.
+    /// when they've changed, and what their terminals show.
     fn keep_up(&self) {
         let mut last_saved: Vec<SavedSession> = Vec::new();
+        let mut kept_screens = KeptScreens::default();
+        let mut screens_checked = Instant::now();
         // The sessions whose program has ended and been told of, by id: a
         // daemon handed ones that had ended was told of them already.
         let mut told_ended: HashSet<String> = self
@@ -786,12 +823,89 @@ impl Daemon {
                     Err(err) => eprintln!("crystal daemon: couldn't save the sessions: {err:#}"),
                 }
             }
+            if screens_checked.elapsed() >= SCREENS_CHECK_EVERY {
+                screens_checked = Instant::now();
+                self.keep_screens(&sessions, &mut kept_screens);
+            }
             let runs = self.flows.lock().unwrap().clone();
             if runs != last_runs {
                 match self.db.lock().unwrap().save_flow_runs(&runs) {
                     Ok(()) => last_runs = runs,
                     Err(err) => eprintln!("crystal daemon: couldn't save the flow runs: {err:#}"),
                 }
+            }
+        }
+    }
+
+    /// Keeps what each terminal shows in the database, while `[sessions]
+    /// restore_screens` is on, to show again above its program should a
+    /// crash or a reboot have it start again: a screen not kept yet as soon
+    /// as there's something on it, then again once it has changed, at most
+    /// every [`KEEP_SCREEN_EVERY`]. A task's isn't kept, nor that of an
+    /// agent a restart would pick up in its conversation, which shows its
+    /// own; one yet to start again keeps what was kept. With the setting
+    /// off, nothing is kept, and what was is forgotten. Called with the
+    /// sessions locked, so nothing is kept once a shutdown has emptied them.
+    fn keep_screens(&self, sessions: &[Session], kept: &mut KeptScreens) {
+        if !settings().sessions.restore_screens {
+            if kept.maybe_some {
+                match self.db.lock().unwrap().forget_screens() {
+                    Ok(()) => *kept = KeptScreens::nothing(),
+                    Err(err) => eprintln!("crystal daemon: couldn't forget the screens: {err:#}"),
+                }
+            }
+            return;
+        }
+        kept.maybe_some = true;
+        kept.sessions
+            .retain(|id, _| sessions.iter().any(|session| &session.id == id));
+        let db = self.db.lock().unwrap();
+        for session in sessions.iter().filter(|session| session.is_running()) {
+            let Some(saved) = session.saved() else {
+                continue;
+            };
+            let was = kept.sessions.get(&session.id);
+            let renamed = was.is_some_and(|was| was.name != session.name);
+            if !shows_again(&saved) {
+                if renamed || was.is_none_or(|was| was.kept.is_some()) {
+                    if let Err(err) = db.forget_screen(&session.name) {
+                        eprintln!("crystal daemon: couldn't forget a screen: {err:#}");
+                        continue;
+                    }
+                    let forgotten = KeptScreen {
+                        name: session.name.clone(),
+                        kept: None,
+                    };
+                    kept.sessions.insert(session.id.clone(), forgotten);
+                }
+                continue;
+            }
+            let term = session.term();
+            let written = term.main_written();
+            let due = match was.and_then(|was| was.kept.filter(|_| !renamed)) {
+                Some((then, at)) => then != written && at.elapsed() >= KEEP_SCREEN_EVERY,
+                None => true,
+            };
+            if !due {
+                continue;
+            }
+            let screen = term.kept_screen();
+            // Looked at again next time.
+            if screen.output.is_empty() {
+                continue;
+            }
+            match db.keep_screen(&session.name, &screen) {
+                Ok(()) => {
+                    let now = KeptScreen {
+                        name: session.name.clone(),
+                        kept: Some((written, Instant::now())),
+                    };
+                    kept.sessions.insert(session.id.clone(), now);
+                }
+                Err(err) => eprintln!(
+                    "crystal daemon: couldn't keep what {} shows: {err:#}",
+                    session.name
+                ),
             }
         }
     }
@@ -3008,6 +3122,7 @@ impl Daemon {
         // that doesn't start.
         let ended = sessions.remove(index);
         let launch = ended.launch();
+        let name_given = launch.name_given;
         // Run again, its task is open again: the work goes on.
         let backlog = launch.goal.as_ref().and_then(|goal| goal.backlog);
         let brief = brief_of(&launch);
@@ -3059,6 +3174,9 @@ impl Daemon {
         // `start` adds the new session at the end; it goes where the old
         // one was.
         let mut started = sessions.pop().expect("start added a session");
+        if name_given {
+            started.keep_given_name();
+        }
         // It's the same task, open again, under the same number.
         if let (Some(goal), true) = (launch.goal, started.task_record().is_some()) {
             started.give_task(TaskInfo {
@@ -3331,6 +3449,55 @@ fn how_step_ended(sessions: &[Session], run: &FlowRun, step: usize) -> Option<En
     })
 }
 
+/// What the keep-up loop has kept of each terminal's screen in the
+/// database: see [`Daemon::keep_screens`].
+struct KeptScreens {
+    /// Whether the database may hold screens: those a daemon before this
+    /// one kept, until it has looked.
+    maybe_some: bool,
+    /// By each session's id.
+    sessions: HashMap<String, KeptScreen>,
+}
+
+impl Default for KeptScreens {
+    fn default() -> KeptScreens {
+        KeptScreens {
+            maybe_some: true,
+            sessions: HashMap::new(),
+        }
+    }
+}
+
+impl KeptScreens {
+    /// None at all: they've been forgotten.
+    fn nothing() -> KeptScreens {
+        KeptScreens {
+            maybe_some: false,
+            sessions: HashMap::new(),
+        }
+    }
+}
+
+/// What was last kept of a session's screen, or forgotten.
+struct KeptScreen {
+    /// The name it was kept under.
+    name: String,
+    /// The screen's [`Term::main_written`] as it was kept, and when; `None`
+    /// when it was forgotten instead.
+    kept: Option<(u64, Instant)>,
+}
+
+/// Whether a terminal started again from `saved` after a restart shows what
+/// it showed before: not a task's, which draws its transcript again, nor an
+/// agent's picked up in its conversation, which shows its own.
+fn shows_again(saved: &SavedSession) -> bool {
+    let resumes = saved
+        .conversation
+        .as_ref()
+        .is_some_and(Conversation::can_resume);
+    saved.task.is_none() && saved.resume.is_none() && !resumes
+}
+
 /// A session found for a client about to show it.
 struct Found {
     name: String,
@@ -3355,6 +3522,7 @@ fn start(
         conversation,
         resume_command,
         None,
+        None,
     )
 }
 
@@ -3363,7 +3531,11 @@ fn start(
 /// `resume_command`, the command an agent said resumes it, it's resumed
 /// with that instead. Never anywhere but its directory. An agent picked up
 /// in its conversation after a move into another worktree is given
-/// `moved`, which tells it so, as its next prompt: see [`moving`].
+/// `moved`, which tells it so, as its next prompt: see [`moving`]. Given
+/// `before`, what its terminal showed before a cold restart, it shows that
+/// above its program, unless its agent is picked up in its conversation,
+/// which shows its own.
+#[allow(clippy::too_many_arguments)]
 fn start_as(
     id: String,
     sessions: &mut Vec<Session>,
@@ -3372,6 +3544,7 @@ fn start_as(
     conversation: Option<Conversation>,
     resume_command: Option<Vec<String>>,
     moved: Option<&str>,
+    before: Option<vt::Saved>,
 ) -> Result<String> {
     let NewSession {
         name,
@@ -3484,8 +3657,9 @@ fn start_as(
         Some(notice) => agents::moved(argv, notice, &cwd),
         None => argv,
     };
+    let before = before.filter(|_| resume.is_none() && !resumed);
     keep_scrollback();
-    let mut session = Session::spawn(id, name.clone(), command, &argv, cwd, &env)?;
+    let mut session = Session::spawn(id, name.clone(), command, &argv, cwd, &env, before.as_ref())?;
     if let Some(typed) = typed
         && let Err(err) = session.term().write(&typed)
     {
@@ -4240,6 +4414,53 @@ fn unique_name(program: &str, taken: impl Fn(&str) -> bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_terminal_shows_again_what_it_showed_unless_its_agent_picks_its_conversation_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let shell = SavedSession {
+            name: "shell".into(),
+            command: vec!["zsh".into()],
+            cwd: dir.path().to_path_buf(),
+            conversation: None,
+            task: None,
+            goal: None,
+            resume: None,
+            about: TaskBrief::default(),
+            name_given: false,
+            moved: None,
+        };
+        assert!(shows_again(&shell));
+        // An agent whose conversation is there to pick up shows its own.
+        let transcript = dir.path().join("talk.jsonl");
+        let agent = SavedSession {
+            command: vec!["claude".into()],
+            conversation: Some(Conversation {
+                id: "talk".into(),
+                transcript: Some(transcript.clone()),
+                prompted: false,
+            }),
+            ..shell.clone()
+        };
+        assert!(shows_again(&agent), "nothing to pick up yet");
+        fs::write(&transcript, "{}\n").unwrap();
+        assert!(!shows_again(&agent));
+        // So does one resumed as it said, and a task, which draws its
+        // transcript again.
+        let reported = SavedSession {
+            resume: Some(vec!["pi".into(), "--session".into(), "s1".into()]),
+            ..shell.clone()
+        };
+        assert!(!shows_again(&reported));
+        let task = SavedSession {
+            task: Some(TaskSpec {
+                prompt: "fix it".into(),
+                args: Vec::new(),
+            }),
+            ..shell
+        };
+        assert!(!shows_again(&task));
+    }
 
     #[test]
     fn claude_may_run_crystal_s_own_commands_but_not_those_that_remove_or_answer() {

@@ -101,6 +101,7 @@ impl Notice {
 /// Whether the user is at crystal, by what its TUIs' terminals say of their
 /// focus. `crystal layout --json` has it as `presence`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum Presence {
     /// No TUI says, or one whose terminal never says.

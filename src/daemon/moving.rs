@@ -146,7 +146,8 @@ impl Daemon {
         // Where its last program ran: its next works it out for itself.
         env.remove("PWD");
         env.remove("OLDPWD");
-        let started = self.start_saved(sessions, saved.clone(), env, Some(ended.id.clone()));
+        let id = Some(ended.id.clone());
+        let started = self.start_saved(sessions, saved.clone(), env, id, None);
         // Whoever was looking at it is let go, to look again at the session
         // started under its id.
         ended.term().close();

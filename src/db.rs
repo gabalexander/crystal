@@ -2,7 +2,8 @@
 //! in the state directory holding the sessions to start again after a
 //! restart, the flow runs, each project's backlog and closed tasks, the
 //! tasks waiting to start and the number the next task gets, what
-//! background tasks have spent each day, the event log, and the TUI's tabs,
+//! background tasks have spent each day, the event log, what terminals
+//! showed when `[sessions] restore_screens` is on, and the TUI's tabs,
 //! layouts and what the new-session panel remembers. The
 //! settings stay in the config file, which people edit by hand, and memory
 //! in a database of its own.
@@ -26,9 +27,12 @@ use crate::protocol::{
 };
 use crate::state::{self, SavedSession};
 use crate::tasks;
+use crate::vt::Saved;
 use anyhow::{Context, Result};
 use rusqlite::types::Value;
-use rusqlite::{Connection, OpenFlags, Row, Transaction, TransactionBehavior, params};
+use rusqlite::{
+    Connection, OpenFlags, OptionalExtension, Row, Transaction, TransactionBehavior, params,
+};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::fs;
@@ -243,6 +247,25 @@ ALTER TABLE sessions ADD COLUMN about TEXT;
 ALTER TABLE archived ADD COLUMN about TEXT;
 ";
 
+/// Whether the user or a script gave a session its name, which a rename in
+/// Claude Code leaves: 1 if they did.
+const NAME_GIVEN: &str = "
+ALTER TABLE sessions ADD COLUMN name_given INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE archived ADD COLUMN name_given INTEGER NOT NULL DEFAULT 0;
+";
+
+/// What each terminal showed, to show again above its program after a cold
+/// restart, while `[sessions] restore_screens` is on (see
+/// [`crate::vt::Screen::kept`]): by the name of the session it's written
+/// down under, as JSON. A row goes with its session as the sessions are
+/// written down without it.
+const SCREENS: &str = "
+CREATE TABLE screens (
+  name   TEXT PRIMARY KEY,
+  screen TEXT NOT NULL
+);
+";
+
 /// The worktree a session was on its way into when it was written down, as
 /// JSON (see [`crate::state::MovedTo`]): it starts again there after a
 /// restart, its agent told it has moved. `NULL` for one staying where it
@@ -266,13 +289,16 @@ const MIGRATIONS: &[&str] = &[
     BRIEFS,
     BACKLOG_BODIES,
     ABOUT,
+    NAME_GIVEN,
+    SCREENS,
     MOVED,
 ];
 
 /// The file each project kept its backlog in before the database.
 const OLD_BACKLOG: &str = "backlog.json";
 
-const SESSION_COLUMNS: &str = "name, command, cwd, conversation, task, goal, resume, about, moved";
+const SESSION_COLUMNS: &str =
+    "name, command, cwd, conversation, task, goal, resume, about, name_given, moved";
 const RUN_COLUMNS: &str =
     "name, flow, profiles, goal, cwd, worktree, round, feedback, steps, started";
 const TASK_COLUMNS: &str = "project_name, goal, session, branch, background, backlog, failed, \
@@ -330,13 +356,52 @@ impl Db {
         Ok(())
     }
 
+    /// Keeps `screen` as what the session written down as `name` showed, in
+    /// place of what was kept of it. A session that isn't written down
+    /// keeps none.
+    pub fn keep_screen(&self, name: &str, screen: &Saved) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO screens (name, screen) \
+             SELECT ?1, ?2 WHERE EXISTS (SELECT 1 FROM sessions WHERE name = ?1)",
+            params![name, json(screen)?],
+        )?;
+        Ok(())
+    }
+
+    /// What the session written down as `name` showed when it was last
+    /// kept, if anything was. One that can't be read is none.
+    pub fn screen(&self, name: &str) -> Result<Option<Saved>> {
+        let screen: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT screen FROM screens WHERE name = ?1",
+                params![name],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(screen.and_then(|screen| serde_json::from_str(&screen).ok()))
+    }
+
+    /// Forgets what the session written down as `name` showed.
+    pub fn forget_screen(&self, name: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM screens WHERE name = ?1", params![name])?;
+        Ok(())
+    }
+
+    /// Forgets what every terminal showed.
+    pub fn forget_screens(&self) -> Result<()> {
+        self.conn.execute("DELETE FROM screens", [])?;
+        Ok(())
+    }
+
     /// Keeps `archived` in the archive.
     pub fn archive(&self, archived: &ArchivedSession) -> Result<()> {
         let session = &archived.session;
         self.conn.execute(
             &format!(
                 "INSERT OR REPLACE INTO archived (id, {SESSION_COLUMNS}, worktree, archived) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"
             ),
             params![
                 archived.id,
@@ -348,6 +413,7 @@ impl Db {
                 json_or_null(&session.goal)?,
                 json_or_null(&session.resume)?,
                 brief_json(&session.about)?,
+                session.name_given,
                 json_or_null(&session.moved)?,
                 json_or_null(&archived.worktree)?,
                 archived.archived as i64,
@@ -872,13 +938,15 @@ fn migrate(conn: &mut Connection) -> Result<()> {
     Ok(())
 }
 
+/// Writes `sessions` down in place of those that were, and forgets what
+/// the sessions no longer written down showed.
 fn write_sessions(conn: &Connection, sessions: &[SavedSession]) -> Result<()> {
     conn.execute("DELETE FROM sessions", [])?;
     for (position, session) in sessions.iter().enumerate() {
         conn.execute(
             &format!(
                 "INSERT INTO sessions (position, {SESSION_COLUMNS}) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"
             ),
             params![
                 position as i64,
@@ -890,10 +958,15 @@ fn write_sessions(conn: &Connection, sessions: &[SavedSession]) -> Result<()> {
                 json_or_null(&session.goal)?,
                 json_or_null(&session.resume)?,
                 brief_json(&session.about)?,
+                session.name_given,
                 json_or_null(&session.moved)?,
             ],
         )?;
     }
+    conn.execute(
+        "DELETE FROM screens WHERE name NOT IN (SELECT name FROM sessions)",
+        [],
+    )?;
     Ok(())
 }
 
@@ -907,16 +980,17 @@ fn session_of(row: &Row) -> Result<SavedSession> {
         goal: from_json_or_null(row.get(5)?)?,
         resume: from_json_or_null(row.get(6)?)?,
         about: from_json_or_null(row.get(7)?)?.unwrap_or_default(),
-        moved: from_json_or_null(row.get(8)?)?,
+        name_given: row.get(8)?,
+        moved: from_json_or_null(row.get(9)?)?,
     })
 }
 
 fn archived_of(row: &Row) -> Result<ArchivedSession> {
     Ok(ArchivedSession {
         session: session_of(row)?,
-        id: row.get(9)?,
-        worktree: from_json_or_null(row.get(10)?)?,
-        archived: row.get::<_, i64>(11)? as u64,
+        id: row.get(10)?,
+        worktree: from_json_or_null(row.get(11)?)?,
+        archived: row.get::<_, i64>(12)? as u64,
     })
 }
 
@@ -1198,6 +1272,7 @@ mod tests {
             goal: None,
             resume: None,
             about: Default::default(),
+            name_given: false,
             moved: None,
         }
     }
@@ -1300,14 +1375,19 @@ mod tests {
             url: "https://github.com/o/r/issues/7".into(),
             branch: None,
         }));
+        // A name the user gave stays theirs.
+        let named = SavedSession {
+            name_given: true,
+            ..saved("a")
+        };
         // One on its way into another worktree goes with where to.
-        let mut moving = saved("a");
+        let mut moving = saved("b");
         moving.cwd = PathBuf::from("/code/app.worktrees/fix");
         moving.moved = Some(crate::state::MovedTo {
             path: PathBuf::from("/code/app.worktrees/fix"),
             branch: Some("fix".into()),
         });
-        let sessions = vec![reported, task, moving];
+        let sessions = vec![reported, task, named, moving];
         db.save_sessions(&sessions).unwrap();
         assert_eq!(db.sessions().unwrap(), sessions);
 
@@ -1315,6 +1395,47 @@ mod tests {
         db.save_sessions(&sessions[..1]).unwrap();
         let other = Db::open(&socket_in(&dir)).unwrap();
         assert_eq!(other.sessions().unwrap(), &sessions[..1]);
+    }
+
+    #[test]
+    fn a_screen_is_kept_while_its_session_is_written_down() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Db::open(&socket_in(&dir)).unwrap();
+        let screen = |output: &str| Saved {
+            rows: 4,
+            cols: 20,
+            title: String::new(),
+            output: output.into(),
+        };
+        // Not for a session that isn't written down.
+        db.keep_screen("a", &screen("$ ls")).unwrap();
+        assert!(db.screen("a").unwrap().is_none());
+
+        db.save_sessions(&[saved("a"), saved("b")]).unwrap();
+        db.keep_screen("a", &screen("$ ls")).unwrap();
+        db.keep_screen("b", &screen("$ make")).unwrap();
+        db.keep_screen("a", &screen("$ ls -l")).unwrap();
+        assert_eq!(db.screen("a").unwrap().unwrap().output, "$ ls -l");
+        assert_eq!(db.screen("b").unwrap().unwrap().output, "$ make");
+
+        // Written down without it, a session's screen goes with it.
+        db.save_sessions(&[saved("b")]).unwrap();
+        assert!(db.screen("a").unwrap().is_none());
+        assert!(db.screen("b").unwrap().is_some());
+        db.forget_screen("b").unwrap();
+        assert!(db.screen("b").unwrap().is_none());
+        db.keep_screen("b", &screen("$ make")).unwrap();
+        db.forget_screens().unwrap();
+        assert!(db.screen("b").unwrap().is_none());
+        // Stopped by the user, nothing is written down, and nothing kept.
+        db.keep_screen("b", &screen("$ make")).unwrap();
+        db.save_sessions(&[]).unwrap();
+        let count = |db: &Db| -> i64 {
+            db.conn
+                .query_row("SELECT count(*) FROM screens", [], |row| row.get(0))
+                .unwrap()
+        };
+        assert_eq!(count(&db), 0);
     }
 
     #[test]
@@ -1600,6 +1721,7 @@ mod tests {
                     })),
                     ..Default::default()
                 },
+                name_given: true,
                 ..saved(name)
             },
             worktree: None,

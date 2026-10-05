@@ -32,7 +32,8 @@ reads it; agents write it with `crystal remember`.
 
 ## When something needs you
 
-A session waiting on you wears `▲` and is pinned at the top of the sidebar, in whichever tab it's in.
+A session waiting on you wears `▲` and is pinned at the top of the sidebar, in whichever tab it's in. So is
+one a crash or a reboot couldn't start again, saying why: put that right and `Enter` starts it.
 
 - `u` goes to the next one that needs you, and `U` lists everything that does, the most urgent first.
 - `y`, `n` and `Y` answer a background task asking for a permission: yes, no, always.
@@ -50,7 +51,7 @@ A session waiting on you wears `▲` and is pinned at the top of the sidebar, in
 | `n` `w` | A new session, or one in a new worktree |
 | `Space` | Reply to the selected session |
 | `u` | The next session that needs you |
-| `/` | Find a session, a worktree, a flow run or a pull request |
+| `/` | Find a session, a worktree, a flow run, a pull request, an issue or a backlog item |
 | `:` | Every command, by its name |
 | `\|` `-` | Split the pane, side by side or one above the other |
 | `z` | Zoom the pane to the whole screen, and back |

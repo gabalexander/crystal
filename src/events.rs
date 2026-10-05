@@ -283,8 +283,29 @@ impl TryFrom<String> for Kind {
     }
 }
 
+/// A kind in the API's schema: one of the names, each with when it happens.
+#[cfg(test)]
+impl schemars::JsonSchema for Kind {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "EventKind".into()
+    }
+
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        let kinds: Vec<serde_json::Value> = Kind::ALL
+            .into_iter()
+            .map(|kind| serde_json::json!({ "const": kind.name(), "description": kind.about() }))
+            .collect();
+        schemars::json_schema!({
+            "description": "What happened. A kind can be added, but never renamed or taken away.",
+            "type": "string",
+            "oneOf": kinds,
+        })
+    }
+}
+
 /// Something that happened. Only the fields its kind carries are there.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct Event {
     /// Its place in the log: 1 for the first event, and one more for each
     /// after it. The daemon gives it as it writes the event down.
@@ -342,6 +363,7 @@ pub struct Event {
 
 /// The session an event is about, as it was then.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct SessionAbout {
     pub name: String,
     pub id: String,
@@ -372,6 +394,7 @@ pub struct SessionAbout {
 /// the permissions it asks for and how they're answered, and how it went
 /// once it has ended.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct RunAbout {
     /// The first line of the task's prompt, or of a follow-up.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -397,6 +420,7 @@ pub struct RunAbout {
 
 /// A flow run, and the step an event is about.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct FlowAbout {
     /// The run's name: `ship-1`.
     pub run: String,
@@ -420,6 +444,7 @@ pub struct FlowAbout {
 
 /// A worktree crystal made or removed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct WorktreeAbout {
     pub path: PathBuf,
     pub branch: Option<String>,
@@ -433,6 +458,7 @@ pub struct WorktreeAbout {
 
 /// A note added to a worktree's handoff file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct HandoffAbout {
     /// The handoff file.
     pub path: PathBuf,
@@ -441,6 +467,7 @@ pub struct HandoffAbout {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct PluginAbout {
     pub name: String,
     pub why: String,
@@ -448,6 +475,7 @@ pub struct PluginAbout {
 
 /// A message a session was sent with `crystal send`, or from the TUI.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct MessageAbout {
     /// The session that sent it, by name, when another session did; `None`
     /// from the user, or a script.
@@ -465,6 +493,7 @@ pub struct MessageAbout {
 /// is the event's `from`. Or restarted cold: how many sessions it started
 /// again, and those that couldn't start, by name.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct DaemonAbout {
     pub version: String,
     pub sessions: usize,
@@ -475,6 +504,7 @@ pub struct DaemonAbout {
 /// A tool a background task's Claude used: its name, and the gist of what
 /// it was given, like the command it ran.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct ToolUse {
     pub name: String,
     pub gist: String,
@@ -484,6 +514,7 @@ pub struct ToolUse {
 /// added to the project's memory, found there already and turned down,
 /// and what it cost; or why it failed.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct DistillAbout {
     pub added: usize,
     pub again: usize,
@@ -1455,6 +1486,7 @@ pub fn example(kind: Kind, session: Option<&SessionInfo>, dir: &Path) -> Event {
 
 /// Which events a reader wants: every one, but for what it says.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct Filter {
     /// Names or patterns, the way a plugin's `on` takes them:
     /// `session.waiting`, `task.*`, `*`. None takes every kind.
@@ -1532,6 +1564,7 @@ impl Scope {
 
 /// Where in the log a reader starts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum Since {
     /// After the event with this `seq`: 0 for the whole log.

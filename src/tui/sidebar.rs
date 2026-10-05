@@ -339,41 +339,61 @@ fn row_line<'a>(app: &'a App, row: &Row, look: &Look, width: u16, selected: bool
             )
         }
         Row::PullRequest { project, number } => {
-            pull_request_line(app, project, *number, look, width, selected)
+            let Some((pull_request, marked)) = app.found_pull_request(project, *number) else {
+                return Line::default();
+            };
+            let label = (pull_request.label(), theme.muted);
+            let mark = pull_request_mark(pull_request.state(), theme);
+            let title = &pull_request.title;
+            found_line(label, title, &marked, mark, look, width, selected)
+        }
+        Row::Issue { project, number } => {
+            let Some((issue, marked)) = app.found_issue(project, *number) else {
+                return Line::default();
+            };
+            let label = (format!("#{}", issue.number), theme.done);
+            let mark = Some(("issue", theme.muted));
+            found_line(label, &issue.title, &marked, mark, look, width, selected)
+        }
+        Row::BacklogItem { project, number } => {
+            let Some((item, marked)) = app.found_backlog_item(project, *number) else {
+                return Line::default();
+            };
+            let label = (format!("#{}", item.number), theme.muted);
+            let mark = Some(("to do", theme.muted));
+            let text = item.text.lines().next().unwrap_or_default();
+            found_line(label, text, &marked, mark, look, width, selected)
         }
     }
 }
 
-/// An open pull request `/` found, under its project, in line with the
-/// worktrees: its number, its title with the letters the filter matched
-/// marked, and on the right the mark for what matters most about it.
-/// Short of room, the title is cut, down to a few letters before the mark
-/// goes.
-fn pull_request_line<'a>(
-    app: &App,
-    project: &Path,
-    number: u64,
+/// Something `/` found on a project's forge or backlog, under the
+/// project, in line with the worktrees: its number in its `label`'s color,
+/// its `title` with the letters the filter matched, `marked`, marked, and
+/// on the right its `mark`: for a pull request, what matters most about
+/// it; for an issue or a backlog item, what it is. Short of room, the title
+/// is cut, down to a few letters before the mark goes.
+fn found_line<'a>(
+    (label, label_color): (String, Color),
+    title: &str,
+    marked: &[usize],
+    mark: Option<(&'static str, Color)>,
     look: &Look,
     width: u16,
     selected: bool,
 ) -> Line<'a> {
     let theme = look.theme;
-    let Some((pull_request, marked)) = app.found_pull_request(project, number) else {
-        return Line::default();
-    };
-    let label = pull_request.label();
     // The indent, the number and a space before the title; a space at the
     // end.
     let room =
         usize::from(width).saturating_sub(WORKTREE_INDENT.len() + label.chars().count() + 1 + 1);
-    let mark = pull_request_mark(pull_request.state(), theme);
-    let title_width = pull_request.title.chars().count();
+    let title_width = title.chars().count();
     let mark = mark.filter(|(mark, _)| title_width.min(8) + 1 + mark.chars().count() <= room);
     let title_room = match mark {
         Some((mark, _)) => room - 1 - mark.chars().count(),
         None => room,
     };
-    let title = fit(&pull_request.title, title_room);
+    let title = fit(title, title_room);
     let mut title_style = Style::new().fg(theme.text);
     if selected {
         title_style = title_style.add_modifier(Modifier::BOLD);
@@ -383,11 +403,11 @@ fn pull_request_line<'a>(
         .add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
     let mut spans = vec![
         Span::raw(WORKTREE_INDENT),
-        Span::styled(label, Style::new().fg(theme.muted)),
+        Span::styled(label, Style::new().fg(label_color)),
         Span::raw(" "),
     ];
     let title_width = title.chars().count();
-    spans.extend(marked_spans(&title, &marked, title_style, marked_style));
+    spans.extend(marked_spans(&title, marked, title_style, marked_style));
     if let Some((mark, color)) = mark {
         let gap = room.saturating_sub(title_width + mark.chars().count());
         spans.push(Span::raw(" ".repeat(gap)));

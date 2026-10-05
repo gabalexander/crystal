@@ -32,6 +32,8 @@ pub enum Pane {
 
 /// Which way a split cuts its room.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+#[cfg_attr(test, schemars(rename = "SplitWay"))]
 #[serde(rename_all = "lowercase")]
 pub enum Way {
     /// Its second side to the right of its first, a rule between them.
@@ -44,6 +46,8 @@ pub enum Way {
 /// A way to go from a pane on screen: to the pane there, or to move a
 /// border.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+#[cfg_attr(test, schemars(rename = "PaneDirection"))]
 #[serde(rename_all = "lowercase")]
 pub enum Direction {
     Left,
