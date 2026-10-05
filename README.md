@@ -1767,22 +1767,27 @@ gives up when that runs out, with exit status 2; anything else that goes wrong, 
 as busy until it ends.
 
 `send --wait` waits for the turn the text starts, never one that ended before it: it listens to the session
-from before the text goes. An agent that wasn't working has five seconds from then to be seen starting on it,
-working, asking something, or its program ending; if it isn't, the prompt has stalled, and `send` fails with an
-error that starts `agent_prompt_stalled:`, with exit status 3, rather than taking what the agent said about its
-turn before for an answer. A stall doesn't prove the agent never got the text, which a turn too short to see
-can take, so `read` it before sending the text again. An agent working already takes the text once its turn
-is over, and that turn's end may be what ends the wait. A program that doesn't say what it's doing is waited on
-until it's seen starting or it ends, with no five seconds. `send-keys --wait` waits the five seconds for the
-turn the keys start too, then goes on either way: keys can start nothing to see, or carry on a turn its agent
-doesn't say it's working on, like an answer to a permission.
+from before the text goes, and looks at its screen once the text shows there. An agent that wasn't working has
+five seconds from then to be seen starting on it, working, asking something, or its program ending, or to change
+its screen. One whose screen changes took the text, though its turn wasn't seen: one too short to fall between
+two of crystal's looks, or one getting under way on a loaded machine. Once the five seconds are over and its
+screen has held still for two, the wait ends on how it stands. One that did neither, its screen as it was once
+the text went in, has stalled, and `send` fails with an error that starts `agent_prompt_stalled:`, with exit
+status 3, rather than taking what the agent said about its turn before for an answer. A stall doesn't prove the
+agent never got the text, which a turn shorter than the moment the screen is given to show it can take, so
+`read` it before sending the text again. An agent working already takes the text once its turn is over, and
+that turn's end may be what ends the wait. A program that doesn't say what it's doing is waited on until it's
+seen starting or it ends, or its screen changes and holds still. `send-keys --wait` waits for the turn the keys
+start the same way, but never stalls: keys that change nothing on the screen in five seconds end the wait on how
+the agent stands, as they can carry on a turn its agent doesn't say it's working on, like an answer to a
+permission.
 
 | Exit status | `wait`, `send --wait`, `send-keys --wait`, `task --wait`, `flow wait` |
 |---|---|
 | 0 | it got there, and printed where |
 | 1 | anything else went wrong: no such session, it ended or was killed first, a mistyped flag |
 | 2 | `--timeout` ran out first: not yet |
-| 3 | `send --wait` only: the agent was never seen starting on what it was sent (`agent_prompt_stalled:`) |
+| 3 | `send --wait` only: the agent was never seen starting on what it was sent, nor changed its screen (`agent_prompt_stalled:`) |
 
 An agent asking you something takes nothing `send` types, since the text would land in its question: `send`
 refuses with an error that starts `agent_blocked:`, saying what it asks and how to answer it, with `crystal

@@ -4071,12 +4071,14 @@ fn wait_gives_up_after_its_timeout() {
 fn send_wait_waits_for_the_turn_it_started() {
     let crystal = Crystal::new();
     // A pretend agent without hooks: for each line it's sent, it shows a
-    // spinner in its title while it works for a second, then answers, and
-    // the spinner goes: its answer is on screen once its turn is done.
+    // spinner in its title while it works for two seconds, then answers,
+    // and the spinner goes: its answer is on screen once its turn is done.
+    // Until its first turn is seen, it says nothing of what it's doing, so
+    // that one is long enough to be seen on a loaded machine.
     let script = r#"
         while read line; do
             printf '\033]0;⠋ working\007'
-            sleep 1
+            sleep 2
             echo "answer to $line"
             printf '\033]0;\007'
         done
@@ -4095,26 +4097,31 @@ fn send_wait_waits_for_the_turn_it_started() {
 #[test]
 fn send_wait_fails_when_the_agent_never_starts_on_what_it_was_sent() {
     let crystal = Crystal::new();
-    // An agent its hooks say is done with a turn, which takes nothing it's
-    // sent after it.
-    crystal.ok(&["new", "-n", "agent", "sleep", "30"]);
     let hook = format!("'{CRYSTAL}' hook claude");
     let submit = r#"{"hook_event_name":"UserPromptSubmit"}"#;
+    let stop = r#"{"hook_event_name":"Stop"}"#;
+    // An agent its hooks say is done with a turn, which takes nothing it's
+    // sent after it, nor shows it: its terminal doesn't echo.
+    crystal.ok(&[
+        "new",
+        "-n",
+        "agent",
+        "sh",
+        "-c",
+        "stty -echo; exec sleep 30",
+    ]);
     run_hook(&crystal, "agent", &hook, submit);
-    run_hook(&crystal, "agent", &hook, r#"{"hook_event_name":"Stop"}"#);
+    run_hook(&crystal, "agent", &hook, stop);
     eventually("the agent is done", || status(&crystal, "agent") == "done");
 
-    // Its turn before ends nothing: five seconds on, the prompt has
-    // stalled, which exits 3.
+    // Its turn before ends nothing: five seconds on, its screen as it was,
+    // the prompt has stalled, which exits 3.
     let out = crystal.run(&["send", "agent", "hello", "--wait"]);
     let err = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(3), "{err}");
-    assert!(
-        err.contains(
-            "agent_prompt_stalled: agent didn't start on what it was sent: 5s on, it's done"
-        ),
-        "{err}"
-    );
+    let stalled = "agent_prompt_stalled: agent didn't start on what it was sent: 5s on, it's \
+                   done, its screen as it was once the text went in";
+    assert!(err.contains(stalled), "{err}");
     assert!(
         err.contains("`crystal read agent` before sending it again"),
         "{err}"
@@ -4126,20 +4133,83 @@ fn send_wait_fails_when_the_agent_never_starts_on_what_it_was_sent() {
     assert_eq!(out.status.code(), Some(2));
 
     // One already working takes it after its turn, whose end ends the wait.
-    run_hook(&crystal, "agent", &hook, submit);
-    eventually("the agent works", || status(&crystal, "agent") == "working");
+    crystal.ok(&["new", "-n", "busy", "sleep", "30"]);
+    run_hook(&crystal, "busy", &hook, submit);
+    eventually("busy works", || status(&crystal, "busy") == "working");
     let waiting = crystal
-        .command(&["send", "agent", "queued", "--wait"])
+        .command(&["send", "busy", "queued", "--wait"])
         .stdout(Stdio::piped())
         .spawn()
         .unwrap();
     // It types only once it has seen the agent working: the turn ends after
     // that, or the send would find it done, and stall.
-    shows_on_screen(&crystal, "agent", "queued");
-    run_hook(&crystal, "agent", &hook, r#"{"hook_event_name":"Stop"}"#);
+    shows_on_screen(&crystal, "busy", "queued");
+    run_hook(&crystal, "busy", &hook, stop);
     let out = waiting.wait_with_output().unwrap();
     assert!(out.status.success());
     assert_eq!(String::from_utf8(out.stdout).unwrap(), "done\n");
+}
+
+#[test]
+fn send_wait_waits_through_a_turn_held_for_subagents() {
+    let crystal = Crystal::new();
+    let hook = format!("'{CRYSTAL}' hook claude");
+    let says = |event: &str| run_hook(&crystal, "lead", &hook, event);
+    let submit = r#"{"hook_event_name":"UserPromptSubmit"}"#;
+    let stop = r#"{"hook_event_name":"Stop"}"#;
+    crystal.ok(&["new", "-n", "lead", "sleep", "30"]);
+    says(submit);
+    says(stop);
+    eventually("lead is done", || status(&crystal, "lead") == "done");
+
+    let mut waiting = crystal
+        .command(&["send", "lead", "explore", "--wait"])
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    shows_on_screen(&crystal, "lead", "explore");
+    says(submit);
+    // Its turn ends with a subagent still running: held, it works on, and
+    // the wait with it.
+    says(r#"{"hook_event_name":"SubagentStart","agent_id":"a1","agent_type":"Explore"}"#);
+    says(stop);
+    assert_eq!(status(&crystal, "lead"), "working");
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        waiting.try_wait().unwrap().is_none(),
+        "the wait ended early"
+    );
+
+    // The subagent done, the agent's own turn after it is the end of its work.
+    says(r#"{"hook_event_name":"SubagentStop","agent_id":"a1"}"#);
+    says(r#"{"hook_event_name":"PostToolUse"}"#);
+    says(stop);
+    let out = waiting.wait_with_output().unwrap();
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8(out.stdout).unwrap(), "done\n");
+}
+
+#[test]
+fn send_wait_takes_a_turn_too_short_to_see_from_what_its_screen_shows() {
+    let crystal = Crystal::new();
+    let hook = format!("'{CRYSTAL}' hook claude");
+    // An agent its hooks say is done, which answers what it's sent a moment
+    // later without ever saying it's working: as an agent whose whole turn
+    // falls between two looks at its screen, on a loaded machine.
+    let script = "stty -echo; while read line; do sleep 1; echo \"answer to $line\"; done";
+    crystal.ok(&["new", "-n", "quick", "sh", "-c", script]);
+    run_hook(
+        &crystal,
+        "quick",
+        &hook,
+        r#"{"hook_event_name":"UserPromptSubmit"}"#,
+    );
+    run_hook(&crystal, "quick", &hook, r#"{"hook_event_name":"Stop"}"#);
+    eventually("quick is done", || status(&crystal, "quick") == "done");
+
+    // Its screen changed: it took the prompt, and its turn is over.
+    assert_eq!(crystal.ok(&["send", "quick", "first", "--wait"]), "done\n");
+    assert!(crystal.ok(&["read", "quick"]).contains("answer to first"));
 }
 
 #[test]

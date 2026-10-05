@@ -52,9 +52,10 @@ a background task too, once its run ends.
 crystal send reviewer "Now check the tests too" --wait
 ```
 
-`--wait` waits for the turn that text starts, then prints how it ended. An agent not seen starting on it
-within five seconds has stalled: `send` fails with an error starting `agent_prompt_stalled:` and exits 3. It
-may have taken the text all the same, so `read` it before sending it again. Then read the answer:
+`--wait` waits for the turn that text starts, then prints how it ended. An agent neither seen starting on it
+nor changing its screen within five seconds has stalled: `send` fails with an error starting
+`agent_prompt_stalled:` and exits 3. It may have taken the text all the same, so `read` it before sending it
+again. Then read the answer:
 
 ```sh
 crystal read reviewer --lines 40

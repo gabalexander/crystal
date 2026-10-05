@@ -24,13 +24,29 @@ use crate::tasks;
 use anyhow::{Context, Result, bail, ensure};
 use std::fmt;
 use std::path::Path;
+use std::thread;
 use std::time::{Duration, Instant};
 
 /// How long `send --wait` gives an agent that wasn't working to be seen
-/// starting on what it was sent: past it, the prompt has stalled. For keys,
-/// and a new task's run, which may be over before it's seen starting, the
-/// wait goes on to the end of the turn either way.
+/// starting on what it was sent, or to change its screen: past it, the
+/// prompt has stalled. For keys, and a new task's run, which may be over
+/// before it's seen starting, the wait goes on to the end of the turn
+/// either way.
 const START_GRACE: Duration = Duration::from_secs(5);
+
+/// How long the screen is given to show what was just sent: it's looked at
+/// until it holds still, this long at most. A change from how it shows
+/// then is the agent's doing.
+const LANDING: Duration = Duration::from_secs(1);
+
+/// How often a screen is looked at while it's all there is to go by.
+const LOOK_EVERY: Duration = Duration::from_millis(200);
+
+/// How long the screen of an agent that has taken what it was sent, but
+/// wasn't seen starting on it, must then hold still for its turn to be
+/// over: one too short to fall between two looks at its screen, or one
+/// getting under way on a loaded machine, whose work shows first.
+const STILL_FOR: Duration = Duration::from_secs(2);
 
 /// How long a wait for a task to close gives it once its session has ended
 /// with it open: the daemon fails it as it sees the session end, a moment
@@ -372,8 +388,9 @@ impl<'a> Turn<'a> {
     /// Waits for the turn a prompt just sent starts to end, and prints how
     /// it ended. Whatever the agent said about the turn before ends nothing:
     /// one that wasn't working has [`START_GRACE`] to be seen starting on
-    /// the prompt, or it has [`Stalled`]. One that was takes the prompt
-    /// once its turn is over, and that turn's end may be the wait's.
+    /// the prompt, or to change its screen, or it has [`Stalled`]. One that
+    /// was takes the prompt once its turn is over, and that turn's end may
+    /// be the wait's.
     fn prompted(self, timeout: Option<Duration>) -> Result<()> {
         let name = self.watch.name;
         match self.settled(deadline(timeout), true)? {
@@ -383,10 +400,10 @@ impl<'a> Turn<'a> {
     }
 
     /// Waits for the turn keys just pressed start or carry on to end, and
-    /// prints how it ended, as [`Turn::prompted`] does; but keys can start
-    /// nothing there's to see, like a move through a menu, or carry on a
-    /// turn its agent doesn't say it's working on, like an answer to a
-    /// permission, so after [`START_GRACE`] the wait goes on either way.
+    /// prints how it ended, as [`Turn::prompted`] does; but keys can carry
+    /// on a turn its agent doesn't say it's working on, like an answer to a
+    /// permission, so keys that change nothing on its screen in
+    /// [`START_GRACE`] end the wait on how it stands then, never a stall.
     fn pressed(self, timeout: Option<Duration>) -> Result<()> {
         let name = self.watch.name;
         match self.settled(deadline(timeout), false)? {
@@ -396,40 +413,91 @@ impl<'a> Turn<'a> {
     }
 
     /// What the session settles on once the turn is over, or `None` after
-    /// `deadline`. With `stalls`, a turn not seen starting in time is a
-    /// [`Stalled`].
+    /// `deadline`. The turn has started once it's seen to, or once the
+    /// screen has changed from how it showed what was sent; then, past
+    /// [`START_GRACE`], held still for [`STILL_FOR`], it's over. With
+    /// `stalls`, an agent that says what it's doing, seen to do nothing with
+    /// it, its screen unchanged, has [`Stalled`].
     fn settled(mut self, deadline: Option<Instant>, stalls: bool) -> Result<Option<String>> {
+        if self.before == Some(Activity::Working) {
+            return self.watch.settle(deadline);
+        }
         let grace_over = Instant::now() + START_GRACE;
-        match self.before {
-            Some(Activity::Working) => {}
+        let landed = self.watch.landed(deadline)?;
+        match self.watch.taken(landed, grace_over, deadline)? {
+            None => return Ok(None),
+            Some(Taken::Seen | Taken::Unseen) => {}
             // A program that doesn't say what it's doing, or an agent that
             // hasn't yet: busy until it's seen starting, or until it ends.
-            None => {
+            Some(Taken::Unmoved) if self.before.is_none() => {
                 if self.watch.hear(&STARTED, deadline)?.is_none() {
                     return Ok(None);
                 }
             }
-            Some(_) => {
-                let by = deadline.map_or(grace_over, |deadline| deadline.min(grace_over));
-                if self.watch.hear(&STARTED, Some(by))?.is_none() {
-                    if by < grace_over {
-                        return Ok(None);
-                    }
-                    if stalls {
-                        let name = self.watch.name;
-                        let status = self.watch.now()?.status();
-                        let seconds = START_GRACE.as_secs();
-                        return Err(Stalled(format!(
-                            "agent_prompt_stalled: {name} didn't start on what it was sent: \
-                             {seconds}s on, it's {status}. It may have taken it all the same: \
-                             `crystal read {name}` before sending it again"
-                        ))
-                        .into());
-                    }
-                }
+            Some(Taken::Unmoved) if stalls => {
+                let name = self.watch.name;
+                let status = self.watch.now()?.status();
+                let seconds = START_GRACE.as_secs();
+                return Err(Stalled(format!(
+                    "agent_prompt_stalled: {name} didn't start on what it was sent: {seconds}s \
+                     on, it's {status}, its screen as it was once the text went in. It may have \
+                     taken it all the same: `crystal read {name}` before sending it again"
+                ))
+                .into());
             }
+            Some(Taken::Unmoved) => {}
         }
         self.watch.settle(deadline)
+    }
+}
+
+/// Whether an agent has taken what it was just sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Taken {
+    /// It was seen starting on it: working, asking something, or ending.
+    Seen,
+    /// It wasn't, but its screen changed, then held still: its turn went
+    /// by between two looks, or showed only on its screen.
+    Unseen,
+    /// Neither, past [`START_GRACE`].
+    Unmoved,
+}
+
+/// What a session's screen has done since what was sent to it showed,
+/// while that's all there is to go by.
+#[derive(Debug)]
+struct Moves {
+    screen: Vec<String>,
+    moved: bool,
+    /// When it was last seen changing, or first looked at.
+    still_since: Instant,
+}
+
+impl Moves {
+    fn new(landed: Vec<String>, now: Instant) -> Moves {
+        Moves {
+            screen: landed,
+            moved: false,
+            still_since: now,
+        }
+    }
+
+    /// Takes in the screen as it is at `now`, and says what comes of it,
+    /// if it's time to: nothing before `grace_over`.
+    fn look(&mut self, screen: Vec<String>, now: Instant, grace_over: Instant) -> Option<Taken> {
+        if screen != self.screen {
+            self.screen = screen;
+            self.moved = true;
+            self.still_since = now;
+        }
+        if now < grace_over {
+            return None;
+        }
+        if !self.moved {
+            return Some(Taken::Unmoved);
+        }
+        let still = now.saturating_duration_since(self.still_since) >= STILL_FOR;
+        still.then_some(Taken::Unseen)
     }
 }
 
@@ -715,6 +783,65 @@ impl<'a> Watch<'a> {
         Ok(Standing::of_session(&self.now()?))
     }
 
+    /// What the session's screen shows now, a row each.
+    fn screen(&self) -> Result<Vec<String>> {
+        // By its name now: Claude Code can rename it as it takes a prompt.
+        let request = Request::Read {
+            name: self.now()?.name,
+            history: false,
+            unwrap: false,
+            ansi: false,
+            since_ms: None,
+        };
+        let Response::Screen { rows } = ask(self.socket, &request)? else {
+            bail!("the daemon didn't send the screen");
+        };
+        Ok(rows)
+    }
+
+    /// The session's screen once what was just sent to it has had a moment
+    /// to show: looked at until it holds still, for [`LANDING`] at most, or
+    /// until `deadline`.
+    fn landed(&self, deadline: Option<Instant>) -> Result<Vec<String>> {
+        let landing = Instant::now() + LANDING;
+        let until = deadline.map_or(landing, |deadline| deadline.min(landing));
+        let mut screen = self.screen()?;
+        while Instant::now() < until {
+            thread::sleep(LOOK_EVERY);
+            let again = self.screen()?;
+            if again == screen {
+                break;
+            }
+            screen = again;
+        }
+        Ok(screen)
+    }
+
+    /// Waits until the session's agent has taken what was just sent to it,
+    /// its screen showing it as `landed`, as [`Moves`] tells, looking at
+    /// the screen between events; `None` once `deadline` has passed.
+    fn taken(
+        &mut self,
+        landed: Vec<String>,
+        grace_over: Instant,
+        deadline: Option<Instant>,
+    ) -> Result<Option<Taken>> {
+        let mut moves = Moves::new(landed, Instant::now());
+        loop {
+            let look = Instant::now() + LOOK_EVERY;
+            let by = deadline.map_or(look, |deadline| deadline.min(look));
+            if self.hear(&STARTED, Some(by))?.is_some() {
+                return Ok(Some(Taken::Seen));
+            }
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                return Ok(None);
+            }
+            if let Some(taken) = moves.look(self.screen()?, Instant::now(), grace_over) {
+                return Ok(Some(taken));
+            }
+        }
+    }
+
     /// Waits until the session settles, as [`settled`] says, looking again
     /// after each event about it; `None` once `deadline` has passed.
     fn settle(&mut self, deadline: Option<Instant>) -> Result<Option<String>> {
@@ -992,6 +1119,37 @@ mod tests {
         assert_eq!(Until::of_event(Kind::SessionWaiting), Some(Until::Waiting));
         assert_eq!(Until::of_event(Kind::SessionRenamed), None);
         assert_eq!(words(&[Until::Waiting, Until::Done]), "waiting or done");
+    }
+
+    #[test]
+    fn a_screen_that_changes_after_a_send_took_it_once_it_holds_still() {
+        let start = Instant::now();
+        let at = |ms| start + Duration::from_millis(ms);
+        let grace_over = at(5000);
+        let landed = rows(&["> fix it"]);
+
+        // Nothing comes of a look before the grace is over; past it, a
+        // screen just as it was once the text went in took nothing.
+        let mut moves = Moves::new(landed.clone(), start);
+        assert_eq!(moves.look(landed.clone(), at(1000), grace_over), None);
+        let unmoved = moves.look(landed.clone(), at(5000), grace_over);
+        assert_eq!(unmoved, Some(Taken::Unmoved));
+
+        // A turn too short to see, over well before the grace is.
+        let mut moves = Moves::new(landed.clone(), start);
+        let answered = rows(&["> fix it", "fixed"]);
+        assert_eq!(moves.look(answered.clone(), at(1000), grace_over), None);
+        let unseen = moves.look(answered, at(5000), grace_over);
+        assert_eq!(unseen, Some(Taken::Unseen));
+
+        // One still drawing past the grace is waited on until it holds
+        // still, even back to how it was.
+        let mut moves = Moves::new(landed.clone(), start);
+        assert_eq!(moves.look(rows(&["⠋"]), at(4900), grace_over), None);
+        assert_eq!(moves.look(landed.clone(), at(5200), grace_over), None);
+        assert_eq!(moves.look(landed.clone(), at(7000), grace_over), None);
+        let still = moves.look(landed, at(7200), grace_over);
+        assert_eq!(still, Some(Taken::Unseen));
     }
 
     /// A task, numbered 12, as `outcome` says it went: open with `None`.
