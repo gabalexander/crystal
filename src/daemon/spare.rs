@@ -187,7 +187,7 @@ impl Daemon {
         }
     }
 
-    /// The warm agent's program, for the RAM view.
+    /// The warm agent's program, for the resources view.
     pub(super) fn spare_pid(&self) -> Option<u32> {
         self.spare.lock().unwrap().as_ref()?.session.running_pid()
     }

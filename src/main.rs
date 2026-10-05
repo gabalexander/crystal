@@ -89,6 +89,7 @@ mod transcript;
 mod tui;
 mod typing;
 mod update;
+mod usage_cli;
 mod viewer;
 mod vt;
 mod work;
@@ -486,6 +487,21 @@ enum Command {
         /// List the archived sessions instead.
         #[arg(long)]
         archived: bool,
+    },
+    /// Print what crystal's processes take, memory and CPU, as the TUI's
+    /// `#` shows it: each session's program with every process under it,
+    /// the daemon and the processes it runs, the agent kept warm, and the
+    /// totals. CPU is in percent of one core, 100% being one core busy,
+    /// since the daemon last looked, or over half a second when it hasn't
+    /// lately.
+    Usage {
+        /// Print it as JSON, for scripts and agents.
+        #[arg(long)]
+        json: bool,
+
+        /// What the sessions go by, the biggest first.
+        #[arg(long, value_enum, default_value_t)]
+        sort: usage_cli::Sort,
     },
     /// Lay out the TUI's tabs: make one, go to one, name one, close one, or
     /// move a session to one. The TUI used last does it.
@@ -2513,6 +2529,7 @@ fn run(cli: Cli) -> Result<()> {
                 print_archived(&archived)?;
             }
         }
+        Command::Usage { json, sort } => usage_cli::run(&socket, json, sort)?,
         Command::Ls { json, .. } => {
             // Without a daemon, there are no sessions.
             let sessions = match client::ask(&socket, &Request::List, false)? {

@@ -1903,7 +1903,7 @@ fn q_asks_before_it_quits_unless_the_settings_say_not_to() {
 }
 
 #[test]
-fn hash_shows_the_memory_each_session_takes() {
+fn hash_shows_the_memory_and_cpu_each_session_takes() {
     let crystal = Crystal::new();
     crystal.ok(&["new", "-n", "stays", "sleep", "30"]);
     crystal.ok(&["new", "-n", "other", "sleep", "30"]);
@@ -1911,11 +1911,19 @@ fn hash_shows_the_memory_each_session_takes() {
     let mut tui = crystal.tui();
     tui.shows("❯ stays");
     tui.type_keys("#");
-    tui.shows(" RAM · ");
+    tui.shows(" Resources · RAM ");
+    tui.shows(" of a core");
+    tui.shows("RAM↓");
     tui.shows("1 process");
     tui.shows("crystal itself");
     tui.shows("the daemon");
     tui.shows("this TUI");
+    // `s` puts the busiest first, and back.
+    tui.type_keys("s");
+    tui.shows("CPU↓");
+    tui.shows("s by RAM");
+    tui.type_keys("s");
+    tui.shows("RAM↓");
     // Enter goes to the session the bar is on.
     tui.type_keys("j\r");
     tui.hides("crystal itself");
@@ -8693,6 +8701,54 @@ fn ls_json_lists_every_session_with_its_status() {
     assert!(worker["pid"].as_u64().is_some());
     assert!(worker["cwd"].as_str().is_some());
     assert_eq!(sessions[1]["status"], "exited 3");
+}
+
+#[test]
+fn usage_counts_each_session_s_memory_and_cpu_and_crystal_s_own() {
+    let crystal = Crystal::new();
+    let said = crystal.fails(&["usage"]);
+    assert!(said.contains("no daemon is running"), "{said}");
+
+    crystal.ok(&["new", "-n", "busy", "sh", "-c", "while :; do :; done"]);
+    crystal.ok(&["new", "-n", "idle", "sleep", "30"]);
+    // The daemon hasn't looked before: it looks twice, half a second apart.
+    let json = crystal.ok(&["usage", "--json"]);
+    let usage: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert!(usage["cpu_over_ms"].as_u64().unwrap() >= 500, "{json}");
+    let session = |name: &str| {
+        let sessions = usage["sessions"].as_array().unwrap();
+        let found = sessions.iter().find(|session| session["name"] == name);
+        found.unwrap()["usage"].clone()
+    };
+    let (busy, idle) = (session("busy"), session("idle"));
+    assert_eq!(busy["pid"], crystal.pid("busy"));
+    assert_eq!(idle["pid"], crystal.pid("idle"));
+    assert!(busy["bytes"].as_u64().unwrap() > 0, "{json}");
+    assert!(busy["processes"].as_u64().unwrap() >= 1, "{json}");
+    // A shell spinning keeps a core busy, as much of it as the machine
+    // gives it; `sleep` keeps none.
+    assert!(busy["cpu"].as_f64().unwrap() > 10.0, "{json}");
+    assert!(idle["cpu"].as_f64().unwrap() < busy["cpu"].as_f64().unwrap());
+    assert!(usage["daemon"]["bytes"].as_u64().unwrap() > 0, "{json}");
+    assert!(usage["machine"]["cores"].as_u64().unwrap() > 0, "{json}");
+    assert!(usage["machine"]["bytes"].as_u64().unwrap() > 0, "{json}");
+    let (own, all) = (&usage["crystal"], &usage["all"]);
+    assert!(all["bytes"].as_u64() > own["bytes"].as_u64(), "{json}");
+    assert!(all["processes"].as_u64().unwrap() >= 3, "{json}");
+
+    // The table, the busiest first.
+    let table = crystal.ok(&["usage", "--sort", "cpu"]);
+    let lines: Vec<Vec<&str>> = table
+        .lines()
+        .map(|line| line.split_whitespace().collect())
+        .collect();
+    assert_eq!(lines[0], ["NAME", "KIND", "PID", "PROCESSES", "RAM", "CPU"]);
+    assert_eq!(lines[1][..2], ["busy", "session"], "{table}");
+    assert!(
+        lines.iter().any(|line| line[..2] == ["crystal", "daemon"]),
+        "{table}"
+    );
+    assert_eq!(lines.last().unwrap()[..2], ["all", "total"], "{table}");
 }
 
 #[test]

@@ -209,8 +209,9 @@ pub enum Request {
     },
     /// What background tasks have spent today, and the daily budget.
     Spending,
-    /// The memory each running session's processes take, the daemon's
-    /// own, and the asking client's, whose process is `client`.
+    /// The memory and CPU each running session's processes take, the
+    /// daemon's own and its helpers', and the asking client's, whose
+    /// process is `client`.
     Resources {
         #[serde(default)]
         client: Option<u32>,

@@ -1406,8 +1406,8 @@ fn draw_footer(frame: &mut Frame, app: &App, panes: &[Pane], look: &Look, area: 
     } else if let Some(view) = app.needs_you_view() {
         let hints = as_keys_are(app, needs_you::hints(view), true);
         draw_notice_or(frame, app.notice(), &borrowed(&hints), theme, area);
-    } else if app.ram_view().is_some() {
-        let hints = as_keys_are(app, ram_view::HINTS, false);
+    } else if let Some(view) = app.ram_view() {
+        let hints = as_keys_are(app, ram_view::hints(view), false);
         draw_notice_or(frame, app.notice(), &borrowed(&hints), theme, area);
     } else if let Some(view) = app.timeline_view() {
         draw_notice_or(frame, app.notice(), timeline::hints(view), theme, area);
@@ -2122,7 +2122,7 @@ fn draw_shown_key(frame: &mut Frame, app: &App, theme: &Theme, footer: Rect) {
 /// key: from the sidebar only, since in a pane `?` goes to the program.
 fn footer_right<'a>(app: &App, readout: Option<&str>, theme: &Theme) -> Line<'a> {
     let mut spans = Vec::new();
-    // What crystal takes, which a click on opens the RAM view.
+    // What crystal takes, which a click on opens the resources view.
     if let Some(readout) = readout {
         spans.push(Span::styled(
             readout.to_string(),
