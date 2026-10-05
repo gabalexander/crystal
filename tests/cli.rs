@@ -9282,6 +9282,102 @@ fn memory_lists_by_kind_by_title_and_what_was_forgotten() {
 }
 
 #[test]
+fn memory_puts_lessons_first_lets_status_go_in_bulk_and_expires_notes_nobody_finds() {
+    let (crystal, repo) = crystal_remembering();
+    let repo_dir = repo.to_str().unwrap();
+    let memory = |args: &[&str]| crystal.ok(&[&["memory", "-C", repo_dir], args].concat());
+    crystal.ok(&["remember", "-C", repo_dir, "The ledger flakes on refunds"]);
+    crystal.ok(&[
+        "remember",
+        "-C",
+        repo_dir,
+        "-k",
+        "gotcha",
+        "The ledger needs redis",
+    ]);
+    crystal.ok(&[
+        "remember",
+        "-C",
+        repo_dir,
+        "PR #12 squash-merged into master as 8012b6c",
+    ]);
+    crystal.ok(&[
+        "remember",
+        "-C",
+        repo_dir,
+        "-k",
+        "decision",
+        "Fees in cents",
+    ]);
+    let ids = |listed: String| -> Vec<String> {
+        let ids = listed.lines().map(|line| line.split_whitespace().next());
+        ids.map(|id| id.unwrap().to_string()).collect()
+    };
+
+    // The note says more of what's asked, but the lesson comes first,
+    // unless what's asked is what was done.
+    assert_eq!(
+        ids(memory(&["search", "ledger", "flakes", "refunds"])),
+        ["2", "1"]
+    );
+    let done = memory(&["search", "what", "happened", "to", "ledger", "refunds"]);
+    assert_eq!(ids(done), ["1", "2"]);
+
+    // What reads as status is listed, and goes only once --yes says so.
+    let status = memory(&["list", "--status"]);
+    assert_eq!(ids(status.clone()), ["3"]);
+    let dry = memory(&["rm", "--status"]);
+    assert_eq!(
+        dry,
+        format!("{status}would forget these 1: add --yes to forget them\n")
+    );
+    assert!(memory(&["list"]).contains("squash-merged"));
+    let forgot = memory(&["rm", "--status", "--yes"]);
+    assert!(forgot.starts_with("forgot 3: PR #12"), "{forgot}");
+    assert_eq!(memory(&["list", "--status"]), "");
+    assert_eq!(memory(&["rm", "--status"]), "nothing reads as status\n");
+
+    // A note nobody found again expires, kept and marked; a lesson doesn't.
+    let db = crystal.socket.with_file_name("memory").join("memory.db");
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.busy_timeout(Duration::from_secs(5)).unwrap();
+    conn.execute(
+        "UPDATE entries SET created = created - 3456000, last_seen = last_seen - 3456000",
+        [],
+    )
+    .unwrap();
+    assert_eq!(ids(memory(&["search", "ledger", "refunds"])), ["2"]);
+    let all = memory(&["search", "ledger", "refunds", "--all"]);
+    assert!(
+        all.contains("The ledger flakes on refunds  [expired]"),
+        "{all}"
+    );
+    assert_eq!(ids(memory(&["list", "--expired"])), ["1"]);
+    let listed = memory(&["list"]);
+    assert!(listed.contains("Fees in cents\n"), "{listed}");
+    // Read in full by an agent, it's found again.
+    let show = serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                                  "params": {"name": "memory_show", "arguments": {"id": 1}}});
+    let replies = mcp(&crystal, &repo, &[show]);
+    let shown = replies[0]["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        shown.ends_with("an agent read it in full just now"),
+        "{shown}"
+    );
+    assert_eq!(ids(memory(&["search", "ledger", "refunds"])), ["2", "1"]);
+    assert_eq!(memory(&["list", "--expired"]), "");
+
+    // Several go at once, once every one is there.
+    let missing = crystal.fails(&["memory", "-C", repo_dir, "rm", "2", "9"]);
+    assert!(missing.contains("there's no entry 9"), "{missing}");
+    let forgot = memory(&["rm", "2", "4"]);
+    assert_eq!(
+        forgot,
+        "forgot 2: The ledger needs redis\nforgot 4: Fees in cents\n"
+    );
+}
+
+#[test]
 fn search_by_meaning_without_its_model_goes_by_words_and_says_how_to_get_it() {
     let (crystal, repo) = crystal_remembering();
     crystal.configure("notify = false\n\n[memory]\nembeddings = true\ndistill = false\n");

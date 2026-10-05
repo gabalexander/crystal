@@ -64,16 +64,23 @@ pub fn remember(
     Ok(())
 }
 
-/// Prints the project's memory, newest first: of `kind` alone if it's
-/// given, or with `forgotten`, what was forgotten instead, the latest
-/// forgotten first.
-pub fn list(
-    socket: &Path,
-    dir: Option<PathBuf>,
-    kind: Option<Kind>,
-    forgotten: bool,
-) -> Result<()> {
-    if forgotten {
+/// Which of a project's entries `crystal memory list` lists.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Listing {
+    /// Of this kind alone.
+    pub kind: Option<Kind>,
+    /// What was forgotten instead, the latest forgotten first.
+    pub forgotten: bool,
+    /// Those that read as status rather than lessons: see [`is_status`].
+    pub status: bool,
+    /// The expired alone.
+    pub expired: bool,
+}
+
+/// Prints the project's memory, newest first, as `listing` says.
+pub fn list(socket: &Path, dir: Option<PathBuf>, listing: Listing) -> Result<()> {
+    let kind = listing.kind;
+    if listing.forgotten {
         check_on()?;
         let project = memory::project_of(&dir_or_current(dir)?);
         let forgotten = Store::open(socket)?.forgotten(&project)?;
@@ -87,21 +94,38 @@ pub fn list(
     }
     let memory = read(socket, dir)?;
     let listed = memory.listed();
+    let now = now();
     let listed: Vec<&Listed> = listed
         .iter()
         .filter(|item| kind.is_none_or(|kind| item.entry.kind == kind))
+        .filter(|item| !listing.status || is_status(&item.entry))
+        .filter(|item| !listing.expired || item.entry.expired(now))
         .collect();
     print_entries(&listed)
 }
 
-/// Prints entry `id` in full.
+/// Whether `entry` reads as progress or status rather than a lesson, by
+/// [`memory::reads_as_status`]: tasks' outcomes, all status, have a kind
+/// of their own to list them by, and expire, so they aren't counted.
+fn is_status(entry: &Entry) -> bool {
+    entry.kind != Kind::Outcome && memory::reads_as_status(&entry.text)
+}
+
+/// Prints entry `id` in full. An agent in a session reading it uses it,
+/// which keeps it from expiring.
 pub fn show(socket: &Path, dir: Option<PathBuf>, id: u64) -> Result<()> {
-    let memory = read(socket, dir)?;
-    let Some(entry) = memory.get(id) else {
+    check_on()?;
+    let project = memory::project_of(&dir_or_current(dir)?);
+    let mut store = Store::open(socket)?;
+    let entry = match env::own_session_id(socket) {
+        Some(_) => store.used(&project, id)?,
+        None => store.get(&project, id)?,
+    };
+    let Some(entry) = entry else {
         bail!("there's no entry {id}");
     };
-    let freshness = memory::freshness(entry, &memory.project);
-    outln!("{}", in_full(entry, freshness, now()))?;
+    let freshness = memory::freshness(&entry, &project);
+    outln!("{}", in_full(&entry, freshness, now()))?;
     Ok(())
 }
 
@@ -122,13 +146,14 @@ pub struct SearchArgs {
     pub kind: Option<Kind>,
     /// Files or directories, as given from the current directory.
     pub files: Vec<String>,
-    /// Stale entries too.
+    /// Stale and expired entries too.
     pub all: bool,
     pub limit: Option<usize>,
 }
 
 /// Prints the entries that have to do with `words`, the best first, as
-/// `args` says: those that are stale left out, unless it says all.
+/// `args` says: those that are stale or expired left out, unless it says
+/// all.
 pub fn search(
     socket: &Path,
     dir: Option<PathBuf>,
@@ -154,6 +179,7 @@ pub fn search(
             .map(|file| from_top(file, &dir, &top))
             .collect(),
         fresh: !args.all,
+        expired: args.all,
         limit: args.limit.unwrap_or(memory::SEARCH_LIMIT).max(1),
     };
     let found = found(socket, &dir, &words.join(" "), &wanted)?;
@@ -179,15 +205,61 @@ pub fn found(socket: &Path, dir: &Path, query: &str, wanted: &Wanted) -> Result<
     store.find(&project, query, wanted, embed::as_embed(&embedder))
 }
 
-pub fn remove(socket: &Path, dir: Option<PathBuf>, id: u64) -> Result<()> {
+/// Which entries `crystal memory rm` forgets.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Forgetting {
+    /// These, by their ids.
+    pub ids: Vec<u64>,
+    /// Every one that reads as status, as `list --status` lists them, of
+    /// `kind` if it's given.
+    pub status: bool,
+    pub kind: Option<Kind>,
+    /// With `status`, forget them: without it, they're only listed, as what
+    /// would be forgotten.
+    pub yes: bool,
+}
+
+/// Forgets the entries `forgetting` says, and says which: each of its ids,
+/// once every one is there, or with `status`, every entry that reads as
+/// status, listed first and forgotten only once it says yes.
+pub fn remove(socket: &Path, dir: Option<PathBuf>, forgetting: Forgetting) -> Result<()> {
     check_on()?;
     let project = memory::project_of(&dir_or_current(dir)?);
-    let entry = memory::remove(socket, &project, id)?;
-    outln!("forgot {}: {}", entry.id, entry.text)?;
-    tell(
-        socket,
-        Event::memory(events::Kind::MemoryForgotten, project, entry),
-    );
+    let mut store = Store::open(socket)?;
+    let ids = if forgetting.status {
+        let listed = memory::marked(store.entries(&project)?, &project);
+        let listed: Vec<&Listed> = listed
+            .iter()
+            .filter(|item| forgetting.kind.is_none_or(|kind| item.entry.kind == kind))
+            .filter(|item| is_status(&item.entry))
+            .collect();
+        if !forgetting.yes {
+            print_entries(&listed)?;
+            match listed.len() {
+                0 => outln!("nothing reads as status")?,
+                n => outln!("would forget these {n}: add --yes to forget them")?,
+            }
+            return Ok(());
+        }
+        listed.iter().map(|item| item.entry.id).collect()
+    } else {
+        let mut missing = Vec::new();
+        for &id in &forgetting.ids {
+            if store.get(&project, id)?.is_none() {
+                missing.push(id.to_string());
+            }
+        }
+        if !missing.is_empty() {
+            bail!("there's no entry {}", missing.join(", "));
+        }
+        forgetting.ids
+    };
+    for id in ids {
+        let entry = store.remove(&project, id)?;
+        outln!("forgot {}: {}", entry.id, entry.text)?;
+        let forgotten = Event::memory(events::Kind::MemoryForgotten, project.clone(), entry);
+        tell(socket, forgotten);
+    }
     Ok(())
 }
 
@@ -311,13 +383,14 @@ fn from_top(file: &str, dir: &Path, top: &Path) -> String {
 }
 
 /// One line an entry: its id, kind and age, then its text, marked when
-/// it's drifting or stale.
+/// it's drifting, stale or expired.
 fn print_entries(entries: &[&Listed]) -> Result<()> {
     let now = now();
     for item in entries {
         let entry = &item.entry;
-        let mark = item.freshness.mark().map(|mark| format!("  [{mark}]"));
-        let mark = mark.unwrap_or_default();
+        let expired = entry.expired(now).then_some("expired");
+        let marks = item.freshness.mark().into_iter().chain(expired);
+        let mark: String = marks.map(|mark| format!("  [{mark}]")).collect();
         let files = if entry.files.is_empty() {
             String::new()
         } else {
@@ -355,15 +428,18 @@ fn forgotten_line(entry: &Forgotten, now: u64) -> String {
 }
 
 /// An entry in full, as `crystal memory show` and the `memory_show` tool
-/// give it: its id and kind, how it holds when it's drifting or stale, its
-/// text, its files, where it came from, and how often and how lately it
-/// was said.
+/// give it: its id and kind, how it holds when it's drifting or stale,
+/// whether it's expired, its text, its files, where it came from, how often
+/// and how lately it was said, and when an agent last read it in full.
 pub fn in_full(entry: &Entry, freshness: Freshness, now: u64) -> String {
     let mut text = format!("{} · {}", entry.id, entry.kind);
     match freshness {
         Freshness::Fresh => {}
         Freshness::Drifting => text.push_str(" · drifting: some of its files have changed since"),
         Freshness::Stale => text.push_str(" · stale: the files it's about have changed since"),
+    }
+    if entry.expired(now) {
+        text.push_str(" · expired: nobody has found it again, so searches leave it out");
     }
     text.push_str(&format!("\n\n{}\n", entry.text));
     if !entry.files.is_empty() {
@@ -380,6 +456,13 @@ pub fn in_full(entry: &Entry, freshness: Freshness, now: u64) -> String {
         ago(entry.created, now),
         ago(entry.last_seen, now)
     ));
+    if let Some(used) = entry.used {
+        let when = match ago(used, now).as_str() {
+            "now" => "just now".to_string(),
+            age => format!("{age} ago"),
+        };
+        text.push_str(&format!("; an agent read it in full {when}"));
+    }
     printable::text(&text).into_owned()
 }
 

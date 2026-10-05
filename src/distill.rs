@@ -104,23 +104,42 @@ const NO_TOOLS: &[&str] = &[
 /// isn't one.
 const SETTINGS: &str = r#"{"disableAllHooks":true}"#;
 
-/// What the model is told it's doing.
+/// What the model is told it's doing: what to keep, what never to, with
+/// entries of each that crystal's own memory kept before these rules, and
+/// never to put words in the user's mouth.
 pub const SYSTEM_PROMPT: &str = "You are crystal's memory distiller. You are given the \
 record of one finished task in a software project: what it was asked to do, how it ended, and \
-what the session that worked on it said and did. Keep only what a later session working in \
-this project would need to know and could NOT find by reading the code: decisions and why they \
-were made, dead ends and what did not work, commands that work here, surprises and traps. Never \
-restate what the code, its comments or its docs already say. Never record progress reports, \
-to-do items, or what this session happened to do. Never guess: everything you keep must be \
-supported by the record. The message lists what the project's memory has already: never give \
-any of that again, even in other words, and keep an entry only when it adds something new.\n\n\
-Each entry has: a kind (decision, gotcha, command or note); a text, \
-one self-contained statement of at most 300 characters that states the claim itself, with why \
-when that matters; and the files it is about, as paths relative to the repository root exactly \
-as the record names them (only files the record names; an empty list is fine).\n\nReturn at \
-most 8 entries, the most useful first. Return an empty list when nothing qualifies: an empty \
-list is better than a weak entry. You have no tools; do not try to read files or run commands: \
-everything you may use is in the message. Answer only through the structured output.";
+what the session that worked on it said and did. Keep only lessons a later session working in \
+this project would need and could NOT get from the code, its comments and docs, the git log, \
+the project's backlog or its CLAUDE.md: decisions and why they were made, dead ends and what \
+did not work, commands that work here, surprises and traps.\n\n\
+Never keep:\n\
+- progress or status: what was merged, pushed, committed, installed or released, that CI \
+passed, what this session did or still has to do;\n\
+- a commit hash, or a pull request, issue or backlog number as the point of an entry;\n\
+- anything only true today: what isn't done yet, what is tracked where, what waits on what;\n\
+- what the code, its comments, its docs or the git log already say.\n\
+For example, none of these is a lesson: \"PR #56 squash-merged into master as 8012b6c\"; \"PRs \
+#99-#104 all merged but the binary is not yet installed; run make install\"; \"Backlog #81 \
+tracks showing removal progress to other clients\"; \"Flaky plugin test archived to backlog \
+#135 during the merge\"; \"Text boxes now share src/tui/editing.rs\". These are: \"The ledger \
+tests need the database up: run make db first\"; \"Fees are kept in cents, since a float lost \
+a cent in a refund\".\n\n\
+Never guess: everything you keep must be supported by the record. Never say what the user \
+decided, wants or prefers unless the record shows the user saying it (a USER: line); what the \
+assistant proposed or did is not the user's decision, and never turn a question into an \
+answer. Quote names exactly as the record gives them (files, functions, tests, commands, \
+settings), and give no line numbers. The message lists what the project's memory has already: \
+never give any of that again, even in other words, and keep an entry only when it adds \
+something new.\n\n\
+Each entry has: a kind (decision, gotcha or command for a lesson; note only for a lasting \
+fact that is none of those, and notes nobody finds again expire); a text, one self-contained \
+statement of at most 300 characters that states the claim itself, with why when that matters; \
+and the files it is about, as paths relative to the repository root exactly as the record \
+names them (only files the record names; an empty list is fine).\n\nReturn at most 8 entries, \
+the most useful first. Return an empty list when nothing qualifies: an empty list is better \
+than a weak entry. You have no tools; do not try to read files or run commands: everything you \
+may use is in the message. Answer only through the structured output.";
 
 /// The shape of the answer, for `--json-schema`: an object holding the
 /// entries, since structured output wants an object at the top.
@@ -690,6 +709,32 @@ mod tests {
         assert_eq!(after("--max-budget-usd"), "0.25");
         let schema: Value = serde_json::from_str(&after("--json-schema")).unwrap();
         assert_eq!(schema["properties"]["entries"]["maxItems"], 8);
+    }
+
+    #[test]
+    fn the_pass_is_told_to_keep_lessons_and_never_status() {
+        for rule in [
+            "the git log",
+            "the project's backlog",
+            "merged, pushed, committed, installed or released",
+            "a commit hash",
+            "only true today",
+            "unless the record shows the user saying it",
+            "give no line numbers",
+        ] {
+            assert!(SYSTEM_PROMPT.contains(rule), "{rule}");
+        }
+        // What it's shown as never worth keeping is what `crystal memory
+        // list --status` lists.
+        for status in [
+            "PR #56 squash-merged into master as 8012b6c",
+            "PRs #99-#104 all merged but the binary is not yet installed; run make install",
+            "Backlog #81 tracks showing removal progress to other clients",
+            "Flaky plugin test archived to backlog #135 during the merge",
+        ] {
+            assert!(SYSTEM_PROMPT.contains(&format!("\"{status}\"")), "{status}");
+            assert!(memory::reads_as_status(status), "{status}");
+        }
     }
 
     #[test]

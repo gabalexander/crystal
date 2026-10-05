@@ -396,8 +396,8 @@ fn draw_filter(frame: &mut Frame, view: &MemoryView, look: &Look, list: Rect) {
 }
 
 /// One row an entry: its kind, its text on one line, and how long ago it
-/// was added on the right. A drifting entry says so; a stale one is muted
-/// too.
+/// was added on the right. A drifting entry says so; a stale or an expired
+/// one is muted too.
 fn draw_list(frame: &mut Frame, view: &MemoryView, look: &Look, area: Rect) {
     let theme = look.theme;
     let shown = view.shown();
@@ -418,12 +418,15 @@ fn draw_list(frame: &mut Frame, view: &MemoryView, look: &Look, area: Rect) {
             frame.buffer_mut().set_style(line_area, theme.selection);
         }
         let age = ago(entry.created, now);
-        let mark = item.freshness.mark().map(|mark| format!(" {mark}"));
-        let mark = mark.unwrap_or_default();
+        let expired = entry.expired(now);
+        let marks = item.freshness.mark().into_iter();
+        let marks = marks.chain(expired.then_some("expired"));
+        let mark: String = marks.map(|mark| format!(" {mark}")).collect();
         let room = usize::from(area.width)
             .saturating_sub(1 + KIND_WIDTH + age.chars().count() + mark.len() + 2);
         let text_color = match item.freshness {
             Freshness::Stale => theme.muted,
+            _ if expired => theme.muted,
             _ => theme.text,
         };
         let line = Line::from(vec![
@@ -447,14 +450,15 @@ fn draw_list(frame: &mut Frame, view: &MemoryView, look: &Look, area: Rect) {
 }
 
 /// The entry the bar is on, in full: its kind, when and from whom, the
-/// files it's about, whether it's drifting or stale, and its text.
+/// files it's about, whether it's drifting, stale or expired, and its text.
 fn draw_entry(frame: &mut Frame, view: &MemoryView, look: &Look, area: Rect) {
     let theme = look.theme;
     let Some(item) = view.selected() else {
         return;
     };
     let entry = &item.entry;
-    let added = match ago(entry.created, super::seconds_since_epoch()).as_str() {
+    let now = super::seconds_since_epoch();
+    let added = match ago(entry.created, now).as_str() {
         "now" => "just now".to_string(),
         age => format!("{age} ago"),
     };
@@ -487,6 +491,12 @@ fn draw_entry(frame: &mut Frame, view: &MemoryView, look: &Look, area: Rect) {
     if let Some(holds) = holds {
         lines.push(Line::styled(holds, Style::new().fg(theme.waiting)));
     }
+    if entry.expired(now) {
+        lines.push(Line::styled(
+            " expired: nobody has found it again, so searches and agents starting leave it out",
+            Style::new().fg(theme.waiting),
+        ));
+    }
     lines.push(Line::raw(""));
     for text_line in entry.text.lines() {
         lines.push(Line::styled(
@@ -515,6 +525,7 @@ mod tests {
                 last_seen: 1_000,
                 anchors: Default::default(),
                 checkout: None,
+                used: None,
             },
             freshness: Freshness::Fresh,
         }
@@ -658,6 +669,32 @@ mod tests {
             .collect();
         assert!(row.contains("Fees are in cents"), "{row}");
         assert!(!row.contains("Never"), "{row}");
+    }
+
+    #[test]
+    fn a_note_nobody_found_again_is_marked_expired_and_a_lesson_never_is() {
+        // Both said long ago, and neither found since.
+        let view = view_of(vec![
+            item(2, Kind::Note, "Fees are in cents"),
+            item(1, Kind::Gotcha, "The ledger needs redis"),
+        ]);
+        let theme = super::super::theme::Theme::new(crate::config::ThemeName::DARK, false);
+        let look = Look {
+            theme: &theme,
+            now: 2_000,
+            spin: 0,
+        };
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 4)).unwrap();
+        terminal
+            .draw(|frame| draw_list(frame, &view, &look, frame.area()))
+            .unwrap();
+        let rows: Vec<String> = terminal.backend().buffer().content()[..120]
+            .chunks(60)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect())
+            .collect();
+        assert!(rows[0].contains("Fees are in cents") && rows[0].contains(" expired"));
+        assert!(!rows[1].contains("expired"), "{}", rows[1]);
     }
 
     #[test]
