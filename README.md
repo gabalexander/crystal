@@ -401,6 +401,15 @@ it was doing goes with it. `crystal agent explain <session>` shows why crystal r
 does. While Claude Code's agent has subagents running, its row says how many after
 what's in front: `claude +2`.
 
+Claude Code runs subagents in the background: its turn ends and its prompt comes back while they go on, and it
+takes up what each finds in a turn of its own. So a turn that ends with subagents running isn't the agent done:
+it reads as working, isn't `✓`, tells you nothing, and an open task isn't waiting on you nor reminded of itself,
+until they've all stopped and the agent has taken their work up. crystal looks four times a second: once the last
+one has stopped, a turn of the agent's own, its prompt or its spinner, is the work going on, and its end the
+end of it; with none within a minute, the turn is over. Subagents that show no sign of life for 15 minutes,
+none starting or stopping, no tool finishing, no permission asked for, are taken for gone, and the turn is over
+too.
+
 A Claude Code or Codex you start yourself, typed into a session's shell, has no hooks of crystal's: crystal
 doesn't start it. `crystal integration install` puts crystal's hooks in their own settings, beside yours:
 
@@ -1049,6 +1058,16 @@ and the first that has words to go on names it, a slash command never. A name yo
 to, stays, and so does one a script has typed into the session by with `crystal send` or `send-keys`.
 `crystal new` and `crystal task` name a session the same way when you don't, and print the name.
 `name_from_prompt = false` in the [settings](#settings) names sessions after their programs.
+
+A prompt's first words don't always say what it's about, so Claude Code names a session better: with the first
+prompt you send it that says what you're asking for, crystal asks it to name the session in three or four words
+of its own, which it does with `crystal name`, like `crystal name Fix Login Redirect`, and the session is called
+`fix-login-redirect` from then on, as docket's AUTO-TITLE does. It's asked once, with that prompt alone, as
+Claude Code's hook tells crystal of it, and allowed the command without asking you. Only a session you start
+from the TUI, or with `crystal new` attaching it in your terminal, is named this way: one whose name crystal
+printed, with `-d` or for a script, keeps it, since whoever started it may know it by it, and so does one you've
+named or renamed, or a script has typed into by its name. A rename in Claude Code is followed all the same.
+`name_by_agent = false` in the [settings](#settings) keeps the name from the prompt.
 
 Claude Code's own name for a conversation, the one `/rename` gives it, and the session's name in crystal are
 kept in step, as far as Claude Code lets them be. `/rename Fix refund rounding` renames the session
@@ -3156,6 +3175,7 @@ that makes no sense is said there too, and the settings stay as they were until 
 | `theme` | `"dark"` | the TUI's colors: one of the [themes](#themes) |
 | `[colors]` | | colors of your own over the theme's: [themes](#themes) |
 | `name_from_prompt` | `true` | name a session you don't name for the [first thing it's asked](#starting-a-session) |
+| `name_by_agent` | `true` | have Claude Code name a session you don't name in [a few words of its own](#starting-a-session), as it's sent its first prompt |
 | `resume_reported_agents` | `true` | after a restart, run the command an agent [said resumes it](#teaching-crystal-about-your-agent), or the one that resumes an agent [typed into a shell](#usage) whose hooks named its conversation |
 | `confirm_quit` | `true` | `q` asks before it quits the TUI, since a key meant for an agent can land on the sidebar; the sessions keep running either way |
 | `show_keys` | `false` | show each key that runs a command at the right of the footer, with the command, for a few seconds: for whoever watches your screen shared or recorded |
@@ -3197,7 +3217,8 @@ does something a plugin adds, `[memory]` each time a task closes or a search run
 background task's run starts, `[handoff]` each time a note is written, `[sessions]` every 15 seconds and as it
 starts sessions again (`restore_screens` every second), a flow
 each time one starts, `[[project]]` each time a project's commands run,
-`name_from_prompt` each time it names a session, `resume_reported_agents` as it starts sessions again,
+`name_from_prompt` and `name_by_agent` each time they name a session, `resume_reported_agents` as it starts
+sessions again,
 `[clipboard]` each time a program copies out of sight,
 `scrollback_lines` as each session starts and every 15 seconds for the sessions running, and `mermaid_ascii` as
 each session starts and each background task's run does, so a change counts straight away (but for

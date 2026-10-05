@@ -625,6 +625,7 @@ impl Daemon {
                     task: goal.as_ref().map(|goal| goal.goal.clone()),
                     backlog,
                     brief,
+                    agent_names: false,
                 };
                 start_as(
                     id,
@@ -1326,6 +1327,7 @@ impl Daemon {
                 task: Some(asked),
                 backlog: None,
                 brief: TaskBrief::default(),
+                agent_names: false,
             };
             start(sessions, &self.socket, new, None, None)?
         } else {
@@ -1996,8 +1998,39 @@ impl Daemon {
         let new_name = unique_name(&base, taken);
         let session = &mut sessions[index];
         let old_name = std::mem::replace(&mut session.name, new_name);
-        session.keep_name();
+        session.named_from_prompt();
         self.tell_renamed(session, &old_name);
+    }
+
+    /// Names the session with id `id` in `title`'s words, which its agent
+    /// picked as crystal asked it to, while crystal still names it itself.
+    fn name_by_agent(&self, id: &str, title: &str) -> Result<()> {
+        let mut sessions = self.sessions.lock().unwrap();
+        let index = sessions
+            .iter()
+            .position(|session| session.id == id)
+            .context("this session has gone")?;
+        let session = &sessions[index];
+        ensure!(
+            settings().name_by_agent && session.awaits_agent_name(),
+            "{} keeps its name",
+            session.name
+        );
+        let base = names::from_title(title).context("say in a few words what it's about")?;
+        let taken = |name: &str| {
+            let others = sessions.iter().enumerate().filter(|(at, _)| *at != index);
+            others
+                .map(|(_, session)| session)
+                .any(|session| session.name == name)
+        };
+        let new_name = unique_name(&base, taken);
+        let session = &mut sessions[index];
+        session.keep_name();
+        if session.name != new_name {
+            let old_name = std::mem::replace(&mut session.name, new_name);
+            self.tell_renamed(session, &old_name);
+        }
+        Ok(())
     }
 
     /// Names the session with id `id` after `title`, the name Claude Code
@@ -2104,10 +2137,10 @@ impl Daemon {
                 // that keeps the agent from ending its turn.
                 let can_remind = matches!(agent.as_str(), "claude" | "codex");
                 // Only Claude Code's prompt hook takes a name for its
-                // conversation.
+                // conversation, or more for it to read.
                 let can_retitle = agent == "claude" && prompt.is_some();
-                if let Some(prompt) = prompt {
-                    self.name_from_prompt(&mut sessions, &id, &prompt);
+                if let Some(prompt) = &prompt {
+                    self.name_from_prompt(&mut sessions, &id, prompt);
                 }
                 let moving = self.is_moving(&id);
                 let session = with_id(&mut sessions, &id)?;
@@ -2144,6 +2177,11 @@ impl Daemon {
                     });
                 }
                 let retitle = can_retitle.then(|| session.title_to_give()).flatten();
+                // Asked to name the session, the agent says better what it's
+                // about than the prompt's first words.
+                let ask_name = can_retitle
+                    && settings().name_by_agent
+                    && session.ask_agent_to_name(prompt.as_deref().unwrap_or_default());
                 // An agent that reports for itself holds the session's
                 // status: what hooks say counts again once it lets go.
                 if !session.is_claimed() {
@@ -2159,8 +2197,13 @@ impl Daemon {
                     }
                 }
                 self.tell_changes(session);
+                // A session the user renamed isn't asked about: its name
+                // stays.
                 match retitle {
                     Some(title) => Ok(Response::Retitle { title }),
+                    None if ask_name => Ok(Response::Context {
+                        text: names::ASK_AGENT.to_string(),
+                    }),
                     None => Ok(Response::Done),
                 }
             }
@@ -2274,6 +2317,10 @@ impl Daemon {
                 if new_name != name {
                     self.tell_renamed(session, &name);
                 }
+                Ok(Response::Done)
+            }
+            Request::NameByAgent { id, title } => {
+                self.name_by_agent(&id, &title)?;
                 Ok(Response::Done)
             }
             Request::Respawn { name, env } => self.respawn(&name, env),
@@ -2830,6 +2877,7 @@ impl Daemon {
                     task: Some(goal),
                     backlog,
                     brief,
+                    agent_names: false,
                 };
                 start(&mut sessions, &self.socket, new, None, None)
             }
@@ -2915,6 +2963,7 @@ impl Daemon {
             task: open.map(|goal| goal.goal.clone()),
             backlog,
             brief,
+            agent_names: false,
         };
         // The task makes way, and comes back if Claude doesn't start.
         let background = sessions.remove(index);
@@ -3183,6 +3232,7 @@ impl Daemon {
                     task: launch.goal.as_ref().map(|goal| goal.goal.clone()),
                     backlog,
                     brief,
+                    agent_names: false,
                 };
                 start(
                     &mut sessions,
@@ -3586,6 +3636,7 @@ fn start_as(
         task,
         backlog,
         brief,
+        agent_names,
     } = new;
     let Some(program) = command.first() else {
         bail!("no command to run");
@@ -3603,6 +3654,12 @@ fn start_as(
         .filter(|_| config.name_from_prompt)
         .and_then(names::from_prompt);
     let named_after_program = name.is_none() && from_prompt.is_none();
+    // Claude Code, asked to with its first prompt, names it better still,
+    // unless whoever started it holds on to the name it's given here.
+    let agent_names = agent_names
+        && name.is_none()
+        && config.name_by_agent
+        && agents::program_name(&command) == Some("claude");
     let taken = |name: &str| sessions.iter().any(|session| session.name == name);
     let name = match name {
         Some(name) => {
@@ -3699,6 +3756,9 @@ fn start_as(
     }
     if named_after_program {
         session.mark_named_after_program();
+    }
+    if agent_names {
+        session.let_agent_name();
     }
     session.set_about(&brief);
     if let Some(goal) = task {
@@ -3815,9 +3875,9 @@ fn launch_memory(socket: &Path, cwd: &Path, asked: &str, reader: memory::Reader)
 
 /// What gives a Claude Code session in `cwd` the tools crystal tells it
 /// to use, allowed up front so it never stops to ask for them: the crystal
-/// commands its notes name, and with memory on, crystal's MCP server, run
-/// by `crystal`, the path of this program, and its tools. Nothing for
-/// another program.
+/// commands its notes name, `crystal name` while crystal may ask it to name
+/// its session, and with memory on, crystal's MCP server, run by `crystal`,
+/// the path of this program, and its tools. Nothing for another program.
 fn claude_tools(
     socket: &Path,
     cwd: &Path,
@@ -3829,6 +3889,10 @@ fn claude_tools(
         return Vec::new();
     }
     let mut tools = crystal_commands(config);
+    // Asked to name its session, it does without stopping for the user.
+    if config.name_by_agent {
+        tools.push("Bash(crystal name:*)");
+    }
     let mut options = Vec::new();
     if memory::enabled(config) {
         options.extend([

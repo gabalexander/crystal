@@ -25,13 +25,14 @@ impl Crystal {
         // the test sees, and no test pops up a real notification or plays
         // a sound (nor one that configures its own: see `QUIET`). Memory is
         // off unless a test turns it on, so Claude's arguments stay as each
-        // test expects them, and so is naming a session from its prompt, so
-        // its name does. So are panes' scrollbars, so a pane's screen is as
+        // test expects them, and so is naming a session from its prompt or
+        // by its agent, so its name does. So are panes' scrollbars, so a pane's screen is as
         // wide as the pane, as the tests that count its columns expect. A
         // shell isn't a login shell, which on a Mac it would be, so it starts
         // the same on every machine. And `q` quits without asking first.
         crystal.configure(
-            "notify = false\nname_from_prompt = false\nconfirm_quit = false\n\n\
+            "notify = false\nname_from_prompt = false\nname_by_agent = false\n\
+             confirm_quit = false\n\n\
              [plugins]\nmemory = false\n\n\
              [sound]\nenabled = false\n\n[mouse]\nscrollbars = false\n\n\
              [terminal]\nshell_mode = \"non_login\"\n",
@@ -4132,6 +4133,9 @@ fn send_wait_fails_when_the_agent_never_starts_on_what_it_was_sent() {
         .stdout(Stdio::piped())
         .spawn()
         .unwrap();
+    // It types only once it has seen the agent working: the turn ends after
+    // that, or the send would find it done, and stall.
+    shows_on_screen(&crystal, "agent", "queued");
     run_hook(&crystal, "agent", &hook, r#"{"hook_event_name":"Stop"}"#);
     let out = waiting.wait_with_output().unwrap();
     assert!(out.status.success());
@@ -8602,9 +8606,10 @@ fn a_daemon_starting_never_installs_the_skill() {
 }
 
 /// A crystal with memory on, and a project for it to remember things about.
+/// Claude isn't asked to name its sessions, so its arguments are memory's.
 fn crystal_remembering() -> (Crystal, PathBuf) {
     let crystal = Crystal::new();
-    crystal.configure("notify = false\n");
+    crystal.configure("notify = false\nname_by_agent = false\n");
     let repo = git_repo(crystal.dir.path(), "app");
     (crystal, repo)
 }
@@ -12121,6 +12126,135 @@ fn an_agent_that_ends_its_turn_with_its_task_open_is_reminded_once() {
     );
     assert_eq!(crystal.row("agent").unwrap()[1], "working");
     assert!(crystal.ok(&["tasks"]).starts_with("t1    running    agent"));
+}
+
+#[test]
+fn an_agent_whose_subagents_still_run_as_its_turn_ends_works_on() {
+    let crystal = Crystal::new();
+    let bin = fake_claude(crystal.dir.path());
+    let out = crystal
+        .command(&["new", "-d", "-n", "agent", "claude", "fix the tests"])
+        .env("PATH", path_of(&[&bin]))
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let hook = format!("{CRYSTAL} hook claude");
+    let session = [("CRYSTAL_SESSION", "agent")];
+    let says = |event: &str| hook_says(&crystal, &session, &hook, event);
+    let status = || crystal.row("agent").unwrap()[1].clone();
+    assert_eq!(says(r#"{"hook_event_name":"UserPromptSubmit"}"#), "");
+    let start = r#"{"hook_event_name":"SubagentStart","agent_id":"a1","agent_type":"Explore"}"#;
+    assert_eq!(says(start), "");
+
+    // Its turn ends with its subagent in the background: it's still at
+    // work, not reminded of its task, which isn't waiting on the user.
+    let stop = r#"{"hook_event_name":"Stop"}"#;
+    assert_eq!(says(stop), "", "not reminded");
+    assert_eq!(status(), "working");
+    assert_eq!(listed(&crystal, "agent")["task"]["waiting"], false);
+    assert_eq!(listed(&crystal, "agent")["subagents"], 1);
+    let idle = r#"{"hook_event_name":"Notification","notification_type":"idle_prompt"}"#;
+    assert_eq!(says(idle), "");
+    assert_eq!(status(), "working", "its prompt back says nothing");
+
+    // The subagent done, the agent takes up what it found, in a turn of its
+    // own, whose end is the end of its work.
+    assert_eq!(
+        says(r#"{"hook_event_name":"SubagentStop","agent_id":"a1"}"#),
+        ""
+    );
+    assert_eq!(status(), "working");
+    assert_eq!(says(r#"{"hook_event_name":"PostToolUse"}"#), "");
+    let said: serde_json::Value = serde_json::from_str(&says(stop)).unwrap();
+    assert_eq!(said["decision"], "block", "reminded now: {said}");
+    assert_eq!(says(stop), "");
+    assert_eq!(status(), "waiting");
+    let told = events(&crystal, &["-n", "agent", "-k", "subagent.*"]);
+    assert_eq!(names(&told), ["subagent.started", "subagent.stopped"]);
+}
+
+#[test]
+fn claude_names_a_session_nobody_holds_the_name_of_when_asked() {
+    let crystal = Crystal::new();
+    crystal.configure(
+        "notify = false\nname_from_prompt = true\nname_by_agent = true\n\n\
+         [plugins]\nmemory = false\n",
+    );
+    let bin = fake_claude(crystal.dir.path());
+    let path = path_of(&[&bin]);
+    let hook = format!("{CRYSTAL} hook claude");
+    let prompt = |name: &str, text: &str| {
+        let id = crystal.listed(name)["id"].as_str().unwrap().to_string();
+        let env = [
+            ("CRYSTAL_SESSION", name),
+            ("CRYSTAL_SESSION_ID", id.as_str()),
+        ];
+        let event = serde_json::json!({"hook_event_name": "UserPromptSubmit", "prompt": text});
+        hook_says(&crystal, &env, &hook, &event.to_string())
+    };
+    let name = |name: &str, words: &[&str]| {
+        let id = crystal.listed(name)["id"].as_str().unwrap().to_string();
+        crystal
+            .command(&[&["name"], words].concat())
+            .env("CRYSTAL_SESSION_ID", &id)
+            .env("CRYSTAL_SOCKET", &crystal.socket)
+            .output()
+            .unwrap()
+    };
+
+    // Started in a terminal, attached, its name is printed for no script.
+    let _terminal = crystal.terminal_with_env(
+        &["new", "claude", "Fix the login redirect"],
+        &[("PATH", &path)],
+    );
+    eventually("it has started", || {
+        crystal.row("fix-login-redirect").is_some()
+    });
+    let args = written(&crystal.dir.path().join("args"));
+    assert!(args.contains("Bash(crystal name:*)"), "allowed: {args}");
+
+    // A slash command says nothing of what it's about; the first prompt
+    // that does asks Claude, once, to name the session.
+    assert_eq!(prompt("fix-login-redirect", "/model"), "");
+    let said = prompt("fix-login-redirect", "Fix the login redirect");
+    let said: serde_json::Value = serde_json::from_str(&said).unwrap();
+    let context = &said["hookSpecificOutput"]["additionalContext"];
+    assert!(
+        context.as_str().unwrap().contains("crystal name <title>"),
+        "{said}"
+    );
+    assert_eq!(prompt("fix-login-redirect", "and the tests"), "", "once");
+
+    // It does, in a few words, which name it as Claude Code's own name
+    // for its conversation would.
+    let out = name("fix-login-redirect", &["Login", "Redirect", "Loop"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(crystal.row("login-redirect-loop").is_some());
+    let renamed = events(&crystal, &["-k", "session.renamed"]);
+    assert_eq!(renamed[0]["from"], "fix-login-redirect");
+    // Once.
+    let out = name("login-redirect-loop", &["Something", "Else"]);
+    assert!(!out.status.success());
+    let refused = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        refused.contains("login-redirect-loop keeps its name"),
+        "{refused}"
+    );
+
+    // Started for a script, which is told its name, it keeps it.
+    let out = crystal
+        .command(&["new", "-d", "claude", "Write the docs"])
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "write-docs\n");
+    assert_eq!(prompt("write-docs", "Write the docs"), "");
+    assert!(!name("write-docs", &["Docs", "Pass"]).status.success());
+    assert!(crystal.row("write-docs").is_some());
 }
 
 #[test]

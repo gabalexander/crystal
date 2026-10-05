@@ -2719,6 +2719,11 @@
             }
           ],
           "description": "The issue it's for."
+        },
+        "agent_names": {
+          "type": "boolean",
+          "description": "Whether the session's agent may name it, in place of the name crystal gives it, when the settings say so: for a client that doesn't hold on to that name, like the TUI, which follows a rename. A script that was told the name may use it later.",
+          "default": false
         }
       },
       "required": [
@@ -3518,6 +3523,27 @@
             "new_name"
           ],
           "description": "Give a session another name."
+        },
+        {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "title": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "name_by_agent"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "title"
+          ],
+          "description": "The agent in the session with `id` names it, in `title`'s words, as crystal asked it to: only while crystal names it itself, and nobody holds on to that name."
         },
         {
           "type": "object",
@@ -5134,6 +5160,23 @@
             "title"
           ],
           "description": "What the hook reporting a prompt the user sent tells Claude Code: the title to give the conversation, the name the user renamed the session to in crystal."
+        },
+        {
+          "type": "object",
+          "properties": {
+            "text": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "context"
+            }
+          },
+          "required": [
+            "type",
+            "text"
+          ],
+          "description": "What the hook reporting a prompt the user sent adds to it for Claude Code to read: crystal asking it to name its session."
         },
         {
           "$ref": "#/$defs/Backlog",

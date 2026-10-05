@@ -1,8 +1,10 @@
 //! Names: made-up ones for new worktrees' branches, like `brave-otter`:
 //! short, easy to say and to tell apart, and nothing to do with the task,
 //! which can change while the branch can't; and a session's, from the
-//! first thing it's asked, like `fix-login-redirect`, or from the name
-//! Claude Code gave its conversation, which a session can change.
+//! first thing it's asked, like `fix-login-redirect`, from the name Claude
+//! Code gave its conversation, which a session can change, or from the few
+//! words its agent picks when crystal asks it to, which say better what
+//! it's about than a prompt's first words do (docket's AUTO-TITLE).
 
 use std::hash::{BuildHasher, RandomState};
 use std::time::SystemTime;
@@ -47,6 +49,20 @@ const FILLER: &[&str] = &[
     "up", "us", "want", "was", "we", "what", "when", "where", "which", "why", "will", "with",
     "would", "you", "your",
 ];
+
+/// What Claude Code is told with the first prompt the user sends it that
+/// says what it's about, for its session to have a name that says it too:
+/// to name it with `crystal name`, as `title`, with each of `title`'s words
+/// joined by dashes, makes it. A session whose name crystal no longer
+/// makes, since the user or a script has given it one, says so, which
+/// isn't the agent's to put right.
+pub const ASK_AGENT: &str = "[crystal] Before you start on this, run `crystal name <title>` \
+                             once, with 3 or 4 words in place of <title> that say what the \
+                             user is asking for, unquoted, like `crystal name Fix Login \
+                             Redirect`: crystal names this session by them in the user's \
+                             sidebar. If it says the session keeps its name, leave it. Then \
+                             carry on with the request, and don't mention the name to the \
+                             user.";
 
 /// A session's name from `prompt`, the first thing it was asked: its first
 /// few words that say what it's about, in lower case, joined by dashes.
@@ -190,6 +206,16 @@ mod tests {
         assert_eq!(from_prompt(""), None);
         assert_eq!(from_prompt("can you?"), None);
         assert_eq!(from_prompt("/compact keep the tests"), None);
+    }
+
+    #[test]
+    fn the_words_an_agent_picks_name_a_session_as_its_conversation_s_name_does() {
+        // As `crystal name` gets them, its words joined.
+        assert_eq!(
+            from_title("Fix Login Redirect").as_deref(),
+            Some("fix-login-redirect")
+        );
+        assert!(ASK_AGENT.contains("`crystal name <title>`"));
     }
 
     #[test]
