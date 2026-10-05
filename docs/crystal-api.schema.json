@@ -5520,6 +5520,10 @@
         "about": {
           "$ref": "#/$defs/TaskBrief",
           "description": "The pull request and the issue it's about, task or not, which its agent is told of each time it starts."
+        },
+        "name_given": {
+          "type": "boolean",
+          "description": "Whether the user or a script gave it its name, which a rename in Claude Code leaves, after a restart as before it."
         }
       },
       "required": [

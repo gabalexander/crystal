@@ -199,7 +199,8 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   - `command_list.rs`: the command list (`:`): every command, the user's own keys' commands and plugin action
     by name, with its keys, filtered as you type, the latest run first; its state and keys, kept apart from
     I/O, and its drawing
-  - `status.rs`: a session's status as the TUI shows it, and its mark
+  - `status.rs`: a session's status as the TUI shows it, its mark, and what it needs of the user, which the
+    sidebar's pinned rows and `u` go by
   - `theme.rs`: every color, named for what it's for, and `THEMES`, the one table of every theme by its names:
     crystal's own `dark`, `light` and `terminal`, and the well-known schemes (catppuccin, nord, …), each a
     palette of ten colors given their roles, its tints blended toward the background; the theme for a light
@@ -310,8 +311,9 @@ whenever what's handed over changes in a way the crystal before couldn't read.
     its task kept, listed, the one the bar is on previewed, and opened in the editor; its state and keys,
     kept apart from I/O (the event loop looks for the notes and reads the kept files), and its drawing
   - `needs_you.rs`: the needs-you view (`U`): everything waiting on the user, in every tab, the most urgent
-    first, from the sessions and flow runs the TUI has; answering a permission or a gate in place, the bar
-    kept on its row as rows come and go, and its drawing
+    first, from the sessions and flow runs the TUI has, those that couldn't start again after a restart among
+    them; answering a permission or a gate in place, or starting one of those again, the bar kept on its row
+    as rows come and go, and its drawing
   - `ram_view.rs`: the RAM view (`#`): the memory each session's processes take, the biggest first, its
     share of all of it, and crystal's own; Enter goes to the session, the bar kept on its session as a new
     look reorders the rows; its state, keys and drawing, and the footer's readout
@@ -334,8 +336,10 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   stops agents left idle past `[sessions] stop_idle_after`, and keeps the list of projects sessions ran in;
   after a cold restart, puts the sessions written down back in their places and starts them again, agents
   `[sessions] restart_spacing_ms` apart on a thread of their own, those that can't start kept, failed, saying
-  why; opens a background task in a terminal, in its place, its task carried on; hands itself over to a new
-  crystal, and takes over from the daemon that handed over
+  why, a name the user gave still theirs, and with `[sessions] restore_screens` a terminal below what it
+  showed before, which it keeps in the database meanwhile; opens a background task in a terminal, in its
+  place, its task carried on; hands itself over to a new crystal, and takes over from the daemon that handed
+  over
   - `daemon/removal.rs`: removing a worktree, for `W` and `crystal worktree rm`: refused while a session runs
     there, git started and reaped while the removals are held, the sessions that had ended there killed,
     `worktree.removed`, and everyone who asked answered, a second ask waiting with the first; the worktrees
@@ -443,8 +447,9 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   the rows it wrapped onto, as `vt::Link`; the
   times the program rang the bell; the text it last asked to copy (OSC 52), a read of the clipboard never
   answered; the progress a program reports (OSC 9;4), picked out of its output, which
-  alacritty_terminal passes over; and a screen saved for a handover, both its screens and the history, and
-  restored. The only module that uses
+  alacritty_terminal passes over; a screen saved for a handover, both its screens and the history, and
+  restored; and the main screen and its history kept to show again, without what its program set, above
+  the program a cold restart starts in its place. The only module that uses
   `alacritty_terminal`
 - `src/links.rs`: opening a link a pane shows: `open` or `xdg-open`, or over ssh (or with neither) the link put
   on the user's clipboard instead
@@ -498,7 +503,7 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   the projects on crystal's list, each project's backlog (each item's line, body and tags) and closed tasks, the files tasks kept, the tasks waiting to start and the last task number, what each
   task carried beside its goal (its acceptance criteria, pull request and issue), what background
   tasks spent each day, the event log, read from a point on or a page of a timeline's scope at a time back
-  from its end, and the TUI's
+  from its end, what each terminal written down showed (`[sessions] restore_screens`), and the TUI's
   tabs, layouts, the new-session panel's memory, the diff view's reviewed marks, the projects folded in the
   sidebar and the latest event the user had seen, each a JSON document; and bringing in the JSON files from before, a project's the first time it's
   asked for. Settings stay in the config file and memory in `memory.db`

@@ -23,6 +23,30 @@ pub enum Status {
     Starting,
 }
 
+/// What a session needs of the user, the most pressing first: the sidebar
+/// pins those that need anything, and `u` goes to them in this order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Need {
+    /// Its agent is asking the user something.
+    Answer,
+    /// It couldn't start again after a restart: nothing runs there until
+    /// the user puts that right, or kills it.
+    Restart,
+    /// Its agent finished a turn nobody has looked at.
+    Look,
+}
+
+impl Need {
+    pub fn of(session: &SessionInfo) -> Option<Need> {
+        match Status::of(session) {
+            Status::Waiting => Some(Need::Answer),
+            Status::Done => Some(Need::Look),
+            _ if matches!(session.state, State::Failed { .. }) => Some(Need::Restart),
+            _ => None,
+        }
+    }
+}
+
 /// The working mark turns through these, a quarter at a time.
 const SPINNER: [&str; 4] = ["◐", "◓", "◑", "◒"];
 
@@ -103,6 +127,22 @@ mod tests {
         let why = "its directory, ~/code/app, isn't there".to_string();
         let failed = Status::of(&session(State::Failed { why }, None));
         assert_eq!(failed, Status::Failed);
+    }
+
+    #[test]
+    fn a_session_that_couldn_t_start_again_needs_the_user_after_a_question() {
+        let why = "command not found: claude".to_string();
+        let failed = session(State::Failed { why }, None);
+        let asking = session(State::Running, Some(Activity::Waiting));
+        let done = session(State::Running, Some(Activity::Done));
+        assert_eq!(Need::of(&failed), Some(Need::Restart));
+        assert_eq!(Need::of(&asking), Some(Need::Answer));
+        assert_eq!(Need::of(&done), Some(Need::Look));
+        assert!(Need::Answer < Need::Restart && Need::Restart < Need::Look);
+        // A program that failed, or one waiting its turn, needs nothing.
+        assert_eq!(Need::of(&session(State::Exited { code: 1 }, None)), None);
+        assert_eq!(Need::of(&session(State::Starting, None)), None);
+        assert_eq!(Need::of(&session(State::Running, None)), None);
     }
 
     #[test]
