@@ -2587,10 +2587,12 @@ crystal memory dedupe                # entries that say what another does, by me
   the distiller said, then the one most of the others say the same as, then the earliest. Nothing changes
   until `--apply`: then the one kept counts every time each of the others was said, so it doesn't expire,
   takes their files, and holds as well as the freshest of them (when one still holds, it's anchored to its
-  files and what it names as they are now, as though said again). The others leave the list (`show` says where one went), kept
-  apart so their words said again count as the one kept said again, and the distiller can't add them back.
-  Each one goes straight into the one kept, never through another, so two that only both look like a third
-  stay apart. It needs the models, and takes under a minute on a few hundred entries.
+  files and what it names as they are now, as though said again). The others leave the list (`show` says
+  where one went), kept apart so their words said again count as the one kept said again, and the distiller
+  can't add them back. What they said still finds the one kept: a search matches their words and what they
+  mean as its own, and the reranker reads them after its text. Each one goes straight into the one kept,
+  never through another, so two that only both look like a third stay apart. It needs the models, and takes
+  under a minute on a few hundred entries.
 - Whether an entry still holds goes by what it names: the identifiers, paths, commands and flags in its text,
   in backticks or shaped like code (`local_origin`, `TaskRecord`, `Request::Shutdown` as `Shutdown`,
   `src/agent_rules.rs`, `agents/`, `--test-threads`), that are in the worktree's code as it's remembered:
@@ -2610,8 +2612,9 @@ crystal memory dedupe                # entries that say what another does, by me
   worktree after.
 - `promote` asks first at a terminal; `--yes` doesn't. It writes to CLAUDE.md, or to AGENTS.md when that's the
   only one the project has.
-- `rm` forgets an entry: it leaves the list, and the distiller never adds it back. `memory list --forgotten`
-  (or `--wrong`) lists what was forgotten, as it was; remembering it again brings it back.
+- `rm` forgets an entry: it leaves the list, and the distiller never adds it back, in the same words or, with
+  search by meaning on, in others that say the same thing by the rule below. `memory list --forgotten` (or
+  `--wrong`) lists what was forgotten, as it was; remembering it again brings it back.
 - `m` in the sidebar opens the selected session's project's list, drifting, stale and expired entries marked:
   the entry the bar is on is shown in full beside it, with what's gone, `/` filters, `Enter` opens its file in
   your `$EDITOR` (in the worktree it was remembered in while that's there, as a session of its own), `x`
@@ -2702,9 +2705,11 @@ crystal memory embed   # downloads both models now (2.4 GB), and gives every ent
   and every task's `memory_search` ask it, and only search in their own process when no daemon is running. A
   search takes about half a second on an Apple silicon Mac, most of it the reranker's; on a CPU, a few
   seconds.
-- Each entry's vector is kept beside it in `memory.db`. An entry without one, say one remembered while the
-  models were off, gets it the first time a search needs it, and vectors from a model crystal no longer uses
-  are let go.
+- Each entry's vector is kept beside it in `memory.db`, and so is each merged or forgotten one's. An entry
+  without one, say one remembered while the models were off, gets it the first time a search needs it, and
+  vectors from a model crystal no longer uses are let go. The model has once given a vector that wasn't
+  numbers (NaN), for a text it never did again, on the GPU or the CPU: one like it is made again, and never
+  kept, and one kept from before is made again as the daemon starts, or with `crystal memory embed`.
 - An entry being added is held against those there already, tasks' outcomes aside: one whose vector is as
   alike as 0.92 says the same thing; one as alike as 0.87 does when the reranker, reading the new one as the
   query, scores it 0.40 or more. On crystal's own memory, every pair that alike said the same thing, and
@@ -2796,7 +2801,7 @@ task closed done or failed and it was read then. It's one `claude -p` run on Hai
   checkout.
 - What passes is kept like anything else, `from the distiller, after task <name>`: what's there already, in
   its words or others, is seen again rather than added twice, and what you forgot with `rm` it never adds
-  back (you can, by remembering it yourself).
+  back, in its words or others (you can, by remembering it yourself).
 - It's also shown up to 4 of the stale entries about the files the work touched (those its branch changed
   since it left the default one, and those it edited), with what each names that's gone, and says of each the
   record settles whether it still holds (it's anchored again, to the code as it is), holds once reworded (its

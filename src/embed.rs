@@ -453,17 +453,25 @@ impl Embed for Models {
     }
 
     fn embed_passages(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
-        self.vectors(
-            texts
-                .iter()
-                .map(|text| format!("{PASSAGE}{text}"))
-                .collect(),
-        )
+        let texts: Vec<String> = texts
+            .iter()
+            .map(|text| format!("{PASSAGE}{text}"))
+            .collect();
+        let vectors = self.vectors(texts.clone())?;
+        again_unless_numbers(vectors, &texts, |text| self.vectors(vec![text.to_string()]))
     }
 
     fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
-        let mut vectors = self.vectors(vec![format!("{QUERY}{text}")])?;
-        vectors.pop().context("the model gave no vector")
+        let texts = vec![format!("{QUERY}{text}")];
+        let vectors = self.vectors(texts.clone())?;
+        let vector =
+            again_unless_numbers(vectors, &texts, |text| self.vectors(vec![text.to_string()]))?
+                .pop()
+                .context("the model gave no vector")?;
+        if !is_numbers(&vector) {
+            bail!("the model gave a vector that isn't numbers");
+        }
+        Ok(vector)
     }
 
     fn rerank(&self, query: &str, passages: &[&str]) -> Result<Option<Vec<f32>>> {
@@ -527,6 +535,33 @@ impl Embed for Remote {
     fn fallback(&self) -> Option<&dyn Embed> {
         self.local.as_deref().map(|models| models as &dyn Embed)
     }
+}
+
+/// Whether every number of `vector` is one: the model has given NaN, every
+/// number of one vector, though the same text never did again, on the GPU
+/// or the CPU, alone or in any batch.
+pub fn is_numbers(vector: &[f32]) -> bool {
+    vector.iter().all(|x| x.is_finite())
+}
+
+/// `vectors`, of `texts`, with each that isn't numbers ([`is_numbers`])
+/// made again from its text alone by `again`, once: what went wrong once
+/// hasn't been seen twice. One still not numbers is left as it is, for
+/// whoever asked to leave out.
+fn again_unless_numbers(
+    mut vectors: Vec<Vec<f32>>,
+    texts: &[String],
+    again: impl Fn(&str) -> Result<Vec<Vec<f32>>>,
+) -> Result<Vec<Vec<f32>>> {
+    for (vector, text) in vectors.iter_mut().zip(texts) {
+        if !is_numbers(vector) {
+            errln!("crystal: the model gave a vector that isn't numbers; making it again");
+            if let Some(remade) = again(text)?.pop() {
+                *vector = remade;
+            }
+        }
+    }
+    Ok(vectors)
 }
 
 /// The models, once a process has loaded them.
@@ -949,6 +984,22 @@ mod tests {
         assert_eq!(up, vec![vec![1.5, 1.0], vec![0.0, 1.0]]);
         let norm: Vec<f32> = merged["norm.weight"].to_vec1().unwrap();
         assert_eq!(norm, vec![1.0, 1.0]);
+    }
+
+    #[test]
+    fn a_vector_that_isn_t_numbers_is_made_again_once() {
+        let texts = ["one".to_string(), "two".to_string()];
+        let vectors = vec![vec![1.0, 0.0], vec![f32::NAN, f32::NAN]];
+        let again = |text: &str| -> Result<Vec<Vec<f32>>> {
+            assert_eq!(text, "two", "only what isn't numbers is made again");
+            Ok(vec![vec![0.0, 1.0]])
+        };
+        let made = again_unless_numbers(vectors.clone(), &texts, again).unwrap();
+        assert_eq!(made, [vec![1.0, 0.0], vec![0.0, 1.0]]);
+        // Still not numbers, it's left for whoever asked to leave out.
+        let still = |_: &str| -> Result<Vec<Vec<f32>>> { Ok(vec![vec![f32::INFINITY, 0.0]]) };
+        let made = again_unless_numbers(vectors, &texts, still).unwrap();
+        assert!(is_numbers(&made[0]) && !is_numbers(&made[1]));
     }
 
     /// Runs the real models, once `crystal memory embed` has downloaded
