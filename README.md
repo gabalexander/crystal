@@ -187,7 +187,7 @@ and the footer says where you are and offers the keys that matter there, or, whe
 | `Z` | the archive: start an archived session again, in its conversation, or delete it |
 | `!` | run the selected worktree's [project](#projects), with its `run` command, in a terminal of its own; again, stop it |
 | `.` | open the selected worktree with its project's `open` command, like `code .` |
-| `u` | select the next session that needs you: waiting on you first, then done |
+| `u` | select the next session that needs you: waiting on you first, then one that couldn't start again after a restart, then done |
 | `U` | list everything that [needs you](#timeline), in every tab, and answer a permission or a gate where it stands |
 | `a` | the [timeline](#timeline): what happened, the newest first, as it happens |
 | `I` | the [timeline](#timeline) of the selected session; `Ctrl+S` there goes on to its task's, its project's and everything |
@@ -617,11 +617,22 @@ the first agent, but the agents after it start a quarter of a second apart (`res
 says `starting`. A session that can't start again, because its directory has gone or its command isn't there
 any more, isn't dropped, and never starts somewhere else instead: it stays in its place, its row says
 `couldn't start`, its screen and `crystal ls` say why, and it stays written down, to try again with the next
-restart. Put it right and `Enter` on it (or `crystal respawn`) starts it, or kill it. Once they've all started
+restart. It's pinned with what [needs you](#the-sidebar), and `U` lists it with why. Put it right and `Enter`
+on it (or `crystal respawn`, or `r` in `U`'s list) starts it, or kill it. Once they've all started
 or failed, the TUI's footer says how it went, like `after the restart: 6 sessions back · 1 couldn't start:
 docs`, and the [event log](#events) has a `session.start_failed` for each that couldn't and a
 `daemon.restarted` for the lot. `crystal kill-server` is asked to stop everything, so after it nothing comes
-back.
+back. A session comes back under its name, and one you or a script named keeps it through a `/rename` in
+Claude Code, as [before the restart](#starting-a-session).
+
+A shell or any other program starts again afresh, on a clear screen. With `restore_screens = true` under
+`[sessions]`, its terminal shows what it showed before instead, history and all, above a line saying crystal
+restarted, and its program starts under it: crystal keeps what each terminal shows in its database, as soon as
+there's something on it and then at most every 15 seconds while it changes. It's off unless you turn it on,
+since a screen can show secrets, like a token a command printed. Claude Code and Codex picked up in their
+conversation show their own, so their screens aren't kept, and a background task draws its transcript again.
+Turning it off forgets what was kept, and so does `crystal kill-server`.
+
 The list is kept in crystal's database, `~/.local/state/crystal/crystal.db`, without the sessions' environment
 variables, since those can hold secrets; a session started again gets the environment of whoever started the
 daemon again.
@@ -769,7 +780,8 @@ a row, so a session waiting on you still shows while the panes take the room; `\
 edge, unfolds it. While it's folded, or the tab is zoomed, `/` brings it out over the panes to look through.
 
 Whatever needs you, in every tab, is pinned at the top under **needs you**: the agents waiting on you, then
-those that finished a turn you haven't looked at. One in another tab says which tab, and a click on it takes
+the sessions that couldn't start again after a [restart](#usage), then those that finished a turn you haven't
+looked at. One in another tab says which tab, and a click on it takes
 you there. `u` goes to each in turn, and `U` lists them with what each waits for.
 
 A row says what fits of what there is to say, and leaves the rest out as the sidebar narrows:
@@ -1967,10 +1979,11 @@ sessions, `I` opens its project's.
 
 `U` lists everything that needs you now, in every tab, the most urgent first: background tasks asking for a
 permission, flow runs at a gate, tasks whose agent ended its turn with the task still open, agents asking you
-something, then agents that finished a turn you haven't seen. Within each, whatever has waited longest comes
-first, and each thing has one row. `y`, `n` and `Y` answer a permission where it stands, and `g` and `f` a
-gate (go on, or send it back with your notes), as on the session's own row; the list stays open, and an
-answered row leaves it. `Enter` goes to the session, and `Esc` closes the list.
+something, sessions that couldn't start again after a [restart](#usage), with why, then agents that finished
+a turn you haven't seen. Within each, whatever has waited longest comes first, and each thing has one row.
+`y`, `n` and `Y` answer a permission where it stands, `g` and `f` a gate (go on, or send it back with your
+notes), as on the session's own row, and `r` starts again a session that couldn't start, once you've put
+right what stopped it; the list stays open, and an answered row leaves it. `Enter` goes to the session, and `Esc` closes the list.
 
 When you come back to crystal, the footer says what happened while you were away, in one line:
 
@@ -2980,7 +2993,7 @@ that makes no sense is said there too, and the settings stay as they were until 
 | `[handoff]` | | `in_git`, the projects, by their main worktree, whose [handoff notes](#the-handoff-file) go in git |
 | `[worktrees]` | | `base`, the branch new worktrees' new branches [start from](#usage): `origin`'s default branch unless set; `directory`, where new worktrees [go](#usage), each project's in a directory of its own, from `/` or `~`: beside the project, in `<repo>.worktrees`, unless set |
 | `[forge]` | | `hide_draft_prs`, leave draft pull requests out of [the pull requests](#pull-requests), the tab bar's count and `/` (`false`) |
-| `[sessions]` | | `stop_idle_after`, how long an agent may sit [idle](#archiving-and-idle-agents) before crystal stops it, like `"30m"`: `"off"`; `restart_spacing_ms`, how far apart the agents a [crash or a reboot](#usage) starts again start (`250`, or `0` for all at once) |
+| `[sessions]` | | `stop_idle_after`, how long an agent may sit [idle](#archiving-and-idle-agents) before crystal stops it, like `"30m"`: `"off"`; `restart_spacing_ms`, how far apart the agents a [crash or a reboot](#usage) starts again start (`250`, or `0` for all at once); `restore_screens`, whether a terminal a crash or a reboot starts again shows what it showed before, kept in crystal's database (`false`: a screen can hold secrets) |
 | `[[project]]` | | a project's [run and open commands](#projects), by its main worktree's `path`, in place of its own file's, and the [plugins it ships](#a-projects-own-plugins) that are on for it, `plugins` |
 | `[keys]` | | the TUI's keys, by command, its prefixes, the key back to the sidebar, answering's, resize mode's and the views', and `[[keys.command]]`, keys of your own that run commands: [keys and commands](#keys-and-commands) |
 | `[sidebar]` | | the sidebar's `width`, whether it starts `folded`, what folding keeps, whether what needs you is pinned, and how narrow a terminal shows [one column](#on-a-phone): [the sidebar](#the-sidebar) |
@@ -3007,7 +3020,7 @@ offered as a profile of its own.
 The daemon reads the notification and sound settings each time it tells you something, `[plugins]` each time it
 does something a plugin adds, `[memory]` each time a task closes or a search runs, `[tasks]` each time a
 background task's run starts, `[handoff]` each time a note is written, `[sessions]` every 15 seconds and as it
-starts sessions again, a flow
+starts sessions again (`restore_screens` every second), a flow
 each time one starts, `[[project]]` each time a project's commands run,
 `name_from_prompt` each time it names a session, `resume_reported_agents` as it starts sessions again,
 `[clipboard]` each time a program copies out of sight,
@@ -3192,7 +3205,7 @@ and `[`) go from one to the next, and `1` to `8` straight to one.
 |---|---|
 | General | [notifications](#usage): whether, after how long, only while you're away, and a command of your own in place of them; sounds; whether `q` asks before it quits; looking for a [newer crystal](#updating); how long the [event log](#events) keeps what happened; and whether [draft pull requests](#pull-requests) are hidden |
 | Look | the [theme](#themes), whether it follows your system's appearance (the row says which theme each side is) and the theme for each side; the [tab bar](#terminals-the-window-and-the-tab-bar)'s place, whether it's left out with one tab, and its separator; the window's title; the [sidebar](#the-sidebar)'s width, whether it starts folded, what folding keeps, whether what needs you is pinned, and how narrow a terminal shows [one column](#on-a-phone); whether keys pressed show at the footer (`show_keys`), and whether [mermaid diagrams](#the-file-finder-and-the-tree-browser) are drawn in ASCII |
-| Sessions | what the [new-session panel](#starting-a-session) offers first, naming sessions for their prompt, how long an agent may sit [idle](#archiving-and-idle-agents), how far apart agents start again after a [crash or a reboot](#usage) and whether one resumes as it said; a new terminal's shell, whether it's a login shell and where it starts; how much a session's history keeps; and the branch new worktrees start from and where they go |
+| Sessions | what the [new-session panel](#starting-a-session) offers first, naming sessions for their prompt, how long an agent may sit [idle](#archiving-and-idle-agents), how far apart agents start again after a [crash or a reboot](#usage) and whether one resumes as it said; a new terminal's shell, whether it's a login shell and where it starts; how much a session's history keeps, and whether a terminal shows it again after a crash or a reboot; and the branch new worktrees start from and where they go |
 | Mouse | [the mouse](#usage), and whether programs' copies go on [your clipboard](#zoom-copy-mode-and-search) |
 | Tasks | the permission mode [background tasks](#background-tasks) start in, and what a run and a day may spend |
 | Memory | how memory learns ([the distiller](#the-distiller), its model and what it may spend) and whether it searches [by meaning](#search-by-meaning) and reranks |

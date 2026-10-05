@@ -174,6 +174,7 @@ impl Daemon {
             saved.conversation.clone(),
             saved.resume.clone(),
             Some(&notice),
+            None,
         );
         // Whoever was looking at it is let go, to look again at the session
         // started under its id.
@@ -183,6 +184,9 @@ impl Daemon {
                 let mut started = sessions.pop().expect("start added a session");
                 if let Some(goal) = goal {
                     started.give_task(goal);
+                }
+                if saved.name_given {
+                    started.keep_given_name();
                 }
                 self.events
                     .emit(Event::about_session(Kind::SessionStarted, &started.info()));

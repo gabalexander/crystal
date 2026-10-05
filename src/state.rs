@@ -37,6 +37,10 @@ pub struct SavedSession {
     /// agent is told of each time it starts.
     #[serde(default, skip_serializing_if = "TaskBrief::is_empty")]
     pub about: TaskBrief,
+    /// Whether the user or a script gave it its name, which a rename in
+    /// Claude Code leaves, after a restart as before it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub name_given: bool,
 }
 
 /// The database of the daemon at `socket`. A server's socket lives in

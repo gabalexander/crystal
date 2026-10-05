@@ -790,6 +790,12 @@ pub struct SessionSettings {
     /// don't all start at once: the first straight away, and `0` all of
     /// them. Other programs start straight away.
     pub restart_spacing_ms: u64,
+    /// Whether a terminal started again after a cold restart shows what it
+    /// showed before, its history and all, above its new program: each
+    /// terminal's screen is kept in the database every so often while this
+    /// is on. Off unless asked for, since a screen can hold secrets; an
+    /// agent picked up in its conversation shows its own.
+    pub restore_screens: bool,
 }
 
 impl Default for SessionSettings {
@@ -797,6 +803,7 @@ impl Default for SessionSettings {
         SessionSettings {
             stop_idle_after: "off".to_string(),
             restart_spacing_ms: 250,
+            restore_screens: false,
         }
     }
 }
@@ -2078,6 +2085,7 @@ back_to = "build"
             sessions: SessionSettings {
                 stop_idle_after: "45m".into(),
                 restart_spacing_ms: 1000,
+                restore_screens: true,
             },
             update: UpdateSettings { check: false },
             profiles: vec![Profile {

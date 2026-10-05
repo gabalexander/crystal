@@ -3566,12 +3566,139 @@ fn the_tui_says_what_a_restart_couldn_t_start_and_starts_it_again() {
     tui.shows("after the restart: 1 couldn't start: lost");
     tui.shows("couldn't start");
     tui.shows("isn't there");
+    // It needs you: pinned at the top, and listed with why.
+    tui.shows("needs you · 1");
+    tui.type_keys("U");
+    tui.shows("couldn't start again");
+    tui.shows("r starts it again");
+    tui.type_keys("\x1b");
+    tui.hides("r starts it again");
     // Put right, Enter starts it again.
     std::fs::create_dir(&gone).unwrap();
     tui.type_keys("\r");
     tui.shows("start lost again? y/n");
     tui.type_keys("y");
     eventually("it has started", || status(&crystal, "lost") == "running");
+    crash(daemon);
+}
+
+#[test]
+fn a_terminal_shows_what_it_showed_before_a_crash_only_when_asked_to() {
+    let crystal = Crystal::new();
+    let daemon = crystal.start_daemon();
+    crystal.ok(&[
+        "new",
+        "-n",
+        "shell",
+        "sh",
+        "-c",
+        "echo pid $$; exec sleep 300",
+    ]);
+    let before = crystal.pid("shell");
+    shows_on_screen(&crystal, "shell", &format!("pid {before}"));
+    eventually("it's saved", || crystal.saved().contains("shell"));
+    let kept = || crystal.query("SELECT coalesce(group_concat(screen), '') FROM screens");
+    // Off unless asked for: a screen can hold secrets.
+    thread::sleep(Duration::from_millis(1500));
+    assert_eq!(kept().as_deref(), Some(""));
+
+    let quiet = "notify = false\nname_from_prompt = false\n\n[plugins]\nmemory = false\n\n\
+                 [sound]\nenabled = false\n";
+    crystal.configure(&format!("{quiet}\n[sessions]\nrestore_screens = true\n"));
+    eventually("its screen is kept", || {
+        kept().is_some_and(|kept| kept.contains(&format!("pid {before}")))
+    });
+
+    crash(daemon);
+    // Left behind by the crash, it would pass for the next daemon's.
+    std::fs::remove_file(&crystal.socket).unwrap();
+    let daemon = crystal.start_daemon();
+    let after = crystal.pid("shell");
+    assert_ne!(after, before);
+    // What it showed, above what its program shows now.
+    let read = || crystal.ok(&["read", "shell", "--history"]);
+    eventually("its program has written", || {
+        read().contains(&format!("pid {after}"))
+    });
+    let screen = read();
+    let at = |text: &str| {
+        screen
+            .find(text)
+            .unwrap_or_else(|| panic!("{text}: {screen}"))
+    };
+    assert!(at(&format!("pid {before}")) < at("crystal restarted"));
+    assert!(at("crystal restarted") < at(&format!("pid {after}")));
+
+    // Turned off, what was kept is forgotten.
+    crystal.configure(quiet);
+    eventually("the screens are forgotten", || {
+        kept().as_deref() == Some("")
+    });
+    crash(daemon);
+}
+
+#[test]
+fn a_name_given_stays_through_a_rename_in_claude_code_after_a_restart() {
+    let crystal = Crystal::new();
+    let bin = fake_claude(crystal.dir.path());
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let daemon = crystal.start_daemon_with(&[("PATH", &path)]);
+    let out = crystal
+        .command(&["new", "-n", "refunds", "claude"])
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let args = written(&crystal.dir.path().join("args"));
+    let args: Vec<&str> = args.lines().collect();
+    let settings: serde_json::Value = serde_json::from_str(args[3]).unwrap();
+    let hook = settings["hooks"]["Stop"][0]["hooks"][0]["command"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let id = || {
+        let sessions: serde_json::Value =
+            serde_json::from_str(&crystal.ok(&["ls", "--json"])).unwrap();
+        sessions[0]["id"].as_str().unwrap().to_string()
+    };
+    // Where Claude Code keeps the conversation, and its name beside it.
+    let projects = crystal.dir.path().join("projects");
+    let transcript = projects.join("talk-1.jsonl");
+    let named = projects.join("talk-1").join("custom-title.json");
+    std::fs::create_dir_all(named.parent().unwrap()).unwrap();
+    std::fs::write(&transcript, "{}\n").unwrap();
+    std::fs::write(&named, r#"{"customTitle":"Fix refund rounding"}"#).unwrap();
+    let event = |name: &str| {
+        format!(
+            r#"{{"hook_event_name":"{name}","session_id":"talk-1","transcript_path":"{}"}}"#,
+            transcript.display()
+        )
+    };
+    let says = |event: &str| {
+        let id = id();
+        let env = [("CRYSTAL_SESSION", "refunds"), ("CRYSTAL_SESSION_ID", &id)];
+        hook_says(&crystal, &env, &hook, event)
+    };
+    assert_eq!(says(&event("SessionStart")), "");
+    eventually("its conversation is written down", || {
+        crystal.saved().contains("talk-1")
+    });
+
+    crash(daemon);
+    // Left behind by the crash, it would pass for the next daemon's.
+    std::fs::remove_file(&crystal.socket).unwrap();
+    let daemon = crystal.start_daemon_with(&[("PATH", &path)]);
+    assert_eq!(status(&crystal, "refunds"), "running");
+    eventually("claude picks its conversation up", || {
+        written(&crystal.dir.path().join("args")).contains("talk-1")
+    });
+    // The name Claude Code has is where it starts; a rename after it is
+    // followed but for a name the user gave, before the restart as after.
+    assert_eq!(says(&event("Stop")), "");
+    std::fs::write(&named, r#"{"customTitle":"Something else"}"#).unwrap();
+    assert_eq!(says(&event("Stop")), "");
+    assert!(crystal.row("refunds").is_some());
+    assert!(crystal.row("something-else").is_none());
     crash(daemon);
 }
 

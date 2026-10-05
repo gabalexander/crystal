@@ -311,6 +311,7 @@ impl Handed {
             goal: self.goal.clone(),
             resume,
             about: self.about.clone(),
+            name_given: self.name_given,
         })
     }
 }
@@ -345,7 +346,9 @@ fn restart_with(
 impl Session {
     /// Starts `argv` in a PTY of its own. `command` is what was asked for;
     /// `argv` may add to it, like the flags that make an agent report what
-    /// it's doing.
+    /// it's doing. Given `before`, the screen a terminal of the session's
+    /// showed before a cold restart, its screen shows that above what the
+    /// program writes (see [`vt::Screen::after_restart`]).
     pub fn spawn(
         id: String,
         name: String,
@@ -353,6 +356,7 @@ impl Session {
         argv: &[String],
         cwd: PathBuf,
         env: &BTreeMap<String, String>,
+        before: Option<&vt::Saved>,
     ) -> Result<Session> {
         let (rows, cols) = UNSEEN_SIZE;
         let pty = native_pty_system().openpty(portable_pty::PtySize {
@@ -379,7 +383,16 @@ impl Session {
         // waits for it.
         drop(child);
 
-        let term = Arc::new(Term::new(Some(Pty::of(pty.master)?)));
+        let pty = Some(Pty::of(pty.master)?);
+        let term = match before {
+            // What's on the screen isn't in the ring.
+            Some(before) => {
+                let vt = vt::Screen::after_restart(before, rows, cols);
+                Term::with_screen(pty, vt, false)
+            }
+            None => Term::new(pty),
+        };
+        let term = Arc::new(term);
         term.start_pumping();
         let state = Arc::new(Mutex::new(State::Running));
         let changed = Arc::new(Mutex::new(SystemTime::now()));
@@ -549,7 +562,7 @@ impl Session {
             reporter: None,
             reporter_job: None,
             named_after_program: false,
-            name_given: false,
+            name_given: saved.name_given,
             title: claude_title::Watch::default(),
             typed_agent: None,
             subagents: 0,
@@ -1611,6 +1624,7 @@ impl Session {
         if let Some(saved) = &self.start_from {
             return SavedSession {
                 name: self.name.clone(),
+                name_given: self.name_given,
                 ..saved.clone()
             };
         }
@@ -1639,6 +1653,7 @@ impl Session {
             goal: self.goal.clone(),
             resume,
             about: self.about.clone(),
+            name_given: self.name_given,
         }
     }
 
@@ -1915,7 +1930,17 @@ struct Screen {
     unseen_copies: u32,
     /// The output lately, with when it came, for `crystal read --since`.
     ring: OutputRing,
+    /// The [`WRITES`] count as the program last wrote to the main screen,
+    /// the one a cold restart shows again: it has changed since whoever
+    /// last kept it when this has. The alternate screen doesn't count, so
+    /// a program that stays on it isn't gone back from again and again to
+    /// keep a main screen that hasn't changed.
+    main_written: u64,
 }
+
+/// How many times any session's program has written to its screen: each
+/// time, the count goes up, so the count a screen keeps is never another's.
+static WRITES: AtomicU64 = AtomicU64::new(0);
 
 struct Viewer {
     id: u64,
@@ -1961,6 +1986,7 @@ impl Term {
                 touched: Instant::now(),
                 unseen_copies: 0,
                 ring: OutputRing::new(now_ms(), from_the_start),
+                main_written: 0,
             }),
             pump: Mutex::default(),
             output_waits: AtomicU32::new(0),
@@ -2049,6 +2075,19 @@ impl Term {
     /// are looking at it.
     pub fn output_waits(&self) -> u32 {
         self.output_waits.load(Ordering::Relaxed)
+    }
+
+    /// A number that changes each time the program writes to the main
+    /// screen, and is never another screen's: whether what
+    /// [`Term::kept_screen`] keeps has changed since it was last kept.
+    pub fn main_written(&self) -> u64 {
+        self.screen.lock().unwrap().main_written
+    }
+
+    /// The main screen and its history, to show again above the program
+    /// started again after a cold restart: see [`vt::Screen::kept`].
+    pub fn kept_screen(&self) -> vt::Saved {
+        self.screen.lock().unwrap().vt.kept()
     }
 
     /// The screen, one string per row, after the last `history` rows of
@@ -2231,8 +2270,12 @@ impl Term {
     /// viewer. Returns what the program asked its terminal, to answer.
     fn take_output(&self, output: &[u8]) -> Vec<u8> {
         let mut screen = self.screen.lock().unwrap();
+        let alternate = screen.vt.alternate_screen();
         screen.vt.process(output);
         screen.ring.push(output, now_ms());
+        if !alternate || !screen.vt.alternate_screen() {
+            screen.main_written = WRITES.fetch_add(1, Ordering::Relaxed) + 1;
+        }
         // Viewers get the same output, so that their own screens keep the
         // same history.
         let chunk: Arc<[u8]> = output.into();
@@ -2495,7 +2538,32 @@ mod tests {
             }),
             resume: None,
             about: Default::default(),
+            name_given: false,
         }
+    }
+
+    #[test]
+    fn only_what_goes_on_the_main_screen_changes_what_a_restart_would_show_again() {
+        let term = Term::without_terminal();
+        assert_eq!(term.main_written(), 0);
+        term.show(b"$ ls\r\nCargo.toml\r\n");
+        let main = term.main_written();
+        assert!(main > 0);
+        // Onto the alternate screen, the main one stays as it was.
+        term.show(b"\x1b[?1049hfull screen");
+        let entered = term.main_written();
+        assert!(entered > main, "it began on the main screen");
+        term.show(b"\x1b[Hredrawn");
+        assert_eq!(term.main_written(), entered);
+        assert!(term.kept_screen().output.contains("Cargo.toml"));
+        term.show(b"\x1b[?1049l$ ");
+        assert!(term.main_written() > entered);
+        let kept = term.kept_screen().output;
+        assert!(kept.contains("$ ls") && !kept.contains("redrawn"), "{kept}");
+        // Another screen's count is never the same.
+        let other = Term::without_terminal();
+        other.show(b"$ ls\r\n");
+        assert_ne!(other.main_written(), term.main_written());
     }
 
     #[test]
@@ -2524,10 +2592,20 @@ mod tests {
         session.check();
         assert!(session.take_closed().is_empty());
         assert!(session.goal.as_ref().unwrap().is_open());
-        // Renamed meanwhile, it starts under its new name.
+        // Renamed meanwhile, it starts under its new name, which is given.
         session.name = "login".into();
+        session.renamed();
         assert_eq!(session.launch().name, "login");
+        assert!(session.launch().name_given);
         assert_eq!(session.launch().conversation, saved.conversation);
+        // A name given before the restart stays given.
+        let given = SavedSession {
+            name_given: true,
+            ..saved
+        };
+        let session = Session::to_start("id-2".into(), given.clone());
+        assert!(session.name_given());
+        assert_eq!(session.saved(), Some(given));
     }
 
     #[test]

@@ -81,6 +81,7 @@ pub enum Setting {
     ShellMode,
     NewCwd,
     Scrollback,
+    RestoreScreens,
     WorktreeBase,
     WorktreeDirectory,
     MouseCapture,
@@ -136,6 +137,7 @@ impl Setting {
             Setting::ShellMode => &["terminal", "shell_mode"],
             Setting::NewCwd => &["terminal", "new_cwd"],
             Setting::Scrollback => &["scrollback_lines"],
+            Setting::RestoreScreens => &["sessions", "restore_screens"],
             Setting::WorktreeBase => &["worktrees", "base"],
             Setting::WorktreeDirectory => &["worktrees", "directory"],
             Setting::MouseCapture => &["mouse", "capture"],
@@ -191,6 +193,7 @@ impl Setting {
             Setting::ShellMode => "  login shell",
             Setting::NewCwd => "new terminals in",
             Setting::Scrollback => "scrollback",
+            Setting::RestoreScreens => "restore screens",
             Setting::WorktreeBase => "base branch",
             Setting::WorktreeDirectory => "directory",
             Setting::MouseCapture => "take the mouse",
@@ -483,7 +486,13 @@ const TABS: [Tab; 8] = [
             ),
             (
                 "Terminals",
-                &[S::Shell, S::ShellMode, S::NewCwd, S::Scrollback],
+                &[
+                    S::Shell,
+                    S::ShellMode,
+                    S::NewCwd,
+                    S::Scrollback,
+                    S::RestoreScreens,
+                ],
             ),
             ("Worktrees", &[S::WorktreeBase, S::WorktreeDirectory]),
         ],
@@ -952,6 +961,7 @@ impl SettingsView {
                 let lines = next_of(&SCROLLBACK, config.scrollback_lines, forward);
                 number(i64::try_from(lines).unwrap_or(i64::MAX))
             }
+            S::RestoreScreens => on(!config.sessions.restore_screens),
             S::MouseCapture => on(!config.mouse.capture),
             S::CopyOnSelect => on(!config.mouse.copy_on_select),
             S::ScrollLines => {
@@ -1500,6 +1510,10 @@ fn shown(setting: Setting, config: &Config) -> Shown {
             format!("{} lines", config.scrollback_lines),
             "kept as they scroll off, from the next session on: ←/→",
         ),
+        S::RestoreScreens => switch(
+            config.sessions.restore_screens,
+            "after a crash or a reboot, kept in the database: it may hold secrets",
+        ),
         S::WorktreeBase => choice(
             or_none(
                 config.worktrees.base.as_deref().unwrap_or(""),
@@ -1998,6 +2012,7 @@ mod tests {
             (S::MermaidAscii, true),
             (S::NameFromPrompt, false),
             (S::ResumeReported, false),
+            (S::RestoreScreens, true),
             (S::MouseCapture, false),
             (S::CopyOnSelect, false),
             (S::Scrollbars, false),
@@ -2181,7 +2196,7 @@ mod tests {
             }
         }
         let settings: usize = (0..KEYS_TAB).map(|tab| rows(tab, &[]).len()).sum();
-        assert_eq!(settings, 49);
+        assert_eq!(settings, 50);
     }
 
     /// Writes `change` to a config file made of `text`, and reads it back.

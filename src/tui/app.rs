@@ -42,7 +42,7 @@ use super::review;
 use super::search::{self, Around, StatusFilter};
 use super::settings_view::{self, SettingsView};
 use super::split_tree::{Direction, Pane, SplitTree, Way};
-use super::status::Status;
+use super::status::{Need, Status};
 use super::switcher::{self, Switcher};
 use super::tabs::Tabs;
 use super::text_input::TextInput;
@@ -2368,8 +2368,9 @@ impl App {
     }
 
     /// The sessions the sidebar pins at its top, from every tab: those
-    /// waiting on the user, then those that finished a turn nobody has
-    /// looked at, each tab's in its order, the tab in front's first. None
+    /// waiting on the user, then those that couldn't start again after a
+    /// restart, then those that finished a turn nobody has looked at (see
+    /// [`Need`]), each tab's in its order, the tab in front's first. None
     /// while `/`'s filter is open, which finds sessions in every tab itself.
     fn pinned(&self) -> Vec<usize> {
         if !self.pin_needs_you || self.filter.is_some() {
@@ -2377,19 +2378,13 @@ impl App {
         }
         let count = self.tabs.all().len();
         let first = self.tabs.current_index();
-        let in_order: Vec<usize> = (0..count)
+        let mut pinned: Vec<(Need, usize)> = (0..count)
             .flat_map(|step| self.sessions_in((first + step) % count))
+            .filter_map(|index| Need::of(&self.sessions[index]).map(|need| (need, index)))
             .collect();
-        [Status::Waiting, Status::Done]
-            .into_iter()
-            .flat_map(|wanted| {
-                in_order
-                    .iter()
-                    .copied()
-                    .filter(move |&index| Status::of(&self.sessions[index]) == wanted)
-                    .collect::<Vec<_>>()
-            })
-            .collect()
+        // Stable: each need's in the order they came.
+        pinned.sort_by_key(|(need, _)| *need);
+        pinned.into_iter().map(|(_, index)| index).collect()
     }
 
     /// The tab the session at `index` is in, when it isn't the tab in
@@ -6991,6 +6986,7 @@ impl App {
                 self.ask(Question::SendFlowBack(run), "");
                 None
             }
+            needs_you::Step::StartAgain(name) => Some(Action::Respawn(name)),
             needs_you::Step::Say(said) => {
                 self.notify(said);
                 None
@@ -7128,19 +7124,16 @@ impl App {
     }
 
     /// The next session that needs the user, in any tab: one waiting on
-    /// them comes before one that's done. See [`Self::sessions_in_turn`].
+    /// them comes before one that couldn't start again after a restart, and
+    /// that before one that's done (see [`Need`]). See
+    /// [`Self::sessions_in_turn`].
     fn next_needing_user(&self) -> Option<usize> {
-        let in_turn = self.sessions_in_turn();
-        for wanted in [Activity::Waiting, Activity::Done] {
-            let found = in_turn.iter().copied().find(|&index| {
-                let session = &self.sessions[index];
-                session.state == State::Running && session.activity == Some(wanted)
-            });
-            if found.is_some() {
-                return found;
-            }
-        }
-        None
+        // The first of the most pressing need.
+        self.sessions_in_turn()
+            .into_iter()
+            .filter_map(|index| Need::of(&self.sessions[index]).map(|need| (need, index)))
+            .min_by_key(|(need, _)| *need)
+            .map(|(_, index)| index)
     }
 
     /// Every session, by index, in the order `u` looks through them: down
@@ -7324,6 +7317,38 @@ mod tests {
         app.select("quiet");
         press(&mut app, KeyCode::Char('u'));
         assert_eq!(selected_name(&app), Some("asking"));
+    }
+
+    /// A session that couldn't start again after a restart, saying why.
+    fn couldnt_start(name: &str) -> SessionInfo {
+        SessionInfo {
+            state: State::Failed {
+                why: "command not found: claude".into(),
+            },
+            pid: None,
+            ..session(name)
+        }
+    }
+
+    #[test]
+    fn u_goes_to_a_session_that_couldn_t_start_again_after_one_asking() {
+        let mut app = App::new(None);
+        app.set_sessions(vec![
+            doing("finished", Activity::Done),
+            couldnt_start("lost"),
+            session("quiet"),
+            doing("asking", Activity::Waiting),
+        ]);
+        app.select("quiet");
+        press(&mut app, KeyCode::Char('u'));
+        assert_eq!(selected_name(&app), Some("asking"));
+        app.set_sessions(vec![
+            doing("finished", Activity::Done),
+            couldnt_start("lost"),
+            session("quiet"),
+        ]);
+        press(&mut app, KeyCode::Char('u'));
+        assert_eq!(selected_name(&app), Some("lost"));
     }
 
     #[test]
@@ -9895,6 +9920,28 @@ mod tests {
     }
 
     #[test]
+    fn a_session_that_couldn_t_start_again_is_pinned_between_a_question_and_a_turn_done() {
+        let mut app = app_with(&["a"]);
+        app.set_sessions(vec![
+            doing("done", Activity::Done),
+            couldnt_start("lost"),
+            doing("asking", Activity::Waiting),
+            ended("gone"),
+        ]);
+        let at = |name: &str| app.sessions().iter().position(|s| s.name == name).unwrap();
+        let (asking, lost, done) = (at("asking"), at("lost"), at("done"));
+        assert_eq!(
+            app.rows()[..4],
+            [
+                Row::NeedsYou(3),
+                Row::Pinned(asking),
+                Row::Pinned(lost),
+                Row::Pinned(done)
+            ]
+        );
+    }
+
+    #[test]
     fn the_config_can_leave_nothing_pinned() {
         let mut app = app_with(&["a"]);
         app.set_sessions(vec![doing("a", Activity::Waiting)]);
@@ -12134,6 +12181,21 @@ gate = true
         assert!(app.needs_you_view().is_none());
         assert_eq!(selected_name(&app), Some("a"));
         assert_eq!(app.tabs().current_index(), 0);
+    }
+
+    #[test]
+    fn r_in_the_needs_you_view_starts_again_a_session_that_couldn_t_start() {
+        let mut app = app_with(&["a"]);
+        app.set_sessions(vec![couldnt_start("lost"), session("shell")]);
+        press(&mut app, KeyCode::Char('U'));
+        let row = app.needs_you_view().unwrap().highlighted().unwrap();
+        assert_eq!(row.name, "lost");
+        assert_eq!(
+            press(&mut app, KeyCode::Char('r')),
+            Some(Action::Respawn("lost".into()))
+        );
+        // The list stays open, for the next.
+        assert!(app.needs_you_view().is_some());
     }
 
     fn resources(sessions: &[(&str, u64)]) -> Resources {
