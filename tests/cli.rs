@@ -10469,6 +10469,56 @@ fn slash_finds_a_pull_request_a_project_with_nothing_running_and_keeps_to_a_stat
 }
 
 #[test]
+fn slash_finds_an_issue_and_a_backlog_item_and_a_click_on_a_count_lists_them() {
+    let crystal = Crystal::new();
+    let dir = crystal.dir.path();
+    let repo = github_repo(dir);
+    let issues = r#"[{"number": 42, "title": "Fix login redirect", "labels": [{"name": "bug"}],
+        "updatedAt": "2026-10-01T10:00:00Z", "author": {"login": "ana"},
+        "url": "https://github.com/acme/app/issues/42"}]"#;
+    let bin = fake_gh(dir, OPEN_PULL_REQUEST, issues);
+    let repo_arg = repo.to_str().unwrap();
+    crystal.ok(&["backlog", "add", "Retry failed charges", "-C", repo_arg]);
+    crystal.ok(&["new", "-n", "planner", "-c", repo_arg, "sleep", "30"]);
+
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let mut tui = crystal.attach_with_env(&[], &[("PATH", &path)]);
+    tui.shows("▸ planner");
+    tui.shows("1 pr · 1 issue");
+
+    // An issue, by its label, opens in the issues view on it.
+    tui.type_keys("/bug");
+    tui.shows("#42 Fix login");
+    tui.shows("1 match");
+    tui.type_keys("\r");
+    tui.shows("issues · app");
+    tui.type_keys("\x1b");
+    tui.shows("▸ planner");
+
+    // An item on the backlog, by a word of its line, opens the backlog on
+    // it.
+    tui.type_keys("/charges");
+    tui.shows("#1 Retry failed");
+    tui.type_keys("\r");
+    tui.shows("backlog · app");
+    tui.type_keys("\x1b");
+    tui.shows("▸ planner");
+
+    // A click on a count on the tab bar lists what it counts.
+    let click = |tui: &mut Terminal, text: &str| {
+        let top = tui.text().lines().next().unwrap().to_string();
+        let column = top[..top.find(text).unwrap()].chars().count() + 1;
+        tui.type_keys(&format!("\x1b[<0;{column};1M\x1b[<0;{column};1m"));
+    };
+    click(&mut tui, "1 pr");
+    tui.shows("pull requests · app");
+    tui.type_keys("\x1b");
+    tui.shows("▸ planner");
+    click(&mut tui, "1 issue");
+    tui.shows("issues · app");
+}
+
+#[test]
 fn an_issue_takes_a_comment_and_a_new_title() {
     let crystal = Crystal::new();
     let repo = github_repo(crystal.dir.path());

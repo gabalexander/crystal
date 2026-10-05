@@ -195,7 +195,7 @@ pub const COMMANDS: &[Spec] = &[
     spec(
         Command::Search,
         "search",
-        "find a session, project, flow run or pull request",
+        "find a session, project, flow run, pull request, issue or backlog item",
         &["/"],
     ),
     spec(

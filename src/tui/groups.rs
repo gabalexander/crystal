@@ -73,6 +73,13 @@ pub enum Row {
     /// An open pull request `/` found, under its project: the project's
     /// main worktree, and the pull request's number.
     PullRequest { project: PathBuf, number: u64 },
+    /// An open issue `/` found, under its project: the project's main
+    /// worktree, and the issue's number.
+    Issue { project: PathBuf, number: u64 },
+    /// An item to do on a project's backlog that `/` found, under its
+    /// project: the project's main worktree, or its directory outside git,
+    /// and the item's number.
+    BacklogItem { project: PathBuf, number: u64 },
 }
 
 /// Puts sessions in the sidebar's order. They come in the order they were
