@@ -93,8 +93,11 @@ whenever what's handed over changes in a way the crystal before couldn't read.
 - `src/drive.rs`: `crystal send` (its text from standard input with `-`, a task's run stopped first with
   `--interrupt`), `wait`, `read` (`--ansi`, `--unwrap`, `--since`), `process-info`, `result`, `answer` and
   `interrupt`, for driving one session from another or a script; waits listen to the daemon's events about their
-  session, and `wait --output` has the daemon look at its screen, asking again when a handover cuts it; `task
-  --wait`'s run, done or failed; a wait that gives up is a `TimedOut`, which `crystal` exits 2 for
+  session, or their task, and `wait --output` has the daemon look at its screen, asking again when a handover
+  cuts it; `send --wait` listening from before it sends, a prompt its agent isn't seen starting on in five
+  seconds a `Stalled`, which `crystal` exits 3 for; a task waited for by its number until it closes, whichever
+  session works on it, and `--until closed`; `task --wait`'s run, done or failed; a wait that gives up is a
+  `TimedOut`, which `crystal` exits 2 for
 - `src/stream.rs`: `crystal observe` and `control`: a session's terminal as JSON lines, its output base64,
   attached again after a handover, and `control`'s commands on standard input (input, keys, resize, release)
 - `src/api.rs`: `crystal api snapshot`: the sessions, layout, projects, open tasks, flow runs and archive in one
