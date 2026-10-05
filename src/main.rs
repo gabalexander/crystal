@@ -53,6 +53,7 @@ mod messages;
 mod model;
 mod names;
 mod notify;
+mod open;
 mod output;
 mod output_ring;
 mod plugin_cli;
@@ -469,6 +470,15 @@ enum Command {
         #[command(subcommand)]
         command: TitleCommand,
     },
+    /// Show files in the TUI used last, in a view of their own: a markdown
+    /// file as its page, its mermaid diagrams drawn, and Enter opening one
+    /// in your $EDITOR. What an agent runs when you ask to see a file.
+    /// Text files only.
+    Open {
+        /// The files, from the current directory or absolute.
+        #[arg(required = true, value_name = "FILE")]
+        files: Vec<PathBuf>,
+    },
     /// Print the TUI's tabs: each one's sessions, and how its panes split
     /// the room. Or write them to a layout file, or lay them out the way
     /// one says, starting what isn't there.
@@ -532,6 +542,8 @@ enum Command {
         interrupt: bool,
 
         /// Then wait for the turn it starts to end, and print how it ended.
+        /// An agent that isn't seen starting on it within 5 seconds has
+        /// stalled: that exits 3.
         #[arg(long)]
         wait: bool,
 
@@ -540,13 +552,15 @@ enum Command {
         timeout: Option<f64>,
     },
     /// Wait until a session's agent isn't working, or its program has
-    /// ended, and print which: done, waiting, idle, exited 0…
+    /// ended, and print which: done, waiting, idle, exited 0… Or until a
+    /// task closes, and print how it went: done, failed or cancelled.
     Wait {
+        /// The session, or a task by its number, like t12.
         name: String,
 
         /// Wait for this instead, and print it once it's reached: working,
-        /// waiting, done, idle, or ended (exited). Several, with commas
-        /// between, wait for any of them.
+        /// waiting, done, idle, ended (exited), or closed, its task. Several,
+        /// with commas between, wait for any of them.
         #[arg(
             long,
             value_enum,
@@ -2066,6 +2080,11 @@ enum BacklogCommand {
 /// script can tell "not yet" from anything else going wrong.
 const TIMED_OUT: u8 = 2;
 
+/// What `crystal send --wait` exits with when the agent was never seen
+/// starting on what it was sent: 3, so a script can read it before sending
+/// it again.
+const STALLED: u8 = 3;
+
 fn main() -> ExitCode {
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
@@ -2088,9 +2107,12 @@ fn main() -> ExitCode {
             // standard error may be a pipe that has gone too.
             let said = format!("{err:#}");
             let _ = writeln!(std::io::stderr(), "crystal: {}", printable::text(&said));
-            match err.is::<drive::TimedOut>() {
-                true => ExitCode::from(TIMED_OUT),
-                false => ExitCode::FAILURE,
+            if err.is::<drive::TimedOut>() {
+                ExitCode::from(TIMED_OUT)
+            } else if err.is::<drive::Stalled>() {
+                ExitCode::from(STALLED)
+            } else {
+                ExitCode::FAILURE
             }
         }
     }
@@ -2252,6 +2274,7 @@ fn run(cli: Cli) -> Result<()> {
             };
             client::lay_out(&socket, layout::Command::Title { text })?;
         }
+        Command::Open { files } => open::run(&socket, &files)?,
         Command::Layout {
             command: Some(LayoutCommand::Export { tab }),
             ..
@@ -2311,22 +2334,21 @@ fn run(cli: Cli) -> Result<()> {
                 [dash] if dash == drive::FROM_STDIN => drive::read_stdin()?,
                 words => words.join(" "),
             };
-            drive::send(&socket, &name, &text, !no_enter, force, interrupt)?;
-            if wait {
-                drive::wait_for_turn(&socket, &name, seconds(timeout), false)?;
-            }
+            let sending = drive::Sending {
+                enter: !no_enter,
+                force,
+                interrupt,
+                wait,
+                timeout: seconds(timeout),
+            };
+            drive::send(&socket, &name, &text, sending)?;
         }
         Command::SendKeys {
             name,
             keys,
             wait,
             timeout,
-        } => {
-            drive::send_keys(&socket, &name, keys)?;
-            if wait {
-                drive::wait_for_turn(&socket, &name, seconds(timeout), false)?;
-            }
-        }
+        } => drive::send_keys(&socket, &name, keys, wait, seconds(timeout))?,
         Command::Wait {
             name,
             until,

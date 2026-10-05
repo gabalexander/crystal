@@ -1,6 +1,7 @@
 //! Laying out the TUI from the command line: `crystal tab`, `crystal pane`
-//! and `crystal layout`. A command goes through the daemon to the TUI used
-//! last, which carries it out and answers with the layout it came to: see
+//! and `crystal layout`, and the files `crystal open` shows in it. A
+//! command goes through the daemon to the TUI used last, which carries it
+//! out and answers with the layout it came to: see
 //! [`crate::layout_relay`]. With no TUI open, the daemon carries it out
 //! itself, the same way, on the tabs the TUIs keep in the database, where
 //! the next TUI to open finds them. This is what goes between them, and how
@@ -12,6 +13,7 @@ use crate::notify::Presence;
 use crate::tui::keymap::Extent;
 use crate::tui::split_tree::{Direction, Way};
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 /// Why an order can't be passed on to a TUI: none is open.
 pub const NO_TUI: &str = "no TUI is running";
@@ -107,6 +109,11 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         popup: Option<Popup>,
     },
+    /// Show `files`, text files by their absolute paths, in a view of
+    /// their own over the tabs, each by its path from `dir`, the worktree
+    /// they were opened in, where an editor opening one starts: `crystal
+    /// open`. Only a TUI can.
+    Open { dir: PathBuf, files: Vec<PathBuf> },
     /// Give the TUI's terminal the title `text`, in place of the one the
     /// settings make, or with none, go back to that one.
     Title { text: Option<String> },

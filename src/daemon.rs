@@ -2809,13 +2809,9 @@ impl Daemon {
         let id = tasks::parse_id(handle).with_context(|| {
             format!("there's no task or session called {handle}: give a task's number, like t12")
         })?;
-        let pending = {
-            let db = self.db.lock().unwrap();
-            let pending = db.pending_task(id)?;
-            let pending = pending.with_context(|| format!("there's no open task t{id}"))?;
-            db.remove_pending_task(id)?;
-            pending
-        };
+        let pending = self.db.lock().unwrap().pending_task(id)?;
+        let pending = pending.with_context(|| format!("there's no open task t{id}"))?;
+        let project = project::of(&pending.cwd).path;
         let closed = now_seconds();
         let cancelled = TaskRecord {
             outcome: Some(TaskOutcome::new(
@@ -2826,7 +2822,18 @@ impl Daemon {
             pending: false,
             ..tasks::pending_record(&pending)
         };
-        self.write_down(&pending.cwd, None, &cancelled);
+        {
+            // Closed as it stops waiting to start, in one go, so that
+            // whoever looks for it meanwhile finds it one way or the other;
+            // and once, though it's cancelled twice at once.
+            let mut db = self.db.lock().unwrap();
+            ensure!(db.remove_pending_task(id)?, "there's no open task t{id}");
+            if let Err(err) = db.record_task(&project, &cancelled) {
+                eprintln!("crystal daemon: couldn't write down a closed task: {err:#}");
+            }
+        }
+        let event = Event::pending_task(Kind::TaskClosed, project, cancelled);
+        self.events.emit(event);
         Ok(())
     }
 
@@ -3694,7 +3701,7 @@ fn start_as(
         tasks::forge_notes(&brief, &cwd, task.is_some()),
     ]);
     let parallel = (agents::program_name(&command) == Some("claude"))
-        .then(|| agents::PARALLEL_WORK.to_string());
+        .then(|| format!("{} {}", agents::PARALLEL_WORK, agents::SHOWING_FILES));
     let remembered = remembered(socket, &cwd, &command);
     let said = [
         task.as_deref(),
@@ -3886,8 +3893,9 @@ fn claude_tools(
 
 /// Claude Code's permission rules for crystal's own commands, so that an
 /// agent doing what its notes and crystal's skill teach (starting and
-/// driving sessions of its own, reading them, closing its task, noting
-/// something for later) doesn't stop for the user at every step: a task in
+/// driving sessions of its own, reading them, showing the user a file,
+/// closing its task, noting something for later) doesn't stop for the user
+/// at every step: a task in
 /// the background that did would sit there with its work done, and one
 /// driving workers would wait on each. A plugin's commands only while it's
 /// on. What removes or cancels what's there (`crystal kill`, `worktree rm`,
@@ -3901,7 +3909,8 @@ fn claude_tools(
 /// only as whole words: `crystal send:*` isn't `crystal send-keys`, and
 /// `crystal task:*` isn't `crystal tasks cancel`.
 fn crystal_commands(config: &Config) -> Vec<&'static str> {
-    // Sessions: starting, driving and reading them, and what's on screen.
+    // Sessions: starting, driving and reading them, and what's on screen,
+    // files shown there among it.
     let mut rules = vec![
         "Bash(crystal ls:*)",
         "Bash(crystal new:*)",
@@ -3919,6 +3928,7 @@ fn crystal_commands(config: &Config) -> Vec<&'static str> {
         "Bash(crystal layout export:*)",
         "Bash(crystal pane split:*)",
         "Bash(crystal pane close:*)",
+        "Bash(crystal open:*)",
     ];
     if tasks::enabled(config) {
         rules.extend([
@@ -4544,6 +4554,7 @@ mod tests {
             "Bash(crystal send:*)",
             "Bash(crystal wait:*)",
             "Bash(crystal read:*)",
+            "Bash(crystal open:*)",
             "Bash(crystal task:*)",
             "Bash(crystal flow run:*)",
             "Bash(crystal backlog done:*)",

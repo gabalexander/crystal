@@ -1958,6 +1958,30 @@
         {
           "type": "object",
           "properties": {
+            "dir": {
+              "type": "string"
+            },
+            "files": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "do": {
+              "type": "string",
+              "const": "open"
+            }
+          },
+          "required": [
+            "do",
+            "dir",
+            "files"
+          ],
+          "description": "Show `files`, text files by their absolute paths, in a view of their own over the tabs, each by its path from `dir`, the worktree they were opened in, where an editor opening one starts: `crystal open`. Only a TUI can."
+        },
+        {
+          "type": "object",
+          "properties": {
             "text": {
               "type": [
                 "string",
