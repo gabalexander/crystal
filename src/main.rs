@@ -53,6 +53,7 @@ mod messages;
 mod model;
 mod names;
 mod notify;
+mod open;
 mod output;
 mod output_ring;
 mod plugin_cli;
@@ -467,6 +468,15 @@ enum Command {
     Title {
         #[command(subcommand)]
         command: TitleCommand,
+    },
+    /// Show files in the TUI used last, in a view of their own: a markdown
+    /// file as its page, its mermaid diagrams drawn, and Enter opening one
+    /// in your $EDITOR. What an agent runs when you ask to see a file.
+    /// Text files only.
+    Open {
+        /// The files, from the current directory or absolute.
+        #[arg(required = true, value_name = "FILE")]
+        files: Vec<PathBuf>,
     },
     /// Print the TUI's tabs: each one's sessions, and how its panes split
     /// the room. Or write them to a layout file, or lay them out the way
@@ -2254,6 +2264,7 @@ fn run(cli: Cli) -> Result<()> {
             };
             client::lay_out(&socket, layout::Command::Title { text })?;
         }
+        Command::Open { files } => open::run(&socket, &files)?,
         Command::Layout {
             command: Some(LayoutCommand::Export { tab }),
             ..

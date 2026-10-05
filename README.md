@@ -534,6 +534,7 @@ crystal profile show review                 # what a profile runs, and where it 
 crystal pane split review                   # show a session in a pane beside yours in the TUI (see below)
 crystal tab new review                      # a new tab in the TUI, in front
 crystal title set "deploying"               # the title of the TUI's terminal, until `crystal title clear`
+crystal open docs/plan.md                   # show a file in the TUI, a markdown file as its page (see below)
 crystal layout                              # the TUI's tabs and how each splits its panes
 crystal layout apply dev.json               # lay them out as a file says, starting what isn't there
 crystal skill --install                     # teach Claude Code to drive crystal (see below)
@@ -725,8 +726,8 @@ everywhere else. `[keys]` names them the same way:
 | `view-close` | `q` | in a view: close it, or step back out of what's open in it |
 
 A view is any of the lists that take the keyboard: the diff, the file finder, the tree browser, find in files,
-the branch switcher, memory, the handoff notes, the backlog, layouts, the archive, the plugins, the settings,
-what needs you, RAM, the timeline, the issues, the pull requests, `/` and the command list. A key you give a view's name stands in every
+the branch switcher, memory, the handoff notes, the files `crystal open` shows, the backlog, layouts, the
+archive, the plugins, the settings, what needs you, RAM, the timeline, the issues, the pull requests, `/` and the command list. A key you give a view's name stands in every
 one of them for the key they all take for it, `↓`, `↑`, `PgDn`, `PgUp`, `Enter` or `Esc`, which go on working
 whatever you give; the defaults you leave it without do nothing. While a view is taking what you type, like
 the file finder's query or a filter, a letter is typed rather than standing for anything, so a key there is
@@ -1348,6 +1349,48 @@ $ printf 'sequenceDiagram\n  Alice->>Bob: hello\n  Bob-->>Alice: hi\n' | crystal
     │         │
 ```
 
+### Files an agent shows you
+
+Ask an agent to show you a file, "open it" or "show me the plan", and it runs `crystal open <file>...`: the
+files come up in the TUI you used last, in a view of their own over the tabs, rather than pasted into its
+answer. They're listed on the left, each by its path from the worktree they were opened in, and the one selected
+is read on the right, highlighted as the [file finder](#the-file-finder-and-the-tree-browser) shows it, a
+markdown file as its page with its mermaid diagrams drawn. That makes it the place to read an explanation an
+agent writes you: a markdown page with a diagram for each flow, which it opens once it's written.
+
+| Key | In the files shown |
+|---|---|
+| `↑` / `↓`, `Tab` / `Shift+Tab` | the file above or below; `Tab` goes round |
+| `Space` / `Shift+Space`, `PageDown` / `PageUp` | page through the preview |
+| `Home` / `End`, `Shift+↑` / `Shift+↓` | the top or end of the preview; a line up or down |
+| `Ctrl+R` | a markdown file's source, or its page again |
+| `Enter` | open the file in your `$EDITOR` (or `vi`) as a session of its own, as the finder's `Enter` does |
+| `Esc` | close it |
+
+A click picks a file, and the wheel scrolls the preview. The files take the place of any view that was open,
+like the diff, and files opened again take the place of those shown, read afresh; what else was open, like the
+new-session panel with what you'd typed in it, is there again once they're closed.
+
+A [profile](#profiles) can ask for a page every time, like docket's explainer:
+
+```toml
+[[profile]]
+name = "explainer"
+description = "Writes you a page on part of the code"
+agent = "claude"
+prompt = "Explain this part of the codebase:"
+postfix = """Change no code. Write the explanation to a markdown file: a summary, then the flow with \
+file and function names, a mermaid diagram for each flow or structure. Then crystal open it, \
+and keep your answer here short."""
+launch = "session"
+```
+
+Claude Code is told to open a file only when you ask, in a prompt or a profile like that one, since it takes
+your screen: a file it wrote or changed is no reason, and it names the path instead. `crystal open` takes text
+files only, from the directory it runs in or absolute, and refuses anything else, an image, a PDF or another
+binary, before anything is shown, so the agent names that path too. With no TUI open, nothing is shown and it
+fails, saying so. You can run it yourself, from any shell.
+
 ### Find in files
 
 `G` searches the files of the selected session's worktree for what you type, with `git grep`: the files git
@@ -1965,7 +2008,9 @@ The install script installs it when it finds Claude Code (its `claude` command, 
 Every Claude Code session crystal starts is also told, on top of its system prompt, to work on several things
 at once as sessions of crystal's, one `crystal new -d -w <branch>` each, rather than in worktrees or subagents
 of its own: a session shows in the sidebar with its status, its diff and its screen, where you can step in,
-while a worktree Claude Code makes for itself shows only once it's left behind.
+while a worktree Claude Code makes for itself shows only once it's left behind. It's told too to show you a
+file you ask to see with [`crystal open`](#files-an-agent-shows-you), rather than paste it into its answer, and
+never to open one unasked.
 
 `--install` won't write over a skill file you've changed; `--force` does. The skill lives in
 [`skill/SKILL.md`](skill/SKILL.md), and each crystal carries its own copy. After an upgrade, the daemon brings
@@ -2176,7 +2221,7 @@ crystal tasks terminal docs                                          # carry on 
 - Every Claude Code session crystal starts, a task or in a terminal, may run the crystal commands it's told
   to without asking, so one driving others doesn't stop at every step:
   - starting and driving sessions: `ls`, `new`, `send`, `wait`, `read`, `result`, `interrupt`, `events`,
-    `rename`, `report`, `notify`, `layout` and `layout export`, `pane split` and `pane close`
+    `rename`, `report`, `notify`, `layout` and `layout export`, `pane split` and `pane close`, and `open`
   - with tasks on, `done`, `task`, and `tasks` with `show`, `log`, `new` and `start`; with flows on, `flow`
     with `run`, `wait`, `show`, `defs` and `retry`
   - with the backlog on, reading it and `add`, `list`, `show`, `edit`, `export`, `done`, `reopen` and

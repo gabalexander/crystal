@@ -59,10 +59,10 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   `subscribe` a stream of its events, for the CLI and a TUI to read, which picks up again after a handover,
   and `lay_out` a layout command for the TUI; restarting the daemon, handed over or cold
 - `src/layout.rs`: laying out the TUI from the command line: the commands `crystal tab`, `crystal pane`,
-  `crystal title`, `crystal layout apply` and `crystal plugin pane open` send (a session shown over the panes
-  or in a popup only by a TUI), the order a TUI gets with the id of the session it was run in, what the TUI
-  reports back, the layout it answers with, where the daemon says the user is, and how `crystal layout` prints
-  it
+  `crystal title`, `crystal layout apply`, `crystal plugin pane open` and `crystal open` send (a session
+  shown over the panes or in a popup, and files shown, only by a TUI), the order a TUI gets with the id of
+  the session it was run in, what the TUI reports back, the layout it answers with, where the daemon says the
+  user is, and how `crystal layout` prints it
 - `src/layout_file.rs`: layout files, as herdr's `layout.export` and `layout.apply` take them: `crystal layout
   export` writing the tabs with what starts each session again, and `crystal layout apply` reading one (the
   shape `crystal layout --json` prints, with a session's `cwd`, `command` and `env` where it's named),
@@ -74,6 +74,10 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   waiting, a few seconds at most, or `NoTui`, for the daemon to carry it out itself on the tabs the TUIs keep;
   nothing is handed over, as each TUI offers again after a handover saying when it was last used, and a
   command just after the daemon starts waits a moment for one to come back
+- `src/open.rs`: `crystal open`: files shown to the user in the TUI used last, as a layout command, what an
+  agent runs when they ask to see one: each checked to be a text file and made absolute, and shown from the
+  top of the worktree it runs in; with no TUI open, nothing shown and the command failing, for the agent to
+  name the paths; adapted from docket's file tabs
 - `src/attach.rs`: `crystal attach`: draws a session in your terminal and sends it your keys, your terminal
   asked for what its program asked of them (the wheel's arrows only while it's on the alternate screen, your
   terminal's own put back after), attaching again after a handover, and passes its bell and what its program
@@ -167,10 +171,11 @@ whenever what's handed over changes in a way the crystal before couldn't read.
     the directory; what crystal's processes take, and where the footer drew its readout of it, for a click;
     no I/O, so it's unit-tested
     - `app/commands.rs`: the layout commands carried out on the state, each on the tab holding the session it's
-      about, in front or not, a layout applied (each of its tabs in place of the tab of its name or after the
-      others, or in place of every tab), and the layout the TUI answers with; and carried out with no TUI
-      open, on a state made for it from the tabs kept, the sessions and the flow runs, on a screen of an unseen
-      session's size; a plugin's pane over the panes left to the event loop to show
+      about, in front or not, the files `crystal open` shows put in a view of their own, a layout applied (each
+      of its tabs in place of the tab of its name or after the others, or in place of every tab), and the
+      layout the TUI answers with; and carried out with no TUI open, on a state made for it from the tabs
+      kept, the sessions and the flow runs, on a screen of an unseen session's size; a plugin's pane over the
+      panes left to the event loop to show
   - `layout_link.rs`: the TUI's end of the layout commands: offering the daemon to take them, again at once
     after a handover or a restart, each one an event for the loop, and its answers, that it was used (a
     key, the mouse, a paste, focus gained) and when its terminal gains and loses the focus  sent back
@@ -312,9 +317,9 @@ whenever what's handed over changes in a way the crystal before couldn't read.
     that narrows it to the files that match and their directories, edited as a text box is but for the keys
     the tree and the preview take, the border dragged, its keys and drawing; kept apart from I/O, so it's
     unit-tested
-  - `preview.rs`: the file finder's, the tree browser's and the handoff view's preview: a file read and
-    highlighted off the event loop, a markdown file's page laid out for its width or its source, scrolling,
-    and drawing them
+  - `preview.rs`: the file finder's, the tree browser's, the handoff view's and the opened view's preview: a
+    file read and highlighted off the event loop, a binary one refused by git's test, which `crystal open`
+    makes too, a markdown file's page laid out for its width or its source, scrolling, and drawing them
   - `memory_view.rs`: the memory view (`m`): a project's entries by their titles, the filter, the entry's
     file opened in the editor (Enter), in the worktree it was said in while that's there, forgetting and
     promoting after a `y`, and its drawing
@@ -331,6 +336,10 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   - `handoff_view.rs`: the handoff view (`M`): the selected session's worktree's handoff notes and the files
     its task kept, listed, the one the bar is on previewed, and opened in the editor; its state and keys,
     kept apart from I/O (the event loop looks for the notes and reads the kept files), and its drawing
+  - `opened_view.rs`: the view `crystal open` brings up: the files listed by their paths from the worktree
+    they were opened in, the one the bar is on previewed, a markdown file as its page with its mermaid
+    diagrams drawn, `Tab` going round them, and Enter opening it in the editor; its state and keys, kept
+    apart from I/O (the event loop reads each file), and its drawing
   - `needs_you.rs`: the needs-you view (`U`): everything waiting on the user, in every tab, the most urgent
     first, from the sessions and flow runs the TUI has, those that couldn't start again after a restart among
     them; answering a permission or a gate in place, or starting one of those again, the bar kept on its row
