@@ -630,7 +630,8 @@ whenever what's handed over changes in a way the crystal before couldn't read.
 - `src/server_cli.rs`: `crystal server`: every server with whether it's running and how many sessions it has,
   stopping one, and deleting a stopped one's state
 - `src/db.rs`: the SQLite database the daemon and the TUI keep their state in (WAL, `synchronous=NORMAL`,
-  migrations by `user_version`, as docket does): the sessions to start again, the archived sessions, flow runs,
+  migrations by `user_version`, as docket does): the sessions to start again and the flow runs, written in one
+  transaction so a crash never leaves a step's session without its run, the archived sessions,
   the projects on crystal's list, each project's backlog (each item's line, body and tags) and closed tasks, the files tasks kept, the tasks waiting to start and the last task number, what each
   task carried beside its goal (its acceptance criteria, pull request and issue), what background
   tasks spent each day, the event log, read from a point on or a page of a timeline's scope at a time back

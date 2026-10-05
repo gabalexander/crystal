@@ -840,24 +840,30 @@ impl Daemon {
             });
             self.list_projects_of(&sessions);
             // Written while the list is still locked, so that an older list
-            // can never be written after a shutdown has emptied it.
+            // can never be written after a shutdown has emptied it; and with
+            // the flow runs, in one go, so that a crash never leaves a step's
+            // session written down without its run.
             let saved = written_down(&sessions, &self.moves.lock().unwrap());
-            if saved != last_saved {
-                match self.db.lock().unwrap().save_sessions(&saved) {
-                    Ok(()) => last_saved = saved,
-                    Err(err) => errln!("crystal daemon: couldn't save the sessions: {err:#}"),
+            let runs = self.flows.lock().unwrap().clone();
+            if saved != last_saved || runs != last_runs {
+                match self
+                    .db
+                    .lock()
+                    .unwrap()
+                    .save_sessions_and_runs(&saved, &runs)
+                {
+                    Ok(()) => {
+                        last_saved = saved;
+                        last_runs = runs;
+                    }
+                    Err(err) => {
+                        errln!("crystal daemon: couldn't save the sessions and flow runs: {err:#}")
+                    }
                 }
             }
             if screens_checked.elapsed() >= SCREENS_CHECK_EVERY {
                 screens_checked = Instant::now();
                 self.keep_screens(&sessions, &mut kept_screens);
-            }
-            let runs = self.flows.lock().unwrap().clone();
-            if runs != last_runs {
-                match self.db.lock().unwrap().save_flow_runs(&runs) {
-                    Ok(()) => last_runs = runs,
-                    Err(err) => errln!("crystal daemon: couldn't save the flow runs: {err:#}"),
-                }
             }
         }
     }
@@ -1108,11 +1114,10 @@ impl Daemon {
         // Written down first: whatever goes wrong from here, the next
         // daemon starts them again, as after any restart.
         let saved = written_down(&sessions, &moves);
-        {
-            let mut db = self.db.lock().unwrap();
-            db.save_sessions(&saved)?;
-            db.save_flow_runs(&flows)?;
-        }
+        self.db
+            .lock()
+            .unwrap()
+            .save_sessions_and_runs(&saved, &flows)?;
         handover::HELPERS.finish(deadline);
         handover::stop_reading();
         let mut handed = Vec::new();

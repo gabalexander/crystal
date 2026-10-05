@@ -471,9 +471,16 @@ impl Db {
         readable(rows, "a flow run")
     }
 
-    /// Writes `runs` down in place of those that were.
-    pub fn save_flow_runs(&mut self, runs: &[FlowRun]) -> Result<()> {
+    /// Writes `sessions` and `runs` down in place of those that were, in
+    /// one go: a flow run's step is never written down without its run,
+    /// nor the run without the step, whatever stops the daemon between.
+    pub fn save_sessions_and_runs(
+        &mut self,
+        sessions: &[SavedSession],
+        runs: &[FlowRun],
+    ) -> Result<()> {
         let tx = self.write()?;
+        write_sessions(&tx, sessions)?;
         write_runs(&tx, runs)?;
         tx.commit()?;
         Ok(())
@@ -1486,7 +1493,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut db = Db::open(&socket_in(&dir)).unwrap();
         let runs = vec![run("ship-1"), run("ship-2")];
-        db.save_flow_runs(&runs).unwrap();
+        db.save_sessions_and_runs(&[saved("a")], &runs).unwrap();
+        assert_eq!(db.sessions().unwrap(), [saved("a")]);
         let kept: String = db
             .conn
             .query_row(
