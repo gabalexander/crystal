@@ -3691,6 +3691,35 @@
         {
           "type": "object",
           "properties": {
+            "name": {
+              "type": "string",
+              "description": "As `Request::Report`'s."
+            },
+            "id": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "default": null
+            },
+            "file": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "recall"
+            }
+          },
+          "required": [
+            "type",
+            "name",
+            "file"
+          ],
+          "description": "Claude Code in a session is about to read or edit `file`, by its path as the agent gave it, its hook says: what its project's memory has about it that the session hasn't been shown, if anything, comes back as `Response::Context`. See `crate::recall`."
+        },
+        {
+          "type": "object",
+          "properties": {
             "id": {
               "type": [
                 "string",
@@ -5602,7 +5631,7 @@
             "type",
             "text"
           ],
-          "description": "What the hook reporting a prompt the user sent adds to it for Claude Code to read: crystal asking it to name its session."
+          "description": "What a hook adds for Claude Code to read: with a prompt the user sent, crystal asking it to name its session; with a file it's about to read or edit, what its project's memory has about it."
         },
         {
           "$ref": "#/$defs/Backlog",

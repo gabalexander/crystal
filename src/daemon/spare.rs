@@ -230,11 +230,13 @@ pub(super) fn adopt(sessions: &mut Vec<Session>, spare: Spare, new: NewSession) 
 }
 
 /// What a warm agent is started with, got ready before it starts: its id,
-/// its arguments, crystal's notes among them, and its environment.
+/// its arguments, crystal's notes among them, and its environment; and the
+/// entries of its project's memory the notes show it.
 struct Boot {
     id: String,
     argv: Vec<String>,
     env: BTreeMap<String, String>,
+    remembered: Vec<u64>,
 }
 
 impl Boot {
@@ -255,7 +257,7 @@ impl Boot {
         // Its task is what's typed into it: the notes say only how to close
         // it.
         let task = tasked.then_some("");
-        let notes = launch_notes(
+        let (notes, remembered) = launch_notes(
             socket,
             &warm.cwd,
             command,
@@ -266,13 +268,18 @@ impl Boot {
         let argv = agents::argv(command, &crystal, None, None, &notes);
         let tools = claude_tools(socket, &warm.cwd, command, &crystal, config);
         let argv = agents::with_options(argv, &tools);
-        Ok(Boot { id, argv, env })
+        Ok(Boot {
+            id,
+            argv,
+            env,
+            remembered,
+        })
     }
 
     /// Starts it, as `warm` asked for it.
     fn spawn(self, warm: &WarmAgent) -> Result<Session> {
         keep_scrollback();
-        Session::spawn(
+        let mut session = Session::spawn(
             self.id,
             NAME.to_string(),
             warm.command.clone(),
@@ -280,7 +287,9 @@ impl Boot {
             warm.cwd.clone(),
             &self.env,
             None,
-        )
+        )?;
+        session.recalled().launched(&self.remembered);
+        Ok(session)
     }
 }
 

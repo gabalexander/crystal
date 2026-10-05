@@ -72,6 +72,17 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         wakeup: Option<Wakeup>,
     },
+    /// Claude Code in a session is about to read or edit `file`, by its
+    /// path as the agent gave it, its hook says: what its project's memory
+    /// has about it that the session hasn't been shown, if anything, comes
+    /// back as [`Response::Context`]. See [`crate::recall`].
+    Recall {
+        /// As [`Request::Report`]'s.
+        name: String,
+        #[serde(default)]
+        id: Option<String>,
+        file: PathBuf,
+    },
     /// What an agent says about itself with `crystal report`. A program in
     /// a session says which by its `id`; from outside, it's the session's
     /// `name`. A report numbered `seq` no higher than the last `source`
@@ -758,8 +769,9 @@ pub enum Response {
     Retitle {
         title: String,
     },
-    /// What the hook reporting a prompt the user sent adds to it for
-    /// Claude Code to read: crystal asking it to name its session.
+    /// What a hook adds for Claude Code to read: with a prompt the user
+    /// sent, crystal asking it to name its session; with a file it's about
+    /// to read or edit, what its project's memory has about it.
     Context {
         text: String,
     },
