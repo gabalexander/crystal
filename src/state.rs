@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 
 /// A running session, as much of it as it takes to start it again.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct SavedSession {
     pub name: String,
     pub command: Vec<String>,

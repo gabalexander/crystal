@@ -4329,6 +4329,35 @@ fn api_snapshot_holds_everything_and_the_seq_to_follow_on_from() {
 }
 
 #[test]
+fn api_schema_says_what_it_covers_prints_it_and_writes_it_to_a_file() {
+    let crystal = Crystal::new();
+    let summary = crystal.ok(&["api", "schema"]);
+    assert!(summary.contains(env!("CARGO_PKG_VERSION")), "{summary}");
+    for message in ["request", "response", "event", "snapshot"] {
+        assert!(summary.contains(message), "{summary}");
+    }
+
+    let printed = crystal.ok(&["api", "schema", "--json"]);
+    let bundled = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/crystal-api.schema.json"),
+    )
+    .unwrap();
+    assert_eq!(printed, bundled);
+    let schema: serde_json::Value = serde_json::from_str(&printed).unwrap();
+    assert_eq!(schema["schemas"]["request"]["$ref"], "#/$defs/Request");
+    assert!(schema["$defs"]["Event"].is_object(), "{schema}");
+
+    let path = crystal.dir.path().join("crystal-api.schema.json");
+    let wrote = crystal.ok(&["api", "schema", "--output", path.to_str().unwrap()]);
+    assert!(wrote.starts_with("wrote the API schema to "), "{wrote}");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), printed);
+    let err = crystal.fails(&["api", "schema", "--json", "--output", "x.json"]);
+    assert!(err.contains("cannot be used with"), "{err}");
+    // None of it needs the daemon, so none was started.
+    assert!(!crystal.socket.exists());
+}
+
+#[test]
 fn integration_status_lists_only_those_out_of_date_when_asked() {
     let crystal = Crystal::new();
     std::fs::create_dir_all(crystal.claude_config_dir()).unwrap();

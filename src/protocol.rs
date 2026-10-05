@@ -20,6 +20,7 @@ use std::io::{self, BufRead, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Request {
     New(NewSession),
@@ -480,6 +481,7 @@ pub enum Request {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct NewSession {
     /// `None` names the session for its task, or else after its program
     /// until its first prompt names it.
@@ -504,6 +506,7 @@ pub struct NewSession {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct NewTask {
     /// `None` names the task for its prompt, or else "task", with a number
     /// added if that's taken.
@@ -522,6 +525,7 @@ pub struct NewTask {
 
 /// A task made to start later: what it's to do, where, and how it starts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct PendingTask {
     /// Given by the daemon as it takes the task.
     #[serde(default)]
@@ -544,6 +548,7 @@ pub struct PendingTask {
 
 /// How a task starts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TaskStart {
     /// An agent in a terminal: this command, with the goal in it as the
@@ -555,6 +560,7 @@ pub enum TaskStart {
 
 /// An answer to the permission a background task asks for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum Answer {
     /// Yes, this once.
@@ -567,6 +573,7 @@ pub enum Answer {
 /// What a task is asked to do: the prompt it starts with, and arguments
 /// for each `claude -p` it runs, like `--permission-mode acceptEdits`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct TaskSpec {
     pub prompt: String,
     #[serde(default)]
@@ -576,6 +583,7 @@ pub struct TaskSpec {
 /// What `crystal result` answers with: a task's last answer, and what the
 /// task has come to so far.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct TaskResult {
     /// What Claude said at the end of its last run, or what went wrong.
     pub text: String,
@@ -591,6 +599,7 @@ pub struct TaskResult {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Response {
     Created {
@@ -729,6 +738,7 @@ pub enum Response {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct SessionInfo {
     pub name: String,
     /// Unlike its name, a session's id never changes: it's how a program
@@ -805,6 +815,7 @@ fn is_zero(count: &u32) -> bool {
 
 /// What runs in a session's terminal: `crystal process-info`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct Processes {
     /// The session's own program.
     pub pid: Option<u32>,
@@ -817,6 +828,7 @@ pub struct Processes {
 
 /// A process, as `crystal process-info` shows it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct ProcessInfo {
     pub pid: i32,
     /// Its program's name.
@@ -830,6 +842,7 @@ pub struct ProcessInfo {
 /// How full a conversation's context is: the tokens the model was given for
 /// its last message, of the most its model takes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct ContextUse {
     pub tokens: u64,
     pub window: u64,
@@ -869,6 +882,7 @@ fn thousands(count: u64) -> String {
 /// A subagent an agent started, as its hooks name it: its id, and its
 /// type, like `Explore`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct Subagent {
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -878,6 +892,7 @@ pub struct Subagent {
 /// A session kept in the archive: what it takes to start it again, where
 /// it ran, and when it was archived.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct ArchivedSession {
     /// The id it had, which it keeps in the archive.
     pub id: String,
@@ -904,6 +919,7 @@ impl ArchivedSession {
 /// An agent that says what it's doing itself, with `crystal report`, and
 /// how to pick its session up again after a restart.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct Reporter {
     /// The name it gave, which is what's in front in the session.
     pub agent: String,
@@ -922,6 +938,7 @@ pub struct Reporter {
 
 /// What an agent says about itself with `crystal report`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AgentReport {
     /// It's doing `state`, which takes the session's status over from
@@ -950,6 +967,7 @@ pub enum AgentReport {
 
 /// What `crystal report --line` and `--model` put on a session's row.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct Metadata {
     /// A short line under its row; empty takes it off.
     #[serde(default)]
@@ -981,6 +999,7 @@ impl Metadata {
 /// A permission a background task's Claude asks for: the tool, and what
 /// it's asked to do with it, like `Bash` and `cargo test`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct Asking {
     pub tool: String,
     pub gist: String,
@@ -989,6 +1008,7 @@ pub struct Asking {
 /// What background tasks have spent today, by Claude's own count, and the
 /// daily budget, if there is one.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct Spending {
     pub today_usd: f64,
     /// 0 for none.
@@ -1016,6 +1036,7 @@ impl SessionInfo {
 /// Why crystal reads a session's agent the way it does, for `crystal agent
 /// explain`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct ScreenExplained {
     pub session: String,
     /// What's in front in its terminal, once that's been looked at.
@@ -1035,6 +1056,7 @@ pub struct ScreenExplained {
 
 /// What's in front in a session's terminal: the program its keys go to.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Front {
     /// A coding agent crystal knows: its program, like `claude`, and what
@@ -1072,6 +1094,7 @@ impl Front {
 /// A session's task: what its agent was asked to do, and, once it's
 /// closed, how that went.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct TaskInfo {
     /// Its number, which `crystal tasks` shows as `t12`. `None` for a task
     /// from before tasks had one.
@@ -1116,6 +1139,7 @@ impl TaskInfo {
 /// What a task carries beside its goal: what has to hold before it's done,
 /// and the pull request and the issue it's about, on its project's forge.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct TaskBrief {
     /// Its acceptance criteria, each one a line, which its agent is told
     /// under its goal.
@@ -1139,6 +1163,7 @@ impl TaskBrief {
 /// number, title and address, and for a pull request, the branch its
 /// worktree is on.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct ForgeLink {
     pub forge: crate::forge::Forge,
     pub number: u64,
@@ -1150,6 +1175,7 @@ pub struct ForgeLink {
 
 /// How a task went, once it's closed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct TaskOutcome {
     pub failed: bool,
     /// The user cancelled it, or killed its session while it was open.
@@ -1186,6 +1212,7 @@ impl TaskOutcome {
 
 /// How a task stands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum TaskState {
     /// Made to start later, with `--no-launch`: nothing works on it yet.
@@ -1217,6 +1244,7 @@ impl TaskState {
 /// A task as `crystal tasks` lists it: one still open in a session, one
 /// waiting to start, or one closed, from its project's history.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct TaskRecord {
     #[serde(default)]
     pub id: Option<u64>,
@@ -1262,6 +1290,7 @@ impl TaskRecord {
 /// A task as the CLI shows it: what's kept of it, how it stands, and, while
 /// a session works on it, what that session is doing.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct TaskView {
     #[serde(flatten)]
     pub record: TaskRecord,
@@ -1297,6 +1326,7 @@ impl TaskView {
 /// A file kept with a task as it closed: copied out of its worktree into
 /// crystal's state directory, so it outlives the worktree.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct Artifact {
     pub kind: ArtifactKind,
     /// The copy's name, which is the file's own unless two had one name.
@@ -1307,6 +1337,7 @@ pub struct Artifact {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum ArtifactKind {
     /// A file `crystal done --artifact` named.
@@ -1341,6 +1372,7 @@ pub fn task_label(id: Option<u64>) -> String {
 
 /// One project's backlog: things to do later.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct Backlog {
     /// The project's name, as the sidebar shows it.
     pub project: String,
@@ -1368,6 +1400,7 @@ impl Backlog {
 
 /// A thing to do later.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct BacklogItem {
     /// Its number in the project's backlog, which never changes: #1, #2…
     pub number: u64,
@@ -1388,6 +1421,7 @@ pub struct BacklogItem {
 
 /// An item to put on the backlog, as `crystal backlog import` read it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct NewItem {
     pub text: String,
     #[serde(default)]
@@ -1401,6 +1435,7 @@ pub struct NewItem {
 
 /// The git worktree a session runs in, and the project it belongs to.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct Worktree {
     /// The project's name: the name of its main worktree's directory.
     pub project: String,
@@ -1443,6 +1478,7 @@ pub fn claude_codes_own(project: &Path, path: &Path) -> bool {
 /// finished or aborted. Nothing should cut through it: no switch of branch,
 /// and no task closed done.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(rename_all = "kebab-case")]
 pub enum InProgress {
     Merge,
@@ -1475,6 +1511,7 @@ impl InProgress {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum State {
     Running,
@@ -1506,6 +1543,7 @@ impl State {
 /// An agent's conversation, as its hooks name it: what it takes to pick
 /// the conversation up again after a restart.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct Conversation {
     pub id: String,
     /// The file the agent keeps the conversation in.
@@ -1534,6 +1572,7 @@ impl Conversation {
 /// What an agent's hooks report, in terms that fit any agent. The daemon
 /// works out the session's [`Activity`] from these.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum AgentEvent {
     /// The agent is up and waiting for its first prompt.
@@ -1560,6 +1599,7 @@ pub enum AgentEvent {
 
 /// What the agent in a session is doing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum Activity {
     /// Working on a turn.

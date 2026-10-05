@@ -27,6 +27,7 @@ use std::path::PathBuf;
 const FINISHED_KEPT: usize = 50;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct FlowRun {
     /// The flow's name and a number: `ship-1`, `ship-2`…
     pub name: String,
@@ -61,6 +62,7 @@ pub struct FlowRun {
 
 /// How one step of a run stands.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct StepRun {
     pub state: StepState,
     /// The session it runs in, a task, by name, once it has started.
@@ -92,6 +94,7 @@ pub struct StepRun {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum StepState {
     /// Still to come.
