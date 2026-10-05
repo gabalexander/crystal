@@ -59,10 +59,10 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   `subscribe` a stream of its events, for the CLI and a TUI to read, which picks up again after a handover,
   and `lay_out` a layout command for the TUI; restarting the daemon, handed over or cold
 - `src/layout.rs`: laying out the TUI from the command line: the commands `crystal tab`, `crystal pane`,
-  `crystal title`, `crystal layout apply`, `crystal plugin pane open` and `crystal open` send (a session
-  shown over the panes or in a popup, and files shown, only by a TUI), the order a TUI gets with the id of
-  the session it was run in, what the TUI reports back, the layout it answers with, where the daemon says the
-  user is, and how `crystal layout` prints it
+  `crystal title`, `crystal sidebar move`, `crystal layout apply`, `crystal plugin pane open` and `crystal
+  open` send (a session shown over the panes or in a popup, and files shown, only by a TUI), the order a TUI
+  gets with the id of the session it was run in, what the TUI reports back, the layout it answers with, where
+  the daemon says the user is, and how `crystal layout` prints it
 - `src/layout_file.rs`: layout files, as herdr's `layout.export` and `layout.apply` take them: `crystal layout
   export` writing the tabs with what starts each session again, and `crystal layout apply` reading one (the
   shape `crystal layout --json` prints, with a session's `cwd`, `command` and `env` where it's named),
@@ -175,18 +175,23 @@ whenever what's handed over changes in a way the crystal before couldn't read.
     new-session panel like the selected session; `+`'s question, its `Tab` handed to the event loop to finish
     the directory; what crystal's processes take, and where the footer drew its readout of it, for a click;
     no I/O, so it's unit-tested
+    - `app/by_hand.rs`: moving the sidebar's sessions and projects by hand, with `move-up` and the rest, a drag
+      of a session's row or a project's heading (a click on one folding it as the button comes up), and
+      `crystal sidebar move`: a session among those beside it in its worktree, agents among agents, a project
+      among the projects, the order every one stands in written out first; and saying when the order by
+      attention holds one back
     - `app/commands.rs`: the layout commands carried out on the state, each on the tab holding the session it's
       about, in front or not, the files `crystal open` shows put in a view of their own, a layout applied (each
       of its tabs in place of the tab of its name or after the others, or in place of every tab), and the
-      layout the TUI answers with; and carried out with no TUI open, on a state made for it from the tabs
-      kept, the sessions and the flow runs, on a screen of an unseen session's size, with the events for what
-      it changed; a plugin's pane over the panes left to the event loop to show; and the look the TUI's layout
-      events are told from
-  - `layout_events.rs`: what changed in a TUI's tabs and panes, as events for plugins (`tab.*`, `pane.focused`,
-    `pane.moved`, `layout.updated`, `project.focused`), found from a look at the layout before and after, by
-    each tab's id; the event loop looks once the layout has held still for a moment, so a key held down or a
-    border dragged is one event, and the user stays on their session while the selection rests on no session;
-    pure, so it's unit-tested
+      layout the TUI answers with; and carried out with no TUI open, on a state made for it from the tabs and
+      the order by hand kept, the sessions, the flow runs and the projects, on a screen of an unseen session's
+      size, with the events for what it changed; a plugin's pane over the panes left to the event loop to
+      show; and the look the TUI's layout events are told from
+    - `layout_events.rs`: what changed in a TUI's tabs and panes, as events for plugins (`tab.*`, `pane.focused`,
+      `pane.moved`, `layout.updated`, `project.focused`), found from a look at the layout before and after, by
+      each tab's id; the event loop looks once the layout has held still for a moment, so a key held down or a
+      border dragged is one event, and the user stays on their session while the selection rests on no session;
+      pure, so it's unit-tested
   - `layout_link.rs`: the TUI's end of the layout commands: offering the daemon to take them, again at once
     after a handover or a restart, each one an event for the loop, and its answers, that it was used (a
     key, the mouse, a paste, focus gained), when its terminal gains and loses the focus, and what changed in
@@ -222,9 +227,11 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   - `sidebar.rs`: the sidebar's rows: headings, a folded project's with what's in it, worktree lines with
     what git is in the middle of there, their changes not committed and how far they are from their upstream,
     Claude Code's own named by their commits and a labelled one by its label, sessions with their mark, their
-    agent's model and how long ago, the line reported for one under it, terminals drawn apart from agents, the
-    sessions that need the user pinned on top with the tab each is in, the pull requests, issues and backlog
-    items `/` found, and the rail of marks a folded sidebar keeps; what doesn't fit left out
+    agent's model (or the agent reported) and how long ago, the line reported for one under it, terminals drawn
+    apart from agents, the sessions that need the user pinned on top with the tab each is in, the pull
+    requests, issues and backlog items `/` found, and the rail of marks a folded sidebar keeps; what doesn't fit
+    left out; a session's lines, a worktree's or a project's heading as `[sidebar]` lays them out, from what
+    each token says (see `rows.rs`), and the row a session or a project dragged with the mouse would go to
   - `keymap.rs`: the sidebar's commands, each with the id `[keys]` names it by, what it does and its default
     keys; keys as the config writes them and as terminals send them, folded into one form; the config's
     keys laid over the defaults, a key given to one command taken from the one that had it, and those written
@@ -264,9 +271,15 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   - `page.rs`: a markdown page over everything, scrolled with the arrows and any other key closing it: the
     guide (`docs/guide.md`), the `?` overlay's second tab, and what's new in crystal after an update; its
     state and keys, and its drawing
+  - `rows.rs`: the sidebar's rows as `[sidebar]` lays them out (`rows`, `rows_by_agent`, `worktree_row`,
+    `project_row`, adapted from herdr's): the tokens each kind takes, a token alone or styled with its rules,
+    the theme's colors by name, checked as the config is read, and a line laid out from its tokens' values in
+    a width, what follows `gap` at its right; pure, so it's unit-tested
   - `groups.rs`: the sidebar's order and headings: sessions by project, then worktree, agents before
-    terminals, a session's task and the line reported for it under it, each flow run's steps under it, and
-    linked worktrees with no sessions left at the end of their project, Claude Code's own last
+    terminals, by attention or stable (`[sidebar] order`), then as the user put projects and sessions by hand
+    (`ByHand`, which the event loop keeps in the database, sessions by name), then as they were made; a
+    session's task and the line reported for it under it, or its lines laid out, each flow run's steps under
+    it, and linked worktrees with no sessions left at the end of their project, Claude Code's own last
   - `editing.rs`: the editing every text box shares: the text and the cursor, the motions (a character, a word
     as readline splits them, a line's ends, the text's), deleting to where one goes, and a shell's keys for
     them (`Ctrl+W`, `Alt+B`, `Ctrl+K`, …) looked up apart from what they do, for a vim mode to drive the same
@@ -461,8 +474,10 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   (`--outdated-only`), and the agents installed here, for the settings view
 - `src/report.rs`: `crystal report`: any agent, or a script wrapped around one, saying what it's doing and the
   command that resumes it; checking that command, and what's typed into a shell to run it after a restart; and
-  what `--line` and `--model` put on a session's row, for the sidebar alone: tidied, each with when it goes
-  (`--ttl`); and a source's late reports (`--seq`) passed over, what's on the row and what the agent is doing
+  what `--line`, `--model`, `--title`, `--display-agent`, `--state-label` and `--token` put on a session's
+  row, or `crystal project report --token` on a project's, for the sidebar alone: tidied, each with when it
+  goes (`--ttl`), tokens' names and the status words checked; and a source's late reports (`--seq`) passed
+  over, what's on the row and what the agent is doing
   numbered apart
 - `src/model.rs`: the model a session's agent runs on: its command's `--model`, what its hooks say, then the
   newest switch in its conversation's transcript, Claude Code's `/model` or Codex's turn context, read a little
@@ -564,14 +579,16 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   tasks spent each day, the event log, read from a point on or a page of a timeline's scope at a time back
   from its end, what each terminal written down showed (`[sessions] restore_screens`), and the TUI's
   tabs, layouts, the new-session panel's memory, the diff view's reviewed marks, the projects folded in the
-  sidebar and the latest event the user had seen, each a JSON document; and bringing in the JSON files from before, a project's the first time it's
+  sidebar, the order its projects and sessions were put in by hand and the latest event the user had seen,
+  each a JSON document; and bringing in the JSON files from before, a project's the first time it's
   asked for. Settings stay in the config file and memory in `memory.db`
 - `src/project.rs`: the project a directory is in: its git main worktree, or the directory itself outside git
 - `src/project_commands.rs`: a project's `run` and `open` commands, from the config's `[[project]]`, or else the
   worktree's `.crystal/project.toml`, or else the main worktree's; the command a run session runs and its name
   (`run-app`), which session is a worktree's run, and running `open` in the background
-- `src/project_cli.rs`: `crystal project`: the projects crystal knows, adding and taking one off the list, and
-  running or opening the project in a worktree
+- `src/project_cli.rs`: `crystal project`: the projects crystal knows, adding and taking one off the list,
+  running or opening the project in a worktree, and `report`, the tokens on a project's rows in the sidebar,
+  which the daemon keeps, hands over and the TUI asks for while a layout shows them
 - `src/tasks.rs`: tasks, sessions started with something to do: the paragraph an agent is told about
   `crystal done`, the reminder for one that ends a turn with its task open, a task's acceptance criteria and
   where they go in its first prompt, the goal of a task on a pull request or an issue and what its agent is
@@ -605,8 +622,9 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   names, the colors `[colors]` takes, what the mouse does (`[mouse]`) and whether programs' copies go on the
   clipboard (`[clipboard]`); what background tasks may spend and do unasked (`[tasks]`); the shell a new terminal runs
   (`[terminal]`, `-l` for a login shell) and where the TUI starts one, the window's title, the tab bar and
-  the appearance; where new worktrees start and go, and what's done with one emptied (`[worktrees]`); and the
-  settings view's edits to the
+  the appearance; where new worktrees start and go, and what's done with one emptied (`[worktrees]`); the
+  sidebar's order and its rows laid out (`[sidebar]`, checked by `tui/rows.rs`); and the settings view's
+  edits to the
   file (`apply`), several at once, a line set or taken out for its default, the rest of the file as the user
   wrote it, written only if what they come to is read
 - `src/memory.rs`: what a project's sessions learned: the SQLite store in the state directory with its FTS5

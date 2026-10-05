@@ -29,7 +29,7 @@ use super::text_input::TextInput;
 use super::theme::{self, Theme};
 use crate::config::{
     self, BarPosition, Config, EmptiedWorktree, Fold, NewCwd, SessionSettings, ShellMode,
-    TaskSettings, ThemeName,
+    SidebarOrder, TaskSettings, ThemeName,
 };
 use crate::embed::Status;
 use crate::integration::{self, Standing};
@@ -78,6 +78,7 @@ pub enum Setting {
     SidebarFolded,
     Fold,
     PinNeedsYou,
+    SidebarOrder,
     PhoneWidth,
     ShowKeys,
     MermaidAscii,
@@ -136,6 +137,7 @@ impl Setting {
             Setting::SidebarFolded => &["sidebar", "folded"],
             Setting::Fold => &["sidebar", "fold"],
             Setting::PinNeedsYou => &["sidebar", "needs_you"],
+            Setting::SidebarOrder => &["sidebar", "order"],
             Setting::PhoneWidth => &["sidebar", "phone_width"],
             Setting::ShowKeys => &["show_keys"],
             Setting::MermaidAscii => &["mermaid_ascii"],
@@ -194,6 +196,7 @@ impl Setting {
             Setting::SidebarFolded => "  starts folded",
             Setting::Fold => "  folded, keeps",
             Setting::PinNeedsYou => "  pin what needs you",
+            Setting::SidebarOrder => "  waiting goes first",
             Setting::PhoneWidth => "  one column at",
             Setting::ShowKeys => "show keys pressed",
             Setting::MermaidAscii => "diagrams in ASCII",
@@ -480,6 +483,7 @@ const TABS: [Tab; 8] = [
                     S::SidebarFolded,
                     S::Fold,
                     S::PinNeedsYou,
+                    S::SidebarOrder,
                     S::PhoneWidth,
                 ],
             ),
@@ -1128,6 +1132,13 @@ impl SettingsView {
                 },
             ),
             S::PinNeedsYou => on(!config.sidebar.needs_you),
+            S::SidebarOrder => Change::set(
+                setting,
+                match config.sidebar.order {
+                    SidebarOrder::Attention => "stable",
+                    SidebarOrder::Stable => "attention",
+                },
+            ),
             S::PhoneWidth => {
                 number(next_of(&PHONE_WIDTHS, config.sidebar.phone_width, forward).into())
             }
@@ -1812,6 +1823,10 @@ fn shown(setting: Setting, config: &Config) -> Shown {
             config.sidebar.needs_you,
             "what needs you, from every tab, at its top",
         ),
+        S::SidebarOrder => switch(
+            config.sidebar.order == SidebarOrder::Attention,
+            "its project to the top, it first in its worktree",
+        ),
         S::PhoneWidth => choice(
             match config.sidebar.phone_width {
                 0 => "never".to_string(),
@@ -2473,6 +2488,12 @@ mod tests {
         );
         both(
             &mut view,
+            S::SidebarOrder,
+            change(S::SidebarOrder, "stable"),
+            change(S::SidebarOrder, "stable"),
+        );
+        both(
+            &mut view,
             S::KeepEvents,
             number(S::KeepEvents, 90),
             number(S::KeepEvents, 7),
@@ -2601,7 +2622,7 @@ mod tests {
             }
         }
         let settings: usize = (0..KEYS_TAB).map(|tab| rows(tab, &[]).len()).sum();
-        assert_eq!(settings, 52);
+        assert_eq!(settings, 53);
     }
 
     /// Writes `change` to a config file made of `text`, and reads it back.

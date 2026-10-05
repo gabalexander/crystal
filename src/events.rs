@@ -1398,6 +1398,7 @@ pub fn example(kind: Kind, session: Option<&SessionInfo>, dir: &Path) -> Event {
             unseen_copies: 0,
             context: None,
             output_waits: 0,
+            row: Default::default(),
         },
     };
     let now = now_ms() / 1000;
@@ -1841,6 +1842,7 @@ mod tests {
             unseen_copies: 0,
             context: None,
             output_waits: 0,
+            row: Default::default(),
         }
     }
 

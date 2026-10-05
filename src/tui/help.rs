@@ -503,11 +503,26 @@ mod tests {
         label
             .split(' ')
             .flat_map(|group| match group {
-                "/" => vec![group],
-                _ => group.split('/').collect(),
+                "/" => vec![group.to_string()],
+                _ => with_modifier(group),
             })
             .filter(|key| !key.is_empty())
-            .map(String::from)
+            .collect()
+    }
+
+    /// The keys in `group`, split at its `/`s, a modifier the first has
+    /// going with the single letters after it: `Alt+k/j` is `Alt+k` and
+    /// `Alt+j`, where `Tab/Shift+Tab` is `Tab` and `Shift+Tab`.
+    fn with_modifier(group: &str) -> Vec<String> {
+        let keys: Vec<&str> = group.split('/').collect();
+        let modifier = keys[0].rsplit_once('+').map(|(modifier, _)| modifier);
+        let letter = |key: &str| key.chars().count() == 1 && key.chars().all(char::is_alphabetic);
+        keys.iter()
+            .enumerate()
+            .map(|(at, key)| match modifier {
+                Some(modifier) if at > 0 && letter(key) => format!("{modifier}+{key}"),
+                _ => key.to_string(),
+            })
             .collect()
     }
 

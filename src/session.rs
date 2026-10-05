@@ -990,6 +990,7 @@ impl Session {
             },
             model: self.shown.model(now).map(String::from).or(read_model),
             line: self.shown.line(now).map(String::from),
+            row: self.shown.row(now),
             stopped_idle: self.stopped_idle,
             bell: self.bell,
             unseen_copies: self.unseen_copies,

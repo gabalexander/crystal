@@ -56,6 +56,8 @@ pub const SEEN: &str = "seen";
 pub const SIDEBAR: &str = "sidebar";
 /// The projects folded in the sidebar, by their main worktrees.
 pub const FOLDED: &str = "folded";
+/// The order the sidebar's projects and sessions were put in by hand.
+pub const ORDER: &str = "order";
 /// When the TUI last looked for a newer crystal.
 pub const UPDATE: &str = "update";
 /// The crystal whose TUI opened last: what's new in another is news.
