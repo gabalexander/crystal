@@ -375,6 +375,8 @@ pub fn about(task: &TaskRecord) -> String {
 
 /// What a pass came to.
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+#[cfg_attr(test, schemars(rename = "DistillReport"))]
 pub struct Report {
     /// The ids of the entries it added.
     pub added: Vec<u64>,

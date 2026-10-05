@@ -669,8 +669,9 @@ enum Command {
         #[arg(long, requires = "rows")]
         cols: Option<u16>,
     },
-    /// Read everything crystal knows as JSON, for a client of your own to
-    /// start from: `api snapshot`.
+    /// For a client of your own: everything crystal knows as JSON (`api
+    /// snapshot`), and the schema of what crystal says over its socket (`api
+    /// schema`).
     Api {
         #[command(subcommand)]
         command: ApiCommand,
@@ -905,6 +906,18 @@ enum ApiCommand {
     /// archive, and the latest event's `seq`, to follow on from with
     /// `crystal events --follow --after <seq>`.
     Snapshot,
+    /// Print the JSON Schema of what crystal says over its socket: the
+    /// requests, the responses, the events, the lines a TUI taking layout
+    /// orders trades, and what `api snapshot` prints; with neither flag, a
+    /// line on each.
+    Schema {
+        /// Print the whole schema.
+        #[arg(long, conflicts_with = "output")]
+        json: bool,
+        /// Write the whole schema to this file.
+        #[arg(short, long, value_name = "PATH")]
+        output: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2349,6 +2362,16 @@ fn run(cli: Cli) -> Result<()> {
             "{}",
             serde_json::to_string_pretty(&api::snapshot(&socket)?)?
         ),
+        Command::Api {
+            command: ApiCommand::Schema { json, output },
+        } => match output {
+            Some(path) => {
+                api::schema::write(&path)?;
+                println!("wrote the API schema to {}", path.display());
+            }
+            None if json => print!("{}", api::schema::JSON),
+            None => print!("{}", api::schema::summary()?),
+        },
         Command::Control { name, rows, cols } => {
             let size = rows.zip(cols).filter(|&(rows, cols)| rows > 0 && cols > 0);
             stream::control(&socket, &name, size)?

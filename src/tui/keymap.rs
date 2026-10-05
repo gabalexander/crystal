@@ -1285,6 +1285,7 @@ pub enum SplitWay {
 
 /// A popup's width or height: so many cells, or a share of the screen.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(untagged, expecting = "a number of cells, or a share like \"80%\"")]
 pub enum Extent {
     Cells(u16),

@@ -496,6 +496,7 @@ crystal read review --since 10m             # only what it wrote in the last ten
 crystal ps review                           # what runs in its terminal, and where (process-info)
 crystal observe review                      # its terminal as JSON lines, for a program; `control` drives it
 crystal api snapshot                        # everything at once, as JSON, for a client of your own
+crystal api schema --json                   # the JSON Schema of what crystal says over its socket
 crystal rename review reviewer              # give a session another name
 crystal respawn reviewer                    # run an ended session again; an agent in its conversation
 crystal kill review                         # stop one session
@@ -1719,6 +1720,16 @@ lists them, `layout` as `crystal layout --json` prints it, `projects`, the `task
 in `flows`, and the `archived` sessions. `crystal events --follow --after <seq>` then carries on from it with
 nothing missed: an event says what changed, and the client asks again for what it shows. It never starts the
 daemon.
+
+`crystal api schema` says what the schema of crystal's socket protocol covers, the one bundled with that crystal:
+`--json` prints the whole JSON Schema (draft 2020-12), and `--output PATH` writes it to a file. It's
+[`docs/crystal-api.schema.json`](docs/crystal-api.schema.json) too. Its `schemas` name each message: the
+`request` a client sends, a JSON object a line with its kind in `type` and the `version` of the crystal sending
+it, which must be the daemon's; the `response` the daemon answers with; each `event` a `subscribe` streams,
+`crystal events --json` prints and plugins' hooks are given, its kind in `event` with when it happens; the
+`layout_order` and `layout_report` lines a TUI taking layout orders and the daemon trade; and the `snapshot`
+`crystal api snapshot` prints. `$defs` holds every type they're made of, described as crystal reads it: a field
+it can do without is optional, though crystal may always write it.
 
 `crystal ls --json` prints the sessions as a JSON array. Each object holds what the daemon knows about the
 session, plus `status`, the word the STATE column shows:
@@ -3369,7 +3380,11 @@ make build      # cargo build
 make test       # cargo test
 make lint       # cargo fmt --check, and clippy with warnings as errors
 make install    # a release build into ~/.local/bin, and the daemon handed over to it
+CRYSTAL_UPDATE_API_SCHEMA=1 cargo test api_schema  # write docs/crystal-api.schema.json again
 ```
+
+A test keeps [`docs/crystal-api.schema.json`](docs/crystal-api.schema.json) what the protocol's types make, and
+fails once one of them changes until the schema is written again.
 
 If you're an AI agent working on this repository, read [`AGENTS.md`](AGENTS.md) before making changes.
 

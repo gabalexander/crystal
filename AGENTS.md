@@ -16,6 +16,12 @@ roadmap.
 
 Run lint, format and tests before every commit.
 
+Every type a request, a response or an event reaches derives `schemars::JsonSchema` in test builds alone
+(`#[cfg_attr(test, derive(schemars::JsonSchema))]`, schemars being a dev-dependency), a new one too, and one
+whose name another has, or says little alone, takes `#[cfg_attr(test, schemars(rename = "..."))]`. A test
+keeps `docs/crystal-api.schema.json` what they make: after changing one, `CRYSTAL_UPDATE_API_SCHEMA=1 cargo test
+api_schema` writes it again.
+
 ## Releasing
 
 Releases are built by `.github/workflows/release.yml`, for macOS (Apple silicon and Intel) and Linux (x86_64
@@ -82,6 +88,9 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   attached again after a handover, and `control`'s commands on standard input (input, keys, resize, release)
 - `src/api.rs`: `crystal api snapshot`: the sessions, layout, projects, open tasks, flow runs and archive in one
   JSON document, with the latest event's seq to follow on from
+  - `api/schema.rs`: `crystal api schema`: the JSON Schema of the socket protocol, `docs/crystal-api.schema.json`
+    bundled as it is, a line on each message it names, or the whole of it printed or written to a file; and the
+    tests that make it from the types, keep the file in step and check messages crystal writes against it
 - `src/messages.rs`: what `crystal send` carries from one session to another: the text tidied and cut to 8 KiB,
   the line ahead of it saying which session sent it, the guard that holds a session to 20 sends a minute, the
   refusal of a message that only acknowledges (`ok`, `thanks`, `👍`), and the `agent_blocked:` refusal for an
@@ -472,7 +481,8 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   for mermaid to draw in the browser
 - `src/spending.rs`: what background tasks have spent today, kept in the database by the day: the TUI footer's
   `$X today`, and what `daily_budget_usd` is held against
-- `src/protocol.rs`: requests and responses, one JSON line each, and the frames an attached client sends
+- `src/protocol.rs`: requests and responses, one JSON line each, and the frames an attached client sends; their
+  JSON Schema is `docs/crystal-api.schema.json` (see `api/schema.rs`)
 - `src/socket.rs`: where the socket lives: a server's, named after it in crystal's socket directory, or one
   given by its path; which a command is for (`-S`, `--server`, `CRYSTAL_SOCKET`, then `CRYSTAL_SERVER`); and
   which server a socket is, however it's spelled and whoever starts its daemon, so the same socket always gets
