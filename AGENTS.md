@@ -354,8 +354,8 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   - `preview.rs`: the file finder's, the tree browser's, the handoff view's and the opened view's preview: a
     file read and highlighted off the event loop, a binary one refused by git's test, which `crystal open`
     makes too, a markdown file's page laid out for its width or its source, scrolling, and drawing them
-  - `memory_view.rs`: the memory view (`m`): a project's entries by their titles, the filter, the entry's
-    file opened in the editor (Enter), in the worktree it was said in while that's there, forgetting and
+  - `memory_view.rs`: the memory view (`m`): a project's entries by their titles, the drifting and the stale
+    marked, the entry the bar is on with what's gone, the filter, the entry's file opened in the editor (Enter), in the worktree it was said in while that's there, forgetting and
     promoting after a `y`, and its drawing
   - `plugins_view.rs`: the plugins view (`X`): every plugin, on or off, with installed ones' actions, panes and
     link handlers, and those the selected session's project ships under its name, which the view turns off
@@ -649,16 +649,20 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   index (bm25, prefix and porter-stemmed words), each entry's vector and search by meaning merged with it by
   reciprocal rank fusion, then the reranker's read of the best (nothing when none answers), its migrations,
   the same said again seen again, forgotten entries the distiller can't add back, kept as they were to list,
-  bringing in a project's JSON file from before, anchors (each file's SHA-256 when
-  an entry was said) and whether an entry holds, fresh, drifting or stale, the entries gone stale the daemon
-  hasn't told of, search (of a kind, about some files or directories, the stale left out or not), an entry's
+  bringing in a project's JSON file from before, anchors (what an entry's text names that looks like code and
+  was in its worktree's code when it was said, `names_in`, and each file's SHA-256 then) and whether an entry
+  holds, fresh, drifting or stale, by what it names, looked up among the words of a worktree's files
+  (`Words`), or naming nothing, by its files, the entries gone stale the daemon hasn't told of, and those about
+  some files for the distiller to ask about again, anchored again or reworded, search (of a kind, about some
+  files or directories, the stale after the rest or left out), an entry's
   title, its first line, or one of its own, the paragraph every agent is
   shown at launch (entries about what its worktree changed first, in docket's 800 bytes, tasks' outcomes kept
   by an earlier crystal left out of it), promoting into
   CLAUDE.md, the markdown export, and `enabled`, the one gate everything memory adds goes through
 - `src/distill.rs`: the distiller: after a task closes, or a session is archived that wasn't read as its task
   closed, one tool-less `claude -p` (Haiku by default, `[memory]`
-  in the config) over the end of its transcript, told what the memory has already; its answer checked
+  in the config) over the end of its transcript, told what the memory has already, and asked about the
+  entries gone stale that are about the files the work touched, to keep, reword or forget; its answer checked
   against the checkout before it's kept
 - `src/mcp.rs`: `crystal mcp`: an MCP server over stdio with `memory_search` and `memory_show`, which every
   Claude Code session crystal starts, in a terminal or a task in the background, is given with `--mcp-config`
@@ -681,8 +685,8 @@ whenever what's handed over changes in a way the crystal before couldn't read.
   projector over the model's state at the marks, and each passage's cosine with the query
 - `src/secrets.rs`: taking credentials out of text before memory keeps it or the distiller reads it
 - `src/memory_cli.rs`: `crystal remember` and `crystal memory`, `add`, `list` (by kind, or what was
-  forgotten), `search` (by kind, files, the stale too, and how many), `show`, `export` and `distill` included,
-  and an entry in full as `show` and the `memory_show` tool print it
+  forgotten), `search` (by kind, files, the stale left out or not, and how many), `show`, `export` and
+  `distill` included, and an entry in full as `show` and the `memory_show` tool print it, with what's gone
 - `src/profile.rs`: agent profiles: what one runs, its prompt and postfix around the task or alone with no
   task (`skip_task`), how it's meant to start (`launch`: a session, a task or a background task), checking it,
   and saving or removing one in the config file with `toml_edit`, so the user's comments and layout stay;

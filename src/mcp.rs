@@ -143,7 +143,7 @@ impl Server {
         };
         let limit = arguments["limit"].as_u64().unwrap_or(DEFAULT_LIMIT);
         let limit = limit.clamp(1, memory::SEARCH_LIMIT as u64) as usize;
-        // Stale entries too, marked: the model can tell.
+        // Stale entries too, after the rest, marked: the model can tell.
         let wanted = Wanted {
             kind,
             ..Wanted::best(limit)
@@ -172,8 +172,8 @@ impl Server {
         let entry = Store::open(&self.socket)?
             .get(&self.project, id)?
             .with_context(|| format!("there's no entry {id}"))?;
-        let freshness = memory::freshness(&entry, &self.project);
-        Ok(memory_cli::in_full(&entry, freshness, now()))
+        let item = memory::checked(entry, &self.project);
+        Ok(memory_cli::in_full(&item, now()))
     }
 }
 
@@ -201,8 +201,10 @@ fn tools() -> Value {
                             and so does a word they start or stem from; with search by meaning \
                             on, so does what means the same, and a search nothing answers finds \
                             nothing. Gives the best matches first, a line each: id, kind, age, \
-                            text, the files it's about, [drifting] when some of those have \
-                            changed since, and [stale] when all of them have.",
+                            text, the files it's about, [drifting] when some of what it names \
+                            is gone from the code, or some of its files have changed since, and \
+                            [stale] when all of what it names is gone, or every file it's about; \
+                            the stale come after the rest.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

@@ -8,9 +8,7 @@ use crate::embed::{self, Models};
 use crate::env;
 use crate::events::{self, Event};
 use crate::git::Checkout;
-use crate::memory::{
-    self, Added, Entry, Forgotten, Freshness, Kind, Listed, Memory, New, Source, Store, Wanted,
-};
+use crate::memory::{self, Added, Forgotten, Kind, Listed, Memory, New, Source, Store, Wanted};
 use crate::output::{out, outln};
 use crate::printable;
 use crate::protocol::{Request, Response};
@@ -100,8 +98,8 @@ pub fn show(socket: &Path, dir: Option<PathBuf>, id: u64) -> Result<()> {
     let Some(entry) = memory.get(id) else {
         bail!("there's no entry {id}");
     };
-    let freshness = memory::freshness(entry, &memory.project);
-    outln!("{}", in_full(entry, freshness, now()))?;
+    let item = memory::checked(entry.clone(), &memory.project);
+    outln!("{}", in_full(&item, now()))?;
     Ok(())
 }
 
@@ -122,13 +120,14 @@ pub struct SearchArgs {
     pub kind: Option<Kind>,
     /// Files or directories, as given from the current directory.
     pub files: Vec<String>,
-    /// Stale entries too.
-    pub all: bool,
+    /// Leave the stale out.
+    pub fresh: bool,
     pub limit: Option<usize>,
 }
 
 /// Prints the entries that have to do with `words`, the best first, as
-/// `args` says: those that are stale left out, unless it says all.
+/// `args` says: those that hold before the stale, or with `fresh`, the
+/// stale left out.
 pub fn search(
     socket: &Path,
     dir: Option<PathBuf>,
@@ -153,7 +152,7 @@ pub fn search(
             .iter()
             .map(|file| from_top(file, &dir, &top))
             .collect(),
-        fresh: !args.all,
+        fresh: args.fresh,
         limit: args.limit.unwrap_or(memory::SEARCH_LIMIT).max(1),
     };
     let found = found(socket, &dir, &words.join(" "), &wanted)?;
@@ -358,12 +357,11 @@ fn forgotten_line(entry: &Forgotten, now: u64) -> String {
 /// give it: its id and kind, how it holds when it's drifting or stale, its
 /// text, its files, where it came from, and how often and how lately it
 /// was said.
-pub fn in_full(entry: &Entry, freshness: Freshness, now: u64) -> String {
+pub fn in_full(item: &Listed, now: u64) -> String {
+    let entry = &item.entry;
     let mut text = format!("{} · {}", entry.id, entry.kind);
-    match freshness {
-        Freshness::Fresh => {}
-        Freshness::Drifting => text.push_str(" · drifting: some of its files have changed since"),
-        Freshness::Stale => text.push_str(" · stale: the files it's about have changed since"),
+    if let Some(holds) = item.how_it_holds() {
+        text.push_str(&format!(" · {holds}"));
     }
     text.push_str(&format!("\n\n{}\n", entry.text));
     if !entry.files.is_empty() {

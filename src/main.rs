@@ -1262,9 +1262,10 @@ struct EntryArgs {
     #[arg(short, long, value_enum, default_value_t = memory::Kind::Note)]
     kind: memory::Kind,
 
-    /// A file it's about; once some of its files change, the entry is
-    /// marked drifting, and once all of them have, stale. Give it once a
-    /// file.
+    /// A file it's about. Give it once a file. Whether the entry holds
+    /// goes by what its text names, like `local_origin` or `--force`; one
+    /// that names nothing to look for goes by its files: drifting once some
+    /// have changed, and stale once every one is gone.
     #[arg(short = 'f', long = "file", value_name = "FILE")]
     files: Vec<String>,
 
@@ -1299,8 +1300,8 @@ enum MemoryCommand {
         #[arg(long, visible_alias = "wrong")]
         forgotten: bool,
     },
-    /// The entries that have to do with these words, the best first,
-    /// those that are stale left out.
+    /// The entries that have to do with these words, the best first, those
+    /// that still hold before the stale, which are marked.
     Search {
         #[arg(required = true)]
         words: Vec<String>,
@@ -1314,8 +1315,14 @@ enum MemoryCommand {
         #[arg(short = 'f', long = "file", value_name = "PATH")]
         files: Vec<String>,
 
-        /// Stale entries too, marked.
-        #[arg(short, long)]
+        /// Leave the stale out: those whose every name is gone from the
+        /// code.
+        #[arg(long)]
+        fresh: bool,
+
+        /// What a search gives already, the stale too: kept so that what
+        /// passed it before still runs.
+        #[arg(short, long, hide = true)]
         all: bool,
 
         /// The most entries to print [default: 50]
@@ -2640,13 +2647,14 @@ fn run(cli: Cli) -> Result<()> {
                 words,
                 kind,
                 files,
-                all,
+                fresh,
+                all: _,
                 limit,
             }) => {
                 let args = memory_cli::SearchArgs {
                     kind,
                     files,
-                    all,
+                    fresh,
                     limit,
                 };
                 memory_cli::search(&socket, dir, &words, args)?;
