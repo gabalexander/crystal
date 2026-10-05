@@ -4,7 +4,7 @@
 
 use crate::client;
 use crate::db;
-use crate::output::outln;
+use crate::output::{errln, outln};
 use crate::protocol::{Request, Response};
 use crate::socket::{self, DEFAULT};
 use crate::state;
@@ -57,7 +57,7 @@ pub fn list(json: bool) -> Result<()> {
     crate::print_table(["NAME", "STATE", "SESSIONS"], &rows)?;
     for server in &servers {
         if let Some(error) = &server.error {
-            eprintln!("crystal: {}: {error}", server.name);
+            errln!("crystal: {}: {error}", server.name);
         }
     }
     Ok(())

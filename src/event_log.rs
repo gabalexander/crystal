@@ -16,6 +16,7 @@
 
 use crate::db::Db;
 use crate::events::{Event, Filter, Since, now_ms};
+use crate::output::errln;
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, SyncSender};
@@ -84,14 +85,12 @@ impl Bus {
     /// event its log has ever had.
     pub fn new(socket: &Path) -> Bus {
         let db = Db::open(socket)
-            .inspect_err(|err| eprintln!("crystal daemon: couldn't open the event log: {err:#}"))
+            .inspect_err(|err| errln!("crystal daemon: couldn't open the event log: {err:#}"))
             .ok();
         let known = |read: fn(&Db) -> Result<u64>| {
             let db = db.as_ref()?;
             read(db)
-                .inspect_err(|err| {
-                    eprintln!("crystal daemon: couldn't read the event log: {err:#}")
-                })
+                .inspect_err(|err| errln!("crystal daemon: couldn't read the event log: {err:#}"))
                 .ok()
         };
         let last = known(Db::latest_event).unwrap_or(0);
@@ -120,7 +119,7 @@ impl Bus {
         if let Some(db) = &state.db {
             match db.add_event(&event) {
                 Ok(()) => state.count += 1,
-                Err(err) => eprintln!(
+                Err(err) => errln!(
                     "crystal daemon: couldn't write {} in the event log: {err:#}",
                     event.kind.name()
                 ),
@@ -159,7 +158,7 @@ impl Bus {
     /// connection of their own, so the daemon goes on emitting meanwhile.
     pub fn replay(&self, filter: &Filter, since: Since, through: u64) -> Vec<Event> {
         let logged = read(&self.socket, filter, since).unwrap_or_else(|err| {
-            eprintln!("crystal daemon: couldn't read the event log: {err:#}");
+            errln!("crystal daemon: couldn't read the event log: {err:#}");
             Vec::new()
         });
         logged
@@ -207,7 +206,7 @@ impl BusState {
         })();
         match pruned {
             Ok(count) => self.count = count,
-            Err(err) => eprintln!("crystal daemon: couldn't prune the event log: {err:#}"),
+            Err(err) => errln!("crystal daemon: couldn't prune the event log: {err:#}"),
         }
     }
 }

@@ -34,6 +34,7 @@ use crate::memory;
 use crate::messages::{self, Sender};
 use crate::names;
 use crate::notify::{self, Notice};
+use crate::output::errln;
 use crate::plugin_hooks;
 use crate::printable;
 use crate::project;
@@ -195,9 +196,9 @@ pub fn run(socket: &Path, handover: Option<RawFd>) -> Result<()> {
     // learns this one's commands: before the saved sessions start, so that
     // Claude Code in them reads the new one.
     match skill::refresh() {
-        Ok(Some(path)) => eprintln!("crystal daemon: updated the skill in {}", path.display()),
+        Ok(Some(path)) => errln!("crystal daemon: updated the skill in {}", path.display()),
         Ok(None) => {}
-        Err(err) => eprintln!("crystal daemon: couldn't update the skill: {err:#}"),
+        Err(err) => errln!("crystal daemon: couldn't update the skill: {err:#}"),
     }
     let cold = handed.is_none();
     // The sessions written down start again before the daemon answers,
@@ -225,7 +226,7 @@ pub fn run(socket: &Path, handover: Option<RawFd>) -> Result<()> {
             let back = first.0 + back;
             failed.splice(0..0, first.1);
             if !failed.is_empty() {
-                eprintln!(
+                errln!(
                     "crystal daemon: started {back} sessions again; {} couldn't start: {}",
                     failed.len(),
                     failed.join(", ")
@@ -269,7 +270,7 @@ pub fn run(socket: &Path, handover: Option<RawFd>) -> Result<()> {
 /// daemon, which starts them again from the database. The socket goes
 /// first, so the client finds it gone.
 fn give_up(socket: &Path, err: anyhow::Error) -> ! {
-    eprintln!("crystal daemon: couldn't take over: {err:#}");
+    errln!("crystal daemon: couldn't take over: {err:#}");
     let _ = fs::remove_file(socket);
     process::exit(1);
 }
@@ -375,7 +376,7 @@ impl Daemon {
         let daemon = self.clone();
         thread::spawn(move || {
             if let Err(err) = daemon.serve(conn, ticket) {
-                eprintln!("crystal daemon: {err:#}");
+                errln!("crystal daemon: {err:#}");
             }
         });
     }
@@ -459,7 +460,7 @@ impl Daemon {
         let mut sessions = self.sessions.lock().unwrap();
         let saved = self.db.lock().unwrap().sessions();
         let saved = saved.unwrap_or_else(|err| {
-            eprintln!("crystal daemon: couldn't read the sessions to start again: {err:#}");
+            errln!("crystal daemon: couldn't read the sessions to start again: {err:#}");
             Vec::new()
         });
         sessions.extend(
@@ -552,7 +553,7 @@ impl Daemon {
             }
             Err(err) => {
                 let why = format!("{err:#}");
-                eprintln!("crystal daemon: couldn't start {} again: {why}", saved.name);
+                errln!("crystal daemon: couldn't start {} again: {why}", saved.name);
                 let failed = if waiting.is_starting() {
                     waiting.fail_to_start(&why);
                     waiting
@@ -577,7 +578,7 @@ impl Daemon {
         }
         let screen = self.db.lock().unwrap().screen(&saved.name);
         screen.unwrap_or_else(|err| {
-            eprintln!(
+            errln!(
                 "crystal daemon: couldn't read what {} showed: {err:#}",
                 saved.name
             );
@@ -664,7 +665,7 @@ impl Daemon {
         if let Some(notice) = moved.filter(|_| session.is_task())
             && let Err(err) = session.prompt(&notice)
         {
-            eprintln!("crystal daemon: couldn't tell {name} it has moved: {err:#}");
+            errln!("crystal daemon: couldn't tell {name} it has moved: {err:#}");
         }
         Ok(name)
     }
@@ -840,7 +841,7 @@ impl Daemon {
             if saved != last_saved {
                 match self.db.lock().unwrap().save_sessions(&saved) {
                     Ok(()) => last_saved = saved,
-                    Err(err) => eprintln!("crystal daemon: couldn't save the sessions: {err:#}"),
+                    Err(err) => errln!("crystal daemon: couldn't save the sessions: {err:#}"),
                 }
             }
             if screens_checked.elapsed() >= SCREENS_CHECK_EVERY {
@@ -851,7 +852,7 @@ impl Daemon {
             if runs != last_runs {
                 match self.db.lock().unwrap().save_flow_runs(&runs) {
                     Ok(()) => last_runs = runs,
-                    Err(err) => eprintln!("crystal daemon: couldn't save the flow runs: {err:#}"),
+                    Err(err) => errln!("crystal daemon: couldn't save the flow runs: {err:#}"),
                 }
             }
         }
@@ -871,7 +872,7 @@ impl Daemon {
             if kept.maybe_some {
                 match self.db.lock().unwrap().forget_screens() {
                     Ok(()) => *kept = KeptScreens::nothing(),
-                    Err(err) => eprintln!("crystal daemon: couldn't forget the screens: {err:#}"),
+                    Err(err) => errln!("crystal daemon: couldn't forget the screens: {err:#}"),
                 }
             }
             return;
@@ -889,7 +890,7 @@ impl Daemon {
             if !shows_again(&saved) {
                 if renamed || was.is_none_or(|was| was.kept.is_some()) {
                     if let Err(err) = db.forget_screen(&session.name) {
-                        eprintln!("crystal daemon: couldn't forget a screen: {err:#}");
+                        errln!("crystal daemon: couldn't forget a screen: {err:#}");
                         continue;
                     }
                     let forgotten = KeptScreen {
@@ -922,7 +923,7 @@ impl Daemon {
                     };
                     kept.sessions.insert(session.id.clone(), now);
                 }
-                Err(err) => eprintln!(
+                Err(err) => errln!(
                     "crystal daemon: couldn't keep what {} shows: {err:#}",
                     session.name
                 ),
@@ -947,7 +948,7 @@ impl Daemon {
                         self.events.emit(event);
                     }
                 }
-                Err(err) => eprintln!(
+                Err(err) => errln!(
                     "crystal daemon: couldn't keep {} in the list of projects: {err:#}",
                     project.display()
                 ),
@@ -1021,7 +1022,7 @@ impl Daemon {
         let mut sessions = self.sessions.lock().unwrap();
         let runs = self.db.lock().unwrap().flow_runs();
         let mut runs = runs.unwrap_or_else(|err| {
-            eprintln!("crystal daemon: couldn't read the flow runs: {err:#}");
+            errln!("crystal daemon: couldn't read the flow runs: {err:#}");
             Vec::new()
         });
         for run in &mut runs {
@@ -1053,7 +1054,7 @@ impl Daemon {
         if !first {
             return Ok(());
         }
-        eprintln!("crystal daemon: handing over to {}", exe.display());
+        errln!("crystal daemon: handing over to {}", exe.display());
         handover::begin();
         let deadline = Instant::now() + HANDOVER_GRACE;
         let waiting = self.gate.close(&self.socket, deadline);
@@ -1061,7 +1062,7 @@ impl Daemon {
         // The sessions can't carry on: the daemon stops as a shutdown that
         // keeps them does, and the client starts the next, which starts them
         // again. Its socket goes first, so the client finds it gone.
-        eprintln!("crystal daemon: couldn't hand over, so it stops: {err:#}");
+        errln!("crystal daemon: couldn't hand over, so it stops: {err:#}");
         let _ = fs::remove_file(&self.socket);
         let message = format!("couldn't hand over: {err:#}");
         for conn in self.asking_to_hand_over.lock().unwrap().iter() {
@@ -1179,7 +1180,7 @@ impl Daemon {
             match Session::adopt(handed, &self.spending) {
                 Ok(session) => sessions.push(session),
                 Err(err) => {
-                    eprintln!("crystal daemon: couldn't carry {name} on: {err:#}");
+                    errln!("crystal daemon: couldn't carry {name} on: {err:#}");
                     // Hung up on, then reaped, since they're this process's
                     // children still.
                     for pid in processes {
@@ -1216,7 +1217,7 @@ impl Daemon {
         drop(sessions);
         self.carry_on_removals(removals);
         self.carry_on_moves(moves);
-        eprintln!("crystal daemon: took over from crystal {from}: {carried} sessions carried on");
+        errln!("crystal daemon: took over from crystal {from}: {carried} sessions carried on");
         self.events
             .emit(Event::handed_over(&from, &protocol::version(), carried));
         for conn in asking {
@@ -1516,7 +1517,7 @@ impl Daemon {
         for session in sessions.iter_mut().filter(|s| s.task_unnumbered()) {
             match self.db.lock().unwrap().new_task_number() {
                 Ok(number) => session.number_task(number),
-                Err(err) => eprintln!("crystal daemon: couldn't number a task: {err:#}"),
+                Err(err) => errln!("crystal daemon: couldn't number a task: {err:#}"),
             }
         }
     }
@@ -1540,7 +1541,7 @@ impl Daemon {
         let ticked = {
             let mut db = self.db.lock().unwrap();
             if let Err(err) = db.record_task(&project, task) {
-                eprintln!("crystal daemon: couldn't write down a closed task: {err:#}");
+                errln!("crystal daemon: couldn't write down a closed task: {err:#}");
             }
             let done = task.state() == TaskState::Done;
             let ticks = done && backlog::enabled(&settings());
@@ -1551,9 +1552,7 @@ impl Daemon {
                         Ok(store.get(number).cloned())
                     });
                     ticked.unwrap_or_else(|err| {
-                        eprintln!(
-                            "crystal daemon: couldn't tick #{number} on the backlog: {err:#}"
-                        );
+                        errln!("crystal daemon: couldn't tick #{number} on the backlog: {err:#}");
                         None
                     })
                 }
@@ -1593,7 +1592,7 @@ impl Daemon {
                 handoff::heading(&handoff::now(), &info.name, Some(&task.goal), Some(how));
             match self.add_to_handoff(worktree, &handoff::section(&heading, &note)) {
                 Ok(path) => self.events.emit(Event::handoff(info, path, &note)),
-                Err(err) => eprintln!("crystal daemon: couldn't add to a handoff file: {err:#}"),
+                Err(err) => errln!("crystal daemon: couldn't add to a handoff file: {err:#}"),
             }
         }
         let Some(id) = task.id else {
@@ -1603,7 +1602,7 @@ impl Daemon {
         match artifacts::keep_handoff(&dir, &handoff::path(worktree)) {
             Ok(Some(kept)) => self.record_kept(info, task, &[kept]),
             Ok(None) => {}
-            Err(err) => eprintln!("crystal daemon: couldn't keep t{id}'s handoff file: {err:#}"),
+            Err(err) => errln!("crystal daemon: couldn't keep t{id}'s handoff file: {err:#}"),
         }
     }
 
@@ -1655,7 +1654,7 @@ impl Daemon {
                     .events
                     .emit(Event::artifact(info, task.clone(), artifact.clone())),
                 Err(err) => {
-                    eprintln!("crystal daemon: couldn't write down a file t{id} kept: {err:#}")
+                    errln!("crystal daemon: couldn't write down a file t{id} kept: {err:#}")
                 }
             }
         }
@@ -1668,7 +1667,7 @@ impl Daemon {
         };
         let kept = self.db.lock().unwrap().artifacts(id);
         kept.unwrap_or_else(|err| {
-            eprintln!("crystal daemon: couldn't read the files t{id} kept: {err:#}");
+            errln!("crystal daemon: couldn't read the files t{id} kept: {err:#}");
             Vec::new()
         })
     }
@@ -1725,13 +1724,13 @@ impl Daemon {
             let report = distill::run(&job);
             match &report {
                 Ok(report) => {
-                    eprintln!("crystal daemon: distilled {name}: {}", report.line());
+                    errln!("crystal daemon: distilled {name}: {}", report.line());
                     for why in &report.rejected {
-                        eprintln!("crystal daemon:   rejected {why}");
+                        errln!("crystal daemon:   rejected {why}");
                     }
                     tell_distilled(&events, &job, &report.added);
                 }
-                Err(err) => eprintln!("crystal daemon: couldn't distill {name}: {err:#}"),
+                Err(err) => errln!("crystal daemon: couldn't distill {name}: {err:#}"),
             }
             events.emit(Event::distilled(&info, distill_about(&report)));
             drop(reading);
@@ -1817,7 +1816,7 @@ impl Daemon {
                     if !download {
                         return Ok(());
                     }
-                    eprintln!("crystal daemon: downloading {}", embed::names());
+                    errln!("crystal daemon: downloading {}", embed::names());
                     embed::download(false)?;
                 }
                 doing("loading the models");
@@ -1829,14 +1828,14 @@ impl Daemon {
                 store.forget_vectors_but(embed::MODEL)?;
                 match store.embed_missing(&*models)? {
                     0 => {}
-                    count => eprintln!("crystal daemon: embedded {count} entries of memory"),
+                    count => errln!("crystal daemon: embedded {count} entries of memory"),
                 }
                 Ok(())
             })();
             let mut preparing = preparing.lock().unwrap();
             preparing.doing = None;
             if let Err(err) = prepared {
-                eprintln!("crystal daemon: couldn't get memory's models ready: {err:#}");
+                errln!("crystal daemon: couldn't get memory's models ready: {err:#}");
                 preparing.failed = Some(format!("{err:#}"));
             }
         });
@@ -2796,7 +2795,7 @@ impl Daemon {
                 }
                 // Asked to stop, the sessions stay stopped.
                 if let Err(err) = self.db.lock().unwrap().save_sessions(&[]) {
-                    eprintln!("crystal daemon: couldn't forget the sessions: {err:#}");
+                    errln!("crystal daemon: couldn't forget the sessions: {err:#}");
                 }
                 Ok(Response::Done)
             }
@@ -2836,7 +2835,7 @@ impl Daemon {
         };
         let pending = self.db.lock().unwrap().pending_tasks();
         let pending = pending.unwrap_or_else(|err| {
-            eprintln!("crystal daemon: couldn't read the tasks waiting to start: {err:#}");
+            errln!("crystal daemon: couldn't read the tasks waiting to start: {err:#}");
             Vec::new()
         });
         let pending = pending.iter().filter(|task| in_project(&task.cwd));
@@ -2860,7 +2859,7 @@ impl Daemon {
     fn closed_tasks(&self, project: Option<&Path>) -> Vec<TaskRecord> {
         let closed = self.db.lock().unwrap().closed_tasks(project);
         let mut closed = closed.unwrap_or_else(|err| {
-            eprintln!("crystal daemon: couldn't read the closed tasks: {err:#}");
+            errln!("crystal daemon: couldn't read the closed tasks: {err:#}");
             Vec::new()
         });
         closed.sort_by_key(|task| {
@@ -2947,7 +2946,7 @@ impl Daemon {
             let mut db = self.db.lock().unwrap();
             ensure!(db.remove_pending_task(id)?, "there's no open task t{id}");
             if let Err(err) = db.record_task(&project, &cancelled) {
-                eprintln!("crystal daemon: couldn't write down a closed task: {err:#}");
+                errln!("crystal daemon: couldn't write down a closed task: {err:#}");
             }
         }
         let event = Event::pending_task(Kind::TaskClosed, project, cancelled);
@@ -3004,7 +3003,7 @@ impl Daemon {
             session.number_task(id);
         }
         if let Err(err) = self.db.lock().unwrap().remove_pending_task(id) {
-            eprintln!("crystal daemon: couldn't forget that t{id} waits to start: {err:#}");
+            errln!("crystal daemon: couldn't forget that t{id} waits to start: {err:#}");
         }
         Ok(self.started(&mut sessions, name, Kind::TaskStarted))
     }
@@ -3606,7 +3605,7 @@ fn tell_stale(socket: &Path, events: &Bus, sweeps: &Receiver<()>) {
                         events.emit(Event::memory(Kind::MemoryStale, project, entry));
                     }
                 }
-                Err(err) => eprintln!("crystal daemon: couldn't look at memory: {err:#}"),
+                Err(err) => errln!("crystal daemon: couldn't look at memory: {err:#}"),
             }
         }
         if let Err(RecvTimeoutError::Disconnected) = sweeps.recv_timeout(STALE_SWEEP_EVERY) {
@@ -3863,7 +3862,7 @@ fn start_as(
     if let Some(typed) = typed
         && let Err(err) = session.term().write(&typed)
     {
-        eprintln!("crystal daemon: couldn't resume {name}'s agent: {err:#}");
+        errln!("crystal daemon: couldn't resume {name}'s agent: {err:#}");
     }
     if named_after_program {
         session.mark_named_after_program();
@@ -3966,7 +3965,7 @@ fn resumable(
     };
     let found = exists(program, cwd, env.get("PATH"));
     if !found {
-        eprintln!("crystal daemon: couldn't resume {name}'s agent: command not found: {program}");
+        errln!("crystal daemon: couldn't resume {name}'s agent: command not found: {program}");
     }
     found
 }

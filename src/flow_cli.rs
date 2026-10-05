@@ -6,7 +6,7 @@ use crate::client;
 use crate::config::Config;
 use crate::flow_run::{FlowRun, RunState};
 use crate::flows;
-use crate::output::{out, outln};
+use crate::output::{errln, out, outln};
 use crate::printable;
 use crate::protocol::{Request, Response};
 use crate::shell;
@@ -134,7 +134,7 @@ pub fn defs(dir: &Path) -> Result<()> {
     ensure_on()?;
     let (found, problem) = flows::definitions(&Config::load()?, dir);
     if let Some(problem) = problem {
-        eprintln!("crystal: couldn't read the project's flows: {problem}");
+        errln!("crystal: couldn't read the project's flows: {problem}");
     }
     if found.is_empty() {
         outln!("no flows yet: `crystal flow example` prints one to copy into your config file")?;

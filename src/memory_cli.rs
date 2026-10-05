@@ -11,7 +11,7 @@ use crate::git::Checkout;
 use crate::memory::{
     self, Added, Entry, Forgotten, Freshness, Kind, Listed, Memory, New, Source, Store, Wanted,
 };
-use crate::output::{out, outln};
+use crate::output::{err, errln, out, outln};
 use crate::printable;
 use crate::protocol::{Request, Response};
 use crate::tui::sidebar::ago;
@@ -140,7 +140,7 @@ pub fn search(
     let settings = Config::load()?.memory;
     let downloaded = embed::models_dir().is_some_and(|dir| embed::is_downloaded(&dir));
     if settings.embeddings && !downloaded {
-        eprintln!(
+        errln!(
             "the models that search by meaning aren't downloaded yet, so this goes by words \
              alone: the daemon gets them as it starts, or `crystal memory embed` does now"
         );
@@ -196,7 +196,7 @@ pub fn remove(socket: &Path, dir: Option<PathBuf>, id: u64) -> Result<()> {
 /// to fail.
 fn tell(socket: &Path, event: Event) {
     if let Err(err) = client::tell(socket, event) {
-        eprintln!("crystal: couldn't tell the daemon: {err:#}");
+        errln!("crystal: couldn't tell the daemon: {err:#}");
     }
 }
 
@@ -208,7 +208,7 @@ pub fn embed(socket: &Path) -> Result<()> {
     let root = match embed::models_dir().filter(|root| embed::is_downloaded(root)) {
         Some(root) => root,
         None => {
-            eprintln!("downloading {} ({} MB)", embed::names(), embed::size_mb());
+            errln!("downloading {} ({} MB)", embed::names(), embed::size_mb());
             embed::download(std::io::stderr().is_terminal())?
         }
     };
@@ -389,7 +389,7 @@ pub fn confirm(question: &str) -> Result<bool> {
     if !std::io::stdin().is_terminal() {
         bail!("not at a terminal to ask: add --yes to go ahead");
     }
-    eprint!("{question} [y/N] ");
+    err!("{question} [y/N] ");
     std::io::stderr().flush()?;
     let mut answer = String::new();
     std::io::stdin().lock().read_line(&mut answer)?;
