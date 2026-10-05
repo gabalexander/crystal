@@ -9,9 +9,10 @@
 //! from what a closed task did. The same thing said again is the one entry
 //! seen again, not a second one: in the same words, or, with the models
 //! that search by meaning, in others; and what the user forgot the distiller
-//! can't bring back. Entries kept twice before that check, `crystal memory
-//! dedupe` merges into one, and what it merged counts as the entry it went
-//! into said again.
+//! can't bring back, in its words or others. Entries kept twice before that
+//! check, `crystal memory dedupe` merges into one: what it merged counts as
+//! the entry it went into said again, and a search finds that entry by its
+//! words and meaning too.
 //!
 //! Every agent crystal starts is shown, as it starts, the entries that have
 //! most to do with its launch: first those about files its worktree has
@@ -49,7 +50,7 @@
 //! decides, and everything memory adds asks it first.
 
 use crate::config::Config;
-use crate::embed::Embed;
+use crate::embed::{self, Embed};
 use crate::git::Checkout;
 use crate::output::errln;
 use crate::printable;
@@ -205,10 +206,12 @@ const STOP_WORDS: &[&str] = &[
     "with", "you", "your",
 ];
 
-/// bm25's weight for each indexed column, the text and the files: a word
-/// in a file's name says more about what an entry is about than one in a
-/// sentence.
-const RANK: &str = "bm25(entries_fts, 1.0, 2.0)";
+/// bm25's weight for each indexed column, the text, the files and the
+/// words of the entries merged into it: a word in a file's name says more
+/// about what an entry is about than one in a sentence, and one in what was
+/// merged into it, less than one in what it says itself. On crystal's
+/// notes, 0.5 for those merged found the most.
+const RANK: &str = "bm25(entries_fts, 1.0, 2.0, 0.5)";
 
 /// How long a write waits for another to finish: crystal's commands, the
 /// daemon, the TUI and the MCP servers all share the one database.
@@ -396,6 +399,48 @@ CREATE TABLE merged (
 );
 ";
 
+/// What the entries merged into each entry said, a line each, in its own
+/// column of the full-text index, so their words find the entry they went
+/// into; and the vector of each entry merged or forgotten, by the hash of
+/// its key as `merged` and `forgotten` keep it, so its meaning does too,
+/// and what was forgotten is told by its meaning as well as its words. The
+/// index is made again with the column, from what's merged so far.
+const APART: &str = "
+DROP TRIGGER entries_fts_insert;
+DROP TRIGGER entries_fts_delete;
+DROP TRIGGER entries_fts_update;
+DROP TABLE entries_fts;
+ALTER TABLE entries ADD COLUMN merged_words TEXT NOT NULL DEFAULT '';
+UPDATE entries SET merged_words = coalesce((SELECT group_concat(m.text, char(10)) FROM merged m
+  WHERE m.project = entries.project AND m.kept = entries.id), '');
+CREATE VIRTUAL TABLE entries_fts USING fts5(
+  text, files, merged_words, content = 'entries', content_rowid = 'n',
+  tokenize = 'porter unicode61'
+);
+CREATE TRIGGER entries_fts_insert AFTER INSERT ON entries BEGIN
+  INSERT INTO entries_fts (rowid, text, files, merged_words)
+    VALUES (new.n, new.text, new.files, new.merged_words);
+END;
+CREATE TRIGGER entries_fts_delete AFTER DELETE ON entries BEGIN
+  INSERT INTO entries_fts (entries_fts, rowid, text, files, merged_words)
+    VALUES ('delete', old.n, old.text, old.files, old.merged_words);
+END;
+CREATE TRIGGER entries_fts_update AFTER UPDATE OF text, files, merged_words ON entries BEGIN
+  INSERT INTO entries_fts (entries_fts, rowid, text, files, merged_words)
+    VALUES ('delete', old.n, old.text, old.files, old.merged_words);
+  INSERT INTO entries_fts (rowid, text, files, merged_words)
+    VALUES (new.n, new.text, new.files, new.merged_words);
+END;
+INSERT INTO entries_fts (entries_fts) VALUES ('rebuild');
+CREATE TABLE apart_vectors (
+  project TEXT NOT NULL,
+  key     TEXT NOT NULL,
+  model   TEXT NOT NULL,
+  vector  BLOB NOT NULL,
+  PRIMARY KEY (project, key)
+);
+";
+
 /// What makes the database as it is now, a step for each version: a
 /// database at version `v`, kept in its `user_version`, takes the steps
 /// after the first `v`.
@@ -410,6 +455,7 @@ const MIGRATIONS: &[fn(&Connection) -> Result<()>] = &[
     add_names,
     count_from_now,
     |conn| Ok(conn.execute_batch(MERGED)?),
+    |conn| Ok(conn.execute_batch(APART)?),
 ];
 
 /// The columns [`entry_of`] reads, in its order.
@@ -724,6 +770,23 @@ pub struct Merge {
     pub merged: Vec<Twin>,
 }
 
+/// What an entry being added comes to by its meaning: its vector, the
+/// entry already there that says what it does, if one does, and whether it
+/// says what was forgotten.
+struct Meant {
+    vector: Vec<f32>,
+    twin: Option<u64>,
+    forgotten: bool,
+}
+
+/// What a project keeps apart, with vectors: each entry merged into one
+/// still there, by that one's id, with what it said; and what each
+/// forgotten entry said.
+struct Apart {
+    merged: Vec<(u64, String, Vec<f32>)>,
+    forgotten: Vec<(String, Vec<f32>)>,
+}
+
 /// What a search keeps to besides its words, and the most it gives.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(schemars::JsonSchema))]
@@ -806,9 +869,11 @@ impl Store {
     /// already there does in other words is that one seen again too: one
     /// as alike as [`Embed::same_from`], or as [`Embed::alike_from`] that
     /// the reranker, reading the new one as the query, scores
-    /// [`Embed::same_reranked_from`]. So is one in the words of an entry
-    /// merged into another. A new entry keeps the vector it was compared
-    /// by.
+    /// [`Embed::same_reranked_from`]; held against the words of the
+    /// entries merged into another too, which count as that one. So is one
+    /// in the words of an entry merged into another. What says what was
+    /// forgotten, by the same rule, crystal can't add, as it can't in the
+    /// same words. A new entry keeps the vector it was compared by.
     pub fn add_with(
         &mut self,
         project: &Path,
@@ -824,7 +889,7 @@ impl Store {
         // By meaning before the write, which holds up every other while
         // the models take their time.
         let meant = embedder.and_then(|embedder| {
-            self.meaning(&name, &text, embedder)
+            self.meaning(&name, &text, embedder, new.source.is_crystal())
                 .map(|meant| (meant, embedder.model()))
                 .inspect_err(|err| errln!("crystal: couldn't compare it by meaning: {err:#}"))
                 .ok()
@@ -870,6 +935,10 @@ impl Store {
                 "DELETE FROM forgotten WHERE project = ?1 AND key = ?2",
                 params![name, forgotten],
             )?;
+            tx.execute(
+                "DELETE FROM apart_vectors WHERE project = ?1 AND key = ?2",
+                params![name, forgotten],
+            )?;
         }
         let merged_into: Option<u64> = tx
             .query_row(
@@ -893,15 +962,23 @@ impl Store {
                         "DELETE FROM merged WHERE project = ?1 AND key = ?2",
                         params![name, forgotten],
                     )?;
+                    tx.execute(
+                        "DELETE FROM apart_vectors WHERE project = ?1 AND key = ?2",
+                        params![name, forgotten],
+                    )?;
                 }
             }
         }
-        let twin = meant.as_ref().and_then(|((_, twin), _)| *twin);
+        let twin = meant.as_ref().and_then(|(meant, _)| meant.twin);
         // Only while it's there: it may have gone as the models ran.
         if let Some(twin) = twin.map(|id| get(&tx, &name, id)).transpose()?.flatten() {
             let entry = seen_again(&tx, &name, &twin, &new, checkout, now, &mut code)?;
             tx.commit()?;
             return Ok(Added::Alike(entry));
+        }
+        // What the user forgot crystal can't add back in other words either.
+        if meant.as_ref().is_some_and(|(meant, _)| meant.forgotten) {
+            return Ok(Added::Refused);
         }
         let id: u64 = tx.query_row(
             "SELECT next_id FROM projects WHERE path = ?1",
@@ -928,10 +1005,10 @@ impl Store {
             counted_from: None,
         };
         insert(&tx, &name, &entry)?;
-        if let Some(((vector, _), model)) = &meant {
+        if let Some((meant, model)) = &meant {
             tx.execute(
                 "INSERT OR REPLACE INTO vectors (n, model, vector) VALUES (?1, ?2, ?3)",
-                params![tx.last_insert_rowid(), model, bytes_of(vector)],
+                params![tx.last_insert_rowid(), model, bytes_of(&meant.vector)],
             )?;
         }
         tx.commit()?;
@@ -1020,24 +1097,88 @@ impl Store {
         Ok(entry)
     }
 
-    /// `text`'s vector, and the entry of the project called `project` that
-    /// says what it does, if one does: see [`Store::add_with`].
+    /// What `text`, being added to the project called `project`, comes to
+    /// by its meaning: see [`Store::add_with`]. Whether it says what one
+    /// forgotten said is only looked for with `forgotten`, and while no
+    /// entry there says it.
     fn meaning(
         &mut self,
         project: &str,
         text: &str,
         embedder: &dyn Embed,
-    ) -> Result<(Vec<f32>, Option<u64>)> {
+        forgotten: bool,
+    ) -> Result<Meant> {
         let entries = self.with_vectors(project, embedder)?;
+        let apart = self.apart(project, embedder.model())?;
         let vector = embedder
             .embed_passages(&[text])?
             .pop()
             .context("the model gave no vector")?;
-        let alike = alike_to(&vector, &entries, embedder.alike_from());
-        let twin = same_as(text, alike, embedder)
+        if !embed::is_numbers(&vector) {
+            bail!("the model gave a vector that isn't numbers");
+        }
+        // What each entry says, in its words and those merged into it.
+        let own = entries
+            .iter()
+            .map(|(entry, other)| (entry.id, &entry.text, other));
+        let merged = (apart.merged.iter()).map(|(kept, said, other)| (*kept, said, other));
+        let mut said: Vec<(f32, &str, u64)> = own
+            .chain(merged)
+            .map(|(id, said, other)| (dot(&vector, other), said.as_str(), id))
+            .filter(|(score, ..)| *score >= embedder.alike_from())
+            .collect();
+        said.sort_by(|a, b| b.0.total_cmp(&a.0));
+        let alike: Vec<(f32, &str)> = said
+            .iter()
+            .map(|(score, said, _)| (*score, *said))
+            .collect();
+        let twin = saying_the_same(text, &alike, embedder)
             .first()
-            .map(|twin| twin.entry.id);
-        Ok((vector, twin))
+            .map(|(at, _)| said[*at].2);
+        let forgotten = forgotten && twin.is_none() && {
+            let mut said: Vec<(f32, &str)> = (apart.forgotten.iter())
+                .map(|(said, other)| (dot(&vector, other), said.as_str()))
+                .filter(|(score, _)| *score >= embedder.alike_from())
+                .collect();
+            said.sort_by(|a, b| b.0.total_cmp(&a.0));
+            !saying_the_same(text, &said, embedder).is_empty()
+        };
+        Ok(Meant {
+            vector,
+            twin,
+            forgotten,
+        })
+    }
+
+    /// What the project called `project` keeps apart, with its vectors from
+    /// the model called `model`: each entry merged into one still there,
+    /// with that one's id and what it said, and what each forgotten entry
+    /// said. Those with no vector yet ([`Store::embed_missing_in`] gives
+    /// them one) are left out.
+    fn apart(&self, project: &str, model: &str) -> Result<Apart> {
+        let vector = |row: &rusqlite::Row, at: usize| -> rusqlite::Result<Vec<f32>> {
+            Ok(vector_of(&row.get::<_, Vec<u8>>(at)?))
+        };
+        let mut merged = self.conn.prepare(
+            "SELECT m.kept, m.text, a.vector FROM merged m \
+             JOIN apart_vectors a ON a.project = m.project AND a.key = m.key AND a.model = ?2 \
+             JOIN entries e ON e.project = m.project AND e.id = m.kept \
+             WHERE m.project = ?1 ORDER BY m.id",
+        )?;
+        let merged = merged.query_map(params![project, model], |row| {
+            Ok((row.get(0)?, row.get(1)?, vector(row, 2)?))
+        })?;
+        let merged = merged.collect::<rusqlite::Result<_>>()?;
+        let mut forgotten = self.conn.prepare(
+            "SELECT f.text, a.vector FROM forgotten f \
+             JOIN apart_vectors a ON a.project = f.project AND a.key = f.key AND a.model = ?2 \
+             WHERE f.project = ?1 AND f.text IS NOT NULL ORDER BY f.id",
+        )?;
+        let forgotten = forgotten.query_map(params![project, model], |row| {
+            Ok((row.get(0)?, vector(row, 1)?))
+        })?;
+        let forgotten = forgotten.collect::<rusqlite::Result<_>>()?;
+        Ok(Apart { merged, forgotten })
     }
 
     /// Every entry of the project called `project` but tasks' outcomes,
@@ -1122,9 +1263,10 @@ impl Store {
     /// still holds, it's anchored to its files and what it names as they
     /// are now, as it would be said again; otherwise each file as the
     /// latest said of them that names it was, and what it names as it was.
-    /// Those merged leave the list, kept apart as they were, so their words
-    /// said again count as the one kept said again. Gives back what it
-    /// merged, each one kept as it is now.
+    /// Those merged leave the list, kept apart as they were with their
+    /// vectors, so their words said again, or what they mean, count as the
+    /// one kept said again, and their words and meaning find it in a
+    /// search. Gives back what it merged, each one kept as it is now.
     pub fn merge(&mut self, project: &Path, merges: &[Merge]) -> Result<Vec<Merge>> {
         let name = self.ready(project)?;
         let now = seconds_since_epoch(SystemTime::now());
@@ -1217,12 +1359,14 @@ impl Store {
                 ],
             )?;
             for Twin { entry, .. } in &merged {
+                let key = hash(&key_of(&entry.text));
+                keep_apart_vector(&tx, &name, entry.id, &key)?;
                 tx.execute(
                     "INSERT OR REPLACE INTO merged (project, key, kept, id, kind, text, files, \
                      source, merged) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                     params![
                         name,
-                        hash(&key_of(&entry.text)),
+                        key,
                         kept.id,
                         entry.id,
                         entry.kind.to_string(),
@@ -1242,6 +1386,7 @@ impl Store {
                     params![name, entry.id],
                 )?;
             }
+            write_merged_words(&tx, &name, kept.id)?;
             let kept = get(&tx, &name, kept.id)?.context("the entry kept is gone")?;
             done.push(Merge { kept, merged });
         }
@@ -1263,19 +1408,23 @@ impl Store {
     }
 
     /// Takes entry `id` out of `project`'s memory, and gives it back. What
-    /// it said is kept apart, with a hash of its words for the distiller to
-    /// know not to add it again, and for [`Store::forgotten`] to list.
+    /// it said is kept apart, with a hash of its words and its vector for
+    /// the distiller to know not to add it again, in those words or others,
+    /// and for [`Store::forgotten`] to list.
     pub fn remove(&mut self, project: &Path, id: u64) -> Result<Entry> {
         let name = self.ready(project)?;
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let entry = get(&tx, &name, id)?.with_context(|| format!("there's no entry {id}"))?;
+        let key = key_of(&entry.text);
+        if !key.is_empty() {
+            keep_apart_vector(&tx, &name, id, &hash(&key))?;
+        }
         tx.execute(
             "DELETE FROM entries WHERE project = ?1 AND id = ?2",
             params![name, id],
         )?;
-        let key = key_of(&entry.text);
         if !key.is_empty() {
             tx.execute(
                 "INSERT OR REPLACE INTO forgotten (project, key, id, kind, text, files, source, \
@@ -1617,12 +1766,12 @@ impl Store {
             return Ok(by_words);
         };
         match self.by_meaning(&name, text, among, pool, embedder) {
-            Ok(by_meaning) => Ok(reranked(
-                fused(&[by_words, by_meaning], pool),
-                text,
-                embedder,
-                limit,
-            )),
+            Ok(by_meaning) => {
+                let found = fused(&[by_words, by_meaning], pool);
+                let read: Vec<u64> = found.iter().take(RERANK_POOL).map(|e| e.id).collect();
+                let merged_words = self.merged_words(&name, &read)?;
+                Ok(reranked(found, text, embedder, limit, &merged_words))
+            }
             // The model failing leaves the search to the words.
             Err(err) => {
                 errln!("crystal: couldn't search by meaning: {err:#}");
@@ -1659,7 +1808,9 @@ impl Store {
 
     /// The entries of the project called `project` that mean much the same
     /// as `text`, as alike as the model counts a match, the most alike
-    /// first. Its entries with no vector yet get one first.
+    /// first: each as alike as the most alike of what it says and what the
+    /// entries merged into it said. Its entries with no vector yet get one
+    /// first.
     fn by_meaning(
         &mut self,
         project: &str,
@@ -1683,10 +1834,19 @@ impl Store {
         let rows = rows.query_map(params![project, model, only, but, files, now], |row| {
             Ok((entry_of(row)?, row.get::<_, Vec<u8>>("vector")?))
         })?;
+        let mut merged: HashMap<u64, Vec<Vec<f32>>> = HashMap::new();
+        for (kept, _, vector) in self.apart(project, model)?.merged {
+            merged.entry(kept).or_default().push(vector);
+        }
         let mut alike = Vec::new();
         for row in rows {
             let (entry, vector) = row?;
-            let score = dot(asked, &vector_of(&vector));
+            let merged = merged.get(&entry.id).into_iter().flatten();
+            let score = std::iter::once(&vector_of(&vector))
+                .chain(merged)
+                .map(|vector| dot(asked, vector))
+                .filter(|score| score.is_finite())
+                .fold(f32::NEG_INFINITY, f32::max);
             if score >= embedder.min_similarity() {
                 alike.push((score, entry));
             }
@@ -1700,6 +1860,19 @@ impl Store {
             .take(limit)
             .map(|(_, e)| e)
             .collect())
+    }
+
+    /// What the entries merged into each of `ids`, entries of the project
+    /// called `project`, said, by its id: those with nothing merged into
+    /// them left out.
+    fn merged_words(&self, project: &str, ids: &[u64]) -> Result<HashMap<u64, String>> {
+        let mut rows = self.conn.prepare(
+            "SELECT id, merged_words FROM entries WHERE project = ?1 AND merged_words != '' \
+             AND id IN (SELECT value FROM json_each(?2))",
+        )?;
+        let ids = serde_json::to_string(ids)?;
+        let rows = rows.query_map(params![project, ids], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     /// The entries of the project called `project` that `among` keeps to,
@@ -1737,25 +1910,68 @@ impl Store {
         let gone = self
             .conn
             .execute("DELETE FROM vectors WHERE model != ?1", params![model])?;
-        Ok(gone)
+        let apart = self.conn.execute(
+            "DELETE FROM apart_vectors WHERE model != ?1",
+            params![model],
+        )?;
+        Ok(gone + apart)
     }
 
     /// Gives every entry, in every project, that has no vector from
-    /// `embedder` one, and says how many that was.
+    /// `embedder` one, and what was merged and forgotten too, a vector
+    /// that isn't numbers ([`embed::is_numbers`]) let go first, to be made
+    /// again; and says how many that was.
     pub fn embed_missing(&mut self, embedder: &dyn Embed) -> Result<usize> {
+        let broken = self.forget_broken_vectors()?;
+        if broken > 0 {
+            errln!("crystal: {broken} of memory's vectors weren't numbers; making them again");
+        }
         self.embed_missing_in(None, embedder)
     }
 
+    /// Lets go of every vector kept that isn't numbers, and says how many.
+    fn forget_broken_vectors(&mut self) -> Result<usize> {
+        let mut broken = 0;
+        for (table, key) in [("vectors", "n"), ("apart_vectors", "rowid")] {
+            let ids: Vec<i64> = {
+                let mut rows = self
+                    .conn
+                    .prepare(&format!("SELECT {key}, vector FROM {table}"))?;
+                let rows = rows.query_map([], |row| {
+                    Ok((row.get(0)?, vector_of(&row.get::<_, Vec<u8>>(1)?)))
+                })?;
+                let rows: Vec<(i64, Vec<f32>)> = rows.collect::<rusqlite::Result<_>>()?;
+                rows.into_iter()
+                    .filter(|(_, vector)| !embed::is_numbers(vector))
+                    .map(|(id, _)| id)
+                    .collect()
+            };
+            for id in &ids {
+                self.conn.execute(
+                    &format!("DELETE FROM {table} WHERE {key} = ?1"),
+                    params![id],
+                )?;
+            }
+            broken += ids.len();
+        }
+        Ok(broken)
+    }
+
     /// Gives the entries of the project called `project`, or of every
-    /// project, that have no vector from `embedder` one.
+    /// project, that have no vector from `embedder` one, and what was
+    /// merged or forgotten there too (but for what was forgotten before
+    /// crystal kept what it said). A vector the model gives that isn't
+    /// numbers, even once made again, isn't kept: what has none is tried
+    /// again next time.
     fn embed_missing_in(&mut self, project: Option<&str>, embedder: &dyn Embed) -> Result<usize> {
+        let model = embedder.model();
         let missing: Vec<(i64, String)> = {
             let mut missing = self.conn.prepare(
                 "SELECT e.n, e.text FROM entries e \
                  LEFT JOIN vectors v ON v.n = e.n AND v.model = ?2 \
                  WHERE v.n IS NULL AND (?1 IS NULL OR e.project = ?1)",
             )?;
-            let missing = missing.query_map(params![project, embedder.model()], |row| {
+            let missing = missing.query_map(params![project, model], |row| {
                 Ok((row.get(0)?, row.get(1)?))
             })?;
             missing.collect::<rusqlite::Result<_>>()?
@@ -1767,17 +1983,52 @@ impl Store {
                 .conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)?;
             for ((n, text), vector) in batch.iter().zip(&vectors) {
+                if !embed::is_numbers(vector) {
+                    continue;
+                }
                 // Only for the entry as it was read: it may have gone since.
                 tx.execute(
                     "INSERT OR REPLACE INTO vectors (n, model, vector) \
                      SELECT ?1, ?2, ?3 WHERE EXISTS \
                      (SELECT 1 FROM entries WHERE n = ?1 AND text = ?4)",
-                    params![n, embedder.model(), bytes_of(vector), text],
+                    params![n, model, bytes_of(vector), text],
                 )?;
             }
             tx.commit()?;
         }
-        Ok(missing.len())
+        let apart: Vec<(String, String, String)> = {
+            let mut apart = self.conn.prepare(
+                "SELECT m.project, m.key, m.text FROM merged m \
+                 WHERE (?1 IS NULL OR m.project = ?1) AND NOT EXISTS (SELECT 1 FROM apart_vectors a \
+                   WHERE a.project = m.project AND a.key = m.key AND a.model = ?2) \
+                 UNION ALL SELECT f.project, f.key, f.text FROM forgotten f \
+                 WHERE f.text IS NOT NULL AND (?1 IS NULL OR f.project = ?1) \
+                   AND NOT EXISTS (SELECT 1 FROM apart_vectors a \
+                   WHERE a.project = f.project AND a.key = f.key AND a.model = ?2)",
+            )?;
+            let apart = apart.query_map(params![project, model], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?;
+            apart.collect::<rusqlite::Result<_>>()?
+        };
+        for batch in apart.chunks(EMBED_BATCH) {
+            let texts: Vec<&str> = batch.iter().map(|(_, _, text)| text.as_str()).collect();
+            let vectors = embedder.embed_passages(&texts)?;
+            let tx = self
+                .conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            for ((project, key, _), vector) in batch.iter().zip(&vectors) {
+                if embed::is_numbers(vector) {
+                    tx.execute(
+                        "INSERT OR REPLACE INTO apart_vectors (project, key, model, vector) \
+                         VALUES (?1, ?2, ?3, ?4)",
+                        params![project, key, model, bytes_of(vector)],
+                    )?;
+                }
+            }
+            tx.commit()?;
+        }
+        Ok(missing.len() + apart.len())
     }
 
     /// `project`'s name in the database, once it has its row there: the
@@ -2110,6 +2361,32 @@ fn seen_again(
     get(conn, project, said.id)?.context("the entry just seen is gone")
 }
 
+/// Keeps the vector of entry `id` of the project called `project` as it
+/// goes, merged or forgotten, under `key`, the hash of its key, so what it
+/// said is still told by its meaning: see [`APART`].
+fn keep_apart_vector(conn: &Connection, project: &str, id: u64, key: &str) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO apart_vectors (project, key, model, vector) \
+         SELECT ?1, ?3, v.model, v.vector FROM vectors v JOIN entries e ON e.n = v.n \
+         WHERE e.project = ?1 AND e.id = ?2",
+        params![project, id, key],
+    )?;
+    Ok(())
+}
+
+/// Writes down, beside entry `id` of the project called `project`, what
+/// the entries merged into it said, a line each, for their words to find
+/// it: see [`APART`].
+fn write_merged_words(conn: &Connection, project: &str, id: u64) -> Result<()> {
+    conn.execute(
+        "UPDATE entries SET merged_words = coalesce((SELECT group_concat(m.text, char(10)) \
+         FROM merged m WHERE m.project = ?1 AND m.kept = ?2), '') \
+         WHERE project = ?1 AND id = ?2",
+        params![project, id],
+    )?;
+    Ok(())
+}
+
 /// Of `entries`, those at least `from` alike to `vector`, the most alike
 /// first, each with how alike. A vector the model made nothing of, which
 /// it can, is alike to none.
@@ -2128,22 +2405,48 @@ fn alike_to<'a>(
 }
 
 /// Of `alike`, the entries said before at least [`Embed::alike_from`]
-/// alike to `text`, the most alike first, those that say what `text` does:
-/// every one at least [`Embed::same_from`] alike, and those the reranker,
-/// reading `text` as the query with the first [`TWIN_POOL`] of them, scores
-/// at least [`Embed::same_reranked_from`]. Without a reranker, or with it
-/// failing, only the first.
+/// alike to `text`, the most alike first, those that say what `text` does,
+/// as [`saying_the_same`] finds them.
 fn same_as(text: &str, alike: Vec<(f32, &Entry)>, embedder: &dyn Embed) -> Vec<Twin> {
-    let alike: Vec<(f32, &Entry)> = alike
-        .into_iter()
-        .filter(|(score, _)| *score >= embedder.alike_from())
-        .take(TWIN_POOL)
+    let texts: Vec<(f32, &str)> = alike
+        .iter()
+        .map(|(score, entry)| (*score, entry.text.as_str()))
         .collect();
-    let unsure = alike.iter().any(|(score, _)| *score < embedder.same_from());
+    saying_the_same(text, &texts, embedder)
+        .into_iter()
+        .map(|(at, reranked)| Twin {
+            entry: alike[at].1.clone(),
+            alike: alike[at].0,
+            reranked,
+        })
+        .collect()
+}
+
+/// Of `alike`, what was said before, each with how alike it is to `text`,
+/// the most alike first, those that say what `text` does, by their places
+/// in it, each with what the reranker scored it when it was asked: every
+/// one at least [`Embed::same_from`] alike, and of those at least
+/// [`Embed::alike_from`] alike, those the reranker, reading `text` as the
+/// query with the first [`TWIN_POOL`] of them, scores at least
+/// [`Embed::same_reranked_from`]. Without a reranker, or with it failing,
+/// only the first.
+fn saying_the_same(
+    text: &str,
+    alike: &[(f32, &str)],
+    embedder: &dyn Embed,
+) -> Vec<(usize, Option<f32>)> {
+    let pool: Vec<(usize, f32, &str)> = (alike.iter().enumerate())
+        .filter(|(_, (score, _))| *score >= embedder.alike_from())
+        .take(TWIN_POOL)
+        .map(|(at, (score, said))| (at, *score, *said))
+        .collect();
+    let unsure = pool
+        .iter()
+        .any(|(_, score, _)| *score < embedder.same_from());
     let scores = if unsure {
-        let passages: Vec<&str> = alike.iter().map(|(_, entry)| entry.text.as_str()).collect();
+        let passages: Vec<&str> = pool.iter().map(|(_, _, said)| *said).collect();
         match embedder.rerank(text, &passages) {
-            Ok(Some(scores)) if scores.len() == alike.len() => Some(scores),
+            Ok(Some(scores)) if scores.len() == pool.len() => Some(scores),
             Ok(Some(_)) => {
                 errln!("crystal: the reranker didn't score every entry");
                 None
@@ -2157,18 +2460,13 @@ fn same_as(text: &str, alike: Vec<(f32, &Entry)>, embedder: &dyn Embed) -> Vec<T
     } else {
         None
     };
-    alike
-        .into_iter()
+    pool.into_iter()
         .enumerate()
-        .filter_map(|(at, (score, entry))| {
-            let reranked = scores.as_ref().map(|scores| scores[at]);
+        .filter_map(|(read, (at, score, _))| {
+            let reranked = scores.as_ref().map(|scores| scores[read]);
             let same = score >= embedder.same_from()
                 || reranked.is_some_and(|reranked| reranked >= embedder.same_reranked_from());
-            same.then(|| Twin {
-                entry: entry.clone(),
-                alike: score,
-                reranked,
-            })
+            same.then_some((at, reranked))
         })
         .collect()
 }
@@ -2302,12 +2600,26 @@ pub fn fused(rankings: &[Vec<Entry>], limit: usize) -> Vec<Entry> {
 /// `found`, the best ranked first, read again with `text` by the
 /// embedder's reranker: nothing, when not even the best of the first
 /// [`RERANK_POOL`] answers `text`; otherwise those of them it doesn't rule
-/// out, in the order of the two rankings merged. Without a reranker, or
-/// with it failing, `found` as it is.
-fn reranked(mut found: Vec<Entry>, text: &str, embedder: &dyn Embed, limit: usize) -> Vec<Entry> {
+/// out, in the order of the two rankings merged. An entry is read with the
+/// words of those merged into it, `merged_words`, by its id, after its own.
+/// Without a reranker, or with it failing, `found` as it is.
+fn reranked(
+    mut found: Vec<Entry>,
+    text: &str,
+    embedder: &dyn Embed,
+    limit: usize,
+    merged_words: &HashMap<u64, String>,
+) -> Vec<Entry> {
     found.truncate(RERANK_POOL.max(limit));
     let read = &found[..found.len().min(RERANK_POOL)];
-    let passages: Vec<&str> = read.iter().map(|entry| entry.text.as_str()).collect();
+    let passages: Vec<String> = read
+        .iter()
+        .map(|entry| match merged_words.get(&entry.id) {
+            Some(words) => format!("{}\n{words}", entry.text),
+            None => entry.text.clone(),
+        })
+        .collect();
+    let passages: Vec<&str> = passages.iter().map(String::as_str).collect();
     let scores = match embedder.rerank(text, &passages) {
         Ok(Some(scores)) if scores.len() == read.len() => scores,
         Ok(Some(_)) => {
@@ -4739,16 +5051,17 @@ mod tests {
         assert_eq!(store.counts("meanings").unwrap(), (3, 2));
         assert_eq!(store.embed_missing(&MEANINGS).unwrap(), 1);
         assert_eq!(store.counts("meanings").unwrap(), (3, 3));
+        // The one forgotten keeps its vector apart.
         store.remove(project, 1).unwrap();
         assert_eq!(vectors(&store), 2);
         assert_eq!(store.forget_vectors_but("meanings").unwrap(), 0);
-        assert_eq!(store.forget_vectors_but("another").unwrap(), 2);
+        assert_eq!(store.forget_vectors_but("another").unwrap(), 3);
         assert_eq!(vectors(&store), 0);
 
         // Another model's vectors can't be compared: it makes its own.
         let other = Meanings { model: "other" };
-        assert_eq!(store.embed_missing(&other).unwrap(), 2);
-        assert_eq!(store.embed_missing(&MEANINGS).unwrap(), 2);
+        assert_eq!(store.embed_missing(&other).unwrap(), 3);
+        assert_eq!(store.embed_missing(&MEANINGS).unwrap(), 3);
     }
 
     #[test]
@@ -5102,6 +5415,217 @@ mod tests {
             .unwrap();
         assert_eq!(ids(&near), [4, 1], "outcomes left out");
         assert!(store.nearest(project, &[], 2, &ANGLED).unwrap().is_empty());
+    }
+
+    /// Merges what [`Store::twins`] finds in `store`'s project.
+    fn deduped(store: &mut Store) -> Vec<(u64, Vec<u64>)> {
+        let merges = store.twins(Path::new(APP), &ANGLED).unwrap();
+        groups(&store.merge(Path::new(APP), &merges).unwrap())
+    }
+
+    #[test]
+    fn a_merged_entry_s_words_still_find_the_one_it_went_into() {
+        let (_dir, mut store) = said(&[
+            "@0 fees are kept in cents",
+            "@5 money is stored as integers (distilled)",
+        ]);
+        assert_eq!(deduped(&mut store), [(1, vec![2])]);
+        let found = store.search(Path::new(APP), "integers", None, 10, None);
+        assert_eq!(ids(&found.unwrap()), [1]);
+        // Forgotten, its words go with it.
+        store.remove(Path::new(APP), 1).unwrap();
+        let found = store.search(Path::new(APP), "integers", None, 10, None);
+        assert!(found.unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_entry_means_what_those_merged_into_it_meant_too() {
+        let (_dir, mut store) = said(&["@0 one", "@20 two (distilled)", "@35 three"]);
+        assert_eq!(deduped(&mut store), [(1, vec![2])]);
+        // One is 23 degrees from the query and three 12, but two, merged
+        // into one, is 3.
+        let found = store.search(Path::new(APP), "@23 query", None, 10, Some(&ANGLED));
+        assert_eq!(ids(&found.unwrap()), [1, 3]);
+        // And what says what two said is one said again.
+        let again = store.add_with(Path::new(APP), note("@21 two again"), Some(&ANGLED));
+        assert!(matches!(again.unwrap(), Added::Alike(Entry { id: 1, .. })));
+    }
+
+    /// A stand-in whose reranker scores a passage by whether it has the
+    /// query's last word.
+    struct Wording;
+
+    impl Embed for Wording {
+        fn model(&self) -> &str {
+            "angled"
+        }
+
+        fn embed_passages(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+            ANGLED.embed_passages(texts)
+        }
+
+        fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
+            ANGLED.embed_query(text)
+        }
+
+        fn min_similarity(&self) -> f32 {
+            0.0
+        }
+
+        fn near_best(&self) -> f32 {
+            1.0
+        }
+
+        fn rerank(&self, query: &str, passages: &[&str]) -> Result<Option<Vec<f32>>> {
+            let word = query.split_whitespace().last().unwrap_or_default();
+            let scores = passages
+                .iter()
+                .map(|passage| if passage.contains(word) { 0.9 } else { -1.0 })
+                .collect();
+            Ok(Some(scores))
+        }
+    }
+
+    #[test]
+    fn the_reranker_reads_an_entry_with_the_words_merged_into_it() {
+        let found = vec![
+            entry(1, Kind::Note, "fees in cents"),
+            entry(2, Kind::Note, "deploys"),
+        ];
+        let merged = HashMap::from([(1, "money as integers".to_string())]);
+        let read = reranked(found.clone(), "@0 integers", &Wording, 10, &merged);
+        assert_eq!(ids(&read), [1]);
+        let unmerged = reranked(found, "@0 integers", &Wording, 10, &HashMap::new());
+        assert!(unmerged.is_empty(), "nothing answers it: {unmerged:?}");
+    }
+
+    #[test]
+    fn what_was_forgotten_crystal_can_t_add_back_in_other_words() {
+        let (_dir, _socket, mut store) =
+            remembering(&[(Kind::Gotcha, "@0 the ledger tests need redis up")]);
+        let project = Path::new(APP);
+        // Forgotten with no vector yet: it gets one as it's needed.
+        store.remove(project, 1).unwrap();
+        let distilled = |text: &str| New {
+            source: Source::Distilled("fixer".into()),
+            ..note(text)
+        };
+        let again = store.add_with(
+            project,
+            distilled("@10 redis has to run for the ledger"),
+            Some(&ANGLED),
+        );
+        assert_eq!(again.unwrap(), Added::Refused);
+        let unlike = store.add_with(
+            project,
+            distilled("@-25 unlike: the ledger skips redis"),
+            Some(&ANGLED),
+        );
+        assert!(matches!(unlike.unwrap(), Added::New(Entry { id: 2, .. })));
+        let apart = store.add_with(
+            project,
+            distilled("@60 deploys go out on tuesdays"),
+            Some(&ANGLED),
+        );
+        assert!(matches!(apart.unwrap(), Added::New(Entry { id: 3, .. })));
+        // The user can, in any words.
+        let theirs = store.add_with(
+            project,
+            note("@10 redis has to run for the ledger"),
+            Some(&ANGLED),
+        );
+        assert!(matches!(theirs.unwrap(), Added::New(Entry { id: 4, .. })));
+        // Forgotten with its vector, kept apart as it goes.
+        store.remove(project, 3).unwrap();
+        let again = store.add_with(project, distilled("@58 deploys on tuesdays"), Some(&ANGLED));
+        assert_eq!(again.unwrap(), Added::Refused);
+    }
+
+    /// A stand-in that makes nothing of a text with "nan" in it, as the
+    /// model once did of one, every number of its vector NaN.
+    struct Faulty;
+
+    impl Embed for Faulty {
+        fn model(&self) -> &str {
+            "angled"
+        }
+
+        fn embed_passages(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+            let vectors = ANGLED.embed_passages(texts)?;
+            Ok(texts
+                .iter()
+                .zip(vectors)
+                .map(|(text, vector)| match text.contains("nan") {
+                    true => vec![f32::NAN; vector.len()],
+                    false => vector,
+                })
+                .collect())
+        }
+
+        fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
+            ANGLED.embed_query(text)
+        }
+
+        fn min_similarity(&self) -> f32 {
+            0.0
+        }
+
+        fn near_best(&self) -> f32 {
+            1.0
+        }
+    }
+
+    #[test]
+    fn a_vector_that_isn_t_numbers_is_never_kept_and_one_kept_is_made_again() {
+        let (_dir, _socket, mut store) = remembering(&[(Kind::Note, "@0 fees are kept in cents")]);
+        let project = Path::new(APP);
+        // Added, it's kept with no vector, and tried again each time.
+        let added = store.add_with(project, note("@1 a nan of a note"), Some(&Faulty));
+        assert!(matches!(added.unwrap(), Added::New(Entry { id: 2, .. })));
+        assert_eq!(store.counts("angled").unwrap(), (2, 1));
+        assert_eq!(store.embed_missing(&Faulty).unwrap(), 1);
+        assert_eq!(store.counts("angled").unwrap(), (2, 1));
+        // One kept from before, a vector of NaN, is let go and made again.
+        store
+            .conn
+            .execute(
+                "UPDATE vectors SET vector = ?1",
+                params![bytes_of(&[f32::NAN, f32::NAN])],
+            )
+            .unwrap();
+        assert_eq!(store.embed_missing(&ANGLED).unwrap(), 2);
+        assert_eq!(store.counts("angled").unwrap(), (2, 2));
+        let found = store
+            .search(project, "@0 cents", None, 10, Some(&ANGLED))
+            .unwrap();
+        assert_eq!(ids(&found), [1, 2]);
+    }
+
+    #[test]
+    fn a_database_from_before_merged_words_finds_the_kept_by_what_went_into_it() {
+        let (_dir, socket) = socket();
+        fs::create_dir_all(dir(&socket)).unwrap();
+        let conn = Connection::open(dir(&socket).join("memory.db")).unwrap();
+        // The steps before the words merged into an entry were searched.
+        for step in &MIGRATIONS[..10] {
+            step(&conn).unwrap();
+        }
+        conn.execute_batch(
+            "PRAGMA user_version = 10;
+             INSERT INTO projects (path, next_id) VALUES ('/code/app', 3);
+             INSERT INTO entries (project, id, kind, text, key, source, created, last_seen)
+               VALUES ('/code/app', 1, 'decision', 'fees are kept in cents', 'k', '\"user\"', 1, 1);
+             INSERT INTO merged (project, key, kept, id, kind, text, source, merged)
+               VALUES ('/code/app', 'h', 1, 2, 'note', 'money is stored as integers',
+                 '\"user\"', 1);",
+        )
+        .unwrap();
+        drop(conn);
+        let mut store = Store::open(&socket).unwrap();
+        let found = store.search(Path::new(APP), "integers", None, 10, None);
+        assert_eq!(ids(&found.unwrap()), [1]);
+        let found = store.search(Path::new(APP), "cents", None, 10, None);
+        assert_eq!(ids(&found.unwrap()), [1]);
     }
 
     #[test]
