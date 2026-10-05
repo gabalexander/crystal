@@ -64,7 +64,7 @@ pub fn run(socket: &Path, version: Option<String>, check: bool, notes: bool) -> 
         let version = version.as_deref().unwrap_or(VERSION);
         let body = kept_notes(version)
             .or_else(|| fetch_notes(version))
-            .with_context(|| format!("there are no notes for crystal {version} to be found"))?;
+            .with_context(|| no_notes_of(version))?;
         println!("{}", printable::text(&body).trim_end());
         return Ok(());
     }
@@ -205,6 +205,15 @@ pub fn notes_title() -> String {
 /// This crystal's notes, as an update kept them.
 pub fn this_crystals_kept_notes() -> Option<String> {
     kept_notes(VERSION)
+}
+
+/// What's said when there are no notes for this crystal to be had.
+pub fn no_notes() -> String {
+    no_notes_of(VERSION)
+}
+
+fn no_notes_of(version: &str) -> String {
+    format!("there are no notes for crystal {version} to be found")
 }
 
 /// This crystal's notes, asked of where the releases are. Not being able

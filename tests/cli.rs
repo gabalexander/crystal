@@ -6279,6 +6279,29 @@ fn scrollback_lines_in_the_config_is_how_much_history_a_session_keeps() {
 }
 
 #[test]
+fn a_change_to_scrollback_lines_counts_for_the_sessions_running_too() {
+    let crystal = Crystal::new();
+    let out = crystal
+        .command(&["new", "-n", "printer", "sh", "-c", LONG_OUTPUT])
+        .env("CRYSTAL_IDLE_CHECK_MS", "100")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    written(&crystal.dir.path().join("printed"));
+    shows_on_screen(&crystal, "printer", "line 60");
+    let history = || crystal.ok(&["read", "printer", "--history"]);
+    assert!(history().starts_with("first-line\n"), "{}", history());
+
+    let config = std::fs::read_to_string(crystal.config_file()).unwrap();
+    crystal.configure(&format!("scrollback_lines = 10\n{config}"));
+    // Its oldest rows go, and 10 are left above the screen's 40.
+    eventually("the history is cut to 10 rows", || {
+        history().lines().count() == 49
+    });
+    assert!(history().starts_with("line 12\n"), "{}", history());
+}
+
+#[test]
 fn rows_an_inline_agent_scrolls_up_through_a_region_reach_the_history() {
     let crystal = Crystal::new();
     // How an agent like Codex prints above its prompt: a scroll region from
@@ -12968,7 +12991,7 @@ fn the_settings_view_changes_the_config_and_follows_it_live() {
         "notify = true\ntheme = \"light\"\n\n[memory]\ndistill = false\nembeddings = false\n",
     );
     tui.type_keys("6");
-    tui.shows("○ distill closed tasks");
+    tui.shows("○ distill finished work");
     tui.shows("not downloaded (2449 MB)");
 
     // Turned on, search by meaning has the daemon get the models, and the
@@ -13034,6 +13057,59 @@ fn a_key_pressed_in_the_settings_is_given_its_command_at_once() {
     tui.hides("From a pane");
     tui.type_keys("\x1bOQ");
     tui.shows("enter runs · ↑/↓ choose · esc closes");
+}
+
+/// Where `needle` first is in the screen's `text`, as the `(column, row)`
+/// of its first character, counted from 0.
+fn place_of(text: &str, needle: &str) -> (usize, usize) {
+    let row = line_with(text, needle);
+    let line = text.lines().nth(row).unwrap();
+    let column = line[..line.find(needle).unwrap()].chars().count();
+    (column, row)
+}
+
+#[test]
+fn the_settings_view_takes_the_mouse_and_filters_the_keys() {
+    let crystal = Crystal::new();
+    where_plugin(&crystal);
+    crystal.ok(&["plugin", "enable", "notes"]);
+    crystal.ok(&["new", "-n", "agent", "sleep", "30"]);
+    let mut tui = crystal.tui();
+    tui.shows("❯ agent");
+    let config = || std::fs::read_to_string(crystal.config_file()).unwrap_or_default();
+
+    // A click on a tab shows it.
+    tui.type_keys(",");
+    tui.shows("ask before quitting");
+    let (column, row) = place_of(&tui.text(), "Keys");
+    tui.type_keys(&click(column, row));
+    tui.shows("From a pane");
+
+    // `/` narrows the keys to those it finds, and a click on the row the
+    // bar is on waits for its key.
+    tui.type_keys("/commands");
+    tui.shows("/ commands  1 of");
+    tui.hides("From a pane");
+    tui.type_keys("\r");
+    let (column, row) = place_of(&tui.text(), "run a command by its name");
+    tui.type_keys(&click(column, row));
+    tui.shows("press a key…");
+    tui.type_keys("\x1bOQ");
+    eventually("F2 is written down", || {
+        config().contains("[keys]\ncommands = \"f2\"")
+    });
+    tui.shows("• commands              F2");
+    // Esc shows them all again.
+    tui.type_keys("\x1b");
+    tui.shows("From a pane");
+    tui.hides("/ commands");
+
+    // A key the notes plugin's action has asks before a command takes it.
+    tui.type_keys("/new-session\r\rN");
+    tui.shows("N runs the notes plugin's \"Where am I\"");
+    tui.type_keys("\x1b");
+    tui.hides("Where am I");
+    assert!(!config().contains("new-session"), "{}", config());
 }
 
 #[test]
@@ -16553,10 +16629,14 @@ fn the_tui_shows_what_s_new_once_after_an_update() {
     tui.hides("what's new");
     tui.type_keys("q");
     assert!(tui.exit());
-    let tui = crystal.attach_with_env(&[], &env);
+    let mut tui = crystal.attach_with_env(&[], &env);
     tui.shows("crystal");
     thread::sleep(Duration::from_millis(300));
     assert!(!tui.text().contains("what's new"));
+    // Until it's asked for.
+    tui.type_keys(":release-notes\r");
+    tui.shows(&format!("what's new in crystal {VERSION}"));
+    tui.shows("• one column on a phone");
 
     // And the command line prints them.
     let out = crystal
@@ -16586,6 +16666,11 @@ fn the_help_has_a_guide_and_keys_can_show_as_they_are_pressed() {
     tui.shows("In the sidebar");
     tui.type_keys("x");
     tui.hides("In the sidebar");
+    // And it's a command of its own, with no key.
+    tui.type_keys(":guide\r");
+    tui.shows("The crystal guide");
+    tui.type_keys("x");
+    tui.hides("The crystal guide");
     assert_eq!(crystal.ok(&["guide"]), include_str!("../docs/guide.md"));
     tui.type_keys("q");
     assert!(tui.exit());

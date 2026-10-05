@@ -1492,6 +1492,15 @@ impl Tui {
             }
         }
         let areas = ui::Areas::of(&self.app, self.screen);
+        // The settings view has the mouse while it's open.
+        if let Some(view) = self.app.settings_view() {
+            let middle = ui::middle(&areas, self.screen);
+            let spot = settings_view::hit(view, &self.theme, middle, mouse.column, mouse.row);
+            if let Some(action) = self.app.settings_mouse(mouse.kind, spot) {
+                self.carry_out(action);
+            }
+            return;
+        }
         let mut hit = ui::hit(&areas, &self.app, mouse.column, mouse.row);
         if self.click_on_link(&mouse, hit) {
             return;
@@ -1544,7 +1553,7 @@ impl Tui {
     /// The mouse moved: with Ctrl held, onto the link to underline.
     /// Returns whether that changes what's drawn.
     fn mouse_moved(&mut self, mouse: &MouseEvent) -> bool {
-        if self.overlay.is_some() {
+        if self.overlay.is_some() || self.app.settings_view().is_some() {
             return false;
         }
         // Over a menu, the bar follows the mouse.
@@ -1940,6 +1949,16 @@ impl Tui {
             Action::DeleteProfile(name) => {
                 let deleted = profile::delete(&config::path(), &name);
                 self.profiles_changed(deleted, None);
+            }
+            Action::ReleaseNotes => {
+                self.read_in_background(|| {
+                    let notes =
+                        update::this_crystals_kept_notes().or_else(update::this_crystals_notes);
+                    match notes {
+                        Some(body) => Event::WhatsNew(body),
+                        None => Event::Notice(update::no_notes()),
+                    }
+                });
             }
             Action::OpenSettings => {
                 self.poll_settings.store(true, Ordering::Relaxed);
@@ -2555,7 +2574,12 @@ impl Tui {
             );
         }
         self.app.set_start_dir(start_dir(config));
+        // The panes showing sessions keep as much history as the daemon's
+        // screens come to.
         crate::vt::set_history_lines(config.scrollback_lines);
+        for pane in self.panes.iter_mut().chain(self.overlay.as_mut()) {
+            pane.screen.keep_history(config.scrollback_lines);
+        }
         crate::mermaid::set_ascii(config.mermaid_ascii);
         if config.mouse.capture != self.config.mouse.capture {
             capture_mouse(config.mouse.capture);

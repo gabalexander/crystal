@@ -43,7 +43,8 @@ pub const MAX_HISTORY_LINES: usize = 1_000_000;
 static HISTORY_LINES: AtomicUsize = AtomicUsize::new(DEFAULT_HISTORY_LINES);
 
 /// Has the screens made from now on keep `lines` rows of history, at most
-/// [`MAX_HISTORY_LINES`]. A screen made before keeps what it kept.
+/// [`MAX_HISTORY_LINES`]. A screen made before keeps what it kept, until
+/// [`Screen::keep_history`] says otherwise.
 pub fn set_history_lines(lines: usize) {
     HISTORY_LINES.store(lines.min(MAX_HISTORY_LINES), Ordering::Relaxed);
 }
@@ -114,6 +115,8 @@ pub struct Screen {
     /// The progress the program reports, which alacritty_terminal passes
     /// over.
     progress: Progress,
+    /// How many rows of history it keeps.
+    history: usize,
 }
 
 /// Picks the progress a program reports out of its output: OSC 9;4, which
@@ -370,6 +373,19 @@ impl Timeout for Unsynced {
     }
 }
 
+/// How alacritty_terminal is to keep a screen that keeps `history` rows
+/// of history.
+fn options(history: usize) -> Config {
+    Config {
+        scrolling_history: history,
+        kitty_keyboard: true,
+        // A program may put text on the user's clipboard, as in a terminal
+        // of its own, but never read what's there.
+        osc52: Osc52::OnlyCopy,
+        ..Config::default()
+    }
+}
+
 /// A screen's size, the way alacritty_terminal takes it.
 struct Size {
     rows: usize,
@@ -446,14 +462,7 @@ impl Screen {
     /// A screen that keeps `history` rows of history.
     fn keeping(rows: u16, cols: u16, history: usize) -> Screen {
         let heard = Arc::new(Mutex::new(Heard::default()));
-        let config = Config {
-            scrolling_history: history,
-            kitty_keyboard: true,
-            // A program may put text on the user's clipboard, as in a
-            // terminal of its own, but never read what's there.
-            osc52: Osc52::OnlyCopy,
-            ..Config::default()
-        };
+        let config = options(history);
         let term = Term::new(config, &size(rows, cols), Listener(heard.clone()));
         Screen {
             term,
@@ -462,6 +471,24 @@ impl Screen {
             search: None,
             urls: RefCell::default(),
             progress: Progress::default(),
+            history,
+        }
+    }
+
+    /// Has the screen keep `lines` rows of history from now on, at most
+    /// [`MAX_HISTORY_LINES`]: fewer than it has lets the oldest go, and
+    /// copy mode's cursor on one of them comes to the oldest left.
+    pub fn keep_history(&mut self, lines: usize) {
+        let lines = lines.min(MAX_HISTORY_LINES);
+        if lines == self.history {
+            return;
+        }
+        self.history = lines;
+        self.term.set_options(options(lines));
+        let topmost = self.term.topmost_line();
+        let cursor = &mut self.term.vi_mode_cursor.point;
+        if cursor.line < topmost {
+            cursor.line = topmost;
         }
     }
 
@@ -1718,6 +1745,23 @@ mod tests {
         let mut screen = Screen::keeping(2, 10, 1);
         screen.process(b"one\r\ntwo\r\nthree\r\nfour");
         assert_eq!(screen.rows(true), ["two", "three", "four"]);
+    }
+
+    #[test]
+    fn a_screen_told_to_keep_less_history_lets_the_oldest_go() {
+        let mut screen = Screen::keeping(2, 10, 100);
+        screen.process(b"one\r\ntwo\r\nthree\r\nfour\r\nfive");
+        screen.start_copying();
+        screen.move_copy_cursor(Motion::HistoryTop);
+        assert_eq!(screen.copy_cursor_line(), "one");
+        screen.keep_history(1);
+        assert_eq!(screen.rows(true), ["three", "four", "five"]);
+        // Copy mode's cursor was on a row let go: it's on the oldest left.
+        assert_eq!(screen.copy_cursor_line(), "three");
+        screen.keep_history(10);
+        screen.process(b"\r\nsix\r\nseven");
+        assert_eq!(screen.history(), 3);
+        assert_eq!(screen.rows(true)[0], "three");
     }
 
     #[test]

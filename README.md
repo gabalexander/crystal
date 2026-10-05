@@ -117,7 +117,8 @@ Once a day, as it opens, the TUI looks for a newer release and says so on its bo
 The first time the TUI opens on a new crystal, it shows what's new in it: the release's notes, as GitHub has
 them, scrolled with the arrows and put away with any other key, and never shown again. `crystal update` keeps
 them as it installs the release, so the TUI has them at once; updated some other way, the TUI asks for them
-itself, unless `check = false` says not to. `crystal update --notes` prints them, or another release's, like
+itself, unless `check = false` says not to. `release-notes` in the [command list](#keys-and-commands) (`:`)
+shows them again, and `crystal update --notes` prints them, or another release's, like
 `crystal update --notes 0.2.0`. A mirror named by `CRYSTAL_RELEASES` keeps each release's notes as
 `release-notes.md` among its files.
 
@@ -758,7 +759,8 @@ and `Ctrl+Home` and `Ctrl+End` for its ends.
 `:` opens the command list: every command by its name, with what it does and its key, and your plugins'
 actions after them. Type a little of a name, or of what it does, and `Enter` runs the one the bar is on, as
 its key would. Before you type, the five you ran from it last come first, so it's also a quick way back to
-what you just did. A command with no key, or whose key you don't remember, is always there.
+what you just did. A command with no key, or whose key you don't remember, is always there: `guide` opens the
+[guide](docs/guide.md) and `release-notes` what's new in this crystal, neither with a key until you give it one.
 
 ### The sidebar
 
@@ -2972,7 +2974,7 @@ that makes no sense is said there too, and the settings stay as they were until 
 | `confirm_quit` | `true` | `q` asks before it quits the TUI, since a key meant for an agent can land on the sidebar; the sessions keep running either way |
 | `show_keys` | `false` | show each key that runs a command at the right of the footer, with the command, for a few seconds: for whoever watches your screen shared or recorded |
 | `mermaid_ascii` | `false` | draw [mermaid diagrams](#the-file-finder-and-the-tree-browser) with ASCII rather than box drawing |
-| `scrollback_lines` | `10000` | how many rows that scrolled off a session's screen it keeps, up to 1,000,000, for scrolling back, copy mode, `e` and `crystal read --history` |
+| `scrollback_lines` | `10000` | how many rows that scrolled off a session's screen it keeps, up to 1,000,000, for scrolling back, copy mode, `e` and `crystal read --history`; a change counts for the sessions running too, which let their oldest rows go when it's fewer |
 | `[plugins]` | | which plugins are on and off: [plugins](#plugins) |
 | `[memory]` | | how memory's [distiller](#the-distiller) runs, and whether it [searches by meaning](#search-by-meaning) |
 | `[tasks]` | | what [background tasks](#background-tasks) may spend: `max_budget_usd` each (`5`), `daily_budget_usd` all together (none); and what they may do without asking: `permission_mode` (`"default"`), `allowed_tools` (none) and `allow_bypass` (`false`) |
@@ -3011,10 +3013,11 @@ starts sessions again, a flow
 each time one starts, `[[project]]` each time a project's commands run,
 `name_from_prompt` each time it names a session, `resume_reported_agents` as it starts sessions again,
 `[clipboard]` each time a program copies out of sight,
-`scrollback_lines` as each session starts and `mermaid_ascii` as each session starts and each background task's
-run does, so a change counts straight away (a session already running keeps
-what it had); `crystal new` and the TUI read `[terminal]` each time they start a shell, and `crystal attach`
-reads `[clipboard]` as it attaches; the TUI reads
+`scrollback_lines` as each session starts and every 15 seconds for the sessions running, and `mermaid_ascii` as
+each session starts and each background task's run does, so a change counts straight away (but for
+`mermaid_ascii`, a session already running keeps what it had); `crystal new` and the TUI read `[terminal]` each
+time they start a shell, and `crystal attach` reads `[clipboard]` and `scrollback_lines` as it attaches; the TUI
+reads
 `new_session`, `theme`, `[colors]`, `[appearance]`, `[window]`, `[tab_bar]`, `scrollback_lines`, `mermaid_ascii`,
 `[plugins]`, `[update]`, `[mouse]`, `[clipboard]`, `[forge]`, `confirm_quit`, `show_keys`, the profiles and the
 flows when it starts, again when you save a profile or switch a plugin, and every half a second while the
@@ -3186,13 +3189,15 @@ issues give way before it.
 #### The settings view
 
 `,` in the sidebar opens the settings you'd otherwise change in the file, in tabs: `Tab` and `Shift+Tab` (or `]`
-and `[`) go from one to the next, and `1` to `8` straight to one.
+and `[`) go from one to the next, and `1` to `8` straight to one. With the mouse, a click on a tab shows it and a
+click on a row puts the bar there; a click on the row the bar is on is `enter` there, and the wheel moves the
+bar.
 
 | Tab | What's in it |
 |---|---|
 | General | [notifications](#usage): whether, after how long, only while you're away, and a command of your own in place of them; sounds; whether `q` asks before it quits; looking for a [newer crystal](#updating); how long the [event log](#events) keeps what happened; and whether [draft pull requests](#pull-requests) are hidden |
 | Look | the [theme](#themes), whether it follows your system's appearance (the row says which theme each side is) and the theme for each side; the [tab bar](#terminals-the-window-and-the-tab-bar)'s place, whether it's left out with one tab, and its separator; the window's title; the [sidebar](#the-sidebar)'s width, whether it starts folded, what folding keeps, whether what needs you is pinned, and how narrow a terminal shows [one column](#on-a-phone); whether keys pressed show at the footer (`show_keys`), and whether [mermaid diagrams](#the-file-finder-and-the-tree-browser) are drawn in ASCII |
-| Sessions | what the [new-session panel](#starting-a-session) offers first, naming sessions for their prompt, how long an agent may sit [idle](#archiving-and-idle-agents), how far apart agents start again after a [crash or a reboot](#usage) and whether one resumes as it said; a new terminal's shell, whether it's a login shell and where it starts; how much a session's history keeps; and the branch new worktrees start from and where they go |
+| Sessions | what the [new-session panel](#starting-a-session) offers first, naming sessions for their prompt, how long an agent may sit [idle](#archiving-and-idle-agents), how far apart agents start again after a [crash or a reboot](#usage) and whether one resumes as it said; a new terminal's shell, whether it's a login shell and where it starts; how much each session's history keeps, the running ones' too; and the branch new worktrees start from and where they go |
 | Mouse | [the mouse](#usage), and whether programs' copies go on [your clipboard](#zoom-copy-mode-and-search) |
 | Tasks | the permission mode [background tasks](#background-tasks) start in, and what a run and a day may spend |
 | Memory | how memory learns ([the distiller](#the-distiller), its model and what it may spend) and whether it searches [by meaning](#search-by-meaning) and reranks |
@@ -3217,9 +3222,15 @@ each has and a `•` beside those the file gives. `enter` on one waits for the k
 key in place of its own, and `a` gives it the key beside them; `x` leaves it with none, and `del` puts its own
 back. A key is checked as the file's keys are: one another command has asks first, saying whose it is, and
 `enter` takes it from that one, which keeps its other keys, while `esc` leaves it; a key a view always has, or
-the key back from a pane, isn't given, and the view says why. Your own `[[keys.command]]` keys are listed under
-the rest, for the file to change. `esc` can't be given this way, since it stops the waiting; the file can give
-it.
+the key back from a pane, isn't given, and the view says why. A key an installed [plugin](#plugins)'s action
+takes asks first too, since the command would have it before the action, which would run from the command list
+alone; `enter` gives it all the same. Your own `[[keys.command]]` keys are listed under the rest, for the file to
+change. `esc` can't be given this way, since it stops the waiting; the file can give it.
+
+`/` filters the keys' tab as you type: a key stays when each word is in its command's name, letters in order,
+or in what it does, or is one of its keys, like `x` or `ctrl+n`. The arrows move the bar meanwhile, `enter` keeps
+the filter and gives the rows their keys back, and `esc` takes it away, the bar staying on the key it was on;
+`esc` again closes the view.
 
 While it's open, the view reads the file and asks the daemon again every half a second, so it follows a
 change made by hand in the file too, and shows how the models that search by meaning stand: downloading

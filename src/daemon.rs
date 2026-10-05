@@ -77,8 +77,9 @@ use std::{fs, process, thread};
 const KEEP_UP_EVERY: Duration = Duration::from_millis(250);
 
 /// How often the keep-up loop looks for agents that have sat idle for too
-/// long: the settings are read each time. `CRYSTAL_IDLE_CHECK_MS` sets it
-/// otherwise, for tests.
+/// long, and for another amount of history for the sessions to keep: the
+/// settings are read each time. `CRYSTAL_IDLE_CHECK_MS` sets it otherwise,
+/// for tests.
 fn idle_check_every() -> Duration {
     std::env::var("CRYSTAL_IDLE_CHECK_MS")
         .ok()
@@ -738,7 +739,9 @@ impl Daemon {
             self.follow_flows(&mut sessions);
             if idle_checked.elapsed() >= idle_check_every {
                 idle_checked = Instant::now();
-                stop_idle_agents(&mut sessions);
+                let settings = settings();
+                stop_idle_agents(&mut sessions, &settings);
+                follow_scrollback(&sessions, &settings);
             }
             // Read only when a session has something to tell, at most once
             // a round.
@@ -3064,26 +3067,32 @@ impl Daemon {
     }
 }
 
-/// Stops the agents that have sat idle for longer than the settings allow:
+/// Stops the agents that have sat idle for longer than `settings` allow:
 /// see [`Session::idle_for`]. They stay in the list, ended, to start again
 /// in their conversations.
-fn stop_idle_agents(sessions: &mut [Session]) {
+fn stop_idle_agents(sessions: &mut [Session], settings: &Config) {
+    let Some(limit) = settings.sessions.idle_limit() else {
+        return;
+    };
     let idle: Vec<(usize, Duration)> = sessions
         .iter()
         .enumerate()
         .filter_map(|(index, session)| Some((index, session.idle_for()?)))
         .collect();
-    // The settings are only read when there's an agent they could stop.
-    if idle.is_empty() {
-        return;
-    }
-    let Some(limit) = settings().sessions.idle_limit() else {
-        return;
-    };
     for (index, for_how_long) in idle {
         if for_how_long >= limit {
             sessions[index].stop_idle();
         }
+    }
+}
+
+/// Has every session keep the history `settings` say, the running ones
+/// too, which let their oldest rows go when it's fewer.
+fn follow_scrollback(sessions: &[Session], settings: &Config) {
+    let lines = settings.scrollback_lines;
+    vt::set_history_lines(lines);
+    for session in sessions {
+        session.term().keep_history(lines);
     }
 }
 
