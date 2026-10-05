@@ -14188,6 +14188,131 @@ fn a_session_with_nothing_to_read_can_t_be_distilled() {
     );
 }
 
+/// What crystal's hook adds for Claude Code as it reads or edits `file`
+/// in the session called `session`, with `tool`: nothing, or what Claude
+/// reads beside what the tool gives it.
+fn told_about_file(
+    crystal: &Crystal,
+    session: &str,
+    hook: &str,
+    tool: &str,
+    file: &Path,
+) -> String {
+    let event = serde_json::json!({
+        "hook_event_name": "PreToolUse",
+        "session_id": "conv-1",
+        "tool_name": tool,
+        "tool_input": {"file_path": file},
+    });
+    let said = hook_says(
+        crystal,
+        &[("CRYSTAL_SESSION", session)],
+        hook,
+        &event.to_string(),
+    );
+    if said.is_empty() {
+        return said;
+    }
+    let said: serde_json::Value = serde_json::from_str(&said).unwrap();
+    assert_eq!(said["hookSpecificOutput"]["hookEventName"], "PreToolUse");
+    said["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+#[test]
+fn claude_is_shown_what_its_project_remembered_about_a_file_as_it_reads_it() {
+    let (crystal, repo) = crystal_remembering();
+    let repo_dir = repo.to_str().unwrap();
+    std::fs::create_dir(repo.join("src")).unwrap();
+    std::fs::write(repo.join("src/ledger.rs"), "fn round_cents() {}").unwrap();
+    std::fs::write(repo.join("src/fees.rs"), "fn fee() {}").unwrap();
+    for (kind, file, text) in [
+        (
+            "gotcha",
+            "src/ledger.rs",
+            "The ledger tests need the database up",
+        ),
+        ("note", "src/ledger.rs", "Fees are rounded half up"),
+        ("gotcha", "", "Rounding goes through `round_cents`"),
+        ("decision", "src/fees.rs", "Fees are kept in cents"),
+    ] {
+        let mut args = vec!["remember", "-C", repo_dir, "-k", kind, text];
+        if !file.is_empty() {
+            args.extend(["-f", file]);
+        }
+        crystal.ok(&args);
+    }
+    let bin = fake_claude(crystal.dir.path());
+    let out = crystal
+        .command(&[
+            "new",
+            "-n",
+            "agent",
+            "-c",
+            repo_dir,
+            "claude",
+            "fix the database setup",
+        ])
+        .env("PATH", path_of(&[&bin]))
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let args = written(&repo.join("args"));
+    assert!(
+        args.contains("\n- 1 (gotcha) The ledger tests need the database up [src/ledger.rs]\n"),
+        "{args}"
+    );
+    let settings = claude_settings(&args);
+    let before = &settings["hooks"]["PreToolUse"][0];
+    assert_eq!(before["matcher"], "Read|Edit|Write|MultiEdit|NotebookEdit");
+    let hook = before["hooks"][0]["command"].as_str().unwrap();
+
+    // Reading the ledger, it's told what it wasn't as it started: the
+    // lesson naming what's in it first, then the note about it.
+    let ledger = repo.join("src/ledger.rs");
+    assert_eq!(
+        told_about_file(&crystal, "agent", hook, "Read", &ledger),
+        "What this project's earlier sessions learned about src/ledger.rs:\n\
+         - 3 (gotcha) Rounding goes through `round_cents`\n\
+         - 2 (note) Fees are rounded half up\n\
+         The memory_show tool reads one in full."
+    );
+    // Once a file.
+    assert_eq!(
+        told_about_file(&crystal, "agent", hook, "Edit", &ledger),
+        ""
+    );
+    // Nothing from outside the project, nor for another tool.
+    let outside = crystal.dir.path().join("notes.md");
+    assert_eq!(
+        told_about_file(&crystal, "agent", hook, "Write", &outside),
+        ""
+    );
+    let fees = repo.join("src/fees.rs");
+    assert_eq!(told_about_file(&crystal, "agent", hook, "Bash", &fees), "");
+
+    // Switched off, nothing; switched on again, it's told as before.
+    crystal
+        .configure("notify = false\nname_by_agent = false\n\n[memory]\nrecall_on_read = false\n");
+    assert_eq!(told_about_file(&crystal, "agent", hook, "Read", &fees), "");
+    crystal.configure("notify = false\nname_by_agent = false\n");
+    assert_eq!(
+        told_about_file(&crystal, "agent", hook, "Read", &fees),
+        "What this project's earlier sessions learned about src/fees.rs:\n\
+         - 4 (decision) Fees are kept in cents\n\
+         The memory_show tool reads one in full."
+    );
+
+    // What it was shown goes with it through a handover.
+    crystal.ok(&["restart-server"]);
+    assert_eq!(
+        told_about_file(&crystal, "agent", hook, "Read", &ledger),
+        ""
+    );
+}
+
 #[test]
 fn archiving_a_claude_session_has_the_distiller_read_what_it_did() {
     let (crystal, repo) = crystal_remembering();
