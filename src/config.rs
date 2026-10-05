@@ -660,6 +660,9 @@ pub struct MemorySettings {
     /// Have the reranker read the best of a search again, putting what
     /// answers it first and leaving out what doesn't.
     pub rerank: bool,
+    /// Show Claude Code the entries about a file as it reads or edits it,
+    /// a few once per file: see [`crate::recall`].
+    pub recall_on_read: bool,
     /// What turns entries and searches into vectors: the model run on this
     /// machine, or Google's Gemini API, which entries' text goes to.
     pub embedder: Embedder,
@@ -695,6 +698,7 @@ impl Default for MemorySettings {
             distill_budget_usd: 0.25,
             embeddings: true,
             rerank: true,
+            recall_on_read: true,
             embedder: Embedder::Local,
             gemini_model: crate::gemini::MODEL.to_string(),
             gemini_dimensions: crate::gemini::DEFAULT_DIMENSIONS,
@@ -2298,6 +2302,7 @@ back_to = "build"
                 distill_budget_usd: 0.5,
                 embeddings: true,
                 rerank: false,
+                recall_on_read: false,
                 embedder: Embedder::Gemini,
                 gemini_model: "gemini-embedding-2".into(),
                 gemini_dimensions: 3072,

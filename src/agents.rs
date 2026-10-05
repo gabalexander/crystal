@@ -37,6 +37,11 @@ pub const CLAUDE_HOOK_EVENTS: &[&str] = &[
     "SubagentStop",
 ];
 
+/// The tools of Claude Code's that read or edit a file, which crystal's
+/// `PreToolUse` hook is matched to: as one is about to, the agent is shown
+/// what its project's memory has about the file (see [`crate::recall`]).
+pub const CLAUDE_FILE_TOOLS: &[&str] = &["Read", "Edit", "Write", "MultiEdit", "NotebookEdit"];
+
 /// The Codex hook events crystal listens to; [`codex_event`] says what each
 /// one means. Codex has no `Notification`: the questions it asks while
 /// it waits on the user are read off its screen.
@@ -435,6 +440,28 @@ pub fn subagent(input: &Value) -> Option<Subagent> {
     })
 }
 
+/// The file a Claude Code `PreToolUse` hook's input says its agent is
+/// about to read or edit with one of [`CLAUDE_FILE_TOOLS`], by its path
+/// from the top, as the tool takes it. Not one a subagent reads, which only
+/// what the subagent says of it reaches the agent with.
+pub fn claude_file(input: &Value) -> Option<PathBuf> {
+    if event_name(input)? != "PreToolUse" || in_subagent(input) {
+        return None;
+    }
+    if !CLAUDE_FILE_TOOLS.contains(&input["tool_name"].as_str()?) {
+        return None;
+    }
+    let tool_input = &input["tool_input"];
+    let path = (tool_input["file_path"].as_str())
+        .or_else(|| tool_input["notebook_path"].as_str())
+        .filter(|path| !path.is_empty())?;
+    let path = PathBuf::from(path);
+    match path.is_absolute() {
+        true => Some(path),
+        false => Some(hook_cwd(input)?.join(path)),
+    }
+}
+
 /// What a Codex hook's input means, or `None` if it's nothing that changes
 /// what the session is doing. Codex's hooks are Claude Code's, mostly, with
 /// `Interrupt` for a turn the user cut short, which is no turn ending the
@@ -640,13 +667,15 @@ pub fn claude_keep_going(reason: &str) -> String {
     json!({ "decision": "block", "reason": reason }).to_string()
 }
 
-/// What a Claude Code hook prints for the prompt the user just sent to
-/// come with `context`, which Claude reads before it: the
-/// `UserPromptSubmit` hook's `additionalContext`.
-pub fn claude_context(context: &str) -> String {
+/// What a Claude Code hook for `event` prints for Claude to read
+/// `context` with what set it off: its `additionalContext`. With the
+/// prompt the user just sent, `UserPromptSubmit`'s, Claude reads it before
+/// the prompt; with a tool it's about to use, `PreToolUse`'s, beside what
+/// the tool gives it.
+pub fn claude_context(event: &str, context: &str) -> String {
     json!({
         "hookSpecificOutput": {
-            "hookEventName": "UserPromptSubmit",
+            "hookEventName": event,
             "additionalContext": context,
         }
     })
@@ -654,7 +683,8 @@ pub fn claude_context(context: &str) -> String {
 }
 
 /// Settings for Claude Code that add a hook, `crystal hook claude`, to
-/// each event in [`CLAUDE_HOOK_EVENTS`].
+/// each event in [`CLAUDE_HOOK_EVENTS`], and to `PreToolUse` for
+/// [`CLAUDE_FILE_TOOLS`].
 fn claude_settings(crystal: &Path) -> String {
     let command = hook_command(crystal, "claude", false);
     // Each event takes a list of matcher groups; with no matcher, a group
@@ -666,6 +696,13 @@ fn claude_settings(crystal: &Path) -> String {
     for event in CLAUDE_HOOK_EVENTS {
         hooks.insert(event.to_string(), groups.clone());
     }
+    // Claude waits on it before each read and edit, so it gives up on the
+    // daemon sooner than this.
+    let before_files = json!([{
+        "matcher": CLAUDE_FILE_TOOLS.join("|"),
+        "hooks": [{ "type": "command", "command": command, "timeout": 2 }]
+    }]);
+    hooks.insert("PreToolUse".to_string(), before_files);
     json!({ "hooks": hooks }).to_string()
 }
 
@@ -1297,6 +1334,50 @@ mod tests {
             let hook = &settings["hooks"][event][0]["hooks"][0];
             assert_eq!(hook["command"], "'/opt/my tools/crystal' hook claude");
         }
+        // And before the tools that read and edit files, for what the
+        // memory has about each.
+        let before = &settings["hooks"]["PreToolUse"][0];
+        assert_eq!(before["matcher"], "Read|Edit|Write|MultiEdit|NotebookEdit");
+        assert_eq!(
+            before["hooks"][0]["command"],
+            "'/opt/my tools/crystal' hook claude"
+        );
+    }
+
+    #[test]
+    fn a_file_claude_reads_or_edits_is_found_in_its_hook_s_input() {
+        let read = json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Read",
+            "tool_input": {"file_path": "/code/app/src/ledger.rs", "offset": 10},
+        });
+        assert_eq!(
+            claude_file(&read),
+            Some(PathBuf::from("/code/app/src/ledger.rs"))
+        );
+        let notebook = json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "NotebookEdit",
+            "cwd": "/code/app",
+            "tool_input": {"notebook_path": "eda.ipynb"},
+        });
+        assert_eq!(
+            claude_file(&notebook),
+            Some(PathBuf::from("/code/app/eda.ipynb"))
+        );
+        let after = json!({"hook_event_name": "PostToolUse", "tool_name": "Read",
+                           "tool_input": {"file_path": "/code/app/a.rs"}});
+        assert_eq!(claude_file(&after), None);
+        let bash = json!({"hook_event_name": "PreToolUse", "tool_name": "Bash",
+                          "tool_input": {"command": "cat /code/app/a.rs"}});
+        assert_eq!(claude_file(&bash), None);
+        let mut subagent = read.clone();
+        subagent["agent_id"] = json!("a1");
+        assert_eq!(
+            claude_file(&subagent),
+            None,
+            "a subagent's reads aren't the agent's"
+        );
     }
 
     #[test]
@@ -1310,7 +1391,8 @@ mod tests {
 
     #[test]
     fn a_prompt_hook_adds_to_what_claude_reads_with_the_prompt() {
-        let output: Value = serde_json::from_str(&claude_context("Name it.")).unwrap();
+        let output = claude_context("UserPromptSubmit", "Name it.");
+        let output: Value = serde_json::from_str(&output).unwrap();
         assert_eq!(
             output["hookSpecificOutput"],
             json!({"hookEventName": "UserPromptSubmit", "additionalContext": "Name it."})

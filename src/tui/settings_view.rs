@@ -114,6 +114,7 @@ pub enum Setting {
     Embedder,
     GeminiDimensions,
     Rerank,
+    RecallOnRead,
 }
 
 impl Setting {
@@ -177,6 +178,7 @@ impl Setting {
             Setting::Embedder => &["memory", "embedder"],
             Setting::GeminiDimensions => &["memory", "gemini_dimensions"],
             Setting::Rerank => &["memory", "rerank"],
+            Setting::RecallOnRead => &["memory", "recall_on_read"],
         }
     }
 
@@ -240,6 +242,7 @@ impl Setting {
             Setting::Embedder => "  vectors by",
             Setting::GeminiDimensions => "  dimensions",
             Setting::Rerank => "  rerank",
+            Setting::RecallOnRead => "shown as files are read",
         }
     }
 
@@ -579,6 +582,7 @@ const TABS: [Tab; 8] = [
                 S::Embedder,
                 S::GeminiDimensions,
                 S::Rerank,
+                S::RecallOnRead,
             ],
         )],
     },
@@ -1231,6 +1235,7 @@ impl SettingsView {
                 number(next_of(&crate::gemini::DIMENSIONS, now, forward).into())
             }
             S::Rerank => on(!config.memory.rerank),
+            S::RecallOnRead => on(!config.memory.recall_on_read),
             S::NotifyCommand
             | S::Separator
             | S::WindowTitle
@@ -2133,6 +2138,13 @@ fn shown(setting: Setting, config: &Config) -> Shown {
                 "jina's reranker reads the best of a search again",
             )
         },
+        S::RecallOnRead => Shown {
+            dim: !memory_on,
+            ..switch(
+                config.memory.recall_on_read,
+                "what's known about a file, as Claude Code reads or edits it",
+            )
+        },
     };
     let quiet = match setting {
         S::NotifyAfter | S::UnfocusedOnly | S::NotifyCommand => !config.notify,
@@ -2541,6 +2553,7 @@ mod tests {
             (S::Distill, false),
             (S::Embeddings, false),
             (S::Rerank, false),
+            (S::RecallOnRead, false),
             (S::HideDrafts, true),
         ];
         for (setting, to) in switches {
@@ -2740,7 +2753,7 @@ mod tests {
             }
         }
         let settings: usize = (0..KEYS_TAB).map(|tab| rows(tab, &[]).len()).sum();
-        assert_eq!(settings, 57);
+        assert_eq!(settings, 58);
     }
 
     /// Writes `change` to a config file made of `text`, and reads it back.

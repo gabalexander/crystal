@@ -141,7 +141,7 @@ impl Daemon {
         else {
             return;
         };
-        let ended = sessions.remove(index);
+        let mut ended = sessions.remove(index);
         let saved = moved(&ended, &moving.to);
         let mut env = ended.env().clone();
         // Where its last program ran: its next works it out for itself.
@@ -154,7 +154,11 @@ impl Daemon {
         ended.term().close();
         let session = match started {
             Ok(_) => {
-                let started = sessions.pop().expect("start added a session");
+                let mut started = sessions.pop().expect("start added a session");
+                // Its agent goes on in its conversation, which has what it
+                // was shown.
+                let recalled = std::mem::take(ended.recalled());
+                started.recalled().carry_on(recalled);
                 self.events
                     .emit(Event::about_session(Kind::SessionStarted, &started.info()));
                 started

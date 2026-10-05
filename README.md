@@ -2632,6 +2632,36 @@ line on how to read the rest and add more:
   one. A prompt that would pass 16 KiB with them loses what the memory has first. An agent that takes no first
   prompt, like Aider, isn't told.
 
+As Claude Code reads or edits a file (`Read`, `Edit`, `Write`, `MultiEdit`, `NotebookEdit`), crystal shows it
+the entries about that file it hasn't been shown yet: the few lessons that matter just as it's about to work
+there, which the few it was shown as it started, or what it thinks to search for, may not have.
+
+- The entries about a file are those about it with `-f`, or about a directory it's in, and those whose text
+  names its path, or names something in it, like `round_cents`, that no more than one other file has. Lessons
+  come first; then those about the file itself, then those naming what's in it, then those about its
+  directory; then those that have most to do with what the session was started to do and the prompt you last
+  sent, by their words; then those said most often, those you or an agent remembered before the distiller's,
+  those about the fewest files, and the newest. None that's stale, expired or a task's outcome; drifting ones
+  are marked `[may be out of date]`.
+- It's shown at most three, in 600 bytes in all, each by its id, its kind and its title cut to about a sentence,
+  under a line saying which file they're about. It reads one in full with `memory_show`.
+- Each file once a session, and never an entry it was shown already, at launch or with another file. What a
+  session was shown goes with it through a `restart-server`, a `crystal worktree move` and a stop for being idle,
+  since its agent goes on in its conversation, and ends with it.
+- A subagent's reads aren't shown anything: what it finds reaches the agent only as what it says.
+- It goes through crystal's own `PreToolUse` hook, which Claude Code waits on before the tool runs. The daemon
+  looks the file's entries up in a few milliseconds, with no model, telling what holds by the code as it last
+  read it, at most a minute before; the hook gives up on a daemon that hasn't answered in 300 ms, and adds
+  nothing. Claude Code reads what it adds beside what the tool gives it.
+- What it adds to the context: on crystal's own memory (512 entries), a session asked one of nine merged pull
+  requests' titles, reading every file the pull request touched (6 to 27), was told something about most of
+  them, 2.3 entries and about 490 bytes each, 3 to 10 KB in all.
+- Being shown an entry doesn't count as finding it again: crystal chose to show it. An agent it helps reads it
+  in full with `memory_show`, which does, so it doesn't expire.
+- `recall_on_read = false` under `[memory]` (or the settings view's Memory tab) turns it off, at once for the
+  sessions running. Only Claude Code sessions crystal starts get it, not one typed into a shell with `crystal
+  integration`'s hooks, nor a background task.
+
 `crystal plugin disable memory` turns it all off: see [plugins](#plugins).
 
 Every Claude Code session crystal starts, in a terminal or as a task in the background (`claude -p`), gets
@@ -2785,6 +2815,7 @@ distill_model = "claude-haiku-4-5"  # the model, as `claude --model` takes it
 distill_budget_usd = 0.25           # the most one task's pass may spend
 embeddings = true                   # false to search by words alone: see above
 rerank = true                       # false to leave the reranker out
+recall_on_read = true               # false to stop showing Claude Code what's known about each file it reads
 embedder = "local"                  # "gemini" for Google's Gemini API, which entries' text goes to: see above
 gemini_model = "gemini-embedding-2" # Gemini's model
 gemini_dimensions = 768             # 3072, 1536 or 768 numbers to a vector
@@ -3494,7 +3525,7 @@ that makes no sense is said there too, and the settings stay as they were until 
 | `mermaid_ascii` | `false` | draw [mermaid diagrams](#the-file-finder-and-the-tree-browser) with ASCII rather than box drawing |
 | `scrollback_lines` | `10000` | how many rows that scrolled off a session's screen it keeps, up to 1,000,000, for scrolling back, copy mode, `e` and `crystal read --history`; a change counts for the sessions running too, which let their oldest rows go when it's fewer |
 | `[plugins]` | | which plugins are on and off: [plugins](#plugins) |
-| `[memory]` | | how memory's [distiller](#the-distiller) runs, whether it [searches by meaning](#search-by-meaning), and with what: the model here or [Gemini](#gemini-instead-of-the-model-here) |
+| `[memory]` | | how memory's [distiller](#the-distiller) runs, whether it [searches by meaning](#search-by-meaning), and with what: the model here or [Gemini](#gemini-instead-of-the-model-here); and whether Claude Code is shown the entries about each file it reads |
 | `[tasks]` | | what [background tasks](#background-tasks) may spend: `max_budget_usd` each (`5`), `daily_budget_usd` all together (none); and what they may do without asking: `permission_mode` (`"default"`), `allowed_tools` (none) and `allow_bypass` (`false`) |
 | `[events]` | | `keep_days`, how long the [event log](#events) keeps what happened: 30 days, or `0` for ever |
 | `[handoff]` | | `in_git`, the projects, by their main worktree, whose [handoff notes](#the-handoff-file) go in git |
@@ -3721,7 +3752,7 @@ bar.
 | Sessions | what the [new-session panel](#starting-a-session) offers first, naming sessions for their prompt, how long an agent may sit [idle](#archiving-and-idle-agents) and whether a terminal is stopped too, whether an agent is kept warm for the next session, how far apart agents start again after a [crash or a reboot](#usage) and whether one resumes as it said; a new terminal's shell, whether it's a login shell and where it starts; how much each session's history keeps, the running ones' too, and whether a terminal shows it again after a crash or a reboot; and the branch new worktrees start from, where they go and whether one its last session is killed from is removed |
 | Mouse | [the mouse](#usage), and whether programs' copies go on [your clipboard](#zoom-copy-mode-and-search) |
 | Tasks | the permission mode [background tasks](#background-tasks) start in, and what a run and a day may spend |
-| Memory | how memory learns ([the distiller](#the-distiller), its model and what it may spend), whether it searches [by meaning](#search-by-meaning), with the model here or [Gemini](#gemini-instead-of-the-model-here) and at how many dimensions, and reranks |
+| Memory | how memory learns ([the distiller](#the-distiller), its model and what it may spend), whether it searches [by meaning](#search-by-meaning), with the model here or [Gemini](#gemini-instead-of-the-model-here) and at how many dimensions, and reranks, and whether Claude Code is shown what's known about a file as it reads it |
 | Integrations | the agents installed here that crystal can [hook](#hooks-in-other-agents-own-settings): below |
 | Keys | every key `[keys]` gives, each given by pressing it: below |
 

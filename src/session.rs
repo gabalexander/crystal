@@ -23,6 +23,7 @@ use crate::protocol::{
     Reporter, ScreenExplained, SessionInfo, State, TaskBrief, TaskInfo, TaskOutcome, TaskRecord,
     TaskResult, TaskSpec, TaskState, TaskView, Wakeup,
 };
+use crate::recall::{self, Recalled};
 use crate::report;
 use crate::resources::Under;
 use crate::spending::Spending;
@@ -35,7 +36,7 @@ use anyhow::{Context, Result, bail, ensure};
 use portable_pty::{CommandBuilder, ExitStatus, MasterPty, native_pty_system};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{self, Write};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
 use std::path::{Path, PathBuf};
@@ -167,6 +168,9 @@ pub struct Session {
     /// crystal stopped it to start it again in another worktree: see
     /// [`Session::stop_to_move`].
     stopped_to_move: bool,
+    /// What its agent has been shown of its project's memory, as it
+    /// started and as it read files since: see [`crate::recall`].
+    recalled: Recalled,
     /// Tasks that closed of themselves, like a background task whose run
     /// ended, for the daemon to write down.
     closed: Vec<TaskRecord>,
@@ -324,6 +328,8 @@ pub struct Handed {
     stopped_in: Option<PathBuf>,
     #[serde(default)]
     wakes: Wakes,
+    #[serde(default)]
+    recalled: Recalled,
     /// For a session yet to start again after a restart, or that couldn't:
     /// what it starts from. Its `state` says it has ended, which is how a
     /// crystal from before these reads it.
@@ -524,6 +530,7 @@ impl Session {
             stopped_in: None,
             wakes: Wakes::default(),
             stopped_to_move: false,
+            recalled: Recalled::default(),
             closed: Vec::new(),
             changes: Vec::new(),
             start_from: None,
@@ -597,6 +604,7 @@ impl Session {
             stopped_in: None,
             wakes: Wakes::default(),
             stopped_to_move: false,
+            recalled: Recalled::default(),
             closed: Vec::new(),
             changes: Vec::new(),
             start_from: None,
@@ -694,6 +702,7 @@ impl Session {
             stopped_in: None,
             wakes: Wakes::default(),
             stopped_to_move: false,
+            recalled: Recalled::default(),
             closed: Vec::new(),
             changes: Vec::new(),
             start_from: Some(saved),
@@ -1002,6 +1011,34 @@ impl Session {
     /// in one.
     pub fn project_path(&self) -> Option<&Path> {
         self.checkout.as_ref().map(Checkout::project_path)
+    }
+
+    /// What its agent has been shown of its project's memory: see
+    /// [`crate::recall`].
+    pub fn recalled(&mut self) -> &mut Recalled {
+        &mut self.recalled
+    }
+
+    /// Where to look for what its agent is told as it reads or edits
+    /// `file`, the first time it does, and what to rank that by: what it
+    /// was started to do and the prompt it was last sent. `None` after
+    /// that, for a task, whose Claude has no hooks of crystal's, and for a
+    /// file outside its project.
+    pub fn recall_lookup(&mut self, file: &Path) -> Option<(recall::Lookup, String)> {
+        if self.task.is_some() {
+            return None;
+        }
+        let top = self.checkout_top();
+        let project = match self.project_path() {
+            Some(project) => project.to_path_buf(),
+            None => fs::canonicalize(&self.cwd).unwrap_or_else(|_| self.cwd.clone()),
+        };
+        let lookup = self.recalled.first_look(file, &top, &project)?;
+        let first = match &self.goal {
+            Some(goal) => goal.goal.clone(),
+            None => self.command.get(1..).unwrap_or_default().join(" "),
+        };
+        Some((lookup, self.recalled.query(&first)))
     }
 
     pub fn env(&self) -> &BTreeMap<String, String> {
@@ -2013,6 +2050,7 @@ impl Session {
             stopped_idle: self.stopped_idle,
             stopped_in: self.stopped_in.clone(),
             wakes: self.wakes.clone(),
+            recalled: self.recalled.clone(),
             start_from,
             screen,
             ended,
@@ -2104,6 +2142,7 @@ impl Session {
             stopped_in: handed.stopped_in,
             wakes: handed.wakes,
             stopped_to_move: false,
+            recalled: handed.recalled,
             closed: Vec::new(),
             changes: Vec::new(),
             start_from: None,
@@ -2756,6 +2795,8 @@ mod tests {
             ..Metadata::default()
         };
         shown.take(&metadata, SystemTime::now()).unwrap();
+        let mut recalled = Recalled::default();
+        recalled.launched(&[4, 7]);
         let handed = Handed {
             name: "agent".into(),
             id: "id-1".into(),
@@ -2797,6 +2838,7 @@ mod tests {
             stopped_idle: false,
             stopped_in: None,
             wakes: Wakes::default(),
+            recalled: recalled.clone(),
             start_from: None,
             screen: screen.save(),
             ended: true,
@@ -2842,6 +2884,9 @@ mod tests {
         assert_eq!(info.line.as_deref(), Some("deploying"));
         assert_eq!(info.model.as_deref(), Some("pi-large"));
         assert_eq!(session.model.model(), Some("opus"));
+        // What its agent was shown of its project's memory, not to be
+        // shown again.
+        assert_eq!(session.recalled, recalled);
     }
 
     /// A Claude Code session as it was written down before a restart, in
@@ -3076,6 +3121,7 @@ mod tests {
             stopped_idle: false,
             stopped_in: None,
             wakes: Wakes::default(),
+            recalled: Recalled::default(),
             start_from: None,
             screen: vt::Screen::answering(5, 20).save(),
             ended: true,
@@ -3350,6 +3396,7 @@ mod tests {
             stopped_idle: false,
             stopped_in: None,
             wakes: Wakes::default(),
+            recalled: Recalled::default(),
             typed_agent: None,
             subagents: 0,
             held_for_subagents: None,
