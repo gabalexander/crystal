@@ -15,7 +15,7 @@
 //! from the jsDelivr CDN.
 
 use crate::mermaid::{self, Glyphs, Rendered};
-use crate::output::{self, outln};
+use crate::output::{self, errln, outln};
 use crate::{links, markdown, printable, state};
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
@@ -33,7 +33,7 @@ pub fn run(input: Option<&str>, width: Option<usize>, ascii: bool, open: bool) -
     if open {
         let page = write_page(&text, &state::diagrams_dir())?;
         outln!("{}", page.display())?;
-        eprintln!("{}", links::open(&file_url(&page))?);
+        errln!("{}", links::open(&file_url(&page))?);
         return Ok(());
     }
     let width = width.unwrap_or_else(terminal_width).max(1);

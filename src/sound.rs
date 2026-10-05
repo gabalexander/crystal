@@ -15,6 +15,7 @@
 //! quiet whatever the config says.
 
 use crate::config::{Config, SoundSettings};
+use crate::output::errln;
 use crate::protocol::Activity;
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
@@ -99,7 +100,7 @@ pub fn play(sound: Sound, settings: &SoundSettings) {
     let own = sound.own(settings).map(|path| resolve(path, &config_dir()));
     thread::spawn(move || {
         if let Err(err) = play_now(sound, own.as_deref()) {
-            eprintln!(
+            errln!(
                 "crystal daemon: couldn't play the {} sound: {err:#}",
                 sound.name()
             );
@@ -111,7 +112,7 @@ fn play_now(sound: Sound, own: Option<&Path>) -> Result<()> {
     if let Some(path) = own {
         match play_file(path) {
             Ok(()) => return Ok(()),
-            Err(err) => eprintln!(
+            Err(err) => errln!(
                 "crystal daemon: couldn't play {}, crystal's own sound instead: {err:#}",
                 path.display()
             ),

@@ -23,6 +23,7 @@
 //! it did.
 
 use crate::agent_screen::Looks;
+use crate::output::errln;
 use regex::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -955,7 +956,7 @@ pub fn current() -> Arc<Registry> {
     let registry = Arc::new(Registry::load(dir.as_deref()));
     if LOG_PROBLEMS.load(Ordering::Relaxed) {
         for problem in registry.all_problems() {
-            eprintln!("crystal daemon: agent rules: {problem}");
+            errln!("crystal daemon: agent rules: {problem}");
         }
     }
     *cache = Some(Cache {
