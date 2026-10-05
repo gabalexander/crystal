@@ -1,8 +1,8 @@
 //! The overlay `?` opens: every key the TUI takes, grouped by where it
 //! works. The sidebar's keys come from the keymap's table,
 //! [`keymap::HELP`], written as the user's `[keys]` has them; the others
-//! from [`KEYS`]. The README's table of sidebar keys is checked against
-//! the defaults. A key that belongs to one of crystal's plugins is only
+//! from [`KEYS`]. The table of sidebar keys in `docs/keys.md` is checked
+//! against the defaults. A key that belongs to one of crystal's plugins is only
 //! listed while that plugin is on, and the keys installed plugins' actions
 //! took are listed after the sidebar's own.
 
@@ -526,15 +526,15 @@ mod tests {
             .collect()
     }
 
-    /// The keys in each row of the README's table of sidebar keys: what's
-    /// between backticks in its first column, with a `|` written `\|` so
-    /// it doesn't end the cell.
-    fn readme_sidebar_keys() -> Vec<Vec<String>> {
-        let readme = include_str!("../../README.md");
-        let table = readme
+    /// The keys in each row of the table of sidebar keys in `docs/keys.md`:
+    /// what's between backticks in its first column, with a `|` written
+    /// `\|` so it doesn't end the cell.
+    fn documented_sidebar_keys() -> Vec<Vec<String>> {
+        let page = include_str!("../../docs/keys.md");
+        let table = page
             .split("| Key | In the sidebar |")
             .nth(1)
-            .expect("the README has a table of sidebar keys");
+            .expect("docs/keys.md has a table of sidebar keys");
         table
             .lines()
             .skip(2)
@@ -552,18 +552,18 @@ mod tests {
     }
 
     #[test]
-    fn the_overlay_and_the_readme_list_the_same_sidebar_keys() {
+    fn the_overlay_and_the_docs_list_the_same_sidebar_keys() {
         // The overlay puts keys that go together on one row to fit a small
-        // terminal, and the README gives most a row each, so the keys are
+        // terminal, and the docs give most a row each, so the keys are
         // compared, not the rows.
         let mut overlay: Vec<String> = keymap::HELP
             .iter()
             .flat_map(|row| keys_in(row.label))
             .collect();
-        let mut readme: Vec<String> = readme_sidebar_keys().into_iter().flatten().collect();
+        let mut documented: Vec<String> = documented_sidebar_keys().into_iter().flatten().collect();
         overlay.sort();
-        readme.sort();
-        assert_eq!(overlay, readme);
+        documented.sort();
+        assert_eq!(overlay, documented);
     }
 
     /// Every row, with every plugin on and none installed.

@@ -957,7 +957,7 @@ enum Command {
         command: IntegrationCommand,
     },
     /// Print the script that completes crystal's commands in your shell:
-    /// see the README for where each shell wants it.
+    /// see docs/install.md for where each shell wants it.
     Completions {
         #[arg(value_enum)]
         shell: completions::Target,

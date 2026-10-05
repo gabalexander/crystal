@@ -2222,12 +2222,12 @@ mod tests {
     }
 
     #[test]
-    fn the_readme_lists_every_event() {
-        let readme = include_str!("../README.md");
-        let table = readme
+    fn the_docs_list_every_event() {
+        let page = include_str!("../docs/plugins.md");
+        let table = page
             .split("| Event | When |")
             .nth(1)
-            .expect("the README has a table of events");
+            .expect("docs/plugins.md has a table of events");
         let listed: Vec<&str> = table
             .lines()
             .skip(2)
